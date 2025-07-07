@@ -1,5 +1,5 @@
 const express = require('express');
-const { handleCommands } = require('./handlers/commands');
+const { handleCommands } = require('../handlers/commands');
 const { handleMedia } = require('./handlers/media');
 const { handleOnboarding } = require('./handlers/onboarding');
 const { handleTimeclock } = require('./handlers/timeclock');

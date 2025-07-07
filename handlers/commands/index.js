@@ -407,4 +407,14 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
   }
 }
 
-module.exports = { handleCommands };
+module.exports = {
+  expense: handleExpense,
+  revenue: handleRevenue,
+  bill: handleBill,
+  job: handleJob,
+  quote: handleQuote,
+  metrics: handleMetrics,
+  tax: handleTax,
+  receipt: handleReceipt,
+  team: handleTeam
+};

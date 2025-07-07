@@ -1,12 +1,12 @@
 const express = require('express');
 const { handleCommands } = require('../handlers/commands');
-const { handleMedia } = require('./handlers/media');
-const { handleOnboarding } = require('./handlers/onboarding');
-const { handleTimeclock } = require('./handlers/timeclock');
-const { lockMiddleware, releaseLock } = require('./middleware/lock');
-const { userProfileMiddleware } = require('./middleware/userProfile');
-const { tokenMiddleware } = require('./middleware/token');
-const { errorMiddleware } = require('./middleware/error');
+const { handleMedia      } = require('../handlers/media');
+const { handleOnboarding } = require('../handlers/onboarding');
+const { handleTimeclock  } = require('../handlers/timeClock');
+const { lockMiddleware, releaseLock } = require('../middleware/lock');
+const { userProfileMiddleware } = require('../middleware/userProfile')
+const { tokenMiddleware } = require('../middleware/token');
+const { errorMiddleware } = require('../middleware/error');
 
 const router = express.Router();
 

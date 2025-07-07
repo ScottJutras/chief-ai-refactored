@@ -24,6 +24,7 @@
                   "firebase-admin": "^12.5.0",
                   "fuzzball": "^2.2.2",
                   "glob": "^10.4.1",
+                  "googleapis": "^150.0.1",
                   "libphonenumber-js": "^1.12.6",
                   "openai": "^4.61.1",
                   "papaparse": "^5.5.2",

@@ -1,9 +1,11 @@
+// services/documentAI.js
 require('dotenv').config();
 const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
-const { parseReceiptText, logReceiptExpense } = require('../legacy/googleSheetsnewer');
-const { getAuthorizedClient } = require('../legacy/googleSheetsnewer');
+const vision = require('@google-cloud/vision');
+const { parseReceiptText } = require('../utils/expenseParser');
+const { saveExpense, getActiveJob } = require('./postgres');
 
-// Decode Google credentials
+// Decode your JSON key once
 const googleCredentials = JSON.parse(
   Buffer.from(process.env.GOOGLE_CREDENTIALS_BASE64, 'base64').toString('utf-8')
 );
@@ -12,9 +14,13 @@ const googleCredentials = JSON.parse(
  * Returns an authenticated Document AI client using the proper regional endpoint.
  */
 function getDocumentAIClient() {
-  const location = process.env.GCP_LOCATION || 'us';
-  const apiEndpoint = `${location}-documentai.googleapis.com`;
-
+  const location     = process.env.GCP_LOCATION    || 'us';
+  const apiEndpoint  = `${location}-documentai.googleapis.com`;
+  const projectId    = process.env.GCP_PROJECT_ID;
+  const processorId  = process.env.DOCUMENTAI_PROCESSOR_ID;
+  if (!projectId || !processorId) {
+    throw new Error('Missing GCP_PROJECT_ID or DOCUMENTAI_PROCESSOR_ID');
+  }
   return new DocumentProcessorServiceClient({
     credentials: googleCredentials,
     apiEndpoint
@@ -22,71 +28,66 @@ function getDocumentAIClient() {
 }
 
 /**
- * Processes the provided image using Document AI and returns the OCR text.
- *
- * @param {Buffer|string} imageContent - The image content as a Buffer or base64-encoded string.
- * @param {string} mimeType - The MIME type of the image (e.g., 'image/jpeg', 'image/png').
- * @returns {Promise<string>} The OCR text extracted by Document AI.
+ * Returns an authenticated Vision client.
  */
-async function processDocumentAI(imageContent, mimeType = 'image/jpeg') {
-  const projectId = process.env.GCP_PROJECT_ID;
-  const location = process.env.GCP_LOCATION || 'us';
-  const processorId = process.env.DOCUMENTAI_PROCESSOR_ID;
-
-  if (!projectId || !processorId) {
-    console.error('[ERROR] Missing GCP_PROJECT_ID or DOCUMENTAI_PROCESSOR_ID');
-    throw new Error('Missing required environment variables for Document AI');
-  }
-
-  const name = `projects/${projectId}/locations/${location}/processors/${processorId}`;
-  const client = getDocumentAIClient();
-
-  const request = {
-    name,
-    rawDocument: {
-      content: imageContent,
-      mimeType: mimeType // Dynamic MIME type
-    }
-  };
-
-  try {
-    const [result] = await client.processDocument(request);
-    const ocrText = result.document.text;
-    console.log('[DEBUG] Document AI OCR text:', ocrText);
-    return ocrText;
-  } catch (error) {
-    console.error('[ERROR] Document AI Failed:', error.message);
-    throw new Error(`Failed to process image: ${error.message}`);
-  }
+function getVisionClient() {
+  return new vision.ImageAnnotatorClient({
+    credentials: googleCredentials
+  });
 }
 
 /**
- * Handles the receipt image processing workflow:
- * 1. Processes the image via Document AI.
- * 2. Parses the OCR text using parseReceiptText.
- * 3. Logs the receipt expense using logReceiptExpense.
- *
- * @param {string} phoneNumber - The user's phone number.
- * @param {Buffer|string} imageContent - The image content.
- * @param {string} mimeType - The MIME type of the image (e.g., 'image/jpeg', 'image/png').
- * @returns {Promise<string>} The result of logging the receipt expense.
+ * Processes the provided image buffer via Document AI to return raw OCR text.
+ */
+async function processDocumentAI(imageContent, mimeType = 'image/jpeg') {
+  const projectId   = process.env.GCP_PROJECT_ID;
+  const location    = process.env.GCP_LOCATION    || 'us';
+  const processorId = process.env.DOCUMENTAI_PROCESSOR_ID;
+  const name        = `projects/${projectId}/locations/${location}/processors/${processorId}`;
+  const client      = getDocumentAIClient();
+  const request     = { name, rawDocument: { content: imageContent, mimeType } };
+  const [result]    = await client.processDocument(request);
+  return result.document.text;
+}
+
+/**
+ * Full receipt handling: OCR -> parse -> save.
  */
 async function handleReceiptImage(phoneNumber, imageContent, mimeType = 'image/jpeg') {
-  try {
-    const ocrText = await processDocumentAI(imageContent, mimeType);
-    const parsedData = parseReceiptText(ocrText);
-    if (!parsedData) {
-      throw new Error('Failed to parse receipt data');
+  // 1) OCR via Document AI
+  const ocrText = await processDocumentAI(imageContent, mimeType);
+
+  // 2) Fallback: if DAi didn't pick anything up, try Vision’s text detection
+  if (!ocrText || ocrText.trim().length < 20) {
+    const visionClient = getVisionClient();
+    const [visionResult] = await visionClient.textDetection({ image: { content: imageContent } });
+    const altText       = (visionResult.textAnnotations || [])[0]?.description || '';
+    if (altText) {
+      console.log('[DEBUG] Vision OCR fallback:', altText);
+      ocrText = altText;
     }
-    const result = await logReceiptExpense(phoneNumber, ocrText);
-    if (!result) {
-      throw new Error('Failed to log receipt expense');
-    }
-    return result;
-  } catch (error) {
-    console.error('[ERROR] Failed to process receipt image:', error.message);
-    throw new Error(`Receipt processing failed: ${error.message}`);
   }
+
+  // 3) Parse fields
+  const parsed = parseReceiptText(ocrText);
+  if (!parsed) throw new Error('Failed to parse receipt data');
+
+  // 4) Determine active job
+  const jobName = await getActiveJob(phoneNumber) || 'Uncategorized';
+
+  // 5) Persist to Postgres
+  await saveExpense({
+    ownerId:  phoneNumber,
+    date:     parsed.date,
+    item:     parsed.item,
+    amount:   parsed.amount,
+    store:    parsed.store,
+    jobName,
+    category: parsed.category,
+    user:     parsed.user || 'Unknown'
+  });
+
+  return `✅ Logged expense $${parsed.amount} for ${parsed.item}`;
 }
 
 module.exports = {

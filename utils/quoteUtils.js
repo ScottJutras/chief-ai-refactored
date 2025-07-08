@@ -1,65 +1,89 @@
-const { fetchMaterialPrices } = require('../legacy/googleSheetsnewer'); // Adjust path as needed
+// utils/quoteUtils.js
 
+const { getPricingItems } = require('../services/postgres');
+
+/**
+ * Parses a “quote for <jobName>: …” message into its components.
+ */
 function parseQuoteMessage(message) {
-    // Handles: "quote for Job 75: 10 nails plus 40%, $50 for paint" or "quote for Job 75: 100 for painting"
-    const match = message.match(/quote for\s+([^:]+)(?::\s*(.+))?/i);
-    if (!match) return null;
+  const match = message.match(/quote for\s+([^:]+)(?::\s*(.+))?/i);
+  if (!match) return null;
 
-    const jobName = match[1].trim();
-    const itemsText = match[2]?.trim() || '';
-    if (!itemsText) return { jobName, items: [], overallMarkup: 1.40 }; // Default markup if no items
+  const jobName = match[1].trim();
+  const itemsText = match[2]?.trim() || '';
+  if (!itemsText) return { jobName, items: [], overallMarkup: 1.40 };
 
-    const overallMarkupMatch = itemsText.match(/plus\s+(\d+)%$/i);
-    const overallMarkup = overallMarkupMatch ? (1 + parseInt(overallMarkupMatch[1]) / 100) : 1.40;
-    const itemsTextWithoutMarkup = overallMarkupMatch ? itemsText.replace(overallMarkupMatch[0], '').trim() : itemsText;
+  // detect an overall markup at the end
+  const overallMarkupMatch = itemsText.match(/plus\s+(\d+)%$/i);
+  const overallMarkup = overallMarkupMatch
+    ? 1 + parseInt(overallMarkupMatch[1], 10) / 100
+    : 1.40;
+  const rawList = overallMarkupMatch
+    ? itemsText.replace(overallMarkupMatch[0], '').trim()
+    : itemsText;
 
-    const itemList = itemsTextWithoutMarkup.split(',').map(item => item.trim());
-    const items = [];
-    for (const itemEntry of itemList) {
-        const customMatch = itemEntry.match(/\$(\d+(?:\.\d{1,2})?)\s+for\s+(.+)/i);
-        if (customMatch) {
-            items.push({ quantity: 1, item: customMatch[2].trim(), price: parseFloat(customMatch[1]) });
-        } else {
-            const match = itemEntry.match(/(\d+)\s+(.+?)(?:\s+plus\s+(\d+)%|$)/i);
-            if (match) {
-                const quantity = parseInt(match[1], 10);
-                const item = match[2].trim();
-                const itemMarkup = match[3] ? (1 + parseInt(match[3]) / 100) : overallMarkup;
-                items.push({ quantity, item, markup: itemMarkup });
-            }
-        }
-    }
-    return { jobName, items, overallMarkup };
+  const items = rawList
+    .split(',')
+    .map(entry => entry.trim())
+    .map(entry => {
+      // custom‐price item: “$50 for paint”
+      let m = entry.match(/^\$(\d+(?:\.\d{1,2})?)\s+for\s+(.+)$/i);
+      if (m) {
+        return { quantity: 1, item: m[2].trim(), price: parseFloat(m[1]) };
+      }
+      // quantity + optional per‐item markup
+      m = entry.match(/^(\d+)\s+(.+?)(?:\s+plus\s+(\d+)%|)$/i);
+      if (m) {
+        return {
+          quantity: parseInt(m[1], 10),
+          item: m[2].trim(),
+          markup: m[3] ? 1 + parseInt(m[3], 10) / 100 : overallMarkup
+        };
+      }
+      return null;
+    })
+    .filter(x => x);
+
+  return { jobName, items, overallMarkup };
 }
 
-async function buildQuoteDetails(parsedQuote, ownerProfile) {
-    const pricingSpreadsheetId = process.env.PRICING_SPREADSHEET_ID;
-    if (!pricingSpreadsheetId) throw new Error('Pricing spreadsheet not configured');
-    const priceMap = await fetchMaterialPrices(pricingSpreadsheetId);
-    const quoteItems = [];
-    let total = 0;
-    const missingItems = [];
+/**
+ * Loads user‐specific pricing from Postgres and calculates:
+ *  - per‐item line totals
+ *  - overall quote total
+ *  - any missing items
+ */
+async function buildQuoteDetails(parsedQuote, ownerId) {
+  // 1) get this user’s pricing table
+  const pricing = await getPricingItems(ownerId);
+  const priceMap = Object.fromEntries(
+    pricing.map(p => [p.item_name.toLowerCase(), p.unit_cost])
+  );
 
-    parsedQuote.items.forEach(({ quantity, item, price, markup }) => {
-        if (price !== undefined) {
-            // Fixed price item (e.g., "$50 for paint")
-            total += price * quantity;
-            quoteItems.push({ item, quantity, price });
-        } else {
-            // Item with markup (e.g., "10 nails plus 40%")
-            const normalizedItem = item.toLowerCase().replace(/\s+/g, ' ').trim();
-            const basePrice = priceMap[normalizedItem] || 0;
-            if (basePrice > 0) {
-                const markedUpPrice = basePrice * (markup || parsedQuote.overallMarkup);
-                total += markedUpPrice * quantity;
-                quoteItems.push({ item, quantity, price: markedUpPrice });
-            } else {
-                missingItems.push(item);
-            }
-        }
-    });
+  const quoteItems = [];
+  let total = 0;
+  const missingItems = [];
 
-    return { items: quoteItems, total, missingItems };
+  for (const { quantity, item, price, markup } of parsedQuote.items) {
+    if (price !== undefined) {
+      // fixed‐price line
+      quoteItems.push({ item, quantity, price });
+      total += price * quantity;
+    } else {
+      // lookup base cost and apply markup
+      const key = item.toLowerCase().trim();
+      const base = priceMap[key];
+      if (base != null) {
+        const perUnit = base * (markup || parsedQuote.overallMarkup);
+        quoteItems.push({ item, quantity, price: perUnit });
+        total += perUnit * quantity;
+      } else {
+        missingItems.push(item);
+      }
+    }
+  }
+
+  return { items: quoteItems, total, missingItems };
 }
 
 module.exports = { parseQuoteMessage, buildQuoteDetails };

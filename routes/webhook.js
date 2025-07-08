@@ -1,14 +1,6 @@
 // routes/webhook.js
 
 const express = require('express');
-const { handleCommands  } = require('../handlers/commands');
-const { handleMedia     } = require('../handlers/media');
-const { handleOnboarding} = require('../handlers/onboarding');
-const { handleTimeclock } = require('../handlers/timeClock');
-const { lockMiddleware, releaseLock } = require('./middleware/lock');
-const { userProfileMiddleware } = require('./middleware/userProfile');
-const { tokenMiddleware } = require('./middleware/token');
-const { errorMiddleware } = require('./middleware/error');
 const { handleCommands } = require('../handlers/commands');
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
@@ -17,8 +9,6 @@ const { lockMiddleware, releaseLock } = require('../middleware/lock');
 const { userProfileMiddleware } = require('../middleware/userProfile');
 const { tokenMiddleware } = require('../middleware/token');
 const { errorMiddleware } = require('../middleware/error');
-
-
 const router = express.Router();
 
 // 1️⃣ Respond to GET so browsers (or health checks) don’t 404

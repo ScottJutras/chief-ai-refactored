@@ -13,7 +13,7 @@ async function initFFmpeg() {
   if (ffmpegLoaded) return ffmpeg;
   const { createFFmpeg, fetchFile } = await import('@ffmpeg/ffmpeg');
   ffmpeg = createFFmpeg({ log: true });
-  // writeFile/readFile helpers need fetchFile
+  // attach fetchFile helper so we can load from a Buffer/URL
   ffmpeg.fetchFile = fetchFile;
   await ffmpeg.load();
   ffmpegLoaded = true;
@@ -30,7 +30,7 @@ async function transcribeAudio(audioBuffer) {
   try {
     const ff = await initFFmpeg();
     console.log('[DEBUG] Converting OGG_OPUS to WAV…');
-    // write the incoming buffer into FFmpeg FS
+    // write the incoming buffer into FFmpeg’s FS
     ff.FS('writeFile', 'input.ogg', audioBuffer);
     // convert to 16k WAV
     await ff.run(

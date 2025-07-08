@@ -1,7 +1,10 @@
-const { getPricingItems } = require('../services/postgres');
-const { pdfKitQuote } = require('./pdfService');
-const pricing = await getPricingItems(ownerId);
+// utils/quoteUtils.js
 
+const { getPricingItems } = require('../services/postgres');
+
+/**
+ * Parses a “quote for <jobName>: …” message into its components.
+ */
 function parseQuoteMessage(message) {
   const match = message.match(/quote for\s+([^:]+)(?::\s*(.+))?/i);
   if (!match) return null;
@@ -10,45 +13,51 @@ function parseQuoteMessage(message) {
   const itemsText = match[2]?.trim() || '';
   if (!itemsText) return { jobName, items: [], overallMarkup: 1.40 };
 
+  // detect an overall markup at the end
   const overallMarkupMatch = itemsText.match(/plus\s+(\d+)%$/i);
   const overallMarkup = overallMarkupMatch
-    ? (1 + parseInt(overallMarkupMatch[1], 10) / 100)
+    ? 1 + parseInt(overallMarkupMatch[1], 10) / 100
     : 1.40;
-  const textNoMarkup = overallMarkupMatch
+  const rawList = overallMarkupMatch
     ? itemsText.replace(overallMarkupMatch[0], '').trim()
     : itemsText;
 
-  const entries = textNoMarkup.split(',').map(s => s.trim());
-  const items = [];
-
-  for (const entry of entries) {
-    const custom = entry.match(/\$(\d+(?:\.\d{1,2})?)\s+for\s+(.+)/i);
-    if (custom) {
-      items.push({ quantity: 1, item: custom[2].trim(), price: parseFloat(custom[1]) });
-    } else {
-      const m = entry.match(/(\d+)\s+(.+?)(?:\s+plus\s+(\d+)%|$)/i);
+  const items = rawList
+    .split(',')
+    .map(entry => entry.trim())
+    .map(entry => {
+      // custom‐price item: “$50 for paint”
+      let m = entry.match(/^\$(\d+(?:\.\d{1,2})?)\s+for\s+(.+)$/i);
       if (m) {
-        const quantity = parseInt(m[1], 10);
-        const item = m[2].trim();
-        const markup = m[3] ? (1 + parseInt(m[3], 10) / 100) : overallMarkup;
-        items.push({ quantity, item, markup });
+        return { quantity: 1, item: m[2].trim(), price: parseFloat(m[1]) };
       }
-    }
-  }
+      // quantity + optional per‐item markup
+      m = entry.match(/^(\d+)\s+(.+?)(?:\s+plus\s+(\d+)%|)$/i);
+      if (m) {
+        return {
+          quantity: parseInt(m[1], 10),
+          item: m[2].trim(),
+          markup: m[3] ? 1 + parseInt(m[3], 10) / 100 : overallMarkup
+        };
+      }
+      return null;
+    })
+    .filter(x => x);
 
   return { jobName, items, overallMarkup };
 }
 
 /**
- * Builds quote pricing using user-specific pricing items from Postgres.
- * @param {Object} parsedQuote - result of parseQuoteMessage()
- * @param {string} ownerId - user id to fetch pricing
+ * Loads user‐specific pricing from Postgres and calculates:
+ *  - per‐item line totals
+ *  - overall quote total
+ *  - any missing items
  */
 async function buildQuoteDetails(parsedQuote, ownerId) {
-  // load dynamic pricing
+  // 1) get this user’s pricing table
   const pricing = await getPricingItems(ownerId);
   const priceMap = Object.fromEntries(
-    pricing.map(({ item_name, unit_cost }) => [item_name.toLowerCase(), unit_cost])
+    pricing.map(p => [p.item_name.toLowerCase(), p.unit_cost])
   );
 
   const quoteItems = [];
@@ -57,15 +66,17 @@ async function buildQuoteDetails(parsedQuote, ownerId) {
 
   for (const { quantity, item, price, markup } of parsedQuote.items) {
     if (price !== undefined) {
-      total += price * quantity;
+      // fixed‐price line
       quoteItems.push({ item, quantity, price });
+      total += price * quantity;
     } else {
-      const key = item.toLowerCase().replace(/\s+/g, ' ').trim();
+      // lookup base cost and apply markup
+      const key = item.toLowerCase().trim();
       const base = priceMap[key];
       if (base != null) {
-        const unitPrice = base * (markup || parsedQuote.overallMarkup);
-        total += unitPrice * quantity;
-        quoteItems.push({ item, quantity, price: unitPrice });
+        const perUnit = base * (markup || parsedQuote.overallMarkup);
+        quoteItems.push({ item, quantity, price: perUnit });
+        total += perUnit * quantity;
       } else {
         missingItems.push(item);
       }

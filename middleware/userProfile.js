@@ -1,6 +1,6 @@
 // middleware/userProfile.js
 
-const { db } = require('../../services/firebase')
+const { db } = require('../services/firebase')
 
 /**
  * Loads the current user's Firestore document (based on their phone),

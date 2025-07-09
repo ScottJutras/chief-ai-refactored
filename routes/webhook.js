@@ -1,14 +1,14 @@
 // routes/webhook.js
 
 const express = require('express');
-const { handleCommands } = require('./handlers/commands');
-const { handleMedia } = require('./handlers/media');
-const { handleOnboarding } = require('./handlers/onboarding');
-const { handleTimeclock } = require('./handlers/timeclock');
-const { lockMiddleware, releaseLock } = require('./middleware/lock');
-const { userProfileMiddleware } = require('./middleware/userProfile');
-const { tokenMiddleware } = require('./middleware/token');
-const { errorMiddleware } = require('./middleware/error');
+const { handleCommands } = require('../handlers/commands');
+const { handleMedia } = require('../handlers/media');
+const { handleOnboarding } = require('../handlers/onboarding');
+const { handleTimeclock } = require('../handlers/timeclock');
+const { lockMiddleware, releaseLock } = require('../middleware/lock');
+const { userProfileMiddleware } = require('../middleware/userProfile');
+const { tokenMiddleware } = require('../middleware/token');
+const { errorMiddleware } = require('../middleware/error');
 
 const router = express.Router();
 
@@ -45,22 +45,20 @@ router.post(
         return await handleOnboarding(from, input, userProfile, ownerId, res);
       }
 
-      // media (receipt, quote image, etc)
+      // media handling (e.g., receipt images)
       if (mediaUrl && mediaType) {
         return await handleMedia(from, mediaUrl, mediaType, userProfile, ownerId, ownerProfile, isOwner, res);
       }
 
-      // timeclock commands
+      // timeclock commands (punch, break, etc.)
       if (
-        input.toLowerCase().includes('punch') ||
-        input.toLowerCase().includes('lunch') ||
-        input.toLowerCase().includes('drive') ||
-        input.toLowerCase().includes('hours')
+        ['punch', 'break', 'lunch', 'drive', 'hours']
+          .some(cmd => input.toLowerCase().includes(cmd))
       ) {
         return await handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
       }
 
-      // everything else → command handler
+      // default: command handler
       return await handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${from}:`, error);

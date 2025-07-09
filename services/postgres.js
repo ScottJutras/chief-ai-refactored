@@ -2,6 +2,7 @@
 const { Pool } = require('pg');
 const ExcelJS = require('exceljs');
 const crypto = require('crypto');
+console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
 
 // Initialize Postgres connection
 const pool = new Pool({

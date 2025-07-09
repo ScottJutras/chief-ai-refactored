@@ -1,27 +1,24 @@
-
-// services/postgres.js
 const { Pool } = require('pg');
-const ExcelJS = require('exceljs');
-const crypto = require('crypto');
-console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
+console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
+
 // --- Transaction logging ---
 async function appendToUserSpreadsheet(ownerId, data) {
   console.log('[DEBUG] appendToUserSpreadsheet called:', { ownerId, data });
   try {
-    const [date, description, amount, source, job, type, category, mediaUrl, userName] = data;
+    const [date, item, amount, store, jobName, type, category, mediaUrl, userName] = data;
     const query = `
       INSERT INTO transactions
-        (owner_id, date, description, amount, source, job, type, category, media_url, user_name)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+        (owner_id, date, item, amount, store, job_name, type, category, media_url, user_name, created_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
       RETURNING id`;
     const result = await pool.query(query, [
-      ownerId, date, description, amount, source, job, type, category, mediaUrl || null, userName
+      ownerId, date, item, parseFloat(amount), store, jobName, type, category, mediaUrl || null, userName
     ]);
     console.log('[DEBUG] appendToUserSpreadsheet success:', { id: result.rows[0].id });
     return result.rows[0].id;
@@ -31,18 +28,71 @@ async function appendToUserSpreadsheet(ownerId, data) {
   }
 }
 
+async function saveExpense({ ownerId, date, item, amount, store, jobName, category, user }) {
+  console.log('[DEBUG] saveExpense called for ownerId:', ownerId);
+  try {
+    await pool.query(
+      `INSERT INTO transactions (owner_id, type, date, item, amount, store, job_name, category, user_name, created_at)
+       VALUES ($1, 'expense', $2, $3, $4, $5, $6, $7, $8, NOW())`,
+      [ownerId, date, item, parseFloat(amount.replace('$', '')), store, jobName, category, user]
+    );
+    console.log('[DEBUG] saveExpense success for', ownerId);
+  } catch (error) {
+    console.error('[ERROR] saveExpense failed for', ownerId, ':', error.message);
+    throw error;
+  }
+}
+
+async function deleteExpense(ownerId, criteria) {
+  console.log('[DEBUG] deleteExpense called for ownerId:', ownerId, ', criteria:', criteria);
+  try {
+    const res = await pool.query(
+      `DELETE FROM transactions
+       WHERE owner_id = $1 AND type = 'expense' AND item = $2 AND amount = $3 AND store = $4
+       RETURNING *`,
+      [ownerId, criteria.item, parseFloat(criteria.amount.replace('$', '')), criteria.store]
+    );
+    console.log('[DEBUG] deleteExpense result:', res.rows[0]);
+    return res.rows.length > 0;
+  } catch (error) {
+    console.error('[ERROR] deleteExpense failed for', ownerId, ':', error.message);
+    return false;
+  }
+}
+
 // --- Job management ---
 async function getActiveJob(ownerId) {
   console.log('[DEBUG] getActiveJob called:', { ownerId });
   try {
     const res = await pool.query(
-      `SELECT job_name FROM jobs WHERE owner_id=$1 AND active=true LIMIT 1`,
+      `SELECT active_job FROM users WHERE user_id = $1`,
       [ownerId]
     );
-    console.log('[DEBUG] getActiveJob result:', res.rows[0]?.job_name || 'Uncategorized');
-    return res.rows[0]?.job_name || 'Uncategorized';
+    console.log('[DEBUG] getActiveJob result:', res.rows[0]?.active_job || 'Uncategorized');
+    return res.rows[0]?.active_job || 'Uncategorized';
   } catch (error) {
     console.error('[ERROR] getActiveJob failed:', error.message);
+    return 'Uncategorized';
+  }
+}
+
+async function saveJob(ownerId, jobName, startTime) {
+  console.log('[DEBUG] saveJob called:', { ownerId, jobName });
+  try {
+    await pool.query(
+      `INSERT INTO jobs (owner_id, job_name, start_time, status, created_at)
+       VALUES ($1, $2, $3, 'active', NOW())`,
+      [ownerId, jobName, startTime]
+    );
+    await pool.query(
+      `UPDATE users
+       SET active_job = $1, job_history = COALESCE(job_history, '[]'::jsonb) || $2::jsonb
+       WHERE user_id = $3`,
+      [jobName, JSON.stringify([{ jobName, startTime, status: 'active' }]), ownerId]
+    );
+    console.log('[DEBUG] saveJob success');
+  } catch (error) {
+    console.error('[ERROR] saveJob failed:', error.message);
     throw error;
   }
 }
@@ -50,10 +100,12 @@ async function getActiveJob(ownerId) {
 async function setActiveJob(ownerId, jobName) {
   console.log('[DEBUG] setActiveJob called:', { ownerId, jobName });
   try {
-    await pool.query(`UPDATE jobs SET active=false WHERE owner_id=$1`, [ownerId]);
     await pool.query(
-      `INSERT INTO jobs (owner_id, job_name, active, start_date)
-       VALUES ($1,$2,true,NOW())`,
+      `UPDATE users SET active_job = $1, updated_at = NOW() WHERE user_id = $2`,
+      [jobName, ownerId]
+    );
+    await pool.query(
+      `UPDATE jobs SET status = 'active', start_time = NOW() WHERE owner_id = $1 AND job_name = $2`,
       [ownerId, jobName]
     );
     console.log('[DEBUG] setActiveJob success');
@@ -68,9 +120,19 @@ async function finishJob(ownerId, jobName) {
   try {
     await pool.query(
       `UPDATE jobs
-       SET active=false, end_date=NOW()
-       WHERE owner_id=$1 AND job_name=$2`,
+       SET status = 'finished', updated_at = NOW()
+       WHERE owner_id = $1 AND job_name = $2`,
       [ownerId, jobName]
+    );
+    await pool.query(
+      `UPDATE users
+       SET active_job = NULL,
+           job_history = jsonb_set(
+             COALESCE(job_history, '[]'::jsonb),
+             ARRAY[(SELECT i FROM generate_series(0, jsonb_array_length(COALESCE(job_history, '[]'::jsonb)) - 1) i WHERE (job_history->i->>'jobName') = $1 LIMIT 1)::text, 'status']::text[],
+             '"finished"')
+       WHERE user_id = $2`,
+      [jobName, ownerId]
     );
     console.log('[DEBUG] finishJob success');
   } catch (error) {
@@ -83,8 +145,8 @@ async function createJob(ownerId, jobName) {
   console.log('[DEBUG] createJob called:', { ownerId, jobName });
   try {
     await pool.query(
-      `INSERT INTO jobs (owner_id, job_name, created_at, active)
-       VALUES ($1,$2,NOW(),false)`,
+      `INSERT INTO jobs (owner_id, job_name, status, created_at)
+       VALUES ($1, $2, 'created', NOW())`,
       [ownerId, jobName]
     );
     console.log('[DEBUG] createJob success');
@@ -98,8 +160,8 @@ async function pauseJob(ownerId, jobName) {
   console.log('[DEBUG] pauseJob called:', { ownerId, jobName });
   try {
     await pool.query(
-      `UPDATE jobs SET paused_at=NOW()
-       WHERE owner_id=$1 AND job_name=$2 AND active=true`,
+      `UPDATE jobs SET status = 'paused', updated_at = NOW()
+       WHERE owner_id = $1 AND job_name = $2`,
       [ownerId, jobName]
     );
     console.log('[DEBUG] pauseJob success');
@@ -113,8 +175,8 @@ async function resumeJob(ownerId, jobName) {
   console.log('[DEBUG] resumeJob called:', { ownerId, jobName });
   try {
     await pool.query(
-      `UPDATE jobs SET paused_at=NULL
-       WHERE owner_id=$1 AND job_name=$2 AND active=true`,
+      `UPDATE jobs SET status = 'active', updated_at = NOW()
+       WHERE owner_id = $1 AND job_name = $2`,
       [ownerId, jobName]
     );
     console.log('[DEBUG] resumeJob success');
@@ -128,52 +190,54 @@ async function summarizeJob(ownerId, jobName) {
   console.log('[DEBUG] summarizeJob called:', { ownerId, jobName });
   try {
     const jobRes = await pool.query(
-      `SELECT start_date, end_date FROM jobs
-       WHERE owner_id=$1 AND job_name=$2 LIMIT 1`,
+      `SELECT start_time FROM jobs
+       WHERE owner_id = $1 AND job_name = $2 LIMIT 1`,
       [ownerId, jobName]
     );
-    const { start_date, end_date } = jobRes.rows[0] || {};
-    const start = start_date || new Date();
-    const end = end_date || new Date();
-    const durationDays = Math.ceil((new Date(end) - new Date(start)) / (1000*60*60*24));
+    const startTime = jobRes.rows[0]?.start_time ? new Date(jobRes.rows[0].start_time) : new Date();
+    const durationDays = ((new Date() - startTime) / (1000 * 60 * 60 * 24)).toFixed(2);
 
-    const expRes = await pool.query(
-      `SELECT COALESCE(SUM(amount::numeric),0) AS total_expenses
-       FROM transactions
-       WHERE owner_id=$1 AND job=$2 AND type='expense'`,
+    const transRes = await pool.query(
+      `SELECT type, amount FROM transactions
+       WHERE owner_id = $1 AND job_name = $2`,
       [ownerId, jobName]
     );
-    const revRes = await pool.query(
-      `SELECT COALESCE(SUM(amount::numeric),0) AS total_revenue
-       FROM transactions
-       WHERE owner_id=$1 AND job=$2 AND type='revenue'`,
-      [ownerId, jobName]
-    );
-    const materialCost = parseFloat(expRes.rows[0].total_expenses);
-    const revenue = parseFloat(revRes.rows[0].total_revenue);
-    const profit = revenue - materialCost;
-    const profitMargin = revenue > 0 ? profit / revenue : 0;
+    const materialCost = transRes.rows
+      .filter(row => row.type === 'expense' || row.type === 'bill')
+      .reduce((sum, row) => sum + parseFloat(row.amount || 0), 0);
+    const revenue = transRes.rows
+      .filter(row => row.type === 'revenue')
+      .reduce((sum, row) => sum + parseFloat(row.amount || 0), 0);
 
-    const rateRes = await pool.query(
-      `SELECT unit_cost FROM pricing_items
-       WHERE owner_id=$1 AND category='labour' LIMIT 1`,
-      [ownerId]
-    );
-    const labourRate = parseFloat(rateRes.rows[0]?.unit_cost) || 0;
     const timeRes = await pool.query(
-      `SELECT COALESCE(
-         SUM(
-           EXTRACT(EPOCH FROM (LEAD(timestamp) OVER (ORDER BY timestamp) - timestamp))/3600
-         ),0) AS hours
-       FROM time_entries
-       WHERE owner_id=$1 AND job=$2`,
+      `SELECT type, timestamp FROM time_entries
+       WHERE owner_id = $1 AND job_name = $2`,
       [ownerId, jobName]
     );
-    const labourHours = parseFloat(timeRes.rows[0].hours);
-    const labourCost = labourHours * labourRate;
+    let labourHours = 0;
+    let lastPunchIn = null;
+    timeRes.rows.forEach(row => {
+      if (row.type === 'punch_in') {
+        lastPunchIn = new Date(row.timestamp);
+      } else if (row.type === 'punch_out' && lastPunchIn) {
+        labourHours += (new Date(row.timestamp) - lastPunchIn) / (1000 * 60 * 60);
+        lastPunchIn = null;
+      }
+    });
+    const labourCost = labourHours * 50; // Assume $50/hour
+    const profit = revenue - (materialCost + labourCost);
+    const profitMargin = revenue ? profit / revenue : 0;
 
     console.log('[DEBUG] summarizeJob result:', { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin });
-    return { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin };
+    return {
+      durationDays,
+      labourHours: labourHours.toFixed(2),
+      labourCost: labourCost.toFixed(2),
+      materialCost: materialCost.toFixed(2),
+      revenue: revenue.toFixed(2),
+      profit: profit.toFixed(2),
+      profitMargin
+    };
   } catch (error) {
     console.error('[ERROR] summarizeJob failed:', error.message);
     throw error;
@@ -186,8 +250,8 @@ async function addPricingItem(ownerId, itemName, unitCost, unit = 'each', catego
   try {
     const res = await pool.query(
       `INSERT INTO pricing_items
-        (owner_id, item_name, unit_cost, unit, category, created_at)
-       VALUES ($1,$2,$3,$4,$5,NOW())
+        (owner_id, item_name, price, unit, category, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
        RETURNING *`,
       [ownerId, itemName, unitCost, unit, category]
     );
@@ -203,9 +267,9 @@ async function getPricingItems(ownerId) {
   console.log('[DEBUG] getPricingItems called:', { ownerId });
   try {
     const res = await pool.query(
-      `SELECT item_name, unit_cost, unit, category
+      `SELECT item_name, price, unit, category
        FROM pricing_items
-       WHERE owner_id=$1`,
+       WHERE owner_id = $1`,
       [ownerId]
     );
     console.log('[DEBUG] getPricingItems result:', res.rows);
@@ -221,8 +285,8 @@ async function updatePricingItem(ownerId, itemName, unitCost) {
   try {
     const res = await pool.query(
       `UPDATE pricing_items
-       SET unit_cost=$1
-       WHERE owner_id=$2 AND item_name=$3
+       SET price = $1
+       WHERE owner_id = $2 AND item_name = $3
        RETURNING *`,
       [unitCost, ownerId, itemName]
     );
@@ -239,7 +303,7 @@ async function deletePricingItem(ownerId, itemName) {
   try {
     await pool.query(
       `DELETE FROM pricing_items
-       WHERE owner_id=$1 AND item_name=$2`,
+       WHERE owner_id = $1 AND item_name = $2`,
       [ownerId, itemName]
     );
     console.log('[DEBUG] deletePricingItem success');
@@ -254,10 +318,10 @@ async function deletePricingItem(ownerId, itemName) {
 async function createUserProfile({ phone, ownerId, onboarding_in_progress }) {
   console.log('[DEBUG] createUserProfile called:', { phone, ownerId, onboarding_in_progress });
   try {
-    const dashboardToken = crypto.randomBytes(16).toString('hex');
+    const dashboardToken = require('crypto').randomBytes(16).toString('hex');
     const res = await pool.query(
-      `INSERT INTO users (user_id, owner_id, onboarding_in_progress, dashboard_token)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO users (user_id, owner_id, onboarding_in_progress, dashboard_token, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
        RETURNING *`,
       [phone, ownerId, onboarding_in_progress, dashboardToken]
     );
@@ -272,46 +336,26 @@ async function createUserProfile({ phone, ownerId, onboarding_in_progress }) {
 async function saveUserProfile(userProfile) {
   console.log('[DEBUG] saveUserProfile called:', { user_id: userProfile.user_id });
   try {
-    const {
-      user_id, name, country, province,
-      business_country, business_province, email,
-      spreadsheetId, onboarding_in_progress,
-      onboarding_completed, subscription_tier,
-      trial_start, trial_end, token_usage,
-      dashboard_token
-    } = userProfile;
+    const { user_id, name, country, province, email, onboarding_in_progress, onboarding_completed, subscription_tier, trial_start, trial_end, token_usage, dashboard_token, industry } = userProfile;
     await pool.query(
       `INSERT INTO users
-        (user_id, name, country, province,
-         business_country, business_province, email,
-         spreadsheet_id, onboarding_in_progress,
-         onboarding_completed, subscription_tier,
-         trial_start, trial_end, token_usage,
-         dashboard_token)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+        (user_id, name, country, province, email, onboarding_in_progress, onboarding_completed, subscription_tier, trial_start, trial_end, token_usage, dashboard_token, industry, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
        ON CONFLICT (user_id) DO UPDATE SET
-         name=EXCLUDED.name,
-         country=EXCLUDED.country,
-         province=EXCLUDED.province,
-         business_country=EXCLUDED.business_country,
-         business_province=EXCLUDED.business_province,
-         email=EXCLUDED.email,
-         spreadsheet_id=EXCLUDED.spreadsheet_id,
-         onboarding_in_progress=EXCLUDED.onboarding_in_progress,
-         onboarding_completed=EXCLUDED.onboarding_completed,
-         subscription_tier=EXCLUDED.subscription_tier,
-         trial_start=EXCLUDED.trial_start,
-         trial_end=EXCLUDED.trial_end,
-         token_usage=EXCLUDED.token_usage,
-         dashboard_token=EXCLUDED.dashboard_token`,
-      [
-        user_id, name, country, province,
-        business_country, business_province, email,
-        spreadsheetId, onboarding_in_progress,
-        onboarding_completed, subscription_tier,
-        trial_start, trial_end, token_usage,
-        dashboard_token
-      ]
+         name = COALESCE(EXCLUDED.name, users.name),
+         country = COALESCE(EXCLUDED.country, users.country),
+         province = COALESCE(EXCLUDED.province, users.province),
+         email = COALESCE(EXCLUDED.email, users.email),
+         onboarding_in_progress = COALESCE(EXCLUDED.onboarding_in_progress, users.onboarding_in_progress),
+         onboarding_completed = COALESCE(EXCLUDED.onboarding_completed, users.onboarding_completed),
+         subscription_tier = COALESCE(EXCLUDED.subscription_tier, users.subscription_tier),
+         trial_start = COALESCE(EXCLUDED.trial_start, users.trial_start),
+         trial_end = COALESCE(EXCLUDED.trial_end, users.trial_end),
+         token_usage = COALESCE(EXCLUDED.token_usage, users.token_usage),
+         dashboard_token = COALESCE(EXCLUDED.dashboard_token, users.dashboard_token),
+         industry = COALESCE(EXCLUDED.industry, users.industry),
+         updated_at = NOW()`,
+      [user_id, name, country, province, email, onboarding_in_progress, onboarding_completed, subscription_tier, trial_start, trial_end, token_usage, dashboard_token, industry]
     );
     console.log('[DEBUG] saveUserProfile success');
   } catch (error) {
@@ -321,9 +365,9 @@ async function saveUserProfile(userProfile) {
 }
 
 async function getUserProfile(userId) {
-  console.log('[DEBUG] getUserProfile called:', { userId, timestamp: new Date().toISOString() });
+  console.log('[DEBUG] getUserProfile called:', { userId });
   try {
-    const res = await pool.query('SELECT * FROM users WHERE user_id=$1', [userId]);
+    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
     console.log('[DEBUG] getUserProfile result:', res.rows[0] || 'No user found');
     return res.rows[0] || null;
   } catch (error) {
@@ -335,7 +379,7 @@ async function getUserProfile(userId) {
 async function getOwnerProfile(ownerId) {
   console.log('[DEBUG] getOwnerProfile called:', { ownerId });
   try {
-    const res = await pool.query('SELECT * FROM users WHERE owner_id=$1', [ownerId]);
+    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [ownerId]);
     console.log('[DEBUG] getOwnerProfile result:', res.rows[0] || 'No owner found');
     return res.rows[0] || { ownerId };
   } catch (error) {
@@ -349,6 +393,7 @@ async function parseFinancialFile(fileBuffer, fileType) {
   console.log('[DEBUG] parseFinancialFile called:', { fileType });
   try {
     let data = [];
+    const ExcelJS = require('exceljs');
     if (fileType === 'text/csv') {
       const csvText = fileBuffer.toString('utf-8');
       data = require('papaparse').parse(csvText, { header: true, skipEmptyLines: true }).data;
@@ -369,8 +414,8 @@ async function parseFinancialFile(fileBuffer, fileType) {
     const result = data.map(r => ({
       date: r.Date || r.date || new Date().toISOString().split('T')[0],
       amount: parseFloat(r.Amount || r.amount || 0).toFixed(2),
-      description: r.Description || r.description || r.Item || "Unknown",
-      source: r.Source || r.source || r.Store || "Unknown",
+      item: r.Description || r.description || r.Item || 'Unknown',
+      store: r.Source || r.source || r.Store || 'Unknown',
       type: parseFloat(r.Amount || r.amount) >= 0 ? 'revenue' : 'expense'
     }));
     console.log('[DEBUG] parseFinancialFile result:', result);
@@ -386,7 +431,7 @@ async function parseReceiptText(text) {
   try {
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
     const amt = lines.find(l => l.match(/\$?\d+\.\d{2}/));
-    const amount = amt ? amt.match(/\$(\d+\.\d{2})/)?.[1] || '0.00' : '0.00';
+    const amount = amt ? amt.match(/\$?(\d+\.\d{2})/)?.[1] || '0.00' : '0.00';
     const store = lines.find(l => !l.match(/\$?\d+\.\d{2}/)) || 'Unknown';
     const result = { date: new Date().toISOString().split('T')[0], item: store, amount: `$${amount}`, store };
     console.log('[DEBUG] parseReceiptText result:', result);
@@ -404,7 +449,7 @@ async function generateOTP(userId) {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
     await pool.query(
-      `UPDATE users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
+      `UPDATE users SET otp = $1, otp_expiry = $2 WHERE user_id = $3`,
       [otp, expiry, userId]
     );
     console.log('[DEBUG] generateOTP success:', { otp });
@@ -419,7 +464,7 @@ async function verifyOTP(userId, otp) {
   console.log('[DEBUG] verifyOTP called:', { userId, otp });
   try {
     const res = await pool.query(
-      `SELECT otp, otp_expiry FROM users WHERE user_id=$1`,
+      `SELECT otp, otp_expiry FROM users WHERE user_id = $1`,
       [userId]
     );
     const user = res.rows[0];
@@ -428,7 +473,7 @@ async function verifyOTP(userId, otp) {
       return false;
     }
     await pool.query(
-      `UPDATE users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`,
+      `UPDATE users SET otp = NULL, otp_expiry = NULL WHERE user_id = $1`,
       [userId]
     );
     console.log('[DEBUG] verifyOTP success');
@@ -440,15 +485,16 @@ async function verifyOTP(userId, otp) {
 }
 
 // --- Time Entries ---
-async function logTimeEntry(ownerId, employeeName, type, timestamp, job = null) {
-  console.log('[DEBUG] logTimeEntry called:', { ownerId, employeeName, type, timestamp, job });
+async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = null) {
+  console.log('[DEBUG] logTimeEntry called:', { ownerId, employeeName, type, timestamp, jobName });
   try {
-    const q = `
-      INSERT INTO time_entries
-        (owner_id, employee_name, type, timestamp, job)
-      VALUES ($1,$2,$3,$4,$5)
-      RETURNING id`;
-    const res = await pool.query(q, [ownerId, employeeName, type, timestamp, job]);
+    const res = await pool.query(
+      `INSERT INTO time_entries
+        (owner_id, employee_name, type, timestamp, job_name, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING id`,
+      [ownerId, employeeName, type, timestamp, jobName]
+    );
     console.log('[DEBUG] logTimeEntry success:', { id: res.rows[0].id });
     return res.rows[0].id;
   } catch (error) {
@@ -460,14 +506,24 @@ async function logTimeEntry(ownerId, employeeName, type, timestamp, job = null) 
 async function getTimeEntries(ownerId, employeeName, period = 'week', date = new Date()) {
   console.log('[DEBUG] getTimeEntries called:', { ownerId, employeeName, period, date });
   try {
-    let filter;
-    if (period === 'day') filter = `DATE(timestamp) = $2`;
-    else if (period === 'week') filter = `DATE(timestamp) BETWEEN $2 AND $2 + INTERVAL '6 days'`;
-    else if (period === 'month') filter = `EXTRACT(MONTH FROM timestamp)=EXTRACT(MONTH FROM $2) AND EXTRACT(YEAR FROM timestamp)=EXTRACT(YEAR FROM $2)`;
-    else throw new Error('Invalid period');
-
-    const q = `SELECT * FROM time_entries WHERE owner_id=$1 AND employee_name=$3 AND ${filter} ORDER BY timestamp`;
-    const res = await pool.query(q, [ownerId, date, employeeName]);
+    let sql = `SELECT type, timestamp, job_name FROM time_entries WHERE owner_id = $1 AND employee_name = $2`;
+    const params = [ownerId, employeeName];
+    if (period) {
+      const now = new Date(date);
+      let endDate;
+      if (period === 'day') {
+        endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+      } else if (period === 'week') {
+        endDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 7);
+      } else if (period === 'month') {
+        endDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+      } else {
+        throw new Error('Invalid period');
+      }
+      sql += ` AND timestamp >= $3 AND timestamp <= $4 ORDER BY timestamp`;
+      params.push(now.toISOString(), endDate.toISOString());
+    }
+    const res = await pool.query(sql, params);
     console.log('[DEBUG] getTimeEntries result:', res.rows);
     return res.rows;
   } catch (error) {
@@ -480,18 +536,31 @@ async function generateTimesheet(ownerId, employeeName, period, date) {
   console.log('[DEBUG] generateTimesheet called:', { ownerId, employeeName, period, date });
   try {
     const entries = await getTimeEntries(ownerId, employeeName, period, date);
-    const user = await getUserProfile(ownerId);
     let totalHours = 0, driveHours = 0;
-    const days = {};
-
-    entries.forEach(e => {
-      const day = e.timestamp.toISOString().split('T')[0];
-      days[day] = days[day] || [];
-      days[day].push(e);
+    let lastPunchIn = null;
+    entries.forEach(entry => {
+      if (entry.type === 'punch_in') {
+        lastPunchIn = new Date(entry.timestamp);
+      } else if (entry.type === 'punch_out' && lastPunchIn) {
+        totalHours += (new Date(entry.timestamp) - lastPunchIn) / (1000 * 60 * 60);
+        lastPunchIn = null;
+      } else if (entry.type === 'drive_start') {
+        lastPunchIn = new Date(entry.timestamp);
+      } else if (entry.type === 'drive_end' && lastPunchIn) {
+        driveHours += (new Date(entry.timestamp) - lastPunchIn) / (1000 * 60 * 60);
+        lastPunchIn = null;
+      }
     });
-
-    console.log('[DEBUG] generateTimesheet result:', { employeeName, period, startDate: date.toISOString().split('T')[0], totalHours, driveHours, company: { name: user?.name }, entriesByDay: days });
-    return { employeeName, period, startDate: date.toISOString().split('T')[0], totalHours, driveHours, company: { name: user?.name }, entriesByDay: days };
+    const user = await getUserProfile(ownerId);
+    console.log('[DEBUG] generateTimesheet result:', { totalHours, driveHours });
+    return {
+      employeeName,
+      period,
+      startDate: date.toISOString().split('T')[0],
+      totalHours: totalHours.toFixed(2),
+      driveHours: driveHours.toFixed(2),
+      company: { name: user?.name }
+    };
   } catch (error) {
     console.error('[ERROR] generateTimesheet failed:', error.message);
     throw error;
@@ -501,6 +570,9 @@ async function generateTimesheet(ownerId, employeeName, period, date) {
 module.exports = {
   appendToUserSpreadsheet,
   getActiveJob,
+  saveExpense,
+  deleteExpense,
+  saveJob,
   setActiveJob,
   finishJob,
   createJob,

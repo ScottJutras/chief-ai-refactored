@@ -1,39 +1,13 @@
 {
-    "name":  "chief-ai",
-    "version":  "1.0.0",
-    "main":  "index.js",
-    "scripts":  {
-                    "start":  "node index.js",
-                    "dev":  "node index.js",
-                    "test":  "jest tests"
-                },
-    "dependencies":  {
-                         "@ffmpeg/ffmpeg":  "^0.12.10",
-                         "@google-cloud/documentai":  "^9.2.0",
-                         "@google-cloud/speech":  "^7.1.0",
-                         "@google-cloud/vision":  "^5.2.0",
-                         "@sendgrid/mail":  "^8.1.4",
-                         "axios":  "^1.7.2",
-                         "body-parser":  "^1.20.3",
-                         "chartjs-node-canvas":  "^5.0.0",
-                         "chrono-node":  "^2.7.8",
-                         "cors":  "^2.8.5",
-                         "dotenv":  "^16.6.1",
-                         "exceljs":  "^4.4.0",
-                         "express":  "^4.21.2",
-                         "express-rate-limit":  "^7.5.1",
-                         "fuzzball":  "^2.2.2",
-                         "glob":  "^10.4.1",
-                         "googleapis":  "^150.0.1",
-                         "libphonenumber-js":  "^1.12.6",
-                         "openai":  "^4.61.1",
-                         "papaparse":  "^5.5.2",
-                         "pdfkit":  "^0.16.0",
-                         "pg":  "^8.11.3",
-                         "twilio":  "^5.4.0",
-                         "winston":  "^3.17.0"
-                     },
-    "devDependencies":  {
-                            "jest":  "^30.0.4"
-                        }
+  "name": "chief-ai-refactored",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "pg": "^8.11.3",
+    "express": "^4.18.2",
+    "twilio": "^4.11.0"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
 }

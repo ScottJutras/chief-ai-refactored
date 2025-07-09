@@ -1,38 +1,32 @@
-// middleware/userProfile.js
+const { getUserProfile, createUserProfile } = require('../services/postgres');
+const { getOwnerProfile } = require('../services/postgres');
 
-const { db } = require('../services/firebase')
-
-/**
- * Loads the current user's Firestore document (based on their phone),
- * then also loads the "owner" doc (for teams), and stamps req.isOwner.
- */
+// normalize and fetch/create user in Postgres
 async function userProfileMiddleware(req, res, next) {
-  const from       = req.body.From || ''
-  const phone      = from.replace(/\D/g, '')
-  let userDoc, ownerDoc
+  // 1) Normalize WhatsApp “From” to digits-only
+  const rawFrom = req.body.From || '';
+  const phone   = rawFrom.replace(/\D/g, '');
 
-  try {
-    // 1) load this user’s doc
-    userDoc = await db.collection('users').doc(phone).get()
-    req.userProfile = userDoc.exists ? userDoc.data() : {}
+  // 2) Fetch existing profile
+  let profile = await getUserProfile(phone);
 
-    // 2) determine ownerId (for team members, it’ll be set on their doc)
-    req.ownerId = req.userProfile.ownerId || phone
-
-    // 3) load the owner’s profile
-    ownerDoc = await db.collection('users').doc(req.ownerId).get()
-    req.ownerProfile = ownerDoc.exists ? ownerDoc.data() : {}
-
-    // 4) is this request coming from the owner phone or a team‐member phone?
-    req.isOwner = phone === req.ownerId
-
-    return next()
-  } catch (err) {
-    console.error('userProfileMiddleware error:', err)
-    return res
-      .status(500)
-      .send('⚠️ Failed to load user profile. Please try again.')
+  // 3) If none, create and start onboarding
+  if (!profile) {
+    profile = await createUserProfile({
+      phone,
+      ownerId: process.env.DEFAULT_OWNER_ID,
+      onboarding_in_progress: true
+    });
+    console.log(`[INFO] Created new user profile for ${phone}`);
   }
+
+  // 4) Attach to request
+  req.userProfile   = profile;
+  req.ownerId       = profile.ownerId;
+  req.ownerProfile  = await getOwnerProfile(profile.ownerId);
+  req.isOwner       = req.ownerProfile.ownerId === profile.ownerId;
+
+  next();
 }
 
-module.exports = { userProfileMiddleware }
+module.exports = { userProfileMiddleware };

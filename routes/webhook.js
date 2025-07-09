@@ -3,7 +3,7 @@ const twilio = require('twilio');
 const commandHandlers = require('../handlers/commands');
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
-const { handleTimeclock } = require('../handlers/timeClock');
+const { handleTimeclock } = require('../handlers/commands/timeclock');
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
 const { userProfileMiddleware } = require('../middleware/userProfile');
 const { tokenMiddleware } = require('../middleware/token');
@@ -98,7 +98,7 @@ router.post(
         const target = userProfile.goalProgress?.target || 0;
         return res.send(`<Response><Message>🎯 Goal: ${userProfile.goal}\nProgress: ${currency} ${progress.toFixed(2)} / ${currency} ${target.toFixed(2)} (${((progress / target) * 100).toFixed(1)}%)</Message></Response>`);
       }
-      return res.send('<Response><Message>🤔 Unrecognized command: "' + input + '". Try "start job [name]" or "expense $100 tools".</Message></Response>');
+      return res.send(`<Response><Message>🤔 Unrecognized command: "${input}". Try "start job [name]" or "expense $100 tools".</Message></Response>`);
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${from}:`, error);
       await releaseLock(lockKey);

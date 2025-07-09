@@ -1,5 +1,3 @@
-// routes/webhook.js
-
 const express = require('express');
 const { handleCommands } = require('../handlers/commands');
 const { handleMedia } = require('../handlers/media');
@@ -13,19 +11,25 @@ const router = express.Router();
 
 // 1️⃣ Health‐check endpoint
 router.get('/', (req, res) => {
+  console.log('[WEBHOOK] GET /');
   res.send('👋 Chief AI webhook endpoint is live. POST here for Twilio events.');
 });
 
 // 2️⃣ Main Twilio webhook
 router.post(
   '/',
+  // 🔍 Route‐level sanity check
+  (req, res, next) => {
+    console.log('[ROUTE] hit POST /api/webhook');
+    next();
+  },
   lockMiddleware,
   userProfileMiddleware,
   tokenMiddleware,
   async (req, res, next) => {
-    // Grab Twilio's sender and normalize to digits-only
     const rawFrom = req.body.From || '';
     const from = rawFrom.replace(/\D/g, '');
+    console.log(`[WEBHOOK] processing message from ${from}`);
 
     const input = (req.body.Body || '').trim();
     const mediaUrl = req.body.MediaUrl0 || null;
@@ -56,8 +60,7 @@ router.post(
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${from}:`, error);
       await releaseLock(lockKey);
-      // Let errorMiddleware pick it up
-      throw error;
+      throw error; // let errorMiddleware handle response
     }
   },
   errorMiddleware

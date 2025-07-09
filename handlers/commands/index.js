@@ -7,7 +7,7 @@ const metricsHandler = require('./metrics');
 const taxHandler = require('./tax');
 const receiptHandler = require('./receipt');
 const teamHandler = require('./team');
-const timeclockHandler = require('./timeClock');
+const timeclockHandler = require('./timeclock');
 
 async function handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lockKey = `lock:${from}`;

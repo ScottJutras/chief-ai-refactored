@@ -1,44 +1,51 @@
-// middleware/token.js
-const { db } = require('../services/firebase');
-const { sendTemplateMessage } = require('../services/twilio');
+const { Pool } = require('pg');
 
-/**
- * Increment a user's token usage counters.
- */
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
 async function updateUserTokenUsage(userId, { messages = 0, aiCalls = 0 }) {
-  const userRef = db.collection('users').doc(userId);
-  const snap = await userRef.get();
-  const current = snap.data().tokenUsage || { messages: 0, aiCalls: 0 };
-  await userRef.update({
-    tokenUsage: {
-      messages: current.messages + messages,
-      aiCalls: current.aiCalls + aiCalls,
-    }
-  });
-  console.log(`[✅] Updated token usage for ${userId}: messages+${messages}, aiCalls+${aiCalls}`);
+  console.log(`[DEBUG] updateUserTokenUsage called for ${userId}: messages+${messages}, aiCalls+${aiCalls}`);
+  try {
+    const res = await pool.query(
+      `UPDATE users
+       SET token_usage = token_usage + $1::jsonb
+       WHERE user_id = $2
+       RETURNING token_usage`,
+      [JSON.stringify({ messages, aiCalls }), userId]
+    );
+    console.log(`[✅] Updated token usage for ${userId}:`, res.rows[0]?.token_usage);
+  } catch (error) {
+    console.error(`[ERROR] updateUserTokenUsage failed for ${userId}:`, error.message);
+    throw error;
+  }
 }
 
-/**
- * Check if a user has exceeded their tier’s token limits.
- */
 async function checkTokenLimit(userId, tier) {
   const limits = {
     Free: { messages: 100, aiCalls: 10 },
     basic: { messages: 1000, aiCalls: 100 },
     Pro: { messages: 5000, aiCalls: 500 },
-    Enterprise: { messages: Infinity, aiCalls: Infinity },
+    Enterprise: { messages: Infinity, aiCalls: Infinity }
   };
-  const snap = await db.collection('users').doc(userId).get();
-  const usage = snap.data().tokenUsage || { messages: 0, aiCalls: 0 };
-  const { messages: msgLimit, aiCalls: aiLimit } = limits[tier] || limits.basic;
-  const exceeded = usage.messages > msgLimit || usage.aiCalls > aiLimit;
-  console.log(`[✅] Token check for ${userId} (${tier}): ${exceeded ? '❌ exceeded' : '✅ within limits'}`);
-  return { exceeded };
+  try {
+    const res = await pool.query(
+      `SELECT token_usage FROM users WHERE user_id = $1`,
+      [userId]
+    );
+    const usage = res.rows[0]?.token_usage || { messages: 0, aiCalls: 0 };
+    const { messages: msgLimit, aiCalls: aiLimit } = limits[tier] || limits.basic;
+    const exceeded = usage.messages > msgLimit || usage.aiCalls > aiLimit;
+    console.log(`[✅] Token check for ${userId} (${tier}): ${exceeded ? '❌ exceeded' : '✅ within limits'}`);
+    return { exceeded };
+  } catch (error) {
+    console.error(`[ERROR] checkTokenLimit failed for ${userId}:`, error.message);
+    throw error;
+  }
 }
 
-
 async function tokenMiddleware(req, res, next) {
-  // userProfileMiddleware already ran, so req.ownerId is set for webhooks
   const raw = req.ownerId || req.body.userId;
   const userId = raw ? raw.replace(/\D/g, '') : null;
   const isWebhook = Boolean(req.body.From && req.ownerId);
@@ -46,39 +53,35 @@ async function tokenMiddleware(req, res, next) {
   if (!userId) {
     console.error('[ERROR] Missing userId');
     if (isWebhook) {
-      return res.send(
-        `<Response><Message>⚠️ Invalid user ID. Please try again.</Message></Response>`
-      );
+      return res.send(`<Response><Message>⚠️ Invalid user ID. Please try again.</Message></Response>`);
     }
     return res.status(400).json({ error: 'Missing user ID' });
   }
 
   try {
-    const userSnap = await db.collection('users').doc(userId).get();
-    if (!userSnap.exists) {
+    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+    if (!res.rows[0]) {
       console.error(`[ERROR] No profile for ${userId}`);
       if (isWebhook) {
-        return res.send(
-          `<Response><Message>⚠️ User not found. Please start onboarding.</Message></Response>`
-        );
+        return res.send(`<Response><Message>⚠️ User not found. Please start onboarding.</Message></Response>`);
       }
       return res.status(404).json({ error: 'User not found' });
     }
 
-    const data = userSnap.data();
-    const ownerId = data.ownerId || userId;
-    let tier = data.subscriptionTier || 'basic';
+    const data = res.rows[0];
+    const ownerId = data.owner_id || userId;
+    let tier = data.subscription_tier || 'basic';
 
-    // first‐time setup
-    if (!data.subscriptionTier) {
-      await db.collection('users').doc(userId).update({
-        subscriptionTier: 'basic',
-        tokenUsage: { messages: 0, aiCalls: 0 }
-      });
+    if (!data.subscription_tier) {
+      await pool.query(
+        `UPDATE users
+         SET subscription_tier = $1, token_usage = $2
+         WHERE user_id = $3`,
+        ['basic', JSON.stringify({ messages: 0, aiCalls: 0 }), userId]
+      );
       console.log(`[✅] Initialized tier/basic usage for ${userId}`);
     }
 
-    // count this request
     const isDeepDive = req.path.includes('/deep-dive');
     const didMessage = isWebhook && Boolean(req.body.Body);
     const didAICall =
@@ -94,30 +97,22 @@ async function tokenMiddleware(req, res, next) {
       aiCalls: didAICall ? 1 : 0
     });
 
-    // enforce limits
     const { exceeded } = await checkTokenLimit(ownerId, tier);
     if (exceeded) {
       console.log(`[⚠️] ${ownerId} exceeded tokens`);
       if (isWebhook) {
-        // release any Twilio lock
-        const lockKey = `lock:${userId}`;
-        await db.collection('locks').doc(lockKey).delete().catch(() => {});
-        return res.send(
-          `<Response><Message>⚠️ Trial limit reached! Reply 'Upgrade' to continue.</Message></Response>`
-        );
+        await pool.query('DELETE FROM locks WHERE lock_key = $1', [`lock:${userId}`]);
+        return res.send(`<Response><Message>⚠️ Trial limit reached! Reply 'Upgrade' to continue.</Message></Response>`);
       }
       return res.status(403).json({ error: 'Trial limit reached' });
     }
 
-    return next();
-  } catch (err) {
-    console.error(`[ERROR] tokenMiddleware for ${userId}`, err);
+    next();
+  } catch (error) {
+    console.error(`[ERROR] tokenMiddleware for ${userId}:`, error.message);
     if (isWebhook) {
-      const lockKey = `lock:${userId}`;
-      await db.collection('locks').doc(lockKey).delete().catch(() => {});
-      return res.send(
-        `<Response><Message>⚠️ An error occurred. Please try again later.</Message></Response>`
-      );
+      await pool.query('DELETE FROM locks WHERE lock_key = $1', [`lock:${userId}`]);
+      return res.send(`<Response><Message>⚠️ An error occurred. Please try again later.</Message></Response>`);
     }
     return res.status(500).json({ error: 'Token processing failed' });
   }

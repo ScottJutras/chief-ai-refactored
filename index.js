@@ -10,8 +10,6 @@ const app = express();
 app.use((req, res, next) => {
   console.log(`[INCOMING] ${req.method} ${req.originalUrl}`);
   console.log('  headers:', JSON.stringify(req.headers));
-  // Twilio sends urlencoded bodies
-  // so we need bodyParser first
   next();
 });
 
@@ -35,7 +33,12 @@ app.use((req, res) => {
   res.status(404).send('Not Found');
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server listening on port ${PORT}`);
-});
+// Only listen when running locally
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`✅ Server listening on port ${PORT}`);
+  });
+}
+
+module.exports = app;

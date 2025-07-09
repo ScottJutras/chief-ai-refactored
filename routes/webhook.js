@@ -1,66 +1,71 @@
+// routes/webhook.js
+
 const express = require('express');
-const { handleCommands } = require('../handlers/commands');
-const { handleMedia } = require('../handlers/media');
-const { handleOnboarding } = require('../handlers/onboarding');
-const { handleTimeclock } = require('../handlers/timeClock');
-const { lockMiddleware, releaseLock } = require('../middleware/lock');
-const { userProfileMiddleware } = require('../middleware/userProfile');
-const { tokenMiddleware } = require('../middleware/token');
-const { errorMiddleware } = require('../middleware/error');
+const { handleCommands } = require('./handlers/commands');
+const { handleMedia } = require('./handlers/media');
+const { handleOnboarding } = require('./handlers/onboarding');
+const { handleTimeclock } = require('./handlers/timeclock');
+const { lockMiddleware, releaseLock } = require('./middleware/lock');
+const { userProfileMiddleware } = require('./middleware/userProfile');
+const { tokenMiddleware } = require('./middleware/token');
+const { errorMiddleware } = require('./middleware/error');
+
 const router = express.Router();
 
-// 1️⃣ Health‐check endpoint
-router.get('/', (req, res) => {
-  console.log('[WEBHOOK] GET /');
-  res.send('👋 Chief AI webhook endpoint is live. POST here for Twilio events.');
-});
-
-// 2️⃣ Main Twilio webhook
 router.post(
   '/',
-  // 🔍 Route‐level sanity check
-  (req, res, next) => {
-    console.log('[ROUTE] hit POST /api/webhook');
-    next();
-  },
   lockMiddleware,
   userProfileMiddleware,
   tokenMiddleware,
   async (req, res, next) => {
-    const rawFrom = req.body.From || '';
-    const from = rawFrom.replace(/\D/g, '');
-    console.log(`[WEBHOOK] processing message from ${from}`);
+    // 👇 Log the incoming WhatsApp payload for Vercel runtime logs
+    console.log('[WEBHOOK] Incoming WhatsApp message:', {
+      timestamp: new Date().toISOString(),
+      from: req.body.From,
+      body: req.body.Body,
+      mediaUrl: req.body.MediaUrl0,
+      mediaType: req.body.MediaContentType0,
+      headers: {
+        'user-agent': req.headers['user-agent'],
+        'x-twilio-signature': req.headers['x-twilio-signature']
+      }
+    });
 
-    const input = (req.body.Body || '').trim();
-    const mediaUrl = req.body.MediaUrl0 || null;
-    const mediaType = req.body.MediaContentType0 || null;
-
+    const { From, Body, MediaUrl0, MediaContentType0 } = req.body;
+    const from = req.from || 'UNKNOWN_FROM';
+    const input = Body?.trim() || '';
+    const mediaUrl = MediaUrl0 || null;
+    const mediaType = MediaContentType0 || null;
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
     const lockKey = `lock:${from}`;
 
     try {
-      // 1) Onboarding
+      // onboarding flow
       if (userProfile.onboarding_in_progress || input.toLowerCase().includes('start onboarding')) {
         return await handleOnboarding(from, input, userProfile, ownerId, res);
       }
 
-      // 2) Media (images, audio, etc.)
+      // media (receipt, quote image, etc)
       if (mediaUrl && mediaType) {
         return await handleMedia(from, mediaUrl, mediaType, userProfile, ownerId, ownerProfile, isOwner, res);
       }
 
-      // 3) Timeclock commands
-      const lc = input.toLowerCase();
-      if (lc.includes('punch') || lc.includes('break') || lc.includes('lunch') || lc.includes('drive') || lc.includes('hours')) {
+      // timeclock commands
+      if (
+        input.toLowerCase().includes('punch') ||
+        input.toLowerCase().includes('lunch') ||
+        input.toLowerCase().includes('drive') ||
+        input.toLowerCase().includes('hours')
+      ) {
         return await handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
       }
 
-      // 4) Everything else
+      // everything else → command handler
       return await handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${from}:`, error);
       await releaseLock(lockKey);
-      throw error; // let errorMiddleware handle response
+      throw error;
     }
   },
   errorMiddleware

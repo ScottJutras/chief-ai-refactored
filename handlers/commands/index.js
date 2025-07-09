@@ -1,22 +1,13 @@
-const { handleExpense } = require('./expense');
-const { handleRevenue } = require('./revenue');
-const { handleQuote } = require('./quote');
-const { handleBill } = require('./bill');
-const { handleJob } = require('./job');
-const { handleMetrics } = require('./metrics');
-const { handleReceipt } = require('./receipt');
-const { handleTeam } = require('./team');
-const { handleTax } = require('./tax');
-const { isOnboardingTrigger, isValidCommand, isValidExpenseInput } = require('../../utils/inputValidator');
-const { db, admin } = require('../../services/firebase');
-const { getOnboardingState, setOnboardingState, deleteOnboardingState } = require('../../utils/stateManager');
-const { saveUserProfile } = require('../../services/postgres.js');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-const { sendTemplateMessage } = require('../../services/twilio');
-const { confirmationTemplates } = require('../../config');
-const OpenAI = require('openai');
-const { google } = require('googleapis');
-const { getAuthorizedClient } = require('../../services/postgres.js');
+const expenseHandler = require('./expense');
+const revenueHandler = require('./revenue');
+const billHandler = require('./bill');
+const jobHandler = require('./job');
+const quoteHandler = require('./quote');
+const metricsHandler = require('./metrics');
+const taxHandler = require('./tax');
+const receiptHandler = require('./receipt');
+const teamHandler = require('./team');
+const timeclockHandler = require('./timeClock');
 
 async function handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lockKey = `lock:${from}`;
@@ -408,13 +399,14 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
 }
 
 module.exports = {
-  expense: handleExpense,
-  revenue: handleRevenue,
-  bill: handleBill,
-  job: handleJob,
-  quote: handleQuote,
-  metrics: handleMetrics,
-  tax: handleTax,
-  receipt: handleReceipt,
-  team: handleTeam
+  expense: expenseHandler,
+  revenue: revenueHandler,
+  bill: billHandler,
+  job: jobHandler,
+  quote: quoteHandler,
+  metrics: metricsHandler,
+  tax: taxHandler,
+  receipt: receiptHandler,
+  team: teamHandler,
+  timeclock: timeclockHandler
 };

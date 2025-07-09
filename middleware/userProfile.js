@@ -1,32 +1,35 @@
-const { getUserProfile, createUserProfile } = require('../services/postgres');
-const { getOwnerProfile } = require('../services/postgres');
+const { getUserProfile, createUserProfile, getOwnerProfile } = require('../services/postgres');
 
-// normalize and fetch/create user in Postgres
 async function userProfileMiddleware(req, res, next) {
-  // 1) Normalize WhatsApp “From” to digits-only
-  const rawFrom = req.body.From || '';
-  const phone   = rawFrom.replace(/\D/g, '');
-
-  // 2) Fetch existing profile
-  let profile = await getUserProfile(phone);
-
-  // 3) If none, create and start onboarding
-  if (!profile) {
-    profile = await createUserProfile({
-      phone,
-      ownerId: process.env.DEFAULT_OWNER_ID,
-      onboarding_in_progress: true
-    });
-    console.log(`[INFO] Created new user profile for ${phone}`);
+  console.log('[DEBUG] userProfileMiddleware invoked:', { from: req.body.From, timestamp: new Date().toISOString() });
+  try {
+    const rawFrom = req.body.From || 'UNKNOWN_FROM';
+    const phoneNumber = rawFrom.replace(/\D/g, '');
+    let userProfile = await getUserProfile(phoneNumber);
+    if (!userProfile) {
+      userProfile = await createUserProfile({
+        phone: phoneNumber,
+        ownerId: process.env.DEFAULT_OWNER_ID || phoneNumber,
+        onboarding_in_progress: true
+      });
+      console.log('[INFO] Created new user profile for', phoneNumber);
+    }
+    req.userProfile = userProfile || { onboarding_completed: false, name: 'Unknown', country: 'Canada' };
+    req.ownerId = userProfile.ownerId || phoneNumber;
+    req.ownerProfile = await getOwnerProfile(req.ownerId) || {};
+    req.isOwner = req.ownerProfile.ownerId === userProfile.ownerId;
+    console.log('[DEBUG] userProfileMiddleware result:', { userProfile: req.userProfile });
+    next();
+  } catch (error) {
+    console.error('[ERROR] userProfileMiddleware failed:', error.message);
+    const phoneNumber = req.body.From ? req.body.From.replace(/\D/g, '') : 'UNKNOWN_FROM';
+    req.userProfile = { onboarding_completed: false, name: 'Unknown', country: 'Canada' };
+    req.ownerId = phoneNumber;
+    req.ownerProfile = {};
+    req.isOwner = true;
+    console.log('[DEBUG] userProfileMiddleware fallback applied');
+    next();
   }
-
-  // 4) Attach to request
-  req.userProfile   = profile;
-  req.ownerId       = profile.ownerId;
-  req.ownerProfile  = await getOwnerProfile(profile.ownerId);
-  req.isOwner       = req.ownerProfile.ownerId === profile.ownerId;
-
-  next();
 }
 
 module.exports = { userProfileMiddleware };

@@ -1,74 +1,83 @@
-const { db, admin } = require('../../services/firebase');
-const { releaseLock } = require('../../middleware/lock');
-const { sendTemplateMessage } = require('../../services/twilio');
-const { confirmationTemplates } = require('../../config');
+const { Pool } = require('pg');
+const { releaseLock } = require('../middleware/lock');
 
-async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwner) {
   const lockKey = `lock:${from}`;
   let reply;
 
   try {
     if (!isOwner) {
       reply = "⚠️ Only the owner can manage team members.";
-      await releaseLock(lockKey);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    const lcInput = input.toLowerCase();
+    const lcInput = input.toLowerCase().trim();
     if (lcInput.startsWith('add member')) {
       const phoneNumber = input.match(/add member\s+(\+\d{10,})/i)?.[1];
       if (!phoneNumber) {
         reply = "⚠️ Please provide a valid phone number. Try: 'add member +1234567890'";
-        await releaseLock(lockKey);
-        return res.send(`<Response><Message>${reply}</Message></Response>`);
+        return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      await db.collection('users').doc(ownerId).update({
-        teamMembers: admin.firestore.FieldValue.arrayUnion(phoneNumber)
-      });
-      await db.collection('users').doc(phoneNumber.replace(/\D/g, '')).set({
-        user_id: phoneNumber,
-        ownerId,
-        isTeamMember: true,
-        created_at: new Date().toISOString()
-      }, { merge: true });
+      await pool.query(
+        `UPDATE users
+         SET team_members = COALESCE(team_members, '[]'::jsonb) || $1::jsonb
+         WHERE user_id = $2`,
+        [JSON.stringify([phoneNumber]), ownerId]
+      );
+      await pool.query(
+        `INSERT INTO users (user_id, owner_id, is_team_member, created_at)
+         VALUES ($1, $2, true, NOW())
+         ON CONFLICT (user_id) DO UPDATE
+         SET owner_id = $2, is_team_member = true, updated_at = NOW()`,
+        [phoneNumber.replace(/\D/g, ''), ownerId]
+      );
       reply = `✅ Added team member ${phoneNumber}.`;
-      await sendTemplateMessage(from, confirmationTemplates.teamAdd, [
-        { type: 'text', text: phoneNumber }
-      ]);
-      await releaseLock(lockKey);
-      return res.send(`<Response></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     } else if (lcInput.startsWith('remove member')) {
       const phoneNumber = input.match(/remove member\s+(\+\d{10,})/i)?.[1];
       if (!phoneNumber) {
         reply = "⚠️ Please provide a valid phone number. Try: 'remove member +1234567890'";
-        await releaseLock(lockKey);
-        return res.send(`<Response><Message>${reply}</Message></Response>`);
+        return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      await db.collection('users').doc(ownerId).update({
-        teamMembers: admin.firestore.FieldValue.arrayRemove(phoneNumber)
-      });
-      await db.collection('users').doc(phoneNumber.replace(/\D/g, '')).delete();
+      await pool.query(
+        `UPDATE users
+         SET team_members = team_members - $1
+         WHERE user_id = $2`,
+        [phoneNumber, ownerId]
+      );
+      await pool.query(
+        `DELETE FROM users WHERE user_id = $1`,
+        [phoneNumber.replace(/\D/g, '')]
+      );
       reply = `✅ Removed team member ${phoneNumber}.`;
-      await releaseLock(lockKey);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     } else if (lcInput === 'team') {
-      const teamMembers = ownerProfile.teamMembers || [];
+      const res = await pool.query(
+        `SELECT team_members FROM users WHERE user_id = $1`,
+        [ownerId]
+      );
+      const teamMembers = res.rows[0]?.team_members || [];
       reply = teamMembers.length
         ? `📋 Team Members:\n${teamMembers.map((member, i) => `${i + 1}. ${member}`).join('\n')}`
         : "No team members added yet. Use 'add member +1234567890' to add one.";
-      await releaseLock(lockKey);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
     reply = "⚠️ Invalid team command. Try: 'team', 'add member +1234567890', 'remove member +1234567890'";
-    await releaseLock(lockKey);
-    return res.send(`<Response><Message>${reply}</Message></Response>`);
+    return `<Response><Message>${reply}</Message></Response>`;
   } catch (error) {
-    console.error(`Error in handleTeam: ${error.message}`);
+    console.error(`[ERROR] handleTeam failed for ${from}:`, error.message);
+    reply = `⚠️ Failed to process team command: ${error.message}`;
+    return `<Response><Message>${reply}</Message></Response>`;
+  } finally {
     await releaseLock(lockKey);
-    throw error;
   }
 }
 

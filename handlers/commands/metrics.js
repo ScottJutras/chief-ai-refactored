@@ -1,84 +1,85 @@
-const { parseFinancialQuery } = require('../../services/openAI');
-const { getAuthorizedClient } = require('../../services/postgres.js');
-const { google } = require('googleapis');
-const { db } = require('../../services/firebase');
+const { Pool } = require('pg');
+const { getPendingTransactionState, deletePendingTransactionState } = require('../utils/stateManager');
 
-async function handleMetrics(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function parseFinancialQuery(input) {
+  const lcInput = input.toLowerCase().trim();
+  const intents = {
+    profit: ['profit', 'earnings', 'net'],
+    spend: ['spend', 'expenses', 'costs'],
+    revenue: ['revenue', 'income', 'sales'],
+    margin: ['margin', 'profit margin']
+  };
+  let intent = 'summary';
+  for (const [key, keywords] of Object.entries(intents)) {
+    if (keywords.some(k => lcInput.includes(k))) {
+      intent = key;
+      break;
+    }
+  }
+
+  const jobMatch = lcInput.match(/(?:for|on)\s+([\w\s]+)/i);
+  const periodMatch = lcInput.match(/(ytd|month|this month|last month|january|february|march|april|may|june|july|august|september|october|november|december)\s*(\d{4})?/i);
+
+  return {
+    intent,
+    job: jobMatch ? jobMatch[1].trim() : null,
+    period: periodMatch ? (periodMatch[1].toLowerCase() === 'ytd' ? 'ytd' : periodMatch[1].toLowerCase() === 'this month' ? 'month' : 'specific month') : null,
+    specificMonth: periodMatch && periodMatch[1].toLowerCase() !== 'ytd' && periodMatch[1].toLowerCase() !== 'this month' ? periodMatch[1].toLowerCase() : null,
+    year: periodMatch && periodMatch[2] ? parseInt(periodMatch[2]) : null
+  };
+}
+
+async function handleMetrics(from, input, userProfile, ownerId) {
   const lockKey = `lock:${from}`;
   let reply;
 
   try {
-    // Parse the financial query using OpenAI
     const query = await parseFinancialQuery(input);
-    if (query.intent === 'unknown' || query.response) {
-      reply = query.response || `⚠️ Couldn’t understand the query "${input}". Try: "profit on Roof Repair for this month"`;
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (invalid query)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+    if (query.intent === 'unknown') {
+      reply = `⚠️ Couldn’t understand the query "${input}". Try: "profit on Roof Repair for this month"`;
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // Fetch data from Google Sheets
-    const auth = await getAuthorizedClient();
-    const sheets = google.sheets({ version: 'v4', auth });
-    const expenses = await sheets.spreadsheets.values.get({
-      spreadsheetId: ownerProfile.spreadsheetId,
-      range: 'Sheet1!A:I'
-    });
-    const revenues = await sheets.spreadsheets.values.get({
-      spreadsheetId: ownerProfile.spreadsheetId,
-      range: 'Revenue!A:I'
-    });
-
-    // Filter data by job and period
-    let expenseData = (expenses.data.values || []).slice(1).filter(row => row[5] === 'expense' || row[5] === 'bill');
-    let revenueData = (revenues.data.values || []).slice(1).filter(row => row[5] === 'revenue');
-
+    let sql = `SELECT type, amount, job_name, date FROM transactions WHERE owner_id = $1`;
+    const params = [ownerId];
     if (query.job) {
-      expenseData = expenseData.filter(row => row[4] === query.job);
-      revenueData = revenueData.filter(row => row[4] === query.job);
+      sql += ` AND job_name = $${params.length + 1}`;
+      params.push(query.job);
     }
-
     if (query.period) {
       const now = new Date();
-      const yearStart = new Date(now.getFullYear(), 0, 1);
-      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
       let startDate, endDate;
-
       if (query.period === 'ytd') {
-        startDate = yearStart;
+        startDate = new Date(now.getFullYear(), 0, 1);
         endDate = now;
       } else if (query.period === 'month') {
-        startDate = monthStart;
+        startDate = new Date(now.getFullYear(), now.getMonth(), 1);
         endDate = now;
       } else if (query.period === 'specific month') {
-        const monthMatch = input.match(/(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{4})/i);
-        if (monthMatch) {
-          const monthIndex = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'].indexOf(monthMatch[1].toLowerCase());
-          startDate = new Date(parseInt(monthMatch[2]), monthIndex, 1);
-          endDate = new Date(parseInt(monthMatch[2]), monthIndex + 1, 0);
-        }
+        const monthIndex = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'].indexOf(query.specificMonth);
+        const year = query.year || now.getFullYear();
+        startDate = new Date(year, monthIndex, 1);
+        endDate = new Date(year, monthIndex + 1, 0);
       }
-
-      if (startDate && endDate) {
-        expenseData = expenseData.filter(row => {
-          const rowDate = new Date(row[0]);
-          return rowDate >= startDate && rowDate <= endDate;
-        });
-        revenueData = revenueData.filter(row => {
-          const rowDate = new Date(row[0]);
-          return rowDate >= startDate && rowDate <= endDate;
-        });
-      }
+      sql += ` AND date >= $${params.length + 1} AND date <= $${params.length + 2}`;
+      params.push(startDate.toISOString().split('T')[0], endDate.toISOString().split('T')[0]);
     }
 
-    // Calculate metrics
-    const totalExpenses = expenseData.reduce((sum, row) => sum + parseFloat(row[2].replace(/[^0-9.]/g, '') || 0), 0);
-    const totalRevenue = revenueData.reduce((sum, row) => sum + parseFloat(row[2].replace(/[^0-9.]/g, '') || 0), 0);
+    const res = await pool.query(sql, params);
+    const expenseData = res.rows.filter(row => row.type === 'expense' || row.type === 'bill');
+    const revenueData = res.rows.filter(row => row.type === 'revenue');
+
+    const totalExpenses = expenseData.reduce((sum, row) => sum + parseFloat(row.amount || 0), 0);
+    const totalRevenue = revenueData.reduce((sum, row) => sum + parseFloat(row.amount || 0), 0);
     const profit = totalRevenue - totalExpenses;
     const margin = totalRevenue ? (profit / totalRevenue * 100).toFixed(2) : 0;
     const currency = userProfile.country === 'United States' ? 'USD' : 'CAD';
 
-    // Format response based on intent
     let replyData;
     switch (query.intent) {
       case 'profit':
@@ -102,14 +103,14 @@ async function handleMetrics(from, input, userProfile, ownerId, ownerProfile, is
       reply += `\nGoal Progress: ${currency} ${userProfile.goalProgress.current.toFixed(2)} / ${currency} ${userProfile.goalProgress.target.toFixed(2)} (${((userProfile.goalProgress.current / userProfile.goalProgress.target) * 100).toFixed(1)}%)`;
     }
 
-    await db.collection('locks').doc(lockKey).delete();
-    console.log(`[LOCK] Released lock for ${from} (metrics)`);
-    return res.send(`<Response><Message>${reply}</Message></Response>`);
+    return `<Response><Message>${reply}</Message></Response>`;
   } catch (error) {
-    console.error(`Error in handleMetrics: ${error.message}`);
-    await db.collection('locks').doc(lockKey).delete();
-    console.log(`[LOCK] Released lock for ${from} (metrics error)`);
-    return res.send(`<Response><Message>⚠️ Failed to fetch metrics: ${error.message}</Message></Response>`);
+    console.error(`[ERROR] handleMetrics failed for ${from}:`, error.message);
+    reply = `⚠️ Failed to fetch metrics: ${error.message}`;
+    return `<Response><Message>${reply}</Message></Response>`;
+  } finally {
+    await deletePendingTransactionState(from);
+    await require('../middleware/lock').releaseLock(lockKey);
   }
 }
 

@@ -1,44 +1,59 @@
-const { db } = require('../../services/firebase');
-const { releaseLock } = require('../../middleware/lock');
-const { parseReceiptQuery } = require('../../services/openAI');
+const { Pool } = require('pg');
+const { releaseLock } = require('../middleware/lock');
 
-async function handleReceipt(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+function parseReceiptQuery(input) {
+  const lcInput = input.toLowerCase().trim();
+  const itemMatch = lcInput.match(/(?:find receipt for|receipt)\s+(.+)/i);
+  return {
+    item: itemMatch ? itemMatch[1].trim() : null
+  };
+}
+
+async function handleReceipt(from, input, userProfile, ownerId) {
   const lockKey = `lock:${from}`;
   let reply;
 
   try {
-    const query = await parseReceiptQuery(input);
+    const query = parseReceiptQuery(input);
     if (!query.item) {
       reply = "⚠️ Please specify an item to search for. Try: 'find receipt for Hammer'";
-      await releaseLock(lockKey);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    const snapshot = await db.collection('users').doc(ownerId).collection('expenses')
-      .where('item', '>=', query.item.toLowerCase())
-      .where('item', '<=', query.item.toLowerCase() + '\uf8ff')
-      .get();
+    const res = await pool.query(
+      `SELECT date, amount, item, store, media_url
+       FROM transactions
+       WHERE owner_id = $1
+       AND type = 'expense'
+       AND LOWER(item) LIKE $2
+       AND media_url IS NOT NULL`,
+      [ownerId, `%${query.item.toLowerCase()}%`]
+    );
 
-    const receipts = snapshot.docs.filter(doc => doc.data().mediaUrl);
+    const receipts = res.rows;
     if (!receipts.length) {
       reply = `🤔 No receipts found for "${query.item}". Try a different item or check your expenses.`;
-      await releaseLock(lockKey);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
     reply = `📄 Found ${receipts.length} receipt${receipts.length > 1 ? 's' : ''} for "${query.item}":\n`;
-    receipts.slice(0, 3).forEach((doc, i) => {
-      const data = doc.data();
-      reply += `${i + 1}. ${data.date} - ${data.amount} from ${data.store}\nLink: ${data.mediaUrl}\n`;
+    receipts.slice(0, 3).forEach((data, i) => {
+      reply += `${i + 1}. ${data.date} - ${data.amount.toFixed(2)} from ${data.store}\nLink: ${data.media_url}\n`;
     });
     if (receipts.length > 3) reply += `...and ${receipts.length - 3} more. Refine your search for more details.`;
 
-    await releaseLock(lockKey);
-    return res.send(`<Response><Message>${reply}</Message></Response>`);
+    return `<Response><Message>${reply}</Message></Response>`;
   } catch (error) {
-    console.error(`Error in handleReceipt: ${error.message}`);
+    console.error(`[ERROR] handleReceipt failed for ${from}:`, error.message);
+    reply = `⚠️ Failed to process receipt: ${error.message}`;
+    return `<Response><Message>${reply}</Message></Response>`;
+  } finally {
     await releaseLock(lockKey);
-    throw error;
   }
 }
 

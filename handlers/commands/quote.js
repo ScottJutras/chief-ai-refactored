@@ -1,165 +1,203 @@
-const { parseQuoteMessage, buildQuoteDetails } = require('../../utils/quoteUtils');
-const { generateQuotePDF } = require('../../utils/pdfService');
-const { sendEmail } = require('../../utils/sendGridService');
-const { getTaxRate } = require('../../utils/taxRate');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-const { uploadFile, setFilePermissions } = require('../../services/drive');
-const { fetchMaterialPrices } = require('../../services/postgres.js');
-const { db } = require('../../services/firebase');
-const fs = require('fs').promises;
+const { Pool } = require('pg');
+const { getActiveJob, saveJob } = require('../services/postgres');
+const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../utils/stateManager');
+const { parseQuoteMessage } = require('../utils/aiErrorHandler');
 
-async function handleQuote(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function saveQuote(ownerId, quoteData) {
+  console.log(`[DEBUG] saveQuote called for ownerId: ${ownerId}, quoteData:`, quoteData);
+  try {
+    const res = await pool.query(
+      `INSERT INTO quotes (owner_id, job_name, customer_name, customer_email, subtotal, tax, total, status, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       RETURNING id`,
+      [
+        ownerId,
+        quoteData.jobName,
+        quoteData.customerName,
+        quoteData.customerEmail,
+        quoteData.subtotal,
+        quoteData.tax,
+        quoteData.total,
+        'Open/No Response'
+      ]
+    );
+    console.log(`[DEBUG] saveQuote success, quote ID: ${res.rows[0].id}`);
+    return res.rows[0].id;
+  } catch (error) {
+    console.error(`[ERROR] saveQuote failed for ${ownerId}:`, error.message);
+    throw error;
+  }
+}
+
+async function updateQuoteStatus(ownerId, quoteId, status) {
+  console.log(`[DEBUG] updateQuoteStatus called for ownerId: ${ownerId}, quoteId: ${quoteId}, status: ${status}`);
+  try {
+    const res = await pool.query(
+      `UPDATE quotes
+       SET status = $1, updated_at = NOW()
+       WHERE owner_id = $2 AND id = $3
+       RETURNING *`,
+      [status, ownerId, quoteId]
+    );
+    console.log(`[DEBUG] updateQuoteStatus result:`, res.rows[0]);
+    return res.rows.length > 0;
+  } catch (error) {
+    console.error(`[ERROR] updateQuoteStatus failed for ${ownerId}:`, error.message);
+    return false;
+  }
+}
+
+async function getMaterialPrices(ownerId) {
+  console.log(`[DEBUG] getMaterialPrices called for ownerId: ${ownerId}`);
+  try {
+    const res = await pool.query(
+      `SELECT item_name, price FROM pricing_items WHERE owner_id = $1`,
+      [ownerId]
+    );
+    const prices = {};
+    res.rows.forEach(row => {
+      prices[row.item_name.toLowerCase()] = row.price || 50; // Default price if not set
+    });
+    console.log(`[DEBUG] getMaterialPrices result:`, prices);
+    return prices;
+  } catch (error) {
+    console.error(`[ERROR] getMaterialPrices failed for ${ownerId}:`, error.message);
+    return {};
+  }
+}
+
+function getTaxRate(country, province) {
+  const taxRates = {
+    'United States': { default: 0.08 },
+    'Canada': {
+      'Ontario': 0.13,
+      'British Columbia': 0.12,
+      'Alberta': 0.05,
+      default: 0.13
+    }
+  };
+  return country === 'United States'
+    ? taxRates['United States'].default
+    : taxRates['Canada'][province] || taxRates['Canada'].default;
+}
+
+async function buildQuoteDetails(quoteData, ownerProfile) {
+  const materialPrices = await getMaterialPrices(ownerProfile.owner_id || ownerProfile.user_id);
+  let subtotal = 0;
+  let items = [];
+  const isFixedPrice = !!quoteData.amount;
+
+  if (isFixedPrice) {
+    subtotal = quoteData.amount;
+    items = [{ item: quoteData.description, quantity: 1, price: subtotal }];
+  } else {
+    items = quoteData.items.map(item => {
+      const price = materialPrices[item.item.toLowerCase()] || 50;
+      const itemTotal = item.quantity * price;
+      subtotal += itemTotal;
+      return { item: item.item, quantity: item.quantity, price, total: itemTotal };
+    });
+  }
+
+  return {
+    jobName: quoteData.jobName,
+    items,
+    subtotal,
+    isFixedPrice
+  };
+}
+
+async function handleQuote(from, input, userProfile, ownerId, ownerProfile, isOwner) {
   const lockKey = `lock:${from}`;
   let reply;
 
   try {
-    // Ensure only the owner can generate quotes
     if (!isOwner) {
       reply = `⚠️ Only the owner can generate quotes.`;
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (not owner)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // Check for pending quote confirmation
     const pendingState = await getPendingTransactionState(from);
     if (pendingState && pendingState.pendingQuote) {
       const customerInput = input.trim();
       const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
       const customerName = emailRegex.test(customerInput) ? 'Email Provided' : customerInput;
       const customerEmail = emailRegex.test(customerInput) ? customerInput : null;
-      const { jobName, items, total, isFixedPrice, description } = pendingState.pendingQuote;
+      const { jobName, items, subtotal, isFixedPrice, description } = pendingState.pendingQuote;
 
-      // Calculate tax and total
       const taxRate = getTaxRate(userProfile.country, userProfile.province);
-      const subtotal = total;
       const tax = subtotal * taxRate;
-      const totalWithTax = subtotal + tax;
+      const total = subtotal + tax;
       const currency = userProfile.country === 'United States' ? 'USD' : 'CAD';
 
-      // Generate PDF
-      const outputPath = `/tmp/quote_${from}_${Date.now()}.pdf`;
-      const quoteData = {
-        jobName,
-        items: isFixedPrice ? [{ item: description, quantity: 1, price: subtotal }] : items,
-        subtotal,
-        tax,
-        total: totalWithTax,
-        customerName,
-        contractorName: ownerProfile.name || 'Your Company Name',
-        companyName: ownerProfile.companyName || '',
-        hstNumber: ownerProfile.hstNumber || '',
-        companyAddress: ownerProfile.companyAddress || '',
-        companyPhone: ownerProfile.companyPhone || '',
-        logoUrl: ownerProfile.logoUrl || '',
-        paymentTerms: ownerProfile.paymentTerms || 'Due upon receipt',
-        specialMessage: ownerProfile.specialMessage || 'Thank you for your business!'
-      };
-      await generateQuotePDF(quoteData, outputPath);
-
-      // Upload to Google Drive
-      const fileName = `Quote_${jobName}_${Date.now()}.pdf`;
-      const driveResponse = await uploadFile(fileName, 'application/pdf', fs.createReadStream(outputPath));
-      await setFilePermissions(driveResponse.id, 'reader', 'anyone');
-      const pdfUrl = driveResponse.webViewLink;
-
-      // Store quote in Firestore
-      const quoteRef = await db.collection('users').doc(ownerId).collection('quotes').add({
+      const quoteId = await saveQuote(ownerId, {
         jobName,
         customerName,
         customerEmail,
         subtotal,
         tax,
-        total: totalWithTax,
-        status: 'Open/No Response',
-        createdAt: new Date().toISOString(),
-        pdfUrl
+        total
       });
 
-      // Clean up state
       await deletePendingTransactionState(from);
-
-      // Prepare response
-      reply = `✅ Quote for ${jobName} generated.\nSubtotal: ${currency} ${subtotal.toFixed(2)}\nTax (${(taxRate * 100).toFixed(2)}%): ${currency} ${tax.toFixed(2)}\nTotal: ${currency} ${totalWithTax.toFixed(2)}\nCustomer: ${customerName}\nDownload here: ${pdfUrl}`;
-      if (customerEmail) {
-        await sendEmail(customerEmail, `Your Quote for ${jobName}`, `Please find your quote attached.`, pdfUrl);
-        reply += `\nAlso sent to ${customerEmail}`;
-      }
-
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (pending quote processed)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      reply = `✅ Quote for ${jobName} generated.\nSubtotal: ${currency} ${subtotal.toFixed(2)}\nTax (${(taxRate * 100).toFixed(2)}%): ${currency} ${tax.toFixed(2)}\nTotal: ${currency} ${total.toFixed(2)}\nCustomer: ${customerName}${customerEmail ? `\nEmail: ${customerEmail}` : ''}`;
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // Handle quote status updates
-    const statusMatch = input.match(/^update quote\s+(.+?)\s+(open no response|open responded|closed win|closed lost)$/i);
+    const statusMatch = input.match(/^update quote\s+(\d+)\s+(open no response|open responded|closed win|closed lost)$/i);
     if (statusMatch) {
       const [, quoteId, status] = statusMatch;
       const normalizedStatus = status.toLowerCase().replace(/\s+/g, '/').replace('open/no/response', 'Open/No Response').replace('open/responded', 'Open/Responded').replace('closed/win', 'Closed/Win').replace('closed/lost', 'Closed/Lost');
-      await db.collection('users').doc(ownerId).collection('quotes').doc(quoteId).update({
-        status: normalizedStatus,
-        updatedAt: new Date().toISOString()
-      });
-      reply = `✅ Quote ${quoteId} updated to ${normalizedStatus}.`;
+      const success = await updateQuoteStatus(ownerId, quoteId, normalizedStatus);
+      reply = success ? `✅ Quote ${quoteId} updated to ${normalizedStatus}.` : `⚠️ Quote ${quoteId} not found or update failed.`;
       if (normalizedStatus === 'Closed/Win') {
-        reply += `\nWould you like to start a new job for this quote? Reply 'yes' or 'no'.`;
-        await setPendingTransactionState(from, { pendingJobCreation: { quoteId, jobName: (await db.collection('users').doc(ownerId).collection('quotes').doc(quoteId).get()).data().jobName } });
+        const quote = await pool.query(`SELECT job_name FROM quotes WHERE id = $1 AND owner_id = $2`, [quoteId, ownerId]);
+        if (quote.rows[0]) {
+          await setPendingTransactionState(from, { pendingJobCreation: { quoteId, jobName: quote.rows[0].job_name } });
+          reply += `\nWould you like to start a new job for this quote? Reply 'yes' or 'no'.`;
+        }
       }
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (quote status updated)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // Handle job creation from closed/won quote
     if (pendingState && pendingState.pendingJobCreation) {
       const { quoteId, jobName } = pendingState.pendingJobCreation;
-      if (input.toLowerCase() === 'yes') {
-        await db.collection('users').doc(ownerId).set({
-          activeJob: jobName,
-          jobHistory: admin.firestore.FieldValue.arrayUnion({
-            jobName,
-            startTime: new Date().toISOString(),
-            status: 'active'
-          })
-        }, { merge: true });
+      const lcInput = input.toLowerCase().trim();
+      if (lcInput === 'yes') {
+        await saveJob(ownerId, jobName, new Date().toISOString());
         await deletePendingTransactionState(from);
         reply = `✅ Job ${jobName} started from quote ${quoteId}.`;
-      } else if (input.toLowerCase() === 'no') {
+      } else if (lcInput === 'no') {
         await deletePendingTransactionState(from);
         reply = `Okay, no job created for quote ${quoteId}.`;
       } else {
         reply = `Please reply 'yes' or 'no' to confirm job creation for quote ${quoteId}.`;
       }
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (job creation response)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // Handle new quote from input
-    const quoteData = parseQuoteMessage(input);
+    const quoteData = await parseQuoteMessage(input);
     if (!quoteData) {
-      reply = `⚠️ Invalid quote format. Try: 'quote [amount] for [description] to [client]' or 'quote for [jobName] with [item1 qty price, item2 qty price]'`;
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (invalid quote)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      reply = `⚠️ Invalid quote format. Try: "quote $500 for Roof Repair to John" or "quote for Roof Repair with shingles 10 $50"`;
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // Fetch material prices for detailed quotes
-    const pricingSpreadsheetId = ownerProfile.pricingSpreadsheetId || process.env.DEFAULT_PRICING_SPREADSHEET_ID;
-    const materialPrices = await fetchMaterialPrices(pricingSpreadsheetId);
-    const quoteDetails = await buildQuoteDetails(quoteData, ownerProfile, materialPrices);
-
-    // Store pending quote state
+    const quoteDetails = await buildQuoteDetails(quoteData, ownerProfile);
     await setPendingTransactionState(from, { pendingQuote: quoteDetails });
+    const currency = userProfile.country === 'United States' ? 'USD' : 'CAD';
     reply = `📝 Quote prepared for ${quoteData.jobName}: ${currency} ${quoteDetails.total.toFixed(2)} for ${quoteDetails.description}.\nPlease provide the customer name or email to finalize.`;
-    await db.collection('locks').doc(lockKey).delete();
-    console.log(`[LOCK] Released lock for ${from} (quote prepared)`);
-    return res.send(`<Response><Message>${reply}</Message></Response>`);
-  } catch (err) {
-    console.error(`Error in handleQuote: ${err.message}`);
-    await db.collection('locks').doc(lockKey).delete();
-    console.log(`[LOCK] Released lock for ${from} (error)`);
-    return res.send(`<Response><Message>⚠️ Failed to process quote: ${err.message}</Message></Response>`);
+    return `<Response><Message>${reply}</Message></Response>`;
+  } catch (error) {
+    console.error(`[ERROR] handleQuote failed for ${from}:`, error.message);
+    reply = `⚠️ Failed to process quote: ${error.message}`;
+    return `<Response><Message>${reply}</Message></Response>`;
+  } finally {
+    await require('../middleware/lock').releaseLock(lockKey);
   }
 }
 

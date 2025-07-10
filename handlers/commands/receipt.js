@@ -1,5 +1,5 @@
 const { Pool } = require('pg');
-const { releaseLock } = require('../middleware/lock');
+const { releaseLock } = require('../../middleware/lock');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

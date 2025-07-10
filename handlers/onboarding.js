@@ -1,8 +1,8 @@
 const { createUserProfile, saveUserProfile, generateOTP } = require('../services/postgres');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-const { sendTemplateMessage, sendMessage } = require('../../services/twilio');
-const { confirmationTemplates } = require('../../config');
-const { getValidationLists, detectLocation } = require('../../utils/validateLocation');
+const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../utils/stateManager');
+const { sendTemplateMessage, sendMessage } = require('../services/twilio');
+const { confirmationTemplates } = require('../config');
+const { getValidationLists, detectLocation } = require('../utils/validateLocation');
 
 async function handleOnboarding(from, input, userProfile, ownerId) {
   const lockKey = `lock:${from}`;

@@ -314,16 +314,16 @@ async function deletePricingItem(ownerId, itemName) {
   }
 }
 
-async function createUserProfile({ phone, ownerId, onboarding_in_progress = false }) {
-  console.log('[DEBUG] createUserProfile called:', { phone, ownerId, onboarding_in_progress });
+async function createUserProfile({ user_id, ownerId, onboarding_in_progress = false }) {
+  console.log('[DEBUG] createUserProfile called:', { user_id, ownerId, onboarding_in_progress });
   try {
     const dashboard_token = require('crypto').randomBytes(16).toString('hex');
     const result = await pool.query(
-      `INSERT INTO users (user_id, phone, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO users (user_id, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (user_id) DO NOTHING
        RETURNING *`,
-      [phone, phone, ownerId, onboarding_in_progress, false, 'basic', dashboard_token]
+      [user_id, ownerId, onboarding_in_progress, false, 'basic', dashboard_token]
     );
     console.log('[DEBUG] createUserProfile success:', result.rows[0]);
     return result.rows[0];

@@ -1,23 +1,32 @@
-const { db } = require('../services/firebase');
+const { Pool } = require('pg');
+const { releaseLock } = require('./lock');
 
-/**
- * Error-handling middleware for Express routes.
- * Handles errors from webhook, parse, and deep-dive routes, formatting responses
- * appropriately (WhatsApp TwiML or JSON) and releasing locks for WhatsApp requests.
- * @param {Error} err - The error object.
- * @param {Object} req - The Express request object.
- * @param {Object} res - The Express response object.
- * @param {Function} next - The next middleware function.
- */
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function logError(from, error, context) {
+  console.log(`[DEBUG] logError called:`, { from, error: error.message, context });
+  try {
+    await pool.query(
+      `INSERT INTO error_logs (user_id, error_message, error_stack, context, created_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [from, error.message, error.stack, context]
+    );
+    console.log(`[DEBUG] Error logged for ${from}`);
+  } catch (dbError) {
+    console.error(`[ERROR] Failed to log error for ${from}:`, dbError.message);
+  }
+}
+
 async function errorMiddleware(err, req, res, next) {
   console.error(`[ERROR] ${req.method} ${req.path} failed:`, err.message, err.stack);
 
-  // Determine if this is a WhatsApp webhook request
   const isWebhook = req.path === '/webhook' && req.body.From;
-  const from = req.body.From ? req.body.From.replace(/\D/g, "") : 'unknown';
+  const from = req.body.From ? req.body.From.replace(/\D/g, '') : 'unknown';
   const lockKey = `lock:${from}`;
 
-  // Handle specific error cases
   let message = 'An error occurred. Please try again later.';
   let status = 500;
 
@@ -64,7 +73,7 @@ async function errorMiddleware(err, req, res, next) {
     message = '⚠️ No valid data extracted from media. Please try again with a clear image or audio.';
     status = 400;
   } else if (err.message.includes('Only the owner can')) {
-    message = err.message; // e.g., "Only the owner can start jobs"
+    message = err.message;
     status = 403;
   } else if (err.message.includes('Invalid delete request')) {
     message = '⚠️ Invalid delete request. Try: "delete expense $100 tools from Home Depot"';
@@ -74,22 +83,19 @@ async function errorMiddleware(err, req, res, next) {
     status = 500;
   }
 
-  // Release lock for WhatsApp requests
+  await logError(from, err, `${req.method} ${req.path}`);
+
   if (isWebhook) {
     try {
-      await db.collection('locks').doc(lockKey).delete();
+      await releaseLock(lockKey);
       console.log(`[LOCK] Released lock for ${from} (error)`);
     } catch (lockError) {
       console.error(`[ERROR] Failed to release lock for ${from}:`, lockError.message);
     }
-  }
-
-  // Format response based on route
-  if (isWebhook) {
-    res.send(`<Response><Message>${message}</Message></Response>`);
+    return res.send(`<Response><Message>${message}</Message></Response>`);
   } else {
-    res.status(status).json({ error: message });
+    return res.status(status).json({ error: message });
   }
 }
 
-module.exports = { errorMiddleware };
+module.exports = { logError, errorMiddleware };

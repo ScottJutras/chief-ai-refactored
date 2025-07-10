@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -317,15 +318,16 @@ async function deletePricingItem(ownerId, itemName) {
 async function createUserProfile({ user_id, ownerId, onboarding_in_progress = false }) {
   console.log('[DEBUG] createUserProfile called:', { user_id, ownerId, onboarding_in_progress });
   try {
-    const dashboard_token = require('crypto').randomBytes(16).toString('hex');
+    const dashboard_token = crypto.randomBytes(16).toString('hex');
     const result = await pool.query(
       `INSERT INTO users
-         (user_id, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token, phone, created_at)
+         (user_id, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token, created_at)
        VALUES
-         ($1, $2, $3, $4, $5, $6, $7, NOW())
-       ON CONFLICT (user_id) DO NOTHING
+         ($1, $2, $3, $4, $5, $6, NOW())
+       ON CONFLICT (user_id) DO UPDATE
+         SET onboarding_in_progress = EXCLUDED.onboarding_in_progress
        RETURNING *`,
-      [user_id, ownerId, onboarding_in_progress, false, 'basic', dashboard_token, user_id]
+      [user_id, ownerId, onboarding_in_progress, false, 'basic', dashboard_token]
     );
     console.log('[DEBUG] createUserProfile success:', result.rows[0]);
     return result.rows[0];

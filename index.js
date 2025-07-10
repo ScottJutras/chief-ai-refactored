@@ -18,7 +18,7 @@ app.get('/', (req, res) => {
   res.send('👋 Chief AI Webhook Server is up!');
 });
 
-app.use('/webhook', webhookRouter);
+app.use('/api/webhook', webhookRouter);
 app.use('/deep-dive', deepDiveRouter);
 app.use('/dashboard', dashboardRouter);
 

@@ -1,4 +1,4 @@
-const { createUserProfile, saveUserProfile, generateOTP } = require('../../services/postgres');
+const { createUserProfile, saveUserProfile, generateOTP } = require('../services/postgres');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
 const { sendTemplateMessage, sendMessage } = require('../../services/twilio');
 const { confirmationTemplates } = require('../../config');

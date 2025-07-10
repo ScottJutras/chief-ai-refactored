@@ -1,97 +1,78 @@
-// services/documentAI.js
-require('dotenv').config();
-const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
-const vision = require('@google-cloud/vision');
-const { parseReceiptText } = require('../utils/expenseParser');
 const { saveExpense, getActiveJob } = require('./postgres');
 
-// Decode your JSON key once
-const googleCredentials = JSON.parse(
-  Buffer.from(process.env.GOOGLE_CREDENTIALS_BASE64, 'base64').toString('utf-8')
-);
-
-/**
- * Returns an authenticated Document AI client using the proper regional endpoint.
- */
-function getDocumentAIClient() {
-  const location     = process.env.GCP_LOCATION    || 'us';
-  const apiEndpoint  = `${location}-documentai.googleapis.com`;
-  const projectId    = process.env.GCP_PROJECT_ID;
-  const processorId  = process.env.DOCUMENTAI_PROCESSOR_ID;
-  if (!projectId || !processorId) {
-    throw new Error('Missing GCP_PROJECT_ID or DOCUMENTAI_PROCESSOR_ID');
+async function parseReceiptText(text) {
+  console.log('[DEBUG] parseReceiptText called:', { text });
+  try {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const amt = lines.find(l => l.match(/\$?\d+\.\d{2}/));
+    const amount = amt ? amt.match(/\$?(\d+\.\d{2})/)?.[1] || '0.00' : '0.00';
+    const store = lines.find(l => !l.match(/\$?\d+\.\d{2}/)) || 'Unknown';
+    const result = { date: new Date().toISOString().split('T')[0], item: store, amount: `$${amount}`, store, category: 'Miscellaneous' };
+    console.log('[DEBUG] parseReceiptText result:', result);
+    return result;
+  } catch (error) {
+    console.error('[ERROR] parseReceiptText failed:', error.message);
+    throw error;
   }
-  return new DocumentProcessorServiceClient({
-    credentials: googleCredentials,
-    apiEndpoint
-  });
 }
 
-/**
- * Returns an authenticated Vision client.
- */
-function getVisionClient() {
-  return new vision.ImageAnnotatorClient({
-    credentials: googleCredentials
-  });
-}
-
-/**
- * Processes the provided image buffer via Document AI to return raw OCR text.
- */
-async function processDocumentAI(imageContent, mimeType = 'image/jpeg') {
-  const projectId   = process.env.GCP_PROJECT_ID;
-  const location    = process.env.GCP_LOCATION    || 'us';
-  const processorId = process.env.DOCUMENTAI_PROCESSOR_ID;
-  const name        = `projects/${projectId}/locations/${location}/processors/${processorId}`;
-  const client      = getDocumentAIClient();
-  const request     = { name, rawDocument: { content: imageContent, mimeType } };
-  const [result]    = await client.processDocument(request);
-  return result.document.text;
-}
-
-/**
- * Full receipt handling: OCR -> parse -> save.
- */
-async function handleReceiptImage(phoneNumber, imageContent, mimeType = 'image/jpeg') {
-  // 1) OCR via Document AI
-  const ocrText = await processDocumentAI(imageContent, mimeType);
-
-  // 2) Fallback: if DAi didn't pick anything up, try Vision’s text detection
-  if (!ocrText || ocrText.trim().length < 20) {
-    const visionClient = getVisionClient();
-    const [visionResult] = await visionClient.textDetection({ image: { content: imageContent } });
-    const altText       = (visionResult.textAnnotations || [])[0]?.description || '';
-    if (altText) {
-      console.log('[DEBUG] Vision OCR fallback:', altText);
-      ocrText = altText;
+async function parseMediaText(text) {
+  console.log('[DEBUG] parseMediaText called:', { text });
+  try {
+    const lcText = text.toLowerCase().trim();
+    if (lcText.match(/(punch in|punch out|break start|break end|lunch start|lunch end|drive start|drive end)/i)) {
+      const parts = lcText.split(' ');
+      const employeeName = parts[0];
+      const type = parts.slice(1).join(' ').match(/(punch in|punch out|break start|break end|lunch start|lunch end|drive start|drive end)/i)?.[1]?.replace(' ', '_').toLowerCase();
+      const timeMatch = lcText.match(/at\s+(\d{1,2}(?::\d{2})?\s*(am|pm))/i);
+      const timestamp = timeMatch ? new Date(`${new Date().toISOString().split('T')[0]} ${timeMatch[1]}`) : new Date();
+      if (!employeeName || !type || isNaN(timestamp)) {
+        throw new Error('Invalid time entry format');
+      }
+      return { type: 'time_entry', data: { employeeName, type, timestamp: timestamp.toISOString() } };
+    } else if (lcText.match(/\$?\d+\.\d{2}/)) {
+      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+      const amt = lines.find(l => l.match(/\$?\d+\.\d{2}/));
+      const amount = amt ? amt.match(/\$?(\d+\.\d{2})/)?.[1] || '0.00' : '0.00';
+      const store = lines.find(l => !l.match(/\$?\d+\.\d{2}/)) || 'Unknown';
+      return { type: 'expense', data: { date: new Date().toISOString().split('T')[0], item: store, amount: `$${amount}`, store, category: 'Miscellaneous' } };
+    } else {
+      const parts = lcText.split(' from ');
+      if (parts.length > 1 && parts[0].match(/\$?\d+\.\d{2}/)) {
+        const amount = parts[0].match(/\$?(\d+\.\d{2})/)?.[1] || '0.00';
+        const source = parts[1].trim() || 'Unknown';
+        return { type: 'revenue', data: { date: new Date().toISOString().split('T')[0], description: source, amount: `$${amount}`, source, category: 'Service' } };
+      }
+      throw new Error('Invalid media format');
     }
+  } catch (error) {
+    console.error('[ERROR] parseMediaText failed:', error.message);
+    throw error;
   }
-
-  // 3) Parse fields
-  const parsed = parseReceiptText(ocrText);
-  if (!parsed) throw new Error('Failed to parse receipt data');
-
-  // 4) Determine active job
-  const jobName = await getActiveJob(phoneNumber) || 'Uncategorized';
-
-  // 5) Persist to Postgres
-  await saveExpense({
-    ownerId:  phoneNumber,
-    date:     parsed.date,
-    item:     parsed.item,
-    amount:   parsed.amount,
-    store:    parsed.store,
-    jobName,
-    category: parsed.category,
-    user:     parsed.user || 'Unknown'
-  });
-
-  return `✅ Logged expense $${parsed.amount} for ${parsed.item}`;
 }
 
-module.exports = {
-  getDocumentAIClient,
-  processDocumentAI,
-  handleReceiptImage
-};
+async function handleReceiptImage(phoneNumber, text, mediaUrl) {
+  console.log('[DEBUG] handleReceiptImage called:', { phoneNumber, text, mediaUrl });
+  try {
+    const parsed = await parseReceiptText(text || 'Unknown receipt');
+    const jobName = await getActiveJob(phoneNumber) || 'Uncategorized';
+    await saveExpense({
+      ownerId: phoneNumber,
+      date: parsed.date,
+      item: parsed.item,
+      amount: parsed.amount,
+      store: parsed.store,
+      jobName,
+      category: parsed.category,
+      user: 'Unknown',
+      media_url: mediaUrl || null
+    });
+    console.log('[DEBUG] handleReceiptImage success for', phoneNumber);
+    return `✅ Logged expense ${parsed.amount} for ${parsed.item} from ${parsed.store}`;
+  } catch (error) {
+    console.error('[ERROR] handleReceiptImage failed for', phoneNumber, ':', error.message);
+    throw error;
+  }
+}
+
+module.exports = { parseReceiptText, parseMediaText, handleReceiptImage };

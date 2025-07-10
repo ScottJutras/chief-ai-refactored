@@ -1,34 +1,38 @@
-const { getUserProfile, createUserProfile, getOwnerProfile } = require('../services/postgres');
+const { getUserProfile, getOwnerProfile, createUserProfile } = require('../services/postgres');
+const { logError } = require('./error');
 
 async function userProfileMiddleware(req, res, next) {
-  console.log('[DEBUG] userProfileMiddleware invoked:', { from: req.body.From, timestamp: new Date().toISOString() });
+  // Always pull the phone number from Twilio's 'From'
+  const from = req.body.From ? req.body.From.replace(/\D/g, '') : '';
+  console.log('[DEBUG] userProfileMiddleware invoked:', { from, timestamp: new Date().toISOString() });
+
+  if (!from) {
+    console.error('[ERROR] Missing From in request body');
+    return res.status(400).send(`<Response><Message>⚠️ Invalid request: missing sender.</Message></Response>`);
+  }
+
   try {
-    const rawFrom = req.body.From || 'UNKNOWN_FROM';
-    const phoneNumber = rawFrom.replace(/\D/g, '');
-    let userProfile = await getUserProfile(phoneNumber);
+    let userProfile = await getUserProfile(from);
+    let ownerId = from;
+
     if (!userProfile) {
-      userProfile = await createUserProfile({
-        phone: phoneNumber,
-        ownerId: process.env.DEFAULT_OWNER_ID || phoneNumber,
-        onboarding_in_progress: true
-      });
-      console.log('[INFO] Created new user profile for', phoneNumber);
+      userProfile = await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
+      console.log('[INFO] Created new user profile for', from);
+    } else {
+      ownerId = userProfile.owner_id || from;
     }
-    req.userProfile = userProfile || { onboarding_completed: false, name: 'Unknown', country: 'Canada' };
-    req.ownerId = userProfile.ownerId || phoneNumber;
-    req.ownerProfile = await getOwnerProfile(req.ownerId) || {};
-    req.isOwner = req.ownerProfile.ownerId === userProfile.ownerId;
-    console.log('[DEBUG] userProfileMiddleware result:', { userProfile: req.userProfile });
+
+    const ownerProfile = await getOwnerProfile(ownerId);
+    req.userProfile = userProfile;
+    req.ownerId = ownerId;
+    req.ownerProfile = ownerProfile;
+
+    console.log('[DEBUG] userProfileMiddleware result:', { userProfile });
     next();
   } catch (error) {
     console.error('[ERROR] userProfileMiddleware failed:', error.message);
-    const phoneNumber = req.body.From ? req.body.From.replace(/\D/g, '') : 'UNKNOWN_FROM';
-    req.userProfile = { onboarding_completed: false, name: 'Unknown', country: 'Canada' };
-    req.ownerId = phoneNumber;
-    req.ownerProfile = {};
-    req.isOwner = true;
-    console.log('[DEBUG] userProfileMiddleware fallback applied');
-    next();
+    await logError(from, error, 'userProfileMiddleware');
+    res.status(500).send(`<Response><Message>⚠️ Failed to load your profile: ${error.message}</Message></Response>`);
   }
 }
 

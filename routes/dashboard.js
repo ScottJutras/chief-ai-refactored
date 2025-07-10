@@ -1,6 +1,7 @@
 const express = require('express');
 const { Pool } = require('pg');
 const { userProfileMiddleware } = require('../middleware/userProfile');
+const { tokenMiddleware } = require('../middleware/token');
 const { errorMiddleware } = require('../middleware/error');
 const { generateOTP, verifyOTP } = require('../services/postgres');
 const { sendMessage } = require('../services/twilio');
@@ -13,10 +14,10 @@ const pool = new Pool({
 
 router.get('/:userId', userProfileMiddleware, async (req, res, next) => {
   const { userId } = req.params;
-  const { userProfile, ownerId } = req;
+  const { userProfile } = req;
   const token = req.query.token;
 
-  if (userId !== userProfile.user_id && userId !== ownerId) {
+  if (userId !== userProfile.user_id) {
     throw new Error('Unauthorized access');
   }
 
@@ -47,12 +48,12 @@ router.get('/:userId', userProfileMiddleware, async (req, res, next) => {
   }
 });
 
-router.post('/:userId/verify', userProfileMiddleware, async (req, res, next) => {
+router.post('/:userId/verify', userProfileMiddleware, tokenMiddleware, async (req, res, next) => {
   const { userId } = req.params;
-  const { userProfile, ownerId } = req;
+  const { userProfile } = req;
   const { otp, token } = req.body;
 
-  if (userId !== userProfile.user_id && userId !== ownerId) {
+  if (userId !== userProfile.user_id) {
     throw new Error('Unauthorized access');
   }
 
@@ -76,19 +77,23 @@ router.post('/:userId/verify', userProfileMiddleware, async (req, res, next) => 
 
     const transactions = await pool.query(
       `SELECT * FROM transactions WHERE owner_id = $1 ORDER BY date DESC`,
-      [ownerId]
+      [userId]
     );
     const jobs = await pool.query(
       `SELECT * FROM jobs WHERE owner_id = $1 ORDER BY start_date DESC`,
-      [ownerId]
+      [userId]
     );
     const quotes = await pool.query(
       `SELECT * FROM quotes WHERE owner_id = $1 ORDER BY created_at DESC`,
-      [ownerId]
+      [userId]
     );
     const timeEntries = await pool.query(
       `SELECT * FROM time_entries WHERE owner_id = $1 ORDER BY timestamp DESC`,
-      [ownerId]
+      [userId]
+    );
+    const reports = await pool.query(
+      `SELECT * FROM reports WHERE user_id = $1 ORDER BY created_at DESC`,
+      [userId]
     );
 
     res.send(`
@@ -161,6 +166,19 @@ router.post('/:userId/verify', userProfileMiddleware, async (req, res, next) => 
                 <td>${t.type.replace('_', ' ')}</td>
                 <td>${new Date(t.timestamp).toLocaleString()}</td>
                 <td>${t.job || ''}</td>
+              </tr>
+            `).join('')}
+          </table>
+          <h2>Reports</h2>
+          <table>
+            <tr>
+              <th>Tier</th><th>Created At</th><th>Data</th>
+            </tr>
+            ${reports.rows.map(r => `
+              <tr>
+                <td>${r.tier}</td>
+                <td>${new Date(r.created_at).toLocaleString()}</td>
+                <td><pre>${JSON.stringify(r.report_data, null, 2)}</pre></td>
               </tr>
             `).join('')}
           </table>

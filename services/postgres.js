@@ -78,19 +78,19 @@ async function getActiveJob(ownerId) {
   }
 }
 
-async function saveJob(ownerId, jobName, startTime) {
+async function saveJob(ownerId, jobName, startDate) {
   console.log('[DEBUG] saveJob called:', { ownerId, jobName });
   try {
     await pool.query(
-      `INSERT INTO jobs (owner_id, job_name, start_time, status, created_at)
+      `INSERT INTO jobs (owner_id, job_name, start_date, status, created_at)
        VALUES ($1, $2, $3, 'active', NOW())`,
-      [ownerId, jobName, startTime]
+      [ownerId, jobName, startDate]
     );
     await pool.query(
       `UPDATE users
        SET active_job = $1, job_history = COALESCE(job_history, '[]'::jsonb) || $2::jsonb
        WHERE user_id = $3`,
-      [jobName, JSON.stringify([{ jobName, startTime, status: 'active' }]), ownerId]
+      [jobName, JSON.stringify([{ jobName, startDate, status: 'active' }]), ownerId]
     );
     console.log('[DEBUG] saveJob success');
   } catch (error) {
@@ -107,7 +107,7 @@ async function setActiveJob(ownerId, jobName) {
       [jobName, ownerId]
     );
     await pool.query(
-      `UPDATE jobs SET status = 'active', start_time = NOW() WHERE owner_id = $1 AND job_name = $2`,
+      `UPDATE jobs SET status = 'active', start_date = NOW() WHERE owner_id = $1 AND job_name = $2`,
       [ownerId, jobName]
     );
     console.log('[DEBUG] setActiveJob success');
@@ -122,7 +122,7 @@ async function finishJob(ownerId, jobName) {
   try {
     await pool.query(
       `UPDATE jobs
-       SET status = 'finished', updated_at = NOW()
+       SET status = 'finished', end_date = NOW(), updated_at = NOW()
        WHERE owner_id = $1 AND job_name = $2`,
       [ownerId, jobName]
     );
@@ -206,12 +206,12 @@ async function summarizeJob(ownerId, jobName) {
   console.log('[DEBUG] summarizeJob called:', { ownerId, jobName });
   try {
     const jobRes = await pool.query(
-      `SELECT start_time FROM jobs
+      `SELECT start_date FROM jobs
        WHERE owner_id = $1 AND job_name = $2 LIMIT 1`,
       [ownerId, jobName]
     );
-    const startTime = jobRes.rows[0]?.start_time ? new Date(jobRes.rows[0].start_time) : new Date();
-    const durationDays = ((new Date() - startTime) / (1000 * 60 * 60 * 24)).toFixed(2);
+    const startDate = jobRes.rows[0]?.start_date ? new Date(jobRes.rows[0].start_date) : new Date();
+    const durationDays = ((new Date() - startDate) / (1000 * 60 * 60 * 24)).toFixed(2);
 
     const transRes = await pool.query(
       `SELECT type, amount FROM transactions
@@ -393,7 +393,7 @@ async function getUserProfile(userId) {
 async function getOwnerProfile(ownerId) {
   console.log('[DEBUG] getOwnerProfile called:', { ownerId });
   try {
-    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [ownerId]);
+    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
     console.log('[DEBUG] getOwnerProfile result:', res.rows[0] || 'No owner found');
     return res.rows[0] || { ownerId };
   } catch (error) {

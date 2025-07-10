@@ -2,46 +2,63 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 20,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000
 });
 
-async function lockMiddleware(req, res, next) {
-  const from = req.body.From ? req.body.From.replace(/\D/g, '') : 'UNKNOWN_FROM';
-  const lockKey = `lock:${from}`;
-  const ttlSeconds = 5;
-  console.log('[LOCK] Attempting to acquire lock for', from);
-
+async function acquireLock(key) {
+  console.log('[LOCK] Attempting to acquire lock for', key);
   try {
-    const res = await pool.query(
+    const result = await pool.query(
       `INSERT INTO locks (lock_key, created_at)
        VALUES ($1, NOW())
-       ON CONFLICT (lock_key) DO UPDATE
-       SET created_at = NOW()
-       WHERE locks.created_at < NOW() - INTERVAL '5 seconds'
+       ON CONFLICT (lock_key) DO NOTHING
        RETURNING *`,
-      [lockKey]
+      [key]
     );
-    if (res.rows.length === 0) {
-      console.log('[LOCK] Stale lock detected for', from);
-      return res.status(429).send('<Response><Message>Too many requests, please try again later.</Message></Response>');
+    if (result.rows.length === 0) {
+      console.log('[LOCK] Lock acquisition failed for', key, ': already locked');
+      return false;
     }
-    console.log('[LOCK] Acquired lock for', from);
-    req.lockKey = lockKey;
-    next();
+    console.log('[LOCK] Acquired lock for', key);
+    return true;
   } catch (error) {
-    console.error('[ERROR] Lock acquisition failed:', error.message);
-    return res.status(500).send('<Response><Message>⚠️ Server error, please try again later.</Message></Response>');
+    console.error('[ERROR] acquireLock failed for', key, ':', error.message);
+    throw error;
   }
 }
 
-async function releaseLock(lockKey) {
-  console.log('[LOCK] Releasing lock for', lockKey);
+async function releaseLock(key) {
+  console.log('[LOCK] Releasing lock for', key);
   try {
-    await pool.query('DELETE FROM locks WHERE lock_key = $1', [lockKey]);
-    console.log('[LOCK] Released lock for', lockKey);
+    await pool.query(`DELETE FROM locks WHERE lock_key = $1`, [key]);
+    console.log('[LOCK] Released lock for', key);
   } catch (error) {
-    console.error('[ERROR] Lock release failed:', error.message);
+    console.error('[ERROR] releaseLock failed for', key, ':', error.message);
+    throw error;
   }
 }
 
-module.exports = { lockMiddleware, releaseLock };
+async function lockMiddleware(req, res, next) {
+  const key = req.body.From ? `lock:${req.body.From.replace(/\D/g, '')}` : null;
+  if (!key) {
+    console.error('[ERROR] Missing From in lockMiddleware');
+    return res.send(`<Response><Message>⚠️ Invalid request. Please try again.</Message></Response>`);
+  }
+  try {
+    const lockAcquired = await acquireLock(key);
+    if (!lockAcquired) {
+      console.log('[LOCK] Failed to acquire lock for', key);
+      return res.send(`<Response><Message>⚠️ Another request is being processed. Please try again shortly.</Message></Response>`);
+    }
+    req.lockKey = key;
+    next();
+  } catch (err) {
+    console.error('[ERROR] lockMiddleware failed for', key, ':', err.message);
+    next(err);
+  }
+}
+
+module.exports = { acquireLock, releaseLock, lockMiddleware };

@@ -319,11 +319,13 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
   try {
     const dashboard_token = require('crypto').randomBytes(16).toString('hex');
     const result = await pool.query(
-      `INSERT INTO users (user_id, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO users
+         (user_id, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token, phone, created_at)
+       VALUES
+         ($1, $2, $3, $4, $5, $6, $7, NOW())
        ON CONFLICT (user_id) DO NOTHING
        RETURNING *`,
-      [user_id, ownerId, onboarding_in_progress, false, 'basic', dashboard_token]
+      [user_id, ownerId, onboarding_in_progress, false, 'basic', dashboard_token, user_id]
     );
     console.log('[DEBUG] createUserProfile success:', result.rows[0]);
     return result.rows[0];

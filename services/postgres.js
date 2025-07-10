@@ -2,12 +2,14 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 20,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000
 });
 
 console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
 
-// --- Transaction logging ---
 async function appendToUserSpreadsheet(ownerId, data) {
   console.log('[DEBUG] appendToUserSpreadsheet called:', { ownerId, data });
   try {
@@ -60,7 +62,6 @@ async function deleteExpense(ownerId, criteria) {
   }
 }
 
-// --- Job management ---
 async function getActiveJob(ownerId) {
   console.log('[DEBUG] getActiveJob called:', { ownerId });
   try {
@@ -244,7 +245,6 @@ async function summarizeJob(ownerId, jobName) {
   }
 }
 
-// --- Dynamic pricing items ---
 async function addPricingItem(ownerId, itemName, unitCost, unit = 'each', category = 'material') {
   console.log('[DEBUG] addPricingItem called:', { ownerId, itemName, unitCost, unit, category });
   try {
@@ -314,50 +314,46 @@ async function deletePricingItem(ownerId, itemName) {
   }
 }
 
-// --- User & onboarding ---
-async function createUserProfile({ phone, ownerId, onboarding_in_progress }) {
+async function createUserProfile({ phone, ownerId, onboarding_in_progress = false }) {
   console.log('[DEBUG] createUserProfile called:', { phone, ownerId, onboarding_in_progress });
   try {
-    const dashboardToken = require('crypto').randomBytes(16).toString('hex');
-    const res = await pool.query(
-      `INSERT INTO users (user_id, owner_id, onboarding_in_progress, dashboard_token, created_at)
-       VALUES ($1, $2, $3, $4, NOW())
+    const dashboard_token = require('crypto').randomBytes(16).toString('hex');
+    const result = await pool.query(
+      `INSERT INTO users (user_id, phone, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (user_id) DO NOTHING
        RETURNING *`,
-      [phone, ownerId, onboarding_in_progress, dashboardToken]
+      [phone, phone, ownerId, onboarding_in_progress, false, 'basic', dashboard_token]
     );
-    console.log('[DEBUG] createUserProfile success:', res.rows[0]);
-    return res.rows[0];
+    console.log('[DEBUG] createUserProfile success:', result.rows[0]);
+    return result.rows[0];
   } catch (error) {
     console.error('[ERROR] createUserProfile failed:', error.message);
     throw error;
   }
 }
 
-async function saveUserProfile(userProfile) {
-  console.log('[DEBUG] saveUserProfile called:', { user_id: userProfile.user_id });
+async function saveUserProfile(profile) {
+  console.log('[DEBUG] saveUserProfile called:', { user_id: profile.user_id });
   try {
-    const { user_id, name, country, province, email, onboarding_in_progress, onboarding_completed, subscription_tier, trial_start, trial_end, token_usage, dashboard_token, industry } = userProfile;
-    await pool.query(
-      `INSERT INTO users
-        (user_id, name, country, province, email, onboarding_in_progress, onboarding_completed, subscription_tier, trial_start, trial_end, token_usage, dashboard_token, industry, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
-       ON CONFLICT (user_id) DO UPDATE SET
-         name = COALESCE(EXCLUDED.name, users.name),
-         country = COALESCE(EXCLUDED.country, users.country),
-         province = COALESCE(EXCLUDED.province, users.province),
-         email = COALESCE(EXCLUDED.email, users.email),
-         onboarding_in_progress = COALESCE(EXCLUDED.onboarding_in_progress, users.onboarding_in_progress),
-         onboarding_completed = COALESCE(EXCLUDED.onboarding_completed, users.onboarding_completed),
-         subscription_tier = COALESCE(EXCLUDED.subscription_tier, users.subscription_tier),
-         trial_start = COALESCE(EXCLUDED.trial_start, users.trial_start),
-         trial_end = COALESCE(EXCLUDED.trial_end, users.trial_end),
-         token_usage = COALESCE(EXCLUDED.token_usage, users.token_usage),
-         dashboard_token = COALESCE(EXCLUDED.dashboard_token, users.dashboard_token),
-         industry = COALESCE(EXCLUDED.industry, users.industry),
-         updated_at = NOW()`,
-      [user_id, name, country, province, email, onboarding_in_progress, onboarding_completed, subscription_tier, trial_start, trial_end, token_usage, dashboard_token, industry]
+    const result = await pool.query(
+      `UPDATE users
+       SET name = $1, country = $2, province = $3, business_country = $4, business_province = $5,
+           email = $6, onboarding_in_progress = $7, onboarding_completed = $8,
+           subscription_tier = $9, trial_start = $10, trial_end = $11, token_usage = $12,
+           goal = $13, goal_progress = $14, updated_at = NOW()
+       WHERE user_id = $15
+       RETURNING *`,
+      [
+        profile.name, profile.country, profile.province, profile.business_country,
+        profile.business_province, profile.email, profile.onboarding_in_progress,
+        profile.onboarding_completed, profile.subscription_tier || 'basic',
+        profile.trial_start, profile.trial_end, profile.token_usage, profile.goal,
+        profile.goalProgress, profile.user_id
+      ]
     );
-    console.log('[DEBUG] saveUserProfile success');
+    console.log('[DEBUG] saveUserProfile success:', result.rows[0]);
+    return result.rows[0];
   } catch (error) {
     console.error('[ERROR] saveUserProfile failed:', error.message);
     throw error;
@@ -388,7 +384,6 @@ async function getOwnerProfile(ownerId) {
   }
 }
 
-// --- File parsing ---
 async function parseFinancialFile(fileBuffer, fileType) {
   console.log('[DEBUG] parseFinancialFile called:', { fileType });
   try {
@@ -442,49 +437,6 @@ async function parseReceiptText(text) {
   }
 }
 
-// --- OTP & verification ---
-async function generateOTP(userId) {
-  console.log('[DEBUG] generateOTP called:', { userId });
-  try {
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiry = new Date(Date.now() + 10 * 60 * 1000);
-    await pool.query(
-      `UPDATE users SET otp = $1, otp_expiry = $2 WHERE user_id = $3`,
-      [otp, expiry, userId]
-    );
-    console.log('[DEBUG] generateOTP success:', { otp });
-    return otp;
-  } catch (error) {
-    console.error('[ERROR] generateOTP failed:', error.message);
-    throw error;
-  }
-}
-
-async function verifyOTP(userId, otp) {
-  console.log('[DEBUG] verifyOTP called:', { userId, otp });
-  try {
-    const res = await pool.query(
-      `SELECT otp, otp_expiry FROM users WHERE user_id = $1`,
-      [userId]
-    );
-    const user = res.rows[0];
-    if (!user || user.otp !== otp || new Date() > new Date(user.otp_expiry)) {
-      console.log('[DEBUG] verifyOTP failed: Invalid OTP or expired');
-      return false;
-    }
-    await pool.query(
-      `UPDATE users SET otp = NULL, otp_expiry = NULL WHERE user_id = $1`,
-      [userId]
-    );
-    console.log('[DEBUG] verifyOTP success');
-    return true;
-  } catch (error) {
-    console.error('[ERROR] verifyOTP failed:', error.message);
-    throw error;
-  }
-}
-
-// --- Time Entries ---
 async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = null) {
   console.log('[DEBUG] logTimeEntry called:', { ownerId, employeeName, type, timestamp, jobName });
   try {
@@ -567,6 +519,47 @@ async function generateTimesheet(ownerId, employeeName, period, date) {
   }
 }
 
+async function generateOTP(userId) {
+  console.log('[DEBUG] generateOTP called:', { userId });
+  try {
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiry = new Date(Date.now() + 10 * 60 * 1000);
+    await pool.query(
+      `UPDATE users SET otp = $1, otp_expiry = $2 WHERE user_id = $3`,
+      [otp, expiry, userId]
+    );
+    console.log('[DEBUG] generateOTP success:', { otp });
+    return otp;
+  } catch (error) {
+    console.error('[ERROR] generateOTP failed:', error.message);
+    throw error;
+  }
+}
+
+async function verifyOTP(userId, otp) {
+  console.log('[DEBUG] verifyOTP called:', { userId, otp });
+  try {
+    const res = await pool.query(
+      `SELECT otp, otp_expiry FROM users WHERE user_id = $1`,
+      [userId]
+    );
+    const user = res.rows[0];
+    if (!user || user.otp !== otp || new Date() > new Date(user.otp_expiry)) {
+      console.log('[DEBUG] verifyOTP failed: Invalid OTP or expired');
+      return false;
+    }
+    await pool.query(
+      `UPDATE users SET otp = NULL, otp_expiry = NULL WHERE user_id = $1`,
+      [userId]
+    );
+    console.log('[DEBUG] verifyOTP success');
+    return true;
+  } catch (error) {
+    console.error('[ERROR] verifyOTP failed:', error.message);
+    throw error;
+  }
+}
+
 module.exports = {
   appendToUserSpreadsheet,
   getActiveJob,
@@ -589,9 +582,9 @@ module.exports = {
   getOwnerProfile,
   parseFinancialFile,
   parseReceiptText,
-  generateOTP,
-  verifyOTP,
   logTimeEntry,
   getTimeEntries,
-  generateTimesheet
+  generateTimesheet,
+  generateOTP,
+  verifyOTP
 };

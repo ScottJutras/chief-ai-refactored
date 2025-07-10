@@ -1,5 +1,4 @@
-const { logTimeEntry, getTimeEntries, generateTimesheet, getActiveJob } = require('../services/postgres');
-
+const { logTimeEntry, getTimeEntries, generateTimesheet, getActiveJob } = require('../../services/postgres');
 async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lockKey = `lock:${from}`;
   let reply;

@@ -1,5 +1,5 @@
 const { Pool } = require('pg');
-const { getPendingTransactionState, deletePendingTransactionState } = require('../utils/stateManager');
+const { getPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

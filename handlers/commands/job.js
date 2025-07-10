@@ -7,8 +7,8 @@ const {
   pauseJob,
   resumeJob,
   summarizeJob
-} = require('../services/postgres');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../utils/stateManager');
+} = require('../../services/postgres');
+const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
 const { handleInputWithAI, parseJobMessage } = require('../utils/aiErrorHandler');
 
 const pool = new Pool({

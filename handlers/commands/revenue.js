@@ -1,6 +1,6 @@
 const { getActiveJob, appendToUserSpreadsheet } = require('../../services/postgres');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-const { handleInputWithAI, parseRevenueMessage, detectErrors, categorizeEntry } = require('../utils/aiErrorHandler');
+const { handleInputWithAI, parseRevenueMessage, detectErrors, categorizeEntry } = require('../../utils/aiErrorHandler');
 
 async function handleRevenue(from, input, userProfile, ownerId) {
   const lockKey = `lock:${from}`;

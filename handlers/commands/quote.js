@@ -1,7 +1,7 @@
 const { Pool } = require('pg');
 const { getActiveJob, saveJob } = require('../../services/postgres');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-const { parseQuoteMessage } = require('../utils/aiErrorHandler');
+const { parseQuoteMessage } = require('../../utils/aiErrorHandler');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

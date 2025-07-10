@@ -9,7 +9,7 @@ const {
   summarizeJob
 } = require('../../services/postgres');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-const { handleInputWithAI, parseJobMessage } = require('../utils/aiErrorHandler');
+const { handleInputWithAI, parseJobMessage } = require('../../utils/aiErrorHandler');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

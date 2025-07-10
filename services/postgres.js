@@ -158,6 +158,20 @@ async function createJob(ownerId, jobName) {
   }
 }
 
+async function finalizeJobCreation(ownerId, jobName, activate) {
+  console.log('[DEBUG] finalizeJobCreation called:', { ownerId, jobName, activate });
+  try {
+    await createJob(ownerId, jobName);
+    if (activate) {
+      await setActiveJob(ownerId, jobName);
+    }
+    console.log('[DEBUG] finalizeJobCreation success');
+  } catch (error) {
+    console.error('[ERROR] finalizeJobCreation failed:', error.message);
+    throw error;
+  }
+}
+
 async function pauseJob(ownerId, jobName) {
   console.log('[DEBUG] pauseJob called:', { ownerId, jobName });
   try {
@@ -573,6 +587,7 @@ module.exports = {
   setActiveJob,
   finishJob,
   createJob,
+  finalizeJobCreation,
   pauseJob,
   resumeJob,
   summarizeJob,

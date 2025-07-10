@@ -1,5 +1,5 @@
 const express = require('express');
-const { getUserProfile, getOwnerProfile } = require('../services/postgres');
+const { getUserProfile, getOwnerProfile, createUserProfile } = require('../services/postgres');
 const { acquireLock, releaseLock } = require('../middleware/lock');
 const { logError } = require('../middleware/error');
 const { tokenMiddleware } = require('../middleware/token');

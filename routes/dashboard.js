@@ -9,7 +9,10 @@ const { sendMessage } = require('../services/twilio');
 const router = express.Router();
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 20,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000
 });
 
 router.get('/:userId', userProfileMiddleware, async (req, res, next) => {
@@ -46,7 +49,7 @@ router.get('/:userId', userProfileMiddleware, async (req, res, next) => {
     console.error(`[ERROR] OTP generation failed for ${userId}:`, error.message);
     next(error);
   }
-});
+}, errorMiddleware);
 
 router.post('/:userId/verify', userProfileMiddleware, tokenMiddleware, async (req, res, next) => {
   const { userId } = req.params;

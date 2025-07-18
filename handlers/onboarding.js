@@ -17,11 +17,15 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       if (userProfile?.onboarding_completed) {
         return `<Response><Message>You've already completed onboarding. Reply 'help' for commands.</Message></Response>`;
       }
+      // Reset state for fresh start
+      state = { step: 1, responses: {}, detectedLocation: detectLocation(from), invalidAttempts: {} };
       userProfile = await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
-      state.step = 1;
       await setPendingTransactionState(from, state);
       return `<Response><Message>Welcome to Chief AI! Please reply with your full name.</Message></Response>`;
     }
+
+    // Ensure responses is defined
+    if (!state.responses) state.responses = {};
 
     // Step 1: Capture name (simple validation, no AI)
     if (state.step === 1) {

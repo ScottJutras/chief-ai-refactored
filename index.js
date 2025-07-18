@@ -26,6 +26,20 @@ app.get('/', (req, res) => {
   res.send('👋 Chief AI Webhook Server is up!');
 });
 
+// Check router objects to prevent "got Object" error
+function assertRouter(r, name) {
+  if (typeof r !== 'function' && typeof r !== 'object') {
+    throw new Error(`[BOOT] ${name} is not a valid router!`);
+  }
+  // If it's an object, try to detect a named export problem
+  if (typeof r === 'object' && typeof r.handle !== 'function') {
+    throw new Error(`[BOOT] ${name} looks like an object, not an Express router. Check your export!`);
+  }
+}
+assertRouter(webhookRouter, 'webhookRouter');
+assertRouter(dashboardRouter, 'dashboardRouter');
+assertRouter(deepDiveRouter, 'deepDiveRouter');
+
 app.use('/api/webhook', webhookRouter);
 app.use('/dashboard', dashboardRouter);
 app.use('/deep-dive', deepDiveRouter);

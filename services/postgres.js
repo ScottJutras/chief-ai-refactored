@@ -268,7 +268,6 @@ async function resumeJob(ownerId, jobName) {
 async function summarizeJob(ownerId, jobName) {
   console.log('[DEBUG] summarizeJob called:', { ownerId, jobName });
   try {
-    // Duration
     const jobRes = await pool.query(
       `SELECT start_date, end_date FROM jobs
        WHERE owner_id=$1 AND job_name=$2 LIMIT 1`,
@@ -279,7 +278,6 @@ async function summarizeJob(ownerId, jobName) {
     const end = end_date || new Date();
     const durationDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
 
-    // Expenses & Revenue
     const expRes = await pool.query(
       `SELECT COALESCE(SUM(amount::numeric),0) AS total_expenses
        FROM transactions
@@ -297,7 +295,6 @@ async function summarizeJob(ownerId, jobName) {
     const profit = revenue - materialCost;
     const profitMargin = revenue > 0 ? profit / revenue : 0;
 
-    // Labour
     const rateRes = await pool.query(
       `SELECT unit_cost FROM pricing_items
        WHERE owner_id=$1 AND category='labour' LIMIT 1`,

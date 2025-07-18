@@ -62,15 +62,49 @@ router.get('/:userId', userProfileMiddleware, async (req, res, next) => {
     return res.status(403).send('Invalid or missing dashboard token');
   }
 
+  // Just render the OTP entry form (no new OTP sent)
+  res.send(`
+    <html>
+      <head><title>Chief AI Dashboard - OTP Verification</title></head>
+      <body>
+        <h1>Chief AI Dashboard</h1>
+        <p>Please enter the OTP sent to your WhatsApp number:</p>
+        <form action="/dashboard/${userId}/verify" method="POST">
+          <input type="hidden" name="token" value="${token}">
+          <input type="text" name="otp" placeholder="Enter OTP" required>
+          <button type="submit">Verify</button>
+        </form>
+        <form action="/dashboard/${userId}/resend-otp" method="POST" style="margin-top:10px;">
+          <input type="hidden" name="token" value="${token}">
+          <button type="submit">Resend OTP</button>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+// POST /dashboard/:userId/resend-otp
+router.post('/:userId/resend-otp', userProfileMiddleware, async (req, res, next) => {
+  const { userId } = req.params;
+  const { userProfile } = req;
+  const token = req.body.token;
+
+  if (userId !== userProfile.user_id) {
+    return res.status(403).send('Unauthorized access');
+  }
+
+  if (!token || token !== userProfile.dashboard_token) {
+    return res.status(403).send('Invalid or missing dashboard token');
+  }
+
   try {
     const otp = await generateOTP(userId);
     await sendMessage(userId, `Your Chief AI dashboard OTP is ${otp}. It expires in 10 minutes.`);
     res.send(`
       <html>
-        <head><title>Chief AI Dashboard - OTP Verification</title></head>
         <body>
-          <h1>Chief AI Dashboard</h1>
-          <p>Please enter the OTP sent to your WhatsApp number:</p>
+          <h1>OTP Resent</h1>
+          <p>We’ve sent you a new OTP! Please check your WhatsApp and enter it below.</p>
           <form action="/dashboard/${userId}/verify" method="POST">
             <input type="hidden" name="token" value="${token}">
             <input type="text" name="otp" placeholder="Enter OTP" required>
@@ -80,7 +114,6 @@ router.get('/:userId', userProfileMiddleware, async (req, res, next) => {
       </html>
     `);
   } catch (error) {
-    console.error(`[ERROR] OTP generation failed for ${userId}:`, error.message);
     next(error);
   }
 });

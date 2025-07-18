@@ -3,34 +3,33 @@ const { getPendingTransactionState, setPendingTransactionState, deletePendingTra
 const { sendTemplateMessage, sendMessage } = require('../services/twilio');
 const { confirmationTemplates } = require('../config');
 const { getValidationLists, detectLocation } = require('../utils/validateLocation');
-const { releaseLock } = require('../middleware/lock');
+const { handleInputWithAI, handleError } = require('../utils/aiErrorHandler');
 
 async function handleOnboarding(from, input, userProfile, ownerId) {
-  const lockKey = `lock:${from}`;
   try {
-    let state = await getPendingTransactionState(from) || { step: 0, responses: {}, detectedLocation: detectLocation(from) };
-    const msg = input?.trim() || '';
+    let state = await getPendingTransactionState(from) || { step: userProfile.onboarding_step || 0, responses: {}, detectedLocation: detectLocation(from), invalidAttempts: {} };
+    const msg = input?.trim().toLowerCase() || '';
 
     console.log(`[DEBUG] Onboarding state for ${from}: step=${state.step}, response=${msg}`);
 
     // Step 0: Start onboarding
-    if (state.step === 0 || msg.toLowerCase() === 'start onboarding') {
+    if (state.step === 0 || msg === 'start onboarding') {
       if (userProfile?.onboarding_completed) {
-        return await sendMessage(from, "You've already completed onboarding. Reply 'help' for commands.");
+        return `<Response><Message>You've already completed onboarding. Reply 'help' for commands.</Message></Response>`;
       }
-      await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
-      userProfile = await getUserProfile(from);
+      userProfile = await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
       state.step = 1;
       await setPendingTransactionState(from, state);
-      return await sendMessage(from, 'Welcome to Chief AI! Please reply with your full name.');
+      return `<Response><Message>Welcome to Chief AI! Please reply with your full name.</Message></Response>`;
     }
 
-    // Step 1: Capture name
+    // Step 1: Capture name (simple validation, no AI)
     if (state.step === 1) {
-      if (!msg) {
-        return await sendMessage(from, 'Please provide your full name to continue.');
+      const name = input.trim();
+      if (!name || name.length < 2) {
+        return `<Response><Message>Please provide your full name to continue.</Message></Response>`;
       }
-      state.responses.name = msg;
+      state.responses.name = name;
       state.step = 2;
       await setPendingTransactionState(from, state);
       return await sendTemplateMessage(from, confirmationTemplates.locationConfirmation, [
@@ -41,55 +40,61 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
 
     // Step 2: Confirm location
     if (state.step === 2) {
-      const lc = msg.toLowerCase();
-      if (lc === 'yes') {
-        state.step = 3;
+      if (msg === 'yes') {
         state.responses.location = state.detectedLocation;
+        state.step = 3;
         await setPendingTransactionState(from, state);
         return await sendTemplateMessage(from, confirmationTemplates.businessLocationConfirmation, []);
-      } else if (lc === 'edit') {
+      } else if (msg === 'edit') {
         state.step = 2.5;
         await setPendingTransactionState(from, state);
-        return await sendMessage(from, "Please provide your State/Province, Country (e.g., 'Ontario, Canada').");
-      } else if (lc === 'cancel') {
+        return `<Response><Message>Please provide your State/Province, Country (e.g., 'Ontario, Canada').</Message></Response>`;
+      } else if (msg === 'cancel') {
         await deletePendingTransactionState(from);
-        await saveUserProfile({ user_id: from, onboarding_in_progress: false });
-        return await sendMessage(from, "Onboarding cancelled. Reply 'start onboarding' to begin again.");
+        await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+        return `<Response><Message>Onboarding cancelled. Reply 'start onboarding' to begin again.</Message></Response>`;
       } else {
-        return await sendMessage(from, "Please reply with 'yes', 'edit', or 'cancel' to confirm your location.");
+        return `<Response><Message>Please reply with 'yes', 'edit', or 'cancel' to confirm your location.</Message></Response>`;
       }
     }
 
     // Step 2.5: Manual location edit
     if (state.step === 2.5) {
-      if (!msg) {
-        return await sendMessage(from, "Please provide your State/Province, Country (e.g., 'Ontario, Canada').");
-      }
       const { knownProvinces, knownCountries } = getValidationLists();
       const countryAliases = { 'united states': 'United States', 'us': 'United States', 'canada': 'Canada' };
-      let province, country;
-      const match = msg.match(/^(.+?)[\s,]+(.+)$/);
-      if (match) {
-        province = match[1].trim();
-        country = match[2].trim();
-      } else {
-        const parts = msg.trim().split(/\s+/);
-        country = parts.pop();
-        province = parts.join(' ').trim();
-      }
-      country = countryAliases[country.toLowerCase()] || country;
-      const isValidProvince = knownProvinces.some(p => p.toLowerCase() === province.toLowerCase());
-      const isValidCountry = knownCountries.some(c => c.toLowerCase() === country.toLowerCase());
-      if (!isValidProvince || !isValidCountry) {
-        state.invalidLocationAttempts = (state.invalidLocationAttempts || 0) + 1;
-        if (state.invalidLocationAttempts > 3) {
-          await deletePendingTransactionState(from);
-          await saveUserProfile({ user_id: from, onboarding_in_progress: false });
-          return await sendMessage(from, "Too many invalid location attempts. Onboarding cancelled.");
+      const defaultData = { province: '', country: '' };
+      const parseFn = input => {
+        let province, country;
+        const match = input.match(/^(.+?)[\s,]+(.+)$/i);
+        if (match) {
+          province = match[1].trim();
+          country = match[2].trim();
+        } else {
+          const parts = input.trim().split(/\s+/);
+          country = parts.pop();
+          province = parts.join(' ').trim();
         }
-        return await sendMessage(from, "Invalid location. Please use 'State/Province, Country' format (e.g., 'Ontario, Canada').");
+        country = countryAliases[country.toLowerCase()] || country;
+        const isValidProvince = knownProvinces.some(p => p.toLowerCase() === province.toLowerCase());
+        const isValidCountry = knownCountries.some(c => c.toLowerCase() === country.toLowerCase());
+        if (!isValidProvince || !isValidCountry) {
+          return null;
+        }
+        return { province, country };
+      };
+      const { data, reply, confirmed } = await handleInputWithAI(from, input, 'location', parseFn, defaultData);
+      if (!confirmed) {
+        state.invalidAttempts.location = (state.invalidAttempts.location || 0) + 1;
+        if (state.invalidAttempts.location > 3) {
+          await deletePendingTransactionState(from);
+          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          return `<Response><Message>Too many invalid location attempts. Onboarding cancelled.</Message></Response>`;
+        }
+        await setPendingTransactionState(from, state);
+        return `<Response><Message>${reply || "Invalid location. Please use 'State/Province, Country' format (e.g., 'Ontario, Canada')."}</Message></Response>`;
       }
-      state.responses.location = { province, country };
+      state.responses.location = data;
+      state.invalidAttempts.location = 0; // Reset on success
       state.step = 3;
       await setPendingTransactionState(from, state);
       return await sendTemplateMessage(from, confirmationTemplates.businessLocationConfirmation, []);
@@ -97,79 +102,93 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
 
     // Step 3: Confirm business location
     if (state.step === 3) {
-      const lc = msg.toLowerCase();
-      if (lc === 'yes') {
-        state.step = 4;
+      if (msg === 'yes') {
         state.responses.business_location = state.responses.location;
+        state.step = 4;
         await setPendingTransactionState(from, state);
-        return await sendMessage(from, "Please share your email address for your financial dashboard.");
-      } else if (lc === 'no') {
+        return `<Response><Message>Please share your email address for your financial dashboard.</Message></Response>`;
+      } else if (msg === 'no') {
         state.step = 3.5;
         await setPendingTransactionState(from, state);
-        return await sendMessage(from, "Please provide your business's registered State/Province, Country (e.g., 'Ontario, Canada').");
-      } else if (lc === 'cancel') {
+        return `<Response><Message>Please provide your business's registered State/Province, Country (e.g., 'Ontario, Canada').</Message></Response>`;
+      } else if (msg === 'cancel') {
         await deletePendingTransactionState(from);
-        await saveUserProfile({ user_id: from, onboarding_in_progress: false });
-        return await sendMessage(from, "Onboarding cancelled. Reply 'start onboarding' to begin again.");
+        await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+        return `<Response><Message>Onboarding cancelled. Reply 'start onboarding' to begin again.</Message></Response>`;
       } else {
-        return await sendMessage(from, "Please reply with 'yes', 'no', or 'cancel' to confirm your business location.");
+        return `<Response><Message>Please reply with 'yes', 'no', or 'cancel' to confirm your business location.</Message></Response>`;
       }
     }
 
     // Step 3.5: Manual business location edit
     if (state.step === 3.5) {
-      if (!msg) {
-        return await sendMessage(from, "Please provide your business's registered State/Province, Country (e.g., 'Ontario, Canada').");
-      }
       const { knownProvinces, knownCountries } = getValidationLists();
       const countryAliases = { 'united states': 'United States', 'us': 'United States', 'canada': 'Canada' };
-      let businessProvince, businessCountry;
-      const match = msg.match(/^(.+?)[\s,]+(.+)$/);
-      if (match) {
-        businessProvince = match[1].trim();
-        businessCountry = match[2].trim();
-      } else {
-        const parts = msg.trim().split(/\s+/);
-        businessCountry = parts.pop();
-        businessProvince = parts.join(' ').trim();
-      }
-      businessCountry = countryAliases[businessCountry.toLowerCase()] || businessCountry;
-      const isValidProvince = knownProvinces.some(p => p.toLowerCase() === businessProvince.toLowerCase());
-      const isValidCountry = knownCountries.some(c => c.toLowerCase() === businessCountry.toLowerCase());
-      if (!isValidProvince || !isValidCountry) {
-        state.invalidLocationAttempts = (state.invalidLocationAttempts || 0) + 1;
-        if (state.invalidLocationAttempts > 3) {
-          await deletePendingTransactionState(from);
-          await saveUserProfile({ user_id: from, onboarding_in_progress: false });
-          return await sendMessage(from, "Too many invalid location attempts. Onboarding cancelled.");
+      const defaultData = { province: '', country: '' };
+      const parseFn = input => {
+        let province, country;
+        const match = input.match(/^(.+?)[\s,]+(.+)$/i);
+        if (match) {
+          province = match[1].trim();
+          country = match[2].trim();
+        } else {
+          const parts = input.trim().split(/\s+/);
+          country = parts.pop();
+          province = parts.join(' ').trim();
         }
-        return await sendMessage(from, "Invalid business location. Please use 'State/Province, Country' format (e.g., 'Ontario, Canada').");
+        country = countryAliases[country.toLowerCase()] || country;
+        const isValidProvince = knownProvinces.some(p => p.toLowerCase() === province.toLowerCase());
+        const isValidCountry = knownCountries.some(c => c.toLowerCase() === country.toLowerCase());
+        if (!isValidProvince || !isValidCountry) {
+          return null;
+        }
+        return { province, country };
+      };
+      const { data, reply, confirmed } = await handleInputWithAI(from, input, 'business_location', parseFn, defaultData);
+      if (!confirmed) {
+        state.invalidAttempts.business_location = (state.invalidAttempts.business_location || 0) + 1;
+        if (state.invalidAttempts.business_location > 3) {
+          await deletePendingTransactionState(from);
+          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          return `<Response><Message>Too many invalid location attempts. Onboarding cancelled.</Message></Response>`;
+        }
+        await setPendingTransactionState(from, state);
+        return `<Response><Message>${reply || "Invalid business location. Please use 'State/Province, Country' format (e.g., 'Ontario, Canada')."}</Message></Response>`;
       }
-      state.responses.business_location = { province: businessProvince, country: businessCountry };
+      state.responses.business_location = data;
+      state.invalidAttempts.business_location = 0; // Reset on success
       state.step = 4;
       await setPendingTransactionState(from, state);
-      return await sendMessage(from, "Please share your email address for your financial dashboard.");
+      return `<Response><Message>Please share your email address for your financial dashboard.</Message></Response>`;
     }
 
-    // Step 4: Collect email
+    // Step 4: Collect email (simple validation, no AI)
     if (state.step === 4) {
-      if (!msg || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(msg)) {
-        return await sendMessage(from, "Please provide a valid email address for your financial dashboard.");
+      const email = input.trim();
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        state.invalidAttempts.email = (state.invalidAttempts.email || 0) + 1;
+        if (state.invalidAttempts.email > 3) {
+          await deletePendingTransactionState(from);
+          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          return `<Response><Message>Too many invalid attempts. Onboarding cancelled.</Message></Response>`;
+        }
+        await setPendingTransactionState(from, state);
+        return `<Response><Message>Please provide a valid email address for your financial dashboard.</Message></Response>`;
       }
-      state.responses.email = msg;
-      userProfile = {
+      state.responses.email = email;
+      state.invalidAttempts.email = 0; // Reset on success
+      const userProfileData = {
         ...userProfile,
-        user_id: from,
         name: state.responses.name,
         country: state.responses.location.country,
         province: state.responses.location.province,
         business_country: state.responses.business_location.country,
         business_province: state.responses.business_location.province,
-        email: msg,
-        onboarding_in_progress: false,
-        onboarding_completed: true
+        email: state.responses.email,
+        onboarding_in_progress: true,
+        onboarding_completed: false
       };
-      await saveUserProfile(userProfile);
+      await saveUserProfile(userProfileData);
       userProfile = await getUserProfile(from);
       const otp = await generateOTP(from);
       const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${from}?token=${userProfile.dashboard_token}`;
@@ -206,46 +225,63 @@ Let’s build something great.
       await sendMessage(from, congratsMessage);
       state.step = 5;
       await setPendingTransactionState(from, state);
-      return await sendMessage(from, "Please provide your industry (e.g., Construction, Freelancer).");
+      return `<Response><Message>Please provide your industry (e.g., Construction, Freelancer).</Message></Response>`;
     }
 
-    // Step 5: Collect industry
+    // Step 5: Collect industry (simple validation, no AI)
     if (state.step === 5) {
-      if (!msg) {
-        return await sendMessage(from, "Please provide your industry (e.g., Construction, Freelancer).");
+      const industry = input.trim();
+      if (!industry || industry.length < 3) {
+        state.invalidAttempts.industry = (state.invalidAttempts.industry || 0) + 1;
+        if (state.invalidAttempts.industry > 3) {
+          await deletePendingTransactionState(from);
+          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          return `<Response><Message>Too many invalid attempts. Onboarding cancelled.</Message></Response>`;
+        }
+        await setPendingTransactionState(from, state);
+        return `<Response><Message>Please provide your industry (e.g., Construction, Freelancer).</Message></Response>`;
       }
-      userProfile.industry = msg;
+      userProfile.industry = industry;
+      state.invalidAttempts.industry = 0; // Reset on success
       await saveUserProfile({ ...userProfile, user_id: from });
       state.step = 6;
       await setPendingTransactionState(from, state);
-      return await sendMessage(from, "Please set a financial goal (e.g., 'Grow profit by $10000' or 'Pay off $5000 debt').");
+      return `<Response><Message>Please set a financial goal (e.g., 'Grow profit by $10000' or 'Pay off $5000 debt').</Message></Response>`;
     }
 
-    // Step 6: Collect goal
+    // Step 6: Collect goal (keep AI for parsing, as goals have specific format)
     if (state.step === 6) {
-      if (!msg || !msg.match(/\d+/) || (!msg.includes('profit') && !msg.includes('debt'))) {
-        return await sendMessage(from, "Invalid goal. Try 'Grow profit by $10000' or 'Pay off $5000 debt'.");
+      const defaultData = { goal: '' };
+      const { data, reply, confirmed } = await handleInputWithAI(from, input, 'goal', input => ({ goal: input.trim() }), defaultData);
+      if (!confirmed || !data.goal.match(/\d+/) || (!data.goal.includes('profit') && !data.goal.includes('debt'))) {
+        state.invalidAttempts.goal = (state.invalidAttempts.goal || 0) + 1;
+        if (state.invalidAttempts.goal > 3) {
+          await deletePendingTransactionState(from);
+          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          return `<Response><Message>Too many invalid attempts. Onboarding cancelled.</Message></Response>`;
+        }
+        await setPendingTransactionState(from, state);
+        return `<Response><Message>${reply || "Invalid goal. Try 'Grow profit by $10000' or 'Pay off $5000 debt'."}</Message></Response>`;
       }
-      userProfile.goal = msg;
-      userProfile.goalProgress = {
-        target: msg.includes('debt')
-          ? -parseFloat(msg.match(/\d+/)?.[0] || 5000) * 1000
-          : parseFloat(msg.match(/\d+/)?.[0] || 10000) * 1000,
+      userProfile.goal = data.goal;
+      userProfile.goal_progress = {
+        target: data.goal.includes('debt')
+          ? -parseFloat(data.goal.match(/\d+/)?.[0] || 5000) * 1000
+          : parseFloat(data.goal.match(/\d+/)?.[0] || 10000) * 1000,
         current: 0
       };
-      await saveUserProfile({ ...userProfile, user_id: from });
+      state.invalidAttempts.goal = 0; // Reset on success
+      await saveUserProfile({ ...userProfile, onboarding_in_progress: false, onboarding_completed: true });
       const currency = userProfile.country === 'United States' ? 'USD' : 'CAD';
       await deletePendingTransactionState(from);
-      return await sendMessage(from, `✅ Goal set: "${msg}" (${currency} ${userProfile.goalProgress.target.toFixed(2)}). You're ready to go!`);
+      return `<Response><Message>✅ Goal set: "${data.goal}" (${currency} ${userProfile.goal_progress.target.toFixed(2)}). You're ready to go!</Message></Response>`;
     }
 
     // Fallback
-    return await sendMessage(from, "Unknown onboarding state. Reply 'start onboarding' to begin again.");
-  } catch (err) {
-    console.error(`[ERROR] handleOnboarding failed for ${from}:`, err.message);
-    return await sendMessage(from, `⚠️ Failed to process onboarding: ${err.message}`);
-  } finally {
-    await releaseLock(lockKey);
+    return `<Response><Message>Unknown onboarding state. Reply 'start onboarding' to begin again.</Message></Response>`;
+  } catch (error) {
+    console.error('[ERROR] handleOnboarding failed for', from, ':', error.message);
+    return await handleError(from, error, 'handleOnboarding', input);
   }
 }
 

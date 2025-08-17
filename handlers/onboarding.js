@@ -49,10 +49,12 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.step = 2;
       await setPendingTransactionState(from, state);
 
-      await sendTemplateMessage(from, confirmationTemplates.locationConfirmation, [
-        state.detectedLocation.province,
-        state.detectedLocation.country
-      ]);
+      // SEND QUICK REPLY TEMPLATE (strings, not objects) + return empty TwiML
+      await sendTemplateMessage(
+        from,
+        confirmationTemplates.locationConfirmation, // HX content SID
+        [ state.detectedLocation.province, state.detectedLocation.country ]
+      );
       return `<Response></Response>`;
     }
 

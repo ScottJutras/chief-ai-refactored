@@ -1,64 +1,49 @@
 require('dotenv').config();
 const twilio = require('twilio');
 
-const client = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-/**
- * Plain text / media message
- */
+// Plain message
 async function sendMessage(to, body) {
+  const dest = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
   try {
     const message = await client.messages.create({
       body,
-      // Use EITHER messagingServiceSid OR from. Prefer the service for WhatsApp senders.
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
-      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+      to: dest,
     });
-    console.log(`[✅ SUCCESS] Message sent: ${message.sid}`);
+    console.log(`[✅ SUCCESS] Message sent: ${message.sid} channel=${message.channel || 'n/a'}`);
     return message.sid;
   } catch (error) {
-    console.error('[ERROR] Failed to send message:', error?.message, error?.code, error?.moreInfo);
+    console.error('[ERROR] Failed to send message:', error.message, error.code, error.moreInfo);
     throw error;
   }
 }
 
-/**
- * WhatsApp buttons must be sent via an approved Content Template (twilio/quick-reply).
- * Pass the HX Content SID and numbered variables matching {{1}}, {{2}}, etc.
- */
-async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
+// Content Template (Quick Reply)
+async function sendTemplateMessage(to, contentSid, contentVariables = []) {
+  const dest = to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
+  if (!contentSid) throw new Error('Missing ContentSid');
+
+  // Normalize to {"1":"..","2":".."} as WhatsApp expects numbered placeholders
+  const normalized = Array.isArray(contentVariables)
+    ? contentVariables.reduce((acc, v, i) => {
+        acc[String(i + 1)] = typeof v === 'string' ? v : (v?.text ?? String(v ?? ''));
+        return acc;
+      }, {})
+    : contentVariables;
+
   try {
-    if (!contentSid) {
-      throw new Error('Missing ContentSid');
-    }
-
-    // Normalize variables: accept array => { "1": "...", "2": "..." }
-    const normalized =
-      Array.isArray(contentVariables)
-        ? contentVariables.reduce((acc, val, i) => {
-            acc[(i + 1).toString()] = typeof val === 'string' ? val : val?.text ?? '';
-            return acc;
-          }, {})
-        : contentVariables;
-
     const message = await client.messages.create({
       contentSid,
       contentVariables: JSON.stringify(normalized),
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
-      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+      to: dest,
     });
-
-    console.log(`[✅ SUCCESS] Template message sent: ${message.sid}`);
+    console.log(`[✅ SUCCESS] Template sent: ${message.sid} contentSid=${contentSid}`);
     return message.sid;
   } catch (error) {
-    // Common causes of “plain text fallback”:
-    // - Template not approved / wrong type (not twilio/quick-reply)
-    // - Using Sandbox sender
-    // - Variables don’t match placeholders
-    console.error('[ERROR] Failed to send template message:', error?.message, error?.code, error?.moreInfo);
+    console.error('[ERROR] Failed to send template:', error.message, error.code, error.moreInfo);
     throw error;
   }
 }

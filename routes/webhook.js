@@ -11,7 +11,6 @@ const { parseUpload } = require('../services/deepDive');
 const { getPendingTransactionState, setPendingTransactionState } = require('../utils/stateManager');
 const { handleGenericQuery } = require('../services/openAI');
 const { handleOnboarding } = require('../handlers/onboarding');
-const { handleUserInfo } = require('../handlers/userInfo');
 const { handleTeamSetup } = require('../handlers/teamSetup');
 const { handleUserTraining } = require('../handlers/userTraining');
 const { handleExpense } = require('../handlers/commands/expense');
@@ -67,6 +66,11 @@ router.post('/', lockMiddleware, userProfileMiddleware, tokenMiddleware, async (
       const paymentLink = await stripe.paymentLinks.create({
         line_items: [{ price: priceId, quantity: 1 }],
         metadata: { user_id: userProfile.user_id }
+      });
+      const { Pool } = require('pg');
+      const pool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
       });
       await pool.query(
         `UPDATE users SET stripe_customer_id=$1, subscription_tier=$2 WHERE user_id=$3`,

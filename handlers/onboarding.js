@@ -11,33 +11,53 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Treat the profile as "incomplete" if any of these are empty/null/undefined
+// Adjust the field names to match your schema if needed.
+const REQUIRED_PROFILE_FIELDS = ['user_id', 'phone']; // <— add/adjust keys you consider mandatory
+
+function isBlank(v) {
+  return v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
+}
+function isProfileIncomplete(profile) {
+  if (!profile) return true;
+  return REQUIRED_PROFILE_FIELDS.some(k => k in profile ? isBlank(profile[k]) : true);
+}
+
 async function handleOnboarding(from, input, userProfile, ownerId) {
   try {
     const msgRaw = input || '';
     const msg = msgRaw.trim().toLowerCase();
     const wantsReset = msg === 'reset onboarding' || msg === 'start onboarding';
 
-    // Always verify the real DB row to avoid stale caller-provided userProfile.
+    // Always fetch fresh DB profile to avoid stale caller data
     let dbProfile = null;
-    try {
-      dbProfile = await getUserProfile(from);
-    } catch (_) {}
+    try { dbProfile = await getUserProfile(from); } catch (_) {}
     let profile = dbProfile || userProfile || null;
-    const hasDbUser = !!(dbProfile && (dbProfile.user_id || dbProfile.id));
 
-    // If the DB row is missing OR user explicitly wants to restart:
-    if (!hasDbUser || wantsReset) {
+    const hasDbUser = !!dbProfile; // row exists
+    const missingRequiredFields = isProfileIncomplete(dbProfile); // e.g., phone removed
+
+    // Reset when:
+    // - user typed reset/start
+    // - no DB row
+    // - DB row exists but is incomplete (e.g., phone removed)
+    if (wantsReset || !hasDbUser || missingRequiredFields) {
       await clearUserState(from).catch(() => {}); // ignore if locks table doesn't exist
-      profile = hasDbUser
-        ? dbProfile
-        : await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
+
+      if (!hasDbUser) {
+        profile = await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
+      } else {
+        // row exists but incomplete -> mark as (re)onboarding
+        profile = { ...dbProfile, onboarding_in_progress: true, onboarding_completed: false };
+        await saveUserProfile(profile);
+      }
 
       const state = { step: 1, responses: {}, detectedLocation: detectLocation(from), invalidAttempts: {} };
       await setPendingTransactionState(from, state);
       return `<Response><Message>Welcome to Chief AI! Please reply with your full name.</Message></Response>`;
     }
 
-    // Pull any saved conversational state.
+    // Pull any saved conversational state; if none, bootstrap
     let state = await getPendingTransactionState(from);
     if (!state) {
       state = { step: 1, responses: {}, detectedLocation: detectLocation(from), invalidAttempts: {} };

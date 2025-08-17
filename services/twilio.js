@@ -1,3 +1,4 @@
+require('dotenv').config();
 const twilio = require('twilio');
 
 const client = twilio(
@@ -6,50 +7,63 @@ const client = twilio(
 );
 
 async function sendMessage(to, body) {
-  console.log('[DEBUG] sendMessage called:', { to, body });
   try {
     const message = await client.messages.create({
       body,
-      from: 'whatsapp:+12316802664',
-      to: `whatsapp:${to}`
+      from: process.env.TWILIO_WHATSAPP_NUMBER,
+      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID
     });
-    console.log('[DEBUG] sendMessage success:', message.sid);
+    console.log(`[✅ SUCCESS] Message sent: ${message.sid}`);
     return message.sid;
   } catch (error) {
-    console.error('[ERROR] sendMessage failed for', to, ':', error.message);
+    console.error('[ERROR] Failed to send message:', error.message);
     throw error;
   }
 }
 
 async function sendQuickReply(to, body, replies = []) {
-  console.log('[DEBUG] sendQuickReply called:', { to, body, replies });
   try {
     const message = await client.messages.create({
       body,
-      from: 'whatsapp:+12316802664',
-      to: `whatsapp:${to}`,
+      from: process.env.TWILIO_WHATSAPP_NUMBER,
+      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
       persistentAction: replies.map(reply => `reply?text=${encodeURIComponent(reply)}`)
     });
-    console.log('[DEBUG] sendQuickReply success:', message.sid);
+    console.log(`[✅ SUCCESS] Quick reply sent: ${message.sid}`);
     return message.sid;
   } catch (error) {
-    console.error('[ERROR] sendQuickReply failed for', to, ':', error.message);
+    console.error('[ERROR] Failed to send quick reply:', error.message);
     throw error;
   }
 }
 
-async function sendTemplateMessage(to, template, params = []) {
-  console.log('[DEBUG] sendTemplateMessage called:', { to, template, params });
+async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
   try {
-    const message = template.replace(/{(\d+)}/g, (_, index) => params[index]?.text || '');
-    await client.messages.create({
-      body: message,
-      from: 'whatsapp:+12316802664',
-      to: `whatsapp:${to}`
+    if (!contentSid) {
+      console.error('[ERROR] Missing ContentSid for Twilio template message.');
+      throw new Error('Missing ContentSid');
+    }
+    const formattedVariables = JSON.stringify(
+      Array.isArray(contentVariables)
+        ? contentVariables.reduce((acc, item, index) => {
+            acc[index + 1] = item.text;
+            return acc;
+          }, {})
+        : contentVariables
+    );
+    const message = await client.messages.create({
+      contentSid,
+      contentVariables: formattedVariables,
+      from: process.env.TWILIO_WHATSAPP_NUMBER,
+      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID
     });
-    console.log('[DEBUG] sendTemplateMessage success for', to);
+    console.log(`[✅ SUCCESS] Template message sent: ${message.sid}`);
+    return message.sid;
   } catch (error) {
-    console.error('[ERROR] sendTemplateMessage failed for', to, ':', error.message);
+    console.error('[ERROR] Failed to send template message:', error.message);
     throw error;
   }
 }

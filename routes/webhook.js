@@ -12,7 +12,6 @@ const { getPendingTransactionState, setPendingTransactionState } = require('../u
 const { handleGenericQuery } = require('../services/openAI');
 const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTeamSetup } = require('../handlers/teamSetup');
-const { handleUserTraining } = require('../handlers/userTraining');
 const { handleExpense } = require('../handlers/commands/expense');
 const { handleBill } = require('../handlers/commands/bill');
 const { handleRevenue } = require('../handlers/commands/revenue');

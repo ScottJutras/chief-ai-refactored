@@ -16,6 +16,8 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
     let state = await getPendingTransactionState(from) || { step: userProfile.onboarding_step || 0, responses: {}, detectedLocation: detectLocation(from), invalidAttempts: {} };
     const msg = input?.trim().toLowerCase() || '';
     console.log(`[DEBUG] Onboarding state for ${from}: step=${state.step}, response=${msg}`);
+
+    // Start onboarding
     if (state.step === 0 || msg === 'start onboarding') {
       if (userProfile?.onboarding_completed) {
         return `<Response><Message>You've already completed onboarding. Reply 'help' for commands.</Message></Response>`;
@@ -25,7 +27,10 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       await setPendingTransactionState(from, state);
       return `<Response><Message>Welcome to Chief AI! Please reply with your full name.</Message></Response>`;
     }
+
     if (!state.responses) state.responses = {};
+
+    // Step 1: Capture Name -> Send Location Confirmation (buttons)
     if (state.step === 1) {
       const name = input.trim();
       if (!name || name.length < 2) {
@@ -34,17 +39,24 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.responses.name = name;
       state.step = 2;
       await setPendingTransactionState(from, state);
-      return await sendTemplateMessage(from, confirmationTemplates.locationConfirmation, [
-        { type: 'text', text: state.detectedLocation.province },
-        { type: 'text', text: state.detectedLocation.country }
+
+      await sendTemplateMessage(from, confirmationTemplates.locationConfirmation, [
+        state.detectedLocation.province, // {{1}}
+        state.detectedLocation.country   // {{2}}
       ]);
+      // We already sent the message via REST; return empty TwiML.
+      return `<Response></Response>`;
     }
+
+    // Step 2: Confirm Detected Location
     if (state.step === 2) {
       if (msg === 'yes') {
         state.responses.location = state.detectedLocation;
         state.step = 3;
         await setPendingTransactionState(from, state);
-        return await sendTemplateMessage(from, confirmationTemplates.businessLocationConfirmation, []);
+
+        await sendTemplateMessage(from, confirmationTemplates.businessLocationConfirmation, []);
+        return `<Response></Response>`;
       } else if (msg === 'edit') {
         state.step = 2.5;
         await setPendingTransactionState(from, state);
@@ -57,6 +69,8 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         return `<Response><Message>Please reply with 'yes', 'edit', or 'cancel' to confirm your location.</Message></Response>`;
       }
     }
+
+    // Step 2.5: Manually Provide Personal Location
     if (state.step === 2.5) {
       const { knownProvinces, knownCountries } = getValidationLists();
       const countryAliases = { 'united states': 'United States', 'us': 'United States', 'canada': 'Canada' };
@@ -95,8 +109,12 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.invalidAttempts.location = 0;
       state.step = 3;
       await setPendingTransactionState(from, state);
-      return await sendTemplateMessage(from, confirmationTemplates.businessLocationConfirmation, []);
+
+      await sendTemplateMessage(from, confirmationTemplates.businessLocationConfirmation, []);
+      return `<Response></Response>`;
     }
+
+    // Step 3: Confirm Business Location (same as personal?) -> yes/no/cancel
     if (state.step === 3) {
       if (msg === 'yes') {
         state.responses.business_location = state.responses.location;
@@ -115,6 +133,8 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         return `<Response><Message>Please reply with 'yes', 'no', or 'cancel' to confirm your business location.</Message></Response>`;
       }
     }
+
+    // Step 3.5: Manually Provide Business Location
     if (state.step === 3.5) {
       const { knownProvinces, knownCountries } = getValidationLists();
       const countryAliases = { 'united states': 'United States', 'us': 'United States', 'canada': 'Canada' };
@@ -155,6 +175,8 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       await setPendingTransactionState(from, state);
       return `<Response><Message>Please share your email address for your financial dashboard.</Message></Response>`;
     }
+
+    // Step 4: Capture Email
     if (state.step === 4) {
       const email = input.trim();
       if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -167,8 +189,10 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         await setPendingTransactionState(from, state);
         return `<Response><Message>Please provide a valid email address for your financial dashboard.</Message></Response>`;
       }
+
       state.responses.email = email;
       state.invalidAttempts.email = 0;
+
       const userProfileData = {
         ...userProfile,
         name: state.responses.name,
@@ -181,12 +205,17 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         onboarding_completed: false
       };
       await saveUserProfile(userProfileData);
+
       userProfile = await getUserProfile(from);
       const otp = await generateOTP(from);
+
       const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${from}?token=${userProfile.dashboard_token}`;
+
+      // Send a template with the dashboard link (could be a "CTA" or text-only template)
       await sendTemplateMessage(from, confirmationTemplates.spreadsheetLink, [
-        { type: 'text', text: dashboardUrl }
+        dashboardUrl
       ]);
+
       const name = userProfile.name || 'there';
       const congratsMessage = `Congratulations ${name}!
 You’ve now got a personal CFO — in your pocket — on demand.
@@ -212,10 +241,13 @@ A quick walkthrough video is on its way.
 Let’s build something great.
 — Chief 💼`;
       await sendMessage(from, congratsMessage);
+
       state.step = 5;
       await setPendingTransactionState(from, state);
       return `<Response><Message>Please provide your industry (e.g., Construction, Freelancer).</Message></Response>`;
     }
+
+    // Step 5: Capture Industry -> Send Goal Options (buttons)
     if (state.step === 5) {
       const industry = input.trim();
       if (!industry || industry.length < 3) {
@@ -233,8 +265,12 @@ Let’s build something great.
       await saveUserProfile({ ...userProfile, user_id: from });
       state.step = 6;
       await setPendingTransactionState(from, state);
-      return await sendTemplateMessage(from, confirmationTemplates.goalOptions, []);
+
+      await sendTemplateMessage(from, confirmationTemplates.goalOptions, []);
+      return `<Response></Response>`;
     }
+
+    // Step 6: Parse Goal input
     if (state.step === 6) {
       const defaultData = { goal: '', amount: 0 };
       const parseFn = input => {
@@ -266,10 +302,12 @@ Let’s build something great.
       await deletePendingTransactionState(from);
       return `<Response><Message>✅ Goal set: "${data.goal}" (${currency} ${userProfile.goal_progress.target.toFixed(2)}). You're ready to go!</Message></Response>`;
     }
+
     return `<Response><Message>Unknown onboarding state. Reply 'start onboarding' to begin again.</Message></Response>`;
   } catch (error) {
     console.error('[ERROR] handleOnboarding failed for', from, ':', error.message);
     return await handleError(from, error, 'handleOnboarding', input);
   }
 }
+
 module.exports = { handleOnboarding };

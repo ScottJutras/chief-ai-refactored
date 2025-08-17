@@ -17,20 +17,28 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
     const msg = msgRaw.trim().toLowerCase();
     const wantsReset = msg === 'reset onboarding' || msg === 'start onboarding';
 
-    // If user profile doesn't exist (e.g., you deleted the user row) OR user explicitly wants to restart,
-    // wipe any lingering state and start from step 1.
-    if (!userProfile || wantsReset) {
+    // Always verify the real DB row to avoid stale caller-provided userProfile.
+    let dbProfile = null;
+    try {
+      dbProfile = await getUserProfile(from);
+    } catch (_) {}
+    let profile = dbProfile || userProfile || null;
+    const hasDbUser = !!(dbProfile && (dbProfile.user_id || dbProfile.id));
+
+    // If the DB row is missing OR user explicitly wants to restart:
+    if (!hasDbUser || wantsReset) {
       await clearUserState(from).catch(() => {}); // ignore if locks table doesn't exist
+      profile = hasDbUser
+        ? dbProfile
+        : await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
+
       const state = { step: 1, responses: {}, detectedLocation: detectLocation(from), invalidAttempts: {} };
-      // (Re)create the profile shell so downstream logic has a record
-      const profile = userProfile || await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
       await setPendingTransactionState(from, state);
       return `<Response><Message>Welcome to Chief AI! Please reply with your full name.</Message></Response>`;
     }
 
-    // If we’re here, userProfile exists. Pull any saved state (may be null).
+    // Pull any saved conversational state.
     let state = await getPendingTransactionState(from);
-    // If no state exists, initialize a fresh one (do NOT rely on onboarding_step—it's not persisted).
     if (!state) {
       state = { step: 1, responses: {}, detectedLocation: detectLocation(from), invalidAttempts: {} };
       await setPendingTransactionState(from, state);
@@ -39,7 +47,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
 
     console.log(`[DEBUG] Onboarding state for ${from}: step=${state.step}, msg=${msg}`);
 
-    // ---- Step 1: capture full name
+    // ---- Step 1: capture full name -> send location confirmation (quick-reply template)
     if (state.step === 1) {
       const name = msgRaw.trim();
       if (!name || name.length < 2) {
@@ -49,11 +57,10 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.step = 2;
       await setPendingTransactionState(from, state);
 
-      // SEND QUICK REPLY TEMPLATE (strings, not objects) + return empty TwiML
       await sendTemplateMessage(
         from,
-        confirmationTemplates.locationConfirmation, // HX content SID
-        [ state.detectedLocation.province, state.detectedLocation.country ]
+        confirmationTemplates.locationConfirmation,
+        [ state.detectedLocation.province, state.detectedLocation.country ] // strings, not objects
       );
       return `<Response></Response>`;
     }
@@ -72,7 +79,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         return `<Response><Message>Please provide your State/Province, Country (e.g., 'Ontario, Canada').</Message></Response>`;
       } else if (msg === 'cancel') {
         await deletePendingTransactionState(from);
-        await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+        await saveUserProfile({ ...profile, onboarding_in_progress: false });
         return `<Response><Message>Onboarding cancelled. Reply 'start onboarding' to begin again.</Message></Response>`;
       } else {
         return `<Response><Message>Please reply with 'yes', 'edit', or 'cancel' to confirm your location.</Message></Response>`;
@@ -106,7 +113,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         state.invalidAttempts.location = (state.invalidAttempts.location || 0) + 1;
         if (state.invalidAttempts.location > 3) {
           await deletePendingTransactionState(from);
-          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          await saveUserProfile({ ...profile, onboarding_in_progress: false });
           return `<Response><Message>Too many invalid location attempts. Onboarding cancelled.</Message></Response>`;
         }
         await setPendingTransactionState(from, state);
@@ -133,7 +140,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         return `<Response><Message>Please provide your business's registered State/Province, Country (e.g., 'Ontario, Canada').</Message></Response>`;
       } else if (msg === 'cancel') {
         await deletePendingTransactionState(from);
-        await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+        await saveUserProfile({ ...profile, onboarding_in_progress: false });
         return `<Response><Message>Onboarding cancelled. Reply 'start onboarding' to begin again.</Message></Response>`;
       } else {
         return `<Response><Message>Please reply with 'yes', 'no', or 'cancel' to confirm your business location.</Message></Response>`;
@@ -167,7 +174,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         state.invalidAttempts.business_location = (state.invalidAttempts.business_location || 0) + 1;
         if (state.invalidAttempts.business_location > 3) {
           await deletePendingTransactionState(from);
-          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          await saveUserProfile({ ...profile, onboarding_in_progress: false });
           return `<Response><Message>Too many invalid location attempts. Onboarding cancelled.</Message></Response>`;
         }
         await setPendingTransactionState(from, state);
@@ -187,7 +194,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         state.invalidAttempts.email = (state.invalidAttempts.email || 0) + 1;
         if (state.invalidAttempts.email > 3) {
           await deletePendingTransactionState(from);
-          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          await saveUserProfile({ ...profile, onboarding_in_progress: false });
           return `<Response><Message>Too many invalid attempts. Onboarding cancelled.</Message></Response>`;
         }
         await setPendingTransactionState(from, state);
@@ -198,7 +205,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.invalidAttempts.email = 0;
 
       const userProfileData = {
-        ...userProfile,
+        ...profile,
         name: state.responses.name,
         country: state.responses.location.country,
         province: state.responses.location.province,
@@ -210,14 +217,14 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       };
       await saveUserProfile(userProfileData);
 
-      const freshProfile = await getUserProfile(from);
+      profile = await getUserProfile(from);
       await generateOTP(from);
 
-      const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${from}?token=${freshProfile.dashboard_token}`;
+      const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${from}?token=${profile.dashboard_token}`;
 
       await sendTemplateMessage(from, confirmationTemplates.spreadsheetLink, [ dashboardUrl ]);
 
-      const name = freshProfile.name || 'there';
+      const name = profile.name || 'there';
       const congratsMessage = `Congratulations ${name}!
 You’ve now got a personal CFO — in your pocket — on demand.
 Real-time. Data-smart. Built to make your business *make sense*.
@@ -255,15 +262,15 @@ Let’s build something great.
         state.invalidAttempts.industry = (state.invalidAttempts.industry || 0) + 1;
         if (state.invalidAttempts.industry > 3) {
           await deletePendingTransactionState(from);
-          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          await saveUserProfile({ ...profile, onboarding_in_progress: false });
           return `<Response><Message>Too many invalid attempts. Onboarding cancelled.</Message></Response>`;
         }
         await setPendingTransactionState(from, state);
         return `<Response><Message>Please provide your industry (e.g., Construction, Freelancer).</Message></Response>`;
       }
-      userProfile.industry = industry;
+      profile.industry = industry;
       state.invalidAttempts.industry = 0;
-      await saveUserProfile({ ...userProfile, user_id: from });
+      await saveUserProfile({ ...profile, user_id: from });
       state.step = 6;
       await setPendingTransactionState(from, state);
 
@@ -286,25 +293,25 @@ Let’s build something great.
         state.invalidAttempts.goal = (state.invalidAttempts.goal || 0) + 1;
         if (state.invalidAttempts.goal > 3) {
           await deletePendingTransactionState(from);
-          await saveUserProfile({ ...userProfile, onboarding_in_progress: false });
+          await saveUserProfile({ ...profile, onboarding_in_progress: false });
           return `<Response><Message>Too many invalid attempts. Onboarding cancelled.</Message></Response>`;
         }
         await setPendingTransactionState(from, state);
         return `<Response><Message>${reply || "Invalid goal. Try 'Grow profit by $10000' or 'Pay off $5000 debt'."}</Message></Response>`;
       }
 
-      userProfile.goal = data.goal;
-      userProfile.goal_progress = {
+      profile.goal = data.goal;
+      profile.goal_progress = {
         target: data.goal.includes('debt') ? -data.amount : data.amount,
         current: 0
       };
       state.invalidAttempts.goal = 0;
 
-      await saveUserProfile({ ...userProfile, onboarding_in_progress: false, onboarding_completed: true });
-      const currency = userProfile.country === 'United States' ? 'USD' : 'CAD';
+      await saveUserProfile({ ...profile, onboarding_in_progress: false, onboarding_completed: true });
+      const currency = profile.country === 'United States' ? 'USD' : 'CAD';
       await deletePendingTransactionState(from);
 
-      return `<Response><Message>✅ Goal set: "${data.goal}" (${currency} ${userProfile.goal_progress.target.toFixed(2)}). You're ready to go!</Message></Response>`;
+      return `<Response><Message>✅ Goal set: "${data.goal}" (${currency} ${profile.goal_progress.target.toFixed(2)}). You're ready to go!</Message></Response>`;
     }
 
     return `<Response><Message>Unknown onboarding state. Reply 'start onboarding' to begin again.</Message></Response>`;

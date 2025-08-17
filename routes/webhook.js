@@ -23,7 +23,6 @@ const { handlePricing } = require('../handlers/commands/pricing');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
 const { handleMedia } = require('../handlers/media');
 const { handleError } = require('../utils/aiErrorHandler');
-const { handleRecapFirstDay, handleRecapFirstWeek, handleRecapFirstMonth, handleRecapEveryMonth, handleRecapEveryQuarter, handleRecapHalfWay, handleRecapYearEnd } = require('../handlers/recap');
 const router = express.Router();
 
 router.post('/', lockMiddleware, userProfileMiddleware, tokenMiddleware, async (req, res) => {
@@ -113,9 +112,6 @@ router.post('/', lockMiddleware, userProfileMiddleware, tokenMiddleware, async (
       case 'addEmployees':
         response = await handleTeamSetup(from, body, userProfile, ownerId, req.ownerProfile, req.isOwner);
         break;
-      case 'training':
-        response = await handleUserTraining(from, body, userProfile, ownerId);
-        break;
       case 'complete':
         if (mediaUrl && mediaType) {
           if (isInDeepDiveUpload) {
@@ -174,18 +170,6 @@ router.post('/', lockMiddleware, userProfileMiddleware, tokenMiddleware, async (
             response = await handlePricing(from, body, userProfile, ownerId, req.ownerProfile, req.isOwner, res);
           } else if (lowerBody.includes('punch') || lowerBody.includes('hours')) {
             response = await handleTimeclock(from, body, userProfile, ownerId, req.ownerProfile, req.isOwner);
-          } else if (lowerBody.includes('recap day')) {
-            response = await handleRecapFirstDay(from, body, userProfile, ownerId);
-          } else if (lowerBody.includes('recap week')) {
-            response = await handleRecapFirstWeek(from, body, userProfile, ownerId);
-          } else if (lowerBody.includes('recap month')) {
-            response = await handleRecapEveryMonth(from, body, userProfile, ownerId);
-          } else if (lowerBody.includes('recap quarter')) {
-            response = await handleRecapEveryQuarter(from, body, userProfile, ownerId);
-          } else if (lowerBody.includes('recap half')) {
-            response = await handleRecapHalfWay(from, body, userProfile, ownerId);
-          } else if (lowerBody.includes('recap year')) {
-            response = await handleRecapYearEnd(from, body, userProfile, ownerId);
           } else if (lowerBody.includes('help')) {
             response = `<Response><Message>I can help with expenses, jobs, and more. Try ‘expense $100 tools’, ‘create job Roof Repair’, ‘recap month’, or ‘summarize job Roof Repair’. What would you like to do?</Message></Response>`;
           } else if (lowerBody === 'hi') {

@@ -77,10 +77,12 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.step = 2;
       await setPendingTransactionState(from, state);
 
+      // A) Log the SID and send the quick-reply template (strings, not objects)
+      console.log('[TEMPLATE] locationConfirmation =', confirmationTemplates.locationConfirmation, state.detectedLocation);
       await sendTemplateMessage(
         from,
         confirmationTemplates.locationConfirmation,
-        [ state.detectedLocation.province, state.detectedLocation.country ] // strings, not objects
+        [ state.detectedLocation.province, state.detectedLocation.country ]
       );
       return `<Response></Response>`;
     }
@@ -242,7 +244,13 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
 
       const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${from}?token=${profile.dashboard_token}`;
 
-      await sendTemplateMessage(from, confirmationTemplates.spreadsheetLink, [ dashboardUrl ]);
+      // B) Safely send link via template if configured; otherwise fallback to plain message
+      if (confirmationTemplates.spreadsheetLink) {
+        console.log('[TEMPLATE] spreadsheetLink =', confirmationTemplates.spreadsheetLink, dashboardUrl);
+        await sendTemplateMessage(from, confirmationTemplates.spreadsheetLink, [ dashboardUrl ]);
+      } else {
+        await sendMessage(from, `Your financial dashboard is ready: ${dashboardUrl}`);
+      }
 
       const name = profile.name || 'there';
       const congratsMessage = `Congratulations ${name}!

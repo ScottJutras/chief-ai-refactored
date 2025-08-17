@@ -10,8 +10,8 @@ const confirmationTemplates = {
   bill: process.env.HEX_BILL_CONFIRMATION, // SID for bill confirmation
   startJob: process.env.HEX_START_JOB, // SID for job start confirmation
   deleteConfirmation: process.env.HEX_YES_NO, // SID for delete confirmation
-  locationConfirmation: process.env.HEX_LOCATION_CONFIRMATION, // SID for location
-  businessLocationConfirmation: process.env.HEX_BUSINESS_LOCATION_CONFIRMATION, // SID for business location
+  locationConfirmation: process.env.LOCATION_CONFIRMATION, // SID for location
+  businessLocationConfirmation: process.env.BUSINESS_LOCATION_CONFIRMATION, // SID for business location
   industryOptions: process.env.HEX_INDUSTRY_OPTIONS, // SID for industry selection
   goalOptions: process.env.HEX_GOAL_OPTIONS, // SID for historical data
   financialGoal: process.env.HEX_ONBOARDING_GOAL, // SID for financial goal

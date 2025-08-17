@@ -1,13 +1,47 @@
-const expenseHandler = require('./expense');
-const revenueHandler = require('./revenue');
-const billHandler = require('./bill');
-const jobHandler = require('./job');
-const quoteHandler = require('./quote');
-const metricsHandler = require('./metrics');
-const taxHandler = require('./tax');
-const receiptHandler = require('./receipt');
-const teamHandler = require('./team');
-const timeclockHandler = require('./timeclock');
+const { handleExpense } = require('./expense');
+const { handleRevenue } = require('./revenue');
+const { handleBill } = require('./bill');
+const { handleJob } = require('./job');
+const { handleQuote } = require('./quote');
+const { handleMetrics } = require('./metrics');
+const { handleTax } = require('./tax');
+const { handleReceipt } = require('./receipt');
+const { handleTeam } = require('./team');
+const { handleTimeclock } = require('./timeclock');
+const { isOnboardingTrigger, isValidCommand, isValidExpenseInput } = require('../../utils/inputValidator');
+const { db, admin } = require('../../services/firebase');
+const { getOnboardingState, setOnboardingState, deleteOnboardingState } = require('../../utils/stateManager');
+const { saveUserProfile } = require('../../services/postgres.js');
+const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
+const { sendTemplateMessage, sendMessage } = require('../../services/twilio');
+const { confirmationTemplates } = require('../../config');
+const OpenAI = require('openai');
+const { google } = require('googleapis');
+const { getAuthorizedClient } = require('../../services/postgres.js');
+const Stripe = require('stripe');
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+async function handleGenericQuery(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+  const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  try {
+    const response = await openaiClient.chat.completions.create({
+      model: "gpt-4o",
+      messages: [
+        { role: "system", content: `You are a financial assistant for a small business. Answer the query "${input}" based on user profile: industry=${userProfile.industry}, country=${userProfile.country}.` },
+        { role: "user", content: input }
+      ],
+      max_tokens: 200,
+      temperature: 0.5
+    });
+    const reply = response.choices[0].message.content;
+    await sendMessage(from, reply);
+    return res.send('<Response></Response>');
+  } catch (error) {
+    console.error(`[ERROR] Generic query failed: ${error.message}`);
+    await sendMessage(from, "⚠️ Couldn’t process your query. Try a specific command like 'stats' or 'expense $100 tools'.");
+    return res.send('<Response></Response>');
+  }
+}
 
 async function handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lockKey = `lock:${from}`;
@@ -74,8 +108,15 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
         reply = `⚠️ Please respond with 'yes', 'no', 'edit', or 'cancel' to proceed.\nSuggested Category: ${category}`;
         const sent = await sendTemplateMessage(
           from,
-          type === 'expense' || type === 'bill' ? confirmationTemplates.expense : confirmationTemplates.revenue,
-          { "1": `Please confirm: ${type === 'expense' || type === 'bill' ? `${pendingData.amount} for ${pendingData.item || pendingData.source || pendingData.billName} on ${pendingData.date}` : `Revenue of ${pendingData.amount} from ${pendingData.source} on ${pendingData.date}`} (Category: ${category})` }
+          type === 'expense' ? confirmationTemplates.expense : type === 'revenue' ? confirmationTemplates.revenue : confirmationTemplates.bill,
+          {
+            "1": type === 'expense' ? `${pendingData.amount} for ${pendingData.item} from ${pendingData.store}` :
+                 type === 'revenue' ? `${pendingData.amount} from ${pendingData.source || pendingData.client}` :
+                 `${pendingData.amount} for ${pendingData.billName} (${pendingData.recurrence})`,
+            "2": pendingData.amount,
+            "3": pendingData.date,
+            "4": pendingData.recurrence || ''
+          }
         );
         await db.collection('locks').doc(lockKey).delete();
         console.log(`[LOCK] Released lock for ${from} (pending ${type} confirmation)`);
@@ -91,13 +132,18 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
         console.log(`[LOCK] Released lock for ${from} (not owner)`);
         return res.send(`<Response><Message>${reply}</Message></Response>`);
       }
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Delete features require Pro or Enterprise plan.` });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
       console.log("[DEBUG] Detected delete request:", input);
 
       const auth = await getAuthorizedClient();
       const sheets = google.sheets({ version: 'v4', auth });
       const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
       const gptResponse = await openaiClient.chat.completions.create({
-        model: "gpt-3.5-turbo",
+        model: "gpt-4o",
         messages: [
           { role: "system", content: `Parse a delete request: "${input}". Return JSON: { type: 'revenue|expense|job|bill', criteria: { item: 'string|null', amount: 'string|null', date: 'string|null', store: 'string|null', source: 'string|null', billName: 'string|null', jobName: 'string|null' } }. Set unmatched fields to null.` },
           { role: "user", content: input }
@@ -184,6 +230,11 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
         console.log(`[LOCK] Released lock for ${from} (pending delete not owner)`);
         return res.send(`<Response><Message>${reply}</Message></Response>`);
       }
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Delete features require Pro or Enterprise plan.` });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
       if (lcInput === 'yes') {
         const { type, rowIndex, sheetName } = pendingState.pendingDelete;
         const auth = await getAuthorizedClient();
@@ -213,107 +264,364 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
       }
     }
 
-    // Check for onboarding triggers
-    if (isOnboardingTrigger(input)) {
-      console.log(`[INFO] Onboarding trigger detected in quick match for ${from}: input="${input}"`);
-      if (userProfile.onboarding_in_progress) {
-        reply = "Please respond to the current onboarding question or cancel to restart.";
-      } else {
-        await db.runTransaction(async (transaction) => {
-          const userRef = db.collection('users').doc(from);
-          transaction.update(userRef, {
-            onboarding_in_progress: true,
-            name: admin.firestore.FieldValue.delete(),
-            country: admin.firestore.FieldValue.delete(),
-            province: admin.firestore.FieldValue.delete(),
-            email: admin.firestore.FieldValue.delete(),
-            business_province: admin.firestore.FieldValue.delete(),
-            business_country: admin.firestore.FieldValue.delete(),
-            spreadsheetId: admin.firestore.FieldValue.delete(),
-            onboarding_completed: admin.firestore.FieldValue.delete()
-          });
-        });
-        await db.collection('onboarding').doc(from).delete();
-        const newState = {
-          step: 0,
-          responses: {},
-          detectedLocation: {
-            country: userProfile?.country || "Unknown Country",
-            province: userProfile?.province || "Unknown Province"
-          }
-        };
-        await setOnboardingState(from, newState);
-        reply = "Welcome! What's your name?";
-      }
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (onboarding trigger)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
-    }
-
-    // Check for valid commands
-    if (isValidCommand(input)) {
-      console.error(`[ERROR] Unhandled command in quick match for ${from}: ${input}`);
-      reply = `⚠️ Command "${input}" was not processed correctly. Please try again.`;
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (unhandled command)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
-    }
-
-    // Check for expense/revenue/bill triggers
-    if (!isValidExpenseInput(input)) {
-      console.log(`[INFO] Non-expense/revenue/bill input detected in quick match for ${from}: input="${input}"`);
-      reply = `🤔 I didn't understand "${input}". Please provide a valid command (e.g., "team", "edit bill", "expense $100 tools") or reply 'start' to begin onboarding.`;
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (invalid input)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
-    }
-
-    // Onboarding checks for industry and goal
-    let state = await getOnboardingState(from);
-    if (!userProfile.industry && input.includes('$') && !state?.dynamicStep) {
-      await setOnboardingState(from, { step: 0, responses: {}, dynamicStep: 'industry' });
-      reply = "Hey, what industry are you in? (e.g., Construction, Freelancer)";
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (industry onboarding)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
-    }
-    if (state?.dynamicStep === 'industry') {
-      userProfile.industry = input;
-      await saveUserProfile(userProfile);
-      reply = `Got it, ${userProfile.name}! Industry set to ${input}. Keep logging—next up, I’ll ask your financial goal when you add a bill or revenue.`;
-      await deleteOnboardingState(from);
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (industry set)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
-    }
-    if (!userProfile.goal && (lcInput.includes('bill') || lcInput.includes('revenue')) && !state?.dynamicStep) {
-      await setOnboardingState(from, { step: 0, responses: {}, dynamicStep: 'goal' });
-      reply = "What’s your financial goal, boss? (e.g., Grow profit by $10,000, Pay off $5,000 debt)";
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (goal onboarding)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
-    }
-    if (state?.dynamicStep === 'goal') {
-      if (!input.match(/\d+/) || (!input.includes('profit') && !input.includes('debt'))) {
-        reply = "⚠️ That doesn’t look like a goal. Try 'Grow profit by $10,000' or 'Pay off $5,000 debt'.";
+    // Handle pricing item addition
+    if (lcInput.startsWith('add material') || lcInput.startsWith('add pricing')) {
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Pricing items require Pro or Enterprise plan.` });
         await db.collection('locks').doc(lockKey).delete();
-        console.log(`[LOCK] Released lock for ${from} (invalid goal)`);
+        return res.send(`<Response></Response>`);
+      }
+      const match = input.match(/^add (?:material|pricing)\s+(.+?)\s+at\s+\$?(\d+(?:\.\d{1,2})?)\s*(?:as\s+(.+))?$/i);
+      if (!match) {
+        reply = "Please provide valid pricing details (e.g., 'add material Nails at $59.99 as material').";
+        await db.collection('locks').doc(lockKey).delete();
         return res.send(`<Response><Message>${reply}</Message></Response>`);
       }
-      userProfile.goal = input;
-      userProfile.goalProgress = {
-        target: input.includes('debt')
-          ? -parseFloat(input.match(/\d+/)?.[0] || 5000) * 1000
-          : parseFloat(input.match(/\d+/)?.[0] || 10000) * 1000,
-        current: 0
-      };
-      await saveUserProfile(userProfile);
-      const currency = userProfile.country === 'United States' ? 'USD' : 'CAD';
-      reply = `Goal locked in: "${input}" (${currency} ${userProfile.goalProgress.target.toFixed(2)}). You’re unstoppable, ${userProfile.name}!`;
-      await deleteOnboardingState(from);
+      const [, itemName, unitCost, category = 'material'] = match;
+      await setPendingTransactionState(from, { pendingPricing: { itemName, unitCost, category } });
+      reply = await sendTemplateMessage(from, confirmationTemplates.pricingConfirmation, {
+        "1": itemName,
+        "2": `$${unitCost}`,
+        "3": category
+      });
       await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (goal set)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      console.log(`[LOCK] Released lock for ${from} (pricing confirmation)`);
+      return res.send(`<Response></Response>`);
+    } else if (pendingState && pendingState.pendingPricing) {
+      if (lcInput === 'yes') {
+        const { itemName, unitCost, category } = pendingState.pendingPricing;
+        await addPricingItem(ownerId, itemName, unitCost, 'each', category);
+        reply = `✅ Added pricing item: ${itemName} at $${unitCost} (${category}).`;
+        await deletePendingTransactionState(from);
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (pricing confirmed)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (lcInput === 'edit') {
+        reply = "Please provide corrected pricing details (e.g., 'add material Nails at $59.99 as material').";
+        await setPendingTransactionState(from, { isEditing: true, type: 'pricing' });
+        await deletePendingTransactionState(from);
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (pricing edit)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (lcInput === 'cancel') {
+        await deletePendingTransactionState(from);
+        reply = "❌ Pricing addition cancelled.";
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (pricing cancelled)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else {
+        reply = "Please reply with 'yes', 'edit', or 'cancel'.";
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (pricing invalid response)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      }
+    }
+
+    // Handle historical data payment
+    if (pendingState && pendingState.pendingHistoricalData) {
+      if (lcInput === 'upgrade now') {
+        const upgradeTo = userProfile.subscription_tier === 'starter' ? 'pro' : 'enterprise';
+        const priceId = upgradeTo === 'pro' ? process.env.PRO_PRICE_ID : process.env.ENTERPRISE_PRICE_ID;
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ['card'],
+          line_items: [{ price: priceId, quantity: 1 }],
+          mode: 'subscription',
+          success_url: `https://your-domain.com/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `https://your-domain.com/cancel`,
+          metadata: { userId: from, type: 'upgrade', tier: upgradeTo }
+        });
+        reply = `Please complete your ${upgradeTo} upgrade: ${session.url}`;
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (upgrade initiated)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (lcInput === 'pay one-time fee') {
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ['card'],
+          line_items: [{
+            price_data: {
+              currency: userProfile.country === 'United States' ? 'usd' : 'cad',
+              product_data: { name: 'Historical Data Upload' },
+              unit_amount: 5000 // $50.00
+            },
+            quantity: 1
+          }],
+          mode: 'payment',
+          success_url: `https://your-domain.com/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `https://your-domain.com/cancel`,
+          metadata: { userId: from, type: 'historical_data' }
+        });
+        reply = `Please complete your one-time payment for historical data: ${session.url}`;
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (one-time fee initiated)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (lcInput === 'no thanks') {
+        await deletePendingTransactionState(from);
+        reply = "Okay, you can add historical data later with 'stats' or 'metrics'.";
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (historical data declined)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else {
+        reply = "Please reply with 'Upgrade Now', 'Pay one-time fee', or 'No thanks'.";
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      }
+    }
+
+    // Onboarding flow
+    let state = await getOnboardingState(from);
+    if (isOnboardingTrigger(input) || userProfile.onboarding_in_progress) {
+      if (!state) {
+        state = { step: 0, responses: {}, detectedLocation: { country: userProfile?.country || "Unknown Country", province: userProfile?.province || "Unknown Province" } };
+        await setOnboardingState(from, state);
+      }
+
+      if (state.step === 0) {
+        await db.runTransaction(async (transaction) => {
+          const userRef = db.collection('users').doc(from);
+          transaction.update(userRef, { onboarding_in_progress: true });
+        });
+        reply = "Welcome! What's your name?";
+        await setOnboardingState(from, { ...state, step: 1 });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding name)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (state.step === 1) {
+        userProfile.name = input;
+        await saveUserProfile(userProfile);
+        reply = await sendTemplateMessage(from, confirmationTemplates.locationConfirmation, {
+          "1": state.detectedLocation.country,
+          "2": state.detectedLocation.province
+        });
+        await setOnboardingState(from, { ...state, step: 2, responses: { ...state.responses, name: input } });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding location)`);
+        return res.send(`<Response></Response>`);
+      } else if (state.step === 2) {
+        if (lcInput === 'yes') {
+          userProfile.country = state.detectedLocation.country;
+          userProfile.province = state.detectedLocation.province;
+          await saveUserProfile(userProfile);
+          reply = await sendTemplateMessage(from, confirmationTemplates.businessLocationConfirmation);
+          await setOnboardingState(from, { ...state, step: 3 });
+        } else if (lcInput === 'edit') {
+          reply = "Please provide your country and province (e.g., Canada, Ontario).";
+          await setOnboardingState(from, { ...state, step: 2.1 });
+        } else if (lcInput === 'cancel') {
+          await deleteOnboardingState(from);
+          userProfile.onboarding_in_progress = false;
+          await saveUserProfile(userProfile);
+          reply = "Onboarding cancelled. Send 'start' to try again.";
+        } else {
+          reply = "Please reply with 'yes', 'edit', or 'cancel'.";
+        }
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding location response)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (state.step === 2.1) {
+        const [country, province] = input.split(',').map(s => s.trim());
+        if (!country || !province) {
+          reply = "Please provide both country and province (e.g., Canada, Ontario).";
+          await db.collection('locks').doc(lockKey).delete();
+          return res.send(`<Response><Message>${reply}</Message></Response>`);
+        }
+        userProfile.country = country;
+        userProfile.province = province;
+        await saveUserProfile(userProfile);
+        reply = await sendTemplateMessage(from, confirmationTemplates.businessLocationConfirmation);
+        await setOnboardingState(from, { ...state, step: 3, responses: { ...state.responses, country, province } });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding manual location)`);
+        return res.send(`<Response></Response>`);
+      } else if (state.step === 3) {
+        if (lcInput === 'yes') {
+          userProfile.business_country = userProfile.country;
+          userProfile.business_province = userProfile.province;
+          await saveUserProfile(userProfile);
+        } else if (lcInput === 'no') {
+          reply = "Please provide your business country and province (e.g., Canada, Ontario).";
+          await setOnboardingState(from, { ...state, step: 3.1 });
+          await db.collection('locks').doc(lockKey).delete();
+          console.log(`[LOCK] Released lock for ${from} (onboarding business location)`);
+          return res.send(`<Response><Message>${reply}</Message></Response>`);
+        } else {
+          reply = "Please reply with 'yes' or 'no'.";
+          await db.collection('locks').doc(lockKey).delete();
+          return res.send(`<Response><Message>${reply}</Message></Response>`);
+        }
+        reply = await sendTemplateMessage(from, confirmationTemplates.industryOptions);
+        await setOnboardingState(from, { ...state, step: 4 });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding industry)`);
+        return res.send(`<Response></Response>`);
+      } else if (state.step === 3.1) {
+        const [business_country, business_province] = input.split(',').map(s => s.trim());
+        if (!business_country || !business_province) {
+          reply = "Please provide both business country and province (e.g., Canada, Ontario).";
+          await db.collection('locks').doc(lockKey).delete();
+          return res.send(`<Response><Message>${reply}</Message></Response>`);
+        }
+        userProfile.business_country = business_country;
+        userProfile.business_province = business_province;
+        await saveUserProfile(userProfile);
+        reply = await sendTemplateMessage(from, confirmationTemplates.industryOptions);
+        await setOnboardingState(from, { ...state, step: 4, responses: { ...state.responses, business_country, business_province } });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding manual business location)`);
+        return res.send(`<Response></Response>`);
+      } else if (state.step === 4) {
+        if (!['construction', 'real estate', 'retail', 'freelancer', 'finance'].includes(lcInput)) {
+          reply = "Please select an industry: Construction, Real Estate, Retail, Freelancer, or Finance.";
+          await db.collection('locks').doc(lockKey).delete();
+          return res.send(`<Response><Message>${reply}</Message></Response>`);
+        }
+        userProfile.industry = input;
+        await saveUserProfile(userProfile);
+        reply = await sendTemplateMessage(from, confirmationTemplates.financialGoal);
+        await setOnboardingState(from, { ...state, step: 5, responses: { ...state.responses, industry: input } });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding industry set)`);
+        return res.send(`<Response></Response>`);
+      } else if (state.step === 5) {
+        if (['pay off debt', 'save to invest', 'lower tax bracket', 'spend to invest'].includes(lcInput)) {
+          reply = `Great! How much for ${input}? (e.g., $10,000)`;
+          await setOnboardingState(from, { ...state, step: 5.1, responses: { ...state.responses, goalType: input } });
+        } else {
+          reply = "Please select 'Pay off debt', 'Save to invest', 'Lower tax bracket', or 'Spend to invest'.";
+        }
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding goal)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (state.step === 5.1) {
+        const amountMatch = input.match(/\$?(\d+(?:\.\d{1,2})?)/);
+        if (!amountMatch) {
+          reply = "Please provide a valid amount (e.g., $10,000).";
+          await db.collection('locks').doc(lockKey).delete();
+          return res.send(`<Response><Message>${reply}</Message></Response>`);
+        }
+        const amount = parseFloat(amountMatch[1]) * 1000;
+        userProfile.goal = state.responses.goalType;
+        userProfile.goalProgress = {
+          target: state.responses.goalType === 'pay off debt' ? -amount : amount,
+          current: 0
+        };
+        await saveUserProfile(userProfile);
+        reply = await sendTemplateMessage(from, confirmationTemplates.billTracking);
+        await setOnboardingState(from, { ...state, step: 6, responses: { ...state.responses, goalAmount: amount } });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding goal amount)`);
+        return res.send(`<Response></Response>`);
+      } else if (state.step === 6) {
+        if (lcInput === 'yes') {
+          reply = "Please provide bill details (e.g., 'Truck Payment $500 monthly').";
+          await setOnboardingState(from, { ...state, step: 6.1 });
+        } else if (lcInput === 'no') {
+          reply = await sendTemplateMessage(from, confirmationTemplates.addEmployees);
+          await setOnboardingState(from, { ...state, step: 7 });
+        } else {
+          reply = "Please reply with 'yes' or 'no'.";
+        }
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding bill tracking)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (state.step === 6.1) {
+        const billMatch = input.match(/^(.+?)\s+\$?(\d+(?:\.\d{1,2})?)\s+(yearly|monthly|weekly|bi-weekly|one-time)$/i);
+        if (!billMatch) {
+          reply = "Please provide valid bill details (e.g., 'Truck Payment $500 monthly').";
+          await db.collection('locks').doc(lockKey).delete();
+          return res.send(`<Response><Message>${reply}</Message></Response>`);
+        }
+        const [, billName, amount, recurrence] = billMatch;
+        const billData = { billName, amount, recurrence, date: new Date().toISOString().split('T')[0] };
+        const category = await categorizeEntry('bill', billData, ownerProfile);
+        await appendToUserSpreadsheet(ownerId, [billData.date, billName, amount, '', await getActiveJob(ownerId) || 'Uncategorized', 'bill', category, '', userProfile.name || 'Unknown User']);
+        reply = await sendTemplateMessage(from, confirmationTemplates.addEmployees);
+        await setOnboardingState(from, { ...state, step: 7 });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding bill added)`);
+        return res.send(`<Response></Response>`);
+      } else if (state.step === 7) {
+        if (lcInput === 'yes') {
+          reply = "Please provide employee details (e.g., 'John, Manager').";
+          await setOnboardingState(from, { ...state, step: 7.1 });
+        } else if (lcInput === 'no') {
+          if (!userProfile.historicalDataYears && userProfile.subscription_tier !== 'enterprise') {
+            reply = await sendTemplateMessage(from, confirmationTemplates.goalOptions);
+            await setOnboardingState(from, { ...state, step: 8 });
+          } else {
+            userProfile.onboarding_in_progress = false;
+            userProfile.onboarding_completed = true;
+            await saveUserProfile(userProfile);
+            await deleteOnboardingState(from);
+            reply = `Onboarding complete, ${userProfile.name}! You're ready to roll. Try 'expense $100 tools' or 'stats' to get started.`;
+          }
+        } else {
+          reply = "Please reply with 'yes' or 'no'.";
+        }
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding team)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (state.step === 7.1) {
+        const [name, role] = input.split(',').map(s => s.trim());
+        if (!name || !role) {
+          reply = "Please provide both name and role (e.g., 'John, Manager').";
+          await db.collection('locks').doc(lockKey).delete();
+          return res.send(`<Response><Message>${reply}</Message></Response>`);
+        }
+        await handleTeam(from, `add member ${name}, ${role}`, userProfile, ownerId, ownerProfile, isOwner, res);
+        if (!userProfile.historicalDataYears && userProfile.subscription_tier !== 'enterprise') {
+          reply = await sendTemplateMessage(from, confirmationTemplates.goalOptions);
+          await setOnboardingState(from, { ...state, step: 8 });
+        } else {
+          userProfile.onboarding_in_progress = false;
+          userProfile.onboarding_completed = true;
+          await saveUserProfile(userProfile);
+          await deleteOnboardingState(from);
+          reply = `Onboarding complete, ${userProfile.name}! Team member ${name} added. Try 'expense $100 tools' or 'stats' to get started.`;
+        }
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding team added)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (state.step === 8) {
+        if (lcInput === 'yes, deeper insights') {
+          if (userProfile.subscription_tier === 'enterprise') {
+            reply = "Great! Please upload your historical financial data (CSV or Excel) or reply with the number of years (e.g., '2 years').";
+            await setOnboardingState(from, { ...state, step: 8.1 });
+          } else {
+            const upgradeTo = userProfile.subscription_tier === 'starter' ? 'pro' : 'enterprise';
+            reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, {
+              "1": `Historical data requires ${upgradeTo} plan or a one-time $50 fee.`
+            });
+            await setPendingTransactionState(from, { pendingHistoricalData: true });
+          }
+        } else if (lcInput === 'no, skip insights') {
+          userProfile.onboarding_in_progress = false;
+          userProfile.onboarding_completed = true;
+          await saveUserProfile(userProfile);
+          await deleteOnboardingState(from);
+          reply = `Onboarding complete, ${userProfile.name}! You're ready to roll. Try 'expense $100 tools' or 'stats' to get started.`;
+        } else {
+          reply = "Please reply with 'Yes, deeper insights' or 'No, skip insights'.";
+        }
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding historical data)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else if (state.step === 8.1) {
+        const yearsMatch = input.match(/^(\d+)\s*years?$/i);
+        if (yearsMatch) {
+          userProfile.historicalDataYears = parseInt(yearsMatch[1]);
+          await saveUserProfile(userProfile);
+          userProfile.onboarding_in_progress = false;
+          userProfile.onboarding_completed = true;
+          await saveUserProfile(userProfile);
+          await deleteOnboardingState(from);
+          reply = `Onboarding complete, ${userProfile.name}! Historical data set for ${userProfile.historicalDataYears} years. Try 'stats' to see insights.`;
+        } else {
+          reply = "Please specify the number of years (e.g., '2 years') or upload a CSV/Excel file.";
+        }
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (onboarding historical data years)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      }
     }
 
     // Quick match for expense, revenue, bill
@@ -326,18 +634,55 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
     } else if (revenueMatch) {
       return await handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (billMatch) {
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Bills require Pro or Enterprise plan.` });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
       return await handleBill(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (lcInput.startsWith('start job') || lcInput.startsWith('finish job')) {
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Jobs require Pro or Enterprise plan.` });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
       return await handleJob(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (lcInput.startsWith('quote')) {
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Quotes require Pro or Enterprise plan.` });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
       return await handleQuote(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (lcInput.includes('profit') || lcInput.includes('margin') || lcInput.includes('spend') || lcInput.includes('spent') || (lcInput.includes('how about') && (await getLastQuery(from))?.intent)) {
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Metrics require Pro or Enterprise plan.` });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
+      if (!userProfile.historicalDataYears) {
+        reply = await sendTemplateMessage(from, confirmationTemplates.goalOptions);
+        await setOnboardingState(from, { step: 8, responses: {} });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (metrics historical data prompt)`);
+        return res.send(`<Response></Response>`);
+      }
       return await handleMetrics(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (lcInput.includes('find receipt') || lcInput.includes('where’s my receipt') || lcInput.includes('show me the receipt')) {
       return await handleReceipt(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (lcInput.startsWith('team') || lcInput.includes('add member') || lcInput.includes('remove member')) {
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Team features require Pro or Enterprise plan.` });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
       return await handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (lcInput.includes('tax rate') || lcInput.startsWith('export tax')) {
+      if (userProfile.subscription_tier === 'starter') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Tax features require Pro or Enterprise plan.` });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
       return await handleTax(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (lcInput === 'chief!!') {
       reply = '🔥 You’re the boss, Chief! What’s the next move?';
@@ -345,6 +690,13 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
       console.log(`[LOCK] Released lock for ${from} (chief command)`);
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     } else if (lcInput.startsWith('stats')) {
+      if (!userProfile.historicalDataYears && userProfile.subscription_tier !== 'enterprise') {
+        reply = await sendTemplateMessage(from, confirmationTemplates.goalOptions);
+        await setOnboardingState(from, { step: 8, responses: {} });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (stats historical data prompt)`);
+        return res.send(`<Response></Response>`);
+      }
       try {
         const auth = await getAuthorizedClient();
         const sheets = google.sheets({ version: 'v4', auth });
@@ -373,22 +725,30 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
     } else if (lcInput.startsWith('goal')) {
       const currency = userProfile.country === 'United States' ? 'USD' : 'CAD';
       if (!userProfile.goal) {
-        reply = "You haven’t set a financial goal yet. Reply with something like 'Grow profit by $10,000' or 'Pay off $5,000 debt'.";
+        reply = await sendTemplateMessage(from, confirmationTemplates.financialGoal);
+        await setOnboardingState(from, { step: 5, responses: {} });
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (goal prompt)`);
+        return res.send(`<Response></Response>`);
       } else {
         const progress = userProfile.goalProgress?.current || 0;
         const target = userProfile.goalProgress?.target || 0;
         reply = `🎯 Goal: ${userProfile.goal}\nProgress: ${currency} ${progress.toFixed(2)} / ${currency} ${target.toFixed(2)} (${((progress / target) * 100).toFixed(1)}%)`;
+        await db.collection('locks').doc(lockKey).delete();
+        console.log(`[LOCK] Released lock for ${from} (goal)`);
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
       }
-      await db.collection('locks').doc(lockKey).delete();
-      console.log(`[LOCK] Released lock for ${from} (goal)`);
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
     // Fallback
-    reply = `⚠️ Command not recognized. Try "help" for options.`;
-    await db.collection('locks').doc(lockKey).delete();
-    console.log(`[LOCK] Released lock for ${from} (unrecognized command)`);
-    return res.send(`<Response><Message>${reply}</Message></Response>`);
+    if (userProfile.subscription_tier !== 'starter') {
+      return await handleGenericQuery(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+    } else {
+      reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Command not recognized. Try "help" for options. Advanced queries require Pro or Enterprise.` });
+      await db.collection('locks').doc(lockKey).delete();
+      console.log(`[LOCK] Released lock for ${from} (unrecognized command)`);
+      return res.send(`<Response></Response>`);
+    }
   } catch (err) {
     console.error(`Error in handleCommands: ${err.message}`);
     reply = `⚠️ An error occurred. Please try again later.`;
@@ -399,14 +759,14 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
 }
 
 module.exports = {
-  expense: expenseHandler,
-  revenue: revenueHandler,
-  bill: billHandler,
-  job: jobHandler,
-  quote: quoteHandler,
-  metrics: metricsHandler,
-  tax: taxHandler,
-  receipt: receiptHandler,
-  team: teamHandler,
-  timeclock: timeclockHandler
+  expense: handleExpense,
+  revenue: handleRevenue,
+  bill: handleBill,
+  job: handleJob,
+  quote: handleQuote,
+  metrics: handleMetrics,
+  tax: handleTax,
+  receipt: handleReceipt,
+  team: handleTeam,
+  timeclock: handleTimeclock
 };

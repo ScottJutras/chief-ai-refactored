@@ -1,0 +1,15 @@
+{
+  // silence the “too many active changes” warning
+  "git.ignoreLimitWarning": true,
+
+  // don’t even scan node_modules in the file watcher, search, or explorer
+  "files.watcherExclude": {
+    "**/node_modules/**": true
+  },
+  "search.exclude": {
+    "**/node_modules": true
+  },
+  "files.exclude": {
+    "**/node_modules": true
+  }
+}

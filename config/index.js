@@ -1,30 +1,25 @@
-// config/index.js
-
 /**
  * Twilio template snippets used throughout the bot.
- * Feel free to customize messages or add new templates here.
+ * Templates map to Twilio Content SIDs (HEX_* in .env) for quick replies.
  */
 const confirmationTemplates = {
-  // Used in expense.js for confirming a pending expense
-  expense: [
-    { type: "text", text: "⚠️ You entered: {{1}}. Reply 'yes' to save, 'no' to cancel." }
-  ],
-  // Used in expense.js once an expense is saved
+  expense: process.env.HEX_EXPENSE_CONFIRMATION, // SID for expense confirmation
   expenseSaved: ({ date, item, amount }) =>
     `✅ Logged ${amount} for ${item} on ${date}.`,
-
-  // Used to ask before deleting any entry
-  deleteConfirmation: [
-    { type: "text", text: "⚠️ Are you sure you want to delete this? Reply 'yes' or 'no'." }
-  ],
-
-  // Used in job.js to confirm a job start
-  startJob: [
-    { type: "text", text: "✅ Job started: {{1}}" }
-  ],
-
-  // you can add more as needed, for example:
-  // finishJob, pauseJob, resumeJob, etc.
+  revenue: process.env.HEX_REVENUE_CONFIRMATION, // SID for revenue confirmation
+  bill: process.env.HEX_BILL_CONFIRMATION, // SID for bill confirmation
+  startJob: process.env.HEX_START_JOB, // SID for job start confirmation
+  deleteConfirmation: process.env.HEX_YES_NO, // SID for delete confirmation
+  locationConfirmation: process.env.HEX_LOCATION_CONFIRMATION, // SID for location
+  businessLocationConfirmation: process.env.HEX_BUSINESS_LOCATION_CONFIRMATION, // SID for business location
+  industryOptions: process.env.HEX_INDUSTRY_OPTIONS, // SID for industry selection
+  goalOptions: process.env.HEX_GOAL_OPTIONS, // SID for historical data
+  financialGoal: process.env.HEX_ONBOARDING_GOAL, // SID for financial goal
+  billTracking: process.env.HEX_BILL_TRACKING, // SID for bill tracking
+  addEmployees: process.env.HEX_ADD_EMPLOYEES, // SID for team setup
+  reminder: process.env.HEX_REMINDER, // SID for reminder scheduling
+  upgradeNow: process.env.HEX_UPGRADE_NOW, // SID for upgrade prompts
+  pricingConfirmation: process.env.HEX_PRICING_CONFIRMATION // SID for pricing item confirmation
 };
 
 module.exports = { confirmationTemplates };

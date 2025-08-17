@@ -1,0 +1,30 @@
+const UserProfileSchema = {
+  user_id:        { type: String, required: true, unique: true },
+  name:           { type: String, default: null },
+  country:        { type: String, default: null },
+  province:       { type: String, default: null },
+  business_country: { type: String, default: null },
+  business_province: { type: String, default: null },
+  email:          { type: String, default: null },
+  industry:       { type: String, default: null },
+  goal:           { type: String, default: null },
+  goal_progress:  { type: Number, default: 0 },
+  team:           { type: Array, default: [] },
+  subscription_tier: { type: String, enum: ['starter', 'pro', 'enterprise'], default: 'starter' },
+  stripe_customer_id: { type: String, default: null },
+  stripe_subscription_id: { type: String, default: null },
+  current_stage:  { type: String, enum: ['onboarding', 'userInfo', 'teamSetup', 'training', 'complete'], default: 'onboarding' },
+  reminder_needed: { type: Boolean, default: false },
+  otp:            { type: String, default: null },
+  otp_expiry:     { type: Date, default: null },
+  fiscal_year_start: { type: String, default: null },
+  fiscal_year_end:   { type: String, default: null },
+  historical_data_years: { type: Number, default: 0 },
+  dashboard_token: { type: String, default: null },
+  recap_time_pref: { type: String, enum: ['morning', 'noon', 'evening'], default: 'morning' },
+  training_completed: { type: Boolean, default: false },
+  created_at:     { type: Date, default: Date.now },
+  updated_at:     { type: Date, default: Date.now }
+};
+
+module.exports = UserProfileSchema;

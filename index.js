@@ -1,16 +1,19 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+const path = require('path');
+const favicon = require('serve-favicon');
 
 console.log('[BOOT] Starting Chief AI...');
 
 const app = express();
 
+// Serve favicon to prevent 404 logs
+app.use(favicon(path.join(__dirname, 'public', 'favicon.png')));
+
 // GLOBAL LOGGER: logs every incoming request
 app.use((req, res, next) => {
   console.log(`[INCOMING] ${req.method} ${req.originalUrl}`);
   console.log('  headers:', JSON.stringify(req.headers));
-  // Twilio sends urlencoded bodies
-  // so we need bodyParser first
   next();
 });
 

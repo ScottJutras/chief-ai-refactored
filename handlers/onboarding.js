@@ -1,6 +1,6 @@
 const { createUserProfile, saveUserProfile, generateOTP, getUserProfile } = require('../services/postgres');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState, clearUserState } = require('../utils/stateManager');
-const { sendMessage, sendQuickReply } = require('../services/twilio');
+const { sendTemplateMessage, sendMessage } = require('../services/twilio');
 const { getValidationLists, detectLocation } = require('../utils/validateLocation');
 const { handleInputWithAI, handleError } = require('../utils/aiErrorHandler');
 const { Pool } = require('pg');
@@ -64,11 +64,14 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.step = 2;
       await setPendingTransactionState(from, state);
       // A) Log the SID and send the quick-reply template (strings, not objects)
-      console.log('[TEMPLATE] locationConfirmation =', state.detectedLocation);
-      await sendQuickReply(
+      console.log('[TEMPLATE] locationConfirmation = HX0280df498999848aaff04cc079e16c31', state.detectedLocation);
+      await sendTemplateMessage(
         from,
-        `Is your location ${state.detectedLocation.province}, ${state.detectedLocation.country}?`,
-        ['Yes', 'Edit']
+        'HX0280df498999848aaff04cc079e16c31',
+        [
+          { type: "text", text: state.detectedLocation.province },
+          { type: "text", text: state.detectedLocation.country }
+        ]
       );
       return `<Response></Response>`;
     }
@@ -78,7 +81,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         state.responses.location = state.detectedLocation;
         state.step = 3;
         await setPendingTransactionState(from, state);
-        await sendQuickReply(from, 'Is your business location the same?', ['Yes', 'No']);
+        await sendTemplateMessage(from, 'HXa885f78d7654642672bfccfae98d57cb', []);
         return `<Response></Response>`;
       } else if (msg === 'edit') {
         state.step = 2.5;
@@ -129,7 +132,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.invalidAttempts.location = 0;
       state.step = 3;
       await setPendingTransactionState(from, state);
-      await sendQuickReply(from, 'Is your business location the same?', ['Yes', 'No']);
+      await sendTemplateMessage(from, 'HXa885f78d7654642672bfccfae98d57cb', []);
       return `<Response></Response>`;
     }
     // ---- Step 3: confirm business location equals personal?
@@ -269,7 +272,7 @@ Let’s build something great.
       await saveUserProfile({ ...profile, user_id: from });
       state.step = 6;
       await setPendingTransactionState(from, state);
-      await sendQuickReply(from, 'What’s your financial goal?', ['Grow profit by $10,000', 'Pay off $5,000 debt']);
+      await sendTemplateMessage(from, 'HX20b1be5490ea39f3730fb9e70d5275df', []);
       return `<Response></Response>`;
     }
     // ---- Step 6: goal

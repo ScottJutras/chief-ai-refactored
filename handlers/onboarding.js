@@ -101,7 +101,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       await setPendingTransactionState(from, state);
 
       // Quick reply template for personal location
-      await sendTemplateOrText(
+      await sendTemplateMessage(
         from,
         confirmationTemplates.locationConfirmation,
         [state.detectedLocation.province, state.detectedLocation.country],
@@ -118,7 +118,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         await setPendingTransactionState(from, state);
 
         // Quick reply template asking if business location is the same
-        await sendTemplateOrText(
+        await sendTemplateMessage(
           from,
           confirmationTemplates.businessLocationConfirmation,
           [],

@@ -5,18 +5,16 @@ const {
   createUserProfile,
 } = require('../services/postgres');
 
-/**
- * Normalize a Twilio "From" into digits-only.
- * Handles values like "whatsapp:+19051234567" or "+19051234567".
- */
+/** Normalize a Twilio "From" into digits-only (e.g., "whatsapp:+1905..." => "1905...") */
 function normalizePhoneNumber(raw = '') {
   const v = String(raw || '');
   const withoutWa = v.startsWith('whatsapp:') ? v.slice('whatsapp:'.length) : v;
-  return withoutWa.replace(/\D/g, ''); // strip all non-digits
+  return withoutWa.replace(/\D/g, '');
 }
 
+/** For logs only */
 function maskPhone(p) {
-  return p ? p.replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
+  return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
 }
 
 async function userProfileMiddleware(req, res, next) {
@@ -31,22 +29,26 @@ async function userProfileMiddleware(req, res, next) {
         .send('<Response><Message>⚠️ Invalid request: missing sender.</Message></Response>');
     }
 
-    // Keep req.from normalized for all downstream code (and consistent with lock key)
+    // Keep req.from normalized for downstream (aligns with lock key)
     const from = normalizePhoneNumber(rawFrom);
     req.from = from;
 
-    // Fetch or create the user profile
+    // Fetch or create profile (PASS AN OBJECT — not a string)
     let user = await getUserProfile(from);
     if (!user) {
-      user = await createUserProfile(from);
+      user = await createUserProfile({
+        user_id: from,
+        ownerId: from,
+        onboarding_in_progress: true, // start onboarding for new users
+      });
     }
 
-    // Derive owner context
+    // Owner context
     const ownerId = user.owner_id || user.user_id || from;
     const ownerProfile = await getOwnerProfile(ownerId).catch(() => null);
     const isOwner = user.user_id === ownerId;
 
-    // Attach to request for all handlers
+    // Attach to request
     req.userProfile = user;
     req.ownerId = ownerId;
     req.ownerProfile = ownerProfile;
@@ -62,5 +64,5 @@ async function userProfileMiddleware(req, res, next) {
 
 module.exports = {
   userProfileMiddleware,
-  normalizePhoneNumber, // exported in case other modules want it
+  normalizePhoneNumber, // optional export for other modules
 };

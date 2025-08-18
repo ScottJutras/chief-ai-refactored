@@ -19,11 +19,9 @@ const { getPendingTransactionState, setPendingTransactionState } = require('../u
 
 const router = express.Router();
 
-/**
- * For logs only (don’t use for IDs)
- */
+/** For logs only (don’t use for IDs) */
 function maskPhone(p) {
-  return p ? p.replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
+  return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
 }
 
 /**
@@ -33,7 +31,7 @@ function maskPhone(p) {
  *
  * Notes:
  *  - NEVER reference a lowercase `body` variable; use `req.body` or the destructured `Body`.
- *  - Always release the per-number lock in a `finally` block.
+ *  - Always release the per-number lock in a `finally` block using req.lockKey + req.lockToken.
  */
 router.post(
   '/',
@@ -43,16 +41,13 @@ router.post(
   async (req, res, next) => {
     // Destructure from req.body (Twilio param casing)
     const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
-    const from = req.from || From || 'UNKNOWN_FROM';
+    const from = (req.from || From || 'UNKNOWN_FROM').replace(/^whatsapp:/, '');
     const input = (Body || '').trim();
     const mediaUrl = MediaUrl0 || null;
     const mediaType = MediaContentType0 || null;
 
     // Enriched by userProfileMiddleware / tokenMiddleware
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
-
-    // Lock is created in lockMiddleware; keep the key consistent here
-    const lockKey = `lock:${from}`;
 
     try {
       // ===== 0) Onboarding path =====
@@ -98,7 +93,7 @@ router.post(
               metadata: { user_id: userProfile.user_id }
             });
 
-            // Persist minimal customer + desired tier (sub is activated via webhook)
+            // Persist minimal customer + desired tier (sub is activated via Stripe webhook)
             const { Pool } = require('pg');
             const pool = new Pool({
               connectionString: process.env.DATABASE_URL,
@@ -119,7 +114,6 @@ router.post(
             return;
           } catch (err) {
             console.error('[UPGRADE] error:', err?.message);
-            // Fall through to error handler
             return next(err);
           }
         }
@@ -196,7 +190,6 @@ router.post(
             }
           }
 
-          // Prompt user to upload now
           const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
           res.status(200).send(
             `<Response><Message>Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: ${dashUrl}</Message></Response>`
@@ -338,14 +331,14 @@ router.post(
       return;
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
-      // Defer to centralized error handler
       return next(error);
     } finally {
       try {
-        await releaseLock(lockKey);
-        console.log('[LOCK] released for', maskPhone(from));
+        // IMPORTANT: release using the SAME key+token the middleware set
+        await releaseLock(req.lockKey, req.lockToken);
+        console.log('[LOCK] released for', req.lockKey);
       } catch (e) {
-        console.error(`[WARN] Failed to release lock for ${maskPhone(from)}:`, e.message);
+        console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
       }
     }
   },

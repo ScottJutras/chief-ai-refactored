@@ -6,7 +6,7 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const { handleCommands } = require('../handlers/commands');
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
-const { handleTimeclock } = require('../handlers/timeclock');
+const { handleTimeclock } = require('../handlers/commands/timeclock');
 
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
 const { userProfileMiddleware } = require('../middleware/userProfile');

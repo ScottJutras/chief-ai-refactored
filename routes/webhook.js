@@ -23,27 +23,38 @@ const { handlePricing } = require('../handlers/commands/pricing');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
 const { handleMedia } = require('../handlers/media');
 const { handleError } = require('../utils/aiErrorHandler');
+
 const router = express.Router();
 
 /**
  * Normalize phone to digits-only (remove '+' and non-digits)
  */
-function normalizePhone(rawFrom = '') {
-  return rawFrom.replace(/\D/g, '');
+function normalizePhoneNumber(rawFrom = '') {
+  const val = String(rawFrom || '');
+  const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
+  return noWa.replace(/^\+/, '').trim();
+}
+
+/**
+ * For logs only (don’t use for IDs)
+ */
+function maskPhone(p) {
+  return p ? p.replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
 }
 
 router.post('/', async (req, res) => {
-  const rawFrom = req.body.From || '';
-  const from = normalizePhone(rawFrom);
+  console.log('[INCOMING] POST /api/webhook');
+
+  const from = normalizePhoneNumber(req.body.From);
   const idempotencyToken =
     req.headers['i-twilio-idempotency-token'] ||
     req.get('i-twilio-idempotency-token') ||
     `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-  console.log('[LOCK] trying for', from, 'token=', idempotencyToken);
+  console.log('[LOCK] trying for', maskPhone(from), 'token=', idempotencyToken);
 
   const gotLock = await acquireLock(from, idempotencyToken).catch(err => {
-    console.error('[LOCK] acquire error:', err.message);
+    console.error('[LOCK] acquire error:', err?.message);
     return false;
   });
 
@@ -55,14 +66,16 @@ router.post('/', async (req, res) => {
   }
 
   try {
+    req.normalizedUserId = from; // Inject normalized ID
     await userProfileMiddleware(req, res, async () => {
       await tokenMiddleware(req, res, async () => {
-        const body = req.body.Body?.trim();
+        const body = (req.body.Body || '').trim();
         const mediaUrl = req.body.MediaUrl0;
         const mediaType = req.body.MediaContentType0;
+
         console.log('[WEBHOOK] Incoming WhatsApp message:', {
           timestamp: new Date().toISOString(),
-          from,
+          from: maskPhone(from),
           body,
           mediaUrl,
           mediaType,
@@ -71,13 +84,16 @@ router.post('/', async (req, res) => {
             'x-twilio-signature': req.headers['x-twilio-signature']
           }
         });
+
         if (!from) {
           console.error('[ERROR] Missing From in webhook request');
           return res.status(200).send(`<Response><Message>⚠️ Invalid request: missing sender.</Message></Response>`);
         }
+
         const { userProfile, ownerId } = req;
         let response;
         const lc = body?.toLowerCase();
+
         if (lc?.includes('upgrade to pro') || lc?.includes('upgrade to enterprise')) {
           if (userProfile.stripe_subscription_id) {
             await sendMessage(from, `⚠️ You already have an active ${userProfile.subscription_tier} subscription. Contact support to change plans.`);
@@ -103,9 +119,10 @@ router.post('/', async (req, res) => {
             `UPDATE users SET stripe_customer_id=$1, subscription_tier=$2 WHERE user_id=$3`,
             [customer.id, tier, userProfile.user_id]
           );
-          await sendTemplateMessage(from, [{ type: 'text', text: `Upgrade to ${tier} for ${priceText}/month CAD: ${paymentLink.url}` }], process.env.HEX_UPGRADE_NOW);
+          await sendTemplateMessage(from, process.env.HEX_UPGRADE_NOW, [`Upgrade to ${tier} for ${priceText}/month CAD: ${paymentLink.url}`]);
           return res.status(200).send(`<Response><Message>Upgrade link sent!</Message></Response>`);
         }
+
         if (lc?.includes('upload history') || lc?.includes('historical data') || lc?.includes('deepdive')) {
           const tierLimits = {
             starter: { years: 7, transactions: 5000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_STARTER, parsingPriceText: '$19' },
@@ -121,15 +138,19 @@ router.post('/', async (req, res) => {
                 line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
                 metadata: { user_id: userProfile.user_id, type: 'historical_parsing' }
               });
-              await sendTemplateMessage(from, [{ type: 'text', text: `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`}], process.env.HEX_DEEPDIVE_CONFIRMATION);
+              await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
+                `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`
+              ]);
               return res.status(200).send(`<Response><Message>DeepDive payment link sent!</Message></Response>`);
             }
           }
           response = `<Response><Message>Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: /dashboard/${from}?token=${userProfile.dashboard_token}</Message></Response>`;
         }
+
         const stage = userProfile.current_stage || (userProfile.onboarding_in_progress ? 'onboarding' : 'complete');
         let deepDiveState = await getPendingTransactionState(from);
         const isInDeepDiveUpload = deepDiveState?.deepDiveUpload === true || deepDiveState?.historicalDataUpload === true;
+
         switch (stage) {
           case 'onboarding':
           case 'userInfo':
@@ -218,16 +239,16 @@ router.post('/', async (req, res) => {
           default:
             response = await handleOnboarding(from, body, userProfile, ownerId);
         }
-        res.status(200).send(response);
+        return res.status(200).send(response);
       });
     });
   } catch (error) {
-    console.error('[ERROR] Webhook processing failed for', from, ':', error.message);
+    console.error('[ERROR] Webhook processing failed for', maskPhone(from), ':', error.message);
     await logError(from, error, 'webhook');
-    res.status(200).send(await handleError(from, error, 'webhook', body));
+    return res.status(200).send(await handleError(from, error, 'webhook', body));
   } finally {
     await releaseLock(from, idempotencyToken);
-    console.log('[LOCK] released for', from);
+    console.log('[LOCK] released for', maskPhone(from));
   }
 });
 

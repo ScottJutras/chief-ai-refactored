@@ -12,6 +12,12 @@ const pool = new Pool({
 
 console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
 
+function normalizePhoneNumber(phone = '') {
+  const val = String(phone || '');
+  const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
+  return noWa.replace(/^\+/, '').trim();
+}
+
 async function appendToUserSpreadsheet(ownerId, data) {
   console.log('[DEBUG] appendToUserSpreadsheet called:', { ownerId, data });
   try {
@@ -391,7 +397,9 @@ async function deletePricingItem(ownerId, itemName) {
 }
 
 async function createUserProfile({ user_id, ownerId, onboarding_in_progress = false }) {
-  console.log('[DEBUG] createUserProfile called:', { user_id, ownerId, onboarding_in_progress });
+  const normalizedId = normalizePhoneNumber(user_id);
+  const normalizedOwnerId = normalizePhoneNumber(ownerId);
+  console.log('[DEBUG] createUserProfile called:', { user_id: normalizedId, ownerId: normalizedOwnerId, onboarding_in_progress });
   try {
     const dashboard_token = crypto.randomBytes(16).toString('hex');
     const result = await pool.query(
@@ -402,7 +410,7 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
        ON CONFLICT (user_id) DO UPDATE
          SET onboarding_in_progress = EXCLUDED.onboarding_in_progress
        RETURNING *`,
-      [user_id, ownerId, onboarding_in_progress, false, 'basic', dashboard_token]
+      [normalizedId, normalizedOwnerId, onboarding_in_progress, false, 'basic', dashboard_token]
     );
     console.log('[DEBUG] createUserProfile success:', result.rows[0]);
     return result.rows[0];
@@ -413,7 +421,8 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
 }
 
 async function saveUserProfile(profile) {
-  console.log('[DEBUG] saveUserProfile called:', { user_id: profile.user_id });
+  const normalizedId = normalizePhoneNumber(profile.user_id);
+  console.log('[DEBUG] saveUserProfile called:', { user_id: normalizedId });
   try {
     const result = await pool.query(
       `UPDATE users
@@ -428,7 +437,7 @@ async function saveUserProfile(profile) {
         profile.business_province, profile.email, profile.industry, profile.goal,
         profile.goalProgress, profile.onboarding_in_progress,
         profile.onboarding_completed, profile.subscription_tier || 'basic',
-        profile.trial_start, profile.trial_end, profile.token_usage, profile.user_id
+        profile.trial_start, profile.trial_end, profile.token_usage, normalizedId
       ]
     );
     console.log('[DEBUG] saveUserProfile success:', result.rows[0]);
@@ -440,9 +449,10 @@ async function saveUserProfile(profile) {
 }
 
 async function getUserProfile(userId) {
-  console.log('[DEBUG] getUserProfile called:', { userId });
+  const normalizedId = normalizePhoneNumber(userId);
+  console.log('[DEBUG] getUserProfile called:', { userId: normalizedId });
   try {
-    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [userId]);
+    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [normalizedId]);
     console.log('[DEBUG] getUserProfile result:', res.rows[0] || 'No user found');
     return res.rows[0] || null;
   } catch (error) {
@@ -452,9 +462,10 @@ async function getUserProfile(userId) {
 }
 
 async function getOwnerProfile(ownerId) {
-  console.log('[DEBUG] getOwnerProfile called:', { ownerId });
+  const normalizedId = normalizePhoneNumber(ownerId);
+  console.log('[DEBUG] getOwnerProfile called:', { ownerId: normalizedId });
   try {
-    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [ownerId]);
+    const res = await pool.query('SELECT * FROM users WHERE user_id = $1', [normalizedId]);
     console.log('[DEBUG] getOwnerProfile result:', res.rows[0] || 'No owner found');
     return res.rows[0] || null;
   } catch (error) {
@@ -517,13 +528,14 @@ async function parseReceiptText(text) {
 }
 
 async function generateOTP(userId) {
-  console.log('[DEBUG] generateOTP called:', { userId });
+  const normalizedId = normalizePhoneNumber(userId);
+  console.log('[DEBUG] generateOTP called:', { userId: normalizedId });
   try {
     const otp = Math.floor(100000 + Math.random()*900000).toString();
     const expiry = new Date(Date.now() + 10*60*1000);
     await pool.query(
       `UPDATE users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
-      [otp, expiry, userId]
+      [otp, expiry, normalizedId]
     );
     console.log('[DEBUG] generateOTP success');
     return otp;
@@ -534,17 +546,18 @@ async function generateOTP(userId) {
 }
 
 async function verifyOTP(userId, otp) {
-  console.log('[DEBUG] verifyOTP called:', { userId, otp });
+  const normalizedId = normalizePhoneNumber(userId);
+  console.log('[DEBUG] verifyOTP called:', { userId: normalizedId, otp });
   try {
     const res = await pool.query(
       `SELECT otp, otp_expiry FROM users WHERE user_id=$1`,
-      [userId]
+      [normalizedId]
     );
     const user = res.rows[0];
     if (!user || user.otp !== otp || new Date() > new Date(user.otp_expiry)) return false;
     await pool.query(
       `UPDATE users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`,
-      [userId]
+      [normalizedId]
     );
     console.log('[DEBUG] verifyOTP success');
     return true;

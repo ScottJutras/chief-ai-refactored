@@ -1,7 +1,7 @@
 const express = require('express');
 const axios = require('axios');
 const { getUserProfile, getOwnerProfile, createUserProfile } = require('../services/postgres');
-const { acquireLock, releaseLock } = require('../utils/lockManager'); // Use the new lockManager
+const { acquireLock, releaseLock } = require('../utils/lockManager');
 const { logError } = require('../middleware/error');
 const { tokenMiddleware } = require('../middleware/token');
 const { userProfileMiddleware } = require('../middleware/userProfile');
@@ -25,7 +25,6 @@ const { handleMedia } = require('../handlers/media');
 const { handleError } = require('../utils/aiErrorHandler');
 const router = express.Router();
 
-// Normalize phone number
 function normalizePhoneNumber(rawFrom = '') {
   const val = String(rawFrom);
   if (val.startsWith('whatsapp:')) return val.replace(/^whatsapp:/, '');
@@ -43,7 +42,7 @@ router.post('/', async (req, res) => {
   console.log('[LOCK] trying for', from, 'token=', idempotencyToken);
 
   const gotLock = await acquireLock(from, idempotencyToken).catch(err => {
-    console.error('[LOCK] acquire error:', err?.message);
+    console.error('[LOCK] acquire error:', err.message);
     return false;
   });
 
@@ -121,7 +120,7 @@ router.post('/', async (req, res) => {
                 line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
                 metadata: { user_id: userProfile.user_id, type: 'historical_parsing' }
               });
-              await sendTemplateMessage(from, [{ type: 'text', text: `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`}], process.env.HEX_DEEPDIVE_CONFIRMATION);
+              await sendTemplateMessage(from, [{ type: 'text', text: `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`}], process.env.HEX_DEEPDIVE_CONFIRMATION);
               return res.status(200).send(`<Response><Message>DeepDive payment link sent!</Message></Response>`);
             }
           }

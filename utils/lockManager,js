@@ -7,18 +7,11 @@ const pool = new Pool({
 
 const DEFAULT_TTL_SEC = 25;
 
-/**
- * Try to acquire an expiring lock for user_id.
- * - If existing lock is expired, steal it.
- * - If the same token arrives (retry), allow re-entry.
- * Returns true if acquired, false otherwise.
- */
 async function acquireLock(userId, token, ttlSec = DEFAULT_TTL_SEC) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Check current lock
     const { rows } = await client.query(
       `SELECT token, expires_at FROM locks WHERE user_id = $1 FOR UPDATE`,
       [userId]
@@ -28,7 +21,6 @@ async function acquireLock(userId, token, ttlSec = DEFAULT_TTL_SEC) {
     const newExpiry = new Date(now.getTime() + ttlSec * 1000);
 
     if (rows.length === 0) {
-      // No lock -> insert new
       await client.query(
         `INSERT INTO locks (user_id, token, expires_at, updated_at)
          VALUES ($1, $2, $3, NOW())`,
@@ -43,7 +35,6 @@ async function acquireLock(userId, token, ttlSec = DEFAULT_TTL_SEC) {
     const sameToken = current.token === token;
 
     if (expired || sameToken) {
-      // Steal/refresh the lock or re-enter idempotently
       await client.query(
         `UPDATE locks
            SET token = $2, expires_at = $3, updated_at = NOW()
@@ -54,7 +45,6 @@ async function acquireLock(userId, token, ttlSec = DEFAULT_TTL_SEC) {
       return true;
     }
 
-    // Someone else holds an unexpired lock
     await client.query('ROLLBACK');
     return false;
   } catch (e) {
@@ -65,10 +55,6 @@ async function acquireLock(userId, token, ttlSec = DEFAULT_TTL_SEC) {
   }
 }
 
-/**
- * Release the lock if owned by the same token (so parallel requests can’t clobber).
- * If token is unknown, do nothing (best-effort).
- */
 async function releaseLock(userId, token) {
   try {
     await pool.query(

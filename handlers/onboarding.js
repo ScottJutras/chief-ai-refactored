@@ -8,6 +8,11 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+const LOCATION_CONFIRMATION_SID = 'HX0280df498999848aaff04cc079e16c31';
+const BUSINESS_LOCATION_CONFIRMATION_SID = 'HXa885f78d7654642672bfccfae98d57cb';
+const ONBOARDING_GOAL_SID = 'HX20b1be5490ea39f3730fb9e70d5275df';
+
 // Treat the profile as "incomplete" if any of these are empty/null/undefined
 // Adjust the field names to match your schema if needed.
 const REQUIRED_PROFILE_FIELDS = ['user_id', 'phone']; // <— add/adjust keys you consider mandatory
@@ -67,11 +72,8 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       console.log('[TEMPLATE] locationConfirmation = HX0280df498999848aaff04cc079e16c31', state.detectedLocation);
       await sendTemplateMessage(
         from,
-        'HX0280df498999848aaff04cc079e16c31',
-        [
-          { type: "text", text: state.detectedLocation.province },
-          { type: "text", text: state.detectedLocation.country }
-        ]
+        LOCATION_CONFIRMATION_SID,
+        { "1": state.detectedLocation.province, "2": state.detectedLocation.country }
       );
       return `<Response></Response>`;
     }
@@ -81,7 +83,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
         state.responses.location = state.detectedLocation;
         state.step = 3;
         await setPendingTransactionState(from, state);
-        await sendTemplateMessage(from, 'HXa885f78d7654642672bfccfae98d57cb', []);
+        await sendTemplateMessage(from, BUSINESS_LOCATION_CONFIRMATION_SID, {});
         return `<Response></Response>`;
       } else if (msg === 'edit') {
         state.step = 2.5;
@@ -132,7 +134,7 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       state.invalidAttempts.location = 0;
       state.step = 3;
       await setPendingTransactionState(from, state);
-      await sendTemplateMessage(from, 'HXa885f78d7654642672bfccfae98d57cb', []);
+      await sendTemplateMessage(from, BUSINESS_LOCATION_CONFIRMATION_SID, {});
       return `<Response></Response>`;
     }
     // ---- Step 3: confirm business location equals personal?
@@ -223,7 +225,6 @@ async function handleOnboarding(from, input, userProfile, ownerId) {
       profile = await getUserProfile(from);
       await generateOTP(from);
       const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${from}?token=${profile.dashboard_token}`;
-      // B) Safely send link via template if configured; otherwise fallback to plain message
       await sendMessage(from, `Your financial dashboard is ready: ${dashboardUrl}`);
       const name = profile.name || 'there';
       const congratsMessage = `Congratulations ${name}!
@@ -272,7 +273,7 @@ Let’s build something great.
       await saveUserProfile({ ...profile, user_id: from });
       state.step = 6;
       await setPendingTransactionState(from, state);
-      await sendTemplateMessage(from, 'HX20b1be5490ea39f3730fb9e70d5275df', []);
+      await sendTemplateMessage(from, ONBOARDING_GOAL_SID, {});
       return `<Response></Response>`;
     }
     // ---- Step 6: goal

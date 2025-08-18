@@ -24,6 +24,7 @@ function isProfileIncomplete(profile) {
   return REQUIRED_PROFILE_FIELDS.some(k => k in profile ? isBlank(profile[k]) : true);
 }
 async function handleOnboarding(from, input, userProfile, ownerId) {
+  console.log('[TEST] Onboarding handler called with input:', input);  // New debug line
   try {
     const msgRaw = input || '';
     const msg = msgRaw.trim().toLowerCase();

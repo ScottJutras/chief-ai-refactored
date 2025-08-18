@@ -24,22 +24,27 @@ function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
 }
 
+/** Ensure Twilio gets a TwiML reply if a handler forgot to res.send() */
+function ensureReply(res, text) {
+  if (!res.headersSent) {
+    res.status(200).send(`<Response><Message>${text}</Message></Response>`);
+  }
+}
+
 router.post(
   '/',
   lockMiddleware,
   userProfileMiddleware,
   tokenMiddleware,
   async (req, res, next) => {
-    // Twilio form fields
     const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
 
-    // `userProfileMiddleware` normalizes req.from to digits-only
+    // userProfileMiddleware sets req.from to digits-only
     const from = req.from || String(From || '').replace(/^whatsapp:/, '').replace(/\D/g, '');
     const input = (Body || '').trim();
     const mediaUrl = MediaUrl0 || null;
     const mediaType = MediaContentType0 || null;
 
-    // Enriched by middlewares
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
 
     try {
@@ -49,6 +54,7 @@ router.post(
         input.toLowerCase().includes('start onboarding')
       ) {
         await handleOnboarding(from, input, userProfile, ownerId, res);
+        ensureReply(res, `Welcome to Chief AI! Quick question — what's your name?`);
         return;
       }
 
@@ -64,7 +70,7 @@ router.post(
                 from,
                 `⚠️ You already have an active ${userProfile.subscription_tier} subscription. Contact support to change plans.`
               );
-              res.status(200).send(`<Response><Message>Already subscribed!</Message></Response>`);
+              ensureReply(res, 'Already subscribed!');
               return;
             }
 
@@ -83,7 +89,6 @@ router.post(
               metadata: { user_id: userProfile.user_id }
             });
 
-            // Persist minimal customer + desired tier (subscription activation via Stripe webhook)
             const { Pool } = require('pg');
             const pool = new Pool({
               connectionString: process.env.DATABASE_URL,
@@ -100,7 +105,7 @@ router.post(
               [`Upgrade to ${tier} for ${priceText}/month CAD: ${paymentLink.url}`]
             );
 
-            res.status(200).send(`<Response><Message>Upgrade link sent!</Message></Response>`);
+            ensureReply(res, 'Upgrade link sent!');
             return;
           } catch (err) {
             console.error('[UPGRADE] error:', err?.message);
@@ -165,7 +170,7 @@ router.post(
                     `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`
                   ]
                 );
-                res.status(200).send(`<Response><Message>DeepDive payment link sent!</Message></Response>`);
+                ensureReply(res, 'DeepDive payment link sent!');
                 return;
               }
             } catch (err) {
@@ -175,13 +180,14 @@ router.post(
           }
 
           const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
-          res.status(200).send(
-            `<Response><Message>Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: ${dashUrl}</Message></Response>`
+          ensureReply(
+            res,
+            `Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: ${dashUrl}`
           );
           return;
         }
 
-        // If they’re mid DeepDive upload and sent a media file, process it here
+        // If mid DeepDive upload and sent a media file, process it here
         const deepDiveState = await getPendingTransactionState(from);
         const isInDeepDiveUpload =
           deepDiveState?.deepDiveUpload === true || deepDiveState?.historicalDataUpload === true;
@@ -198,7 +204,7 @@ router.post(
               'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             ];
             if (!allowed.includes(mediaType)) {
-              res.status(200).send(`<Response><Message>Unsupported file type. Please upload a PDF, image, audio, CSV, or Excel.</Message></Response>`);
+              ensureReply(res, 'Unsupported file type. Please upload a PDF, image, audio, CSV, or Excel.');
               return;
             }
 
@@ -217,7 +223,7 @@ router.post(
                   `To parse PDFs/images/audio, unlock DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}. CSV/Excel uploads remain free (${limit.transactions} transactions).`
                 ]
               );
-              res.status(200).send(`<Response><Message>DeepDive payment link sent!</Message></Response>`);
+              ensureReply(res, 'DeepDive payment link sent!');
               return;
             }
 
@@ -237,24 +243,18 @@ router.post(
             if (deepDiveState.historicalDataUpload) {
               const transactionCount = summary?.transactions?.length || 0;
               if (transactionCount > (deepDiveState.maxTransactions || limit.transactions)) {
-                res.status(200).send(
-                  `<Response><Message>Upload exceeds ${deepDiveState.maxTransactions || limit.transactions} transactions. Contact support for larger datasets.</Message></Response>`
-                );
+                ensureReply(res, `Upload exceeds ${deepDiveState.maxTransactions || limit.transactions} transactions. Contact support for larger datasets.`);
                 return;
               }
               const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
-              res.status(200).send(
-                `<Response><Message>✅ ${transactionCount} new transactions processed. Track progress on your dashboard: ${dashUrl}</Message></Response>`
-              );
+              ensureReply(res, `✅ ${transactionCount} new transactions processed. Track progress on your dashboard: ${dashUrl}`);
               deepDiveState.historicalDataUpload = false;
               deepDiveState.deepDiveUpload = false;
               await setPendingTransactionState(from, deepDiveState);
               return;
             }
 
-            res.status(200).send(
-              `<Response><Message>File received and processed. ${summary ? 'Summary: ' + JSON.stringify(summary) : 'OK'}.</Message></Response>`
-            );
+            ensureReply(res, `File received and processed. ${summary ? 'Summary: ' + JSON.stringify(summary) : 'OK'}.`);
             deepDiveState.deepDiveUpload = false;
             await setPendingTransactionState(from, deepDiveState);
             return;
@@ -277,6 +277,7 @@ router.post(
           isOwner,
           res
         );
+        ensureReply(res, 'Got your file — processing complete.');
         return;
       }
 
@@ -299,6 +300,7 @@ router.post(
             isOwner,
             res
           );
+          ensureReply(res, '✅ Timeclock request received.');
           return;
         }
       }
@@ -313,13 +315,13 @@ router.post(
         isOwner,
         res
       );
+      ensureReply(res, "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', or 'help'.");
       return;
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
       return next(error);
     } finally {
       try {
-        // release using the SAME key+token the middleware set
         await releaseLock(req.lockKey, req.lockToken);
         console.log('[LOCK] released for', req.lockKey);
       } catch (e) {

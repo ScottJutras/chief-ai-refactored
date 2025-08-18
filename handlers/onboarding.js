@@ -1,3 +1,7 @@
+const LOCATION_CONFIRMATION_SID = 'HX0280df498999848aaff04cc079e16c31';
+const BUSINESS_LOCATION_CONFIRMATION_SID = 'HXa885f78d7654642672bfccfae98d57cb';
+const ONBOARDING_GOAL_SID = 'HX20b1be5490ea39f3730fb9e70d5275df';
+
 const { createUserProfile, saveUserProfile, generateOTP, getUserProfile } = require('../services/postgres');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState, clearUserState } = require('../utils/stateManager');
 const { sendTemplateMessage, sendMessage } = require('../services/twilio');
@@ -8,10 +12,6 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
-
-const LOCATION_CONFIRMATION_SID = 'HX0280df498999848aaff04cc079e16c31';
-const BUSINESS_LOCATION_CONFIRMATION_SID = 'HXa885f78d7654642672bfccfae98d57cb';
-const ONBOARDING_GOAL_SID = 'HX20b1be5490ea39f3730fb9e70d5275df';
 
 // Treat the profile as "incomplete" if any of these are empty/null/undefined
 // Adjust the field names to match your schema if needed.
@@ -24,7 +24,7 @@ function isProfileIncomplete(profile) {
   return REQUIRED_PROFILE_FIELDS.some(k => k in profile ? isBlank(profile[k]) : true);
 }
 async function handleOnboarding(from, input, userProfile, ownerId) {
-  console.log('[TEST] Onboarding handler called with input:', input);  // New debug line
+  console.log('[TEST] Onboarding handler called with input:', input);  // Debug log for deployment test
   try {
     const msgRaw = input || '';
     const msg = msgRaw.trim().toLowerCase();

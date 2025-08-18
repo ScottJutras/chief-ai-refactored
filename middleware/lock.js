@@ -1,64 +1,108 @@
+// middleware/lock.js
 const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 20,
+  max: 10,
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000
 });
 
-async function acquireLock(key) {
-  console.log('[LOCK] Attempting to acquire lock for', key);
+const LOCK_TTL_MS = parseInt(process.env.LOCK_TTL_MS || '10000', 10); // 10s default
+
+function nowPlusMs(ms) {
+  return new Date(Date.now() + ms);
+}
+
+/**
+ * Try to acquire a per-key lock.
+ * Success if: no existing lock, or existing lock is expired, or we already own it (same token).
+ */
+async function acquireLock(lockKey, token, ttlMs = LOCK_TTL_MS) {
+  const client = await pool.connect();
   try {
-    const result = await pool.query(
-      `INSERT INTO locks (lock_key, created_at)
-       VALUES ($1, NOW())
-       ON CONFLICT (lock_key) DO NOTHING
-       RETURNING *`,
-      [key]
+    const res = await client.query(
+      `
+      insert into locks (lock_key, token, expires_at)
+      values ($1, $2, $3)
+      on conflict (lock_key) do update
+        set token = excluded.token,
+            expires_at = excluded.expires_at,
+            updated_at = now()
+      where locks.expires_at < now() or locks.token = excluded.token
+      returning token
+      `,
+      [lockKey, token, nowPlusMs(ttlMs)]
     );
-    if (result.rows.length === 0) {
-      console.log('[LOCK] Lock acquisition failed for', key, ': already locked');
-      return false;
+
+    const acquired = res.rowCount === 1 && res.rows[0]?.token === token;
+    if (!acquired) {
+      console.error('[ERROR] acquireLock failed for', lockKey, ': already locked');
     }
-    console.log('[LOCK] Acquired lock for', key);
-    return true;
-  } catch (error) {
-    console.error('[ERROR] acquireLock failed for', key, ':', error.message);
-    throw error;
+    return acquired;
+  } finally {
+    client.release();
   }
 }
 
-async function releaseLock(key) {
-  console.log('[LOCK] Releasing lock for', key);
+/**
+ * Release lock if we own it.
+ */
+async function releaseLock(lockKey, token) {
+  const client = await pool.connect();
   try {
-    await pool.query(`DELETE FROM locks WHERE lock_key = $1`, [key]);
-    console.log('[LOCK] Released lock for', key);
-  } catch (error) {
-    console.error('[ERROR] releaseLock failed for', key, ':', error.message);
-    throw error;
+    await client.query(`delete from locks where lock_key = $1 and token = $2`, [lockKey, token]);
+    // no throw if 0 rows; maybe it already expired/was taken over
+  } finally {
+    client.release();
   }
 }
 
+/**
+ * Express middleware:
+ * - Derives lockKey from sender phone (normalizes optional whatsapp: prefix)
+ * - Uses Twilio idempotency token (or a generated fallback) as the lock token
+ * - Acquires or returns a "busy" TwiML message
+ */
 async function lockMiddleware(req, res, next) {
-  const key = req.body.From ? `lock:${req.body.From.replace(/\D/g, '')}` : null;
-  if (!key) {
-    console.error('[ERROR] Missing From in lockMiddleware');
-    return res.send(`<Response><Message>⚠️ Invalid request. Please try again.</Message></Response>`);
-  }
   try {
-    const lockAcquired = await acquireLock(key);
-    if (!lockAcquired) {
-      console.log('[LOCK] Failed to acquire lock for', key);
-      return res.send(`<Response><Message>⚠️ Another request is being processed. Please try again shortly.</Message></Response>`);
+    const { From } = req.body || {};
+    const rawFrom = req.from || From || 'UNKNOWN_FROM';
+    const from = String(rawFrom).replace(/^whatsapp:/, '');
+    const lockKey = `lock:${from}`;
+
+    // Prefer Twilio’s idempotency token (unique per inbound message)
+    const token =
+      req.headers['i-twilio-idempotency-token'] ||
+      req.get?.('i-twilio-idempotency-token') ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    console.log('[LOCK] Attempting to acquire lock for', lockKey);
+
+    const ok = await acquireLock(lockKey, token);
+    if (!ok) {
+      // Busy response—Twilio expects 200 + TwiML
+      console.log('[LOCK] Busy; returning busy TwiML for', lockKey);
+      return res
+        .status(200)
+        .send(`<Response><Message>I'm processing your previous message—try again in a moment.</Message></Response>`);
     }
-    req.lockKey = key;
-    next();
+
+    // Expose for downstream handlers
+    req.lockKey = lockKey;
+    req.lockToken = token;
+
+    // Ensure we always release in router finally
+    return next();
   } catch (err) {
-    console.error('[ERROR] lockMiddleware failed for', key, ':', err.message);
-    next(err);
+    console.error('[ERROR] lockMiddleware failed:', err?.message);
+    return next(err);
   }
 }
 
-module.exports = { acquireLock, releaseLock, lockMiddleware };
+module.exports = {
+  acquireLock,
+  releaseLock,
+  lockMiddleware
+};

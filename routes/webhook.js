@@ -25,15 +25,16 @@ const { handleMedia } = require('../handlers/media');
 const { handleError } = require('../utils/aiErrorHandler');
 const router = express.Router();
 
-function normalizePhoneNumber(rawFrom = '') {
-  const val = String(rawFrom);
-  if (val.startsWith('whatsapp:')) return val.replace(/^whatsapp:/, '');
-  return val;
+/**
+ * Normalize phone to digits-only (remove '+' and non-digits)
+ */
+function normalizePhone(rawFrom = '') {
+  return rawFrom.replace(/\D/g, '');
 }
 
 router.post('/', async (req, res) => {
   const rawFrom = req.body.From || '';
-  const from = normalizePhoneNumber(rawFrom);
+  const from = normalizePhone(rawFrom);
   const idempotencyToken =
     req.headers['i-twilio-idempotency-token'] ||
     req.get('i-twilio-idempotency-token') ||

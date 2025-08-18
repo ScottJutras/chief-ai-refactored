@@ -18,20 +18,20 @@ function normalizeFrom(raw) {
 }
 
 /**
- * Acquire a lock for the given key+user.
+ * Acquire a lock for the given key+user with a non-null token.
  * Returns true if acquired, false if already locked.
  */
-async function acquireLock(lockKey, userId) {
+async function acquireLock(lockKey, userId, token) {
   console.log('[LOCK] Attempting to acquire lock for', lockKey);
   try {
     const result = await pool.query(
       `
-      INSERT INTO public.locks (lock_key, user_id, created_at)
-      VALUES ($1, $2, NOW())
+      INSERT INTO public.locks (lock_key, user_id, token, created_at)
+      VALUES ($1, $2, $3, NOW())
       ON CONFLICT (lock_key) DO NOTHING
       RETURNING lock_key
       `,
-      [lockKey, userId]
+      [lockKey, userId, token]
     );
 
     if (result.rows.length === 0) {
@@ -47,10 +47,9 @@ async function acquireLock(lockKey, userId) {
   }
 }
 
-/**
- * Release a lock for the given key.
- */
+/** Release a lock for the given key. */
 async function releaseLock(lockKey) {
+  if (!lockKey) return;
   console.log('[LOCK] Releasing lock for', lockKey);
   try {
     await pool.query(`DELETE FROM public.locks WHERE lock_key = $1`, [lockKey]);
@@ -61,24 +60,28 @@ async function releaseLock(lockKey) {
   }
 }
 
-/**
- * Express middleware to enforce per-number locking.
- */
+/** Express middleware to enforce per-number locking. */
 async function lockMiddleware(req, res, next) {
-  const { From } = req.body || {};
-  const fromRaw = req.from || From || null;
-  const userId = normalizeFrom(fromRaw);
-  const lockKey = userId ? `lock:${userId}` : null;
-
-  if (!lockKey) {
-    console.error('[ERROR] Missing From in lockMiddleware');
-    return res
-      .status(200)
-      .send(`<Response><Message>⚠️ Invalid request. Please try again.</Message></Response>`);
-  }
-
   try {
-    const acquired = await acquireLock(lockKey, userId);
+    const { From } = req.body || {};
+    const fromRaw = req.from || From || null;
+    const userId = normalizeFrom(fromRaw);
+    const lockKey = userId ? `lock:${userId}` : null;
+
+    if (!lockKey) {
+      console.error('[ERROR] Missing From in lockMiddleware');
+      return res
+        .status(200)
+        .send(`<Response><Message>⚠️ Invalid request. Please try again.</Message></Response>`);
+    }
+
+    // Prefer Twilio’s idempotency token; fallback to random
+    const token =
+      req.headers['i-twilio-idempotency-token'] ||
+      (typeof req.get === 'function' && req.get('i-twilio-idempotency-token')) ||
+      `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    const acquired = await acquireLock(lockKey, userId, token);
     if (!acquired) {
       return res
         .status(200)
@@ -86,10 +89,10 @@ async function lockMiddleware(req, res, next) {
     }
 
     req.lockKey = lockKey; // router uses this in finally
-    next();
+    return next();
   } catch (err) {
-    console.error('[ERROR] lockMiddleware failed for', lockKey, ':', err.message);
-    next(err);
+    console.error('[ERROR] lockMiddleware failed:', err?.message);
+    return next(err);
   }
 }
 

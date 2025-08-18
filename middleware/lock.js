@@ -9,7 +9,9 @@ const pool = new Pool({
   idleTimeoutMillis: 30000
 });
 
-// Normalize a Twilio From value -> digits only user_id (e.g., "whatsapp:+1905..." => "1905...")
+const LOCK_TTL_MS = parseInt(process.env.LOCK_TTL_MS || '10000', 10); // 10s
+
+// Normalize a Twilio From value -> digits only (e.g., "whatsapp:+1905..." => "1905...")
 function normalizeFrom(raw) {
   return String(raw || '')
     .replace(/^whatsapp:/i, '')
@@ -17,42 +19,46 @@ function normalizeFrom(raw) {
     .replace(/\D/g, '');
 }
 
-/**
- * Acquire a lock for the given key+user with a non-null token.
- * Returns true if acquired, false if already locked.
- */
-async function acquireLock(lockKey, userId, token) {
-  console.log('[LOCK] Attempting to acquire lock for', lockKey);
-  try {
-    const result = await pool.query(
-      `
-      INSERT INTO public.locks (lock_key, user_id, token, created_at)
-      VALUES ($1, $2, $3, NOW())
-      ON CONFLICT (lock_key) DO NOTHING
-      RETURNING lock_key
-      `,
-      [lockKey, userId, token]
-    );
-
-    if (result.rows.length === 0) {
-      console.log('[LOCK] Lock acquisition failed for', lockKey, ': already locked');
-      return false;
-    }
-
-    console.log('[LOCK] Acquired lock for', lockKey);
-    return true;
-  } catch (err) {
-    console.error('[ERROR] acquireLock failed for', lockKey, ':', err.message);
-    throw err;
-  }
+function tsPlus(ms) {
+  return new Date(Date.now() + ms);
 }
 
-/** Release a lock for the given key. */
-async function releaseLock(lockKey) {
+/**
+ * Acquire (or re-acquire) a lock:
+ * - If no row, insert (lock taken)
+ * - If expired, take over
+ * - If same token, refresh
+ */
+async function acquireLock(lockKey, userId, token, ttlMs = LOCK_TTL_MS) {
+  console.log('[LOCK] Attempting to acquire lock for', lockKey);
+  const q = `
+    insert into public.locks (lock_key, user_id, token, expires_at, created_at, updated_at)
+    values ($1, $2, $3, $4, now(), now())
+    on conflict (lock_key) do update
+      set token = excluded.token,
+          user_id = excluded.user_id,
+          expires_at = excluded.expires_at,
+          updated_at = now()
+    where public.locks.expires_at < now() or public.locks.token = excluded.token
+    returning token
+  `;
+  const params = [lockKey, userId, token, tsPlus(ttlMs)];
+  const res = await pool.query(q, params);
+  const ok = res.rowCount === 1 && res.rows[0]?.token === token;
+  if (!ok) console.log('[LOCK] Lock acquisition failed for', lockKey, ': already locked');
+  else console.log('[LOCK] Acquired lock for', lockKey);
+  return ok;
+}
+
+/** Release lock; if token provided, require ownership */
+async function releaseLock(lockKey, token) {
   if (!lockKey) return;
-  console.log('[LOCK] Releasing lock for', lockKey);
+  const q = token
+    ? `delete from public.locks where lock_key = $1 and token = $2`
+    : `delete from public.locks where lock_key = $1`;
+  const params = token ? [lockKey, token] : [lockKey];
   try {
-    await pool.query(`DELETE FROM public.locks WHERE lock_key = $1`, [lockKey]);
+    await pool.query(q, params);
     console.log('[LOCK] Released lock for', lockKey);
   } catch (err) {
     console.error('[ERROR] releaseLock failed for', lockKey, ':', err.message);
@@ -60,35 +66,35 @@ async function releaseLock(lockKey) {
   }
 }
 
-/** Express middleware to enforce per-number locking. */
+/** Express middleware to enforce per-number locking with TTL */
 async function lockMiddleware(req, res, next) {
   try {
     const { From } = req.body || {};
-    const fromRaw = req.from || From || null;
-    const userId = normalizeFrom(fromRaw);
-    const lockKey = userId ? `lock:${userId}` : null;
-
-    if (!lockKey) {
+    const userId = normalizeFrom(req.from || From || '');
+    if (!userId) {
       console.error('[ERROR] Missing From in lockMiddleware');
       return res
         .status(200)
         .send(`<Response><Message>⚠️ Invalid request. Please try again.</Message></Response>`);
     }
+    const lockKey = `lock:${userId}`;
 
-    // Prefer Twilio’s idempotency token; fallback to random
+    // Use Twilio idempotency token; fallback to random
     const token =
       req.headers['i-twilio-idempotency-token'] ||
       (typeof req.get === 'function' && req.get('i-twilio-idempotency-token')) ||
       `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-    const acquired = await acquireLock(lockKey, userId, token);
-    if (!acquired) {
+    const ok = await acquireLock(lockKey, userId, token);
+    if (!ok) {
       return res
         .status(200)
         .send(`<Response><Message>⚠️ Another request is being processed. Please try again shortly.</Message></Response>`);
     }
 
-    req.lockKey = lockKey; // router uses this in finally
+    // Expose for router finally{}
+    req.lockKey = lockKey;
+    req.lockToken = token;
     return next();
   } catch (err) {
     console.error('[ERROR] lockMiddleware failed:', err?.message);
@@ -96,8 +102,4 @@ async function lockMiddleware(req, res, next) {
   }
 }
 
-module.exports = {
-  acquireLock,
-  releaseLock,
-  lockMiddleware
-};
+module.exports = { acquireLock, releaseLock, lockMiddleware };

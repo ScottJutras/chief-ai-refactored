@@ -702,5 +702,6 @@ module.exports = {
   logTimeEntry,
   getTimeEntries,
   generateTimesheet,
-  generateReport
+  generateReport,
+  normalizePhoneNumber
 };

@@ -9,32 +9,40 @@ const pool = new Pool({
   idleTimeoutMillis: 30000
 });
 
+// Normalize a Twilio From value -> digits only user_id (e.g., "whatsapp:+1905..." => "1905...")
+function normalizeFrom(raw) {
+  return String(raw || '')
+    .replace(/^whatsapp:/i, '')
+    .replace(/^\+/, '')
+    .replace(/\D/g, '');
+}
+
 /**
- * Acquire a lock for the given key.
+ * Acquire a lock for the given key+user.
  * Returns true if acquired, false if already locked.
  */
-async function acquireLock(key) {
-  console.log('[LOCK] Attempting to acquire lock for', key);
+async function acquireLock(lockKey, userId) {
+  console.log('[LOCK] Attempting to acquire lock for', lockKey);
   try {
     const result = await pool.query(
       `
-      INSERT INTO locks (lock_key, created_at)
-      VALUES ($1, NOW())
+      INSERT INTO public.locks (lock_key, user_id, created_at)
+      VALUES ($1, $2, NOW())
       ON CONFLICT (lock_key) DO NOTHING
       RETURNING lock_key
       `,
-      [key]
+      [lockKey, userId]
     );
 
     if (result.rows.length === 0) {
-      console.log('[LOCK] Lock acquisition failed for', key, ': already locked');
+      console.log('[LOCK] Lock acquisition failed for', lockKey, ': already locked');
       return false;
     }
 
-    console.log('[LOCK] Acquired lock for', key);
+    console.log('[LOCK] Acquired lock for', lockKey);
     return true;
   } catch (err) {
-    console.error('[ERROR] acquireLock failed for', key, ':', err.message);
+    console.error('[ERROR] acquireLock failed for', lockKey, ':', err.message);
     throw err;
   }
 }
@@ -42,13 +50,13 @@ async function acquireLock(key) {
 /**
  * Release a lock for the given key.
  */
-async function releaseLock(key) {
-  console.log('[LOCK] Releasing lock for', key);
+async function releaseLock(lockKey) {
+  console.log('[LOCK] Releasing lock for', lockKey);
   try {
-    await pool.query(`DELETE FROM locks WHERE lock_key = $1`, [key]);
-    console.log('[LOCK] Released lock for', key);
+    await pool.query(`DELETE FROM public.locks WHERE lock_key = $1`, [lockKey]);
+    console.log('[LOCK] Released lock for', lockKey);
   } catch (err) {
-    console.error('[ERROR] releaseLock failed for', key, ':', err.message);
+    console.error('[ERROR] releaseLock failed for', lockKey, ':', err.message);
     throw err;
   }
 }
@@ -58,8 +66,9 @@ async function releaseLock(key) {
  */
 async function lockMiddleware(req, res, next) {
   const { From } = req.body || {};
-  const from = req.from || From || null;
-  const lockKey = from ? `lock:${from.replace(/\D/g, '')}` : null;
+  const fromRaw = req.from || From || null;
+  const userId = normalizeFrom(fromRaw);
+  const lockKey = userId ? `lock:${userId}` : null;
 
   if (!lockKey) {
     console.error('[ERROR] Missing From in lockMiddleware');
@@ -69,14 +78,14 @@ async function lockMiddleware(req, res, next) {
   }
 
   try {
-    const acquired = await acquireLock(lockKey);
+    const acquired = await acquireLock(lockKey, userId);
     if (!acquired) {
       return res
         .status(200)
         .send(`<Response><Message>⚠️ Another request is being processed. Please try again shortly.</Message></Response>`);
     }
 
-    req.lockKey = lockKey;
+    req.lockKey = lockKey; // router uses this in finally
     next();
   } catch (err) {
     console.error('[ERROR] lockMiddleware failed for', lockKey, ':', err.message);

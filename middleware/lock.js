@@ -15,6 +15,21 @@ function nowPlusMs(ms) {
   return new Date(Date.now() + ms);
 }
 
+// --- NEW: ensure table exists (idempotent)
+async function ensureLocksTable() {
+  const ddl = `
+    create table if not exists public.locks (
+      lock_key   text primary key,
+      token      text not null,
+      expires_at timestamptz not null,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+    create index if not exists idx_locks_expires_at on public.locks (expires_at);
+  `;
+  await pool.query(ddl);
+}
+
 /**
  * Try to acquire a per-key lock.
  * Success if: no existing lock, or existing lock is expired, or we already own it (same token).
@@ -22,6 +37,8 @@ function nowPlusMs(ms) {
 async function acquireLock(lockKey, token, ttlMs = LOCK_TTL_MS) {
   const client = await pool.connect();
   try {
+    await ensureLocksTable(); // <-- NEW
+
     const res = await client.query(
       `
       insert into locks (lock_key, token, expires_at)
@@ -46,33 +63,25 @@ async function acquireLock(lockKey, token, ttlMs = LOCK_TTL_MS) {
   }
 }
 
-/**
- * Release lock if we own it.
- */
+/** Release lock if we own it. */
 async function releaseLock(lockKey, token) {
   const client = await pool.connect();
   try {
     await client.query(`delete from locks where lock_key = $1 and token = $2`, [lockKey, token]);
-    // no throw if 0 rows; maybe it already expired/was taken over
   } finally {
     client.release();
   }
 }
 
-/**
- * Express middleware:
- * - Derives lockKey from sender phone (normalizes optional whatsapp: prefix)
- * - Uses Twilio idempotency token (or a generated fallback) as the lock token
- * - Acquires or returns a "busy" TwiML message
- */
+/** Express middleware */
 async function lockMiddleware(req, res, next) {
   try {
     const { From } = req.body || {};
     const rawFrom = req.from || From || 'UNKNOWN_FROM';
-    const from = String(rawFrom).replace(/^whatsapp:/, '');
+    // normalize: drop whatsapp: prefix and leading +
+    const from = String(rawFrom).replace(/^whatsapp:/, '').replace(/^\+/, '');
     const lockKey = `lock:${from}`;
 
-    // Prefer Twilio’s idempotency token (unique per inbound message)
     const token =
       req.headers['i-twilio-idempotency-token'] ||
       req.get?.('i-twilio-idempotency-token') ||
@@ -82,18 +91,14 @@ async function lockMiddleware(req, res, next) {
 
     const ok = await acquireLock(lockKey, token);
     if (!ok) {
-      // Busy response—Twilio expects 200 + TwiML
       console.log('[LOCK] Busy; returning busy TwiML for', lockKey);
       return res
         .status(200)
         .send(`<Response><Message>I'm processing your previous message—try again in a moment.</Message></Response>`);
     }
 
-    // Expose for downstream handlers
     req.lockKey = lockKey;
     req.lockToken = token;
-
-    // Ensure we always release in router finally
     return next();
   } catch (err) {
     console.error('[ERROR] lockMiddleware failed:', err?.message);
@@ -101,8 +106,4 @@ async function lockMiddleware(req, res, next) {
   }
 }
 
-module.exports = {
-  acquireLock,
-  releaseLock,
-  lockMiddleware
-};
+module.exports = { acquireLock, releaseLock, lockMiddleware };

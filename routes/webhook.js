@@ -24,29 +24,22 @@ function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
 }
 
-/**
- * POST /api/webhook
- * Twilio sends application/x-www-form-urlencoded body:
- *  - From, Body, MediaUrl0, MediaContentType0, etc.
- *
- * Notes:
- *  - NEVER reference a lowercase `body` variable; use `req.body` or the destructured `Body`.
- *  - Always release the per-number lock in a `finally` block using req.lockKey + req.lockToken.
- */
 router.post(
   '/',
   lockMiddleware,
   userProfileMiddleware,
   tokenMiddleware,
   async (req, res, next) => {
-    // Destructure from req.body (Twilio param casing)
+    // Twilio form fields
     const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
-    const from = (req.from || From || 'UNKNOWN_FROM').replace(/^whatsapp:/, '');
+
+    // `userProfileMiddleware` normalizes req.from to digits-only
+    const from = req.from || String(From || '').replace(/^whatsapp:/, '').replace(/\D/g, '');
     const input = (Body || '').trim();
     const mediaUrl = MediaUrl0 || null;
     const mediaType = MediaContentType0 || null;
 
-    // Enriched by userProfileMiddleware / tokenMiddleware
+    // Enriched by middlewares
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
 
     try {
@@ -60,11 +53,9 @@ router.post(
       }
 
       // ===== 1) UPGRADE FLOW (Stripe) =====
-      // Matches: "upgrade to pro" or "upgrade to enterprise"
       {
         const lc = input.toLowerCase();
-        const wantsUpgrade =
-          lc.includes('upgrade to pro') || lc.includes('upgrade to enterprise');
+        const wantsUpgrade = lc.includes('upgrade to pro') || lc.includes('upgrade to enterprise');
 
         if (wantsUpgrade) {
           try {
@@ -82,7 +73,6 @@ router.post(
               tier === 'pro' ? process.env.PRO_PRICE_ID : process.env.ENTERPRISE_PRICE_ID;
             const priceText = tier === 'pro' ? '$29' : '$99';
 
-            // Create/ensure Stripe customer and a payment link
             const customer = await stripe.customers.create({
               phone: from,
               metadata: { user_id: userProfile.user_id }
@@ -93,7 +83,7 @@ router.post(
               metadata: { user_id: userProfile.user_id }
             });
 
-            // Persist minimal customer + desired tier (sub is activated via Stripe webhook)
+            // Persist minimal customer + desired tier (subscription activation via Stripe webhook)
             const { Pool } = require('pg');
             const pool = new Pool({
               connectionString: process.env.DATABASE_URL,
@@ -120,9 +110,6 @@ router.post(
       }
 
       // ===== 2) DEEPDIVE / HISTORICAL UPLOAD FLOW =====
-      // Triggers: "upload history", "historical data", "deepdive", or "deep dive"
-      //   - Sets state with per-tier limits
-      //   - While active, media uploads get parsed via parseUpload
       {
         const lc = input.toLowerCase();
         const triggersDeepDive =
@@ -131,7 +118,6 @@ router.post(
           lc.includes('deepdive') ||
           lc.includes('deep dive');
 
-        // Per-tier limits & parsing price (only needed for paid parsing of images/audio)
         const tierLimits = {
           starter: {
             years: 7,
@@ -157,7 +143,6 @@ router.post(
         const limit = tierLimits[tier] || tierLimits.starter;
 
         if (triggersDeepDive) {
-          // Default to CSV/Excel path free-of-charge
           await setPendingTransactionState(from, {
             historicalDataUpload: true,
             deepDiveUpload: true,
@@ -165,7 +150,6 @@ router.post(
             uploadType: 'csv'
           });
 
-          // If user immediately sends paid media (image/pdf/audio), require purchase (if not already purchased)
           if (mediaUrl && mediaType && ['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType)) {
             try {
               if (!userProfile?.historical_parsing_purchased) {
@@ -199,7 +183,8 @@ router.post(
 
         // If they’re mid DeepDive upload and sent a media file, process it here
         const deepDiveState = await getPendingTransactionState(from);
-        const isInDeepDiveUpload = deepDiveState?.deepDiveUpload === true || deepDiveState?.historicalDataUpload === true;
+        const isInDeepDiveUpload =
+          deepDiveState?.deepDiveUpload === true || deepDiveState?.historicalDataUpload === true;
 
         if (isInDeepDiveUpload && mediaUrl && mediaType) {
           try {
@@ -217,7 +202,6 @@ router.post(
               return;
             }
 
-            // If uploading paid media and not purchased, gate it
             if (
               ['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType) &&
               !userProfile?.historical_parsing_purchased
@@ -237,7 +221,6 @@ router.post(
               return;
             }
 
-            // Pull file from Twilio URL and parse
             const fileResp = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
             const buffer = Buffer.from(fileResp.data);
             const filename = mediaUrl.split('/').pop() || 'upload';
@@ -298,24 +281,26 @@ router.post(
       }
 
       // ===== 4) TIMECLOCK =====
-      const lower = input.toLowerCase();
-      if (
-        lower.includes('punch') ||
-        lower.includes('break') ||
-        lower.includes('lunch') ||
-        lower.includes('drive') ||
-        lower.includes('hours')
-      ) {
-        await handleTimeclock(
-          from,
-          input,
-          userProfile,
-          ownerId,
-          ownerProfile,
-          isOwner,
-          res
-        );
-        return;
+      {
+        const lower = input.toLowerCase();
+        if (
+          lower.includes('punch') ||
+          lower.includes('break') ||
+          lower.includes('lunch') ||
+          lower.includes('drive') ||
+          lower.includes('hours')
+        ) {
+          await handleTimeclock(
+            from,
+            input,
+            userProfile,
+            ownerId,
+            ownerProfile,
+            isOwner,
+            res
+          );
+          return;
+        }
       }
 
       // ===== 5) GENERAL COMMANDS / AI fallback (delegated) =====
@@ -334,7 +319,7 @@ router.post(
       return next(error);
     } finally {
       try {
-        // IMPORTANT: release using the SAME key+token the middleware set
+        // release using the SAME key+token the middleware set
         await releaseLock(req.lockKey, req.lockToken);
         console.log('[LOCK] released for', req.lockKey);
       } catch (e) {

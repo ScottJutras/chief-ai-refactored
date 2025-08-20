@@ -1,7 +1,7 @@
 // services/twilio.js
 require('dotenv').config();
 const twilio = require('twilio');
-const rateLimit = require('express-rate-limit'); // Correct import
+const rateLimit = require('express-rate-limit');
 
 // Validate environment variables
 const requiredEnvVars = [

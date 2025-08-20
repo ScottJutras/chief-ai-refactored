@@ -16,15 +16,43 @@ const { getValidationLists, detectLocation } = require('../utils/validateLocatio
 const { handleInputWithAI, handleError } = require('../utils/aiErrorHandler');
 const { ack } = require('../utils/http');
 const { pool } = require('../services/postgres');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Check subscription status
 async function checkSubscription(normalizedFrom) {
   const res = await pool.query(
-    `SELECT subscription_tier, paid_tier FROM users WHERE user_id = $1`,
+    `SELECT stripe_customer_id, stripe_subscription_id FROM users WHERE user_id = $1`,
     [normalizedFrom]
   );
   const user = res.rows[0];
-  return user && user.subscription_tier !== 'none' && user.paid_tier !== 'none';
+  if (!user || !user.stripe_customer_id || !user.stripe_subscription_id) {
+    return false;
+  }
+  try {
+    const subscription = await stripe.subscriptions.retrieve(user.stripe_subscription_id);
+    return subscription.status === 'active' || subscription.status === 'trialing';
+  } catch (error) {
+    console.error('[ERROR] Stripe subscription check failed:', error.message);
+    return false;
+  }
+}
+
+// Check onboarding attempts to prevent spam
+async function checkOnboardingAttempts(normalizedFrom) {
+  const res = await pool.query(
+    `SELECT COUNT(*) as attempts FROM onboarding_attempts 
+     WHERE user_id = $1 AND created_at > NOW() - INTERVAL '1 hour'`,
+    [normalizedFrom]
+  );
+  const attempts = parseInt(res.rows[0].attempts);
+  if (attempts >= 3) {
+    await sendMessage(normalizedFrom, 'Too many onboarding attempts. Please try again later.');
+    throw new Error('Too many onboarding attempts');
+  }
+  await pool.query(
+    `INSERT INTO onboarding_attempts (user_id, created_at) VALUES ($1, NOW())`,
+    [normalizedFrom]
+  );
 }
 
 // --- DB-backed state bridge ---
@@ -113,6 +141,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
 
     // Reset flow if requested
     if (wantsReset) {
+      await checkOnboardingAttempts(normalizedFrom); // Check attempts before reset
       await clearUserState(normalizedFrom).catch(() => {});
       if (!hasDbUser) {
         profile = await createUserProfile({

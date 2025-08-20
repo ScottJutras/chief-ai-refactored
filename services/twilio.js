@@ -1,7 +1,6 @@
 // services/twilio.js
 require('dotenv').config();
 const twilio = require('twilio');
-const rateLimit = require('express-rate-limit');
 
 const requiredEnvVars = [
   'TWILIO_ACCOUNT_SID',
@@ -9,36 +8,55 @@ const requiredEnvVars = [
   'TWILIO_MESSAGING_SERVICE_SID',
 ];
 for (const envVar of requiredEnvVars) {
-  if (!process.env[envVar]) throw new Error(`Missing required environment variable: ${envVar}`);
+  if (!process.env[envVar]) {
+    throw new Error(`Missing required environment variable: ${envVar}`);
+  }
 }
 
-const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const client = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
-// --- helper: always return whatsapp:+E164 ---
+// --- helper: always produce whatsapp:+E164 ---
 function wa(to) {
   const raw = String(to || '').replace(/^whatsapp:/i, '').trim();
   const e164 = raw.startsWith('+') ? raw : `+${raw}`;
   return `whatsapp:${e164}`;
 }
 
-const messageLimiter = rateLimit({
-  store: new (require('express-rate-limit').MemoryStore)(),
-  windowMs: 60 * 60 * 1000,
-  max: 100,
-  keyGenerator: (req) => req.body.From || 'unknown',
-});
+// --- super light in-memory rate limiter (100 msgs / hour / recipient) ---
+const sendWindowMs = 60 * 60 * 1000;
+const sendLimit = 100;
+const buckets = new Map(); // key: wa(to) -> { start, count }
+
+function checkSendRate(to) {
+  const key = wa(to);
+  const now = Date.now();
+  let entry = buckets.get(key);
+  if (!entry || (now - entry.start) >= sendWindowMs) {
+    entry = { start: now, count: 0 };
+  }
+  entry.count += 1;
+  buckets.set(key, entry);
+  if (entry.count > sendLimit) {
+    const err = new Error('Rate limit exceeded for outbound messages');
+    err.status = 429;
+    err.retryAfterMs = sendWindowMs - (now - entry.start);
+    throw err;
+  }
+}
 
 async function sendMessage(to, body) {
   try {
-    await messageLimiter({ body: { From: wa(to) } });
+    checkSendRate(to);
     const message = await client.messages.create({
       body,
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
       to: wa(to),
-      // optional: get delivery diagnostics
-      // statusCallback: process.env.TWILIO_STATUS_CALLBACK_URL,
+      // statusCallback: process.env.TWILIO_STATUS_CALLBACK_URL, // optional
     });
-    console.log(`[✅ SUCCESS] Message sent: ${message.sid} -> ${wa(to)} | len=${(body||'').length}`);
+    console.log(`[✅ SUCCESS] Message sent: ${message.sid} -> ${wa(to)} | len=${(body || '').length}`);
     return message.sid;
   } catch (error) {
     console.error('[ERROR] Failed to send message:', error.message, error.code, error.moreInfo);
@@ -48,11 +66,12 @@ async function sendMessage(to, body) {
 
 async function sendQuickReply(to, body, replies = []) {
   try {
-    await messageLimiter({ body: { From: wa(to) } });
+    checkSendRate(to);
     const message = await client.messages.create({
       body,
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
       to: wa(to),
+      // WhatsApp "tap to reply" suggestions
       persistentAction: replies.slice(0, 3).map(r => `reply?text=${encodeURIComponent(r)}`),
       // statusCallback: process.env.TWILIO_STATUS_CALLBACK_URL,
     });
@@ -66,7 +85,7 @@ async function sendQuickReply(to, body, replies = []) {
 
 async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
   try {
-    await messageLimiter({ body: { From: wa(to) } });
+    checkSendRate(to);
     if (!contentSid) throw new Error('Missing ContentSid');
 
     const formattedVariables = JSON.stringify(
@@ -85,7 +104,6 @@ async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
       to: wa(to),
       // statusCallback: process.env.TWILIO_STATUS_CALLBACK_URL,
     });
-
     console.log(`[✅ SUCCESS] Template message sent: ${message.sid} -> ${wa(to)} contentSid=${contentSid}`);
     return message.sid;
   } catch (error) {

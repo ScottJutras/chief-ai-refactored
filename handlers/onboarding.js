@@ -20,11 +20,11 @@ const { pool } = require('../services/postgres');
 // Check subscription status
 async function checkSubscription(normalizedFrom) {
   const res = await pool.query(
-    `SELECT subscription_status FROM users WHERE user_id = $1`,
+    `SELECT subscription_tier, paid_tier FROM users WHERE user_id = $1`,
     [normalizedFrom]
   );
   const user = res.rows[0];
-  return user && user.subscription_status === 'active';
+  return user && user.subscription_tier !== 'none' && user.paid_tier !== 'none';
 }
 
 // --- DB-backed state bridge ---
@@ -478,7 +478,11 @@ Let’s build something great.
         return ack(res);
       } catch (error) {
         console.error('[ERROR] Template message failed:', error.message, error.code, error.moreInfo);
-        await sendMessage(normalizedFrom, `Great — set industry to ${cap(industry)}. What’s your first money goal? Try "Grow profit by $10,000" or "Pay off $5,000 debt".`);
+        await sendQuickReply(
+          normalizedFrom,
+          `Great — set industry to ${cap(industry)}. What’s your first money goal? Try "Grow profit by $10,000" or "Pay off $5,000 debt".`,
+          ['Grow profit by $10000', 'Pay off $5000 debt']
+        );
         return ack(res);
       }
     }
@@ -511,7 +515,11 @@ Let’s build something great.
           return ack(res);
         }
         await setPendingTransactionState(normalizedFrom, state);
-        await sendMessage(normalizedFrom, aiReply || `Invalid goal. Try "Grow profit by $10000" or "Pay off $5000 debt".`);
+        await sendQuickReply(
+          normalizedFrom,
+          aiReply || `Invalid goal. Try "Grow profit by $10000" or "Pay off $5000 debt".`,
+          ['Grow profit by $10000', 'Pay off $5000 debt']
+        );
         return ack(res);
       }
 

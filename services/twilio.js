@@ -1,7 +1,7 @@
 // services/twilio.js
 require('dotenv').config();
 const twilio = require('twilio');
-const { RateLimiter } = require('express-rate-limit');
+const rateLimit = require('express-rate-limit'); // Correct import
 
 // Validate environment variables
 const requiredEnvVars = [
@@ -21,7 +21,7 @@ const client = twilio(
 );
 
 // Rate limiter for message sending (max 100 messages per hour per user)
-const messageLimiter = new RateLimiter({
+const messageLimiter = rateLimit({
   store: new (require('express-rate-limit').MemoryStore)(),
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 100, // Max 100 messages per hour

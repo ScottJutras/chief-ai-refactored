@@ -1,9 +1,8 @@
 // services/twilio.js
 require('dotenv').config();
 const twilio = require('twilio');
-const rateLimit = require('express-rate-limit'); // Correct import
+const { RateLimiter } = require('express-rate-limit');
 
-// Validate environment variables
 const requiredEnvVars = [
   'TWILIO_ACCOUNT_SID',
   'TWILIO_AUTH_TOKEN',
@@ -20,13 +19,18 @@ const client = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// Rate limiter for message sending (max 100 messages per hour per user)
-const messageLimiter = rateLimit({
+// Rate limiter (best-effort in serverless)
+const messageLimiter = new RateLimiter({
   store: new (require('express-rate-limit').MemoryStore)(),
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 100, // Max 100 messages per hour
+  windowMs: 60 * 60 * 1000,
+  max: 100,
   keyGenerator: (req) => req.body.From || 'unknown',
 });
+
+// Normalize to whatsapp:+E164
+function toWhatsApp(to) {
+  return to.startsWith('whatsapp:') ? to : `whatsapp:${to}`;
+}
 
 async function sendMessage(to, body) {
   try {
@@ -34,7 +38,7 @@ async function sendMessage(to, body) {
     const message = await client.messages.create({
       body,
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
-      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+      to: toWhatsApp(to),
     });
     console.log(`[✅ SUCCESS] Message sent: ${message.sid}`);
     return message.sid;
@@ -44,14 +48,15 @@ async function sendMessage(to, body) {
   }
 }
 
+// Session quick replies (no contentSid)
 async function sendQuickReply(to, body, replies = []) {
   try {
     await messageLimiter({ body: { From: to } });
     const message = await client.messages.create({
       body,
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
-      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
-      persistentAction: replies.slice(0, 3).map(reply => `reply?text=${encodeURIComponent(reply)}`),
+      to: toWhatsApp(to),
+      persistentAction: replies.slice(0, 3).map(r => `reply?text=${encodeURIComponent(r)}`),
     });
     console.log(`[✅ SUCCESS] Quick reply sent: ${message.sid}`);
     return message.sid;
@@ -61,26 +66,26 @@ async function sendQuickReply(to, body, replies = []) {
   }
 }
 
+// Content template (buttons must be defined in the template itself)
 async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
   try {
     await messageLimiter({ body: { From: to } });
-    if (!contentSid) {
-      console.error('[ERROR] Missing ContentSid for Twilio template message.');
-      throw new Error('Missing ContentSid');
-    }
+    if (!contentSid) throw new Error('Missing ContentSid');
+
     const formattedVariables = JSON.stringify(
       Array.isArray(contentVariables)
-        ? contentVariables.reduce((acc, item, index) => {
-            acc[index + 1] = typeof item === 'string' ? item : (item?.text ?? String(item ?? ''));
+        ? contentVariables.reduce((acc, item, idx) => {
+            acc[idx + 1] = typeof item === 'string' ? item : (item?.text ?? String(item ?? ''));
             return acc;
           }, {})
         : contentVariables
     );
+
     const message = await client.messages.create({
       contentSid,
       contentVariables: formattedVariables,
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
-      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+      to: toWhatsApp(to),
     });
     console.log(`[✅ SUCCESS] Template message sent: ${message.sid}`);
     return message.sid;

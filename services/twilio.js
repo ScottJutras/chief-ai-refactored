@@ -5,7 +5,7 @@ const twilio = require('twilio');
 const requiredEnvVars = [
   'TWILIO_ACCOUNT_SID',
   'TWILIO_AUTH_TOKEN',
-  'TWILIO_MESSAGING_SERVICE_SID',
+  'TWILIO_WHATSAPP_NUMBER',  // Ensure this is set to 'whatsapp:+14155238886' for sandbox
 ];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
@@ -29,7 +29,7 @@ async function sendMessage(to, body) {
   try {
     const message = await client.messages.create({
       body,
-      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
+      from: process.env.TWILIO_WHATSAPP_NUMBER,
       to: wa(to),
     });
     console.log(`[✅ SUCCESS] Message sent: ${message.sid} -> ${wa(to)} | len=${(body || '').length}`);
@@ -44,7 +44,7 @@ async function sendQuickReply(to, body, replies = []) {
   try {
     const message = await client.messages.create({
       body,
-      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
+      from: process.env.TWILIO_WHATSAPP_NUMBER,
       to: wa(to),
       persistentAction: replies.slice(0, 3).map(r => `reply?text=${encodeURIComponent(r)}`),
     });
@@ -72,7 +72,7 @@ async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
     const message = await client.messages.create({
       contentSid,
       contentVariables: formattedVariables,
-      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
+      from: process.env.TWILIO_WHATSAPP_NUMBER,
       to: wa(to),
     });
     console.log(`[✅ SUCCESS] Template message sent: ${message.sid} -> ${wa(to)} contentSid=${contentSid}`);

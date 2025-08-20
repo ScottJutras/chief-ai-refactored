@@ -11,22 +11,21 @@ const {
   deletePendingTransactionState,
   clearUserState,
 } = require('../utils/stateManager');
-const { sendTemplateMessage, sendMessage } = require('../services/twilio');
+const { sendTemplateMessage, sendQuickReply, sendMessage } = require('../services/twilio');
 const { getValidationLists, detectLocation } = require('../utils/validateLocation');
 const { handleInputWithAI, handleError } = require('../utils/aiErrorHandler');
 
 // --- DB-backed state bridge ---
 async function loadState(normalizedFrom, profile) {
-  // Prefer in-memory (if your stateManager was replaced later), otherwise DB
   let state = await getPendingTransactionState(normalizedFrom).catch(() => null);
   if (!state && profile && profile.onboarding_state) {
     state = profile.onboarding_state;
+    await setPendingTransactionState(normalizedFrom, state);
   }
   return state || null;
 }
 
 async function persistState(normalizedFrom, profile, state) {
-  // Keep both: in-memory (no-op on serverless) + DB
   await setPendingTransactionState(normalizedFrom, state).catch(() => {});
   await saveUserProfile({ ...(profile || {}), user_id: normalizedFrom, onboarding_state: state });
 }
@@ -35,7 +34,6 @@ async function clearState(normalizedFrom, profile) {
   await deletePendingTransactionState(normalizedFrom).catch(() => {});
   await saveUserProfile({ ...(profile || {}), user_id: normalizedFrom, onboarding_state: null });
 }
-
 
 // --- utils ---
 function normalizePhoneNumber(from = '') {
@@ -58,7 +56,6 @@ function cap(s = '') {
 }
 
 // Treat the profile as "incomplete" if any of these are empty
-// NOTE: don't include non-existent columns like `phone`; that caused the loop.
 const REQUIRED_PROFILE_FIELDS = ['user_id'];
 
 function isBlank(v) {
@@ -123,7 +120,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
     }
 
     // Bootstrap state if needed
-    let state = await getPendingTransactionState(normalizedFrom);
+    let state = await loadState(normalizedFrom, profile);
     if (!state || !hasDbUser || isProfileIncomplete(dbProfile)) {
       if (!hasDbUser) {
         profile = await createUserProfile({
@@ -159,14 +156,23 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       state.step = 2;
       await setPendingTransactionState(normalizedFrom, state);
 
-      // Send WhatsApp template (if available) AND TwiML fallback
+      // Send WhatsApp template with quick replies
+      const quickReplies = ['yes', 'edit', 'cancel'];
       try {
         await sendTemplateMessage(
           normalizedFrom,
-          'HX0280df498999848aaff04cc079e16c31', // location confirmation template
-          { '1': state.detectedLocation.province, '2': state.detectedLocation.country }
+          'HX0280df498999848aaff04cc079e16c31',
+          { '1': state.responses.name, '2': state.detectedLocation.province, '3': state.detectedLocation.country },
+          quickReplies
         );
-      } catch (_) {}
+      } catch (error) {
+        console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
+        await sendQuickReply(
+          normalizedFrom,
+          `Hi ${state.responses.name}! I detected you’re in ${state.detectedLocation.province}, ${state.detectedLocation.country}. Is that correct?`,
+          quickReplies
+        );
+      }
       reply(
         res,
         `Hi ${state.responses.name}! I detected you’re in ${state.detectedLocation.province}, ${state.detectedLocation.country}. Is that correct? Reply 'yes', 'edit', or 'cancel'.`
@@ -181,10 +187,22 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         state.step = 3;
         await setPendingTransactionState(normalizedFrom, state);
 
-        // Template for confirming business same-as-personal + fallback
+        // Template for confirming business same-as-personal
         try {
-          await sendTemplateMessage(normalizedFrom, 'HXa885f78d7654642672bfccfae98d57cb', {});
-        } catch (_) {}
+          await sendTemplateMessage(
+            normalizedFrom,
+            'HXa885f78d7654642672bfccfae98d57cb',
+            {},
+            ['yes', 'no', 'cancel']
+          );
+        } catch (error) {
+          console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
+          await sendQuickReply(
+            normalizedFrom,
+            `Is your business registered in the same place?`,
+            ['yes', 'no', 'cancel']
+          );
+        }
         reply(res, `Is your business registered in the same place? Reply 'yes', 'no', or 'cancel'.`);
         return;
       }
@@ -257,9 +275,22 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       state.step = 3;
       await setPendingTransactionState(normalizedFrom, state);
 
+      // Template for confirming business same-as-personal
       try {
-        await sendTemplateMessage(normalizedFrom, 'HXa885f78d7654642672bfccfae98d57cb', {});
-      } catch (_) {}
+        await sendTemplateMessage(
+          normalizedFrom,
+          'HXa885f78d7654642672bfccfae98d57cb',
+          {},
+          ['yes', 'no', 'cancel']
+        );
+      } catch (error) {
+        console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
+        await sendQuickReply(
+          normalizedFrom,
+          `Is your business registered in the same place?`,
+          ['yes', 'no', 'cancel']
+        );
+      }
       reply(res, `Is your business registered in the same place? Reply 'yes', 'no', or 'cancel'.`);
       return;
     }

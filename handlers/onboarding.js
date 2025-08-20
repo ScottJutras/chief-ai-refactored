@@ -15,6 +15,28 @@ const { sendTemplateMessage, sendMessage } = require('../services/twilio');
 const { getValidationLists, detectLocation } = require('../utils/validateLocation');
 const { handleInputWithAI, handleError } = require('../utils/aiErrorHandler');
 
+// --- DB-backed state bridge ---
+async function loadState(normalizedFrom, profile) {
+  // Prefer in-memory (if your stateManager was replaced later), otherwise DB
+  let state = await getPendingTransactionState(normalizedFrom).catch(() => null);
+  if (!state && profile && profile.onboarding_state) {
+    state = profile.onboarding_state;
+  }
+  return state || null;
+}
+
+async function persistState(normalizedFrom, profile, state) {
+  // Keep both: in-memory (no-op on serverless) + DB
+  await setPendingTransactionState(normalizedFrom, state).catch(() => {});
+  await saveUserProfile({ ...(profile || {}), user_id: normalizedFrom, onboarding_state: state });
+}
+
+async function clearState(normalizedFrom, profile) {
+  await deletePendingTransactionState(normalizedFrom).catch(() => {});
+  await saveUserProfile({ ...(profile || {}), user_id: normalizedFrom, onboarding_state: null });
+}
+
+
 // --- utils ---
 function normalizePhoneNumber(from = '') {
   const val = String(from || '');

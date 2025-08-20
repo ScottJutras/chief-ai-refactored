@@ -14,6 +14,18 @@ const {
 const { sendTemplateMessage, sendQuickReply, sendMessage } = require('../services/twilio');
 const { getValidationLists, detectLocation } = require('../utils/validateLocation');
 const { handleInputWithAI, handleError } = require('../utils/aiErrorHandler');
+const { ack } = require('../utils/http');
+const { pool } = require('../services/postgres');
+
+// Check subscription status
+async function checkSubscription(normalizedFrom) {
+  const res = await pool.query(
+    `SELECT subscription_status FROM users WHERE user_id = $1`,
+    [normalizedFrom]
+  );
+  const user = res.rows[0];
+  return user && user.subscription_status === 'active';
+}
 
 // --- DB-backed state bridge ---
 async function loadState(normalizedFrom, profile) {
@@ -83,6 +95,12 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
   const normalizedFrom = normalizePhoneNumber(from);
 
   try {
+    // Check subscription status
+    if (!(await checkSubscription(normalizedFrom))) {
+      await sendMessage(normalizedFrom, 'Please activate your subscription to start onboarding. Visit https://chief-ai-refactored.vercel.app/subscribe.');
+      return ack(res);
+    }
+
     // Always fetch fresh DB profile
     let dbProfile = null;
     try {
@@ -115,8 +133,8 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       await setPendingTransactionState(normalizedFrom, state);
 
       // First prompt
-      reply(res, 'Welcome to Chief AI! Please reply with your full name.');
-      return;
+      await sendMessage(normalizedFrom, 'Welcome to Chief AI! Please reply with your full name.');
+      return ack(res);
     }
 
     // Bootstrap state if needed
@@ -139,8 +157,8 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         invalidAttempts: {},
       };
       await setPendingTransactionState(normalizedFrom, state);
-      reply(res, 'Welcome to Chief AI! Please reply with your full name.');
-      return;
+      await sendMessage(normalizedFrom, 'Welcome to Chief AI! Please reply with your full name.');
+      return ack(res);
     }
 
     // --- STEP MACHINE ---
@@ -148,36 +166,31 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
     if (state.step === 1) {
       const name = msgRaw.trim();
       if (!name || name.length < 2) {
-        reply(res, 'Please provide your full name to continue.');
-        return;
+        await sendMessage(normalizedFrom, 'Please provide your full name to continue.');
+        return ack(res);
       }
 
       state.responses.name = cap(name);
       state.step = 2;
       await setPendingTransactionState(normalizedFrom, state);
 
-      // Send WhatsApp template with quick replies
-      const quickReplies = ['yes', 'edit', 'cancel'];
+      // Send WhatsApp template with quick replies defined in Twilio Console
       try {
         await sendTemplateMessage(
           normalizedFrom,
           'HX0280df498999848aaff04cc079e16c31',
-          { '1': state.responses.name, '2': state.detectedLocation.province, '3': state.detectedLocation.country },
-          quickReplies
+          { '1': state.responses.name, '2': state.detectedLocation.province, '3': state.detectedLocation.country }
         );
+        return ack(res);
       } catch (error) {
         console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
         await sendQuickReply(
           normalizedFrom,
           `Hi ${state.responses.name}! I detected you’re in ${state.detectedLocation.province}, ${state.detectedLocation.country}. Is that correct?`,
-          quickReplies
+          ['yes', 'edit', 'cancel']
         );
+        return ack(res);
       }
-      reply(
-        res,
-        `Hi ${state.responses.name}! I detected you’re in ${state.detectedLocation.province}, ${state.detectedLocation.country}. Is that correct? Reply 'yes', 'edit', or 'cancel'.`
-      );
-      return;
     }
 
     // Step 2: confirm detected personal location
@@ -187,14 +200,13 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         state.step = 3;
         await setPendingTransactionState(normalizedFrom, state);
 
-        // Template for confirming business same-as-personal
         try {
           await sendTemplateMessage(
             normalizedFrom,
             'HXa885f78d7654642672bfccfae98d57cb',
-            {},
-            ['yes', 'no', 'cancel']
+            {}
           );
+          return ack(res);
         } catch (error) {
           console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
           await sendQuickReply(
@@ -202,24 +214,23 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
             `Is your business registered in the same place?`,
             ['yes', 'no', 'cancel']
           );
+          return ack(res);
         }
-        reply(res, `Is your business registered in the same place? Reply 'yes', 'no', or 'cancel'.`);
-        return;
       }
       if (msg === 'edit') {
         state.step = 2.5;
         await setPendingTransactionState(normalizedFrom, state);
-        reply(res, `Please provide your State/Province, Country (e.g., 'Ontario, Canada').`);
-        return;
+        await sendMessage(normalizedFrom, `Please provide your State/Province, Country (e.g., 'Ontario, Canada').`);
+        return ack(res);
       }
       if (msg === 'cancel') {
         await deletePendingTransactionState(normalizedFrom);
         await saveUserProfile({ ...profile, onboarding_in_progress: false });
-        reply(res, `Onboarding cancelled. Reply 'start onboarding' to begin again.`);
-        return;
+        await sendMessage(normalizedFrom, `Onboarding cancelled. Reply 'start onboarding' to begin again.`);
+        return ack(res);
       }
-      reply(res, `Please reply with 'yes', 'edit', or 'cancel' to confirm your location.`);
-      return;
+      await sendMessage(normalizedFrom, `Please reply with 'yes', 'edit', or 'cancel' to confirm your location.`);
+      return ack(res);
     }
 
     // Step 2.5: manual personal location
@@ -258,16 +269,15 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         if (state.invalidAttempts.location > 3) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
-          reply(res, `Too many invalid location attempts. Onboarding cancelled.`);
-          return;
+          await sendMessage(normalizedFrom, `Too many invalid location attempts. Onboarding cancelled.`);
+          return ack(res);
         }
         await setPendingTransactionState(normalizedFrom, state);
-        reply(
-          res,
-          aiReply ||
-            `Invalid location. Please use 'State/Province, Country' format (e.g., 'Ontario, Canada').`
+        await sendMessage(
+          normalizedFrom,
+          aiReply || `Invalid location. Please use 'State/Province, Country' format (e.g., 'Ontario, Canada').`
         );
-        return;
+        return ack(res);
       }
 
       state.responses.location = data;
@@ -275,14 +285,13 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       state.step = 3;
       await setPendingTransactionState(normalizedFrom, state);
 
-      // Template for confirming business same-as-personal
       try {
         await sendTemplateMessage(
           normalizedFrom,
           'HXa885f78d7654642672bfccfae98d57cb',
-          {},
-          ['yes', 'no', 'cancel']
+          {}
         );
+        return ack(res);
       } catch (error) {
         console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
         await sendQuickReply(
@@ -290,9 +299,8 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
           `Is your business registered in the same place?`,
           ['yes', 'no', 'cancel']
         );
+        return ack(res);
       }
-      reply(res, `Is your business registered in the same place? Reply 'yes', 'no', or 'cancel'.`);
-      return;
     }
 
     // Step 3: confirm business location
@@ -301,26 +309,23 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         state.responses.business_location = state.responses.location;
         state.step = 4;
         await setPendingTransactionState(normalizedFrom, state);
-        reply(res, `Please share your email address for your financial dashboard.`);
-        return;
+        await sendMessage(normalizedFrom, `Please share your email address for your financial dashboard.`);
+        return ack(res);
       }
       if (msg === 'no') {
         state.step = 3.5;
         await setPendingTransactionState(normalizedFrom, state);
-        reply(
-          res,
-          `Please provide your business's registered State/Province, Country (e.g., 'Ontario, Canada').`
-        );
-        return;
+        await sendMessage(normalizedFrom, `Please provide your business's registered State/Province, Country (e.g., 'Ontario, Canada').`);
+        return ack(res);
       }
       if (msg === 'cancel') {
         await deletePendingTransactionState(normalizedFrom);
         await saveUserProfile({ ...profile, onboarding_in_progress: false });
-        reply(res, `Onboarding cancelled. Reply 'start onboarding' to begin again.`);
-        return;
+        await sendMessage(normalizedFrom, `Onboarding cancelled. Reply 'start onboarding' to begin again.`);
+        return ack(res);
       }
-      reply(res, `Please reply with 'yes', 'no', or 'cancel' to confirm your business location.`);
-      return;
+      await sendMessage(normalizedFrom, `Please reply with 'yes', 'no', or 'cancel' to confirm your business location.`);
+      return ack(res);
     }
 
     // Step 3.5: manual business location
@@ -359,24 +364,23 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         if (state.invalidAttempts.business_location > 3) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
-          reply(res, `Too many invalid location attempts. Onboarding cancelled.`);
-          return;
+          await sendMessage(normalizedFrom, `Too many invalid location attempts. Onboarding cancelled.`);
+          return ack(res);
         }
         await setPendingTransactionState(normalizedFrom, state);
-        reply(
-          res,
-          aiReply ||
-            `Invalid business location. Please use 'State/Province, Country' format (e.g., 'Ontario, Canada').`
+        await sendMessage(
+          normalizedFrom,
+          aiReply || `Invalid business location. Please use 'State/Province, Country' format (e.g., 'Ontario, Canada').`
         );
-        return;
+        return ack(res);
       }
 
       state.responses.business_location = data;
       state.invalidAttempts.business_location = 0;
       state.step = 4;
       await setPendingTransactionState(normalizedFrom, state);
-      reply(res, `Please share your email address for your financial dashboard.`);
-      return;
+      await sendMessage(normalizedFrom, `Please share your email address for your financial dashboard.`);
+      return ack(res);
     }
 
     // Step 4: email
@@ -387,12 +391,12 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         if (state.invalidAttempts.email > 3) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
-          reply(res, `Too many invalid attempts. Onboarding cancelled.`);
-          return;
+          await sendMessage(normalizedFrom, `Too many invalid attempts. Onboarding cancelled.`);
+          return ack(res);
         }
         await setPendingTransactionState(normalizedFrom, state);
-        reply(res, `Please provide a valid email address for your financial dashboard.`);
-        return;
+        await sendMessage(normalizedFrom, `Please provide a valid email address for your financial dashboard.`);
+        return ack(res);
       }
 
       // Persist captured fields
@@ -443,8 +447,8 @@ Let’s build something great.
 
       state.step = 5;
       await setPendingTransactionState(normalizedFrom, state);
-      reply(res, `Please provide your industry (e.g., Construction, Freelancer).`);
-      return;
+      await sendMessage(normalizedFrom, `Please provide your industry (e.g., Construction, Freelancer).`);
+      return ack(res);
     }
 
     // Step 5: industry
@@ -455,12 +459,12 @@ Let’s build something great.
         if (state.invalidAttempts.industry > 3) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
-          reply(res, `Too many invalid attempts. Onboarding cancelled.`);
-          return;
+          await sendMessage(normalizedFrom, `Too many invalid attempts. Onboarding cancelled.`);
+          return ack(res);
         }
         await setPendingTransactionState(normalizedFrom, state);
-        reply(res, `Please provide your industry (e.g., Construction, Freelancer).`);
-        return;
+        await sendMessage(normalizedFrom, `Please provide your industry (e.g., Construction, Freelancer).`);
+        return ack(res);
       }
 
       profile = { ...(profile || {}), user_id: normalizedFrom, industry: cap(industry) };
@@ -469,13 +473,14 @@ Let’s build something great.
       await saveUserProfile(profile);
       await setPendingTransactionState(normalizedFrom, state);
 
-      // Optional template nudge (no-op if template unavailable)
       try {
         await sendTemplateMessage(normalizedFrom, 'HX20b1be5490ea39f3730fb9e70d5275df', {});
-      } catch (_) {}
-
-      reply(res, `Great — set industry to ${cap(industry)}. What’s your first money goal? Try "Grow profit by $10,000" or "Pay off $5,000 debt".`);
-      return;
+        return ack(res);
+      } catch (error) {
+        console.error('[ERROR] Template message failed:', error.message, error.code, error.moreInfo);
+        await sendMessage(normalizedFrom, `Great — set industry to ${cap(industry)}. What’s your first money goal? Try "Grow profit by $10,000" or "Pay off $5,000 debt".`);
+        return ack(res);
+      }
     }
 
     // Step 6: goal
@@ -485,7 +490,7 @@ Let’s build something great.
         const m = input.match(/(grow profit by|pay off)\s+\$?(\d+(?:\.\d{1,2})?)/i);
         if (!m) return null;
         const goalType = m[1].toLowerCase();
-        const amount = parseFloat(m[2]) * 1000; // keep your previous semantics
+        const amount = parseFloat(m[2]) * 1000;
         return { goal: `${goalType} $${amount}`, amount };
       };
 
@@ -502,12 +507,12 @@ Let’s build something great.
         if (state.invalidAttempts.goal > 3) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
-          reply(res, `Too many invalid attempts. Onboarding cancelled.`);
-          return;
+          await sendMessage(normalizedFrom, `Too many invalid attempts. Onboarding cancelled.`);
+          return ack(res);
         }
         await setPendingTransactionState(normalizedFrom, state);
-        reply(res, aiReply || `Invalid goal. Try "Grow profit by $10000" or "Pay off $5000 debt".`);
-        return;
+        await sendMessage(normalizedFrom, aiReply || `Invalid goal. Try "Grow profit by $10000" or "Pay off $5000 debt".`);
+        return ack(res);
       }
 
       // Save goal + complete onboarding
@@ -527,23 +532,21 @@ Let’s build something great.
       await deletePendingTransactionState(normalizedFrom);
 
       const currency = nextProfile.country === 'United States' ? 'USD' : 'CAD';
-      reply(
-        res,
-        `✅ Goal set: "${data.goal}" (${currency} ${nextProfile.goal_progress.target.toFixed(
-          2
-        )}). You're ready to go! Try: "expense $100 tools" or "create job Roof Repair".`
+      await sendMessage(
+        normalizedFrom,
+        `✅ Goal set: "${data.goal}" (${currency} ${nextProfile.goal_progress.target.toFixed(2)}). You're ready to go! Try: "expense $100 tools" or "create job Roof Repair".`
       );
-      return;
+      return ack(res);
     }
 
     // Fallback if state is unexpected
-    reply(res, `Unknown onboarding state. Reply 'start onboarding' to begin again.`);
+    await sendMessage(normalizedFrom, `Unknown onboarding state. Reply 'start onboarding' to begin again.`);
+    return ack(res);
   } catch (error) {
-    console.error('[ERROR] handleOnboarding failed for', normalizedFrom, ':', error.message);
+    console.error('[ERROR] handleOnboarding failed for', normalizedFrom, ':', error.message, error.code, error.moreInfo);
     const errorReply = await handleError(normalizedFrom, error, 'handleOnboarding', input);
-    if (!res.headersSent) {
-      res.status(200).send(errorReply);
-    }
+    await sendMessage(normalizedFrom, errorReply || 'An error occurred. Please try again.');
+    return ack(res);
   }
 }
 

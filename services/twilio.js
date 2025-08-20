@@ -7,7 +7,6 @@ const { RateLimiter } = require('express-rate-limit');
 const requiredEnvVars = [
   'TWILIO_ACCOUNT_SID',
   'TWILIO_AUTH_TOKEN',
-  'TWILIO_WHATSAPP_NUMBER',
   'TWILIO_MESSAGING_SERVICE_SID',
 ];
 for (const envVar of requiredEnvVars) {
@@ -34,9 +33,8 @@ async function sendMessage(to, body) {
     await messageLimiter({ body: { From: to } });
     const message = await client.messages.create({
       body,
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
+      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
       to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
-      messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID
     });
     console.log(`[✅ SUCCESS] Message sent: ${message.sid}`);
     return message.sid;
@@ -51,10 +49,9 @@ async function sendQuickReply(to, body, replies = []) {
     await messageLimiter({ body: { From: to } });
     const message = await client.messages.create({
       body,
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
-      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
-      persistentAction: replies.map(reply => `reply?text=${encodeURIComponent(reply)}`)
+      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+      persistentAction: replies.slice(0, 3).map(reply => `reply?text=${encodeURIComponent(reply)}`),
     });
     console.log(`[✅ SUCCESS] Quick reply sent: ${message.sid}`);
     return message.sid;
@@ -64,7 +61,7 @@ async function sendQuickReply(to, body, replies = []) {
   }
 }
 
-async function sendTemplateMessage(to, contentSid, contentVariables = {}, quickReplies = []) {
+async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
   try {
     await messageLimiter({ body: { From: to } });
     if (!contentSid) {
@@ -79,18 +76,13 @@ async function sendTemplateMessage(to, contentSid, contentVariables = {}, quickR
           }, {})
         : contentVariables
     );
-    const messageOptions = {
+    const message = await client.messages.create({
       contentSid,
       contentVariables: formattedVariables,
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
-      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
       messagingServiceSid: process.env.TWILIO_MESSAGING_SERVICE_SID,
-    };
-    if (quickReplies.length > 0) {
-      messageOptions.persistentAction = quickReplies.map(reply => `reply?text=${encodeURIComponent(reply)}`);
-    }
-    const message = await client.messages.create(messageOptions);
-    console.log(`[✅ SUCCESS] Template message sent: ${message.sid} with quick replies: ${quickReplies.join(', ')}`);
+      to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+    });
+    console.log(`[✅ SUCCESS] Template message sent: ${message.sid}`);
     return message.sid;
   } catch (error) {
     console.error('[ERROR] Failed to send template message:', error.message, error.code, error.moreInfo);

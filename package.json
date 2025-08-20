@@ -1,3 +1,6 @@
+Looks like you removed "csv-parser": "^3.0.0", was that on purpose?
+
+C:\Users\scott\Documents\Sherpa AI\Chief\package.json
 {
   "name": "chief-ai",
   "version": "1.0.0",
@@ -26,6 +29,7 @@
     "glob": "^10.4.1",
     "googleapis": "^150.0.1",
     "libphonenumber-js": "^1.12.6",
+    "multer": "^1.4.5-lts.1",
     "openai": "^4.61.1",
     "papaparse": "^5.5.2",
     "pdfkit": "^0.16.0",
@@ -36,7 +40,6 @@
     "winston": "^3.17.0"
   },
   "devDependencies": {
-    "jest": "^30.0.4",
-    "csv-parser": "^3.0.0"
+    "jest": "^30.0.4"
   }
 }

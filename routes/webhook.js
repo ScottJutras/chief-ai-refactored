@@ -3,7 +3,21 @@ const express = require('express');
 const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-const { handleCommands } = require('../handlers/commands');
+// --- Robust import for command handler (supports CJS default, named, or ESM default) ---
+const commandsMod = require('../handlers/commands');
+const handleCommands =
+  (typeof commandsMod === 'function' && commandsMod) ||
+  (commandsMod && commandsMod.handleCommands) ||
+  (commandsMod && commandsMod.default);
+
+if (typeof handleCommands !== 'function') {
+  console.error(
+    '[BOOT] handlers/commands did not export a callable handleCommands. Export keys:',
+    commandsMod && Object.keys(commandsMod)
+  );
+  throw new TypeError('handleCommands is not a function');
+}
+
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');

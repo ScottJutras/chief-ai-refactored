@@ -28,19 +28,31 @@ function tsPlus(ms) {
  * - If no row, insert (lock taken)
  * - If expired, take over
  * - If same token, refresh
+ *
+ * IMPORTANT: If userId is missing (common in legacy handlers),
+ * we NO-OP to avoid writing a NULL into locks.user_id.
+ * Router-level lockMiddleware passes a proper userId, so DB locking still applies there.
  */
 async function acquireLock(lockKey, userId, token, ttlMs = LOCK_TTL_MS) {
+  if (!lockKey) return true;
+
+  if (!userId) {
+    // Handler-level call without userId — treat as a no-op so we don't violate NOT NULL.
+    console.log('[LOCK] acquireLock called without userId; no-op for', lockKey);
+    return true;
+  }
+
   console.log('[LOCK] Attempting to acquire lock for', lockKey);
   const q = `
-    insert into public.locks (lock_key, user_id, token, expires_at, created_at, updated_at)
-    values ($1, $2, $3, $4, now(), now())
-    on conflict (lock_key) do update
-      set token = excluded.token,
-          user_id = excluded.user_id,
-          expires_at = excluded.expires_at,
-          updated_at = now()
-    where public.locks.expires_at < now() or public.locks.token = excluded.token
-    returning token
+    INSERT INTO public.locks (lock_key, user_id, token, expires_at, created_at, updated_at)
+    VALUES ($1, $2, $3, $4, NOW(), NOW())
+    ON CONFLICT (lock_key) DO UPDATE
+      SET token = EXCLUDED.token,
+          user_id = EXCLUDED.user_id,
+          expires_at = EXCLUDED.expires_at,
+          updated_at = NOW()
+    WHERE public.locks.expires_at < NOW() OR public.locks.token = EXCLUDED.token
+    RETURNING token
   `;
   const params = [lockKey, userId, token, tsPlus(ttlMs)];
   const res = await pool.query(q, params);
@@ -52,14 +64,15 @@ async function acquireLock(lockKey, userId, token, ttlMs = LOCK_TTL_MS) {
 
 /** Release lock; if token provided, require ownership */
 async function releaseLock(lockKey, token) {
-  if (!lockKey) return;
+  if (!lockKey) return true;
   const q = token
-    ? `delete from public.locks where lock_key = $1 and token = $2`
-    : `delete from public.locks where lock_key = $1`;
+    ? `DELETE FROM public.locks WHERE lock_key = $1 AND token = $2`
+    : `DELETE FROM public.locks WHERE lock_key = $1`;
   const params = token ? [lockKey, token] : [lockKey];
   try {
     await pool.query(q, params);
     console.log('[LOCK] Released lock for', lockKey);
+    return true;
   } catch (err) {
     console.error('[ERROR] releaseLock failed for', lockKey, ':', err.message);
     throw err;
@@ -77,6 +90,7 @@ async function lockMiddleware(req, res, next) {
         .status(200)
         .send(`<Response><Message>⚠️ Invalid request. Please try again.</Message></Response>`);
     }
+
     const lockKey = `lock:${userId}`;
 
     // Use Twilio idempotency token; fallback to random
@@ -102,4 +116,4 @@ async function lockMiddleware(req, res, next) {
   }
 }
 
-module.exports = { acquireLock, releaseLock, lockMiddleware };
+module.exports = { acquireLock, releaseLock, lockMiddleware, normalizeFrom };

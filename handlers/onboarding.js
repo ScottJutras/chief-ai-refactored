@@ -32,7 +32,9 @@ function cap(s = '') {
     .join(' ');
 }
 
-// Treat the profile as "incomplete" if any of these are empty
+// Constants
+const INVALID_MAX = 3;
+
 const REQUIRED_PROFILE_FIELDS = ['user_id'];
 
 function isBlank(v) {
@@ -153,17 +155,13 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
 
     // Step 2: confirm detected personal location
     if (state.step === 2) {
-      if (msg === 'yes') {
+      if (/^(y|ya|yep|yeah|yes)$/i.test(msg)) {
         state.responses.location = state.detectedLocation;
         state.step = 3;
         await setPendingTransactionState(normalizedFrom, state);
 
         try {
-          await sendTemplateMessage(
-            normalizedFrom,
-            'HXa885f78d7654642672bfccfae98d57cb',
-            {}
-          );
+          await sendTemplateMessage(normalizedFrom, 'HXa885f78d7654642672bfccfae98d57cb', {});
           return ack(res);
         } catch (error) {
           console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
@@ -175,13 +173,13 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
           return ack(res);
         }
       }
-      if (msg === 'edit') {
+      if (/^edit$/i.test(msg)) {
         state.step = 2.5;
         await setPendingTransactionState(normalizedFrom, state);
         await sendMessage(normalizedFrom, `Please provide your State/Province, Country (e.g., 'Ontario, Canada').`);
         return ack(res);
       }
-      if (msg === 'cancel') {
+      if (/^cancel$/i.test(msg)) {
         await deletePendingTransactionState(normalizedFrom);
         await saveUserProfile({ ...profile, onboarding_in_progress: false });
         await sendMessage(normalizedFrom, `Onboarding cancelled. Reply 'start onboarding' to begin again.`);
@@ -224,7 +222,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
 
       if (!confirmed) {
         state.invalidAttempts.location = (state.invalidAttempts.location || 0) + 1;
-        if (state.invalidAttempts.location > 3) {
+        if (state.invalidAttempts.location >= INVALID_MAX) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
           await sendMessage(normalizedFrom, `Too many invalid location attempts. Onboarding cancelled.`);
@@ -244,11 +242,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       await setPendingTransactionState(normalizedFrom, state);
 
       try {
-        await sendTemplateMessage(
-          normalizedFrom,
-          'HXa885f78d7654642672bfccfae98d57cb',
-          {}
-        );
+        await sendTemplateMessage(normalizedFrom, 'HXa885f78d7654642672bfccfae98d57cb', {});
         return ack(res);
       } catch (error) {
         console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
@@ -263,20 +257,20 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
 
     // Step 3: confirm business location
     if (state.step === 3) {
-      if (msg === 'yes') {
+      if (/^(y|ya|yep|yeah|yes)$/i.test(msg)) {
         state.responses.business_location = state.responses.location;
         state.step = 4;
         await setPendingTransactionState(normalizedFrom, state);
         await sendMessage(normalizedFrom, `Please share your email address for your financial dashboard.`);
         return ack(res);
       }
-      if (msg === 'no') {
+      if (/^(n|no|nope)$/i.test(msg)) {
         state.step = 3.5;
         await setPendingTransactionState(normalizedFrom, state);
         await sendMessage(normalizedFrom, `Please provide your business's registered State/Province, Country (e.g., 'Ontario, Canada').`);
         return ack(res);
       }
-      if (msg === 'cancel') {
+      if (/^cancel$/i.test(msg)) {
         await deletePendingTransactionState(normalizedFrom);
         await saveUserProfile({ ...profile, onboarding_in_progress: false });
         await sendMessage(normalizedFrom, `Onboarding cancelled. Reply 'start onboarding' to begin again.`);
@@ -319,7 +313,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
 
       if (!confirmed) {
         state.invalidAttempts.business_location = (state.invalidAttempts.business_location || 0) + 1;
-        if (state.invalidAttempts.business_location > 3) {
+        if (state.invalidAttempts.business_location >= INVALID_MAX) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
           await sendMessage(normalizedFrom, `Too many invalid location attempts. Onboarding cancelled.`);
@@ -341,12 +335,12 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       return ack(res);
     }
 
-    // Step 4: email + start 7-day Pro trial (best-effort)
+    // Step 4: email + start 7-day Pro trial (best-effort) + OTP + dashboard link
     if (state.step === 4) {
-      const email = msgRaw.trim();
+      const email = msgRaw.trim().toLowerCase(); // normalize to avoid dup customers
       if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         state.invalidAttempts.email = (state.invalidAttempts.email || 0) + 1;
-        if (state.invalidAttempts.email > 3) {
+        if (state.invalidAttempts.email >= INVALID_MAX) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
           await sendMessage(normalizedFrom, `Too many invalid attempts. Onboarding cancelled.`);
@@ -367,28 +361,34 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         try {
           // Create customer if missing
           if (!stripe_customer_id) {
-            const customer = await stripe.customers.create({
-              email,
-              phone: `+${normalizedFrom}`,
-              metadata: { user_id: normalizedFrom },
-            });
+            const customer = await stripe.customers.create(
+              {
+                email,
+                phone: `+${normalizedFrom}`,
+                metadata: { user_id: normalizedFrom },
+              },
+              { idempotencyKey: `cust_${normalizedFrom}` }
+            );
             stripe_customer_id = customer.id;
           }
 
           // Create trialing subscription if missing
           if (!stripe_subscription_id) {
-            const sub = await stripe.subscriptions.create({
-              customer: stripe_customer_id,
-              items: [{ price: PRO_PRICE_ID }],
-              trial_period_days: 7,
-              payment_behavior: 'default_incomplete',
-              trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
-              metadata: { user_id: normalizedFrom, plan: 'pro_trial' },
-            });
+            const sub = await stripe.subscriptions.create(
+              {
+                customer: stripe_customer_id,
+                items: [{ price: PRO_PRICE_ID }],
+                trial_period_days: 7,
+                payment_behavior: 'default_incomplete',
+                trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
+                metadata: { user_id: normalizedFrom, plan: 'pro_trial' },
+              },
+              { idempotencyKey: `sub_${normalizedFrom}` }
+            );
             stripe_subscription_id = sub.id;
-            // Stripe returns seconds; convert to Date
-            if (sub.trial_start) trial_start = new Date(sub.trial_start * 1000);
-            if (sub.trial_end) trial_end = new Date(sub.trial_end * 1000);
+            // convert to ISO strings for DB safety
+            if (sub.trial_start) trial_start = new Date(sub.trial_start * 1000).toISOString();
+            if (sub.trial_end) trial_end = new Date(sub.trial_end * 1000).toISOString();
           }
         } catch (e) {
           console.warn('[TRIAL] Stripe trial setup failed (continuing onboarding):', e.message);
@@ -420,11 +420,15 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         onboarding_completed: false,
       };
       await saveUserProfile(userProfileData);
-      profile = await getUserProfile(normalizedFrom);
 
-      // OTP + dashboard link
-      await generateOTP(normalizedFrom);
-      const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${normalizedFrom}?token=${profile.dashboard_token}`;
+      // OTP + dashboard link (fix race: get token from generator or fresh profile)
+      const otpToken = await generateOTP(normalizedFrom);
+      const fresh = await getUserProfile(normalizedFrom);
+      profile = fresh || userProfileData;
+      const token = otpToken || fresh?.dashboard_token || null;
+      const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${normalizedFrom}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+
+      // Send link first (then the long message)
       await sendMessage(normalizedFrom, `Your financial dashboard is ready: ${dashboardUrl}`);
 
       const name = profile.name ? cap(profile.name) : 'there';
@@ -447,7 +451,6 @@ Start simple. Try:
 ✅ Finish job: Finished Jack's renovation
 💵 Revenue: Got a $7,500 payment from J
 📊 Metrics: How long did Jack's job take and how much did I make?
-Your dashboard: ${dashboardUrl}
 You'll receive a one-time code via WhatsApp to access it.
 Let’s build something great.
 — Chief 💼`;
@@ -455,7 +458,11 @@ Let’s build something great.
 
       state.step = 5;
       await setPendingTransactionState(normalizedFrom, state);
-      await sendMessage(normalizedFrom, `Please provide your industry (e.g., Construction, Freelancer).`);
+      await sendQuickReply(
+        normalizedFrom,
+        `What industry is your business in? (e.g., Construction, Freelancer)`,
+        ['Construction', 'Freelancer', 'Other']
+      );
       return ack(res);
     }
 
@@ -464,14 +471,18 @@ Let’s build something great.
       const industry = msgRaw.trim();
       if (!industry || industry.length < 3) {
         state.invalidAttempts.industry = (state.invalidAttempts.industry || 0) + 1;
-        if (state.invalidAttempts.industry > 3) {
+        if (state.invalidAttempts.industry >= INVALID_MAX) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
           await sendMessage(normalizedFrom, `Too many invalid attempts. Onboarding cancelled.`);
           return ack(res);
         }
         await setPendingTransactionState(normalizedFrom, state);
-        await sendMessage(normalizedFrom, `Please provide your industry (e.g., Construction, Freelancer).`);
+        await sendQuickReply(
+          normalizedFrom,
+          `Please provide your industry (e.g., Construction, Freelancer).`,
+          ['Construction', 'Freelancer', 'Other']
+        );
         return ack(res);
       }
 
@@ -488,8 +499,8 @@ Let’s build something great.
         console.error('[ERROR] Template message failed:', error.message, error.code, error.moreInfo);
         await sendQuickReply(
           normalizedFrom,
-          `Great — set industry to ${cap(industry)}. What’s your first money goal? Try "Grow profit by $10,000" or "Pay off $5,000 debt".`,
-          ['Grow profit by $10000', 'Pay off $5000 debt']
+          `Great — set industry to ${cap(industry)}. What’s your financial goal for your business? For example, you might want to save for a big purchase, pay off debt, or grow your profits.`,
+          ['Save for a purchase', 'Pay off debt', 'Grow profits']
         );
         return ack(res);
       }
@@ -497,13 +508,15 @@ Let’s build something great.
 
     // Step 6: goal
     if (state.step === 6) {
-      const defaultData = { goal: '', amount: 0 };
+      const defaultData = { goal: msgRaw, amount: null, timeframe: null };
       const parseFn = input => {
-        const m = input.match(/(grow profit by|pay off)\s+\$?([\d,]+(?:\.\d{1,2})?)/i);
-        if (!m) return null;
-        const goalType = m[1].toLowerCase();
-        const amount = parseFloat(m[2].replace(/,/g, '')); // no *1000
-        return { goal: `${goalType} $${amount}`, amount };
+        const amountMatch = input.match(/\$?([\d,]+(?:\.\d{1,2})?)/i);
+        const timeframeMatch = input.match(/(in|within|by)\s+(\d+\s*(month|year|week)s?)/i);
+        return {
+          goal: input.trim(),
+          amount: amountMatch ? parseFloat(amountMatch[1].replace(/,/g, '')) : null,
+          timeframe: timeframeMatch ? timeframeMatch[2] : null,
+        };
       };
 
       const { data, reply: aiReply, confirmed } = await handleInputWithAI(
@@ -516,7 +529,7 @@ Let’s build something great.
 
       if (!confirmed) {
         state.invalidAttempts.goal = (state.invalidAttempts.goal || 0) + 1;
-        if (state.invalidAttempts.goal > 3) {
+        if (state.invalidAttempts.goal >= INVALID_MAX) {
           await deletePendingTransactionState(normalizedFrom);
           await saveUserProfile({ ...profile, onboarding_in_progress: false });
           await sendMessage(normalizedFrom, `Too many invalid attempts. Onboarding cancelled.`);
@@ -525,21 +538,27 @@ Let’s build something great.
         await setPendingTransactionState(normalizedFrom, state);
         await sendQuickReply(
           normalizedFrom,
-          aiReply || `Invalid goal. Try "Grow profit by $10000" or "Pay off $5000 debt".`,
-          ['Grow profit by $10000', 'Pay off $5000 debt']
+          aiReply || `Please share your financial goal. For example, you might want to save for a big purchase, pay off debt, or grow your profits.`,
+          ['Save for a purchase', 'Pay off debt', 'Grow profits']
         );
         return ack(res);
       }
 
-      // Save goal
       const isDebt = data.goal.toLowerCase().startsWith('pay off');
       profile = {
         ...(profile || {}),
         user_id: normalizedFrom,
         goal: data.goal,
-        goal_progress: {
-          target: isDebt ? -data.amount : data.amount,
-          current: 0,
+        goal_progress: data.amount
+          ? {
+              target: isDebt ? -data.amount : data.amount,
+              current: 0,
+            }
+          : null,
+        goal_context: {
+          raw_goal: data.goal,
+          amount: data.amount,
+          timeframe: data.timeframe,
         },
         onboarding_in_progress: true,
         onboarding_completed: false,
@@ -550,7 +569,7 @@ Let’s build something great.
 
       await sendQuickReply(
         normalizedFrom,
-        `Great — goal set to "${data.goal}". To continue, please agree to our Terms and Conditions and User Agreement: https://chief-ai-refactored.vercel.app/terms-and-conditions. Reply 'agree' to proceed or 'cancel' to stop.`,
+        `That’s a fantastic goal: "${data.goal}". To continue, please agree to our Terms and Conditions and User Agreement: https://chief-ai-refactored.vercel.app/terms-and-conditions. Reply 'agree' to proceed or 'cancel' to stop.`,
         ['agree', 'cancel']
       );
       return ack(res);
@@ -558,7 +577,7 @@ Let’s build something great.
 
     // Step 7: terms and conditions
     if (state.step === 7) {
-      if (msg === 'agree') {
+      if (/^\s*(i\s+agree|agree|accept|accepted|yes|yep|yeah)\b/i.test(msg)) {
         const nextProfile = {
           ...(profile || {}),
           user_id: normalizedFrom,
@@ -579,7 +598,7 @@ Let’s build something great.
         );
         return ack(res);
       }
-      if (msg === 'cancel') {
+      if (/^cancel$/i.test(msg)) {
         await deletePendingTransactionState(normalizedFrom);
         await saveUserProfile({ ...profile, onboarding_in_progress: false });
         await sendMessage(normalizedFrom, `Onboarding cancelled. Reply 'start onboarding' to begin again.`);

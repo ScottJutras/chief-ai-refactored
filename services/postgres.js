@@ -10,7 +10,15 @@ const pool = new Pool({
   idleTimeoutMillis: 30000
 });
 
-console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
+try {
+  if (process.env.DATABASE_URL) {
+    console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
+  } else {
+    console.warn('[DEBUG] DATABASE_URL is not set');
+  }
+} catch (e) {
+  console.warn('[DEBUG] Could not parse DATABASE_URL:', e.message);
+}
 
 function normalizePhoneNumber(phone = '') {
   const val = String(phone || '');
@@ -435,8 +443,9 @@ async function saveUserProfile(profile) {
       [
         profile.name, profile.country, profile.province, profile.business_country,
         profile.business_province, profile.email, profile.industry, profile.goal,
-        profile.goalProgress, profile.onboarding_in_progress,
-        profile.onboarding_completed, profile.subscription_tier || 'basic',
+        /** FIXED: was profile.goalProgress */ profile.goal_progress,
+        profile.onboarding_in_progress, profile.onboarding_completed,
+        profile.subscription_tier || 'basic',
         profile.trial_start, profile.trial_end, profile.token_usage, normalizedId
       ]
     );
@@ -447,6 +456,7 @@ async function saveUserProfile(profile) {
     throw error;
   }
 }
+
 
 async function getUserProfile(userId) {
   const normalizedId = normalizePhoneNumber(userId);
@@ -527,46 +537,33 @@ async function parseReceiptText(text) {
   }
 }
 
-async function generateOTP(userId) {
-  const normalizedId = normalizePhoneNumber(userId);
-  console.log('[DEBUG] generateOTP called:', { userId: normalizedId });
-  try {
-    const otp = Math.floor(100000 + Math.random()*900000).toString();
-    const expiry = new Date(Date.now() + 10*60*1000);
-    await pool.query(
-      `UPDATE users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
-      [otp, expiry, normalizedId]
-    );
-    console.log('[DEBUG] generateOTP success');
-    return otp;
-  } catch (error) {
-    console.error('[ERROR] generateOTP failed:', error.message);
-    throw error;
-  }
-}
-
+// --- OTP verification (fixed) ---
 async function verifyOTP(userId, otp) {
-  const normalizedId = normalizePhoneNumber(userId);
-  console.log('[DEBUG] verifyOTP called:', { userId: normalizedId, otp });
   try {
     const res = await pool.query(
       `SELECT otp, otp_expiry FROM users WHERE user_id=$1`,
-      [normalizedId]
+      [userId]
     );
+
     const user = res.rows[0];
-    if (!user || user.otp !== otp || new Date() > new Date(user.otp_expiry)) return false;
+    const isValid =
+      !!user &&
+      user.otp === otp &&
+      new Date() <= new Date(user.otp_expiry);
+
+    if (!isValid) return false;
+
     await pool.query(
       `UPDATE users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`,
-      [normalizedId]
+      [userId]
     );
-    console.log('[DEBUG] verifyOTP success');
+
     return true;
   } catch (error) {
     console.error('[ERROR] verifyOTP failed:', error.message);
     throw error;
   }
 }
-
 async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = null) {
   console.log('[DEBUG] logTimeEntry called:', { ownerId, employeeName, type, timestamp, jobName });
   try {

@@ -289,17 +289,34 @@ async function finishJob(ownerId, jobName) {
   }
 }
 
+// create a job (inactive by default)
 async function createJob(ownerId, jobName) {
   console.log('[DEBUG] createJob called:', { ownerId, jobName });
   try {
     await pool.query(
-      `INSERT INTO jobs (owner_id, job_name, active, created_at)
-       VALUES ($1,$2,false,NOW())`,
-      [ownerId, jobName],
+      `INSERT INTO jobs (owner_id, job_name, active)
+       VALUES ($1, $2, false)`,
+      [ownerId, jobName]
     );
     console.log('[DEBUG] createJob success');
   } catch (error) {
     console.error('[ERROR] createJob failed:', error.message);
+    throw error;
+  }
+}
+
+// create & immediately mark active (optionally set start_date)
+async function saveJob(ownerId, jobName, startDate) {
+  console.log('[DEBUG] saveJob called:', { ownerId, jobName, startDate });
+  try {
+    await pool.query(
+      `INSERT INTO jobs (owner_id, job_name, start_date, active)
+       VALUES ($1, $2, $3, true)`,
+      [ownerId, jobName, startDate || new Date()]
+    );
+    console.log('[DEBUG] saveJob success');
+  } catch (error) {
+    console.error('[ERROR] saveJob failed:', error.message);
     throw error;
   }
 }

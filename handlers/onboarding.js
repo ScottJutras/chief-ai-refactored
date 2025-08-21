@@ -1,4 +1,3 @@
-// handlers/onboarding.js
 const {
   createUserProfile,
   saveUserProfile,
@@ -16,17 +15,13 @@ const { getValidationLists, detectLocation } = require('../utils/validateLocatio
 const { handleInputWithAI, handleError } = require('../utils/aiErrorHandler');
 const { ack } = require('../utils/http');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const PRO_PRICE_ID = process.env.PRO_PRICE_ID; // price_1RvLTOGgTkTcASeqgPQ1k8MG from .env
 
 // --- utils ---
 function normalizePhoneNumber(from = '') {
   const val = String(from || '');
   const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
   return noWa.replace(/^\+/, '').trim();
-}
-function reply(res, text) {
-  if (!res.headersSent) {
-    res.status(200).send(`<Response><Message>${text}</Message></Response>`);
-  }
 }
 function cap(s = '') {
   return s
@@ -48,21 +43,6 @@ function isProfileIncomplete(profile) {
   return REQUIRED_PROFILE_FIELDS.some(k => !profile[k] || isBlank(profile[k]));
 }
 
-// Subscription check using the already-fetched profile
-async function checkSubscriptionFromProfile(profile) {
-  try {
-    if (!profile) return false;
-    const subId = profile.stripe_subscription_id;
-    if (!subId) return false;
-    const sub = await stripe.subscriptions.retrieve(subId);
-    // allow active or trialing; tweak if you want to allow 'past_due'
-    return sub.status === 'active' || sub.status === 'trialing';
-  } catch (err) {
-    console.error('[ERROR] Stripe subscription check failed:', err.message);
-    return false;
-  }
-}
-
 /**
  * Multi-step onboarding:
  * 1) name
@@ -70,9 +50,10 @@ async function checkSubscriptionFromProfile(profile) {
  * 2.5) manual personal location input
  * 3) business location confirm (yes/no/cancel)
  * 3.5) manual business location input
- * 4) email -> OTP + dashboard link (and a friendly getting-started message)
+ * 4) email + start 7-day Pro trial (best-effort) + OTP + dashboard link
  * 5) industry
- * 6) goal -> complete
+ * 6) goal
+ * 7) terms and conditions -> complete
  */
 async function handleOnboarding(from, input, userProfile, ownerId, res) {
   const msgRaw = (input || '').trim();
@@ -88,18 +69,8 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
     let profile = dbProfile || userProfile || null;
     const hasDbUser = !!dbProfile;
 
-    // Subscription gate (after profile fetch so we don't need pool)
-    const wantsReset = msg === 'reset onboarding' || msg === 'start onboarding';
-    const isSubActive = await checkSubscriptionFromProfile(dbProfile);
-    if (!isSubActive && !wantsReset) {
-      await sendMessage(
-        normalizedFrom,
-        'Please activate your subscription to start onboarding. Visit https://chief-ai-refactored.vercel.app/subscribe.'
-      );
-      return ack(res);
-    }
-
     // Reset flow if requested
+    const wantsReset = msg === 'reset onboarding' || msg === 'start onboarding';
     if (wantsReset) {
       await clearUserState(normalizedFrom).catch(() => {});
       if (!hasDbUser) {
@@ -162,17 +133,18 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       await setPendingTransactionState(normalizedFrom, state);
 
       try {
+        const { province = 'your state/province', country = 'your country' } = state.detectedLocation || {};
         await sendTemplateMessage(
           normalizedFrom,
           'HX0280df498999848aaff04cc079e16c31',
-          { '1': state.responses.name, '2': state.detectedLocation.province, '3': state.detectedLocation.country }
+          { '1': state.responses.name, '2': province, '3': country }
         );
         return ack(res);
       } catch (error) {
         console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
         await sendQuickReply(
           normalizedFrom,
-          `Hi ${state.responses.name}! I detected you’re in ${state.detectedLocation.province}, ${state.detectedLocation.country}. Is that correct?`,
+          `Hi ${state.responses.name}! I detected you’re in ${state.detectedLocation?.province || 'your state/province'}, ${state.detectedLocation?.country || 'your country'}. Is that correct?`,
           ['yes', 'edit', 'cancel']
         );
         return ack(res);
@@ -369,7 +341,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       return ack(res);
     }
 
-    // Step 4: email
+    // Step 4: email + start 7-day Pro trial (best-effort)
     if (state.step === 4) {
       const email = msgRaw.trim();
       if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -385,16 +357,65 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         return ack(res);
       }
 
-      // Persist captured fields
+      // Try to create/update Stripe customer & 7-day trial (non-blocking)
+      let stripe_customer_id = profile?.stripe_customer_id || null;
+      let stripe_subscription_id = profile?.stripe_subscription_id || null;
+      let trial_start = null;
+      let trial_end = null;
+
+      if (process.env.STRIPE_SECRET_KEY && PRO_PRICE_ID) {
+        try {
+          // Create customer if missing
+          if (!stripe_customer_id) {
+            const customer = await stripe.customers.create({
+              email,
+              phone: `+${normalizedFrom}`,
+              metadata: { user_id: normalizedFrom },
+            });
+            stripe_customer_id = customer.id;
+          }
+
+          // Create trialing subscription if missing
+          if (!stripe_subscription_id) {
+            const sub = await stripe.subscriptions.create({
+              customer: stripe_customer_id,
+              items: [{ price: PRO_PRICE_ID }],
+              trial_period_days: 7,
+              payment_behavior: 'default_incomplete',
+              trial_settings: { end_behavior: { missing_payment_method: 'cancel' } },
+              metadata: { user_id: normalizedFrom, plan: 'pro_trial' },
+            });
+            stripe_subscription_id = sub.id;
+            // Stripe returns seconds; convert to Date
+            if (sub.trial_start) trial_start = new Date(sub.trial_start * 1000);
+            if (sub.trial_end) trial_end = new Date(sub.trial_end * 1000);
+          }
+        } catch (e) {
+          console.warn('[TRIAL] Stripe trial setup failed (continuing onboarding):', e.message);
+        }
+      } else {
+        console.warn('[TRIAL] Missing STRIPE_SECRET_KEY or PRO_PRICE_ID; skipping trial setup.');
+      }
+
+      // Persist captured fields (don’t block if Stripe was skipped/failed)
+      const loc = state.responses.location || state.detectedLocation || { province: '', country: '' };
+      const bloc = state.responses.business_location || loc;
       const userProfileData = {
         ...(profile || {}),
         user_id: normalizedFrom,
         name: state.responses.name,
-        country: state.responses.location.country,
-        province: state.responses.location.province,
-        business_country: state.responses.business_location.country,
-        business_province: state.responses.business_location.province,
-        email: email,
+        country: loc.country,
+        province: loc.province,
+        business_country: bloc.country,
+        business_province: bloc.province,
+        email,
+        stripe_customer_id: stripe_customer_id || null,
+        stripe_subscription_id: stripe_subscription_id || null,
+        subscription_tier: stripe_subscription_id ? 'pro' : (profile?.subscription_tier || 'basic'),
+        paid_tier: stripe_subscription_id ? 'trial' : (profile?.paid_tier || 'free'),
+        trial_start: trial_start || null,
+        trial_end: trial_end || null,
+        current_stage: stripe_subscription_id ? 'trial' : (profile?.current_stage || 'onboarding'),
         onboarding_in_progress: true,
         onboarding_completed: false,
       };
@@ -409,6 +430,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       const name = profile.name ? cap(profile.name) : 'there';
       const congratsMessage = `Congratulations ${name}!
 You’ve now got a personal CFO — in your pocket — on demand.
+${profile.paid_tier === 'trial' ? 'You’re on a 7-day free trial of the Pro plan — explore all features!' : 'You can explore core features right away!'}
 Real-time. Data-smart. Built to make your business *make sense*.
 📈 We’re talking:
 — Auto-tracking your money
@@ -477,10 +499,10 @@ Let’s build something great.
     if (state.step === 6) {
       const defaultData = { goal: '', amount: 0 };
       const parseFn = input => {
-        const m = input.match(/(grow profit by|pay off)\s+\$?(\d+(?:\.\d{1,2})?)/i);
+        const m = input.match(/(grow profit by|pay off)\s+\$?([\d,]+(?:\.\d{1,2})?)/i);
         if (!m) return null;
         const goalType = m[1].toLowerCase();
-        const amount = parseFloat(m[2]) * 1000;
+        const amount = parseFloat(m[2].replace(/,/g, '')); // no *1000
         return { goal: `${goalType} $${amount}`, amount };
       };
 
@@ -509,26 +531,64 @@ Let’s build something great.
         return ack(res);
       }
 
-      // Save goal + complete onboarding
-      const nextProfile = {
+      // Save goal
+      const isDebt = data.goal.toLowerCase().startsWith('pay off');
+      profile = {
         ...(profile || {}),
         user_id: normalizedFrom,
         goal: data.goal,
         goal_progress: {
-          target: data.goal.includes('debt') ? -data.amount : data.amount,
+          target: isDebt ? -data.amount : data.amount,
           current: 0,
         },
-        onboarding_in_progress: false,
-        onboarding_completed: true,
-        current_stage: 'complete',
+        onboarding_in_progress: true,
+        onboarding_completed: false,
       };
-      await saveUserProfile(nextProfile);
-      await deletePendingTransactionState(normalizedFrom);
+      await saveUserProfile(profile);
+      state.step = 7;
+      await setPendingTransactionState(normalizedFrom, state);
 
-      const currency = nextProfile.country === 'United States' ? 'USD' : 'CAD';
-      await sendMessage(
+      await sendQuickReply(
         normalizedFrom,
-        `✅ Goal set: "${data.goal}" (${currency} ${nextProfile.goal_progress.target.toFixed(2)}). You're ready to go! Try: "expense $100 tools" or "create job Roof Repair".`
+        `Great — goal set to "${data.goal}". To continue, please agree to our Terms and Conditions and User Agreement: https://chief-ai-refactored.vercel.app/terms-and-conditions. Reply 'agree' to proceed or 'cancel' to stop.`,
+        ['agree', 'cancel']
+      );
+      return ack(res);
+    }
+
+    // Step 7: terms and conditions
+    if (state.step === 7) {
+      if (msg === 'agree') {
+        const nextProfile = {
+          ...(profile || {}),
+          user_id: normalizedFrom,
+          onboarding_in_progress: false,
+          onboarding_completed: true,
+          current_stage: 'complete',
+        };
+        await saveUserProfile(nextProfile);
+        await deletePendingTransactionState(normalizedFrom);
+
+        const trialEndStr = profile?.trial_end
+          ? new Date(profile.trial_end).toLocaleDateString()
+          : null;
+
+        await sendMessage(
+          normalizedFrom,
+          `✅ Terms accepted! ${trialEndStr ? `Your 7-day Pro trial runs until ${trialEndStr}. ` : ''}You're ready to go. Try: "expense $100 tools" or "create job Roof Repair".`
+        );
+        return ack(res);
+      }
+      if (msg === 'cancel') {
+        await deletePendingTransactionState(normalizedFrom);
+        await saveUserProfile({ ...profile, onboarding_in_progress: false });
+        await sendMessage(normalizedFrom, `Onboarding cancelled. Reply 'start onboarding' to begin again.`);
+        return ack(res);
+      }
+      await sendQuickReply(
+        normalizedFrom,
+        `Please reply with 'agree' to accept the Terms and Conditions or 'cancel' to stop.`,
+        ['agree', 'cancel']
       );
       return ack(res);
     }

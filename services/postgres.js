@@ -32,6 +32,43 @@ function normalizePhoneNumber(phone = '') {
   return noWa.replace(/^\+/, '').trim();
 }
 
+// --- OTP & verification (moved up so exports always see them) ---
+async function generateOTP(userId) {
+  const normalizedId = normalizePhoneNumber(userId);
+  try {
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    await pool.query(
+      `UPDATE users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
+      [otp, expiry, normalizedId],
+    );
+    return otp;
+  } catch (error) {
+    console.error('[ERROR] generateOTP failed:', error.message);
+    throw error;
+  }
+}
+
+async function verifyOTP(userId, otp) {
+  const normalizedId = normalizePhoneNumber(userId);
+  try {
+    const res = await pool.query(
+      `SELECT otp, otp_expiry FROM users WHERE user_id=$1`,
+      [normalizedId],
+    );
+    const user = res.rows[0];
+    const isValid = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
+
+    if (!isValid) return false;
+
+    await pool.query(`UPDATE users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [normalizedId]);
+    return true;
+  } catch (error) {
+    console.error('[ERROR] verifyOTP failed:', error.message);
+    throw error;
+  }
+}
+
 // --- Transactions / Expenses / Bills / Revenue / Quotes ---
 async function appendToUserSpreadsheet(ownerId, data) {
   console.log('[DEBUG] appendToUserSpreadsheet called:', { ownerId, data });
@@ -160,8 +197,8 @@ async function saveRevenue(ownerId, revenueData) {
       [
         ownerId,
         parseFloat(String(revenueData.amount).replace('$', '')),
-        revenueData.description, // mapped to item
-        revenueData.source,      // mapped to store
+        revenueData.description, // -> item
+        revenueData.source,      // -> store
         revenueData.category,
         revenueData.date,
         revenueData.jobName,
@@ -463,24 +500,21 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
 
 /**
  * Upsert user profile with whatever fields are provided.
- * This supports new fields (stripe ids, goal_context, terms_accepted_at, etc.)
+ * Supports stripe ids, goal_context, terms_accepted_at, etc.
  */
 async function saveUserProfile(profile) {
   const normalizedId = normalizePhoneNumber(profile.user_id);
   console.log('[DEBUG] saveUserProfile called:', { user_id: normalizedId });
 
-  // Ensure user_id is part of the upsert payload
   const data = { ...profile, user_id: normalizedId };
-
   const keys = Object.keys(data);
   const values = Object.values(data);
 
-  // Build "INSERT ... ON CONFLICT ... DO UPDATE SET ..." dynamically
-  const insertCols = keys.map(k => k).join(', ');
+  const insertCols = keys.join(', ');
   const insertVals = keys.map((_, i) => `$${i + 1}`).join(', ');
   const updateSet = keys
     .filter(k => k !== 'user_id')
-    .map((k, i) => `${k}=EXCLUDED.${k}`)
+    .map(k => `${k}=EXCLUDED.${k}`)
     .join(', ');
 
   const sql = `
@@ -580,43 +614,6 @@ async function parseReceiptText(text) {
     return result;
   } catch (error) {
     console.error('[ERROR] parseReceiptText failed:', error.message);
-    throw error;
-  }
-}
-
-// --- OTP & verification ---
-async function generateOTP(userId) {
-  const normalizedId = normalizePhoneNumber(userId);
-  try {
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-    await pool.query(
-      `UPDATE users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
-      [otp, expiry, normalizedId],
-    );
-    return otp; // return the token
-  } catch (error) {
-    console.error('[ERROR] generateOTP failed:', error.message);
-    throw error;
-  }
-}
-
-async function verifyOTP(userId, otp) {
-  const normalizedId = normalizePhoneNumber(userId);
-  try {
-    const res = await pool.query(
-      `SELECT otp, otp_expiry FROM users WHERE user_id=$1`,
-      [normalizedId],
-    );
-    const user = res.rows[0];
-    const isValid = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
-
-    if (!isValid) return false;
-
-    await pool.query(`UPDATE users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [normalizedId]);
-    return true;
-  } catch (error) {
-    console.error('[ERROR] verifyOTP failed:', error.message);
     throw error;
   }
 }
@@ -771,6 +768,7 @@ module.exports = {
   parseFinancialFile,
   parseReceiptText,
 
+  // OTP helpers (now definitely defined above)
   generateOTP,
   verifyOTP,
 

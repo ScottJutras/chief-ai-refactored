@@ -3,21 +3,8 @@ const express = require('express');
 const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-// --- Robust import for command handler (supports CJS default, named, or ESM default) ---
-const commandsMod = require('../handlers/commands');
-const handleCommands =
-  (typeof commandsMod === 'function' && commandsMod) ||
-  (commandsMod && commandsMod.handleCommands) ||
-  (commandsMod && commandsMod.default);
-
-if (typeof handleCommands !== 'function') {
-  console.error(
-    '[BOOT] handlers/commands did not export a callable handleCommands. Export keys:',
-    commandsMod && Object.keys(commandsMod)
-  );
-  throw new TypeError('handleCommands is not a function');
-}
-
+// Import all command handlers (named exports)
+const commands = require('../handlers/commands');
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
@@ -43,6 +30,43 @@ function ensureReply(res, text) {
   if (!res.headersSent) {
     res.status(200).send(`<Response><Message>${text}</Message></Response>`);
   }
+}
+
+/**
+ * Try running command handlers in order until one handles the input.
+ * A handler is considered "handled" if:
+ *  - res.headersSent is true after it runs, OR
+ *  - it returns true, OR
+ *  - it returns an object with { handled: true }.
+ */
+async function dispatchCommands(
+  from,
+  input,
+  userProfile,
+  ownerId,
+  ownerProfile,
+  isOwner,
+  res
+) {
+  // Preferred order; adjust as needed
+  const ORDER = ['expense', 'revenue', 'bill', 'job', 'quote', 'metrics', 'tax', 'receipt', 'team'];
+
+  for (const key of ORDER) {
+    const fn = commands && commands[key];
+    if (typeof fn !== 'function') continue;
+
+    try {
+      const out = await fn(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+      if (res.headersSent) return true;
+      if (out === true) return true;
+      if (out && typeof out === 'object' && out.handled) return true;
+    } catch (err) {
+      console.error(`[COMMAND ${key}] error:`, err?.message);
+      // Let the loop continue to next handler; or break if you want a hard fail
+    }
+  }
+
+  return false;
 }
 
 router.post(
@@ -320,7 +344,7 @@ router.post(
       }
 
       // ===== 5) GENERAL COMMANDS / AI fallback (delegated) =====
-      await handleCommands(
+      const handled = await dispatchCommands(
         from,
         input,
         userProfile,
@@ -329,7 +353,13 @@ router.post(
         isOwner,
         res
       );
-      ensureReply(res, "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', or 'help'.");
+
+      if (!handled) {
+        ensureReply(
+          res,
+          "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', or 'help'."
+        );
+      }
       return;
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);

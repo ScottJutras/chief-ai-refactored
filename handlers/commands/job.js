@@ -1,83 +1,195 @@
-const { saveJob, setActiveJob, finishJob, createJob, pauseJob, resumeJob, summarizeJob } = require('../../services/postgres');
-const { acquireLock, releaseLock } = require('../../middleware/lock');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-const { handleInputWithAI, parseJobMessage, handleError } = require('../../utils/aiErrorHandler');
+// handlers/commands/job.js
+const { sendQuickReply, sendMessage } = require('../../services/twilio');
+const {
+  getPendingTransactionState,
+  setPendingTransactionState,
+} = require('../../utils/stateManager');
+const {
+  createJob,
+  setActiveJob,
+  pauseJob,
+  resumeJob,
+  finishJob,
+  summarizeJob,
+} = require('../../services/postgres');
+const { ack } = require('../../utils/http');
 
-async function handleJob(from, input, userProfile, ownerId) {
-  const lockKey = `lock:${from}`;
-  await acquireLock(lockKey);
-
-  try {
-    const msg = input?.trim();
-    const lower = msg.toLowerCase();
-    const state = (await getPendingTransactionState(from)) || {};
-
-    // Two-step CREATE JOB
-    if (!state.pendingCreateJob && lower.startsWith('create job')) {
-      const { data, reply, confirmed } = await handleInputWithAI(from, input, 'job', parseJobMessage);
-      if (!confirmed) return `<Response><Message>${reply}</Message></Response>`;
-      const { jobName } = data;
-      await createJob(ownerId, jobName);
-      await setPendingTransactionState(from, { pendingCreateJob: { jobName } });
-      return `<Response><Message>✅ Job "${jobName}" created. Would you like to set it as active now? Reply "yes" or "no".</Message></Response>`;
-    }
-
-    if (state.pendingCreateJob) {
-      const { jobName } = state.pendingCreateJob;
-      const ans = lower;
-      await deletePendingTransactionState(from);
-      if (ans === 'yes') {
-        await setActiveJob(ownerId, jobName);
-        return `<Response><Message>▶️ Job "${jobName}" is now active.</Message></Response>`;
-      } else if (ans === 'no') {
-        return `<Response><Message>✅ Job "${jobName}" remains inactive. Use "start job ${jobName}" when ready.</Message></Response>`;
-      } else {
-        await setPendingTransactionState(from, state);
-        return `<Response><Message>Please reply "yes" or "no" to confirm activation of "${jobName}".</Message></Response>`;
-      }
-    }
-
-    // Single-shot commands
-    if (lower.startsWith('start job') || lower.startsWith('pause job') || lower.startsWith('resume job') || 
-        lower.startsWith('finish job') || lower.startsWith('summarize job')) {
-      const { data, reply, confirmed } = await handleInputWithAI(from, input, 'job', parseJobMessage);
-      if (!confirmed) return `<Response><Message>${reply}</Message></Response>`;
-      const { jobName } = data;
-
-      if (lower.startsWith('start job')) {
-        await saveJob(ownerId, jobName, new Date());
-        return `<Response><Message>▶️ Started job: ${jobName}</Message></Response>`;
-      }
-      if (lower.startsWith('pause job')) {
-        await pauseJob(ownerId, jobName);
-        return `<Response><Message>⏸️ Paused job: ${jobName}</Message></Response>`;
-      }
-      if (lower.startsWith('resume job')) {
-        await resumeJob(ownerId, jobName);
-        return `<Response><Message>▶️ Resumed job: ${jobName}</Message></Response>`;
-      }
-      if (lower.startsWith('finish job')) {
-        await finishJob(ownerId, jobName);
-        const stats = await summarizeJob(ownerId, jobName);
-        return `<Response><Message>✅ Finished "${jobName}".\nDuration: ${stats.durationDays} days\nLabour: ${stats.labourHours}h / $${stats.labourCost}\nMaterials: $${stats.materialCost}\nRevenue: $${stats.revenue}\nProfit: $${stats.profit} (${(stats.profitMargin * 100).toFixed(2)}%)</Message></Response>`;
-      }
-      const summary = await summarizeJob(ownerId, jobName);
-      return `<Response><Message>📋 Recap for "${jobName}":\nDuration: ${summary.durationDays} days\nLabour: ${summary.labourHours}h / $${summary.labourCost}\nMaterials: $${summary.materialCost}\nRevenue: $${summary.revenue}\nProfit: $${summary.profit} (${(summary.profitMargin * 100).toFixed(2)}%)</Message></Response>`;
-    }
-
-    // Fallback for unknown commands
-    const resp = await xaiClient.post('/grok', {
-      prompt: `${CODEBASE_CONTEXT}\nUser input: "${input}"\nThey tried a job command but it wasn’t recognized. Infer their intent, suggest a valid job command (e.g., "create job Roof Repair"), and ask a clarifying question if needed. Respond conversationally, considering state: ${JSON.stringify(state)}.`
-    });
-    const aiMsg = resp.data.choices?.[0]?.text?.trim() || 
-      `⚠️ I didn’t recognize that job command. Try "create job Roof Repair", "start job Roof Repair", etc.`;
-    return `<Response><Message>${aiMsg}</Message></Response>`;
-  } catch (err) {
-    console.error('[ERROR] handleJob failed for', from, ':', err.message);
-    return await handleError(from, err, 'handleJob', input);
-  } finally {
-    await releaseLock(lockKey);
-  }
+function cap(s = '') {
+  return String(s)
+    .trim()
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
 }
 
-module.exports = { handleJob };
+// "create job X" / "new job X" / "add job X"
+function parseCreateJob(text = '') {
+  const m = /^\s*(create|new|add)\s+job\s+(.+?)\s*$/i.exec(text);
+  if (!m) return null;
+  const name = m[2].trim();
+  return name.length >= 2 ? name : null;
+}
+
+// "start/pause/resume/finish/summarize job X"
+function parseVerbJob(text = '') {
+  const m = /^\s*(start|pause|resume|finish|summarize)\s+job(?:\s+(.+?))?\s*$/i.exec(text);
+  if (!m) return null;
+  return { verb: m[1].toLowerCase(), name: (m[2] || '').trim() || null };
+}
+
+async function handleJob(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+  const msg = String(input || '').trim();
+  const lc = msg.toLowerCase();
+  const state = (await getPendingTransactionState(from)) || {};
+
+  // 1) Confirmation for pending "create job"
+  if (state.jobFlow && state.jobFlow.action === 'create' && state.jobFlow.name) {
+    const wantsCreate = /^(create|yes|y|confirm|ok|👍)$/i.test(msg);
+    const wantsCancel = /^(cancel|no|n|stop|abort|✖️)$/i.test(msg);
+
+    if (wantsCancel) {
+      delete state.jobFlow;
+      await setPendingTransactionState(from, state);
+      await sendMessage(from, `❌ Got it — I won't create that job.`);
+      return ack(res);
+    }
+
+    if (wantsCreate) {
+      const jobName = state.jobFlow.name;
+      delete state.jobFlow;
+
+      try {
+        await createJob(ownerId, jobName);
+        // remember last created job for quick "Start job"
+        state.lastCreatedJobName = jobName;
+        await setPendingTransactionState(from, state);
+
+        await sendQuickReply(
+          from,
+          `✅ Created job: ${cap(jobName)}.\nWhat would you like to do next?`,
+          ['Start job', 'Add expense', 'Log hours', 'Finish job', 'Dashboard']
+        );
+      } catch (err) {
+        console.error('[ERROR] createJob failed:', err?.message);
+        await sendMessage(
+          from,
+          `⚠️ I couldn't create "${cap(jobName)}". Please try again or choose a different name.`
+        );
+      }
+      return ack(res);
+    }
+
+    // still waiting for a clear response
+    await sendQuickReply(from, `Create job "${cap(state.jobFlow.name)}"?`, ['Create', 'Cancel']);
+    return ack(res);
+  }
+
+  // 2) New "create job ..." request
+  const createdName = parseCreateJob(msg);
+  if (createdName) {
+    state.jobFlow = { action: 'create', name: createdName };
+    await setPendingTransactionState(from, state);
+
+    await sendQuickReply(
+      from,
+      `Just to confirm — create job "${cap(createdName)}"?`,
+      ['Create', 'Cancel']
+    );
+    return ack(res);
+  }
+
+  // 3) Verb-based commands: start/pause/resume/finish/summarize
+  const parsed = parseVerbJob(msg);
+  if (parsed) {
+    const { verb } = parsed;
+    let name = parsed.name;
+
+    // Allow "Start job" (no name) to use last created job
+    if (!name && verb === 'start') {
+      name = state.lastCreatedJobName || null;
+      if (!name) {
+        await sendMessage(from, `Which job should I start? Try: "start job <name>".`);
+        return ack(res);
+      }
+    }
+
+    // If a name is still missing for other verbs, ask
+    if (!name) {
+      await sendMessage(from, `Please specify the job name. E.g., "${verb} job Roof Repair".`);
+      return ack(res);
+    }
+
+    // Route by verb
+    try {
+      if (verb === 'start') {
+        // Try to activate; if it fails (job may not exist), create then activate.
+        try {
+          await setActiveJob(ownerId, name);
+        } catch (e1) {
+          try {
+            await createJob(ownerId, name);
+            await setActiveJob(ownerId, name);
+          } catch (e2) {
+            throw e2;
+          }
+        }
+        await sendMessage(
+          from,
+          `▶️ "${cap(name)}" is now active. You can Clock in, add Expenses, or Pause/Finish when done.`
+        );
+        return ack(res);
+      }
+
+      if (verb === 'pause') {
+        await pauseJob(ownerId, name);
+        await sendMessage(from, `⏸️ Paused "${cap(name)}". Say "resume job ${cap(name)}" to continue.`);
+        return ack(res);
+      }
+
+      if (verb === 'resume') {
+        await resumeJob(ownerId, name);
+        await sendMessage(from, `▶️ Resumed "${cap(name)}".`);
+        return ack(res);
+      }
+
+      if (verb === 'finish') {
+        await finishJob(ownerId, name);
+        const s = await summarizeJob(ownerId, name);
+        await sendMessage(
+          from,
+          `✅ Finished "${cap(name)}".\n` +
+            `Duration: ${s.durationDays} days\n` +
+            `Labour: ${s.labourHours}h / $${s.labourCost}\n` +
+            `Materials: $${s.materialCost}\n` +
+            `Revenue: $${s.revenue}\n` +
+            `Profit: $${s.profit} (${(s.profitMargin * 100).toFixed(2)}%)`
+        );
+        return ack(res);
+      }
+
+      if (verb === 'summarize') {
+        const s = await summarizeJob(ownerId, name);
+        await sendMessage(
+          from,
+          `📋 Recap for "${cap(name)}":\n` +
+            `Duration: ${s.durationDays} days\n` +
+            `Labour: ${s.labourHours}h / $${s.labourCost}\n` +
+            `Materials: $${s.materialCost}\n` +
+            `Revenue: $${s.revenue}\n` +
+            `Profit: $${s.profit} (${(s.profitMargin * 100).toFixed(2)}%)`
+        );
+        return ack(res);
+      }
+    } catch (err) {
+      console.error(`[ERROR] ${verb} job failed:`, err?.message);
+      await sendMessage(from, `⚠️ I couldn't ${verb} "${cap(name)}". Please try again.`);
+      return ack(res);
+    }
+  }
+
+  // 4) Not handled by this handler → let the router try others
+  return false;
+}
+
+module.exports = handleJob;

@@ -3,7 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-// Import all command handlers (named exports)
+// Import the commands registry (not a single handleCommands fn)
 const commands = require('../handlers/commands');
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
@@ -32,37 +32,29 @@ function ensureReply(res, text) {
   }
 }
 
-/**
- * Try running command handlers in order until one handles the input.
- * A handler is considered "handled" if:
- *  - res.headersSent is true after it runs, OR
- *  - it returns true, OR
- *  - it returns an object with { handled: true }.
- */
-async function dispatchCommands(
-  from,
-  input,
-  userProfile,
-  ownerId,
-  ownerProfile,
-  isOwner,
-  res
-) {
-  // Preferred order; adjust as needed
-  const ORDER = ['expense', 'revenue', 'bill', 'job', 'quote', 'metrics', 'tax', 'receipt', 'team'];
+/** Try command handlers one by one, job-first. Respect handlers that already sent a response. */
+async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+  const order = ['job', 'expense', 'revenue', 'bill', 'quote', 'metrics', 'tax', 'receipt', 'team', 'timeclock'];
 
-  for (const key of ORDER) {
-    const fn = commands && commands[key];
+  for (const key of order) {
+    const fn = commands[key];
     if (typeof fn !== 'function') continue;
 
-    try {
-      const out = await fn(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-      if (res.headersSent) return true;
-      if (out === true) return true;
-      if (out && typeof out === 'object' && out.handled) return true;
-    } catch (err) {
-      console.error(`[COMMAND ${key}] error:`, err?.message);
-      // Let the loop continue to next handler; or break if you want a hard fail
+    const out = await fn(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+
+    if (res.headersSent) return true;
+
+    if (typeof out === 'string' && out.trim().startsWith('<Response>')) {
+      res.status(200).send(out);
+      return true;
+    }
+    if (out && typeof out === 'object' && typeof out.twiml === 'string') {
+      res.status(200).send(out.twiml);
+      return true;
+    }
+    if (out === true) {
+      ensureReply(res, '');
+      return true;
     }
   }
 
@@ -319,7 +311,7 @@ router.post(
         return;
       }
 
-      // ===== 4) TIMECLOCK =====
+      // ===== 4) TIMECLOCK (direct keywords) =====
       {
         const lower = input.toLowerCase();
         if (
@@ -343,7 +335,14 @@ router.post(
         }
       }
 
-      // ===== 5) GENERAL COMMANDS / AI fallback (delegated) =====
+      // ===== 5) FAST INTENT ROUTER (avoid expense grabbing job phrases) =====
+      if (/^\s*(create|new|add)\s+job\s+/i.test(input)) {
+        await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+        if (!res.headersSent) ensureReply(res, '');
+        return;
+      }
+
+      // ===== 6) GENERAL COMMANDS (dispatch to individual handlers) =====
       const handled = await dispatchCommands(
         from,
         input,
@@ -353,13 +352,13 @@ router.post(
         isOwner,
         res
       );
+      if (handled) return;
 
-      if (!handled) {
-        ensureReply(
-          res,
-          "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', or 'help'."
-        );
-      }
+      // Fallback helper prompt
+      ensureReply(
+        res,
+        "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', or 'help'."
+      );
       return;
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);

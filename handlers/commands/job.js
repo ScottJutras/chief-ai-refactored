@@ -61,8 +61,7 @@ async function handleJob(from, input, userProfile, ownerId, ownerProfile, isOwne
 
       try {
         await createJob(ownerId, jobName);
-        // remember last created job for quick "Start job"
-        state.lastCreatedJobName = jobName;
+        state.lastCreatedJobName = jobName; // remember for quick "Start job"
         await setPendingTransactionState(from, state);
 
         await sendQuickReply(
@@ -120,20 +119,17 @@ async function handleJob(from, input, userProfile, ownerId, ownerProfile, isOwne
       return ack(res);
     }
 
-    // Route by verb
     try {
       if (verb === 'start') {
         // Try to activate; if it fails (job may not exist), create then activate.
         try {
           await setActiveJob(ownerId, name);
-        } catch (e1) {
-          try {
-            await createJob(ownerId, name);
-            await setActiveJob(ownerId, name);
-          } catch (e2) {
-            throw e2;
-          }
+        } catch {
+          await createJob(ownerId, name);
+          await setActiveJob(ownerId, name);
         }
+        state.lastCreatedJobName = name;
+        await setPendingTransactionState(from, state);
         await sendMessage(
           from,
           `▶️ "${cap(name)}" is now active. You can Clock in, add Expenses, or Pause/Finish when done.`

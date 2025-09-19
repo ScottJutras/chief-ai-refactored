@@ -19,7 +19,6 @@ const { parseUpload } = require('../services/deepDive');
 const { getPendingTransactionState, setPendingTransactionState } = require('../utils/stateManager');
 const { routeWithAI } = require('../nlp/intentRouter');
 
-
 const router = express.Router();
 
 /** For logs only (don’t use for IDs) */
@@ -34,29 +33,110 @@ function ensureReply(res, text) {
   }
 }
 
-/** True if the message is a timeclock intent */
+/** True if the message is a timeclock intent (supports “clocked/punched” past tense, etc.) */
 function isTimeclockMessage(s = '') {
   const lc = String(s).toLowerCase();
 
-  // Direct "clock in/out" variants
-  if (/\bclock\s*in\b/.test(lc)) return true;
-  if (/\bclock\s*out\b/.test(lc)) return true;
+  // clock/punch (present or past) + in/out
+  if (/\b(?:clock|punch)(?:ed)?\s*(?:in|out)\b/.test(lc)) return true;
+
+  // standalones
   if (/\bclock-?in\b/.test(lc)) return true;
   if (/\bclock-?out\b/.test(lc)) return true;
   if (/\bclockin\b/.test(lc)) return true;
   if (/\bclockout\b/.test(lc)) return true;
 
-  // Punch variants
-  if (/\bpunch(?:\s*(in|out))?\b/.test(lc)) return true;
+  // shift verbs
+  if (/\bstart\s+(?:shift|work)\b/.test(lc)) return true;
+  if (/\bend\s+(?:shift|work)\b/.test(lc)) return true;
 
-  // Shift verbs
-  if (/\bstart\s+(shift|work)\b/.test(lc)) return true;
-  if (/\bend\s+(shift|work)\b/.test(lc)) return true;
-
-  // Other keywords already considered timeclock-related
+  // other common timeclock keywords
   if (/\b(break|lunch|drive|hours?)\b/.test(lc)) return true;
 
   return false;
+}
+
+/** Normalize timeclock phrasing into “[Name] punched in/out (at TIME)”. */
+function normalizeTimeclockInput(input, userProfile) {
+  const original = String(input || '');
+  let s = original.trim();
+
+  // Helper: extract time (handles "8am", "8 am", "8:30am", "830am")
+  const findTime = (text) => {
+    // h:mm am/pm  or h:mmam
+    let m = text.match(/\b(\d{1,2}):(\d{2})\s*([ap])\.?m\.?\b/i);
+    if (m) {
+      const h = parseInt(m[1], 10);
+      const mm = m[2];
+      const ap = m[3].toLowerCase() === 'a' ? 'am' : 'pm';
+      const t = `${h}:${mm} ${ap}`;
+      return { t, rest: text.replace(m[0], '').trim() };
+    }
+
+    // hhmmam (e.g., 0830am or 830am)
+    m = text.match(/\b(\d{1,2})(\d{2})\s*([ap])\.?m\.?\b/i);
+    if (m) {
+      const hRaw = parseInt(m[1], 10);
+      const mm = m[2];
+      const ap = m[3].toLowerCase() === 'a' ? 'am' : 'pm';
+      const t = `${hRaw}:${mm} ${ap}`;
+      return { t, rest: text.replace(m[0], '').trim() };
+    }
+
+    // h am/pm or ham
+    m = text.match(/\b(\d{1,2})\s*([ap])\.?m\.?\b/i);
+    if (m) {
+      const h = parseInt(m[1], 10);
+      const ap = m[2].toLowerCase() === 'a' ? 'am' : 'pm';
+      const t = `${h}:00 ${ap}`;
+      return { t, rest: text.replace(m[0], '').trim() };
+    }
+
+    return { t: null, rest: text };
+  };
+
+  // 1) Normalize verbs to “punched in/out” so we emit exactly what the handler’s help text suggests.
+  s = s.replace(/\bclock(?:ed)?\s*in\b/gi, 'punched in');
+  s = s.replace(/\bclock(?:ed)?\s*out\b/gi, 'punched out');
+  s = s.replace(/\bpunch\s*in\b/gi, 'punched in');
+  s = s.replace(/\bpunch\s*out\b/gi, 'punched out');
+
+  // 2) Extract time (optional)
+  const timeHit = findTime(s);
+  const timeStr = timeHit.t;
+  s = timeHit.rest; // remove time token from the working string
+
+  // 3) Try to capture person + direction in either order.
+
+  // Case A: "Scott punched in" / "Scott punched out"
+  let m = s.match(/^\s*([a-z][\w\s.'-]{1,50}?)\s+punched\s+(in|out)\b/i);
+  if (m) {
+    const person = m[1].trim();
+    const dir = m[2].toLowerCase();
+    const when = timeStr ? ` at ${timeStr}` : '';
+    return `${person} punched ${dir}${when}`.trim();
+  }
+
+  // Case B: "punched in Scott" / "punched out Scott"
+  m = s.match(/\bpunched\s+(in|out)\s+([a-z][\w\s.'-]{1,50}?)\b/i);
+  if (m) {
+    const dir = m[1].toLowerCase();
+    const person = m[2].trim();
+    const when = timeStr ? ` at ${timeStr}` : '';
+    return `${person} punched ${dir}${when}`.trim();
+  }
+
+  // Case C: we see just "punched in/out" (no explicit name) → use profile name if available
+  m = s.match(/\bpunched\s+(in|out)\b/i);
+  if (m) {
+    const dir = m[1].toLowerCase();
+    const who = (userProfile && userProfile.name) ? userProfile.name : '';
+    const when = timeStr ? ` at ${timeStr}` : '';
+    return `${who ? who + ' ' : ''}punched ${dir}${when}`.trim();
+  }
+
+  // If none matched, just stitch time back if we had it.
+  return timeStr ? `${s} at ${timeStr}`.trim() : original;
 }
 
 /** Try command handlers one by one. Put timeclock before expense to avoid misroutes. */
@@ -340,84 +420,74 @@ router.post(
       }
 
       // ===== 4) TIMECLOCK (direct keywords) =====
-{
-  if (isTimeclockMessage(input)) {
-    let normalized = input;
-    const lc = input.toLowerCase();
-
-    // Normalize "clock in/out <name>" → "punch in/out <name>"
-    const mIn = lc.match(/\bclock\s*in\b\s*(.*)$/i);
-    const mOut = lc.match(/\bclock\s*out\b\s*(.*)$/i);
-    if (mIn) normalized = `punch in ${mIn[1] || ''}`.trim();
-    else if (mOut) normalized = `punch out ${mOut[1] || ''}`.trim();
-
-    await handleTimeclock(
-      from,
-      normalized,
-      userProfile,
-      ownerId,
-      ownerProfile,
-      isOwner,
-      res
-    );
-    ensureReply(res, '✅ Timeclock request received.');
-    return;
-  }
-}
-
-      // ===== AI INTENT ROUTER (OpenAI) =====
-try {
-  const ai = await routeWithAI(input, { userProfile });
-  if (ai) {
-    // Map normalized intents to your existing handlers
-    if (ai.intent === 'timeclock.clock_in') {
-      // Build a normalized phrase your handler already understands, or call a direct fn
-      const who = ai.args.person || userProfile?.name || 'Unknown';
-      const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
-      const normalized = `punch in ${who}${jobHint}`;
-      await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-      if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
-      return;
-    }
-
-    if (ai.intent === 'timeclock.clock_out') {
-      const who = ai.args.person || userProfile?.name || 'Unknown';
-      const note = ai.args.notes ? ` (${ai.args.notes})` : '';
-      const normalized = `punch out ${who}${note}`;
-      await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-      if (!res.headersSent) ensureReply(res, '✅ Clocked out.');
-      return;
-    }
-
-    if (ai.intent === 'job.create') {
-      const name = ai.args.name?.trim();
-      if (name) {
-        const normalized = `create job ${name}`;
-        if (typeof commands.job === 'function') {
-          await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-          if (!res.headersSent) ensureReply(res, '');
+      {
+        if (isTimeclockMessage(input)) {
+          const normalized = normalizeTimeclockInput(input, userProfile);
+          await handleTimeclock(
+            from,
+            normalized,
+            userProfile,
+            ownerId,
+            ownerProfile,
+            isOwner,
+            res
+          );
+          if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
           return;
         }
       }
-    }
 
-    if (ai.intent === 'expense.add') {
-      // Convert back to your current free-form format to reuse existing handler
-      const amt = ai.args.amount;
-      const cat = ai.args.category ? ` ${ai.args.category}` : '';
-      const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
-      const normalized = `expense $${amt}${cat}${fromWho}`.trim();
-      if (typeof commands.expense === 'function') {
-        await commands.expense(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-        if (!res.headersSent) ensureReply(res, '');
-        return;
+      // ===== AI INTENT ROUTER (OpenAI) =====
+      try {
+        const ai = await routeWithAI(input, { userProfile });
+        if (ai) {
+          // Map normalized intents to your existing handlers
+          if (ai.intent === 'timeclock.clock_in') {
+            const who = ai.args.person || userProfile?.name || 'Unknown';
+            const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
+            const t = ai.args.time ? ` at ${ai.args.time}` : '';
+            const normalized = `${who} punched in${jobHint}${t}`;
+            await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
+            return;
+          }
+
+          if (ai.intent === 'timeclock.clock_out') {
+            const who = ai.args.person || userProfile?.name || 'Unknown';
+            const t = ai.args.time ? ` at ${ai.args.time}` : '';
+            const normalized = `${who} punched out${t}`;
+            await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            if (!res.headersSent) ensureReply(res, '✅ Clocked out.');
+            return;
+          }
+
+          if (ai.intent === 'job.create') {
+            const name = ai.args.name?.trim();
+            if (name && typeof commands.job === 'function') {
+              const normalized = `create job ${name}`;
+              await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              if (!res.headersSent) ensureReply(res, '');
+              return;
+            }
+          }
+
+          if (ai.intent === 'expense.add') {
+            const amt = ai.args.amount;
+            const cat = ai.args.category ? ` ${ai.args.category}` : '';
+            const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
+            const normalized = `expense $${amt}${cat}${fromWho}`.trim();
+            if (typeof commands.expense === 'function') {
+              await commands.expense(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              if (!res.headersSent) ensureReply(res, '');
+              return;
+            }
+          }
+          // Unknown intents fall through.
+        }
+      } catch (e) {
+        console.warn('[AI Router] skipped due to error:', e?.message);
       }
-    }
-    // If an unknown intent comes back, just fall through to your existing flow.
-  }
-} catch (e) {
-  console.warn('[AI Router] skipped due to error:', e?.message);
-}
+
       // ===== 5) FAST INTENT ROUTER (prioritize job to avoid expense parser grabbing it) =====
       if (
         /^\s*(create|new|add)\s+job\b/i.test(input) ||

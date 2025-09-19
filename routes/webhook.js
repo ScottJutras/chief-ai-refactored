@@ -336,23 +336,26 @@ router.post(
       }
 
       // ===== 5) FAST INTENT ROUTER (prioritize job to avoid expense parser grabbing it) =====
-      if (/^\s*(create|new|add)\s+job\b/i.test(input) ||
-          /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)) {
-        if (typeof commands.job === 'function') {
-          try {
-            const handled = await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-            if (handled !== false) {
-              if (!res.headersSent) ensureReply(res, '');
-              return;
-            }
-          } catch (e) {
-            console.error('[ERROR] job handler threw:', e?.message);
-          }
-        } else {
-          console.warn('[WARN] commands.job not callable; exports:', Object.keys(commands || {}));
-        }
-        // If job handler didn’t handle it, continue to generic dispatch below
+if (
+  /^\s*(create|new|add)\s+job\b/i.test(input) ||
+  /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)
+) {
+  if (typeof commands.job === 'function') {
+    try {
+      const handled = await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+      if (handled !== false) {
+        if (!res.headersSent) ensureReply(res, '');
+        return;
       }
+    } catch (e) {
+      console.error('[ERROR] job handler threw:', e?.message);
+    }
+  } else {
+    console.warn('[WARN] commands.job not callable; exports:', Object.keys(commands || {}));
+  }
+  // If job handler didn’t handle it, continue to generic dispatch below
+}
+
 
       // ===== 6) GENERAL COMMANDS (dispatch to individual handlers) =====
       {
@@ -369,22 +372,23 @@ router.post(
       }
 
       // ===== 7) LEGACY COMBINED HANDLER (if present) =====
-      if (typeof commands.handleCommands === 'function') {
-        try {
-          const handled = await commands.handleCommands(
-            from,
-            input,
-            userProfile,
-            ownerId,
-            ownerProfile,
-            isOwner,
-            res
-          );
-          if (handled !== false) return;
-        } catch (e) {
-          console.error('[ERROR] handleCommands threw:', e?.message);
-        }
-      }
+if (typeof commands.handleCommands === 'function') {
+  try {
+    const handled = await commands.handleCommands(
+      from,
+      input,
+      userProfile,
+      ownerId,
+      ownerProfile,
+      isOwner,
+      res
+    );
+    if (handled !== false) return;
+  } catch (e) {
+    console.error('[ERROR] handleCommands threw:', e?.message);
+  }
+}
+
 
       // Fallback helper prompt
       ensureReply(
@@ -396,13 +400,15 @@ router.post(
       console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
       return next(error);
     } finally {
-      try {
-        await releaseLock(req.lockKey, req.lockToken);
-        console.log('[LOCK] released for', req.lockKey);
-      } catch (e) {
-        console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
-      }
+  try {
+    if (req.lockKey && req.lockToken) {
+      await releaseLock(req.lockKey, req.lockToken);
+      console.log('[LOCK] released for', req.lockKey);
     }
+  } catch (e) {
+    console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
+  }
+}
   },
   // Centralized error handler (kept last)
   errorMiddleware

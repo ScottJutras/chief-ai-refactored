@@ -1,0 +1,21 @@
+New-Item -ItemType Directory -Path .vscode -Force | Out-Null
+$tasks = @"
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Vercel: Pull Env (production)",
+      "type": "shell",
+      "command": "npx vercel pull --yes --environment=production",
+      "problemMatcher": []
+    },
+    {
+      "label": "Vercel: Deploy (prod)",
+      "type": "shell",
+      "command": "npx vercel deploy --prod",
+      "problemMatcher": []
+    }
+  ]
+}
+"@
+$tasks | Set-Content -Path .vscode\tasks.json -Encoding utf8

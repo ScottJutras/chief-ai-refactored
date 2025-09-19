@@ -3,7 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-// Import the commands registry (not a single handleCommands fn)
+// Import the commands registry (collection of handlers; may also export handleCommands)
 const commands = require('../handlers/commands');
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
@@ -335,24 +335,56 @@ router.post(
         }
       }
 
-      // ===== 5) FAST INTENT ROUTER (avoid expense grabbing job phrases) =====
-      if (/^\s*(create|new|add)\s+job\s+/i.test(input)) {
-        await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-        if (!res.headersSent) ensureReply(res, '');
-        return;
+      // ===== 5) FAST INTENT ROUTER (prioritize job to avoid expense parser grabbing it) =====
+      if (/^\s*(create|new|add)\s+job\b/i.test(input) ||
+          /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)) {
+        if (typeof commands.job === 'function') {
+          try {
+            const handled = await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+            if (handled !== false) {
+              if (!res.headersSent) ensureReply(res, '');
+              return;
+            }
+          } catch (e) {
+            console.error('[ERROR] job handler threw:', e?.message);
+          }
+        } else {
+          console.warn('[WARN] commands.job not callable; exports:', Object.keys(commands || {}));
+        }
+        // If job handler didn’t handle it, continue to generic dispatch below
       }
 
       // ===== 6) GENERAL COMMANDS (dispatch to individual handlers) =====
-      const handled = await dispatchCommands(
-        from,
-        input,
-        userProfile,
-        ownerId,
-        ownerProfile,
-        isOwner,
-        res
-      );
-      if (handled) return;
+      {
+        const handled = await dispatchCommands(
+          from,
+          input,
+          userProfile,
+          ownerId,
+          ownerProfile,
+          isOwner,
+          res
+        );
+        if (handled) return;
+      }
+
+      // ===== 7) LEGACY COMBINED HANDLER (if present) =====
+      if (typeof commands.handleCommands === 'function') {
+        try {
+          const handled = await commands.handleCommands(
+            from,
+            input,
+            userProfile,
+            ownerId,
+            ownerProfile,
+            isOwner,
+            res
+          );
+          if (handled !== false) return;
+        } catch (e) {
+          console.error('[ERROR] handleCommands threw:', e?.message);
+        }
+      }
 
       // Fallback helper prompt
       ensureReply(

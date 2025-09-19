@@ -1,13 +1,16 @@
+// handlers/commands/index.js
 const { handleExpense } = require('./expense');
 const { handleRevenue } = require('./revenue');
 const { handleBill } = require('./bill');
-const { handleJob } = require('./job');
+// job.js now exports the function directly
+const handleJob = require('./job');
 const { handleQuote } = require('./quote');
 const { handleMetrics } = require('./metrics');
 const { handleTax } = require('./tax');
 const { handleReceipt } = require('./receipt');
 const { handleTeam } = require('./team');
 const { handleTimeclock } = require('./timeclock');
+
 const { isOnboardingTrigger, isValidCommand, isValidExpenseInput } = require('../../utils/inputValidator');
 const { db, admin } = require('../../services/firebase');
 const { getOnboardingState, setOnboardingState, deleteOnboardingState } = require('../../utils/stateManager');
@@ -20,6 +23,9 @@ const { google } = require('googleapis');
 const { getAuthorizedClient } = require('../../services/postgres.js');
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// NOTE: if you reference helpers like categorizeEntry / appendToUserSpreadsheet / getActiveJob / getLastQuery,
+// ensure they are imported where they actually live in your codebase.
 
 async function handleGenericQuery(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -48,7 +54,7 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
   let reply;
   try {
     console.log(`[DEBUG] Attempting command processing for ${from}: "${input}"`);
-    const lcInput = input.toLowerCase();
+    const lcInput = String(input || '').toLowerCase();
 
     // Check for pending transaction confirmation
     const pendingState = await getPendingTransactionState(from);
@@ -498,7 +504,7 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
           await db.collection('locks').doc(lockKey).delete();
           return res.send(`<Response><Message>${reply}</Message></Response>`);
         }
-        const amount = parseFloat(amountMatch[1]) * 1000;
+        const amount = parseFloat(amountMatch[1]) * 1000; // NOTE: adjust if not intentional
         userProfile.goal = state.responses.goalType;
         userProfile.goalProgress = {
           target: state.responses.goalType === 'pay off debt' ? -amount : amount,
@@ -624,6 +630,21 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
       }
     }
 
+    // 🔎 Job intents (handle BEFORE expense/revenue heuristics)
+    if (/^(create|new|add)\s+job\b/i.test(lcInput) ||
+        /^(start|pause|resume|finish|summarize)\s+job\b/i.test(lcInput)) {
+      if (userProfile.subscription_tier === 'starter') {
+        const sent = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, {
+          "1": `⚠️ Jobs require Pro or Enterprise plan.`
+        });
+        await db.collection('locks').doc(lockKey).delete();
+        return res.send(`<Response></Response>`);
+      }
+      // Let job.js own the response lifecycle; release our lock first.
+      await db.collection('locks').doc(lockKey).delete();
+      return await handleJob(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+    }
+
     // Quick match for expense, revenue, bill
     const expenseMatch = input.match(/^(?:expense\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
     const revenueMatch = input.match(/^(?:revenue\s+)?(?:received\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(?:from\s+)?(.+)/i);
@@ -640,13 +661,6 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
         return res.send(`<Response></Response>`);
       }
       return await handleBill(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-    } else if (lcInput.startsWith('start job') || lcInput.startsWith('finish job')) {
-      if (userProfile.subscription_tier === 'starter') {
-        reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Jobs require Pro or Enterprise plan.` });
-        await db.collection('locks').doc(lockKey).delete();
-        return res.send(`<Response></Response>`);
-      }
-      return await handleJob(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     } else if (lcInput.startsWith('quote')) {
       if (userProfile.subscription_tier === 'starter') {
         reply = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, { "1": `⚠️ Quotes require Pro or Enterprise plan.` });
@@ -768,5 +782,6 @@ module.exports = {
   tax: handleTax,
   receipt: handleReceipt,
   team: handleTeam,
-  timeclock: handleTimeclock
+  timeclock: handleTimeclock,
+  handleCommands, // <-- keep this exported
 };

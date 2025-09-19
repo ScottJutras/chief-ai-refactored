@@ -17,6 +17,8 @@ const { errorMiddleware } = require('../middleware/error');
 const { sendMessage, sendTemplateMessage } = require('../services/twilio');
 const { parseUpload } = require('../services/deepDive');
 const { getPendingTransactionState, setPendingTransactionState } = require('../utils/stateManager');
+const { routeWithAI } = require('../nlp/intentRouter');
+
 
 const router = express.Router();
 
@@ -338,22 +340,84 @@ router.post(
       }
 
       // ===== 4) TIMECLOCK (direct keywords) =====
-      {
-        if (isTimeclockMessage(input)) {
-          await handleTimeclock(
-            from,
-            input,
-            userProfile,
-            ownerId,
-            ownerProfile,
-            isOwner,
-            res
-          );
-          ensureReply(res, '✅ Timeclock request received.');
+{
+  if (isTimeclockMessage(input)) {
+    let normalized = input;
+    const lc = input.toLowerCase();
+
+    // Normalize "clock in/out <name>" → "punch in/out <name>"
+    const mIn = lc.match(/\bclock\s*in\b\s*(.*)$/i);
+    const mOut = lc.match(/\bclock\s*out\b\s*(.*)$/i);
+    if (mIn) normalized = `punch in ${mIn[1] || ''}`.trim();
+    else if (mOut) normalized = `punch out ${mOut[1] || ''}`.trim();
+
+    await handleTimeclock(
+      from,
+      normalized,
+      userProfile,
+      ownerId,
+      ownerProfile,
+      isOwner,
+      res
+    );
+    ensureReply(res, '✅ Timeclock request received.');
+    return;
+  }
+}
+
+      // ===== AI INTENT ROUTER (OpenAI) =====
+try {
+  const ai = await routeWithAI(input, { userProfile });
+  if (ai) {
+    // Map normalized intents to your existing handlers
+    if (ai.intent === 'timeclock.clock_in') {
+      // Build a normalized phrase your handler already understands, or call a direct fn
+      const who = ai.args.person || userProfile?.name || 'Unknown';
+      const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
+      const normalized = `punch in ${who}${jobHint}`;
+      await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+      if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
+      return;
+    }
+
+    if (ai.intent === 'timeclock.clock_out') {
+      const who = ai.args.person || userProfile?.name || 'Unknown';
+      const note = ai.args.notes ? ` (${ai.args.notes})` : '';
+      const normalized = `punch out ${who}${note}`;
+      await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+      if (!res.headersSent) ensureReply(res, '✅ Clocked out.');
+      return;
+    }
+
+    if (ai.intent === 'job.create') {
+      const name = ai.args.name?.trim();
+      if (name) {
+        const normalized = `create job ${name}`;
+        if (typeof commands.job === 'function') {
+          await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          if (!res.headersSent) ensureReply(res, '');
           return;
         }
       }
+    }
 
+    if (ai.intent === 'expense.add') {
+      // Convert back to your current free-form format to reuse existing handler
+      const amt = ai.args.amount;
+      const cat = ai.args.category ? ` ${ai.args.category}` : '';
+      const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
+      const normalized = `expense $${amt}${cat}${fromWho}`.trim();
+      if (typeof commands.expense === 'function') {
+        await commands.expense(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+        if (!res.headersSent) ensureReply(res, '');
+        return;
+      }
+    }
+    // If an unknown intent comes back, just fall through to your existing flow.
+  }
+} catch (e) {
+  console.warn('[AI Router] skipped due to error:', e?.message);
+}
       // ===== 5) FAST INTENT ROUTER (prioritize job to avoid expense parser grabbing it) =====
       if (
         /^\s*(create|new|add)\s+job\b/i.test(input) ||

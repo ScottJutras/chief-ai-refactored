@@ -32,9 +32,34 @@ function ensureReply(res, text) {
   }
 }
 
-/** Try command handlers one by one, job-first. Respect handlers that already sent a response. */
+/** True if the message is a timeclock intent */
+function isTimeclockMessage(s = '') {
+  const lc = String(s).toLowerCase();
+
+  // Direct "clock in/out" variants
+  if (/\bclock\s*in\b/.test(lc)) return true;
+  if (/\bclock\s*out\b/.test(lc)) return true;
+  if (/\bclock-?in\b/.test(lc)) return true;
+  if (/\bclock-?out\b/.test(lc)) return true;
+  if (/\bclockin\b/.test(lc)) return true;
+  if (/\bclockout\b/.test(lc)) return true;
+
+  // Punch variants
+  if (/\bpunch(?:\s*(in|out))?\b/.test(lc)) return true;
+
+  // Shift verbs
+  if (/\bstart\s+(shift|work)\b/.test(lc)) return true;
+  if (/\bend\s+(shift|work)\b/.test(lc)) return true;
+
+  // Other keywords already considered timeclock-related
+  if (/\b(break|lunch|drive|hours?)\b/.test(lc)) return true;
+
+  return false;
+}
+
+/** Try command handlers one by one. Put timeclock before expense to avoid misroutes. */
 async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
-  const order = ['job', 'expense', 'revenue', 'bill', 'quote', 'metrics', 'tax', 'receipt', 'team', 'timeclock'];
+  const order = ['job', 'timeclock', 'expense', 'revenue', 'bill', 'quote', 'metrics', 'tax', 'receipt', 'team'];
 
   for (const key of order) {
     const fn = commands[key];
@@ -63,8 +88,9 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
 
 router.post(
   '/',
-  lockMiddleware,
+  // IMPORTANT: normalize user (sets req.from/ownerId) BEFORE taking a lock
   userProfileMiddleware,
+  lockMiddleware,
   tokenMiddleware,
   async (req, res, next) => {
     const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
@@ -313,14 +339,7 @@ router.post(
 
       // ===== 4) TIMECLOCK (direct keywords) =====
       {
-        const lower = input.toLowerCase();
-        if (
-          lower.includes('punch') ||
-          lower.includes('break') ||
-          lower.includes('lunch') ||
-          lower.includes('drive') ||
-          lower.includes('hours')
-        ) {
+        if (isTimeclockMessage(input)) {
           await handleTimeclock(
             from,
             input,
@@ -336,26 +355,25 @@ router.post(
       }
 
       // ===== 5) FAST INTENT ROUTER (prioritize job to avoid expense parser grabbing it) =====
-if (
-  /^\s*(create|new|add)\s+job\b/i.test(input) ||
-  /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)
-) {
-  if (typeof commands.job === 'function') {
-    try {
-      const handled = await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-      if (handled !== false) {
-        if (!res.headersSent) ensureReply(res, '');
-        return;
+      if (
+        /^\s*(create|new|add)\s+job\b/i.test(input) ||
+        /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)
+      ) {
+        if (typeof commands.job === 'function') {
+          try {
+            const handled = await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+            if (handled !== false) {
+              if (!res.headersSent) ensureReply(res, '');
+              return;
+            }
+          } catch (e) {
+            console.error('[ERROR] job handler threw:', e?.message);
+          }
+        } else {
+          console.warn('[WARN] commands.job not callable; exports:', Object.keys(commands || {}));
+        }
+        // If job handler didn’t handle it, continue to generic dispatch below
       }
-    } catch (e) {
-      console.error('[ERROR] job handler threw:', e?.message);
-    }
-  } else {
-    console.warn('[WARN] commands.job not callable; exports:', Object.keys(commands || {}));
-  }
-  // If job handler didn’t handle it, continue to generic dispatch below
-}
-
 
       // ===== 6) GENERAL COMMANDS (dispatch to individual handlers) =====
       {
@@ -372,23 +390,22 @@ if (
       }
 
       // ===== 7) LEGACY COMBINED HANDLER (if present) =====
-if (typeof commands.handleCommands === 'function') {
-  try {
-    const handled = await commands.handleCommands(
-      from,
-      input,
-      userProfile,
-      ownerId,
-      ownerProfile,
-      isOwner,
-      res
-    );
-    if (handled !== false) return;
-  } catch (e) {
-    console.error('[ERROR] handleCommands threw:', e?.message);
-  }
-}
-
+      if (typeof commands.handleCommands === 'function') {
+        try {
+          const handled = await commands.handleCommands(
+            from,
+            input,
+            userProfile,
+            ownerId,
+            ownerProfile,
+            isOwner,
+            res
+          );
+          if (handled !== false) return;
+        } catch (e) {
+          console.error('[ERROR] handleCommands threw:', e?.message);
+        }
+      }
 
       // Fallback helper prompt
       ensureReply(
@@ -400,15 +417,13 @@ if (typeof commands.handleCommands === 'function') {
       console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
       return next(error);
     } finally {
-  try {
-    if (req.lockKey && req.lockToken) {
-      await releaseLock(req.lockKey, req.lockToken);
-      console.log('[LOCK] released for', req.lockKey);
+      try {
+        await releaseLock(req.lockKey, req.lockToken);
+        console.log('[LOCK] released for', req.lockKey);
+      } catch (e) {
+        console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
+      }
     }
-  } catch (e) {
-    console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
-  }
-}
   },
   // Centralized error handler (kept last)
   errorMiddleware

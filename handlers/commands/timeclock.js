@@ -7,7 +7,7 @@ const {
 
 const { zonedTimeToUtc, utcToZonedTime, format } = require('date-fns-tz');
 
-// ✨ NEW: use shared timezone helpers
+// ✨ uses shared timezone helpers
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
 
 // ----- helpers --------------------------------------------------------------
@@ -20,6 +20,15 @@ function titleCase(s = '') {
     .join(' ');
 }
 
+/** Normalize weird whitespace & Unicode quirks. */
+function norm(msg = '') {
+  return String(msg)
+    .normalize('NFKC')                           // Unicode normalize
+    .replace(/[\u00A0\u2007\u202F]/g, ' ')       // NBSPs → normal spaces
+    .replace(/\s{2,}/g, ' ')                     // collapse runs
+    .trim();
+}
+
 /** Prefer explicit @ Job or "on Job" at tail of message. */
 function extractJobHint(text = '') {
   let m = text.match(/@\s*([^\n\r]+)$/i);
@@ -29,45 +38,12 @@ function extractJobHint(text = '') {
   return null;
 }
 
-/** Normalize frequent typos / variants before parsing. */
+/** Legacy lowercasing + a couple of autocorrections (kept for safety). */
 function normalizeInput(raw) {
   let lc = String(raw || '').trim().toLowerCase();
-  // Fix “clocked our/or” → “clocked out”
-  lc = lc.replace(/\bclock(?:ed)?\s+(our|or)\b/g, 'clocked out');
-  // Compact spaces
+  lc = lc.replace(/\bclock(?:ed)?\s+(our|or)\b/g, 'clocked out'); // “clocked our/or”
   lc = lc.replace(/\s{2,}/g, ' ').trim();
   return lc;
-}
-
-/** Extract a name if it appears before the verb; else fallback to profile name. */
-function extractName(lc, userProfile) {
-  const verbIdx = lc.search(/\b(clock|clocked|punch|break|lunch|drive|hours)\b/);
-  if (verbIdx > 0) {
-    const head = lc.slice(0, verbIdx).trim();
-    const m = head.match(/^[a-z][a-z.'\- ]{0,40}/i);
-    if (m) return titleCase(m[0].trim());
-  }
-  const m2 = lc.match(/^([a-z][a-z.'\- ]{0,40})\s+(clock|clocked|punch|break|lunch|drive|hours)\b/i);
-  if (m2) return titleCase(m2[1].trim());
-  return titleCase((userProfile && userProfile.name) || 'Unknown');
-}
-
-/** Detect action type. */
-function detectAction(lc) {
-  const rules = [
-    { re: /\b(punch|clock(?:ed)?)\s*in\b/, type: 'punch_in' },
-    { re: /\b(punch|clock(?:ed)?)\s*out\b/, type: 'punch_out' },
-    { re: /\bbreak\s+start\b/, type: 'break_start' },
-    { re: /\bbreak\s+end\b/, type: 'break_end' },
-    { re: /\blunch\s+start\b/, type: 'lunch_start' },
-    { re: /\blunch\s+end\b/, type: 'lunch_end' },
-    { re: /\bdrive\s+start\b/, type: 'drive_start' },
-    { re: /\bdrive\s+end\b/, type: 'drive_end' },
-  ];
-  for (const r of rules) {
-    if (r.re.test(lc)) return r.type;
-  }
-  return null;
 }
 
 /** Build a UTC Date for "today(+offset) at HH:MM in tz". */
@@ -84,12 +60,11 @@ function zonedDayTimeToUtc(tz, hours, minutes, dayOffset = 0) {
   return zonedTimeToUtc(localStr, tz);
 }
 
-/** Parse a time from text in the user's timezone; return a UTC Date or null if not present. */
+/** Parse a time from text in the user's timezone; return a UTC Date or null. */
 function parseTimeFromText(lc, tz) {
-  // Optional day words
   const dayOffset = /\byesterday\b/.test(lc) ? -1 : 0;
 
-  // 1) 8am / 8:15 pm / at 7 pm
+  // 8am / 8:15 pm / at 7 pm
   let m = lc.match(/\b(?:at|@)?\s*(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/i);
   if (m) {
     let hour = parseInt(m[1], 10);
@@ -100,7 +75,7 @@ function parseTimeFromText(lc, tz) {
     return zonedDayTimeToUtc(tz, hour, minute, dayOffset);
   }
 
-  // 2) 730pm (no colon)
+  // 730pm (no colon)
   m = lc.match(/\b(?:at|@)?\s*(\d{1,2})(\d{2})\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/i);
   if (m) {
     let hour = parseInt(m[1], 10);
@@ -111,7 +86,7 @@ function parseTimeFromText(lc, tz) {
     return zonedDayTimeToUtc(tz, hour, minute, dayOffset);
   }
 
-  // 3) 24h: 19:30
+  // 24h: 19:30
   m = lc.match(/\b(?:at|@)?\s*(\d{1,2}):(\d{2})\b/);
   if (m) {
     const hour = parseInt(m[1], 10);
@@ -121,8 +96,8 @@ function parseTimeFromText(lc, tz) {
     }
   }
 
-  // 4) 'now'
-  if (/\bnow\b/.test(lc)) return new Date(); // current UTC
+  // 'now'
+  if (/\bnow\b/.test(lc)) return new Date();
   return null;
 }
 
@@ -153,27 +128,56 @@ function parseHoursQuery(lcInput, fallbackName) {
   return { employeeName: employeeName || fallbackName || '', period };
 }
 
-// ----- TZ resolver (tiny patch) --------------------------------------------
+// ----- TZ resolver ----------------------------------------------------------
 
 function getUserTz(userProfile) {
-  // Prefer util if available
   if (typeof getUserTzFromProfile === 'function') {
     const tz = getUserTzFromProfile(userProfile);
     if (tz) return tz;
   }
-  // Fallbacks
   if (userProfile?.timezone) return userProfile.timezone;
   const country = userProfile?.business_country || userProfile?.country || '';
   const region = userProfile?.business_province || userProfile?.province || '';
   return suggestTimezone(country, region) || 'UTC';
 }
 
+// ----- tolerant command patterns -------------------------------------------
+// Name-first variants, e.g. "Scott punched in at 8am"
+const RE_NAME_FIRST = [
+  { type: 'punch_in',  re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+
+  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'break_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+
+  { type: 'drive_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'drive_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+];
+
+// Action-first variants, e.g. "punched in at 8am", optional "for Scott"
+const RE_ACTION_FIRST = [
+  { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+
+  { type: 'break_start', re: /^(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'break_end',   re: /^(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+
+  { type: 'drive_start', re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'drive_end',   re: /^drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+];
+
+function dbgMatch(label, m) {
+  if (m) console.log(`[timeclock] matched ${label}:`, m.groups || {});
+}
+
 // ----- main handler ---------------------------------------------------------
 
 async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   try {
-    const tz = getUserTz(userProfile);
-    const lc = normalizeInput(input);
+    // Normalize first to handle NBSPs etc.
+    const raw = norm(input);
+    const lc  = normalizeInput(raw); // keep the legacy lowercasing/cleanup too
+    const tz  = getUserTz(userProfile);
 
     // 1) Hours query
     const hoursQ = parseHoursQuery(lc, (userProfile && userProfile.name) || '');
@@ -199,30 +203,45 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    // 2) Action entry (punch/clock/break/lunch/drive)
-    const action = detectAction(lc);
-    if (!action) {
+    // 2) Action entry (punch/clock/break/lunch/drive) — tolerant patterns
+    let match = null;
+    let action = null;
+
+    for (const { type, re } of RE_NAME_FIRST) {
+      const m = raw.match(re); // use raw to preserve casing for name
+      if (m) { match = m; action = type; dbgMatch(type + ':name-first', m); break; }
+    }
+    if (!match) {
+      for (const { type, re } of RE_ACTION_FIRST) {
+        const m = raw.match(re);
+        if (m) { match = m; action = type; dbgMatch(type + ':action-first', m); break; }
+      }
+    }
+
+    if (!match || !action) {
       const reply = '⚠ Invalid time entry. Use: "[Name] punched in at 9am" or "[Name] hours week".';
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    const who = extractName(lc, userProfile);
+    // Name: from regex or fallback to profile
+    const who = titleCase(match.groups?.name || userProfile?.name || 'Unknown');
 
     // Job: explicit override at tail > active job > null
-    const jobOverride = extractJobHint(lc);
+    const jobOverride = extractJobHint(raw);
     let jobName = jobOverride && jobOverride.trim() ? jobOverride.trim() : null;
     if (!jobName) {
       const activeJob = await getActiveJob(ownerId);
       jobName = activeJob && activeJob !== 'Uncategorized' ? activeJob : null;
     }
 
-    // When: parsed specific time in user's tz → UTC; else now (UTC)
-    let whenUtc = parseTimeFromText(lc, tz);
-    if (!whenUtc) whenUtc = new Date();
+    // When: if a time phrase is present, parse; else parse whole lc (yesterday/now) or fallback to now
+    const timePhrase = (match.groups?.time || '').trim();
+    let whenUtc = parseTimeFromText(timePhrase ? timePhrase.toLowerCase() : lc, tz);
+    if (!whenUtc) whenUtc = new Date(); // current UTC
 
     await logTimeEntry(
       ownerId,
-      titleCase(who),
+      who,
       action,                         // punch_in, punch_out, break_start, etc.
       whenUtc.toISOString(),
       jobName || null
@@ -230,7 +249,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
 
     const humanTime = fmtInTz(whenUtc, tz);
     const actionText = action.replace('_', ' ');
-    const reply = `✅ ${actionText} logged for ${titleCase(who)} at ${humanTime}${jobName ? ` on ${jobName}` : ''}`;
+    const reply = `✅ ${actionText} logged for ${who} at ${humanTime}${jobName ? ` on ${jobName}` : ''}`;
 
     return res.send(`<Response><Message>${reply}</Message></Response>`);
   } catch (error) {

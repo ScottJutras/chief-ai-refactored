@@ -3,6 +3,7 @@ const {
   logTimeEntry,
   generateTimesheet,
   getActiveJob,
+  getTimeEntries,            // NEW: to anchor inserts around real-day punches
 } = require('../../services/postgres');
 
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
@@ -10,7 +11,7 @@ const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-t
 // uses shared timezone helpers
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
 
-// ----- helpers --------------------------------------------------------------
+// --------------------------------- helpers ----------------------------------
 
 function titleCase(s = '') {
   return String(s)
@@ -124,7 +125,7 @@ function parseHoursQuery(lcInput, fallbackName) {
   return { employeeName: employeeName || fallbackName || '', period };
 }
 
-// ----- TZ resolver ----------------------------------------------------------
+// ----------------------------- TZ resolver ---------------------------------
 
 function getUserTz(userProfile) {
   if (typeof getUserTzFromProfile === 'function') {
@@ -137,7 +138,7 @@ function getUserTz(userProfile) {
   return suggestTimezone(country, region) || 'UTC';
 }
 
-// ----- tolerant command patterns -------------------------------------------
+// ------------------- tolerant command patterns (single) ---------------------
 // Name-first variants, e.g. "Scott punched in at 8am"
 const NAME = String.raw`(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)`;
 const T = String.raw`(?<time>.+)?`;
@@ -152,7 +153,7 @@ const RE_NAME_FIRST = [
   { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:break|lunch)\\s*(?:start|in|begin)?${AT}${T}$`, 'iu') },
   { type: 'break_end',   re: new RegExp(`^${NAME}\\s+(?:break|lunch)\\s*(?:end|out|finish)?${AT}${T}$`, 'iu') },
 
-  // ✅ NEW: natural phrasings
+  // natural phrasings
   { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?break${AT}${T}$`, 'iu') },
   { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?lunch${AT}${T}$`, 'iu') },
   { type: 'break_end',   re: new RegExp(`^${NAME}\\s+(?:back\\s+from|finished|ended|done\\s+with)\\s+(?:a\\s+)?(?:break|lunch)${AT}${T}$`, 'iu') },
@@ -170,11 +171,9 @@ const RE_ACTION_FIRST = [
   { type: 'punch_in',  re: new RegExp(`^(?:punch(?:ed)?|clock(?:ed)?)\\s*in${AT}${T}${FOR_NAME}$`, 'iu') },
   { type: 'punch_out', re: new RegExp(`^(?:punch(?:ed)?|clock(?:ed)?)\\s*out${AT}${T}${FOR_NAME}$`, 'iu') },
 
-  // break/lunch: traditional
+  // break/lunch: traditional + natural
   { type: 'break_start', re: new RegExp(`^(?:break|lunch)\\s*(?:start|in|begin)?${AT}${T}${FOR_NAME}$`, 'iu') },
   { type: 'break_end',   re: new RegExp(`^(?:break|lunch)\\s*(?:end|out|finish)?${AT}${T}${FOR_NAME}$`, 'iu') },
-
-  // ✅ NEW: natural phrasings
   { type: 'break_start', re: new RegExp(`^(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?break${AT}${T}${FOR_NAME}$`, 'iu') },
   { type: 'break_start', re: new RegExp(`^(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?lunch${AT}${T}${FOR_NAME}$`, 'iu') },
   { type: 'break_end',   re: new RegExp(`^(?:back\\s+from|finished|ended|done\\s+with)\\s+(?:a\\s+)?(?:break|lunch)${AT}${T}${FOR_NAME}$`, 'iu') },
@@ -188,7 +187,100 @@ function dbgMatch(label, m) {
   if (m) console.log(`[timeclock] matched ${label}:`, m.groups || {});
 }
 
-// ----- main handler ---------------------------------------------------------
+// ------------------------- batch break parser (NEW) -------------------------
+
+// Examples handled:
+//  "Scott took a 15 minute break then a 30 minute lunch"
+//  "Scott, Joe, Justin took a 15 minute break then a 35 minute lunch yesterday"
+//  "Scott, Joe, Justin took a 15 minute break then a 35 minute lunch today"
+const RE_BATCH = new RegExp(
+  String.raw`^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+` +
+  String.raw`(?:took|had|did)\s+(?:a\s+)?(?<bmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+break\s+` +
+  String.raw`(?:then\s+(?:a\s+)?)?(?<lmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+lunch` +
+  String.raw`(?:\s+(?<day>today|yesterday))?\s*$`,
+  'iu'
+);
+
+function splitNames(namesStr) {
+  // turn "Scott, Joe, Justin" or "Scott, Joe and Justin" into ["Scott","Joe","Justin"]
+  const s = namesStr.replace(/\s+and\s+/gi, ',');
+  return s.split(',').map(x => titleCase(x.trim())).filter(Boolean);
+}
+
+const BATCH_LIMIT = 10;          // safety cap on number of people
+const MAX_MINUTES = 240;         // safety cap on duration minutes
+const GAP_MINUTES = 5;
+
+function safeMinutes(n) {
+  const v = Math.max(1, Math.min(MAX_MINUTES, parseInt(n, 10) || 0));
+  return v;
+}
+
+async function computeAnchorEnd(ownerId, name, tz, dayOffset) {
+  // Prefer the person's punch_out that day; else now (today) or 5:00 PM (yesterday)
+  const anchorDate = new Date(); // used only as "day" token in getTimeEntries
+  if (dayOffset !== 0) {
+    // anchorDate ← "yesterday" in local tz, but getTimeEntries compares DATE(timestamp) to DATE($2)
+    // Passing the shifted date is sufficient for that query shape.
+    anchorDate.setDate(anchorDate.getDate() + dayOffset);
+  }
+
+  try {
+    const rows = await getTimeEntries(ownerId, name, 'day', anchorDate);
+    const lastOut = [...rows].reverse().find(r => r.type === 'punch_out');
+    if (lastOut) return new Date(lastOut.timestamp);
+  } catch (_) {
+    // ignore and fallback below
+  }
+
+  if (dayOffset === 0) {
+    return new Date(); // now
+  } else {
+    // Yesterday 5:00 PM local → UTC
+    return zonedDayTimeToUtc(tz, 17, 0, dayOffset);
+  }
+}
+
+async function handleBatchBreaks(raw, tz, ownerId, jobName) {
+  const m = raw.match(RE_BATCH);
+  if (!m) return null;
+
+  const names = splitNames(m.groups.names || '').slice(0, BATCH_LIMIT);
+  if (!names.length) return { handled: false };
+
+  const bMin = safeMinutes(m.groups.bmin);
+  const lMin = safeMinutes(m.groups.lmin);
+  const dayWord = (m.groups.day || '').toLowerCase();
+  const dayOffset = dayWord === 'yesterday' ? -1 : 0;
+
+  const results = [];
+
+  for (const name of names) {
+    const endAnchor = await computeAnchorEnd(ownerId, name, tz, dayOffset);
+
+    const gapMs   = GAP_MINUTES * 60 * 1000;
+    const lMs     = lMin * 60 * 1000;
+    const bMs     = bMin * 60 * 1000;
+
+    // Place lunch ending at anchor, break before that with a small gap
+    const lunchEnd   = new Date(endAnchor.getTime());
+    const lunchStart = new Date(lunchEnd.getTime() - lMs);
+    const breakEnd   = new Date(lunchStart.getTime() - gapMs);
+    const breakStart = new Date(breakEnd.getTime() - bMs);
+
+    // Store four events: break_start/break_end, lunch_start/break_end (we normalize lunch to "break" types)
+    await logTimeEntry(ownerId, name, 'break_start', breakStart.toISOString(), jobName || null);
+    await logTimeEntry(ownerId, name, 'break_end',   breakEnd.toISOString(),   jobName || null);
+    await logTimeEntry(ownerId, name, 'break_start', lunchStart.toISOString(), jobName || null); // lunch start
+    await logTimeEntry(ownerId, name, 'break_end',   lunchEnd.toISOString(),   jobName || null); // lunch end
+
+    results.push({ name, break: bMin, lunch: lMin, lunchEnd });
+  }
+
+  return { handled: true, names, bMin, lMin, when: results[0]?.lunchEnd || new Date() };
+}
+
+// ------------------------------- main handler -------------------------------
 
 async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   try {
@@ -196,6 +288,23 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     const raw = norm(input);
     const lc  = normalizeInput(raw); // keep the legacy lowercasing/cleanup too
     const tz  = getUserTz(userProfile);
+
+    // Job context: explicit tail > active job > null
+    const jobOverride = extractJobHint(raw);
+    let jobName = jobOverride && jobOverride.trim() ? jobOverride.trim() : null;
+    if (!jobName) {
+      const activeJob = await getActiveJob(ownerId);
+      jobName = activeJob && activeJob !== 'Uncategorized' ? activeJob : null;
+    }
+
+    // 0) Batch "took a 15 minute break then a 30 minute lunch" (possibly multiple names)
+    const batch = await handleBatchBreaks(raw, tz, ownerId, jobName);
+    if (batch?.handled) {
+      const who = batch.names.join(', ');
+      const dayStr = formatInTimeZone(batch.when, tz, 'MMM d');
+      const reply = `✅ Logged ${batch.bMin} min break and ${batch.lMin} min lunch for ${who}${jobName ? ` on ${jobName}` : ''} (${dayStr}).`;
+      return res.send(`<Response><Message>${reply}</Message></Response>`);
+    }
 
     // 1) Hours query
     const hoursQ = parseHoursQuery(lc, (userProfile && userProfile.name) || '');
@@ -221,7 +330,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    // 2) Action entry (punch/clock/break/lunch/drive) — tolerant patterns
+    // 2) Single action entry (punch/clock/break/lunch/drive) — tolerant patterns
     let match = null;
     let action = null;
 
@@ -237,7 +346,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     }
 
     if (!match || !action) {
-      const reply = '⚠ Invalid time entry. Use: "[Name] punched in at 9am" or "[Name] hours week".';
+      const reply = '⚠️ Invalid time entry. Try e.g. "Scott punched in at 9am", "hours week", or "Scott, Joe took a 15 minute break then a 30 minute lunch".';
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
@@ -247,14 +356,6 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
 
     // Name: from regex or fallback to profile
     const who = titleCase(match.groups?.name || userProfile?.name || 'Unknown');
-
-    // Job: explicit override at tail > active job > null
-    const jobOverride = extractJobHint(raw);
-    let jobName = jobOverride && jobOverride.trim() ? jobOverride.trim() : null;
-    if (!jobName) {
-      const activeJob = await getActiveJob(ownerId);
-      jobName = activeJob && activeJob !== 'Uncategorized' ? activeJob : null;
-    }
 
     // When: if a time phrase is present, parse; else parse whole lc (yesterday/now) or fallback to now
     const timePhrase = (match.groups?.time || '').trim();
@@ -272,7 +373,6 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     const humanTime = fmtInTz(whenUtc, tz);
     const actionText = action.replace('_', ' ');
     const reply = `✅ ${actionText} logged for ${who} at ${humanTime}${jobName ? ` on ${jobName}` : ''}`;
-
     return res.send(`<Response><Message>${reply}</Message></Response>`);
   } catch (error) {
     console.error(`[ERROR] handleTimeclock failed for ${from}:`, error?.message);

@@ -7,7 +7,7 @@ const {
 
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 
-// ✨ uses shared timezone helpers
+// uses shared timezone helpers
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
 
 // ----- helpers --------------------------------------------------------------
@@ -139,27 +139,49 @@ function getUserTz(userProfile) {
 
 // ----- tolerant command patterns -------------------------------------------
 // Name-first variants, e.g. "Scott punched in at 8am"
+const NAME = String.raw`(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)`;
+const T = String.raw`(?<time>.+)?`;
+const AT = String.raw`(?:\s*(?:at|@))?\s*`;
+
 const RE_NAME_FIRST = [
-  { type: 'punch_in',  re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  // punch / clock
+  { type: 'punch_in',  re: new RegExp(`^${NAME}\\s+(?:punch(?:ed)?|clock(?:ed)?)\\s*in${AT}${T}$`, 'iu') },
+  { type: 'punch_out', re: new RegExp(`^${NAME}\\s+(?:punch(?:ed)?|clock(?:ed)?)\\s*out${AT}${T}$`, 'iu') },
 
-  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'break_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  // break/lunch: traditional "break start/end"
+  { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:break|lunch)\\s*(?:start|in|begin)?${AT}${T}$`, 'iu') },
+  { type: 'break_end',   re: new RegExp(`^${NAME}\\s+(?:break|lunch)\\s*(?:end|out|finish)?${AT}${T}$`, 'iu') },
 
-  { type: 'drive_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'drive_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  // ✅ NEW: natural phrasings
+  { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?break${AT}${T}$`, 'iu') },
+  { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?lunch${AT}${T}$`, 'iu') },
+  { type: 'break_end',   re: new RegExp(`^${NAME}\\s+(?:back\\s+from|finished|ended|done\\s+with)\\s+(?:a\\s+)?(?:break|lunch)${AT}${T}$`, 'iu') },
+
+  // drive
+  { type: 'drive_start', re: new RegExp(`^${NAME}\\s+drive\\s*(?:start|begin)?${AT}${T}$`, 'iu') },
+  { type: 'drive_end',   re: new RegExp(`^${NAME}\\s+drive\\s*(?:end|stop|finish)?${AT}${T}$`, 'iu') },
 ];
 
 // Action-first variants, e.g. "punched in at 8am", optional "for Scott"
+const FOR_NAME = String.raw`(?:\s+for\s+${NAME})?`;
+
 const RE_ACTION_FIRST = [
-  { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  // punch / clock
+  { type: 'punch_in',  re: new RegExp(`^(?:punch(?:ed)?|clock(?:ed)?)\\s*in${AT}${T}${FOR_NAME}$`, 'iu') },
+  { type: 'punch_out', re: new RegExp(`^(?:punch(?:ed)?|clock(?:ed)?)\\s*out${AT}${T}${FOR_NAME}$`, 'iu') },
 
-  { type: 'break_start', re: /^(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'break_end',   re: /^(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  // break/lunch: traditional
+  { type: 'break_start', re: new RegExp(`^(?:break|lunch)\\s*(?:start|in|begin)?${AT}${T}${FOR_NAME}$`, 'iu') },
+  { type: 'break_end',   re: new RegExp(`^(?:break|lunch)\\s*(?:end|out|finish)?${AT}${T}${FOR_NAME}$`, 'iu') },
 
-  { type: 'drive_start', re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'drive_end',   re: /^drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  // ✅ NEW: natural phrasings
+  { type: 'break_start', re: new RegExp(`^(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?break${AT}${T}${FOR_NAME}$`, 'iu') },
+  { type: 'break_start', re: new RegExp(`^(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?lunch${AT}${T}${FOR_NAME}$`, 'iu') },
+  { type: 'break_end',   re: new RegExp(`^(?:back\\s+from|finished|ended|done\\s+with)\\s+(?:a\\s+)?(?:break|lunch)${AT}${T}${FOR_NAME}$`, 'iu') },
+
+  // drive
+  { type: 'drive_start', re: new RegExp(`^drive\\s*(?:start|begin)?${AT}${T}${FOR_NAME}$`, 'iu') },
+  { type: 'drive_end',   re: new RegExp(`^drive\\s*(?:end|stop|finish)?${AT}${T}${FOR_NAME}$`, 'iu') },
 ];
 
 function dbgMatch(label, m) {

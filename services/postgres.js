@@ -32,9 +32,14 @@ function normalizePhoneNumber(phone = '') {
   return noWa.replace(/^\+/, '').trim();
 }
 
-// --- OTP & verification (moved up so exports always see them) ---
+function toAmount(x) {
+  return parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
+}
+
+// --- OTP & verification ---
 async function generateOTP(userId) {
   const normalizedId = normalizePhoneNumber(userId);
+  console.log('[DEBUG] generateOTP called:', { userId: normalizedId });
   try {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
@@ -42,6 +47,7 @@ async function generateOTP(userId) {
       `UPDATE users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
       [otp, expiry, normalizedId],
     );
+    console.log('[DEBUG] generateOTP success:', { userId: normalizedId });
     return otp;
   } catch (error) {
     console.error('[ERROR] generateOTP failed:', error.message);
@@ -51,6 +57,7 @@ async function generateOTP(userId) {
 
 async function verifyOTP(userId, otp) {
   const normalizedId = normalizePhoneNumber(userId);
+  console.log('[DEBUG] verifyOTP called:', { userId: normalizedId });
   try {
     const res = await pool.query(
       `SELECT otp, otp_expiry FROM users WHERE user_id=$1`,
@@ -58,10 +65,12 @@ async function verifyOTP(userId, otp) {
     );
     const user = res.rows[0];
     const isValid = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
-
-    if (!isValid) return false;
-
+    if (!isValid) {
+      console.log('[DEBUG] verifyOTP failed: Invalid OTP or expired');
+      return false;
+    }
     await pool.query(`UPDATE users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [normalizedId]);
+    console.log('[DEBUG] verifyOTP success:', { userId: normalizedId });
     return true;
   } catch (error) {
     console.error('[ERROR] verifyOTP failed:', error.message);
@@ -80,7 +89,16 @@ async function appendToUserSpreadsheet(ownerId, data) {
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
       RETURNING id`;
     const result = await pool.query(query, [
-      ownerId, date, item, parseFloat(amount), store, jobName, type, category, mediaUrl || null, userName,
+      ownerId,
+      date,
+      item,
+      toAmount(amount),
+      store,
+      jobName,
+      type,
+      category,
+      mediaUrl || null,
+      userName,
     ]);
     console.log('[DEBUG] appendToUserSpreadsheet success:', { id: result.rows[0].id });
     return result.rows[0].id;
@@ -91,39 +109,39 @@ async function appendToUserSpreadsheet(ownerId, data) {
 }
 
 async function saveExpense({ ownerId, date, item, amount, store, jobName, category, user, mediaUrl }) {
-  console.log('[DEBUG] saveExpense called for ownerId:', ownerId);
+  console.log('[DEBUG] saveExpense called:', { ownerId });
   try {
     await pool.query(
       `INSERT INTO transactions (owner_id, type, date, item, amount, store, job_name, category, user_name, media_url, created_at)
        VALUES ($1,'expense',$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
-      [ownerId, date, item, parseFloat(String(amount).replace('$', '')), store, jobName, category, user, mediaUrl || null],
+      [ownerId, date, item, toAmount(amount), store, jobName, category, user, mediaUrl || null],
     );
-    console.log('[DEBUG] saveExpense success for', ownerId);
+    console.log('[DEBUG] saveExpense success:', { ownerId });
   } catch (error) {
-    console.error('[ERROR] saveExpense failed for', ownerId, ':', error.message);
+    console.error('[ERROR] saveExpense failed:', error.message);
     throw error;
   }
 }
 
 async function deleteExpense(ownerId, criteria) {
-  console.log('[DEBUG] deleteExpense called for ownerId:', ownerId, ', criteria:', criteria);
+  console.log('[DEBUG] deleteExpense called:', { ownerId, criteria });
   try {
     const res = await pool.query(
       `DELETE FROM transactions
        WHERE owner_id=$1 AND type='expense' AND item=$2 AND amount=$3 AND store=$4
        RETURNING *`,
-      [ownerId, criteria.item, parseFloat(String(criteria.amount).replace('$', '')), criteria.store],
+      [ownerId, criteria.item, toAmount(criteria.amount), criteria.store],
     );
     console.log('[DEBUG] deleteExpense result:', res.rows[0]);
     return res.rows.length > 0;
   } catch (error) {
-    console.error('[ERROR] deleteExpense failed for', ownerId, ':', error.message);
+    console.error('[ERROR] deleteExpense failed:', error.message);
     return false;
   }
 }
 
 async function saveBill(ownerId, billData) {
-  console.log('[DEBUG] saveBill called for ownerId:', ownerId);
+  console.log('[DEBUG] saveBill called:', { ownerId });
   try {
     await pool.query(
       `INSERT INTO transactions (owner_id, type, date, item, amount, recurrence, job_name, category, created_at)
@@ -132,13 +150,13 @@ async function saveBill(ownerId, billData) {
         ownerId,
         billData.date,
         billData.billName,
-        parseFloat(String(billData.amount).replace('$', '')),
+        toAmount(billData.amount),
         billData.recurrence,
         billData.jobName,
         billData.category,
       ],
     );
-    console.log('[DEBUG] saveBill success for', ownerId);
+    console.log('[DEBUG] saveBill success:', { ownerId });
   } catch (error) {
     console.error('[ERROR] saveBill failed:', error.message);
     throw error;
@@ -146,7 +164,7 @@ async function saveBill(ownerId, billData) {
 }
 
 async function updateBill(ownerId, billData) {
-  console.log('[DEBUG] updateBill called for ownerId:', ownerId);
+  console.log('[DEBUG] updateBill called:', { ownerId });
   try {
     const res = await pool.query(
       `UPDATE transactions
@@ -157,9 +175,9 @@ async function updateBill(ownerId, billData) {
        WHERE owner_id=$4 AND type='bill' AND item=$5
        RETURNING *`,
       [
-        billData.amount ? parseFloat(String(billData.amount).replace('$', '')) : null,
-        billData.recurrence,
-        billData.date,
+        billData.amount != null ? toAmount(billData.amount) : null,
+        billData.recurrence || null,
+        billData.date || null,
         ownerId,
         billData.billName,
       ],
@@ -173,7 +191,7 @@ async function updateBill(ownerId, billData) {
 }
 
 async function deleteBill(ownerId, billName) {
-  console.log('[DEBUG] deleteBill called for ownerId:', ownerId);
+  console.log('[DEBUG] deleteBill called:', { ownerId });
   try {
     const res = await pool.query(
       `DELETE FROM transactions WHERE owner_id=$1 AND type='bill' AND item=$2 RETURNING *`,
@@ -188,23 +206,22 @@ async function deleteBill(ownerId, billName) {
 }
 
 async function saveRevenue(ownerId, revenueData) {
-  console.log('[DEBUG] saveRevenue called for ownerId:', ownerId);
+  console.log('[DEBUG] saveRevenue called:', { ownerId });
   try {
-    // Align to transactions schema using item/store
     await pool.query(
       `INSERT INTO transactions (owner_id, type, amount, item, store, category, date, job_name, created_at)
        VALUES ($1,'revenue',$2,$3,$4,$5,$6,$7,NOW())`,
       [
         ownerId,
-        parseFloat(String(revenueData.amount).replace('$', '')),
-        revenueData.description, // -> item
-        revenueData.source,      // -> store
+        toAmount(revenueData.amount),
+        revenueData.description,
+        revenueData.source,
         revenueData.category,
         revenueData.date,
         revenueData.jobName,
       ],
     );
-    console.log('[DEBUG] saveRevenue success for', ownerId);
+    console.log('[DEBUG] saveRevenue success:', { ownerId });
   } catch (error) {
     console.error('[ERROR] saveRevenue failed:', error.message);
     throw error;
@@ -212,14 +229,14 @@ async function saveRevenue(ownerId, revenueData) {
 }
 
 async function saveQuote(ownerId, quoteData) {
-  console.log('[DEBUG] saveQuote called for ownerId:', ownerId);
+  console.log('[DEBUG] saveQuote called:', { ownerId });
   try {
     await pool.query(
       `INSERT INTO quotes (owner_id, amount, description, client, job_name, created_at)
        VALUES ($1,$2,$3,$4,$5,NOW())`,
-      [ownerId, parseFloat(quoteData.amount), quoteData.description, quoteData.client, quoteData.jobName],
+      [ownerId, toAmount(quoteData.amount), quoteData.description, quoteData.client, quoteData.jobName],
     );
-    console.log('[DEBUG] saveQuote success for', ownerId);
+    console.log('[DEBUG] saveQuote success:', { ownerId });
   } catch (error) {
     console.error('[ERROR] saveQuote failed:', error.message);
     throw error;
@@ -243,13 +260,28 @@ async function getActiveJob(ownerId) {
   }
 }
 
+async function createJob(ownerId, jobName) {
+  console.log('[DEBUG] createJob called:', { ownerId, jobName });
+  try {
+    await pool.query(
+      `INSERT INTO jobs (owner_id, job_name, active, created_at)
+       VALUES ($1, $2, false, NOW())`,
+      [ownerId, jobName],
+    );
+    console.log('[DEBUG] createJob success');
+  } catch (error) {
+    console.error('[ERROR] createJob failed:', error.message);
+    throw error;
+  }
+}
+
 async function saveJob(ownerId, jobName, startDate) {
-  console.log('[DEBUG] saveJob called:', { ownerId, jobName });
+  console.log('[DEBUG] saveJob called:', { ownerId, jobName, startDate });
   try {
     await pool.query(
       `INSERT INTO jobs (owner_id, job_name, start_date, active, created_at)
-       VALUES ($1,$2,$3,true,NOW())`,
-      [ownerId, jobName, startDate],
+       VALUES ($1, $2, $3, true, NOW())`,
+      [ownerId, jobName, startDate || new Date()],
     );
     console.log('[DEBUG] saveJob success');
   } catch (error) {
@@ -285,38 +317,6 @@ async function finishJob(ownerId, jobName) {
     console.log('[DEBUG] finishJob success');
   } catch (error) {
     console.error('[ERROR] finishJob failed:', error.message);
-    throw error;
-  }
-}
-
-// create a job (inactive by default)
-async function createJob(ownerId, jobName) {
-  console.log('[DEBUG] createJob called:', { ownerId, jobName });
-  try {
-    await pool.query(
-      `INSERT INTO jobs (owner_id, job_name, active)
-       VALUES ($1, $2, false)`,
-      [ownerId, jobName]
-    );
-    console.log('[DEBUG] createJob success');
-  } catch (error) {
-    console.error('[ERROR] createJob failed:', error.message);
-    throw error;
-  }
-}
-
-// create & immediately mark active (optionally set start_date)
-async function saveJob(ownerId, jobName, startDate) {
-  console.log('[DEBUG] saveJob called:', { ownerId, jobName, startDate });
-  try {
-    await pool.query(
-      `INSERT INTO jobs (owner_id, job_name, start_date, active)
-       VALUES ($1, $2, $3, true)`,
-      [ownerId, jobName, startDate || new Date()]
-    );
-    console.log('[DEBUG] saveJob success');
-  } catch (error) {
-    console.error('[ERROR] saveJob failed:', error.message);
     throw error;
   }
 }
@@ -363,6 +363,26 @@ async function resumeJob(ownerId, jobName) {
   }
 }
 
+async function listOpenJobs(ownerId, limit = 3) {
+  console.log('[DEBUG] listOpenJobs called:', { ownerId, limit });
+  try {
+    const query = `
+      SELECT job_name
+      FROM jobs
+      WHERE owner_id = $1 AND (active = true OR end_date IS NULL)
+      ORDER BY created_at DESC
+      LIMIT $2
+    `;
+    const res = await pool.query(query, [ownerId, limit]);
+    const jobs = res.rows.map(row => ({ name: row.job_name }));
+    console.log('[DEBUG] listOpenJobs result:', jobs);
+    return jobs;
+  } catch (error) {
+    console.error('[ERROR] listOpenJobs failed:', error.message);
+    throw error;
+  }
+}
+
 async function summarizeJob(ownerId, jobName) {
   console.log('[DEBUG] summarizeJob called:', { ownerId, jobName });
   try {
@@ -372,8 +392,8 @@ async function summarizeJob(ownerId, jobName) {
       [ownerId, jobName],
     );
     const { start_date, end_date } = jobRes.rows[0] || {};
-    const start = start_date || new Date();
-    const end = end_date || new Date();
+    const start = start_date ? new Date(start_date) : new Date();
+    const end = end_date ? new Date(end_date) : new Date();
     const durationDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
 
     const expRes = await pool.query(
@@ -393,99 +413,36 @@ async function summarizeJob(ownerId, jobName) {
     const profit = revenue - materialCost;
     const profitMargin = revenue > 0 ? profit / revenue : 0;
 
+    // Labour hours: sum only intervals that start at punch_in
+    const timeRes = await pool.query(
+      `SELECT COALESCE(SUM(hours),0) AS hours FROM (
+         SELECT
+           CASE
+             WHEN type = 'punch_in' THEN
+               EXTRACT(EPOCH FROM (
+                 (LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job ORDER BY timestamp)) - timestamp
+               )) / 3600.0
+             ELSE 0
+           END AS hours
+         FROM time_entries
+         WHERE owner_id = $1 AND job = $2
+       ) x`,
+      [ownerId, jobName],
+    );
+    const labourHours = parseFloat(timeRes.rows[0].hours) || 0;
+
     const rateRes = await pool.query(
       `SELECT unit_cost FROM pricing_items
        WHERE owner_id=$1 AND category='labour' LIMIT 1`,
       [ownerId],
     );
     const labourRate = parseFloat(rateRes.rows[0]?.unit_cost) || 0;
-
-    const timeRes = await pool.query(
-      `SELECT COALESCE(
-         SUM(
-           EXTRACT(EPOCH FROM (LEAD(timestamp) OVER (ORDER BY timestamp) - timestamp))/3600
-         ),0) AS hours
-       FROM time_entries
-       WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName],
-    );
-    const labourHours = parseFloat(timeRes.rows[0].hours);
     const labourCost = labourHours * labourRate;
 
     console.log('[DEBUG] summarizeJob result:', { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin });
     return { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin };
   } catch (error) {
     console.error('[ERROR] summarizeJob failed:', error.message);
-    throw error;
-  }
-}
-
-// --- Pricing Items ---
-async function addPricingItem(ownerId, itemName, unitCost, unit = 'each', category = 'material') {
-  console.log('[DEBUG] addPricingItem called:', { ownerId, itemName, unitCost, unit, category });
-  try {
-    const res = await pool.query(
-      `INSERT INTO pricing_items
-        (owner_id, item_name, unit_cost, unit, category, created_at)
-       VALUES ($1,$2,$3,$4,$5,NOW())
-       RETURNING *`,
-      [ownerId, itemName, unitCost, unit, category],
-    );
-    console.log('[DEBUG] addPricingItem success:', res.rows[0]);
-    return res.rows[0];
-  } catch (error) {
-    console.error('[ERROR] addPricingItem failed:', error.message);
-    throw error;
-  }
-}
-
-async function getPricingItems(ownerId) {
-  console.log('[DEBUG] getPricingItems called:', { ownerId });
-  try {
-    const res = await pool.query(
-      `SELECT item_name, unit_cost, unit, category
-       FROM pricing_items
-       WHERE owner_id=$1`,
-      [ownerId],
-    );
-    console.log('[DEBUG] getPricingItems result:', res.rows);
-    return res.rows;
-  } catch (error) {
-    console.error('[ERROR] getPricingItems failed:', error.message);
-    throw error;
-  }
-}
-
-async function updatePricingItem(ownerId, itemName, unitCost) {
-  console.log('[DEBUG] updatePricingItem called:', { ownerId, itemName, unitCost });
-  try {
-    const res = await pool.query(
-      `UPDATE pricing_items
-       SET unit_cost=$1
-       WHERE owner_id=$2 AND item_name=$3
-       RETURNING *`,
-      [unitCost, ownerId, itemName],
-    );
-    console.log('[DEBUG] updatePricingItem result:', res.rows[0]);
-    return res.rows[0];
-  } catch (error) {
-    console.error('[ERROR] updatePricingItem failed:', error.message);
-    throw error;
-  }
-}
-
-async function deletePricingItem(ownerId, itemName) {
-  console.log('[DEBUG] deletePricingItem called:', { ownerId, itemName });
-  try {
-    await pool.query(
-      `DELETE FROM pricing_items
-       WHERE owner_id=$1 AND item_name=$2`,
-      [ownerId, itemName],
-    );
-    console.log('[DEBUG] deletePricingItem success');
-    return true;
-  } catch (error) {
-    console.error('[ERROR] deletePricingItem failed:', error.message);
     throw error;
   }
 }
@@ -515,31 +472,23 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
   }
 }
 
-/**
- * Upsert user profile with whatever fields are provided.
- * Supports stripe ids, goal_context, terms_accepted_at, etc.
- */
 async function saveUserProfile(profile) {
   const normalizedId = normalizePhoneNumber(profile.user_id);
   console.log('[DEBUG] saveUserProfile called:', { user_id: normalizedId });
-
   const data = { ...profile, user_id: normalizedId };
   const keys = Object.keys(data);
   const values = Object.values(data);
-
   const insertCols = keys.join(', ');
   const insertVals = keys.map((_, i) => `$${i + 1}`).join(', ');
   const updateSet = keys
     .filter(k => k !== 'user_id')
     .map(k => `${k}=EXCLUDED.${k}`)
     .join(', ');
-
   const sql = `
     INSERT INTO users (${insertCols})
     VALUES (${insertVals})
     ON CONFLICT (user_id) DO UPDATE SET ${updateSet}
     RETURNING *`;
-
   try {
     const result = await pool.query(sql, values);
     console.log('[DEBUG] saveUserProfile success:', result.rows[0]);
@@ -604,7 +553,7 @@ async function parseFinancialFile(fileBuffer, fileType) {
       amount: parseFloat(r.Amount || r.amount || 0).toFixed(2),
       description: r.Description || r.description || r.Item || 'Unknown',
       source: r.Source || r.source || r.Store || 'Unknown',
-      type: parseFloat(r.Amount || r.amount) >= 0 ? 'revenue' : 'expense',
+      type: toAmount(r.Amount || r.amount) >= 0 ? 'revenue' : 'expense',
     }));
     console.log('[DEBUG] parseFinancialFile result:', result);
     return result;
@@ -641,7 +590,7 @@ async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = nu
   try {
     const res = await pool.query(
       `INSERT INTO time_entries
-        (owner_id, employee_name, type, timestamp, job_name, created_at)
+        (owner_id, employee_name, type, timestamp, job, created_at)
        VALUES ($1,$2,$3,$4,$5,NOW())
        RETURNING id`,
       [ownerId, employeeName, type, timestamp, jobName],
@@ -654,13 +603,33 @@ async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = nu
   }
 }
 
+async function moveLastEntryToJob(ownerId, employeeName, jobName) {
+  console.log('[DEBUG] moveLastEntryToJob called:', { ownerId, employeeName, jobName });
+  const q = `
+    UPDATE time_entries t
+    SET job = $1
+    WHERE t.id = (
+      SELECT id FROM time_entries
+      WHERE owner_id = $2 AND employee_name = $3
+      ORDER BY timestamp DESC
+      LIMIT 1
+    )
+    RETURNING id, type, timestamp, job
+  `;
+  const { rows } = await pool.query(q, [jobName || null, ownerId, employeeName]);
+  const row = rows[0] || null;
+  console.log('[DEBUG] moveLastEntryToJob result:', row);
+  return row;
+}
+
 async function getTimeEntries(ownerId, employeeName, period = 'week', date = new Date()) {
   console.log('[DEBUG] getTimeEntries called:', { ownerId, employeeName, period, date });
   try {
     let filter;
     if (period === 'day') filter = `DATE(timestamp) = $2`;
     else if (period === 'week') filter = `DATE(timestamp) BETWEEN $2 AND $2 + INTERVAL '6 days'`;
-    else if (period === 'month') filter = `EXTRACT(MONTH FROM timestamp)=EXTRACT(MONTH FROM $2) AND EXTRACT(YEAR FROM timestamp)=EXTRACT(YEAR FROM $2)`;
+    else if (period === 'month') filter =
+      `EXTRACT(MONTH FROM timestamp)=EXTRACT(MONTH FROM $2) AND EXTRACT(YEAR FROM timestamp)=EXTRACT(YEAR FROM $2)`;
     else throw new Error('Invalid period');
 
     const q = `SELECT * FROM time_entries WHERE owner_id=$1 AND employee_name=$3 AND ${filter} ORDER BY timestamp`;
@@ -682,32 +651,33 @@ async function generateTimesheet(ownerId, employeeName, period, date) {
     let totalHours = 0;
     let driveHours = 0;
     const days = {};
-
     let lastPunchIn = null;
     let lastDriveStart = null;
 
     entries.forEach(e => {
-      const day = e.timestamp.toISOString().split('T')[0];
-      days[day] = days[day] || [];
-      days[day].push(e);
+      const ts = new Date(e.timestamp);
+      const day = ts.toISOString().split('T')[0];
+
+      (days[day] = days[day] || []).push(e);
 
       if (e.type === 'punch_in') {
-        lastPunchIn = new Date(e.timestamp);
+        lastPunchIn = ts;
       } else if (e.type === 'punch_out' && lastPunchIn) {
-        totalHours += (new Date(e.timestamp) - lastPunchIn) / (1000 * 60 * 60);
+        totalHours += (ts - lastPunchIn) / (1000 * 60 * 60);
         lastPunchIn = null;
       } else if (e.type === 'drive_start') {
-        lastDriveStart = new Date(e.timestamp);
+        lastDriveStart = ts;
       } else if (e.type === 'drive_end' && lastDriveStart) {
-        driveHours += (new Date(e.timestamp) - lastDriveStart) / (1000 * 60 * 60);
+        driveHours += (ts - lastDriveStart) / (1000 * 60 * 60);
         lastDriveStart = null;
       }
     });
 
+    console.log('[DEBUG] generateTimesheet result:', { employeeName, period, totalHours, driveHours });
     return {
       employeeName,
       period,
-      startDate: date.toISOString().split('T')[0],
+      startDate: new Date(date).toISOString().split('T')[0],
       totalHours,
       driveHours,
       company: { name: user?.name },
@@ -724,7 +694,7 @@ async function generateReport(ownerId, tier) {
   console.log('[DEBUG] generateReport called:', { ownerId, tier });
   try {
     const res = await pool.query(
-      `SELECT 
+      `SELECT
          COALESCE(SUM(CASE WHEN type='revenue' THEN amount ELSE 0 END),0) AS revenue,
          COALESCE(SUM(CASE WHEN type IN ('expense','bill') THEN amount ELSE 0 END),0) AS expenses
        FROM transactions
@@ -734,14 +704,12 @@ async function generateReport(ownerId, tier) {
     const revenue = parseFloat(res.rows[0].revenue) || 0;
     const expenses = parseFloat(res.rows[0].expenses) || 0;
     const report = { revenue, expenses, profit: revenue - expenses, tier };
-
     const reportId = crypto.randomBytes(8).toString('hex');
     await pool.query(
       `INSERT INTO reports (owner_id, report_id, data, created_at)
        VALUES ($1,$2,$3::jsonb,NOW())`,
       [ownerId, reportId, JSON.stringify(report)],
     );
-
     const url = `https://chief-ai-refactored.vercel.app/reports/${reportId}`;
     console.log('[DEBUG] generateReport success:', { url });
     return { url };
@@ -753,6 +721,7 @@ async function generateReport(ownerId, tier) {
 
 // --- Exports ---
 module.exports = {
+  pool, // Export for direct query access if needed
   appendToUserSpreadsheet,
   saveExpense,
   deleteExpense,
@@ -761,7 +730,6 @@ module.exports = {
   deleteBill,
   saveRevenue,
   saveQuote,
-
   getActiveJob,
   saveJob,
   setActiveJob,
@@ -770,30 +738,24 @@ module.exports = {
   finalizeJobCreation,
   pauseJob,
   resumeJob,
+  listOpenJobs,
   summarizeJob,
-
   addPricingItem,
   getPricingItems,
   updatePricingItem,
   deletePricingItem,
-
   createUserProfile,
   saveUserProfile,
   getUserProfile,
   getOwnerProfile,
-
   parseFinancialFile,
   parseReceiptText,
-
-  // OTP helpers (now definitely defined above)
   generateOTP,
   verifyOTP,
-
   logTimeEntry,
+  moveLastEntryToJob,   // <-- added
   getTimeEntries,
   generateTimesheet,
-
   generateReport,
-
   normalizePhoneNumber,
 };

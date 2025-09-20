@@ -1,21 +1,32 @@
+// handlers/onboarding.js
 const {
   createUserProfile,
   saveUserProfile,
   generateOTP,
   getUserProfile,
 } = require('../services/postgres');
+
 const {
   getPendingTransactionState,
   setPendingTransactionState,
   deletePendingTransactionState,
   clearUserState,
 } = require('../utils/stateManager');
+
 const { sendTemplateMessage, sendQuickReply, sendMessage } = require('../services/twilio');
 const { getValidationLists, detectLocation } = require('../utils/validateLocation');
 const { handleInputWithAI, handleError } = require('../utils/aiErrorHandler');
 const { ack } = require('../utils/http');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const PRO_PRICE_ID = process.env.PRO_PRICE_ID; // price_1RvLTOGgTkTcASeqgPQ1k8MG from .env
+const PRO_PRICE_ID = process.env.PRO_PRICE_ID;
+
+// Timezone helpers (NEW)
+const {
+  resolveTimezone,
+  isValidIanaTz,
+  suggestTimezone,
+  getUserTzFromProfile, // not used here but available if needed later
+} = require('../utils/timezones');
 
 // --- utils ---
 function normalizePhoneNumber(from = '') {
@@ -23,6 +34,7 @@ function normalizePhoneNumber(from = '') {
   const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
   return noWa.replace(/^\+/, '').trim();
 }
+
 function cap(s = '') {
   return s
     .trim()
@@ -34,12 +46,12 @@ function cap(s = '') {
 
 // Constants
 const INVALID_MAX = 3;
-
 const REQUIRED_PROFILE_FIELDS = ['user_id'];
 
 function isBlank(v) {
   return v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
 }
+
 function isProfileIncomplete(profile) {
   if (!profile) return true;
   return REQUIRED_PROFILE_FIELDS.some(k => !profile[k] || isBlank(profile[k]));
@@ -54,8 +66,9 @@ function isProfileIncomplete(profile) {
  * 3.5) manual business location input
  * 4) email + start 7-day Pro trial (best-effort) + OTP + dashboard link
  * 5) industry
- * 6) goal
- * 7) terms and conditions -> complete
+ * 6) timezone  (NEW: prefers detectLocation().timezone and validates with utils/timezones)
+ * 7) goal
+ * 8) terms and conditions -> complete
  */
 async function handleOnboarding(from, input, userProfile, ownerId, res) {
   const msgRaw = (input || '').trim();
@@ -122,6 +135,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
     }
 
     // --- STEP MACHINE ---
+
     // Step 1: capture full name
     if (state.step === 1) {
       const name = msgRaw.trim();
@@ -337,7 +351,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
 
     // Step 4: email + start 7-day Pro trial (best-effort) + OTP + dashboard link
     if (state.step === 4) {
-      const email = msgRaw.trim().toLowerCase(); // normalize to avoid dup customers
+      const email = msgRaw.trim().toLowerCase();
       if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
         state.invalidAttempts.email = (state.invalidAttempts.email || 0) + 1;
         if (state.invalidAttempts.email >= INVALID_MAX) {
@@ -359,7 +373,6 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
 
       if (process.env.STRIPE_SECRET_KEY && PRO_PRICE_ID) {
         try {
-          // Create customer if missing
           if (!stripe_customer_id) {
             const customer = await stripe.customers.create(
               {
@@ -372,7 +385,6 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
             stripe_customer_id = customer.id;
           }
 
-          // Create trialing subscription if missing
           if (!stripe_subscription_id) {
             const sub = await stripe.subscriptions.create(
               {
@@ -386,7 +398,6 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
               { idempotencyKey: `sub_${normalizedFrom}` }
             );
             stripe_subscription_id = sub.id;
-            // convert to ISO strings for DB safety
             if (sub.trial_start) trial_start = new Date(sub.trial_start * 1000).toISOString();
             if (sub.trial_end) trial_end = new Date(sub.trial_end * 1000).toISOString();
           }
@@ -397,7 +408,7 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
         console.warn('[TRIAL] Missing STRIPE_SECRET_KEY or PRO_PRICE_ID; skipping trial setup.');
       }
 
-      // Persist captured fields (don’t block if Stripe was skipped/failed)
+      // Persist captured fields
       const loc = state.responses.location || state.detectedLocation || { province: '', country: '' };
       const bloc = state.responses.business_location || loc;
       const userProfileData = {
@@ -421,14 +432,13 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
       };
       await saveUserProfile(userProfileData);
 
-      // OTP + dashboard link (fix race: get token from generator or fresh profile)
+      // OTP + dashboard link
       const otpToken = await generateOTP(normalizedFrom);
       const fresh = await getUserProfile(normalizedFrom);
       profile = fresh || userProfileData;
       const token = otpToken || fresh?.dashboard_token || null;
       const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${normalizedFrom}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
 
-      // Send link first (then the long message)
       await sendMessage(normalizedFrom, `Your financial dashboard is ready: ${dashboardUrl}`);
 
       const name = profile.name ? cap(profile.name) : 'there';
@@ -492,22 +502,86 @@ Let’s build something great.
       await saveUserProfile(profile);
       await setPendingTransactionState(normalizedFrom, state);
 
-      try {
-        await sendTemplateMessage(normalizedFrom, 'HX20b1be5490ea39f3730fb9e70d5275df', {});
-        return ack(res);
-      } catch (error) {
-        console.error('[ERROR] Template message failed:', error.message, error.code, error.moreInfo);
-        await sendQuickReply(
+      // NEW: Suggest a timezone based on the best info we have
+      const loc = state.responses.location || state.detectedLocation || { province: '', country: '' };
+      const suggestedTz =
+        state.detectedLocation?.timezone ||                // from phone/area code (most accurate)
+        profile?.timezone ||                                // if user already has one saved
+        suggestTimezone(loc.country, loc.province, state.detectedLocation?.areaCode) || // mapping fallback
+        'UTC';
+
+      await sendQuickReply(
+        normalizedFrom,
+        `Great — set industry to ${cap(industry)}. What’s your timezone? You can reply with a city (e.g., Toronto) or a timezone (e.g., America/Toronto).\nSuggested: ${suggestedTz}`,
+        [suggestedTz, 'Other']
+      );
+      return ack(res);
+    }
+
+    // Step 6: timezone (VALIDATES VIA utils/timezones)
+    if (state.step === 6) {
+      const candidate = msgRaw.trim();
+
+      // If they tapped the quick reply "Other", prompt for free text
+      if (/^other$/i.test(candidate)) {
+        await sendMessage(
           normalizedFrom,
-          `Great — set industry to ${cap(industry)}. What’s your financial goal for your business? For example, you might want to save for a big purchase, pay off debt, or grow your profits.`,
-          ['Save for a purchase', 'Pay off debt', 'Grow profits']
+          `No problem — reply with your city (e.g., "Toronto") or an IANA timezone (e.g., "America/Toronto").`
         );
         return ack(res);
       }
+
+      // Try to resolve city/state/province/abbrev/IANA -> IANA
+      let tz = resolveTimezone(candidate);
+
+      // If that failed, try using detected country/province to suggest again
+      if (!tz) {
+        const loc = state.responses.location || state.detectedLocation || { province: '', country: '' };
+        tz = suggestTimezone(loc.country, loc.province, state.detectedLocation?.areaCode) || null;
+
+        // If user typed something and we still can't validate it, treat as invalid
+        if (!isValidIanaTz(candidate) && !tz) {
+          state.invalidAttempts.timezone = (state.invalidAttempts.timezone || 0) + 1;
+          if (state.invalidAttempts.timezone >= INVALID_MAX) {
+            await deletePendingTransactionState(normalizedFrom);
+            await saveUserProfile({ ...profile, onboarding_in_progress: false });
+            await sendMessage(normalizedFrom, `Too many invalid attempts. Onboarding cancelled.`);
+            return ack(res);
+          }
+          await setPendingTransactionState(normalizedFrom, state);
+          await sendQuickReply(
+            normalizedFrom,
+            `Invalid timezone. Reply with a city (e.g., "Toronto") or an IANA timezone (e.g., "America/Toronto").`,
+            ['America/Toronto', 'America/Vancouver', 'Other']
+          );
+          return ack(res);
+        }
+      }
+
+      // Final validation guard (covers the case where tz came from candidate)
+      if (tz && !isValidIanaTz(tz)) {
+        state.invalidAttempts.timezone = (state.invalidAttempts.timezone || 0) + 1;
+        await setPendingTransactionState(normalizedFrom, state);
+        await sendMessage(normalizedFrom, `That doesn’t look like a valid timezone. Try something like "America/Toronto".`);
+        return ack(res);
+      }
+
+      profile = { ...(profile || {}), user_id: normalizedFrom, timezone: tz };
+      state.invalidAttempts.timezone = 0;
+      state.step = 7;
+      await saveUserProfile(profile);
+      await setPendingTransactionState(normalizedFrom, state);
+
+      await sendQuickReply(
+        normalizedFrom,
+        `Great — set timezone to ${tz}. What’s your financial goal for your business?`,
+        ['Save for a purchase', 'Pay off debt', 'Grow profits']
+      );
+      return ack(res);
     }
 
-    // Step 6: goal
-    if (state.step === 6) {
+    // Step 7: goal
+    if (state.step === 7) {
       const defaultData = { goal: msgRaw, amount: null, timeframe: null };
       const parseFn = input => {
         const amountMatch = input.match(/\$?([\d,]+(?:\.\d{1,2})?)/i);
@@ -564,7 +638,7 @@ Let’s build something great.
         onboarding_completed: false,
       };
       await saveUserProfile(profile);
-      state.step = 7;
+      state.step = 8;
       await setPendingTransactionState(normalizedFrom, state);
 
       await sendQuickReply(
@@ -575,8 +649,8 @@ Let’s build something great.
       return ack(res);
     }
 
-    // Step 7: terms and conditions
-    if (state.step === 7) {
+    // Step 8: terms and conditions
+    if (state.step === 8) {
       if (/^\s*(i\s+agree|agree|accept|accepted|yes|yep|yeah)\b/i.test(msg)) {
         const nextProfile = {
           ...(profile || {}),

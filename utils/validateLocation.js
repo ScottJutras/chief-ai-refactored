@@ -1,37 +1,75 @@
-const areaCodeMap = require('./areaCodes');
+// utils/validateLocation.js
+const areaCodeMap = require('./areaCodes'); // expects { [areaCode]: { country: 'Canada'|'USA'|..., state?: string, province?: string } }
+const { suggestTimezone } = require('./timezones');
 
+/**
+ * Build validation lists (still used by onboarding).
+ */
 function getValidationLists() {
-  const provinces = new Set();
-  const countries = new Set();
-  Object.values(areaCodeMap).forEach(entry => {
-    if (entry.state) provinces.add(entry.state);
-    else if (entry.province) provinces.add(entry.province);
-    countries.add(entry.country);
-  });
-  return {
-    knownProvinces: Array.from(provinces),
-    knownCountries: Array.from(countries)
-  };
+  console.log('[DEBUG] getValidationLists called');
+  try {
+    const provinces = new Set();
+    const countries = new Set();
+
+    Object.values(areaCodeMap).forEach(entry => {
+      if (entry.state) provinces.add(entry.state);
+      if (entry.province) provinces.add(entry.province);
+      if (entry.country) countries.add(entry.country === 'USA' ? 'United States' : entry.country);
+    });
+
+    const result = {
+      knownProvinces: Array.from(provinces),
+      knownCountries: Array.from(countries)
+    };
+    console.log('[DEBUG] getValidationLists result:', result);
+    return result;
+  } catch (error) {
+    console.error('[ERROR] getValidationLists failed:', error.message);
+    return { knownProvinces: [], knownCountries: [] };
+  }
 }
 
+/**
+ * Detect country/province/timezone from a phone number.
+ * Accepts formats: "whatsapp:+12223334444", "+12223334444", "12223334444", "2223334444"
+ * Defaults to Canada/Ontario/America/Toronto if unknown.
+ */
 function detectLocation(phoneNumber) {
   console.log('[DEBUG] detectLocation called:', { phoneNumber });
   try {
-    const countryCode = phoneNumber.match(/^\+(\d{1,3})/)?.[1];
-    let country = 'Canada'; // Default
-    let province = 'Ontario'; // Default
-    if (countryCode === '1') {
-      const areaCode = phoneNumber.match(/^\+1(\d{3})/)?.[1];
-      if (areaCode && areaCodeMap[areaCode]) {
-        country = areaCodeMap[areaCode].country === 'USA' ? 'United States' : areaCodeMap[areaCode].country;
-        province = areaCodeMap[areaCode].state || areaCodeMap[areaCode].province || 'Ontario';
+    const raw = String(phoneNumber || '');
+    // Strip non-digits, keep only numbers
+    const digits = raw.replace(/\D/g, '');
+
+    // Try to read NANP (+1) numbers
+    let country = 'Canada';
+    let province = 'Ontario';
+    let timezone = 'America/Toronto';
+    let areaCode = null;
+
+    if (digits.length >= 10) {
+      // If it starts with country code 1, area code is next 3
+      if (digits.length === 11 && digits.startsWith('1')) {
+        areaCode = digits.slice(1, 4);
+      } else if (digits.length === 10) {
+        // Assume NANP without country code
+        areaCode = digits.slice(0, 3);
       }
     }
-    console.log('[DEBUG] detectLocation result:', { country, province });
-    return { country, province };
+
+    if (areaCode && areaCodeMap[areaCode]) {
+      const rec = areaCodeMap[areaCode];
+      country = rec.country === 'USA' ? 'United States' : (rec.country || 'Canada');
+      province = rec.state || rec.province || province;
+      timezone = suggestTimezone(country, province, areaCode) || timezone;
+    }
+
+    const result = { country, province, timezone, areaCode };
+    console.log('[DEBUG] detectLocation result:', result);
+    return result;
   } catch (error) {
     console.error('[ERROR] detectLocation failed:', error.message);
-    return { country: 'Canada', province: 'Ontario' };
+    return { country: 'Canada', province: 'Ontario', timezone: 'America/Toronto', areaCode: null };
   }
 }
 

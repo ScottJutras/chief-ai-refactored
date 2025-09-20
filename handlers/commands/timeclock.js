@@ -5,7 +5,7 @@ const {
   getActiveJob,
 } = require('../../services/postgres');
 
-const { zonedTimeToUtc, utcToZonedTime, format } = require('date-fns-tz');
+const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 
 // ✨ uses shared timezone helpers
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
@@ -101,13 +101,9 @@ function parseTimeFromText(lc, tz) {
   return null;
 }
 
-/** Format a Date for the user’s timezone. */
+/** Format a Date for the user’s timezone (deterministic). */
 function fmtInTz(date, tz) {
-  try {
-    return format(date, 'h:mm a', { timeZone: tz });
-  } catch (_) {
-    return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz });
-  }
+  return formatInTimeZone(date, tz, 'h:mm a');
 }
 
 /** Hours query like "Scott hours week", "hours week", "Alex hours day" */
@@ -192,7 +188,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       const timesheet = await generateTimesheet(ownerId, employeeName, period, new Date());
 
       const start = timesheet.startDate
-        ? format(new Date(timesheet.startDate), 'MMM d, yyyy', { timeZone: tz })
+        ? formatInTimeZone(new Date(timesheet.startDate), tz, 'MMM d, yyyy')
         : 'N/A';
 
       const reply =
@@ -222,6 +218,10 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       const reply = '⚠ Invalid time entry. Use: "[Name] punched in at 9am" or "[Name] hours week".';
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
+
+    // Normalize lunch → break for downstream consistency
+    if (action === 'lunch_start') action = 'break_start';
+    if (action === 'lunch_end')   action = 'break_end';
 
     // Name: from regex or fallback to profile
     const who = titleCase(match.groups?.name || userProfile?.name || 'Unknown');

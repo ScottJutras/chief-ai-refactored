@@ -3,7 +3,7 @@ const {
   logTimeEntry,
   generateTimesheet,
   getActiveJob,
-  getTimeEntries,            // NEW: to anchor inserts around real-day punches
+  getTimeEntries, // used to anchor end-of-day summaries
 } = require('../../services/postgres');
 
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
@@ -139,7 +139,6 @@ function getUserTz(userProfile) {
 }
 
 // ------------------- tolerant command patterns (single) ---------------------
-// Name-first variants, e.g. "Scott punched in at 8am"
 const NAME = String.raw`(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)`;
 const T = String.raw`(?<time>.+)?`;
 const AT = String.raw`(?:\s*(?:at|@))?\s*`;
@@ -149,13 +148,10 @@ const RE_NAME_FIRST = [
   { type: 'punch_in',  re: new RegExp(`^${NAME}\\s+(?:punch(?:ed)?|clock(?:ed)?)\\s*in${AT}${T}$`, 'iu') },
   { type: 'punch_out', re: new RegExp(`^${NAME}\\s+(?:punch(?:ed)?|clock(?:ed)?)\\s*out${AT}${T}$`, 'iu') },
 
-  // break/lunch: traditional "break start/end"
+  // break/lunch: traditional + natural
   { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:break|lunch)\\s*(?:start|in|begin)?${AT}${T}$`, 'iu') },
   { type: 'break_end',   re: new RegExp(`^${NAME}\\s+(?:break|lunch)\\s*(?:end|out|finish)?${AT}${T}$`, 'iu') },
-
-  // natural phrasings
-  { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?break${AT}${T}$`, 'iu') },
-  { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?lunch${AT}${T}$`, 'iu') },
+  { type: 'break_start', re: new RegExp(`^${NAME}\\s+(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?(?:break|lunch)${AT}${T}$`, 'iu') },
   { type: 'break_end',   re: new RegExp(`^${NAME}\\s+(?:back\\s+from|finished|ended|done\\s+with)\\s+(?:a\\s+)?(?:break|lunch)${AT}${T}$`, 'iu') },
 
   // drive
@@ -174,8 +170,7 @@ const RE_ACTION_FIRST = [
   // break/lunch: traditional + natural
   { type: 'break_start', re: new RegExp(`^(?:break|lunch)\\s*(?:start|in|begin)?${AT}${T}${FOR_NAME}$`, 'iu') },
   { type: 'break_end',   re: new RegExp(`^(?:break|lunch)\\s*(?:end|out|finish)?${AT}${T}${FOR_NAME}$`, 'iu') },
-  { type: 'break_start', re: new RegExp(`^(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?break${AT}${T}${FOR_NAME}$`, 'iu') },
-  { type: 'break_start', re: new RegExp(`^(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?lunch${AT}${T}${FOR_NAME}$`, 'iu') },
+  { type: 'break_start', re: new RegExp(`^(?:took|taking|went|going)\\s+(?:on\\s+)?(?:a\\s+)?(?:break|lunch)${AT}${T}${FOR_NAME}$`, 'iu') },
   { type: 'break_end',   re: new RegExp(`^(?:back\\s+from|finished|ended|done\\s+with)\\s+(?:a\\s+)?(?:break|lunch)${AT}${T}${FOR_NAME}$`, 'iu') },
 
   // drive
@@ -187,19 +182,16 @@ function dbgMatch(label, m) {
   if (m) console.log(`[timeclock] matched ${label}:`, m.groups || {});
 }
 
-// ------------------------- batch break parser (NEW) -------------------------
+// ------------------------- batch parsers ------------------------------------
 
-// Examples handled:
-//  "Scott took a 15 minute break then a 30 minute lunch"
-//  "Scott, Joe, Justin took a 15 minute break then a 35 minute lunch yesterday"
-//  "Scott, Joe, Justin took a 15 minute break then a 35 minute lunch today"
-const RE_BATCH = new RegExp(
-  String.raw`^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+` +
-  String.raw`(?:took|had|did)\s+(?:a\s+)?(?<bmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+break\s+` +
-  String.raw`(?:then\s+(?:a\s+)?)?(?<lmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+lunch` +
-  String.raw`(?:\s+(?<day>today|yesterday))?\s*$`,
-  'iu'
-);
+// Utilities
+function extractDayOffset(text) {
+  return /\byesterday\b/i.test(text) ? -1 : 0; // default today
+}
+
+function stripDayWords(text) {
+  return text.replace(/\b(today|yesterday)\b/gi, ' ').replace(/\s{2,}/g, ' ').trim();
+}
 
 function splitNames(namesStr) {
   // turn "Scott, Joe, Justin" or "Scott, Joe and Justin" into ["Scott","Joe","Justin"]
@@ -220,18 +212,13 @@ async function computeAnchorEnd(ownerId, name, tz, dayOffset) {
   // Prefer the person's punch_out that day; else now (today) or 5:00 PM (yesterday)
   const anchorDate = new Date(); // used only as "day" token in getTimeEntries
   if (dayOffset !== 0) {
-    // anchorDate ← "yesterday" in local tz, but getTimeEntries compares DATE(timestamp) to DATE($2)
-    // Passing the shifted date is sufficient for that query shape.
     anchorDate.setDate(anchorDate.getDate() + dayOffset);
   }
-
   try {
     const rows = await getTimeEntries(ownerId, name, 'day', anchorDate);
     const lastOut = [...rows].reverse().find(r => r.type === 'punch_out');
     if (lastOut) return new Date(lastOut.timestamp);
-  } catch (_) {
-    // ignore and fallback below
-  }
+  } catch (_) { /* ignore */ }
 
   if (dayOffset === 0) {
     return new Date(); // now
@@ -241,43 +228,87 @@ async function computeAnchorEnd(ownerId, name, tz, dayOffset) {
   }
 }
 
-async function handleBatchBreaks(raw, tz, ownerId, jobName) {
-  const m = raw.match(RE_BATCH);
-  if (!m) return null;
+// A) break THEN lunch summary (two durations)
+const RE_BATCH_BREAK_THEN_LUNCH = new RegExp(
+  String.raw`^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+` +
+  String.raw`(?:took|had|did)\s+(?:a\s+)?(?<bmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+break\s+` +
+  String.raw`(?:then\s+(?:a\s+)?)?(?<lmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+lunch\s*$`,
+  'iu'
+);
 
-  const names = splitNames(m.groups.names || '').slice(0, BATCH_LIMIT);
-  if (!names.length) return { handled: false };
+// B) single summary (ONE duration): “… took a 15 minute break|lunch”
+const RE_BATCH_SINGLE = new RegExp(
+  String.raw`^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+` +
+  String.raw`(?:took|had|did)\s+(?:a\s+)?(?<min>\d{1,3})\s*(?:min|mins|minute|minutes)\s+` +
+  String.raw`(?<kind>break|lunch)\s*$`,
+  'iu'
+);
 
-  const bMin = safeMinutes(m.groups.bmin);
-  const lMin = safeMinutes(m.groups.lmin);
-  const dayWord = (m.groups.day || '').toLowerCase();
-  const dayOffset = dayWord === 'yesterday' ? -1 : 0;
+async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName) {
+  // allow "today|yesterday" anywhere
+  const dayOffset = extractDayOffset(raw);
+  const stripped = stripDayWords(raw);
 
-  const results = [];
+  // Try “break then lunch”
+  let m = stripped.match(RE_BATCH_BREAK_THEN_LUNCH);
+  if (m) {
+    const names = splitNames(m.groups.names || '').slice(0, BATCH_LIMIT);
+    if (!names.length) return { handled: false };
 
-  for (const name of names) {
-    const endAnchor = await computeAnchorEnd(ownerId, name, tz, dayOffset);
+    const bMin = safeMinutes(m.groups.bmin);
+    const lMin = safeMinutes(m.groups.lmin);
+    let whenAny = null;
 
-    const gapMs   = GAP_MINUTES * 60 * 1000;
-    const lMs     = lMin * 60 * 1000;
-    const bMs     = bMin * 60 * 1000;
+    for (const name of names) {
+      const endAnchor = await computeAnchorEnd(ownerId, name, tz, dayOffset);
 
-    // Place lunch ending at anchor, break before that with a small gap
-    const lunchEnd   = new Date(endAnchor.getTime());
-    const lunchStart = new Date(lunchEnd.getTime() - lMs);
-    const breakEnd   = new Date(lunchStart.getTime() - gapMs);
-    const breakStart = new Date(breakEnd.getTime() - bMs);
+      const gapMs   = GAP_MINUTES * 60 * 1000;
+      const lMs     = lMin * 60 * 1000;
+      const bMs     = bMin * 60 * 1000;
 
-    // Store four events: break_start/break_end, lunch_start/break_end (we normalize lunch to "break" types)
-    await logTimeEntry(ownerId, name, 'break_start', breakStart.toISOString(), jobName || null);
-    await logTimeEntry(ownerId, name, 'break_end',   breakEnd.toISOString(),   jobName || null);
-    await logTimeEntry(ownerId, name, 'break_start', lunchStart.toISOString(), jobName || null); // lunch start
-    await logTimeEntry(ownerId, name, 'break_end',   lunchEnd.toISOString(),   jobName || null); // lunch end
+      const lunchEnd   = new Date(endAnchor.getTime());
+      const lunchStart = new Date(lunchEnd.getTime() - lMs);
+      const breakEnd   = new Date(lunchStart.getTime() - gapMs);
+      const breakStart = new Date(breakEnd.getTime() - bMs);
 
-    results.push({ name, break: bMin, lunch: lMin, lunchEnd });
+      await logTimeEntry(ownerId, name, 'break_start', breakStart.toISOString(), jobName || null);
+      await logTimeEntry(ownerId, name, 'break_end',   breakEnd.toISOString(),   jobName || null);
+      await logTimeEntry(ownerId, name, 'break_start', lunchStart.toISOString(), jobName || null); // lunch
+      await logTimeEntry(ownerId, name, 'break_end',   lunchEnd.toISOString(),   jobName || null);
+
+      whenAny ||= lunchEnd;
+    }
+
+    return { handled: true, names, bMin, lMin, when: whenAny };
   }
 
-  return { handled: true, names, bMin, lMin, when: results[0]?.lunchEnd || new Date() };
+  // Try single: “… took a 15 minute break|lunch”
+  m = stripped.match(RE_BATCH_SINGLE);
+  if (m) {
+    const names = splitNames(m.groups.names || '').slice(0, BATCH_LIMIT);
+    if (!names.length) return { handled: false };
+
+    const mins = safeMinutes(m.groups.min);
+    const isLunch = (m.groups.kind || '').toLowerCase() === 'lunch';
+    let whenAny = null;
+
+    for (const name of names) {
+      const endAnchor = await computeAnchorEnd(ownerId, name, tz, dayOffset);
+      const durMs = mins * 60 * 1000;
+
+      const end   = new Date(endAnchor.getTime());
+      const start = new Date(end.getTime() - durMs);
+
+      await logTimeEntry(ownerId, name, 'break_start', start.toISOString(), jobName || null);
+      await logTimeEntry(ownerId, name, 'break_end',   end.toISOString(),   jobName || null);
+
+      whenAny ||= end;
+    }
+
+    return { handled: true, names, mins, kind: (isLunch ? 'lunch' : 'break'), when: whenAny };
+  }
+
+  return { handled: false };
 }
 
 // ------------------------------- main handler -------------------------------
@@ -297,13 +328,18 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       jobName = activeJob && activeJob !== 'Uncategorized' ? activeJob : null;
     }
 
-    // 0) Batch "took a 15 minute break then a 30 minute lunch" (possibly multiple names)
-    const batch = await handleBatchBreaks(raw, tz, ownerId, jobName);
+    // 0) Batch summaries (supports: “… break then lunch” and single “… break|lunch”)
+    const batch = await handleBatchBreaksOrLunch(raw, tz, ownerId, jobName);
     if (batch?.handled) {
       const who = batch.names.join(', ');
       const dayStr = formatInTimeZone(batch.when, tz, 'MMM d');
-      const reply = `✅ Logged ${batch.bMin} min break and ${batch.lMin} min lunch for ${who}${jobName ? ` on ${jobName}` : ''} (${dayStr}).`;
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
+      if ('bMin' in batch && 'lMin' in batch) {
+        const reply = `✅ Logged ${batch.bMin} min break and ${batch.lMin} min lunch for ${who}${jobName ? ` on ${jobName}` : ''} (${dayStr}).`;
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      } else {
+        const reply = `✅ Logged ${batch.mins} min ${batch.kind} for ${who}${jobName ? ` on ${jobName}` : ''} (${dayStr}).`;
+        return res.send(`<Response><Message>${reply}</Message></Response>`);
+      }
     }
 
     // 1) Hours query

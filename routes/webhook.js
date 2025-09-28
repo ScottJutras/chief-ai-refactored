@@ -1,36 +1,40 @@
 // routes/webhook.js
 // Serverless-safe WhatsApp webhook router for Vercel + Express
-// - No process-wide listeners here
-// - Sends proper TwiML (text/xml) if a handler forgets to reply
-// - Small hardening: only accept POST, basic size/content checks
-// - Leaves your existing handler wiring intact
 const express = require('express');
 const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
 // Handlers / services
 const commands = require('../handlers/commands');
+const tasksHandler = require('../handlers/commands/tasks'); // <-- direct import fallback
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
+
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
 const { userProfileMiddleware } = require('../middleware/userProfile');
 const { tokenMiddleware } = require('../middleware/token');
 const { errorMiddleware } = require('../middleware/error');
+
 const { sendMessage, sendTemplateMessage } = require('../services/twilio');
 const { parseUpload } = require('../services/deepDive');
 const { getPendingTransactionState, setPendingTransactionState } = require('../utils/stateManager');
 const { routeWithAI } = require('../nlp/intentRouter');
+
 const router = express.Router();
+
 /** Mask phone in logs (do NOT use for IDs) */
 function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
 }
+
 /** Ensure Twilio gets a TwiML reply if a handler forgot to res.send() */
 function ensureReply(res, text) {
   if (!res.headersSent) {
     res.status(200).type('text/xml').send(`<Response><Message>${text}</Message></Response>`);
   }
 }
+
 /** Timeclock keyword detection */
 function isTimeclockMessage(s = '') {
   const lc = String(s).toLowerCase();
@@ -44,6 +48,7 @@ function isTimeclockMessage(s = '') {
   if (/\b(break|lunch|drive|hours?)\b/.test(lc)) return true;
   return false;
 }
+
 /** Normalize to “<Name> punched in/out (at TIME)” */
 function normalizeTimeclockInput(input, userProfile) {
   const original = String(input || '');
@@ -64,6 +69,7 @@ function normalizeTimeclockInput(input, userProfile) {
   const timeHit = findTime(s);
   const timeStr = timeHit.t;
   s = timeHit.rest;
+
   let m = s.match(/^\s*([a-z][\w\s.'-]{1,50}?)\s+punched\s+(in|out)\b/i);
   if (m) return `${m[1].trim()} punched ${m[2].toLowerCase()}${timeStr ? ` at ${timeStr}` : ''}`.trim();
   m = s.match(/\bpunched\s+(in|out)\s+([a-z][\w\s.'-]{1,50}?)\b/i);
@@ -75,14 +81,29 @@ function normalizeTimeclockInput(input, userProfile) {
   }
   return timeStr ? `${s} at ${timeStr}`.trim() : original;
 }
-/** Try command handlers in safe order */
+
+/** Helper to resolve a handler by key with fallbacks */
+function getHandler(key) {
+  if (key === 'tasks') {
+    return (typeof commands.tasks === 'function') ? commands.tasks
+         : (typeof tasksHandler === 'function') ? tasksHandler
+         : null;
+  }
+  return (typeof commands[key] === 'function') ? commands[key] : null;
+}
+
+/** Try command handlers in safe order (skip timeclock unless it actually matches) */
 async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const order = ['tasks', 'job', 'timeclock', 'expense', 'revenue', 'bill', 'quote', 'metrics', 'tax', 'receipt', 'team'];
   for (const key of order) {
-    const fn = commands[key];
+    if (key === 'timeclock' && !isTimeclockMessage(input)) continue; // guard
+
+    const fn = getHandler(key);
     if (typeof fn !== 'function') continue;
+
     const out = await fn(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
     if (res.headersSent) return true;
+
     if (typeof out === 'string' && out.trim().startsWith('<Response>')) {
       res.status(200).type('text/xml').send(out);
       return true;
@@ -98,9 +119,12 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
   }
   return false;
 }
+
 // ---- ROUTES ----
+
 // Basic GET for health (Twilio occasionally pings)
 router.get('/', (_req, res) => res.status(200).send('Webhook OK'));
+
 // Main WhatsApp webhook
 router.post(
   '/',
@@ -110,16 +134,19 @@ router.post(
     if ((req.headers['content-length'] || '0') > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
     next();
   },
+
   // IMPORTANT: normalize + auth + lock before handlers
   userProfileMiddleware,
   lockMiddleware,
   tokenMiddleware,
+
   async (req, res, next) => {
     const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
     const from = req.from || String(From || '').replace(/^whatsapp:/, '').replace(/\D/g, '');
     const input = (Body || '').trim();
     const mediaUrl = MediaUrl0 || null;
     const mediaType = MediaContentType0 || null;
+
     // WhatsApp location payload
     const isLocation = (!!req.body.Latitude && !!req.body.Longitude) ||
       (req.body.MessageType && String(req.body.MessageType).toLowerCase() === 'location');
@@ -133,7 +160,9 @@ router.post(
       if (req.body.Address) extras.address = String(req.body.Address).trim() || undefined;
       console.log('[WEBHOOK] location payload:', { lat: extras.lat, lng: extras.lng, address: extras.address || null });
     }
+
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
+
     try {
       // 0) Onboarding
       if ((userProfile && userProfile.onboarding_in_progress) || input.toLowerCase().includes('start onboarding')) {
@@ -141,6 +170,7 @@ router.post(
         ensureReply(res, `Welcome to Chief AI! Quick question — what's your name?`);
         return;
       }
+
       // 1) Upgrade flow (Stripe)
       {
         const lc = input.toLowerCase();
@@ -155,14 +185,17 @@ router.post(
             const tier = lc.includes('pro') ? 'pro' : 'enterprise';
             const priceId = tier === 'pro' ? process.env.PRO_PRICE_ID : process.env.ENTERPRISE_PRICE_ID;
             const priceText = tier === 'pro' ? '$29' : '$99';
+
             const customer = await stripe.customers.create({ phone: from, metadata: { user_id: userProfile.user_id } });
             const paymentLink = await stripe.paymentLinks.create({
               line_items: [{ price: priceId, quantity: 1 }],
               metadata: { user_id: userProfile.user_id }
             });
+
             const { Pool } = require('pg');
             const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
             await pool.query(`UPDATE users SET stripe_customer_id=$1, subscription_tier=$2 WHERE user_id=$3`, [customer.id, tier, userProfile.user_id]);
+
             await sendTemplateMessage(from, process.env.HEX_UPGRADE_NOW, [`Upgrade to ${tier} for ${priceText}/month CAD: ${paymentLink.url}`]);
             ensureReply(res, 'Upgrade link sent!');
             return;
@@ -172,17 +205,21 @@ router.post(
           }
         }
       }
+
       // 2) DeepDive / historical upload
       {
         const lc = input.toLowerCase();
         const triggersDeepDive = lc.includes('upload history') || lc.includes('historical data') || lc.includes('deepdive') || lc.includes('deep dive');
+
         const tierLimits = {
           starter: { years: 7, transactions: 5000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_STARTER, parsingPriceText: '$19' },
           pro: { years: 7, transactions: 20000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_PRO, parsingPriceText: '$49' },
           enterprise: { years: 7, transactions: 50000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_ENTERPRISE, parsingPriceText: '$99' }
         };
+
         const tier = (userProfile?.subscription_tier || 'starter').toLowerCase();
         const limit = tierLimits[tier] || tierLimits.starter;
+
         if (triggersDeepDive) {
           await setPendingTransactionState(from, {
             historicalDataUpload: true,
@@ -190,6 +227,7 @@ router.post(
             maxTransactions: limit.transactions,
             uploadType: 'csv'
           });
+
           if (mediaUrl && mediaType && ['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType)) {
             try {
               if (!userProfile?.historical_parsing_purchased) {
@@ -208,13 +246,16 @@ router.post(
               return next(err);
             }
           }
+
           const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
           ensureReply(res, `Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: ${dashUrl}`);
           return;
         }
+
         // If mid DeepDive upload and sent a media file, process it here
         const deepDiveState = await getPendingTransactionState(from);
         const isInDeepDiveUpload = deepDiveState?.deepDiveUpload === true || deepDiveState?.historicalDataUpload === true;
+
         if (isInDeepDiveUpload && mediaUrl && mediaType) {
           try {
             const allowed = [
@@ -226,6 +267,7 @@ router.post(
               ensureReply(res, 'Unsupported file type. Please upload a PDF, image, audio, CSV, or Excel.');
               return;
             }
+
             if (['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType) && !userProfile?.historical_parsing_purchased) {
               const paymentLink = await stripe.paymentLinks.create({
                 line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
@@ -237,9 +279,11 @@ router.post(
               ensureReply(res, 'DeepDive payment link sent!');
               return;
             }
+
             const fileResp = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
             const buffer = Buffer.from(fileResp.data);
             const filename = mediaUrl.split('/').pop() || 'upload';
+
             const summary = await parseUpload(
               buffer,
               filename,
@@ -248,6 +292,7 @@ router.post(
               deepDiveState.uploadType || 'csv',
               userProfile?.fiscal_year_start
             );
+
             if (deepDiveState.historicalDataUpload) {
               const transactionCount = summary?.transactions?.length || 0;
               if (transactionCount > (deepDiveState.maxTransactions || limit.transactions)) {
@@ -261,6 +306,7 @@ router.post(
               await setPendingTransactionState(from, deepDiveState);
               return;
             }
+
             ensureReply(res, `File received and processed. ${summary ? 'Summary: ' + JSON.stringify(summary) : 'OK'}.`);
             deepDiveState.deepDiveUpload = false;
             await setPendingTransactionState(from, deepDiveState);
@@ -271,20 +317,51 @@ router.post(
           }
         }
       }
+
       // 3) Media (non-DeepDive)
       if (mediaUrl && mediaType) {
         await handleMedia(from, mediaUrl, mediaType, userProfile, ownerId, ownerProfile, isOwner, res);
         ensureReply(res, 'Got your file — processing complete.');
         return;
       }
-      // 4) Timeclock (direct keywords)
+
+      // 4) TASKS (fast path) — catch "task ..." / "tasks ..." / "todo ..."
+      {
+        const m = input.match(/^\s*(tasks?|todo)\b[:\-]?\s*(.*)$/i);
+        if (m) {
+          const rest = m[2] && m[2].trim() ? m[2].trim() : '';
+          const normalized = rest ? `task - ${rest}` : 'task';
+          const tasksFn = getHandler('tasks');
+          if (typeof tasksFn === 'function') {
+            console.log('[ROUTER] Fast tasks path hit:', { from, normalized });
+            try {
+              const handled = await tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              if (handled !== false) {
+                if (!res.headersSent) ensureReply(res, '');
+                return;
+              }
+            } catch (e) {
+              console.error('[ERROR] tasks handler threw:', e?.message);
+            }
+          } else {
+            console.warn('[ROUTER] tasks handler not found in registry; using fallback failed.');
+          }
+          // Avoid misrouting to timeclock if we clearly meant tasks
+          ensureReply(res, `Try "task - buy tape" or "task - order nails".`);
+          return;
+        }
+      }
+
+      // 5) Timeclock (direct keywords)
       if (isTimeclockMessage(input)) {
+        console.log('[ROUTER] Direct timeclock path hit:', { from, input });
         const normalized = normalizeTimeclockInput(input, userProfile);
         await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
         if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
         return;
       }
-      // 5) AI intent router
+
+      // 6) AI intent router
       try {
         const ai = await routeWithAI(input, { userProfile });
         if (ai) {
@@ -327,7 +404,8 @@ router.post(
       } catch (e) {
         console.warn('[AI Router] skipped due to error:', e?.message);
       }
-      // 6) Fast intent router for jobs
+
+      // 7) Fast intent router for jobs
       if (/^\s*(create|new|add)\s+job\b/i.test(input) || /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)) {
         if (typeof commands.job === 'function') {
           try {
@@ -343,12 +421,14 @@ router.post(
           console.warn('[WARN] commands.job not callable; exports:', Object.keys(commands || {}));
         }
       }
-      // 7) General dispatch
+
+      // 8) General dispatch (with timeclock guard inside)
       {
         const handled = await dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
         if (handled) return;
       }
-      // 8) Legacy combined handler
+
+      // 9) Legacy combined handler
       if (typeof commands.handleCommands === 'function') {
         try {
           const handled = await commands.handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
@@ -357,6 +437,7 @@ router.post(
           console.error('[ERROR] handleCommands threw:', e?.message);
         }
       }
+
       // Fallback helper
       ensureReply(res, "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', 'task - buy tape', or 'help'.");
       return;
@@ -372,7 +453,9 @@ router.post(
       }
     }
   },
+
   // Centralized error handler (keep last)
   errorMiddleware
 );
+
 module.exports = router;

@@ -1,43 +1,41 @@
 // index.js
-require('dotenv').config();
+if (!process.env.VERCEL) { require('dotenv').config(); } // local only
+
 const express = require('express');
 const bodyParser = require('body-parser');
 
-console.log('[BOOT] Starting Chief AI...');
+const webhookRouter = require('./routes/webhook');
+const parseRouter = require('./routes/parse');
+const deepDiveRouter = require('./routes/deepDive');
+const dashboardRouter = require('./routes/dashboard');
+// If you still need exports endpoints, uncomment the next line:
+// const exportsRouter = require('./routes/exports');
 
 const app = express();
-app.set('trust proxy', true);
 
-// 📥 GLOBAL LOGGER: logs every incoming request
-app.use((req, res, next) => {
-  console.log(`[INCOMING] ${req.method} ${req.originalUrl}`);
-  next();
-});
-
+// Basic hardening & parsing
+app.disable('x-powered-by');
 app.use(bodyParser.urlencoded({ extended: false, limit: '50mb' }));
 app.use(bodyParser.json({ limit: '50mb' }));
 
-// Health check (for uptime monitors)
-app.get('/healthz', (_req, res) => res.status(200).send('ok'));
-
-// Mount routers
-app.get('/', (_req, res) => {
-  res.send('👋 Chief AI Webhook Server is up!');
+app.get('/', (req, res) => {
+  console.log('[DEBUG] GET request received at root URL');
+  res.set('Cache-Control', 'no-store').send('Chief AI Webhook Server is running!');
 });
 
-app.use('/api/webhook', require('./routes/webhook'));
-app.use('/parse', require('./routes/parse'));
-app.use('/deep-dive', require('./routes/deepDive'));
-app.use('/dashboard', require('./routes/dashboard'));
-app.use('/exports', require('./routes/exports'));
+// IMPORTANT: Twilio path must match your Twilio console
+app.use('/api/webhook', webhookRouter);
+app.use('/parse', parseRouter);
+app.use('/deep-dive', deepDiveRouter);
+app.use('/dashboard', dashboardRouter);
+// if (exportsRouter) app.use('/exports', exportsRouter);
 
-// Catch-all 404 logger
-app.use((req, res) => {
-  console.warn(`[404] No route for ${req.method} ${req.originalUrl}`);
-  res.status(404).send('Not Found');
-});
+// Only listen locally; Vercel uses serverless handler
+if (!process.env.VERCEL) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`✅ Server is running on port ${PORT}`);
+  });
+}
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server listening on port ${PORT}`);
-});
+module.exports = app;

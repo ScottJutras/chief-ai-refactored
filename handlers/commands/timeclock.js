@@ -3,59 +3,84 @@ const {
   logTimeEntry,
   generateTimesheet,
   getActiveJob,
-  // new helpers:
   createTimePrompt,
   getPendingPrompt,
   clearPrompt,
   getOpenShift,
   getOpenBreakSince,
   closeOpenBreakIfAny,
+  getTimeEntries,
+  exportTimesheetXlsx,
+  exportTimesheetPdf,
+  createTimeEditRequestTask,
+  pool,
 } = require('../../services/postgres');
-
-const { zonedTimeToUtc, utcToZonedTime, format } = require('date-fns-tz');
-// shared tz helpers
+const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
 
-// ---------- small utils ----------
-const titleCase = (s='') => String(s).trim().split(/\s+/).map(w=>w.charAt(0).toUpperCase()+w.slice(1)).join(' ');
-const norm = (msg='') => String(msg)
-  .normalize('NFKC')
-  .replace(/[\u00A0\u2007\u202F]/g, ' ')
-  .replace(/\s{2,}/g, ' ')
-  .trim();
+// ---------- Subscription tier limits to prevent DB spam ----------
+const TIME_ENTRY_LIMITS = {
+  starter: { maxEntriesPerDay: 50 },
+  pro: { maxEntriesPerDay: 200 },
+  enterprise: { maxEntriesPerDay: 1000 },
+};
 
+// ---------- Small utils ----------
+const titleCase = (s='') => String(s).trim().split(/\s+/).map(w=>w.charAt(0).toUpperCase()+w.slice(1)).join(' ');
+const norm = (msg='') => String(msg).normalize('NFKC').replace(/[\u00A0\u2007\u202F]/g, ' ').replace(/\s{2,}/g, ' ').trim();
+
+function sanitizeInput(text) {
+  return String(text || '').replace(/[<>"'&]/g, '').trim().slice(0, 100);
+}
 function normalizeInput(raw) {
   let lc = String(raw || '').trim().toLowerCase();
-  lc = lc.replace(/\bclock(?:ed)?\s+(our|or)\b/g, 'clocked out'); // common autocorrect
+  lc = lc.replace(/\bclock(?:ed)?\s+(our|or)\b/g, 'clocked out');
   return lc.replace(/\s{2,}/g, ' ').trim();
 }
 
-function extractJobHint(text = '') {
+function extractJobHint(text='') {
   let m = text.match(/@\s*([^\n\r]+)$/i);
-  if (m) return m[1].trim();
+  if (m) return sanitizeInput(m[1].trim());
   m = text.match(/\bon\s+([A-Za-z0-9].+)$/i);
-  if (m) return m[1].trim();
+  if (m) return sanitizeInput(m[1].trim());
   return null;
 }
+function parseEmployeeFor(text) {
+  const m = text.match(/\bfor\s+([A-Za-z][A-Za-z.'\- ]{0,60})\b/i);
+  return m ? titleCase(sanitizeInput(m[1].trim())) : null;
+}
 
-// ---------- time parsing ----------
+// ---------- Owner/day limit (safer + avoids miscount by employee) ----------
+async function checkTimeEntryLimit(ownerId, tier) {
+  const limit =
+    TIME_ENTRY_LIMITS[String(tier || 'starter').toLowerCase()]?.maxEntriesPerDay
+    || TIME_ENTRY_LIMITS.starter.maxEntriesPerDay;
+
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) AS count
+       FROM time_entries
+      WHERE owner_id = $1
+        AND DATE(created_at AT TIME ZONE 'UTC') = CURRENT_DATE`,
+    [ownerId]
+  );
+  return parseInt(rows[0]?.count || '0', 10) < limit;
+}
+
+// ---------- Time parsing ----------
 function zonedDayTimeToUtc(tz, hours, minutes, dayOffset = 0) {
   const now = new Date();
   const zNow = utcToZonedTime(now, tz);
   zNow.setDate(zNow.getDate() + (dayOffset || 0));
-  const y = zNow.getFullYear();
-  const m = String(zNow.getMonth() + 1).padStart(2, '0');
-  const d = String(zNow.getDate()).padStart(2, '0');
+  const y  = zNow.getFullYear();
+  const mo = String(zNow.getMonth() + 1).padStart(2, '0');
+  const d  = String(zNow.getDate()).padStart(2, '0');
   const hh = String(hours).padStart(2, '0');
   const mm = String(minutes).padStart(2, '0');
-  const localStr = `${y}-${m}-${d} ${hh}:${mm}:00`;
-  return zonedTimeToUtc(localStr, tz);
+  return zonedTimeToUtc(`${y}-${mo}-${d} ${hh}:${mm}:00`, tz);
 }
-
 function parseTimeFromText(lc, tz) {
   const dayOffset = /\byesterday\b/.test(lc) ? -1 : 0;
 
-  // 8am / 8:15 pm / at 7 pm
   let m = lc.match(/\b(?:at|@)?\s*(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/i);
   if (m) {
     let hour = parseInt(m[1], 10);
@@ -65,8 +90,6 @@ function parseTimeFromText(lc, tz) {
     if (ampm.includes('a') && hour === 12) hour = 0;
     return zonedDayTimeToUtc(tz, hour, minute, dayOffset);
   }
-
-  // 730pm (no colon)
   m = lc.match(/\b(?:at|@)?\s*(\d{1,2})(\d{2})\s*(a\.?m\.?|p\.?m\.?|am|pm)\b/i);
   if (m) {
     let hour = parseInt(m[1], 10);
@@ -76,8 +99,6 @@ function parseTimeFromText(lc, tz) {
     if (ampm.includes('a') && hour === 12) hour = 0;
     return zonedDayTimeToUtc(tz, hour, minute, dayOffset);
   }
-
-  // 24h: 19:30
   m = lc.match(/\b(?:at|@)?\s*(\d{1,2}):(\d{2})\b/);
   if (m) {
     const hour = parseInt(m[1], 10);
@@ -86,21 +107,15 @@ function parseTimeFromText(lc, tz) {
       return zonedDayTimeToUtc(tz, hour, minute, dayOffset);
     }
   }
-
-  // 'now'
   if (/\bnow\b/.test(lc)) return new Date();
   return null;
 }
-
 function fmtInTz(date, tz) {
-  try {
-    return format(date, 'h:mm a', { timeZone: tz });
-  } catch (_) {
-    return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz });
-  }
+  try { return formatInTimeZone(date, tz, 'h:mm a'); }
+  catch { return date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz }); }
 }
 
-// ---------- period query ----------
+// ---------- Period query ----------
 function parseHoursQuery(lcInput, fallbackName) {
   if (!/\bhours?\b/i.test(lcInput)) return null;
   if (!/\b(day|week|month)\b/i.test(lcInput)) return null;
@@ -108,13 +123,11 @@ function parseHoursQuery(lcInput, fallbackName) {
   let period = parts.find(p => /^(day|week|month)$/i.test(p));
   period = period ? period.toLowerCase() : 'week';
   let employeeName = fallbackName || '';
-  if (!/^hours?\b/i.test(lcInput)) {
-    employeeName = titleCase(parts[0]); // e.g. "scott" → "Scott"
-  }
+  if (!/^hours?\b/i.test(lcInput)) employeeName = titleCase(sanitizeInput(parts[0]));
   return { employeeName: employeeName || fallbackName || '', period };
 }
 
-// ---------- tz resolver ----------
+// ---------- TZ resolver ----------
 function getUserTz(userProfile) {
   if (typeof getUserTzFromProfile === 'function') {
     const tz = getUserTzFromProfile(userProfile);
@@ -127,101 +140,57 @@ function getUserTz(userProfile) {
 }
 
 // ---------- tolerant command patterns ----------
-// Name-first, strict verbs (prevents “Scott Took A” being swallowed into the name)
 const RE_NAME_FIRST = [
-  { type: 'punch_in',  re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-
-  // “Scott break start at … / lunch start …”
+  { type: 'punch_in',    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'punch_out',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
   { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
   { type: 'break_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-
-  // Natural: “Scott took a 15 minute break/lunch at 4:30pm”
-  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+took\s+(?:a|an)?\s*(?<dur>\d+\s*(?:min(?:ute)?s?)?)?\s*(?:break|lunch)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
-
-  // drive
   { type: 'drive_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
   { type: 'drive_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
 ];
-
-// Action-first, optional “for Name”
 const RE_ACTION_FIRST = [
-  { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-
+  { type: 'punch_in',    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'punch_out',   re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
   { type: 'break_start', re: /^(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
   { type: 'break_end',   re: /^(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-
   { type: 'drive_start', re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
   { type: 'drive_end',   re: /^drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 ];
 
-function dbgMatch(label, m) {
-  if (m) console.log(`[timeclock] matched ${label}:`, m.groups || {});
-}
+// Time edit request pattern
+const RE_TIME_EDIT = /^(?:adjust|fix|edit)\s+(?:last)?\s*(?:punch|clock|break|lunch|drive)\s*(?:in|out|start|end)?\s*(?:by)?\s*([+-]?\d{1,3})\s*(?:min|minutes)\b/i;
+
+function dbgMatch(label, m) { if (m) console.log(`[timeclock] matched ${label}:`, m.groups || {}); }
 
 // ---------- batch parsers ----------
-// Utilities
-function extractDayOffset(text) {
-  return /\byesterday\b/i.test(text) ? -1 : 0; // default today
-}
-function stripDayWords(text) {
-  return text.replace(/\b(today|yesterday)\b/gi, ' ').replace(/\s{2,}/g, ' ').trim();
-}
-function splitNames(namesStr) {
-  const s = namesStr.replace(/\s+and\s+/gi, ',');
-  return s.split(',').map(x => titleCase(x.trim())).filter(Boolean);
-}
+function extractDayOffset(text) { return /\byesterday\b/i.test(text) ? -1 : 0; }
+function stripDayWords(text) { return text.replace(/\b(today|yesterday)\b/gi, ' ').replace(/\s{2,}/g, ' ').trim(); }
+function splitNames(namesStr) { const s = namesStr.replace(/\s+and\s+/gi, ','); return s.split(',').map(x => titleCase(sanitizeInput(x.trim()))).filter(Boolean); }
 
-const BATCH_LIMIT = 10;
-const MAX_MINUTES = 240;
-const GAP_MINUTES = 5;
-function safeMinutes(n) {
-  const v = Math.max(1, Math.min(MAX_MINUTES, parseInt(n, 10) || 0));
-  return v;
-}
+const BATCH_LIMIT = 10, MAX_MINUTES = 240, GAP_MINUTES = 5;
+function safeMinutes(n) { return Math.max(1, Math.min(MAX_MINUTES, parseInt(n, 10) || 0)); }
 
 async function computeAnchorEnd(ownerId, name, tz, dayOffset) {
-  // Prefer the person's punch_out that day; else now (today) or 5:00 PM (yesterday)
   const anchorDate = new Date();
-  if (dayOffset !== 0) {
-    anchorDate.setDate(anchorDate.getDate() + dayOffset);
-  }
+  if (dayOffset !== 0) anchorDate.setDate(anchorDate.getDate() + dayOffset);
   try {
-    const rows = await getTimeEntries(ownerId, name, 'day', anchorDate);
+    const rows = await getTimeEntries(ownerId, name, 'day', anchorDate, tz);
     const lastOut = [...rows].reverse().find(r => r.type === 'punch_out');
     if (lastOut) return new Date(lastOut.timestamp);
-  } catch (_) {}
+  } catch {}
   return dayOffset === 0 ? new Date() : zonedDayTimeToUtc(tz, 17, 0, dayOffset);
 }
 
-// A) break THEN lunch summary (two durations)
-const RE_BATCH_BREAK_THEN_LUNCH = new RegExp(
-  String.raw`^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+` +
-  String.raw`(?:took|had|did)\s+(?:a\s+)?(?<bmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+break\s+` +
-  String.raw`(?:then\s+(?:a\s+)?)?(?<lmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+lunch\s*$`,
-  'iu'
-);
-
-// B) single summary (ONE duration): “… took a 15 minute break|lunch”
-const RE_BATCH_SINGLE = new RegExp(
-  String.raw`^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+` +
-  String.raw`(?:took|had|did)\s+(?:a\s+)?(?<min>\d{1,3})\s*(?:min|mins|minute|minutes)\s+` +
-  String.raw`(?<kind>break|lunch)\s*$`,
-  'iu'
-);
-
-async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName) {
-  // allow "today|yesterday" anywhere
+async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras) {
   const dayOffset = extractDayOffset(raw);
   const stripped = stripDayWords(raw);
 
-  // Try “break then lunch”
-  let m = stripped.match(RE_BATCH_BREAK_THEN_LUNCH);
+  let m = stripped.match(
+    /^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+(?:took|had|did)\s+(?:a\s+)?(?<bmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+break\s+(?:then\s+(?:a\s+)?)?(?<lmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+lunch\s*$/iu
+  );
   if (m) {
     const names = splitNames(m.groups.names || '').slice(0, BATCH_LIMIT);
     if (!names.length) return { handled: false };
-
     const bMin = safeMinutes(m.groups.bmin);
     const lMin = safeMinutes(m.groups.lmin);
     let whenAny = null;
@@ -231,34 +200,30 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName) {
       if (!openShift) return { handled: false, error: `${name} isn’t clocked in. Punch in first.` };
 
       const endAnchor = await computeAnchorEnd(ownerId, name, tz, dayOffset);
-      const gapMs   = GAP_MINUTES * 60 * 1000;
-      const lMs     = lMin * 60 * 1000;
-      const bMs     = bMin * 60 * 1000;
+      const gapMs = GAP_MINUTES * 60 * 1000, lMs = lMin * 60 * 1000, bMs = bMin * 60 * 1000;
 
       const lunchEnd   = new Date(endAnchor.getTime());
       const lunchStart = new Date(lunchEnd.getTime() - lMs);
       const breakEnd   = new Date(lunchStart.getTime() - gapMs);
       const breakStart = new Date(breakEnd.getTime() - bMs);
 
-      await logTimeEntry(ownerId, name, 'break_start', breakStart.toISOString(), jobName || null);
-      await logTimeEntry(ownerId, name, 'break_end',   breakEnd.toISOString(),   jobName || null);
-      await logTimeEntry(ownerId, name, 'break_start', lunchStart.toISOString(), jobName || null); // lunch
-      await logTimeEntry(ownerId, name, 'break_end',   lunchEnd.toISOString(),   jobName || null);
+      await logTimeEntry(ownerId, name, 'break_start', breakStart.toISOString(), jobName || null, tz, extras);
+      await logTimeEntry(ownerId, name, 'break_end',   breakEnd.toISOString(),   jobName || null, tz, extras);
+      await logTimeEntry(ownerId, name, 'break_start', lunchStart.toISOString(), jobName || null, tz, extras);
+      await logTimeEntry(ownerId, name, 'break_end',   lunchEnd.toISOString(),   jobName || null, tz, extras);
 
       whenAny ||= lunchEnd;
     }
-
     return { handled: true, names, bMin, lMin, when: whenAny };
   }
 
-  // Try single: “… took a 15 minute break|lunch”
-  m = stripped.match(RE_BATCH_SINGLE);
+  m = stripped.match(
+    /^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+(?:took|had|did)\s+(?:a\s+)?(?<min>\d{1,3})\s*(?:min|mins|minute|minutes)\s+(?<kind>break|lunch)\s*$/iu
+  );
   if (m) {
     const names = splitNames(m.groups.names || '').slice(0, BATCH_LIMIT);
     if (!names.length) return { handled: false };
-
     const mins = safeMinutes(m.groups.min);
-    const isLunch = (m.groups.kind || '').toLowerCase() === 'lunch';
     let whenAny = null;
 
     for (const name of names) {
@@ -267,38 +232,87 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName) {
 
       const endAnchor = await computeAnchorEnd(ownerId, name, tz, dayOffset);
       const durMs = mins * 60 * 1000;
-
       const end   = new Date(endAnchor.getTime());
       const start = new Date(end.getTime() - durMs);
 
-      await logTimeEntry(ownerId, name, 'break_start', start.toISOString(), jobName || null);
-      await logTimeEntry(ownerId, name, 'break_end',   end.toISOString(),   jobName || null);
+      await logTimeEntry(ownerId, name, 'break_start', start.toISOString(), jobName || null, tz, extras);
+      await logTimeEntry(ownerId, name, 'break_end',   end.toISOString(),   jobName || null, tz, extras);
 
       whenAny ||= end;
     }
-
-    return { handled: true, names, mins, kind: (isLunch ? 'lunch' : 'break'), when: whenAny };
+    return { handled: true, names, mins, kind: 'break', when: whenAny };
   }
 
   return { handled: false };
 }
 
-// ---------- summary (for punch_out confirmation) ----------
+// ---------- "last week"/"this week" date range ----------
+const WEEK_STARTS_ON = 1;
+function localMidnight(date, tz) {
+  const y = date.getFullYear(), m = String(date.getMonth()+1).padStart(2,'0'), d = String(date.getDate()).padStart(2,'0');
+  return zonedTimeToUtc(`${y}-${m}-${d} 00:00:00`, tz);
+}
+function localEndOfDay(date, tz) {
+  const y = date.getFullYear(), m = String(date.getMonth()+1).padStart(2,'0'), d = String(date.getDate()).padStart(2,'0');
+  return zonedTimeToUtc(`${y}-${m}-${d} 23:59:59`, tz);
+}
+function getLocalWeekRange(tz, which='current') {
+  const nowUtc = new Date();
+  const localNow = utcToZonedTime(nowUtc, tz);
+  const local = new Date(localNow.getTime()); local.setHours(0,0,0,0);
+  const day = local.getDay();
+  const diffToStart = (day - WEEK_STARTS_ON + 7) % 7;
+  const startLocal = new Date(local);
+  startLocal.setDate(local.getDate() - diffToStart - (which === 'last' ? 7 : 0));
+  const endLocal = new Date(startLocal); endLocal.setDate(startLocal.getDate() + 6); endLocal.setHours(23,59,59,999);
+  return { start: localMidnight(startLocal, tz), end: localEndOfDay(endLocal, tz) };
+}
+
+const MONTHS = {
+  january:0,february:1,march:2,april:3,may:4,june:5,july:6,august:7,september:8,sept:8,october:9,november:10,december:11,
+  jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11,
+};
+function parseDateRangeFromText(text, tz) {
+  const s = String(text || '').toLowerCase();
+
+  if (/\b(last|previous)\s+week\b/.test(s)) return getLocalWeekRange(tz, 'last');
+  if (/\bthis\s+week\b/.test(s)) return getLocalWeekRange(tz, 'current');
+
+  let m = s.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})\s*[-–to]+\s*(\d{1,2}),?\s*(\d{4})\b/i);
+  if (m) {
+    const month = MONTHS[m[1].toLowerCase()], d1 = +m[2], d2 = +m[3], y = +m[4];
+    const startLocal = new Date(y, month, d1, 0,0,0,0);
+    const endLocal   = new Date(y, month, d2, 23,59,59,999);
+    return { start: localMidnight(startLocal, tz), end: localEndOfDay(endLocal, tz) };
+  }
+  m = s.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2}),?\s*(\d{4})\s*(?:to|-\s*)\s*(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2}),?\s*(\d{4})\b/i);
+  if (m) {
+    const m1 = MONTHS[m[1].toLowerCase()], d1 = +m[2], y1 = +m[3];
+    const m2 = MONTHS[m[4].toLowerCase()], d2 = +m[5], y2 = +m[6];
+    const startLocal = new Date(y1, m1, d1, 0,0,0,0);
+    const endLocal   = new Date(y2, m2, d2, 23,59,59,999);
+    return { start: localMidnight(startLocal, tz), end: localEndOfDay(endLocal, tz) };
+  }
+  m = s.match(/\b(\d{4})-(\d{2})-(\d{2})\s*(?:to|-\s*)\s*(\d{4})-(\d{2})-(\d{2})\b/);
+  if (m) {
+    const startLocal = new Date(+m[1], +m[2]-1, +m[3], 0,0,0,0);
+    const endLocal   = new Date(+m[4], +m[5]-1, +m[6], 23,59,59,999);
+    return { start: localMidnight(startLocal, tz), end: localEndOfDay(endLocal, tz) };
+  }
+  return null;
+}
+
+// ---------- summary ----------
 function summarizeShiftFromEntries(entries, punchInUtcIso, punchOutUtcIso) {
-  // filter within [punchIn, punchOut]
   const startMs = new Date(punchInUtcIso).getTime();
   const endMs   = new Date(punchOutUtcIso).getTime();
   const inRange = entries.filter(e => {
     const t = new Date(e.timestamp).getTime();
     return t >= startMs && t <= endMs;
   });
-
   let breakMinutes = 0;
   let lastBreakStart = null;
-
-  // order by time just in case
-  inRange.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-
+  inRange.sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));
   for (const e of inRange) {
     if (e.type === 'break_start' && !lastBreakStart) {
       lastBreakStart = new Date(e.timestamp);
@@ -307,22 +321,24 @@ function summarizeShiftFromEntries(entries, punchInUtcIso, punchOutUtcIso) {
       lastBreakStart = null;
     }
   }
-  // if a break is still open at punch-out, count it up to punch-out
-  if (lastBreakStart) {
-    breakMinutes += Math.max(0, (endMs - lastBreakStart.getTime()) / 60000);
-  }
-
+  if (lastBreakStart) breakMinutes += Math.max(0, (endMs - lastBreakStart.getTime()) / 60000);
   const shiftHours = Math.max(0, (endMs - startMs) / 3600000);
   return { shiftHours, breakMinutes: Math.round(breakMinutes) };
 }
 
 // ---------- handler ----------
-async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res, extras = {}) {
   try {
-    // Normalize early
     const raw = norm(input);
     const lc  = normalizeInput(raw);
     const tz  = getUserTz(userProfile);
+
+    // Owner/day limit check (preflight)
+    const ok = await checkTimeEntryLimit(ownerId, userProfile?.subscription_tier || 'starter');
+    if (!ok) {
+      const tier = userProfile?.subscription_tier || 'starter';
+      return res.send(`<Response><Message>⚠️ Time entry limit reached for ${tier} tier (${TIME_ENTRY_LIMITS[tier.toLowerCase()].maxEntriesPerDay}/day). Upgrade or try tomorrow.</Message></Response>`);
+    }
 
     // Job context: explicit tail > active job > null
     const jobOverride = extractJobHint(raw);
@@ -332,42 +348,71 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       jobName = activeJob && activeJob !== 'Uncategorized' ? activeJob : null;
     }
 
-    // 0) Pending prompt flow: if we previously asked for a missing clock-out time
+    // 0a) Timesheet export
+    if (/\btimes?\s*sheet\b/i.test(lc)) {
+      const range = parseDateRangeFromText(raw, tz);
+      if (!range) {
+        const help = 'Tell me a date range, e.g. "timesheet for September 15-19, 2025", "timesheet 2025-09-15 to 2025-09-19", or "timesheet for last week". Optionally: "for Scott" or "pdf".';
+        return res.send(`<Response><Message>${help}</Message></Response>`);
+      }
+      const wantsPdf   = /\bpdf\b/i.test(lc);
+      const employeeOne = parseEmployeeFor(raw);
+      const startIso = range.start.toISOString();
+      const endIso   = range.end.toISOString();
+      const exportFn = wantsPdf ? exportTimesheetPdf : exportTimesheetXlsx;
+      const { url, filename } = await exportFn({ ownerId, startIso, endIso, employeeName: employeeOne, tz });
+      const body = `📄 Timesheet ready (${startIso.slice(0,10)} → ${endIso.slice(0,10)}${employeeOne ? ` • ${employeeOne}` : ''}).\n${filename}`;
+      return res.send(`<Response><Message><Body>${body}</Body><Media>${url}</Media></Message></Response>`);
+    }
+
+    // 0b) Pending prompt flow (need clock-out time)
     const pending = await getPendingPrompt(ownerId);
     if (pending && pending.kind === 'need_clock_out_time') {
       const t = parseTimeFromText(lc, tz);
       if (!t) {
         const who = titleCase(pending.employee_name || 'the employee');
-        const askedAt = pending.context?.shiftStartUtc
-          ? fmtInTz(new Date(pending.context.shiftStartUtc), tz)
-          : 'earlier';
-        const msg = `I still need ${who}’s clock-out time for the last open shift (started ${askedAt}). Reply with a time like "5:45pm yesterday" or "4:30".`;
+        const askedAt = pending.context?.shiftStartUtc ? fmtInTz(new Date(pending.context.shiftStartUtc), tz) : 'earlier';
+        const msg = `I still need ${who}’s clock-out time for the last open shift (started ${askedAt}). Reply "5:45pm yesterday" or "4:30".`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
+      const employeeName   = pending.employee_name;
+      const shiftStartIso  = pending.context?.shiftStartUtc;
+      const punchOutUtcIso = t.toISOString();
 
-      const employeeName = pending.employee_name;
-      const shiftStartUtcIso = pending.context?.shiftStartUtc;
-      const punchOutUtcIso   = t.toISOString();
-
-      // Close any open break up to the provided punch-out time
-      if (shiftStartUtcIso) {
-        await closeOpenBreakIfAny(ownerId, employeeName, shiftStartUtcIso, punchOutUtcIso);
-      }
-
-      await logTimeEntry(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null);
+      if (shiftStartIso) await closeOpenBreakIfAny(ownerId, employeeName, shiftStartIso, punchOutUtcIso, tz);
+      await logTimeEntry(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null, tz, extras);
       await clearPrompt(pending.id);
 
-      const timesheet = await generateTimesheet(ownerId, employeeName, 'day', t);
-      const dayKey = t.toISOString().split('T')[0];
-      const entriesForDay = timesheet.entriesByDay?.[dayKey] || [];
-      const { shiftHours, breakMinutes } = summarizeShiftFromEntries(
-        entriesForDay,
-        shiftStartUtcIso || punchOutUtcIso,
-        punchOutUtcIso
-      );
+      const timesheet = await generateTimesheet(ownerId, employeeName, 'day', t, tz);
+      const entriesForDay = timesheet.entriesByDay?.[t.toISOString().split('T')[0]] || [];
+      const { shiftHours, breakMinutes } = summarizeShiftFromEntries(entriesForDay, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
 
       const msg = `✅ Clocked out ${titleCase(employeeName)} at ${fmtInTz(t, tz)}.\nWorked ${shiftHours.toFixed(2)}h including ${breakMinutes}m paid breaks/lunch.`;
       return res.send(`<Response><Message>${msg}</Message></Response>`);
+    }
+
+    // 0c) Time edit request
+    const editMatch = lc.match(RE_TIME_EDIT);
+    if (editMatch) {
+      const minutes = parseInt(editMatch[1], 10);
+      if (Math.abs(minutes) > 240) {
+        return res.send(`<Response><Message>⚠️ Adjustment must be between -240 and +240 minutes.</Message></Response>`);
+      }
+      const employeeName = parseEmployeeFor(raw) || userProfile?.name || 'Unknown';
+      const openShift = await getOpenShift(ownerId, employeeName);
+      const lastEntry = (await getTimeEntries(ownerId, employeeName, 'day', new Date(), tz)).slice(-1)[0];
+      if (!lastEntry && !openShift) {
+        return res.send(`<Response><Message>⚠️ No recent time entries found for ${employeeName}. Punch in first.</Message></Response>`);
+      }
+      const task = await createTimeEditRequestTask({
+        ownerId,
+        employeeId: employeeName,
+        requesterId: from,
+        title: `Adjust last time entry by ${minutes} minutes for ${employeeName}`,
+        body: `Requested adjustment: ${minutes} minutes for ${employeeName}'s last time entry${lastEntry ? ` (${lastEntry.type} at ${fmtInTz(new Date(lastEntry.timestamp), tz)})` : ''}.`,
+        relatedEntryId: lastEntry?.id || null,
+      });
+      return res.send(`<Response><Message>✅ Time edit request created (#${task.id}): Adjust last entry by ${minutes} minutes for ${employeeName}. Owner/Board will review.</Message></Response>`);
     }
 
     // 1) Hours query
@@ -375,84 +420,58 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     if (hoursQ) {
       const employeeName = hoursQ.employeeName || userProfile?.name || '';
       if (!employeeName) {
-        const reply = `⚠️ Who for? Try "Scott hours week".`;
-        return res.send(`<Response><Message>${reply}</Message></Response>`);
+        return res.send(`<Response><Message>⚠️ Who for? Try "Scott hours week".</Message></Response>`);
       }
-
       const period = hoursQ.period || 'week';
-      const timesheet = await generateTimesheet(ownerId, employeeName, period, new Date());
-
-      const start = timesheet.startDate
-        ? format(new Date(timesheet.startDate), 'MMM d, yyyy', { timeZone: tz })
-        : 'N/A';
-
+      const timesheet = await generateTimesheet(ownerId, employeeName, period, new Date(), tz);
+      const start = timesheet.startDate ? formatInTimeZone(new Date(timesheet.startDate), tz, 'MMM d, yyyy') : 'N/A';
       const reply =
         `${titleCase(employeeName)}'s ${period}ly hours (starting ${start}):\n` +
         `Total Hours: ${timesheet.totalHours.toFixed(2)}\n` +
         `Drive Hours: ${timesheet.driveHours.toFixed(2)}`;
-
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    // 2) Batch summaries (supports: “… break then lunch” and single “… break|lunch”)
-    const batch = await handleBatchBreaksOrLunch(raw, tz, ownerId, jobName);
+    // 2) Batch summaries
+    const batch = await handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras);
     if (batch?.handled) {
       const who = batch.names.join(', ');
-      const dayStr = format(new Date(batch.when), 'MMM d', { timeZone: tz });
-      if ('bMin' in batch && 'lMin' in batch) {
-        const reply = `✅ Logged ${batch.bMin} min break and ${batch.lMin} min lunch for ${who}${jobName ? ` on ${jobName}` : ''} (${dayStr}).`;
-        return res.send(`<Response><Message>${reply}</Message></Response>`);
-      } else {
-        const reply = `✅ Logged ${batch.mins} min ${batch.kind} for ${who}${jobName ? ` on ${jobName}` : ''} (${dayStr}).`;
-        return res.send(`<Response><Message>${reply}</Message></Response>`);
-      }
+      const dayStr = formatInTimeZone(new Date(batch.when), tz, 'MMM d');
+      const reply = ('bMin' in batch && 'lMin' in batch)
+        ? `✅ Logged ${batch.bMin} min break and ${batch.lMin} min lunch for ${who}${jobName ? ` on ${jobName}` : ''} (${dayStr}).`
+        : `✅ Logged ${batch.mins} min ${batch.kind} for ${who}${jobName ? ` on ${jobName}` : ''} (${dayStr}).`;
+      return res.send(`<Response><Message>${reply}</Message></Response>`);
     } else if (batch?.error) {
       return res.send(`<Response><Message>⚠️ ${batch.error}</Message></Response>`);
     }
 
-    // 3) Single action entry — tolerant patterns (incl. "took a ... break/lunch")
-    let match = null;
-    let action = null;
-
-    for (const { type, re } of RE_NAME_FIRST) {
-      const m = raw.match(re); // use raw to preserve casing for name
-      if (m) { match = m; action = type; dbgMatch(type + ':name-first', m); break; }
-    }
-    if (!match) {
-      for (const { type, re } of RE_ACTION_FIRST) {
-        const m = raw.match(re);
-        if (m) { match = m; action = type; dbgMatch(type + ':action-first', m); break; }
-      }
-    }
+    // 3) Single action entry
+    let match = null, action = null;
+    for (const { type, re } of RE_NAME_FIRST) { const m = raw.match(re); if (m) { match = m; action = type; dbgMatch(type+':name-first', m); break; } }
+    if (!match) { for (const { type, re } of RE_ACTION_FIRST) { const m = raw.match(re); if (m) { match = m; action = type; dbgMatch(type+':action-first', m); break; } } }
 
     if (!match || !action) {
-      const reply = '⚠️ Invalid time entry. Try e.g. "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".';
+      const reply = '⚠️ Invalid time entry. Try "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".';
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    const who = titleCase(match.groups?.name || userProfile?.name || 'Unknown');
-
-    // When: prefer captured time fragment if present; else full lc (handles 'yesterday'/'now'); else now
+    const who = titleCase(sanitizeInput(match.groups?.name || userProfile?.name || 'Unknown'));
     const timePhrase = (match.groups?.time || '').trim();
     let whenUtc = parseTimeFromText(timePhrase ? timePhrase.toLowerCase() : lc, tz);
-    if (!whenUtc) whenUtc = new Date(); // current UTC
+    // PRESERVE original behavior: default to "now" if no time parsed
+    if (!whenUtc) whenUtc = new Date();
     const whenIso = whenUtc.toISOString();
 
-    // --- state rules ---
+    // State rules
     if (action === 'punch_in') {
       const open = await getOpenShift(ownerId, who);
       if (open) {
         const openLocal = fmtInTz(new Date(open.timestamp), tz);
-        await createTimePrompt(ownerId, who, 'need_clock_out_time', {
-          shiftStartUtc: open.timestamp,
-          tz,
-        });
-        const msg =
-          `I see you’re trying to clock-in ${who}, but they weren’t clocked out from the last shift (started ${openLocal}). ` +
-          `Reply with their clock-out time (e.g., "5:45pm yesterday").`;
+        await createTimePrompt(ownerId, who, 'need_clock_out_time', { shiftStartUtc: open.timestamp, tz });
+        const msg = `I see you’re trying to clock-in ${who}, but they weren’t clocked out from the last shift (started ${openLocal}). Reply with their clock-out time (e.g., "5:45pm yesterday").`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
-      await logTimeEntry(ownerId, who, 'punch_in', whenIso, jobName || null);
+      await logTimeEntry(ownerId, who, 'punch_in', whenIso, jobName || null, tz, extras);
       const reply = `✅ Punch in logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
@@ -463,23 +482,17 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `${who} isn’t clocked in. Reply "clock in at 8am" to start a shift, or "hours week" to review.`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
+      await closeOpenBreakIfAny(ownerId, who, open.timestamp, whenIso, tz);
+      await logTimeEntry(ownerId, who, 'punch_out', whenIso, jobName || null, tz, extras);
 
-      // close any open break up to this punch-out
-      await closeOpenBreakIfAny(ownerId, who, open.timestamp, whenIso);
-      await logTimeEntry(ownerId, who, 'punch_out', whenIso, jobName || null);
-
-      // same-day summary
-      const timesheet = await generateTimesheet(ownerId, who, 'day', whenUtc);
+      const timesheet = await generateTimesheet(ownerId, who, 'day', whenUtc, tz);
       const entriesForDay = timesheet.entriesByDay?.[whenIso.split('T')[0]] || [];
       const { shiftHours, breakMinutes } = summarizeShiftFromEntries(entriesForDay, open.timestamp, whenIso);
 
-      const reply =
-        `✅ Clocked out ${who} at ${fmtInTz(whenUtc, tz)}.\n` +
-        `Worked ${shiftHours.toFixed(2)}h, including ${breakMinutes}m paid breaks/lunch.`;
+      const reply = `✅ Clocked out ${who} at ${fmtInTz(whenUtc, tz)}.\nWorked ${shiftHours.toFixed(2)}h, including ${breakMinutes}m paid breaks/lunch.`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    // Breaks must happen inside an open shift
     const openShift = await getOpenShift(ownerId, who);
     if (!openShift) {
       const msg = `${who} isn’t clocked in. Punch in first (e.g., "${who} punched in at 8am").`;
@@ -492,7 +505,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `${who} already has an open break started at ${fmtInTz(new Date(existingBreak.timestamp), tz)}. End it first (e.g., "${who} break end").`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
-      await logTimeEntry(ownerId, who, 'break_start', whenIso, jobName || null);
+      await logTimeEntry(ownerId, who, 'break_start', whenIso, jobName || null, tz, extras);
       const reply = `✅ Break start logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
@@ -503,18 +516,17 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `I don’t see an open break for ${who}. Start one first (e.g., "${who} break start at 10:15").`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
-      await logTimeEntry(ownerId, who, 'break_end', whenIso, jobName || null);
+      await logTimeEntry(ownerId, who, 'break_end', whenIso, jobName || null, tz, extras);
       const reply = `✅ Break end logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    // (drive_* just pass through)
-    await logTimeEntry(ownerId, who, action, whenIso, jobName || null);
+    await logTimeEntry(ownerId, who, action, whenIso, jobName || null, tz, extras);
     const reply = `✅ ${action.replace('_',' ')} logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
     return res.send(`<Response><Message>${reply}</Message></Response>`);
   } catch (error) {
     console.error(`[ERROR] handleTimeclock failed for ${from}:`, error?.message);
-    const reply = '⚠️ Error logging time entry. Please try again.';
+    const reply = `⚠️ Error logging time entry. Please try again.`;
     return res.send(`<Response><Message>${reply}</Message></Response>`);
   }
 }

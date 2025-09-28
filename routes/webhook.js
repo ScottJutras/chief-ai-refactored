@@ -63,7 +63,7 @@ function normalizeTimeclockInput(input, userProfile) {
 
   // Helper: extract time (handles "8am", "8 am", "8:30am", "830am")
   const findTime = (text) => {
-    // h:mm am/pm  or h:mmam
+    // h:mm am/pm
     let m = text.match(/\b(\d{1,2}):(\d{2})\s*([ap])\.?m\.?\b/i);
     if (m) {
       const h = parseInt(m[1], 10);
@@ -72,8 +72,7 @@ function normalizeTimeclockInput(input, userProfile) {
       const t = `${h}:${mm} ${ap}`;
       return { t, rest: text.replace(m[0], '').trim() };
     }
-
-    // hhmmam (e.g., 0830am or 830am)
+    // hhmmam
     m = text.match(/\b(\d{1,2})(\d{2})\s*([ap])\.?m\.?\b/i);
     if (m) {
       const hRaw = parseInt(m[1], 10);
@@ -82,8 +81,7 @@ function normalizeTimeclockInput(input, userProfile) {
       const t = `${hRaw}:${mm} ${ap}`;
       return { t, rest: text.replace(m[0], '').trim() };
     }
-
-    // h am/pm or ham
+    // h am/pm
     m = text.match(/\b(\d{1,2})\s*([ap])\.?m\.?\b/i);
     if (m) {
       const h = parseInt(m[1], 10);
@@ -91,24 +89,21 @@ function normalizeTimeclockInput(input, userProfile) {
       const t = `${h}:00 ${ap}`;
       return { t, rest: text.replace(m[0], '').trim() };
     }
-
     return { t: null, rest: text };
   };
 
-  // 1) Normalize verbs to “punched in/out” so we emit exactly what the handler’s help text suggests.
+  // normalize verbs to “punched in/out”
   s = s.replace(/\bclock(?:ed)?\s*in\b/gi, 'punched in');
   s = s.replace(/\bclock(?:ed)?\s*out\b/gi, 'punched out');
   s = s.replace(/\bpunch\s*in\b/gi, 'punched in');
   s = s.replace(/\bpunch\s*out\b/gi, 'punched out');
 
-  // 2) Extract time (optional)
+  // extract time (optional)
   const timeHit = findTime(s);
   const timeStr = timeHit.t;
-  s = timeHit.rest; // remove time token from the working string
+  s = timeHit.rest;
 
-  // 3) Try to capture person + direction in either order.
-
-  // Case A: "Scott punched in" / "Scott punched out"
+  // A: "Scott punched in"
   let m = s.match(/^\s*([a-z][\w\s.'-]{1,50}?)\s+punched\s+(in|out)\b/i);
   if (m) {
     const person = m[1].trim();
@@ -117,7 +112,7 @@ function normalizeTimeclockInput(input, userProfile) {
     return `${person} punched ${dir}${when}`.trim();
   }
 
-  // Case B: "punched in Scott" / "punched out Scott"
+  // B: "punched in Scott"
   m = s.match(/\bpunched\s+(in|out)\s+([a-z][\w\s.'-]{1,50}?)\b/i);
   if (m) {
     const dir = m[1].toLowerCase();
@@ -126,7 +121,7 @@ function normalizeTimeclockInput(input, userProfile) {
     return `${person} punched ${dir}${when}`.trim();
   }
 
-  // Case C: we see just "punched in/out" (no explicit name) → use profile name if available
+  // C: only "punched in/out" → use profile name if available
   m = s.match(/\bpunched\s+(in|out)\b/i);
   if (m) {
     const dir = m[1].toLowerCase();
@@ -135,13 +130,13 @@ function normalizeTimeclockInput(input, userProfile) {
     return `${who ? who + ' ' : ''}punched ${dir}${when}`.trim();
   }
 
-  // If none matched, just stitch time back if we had it.
+  // else stitch time back if we had it
   return timeStr ? `${s} at ${timeStr}`.trim() : original;
 }
 
-/** Try command handlers one by one. Put timeclock before expense to avoid misroutes. */
+/** Try command handlers one by one. Put tasks and timeclock before expense to avoid misroutes. */
 async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
-  const order = ['job', 'timeclock', 'expense', 'revenue', 'bill', 'quote', 'metrics', 'tax', 'receipt', 'team'];
+  const order = ['tasks', 'job', 'timeclock', 'expense', 'revenue', 'bill', 'quote', 'metrics', 'tax', 'receipt', 'team'];
 
   for (const key of order) {
     const fn = commands[key];
@@ -182,6 +177,26 @@ router.post(
     const input = (Body || '').trim();
     const mediaUrl = MediaUrl0 || null;
     const mediaType = MediaContentType0 || null;
+
+    // Capture WhatsApp location, if present
+    const isLocation =
+      (!!req.body.Latitude && !!req.body.Longitude) ||
+      (req.body.MessageType && String(req.body.MessageType).toLowerCase() === 'location');
+
+    const extras = {};
+    if (isLocation) {
+      const lat = parseFloat(req.body.Latitude);
+      const lng = parseFloat(req.body.Longitude);
+      if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
+        extras.lat = lat;
+        extras.lng = lng;
+      }
+      if (req.body.Address) {
+        // Human label provided by WhatsApp UI; we still reverse-geocode on the server for consistency
+        extras.address = String(req.body.Address).trim() || undefined;
+      }
+      console.log('[WEBHOOK] location payload:', { lat: extras.lat, lng: extras.lng, address: extras.address || null });
+    }
 
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
 
@@ -262,24 +277,9 @@ router.post(
           lc.includes('deep dive');
 
         const tierLimits = {
-          starter: {
-            years: 7,
-            transactions: 5000,
-            parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_STARTER,
-            parsingPriceText: '$19'
-          },
-          pro: {
-            years: 7,
-            transactions: 20000,
-            parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_PRO,
-            parsingPriceText: '$49'
-          },
-          enterprise: {
-            years: 7,
-            transactions: 50000,
-            parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_ENTERPRISE,
-            parsingPriceText: '$99'
-          }
+          starter: { years: 7, transactions: 5000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_STARTER, parsingPriceText: '$19' },
+          pro:      { years: 7, transactions: 20000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_PRO,      parsingPriceText: '$49' },
+          enterprise:{ years: 7, transactions: 50000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_ENTERPRISE, parsingPriceText: '$99' }
         };
 
         const tier = (userProfile?.subscription_tier || 'starter').toLowerCase();
@@ -333,12 +333,8 @@ router.post(
         if (isInDeepDiveUpload && mediaUrl && mediaType) {
           try {
             const allowed = [
-              'application/pdf',
-              'image/jpeg',
-              'image/png',
-              'audio/mpeg',
-              'text/csv',
-              'application/vnd.ms-excel',
+              'application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg',
+              'text/csv', 'application/vnd.ms-excel',
               'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             ];
             if (!allowed.includes(mediaType)) {
@@ -430,7 +426,8 @@ router.post(
             ownerId,
             ownerProfile,
             isOwner,
-            res
+            res,
+            extras     // <-- passes lat/lng/address; ensure your timeclock handler forwards to logTimeEntry()
           );
           if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
           return;
@@ -447,7 +444,7 @@ router.post(
             const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
             const t = ai.args.time ? ` at ${ai.args.time}` : '';
             const normalized = `${who} punched in${jobHint}${t}`;
-            await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
             if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
             return;
           }
@@ -456,7 +453,7 @@ router.post(
             const who = ai.args.person || userProfile?.name || 'Unknown';
             const t = ai.args.time ? ` at ${ai.args.time}` : '';
             const normalized = `${who} punched out${t}`;
-            await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
             if (!res.headersSent) ensureReply(res, '✅ Clocked out.');
             return;
           }
@@ -544,7 +541,7 @@ router.post(
       // Fallback helper prompt
       ensureReply(
         res,
-        "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', or 'help'."
+        "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', 'task - buy tape', or 'help'."
       );
       return;
     } catch (error) {

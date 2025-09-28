@@ -24,7 +24,7 @@ const { getPendingTransactionState, setPendingTransactionState } = require('../u
 
 // AI routers
 const { routeWithAI } = require('../nlp/intentRouter');           // tool-calls (strict)
-const { converseAndRoute, ConvoState } = require('../nlp/router'); // conversational normalizer
+const { converseAndRoute, ConvoState } = require('../nlp/conversation'); // conversational normalizer
 
 // Memory
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');

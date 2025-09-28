@@ -1,6 +1,11 @@
+# don’t upload these to Vercel
 **/node_modules/
 node_modules/
-.env
+.env*
 .DS_Store
 *.log
-.vercel
+.vercel/
+.vscode/
+legacy/
+scripts/
+tests/

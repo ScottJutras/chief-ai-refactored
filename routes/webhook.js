@@ -1,41 +1,47 @@
 // routes/webhook.js
-// Serverless-safe WhatsApp webhook router for Vercel + Express
+// Serverless-safe WhatsApp webhook router for Vercel + Express (conversational + memory)
 const express = require('express');
 const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Handlers / services
 const commands = require('../handlers/commands');
-const tasksHandler = require('../handlers/commands/tasks'); // <-- direct import fallback
+const tasksHandler = require('../handlers/commands/tasks'); // direct import fallback for tasks
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
 
+// Middleware
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
 const { userProfileMiddleware } = require('../middleware/userProfile');
 const { tokenMiddleware } = require('../middleware/token');
 const { errorMiddleware } = require('../middleware/error');
 
+// Services
 const { sendMessage, sendTemplateMessage } = require('../services/twilio');
 const { parseUpload } = require('../services/deepDive');
 const { getPendingTransactionState, setPendingTransactionState } = require('../utils/stateManager');
-const { routeWithAI } = require('../nlp/intentRouter');
+
+// AI routers
+const { routeWithAI } = require('../nlp/intentRouter');           // tool-calls (strict)
+const { converseAndRoute, ConvoState } = require('../nlp/router'); // conversational normalizer
+
+// Memory
+const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
 const router = express.Router();
 
-/** Mask phone in logs (do NOT use for IDs) */
+// ----------------- helpers -----------------
 function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
 }
 
-/** Ensure Twilio gets a TwiML reply if a handler forgot to res.send() */
 function ensureReply(res, text) {
   if (!res.headersSent) {
     res.status(200).type('text/xml').send(`<Response><Message>${text}</Message></Response>`);
   }
 }
 
-/** Timeclock keyword detection */
 function isTimeclockMessage(s = '') {
   const lc = String(s).toLowerCase();
   if (/\b(?:clock|punch)(?:ed)?\s*(?:in|out)\b/.test(lc)) return true;
@@ -49,7 +55,6 @@ function isTimeclockMessage(s = '') {
   return false;
 }
 
-/** Normalize to “<Name> punched in/out (at TIME)” */
 function normalizeTimeclockInput(input, userProfile) {
   const original = String(input || '');
   let s = original.trim();
@@ -82,7 +87,6 @@ function normalizeTimeclockInput(input, userProfile) {
   return timeStr ? `${s} at ${timeStr}`.trim() : original;
 }
 
-/** Helper to resolve a handler by key with fallbacks */
 function getHandler(key) {
   if (key === 'tasks') {
     return (typeof commands.tasks === 'function') ? commands.tasks
@@ -92,11 +96,10 @@ function getHandler(key) {
   return (typeof commands[key] === 'function') ? commands[key] : null;
 }
 
-/** Try command handlers in safe order (skip timeclock unless it actually matches) */
 async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const order = ['tasks', 'job', 'timeclock', 'expense', 'revenue', 'bill', 'quote', 'metrics', 'tax', 'receipt', 'team'];
   for (const key of order) {
-    if (key === 'timeclock' && !isTimeclockMessage(input)) continue; // guard
+    if (key === 'timeclock' && !isTimeclockMessage(input)) continue;
 
     const fn = getHandler(key);
     if (typeof fn !== 'function') continue;
@@ -105,41 +108,29 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
     if (res.headersSent) return true;
 
     if (typeof out === 'string' && out.trim().startsWith('<Response>')) {
-      res.status(200).type('text/xml').send(out);
-      return true;
+      res.status(200).type('text/xml').send(out); return true;
     }
     if (out && typeof out === 'object' && typeof out.twiml === 'string') {
-      res.status(200).type('text/xml').send(out.twiml);
-      return true;
+      res.status(200).type('text/xml').send(out.twiml); return true;
     }
-    if (out === true) {
-      ensureReply(res, '');
-      return true;
-    }
+    if (out === true) { ensureReply(res, ''); return true; }
   }
   return false;
 }
 
-// ---- ROUTES ----
-
-// Basic GET for health (Twilio occasionally pings)
+// ----------------- routes -----------------
 router.get('/', (_req, res) => res.status(200).send('Webhook OK'));
 
-// Main WhatsApp webhook
 router.post(
   '/',
-  // Security/hardening first:
   (req, res, next) => {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
     if ((req.headers['content-length'] || '0') > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
     next();
   },
-
-  // IMPORTANT: normalize + auth + lock before handlers
   userProfileMiddleware,
   lockMiddleware,
   tokenMiddleware,
-
   async (req, res, next) => {
     const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
     const from = req.from || String(From || '').replace(/^whatsapp:/, '').replace(/\D/g, '');
@@ -154,19 +145,39 @@ router.post(
     if (isLocation) {
       const lat = parseFloat(req.body.Latitude);
       const lng = parseFloat(req.body.Longitude);
-      if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
-        extras.lat = lat; extras.lng = lng;
-      }
+      if (!Number.isNaN(lat) && !Number.isNaN(lng)) { extras.lat = lat; extras.lng = lng; }
       if (req.body.Address) extras.address = String(req.body.Address).trim() || undefined;
       console.log('[WEBHOOK] location payload:', { lat: extras.lat, lng: extras.lng, address: extras.address || null });
     }
 
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
 
+    // ---------- memory bootstrapping ----------
+    const tenantId = ownerId;
+    const userId = from;
+    let convo = await getConvoState(tenantId, userId);     // DB snapshot (aliases, history, active_job…)
+    const state = new ConvoState(userId, tenantId);
+    state.active_job = convo.active_job || null;
+    state.aliases = convo.aliases || {};
+    state.history = Array.isArray(convo.history) ? convo.history.slice(-5) : [];
+
+    // Optional fetch of defaults you may use in your nlp/router
+    const memory = await getMemory(tenantId, userId, [
+      'default.expense.bucket',
+      'labor_rate',
+      'default.markup',
+      'client.default_terms'
+    ]);
+    // (Use `memory` inside your nlp/router if you want; this file doesn’t need it directly.)
+
     try {
       // 0) Onboarding
       if ((userProfile && userProfile.onboarding_in_progress) || input.toLowerCase().includes('start onboarding')) {
-        await handleOnboarding(from, input, userProfile, ownerId, res);
+        const response = await handleOnboarding(from, input, userProfile, ownerId, res);
+        await logEvent(tenantId, userId, 'onboarding', { input, response });
+        await saveConvoState(tenantId, userId, {
+          history: [...(convo.history || []).slice(-4), { input, response, intent: 'onboarding' }]
+        });
         ensureReply(res, `Welcome to Chief AI! Quick question — what's your name?`);
         return;
       }
@@ -186,17 +197,25 @@ router.post(
             const priceId = tier === 'pro' ? process.env.PRO_PRICE_ID : process.env.ENTERPRISE_PRICE_ID;
             const priceText = tier === 'pro' ? '$29' : '$99';
 
+            const { Pool } = require('pg');
+            const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
             const customer = await stripe.customers.create({ phone: from, metadata: { user_id: userProfile.user_id } });
             const paymentLink = await stripe.paymentLinks.create({
               line_items: [{ price: priceId, quantity: 1 }],
               metadata: { user_id: userProfile.user_id }
             });
 
-            const { Pool } = require('pg');
-            const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-            await pool.query(`UPDATE users SET stripe_customer_id=$1, subscription_tier=$2 WHERE user_id=$3`, [customer.id, tier, userProfile.user_id]);
+            await pool.query(
+              `UPDATE users SET stripe_customer_id=$1, subscription_tier=$2 WHERE user_id=$3`,
+              [customer.id, tier, userProfile.user_id]
+            );
 
             await sendTemplateMessage(from, process.env.HEX_UPGRADE_NOW, [`Upgrade to ${tier} for ${priceText}/month CAD: ${paymentLink.url}`]);
+            await logEvent(tenantId, userId, 'upgrade', { tier, link: paymentLink.url });
+            await saveConvoState(tenantId, userId, {
+              history: [...(convo.history || []).slice(-4), { input, response: 'Upgrade link sent!', intent: 'upgrade' }]
+            });
             ensureReply(res, 'Upgrade link sent!');
             return;
           } catch (err) {
@@ -216,7 +235,6 @@ router.post(
           pro: { years: 7, transactions: 20000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_PRO, parsingPriceText: '$49' },
           enterprise: { years: 7, transactions: 50000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_ENTERPRISE, parsingPriceText: '$99' }
         };
-
         const tier = (userProfile?.subscription_tier || 'starter').toLowerCase();
         const limit = tierLimits[tier] || tierLimits.starter;
 
@@ -238,6 +256,7 @@ router.post(
                 await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
                   `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`
                 ]);
+                await logEvent(tenantId, userId, 'deepdive_paylink', { link: paymentLink.url, tier });
                 ensureReply(res, 'DeepDive payment link sent!');
                 return;
               }
@@ -248,6 +267,10 @@ router.post(
           }
 
           const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
+          await logEvent(tenantId, userId, 'deepdive_init', { tier, maxTransactions: limit.transactions });
+          await saveConvoState(tenantId, userId, {
+            history: [...(convo.history || []).slice(-4), { input, response: `Ready to upload historical data…`, intent: 'deepdive' }]
+          });
           ensureReply(res, `Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: ${dashUrl}`);
           return;
         }
@@ -276,6 +299,7 @@ router.post(
               await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
                 `To parse PDFs/images/audio, unlock DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}. CSV/Excel uploads remain free (${limit.transactions} transactions).`
               ]);
+              await logEvent(tenantId, userId, 'deepdive_blocked_payment_required', { link: paymentLink.url });
               ensureReply(res, 'DeepDive payment link sent!');
               return;
             }
@@ -300,6 +324,10 @@ router.post(
                 return;
               }
               const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
+              await logEvent(tenantId, userId, 'deepdive_upload', { transactionCount, mediaType });
+              await saveConvoState(tenantId, userId, {
+                history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: `✅ ${transactionCount} new transactions processed.`, intent: 'deepdive_upload' }]
+              });
               ensureReply(res, `✅ ${transactionCount} new transactions processed. Track progress on your dashboard: ${dashUrl}`);
               deepDiveState.historicalDataUpload = false;
               deepDiveState.deepDiveUpload = false;
@@ -307,6 +335,7 @@ router.post(
               return;
             }
 
+            await logEvent(tenantId, userId, 'deepdive_file_processed', { mediaType, filename });
             ensureReply(res, `File received and processed. ${summary ? 'Summary: ' + JSON.stringify(summary) : 'OK'}.`);
             deepDiveState.deepDiveUpload = false;
             await setPendingTransactionState(from, deepDiveState);
@@ -321,83 +350,164 @@ router.post(
       // 3) Media (non-DeepDive)
       if (mediaUrl && mediaType) {
         await handleMedia(from, mediaUrl, mediaType, userProfile, ownerId, ownerProfile, isOwner, res);
+        await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl });
+        await saveConvoState(tenantId, userId, {
+          history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: 'Got your file — processing complete.', intent: 'media' }]
+        });
         ensureReply(res, 'Got your file — processing complete.');
         return;
       }
 
-      // 4) TASKS (fast path) — catch "task ..." / "tasks ..." / "todo ..."
-      {
-        const m = input.match(/^\s*(tasks?|todo)\b[:\-]?\s*(.*)$/i);
-        if (m) {
-          const rest = m[2] && m[2].trim() ? m[2].trim() : '';
-          const normalized = rest ? `task - ${rest}` : 'task';
-          const tasksFn = getHandler('tasks');
-          if (typeof tasksFn === 'function') {
-            console.log('[ROUTER] Fast tasks path hit:', { from, normalized });
-            try {
-              const handled = await tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              if (handled !== false) {
-                if (!res.headersSent) ensureReply(res, '');
-                return;
-              }
-            } catch (e) {
-              console.error('[ERROR] tasks handler threw:', e?.message);
-            }
-          } else {
-            console.warn('[ROUTER] tasks handler not found in registry; using fallback failed.');
-          }
-          // Avoid misrouting to timeclock if we clearly meant tasks
-          ensureReply(res, `Try "task - buy tape" or "task - order nails".`);
+      // 3b) Conversational router first (prevents misroutes, emits handler-safe strings)
+      try {
+        const conv = await converseAndRoute(input, { userProfile, ownerId: tenantId, convoState: state });
+
+        // Quick helper to pluck plain text from TwiML when we want to log it
+        const extractMsg = (twiml) => {
+          if (!twiml) return '';
+          const m = twiml.match(/<Message>([\s\S]*?)<\/Message>/);
+          return m ? m[1] : '';
+        };
+
+        if (conv?.handled && conv.twiml) {
+          const responseText = extractMsg(conv.twiml);
+          await logEvent(tenantId, userId, 'clarify', { input, response: responseText, intent: conv.intent || null });
+          await saveConvoState(tenantId, userId, {
+            last_intent: conv.intent || convo.last_intent || null,
+            last_args: conv.args || convo.last_args || {},
+            history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
+          });
+          res.status(200).type('text/xml').send(conv.twiml);
           return;
         }
+
+        if (conv && conv.route && conv.normalized) {
+          let responseText = extractMsg(conv.twiml);
+          let handled = false;
+
+          if (conv.route === 'tasks') {
+            const tasksFn = getHandler('tasks');
+            if (typeof tasksFn === 'function') {
+              handled = await tasksFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              responseText = responseText || 'Task created!';
+              await logEvent(tenantId, userId, 'tasks.create', { normalized: conv.normalized, args: conv.args || {} });
+            }
+          } else if (conv.route === 'expense') {
+            const expenseFn = getHandler('expense');
+            if (typeof expenseFn === 'function') {
+              handled = await expenseFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              responseText = responseText || 'Expense logged!';
+              await logEvent(tenantId, userId, 'expense.add', { normalized: conv.normalized, args: conv.args || {} });
+
+              // Example: learn an alias/vendor default if present
+              if (conv.args?.alias && (conv.args.vendor || conv.args.job)) {
+                await upsertMemory(tenantId, userId, `alias.vendor.${conv.args.alias.toLowerCase()}`, { name: conv.args.vendor || conv.args.job });
+              }
+              // Example: if user repeatedly targets Overhead, you could set a default (lightweight; keep/adjust rule in your router)
+              if (conv.args?.bucket === 'Overhead') {
+                await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
+              }
+            }
+          } else if (conv.route === 'timeclock') {
+            const normalized = normalizeTimeclockInput(conv.normalized, userProfile);
+            handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+            responseText = responseText || '✅ Timeclock request received.';
+            await logEvent(tenantId, userId, 'timeclock', { normalized, args: conv.args || {} });
+
+            // If router resolved a job, keep it active
+            if (conv.args?.job || conv.args?.job_id) {
+              await saveConvoState(tenantId, userId, {
+                active_job: conv.args.job || convo.active_job || null,
+                active_job_id: conv.args.job_id || convo.active_job_id || null
+              });
+            }
+          } else if (conv.route === 'job') {
+            const jobFn = getHandler('job');
+            if (typeof jobFn === 'function') {
+              handled = await jobFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              responseText = responseText || 'Job created!';
+              await logEvent(tenantId, userId, 'job.create', { normalized: conv.normalized, args: conv.args || {} });
+            }
+          }
+
+          if (handled) {
+            await saveConvoState(tenantId, userId, {
+              last_intent: conv.intent || convo.last_intent || null,
+              last_args: conv.args || convo.last_args || {},
+              history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
+            });
+            if (!res.headersSent && conv.twiml) res.status(200).type('text/xml').send(conv.twiml);
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn('[Conversational Router] error:', e?.message);
       }
 
-      // 5) Timeclock (direct keywords)
+      // 4) Timeclock (direct keywords)
       if (isTimeclockMessage(input)) {
-        console.log('[ROUTER] Direct timeclock path hit:', { from, input });
         const normalized = normalizeTimeclockInput(input, userProfile);
         await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+        await logEvent(tenantId, userId, 'timeclock', { normalized });
         if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
         return;
       }
 
-      // 6) AI intent router
+      // 5) AI intent router (tool-calls)
       try {
         const ai = await routeWithAI(input, { userProfile });
         if (ai) {
+          let handled = false;
+          let responseText = 'Action completed!';
+          let normalizedForLog = null;
+
           if (ai.intent === 'timeclock.clock_in') {
             const who = ai.args.person || userProfile?.name || 'Unknown';
             const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
             const t = ai.args.time ? ` at ${ai.args.time}` : '';
             const normalized = `${who} punched in${jobHint}${t}`;
-            await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-            if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
-            return;
-          }
-          if (ai.intent === 'timeclock.clock_out') {
+            normalizedForLog = normalized;
+            handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+            responseText = `Punched in${jobHint}! What’s next?`;
+          } else if (ai.intent === 'timeclock.clock_out') {
             const who = ai.args.person || userProfile?.name || 'Unknown';
             const t = ai.args.time ? ` at ${ai.args.time}` : '';
             const normalized = `${who} punched out${t}`;
-            await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-            if (!res.headersSent) ensureReply(res, '✅ Clocked out.');
-            return;
-          }
-          if (ai.intent === 'job.create' && typeof commands.job === 'function') {
+            normalizedForLog = normalized;
+            handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+            responseText = `Clocked out${t}! Anything else?`;
+          } else if (ai.intent === 'job.create') {
             const name = ai.args.name?.trim();
-            if (name) {
+            if (name && typeof commands.job === 'function') {
               const normalized = `create job ${name}`;
-              await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              if (!res.headersSent) ensureReply(res, '');
-              return;
+              normalizedForLog = normalized;
+              handled = await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              responseText = `Created job: ${name}. Need tasks for it?`;
             }
-          }
-          if (ai.intent === 'expense.add' && typeof commands.expense === 'function') {
+          } else if (ai.intent === 'expense.add') {
             const amt = ai.args.amount;
             const cat = ai.args.category ? ` ${ai.args.category}` : '';
             const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
             const normalized = `expense $${amt}${cat}${fromWho}`.trim();
-            await commands.expense(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-            if (!res.headersSent) ensureReply(res, '');
+            normalizedForLog = normalized;
+            const expenseFn = getHandler('expense');
+            if (typeof expenseFn === 'function') {
+              handled = await expenseFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              responseText = `Logged $${amt}${fromWho}! Got more expenses?`;
+              if (ai.args.merchant) {
+                await upsertMemory(tenantId, userId, `alias.vendor.${ai.args.merchant.toLowerCase()}`, { name: ai.args.merchant });
+              }
+            }
+          }
+
+          if (handled) {
+            await logEvent(tenantId, userId, ai.intent, { normalized: normalizedForLog, args: ai.args });
+            await saveConvoState(tenantId, userId, {
+              last_intent: ai.intent,
+              last_args: ai.args,
+              history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: ai.intent }]
+            });
+            if (!res.headersSent) ensureReply(res, responseText);
             return;
           }
         }
@@ -405,12 +515,16 @@ router.post(
         console.warn('[AI Router] skipped due to error:', e?.message);
       }
 
-      // 7) Fast intent router for jobs
+      // 6) Fast intent router for jobs
       if (/^\s*(create|new|add)\s+job\b/i.test(input) || /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)) {
         if (typeof commands.job === 'function') {
           try {
             const handled = await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
             if (handled !== false) {
+              await logEvent(tenantId, userId, 'job', { input });
+              await saveConvoState(tenantId, userId, {
+                history: [...(convo.history || []).slice(-4), { input, response: 'Job action completed.', intent: 'job' }]
+              });
               if (!res.headersSent) ensureReply(res, '');
               return;
             }
@@ -422,27 +536,45 @@ router.post(
         }
       }
 
-      // 8) General dispatch (with timeclock guard inside)
+      // 7) General dispatch (with internal timeclock guard)
       {
         const handled = await dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-        if (handled) return;
+        if (handled) {
+          await logEvent(tenantId, userId, 'dispatch', { input });
+          await saveConvoState(tenantId, userId, {
+            history: [...(convo.history || []).slice(-4), { input, response: 'Action completed.', intent: 'dispatch' }]
+          });
+          return;
+        }
       }
 
-      // 9) Legacy combined handler
+      // 8) Legacy combined handler
       if (typeof commands.handleCommands === 'function') {
         try {
           const handled = await commands.handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-          if (handled !== false) return;
+          if (handled !== false) {
+            await logEvent(tenantId, userId, 'legacy', { input });
+            await saveConvoState(tenantId, userId, {
+              history: [...(convo.history || []).slice(-4), { input, response: 'Action completed.', intent: 'legacy' }]
+            });
+            return;
+          }
         } catch (e) {
           console.error('[ERROR] handleCommands threw:', e?.message);
         }
       }
 
       // Fallback helper
-      ensureReply(res, "I'm here to help. Try 'expense $100 tools', 'create job Roof Repair', 'task - buy tape', or 'help'.");
+      const response = "I'm here to help! Try 'expense $100 tools', 'create job Roof Repair', 'task - buy tape', or 'help'.";
+      await logEvent(tenantId, userId, 'fallback', { input, response });
+      await saveConvoState(tenantId, userId, {
+        history: [...(convo.history || []).slice(-4), { input, response, intent: null }]
+      });
+      ensureReply(res, response);
       return;
     } catch (error) {
       console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
+      await logEvent(tenantId, userId, 'error', { input, error: error.message });
       return next(error);
     } finally {
       try {
@@ -453,8 +585,6 @@ router.post(
       }
     }
   },
-
-  // Centralized error handler (keep last)
   errorMiddleware
 );
 

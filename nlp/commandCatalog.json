@@ -1,0 +1,93 @@
+{
+  "tasks.create": {
+    "synonyms": [
+      "task",
+      "add a task",
+      "make a task",
+      "create a task",
+      "todo",
+      "remind me to",
+      "note to",
+      "please remember"
+    ],
+    "required": ["title"],
+    "confirm": "Got it — “{title}” added.",
+    "asks": {
+      "title": "What’s the task you want to add?"
+    },
+    "personality_hints": ["Alright, let’s jot that down—", "Cool, new task coming up!"],
+    "follow_up_prompts": [
+      "Need to assign it to someone or set a due date?",
+      "Anything else to tackle?"
+    ],
+    "examples": [
+      "task - buy tape",
+      "todo pick up nails",
+      "remind me to send the quote tomorrow"
+    ]
+  },
+
+  "timeclock.punch_in": {
+    "synonyms": [
+      "punch in",
+      "clock in",
+      "start shift",
+      "start my day",
+      "start time",
+      "clock me in",
+      "get going on work"
+    ],
+    "required": [],
+    "confirm": "Punching you in{job_hint}.",
+    "personality_hints": ["Let’s get you started—", "Time to roll!"],
+    "follow_up_prompts": [
+      "Want to log any expenses from earlier?",
+      "What’s the plan today?"
+    ]
+  },
+
+  "timeclock.punch_out": {
+    "synonyms": ["punch out", "clock out", "end shift", "finish up", "wrap up"],
+    "required": [],
+    "confirm": "Clocking you out{job_hint}.",
+    "personality_hints": ["All done for now—", "Nice work today!"],
+    "follow_up_prompts": [
+      "Need to log any final expenses?",
+      "Back tomorrow?"
+    ]
+  },
+
+  "expense.add": {
+    "synonyms": [
+      "log expense",
+      "record expense",
+      "add cost",
+      "spent",
+      "purchase",
+      "bought",
+      "receipt",
+      "overhead"
+    ],
+    "required": ["amount"],
+    "confirm": "Logging expense {amount}{job_hint}.",
+    "asks": {
+      "amount": "How much was that expense?",
+      "job": "Which job should I tie this to (or Overhead)?"
+    },
+    "personality_hints": ["Alright, let’s log that expense—", "Got a purchase to record?"],
+    "follow_up_prompts": ["Got a receipt to attach?", "Anything else you spent on?"],
+    "examples": ["expense $120 tools", "home depot 89.24", "log receipt for 45 bucks to overhead"]
+  },
+
+  "job.create": {
+    "synonyms": ["new job", "create job", "add job", "start job", "set up job"],
+    "required": ["name"],
+    "confirm": "Created new job: {name}.",
+    "asks": { "name": "What’s the name or address for this job?" },
+    "personality_hints": ["New job? Sweet, let’s set it up—", "Ready to kick off something new!"],
+    "follow_up_prompts": [
+      "Want to assign a team member to this job?",
+      "Need tasks for it?"
+    ]
+  }
+}

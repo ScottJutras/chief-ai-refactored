@@ -15,18 +15,59 @@
     "asks": {
       "title": "What’s the task you want to add?"
     },
-    "personality_hints": ["Alright, let’s jot that down—", "Cool, new task coming up!"],
-    "follow_up_prompts": [
-      "Need to assign it to someone or set a due date?",
-      "Anything else to tackle?"
-    ],
+    "personality_hints": ["Let’s jot that down—"],
+    "follow_up_prompts": ["Want a due date or assignee?"],
     "examples": [
       "task - buy tape",
       "todo pick up nails",
       "remind me to send the quote tomorrow"
-    ]
+    ],
+    "contextual_defaults": { "job": "active_job_or_ask" }
   },
-
+  "tasks.list": {
+    "synonyms": [
+      "my tasks",
+      "view my tasks",
+      "what are my tasks",
+      "show my tasks",
+      "list my tasks",
+      "todos",
+      "to-do list"
+    ],
+    "required": [],
+    "confirm": "Here’s what’s on your plate.",
+    "personality_hints": ["Let’s triage—"],
+    "follow_up_prompts": ["Want to assign or add due dates?"],
+    "examples": [
+      "my tasks",
+      "view my tasks",
+      "what are my tasks"
+    ],
+    "contextual_defaults": {}
+  },
+  "tasks.assign_all": {
+    "synonyms": [
+      "task for everyone",
+      "task everyone",
+      "send task to everyone",
+      "assign everyone",
+      "broadcast task",
+      "all hands task"
+    ],
+    "required": ["title"],
+    "confirm": "Sent to everyone — “{title}”.",
+    "asks": {
+      "title": "What’s the task for everyone?"
+    },
+    "personality_hints": ["Team-wide note—"],
+    "follow_up_prompts": ["Add a due time or reminder?"],
+    "examples": [
+      "task for everyone - be on time tomorrow morning",
+      "broadcast task: submit timecards by 5",
+      "task everyone: clean up the van"
+    ],
+    "contextual_defaults": { "job": "active_job_or_ask" }
+  },
   "timeclock.punch_in": {
     "synonyms": [
       "punch in",
@@ -39,24 +80,34 @@
     ],
     "required": [],
     "confirm": "Punching you in{job_hint}.",
-    "personality_hints": ["Let’s get you started—", "Time to roll!"],
-    "follow_up_prompts": [
-      "Want to log any expenses from earlier?",
-      "What’s the plan today?"
-    ]
+    "personality_hints": ["Let’s get you started—"],
+    "follow_up_prompts": ["Log any expenses from earlier?"],
+    "examples": [
+      "punch in",
+      "clock in",
+      "start shift"
+    ],
+    "contextual_defaults": { "job": "active_job_or_ask" }
   },
-
   "timeclock.punch_out": {
-    "synonyms": ["punch out", "clock out", "end shift", "finish up", "wrap up"],
+    "synonyms": [
+      "punch out",
+      "clock out",
+      "end shift",
+      "finish up",
+      "wrap up"
+    ],
     "required": [],
     "confirm": "Clocking you out{job_hint}.",
-    "personality_hints": ["All done for now—", "Nice work today!"],
-    "follow_up_prompts": [
-      "Need to log any final expenses?",
-      "Back tomorrow?"
-    ]
+    "personality_hints": ["All done for now—"],
+    "follow_up_prompts": ["Log any final expenses?"],
+    "examples": [
+      "punch out",
+      "clock out",
+      "end shift"
+    ],
+    "contextual_defaults": { "job": "active_job_or_ask" }
   },
-
   "expense.add": {
     "synonyms": [
       "log expense",
@@ -68,26 +119,119 @@
       "receipt",
       "overhead"
     ],
-    "required": ["amount"],
-    "confirm": "Logging expense {amount}{job_hint}.",
+    "required": ["amount", "item"],
+    "confirm": "Logging expense {amount} for {item}{job_hint}.",
     "asks": {
       "amount": "How much was that expense?",
+      "item": "What’s the expense item?",
       "job": "Which job should I tie this to (or Overhead)?"
     },
-    "personality_hints": ["Alright, let’s log that expense—", "Got a purchase to record?"],
-    "follow_up_prompts": ["Got a receipt to attach?", "Anything else you spent on?"],
-    "examples": ["expense $120 tools", "home depot 89.24", "log receipt for 45 bucks to overhead"]
+    "personality_hints": ["Let’s log that expense—"],
+    "follow_up_prompts": ["Got a receipt to attach?"],
+    "examples": [
+      "expense $120 tools",
+      "home depot 89.24 shingles",
+      "log receipt for 45 bucks to overhead"
+    ],
+    "contextual_defaults": { "job": "last_job_or_overhead" }
   },
-
   "job.create": {
-    "synonyms": ["new job", "create job", "add job", "start job", "set up job"],
+    "synonyms": [
+      "new job",
+      "create job",
+      "add job",
+      "start job",
+      "set up job"
+    ],
     "required": ["name"],
     "confirm": "Created new job: {name}.",
-    "asks": { "name": "What’s the name or address for this job?" },
-    "personality_hints": ["New job? Sweet, let’s set it up—", "Ready to kick off something new!"],
-    "follow_up_prompts": [
-      "Want to assign a team member to this job?",
-      "Need tasks for it?"
+    "asks": {
+      "name": "What’s the name or address for this job?"
+    },
+    "personality_hints": ["New job? Let’s set it up—"],
+    "follow_up_prompts": ["Assign a team member?"],
+    "examples": [
+      "new job Roof Repair",
+      "create job 123 Main St"
+    ],
+    "contextual_defaults": { "job": "active_job_or_ask" }
+  },
+  "quote.send": {
+    "synonyms": [
+      "email quote",
+      "send quote",
+      "share quote",
+      "quote to"
+    ],
+    "required": ["client", "quote_id"],
+    "confirm": "Sending quote {quote_id} to {client}.",
+    "asks": {
+      "client": "Who’s getting the quote (e.g., Bob)?",
+      "quote_id": "Which quote (e.g., Kitchen Reno quote)?"
+    },
+    "personality_hints": ["Let’s get that quote out—"],
+    "follow_up_prompts": ["Need to tweak the terms?"],
+    "examples": [
+      "email quote to Bob",
+      "send quote Kitchen Reno to John"
+    ],
+    "contextual_defaults": {
+      "client": "last_client_or_ask",
+      "quote_id": "last_quote_or_ask"
+    }
+  },
+  "budget.set": {
+    "synonyms": [
+      "set budget",
+      "budget for",
+      "update budget",
+      "assign budget"
+    ],
+    "required": ["job", "amount"],
+    "confirm": "Set budget of {amount} for {job}.",
+    "asks": {
+      "job": "Which job are we budgeting for?",
+      "amount": "What’s the budget amount?"
+    },
+    "personality_hints": ["Let’s lock in that budget—"],
+    "follow_up_prompts": ["Want a spending breakdown?"],
+    "examples": [
+      "set budget for Kitchen Reno $15000",
+      "budget for Roof Repair $5000"
+    ],
+    "contextual_defaults": { "job": "active_job_or_ask" }
+  },
+  "memory.forget": {
+    "synonyms": [
+      "forget",
+      "remove alias",
+      "delete alias"
+    ],
+    "required": ["key"],
+    "confirm": "Forgot {key}.",
+    "asks": {
+      "key": "What do you want me to forget (e.g., ‘hd’ alias)?"
+    },
+    "personality_hints": ["Got it, let’s clear that—"],
+    "follow_up_prompts": ["Anything else to forget?"],
+    "examples": [
+      "forget hd alias",
+      "remove alias vendor.hd"
+    ]
+  },
+  "memory.show": {
+    "synonyms": [
+      "what do you know",
+      "what do you remember",
+      "show memory"
+    ],
+    "required": [],
+    "confirm": "Here’s what I know: {memory_summary}.",
+    "personality_hints": ["Let’s review what I’ve got—"],
+    "follow_up_prompts": ["Need me to forget anything?"],
+    "examples": [
+      "what do you know",
+      "show memory"
     ]
   }
 }

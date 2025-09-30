@@ -1,11 +1,11 @@
 // nlp/intentRouter.js
 const OpenAI = require("openai");
 
-const client =
-  process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+const client = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
-// Describe the commands you want the model to call.
-// Keep these tight and literal to reduce hallucinations.
+// Keep tools literal and narrow to avoid hallucinations.
 const tools = [
   {
     type: "function",
@@ -17,7 +17,7 @@ const tools = [
         properties: {
           person: { type: "string", description: "Team member name or nickname" },
           job: { type: "string", description: "Optional job/address to associate" },
-          when: { type: "string", description: "Natural language time, e.g. 'now', '7:30am'" }
+          when: { type: "string", description: "Natural time like 'now' or '7:30am'" }
         },
         required: ["person"]
       }
@@ -46,7 +46,7 @@ const tools = [
       parameters: {
         type: "object",
         properties: {
-          name: { type: "string", description: "Job name (e.g., address or short title)" }
+          name: { type: "string", description: "Job name or address" }
         },
         required: ["name"]
       }
@@ -68,67 +68,156 @@ const tools = [
         required: ["amount"]
       }
     }
+  },
+
+  // Optional: let AI surface task list & broadcast when fuzzy match is unsure.
+  {
+    type: "function",
+    function: {
+      name: "tasks_list",
+      description: "Show the tasks assigned to the requester.",
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "tasks_assign_all",
+      description: "Create a task for all teammates.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "The task text to send to everyone" }
+        },
+        required: ["title"]
+      }
+    }
+  },
+
+  // Optional extras you referenced elsewhere:
+  {
+    type: "function",
+    function: {
+      name: "quote_send",
+      description: "Send a quote to a client.",
+      parameters: {
+        type: "object",
+        properties: {
+          client: { type: "string" },
+          quote_id: { type: "string" }
+        },
+        required: ["client", "quote_id"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "budget_set",
+      description: "Set a budget for a job.",
+      parameters: {
+        type: "object",
+        properties: {
+          job: { type: "string" },
+          amount: { type: "number" }
+        },
+        required: ["job", "amount"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "memory_forget",
+      description: "Forget a stored key (e.g., alias.vendor.hd).",
+      parameters: {
+        type: "object",
+        properties: { key: { type: "string" } },
+        required: ["key"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "memory_show",
+      description: "Show what the assistant remembers for this user.",
+      parameters: { type: "object", properties: {}, additionalProperties: false }
+    }
   }
-  // Add more (revenue_add, bill_add, metrics_query, team_add, quote_create, tax_*...) as you like
 ];
 
-// Minimal, deterministic system rules.
 const SYSTEM = `
 You are a STRICT command router for a bookkeeping & field-ops assistant (Chief AI).
-Only call a tool if you are >95% confident. Otherwise, return plain text saying "none".
-Never infer money amounts. Never invent people. Avoid over-eager matches.
+Only call a tool if you are >95% confident the user is asking for that exact action.
+If you are not >95% confident, do NOT call any tool and reply with the single word: none.
+Never infer money amounts or invent people. Avoid over-eager matches.
 `;
 
 /**
  * routeWithAI(text, context) -> { intent, args } | null
- * Returns null if no OPENAI_API_KEY or if the model doesn’t call a tool.
+ * Returns null if no OPENAI_API_KEY, if the model declines, or if no tool was called.
  */
 async function routeWithAI(text, context = {}) {
   if (!client) return null;
 
-  const msgs = [
-    { role: "system", content: SYSTEM.trim() },
-    {
-      role: "user",
-      content: text
-    }
-  ];
-
-  // Prefer a small, fast model; adjust via OPENAI_MODEL if you want.
-  const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-  const resp = await client.chat.completions.create({
-    model,
-    temperature: 0,
-    messages: msgs,
-    tools,
-    tool_choice: "auto"
-  });
-
-  const msg = resp.choices?.[0]?.message || {};
-  const call = msg.tool_calls?.[0] || null;
-  if (!call) return null;
-
-  // Works with current tool-calling shape
-  const name = call.function?.name || call.name;
-  let args = {};
   try {
-    args = JSON.parse(call.function?.arguments || call.arguments || "{}");
-  } catch {
-    args = {};
-  }
+    const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
 
-  switch (name) {
-    case "timeclock_clock_in":
-      return { intent: "timeclock.clock_in", args };
-    case "timeclock_clock_out":
-      return { intent: "timeclock.clock_out", args };
-    case "job_create":
-      return { intent: "job.create", args };
-    case "expense_add":
-      return { intent: "expense.add", args };
-    default:
+    const messages = [
+      { role: "system", content: SYSTEM.trim() },
+      // You can thread minimal context to help disambiguate without leaking PII:
+      ...(context?.userProfile?.name ? [{ role: "system", content: `User name: ${context.userProfile.name}` }] : []),
+      { role: "user", content: text }
+    ];
+
+    const resp = await client.chat.completions.create({
+      model,
+      temperature: 0,
+      messages,
+      tools,
+      tool_choice: "auto",
+      // small cap to discourage verbose non-tool replies
+      max_tokens: 100,
+    });
+
+    const msg = resp.choices?.[0]?.message;
+    if (!msg) return null;
+
+    // If the model followed the instruction to say "none"
+    if (typeof msg.content === "string" && msg.content.trim().toLowerCase() === "none") {
       return null;
+    }
+
+    const call = msg.tool_calls?.[0];
+    if (!call) return null;
+
+    const name = call.function?.name || call.name;
+    let args = {};
+    try {
+      args = JSON.parse(call.function?.arguments || call.arguments || "{}");
+    } catch { args = {}; }
+
+    switch (name) {
+      case "timeclock_clock_in":   return { intent: "timeclock.clock_in",   args };
+      case "timeclock_clock_out":  return { intent: "timeclock.clock_out",  args };
+      case "job_create":           return { intent: "job.create",           args };
+      case "expense_add":          return { intent: "expense.add",          args };
+
+      // Optional extended intents (match your conversation.js)
+      case "tasks_list":           return { intent: "tasks.list",           args };
+      case "tasks_assign_all":     return { intent: "tasks.assign_all",     args };
+      case "quote_send":           return { intent: "quote.send",           args };
+      case "budget_set":           return { intent: "budget.set",           args };
+      case "memory_forget":        return { intent: "memory.forget",        args };
+      case "memory_show":          return { intent: "memory.show",          args };
+
+      default: return null;
+    }
+  } catch (err) {
+    // Fail silent → let deterministic router handle it
+    console.warn("[intentRouter] AI route error:", err?.message);
+    return null;
   }
 }
 

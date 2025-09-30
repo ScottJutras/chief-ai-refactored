@@ -6,3 +6,4 @@ tests/
 scripts/
 legacy/
 *.log
+node_modules

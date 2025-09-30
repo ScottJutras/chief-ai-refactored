@@ -24,7 +24,7 @@ const { getPendingTransactionState, setPendingTransactionState } = require('../u
 
 // AI routers
 const { routeWithAI } = require('../nlp/intentRouter');           // tool-calls (strict)
-const { converseAndRoute, ConvoState } = require('../nlp/conversation'); // conversational normalizer
+const { converseAndRoute } = require('../nlp/conversation');
 
 // Memory
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
@@ -156,8 +156,16 @@ router.post(
     const tenantId = ownerId;
     const userId = from;
     let convo = await getConvoState(tenantId, userId);     // DB snapshot (aliases, history, active_job…)
-    const state = new ConvoState(userId, tenantId);
+    const state = {
+  user_id: userId,
+  tenant_id: tenantId,
+  active_job: null,
+  active_job_id: null,
+  aliases: {},
+  history: []
+};
     state.active_job = convo.active_job || null;
+    state.active_job_id  = convo.active_job_id || null;
     state.aliases = convo.aliases || {};
     state.history = Array.isArray(convo.history) ? convo.history.slice(-5) : [];
 

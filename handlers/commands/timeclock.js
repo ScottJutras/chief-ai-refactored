@@ -14,12 +14,13 @@ const {
   exportTimesheetPdf,
   createTimeEditRequestTask,
   checkTimeEntryLimit,
-  checkActorLimit
+  checkActorLimit,
+  hasCreatedByColumn
 } = require('../../services/postgres');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
 
-// ---------- Subscription tier limits to prevent DB spam (kept for compatibility/telemetry) ----------
+// ---------- Subscription tier limits to prevent DB spam ----------
 const TIME_ENTRY_LIMITS = {
   starter: { maxEntriesPerDay: 50 },
   pro: { maxEntriesPerDay: 200 },
@@ -185,10 +186,10 @@ const RE_ACTION_FIRST = [
   { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
   // NEW: verb-first “went on break”, with optional “for NAME”
   { type: 'break_start', re: /^(?:just\s+)?(?:went\s+on\s+|on\s+)?break(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'break_start', re: /^(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'break_end', re: /^(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'drive_start', re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'drive_end', re: /^drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'break_start', re: /^(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'break_end', re: /^(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'drive_start', re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'drive_end', re: /^drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 ];
 
 // Time edit request pattern
@@ -280,7 +281,7 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userP
 
       whenAny ||= end;
     }
-    return { handled: true, names, mins, kind: 'break', when: whenAny };
+    return { handled: true, names, mins, kind: m.groups.kind, when: whenAny };
   }
 
   return { handled: false };
@@ -325,7 +326,7 @@ function parseDateRangeFromText(text, tz) {
     const endLocal = new Date(y, month, d2, 23, 59, 59, 999);
     return { start: localMidnight(startLocal, tz), end: localEndOfDay(endLocal, tz) };
   }
-  m = s.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2}),?\s*(\d{4})\s*(?:to|-\s*)\s*(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?)\s+(\d{1,2}),?\s*(\d{4})\b/i);
+  m = s.match(/\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2}),?\s*(\d{4})\s*(?:to|-\s*)\s*(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2}),?\s*(\d{4})\b/i);
   if (m) {
     const m1 = MONTHS[m[1].toLowerCase()], d1 = +m[2], y1 = +m[3];
     const m2 = MONTHS[m[4].toLowerCase()], d2 = +m[5], y2 = +m[6];
@@ -373,9 +374,8 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     const lc = normalizeInput(raw);
     const tz = getUserTz(userProfile);
 
-    // Always stamp the requester for auditing / per-actor limits
-    if (!extras || typeof extras !== 'object') extras = {};
-    if (!extras.requester_id) extras.requester_id = from;
+    // Set created_by for per-actor rate limiting
+    const xtras = { ...extras, created_by: from };
 
     // Block unapproved non-owners and notify Owner to approve
     if (!isOwner && !isApproved(userProfile)) {
@@ -394,7 +394,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>${approvalBlockMsg(userProfile, ownerProfile)}</Message></Response>`);
     }
 
-    // Owner/day limit check (preflight) – uses services/postgres implementation
+    // Owner/day limit check (preflight)
     const { ok: ownerLimitOk, tierKey, tierLimit } = await checkTimeEntryLimit(ownerId, userProfile?.subscription_tier || 'starter');
     if (!ownerLimitOk) {
       return res.send(
@@ -402,7 +402,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       );
     }
 
-    // Actor/day limit check – use sender id for stability
+    // Actor/day limit check
     const actorOk = await checkActorLimit(ownerId, from);
     if (!actorOk) {
       return res.send(`<Response><Message>⚠️ Daily action limit reached for your account. Try again tomorrow.</Message></Response>`);
@@ -441,7 +441,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `${who} already has an open break started at ${fmtInTz(new Date(existingBreak.timestamp), tz)}. End it first (e.g., "${who} break end").`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
-      await logTimeEntry(ownerId, who, 'break_start', whenUtc.toISOString(), jobName || null, tz, extras);
+      await logTimeEntry(ownerId, who, 'break_start', whenUtc.toISOString(), jobName || null, tz, xtras);
       const reply = `✅ Break start logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
@@ -478,7 +478,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       const punchOutUtcIso = t.toISOString();
 
       if (shiftStartIso) await closeOpenBreakIfAny(ownerId, employeeName, shiftStartIso, punchOutUtcIso, tz);
-      await logTimeEntry(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null, tz, extras);
+      await logTimeEntry(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null, tz, xtras);
       await clearPrompt(pending.id);
 
       const timesheet = await generateTimesheet(ownerId, employeeName, 'day', t, tz);
@@ -534,7 +534,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     }
 
     // 2) Batch summaries
-    const batch = await handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userProfile, isOwner, ownerProfile);
+    const batch = await handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, xtras, userProfile, isOwner, ownerProfile);
     if (batch?.handled) {
       const who = batch.names.join(', ');
       const dayStr = formatInTimeZone(new Date(batch.when), tz, 'MMM d');
@@ -577,7 +577,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `I see you’re trying to clock-in ${who}, but they weren’t clocked out from the last shift (started ${openLocal}). Reply with their clock-out time (e.g., "5:45pm yesterday").`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
-      await logTimeEntry(ownerId, who, 'punch_in', whenIso, jobName || null, tz, extras);
+      await logTimeEntry(ownerId, who, 'punch_in', whenIso, jobName || null, tz, xtras);
       const reply = `✅ Punch in logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
@@ -589,7 +589,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
       await closeOpenBreakIfAny(ownerId, who, open.timestamp, whenIso, tz);
-      await logTimeEntry(ownerId, who, 'punch_out', whenIso, jobName || null, tz, extras);
+      await logTimeEntry(ownerId, who, 'punch_out', whenIso, jobName || null, tz, xtras);
 
       const timesheet = await generateTimesheet(ownerId, who, 'day', whenUtc, tz);
       const entriesForDay = timesheet.entriesByDay?.[whenIso.split('T')[0]] || [];
@@ -611,7 +611,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `${who} already has an open break started at ${fmtInTz(new Date(existingBreak.timestamp), tz)}. End it first (e.g., "${who} break end").`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
-      await logTimeEntry(ownerId, who, 'break_start', whenIso, jobName || null, tz, extras);
+      await logTimeEntry(ownerId, who, 'break_start', whenIso, jobName || null, tz, xtras);
       const reply = `✅ Break start logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
@@ -622,12 +622,12 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `I don’t see an open break for ${who}. Start one first (e.g., "${who} break start at 10:15").`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
-      await logTimeEntry(ownerId, who, 'break_end', whenIso, jobName || null, tz, extras);
+      await logTimeEntry(ownerId, who, 'break_end', whenIso, jobName || null, tz, xtras);
       const reply = `✅ Break end logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    await logTimeEntry(ownerId, who, action, whenIso, jobName || null, tz, extras);
+    await logTimeEntry(ownerId, who, action, whenIso, jobName || null, tz, xtras);
     const reply = `✅ ${action.replace('_', ' ')} logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
     return res.send(`<Response><Message>${reply}</Message></Response>`);
   } catch (error) {

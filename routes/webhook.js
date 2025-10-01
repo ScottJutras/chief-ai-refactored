@@ -10,6 +10,7 @@ const tasksHandler = require('../handlers/commands/tasks'); // direct import fal
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
+const { handleOwnerApproval } = require('../handlers/commands/owner_approval');
 
 // Middleware
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
@@ -69,8 +70,8 @@ function normalizeTimeclockInput(input, userProfile) {
   };
   s = s.replace(/\bclock(?:ed)?\s*in\b/gi, 'punched in')
        .replace(/\bclock(?:ed)?\s*out\b/gi, 'punched out')
-       .replace(/\bpunch\s*in\b/gi, 'punched in')
-       .replace(/\bpunch\s*out\b/gi, 'punched out');
+       .replace(/\b(punch\s*in)\b/gi, 'punched in')
+       .replace(/\b(punch\s*out)\b/gi, 'punched out');
   const timeHit = findTime(s);
   const timeStr = timeHit.t;
   s = timeHit.rest;
@@ -157,15 +158,15 @@ router.post(
     const userId = from;
     let convo = await getConvoState(tenantId, userId);     // DB snapshot (aliases, history, active_job…)
     const state = {
-  user_id: userId,
-  tenant_id: tenantId,
-  active_job: null,
-  active_job_id: null,
-  aliases: {},
-  history: []
-};
+      user_id: userId,
+      tenant_id: tenantId,
+      active_job: null,
+      active_job_id: null,
+      aliases: {},
+      history: []
+    };
     state.active_job = convo.active_job || null;
-    state.active_job_id  = convo.active_job_id || null;
+    state.active_job_id = convo.active_job_id || null;
     state.aliases = convo.aliases || {};
     state.history = Array.isArray(convo.history) ? convo.history.slice(-5) : [];
 
@@ -176,7 +177,6 @@ router.post(
       'default.markup',
       'client.default_terms'
     ]);
-    // (Use `memory` inside your nlp/router if you want; this file doesn’t need it directly.)
 
     try {
       // 0) Onboarding
@@ -188,6 +188,19 @@ router.post(
         });
         ensureReply(res, `Welcome to Chief AI! Quick question — what's your name?`);
         return;
+      }
+
+      // 0.5) Owner approval command ("approve Justin as team")
+      if (/^approve\s+/i.test(input)) {
+        const handled = await handleOwnerApproval(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+        if (handled !== false) {
+          await logEvent(tenantId, userId, 'owner_approval', { input });
+          await saveConvoState(tenantId, userId, {
+            history: [...(convo.history || []).slice(-4), { input, response: 'Approval processed.', intent: 'owner_approval' }]
+          });
+          if (!res.headersSent) ensureReply(res, 'Approval processed.');
+          return;
+        }
       }
 
       // 1) Upgrade flow (Stripe)
@@ -366,7 +379,7 @@ router.post(
         return;
       }
 
-      // 3b) Conversational router first (prevents misroutes, emits handler-safe strings)
+      // 4) Conversational router first (prevents misroutes, emits handler-safe strings)
       try {
         const conv = await converseAndRoute(input, { userProfile, ownerId: tenantId, convoState: state });
 
@@ -452,7 +465,7 @@ router.post(
         console.warn('[Conversational Router] error:', e?.message);
       }
 
-      // 4) Timeclock (direct keywords)
+      // 5) Timeclock (direct keywords)
       if (isTimeclockMessage(input)) {
         const normalized = normalizeTimeclockInput(input, userProfile);
         await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
@@ -461,7 +474,7 @@ router.post(
         return;
       }
 
-      // 5) AI intent router (tool-calls)
+      // 6) AI intent router (tool-calls)
       try {
         const ai = await routeWithAI(input, { userProfile });
         if (ai) {
@@ -523,7 +536,7 @@ router.post(
         console.warn('[AI Router] skipped due to error:', e?.message);
       }
 
-      // 6) Fast intent router for jobs
+      // 7) Fast intent router for jobs
       if (/^\s*(create|new|add)\s+job\b/i.test(input) || /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)) {
         if (typeof commands.job === 'function') {
           try {
@@ -544,7 +557,7 @@ router.post(
         }
       }
 
-      // 7) General dispatch (with internal timeclock guard)
+      // 8) General dispatch (with internal timeclock guard)
       {
         const handled = await dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
         if (handled) {
@@ -556,7 +569,7 @@ router.post(
         }
       }
 
-      // 8) Legacy combined handler
+      // 9) Legacy combined handler
       if (typeof commands.handleCommands === 'function') {
         try {
           const handled = await commands.handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);

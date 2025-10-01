@@ -647,7 +647,7 @@ async function logTimeEntry(
   timestamp,
   jobName = null,
   tz = 'America/Toronto',
-  extras = {} // <- accept optional lat/lng/address here
+  extras = {} // <- accept optional lat/lng/address/created_by here
 ) {
   try {
     if (!ownerId) throw new Error('Missing ownerId');
@@ -665,6 +665,7 @@ async function logTimeEntry(
     const lat = extras.lat ?? null;
     const lng = extras.lng ?? null;
     let address = extras.address ?? null;
+    const createdBy = extras.requester_id || extras.created_by || null;
 
     // De-dupe within ± window
     const dupeQ = `
@@ -680,24 +681,27 @@ async function logTimeEntry(
     const dupe = await pool.query(dupeQ, [ownerId, employeeName, type, tsIso]);
     if (dupe.rows.length) return dupe.rows[0].id;
 
+    // Check if created_by column exists
+    const hasCreatedBy = await hasCreatedByColumn();
+    let ins, params;
+    if (hasCreatedBy) {
+      ins = `
+        INSERT INTO time_entries
+          (owner_id, employee_name, type, timestamp, job_name, tz, local_time, lat, lng, address, created_by, created_at)
+        VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,$9,$10,$11,NOW())
+        RETURNING id`;
+      params = [ownerId, employeeName, type, tsIso, jobName || null, tz, localStr, lat, lng, address, createdBy];
+    } else {
+      ins = `
+        INSERT INTO time_entries
+          (owner_id, employee_name, type, timestamp, job_name, tz, local_time, lat, lng, address, created_at)
+        VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,$9,$10,NOW())
+        RETURNING id`;
+      params = [ownerId, employeeName, type, tsIso, jobName || null, tz, localStr, lat, lng, address];
+    }
+
     // Insert with tz, local_time, and geo columns
-    const ins = `
-      INSERT INTO time_entries
-        (owner_id, employee_name, type, timestamp, job_name, tz, local_time, lat, lng, address, created_at)
-      VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,$9,$10,NOW())
-      RETURNING id`;
-    const { rows } = await pool.query(ins, [
-      ownerId,
-      employeeName,
-      type,
-      tsIso,
-      jobName || null,
-      tz,
-      localStr,
-      lat,
-      lng,
-      address,
-    ]);
+    const { rows } = await pool.query(ins, params);
     const insertedId = rows[0].id;
 
     // If we have coords but no address, reverse-geocode (best-effort) and backfill
@@ -885,6 +889,66 @@ async function closeOpenBreakIfAny(ownerId, employeeName, sinceUtcIso, endUtcIso
   return rows[0] || null;
 }
 
+// --- Time Entries: limits & audit ---
+const TIER_LIMITS = { starter: 50, pro: 200, enterprise: 1000 };
+function tierLimitFor(tier) {
+  const key = String(tier || 'starter').toLowerCase();
+  return { tierKey: key, tierLimit: TIER_LIMITS[key] ?? TIER_LIMITS.starter };
+}
+
+let HAS_CREATED_BY_CACHE = null;
+async function hasCreatedByColumn() {
+  if (HAS_CREATED_BY_CACHE !== null) return HAS_CREATED_BY_CACHE;
+  try {
+    const { rows } = await pool.query(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_name = 'time_entries'
+          AND column_name = 'created_by'
+        LIMIT 1`
+    );
+    HAS_CREATED_BY_CACHE = rows && rows.length > 0;
+  } catch {
+    HAS_CREATED_BY_CACHE = false;
+  }
+  return HAS_CREATED_BY_CACHE;
+}
+
+/**
+ * Per-owner daily cap. Returns { ok, tierKey, tierLimit, count }
+ */
+async function checkTimeEntryLimit(ownerId, tier) {
+  const { tierKey, tierLimit } = tierLimitFor(tier);
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) AS count
+       FROM time_entries
+      WHERE owner_id = $1
+        AND DATE(timestamp AT TIME ZONE 'UTC') = CURRENT_DATE`,
+    [ownerId]
+  );
+  const count = parseInt(rows?.[0]?.count || '0', 10);
+  return { ok: count < tierLimit, tierKey, tierLimit, count };
+}
+
+/**
+ * Per-actor daily cap. If 'created_by' column is missing, we skip limiting (return true).
+ * Returns boolean.
+ */
+async function checkActorLimit(ownerId, actorId) {
+  // If no created_by column yet, do not block – let entries through.
+  if (!(await hasCreatedByColumn())) return true;
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) AS count
+       FROM time_entries
+      WHERE owner_id = $1
+        AND created_by = $2
+        AND DATE(timestamp AT TIME ZONE 'UTC') = CURRENT_DATE`,
+    [ownerId, String(actorId)]
+  );
+  const n = parseInt(rows?.[0]?.count || '0', 10);
+  return n < 100; // default per-actor cap
+}
+
 // --- Reports ---
 async function generateReport(ownerId, tier) {
   try {
@@ -945,7 +1009,7 @@ async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = n
     { header: 'End', key: 'end', width: 12 },
   ];
   const startStr = (startIso || '').slice(0,10);
-  const endStr   = (endIso   || '').slice(0,10);
+  const endStr = (endIso || '').slice(0,10);
   for (const emp of Object.keys(byEmp)) {
     const summary = computeEmployeeSummary(byEmp[emp]);
     sum.addRow({
@@ -965,11 +1029,11 @@ async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = n
     const safeName = String(emp).slice(0,31).replace(/[\\/?*[\]:]/g, ' ');
     const ws = wb.addWorksheet(safeName || 'Employee');
     ws.columns = [
-      { header: 'Date',       key: 'date',  width: 12 },
+      { header: 'Date', key: 'date', width: 12 },
       { header: 'Local Time', key: 'local', width: 20 },
-      { header: 'UTC Time',   key: 'utc',   width: 20 },
-      { header: 'Type',       key: 'type',  width: 16 },
-      { header: 'Job',        key: 'job',   width: 28 },
+      { header: 'UTC Time', key: 'utc', width: 20 },
+      { header: 'Type', key: 'type', width: 16 },
+      { header: 'Job', key: 'job', width: 28 },
     ];
     for (const r of byEmp[emp]) {
       const ts = new Date(r.timestamp);
@@ -1334,5 +1398,10 @@ module.exports = {
   createTimeEditRequestTask,
   getUserBasic,
   getUserByName,
-  normalizePhoneNumber, // Already present, included for completeness
+  normalizePhoneNumber,
+
+  // time entries: limits & audit
+  checkTimeEntryLimit,
+  checkActorLimit,
+  hasCreatedByColumn
 };

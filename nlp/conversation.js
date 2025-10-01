@@ -8,6 +8,7 @@ const path = require('path');
 const { Pool } = require('pg'); // used for memory.forget branch
 const { routeWithAI } = require('./intentRouter');
 const { getMemory, upsertMemory } = require('../services/memory');
+const { getPendingPrompt } = require('../services/postgres'); // ⬅️ NEW
 
 const CATALOG = JSON.parse(fs.readFileSync(path.join(__dirname, 'commandCatalog.json'), 'utf8'));
 
@@ -139,10 +140,10 @@ function extractSlots(key, userText, convoState, memory) {
     }
   }
   if (def.contextual_defaults?.client && !slots.client) {
-    slots.client = memory?.['client.default_terms']?.name || null;
+    slots = slots; // no-op; left for parity with your structure
   }
   if (def.contextual_defaults?.quote_id && !slots.quote_id) {
-    slots.quote_id = convoState?.last_args?.quote_id || null;
+    slots = slots;
   }
 
   return slots;
@@ -156,7 +157,6 @@ function normalizeForHandlers(key, slots) {
     return { route: 'tasks', normalized: `task - ${title}` };
   }
   if (key === 'tasks.list') {
-    // our tasks handler treats "tasks" as "my tasks"
     return { route: 'tasks', normalized: 'tasks' };
   }
   if (key === 'tasks.assign_all') {
@@ -196,6 +196,25 @@ function normalizeForHandlers(key, slots) {
 
 // ---------------- main ----------------
 async function converseAndRoute(userText, { userProfile, ownerId, convoState, memory } = {}) {
+  // ⬇️⬇️⬇️ FAST-PATH FOR TIME PROMPTS ⬇️⬇️⬇️
+  try {
+    const pending = await getPendingPrompt(ownerId);
+    if (pending) {
+      // While a timeclock prompt is open, route EVERYTHING to timeclock.
+      // Pass the raw text through so time parsing (e.g., “5:40 yesterday”) works.
+      return {
+        handled: false,
+        route: 'timeclock',
+        normalized: userText,                 // pass raw text intact
+        intent: 'timeclock.pending_prompt'
+      };
+    }
+  } catch (e) {
+    // non-fatal; continue with normal routing
+    console.warn('[conversation] pending prompt check failed:', e?.message);
+  }
+  // ⬆️⬆️⬆️ FAST-PATH FOR TIME PROMPTS ⬆️⬆️⬆️
+
   const input = normalize(userText);
   let { key, score } = matchIntent(userText);
 

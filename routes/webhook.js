@@ -30,6 +30,9 @@ const { converseAndRoute } = require('../nlp/conversation');
 // Memory
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
+// ⬅️ NEW: pull pending-prompt checker from Postgres layer
+const { getPendingPrompt } = require('../services/postgres');
+
 const router = express.Router();
 
 // ----------------- helpers -----------------
@@ -377,6 +380,20 @@ router.post(
         });
         ensureReply(res, 'Got your file — processing complete.');
         return;
+      }
+
+      // 3.5) ⬅️ NEW: Fast-path for pending timeclock prompts (must run BEFORE conversational/AI routers)
+      try {
+        const pending = await getPendingPrompt(ownerId);
+        if (pending) {
+          const normalized = normalizeTimeclockInput(input, userProfile);
+          const handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+          await logEvent(tenantId, userId, 'timeclock_prompt_reply', { input, normalized, pending_kind: pending.kind });
+          if (!res.headersSent) ensureReply(res, handled ? '' : ''); // handler already replies; this is a safety net
+          return;
+        }
+      } catch (e) {
+        console.warn('[WEBHOOK] pending prompt check failed:', e?.message);
       }
 
       // 4) Conversational router first (prevents misroutes, emits handler-safe strings)

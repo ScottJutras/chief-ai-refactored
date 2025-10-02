@@ -45,7 +45,7 @@ function groupBy(arr, key) {
   return arr.reduce((m, x) => ((m[x[key]] ||= []).push(x), m), {});
 }
 
-// ✅ MISSING BEFORE: used by XLSX/PDF exports
+// ✅ Used by XLSX/PDF exports
 function computeEmployeeSummary(rows) {
   let totalHours = 0, driveHours = 0, breakMinutes = 0;
   let lastIn = null, lastDrive = null, lastBreak = null;
@@ -63,8 +63,8 @@ function computeEmployeeSummary(rows) {
     if (r.type === 'break_end' && lastBreak) { breakMinutes += (t - lastBreak) / 60000; lastBreak = null; }
   }
   if (lastBreak) {
-    const endTs = sorted.length ? new Date(sorted.at(-1).timestamp) : new Date();
-    breakMinutes += Math.max(0, (endTs - lastBreak) / 60000);
+    const last = sorted.length ? new Date(sorted[sorted.length - 1].timestamp) : new Date();
+    breakMinutes += Math.max(0, (last - lastBreak) / 60000);
   }
   return {
     totalHours: +totalHours.toFixed(2),
@@ -639,6 +639,17 @@ const VALID_TYPES = new Set([
 ]);
 
 const DUPE_WINDOW_SECONDS = Number(process.env.DUPE_WINDOW_SECONDS || 90); // 90 is safer for retries
+const MAX_FUTURE_MINUTES = Number(process.env.MAX_FUTURE_MINUTES || 10); // Grace window for future timestamps
+
+function enforceNoFarFuture(timestampIso) {
+  const now = Date.now();
+  const ts = new Date(timestampIso).getTime();
+  if ((ts - now) > MAX_FUTURE_MINUTES * 60 * 1000) {
+    const err = new Error(`Timestamp is more than ${MAX_FUTURE_MINUTES} minutes in the future`);
+    err.code = 'FUTURE_TS';
+    throw err;
+  }
+}
 
 async function logTimeEntry(
   ownerId,
@@ -656,6 +667,8 @@ async function logTimeEntry(
       throw new Error('Invalid employee name');
     }
     if (!isValidIsoTimestamp(timestamp)) throw new Error('Invalid timestamp');
+    // Defensive: disallow far-future entries beyond the grace window
+    enforceNoFarFuture(timestamp);
     if (jobName && jobName.length > 200) throw new Error('Job name too long');
 
     const ts = new Date(timestamp);
@@ -751,7 +764,8 @@ async function getTimeEntries(ownerId, employeeName, period = 'week', date = new
     } else if (period === 'week') {
       filter = `DATE(local_time) BETWEEN $2 AND $2::date + INTERVAL '6 days'`;
     } else {
-      filter = `DATE_TRUNC('month', local_time AT TIME ZONE $4) = DATE_TRUNC('month', $2::date AT TIME ZONE $4)`;
+      // local_time is stored as a local timestamp; no extra TZ conversion needed here
+      filter = `DATE_TRUNC('month', local_time) = DATE_TRUNC('month', $2::date)`;
     }
 
     const q = `
@@ -768,17 +782,23 @@ async function getTimeEntries(ownerId, employeeName, period = 'week', date = new
     throw error;
   }
 }
+
 async function getEntriesBetween(ownerId, employeeName, startIso, endIso) {
-  const q = `
-    SELECT *
+  try {
+    const q = `
+      SELECT *
       FROM time_entries
-     WHERE owner_id = $1
-       AND employee_name = $2
-       AND timestamp >= $3::timestamptz
-       AND timestamp <= $4::timestamptz
-     ORDER BY timestamp`;
-  const { rows } = await pool.query(q, [ownerId, employeeName, startIso, endIso]);
-  return rows;
+      WHERE owner_id = $1
+        AND employee_name = $2
+        AND timestamp >= $3::timestamptz
+        AND timestamp <= $4::timestamptz
+      ORDER BY timestamp`;
+    const { rows } = await pool.query(q, [ownerId, employeeName, startIso, endIso]);
+    return rows;
+  } catch (error) {
+    console.error('[ERROR] getEntriesBetween failed:', error.message);
+    throw error;
+  }
 }
 
 async function generateTimesheet(ownerId, employeeName, period, date, tz = 'America/Toronto') {
@@ -836,7 +856,7 @@ async function getPendingPrompt(ownerId) {
   await pool.query(`DELETE FROM timeclock_prompts WHERE expires_at < now() AND owner_id = $1`, [ownerId]);
   const { rows } = await pool.query(
     `SELECT * FROM timeclock_prompts
-     WHERE owner_id = $1 AND expires_at >= now()
+     WHERE owner_id = $1 AND (expires_at IS NULL OR expires_at >= now())
      ORDER BY created_at DESC
      LIMIT 1`,
     [ownerId],

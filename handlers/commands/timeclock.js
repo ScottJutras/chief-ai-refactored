@@ -16,7 +16,7 @@ const {
   checkTimeEntryLimit,
   checkActorLimit,
   hasCreatedByColumn,
-  // NEW: direct range query for precise summaries
+  // direct range query for precise summaries
   getEntriesBetween,
 } = require('../../services/postgres');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
@@ -40,6 +40,23 @@ function normalizeInput(raw) {
   let lc = String(raw || '').trim().toLowerCase();
   lc = lc.replace(/\bclock(?:ed)?\s+(our|or)\b/g, 'clocked out');
   return lc.replace(/\s{2,}/g, ' ').trim();
+}
+
+// --- Future-entry policy (grace window) ---
+const MAX_FUTURE_MINUTES = Number(process.env.MAX_FUTURE_MINUTES || 10);
+function isTooFarInFuture(ts) {
+  const now = Date.now();
+  return (new Date(ts).getTime() - now) > MAX_FUTURE_MINUTES * 60 * 1000;
+}
+function guardFutureOrExplain(whenUtc, tz, res, subject = 'That time') {
+  if (!whenUtc) return false;
+  if (isTooFarInFuture(whenUtc)) {
+    const msg = `⛔ ${subject} (${fmtInTz(whenUtc, tz)}) is more than ${MAX_FUTURE_MINUTES} minutes in the future. ` +
+                `Please send a current or past time (e.g., "10:00am yesterday" or "now").`;
+    res.send(`<Response><Message>${msg}</Message></Response>`);
+    return true;
+  }
+  return false;
 }
 
 // ---------- Access control ----------
@@ -163,7 +180,7 @@ function getUserTz(userProfile) {
 }
 
 // ---------- tolerant command patterns ----------
-// Order matters: put explicit “in NAME/out NAME” BEFORE generic patterns.
+// Order matters: explicit “in NAME/out NAME” BEFORE generic patterns.
 const RE_ACTION_FIRST = [
   // Explicit name after action (wins first)
   { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
@@ -242,6 +259,9 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userP
       const breakEnd = new Date(lunchStart.getTime() - gapMs);
       const breakStart = new Date(breakEnd.getTime() - bMs);
 
+      // Future guard for calculated endpoints (unlikely but safe)
+      if (guardFutureOrExplain(lunchEnd, tz, { send: () => {} })) { /* no-op in batch pre-check */ }
+
       await logTimeEntry(ownerId, name, 'break_start', breakStart.toISOString(), jobName || null, tz, extras);
       await logTimeEntry(ownerId, name, 'break_end', breakEnd.toISOString(), jobName || null, tz, extras);
       await logTimeEntry(ownerId, name, 'break_start', lunchStart.toISOString(), jobName || null, tz, extras);
@@ -272,6 +292,8 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userP
       const durMs = mins * 60 * 1000;
       const end = new Date(endAnchor.getTime());
       const start = new Date(end.getTime() - durMs);
+
+      if (guardFutureOrExplain(end, tz, { send: () => {} })) { /* no-op batch pre-check */ }
 
       await logTimeEntry(ownerId, name, 'break_start', start.toISOString(), jobName || null, tz, extras);
       await logTimeEntry(ownerId, name, 'break_end', end.toISOString(), jobName || null, tz, extras);
@@ -423,6 +445,9 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         return res.send(`<Response><Message>${denyActMsg(userProfile, who)}</Message></Response>`);
       }
 
+      // future guard
+      if (guardFutureOrExplain(whenUtc, tz, res, 'That time')) return;
+
       const openShift = await getOpenShift(ownerId, who);
       if (!openShift) {
         const msg = `${who} isn’t clocked in. Punch in first (e.g., "${who} punched in at 8am").`;
@@ -465,6 +490,10 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `I still need ${who}’s clock-out time for the last open shift (started ${askedAt}). Reply "5:45pm yesterday" or "4:30".`;
         return res.send(`<Response><Message>${msg}</Message></Response>`);
       }
+
+      // future guard
+      if (guardFutureOrExplain(t, tz, res, 'That time')) return;
+
       const employeeName = pending.employee_name;
       const shiftStartIso = pending.context?.shiftStartUtc;
       const punchOutUtcIso = t.toISOString();
@@ -473,7 +502,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       await logTimeEntry(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null, tz, xtras);
       await clearPrompt(pending.id);
 
-      // ✅ precise summary across the exact window
+      // precise summary across the exact window
       const windowEntries = await getEntriesBetween(ownerId, employeeName, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
       const { shiftHours, breakMinutes } = summarizeShiftFromEntries(windowEntries, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
 
@@ -556,6 +585,10 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     const timePhrase = (match.groups?.time || '').trim();
     let whenUtc = parseTimeFromText(timePhrase ? timePhrase.toLowerCase() : lc, tz);
     if (!whenUtc) whenUtc = new Date();
+
+    // future guard (applies to all single-action branches)
+    if (guardFutureOrExplain(whenUtc, tz, res, 'That time')) return;
+
     const whenIso = whenUtc.toISOString();
 
     if (action === 'punch_in') {
@@ -580,7 +613,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       await closeOpenBreakIfAny(ownerId, who, open.timestamp, whenIso, tz);
       await logTimeEntry(ownerId, who, 'punch_out', whenIso, jobName || null, tz, xtras);
 
-      // ✅ precise summary across the exact window
+      // precise summary across the exact window
       const windowEntries = await getEntriesBetween(ownerId, who, open.timestamp, whenIso);
       const { shiftHours, breakMinutes } = summarizeShiftFromEntries(windowEntries, open.timestamp, whenIso);
 

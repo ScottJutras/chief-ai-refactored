@@ -15,12 +15,14 @@ const {
   createTimeEditRequestTask,
   checkTimeEntryLimit,
   checkActorLimit,
-  hasCreatedByColumn
+  hasCreatedByColumn,
+  // NEW: direct range query for precise summaries
+  getEntriesBetween,
 } = require('../../services/postgres');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
 
-// ---------- Subscription tier limits to prevent DB spam ----------
+// ---------- Subscription tier limits ----------
 const TIME_ENTRY_LIMITS = {
   starter: { maxEntriesPerDay: 50 },
   pro: { maxEntriesPerDay: 200 },
@@ -40,7 +42,7 @@ function normalizeInput(raw) {
   return lc.replace(/\s{2,}/g, ' ').trim();
 }
 
-// ---------- Access control (Owner / Board / Team / Accountant) ----------
+// ---------- Access control ----------
 function normalizeName(s = '') { return String(s).trim().toLowerCase(); }
 
 function canActOn(userProfile, isOwner, targetName, ownerProfile) {
@@ -49,14 +51,10 @@ function canActOn(userProfile, isOwner, targetName, ownerProfile) {
   const ownerName = String(ownerProfile?.name || '').trim();
   const targetIsOwner = targetName && normalizeName(targetName) === normalizeName(ownerName);
 
-  if (isOwner) return true; // Owner can act on all
-  if (actorRole === 'board') return !targetIsOwner; // Board can act on anyone except the Owner
-  if (actorRole === 'team') {
-    // Team can act only on self; allow null to default to self
-    return !targetName || normalizeName(targetName) === normalizeName(actorName);
-  }
-  if (actorRole === 'accountant') return false; // Accountants cannot create/edit time
-  // Default safest behavior: only self
+  if (isOwner) return true;
+  if (actorRole === 'board') return !targetIsOwner;
+  if (actorRole === 'team') return !targetName || normalizeName(targetName) === normalizeName(actorName);
+  if (actorRole === 'accountant') return false;
   return !targetName || normalizeName(targetName) === normalizeName(actorName);
 }
 
@@ -69,7 +67,7 @@ function denyActMsg(actorProfile, targetName) {
   return `⛔ You don’t have permission to log this entry.`;
 }
 
-// ---------- Approval gate (Owner confirmation before any time actions) ----------
+// ---------- Approval gate ----------
 function isApproved(userProfile) {
   const role = String(userProfile?.role || '').toLowerCase();
   return ['owner', 'board', 'team', 'accountant'].includes(role);
@@ -165,39 +163,38 @@ function getUserTz(userProfile) {
 }
 
 // ---------- tolerant command patterns ----------
-const RE_NAME_FIRST = [
-  // “Justin punched in at 10am”
-  { type: 'punch_in', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  // New: “Scott went on break”, “Scott just went on break at 10:22”
-  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:just\s+)?(?:went\s+on\s+|is\s+on\s+)?break(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'break_end', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'drive_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'drive_end', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-];
-
+// Order matters: put explicit “in NAME/out NAME” BEFORE generic patterns.
 const RE_ACTION_FIRST = [
-  // Existing “... for NAME” forms
-  { type: 'punch_in', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  // NEW: “punch in NAME …” and “clock out NAME …”
-  { type: 'punch_in', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
+  // Explicit name after action (wins first)
+  { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
   { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
-  // NEW: verb-first “went on break”, with optional “for NAME”
+  // Generic optional-name (falls back to self if no name captured)
+  { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+
+  // Break/lunch, drive (action-first)
   { type: 'break_start', re: /^(?:just\s+)?(?:went\s+on\s+|on\s+)?break(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
   { type: 'break_start', re: /^(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'break_end', re: /^(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'break_end',   re: /^(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
   { type: 'drive_start', re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'drive_end', re: /^drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'drive_end',   re: /^drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 ];
 
-// Time edit request pattern
+const RE_NAME_FIRST = [
+  { type: 'punch_in',  re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:just\s+)?(?:went\s+on\s+|is\s+on\s+)?break(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'break_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'drive_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'drive_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+];
+
 const RE_TIME_EDIT = /^(?:adjust|fix|edit)\s+(?:last)?\s*(?:punch|clock|break|lunch|drive)\s*(?:in|out|start|end)?\s*(?:by)?\s*([+-]?\d{1,3})\s*(?:min|minutes)\b/i;
 
 function dbgMatch(label, m) { if (m) console.log(`[timeclock] matched ${label}:`, m.groups || {}); }
 
-// ---------- batch parsers ----------
+// ---------- batch helpers ----------
 function extractDayOffset(text) { return /\byesterday\b/i.test(text) ? -1 : 0; }
 function stripDayWords(text) { return text.replace(/\b(today|yesterday)\b/gi, ' ').replace(/\s{2,}/g, ' ').trim(); }
 function splitNames(namesStr) { const s = namesStr.replace(/\s+and\s+/gi, ','); return s.split(',').map(x => titleCase(sanitizeInput(x.trim()))).filter(Boolean); }
@@ -287,7 +284,7 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userP
   return { handled: false };
 }
 
-// ---------- "last week"/"this week" date range ----------
+// ---------- date ranges for exports ----------
 const WEEK_STARTS_ON = 1;
 function localMidnight(date, tz) {
   const y = date.getFullYear(), m = String(date.getMonth() + 1).padStart(2, '0'), d = String(date.getDate()).padStart(2, '0');
@@ -374,10 +371,8 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     const lc = normalizeInput(raw);
     const tz = getUserTz(userProfile);
 
-    // Set created_by for per-actor rate limiting
     const xtras = { ...extras, created_by: from };
 
-    // Block unapproved non-owners and notify Owner to approve
     if (!isOwner && !isApproved(userProfile)) {
       try {
         await createTimeEditRequestTask({
@@ -394,7 +389,6 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>${approvalBlockMsg(userProfile, ownerProfile)}</Message></Response>`);
     }
 
-    // Owner/day limit check (preflight)
     const { ok: ownerLimitOk, tierKey, tierLimit } = await checkTimeEntryLimit(ownerId, userProfile?.subscription_tier || 'starter');
     if (!ownerLimitOk) {
       return res.send(
@@ -402,13 +396,12 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       );
     }
 
-    // Actor/day limit check
     const actorOk = await checkActorLimit(ownerId, from);
     if (!actorOk) {
       return res.send(`<Response><Message>⚠️ Daily action limit reached for your account. Try again tomorrow.</Message></Response>`);
     }
 
-    // Job context: explicit tail > active job > null
+    // Job context
     const jobOverride = extractJobHint(raw);
     let jobName = jobOverride && jobOverride.trim() ? jobOverride.trim() : null;
     if (!jobName) {
@@ -416,7 +409,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       jobName = activeJob && activeJob !== 'Uncategorized' ? activeJob : null;
     }
 
-    // 0d) Interpret “clock out ... for break/lunch” as a break start (not a shift end)
+    // Interpret “clock out ... for break/lunch” as break start
     if (/\bfor\s+(break|lunch)\b/i.test(raw) && /\b(?:clock(?:ed)?\s*out|punch(?:ed)?\s*out)\b/i.test(raw)) {
       const mNameFirst = raw.match(/^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+.*?\b(?:clock(?:ed)?\s*out|punch(?:ed)?\s*out)\b.*?\bfor\s+(?<kind>break|lunch)\b(?:\s*(?:at|@)\s*(?<time>.+))?$/iu);
       const mActionFirst = raw.match(/^(?:clock(?:ed)?\s*out|punch(?:ed)?\s*out)\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+.*?\bfor\s+(?<kind>break|lunch)\b(?:\s*(?:at|@)\s*(?<time>.+))?$/iu);
@@ -426,7 +419,6 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       let whenUtc = parseTimeFromText((mNameFirst?.groups?.time || mActionFirst?.groups?.time || mFallback?.groups?.time || '').toLowerCase(), tz);
       if (!whenUtc) whenUtc = new Date();
 
-      // Permissions
       if (!canActOn(userProfile, isOwner, who, ownerProfile)) {
         return res.send(`<Response><Message>${denyActMsg(userProfile, who)}</Message></Response>`);
       }
@@ -446,7 +438,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    // 0a) Timesheet export
+    // Timesheet export
     if (/\btimes?\s*sheet\b/i.test(lc)) {
       const range = parseDateRangeFromText(raw, tz);
       if (!range) {
@@ -463,7 +455,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message><Body>${body}</Body><Media>${url}</Media></Message></Response>`);
     }
 
-    // 0b) Pending prompt flow (need clock-out time)
+    // Pending prompt: need clock-out time
     const pending = await getPendingPrompt(ownerId);
     if (pending && pending.kind === 'need_clock_out_time') {
       const t = parseTimeFromText(lc, tz);
@@ -481,15 +473,15 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       await logTimeEntry(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null, tz, xtras);
       await clearPrompt(pending.id);
 
-      const timesheet = await generateTimesheet(ownerId, employeeName, 'day', t, tz);
-      const entriesForDay = timesheet.entriesByDay?.[t.toISOString().split('T')[0]] || [];
-      const { shiftHours, breakMinutes } = summarizeShiftFromEntries(entriesForDay, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
+      // ✅ precise summary across the exact window
+      const windowEntries = await getEntriesBetween(ownerId, employeeName, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
+      const { shiftHours, breakMinutes } = summarizeShiftFromEntries(windowEntries, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
 
       const msg = `✅ Clocked out ${titleCase(employeeName)} at ${fmtInTz(t, tz)}.\nWorked ${shiftHours.toFixed(2)}h including ${breakMinutes}m paid breaks/lunch.`;
       return res.send(`<Response><Message>${msg}</Message></Response>`);
     }
 
-    // 0c) Time edit request
+    // Time edit request
     const editMatch = lc.match(RE_TIME_EDIT);
     if (editMatch) {
       const minutes = parseInt(editMatch[1], 10);
@@ -516,7 +508,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>✅ Time edit request created (#${task.id}): Adjust last entry by ${minutes} minutes for ${employeeName}. Owner/Board will review.</Message></Response>`);
     }
 
-    // 1) Hours query
+    // Hours query
     const hoursQ = parseHoursQuery(lc, userProfile?.name || '');
     if (hoursQ) {
       const employeeName = hoursQ.employeeName || userProfile?.name || '';
@@ -533,7 +525,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>${reply}</Message></Response>`);
     }
 
-    // 2) Batch summaries
+    // Batch summaries
     const batch = await handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, xtras, userProfile, isOwner, ownerProfile);
     if (batch?.handled) {
       const who = batch.names.join(', ');
@@ -546,7 +538,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>⚠️ ${batch.error}</Message></Response>`);
     }
 
-    // 3) Single action entry
+    // Single action entry
     let match = null, action = null;
     for (const { type, re } of RE_NAME_FIRST) { const m = raw.match(re); if (m) { match = m; action = type; dbgMatch(type + ':name-first', m); break; } }
     if (!match) { for (const { type, re } of RE_ACTION_FIRST) { const m = raw.match(re); if (m) { match = m; action = type; dbgMatch(type + ':action-first', m); break; } } }
@@ -557,8 +549,6 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     }
 
     const who = titleCase(sanitizeInput(match.groups?.name || userProfile?.name || 'Unknown'));
-
-    // Permissions: block unauthorized cross-user edits
     if (!canActOn(userProfile, isOwner, who, ownerProfile)) {
       return res.send(`<Response><Message>${denyActMsg(userProfile, who)}</Message></Response>`);
     }
@@ -568,7 +558,6 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     if (!whenUtc) whenUtc = new Date();
     const whenIso = whenUtc.toISOString();
 
-    // State rules
     if (action === 'punch_in') {
       const open = await getOpenShift(ownerId, who);
       if (open) {
@@ -591,9 +580,9 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       await closeOpenBreakIfAny(ownerId, who, open.timestamp, whenIso, tz);
       await logTimeEntry(ownerId, who, 'punch_out', whenIso, jobName || null, tz, xtras);
 
-      const timesheet = await generateTimesheet(ownerId, who, 'day', whenUtc, tz);
-      const entriesForDay = timesheet.entriesByDay?.[whenIso.split('T')[0]] || [];
-      const { shiftHours, breakMinutes } = summarizeShiftFromEntries(entriesForDay, open.timestamp, whenIso);
+      // ✅ precise summary across the exact window
+      const windowEntries = await getEntriesBetween(ownerId, who, open.timestamp, whenIso);
+      const { shiftHours, breakMinutes } = summarizeShiftFromEntries(windowEntries, open.timestamp, whenIso);
 
       const reply = `✅ Clocked out ${who} at ${fmtInTz(whenUtc, tz)}.\nWorked ${shiftHours.toFixed(2)}h, including ${breakMinutes}m paid breaks/lunch.`;
       return res.send(`<Response><Message>${reply}</Message></Response>`);

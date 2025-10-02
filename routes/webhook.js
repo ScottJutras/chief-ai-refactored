@@ -62,27 +62,36 @@ function isTimeclockMessage(s = '') {
 function normalizeTimeclockInput(input, userProfile) {
   const original = String(input || '');
   let s = original.trim();
+
   const findTime = (text) => {
     let m = text.match(/\b(\d{1,2}):(\d{2})\s*([ap])\.?m\.?\b/i);
-    if (m) return { t: `${parseInt(m[1], 10)}:${m[2]} ${m[3].toLowerCase()==='a'?'am':'pm'}`, rest: text.replace(m[0],'').trim() };
+    if (m) return { t: `${parseInt(m[1],10)}:${m[2]} ${m[3].toLowerCase()==='a'?'am':'pm'}`, rest: text.replace(m[0],'').trim() };
     m = text.match(/\b(\d{1,2})(\d{2})\s*([ap])\.?m\.?\b/i);
     if (m) return { t: `${parseInt(m[1],10)}:${m[2]} ${m[3].toLowerCase()==='a'?'am':'pm'}`, rest: text.replace(m[0],'').trim() };
     m = text.match(/\b(\d{1,2})\s*([ap])\.?m\.?\b/i);
     if (m) return { t: `${parseInt(m[1],10)}:00 ${m[2].toLowerCase()==='a'?'am':'pm'}`, rest: text.replace(m[0],'').trim() };
     return { t: null, rest: text };
   };
+
   s = s.replace(/\bclock(?:ed)?\s*in\b/gi, 'punched in')
        .replace(/\bclock(?:ed)?\s*out\b/gi, 'punched out')
        .replace(/\b(punch\s*in)\b/gi, 'punched in')
        .replace(/\b(punch\s*out)\b/gi, 'punched out');
+
   const timeHit = findTime(s);
   const timeStr = timeHit.t;
   s = timeHit.rest;
 
+  // name first → “Justin punched in …”
   let m = s.match(/^\s*([a-z][\w\s.'-]{1,50}?)\s+punched\s+(in|out)\b/i);
   if (m) return `${m[1].trim()} punched ${m[2].toLowerCase()}${timeStr ? ` at ${timeStr}` : ''}`.trim();
-  m = s.match(/\bpunched\s+(in|out)\s+([a-z][\w\s.'-]{1,50}?)\b/i);
+
+  // action first, name after → “punched in Justin …”
+  // allow punctuation or “at …” right after the name
+  m = s.match(/\bpunched\s+(in|out)\s+([a-z][\w\s.'-]{1,50}?)(?=\s|$|[,.!?]|(?:\s+at\b))/i);
   if (m) return `${m[2].trim()} punched ${m[1].toLowerCase()}${timeStr ? ` at ${timeStr}` : ''}`.trim();
+
+  // bare “punched in/out” → default to self
   m = s.match(/\bpunched\s+(in|out)\b/i);
   if (m) {
     const who = (userProfile && userProfile.name) ? userProfile.name : '';
@@ -395,6 +404,16 @@ router.post(
       } catch (e) {
         console.warn('[WEBHOOK] pending prompt check failed:', e?.message);
       }
+      
+      // 3.6) PRIORITY: Direct timeclock route on explicit timeclock language
+if (isTimeclockMessage(input)) {
+  const normalized = normalizeTimeclockInput(input, userProfile);
+  await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+  await logEvent(tenantId, userId, 'timeclock_direct', { normalized });
+  if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
+  return;
+}
+
 
       // 4) Conversational router first (prevents misroutes, emits handler-safe strings)
       try {

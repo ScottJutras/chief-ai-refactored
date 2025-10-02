@@ -1373,6 +1373,7 @@ module.exports = {
   logTimeEntry,
   moveLastEntryToJob,
   getTimeEntries,
+  getEntriesBetween,
   generateTimesheet,
   createTimePrompt,
   getPendingPrompt,

@@ -768,6 +768,18 @@ async function getTimeEntries(ownerId, employeeName, period = 'week', date = new
     throw error;
   }
 }
+async function getEntriesBetween(ownerId, employeeName, startIso, endIso) {
+  const q = `
+    SELECT *
+      FROM time_entries
+     WHERE owner_id = $1
+       AND employee_name = $2
+       AND timestamp >= $3::timestamptz
+       AND timestamp <= $4::timestamptz
+     ORDER BY timestamp`;
+  const { rows } = await pool.query(q, [ownerId, employeeName, startIso, endIso]);
+  return rows;
+}
 
 async function generateTimesheet(ownerId, employeeName, period, date, tz = 'America/Toronto') {
   try {

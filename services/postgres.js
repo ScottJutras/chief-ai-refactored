@@ -1050,6 +1050,12 @@ async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
       throw new Error('generateTimesheet(options): ownerId and person are required');
     }
 
+    // Helpers expected elsewhere in file:
+    // - startOfLocalDay(date, tz)  -> Date (UTC) at local 00:00
+    // - endOfLocalDay(date, tz)    -> Date (UTC) at local 23:59:59
+    // - startOfLocalWeek(date, tz, weekStartsOn=1) -> Date (UTC) at local Monday 00:00
+    // - startOfLocalMonth(date, tz) -> Date (UTC) at local first-of-month 00:00
+
     let startUtc, endUtc;
 
     if (period === 'day') {
@@ -1058,9 +1064,9 @@ async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
     } else if (period === 'week') {
       // Monday → Sunday window in user's TZ
       startUtc = startOfLocalWeek(now, tz, 1);
-      const endLocal = utcToZonedTime(startUtc, tz);
-      endLocal.setDate(endLocal.getDate() + 6);
-      endUtc = endOfLocalDay(endLocal, tz);
+      // add 6 days in ms, then take end of that local day (no utcToZonedTime import needed)
+      const sixDaysLater = new Date(startUtc.getTime() + 6 * 24 * 60 * 60 * 1000);
+      endUtc = endOfLocalDay(sixDaysLater, tz);
     } else if (period === 'month') {
       // 1st of month → today (end of day)
       startUtc = startOfLocalMonth(now, tz);
@@ -1076,10 +1082,21 @@ async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
 
     // Breakdown lines
     let breakdownLines = [];
+
     if (period === 'week') {
       const dayBuckets = await getWeekDayBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
+
+      // Safer date coercion to avoid "Invalid time value" on various driver returns
+      const toDateSafe = (v) => {
+        if (v instanceof Date) return v;
+        const parsed = Date.parse(v);
+        if (!Number.isNaN(parsed)) return new Date(parsed);
+        // fallback for plain 'YYYY-MM-DD'
+        return new Date(`${String(v).slice(0, 10)}T00:00:00Z`);
+      };
+
       breakdownLines = dayBuckets.map((b) => {
-        const d = new Date(b.day + 'T00:00:00');
+        const d = toDateSafe(b.day);
         const label = formatInTimeZone(d, tz, 'EEEE');
         const hrs = (b.seconds / 3600).toFixed(2);
         return `${label} ${hrs} hours`;
@@ -1149,6 +1166,7 @@ async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
     entriesByDay: {},
   };
 }
+
 
 // --- Timeclock helpers (prompts + open-state checks) ---
 async function createTimePrompt(ownerId, employeeName, kind, context = {}) {

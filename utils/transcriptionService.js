@@ -69,7 +69,7 @@ async function transcribeWithGoogle(audioBuffer, mimeType) {
     const config = {
       encoding,
       ...(sampleRateHertz ? { sampleRateHertz } : {}),
-      languageCode: 'en-US',
+      languageCode: process.env.SPEECH_LANG || 'en-US',
       enableAutomaticPunctuation: true,
       enableWordTimeOffsets: false,
       speechContexts: [{
@@ -102,7 +102,8 @@ async function transcribeWithWhisper(audioBuffer, mimeType) {
   if (!ai) return null;
   try {
     const tmpName = path.join('/tmp', `audio_${Date.now()}` + (mimeType?.includes('ogg') ? '.ogg' : '.bin'));
-    fs.writeFileSync(tmpName, audioBuffer);
+    try { fs.writeFileSync(tmpName, audioBuffer); } catch (e) { 
++   console.error('[ERROR] tmp write failed:', e.message); return null; }
     const fileStream = fs.createReadStream(tmpName);
 
     // Prefer the lightweight transcription model name if available; fallback to whisper-1

@@ -26,6 +26,7 @@ async function userProfileMiddleware(req, res, next) {
       console.error('[userProfile] Missing From');
       return res
         .status(200)
+        .type('text/xml') 
         .send('<Response><Message>⚠️ Invalid request: missing sender.</Message></Response>');
     }
 

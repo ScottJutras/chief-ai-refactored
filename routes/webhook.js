@@ -381,15 +381,20 @@ router.post(
       }
 
       // 3) Media (non-DeepDive)
-      if (mediaUrl && mediaType) {
-        await handleMedia(from, mediaUrl, mediaType, userProfile, ownerId, ownerProfile, isOwner, res);
-        await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl });
-        await saveConvoState(tenantId, userId, {
-          history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: 'Got your file — processing complete.', intent: 'media' }]
-        });
-        ensureReply(res, 'Got your file — processing complete.');
-        return;
-      }
+if (mediaUrl && mediaType) {
+  const twiml = await handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType);
+  await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl });
+  await saveConvoState(tenantId, userId, {
+    history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: 'media handled', intent: 'media' }]
+  });
+  if (typeof twiml === 'string') {
+    res.status(200).type('text/xml').send(twiml);
+  } else {
+    ensureReply(res, 'Got your file — processing complete.');
+  }
+  return;
+}
+
 
       // 3.5) ⬅️ NEW: Fast-path for pending timeclock prompts (must run BEFORE conversational/AI routers)
       try {

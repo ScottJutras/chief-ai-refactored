@@ -103,12 +103,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       pendingMedia: { url: mediaUrl, type: null }
     });
     return `<Response><Message>${reply}</Message></Response>`;
-  } catch (error) {
+    } catch (error) {
     console.error(`[ERROR] handleMedia failed for ${from}:`, error.message);
     reply = `⚠️ Failed to process media: ${error.message}`;
     return `<Response><Message>${reply}</Message></Response>`;
-  } finally {
-    await require('../../middleware/lock').releaseLock(lockKey);
   }
 }
 

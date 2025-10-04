@@ -9,12 +9,9 @@ const {
   getActiveJob,
   appendToUserSpreadsheet,
   generateTimesheet,
-  // ⬇️ Optional: if your Postgres layer exposes an open-state probe, we'll use it.
-  // Prefer these names; we check existence at runtime:
-  // getOpenTimeState(ownerId, employeeName) → { on_shift, on_break, on_drive, last_shift_started_at, last_break_started_at, last_drive_started_at }
-  // getCurrentPunchState(ownerId, employeeName) → similar shape (compat)
-  getOpenTimeState,
-  getCurrentPunchState
+
+  // ⬇️ OPTIONAL: if you add these in your Postgres service, the guardrails become hard-enforced.
+  // getOpenShiftFor, getOpenBreakFor
 } = require('../services/postgres');
 
 const {
@@ -51,58 +48,78 @@ function friendlyTypeLabel(type) {
   return String(type).replace('_', ' ');
 }
 
-function hoursDecToHM(dec) {
-  const h = Math.floor(dec);
-  const m = Math.round((dec - h) * 60);
-  return { h, m };
+// ⬇️ NEW: helpers for timeclock guardrails
+function isStartAction(entryType) {
+  return entryType === 'punch_in' || entryType === 'break_start' || entryType === 'drive_start';
 }
-
-// ---------- NEW: fetch open-state if the service provides it ----------
-async function fetchOpenState(ownerId, employeeName) {
-  try {
-    if (typeof getOpenTimeState === 'function') {
-      return await getOpenTimeState(ownerId, employeeName);
-    }
-    if (typeof getCurrentPunchState === 'function') {
-      return await getCurrentPunchState(ownerId, employeeName);
-    }
-  } catch (e) {
-    console.warn('[OPENSTATE] probe failed:', e.message);
+function isEndAction(entryType) {
+  return entryType === 'punch_out' || entryType === 'break_end' || entryType === 'drive_end';
+}
+function conflictMessage(name, entryType, openWhat) {
+  // openWhat: 'shift' | 'break' | 'drive'
+  if (entryType === 'punch_in' && openWhat === 'shift') {
+    return `I can’t clock ${name} in until they’re clocked out of their previous shift. Try “clock out ${name}” first.`;
   }
-  return null; // gracefully degrade if unavailable
+  if (entryType === 'break_start' && openWhat === 'break') {
+    return `Looks like ${name} is already on a break. Say “end break for ${name}” to wrap it up.`;
+  }
+  if (entryType === 'drive_start' && openWhat === 'drive') {
+    return `${name} already has a drive session running. Try “end drive for ${name}” first.`;
+  }
+  if (entryType === 'punch_out' && openWhat !== 'shift') {
+    return `I couldn’t find an active shift for ${name} to clock out from. Try “clock in ${name}” first.`;
+  }
+  if (entryType === 'break_end' && openWhat !== 'break') {
+    return `There’s no active break for ${name}. Say “start break for ${name}” if they’re stepping away.`;
+  }
+  if (entryType === 'drive_end' && openWhat !== 'drive') {
+    return `There’s no active drive session for ${name}. Say “start drive for ${name}” to begin one.`;
+  }
+  return null;
 }
 
-// ---------- NEW: conversational enforcement for overlapping states ----------
-function humanWhen(ts, tz) {
-  if (!ts) return '';
+// ⬇️ NEW: soft guard that checks for open items if your Postgres service exposes helpers.
+// If not, this becomes a no-op and everything else still works.
+async function ensureAllowedTransition(ownerId, employeeName, entryType) {
   try {
-    const d = new Date(ts);
-    const day = d.toLocaleDateString('en-CA', { timeZone: tz, month: 'short', day: 'numeric' });
-    const time = d.toLocaleTimeString('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit' });
-    return `${day} at ${time}`;
+    const pg = require('../services/postgres') || {};
+    const has = (fn) => typeof fn === 'function';
+
+    // When starting, ensure there isn't already an open of the same “lane”
+    if (isStartAction(entryType)) {
+      if (entryType === 'punch_in' && has(pg.getOpenShiftFor)) {
+        const openShift = await pg.getOpenShiftFor(ownerId, employeeName);
+        if (openShift) return conflictMessage(employeeName, 'punch_in', 'shift');
+      }
+      if (entryType === 'break_start' && has(pg.getOpenBreakFor)) {
+        const openBreak = await pg.getOpenBreakFor(ownerId, employeeName);
+        if (openBreak) return conflictMessage(employeeName, 'break_start', 'break');
+      }
+      if (entryType === 'drive_start' && has(pg.getOpenDriveFor)) {
+        const openDrive = await pg.getOpenDriveFor(ownerId, employeeName);
+        if (openDrive) return conflictMessage(employeeName, 'drive_start', 'drive');
+      }
+    }
+
+    // When ending, ensure there IS an open to end
+    if (isEndAction(entryType)) {
+      if (entryType === 'punch_out' && has(pg.getOpenShiftFor)) {
+        const openShift = await pg.getOpenShiftFor(ownerId, employeeName);
+        if (!openShift) return conflictMessage(employeeName, 'punch_out', 'none');
+      }
+      if (entryType === 'break_end' && has(pg.getOpenBreakFor)) {
+        const openBreak = await pg.getOpenBreakFor(ownerId, employeeName);
+        if (!openBreak) return conflictMessage(employeeName, 'break_end', 'none');
+      }
+      if (entryType === 'drive_end' && has(pg.getOpenDriveFor)) {
+        const openDrive = await pg.getOpenDriveFor(ownerId, employeeName);
+        if (!openDrive) return conflictMessage(employeeName, 'drive_end', 'none');
+      }
+    }
+
+    return null; // allowed
   } catch {
-    return '';
-  }
-}
-
-function blockMsg(kind, name, openStartedAt, tz) {
-  const when = humanWhen(openStartedAt, tz);
-  const tail = when ? ` (started ${when})` : '';
-  switch (kind) {
-    case 'shift_open':
-      return `I can’t clock ${name} in until they clock out of the previous shift${tail}. Say “clock out ${name}” when they’re done.`;
-    case 'shift_closed':
-      return `${name} isn’t currently clocked in. Want me to clock them in? Try “clock in ${name}”.`;
-    case 'break_open':
-      return `Looks like ${name} is already on a break${tail}. Say “end break for ${name}” first.`;
-    case 'break_closed':
-      return `${name} isn’t on a break. You can say “start break for ${name}” to begin one.`;
-    case 'drive_open':
-      return `${name} is already tracking drive time${tail}. Say “drive end for ${name}” first.`;
-    case 'drive_closed':
-      return `${name} isn’t currently tracking drive time. Say “drive start for ${name}” to begin.`;
-    default:
-      return `That action can’t be completed right now for ${name}.`;
+    return null; // if helpers aren’t present or error, don’t block
   }
 }
 
@@ -130,156 +147,156 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(reply);
     }
 
-// ---------- Pending confirmation flow (do not block if NEW MEDIA arrived) ----------
-{
-  const pendingState = await getPendingTransactionState(from);
-  if (pendingState?.pendingMedia) {
-    const { type } = pendingState.pendingMedia; // can be null (unknown) or a string
-    const rawInput = String(input || '');
-    const lcInput = rawInput.toLowerCase().trim().replace(/[.!?]$/,'');
-    const isYes = lcInput === 'yes' || lcInput === 'y';
-    const isNo  = lcInput === 'no'  || lcInput === 'n' || lcInput === 'cancel';
+    // ---------- Pending confirmation flow (do not block if NEW MEDIA arrived) ----------
+    {
+      const pendingState = await getPendingTransactionState(from);
+      if (pendingState?.pendingMedia) {
+        const { type } = pendingState.pendingMedia; // can be null (unknown) or a string
+        const rawInput = String(input || '');
+        const lcInput = rawInput.toLowerCase().trim().replace(/[.!?]$/,'');
+        const isYes = lcInput === 'yes' || lcInput === 'y';
+        const isNo  = lcInput === 'no'  || lcInput === 'n' || lcInput === 'cancel';
 
-    const label = typeof friendlyTypeLabel === 'function'
-      ? friendlyTypeLabel(type)
-      : (type === 'time_entry' ? 'time entry' : type === 'hours_inquiry' ? 'hours inquiry' : String(type || 'entry').replace('_',' '));
+        const label = friendlyTypeLabel(type);
 
-    if (mediaUrl && mediaType) {
-      // New media → clear any old pending state and process the new file
-      await deletePendingTransactionState(from);
-
-    } else if (type != null) {
-      if (isYes) {
-        if (type === 'expense' && pendingState.pendingExpense) {
-          const data = pendingState.pendingExpense;
-          await appendToUserSpreadsheet(ownerId, [
-            data.date, data.item, data.amount, data.store,
-            (await getActiveJob(ownerId)) || 'Uncategorized',
-            'expense', data.category, data.mediaUrl || mediaUrl, userProfile.name || 'Unknown',
-          ]);
-          reply = `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`;
-
-        } else if (type === 'revenue' && pendingState.pendingRevenue) {
-          const data = pendingState.pendingRevenue;
-          await appendToUserSpreadsheet(ownerId, [
-            data.date, data.description, data.amount, data.source,
-            (await getActiveJob(ownerId)) || 'Uncategorized',
-            'revenue', data.category, data.mediaUrl || mediaUrl, userProfile.name || 'Unknown',
-          ]);
-          reply = `✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`;
-
-        } else if (type === 'time_entry' && pendingState.pendingTimeEntry) {
-          const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
-          await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
-          const tz = getUserTz(userProfile);
-          reply = `✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}${job ? ` on ${job}` : ''}`;
-
-        } else if (type === 'hours_inquiry') {
-          reply = `Please specify: today, this week, or this month.`;
-
-        } else {
-          reply = `Hmm, I lost the details for that ${label}. Please resend.`;
-        }
-        await deletePendingTransactionState(from);
-        return twiml(reply);
-
-      } else if (isNo) {
-        reply = `❌ ${label} cancelled.`;
-        await deletePendingTransactionState(from);
-        return twiml(reply);
-
-      } else if (lcInput === 'edit') {
-        reply = `Please resend the ${label} details.`;
-        await deletePendingTransactionState(from);
-        return twiml(reply);
-
-      } else if (type === 'hours_inquiry') {
-        let periodWord = lcInput.match(/\b(today|day|this\s+week|week|this\s+month|month|now)\b/i)?.[1]?.toLowerCase();
-        if (periodWord) {
-          if (periodWord === 'now') periodWord = 'today';
-          if (periodWord === 'this week') periodWord = 'week';
-          if (periodWord === 'this month') periodWord = 'month';
-          const period = periodWord === 'today' ? 'day' : periodWord;
-          const tz = getUserTz(userProfile);
-          const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
-          const { message } = await generateTimesheet({
-            ownerId, person: name, period, tz, now: new Date()
-          });
+        if (mediaUrl && mediaType) {
           await deletePendingTransactionState(from);
-          return twiml(message);
+
+        } else if (type != null) {
+          if (isYes) {
+            if (type === 'expense' && pendingState.pendingExpense) {
+              const data = pendingState.pendingExpense;
+              await appendToUserSpreadsheet(ownerId, [
+                data.date,
+                data.item,
+                data.amount,
+                data.store,
+                (await getActiveJob(ownerId)) || 'Uncategorized',
+                'expense',
+                data.category,
+                data.mediaUrl || mediaUrl,
+                userProfile.name || 'Unknown',
+              ]);
+              reply = `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`;
+
+            } else if (type === 'revenue' && pendingState.pendingRevenue) {
+              const data = pendingState.pendingRevenue;
+              await appendToUserSpreadsheet(ownerId, [
+                data.date,
+                data.description,
+                data.amount,
+                data.source,
+                (await getActiveJob(ownerId)) || 'Uncategorized',
+                'revenue',
+                data.category,
+                data.mediaUrl || mediaUrl,
+                userProfile.name || 'Unknown',
+              ]);
+              reply = `✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`;
+
+            } else if (type === 'time_entry' && pendingState.pendingTimeEntry) {
+              const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
+
+              // Guard: prevent illegal transitions (if helpers exist)
+              const deny = await ensureAllowedTransition(ownerId, employeeName, entryType);
+              if (deny) {
+                await deletePendingTransactionState(from);
+                return twiml(`⚠️ ${deny}`);
+              }
+
+              await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
+              const tz = getUserTz(userProfile);
+              reply = `✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}${job ? ` on ${job}` : ''}`;
+
+            } else if (type === 'hours_inquiry') {
+              reply = `Please specify: today, this week, or this month.`;
+
+            } else {
+              reply = `Hmm, I lost the details for that ${label}. Please resend.`;
+            }
+            await deletePendingTransactionState(from);
+            return twiml(reply);
+
+          } else if (isNo) {
+            reply = `❌ ${label} cancelled.`;
+            await deletePendingTransactionState(from);
+            return twiml(reply);
+
+          } else if (lcInput === 'edit') {
+            reply = `Please resend the ${label} details.`;
+            await deletePendingTransactionState(from);
+            return twiml(reply);
+
+          } else if (type === 'hours_inquiry') {
+            let periodWord = lcInput.match(/\b(today|day|this\s+week|week|this\s+month|month|now)\b/i)?.[1]?.toLowerCase();
+            if (periodWord) {
+              if (periodWord === 'now') periodWord = 'today';
+              if (periodWord === 'this week') periodWord = 'week';
+              if (periodWord === 'this month') periodWord = 'month';
+              const period = periodWord === 'today' ? 'day' : periodWord;
+              const tz = getUserTz(userProfile);
+              const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
+              const { message } = await generateTimesheet({
+                ownerId,
+                person: name,
+                period,
+                tz,
+                now: new Date()
+              });
+              await deletePendingTransactionState(from);
+              return twiml(message);
+            }
+            return twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`);
+          } else {
+            return twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${label}.`);
+          }
+
+        } else if (type == null && !mediaUrl) {
+          return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
         }
-        return twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`);
-      } else {
-        return twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${label}.`);
       }
-
-    } else if (type == null && !mediaUrl) {
-      return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
     }
-  }
-}
 
+    // ---------- Build text from media ----------
+    let extractedText = String(input || '').trim();
 
-    /// ---------- Build text from media ----------
-let extractedText = String(input || '').trim();
-
-if (validAudioTypes.some(t => mediaType && mediaType.toLowerCase().startsWith(t.split(';')[0]))) {
-  try {
-    const resp = await axios.get(mediaUrl, {
-      responseType: 'arraybuffer',
-      auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
-    });
-    const audioBuf = Buffer.from(resp.data);
-    console.log('[DEBUG] audio bytes:', audioBuf?.length, 'mime:', mediaType);
-
-    // First pass (whatever your transcribeAudio currently prefers — typically Google first)
-    let primary = await transcribeAudio(audioBuf, mediaType);
-    primary = (primary || '').trim();
-    console.log('[DEBUG] Primary transcript length:', primary.length, 'text:', JSON.stringify(primary));
-
-    // Heuristics for “bad/too-short” outcomes (e.g., just "now.")
-    const looksBad =
-      !primary ||
-      primary.replace(/[^\p{L}\p{N}]+/gu, '').length < 3 ||          // too few alphanum chars
-      /^now\.?$/i.test(primary) ||                                   // only "now"
-      primary.length < 8;                                            // very short
-
-    // Second pass: force Whisper (if your service supports options; if not, it’ll be ignored harmlessly)
-    let secondary = null;
-    if (looksBad) {
+    if (validAudioTypes.some(t => mediaType && mediaType.toLowerCase().startsWith(t.split(';')[0]))) {
       try {
-        secondary = await transcribeAudio(audioBuf, mediaType, { forceEngine: 'whisper' });
-        secondary = (secondary || '').trim();
-        console.log('[DEBUG] Secondary(Whisper) transcript length:', secondary.length, 'text:', JSON.stringify(secondary));
-      } catch (e2) {
-        console.warn('[DEBUG] Whisper secondary transcription failed:', e2.message);
+        const resp = await axios.get(mediaUrl, {
+          responseType: 'arraybuffer',
+          auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
+        });
+        const audioBuf = Buffer.from(resp.data);
+        console.log('[DEBUG] audio bytes:', audioBuf?.length, 'mime:', mediaType);
+        const transcript = await transcribeAudio(audioBuf, mediaType);
+        const len = transcript ? transcript.length : 0;
+        console.log(`[DEBUG] Transcription${transcript ? '' : ' (none)'}${len ? ' length: ' + len : ''}`);
+        extractedText = (transcript || extractedText || '').trim();
+      } catch (e) {
+        console.error('[ERROR] audio download/transcribe failed:', e.message);
       }
+
+      // ⬇️ NEW: salvage “Now.” one-word transcriptions from noise
+      if (/^now\.?$/i.test(extractedText)) {
+        // If it’s literally just “now”, ask a nudge that guides the user into a full phrase.
+        // (We keep this very light so it doesn’t get in the way when STT works.)
+        return twiml(`Heard “now”. If you’re clocking someone, say “clock in Justin now” or “punch out Justin”.`);
+      }
+
+      if (!extractedText) {
+        return twiml(`⚠️ I couldn’t understand the audio. Try again, or text me the details like "Justin hours week" or "expense $12 coffee".`);
+      }
+    } else if (validImageTypes.includes(mediaType)) {
+      const { text } = await extractTextFromImage(mediaUrl);
+      console.log('[DEBUG] OCR text length:', (text || '').length);
+      extractedText = (text || extractedText || '').trim();
     }
 
-    // Pick the better of the two: prefer the longer, non-"now" string
-    let chosen = primary;
-    if (secondary) {
-      const priBadScore = /^now\.?$/i.test(primary) ? 1 : 0;
-      const secBadScore = /^now\.?$/i.test(secondary) ? 1 : 0;
-      if (secondary.length > primary.length || (secBadScore < priBadScore)) {
-        chosen = secondary;
-      }
+    if (!extractedText) {
+      const msg = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
+      await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
+      return twiml(msg);
     }
-
-    extractedText = (chosen || extractedText || '').trim();
-    console.log('[DEBUG] Chosen transcript length:', extractedText.length, 'text:', JSON.stringify(extractedText));
-  } catch (e) {
-    console.error('[ERROR] audio download/transcribe failed:', e.message);
-  }
-
-  if (!extractedText) {
-    return twiml(`⚠️ I couldn’t understand the audio. Try again, or text me the details like "Justin hours week" or "expense $12 coffee".`);
-  }
-} else if (validImageTypes.includes(mediaType)) {
-  const { text } = await extractTextFromImage(mediaUrl);
-  console.log('[DEBUG] OCR text length:', (text || '').length);
-  extractedText = (text || extractedText || '').trim();
-}
 
     // ---------- Parse ----------
     console.log('[DEBUG] parseMediaText called:', { text: extractedText || '(empty)' });
@@ -317,51 +334,24 @@ if (validAudioTypes.some(t => mediaType && mediaType.toLowerCase().startsWith(t.
     }
 
     if (result.type === 'time_entry') {
+      // Voice UX: auto-commit, but add guardrails and only show a summary for punch_out.
       const { employeeName, type, timestamp } = result.data;
       const tz = getUserTz(userProfile);
       const activeJob = await getActiveJob(ownerId);
       const jobForLog = activeJob !== 'Uncategorized' ? activeJob : null;
 
-      // ⬇️ NEW: enforce open/close rules if we can fetch state
-      const state = await fetchOpenState(ownerId, employeeName);
-
-      if (state) {
-        if (type === 'punch_in' && state.on_shift) {
-          return twiml(blockMsg('shift_open', employeeName, state.last_shift_started_at, tz));
-        }
-        if (type === 'punch_out' && !state.on_shift) {
-          return twiml(blockMsg('shift_closed', employeeName, null, tz));
-        }
-
-        // Break is unified (covers “lunch” too, mapping -> break_*)
-        if (type === 'break_start' && !state.on_shift) {
-          return twiml(`I can’t start a break for ${employeeName} until they’re clocked in. Try “clock in ${employeeName}”.`);
-        }
-        if (type === 'break_start' && state.on_break) {
-          return twiml(blockMsg('break_open', employeeName, state.last_break_started_at, tz));
-        }
-        if (type === 'break_end' && !state.on_break) {
-          return twiml(blockMsg('break_closed', employeeName, null, tz));
-        }
-
-        // Drive rules (if you track drive separately)
-        if (type === 'drive_start' && state.on_drive) {
-          return twiml(blockMsg('drive_open', employeeName, state.last_drive_started_at, tz));
-        }
-        if (type === 'drive_end' && !state.on_drive) {
-          return twiml(blockMsg('drive_closed', employeeName, null, tz));
-        }
+      // ⬇️ NEW: guard against illegal transitions when helpers exist
+      const deny = await ensureAllowedTransition(ownerId, employeeName, type);
+      if (deny) {
+        return twiml(`⚠️ ${deny}`);
       }
 
-      // If we reach here, proceed with logging
       await logTimeEntry(ownerId, employeeName, type, timestamp, jobForLog);
 
-      const humanTime = fmtLocal(timestamp, tz);
-      let base = `✅ ${type.replace('_', ' ')} logged for ${employeeName} at ${humanTime}${jobForLog ? ` on ${jobForLog}` : ''}.`;
-
-      // Only add a "today total" for punch_out
-      if (type === 'punch_out') {
-        try {
+      let summaryTail = '';
+      try {
+        if (type === 'punch_out') {
+          // Include a quick same-day total at punch-out (what you asked for)
           const { message } = await generateTimesheet({
             ownerId,
             person: employeeName,
@@ -370,20 +360,14 @@ if (validAudioTypes.some(t => mediaType && mediaType.toLowerCase().startsWith(t.
             now: new Date()
           });
           const firstLine = String(message || '').split('\n')[0] || '';
-          const mm = firstLine.match(/\bworked\s+([\d.]+)\s+hours\b/i);
-          if (mm) {
-            const dec = parseFloat(mm[1]);
-            if (isFinite(dec)) {
-              const { h, m } = hoursDecToHM(dec);
-              base += ` Total hours worked today ${h} ${h === 1 ? 'hour' : 'hours'}${m ? ` ${m} minutes` : ''}.`;
-            }
-          }
-        } catch (e) {
-          console.warn('[MEDIA] day total fetch failed:', e.message);
+          if (firstLine) summaryTail = `\n${firstLine.replace(/^[^A-Za-z0-9]*/, '')}`;
         }
+      } catch (e) {
+        console.warn('[MEDIA] timesheet summary failed:', e.message);
       }
 
-      reply = base;
+      const humanTime = fmtLocal(timestamp, tz);
+      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName} at ${humanTime}${jobForLog ? ` on ${jobForLog}` : ''}.${summaryTail}`;
       return twiml(reply);
     }
 

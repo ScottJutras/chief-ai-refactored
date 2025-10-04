@@ -13,15 +13,6 @@ function sanitizeName(s) {
   return String(s || '').replace(/[^\p{L}\p{N}\s.'-]/gu, '').replace(/\s+/g, ' ').trim();
 }
 
-// Strip trailing time tokens accidentally captured as part of the name
-function stripTrailingTimeTokens(name) {
-  return String(name || '')
-    .replace(/\bnow\b/gi, '')
-    .replace(/\s+at\s+.*$/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 // Build a timestamp from an extracted clock string, else now (UTC ISO).
 function buildTimestampFromText(clockText) {
   if (!clockText) return new Date().toISOString();
@@ -104,9 +95,12 @@ function tryParseTimeEntry(rawText) {
 
     'drive start': 'drive_start',
     'drive begin': 'drive_start',
+    'drive in': 'drive_start',
+
     'drive end': 'drive_end',
     'drive stop': 'drive_end',
     'drive finish': 'drive_end',
+    'drive out': 'drive_end',
   };
 
   function makeResult(name, verbKey) {
@@ -120,6 +114,7 @@ function tryParseTimeEntry(rawText) {
         employeeName: titleCase(sanitizeName(name)),
         type,
         timestamp: ts,
+        // include whether time was implicit "now" to allow handler to auto-commit
         implicitNow: !timeWord || timeWord === 'now'
       }
     };
@@ -127,75 +122,43 @@ function tryParseTimeEntry(rawText) {
 
   // (1) Action-first "punch/clock in/out [for] NAME"
   let m = s.match(/\b(?:punch(?:ed)?|clock(?:ed)?)\s+(in|out)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
-  if (m) {
-    const dir = m[1].toLowerCase();
-    const name = stripTrailingTimeTokens(m[2]);
-    return makeResult(name, `punch ${dir}`);
-  }
+  if (m) return makeResult(m[2], `punch ${m[1].toLowerCase()}`);
 
-  // (1a) Sandwich "punch/clock NAME in/out"
+  // (1a) Sandwich "punch/clock NAME in/out"  ← handles “Clock Justin in now”
   m = s.match(/\b(?:punch|clock)\s+([a-z][\w\s.'-]{1,50})\s+(in|out)\b/iu);
-  if (m) {
-    const name = stripTrailingTimeTokens(m[1]);
-    const dir = m[2].toLowerCase();
-    return makeResult(name, `punch ${dir}`);
-  }
+  if (m) return makeResult(m[1], `punch ${m[2].toLowerCase()}`);
 
   // (2) Name-first "NAME punched/clocked in/out"
   m = s.match(/^([a-z][\w\s.'-]{1,50})\s+(?:punched|clocked|punch|clock)\s+(in|out)\b/iu);
-  if (m) {
-    const name = stripTrailingTimeTokens(m[1]);
-    const dir = m[2].toLowerCase();
-    return makeResult(name, `punch ${dir}`);
-  }
+  if (m) return makeResult(m[1], `punch ${m[2].toLowerCase()}`);
 
-  // (3) Break/Lunch/Drive action-first "(break|lunch|drive) (start|...)[for] NAME"
+  // (3) Break/Lunch/Drive action-first "(break|lunch|drive) (start|end|...)[for] NAME"
   m = s.match(/\b(break|lunch|drive)\s+(start|begin|in|end|out|finish)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
-  if (m) {
-    const name = stripTrailingTimeTokens(m[3]);
-    return makeResult(name, `${m[1].toLowerCase()} ${m[2].toLowerCase()}`);
-  }
+  if (m) return makeResult(m[3], `${m[1].toLowerCase()} ${m[2].toLowerCase()}`);
 
-  // (3b) NEW: action-first reversed "start/begin... (break|lunch|drive) [for] NAME"
-  m = s.match(/\b(start|begin|in|end|out|finish)\s+(break|lunch|drive)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
+  // (3a) NEW: Verb-first for breaks: "(start|begin|end|finish|stop) (break|lunch|drive) [for] NAME"
+  m = s.match(/\b(start|begin|end|finish|stop|in|out)\s+(break|lunch|drive)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
   if (m) {
-    const name = stripTrailingTimeTokens(m[3]);
-    return makeResult(name, `${m[2].toLowerCase()} ${m[1].toLowerCase()}`);
+    const dir = m[1].toLowerCase();
+    const obj = m[2].toLowerCase();
+    // normalize verbs to our map keys (in/out map to start/end)
+    const dirKey = (dir === 'in' ? 'start' : (dir === 'out' ? 'end' : dir));
+    return makeResult(m[3], `${obj} ${dirKey}`);
   }
 
   // (4) Break/Lunch/Drive name-first "NAME break/lunch/drive start/end"
   m = s.match(/^([a-z][\w\s.'-]{1,50})\s+(break|lunch|drive)\s+(start|begin|in|end|out|finish)\b/iu);
-  if (m) {
-    const name = stripTrailingTimeTokens(m[1]);
-    return makeResult(name, `${m[2].toLowerCase()} ${m[3].toLowerCase()}`);
-  }
-
-  // (4b) NEW: name-first reversed "NAME start/begin... break/lunch/drive"
-  m = s.match(/^([a-z][\w\s.'-]{1,50})\s+(start|begin|in|end|out|finish)\s+(break|lunch|drive)\b/iu);
-  if (m) {
-    const name = stripTrailingTimeTokens(m[1]);
-    return makeResult(name, `${m[3].toLowerCase()} ${m[2].toLowerCase()}`);
-  }
+  if (m) return makeResult(m[1], `${m[2].toLowerCase()} ${m[3].toLowerCase()}`);
 
   // (5) Imperative with commas "clock in, justin"
   m = s.match(/\b(?:punch|clock)\s+in\b[^a-z0-9]+([a-z][\w\s.'-]{1,50})\b/iu);
-  if (m) {
-    const name = stripTrailingTimeTokens(m[1]);
-    return makeResult(name, 'punch in');
-  }
+  if (m) return makeResult(m[1], 'punch in');
   m = s.match(/\b(?:punch|clock)\s+out\b[^a-z0-9]+([a-z][\w\s.'-]{1,50})\b/iu);
-  if (m) {
-    const name = stripTrailingTimeTokens(m[1]);
-    return makeResult(name, 'punch out');
-  }
+  if (m) return makeResult(m[1], 'punch out');
 
   // (6) “NAME just punched/clocked in/out”
   m = s.match(/^([a-z][\w\s.'-]{1,50})\s+just\s+(?:punched|clocked)\s+(in|out)\b/iu);
-  if (m) {
-    const name = stripTrailingTimeTokens(m[1]);
-    const dir = m[2].toLowerCase();
-    return makeResult(name, `punch ${dir}`);
-  }
+  if (m) return makeResult(m[1], `punch ${m[2].toLowerCase()}`);
 
   return null;
 }
@@ -205,6 +168,7 @@ function tryParseHoursInquiry(text) {
   const s = String(text || '').trim().toLowerCase();
   if (!/\bhours?\b/.test(s)) return null;
 
+  // capture a name if present
   const forName =
     s.match(/\bfor\s+([a-z][\w\s.'-]{1,50})\b/i)?.[1] ||
     s.match(/\b(?:did|does)\s+([a-z][\w\s.'-]{1,50})\s+(?:work|do)\b/i)?.[1] ||
@@ -212,6 +176,7 @@ function tryParseHoursInquiry(text) {
     s.match(/\b([a-z][\w\s.'-]{1,50})\s+(?:worked?|work)\b/i)?.[1] ||
     null;
 
+  // Accept explicit period if provided; otherwise leave null to trigger a clarifying question.
   const periodMatch = s.match(/\b(today|day|this\s+week|week|this\s+month|month)\b/i);
   let period = null;
   if (periodMatch) {
@@ -226,7 +191,7 @@ function tryParseHoursInquiry(text) {
       type: 'hours_inquiry',
       data: {
         employeeName: forName ? titleCase(sanitizeName(forName)) : null,
-        period
+        period // null | 'day' | 'week' | 'month'
       }
     };
   }
@@ -288,7 +253,7 @@ async function parseMediaText(text) {
   const timeEntry = tryParseTimeEntry(t);
   if (timeEntry) return timeEntry;
 
-  // 2) Hours inquiry (period optional)
+  // 2) Hours inquiry
   const h = tryParseHoursInquiry(t);
   if (h) return h;
 

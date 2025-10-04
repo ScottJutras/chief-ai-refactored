@@ -21,7 +21,7 @@ const { errorMiddleware } = require('../middleware/error');
 // Services
 const { sendMessage, sendTemplateMessage } = require('../services/twilio');
 const { parseUpload } = require('../services/deepDive');
-const { getPendingTransactionState, setPendingTransactionState } = require('../utils/stateManager');
+const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../utils/stateManager');
 
 // AI routers
 const { routeWithAI } = require('../nlp/intentRouter');           // tool-calls (strict)
@@ -31,7 +31,7 @@ const { converseAndRoute } = require('../nlp/conversation');
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
 // ⬅️ NEW: pull pending-prompt checker from Postgres layer
-const { getPendingPrompt } = require('../services/postgres');
+const { getPendingPrompt, logTimeEntry, getActiveJob, appendToUserSpreadsheet, generateTimesheet } = require('../services/postgres');
 
 const router = express.Router();
 
@@ -44,6 +44,20 @@ function ensureReply(res, text) {
   if (!res.headersSent) {
     res.status(200).type('text/xml').send(`<Response><Message>${text}</Message></Response>`);
   }
+}
+
+// ⬇️ NEW: small helpers used by the pending text-reply handler
+function twiml(text) {
+  return `<Response><Message>${text}</Message></Response>`;
+}
+function getUserTz(userProfile) {
+  return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+}
+function friendlyTypeLabel(type) {
+  if (!type) return 'entry';
+  if (type === 'time_entry') return 'time entry';
+  if (type === 'hours_inquiry') return 'hours inquiry';
+  return String(type).replace('_', ' ');
 }
 
 function isTimeclockMessage(s = '') {
@@ -164,6 +178,116 @@ router.post(
     }
 
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
+
+    // ⬇️⬇️⬇️ NEW: Handle pending confirmations for TEXT-ONLY replies (no media) ⬇️⬇️⬇️
+    try {
+      const pendingState = await getPendingTransactionState(from);
+      const hasPending = !!pendingState?.pendingMedia;
+      const isTextOnly = !mediaUrl && !!input;
+
+      if (hasPending && isTextOnly) {
+        const type = pendingState.pendingMedia.type; // may be null
+        const lcInput = String(input || '').toLowerCase().trim();
+
+        // Hours inquiry → expect “today / week / month”
+        if (type === 'hours_inquiry') {
+          const m = lcInput.match(/\b(today|day|this day|week|this week|month|this month)\b/i);
+          if (m) {
+            const raw = m[1].toLowerCase();
+            const period = raw.includes('week') ? 'week' : raw.includes('month') ? 'month' : 'day';
+            const tz = getUserTz(userProfile);
+            const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
+            const { message } = await generateTimesheet({
+              ownerId,
+              person: name,
+              period,
+              tz,
+              now: new Date()
+            });
+            await deletePendingTransactionState(from);
+            return res.status(200).type('text/xml').send(twiml(message));
+          }
+          // Not a valid period → re-prompt
+          return res
+            .status(200)
+            .type('text/xml')
+            .send(twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`));
+        }
+
+        // Expense / Revenue / Time entry confirmation
+        if (type === 'expense' || type === 'revenue' || type === 'time_entry') {
+          if (lcInput === 'yes') {
+            if (type === 'expense') {
+              const data = pendingState.pendingExpense;
+              await appendToUserSpreadsheet(ownerId, [
+                data.date,
+                data.item,
+                data.amount,
+                data.store,
+                (await getActiveJob(ownerId)) || 'Uncategorized',
+                'expense',
+                data.category,
+                data.mediaUrl || null,
+                userProfile.name || 'Unknown',
+              ]);
+              await deletePendingTransactionState(from);
+              return res.status(200).type('text/xml')
+                .send(twiml(`✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`));
+            }
+            if (type === 'revenue') {
+              const data = pendingState.pendingRevenue;
+              await appendToUserSpreadsheet(ownerId, [
+                data.date,
+                data.description,
+                data.amount,
+                data.source,
+                (await getActiveJob(ownerId)) || 'Uncategorized',
+                'revenue',
+                data.category,
+                data.mediaUrl || null,
+                userProfile.name || 'Unknown',
+              ]);
+              await deletePendingTransactionState(from);
+              return res.status(200).type('text/xml')
+                .send(twiml(`✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`));
+            }
+            if (type === 'time_entry') {
+              const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
+              await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
+              const tz = getUserTz(userProfile);
+              await deletePendingTransactionState(from);
+              return res.status(200).type('text/xml')
+                .send(twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${new Date(timestamp).toLocaleString('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit' })}${job ? ` on ${job}` : ''}`));
+            }
+          }
+
+          if (lcInput === 'no' || lcInput === 'cancel') {
+            await deletePendingTransactionState(from);
+            return res.status(200).type('text/xml')
+              .send(twiml(`❌ ${friendlyTypeLabel(type)} cancelled.`));
+          }
+
+          if (lcInput === 'edit') {
+            await deletePendingTransactionState(from);
+            return res.status(200).type('text/xml')
+              .send(twiml(`Please resend the ${friendlyTypeLabel(type)} details.`));
+          }
+
+          // Not yes/no/edit → gentle nudge
+          return res.status(200).type('text/xml')
+            .send(twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${friendlyTypeLabel(type)}.`));
+        }
+
+        // Pending type is null (we previously asked “expense/revenue/timesheet?”)
+        if (type == null) {
+          return res.status(200).type('text/xml')
+            .send(twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`));
+        }
+      }
+    } catch (e) {
+      console.warn('[WEBHOOK] pending text-reply handler skipped:', e?.message);
+    }
+    // ⬆️⬆️⬆️ END new pending text-reply handler ⬆️⬆️⬆️
 
     // ---------- memory bootstrapping ----------
     const tenantId = ownerId;
@@ -382,13 +506,13 @@ router.post(
 
       // 3) Media (non-DeepDive)
 if (mediaUrl && mediaType) {
-  const twiml = await handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType);
+  const twimlOut = await handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType);
   await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl });
   await saveConvoState(tenantId, userId, {
     history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: 'media handled', intent: 'media' }]
   });
-  if (typeof twiml === 'string') {
-    res.status(200).type('text/xml').send(twiml);
+  if (typeof twimlOut === 'string') {
+    res.status(200).type('text/xml').send(twimlOut);
   } else {
     ensureReply(res, 'Got your file — processing complete.');
   }
@@ -425,9 +549,9 @@ if (isTimeclockMessage(input)) {
         const conv = await converseAndRoute(input, { userProfile, ownerId: tenantId, convoState: state });
 
         // Quick helper to pluck plain text from TwiML when we want to log it
-        const extractMsg = (twiml) => {
-          if (!twiml) return '';
-          const m = twiml.match(/<Message>([\s\S]*?)<\/Message>/);
+        const extractMsg = (twimlStr) => {
+          if (!twimlStr) return '';
+          const m = twimlStr.match(/<Message>([\s\S]*?)<\/Message>/);
           return m ? m[1] : '';
         };
 

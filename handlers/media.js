@@ -130,125 +130,156 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(reply);
     }
 
-    // ---------- Pending confirmation flow (do not block if NEW MEDIA arrived) ----------
-    {
-      const pendingState = await getPendingTransactionState(from);
-      if (pendingState?.pendingMedia) {
-        const { type } = pendingState.pendingMedia; // can be null (unknown) or a string
-        const lcInput = String(input || '').toLowerCase().trim();
+// ---------- Pending confirmation flow (do not block if NEW MEDIA arrived) ----------
+{
+  const pendingState = await getPendingTransactionState(from);
+  if (pendingState?.pendingMedia) {
+    const { type } = pendingState.pendingMedia; // can be null (unknown) or a string
+    const rawInput = String(input || '');
+    const lcInput = rawInput.toLowerCase().trim().replace(/[.!?]$/,'');
+    const isYes = lcInput === 'yes' || lcInput === 'y';
+    const isNo  = lcInput === 'no'  || lcInput === 'n' || lcInput === 'cancel';
 
-        if (mediaUrl) {
-          await deletePendingTransactionState(from);
-        } else if (type != null) {
-          if (lcInput === 'yes') {
-            if (type === 'expense') {
-              const data = pendingState.pendingExpense;
-              await appendToUserSpreadsheet(ownerId, [
-                data.date,
-                data.item,
-                data.amount,
-                data.store,
-                (await getActiveJob(ownerId)) || 'Uncategorized',
-                'expense',
-                data.category,
-                data.mediaUrl || mediaUrl,
-                userProfile.name || 'Unknown',
-              ]);
-              reply = `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`;
-            } else if (type === 'revenue') {
-              const data = pendingState.pendingRevenue;
-              await appendToUserSpreadsheet(ownerId, [
-                data.date,
-                data.description,
-                data.amount,
-                data.source,
-                (await getActiveJob(ownerId)) || 'Uncategorized',
-                'revenue',
-                data.category,
-                data.mediaUrl || mediaUrl,
-                userProfile.name || 'Unknown',
-              ]);
-              reply = `✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`;
-            } else if (type === 'time_entry') {
-              const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
-              await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
-              const tz = getUserTz(userProfile);
-              reply = `✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}${job ? ` on ${job}` : ''}`;
-            } else if (type === 'hours_inquiry') {
-              reply = `Please specify: today, this week, or this month.`;
-            }
-            await deletePendingTransactionState(from);
-            return twiml(reply);
+    const label = typeof friendlyTypeLabel === 'function'
+      ? friendlyTypeLabel(type)
+      : (type === 'time_entry' ? 'time entry' : type === 'hours_inquiry' ? 'hours inquiry' : String(type || 'entry').replace('_',' '));
 
-          } else if (lcInput === 'no' || lcInput === 'cancel') {
-            reply = `❌ ${friendlyTypeLabel(type)} cancelled.`;
-            await deletePendingTransactionState(from);
-            return twiml(reply);
+    if (mediaUrl && mediaType) {
+      // New media → clear any old pending state and process the new file
+      await deletePendingTransactionState(from);
 
-          } else if (lcInput === 'edit') {
-            reply = `Please resend the ${friendlyTypeLabel(type)} details.`;
-            await deletePendingTransactionState(from);
-            return twiml(reply);
+    } else if (type != null) {
+      if (isYes) {
+        if (type === 'expense' && pendingState.pendingExpense) {
+          const data = pendingState.pendingExpense;
+          await appendToUserSpreadsheet(ownerId, [
+            data.date, data.item, data.amount, data.store,
+            (await getActiveJob(ownerId)) || 'Uncategorized',
+            'expense', data.category, data.mediaUrl || mediaUrl, userProfile.name || 'Unknown',
+          ]);
+          reply = `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`;
 
-          } else if (type === 'hours_inquiry') {
-            const periodWord = lcInput.match(/\b(today|day|week|month)\b/i)?.[1]?.toLowerCase();
-            if (periodWord) {
-              const period = periodWord === 'today' ? 'day' : periodWord;
-              const tz = getUserTz(userProfile);
-              const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
-              const { message } = await generateTimesheet({
-                ownerId,
-                person: name,
-                period,
-                tz,
-                now: new Date()
-              });
-              await deletePendingTransactionState(from);
-              return twiml(message);
-            }
-            return twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`);
-          } else {
-            return twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${friendlyTypeLabel(type)}.`);
-          }
-        } else if (type == null && !mediaUrl) {
-          return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
+        } else if (type === 'revenue' && pendingState.pendingRevenue) {
+          const data = pendingState.pendingRevenue;
+          await appendToUserSpreadsheet(ownerId, [
+            data.date, data.description, data.amount, data.source,
+            (await getActiveJob(ownerId)) || 'Uncategorized',
+            'revenue', data.category, data.mediaUrl || mediaUrl, userProfile.name || 'Unknown',
+          ]);
+          reply = `✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`;
+
+        } else if (type === 'time_entry' && pendingState.pendingTimeEntry) {
+          const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
+          await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
+          const tz = getUserTz(userProfile);
+          reply = `✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}${job ? ` on ${job}` : ''}`;
+
+        } else if (type === 'hours_inquiry') {
+          reply = `Please specify: today, this week, or this month.`;
+
+        } else {
+          reply = `Hmm, I lost the details for that ${label}. Please resend.`;
         }
+        await deletePendingTransactionState(from);
+        return twiml(reply);
+
+      } else if (isNo) {
+        reply = `❌ ${label} cancelled.`;
+        await deletePendingTransactionState(from);
+        return twiml(reply);
+
+      } else if (lcInput === 'edit') {
+        reply = `Please resend the ${label} details.`;
+        await deletePendingTransactionState(from);
+        return twiml(reply);
+
+      } else if (type === 'hours_inquiry') {
+        let periodWord = lcInput.match(/\b(today|day|this\s+week|week|this\s+month|month|now)\b/i)?.[1]?.toLowerCase();
+        if (periodWord) {
+          if (periodWord === 'now') periodWord = 'today';
+          if (periodWord === 'this week') periodWord = 'week';
+          if (periodWord === 'this month') periodWord = 'month';
+          const period = periodWord === 'today' ? 'day' : periodWord;
+          const tz = getUserTz(userProfile);
+          const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
+          const { message } = await generateTimesheet({
+            ownerId, person: name, period, tz, now: new Date()
+          });
+          await deletePendingTransactionState(from);
+          return twiml(message);
+        }
+        return twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`);
+      } else {
+        return twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${label}.`);
       }
+
+    } else if (type == null && !mediaUrl) {
+      return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
     }
+  }
+}
 
-    // ---------- Build text from media ----------
-    let extractedText = String(input || '').trim();
 
-    if (validAudioTypes.some(t => mediaType && mediaType.toLowerCase().startsWith(t.split(';')[0]))) {
+    /// ---------- Build text from media ----------
+let extractedText = String(input || '').trim();
+
+if (validAudioTypes.some(t => mediaType && mediaType.toLowerCase().startsWith(t.split(';')[0]))) {
+  try {
+    const resp = await axios.get(mediaUrl, {
+      responseType: 'arraybuffer',
+      auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
+    });
+    const audioBuf = Buffer.from(resp.data);
+    console.log('[DEBUG] audio bytes:', audioBuf?.length, 'mime:', mediaType);
+
+    // First pass (whatever your transcribeAudio currently prefers — typically Google first)
+    let primary = await transcribeAudio(audioBuf, mediaType);
+    primary = (primary || '').trim();
+    console.log('[DEBUG] Primary transcript length:', primary.length, 'text:', JSON.stringify(primary));
+
+    // Heuristics for “bad/too-short” outcomes (e.g., just "now.")
+    const looksBad =
+      !primary ||
+      primary.replace(/[^\p{L}\p{N}]+/gu, '').length < 3 ||          // too few alphanum chars
+      /^now\.?$/i.test(primary) ||                                   // only "now"
+      primary.length < 8;                                            // very short
+
+    // Second pass: force Whisper (if your service supports options; if not, it’ll be ignored harmlessly)
+    let secondary = null;
+    if (looksBad) {
       try {
-        const resp = await axios.get(mediaUrl, {
-          responseType: 'arraybuffer',
-          auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
-        });
-        const audioBuf = Buffer.from(resp.data);
-        console.log('[DEBUG] audio bytes:', audioBuf?.length, 'mime:', mediaType);
-        const transcript = await transcribeAudio(audioBuf, mediaType);
-        const len = transcript ? transcript.length : 0;
-        console.log(`[DEBUG] Transcription${transcript ? '' : ' (none)'}${len ? ' length: ' + len : ''}`);
-        extractedText = (transcript || extractedText || '').trim();
-      } catch (e) {
-        console.error('[ERROR] audio download/transcribe failed:', e.message);
+        secondary = await transcribeAudio(audioBuf, mediaType, { forceEngine: 'whisper' });
+        secondary = (secondary || '').trim();
+        console.log('[DEBUG] Secondary(Whisper) transcript length:', secondary.length, 'text:', JSON.stringify(secondary));
+      } catch (e2) {
+        console.warn('[DEBUG] Whisper secondary transcription failed:', e2.message);
       }
-
-      if (!extractedText) {
-        return twiml(`⚠️ I couldn’t understand the audio. Try again, or text me the details like "Justin hours week" or "expense $12 coffee".`);
-      }
-    } else if (validImageTypes.includes(mediaType)) {
-      const { text } = await extractTextFromImage(mediaUrl);
-      console.log('[DEBUG] OCR text length:', (text || '').length);
-      extractedText = (text || extractedText || '').trim();
     }
 
-    if (!extractedText) {
-      const msg = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
-      await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
-      return twiml(msg);
+    // Pick the better of the two: prefer the longer, non-"now" string
+    let chosen = primary;
+    if (secondary) {
+      const priBadScore = /^now\.?$/i.test(primary) ? 1 : 0;
+      const secBadScore = /^now\.?$/i.test(secondary) ? 1 : 0;
+      if (secondary.length > primary.length || (secBadScore < priBadScore)) {
+        chosen = secondary;
+      }
     }
+
+    extractedText = (chosen || extractedText || '').trim();
+    console.log('[DEBUG] Chosen transcript length:', extractedText.length, 'text:', JSON.stringify(extractedText));
+  } catch (e) {
+    console.error('[ERROR] audio download/transcribe failed:', e.message);
+  }
+
+  if (!extractedText) {
+    return twiml(`⚠️ I couldn’t understand the audio. Try again, or text me the details like "Justin hours week" or "expense $12 coffee".`);
+  }
+} else if (validImageTypes.includes(mediaType)) {
+  const { text } = await extractTextFromImage(mediaUrl);
+  console.log('[DEBUG] OCR text length:', (text || '').length);
+  extractedText = (text || extractedText || '').trim();
+}
 
     // ---------- Parse ----------
     console.log('[DEBUG] parseMediaText called:', { text: extractedText || '(empty)' });

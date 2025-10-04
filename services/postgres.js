@@ -1,3 +1,4 @@
+// services/postgres.js
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const ExcelJS = require('exceljs');
@@ -801,7 +802,349 @@ async function getEntriesBetween(ownerId, employeeName, startIso, endIso) {
   }
 }
 
-async function generateTimesheet(ownerId, employeeName, period, date, tz = 'America/Toronto') {
+/* ===========================
+   Timesheet utilities (NEW)
+   =========================== */
+
+/**
+ * Compute [startUtc, endUtc) for 'day' | 'week' | 'month' using local timezone.
+ * - week is Monday-start (Postgres date_trunc('week', ...) is Monday)
+ * - month starts on the 1st
+ */
+async function getLocalPeriodRange({ tz = 'America/Toronto', period }) {
+  const sql = `
+    WITH now_tz AS ( SELECT (NOW() AT TIME ZONE $1) AS n )
+    SELECT
+      CASE $2
+        WHEN 'day'   THEN (date_trunc('day',   n) AT TIME ZONE $1)::timestamptz
+        WHEN 'week'  THEN (date_trunc('week',  n) AT TIME ZONE $1)::timestamptz
+        WHEN 'month' THEN (date_trunc('month', n) AT TIME ZONE $1)::timestamptz
+      END AS start_utc,
+      CASE $2
+        WHEN 'day'   THEN (LEAST(n, date_trunc('day',   n) + INTERVAL '1 day'))
+        WHEN 'week'  THEN (LEAST(n, date_trunc('week',  n) + INTERVAL '7 days'))
+        WHEN 'month' THEN (LEAST(n, date_trunc('month', n) + INTERVAL '1 month'))
+      END AS end_local_tz
+    FROM now_tz;
+  `;
+  const { rows:[r] } = await pool.query(sql, [tz, period]);
+  const x = await pool.query(`SELECT ($1 AT TIME ZONE $2)::timestamptz AS end_utc`, [r.end_local_tz, tz]);
+  return { startUtc: r.start_utc, endUtc: x.rows[0].end_utc };
+}
+
+function hours2(n) { return +(n / 3600).toFixed(2); }
+
+/**
+ * Build intervals for punch (work) and drive inside [startUtc,endUtc).
+ * We pair each punch_in with the next punch_out; same for drive_start/drive_end.
+ * Intervals are clipped to [startUtc,endUtc).
+ */
+async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUtc }) {
+  const q = `
+  WITH params AS (
+    SELECT $1::uuid AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e
+  ),
+  base AS (
+    SELECT t.*
+    FROM time_entries t, params p
+    WHERE t.owner_id=p.owner_id
+      AND t.employee_name=p.emp
+      AND t.timestamp < p.e
+      AND t.timestamp >= (p.s - INTERVAL '35 days') -- allow pairing with earlier punch_in for month/edge cases
+  ),
+  punch_pairs AS (
+    SELECT
+      i.timestamp AS in_ts,
+      (
+        SELECT o.timestamp
+        FROM time_entries o, params p2
+        WHERE o.owner_id = i.owner_id
+          AND o.employee_name = i.employee_name
+          AND o.type = 'punch_out'
+          AND o.timestamp > i.timestamp
+        ORDER BY o.timestamp
+        LIMIT 1
+      ) AS out_ts
+    FROM base i
+    WHERE i.type = 'punch_in'
+  ),
+  drive_pairs AS (
+    SELECT
+      i.timestamp AS start_ts,
+      (
+        SELECT o.timestamp
+        FROM time_entries o
+        WHERE o.owner_id = i.owner_id
+          AND o.employee_name = i.employee_name
+          AND o.type = 'drive_end'
+          AND o.timestamp > i.timestamp
+        ORDER BY o.timestamp
+        LIMIT 1
+      ) AS end_ts
+    FROM base i
+    WHERE i.type = 'drive_start'
+  ),
+  work_intervals AS (
+    SELECT GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
+           LEAST(out_ts, (SELECT e FROM params))   AS end_utc
+    FROM punch_pairs
+    WHERE out_ts IS NOT NULL
+      AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
+  ),
+  drive_intervals AS (
+    SELECT GREATEST(start_ts, (SELECT s FROM params)) AS start_utc,
+           LEAST(end_ts, (SELECT e FROM params))       AS end_utc
+    FROM drive_pairs
+    WHERE end_ts IS NOT NULL
+      AND GREATEST(start_ts, (SELECT s FROM params)) < LEAST(end_ts, (SELECT e FROM params))
+  )
+  SELECT
+    (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))),0) FROM work_intervals) AS work_seconds,
+    (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))),0) FROM drive_intervals) AS drive_seconds;
+  `;
+  const { rows:[r] } = await pool.query(q, [ownerId, employeeName, startUtc, endUtc]);
+  return {
+    workSeconds: Number(r.work_seconds) || 0,
+    driveSeconds: Number(r.drive_seconds) || 0,
+  };
+}
+
+/**
+ * Per-day buckets Mon..Sun for 'week', or 'today' for 'day' based on local tz.
+ * Uses overlap between [startUtc,endUtc) and each local day window.
+ */
+async function getWeekDayBuckets({ ownerId, employeeName, startUtc, endUtc, tz }) {
+  const q = `
+    WITH params AS (
+      SELECT $1::uuid AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e, $5::text AS tz
+    ),
+    week_days AS (
+      SELECT gs::date AS d
+      FROM params,
+      LATERAL generate_series(
+        date_trunc('week', (s AT TIME ZONE tz))::date,
+        (date_trunc('week', (s AT TIME ZONE tz))::date + 6),
+        INTERVAL '1 day'
+      ) gs
+    ),
+    punch_pairs AS (
+      SELECT
+        i.timestamp AS in_ts,
+        (
+          SELECT o.timestamp
+          FROM time_entries o, params p2
+          WHERE o.owner_id = i.owner_id
+            AND o.employee_name = i.employee_name
+            AND o.type = 'punch_out'
+            AND o.timestamp > i.timestamp
+          ORDER BY o.timestamp
+          LIMIT 1
+        ) AS out_ts
+      FROM time_entries i, params p
+      WHERE i.owner_id=p.owner_id
+        AND i.employee_name=p.emp
+        AND i.type='punch_in'
+        AND i.timestamp < p.e
+        AND i.timestamp >= (p.s - INTERVAL '35 days')
+    ),
+    work_intervals AS (
+      SELECT GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
+             LEAST(out_ts, (SELECT e FROM params))   AS end_utc,
+             (SELECT tz FROM params) AS tz
+      FROM punch_pairs
+      WHERE out_ts IS NOT NULL
+        AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
+    ),
+    day_buckets AS (
+      SELECT
+        wd.d AS local_day,
+        COALESCE(SUM(
+          GREATEST(0, EXTRACT(EPOCH FROM (
+            LEAST(w.end_utc, (wd.d + INTERVAL '1 day') AT TIME ZONE w.tz) -
+            GREATEST(w.start_utc, (wd.d AT TIME ZONE w.tz))
+          )))
+        ),0) AS seconds
+      FROM week_days wd
+      LEFT JOIN work_intervals w
+        ON w.start_utc < ((wd.d + INTERVAL '1 day') AT TIME ZONE w.tz)
+       AND w.end_utc   > (wd.d AT TIME ZONE w.tz)
+      GROUP BY 1
+      ORDER BY 1
+    )
+    SELECT local_day, seconds FROM day_buckets;
+  `;
+  const { rows } = await pool.query(q, [ownerId, employeeName, startUtc, endUtc, tz]);
+  return rows.map(r => ({ day: String(r.local_day), seconds: Number(r.seconds) || 0 }));
+}
+
+/**
+ * Weekly buckets (Mon-start) inside the current month, based on local tz.
+ */
+async function getMonthWeekBuckets({ ownerId, employeeName, startUtc, endUtc, tz }) {
+  const q = `
+    WITH params AS (
+      SELECT $1::uuid AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e, $5::text AS tz
+    ),
+    month_start AS (
+      SELECT date_trunc('month', (s AT TIME ZONE tz))::date AS mstart FROM params
+    ),
+    week_starts AS (
+      SELECT gs::date AS ws
+      FROM month_start m,
+      params p,
+      LATERAL generate_series(
+        date_trunc('week', m.mstart),
+        (p.e AT TIME ZONE p.tz)::date,
+        INTERVAL '7 day'
+      ) gs
+    ),
+    week_ranges AS (
+      SELECT ws AS week_start, (ws + INTERVAL '7 day') AS week_end
+      FROM week_starts
+    ),
+    punch_pairs AS (
+      SELECT
+        i.timestamp AS in_ts,
+        (
+          SELECT o.timestamp
+          FROM time_entries o, params p2
+          WHERE o.owner_id = i.owner_id
+            AND o.employee_name = i.employee_name
+            AND o.type = 'punch_out'
+            AND o.timestamp > i.timestamp
+          ORDER BY o.timestamp
+          LIMIT 1
+        ) AS out_ts
+      FROM time_entries i, params p
+      WHERE i.owner_id=p.owner_id
+        AND i.employee_name=p.emp
+        AND i.type='punch_in'
+        AND i.timestamp < p.e
+        AND i.timestamp >= (p.s - INTERVAL '40 days')
+    ),
+    work_intervals AS (
+      SELECT GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
+             LEAST(out_ts, (SELECT e FROM params))   AS end_utc,
+             (SELECT tz FROM params) AS tz
+      FROM punch_pairs
+      WHERE out_ts IS NOT NULL
+        AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
+    ),
+    weekly AS (
+      SELECT
+        wr.week_start,
+        COALESCE(SUM(
+          GREATEST(0, EXTRACT(EPOCH FROM (
+            LEAST(w.end_utc, (wr.week_end AT TIME ZONE w.tz)) -
+            GREATEST(w.start_utc, (wr.week_start AT TIME ZONE w.tz))
+          )))
+        ),0) AS seconds
+      FROM week_ranges wr
+      LEFT JOIN work_intervals w
+        ON w.start_utc < (wr.week_end AT TIME ZONE w.tz)
+       AND w.end_utc   > (wr.week_start AT TIME ZONE w.tz)
+      GROUP BY 1
+      ORDER BY 1
+    )
+    SELECT week_start, seconds FROM weekly;
+  `;
+  const { rows } = await pool.query(q, [ownerId, employeeName, startUtc, endUtc, tz]);
+  return rows.map((r, i) => ({ idx: i + 1, weekStart: String(r.week_start), seconds: Number(r.seconds) || 0 }));
+}
+
+/**
+ * NEW generateTimesheet
+ * - Object style preferred: { ownerId, person, period, tz }
+ * - Legacy positional kept: (ownerId, employeeName, period, date, tz)
+ */
+async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
+  // Detect call style
+  const objectStyle = (typeof arg1 === 'object' && arg1 !== null && !Array.isArray(arg1));
+  if (objectStyle) {
+    const { ownerId, person, period, tz = 'America/Toronto' } = arg1;
+    if (!ownerId || !person || !period) throw new Error('generateTimesheet: missing fields');
+
+    const { startUtc, endUtc } = await getLocalPeriodRange({ tz, period });
+
+    // Totals
+    const { workSeconds, driveSeconds } = await getWorkAndDriveIntervals({
+      ownerId, employeeName: person, startUtc, endUtc
+    });
+
+    // Build message per period
+    if (period === 'day') {
+      // per-day: just total "today"
+      const totalH = hours2(workSeconds);
+      const message = `${person} worked ${totalH.toFixed(2)} hours today.`;
+      return {
+        message,
+        totalHours: totalH,
+        driveHours: hours2(driveSeconds),
+        startDate: startUtc.toISOString(),
+        endDate: endUtc.toISOString(),
+      };
+    }
+
+    if (period === 'week') {
+      // Mon–Sun buckets
+      const days = await getWeekDayBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
+      const totalH = hours2(workSeconds);
+      // Format Mon..Sun lines
+      // We already queried exact week days in order.
+      const labelsSql = `
+        SELECT to_char($1::date, 'FMDay') AS name
+      `;
+      const lines = [];
+      for (const d of days) {
+        const { rows:[lab] } = await pool.query(labelsSql, [d.day]);
+        lines.push(`${lab.name.trim()} ${hours2(d.seconds).toFixed(2)} hours`);
+      }
+      const header = `${person} worked ${totalH.toFixed(2)} hours this week (Mon–Sun):`;
+      const message = [header, ...lines].join('\n');
+      return {
+        message,
+        totalHours: totalH,
+        driveHours: hours2(driveSeconds),
+        startDate: startUtc.toISOString(),
+        endDate: endUtc.toISOString(),
+        byDay: days.map(d => ({ day: d.day, hours: hours2(d.seconds) })),
+      };
+    }
+
+    if (period === 'month') {
+      // First of month → now; per-week buckets
+      const weeks = await getMonthWeekBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
+      const totalH = hours2(workSeconds);
+      const lines = weeks.map((w, i) => {
+        const isCurrent = (i === weeks.length - 1);
+        return `Week ${w.idx}: ${hours2(w.seconds).toFixed(2)} hours${isCurrent ? ' *(current week)*' : ''}`;
+      });
+      const message = [
+        `${person} worked ${totalH.toFixed(2)} hours so far this month:`,
+        ...lines
+      ].join('\n');
+      return {
+        message,
+        totalHours: totalH,
+        driveHours: hours2(driveSeconds),
+        startDate: startUtc.toISOString(),
+        endDate: endUtc.toISOString(),
+        byWeek: weeks.map(w => ({ index: w.idx, weekStart: w.weekStart, hours: hours2(w.seconds) })),
+      };
+    }
+
+    // Fallback
+    return { message: `⚠️ Unknown period.` };
+  }
+
+  // -------- Legacy positional API (kept for compatibility) --------
+  const ownerId = arg1;
+  const employeeName = arg2;
+  const period = arg3;
+  const date = arg4 || new Date();
+  const tz = arg5 || 'America/Toronto';
+
+  // Use existing behavior to avoid breaking legacy callers
   try {
     const entries = await getTimeEntries(ownerId, employeeName, period, date, tz);
 
@@ -813,7 +1156,7 @@ async function generateTimesheet(ownerId, employeeName, period, date, tz = 'Amer
 
     entries.forEach(e => {
       const ts = new Date(e.timestamp);
-      const day = ts.toISOString().split('T')[0]; // keep UTC key to match callers
+      const day = ts.toISOString().split('T')[0];
 
       (days[day] = days[day] || []).push(e);
 
@@ -837,7 +1180,7 @@ async function generateTimesheet(ownerId, employeeName, period, date, tz = 'Amer
       entriesByDay: days,
     };
   } catch (error) {
-    console.error('[ERROR] generateTimesheet failed:', error.message);
+    console.error('[ERROR] generateTimesheet (legacy) failed:', error.message);
     throw error;
   }
 }
@@ -1406,7 +1749,10 @@ module.exports = {
   moveLastEntryToJob,
   getTimeEntries,
   getEntriesBetween,
+
+  // NEW/UPGRADED timesheet
   generateTimesheet,
+
   createTimePrompt,
   getPendingPrompt,
   clearPrompt,

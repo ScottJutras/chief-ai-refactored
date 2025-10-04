@@ -537,22 +537,30 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>✅ Time edit request created (#${task.id}): Adjust last entry by ${minutes} minutes for ${employeeName}. Owner/Board will review.</Message></Response>`);
     }
 
-    // Hours query
-    const hoursQ = parseHoursQuery(lc, userProfile?.name || '');
-    if (hoursQ) {
-      const employeeName = hoursQ.employeeName || userProfile?.name || '';
-      if (!employeeName) {
-        return res.send(`<Response><Message>⚠️ Who for? Try "Scott hours week".</Message></Response>`);
-      }
-      const period = hoursQ.period || 'week';
-      const timesheet = await generateTimesheet(ownerId, employeeName, period, new Date(), tz);
-      const start = timesheet.startDate ? formatInTimeZone(new Date(timesheet.startDate), tz, 'MMM d, yyyy') : 'N/A';
-      const reply =
-        `${titleCase(employeeName)}'s ${period}ly hours (starting ${start}):\n` +
-        `Total Hours: ${timesheet.totalHours.toFixed(2)}\n` +
-        `Drive Hours: ${timesheet.driveHours.toFixed(2)}`;
-      return res.send(`<Response><Message>${reply}</Message></Response>`);
-    }
+    // Hours query (uses new generateTimesheet signature that formats the reply)
+const hoursQ = parseHoursQuery(lc, userProfile?.name || '');
+if (hoursQ) {
+  const employeeName = hoursQ.employeeName || userProfile?.name || '';
+  if (!employeeName) {
+    return res.send(`<Response><Message>⚠️ Who for? Try "Scott hours week".</Message></Response>`);
+  }
+
+  const period = hoursQ.period || 'week';
+
+  const ts = await generateTimesheet({
+    ownerId,
+    person: employeeName,
+    period, // 'day' | 'week' | 'month'
+    tz,     // you computed this earlier via getUserTz(userProfile)
+  });
+
+  const reply = ts?.message
+    ? ts.message
+    : `${titleCase(employeeName)} worked ${(ts?.totalHours ?? 0).toFixed(2)} hours.`; // legacy fallback
+
+  return res.send(`<Response><Message>${reply}</Message></Response>`);
+}
+
 
     // Batch summaries
     const batch = await handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, xtras, userProfile, isOwner, ownerProfile);

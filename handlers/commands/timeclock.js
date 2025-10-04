@@ -157,15 +157,36 @@ function fmtInTz(date, tz) {
 
 // ---------- Period query ----------
 function parseHoursQuery(lcInput, fallbackName) {
-  if (!/\bhours?\b/i.test(lcInput)) return null;
-  if (!/\b(day|week|month)\b/i.test(lcInput)) return null;
-  const parts = lcInput.trim().split(/\s+/);
-  let period = parts.find(p => /^(day|week|month)$/i.test(p));
-  period = period ? period.toLowerCase() : 'week';
-  let employeeName = fallbackName || '';
-  if (!/^hours?\b/i.test(lcInput)) employeeName = titleCase(sanitizeInput(parts[0]));
-  return { employeeName: employeeName || fallbackName || '', period };
+  const s = String(lcInput || '').trim();
+
+  // must mention hour(s) and day/week/month
+  const periodMatch = s.match(/\b(day|week|month)\b/i);
+  if (!/\bhours?\b/i.test(s) || !periodMatch) return null;
+  const period = periodMatch[1].toLowerCase();
+
+  // Try several name patterns, in order of confidence:
+  const nameFromFor = s.match(/\bfor\s+([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\b/i);
+  const nameFromHowMany = s.match(/\bhow\s+many\s+hours\b.*?\b(?:did\s+)?([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\s+(?:work|do)\b/i);
+  const nameBeforeHours = s.match(/^([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\s+hours?\b/i);
+  const nameNearWork = s.match(/\b([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\s+(?:worked?|work)\b/i);
+
+  let name =
+    (nameFromFor && nameFromFor[1]) ||
+    (nameFromHowMany && nameFromHowMany[1]) ||
+    (nameBeforeHours && nameBeforeHours[1]) ||
+    (nameNearWork && nameNearWork[1]) ||
+    '';
+
+  // Avoid taking WH-words or helpers as the name
+  const stop = new Set(['how','what','who','when','where','why','which','many','much','did','does','do','the','a','an','this','that','my','his','her','their']);
+  name = name.split(/\s+/).filter(w => !stop.has(w)).join(' ').trim();
+
+  // If we still don't have a name, use fallback (self)
+  if (!name) name = fallbackName || '';
+
+  return { employeeName: titleCase(sanitizeInput(name)), period };
 }
+
 
 // ---------- TZ resolver ----------
 function getUserTz(userProfile) {
@@ -191,14 +212,18 @@ const RE_ACTION_FIRST = [
   { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
   { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 
+  // ---- Work/shift synonyms (action-first) ----
+  { type: 'punch_out', re: /^(?:end|finish|stop)\s+(?:work|shift)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'punch_in',  re: /^(?:start|begin)\s+(?:work|shift)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+
   // ---- Break/lunch, drive ----
   // IMPORTANT: break_end BEFORE break_start
-  { type: 'break_end', re: /^(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  { type: 'break_end',   re: /^(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 
   // break_start must NOT match phrases that clearly indicate an end
   { type: 'break_start', re: /^(?:break|lunch)(?!\s*(?:end|out|finish)\b)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 
-  // “went on break / on break” (implicit start)
+  // “went/is/on break” (implicit start)
   { type: 'break_start', re: /^(?:just\s+)?(?:went\s+on\s+|on\s+|is\s+on\s+)(?:break)(?!\s*(?:end|out|finish)\b)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 
   { type: 'drive_end',   re: /^drive\s*(?:end|stop|finish)(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
@@ -209,13 +234,17 @@ const RE_NAME_FIRST = [
   { type: 'punch_in',  re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
   { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
 
+  // ---- Work/shift synonyms (name-first) ----
+  { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:work|shift)\s*(?:end|out|finish|stop)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  { type: 'punch_in',  re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:work|shift)\s*(?:start|in|begin)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+
   // IMPORTANT: break_end BEFORE break_start
   { type: 'break_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
 
   // break_start must NOT match phrases that clearly indicate an end
   { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)(?!\s*(?:end|out|finish)\b)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
 
-  // “went on break / is on break” (implicit start)
+  // “went on / is on break” (implicit start)
   { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:just\s+)?(?:went\s+on\s+|is\s+on\s+|on\s+)break(?!\s*(?:end|out|finish)\b)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
 
   { type: 'drive_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
@@ -564,14 +593,15 @@ if (hoursQ) {
   const period = hoursQ.period || 'week';
   const { message } = await generateTimesheet({
     ownerId,
-    person: employeeName,
-    period,                     // 'day' | 'week' | 'month'
-    tz: getUserTz(userProfile), // e.g., 'America/Toronto'
-    now: new Date(),            // optional; defaults to now
+    person: titleCase(employeeName),
+    period, // 'day' | 'week' | 'month'
+    tz,     // you already computed tz = getUserTz(userProfile) earlier
+    now: new Date(),
   });
 
   return res.send(`<Response><Message>${message}</Message></Response>`);
 }
+
 
 
 

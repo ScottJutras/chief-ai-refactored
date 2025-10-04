@@ -1,6 +1,6 @@
 // services/mediaParser.js
 // Robust media text parser for time entries, expenses, and revenue.
-// - Handles action-first ("punch in Justin", "clock in, Justin. now")
+// - Handles action-first ("punch in Justin", "clock in, Justin. now", "clock Justin in now")
 // - Handles name-first ("Justin punched in", "Justin break end at 12:05")
 // - Supports break/lunch/drive start/end
 // - Lightweight time extraction: "now", "at 8", "at 8am", "at 8:15 pm"
@@ -81,8 +81,7 @@ function tryParseTimeEntry(rawText) {
 
   // Supported verbs/objects
   // punch/clock in/out
-  // break/lunch start/end
-  // drive start/end
+  // break/lunch/drive start/end
   const timeWord = extractTimePhrase(s);
   const actionMap = {
     'punch in': 'punch_in',
@@ -143,7 +142,15 @@ function tryParseTimeEntry(rawText) {
     return makeResult(name, `punch ${dir}`);
   }
 
-  // 2) Name-first: "NAME (punched|clocked) (in|out) ..."
+  // 1a) Sandwich order: "(punch|clock) NAME (in|out)"  ← fixes "Clock Justin in now"
+  m = s.match(/\b(?:punch|clock)\s+([a-z][\w\s.'-]{1,50})\s+(in|out)\b/iu);
+  if (m) {
+    const name = m[1];
+    const dir = m[2].toLowerCase();
+    return makeResult(name, `punch ${dir}`);
+  }
+
+  // 2) Name-first: "NAME (punched|clocked|punch|clock) (in|out) ..."
   // e.g., "justin punched in", "justin clocked out at 5 pm"
   m = s.match(/^([a-z][\w\s.'-]{1,50})\s+(?:punched|clocked|punch|clock)\s+(in|out)\b/iu);
   if (m) {
@@ -182,7 +189,7 @@ function tryParseTimeEntry(rawText) {
     return makeResult(name, 'punch out');
   }
 
-  // 6) “NAME just punched in/out”
+  // 6) “NAME just punched/clocked in/out”
   m = s.match(/^([a-z][\w\s.'-]{1,50})\s+just\s+(?:punched|clocked)\s+(in|out)\b/iu);
   if (m) {
     const name = m[1];
@@ -246,7 +253,7 @@ async function parseMediaText(text) {
   const t = clean(text);
   console.log('[DEBUG] parseMediaText called:', { text: t });
 
-  // 1) Time-entry first (so “clock in Justin” doesn’t fall through)
+  // 1) Time-entry first (so “clock Justin in now” doesn’t fall through)
   const timeEntry = tryParseTimeEntry(t);
   if (timeEntry) return timeEntry;
 

@@ -45,6 +45,13 @@ function friendlyTypeLabel(type) {
   return String(type).replace('_', ' ');
 }
 
+// helper: convert decimal hours → {h, m}
+function hoursDecToHM(dec) {
+  const h = Math.floor(dec);
+  const m = Math.round((dec - h) * 60);
+  return { h, m };
+}
+
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType) {
   let reply;
   try {
@@ -69,19 +76,17 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(reply);
     }
 
-    // ---------- Pending confirmation flow (NEW: do not block if we received *new media* this time) ----------
+    // ---------- Pending confirmation flow (do not block if NEW MEDIA arrived) ----------
     {
       const pendingState = await getPendingTransactionState(from);
       if (pendingState?.pendingMedia) {
         const { type } = pendingState.pendingMedia; // can be null (unknown) or a string
         const lcInput = String(input || '').toLowerCase().trim();
 
-        // If we got NEW MEDIA with a pending state from earlier, clear it and proceed with the new file.
-        // This prevents the “please reply yes/no/edit” loop when user sends another voice note.
+        // New media → clear old pending and process this media
         if (mediaUrl) {
           await deletePendingTransactionState(from);
         } else if (type != null) {
-          // No new media this time, so handle confirmations.
           if (lcInput === 'yes') {
             if (type === 'expense') {
               const data = pendingState.pendingExpense;
@@ -133,7 +138,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
             return twiml(reply);
 
           } else if (type === 'hours_inquiry') {
-            // Expecting a period like "today", "week", "month"
+            // Expecting "today|week|month"
             const periodWord = lcInput.match(/\b(today|day|week|month)\b/i)?.[1]?.toLowerCase();
             if (periodWord) {
               const period = periodWord === 'today' ? 'day' : periodWord;
@@ -149,17 +154,13 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
               await deletePendingTransactionState(from);
               return twiml(message);
             }
-            // Not a period → re-prompt
             return twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`);
           } else {
-            // No new media and not yes/no/edit: prompt without duplicating the word “entry”
             return twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${friendlyTypeLabel(type)}.`);
           }
         } else if (type == null && !mediaUrl) {
-          // Old pending was unknown and no new media—nudge for type again.
           return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
         }
-        // else: type == null but we *do* have new media → we already cleared it above.
       }
     }
 
@@ -234,7 +235,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     if (result.type === 'time_entry') {
-      // Voice UX: auto-commit (no confirmation). Use user TZ; include quick weekly snapshot.
+      // Voice UX: auto-commit. Use user TZ.
       const { employeeName, type, timestamp } = result.data;
       const tz = getUserTz(userProfile);
       const activeJob = await getActiveJob(ownerId);
@@ -242,23 +243,35 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       await logTimeEntry(ownerId, employeeName, type, timestamp, jobForLog);
 
-      let summaryTail = '';
-      try {
-        const { message } = await generateTimesheet({
-          ownerId,
-          person: employeeName,
-          period: 'week',
-          tz,
-          now: new Date()
-        });
-        const firstLine = String(message || '').split('\n')[0] || '';
-        if (firstLine) summaryTail = `\n${firstLine.replace(/^[^A-Za-z0-9]*/, '')}`;
-      } catch (e) {
-        console.warn('[MEDIA] timesheet summary failed:', e.message);
+      const humanTime = fmtLocal(timestamp, tz);
+      let base = `✅ ${type.replace('_', ' ')} logged for ${employeeName} at ${humanTime}${jobForLog ? ` on ${jobForLog}` : ''}.`;
+
+      // Only add a "today total" for punch_out; no weekly summary for punch_in
+      if (type === 'punch_out') {
+        try {
+          const { message } = await generateTimesheet({
+            ownerId,
+            person: employeeName,
+            period: 'day',
+            tz,
+            now: new Date()
+          });
+          // Expect first line: "Justin worked 4.53 hours today ..."
+          const firstLine = String(message || '').split('\n')[0] || '';
+          const mm = firstLine.match(/\bworked\s+([\d.]+)\s+hours\b/i);
+          if (mm) {
+            const dec = parseFloat(mm[1]);
+            if (isFinite(dec)) {
+              const { h, m } = hoursDecToHM(dec);
+              base += ` Total hours worked today ${h} ${h === 1 ? 'hour' : 'hours'}${m ? ` ${m} minutes` : ''}.`;
+            }
+          }
+        } catch (e) {
+          console.warn('[MEDIA] day total fetch failed:', e.message);
+        }
       }
 
-      const humanTime = fmtLocal(timestamp, tz);
-      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName} at ${humanTime}${jobForLog ? ` on ${jobForLog}` : ''}.${summaryTail}`;
+      reply = base;
       return twiml(reply);
     }
 

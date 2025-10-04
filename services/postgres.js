@@ -1,9 +1,8 @@
-// services/postgres.js
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
-const { formatInTimeZone } = require('date-fns-tz');
+const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { reverseGeocode } = require('./geocode');
 
 // --- Postgres pool (kept your original tuning to avoid surprise SSL issues) ---
@@ -154,7 +153,7 @@ async function deleteExpense(ownerId, criteria) {
   try {
     const res = await pool.query(
       `DELETE FROM transactions
-       WHERE owner_id=$1 AND type='expense' AND item=$2 AND amount=$3 AND store=$4
+       WHERE owner_id = $1 AND type='expense' AND item=$2 AND amount=$3 AND store=$4
        RETURNING *`,
       [ownerId, criteria.item, toAmount(criteria.amount), criteria.store],
     );
@@ -802,43 +801,7 @@ async function getEntriesBetween(ownerId, employeeName, startIso, endIso) {
   }
 }
 
-/* ===========================
-   Timesheet utilities (NEW)
-   =========================== */
-
-/**
- * Compute [startUtc, endUtc) for 'day' | 'week' | 'month' using local timezone.
- * - week is Monday-start (Postgres date_trunc('week', ...) is Monday)
- * - month starts on the 1st
- */
-async function getLocalPeriodRange({ tz = 'America/Toronto', period }) {
-  const sql = `
-    WITH now_tz AS ( SELECT (NOW() AT TIME ZONE $1) AS n )
-    SELECT
-      CASE $2
-        WHEN 'day'   THEN (date_trunc('day',   n) AT TIME ZONE $1)::timestamptz
-        WHEN 'week'  THEN (date_trunc('week',  n) AT TIME ZONE $1)::timestamptz
-        WHEN 'month' THEN (date_trunc('month', n) AT TIME ZONE $1)::timestamptz
-      END AS start_utc,
-      CASE $2
-        WHEN 'day'   THEN (LEAST(n, date_trunc('day',   n) + INTERVAL '1 day'))
-        WHEN 'week'  THEN (LEAST(n, date_trunc('week',  n) + INTERVAL '7 days'))
-        WHEN 'month' THEN (LEAST(n, date_trunc('month', n) + INTERVAL '1 month'))
-      END AS end_local_tz
-    FROM now_tz;
-  `;
-  const { rows:[r] } = await pool.query(sql, [tz, period]);
-  const x = await pool.query(`SELECT ($1 AT TIME ZONE $2)::timestamptz AS end_utc`, [r.end_local_tz, tz]);
-  return { startUtc: r.start_utc, endUtc: x.rows[0].end_utc };
-}
-
-function hours2(n) { return +(n / 3600).toFixed(2); }
-
-/**
- * Build intervals for punch (work) and drive inside [startUtc,endUtc).
- * We pair each punch_in with the next punch_out; same for drive_start/drive_end.
- * Intervals are clipped to [startUtc,endUtc).
- */
+/* ---------- NEW helpers for robust timesheets (text owner_id, tz-safe windows) ---------- */
 async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUtc }) {
   const q = `
   WITH params AS (
@@ -909,10 +872,6 @@ async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUt
   };
 }
 
-/**
- * Per-day buckets Mon..Sun for 'week', or 'today' for 'day' based on local tz.
- * Uses overlap between [startUtc,endUtc) and each local day window.
- */
 async function getWeekDayBuckets({ ownerId, employeeName, startUtc, endUtc, tz }) {
   const q = `
     WITH params AS (
@@ -977,9 +936,6 @@ async function getWeekDayBuckets({ ownerId, employeeName, startUtc, endUtc, tz }
   return rows.map(r => ({ day: String(r.local_day), seconds: Number(r.seconds) || 0 }));
 }
 
-/**
- * Weekly buckets (Mon-start) inside the current month, based on local tz.
- */
 async function getMonthWeekBuckets({ ownerId, employeeName, startUtc, endUtc, tz }) {
   const q = `
     WITH params AS (
@@ -1052,137 +1008,146 @@ async function getMonthWeekBuckets({ ownerId, employeeName, startUtc, endUtc, tz
   return rows.map((r, i) => ({ idx: i + 1, weekStart: String(r.week_start), seconds: Number(r.seconds) || 0 }));
 }
 
-/**
- * NEW generateTimesheet
- * - Object style preferred: { ownerId, person, period, tz }
- * - Legacy positional kept: (ownerId, employeeName, period, date, tz)
- */
-async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
-  // Detect call style
-  const objectStyle = (typeof arg1 === 'object' && arg1 !== null && !Array.isArray(arg1));
-  if (objectStyle) {
-    const { ownerId, person, period, tz = 'America/Toronto' } = arg1;
-    if (!ownerId || !person || !period) throw new Error('generateTimesheet: missing fields');
+/* ---------- Helpers to build local ranges (no string ::date params) ---------- */
+function startOfLocalDay(date, tz) {
+  const z = utcToZonedTime(date, tz);
+  z.setHours(0,0,0,0);
+  const y = z.getFullYear(), m = z.getMonth()+1, d = z.getDate();
+  return zonedTimeToUtc(`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')} 00:00:00`, tz);
+}
+function endOfLocalDay(date, tz) {
+  const z = utcToZonedTime(date, tz);
+  z.setHours(23,59,59,999);
+  const y = z.getFullYear(), m = z.getMonth()+1, d = z.getDate();
+  return zonedTimeToUtc(`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')} 23:59:59.999`, tz);
+}
+function startOfLocalWeek(date, tz, weekStartsOn = 1 /* Mon */) {
+  const z = utcToZonedTime(date, tz);
+  const day = z.getDay();
+  const diff = (day - weekStartsOn + 7) % 7;
+  z.setDate(z.getDate() - diff);
+  return startOfLocalDay(z, tz);
+}
+function startOfLocalMonth(date, tz) {
+  const z = utcToZonedTime(date, tz);
+  z.setDate(1);
+  return startOfLocalDay(z, tz);
+}
 
-    const { startUtc, endUtc } = await getLocalPeriodRange({ tz, period });
+/* ---------- New object-style generateTimesheet (keeps legacy overload) ---------- */
+async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
+  // New API: single options object
+  if (typeof arg1 === 'object' && arg1 !== null && !Array.isArray(arg1)) {
+    const {
+      ownerId,
+      person,
+      period,      // 'day' | 'week' | 'month'
+      tz = 'America/Toronto',
+      now = new Date(),
+    } = arg1;
+
+    if (!ownerId || !person) {
+      throw new Error('generateTimesheet(options): ownerId and person are required');
+    }
+
+    let startUtc, endUtc;
+
+    if (period === 'day') {
+      startUtc = startOfLocalDay(now, tz);
+      endUtc   = endOfLocalDay(now, tz);
+    } else if (period === 'week') {
+      // Monday → Sunday window in user's TZ
+      startUtc = startOfLocalWeek(now, tz, 1);
+      const endLocal = utcToZonedTime(startUtc, tz);
+      endLocal.setDate(endLocal.getDate() + 6);
+      endUtc = endOfLocalDay(endLocal, tz);
+    } else if (period === 'month') {
+      // 1st of month → today (end of day)
+      startUtc = startOfLocalMonth(now, tz);
+      endUtc   = endOfLocalDay(now, tz);
+    } else {
+      throw new Error('period must be "day", "week", or "month"');
+    }
 
     // Totals
     const { workSeconds, driveSeconds } = await getWorkAndDriveIntervals({
-      ownerId, employeeName: person, startUtc, endUtc
+      ownerId, employeeName: person, startUtc, endUtc,
     });
 
-    // Build message per period
-    if (period === 'day') {
-      // per-day: just total "today"
-      const totalH = hours2(workSeconds);
-      const message = `${person} worked ${totalH.toFixed(2)} hours today.`;
-      return {
-        message,
-        totalHours: totalH,
-        driveHours: hours2(driveSeconds),
-        startDate: startUtc.toISOString(),
-        endDate: endUtc.toISOString(),
-      };
-    }
-
+    // Breakdown lines
+    let breakdownLines = [];
     if (period === 'week') {
-      // Mon–Sun buckets
-      const days = await getWeekDayBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
-      const totalH = hours2(workSeconds);
-      // Format Mon..Sun lines
-      // We already queried exact week days in order.
-      const labelsSql = `
-        SELECT to_char($1::date, 'FMDay') AS name
-      `;
-      const lines = [];
-      for (const d of days) {
-        const { rows:[lab] } = await pool.query(labelsSql, [d.day]);
-        lines.push(`${lab.name.trim()} ${hours2(d.seconds).toFixed(2)} hours`);
-      }
-      const header = `${person} worked ${totalH.toFixed(2)} hours this week (Mon–Sun):`;
-      const message = [header, ...lines].join('\n');
-      return {
-        message,
-        totalHours: totalH,
-        driveHours: hours2(driveSeconds),
-        startDate: startUtc.toISOString(),
-        endDate: endUtc.toISOString(),
-        byDay: days.map(d => ({ day: d.day, hours: hours2(d.seconds) })),
-      };
-    }
-
-    if (period === 'month') {
-      // First of month → now; per-week buckets
-      const weeks = await getMonthWeekBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
-      const totalH = hours2(workSeconds);
-      const lines = weeks.map((w, i) => {
-        const isCurrent = (i === weeks.length - 1);
-        return `Week ${w.idx}: ${hours2(w.seconds).toFixed(2)} hours${isCurrent ? ' *(current week)*' : ''}`;
+      const dayBuckets = await getWeekDayBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
+      breakdownLines = dayBuckets.map((b) => {
+        const d = new Date(b.day + 'T00:00:00');
+        const label = formatInTimeZone(d, tz, 'EEEE');
+        const hrs = (b.seconds / 3600).toFixed(2);
+        return `${label} ${hrs} hours`;
       });
-      const message = [
-        `${person} worked ${totalH.toFixed(2)} hours so far this month:`,
-        ...lines
-      ].join('\n');
-      return {
-        message,
-        totalHours: totalH,
-        driveHours: hours2(driveSeconds),
-        startDate: startUtc.toISOString(),
-        endDate: endUtc.toISOString(),
-        byWeek: weeks.map(w => ({ index: w.idx, weekStart: w.weekStart, hours: hours2(w.seconds) })),
-      };
+    } else if (period === 'month') {
+      const weeks = await getMonthWeekBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
+      breakdownLines = weeks.map(w => `Week ${w.idx}: ${(w.seconds/3600).toFixed(2)} hours`);
     }
 
-    // Fallback
-    return { message: `⚠️ Unknown period.` };
-  }
+    const totalHours = (workSeconds / 3600).toFixed(2);
+    const driveHours = (driveSeconds / 3600).toFixed(2);
 
-  // -------- Legacy positional API (kept for compatibility) --------
-  const ownerId = arg1;
-  const employeeName = arg2;
-  const period = arg3;
-  const date = arg4 || new Date();
-  const tz = arg5 || 'America/Toronto';
+    // Labels
+    const startLabel = formatInTimeZone(startUtc, tz, 'MMM d, yyyy');
+    const endLabel   = formatInTimeZone(endUtc,   tz, 'MMM d, yyyy');
 
-  // Use existing behavior to avoid breaking legacy callers
-  try {
-    const entries = await getTimeEntries(ownerId, employeeName, period, date, tz);
-
-    let totalHours = 0;
-    let driveHours = 0;
-    const days = {};
-    let lastPunchIn = null;
-    let lastDriveStart = null;
-
-    entries.forEach(e => {
-      const ts = new Date(e.timestamp);
-      const day = ts.toISOString().split('T')[0];
-
-      (days[day] = days[day] || []).push(e);
-
-      if (e.type === 'punch_in') lastPunchIn = ts;
-      else if (e.type === 'punch_out' && lastPunchIn) {
-        totalHours += (ts - lastPunchIn) / 3600000;
-        lastPunchIn = null;
-      } else if (e.type === 'drive_start') lastDriveStart = ts;
-      else if (e.type === 'drive_end' && lastDriveStart) {
-        driveHours += (ts - lastDriveStart) / 3600000;
-        lastDriveStart = null;
-      }
-    });
+    // Compose WhatsApp-friendly message
+    let message = `${person} worked ${totalHours} hours`;
+    if (period === 'day') {
+      message = `${person} worked ${totalHours} hours today (${startLabel}).`;
+    } else if (period === 'week') {
+      message = `${person} worked ${totalHours} hours this week (${startLabel}–${endLabel}):\n` + breakdownLines.join('\n');
+    } else if (period === 'month') {
+      message = `${person} worked ${totalHours} hours so far this month (as of ${endLabel}):\n` + breakdownLines.join('\n');
+    }
+    message += `\nDrive Hours: ${driveHours}`;
 
     return {
-      employeeName,
+      message,
+      totalHours: Number(totalHours),
+      driveHours: Number(driveHours),
+      startUtc: startUtc.toISOString(),
+      endUtc: endUtc.toISOString(),
       period,
-      startDate: new Date(date).toISOString().split('T')[0],
-      totalHours,
-      driveHours,
-      entriesByDay: days,
+      person,
     };
-  } catch (error) {
-    console.error('[ERROR] generateTimesheet (legacy) failed:', error.message);
-    throw error;
   }
+
+  // ---- Legacy positional API (kept for compatibility) ----
+  // generateTimesheet(ownerId, employeeName, period, date, tz)
+  const ownerId = arg1, employeeName = arg2, period = arg3, date = arg4, tz = arg5 || 'America/Toronto';
+  const entries = await getTimeEntries(ownerId, employeeName, period, date, tz);
+
+  let totalHours = 0;
+  let driveHours = 0;
+  let lastPunchIn = null;
+  let lastDriveStart = null;
+  for (const e of entries) {
+    const ts = new Date(e.timestamp);
+    if (e.type === 'punch_in') lastPunchIn = ts;
+    else if (e.type === 'punch_out' && lastPunchIn) {
+      totalHours += (ts - lastPunchIn) / 3600000;
+      lastPunchIn = null;
+    } else if (e.type === 'drive_start') lastDriveStart = ts;
+    else if (e.type === 'drive_end' && lastDriveStart) {
+      driveHours += (ts - lastDriveStart) / 3600000;
+      lastDriveStart = null;
+    }
+  }
+
+  return {
+    employeeName,
+    period,
+    startDate: new Date(date || new Date()).toISOString().split('T')[0],
+    totalHours,
+    driveHours,
+    entriesByDay: {},
+  };
 }
 
 // --- Timeclock helpers (prompts + open-state checks) ---
@@ -1749,10 +1714,7 @@ module.exports = {
   moveLastEntryToJob,
   getTimeEntries,
   getEntriesBetween,
-
-  // NEW/UPGRADED timesheet
-  generateTimesheet,
-
+  generateTimesheet, // new overload + legacy preserved
   createTimePrompt,
   getPendingPrompt,
   clearPrompt,

@@ -537,7 +537,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       return res.send(`<Response><Message>✅ Time edit request created (#${task.id}): Adjust last entry by ${minutes} minutes for ${employeeName}. Owner/Board will review.</Message></Response>`);
     }
 
-    // Hours query (uses new generateTimesheet signature that formats the reply)
+    // Hours query
 const hoursQ = parseHoursQuery(lc, userProfile?.name || '');
 if (hoursQ) {
   const employeeName = hoursQ.employeeName || userProfile?.name || '';
@@ -546,20 +546,17 @@ if (hoursQ) {
   }
 
   const period = hoursQ.period || 'week';
-
-  const ts = await generateTimesheet({
+  const { message } = await generateTimesheet({
     ownerId,
     person: employeeName,
-    period, // 'day' | 'week' | 'month'
-    tz,     // you computed this earlier via getUserTz(userProfile)
+    period,                     // 'day' | 'week' | 'month'
+    tz: getUserTz(userProfile), // e.g., 'America/Toronto'
+    now: new Date(),            // optional; defaults to now
   });
 
-  const reply = ts?.message
-    ? ts.message
-    : `${titleCase(employeeName)} worked ${(ts?.totalHours ?? 0).toFixed(2)} hours.`; // legacy fallback
-
-  return res.send(`<Response><Message>${reply}</Message></Response>`);
+  return res.send(`<Response><Message>${message}</Message></Response>`);
 }
+
 
 
     // Batch summaries

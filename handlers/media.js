@@ -1,10 +1,16 @@
 // handlers/media.js
 const axios = require('axios');
-const { parseMediaText } = require('../services/mediaParser'); // <- was documentAI
+const { parseMediaText } = require('../services/mediaParser'); // expense/revenue/time_entry parser
 const { extractTextFromImage } = require('../utils/visionService');
 const { transcribeAudio } = require('../utils/transcriptionService');
 
-const { logTimeEntry, getActiveJob, appendToUserSpreadsheet } = require('../services/postgres');
+const {
+  logTimeEntry,
+  getActiveJob,
+  appendToUserSpreadsheet,
+  generateTimesheet, // ⬅️ use the object-style API already in services/postgres
+} = require('../services/postgres');
+
 const {
   getPendingTransactionState,
   setPendingTransactionState,
@@ -15,22 +21,83 @@ function twiml(text) {
   return `<Response><Message>${text}</Message></Response>`;
 }
 
+async function downloadTwilioMedia(url) {
+  // Twilio media requires basic auth with your Account SID and Auth Token
+  const resp = await axios.get(url, {
+    responseType: 'arraybuffer',
+    auth: {
+      username: process.env.TWILIO_ACCOUNT_SID,
+      password: process.env.TWILIO_AUTH_TOKEN,
+    },
+  });
+  return Buffer.from(resp.data);
+}
+
+/** Minimal helpers (mirrors the tolerant logic you added elsewhere) */
+function titleCase(s) {
+  return String(s || '')
+    .split(/\s+/)
+    .map(w => w ? (w[0].toUpperCase() + w.slice(1)) : '')
+    .join(' ')
+    .trim();
+}
+function sanitizeInput(s) {
+  return String(s || '').replace(/[^\p{L}\p{N}\s.'-]/gu, '').trim();
+}
+
+/** Robust hours query parser — same behavior you adopted in timeclock.js */
+function parseHoursQuery(lcInput, fallbackName) {
+  const s = String(lcInput || '').trim();
+  const periodMatch = s.match(/\b(day|week|month)\b/i);
+  if (!/\bhours?\b/i.test(s) || !periodMatch) return null;
+  const period = periodMatch[1].toLowerCase();
+
+  const nameFromFor = s.match(/\bfor\s+([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\b/i);
+  const nameFromHowMany = s.match(/\bhow\s+many\s+hours\b.*?\b(?:did\s+)?([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\s+(?:work|do)\b/i);
+  const nameBeforeHours = s.match(/^([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\s+hours?\b/i);
+  const nameNearWork = s.match(/\b([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\s+(?:worked?|work)\b/i);
+
+  let name =
+    (nameFromFor && nameFromFor[1]) ||
+    (nameFromHowMany && nameFromHowMany[1]) ||
+    (nameBeforeHours && nameBeforeHours[1]) ||
+    (nameNearWork && nameNearWork[1]) ||
+    '';
+
+  const stop = new Set(['how','what','who','when','where','why','which','many','much','did','does','do','the','a','an','this','that','my','his','her','their']);
+  name = name.split(/\s+/).filter(w => !stop.has(w)).join(' ').trim();
+
+  if (!name) name = fallbackName || '';
+
+  return { employeeName: titleCase(sanitizeInput(name)), period };
+}
+
+/** Best-effort TZ (matches how your timeclock route sets tz) */
+function getUserTzCheap(userProfile) {
+  return (
+    userProfile?.timezone ||
+    userProfile?.tz ||
+    userProfile?.time_zone ||
+    'America/Toronto'
+  );
+}
+
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType) {
   let reply;
   try {
-    console.log(
-      `[DEBUG] Processing media from ${from}: type=${mediaType}, url=${mediaUrl}, input=${input || ''}`
-    );
+    console.log(`[DEBUG] Processing media from ${from}: type=${mediaType}, url=${mediaUrl}, input=${input || ''}`);
 
-    // --- normalize and allow-lists (lowercase only) ---
-    const mt = String(mediaType || '').toLowerCase();
     const validImageTypes = ['image/jpeg', 'image/png'];
-    const validAudioTypes = ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/webm']; // check with startsWith
+    const validAudioTypes = [
+      'audio/mpeg',
+      'audio/wav',
+      'audio/ogg',
+      'audio/ogg; codecs=opus',
+      'audio/webm',
+      'audio/webm; codecs=opus'
+    ];
 
-    const isAudio = validAudioTypes.some(t => mt.startsWith(t));
-    const isImage = validImageTypes.includes(mt);
-
-    if (!isAudio && !isImage) {
+    if (!validImageTypes.includes(mediaType) && !validAudioTypes.some(t => (mediaType || '').toLowerCase().startsWith(t.split(';')[0]))) {
       reply = `⚠️ Unsupported media type: ${mediaType}. Please send a JPEG/PNG image or MP3/WAV/OGG audio.`;
       return twiml(reply);
     }
@@ -53,7 +120,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
             'expense',
             data.category,
             data.mediaUrl || mediaUrl,
-            userProfile.name || 'Unknown'
+            userProfile.name || 'Unknown',
           ]);
           reply = `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`;
         } else if (type === 'revenue') {
@@ -67,31 +134,29 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
             'revenue',
             data.category,
             data.mediaUrl || mediaUrl,
-            userProfile.name || 'Unknown'
+            userProfile.name || 'Unknown',
           ]);
           reply = `✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`;
         } else if (type === 'time_entry') {
           const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
           await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
-          reply = `✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${new Date(
-            timestamp
-          ).toLocaleString()}${job ? ` on ${job}` : ''}`;
+          reply = `✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${new Date(timestamp).toLocaleString()}${job ? ` on ${job}` : ''}`;
         }
         await deletePendingTransactionState(from);
         return twiml(reply);
+
       } else if (lcInput === 'no' || lcInput === 'cancel') {
         reply = `❌ ${type} cancelled.`;
         await deletePendingTransactionState(from);
         return twiml(reply);
+
       } else if (lcInput === 'edit') {
         reply = `Please resend the ${type.replace('_', ' ')} details.`;
         await deletePendingTransactionState(from);
         return twiml(reply);
+
       } else {
-        reply = `⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${type.replace(
-          '_',
-          ' '
-        )} entry.`;
+        reply = `⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${type.replace('_', ' ')} entry.`;
         return twiml(reply);
       }
     }
@@ -99,19 +164,19 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     // ---------- Build text from media ----------
     let extractedText = String(input || '').trim();
 
-    if (isAudio) {
+    if (validAudioTypes.some(t => mediaType && mediaType.toLowerCase().startsWith(t.split(';')[0]))) {
       // AUDIO: download & transcribe to text (no transcoding; pass MIME to STT)
       try {
         const resp = await axios.get(mediaUrl, {
           responseType: 'arraybuffer',
-          auth: {
-            // Twilio media requires basic auth
+          auth: { // Twilio media requires basic auth
             username: process.env.TWILIO_ACCOUNT_SID,
-            password: process.env.TWILIO_AUTH_TOKEN
-          }
+            password: process.env.TWILIO_AUTH_TOKEN,
+          },
         });
         const audioBuf = Buffer.from(resp.data);
-        const transcript = await transcribeAudio(audioBuf, mt);
+        console.log('[DEBUG] audio bytes:', audioBuf.length, 'mime:', mediaType);
+        const transcript = await transcribeAudio(audioBuf, mediaType);
         console.log('[DEBUG] Audio transcript:', transcript);
         extractedText = (transcript || extractedText || '').trim();
       } catch (e) {
@@ -123,7 +188,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
           `⚠️ I couldn’t understand the audio. Try again, or text me the details like "Justin hours week" or "expense $12 coffee".`
         );
       }
-    } else if (isImage) {
+    } else if (validImageTypes.includes(mediaType)) {
       // IMAGE: OCR to text, then parse
       const { text } = await extractTextFromImage(mediaUrl);
       console.log('[DEBUG] OCR text length:', (text || '').length);
@@ -138,26 +203,45 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(msg);
     }
 
-    // ---------- Try to parse ----------
+    // ---------- SPECIAL CASE: “hours” question from voice (day|week|month) ----------
+    // e.g. "How many hours did Justin work this week?"
+    const hoursQ = parseHoursQuery(extractedText, userProfile?.name || '');
+    if (hoursQ) {
+      const employeeName = hoursQ.employeeName || userProfile?.name || '';
+      if (!employeeName) {
+        return twiml(`⚠️ Who for? Try "Scott hours week".`);
+      }
+      const period = hoursQ.period || 'week';
+      const tz = getUserTzCheap(userProfile);
+
+      const { message } = await generateTimesheet({
+        ownerId,
+        person: titleCase(employeeName),
+        period,                   // 'day' | 'week' | 'month'
+        tz,                       // best-effort tz
+        now: new Date(),
+      });
+
+      return twiml(message);
+    }
+
+    // ---------- Try to parse as time_entry / expense / revenue ----------
     console.log('[DEBUG] parseMediaText called:', { text: extractedText || '(empty)' });
     let result;
     try {
       result = await parseMediaText(extractedText);
     } catch (e) {
       console.error('[ERROR] parseMediaText failed:', e.message);
-      // Fall back to asking what it is
       const msg = `I couldn’t read that. Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
       await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
       return twiml(msg);
     }
 
-    if (result.type === 'time_entry') {
-      const { employeeName, type, timestamp } = result.data;
+    if (result?.type === 'time_entry') {
+      const { employeeName, type, timestamp } = result.data || {};
       const activeJob = await getActiveJob(ownerId);
       reply =
-        `Please confirm: Log ${type.replace('_', ' ')} for ${employeeName} at ${new Date(
-          timestamp
-        ).toLocaleString()}` +
+        `Please confirm: Log ${type.replace('_', ' ')} for ${employeeName} at ${new Date(timestamp).toLocaleString()}` +
         `${activeJob !== 'Uncategorized' ? ` on ${activeJob}` : ''}? Reply 'yes', 'no', or 'edit'.`;
       await setPendingTransactionState(from, {
         pendingMedia: { type: 'time_entry' },
@@ -170,7 +254,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         }
       });
       return twiml(reply);
-    } else if (result.type === 'expense') {
+
+    } else if (result?.type === 'expense') {
       const { item, amount, store, date, category } = result.data;
       reply = `Please confirm: Log expense ${amount} for ${item} from ${store} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
       await setPendingTransactionState(from, {
@@ -178,7 +263,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         pendingExpense: { item, amount, store, date, category, mediaUrl }
       });
       return twiml(reply);
-    } else if (result.type === 'revenue') {
+
+    } else if (result?.type === 'revenue') {
       const { description, amount, source, date, category } = result.data;
       reply = `Please confirm: Log revenue ${amount} from ${source} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
       await setPendingTransactionState(from, {
@@ -192,6 +278,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     reply = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
     await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
     return twiml(reply);
+
   } catch (error) {
     console.error(`[ERROR] handleMedia failed for ${from}:`, error.message);
     reply = `⚠️ Failed to process media: ${error.message}`;

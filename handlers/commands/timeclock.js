@@ -180,32 +180,48 @@ function getUserTz(userProfile) {
 }
 
 // ---------- tolerant command patterns ----------
-// Order matters: explicit “in NAME/out NAME” BEFORE generic patterns.
+// Order matters: handle explicit “end/out/finish” BEFORE generic “start/in/begin/implicit”.
+
 const RE_ACTION_FIRST = [
   // Explicit name after action (wins first)
   { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
   { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
+
   // Generic optional-name (falls back to self if no name captured)
   { type: 'punch_in',  re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
   { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 
-  // Break/lunch, drive (action-first)
-  { type: 'break_start', re: /^(?:just\s+)?(?:went\s+on\s+|on\s+)?break(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'break_start', re: /^(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'break_end',   re: /^(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  // ---- Break/lunch, drive ----
+  // IMPORTANT: break_end BEFORE break_start
+  { type: 'break_end', re: /^(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+
+  // break_start must NOT match phrases that clearly indicate an end
+  { type: 'break_start', re: /^(?:break|lunch)(?!\s*(?:end|out|finish)\b)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+
+  // “went on break / on break” (implicit start)
+  { type: 'break_start', re: /^(?:just\s+)?(?:went\s+on\s+|on\s+|is\s+on\s+)(?:break)(?!\s*(?:end|out|finish)\b)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+
+  { type: 'drive_end',   re: /^drive\s*(?:end|stop|finish)(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
   { type: 'drive_start', re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'drive_end',   re: /^drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
 ];
 
 const RE_NAME_FIRST = [
   { type: 'punch_in',  re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
   { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:just\s+)?(?:went\s+on\s+|is\s+on\s+)?break(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'break_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+
+  // IMPORTANT: break_end BEFORE break_start
+  { type: 'break_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+
+  // break_start must NOT match phrases that clearly indicate an end
+  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)(?!\s*(?:end|out|finish)\b)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+
+  // “went on break / is on break” (implicit start)
+  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:just\s+)?(?:went\s+on\s+|is\s+on\s+|on\s+)break(?!\s*(?:end|out|finish)\b)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+
+  { type: 'drive_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
   { type: 'drive_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'drive_end',   re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
 ];
+
 
 const RE_TIME_EDIT = /^(?:adjust|fix|edit)\s+(?:last)?\s*(?:punch|clock|break|lunch|drive)\s*(?:in|out|start|end)?\s*(?:by)?\s*([+-]?\d{1,3})\s*(?:min|minutes)\b/i;
 

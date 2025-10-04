@@ -5,15 +5,12 @@ const { SpeechClient } = require('@google-cloud/speech').v1;
 let speechClient = null;
 
 function loadSpeechCredentials() {
-  // Prefer a speech-specific var, then generic ones you already use elsewhere.
   const b64 =
     process.env.GOOGLE_SPEECH_CREDENTIALS_BASE64 ||
     process.env.GOOGLE_VISION_CREDENTIALS_BASE64 ||
     process.env.GOOGLE_CREDENTIALS_BASE64 ||
     null;
-
   if (!b64) return null;
-
   try {
     const json = Buffer.from(b64, 'base64').toString('utf-8');
     return JSON.parse(json);
@@ -25,16 +22,9 @@ function loadSpeechCredentials() {
 
 function getSpeechClient() {
   if (speechClient) return speechClient;
-
   const creds = loadSpeechCredentials();
-  if (creds) {
-    speechClient = new SpeechClient({ credentials: creds });
-    return speechClient;
-  }
-
-  // Fallback to ADC if credentials weren’t provided (useful in local dev with GOOGLE_APPLICATION_CREDENTIALS).
   try {
-    speechClient = new SpeechClient();
+    speechClient = creds ? new SpeechClient({ credentials: creds }) : new SpeechClient();
   } catch (e) {
     console.error('[ERROR] Could not initialize Google Speech client:', e.message);
     speechClient = null;
@@ -44,14 +34,18 @@ function getSpeechClient() {
 
 /**
  * Map a media MIME type to Google STT encoding + sample rate.
+ * IMPORTANT: For Opus (OGG/WEBM), set sampleRateHertz explicitly (Twilio is typically 48000).
  */
 function encodingForMime(mime) {
   const m = String(mime || '').toLowerCase();
-  if (m.includes('ogg')) return { encoding: 'OGG_OPUS' };          // Twilio voice notes
-  if (m.includes('webm')) return { encoding: 'WEBM_OPUS' };
-  if (m.includes('mpeg') || m.includes('mp3')) return { encoding: 'MP3' };
+
+  // Twilio voice notes are usually audio/ogg;codecs=opus at 48kHz
+  if (m.includes('ogg'))  return { encoding: 'OGG_OPUS',  sampleRateHertz: 48000 };
+  if (m.includes('webm')) return { encoding: 'WEBM_OPUS', sampleRateHertz: 48000 };
+
+  if (m.includes('mpeg') || m.includes('mp3')) return { encoding: 'MP3' }; // sample rate auto-detected
   if (m.includes('wav') || m.includes('x-wav')) return { encoding: 'LINEAR16', sampleRateHertz: 16000 };
-  return { encoding: 'ENCODING_UNSPECIFIED' };
+  return { encoding: 'ENCODING_UNSPECIFIED' }; // last resort
 }
 
 /**
@@ -72,7 +66,8 @@ async function transcribeAudio(audioBuffer, mimeType) {
     const audio = { content: audioBuffer.toString('base64') };
     const config = {
       encoding,
-      sampleRateHertz,
+      // Only set sampleRateHertz if we have a value; otherwise let Google infer.
+      ...(sampleRateHertz ? { sampleRateHertz } : {}),
       languageCode: 'en-US',
       enableAutomaticPunctuation: true,
       enableWordTimeOffsets: false,

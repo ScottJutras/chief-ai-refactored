@@ -12,12 +12,15 @@ function titleCase(s) {
 function sanitizeName(s) {
   return String(s || '').replace(/[^\p{L}\p{N}\s.'-]/gu, '').replace(/\s+/g, ' ').trim();
 }
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 // Build a timestamp from an extracted clock string, else now (UTC ISO).
 function buildTimestampFromText(clockText) {
   if (!clockText) return new Date().toISOString();
 
-  const t = clockText.toLowerCase().trim();
+  const t = String(clockText).toLowerCase().trim();
   if (t === 'now' || t === 'right now') return new Date().toISOString();
 
   const m = t.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
@@ -47,25 +50,48 @@ function buildTimestampFromText(clockText) {
 
 function extractTimePhrase(text) {
   const s = String(text || '').toLowerCase();
+
+  // explicit "at TIME"
   let m = s.match(/\bat\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i);
   if (m) return m[1];
+
+  // bare "now" anywhere
   m = s.match(/\bnow\b/i);
   if (m) return 'now';
+
   return null;
 }
 
 // ---------------- Time-entry parsing ----------------
 function tryParseTimeEntry(rawText) {
-  const original = clean(rawText);
-  if (!original) return null;
+  let originalStr = clean(rawText);
+  if (!originalStr) return null;
 
-  const s = original
+  // Pull a time phrase out of the *original* first, then strip it from a working copy
+  const timeWordRaw = extractTimePhrase(originalStr); // e.g., "now", "8", "8am", "8:15 pm"
+  let working = originalStr;
+
+  if (timeWordRaw) {
+    // remove "now" or "at HH(:MM) am/pm" once, case-insensitive
+    const timeEsc = escapeRegExp(timeWordRaw);
+    // Try "at TIME" first, then bare TIME, to avoid deleting a name chunk accidentally
+    const atRe = new RegExp(`\\bat\\s+${timeEsc}\\b`, 'i');
+    const bareRe = new RegExp(`\\b${timeEsc}\\b`, 'i');
+    if (atRe.test(working)) {
+      working = working.replace(atRe, ' ');
+    } else if (bareRe.test(working)) {
+      working = working.replace(bareRe, ' ');
+    }
+    working = working.replace(/\s+/g, ' ').trim();
+  }
+
+  // Normalize punctuation & whitespace for matching
+  const s = working
     .replace(/[.,!?]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
 
-  const timeWord = extractTimePhrase(s);
   const actionMap = {
     'punch in': 'punch_in',
     'clock in': 'punch_in',
@@ -107,24 +133,27 @@ function tryParseTimeEntry(rawText) {
     if (!verbKey) return null;
     const type = actionMap[verbKey];
     if (!type) return null;
-    const ts = buildTimestampFromText(timeWord);
+    const ts = buildTimestampFromText(timeWordRaw);
     return {
       type: 'time_entry',
       data: {
-        employeeName: titleCase(sanitizeName(name)),
+        employeeName: name ? titleCase(sanitizeName(name)) : null,
         type,
         timestamp: ts,
-        // include whether time was implicit "now" to allow handler to auto-commit
-        implicitNow: !timeWord || timeWord === 'now'
+        implicitNow: !timeWordRaw || String(timeWordRaw).toLowerCase() === 'now'
       }
     };
   }
 
+  // (0) Nameless action "punch/clock in/out"
+  let m = s.match(/\b(?:punch(?:ed)?|clock(?:ed)?)\s+(in|out)\b/iu);
+  if (m) return makeResult(null, `punch ${m[1].toLowerCase()}`);
+
   // (1) Action-first "punch/clock in/out [for] NAME"
-  let m = s.match(/\b(?:punch(?:ed)?|clock(?:ed)?)\s+(in|out)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
+  m = s.match(/\b(?:punch(?:ed)?|clock(?:ed)?)\s+(in|out)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
   if (m) return makeResult(m[2], `punch ${m[1].toLowerCase()}`);
 
-  // (1a) Sandwich "punch/clock NAME in/out"  ← handles “Clock Justin in now”
+  // (1a) Sandwich "punch/clock NAME in/out"  ← handles “Clock Justin in (now)”
   m = s.match(/\b(?:punch|clock)\s+([a-z][\w\s.'-]{1,50})\s+(in|out)\b/iu);
   if (m) return makeResult(m[1], `punch ${m[2].toLowerCase()}`);
 
@@ -132,21 +161,33 @@ function tryParseTimeEntry(rawText) {
   m = s.match(/^([a-z][\w\s.'-]{1,50})\s+(?:punched|clocked|punch|clock)\s+(in|out)\b/iu);
   if (m) return makeResult(m[1], `punch ${m[2].toLowerCase()}`);
 
-  // (3) Break/Lunch/Drive action-first "(break|lunch|drive) (start|end|...)[for] NAME"
+  // (3) Break/Lunch/Drive action-first "(break|lunch|drive) (start|…|end) [for] NAME"
   m = s.match(/\b(break|lunch|drive)\s+(start|begin|in|end|out|finish)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
   if (m) return makeResult(m[3], `${m[1].toLowerCase()} ${m[2].toLowerCase()}`);
 
-  // (3a) NEW: Verb-first for breaks: "(start|begin|end|finish|stop) (break|lunch|drive) [for] NAME"
+  // (3-nameless) Break/Lunch/Drive action-first without name
+  m = s.match(/\b(break|lunch|drive)\s+(start|begin|in|end|out|finish)\b/iu);
+  if (m) return makeResult(null, `${m[1].toLowerCase()} ${m[2].toLowerCase()}`);
+
+  // (3a) Verb-first "(start|begin|end|finish|stop|in|out) (break|lunch|drive) [for] NAME"
   m = s.match(/\b(start|begin|end|finish|stop|in|out)\s+(break|lunch|drive)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
   if (m) {
     const dir = m[1].toLowerCase();
     const obj = m[2].toLowerCase();
-    // normalize verbs to our map keys (in/out map to start/end)
     const dirKey = (dir === 'in' ? 'start' : (dir === 'out' ? 'end' : dir));
     return makeResult(m[3], `${obj} ${dirKey}`);
   }
 
-  // (4) Break/Lunch/Drive name-first "NAME break/lunch/drive start/end"
+  // (3a-nameless) Verb-first without name
+  m = s.match(/\b(start|begin|end|finish|stop|in|out)\s+(break|lunch|drive)\b/iu);
+  if (m) {
+    const dir = m[1].toLowerCase();
+    const obj = m[2].toLowerCase();
+    const dirKey = (dir === 'in' ? 'start' : (dir === 'out' ? 'end' : dir));
+    return makeResult(null, `${obj} ${dirKey}`);
+  }
+
+  // (4) Name-first "NAME break/lunch/drive start/end"
   m = s.match(/^([a-z][\w\s.'-]{1,50})\s+(break|lunch|drive)\s+(start|begin|in|end|out|finish)\b/iu);
   if (m) return makeResult(m[1], `${m[2].toLowerCase()} ${m[3].toLowerCase()}`);
 
@@ -168,7 +209,6 @@ function tryParseHoursInquiry(text) {
   const s = String(text || '').trim().toLowerCase();
   if (!/\bhours?\b/.test(s)) return null;
 
-  // capture a name if present
   const forName =
     s.match(/\bfor\s+([a-z][\w\s.'-]{1,50})\b/i)?.[1] ||
     s.match(/\b(?:did|does)\s+([a-z][\w\s.'-]{1,50})\s+(?:work|do)\b/i)?.[1] ||
@@ -176,7 +216,6 @@ function tryParseHoursInquiry(text) {
     s.match(/\b([a-z][\w\s.'-]{1,50})\s+(?:worked?|work)\b/i)?.[1] ||
     null;
 
-  // Accept explicit period if provided; otherwise leave null to trigger a clarifying question.
   const periodMatch = s.match(/\b(today|day|this\s+week|week|this\s+month|month)\b/i);
   let period = null;
   if (periodMatch) {
@@ -191,7 +230,7 @@ function tryParseHoursInquiry(text) {
       type: 'hours_inquiry',
       data: {
         employeeName: forName ? titleCase(sanitizeName(forName)) : null,
-        period // null | 'day' | 'week' | 'month'
+        period
       }
     };
   }

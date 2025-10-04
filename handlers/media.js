@@ -9,10 +9,10 @@ const {
   getActiveJob,
   appendToUserSpreadsheet,
   generateTimesheet,
-
-  // ⬇️ OPTIONAL: if you add these in your Postgres service, the guardrails become hard-enforced.
-  // getOpenShiftFor, getOpenBreakFor
 } = require('../services/postgres');
+
+// ⬇️ NEW: reuse your canonical timeclock pipeline (enforces guardrails)
+const { handleTimeclock } = require('../handlers/commands/timeclock');
 
 const {
   getPendingTransactionState,
@@ -48,78 +48,30 @@ function friendlyTypeLabel(type) {
   return String(type).replace('_', ' ');
 }
 
-// ⬇️ NEW: helpers for timeclock guardrails
-function isStartAction(entryType) {
-  return entryType === 'punch_in' || entryType === 'break_start' || entryType === 'drive_start';
-}
-function isEndAction(entryType) {
-  return entryType === 'punch_out' || entryType === 'break_end' || entryType === 'drive_end';
-}
-function conflictMessage(name, entryType, openWhat) {
-  // openWhat: 'shift' | 'break' | 'drive'
-  if (entryType === 'punch_in' && openWhat === 'shift') {
-    return `I can’t clock ${name} in until they’re clocked out of their previous shift. Try “clock out ${name}” first.`;
-  }
-  if (entryType === 'break_start' && openWhat === 'break') {
-    return `Looks like ${name} is already on a break. Say “end break for ${name}” to wrap it up.`;
-  }
-  if (entryType === 'drive_start' && openWhat === 'drive') {
-    return `${name} already has a drive session running. Try “end drive for ${name}” first.`;
-  }
-  if (entryType === 'punch_out' && openWhat !== 'shift') {
-    return `I couldn’t find an active shift for ${name} to clock out from. Try “clock in ${name}” first.`;
-  }
-  if (entryType === 'break_end' && openWhat !== 'break') {
-    return `There’s no active break for ${name}. Say “start break for ${name}” if they’re stepping away.`;
-  }
-  if (entryType === 'drive_end' && openWhat !== 'drive') {
-    return `There’s no active drive session for ${name}. Say “start drive for ${name}” to begin one.`;
-  }
-  return null;
-}
-
-// ⬇️ NEW: soft guard that checks for open items if your Postgres service exposes helpers.
-// If not, this becomes a no-op and everything else still works.
-async function ensureAllowedTransition(ownerId, employeeName, entryType) {
+// ⬇️ helper to feed time_entry into timeclock handler and capture its TwiML
+async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
+  // minimal stub of res to capture the TwiML
+  let payload = null;
+  const resStub = {
+    headersSent: false,
+    status() { return this; },
+    type() { return this; },
+    send(body) { payload = String(body || ''); this.headersSent = true; return this; }
+  };
   try {
-    const pg = require('../services/postgres') || {};
-    const has = (fn) => typeof fn === 'function';
+    // ownerProfile/isOwner/extras are optional for core flows; pass safest defaults
+    await handleTimeclock(from, normalized, userProfile, ownerId, null, false, resStub, {});
+  } catch (e) {
+    console.error('[MEDIA] handleTimeclock failed:', e?.message);
+  }
+  return payload; // TwiML string or null
+}
 
-    // When starting, ensure there isn't already an open of the same “lane”
-    if (isStartAction(entryType)) {
-      if (entryType === 'punch_in' && has(pg.getOpenShiftFor)) {
-        const openShift = await pg.getOpenShiftFor(ownerId, employeeName);
-        if (openShift) return conflictMessage(employeeName, 'punch_in', 'shift');
-      }
-      if (entryType === 'break_start' && has(pg.getOpenBreakFor)) {
-        const openBreak = await pg.getOpenBreakFor(ownerId, employeeName);
-        if (openBreak) return conflictMessage(employeeName, 'break_start', 'break');
-      }
-      if (entryType === 'drive_start' && has(pg.getOpenDriveFor)) {
-        const openDrive = await pg.getOpenDriveFor(ownerId, employeeName);
-        if (openDrive) return conflictMessage(employeeName, 'drive_start', 'drive');
-      }
-    }
-
-    // When ending, ensure there IS an open to end
-    if (isEndAction(entryType)) {
-      if (entryType === 'punch_out' && has(pg.getOpenShiftFor)) {
-        const openShift = await pg.getOpenShiftFor(ownerId, employeeName);
-        if (!openShift) return conflictMessage(employeeName, 'punch_out', 'none');
-      }
-      if (entryType === 'break_end' && has(pg.getOpenBreakFor)) {
-        const openBreak = await pg.getOpenBreakFor(ownerId, employeeName);
-        if (!openBreak) return conflictMessage(employeeName, 'break_end', 'none');
-      }
-      if (entryType === 'drive_end' && has(pg.getOpenDriveFor)) {
-        const openDrive = await pg.getOpenDriveFor(ownerId, employeeName);
-        if (!openDrive) return conflictMessage(employeeName, 'drive_end', 'none');
-      }
-    }
-
-    return null; // allowed
+function toAmPm(tsIso, tz) {
+  try {
+    return new Date(tsIso).toLocaleString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).toLowerCase();
   } catch {
-    return null; // if helpers aren’t present or error, don’t block
+    return new Date(tsIso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase();
   }
 }
 
@@ -195,18 +147,23 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
               reply = `✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`;
 
             } else if (type === 'time_entry' && pendingState.pendingTimeEntry) {
-              const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
-
-              // Guard: prevent illegal transitions (if helpers exist)
-              const deny = await ensureAllowedTransition(ownerId, employeeName, entryType);
-              if (deny) {
-                await deletePendingTransactionState(from);
-                return twiml(`⚠️ ${deny}`);
-              }
-
-              await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
+              // Defer to canonical handler to enforce “no double clock-ins”, break rules, etc.
+              const { employeeName, type: entryType, timestamp } = pendingState.pendingTimeEntry;
               const tz = getUserTz(userProfile);
-              reply = `✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}${job ? ` on ${job}` : ''}`;
+              const hhmm = toAmPm(timestamp, tz);
+
+              let normalized;
+              if (entryType === 'punch_in') normalized = `${employeeName} punched in at ${hhmm}`;
+              else if (entryType === 'punch_out') normalized = `${employeeName} punched out at ${hhmm}`;
+              else if (entryType === 'break_start') normalized = `start break for ${employeeName} at ${hhmm}`;
+              else if (entryType === 'break_end') normalized = `end break for ${employeeName} at ${hhmm}`;
+              else if (entryType === 'drive_start') normalized = `start drive for ${employeeName} at ${hhmm}`;
+              else if (entryType === 'drive_end') normalized = `end drive for ${employeeName} at ${hhmm}`;
+              else normalized = `${employeeName} punched in at ${hhmm}`;
+
+              const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
+              await deletePendingTransactionState(from);
+              return tw || twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}`);
 
             } else if (type === 'hours_inquiry') {
               reply = `Please specify: today, this week, or this month.`;
@@ -276,10 +233,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         console.error('[ERROR] audio download/transcribe failed:', e.message);
       }
 
-      // ⬇️ NEW: salvage “Now.” one-word transcriptions from noise
+      // When both engines only return "Now.", don’t pretend we can act—guide quickly.
       if (/^now\.?$/i.test(extractedText)) {
-        // If it’s literally just “now”, ask a nudge that guides the user into a full phrase.
-        // (We keep this very light so it doesn’t get in the way when STT works.)
         return twiml(`Heard “now”. If you’re clocking someone, say “clock in Justin now” or “punch out Justin”.`);
       }
 
@@ -319,7 +274,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         const { message } = await generateTimesheet({
           ownerId,
           person: name,
-          period: result.data.period, // 'day'|'week'|'month'
+          period: result.data.period,
           tz,
           now: new Date()
         });
@@ -334,24 +289,28 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     if (result.type === 'time_entry') {
-      // Voice UX: auto-commit, but add guardrails and only show a summary for punch_out.
+      // Route voice time entries through the canonical timeclock command handler (enforces guardrails).
       const { employeeName, type, timestamp } = result.data;
       const tz = getUserTz(userProfile);
-      const activeJob = await getActiveJob(ownerId);
-      const jobForLog = activeJob !== 'Uncategorized' ? activeJob : null;
+      const hhmm = toAmPm(timestamp, tz);
 
-      // ⬇️ NEW: guard against illegal transitions when helpers exist
-      const deny = await ensureAllowedTransition(ownerId, employeeName, type);
-      if (deny) {
-        return twiml(`⚠️ ${deny}`);
-      }
+      let normalized;
+      if (type === 'punch_in') normalized = `${employeeName} punched in at ${hhmm}`;
+      else if (type === 'punch_out') normalized = `${employeeName} punched out at ${hhmm}`;
+      else if (type === 'break_start') normalized = `start break for ${employeeName} at ${hhmm}`;
+      else if (type === 'break_end') normalized = `end break for ${employeeName} at ${hhmm}`;
+      else if (type === 'drive_start') normalized = `start drive for ${employeeName} at ${hhmm}`;
+      else if (type === 'drive_end') normalized = `end drive for ${employeeName} at ${hhmm}`;
+      else normalized = `${employeeName} punched in at ${hhmm}`;
 
-      await logTimeEntry(ownerId, employeeName, type, timestamp, jobForLog);
+      const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
+      if (tw) return tw;
 
+      // Fallback (if the handler didn’t emit TwiML for some reason)
+      const humanTime = fmtLocal(timestamp, tz);
       let summaryTail = '';
       try {
         if (type === 'punch_out') {
-          // Include a quick same-day total at punch-out (what you asked for)
           const { message } = await generateTimesheet({
             ownerId,
             person: employeeName,
@@ -365,9 +324,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       } catch (e) {
         console.warn('[MEDIA] timesheet summary failed:', e.message);
       }
-
-      const humanTime = fmtLocal(timestamp, tz);
-      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName} at ${humanTime}${jobForLog ? ` on ${jobForLog}` : ''}.${summaryTail}`;
+      const job = await getActiveJob(ownerId);
+      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName} at ${humanTime}${job && job !== 'Uncategorized' ? ` on ${job}` : ''}.${summaryTail}`;
       return twiml(reply);
     }
 

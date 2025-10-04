@@ -9,6 +9,12 @@ const {
   getActiveJob,
   appendToUserSpreadsheet,
   generateTimesheet,
+  // ⬇️ Optional: if your Postgres layer exposes an open-state probe, we'll use it.
+  // Prefer these names; we check existence at runtime:
+  // getOpenTimeState(ownerId, employeeName) → { on_shift, on_break, on_drive, last_shift_started_at, last_break_started_at, last_drive_started_at }
+  // getCurrentPunchState(ownerId, employeeName) → similar shape (compat)
+  getOpenTimeState,
+  getCurrentPunchState
 } = require('../services/postgres');
 
 const {
@@ -45,11 +51,59 @@ function friendlyTypeLabel(type) {
   return String(type).replace('_', ' ');
 }
 
-// helper: convert decimal hours → {h, m}
 function hoursDecToHM(dec) {
   const h = Math.floor(dec);
   const m = Math.round((dec - h) * 60);
   return { h, m };
+}
+
+// ---------- NEW: fetch open-state if the service provides it ----------
+async function fetchOpenState(ownerId, employeeName) {
+  try {
+    if (typeof getOpenTimeState === 'function') {
+      return await getOpenTimeState(ownerId, employeeName);
+    }
+    if (typeof getCurrentPunchState === 'function') {
+      return await getCurrentPunchState(ownerId, employeeName);
+    }
+  } catch (e) {
+    console.warn('[OPENSTATE] probe failed:', e.message);
+  }
+  return null; // gracefully degrade if unavailable
+}
+
+// ---------- NEW: conversational enforcement for overlapping states ----------
+function humanWhen(ts, tz) {
+  if (!ts) return '';
+  try {
+    const d = new Date(ts);
+    const day = d.toLocaleDateString('en-CA', { timeZone: tz, month: 'short', day: 'numeric' });
+    const time = d.toLocaleTimeString('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit' });
+    return `${day} at ${time}`;
+  } catch {
+    return '';
+  }
+}
+
+function blockMsg(kind, name, openStartedAt, tz) {
+  const when = humanWhen(openStartedAt, tz);
+  const tail = when ? ` (started ${when})` : '';
+  switch (kind) {
+    case 'shift_open':
+      return `I can’t clock ${name} in until they clock out of the previous shift${tail}. Say “clock out ${name}” when they’re done.`;
+    case 'shift_closed':
+      return `${name} isn’t currently clocked in. Want me to clock them in? Try “clock in ${name}”.`;
+    case 'break_open':
+      return `Looks like ${name} is already on a break${tail}. Say “end break for ${name}” first.`;
+    case 'break_closed':
+      return `${name} isn’t on a break. You can say “start break for ${name}” to begin one.`;
+    case 'drive_open':
+      return `${name} is already tracking drive time${tail}. Say “drive end for ${name}” first.`;
+    case 'drive_closed':
+      return `${name} isn’t currently tracking drive time. Say “drive start for ${name}” to begin.`;
+    default:
+      return `That action can’t be completed right now for ${name}.`;
+  }
 }
 
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType) {
@@ -83,7 +137,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         const { type } = pendingState.pendingMedia; // can be null (unknown) or a string
         const lcInput = String(input || '').toLowerCase().trim();
 
-        // New media → clear old pending and process this media
         if (mediaUrl) {
           await deletePendingTransactionState(from);
         } else if (type != null) {
@@ -138,7 +191,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
             return twiml(reply);
 
           } else if (type === 'hours_inquiry') {
-            // Expecting "today|week|month"
             const periodWord = lcInput.match(/\b(today|day|week|month)\b/i)?.[1]?.toLowerCase();
             if (periodWord) {
               const period = periodWord === 'today' ? 'day' : periodWord;
@@ -226,7 +278,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         return twiml(message);
       }
 
-      // Ask for period and store pending
       await setPendingTransactionState(from, {
         pendingMedia: { type: 'hours_inquiry' },
         pendingHours: { employeeName: name }
@@ -235,18 +286,49 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     if (result.type === 'time_entry') {
-      // Voice UX: auto-commit. Use user TZ.
       const { employeeName, type, timestamp } = result.data;
       const tz = getUserTz(userProfile);
       const activeJob = await getActiveJob(ownerId);
       const jobForLog = activeJob !== 'Uncategorized' ? activeJob : null;
 
+      // ⬇️ NEW: enforce open/close rules if we can fetch state
+      const state = await fetchOpenState(ownerId, employeeName);
+
+      if (state) {
+        if (type === 'punch_in' && state.on_shift) {
+          return twiml(blockMsg('shift_open', employeeName, state.last_shift_started_at, tz));
+        }
+        if (type === 'punch_out' && !state.on_shift) {
+          return twiml(blockMsg('shift_closed', employeeName, null, tz));
+        }
+
+        // Break is unified (covers “lunch” too, mapping -> break_*)
+        if (type === 'break_start' && !state.on_shift) {
+          return twiml(`I can’t start a break for ${employeeName} until they’re clocked in. Try “clock in ${employeeName}”.`);
+        }
+        if (type === 'break_start' && state.on_break) {
+          return twiml(blockMsg('break_open', employeeName, state.last_break_started_at, tz));
+        }
+        if (type === 'break_end' && !state.on_break) {
+          return twiml(blockMsg('break_closed', employeeName, null, tz));
+        }
+
+        // Drive rules (if you track drive separately)
+        if (type === 'drive_start' && state.on_drive) {
+          return twiml(blockMsg('drive_open', employeeName, state.last_drive_started_at, tz));
+        }
+        if (type === 'drive_end' && !state.on_drive) {
+          return twiml(blockMsg('drive_closed', employeeName, null, tz));
+        }
+      }
+
+      // If we reach here, proceed with logging
       await logTimeEntry(ownerId, employeeName, type, timestamp, jobForLog);
 
       const humanTime = fmtLocal(timestamp, tz);
       let base = `✅ ${type.replace('_', ' ')} logged for ${employeeName} at ${humanTime}${jobForLog ? ` on ${jobForLog}` : ''}.`;
 
-      // Only add a "today total" for punch_out; no weekly summary for punch_in
+      // Only add a "today total" for punch_out
       if (type === 'punch_out') {
         try {
           const { message } = await generateTimesheet({
@@ -256,7 +338,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
             tz,
             now: new Date()
           });
-          // Expect first line: "Justin worked 4.53 hours today ..."
           const firstLine = String(message || '').split('\n')[0] || '';
           const mm = firstLine.match(/\bworked\s+([\d.]+)\s+hours\b/i);
           if (mm) {

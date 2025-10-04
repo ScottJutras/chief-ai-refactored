@@ -842,7 +842,7 @@ function hours2(n) { return +(n / 3600).toFixed(2); }
 async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUtc }) {
   const q = `
   WITH params AS (
-    SELECT $1::uuid AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e
+    SELECT $1::text AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e
   ),
   base AS (
     SELECT t.*
@@ -850,7 +850,7 @@ async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUt
     WHERE t.owner_id=p.owner_id
       AND t.employee_name=p.emp
       AND t.timestamp < p.e
-      AND t.timestamp >= (p.s - INTERVAL '35 days') -- allow pairing with earlier punch_in for month/edge cases
+      AND t.timestamp >= (p.s - INTERVAL '35 days')
   ),
   punch_pairs AS (
     SELECT
@@ -916,7 +916,7 @@ async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUt
 async function getWeekDayBuckets({ ownerId, employeeName, startUtc, endUtc, tz }) {
   const q = `
     WITH params AS (
-      SELECT $1::uuid AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e, $5::text AS tz
+      SELECT $1::text AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e, $5::text AS tz
     ),
     week_days AS (
       SELECT gs::date AS d
@@ -983,7 +983,7 @@ async function getWeekDayBuckets({ ownerId, employeeName, startUtc, endUtc, tz }
 async function getMonthWeekBuckets({ ownerId, employeeName, startUtc, endUtc, tz }) {
   const q = `
     WITH params AS (
-      SELECT $1::uuid AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e, $5::text AS tz
+      SELECT $1::text AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e, $5::text AS tz
     ),
     month_start AS (
       SELECT date_trunc('month', (s AT TIME ZONE tz))::date AS mstart FROM params

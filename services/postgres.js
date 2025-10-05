@@ -1,3 +1,4 @@
+// services/postgres.js
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const ExcelJS = require('exceljs');
@@ -5,29 +6,59 @@ const PDFDocument = require('pdfkit');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { reverseGeocode } = require('./geocode');
 
-// --- Postgres pool (kept your original tuning to avoid surprise SSL issues) ---
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 10,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000,
-});
-
-// Safe debug for DATABASE_URL host (non-prod)
-if (process.env.NODE_ENV !== 'production') {
-  try {
-    if (process.env.DATABASE_URL) {
-      console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
-    } else {
-      console.warn('[DEBUG] DATABASE_URL is not set');
+// ---------- Lazy Pool Singleton (prevents read-before-init in cycles) ----------
+let _pool = null;
+function getPool() {
+  if (_pool) return _pool;
+  _pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 10,
+    connectionTimeoutMillis: 10000,
+    idleTimeoutMillis: 30000,
+  });
+  _pool.on('error', (err) => {
+    console.error('[PG] idle client error:', err?.message || err);
+  });
+  // Safe debug for DATABASE_URL host (non-prod)
+  if (process.env.NODE_ENV !== 'production') {
+    try {
+      if (process.env.DATABASE_URL) {
+        console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
+      } else {
+        console.warn('[DEBUG] DATABASE_URL is not set');
+      }
+    } catch (e) {
+      console.warn('[DEBUG] Could not parse DATABASE_URL:', e.message);
     }
-  } catch (e) {
-    console.warn('[DEBUG] Could not parse DATABASE_URL:', e.message);
+  }
+  return _pool;
+}
+
+// Convenience helpers (use these instead of exporting `pool`)
+async function query(text, params) {
+  return getPool().query(text, params);
+}
+
+// Run a function with a dedicated client + transaction
+async function withClient(fn, { useTransaction = true } = {}) {
+  const client = await getPool().connect();
+  try {
+    if (useTransaction) await client.query('BEGIN');
+    const result = await fn(client);
+    if (useTransaction) await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    if (useTransaction) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
-// --- Helpers ---
+// ---------- Helpers ----------
 function normalizePhoneNumber(phone = '') {
   const val = String(phone || '');
   const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
@@ -73,13 +104,13 @@ function computeEmployeeSummary(rows) {
   };
 }
 
-// --- OTP & verification ---
+// ---------- OTP & verification ----------
 async function generateOTP(userId) {
   const normalizedId = normalizePhoneNumber(userId);
   try {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
-    await pool.query(
+    await query(
       `UPDATE users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
       [otp, expiry, normalizedId],
     );
@@ -93,14 +124,14 @@ async function generateOTP(userId) {
 async function verifyOTP(userId, otp) {
   const normalizedId = normalizePhoneNumber(userId);
   try {
-    const res = await pool.query(
+    const res = await query(
       `SELECT otp, otp_expiry FROM users WHERE user_id=$1`,
       [normalizedId],
     );
     const user = res.rows[0];
     const isValid = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
     if (!isValid) return false;
-    await pool.query(`UPDATE users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [normalizedId]);
+    await query(`UPDATE users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [normalizedId]);
     return true;
   } catch (error) {
     console.error('[ERROR] verifyOTP failed:', error.message);
@@ -108,16 +139,16 @@ async function verifyOTP(userId, otp) {
   }
 }
 
-// --- Transactions / Expenses / Bills / Revenue / Quotes ---
+// ---------- Transactions / Expenses / Bills / Revenue / Quotes ----------
 async function appendToUserSpreadsheet(ownerId, data) {
   try {
     const [date, item, amount, store, jobName, type, category, mediaUrl, userName] = data;
-    const query = `
+    const sql = `
       INSERT INTO transactions
         (owner_id, date, item, amount, store, job_name, type, category, media_url, user_name, created_at)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
       RETURNING id`;
-    const result = await pool.query(query, [
+    const result = await query(sql, [
       ownerId,
       date,
       item,
@@ -138,7 +169,7 @@ async function appendToUserSpreadsheet(ownerId, data) {
 
 async function saveExpense({ ownerId, date, item, amount, store, jobName, category, user, mediaUrl }) {
   try {
-    await pool.query(
+    await query(
       `INSERT INTO transactions (owner_id, type, date, item, amount, store, job_name, category, user_name, media_url, created_at)
        VALUES ($1,'expense',$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
       [ownerId, date, item, toAmount(amount), store, jobName, category, user, mediaUrl || null],
@@ -151,7 +182,7 @@ async function saveExpense({ ownerId, date, item, amount, store, jobName, catego
 
 async function deleteExpense(ownerId, criteria) {
   try {
-    const res = await pool.query(
+    const res = await query(
       `DELETE FROM transactions
        WHERE owner_id = $1 AND type='expense' AND item=$2 AND amount=$3 AND store=$4
        RETURNING *`,
@@ -166,7 +197,7 @@ async function deleteExpense(ownerId, criteria) {
 
 async function saveBill(ownerId, billData) {
   try {
-    await pool.query(
+    await query(
       `INSERT INTO transactions (owner_id, type, date, item, amount, recurrence, job_name, category, created_at)
        VALUES ($1,'bill',$2,$3,$4,$5,$6,$7,NOW())`,
       [
@@ -187,7 +218,7 @@ async function saveBill(ownerId, billData) {
 
 async function updateBill(ownerId, billData) {
   try {
-    const res = await pool.query(
+    const res = await query(
       `UPDATE transactions
        SET amount = COALESCE($1, amount),
            recurrence = COALESCE($2, recurrence),
@@ -212,7 +243,7 @@ async function updateBill(ownerId, billData) {
 
 async function deleteBill(ownerId, billName) {
   try {
-    const res = await pool.query(
+    const res = await query(
       `DELETE FROM transactions WHERE owner_id=$1 AND type='bill' AND item=$2 RETURNING *`,
       [ownerId, billName],
     );
@@ -225,7 +256,7 @@ async function deleteBill(ownerId, billName) {
 
 async function saveRevenue(ownerId, revenueData) {
   try {
-    await pool.query(
+    await query(
       `INSERT INTO transactions (owner_id, type, amount, item, store, category, date, job_name, created_at)
        VALUES ($1,'revenue',$2,$3,$4,$5,$6,$7,NOW())`,
       [
@@ -246,7 +277,7 @@ async function saveRevenue(ownerId, revenueData) {
 
 async function saveQuote(ownerId, quoteData) {
   try {
-    await pool.query(
+    await query(
       `INSERT INTO quotes (owner_id, amount, description, client, job_name, created_at)
        VALUES ($1,$2,$3,$4,$5,NOW())`,
       [ownerId, toAmount(quoteData.amount), quoteData.description, quoteData.client, quoteData.jobName],
@@ -256,6 +287,7 @@ async function saveQuote(ownerId, quoteData) {
     throw error;
   }
 }
+
 
 // --- Pricing Items ---
 async function addPricingItem(ownerId, itemName, unitCost, unit = 'each', category = 'material') {
@@ -1716,7 +1748,13 @@ async function getCurrentStatus(ownerId, employeeName) {
 
 // --- Exports ---
 module.exports = {
-  pool, // keep exported (routes/exports.js needs it)
+  // Keep "pool" exported for routes/exports.js, but make it LAZY to break cycles
+  get pool() { return getPool(); },
+
+  // also export helpers so other code can migrate off raw pool use
+  getPool,
+  query,
+  withClient,
 
   // transactions
   appendToUserSpreadsheet,
@@ -1749,7 +1787,7 @@ module.exports = {
   // users
   createUserProfile,
   saveUserProfile,
-  getUserProfile, //<------added this
+  getUserProfile,
   getOwnerProfile,
   getCurrentStatus,
 
@@ -1766,7 +1804,7 @@ module.exports = {
   moveLastEntryToJob,
   getTimeEntries,
   getEntriesBetween,
-  generateTimesheet, // new overload + legacy preserved
+  generateTimesheet,
   createTimePrompt,
   getPendingPrompt,
   clearPrompt,
@@ -1793,8 +1831,9 @@ module.exports = {
   getUserByName,
   normalizePhoneNumber,
 
-  // time entries: limits & audit
+  // limits & audit
   checkTimeEntryLimit,
   checkActorLimit,
-  hasCreatedByColumn
+  hasCreatedByColumn,
 };
+

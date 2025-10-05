@@ -1,4 +1,3 @@
-// handlers/commands/timeclock.js
 const {
   logTimeEntry,
   generateTimesheet,
@@ -16,14 +15,13 @@ const {
   checkTimeEntryLimit,
   checkActorLimit,
   hasCreatedByColumn,
-  // precise range summary
   getEntriesBetween,
-  // OPTIONAL: if implemented; we will gracefully fallback if not present
   getCurrentStatus,
 } = require('../../services/postgres');
-
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
+// Assuming inferIntentFromText is moved to utils/intent.js to avoid circular dependencies
+const { inferIntentFromText } = require('../../utils/intent');
 
 // ---------- Subscription tier limits ----------
 const TIME_ENTRY_LIMITS = {
@@ -53,14 +51,6 @@ function normalizeInput(raw) {
   lc = lc.replace(/\bclock(?:ed)?\s+(our|or)\b/g, 'clocked out');
   return lc.replace(/\s{2,}/g, ' ').trim();
 }
-function inferIntentFromText(s = '') {
-  const lc = String(s).toLowerCase();
-  if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift)\b/.test(lc)) return 'punch_in';
-  if (/\b(clock|punch)\s+out\b/.test(lc) || /\b(end|finish|stop)\s+(work|shift)\b/.test(lc)) return 'punch_out';
-  if (/\b(start|begin)\s+(break|lunch)\b/.test(lc) || /\bon\s+break\b/.test(lc)) return 'break_start';
-  if (/\b(end|finish)\s+(break|lunch)\b/.test(lc) || /\boff\s+break\b/.test(lc)) return 'break_end';
-  return null;
-}
 
 // --- Future-entry policy (grace window) ---
 const MAX_FUTURE_MINUTES = Number(process.env.MAX_FUTURE_MINUTES || 10);
@@ -71,9 +61,7 @@ function isTooFarInFuture(ts) {
 function guardFutureOrExplain(whenUtc, tz, res, subject = 'That time') {
   if (!whenUtc) return false;
   if (isTooFarInFuture(whenUtc)) {
-    const msg =
-      `⛔ ${subject} (${fmtInTz(whenUtc, tz)}) is more than ${MAX_FUTURE_MINUTES} minutes in the future. ` +
-      `Please send a current or past time (e.g., "10:00am yesterday" or "now").`;
+    const msg = `⛔ ${subject} (${fmtInTz(whenUtc, tz)}) is more than ${MAX_FUTURE_MINUTES} minutes in the future. Please send a current or past time (e.g., "10:00am yesterday" or "now").`;
     res.send(twiml(msg));
     return true;
   }
@@ -111,7 +99,6 @@ function denyActMsg(actorProfile, targetName) {
 function isApproved(userProfile, isOwner) {
   if (isOwner) return true;
   const role = String(userProfile?.role || '').toLowerCase();
-  // treat these as approved; allow legacy 'approved' if used elsewhere
   return ['owner', 'board', 'team', 'accountant', 'approved'].includes(role);
 }
 
@@ -193,13 +180,10 @@ function fmtInTz(date, tz) {
 // ---------- Period query ----------
 function parseHoursQuery(lcInput, fallbackName) {
   const s = String(lcInput || '').trim();
-
-  // must mention hour(s) and day/week/month
   const periodMatch = s.match(/\b(day|week|month)\b/i);
   if (!/\bhours?\b/i.test(s) || !periodMatch) return null;
   const period = periodMatch[1].toLowerCase();
 
-  // Try several name patterns, in order of confidence:
   const nameFromFor = s.match(/\bfor\s+([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\b/i);
   const nameFromHowMany = s.match(/\bhow\s+many\s+hours\b.*?\b(?:did\s+)?([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\s+(?:work|do)\b/i);
   const nameBeforeHours = s.match(/^([a-z][a-z.'\-]*(?:\s+[a-z][a-z.'\-]*){0,3})\s+hours?\b/i);
@@ -212,39 +196,13 @@ function parseHoursQuery(lcInput, fallbackName) {
     (nameNearWork && nameNearWork[1]) ||
     '';
 
-  // Avoid taking WH-words or helpers as the name
   const stop = new Set([
-    'how',
-    'what',
-    'who',
-    'when',
-    'where',
-    'why',
-    'which',
-    'many',
-    'much',
-    'did',
-    'does',
-    'do',
-    'the',
-    'a',
-    'an',
-    'this',
-    'that',
-    'my',
-    'his',
-    'her',
-    'their',
+    'how', 'what', 'who', 'when', 'where', 'why', 'which',
+    'many', 'much', 'did', 'does', 'do', 'the', 'a', 'an',
+    'this', 'that', 'my', 'his', 'her', 'their',
   ]);
-  name = name
-    .split(/\s+/)
-    .filter(w => !stop.has(w))
-    .join(' ')
-    .trim();
-
-  // If we still don't have a name, use fallback (self)
+  name = name.split(/\s+/).filter(w => !stop.has(w)).join(' ').trim();
   if (!name) name = fallbackName || '';
-
   return { employeeName: titleCase(sanitizeInput(name)), period };
 }
 
@@ -261,60 +219,110 @@ function getUserTz(userProfile) {
 }
 
 // ---------- tolerant command patterns ----------
-// Order matters: handle explicit “end/out/finish” BEFORE generic “start/in/begin/implicit”.
 const RE_ACTION_FIRST = [
-  // Explicit name after action (wins first)
-  { type: 'punch_in', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
-  { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu },
-
-  // Generic optional-name (falls back to self if no name captured)
-  { type: 'punch_in', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'punch_out', re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-
-  // ---- Work/shift synonyms (action-first) ----
-  { type: 'punch_out', re: /^(?:end|finish|stop)\s+(?:work|shift)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'punch_in', re: /^(?:start|begin)\s+(?:work|shift)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-
-  // ---- Break/lunch, drive ----
-  // IMPORTANT: break_end BEFORE break_start
-  { type: 'break_end', re: /^(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-
-  // break_start must NOT match phrases that clearly indicate an end
-  { type: 'break_start', re: /^(?:break|lunch)(?!\s*(?:end|out|finish)\b)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-
-  // “went/is/on break” (implicit start)
-  { type: 'break_start', re: /^(?:just\s+)?(?:went\s+on\s+|on\s+|is\s+on\s+)(?:break)(?!\s*(?:end|out|finish)\b)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-
-  { type: 'drive_end', re: /^drive\s*(?:end|stop|finish)(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
-  { type: 'drive_start', re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?:.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu },
+  // High-priority patterns for voice input like "clock in, Justin, now"
+  {
+    type: 'punch_in',
+    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s*[,:-]?\s*(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*,?\s*(?:now|right\s+now)\b|\s*(?:at|@)\s*(?<time>.+))?$/iu,
+  },
+  {
+    type: 'punch_out',
+    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s*[,:-]?\s*(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*,?\s*(?:now|right\s+now)\b|\s*(?:at|@)\s*(?<time>.+))?$/iu,
+  },
+  // Explicit name after action
+  {
+    type: 'punch_in',
+    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu,
+  },
+  {
+    type: 'punch_out',
+    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu,
+  },
+  // Generic optional-name
+  {
+    type: 'punch_in',
+    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
+  {
+    type: 'punch_out',
+    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
+  // Work/shift synonyms (action-first)
+  {
+    type: 'punch_out',
+    re: /^(?:end|finish|stop)\s+(?:work|shift)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
+  {
+    type: 'punch_in',
+    re: /^(?:start|begin)\s+(?:work|shift)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
+  // Break/lunch, drive
+  {
+    type: 'break_end',
+    re: /^(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
+  {
+    type: 'break_start',
+    re: /^(?:break|lunch)(?!\s*(?:end|out|finish)\b)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
+  {
+    type: 'break_start',
+    re: /^(?:just\s+)?(?:went\s+on\s+|on\s+|is\s+on\s+)(?:break)(?!\s*(?:end|out|finish)\b)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
+  {
+    type: 'drive_end',
+    re: /^drive\s*(?:end|stop|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
+  {
+    type: 'drive_start',
+    re: /^drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
+  },
 ];
 
 const RE_NAME_FIRST = [
-  { type: 'punch_in', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-
-  // ---- Work/shift synonyms (name-first) ----
-  { type: 'punch_out', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:work|shift)\s*(?:end|out|finish|stop)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'punch_in', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:work|shift)\s*(?:start|in|begin)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-
-  // IMPORTANT: break_end BEFORE break_start
-  { type: 'break_end', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-
-  // break_start must NOT match phrases that clearly indicate an end
-  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)(?!\s*(?:end|out|finish)\b)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-
-  // “went on / is on break” (implicit start)
-  { type: 'break_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:just\s+)?(?:went\s+on\s+|is\s+on\s+|on\s+)break(?!\s*(?:end|out|finish)\b)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-
-  { type: 'drive_end', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
-  { type: 'drive_start', re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu },
+  {
+    type: 'punch_in',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
+  {
+    type: 'punch_out',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
+  {
+    type: 'punch_out',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:work|shift)\s*(?:end|out|finish|stop)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
+  {
+    type: 'punch_in',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:work|shift)\s*(?:start|in|begin)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
+  {
+    type: 'break_end',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
+  {
+    type: 'break_start',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:break|lunch)(?!\s*(?:end|out|finish)\b)\s*(?:start|in|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
+  {
+    type: 'break_start',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+(?:just\s+)?(?:went\s+on\s+|is\s+on\s+|on\s+)break(?!\s*(?:end|out|finish)\b)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
+  {
+    type: 'drive_end',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:end|stop|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
+  {
+    type: 'drive_start',
+    re: /^(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)\s+drive\s*(?:start|begin)?(?:\s*(?:at|@))?\s*(?<time>.+)?$/iu,
+  },
 ];
 
 const RE_TIME_EDIT =
   /^(?:adjust|fix|edit)\s+(?:last)?\s*(?:punch|clock|break|lunch|drive)\s*(?:in|out|start|end)?\s*(?:by)?\s*([+-]?\d{1,3})\s*(?:min|minutes)\b/i;
 
 function dbgMatch(label, m) {
-  if (m) console.log(`[timeclock] matched ${label}:`, m.groups || {});
+  if (m) console.log(`[timeclock] matched ${label}:`, m?.groups || {});
 }
 
 // ---------- batch helpers ----------
@@ -326,10 +334,7 @@ function stripDayWords(text) {
 }
 function splitNames(namesStr) {
   const s = namesStr.replace(/\s+and\s+/gi, ',');
-  return s
-    .split(',')
-    .map(x => titleCase(sanitizeInput(x.trim())))
-    .filter(Boolean);
+  return s.split(',').map(x => titleCase(sanitizeInput(x.trim()))).filter(Boolean);
 }
 
 const BATCH_LIMIT = 10,
@@ -381,7 +386,6 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userP
       const breakEnd = new Date(lunchStart.getTime() - gapMs);
       const breakStart = new Date(breakEnd.getTime() - bMs);
 
-      // future guard for calculated endpoints (unlikely but safe)
       if (guardFutureOrExplain(lunchEnd, tz, { send: () => {} })) {
         /* no-op in batch pre-check */
       }
@@ -479,7 +483,7 @@ const MONTHS = {
   feb: 1,
   mar: 2,
   apr: 3,
-  may2: 4, // safeguard if "may" is reused, ignore
+  may2: 4,
   jun: 5,
   jul: 6,
   aug: 7,
@@ -561,10 +565,13 @@ function twiml(text) {
 // ---------- handler ----------
 async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res, extras = {}) {
   try {
-    const raw = norm(input);
-    const lc = normalizeInput(raw);
+    let raw = norm(input);
+    // Voice punctuation normalization (fixes "clock in, Justin, now")
+    raw = raw
+      .replace(/\b(clock|punch)\s*(in|out)\s*,\s*/gi, '$1 $2 ')
+      .replace(/,\s*(now|today)\b/gi, ' $1');
+    let lc = normalizeInput(raw);
     const tz = getUserTz(userProfile);
-
     const xtras = { ...extras, created_by: from };
 
     // 1) Approval gate
@@ -579,7 +586,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
           relatedEntryId: null,
         });
       } catch (e) {
-        console.warn('[timeclock] failed to enqueue approval task:', e?.message);
+        console.warn(`[timeclock] failed to enqueue approval task: ${e?.message}`);
       }
       return res.send(twiml(approvalBlockMsg(userProfile, ownerProfile)));
     }
@@ -590,9 +597,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       userProfile?.subscription_tier || 'starter'
     );
     if (!ownerLimitOk) {
-      return res.send(
-        twiml(`⚠️ Time entry limit reached for ${tierKey} tier (${tierLimit}/day). Upgrade or try tomorrow.`)
-      );
+      return res.send(twiml(`⚠️ Time entry limit reached for ${tierKey} tier (${tierLimit}/day). Upgrade or try tomorrow.`));
     }
     const actorOk = await checkActorLimit(ownerId, from);
     if (!actorOk) {
@@ -639,10 +644,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       }
       const existingBreak = await getOpenBreakSince(ownerId, who, openShift.timestamp);
       if (existingBreak) {
-        const msg = `${who} already has an open break started at ${fmtInTz(
-          new Date(existingBreak.timestamp),
-          tz
-        )}. End it first (e.g., "${who} break end").`;
+        const msg = `${who} already has an open break started at ${fmtInTz(new Date(existingBreak.timestamp), tz)}. End it first (e.g., "${who} break end").`;
         return res.send(twiml(msg));
       }
       await logTimeEntry(ownerId, who, 'break_start', whenUtc.toISOString(), jobName || null, tz, xtras);
@@ -664,9 +666,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       const endIso = range.end.toISOString();
       const exportFn = wantsPdf ? exportTimesheetPdf : exportTimesheetXlsx;
       const { url, filename } = await exportFn({ ownerId, startIso, endIso, employeeName: employeeOne, tz });
-      const body = `📄 Timesheet ready (${startIso.slice(0, 10)} → ${endIso.slice(0, 10)}${
-        employeeOne ? ` • ${employeeOne}` : ''
-      }).\n${filename}`;
+      const body = `📄 Timesheet ready (${startIso.slice(0, 10)} → ${endIso.slice(0, 10)}${employeeOne ? ` • ${employeeOne}` : ''}).\n${filename}`;
       return res.send(`<Response><Message><Body>${body}</Body><Media>${url}</Media></Message></Response>`);
     }
 
@@ -686,26 +686,14 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       const shiftStartIso = pending.context?.shiftStartUtc;
       const punchOutUtcIso = t.toISOString();
 
-      if (shiftStartIso)
-        await closeOpenBreakIfAny(ownerId, employeeName, shiftStartIso, punchOutUtcIso, tz);
+      if (shiftStartIso) await closeOpenBreakIfAny(ownerId, employeeName, shiftStartIso, punchOutUtcIso, tz);
       await logTimeEntry(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null, tz, xtras);
       await clearPrompt(pending.id);
 
-      const windowEntries = await getEntriesBetween(
-        ownerId,
-        employeeName,
-        shiftStartIso || punchOutUtcIso,
-        punchOutUtcIso
-      );
-      const { shiftHours, breakMinutes } = summarizeShiftFromEntries(
-        windowEntries,
-        shiftStartIso || punchOutUtcIso,
-        punchOutUtcIso
-      );
+      const windowEntries = await getEntriesBetween(ownerId, employeeName, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
+      const { shiftHours, breakMinutes } = summarizeShiftFromEntries(windowEntries, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
 
-      const msg = `✅ Clocked out ${titleCase(employeeName)} at ${fmtInTz(t, tz)}.\nWorked ${shiftHours.toFixed(
-        2
-      )}h including ${breakMinutes}m paid breaks/lunch.`;
+      const msg = `✅ Clocked out ${titleCase(employeeName)} at ${fmtInTz(t, tz)}.\nWorked ${shiftHours.toFixed(2)}h including ${breakMinutes}m paid breaks/lunch.`;
       return res.send(twiml(msg));
     }
 
@@ -730,16 +718,10 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         employeeId: employeeName,
         requesterId: from,
         title: `Adjust last time entry by ${minutes} minutes for ${employeeName}`,
-        body: `Requested adjustment: ${minutes} minutes for ${employeeName}'s last time entry${
-          lastEntry ? ` (${lastEntry.type} at ${fmtInTz(new Date(lastEntry.timestamp), tz)})` : ''
-        }.`,
+        body: `Requested adjustment: ${minutes} minutes for ${employeeName}'s last time entry${lastEntry ? ` (${lastEntry.type} at ${fmtInTz(new Date(lastEntry.timestamp), tz)})` : ''}.`,
         relatedEntryId: lastEntry?.id || null,
       });
-      return res.send(
-        twiml(
-          `✅ Time edit request created (#${task.id}): Adjust last entry by ${minutes} minutes for ${employeeName}. Owner/Board will review.`
-        )
-      );
+      return res.send(twiml(`✅ Time edit request created (#${task.id}): Adjust last entry by ${minutes} minutes for ${employeeName}. Owner/Board will review.`));
     }
 
     // 8) Hours query (fast path)
@@ -753,7 +735,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       const { message } = await generateTimesheet({
         ownerId,
         person: titleCase(employeeName),
-        period, // 'day' | 'week' | 'month'
+        period,
         tz,
         now: new Date(),
       });
@@ -782,7 +764,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       if (m) {
         match = m;
         action = type;
-        dbgMatch(type + ':name-first', m);
+        dbgMatch(`${type}:name-first`, m);
         break;
       }
     }
@@ -792,27 +774,23 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         if (m) {
           match = m;
           action = type;
-          dbgMatch(type + ':action-first', m);
+          dbgMatch(`${type}:action-first`, m);
           break;
         }
       }
     }
 
     if (!match || !action) {
-      const reply =
-        '⚠️ Invalid time entry. Try "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".';
+      const reply = '⚠️ Invalid time entry. Try "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".';
       return res.send(twiml(reply));
     }
-// --- HARD INTENT OVERRIDE (timeclock.js) ---
-const rawIntent = inferIntentFromText(raw); // 'raw' = normalized input string
-if (rawIntent === 'punch_in'   && action === 'punch_out') action = 'punch_in';
-if (rawIntent === 'punch_out'  && action === 'punch_in')  action = 'punch_out';
-if (rawIntent === 'break_start'&& action === 'break_end')  action = 'break_start';
-if (rawIntent === 'break_end'  && action === 'break_start')action = 'break_end';
-{
-  console.log('[timeclock] hard-intent override:', { rawIntent, before: action });
-  action = rawIntent; // set directly to the inferred intent
-}
+
+    const rawIntent = inferIntentFromText(raw);
+    if (rawIntent && rawIntent !== action) {
+      action = rawIntent;
+      console.log(`[timeclock] intent override:`, { rawIntent, before: action });
+    }
+
     const who = titleCase(sanitizeInput(match.groups?.name || userProfile?.name || 'Unknown'));
     if (!canActOn(userProfile, isOwner, who, ownerProfile)) {
       return res.send(twiml(denyActMsg(userProfile, who)));
@@ -824,7 +802,7 @@ if (rawIntent === 'break_end'  && action === 'break_start')action = 'break_end';
     if (guardFutureOrExplain(whenUtc, tz, res, 'That time')) return;
     const whenIso = whenUtc.toISOString();
 
-    // 11) Guardrails via current status (optional function), else fall back to open-shift queries
+    // 11) Guardrails via current status (optional function)
     let status = null;
     try {
       if (typeof getCurrentStatus === 'function') {
@@ -879,13 +857,10 @@ if (rawIntent === 'break_end'  && action === 'break_start')action = 'break_end';
       const windowEntries = await getEntriesBetween(ownerId, who, open.timestamp, whenIso);
       const { shiftHours, breakMinutes } = summarizeShiftFromEntries(windowEntries, open.timestamp, whenIso);
 
-      const reply = `✅ Clocked out ${who} at ${fmtInTz(whenUtc, tz)}.\nWorked ${shiftHours.toFixed(
-        2
-      )}h, including ${breakMinutes}m paid breaks/lunch.`;
+      const reply = `✅ Clocked out ${who} at ${fmtInTz(whenUtc, tz)}.\nWorked ${shiftHours.toFixed(2)}h, including ${breakMinutes}m paid breaks/lunch.`;
       return res.send(twiml(reply));
     }
 
-    // For break/drive, must be on shift
     const openShift = await getOpenShift(ownerId, who);
     if (!openShift) {
       const msg = `${who} isn’t clocked in. Punch in first (e.g., "${who} punched in at 8am").`;
@@ -895,10 +870,7 @@ if (rawIntent === 'break_end'  && action === 'break_start')action = 'break_end';
     if (action === 'break_start') {
       const existingBreak = await getOpenBreakSince(ownerId, who, openShift.timestamp);
       if (existingBreak) {
-        const msg = `${who} already has an open break started at ${fmtInTz(
-          new Date(existingBreak.timestamp),
-          tz
-        )}. End it first (e.g., "${who} break end").`;
+        const msg = `${who} already has an open break started at ${fmtInTz(new Date(existingBreak.timestamp), tz)}. End it first (e.g., "${who} break end").`;
         return res.send(twiml(msg));
       }
       await logTimeEntry(ownerId, who, 'break_start', whenIso, jobName || null, tz, xtras);
@@ -917,12 +889,11 @@ if (rawIntent === 'break_end'  && action === 'break_start')action = 'break_end';
       return res.send(twiml(reply));
     }
 
-    // drive_start / drive_end or any other supported action
     await logTimeEntry(ownerId, who, action, whenIso, jobName || null, tz, xtras);
     const reply = `✅ ${action.replace('_', ' ')} logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
     return res.send(twiml(reply));
   } catch (error) {
-    console.error(`[ERROR] handleTimeclock failed for ${from}:`, error?.message);
+    console.error(`[ERROR] handleTimeclock failed for ${from}: ${error?.message}`);
     const reply = `⚠️ Error logging time entry. Please try again.`;
     return res.send(twiml(reply));
   }

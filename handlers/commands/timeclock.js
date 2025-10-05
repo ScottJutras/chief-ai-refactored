@@ -17,10 +17,10 @@ const {
   hasCreatedByColumn,
   getEntriesBetween,
   getCurrentStatus,
+  getUserByName,
 } = require('../../services/postgres');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
-// Assuming inferIntentFromText is moved to utils/intent.js to avoid circular dependencies
 const { inferIntentFromText } = require('../../utils/intent');
 
 // ---------- Subscription tier limits ----------
@@ -47,9 +47,25 @@ function sanitizeInput(text) {
 
 function normalizeInput(raw) {
   let lc = String(raw || '').trim().toLowerCase();
-  // common mishearing fix: "clock our" -> "clock out"
   lc = lc.replace(/\bclock(?:ed)?\s+(our|or)\b/g, 'clocked out');
   return lc.replace(/\s{2,}/g, ' ').trim();
+}
+
+// Remove trailing punctuation and filler tokens that accidentally end up in a name capture
+function cleanPersonName(input = '') {
+  let s = String(input || '').trim();
+  // strip trailing punctuation
+  s = s.replace(/[.,!?;:]+$/u, '').trim();
+  // if someone said "Justin now" or "Justin today please"
+  s = s
+    .replace(/\b(now|right now|today|pls|please)\b$/iu, '')
+    .replace(/\b(now|right now|today|pls|please)\b/giu, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  // super defensive: if the *only* second token is "now" after punctuation removal
+  s = s.replace(/\s+\bnow\b$/iu, '').trim();
+  // final cleanup + TitleCase
+  return titleCase(sanitizeInput(s));
 }
 
 // --- Future-entry policy (grace window) ---
@@ -79,7 +95,7 @@ function canActOn(userProfile, isOwner, targetName, ownerProfile) {
   const ownerName = String(ownerProfile?.name || '').trim();
   const targetIsOwner = targetName && normalizeName(targetName) === normalizeName(ownerName);
 
-  if (isOwner) return true; // Owner can do anything
+  if (isOwner) return true;
   if (actorRole === 'board') return !targetIsOwner;
   if (actorRole === 'team') return !targetName || normalizeName(targetName) === normalizeName(actorName);
   if (actorRole === 'accountant') return false;
@@ -220,16 +236,14 @@ function getUserTz(userProfile) {
 
 // ---------- tolerant command patterns ----------
 const RE_ACTION_FIRST = [
-  // High-priority patterns for voice input like "clock in, Justin, now"
   {
     type: 'punch_in',
-    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s*[,:-]?\s*(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*,?\s*(?:now|right\s+now)\b|\s*(?:at|@)\s*(?<time>.+))?$/iu,
+    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s*[,:-]?\s*(?<name>(?:(?!\bnow\b)[\p{L}.'-]+)(?:\s+(?:(?!\bnow\b)[\p{L}.'-]+))*)(?:\s*,?\s*(?:now|right\s+now)\b|\s*(?:at|@)\s*(?<time>.+))?$/iu,
   },
   {
     type: 'punch_out',
-    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s*[,:-]?\s*(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*,?\s*(?:now|right\s+now)\b|\s*(?:at|@)\s*(?<time>.+))?$/iu,
+    re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s*[,:-]?\s*(?<name>(?:(?!\bnow\b)[\p{L}.'-]+)(?:\s+(?:(?!\bnow\b)[\p{L}.'-]+))*)(?:\s*,?\s*(?:now|right\s+now)\b|\s*(?:at|@)\s*(?<time>.+))?$/iu,
   },
-  // Explicit name after action
   {
     type: 'punch_in',
     re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu,
@@ -238,7 +252,6 @@ const RE_ACTION_FIRST = [
     type: 'punch_out',
     re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*)(?:\s*(?:at|@)\s*(?<time>.+))?$/iu,
   },
-  // Generic optional-name
   {
     type: 'punch_in',
     re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*in(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
@@ -247,7 +260,6 @@ const RE_ACTION_FIRST = [
     type: 'punch_out',
     re: /^(?:punch(?:ed)?|clock(?:ed)?)\s*out(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
   },
-  // Work/shift synonyms (action-first)
   {
     type: 'punch_out',
     re: /^(?:end|finish|stop)\s+(?:work|shift)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
@@ -256,7 +268,6 @@ const RE_ACTION_FIRST = [
     type: 'punch_in',
     re: /^(?:start|begin)\s+(?:work|shift)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
   },
-  // Break/lunch, drive
   {
     type: 'break_end',
     re: /^(?:break|lunch)\s*(?:end|out|finish)(?:\s*(?:at|@))?\s*(?<time>.+)?(?:\s+for\s+(?<name>[\p{L}.'-]+(?:\s+[\p{L}.'-]+)*))?$/iu,
@@ -360,7 +371,7 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userP
   const stripped = stripDayWords(raw);
 
   let m = stripped.match(
-    /^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+(?:took|had|did)\s+(?:a\s+)?(?<bmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+break\s+(?:then\s+(?:a\s+)?)?(?<lmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+lunch\s*$/iu
+    /^(?<names>[\p{L}.'\- ]+(?:\s*,\s*[\p{L}.'\- ]+)*(?:\s*,?\s*and\s+[\p{L}.'\- ]+)?)\s+(?:took|had|did)\s+(?:a\s+)? (?<bmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+break\s+(?:then\s+(?:a\s+)?)?(?<lmin>\d{1,3})\s*(?:min|mins|minute|minutes)\s+lunch\s*$/iu
   );
   if (m) {
     const names = splitNames(m.groups.names || '').slice(0, BATCH_LIMIT);
@@ -566,13 +577,14 @@ function twiml(text) {
 async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, isOwner, res, extras = {}) {
   try {
     let raw = norm(input);
-    // Voice punctuation normalization (fixes "clock in, Justin, now")
     raw = raw
       .replace(/\b(clock|punch)\s*(in|out)\s*,\s*/gi, '$1 $2 ')
       .replace(/,\s*(now|today)\b/gi, ' $1');
     let lc = normalizeInput(raw);
     const tz = getUserTz(userProfile);
     const xtras = { ...extras, created_by: from };
+
+    console.log(`[timeclock] input:`, { raw, lc, from });
 
     // 1) Approval gate
     if (!isApproved(userProfile, isOwner)) {
@@ -622,9 +634,11 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       );
       const mFallback = raw.match(/\bfor\s+(?<kind>break|lunch)\b(?:\s*(?:at|@)\s*(?<time>.+))?$/iu);
 
-      const who = titleCase(
-        sanitizeInput((mNameFirst?.groups?.name || mActionFirst?.groups?.name || userProfile?.name || 'Unknown').trim())
-      );
+      const nameHintPresent = /\bfor\s+(break|lunch)\b/i.test(raw);
+      const who = cleanPersonName(mNameFirst?.groups?.name || mActionFirst?.groups?.name || (!nameHintPresent ? userProfile?.name : '') || 'Unknown');
+      if (who === 'Unknown') {
+        return res.send(twiml(`⚠️ Who’s the break for? Try "Justin break start" or "Clock out Justin for lunch".`));
+      }
 
       let whenUtc = parseTimeFromText(
         (mNameFirst?.groups?.time || mActionFirst?.groups?.time || mFallback?.groups?.time || '').toLowerCase(),
@@ -781,17 +795,47 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     }
 
     if (!match || !action) {
-      const reply = '⚠️ Invalid time entry. Try "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".';
-      return res.send(twiml(reply));
+      console.log(`[timeclock] no match for input:`, { raw, lc });
+      return res.send(twiml('⚠️ Invalid time entry. Try "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".'));
     }
 
+    // Safer intent override: only allow related action swaps
     const rawIntent = inferIntentFromText(raw);
-    if (rawIntent && rawIntent !== action) {
+    const relatedActions = {
+      punch_in: ['punch_out'],
+      punch_out: ['punch_in'],
+      break_start: ['break_end'],
+      break_end: ['break_start'],
+      drive_start: ['drive_end'],
+      drive_end: ['drive_start'],
+    };
+    if (rawIntent && rawIntent !== action && relatedActions[action]?.includes(rawIntent)) {
+      console.log(`[timeclock] intent override allowed`, { matched: action, override: rawIntent, input: raw });
       action = rawIntent;
-      console.log(`[timeclock] intent override:`, { rawIntent, before: action });
+    } else if (rawIntent && rawIntent !== action) {
+      console.log(`[timeclock] intent override blocked`, { matched: action, proposed: rawIntent, input: raw });
     }
 
-    const who = titleCase(sanitizeInput(match.groups?.name || userProfile?.name || 'Unknown'));
+    // Avoid sender fallback if another person is mentioned
+    const tokensContainOtherPerson =
+      /\bfor\s+[a-z]/i.test(raw) ||
+      /\b(?:clock|punch)\s+(?:in|out)\s+[a-z]/i.test(raw) ||
+      /^[a-z].*\b(?:clock|punch|work|shift|break|drive)\b/i.test(raw);
+    const whoRaw = match.groups?.name || (!tokensContainOtherPerson ? userProfile?.name : '') || 'Unknown';
+    const who = cleanPersonName(whoRaw);
+    if (who === 'Unknown') {
+      return res.send(twiml(`⚠️ Who should I log this for? Try "Clock in Justin" or "Scott break start".`));
+    }
+
+    // Disambiguate name with getUserByName
+    const resolved = await getUserByName(ownerId, who);
+    console.log(`[timeclock] getUserByName result:`, { who, resolved });
+    if (!resolved) {
+      return res.send(twiml(`⚠️ I couldn’t find "${who}". Try the full name or check if the user is registered.`));
+    }
+
+    console.log(`[timeclock] processing for:`, { who, action, time: match.groups?.time });
+
     if (!canActOn(userProfile, isOwner, who, ownerProfile)) {
       return res.send(twiml(denyActMsg(userProfile, who)));
     }

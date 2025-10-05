@@ -1,12 +1,13 @@
 // routes/exports.js
 const express = require('express');
 const router = express.Router();
-const { query } = require('../services/postgres');
+const pg = require('../services/postgres');
 
+// GET /exports/:id  → returns the stored file (xlsx/pdf)
 router.get('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { rows } = await query(
+    const { rows } = await pg.query(             // or: await pg.getPool().query(...)
       `SELECT filename, content_type, bytes FROM file_exports WHERE id=$1 LIMIT 1`,
       [id]
     );

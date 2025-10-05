@@ -1681,6 +1681,39 @@ async function createTimeEditRequestTask({
   }
 }
 
+async function getCurrentStatus(ownerId, employeeName) {
+  const res = await pool.query(`
+    SELECT type, timestamp
+    FROM time_entries
+    WHERE owner_id = $1 AND employee_name = $2
+    ORDER BY timestamp DESC
+    LIMIT 2
+  `, [ownerId, employeeName]);
+
+  let onShift = false;
+  let onBreak = false;
+  let lastShiftStart = null;
+  let lastBreakStart = null;
+
+  for (const entry of res.rows) {
+    if (entry.type === 'punch_in') {
+      onShift = true;
+      lastShiftStart = entry.timestamp;
+      break;
+    } else if (entry.type === 'punch_out') {
+      onShift = false;
+      break;
+    } else if (entry.type === 'break_start') {
+      onBreak = true;
+      lastBreakStart = entry.timestamp;
+    } else if (entry.type === 'break_end') {
+      onBreak = false;
+    }
+  }
+
+  return { onShift, onBreak, lastShiftStart, lastBreakStart };
+}
+
 // --- Exports ---
 module.exports = {
   pool, // keep exported (routes/exports.js needs it)
@@ -1716,8 +1749,9 @@ module.exports = {
   // users
   createUserProfile,
   saveUserProfile,
-  getUserProfile,
+  getUserProfile, //<------added this
   getOwnerProfile,
+  getCurrentStatus,
 
   // parsing
   parseFinancialFile,

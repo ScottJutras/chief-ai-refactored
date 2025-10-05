@@ -468,6 +468,7 @@ async function listOpenJobs(ownerId, limit = 3) {
   }
 }
 
+
 async function summarizeJob(ownerId, jobName) {
   try {
     const jobRes = await query(

@@ -1,1 +1,16 @@
-{"projectId":"prj_qnyGNpaAFrq9JXIRuejBESCdKwZ4","orgId":"team_QP4aDTwCG7iQ7msRhEggbi6r"}
+{
+  "projectId": "prj_qnyGNpaAFrq9JXIRuejBESCdKwZ4",
+  "orgId": "team_QP4aDTwCG7iQ7msRhEggbi6r",
+  "projectName": "chief-ai-refactored",
+  "settings": {
+    "createdAt": 1751775436151,
+    "framework": null,
+    "devCommand": null,
+    "installCommand": null,
+    "buildCommand": null,
+    "outputDirectory": null,
+    "rootDirectory": null,
+    "directoryListing": false,
+    "nodeVersion": "22.x"
+  }
+}

@@ -46,14 +46,30 @@ function friendlyTypeLabel(type) {
 
 async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   let payload = null;
+
+  // Derive isOwner from the profile/ownerId (digits-only compare)
+  const up = userProfile || {};
+  const ownerIdFromProfile = String(up.owner_id || up.ownerId || ownerId || '').replace(/\D/g, '');
+  const isOwner = String(up.user_id || '').replace(/\D/g, '') === ownerIdFromProfile;
+
   const resStub = {
     headersSent: false,
     status() { return this; },
     type() { return this; },
     send(body) { payload = String(body || ''); this.headersSent = true; return this; }
   };
+
   try {
-    await handleTimeclock(from, normalized, userProfile, ownerId, null, false, resStub, {});
+    await handleTimeclock(
+      from,
+      normalized,
+      userProfile,
+      ownerIdFromProfile || ownerId,
+      null,                      // ownerProfile (unused here)
+      isOwner,                   // <-- IMPORTANT: pass real isOwner
+      resStub,
+      {}
+    );
   } catch (e) {
     console.error('[MEDIA] handleTimeclock failed:', e?.message);
   }
@@ -284,44 +300,39 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     if (result.type === 'time_entry') {
-      let { employeeName, type, timestamp } = result.data;
-      if (!employeeName) employeeName = userProfile.name || 'Unknown';
-      const tz = getUserTz(userProfile);
-      const timeWord = /T/.test(timestamp) ? new Date(timestamp) : null;
-      const timeSuffix = timeWord ? ` at ${toAmPm(timestamp, tz)}` : '';
-      let normalized;
-      if (type === 'punch_in') normalized = `${employeeName} punched in${timeSuffix}`;
-      else if (type === 'punch_out') normalized = `${employeeName} punched out${timeSuffix}`;
-      else if (type === 'break_start') normalized = `start break for ${employeeName}${timeSuffix}`;
-      else if (type === 'break_end') normalized = `end break for ${employeeName}${timeSuffix}`;
-      else if (type === 'drive_start') normalized = `start drive for ${employeeName}${timeSuffix}`;
-      else if (type === 'drive_end') normalized = `end drive for ${employeeName}${timeSuffix}`;
-      else normalized = `${employeeName} punched in${timeSuffix}`;
-      const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
-      if (typeof tw === 'string' && tw.trim()) return tw;
+  let { employeeName, type, timestamp } = result.data;
 
-      // Fallback
-      const humanTime = fmtLocal(timestamp, tz);
-      let summaryTail = '';
-      try {
-        if (type === 'punch_out') {
-          const { message } = await generateTimesheet({
-            ownerId,
-            person: employeeName,
-            period: 'day',
-            tz,
-            now: new Date()
-          });
-          const firstLine = String(message || '').split('\n')[0] || '';
-          if (firstLine) summaryTail = `\n${firstLine.replace(/^[^A-Za-z0-9]*/, '')}`;
-        }
-      } catch (e) {
-        console.warn('[MEDIA] timesheet summary failed:', e.message);
-      }
-      const job = await getActiveJob(ownerId);
-      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName} at ${humanTime}${job && job !== 'Uncategorized' ? ` on ${job}` : ''}.${summaryTail}`;
-      return twiml(reply);
-    }
+  const tz = getUserTz(userProfile);
+  const timeWord = /T/.test(timestamp) ? new Date(timestamp) : null;
+  const timeSuffix = timeWord ? ` at ${toAmPm(timestamp, tz)}` : '';
+
+  let normalized;
+
+  if (employeeName && employeeName.trim()) {
+    // We captured a name → build a clean, explicit command
+    if (type === 'punch_in')          normalized = `${employeeName} punched in${timeSuffix}`;
+    else if (type === 'punch_out')    normalized = `${employeeName} punched out${timeSuffix}`;
+    else if (type === 'break_start')  normalized = `start break for ${employeeName}${timeSuffix}`;
+    else if (type === 'break_end')    normalized = `end break for ${employeeName}${timeSuffix}`;
+    else if (type === 'drive_start')  normalized = `start drive for ${employeeName}${timeSuffix}`;
+    else if (type === 'drive_end')    normalized = `end drive for ${employeeName}${timeSuffix}`;
+    else                              normalized = `${employeeName} punched in${timeSuffix}`;
+  } else {
+    // No name captured → DO NOT silently substitute the owner/self.
+    // Pass the original user utterance so timeclock’s tolerant regex can still detect “Justin”.
+    normalized = extractedText; // ← key fallback
+  }
+
+  const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
+  if (typeof tw === 'string' && tw.trim()) return tw;
+
+  // If timeclock didn’t return a body, keep the old fallback (rare)
+  const humanTime = fmtLocal(timestamp, tz);
+  const job = await getActiveJob(ownerId);
+  const who = employeeName || (userProfile.name || 'Unknown');
+  reply = `✅ ${type.replace('_', ' ')} logged for ${who} at ${humanTime}${job && job !== 'Uncategorized' ? ` on ${job}` : ''}.`;
+  return twiml(reply);
+}
 
     if (result.type === 'expense') {
       const { item, amount, store, date, category } = result.data;

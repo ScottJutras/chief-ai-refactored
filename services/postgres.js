@@ -1,4 +1,3 @@
-// services/postgres.js
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const ExcelJS = require('exceljs');
@@ -20,7 +19,6 @@ function getPool() {
   _pool.on('error', (err) => {
     console.error('[PG] idle client error:', err?.message || err);
   });
-  // Safe debug for DATABASE_URL host (non-prod)
   if (process.env.NODE_ENV !== 'production') {
     try {
       if (process.env.DATABASE_URL) {
@@ -35,12 +33,11 @@ function getPool() {
   return _pool;
 }
 
-// Convenience helpers (use these instead of exporting `pool`)
+// Convenience helpers
 async function query(text, params) {
   return getPool().query(text, params);
 }
 
-// Run a function with a dedicated client + transaction
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await getPool().connect();
   try {
@@ -64,19 +61,21 @@ function normalizePhoneNumber(phone = '') {
   const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
   return noWa.replace(/^\+/, '').trim();
 }
+
 function toAmount(x) {
   return parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
 }
+
 function isValidIsoTimestamp(ts) {
   if (!ts || (typeof ts !== 'string' && !(ts instanceof Date))) return false;
   const d = new Date(ts);
   return !Number.isNaN(d.getTime());
 }
+
 function groupBy(arr, key) {
   return arr.reduce((m, x) => ((m[x[key]] ||= []).push(x), m), {});
 }
 
-// ✅ Used by XLSX/PDF exports
 function computeEmployeeSummary(rows) {
   let totalHours = 0, driveHours = 0, breakMinutes = 0;
   let lastIn = null, lastDrive = null, lastBreak = null;
@@ -86,10 +85,8 @@ function computeEmployeeSummary(rows) {
     const t = new Date(r.timestamp);
     if (r.type === 'punch_in') lastIn = t;
     if (r.type === 'punch_out' && lastIn) { totalHours += (t - lastIn) / 3600000; lastIn = null; }
-
     if (r.type === 'drive_start') lastDrive = t;
     if (r.type === 'drive_end' && lastDrive) { driveHours += (t - lastDrive) / 3600000; lastDrive = null; }
-
     if (r.type === 'break_start') lastBreak = t;
     if (r.type === 'break_end' && lastBreak) { breakMinutes += (t - lastBreak) / 60000; lastBreak = null; }
   }
@@ -112,7 +109,7 @@ async function generateOTP(userId) {
     const expiry = new Date(Date.now() + 10 * 60 * 1000);
     await query(
       `UPDATE users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
-      [otp, expiry, normalizedId],
+      [otp, expiry, normalizedId]
     );
     return otp;
   } catch (error) {
@@ -126,7 +123,7 @@ async function verifyOTP(userId, otp) {
   try {
     const res = await query(
       `SELECT otp, otp_expiry FROM users WHERE user_id=$1`,
-      [normalizedId],
+      [normalizedId]
     );
     const user = res.rows[0];
     const isValid = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
@@ -158,7 +155,7 @@ async function appendToUserSpreadsheet(ownerId, data) {
       type,
       category,
       mediaUrl || null,
-      userName,
+      userName
     ]);
     return result.rows[0].id;
   } catch (error) {
@@ -172,7 +169,7 @@ async function saveExpense({ ownerId, date, item, amount, store, jobName, catego
     await query(
       `INSERT INTO transactions (owner_id, type, date, item, amount, store, job_name, category, user_name, media_url, created_at)
        VALUES ($1,'expense',$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
-      [ownerId, date, item, toAmount(amount), store, jobName, category, user, mediaUrl || null],
+      [ownerId, date, item, toAmount(amount), store, jobName, category, user, mediaUrl || null]
     );
   } catch (error) {
     console.error('[ERROR] saveExpense failed:', error.message);
@@ -186,7 +183,7 @@ async function deleteExpense(ownerId, criteria) {
       `DELETE FROM transactions
        WHERE owner_id = $1 AND type='expense' AND item=$2 AND amount=$3 AND store=$4
        RETURNING *`,
-      [ownerId, criteria.item, toAmount(criteria.amount), criteria.store],
+      [ownerId, criteria.item, toAmount(criteria.amount), criteria.store]
     );
     return res.rows.length > 0;
   } catch (error) {
@@ -207,8 +204,8 @@ async function saveBill(ownerId, billData) {
         toAmount(billData.amount),
         billData.recurrence,
         billData.jobName,
-        billData.category,
-      ],
+        billData.category
+      ]
     );
   } catch (error) {
     console.error('[ERROR] saveBill failed:', error.message);
@@ -231,8 +228,8 @@ async function updateBill(ownerId, billData) {
         billData.recurrence || null,
         billData.date || null,
         ownerId,
-        billData.billName,
-      ],
+        billData.billName
+      ]
     );
     return res.rows.length > 0;
   } catch (error) {
@@ -245,7 +242,7 @@ async function deleteBill(ownerId, billName) {
   try {
     const res = await query(
       `DELETE FROM transactions WHERE owner_id=$1 AND type='bill' AND item=$2 RETURNING *`,
-      [ownerId, billName],
+      [ownerId, billName]
     );
     return res.rows.length > 0;
   } catch (error) {
@@ -266,8 +263,8 @@ async function saveRevenue(ownerId, revenueData) {
         revenueData.source,
         revenueData.category,
         revenueData.date,
-        revenueData.jobName,
-      ],
+        revenueData.jobName
+      ]
     );
   } catch (error) {
     console.error('[ERROR] saveRevenue failed:', error.message);
@@ -280,7 +277,7 @@ async function saveQuote(ownerId, quoteData) {
     await query(
       `INSERT INTO quotes (owner_id, amount, description, client, job_name, created_at)
        VALUES ($1,$2,$3,$4,$5,NOW())`,
-      [ownerId, toAmount(quoteData.amount), quoteData.description, quoteData.client, quoteData.jobName],
+      [ownerId, toAmount(quoteData.amount), quoteData.description, quoteData.client, quoteData.jobName]
     );
   } catch (error) {
     console.error('[ERROR] saveQuote failed:', error.message);
@@ -288,16 +285,15 @@ async function saveQuote(ownerId, quoteData) {
   }
 }
 
-
 // --- Pricing Items ---
 async function addPricingItem(ownerId, itemName, unitCost, unit = 'each', category = 'material') {
   try {
-    const res = await pool.query(
+    const res = await query(
       `INSERT INTO pricing_items
         (owner_id, item_name, unit_cost, unit, category, created_at)
        VALUES ($1,$2,$3,$4,$5,NOW())
        RETURNING item_name, unit_cost, unit, category`,
-      [ownerId, itemName, toAmount(unitCost), unit, category],
+      [ownerId, itemName, toAmount(unitCost), unit, category]
     );
     return res.rows[0];
   } catch (error) {
@@ -308,12 +304,12 @@ async function addPricingItem(ownerId, itemName, unitCost, unit = 'each', catego
 
 async function getPricingItems(ownerId) {
   try {
-    const res = await pool.query(
+    const res = await query(
       `SELECT item_name, unit_cost, unit, category
        FROM pricing_items
        WHERE owner_id=$1
        ORDER BY item_name ASC`,
-      [ownerId],
+      [ownerId]
     );
     return res.rows;
   } catch (error) {
@@ -324,12 +320,12 @@ async function getPricingItems(ownerId) {
 
 async function updatePricingItem(ownerId, itemName, unitCost) {
   try {
-    const res = await pool.query(
+    const res = await query(
       `UPDATE pricing_items
        SET unit_cost=$1, updated_at=NOW()
        WHERE owner_id=$2 AND item_name=$3
        RETURNING item_name, unit_cost, unit, category`,
-      [toAmount(unitCost), ownerId, itemName],
+      [toAmount(unitCost), ownerId, itemName]
     );
     return res.rows[0] || null;
   } catch (error) {
@@ -340,10 +336,10 @@ async function updatePricingItem(ownerId, itemName, unitCost) {
 
 async function deletePricingItem(ownerId, itemName) {
   try {
-    await pool.query(
+    await query(
       `DELETE FROM pricing_items
        WHERE owner_id=$1 AND item_name=$2`,
-      [ownerId, itemName],
+      [ownerId, itemName]
     );
     return true;
   } catch (error) {
@@ -355,12 +351,11 @@ async function deletePricingItem(ownerId, itemName) {
 // --- Jobs ---
 async function getActiveJob(ownerId) {
   try {
-    const res = await pool.query(
+    const res = await query(
       `SELECT job_name FROM jobs WHERE owner_id=$1 AND active=true LIMIT 1`,
-      [ownerId],
+      [ownerId]
     );
-    const name = res.rows[0]?.job_name || 'Uncategorized';
-    return name;
+    return res.rows[0]?.job_name || 'Uncategorized';
   } catch (error) {
     console.error('[ERROR] getActiveJob failed:', error.message);
     return 'Uncategorized';
@@ -369,10 +364,10 @@ async function getActiveJob(ownerId) {
 
 async function createJob(ownerId, jobName) {
   try {
-    await pool.query(
+    await query(
       `INSERT INTO jobs (owner_id, job_name, active, created_at)
        VALUES ($1, $2, false, NOW())`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
   } catch (error) {
     console.error('[ERROR] createJob failed:', error.message);
@@ -382,10 +377,10 @@ async function createJob(ownerId, jobName) {
 
 async function saveJob(ownerId, jobName, startDate) {
   try {
-    await pool.query(
+    await query(
       `INSERT INTO jobs (owner_id, job_name, start_date, active, created_at)
        VALUES ($1, $2, $3, true, NOW())`,
-      [ownerId, jobName, startDate || new Date()],
+      [ownerId, jobName, startDate || new Date()]
     );
   } catch (error) {
     console.error('[ERROR] saveJob failed:', error.message);
@@ -395,10 +390,10 @@ async function saveJob(ownerId, jobName, startDate) {
 
 async function setActiveJob(ownerId, jobName) {
   try {
-    await pool.query(`UPDATE jobs SET active=false WHERE owner_id=$1`, [ownerId]);
-    await pool.query(
+    await query(`UPDATE jobs SET active=false WHERE owner_id=$1`, [ownerId]);
+    await query(
       `UPDATE jobs SET active=true, start_date=NOW() WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
   } catch (error) {
     console.error('[ERROR] setActiveJob failed:', error.message);
@@ -408,11 +403,11 @@ async function setActiveJob(ownerId, jobName) {
 
 async function finishJob(ownerId, jobName) {
   try {
-    await pool.query(
+    await query(
       `UPDATE jobs
        SET active=false, end_date=NOW()
        WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
   } catch (error) {
     console.error('[ERROR] finishJob failed:', error.message);
@@ -434,9 +429,9 @@ async function finalizeJobCreation(ownerId, jobName, activate) {
 
 async function pauseJob(ownerId, jobName) {
   try {
-    await pool.query(
+    await query(
       `UPDATE jobs SET active=false WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
   } catch (error) {
     console.error('[ERROR] pauseJob failed:', error.message);
@@ -446,9 +441,9 @@ async function pauseJob(ownerId, jobName) {
 
 async function resumeJob(ownerId, jobName) {
   try {
-    await pool.query(
+    await query(
       `UPDATE jobs SET active=true WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
   } catch (error) {
     console.error('[ERROR] resumeJob failed:', error.message);
@@ -458,14 +453,14 @@ async function resumeJob(ownerId, jobName) {
 
 async function listOpenJobs(ownerId, limit = 3) {
   try {
-    const query = `
+    const sql = `
       SELECT job_name
       FROM jobs
       WHERE owner_id = $1 AND (active = true OR end_date IS NULL)
       ORDER BY created_at DESC
       LIMIT $2
     `;
-    const res = await pool.query(query, [ownerId, limit]);
+    const res = await query(sql, [ownerId, limit]);
     return res.rows.map(row => ({ name: row.job_name }));
   } catch (error) {
     console.error('[ERROR] listOpenJobs failed:', error.message);
@@ -475,27 +470,27 @@ async function listOpenJobs(ownerId, limit = 3) {
 
 async function summarizeJob(ownerId, jobName) {
   try {
-    const jobRes = await pool.query(
+    const jobRes = await query(
       `SELECT start_date, end_date FROM jobs
        WHERE owner_id=$1 AND job_name=$2 LIMIT 1`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
     const { start_date, end_date } = jobRes.rows[0] || {};
     const start = start_date ? new Date(start_date) : new Date();
     const end = end_date ? new Date(end_date) : new Date();
     const durationDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
 
-    const expRes = await pool.query(
+    const expRes = await query(
       `SELECT COALESCE(SUM(amount::numeric),0) AS total_expenses
        FROM transactions
        WHERE owner_id=$1 AND job_name=$2 AND (type='expense' OR type='bill')`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
-    const revRes = await pool.query(
+    const revRes = await query(
       `SELECT COALESCE(SUM(amount::numeric),0) AS total_revenue
        FROM transactions
        WHERE owner_id=$1 AND job_name=$2 AND type='revenue'`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
 
     const materialCost = parseFloat(expRes.rows[0].total_expenses);
@@ -503,8 +498,7 @@ async function summarizeJob(ownerId, jobName) {
     const profit = revenue - materialCost;
     const profitMargin = revenue > 0 ? profit / revenue : 0;
 
-    // Labour hours: sum intervals that start with punch_in (per job_name)
-    const timeRes = await pool.query(
+    const timeRes = await query(
       `SELECT COALESCE(SUM(hours),0) AS hours FROM (
          SELECT
            CASE
@@ -517,14 +511,14 @@ async function summarizeJob(ownerId, jobName) {
          FROM time_entries
          WHERE owner_id = $1 AND job_name = $2
        ) x`,
-      [ownerId, jobName],
+      [ownerId, jobName]
     );
     const labourHours = parseFloat(timeRes.rows[0].hours) || 0;
 
-    const rateRes = await pool.query(
+    const rateRes = await query(
       `SELECT unit_cost FROM pricing_items
        WHERE owner_id=$1 AND category='labour' LIMIT 1`,
-      [ownerId],
+      [ownerId]
     );
     const labourRate = parseFloat(rateRes.rows[0]?.unit_cost) || 0;
     const labourCost = labourHours * labourRate;
@@ -542,7 +536,7 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
   const normalizedOwnerId = normalizePhoneNumber(ownerId);
   try {
     const dashboard_token = crypto.randomBytes(16).toString('hex');
-    const result = await pool.query(
+    const result = await query(
       `INSERT INTO users
          (user_id, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token, created_at)
        VALUES
@@ -550,7 +544,7 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
        ON CONFLICT (user_id) DO UPDATE
          SET onboarding_in_progress = EXCLUDED.onboarding_in_progress
        RETURNING *`,
-      [normalizedId, normalizedOwnerId, onboarding_in_progress, false, 'basic', dashboard_token],
+      [normalizedId, normalizedOwnerId, onboarding_in_progress, false, 'basic', dashboard_token]
     );
     return result.rows[0];
   } catch (error) {
@@ -576,7 +570,7 @@ async function saveUserProfile(profile) {
     ON CONFLICT (user_id) DO UPDATE SET ${updateSet}
     RETURNING *`;
   try {
-    const result = await pool.query(sql, values);
+    const result = await query(sql, values);
     return result.rows[0];
   } catch (error) {
     console.error('[ERROR] saveUserProfile failed:', error.message);
@@ -587,7 +581,7 @@ async function saveUserProfile(profile) {
 async function getUserProfile(userId) {
   const normalizedId = normalizePhoneNumber(userId);
   try {
-    const res = await pool.query('SELECT * FROM users WHERE user_id=$1', [normalizedId]);
+    const res = await query('SELECT * FROM users WHERE user_id=$1', [normalizedId]);
     return res.rows[0] || null;
   } catch (error) {
     console.error('[ERROR] getUserProfile failed:', error.message);
@@ -598,7 +592,7 @@ async function getUserProfile(userId) {
 async function getOwnerProfile(ownerId) {
   const normalizedId = normalizePhoneNumber(ownerId);
   try {
-    const res = await pool.query('SELECT * FROM users WHERE user_id=$1', [normalizedId]);
+    const res = await query('SELECT * FROM users WHERE user_id=$1', [normalizedId]);
     return res.rows[0] || null;
   } catch (error) {
     console.error('[ERROR] getOwnerProfile failed:', error.message);
@@ -670,8 +664,8 @@ const VALID_TYPES = new Set([
   'drive_end',
 ]);
 
-const DUPE_WINDOW_SECONDS = Number(process.env.DUPE_WINDOW_SECONDS || 90); // 90 is safer for retries
-const MAX_FUTURE_MINUTES = Number(process.env.MAX_FUTURE_MINUTES || 10); // Grace window for future timestamps
+const DUPE_WINDOW_SECONDS = Number(process.env.DUPE_WINDOW_SECONDS || 90);
+const MAX_FUTURE_MINUTES = Number(process.env.MAX_FUTURE_MINUTES || 10);
 
 function enforceNoFarFuture(timestampIso) {
   const now = Date.now();
@@ -683,15 +677,7 @@ function enforceNoFarFuture(timestampIso) {
   }
 }
 
-async function logTimeEntry(
-  ownerId,
-  employeeName,
-  type,
-  timestamp,
-  jobName = null,
-  tz = 'America/Toronto',
-  extras = {} // <- accept optional lat/lng/address/created_by here
-) {
+async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = null, tz = 'America/Toronto', extras = {}) {
   try {
     if (!ownerId) throw new Error('Missing ownerId');
     if (!VALID_TYPES.has(type)) throw new Error('Invalid time entry type');
@@ -699,7 +685,6 @@ async function logTimeEntry(
       throw new Error('Invalid employee name');
     }
     if (!isValidIsoTimestamp(timestamp)) throw new Error('Invalid timestamp');
-    // Defensive: disallow far-future entries beyond the grace window
     enforceNoFarFuture(timestamp);
     if (jobName && jobName.length > 200) throw new Error('Job name too long');
 
@@ -712,7 +697,6 @@ async function logTimeEntry(
     let address = extras.address ?? null;
     const createdBy = extras.requester_id || extras.created_by || null;
 
-    // De-dupe within ± window
     const dupeQ = `
       SELECT id
       FROM time_entries
@@ -723,10 +707,9 @@ async function logTimeEntry(
                            AND ($4::timestamptz + INTERVAL '${DUPE_WINDOW_SECONDS} seconds')
       ORDER BY id DESC
       LIMIT 1`;
-    const dupe = await pool.query(dupeQ, [ownerId, employeeName, type, tsIso]);
+    const dupe = await query(dupeQ, [ownerId, employeeName, type, tsIso]);
     if (dupe.rows.length) return dupe.rows[0].id;
 
-    // Check if created_by column exists
     const hasCreatedBy = await hasCreatedByColumn();
     let ins, params;
     if (hasCreatedBy) {
@@ -745,16 +728,14 @@ async function logTimeEntry(
       params = [ownerId, employeeName, type, tsIso, jobName || null, tz, localStr, lat, lng, address];
     }
 
-    // Insert with tz, local_time, and geo columns
-    const { rows } = await pool.query(ins, params);
+    const { rows } = await query(ins, params);
     const insertedId = rows[0].id;
 
-    // If we have coords but no address, reverse-geocode (best-effort) and backfill
     if ((lat != null && lng != null) && !address) {
       try {
         address = await reverseGeocode(lat, lng);
         if (address) {
-          await pool.query(`UPDATE time_entries SET address=$1 WHERE id=$2`, [address, insertedId]);
+          await query(`UPDATE time_entries SET address=$1 WHERE id=$2`, [address, insertedId]);
         }
       } catch (e) {
         console.warn('[WARN] reverseGeocode failed:', e.message);
@@ -780,7 +761,7 @@ async function moveLastEntryToJob(ownerId, employeeName, jobName) {
     )
     RETURNING id, type, timestamp, job_name
   `;
-  const { rows } = await pool.query(q, [jobName || null, ownerId, employeeName]);
+  const { rows } = await query(q, [jobName || null, ownerId, employeeName]);
   return rows[0] || null;
 }
 
@@ -796,7 +777,6 @@ async function getTimeEntries(ownerId, employeeName, period = 'week', date = new
     } else if (period === 'week') {
       filter = `DATE(local_time) BETWEEN $2 AND $2::date + INTERVAL '6 days'`;
     } else {
-      // local_time is stored as a local timestamp; no extra TZ conversion needed here
       filter = `DATE_TRUNC('month', local_time) = DATE_TRUNC('month', $2::date)`;
     }
 
@@ -807,7 +787,7 @@ async function getTimeEntries(ownerId, employeeName, period = 'week', date = new
         AND employee_name = $3
         AND ${filter}
       ORDER BY timestamp`;
-    const res = await pool.query(q, [ownerId, dateLocal, employeeName, tz]);
+    const res = await query(q, [ownerId, dateLocal, employeeName, tz]);
     return res.rows;
   } catch (error) {
     console.error('[ERROR] getTimeEntries failed:', error.message);
@@ -825,7 +805,7 @@ async function getEntriesBetween(ownerId, employeeName, startIso, endIso) {
         AND timestamp >= $3::timestamptz
         AND timestamp <= $4::timestamptz
       ORDER BY timestamp`;
-    const { rows } = await pool.query(q, [ownerId, employeeName, startIso, endIso]);
+    const { rows } = await query(q, [ownerId, employeeName, startIso, endIso]);
     return rows;
   } catch (error) {
     console.error('[ERROR] getEntriesBetween failed:', error.message);
@@ -833,7 +813,6 @@ async function getEntriesBetween(ownerId, employeeName, startIso, endIso) {
   }
 }
 
-/* ---------- NEW helpers for robust timesheets (text owner_id, tz-safe windows) ---------- */
 async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUtc }) {
   const q = `
   WITH params AS (
@@ -880,15 +859,17 @@ async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUt
     WHERE i.type = 'drive_start'
   ),
   work_intervals AS (
-    SELECT GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
-           LEAST(out_ts, (SELECT e FROM params))   AS end_utc
+    SELECT
+      GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
+      LEAST(out_ts, (SELECT e FROM params)) AS end_utc
     FROM punch_pairs
     WHERE out_ts IS NOT NULL
       AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
   ),
   drive_intervals AS (
-    SELECT GREATEST(start_ts, (SELECT s FROM params)) AS start_utc,
-           LEAST(end_ts, (SELECT e FROM params))       AS end_utc
+    SELECT
+      GREATEST(start_ts, (SELECT s FROM params)) AS start_utc,
+      LEAST(end_ts, (SELECT e FROM params)) AS end_utc
     FROM drive_pairs
     WHERE end_ts IS NOT NULL
       AND GREATEST(start_ts, (SELECT s FROM params)) < LEAST(end_ts, (SELECT e FROM params))
@@ -897,7 +878,7 @@ async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUt
     (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))),0) FROM work_intervals) AS work_seconds,
     (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))),0) FROM drive_intervals) AS drive_seconds;
   `;
-  const { rows:[r] } = await pool.query(q, [ownerId, employeeName, startUtc, endUtc]);
+  const { rows: [r] } = await query(q, [ownerId, employeeName, startUtc, endUtc]);
   return {
     workSeconds: Number(r.work_seconds) || 0,
     driveSeconds: Number(r.drive_seconds) || 0,
@@ -939,9 +920,10 @@ async function getWeekDayBuckets({ ownerId, employeeName, startUtc, endUtc, tz }
         AND i.timestamp >= (p.s - INTERVAL '35 days')
     ),
     work_intervals AS (
-      SELECT GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
-             LEAST(out_ts, (SELECT e FROM params))   AS end_utc,
-             (SELECT tz FROM params) AS tz
+      SELECT
+        GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
+        LEAST(out_ts, (SELECT e FROM params)) AS end_utc,
+        (SELECT tz FROM params) AS tz
       FROM punch_pairs
       WHERE out_ts IS NOT NULL
         AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
@@ -958,13 +940,13 @@ async function getWeekDayBuckets({ ownerId, employeeName, startUtc, endUtc, tz }
       FROM week_days wd
       LEFT JOIN work_intervals w
         ON w.start_utc < ((wd.d + INTERVAL '1 day') AT TIME ZONE w.tz)
-       AND w.end_utc   > (wd.d AT TIME ZONE w.tz)
+       AND w.end_utc > (wd.d AT TIME ZONE w.tz)
       GROUP BY 1
       ORDER BY 1
     )
     SELECT local_day, seconds FROM day_buckets;
   `;
-  const { rows } = await pool.query(q, [ownerId, employeeName, startUtc, endUtc, tz]);
+  const { rows } = await query(q, [ownerId, employeeName, startUtc, endUtc, tz]);
   return rows.map(r => ({ day: String(r.local_day), seconds: Number(r.seconds) || 0 }));
 }
 
@@ -1011,9 +993,10 @@ async function getMonthWeekBuckets({ ownerId, employeeName, startUtc, endUtc, tz
         AND i.timestamp >= (p.s - INTERVAL '40 days')
     ),
     work_intervals AS (
-      SELECT GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
-             LEAST(out_ts, (SELECT e FROM params))   AS end_utc,
-             (SELECT tz FROM params) AS tz
+      SELECT
+        GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
+        LEAST(out_ts, (SELECT e FROM params)) AS end_utc,
+        (SELECT tz FROM params) AS tz
       FROM punch_pairs
       WHERE out_ts IS NOT NULL
         AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
@@ -1030,50 +1013,50 @@ async function getMonthWeekBuckets({ ownerId, employeeName, startUtc, endUtc, tz
       FROM week_ranges wr
       LEFT JOIN work_intervals w
         ON w.start_utc < (wr.week_end AT TIME ZONE w.tz)
-       AND w.end_utc   > (wr.week_start AT TIME ZONE w.tz)
+       AND w.end_utc > (wr.week_start AT TIME ZONE w.tz)
       GROUP BY 1
       ORDER BY 1
     )
     SELECT week_start, seconds FROM weekly;
   `;
-  const { rows } = await pool.query(q, [ownerId, employeeName, startUtc, endUtc, tz]);
+  const { rows } = await query(q, [ownerId, employeeName, startUtc, endUtc, tz]);
   return rows.map((r, i) => ({ idx: i + 1, weekStart: String(r.week_start), seconds: Number(r.seconds) || 0 }));
 }
 
-/* ---------- Helpers to build local ranges (no string ::date params) ---------- */
 function startOfLocalDay(date, tz) {
   const z = utcToZonedTime(date, tz);
-  z.setHours(0,0,0,0);
-  const y = z.getFullYear(), m = z.getMonth()+1, d = z.getDate();
-  return zonedTimeToUtc(`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')} 00:00:00`, tz);
+  z.setHours(0, 0, 0, 0);
+  const y = z.getFullYear(), m = z.getMonth() + 1, d = z.getDate();
+  return zonedTimeToUtc(`${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')} 00:00:00`, tz);
 }
+
 function endOfLocalDay(date, tz) {
   const z = utcToZonedTime(date, tz);
-  z.setHours(23,59,59,999);
-  const y = z.getFullYear(), m = z.getMonth()+1, d = z.getDate();
-  return zonedTimeToUtc(`${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')} 23:59:59.999`, tz);
+  z.setHours(23, 59, 59, 999);
+  const y = z.getFullYear(), m = z.getMonth() + 1, d = z.getDate();
+  return zonedTimeToUtc(`${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')} 23:59:59.999`, tz);
 }
-function startOfLocalWeek(date, tz, weekStartsOn = 1 /* Mon */) {
+
+function startOfLocalWeek(date, tz, weekStartsOn = 1) {
   const z = utcToZonedTime(date, tz);
   const day = z.getDay();
   const diff = (day - weekStartsOn + 7) % 7;
   z.setDate(z.getDate() - diff);
   return startOfLocalDay(z, tz);
 }
+
 function startOfLocalMonth(date, tz) {
   const z = utcToZonedTime(date, tz);
   z.setDate(1);
   return startOfLocalDay(z, tz);
 }
 
-/* ---------- New object-style generateTimesheet (keeps legacy overload) ---------- */
 async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
-  // New API: single options object
   if (typeof arg1 === 'object' && arg1 !== null && !Array.isArray(arg1)) {
     const {
       ownerId,
       person,
-      period,      // 'day' | 'week' | 'month'
+      period,
       tz = 'America/Toronto',
       now = new Date(),
     } = arg1;
@@ -1082,51 +1065,34 @@ async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
       throw new Error('generateTimesheet(options): ownerId and person are required');
     }
 
-    // Helpers expected elsewhere in file:
-    // - startOfLocalDay(date, tz)  -> Date (UTC) at local 00:00
-    // - endOfLocalDay(date, tz)    -> Date (UTC) at local 23:59:59
-    // - startOfLocalWeek(date, tz, weekStartsOn=1) -> Date (UTC) at local Monday 00:00
-    // - startOfLocalMonth(date, tz) -> Date (UTC) at local first-of-month 00:00
-
     let startUtc, endUtc;
-
     if (period === 'day') {
       startUtc = startOfLocalDay(now, tz);
-      endUtc   = endOfLocalDay(now, tz);
+      endUtc = endOfLocalDay(now, tz);
     } else if (period === 'week') {
-      // Monday → Sunday window in user's TZ
       startUtc = startOfLocalWeek(now, tz, 1);
-      // add 6 days in ms, then take end of that local day (no utcToZonedTime import needed)
       const sixDaysLater = new Date(startUtc.getTime() + 6 * 24 * 60 * 60 * 1000);
       endUtc = endOfLocalDay(sixDaysLater, tz);
     } else if (period === 'month') {
-      // 1st of month → today (end of day)
       startUtc = startOfLocalMonth(now, tz);
-      endUtc   = endOfLocalDay(now, tz);
+      endUtc = endOfLocalDay(now, tz);
     } else {
       throw new Error('period must be "day", "week", or "month"');
     }
 
-    // Totals
     const { workSeconds, driveSeconds } = await getWorkAndDriveIntervals({
       ownerId, employeeName: person, startUtc, endUtc,
     });
 
-    // Breakdown lines
     let breakdownLines = [];
-
     if (period === 'week') {
       const dayBuckets = await getWeekDayBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
-
-      // Safer date coercion to avoid "Invalid time value" on various driver returns
       const toDateSafe = (v) => {
         if (v instanceof Date) return v;
         const parsed = Date.parse(v);
         if (!Number.isNaN(parsed)) return new Date(parsed);
-        // fallback for plain 'YYYY-MM-DD'
         return new Date(`${String(v).slice(0, 10)}T00:00:00Z`);
       };
-
       breakdownLines = dayBuckets.map((b) => {
         const d = toDateSafe(b.day);
         const label = formatInTimeZone(d, tz, 'EEEE');
@@ -1135,17 +1101,14 @@ async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
       });
     } else if (period === 'month') {
       const weeks = await getMonthWeekBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
-      breakdownLines = weeks.map(w => `Week ${w.idx}: ${(w.seconds/3600).toFixed(2)} hours`);
+      breakdownLines = weeks.map(w => `Week ${w.idx}: ${(w.seconds / 3600).toFixed(2)} hours`);
     }
 
     const totalHours = (workSeconds / 3600).toFixed(2);
     const driveHours = (driveSeconds / 3600).toFixed(2);
-
-    // Labels
     const startLabel = formatInTimeZone(startUtc, tz, 'MMM d, yyyy');
-    const endLabel   = formatInTimeZone(endUtc,   tz, 'MMM d, yyyy');
+    const endLabel = formatInTimeZone(endUtc, tz, 'MMM d, yyyy');
 
-    // Compose WhatsApp-friendly message
     let message = `${person} worked ${totalHours} hours`;
     if (period === 'day') {
       message = `${person} worked ${totalHours} hours today (${startLabel}).`;
@@ -1167,8 +1130,6 @@ async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
     };
   }
 
-  // ---- Legacy positional API (kept for compatibility) ----
-  // generateTimesheet(ownerId, employeeName, period, date, tz)
   const ownerId = arg1, employeeName = arg2, period = arg3, date = arg4, tz = arg5 || 'America/Toronto';
   const entries = await getTimeEntries(ownerId, employeeName, period, date, tz);
 
@@ -1199,31 +1160,29 @@ async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
   };
 }
 
-
-// --- Timeclock helpers (prompts + open-state checks) ---
 async function createTimePrompt(ownerId, employeeName, kind, context = {}) {
   const q = `
     INSERT INTO timeclock_prompts (owner_id, employee_name, kind, context)
     VALUES ($1,$2,$3,$4::jsonb)
     RETURNING *`;
-  const { rows } = await pool.query(q, [ownerId, employeeName, kind, JSON.stringify(context)]);
+  const { rows } = await query(q, [ownerId, employeeName, kind, JSON.stringify(context)]);
   return rows[0];
 }
 
 async function getPendingPrompt(ownerId) {
-  await pool.query(`DELETE FROM timeclock_prompts WHERE expires_at < now() AND owner_id = $1`, [ownerId]);
-  const { rows } = await pool.query(
+  await query(`DELETE FROM timeclock_prompts WHERE expires_at < now() AND owner_id = $1`, [ownerId]);
+  const { rows } = await query(
     `SELECT * FROM timeclock_prompts
      WHERE owner_id = $1 AND (expires_at IS NULL OR expires_at >= now())
      ORDER BY created_at DESC
      LIMIT 1`,
-    [ownerId],
+    [ownerId]
   );
   return rows?.[0] || null;
 }
 
 async function clearPrompt(id) {
-  await pool.query(`DELETE FROM timeclock_prompts WHERE id = $1`, [id]);
+  await query(`DELETE FROM timeclock_prompts WHERE id = $1`, [id]);
 }
 
 async function getOpenShift(ownerId, employeeName) {
@@ -1242,7 +1201,7 @@ async function getOpenShift(ownerId, employeeName) {
       )
     ORDER BY t.timestamp DESC
     LIMIT 1`;
-  const { rows } = await pool.query(q, [ownerId, employeeName]);
+  const { rows } = await query(q, [ownerId, employeeName]);
   return rows[0] || null;
 }
 
@@ -1263,7 +1222,7 @@ async function getOpenBreakSince(ownerId, employeeName, sinceUtcIso) {
       )
     ORDER BY b.timestamp DESC
     LIMIT 1`;
-  const { rows } = await pool.query(q, [ownerId, employeeName, sinceUtcIso]);
+  const { rows } = await query(q, [ownerId, employeeName, sinceUtcIso]);
   return rows[0] || null;
 }
 
@@ -1275,7 +1234,7 @@ async function closeOpenBreakIfAny(ownerId, employeeName, sinceUtcIso, endUtcIso
     INSERT INTO time_entries (owner_id, employee_name, type, timestamp, job_name, tz, local_time, created_at)
     VALUES ($1,$2,'break_end',$3::timestamptz,$4,$5,$6::timestamp,NOW())
     RETURNING id`;
-  const { rows } = await pool.query(q, [ownerId, employeeName, endUtcIso, open.job_name || null, tz, localStr]);
+  const { rows } = await query(q, [ownerId, employeeName, endUtcIso, open.job_name || null, tz, localStr]);
   return rows[0] || null;
 }
 
@@ -1290,7 +1249,7 @@ let HAS_CREATED_BY_CACHE = null;
 async function hasCreatedByColumn() {
   if (HAS_CREATED_BY_CACHE !== null) return HAS_CREATED_BY_CACHE;
   try {
-    const { rows } = await pool.query(
+    const { rows } = await query(
       `SELECT 1
          FROM information_schema.columns
         WHERE table_name = 'time_entries'
@@ -1304,12 +1263,9 @@ async function hasCreatedByColumn() {
   return HAS_CREATED_BY_CACHE;
 }
 
-/**
- * Per-owner daily cap. Returns { ok, tierKey, tierLimit, count }
- */
 async function checkTimeEntryLimit(ownerId, tier) {
   const { tierKey, tierLimit } = tierLimitFor(tier);
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `SELECT COUNT(*) AS count
        FROM time_entries
       WHERE owner_id = $1
@@ -1320,14 +1276,9 @@ async function checkTimeEntryLimit(ownerId, tier) {
   return { ok: count < tierLimit, tierKey, tierLimit, count };
 }
 
-/**
- * Per-actor daily cap. If 'created_by' column is missing, we skip limiting (return true).
- * Returns boolean.
- */
 async function checkActorLimit(ownerId, actorId) {
-  // If no created_by column yet, do not block – let entries through.
   if (!(await hasCreatedByColumn())) return true;
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `SELECT COUNT(*) AS count
        FROM time_entries
       WHERE owner_id = $1
@@ -1336,28 +1287,27 @@ async function checkActorLimit(ownerId, actorId) {
     [ownerId, String(actorId)]
   );
   const n = parseInt(rows?.[0]?.count || '0', 10);
-  return n < 100; // default per-actor cap
+  return n < 100;
 }
 
-// --- Reports ---
 async function generateReport(ownerId, tier) {
   try {
-    const res = await pool.query(
+    const res = await query(
       `SELECT
          COALESCE(SUM(CASE WHEN type='revenue' THEN amount::numeric ELSE 0 END),0) AS revenue,
          COALESCE(SUM(CASE WHEN type IN ('expense','bill') THEN amount::numeric ELSE 0 END),0) AS expenses
        FROM transactions
        WHERE owner_id=$1`,
-      [ownerId],
+      [ownerId]
     );
     const revenue = parseFloat(res.rows[0].revenue) || 0;
     const expenses = parseFloat(res.rows[0].expenses) || 0;
     const report = { revenue, expenses, profit: revenue - expenses, tier };
     const reportId = crypto.randomBytes(8).toString('hex');
-    await pool.query(
+    await query(
       `INSERT INTO reports (owner_id, report_id, data, created_at)
        VALUES ($1,$2,$3::jsonb,NOW())`,
-      [ownerId, reportId, JSON.stringify(report)],
+      [ownerId, reportId, JSON.stringify(report)]
     );
     const url = `https://chief-ai-refactored.vercel.app/reports/${reportId}`;
     return { url };
@@ -1367,13 +1317,12 @@ async function generateReport(ownerId, tier) {
   }
 }
 
-// --- File exports (XLSX/PDF) ---
 async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = null, tz = 'America/Toronto' }) {
   const params = employeeName
     ? [ownerId, startIso, endIso, tz, employeeName]
     : [ownerId, startIso, endIso, tz];
 
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `SELECT employee_name, type, timestamp, COALESCE(job_name,'') AS job_name, COALESCE(tz,$4) AS tz
      FROM time_entries
      WHERE owner_id = $1
@@ -1387,7 +1336,6 @@ async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = n
   const wb = new ExcelJS.Workbook();
   const byEmp = groupBy(rows, 'employee_name');
 
-  // Summary
   const sum = wb.addWorksheet('Summary');
   sum.columns = [
     { header: 'Employee', key: 'employee', width: 24 },
@@ -1398,8 +1346,8 @@ async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = n
     { header: 'Start', key: 'start', width: 12 },
     { header: 'End', key: 'end', width: 12 },
   ];
-  const startStr = (startIso || '').slice(0,10);
-  const endStr = (endIso || '').slice(0,10);
+  const startStr = (startIso || '').slice(0, 10);
+  const endStr = (endIso || '').slice(0, 10);
   for (const emp of Object.keys(byEmp)) {
     const summary = computeEmployeeSummary(byEmp[emp]);
     sum.addRow({
@@ -1414,9 +1362,8 @@ async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = n
   }
   sum.getRow(1).font = { bold: true };
 
-  // One sheet per employee
   for (const emp of Object.keys(byEmp)) {
-    const safeName = String(emp).slice(0,31).replace(/[\\/?*[\]:]/g, ' ');
+    const safeName = String(emp).slice(0, 31).replace(/[\\/?*[\]:]/g, ' ');
     const ws = wb.addWorksheet(safeName || 'Employee');
     ws.columns = [
       { header: 'Date', key: 'date', width: 12 },
@@ -1428,9 +1375,9 @@ async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = n
     for (const r of byEmp[emp]) {
       const ts = new Date(r.timestamp);
       ws.addRow({
-        date: ts.toISOString().slice(0,10),
+        date: ts.toISOString().slice(0, 10),
         local: formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm'),
-        utc: ts.toISOString().slice(11,19) + 'Z',
+        utc: ts.toISOString().slice(11, 19) + 'Z',
         type: r.type,
         job: r.job_name || '',
       });
@@ -1440,10 +1387,10 @@ async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = n
 
   const buf = await wb.xlsx.writeBuffer();
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startStr}_${endStr}${employeeName ? '_' + employeeName.replace(/\s+/g,'_') : ''}.xlsx`;
+  const filename = `timesheet_${startStr}_${endStr}${employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''}.xlsx`;
   const contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
 
-  await pool.query(
+  await query(
     `INSERT INTO file_exports (id, owner_id, filename, content_type, bytes, created_at)
      VALUES ($1,$2,$3,$4,$5,NOW())`,
     [id, ownerId, filename, contentType, Buffer.from(buf)]
@@ -1458,7 +1405,7 @@ async function exportTimesheetPdf({ ownerId, startIso, endIso, employeeName = nu
     ? [ownerId, startIso, endIso, tz, employeeName]
     : [ownerId, startIso, endIso, tz];
 
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `SELECT employee_name, type, timestamp, COALESCE(job_name,'') AS job_name, COALESCE(tz,$4) AS tz
      FROM time_entries
      WHERE owner_id = $1
@@ -1476,7 +1423,7 @@ async function exportTimesheetPdf({ ownerId, startIso, endIso, employeeName = nu
   doc.on('data', d => chunks.push(d));
   const done = new Promise(res => doc.on('end', res));
 
-  const title = `Timesheet ${startIso.slice(0,10)} → ${endIso.slice(0,10)}`;
+  const title = `Timesheet ${startIso.slice(0, 10)} → ${endIso.slice(0, 10)}`;
   doc.fontSize(16).text(title, { align: 'center' }).moveDown();
 
   for (const emp of Object.keys(byEmp)) {
@@ -1499,9 +1446,9 @@ async function exportTimesheetPdf({ ownerId, startIso, endIso, employeeName = nu
 
     for (const r of byEmp[emp]) {
       const ts = new Date(r.timestamp);
-      doc.text(ts.toISOString().slice(0,10), 40)
+      doc.text(ts.toISOString().slice(0, 10), 40)
          .text(formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm'), 130)
-         .text(ts.toISOString().slice(11,19) + 'Z', 240)
+         .text(ts.toISOString().slice(11, 19) + 'Z', 240)
          .text(r.type, 320)
          .text(r.job_name || '', 420)
          .moveDown(0.1);
@@ -1517,10 +1464,10 @@ async function exportTimesheetPdf({ ownerId, startIso, endIso, employeeName = nu
   const buffer = Buffer.concat(chunks);
 
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}${employeeName ? '_' + employeeName.replace(/\s+/g,'_') : ''}.pdf`;
+  const filename = `timesheet_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''}.pdf`;
   const contentType = 'application/pdf';
 
-  await pool.query(
+  await query(
     `INSERT INTO file_exports (id, owner_id, filename, content_type, bytes, created_at)
      VALUES ($1,$2,$3,$4,$5,NOW())`,
     [id, ownerId, filename, contentType, buffer]
@@ -1530,11 +1477,10 @@ async function exportTimesheetPdf({ ownerId, startIso, endIso, employeeName = nu
   return { url: `${baseUrl}/exports/${id}`, id, filename, contentType };
 }
 
-// --- TASKS: helpers ---
 async function getUserBasic(userId) {
   const uid = normalizePhoneNumber(userId);
   try {
-    const { rows } = await pool.query(
+    const { rows } = await query(
       `SELECT user_id, owner_id, name, role, can_edit_time
        FROM users
        WHERE user_id=$1`,
@@ -1549,7 +1495,7 @@ async function getUserBasic(userId) {
 
 async function getUserByName(ownerId, nameLike) {
   try {
-    const { rows } = await pool.query(
+    const { rows } = await query(
       `SELECT user_id, name, role
        FROM users
        WHERE owner_id=$1 AND name ILIKE $2
@@ -1564,11 +1510,10 @@ async function getUserByName(ownerId, nameLike) {
   }
 }
 
-// --- TASKS: core CRUD ---
 async function createTask({
   ownerId,
   createdBy,
-  assignedTo = null, // user_id or null
+  assignedTo = null,
   title,
   body = null,
   type = 'general',
@@ -1577,7 +1522,7 @@ async function createTask({
 }) {
   try {
     if (!ownerId || !createdBy || !title) throw new Error('Missing required fields');
-    const { rows } = await pool.query(
+    const { rows } = await query(
       `INSERT INTO tasks (owner_id, created_by, assigned_to, title, body, status, type, related_entry_id, due_at)
        VALUES ($1,$2,$3,$4,$5,'open',$6,$7,$8)
        RETURNING *`,
@@ -1601,7 +1546,7 @@ async function createTask({
 
 async function listMyTasks({ ownerId, userId, status = 'open' }) {
   try {
-    const { rows } = await pool.query(
+    const { rows } = await query(
       `SELECT t.*, u.name AS assigned_name, c.name AS creator_name
        FROM tasks t
        LEFT JOIN users u ON u.user_id = t.assigned_to
@@ -1621,7 +1566,7 @@ async function listMyTasks({ ownerId, userId, status = 'open' }) {
 
 async function listInboxTasks({ ownerId, status = 'open' }) {
   try {
-    const { rows } = await pool.query(
+    const { rows } = await query(
       `SELECT t.*, c.name AS creator_name
        FROM tasks t
        LEFT JOIN users c ON c.user_id = t.created_by
@@ -1654,9 +1599,9 @@ async function listTasksForUser({ ownerId, nameOrId, status = 'open' }) {
   }
 }
 
-async function markTaskDone({ ownerId, taskId /*, actorId*/ }) {
+async function markTaskDone({ ownerId, taskId }) {
   try {
-    const { rows } = await pool.query(
+    const { rows } = await query(
       `UPDATE tasks
        SET status='done', updated_at=NOW()
        WHERE id=$1 AND owner_id=$2
@@ -1671,9 +1616,9 @@ async function markTaskDone({ ownerId, taskId /*, actorId*/ }) {
   }
 }
 
-async function reopenTask({ ownerId, taskId /*, actorId*/ }) {
+async function reopenTask({ ownerId, taskId }) {
   try {
-    const { rows } = await pool.query(
+    const { rows } = await query(
       `UPDATE tasks
        SET status='open', updated_at=NOW()
        WHERE id=$1 AND owner_id=$2
@@ -1690,17 +1635,17 @@ async function reopenTask({ ownerId, taskId /*, actorId*/ }) {
 
 async function createTimeEditRequestTask({
   ownerId,
-  employeeId, // who needs the edit (usually the requester)
-  requesterId, // who is asking
-  title, // e.g., "Adjust my last punch by -10 minutes"
-  body, // free text
-  relatedEntryId = null, // if you captured time_entries.id
+  employeeId,
+  requesterId,
+  title,
+  body,
+  relatedEntryId = null,
 }) {
   try {
     const task = await createTask({
       ownerId,
       createdBy: requesterId,
-      assignedTo: null, // unassigned → owner/board review
+      assignedTo: null,
       title,
       body,
       type: 'time_edit_request',
@@ -1714,7 +1659,7 @@ async function createTimeEditRequestTask({
 }
 
 async function getCurrentStatus(ownerId, employeeName) {
-  const res = await pool.query(`
+  const res = await query(`
     SELECT type, timestamp
     FROM time_entries
     WHERE owner_id = $1 AND employee_name = $2
@@ -1748,15 +1693,10 @@ async function getCurrentStatus(ownerId, employeeName) {
 
 // --- Exports ---
 module.exports = {
-  // Keep "pool" exported for routes/exports.js, but make it LAZY to break cycles
   get pool() { return getPool(); },
-
-  // also export helpers so other code can migrate off raw pool use
   getPool,
   query,
   withClient,
-
-  // transactions
   appendToUserSpreadsheet,
   saveExpense,
   deleteExpense,
@@ -1765,14 +1705,10 @@ module.exports = {
   deleteBill,
   saveRevenue,
   saveQuote,
-
-  // pricing items
   addPricingItem,
   getPricingItems,
   updatePricingItem,
   deletePricingItem,
-
-  // jobs
   getActiveJob,
   saveJob,
   setActiveJob,
@@ -1783,23 +1719,15 @@ module.exports = {
   resumeJob,
   listOpenJobs,
   summarizeJob,
-
-  // users
   createUserProfile,
   saveUserProfile,
   getUserProfile,
   getOwnerProfile,
   getCurrentStatus,
-
-  // parsing
   parseFinancialFile,
   parseReceiptText,
-
-  // auth
   generateOTP,
   verifyOTP,
-
-  // time entries
   logTimeEntry,
   moveLastEntryToJob,
   getTimeEntries,
@@ -1811,15 +1739,9 @@ module.exports = {
   getOpenShift,
   getOpenBreakSince,
   closeOpenBreakIfAny,
-
-  // reports
   generateReport,
-
-  // file exports
   exportTimesheetXlsx,
   exportTimesheetPdf,
-
-  // tasks
   createTask,
   listMyTasks,
   listInboxTasks,
@@ -1830,10 +1752,7 @@ module.exports = {
   getUserBasic,
   getUserByName,
   normalizePhoneNumber,
-
-  // limits & audit
   checkTimeEntryLimit,
   checkActorLimit,
   hasCreatedByColumn,
 };
-

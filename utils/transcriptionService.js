@@ -47,25 +47,21 @@ function getOpenAI() {
   return openai;
 }
 
-/* --------- MIME → encoding map --------- */
+// --- MIME → encoding map (force 48k for Opus) ---
 function encodingForMime(mime) {
   const m = String(mime || '').toLowerCase();
-  // For Opus, let Google auto-detect sample rate (omit sampleRateHertz)
-  if (m.includes('ogg')) return { encoding: 'OGG_OPUS' };
-  if (m.includes('webm')) return { encoding: 'WEBM_OPUS' };
+  if (m.includes('ogg'))  return { encoding: 'OGG_OPUS',  sampleRateHertz: 48000 };
+  if (m.includes('webm')) return { encoding: 'WEBM_OPUS', sampleRateHertz: 48000 };
   if (m.includes('mpeg') || m.includes('mp3')) return { encoding: 'MP3' };
   if (m.includes('wav') || m.includes('x-wav')) return { encoding: 'LINEAR16', sampleRateHertz: 16000 };
   return { encoding: 'ENCODING_UNSPECIFIED' };
 }
 
-/* --------- Google STT --------- */
+// --- Google STT ---
 async function transcribeWithGoogle(audioBuffer, mimeType) {
   try {
     const client = getSpeechClient();
-    if (!client) {
-      console.error('[ERROR] Google STT client unavailable');
-      return null;
-    }
+    if (!client) { console.error('[ERROR] Google STT client unavailable'); return null; }
 
     const { encoding, sampleRateHertz } = encodingForMime(mimeType);
     const audio = { content: audioBuffer.toString('base64') };
@@ -73,30 +69,31 @@ async function transcribeWithGoogle(audioBuffer, mimeType) {
       encoding,
       ...(sampleRateHertz ? { sampleRateHertz } : {}),
       languageCode: 'en-US',
-      alternativeLanguageCodes: ['en-CA', 'en-GB'],
+      alternativeLanguageCodes: ['en-CA','en-GB'],
       enableAutomaticPunctuation: true,
       ...(process.env.GOOGLE_SPEECH_USE_ENHANCED === '1' ? { useEnhanced: true } : {}),
       ...(process.env.GOOGLE_SPEECH_MODEL ? { model: process.env.GOOGLE_SPEECH_MODEL } : {}),
       speechContexts: [{
         phrases: [
-          'punch in', 'punch out', 'clock in', 'clock out',
-          'break start', 'break end', 'lunch start', 'lunch end',
-          'drive start', 'drive end', 'hours', 'timesheet', 'time sheet', 'timeclock',
-          'clock Justin in', 'clock in Justin', 'punch Justin in',
-          'Justin', 'Scott', 'Jutras','clock-in', 'clock-out', 'clock in now', 'clock out now',
-'punch in now', 'punch out now', 'start break', 'end break'
-
+          'punch in','punch out','clock in','clock out',
+          'break start','break end','lunch start','lunch end',
+          'drive start','drive end','hours','timesheet','time sheet','timeclock',
+          'clock Justin in','clock in Justin','punch Justin in',
+          'clock-in','clock-out','clock in now','clock out now','punch in now','punch out now',
+          'start break','end break','Justin','Scott','Jutras'
         ],
         boost: 20
-      }]
+      }],
     };
 
-    console.log('[DEBUG] Google STT config:', JSON.stringify({ encoding, sampleRateHertz }));
+    // DEFENSIVE: ensure Opus sample rate is set
+    if ((config.encoding === 'OGG_OPUS' || config.encoding === 'WEBM_OPUS') && !config.sampleRateHertz) {
+      config.sampleRateHertz = 48000;
+    }
+
+    console.log('[DEBUG] Google STT config:', JSON.stringify({ encoding: config.encoding, sampleRateHertz: config.sampleRateHertz }));
     const [response] = await client.recognize({ audio, config });
-    const transcription = (response.results || [])
-      .map(r => r.alternatives?.[0]?.transcript || '')
-      .filter(Boolean)
-      .join(' ');
+    const transcription = (response.results || []).map(r => r.alternatives?.[0]?.transcript || '').filter(Boolean).join(' ');
     console.log('[DEBUG] Google STT transcription length:', transcription.length, 'text:', transcription || '(none)');
     return transcription || null;
   } catch (err) {

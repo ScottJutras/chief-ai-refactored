@@ -36,6 +36,15 @@ function fmtLocal(tsIso, tz) {
     return new Date(tsIso).toLocaleString();
   }
 }
+function inferIntentFromText(s = '') {
+  const lc = String(s).toLowerCase();
+  // Order matters: if both appear, prefer the *explicit* phrase positions
+  if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift)\b/.test(lc)) return 'punch_in';
+  if (/\b(clock|punch)\s+out\b/.test(lc) || /\b(end|finish|stop)\s+(work|shift)\b/.test(lc)) return 'punch_out';
+  if (/\b(start|begin)\s+(break|lunch)\b/.test(lc) || /\bon\s+break\b/.test(lc)) return 'break_start';
+  if (/\b(end|finish)\s+(break|lunch)\b/.test(lc) || /\boff\s+break\b/.test(lc)) return 'break_end';
+  return null;
+}
 
 function friendlyTypeLabel(type) {
   if (!type) return 'entry';
@@ -278,95 +287,127 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(msg);
     }
 
-    // ---------- Handle parse result ----------
-    if (result.type === 'hours_inquiry') {
-      const name = result.data.employeeName || userProfile?.name || '';
-      const tz = getUserTz(userProfile);
-      if (result.data.period) {
-        const { message } = await generateTimesheet({
-          ownerId,
-          person: name,
-          period: result.data.period,
-          tz,
-          now: new Date()
-        });
-        return twiml(message);
-      }
-      await setPendingTransactionState(from, {
-        pendingMedia: { type: 'hours_inquiry' },
-        pendingHours: { employeeName: name }
-      });
-      return twiml(`Looks like you’re asking about ${name}’s hours. Do you want **today**, **this week**, or **this month**?`);
-    }
+   // ---------- Handle parse result ----------
+if (result.type === 'hours_inquiry') {
+  const name = result.data.employeeName || userProfile?.name || '';
+  const tz = getUserTz(userProfile);
 
-    if (result.type === 'time_entry') {
+  if (result.data.period) {
+    const { message } = await generateTimesheet({
+      ownerId,
+      person: name,
+      period: result.data.period,
+      tz,
+      now: new Date()
+    });
+    return twiml(message);
+  }
+
+  await setPendingTransactionState(from, {
+    pendingMedia: { type: 'hours_inquiry' },
+    pendingHours: { employeeName: name }
+  });
+  return twiml(`Looks like you’re asking about ${name}’s hours. Do you want **today**, **this week**, or **this month**?`);
+}
+
+if (result.type === 'time_entry') {
   let { employeeName, type, timestamp } = result.data;
 
+  // --- HARD INTENT OVERRIDE from the raw utterance ---
+  const inferred = inferIntentFromText(extractedText);
+  if (inferred === 'punch_in'    && type === 'punch_out')  type = 'punch_in';
+  if (inferred === 'punch_out'   && type === 'punch_in')   type = 'punch_out';
+  if (inferred === 'break_start' && type === 'break_end')  type = 'break_start';
+  if (inferred === 'break_end'   && type === 'break_start')type = 'break_end';
+  // ----------------------------------------------------
+
+  // Try to keep the spoken name; do NOT silently default to owner.
+  let hasName = !!(employeeName && String(employeeName).trim());
+  if (!hasName) {
+    const mFor = extractedText.match(/\bfor\s+([A-Za-z][A-Za-z.'\- ]{0,60})\b/i);
+    if (mFor) {
+      employeeName = mFor[1].trim();
+      hasName = true;
+    }
+  }
+
   const tz = getUserTz(userProfile);
-  const timeWord = /T/.test(timestamp) ? new Date(timestamp) : null;
-  const timeSuffix = timeWord ? ` at ${toAmPm(timestamp, tz)}` : '';
+  const timeSuffix = /T/.test(timestamp) ? ` at ${toAmPm(timestamp, tz)}` : '';
 
   let normalized;
-
-  if (employeeName && employeeName.trim()) {
-    // We captured a name → build a clean, explicit command
-    if (type === 'punch_in')          normalized = `${employeeName} punched in${timeSuffix}`;
-    else if (type === 'punch_out')    normalized = `${employeeName} punched out${timeSuffix}`;
-    else if (type === 'break_start')  normalized = `start break for ${employeeName}${timeSuffix}`;
-    else if (type === 'break_end')    normalized = `end break for ${employeeName}${timeSuffix}`;
-    else if (type === 'drive_start')  normalized = `start drive for ${employeeName}${timeSuffix}`;
-    else if (type === 'drive_end')    normalized = `end drive for ${employeeName}${timeSuffix}`;
-    else                              normalized = `${employeeName} punched in${timeSuffix}`;
+  if (hasName) {
+    const who = employeeName || userProfile.name || 'Unknown';
+    if (type === 'punch_in')          normalized = `${who} punched in${timeSuffix}`;
+    else if (type === 'punch_out')    normalized = `${who} punched out${timeSuffix}`;
+    else if (type === 'break_start')  normalized = `start break for ${who}${timeSuffix}`;
+    else if (type === 'break_end')    normalized = `end break for ${who}${timeSuffix}`;
+    else if (type === 'drive_start')  normalized = `start drive for ${who}${timeSuffix}`;
+    else if (type === 'drive_end')    normalized = `end drive for ${who}${timeSuffix}`;
+    else                              normalized = `${who} punched in${timeSuffix}`;
   } else {
-    // No name captured → DO NOT silently substitute the owner/self.
-    // Pass the original user utterance so timeclock’s tolerant regex can still detect “Justin”.
-    normalized = extractedText; // ← key fallback
+    // Let timeclock’s tolerant regex handle it.
+    normalized = extractedText;
   }
 
   const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
   if (typeof tw === 'string' && tw.trim()) return tw;
 
-  // If timeclock didn’t return a body, keep the old fallback (rare)
+  // Fallback summary path
   const humanTime = fmtLocal(timestamp, tz);
+  let summaryTail = '';
+  try {
+    if (type === 'punch_out') {
+      const { message } = await generateTimesheet({
+        ownerId,
+        person: employeeName || userProfile?.name || '',
+        period: 'day',
+        tz,
+        now: new Date()
+      });
+      const firstLine = String(message || '').split('\n')[0] || '';
+      if (firstLine) summaryTail = `\n${firstLine.replace(/^[^A-Za-z0-9]*/, '')}`;
+    }
+  } catch (e) {
+    console.warn('[MEDIA] timesheet summary failed:', e.message);
+  }
+
   const job = await getActiveJob(ownerId);
-  const who = employeeName || (userProfile.name || 'Unknown');
-  reply = `✅ ${type.replace('_', ' ')} logged for ${who} at ${humanTime}${job && job !== 'Uncategorized' ? ` on ${job}` : ''}.`;
+  reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName || userProfile?.name || 'Unknown'} at ${humanTime}${job && job !== 'Uncategorized' ? ` on ${job}` : ''}.${summaryTail}`;
   return twiml(reply);
 }
 
-    if (result.type === 'expense') {
-      const { item, amount, store, date, category } = result.data;
-      reply = `Please confirm: Log expense ${amount} for ${item} from ${store} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
-      await setPendingTransactionState(from, {
-        pendingMedia: { type: 'expense' },
-        pendingExpense: { item, amount, store, date, category, mediaUrl }
-      });
-      return twiml(reply);
-    }
-
-    if (result.type === 'revenue') {
-      const { description, amount, source, date, category } = result.data;
-      reply = `Please confirm: Log revenue ${amount} from ${source} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
-      await setPendingTransactionState(from, {
-        pendingMedia: { type: 'revenue' },
-        pendingRevenue: { description, amount, source, date, category, mediaUrl }
-      });
-      return twiml(reply);
-    }
-
-    // Fallback
-    reply = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
-    await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
-    return twiml(reply);
-  } catch (error) {
-    console.error(`[ERROR] handleMedia failed for ${from}:`, error.message);
-    reply = `⚠️ Failed to process media: ${error.message}`;
-    return twiml(reply);
-  }
+if (result.type === 'expense') {
+  const { item, amount, store, date, category } = result.data;
+  reply = `Please confirm: Log expense ${amount} for ${item} from ${store} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
+  await setPendingTransactionState(from, {
+    pendingMedia: { type: 'expense' },
+    pendingExpense: { item, amount, store, date, category, mediaUrl }
+  });
+  return twiml(reply);
 }
 
-module.exports = { handleMedia };
+if (result.type === 'revenue') {
+  const { description, amount, source, date, category } = result.data;
+  reply = `Please confirm: Log revenue ${amount} from ${source} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
+  await setPendingTransactionState(from, {
+    pendingMedia: { type: 'revenue' },
+    pendingRevenue: { description, amount, source, date, category, mediaUrl }
+  });
+  return twiml(reply);
+}
 
+// Fallback
+reply = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
+await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
+return twiml(reply);
+
+} catch (error) {
+  console.error(`[ERROR] handleMedia failed for ${from}:`, error.message);
+  reply = `⚠️ Failed to process media: ${error.message}`;
+  return twiml(reply);
+}
+}
+module.exports = { handleMedia };
 
 
 

@@ -53,6 +53,14 @@ function normalizeInput(raw) {
   lc = lc.replace(/\bclock(?:ed)?\s+(our|or)\b/g, 'clocked out');
   return lc.replace(/\s{2,}/g, ' ').trim();
 }
+function inferIntentFromText(s = '') {
+  const lc = String(s).toLowerCase();
+  if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift)\b/.test(lc)) return 'punch_in';
+  if (/\b(clock|punch)\s+out\b/.test(lc) || /\b(end|finish|stop)\s+(work|shift)\b/.test(lc)) return 'punch_out';
+  if (/\b(start|begin)\s+(break|lunch)\b/.test(lc) || /\bon\s+break\b/.test(lc)) return 'break_start';
+  if (/\b(end|finish)\s+(break|lunch)\b/.test(lc) || /\boff\s+break\b/.test(lc)) return 'break_end';
+  return null;
+}
 
 // --- Future-entry policy (grace window) ---
 const MAX_FUTURE_MINUTES = Number(process.env.MAX_FUTURE_MINUTES || 10);
@@ -795,7 +803,16 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         '⚠️ Invalid time entry. Try "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".';
       return res.send(twiml(reply));
     }
-
+// --- HARD INTENT OVERRIDE (timeclock.js) ---
+const rawIntent = inferIntentFromText(raw); // 'raw' = normalized input string
+if (rawIntent === 'punch_in'   && action === 'punch_out') action = 'punch_in';
+if (rawIntent === 'punch_out'  && action === 'punch_in')  action = 'punch_out';
+if (rawIntent === 'break_start'&& action === 'break_end')  action = 'break_start';
+if (rawIntent === 'break_end'  && action === 'break_start')action = 'break_end';
+{
+  console.log('[timeclock] hard-intent override:', { rawIntent, before: action });
+  action = rawIntent; // set directly to the inferred intent
+}
     const who = titleCase(sanitizeInput(match.groups?.name || userProfile?.name || 'Unknown'));
     if (!canActOn(userProfile, isOwner, who, ownerProfile)) {
       return res.send(twiml(denyActMsg(userProfile, who)));

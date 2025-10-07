@@ -137,35 +137,47 @@ async function handleOnboarding(from, input, userProfile, ownerId, res) {
     // --- STEP MACHINE ---
 
     // Step 1: capture full name
-    if (state.step === 1) {
-      const name = msgRaw.trim();
-      if (!name || name.length < 2) {
-        await sendMessage(normalizedFrom, 'Please provide your full name to continue.');
-        return ack(res);
-      }
+if (state.step === 1) {
+  const name = msgRaw.trim();
+  if (!name || name.length < 2) {
+    await sendMessage(normalizedFrom, 'Please provide your full name to continue.');
+    return ack(res);
+  }
 
-      state.responses.name = cap(name);
-      state.step = 2;
-      await setPendingTransactionState(normalizedFrom, state);
+  state.responses.name = cap(name);
+  state.step = 2;
+  await setPendingTransactionState(normalizedFrom, state);
 
-      try {
-        const { province = 'your state/province', country = 'your country' } = state.detectedLocation || {};
-        await sendTemplateMessage(
-          normalizedFrom,
-          'HX0280df498999848aaff04cc079e16c31',
-          { '1': state.responses.name, '2': province, '3': country }
-        );
-        return ack(res);
-      } catch (error) {
-        console.error('[ERROR] Template message failed, falling back to quick reply:', error.message, error.code, error.moreInfo);
-        await sendQuickReply(
-          normalizedFrom,
-          `Hi ${state.responses.name}! I detected you’re in ${state.detectedLocation?.province || 'your state/province'}, ${state.detectedLocation?.country || 'your country'}. Is that correct?`,
-          ['yes', 'edit', 'cancel']
-        );
-        return ack(res);
-      }
+  const { getValidationLists } = require('../utils/validateLocation');
+  const { knownProvinces, knownCountries } = getValidationLists();
+
+  const detected = state.detectedLocation || {};
+  const provinceOk = detected.province && knownProvinces.some(p => p.toLowerCase() === detected.province.toLowerCase());
+  const countryOk  = detected.country  && knownCountries.some(c => c.toLowerCase() === detected.country.toLowerCase());
+
+  if (provinceOk && countryOk) {
+    try {
+      await sendTemplateMessage(
+        normalizedFrom,
+        'HX0280df498999848aaff04cc079e16c31', // "Hi {1}! I detected you’re in {2}, {3}. Is that correct?"
+        { '1': state.responses.name, '2': detected.province, '3': detected.country }
+      );
+      return ack(res);
+    } catch (error) {
+      console.error('[ERROR] Template message failed, falling back:', error.message);
+      // fall through
     }
+  }
+
+  // Fallback if detection is missing/invalid (or template failed)
+  await sendQuickReply(
+    normalizedFrom,
+    `Hi ${state.responses.name}! I couldn’t confidently detect your location. Please provide your State/Province, Country (e.g., "Ontario, Canada").`,
+    ['edit', 'cancel']
+  );
+  return ack(res);
+}
+
 
     // Step 2: confirm detected personal location
     if (state.step === 2) {

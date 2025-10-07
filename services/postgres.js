@@ -1521,68 +1521,33 @@ async function createTask({
   relatedEntryId = null,
   dueAt = null,
 }) {
-  if (!ownerId || !createdBy || !title) {
-    throw new Error('Missing required fields');
+  if (!ownerId || !createdBy || !title) throw new Error('Missing required fields');
+
+  try {
+    const { rows } = await query(
+      `
+      INSERT INTO tasks
+        (owner_id, created_by, assigned_to, title, body, status, type, related_entry_id, due_at)
+      VALUES
+        ($1, $2, $3, $4, $5, 'open', $6, $7, $8)
+      RETURNING *;
+      `,
+      [
+        ownerId,
+        normalizePhoneNumber(createdBy),
+        assignedTo ? normalizePhoneNumber(assignedTo) : null,
+        title,
+        body,
+        type,
+        relatedEntryId,
+        dueAt,
+      ]
+    );
+    return rows[0]; // will include task_no set by the trigger
+  } catch (error) {
+    console.error('[ERROR] createTask failed:', error.message);
+    throw error;
   }
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      // 1) Get per-owner next number (atomic)
-      const nrows = await client.query(
-        `
-        WITH next_no AS (
-          INSERT INTO task_counters (owner_id, last_no)
-          VALUES ($1, 1)
-          ON CONFLICT (owner_id)
-          DO UPDATE SET last_no = task_counters.last_no + 1
-          RETURNING last_no
-        )
-        SELECT last_no AS task_no FROM next_no;
-        `,
-        [ownerId]
-      );
-      const taskNo = nrows.rows[0].task_no;
-
-      // 2) Insert task with task_no
-      const res = await client.query(
-        `
-        INSERT INTO tasks
-          (owner_id, task_no, created_by, assigned_to, title, body, status, type, related_entry_id, due_at)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, 'open', $7, $8, $9)
-        RETURNING *;
-        `,
-        [
-          ownerId,
-          taskNo,
-          normalizePhoneNumber(createdBy),
-          assignedTo ? normalizePhoneNumber(assignedTo) : null,
-          title,
-          body,
-          type,
-          relatedEntryId,
-          dueAt,
-        ]
-      );
-
-      await client.query('COMMIT');
-      return res.rows[0]; // includes per-owner task_no
-    } catch (error) {
-      await client.query('ROLLBACK');
-      // If two inserts raced and hit the (owner_id, task_no) unique index, retry once
-      if (String(error.code) === '23505' && attempt === 0) continue;
-      console.error('[ERROR] createTask failed:', error.message);
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
-  // Should never reach here
-  throw new Error('Failed to create task after retry');
 }
 
 

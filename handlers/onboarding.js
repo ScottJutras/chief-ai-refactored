@@ -157,19 +157,18 @@ if (state.step === 1) {
 
   if (provinceOk && countryOk) {
     try {
+      // IMPORTANT: Template expects exactly 2 vars → {1}=province, {2}=country (or vice-versa; pick one and keep it consistent)
       await sendTemplateMessage(
         normalizedFrom,
-        'HX0280df498999848aaff04cc079e16c31', // "Hi {1}! I detected you’re in {2}, {3}. Is that correct?"
-        { '1': state.responses.name, '2': detected.province, '3': detected.country }
+        'HX0280df498999848aaff04cc079e16c31',
+        { '1': detected.province, '2': detected.country }   // ✅ no name, only two vars
       );
       return ack(res);
     } catch (error) {
       console.error('[ERROR] Template message failed, falling back:', error.message);
-      // fall through
     }
   }
 
-  // Fallback if detection is missing/invalid (or template failed)
   await sendQuickReply(
     normalizedFrom,
     `Hi ${state.responses.name}! I couldn’t confidently detect your location. Please provide your State/Province, Country (e.g., "Ontario, Canada").`,
@@ -177,6 +176,7 @@ if (state.step === 1) {
   );
   return ack(res);
 }
+
 
 
     // Step 2: confirm detected personal location

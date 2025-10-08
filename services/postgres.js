@@ -30,7 +30,7 @@ async function query(sql, params) {
 }
 
 async function withClient(fn, { useTransaction = true } = {}) {
-  const client = await getPool().connect();
+  const client = await pool.connect();
   try {
     if (useTransaction) await client.query('BEGIN');
     const result = await fn(client);
@@ -45,6 +45,7 @@ async function withClient(fn, { useTransaction = true } = {}) {
     client.release();
   }
 }
+
 
 // ---------- Helpers ----------
 function normalizePhoneNumber(phone = '') {
@@ -1726,10 +1727,10 @@ async function getCurrentStatus(ownerId, employeeName) {
 
 // --- Exports ---
 module.exports = {
-  get pool() { return getPool(); },
-  getPool,
+  pool,            // export the instance directly
   query,
   withClient,
+
   appendToUserSpreadsheet,
   saveExpense,
   deleteExpense,
@@ -1775,6 +1776,8 @@ module.exports = {
   generateReport,
   exportTimesheetXlsx,
   exportTimesheetPdf,
+
+  // tasks API (ensure these are the per-user `task_no` versions you just adopted)
   createTask,
   listMyTasks,
   listInboxTasks,
@@ -1782,6 +1785,7 @@ module.exports = {
   markTaskDone,
   reopenTask,
   createTimeEditRequestTask,
+
   getUserBasic,
   getUserByName,
   normalizePhoneNumber,
@@ -1789,3 +1793,4 @@ module.exports = {
   checkActorLimit,
   hasCreatedByColumn,
 };
+

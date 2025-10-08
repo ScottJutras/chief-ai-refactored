@@ -3,10 +3,9 @@
 // • "tasks" / "my tasks" / "my tasks done" → list mine
 // • "inbox tasks" / "inbox tasks done" (owner/board only)
 // • "tasks for Jon" → list someone else’s (owner/board only)
-// • "task - <title> [for <name|phone>] [due <time>]" → create (old behavior kept)
-// • "task @everyone - <title>" → create one task per teammate + WhatsApp DM
+// • "task - <title> [for <name|phone>] [due <time>]" → create
+// • "task @everyone - <title>" → create one task per teammate + DM
 // • "done 12" / "reopen 12"
-//
 // Keeps: daily creation limits by subscription tier
 
 const chrono = require('chrono-node');
@@ -41,17 +40,21 @@ async function checkTaskLimit(ownerId, userId, tier) {
 
   const createdBy = normalizePhoneNumber(userId);
   const { rows } = await pool.query(
-    `SELECT COUNT(*) AS count
-       FROM tasks
-      WHERE owner_id = $1
-        AND created_by = $2
-        AND DATE(created_at AT TIME ZONE 'UTC') = CURRENT_DATE`,
+    `
+    SELECT COUNT(*) AS count
+      FROM tasks
+     WHERE owner_id = $1
+       AND created_by = $2
+       AND DATE(created_at AT TIME ZONE 'UTC') = CURRENT_DATE
+    `,
     [ownerId, createdBy]
   );
   return parseInt(rows[0]?.count || '0', 10) < limit;
 }
 
 // ---------- helpers ----------
+const fmtDate = (iso) => new Date(iso).toISOString().split('T')[0];
+
 function sanitizeInput(text) {
   return String(text || '').replace(/[<>"'&]/g, '').trim().slice(0, 140);
 }
@@ -63,18 +66,29 @@ function parseStatus(s = '') {
 const norm = (s = '') =>
   String(s).normalize('NFKC').replace(/[\u00A0\u2007\u202F]/g, ' ').replace(/\s{2,}/g, ' ').trim();
 
-// Parse task command for title, assignee, due date (old behavior)
+function cap(s = '') {
+  return String(s)
+    .trim()
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(' ');
+}
+
+// Parse task command for title, assignee, due date
 function parseTaskCommand(input) {
   let title = input;
   let assignedTo = null;
   let dueAt = null;
 
-  const assigneeMatch = input.match(/\bfor\s+([a-z][\w\s.'-]{1,50}?|\+?\d{10,15})\b/i);
+  // assignee: "for <name|+15551234567>"
+  const assigneeMatch = input.match(/\bfor\s+([a-z][\w\s.'-]{1,50}|\+?\d{10,15})\b/i);
   if (assigneeMatch) {
     assignedTo = assigneeMatch[1].trim();
     title = input.replace(assigneeMatch[0], '').trim();
   }
 
+  // due date: "due <...>"
   const dueMatch = title.match(/\bdue\s+(.+)$/i);
   if (dueMatch) {
     const dueText = dueMatch[1].trim();
@@ -86,7 +100,7 @@ function parseTaskCommand(input) {
   return { title: sanitizeInput(title), assignedTo, dueAt };
 }
 
-// New: detect @everyone broadcast
+// Detect @everyone broadcast
 function parseEveryone(input) {
   const s = input.trim();
   const m =
@@ -99,7 +113,7 @@ function parseEveryone(input) {
   return m ? sanitizeInput(m[1]) : null;
 }
 
-// Team roster (uses same DB pool you already export)
+// Team roster
 async function getTeamMembers(ownerId) {
   const { rows } = await pool.query(
     `
@@ -129,27 +143,26 @@ module.exports = async function tasksHandler(
 
     // --- LIST: "tasks" / "my tasks" / "my tasks done"
     {
-      // exact "tasks" or "my tasks" → list mine (open)
       if (/^\s*(tasks|my\s+tasks)\s*$/i.test(body)) {
         const status = 'open';
         const rows = await listMyTasks({ ownerId, userId: from, status });
-        if (!rows.length) return res.send(RESP(`✅ You’re all clear — no open tasks assigned to you.`));
+        if (!rows.length) return res.send(RESP(`✅ You're all clear — no open tasks assigned to you.`));
         const lines = rows.slice(0, 12).map((r) => {
-          const due = r.due_at ? ` (due ${new Date(r.due_at).toLocaleDateString()})` : '';
-          return `• #${r.id} ${r.title}${due}`;
+          const due = r.due_at ? ` (due ${fmtDate(r.due_at)})` : '';
+          return `• #${r.task_no} ${cap(r.title)}${due}`;
         });
-        return res.send(RESP(`✅ Here’s what’s on your plate:\n${lines.join('\n')}\nWant to add due dates or reassign?`));
+        return res.send(
+          RESP(`✅ Here's what's on your plate:\n${lines.join('\n')}\nWant to add due dates or reassign?`)
+        );
       }
-
-      // "my tasks done"
-      let m = body.match(/^my\s+tasks\s+(open|done)$/i);
+      const m = body.match(/^my\s+tasks\s+(open|done)$/i);
       if (m) {
         const status = parseStatus(m[1]);
         const rows = await listMyTasks({ ownerId, userId: from, status });
         if (!rows.length) return res.send(RESP(`No ${status} tasks assigned to you.`));
         const lines = rows.slice(0, 12).map((r) => {
-          const due = r.due_at ? ` (due ${new Date(r.due_at).toLocaleDateString()})` : '';
-          return `• #${r.id} ${r.title}${due}`;
+          const due = r.due_at ? ` (due ${fmtDate(r.due_at)})` : '';
+          return `• #${r.task_no} ${cap(r.title)}${due}`;
         });
         return res.send(RESP(`${status.toUpperCase()} tasks for you:\n${lines.join('\n')}`));
       }
@@ -165,8 +178,8 @@ module.exports = async function tasksHandler(
       const rows = await listInboxTasks({ ownerId, status });
       if (!rows.length) return res.send(RESP(`No ${status} tasks in Inbox.`));
       const lines = rows.slice(0, 12).map((r) => {
-        const due = r.due_at ? ` (due ${new Date(r.due_at).toLocaleDateString()})` : '';
-        return `• #${r.id} ${r.title} (from ${r.creator_name || r.created_by})${due}`;
+        const due = r.due_at ? ` (due ${fmtDate(r.due_at)})` : '';
+        return `• #${r.task_no} ${cap(r.title)} (from ${r.creator_name || r.created_by})${due}`;
       });
       return res.send(RESP(`INBOX (${status.toUpperCase()}):\n${lines.join('\n')}`));
     }
@@ -182,40 +195,40 @@ module.exports = async function tasksHandler(
         const rows = await listTasksForUser({ ownerId, nameOrId: who, status: 'open' });
         if (!rows.length) return res.send(RESP(`No open tasks for "${who}".`));
         const lines = rows.slice(0, 12).map((r) => {
-          const due = r.due_at ? ` (due ${new Date(r.due_at).toLocaleDateString()})` : '';
-          return `• #${r.id} ${r.title}${due}`;
+          const due = r.due_at ? ` (due ${fmtDate(r.due_at)})` : '';
+          return `• #${r.task_no} ${cap(r.title)}${due}`;
         });
         return res.send(RESP(`Open tasks for ${who}:\n${lines.join('\n')}`));
       }
     }
 
-    // --- DONE / REOPEN
+    // --- DONE / REOPEN (use task_no, not global id)
     {
       let m = body.match(/^(?:done|close)\s+#?(\d+)$/i);
       if (m) {
-        const id = parseInt(m[1], 10);
+        const taskNo = parseInt(m[1], 10);
         try {
-          const t = await markTaskDone({ ownerId, taskId: id, actorId: from });
-          return res.send(RESP(`✅ Task #${id} marked done: ${t.title}`));
+          const t = await markTaskDone({ ownerId, taskNo, actorId: from });
+          return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
         } catch (e) {
-          if (e.message.includes('Task not found')) return res.send(RESP(`⚠️ Task #${id} not found.`));
+          if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
           throw e;
         }
       }
       m = body.match(/^reopen\s+#?(\d+)$/i);
       if (m) {
-        const id = parseInt(m[1], 10);
+        const taskNo = parseInt(m[1], 10);
         try {
-          const t = await reopenTask({ ownerId, taskId: id, actorId: from });
-          return res.send(RESP(`↩️ Task #${id} reopened: ${t.title}`));
+          const t = await reopenTask({ ownerId, taskNo, actorId: from });
+          return res.send(RESP(`↩️ Task #${taskNo} reopened: ${cap(t.title)}`));
         } catch (e) {
-          if (e.message.includes('Task not found')) return res.send(RESP(`⚠️ Task #${id} not found.`));
+          if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
           throw e;
         }
       }
     }
 
-    // --- CREATE LIMIT (applies to "task ..." and "@everyone")
+    // --- CREATE LIMIT
     if (/^task\b/i.test(body)) {
       const canCreate = await checkTaskLimit(ownerId, from, tier);
       if (!canCreate) {
@@ -232,33 +245,38 @@ module.exports = async function tasksHandler(
       if (titleForAll) {
         const team = await getTeamMembers(ownerId);
         const teammates = team.filter((u) => u.user_id && u.user_id !== from);
-        if (!teammates.length) return res.send(RESP(`⚠️ I didn’t find any teammates to assign. Add team members first.`));
+        if (!teammates.length)
+          return res.send(RESP(`⚠️ I didn’t find any teammates to assign. Add team members first.`));
 
         let createdCount = 0;
+        const taskNos = [];
         for (const tm of teammates) {
           const task = await createTask({
             ownerId,
             createdBy: from,
-            assignedTo: tm.user_id, // services/postgres createTask expects a user_id here
+            assignedTo: tm.user_id,
             title: titleForAll,
             body: null,
             type: 'general',
             dueAt: null,
           });
           createdCount++;
-
-          // Best-effort DM to each teammate
+          taskNos.push(task.task_no);
+          // DM teammate (best-effort)
           try {
             await sendMessage(
               tm.user_id,
-              `📝 New team task: ${task.title} (#${task.id})\nAssigned by ${userProfile?.name || 'Owner'}`
+              `📝 New team task: ${cap(task.title)} (#${task.task_no})\nAssigned by ${userProfile?.name || 'Owner'}`
             );
           } catch (e) {
             console.warn('[tasks.assign_all] DM failed:', tm.user_id, e?.message);
           }
         }
-
-        return res.send(RESP(`✅ Sent to everyone — “${titleForAll}”. (${createdCount} teammates notified)`));
+        return res.send(
+          RESP(
+            `✅ Sent task #${taskNos.join(', #')} to everyone — “${cap(titleForAll)}”. (${createdCount} teammates notified)`
+          )
+        );
       }
     }
 
@@ -286,7 +304,7 @@ module.exports = async function tasksHandler(
             return res.send(RESP(`⚠️ User "${assignedTo}" not found. Try their phone number or exact name.`));
           }
         } else {
-          // default: assign to sender (old behavior)
+          // default: assign to sender
           resolvedAssignee = from;
           assigneeLabel = userProfile?.name || from;
         }
@@ -301,22 +319,27 @@ module.exports = async function tasksHandler(
           dueAt,
         });
 
-        let reply = `✅ Task #${task.id} created: ${task.title}`;
-        if (resolvedAssignee) {
-          reply += `\nAssigned to: ${assigneeLabel}`;
-          // Notify assignee (best-effort)
+        if (!task || task.task_no == null) {
+          console.error('[tasks] createTask failed: missing task_no');
+          return res.send(RESP('⚠️ Failed to create task. Please try again.'));
+        }
+
+        // Single confirmation; DM only if assigning to someone else
+        let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
+        if (resolvedAssignee !== from) {
+          reply += `\nAssigned to: ${cap(assigneeLabel)}`;
           try {
             await sendMessage(
               resolvedAssignee,
-              `New task assigned to you: ${task.title} (#${task.id})${dueAt ? `, due ${new Date(dueAt).toLocaleDateString()}` : ''}`
+              `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${
+                dueAt ? `, due ${fmtDate(dueAt)}` : ''
+              }`
             );
           } catch (e) {
             console.warn('[tasks] Assignee notification failed:', e.message);
           }
-        } else {
-          reply += '\n(Unassigned: Owner/Board will see it in Inbox)';
         }
-        if (dueAt) reply += `\nDue: ${new Date(dueAt).toLocaleDateString()}`;
+        if (dueAt) reply += `\nDue: ${fmtDate(dueAt)}`;
         return res.send(RESP(reply));
       }
     }

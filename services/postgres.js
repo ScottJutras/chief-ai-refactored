@@ -1,41 +1,32 @@
 const { Pool } = require('pg');
-const crypto = require('crypto');
 const ExcelJS = require('exceljs');
+const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { reverseGeocode } = require('./geocode');
 
-// ---------- Lazy Pool Singleton (prevents read-before-init in cycles) ----------
-let _pool = null;
-function getPool() {
-  if (_pool) return _pool;
-  _pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
-    max: 10,
-    connectionTimeoutMillis: 10000,
-    idleTimeoutMillis: 30000,
-  });
-  _pool.on('error', (err) => {
-    console.error('[PG] idle client error:', err?.message || err);
-  });
-  if (process.env.NODE_ENV !== 'production') {
-    try {
-      if (process.env.DATABASE_URL) {
-        console.log('[DEBUG] DATABASE_URL host:', new URL(process.env.DATABASE_URL).hostname);
-      } else {
-        console.warn('[DEBUG] DATABASE_URL is not set');
-      }
-    } catch (e) {
-      console.warn('[DEBUG] Could not parse DATABASE_URL:', e.message);
-    }
-  }
-  return _pool;
-}
+// Initialize Postgres connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  // you can keep reasonable defaults; tweak if needed
+  max: 10,
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+});
 
-// Convenience helpers
-async function query(text, params) {
-  return getPool().query(text, params);
+pool.on('error', (err) => {
+  console.error('[PG] idle client error:', err?.message || err);
+});
+
+async function query(sql, params) {
+  try {
+    return await pool.query(sql, params);
+  } catch (error) {
+    // Avoid logging huge SQL with sensitive data; this is fine for your internal queries
+    console.error('[ERROR] Query failed:', error.message);
+    throw error;
+  }
 }
 
 async function withClient(fn, { useTransaction = true } = {}) {
@@ -1530,7 +1521,7 @@ async function createTask({
         (owner_id, created_by, assigned_to, title, body, status, type, related_entry_id, due_at)
       VALUES
         ($1, $2, $3, $4, $5, 'open', $6, $7, $8)
-      RETURNING *;
+      RETURNING id, task_no, owner_id, created_by, assigned_to, title, due_at, status, type, related_entry_id, created_at, updated_at
       `,
       [
         ownerId,
@@ -1543,25 +1534,30 @@ async function createTask({
         dueAt,
       ]
     );
-    return rows[0]; // will include task_no set by the trigger
+    return rows[0]; // includes task_no (set by trigger)
   } catch (error) {
     console.error('[ERROR] createTask failed:', error.message);
     throw error;
   }
 }
 
-
 async function listMyTasks({ ownerId, userId, status = 'open' }) {
   try {
     const { rows } = await query(
-      `SELECT t.*, u.name AS assigned_name, c.name AS creator_name
-       FROM tasks t
-       LEFT JOIN users u ON u.user_id = t.assigned_to
-       LEFT JOIN users c ON c.user_id = t.created_by
-       WHERE t.owner_id=$1
-         AND t.assigned_to=$2
-         AND t.status=$3
-       ORDER BY t.updated_at DESC, t.created_at DESC`,
+      `
+      SELECT
+        t.task_no,
+        t.title,
+        t.due_at,
+        t.status,
+        COALESCE(c.name, t.created_by) AS creator_name
+      FROM tasks t
+      LEFT JOIN users c ON c.user_id = t.created_by
+      WHERE t.owner_id = $1
+        AND t.assigned_to = $2
+        AND t.status = $3
+      ORDER BY t.due_at ASC NULLS LAST, t.task_no ASC
+      `,
       [ownerId, normalizePhoneNumber(userId), status]
     );
     return rows;
@@ -1574,13 +1570,21 @@ async function listMyTasks({ ownerId, userId, status = 'open' }) {
 async function listInboxTasks({ ownerId, status = 'open' }) {
   try {
     const { rows } = await query(
-      `SELECT t.*, c.name AS creator_name
-       FROM tasks t
-       LEFT JOIN users c ON c.user_id = t.created_by
-       WHERE t.owner_id=$1
-         AND t.assigned_to IS NULL
-         AND t.status=$2
-       ORDER BY t.updated_at DESC, t.created_at DESC`,
+      `
+      SELECT
+        t.task_no,
+        t.title,
+        t.due_at,
+        t.status,
+        t.created_by,
+        COALESCE(c.name, t.created_by) AS creator_name
+      FROM tasks t
+      LEFT JOIN users c ON c.user_id = t.created_by
+      WHERE t.owner_id = $1
+        AND t.assigned_to IS NULL
+        AND t.status = $2
+      ORDER BY t.due_at ASC NULLS LAST, t.task_no ASC
+      `,
       [ownerId, status]
     );
     return rows;
@@ -1593,7 +1597,7 @@ async function listInboxTasks({ ownerId, status = 'open' }) {
 async function listTasksForUser({ ownerId, nameOrId, status = 'open' }) {
   try {
     let user = null;
-    if (/^\+?\d/.test(nameOrId)) {
+    if (/^\+?\d{10,15}$/.test(String(nameOrId))) {
       user = await getUserBasic(nameOrId);
     } else {
       user = await getUserByName(ownerId, nameOrId);
@@ -1606,14 +1610,23 @@ async function listTasksForUser({ ownerId, nameOrId, status = 'open' }) {
   }
 }
 
-async function markTaskDone({ ownerId, taskId }) {
+async function markTaskDone({ ownerId, taskNo, actorId }) {
   try {
+    const actor = normalizePhoneNumber(actorId);
     const { rows } = await query(
-      `UPDATE tasks
-       SET status='done', updated_at=NOW()
-       WHERE id=$1 AND owner_id=$2
-       RETURNING *`,
-      [taskId, ownerId]
+      `
+      UPDATE tasks
+         SET status = 'done',
+             updated_at = NOW()
+       WHERE owner_id = $1
+         AND task_no  = $2
+         AND (
+               assigned_to = $3
+               OR (assigned_to IS NULL AND created_by = $3)
+             )
+       RETURNING task_no, title
+      `,
+      [ownerId, taskNo, actor]
     );
     if (!rows.length) throw new Error('Task not found');
     return rows[0];
@@ -1623,14 +1636,23 @@ async function markTaskDone({ ownerId, taskId }) {
   }
 }
 
-async function reopenTask({ ownerId, taskId }) {
+async function reopenTask({ ownerId, taskNo, actorId }) {
   try {
+    const actor = normalizePhoneNumber(actorId);
     const { rows } = await query(
-      `UPDATE tasks
-       SET status='open', updated_at=NOW()
-       WHERE id=$1 AND owner_id=$2
-       RETURNING *`,
-      [taskId, ownerId]
+      `
+      UPDATE tasks
+         SET status = 'open',
+             updated_at = NOW()
+       WHERE owner_id = $1
+         AND task_no  = $2
+         AND (
+               assigned_to = $3
+               OR (assigned_to IS NULL AND created_by = $3)
+             )
+       RETURNING task_no, title
+      `,
+      [ownerId, taskNo, actor]
     );
     if (!rows.length) throw new Error('Task not found');
     return rows[0];
@@ -1666,13 +1688,17 @@ async function createTimeEditRequestTask({
 }
 
 async function getCurrentStatus(ownerId, employeeName) {
-  const res = await query(`
+  const res = await query(
+    `
     SELECT type, timestamp
-    FROM time_entries
-    WHERE owner_id = $1 AND employee_name = $2
-    ORDER BY timestamp DESC
-    LIMIT 2
-  `, [ownerId, employeeName]);
+      FROM time_entries
+     WHERE owner_id = $1
+       AND employee_name = $2
+     ORDER BY timestamp DESC
+     LIMIT 2
+    `,
+    [ownerId, employeeName]
+  );
 
   let onShift = false;
   let onBreak = false;

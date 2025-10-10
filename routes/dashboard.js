@@ -1,5 +1,5 @@
 const express = require('express');
-const { Pool } = require('pg');
+const { query } = require('../services/postgres');
 const { getUserProfile, getOwnerProfile, createUserProfile, generateOTP, verifyOTP } = require('../services/postgres');
 const { sendMessage } = require('../services/twilio');
 const { errorMiddleware } = require('../middleware/error');
@@ -34,13 +34,6 @@ async function userProfileMiddleware(req, res, next) {
 }
 
 const router = express.Router();
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 20,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000
-});
 
 router.get('/:userId', userProfileMiddleware, async (req, res, next) => {
   const { userId } = req.params;
@@ -52,7 +45,7 @@ router.get('/:userId', userProfileMiddleware, async (req, res, next) => {
   if (!token || token !== userProfile.dashboard_token) {
     return res.status(403).send('Invalid or missing dashboard token');
   }
-  const transCountRes = await pool.query(`SELECT COUNT(*) FROM transactions WHERE owner_id = $1`, [userId]);
+  const transCountRes = await query(`SELECT COUNT(*) FROM transactions WHERE owner_id = $1`, [userId]);
   const transactionCount = parseInt(transCountRes.rows[0].count) || 0;
   const maxTransactions = { starter: 5000, pro: 20000, enterprise: 50000 }[userProfile.subscription_tier || 'starter'];
   const progress = (transactionCount / maxTransactions) * 100;
@@ -194,27 +187,27 @@ router.post('/:userId/verify', userProfileMiddleware, async (req, res, next) => 
       `);
       return;
     }
-    const transactions = await pool.query(
+    const transactions = await query(
       `SELECT * FROM transactions WHERE owner_id = $1 ORDER BY date DESC`,
       [userId]
     );
-    const jobs = await pool.query(
+    const jobs = await query(
       `SELECT * FROM jobs WHERE owner_id = $1 ORDER BY start_date DESC`,
       [userId]
     );
-    const quotes = await pool.query(
+    const quotes = await query(
       `SELECT * FROM quotes WHERE owner_id = $1 ORDER BY created_at DESC`,
       [userId]
     );
-    const timeEntries = await pool.query(
+    const timeEntries = await query(
       `SELECT * FROM time_entries WHERE owner_id = $1 ORDER BY timestamp DESC`,
       [userId]
     );
-    const reports = await pool.query(
+    const reports = await query(
       `SELECT * FROM reports WHERE owner_id = $1 ORDER BY created_at DESC`,
       [userId]
     );
-    const transCountRes = await pool.query(`SELECT COUNT(*) FROM transactions WHERE owner_id = $1`, [userId]);
+    const transCountRes = await query(`SELECT COUNT(*) FROM transactions WHERE owner_id = $1`, [userId]);
     const transactionCount = parseInt(transCountRes.rows[0].count) || 0;
     const maxTransactions = { starter: 5000, pro: 20000, enterprise: 50000 }[userProfile.subscription_tier || 'starter'];
     const progress = (transactionCount / maxTransactions) * 100;
@@ -395,8 +388,8 @@ router.post('/:userId/report', userProfileMiddleware, async (req, res, next) => 
     return res.status(400).send('Invalid tier. Use: BASIC, FULL, ENTERPRISE');
   }
   try {
-    const expenseResult = await pool.query(`SELECT * FROM transactions WHERE owner_id = $1 AND type IN ('expense', 'bill')`, [userId]);
-    const revenueResult = await pool.query(`SELECT * FROM transactions WHERE owner_id = $1 AND type = 'revenue'`, [userId]);
+    const expenseResult = await query(`SELECT * FROM transactions WHERE owner_id = $1 AND type IN ('expense', 'bill')`, [userId]);
+    const revenueResult = await query(`SELECT * FROM transactions WHERE owner_id = $1 AND type = 'revenue'`, [userId]);
     const expenses = expenseResult.rows;
     const revenues = revenueResult.rows;
     if (!expenses.length && !revenues.length) {
@@ -431,7 +424,7 @@ router.post('/:userId/report', userProfileMiddleware, async (req, res, next) => 
       } : null,
       goals: DEEP_DIVE_TIERS[tier].features.includes('goals') ? userProfile.goalProgress : null
     };
-    await pool.query(
+    await query(
       `INSERT INTO reports (user_id, tier, report_data, created_at)
        VALUES ($1, $2, $3, $4)`,
       [userProfile.user_id, DEEP_DIVE_TIERS[tier].name, JSON.stringify(report), new Date()]
@@ -467,7 +460,7 @@ router.post('/:userId/upload', upload.single('file'), userProfileMiddleware, asy
     if (!req.file) throw new Error('No file uploaded');
     const { buffer, originalname, mimetype } = req.file;
     const summary = await parseUpload(buffer, originalname, userId, mimetype, uploadType, userProfile.fiscal_year_start);
-    const transCountRes = await pool.query(`SELECT COUNT(*) FROM transactions WHERE owner_id = $1`, [userId]);
+    const transCountRes = await query(`SELECT COUNT(*) FROM transactions WHERE owner_id = $1`, [userId]);
     const transactionCount = parseInt(transCountRes.rows[0].count) || 0;
     const maxTransactions = { starter: 5000, pro: 20000, enterprise: 50000 }[userProfile.subscription_tier || 'starter'];
     const progress = (transactionCount / maxTransactions) * 100;

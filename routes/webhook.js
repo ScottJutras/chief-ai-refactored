@@ -354,8 +354,7 @@ router.post(
             const priceId = tier === 'pro' ? process.env.PRO_PRICE_ID : process.env.ENTERPRISE_PRICE_ID;
             const priceText = tier === 'pro' ? '$29' : '$99';
 
-            const { Pool } = require('pg');
-            const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+            const { query } = require('../services/postgres');
 
             const customer = await stripe.customers.create({ phone: from, metadata: { user_id: userProfile.user_id } });
             const paymentLink = await stripe.paymentLinks.create({
@@ -363,7 +362,7 @@ router.post(
               metadata: { user_id: userProfile.user_id }
             });
 
-            await pool.query(
+            await query(
               `UPDATE users SET stripe_customer_id=$1, subscription_tier=$2 WHERE user_id=$3`,
               [customer.id, tier, userProfile.user_id]
             );

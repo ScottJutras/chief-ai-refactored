@@ -1,10 +1,5 @@
-const { Pool } = require('pg');
+const { query } = require('../../services/postgres');
 const { releaseLock } = require('../../middleware/lock');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwner) {
   const lockKey = `lock:${from}`;
@@ -24,13 +19,13 @@ async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwn
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      await pool.query(
+      await query(
         `UPDATE users
          SET team_members = COALESCE(team_members, '[]'::jsonb) || $1::jsonb
          WHERE user_id = $2`,
         [JSON.stringify([phoneNumber]), ownerId]
       );
-      await pool.query(
+      await query(
         `INSERT INTO users (user_id, owner_id, is_team_member, created_at)
          VALUES ($1, $2, true, NOW())
          ON CONFLICT (user_id) DO UPDATE
@@ -46,20 +41,20 @@ async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwn
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      await pool.query(
+      await query(
         `UPDATE users
          SET team_members = team_members - $1
          WHERE user_id = $2`,
         [phoneNumber, ownerId]
       );
-      await pool.query(
+      await query(
         `DELETE FROM users WHERE user_id = $1`,
         [phoneNumber.replace(/\D/g, '')]
       );
       reply = `✅ Removed team member ${phoneNumber}.`;
       return `<Response><Message>${reply}</Message></Response>`;
     } else if (lcInput === 'team') {
-      const res = await pool.query(
+      const res = await query(
         `SELECT team_members FROM users WHERE user_id = $1`,
         [ownerId]
       );

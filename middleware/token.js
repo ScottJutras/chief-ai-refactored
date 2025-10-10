@@ -1,13 +1,5 @@
-const { Pool } = require('pg');
+const { query } = require('../services/postgres');
 const { releaseLock } = require('./lock');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 20,
-  connectionTimeoutMillis: 10000,
-  idleTimeoutMillis: 30000
-});
 
 async function checkTokenLimit(userId, tier) {
   console.log('[DEBUG] checkTokenLimit called:', { userId, tier });
@@ -18,7 +10,7 @@ async function checkTokenLimit(userId, tier) {
     Enterprise: { messages: Infinity, aiCalls: Infinity }
   };
   try {
-    const res = await pool.query(
+    const res = await query(
       `SELECT token_usage FROM users WHERE user_id = $1`,
       [userId]
     );
@@ -36,7 +28,7 @@ async function checkTokenLimit(userId, tier) {
 async function updateUserTokenUsage(userId, { messages = 0, aiCalls = 0 }) {
   console.log('[DEBUG] updateUserTokenUsage called:', { userId, messages, aiCalls });
   try {
-    const res = await pool.query(
+    const res = await query(
       `UPDATE users
        SET token_usage = COALESCE(token_usage, '{}')::jsonb || $1::jsonb
        WHERE user_id = $2
@@ -65,7 +57,7 @@ async function tokenMiddleware(req, res, next) {
   }
 
   try {
-    const res = await pool.query('SELECT subscription_tier, trial_end, token_usage FROM users WHERE user_id = $1', [userId]);
+    const res = await query('SELECT subscription_tier, trial_end, token_usage FROM users WHERE user_id = $1', [userId]);
     if (!res.rows[0]) {
       console.error(`[ERROR] No profile for ${userId}`);
       if (isWebhook) {
@@ -79,7 +71,7 @@ async function tokenMiddleware(req, res, next) {
     const tier = user.subscription_tier || 'basic';
 
     if (!user.subscription_tier) {
-      await pool.query(
+      await query(
         `UPDATE users
          SET subscription_tier = $1, token_usage = $2
          WHERE user_id = $3`,

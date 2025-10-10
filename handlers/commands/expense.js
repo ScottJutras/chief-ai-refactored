@@ -1,17 +1,11 @@
-const { Pool } = require('pg');
-const { getActiveJob } = require('../../services/postgres');
+const { query, getActiveJob } = require('../../services/postgres');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
 const { handleInputWithAI, parseExpenseMessage, detectErrors, categorizeEntry } = require('../../utils/aiErrorHandler');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 async function saveExpense({ ownerId, date, item, amount, store, jobName, category, user }) {
   console.log(`[DEBUG] saveExpense called for ownerId: ${ownerId}`);
   try {
-    await pool.query(
+    await query(
       `INSERT INTO transactions (owner_id, type, date, item, amount, store, job_name, category, user_name, created_at)
        VALUES ($1, 'expense', $2, $3, $4, $5, $6, $7, $8, NOW())`,
       [ownerId, date, item, parseFloat(amount.replace('$', '')), store, jobName, category, user]
@@ -26,7 +20,7 @@ async function saveExpense({ ownerId, date, item, amount, store, jobName, catego
 async function deleteExpense(ownerId, criteria) {
   console.log(`[DEBUG] deleteExpense called for ownerId: ${ownerId}, criteria:`, criteria);
   try {
-    const res = await pool.query(
+    const res = await query(
       `DELETE FROM transactions
        WHERE owner_id = $1 AND type = 'expense' AND item = $2 AND amount = $3 AND store = $4
        RETURNING *`,
@@ -43,7 +37,7 @@ async function deleteExpense(ownerId, criteria) {
 async function saveUserProfile(userProfile) {
   console.log(`[DEBUG] saveUserProfile called for userId: ${userProfile.user_id}`);
   try {
-    await pool.query(
+    await query(
       `UPDATE users
        SET industry = $1, updated_at = NOW()
        WHERE user_id = $2`,

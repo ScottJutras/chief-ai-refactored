@@ -1,10 +1,5 @@
-const { Pool } = require('pg');
+const { query } = require('../../services/postgres');
 const { releaseLock } = require('../../middleware/lock');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 function parseReceiptQuery(input) {
   const lcInput = input.toLowerCase().trim();
@@ -25,7 +20,7 @@ async function handleReceipt(from, input, userProfile, ownerId) {
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    const res = await pool.query(
+    const res = await query(
       `SELECT date, amount, item, store, media_url
        FROM transactions
        WHERE owner_id = $1

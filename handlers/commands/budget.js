@@ -1,5 +1,3 @@
-
-const { Pool } = require('pg');
 const { getActiveJob } = require('../../services/postgres');
 const { logEvent, saveConvoState } = require('../../services/memory');
 
@@ -11,7 +9,7 @@ const pool = new Pool({
 async function saveBudget(ownerId, jobName, amount) {
   console.log(`[DEBUG] saveBudget called for ownerId: ${ownerId}, jobName: ${jobName}, amount: ${amount}`);
   try {
-    const res = await pool.query(
+    const res = await query(
       `INSERT INTO budgets (owner_id, job_name, amount, created_at)
        VALUES ($1, $2, $3, NOW())
        ON CONFLICT (owner_id, job_name)

@@ -19,10 +19,10 @@ function tsPlus(ms) {
  * Acquire (or re-acquire) a lock:
  *   - If no row, insert (lock taken)
  *   - If expired, take over
- *   - If same holder, refresh
+ *   - If same holder, refresh (re-acquire)
  *
- * NOTE: `token` is accepted for signature compatibility but not persisted
- * (your table has no `token` column). We use `holder` for ownership checks.
+ * NOTE: `token` is accepted for signature compatibility but is NOT persisted
+ * (your table has no `token` column). We use `holder` to identify the owner.
  */
 async function acquireLock(lockKey, userId, token, ttlMs = LOCK_TTL_MS) {
   if (!lockKey) return true;
@@ -49,19 +49,15 @@ async function acquireLock(lockKey, userId, token, ttlMs = LOCK_TTL_MS) {
   `;
   const params = [lockKey, userId, tsPlus(ttlMs)];
 
-  try {
-    const res = await query(sql, params);
-    const ok = res.rowCount === 1 && res.rows[0]?.holder === userId;
-    if (!ok) {
-      console.log('[LOCK] Lock acquisition failed for', lockKey, ': already locked by another holder');
-    } else {
-      console.log('[LOCK] Acquired lock for', lockKey);
-    }
-    return ok;
-  } catch (err) {
-    console.error('[ERROR] acquireLock failed for', lockKey, ':', err.message);
-    throw err;
+  const res = await query(sql, params);
+  const ok = res.rowCount === 1 && res.rows[0]?.holder === userId;
+
+  if (!ok) {
+    console.log('[LOCK] Lock acquisition failed for', lockKey, ': already locked by another holder');
+  } else {
+    console.log('[LOCK] Acquired lock for', lockKey);
   }
+  return ok;
 }
 
 /**

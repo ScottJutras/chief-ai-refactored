@@ -1,17 +1,11 @@
-const { Pool } = require('pg');
-const { getActiveJob, saveJob } = require('../../services/postgres');
+const { query, getActiveJob, saveJob } = require('../../services/postgres');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
 const { parseQuoteMessage } = require('../../utils/aiErrorHandler');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 async function saveQuote(ownerId, quoteData) {
   console.log(`[DEBUG] saveQuote called for ownerId: ${ownerId}, quoteData:`, quoteData);
   try {
-    const res = await pool.query(
+    const res = await query(
       `INSERT INTO quotes (owner_id, job_name, customer_name, customer_email, subtotal, tax, total, status, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
        RETURNING id`,
@@ -37,7 +31,7 @@ async function saveQuote(ownerId, quoteData) {
 async function updateQuoteStatus(ownerId, quoteId, status) {
   console.log(`[DEBUG] updateQuoteStatus called for ownerId: ${ownerId}, quoteId: ${quoteId}, status: ${status}`);
   try {
-    const res = await pool.query(
+    const res = await query(
       `UPDATE quotes
        SET status = $1, updated_at = NOW()
        WHERE owner_id = $2 AND id = $3
@@ -55,7 +49,7 @@ async function updateQuoteStatus(ownerId, quoteId, status) {
 async function getMaterialPrices(ownerId) {
   console.log(`[DEBUG] getMaterialPrices called for ownerId: ${ownerId}`);
   try {
-    const res = await pool.query(
+    const res = await query(
       `SELECT item_name, price FROM pricing_items WHERE owner_id = $1`,
       [ownerId]
     );
@@ -156,7 +150,7 @@ async function handleQuote(from, input, userProfile, ownerId, ownerProfile, isOw
       const success = await updateQuoteStatus(ownerId, quoteId, normalizedStatus);
       reply = success ? `✅ Quote ${quoteId} updated to ${normalizedStatus}.` : `⚠️ Quote ${quoteId} not found or update failed.`;
       if (normalizedStatus === 'Closed/Win') {
-        const quote = await pool.query(`SELECT job_name FROM quotes WHERE id = $1 AND owner_id = $2`, [quoteId, ownerId]);
+        const quote = await query(`SELECT job_name FROM quotes WHERE id = $1 AND owner_id = $2`, [quoteId, ownerId]);
         if (quote.rows[0]) {
           await setPendingTransactionState(from, { pendingJobCreation: { quoteId, jobName: quote.rows[0].job_name } });
           reply += `\nWould you like to start a new job for this quote? Reply 'yes' or 'no'.`;

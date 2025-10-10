@@ -5,11 +5,10 @@ const PDFDocument = require('pdfkit');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { reverseGeocode } = require('./geocode');
 
-// Initialize Postgres connection
+// Initialize ONE Postgres pool for the whole app
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  // you can keep reasonable defaults; tweak if needed
   max: 10,
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
@@ -21,14 +20,15 @@ pool.on('error', (err) => {
 
 async function query(sql, params) {
   try {
+    // IMPORTANT: call pool.query, NOT query(...) (to avoid recursion)
     return await pool.query(sql, params);
   } catch (error) {
-    // Avoid logging huge SQL with sensitive data; this is fine for your internal queries
     console.error('[ERROR] Query failed:', error.message);
     throw error;
   }
 }
 
+// If you still use withClient anywhere, keep this:
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await pool.connect();
   try {
@@ -45,7 +45,6 @@ async function withClient(fn, { useTransaction = true } = {}) {
     client.release();
   }
 }
-
 
 // ---------- Helpers ----------
 function normalizePhoneNumber(phone = '') {

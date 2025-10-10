@@ -1,10 +1,5 @@
-const { Pool } = require('pg');
+const { query } = require('../../services/postgres');
 const { releaseLock } = require('../../middleware/lock');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 function getTaxRate(country, province) {
   const taxRates = {
@@ -33,7 +28,7 @@ async function handleTax(from, input, userProfile, ownerId) {
       reply = `📊 Tax rate for ${userProfile.country}, ${userProfile.province}: ${(taxRate * 100).toFixed(2)}%`;
       return `<Response><Message>${reply}</Message></Response>`;
     } else if (lcInput.startsWith('export tax')) {
-      const res = await pool.query(
+      const res = await query(
         `SELECT date, item, amount FROM transactions WHERE owner_id = $1 AND type IN ('expense', 'bill')`,
         [ownerId]
       );

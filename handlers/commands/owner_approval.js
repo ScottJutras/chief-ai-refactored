@@ -3,7 +3,7 @@
 // Enforces tier seat limits (board/team fixed; accountant depends on tier).
 // Closes any open "Role approval needed" tasks for that person.
 
-const { pool } = require('../../services/postgres');
+const { query } = require('../../services/postgres');
 
 // ----- roles & limits -----
 const VALID_ROLES = new Set(['board', 'team', 'accountant']);
@@ -66,7 +66,7 @@ function parseApproveCommand(input) {
  */
 async function findPeopleByName(ownerId, name) {
   const q = `%${name.replace(/\s+/g,' ').trim()}%`;
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `SELECT user_id AS id, name, role, approved_at
        FROM users
       WHERE owner_id = $1
@@ -82,7 +82,7 @@ async function findPeopleByName(ownerId, name) {
  * Enforce seat limits by tier.
  */
 async function enforceSeatLimitOrThrow(ownerId, role) {
-  const { rows: tierRows } = await pool.query(
+  const { rows: tierRows } = await query(
     `SELECT subscription_tier FROM users WHERE user_id = $1 LIMIT 1`,
     [ownerId]
   );
@@ -90,7 +90,7 @@ async function enforceSeatLimitOrThrow(ownerId, role) {
   const limits = SEAT_LIMITS[tier] || SEAT_LIMITS.starter;
 
   // Count current approved users by role
-  const { rows: counts } = await pool.query(
+  const { rows: counts } = await query(
     `SELECT role, COUNT(*)::int AS count
        FROM users
       WHERE owner_id = $1
@@ -116,7 +116,7 @@ async function approvePerson(ownerId, personId, role) {
   // Enforce tier limits
   await enforceSeatLimitOrThrow(ownerId, role);
 
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `UPDATE users
         SET role = $1,
             approved_at = NOW()
@@ -134,7 +134,7 @@ async function approvePerson(ownerId, personId, role) {
  */
 async function closeApprovalTasks(ownerId, personName) {
   try {
-    await pool.query(
+    await query(
       `UPDATE tasks
           SET status = 'closed',
               closed_at = NOW()

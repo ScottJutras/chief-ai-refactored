@@ -5,10 +5,10 @@
 
 const fs = require('fs');
 const path = require('path');
-const { Pool } = require('pg'); // used for memory.forget branch
+const { query } = require('../services/postgres'); // only if you query here
 const { routeWithAI } = require('./intentRouter');
-const { getMemory, upsertMemory } = require('../services/memory');
-const { getPendingPrompt } = require('../services/postgres'); // ⬅️ NEW
+const { getMemory, upsertMemory, forget } = require('../services/memory');
+const { getPendingPrompt } = require('../services/postgres');
 
 const CATALOG = JSON.parse(fs.readFileSync(path.join(__dirname, 'commandCatalog.json'), 'utf8'));
 

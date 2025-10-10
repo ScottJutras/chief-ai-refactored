@@ -1,11 +1,7 @@
-const { Pool } = require('pg');
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.PGSSL_DISABLE ? undefined : { rejectUnauthorized: false }
-});
+const { query } = require('./postgres');
 
 async function logEvent(tenantId, userId, kind, payload) {
-  await pool.query(
+  await query(
     `INSERT INTO assistant_events (tenant_id, user_id, kind, payload)
      VALUES ($1,$2,$3,$4)`,
     [tenantId, userId, kind, payload]
@@ -14,7 +10,7 @@ async function logEvent(tenantId, userId, kind, payload) {
 
 async function getMemory(tenantId, userId, keys = []) {
   if (!keys.length) return {};
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `SELECT key, value FROM user_memory WHERE tenant_id=$1 AND user_id=$2 AND key = ANY($3)`,
     [tenantId, userId, keys]
   );
@@ -24,7 +20,7 @@ async function getMemory(tenantId, userId, keys = []) {
 }
 
 async function upsertMemory(tenantId, userId, key, value) {
-  await pool.query(
+  await query(
     `INSERT INTO user_memory (tenant_id, user_id, key, value, updated_at)
      VALUES ($1,$2,$3,$4,NOW())
      ON CONFLICT (tenant_id,user_id,key)
@@ -34,7 +30,7 @@ async function upsertMemory(tenantId, userId, key, value) {
 }
 
 async function getConvoState(tenantId, userId) {
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `SELECT active_job, active_job_id, aliases, last_intent, last_args, history
        FROM convo_state WHERE tenant_id=$1 AND user_id=$2`,
     [tenantId, userId]
@@ -53,7 +49,7 @@ async function saveConvoState(tenantId, userId, patch = {}) {
     aliases: { ...(current.aliases||{}), ...(patch.aliases||{}) },
     history: Array.isArray(patch.history) ? patch.history.slice(-5) : (current.history||[]).slice(-5)
   };
-  await pool.query(
+  await query(
     `INSERT INTO convo_state (tenant_id,user_id,active_job,active_job_id,aliases,last_intent,last_args,history,updated_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
      ON CONFLICT (tenant_id,user_id)
@@ -75,7 +71,7 @@ async function saveConvoState(tenantId, userId, patch = {}) {
 }
 
 async function getEntitySummary(tenantId, entityType, entityId) {
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `SELECT summary FROM entity_summary WHERE tenant_id=$1 AND entity_type=$2 AND entity_id=$3`,
     [tenantId, entityType, entityId]
   );
@@ -83,7 +79,7 @@ async function getEntitySummary(tenantId, entityType, entityId) {
 }
 
 async function upsertEntitySummary(tenantId, entityType, entityId, summary) {
-  await pool.query(
+  await query(
     `INSERT INTO entity_summary (tenant_id, entity_type, entity_id, summary, updated_at)
      VALUES ($1,$2,$3,$4,NOW())
      ON CONFLICT (tenant_id, entity_type, entity_id)

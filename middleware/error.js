@@ -1,15 +1,10 @@
-const { Pool } = require('pg');
+const { query } = require('../services/postgres');
 const { releaseLock } = require('./lock');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 async function logError(from, error, context) {
   console.log(`[DEBUG] logError called:`, { from, error: error.message, context });
   try {
-    await pool.query(
+    await query(
       `INSERT INTO error_logs (user_id, error_message, error_stack, context, created_at)
        VALUES ($1, $2, $3, $4, NOW())`,
       [from, error.message, error.stack, context]

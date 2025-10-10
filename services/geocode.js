@@ -1,5 +1,5 @@
 // services/geocode.js
-const { pool } = require('./postgres');
+const { query } = require('./postgres');
 
 let fetchFn = global.fetch;
 if (!fetchFn) {
@@ -12,13 +12,13 @@ const keyFor = (lat, lng) => `${(+lat).toFixed(ROUND)},${(+lng).toFixed(ROUND)}`
 
 async function getCachedAddress(lat, lng) {
   const key = keyFor(lat, lng);
-  const { rows } = await pool.query(`SELECT address FROM geocode_cache WHERE key=$1`, [key]);
+  const { rows } = await query(`SELECT address FROM geocode_cache WHERE key=$1`, [key]);
   return rows[0]?.address || null;
 }
 
 async function putCachedAddress(lat, lng, address) {
   const key = keyFor(lat, lng);
-  await pool.query(
+  await query(
     `INSERT INTO geocode_cache (key, address) VALUES ($1,$2)
      ON CONFLICT (key) DO UPDATE SET address=EXCLUDED.address, created_at=now()`,
     [key, address]

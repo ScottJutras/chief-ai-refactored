@@ -1,13 +1,8 @@
 // services/deepDive.js
 const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
-const { Pool } = require('pg');
+const { query } = require('./postgres');
 const Papa = require('papaparse');
 const ExcelJS = require('exceljs');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
 
 // Lazy-init Document AI client (so local dev without creds doesn’t crash)
 let docAiClient = null;
@@ -64,7 +59,7 @@ async function parseUpload(buffer, filename, from, mimeType, uploadType = 'csv',
     const userId = normalizeFrom(from);
 
     // Find user by user_id or owner_id (schema-safe)
-    const userRes = await pool.query(
+    const userRes = await query(
       `SELECT * FROM users WHERE user_id = $1 OR owner_id = $1 LIMIT 1`,
       [userId]
     );
@@ -185,7 +180,7 @@ async function parseUpload(buffer, filename, from, mimeType, uploadType = 'csv',
       })
       .join(',');
 
-    await pool.query(
+    await query(
       `INSERT INTO transactions (owner_id, date, amount, description, category, created_at)
        VALUES ${placeholders}`,
       values

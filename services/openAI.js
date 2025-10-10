@@ -1,11 +1,6 @@
 require('dotenv').config();
 const OpenAI = require('openai');
-const { Pool } = require('pg');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+const { query } = require('./postgres');
 
 function getOpenAIClient() {
   if (!process.env.OPENAI_API_KEY) {
@@ -74,7 +69,7 @@ async function categorizeEntry(type, data, userProfile, categories) {
     : `${data.billName}`;
   const industry = userProfile.industry || 'Other';
   const ownerId = userProfile.owner_id || userProfile.user_id;
-  const res = await pool.query(
+  const res = await query(
     `SELECT item_name, category FROM pricing_items WHERE owner_id = $1 AND category != 'labour'`,
     [ownerId]
   );

@@ -1730,7 +1730,6 @@ module.exports = {
   pool,            // export the instance directly
   query,
   withClient,
-
   appendToUserSpreadsheet,
   saveExpense,
   deleteExpense,

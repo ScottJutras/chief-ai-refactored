@@ -10,7 +10,7 @@
 
 const chrono = require('chrono-node');
 const {
-  pool,
+  query,
   normalizePhoneNumber,
   createTask,
   listMyTasks,
@@ -39,7 +39,7 @@ async function checkTaskLimit(ownerId, userId, tier) {
     TASK_LIMITS.starter.maxTasksPerDay;
 
   const createdBy = normalizePhoneNumber(userId);
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `
     SELECT COUNT(*) AS count
       FROM tasks
@@ -115,7 +115,7 @@ function parseEveryone(input) {
 
 // Team roster
 async function getTeamMembers(ownerId) {
-  const { rows } = await pool.query(
+  const { rows } = await query(
     `
     SELECT user_id, name, phone, role
       FROM users

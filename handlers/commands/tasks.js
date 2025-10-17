@@ -87,7 +87,7 @@ function parseNaturalDue(source) {
     dueAt = d.toISOString();
   }
 
-  // “tomorrow” → tomorrow 9am (unless a more specific time is parsed below)
+  // “tomorrow” → tomorrow 9am
   if (!dueAt && /\btomorrow\b/i.test(txt)) {
     const d = new Date();
     d.setDate(d.getDate() + 1);
@@ -95,7 +95,7 @@ function parseNaturalDue(source) {
     dueAt = d.toISOString();
   }
 
-  // “by 5pm/by 17:30” etc. Chrono handles “by …” and many variants.
+  // let chrono try anything else (incl. “by 5pm”)
   const chronoDate = chrono.parseDate(txt);
   if (chronoDate) {
     dueAt = new Date(chronoDate).toISOString();
@@ -104,16 +104,35 @@ function parseNaturalDue(source) {
   return dueAt;
 }
 
+// Re-add "to Dylan" (or "for Dylan") back into title if assignee isn't a teammate
+function reinstateAssigneeInTitle(title, preposition, token) {
+  const t = String(title || '').trim();
+  const name = String(token || '').trim();
+  if (!t || !name) return t || name;
+
+  // if already present, avoid duplication
+  const already = new RegExp(`\\b(to|for|@)\\s+${name.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\b`, 'i');
+  if (already.test(t)) return sanitizeInput(t);
+
+  // prefer "to <name>" for readability, even if user used "@"
+  const prep = preposition && preposition.toLowerCase() === 'for' ? 'for' : 'to';
+  return sanitizeInput(`${t} ${prep} ${name}`.replace(/\s{2,}/g, ' ').trim());
+}
+
 // Parse task command for title, assignee, due date
 function parseTaskCommand(input) {
   let title = input;
   let assignedTo = null;
   let dueAt = null;
+  let assigneeToken = null;
+  let assigneePreposition = null;
 
   // assignee: "for|to|@ <name|+15551234567>"
-  const assigneeMatch = input.match(/\b(?:for|to|@)\s+([a-z][\w\s.'-]{1,50}|\+?\d{10,15})\b/i);
+  const assigneeMatch = input.match(/\b(for|to|@)\s+([a-z][\w\s.'-]{1,50}|\+?\d{10,15})\b/i);
   if (assigneeMatch) {
-    assignedTo = assigneeMatch[1].trim();
+    assigneePreposition = assigneeMatch[1];
+    assigneeToken = assigneeMatch[2].trim();
+    assignedTo = assigneeToken;
     title = input.replace(assigneeMatch[0], '').trim();
   }
 
@@ -140,7 +159,13 @@ function parseTaskCommand(input) {
     }
   }
 
-  return { title: sanitizeInput(title), assignedTo, dueAt };
+  return {
+    title: sanitizeInput(title),
+    assignedTo,
+    dueAt,
+    assigneeToken,
+    assigneePreposition,
+  };
 }
 
 // Detect @everyone broadcast
@@ -185,7 +210,7 @@ module.exports = async function tasksHandler(
     const tier = userProfile?.subscription_tier || 'starter';
 
     // OPTIONAL: allow upstream router to pass structured args
-    // e.g., conversation.js sets res.locals.intentArgs = { title, dueAt, assigneeName|assignee }
+    // e.g., conversation.js sets res.locals.intentArgs = { title, dueAt, assigneeName }
     const routed = res?.locals?.intentArgs || null;
 
     // --- LIST: "tasks" / "my tasks" / "my tasks done"
@@ -329,30 +354,30 @@ module.exports = async function tasksHandler(
     }
 
     // --- CREATE via upstream router (structured) OR via plain text command
+
     // Preferred path when conversation.js routed intent with args:
     if (routed?.title) {
-      // resolve assignee if router provided a name or number
+      let title = sanitizeInput(routed.title);
       let resolvedAssignee = from;
       let assigneeLabel = userProfile?.name || from;
 
-      const assigneeInput = routed.assigneeName || routed.assignee || null;
-      if (assigneeInput) {
-        if (/^\+?\d{10,15}$/.test(assigneeInput)) {
-          const user = await getUserBasic(assigneeInput);
-          if (user?.user_id) {
-            resolvedAssignee = user.user_id;
-            assigneeLabel = user?.name || assigneeInput;
-          } else {
-            return res.send(RESP(`⚠️ User "${assigneeInput}" not found. Try their phone number or exact name.`));
-          }
+      if (routed.assigneeName) {
+        // Try to resolve teammate; if not found, keep "to <name>" in title and assign to sender
+        let found = null;
+        if (/^\+?\d{10,15}$/.test(routed.assigneeName)) {
+          const user = await getUserBasic(routed.assigneeName);
+          if (user?.user_id) found = user;
         } else {
-          const user = await getUserByName(ownerId, assigneeInput);
-          if (user?.user_id) {
-            resolvedAssignee = user.user_id;
-            assigneeLabel = user?.name || assigneeInput;
-          } else {
-            return res.send(RESP(`⚠️ User "${assigneeInput}" not found. Try their phone number or exact name.`));
-          }
+          const user = await getUserByName(ownerId, routed.assigneeName);
+          if (user?.user_id) found = user;
+        }
+
+        if (found) {
+          resolvedAssignee = found.user_id;
+          assigneeLabel = found?.name || routed.assigneeName;
+        } else {
+          // External person → put back into the title for context
+          title = reinstateAssigneeInTitle(title, 'to', routed.assigneeName);
         }
       }
 
@@ -360,7 +385,7 @@ module.exports = async function tasksHandler(
         ownerId,
         createdBy: from,
         assignedTo: resolvedAssignee,
-        title: routed.title,
+        title,
         body: null,
         type: 'general',
         dueAt: routed.dueAt || null,
@@ -388,9 +413,10 @@ module.exports = async function tasksHandler(
     {
       const m = body.match(/^task(?:\s*[:\-])?\s+(.+)$/i);
       if (m) {
-        const { title, assignedTo, dueAt } = parseTaskCommand(m[1]);
-        if (!title) return res.send(RESP('⚠️ Task title is required. Try "task - buy tape".'));
+        const { title: rawTitle, assignedTo, dueAt, assigneeToken, assigneePreposition } = parseTaskCommand(m[1]);
+        if (!rawTitle) return res.send(RESP('⚠️ Task title is required. Try "task - buy tape".'));
 
+        let title = rawTitle;
         let resolvedAssignee = null;
         let assigneeLabel = null;
 
@@ -404,8 +430,12 @@ module.exports = async function tasksHandler(
             resolvedAssignee = user?.user_id || null;
             assigneeLabel = assignedTo;
           }
+
           if (!resolvedAssignee) {
-            return res.send(RESP(`⚠️ User "${assignedTo}" not found. Try their phone number or exact name.`));
+            // Not a teammate → keep the mention in the title and assign to sender
+            title = reinstateAssigneeInTitle(title, assigneePreposition || 'to', assigneeToken || assignedTo);
+            resolvedAssignee = from;
+            assigneeLabel = userProfile?.name || from;
           }
         } else {
           // default: assign to sender

@@ -3,7 +3,7 @@
 // • "tasks" / "my tasks" / "my tasks done" → list mine
 // • "inbox tasks" / "inbox tasks done" (owner/board only)
 // • "tasks for Jon" → list someone else’s (owner/board only)
-// • "task - <title> [for <name|phone>] [due <time>]" → create
+// • "task - <title> [for|to|@ <name|phone>] [due <time>|tonight|tomorrow|by <time>]" → create
 // • "task @everyone - <title>" → create one task per teammate + DM
 // • "done 12" / "reopen 12"
 // Keeps: daily creation limits by subscription tier
@@ -42,7 +42,7 @@ async function checkTaskLimit(ownerId, userId, tier) {
   const { rows } = await query(
     `
     SELECT COUNT(*) AS count
-      FROM tasks
+      FROM public.tasks
      WHERE owner_id = $1
        AND created_by = $2
        AND DATE(created_at AT TIME ZONE 'UTC') = CURRENT_DATE
@@ -75,26 +75,70 @@ function cap(s = '') {
     .join(' ');
 }
 
+// Natural due parsing to catch “tonight/tomorrow/by 5pm”
+function parseNaturalDue(source) {
+  const txt = String(source || '');
+  let dueAt = null;
+
+  // “tonight” → today 9pm
+  if (/\btonight\b/i.test(txt)) {
+    const d = new Date();
+    d.setHours(21, 0, 0, 0);
+    dueAt = d.toISOString();
+  }
+
+  // “tomorrow” → tomorrow 9am (unless a more specific time is parsed below)
+  if (!dueAt && /\btomorrow\b/i.test(txt)) {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    d.setHours(9, 0, 0, 0);
+    dueAt = d.toISOString();
+  }
+
+  // “by 5pm/by 17:30” etc. Let chrono take a swing at everything too.
+  // Chrono handles “by” phrases and many natural variants.
+  const chronoDate = chrono.parseDate(txt);
+  if (chronoDate) {
+    dueAt = new Date(chronoDate).toISOString();
+  }
+
+  return dueAt;
+}
+
 // Parse task command for title, assignee, due date
 function parseTaskCommand(input) {
   let title = input;
   let assignedTo = null;
   let dueAt = null;
 
-  // assignee: "for <name|+15551234567>"
-  const assigneeMatch = input.match(/\bfor\s+([a-z][\w\s.'-]{1,50}|\+?\d{10,15})\b/i);
+  // assignee: "for|to|@ <name|+15551234567>"
+  const assigneeMatch = input.match(/\b(?:for|to|@)\s+([a-z][\w\s.'-]{1,50}|\+?\d{10,15})\b/i);
   if (assigneeMatch) {
     assignedTo = assigneeMatch[1].trim();
     title = input.replace(assigneeMatch[0], '').trim();
   }
 
-  // due date: "due <...>"
+  // due date explicit: "due <...>"
   const dueMatch = title.match(/\bdue\s+(.+)$/i);
   if (dueMatch) {
     const dueText = dueMatch[1].trim();
     const parsed = chrono.parseDate(dueText);
     if (parsed) dueAt = new Date(parsed).toISOString();
     title = title.replace(dueMatch[0], '').trim();
+  }
+
+  // natural due hints anywhere in the remaining title
+  if (!dueAt) {
+    const natural = parseNaturalDue(title);
+    if (natural) {
+      dueAt = natural;
+      // strip common words so they don't bloat the title
+      title = title
+        .replace(/\b(tonight|tomorrow)\b/ig, '')
+        .replace(/\bby\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/ig, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+    }
   }
 
   return { title: sanitizeInput(title), assignedTo, dueAt };
@@ -118,7 +162,7 @@ async function getTeamMembers(ownerId) {
   const { rows } = await query(
     `
     SELECT user_id, name, phone, role
-      FROM users
+      FROM public.users
      WHERE owner_id = $1
        AND phone IS NOT NULL
      ORDER BY (CASE WHEN role = 'owner' THEN 0 ELSE 1 END), name
@@ -140,6 +184,10 @@ module.exports = async function tasksHandler(
   try {
     const body = norm(input);
     const tier = userProfile?.subscription_tier || 'starter';
+
+    // OPTIONAL: allow upstream router to pass structured args
+    // e.g., conversation.js sets res.locals.intentArgs = { title, dueAt, assigneeName }
+    const routed = res?.locals?.intentArgs || null;
 
     // --- LIST: "tasks" / "my tasks" / "my tasks done"
     {
@@ -228,8 +276,9 @@ module.exports = async function tasksHandler(
       }
     }
 
-    // --- CREATE LIMIT
-    if (/^task\b/i.test(body)) {
+    // --- CREATE LIMIT (applies to all create paths)
+    const isTasky = /^task\b/i.test(body) || !!routed?.title;
+    if (isTasky) {
       const canCreate = await checkTaskLimit(ownerId, from, tier);
       if (!canCreate) {
         const lim = TASK_LIMITS[String(tier || 'starter').toLowerCase()].maxTasksPerDay;
@@ -280,7 +329,62 @@ module.exports = async function tasksHandler(
       }
     }
 
-    // --- CREATE: "task - <title> [for <name|phone>] [due <time>]"
+    // --- CREATE via upstream router (structured) OR via plain text command
+    // Preferred path when conversation.js routed intent with args:
+    if (routed?.title) {
+      // resolve assignee if router provided a name
+      let resolvedAssignee = from;
+      let assigneeLabel = userProfile?.name || from;
+
+      if (routed.assigneeName) {
+        if (/^\+?\d{10,15}$/.test(routed.assigneeName)) {
+          const user = await getUserBasic(routed.assigneeName);
+          if (user?.user_id) {
+            resolvedAssignee = user.user_id;
+            assigneeLabel = user?.name || routed.assigneeName;
+          } else {
+            return res.send(RESP(`⚠️ User "${routed.assigneeName}" not found. Try their phone number or exact name.`));
+          }
+        } else {
+          const user = await getUserByName(ownerId, routed.assigneeName);
+          if (user?.user_id) {
+            resolvedAssignee = user.user_id;
+            assigneeLabel = user?.name || routed.assigneeName;
+          } else {
+            return res.send(RESP(`⚠️ User "${routed.assigneeName}" not found. Try their phone number or exact name.`));
+          }
+        }
+      }
+
+      const task = await createTask({
+        ownerId,
+        createdBy: from,
+        assignedTo: resolvedAssignee,
+        title: routed.title,
+        body: null,
+        type: 'general',
+        dueAt: routed.dueAt || null,
+      });
+
+      let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
+      if (resolvedAssignee !== from) {
+        reply += `\nAssigned to: ${cap(assigneeLabel)}`;
+        try {
+          await sendMessage(
+            resolvedAssignee,
+            `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${
+              routed.dueAt ? `, due ${fmtDate(routed.dueAt)}` : ''
+            }`
+          );
+        } catch (e) {
+          console.warn('[tasks] Assignee notification failed:', e.message);
+        }
+      }
+      if (routed.dueAt) reply += `\nDue: ${fmtDate(routed.dueAt)}`;
+      return res.send(RESP(reply));
+    }
+
+    // Text command path: "task - ..." or "task ..."
     {
       const m = body.match(/^task(?:\s*[:\-])?\s+(.+)$/i);
       if (m) {
@@ -350,7 +454,8 @@ module.exports = async function tasksHandler(
         RESP(
           `Try:
 - "tasks" or "my tasks" or "my tasks done"
-- "task - buy tape" or "task - buy tape for Jon due tomorrow"
+- "task - buy tape" or "task buy tape for Jon due tomorrow"
+- "task email quote to Dylan tonight"
 - "task @everyone - be on time tomorrow"
 - "inbox tasks" (owner/board)
 - "tasks for Jon" (owner/board)

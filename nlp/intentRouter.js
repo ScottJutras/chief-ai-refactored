@@ -1,5 +1,6 @@
 // nlp/intentRouter.js
 const OpenAI = require("openai");
+const { looksLikeTask, parseTaskUtterance } = require("./task_intents"); // ← NEW
 
 const client = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -166,7 +167,6 @@ async function routeWithAI(text, context = {}) {
 
     const messages = [
       { role: "system", content: SYSTEM.trim() },
-      // You can thread minimal context to help disambiguate without leaking PII:
       ...(context?.userProfile?.name ? [{ role: "system", content: `User name: ${context.userProfile.name}` }] : []),
       { role: "user", content: text }
     ];
@@ -177,7 +177,6 @@ async function routeWithAI(text, context = {}) {
       messages,
       tools,
       tool_choice: "auto",
-      // small cap to discourage verbose non-tool replies
       max_tokens: 100,
     });
 
@@ -194,31 +193,56 @@ async function routeWithAI(text, context = {}) {
 
     const name = call.function?.name || call.name;
     let args = {};
-    try {
-      args = JSON.parse(call.function?.arguments || call.arguments || "{}");
-    } catch { args = {}; }
+    try { args = JSON.parse(call.function?.arguments || call.arguments || "{}"); }
+    catch { args = {}; }
 
     switch (name) {
       case "timeclock_clock_in":   return { intent: "timeclock.clock_in",   args };
       case "timeclock_clock_out":  return { intent: "timeclock.clock_out",  args };
       case "job_create":           return { intent: "job.create",           args };
       case "expense_add":          return { intent: "expense.add",          args };
-
-      // Optional extended intents (match your conversation.js)
       case "tasks_list":           return { intent: "tasks.list",           args };
       case "tasks_assign_all":     return { intent: "tasks.assign_all",     args };
       case "quote_send":           return { intent: "quote.send",           args };
       case "budget_set":           return { intent: "budget.set",           args };
       case "memory_forget":        return { intent: "memory.forget",        args };
       case "memory_show":          return { intent: "memory.show",          args };
-
       default: return null;
     }
   } catch (err) {
-    // Fail silent → let deterministic router handle it
     console.warn("[intentRouter] AI route error:", err?.message);
     return null;
   }
 }
 
-module.exports = { routeWithAI };
+/**
+ * route(text, context) -> { intent, args } | null
+ * Deterministic fast-path → then AI tools → else null.
+ */
+async function route(text, context = {}) {
+  const t = String(text || "").trim();
+  if (!t) return null;
+
+  // 1) Deterministic "task" fast-path FIRST (prevents falling into expense/timesheet prompts)
+  if (looksLikeTask(t)) {
+    const parsed = parseTaskUtterance(t, { tz: context.tz || "America/Toronto", now: context.now });
+    // We only parse here. Creation happens in conversation.js / handler.
+    return {
+      intent: "tasks.create_from_utterance",
+      args: {
+        title: parsed.title,
+        dueAt: parsed.dueAt,            // ISO
+        assigneeName: parsed.assignee,  // resolve to user_id in handler
+      }
+    };
+  }
+
+  // 2) Otherwise, try the strict tool-based router
+  const ai = await routeWithAI(t, context);
+  if (ai) return ai;
+
+  // 3) No match
+  return null;
+}
+
+module.exports = { route, routeWithAI };

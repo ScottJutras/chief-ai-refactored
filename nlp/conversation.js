@@ -1,12 +1,13 @@
 // nlp/conversation.js
-// 1) Fuzzy match (fast) against commandCatalog.json
-// 2) If confidence is low, fall back to nlp/intentRouter.js tool-calls
-// 3) Output TwiML (clarify) OR a normalized command your handlers accept
+// 1) Pending time-prompt fast path
+// 2) Deterministic + AI router (intentRouter.route) → includes task NLP fast-path
+// 3) Fuzzy catalog match fallback
+// 4) Output TwiML (clarify) OR a normalized command your handlers accept
 
 const fs = require('fs');
 const path = require('path');
-const { query } = require('../services/postgres'); // only if you query here
-const { routeWithAI } = require('./intentRouter');
+const { route } = require('./intentRouter');               // ⬅️ use the new router (deterministic + tools)
+const { routeWithAI } = require('./intentRouter');          // still use as a fallback if you want
 const { getMemory, upsertMemory, forget } = require('../services/memory');
 const { getPendingPrompt } = require('../services/postgres');
 
@@ -47,7 +48,7 @@ function charSim(a, b) {
   return 1 - dist / base;
 }
 
-// ---------------- intent match ----------------
+// ---------------- intent match (catalog fuzzy) ----------------
 function matchIntent(userText) {
   const input = normalize(userText);
   let best = { key: null, score: 0, via: '' };
@@ -67,11 +68,11 @@ function matchIntent(userText) {
   return best;
 }
 
-// ---------------- slot extraction ----------------
+// ---------------- slot extraction (catalog) ----------------
 function extractSlots(key, userText, convoState, memory) {
   const text = userText || '';
   const lc = normalize(userText);
-  const slots = {};
+  let slots = {};
 
   if (key === 'tasks.create') {
     let m = text.match(/^\s*(?:task[s]?|todo|remind me to|note to|please remember)\s*[:\-]?\s*(.+)$/i);
@@ -80,10 +81,6 @@ function extractSlots(key, userText, convoState, memory) {
       m = text.match(/task(?:s)?\b.*?(?:-|\:)\s*(.+)$/i);
       if (m && m[1]) slots.title = m[1].trim().slice(0, 140);
     }
-  }
-
-  if (key === 'tasks.list') {
-    // no slots needed
   }
 
   if (key === 'tasks.assign_all') {
@@ -139,12 +136,6 @@ function extractSlots(key, userText, convoState, memory) {
       slots.job = convoState?.last_args?.job || memory?.['default.expense.bucket']?.bucket || 'Overhead';
     }
   }
-  if (def.contextual_defaults?.client && !slots.client) {
-    slots = slots; // no-op; left for parity with your structure
-  }
-  if (def.contextual_defaults?.quote_id && !slots.quote_id) {
-    slots = slots;
-  }
 
   return slots;
 }
@@ -195,30 +186,56 @@ function normalizeForHandlers(key, slots) {
 }
 
 // ---------------- main ----------------
-async function converseAndRoute(userText, { userProfile, ownerId, convoState, memory } = {}) {
-  // ⬇️⬇️⬇️ FAST-PATH FOR TIME PROMPTS ⬇️⬇️⬇️
+async function converseAndRoute(userText, { userProfile, ownerId, convoState = {}, memory } = {}) {
+  // 0) Time-prompt fast path (don’t break existing time capture flows)
   try {
     const pending = await getPendingPrompt(ownerId);
     if (pending) {
-      // While a timeclock prompt is open, route EVERYTHING to timeclock.
-      // Pass the raw text through so time parsing (e.g., “5:40 yesterday”) works.
       return {
         handled: false,
         route: 'timeclock',
-        normalized: userText,                 // pass raw text intact
+        normalized: userText,
         intent: 'timeclock.pending_prompt'
       };
     }
   } catch (e) {
-    // non-fatal; continue with normal routing
     console.warn('[conversation] pending prompt check failed:', e?.message);
   }
-  // ⬆️⬆️⬆️ FAST-PATH FOR TIME PROMPTS ⬆️⬆️⬆️
 
+  // 1) Deterministic router (includes task fast-path) → avoids “Is this expense/revenue/timesheet?” misfires
+  const fast = await route(userText, {
+    userProfile,
+    tz: convoState?.tz || 'America/Toronto',
+    now: new Date(),
+    convoState,
+    memory
+  });
+
+  if (fast?.intent === 'tasks.create_from_utterance') {
+    // Don’t create here; return normalized command + rich args for the task handler.
+    const { title, dueAt, assigneeName } = fast.args || {};
+    const confirmTxt = assigneeName
+      ? `Task for ${assigneeName}: “${title}” (due ${new Date(dueAt).toLocaleString()})`
+      : `Task: “${title}” (due ${new Date(dueAt).toLocaleString()})`;
+
+    return {
+      handled: false,
+      route: 'tasks',
+      normalized: `task - ${title}`,            // keep your downstream shape
+      intent: 'tasks.create_from_utterance',
+      args: { title, dueAt, assigneeName },     // pass structured args to handler
+      twiml: `<Response><Message>${CFO.confirm(confirmTxt)}</Message></Response>`
+    };
+  } else if (fast) {
+    // Other AI/tool intents landed; let the old mapping keep working if needed.
+    // (You can add more direct mappings here if you want.)
+  }
+
+  // 2) Fuzzy catalog fallback (kept as-is)
   const input = normalize(userText);
   let { key, score } = matchIntent(userText);
 
-  // fall back to tool-calls if low confidence
+  // 3) If still low confidence, try AI tools-only fallback to fill your older mapping
   if (!key || score < MID) {
     try {
       const ai = await routeWithAI(userText, { userProfile, convoState, memory });
@@ -289,8 +306,7 @@ async function converseAndRoute(userText, { userProfile, ownerId, convoState, me
     return { handled: true, twiml: `<Response><Message>${response}</Message></Response>` };
   }
   if (key === 'memory.forget') {
-    const poolLocal = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-    await poolLocal.query(`DELETE FROM user_memory WHERE tenant_id=$1 AND user_id=$2 AND key=$3`, [ownerId, userProfile.user_id, slots.key]);
+    await forget(ownerId, userProfile.user_id, slots.key); // ⬅️ use your memory helper (no raw Pool)
     const response = CFO.confirm(`Forgot ${slots.key}. Anything else?`);
     return { handled: true, twiml: `<Response><Message>${response}</Message></Response>` };
   }
@@ -301,7 +317,13 @@ async function converseAndRoute(userText, { userProfile, ownerId, convoState, me
     const response = CFO.confirm(
       `${def.confirm.replace(/\{.*?\}/g, v => slots[v.slice(1, -1)] || '')} ${def.follow_up_prompts?.[0] || 'What’s next?'}`
     );
-    return { handled: false, ...norm, twiml: `<Response><Message>${response}</Message></Response>`, intent: key, args: slots };
+    return {
+      handled: false,
+      ...norm,
+      twiml: `<Response><Message>${response}</Message></Response>`,
+      intent: key,
+      args: slots
+    };
   }
 
   // fallback

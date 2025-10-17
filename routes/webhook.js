@@ -248,32 +248,55 @@ try {
       }
 
       // Otherwise, try to parse a time directly from their reply (user timezone aware)
-      const tz = (userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto');
-const ref = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
-const dt = chrono.parseDate(input, ref);
+      const tz = getUserTz(userProfile);
+
+// Compute the user's timezone offset (in minutes) at "now"
+function getTzOffsetMinutes(tz) {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).formatToParts(now);
+
+  // Build a "YYYY-MM-DDTHH:mm:ss" string as if it were local in that TZ
+  const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  const localIso = `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}`;
+
+  // Date.parse(localIso) produces a timestamp *in local server tz*; compare to UTC to get offset
+  const asLocal = Date.parse(localIso);
+  const asUtc   = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
+
+  // offset in minutes (e.g., Toronto in summer ≈ -240)
+  return (asUtc - asLocal) / 60000;
+}
+
+const offsetMinutes = getTzOffsetMinutes(tz);
+
+// Use chrono.parse (NOT parseDate) so we can pass { timezone }
+const results = chrono.parse(input, new Date(), { timezone: offsetMinutes, forwardDate: true });
+if (!results || !results[0]) {
+  return res.status(200).type('text/xml')
+    .send(twiml(`I couldn't find a time in that. Try "7pm tonight" or "tomorrow 8am".`));
+}
+
+const dt = results[0].date(); // <-- correct instant
+const remindAtIso = dt.toISOString();
+
+await createReminder({
+  ownerId: pendingReminder.ownerId,
+  userId: pendingReminder.userId,
+  taskNo: pendingReminder.taskNo,
+  taskTitle: pendingReminder.taskTitle,
+  remindAt: remindAtIso
+});
+await deletePendingTransactionState(from);
+
+return res.status(200).type('text/xml')
+  .send(twiml(`Got it. Reminder set for ${new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz })}.`));
 
 
-      if (!dt) {
-        return res
-          .status(200)
-          .type('text/xml')
-          .send(`<Response><Message>I couldn't find a time in that. Try "7pm tonight" or "tomorrow 8am".</Message></Response>`);
-      }
-
-      const remindAtIso = new Date(dt).toISOString();
-      await createReminder({
-        ownerId: pendingReminder.ownerId,
-        userId: pendingReminder.userId,
-        taskNo: pendingReminder.taskNo,
-        taskTitle: pendingReminder.taskTitle,
-        remindAt: remindAtIso
-      });
-
-      await deletePendingTransactionState(from);
-      return res
-        .status(200)
-        .type('text/xml')
-        .send(`<Response><Message>Got it. Reminder set for ${new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz })}.</Message></Response>`);
     }
   }
 
@@ -938,12 +961,20 @@ router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) 
         console.warn('[reminders/cron] send failed:', r.id, e?.message);
       }
     }
+console.log('[reminders/cron] hit', {
+  isVercelCron: req.headers['x-vercel-cron'],
+  slug: req.params.slug || null,
+  now: new Date().toISOString()
+});
 
     return res.status(200).json({ ok: true, sent, checked: due.length });
   } catch (e) {
     console.error('[reminders/cron] error:', e?.message);
     return next(e);
+    
   }
+  
+  
 });
 
 

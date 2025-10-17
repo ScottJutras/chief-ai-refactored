@@ -27,6 +27,9 @@ const { getPendingTransactionState, setPendingTransactionState, deletePendingTra
 const { routeWithAI } = require('../nlp/intentRouter');           // tool-calls (strict)
 const { converseAndRoute } = require('../nlp/conversation');
 
+// NLP task helpers (NEW)
+const { looksLikeTask, parseTaskUtterance } = require('../nlp/task_intents');
+
 // Memory
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
@@ -179,109 +182,136 @@ router.post(
 
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
 
-    // ⬇️⬇️⬇️ NEW: Handle pending confirmations for TEXT-ONLY replies (no media) ⬇️⬇️⬇️
+    // ---------- NEW: FAST-PATH TASKS ----------
+    // Detect "task ..." or task-ish utterances (e.g., "... tonight/tomorrow/by 5pm") and handle BEFORE pending confirmations.
     try {
-      const pendingState = await getPendingTransactionState(from);
-      const hasPending = !!pendingState?.pendingMedia;
-      const isTextOnly = !mediaUrl && !!input;
+      const body = String(input || '');
+      if (/^task\b/i.test(body) || looksLikeTask(body)) {
+        // Clear any stale pending state (receipt, revenue, timesheet prompts)
+        try { await deletePendingTransactionState(from); } catch (_) {}
 
-      if (hasPending && isTextOnly) {
-        const type = pendingState.pendingMedia.type; // may be null
-        const lcInput = String(input || '').toLowerCase().trim();
+        // Build structured args → tasks handler prefers res.locals.intentArgs when present
+        const parsed = parseTaskUtterance(body, { tz: getUserTz(userProfile), now: new Date() });
+        res.locals = res.locals || {};
+        res.locals.intentArgs = {
+          title: parsed.title,
+          dueAt: parsed.dueAt,
+          assigneeName: parsed.assignee
+        };
 
-        // Hours inquiry → expect “today / week / month”
-        if (type === 'hours_inquiry') {
-          const m = lcInput.match(/\b(today|day|this day|week|this week|month|this month)\b/i);
-          if (m) {
-            const raw = m[1].toLowerCase();
-            const period = raw.includes('week') ? 'week' : raw.includes('month') ? 'month' : 'day';
-            const tz = getUserTz(userProfile);
-            const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
-            const { message } = await generateTimesheet({
-              ownerId,
-              person: name,
-              period,
-              tz,
-              now: new Date()
-            });
-            await deletePendingTransactionState(from);
-            return res.status(200).type('text/xml').send(twiml(message));
-          }
-          // Not a valid period → re-prompt
-          return res
-            .status(200)
-            .type('text/xml')
-            .send(twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`));
-        }
+        return tasksHandler(from, body, userProfile, ownerId, ownerProfile, isOwner, res);
+      }
+    } catch (e) {
+      console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
+    }
+    // ---------- END FAST-PATH TASKS ----------
 
-        // Expense / Revenue / Time entry confirmation
-        if (type === 'expense' || type === 'revenue' || type === 'time_entry') {
-          if (lcInput === 'yes') {
-            if (type === 'expense') {
-              const data = pendingState.pendingExpense;
-              await appendToUserSpreadsheet(ownerId, [
-                data.date,
-                data.item,
-                data.amount,
-                data.store,
-                (await getActiveJob(ownerId)) || 'Uncategorized',
-                'expense',
-                data.category,
-                data.mediaUrl || null,
-                userProfile.name || 'Unknown',
-              ]);
-              await deletePendingTransactionState(from);
-              return res.status(200).type('text/xml')
-                .send(twiml(`✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`));
-            }
-            if (type === 'revenue') {
-              const data = pendingState.pendingRevenue;
-              await appendToUserSpreadsheet(ownerId, [
-                data.date,
-                data.description,
-                data.amount,
-                data.source,
-                (await getActiveJob(ownerId)) || 'Uncategorized',
-                'revenue',
-                data.category,
-                data.mediaUrl || null,
-                userProfile.name || 'Unknown',
-              ]);
-              await deletePendingTransactionState(from);
-              return res.status(200).type('text/xml')
-                .send(twiml(`✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`));
-            }
-            if (type === 'time_entry') {
-              const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
-              await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
+    // ⬇️⬇️⬇️ Handle pending confirmations for TEXT-ONLY replies (no media) — SKIPS task-like messages ⬇️⬇️⬇️
+    try {
+      const isTasky = /^task\b/i.test(input) || looksLikeTask(input || '');
+      if (!isTasky) {
+        const pendingState = await getPendingTransactionState(from);
+        const hasPending = !!pendingState?.pendingMedia;
+        const isTextOnly = !mediaUrl && !!input;
+
+        if (hasPending && isTextOnly) {
+          const type = pendingState.pendingMedia.type; // may be null
+          const lcInput = String(input || '').toLowerCase().trim();
+
+          // Hours inquiry → expect “today / week / month”
+          if (type === 'hours_inquiry') {
+            const m = lcInput.match(/\b(today|day|this day|week|this week|month|this month)\b/i);
+            if (m) {
+              const raw = m[1].toLowerCase();
+              const period = raw.includes('week') ? 'week' : raw.includes('month') ? 'month' : 'day';
               const tz = getUserTz(userProfile);
+              const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
+              const { message } = await generateTimesheet({
+                ownerId,
+                person: name,
+                period,
+                tz,
+                now: new Date()
+              });
+              await deletePendingTransactionState(from);
+              return res.status(200).type('text/xml').send(twiml(message));
+            }
+            // Not a valid period → re-prompt
+            return res
+              .status(200)
+              .type('text/xml')
+              .send(twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`));
+          }
+
+          // Expense / Revenue / Time entry confirmation
+          if (type === 'expense' || type === 'revenue' || type === 'time_entry') {
+            if (lcInput === 'yes') {
+              if (type === 'expense') {
+                const data = pendingState.pendingExpense;
+                await appendToUserSpreadsheet(ownerId, [
+                  data.date,
+                  data.item,
+                  data.amount,
+                  data.store,
+                  (await getActiveJob(ownerId)) || 'Uncategorized',
+                  'expense',
+                  data.category,
+                  data.mediaUrl || null,
+                  userProfile.name || 'Unknown',
+                ]);
+                await deletePendingTransactionState(from);
+                return res.status(200).type('text/xml')
+                  .send(twiml(`✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`));
+              }
+              if (type === 'revenue') {
+                const data = pendingState.pendingRevenue;
+                await appendToUserSpreadsheet(ownerId, [
+                  data.date,
+                  data.description,
+                  data.amount,
+                  data.source,
+                  (await getActiveJob(ownerId)) || 'Uncategorized',
+                  'revenue',
+                  data.category,
+                  data.mediaUrl || null,
+                  userProfile.name || 'Unknown',
+                ]);
+                await deletePendingTransactionState(from);
+                return res.status(200).type('text/xml')
+                  .send(twiml(`✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`));
+              }
+              if (type === 'time_entry') {
+                const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
+                await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
+                const tz = getUserTz(userProfile);
+                await deletePendingTransactionState(from);
+                return res.status(200).type('text/xml')
+                  .send(twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${new Date(timestamp).toLocaleString('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit' })}${job ? ` on ${job}` : ''}`));
+              }
+            }
+
+            if (lcInput === 'no' || lcInput === 'cancel') {
               await deletePendingTransactionState(from);
               return res.status(200).type('text/xml')
-                .send(twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${new Date(timestamp).toLocaleString('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit' })}${job ? ` on ${job}` : ''}`));
+                .send(twiml(`❌ ${friendlyTypeLabel(type)} cancelled.`));
             }
-          }
 
-          if (lcInput === 'no' || lcInput === 'cancel') {
-            await deletePendingTransactionState(from);
+            if (lcInput === 'edit') {
+              await deletePendingTransactionState(from);
+              return res.status(200).type('text/xml')
+                .send(twiml(`Please resend the ${friendlyTypeLabel(type)} details.`));
+            }
+
+            // Not yes/no/edit → gentle nudge
             return res.status(200).type('text/xml')
-              .send(twiml(`❌ ${friendlyTypeLabel(type)} cancelled.`));
+              .send(twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${friendlyTypeLabel(type)}.`));
           }
 
-          if (lcInput === 'edit') {
-            await deletePendingTransactionState(from);
+          // Pending type is null (we previously asked “expense/revenue/timesheet?”)
+          if (type == null) {
             return res.status(200).type('text/xml')
-              .send(twiml(`Please resend the ${friendlyTypeLabel(type)} details.`));
+              .send(twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`));
           }
-
-          // Not yes/no/edit → gentle nudge
-          return res.status(200).type('text/xml')
-            .send(twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${friendlyTypeLabel(type)}.`));
-        }
-
-        // Pending type is null (we previously asked “expense/revenue/timesheet?”)
-        if (type == null) {
-          return res.status(200).type('text/xml')
-            .send(twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`));
         }
       }
     } catch (e) {

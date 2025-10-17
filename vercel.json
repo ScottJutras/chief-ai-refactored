@@ -7,9 +7,8 @@
   ],
   "crons": [
     {
-      "path": "/webhook/reminders/cron",
-      "schedule": "*/5 * * * *",
-      "headers": { "x-cron-secret": "4bf3e4de8ccc4713119b79959f0ac990af24ca2ea5e348ff462b1d7958ae424e" }
+      "path": "/webhook/reminders/cron/4bf3e4de8ccc4713119b79959f0ac990af24ca2ea5e348ff462b1d7958ae424e",  
+      "schedule": "0 13 * * *"
     }
   ]
 }

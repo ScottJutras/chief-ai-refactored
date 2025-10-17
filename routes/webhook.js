@@ -206,57 +206,79 @@ router.post(
     }
     // ---------- END FAST-PATH TASKS ----------
 
-    // ⬇️ Handle pending confirmations for TEXT-ONLY replies (reminders first) ⬇️
+   // === REMINDERS-FIRST SHORT-CIRCUIT ===
+// Place this RIGHT AFTER you derive `from`, `input`, `mediaUrl`, `mediaType`
 try {
   const pendingState = await getPendingTransactionState(from);
   const isTextOnly = !mediaUrl && !!input;
 
-  // ---- B) Pending reminder flow (handle this FIRST; do not gate on isTasky)
   if (pendingState?.pendingReminder && isTextOnly) {
+    console.log('[WEBHOOK] pendingReminder present for', from, 'input=', input);
     const { pendingReminder } = pendingState;
     const lc = String(input || '').trim().toLowerCase();
-    const chrono = require('chrono-node');
-    const { createReminder } = require('../services/reminders');
 
-    // accept “no/cancel” to skip
-    if (lc === 'no' || lc === 'cancel') {
+    // Treat common confirmations as part of reminder flow when pending
+    const looksLikeReminderReply =
+  lc === 'yes' || lc === 'yes.' || lc === 'yep' || lc === 'yeah' ||
+  lc === 'no' || lc === 'no.' || lc === 'cancel' ||
+  /\bremind\b/i.test(input) ||                 // covers “remind me …”
+  /\bin\s+\d+\s+(min|mins|minutes?|hours?|days?)\b/i.test(lc);  // “in 2 minutes”
+
+
+    if (looksLikeReminderReply) {
+      const chrono = require('chrono-node');
+      const { createReminder } = require('../services/reminders');
+
+      // accept “no/cancel” to skip
+      if (lc === 'no' || lc === 'cancel') {
+        await deletePendingTransactionState(from);
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(`<Response><Message>No problem — no reminder set.</Message></Response>`);
+      }
+
+      // if they just said “yes” (and no explicit time), ask for a time
+      const saidYesOnly = /^(yes\.?|yep|yeah)\s*$/i.test(input.trim());
+      if (saidYesOnly) {
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(`<Response><Message>Great — what time should I remind you? (e.g., "7pm tonight" or "tomorrow 8am")</Message></Response>`);
+      }
+
+      // Otherwise, try to parse a time directly from their reply (user timezone aware)
+      const tz = (userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto');
+const ref = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
+const dt = chrono.parseDate(input, ref);
+
+
+      if (!dt) {
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(`<Response><Message>I couldn't find a time in that. Try "7pm tonight" or "tomorrow 8am".</Message></Response>`);
+      }
+
+      const remindAtIso = new Date(dt).toISOString();
+      await createReminder({
+        ownerId: pendingReminder.ownerId,
+        userId: pendingReminder.userId,
+        taskNo: pendingReminder.taskNo,
+        taskTitle: pendingReminder.taskTitle,
+        remindAt: remindAtIso
+      });
+
       await deletePendingTransactionState(from);
-      return res.status(200).type('text/xml').send(twiml(`No problem — no reminder set.`));
-    }
-
-    // if they just said “yes” → ask for a time
-    if (lc === 'yes') {
       return res
         .status(200)
         .type('text/xml')
-        .send(twiml(`Great — what time should I remind you? (e.g., "7pm tonight" or "tomorrow 8am")`));
+        .send(`<Response><Message>Got it. Reminder set for ${new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz })}.</Message></Response>`);
     }
-
-    // Parse in user's timezone
-    const tz = getUserTz(userProfile);
-const ref = new Date(new Date().toLocaleString('en-US', { timeZone: tz })); // anchor "now" to user TZ
-const dt = chrono.parseDate(input, ref);
-if (!dt) {
-  return res
-    .status(200)
-    .type('text/xml')
-    .send(twiml(`I couldn't find a time in that. Try "7pm tonight" or "tomorrow 8am".`));
-}
-
-const remindAtIso = new Date(dt).toISOString();
-await createReminder({
-  ownerId: pendingReminder.ownerId,
-  userId: pendingReminder.userId,
-  taskNo: pendingReminder.taskNo,
-  taskTitle: pendingReminder.taskTitle,
-  remindAt: remindAtIso
-});
-await deletePendingTransactionState(from);
-return res
-  .status(200)
-  .type('text/xml')
-  .send(twiml(`Got it. Reminder set for ${new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz })}.`));
   }
+
+// === END REMINDERS-FIRST SHORT-CIRCUIT ===
+
   // ---- A) Pending media-driven flows (now we can gate on "taskiness")
   const isTasky = /^task\b/i.test(input) || looksLikeTask(input || '');
   if (!isTasky && isTextOnly && pendingState?.pendingMedia) {

@@ -361,9 +361,7 @@ module.exports = async function tasksHandler(
       }
     }
 
-    // --- CREATE via upstream router (structured) OR via plain text command
-
-// Preferred path when conversation.js routed intent with args:
+    // Preferred path when conversation.js routed intent with args:
 if (routed?.title) {
   let title = sanitizeInput(routed.title);
   let resolvedAssignee = from;
@@ -425,6 +423,7 @@ if (routed?.title) {
         taskTitle: task.title
       }
     });
+    console.log('[tasks] pendingReminder set for', from, 'task #', task.task_no); // <-- moved here
     reply += `\nDo you want me to send you a reminder?`;
   } catch (e) {
     console.warn('[tasks] pendingReminder state set failed:', e?.message);
@@ -499,7 +498,7 @@ if (routed?.title) {
     }
     if (dueAt) reply += `\nDue: ${fmtDate(dueAt)}`;
 
-    // ask about reminder (non-blocking)
+    // reminder prompt
     try {
       await setPendingTransactionState(from, {
         pendingReminder: {
@@ -509,6 +508,7 @@ if (routed?.title) {
           taskTitle: task.title
         }
       });
+      console.log('[tasks] pendingReminder set for', from, 'task #', task.task_no); // <-- moved here
       reply += `\nDo you want me to send you a reminder?`;
     } catch (e) {
       console.warn('[tasks] pendingReminder state set failed:', e?.message);

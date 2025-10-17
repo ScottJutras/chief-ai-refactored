@@ -95,8 +95,7 @@ function parseNaturalDue(source) {
     dueAt = d.toISOString();
   }
 
-  // “by 5pm/by 17:30” etc. Let chrono take a swing at everything too.
-  // Chrono handles “by” phrases and many natural variants.
+  // “by 5pm/by 17:30” etc. Chrono handles “by …” and many variants.
   const chronoDate = chrono.parseDate(txt);
   if (chronoDate) {
     dueAt = new Date(chronoDate).toISOString();
@@ -186,7 +185,7 @@ module.exports = async function tasksHandler(
     const tier = userProfile?.subscription_tier || 'starter';
 
     // OPTIONAL: allow upstream router to pass structured args
-    // e.g., conversation.js sets res.locals.intentArgs = { title, dueAt, assigneeName }
+    // e.g., conversation.js sets res.locals.intentArgs = { title, dueAt, assigneeName|assignee }
     const routed = res?.locals?.intentArgs || null;
 
     // --- LIST: "tasks" / "my tasks" / "my tasks done"
@@ -332,26 +331,27 @@ module.exports = async function tasksHandler(
     // --- CREATE via upstream router (structured) OR via plain text command
     // Preferred path when conversation.js routed intent with args:
     if (routed?.title) {
-      // resolve assignee if router provided a name
+      // resolve assignee if router provided a name or number
       let resolvedAssignee = from;
       let assigneeLabel = userProfile?.name || from;
 
-      if (routed.assigneeName) {
-        if (/^\+?\d{10,15}$/.test(routed.assigneeName)) {
-          const user = await getUserBasic(routed.assigneeName);
+      const assigneeInput = routed.assigneeName || routed.assignee || null;
+      if (assigneeInput) {
+        if (/^\+?\d{10,15}$/.test(assigneeInput)) {
+          const user = await getUserBasic(assigneeInput);
           if (user?.user_id) {
             resolvedAssignee = user.user_id;
-            assigneeLabel = user?.name || routed.assigneeName;
+            assigneeLabel = user?.name || assigneeInput;
           } else {
-            return res.send(RESP(`⚠️ User "${routed.assigneeName}" not found. Try their phone number or exact name.`));
+            return res.send(RESP(`⚠️ User "${assigneeInput}" not found. Try their phone number or exact name.`));
           }
         } else {
-          const user = await getUserByName(ownerId, routed.assigneeName);
+          const user = await getUserByName(ownerId, assigneeInput);
           if (user?.user_id) {
             resolvedAssignee = user.user_id;
-            assigneeLabel = user?.name || routed.assigneeName;
+            assigneeLabel = user?.name || assigneeInput;
           } else {
-            return res.send(RESP(`⚠️ User "${routed.assigneeName}" not found. Try their phone number or exact name.`));
+            return res.send(RESP(`⚠️ User "${assigneeInput}" not found. Try their phone number or exact name.`));
           }
         }
       }

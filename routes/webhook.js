@@ -315,6 +315,43 @@ router.post(
     ]);
 
     try {
+
+// 0.25) NLP routing (conversation.js) → normalize to handlers
+      // Tries fuzzy catalog first, then strict tool-calls. Returns either:
+      //   - handled: true  → already produced TwiML (send it and return)
+      //   - handled: false → gives you { route, normalized, args } for a handler
+      try {
+        const routed = await converseAndRoute(input, {
+          userProfile,
+          ownerId,
+          convoState: state,
+          memory
+        });
+        if (routed) {
+          // If conversation.js already replied, send that and bail.
+          if (routed.handled && routed.twiml) {
+            return res.status(200).type('text/xml').send(routed.twiml);
+          }
+          // If it wants the tasks handler, pass along parsed args
+          if (!routed.handled && routed.route === 'tasks') {
+            res.locals = res.locals || {};
+            res.locals.intentArgs = routed.args || null; // title / assignee / dueAt, etc.
+            return tasksHandler(
+              from,
+              routed.normalized,         // e.g., "task - Email quote"
+              userProfile,
+              ownerId,
+              ownerProfile,
+              isOwner,
+              res
+            );
+          }
+          // You can add similar blocks for other routes (expense, timeclock, etc.) if you like.
+       }
+      } catch (e) {
+       console.warn('[WEBHOOK] NLP route skip:', e?.message);
+      }
+
       // 0) Onboarding
       if ((userProfile && userProfile.onboarding_in_progress) || input.toLowerCase().includes('start onboarding')) {
         const response = await handleOnboarding(from, input, userProfile, ownerId, res);

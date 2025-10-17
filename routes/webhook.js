@@ -886,12 +886,19 @@ if (isTimeclockMessage(input)) {
 );
 
 // ---- Reminders Cron (simple polling) ----
-router.get('/reminders/cron', async (req, res, next) => {
+router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) => {
   try {
-    // poor-man auth so the endpoint isn't public
-    if ((req.query.secret || req.headers['x-cron-secret'] || '') !== process.env.CRON_SECRET) {
-  return res.status(403).send('Forbidden');
-}
+    // Accept if it's the Vercel scheduler...
+    const isVercelCron = req.headers['x-vercel-cron'] === '1';
+
+    // ...or if the slug matches (when using the slugged path)
+    const slugOk = !!req.params.slug && (
+      !process.env.CRON_SECRET || req.params.slug === process.env.CRON_SECRET
+    );
+
+    if (!isVercelCron && !slugOk) {
+      return res.status(403).send('Forbidden');
+    }
 
     const { getDueReminders, markReminderSent } = require('../services/reminders');
     const { sendMessage } = require('../services/twilio');
@@ -916,6 +923,7 @@ router.get('/reminders/cron', async (req, res, next) => {
     return next(e);
   }
 });
+
 
 
 module.exports = router;

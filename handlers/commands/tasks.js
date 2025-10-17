@@ -22,7 +22,7 @@ const {
   getUserByName,
 } = require('../../services/postgres');
 const { sendMessage } = require('../../services/twilio');
-
+const { setPendingTransactionState } = require('../../utils/stateManager');
 const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
 const isOwnerOrBoard = (p) => (p?.role === 'owner' || p?.role === 'board');
 
@@ -74,6 +74,14 @@ function cap(s = '') {
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(' ');
 }
+
+function reinstateAssigneeInTitle(title, prep = 'to', token = '') {
+  const t = String(title || '').trim();
+  const who = String(token || '').trim();
+  if (!who) return sanitizeInput(t);
+  return sanitizeInput(`${t} ${prep} ${who}`.replace(/\s{2,}/g, ' ').trim());
+}
+
 
 // Natural due parsing to catch “tonight/tomorrow/by 5pm”
 function parseNaturalDue(source) {
@@ -355,128 +363,161 @@ module.exports = async function tasksHandler(
 
     // --- CREATE via upstream router (structured) OR via plain text command
 
-    // Preferred path when conversation.js routed intent with args:
-    if (routed?.title) {
-      let title = sanitizeInput(routed.title);
-      let resolvedAssignee = from;
-      let assigneeLabel = userProfile?.name || from;
+// Preferred path when conversation.js routed intent with args:
+if (routed?.title) {
+  let title = sanitizeInput(routed.title);
+  let resolvedAssignee = from;
+  let assigneeLabel = userProfile?.name || from;
 
-      if (routed.assigneeName) {
-        // Try to resolve teammate; if not found, keep "to <name>" in title and assign to sender
-        let found = null;
-        if (/^\+?\d{10,15}$/.test(routed.assigneeName)) {
-          const user = await getUserBasic(routed.assigneeName);
-          if (user?.user_id) found = user;
-        } else {
-          const user = await getUserByName(ownerId, routed.assigneeName);
-          if (user?.user_id) found = user;
-        }
+  if (routed.assigneeName) {
+    // Try to resolve teammate; if not found, keep "to <name>" in title and assign to sender
+    let found = null;
+    if (/^\+?\d{10,15}$/.test(routed.assigneeName)) {
+      const user = await getUserBasic(routed.assigneeName);
+      if (user?.user_id) found = user;
+    } else {
+      const user = await getUserByName(ownerId, routed.assigneeName);
+      if (user?.user_id) found = user;
+    }
 
-        if (found) {
-          resolvedAssignee = found.user_id;
-          assigneeLabel = found?.name || routed.assigneeName;
-        } else {
-          // External person → put back into the title for context
-          title = reinstateAssigneeInTitle(title, 'to', routed.assigneeName);
-        }
-      }
+    if (found) {
+      resolvedAssignee = found.user_id;
+      assigneeLabel = found?.name || routed.assigneeName;
+    } else {
+      // External person → put back into the title for context
+      title = reinstateAssigneeInTitle(title, 'to', routed.assigneeName);
+    }
+  }
 
-      const task = await createTask({
+  const task = await createTask({
+    ownerId,
+    createdBy: from,
+    assignedTo: resolvedAssignee,
+    title,
+    body: null,
+    type: 'general',
+    dueAt: routed.dueAt || null,
+  });
+
+  let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
+  if (resolvedAssignee !== from) {
+    reply += `\nAssigned to: ${cap(assigneeLabel)}`;
+    try {
+      await sendMessage(
+        resolvedAssignee,
+        `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${
+          routed.dueAt ? `, due ${fmtDate(routed.dueAt)}` : ''
+        }`
+      );
+    } catch (e) {
+      console.warn('[tasks] Assignee notification failed:', e.message);
+    }
+  }
+  if (routed.dueAt) reply += `\nDue: ${fmtDate(routed.dueAt)}`;
+
+  // kick off reminder prompt (non-blocking)
+  try {
+    await setPendingTransactionState(from, {
+      pendingReminder: {
         ownerId,
-        createdBy: from,
-        assignedTo: resolvedAssignee,
-        title,
-        body: null,
-        type: 'general',
-        dueAt: routed.dueAt || null,
-      });
-
-      let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
-      if (resolvedAssignee !== from) {
-        reply += `\nAssigned to: ${cap(assigneeLabel)}`;
-        try {
-          await sendMessage(
-            resolvedAssignee,
-            `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${
-              routed.dueAt ? `, due ${fmtDate(routed.dueAt)}` : ''
-            }`
-          );
-        } catch (e) {
-          console.warn('[tasks] Assignee notification failed:', e.message);
-        }
+        userId: from,
+        taskNo: task.task_no,
+        taskTitle: task.title
       }
-      if (routed.dueAt) reply += `\nDue: ${fmtDate(routed.dueAt)}`;
-      return res.send(RESP(reply));
+    });
+    reply += `\nDo you want me to send you a reminder?`;
+  } catch (e) {
+    console.warn('[tasks] pendingReminder state set failed:', e?.message);
+  }
+
+  return res.send(RESP(reply));
+}
+
+// Text command path: "task - ..." or "task ..."
+{
+  const m = body.match(/^task(?:\s*[:\-])?\s+(.+)$/i);
+  if (m) {
+    const { title: rawTitle, assignedTo, dueAt, assigneeToken, assigneePreposition } = parseTaskCommand(m[1]);
+    if (!rawTitle) return res.send(RESP('⚠️ Task title is required. Try "task - buy tape".'));
+
+    let title = rawTitle;
+    let resolvedAssignee = null;
+    let assigneeLabel = null;
+
+    if (assignedTo) {
+      if (/^\+?\d{10,15}$/.test(assignedTo)) {
+        const user = await getUserBasic(assignedTo);
+        resolvedAssignee = user?.user_id || null;
+        assigneeLabel = user?.name || assignedTo;
+      } else {
+        const user = await getUserByName(ownerId, assignedTo);
+        resolvedAssignee = user?.user_id || null;
+        assigneeLabel = assignedTo;
+      }
+
+      if (!resolvedAssignee) {
+        // Not a teammate → keep the mention in the title and assign to sender
+        title = reinstateAssigneeInTitle(title, assigneePreposition || 'to', assigneeToken || assignedTo);
+        resolvedAssignee = from;
+        assigneeLabel = userProfile?.name || from;
+      }
+    } else {
+      // default: assign to sender
+      resolvedAssignee = from;
+      assigneeLabel = userProfile?.name || from;
     }
 
-    // Text command path: "task - ..." or "task ..."
-    {
-      const m = body.match(/^task(?:\s*[:\-])?\s+(.+)$/i);
-      if (m) {
-        const { title: rawTitle, assignedTo, dueAt, assigneeToken, assigneePreposition } = parseTaskCommand(m[1]);
-        if (!rawTitle) return res.send(RESP('⚠️ Task title is required. Try "task - buy tape".'));
+    const task = await createTask({
+      ownerId,
+      createdBy: from,
+      assignedTo: resolvedAssignee,
+      title,
+      body: null,
+      type: 'general',
+      dueAt,
+    });
 
-        let title = rawTitle;
-        let resolvedAssignee = null;
-        let assigneeLabel = null;
+    if (!task || task.task_no == null) {
+      console.error('[tasks] createTask failed: missing task_no');
+      return res.send(RESP('⚠️ Failed to create task. Please try again.'));
+    }
 
-        if (assignedTo) {
-          if (/^\+?\d{10,15}$/.test(assignedTo)) {
-            const user = await getUserBasic(assignedTo);
-            resolvedAssignee = user?.user_id || null;
-            assigneeLabel = user?.name || assignedTo;
-          } else {
-            const user = await getUserByName(ownerId, assignedTo);
-            resolvedAssignee = user?.user_id || null;
-            assigneeLabel = assignedTo;
-          }
+    // Single confirmation; DM only if assigning to someone else
+    let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
+    if (resolvedAssignee !== from) {
+      reply += `\nAssigned to: ${cap(assigneeLabel)}`;
+      try {
+        await sendMessage(
+          resolvedAssignee,
+          `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${
+            dueAt ? `, due ${fmtDate(dueAt)}` : ''
+          }`
+        );
+      } catch (e) {
+        console.warn('[tasks] Assignee notification failed:', e.message);
+      }
+    }
+    if (dueAt) reply += `\nDue: ${fmtDate(dueAt)}`;
 
-          if (!resolvedAssignee) {
-            // Not a teammate → keep the mention in the title and assign to sender
-            title = reinstateAssigneeInTitle(title, assigneePreposition || 'to', assigneeToken || assignedTo);
-            resolvedAssignee = from;
-            assigneeLabel = userProfile?.name || from;
-          }
-        } else {
-          // default: assign to sender
-          resolvedAssignee = from;
-          assigneeLabel = userProfile?.name || from;
-        }
-
-        const task = await createTask({
+    // ask about reminder (non-blocking)
+    try {
+      await setPendingTransactionState(from, {
+        pendingReminder: {
           ownerId,
-          createdBy: from,
-          assignedTo: resolvedAssignee,
-          title,
-          body: null,
-          type: 'general',
-          dueAt,
-        });
-
-        if (!task || task.task_no == null) {
-          console.error('[tasks] createTask failed: missing task_no');
-          return res.send(RESP('⚠️ Failed to create task. Please try again.'));
+          userId: from,
+          taskNo: task.task_no,
+          taskTitle: task.title
         }
-
-        // Single confirmation; DM only if assigning to someone else
-        let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
-        if (resolvedAssignee !== from) {
-          reply += `\nAssigned to: ${cap(assigneeLabel)}`;
-          try {
-            await sendMessage(
-              resolvedAssignee,
-              `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${
-                dueAt ? `, due ${fmtDate(dueAt)}` : ''
-              }`
-            );
-          } catch (e) {
-            console.warn('[tasks] Assignee notification failed:', e.message);
-          }
-        }
-        if (dueAt) reply += `\nDue: ${fmtDate(dueAt)}`;
-        return res.send(RESP(reply));
-      }
+      });
+      reply += `\nDo you want me to send you a reminder?`;
+    } catch (e) {
+      console.warn('[tasks] pendingReminder state set failed:', e?.message);
     }
+
+    return res.send(RESP(reply));
+  }
+}
+
 
     // --- Quick help for near-misses
     if (/^task\b/i.test(body) || /\btasks?\b/i.test(body)) {

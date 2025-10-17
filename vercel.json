@@ -1,10 +1,15 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "index.js", "use": "@vercel/node" }
-  ],
+  "builds": [{ "src": "index.js", "use": "@vercel/node" }],
   "routes": [
     { "src": "^/api/webhook$", "methods": ["GET","POST"], "dest": "index.js" },
     { "src": "^/(.*)$", "dest": "index.js" }
+  ],
+  "crons": [
+    {
+      "path": "/webhook/reminders/cron",
+      "schedule": "*/5 * * * *",
+      "headers": { "x-cron-secret": "4bf3e4de8ccc4713119b79959f0ac990af24ca2ea5e348ff462b1d7958ae424e" }
+    }
   ]
 }

@@ -678,50 +678,213 @@ try {
   });
 
   // 2) DeepDive / historical upload  (unchanged – keep your existing block)
-  // ... [your entire DeepDive block remains exactly as you posted] ...
+  // 2) DeepDive / historical upload
+      {
+        const lc = input.toLowerCase();
+        const triggersDeepDive = lc.includes('upload history') || lc.includes('historical data') || lc.includes('deepdive') || lc.includes('deep dive');
 
-  // 3) Media (non-DeepDive)
-  if (mediaUrl && mediaType) {
-    // Normalize content-type (strip parameters like "; codecs=opus")
-    const ct = String(mediaType).split(';')[0].trim().toLowerCase();
-    const isAudio = /^audio\//.test(ct);
+        const tierLimits = {
+          starter: { years: 7, transactions: 5000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_STARTER, parsingPriceText: '$19' },
+          pro: { years: 7, transactions: 20000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_PRO, parsingPriceText: '$49' },
+          enterprise: { years: 7, transactions: 50000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_ENTERPRISE, parsingPriceText: '$99' }
+        };
+        const tier = (userProfile?.subscription_tier || 'starter').toLowerCase();
+        const limit = tierLimits[tier] || tierLimits.starter;
 
-    try {
-      const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType);
+        if (triggersDeepDive) {
+          await setPendingTransactionState(from, {
+            historicalDataUpload: true,
+            deepDiveUpload: true,
+            maxTransactions: limit.transactions,
+            uploadType: 'csv'
+          });
 
-      // Expectation: handleMedia may return { twiml?, transcript? }
-      const transcript = out && typeof out === 'object' ? out.transcript : null;
-      const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
+          if (mediaUrl && mediaType && ['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType)) {
+            try {
+              if (!userProfile?.historical_parsing_purchased) {
+                const paymentLink = await stripe.paymentLinks.create({
+                  line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
+                  metadata: { user_id: userProfile.user_id, type: 'historical_parsing' }
+                });
+                await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
+                  `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`
+                ]);
+                await logEvent(tenantId, userId, 'deepdive_paylink', { link: paymentLink.url, tier });
+                ensureReply(res, 'DeepDive payment link sent!');
+                return;
+              }
+            } catch (err) {
+              console.error('[DEEPDIVE] payment init error:', err?.message);
+              return next(err);
+            }
+          }
 
-      await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl, transcript: transcript || null });
-      await saveConvoState(tenantId, userId, {
-        history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: transcript ? `transcribed: ${transcript}` : 'media handled', intent: 'media' }]
-      });
-
-      if (isAudio && transcript) {
-        // Feed the transcript back into the pipeline
-        input = transcript;
-
-        // Helpful normalization for voice like: "remind me to get groceries"
-        const t = input.trim();
-        if (/^\s*remind me(\s+to)?\b/i.test(t)) {
-          // Convert to task text; e.g. "task get groceries"
-          input = 'task ' + t.replace(/^\s*remind me(\s+to)?\s*/i, '');
+          const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
+          await logEvent(tenantId, userId, 'deepdive_init', { tier, maxTransactions: limit.transactions });
+          await saveConvoState(tenantId, userId, {
+            history: [...(convo.history || []).slice(-4), { input, response: `Ready to upload historical data…`, intent: 'deepdive' }]
+          });
+          ensureReply(res, `Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: ${dashUrl}`);
+          return;
         }
-        // DO NOT return; allow downstream routers to process `input`
-      } else {
-        // Non-audio or no transcript → acknowledge and exit
-        if (typeof tw === 'string') {
-          return res.status(200).type('text/xml').send(tw);
+
+        // If mid DeepDive upload and sent a media file, process it here
+        const deepDiveState = await getPendingTransactionState(from);
+        const isInDeepDiveUpload = deepDiveState?.deepDiveUpload === true || deepDiveState?.historicalDataUpload === true;
+
+        if (isInDeepDiveUpload && mediaUrl && mediaType) {
+          try {
+            const allowed = [
+              'application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg',
+              'text/csv', 'application/vnd.ms-excel',
+              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            ];
+            if (!allowed.includes(mediaType)) {
+              ensureReply(res, 'Unsupported file type. Please upload a PDF, image, audio, CSV, or Excel.');
+              return;
+            }
+
+            if (['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType) && !userProfile?.historical_parsing_purchased) {
+              const paymentLink = await stripe.paymentLinks.create({
+                line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
+                metadata: { user_id: userProfile.user_id, type: 'historical_parsing' }
+              });
+              await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
+                `To parse PDFs/images/audio, unlock DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}. CSV/Excel uploads remain free (${limit.transactions} transactions).`
+              ]);
+              await logEvent(tenantId, userId, 'deepdive_blocked_payment_required', { link: paymentLink.url });
+              ensureReply(res, 'DeepDive payment link sent!');
+              return;
+            }
+
+            const fileResp = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+            const buffer = Buffer.from(fileResp.data);
+            const filename = mediaUrl.split('/').pop() || 'upload';
+
+            const summary = await parseUpload(
+              buffer,
+              filename,
+              from,
+              mediaType,
+              deepDiveState.uploadType || 'csv',
+              userProfile?.fiscal_year_start
+            );
+
+            if (deepDiveState.historicalDataUpload) {
+              const transactionCount = summary?.transactions?.length || 0;
+              if (transactionCount > (deepDiveState.maxTransactions || limit.transactions)) {
+                ensureReply(res, `Upload exceeds ${deepDiveState.maxTransactions || limit.transactions} transactions. Contact support for larger datasets.`);
+                return;
+              }
+              const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
+              await logEvent(tenantId, userId, 'deepdive_upload', { transactionCount, mediaType });
+              await saveConvoState(tenantId, userId, {
+                history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: `✅ ${transactionCount} new transactions processed.`, intent: 'deepdive_upload' }]
+              });
+              ensureReply(res, `✅ ${transactionCount} new transactions processed. Track progress on your dashboard: ${dashUrl}`);
+              deepDiveState.historicalDataUpload = false;
+              deepDiveState.deepDiveUpload = false;
+              await setPendingTransactionState(from, deepDiveState);
+              return;
+            }
+
+            await logEvent(tenantId, userId, 'deepdive_file_processed', { mediaType, filename });
+            ensureReply(res, `File received and processed. ${summary ? 'Summary: ' + JSON.stringify(summary) : 'OK'}.`);
+            deepDiveState.deepDiveUpload = false;
+            await setPendingTransactionState(from, deepDiveState);
+            return;
+          } catch (err) {
+            console.error('[DEEPDIVE] parse error:', err?.message);
+            return next(err);
+          }
         }
-        ensureReply(res, 'Got your file — processing complete.');
-        return;
       }
-    } catch (err) {
-      console.error('[media] error:', err?.message);
-      // fall through to normal pipeline as a safe default
+
+// 3) Media (non-DeepDive)
+if (mediaUrl && mediaType) {
+  // Normalize content-type (strip parameters like "; codecs=opus")
+  const ct = String(mediaType).split(';')[0].trim().toLowerCase();
+  const isAudio = /^audio\//.test(ct);
+
+  try {
+    const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType);
+
+    // handleMedia may return { twiml?, transcript? } OR a string twiml
+    const transcript = out && typeof out === 'object' ? out.transcript : null;
+    const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
+
+    await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl, transcript: transcript || null });
+    await saveConvoState(tenantId, userId, {
+      history: [...(convo.history || []).slice(-4), {
+        input: `file:${mediaType}`,
+        response: transcript ? `transcribed: ${transcript}` : 'media handled',
+        intent: 'media'
+      }]
+    });
+
+    if (isAudio && transcript) {
+      // Feed the transcript back into the pipeline
+      input = transcript;
+
+      // Normalize "remind me to …" into "task …"
+      const t = input.trim();
+      if (/^\s*remind me(\s+to)?\b/i.test(t)) {
+        input = 'task ' + t.replace(/^\s*remind me(\s+to)?\s*/i, '');
+      }
+      // DO NOT return; continue into fast-path / routers with updated `input`
+    } else {
+      // Non-audio or no transcript → acknowledge and exit
+      if (typeof tw === 'string') {
+        return res.status(200).type('text/xml').send(tw);
+      }
+      ensureReply(res, 'Got your file — processing complete.');
+      return;
     }
+  } catch (err) {
+    console.error('[media] error:', err?.message);
+    // fall through to normal pipeline as a safe default
   }
+}
+
+console.log('[TASK FAST-PATH] input =', input);
+
+try {
+  const { looksLikeTask, parseTaskUtterance } = require('../nlp/task_intents');
+  const tasksFn = getHandler && getHandler('tasks'); // keep consistent with the rest of your file
+
+  if (typeof input === 'string' && looksLikeTask(input) && typeof tasksFn === 'function') {
+    const tz = getUserTz(userProfile); // ensure getUserTz is imported/in scope
+    const args = parseTaskUtterance(input, { tz, now: new Date() });
+
+    console.log('[TASK FAST-PATH] parsed', {
+      title: args.title,
+      dueAt: args.dueAt,
+      assignee: args.assignee
+    });
+
+    // Pass parsed args to the tasks handler
+    res.locals = res.locals || {};
+    res.locals.intentArgs = args;
+
+    const handled = await tasksFn(
+      from,
+      `task - ${args.title}`,  // normalize to your “task - …” command
+      userProfile,
+      ownerId,
+      ownerProfile,
+      isOwner,
+      res
+    );
+
+    if (!res.headersSent && handled !== false) {
+      // tasks handler usually replies; this is just a safety net
+      ensureReply(res, 'Task created!');
+    }
+    return;
+  }
+} catch (e) {
+  console.warn('[TASK FAST-PATH] skipped:', e?.message);
+}
 
   // 3.5) ⬅️ NEW: Fast-path for pending timeclock prompts (must run BEFORE conversational/AI routers)
   try {

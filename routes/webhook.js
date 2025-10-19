@@ -230,6 +230,9 @@ console.log('[WEBHOOK][MEDIA-IN]', {
   decidedMediaType: mediaType,
   bodyLen: (req.body.Body || '').length,
 });
+// Track if this request included audio so we can guard fallbacks later
+const ctInit = String(mediaType || '').split(';')[0].trim().toLowerCase();
+const hadIncomingAudio = !!(mediaUrl && /^audio\//.test(ctInit));
 
 
     // ---------- FAST-PATH TASKS (text-only) ----------
@@ -704,44 +707,50 @@ console.log('[WEBHOOK][MEDIA-IN]', {
         }
       }
 
-     // ---------- MEDIA FIRST (AUDIO ONLY): transcribe audio and feed transcript ----------
+    
+// ---------- MEDIA FIRST (AUDIO ONLY): transcribe audio and handle simple commands ----------
 if (mediaUrl && mediaType) {
   const ct = String(mediaType).split(';')[0].trim().toLowerCase();
   const isAudio = /^audio\//.test(ct);
 
   if (isAudio) {
     try {
-      // Use normalized ct to avoid "; codecs=..." issues
+      // Always pass normalized ct to avoid "; codecs=opus" issues
       const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, ct);
 
+      // handleMedia may return { transcript?, twiml? } or a string twiml
       const transcript = out && typeof out === 'object' ? out.transcript : null;
       const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
 
-      // Log here (tenantId/userId may not be set yet)
-      console.log('[MEDIA] audio handled, transcript length:', transcript ? transcript.length : 0);
+      console.log('[MEDIA] audio handled', {
+        ct,
+        hasTranscript: !!transcript,
+        transcriptLen: transcript ? transcript.length : 0,
+        hasTwiml: !!tw
+      });
 
-      if (transcript) {
+      if (transcript && transcript.trim()) {
         // Make transcript the new input
-        input = String(transcript || '').trim();
+        input = transcript.trim();
 
-        // Normalize "remind me ..." → "task ..."
+        // Normalize "remind me …" → "task …"
         if (/^\s*remind me(\s+to)?\b/i.test(input)) {
           input = 'task ' + input.replace(/^\s*remind me(\s+to)?\s*/i, '');
         }
 
-        // 🚀 IMMEDIATE TASK FAST-PATH FOR AUDIO
+        // 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts
         try {
           const tasksFn = getHandler && getHandler('tasks');
           if ((/^task\b/i.test(input) || looksLikeTask(input)) && typeof tasksFn === 'function') {
             const args = parseTaskUtterance(input, { tz: getUserTz(userProfile), now: new Date() });
 
-            console.log('[MEDIA→TASK] parsed', {
+            console.log('[AUDIO→TASK] parsed', {
               title: args.title,
               dueAt: args.dueAt,
               assignee: args.assignee
             });
 
-            // Provide parsed args to tasks handler
+            // Provide parsed args to the tasks handler
             res.locals = res.locals || {};
             res.locals.intentArgs = { title: args.title, dueAt: args.dueAt, assigneeName: args.assignee };
 
@@ -758,27 +767,27 @@ if (mediaUrl && mediaType) {
             if (!res.headersSent && handled !== false) {
               ensureReply(res, `Task created: ${args.title}`);
             }
-            return; // ✅ stop here; task was handled
+            return; // ✅ Stop here; task was handled or at least replied
           }
         } catch (te) {
-          console.warn('[MEDIA→TASK] fast-path failed:', te?.message);
-          // fall through to normal pipeline
+          console.warn('[AUDIO→TASK] fast-path failed:', te?.message);
+          // Fall through to the rest of the pipeline with text input
         }
 
-        // Treat remainder as text-only for the rest of the pipeline
+        // Treat the rest of the pipeline as **text-only** now
         mediaUrl = null;
         mediaType = null;
       } else {
-        // If media handler produced TwiML (e.g., couldn't transcribe), send it; else gentle nudge
+        // No usable transcript
         if (typeof tw === 'string') {
           return res.status(200).type('text/xml').send(tw);
         }
-        ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me like "task - buy tape".`);
-        return;
+        ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
+        return; // ❌ Do not fall through—prevents "Quick one…" helper
       }
     } catch (err) {
       console.error('[MEDIA] audio handling error:', err?.message);
-      // Fall through; pipeline continues with whatever `input` is
+      // Fall through; the next guard (in #3) prevents the helper on empty input
     }
   }
 }
@@ -831,6 +840,12 @@ if (mediaUrl && mediaType) {
         if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
         return;
       }
+// If we had an incoming audio but still have no input by here, never fall into helpers
+if (hadIncomingAudio && (!input || !input.trim())) {
+  console.log('[GUARD] had incoming audio, but no transcript → sending cannot-understand message');
+  ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
+  return;
+}
 
       // 4) Conversational router first
       try {

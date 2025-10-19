@@ -36,6 +36,7 @@ function fmtLocal(tsIso, tz) {
     return new Date(tsIso).toLocaleString();
   }
 }
+
 function toAmPm(tsIso, tz) {
   try {
     return new Date(tsIso).toLocaleString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).toLowerCase();
@@ -44,14 +45,6 @@ function toAmPm(tsIso, tz) {
   }
 }
 
-function friendlyTypeLabel(type) {
-  if (!type) return 'entry';
-  if (type === 'time_entry') return 'time entry';
-  if (type === 'hours_inquiry') return 'hours inquiry';
-  return String(type).replace('_', ' ');
-}
-
-// Very lightweight “did they say timeclock stuff” detector for audio
 function inferIntentFromText(s = '') {
   const lc = String(s).toLowerCase();
   if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift)\b/.test(lc)) return 'punch_in';
@@ -61,8 +54,16 @@ function inferIntentFromText(s = '') {
   return null;
 }
 
+function friendlyTypeLabel(type) {
+  if (!type) return 'entry';
+  if (type === 'time_entry') return 'time entry';
+  if (type === 'hours_inquiry') return 'hours inquiry';
+  return String(type).replace('_', ' ');
+}
+
 async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   let payload = null;
+
   const up = userProfile || {};
   const ownerIdFromProfile = String(up.owner_id || up.ownerId || ownerId || '').replace(/\D/g, '');
   const isOwner = String(up.user_id || '').replace(/\D/g, '') === ownerIdFromProfile;
@@ -94,28 +95,31 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType) {
   let reply;
   try {
-    console.log(`[DEBUG] Processing media from ${from}: type=${mediaType}, url=${mediaUrl}, input=${input || ''}`);
+    console.log(`[MEDIA] incoming`, { from, mediaType, hasUrl: !!mediaUrl, inputLen: (input || '').length });
 
     const validImageTypes = ['image/jpeg', 'image/png'];
     const validAudioTypes = [
       'audio/mpeg',
       'audio/wav',
       'audio/ogg',
-      'audio/ogg; codecs=opus',
       'audio/webm',
+      'audio/ogg; codecs=opus',
       'audio/webm; codecs=opus',
-      'audio/aac',
-      'audio/m4a',
-      'audio/amr'
     ];
 
-    const lcMedia = String(mediaType || '').toLowerCase();
-    const baseType = lcMedia.split(';')[0].trim();
+    const baseType = String(mediaType || '').split(';')[0].trim().toLowerCase();
+    const isSupportedImage = validImageTypes.includes(baseType);
+    const isSupportedAudio = validAudioTypes.some(t => baseType === String(t).split(';')[0].toLowerCase());
 
-    // ---------- Pending confirmation flow (unchanged) ----------
+    if (!isSupportedImage && !isSupportedAudio) {
+      reply = `⚠️ Unsupported media type: ${mediaType}. Please send a JPEG/PNG image or MP3/WAV/OGG/WEBM audio.`;
+      return twiml(reply);
+    }
+
+    // ---------- Pending confirmation (text-only replies) ----------
     {
       const pendingState = await getPendingTransactionState(from);
-      if (pendingState?.pendingMedia) {
+      if (pendingState?.pendingMedia && !mediaUrl) {
         const { type } = pendingState.pendingMedia;
         const rawInput = String(input || '');
         const lcInput = rawInput.toLowerCase().trim().replace(/[.!?]$/, '');
@@ -123,9 +127,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         const isNo = lcInput === 'no' || lcInput === 'n' || lcInput === 'cancel';
         const label = friendlyTypeLabel(type);
 
-        if (mediaUrl && mediaType) {
-          await deletePendingTransactionState(from);
-        } else if (type != null) {
+        if (type != null) {
           if (isYes) {
             if (type === 'expense' && pendingState.pendingExpense) {
               const data = pendingState.pendingExpense;
@@ -137,11 +139,13 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
                 (await getActiveJob(ownerId)) || 'Uncategorized',
                 'expense',
                 data.category,
-                data.mediaUrl || mediaUrl,
+                data.mediaUrl || null,
                 userProfile.name || 'Unknown',
               ]);
-              reply = `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`;
-            } else if (type === 'revenue' && pendingState.pendingRevenue) {
+              await deletePendingTransactionState(from);
+              return twiml(`✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`);
+            }
+            if (type === 'revenue' && pendingState.pendingRevenue) {
               const data = pendingState.pendingRevenue;
               await appendToUserSpreadsheet(ownerId, [
                 data.date,
@@ -151,12 +155,14 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
                 (await getActiveJob(ownerId)) || 'Uncategorized',
                 'revenue',
                 data.category,
-                data.mediaUrl || mediaUrl,
+                data.mediaUrl || null,
                 userProfile.name || 'Unknown',
               ]);
-              reply = `✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`;
-            } else if (type === 'time_entry' && pendingState.pendingTimeEntry) {
-              const { employeeName, type: entryType, timestamp } = pendingState.pendingTimeEntry;
+              await deletePendingTransactionState(from);
+              return twiml(`✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`);
+            }
+            if (type === 'time_entry' && pendingState.pendingTimeEntry) {
+              const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
               const tz = getUserTz(userProfile);
               const hhmm = toAmPm(timestamp, tz);
               let normalized;
@@ -170,23 +176,27 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
               const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
               await deletePendingTransactionState(from);
               if (typeof tw === 'string' && tw.trim()) return tw;
-              return twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}`);
-            } else if (type === 'hours_inquiry') {
-              reply = `Please specify: today, this week, or this month.`;
-            } else {
-              reply = `Hmm, I lost the details for that ${label}. Please resend.`;
+              return twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}${job ? ` on ${job}` : ''}`);
+            }
+            if (type === 'hours_inquiry') {
+              await deletePendingTransactionState(from);
+              return twiml(`Please specify: today, this week, or this month.`);
             }
             await deletePendingTransactionState(from);
-            return twiml(reply);
-          } else if (isNo) {
-            reply = `❌ ${label} cancelled.`;
+            return twiml(`Hmm, I lost the details for that ${label}. Please resend.`);
+          }
+
+          if (isNo) {
             await deletePendingTransactionState(from);
-            return twiml(reply);
-          } else if (lcInput === 'edit') {
-            reply = `Please resend the ${label} details.`;
+            return twiml(`❌ ${label} cancelled.`);
+          }
+
+          if (lcInput === 'edit') {
             await deletePendingTransactionState(from);
-            return twiml(reply);
-          } else if (type === 'hours_inquiry') {
+            return twiml(`Please resend the ${label} details.`);
+          }
+
+          if (type === 'hours_inquiry') {
             let periodWord =
               lcInput.match(/\b(today|day|this\s*week|week|this\s*month|month|now)\b/i)?.[1]?.toLowerCase() ||
               (/\bthisweek\b/i.test(lcInput) ? 'this week' : null) ||
@@ -209,18 +219,21 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
               return twiml(message);
             }
             return twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`);
-          } else {
-            return twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${label}.`);
           }
+
+          return twiml(`⚠️ Reply 'yes', 'no', or 'edit' to confirm or cancel the ${label}.`);
         } else if (type == null && !mediaUrl) {
           return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
         }
       }
     }
 
-    // ---------- AUDIO: transcribe, then decide ----------
-    const isAudio = validAudioTypes.some(t => baseType === String(t).split(';')[0].toLowerCase());
-    if (isAudio) {
+    // ---------- Build text from media ----------
+    let extractedText = String(input || '').trim();
+
+    // AUDIO
+    if (isSupportedAudio) {
+      console.log('[MEDIA] starting transcription', { mediaType, urlLen: (mediaUrl || '').length });
       let transcript = '';
       try {
         const resp = await axios.get(mediaUrl, {
@@ -228,63 +241,59 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
           auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
         });
         const audioBuf = Buffer.from(resp.data);
-        console.log('[DEBUG] audio bytes:', audioBuf?.length, 'mime:', mediaType);
+        console.log('[MEDIA] audio bytes', audioBuf?.length, 'mime', mediaType);
         transcript = await transcribeAudio(audioBuf, mediaType, 'both');
-        console.log('[DEBUG] transcript:', transcript || '(none)');
+        console.log('[MEDIA] transcript bytes', transcript ? transcript.length : 0);
+        console.log('[MEDIA] transcript text', transcript || '(none)');
       } catch (e) {
-        console.error('[ERROR] audio download/transcribe failed:', e.message);
+        console.error('[MEDIA] transcribe failed:', e.message);
       }
 
       if (!transcript) {
         return twiml(`⚠️ I couldn’t understand the audio. Try again, or text me the details like "task - buy tape" or "remind me to call Dylan".`);
       }
 
-      // If it sounds like timeclock/hours/expense/revenue → keep existing media flow
+      // If it smells like finance/timeclock, fall through to the existing media flow
       const lc = transcript.toLowerCase();
-
-      const looksHours = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
+      const looksHours   = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
       const looksExpense = /\b(expense|receipt|spent|cost)\b/.test(lc);
       const looksRevenue = /\b(revenue|payment|paid|deposit|sale)\b/.test(lc);
       const timeclockIntent = inferIntentFromText(transcript);
 
       if (timeclockIntent || looksHours || looksExpense || looksRevenue) {
-        // Let your existing parsing block below handle it:
-        // Re-use transcript as extractedText and continue as if it was text.
-        input = transcript;
+        extractedText = transcript.trim();
       } else {
-        // ✅ Primary goal: for simple voice “task / remind me …”, hand back to webhook pipeline
+        // Primary: simple voice “task … / remind me …”
         return { transcript: transcript.trim() };
       }
     }
 
-    // ---------- IMAGE (OCR) ----------
-    let extractedText = String(input || '').trim();
-    if (!extractedText && validImageTypes.includes(baseType)) {
+    // IMAGE
+    if (isSupportedImage) {
       const { text } = await extractTextFromImage(mediaUrl);
-      console.log('[DEBUG] OCR text length:', (text || '').length);
-      extractedText = (text || '').trim();
+      console.log('[MEDIA] OCR text length', (text || '').length);
+      extractedText = (text || extractedText || '').trim();
     }
 
-    // If still nothing, ask what this is and set pending
     if (!extractedText) {
       const msg = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
       await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
       return twiml(msg);
     }
 
-    // ---------- Parse structured (expense/revenue/time) ----------
-    console.log('[DEBUG] parseMediaText called:', { text: extractedText || '(empty)' });
+    // ---------- Parse ----------
+    console.log('[MEDIA] parseMediaText()', { excerpt: (extractedText || '').slice(0, 80) });
     let result;
     try {
       result = await parseMediaText(extractedText);
     } catch (e) {
-      console.error('[ERROR] parseMediaText failed:', e.message);
+      console.error('[MEDIA] parseMediaText failed:', e.message);
       const msg = `I couldn’t read that. Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
       await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
       return twiml(msg);
     }
 
-    // ---------- Handle parse result (unchanged from your version) ----------
+    // ---------- Handle parse result ----------
     if (result.type === 'hours_inquiry') {
       const name = result.data.employeeName || userProfile?.name || '';
       const tz = getUserTz(userProfile);
@@ -308,7 +317,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     if (result.type === 'time_entry') {
-      let { employeeName, type, timestamp } = result.data;
+      let { employeeName, type, timestamp, job } = result.data;
 
       const inferred = inferIntentFromText(extractedText);
       if (inferred === 'punch_in'    && type === 'punch_out')  type = 'punch_in';
@@ -363,8 +372,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         console.warn('[MEDIA] timesheet summary failed:', e.message);
       }
 
-      const job = await getActiveJob(ownerId);
-      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName || userProfile?.name || 'Unknown'} at ${humanTime}${job && job !== 'Uncategorized' ? ` on ${job}` : ''}.${summaryTail}`;
+      const activeJob = await getActiveJob(ownerId);
+      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName || userProfile?.name || 'Unknown'} at ${humanTime}${activeJob && activeJob !== 'Uncategorized' ? ` on ${activeJob}` : ''}.${summaryTail}`;
       return twiml(reply);
     }
 
@@ -394,7 +403,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     return twiml(reply);
 
   } catch (error) {
-    console.error(`[ERROR] handleMedia failed for ${from}:`, error.message);
+    console.error(`[MEDIA] handleMedia failed for ${from}:`, error.message);
     reply = `⚠️ Failed to process media: ${error.message}`;
     return twiml(reply);
   }

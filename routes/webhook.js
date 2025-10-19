@@ -711,30 +711,65 @@ if (mediaUrl && mediaType) {
 
   if (isAudio) {
     try {
-      // Pass normalized content-type to avoid "; codecs=..." issues
+      // Use normalized ct to avoid "; codecs=..." issues
       const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, ct);
 
       const transcript = out && typeof out === 'object' ? out.transcript : null;
       const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
 
-      // We can't rely on tenantId/userId here yet, so log with ownerId/from
-      await logEvent(ownerId, from, 'media', { mediaType: ct, mediaUrl, transcript: transcript || null });
+      // Log here (tenantId/userId may not be set yet)
+      console.log('[MEDIA] audio handled, transcript length:', transcript ? transcript.length : 0);
 
       if (transcript) {
-        // Feed the transcript back into the pipeline as text
+        // Make transcript the new input
         input = String(transcript || '').trim();
-        console.log('[MEDIA] transcript fed into pipeline:', input);
 
-        // Normalize "remind me …" into "task …" for consistency
+        // Normalize "remind me ..." → "task ..."
         if (/^\s*remind me(\s+to)?\b/i.test(input)) {
           input = 'task ' + input.replace(/^\s*remind me(\s+to)?\s*/i, '');
         }
 
-        // Treat as text-only for the rest of the pipeline
+        // 🚀 IMMEDIATE TASK FAST-PATH FOR AUDIO
+        try {
+          const tasksFn = getHandler && getHandler('tasks');
+          if ((/^task\b/i.test(input) || looksLikeTask(input)) && typeof tasksFn === 'function') {
+            const args = parseTaskUtterance(input, { tz: getUserTz(userProfile), now: new Date() });
+
+            console.log('[MEDIA→TASK] parsed', {
+              title: args.title,
+              dueAt: args.dueAt,
+              assignee: args.assignee
+            });
+
+            // Provide parsed args to tasks handler
+            res.locals = res.locals || {};
+            res.locals.intentArgs = { title: args.title, dueAt: args.dueAt, assigneeName: args.assignee };
+
+            const handled = await tasksFn(
+              from,
+              `task - ${args.title}`,
+              userProfile,
+              ownerId,
+              ownerProfile,
+              isOwner,
+              res
+            );
+
+            if (!res.headersSent && handled !== false) {
+              ensureReply(res, `Task created: ${args.title}`);
+            }
+            return; // ✅ stop here; task was handled
+          }
+        } catch (te) {
+          console.warn('[MEDIA→TASK] fast-path failed:', te?.message);
+          // fall through to normal pipeline
+        }
+
+        // Treat remainder as text-only for the rest of the pipeline
         mediaUrl = null;
         mediaType = null;
       } else {
-        // If the media handler produced TwiML (e.g., couldn't transcribe), send it; else gently ack
+        // If media handler produced TwiML (e.g., couldn't transcribe), send it; else gentle nudge
         if (typeof tw === 'string') {
           return res.status(200).type('text/xml').send(tw);
         }
@@ -743,7 +778,7 @@ if (mediaUrl && mediaType) {
       }
     } catch (err) {
       console.error('[MEDIA] audio handling error:', err?.message);
-      // Fall through; pipeline will continue with whatever `input` is
+      // Fall through; pipeline continues with whatever `input` is
     }
   }
 }

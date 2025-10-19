@@ -266,70 +266,97 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     /* ---------- Build text from media ---------- */
-    let extractedText = String(input || '').trim();
+let extractedText = String(input || '').trim();
+
+// Normalize the incoming content-type once
+const normType = String(mediaType || '').split(';')[0].trim().toLowerCase();
 
     // AUDIO
-    if (isAudioFamily) {
-      console.log('[MEDIA] starting transcription', { mediaType, urlLen: (mediaUrl || '').length });
-      let transcript = '';
+if (isAudioFamily) {
+  const urlLen = (mediaUrl || '').length;
+  console.log('[MEDIA] starting transcription', { mediaType, normType, urlLen });
+
+  let transcript = '';
+  try {
+    // Twilio media requires Basic Auth
+    const resp = await axios.get(mediaUrl, {
+      responseType: 'arraybuffer',
+      auth: {
+        username: process.env.TWILIO_ACCOUNT_SID,
+        password: process.env.TWILIO_AUTH_TOKEN
+      },
+      maxContentLength: 8 * 1024 * 1024, // 8MB cap
+    });
+
+    const audioBuf = Buffer.from(resp.data);
+    console.log('[MEDIA] audio bytes', audioBuf?.length || 0, 'mime', mediaType, 'norm', normType, 'baseType', baseType);
+
+    // First attempt: use normalized content-type
+    transcript = await transcribeAudio(audioBuf, normType, 'both');
+    console.log('[MEDIA] transcript bytes', transcript ? transcript.length : 0);
+
+    // Fallback: OGG/Opus sometimes needs a different label; try a second mime
+    if (!transcript && normType === 'audio/ogg') {
       try {
-        const resp = await axios.get(mediaUrl, {
-          responseType: 'arraybuffer',
-          auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
-          maxContentLength: 8 * 1024 * 1024, // 8MB hard cap
-        });
-        const audioBuf = Buffer.from(resp.data);
-        console.log('[MEDIA] audio bytes', audioBuf?.length, 'mime', mediaType, 'baseType', baseType);
-        transcript = await transcribeAudio(audioBuf, mediaType, 'both');
-        console.log('[MEDIA] transcript bytes', transcript ? transcript.length : 0);
-        console.log('[MEDIA] transcript text', transcript || '(none)');
-      } catch (e) {
-        console.error('[MEDIA] transcribe failed:', e.message);
-      }
-
-      if (!transcript) {
-        return twiml(`⚠️ I couldn’t understand the audio. Try again, or text me the details like "task - buy tape" or "remind me to call Dylan".`);
-      }
-
-      // If it smells like finance/timeclock, fall through to the existing media flow
-      const lc = transcript.toLowerCase();
-      const looksHours   = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
-      const looksExpense = /\b(expense|receipt|spent|cost)\b/.test(lc);
-      const looksRevenue = /\b(revenue|payment|paid|deposit|sale)\b/.test(lc);
-      const timeclockIntent = inferIntentFromText(transcript);
-
-      if (timeclockIntent || looksHours || looksExpense || looksRevenue) {
-        extractedText = transcript.trim();
-      } else {
-        // Primary: simple voice “task … / remind me …”
-        return { transcript: transcript.trim() };
+        console.log('[MEDIA] retry transcription with fallback mime: audio/webm');
+        transcript = await transcribeAudio(audioBuf, 'audio/webm', 'both');
+        console.log('[MEDIA] fallback transcript bytes', transcript ? transcript.length : 0);
+      } catch (e2) {
+        console.warn('[MEDIA] fallback transcribe failed:', e2.message);
       }
     }
+
+    console.log('[MEDIA] transcript text', transcript || '(none)');
+  } catch (e) {
+    console.error('[MEDIA] transcribe fetch/exec failed:', e.message);
+  }
+
+  if (!transcript) {
+    return twiml(
+      `⚠️ I couldn’t understand the audio. Try again, or text me the details like "task - buy tape" or "remind me to call Dylan".`
+    );
+  }
+      // If it smells like finance/timeclock, fall through to the existing media flow
+  const lc = transcript.toLowerCase();
+  const looksHours   = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
+  const looksExpense = /\b(expense|receipt|spent|cost)\b/.test(lc);
+  const looksRevenue = /\b(revenue|payment|paid|deposit|sale)\b/.test(lc);
+  const timeclockIntent = inferIntentFromText(transcript);
+
+  if (timeclockIntent || looksHours || looksExpense || looksRevenue) {
+    extractedText = transcript.trim();
+  } else {
+    // Primary: simple voice “task … / remind me …”
+    // Let the webhook pipeline’s task fast-path handle this.
+    return { transcript: transcript.trim(), twiml: null };
+  }
+}
 
     // IMAGE
-    if (isSupportedImage) {
-      const { text } = await extractTextFromImage(mediaUrl);
-      console.log('[MEDIA] OCR text length', (text || '').length);
-      extractedText = (text || extractedText || '').trim();
-    }
+if (isSupportedImage) {
+  // NOTE: ensure extractTextFromImage fetches Twilio media with Basic Auth as well
+  const { text } = await extractTextFromImage(mediaUrl);
+  console.log('[MEDIA] OCR text length', (text || '').length);
+  extractedText = (text || extractedText || '').trim();
+}
 
-    if (!extractedText) {
-      const msg = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
-      await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
-      return twiml(msg);
-    }
+if (!extractedText) {
+  const msg = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
+  await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
+  return twiml(msg);
+}
 
     /* ---------- Parse ---------- */
-    console.log('[MEDIA] parseMediaText()', { excerpt: (extractedText || '').slice(0, 80) });
-    let result;
-    try {
-      result = await parseMediaText(extractedText);
-    } catch (e) {
-      console.error('[MEDIA] parseMediaText failed:', e.message);
-      const msg = `I couldn’t read that. Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
-      await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
-      return twiml(msg);
-    }
+console.log('[MEDIA] parseMediaText()', { excerpt: (extractedText || '').slice(0, 80) });
+let result;
+try {
+  result = await parseMediaText(extractedText);
+} catch (e) {
+  console.error('[MEDIA] parseMediaText failed:', e.message);
+  const msg = `I couldn’t read that. Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
+  await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
+  return twiml(msg);
+}
 
     /* ---------- Handle parse result ---------- */
     if (result.type === 'hours_inquiry') {

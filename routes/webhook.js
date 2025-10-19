@@ -701,53 +701,56 @@ router.post(
         }
       }
 
-      // 3) Media (non-DeepDive) — run whenever media present
-      if (mediaUrl && mediaType) {
-        const ct = String(mediaType).split(';')[0].trim().toLowerCase();
-        const isAudio = /^audio\//.test(ct);
-        console.log('[MEDIA] detected', { mediaType: ct, isAudio });
+      // 3) Media (non-DeepDive)
+if (mediaUrl && mediaType) {
+  // Normalize content-type (strip parameters like "; codecs=opus")
+  const ct = String(mediaType).split(';')[0].trim().toLowerCase();
+  const isAudio = /^audio\//.test(ct);
 
-        try {
-          const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType);
+  try {
+    // ⬇️ pass normalized content-type to the handler
+    const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, ct);
 
-          const transcript = out && typeof out === 'object' ? out.transcript : null;
-          const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
+    const transcript = out && typeof out === 'object' ? out.transcript : null;
+    const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
 
-          console.log('[MEDIA] outcome', { transcriptLen: transcript ? transcript.length : 0, twimlLen: (tw || '').length });
+    console.log('[MEDIA] outcome', {
+      isAudio,
+      ctNorm: ct,
+      transcript: transcript ? `${Math.min(transcript.length, 80)} chars` : null,
+      hasTwiML: !!tw
+    });
 
-          const tenantId = ownerId; // shadow-safe for log
-          const userId = from;
-          await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl, transcript: transcript || null });
-          const convoNow = await getConvoState(tenantId, userId);
-          await saveConvoState(tenantId, userId, {
-            history: [...(convoNow.history || []).slice(-4), {
-              input: `file:${mediaType}`,
-              response: transcript ? `transcribed: ${transcript}` : 'media handled',
-              intent: 'media'
-            }]
-          });
+    await logEvent(tenantId, userId, 'media', { mediaType: ct, mediaUrl, transcript: transcript || null });
+    await saveConvoState(tenantId, userId, {
+      history: [...(convo.history || []).slice(-4), {
+        input: `file:${ct}`,
+        response: transcript ? `transcribed: ${transcript.slice(0, 120)}` : 'media handled',
+        intent: 'media'
+      }]
+    });
 
-          if (isAudio && transcript) {
-            input = String(transcript || '').trim();
-            console.log('[MEDIA] transcript fed into pipeline:', input);
+    if (isAudio && transcript) {
+      // Feed the transcript back into the pipeline
+      input = transcript.trim();
 
-            if (/^\s*remind me(\s+to)?\b/i.test(input)) {
-              input = 'task ' + input.replace(/^\s*remind me(\s+to)?\s*/i, '');
-            }
-            // fall-through to task/timeclock/routers with updated input
-          } else {
-            if (typeof tw === 'string') {
-              return res.status(200).type('text/xml').send(tw);
-            }
-            ensureReply(res, 'Got your file — processing complete.');
-            return;
-          }
-        } catch (err) {
-          console.error('[MEDIA] error:', err?.message);
-          // fall through to normal pipeline
-        }
+      // Normalize "remind me …" into "task …"
+      if (/^\s*remind me(\s+to)?\b/i.test(input)) {
+        input = 'task ' + input.replace(/^\s*remind me(\s+to)?\s*/i, '');
       }
-
+      // continue pipeline with updated `input`
+    } else {
+      if (typeof tw === 'string') {
+        return res.status(200).type('text/xml').send(tw);
+      }
+      ensureReply(res, 'Got your file — processing complete.');
+      return;
+    }
+  } catch (err) {
+    console.error('[media] error:', err?.message);
+    // fall through to normal pipeline
+  }
+}
       // 3.1) Fast-path tasks AFTER transcript feed-in
       try {
         const tasksFn = getHandler && getHandler('tasks');

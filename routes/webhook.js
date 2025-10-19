@@ -660,20 +660,50 @@ return res.status(200).type('text/xml')
         }
       }
 
-      // 3) Media (non-DeepDive)
+// 3) Media (non-DeepDive)
 if (mediaUrl && mediaType) {
-  const twimlOut = await handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType);
-  await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl });
-  await saveConvoState(tenantId, userId, {
-    history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: 'media handled', intent: 'media' }]
-  });
-  if (typeof twimlOut === 'string') {
-    res.status(200).type('text/xml').send(twimlOut);
-  } else {
-    ensureReply(res, 'Got your file — processing complete.');
+  // Normalize content-type (strip parameters like "; codecs=opus")
+  const ct = String(mediaType).split(';')[0].trim().toLowerCase();
+  const isAudio = /^audio\//.test(ct);
+
+  try {
+    const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType);
+
+    // Expectation: handleMedia may return { twiml?, transcript? }
+    const transcript = out && typeof out === 'object' ? out.transcript : null;
+    const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
+
+    await logEvent(tenantId, userId, 'media', { mediaType, mediaUrl, transcript: transcript || null });
+    await saveConvoState(tenantId, userId, {
+      history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: transcript ? `transcribed: ${transcript}` : 'media handled', intent: 'media' }]
+    });
+
+    if (isAudio && transcript) {
+      // Feed the transcript back into the pipeline
+      input = transcript;
+
+      // Helpful normalization for voice like: "remind me to get groceries"
+      const t = input.trim();
+      if (/^\s*remind me(\s+to)?\b/i.test(t)) {
+        // Convert to task text; e.g. "task get groceries"
+        input = 'task ' + t.replace(/^\s*remind me(\s+to)?\s*/i, '');
+      }
+
+      // DO NOT return; allow downstream routers to process `input`
+    } else {
+      // Non-audio or no transcript → acknowledge and exit
+      if (typeof tw === 'string') {
+        return res.status(200).type('text/xml').send(tw);
+      }
+      ensureReply(res, 'Got your file — processing complete.');
+      return;
+    }
+  } catch (err) {
+    console.error('[media] error:', err?.message);
+    // fall through to normal pipeline as a safe default
   }
-  return;
 }
+
 
 
       // 3.5) ⬅️ NEW: Fast-path for pending timeclock prompts (must run BEFORE conversational/AI routers)

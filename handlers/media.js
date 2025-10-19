@@ -36,14 +36,12 @@ function fmtLocal(tsIso, tz) {
     return new Date(tsIso).toLocaleString();
   }
 }
-function inferIntentFromText(s = '') {
-  const lc = String(s).toLowerCase();
-  // Order matters: if both appear, prefer the *explicit* phrase positions
-  if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift)\b/.test(lc)) return 'punch_in';
-  if (/\b(clock|punch)\s+out\b/.test(lc) || /\b(end|finish|stop)\s+(work|shift)\b/.test(lc)) return 'punch_out';
-  if (/\b(start|begin)\s+(break|lunch)\b/.test(lc) || /\bon\s+break\b/.test(lc)) return 'break_start';
-  if (/\b(end|finish)\s+(break|lunch)\b/.test(lc) || /\boff\s+break\b/.test(lc)) return 'break_end';
-  return null;
+function toAmPm(tsIso, tz) {
+  try {
+    return new Date(tsIso).toLocaleString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).toLowerCase();
+  } catch {
+    return new Date(tsIso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase();
+  }
 }
 
 function friendlyTypeLabel(type) {
@@ -53,10 +51,18 @@ function friendlyTypeLabel(type) {
   return String(type).replace('_', ' ');
 }
 
+// Very lightweight “did they say timeclock stuff” detector for audio
+function inferIntentFromText(s = '') {
+  const lc = String(s).toLowerCase();
+  if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift)\b/.test(lc)) return 'punch_in';
+  if (/\b(clock|punch)\s+out\b/.test(lc) || /\b(end|finish|stop)\s+(work|shift)\b/.test(lc)) return 'punch_out';
+  if (/\b(start|begin)\s+(break|lunch)\b/.test(lc) || /\bon\s+break\b/.test(lc)) return 'break_start';
+  if (/\b(end|finish)\s+(break|lunch)\b/.test(lc) || /\boff\s+break\b/.test(lc)) return 'break_end';
+  return null;
+}
+
 async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   let payload = null;
-
-  // Derive isOwner from the profile/ownerId (digits-only compare)
   const up = userProfile || {};
   const ownerIdFromProfile = String(up.owner_id || up.ownerId || ownerId || '').replace(/\D/g, '');
   const isOwner = String(up.user_id || '').replace(/\D/g, '') === ownerIdFromProfile;
@@ -74,8 +80,8 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
       normalized,
       userProfile,
       ownerIdFromProfile || ownerId,
-      null,                      // ownerProfile (unused here)
-      isOwner,                   // <-- IMPORTANT: pass real isOwner
+      null,
+      isOwner,
       resStub,
       {}
     );
@@ -83,14 +89,6 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
     console.error('[MEDIA] handleTimeclock failed:', e?.message);
   }
   return payload;
-}
-
-function toAmPm(tsIso, tz) {
-  try {
-    return new Date(tsIso).toLocaleString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).toLowerCase();
-  } catch {
-    return new Date(tsIso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase();
-  }
 }
 
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType) {
@@ -105,20 +103,16 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       'audio/ogg',
       'audio/ogg; codecs=opus',
       'audio/webm',
-      'audio/webm; codecs=opus'
+      'audio/webm; codecs=opus',
+      'audio/aac',
+      'audio/m4a',
+      'audio/amr'
     ];
 
-    // --------- Basic media guard ---------
     const lcMedia = String(mediaType || '').toLowerCase();
-    if (
-      !validImageTypes.includes(lcMedia) &&
-      !validAudioTypes.some(t => lcMedia.startsWith(String(t).split(';')[0].toLowerCase()))
-    ) {
-      reply = `⚠️ Unsupported media type: ${mediaType}. Please send a JPEG/PNG image or MP3/WAV/OGG audio.`;
-      return twiml(reply);
-    }
+    const baseType = lcMedia.split(';')[0].trim();
 
-    // ---------- Pending confirmation flow ----------
+    // ---------- Pending confirmation flow (unchanged) ----------
     {
       const pendingState = await getPendingTransactionState(from);
       if (pendingState?.pendingMedia) {
@@ -224,9 +218,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       }
     }
 
-    // ---------- Build text from media ----------
-    let extractedText = String(input || '').trim();
-    if (validAudioTypes.some(t => lcMedia.startsWith(String(t).split(';')[0].toLowerCase()))) {
+    // ---------- AUDIO: transcribe, then decide ----------
+    const isAudio = validAudioTypes.some(t => baseType === String(t).split(';')[0].toLowerCase());
+    if (isAudio) {
+      let transcript = '';
       try {
         const resp = await axios.get(mediaUrl, {
           responseType: 'arraybuffer',
@@ -234,48 +229,50 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         });
         const audioBuf = Buffer.from(resp.data);
         console.log('[DEBUG] audio bytes:', audioBuf?.length, 'mime:', mediaType);
-        const transcript = await transcribeAudio(audioBuf, mediaType, 'both');
-        const len = transcript ? transcript.length : 0;
-        console.log(`[DEBUG] Transcription${transcript ? '' : ' (none)'}${len ? ' length: ' + len : ''} text: ${transcript || '(none)'}`);
-        extractedText = (transcript || extractedText || '').trim();
+        transcript = await transcribeAudio(audioBuf, mediaType, 'both');
+        console.log('[DEBUG] transcript:', transcript || '(none)');
       } catch (e) {
         console.error('[ERROR] audio download/transcribe failed:', e.message);
       }
 
-      if (/^\s*now[\s.!?\-–—]*$/i.test(extractedText)) {
-        const pendingState = await getPendingTransactionState(from);
-        if (pendingState?.pendingMedia?.type === 'hours_inquiry') {
-          const tz = getUserTz(userProfile);
-          const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
-          const { message } = await generateTimesheet({
-            ownerId,
-            person: name,
-            period: 'day',
-            tz,
-            now: new Date()
-          });
-          await deletePendingTransactionState(from);
-          return twiml(message);
-        }
-        return twiml(`Heard “now”. If you’re clocking someone, say “clock in Justin now” or “punch out Justin”.`);
+      if (!transcript) {
+        return twiml(`⚠️ I couldn’t understand the audio. Try again, or text me the details like "task - buy tape" or "remind me to call Dylan".`);
       }
 
-      if (!extractedText) {
-        return twiml(`⚠️ I couldn’t understand the audio. Try again, or text me the details like "Justin hours week" or "expense $12 coffee".`);
+      // If it sounds like timeclock/hours/expense/revenue → keep existing media flow
+      const lc = transcript.toLowerCase();
+
+      const looksHours = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
+      const looksExpense = /\b(expense|receipt|spent|cost)\b/.test(lc);
+      const looksRevenue = /\b(revenue|payment|paid|deposit|sale)\b/.test(lc);
+      const timeclockIntent = inferIntentFromText(transcript);
+
+      if (timeclockIntent || looksHours || looksExpense || looksRevenue) {
+        // Let your existing parsing block below handle it:
+        // Re-use transcript as extractedText and continue as if it was text.
+        input = transcript;
+      } else {
+        // ✅ Primary goal: for simple voice “task / remind me …”, hand back to webhook pipeline
+        return { transcript: transcript.trim() };
       }
-    } else if (validImageTypes.includes(mediaType)) {
-      const { text } = await extractTextFromImage(mediaUrl);
-      console.log('[DEBUG] OCR text length:', (text || '').length);
-      extractedText = (text || extractedText || '').trim();
     }
 
+    // ---------- IMAGE (OCR) ----------
+    let extractedText = String(input || '').trim();
+    if (!extractedText && validImageTypes.includes(baseType)) {
+      const { text } = await extractTextFromImage(mediaUrl);
+      console.log('[DEBUG] OCR text length:', (text || '').length);
+      extractedText = (text || '').trim();
+    }
+
+    // If still nothing, ask what this is and set pending
     if (!extractedText) {
       const msg = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
       await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
       return twiml(msg);
     }
 
-    // ---------- Parse ----------
+    // ---------- Parse structured (expense/revenue/time) ----------
     console.log('[DEBUG] parseMediaText called:', { text: extractedText || '(empty)' });
     let result;
     try {
@@ -287,130 +284,120 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(msg);
     }
 
-   // ---------- Handle parse result ----------
-if (result.type === 'hours_inquiry') {
-  const name = result.data.employeeName || userProfile?.name || '';
-  const tz = getUserTz(userProfile);
+    // ---------- Handle parse result (unchanged from your version) ----------
+    if (result.type === 'hours_inquiry') {
+      const name = result.data.employeeName || userProfile?.name || '';
+      const tz = getUserTz(userProfile);
 
-  if (result.data.period) {
-    const { message } = await generateTimesheet({
-      ownerId,
-      person: name,
-      period: result.data.period,
-      tz,
-      now: new Date()
-    });
-    return twiml(message);
-  }
+      if (result.data.period) {
+        const { message } = await generateTimesheet({
+          ownerId,
+          person: name,
+          period: result.data.period,
+          tz,
+          now: new Date()
+        });
+        return twiml(message);
+      }
 
-  await setPendingTransactionState(from, {
-    pendingMedia: { type: 'hours_inquiry' },
-    pendingHours: { employeeName: name }
-  });
-  return twiml(`Looks like you’re asking about ${name}’s hours. Do you want **today**, **this week**, or **this month**?`);
-}
-
-if (result.type === 'time_entry') {
-  let { employeeName, type, timestamp } = result.data;
-
-  // --- HARD INTENT OVERRIDE from the raw utterance ---
-  const inferred = inferIntentFromText(extractedText);
-  if (inferred === 'punch_in'    && type === 'punch_out')  type = 'punch_in';
-  if (inferred === 'punch_out'   && type === 'punch_in')   type = 'punch_out';
-  if (inferred === 'break_start' && type === 'break_end')  type = 'break_start';
-  if (inferred === 'break_end'   && type === 'break_start')type = 'break_end';
-  // ----------------------------------------------------
-
-  // Try to keep the spoken name; do NOT silently default to owner.
-  let hasName = !!(employeeName && String(employeeName).trim());
-  if (!hasName) {
-    const mFor = extractedText.match(/\bfor\s+([A-Za-z][A-Za-z.'\- ]{0,60})\b/i);
-    if (mFor) {
-      employeeName = mFor[1].trim();
-      hasName = true;
-    }
-  }
-
-  const tz = getUserTz(userProfile);
-  const timeSuffix = /T/.test(timestamp) ? ` at ${toAmPm(timestamp, tz)}` : '';
-
-  let normalized;
-  if (hasName) {
-    const who = employeeName || userProfile.name || 'Unknown';
-    if (type === 'punch_in')          normalized = `${who} punched in${timeSuffix}`;
-    else if (type === 'punch_out')    normalized = `${who} punched out${timeSuffix}`;
-    else if (type === 'break_start')  normalized = `start break for ${who}${timeSuffix}`;
-    else if (type === 'break_end')    normalized = `end break for ${who}${timeSuffix}`;
-    else if (type === 'drive_start')  normalized = `start drive for ${who}${timeSuffix}`;
-    else if (type === 'drive_end')    normalized = `end drive for ${who}${timeSuffix}`;
-    else                              normalized = `${who} punched in${timeSuffix}`;
-  } else {
-    // Let timeclock’s tolerant regex handle it.
-    normalized = extractedText;
-  }
-
-  const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
-  if (typeof tw === 'string' && tw.trim()) return tw;
-
-  // Fallback summary path
-  const humanTime = fmtLocal(timestamp, tz);
-  let summaryTail = '';
-  try {
-    if (type === 'punch_out') {
-      const { message } = await generateTimesheet({
-        ownerId,
-        person: employeeName || userProfile?.name || '',
-        period: 'day',
-        tz,
-        now: new Date()
+      await setPendingTransactionState(from, {
+        pendingMedia: { type: 'hours_inquiry' },
+        pendingHours: { employeeName: name }
       });
-      const firstLine = String(message || '').split('\n')[0] || '';
-      if (firstLine) summaryTail = `\n${firstLine.replace(/^[^A-Za-z0-9]*/, '')}`;
+      return twiml(`Looks like you’re asking about ${name}’s hours. Do you want **today**, **this week**, or **this month**?`);
     }
-  } catch (e) {
-    console.warn('[MEDIA] timesheet summary failed:', e.message);
+
+    if (result.type === 'time_entry') {
+      let { employeeName, type, timestamp } = result.data;
+
+      const inferred = inferIntentFromText(extractedText);
+      if (inferred === 'punch_in'    && type === 'punch_out')  type = 'punch_in';
+      if (inferred === 'punch_out'   && type === 'punch_in')   type = 'punch_out';
+      if (inferred === 'break_start' && type === 'break_end')  type = 'break_start';
+      if (inferred === 'break_end'   && type === 'break_start')type = 'break_end';
+
+      let hasName = !!(employeeName && String(employeeName).trim());
+      if (!hasName) {
+        const mFor = extractedText.match(/\bfor\s+([A-Za-z][A-Za-z.'\- ]{0,60})\b/i);
+        if (mFor) {
+          employeeName = mFor[1].trim();
+          hasName = true;
+        }
+      }
+
+      const tz = getUserTz(userProfile);
+      const timeSuffix = /T/.test(timestamp) ? ` at ${toAmPm(timestamp, tz)}` : '';
+
+      let normalized;
+      if (hasName) {
+        const who = employeeName || userProfile.name || 'Unknown';
+        if (type === 'punch_in')          normalized = `${who} punched in${timeSuffix}`;
+        else if (type === 'punch_out')    normalized = `${who} punched out${timeSuffix}`;
+        else if (type === 'break_start')  normalized = `start break for ${who}${timeSuffix}`;
+        else if (type === 'break_end')    normalized = `end break for ${who}${timeSuffix}`;
+        else if (type === 'drive_start')  normalized = `start drive for ${who}${timeSuffix}`;
+        else if (type === 'drive_end')    normalized = `end drive for ${who}${timeSuffix}`;
+        else                              normalized = `${who} punched in${timeSuffix}`;
+      } else {
+        normalized = extractedText;
+      }
+
+      const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
+      if (typeof tw === 'string' && tw.trim()) return tw;
+
+      const humanTime = fmtLocal(timestamp, tz);
+      let summaryTail = '';
+      try {
+        if (type === 'punch_out') {
+          const { message } = await generateTimesheet({
+            ownerId,
+            person: employeeName || userProfile?.name || '',
+            period: 'day',
+            tz,
+            now: new Date()
+          });
+          const firstLine = String(message || '').split('\n')[0] || '';
+          if (firstLine) summaryTail = `\n${firstLine.replace(/^[^A-Za-z0-9]*/, '')}`;
+        }
+      } catch (e) {
+        console.warn('[MEDIA] timesheet summary failed:', e.message);
+      }
+
+      const job = await getActiveJob(ownerId);
+      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName || userProfile?.name || 'Unknown'} at ${humanTime}${job && job !== 'Uncategorized' ? ` on ${job}` : ''}.${summaryTail}`;
+      return twiml(reply);
+    }
+
+    if (result.type === 'expense') {
+      const { item, amount, store, date, category } = result.data;
+      reply = `Please confirm: Log expense ${amount} for ${item} from ${store} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
+      await setPendingTransactionState(from, {
+        pendingMedia: { type: 'expense' },
+        pendingExpense: { item, amount, store, date, category, mediaUrl }
+      });
+      return twiml(reply);
+    }
+
+    if (result.type === 'revenue') {
+      const { description, amount, source, date, category } = result.data;
+      reply = `Please confirm: Log revenue ${amount} from ${source} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
+      await setPendingTransactionState(from, {
+        pendingMedia: { type: 'revenue' },
+        pendingRevenue: { description, amount, source, date, category, mediaUrl }
+      });
+      return twiml(reply);
+    }
+
+    // Fallback
+    reply = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
+    await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
+    return twiml(reply);
+
+  } catch (error) {
+    console.error(`[ERROR] handleMedia failed for ${from}:`, error.message);
+    reply = `⚠️ Failed to process media: ${error.message}`;
+    return twiml(reply);
   }
-
-  const job = await getActiveJob(ownerId);
-  reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName || userProfile?.name || 'Unknown'} at ${humanTime}${job && job !== 'Uncategorized' ? ` on ${job}` : ''}.${summaryTail}`;
-  return twiml(reply);
 }
 
-if (result.type === 'expense') {
-  const { item, amount, store, date, category } = result.data;
-  reply = `Please confirm: Log expense ${amount} for ${item} from ${store} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
-  await setPendingTransactionState(from, {
-    pendingMedia: { type: 'expense' },
-    pendingExpense: { item, amount, store, date, category, mediaUrl }
-  });
-  return twiml(reply);
-}
-
-if (result.type === 'revenue') {
-  const { description, amount, source, date, category } = result.data;
-  reply = `Please confirm: Log revenue ${amount} from ${source} on ${date} (Category: ${category})? Reply 'yes', 'no', or 'edit'.`;
-  await setPendingTransactionState(from, {
-    pendingMedia: { type: 'revenue' },
-    pendingRevenue: { description, amount, source, date, category, mediaUrl }
-  });
-  return twiml(reply);
-}
-
-// Fallback
-reply = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
-await setPendingTransactionState(from, { pendingMedia: { url: mediaUrl, type: null } });
-return twiml(reply);
-
-} catch (error) {
-  console.error(`[ERROR] handleMedia failed for ${from}:`, error.message);
-  reply = `⚠️ Failed to process media: ${error.message}`;
-  return twiml(reply);
-}
-}
 module.exports = { handleMedia };
-
-
-
-
-
-

@@ -142,6 +142,31 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
   }
   return false;
 }
+// helpers/normalization (put near the other small helpers)
+function cleanSpokenCommand(s = '') {
+  let t = String(s || '');
+
+  // Normalize exotic commas (，、) to ','
+  t = t.replace(/[，、]/g, ',');
+
+  // Strip common speech fillers (safe list)
+  t = t.replace(/\b(?:uh|um|erm|like|you know)\b/gi, '');
+
+  // Normalize the "task" cue: "task,|:|-—  foo" → "task foo"
+  t = t.replace(/(^|\s)task\s*[,:-–—]?\s*/i, '$1task ');
+
+  // Remove stray punctuation except a safe set we allow inside titles
+  // (keep @ # / & ' - for names/handles; remove trailing periods/commas clusters)
+  t = t
+    .replace(/[^\w@#:/&'’\-\s,\.]/g, '')   // drop odd symbols
+    .replace(/\s*\.\s*$/g, '')             // strip final period
+    .replace(/\s*,\s*/g, ' ')              // commas → spaces
+    .replace(/\s{2,}/g, ' ')               // collapse spaces
+    .trim();
+
+  return t;
+}
+
 
 // ----------------- routes -----------------
 router.get('/', (_req, res) => res.status(200).send('Webhook OK'));
@@ -257,8 +282,8 @@ if (mediaUrl && mediaType) {
       });
 
       if (transcript && transcript.trim()) {
-        // Make transcript the new input
-        input = transcript.trim();
+        // 🔹 Clean the transcript first (handles "task, get, groceries.")
+        input = cleanSpokenCommand(transcript);
 
         // Normalize "remind me …" → "task …"
         if (/^\s*remind me(\s+to)?\b/i.test(input)) {
@@ -271,19 +296,22 @@ if (mediaUrl && mediaType) {
           if ((/^task\b/i.test(input) || looksLikeTask(input)) && typeof tasksFn === 'function') {
             const args = parseTaskUtterance(input, { tz: getUserTz(userProfile), now: new Date() });
 
+            // 🔹 Clean the title we pass down (extra safety)
+            const cleanTitle = String(args.title || '').replace(/\s{2,}/g, ' ').trim();
+
             console.log('[AUDIO→TASK] parsed', {
-              title: args.title,
+              title: cleanTitle,
               dueAt: args.dueAt,
               assignee: args.assignee
             });
 
             // Provide parsed args to the tasks handler
             res.locals = res.locals || {};
-            res.locals.intentArgs = { title: args.title, dueAt: args.dueAt, assigneeName: args.assignee };
+            res.locals.intentArgs = { title: cleanTitle, dueAt: args.dueAt, assigneeName: args.assignee };
 
             const handled = await tasksFn(
               from,
-              `task - ${args.title}`,
+              `task - ${cleanTitle}`,
               userProfile,
               ownerId,
               ownerProfile,
@@ -292,7 +320,7 @@ if (mediaUrl && mediaType) {
             );
 
             if (!res.headersSent && handled !== false) {
-              ensureReply(res, `Task created: ${args.title}`);
+              ensureReply(res, `Task created: ${cleanTitle}`);
             }
             return; // ✅ Stop here; task was handled or at least replied
           }
@@ -319,6 +347,7 @@ if (mediaUrl && mediaType) {
   }
 }
 // ---------- END MEDIA FIRST (AUDIO ONLY) ----------
+
 
 
     // ---------- FAST-PATH TASKS (text-only) ----------
@@ -797,29 +826,36 @@ if (mediaUrl && mediaType) {
 
 
       // 3.1) Fast-path tasks AFTER transcript feed-in
-      try {
-        const tasksFn = getHandler && getHandler('tasks');
-        if (typeof input === 'string' && looksLikeTask(input) && typeof tasksFn === 'function') {
-          const tz = getUserTz(userProfile);
-          const args = parseTaskUtterance(input, { tz, now: new Date() });
-          console.log('[TASK FAST-PATH] parsed', { title: args.title, dueAt: args.dueAt, assignee: args.assignee });
-          res.locals = res.locals || {};
-          res.locals.intentArgs = args;
-          const handled = await tasksFn(
-            from,
-            `task - ${args.title}`,
-            userProfile,
-            ownerId,
-            ownerProfile,
-            isOwner,
-            res
-          );
-          if (!res.headersSent && handled !== false) ensureReply(res, 'Task created!');
-          return;
-        }
-      } catch (e) {
-        console.warn('[TASK FAST-PATH] skipped:', e?.message);
-      }
+try {
+  const tasksFn = getHandler && getHandler('tasks');
+  if (typeof input === 'string') {
+    const cleaned = cleanSpokenCommand(input);   // 🔹 add this
+    if (looksLikeTask(cleaned) && typeof tasksFn === 'function') {
+      const tz = getUserTz(userProfile);
+      const args = parseTaskUtterance(cleaned, { tz, now: new Date() });
+
+      const cleanTitle = String(args.title || '').replace(/\s{2,}/g, ' ').trim(); // 🔹 safety
+      console.log('[TASK FAST-PATH] parsed', { title: cleanTitle, dueAt: args.dueAt, assignee: args.assignee });
+
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { ...args, title: cleanTitle };
+
+      const handled = await tasksFn(
+        from,
+        `task - ${cleanTitle}`,
+        userProfile,
+        ownerId,
+        ownerProfile,
+        isOwner,
+        res
+      );
+      if (!res.headersSent && handled !== false) ensureReply(res, 'Task created!');
+      return;
+    }
+  }
+} catch (e) {
+  console.warn('[TASK FAST-PATH] skipped:', e?.message);
+}
 
       // 3.5) Fast-path for pending timeclock prompts
       try {

@@ -153,7 +153,8 @@ router.post(
   (req, res, next) => {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
     const len = parseInt(req.headers['content-length'] || '0', 10);
-    if (Number.isFinite(len) && len > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
+if (len > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
+
 
     console.log('[WEBHOOK] hit', {
       url: req.originalUrl,
@@ -207,27 +208,29 @@ router.post(
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
 
     // ---- Twilio media extraction (robust) ----
-    function pickFirstMedia(reqBody = {}) {
-      const n = parseInt(reqBody.NumMedia || '0', 10) || 0;
-      if (n <= 0) return { mediaUrl: null, mediaType: null, num: 0 };
-      const url = reqBody.MediaUrl0 || reqBody.MediaUrl || null;
-      const typ = reqBody.MediaContentType0 || reqBody.MediaContentType || null;
-      return { mediaUrl: url, mediaType: typ, num: n };
-    }
-    const picked = pickFirstMedia(req.body);
-    if (!mediaUrl && picked.mediaUrl)   mediaUrl  = picked.mediaUrl;
-    if (!mediaType && picked.mediaType) mediaType = picked.mediaType;
+function pickFirstMedia(reqBody = {}) {
+  const n = parseInt(reqBody.NumMedia || '0', 10) || 0;
+  if (n <= 0) return { mediaUrl: null, mediaType: null, num: 0 };
+  const url = reqBody.MediaUrl0 || reqBody.MediaUrl || null;
+  const typ = reqBody.MediaContentType0 || reqBody.MediaContentType || null;
+  return { mediaUrl: url, mediaType: typ, num: n };
+}
 
-    console.log('[WEBHOOK][MEDIA-IN]', {
-      NumMedia: req.body.NumMedia,
-      MediaUrl0: req.body.MediaUrl0,
-      MediaContentType0: req.body.MediaContentType0,
-      MediaUrl: req.body.MediaUrl,
-      MediaContentType: req.body.MediaContentType,
-      decidedMediaUrl: mediaUrl,
-      decidedMediaType: mediaType,
-      bodyLen: (req.body.Body || '').length,
-    });
+const picked = pickFirstMedia(req.body);
+if (!mediaUrl && picked.mediaUrl)   mediaUrl  = picked.mediaUrl;
+if (!mediaType && picked.mediaType) mediaType = picked.mediaType;
+
+console.log('[WEBHOOK][MEDIA-IN]', {
+  NumMedia: req.body.NumMedia,
+  MediaUrl0: req.body.MediaUrl0,
+  MediaContentType0: req.body.MediaContentType0,
+  MediaUrl: req.body.MediaUrl,
+  MediaContentType: req.body.MediaContentType,
+  decidedMediaUrl: mediaUrl,
+  decidedMediaType: mediaType,
+  bodyLen: (req.body.Body || '').length,
+});
+
 
     // ---------- FAST-PATH TASKS (text-only) ----------
     try {
@@ -701,56 +704,51 @@ router.post(
         }
       }
 
-      // 3) Media (non-DeepDive)
+     // ---------- MEDIA FIRST (AUDIO ONLY): transcribe audio and feed transcript ----------
 if (mediaUrl && mediaType) {
-  // Normalize content-type (strip parameters like "; codecs=opus")
   const ct = String(mediaType).split(';')[0].trim().toLowerCase();
   const isAudio = /^audio\//.test(ct);
 
-  try {
-    // ⬇️ pass normalized content-type to the handler
-    const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, ct);
+  if (isAudio) {
+    try {
+      // Pass normalized content-type to avoid "; codecs=..." issues
+      const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, ct);
 
-    const transcript = out && typeof out === 'object' ? out.transcript : null;
-    const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
+      const transcript = out && typeof out === 'object' ? out.transcript : null;
+      const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
 
-    console.log('[MEDIA] outcome', {
-      isAudio,
-      ctNorm: ct,
-      transcript: transcript ? `${Math.min(transcript.length, 80)} chars` : null,
-      hasTwiML: !!tw
-    });
+      // We can't rely on tenantId/userId here yet, so log with ownerId/from
+      await logEvent(ownerId, from, 'media', { mediaType: ct, mediaUrl, transcript: transcript || null });
 
-    await logEvent(tenantId, userId, 'media', { mediaType: ct, mediaUrl, transcript: transcript || null });
-    await saveConvoState(tenantId, userId, {
-      history: [...(convo.history || []).slice(-4), {
-        input: `file:${ct}`,
-        response: transcript ? `transcribed: ${transcript.slice(0, 120)}` : 'media handled',
-        intent: 'media'
-      }]
-    });
+      if (transcript) {
+        // Feed the transcript back into the pipeline as text
+        input = String(transcript || '').trim();
+        console.log('[MEDIA] transcript fed into pipeline:', input);
 
-    if (isAudio && transcript) {
-      // Feed the transcript back into the pipeline
-      input = transcript.trim();
+        // Normalize "remind me …" into "task …" for consistency
+        if (/^\s*remind me(\s+to)?\b/i.test(input)) {
+          input = 'task ' + input.replace(/^\s*remind me(\s+to)?\s*/i, '');
+        }
 
-      // Normalize "remind me …" into "task …"
-      if (/^\s*remind me(\s+to)?\b/i.test(input)) {
-        input = 'task ' + input.replace(/^\s*remind me(\s+to)?\s*/i, '');
+        // Treat as text-only for the rest of the pipeline
+        mediaUrl = null;
+        mediaType = null;
+      } else {
+        // If the media handler produced TwiML (e.g., couldn't transcribe), send it; else gently ack
+        if (typeof tw === 'string') {
+          return res.status(200).type('text/xml').send(tw);
+        }
+        ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me like "task - buy tape".`);
+        return;
       }
-      // continue pipeline with updated `input`
-    } else {
-      if (typeof tw === 'string') {
-        return res.status(200).type('text/xml').send(tw);
-      }
-      ensureReply(res, 'Got your file — processing complete.');
-      return;
+    } catch (err) {
+      console.error('[MEDIA] audio handling error:', err?.message);
+      // Fall through; pipeline will continue with whatever `input` is
     }
-  } catch (err) {
-    console.error('[media] error:', err?.message);
-    // fall through to normal pipeline
   }
 }
+// ---------- END MEDIA FIRST (AUDIO ONLY) ----------
+
       // 3.1) Fast-path tasks AFTER transcript feed-in
       try {
         const tasksFn = getHandler && getHandler('tasks');

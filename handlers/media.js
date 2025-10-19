@@ -4,7 +4,6 @@ const { parseMediaText } = require('../services/mediaParser');
 const { extractTextFromImage } = require('../utils/visionService');
 const { transcribeAudio } = require('../utils/transcriptionService');
 const {
-  logTimeEntry,
   getActiveJob,
   appendToUserSpreadsheet,
   generateTimesheet,
@@ -15,6 +14,8 @@ const {
   setPendingTransactionState,
   deletePendingTransactionState
 } = require('../utils/stateManager');
+
+/* ---------------- helpers ---------------- */
 
 function twiml(text) {
   return `<Response><Message>${text}</Message></Response>`;
@@ -31,7 +32,11 @@ function getUserTz(userProfile) {
 
 function fmtLocal(tsIso, tz) {
   try {
-    return new Date(tsIso).toLocaleString('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit' });
+    return new Date(tsIso).toLocaleString('en-CA', {
+      timeZone: tz,
+      hour: 'numeric',
+      minute: '2-digit'
+    });
   } catch {
     return new Date(tsIso).toLocaleString();
   }
@@ -39,9 +44,16 @@ function fmtLocal(tsIso, tz) {
 
 function toAmPm(tsIso, tz) {
   try {
-    return new Date(tsIso).toLocaleString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).toLowerCase();
+    return new Date(tsIso).toLocaleString('en-US', {
+      timeZone: tz,
+      hour: 'numeric',
+      minute: '2-digit'
+    }).toLowerCase();
   } catch {
-    return new Date(tsIso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase();
+    return new Date(tsIso).toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit'
+    }).toLowerCase();
   }
 }
 
@@ -92,31 +104,56 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   return payload;
 }
 
+/* ---------------- main ---------------- */
+
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType) {
   let reply;
   try {
     console.log(`[MEDIA] incoming`, { from, mediaType, hasUrl: !!mediaUrl, inputLen: (input || '').length });
 
-    const validImageTypes = ['image/jpeg', 'image/png'];
-    const validAudioTypes = [
-      'audio/mpeg',
-      'audio/wav',
-      'audio/ogg',
-      'audio/webm',
-      'audio/ogg; codecs=opus',
-      'audio/webm; codecs=opus',
-    ];
+    const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
+
+    // Normalized allow-list for audio (params like "; codecs=opus" are stripped below)
+    const validAudioTypes = new Set([
+      'audio/mpeg',       // MP3
+      'audio/mp3',        // alt MP3
+      'audio/wav',        // WAV
+      'audio/vnd.wave',   // alt WAV
+      'audio/ogg',        // OGG (WhatsApp voice notes)
+      'audio/webm',       // WebM (some browsers)
+      'audio/mp4',        // M4A / MP4 audio (iOS voice memos/notes)
+      'audio/x-m4a',      // alt M4A
+      'audio/aac',        // AAC
+      'audio/3gpp',       // Android
+      'audio/3gpp2',
+      'audio/basic',      // AU
+      'audio/l24',
+      'audio/vnd.rn-realaudio',
+      'audio/ac3',
+      'audio/amr-nb',
+      'audio/amr',
+      'audio/opus',       // direct Opus (rare)
+    ]);
 
     const baseType = String(mediaType || '').split(';')[0].trim().toLowerCase();
+    console.log('[MEDIA] normalized content-type', { original: mediaType, baseType });
+
     const isSupportedImage = validImageTypes.includes(baseType);
-    const isSupportedAudio = validAudioTypes.some(t => baseType === String(t).split(';')[0].toLowerCase());
+
+    // Be resilient: accept any audio/*, but track if it’s on our known-good list
+    const isAudioFamily = baseType.startsWith('audio/');
+    const isWhitelistedAudio = validAudioTypes.has(baseType);
+    const isSupportedAudio = isAudioFamily; // broad accept to avoid WhatsApp/Twilio mime quirks
 
     if (!isSupportedImage && !isSupportedAudio) {
-      reply = `⚠️ Unsupported media type: ${mediaType}. Please send a JPEG/PNG image or MP3/WAV/OGG/WEBM audio.`;
+      reply = `⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio/voice note.`;
       return twiml(reply);
     }
+    if (isAudioFamily && !isWhitelistedAudio) {
+      console.warn('[MEDIA] audio/* accepted but not on allow-list', { baseType });
+    }
 
-    // ---------- Pending confirmation (text-only replies) ----------
+    /* ---------- Pending confirmation (text-only replies) ---------- */
     {
       const pendingState = await getPendingTransactionState(from);
       if (pendingState?.pendingMedia && !mediaUrl) {
@@ -228,20 +265,21 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       }
     }
 
-    // ---------- Build text from media ----------
+    /* ---------- Build text from media ---------- */
     let extractedText = String(input || '').trim();
 
     // AUDIO
-    if (isSupportedAudio) {
+    if (isAudioFamily) {
       console.log('[MEDIA] starting transcription', { mediaType, urlLen: (mediaUrl || '').length });
       let transcript = '';
       try {
         const resp = await axios.get(mediaUrl, {
           responseType: 'arraybuffer',
           auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
+          maxContentLength: 8 * 1024 * 1024, // 8MB hard cap
         });
         const audioBuf = Buffer.from(resp.data);
-        console.log('[MEDIA] audio bytes', audioBuf?.length, 'mime', mediaType);
+        console.log('[MEDIA] audio bytes', audioBuf?.length, 'mime', mediaType, 'baseType', baseType);
         transcript = await transcribeAudio(audioBuf, mediaType, 'both');
         console.log('[MEDIA] transcript bytes', transcript ? transcript.length : 0);
         console.log('[MEDIA] transcript text', transcript || '(none)');
@@ -281,7 +319,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(msg);
     }
 
-    // ---------- Parse ----------
+    /* ---------- Parse ---------- */
     console.log('[MEDIA] parseMediaText()', { excerpt: (extractedText || '').slice(0, 80) });
     let result;
     try {
@@ -293,7 +331,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(msg);
     }
 
-    // ---------- Handle parse result ----------
+    /* ---------- Handle parse result ---------- */
     if (result.type === 'hours_inquiry') {
       const name = result.data.employeeName || userProfile?.name || '';
       const tz = getUserTz(userProfile);

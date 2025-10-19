@@ -25,6 +25,7 @@ app.get('/', (req, res) => {
 
 // IMPORTANT: Twilio path must match your Twilio console
 app.use('/api/webhook', webhookRouter);
+app.use('/webhook', webhookRouter); // temporary alias
 app.use('/parse', parseRouter);
 app.use('/deep-dive', deepDiveRouter);
 app.use('/dashboard', dashboardRouter);

@@ -151,22 +151,54 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
 // ----------------- routes -----------------
 router.get('/', (_req, res) => res.status(200).send('Webhook OK'));
 
+// IMPORTANT: keep everything in ONE router.post(...) call in order.
 router.post(
   '/',
+  // 0) Basic guards
   (req, res, next) => {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-    if ((req.headers['content-length'] || '0') > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
+    const len = parseInt(req.headers['content-length'] || '0', 10);
+    if (len > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
+
+    // Simple trace to prove which route is being hit
+    console.log('[WEBHOOK] hit', {
+      url: req.originalUrl,
+      method: req.method,
+      contentType: req.headers['content-type'],
+      numMedia: req.body?.NumMedia,
+      hasMedia0: !!req.body?.MediaUrl0,
+      mediaType0: req.body?.MediaContentType0,
+      bodyLen: (req.body?.Body || '').length,
+      vercelId: req.headers['x-vercel-id'] || null,
+    });
     next();
   },
+
+  // 0.1) Version ping BEFORE heavy middlewares
+  (req, res, next) => {
+    const body = (req.body?.Body || '').trim().toLowerCase();
+    if (body === 'version') {
+      const v = process.env.VERCEL_GIT_COMMIT_SHA || process.env.COMMIT_SHA || 'dev-local';
+      return res
+        .status(200)
+        .type('text/xml')
+        .send(`<Response><Message>build ${String(v).slice(0,7)} OK</Message></Response>`);
+    }
+    next();
+  },
+
+  // 1) Your existing middlewares
   userProfileMiddleware,
   lockMiddleware,
   tokenMiddleware,
+
+  // 2) Main handler (unchanged start)
   async (req, res, next) => {
     const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
     const from = req.from || String(From || '').replace(/^whatsapp:/, '').replace(/\D/g, '');
-    const input = (Body || '').trim();
-    const mediaUrl = MediaUrl0 || null;
-    const mediaType = MediaContentType0 || null;
+    let input = (Body || '').trim();                   // <-- left as let for later mutation
+    let mediaUrl = MediaUrl0 || null;
+    let mediaType = MediaContentType0 || null;
 
     // WhatsApp location payload
     const isLocation = (!!req.body.Latitude && !!req.body.Longitude) ||

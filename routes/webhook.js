@@ -930,9 +930,16 @@ if (isTimeclockMessage(input)) {
   errorMiddleware
 );
 
-// ---- Reminders Cron (simple polling) ----
+/// ---- Reminders Cron (simple polling) ----
 router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) => {
   try {
+    // 👇 Add this right at the start — helps confirm Vercel calls the endpoint
+    console.log('[reminders/cron] incoming', {
+      url: req.originalUrl,
+      headers: req.headers,
+      time: new Date().toISOString(),
+    });
+
     // Accept if it's the Vercel scheduler...
     const isVercelCron = req.headers['x-vercel-cron'] === '1';
 
@@ -953,29 +960,32 @@ router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) 
 
     for (const r of due) {
       try {
-        const line = r.task_no ? `Task #${r.task_no}: ${r.task_title}` : r.task_title;
+        const line = r.task_no
+          ? `Task #${r.task_no}: ${r.task_title}`
+          : r.task_title;
+
         await sendMessage(r.user_id, `⏰ Reminder: ${line}`);
         await markReminderSent(r.id);
+
+        console.log('[reminders/cron] sent', {
+          id: r.id,
+          user: r.user_id,
+          when: r.remind_at,
+        });
+
         sent++;
       } catch (e) {
         console.warn('[reminders/cron] send failed:', r.id, e?.message);
       }
     }
-console.log('[reminders/cron] hit', {
-  isVercelCron: req.headers['x-vercel-cron'],
-  slug: req.params.slug || null,
-  now: new Date().toISOString()
-});
 
     return res.status(200).json({ ok: true, sent, checked: due.length });
   } catch (e) {
     console.error('[reminders/cron] error:', e?.message);
     return next(e);
-    
   }
-  
-  
 });
+
 
 
 

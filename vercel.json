@@ -6,9 +6,9 @@
     { "src": "^/(.*)$", "dest": "index.js" }
   ],
   "crons": [
-    {
-      "path": "/webhook/reminders/cron/4bf3e4de8ccc4713119b79959f0ac990af24ca2ea5e348ff462b1d7958ae424e",  
-      "schedule": "*/5 * * * *"
-    }
-  ]
+  {
+    "path": "/api/webhook/reminders/cron/4bf3e4de8ccc4713119b79959f0ac990af24ca2ea5e348ff462b1d7958ae424e",
+    "schedule": "*/5 * * * *"
+  }
+]
 }

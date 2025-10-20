@@ -781,7 +781,8 @@ module.exports = {
   metrics: handleMetrics,
   tax: handleTax,
   receipt: handleReceipt,
-  team: handleTeam,
   timeclock: handleTimeclock,
-  handleCommands, // <-- keep this exported
+  team: require('./team'),   // ✅ Only one team handler (this loads team.js)
+  handleCommands,
 };
+

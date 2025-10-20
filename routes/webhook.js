@@ -166,6 +166,21 @@ function cleanSpokenCommand(s = '') {
 
   return t;
 }
+
+function looksLikeQuestion(s = '') {
+  const t = String(s || '').trim().toLowerCase();
+  if (!t) return false;
+  if (t.includes('?')) return true;
+
+  // Common interrogative/openers
+  if (/^(can|could|may|might|should|would|is|are|was|were|do|does|did|how|what|when|where|why|which)\b/.test(t)) return true;
+
+  // Soft question phrases without '?'
+  if (/\b(is it (ok|okay|possible)|can i|could i|should i|do you|does it)\b/.test(t)) return true;
+
+  return false;
+}
+
 function normalizeTimePhrase(s = '') {
   let t = String(s);
 
@@ -300,35 +315,37 @@ if (mediaUrl && mediaType) {
 
       if (transcript && transcript.trim()) {
         // 🔹 Clean the transcript first (handles "task, get, groceries.")
-        input = cleanSpokenCommand(transcript);
+        let cleaned = cleanSpokenCommand(transcript);
 
         // Normalize "remind me …" → "task …"
-        if (/^\s*remind me(\s+to)?\b/i.test(input)) {
-          input = 'task ' + input.replace(/^\s*remind me(\s+to)?\s*/i, '');
+        if (/^\s*remind me(\s+to)?\b/i.test(cleaned)) {
+          cleaned = 'task ' + cleaned.replace(/^\s*remind me(\s+to)?\s*/i, '');
         }
 
-        // 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts
+        // Make cleaned transcript the new input for the rest of the pipeline
+        input = cleaned;
+
+        // 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts (not a question)
         try {
           const tasksFn = getHandler && getHandler('tasks');
-          if ((/^task\b/i.test(input) || looksLikeTask(input)) && typeof tasksFn === 'function') {
-            const args = parseTaskUtterance(input, { tz: getUserTz(userProfile), now: new Date() });
-
-            // 🔹 Clean the title we pass down (extra safety)
-            const cleanTitle = String(args.title || '').replace(/\s{2,}/g, ' ').trim();
+          if (
+            typeof tasksFn === 'function' &&
+            ( /^task\b/i.test(cleaned) || (looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) )
+          ) {
+            const args = parseTaskUtterance(cleaned, { tz: getUserTz(userProfile), now: new Date() });
 
             console.log('[AUDIO→TASK] parsed', {
-              title: cleanTitle,
+              title: args.title,
               dueAt: args.dueAt,
               assignee: args.assignee
             });
 
-            // Provide parsed args to the tasks handler
             res.locals = res.locals || {};
-            res.locals.intentArgs = { title: cleanTitle, dueAt: args.dueAt, assigneeName: args.assignee };
+            res.locals.intentArgs = { title: args.title, dueAt: args.dueAt, assigneeName: args.assignee };
 
             const handled = await tasksFn(
               from,
-              `task - ${cleanTitle}`,
+              `task - ${args.title}`,
               userProfile,
               ownerId,
               ownerProfile,
@@ -337,25 +354,26 @@ if (mediaUrl && mediaType) {
             );
 
             if (!res.headersSent && handled !== false) {
-              ensureReply(res, `Task created: ${cleanTitle}`);
+              ensureReply(res, `Task created: ${args.title}`);
             }
-            return; // ✅ Stop here; task was handled or at least replied
+            return; // ✅ handled
           }
         } catch (te) {
           console.warn('[AUDIO→TASK] fast-path failed:', te?.message);
-          // Fall through to the rest of the pipeline with text input
+          // fall through
         }
 
         // Treat the rest of the pipeline as text-only now
         mediaUrl = null;
         mediaType = null;
+
       } else {
         // No usable transcript
         if (typeof tw === 'string') {
           return res.status(200).type('text/xml').send(tw);
         }
         ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
-        return; // ❌ Do not fall through—prevents "Quick one…" helper
+        return; // ❌ stop, avoids helper
       }
     } catch (err) {
       console.error('[MEDIA] audio handling error:', err?.message);
@@ -364,7 +382,6 @@ if (mediaUrl && mediaType) {
   }
 }
 // ---------- END MEDIA FIRST (AUDIO ONLY) ----------
-
 
 
     // ---------- FAST-PATH TASKS (text-only) ----------
@@ -905,24 +922,27 @@ try {
     
 
 
-      // 3.1) Fast-path tasks AFTER transcript feed-in
+   // 3.1) Fast-path tasks AFTER transcript feed-in
 try {
   const tasksFn = getHandler && getHandler('tasks');
-  if (typeof input === 'string') {
-    const cleaned = cleanSpokenCommand(input);   // 🔹 add this
-    if (looksLikeTask(cleaned) && typeof tasksFn === 'function') {
+  if (typeof input === 'string' && typeof tasksFn === 'function') {
+    const cleaned = cleanSpokenCommand(input);
+
+    if (
+      /^task\b/i.test(cleaned) ||                    // explicit
+      (looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) // implicit but not a question
+    ) {
       const tz = getUserTz(userProfile);
       const args = parseTaskUtterance(cleaned, { tz, now: new Date() });
 
-      const cleanTitle = String(args.title || '').replace(/\s{2,}/g, ' ').trim(); // 🔹 safety
-      console.log('[TASK FAST-PATH] parsed', { title: cleanTitle, dueAt: args.dueAt, assignee: args.assignee });
+      console.log('[TASK FAST-PATH] parsed', { title: args.title, dueAt: args.dueAt, assignee: args.assignee });
 
       res.locals = res.locals || {};
-      res.locals.intentArgs = { ...args, title: cleanTitle };
+      res.locals.intentArgs = args;
 
       const handled = await tasksFn(
         from,
-        `task - ${cleanTitle}`,
+        `task - ${args.title}`,
         userProfile,
         ownerId,
         ownerProfile,
@@ -965,6 +985,49 @@ if (hadIncomingAudio && (!input || !input.trim())) {
   ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
   return;
 }
+
+// 3.7) Follow-up modifier: "assign this/it to <name>"
+try {
+  // only if it's a question / follow-up, not a command
+  if (looksLikeQuestion(input)) {
+    const m = /\bassign\s+(?:this|it)?\s*(?:to|@)\s*([a-z][\w\s.'-]{1,50})\??$/i.exec(input.trim());
+    if (m) {
+      const assignee = m[1].trim();
+
+      // Hand off to tasks handler in "assign" mode targeting the last created task
+      const tasksFn = getHandler && getHandler('tasks');
+      if (typeof tasksFn === 'function') {
+        res.locals = res.locals || {};
+        res.locals.intentArgs = {
+          action: 'assign',
+          taskRef: 'last',            // let your tasks handler interpret 'last' → last created/active task
+          assigneeName: assignee
+        };
+
+        // Use a normalized command string your tasks handler understands for assignment
+        const normalized = `task assign @${assignee}`;
+
+        const handled = await tasksFn(
+          from,
+          normalized,
+          userProfile,
+          ownerId,
+          ownerProfile,
+          isOwner,
+          res
+        );
+
+        if (!res.headersSent && handled !== false) {
+          ensureReply(res, `Assigned to ${assignee}.`);
+        }
+        return; // ✅ handled as a follow-up modification
+      }
+    }
+  }
+} catch (e) {
+  console.warn('[TASK ASSIGN FOLLOW-UP] failed:', e?.message);
+}
+
 
       // 4) Conversational router first
       try {

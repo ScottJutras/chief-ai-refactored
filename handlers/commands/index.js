@@ -2,56 +2,33 @@
 const { handleExpense } = require('./expense');
 const { handleRevenue } = require('./revenue');
 const { handleBill } = require('./bill');
-
-// If job.js default-exports the handler function:
+// job.js now exports the function directly
 const handleJob = require('./job');
-
 const { handleQuote } = require('./quote');
 const { handleMetrics } = require('./metrics');
 const { handleTax } = require('./tax');
 const { handleReceipt } = require('./receipt');
+const { handleTeam } = require('./team');
 const { handleTimeclock } = require('./timeclock');
 
-// 🔧 Robust import for team handler (works for both export styles)
 const teamMod = require('./team');
 const teamFn = (typeof teamMod === 'function') ? teamMod : teamMod.handleTeam;
 
-// (Keep only what you actually use below)
-// const { isOnboardingTrigger, isValidCommand, isValidExpenseInput } = require('../../utils/inputValidator');
-// const { db, admin } = require('../../services/firebase');
-// const { getOnboardingState, setOnboardingState, deleteOnboardingState } = require('../../utils/stateManager');
-// const { saveUserProfile, getAuthorizedClient } = require('../../services/postgres.js');
-// const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-// const { sendTemplateMessage, sendMessage } = require('../../services/twilio');
-// const { confirmationTemplates } = require('../../config');
-// const OpenAI = require('openai');
-// const { google } = require('googleapis');
-// const Stripe = require('stripe');
-// const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
-// If you still export a generic aggregator, keep it required from ./commands
-// (adjust if your project differs)
+const { isOnboardingTrigger, isValidCommand, isValidExpenseInput } = require('../../utils/inputValidator');
+const { db, admin } = require('../../services/firebase');
+const { getOnboardingState, setOnboardingState, deleteOnboardingState } = require('../../utils/stateManager');
+const { saveUserProfile } = require('../../services/postgres.js');
+const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
+const { sendTemplateMessage, sendMessage } = require('../../services/twilio');
+const { confirmationTemplates } = require('../../config');
+const OpenAI = require('openai');
+const { google } = require('googleapis');
+const { getAuthorizedClient } = require('../../services/postgres.js');
+const Stripe = require('stripe');
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const { handleCommands } = require('./commands');
-
-// ---- exports that webhook/dispatch use ----
-module.exports = {
-  expense: handleExpense,
-  revenue: handleRevenue,
-  bill: handleBill,
-  job: handleJob,
-  quote: handleQuote,
-  metrics: handleMetrics,
-  tax: handleTax,
-  receipt: handleReceipt,
-  timeclock: handleTimeclock,
-
-  // ✅ always a callable function now, regardless of how ./team exports
-  team: teamFn,
-
-  // legacy/combined command router if you still use it
-  handleCommands,
-};
-
+// NOTE: if you reference helpers like categorizeEntry / appendToUserSpreadsheet / getActiveJob / getLastQuery,
+// ensure they are imported where they actually live in your codebase.
 
 async function handleGenericQuery(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -808,7 +785,7 @@ module.exports = {
   tax: handleTax,
   receipt: handleReceipt,
   timeclock: handleTimeclock,
-  team: teamFn, 
+  team: teamFn,
   handleCommands,
 };
 

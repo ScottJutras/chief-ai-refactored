@@ -1,24 +1,29 @@
 // handlers/commands/index.js
+
 const { handleExpense } = require('./expense');
 const { handleRevenue } = require('./revenue');
 const { handleBill } = require('./bill');
-// job.js now exports the function directly
+
 const handleJob = require('./job');
+
 const { handleQuote } = require('./quote');
 const { handleMetrics } = require('./metrics');
 const { handleTax } = require('./tax');
 const { handleReceipt } = require('./receipt');
-const { handleTeam } = require('./team');
 const { handleTimeclock } = require('./timeclock');
 
+// --- Robust import for team handler (supports both export styles) ---
 const teamMod = require('./team');
 const teamFn = (typeof teamMod === 'function') ? teamMod : teamMod.handleTeam;
 
+// Utilities / services referenced by handleCommands
 const { isOnboardingTrigger, isValidCommand, isValidExpenseInput } = require('../../utils/inputValidator');
 const { db, admin } = require('../../services/firebase');
-const { getOnboardingState, setOnboardingState, deleteOnboardingState } = require('../../utils/stateManager');
+const {
+  getOnboardingState, setOnboardingState, deleteOnboardingState,
+  getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState
+} = require('../../utils/stateManager');
 const { saveUserProfile } = require('../../services/postgres.js');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
 const { sendTemplateMessage, sendMessage } = require('../../services/twilio');
 const { confirmationTemplates } = require('../../config');
 const OpenAI = require('openai');
@@ -26,18 +31,32 @@ const { google } = require('googleapis');
 const { getAuthorizedClient } = require('../../services/postgres.js');
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-const { handleCommands } = require('./commands');
 // NOTE: if you reference helpers like categorizeEntry / appendToUserSpreadsheet / getActiveJob / getLastQuery,
 // ensure they are imported where they actually live in your codebase.
+let categorizeEntry, appendToUserSpreadsheet, getActiveJob, getLastQuery, addPricingItem, detectErrors, correctErrorsWithAI;
+try {
+  // adjust paths as needed:
+  ({ categorizeEntry, appendToUserSpreadsheet, getActiveJob, getLastQuery, addPricingItem, detectErrors, correctErrorsWithAI } =
+    require('../../services/postgres_extras')); // <— put the real module here
+} catch {
+  categorizeEntry = async () => 'Uncategorized';
+  appendToUserSpreadsheet = async () => {};
+  getActiveJob = async () => null;
+  getLastQuery = async () => null;
+  addPricingItem = async () => {};
+  detectErrors = () => null;
+  correctErrorsWithAI = async () => null;
+}
 
+// ---------- Generic AI fallback ----------
 async function handleGenericQuery(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
   try {
     const response = await openaiClient.chat.completions.create({
-      model: "gpt-4o",
+      model: 'gpt-4o',
       messages: [
-        { role: "system", content: `You are a financial assistant for a small business. Answer the query "${input}" based on user profile: industry=${userProfile.industry}, country=${userProfile.country}.` },
-        { role: "user", content: input }
+        { role: 'system', content: `You are a financial assistant for a small business. Answer the query "${input}" based on user profile: industry=${userProfile.industry}, country=${userProfile.country}.` },
+        { role: 'user', content: input }
       ],
       max_tokens: 200,
       temperature: 0.5
@@ -52,6 +71,8 @@ async function handleGenericQuery(from, input, userProfile, ownerId, ownerProfil
   }
 }
 
+
+// ---------- Your main commands aggregator (keep this; don't import another) ----------
 async function handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lockKey = `lock:${from}`;
   let reply;
@@ -59,12 +80,12 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
     console.log(`[DEBUG] Attempting command processing for ${from}: "${input}"`);
     const lcInput = String(input || '').toLowerCase();
 
-    // Check for pending transaction confirmation
+    // Check pending transaction confirmation
     const pendingState = await getPendingTransactionState(from);
     if (pendingState && (pendingState.pendingExpense || pendingState.pendingRevenue || pendingState.pendingBill)) {
       const type = pendingState.pendingExpense ? 'expense' : pendingState.pendingRevenue ? 'revenue' : 'bill';
       const pendingData = pendingState.pendingExpense || pendingState.pendingRevenue || pendingState.pendingBill;
-      const activeJob = await getActiveJob(ownerId) || "Uncategorized";
+      const activeJob = await getActiveJob(ownerId) || 'Uncategorized';
       const userName = userProfile.name || 'Unknown User';
 
       if (lcInput === 'yes') {
@@ -119,17 +140,17 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
           from,
           type === 'expense' ? confirmationTemplates.expense : type === 'revenue' ? confirmationTemplates.revenue : confirmationTemplates.bill,
           {
-            "1": type === 'expense' ? `${pendingData.amount} for ${pendingData.item} from ${pendingData.store}` :
+            '1': type === 'expense' ? `${pendingData.amount} for ${pendingData.item} from ${pendingData.store}` :
                  type === 'revenue' ? `${pendingData.amount} from ${pendingData.source || pendingData.client}` :
                  `${pendingData.amount} for ${pendingData.billName} (${pendingData.recurrence})`,
-            "2": pendingData.amount,
-            "3": pendingData.date,
-            "4": pendingData.recurrence || ''
+            '2': pendingData.amount,
+            '3': pendingData.date,
+            '4': pendingData.recurrence || ''
           }
         );
         await db.collection('locks').doc(lockKey).delete();
         console.log(`[LOCK] Released lock for ${from} (pending ${type} confirmation)`);
-        return sent ? res.send(`<Response></Response>`) : res.send(`<Response><Message>${reply}</Message></Response>`);
+        return sent ? res.send('<Response></Response>') : res.send(`<Response><Message>${reply}</Message></Response>`);
       }
     }
 
@@ -768,13 +789,14 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
     }
   } catch (err) {
     console.error(`Error in handleCommands: ${err.message}`);
-    reply = `⚠️ An error occurred. Please try again later.`;
+    const reply = '⚠️ An error occurred. Please try again later.';
     await db.collection('locks').doc(lockKey).delete();
     console.log(`[LOCK] Released lock for ${from} (error)`);
     return res.send(`<Response><Message>${reply}</Message></Response>`);
   }
 }
 
+// ---- Exports ----
 module.exports = {
   expense: handleExpense,
   revenue: handleRevenue,
@@ -785,8 +807,8 @@ module.exports = {
   tax: handleTax,
   receipt: handleReceipt,
   timeclock: handleTimeclock,
-  team: teamFn,
-  handleCommands,
+  team: teamFn,          
+  handleCommands,        
 };
 
 

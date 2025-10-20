@@ -311,6 +311,164 @@ module.exports = async function tasksHandler(
       }
     }
 
+// --- ASSIGN EXISTING TASK (fast-path & routed) ---
+// Helpers local to this file (lightweight, no side-effects):
+function _looksLikeAssign(body = '') {
+  return /^\s*assign\b/i.test(String(body || ''));
+}
+function _parseAssignUtterance(body = '') {
+  // Supports:
+  //  - "assign task #24 to Justin"
+  //  - "assign #24 to +1905..."
+  //  - "assign last task to Justin"
+  //  - "assign this to Justin"
+  const t = String(body || '').trim();
+
+  let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: parseInt(m[1], 10), assignee: m[2].trim() };
+
+  m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  m = t.match(/^\s*assign\s+this\s+(?:to|for)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  return null;
+}
+
+// You likely already import these; adjust paths/names if different:
+const { getTaskByNo, updateTaskAssignee } = require('../../services/tasks'); // <-- adjust path if needed
+// Fallbacks if your service functions have different names:
+//   - getTaskByNo(ownerId, taskNo) -> returns a task row with { task_no, title, assigned_to, ... }
+//   - updateTaskAssignee(ownerId, taskNo, newUserId) -> returns updated task
+
+// RESP, cap, fmtDate, sendMessage, getUserByName, getUserBasic,
+// getPendingTransactionState, setPendingTransactionState are already used later in this file.
+
+(async () => {
+  // 1) Sentinel from webhook fast-path (preferred)
+  if (res.locals?.intentArgs?.assignTaskNo && res.locals?.intentArgs?.assigneeName) {
+    const assignTaskNo = res.locals.intentArgs.assignTaskNo;
+    const assigneeName = res.locals.intentArgs.assigneeName;
+
+    // Resolve "last"
+    let taskNo = assignTaskNo;
+    if (taskNo === 'last') {
+      try {
+        const prev = await getPendingTransactionState(from).catch(() => ({}));
+        if (prev?.lastTaskNo != null) taskNo = prev.lastTaskNo;
+      } catch (_) {}
+    }
+
+    if (!taskNo || Number.isNaN(Number(taskNo))) {
+      return res.send(RESP(`⚠️ I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
+    }
+
+    // 1a) Fetch task
+    const task = await getTaskByNo(ownerId, Number(taskNo));
+    if (!task) {
+      return res.send(RESP(`⚠️ I can’t find task #${taskNo}.`));
+    }
+
+    // 1b) Resolve teammate
+    let assignee = null;
+    if (/^\+?\d{10,15}$/.test(assigneeName)) {
+      assignee = await getUserBasic(assigneeName);
+    } else {
+      assignee = await getUserByName(ownerId, assigneeName);
+    }
+    if (!assignee?.user_id) {
+      return res.send(RESP(`⚠️ I couldn’t find a teammate named “${assigneeName}”. Add them to your team first.`));
+    }
+
+    // 1c) Update assignment
+    const updated = await updateTaskAssignee(ownerId, Number(taskNo), assignee.user_id);
+
+    // DM the assignee (best-effort)
+    try {
+      await sendMessage(
+        assignee.user_id,
+        `📝 Task assigned to you: ${cap(updated?.title || task.title)} (#${taskNo})`
+      );
+    } catch (e) {
+      console.warn('[tasks.assign] assignee DM failed:', assignee.user_id, e?.message);
+    }
+
+    // Save lastTaskNo for follow-up commands like “assign this …”
+    try {
+      const prev = await getPendingTransactionState(from).catch(() => ({}));
+      await setPendingTransactionState(from, { ...prev, lastTaskNo: Number(taskNo) });
+      console.log('[tasks.assign] lastTaskNo saved for', from, 'task #', taskNo);
+    } catch (e) {
+      console.warn('[tasks.assign] lastTaskNo state set failed:', e?.message);
+    }
+
+    return res.send(
+      RESP(`✅ Assigned task #${taskNo} to ${cap(assignee.name || assigneeName)}.`)
+    );
+  }
+
+  // 2) Text path: user typed “assign …”
+  if (_looksLikeAssign(body)) {
+    const parsed = _parseAssignUtterance(body);
+    if (!parsed) {
+      return res.send(RESP(`⚠️ I couldn’t parse that. Try “assign task #12 to Justin”.`));
+    }
+
+    let { taskNo, assignee } = parsed;
+
+    if (taskNo === 'last') {
+      try {
+        const prev = await getPendingTransactionState(from).catch(() => ({}));
+        if (prev?.lastTaskNo != null) taskNo = prev.lastTaskNo;
+      } catch (_) {}
+    }
+
+    if (!taskNo || Number.isNaN(Number(taskNo))) {
+      return res.send(RESP(`⚠️ I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
+    }
+
+    const task = await getTaskByNo(ownerId, Number(taskNo));
+    if (!task) {
+      return res.send(RESP(`⚠️ I can’t find task #${taskNo}.`));
+    }
+
+    let assigneeUser = null;
+    if (/^\+?\d{10,15}$/.test(assignee)) {
+      assigneeUser = await getUserBasic(assignee);
+    } else {
+      assigneeUser = await getUserByName(ownerId, assignee);
+    }
+    if (!assigneeUser?.user_id) {
+      return res.send(RESP(`⚠️ I couldn’t find a teammate named “${assignee}”. Add them to your team first.`));
+    }
+
+    const updated = await updateTaskAssignee(ownerId, Number(taskNo), assigneeUser.user_id);
+
+    try {
+      await sendMessage(
+        assigneeUser.user_id,
+        `📝 Task assigned to you: ${cap(updated?.title || task.title)} (#${taskNo})`
+      );
+    } catch (e) {
+      console.warn('[tasks.assign.text] assignee DM failed:', assigneeUser.user_id, e?.message);
+    }
+
+    try {
+      const prev = await getPendingTransactionState(from).catch(() => ({}));
+      await setPendingTransactionState(from, { ...prev, lastTaskNo: Number(taskNo) });
+      console.log('[tasks.assign.text] lastTaskNo saved for', from, 'task #', taskNo);
+    } catch (e) {
+      console.warn('[tasks.assign.text] lastTaskNo state set failed:', e?.message);
+    }
+
+    return res.send(
+      RESP(`✅ Assigned task #${taskNo} to ${cap(assigneeUser.name || assignee)}.`)
+    );
+  }
+})();
+
+
     // --- CREATE LIMIT (applies to all create paths)
     const isTasky = /^task\b/i.test(body) || !!routed?.title;
     if (isTasky) {

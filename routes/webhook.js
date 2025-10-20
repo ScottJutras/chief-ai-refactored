@@ -49,12 +49,12 @@ function ensureReply(res, text) {
   }
 }
 
-function twiml(text) {
-  return `<Response><Message>${text}</Message></Response>`;
-}
+function twiml(text) { return `<Response><Message>${text}</Message></Response>`; }
+
 function getUserTz(userProfile) {
   return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 }
+
 function friendlyTypeLabel(type) {
   if (!type) return 'entry';
   if (type === 'time_entry') return 'time entry';
@@ -142,26 +142,27 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
   }
   return false;
 }
-// helpers/normalization (put near the other small helpers)
-function cleanSpokenCommand(s = '') {
-  let t = String(s || '');
 
-  // Strips invisible bidi/formatting chars that often appear before a '+' from iOS share sheets, etc.
+/* ---------- Normalization helpers (top-level!) ---------- */
+
+// Strips hidden bidi/formatting chars that often sneak in before '+'
 function stripInvisible(s = '') {
   return String(s).replace(/[\u200E\u200F\u202A-\u202E]/g, '');
 }
 
+function cleanSpokenCommand(s = '') {
+  let t = stripInvisible(String(s || ''));
+
   // Normalize exotic commas (，、) to ','
   t = t.replace(/[，、]/g, ',');
 
-  // Strip common speech fillers (safe list)
+  // Strip common speech fillers
   t = t.replace(/\b(?:uh|um|erm|like|you know)\b/gi, '');
 
   // Normalize the "task" cue: "task,|:|-—  foo" → "task foo"
   t = t.replace(/(^|\s)task\s*[,:-–—]?\s*/i, '$1task ');
 
   // Remove stray punctuation except a safe set we allow inside titles
-  // (keep @ # / & ' - for names/handles; remove trailing periods/commas clusters)
   t = t
     .replace(/[^\w@#:/&'’\-\s,\.]/g, '')   // drop odd symbols
     .replace(/\s*\.\s*$/g, '')             // strip final period
@@ -172,19 +173,37 @@ function stripInvisible(s = '') {
   return t;
 }
 
+function normalizeTimePhrase(s = '') {
+  let t = String(s);
+
+  // "in2" → "in 2"
+  t = t.replace(/\bin\s*(\d+)/gi, 'in $1');
+
+  // "2mins" / "2m" → "2 minutes", etc.
+  t = t.replace(/\b(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/gi, (m, n, u) => {
+    const map = {
+      m:'minutes', min:'minutes', mins:'minutes', minute:'minutes', minutes:'minutes',
+      h:'hours', hr:'hours', hrs:'hours', hour:'hours', hours:'hours',
+      d:'days', day:'days', days:'days'
+    };
+    return `${n} ${map[u.toLowerCase()] || u}`;
+  });
+
+  return t.replace(/\s{2,}/g, ' ').trim();
+}
+
 function looksLikeQuestion(s = '') {
   const t = String(s || '').trim().toLowerCase();
   if (!t) return false;
   if (t.includes('?')) return true;
-
-  // Common interrogative/openers
   if (/^(can|could|may|might|should|would|is|are|was|were|do|does|did|how|what|when|where|why|which)\b/.test(t)) return true;
-
-  // Soft question phrases without '?'
   if (/\b(is it (ok|okay|possible)|can i|could i|should i|do you|does it)\b/.test(t)) return true;
-
   return false;
 }
+
+/* (You can keep your contextual-help helpers below this line) */
+// ==== CONTEXTUAL HELP (module-scope helpers) ====
+
 // ==== CONTEXTUAL HELP (module-scope helpers) ====
 
 function looksLikeHelpFollowup(s = '') {
@@ -829,7 +848,10 @@ try {
 try {
   if (!mediaUrl && typeof input === 'string') {
     const raw = input.trim();
-    const cleaned = stripInvisible(raw); // remove hidden chars around '+'
+
+    // Use helper if present, otherwise identity (defensive)
+    const _strip = (typeof stripInvisible === 'function') ? stripInvisible : (x) => x;
+    const cleaned = _strip(raw); // remove hidden chars around '+'
     const lc = cleaned.toLowerCase();
 
     const looksTeamList   = /^\s*team\s*$/.test(lc);
@@ -837,18 +859,22 @@ try {
     const looksTeamRemove = /^\s*remove\s+(?:team(?:mate|(?:\s*member))|member)\b/.test(lc);
 
     if (looksTeamList || looksTeamAdd || looksTeamRemove) {
-      // Hand off to the team handler directly
+      console.log('[TEAM SHORT-CIRCUIT] hit', { cleaned });
+
       const teamFn = getHandler && getHandler('team');
       if (typeof teamFn === 'function') {
-        // Pass the cleaned text so phone like "‪+1..." is parsed correctly
-        const handled = await teamFn(from, cleaned, userProfile, ownerId, ownerProfile, isOwner, res);
-        if (handled !== false) {
-          // team handler returns TwiML string; ensure a 200 if not already sent
-          if (!res.headersSent && typeof handled === 'string' && handled.startsWith('<Response>')) {
-            return res.status(200).type('text/xml').send(handled);
-          }
-          return; // ✅ stop here, handled
+        const out = await teamFn(from, cleaned, userProfile, ownerId, ownerProfile, isOwner, res);
+
+        if (res.headersSent) return; // already replied by handler
+        if (typeof out === 'string' && out.trim().startsWith('<Response>')) {
+          return res.status(200).type('text/xml').send(out);
         }
+        if (out && typeof out === 'object' && typeof out.twiml === 'string') {
+          return res.status(200).type('text/xml').send(out.twiml);
+        }
+        // If handler returned truthy without twiml, send an empty 200 TwiML to appease Twilio
+        if (out) return res.status(200).type('text/xml').send('<Response><Message></Message></Response>');
+        return; // handled
       } else {
         console.warn('[TEAM SHORT-CIRCUIT] team handler not found or not a function');
       }
@@ -858,6 +884,7 @@ try {
   console.warn('[TEAM SHORT-CIRCUIT] skipped:', e?.message);
 }
 // === END TEAM SHORT-CIRCUIT ===
+
 
 
     // ---------- memory bootstrapping ----------

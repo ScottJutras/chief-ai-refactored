@@ -494,7 +494,34 @@ module.exports = async function tasksHandler(
         const team = await getTeamMembers(ownerId);
         const teammates = team.filter((u) => u.user_id && u.user_id !== from);
         if (!teammates.length)
-          return res.send(RESP(`⚠️ I didn’t find any teammates to assign. Add team members first.`));
+try {
+  const prev = await getPendingTransactionState(from).catch(() => ({}));
+  await setPendingTransactionState(from, {
+    ...prev,
+    helpTopic: {
+      key: 'team_add_member',
+      context: { name: assigneeName }  // e.g., "Justin"
+    }
+  });
+  // give a *helpful* answer right now too:
+  return res.send(RESP(
+`I don’t see “${assigneeName}” on your team yet.
+
+Add a teammate by texting:
+• "add teammate Justin +19055551234"
+• or "invite Justin +19055551234"
+
+Once they’re added, say:
+• "assign task #24 to Justin"`
+  ));
+} catch (e) {
+  console.warn('[tasks.assign] helpTopic state set failed:', e?.message);
+  return res.send(RESP(
+`I don’t see “${assigneeName}” on your team yet.
+Add them with "add teammate <Name> <Phone>", then try assigning again.`
+  ));
+}
+      
 
         let createdCount = 0;
         const taskNos = [];

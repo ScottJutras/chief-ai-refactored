@@ -180,6 +180,34 @@ function looksLikeQuestion(s = '') {
 
   return false;
 }
+// ==== CONTEXTUAL HELP (module-scope helpers) ====
+
+function looksLikeHelpFollowup(s = '') {
+  const t = String(s || '').trim().toLowerCase();
+  if (!t) return false;
+
+  // direct asks
+  if (/^(help|how|what)\b/.test(t)) return true;
+
+  // natural follow-ups after an error
+  if (/^(how do i|how to|how do i do that|what do i do|what now|show me)\b/.test(t)) return true;
+
+  // super-short follow-ups
+  if (/^\s*(how|what)\s*$/i.test(t)) return true;
+
+  return false;
+}
+
+// Minimal, inline FAQ for PocketCFO actions — expand as needed
+const HELP_ARTICLES = {
+  team_add_member: ({ name } = {}) =>
+`Here’s how to add ${name ? `"${name}"` : 'a teammate'}:
+1) Text:  "add teammate <Name> <Phone>"
+   e.g.   "add teammate Justin +19055551234"
+2) I’ll store them on your team so you can assign tasks and send DMs.
+
+Then you can say: "assign task #24 to ${name || '<Name>'}".`,
+};
 
 function normalizeTimePhrase(s = '') {
   let t = String(s);
@@ -760,6 +788,39 @@ try {
       console.warn('[WEBHOOK] pending text-reply handler skipped:', e?.message);
     }
     // === END REMINDERS/PENDING SHORT-CIRCUITS ===
+
+// === CONTEXTUAL HELP (FAQ intercept) — must run BEFORE generic helpers/NLP ===
+try {
+  // If a previous handler (e.g., tasks.js) stored a help topic (like team_add_member),
+  // and the user now asks “how do I do that?”, provide a targeted answer.
+  const pending = await getPendingTransactionState(from).catch(() => null);
+
+  if (pending?.helpTopic?.key && looksLikeHelpFollowup(input)) {
+    const { key, context } = pending.helpTopic;
+    const article = HELP_ARTICLES[key];
+
+    if (typeof article === 'function') {
+      // One-shot: consume the help topic so we don’t loop on every message
+      try {
+        await setPendingTransactionState(from, { ...pending, helpTopic: null });
+      } catch {}
+
+      return res
+        .status(200)
+        .type('text/xml')
+        .send(twiml(article(context)));
+    }
+
+    // Unknown key (defensive): clear and soft fallback
+    try {
+      await setPendingTransactionState(from, { ...pending, helpTopic: null });
+    } catch {}
+  }
+} catch (e) {
+  console.warn('[HELP ROUTER] failed:', e?.message);
+}
+
+
 
     // ---------- memory bootstrapping ----------
     const tenantId = ownerId;

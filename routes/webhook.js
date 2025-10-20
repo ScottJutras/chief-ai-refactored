@@ -166,7 +166,24 @@ function cleanSpokenCommand(s = '') {
 
   return t;
 }
+function normalizeTimePhrase(s = '') {
+  let t = String(s);
 
+  // Insert space after "in" when it's glued to a number: "in2" → "in 2"
+  t = t.replace(/\bin\s*(\d+)/gi, 'in $1');
+
+  // Ensure a space between number and unit: "2mins" → "2 mins", "2m" → "2 m"
+  t = t.replace(/\b(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/gi, (m, n, u) => {
+    const map = { m:'minutes', min:'minutes', mins:'minutes', minute:'minutes', minutes:'minutes',
+                  h:'hours', hr:'hours', hrs:'hours', hour:'hours', hours:'hours',
+                  d:'days', day:'days', days:'days' };
+    return `${n} ${map[u.toLowerCase()] || u}`;
+  });
+
+  // Collapse multi-spaces
+  t = t.replace(/\s{2,}/g, ' ').trim();
+  return t;
+}
 
 // ----------------- routes -----------------
 router.get('/', (_req, res) => res.status(200).send('Webhook OK'));
@@ -366,76 +383,139 @@ if (mediaUrl && mediaType) {
     // ---------- END FAST-PATH TASKS ----------
 
     // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
-    try {
-      const pendingState = await getPendingTransactionState(from);
-      const isTextOnly = !mediaUrl && !!input;
+try {
+  const pendingState = await getPendingTransactionState(from);
+  const isTextOnly = !mediaUrl && !!input;
 
-      if (pendingState?.pendingReminder && isTextOnly) {
-        console.log('[WEBHOOK] pendingReminder present for', from, 'input=', input);
-        const { pendingReminder } = pendingState;
-        const lc = String(input || '').trim().toLowerCase();
+  if (pendingState?.pendingReminder && isTextOnly) {
+    console.log('[WEBHOOK] pendingReminder present for', from, 'input=', input);
+    const { pendingReminder } = pendingState;
 
-        const looksLikeReminderReply =
-          lc === 'yes' || lc === 'yes.' || lc === 'yep' || lc === 'yeah' ||
-          lc === 'no'  || lc === 'no.'  || lc === 'cancel' ||
-          /\bremind\b/i.test(input) ||
-          /\bin\s+\d+\s+(min|mins|minutes?|hours?|days?)\b/i.test(lc);
+    // 1) Normalize common voice-typo patterns like "in2min" → "in 2 minutes"
+    //    and optionally run your cleanSpokenCommand helper if available.
+    const maybeNormalized = (typeof normalizeTimePhrase === 'function')
+      ? normalizeTimePhrase(String(input || ''))
+      : String(input || '');
+    const cleanedInput = (typeof cleanSpokenCommand === 'function')
+      ? cleanSpokenCommand(maybeNormalized)
+      : maybeNormalized;
 
-        if (looksLikeReminderReply) {
-          const chrono = require('chrono-node');
-          const { createReminder } = require('../services/reminders');
+    const lc = cleanedInput.trim().toLowerCase();
 
-          if (lc === 'no' || lc === 'cancel') {
-            await deletePendingTransactionState(from);
-            return res.status(200).type('text/xml')
-              .send(`<Response><Message>No problem — no reminder set.</Message></Response>`);
-          }
+    // 2) Decide if this looks like a reply in the reminder flow
+    //    - yes/no/cancel
+    //    - anything with "remind"
+    //    - "in <num> <unit>" with/without missing spaces (handled by normalizeTimePhrase)
+    const looksLikeReminderReply =
+      lc === 'yes' || lc === 'yes.' || lc === 'yep' || lc === 'yeah' ||
+      lc === 'no'  || lc === 'no.'  || lc === 'cancel' ||
+      /\bremind\b/i.test(cleanedInput) ||
+      /\bin\s*\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/i.test(lc) ||
+      // Also catch "tomorrow", "tonight", "later", "this evening" etc.
+      /\b(today|tonight|tomorrow|this\s+(morning|afternoon|evening|night))\b/i.test(lc) ||
+      // Simple absolute time phrases: "at 7", "7pm", "7:30 pm"
+      /\b(?:at\s*)?\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(lc);
 
-          const saidYesOnly = /^(yes\.?|yep|yeah)\s*$/i.test(input.trim());
-          if (saidYesOnly) {
-            return res.status(200).type('text/xml')
-              .send(`<Response><Message>Great — what time should I remind you? (e.g., "7pm tonight" or "tomorrow 8am")</Message></Response>`);
-          }
+    if (looksLikeReminderReply) {
+      const chrono = require('chrono-node');
+      const { createReminder } = require('../services/reminders');
 
-          const tz = getUserTz(userProfile);
-          // Compute tz offset minutes for chrono
-          function getTzOffsetMinutes(tzName) {
-            const now = new Date();
-            const parts = new Intl.DateTimeFormat('en-US', {
-              timeZone: tzName, hour12: false,
-              year: 'numeric', month: '2-digit', day: '2-digit',
-              hour: '2-digit', minute: '2-digit', second: '2-digit'
-            }).formatToParts(now);
-            const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
-            const localIso = `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}`;
-            const asLocal = Date.parse(localIso);
-            const asUtc   = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
-            return (asUtc - asLocal) / 60000;
-          }
-
-          const offsetMinutes = getTzOffsetMinutes(tz);
-          const results = chrono.parse(input, new Date(), { timezone: offsetMinutes, forwardDate: true });
-          if (!results || !results[0]) {
-            return res.status(200).type('text/xml')
-              .send(twiml(`I couldn't find a time in that. Try "7pm tonight" or "tomorrow 8am".`));
-          }
-
-          const dt = results[0].date();
-          const remindAtIso = dt.toISOString();
-
-          await createReminder({
-            ownerId: pendingReminder.ownerId,
-            userId: pendingReminder.userId,
-            taskNo: pendingReminder.taskNo,
-            taskTitle: pendingReminder.taskTitle,
-            remindAt: remindAtIso
-          });
-          await deletePendingTransactionState(from);
-
-          return res.status(200).type('text/xml')
-            .send(twiml(`Got it. Reminder set for ${new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz })}.`));
-        }
+      // 2a) “no / cancel” → stop and clear
+      if (lc === 'no' || lc === 'cancel') {
+        await deletePendingTransactionState(from);
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(twiml(`No problem — no reminder set.`));
       }
+
+      // 2b) “yes” alone → ask for a time
+      const saidYesOnly = /^(yes\.?|yep|yeah)\s*$/i.test(cleanedInput.trim());
+      if (saidYesOnly) {
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(twiml(`Great — what time should I remind you? (e.g., "7pm tonight" or "tomorrow 8am")`));
+      }
+
+      // 3) Parse time from the (normalized) reply in the user's timezone
+      const tz = getUserTz(userProfile);
+
+      function getTzOffsetMinutes(tzName) {
+        const now = new Date();
+        const parts = new Intl.DateTimeFormat('en-US', {
+          timeZone: tzName, hour12: false,
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit'
+        }).formatToParts(now);
+        const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+        const localIso = `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}`;
+        const asLocal = Date.parse(localIso);
+        const asUtc   = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
+        return (asUtc - asLocal) / 60000;
+      }
+
+      const offsetMinutes = getTzOffsetMinutes(tz);
+
+      // Use the cleaned/normalized text for parsing
+      const results = chrono.parse(cleanedInput, new Date(), {
+        timezone: offsetMinutes,
+        forwardDate: true
+      });
+
+      if (!results || !results[0]) {
+        // One more leniency pass: if user said only "in2min" or "in2 minutes" and we missed it,
+        // try explicitly expanding units again (defensive).
+        const fallback = cleanedInput
+          .replace(/\bin\s*(\d+)\s*(m|min|mins)\b/gi, 'in $1 minutes')
+          .replace(/\bin\s*(\d+)\s*(h|hr|hrs)\b/gi, 'in $1 hours')
+          .replace(/\bin\s*(\d+)\s*(d)\b/gi, 'in $1 days');
+
+        const retry = chrono.parse(fallback, new Date(), {
+          timezone: offsetMinutes,
+          forwardDate: true
+        });
+
+        if (!retry || !retry[0]) {
+          return res.status(200).type('text/xml')
+            .send(twiml(`I couldn't find a time in that. Try "in 2 minutes", "7pm tonight", or "tomorrow 8am".`));
+        }
+
+        const dt = retry[0].date();
+        const remindAtIso = dt.toISOString();
+
+        await createReminder({
+          ownerId: pendingReminder.ownerId,
+          userId: pendingReminder.userId,
+          taskNo: pendingReminder.taskNo,
+          taskTitle: pendingReminder.taskTitle,
+          remindAt: remindAtIso
+        });
+        await deletePendingTransactionState(from);
+
+        const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+        return res.status(200).type('text/xml')
+          .send(twiml(`Got it. Reminder set for ${whenStr}.`));
+      }
+
+      // Success path
+      const dt = results[0].date();
+      const remindAtIso = dt.toISOString();
+
+      await createReminder({
+        ownerId: pendingReminder.ownerId,
+        userId: pendingReminder.userId,
+        taskNo: pendingReminder.taskNo,
+        taskTitle: pendingReminder.taskTitle,
+        remindAt: remindAtIso
+      });
+      await deletePendingTransactionState(from);
+
+      const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+      return res.status(200).type('text/xml')
+        .send(twiml(`Got it. Reminder set for ${whenStr}.`));
+    }
+  }
 
       // ---- A) Pending media-driven flows (text replies only, not "tasky")
       const tasky = /^task\b/i.test(input) || (function () {

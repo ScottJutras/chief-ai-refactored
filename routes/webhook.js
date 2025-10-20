@@ -388,6 +388,73 @@ if (mediaUrl && mediaType) {
           // fall through
         }
         // ---------- END ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
+        
+// ---- ASSIGN FAST-PATH (must run BEFORE any task-creation fast-path) ----
+function looksLikeAssign(s = '') {
+  return /^\s*assign\b/i.test(String(s || ''));
+}
+function parseAssignUtterance(s = '') {
+  // Supports: "assign task #24 to Justin", "assign #24 to +1905...", "assign last task to Justin", "assign this to Justin"
+  const t = String(s || '').trim();
+
+  // assign task #<num> to <name>
+  let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: parseInt(m[1], 10), assignee: m[2].trim() };
+
+  // assign last task to <name>
+  m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  // assign this to <name>  (uses lastTaskNo)
+  m = t.match(/^\s*assign\s+this\s+(?:to|for)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  return null;
+}
+
+try {
+  if (typeof input === 'string' && looksLikeAssign(input)) {
+    const parsed = parseAssignUtterance(input);
+    if (parsed) {
+      // Resolve "last" from session state
+      let { taskNo, assignee } = parsed;
+      if (taskNo === 'last') {
+        try {
+          const ps = await getPendingTransactionState(from);
+          if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+        } catch (_) {}
+      }
+
+      if (!taskNo || Number.isNaN(Number(taskNo))) {
+        return res.status(200).type('text/xml')
+          .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
+      }
+
+      // Normalize a command that tasks.js will understand (see drop-in there)
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
+
+      // Call the tasks handler with a sentinel command that triggers the assign block
+      // (It won’t create a task; the handler will intercept this.)
+      const handled = await tasksHandler(
+        from,
+        `__assign__ #${taskNo} to ${assignee}`,
+        userProfile,
+        ownerId,
+        ownerProfile,
+        isOwner,
+        res
+      );
+      if (!res.headersSent && handled !== false) ensureReply(res, `Assigning task #${taskNo} to ${assignee}…`);
+      return;
+    }
+  }
+} catch (e) {
+  console.warn('[ASSIGN FAST-PATH] skipped:', e?.message);
+}
+// ---- END ASSIGN FAST-PATH ----
+
+
 
         // 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts (not a question)
         try {

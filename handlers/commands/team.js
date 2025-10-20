@@ -1,137 +1,132 @@
 // handlers/commands/team.js
-// Supports:
-//   • "team" → list teammates
-//   • "add teammate <Name> <Phone>"  or  "add member <Name> <Phone>"
-//   • "remove teammate <Name|Phone>" or  "remove member <Name|Phone>"
-//
-// Notes:
-//  - Writes real teammate rows into public.users so tasks.js can resolve assignees by name.
-//  - Does NOT call releaseLock here (router handles it in finally).
-
 const { query, normalizePhoneNumber } = require('../../services/postgres');
+const { releaseLock } = require('../../middleware/lock');
 
-const RESP = (t) => `<Response><Message>${t}</Message></Response>`;
+function cleanPhone(p = '') {
+  // Strip unicode LRM/LRE/RLM etc + whitespace, keep leading +
+  const stripped = String(p).replace(/[\u200E\u200F\u202A-\u202E]/g, '').trim();
+  // Keep "+" and digits only
+  const plus = stripped.startsWith('+') ? '+' : '';
+  const digits = stripped.replace(/[^\d]/g, '');
+  return digits ? plus + digits : '';
+}
 
-async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+function looksLikeAdd(s='') {
+  const t = s.toLowerCase();
+  return t.startsWith('add teammate') || t.startsWith('add team member') || t.startsWith('add member');
+}
+function looksLikeRemove(s='') {
+  const t = s.toLowerCase();
+  return t.startsWith('remove teammate') || t.startsWith('remove team member') || t.startsWith('remove member');
+}
+
+function parseAdd(input='') {
+  // Supports:
+  // "add teammate Jaclyn +15199652188"
+  // "add team member Jaclyn +1 519 965 2188"
+  // "add member Jaclyn 15199652188"
+  const m = input.match(/^(?:add\s+(?:team(?:\s*mate|\s+member)?|member))\s+(.+?)\s+([+()\-.\s\d]+)\s*$/i);
+  if (!m) return null;
+  return { name: m[1].trim(), rawPhone: m[2].trim() };
+}
+function parseRemove(input='') {
+  // "remove teammate +15199652188" OR "remove teammate Jaclyn"
+  const byPhone = input.match(/^(?:remove\s+(?:team(?:\s*mate|\s+member)?|member))\s+([+()\-.\s\d]{7,})\s*$/i);
+  if (byPhone) return { phoneOrName: byPhone[1].trim() };
+  const byName = input.match(/^(?:remove\s+(?:team(?:\s*mate|\s+member)?|member))\s+([A-Za-z][\w .'\-]{1,50})\s*$/i);
+  if (byName) return { phoneOrName: byName[1].trim() };
+  return null;
+}
+
+module.exports = async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwner) {
+  const lockKey = `lock:${from}`;
   try {
     if (!isOwner) {
-      return res.send(RESP('⚠️ Only the owner can manage team members.'));
+      return `<Response><Message>⚠️ Only the owner can manage team members.</Message></Response>`;
     }
 
     const body = String(input || '').trim();
 
-    // ---- LIST ----
-    if (/^teams?$/i.test(body)) {
+    // LIST
+    if (/^\s*team\s*$/i.test(body)) {
       const { rows } = await query(
-        `
-        SELECT COALESCE(NULLIF(TRIM(name), ''), phone) AS label,
-               name, phone, role
-          FROM public.users
-         WHERE owner_id = $1
-           AND user_id <> $1               -- exclude the owner "self" row if present
-           AND (is_team_member = TRUE OR role IS NOT NULL)
-         ORDER BY (CASE WHEN role='owner' THEN 0 ELSE 1 END), LOWER(label)
-        `,
+        `select user_id, name, phone, role
+           from users
+          where owner_id = $1 and is_team_member = true
+          order by (case when role='owner' then 0 else 1 end), coalesce(name, phone)`,
         [ownerId]
       );
-
       if (!rows.length) {
-        return res.send(
-          RESP(`No teammates yet. Add one:\nadd teammate Justin +19055551234`)
-        );
+        return `<Response><Message>No team members yet. Try: "add teammate Jaclyn +15195551234"</Message></Response>`;
       }
-
-      const lines = rows.map(r => {
-        const who = r.name || r.phone;
-        const role = r.role || 'employee';
-        return `• ${who} (${role})`;
-      });
-
-      return res.send(RESP(`👥 Team:\n${lines.join('\n')}`));
+      const lines = rows.map((r,i) => `${i+1}. ${r.name ? r.name : r.phone || r.user_id}`);
+      return `<Response><Message>📋 Team Members:\n${lines.join('\n')}</Message></Response>`;
     }
 
-    // ---- ADD ----
-    // "add teammate <Name> <Phone>" OR "add member <Name> <Phone>"
-    {
-      const m = body.match(/^add\s+(?:teammate|member)\s+([a-z][\w\s.'-]{1,50})\s+(\+?\d{10,15})$/i);
-      if (m) {
-        const nameRaw = m[1].trim();
-        const phoneRaw = m[2].trim();
-        const phone = normalizePhoneNumber ? normalizePhoneNumber(phoneRaw) : phoneRaw.replace(/\D/g, '').replace(/^1?/, '+1'); // simple fallback
-
-        // Upsert a concrete teammate row your other logic can find
-        // user_id is commonly the phone; adjust if your schema differs.
-        await query(
-          `
-          INSERT INTO public.users (user_id, owner_id, name, phone, role, is_team_member, created_at)
-          VALUES ($1, $2, $3, $4, 'employee', TRUE, NOW())
-          ON CONFLICT (user_id)
-          DO UPDATE SET
-            owner_id       = EXCLUDED.owner_id,
-            name           = EXCLUDED.name,
-            phone          = EXCLUDED.phone,
-            role           = EXCLUDED.role,
-            is_team_member = TRUE,
-            updated_at     = NOW()
-          `,
-          [phone.replace(/\D/g, ''), ownerId, nameRaw, phone]
-        );
-
-        return res.send(RESP(`✅ Added teammate ${nameRaw} (${phone}). You can now “assign task #12 to ${nameRaw}”.`));
+    // ADD
+    if (looksLikeAdd(body)) {
+      const parsed = parseAdd(body);
+      if (!parsed) {
+        return `<Response><Message>⚠️ Try: "add teammate &lt;Name&gt; &lt;+1XXXXXXXXXX&gt;"</Message></Response>`;
       }
+      const name = parsed.name;
+      const phoneClean = cleanPhone(parsed.rawPhone);
+      if (!/^\+?\d{10,15}$/.test(phoneClean)) {
+        return `<Response><Message>⚠️ Please provide a valid phone number, e.g., +15195551234</Message></Response>`;
+      }
+      const userId = normalizePhoneNumber ? normalizePhoneNumber(phoneClean) : phoneClean.replace(/[^\d]/g,'');
+      await query(
+        `insert into users (user_id, owner_id, name, phone, is_team_member, role, created_at)
+         values ($1,$2,$3,$4,true,'member', now())
+         on conflict (user_id) do update
+           set owner_id = excluded.owner_id,
+               name = coalesce(excluded.name, users.name),
+               phone = coalesce(excluded.phone, users.phone),
+               is_team_member = true,
+               updated_at = now()`,
+        [userId, ownerId, name || null, phoneClean]
+      );
+      return `<Response><Message>✅ Added teammate ${name ? name+' ' : ''}${phoneClean}.</Message></Response>`;
     }
 
-    // ---- REMOVE ----
-    // "remove teammate <Name|Phone>" OR "remove member <Name|Phone>"
-    {
-      const m = body.match(/^remove\s+(?:teammate|member)\s+(.+)$/i);
-      if (m) {
-        const token = m[1].trim();
-        let byPhone = null;
-        let byName = null;
-
-        if (/^\+?\d{10,15}$/.test(token)) {
-          byPhone = normalizePhoneNumber ? normalizePhoneNumber(token) : token.replace(/\D/g, '');
-        } else {
-          byName = token;
-        }
-
-        // Don’t delete the owner row.
-        const { rowCount } = await query(
-          `
-          DELETE FROM public.users
-           WHERE owner_id = $1
-             AND role <> 'owner'
-             AND (
-               ($2::text IS NOT NULL AND (phone = $2 OR user_id = REGEXP_REPLACE($2, '\\D', '', 'g')))
-               OR
-               ($3::text IS NOT NULL AND LOWER(name) = LOWER($3))
-             )
-          `,
-          [ownerId, byPhone, byName]
-        );
-
-        if (!rowCount) {
-          return res.send(RESP(`⚠️ I couldn’t find that teammate. Try a full phone (“+1905…”) or exact name.`));
-        }
-
-        return res.send(RESP(`🗑 Removed teammate ${token}.`));
+    // REMOVE
+    if (looksLikeRemove(body)) {
+      const parsed = parseRemove(body);
+      if (!parsed) {
+        return `<Response><Message>⚠️ Try: "remove teammate +15195551234" or "remove teammate Jaclyn"</Message></Response>`;
       }
+      const token = parsed.phoneOrName;
+      let result;
+      if (/^\+?[\d()\-.\s]{7,}$/.test(token)) {
+        const phoneClean = cleanPhone(token);
+        const userId = phoneClean.replace(/[^\d]/g,'');
+        result = await query(
+          `update users set is_team_member=false, updated_at=now()
+             where owner_id=$1 and (user_id=$2 or phone=$3) and is_team_member=true`,
+          [ownerId, userId, phoneClean]
+        );
+      } else {
+        result = await query(
+          `update users set is_team_member=false, updated_at=now()
+             where owner_id=$1 and lower(name)=lower($2) and is_team_member=true`,
+          [ownerId, token]
+        );
+      }
+      if (result.rowCount === 0) {
+        return `<Response><Message>⚠️ I couldn’t find that teammate.</Message></Response>`;
+      }
+      return `<Response><Message>✅ Removed teammate ${token}.</Message></Response>`;
     }
 
-    // ---- HELP / DEFAULT ----
-    return res.send(
-      RESP(
-        `Try:
-• team
-• add teammate Justin +19055551234
-• remove teammate Justin`
-      )
-    );
-  } catch (error) {
-    console.error('[team] error:', error.message);
-    return res.send(RESP('⚠️ Team error: ' + error.message));
+    // Help
+    return `<Response><Message>Try:
+- "team"
+- "add teammate Jaclyn +15195551234"
+- "remove teammate Jaclyn"</Message></Response>`;
+  } catch (err) {
+    console.error('[team] error:', err.message);
+    return `<Response><Message>⚠️ Team error: ${err.message}</Message></Response>`;
+  } finally {
+    try { await releaseLock(lockKey); } catch {}
   }
-}
-
-module.exports = handleTeam;
+};

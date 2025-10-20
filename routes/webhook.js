@@ -176,20 +176,20 @@ function cleanSpokenCommand(s = '') {
 function normalizeTimePhrase(s = '') {
   let t = String(s);
 
-  // "in2" → "in 2"
+  // Insert space after "in" when it's glued to a number: "in2" → "in 2"
   t = t.replace(/\bin\s*(\d+)/gi, 'in $1');
 
-  // "2mins" / "2m" → "2 minutes", etc.
+  // Ensure a space between number and unit: "2mins" → "2 mins", "2m" → "2 m"
   t = t.replace(/\b(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/gi, (m, n, u) => {
-    const map = {
-      m:'minutes', min:'minutes', mins:'minutes', minute:'minutes', minutes:'minutes',
-      h:'hours', hr:'hours', hrs:'hours', hour:'hours', hours:'hours',
-      d:'days', day:'days', days:'days'
-    };
+    const map = { m:'minutes', min:'minutes', mins:'minutes', minute:'minutes', minutes:'minutes',
+                  h:'hours', hr:'hours', hrs:'hours', hour:'hours', hours:'hours',
+                  d:'days', day:'days', days:'days' };
     return `${n} ${map[u.toLowerCase()] || u}`;
   });
 
-  return t.replace(/\s{2,}/g, ' ').trim();
+  // Collapse multi-spaces
+  t = t.replace(/\s{2,}/g, ' ').trim();
+  return t;
 }
 
 function looksLikeQuestion(s = '') {
@@ -201,8 +201,8 @@ function looksLikeQuestion(s = '') {
   return false;
 }
 
-/* (You can keep your contextual-help helpers below this line) */
-// ==== CONTEXTUAL HELP (module-scope helpers) ====
+
+
 
 // ==== CONTEXTUAL HELP (module-scope helpers) ====
 
@@ -233,24 +233,7 @@ const HELP_ARTICLES = {
 Then you can say: "assign task #24 to ${name || '<Name>'}".`,
 };
 
-function normalizeTimePhrase(s = '') {
-  let t = String(s);
 
-  // Insert space after "in" when it's glued to a number: "in2" → "in 2"
-  t = t.replace(/\bin\s*(\d+)/gi, 'in $1');
-
-  // Ensure a space between number and unit: "2mins" → "2 mins", "2m" → "2 m"
-  t = t.replace(/\b(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/gi, (m, n, u) => {
-    const map = { m:'minutes', min:'minutes', mins:'minutes', minute:'minutes', minutes:'minutes',
-                  h:'hours', hr:'hours', hrs:'hours', hour:'hours', hours:'hours',
-                  d:'days', day:'days', days:'days' };
-    return `${n} ${map[u.toLowerCase()] || u}`;
-  });
-
-  // Collapse multi-spaces
-  t = t.replace(/\s{2,}/g, ' ').trim();
-  return t;
-}
 // -------- Assignment helpers --------
 function parseAssignmentUtterance(s = '', opts = {}) {
   const t = String(s || '').trim();

@@ -808,7 +808,7 @@ module.exports = {
   receipt: handleReceipt,
   timeclock: handleTimeclock,
   team: teamFn,          
-  handleCommands,        
+  handleCommands,       
 };
 
 

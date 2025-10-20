@@ -22,7 +22,10 @@ const {
   getUserByName,
 } = require('../../services/postgres');
 const { sendMessage } = require('../../services/twilio');
-const { setPendingTransactionState } = require('../../utils/stateManager');
+const {
+  setPendingTransactionState,
+  getPendingTransactionState
+} = require('../../utils/stateManager');
 const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
 const isOwnerOrBoard = (p) => (p?.role === 'owner' || p?.role === 'board');
 
@@ -321,47 +324,60 @@ module.exports = async function tasksHandler(
     }
 
     // --- BROADCAST: "task @everyone - <title>"
-    {
-      const titleForAll = parseEveryone(body);
-      if (titleForAll) {
-        const team = await getTeamMembers(ownerId);
-        const teammates = team.filter((u) => u.user_id && u.user_id !== from);
-        if (!teammates.length)
-          return res.send(RESP(`⚠️ I didn’t find any teammates to assign. Add team members first.`));
+{
+  const titleForAll = parseEveryone(body);
+  if (titleForAll) {
+    const team = await getTeamMembers(ownerId);
+    const teammates = team.filter((u) => u.user_id && u.user_id !== from);
+    if (!teammates.length)
+      return res.send(RESP(`⚠️ I didn’t find any teammates to assign. Add team members first.`));
 
-        let createdCount = 0;
-        const taskNos = [];
-        for (const tm of teammates) {
-          const task = await createTask({
-            ownerId,
-            createdBy: from,
-            assignedTo: tm.user_id,
-            title: titleForAll,
-            body: null,
-            type: 'general',
-            dueAt: null,
-          });
-          createdCount++;
-          taskNos.push(task.task_no);
-          // DM teammate (best-effort)
-          try {
-            await sendMessage(
-              tm.user_id,
-              `📝 New team task: ${cap(task.title)} (#${task.task_no})\nAssigned by ${userProfile?.name || 'Owner'}`
-            );
-          } catch (e) {
-            console.warn('[tasks.assign_all] DM failed:', tm.user_id, e?.message);
-          }
-        }
-        return res.send(
-          RESP(
-            `✅ Sent task #${taskNos.join(', #')} to everyone — “${cap(titleForAll)}”. (${createdCount} teammates notified)`
-          )
+    let createdCount = 0;
+    const taskNos = [];
+    for (const tm of teammates) {
+      const task = await createTask({
+        ownerId,
+        createdBy: from,
+        assignedTo: tm.user_id,
+        title: titleForAll,
+        body: null,
+        type: 'general',
+        dueAt: null,
+      });
+      createdCount++;
+      taskNos.push(task.task_no);
+      // DM teammate (best-effort)
+      try {
+        await sendMessage(
+          tm.user_id,
+          `📝 New team task: ${cap(task.title)} (#${task.task_no})\nAssigned by ${userProfile?.name || 'Owner'}`
         );
+      } catch (e) {
+        console.warn('[tasks.assign_all] DM failed:', tm.user_id, e?.message);
       }
     }
 
-    // Preferred path when conversation.js routed intent with args:
+    // ✅ Save lastTaskNo for later quick references (e.g., "assign last task to Justin")
+    try {
+      const last = taskNos[taskNos.length - 1];
+      if (last != null) {
+        const prev = await getPendingTransactionState(from).catch(() => ({}));
+        await setPendingTransactionState(from, { ...prev, lastTaskNo: last });
+        console.log('[tasks.assign_all] lastTaskNo saved for', from, 'task #', last);
+      }
+    } catch (e) {
+      console.warn('[tasks.assign_all] lastTaskNo state set failed:', e?.message);
+    }
+
+    return res.send(
+      RESP(
+        `✅ Sent task #${taskNos.join(', #')} to everyone — “${cap(titleForAll)}”. (${createdCount} teammates notified)`
+      )
+    );
+  }
+}
+
+   // Preferred path when conversation.js routed intent with args:
 if (routed?.title) {
   let title = sanitizeInput(routed.title);
   let resolvedAssignee = from;
@@ -382,7 +398,6 @@ if (routed?.title) {
       resolvedAssignee = found.user_id;
       assigneeLabel = found?.name || routed.assigneeName;
     } else {
-      // External person → put back into the title for context
       title = reinstateAssigneeInTitle(title, 'to', routed.assigneeName);
     }
   }
@@ -413,9 +428,12 @@ if (routed?.title) {
   }
   if (routed.dueAt) reply += `\nDue: ${fmtDate(routed.dueAt)}`;
 
-  // kick off reminder prompt (non-blocking)
+  // ✅ Save lastTaskNo and queue reminder prompt (merge with any existing pending state)
   try {
+    const prev = await getPendingTransactionState(from).catch(() => ({}));
     await setPendingTransactionState(from, {
+      ...prev,
+      lastTaskNo: task.task_no,
       pendingReminder: {
         ownerId,
         userId: from,
@@ -423,10 +441,10 @@ if (routed?.title) {
         taskTitle: task.title
       }
     });
-    console.log('[tasks] pendingReminder set for', from, 'task #', task.task_no); // <-- moved here
+    console.log('[tasks] pendingReminder set & lastTaskNo saved for', from, 'task #', task.task_no);
     reply += `\nDo you want me to send you a reminder?`;
   } catch (e) {
-    console.warn('[tasks] pendingReminder state set failed:', e?.message);
+    console.warn('[tasks] pendingReminder/lastTaskNo state set failed:', e?.message);
   }
 
   return res.send(RESP(reply));
@@ -455,13 +473,11 @@ if (routed?.title) {
       }
 
       if (!resolvedAssignee) {
-        // Not a teammate → keep the mention in the title and assign to sender
         title = reinstateAssigneeInTitle(title, assigneePreposition || 'to', assigneeToken || assignedTo);
         resolvedAssignee = from;
         assigneeLabel = userProfile?.name || from;
       }
     } else {
-      // default: assign to sender
       resolvedAssignee = from;
       assigneeLabel = userProfile?.name || from;
     }
@@ -481,7 +497,6 @@ if (routed?.title) {
       return res.send(RESP('⚠️ Failed to create task. Please try again.'));
     }
 
-    // Single confirmation; DM only if assigning to someone else
     let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
     if (resolvedAssignee !== from) {
       reply += `\nAssigned to: ${cap(assigneeLabel)}`;
@@ -498,9 +513,12 @@ if (routed?.title) {
     }
     if (dueAt) reply += `\nDue: ${fmtDate(dueAt)}`;
 
-    // reminder prompt
+    // ✅ Save lastTaskNo and queue reminder prompt (merge with any existing pending state)
     try {
+      const prev = await getPendingTransactionState(from).catch(() => ({}));
       await setPendingTransactionState(from, {
+        ...prev,
+        lastTaskNo: task.task_no,
         pendingReminder: {
           ownerId,
           userId: from,
@@ -508,16 +526,15 @@ if (routed?.title) {
           taskTitle: task.title
         }
       });
-      console.log('[tasks] pendingReminder set for', from, 'task #', task.task_no); // <-- moved here
+      console.log('[tasks] pendingReminder set & lastTaskNo saved for', from, 'task #', task.task_no);
       reply += `\nDo you want me to send you a reminder?`;
     } catch (e) {
-      console.warn('[tasks] pendingReminder state set failed:', e?.message);
+      console.warn('[tasks] pendingReminder/lastTaskNo state set failed:', e?.message);
     }
 
     return res.send(RESP(reply));
   }
 }
-
 
     // --- Quick help for near-misses
     if (/^task\b/i.test(body) || /\btasks?\b/i.test(body)) {

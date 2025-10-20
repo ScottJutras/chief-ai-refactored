@@ -199,6 +199,35 @@ function normalizeTimePhrase(s = '') {
   t = t.replace(/\s{2,}/g, ' ').trim();
   return t;
 }
+// -------- Assignment helpers --------
+function parseAssignmentUtterance(s = '', opts = {}) {
+  const t = String(s || '').trim();
+
+  // 1) Explicit number: "assign task #21 to Justin", "assign #21 Justin"
+  const m1 = t.match(/\bassign(?:\s+task)?\s*#?\s*(\d+)\s*(?:to|@)?\s+([a-z][\w .'\-]{1,50})\b/i);
+  if (m1) {
+    return { taskNo: parseInt(m1[1], 10), assigneeName: m1[2].trim() };
+  }
+
+  // 2) "assign this to Justin" → fall back to last known created task if available
+  const m2 = t.match(/\bassign\s+(?:this|it)\s+(?:to|@)\s+([a-z][\w .'\-]{1,50})\b/i);
+  if (m2 && (opts.lastTaskNo || opts.pendingTaskNo)) {
+    return { taskNo: opts.lastTaskNo || opts.pendingTaskNo, assigneeName: m2[1].trim() };
+  }
+
+  // 3) "can you assign … to Justin" (optional number)
+  const m3 = t.match(/\bassign(?:\s+task)?\s*#?\s*(\d+)?\s*(?:to|@)\s+([a-z][\w .'\-]{1,50})\b/i);
+  if (m3 && (m3[1] || opts.lastTaskNo || opts.pendingTaskNo)) {
+    return { taskNo: m3[1] ? parseInt(m3[1], 10) : (opts.lastTaskNo || opts.pendingTaskNo), assigneeName: m3[2].trim() };
+  }
+
+  return null;
+}
+
+function looksLikeAssignment(s = '') {
+  const t = String(s || '').toLowerCase();
+  return /\bassign\b/.test(t) && /\b(to|@)\b/.test(t);
+}
 
 // ----------------- routes -----------------
 router.get('/', (_req, res) => res.status(200).send('Webhook OK'));
@@ -314,7 +343,7 @@ if (mediaUrl && mediaType) {
       });
 
       if (transcript && transcript.trim()) {
-        // 🔹 Clean the transcript first (handles "task, get, groceries.")
+        // 🔹 Clean the transcript first (handles things like "task, get, groceries.")
         let cleaned = cleanSpokenCommand(transcript);
 
         // Normalize "remind me …" → "task …"
@@ -324,6 +353,41 @@ if (mediaUrl && mediaType) {
 
         // Make cleaned transcript the new input for the rest of the pipeline
         input = cleaned;
+
+        // ---------- ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
+        try {
+          // Pull a recent task number if available (e.g., from pendingReminder)
+          const pendingState = await getPendingTransactionState(from);
+          const ctx = {
+            pendingTaskNo: pendingState?.pendingReminder?.taskNo || null,
+            lastTaskNo: pendingState?.lastTaskNo || null, // optional if you track it
+          };
+
+          const assignHit = looksLikeAssignment(input) ? parseAssignmentUtterance(input, ctx) : null;
+          if (assignHit && assignHit.taskNo && assignHit.assigneeName) {
+            // Hand off to tasks handler in "assign" mode
+            res.locals = res.locals || {};
+            res.locals.intentArgs = {
+              action: 'assign',
+              taskNo: assignHit.taskNo,
+              assigneeName: assignHit.assigneeName
+            };
+
+            const tasksFn = getHandler && getHandler('tasks');
+            if (typeof tasksFn === 'function') {
+              const normalized = `task assign #${assignHit.taskNo} @${assignHit.assigneeName}`;
+              const handled = await tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              if (!res.headersSent && handled !== false) {
+                ensureReply(res, `✅ Assigned task #${assignHit.taskNo} to ${assignHit.assigneeName}.`);
+              }
+              return; // ✅ handled
+            }
+          }
+        } catch (e) {
+          console.warn('[AUDIO→ASSIGN] skipped:', e?.message);
+          // fall through
+        }
+        // ---------- END ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
 
         // 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts (not a question)
         try {
@@ -382,6 +446,7 @@ if (mediaUrl && mediaType) {
   }
 }
 // ---------- END MEDIA FIRST (AUDIO ONLY) ----------
+
 
 
     // ---------- FAST-PATH TASKS (text-only) ----------
@@ -918,8 +983,38 @@ try {
           }
         }
       }
+// 3.05) ASSIGNMENT SHORT-CIRCUIT (TEXT)
+try {
+  if (typeof input === 'string' && looksLikeAssignment(input)) {
+    const pendingState = await getPendingTransactionState(from);
+    const ctx = {
+      pendingTaskNo: pendingState?.pendingReminder?.taskNo || null,
+      lastTaskNo: pendingState?.lastTaskNo || null, // if you track this
+    };
 
-    
+    const assignHit = parseAssignmentUtterance(input, ctx);
+    if (assignHit && assignHit.taskNo && assignHit.assigneeName) {
+      res.locals = res.locals || {};
+      res.locals.intentArgs = {
+        action: 'assign',
+        taskNo: assignHit.taskNo,
+        assigneeName: assignHit.assigneeName
+      };
+
+      const tasksFn = getHandler && getHandler('tasks');
+      if (typeof tasksFn === 'function') {
+        const normalized = `task assign #${assignHit.taskNo} @${assignHit.assigneeName}`;
+        const handled = await tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+        if (!res.headersSent && handled !== false) {
+          ensureReply(res, `✅ Assigned task #${assignHit.taskNo} to ${assignHit.assigneeName}.`);
+        }
+        return; // ✅ handled
+      }
+    }
+  }
+} catch (e) {
+  console.warn('[ASSIGN] skipped:', e?.message);
+}
 
 
    // 3.1) Fast-path tasks AFTER transcript feed-in

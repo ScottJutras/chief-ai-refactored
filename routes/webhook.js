@@ -146,6 +146,11 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
 function cleanSpokenCommand(s = '') {
   let t = String(s || '');
 
+  // Strips invisible bidi/formatting chars that often appear before a '+' from iOS share sheets, etc.
+function stripInvisible(s = '') {
+  return String(s).replace(/[\u200E\u200F\u202A-\u202E]/g, '');
+}
+
   // Normalize exotic commas (，、) to ','
   t = t.replace(/[，、]/g, ',');
 
@@ -820,6 +825,39 @@ try {
   console.warn('[HELP ROUTER] failed:', e?.message);
 }
 
+// === TEAM SHORT-CIRCUIT (text-only, before NLP & task fast-paths) ===
+try {
+  if (!mediaUrl && typeof input === 'string') {
+    const raw = input.trim();
+    const cleaned = stripInvisible(raw); // remove hidden chars around '+'
+    const lc = cleaned.toLowerCase();
+
+    const looksTeamList   = /^\s*team\s*$/.test(lc);
+    const looksTeamAdd    = /^\s*add\s+(?:team(?:mate|(?:\s*member))|member)\b/.test(lc);
+    const looksTeamRemove = /^\s*remove\s+(?:team(?:mate|(?:\s*member))|member)\b/.test(lc);
+
+    if (looksTeamList || looksTeamAdd || looksTeamRemove) {
+      // Hand off to the team handler directly
+      const teamFn = getHandler && getHandler('team');
+      if (typeof teamFn === 'function') {
+        // Pass the cleaned text so phone like "‪+1..." is parsed correctly
+        const handled = await teamFn(from, cleaned, userProfile, ownerId, ownerProfile, isOwner, res);
+        if (handled !== false) {
+          // team handler returns TwiML string; ensure a 200 if not already sent
+          if (!res.headersSent && typeof handled === 'string' && handled.startsWith('<Response>')) {
+            return res.status(200).type('text/xml').send(handled);
+          }
+          return; // ✅ stop here, handled
+        }
+      } else {
+        console.warn('[TEAM SHORT-CIRCUIT] team handler not found or not a function');
+      }
+    }
+  }
+} catch (e) {
+  console.warn('[TEAM SHORT-CIRCUIT] skipped:', e?.message);
+}
+// === END TEAM SHORT-CIRCUIT ===
 
 
     // ---------- memory bootstrapping ----------

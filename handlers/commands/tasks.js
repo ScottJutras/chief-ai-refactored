@@ -58,22 +58,16 @@ async function checkTaskLimit(ownerId, userId, tier) {
 }
 
 // ---------- helpers ----------
-const parseStatus = (s) =>
-  String(s || 'open').toLowerCase() === 'done' ? 'done' : 'open';
-
 const fmtDate = (d, tz = 'America/Toronto') => {
   try {
     return new Date(d).toLocaleString('en-CA', {
-      timeZone: tz,
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit'
+      timeZone: tz, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
     });
   } catch {
     return new Date(d).toISOString().slice(0,16).replace('T',' ');
   }
 };
+
 
 function sanitizeInput(text) {
   return String(text || '').replace(/[<>"'&]/g, '').trim().slice(0, 140);
@@ -450,63 +444,75 @@ const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone ||
     // --- LIST: "tasks" / "my tasks" / "my tasks done"
     {
       if (/^\s*(tasks|my\s+tasks)\s*$/i.test(body)) {
-        const status = 'open';
-        const rows = await listMyTasks({ ownerId, userId: from, status });
-        if (!rows.length) return res.send(RESP(`✅ You're all clear — no open tasks assigned to you.`));
-const lines = rows.slice(0, 12).map((r) => {
-  const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
-  return `• #${r.task_no} ${cap(r.title)}${due}`;
-});
-        return res.send(
-          RESP(`✅ Here's what's on your plate:\n${lines.join('\n')}\nWant to add due dates or reassign?`)
-        );
-      }
-      const m = body.match(/^my\s+tasks\s+(open|done)$/i);
-      if (m) {
-        const status = parseStatus ? parseStatus(m[1]) : m[1].toLowerCase();
-        const rows = await listMyTasks({ ownerId, userId: from, status });
-        if (!rows.length) return res.send(RESP(`No ${status} tasks assigned to you.`));
-        const lines = rows.slice(0, 12).map((r) => {
-          const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
-          return `• #${r.task_no} ${cap(r.title)}${due}`;
-        });
-        return res.send(RESP(`${status.toUpperCase()} tasks for you:\n${lines.join('\n')}`));
-      }
+  const status = 'open';
+  const rows = await listMyTasks({ ownerId, userId: from, status });
+  if (!rows.length) return res.send(RESP(`✅ You're all clear — no open tasks assigned to you.`));
+
+  const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+  const lines = rows.slice(0, 12).map((r) => {
+    const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+    return `• #${r.task_no} ${cap(r.title)}${due}`;
+  });
+
+  return res.send(RESP(`✅ Here's what's on your plate:\n${lines.join('\n')}\nWant to add due dates or reassign?`));
+}
+
+const m = body.match(/^my\s+tasks\s+(open|done)$/i);
+if (m) {
+  const status = parseStatus(m[1]);
+  const rows = await listMyTasks({ ownerId, userId: from, status });
+  if (!rows.length) return res.send(RESP(`No ${status} tasks assigned to you.`));
+
+  const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+  const lines = rows.slice(0, 12).map((r) => {
+    const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+    return `• #${r.task_no} ${cap(r.title)}${due}`;
+  });
+
+  return res.send(RESP(`${status.toUpperCase()} tasks for you:\n${lines.join('\n')}`));
+}
     }
 
     // --- INBOX (owner/board): "inbox tasks" / "inbox tasks done"
     if (/^inbox\s+tasks(?:\s+(open|done))?$/i.test(body)) {
-      if (!isOwnerOrBoard(userProfile)) {
-        return res.send(RESP('⚠️ You don’t have permission for Inbox tasks.'));
-      }
-      const statusMatch = body.match(/inbox\s+tasks(?:\s+(open|done))?/i);
-      const status = parseStatus ? parseStatus(statusMatch?.[1] || 'open') : (statusMatch?.[1] || 'open');
-      const rows = await listInboxTasks({ ownerId, status });
-      if (!rows.length) return res.send(RESP(`No ${status} tasks in Inbox.`));
-      const lines = rows.slice(0, 12).map((r) => {
-        const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
-        return `• #${r.task_no} ${cap(r.title)} (from ${r.creator_name || r.created_by})${due}`;
-      });
-      return res.send(RESP(`INBOX (${status.toUpperCase()}):\n${lines.join('\n')}`));
-    }
+  if (!isOwnerOrBoard(userProfile)) {
+    return res.send(RESP('⚠️ You don’t have permission for Inbox tasks.'));
+  }
+  const statusMatch = body.match(/inbox\s+tasks(?:\s+(open|done))?/i);
+  const status = parseStatus(statusMatch?.[1] || 'open');
+  const rows = await listInboxTasks({ ownerId, status });
+  if (!rows.length) return res.send(RESP(`No ${status} tasks in Inbox.`));
+
+  const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+  const lines = rows.slice(0, 12).map((r) => {
+    const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+    return `• #${r.task_no} ${cap(r.title)} (from ${r.creator_name || r.created_by})${due}`;
+  });
+
+  return res.send(RESP(`INBOX (${status.toUpperCase()}):\n${lines.join('\n')}`));
+}
+
 
     // --- OTHERS’ TASKS (owner/board): "tasks for Jon"
     {
-      const m = body.match(/^tasks?\s+for\s+(.+)$/i);
-      if (m) {
-        if (!isOwnerOrBoard(userProfile)) {
-          return res.send(RESP('⚠️ You don’t have permission to view others’ tasks.'));
-        }
-        const who = m[1].trim();
-        const rows = await listTasksForUser({ ownerId, nameOrId: who, status: 'open' });
-        if (!rows.length) return res.send(RESP(`No open tasks for "${who}".`));
-        const lines = rows.slice(0, 12).map((r) => {
-          const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
-          return `• #${r.task_no} ${cap(r.title)}${due}`;
-        });
-        return res.send(RESP(`Open tasks for ${who}:\n${lines.join('\n')}`));
-      }
+  const m = body.match(/^tasks?\s+for\s+(.+)$/i);
+  if (m) {
+    if (!isOwnerOrBoard(userProfile)) {
+      return res.send(RESP('⚠️ You don’t have permission to view others’ tasks.'));
     }
+    const who = m[1].trim();
+    const rows = await listTasksForUser({ ownerId, nameOrId: who, status: 'open' });
+    if (!rows.length) return res.send(RESP(`No open tasks for "${who}".`));
+
+    const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+    const lines = rows.slice(0, 12).map((r) => {
+      const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+      return `• #${r.task_no} ${cap(r.title)}${due}`;
+    });
+
+    return res.send(RESP(`Open tasks for ${who}:\n${lines.join('\n')}`));
+  }
+}
 
     // --- DONE / REOPEN
     {

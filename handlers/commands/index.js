@@ -11,7 +11,7 @@ const { handleMetrics } = require('./metrics');
 const { handleTax } = require('./tax');
 const { handleReceipt } = require('./receipt');
 const { handleTimeclock } = require('./timeclock');
-
+const { tasksHandler } = require('./tasks');
 // --- Robust import for team handler (supports both export styles) ---
 const teamMod = require('./team');
 const teamFn = (typeof teamMod === 'function') ? teamMod : teamMod.handleTeam;
@@ -807,7 +807,8 @@ module.exports = {
   tax: handleTax,
   receipt: handleReceipt,
   timeclock: handleTimeclock,
-  team: teamFn,          
+  team: teamFn, 
+  tasks: tasksHandler,         
   handleCommands,       
 };
 

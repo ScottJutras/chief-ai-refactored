@@ -6,7 +6,7 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 // Handlers / services
 const commands = require('../handlers/commands');
-const tasksHandler = require('../handlers/commands/tasks'); // direct import fallback for tasks
+const { tasksHandler } = require('../handlers/commands/tasks');
 const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
@@ -143,6 +143,13 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
   return false;
 }
 
+async function createReminder({ ownerId, userId, taskNo, taskTitle, remindAt }) {
+  await query(
+    `insert into reminders (owner_id, user_id, task_no, title, remind_at, status, created_at)
+     values ($1, $2, $3, $4, $5::timestamptz, 'pending', now())`,
+    [ownerId, userId, taskNo, taskTitle || null, remindAt]
+  );
+}
 /* ---------- Normalization helpers (top-level!) ---------- */
 
 // Strips hidden bidi/formatting chars that often sneak in before '+'
@@ -424,6 +431,37 @@ if (mediaUrl && mediaType) {
         }
         // ---------- END ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
         
+// ---------- REMIND SHORT-CIRCUIT (TEXT) ----------
+try {
+  const s = stripInvisible(String(input || '')).trim();
+  const lc = s.toLowerCase();
+
+  if (/^(remind\b|set\s+(a\s+)?reminder\b)/i.test(lc)) {
+    const tz = getUserTz(userProfile);
+    const offsetMinutes = getTzOffsetMinutes(tz);
+    const m = s.match(/(?:task\s*)?#\s*(\d+)/i);
+    const taskNo = m ? parseInt(m[1], 10) : null;
+
+    const chrono = require('chrono-node');
+    const results = chrono.parse(s, new Date(), { timezone: offsetMinutes, forwardDate: true });
+    if (!taskNo || !results[0]) {
+      return res.status(200).type('text/xml')
+        .send(twiml(`Tell me which task and when. e.g.\n"remind me about task #28 in 10 minutes"`));
+    }
+
+    const remindAtIso = results[0].date().toISOString();
+    await createReminder({ ownerId, userId: from, taskNo, taskTitle: `Task #${taskNo}`, remindAt: remindAtIso });
+
+    const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+    return res.status(200).type('text/xml')
+      .send(twiml(`⏰ Reminder set for task #${taskNo} at ${whenStr}.`));
+  }
+} catch (e) {
+  console.warn('[REMIND SHORT-CIRCUIT] skipped:', e?.message);
+}
+// ---------- END REMIND SHORT-CIRCUIT ----------
+
+
 // ---- ASSIGN FAST-PATH (must run BEFORE any task-creation fast-path) ----
 function looksLikeAssign(s = '') {
   return /^\s*assign\b/i.test(String(s || ''));
@@ -549,6 +587,45 @@ try {
 }
 // ---------- END MEDIA FIRST (AUDIO ONLY) ----------
 
+// text path:
+// Early YES/NO handler for task offers
+try {
+  const lc = String(input || '').trim().toLowerCase();
+  if (lc === 'yes' || lc === 'no') {
+    const ps = await getPendingTransactionState(from); // "from" is the replier
+    if (ps?.pendingTaskOffer?.taskNo && ps?.pendingTaskOffer?.ownerId) {
+      const { taskNo, ownerId, title } = ps.pendingTaskOffer;
+      const accepted = (lc === 'yes');
+
+      const assigneeId = String(from).replace(/\D/g, ''); // normalize!
+
+      await query(
+        `UPDATE public.tasks
+            SET acceptance_status = $4, updated_at = NOW()
+          WHERE owner_id = $1 AND task_no = $2 AND assigned_to = $3`,
+        [ownerId, taskNo, assigneeId, accepted ? 'accepted' : 'declined']
+      );
+
+      // Notify owner (best-effort)
+      try {
+        await sendMessage(
+          ownerId,
+          `📣 ${assigneeId} ${accepted ? 'accepted' : 'declined'} task #${taskNo}${title ? `: ${title}` : ''}`
+        );
+      } catch {}
+
+      // Ack + clear state
+      await sendMessage(from, accepted ? '👍 Accepted — thanks!' : '👌 Declined — got it.');
+      const { pendingTaskOffer, ...rest } = ps;
+      await setPendingTransactionState(from, rest);
+
+      return res.status(200).type('text/xml').send('<Response></Response>');
+    }
+  }
+} catch (e) {
+  console.warn('[task-offer yes/no] skipped:', e?.message);
+}
+
 
 
     // ---------- FAST-PATH TASKS (text-only) ----------
@@ -626,18 +703,19 @@ try {
       const tz = getUserTz(userProfile);
 
       function getTzOffsetMinutes(tzName) {
-        const now = new Date();
-        const parts = new Intl.DateTimeFormat('en-US', {
-          timeZone: tzName, hour12: false,
-          year: 'numeric', month: '2-digit', day: '2-digit',
-          hour: '2-digit', minute: '2-digit', second: '2-digit'
-        }).formatToParts(now);
-        const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
-        const localIso = `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}`;
-        const asLocal = Date.parse(localIso);
-        const asUtc   = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
-        return (asUtc - asLocal) / 60000;
-      }
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tzName, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).formatToParts(now);
+  const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  const localIso = `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}`;
+  const asLocal = Date.parse(localIso);
+  const asUtc   = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
+  return (asLocal - asUtc) / 60000;  // ✅ negative for N. America, positive for e.g. Europe/Asia
+}
+
 
       const offsetMinutes = getTzOffsetMinutes(tz);
 

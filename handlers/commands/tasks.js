@@ -19,10 +19,10 @@ const {
   listTasksForUser,
   markTaskDone,
   reopenTask,
-  getUserBasic,
-  getUserByName,
 } = require('../../services/postgres');
-const { sendMessage } = require('../../services/twilio');
+const { getUserBasic, getUserByName } = require('../../services/users');
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : '');
+const { sendMessage, sendTemplateMessage } = require('../../services/twilio');
 const {
   setPendingTransactionState,
   getPendingTransactionState
@@ -58,7 +58,22 @@ async function checkTaskLimit(ownerId, userId, tier) {
 }
 
 // ---------- helpers ----------
-const fmtDate = (iso) => new Date(iso).toISOString().split('T')[0];
+const parseStatus = (s) =>
+  String(s || 'open').toLowerCase() === 'done' ? 'done' : 'open';
+
+const fmtDate = (d, tz = 'America/Toronto') => {
+  try {
+    return new Date(d).toLocaleString('en-CA', {
+      timeZone: tz,
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit'
+    });
+  } catch {
+    return new Date(d).toISOString().slice(0,16).replace('T',' ');
+  }
+};
 
 function sanitizeInput(text) {
   return String(text || '').replace(/[<>"'&]/g, '').trim().slice(0, 140);
@@ -201,7 +216,26 @@ async function getTeamMembers(ownerId) {
   return rows || [];
 }
 
-// ---------- DB HELPERS (inline; no external "services/tasks") ----------
+// ---------- ASSIGN PARSERS ----------
+function _looksLikeAssign(body = '') {
+  return /^\s*assign\b/i.test(String(body || ''));
+}
+function _parseAssignUtterance(body = '') {
+  const t = String(body || '').trim();
+
+  let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: parseInt(m[1], 10), assignee: m[2].trim() };
+
+  m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  m = t.match(/^\s*assign\s+this\s+(?:to|for|@)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  return null;
+}
+
+// ---------- DB HELPERS ----------
 async function dbGetTaskByNo(ownerId, taskNo) {
   const sql = `
     SELECT task_no, title, assigned_to
@@ -212,6 +246,7 @@ async function dbGetTaskByNo(ownerId, taskNo) {
   const { rows } = await query(sql, [ownerId, Number(taskNo)]);
   return rows[0] || null;
 }
+
 async function dbUpdateTaskAssignee(ownerId, taskNo, newUserId) {
   const sql = `
     UPDATE public.tasks
@@ -224,30 +259,21 @@ async function dbUpdateTaskAssignee(ownerId, taskNo, newUserId) {
   return rows[0] || null;
 }
 
-// ---------- ASSIGN PARSERS ----------
-function _looksLikeAssign(body = '') {
-  return /^\s*assign\b/i.test(String(body || ''));
-}
-function _parseAssignUtterance(body = '') {
-  // "assign task #24 to Justin" | "assign #24 to +1905..."
-  // "assign last task to Justin" | "assign this to Justin"
-  const t = String(body || '').trim();
-
-  let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for)\s+(.+?)\s*$/i);
-  if (m) return { taskNo: parseInt(m[1], 10), assignee: m[2].trim() };
-
-  m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for)\s+(.+?)\s*$/i);
-  if (m) return { taskNo: 'last', assignee: m[1].trim() };
-
-  m = t.match(/^\s*assign\s+this\s+(?:to|for)\s+(.+?)\s*$/i);
-  if (m) return { taskNo: 'last', assignee: m[1].trim() };
-
-  return null;
+// Optional: record accept/decline
+async function dbUpdateTaskAcceptance(ownerId, taskNo, assigneeUserId, status) {
+  // Add "acceptance_status" column to tasks (text: 'accepted' | 'declined')
+  const sql = `
+    UPDATE public.tasks
+       SET acceptance_status = $4,
+           updated_at = NOW()
+     WHERE owner_id = $1 AND task_no = $2 AND assigned_to = $3
+  `;
+  await query(sql, [ownerId, Number(taskNo), assigneeUserId, status]);
 }
 
 // ---------- ASSIGN FAST-PATH (MUST RUN BEFORE CREATION PATHS) ----------
-async function maybeHandleAssignmentFastPath({ ownerId, from, body, res }) {
-  // 1) Sentinel from webhook fast-path (preferred)
+async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userProfile, ownerProfile }) {
+  // 1) Vector from earlier router (audio/text short-circuit)
   if (res.locals?.intentArgs?.assignTaskNo && res.locals?.intentArgs?.assigneeName) {
     let taskNo = res.locals.intentArgs.assignTaskNo;
     const assigneeName = res.locals.intentArgs.assigneeName;
@@ -264,10 +290,7 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res }) {
     }
 
     const task = await dbGetTaskByNo(ownerId, Number(taskNo));
-    if (!task) {
-      res.send(RESP(`⚠️ I can’t find task #${taskNo}.`));
-      return true;
-    }
+    if (!task) { res.send(RESP(`⚠️ I can’t find task #${taskNo}.`)); return true; }
 
     // Resolve teammate
     let assignee = null;
@@ -279,107 +302,149 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res }) {
       return true;
     }
 
+    // Update assignment
     const updated = await dbUpdateTaskAssignee(ownerId, Number(taskNo), assignee.user_id);
 
-    // Best-effort DM
+    // Save a pending task offer on ASSIGNEE so their "Yes/No" reply correlates
     try {
-      await sendMessage(
-        assignee.user_id,
-        `📝 Task assigned to you: ${cap(updated?.title || task.title)} (#${taskNo})`
-      );
+      const prev = await getPendingTransactionState(assignee.user_id).catch(() => ({}));
+      await setPendingTransactionState(assignee.user_id, {
+        ...prev,
+        pendingTaskOffer: {
+          ownerId,
+          taskNo: Number(taskNo),
+          title: (updated?.title || task.title || '').trim()
+        }
+      });
     } catch (e) {
-      console.warn('[tasks.assign] assignee DM failed:', assignee.user_id, e?.message);
+      console.warn('[tasks.assign] failed to set pendingTaskOffer:', e?.message);
+    }
+
+    // Notify assignee (template → fallback)
+    const title = (updated?.title || task.title || '').trim();
+    const to = assignee.user_id.startsWith('+') ? assignee.user_id : `+${assignee.user_id}`;
+    try {
+      await sendTemplateMessage(to, 'hex_task_assign', {
+        "1": userProfile?.name || ownerProfile?.name || 'Your team',
+        "2": `#${taskNo} ${title}`.trim()
+      });
+    } catch (e) {
+      console.warn('[tasks.assign] template DM failed; fallback:', e?.message);
+      await sendMessage(
+        to,
+        `📝 New Task!\n${userProfile?.name || ownerProfile?.name || 'Your team'} assigned you: #${taskNo} ${title}\nDo you accept this task?`
+      );
     }
 
     // Save lastTaskNo for “assign this …”
     try {
       const prev = await getPendingTransactionState(from).catch(() => ({}));
       await setPendingTransactionState(from, { ...prev, lastTaskNo: Number(taskNo) });
-      console.log('[tasks.assign] lastTaskNo saved for', from, 'task #', taskNo);
     } catch (e) {
       console.warn('[tasks.assign] lastTaskNo state set failed:', e?.message);
     }
 
-    res.send(RESP(`✅ Assigned task #${taskNo} to ${cap(assignee.name || assigneeName)}.`));
+    res.send(RESP(`✅ Assigned task #${taskNo} to ${assignee.name || assigneeName}.`));
     return true;
   }
 
-  // 2) Text path: “assign …”
+  // 2) Plain text: "assign …"
   if (_looksLikeAssign(body)) {
-    const parsed = _parseAssignUtterance(body);
-    if (!parsed) {
-      res.send(RESP(`⚠️ I couldn’t parse that. Try “assign task #12 to Justin”.`));
-      return true;
-    }
+    const hit = _parseAssignUtterance(body);
+    if (!hit) return false;
 
-    let { taskNo, assignee } = parsed;
-
+    let { taskNo, assignee } = hit;
     if (taskNo === 'last') {
-      try {
-        const prev = await getPendingTransactionState(from).catch(() => ({}));
-        if (prev?.lastTaskNo != null) taskNo = prev.lastTaskNo;
-      } catch (_) {}
+      const prev = await getPendingTransactionState(from).catch(() => ({}));
+      taskNo = prev?.lastTaskNo;
     }
-    if (!taskNo || Number.isNaN(Number(taskNo))) {
+    if (!taskNo) {
       res.send(RESP(`⚠️ I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
       return true;
     }
 
     const task = await dbGetTaskByNo(ownerId, Number(taskNo));
-    if (!task) {
-      res.send(RESP(`⚠️ I can’t find task #${taskNo}.`));
-      return true;
-    }
+    if (!task) { res.send(RESP(`⚠️ I can’t find task #${taskNo}.`)); return true; }
 
-    let assigneeUser = null;
-    if (/^\+?\d{10,15}$/.test(assignee)) assigneeUser = await getUserBasic(assignee);
-    else assigneeUser = await getUserByName(ownerId, assignee);
+    // Resolve teammate
+    let assigneeRow = null;
+    if (/^\+?\d{10,15}$/.test(assignee)) assigneeRow = await getUserBasic(assignee);
+    else assigneeRow = await getUserByName(ownerId, assignee);
 
-    if (!assigneeUser?.user_id) {
+    if (!assigneeRow?.user_id) {
       res.send(RESP(`⚠️ I couldn’t find a teammate named “${assignee}”. Add them to your team first.`));
       return true;
     }
 
-    const updated = await dbUpdateTaskAssignee(ownerId, Number(taskNo), assigneeUser.user_id);
+    const updated = await dbUpdateTaskAssignee(ownerId, Number(taskNo), assigneeRow.user_id);
 
+    // Save a pending offer on the assignee
     try {
-      await sendMessage(
-        assigneeUser.user_id,
-        `📝 Task assigned to you: ${cap(updated?.title || task.title)} (#${taskNo})`
-      );
+      const prev = await getPendingTransactionState(assigneeRow.user_id).catch(() => ({}));
+      await setPendingTransactionState(assigneeRow.user_id, {
+        ...prev,
+        pendingTaskOffer: {
+          ownerId,
+          taskNo: Number(taskNo),
+          title: (updated?.title || task.title || '').trim()
+        }
+      });
     } catch (e) {
-      console.warn('[tasks.assign.text] assignee DM failed:', assigneeUser.user_id, e?.message);
+      console.warn('[tasks.assign] failed to set pendingTaskOffer:', e?.message);
     }
 
+    // Notify assignee
+    const title = (updated?.title || task.title || '').trim();
+    const to = assigneeRow.user_id.startsWith('+') ? assigneeRow.user_id : `+${assigneeRow.user_id}`;
+    try {
+      await sendTemplateMessage(to, 'hex_task_assign', {
+        "1": userProfile?.name || ownerProfile?.name || 'Your team',
+        "2": `#${taskNo} ${title}`.trim()
+      });
+    } catch (e) {
+      console.warn('[tasks.assign] template DM failed; fallback:', e?.message);
+      await sendMessage(
+        to,
+        `📝 New Task!\n${userProfile?.name || ownerProfile?.name || 'Your team'} assigned you: #${taskNo} ${title}\nDo you accept this task?`
+      );
+    }
+
+    // Save lastTaskNo for convenience
     try {
       const prev = await getPendingTransactionState(from).catch(() => ({}));
       await setPendingTransactionState(from, { ...prev, lastTaskNo: Number(taskNo) });
-      console.log('[tasks.assign.text] lastTaskNo saved for', from, 'task #', taskNo);
     } catch (e) {
-      console.warn('[tasks.assign.text] lastTaskNo state set failed:', e?.message);
+      console.warn('[tasks.assign] lastTaskNo state set failed:', e?.message);
     }
 
-    res.send(RESP(`✅ Assigned task #${taskNo} to ${cap(assigneeUser.name || assignee)}.`));
+    res.send(RESP(`✅ Assigned task #${taskNo} to ${assigneeRow.name || assignee}.`));
     return true;
   }
 
   return false;
 }
 
+
 module.exports = async function tasksHandler(
-  from,
-  input,
-  userProfile,
-  ownerId,
-  ownerProfile,
-  isOwner,
-  res
+  from, input, userProfile, ownerId, ownerProfile, isOwner, res
 ) {
   try {
-    const body = norm(input);
-    const tier = userProfile?.subscription_tier || 'starter';
+    const body = norm ? norm(input) : String(input || '').trim();
+const tier = userProfile?.subscription_tier || 'starter';
+const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 
-    // OPTIONAL: structured args from router (e.g., conversation.js)
+
+    // ✅ run assign fast-path FIRST
+    const handled = await maybeHandleAssignmentFastPath({
+      ownerId,
+      from,
+      body,
+      res,
+      userProfile,
+      ownerProfile,
+    });
+    if (handled) return true;
+
     const routed = res?.locals?.intentArgs || null;
 
     // --- LIST: "tasks" / "my tasks" / "my tasks done"
@@ -388,21 +453,21 @@ module.exports = async function tasksHandler(
         const status = 'open';
         const rows = await listMyTasks({ ownerId, userId: from, status });
         if (!rows.length) return res.send(RESP(`✅ You're all clear — no open tasks assigned to you.`));
-        const lines = rows.slice(0, 12).map((r) => {
-          const due = r.due_at ? ` (due ${fmtDate(r.due_at)})` : '';
-          return `• #${r.task_no} ${cap(r.title)}${due}`;
-        });
+const lines = rows.slice(0, 12).map((r) => {
+  const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+  return `• #${r.task_no} ${cap(r.title)}${due}`;
+});
         return res.send(
           RESP(`✅ Here's what's on your plate:\n${lines.join('\n')}\nWant to add due dates or reassign?`)
         );
       }
       const m = body.match(/^my\s+tasks\s+(open|done)$/i);
       if (m) {
-        const status = parseStatus(m[1]);
+        const status = parseStatus ? parseStatus(m[1]) : m[1].toLowerCase();
         const rows = await listMyTasks({ ownerId, userId: from, status });
         if (!rows.length) return res.send(RESP(`No ${status} tasks assigned to you.`));
         const lines = rows.slice(0, 12).map((r) => {
-          const due = r.due_at ? ` (due ${fmtDate(r.due_at)})` : '';
+          const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
           return `• #${r.task_no} ${cap(r.title)}${due}`;
         });
         return res.send(RESP(`${status.toUpperCase()} tasks for you:\n${lines.join('\n')}`));
@@ -415,11 +480,11 @@ module.exports = async function tasksHandler(
         return res.send(RESP('⚠️ You don’t have permission for Inbox tasks.'));
       }
       const statusMatch = body.match(/inbox\s+tasks(?:\s+(open|done))?/i);
-      const status = parseStatus(statusMatch?.[1] || 'open');
+      const status = parseStatus ? parseStatus(statusMatch?.[1] || 'open') : (statusMatch?.[1] || 'open');
       const rows = await listInboxTasks({ ownerId, status });
       if (!rows.length) return res.send(RESP(`No ${status} tasks in Inbox.`));
       const lines = rows.slice(0, 12).map((r) => {
-        const due = r.due_at ? ` (due ${fmtDate(r.due_at)})` : '';
+        const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
         return `• #${r.task_no} ${cap(r.title)} (from ${r.creator_name || r.created_by})${due}`;
       });
       return res.send(RESP(`INBOX (${status.toUpperCase()}):\n${lines.join('\n')}`));
@@ -436,7 +501,7 @@ module.exports = async function tasksHandler(
         const rows = await listTasksForUser({ ownerId, nameOrId: who, status: 'open' });
         if (!rows.length) return res.send(RESP(`No open tasks for "${who}".`));
         const lines = rows.slice(0, 12).map((r) => {
-          const due = r.due_at ? ` (due ${fmtDate(r.due_at)})` : '';
+          const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
           return `• #${r.task_no} ${cap(r.title)}${due}`;
         });
         return res.send(RESP(`Open tasks for ${who}:\n${lines.join('\n')}`));
@@ -753,4 +818,9 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
     console.error('[tasks] error:', e.message);
     return res.send(RESP('⚠️ Task error: ' + e.message + '. Please try again.'));
   }
+};
+module.exports = {
+  tasksHandler,               
+  dbUpdateTaskAcceptance,     
+  maybeHandleAssignmentFastPath,
 };

@@ -19,6 +19,7 @@ const { tokenMiddleware } = require('../middleware/token');
 const { errorMiddleware } = require('../middleware/error');
 
 // Services
+const { query } = require('../services/postgres');
 const { sendMessage, sendTemplateMessage } = require('../services/twilio');
 const { parseUpload } = require('../services/deepDive');
 const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../utils/stateManager');
@@ -586,7 +587,6 @@ try {
   }
 }
 // ---------- END MEDIA FIRST (AUDIO ONLY) ----------
-
 // text path:
 // Early YES/NO handler for task offers
 try {
@@ -597,7 +597,8 @@ try {
       const { taskNo, ownerId, title } = ps.pendingTaskOffer;
       const accepted = (lc === 'yes');
 
-      const assigneeId = String(from).replace(/\D/g, ''); // normalize!
+      const assigneeId = String(from).replace(/\D/g, ''); // normalize assignee
+      const ownerDigits = String(ownerId).replace(/\D/g, ''); // normalize owner
 
       await query(
         `UPDATE public.tasks
@@ -609,7 +610,7 @@ try {
       // Notify owner (best-effort)
       try {
         await sendMessage(
-          ownerId,
+          ownerDigits,
           `📣 ${assigneeId} ${accepted ? 'accepted' : 'declined'} task #${taskNo}${title ? `: ${title}` : ''}`
         );
       } catch {}
@@ -634,6 +635,7 @@ try {
       if (!mediaUrl && (/^task\b/i.test(bodyTxt) || looksLikeTask(bodyTxt))) {
         try { await deletePendingTransactionState(from); } catch (_) {}
         const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
+        if (!parsed) throw new Error('Could not parse task intent');
         res.locals = res.locals || {};
         res.locals.intentArgs = { title: parsed.title, dueAt: parsed.dueAt, assigneeName: parsed.assignee };
         return tasksHandler(from, bodyTxt, userProfile, ownerId, ownerProfile, isOwner, res);
@@ -1089,10 +1091,7 @@ try {
             }
             const tier = lc.includes('pro') ? 'pro' : 'enterprise';
             const priceId = tier === 'pro' ? process.env.PRO_PRICE_ID : process.env.ENTERPRISE_PRICE_ID;
-            const priceText = tier === 'pro' ? '$29' : '$99';
-
-            const { query } = require('../services/postgres');
-
+            const priceText = tier === 'pro' ? '$29' : '$99'
             const customer = await stripe.customers.create({ phone: from, metadata: { user_id: userProfile.user_id } });
             const paymentLink = await stripe.paymentLinks.create({
               line_items: [{ price: priceId, quantity: 1 }],

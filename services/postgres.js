@@ -3,7 +3,6 @@ const ExcelJS = require('exceljs');
 const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
-const { reverseGeocode } = require('./geocode');
 
 // Initialize ONE Postgres pool with optimized settings
 const pool = new Pool({
@@ -691,7 +690,15 @@ function enforceNoFarFuture(timestampIso) {
   }
 }
 
-async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = null, tz = 'America/Toronto', extras = {}) {
+async function logTimeEntry(
+  ownerId,
+  employeeName,
+  type,
+  timestamp,
+  jobName = null,
+  tz = 'America/Toronto',
+  extras = {}
+) {
   try {
     if (!ownerId) throw new Error('Missing ownerId');
     if (!VALID_TYPES.has(type)) throw new Error('Invalid time entry type');
@@ -745,8 +752,10 @@ async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = nu
     const { rows } = await query(ins, params);
     const insertedId = rows[0].id;
 
+    // 🔻 Lazy-load geocoder only if we need it (breaks postgres <-> geocode cycle)
     if ((lat != null && lng != null) && !address) {
       try {
+        const { reverseGeocode } = require('./geocode');
         address = await reverseGeocode(lat, lng);
         if (address) {
           await query(`UPDATE public.time_entries SET address=$1 WHERE id=$2`, [address, insertedId]);
@@ -762,6 +771,7 @@ async function logTimeEntry(ownerId, employeeName, type, timestamp, jobName = nu
     throw error;
   }
 }
+
 
 async function moveLastEntryToJob(ownerId, employeeName, jobName) {
   const q = `

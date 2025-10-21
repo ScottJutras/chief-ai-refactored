@@ -411,7 +411,7 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
 }
 
 
-module.exports = async function tasksHandler(
+ async function tasksHandler(
   from, input, userProfile, ownerId, ownerProfile, isOwner, res
 ) {
   try {

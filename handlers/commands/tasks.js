@@ -80,14 +80,6 @@ function parseStatus(s = '') {
 const norm = (s = '') =>
   String(s).normalize('NFKC').replace(/[\u00A0\u2007\u202F]/g, ' ').replace(/\s{2,}/g, ' ').trim();
 
-function cap(s = '') {
-  return String(s)
-    .trim()
-    .replace(/\s+/g, ' ')
-    .split(' ')
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join(' ');
-}
 
 // Natural due parsing to catch “tonight/tomorrow/by 5pm”
 function parseNaturalDue(source) {

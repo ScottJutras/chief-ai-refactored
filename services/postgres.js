@@ -1576,6 +1576,85 @@ async function createTask({
   }
 }
 
+// ---------- TASK LISTING (compat layer for existing imports) ----------
+// Returns ALL open tasks for a given user (both created_by OR assigned_to that user).
+// If status !== 'open', it will filter by that exact status (e.g., 'done').
+
+async function listMyTasks({ ownerId, userId, status = 'open' }) {
+  const norm = (typeof normalizePhoneNumber === 'function')
+    ? normalizePhoneNumber(userId)
+    : String(userId).replace(/\D/g, '');
+
+  // For "open", include anything not done/deleted. Otherwise exact match.
+  const statusClause = (status === 'open')
+    ? `t.status NOT IN ('done','deleted')`
+    : `t.status = $3`;
+
+  const params = (status === 'open') ? [ownerId, norm] : [ownerId, norm, status];
+
+  const { rows } = await query(
+    `
+    SELECT
+      t.task_no,
+      t.title,
+      t.due_at,
+      t.status,
+      COALESCE(a.name, t.assigned_to) AS assignee_name,
+      COALESCE(c.name, t.created_by)  AS creator_name
+    FROM public.tasks t
+    LEFT JOIN public.users a ON a.user_id = t.assigned_to
+    LEFT JOIN public.users c ON c.user_id = t.created_by
+    WHERE t.owner_id = $1
+      AND (t.assigned_to = $2 OR t.created_by = $2)
+      AND ${statusClause}
+    ORDER BY t.due_at ASC NULLS LAST, t.task_no ASC
+    `,
+    params
+  );
+  return rows;
+}
+
+// "Inbox" = unassigned tasks under this tenant (open by default)
+async function listInboxTasks({ ownerId, status = 'open' }) {
+  const statusClause = (status === 'open')
+    ? `t.status NOT IN ('done','deleted')`
+    : `t.status = $2`;
+
+  const params = (status === 'open') ? [ownerId] : [ownerId, status];
+
+  const { rows } = await query(
+    `
+    SELECT
+      t.task_no,
+      t.title,
+      t.due_at,
+      t.status,
+      t.created_by,
+      COALESCE(c.name, t.created_by) AS creator_name
+    FROM public.tasks t
+    LEFT JOIN public.users c ON c.user_id = t.created_by
+    WHERE t.owner_id = $1
+      AND t.assigned_to IS NULL
+      AND ${statusClause}
+    ORDER BY t.due_at ASC NULLS LAST, t.task_no ASC
+    `,
+    params
+  );
+  return rows;
+}
+
+// Lookup by teammate name or phone, then reuse listMyTasks
+async function listTasksForUser({ ownerId, nameOrId, status = 'open' }) {
+  let user = null;
+  if (/^\+?\d{10,15}$/.test(String(nameOrId))) {
+    user = await getUserBasic(nameOrId);
+  } else {
+    user = await getUserByName(ownerId, nameOrId);
+  }
+  if (!user || !user.user_id) return [];
+  return await listMyTasks({ ownerId, userId: user.user_id, status });
+}
+
 
 async function markTaskDone({ ownerId, taskNo, actorId }) {
   try {
@@ -1744,8 +1823,6 @@ module.exports = {
   // tasks API
   createTask,
   listMyTasks,
-  listInboxTasks,
-  listTasksForUser,
   markTaskDone,
   reopenTask,
   createTimeEditRequestTask,

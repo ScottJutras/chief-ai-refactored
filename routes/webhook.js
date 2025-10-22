@@ -462,30 +462,78 @@ try {
 }
 // ---------- END REMIND SHORT-CIRCUIT ----------
 
-
-// ---- ASSIGN FAST-PATH (must run BEFORE any task-creation fast-path) ----
+// ==== CONTROL INTENT HELPERS (define once, used by audio + text) ====
 function looksLikeAssign(s = '') {
   return /^\s*assign\b/i.test(String(s || ''));
 }
 function parseAssignUtterance(s = '') {
-  // Supports: "assign task #24 to Justin", "assign #24 to +1905...", "assign last task to Justin", "assign this to Justin"
+  // Supports:
+  //  - "assign task #24 to Justin" / "assign #24 to +1905..." / "assign #24 for Justin"
+  //  - "assign last task to Justin" / "assign last to Justin"
+  //  - "assign this task to Justin" / "assign this to Justin"
   const t = String(s || '').trim();
 
   // assign task #<num> to <name>
-  let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for)\s+(.+?)\s*$/i);
+  let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
   if (m) return { taskNo: parseInt(m[1], 10), assignee: m[2].trim() };
 
   // assign last task to <name>
-  m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for)\s+(.+?)\s*$/i);
+  m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for|@)\s+(.+?)\s*$/i);
   if (m) return { taskNo: 'last', assignee: m[1].trim() };
 
-  // assign this to <name>  (uses lastTaskNo)
-  m = t.match(/^\s*assign\s+this\s+(?:to|for)\s+(.+?)\s*$/i);
+  // assign this to <name>
+  m = t.match(/^\s*assign\s+this(?:\s+task)?\s+(?:to|for|@)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  // “assign to Jaclyn” (implicit last)
+  m = t.match(/^\s*(?:please\s+)?assign\s+(?:to|for|@)\s+(.+?)\s*$/i);
   if (m) return { taskNo: 'last', assignee: m[1].trim() };
 
   return null;
 }
 
+function looksLikeComplete(s = '') {
+  const t = String(s || '').trim().toLowerCase();
+  if (/^(done|complete|completed|finish|finished|close|closed)\b/.test(t)) return true;
+  if (/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
+  if (/^task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
+  return false;
+}
+function parseCompleteUtterance(s = '') {
+  const t = String(s || '').trim();
+  let m = t.match(/^task\s*#?\s*(\d+)\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+  m = t.match(/^(?:done|complete|completed|finish|finished|close|closed)\s+#?(\d+)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+  if (/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i.test(t)) return { taskNo: 'last' };
+  if (/^(done|complete|completed|finish|finished|close|closed)\b/i.test(t)) return { taskNo: 'last' };
+  return null;
+}
+
+function looksLikeDelete(s = '') {
+  const t = String(s || '').trim().toLowerCase();
+  if (/^(delete|remove|cancel|trash)\b/.test(t)) return true;
+  if (/^task\s*#?\s*\d+\s+(?:delete|remove|cancel|trash)\b/.test(t)) return true;
+  if (/^(delete|remove|cancel|trash)\s+this\s+task\b/.test(t)) return true;
+  return false;
+}
+function parseDeleteUtterance(s = '') {
+  const t = String(s || '').trim();
+  let m = t.match(/^(?:delete|remove|cancel|trash)\s+(?:task\s*)?#?(\d+)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+  m = t.match(/^task\s*#?\s*(\d+)\s+(?:delete|remove|cancel|trash)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+  m = t.match(/^(?:delete|remove|cancel|trash)\s+this\s+task\b/i);
+  if (m) return { taskNo: 'last' };
+  return null;
+}
+
+// Convenience used by guards
+function looksLikeAnyControl(s = '') {
+  return looksLikeAssign(s) || looksLikeComplete(s) || looksLikeDelete(s);
+}
+
+// ---- ASSIGN FAST-PATH (must run BEFORE any task-creation fast-path) ----
 try {
   if (typeof input === 'string' && looksLikeAssign(input)) {
     const parsed = parseAssignUtterance(input);
@@ -504,12 +552,11 @@ try {
           .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
       }
 
-      // Normalize a command that tasks.js will understand (see drop-in there)
+      // Normalize a command that tasks.js will understand
       res.locals = res.locals || {};
       res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
 
-      // Call the tasks handler with a sentinel command that triggers the assign block
-      // (It won’t create a task; the handler will intercept this.)
+      // It won’t create a task; the handler will intercept this.
       const handled = await tasksHandler(
         from,
         `__assign__ #${taskNo} to ${assignee}`,
@@ -528,65 +575,72 @@ try {
 }
 // ---- END ASSIGN FAST-PATH ----
 
-
-
-        // 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts (not a question)
-        try {
-          const tasksFn = getHandler && getHandler('tasks');
-          if (
-            typeof tasksFn === 'function' &&
-            ( /^task\b/i.test(cleaned) || (looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) )
-          ) {
-            const args = parseTaskUtterance(cleaned, { tz: getUserTz(userProfile), now: new Date() });
-
-            console.log('[AUDIO→TASK] parsed', {
-              title: args.title,
-              dueAt: args.dueAt,
-              assignee: args.assignee
-            });
-
-            res.locals = res.locals || {};
-            res.locals.intentArgs = { title: args.title, dueAt: args.dueAt, assigneeName: args.assignee };
-
-            const handled = await tasksFn(
-              from,
-              `task - ${args.title}`,
-              userProfile,
-              ownerId,
-              ownerProfile,
-              isOwner,
-              res
-            );
-
-            if (!res.headersSent && handled !== false) {
-              ensureReply(res, `Task created: ${args.title}`);
-            }
-            return; // ✅ handled
-          }
-        } catch (te) {
-          console.warn('[AUDIO→TASK] fast-path failed:', te?.message);
-          // fall through
-        }
-
-        // Treat the rest of the pipeline as text-only now
-        mediaUrl = null;
-        mediaType = null;
-
-      } else {
-        // No usable transcript
-        if (typeof tw === 'string') {
-          return res.status(200).type('text/xml').send(tw);
-        }
-        ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
-        return; // ❌ stop, avoids helper
-      }
-    } catch (err) {
-      console.error('[MEDIA] audio handling error:', err?.message);
-      // Fall through; guard below will prevent helper on empty text
+// 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts (not a question)
+try {
+  const tasksFn = getHandler && getHandler('tasks');
+  if (
+    typeof tasksFn === 'function' &&
+    ( /^task\b/i.test(cleaned) || (typeof looksLikeTask === 'function' && looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) )
+  ) {
+    // ⛔ Guard: do NOT treat control intents as new tasks
+    if (looksLikeAnyControl(cleaned)) {
+      // Let the text-path control fast-paths handle it below
+      throw new Error('control-intent-on-audio'); // bounce to catch -> fall through
     }
+
+    const args = parseTaskUtterance(cleaned, { tz: getUserTz(userProfile), now: new Date() });
+
+    console.log('[AUDIO→TASK] parsed', {
+      title: args.title,
+      dueAt: args.dueAt,
+      assignee: args.assignee
+    });
+
+    res.locals = res.locals || {};
+    res.locals.intentArgs = { title: args.title, dueAt: args.dueAt, assigneeName: args.assignee };
+
+    const handled = await tasksFn(
+      from,
+      `task - ${args.title}`,
+      userProfile,
+      ownerId,
+      ownerProfile,
+      isOwner,
+      res
+    );
+
+    if (!res.headersSent && handled !== false) {
+      ensureReply(res, `Task created: ${args.title}`);
+    }
+    return; // ✅ handled
   }
+} catch (te) {
+  if (te && te.message !== 'control-intent-on-audio') {
+    console.warn('[AUDIO→TASK] fast-path failed:', te?.message);
+  }
+  // fall through to text path
+}
+
+// Treat the rest of the pipeline as text-only now
+mediaUrl = null;
+mediaType = null;
+
+} else {
+  // No usable transcript
+  if (typeof tw === 'string') {
+    return res.status(200).type('text/xml').send(tw);
+  }
+  ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
+  return; // ❌ stop, avoids helper
+}
+} catch (err) {
+  console.error('[MEDIA] audio handling error:', err?.message);
+  // Fall through; guard below will prevent helper on empty text
+}
+}
 }
 // ---------- END MEDIA FIRST (AUDIO ONLY) ----------
+
 // text path:
 // Early YES/NO handler for task offers
 try {
@@ -627,38 +681,15 @@ try {
   console.warn('[task-offer yes/no] skipped:', e?.message);
 }
 
+
+
 // ---------- FAST-PATH ASSIGN (text) ----------
 // Must run BEFORE the task-creation fast-path and NOT depend on external helpers
 try {
   const raw = String(input || '').trim();
-
-  // Local, self-contained helpers
-  const _looksLikeAssign = (s) => /^\s*assign\b/i.test(String(s || ''));
-  const _parseAssign = (s, ctx = {}) => {
-    const t = String(s || '').trim();
-
-    // "assign task #24 to Jaclyn" | "assign #24 to Jaclyn" | "assign #24 for Jaclyn"
-    let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
-    if (m) return { taskNo: parseInt(m[1], 10), assigneeName: m[2].trim() };
-
-    // "assign last task to Jaclyn" | "assign last to Jaclyn"
-    m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for|@)\s+(.+?)\s*$/i);
-    if (m) return { taskNo: 'last', assigneeName: m[1].trim() };
-
-    // "assign this task to Jaclyn" | "assign this to Jaclyn"
-    m = t.match(/^\s*assign\s+this(?:\s+task)?\s+(?:to|for|@)\s+(.+?)\s*$/i);
-    if (m) return { taskNo: 'last', assigneeName: m[1].trim() };
-
-    // "(please) assign to Jaclyn" (use last)
-    m = t.match(/^\s*(?:please\s+)?assign\s+(?:to|for|@)\s+(.+?)\s*$/i);
-    if (m) return { taskNo: 'last', assigneeName: m[1].trim() };
-
-    return null;
-  };
-
-  if (_looksLikeAssign(raw)) {
-    // Resolve "last" from state
-    let { taskNo, assigneeName } = _parseAssign(raw, {}) || {};
+  if (looksLikeAssign(raw)) {
+    let { taskNo, assignee } = parseAssignUtterance(raw) || {};
+    // Resolve "last" from state if needed
     if (taskNo === 'last' || taskNo == null) {
       try {
         const ps = await getPendingTransactionState(from).catch(() => ({}));
@@ -667,35 +698,29 @@ try {
     }
 
     if (!taskNo || Number.isNaN(Number(taskNo))) {
-      return res
-        .status(200)
-        .type('text/xml')
+      return res.status(200).type('text/xml')
         .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Jaclyn”.`));
     }
-    if (!assigneeName) {
-      return res
-        .status(200)
-        .type('text/xml')
+    if (!assignee) {
+      return res.status(200).type('text/xml')
         .send(twiml(`Tell me who to assign it to. e.g. “assign this to Jaclyn”.`));
     }
 
     // Hand off to tasks handler in "assign" mode
     res.locals = res.locals || {};
-    res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName };
+    res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
 
-    // Call tasks handler with any placeholder string; it will read res.locals.intentArgs
     const handled = await tasksHandler(
       from,
-      `__assign__ #${taskNo} to ${assigneeName}`,
+      `__assign__ #${taskNo} to ${assignee}`,
       userProfile,
       ownerId,
       ownerProfile,
       isOwner,
       res
     );
-
     if (!res.headersSent && handled !== false) {
-      ensureReply(res, `Assigning task #${taskNo} to ${assigneeName}…`);
+      ensureReply(res, `Assigning task #${taskNo} to ${assignee}…`);
     }
     return; // ✅ stop here so we don't fall into task creation
   }
@@ -703,40 +728,8 @@ try {
   console.warn('[FAST-PATH ASSIGN] skipped:', e?.message);
 }
 // ---------- END FAST-PATH ASSIGN (text) ----------
+
 // ---- COMPLETE FAST-PATH (must run BEFORE any task-creation fast-path) ----
-function looksLikeComplete(s = '') {
-  const t = String(s || '').trim().toLowerCase();
-  // direct verbs
-  if (/^(done|complete|completed|finish|finished|close|closed)\b/.test(t)) return true;
-  // "this task has been completed/done/finished/closed"
-  if (/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
-  // "task 37 has been completed"
-  if (/^task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
-  return false;
-}
-
-function parseCompleteUtterance(s = '') {
-  const t = String(s || '').trim();
-
-  // 1) explicit number forms
-  let m = t.match(/^task\s*#?\s*(\d+)\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  m = t.match(/^(?:done|complete|completed|finish|finished|close|closed)\s+#?(\d+)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  // 2) implicit “this task …”
-  m = t.match(/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
-  if (m) return { taskNo: 'last' };
-
-  // 3) plain “done/complete/finish” with no number
-  if (/^(done|complete|completed|finish|finished|close|closed)\b/i.test(t)) {
-    return { taskNo: 'last' };
-  }
-
-  return null;
-}
-
 try {
   if (typeof input === 'string' && looksLikeComplete(input)) {
     const hit = parseCompleteUtterance(input);
@@ -780,36 +773,8 @@ try {
   console.warn('[COMPLETE FAST-PATH] skipped:', e?.message);
 }
 // ---- END COMPLETE FAST-PATH ----
+
 // ---- DELETE FAST-PATH (must run BEFORE task-creation fast-path) ----
-function looksLikeDelete(s = '') {
-  const t = String(s || '').trim().toLowerCase();
-  // deletes with number
-  if (/^(delete|remove|cancel|trash)\s+#?\d+\b/.test(t)) return true;
-  // "task 37 delete/remove/cancel"
-  if (/^task\s*#?\s*\d+\s+(?:delete|remove|cancel|trash)\b/.test(t)) return true;
-  // "delete this task"
-  if (/^(delete|remove|cancel|trash)\s+this\s+task\b/.test(t)) return true;
-  return false;
-}
-
-function parseDeleteUtterance(s = '') {
-  const t = String(s || '').trim();
-
-  // delete #<num> / remove #<num> / cancel #<num> / trash #<num>
-  let m = t.match(/^(?:delete|remove|cancel|trash)\s+#?(\d+)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  // task <num> delete/remove/cancel
-  m = t.match(/^task\s*#?\s*(\d+)\s+(?:delete|remove|cancel|trash)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  // delete this task
-  m = t.match(/^(?:delete|remove|cancel|trash)\s+this\s+task\b/i);
-  if (m) return { taskNo: 'last' };
-
-  return null;
-}
-
 try {
   if (typeof input === 'string' && looksLikeDelete(input)) {
     const hit = parseDeleteUtterance(input);
@@ -852,22 +817,20 @@ try {
 }
 // ---- END DELETE FAST-PATH ----
 
-
 // ---------- FAST-PATH TASKS (text-only) ----------
 try {
   const bodyTxt = String(input || '');
 
-  // IMPORTANT: Never treat "assign ..." as a new task
-  const isAssign = /^\s*assign\b/i.test(bodyTxt);
+  // ⛔ Never treat control intents as a new task
+  const isControl = looksLikeAnyControl(bodyTxt);
 
   if (
     !mediaUrl &&
-    !isAssign && // <-- guard
+    !isControl &&
     (/^task\b/i.test(bodyTxt) ||
       (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
   ) {
     try { await deletePendingTransactionState(from); } catch (_) {}
-
     const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
     if (!parsed) throw new Error('Could not parse task intent');
 

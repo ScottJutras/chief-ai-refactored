@@ -628,60 +628,96 @@ try {
 }
 
 // ---------- FAST-PATH ASSIGN (text) ----------
-// Must run BEFORE the task-creation fast-path
+// Must run BEFORE the task-creation fast-path and NOT depend on external helpers
 try {
-  // Normalize light punctuation/speech fillers if you have this helper
-  const s = typeof cleanSpokenCommand === 'function'
-    ? cleanSpokenCommand(String(input || ''))
-    : String(input || '').trim();
+  const raw = String(input || '').trim();
 
-  // Use your existing helpers (names may already be: looksLikeAssignment / parseAssignmentUtterance)
-  if (typeof looksLikeAssignment === 'function' && looksLikeAssignment(s)) {
-    // Pull context so "assign this/last" resolves to the most recent task you created
-    const prev = await getPendingTransactionState(from).catch(() => ({}));
-    const ctx = {
-      lastTaskNo: prev?.lastTaskNo || prev?.pendingReminder?.taskNo || null,
-      pendingTaskNo: prev?.pendingReminder?.taskNo || null,
-    };
+  // Local, self-contained helpers
+  const _looksLikeAssign = (s) => /^\s*assign\b/i.test(String(s || ''));
+  const _parseAssign = (s, ctx = {}) => {
+    const t = String(s || '').trim();
 
-    const hit = typeof parseAssignmentUtterance === 'function'
-      ? parseAssignmentUtterance(s, ctx)
-      : null;
+    // "assign task #24 to Jaclyn" | "assign #24 to Jaclyn" | "assign #24 for Jaclyn"
+    let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+    if (m) return { taskNo: parseInt(m[1], 10), assigneeName: m[2].trim() };
 
-    // Expect shape: { taskNo, assigneeName } — if your helper returns { assignee }, map it to assigneeName
-    if (hit && (hit.taskNo || ctx.lastTaskNo) && (hit.assigneeName || hit.assignee)) {
-      const taskNo = hit.taskNo || ctx.lastTaskNo;
-      const assigneeName = hit.assigneeName || hit.assignee;
+    // "assign last task to Jaclyn" | "assign last to Jaclyn"
+    m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+    if (m) return { taskNo: 'last', assigneeName: m[1].trim() };
 
-      // Hand off to tasks handler with structured intent args
-      res.locals = res.locals || {};
-      res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName };
+    // "assign this task to Jaclyn" | "assign this to Jaclyn"
+    m = t.match(/^\s*assign\s+this(?:\s+task)?\s+(?:to|for|@)\s+(.+?)\s*$/i);
+    if (m) return { taskNo: 'last', assigneeName: m[1].trim() };
 
-      const tasksFn = getHandler && getHandler('tasks');
-      if (typeof tasksFn === 'function') {
-        // Any placeholder string is fine; the handler will read res.locals.intentArgs
-        const normalized = `task assign #${taskNo} @${assigneeName}`;
-        return tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-      }
+    // "(please) assign to Jaclyn" (use last)
+    m = t.match(/^\s*(?:please\s+)?assign\s+(?:to|for|@)\s+(.+?)\s*$/i);
+    if (m) return { taskNo: 'last', assigneeName: m[1].trim() };
 
-      ensureReply(res, `⚠️ Couldn't assign task #${taskNo} right now.`);
-      return;
+    return null;
+  };
+
+  if (_looksLikeAssign(raw)) {
+    // Resolve "last" from state
+    let { taskNo, assigneeName } = _parseAssign(raw, {}) || {};
+    if (taskNo === 'last' || taskNo == null) {
+      try {
+        const ps = await getPendingTransactionState(from).catch(() => ({}));
+        if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+      } catch (_) {}
     }
+
+    if (!taskNo || Number.isNaN(Number(taskNo))) {
+      return res
+        .status(200)
+        .type('text/xml')
+        .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Jaclyn”.`));
+    }
+    if (!assigneeName) {
+      return res
+        .status(200)
+        .type('text/xml')
+        .send(twiml(`Tell me who to assign it to. e.g. “assign this to Jaclyn”.`));
+    }
+
+    // Hand off to tasks handler in "assign" mode
+    res.locals = res.locals || {};
+    res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName };
+
+    // Call tasks handler with any placeholder string; it will read res.locals.intentArgs
+    const handled = await tasksHandler(
+      from,
+      `__assign__ #${taskNo} to ${assigneeName}`,
+      userProfile,
+      ownerId,
+      ownerProfile,
+      isOwner,
+      res
+    );
+
+    if (!res.headersSent && handled !== false) {
+      ensureReply(res, `Assigning task #${taskNo} to ${assigneeName}…`);
+    }
+    return; // ✅ stop here so we don't fall into task creation
   }
 } catch (e) {
-  console.warn('[WEBHOOK] fast-path assign failed:', e?.message);
+  console.warn('[FAST-PATH ASSIGN] skipped:', e?.message);
 }
 // ---------- END FAST-PATH ASSIGN (text) ----------
 
 
+
 // ---------- FAST-PATH TASKS (text-only) ----------
-// Guarded so "assign ..." does not create a new task by mistake
 try {
   const bodyTxt = String(input || '');
+
+  // IMPORTANT: Never treat "assign ..." as a new task
+  const isAssign = /^\s*assign\b/i.test(bodyTxt);
+
   if (
     !mediaUrl &&
-    (typeof looksLikeAssignment !== 'function' || !looksLikeAssignment(bodyTxt)) && // <-- guard
-    (/^task\b/i.test(bodyTxt) || (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
+    !isAssign && // <-- guard
+    (/^task\b/i.test(bodyTxt) ||
+      (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
   ) {
     try { await deletePendingTransactionState(from); } catch (_) {}
 
@@ -701,6 +737,7 @@ try {
   console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
 }
 // ---------- END FAST-PATH TASKS ----------
+
 
     // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
 try {

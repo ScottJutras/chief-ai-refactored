@@ -816,98 +816,149 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
     }
 
     // --- Text command path: "task - ..." or "task ..."
-    {
-      const m = body.match(/^task(?:\s*[:\-])?\s+(.+)$/i);
-      if (m) {
-        const {
-          title: rawTitle,
-          assignedTo,
-          dueAt,
-          assigneeToken,
-          assigneePreposition
-        } = parseTaskCommand(m[1]);
+{
+  const m = body.match(/^task(?:\s*[:\-])?\s+(.+)$/i);
+  if (m) {
+    const afterTask = String(m[1] || '').trim();
 
-        if (!rawTitle) return res.send(RESP('⚠️ Task title is required. Try "task - buy tape".'));
+    // --- Defensive guard: reroute control phrases that slipped through ---
+    // Normalize the common STT quirk for detection
+    const normAfter = (typeof normalizeForControl === 'function')
+      ? normalizeForControl(`task ${afterTask}`)
+      : `task ${afterTask}`;
 
-        let title = rawTitle;
-        let resolvedAssignee = null;
-        let assigneeLabel = null;
+    // 1) Assign form: "task assign #12 to Jaclyn"
+    if (/^\s*task\s+assign\b/i.test(normAfter)) {
+      // Extract number + assignee
+      let mm = normAfter.match(/assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+      if (!mm) {
+        // fallback: "task assign to Jaclyn" => use last
+        const ps = await getPendingTransactionState(from).catch(() => ({}));
+        const last = ps?.lastTaskNo != null ? ps.lastTaskNo : 'last';
+        mm = [null, last, (normAfter.match(/assign\s+(?:to|for|@)\s+(.+?)\s*$/i) || [])[1]];
+      }
+      const n  = mm && mm[1] ? parseInt(mm[1], 10) : 'last';
+      const an = mm && mm[2] ? mm[2].trim() : null;
 
-        if (assignedTo) {
-          if (/^\+?\d{10,15}$/.test(assignedTo)) {
-            const user = await getUserBasic(assignedTo);
-            resolvedAssignee = user?.user_id || null;
-            assigneeLabel = user?.name || assignedTo;
-          } else {
-            const user = await getUserByName(ownerId, assignedTo);
-            resolvedAssignee = user?.user_id || null;
-            assigneeLabel = assignedTo;
-          }
+      if (an) {
+        res.locals = res.locals || {};
+        res.locals.intentArgs = { assignTaskNo: (n === 'last' ? 'last' : Number(n)), assigneeName: an };
+        return tasksHandler(from, `__assign__ #${n} to ${an}`, userProfile, ownerId, ownerProfile, isOwner, res);
+      }
+      // fall through to create if we cannot parse an assignee
+    }
 
-          if (!resolvedAssignee) {
-            // Not a teammate → keep the mention in the title and assign to sender
-            title = reinstateAssigneeInTitle(title, assigneePreposition || 'to', assigneeToken || assignedTo);
-            resolvedAssignee = from;
-            assigneeLabel = userProfile?.name || from;
-          }
-        } else {
-          // default: assign to sender
-          resolvedAssignee = from;
-          assigneeLabel = userProfile?.name || from;
-        }
+    // 2) Complete forms: "task #42 is/’s/id complete", "task #42 has been completed"
+    if (/^\s*task\s*#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/i.test(normAfter) ||
+        /^\s*task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i.test(normAfter)) {
+      let mm = normAfter.match(/task\s*#?\s*(\d+)/i);
+      const n = mm && mm[1] ? parseInt(mm[1], 10) : 'last';
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { doneTaskNo: (n === 'last' ? 'last' : Number(n)) };
+      return tasksHandler(from, `__done__ #${n}`, userProfile, ownerId, ownerProfile, isOwner, res);
+    }
 
-        const task = await createTask({
-          ownerId,
-          createdBy: from,
-          assignedTo: resolvedAssignee,
-          title,
-          body: null,
-          type: 'general',
-          dueAt,
-        });
+    // 3) Delete forms inside a "task ..." prefix, e.g. "task delete #43"
+    if (/^\s*task\s+(?:delete|remove|cancel|trash)\b/i.test(normAfter)) {
+      let mm = normAfter.match(/#\s*(\d+)/) || normAfter.match(/task\s*#?\s*(\d+)/i);
+      const n = mm && mm[1] ? parseInt(mm[1], 10) : 'last';
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { deleteTaskNo: (n === 'last' ? 'last' : Number(n)) };
+      return tasksHandler(from, `__delete__ #${n}`, userProfile, ownerId, ownerProfile, isOwner, res);
+    }
+    // --- End defensive guard ---
 
-        if (!task || task.task_no == null) {
-          console.error('[tasks] createTask failed: missing task_no');
-          return res.send(RESP('⚠️ Failed to create task. Please try again.'));
-        }
+    // Normal task creation path
+    const {
+      title: rawTitle,
+      assignedTo,
+      dueAt,
+      assigneeToken,
+      assigneePreposition
+    } = parseTaskCommand(afterTask);
 
-        // Single confirmation; DM only if assigning to someone else
-        let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
-        if (resolvedAssignee !== from) {
-          reply += `\nAssigned to: ${cap(assigneeLabel)}`;
-          try {
-            await sendMessage(
-              resolvedAssignee,
-              `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${dueAt ? `, due ${fmtDate(dueAt, tz)}` : ''}`
-            );
-          } catch (e) {
-            console.warn('[tasks] Assignee notification failed:', e.message);
-          }
-        }
-        if (dueAt) reply += `\nDue: ${fmtDate(dueAt, tz)}`;
+    if (!rawTitle) return res.send(RESP('⚠️ Task title is required. Try "task - buy tape".'));
 
-        // Save lastTaskNo + reminder prompt
-        try {
-          const prev = await getPendingTransactionState(from).catch(() => ({}));
-          await setPendingTransactionState(from, {
-            ...prev,
-            lastTaskNo: task.task_no,
-            pendingReminder: {
-              ownerId,
-              userId: from,
-              taskNo: task.task_no,
-              taskTitle: task.title
-            }
-          });
-          console.log('[tasks] pendingReminder set & lastTaskNo saved for', from, 'task #', task.task_no);
-          reply += `\nDo you want me to send you a reminder?`;
-        } catch (e) {
-          console.warn('[tasks] pendingReminder/lastTaskNo state set failed:', e?.message);
-        }
+    let title = rawTitle;
+    let resolvedAssignee = null;
+    let assigneeLabel = null;
 
-        return res.send(RESP(reply));
+    if (assignedTo) {
+      if (/^\+?\d{10,15}$/.test(assignedTo)) {
+        const user = await getUserBasic(assignedTo);
+        resolvedAssignee = user?.user_id || null;
+        assigneeLabel = user?.name || assignedTo;
+      } else {
+        const user = await getUserByName(ownerId, assignedTo);
+        resolvedAssignee = user?.user_id || null;
+        assigneeLabel = assignedTo;
+      }
+
+      if (!resolvedAssignee) {
+        // Not a teammate → keep the mention in the title and assign to sender
+        title = reinstateAssigneeInTitle(title, assigneePreposition || 'to', assigneeToken || assignedTo);
+        resolvedAssignee = from;
+        assigneeLabel = userProfile?.name || from;
+      }
+    } else {
+      // default: assign to sender
+      resolvedAssignee = from;
+      assigneeLabel = userProfile?.name || from;
+    }
+
+    const task = await createTask({
+      ownerId,
+      createdBy: from,
+      assignedTo: resolvedAssignee,
+      title,
+      body: null,
+      type: 'general',
+      dueAt,
+    });
+
+    if (!task || task.task_no == null) {
+      console.error('[tasks] createTask failed: missing task_no');
+      return res.send(RESP('⚠️ Failed to create task. Please try again.'));
+    }
+
+    // Single confirmation; DM only if assigning to someone else
+    let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
+    if (resolvedAssignee !== from) {
+      reply += `\nAssigned to: ${cap(assigneeLabel)}`;
+      try {
+        await sendMessage(
+          resolvedAssignee,
+          `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${dueAt ? `, due ${fmtDate(dueAt, tz)}` : ''}`
+        );
+      } catch (e) {
+        console.warn('[tasks] Assignee notification failed:', e.message);
       }
     }
+    if (dueAt) reply += `\nDue: ${fmtDate(dueAt, tz)}`;
+
+    // Save lastTaskNo + reminder prompt
+    try {
+      const prev = await getPendingTransactionState(from).catch(() => ({}));
+      await setPendingTransactionState(from, {
+        ...prev,
+        lastTaskNo: task.task_no,
+        pendingReminder: {
+          ownerId,
+          userId: from,
+          taskNo: task.task_no,
+          taskTitle: task.title
+        }
+      });
+      console.log('[tasks] pendingReminder set & lastTaskNo saved for', from, 'task #', task.task_no);
+      reply += `\nDo you want me to send you a reminder?`;
+    } catch (e) {
+      console.warn('[tasks] pendingReminder/lastTaskNo state set failed:', e?.message);
+    }
+
+    return res.send(RESP(reply));
+  }
+}
+
 
     // --- Quick help for near-misses
     if (/^task\b/i.test(body) || /\btasks?\b/i.test(body)) {

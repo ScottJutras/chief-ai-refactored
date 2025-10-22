@@ -794,6 +794,253 @@ try {
     }
     // ---------- END FAST-PATH TASKS ----------
 
+// Guard helper so we don't redeclare consts or duplicate logic
+function shouldSkipRouters(res) {
+  if (!res) return false;
+  if (res.headersSent) return true;
+  const args = (res.locals && res.locals.intentArgs) || {};
+  return (
+    args.doneTaskNo != null ||
+    args.deleteTaskNo != null ||
+    args.assignTaskNo != null ||
+    !!args.title
+  );
+}
+
+/* ===================== ROUTERS (in order) ===================== */
+
+// 4) Conversational router first
+try {
+  if (!shouldSkipRouters(res)) {
+    const conv = await converseAndRoute(input, { userProfile, ownerId: tenantId, convoState: state });
+
+    const extractMsg = (twimlStr) => {
+      if (!twimlStr) return '';
+      const m = twimlStr.match(/<Message>([\s\S]*?)<\/Message>/);
+      return m ? m[1] : '';
+    };
+
+    if (conv?.handled && conv.twiml) {
+      const responseText = extractMsg(conv.twiml);
+      await logEvent(tenantId, userId, 'clarify', { input, response: responseText, intent: conv.intent || null });
+      await saveConvoState(tenantId, userId, {
+        last_intent: conv.intent || convo.last_intent || null,
+        last_args: conv.args || convo.last_args || {},
+        history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
+      });
+      res.status(200).type('text/xml').send(conv.twiml);
+      return;
+    }
+
+    if (conv && conv.route && conv.normalized) {
+      let responseText = extractMsg(conv.twiml);
+      let handled = false;
+
+      if (conv.route === 'tasks') {
+        const tasksFn = getHandler('tasks');
+        if (typeof tasksFn === 'function') {
+          handled = await tasksFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = responseText || 'Task created!';
+          await logEvent(tenantId, userId, 'tasks.create', { normalized: conv.normalized, args: conv.args || {} });
+        }
+      } else if (conv.route === 'expense') {
+        const expenseFn = getHandler('expense');
+        if (typeof expenseFn === 'function') {
+          handled = await expenseFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = responseText || 'Expense logged!';
+          await logEvent(tenantId, userId, 'expense.add', { normalized: conv.normalized, args: conv.args || {} });
+          if (conv.args?.alias && (conv.args.vendor || conv.args.job)) {
+            await upsertMemory(tenantId, userId, `alias.vendor.${conv.args.alias.toLowerCase()}`, { name: conv.args.vendor || conv.args.job });
+          }
+          if (conv.args?.bucket === 'Overhead') {
+            await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
+          }
+        }
+      } else if (conv.route === 'timeclock') {
+        const normalized = normalizeTimeclockInput(conv.normalized, userProfile);
+        handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+        responseText = responseText || '✅ Timeclock request received.';
+        await logEvent(tenantId, userId, 'timeclock', { normalized, args: conv.args || {} });
+        if (conv.args?.job || conv.args?.job_id) {
+          await saveConvoState(tenantId, userId, {
+            active_job: conv.args.job || convo.active_job || null,
+            active_job_id: conv.args.job_id || convo.active_job_id || null
+          });
+        }
+      } else if (conv.route === 'job') {
+        const jobFn = getHandler('job');
+        if (typeof jobFn === 'function') {
+          handled = await jobFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = responseText || 'Job created!';
+          await logEvent(tenantId, userId, 'job.create', { normalized: conv.normalized, args: conv.args || {} });
+        }
+      }
+
+      if (handled) {
+        await saveConvoState(tenantId, userId, {
+          last_intent: conv.intent || convo.last_intent || null,
+          last_args: conv.args || convo.last_args || {},
+          history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
+        });
+        if (!res.headersSent && conv.twiml) res.status(200).type('text/xml').send(conv.twiml);
+        return;
+      }
+    }
+  } // end shouldSkipRouters guard
+} catch (e) {
+  console.warn('[Conversational Router] error:', e?.message);
+}
+
+/* 6) AI intent router (tool-calls) */
+try {
+  if (!shouldSkipRouters(res)) {
+    const ai = await routeWithAI(input, { userProfile });
+    if (ai) {
+      let handled = false;
+      let responseText = 'Action completed!';
+      let normalizedForLog = null;
+
+      if (ai.intent === 'timeclock.clock_in') {
+        const who = ai.args.person || userProfile?.name || 'Unknown';
+        const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
+        const t = ai.args.time ? ` at ${ai.args.time}` : '';
+        const normalized = `${who} punched in${jobHint}${t}`;
+        normalizedForLog = normalized;
+        handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+        responseText = `Punched in${jobHint}! What’s next?`;
+      } else if (ai.intent === 'timeclock.clock_out') {
+        const who = ai.args.person || userProfile?.name || 'Unknown';
+        const t = ai.args.time ? ` at ${ai.args.time}` : '';
+        const normalized = `${who} punched out${t}`;
+        normalizedForLog = normalized;
+        handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+        responseText = `Clocked out${t}! Anything else?`;
+      } else if (ai.intent === 'job.create') {
+        const name = ai.args.name?.trim();
+        if (name && typeof commands.job === 'function') {
+          const normalized = `create job ${name}`;
+          normalizedForLog = normalized;
+          handled = await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = `Created job: ${name}. Need tasks for it?`;
+        }
+      } else if (ai.intent === 'expense.add') {
+        const amt = ai.args.amount;
+        const cat = ai.args.category ? ` ${ai.args.category}` : '';
+        const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
+        const normalized = `expense $${amt}${cat}${fromWho}`.trim();
+        normalizedForLog = normalized;
+        const expenseFn = getHandler('expense');
+        if (typeof expenseFn === 'function') {
+          handled = await expenseFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = `Logged $${amt}${fromWho}! Got more expenses?`;
+          if (ai.args.merchant) {
+            await upsertMemory(tenantId, userId, `alias.vendor.${ai.args.merchant.toLowerCase()}`, { name: ai.args.merchant });
+          }
+        }
+      }
+
+      if (handled) {
+        await logEvent(tenantId, userId, ai.intent, { normalized: normalizedForLog, args: ai.args });
+        await saveConvoState(tenantId, userId, {
+          last_intent: ai.intent,
+          last_args: ai.args,
+          history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: ai.intent }]
+        });
+        if (!res.headersSent) ensureReply(res, responseText);
+        return;
+      }
+    }
+  } // end shouldSkipRouters guard
+} catch (e) {
+  console.warn('[AI Router] skipped due to error:', e?.message);
+}
+
+/* 0.25) NLP routing (conversation.js) — legacy fallback after AI */
+try {
+  if (!shouldSkipRouters(res)) {
+    const routed = await converseAndRoute(input, {
+      userProfile,
+      ownerId,
+      convoState: state,
+      memory
+    });
+
+    if (routed) {
+      if (routed.handled && routed.twiml) {
+        return res.status(200).type('text/xml').send(routed.twiml);
+      }
+
+      const route = routed.route;
+      if (!routed.handled && route) {
+        let handled = false;
+        let responseText = '';
+
+        res.locals = res.locals || {};
+        res.locals.intentArgs = routed.args || null;
+
+        if (route === 'tasks') {
+          handled = await tasksHandler(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = 'Task created!';
+          if (handled !== false) {
+            await logEvent(tenantId, userId, 'tasks.create', { normalized: routed.normalized, args: routed.args || {} });
+          }
+        } else if (route === 'expense') {
+          const expenseFn = getHandler('expense');
+          if (typeof expenseFn === 'function') {
+            handled = await expenseFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            responseText = 'Expense logged!';
+            if (handled !== false) {
+              await logEvent(tenantId, userId, 'expense.add', { normalized: routed.normalized, args: routed.args || {} });
+              if (routed.args?.alias && (routed.args.vendor || routed.args.job)) {
+                await upsertMemory(tenantId, userId, `alias.vendor.${routed.args.alias.toLowerCase()}`, { name: routed.args.vendor || routed.args.job });
+              }
+              if (routed.args?.bucket === 'Overhead') {
+                await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
+              }
+            }
+          }
+        } else if (route === 'timeclock') {
+          const normalized = normalizeTimeclockInput(routed.normalized, userProfile);
+          handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+          responseText = '✅ Timeclock request received.';
+          if (handled !== false) {
+            await logEvent(tenantId, userId, 'timeclock', { normalized, args: routed.args || {} });
+            if (routed.args?.job || routed.args?.job_id) {
+              await saveConvoState(tenantId, userId, {
+                active_job: routed.args.job || convo.active_job || null,
+                active_job_id: routed.args.job_id || convo.active_job_id || null
+              });
+            }
+          }
+        } else if (route === 'job') {
+          const jobFn = getHandler('job');
+          if (typeof jobFn === 'function') {
+            handled = await jobFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            responseText = 'Job created!';
+            if (handled !== false) {
+              await logEvent(tenantId, userId, 'job.create', { normalized: routed.normalized, args: routed.args || {} });
+            }
+          }
+        }
+
+        if (handled) {
+          await saveConvoState(tenantId, userId, {
+            last_intent: routed.intent || convo.last_intent || null,
+            last_args: routed.args || convo.last_args || {},
+            history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: routed.intent || route || null }]
+          });
+          if (!res.headersSent) ensureReply(res, responseText);
+          return;
+        }
+      }
+    }
+  } // end shouldSkipRouters guard
+} catch (e) {
+  console.warn('[WEBHOOK] NLP route skip:', e?.message);
+}
+/* =================== END ROUTERS =================== */
+
+
     // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
     try {
       const pendingState = await getPendingTransactionState(from);
@@ -1105,87 +1352,7 @@ try {
     ]);
 
     try {
-      // 0.25) NLP routing (conversation.js)
-      try {
-        const routed = await converseAndRoute(input, {
-          userProfile,
-          ownerId,
-          convoState: state,
-          memory
-        });
-
-        if (routed) {
-          if (routed.handled && routed.twiml) {
-            return res.status(200).type('text/xml').send(routed.twiml);
-          }
-
-          const route = routed.route;
-          if (!routed.handled && route) {
-            let handled = false;
-            let responseText = '';
-
-            res.locals = res.locals || {};
-            res.locals.intentArgs = routed.args || null;
-
-            if (route === 'tasks') {
-              handled = await tasksHandler(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              responseText = 'Task created!';
-              if (handled !== false) {
-                await logEvent(tenantId, userId, 'tasks.create', { normalized: routed.normalized, args: routed.args || {} });
-              }
-            } else if (route === 'expense') {
-              const expenseFn = getHandler('expense');
-              if (typeof expenseFn === 'function') {
-                handled = await expenseFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-                responseText = 'Expense logged!';
-                if (handled !== false) {
-                  await logEvent(tenantId, userId, 'expense.add', { normalized: routed.normalized, args: routed.args || {} });
-                  if (routed.args?.alias && (routed.args.vendor || routed.args.job)) {
-                    await upsertMemory(tenantId, userId, `alias.vendor.${routed.args.alias.toLowerCase()}`, { name: routed.args.vendor || routed.args.job });
-                  }
-                  if (routed.args?.bucket === 'Overhead') {
-                    await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
-                  }
-                }
-              }
-            } else if (route === 'timeclock') {
-              const normalized = normalizeTimeclockInput(routed.normalized, userProfile);
-              handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-              responseText = '✅ Timeclock request received.';
-              if (handled !== false) {
-                await logEvent(tenantId, userId, 'timeclock', { normalized, args: routed.args || {} });
-                if (routed.args?.job || routed.args?.job_id) {
-                  await saveConvoState(tenantId, userId, {
-                    active_job: routed.args.job || convo.active_job || null,
-                    active_job_id: routed.args.job_id || convo.active_job_id || null
-                  });
-                }
-              }
-            } else if (route === 'job') {
-              const jobFn = getHandler('job');
-              if (typeof jobFn === 'function') {
-                handled = await jobFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-                responseText = 'Job created!';
-                if (handled !== false) {
-                  await logEvent(tenantId, userId, 'job.create', { normalized: routed.normalized, args: routed.args || {} });
-                }
-              }
-            }
-
-            if (handled) {
-              await saveConvoState(tenantId, userId, {
-                last_intent: routed.intent || convo.last_intent || null,
-                last_args: routed.args || convo.last_args || {},
-                history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: routed.intent || route || null }]
-              });
-              if (!res.headersSent) ensureReply(res, responseText);
-              return;
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('[WEBHOOK] NLP route skip:', e?.message);
-      }
+      
 
       // 0) Onboarding
       if ((userProfile && userProfile.onboarding_in_progress) || input.toLowerCase().includes('start onboarding')) {
@@ -1509,87 +1676,6 @@ try {
   console.warn('[TASK ASSIGN FOLLOW-UP] failed:', e?.message);
 }
 
-
-      // 4) Conversational router first
-      try {
-        const conv = await converseAndRoute(input, { userProfile, ownerId: tenantId, convoState: state });
-
-        const extractMsg = (twimlStr) => {
-          if (!twimlStr) return '';
-          const m = twimlStr.match(/<Message>([\s\S]*?)<\/Message>/);
-          return m ? m[1] : '';
-        };
-
-        if (conv?.handled && conv.twiml) {
-          const responseText = extractMsg(conv.twiml);
-          await logEvent(tenantId, userId, 'clarify', { input, response: responseText, intent: conv.intent || null });
-          await saveConvoState(tenantId, userId, {
-            last_intent: conv.intent || convo.last_intent || null,
-            last_args: conv.args || convo.last_args || {},
-            history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
-          });
-          res.status(200).type('text/xml').send(conv.twiml);
-          return;
-        }
-
-        if (conv && conv.route && conv.normalized) {
-          let responseText = extractMsg(conv.twiml);
-          let handled = false;
-
-          if (conv.route === 'tasks') {
-            const tasksFn = getHandler('tasks');
-            if (typeof tasksFn === 'function') {
-              handled = await tasksFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              responseText = responseText || 'Task created!';
-              await logEvent(tenantId, userId, 'tasks.create', { normalized: conv.normalized, args: conv.args || {} });
-            }
-          } else if (conv.route === 'expense') {
-            const expenseFn = getHandler('expense');
-            if (typeof expenseFn === 'function') {
-              handled = await expenseFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              responseText = responseText || 'Expense logged!';
-              await logEvent(tenantId, userId, 'expense.add', { normalized: conv.normalized, args: conv.args || {} });
-              if (conv.args?.alias && (conv.args.vendor || conv.args.job)) {
-                await upsertMemory(tenantId, userId, `alias.vendor.${conv.args.alias.toLowerCase()}`, { name: conv.args.vendor || conv.args.job });
-              }
-              if (conv.args?.bucket === 'Overhead') {
-                await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
-              }
-            }
-          } else if (conv.route === 'timeclock') {
-            const normalized = normalizeTimeclockInput(conv.normalized, userProfile);
-            handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-            responseText = responseText || '✅ Timeclock request received.';
-            await logEvent(tenantId, userId, 'timeclock', { normalized, args: conv.args || {} });
-            if (conv.args?.job || conv.args?.job_id) {
-              await saveConvoState(tenantId, userId, {
-                active_job: conv.args.job || convo.active_job || null,
-                active_job_id: conv.args.job_id || convo.active_job_id || null
-              });
-            }
-          } else if (conv.route === 'job') {
-            const jobFn = getHandler('job');
-            if (typeof jobFn === 'function') {
-              handled = await jobFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              responseText = responseText || 'Job created!';
-              await logEvent(tenantId, userId, 'job.create', { normalized: conv.normalized, args: conv.args || {} });
-            }
-          }
-
-          if (handled) {
-            await saveConvoState(tenantId, userId, {
-              last_intent: conv.intent || convo.last_intent || null,
-              last_args: conv.args || convo.last_args || {},
-              history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
-            });
-            if (!res.headersSent && conv.twiml) res.status(200).type('text/xml').send(conv.twiml);
-            return;
-          }
-        }
-      } catch (e) {
-        console.warn('[Conversational Router] error:', e?.message);
-      }
-
       // 5) Timeclock (direct keywords) — backup path
       if (isTimeclockMessage(input)) {
         const normalized = normalizeTimeclockInput(input, userProfile);
@@ -1597,68 +1683,6 @@ try {
         await logEvent(tenantId, userId, 'timeclock', { normalized });
         if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
         return;
-      }
-
-      // 6) AI intent router (tool-calls)
-      try {
-        const ai = await routeWithAI(input, { userProfile });
-        if (ai) {
-          let handled = false;
-          let responseText = 'Action completed!';
-          let normalizedForLog = null;
-
-          if (ai.intent === 'timeclock.clock_in') {
-            const who = ai.args.person || userProfile?.name || 'Unknown';
-            const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
-            const t = ai.args.time ? ` at ${ai.args.time}` : '';
-            const normalized = `${who} punched in${jobHint}${t}`;
-            normalizedForLog = normalized;
-            handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-            responseText = `Punched in${jobHint}! What’s next?`;
-          } else if (ai.intent === 'timeclock.clock_out') {
-            const who = ai.args.person || userProfile?.name || 'Unknown';
-            const t = ai.args.time ? ` at ${ai.args.time}` : '';
-            const normalized = `${who} punched out${t}`;
-            normalizedForLog = normalized;
-            handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-            responseText = `Clocked out${t}! Anything else?`;
-          } else if (ai.intent === 'job.create') {
-            const name = ai.args.name?.trim();
-            if (name && typeof commands.job === 'function') {
-              const normalized = `create job ${name}`;
-              normalizedForLog = normalized;
-              handled = await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              responseText = `Created job: ${name}. Need tasks for it?`;
-            }
-          } else if (ai.intent === 'expense.add') {
-            const amt = ai.args.amount;
-            const cat = ai.args.category ? ` ${ai.args.category}` : '';
-            const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
-            const normalized = `expense $${amt}${cat}${fromWho}`.trim();
-            normalizedForLog = normalized;
-            const expenseFn = getHandler('expense');
-            if (typeof expenseFn === 'function') {
-              handled = await expenseFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              responseText = `Logged $${amt}${fromWho}! Got more expenses?`;
-              if (ai.args.merchant) {
-                await upsertMemory(tenantId, userId, `alias.vendor.${ai.args.merchant.toLowerCase()}`, { name: ai.args.merchant });
-              }
-            }
-          }
-
-          if (handled) {
-            await logEvent(tenantId, userId, ai.intent, { normalized: normalizedForLog, args: ai.args });
-            await saveConvoState(tenantId, userId, {
-              last_intent: ai.intent,
-              last_args: ai.args,
-              history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: ai.intent }]
-            });
-            if (!res.headersSent) ensureReply(res, responseText);
-            return;
-          }
-        }
-      } catch (e) {
-        console.warn('[AI Router] skipped due to error:', e?.message);
       }
 
       // 7) Fast intent router for jobs

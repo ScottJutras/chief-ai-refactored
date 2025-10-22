@@ -703,7 +703,154 @@ try {
   console.warn('[FAST-PATH ASSIGN] skipped:', e?.message);
 }
 // ---------- END FAST-PATH ASSIGN (text) ----------
+// ---- COMPLETE FAST-PATH (must run BEFORE any task-creation fast-path) ----
+function looksLikeComplete(s = '') {
+  const t = String(s || '').trim().toLowerCase();
+  // direct verbs
+  if (/^(done|complete|completed|finish|finished|close|closed)\b/.test(t)) return true;
+  // "this task has been completed/done/finished/closed"
+  if (/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
+  // "task 37 has been completed"
+  if (/^task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
+  return false;
+}
 
+function parseCompleteUtterance(s = '') {
+  const t = String(s || '').trim();
+
+  // 1) explicit number forms
+  let m = t.match(/^task\s*#?\s*(\d+)\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  m = t.match(/^(?:done|complete|completed|finish|finished|close|closed)\s+#?(\d+)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  // 2) implicit “this task …”
+  m = t.match(/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
+  if (m) return { taskNo: 'last' };
+
+  // 3) plain “done/complete/finish” with no number
+  if (/^(done|complete|completed|finish|finished|close|closed)\b/i.test(t)) {
+    return { taskNo: 'last' };
+  }
+
+  return null;
+}
+
+try {
+  if (typeof input === 'string' && looksLikeComplete(input)) {
+    const hit = parseCompleteUtterance(input);
+    if (hit) {
+      let { taskNo } = hit;
+
+      // resolve "last" using sender's state
+      if (taskNo === 'last') {
+        try {
+          const ps = await getPendingTransactionState(from);
+          if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+        } catch (_) {}
+      }
+
+      if (!taskNo || Number.isNaN(Number(taskNo))) {
+        return res.status(200).type('text/xml')
+          .send(twiml(`I couldn’t tell which task to complete. Try “done #12”.`));
+      }
+
+      // Tell tasks handler to perform a DONE action (sentinel)
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { doneTaskNo: Number(taskNo) };
+
+      const handled = await tasksHandler(
+        from,
+        `__done__ #${taskNo}`,
+        userProfile,
+        ownerId,
+        ownerProfile,
+        isOwner,
+        res
+      );
+
+      if (!res.headersSent && handled !== false) {
+        ensureReply(res, `Completing task #${taskNo}…`);
+      }
+      return; // ✅ handled
+    }
+  }
+} catch (e) {
+  console.warn('[COMPLETE FAST-PATH] skipped:', e?.message);
+}
+// ---- END COMPLETE FAST-PATH ----
+// ---- DELETE FAST-PATH (must run BEFORE task-creation fast-path) ----
+function looksLikeDelete(s = '') {
+  const t = String(s || '').trim().toLowerCase();
+  // deletes with number
+  if (/^(delete|remove|cancel|trash)\s+#?\d+\b/.test(t)) return true;
+  // "task 37 delete/remove/cancel"
+  if (/^task\s*#?\s*\d+\s+(?:delete|remove|cancel|trash)\b/.test(t)) return true;
+  // "delete this task"
+  if (/^(delete|remove|cancel|trash)\s+this\s+task\b/.test(t)) return true;
+  return false;
+}
+
+function parseDeleteUtterance(s = '') {
+  const t = String(s || '').trim();
+
+  // delete #<num> / remove #<num> / cancel #<num> / trash #<num>
+  let m = t.match(/^(?:delete|remove|cancel|trash)\s+#?(\d+)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  // task <num> delete/remove/cancel
+  m = t.match(/^task\s*#?\s*(\d+)\s+(?:delete|remove|cancel|trash)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  // delete this task
+  m = t.match(/^(?:delete|remove|cancel|trash)\s+this\s+task\b/i);
+  if (m) return { taskNo: 'last' };
+
+  return null;
+}
+
+try {
+  if (typeof input === 'string' && looksLikeDelete(input)) {
+    const hit = parseDeleteUtterance(input);
+    if (hit) {
+      let { taskNo } = hit;
+
+      if (taskNo === 'last') {
+        try {
+          const ps = await getPendingTransactionState(from);
+          if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+        } catch (_) {}
+      }
+
+      if (!taskNo || Number.isNaN(Number(taskNo))) {
+        return res.status(200).type('text/xml')
+          .send(twiml(`I couldn’t tell which task to delete. Try “delete #12”.`));
+      }
+
+      // Signal tasks.js to delete
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { deleteTaskNo: Number(taskNo) };
+
+      const handled = await tasksHandler(
+        from,
+        `__delete__ #${taskNo}`,
+        userProfile,
+        ownerId,
+        ownerProfile,
+        isOwner,
+        res
+      );
+      if (!res.headersSent && handled !== false) {
+        ensureReply(res, `Deleting task #${taskNo}…`);
+      }
+      return; // ✅ handled
+    }
+  }
+} catch (e) {
+  console.warn('[DELETE FAST-PATH] skipped:', e?.message);
+}
+// ---- END DELETE FAST-PATH ----
 
 
 // ---------- FAST-PATH TASKS (text-only) ----------

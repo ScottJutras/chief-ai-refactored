@@ -233,7 +233,7 @@ function _parseAssignUtterance(body = '') {
 // ---------- DB HELPERS ----------
 async function dbGetTaskByNo(ownerId, taskNo) {
   const sql = `
-    SELECT task_no, title, assigned_to
+    SELECT task_no, title, assigned_to, created_by
       FROM public.tasks
      WHERE owner_id = $1 AND task_no = $2
      LIMIT 1
@@ -256,7 +256,6 @@ async function dbUpdateTaskAssignee(ownerId, taskNo, newUserId) {
 
 // Optional: record accept/decline
 async function dbUpdateTaskAcceptance(ownerId, taskNo, assigneeUserId, status) {
-  // Add "acceptance_status" column to tasks (text: 'accepted' | 'declined')
   const sql = `
     UPDATE public.tasks
        SET acceptance_status = $4,
@@ -265,22 +264,18 @@ async function dbUpdateTaskAcceptance(ownerId, taskNo, assigneeUserId, status) {
   `;
   await query(sql, [ownerId, Number(taskNo), assigneeUserId, status]);
 }
-// --- DB HELPERS (add/extend) ---
-async function dbGetTaskByNo(ownerId, taskNo) {
-  const sql = `
-    SELECT task_no, title, assigned_to, created_by
-    FROM public.tasks
-    WHERE owner_id = $1 AND task_no = $2
-    LIMIT 1
-  `;
-  const { rows } = await query(sql, [ownerId, Number(taskNo)]);
-  return rows[0] || null;
-}
 
 async function dbDeleteTask(ownerId, taskNo) {
-  // Best-effort: remove pending reminders for this task too
-  await query(`DELETE FROM public.reminders WHERE owner_id=$1 AND task_no=$2 AND status='pending'`, [ownerId, Number(taskNo)]);
-  const { rowCount } = await query(`DELETE FROM public.tasks WHERE owner_id=$1 AND task_no=$2`, [ownerId, Number(taskNo)]);
+  // Remove pending reminders for this task too
+  await query(
+    `DELETE FROM public.reminders
+      WHERE owner_id=$1 AND task_no=$2 AND status='pending'`,
+    [ownerId, Number(taskNo)]
+  );
+  const { rowCount } = await query(
+    `DELETE FROM public.tasks WHERE owner_id=$1 AND task_no=$2`,
+    [ownerId, Number(taskNo)]
+  );
   return rowCount > 0;
 }
 
@@ -438,155 +433,188 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
 }
 
 
- async function tasksHandler(
-  from, input, userProfile, ownerId, ownerProfile, isOwner, res
-) {
+ async function tasksHandler(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   try {
-    const body = norm ? norm(input) : String(input || '').trim();
-const tier = userProfile?.subscription_tier || 'starter';
-const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+    const body = (typeof norm === 'function') ? norm(input) : String(input || '').trim();
+    const tier = userProfile?.subscription_tier || 'starter';
+    const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 
-
-    // ✅ run assign fast-path FIRST
+    // ✅ 1) ASSIGN FAST-PATH FIRST (intercepts both webhook and text forms)
     const handled = await maybeHandleAssignmentFastPath({
-      ownerId,
-      from,
-      body,
-      res,
-      userProfile,
-      ownerProfile,
+      ownerId, from, body, res, userProfile, ownerProfile,
     });
     if (handled) return true;
 
+    // Sentinels supplied by webhook fast-paths
     const routed = res?.locals?.intentArgs || null;
+
+    // ✅ 2) DONE SENTINEL (short-circuit)
+    if (routed?.doneTaskNo) {
+      const taskNo = Number(routed.doneTaskNo);
+      try {
+        const t = await markTaskDone({ ownerId, taskNo, actorId: from });
+        return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
+      } catch (e) {
+        if (e.message?.includes('Task not found')) {
+          return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
+        }
+        throw e;
+      }
+    }
+
+    // ✅ 3) DELETE SENTINEL (short-circuit)
+    if (routed?.deleteTaskNo) {
+      const taskNo = Number(routed.deleteTaskNo);
+      try {
+        const t = await dbGetTaskByNo(ownerId, taskNo);
+        if (!t) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
+
+        const fromDigits  = String(from).replace(/\D/g, '');
+        const isOwnerBd   = isOwnerOrBoard(userProfile);
+        const isCreator   = t.created_by && String(t.created_by).replace(/\D/g, '') === fromDigits;
+        const isAssignee  = t.assigned_to && String(t.assigned_to).replace(/\D/g, '') === fromDigits;
+
+        if (!isOwnerBd && !isCreator && !isAssignee) {
+          return res.send(RESP(`⚠️ You don’t have permission to delete task #${taskNo}.`));
+        }
+
+        const ok = await dbDeleteTask(ownerId, taskNo);
+        if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
+
+        return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
+      } catch (e) {
+        console.error('[tasks.delete] error:', e?.message);
+        return res.send(RESP(`⚠️ Delete failed: ${e?.message || 'unknown error'}`));
+      }
+    }
 
     // --- LIST: "tasks" / "my tasks" / "my tasks done"
     {
       if (/^\s*(tasks|my\s+tasks)\s*$/i.test(body)) {
-  const status = 'open';
-  const rows = await listMyTasks({ ownerId, userId: from, status });
-  if (!rows.length) return res.send(RESP(`✅ You're all clear — no open tasks assigned to you.`));
+        const status = 'open';
+        const rows = await listMyTasks({ ownerId, userId: from, status });
+        if (!rows.length) return res.send(RESP(`✅ You're all clear — no open tasks assigned to you.`));
 
-  const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
-  const lines = rows.slice(0, 12).map((r) => {
-    const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
-    return `• #${r.task_no} ${cap(r.title)}${due}`;
-  });
+        const lines = rows.slice(0, 12).map((r) => {
+          const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+          return `• #${r.task_no} ${cap(r.title)}${due}`;
+        });
 
-  return res.send(RESP(`✅ Here's what's on your plate:\n${lines.join('\n')}\nWant to add due dates or reassign?`));
-}
+        return res.send(
+          RESP(`✅ Here's what's on your plate:\n${lines.join('\n')}\nWant to add due dates or reassign?`)
+        );
+      }
 
-const m = body.match(/^my\s+tasks\s+(open|done)$/i);
-if (m) {
-  const status = parseStatus(m[1]);
-  const rows = await listMyTasks({ ownerId, userId: from, status });
-  if (!rows.length) return res.send(RESP(`No ${status} tasks assigned to you.`));
+      const m = body.match(/^my\s+tasks\s+(open|done)$/i);
+      if (m) {
+        const status = parseStatus(m[1]);
+        const rows = await listMyTasks({ ownerId, userId: from, status });
+        if (!rows.length) return res.send(RESP(`No ${status} tasks assigned to you.`));
 
-  const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
-  const lines = rows.slice(0, 12).map((r) => {
-    const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
-    return `• #${r.task_no} ${cap(r.title)}${due}`;
-  });
+        const lines = rows.slice(0, 12).map((r) => {
+          const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+          return `• #${r.task_no} ${cap(r.title)}${due}`;
+        });
 
-  return res.send(RESP(`${status.toUpperCase()} tasks for you:\n${lines.join('\n')}`));
-}
+        return res.send(RESP(`${status.toUpperCase()} tasks for you:\n${lines.join('\n')}`));
+      }
     }
 
     // --- INBOX (owner/board): "inbox tasks" / "inbox tasks done"
     if (/^inbox\s+tasks(?:\s+(open|done))?$/i.test(body)) {
-  if (!isOwnerOrBoard(userProfile)) {
-    return res.send(RESP('⚠️ You don’t have permission for Inbox tasks.'));
-  }
-  const statusMatch = body.match(/inbox\s+tasks(?:\s+(open|done))?/i);
-  const status = parseStatus(statusMatch?.[1] || 'open');
-  const rows = await listInboxTasks({ ownerId, status });
-  if (!rows.length) return res.send(RESP(`No ${status} tasks in Inbox.`));
+      if (!isOwnerOrBoard(userProfile)) {
+        return res.send(RESP('⚠️ You don’t have permission for Inbox tasks.'));
+      }
+      const statusMatch = body.match(/inbox\s+tasks(?:\s+(open|done))?/i);
+      const status = parseStatus(statusMatch?.[1] || 'open');
 
-  const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
-  const lines = rows.slice(0, 12).map((r) => {
-    const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
-    return `• #${r.task_no} ${cap(r.title)} (from ${r.creator_name || r.created_by})${due}`;
-  });
+      const rows = await listInboxTasks({ ownerId, status });
+      if (!rows.length) return res.send(RESP(`No ${status} tasks in Inbox.`));
 
-  return res.send(RESP(`INBOX (${status.toUpperCase()}):\n${lines.join('\n')}`));
-}
+      const lines = rows.slice(0, 12).map((r) => {
+        const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+        return `• #${r.task_no} ${cap(r.title)} (from ${r.creator_name || r.created_by})${due}`;
+      });
 
+      return res.send(RESP(`INBOX (${status.toUpperCase()}):\n${lines.join('\n')}`));
+    }
 
     // --- OTHERS’ TASKS (owner/board): "tasks for Jon"
     {
-  const m = body.match(/^tasks?\s+for\s+(.+)$/i);
-  if (m) {
-    if (!isOwnerOrBoard(userProfile)) {
-      return res.send(RESP('⚠️ You don’t have permission to view others’ tasks.'));
-    }
-    const who = m[1].trim();
-    const rows = await listTasksForUser({ ownerId, nameOrId: who, status: 'open' });
-    if (!rows.length) return res.send(RESP(`No open tasks for "${who}".`));
+      const m = body.match(/^tasks?\s+for\s+(.+)$/i);
+      if (m) {
+        if (!isOwnerOrBoard(userProfile)) {
+          return res.send(RESP('⚠️ You don’t have permission to view others’ tasks.'));
+        }
+        const who = m[1].trim();
+        const rows = await listTasksForUser({ ownerId, nameOrId: who, status: 'open' });
+        if (!rows.length) return res.send(RESP(`No open tasks for "${who}".`));
 
-    const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
-    const lines = rows.slice(0, 12).map((r) => {
-      const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
-      return `• #${r.task_no} ${cap(r.title)}${due}`;
-    });
+        const lines = rows.slice(0, 12).map((r) => {
+          const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+          return `• #${r.task_no} ${cap(r.title)}${due}`;
+        });
 
-    return res.send(RESP(`Open tasks for ${who}:\n${lines.join('\n')}`));
-  }
-}
-
-    // --- DONE / REOPEN / COMPLETE / FINISH ---
-{
-  // done / complete / finish / close
-  let m = body.match(/^(?:done|complete|finish|close)\s+(?:task\s*)?#?(\d+)$/i);
-  if (m) {
-    const taskNo = parseInt(m[1], 10);
-    try {
-      const t = await markTaskDone({ ownerId, taskNo, actorId: from });
-      return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
-    } catch (e) {
-      if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
-      throw e;
-    }
-  }
-
-  // reopen
-  m = body.match(/^reopen\s+(?:task\s*)?#?(\d+)$/i);
-  if (m) {
-    const taskNo = parseInt(m[1], 10);
-    try {
-      const t = await reopenTask({ ownerId, taskNo, actorId: from });
-      return res.send(RESP(`↩️ Task #${taskNo} reopened: ${cap(t.title)}`));
-    } catch (e) {
-      if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
-      throw e;
-    }
-  }
-}
-// --- DELETE TASK ---
-{
-  const m = body.match(/^(?:delete|remove|trash)\s+(?:task\s*)?#?(\d+)$/i);
-  if (m) {
-    const taskNo = parseInt(m[1], 10);
-
-    // Load task for permission + title
-    const t = await dbGetTaskByNo(ownerId, taskNo);
-    if (!t) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
-
-    if (!canDeleteTask(userProfile, from, t)) {
-      return res.send(RESP(`⚠️ Only the owner or the task creator can delete task #${taskNo}.`));
+        return res.send(RESP(`Open tasks for ${who}:\n${lines.join('\n')}`));
+      }
     }
 
-    const ok = await dbDeleteTask(ownerId, taskNo);
-    if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
-
-    return res.send(RESP(`🗑️ Deleted task #${taskNo}: ${cap(t.title)}`));
-  }
-}
-
-
-    // --- ASSIGN EXISTING TASK (fast-path & text) — must be BEFORE any create paths
+    // --- DONE / REOPEN (explicit text forms)
     {
-      const consumed = await maybeHandleAssignmentFastPath({ ownerId, from, body, res });
-      if (consumed) return;
+      // done / complete / finish / close
+      let m = body.match(/^(?:done|complete|completed|finish|finished|close|closed)\s+(?:task\s*)?#?(\d+)$/i);
+      if (m) {
+        const taskNo = parseInt(m[1], 10);
+        try {
+          const t = await markTaskDone({ ownerId, taskNo, actorId: from });
+          return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
+        } catch (e) {
+          if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
+          throw e;
+        }
+      }
+
+      // reopen
+      m = body.match(/^reopen\s+(?:task\s*)?#?(\d+)$/i);
+      if (m) {
+        const taskNo = parseInt(m[1], 10);
+        try {
+          const t = await reopenTask({ ownerId, taskNo, actorId: from });
+          return res.send(RESP(`↩️ Task #${taskNo} reopened: ${cap(t.title)}`));
+        } catch (e) {
+          if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
+          throw e;
+        }
+      }
+    }
+
+    // --- DELETE (explicit text form)
+    {
+      const m = body.match(/^(?:delete|remove|cancel|trash)\s+#?(\d+)$/i);
+      if (m) {
+        const taskNo = parseInt(m[1], 10);
+        try {
+          const t = await dbGetTaskByNo(ownerId, taskNo);
+          if (!t) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
+
+          const fromDigits  = String(from).replace(/\D/g, '');
+          const isOwnerBd   = isOwnerOrBoard(userProfile);
+          const isCreator   = t.created_by && String(t.created_by).replace(/\D/g, '') === fromDigits;
+          const isAssignee  = t.assigned_to && String(t.assigned_to).replace(/\D/g, '') === fromDigits;
+
+          if (!isOwnerBd && !isCreator && !isAssignee) {
+            return res.send(RESP(`⚠️ You don’t have permission to delete task #${taskNo}.`));
+          }
+
+          const ok = await dbDeleteTask(ownerId, taskNo);
+          if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
+
+          return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
+        } catch (e) {
+          console.error('[tasks.delete.explicit] error:', e?.message);
+          return res.send(RESP(`⚠️ Delete failed: ${e?.message || 'unknown error'}`));
+        }
+      }
     }
 
     // --- CREATE LIMIT (applies to all create paths)
@@ -606,36 +634,15 @@ if (m) {
       const titleForAll = parseEveryone(body);
       if (titleForAll) {
         const team = await getTeamMembers(ownerId);
-        const teammates = team.filter((u) => u.user_id && u.user_id !== from);
-        if (!teammates.length)
-try {
-  const prev = await getPendingTransactionState(from).catch(() => ({}));
-  await setPendingTransactionState(from, {
-    ...prev,
-    helpTopic: {
-      key: 'team_add_member',
-      context: { name: assigneeName }  // e.g., "Justin"
-    }
-  });
-  // give a *helpful* answer right now too:
-  return res.send(RESP(
-`I don’t see “${assigneeName}” on your team yet.
+        const teammates = (team || []).filter((u) => u.user_id && u.user_id !== from);
 
-Add a teammate by texting:
-• "add teammate Justin +19055551234"
-• or "invite Justin +19055551234"
-
-Once they’re added, say:
-• "assign task #24 to Justin"`
-  ));
-} catch (e) {
-  console.warn('[tasks.assign] helpTopic state set failed:', e?.message);
-  return res.send(RESP(
-`I don’t see “${assigneeName}” on your team yet.
-Add them with "add teammate <Name> <Phone>", then try assigning again.`
-  ));
-}
-      
+        if (!teammates.length) {
+          return res.send(RESP(
+            `⚠️ I don’t see any teammates on your account yet.\n` +
+            `Add a teammate by texting:\n• "add teammate Justin +19055551234"\n` +
+            `Then try: "task @everyone - Kickoff at 9am"`
+          ));
+        }
 
         let createdCount = 0;
         const taskNos = [];
@@ -651,6 +658,7 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
           });
           createdCount++;
           taskNos.push(task.task_no);
+
           // DM teammate (best-effort)
           try {
             await sendMessage(
@@ -675,21 +683,19 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
         }
 
         return res.send(
-          RESP(
-            `✅ Sent task #${taskNos.join(', #')} to everyone — “${cap(titleForAll)}”. (${createdCount} teammates notified)`
-          )
+          RESP(`✅ Sent task #${taskNos.join(', #')} to everyone — “${cap(titleForAll)}”. (${createdCount} teammates notified)`)
         );
       }
     }
 
-    // --- Preferred path when conversation.js routed intent with args:
+    // --- Preferred path when router provided args (structured create)
     if (routed?.title) {
       let title = sanitizeInput(routed.title);
       let resolvedAssignee = from;
       let assigneeLabel = userProfile?.name || from;
 
       if (routed.assigneeName) {
-        // Try to resolve teammate; if not found, keep "to <name>" in title and assign to sender
+        // Try resolve teammate
         let found = null;
         if (/^\+?\d{10,15}$/.test(routed.assigneeName)) {
           const user = await getUserBasic(routed.assigneeName);
@@ -723,15 +729,13 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
         try {
           await sendMessage(
             resolvedAssignee,
-            `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${
-              routed.dueAt ? `, due ${fmtDate(routed.dueAt)}` : ''
-            }`
+            `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${routed.dueAt ? `, due ${fmtDate(routed.dueAt, tz)}` : ''}`
           );
         } catch (e) {
           console.warn('[tasks] Assignee notification failed:', e.message);
         }
       }
-      if (routed.dueAt) reply += `\nDue: ${fmtDate(routed.dueAt)}`;
+      if (routed.dueAt) reply += `\nDue: ${fmtDate(routed.dueAt, tz)}`;
 
       // Save lastTaskNo + reminder prompt
       try {
@@ -759,7 +763,14 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
     {
       const m = body.match(/^task(?:\s*[:\-])?\s+(.+)$/i);
       if (m) {
-        const { title: rawTitle, assignedTo, dueAt, assigneeToken, assigneePreposition } = parseTaskCommand(m[1]);
+        const {
+          title: rawTitle,
+          assignedTo,
+          dueAt,
+          assigneeToken,
+          assigneePreposition
+        } = parseTaskCommand(m[1]);
+
         if (!rawTitle) return res.send(RESP('⚠️ Task title is required. Try "task - buy tape".'));
 
         let title = rawTitle;
@@ -811,15 +822,13 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
           try {
             await sendMessage(
               resolvedAssignee,
-              `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${
-                dueAt ? `, due ${fmtDate(dueAt)}` : ''
-              }`
+              `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${dueAt ? `, due ${fmtDate(dueAt, tz)}` : ''}`
             );
           } catch (e) {
             console.warn('[tasks] Assignee notification failed:', e.message);
           }
         }
-        if (dueAt) reply += `\nDue: ${fmtDate(dueAt)}`;
+        if (dueAt) reply += `\nDue: ${fmtDate(dueAt, tz)}`;
 
         // Save lastTaskNo + reminder prompt
         try {
@@ -845,9 +854,9 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
     }
 
     // --- Quick help for near-misses
-if (/^task\b/i.test(body) || /\btasks?\b/i.test(body)) {
-  return res.send(
-    RESP(
+    if (/^task\b/i.test(body) || /\btasks?\b/i.test(body)) {
+      return res.send(
+        RESP(
 `Try:
 - "tasks" or "my tasks" or "my tasks done"
 - "task - buy tape" or "task buy tape for Jon due tomorrow"
@@ -856,11 +865,11 @@ if (/^task\b/i.test(body) || /\btasks?\b/i.test(body)) {
 - "assign task #12 to Justin" or "assign last task to Justin"
 - "inbox tasks" (owner/board)
 - "tasks for Jon" (owner/board)
-- "done 12" / "complete 12" / "finish 12" or "reopen 12"
-- "delete 12" or "remove task 12"`
-    )
-  );
-}
+- "done 12" or "reopen 12"
+- "delete 12"`
+        )
+      );
+    }
 
 // Not handled
 return false;

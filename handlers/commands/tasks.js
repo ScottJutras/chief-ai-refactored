@@ -125,6 +125,14 @@ function reinstateAssigneeInTitle(title, preposition, token) {
   return sanitizeInput(`${t} ${prep} ${name}`.replace(/\s{2,}/g, ' ').trim());
 }
 
+// Normalize the common STT quirk for detection
+        function normalizeForControlLocal(s = '') {
+          let t = String(s || '');
+          t = t.replace(/(\btask\s*#?\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
+          t = t.replace(/(\b#\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
+          return t;
+        }
+
 // Parse task command for title, assignee, due date
 function parseTaskCommand(input) {
   let title = input;
@@ -484,8 +492,10 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
           return res.send(RESP(`⚠️ You don’t have permission to delete task #${taskNo}.`));
         }
         const ok = await dbDeleteTask(ownerId, Number(taskNo));
-        if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
-        return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
+if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
+
+console.log(`[tasks.delete] 🗑️ Deleted task #${taskNo} by ${from}`);
+return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
       } catch (e) {
         console.error('[tasks.delete] error:', e?.message);
         return res.send(RESP(`⚠️ Delete failed: ${e?.message || 'unknown error'}`));
@@ -675,13 +685,7 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
         const afterTask = String(m[1] || '').trim();
 
         // --- Defensive guard: reroute control phrases that slipped through ---
-        // Normalize the common STT quirk for detection
-        function normalizeForControlLocal(s = '') {
-          let t = String(s || '');
-          t = t.replace(/(\btask\s*#?\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
-          t = t.replace(/(\b#\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
-          return t;
-        }
+        
         const normAfter = normalizeForControlLocal(`task ${afterTask}`);
 
         // 1) Assign form: "task assign #12 to Jaclyn"
@@ -705,15 +709,15 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
           // fall through to create if we cannot parse an assignee
         }
 
-        // 2) Complete forms: "task #42 is/’s/id complete", "task #42 has been completed"
-        if (/^\s*task\s*#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/i.test(normAfter) ||
-            /^\s*task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i.test(normAfter)) {
-          let mm = normAfter.match(/task\s*#?\s*(\d+)/i);
-          const n = mm && mm[1] ? parseInt(mm[1], 10) : 'last';
-          res.locals = res.locals || {};
-          res.locals.intentArgs = { doneTaskNo: (n === 'last' ? 'last' : Number(n)) };
-          return tasksHandler(from, `__done__ #${n}`, userProfile, ownerId, ownerProfile, isOwner, res);
-        }
+        // 2) Complete forms: accept "task #42 id/is/'s complete", "task #42 complete", "task #42 has been completed"
+if (/^\s*task\s*#?\s*\d+\s+(?:(?:is|id|\'s|’s)\s+)?(?:complete|completed|done|finished|closed)\b/i.test(normAfter)
+    || /^\s*task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i.test(normAfter)) {
+  const mm = normAfter.match(/task\s*#?\s*(\d+)/i);
+  const n  = mm && mm[1] ? parseInt(mm[1], 10) : 'last';
+  res.locals = res.locals || {};
+  res.locals.intentArgs = { doneTaskNo: (n === 'last' ? 'last' : Number(n)) };
+  return tasksHandler(from, `__done__ #${n}`, userProfile, ownerId, ownerProfile, isOwner, res);
+}
 
         // 3) Delete forms inside a "task ..." prefix, e.g. "task delete #43"
         if (/^\s*task\s+(?:delete|remove|cancel|trash)\b/i.test(normAfter)) {
@@ -962,9 +966,10 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
           }
 
           const ok = await dbDeleteTask(ownerId, taskNo);
-          if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
+if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
 
-          return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
+console.log(`[tasks.delete] 🗑️ Deleted task #${taskNo} by ${from}`);
+return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
         } catch (e) {
           console.error('[tasks.delete.explicit] error:', e?.message);
           return res.send(RESP(`⚠️ Delete failed: ${e?.message || 'unknown error'}`));

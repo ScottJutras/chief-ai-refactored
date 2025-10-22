@@ -578,11 +578,16 @@ router.post(
             try {
               const tasksFn = getHandler && getHandler('tasks');
               if (
-                typeof tasksFn === 'function' &&
-                ( /^task\b/i.test(cleaned) || (typeof looksLikeTask === 'function' && looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) )
-              ) {
-                // ⛔ Guard: do NOT treat control intents as new tasks
-                if (looksLikeAnyControl(cleaned)) {
+  typeof tasksFn === 'function' &&
+  ( /^task\b/i.test(cleaned) || (typeof looksLikeTask === 'function' && looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) )
+) {
+  const cleanedControlProbe = (typeof normalizeForControl === 'function')
+    ? normalizeForControl(cleaned)
+    : cleaned;
+
+  // ⛔ Guard: do NOT treat control intents as new tasks
+  if (looksLikeAnyControl(cleanedControlProbe)) {
+
                   // Let the text-path control fast-paths handle it below
                   throw new Error('control-intent-on-audio'); // bounce to catch -> fall through
                 }
@@ -800,16 +805,20 @@ router.post(
     // ---- END DELETE FAST-PATH ----
 
     // ---------- FAST-PATH TASKS (text-only) ----------
-    try {
-      const bodyTxt = String(input || '');
+try {
+  const bodyTxt = String(input || '');
+  const controlProbe = (typeof normalizeForControl === 'function')
+    ? normalizeForControl(bodyTxt)
+    : bodyTxt;
 
-      // IMPORTANT: Never treat control phrases as new tasks
-      if (
-        !mediaUrl &&
-        !looksLikeAnyControl(bodyTxt) &&
-        (/^task\b/i.test(bodyTxt) ||
-          (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
-      ) {
+  // IMPORTANT: Never treat control phrases as new tasks
+  if (
+    !mediaUrl &&
+    !looksLikeAnyControl(controlProbe) &&
+    (/^task\b/i.test(bodyTxt) ||
+      (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
+  ) {
+
         try { await deletePendingTransactionState(from); } catch (_) {}
 
         const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });

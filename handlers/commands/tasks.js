@@ -435,20 +435,27 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
 
  async function tasksHandler(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   try {
+    // Normalize text and context
     const body = (typeof norm === 'function') ? norm(input) : String(input || '').trim();
     const tier = userProfile?.subscription_tier || 'starter';
     const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 
-    // ✅ 1) ASSIGN FAST-PATH FIRST (intercepts both webhook and text forms)
+    // ============================================================
+    // 1) ASSIGN FAST-PATH (must run first; handles webhook + text)
+    //    This should NO-OP if there's nothing to assign.
+    // ============================================================
     const handled = await maybeHandleAssignmentFastPath({
       ownerId, from, body, res, userProfile, ownerProfile,
     });
     if (handled) return true;
 
-    // Sentinels supplied by webhook fast-paths
+    // Routed args from webhook fast-paths
     const routed = res?.locals?.intentArgs || null;
 
-    // ✅ 2) DONE SENTINEL (short-circuit)
+    // ============================================================
+    // 2) DONE SENTINEL (from webhook COMPLETE fast-path)
+    //    Short-circuit before any list/create logic.
+    // ============================================================
     if (routed?.doneTaskNo) {
       const taskNo = Number(routed.doneTaskNo);
       try {
@@ -462,13 +469,17 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
       }
     }
 
-    // ✅ 3) DELETE SENTINEL (short-circuit)
+    // ============================================================
+    // 3) DELETE SENTINEL (from webhook DELETE fast-path)
+    //    Short-circuit before any list/create logic.
+    // ============================================================
     if (routed?.deleteTaskNo) {
       const taskNo = Number(routed.deleteTaskNo);
       try {
         const t = await dbGetTaskByNo(ownerId, taskNo);
         if (!t) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
 
+        // Permission: owner/board OR task creator OR current assignee
         const fromDigits  = String(from).replace(/\D/g, '');
         const isOwnerBd   = isOwnerOrBoard(userProfile);
         const isCreator   = t.created_by && String(t.created_by).replace(/\D/g, '') === fromDigits;
@@ -487,6 +498,51 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
         return res.send(RESP(`⚠️ Delete failed: ${e?.message || 'unknown error'}`));
       }
     }
+
+    // ============================================================
+    // 4) (OPTIONAL) ASSIGN SENTINEL SAFETY NET
+    //    If the webhook set intentArgs (assignTaskNo/assigneeName) and
+    //    maybeHandleAssignmentFastPath didn’t consume it, handle here.
+    //    This preserves robustness without changing your assign logic.
+    // ============================================================
+    if (routed?.assignTaskNo && routed?.assigneeName) {
+      const consumed = await maybeHandleAssignmentFastPath({
+        ownerId,
+        from,
+        body: `assign #${routed.assignTaskNo} to ${routed.assigneeName}`, // normalized body
+        res,
+        userProfile,
+        ownerProfile,
+      });
+      if (consumed) return true;
+    }
+
+    // ==================================================================
+    // From here on, keep your existing branches (lists, inbox, others,
+    // done/reopen commands, delete commands, create paths, etc.)
+    // The key fix is that DONE/DELETE/ASSIGN sentinels have already
+    // short-circuited above, so these won’t be mistaken for new tasks.
+    // ==================================================================
+
+    // --- INBOX (owner/board): "inbox tasks" / "inbox tasks done"
+    if (/^inbox\s+tasks(?:\s+(open|done))?$/i.test(body)) {
+      if (!isOwnerOrBoard(userProfile)) {
+        return res.send(RESP('⚠️ You don’t have permission for Inbox tasks.'));
+      }
+      const statusMatch = body.match(/inbox\s+tasks(?:\s+(open|done))?/i);
+      const status = parseStatus(statusMatch?.[1] || 'open');
+      const rows = await listInboxTasks({ ownerId, status });
+      if (!rows.length) return res.send(RESP(`No ${status} tasks in Inbox.`));
+
+      const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+      const lines = rows.slice(0, 12).map((r) => {
+        const due = r.due_at ? ` (due ${fmtDate(r.due_at, tz)})` : '';
+        return `• #${r.task_no} ${cap(r.title)} (from ${r.creator_name || r.created_by})${due}`;
+      });
+
+      return res.send(RESP(`INBOX (${status.toUpperCase()}):\n${lines.join('\n')}`));
+    }
+
 
     // --- LIST: "tasks" / "my tasks" / "my tasks done"
     {

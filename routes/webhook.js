@@ -639,10 +639,122 @@ mediaType = null;
 }
 }
 }
-// ---------- END MEDIA FIRST (AUDIO ONLY) ----------
+// ---------- TEXT PATH HELPERS (DEFINE BEFORE USE) ----------
+function _sanitize(s) { return String(s || ''); }
+function _trimLower(s) { return _sanitize(s).trim().toLowerCase(); }
 
-// text path:
-// Early YES/NO handler for task offers
+// Treat some common STT quirks (e.g., "id complete" -> "is complete")
+function normalizeForControl(s = '') {
+  let t = String(s || '');
+  // only normalize when 'id' is between a task ref and completion words
+  // e.g., "task #42 id complete" / "#42 id complete"
+  t = t.replace(/(\btask\s*#?\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
+  t = t.replace(/(\b#\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
+  return t;
+}
+
+// ----- ASSIGN helpers -----
+function looksLikeAssign(s = '') {
+  return /^\s*assign\b/i.test(_sanitize(s));
+}
+function parseAssignUtterance(s = '') {
+  const t = _sanitize(s).trim();
+
+  // assign task #<num> to <name> | assign #<num> to <name>
+  let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: parseInt(m[1], 10), assignee: m[2].trim() };
+
+  // assign last task to <name> | assign last to <name>
+  m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  // assign this (task) to <name>
+  m = t.match(/^\s*assign\s+this(?:\s+task)?\s+(?:to|for|@)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  // please assign to <name>
+  m = t.match(/^\s*(?:please\s+)?assign\s+(?:to|for|@)\s+(.+?)\s*$/i);
+  if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+  return null;
+}
+
+// ----- COMPLETE helpers -----
+function looksLikeComplete(s = '') {
+  const t = _trimLower(normalizeForControl(s));
+  // direct verbs
+  if (/^(done|complete|completed|finish|finished|close|closed)\b/.test(t)) return true;
+  // "this task has been completed/done/finished/closed"
+  if (/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
+  // "task 37 has been completed/done/finished/closed"
+  if (/^task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
+  // "#37 is/’s/id complete/done/etc."
+  if (/^#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/.test(t)) return true;
+  // "task #37 is/’s/id complete"
+  if (/^task\s*#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/.test(t)) return true;
+  return false;
+}
+function parseCompleteUtterance(s = '') {
+  const t = normalizeForControl(_sanitize(s).trim());
+
+  // explicit number forms
+  let m = t.match(/^task\s*#?\s*(\d+)\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  m = t.match(/^#?\s*(\d+)\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  m = t.match(/^(?:done|complete|completed|finish|finished|close|closed)\s+#?(\d+)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  // implicit “this task …”
+  m = t.match(/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
+  if (m) return { taskNo: 'last' };
+
+  // plain “done/complete/finish/close” with no number => last
+  if (/^(?:done|complete|completed|finish|finished|close|closed)\b/i.test(t)) {
+    return { taskNo: 'last' };
+  }
+
+  return null;
+}
+
+// ----- DELETE helpers -----
+function looksLikeDelete(s = '') {
+  const t = _trimLower(s);
+  // delete/remove/cancel/trash #<num>
+  if (/^(delete|remove|cancel|trash)\s+#?\d+\b/.test(t)) return true;
+  // task <num> delete/remove/cancel/trash
+  if (/^task\s*#?\s*\d+\s+(?:delete|remove|cancel|trash)\b/.test(t)) return true;
+  // delete this task
+  if (/^(delete|remove|cancel|trash)\s+this\s+task\b/.test(t)) return true;
+  return false;
+}
+function parseDeleteUtterance(s = '') {
+  const t = _sanitize(s).trim();
+
+  let m = t.match(/^(?:delete|remove|cancel|trash)\s+#?(\d+)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  m = t.match(/^task\s*#?\s*(\d+)\s+(?:delete|remove|cancel|trash)\b/i);
+  if (m) return { taskNo: parseInt(m[1], 10) };
+
+  m = t.match(/^(?:delete|remove|cancel|trash)\s+this\s+task\b/i);
+  if (m) return { taskNo: 'last' };
+
+  return null;
+}
+
+// One guard for creation fast-paths
+function looksLikeAnyControl(s = '') {
+  return looksLikeAssign(s) || looksLikeComplete(s) || looksLikeDelete(s);
+}
+// ---------- END TEXT PATH HELPERS ----------
+
+
+// ================= TEXT PATH BEGINS =================
+
+// Early YES/NO handler for task offers (unchanged)
 try {
   const lc = String(input || '').trim().toLowerCase();
   if (lc === 'yes' || lc === 'no') {
@@ -661,7 +773,6 @@ try {
         [ownerId, taskNo, assigneeId, accepted ? 'accepted' : 'declined']
       );
 
-      // Notify owner (best-effort)
       try {
         await sendMessage(
           ownerDigits,
@@ -669,7 +780,6 @@ try {
         );
       } catch {}
 
-      // Ack + clear state
       await sendMessage(from, accepted ? '👍 Accepted — thanks!' : '👌 Declined — got it.');
       const { pendingTaskOffer, ...rest } = ps;
       await setPendingTransactionState(from, rest);
@@ -682,52 +792,46 @@ try {
 }
 
 
-
-// ---------- FAST-PATH ASSIGN (text) ----------
-// Must run BEFORE the task-creation fast-path and NOT depend on external helpers
+// ---- ASSIGN FAST-PATH (must run BEFORE any task-creation fast-path) ----
 try {
-  const raw = String(input || '').trim();
-  if (looksLikeAssign(raw)) {
-    let { taskNo, assignee } = parseAssignUtterance(raw) || {};
-    // Resolve "last" from state if needed
-    if (taskNo === 'last' || taskNo == null) {
-      try {
-        const ps = await getPendingTransactionState(from).catch(() => ({}));
-        if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
-      } catch (_) {}
-    }
+  if (typeof input === 'string' && looksLikeAssign(input)) {
+    const parsed = parseAssignUtterance(input);
+    if (parsed) {
+      let { taskNo, assignee } = parsed;
 
-    if (!taskNo || Number.isNaN(Number(taskNo))) {
-      return res.status(200).type('text/xml')
-        .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Jaclyn”.`));
-    }
-    if (!assignee) {
-      return res.status(200).type('text/xml')
-        .send(twiml(`Tell me who to assign it to. e.g. “assign this to Jaclyn”.`));
-    }
+      if (taskNo === 'last') {
+        try {
+          const ps = await getPendingTransactionState(from);
+          if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+        } catch (_) {}
+      }
 
-    // Hand off to tasks handler in "assign" mode
-    res.locals = res.locals || {};
-    res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
+      if (!taskNo || Number.isNaN(Number(taskNo))) {
+        return res.status(200).type('text/xml')
+          .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
+      }
 
-    const handled = await tasksHandler(
-      from,
-      `__assign__ #${taskNo} to ${assignee}`,
-      userProfile,
-      ownerId,
-      ownerProfile,
-      isOwner,
-      res
-    );
-    if (!res.headersSent && handled !== false) {
-      ensureReply(res, `Assigning task #${taskNo} to ${assignee}…`);
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
+
+      const handled = await tasksHandler(
+        from,
+        `__assign__ #${taskNo} to ${assignee}`,
+        userProfile,
+        ownerId,
+        ownerProfile,
+        isOwner,
+        res
+      );
+      if (!res.headersSent && handled !== false) ensureReply(res, `Assigning task #${taskNo} to ${assignee}…`);
+      return;
     }
-    return; // ✅ stop here so we don't fall into task creation
   }
 } catch (e) {
-  console.warn('[FAST-PATH ASSIGN] skipped:', e?.message);
+  console.warn('[ASSIGN FAST-PATH] skipped:', e?.message);
 }
-// ---------- END FAST-PATH ASSIGN (text) ----------
+// ---- END ASSIGN FAST-PATH ----
+
 
 // ---- COMPLETE FAST-PATH (must run BEFORE any task-creation fast-path) ----
 try {
@@ -736,7 +840,6 @@ try {
     if (hit) {
       let { taskNo } = hit;
 
-      // resolve "last" using sender's state
       if (taskNo === 'last') {
         try {
           const ps = await getPendingTransactionState(from);
@@ -749,7 +852,6 @@ try {
           .send(twiml(`I couldn’t tell which task to complete. Try “done #12”.`));
       }
 
-      // Tell tasks handler to perform a DONE action (sentinel)
       res.locals = res.locals || {};
       res.locals.intentArgs = { doneTaskNo: Number(taskNo) };
 
@@ -763,16 +865,15 @@ try {
         res
       );
 
-      if (!res.headersSent && handled !== false) {
-        ensureReply(res, `Completing task #${taskNo}…`);
-      }
-      return; // ✅ handled
+      if (!res.headersSent && handled !== false) ensureReply(res, `Completing task #${taskNo}…`);
+      return;
     }
   }
 } catch (e) {
   console.warn('[COMPLETE FAST-PATH] skipped:', e?.message);
 }
 // ---- END COMPLETE FAST-PATH ----
+
 
 // ---- DELETE FAST-PATH (must run BEFORE task-creation fast-path) ----
 try {
@@ -793,7 +894,6 @@ try {
           .send(twiml(`I couldn’t tell which task to delete. Try “delete #12”.`));
       }
 
-      // Signal tasks.js to delete
       res.locals = res.locals || {};
       res.locals.intentArgs = { deleteTaskNo: Number(taskNo) };
 
@@ -806,10 +906,8 @@ try {
         isOwner,
         res
       );
-      if (!res.headersSent && handled !== false) {
-        ensureReply(res, `Deleting task #${taskNo}…`);
-      }
-      return; // ✅ handled
+      if (!res.headersSent && handled !== false) ensureReply(res, `Deleting task #${taskNo}…`);
+      return;
     }
   }
 } catch (e) {
@@ -817,20 +915,20 @@ try {
 }
 // ---- END DELETE FAST-PATH ----
 
+
 // ---------- FAST-PATH TASKS (text-only) ----------
 try {
   const bodyTxt = String(input || '');
 
-  // ⛔ Never treat control intents as a new task
-  const isControl = looksLikeAnyControl(bodyTxt);
-
+  // IMPORTANT: Never treat control phrases as new tasks
   if (
     !mediaUrl &&
-    !isControl &&
+    !looksLikeAnyControl(bodyTxt) &&
     (/^task\b/i.test(bodyTxt) ||
       (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
   ) {
     try { await deletePendingTransactionState(from); } catch (_) {}
+
     const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
     if (!parsed) throw new Error('Could not parse task intent');
 
@@ -847,6 +945,7 @@ try {
   console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
 }
 // ---------- END FAST-PATH TASKS ----------
+
 
 
     // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===

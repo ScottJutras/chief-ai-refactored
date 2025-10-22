@@ -56,6 +56,21 @@ function getUserTz(userProfile) {
   return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 }
 
+// Used by reminder parsing; safe and fast (no 3rd-party tz DB)
+function getTzOffsetMinutes(tzName) {
+  const now = new Date();
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tzName, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  }).formatToParts(now);
+  const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  const localIso = `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}`;
+  const asLocal = Date.parse(localIso);
+  const asUtc   = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
+  return (asLocal - asUtc) / 60000;
+}
+
 function friendlyTypeLabel(type) {
   if (!type) return 'entry';
   if (type === 'time_entry') return 'time entry';
@@ -209,9 +224,6 @@ function looksLikeQuestion(s = '') {
   return false;
 }
 
-
-
-
 // ==== CONTEXTUAL HELP (module-scope helpers) ====
 
 function looksLikeHelpFollowup(s = '') {
@@ -282,8 +294,7 @@ router.post(
   (req, res, next) => {
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
     const len = parseInt(req.headers['content-length'] || '0', 10);
-if (len > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
-
+    if (len > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
 
     console.log('[WEBHOOK] hit', {
       url: req.originalUrl,
@@ -337,630 +348,605 @@ if (len > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
     const { userProfile, ownerId, ownerProfile, isOwner } = req;
 
     // ---- Twilio media extraction (robust) ----
-function pickFirstMedia(reqBody = {}) {
-  const n = parseInt(reqBody.NumMedia || '0', 10) || 0;
-  if (n <= 0) return { mediaUrl: null, mediaType: null, num: 0 };
-  const url = reqBody.MediaUrl0 || reqBody.MediaUrl || null;
-  const typ = reqBody.MediaContentType0 || reqBody.MediaContentType || null;
-  return { mediaUrl: url, mediaType: typ, num: n };
-}
-
-const picked = pickFirstMedia(req.body);
-if (!mediaUrl && picked.mediaUrl)   mediaUrl  = picked.mediaUrl;
-if (!mediaType && picked.mediaType) mediaType = picked.mediaType;
-
-console.log('[WEBHOOK][MEDIA-IN]', {
-  NumMedia: req.body.NumMedia,
-  MediaUrl0: req.body.MediaUrl0,
-  MediaContentType0: req.body.MediaContentType0,
-  MediaUrl: req.body.MediaUrl,
-  MediaContentType: req.body.MediaContentType,
-  decidedMediaUrl: mediaUrl,
-  decidedMediaType: mediaType,
-  bodyLen: (req.body.Body || '').length,
-});
-
-// Track if this request included audio so we can guard fallbacks later
-const ctInit = String(mediaType || '').split(';')[0].trim().toLowerCase();
-const hadIncomingAudio = !!(mediaUrl && /^audio\//.test(ctInit));
-
-// ---------- MEDIA FIRST (AUDIO ONLY): transcribe audio and handle simple commands ----------
-if (mediaUrl && mediaType) {
-  const ct = String(mediaType).split(';')[0].trim().toLowerCase();
-  const isAudio = /^audio\//.test(ct);
-
-  if (isAudio) {
-    try {
-      // Always pass normalized ct to handleMedia
-      const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, ct);
-
-      // handleMedia may return { transcript?, twiml? } or a string twiml
-      const transcript = out && typeof out === 'object' ? out.transcript : null;
-      const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
-
-      console.log('[MEDIA] audio handled', {
-        ct,
-        hasTranscript: !!transcript,
-        transcriptLen: transcript ? transcript.length : 0,
-        hasTwiml: !!tw
-      });
-
-      if (transcript && transcript.trim()) {
-        // 🔹 Clean the transcript first (handles things like "task, get, groceries.")
-        let cleaned = cleanSpokenCommand(transcript);
-
-        // Normalize "remind me …" → "task …"
-        if (/^\s*remind me(\s+to)?\b/i.test(cleaned)) {
-          cleaned = 'task ' + cleaned.replace(/^\s*remind me(\s+to)?\s*/i, '');
-        }
-
-        // Make cleaned transcript the new input for the rest of the pipeline
-        input = cleaned;
-
-        // ---------- ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
-        try {
-          // Pull a recent task number if available (e.g., from pendingReminder)
-          const pendingState = await getPendingTransactionState(from);
-          const ctx = {
-            pendingTaskNo: pendingState?.pendingReminder?.taskNo || null,
-            lastTaskNo: pendingState?.lastTaskNo || null, // optional if you track it
-          };
-
-          const assignHit = looksLikeAssignment(input) ? parseAssignmentUtterance(input, ctx) : null;
-          if (assignHit && assignHit.taskNo && assignHit.assigneeName) {
-            // Hand off to tasks handler in "assign" mode
-            res.locals = res.locals || {};
-            res.locals.intentArgs = {
-              action: 'assign',
-              taskNo: assignHit.taskNo,
-              assigneeName: assignHit.assigneeName
-            };
-
-            const tasksFn = getHandler && getHandler('tasks');
-            if (typeof tasksFn === 'function') {
-              const normalized = `task assign #${assignHit.taskNo} @${assignHit.assigneeName}`;
-              const handled = await tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              if (!res.headersSent && handled !== false) {
-                ensureReply(res, `✅ Assigned task #${assignHit.taskNo} to ${assignHit.assigneeName}.`);
-              }
-              return; // ✅ handled
-            }
-          }
-        } catch (e) {
-          console.warn('[AUDIO→ASSIGN] skipped:', e?.message);
-          // fall through
-        }
-        // ---------- END ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
-        
-// ---------- REMIND SHORT-CIRCUIT (TEXT) ----------
-try {
-  const s = stripInvisible(String(input || '')).trim();
-  const lc = s.toLowerCase();
-
-  if (/^(remind\b|set\s+(a\s+)?reminder\b)/i.test(lc)) {
-    const tz = getUserTz(userProfile);
-    const offsetMinutes = getTzOffsetMinutes(tz);
-    const m = s.match(/(?:task\s*)?#\s*(\d+)/i);
-    const taskNo = m ? parseInt(m[1], 10) : null;
-
-    const chrono = require('chrono-node');
-    const results = chrono.parse(s, new Date(), { timezone: offsetMinutes, forwardDate: true });
-    if (!taskNo || !results[0]) {
-      return res.status(200).type('text/xml')
-        .send(twiml(`Tell me which task and when. e.g.\n"remind me about task #28 in 10 minutes"`));
+    function pickFirstMedia(reqBody = {}) {
+      const n = parseInt(reqBody.NumMedia || '0', 10) || 0;
+      if (n <= 0) return { mediaUrl: null, mediaType: null, num: 0 };
+      const url = reqBody.MediaUrl0 || reqBody.MediaUrl || null;
+      const typ = reqBody.MediaContentType0 || reqBody.MediaContentType || null;
+      return { mediaUrl: url, mediaType: typ, num: n };
     }
 
-    const remindAtIso = results[0].date().toISOString();
-    await createReminder({ ownerId, userId: from, taskNo, taskTitle: `Task #${taskNo}`, remindAt: remindAtIso });
+    const picked = pickFirstMedia(req.body);
+    if (!mediaUrl && picked.mediaUrl)   mediaUrl  = picked.mediaUrl;
+    if (!mediaType && picked.mediaType) mediaType = picked.mediaType;
 
-    const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
-    return res.status(200).type('text/xml')
-      .send(twiml(`⏰ Reminder set for task #${taskNo} at ${whenStr}.`));
-  }
-} catch (e) {
-  console.warn('[REMIND SHORT-CIRCUIT] skipped:', e?.message);
-}
-// ---------- END REMIND SHORT-CIRCUIT ----------
-
-// ==== CONTROL INTENT HELPERS (define once, used by audio + text) ====
-function _sanitize(s) { return String(s || ''); }
-function _trimLower(s) { return _sanitize(s).trim().toLowerCase(); }
-
-// Treat STT quirks like "id complete" → "is complete"
-function normalizeForControl(s = '') {
-  let t = String(s || '');
-  // "task #42 id complete" → "task #42 is complete"
-  t = t.replace(/(\btask\s*#?\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
-  // "#42 id complete" → "#42 is complete"
-  t = t.replace(/(\b#\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
-  return t;
-}
-
-// ----- ASSIGN helpers -----
-function looksLikeAssign(s = '') {
-  return /^\s*assign\b/i.test(_sanitize(s));
-}
-function parseAssignUtterance(s = '') {
-  const t = _sanitize(s).trim();
-
-  // "assign task #24 to Jaclyn" | "assign #24 to Jaclyn"
-  let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
-  if (m) return { taskNo: parseInt(m[1], 10), assignee: m[2].trim() };
-
-  // "assign last task to Jaclyn" | "assign last to Jaclyn"
-  m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for|@)\s+(.+?)\s*$/i);
-  if (m) return { taskNo: 'last', assignee: m[1].trim() };
-
-  // "assign this (task) to Jaclyn"
-  m = t.match(/^\s*assign\s+this(?:\s+task)?\s+(?:to|for|@)\s+(.+?)\s*$/i);
-  if (m) return { taskNo: 'last', assignee: m[1].trim() };
-
-  // "(please) assign to Jaclyn" → last
-  m = t.match(/^\s*(?:please\s+)?assign\s+(?:to|for|@)\s+(.+?)\s*$/i);
-  if (m) return { taskNo: 'last', assignee: m[1].trim() };
-
-  return null;
-}
-
-// ----- COMPLETE helpers -----
-function looksLikeComplete(s = '') {
-  const t = _trimLower(normalizeForControl(s));
-  if (/^(done|complete|completed|finish|finished|close|closed)\b/.test(t)) return true;
-  if (/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
-  if (/^task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
-  // "#37 is/’s/id complete"
-  if (/^#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/.test(t)) return true;
-  // "task #37 is complete"
-  if (/^task\s*#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/.test(t)) return true;
-  return false;
-}
-function parseCompleteUtterance(s = '') {
-  const t = normalizeForControl(_sanitize(s).trim());
-
-  let m = t.match(/^task\s*#?\s*(\d+)\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  m = t.match(/^#?\s*(\d+)\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  m = t.match(/^(?:done|complete|completed|finish|finished|close|closed)\s+#?(\d+)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  m = t.match(/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
-  if (m) return { taskNo: 'last' };
-
-  if (/^(?:done|complete|completed|finish|finished|close|closed)\b/i.test(t)) {
-    return { taskNo: 'last' };
-  }
-  return null;
-}
-
-// looksLikeDelete
-function looksLikeDelete(s = '') {
-  const t = _trimLower(s);
-  if (/^(?:delete|remove|cancel|trash)\s+(?:task\s*)?#?\d+\b/.test(t)) return true;  // <— updated
-  if (/^task\s*#?\s*\d+\s+(?:delete|remove|cancel|trash)\b/.test(t)) return true;
-  if (/^(delete|remove|cancel|trash)\s+this\s+task\b/.test(t)) return true;
-  return false;
-}
-
-// parseDeleteUtterance
-function parseDeleteUtterance(s = '') {
-  const t = _sanitize(s).trim();
-
-  // <— updated to allow "task" and no space before '#'
-  let m = t.match(/^(?:delete|remove|cancel|trash)\s+(?:task\s*)?#?(\d+)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  m = t.match(/^task\s*#?\s*(\d+)\s+(?:delete|remove|cancel|trash)\b/i);
-  if (m) return { taskNo: parseInt(m[1], 10) };
-
-  m = t.match(/^(?:delete|remove|cancel|trash)\s+this\s+task\b/i);
-  if (m) return { taskNo: 'last' };
-
-  return null;
-}
-
-// One guard to keep control phrases out of task-create fast-path
-function looksLikeAnyControl(s = '') {
-  return looksLikeAssign(s) || looksLikeComplete(s) || looksLikeDelete(s);
-}
-// ==== END CONTROL INTENT HELPERS ====
-
-// ================= TEXT PATH BEGINS =================
-
-// Early YES/NO handler for task offers (unchanged)
-try {
-  const lc = String(input || '').trim().toLowerCase();
-  if (lc === 'yes' || lc === 'no') {
-    const ps = await getPendingTransactionState(from); // "from" is the replier
-    if (ps?.pendingTaskOffer?.taskNo && ps?.pendingTaskOffer?.ownerId) {
-      const { taskNo, ownerId, title } = ps.pendingTaskOffer;
-      const accepted = (lc === 'yes');
-
-      const assigneeId = String(from).replace(/\D/g, ''); // normalize assignee
-      const ownerDigits = String(ownerId).replace(/\D/g, ''); // normalize owner
-
-      await query(
-        `UPDATE public.tasks
-            SET acceptance_status = $4, updated_at = NOW()
-          WHERE owner_id = $1 AND task_no = $2 AND assigned_to = $3`,
-        [ownerId, taskNo, assigneeId, accepted ? 'accepted' : 'declined']
-      );
-
-      try {
-        await sendMessage(
-          ownerDigits,
-          `📣 ${assigneeId} ${accepted ? 'accepted' : 'declined'} task #${taskNo}${title ? `: ${title}` : ''}`
-        );
-      } catch {}
-
-      await sendMessage(from, accepted ? '👍 Accepted — thanks!' : '👌 Declined — got it.');
-      const { pendingTaskOffer, ...rest } = ps;
-      await setPendingTransactionState(from, rest);
-
-      return res.status(200).type('text/xml').send('<Response></Response>');
-    }
-  }
-} catch (e) {
-  console.warn('[task-offer yes/no] skipped:', e?.message);
-}
-
-// ---- ASSIGN FAST-PATH (must run BEFORE any task-creation fast-path) ----
-try {
-  if (typeof input === 'string' && looksLikeAssign(input)) {
-    const parsed = parseAssignUtterance(input);
-    if (parsed) {
-      let { taskNo, assignee } = parsed;
-
-      if (taskNo === 'last') {
-        try {
-          const ps = await getPendingTransactionState(from);
-          if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
-        } catch (_) {}
-      }
-
-      if (!taskNo || Number.isNaN(Number(taskNo))) {
-        return res.status(200).type('text/xml')
-          .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
-      }
-
-      res.locals = res.locals || {};
-      res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
-
-      const handled = await tasksHandler(
-        from,
-        `__assign__ #${taskNo} to ${assignee}`,
-        userProfile,
-        ownerId,
-        ownerProfile,
-        isOwner,
-        res
-      );
-      if (!res.headersSent && handled !== false) ensureReply(res, `Assigning task #${taskNo} to ${assignee}…`);
-      return;
-    }
-  }
-} catch (e) {
-  console.warn('[ASSIGN FAST-PATH] skipped:', e?.message);
-}
-// ---- END ASSIGN FAST-PATH ----
-
-
-// ---- COMPLETE FAST-PATH (must run BEFORE any task-creation fast-path) ----
-try {
-  if (typeof input === 'string' && looksLikeComplete(input)) {
-    const hit = parseCompleteUtterance(input);
-    if (hit) {
-      let { taskNo } = hit;
-
-      if (taskNo === 'last') {
-        try {
-          const ps = await getPendingTransactionState(from);
-          if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
-        } catch (_) {}
-      }
-
-      if (!taskNo || Number.isNaN(Number(taskNo))) {
-        return res.status(200).type('text/xml')
-          .send(twiml(`I couldn’t tell which task to complete. Try “done #12”.`));
-      }
-
-      res.locals = res.locals || {};
-      res.locals.intentArgs = { doneTaskNo: Number(taskNo) };
-
-      const handled = await tasksHandler(
-        from,
-        `__done__ #${taskNo}`,
-        userProfile,
-        ownerId,
-        ownerProfile,
-        isOwner,
-        res
-      );
-
-      if (!res.headersSent && handled !== false) ensureReply(res, `Completing task #${taskNo}…`);
-      return;
-    }
-  }
-} catch (e) {
-  console.warn('[COMPLETE FAST-PATH] skipped:', e?.message);
-}
-// ---- END COMPLETE FAST-PATH ----
-
-
-// ---- DELETE FAST-PATH (must run BEFORE task-creation fast-path) ----
-try {
-  if (typeof input === 'string' && looksLikeDelete(input)) {
-    const hit = parseDeleteUtterance(input);
-    if (hit) {
-      let { taskNo } = hit;
-
-      if (taskNo === 'last') {
-        try {
-          const ps = await getPendingTransactionState(from);
-          if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
-        } catch (_) {}
-      }
-
-      if (!taskNo || Number.isNaN(Number(taskNo))) {
-        return res.status(200).type('text/xml')
-          .send(twiml(`I couldn’t tell which task to delete. Try “delete #12”.`));
-      }
-
-      res.locals = res.locals || {};
-      res.locals.intentArgs = { deleteTaskNo: Number(taskNo) };
-
-      const handled = await tasksHandler(
-        from,
-        `__delete__ #${taskNo}`,
-        userProfile,
-        ownerId,
-        ownerProfile,
-        isOwner,
-        res
-      );
-      if (!res.headersSent && handled !== false) ensureReply(res, `Deleting task #${taskNo}…`);
-      return;
-    }
-  }
-} catch (e) {
-  console.warn('[DELETE FAST-PATH] skipped:', e?.message);
-}
-// ---- END DELETE FAST-PATH ----
-
-
-// ---------- FAST-PATH TASKS (text-only) ----------
-try {
-  const bodyTxt = String(input || '');
-
-  // IMPORTANT: Never treat control phrases as new tasks
-  if (
-    !mediaUrl &&
-    !looksLikeAnyControl(bodyTxt) &&
-    (/^task\b/i.test(bodyTxt) ||
-      (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
-  ) {
-    try { await deletePendingTransactionState(from); } catch (_) {}
-
-    const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
-    if (!parsed) throw new Error('Could not parse task intent');
-
-    res.locals = res.locals || {};
-    res.locals.intentArgs = {
-      title: parsed.title,
-      dueAt: parsed.dueAt,
-      assigneeName: parsed.assignee
-    };
-
-    return tasksHandler(from, bodyTxt, userProfile, ownerId, ownerProfile, isOwner, res);
-  }
-} catch (e) {
-  console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
-}
-// ---------- END FAST-PATH TASKS ----------
-
-
-// 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts (not a question)
-try {
-  const tasksFn = getHandler && getHandler('tasks');
-  if (
-    typeof tasksFn === 'function' &&
-    ( /^task\b/i.test(cleaned) || (typeof looksLikeTask === 'function' && looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) )
-  ) {
-    // ⛔ Guard: do NOT treat control intents as new tasks
-    if (looksLikeAnyControl(cleaned)) {
-      // Let the text-path control fast-paths handle it below
-      throw new Error('control-intent-on-audio'); // bounce to catch -> fall through
-    }
-
-    const args = parseTaskUtterance(cleaned, { tz: getUserTz(userProfile), now: new Date() });
-
-    console.log('[AUDIO→TASK] parsed', {
-      title: args.title,
-      dueAt: args.dueAt,
-      assignee: args.assignee
+    console.log('[WEBHOOK][MEDIA-IN]', {
+      NumMedia: req.body.NumMedia,
+      MediaUrl0: req.body.MediaUrl0,
+      MediaContentType0: req.body.MediaContentType0,
+      MediaUrl: req.body.MediaUrl,
+      MediaContentType: req.body.MediaContentType,
+      decidedMediaUrl: mediaUrl,
+      decidedMediaType: mediaType,
+      bodyLen: (req.body.Body || '').length,
     });
 
-    res.locals = res.locals || {};
-    res.locals.intentArgs = { title: args.title, dueAt: args.dueAt, assigneeName: args.assignee };
+    // Track if this request included audio so we can guard fallbacks later
+    const ctInit = String(mediaType || '').split(';')[0].trim().toLowerCase();
+    const hadIncomingAudio = !!(mediaUrl && /^audio\//.test(ctInit));
 
-    const handled = await tasksFn(
-      from,
-      `task - ${args.title}`,
-      userProfile,
-      ownerId,
-      ownerProfile,
-      isOwner,
-      res
-    );
+    // ==== CONTROL INTENT HELPERS (define once, used by audio + text) ====
+    function _sanitize(s) { return String(s || ''); }
+    function _trimLower(s) { return _sanitize(s).trim().toLowerCase(); }
 
-    if (!res.headersSent && handled !== false) {
-      ensureReply(res, `Task created: ${args.title}`);
+    // Treat STT quirks like "id complete" → "is complete"
+    function normalizeForControl(s = '') {
+      let t = String(s || '');
+      // "task #42 id complete" → "task #42 is complete"
+      t = t.replace(/(\btask\s*#?\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
+      // "#42 id complete" → "#42 is complete"
+      t = t.replace(/(\b#\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
+      return t;
     }
-    return; // ✅ handled
-  }
-} catch (te) {
-  if (te && te.message !== 'control-intent-on-audio') {
-    console.warn('[AUDIO→TASK] fast-path failed:', te?.message);
-  }
-  // fall through to text path
-}
 
-// Treat the rest of the pipeline as text-only now
-mediaUrl = null;
-mediaType = null;
+    // ----- ASSIGN helpers -----
+    function looksLikeAssign(s = '') { return /^\s*assign\b/i.test(_sanitize(s)); }
+    function parseAssignUtterance(s = '') {
+      const t = _sanitize(s).trim();
 
-} else {
-  // No usable transcript
-  if (typeof tw === 'string') {
-    return res.status(200).type('text/xml').send(tw);
-  }
-  ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
-  return; // ❌ stop, avoids helper
-}
-} catch (err) {
-  console.error('[MEDIA] audio handling error:', err?.message);
-  // Fall through; guard below will prevent helper on empty text
-}
-}
-}
+      // "assign task #24 to Jaclyn" | "assign #24 to Jaclyn"
+      let m = t.match(/^\s*assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+      if (m) return { taskNo: parseInt(m[1], 10), assignee: m[2].trim() };
+
+      // "assign last task to Jaclyn" | "assign last to Jaclyn"
+      m = t.match(/^\s*assign\s+(?:last\s+task|last)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+      if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+      // "assign this (task) to Jaclyn"
+      m = t.match(/^\s*assign\s+this(?:\s+task)?\s+(?:to|for|@)\s+(.+?)\s*$/i);
+      if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+      // "(please) assign to Jaclyn" → last
+      m = t.match(/^\s*(?:please\s+)?assign\s+(?:to|for|@)\s+(.+?)\s*$/i);
+      if (m) return { taskNo: 'last', assignee: m[1].trim() };
+
+      return null;
+    }
+
+    // ----- COMPLETE helpers -----
+    function looksLikeComplete(s = '') {
+      const t = _trimLower(normalizeForControl(s));
+      if (/^(done|complete|completed|finish|finished|close|closed)\b/.test(t)) return true;
+      if (/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
+      if (/^task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
+      // "#37 is/’s/id complete"
+      if (/^#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/.test(t)) return true;
+      // "task #37 is complete"
+      if (/^task\s*#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/.test(t)) return true;
+      return false;
+    }
+    function parseCompleteUtterance(s = '') {
+      const t = normalizeForControl(_sanitize(s).trim());
+
+      let m = t.match(/^task\s*#?\s*(\d+)\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
+      if (m) return { taskNo: parseInt(m[1], 10) };
+
+      m = t.match(/^#?\s*(\d+)\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/i);
+      if (m) return { taskNo: parseInt(m[1], 10) };
+
+      m = t.match(/^(?:done|complete|completed|finish|finished|close|closed)\s+#?(\d+)\b/i);
+      if (m) return { taskNo: parseInt(m[1], 10) };
+
+      m = t.match(/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i);
+      if (m) return { taskNo: 'last' };
+
+      if (/^(?:done|complete|completed|finish|finished|close|closed)\b/i.test(t)) {
+        return { taskNo: 'last' };
+      }
+      return null;
+    }
+
+    // ----- DELETE helpers -----
+    function looksLikeDelete(s = '') {
+      const t = _trimLower(s);
+      // allow "delete #43", "delete task #43", "delete task#43"
+      if (/^(?:delete|remove|cancel|trash)\s+(?:task\s*)?#?\d+\b/.test(t)) return true;
+      if (/^task\s*#?\s*\d+\s+(?:delete|remove|cancel|trash)\b/.test(t)) return true;
+      if (/^(?:delete|remove|cancel|trash)\s+this\s+task\b/.test(t)) return true;
+      return false;
+    }
+    function parseDeleteUtterance(s = '') {
+      const t = _sanitize(s).trim();
+      // supports "delete task#43" (no space)
+      let m = t.match(/^(?:delete|remove|cancel|trash)\s+(?:task\s*)?#?(\d+)\b/i);
+      if (m) return { taskNo: parseInt(m[1], 10) };
+
+      m = t.match(/^task\s*#?\s*(\d+)\s+(?:delete|remove|cancel|trash)\b/i);
+      if (m) return { taskNo: parseInt(m[1], 10) };
+
+      m = t.match(/^(?:delete|remove|cancel|trash)\s+this\s+task\b/i);
+      if (m) return { taskNo: 'last' };
+
+      return null;
+    }
+
+    // One guard to keep control phrases out of task-create fast-path
+    function looksLikeAnyControl(s = '') {
+      return looksLikeAssign(s) || looksLikeComplete(s) || looksLikeDelete(s);
+    }
+    // ==== END CONTROL INTENT HELPERS ====
+
+    // ---------- MEDIA FIRST (AUDIO ONLY): transcribe audio and handle simple commands ----------
+    if (mediaUrl && mediaType) {
+      const ct = String(mediaType).split(';')[0].trim().toLowerCase();
+      const isAudio = /^audio\//.test(ct);
+
+      if (isAudio) {
+        try {
+          // Always pass normalized ct to handleMedia
+          const out = await handleMedia(from, input, userProfile, ownerId, mediaUrl, ct);
+
+          // handleMedia may return { transcript?, twiml? } or a string twiml
+          const transcript = out && typeof out === 'object' ? out.transcript : null;
+          const tw = typeof out === 'string' ? out : (out && out.twiml) ? out.twiml : null;
+
+          console.log('[MEDIA] audio handled', {
+            ct,
+            hasTranscript: !!transcript,
+            transcriptLen: transcript ? transcript.length : 0,
+            hasTwiml: !!tw
+          });
+
+          if (transcript && transcript.trim()) {
+            // 🔹 Clean the transcript first (handles things like "task, get, groceries.")
+            let cleaned = cleanSpokenCommand(transcript);
+
+            // Normalize "remind me …" → "task …"
+            if (/^\s*remind me(\s+to)?\b/i.test(cleaned)) {
+              cleaned = 'task ' + cleaned.replace(/^\s*remind me(\s+to)?\s*/i, '');
+            }
+
+            // Make cleaned transcript the new input for the rest of the pipeline
+            input = cleaned;
+
+            // ---------- ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
+            try {
+              // Pull a recent task number if available (e.g., from pendingReminder)
+              const pendingState = await getPendingTransactionState(from);
+              const ctx = {
+                pendingTaskNo: pendingState?.pendingReminder?.taskNo || null,
+                lastTaskNo: pendingState?.lastTaskNo || null, // optional if you track it
+              };
+
+              const assignHit = looksLikeAssignment(input) ? parseAssignmentUtterance(input, ctx) : null;
+              if (assignHit && assignHit.taskNo && assignHit.assigneeName) {
+                // Hand off to tasks handler in "assign" mode
+                res.locals = res.locals || {};
+                res.locals.intentArgs = {
+                  action: 'assign',
+                  taskNo: assignHit.taskNo,
+                  assigneeName: assignHit.assigneeName
+                };
+
+                const tasksFn = getHandler && getHandler('tasks');
+                if (typeof tasksFn === 'function') {
+                  const normalized = `task assign #${assignHit.taskNo} @${assignHit.assigneeName}`;
+                  const handled = await tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+                  if (!res.headersSent && handled !== false) {
+                    ensureReply(res, `✅ Assigned task #${assignHit.taskNo} to ${assignHit.assigneeName}.`);
+                  }
+                  return; // ✅ handled
+                }
+              }
+            } catch (e) {
+              console.warn('[AUDIO→ASSIGN] skipped:', e?.message);
+              // fall through
+            }
+            // ---------- END ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
+
+            // ---------- REMIND SHORT-CIRCUIT (TEXT) ----------
+            try {
+              const s = stripInvisible(String(input || '')).trim();
+              const lc = s.toLowerCase();
+
+              if (/^(remind\b|set\s+(a\s+)?reminder\b)/i.test(lc)) {
+                const tz = getUserTz(userProfile);
+                const offsetMinutes = getTzOffsetMinutes(tz);
+                const m = s.match(/(?:task\s*)?#\s*(\d+)/i);
+                const taskNo = m ? parseInt(m[1], 10) : null;
+
+                const chrono = require('chrono-node');
+                const results = chrono.parse(s, new Date(), { timezone: offsetMinutes, forwardDate: true });
+                if (!taskNo || !results[0]) {
+                  return res.status(200).type('text/xml')
+                    .send(twiml(`Tell me which task and when. e.g.\n"remind me about task #28 in 10 minutes"`));
+                }
+
+                const remindAtIso = results[0].date().toISOString();
+                await createReminder({ ownerId, userId: from, taskNo, taskTitle: `Task #${taskNo}`, remindAt: remindAtIso });
+
+                const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+                return res.status(200).type('text/xml')
+                  .send(twiml(`⏰ Reminder set for task #${taskNo} at ${whenStr}.`));
+              }
+            } catch (e) {
+              console.warn('[REMIND SHORT-CIRCUIT] skipped:', e?.message);
+            }
+            // ---------- END REMIND SHORT-CIRCUIT ----------
+
+            // 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts (not a question)
+            try {
+              const tasksFn = getHandler && getHandler('tasks');
+              if (
+                typeof tasksFn === 'function' &&
+                ( /^task\b/i.test(cleaned) || (typeof looksLikeTask === 'function' && looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) )
+              ) {
+                // ⛔ Guard: do NOT treat control intents as new tasks
+                if (looksLikeAnyControl(cleaned)) {
+                  // Let the text-path control fast-paths handle it below
+                  throw new Error('control-intent-on-audio'); // bounce to catch -> fall through
+                }
+
+                const args = parseTaskUtterance(cleaned, { tz: getUserTz(userProfile), now: new Date() });
+
+                console.log('[AUDIO→TASK] parsed', {
+                  title: args.title,
+                  dueAt: args.dueAt,
+                  assignee: args.assignee
+                });
+
+                res.locals = res.locals || {};
+                res.locals.intentArgs = { title: args.title, dueAt: args.dueAt, assigneeName: args.assignee };
+
+                const handled = await tasksFn(
+                  from,
+                  `task - ${args.title}`,
+                  userProfile,
+                  ownerId,
+                  ownerProfile,
+                  isOwner,
+                  res
+                );
+
+                if (!res.headersSent && handled !== false) {
+                  ensureReply(res, `Task created: ${args.title}`);
+                }
+                return; // ✅ handled
+              }
+            } catch (te) {
+              if (te && te.message !== 'control-intent-on-audio') {
+                console.warn('[AUDIO→TASK] fast-path failed:', te?.message);
+              }
+              // fall through to text path
+            }
+
+            // Treat the rest of the pipeline as text-only now
+            mediaUrl = null;
+            mediaType = null;
+
+          } else {
+            // No usable transcript
+            if (typeof tw === 'string') {
+              return res.status(200).type('text/xml').send(tw);
+            }
+            ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
+            return; // ❌ stop, avoids helper
+          }
+        } catch (err) {
+          console.error('[MEDIA] audio handling error:', err?.message);
+          // Fall through; guard below will prevent helper on empty text
+        }
+      }
+    }
+
+    // ================= TEXT PATH BEGINS =================
+
+    // Early YES/NO handler for task offers (unchanged)
+    try {
+      const lc = String(input || '').trim().toLowerCase();
+      if (lc === 'yes' || lc === 'no') {
+        const ps = await getPendingTransactionState(from); // "from" is the replier
+        if (ps?.pendingTaskOffer?.taskNo && ps?.pendingTaskOffer?.ownerId) {
+          const { taskNo, ownerId, title } = ps.pendingTaskOffer;
+          const accepted = (lc === 'yes');
+
+          const assigneeId = String(from).replace(/\D/g, ''); // normalize assignee
+          const ownerDigits = String(ownerId).replace(/\D/g, ''); // normalize owner
+
+          await query(
+            `UPDATE public.tasks
+                SET acceptance_status = $4, updated_at = NOW()
+              WHERE owner_id = $1 AND task_no = $2 AND assigned_to = $3`,
+            [ownerId, taskNo, assigneeId, accepted ? 'accepted' : 'declined']
+          );
+
+          try {
+            await sendMessage(
+              ownerDigits,
+              `📣 ${assigneeId} ${accepted ? 'accepted' : 'declined'} task #${taskNo}${title ? `: ${title}` : ''}`
+            );
+          } catch {}
+
+          await sendMessage(from, accepted ? '👍 Accepted — thanks!' : '👌 Declined — got it.');
+          const { pendingTaskOffer, ...rest } = ps;
+          await setPendingTransactionState(from, rest);
+
+          return res.status(200).type('text/xml').send('<Response></Response>');
+        }
+      }
+    } catch (e) {
+      console.warn('[task-offer yes/no] skipped:', e?.message);
+    }
+
+    // ---- ASSIGN FAST-PATH (must run BEFORE any task-creation fast-path) ----
+    try {
+      if (typeof input === 'string' && looksLikeAssign(input)) {
+        const parsed = parseAssignUtterance(input);
+        if (parsed) {
+          let { taskNo, assignee } = parsed;
+
+          if (taskNo === 'last') {
+            try {
+              const ps = await getPendingTransactionState(from);
+              if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+            } catch (_) {}
+          }
+
+          if (!taskNo || Number.isNaN(Number(taskNo))) {
+            return res.status(200).type('text/xml')
+              .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
+          }
+
+          res.locals = res.locals || {};
+          res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
+
+          const handled = await tasksHandler(
+            from,
+            `__assign__ #${taskNo} to ${assignee}`,
+            userProfile,
+            ownerId,
+            ownerProfile,
+            isOwner,
+            res
+          );
+          if (!res.headersSent && handled !== false) ensureReply(res, `Assigning task #${taskNo} to ${assignee}…`);
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('[ASSIGN FAST-PATH] skipped:', e?.message);
+    }
+    // ---- END ASSIGN FAST-PATH ----
+
+    // ---- COMPLETE FAST-PATH (must run BEFORE any task-creation fast-path) ----
+    try {
+      if (typeof input === 'string' && looksLikeComplete(input)) {
+        const hit = parseCompleteUtterance(input);
+        if (hit) {
+          let { taskNo } = hit;
+
+          if (taskNo === 'last') {
+            try {
+              const ps = await getPendingTransactionState(from);
+              if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+            } catch (_) {}
+          }
+
+          if (!taskNo || Number.isNaN(Number(taskNo))) {
+            return res.status(200).type('text/xml')
+              .send(twiml(`I couldn’t tell which task to complete. Try “done #12”.`));
+          }
+
+          res.locals = res.locals || {};
+          res.locals.intentArgs = { doneTaskNo: Number(taskNo) };
+
+          const handled = await tasksHandler(
+            from,
+            `__done__ #${taskNo}`,
+            userProfile,
+            ownerId,
+            ownerProfile,
+            isOwner,
+            res
+          );
+
+          if (!res.headersSent && handled !== false) ensureReply(res, `Completing task #${taskNo}…`);
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('[COMPLETE FAST-PATH] skipped:', e?.message);
+    }
+    // ---- END COMPLETE FAST-PATH ----
+
+    // ---- DELETE FAST-PATH (must run BEFORE task-creation fast-path) ----
+    try {
+      if (typeof input === 'string' && looksLikeDelete(input)) {
+        const hit = parseDeleteUtterance(input);
+        if (hit) {
+          let { taskNo } = hit;
+
+          if (taskNo === 'last') {
+            try {
+              const ps = await getPendingTransactionState(from);
+              if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+            } catch (_) {}
+          }
+
+          if (!taskNo || Number.isNaN(Number(taskNo))) {
+            return res.status(200).type('text/xml')
+              .send(twiml(`I couldn’t tell which task to delete. Try “delete #12”.`));
+          }
+
+          res.locals = res.locals || {};
+          res.locals.intentArgs = { deleteTaskNo: Number(taskNo) };
+
+          const handled = await tasksHandler(
+            from,
+            `__delete__ #${taskNo}`,
+            userProfile,
+            ownerId,
+            ownerProfile,
+            isOwner,
+            res
+          );
+          if (!res.headersSent && handled !== false) ensureReply(res, `Deleting task #${taskNo}…`);
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn('[DELETE FAST-PATH] skipped:', e?.message);
+    }
+    // ---- END DELETE FAST-PATH ----
+
+    // ---------- FAST-PATH TASKS (text-only) ----------
+    try {
+      const bodyTxt = String(input || '');
+
+      // IMPORTANT: Never treat control phrases as new tasks
+      if (
+        !mediaUrl &&
+        !looksLikeAnyControl(bodyTxt) &&
+        (/^task\b/i.test(bodyTxt) ||
+          (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
+      ) {
+        try { await deletePendingTransactionState(from); } catch (_) {}
+
+        const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
+        if (!parsed) throw new Error('Could not parse task intent');
+
+        res.locals = res.locals || {};
+        res.locals.intentArgs = {
+          title: parsed.title,
+          dueAt: parsed.dueAt,
+          assigneeName: parsed.assignee
+        };
+
+        return tasksHandler(from, bodyTxt, userProfile, ownerId, ownerProfile, isOwner, res);
+      }
+    } catch (e) {
+      console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
+    }
+    // ---------- END FAST-PATH TASKS ----------
 
     // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
-try {
-  const pendingState = await getPendingTransactionState(from);
-  const isTextOnly = !mediaUrl && !!input;
+    try {
+      const pendingState = await getPendingTransactionState(from);
+      const isTextOnly = !mediaUrl && !!input;
 
-  if (pendingState?.pendingReminder && isTextOnly) {
-    console.log('[WEBHOOK] pendingReminder present for', from, 'input=', input);
-    const { pendingReminder } = pendingState;
+      if (pendingState?.pendingReminder && isTextOnly) {
+        console.log('[WEBHOOK] pendingReminder present for', from, 'input=', input);
+        const { pendingReminder } = pendingState;
 
-    // 1) Normalize common voice-typo patterns like "in2min" → "in 2 minutes"
-    //    and optionally run your cleanSpokenCommand helper if available.
-    const maybeNormalized = (typeof normalizeTimePhrase === 'function')
-      ? normalizeTimePhrase(String(input || ''))
-      : String(input || '');
-    const cleanedInput = (typeof cleanSpokenCommand === 'function')
-      ? cleanSpokenCommand(maybeNormalized)
-      : maybeNormalized;
+        // 1) Normalize common voice-typo patterns like "in2min" → "in 2 minutes"
+        //    and optionally run your cleanSpokenCommand helper if available.
+        const maybeNormalized = (typeof normalizeTimePhrase === 'function')
+          ? normalizeTimePhrase(String(input || ''))
+          : String(input || '');
+        const cleanedInput = (typeof cleanSpokenCommand === 'function')
+          ? cleanSpokenCommand(maybeNormalized)
+          : maybeNormalized;
 
-    const lc = cleanedInput.trim().toLowerCase();
+        const lc = cleanedInput.trim().toLowerCase();
 
-    // 2) Decide if this looks like a reply in the reminder flow
-    //    - yes/no/cancel
-    //    - anything with "remind"
-    //    - "in <num> <unit>" with/without missing spaces (handled by normalizeTimePhrase)
-    const looksLikeReminderReply =
-      lc === 'yes' || lc === 'yes.' || lc === 'yep' || lc === 'yeah' ||
-      lc === 'no'  || lc === 'no.'  || lc === 'cancel' ||
-      /\bremind\b/i.test(cleanedInput) ||
-      /\bin\s*\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/i.test(lc) ||
-      // Also catch "tomorrow", "tonight", "later", "this evening" etc.
-      /\b(today|tonight|tomorrow|this\s+(morning|afternoon|evening|night))\b/i.test(lc) ||
-      // Simple absolute time phrases: "at 7", "7pm", "7:30 pm"
-      /\b(?:at\s*)?\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(lc);
+        // 2) Decide if this looks like a reply in the reminder flow
+        //    - yes/no/cancel
+        //    - anything with "remind"
+        //    - "in <num> <unit>" with/without missing spaces (handled by normalizeTimePhrase)
+        const looksLikeReminderReply =
+          lc === 'yes' || lc === 'yes.' || lc === 'yep' || lc === 'yeah' ||
+          lc === 'no'  || lc === 'no.'  || lc === 'cancel' ||
+          /\bremind\b/i.test(cleanedInput) ||
+          /\bin\s*\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/i.test(lc) ||
+          // Also catch "tomorrow", "tonight", "later", "this evening" etc.
+          /\b(today|tonight|tomorrow|this\s+(morning|afternoon|evening|night))\b/i.test(lc) ||
+          // Simple absolute time phrases: "at 7", "7pm", "7:30 pm"
+          /\b(?:at\s*)?\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(lc);
 
-    if (looksLikeReminderReply) {
-      const chrono = require('chrono-node');
-      const { createReminder } = require('../services/reminders');
+        if (looksLikeReminderReply) {
+          const chrono = require('chrono-node');
 
-      // 2a) “no / cancel” → stop and clear
-      if (lc === 'no' || lc === 'cancel') {
-        await deletePendingTransactionState(from);
-        return res
-          .status(200)
-          .type('text/xml')
-          .send(twiml(`No problem — no reminder set.`));
-      }
+          // 2a) “no / cancel” → stop and clear
+          if (lc === 'no' || lc === 'cancel') {
+            await deletePendingTransactionState(from);
+            return res
+              .status(200)
+              .type('text/xml')
+              .send(twiml(`No problem — no reminder set.`));
+          }
 
-      // 2b) “yes” alone → ask for a time
-      const saidYesOnly = /^(yes\.?|yep|yeah)\s*$/i.test(cleanedInput.trim());
-      if (saidYesOnly) {
-        return res
-          .status(200)
-          .type('text/xml')
-          .send(twiml(`Great — what time should I remind you? (e.g., "7pm tonight" or "tomorrow 8am")`));
-      }
+          // 2b) “yes” alone → ask for a time
+          const saidYesOnly = /^(yes\.?|yep|yeah)\s*$/i.test(cleanedInput.trim());
+          if (saidYesOnly) {
+            return res
+              .status(200)
+              .type('text/xml')
+              .send(twiml(`Great — what time should I remind you? (e.g., "7pm tonight" or "tomorrow 8am")`));
+          }
 
-      // 3) Parse time from the (normalized) reply in the user's timezone
-      const tz = getUserTz(userProfile);
+          // 3) Parse time from the (normalized) reply in the user's timezone
+          const tz = getUserTz(userProfile);
+          const offsetMinutes = getTzOffsetMinutes(tz);
 
-      function getTzOffsetMinutes(tzName) {
-  const now = new Date();
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: tzName, hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit'
-  }).formatToParts(now);
-  const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
-  const localIso = `${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}`;
-  const asLocal = Date.parse(localIso);
-  const asUtc   = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
-  return (asLocal - asUtc) / 60000;  // ✅ negative for N. America, positive for e.g. Europe/Asia
-}
+          // Use the cleaned/normalized text for parsing
+          const results = chrono.parse(cleanedInput, new Date(), {
+            timezone: offsetMinutes,
+            forwardDate: true
+          });
 
+          if (!results || !results[0]) {
+            // One more leniency pass: if user said only "in2min" or "in2 minutes" and we missed it,
+            // try explicitly expanding units again (defensive).
+            const fallback = cleanedInput
+              .replace(/\bin\s*(\d+)\s*(m|min|mins)\b/gi, 'in $1 minutes')
+              .replace(/\bin\s*(\d+)\s*(h|hr|hrs)\b/gi, 'in $1 hours')
+              .replace(/\bin\s*(\d+)\s*(d)\b/gi, 'in $1 days');
 
-      const offsetMinutes = getTzOffsetMinutes(tz);
+            const retry = chrono.parse(fallback, new Date(), {
+              timezone: offsetMinutes,
+              forwardDate: true
+            });
 
-      // Use the cleaned/normalized text for parsing
-      const results = chrono.parse(cleanedInput, new Date(), {
-        timezone: offsetMinutes,
-        forwardDate: true
-      });
+            if (!retry || !retry[0]) {
+              return res.status(200).type('text/xml')
+                .send(twiml(`I couldn't find a time in that. Try "in 2 minutes", "7pm tonight", or "tomorrow 8am".`));
+            }
 
-      if (!results || !results[0]) {
-        // One more leniency pass: if user said only "in2min" or "in2 minutes" and we missed it,
-        // try explicitly expanding units again (defensive).
-        const fallback = cleanedInput
-          .replace(/\bin\s*(\d+)\s*(m|min|mins)\b/gi, 'in $1 minutes')
-          .replace(/\bin\s*(\d+)\s*(h|hr|hrs)\b/gi, 'in $1 hours')
-          .replace(/\bin\s*(\d+)\s*(d)\b/gi, 'in $1 days');
+            const dt = retry[0].date();
+            const remindAtIso = dt.toISOString();
 
-        const retry = chrono.parse(fallback, new Date(), {
-          timezone: offsetMinutes,
-          forwardDate: true
-        });
+            await createReminder({
+              ownerId: pendingReminder.ownerId,
+              userId: pendingReminder.userId,
+              taskNo: pendingReminder.taskNo,
+              taskTitle: pendingReminder.taskTitle,
+              remindAt: remindAtIso
+            });
+            await deletePendingTransactionState(from);
 
-        if (!retry || !retry[0]) {
+            const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+            return res.status(200).type('text/xml')
+              .send(twiml(`Got it. Reminder set for ${whenStr}.`));
+          }
+
+          // Success path
+          const dt = results[0].date();
+          const remindAtIso = dt.toISOString();
+
+          await createReminder({
+            ownerId: pendingReminder.ownerId,
+            userId: pendingReminder.userId,
+            taskNo: pendingReminder.taskNo,
+            taskTitle: pendingReminder.taskTitle,
+            remindAt: remindAtIso
+          });
+          await deletePendingTransactionState(from);
+
+          const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
           return res.status(200).type('text/xml')
-            .send(twiml(`I couldn't find a time in that. Try "in 2 minutes", "7pm tonight", or "tomorrow 8am".`));
+            .send(twiml(`Got it. Reminder set for ${whenStr}.`));
         }
-
-        const dt = retry[0].date();
-        const remindAtIso = dt.toISOString();
-
-        await createReminder({
-          ownerId: pendingReminder.ownerId,
-          userId: pendingReminder.userId,
-          taskNo: pendingReminder.taskNo,
-          taskTitle: pendingReminder.taskTitle,
-          remindAt: remindAtIso
-        });
-        await deletePendingTransactionState(from);
-
-        const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
-        return res.status(200).type('text/xml')
-          .send(twiml(`Got it. Reminder set for ${whenStr}.`));
       }
-
-      // Success path
-      const dt = results[0].date();
-      const remindAtIso = dt.toISOString();
-
-      await createReminder({
-        ownerId: pendingReminder.ownerId,
-        userId: pendingReminder.userId,
-        taskNo: pendingReminder.taskNo,
-        taskTitle: pendingReminder.taskTitle,
-        remindAt: remindAtIso
-      });
-      await deletePendingTransactionState(from);
-
-      const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
-      return res.status(200).type('text/xml')
-        .send(twiml(`Got it. Reminder set for ${whenStr}.`));
-    }
-  }
 
       // ---- A) Pending media-driven flows (text replies only, not "tasky")
       const tasky = /^task\b/i.test(input) || (function () {
@@ -1056,6 +1042,7 @@ try {
       console.warn('[WEBHOOK] pending text-reply handler skipped:', e?.message);
     }
     // === END REMINDERS/PENDING SHORT-CIRCUITS ===
+
 
 // === CONTEXTUAL HELP (FAQ intercept) — must run BEFORE generic helpers/NLP ===
 try {

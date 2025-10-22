@@ -435,63 +435,56 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
 
  async function tasksHandler(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   try {
-    // Normalize text and context
     const body = (typeof norm === 'function') ? norm(input) : String(input || '').trim();
     const tier = userProfile?.subscription_tier || 'starter';
-    const tz = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+    const tz   = userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 
-    // ============================================================
-    // 1) ASSIGN FAST-PATH (must run first; handles webhook + text)
-    //    This should NO-OP if there's nothing to assign.
-    // ============================================================
+    // ✅ 1) ASSIGN FAST-PATH FIRST (intercepts both webhook and text forms)
     const handled = await maybeHandleAssignmentFastPath({
       ownerId, from, body, res, userProfile, ownerProfile,
     });
     if (handled) return true;
 
-    // Routed args from webhook fast-paths
+    // Sentinels supplied by webhook fast-paths
     const routed = res?.locals?.intentArgs || null;
 
-    // ============================================================
-    // 2) DONE SENTINEL (from webhook COMPLETE fast-path)
-    //    Short-circuit before any list/create logic.
-    // ============================================================
-    if (routed?.doneTaskNo) {
-      const taskNo = Number(routed.doneTaskNo);
+    // ✅ 2) DONE SENTINEL (short-circuit)
+    if (routed?.doneTaskNo != null) {
+      const taskNo = routed.doneTaskNo === 'last'
+        ? (await getPendingTransactionState(from).catch(() => ({})))?.lastTaskNo
+        : Number(routed.doneTaskNo);
+      if (!taskNo || Number.isNaN(Number(taskNo))) {
+        return res.send(RESP(`⚠️ I couldn’t tell which task to complete.`));
+      }
       try {
-        const t = await markTaskDone({ ownerId, taskNo, actorId: from });
+        const t = await markTaskDone({ ownerId, taskNo: Number(taskNo), actorId: from });
         return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
       } catch (e) {
-        if (e.message?.includes('Task not found')) {
-          return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
-        }
+        if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
         throw e;
       }
     }
 
-    // ============================================================
-    // 3) DELETE SENTINEL (from webhook DELETE fast-path)
-    //    Short-circuit before any list/create logic.
-    // ============================================================
-    if (routed?.deleteTaskNo) {
-      const taskNo = Number(routed.deleteTaskNo);
+    // ✅ 3) DELETE SENTINEL (short-circuit)
+    if (routed?.deleteTaskNo != null) {
+      const taskNo = routed.deleteTaskNo === 'last'
+        ? (await getPendingTransactionState(from).catch(() => ({})))?.lastTaskNo
+        : Number(routed.deleteTaskNo);
+      if (!taskNo || Number.isNaN(Number(taskNo))) {
+        return res.send(RESP(`⚠️ I couldn’t tell which task to delete.`));
+      }
       try {
-        const t = await dbGetTaskByNo(ownerId, taskNo);
+        const t = await dbGetTaskByNo(ownerId, Number(taskNo));
         if (!t) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
-
-        // Permission: owner/board OR task creator OR current assignee
-        const fromDigits  = String(from).replace(/\D/g, '');
-        const isOwnerBd   = isOwnerOrBoard(userProfile);
-        const isCreator   = t.created_by && String(t.created_by).replace(/\D/g, '') === fromDigits;
-        const isAssignee  = t.assigned_to && String(t.assigned_to).replace(/\D/g, '') === fromDigits;
-
+        const fromDigits = String(from).replace(/\D/g, '');
+        const isOwnerBd = isOwnerOrBoard(userProfile);
+        const isCreator = t.created_by && String(t.created_by).replace(/\D/g, '') === fromDigits;
+        const isAssignee = t.assigned_to && String(t.assigned_to).replace(/\D/g, '') === fromDigits;
         if (!isOwnerBd && !isCreator && !isAssignee) {
           return res.send(RESP(`⚠️ You don’t have permission to delete task #${taskNo}.`));
         }
-
-        const ok = await dbDeleteTask(ownerId, taskNo);
+        const ok = await dbDeleteTask(ownerId, Number(taskNo));
         if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
-
         return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
       } catch (e) {
         console.error('[tasks.delete] error:', e?.message);
@@ -500,10 +493,9 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
     }
 
     // ============================================================
-    // 4) (OPTIONAL) ASSIGN SENTINEL SAFETY NET
-    //    If the webhook set intentArgs (assignTaskNo/assigneeName) and
-    //    maybeHandleAssignmentFastPath didn’t consume it, handle here.
-    //    This preserves robustness without changing your assign logic.
+    // 5) ASSIGN SENTINEL SAFETY NET
+    //    If webhook set intentArgs (assignTaskNo/assigneeName) and
+    //    the up-front fast-path didn't consume it, handle here.
     // ============================================================
     if (routed?.assignTaskNo && routed?.assigneeName) {
       const consumed = await maybeHandleAssignmentFastPath({
@@ -517,12 +509,319 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
       if (consumed) return true;
     }
 
-    // ==================================================================
-    // From here on, keep your existing branches (lists, inbox, others,
-    // done/reopen commands, delete commands, create paths, etc.)
-    // The key fix is that DONE/DELETE/ASSIGN sentinels have already
-    // short-circuited above, so these won’t be mistaken for new tasks.
-    // ==================================================================
+    // ============================================================
+    // 6) CREATE LIMIT (applies to all create paths)
+    // ============================================================
+    const isTaskyCreate = /^task\b/i.test(body) || !!routed?.title;
+    if (isTaskyCreate) {
+      const canCreate = await checkTaskLimit(ownerId, from, tier);
+      if (!canCreate) {
+        const lim = TASK_LIMITS[String(tier || 'starter').toLowerCase()].maxTasksPerDay;
+        return res.send(
+          RESP(`⚠️ Task creation limit reached for ${tier} tier (${lim}/day). Upgrade or try tomorrow.`)
+        );
+      }
+    }
+
+    // ============================================================
+    // 7) BROADCAST: "task @everyone - <title>"
+    // ============================================================
+    {
+      const titleForAll = typeof parseEveryone === 'function' ? parseEveryone(body) : null;
+      if (titleForAll) {
+        const team = await getTeamMembers(ownerId);
+        const teammates = (team || []).filter((u) => u.user_id && u.user_id !== from);
+
+        if (!teammates.length) {
+          return res.send(RESP(
+            `⚠️ I don’t see any teammates on your account yet.\n` +
+            `Add a teammate by texting:\n• "add teammate Justin +19055551234"\n` +
+            `Then try: "task @everyone - Kickoff at 9am"`
+          ));
+        }
+
+        let createdCount = 0;
+        const taskNos = [];
+        for (const tm of teammates) {
+          const task = await createTask({
+            ownerId,
+            createdBy: from,
+            assignedTo: tm.user_id,
+            title: titleForAll,
+            body: null,
+            type: 'general',
+            dueAt: null,
+          });
+          if (task?.task_no != null) {
+            createdCount++;
+            taskNos.push(task.task_no);
+          }
+
+          // DM teammate (best-effort)
+          try {
+            await sendMessage(
+              tm.user_id,
+              `📝 New team task: ${cap(task.title)} (#${task.task_no})\nAssigned by ${userProfile?.name || 'Owner'}`
+            );
+          } catch (e) {
+            console.warn('[tasks.assign_all] DM failed:', tm.user_id, e?.message);
+          }
+        }
+
+        // Save lastTaskNo for quick follow-ups (“assign last …”)
+        try {
+          const last = taskNos[taskNos.length - 1];
+          if (last != null) {
+            const prev = await getPendingTransactionState(from).catch(() => ({}));
+            await setPendingTransactionState(from, { ...prev, lastTaskNo: last });
+            console.log('[tasks.assign_all] lastTaskNo saved for', from, 'task #', last);
+          }
+        } catch (e) {
+          console.warn('[tasks.assign_all] lastTaskNo state set failed:', e?.message);
+        }
+
+        return res.send(
+          RESP(`✅ Sent task #${taskNos.join(', #')} to everyone — “${cap(titleForAll)}”. (${createdCount} teammates notified)`)
+        );
+      }
+    }
+
+    // ============================================================
+    // 8) STRUCTURED CREATE (router-provided args)
+    // ============================================================
+    if (routed?.title) {
+      let title = String(routed.title || '').trim();
+      let resolvedAssignee = from;
+      let assigneeLabel = userProfile?.name || from;
+
+      if (routed.assigneeName) {
+        // Try resolve teammate via phone or name
+        let found = null;
+        if (/^\+?\d{10,15}$/.test(routed.assigneeName)) {
+          const user = await getUserBasic(routed.assigneeName);
+          if (user?.user_id) found = user;
+        } else {
+          const user = await getUserByName(ownerId, routed.assigneeName);
+          if (user?.user_id) found = user;
+        }
+
+        if (found) {
+          resolvedAssignee = found.user_id;
+          assigneeLabel = found?.name || routed.assigneeName;
+        } else {
+          // Not a teammate → keep mention in title but assign to sender
+          title = reinstateAssigneeInTitle(title, 'to', routed.assigneeName);
+        }
+      }
+
+      const task = await createTask({
+        ownerId,
+        createdBy: from,
+        assignedTo: resolvedAssignee,
+        title,
+        body: null,
+        type: 'general',
+        dueAt: routed.dueAt || null,
+      });
+
+      if (!task || task.task_no == null) {
+        console.error('[tasks] createTask failed: missing task_no');
+        return res.send(RESP('⚠️ Failed to create task. Please try again.'));
+      }
+
+      let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
+      if (resolvedAssignee !== from) {
+        reply += `\nAssigned to: ${cap(assigneeLabel)}`;
+        try {
+          await sendMessage(
+            resolvedAssignee,
+            `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${routed.dueAt ? `, due ${fmtDate(routed.dueAt, tz)}` : ''}`
+          );
+        } catch (e) {
+          console.warn('[tasks] Assignee notification failed:', e.message);
+        }
+      }
+      if (routed.dueAt) reply += `\nDue: ${fmtDate(routed.dueAt, tz)}`;
+
+      // Save lastTaskNo + reminder prompt
+      try {
+        const prev = await getPendingTransactionState(from).catch(() => ({}));
+        await setPendingTransactionState(from, {
+          ...prev,
+          lastTaskNo: task.task_no,
+          pendingReminder: {
+            ownerId,
+            userId: from,
+            taskNo: task.task_no,
+            taskTitle: task.title
+          }
+        });
+        console.log('[tasks] pendingReminder set & lastTaskNo saved for', from, 'task #', task.task_no);
+        reply += `\nDo you want me to send you a reminder?`;
+      } catch (e) {
+        console.warn('[tasks] pendingReminder/lastTaskNo state set failed:', e?.message);
+      }
+
+      return res.send(RESP(reply));
+    }
+
+    // ============================================================
+    // 9) Text command path: "task - ..." or "task ..."
+    //     (with defensive re-route for control phrases)
+    // ============================================================
+    {
+      const m = body.match(/^task(?:\s*[:\-])?\s+(.+)$/i);
+      if (m) {
+        const afterTask = String(m[1] || '').trim();
+
+        // --- Defensive guard: reroute control phrases that slipped through ---
+        // Normalize the common STT quirk for detection
+        function normalizeForControlLocal(s = '') {
+          let t = String(s || '');
+          t = t.replace(/(\btask\s*#?\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
+          t = t.replace(/(\b#\s*\d+\s+)\bid\b(?=\s+(complete|completed|done|finished|closed)\b)/gi, '$1is');
+          return t;
+        }
+        const normAfter = normalizeForControlLocal(`task ${afterTask}`);
+
+        // 1) Assign form: "task assign #12 to Jaclyn"
+        if (/^\s*task\s+assign\b/i.test(normAfter)) {
+          // Extract number + assignee
+          let mm = normAfter.match(/assign\s+(?:task\s*)?#?(\d+)\s+(?:to|for|@)\s+(.+?)\s*$/i);
+          if (!mm) {
+            // fallback: "task assign to Jaclyn" => use last
+            const ps = await getPendingTransactionState(from).catch(() => ({}));
+            const last = ps?.lastTaskNo != null ? ps.lastTaskNo : 'last';
+            mm = [null, last, (normAfter.match(/assign\s+(?:to|for|@)\s+(.+?)\s*$/i) || [])[1]];
+          }
+          const n  = mm && mm[1] ? parseInt(mm[1], 10) : 'last';
+          const an = mm && mm[2] ? mm[2].trim() : null;
+
+          if (an) {
+            res.locals = res.locals || {};
+            res.locals.intentArgs = { assignTaskNo: (n === 'last' ? 'last' : Number(n)), assigneeName: an };
+            return tasksHandler(from, `__assign__ #${n} to ${an}`, userProfile, ownerId, ownerProfile, isOwner, res);
+          }
+          // fall through to create if we cannot parse an assignee
+        }
+
+        // 2) Complete forms: "task #42 is/’s/id complete", "task #42 has been completed"
+        if (/^\s*task\s*#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/i.test(normAfter) ||
+            /^\s*task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/i.test(normAfter)) {
+          let mm = normAfter.match(/task\s*#?\s*(\d+)/i);
+          const n = mm && mm[1] ? parseInt(mm[1], 10) : 'last';
+          res.locals = res.locals || {};
+          res.locals.intentArgs = { doneTaskNo: (n === 'last' ? 'last' : Number(n)) };
+          return tasksHandler(from, `__done__ #${n}`, userProfile, ownerId, ownerProfile, isOwner, res);
+        }
+
+        // 3) Delete forms inside a "task ..." prefix, e.g. "task delete #43"
+        if (/^\s*task\s+(?:delete|remove|cancel|trash)\b/i.test(normAfter)) {
+          let mm = normAfter.match(/#\s*(\d+)/) || normAfter.match(/task\s*#?\s*(\d+)/i);
+          const n = mm && mm[1] ? parseInt(mm[1], 10) : 'last';
+          res.locals = res.locals || {};
+          res.locals.intentArgs = { deleteTaskNo: (n === 'last' ? 'last' : Number(n)) };
+          return tasksHandler(from, `__delete__ #${n}`, userProfile, ownerId, ownerProfile, isOwner, res);
+        }
+        // --- End defensive guard ---
+
+        // Normal task creation path
+        const {
+          title: rawTitle,
+          assignedTo,
+          dueAt,
+          assigneeToken,
+          assigneePreposition
+        } = parseTaskCommand(afterTask);
+
+        if (!rawTitle) return res.send(RESP('⚠️ Task title is required. Try "task - buy tape".'));
+
+        let title = rawTitle;
+        let resolvedAssignee = null;
+        let assigneeLabel = null;
+
+        if (assignedTo) {
+          if (/^\+?\d{10,15}$/.test(assignedTo)) {
+            const user = await getUserBasic(assignedTo);
+            resolvedAssignee = user?.user_id || null;
+            assigneeLabel = user?.name || assignedTo;
+          } else {
+            const user = await getUserByName(ownerId, assignedTo);
+            resolvedAssignee = user?.user_id || null;
+            assigneeLabel = assignedTo;
+          }
+
+          if (!resolvedAssignee) {
+            // Not a teammate → keep the mention in the title and assign to sender
+            title = reinstateAssigneeInTitle(title, assigneePreposition || 'to', assigneeToken || assignedTo);
+            resolvedAssignee = from;
+            assigneeLabel = userProfile?.name || from;
+          }
+        } else {
+          // default: assign to sender
+          resolvedAssignee = from;
+          assigneeLabel = userProfile?.name || from;
+        }
+
+        const task = await createTask({
+          ownerId,
+          createdBy: from,
+          assignedTo: resolvedAssignee,
+          title,
+          body: null,
+          type: 'general',
+          dueAt,
+        });
+
+        if (!task || task.task_no == null) {
+          console.error('[tasks] createTask failed: missing task_no');
+          return res.send(RESP('⚠️ Failed to create task. Please try again.'));
+        }
+
+        // Single confirmation; DM only if assigning to someone else
+        let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
+        if (resolvedAssignee !== from) {
+          reply += `\nAssigned to: ${cap(assigneeLabel)}`;
+          try {
+            await sendMessage(
+              resolvedAssignee,
+              `📝 New task assigned to you: ${cap(task.title)} (#${task.task_no})${dueAt ? `, due ${fmtDate(dueAt, tz)}` : ''}`
+            );
+          } catch (e) {
+            console.warn('[tasks] Assignee notification failed:', e.message);
+          }
+        }
+        if (dueAt) reply += `\nDue: ${fmtDate(dueAt, tz)}`;
+
+        // Save lastTaskNo + reminder prompt
+        try {
+          const prev = await getPendingTransactionState(from).catch(() => ({}));
+          await setPendingTransactionState(from, {
+            ...prev,
+            lastTaskNo: task.task_no,
+            pendingReminder: {
+              ownerId,
+              userId: from,
+              taskNo: task.task_no,
+              taskTitle: task.title
+            }
+          });
+          console.log('[tasks] pendingReminder set & lastTaskNo saved for', from, 'task #', task.task_no);
+          reply += `\nDo you want me to send you a reminder?`;
+        } catch (e) {
+          console.warn('[tasks] pendingReminder/lastTaskNo state set failed:', e?.message);
+        }
+
+        return res.send(RESP(reply));
+      }
+    }
+
+    // ============================================================
+    // 10) (Keep any remaining branches you already have: list, show,
+    //     reopen, inbox, search, summaries, etc.)
+    //     If none match, fall through to your AI router or generic
+    //     handler as before.
+    // ============================================================
 
     // --- INBOX (owner/board): "inbox tasks" / "inbox tasks done"
     if (/^inbox\s+tasks(?:\s+(open|done))?$/i.test(body)) {

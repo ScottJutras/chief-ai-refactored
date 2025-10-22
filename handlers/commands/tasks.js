@@ -505,11 +505,7 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
         return res.send(RESP(`⚠️ I couldn’t tell which task to complete.`));
       }
       try {
-        const t = await markTaskDone({
-  ownerId,
-  taskNo: Number(taskNo),
-  actorId: from,
-  isOwner, });
+        const t = await markTaskDone({ ownerId, taskNo: Number(taskNo), actorId: from, isOwner });
         return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
       } catch (e) {
         if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
@@ -969,7 +965,7 @@ if (/^\s*task\s*#?\s*\d+\s+(?:(?:is|id|\'s|’s)\s+)?(?:complete|completed|done|
       if (m) {
         const taskNo = parseInt(m[1], 10);
         try {
-          const t = await markTaskDone({ ownerId, taskNo, actorId: from });
+          const t = await markTaskDone({ ownerId, taskNo: Number(taskNo), actorId: from, isOwner });
           return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
         } catch (e) {
           if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));

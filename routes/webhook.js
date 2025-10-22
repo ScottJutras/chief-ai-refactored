@@ -1308,6 +1308,107 @@ try {
   console.warn('[WEBHOOK] pending text-reply handler skipped:', e?.message);
 }
 // === END REMINDERS/PENDING SHORT-CIRCUITS ===
+// === "MY TASKS" / "TEAM TASKS" SHORT-CIRCUITS (before routers) ===
+try {
+  if (!mediaUrl && typeof input === 'string') {
+    const raw = input.trim();
+    const lc  = raw.toLowerCase();
+
+    // Helper: chunk long lists into multiple messages
+    async function _sendChunked(to, header, lines, chunkSize = 18) {
+      // 18 lines per message is a safe compromise for WhatsApp/SMS
+      for (let i = 0; i < lines.length; i += chunkSize) {
+        const part = lines.slice(i, i + chunkSize);
+        const prefix = (i === 0) ? header : '…continued';
+        await sendMessage(to, `${prefix}\n${part.join('\n')}`);
+      }
+    }
+
+    // Helper: pretty due
+    function _fmtDue(d, tz) {
+      if (!d) return '';
+      try {
+        return new Date(d).toLocaleString('en-CA', {
+          timeZone: tz, month: 'short', day: 'numeric',
+          hour: 'numeric', minute: '2-digit'
+        });
+      } catch { return ''; }
+    }
+
+    // --- MY TASKS ---
+    if (/^\s*(my\s+tasks|tasks\s+mine|show\s+my\s+tasks)\s*$/i.test(lc)) {
+      const { listMyTasks } = require('../services/postgres'); // path as in your project
+      const tz = getUserTz(userProfile);
+      const me = from;
+
+      let rows = [];
+      try {
+        rows = await listMyTasks({ ownerId, userId: me, status: 'open' });
+      } catch (e) {
+        console.warn('[MY TASKS] failed:', e?.message);
+      }
+
+      if (!rows || rows.length === 0) {
+        return res.status(200).type('text/xml')
+          .send(twiml(`✅ You're all caught up! (no open tasks)`));
+      }
+
+      const lines = rows.map(t => {
+        const due = _fmtDue(t.due_at, tz);
+        const dueTxt = due ? ` (due ${due})` : '';
+        return `• #${t.task_no} ${t.title}${dueTxt}`;
+      });
+
+      await _sendChunked(from, `✅ Here's what's on your plate:`, lines, 18);
+      return res.status(200).type('text/xml').send('<Response></Response>');
+    }
+
+    // --- TEAM TASKS ---
+    if (/^\s*(team\s+tasks|tasks\s+team|show\s+team\s+tasks)\s*$/i.test(lc)) {
+      const { listAllOpenTasksByAssignee } = require('../services/postgres'); // path as in your project
+      const tz = getUserTz(userProfile);
+
+      let rows = [];
+      try {
+        rows = await listAllOpenTasksByAssignee({ ownerId });
+      } catch (e) {
+        console.warn('[TEAM TASKS] failed:', e?.message);
+      }
+
+      if (!rows || rows.length === 0) {
+        return res.status(200).type('text/xml')
+          .send(twiml(`✅ No open team tasks — nice!`));
+      }
+
+      // Group by assignee_name (null/empty => "Unassigned")
+      const groups = new Map();
+      for (const t of rows) {
+        const key = (t.assignee_name && String(t.assignee_name).trim()) || 'Unassigned';
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(t);
+      }
+
+      // Build lines by group; one big list we will chunk
+      const allLines = [];
+      for (const [who, list] of groups.entries()) {
+        allLines.push(`— ${who} —`);
+        for (const t of list) {
+          const due = _fmtDue(t.due_at, tz);
+          const dueTxt = due ? ` (due ${due})` : '';
+          allLines.push(`• #${t.task_no} ${t.title}${dueTxt}`);
+        }
+        allLines.push(''); // blank line between groups
+      }
+      // remove trailing blank
+      if (allLines[allLines.length - 1] === '') allLines.pop();
+
+      await _sendChunked(from, `👥 Team tasks (open):`, allLines, 20);
+      return res.status(200).type('text/xml').send('<Response></Response>');
+    }
+  }
+} catch (e) {
+  console.warn('[TASKS LIST SHORT-CIRCUIT] skipped:', e?.message);
+}
 
 
 // === CONTEXTUAL HELP (FAQ intercept) — must run BEFORE generic helpers/NLP ===

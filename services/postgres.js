@@ -1576,21 +1576,25 @@ async function createTask({
   }
 }
 
-// ---------- TASK LISTING (compat layer for existing imports) ----------
-// Returns ALL open tasks for a given user (both created_by OR assigned_to that user).
-// If status !== 'open', it will filter by that exact status (e.g., 'done').
+// ---------- TASK LISTING + STATUS HELPERS (DB-safe, no external normalizer) ----------
 
+// Local, cycle-safe normalizer (avoid importing normalizePhoneNumber here)
+function _digits(x) {
+  return String(x || '').replace(/\D/g, '');
+}
+
+/**
+ * Returns ALL tasks for a given user (both created_by OR assigned_to),
+ * defaulting to "open" = status NOT IN ('done','deleted').
+ */
 async function listMyTasks({ ownerId, userId, status = 'open' }) {
-  const norm = (typeof normalizePhoneNumber === 'function')
-    ? normalizePhoneNumber(userId)
-    : String(userId).replace(/\D/g, '');
+  const owner = _digits(ownerId);
+  const user  = _digits(userId);
 
-  // For "open", include anything not done/deleted. Otherwise exact match.
   const statusClause = (status === 'open')
     ? `t.status NOT IN ('done','deleted')`
     : `t.status = $3`;
-
-  const params = (status === 'open') ? [ownerId, norm] : [ownerId, norm, status];
+  const params = (status === 'open') ? [owner, user] : [owner, user, status];
 
   const { rows } = await query(
     `
@@ -1599,6 +1603,8 @@ async function listMyTasks({ ownerId, userId, status = 'open' }) {
       t.title,
       t.due_at,
       t.status,
+      t.created_at,
+      t.assigned_to,
       COALESCE(a.name, t.assigned_to) AS assignee_name,
       COALESCE(c.name, t.created_by)  AS creator_name
     FROM public.tasks t
@@ -1614,13 +1620,16 @@ async function listMyTasks({ ownerId, userId, status = 'open' }) {
   return rows;
 }
 
-// "Inbox" = unassigned tasks under this tenant (open by default)
+/**
+ * Unassigned tasks for the tenant.
+ */
 async function listInboxTasks({ ownerId, status = 'open' }) {
+  const owner = _digits(ownerId);
+
   const statusClause = (status === 'open')
     ? `t.status NOT IN ('done','deleted')`
     : `t.status = $2`;
-
-  const params = (status === 'open') ? [ownerId] : [ownerId, status];
+  const params = (status === 'open') ? [owner] : [owner, status];
 
   const { rows } = await query(
     `
@@ -1629,6 +1638,7 @@ async function listInboxTasks({ ownerId, status = 'open' }) {
       t.title,
       t.due_at,
       t.status,
+      t.created_at,
       t.created_by,
       COALESCE(c.name, t.created_by) AS creator_name
     FROM public.tasks t
@@ -1643,130 +1653,120 @@ async function listInboxTasks({ ownerId, status = 'open' }) {
   return rows;
 }
 
-// Lookup by teammate name or phone, then reuse listMyTasks
+/**
+ * Look up a teammate by name or phone, then reuse listMyTasks.
+ */
 async function listTasksForUser({ ownerId, nameOrId, status = 'open' }) {
-  let user = null;
+  let userRow = null;
   if (/^\+?\d{10,15}$/.test(String(nameOrId))) {
-    user = await getUserBasic(nameOrId);
+    userRow = await getUserBasic(nameOrId);
   } else {
-    user = await getUserByName(ownerId, nameOrId);
+    userRow = await getUserByName(ownerId, nameOrId);
   }
-  if (!user || !user.user_id) return [];
-  return await listMyTasks({ ownerId, userId: user.user_id, status });
+  if (!userRow || !userRow.user_id) return [];
+  return await listMyTasks({ ownerId, userId: userRow.user_id, status });
 }
 
-
-async function markTaskDone({ ownerId, taskNo, actorId }) {
-  try {
-    const actor = normalizePhoneNumber(actorId);
-    const { rows } = await query(
-      `
-      UPDATE public.tasks
-         SET status = 'done',
-             updated_at = NOW()
-       WHERE owner_id = $1
-         AND task_no  = $2
-         AND (
-               assigned_to = $3
-               OR (assigned_to IS NULL AND created_by = $3)
-             )
-       RETURNING task_no, title
-      `,
-      [ownerId, taskNo, actor]
-    );
-    if (!rows.length) throw new Error('Task not found');
-    return rows[0];
-  } catch (error) {
-    console.error('[ERROR] markTaskDone failed:', error.message);
-    throw error;
-  }
-}
-
-async function reopenTask({ ownerId, taskNo, actorId }) {
-  try {
-    const actor = normalizePhoneNumber(actorId);
-    const { rows } = await query(
-      `
-      UPDATE public.tasks
-         SET status = 'open',
-             updated_at = NOW()
-       WHERE owner_id = $1
-         AND task_no  = $2
-         AND (
-               assigned_to = $3
-               OR (assigned_to IS NULL AND created_by = $3)
-             )
-       RETURNING task_no, title
-      `,
-      [ownerId, taskNo, actor]
-    );
-    if (!rows.length) throw new Error('Task not found');
-    return rows[0];
-  } catch (error) {
-    console.error('[ERROR] reopenTask failed:', error.message);
-    throw error;
-  }
-}
-
-async function createTimeEditRequestTask({
-  ownerId,
-  requesterId,
-  title,
-  body,
-  relatedEntryId = null,
-}) {
-  try {
-    const task = await createTask({
-      ownerId,
-      createdBy: requesterId,
-      assignedTo: null,
-      title,
-      body,
-      type: 'time_edit_request',
-      relatedEntryId,
-    });
-    return task;
-  } catch (error) {
-    console.error('[ERROR] createTimeEditRequestTask failed:', error.message);
-    throw error;
-  }
-}
-
-async function getCurrentStatus(ownerId, employeeName) {
-  const res = await query(
+/**
+ * All open tasks grouped by assignee (for "Team tasks").
+ */
+async function listAllOpenTasksByAssignee({ ownerId }) {
+  const owner = _digits(ownerId);
+  const { rows } = await query(
     `
-    SELECT type, timestamp
-      FROM public.time_entries
-     WHERE owner_id = $1
-       AND employee_name = $2
-     ORDER BY timestamp DESC
-     LIMIT 2
+    SELECT
+      t.task_no,
+      t.title,
+      t.due_at,
+      t.status,
+      t.created_at,
+      t.assigned_to,
+      COALESCE(a.name, t.assigned_to) AS assignee_name,
+      COALESCE(c.name, t.created_by)  AS creator_name
+    FROM public.tasks t
+    LEFT JOIN public.users a ON a.user_id = t.assigned_to
+    LEFT JOIN public.users c ON c.user_id = t.created_by
+    WHERE t.owner_id = $1
+      AND t.status NOT IN ('done','deleted')
+    ORDER BY
+      (CASE WHEN t.assigned_to IS NULL THEN 1 ELSE 0 END),   -- Unassigned first
+      assignee_name NULLS LAST,
+      t.created_at ASC NULLS LAST,
+      t.task_no ASC
     `,
-    [ownerId, employeeName]
+    [owner]
   );
+  return rows;
+}
 
-  let onShift = false;
-  let onBreak = false;
-  let lastShiftStart = null;
-  let lastBreakStart = null;
+/**
+ * Owners can mark ANY task done; non-owners only tasks they created or that are assigned to them.
+ */
+async function markTaskDone({ ownerId, taskNo, actorId, isOwner }) {
+  const ownerDigits = _digits(ownerId);
+  const actorDigits = _digits(actorId);
+  const actorIsOwner = (typeof isOwner === 'boolean') ? isOwner : (actorDigits === ownerDigits);
 
-  for (const entry of res.rows) {
-    if (entry.type === 'punch_in') {
-      onShift = true;
-      lastShiftStart = entry.timestamp;
-      break;
-    } else if (entry.type === 'punch_out') {
-      onShift = false;
-      break;
-    } else if (entry.type === 'break_start') {
-      onBreak = true;
-      lastBreakStart = entry.timestamp;
-    } else if (entry.type === 'break_end') {
-      onBreak = false;
-    }
+  let sql = `
+    UPDATE public.tasks
+       SET status = 'done',
+           updated_at = NOW()
+     WHERE owner_id = $1
+       AND task_no  = $2
+  `;
+  const params = [ownerDigits, Number(taskNo)];
+
+  if (!actorIsOwner) {
+    sql += ` AND (assigned_to = $3 OR created_by = $3)`;
+    params.push(actorDigits);
   }
 
-  return { onShift, onBreak, lastShiftStart, lastBreakStart };
+  sql += ` RETURNING task_no, title, status, assigned_to, created_by;`;
+
+  const result = await query(sql, params);
+  if (result?.rowCount > 0) return result.rows[0];
+
+  const exists = await query(
+    `SELECT 1 FROM public.tasks WHERE owner_id = $1 AND task_no = $2 LIMIT 1`,
+    [ownerDigits, Number(taskNo)]
+  );
+  if (exists?.rowCount > 0) throw new Error('Permission denied');
+  throw new Error('Task not found');
+}
+
+/**
+ * Owners can reopen ANY task; non-owners only tasks they created or that are assigned to them.
+ */
+async function reopenTask({ ownerId, taskNo, actorId, isOwner }) {
+  const ownerDigits = _digits(ownerId);
+  const actorDigits = _digits(actorId);
+  const actorIsOwner = (typeof isOwner === 'boolean') ? isOwner : (actorDigits === ownerDigits);
+
+  let sql = `
+    UPDATE public.tasks
+       SET status = 'open',
+           updated_at = NOW()
+     WHERE owner_id = $1
+       AND task_no  = $2
+  `;
+  const params = [ownerDigits, Number(taskNo)];
+
+  if (!actorIsOwner) {
+    sql += ` AND (assigned_to = $3 OR created_by = $3)`;
+    params.push(actorDigits);
+  }
+
+  sql += ` RETURNING task_no, title, status, assigned_to, created_by;`;
+
+  const result = await query(sql, params);
+  if (result?.rowCount > 0) return result.rows[0];
+
+  const exists = await query(
+    `SELECT 1 FROM public.tasks WHERE owner_id = $1 AND task_no = $2 LIMIT 1`,
+    [ownerDigits, Number(taskNo)]
+  );
+  if (exists?.rowCount > 0) throw new Error('Permission denied');
+  throw new Error('Task not found');
 }
 
 // --- Exports ---
@@ -1826,7 +1826,8 @@ module.exports = {
   markTaskDone,
   reopenTask,
   createTimeEditRequestTask,
-
+  listInboxTasks,
+  listTasksForUser,
   getUserBasic,
   getUserByName,
   normalizePhoneNumber,

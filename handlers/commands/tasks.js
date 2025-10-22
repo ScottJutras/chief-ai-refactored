@@ -69,6 +69,7 @@ const fmtDate = (d, tz = 'America/Toronto') => {
 };
 
 
+
 function sanitizeInput(text) {
   return String(text || '').replace(/[<>"'&]/g, '').trim().slice(0, 140);
 }
@@ -288,6 +289,52 @@ async function dbDeleteTask(ownerId, taskNo) {
 }
 
 // ---------- ASSIGN FAST-PATH (MUST RUN BEFORE CREATION PATHS) ----------
+
+// Local helpers (scoped to this module)
+function toDigits(p) { return String(p || '').replace(/\D/g, ''); }
+function toWa(p) { const d = toDigits(p); return d ? `whatsapp:+${d}` : null; }
+
+// Template + fallback notifier
+async function notifyAssigneeOfAssignment({ assigneePhone, ownerName, taskNo, title }) {
+  const to = toWa(assigneePhone);
+  if (!to) {
+    console.warn('[tasks.assign] no valid assignee phone to notify');
+    return false;
+  }
+
+  const pretty = `#${taskNo} ${String(title || '').trim()}`.trim();
+
+  // 1) Try WhatsApp template (Content SID in env)
+  try {
+    const contentSid = process.env.HEX_TASK_ASSIGN;
+    if (!contentSid) throw new Error('HEX_TASK_ASSIGN env missing');
+
+    // Your helper should accept (to, contentSid, [vars...])
+    // Ensure your template has exactly 2 variables in this order.
+    console.log('[tasks.assign][template] sending', { to, contentSid, vars: [ownerName || 'Your manager', pretty] });
+    await sendTemplateMessage(to, contentSid, [
+      ownerName || 'Your manager',
+      pretty,
+    ]);
+    return true;
+  } catch (err) {
+    console.error('[tasks.assign] template DM failed; falling back:', err?.message || err);
+  }
+
+  // 2) Fallback to plain WhatsApp text (always works within 24h window)
+  const fallback =
+    `📌 ${ownerName || 'Your manager'} assigned you task ${pretty}.\n` +
+    `Reply "yes" to accept or "no" to decline.`;
+  try {
+    await sendMessage(to, fallback);
+    console.log('[tasks.assign][fallback] sent', to);
+    return true;
+  } catch (err) {
+    console.error('[tasks.assign] fallback sendMessage failed:', err?.message || err);
+    return false;
+  }
+}
+
 async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userProfile, ownerProfile }) {
   // 1) Vector from earlier router (audio/text short-circuit)
   if (res.locals?.intentArgs?.assignTaskNo && res.locals?.intentArgs?.assigneeName) {
@@ -320,6 +367,7 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
 
     // Update assignment
     const updated = await dbUpdateTaskAssignee(ownerId, Number(taskNo), assignee.user_id);
+    const title = (updated?.title || task.title || '').trim();
 
     // Save a pending task offer on ASSIGNEE so their "Yes/No" reply correlates
     try {
@@ -329,27 +377,23 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
         pendingTaskOffer: {
           ownerId,
           taskNo: Number(taskNo),
-          title: (updated?.title || task.title || '').trim()
+          title,
         }
       });
     } catch (e) {
       console.warn('[tasks.assign] failed to set pendingTaskOffer:', e?.message);
     }
 
-    // Notify assignee (template → fallback)
-    const title = (updated?.title || task.title || '').trim();
-    const to = assignee.user_id.startsWith('+') ? assignee.user_id : `+${assignee.user_id}`;
-    try {
-      await sendTemplateMessage(to, 'hex_task_assign', {
-        "1": userProfile?.name || ownerProfile?.name || 'Your team',
-        "2": `#${taskNo} ${title}`.trim()
+    // Avoid DM if owner assigned to self (optional)
+    if (toDigits(assignee.user_id) !== toDigits(ownerId)) {
+      await notifyAssigneeOfAssignment({
+        assigneePhone: assignee.user_id,                            // MUST be assignee, not owner
+        ownerName: userProfile?.name || ownerProfile?.name || 'Your manager',
+        taskNo: Number(taskNo),
+        title,
       });
-    } catch (e) {
-      console.warn('[tasks.assign] template DM failed; fallback:', e?.message);
-      await sendMessage(
-        to,
-        `📝 New Task!\n${userProfile?.name || ownerProfile?.name || 'Your team'} assigned you: #${taskNo} ${title}\nDo you accept this task?`
-      );
+    } else {
+      console.log('[tasks.assign] assignee is owner; skipping DM');
     }
 
     // Save lastTaskNo for “assign this …”
@@ -393,6 +437,7 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
     }
 
     const updated = await dbUpdateTaskAssignee(ownerId, Number(taskNo), assigneeRow.user_id);
+    const title = (updated?.title || task.title || '').trim();
 
     // Save a pending offer on the assignee
     try {
@@ -402,27 +447,23 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
         pendingTaskOffer: {
           ownerId,
           taskNo: Number(taskNo),
-          title: (updated?.title || task.title || '').trim()
+          title,
         }
       });
     } catch (e) {
       console.warn('[tasks.assign] failed to set pendingTaskOffer:', e?.message);
     }
 
-    // Notify assignee
-    const title = (updated?.title || task.title || '').trim();
-    const to = assigneeRow.user_id.startsWith('+') ? assigneeRow.user_id : `+${assigneeRow.user_id}`;
-    try {
-      await sendTemplateMessage(to, 'hex_task_assign', {
-        "1": userProfile?.name || ownerProfile?.name || 'Your team',
-        "2": `#${taskNo} ${title}`.trim()
+    // Notify assignee (template → fallback)
+    if (toDigits(assigneeRow.user_id) !== toDigits(ownerId)) {
+      await notifyAssigneeOfAssignment({
+        assigneePhone: assigneeRow.user_id,
+        ownerName: userProfile?.name || ownerProfile?.name || 'Your manager',
+        taskNo: Number(taskNo),
+        title,
       });
-    } catch (e) {
-      console.warn('[tasks.assign] template DM failed; fallback:', e?.message);
-      await sendMessage(
-        to,
-        `📝 New Task!\n${userProfile?.name || ownerProfile?.name || 'Your team'} assigned you: #${taskNo} ${title}\nDo you accept this task?`
-      );
+    } else {
+      console.log('[tasks.assign] assignee is owner; skipping DM');
     }
 
     // Save lastTaskNo for convenience
@@ -439,7 +480,6 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
 
   return false;
 }
-
 
  async function tasksHandler(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   try {
@@ -465,7 +505,11 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
         return res.send(RESP(`⚠️ I couldn’t tell which task to complete.`));
       }
       try {
-        const t = await markTaskDone({ ownerId, taskNo: Number(taskNo), actorId: from });
+        const t = await markTaskDone({
+  ownerId,
+  taskNo: Number(taskNo),
+  actorId: from,
+  isOwner, });
         return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
       } catch (e) {
         if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));

@@ -724,6 +724,202 @@ try {
         }
       }
     }
+// ================= MY / TEAM TASKS — DROP-IN (place before routers) =================
+
+// --- small utils
+function _digits(x) { return String(x || '').replace(/\D/g, ''); }
+function _cap(s = '') { return s.charAt(0).toUpperCase() + s.slice(1); }
+function _chunk(arr, n) { const out = []; for (let i=0;i<arr.length;i+=n) out.push(arr.slice(i, i+n)); return out; }
+function _dueHuman(d, tz) {
+  if (!d) return '';
+  try {
+    return new Date(d).toLocaleString('en-CA', {
+      timeZone: tz, month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+    });
+  } catch { return ''; }
+}
+function _createdHuman(d, tz) {
+  if (!d) return '';
+  try {
+    return new Date(d).toLocaleDateString('en-CA', { timeZone: tz, month: 'short', day: 'numeric' });
+  } catch { return ''; }
+}
+
+// If you already have getUserBasic(), we’ll cache to avoid repeated lookups.
+const __nameCache = {};
+async function _displayName(userId) {
+  if (!userId) return 'Unassigned';
+  const k = _digits(userId);
+  if (__nameCache[k]) return __nameCache[k];
+  try {
+    const row = await getUserBasic(userId).catch(() => null);
+    __nameCache[k] = row?.name || k;
+  } catch {
+    __nameCache[k] = k;
+  }
+  return __nameCache[k];
+}
+
+// ---------- SQL helpers (NO LIMITS) ----------
+
+// REPLACE your existing listMyTasks with this version (keeps the same signature)
+async function listMyTasks({ ownerId, userId, status = 'open' }) {
+  try {
+    // normalize phone/digits – use your normalizePhoneNumber if you prefer
+    const me = normalizePhoneNumber ? normalizePhoneNumber(userId) : _digits(userId);
+    const owner = normalizePhoneNumber ? normalizePhoneNumber(ownerId) : _digits(ownerId);
+
+    // “My” = assigned_to == me OR created_by == me
+    // status=open → anything not done/deleted (keeps “open” semantics without hardcoding your enum).
+    const { rows } = await query(
+      `
+      SELECT
+        t.task_no,
+        t.title,
+        t.due_at,
+        t.status,
+        t.assigned_to,
+        t.created_by,
+        t.created_at
+      FROM public.tasks t
+      WHERE t.owner_id = $1
+        AND (t.status NOT IN ('done','deleted'))
+        AND (t.assigned_to = $2 OR t.created_by = $2)
+      ORDER BY
+        COALESCE(t.due_at, to_timestamp(0)) NULLS LAST,
+        t.created_at DESC
+      `,
+      [owner, me]
+    );
+    return rows || [];
+  } catch (error) {
+    console.error('[ERROR] listMyTasks failed:', error.message);
+    throw error;
+  }
+}
+
+// Team-wide open tasks (no limit). If you already have something similar, you can reuse it.
+async function dbSelectTeamOpenTasks(ownerId) {
+  const owner = normalizePhoneNumber ? normalizePhoneNumber(ownerId) : _digits(ownerId);
+  const { rows } = await query(
+    `
+    SELECT task_no, title, status, due_at, assigned_to, created_by, created_at
+    FROM public.tasks
+    WHERE owner_id = $1
+      AND status NOT IN ('done','deleted')
+    ORDER BY assigned_to NULLS LAST, created_at DESC
+    `,
+    [owner]
+  );
+  return rows || [];
+}
+
+// ---------- formatters ----------
+function formatMyLine(t, tz) {
+  const due = _dueHuman(t.due_at, tz);
+  return due
+    ? `• #${t.task_no} ${_cap((t.title || '').trim())} (due ${due})`
+    : `• #${t.task_no} ${_cap((t.title || '').trim())}`;
+}
+
+function formatTeamLine(t, tz) {
+  const created = _createdHuman(t.created_at, tz);
+  const due = _dueHuman(t.due_at, tz);
+  const parts = [];
+  if (created) parts.push(`created ${created}`);
+  if (due) parts.push(`due ${due}`);
+  const suffix = parts.length ? ` (${parts.join(', ')})` : '';
+  return `• #${t.task_no} ${_cap((t.title || '').trim())}${suffix}`;
+}
+
+// Send long lists safely (first chunk via ensureReply, the rest as follow-ups)
+async function sendLongListFirstReply({ to, res, header, lines, perChunk = 25 }) {
+  const groups = _chunk(lines, perChunk);
+  if (groups.length === 0) {
+    await ensureReply(res, `${header}\n(none)`);
+    return;
+  }
+  await ensureReply(res, `${header}\n${groups[0].join('\n')}`);
+  for (let i = 1; i < groups.length; i++) {
+    await sendMessage(to, groups[i].join('\n'));
+  }
+}
+
+// ---------- handlers ----------
+async function handleMyTasksCommand({ ownerId, from, userProfile, res }) {
+  const tz = getUserTz(userProfile);
+  const rows = await listMyTasks({ ownerId, userId: from, status: 'open' });
+
+  if (!rows.length) {
+    await ensureReply(res, `✅ You have no open tasks.`);
+    return true;
+  }
+
+  const header = `✅ Here's your full task list (${rows.length}):`;
+  const lines = rows.map((t) => formatMyLine(t, tz));
+  const to = from.startsWith('+') ? `whatsapp:${from}` : from;
+  await sendLongListFirstReply({ to, res, header, lines, perChunk: 25 });
+  return true;
+}
+
+async function handleTeamTasksCommand({ ownerId, from, userProfile, res }) {
+  const tz = getUserTz(userProfile);
+  const rows = await dbSelectTeamOpenTasks(ownerId);
+
+  if (!rows.length) {
+    await ensureReply(res, `✅ Your team has no open tasks.`);
+    return true;
+  }
+
+  // group by assignee label
+  const buckets = new Map();
+  for (const t of rows) {
+    const label = await _displayName(t.assigned_to);
+    if (!buckets.has(label)) buckets.set(label, []);
+    buckets.get(label).push(t);
+  }
+  // sort each bucket by created_at DESC (newest first)
+  for (const [label, arr] of buckets) {
+    arr.sort((a, b) => {
+      const da = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const db = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return db - da;
+    });
+  }
+
+  // build lines with sub-headers
+  const lines = [];
+  for (const [label, arr] of buckets) {
+    lines.push(`\n👤 ${label} — ${arr.length} task${arr.length === 1 ? '' : 's'}`);
+    for (const t of arr) lines.push(formatTeamLine(t, tz));
+  }
+
+  const header = `📋 Team Tasks (grouped by person):`;
+  const to = from.startsWith('+') ? `whatsapp:${from}` : from;
+  await sendLongListFirstReply({ to, res, header, lines, perChunk: 20 });
+  return true;
+}
+
+// ---------- command triggers (SHORT-CIRCUIT before routers) ----------
+try {
+  if (/^\s*my\s+tasks\s*$/i.test(String(input || ''))) {
+    const ok = await handleMyTasksCommand({ ownerId, from, userProfile, res });
+    if (ok) return; // handled
+  }
+} catch (e) {
+  console.warn('[MY TASKS] failed:', e?.message);
+}
+
+try {
+  if (/^\s*team\s+tasks\s*$/i.test(String(input || ''))) {
+    const ok = await handleTeamTasksCommand({ ownerId, from, userProfile, res });
+    if (ok) return; // handled
+  }
+} catch (e) {
+  console.warn('[TEAM TASKS] failed:', e?.message);
+}
+
+// ================= END MY / TEAM TASKS — DROP-IN =================
 
     // ================= TEXT PATH BEGINS =================
 

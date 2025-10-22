@@ -50,6 +50,17 @@ function ensureReply(res, text) {
   }
 }
 
+function shouldSkipRouters(res) {
+  if (res.headersSent) return true;
+  const ia = (res.locals && res.locals.intentArgs) || {};
+  return (
+    ia.doneTaskNo != null ||
+    ia.deleteTaskNo != null ||
+    ia.assignTaskNo != null ||
+    ia.title
+  );
+}
+
 function twiml(text) { return `<Response><Message>${text}</Message></Response>`; }
 
 function getUserTz(userProfile) {
@@ -806,491 +817,227 @@ try {
   console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
 }
 
-// ===== If a fast-path set intentArgs or replied, skip routers =====
-if (shouldSkipRouters(res)) {
-  // A fast-path handled (or decided) this turn.
-} else {
+ // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
+try {
+  const pendingState = await getPendingTransactionState(from);
+  const isTextOnly = !mediaUrl && !!input;
 
-  /* ---------- Conversational router ---------- */
-  try {
-    const conv = await converseAndRoute(input, { userProfile, ownerId: tenantId, convoState: state });
+  if (pendingState?.pendingReminder && isTextOnly) {
+    const { pendingReminder } = pendingState; // <-- you need this
+    console.log('[REMINDER] intercept for', from, 'input =', input);
 
-    const extractMsg = (twimlStr) => {
-      if (!twimlStr) return '';
-      const m = twimlStr.match(/<Message>([\s\S]*?)<\/Message>/);
-      return m ? m[1] : '';
-    };
+    // 1) Normalize common voice-typo patterns like "in2min" → "in 2 minutes"
+    const maybeNormalized = (typeof normalizeTimePhrase === 'function')
+      ? normalizeTimePhrase(String(input || ''))
+      : String(input || '');
+    const cleanedInput = (typeof cleanSpokenCommand === 'function')
+      ? cleanSpokenCommand(maybeNormalized)
+      : maybeNormalized;
 
-    if (conv?.handled && conv.twiml) {
-      const responseText = extractMsg(conv.twiml);
-      await logEvent(tenantId, userId, 'clarify', { input, response: responseText, intent: conv.intent || null });
-      await saveConvoState(tenantId, userId, {
-        last_intent: conv.intent || convo.last_intent || null,
-        last_args: conv.args || convo.last_args || {},
-        history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
-      });
-      res.status(200).type('text/xml').send(conv.twiml);
-      return;
-    }
+    const lc = cleanedInput.trim().toLowerCase();
 
-    if (conv && conv.route && conv.normalized) {
-      let responseText = extractMsg(conv.twiml);
-      let handled = false;
+    // 2) Decide if this looks like a reply in the reminder flow
+    const looksLikeReminderReply =
+      lc === 'yes' || lc === 'yes.' || lc === 'yep' || lc === 'yeah' ||
+      lc === 'no'  || lc === 'no.'  || lc === 'cancel' ||
+      /\bremind\b/i.test(cleanedInput) ||
+      /\bin\s*\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/i.test(lc) ||
+      // Also catch "tomorrow", "tonight", "later", "this evening" etc.
+      /\b(today|tonight|tomorrow|this\s+(morning|afternoon|evening|night))\b/i.test(lc) ||
+      // Simple absolute time phrases: "at 7", "7pm", "7:30 pm"
+      /\b(?:at\s*)?\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(lc);
 
-      if (conv.route === 'tasks') {
-        const tasksFn = getHandler('tasks');
-        if (typeof tasksFn === 'function') {
-          handled = await tasksFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-          responseText = responseText || 'Task created!';
-          await logEvent(tenantId, userId, 'tasks.create', { normalized: conv.normalized, args: conv.args || {} });
-        }
-      } else if (conv.route === 'expense') {
-        const expenseFn = getHandler('expense');
-        if (typeof expenseFn === 'function') {
-          handled = await expenseFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-          responseText = responseText || 'Expense logged!';
-          await logEvent(tenantId, userId, 'expense.add', { normalized: conv.normalized, args: conv.args || {} });
-          if (conv.args?.alias && (conv.args.vendor || conv.args.job)) {
-            await upsertMemory(tenantId, userId, `alias.vendor.${conv.args.alias.toLowerCase()}`, { name: conv.args.vendor || conv.args.job });
-          }
-          if (conv.args?.bucket === 'Overhead') {
-            await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
-          }
-        }
-      } else if (conv.route === 'timeclock') {
-        const normalized = normalizeTimeclockInput(conv.normalized, userProfile);
-        handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-        responseText = responseText || '✅ Timeclock request received.';
-        await logEvent(tenantId, userId, 'timeclock', { normalized, args: conv.args || {} });
-        if (conv.args?.job || conv.args?.job_id) {
-          await saveConvoState(tenantId, userId, {
-            active_job: conv.args.job || convo.active_job || null,
-            active_job_id: conv.args.job_id || convo.active_job_id || null
-          });
-        }
-      } else if (conv.route === 'job') {
-        const jobFn = getHandler('job');
-        if (typeof jobFn === 'function') {
-          handled = await jobFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-          responseText = responseText || 'Job created!';
-          await logEvent(tenantId, userId, 'job.create', { normalized: conv.normalized, args: conv.args || {} });
-        }
+    if (looksLikeReminderReply) {
+      const chrono = require('chrono-node');
+
+      // 2a) “no / cancel” → stop and clear
+      if (lc === 'no' || lc === 'cancel') {
+        await deletePendingTransactionState(from);
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(twiml(`No problem — no reminder set.`));
       }
 
-      if (handled) {
-        await saveConvoState(tenantId, userId, {
-          last_intent: conv.intent || convo.last_intent || null,
-          last_args: conv.args || convo.last_args || {},
-          history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
+      // 2b) “yes” alone → ask for a time
+      const saidYesOnly = /^(yes\.?|yep|yeah)\s*$/i.test(cleanedInput.trim());
+      if (saidYesOnly) {
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(twiml(`Great — what time should I remind you? (e.g., "7pm tonight" or "tomorrow 8am")`));
+      }
+
+      // 3) Parse time from the (normalized) reply in the user's timezone
+      const tz = getUserTz(userProfile);
+      const offsetMinutes = getTzOffsetMinutes(tz);
+
+      const results = chrono.parse(cleanedInput, new Date(), {
+        timezone: offsetMinutes,
+        forwardDate: true
+      });
+
+      if (!results || !results[0]) {
+        // One more leniency pass for "in2min", "in2 minutes", etc.
+        const fallback = cleanedInput
+          .replace(/\bin\s*(\d+)\s*(m|min|mins)\b/gi, 'in $1 minutes')
+          .replace(/\bin\s*(\d+)\s*(h|hr|hrs)\b/gi, 'in $1 hours')
+          .replace(/\bin\s*(\d+)\s*(d)\b/gi, 'in $1 days');
+
+        const retry = chrono.parse(fallback, new Date(), {
+          timezone: offsetMinutes,
+          forwardDate: true
         });
-        if (!res.headersSent && conv.twiml) res.status(200).type('text/xml').send(conv.twiml);
-        return;
-      }
-    }
-  } catch (e) {
-    console.warn('[Conversational Router] error:', e?.message);
-  }
 
-  /* ---------- AI intent router (tool-calls) ---------- */
-  try {
-    if (!shouldSkipRouters(res)) {
-      const ai = await routeWithAI(input, { userProfile });
-      if (ai) {
-        let handled = false;
-        let responseText = 'Action completed!';
-        let normalizedForLog = null;
-
-        if (ai.intent === 'timeclock.clock_in') {
-          const who = ai.args.person || userProfile?.name || 'Unknown';
-          const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
-          const t = ai.args.time ? ` at ${ai.args.time}` : '';
-          const normalized = `${who} punched in${jobHint}${t}`;
-          normalizedForLog = normalized;
-          handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-          responseText = `Punched in${jobHint}! What’s next?`;
-        } else if (ai.intent === 'timeclock.clock_out') {
-          const who = ai.args.person || userProfile?.name || 'Unknown';
-          const t = ai.args.time ? ` at ${ai.args.time}` : '';
-          const normalized = `${who} punched out${t}`;
-          normalizedForLog = normalized;
-          handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-          responseText = `Clocked out${t}! Anything else?`;
-        } else if (ai.intent === 'job.create') {
-          const name = ai.args.name?.trim();
-          if (name && typeof commands.job === 'function') {
-            const normalized = `create job ${name}`;
-            normalizedForLog = normalized;
-            handled = await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-            responseText = `Created job: ${name}. Need tasks for it?`;
-          }
-        } else if (ai.intent === 'expense.add') {
-          const amt = ai.args.amount;
-          const cat = ai.args.category ? ` ${ai.args.category}` : '';
-          const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
-          const normalized = `expense $${amt}${cat}${fromWho}`.trim();
-          normalizedForLog = normalized;
-          const expenseFn = getHandler('expense');
-          if (typeof expenseFn === 'function') {
-            handled = await expenseFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-            responseText = `Logged $${amt}${fromWho}! Got more expenses?`;
-            if (ai.args.merchant) {
-              await upsertMemory(tenantId, userId, `alias.vendor.${ai.args.merchant.toLowerCase()}`, { name: ai.args.merchant });
-            }
-          }
+        if (!retry || !retry[0]) {
+          return res.status(200).type('text/xml')
+            .send(twiml(`I couldn't find a time in that. Try "in 2 minutes", "7pm tonight", or "tomorrow 8am".`));
         }
 
-        if (handled) {
-          await logEvent(tenantId, userId, ai.intent, { normalized: normalizedForLog, args: ai.args });
-          await saveConvoState(tenantId, userId, {
-            last_intent: ai.intent,
-            last_args: ai.args,
-            history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: ai.intent }]
-          });
-          if (!res.headersSent) ensureReply(res, responseText);
-          return;
-        }
+        const dt = retry[0].date();
+        const remindAtIso = dt.toISOString();
+
+        await createReminder({
+          ownerId: pendingReminder.ownerId,
+          userId: pendingReminder.userId,
+          taskNo: pendingReminder.taskNo,
+          taskTitle: pendingReminder.taskTitle,
+          remindAt: remindAtIso
+        });
+        await deletePendingTransactionState(from);
+
+        const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+        return res.status(200).type('text/xml')
+          .send(twiml(`Got it. Reminder set for ${whenStr}.`));
       }
-    }
-  } catch (e) {
-    console.warn('[AI Router] skipped due to error:', e?.message);
-  }
 
-  /* ---------- Legacy NLP routing (conversation.js) ---------- */
-  try {
-    if (!shouldSkipRouters(res)) {
-      const memory = await getMemory(tenantId, userId, [
-        'default.expense.bucket',
-        'labor_rate',
-        'default.markup',
-        'client.default_terms'
-      ]).catch(() => ({}));
+      // Success path
+      const dt = results[0].date();
+      const remindAtIso = dt.toISOString();
 
-      const routed = await converseAndRoute(input, {
-        userProfile,
-        ownerId: tenantId,
-        convoState: state,
-        memory
+      await createReminder({
+        ownerId: pendingReminder.ownerId,
+        userId: pendingReminder.userId,
+        taskNo: pendingReminder.taskNo,
+        taskTitle: pendingReminder.taskTitle,
+        remindAt: remindAtIso
       });
+      await deletePendingTransactionState(from);
 
-      if (routed) {
-        if (routed.handled && routed.twiml) {
-          return res.status(200).type('text/xml').send(routed.twiml);
-        }
-
-        const route = routed.route;
-        if (!routed.handled && route) {
-          let handled = false;
-          let responseText = '';
-
-          res.locals = res.locals || {};
-          res.locals.intentArgs = routed.args || null;
-
-          if (route === 'tasks') {
-            handled = await tasksHandler(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-            responseText = 'Task created!';
-            if (handled !== false) {
-              await logEvent(tenantId, userId, 'tasks.create', { normalized: routed.normalized, args: routed.args || {} });
-            }
-          } else if (route === 'expense') {
-            const expenseFn = getHandler('expense');
-            if (typeof expenseFn === 'function') {
-              handled = await expenseFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              responseText = 'Expense logged!';
-              if (handled !== false) {
-                await logEvent(tenantId, userId, 'expense.add', { normalized: routed.normalized, args: routed.args || {} });
-                if (routed.args?.alias && (routed.args.vendor || routed.args.job)) {
-                  await upsertMemory(tenantId, userId, `alias.vendor.${routed.args.alias.toLowerCase()}`, { name: routed.args.vendor || routed.args.job });
-                }
-                if (routed.args?.bucket === 'Overhead') {
-                  await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
-                }
-              }
-            }
-          } else if (route === 'timeclock') {
-            const normalized = normalizeTimeclockInput(routed.normalized, userProfile);
-            handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-            responseText = '✅ Timeclock request received.';
-            if (handled !== false) {
-              await logEvent(tenantId, userId, 'timeclock', { normalized, args: routed.args || {} });
-              if (routed.args?.job || routed.args?.job_id) {
-                await saveConvoState(tenantId, userId, {
-                  active_job: routed.args.job || convo.active_job || null,
-                  active_job_id: routed.args.job_id || convo.active_job_id || null
-                });
-              }
-            }
-          } else if (route === 'job') {
-            const jobFn = getHandler('job');
-            if (typeof jobFn === 'function') {
-              handled = await jobFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-              responseText = 'Job created!';
-              if (handled !== false) {
-                await logEvent(tenantId, userId, 'job.create', { normalized: routed.normalized, args: routed.args || {} });
-              }
-            }
-          }
-
-          if (handled) {
-            await saveConvoState(tenantId, userId, {
-              last_intent: routed.intent || convo.last_intent || null,
-              last_args: routed.args || convo.last_args || {},
-              history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: routed.intent || route || null }]
-            });
-            if (!res.headersSent) ensureReply(res, responseText);
-            return;
-          }
-        }
-      }
+      const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+      return res.status(200).type('text/xml')
+        .send(twiml(`Got it. Reminder set for ${whenStr}.`));
     }
-  } catch (e) {
-    console.warn('[WEBHOOK] NLP route skip:', e?.message);
   }
 
-} // end else shouldSkipRouters
+  // ---- A) Pending media-driven flows (text replies only, not "tasky")
+  const tasky = /^task\b/i.test(input) || (function () {
+    try { return require('../nlp/task_intents').looksLikeTask(input || ''); } catch { return false; }
+  })();
 
-// ================= END TEXT PATH =================
+  if (!tasky && !mediaUrl) {
+    const pendingState2 = await getPendingTransactionState(from);
+    if (pendingState2?.pendingMedia) {
+      const type = pendingState2.pendingMedia.type; // may be null
+      const lcInput = String(input || '').toLowerCase().trim();
 
-    // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
-    try {
-      const pendingState = await getPendingTransactionState(from);
-      const isTextOnly = !mediaUrl && !!input;
-
-      if (pendingState?.pendingReminder && isTextOnly) {
-        console.log('[WEBHOOK] pendingReminder present for', from, 'input=', input);
-        const { pendingReminder } = pendingState;
-
-        // 1) Normalize common voice-typo patterns like "in2min" → "in 2 minutes"
-        //    and optionally run your cleanSpokenCommand helper if available.
-        const maybeNormalized = (typeof normalizeTimePhrase === 'function')
-          ? normalizeTimePhrase(String(input || ''))
-          : String(input || '');
-        const cleanedInput = (typeof cleanSpokenCommand === 'function')
-          ? cleanSpokenCommand(maybeNormalized)
-          : maybeNormalized;
-
-        const lc = cleanedInput.trim().toLowerCase();
-
-        // 2) Decide if this looks like a reply in the reminder flow
-        //    - yes/no/cancel
-        //    - anything with "remind"
-        //    - "in <num> <unit>" with/without missing spaces (handled by normalizeTimePhrase)
-        const looksLikeReminderReply =
-          lc === 'yes' || lc === 'yes.' || lc === 'yep' || lc === 'yeah' ||
-          lc === 'no'  || lc === 'no.'  || lc === 'cancel' ||
-          /\bremind\b/i.test(cleanedInput) ||
-          /\bin\s*\d+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/i.test(lc) ||
-          // Also catch "tomorrow", "tonight", "later", "this evening" etc.
-          /\b(today|tonight|tomorrow|this\s+(morning|afternoon|evening|night))\b/i.test(lc) ||
-          // Simple absolute time phrases: "at 7", "7pm", "7:30 pm"
-          /\b(?:at\s*)?\d{1,2}(:\d{2})?\s*(am|pm)\b/i.test(lc);
-
-        if (looksLikeReminderReply) {
-          const chrono = require('chrono-node');
-
-          // 2a) “no / cancel” → stop and clear
-          if (lc === 'no' || lc === 'cancel') {
-            await deletePendingTransactionState(from);
-            return res
-              .status(200)
-              .type('text/xml')
-              .send(twiml(`No problem — no reminder set.`));
-          }
-
-          // 2b) “yes” alone → ask for a time
-          const saidYesOnly = /^(yes\.?|yep|yeah)\s*$/i.test(cleanedInput.trim());
-          if (saidYesOnly) {
-            return res
-              .status(200)
-              .type('text/xml')
-              .send(twiml(`Great — what time should I remind you? (e.g., "7pm tonight" or "tomorrow 8am")`));
-          }
-
-          // 3) Parse time from the (normalized) reply in the user's timezone
+      if (type === 'hours_inquiry') {
+        const m = lcInput.match(/\b(today|day|this day|week|this week|month|this month)\b/i);
+        if (m) {
+          const raw = m[1].toLowerCase();
+          const period = raw.includes('week') ? 'week' : raw.includes('month') ? 'month' : 'day';
           const tz = getUserTz(userProfile);
-          const offsetMinutes = getTzOffsetMinutes(tz);
-
-          // Use the cleaned/normalized text for parsing
-          const results = chrono.parse(cleanedInput, new Date(), {
-            timezone: offsetMinutes,
-            forwardDate: true
-          });
-
-          if (!results || !results[0]) {
-            // One more leniency pass: if user said only "in2min" or "in2 minutes" and we missed it,
-            // try explicitly expanding units again (defensive).
-            const fallback = cleanedInput
-              .replace(/\bin\s*(\d+)\s*(m|min|mins)\b/gi, 'in $1 minutes')
-              .replace(/\bin\s*(\d+)\s*(h|hr|hrs)\b/gi, 'in $1 hours')
-              .replace(/\bin\s*(\d+)\s*(d)\b/gi, 'in $1 days');
-
-            const retry = chrono.parse(fallback, new Date(), {
-              timezone: offsetMinutes,
-              forwardDate: true
-            });
-
-            if (!retry || !retry[0]) {
-              return res.status(200).type('text/xml')
-                .send(twiml(`I couldn't find a time in that. Try "in 2 minutes", "7pm tonight", or "tomorrow 8am".`));
-            }
-
-            const dt = retry[0].date();
-            const remindAtIso = dt.toISOString();
-
-            await createReminder({
-              ownerId: pendingReminder.ownerId,
-              userId: pendingReminder.userId,
-              taskNo: pendingReminder.taskNo,
-              taskTitle: pendingReminder.taskTitle,
-              remindAt: remindAtIso
-            });
-            await deletePendingTransactionState(from);
-
-            const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
-            return res.status(200).type('text/xml')
-              .send(twiml(`Got it. Reminder set for ${whenStr}.`));
-          }
-
-          // Success path
-          const dt = results[0].date();
-          const remindAtIso = dt.toISOString();
-
-          await createReminder({
-            ownerId: pendingReminder.ownerId,
-            userId: pendingReminder.userId,
-            taskNo: pendingReminder.taskNo,
-            taskTitle: pendingReminder.taskTitle,
-            remindAt: remindAtIso
+          const name = pendingState2.pendingHours?.employeeName || userProfile?.name || '';
+          const { message } = await generateTimesheet({
+            ownerId,
+            person: name,
+            period,
+            tz,
+            now: new Date()
           });
           await deletePendingTransactionState(from);
+          return res.status(200).type('text/xml').send(twiml(message));
+        }
+        return res.status(200).type('text/xml')
+          .send(twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState2.pendingHours?.employeeName || 'them'}?`));
+      }
 
-          const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+      if (type === 'expense' || type === 'revenue' || type === 'time_entry') {
+        if (lcInput === 'yes') {
+          if (type === 'expense') {
+            const data = pendingState2.pendingExpense;
+            await appendToUserSpreadsheet(ownerId, [
+              data.date, data.item, data.amount, data.store,
+              (await getActiveJob(ownerId)) || 'Uncategorized',
+              'expense', data.category, data.mediaUrl || null,
+              userProfile.name || 'Unknown',
+            ]);
+            await deletePendingTransactionState(from);
+            return res.status(200).type('text/xml')
+              .send(twiml(`✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`));
+          }
+          if (type === 'revenue') {
+            const data = pendingState2.pendingRevenue;
+            await appendToUserSpreadsheet(ownerId, [
+              data.date, data.description, data.amount, data.source,
+              (await getActiveJob(ownerId)) || 'Uncategorized',
+              'revenue', data.category, data.mediaUrl || null,
+              userProfile.name || 'Unknown',
+            ]);
+            await deletePendingTransactionState(from);
+            return res.status(200).type('text/xml')
+              .send(twiml(`✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`));
+          }
+          if (type === 'time_entry') {
+            const { employeeName, type: entryType, timestamp, job } = pendingState2.pendingTimeEntry;
+            await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
+            const tz = getUserTz(userProfile);
+            await deletePendingTransactionState(from);
+            return res.status(200).type('text/xml')
+              .send(twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${new Date(timestamp).toLocaleString('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit' })}${job ? ` on ${job}` : ''}`));
+          }
+        }
+
+        if (lcInput === 'no' || lcInput === 'cancel') {
+          await deletePendingTransactionState(from);
           return res.status(200).type('text/xml')
-            .send(twiml(`Got it. Reminder set for ${whenStr}.`));
+            .send(twiml(`❌ ${friendlyTypeLabel(type)} cancelled.`));
         }
+
+        if (lcInput === 'edit') {
+          await deletePendingTransactionState(from);
+          return res.status(200).type('text/xml')
+            .send(twiml(`Please resend the ${friendlyTypeLabel(type)} details.`));
+        }
+
+        return res.status(200).type('text/xml')
+          .send(twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${friendlyTypeLabel(type)}.`));
       }
 
-      // ---- A) Pending media-driven flows (text replies only, not "tasky")
-      const tasky = /^task\b/i.test(input) || (function () {
-        try { return require('../nlp/task_intents').looksLikeTask(input || ''); } catch { return false; }
-      })();
-
-      if (!tasky && !mediaUrl) {
-        const pendingState2 = await getPendingTransactionState(from);
-        if (pendingState2?.pendingMedia) {
-          const type = pendingState2.pendingMedia.type; // may be null
-          const lcInput = String(input || '').toLowerCase().trim();
-
-          if (type === 'hours_inquiry') {
-            const m = lcInput.match(/\b(today|day|this day|week|this week|month|this month)\b/i);
-            if (m) {
-              const raw = m[1].toLowerCase();
-              const period = raw.includes('week') ? 'week' : raw.includes('month') ? 'month' : 'day';
-              const tz = getUserTz(userProfile);
-              const name = pendingState2.pendingHours?.employeeName || userProfile?.name || '';
-              const { message } = await generateTimesheet({
-                ownerId,
-                person: name,
-                period,
-                tz,
-                now: new Date()
-              });
-              await deletePendingTransactionState(from);
-              return res.status(200).type('text/xml').send(twiml(message));
-            }
-            return res.status(200).type('text/xml')
-              .send(twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState2.pendingHours?.employeeName || 'them'}?`));
-          }
-
-          if (type === 'expense' || type === 'revenue' || type === 'time_entry') {
-            if (lcInput === 'yes') {
-              if (type === 'expense') {
-                const data = pendingState2.pendingExpense;
-                await appendToUserSpreadsheet(ownerId, [
-                  data.date, data.item, data.amount, data.store,
-                  (await getActiveJob(ownerId)) || 'Uncategorized',
-                  'expense', data.category, data.mediaUrl || null,
-                  userProfile.name || 'Unknown',
-                ]);
-                await deletePendingTransactionState(from);
-                return res.status(200).type('text/xml')
-                  .send(twiml(`✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`));
-              }
-              if (type === 'revenue') {
-                const data = pendingState2.pendingRevenue;
-                await appendToUserSpreadsheet(ownerId, [
-                  data.date, data.description, data.amount, data.source,
-                  (await getActiveJob(ownerId)) || 'Uncategorized',
-                  'revenue', data.category, data.mediaUrl || null,
-                  userProfile.name || 'Unknown',
-                ]);
-                await deletePendingTransactionState(from);
-                return res.status(200).type('text/xml')
-                  .send(twiml(`✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`));
-              }
-              if (type === 'time_entry') {
-                const { employeeName, type: entryType, timestamp, job } = pendingState2.pendingTimeEntry;
-                await logTimeEntry(ownerId, employeeName, entryType, timestamp, job);
-                const tz = getUserTz(userProfile);
-                await deletePendingTransactionState(from);
-                return res.status(200).type('text/xml')
-                  .send(twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${new Date(timestamp).toLocaleString('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit' })}${job ? ` on ${job}` : ''}`));
-              }
-            }
-
-            if (lcInput === 'no' || lcInput === 'cancel') {
-              await deletePendingTransactionState(from);
-              return res.status(200).type('text/xml')
-                .send(twiml(`❌ ${friendlyTypeLabel(type)} cancelled.`));
-            }
-
-            if (lcInput === 'edit') {
-              await deletePendingTransactionState(from);
-              return res.status(200).type('text/xml')
-                .send(twiml(`Please resend the ${friendlyTypeLabel(type)} details.`));
-            }
-
-            return res.status(200).type('text/xml')
-              .send(twiml(`⚠️ Please reply with 'yes', 'no', or 'edit' to confirm or cancel the ${friendlyTypeLabel(type)}.`));
-          }
-
-          if (type == null) {
-            return res.status(200).type('text/xml')
-              .send(twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`));
-          }
-        }
+      if (type == null) {
+        return res.status(200).type('text/xml')
+          .send(twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`));
       }
-    } catch (e) {
-      console.warn('[WEBHOOK] pending text-reply handler skipped:', e?.message);
     }
-    // === END REMINDERS/PENDING SHORT-CIRCUITS ===
+  }
+} catch (e) {
+  console.warn('[WEBHOOK] pending text-reply handler skipped:', e?.message);
+}
+// === END REMINDERS/PENDING SHORT-CIRCUITS ===
 
 
 // === CONTEXTUAL HELP (FAQ intercept) — must run BEFORE generic helpers/NLP ===
 try {
-  // If a previous handler (e.g., tasks.js) stored a help topic (like team_add_member),
-  // and the user now asks “how do I do that?”, provide a targeted answer.
   const pending = await getPendingTransactionState(from).catch(() => null);
-
   if (pending?.helpTopic?.key && looksLikeHelpFollowup(input)) {
     const { key, context } = pending.helpTopic;
     const article = HELP_ARTICLES[key];
 
     if (typeof article === 'function') {
-      // One-shot: consume the help topic so we don’t loop on every message
-      try {
-        await setPendingTransactionState(from, { ...pending, helpTopic: null });
-      } catch {}
-
-      return res
-        .status(200)
-        .type('text/xml')
-        .send(twiml(article(context)));
+      try { await setPendingTransactionState(from, { ...pending, helpTopic: null }); } catch {}
+      return res.status(200).type('text/xml').send(twiml(article(context)));
     }
-
-    // Unknown key (defensive): clear and soft fallback
-    try {
-      await setPendingTransactionState(from, { ...pending, helpTopic: null });
-    } catch {}
+    try { await setPendingTransactionState(from, { ...pending, helpTopic: null }); } catch {}
   }
 } catch (e) {
   console.warn('[HELP ROUTER] failed:', e?.message);
@@ -1300,10 +1047,8 @@ try {
 try {
   if (!mediaUrl && typeof input === 'string') {
     const raw = input.trim();
-
-    // Use helper if present, otherwise identity (defensive)
     const _strip = (typeof stripInvisible === 'function') ? stripInvisible : (x) => x;
-    const cleaned = _strip(raw); // remove hidden chars around '+'
+    const cleaned = _strip(raw);
     const lc = cleaned.toLowerCase();
 
     const looksTeamList   = /^\s*team\s*$/.test(lc);
@@ -1312,21 +1057,18 @@ try {
 
     if (looksTeamList || looksTeamAdd || looksTeamRemove) {
       console.log('[TEAM SHORT-CIRCUIT] hit', { cleaned });
-
       const teamFn = getHandler && getHandler('team');
       if (typeof teamFn === 'function') {
         const out = await teamFn(from, cleaned, userProfile, ownerId, ownerProfile, isOwner, res);
-
-        if (res.headersSent) return; // already replied by handler
+        if (res.headersSent) return;
         if (typeof out === 'string' && out.trim().startsWith('<Response>')) {
           return res.status(200).type('text/xml').send(out);
         }
         if (out && typeof out === 'object' && typeof out.twiml === 'string') {
           return res.status(200).type('text/xml').send(out.twiml);
         }
-        // If handler returned truthy without twiml, send an empty 200 TwiML to appease Twilio
         if (out) return res.status(200).type('text/xml').send('<Response><Message></Message></Response>');
-        return; // handled
+        return;
       } else {
         console.warn('[TEAM SHORT-CIRCUIT] team handler not found or not a function');
       }
@@ -1337,397 +1079,472 @@ try {
 }
 // === END TEAM SHORT-CIRCUIT ===
 
-
-    // Optional fetch of defaults you may use in your nlp/router
-    const memory = await getMemory(tenantId, userId, [
-      'default.expense.bucket',
-      'labor_rate',
-      'default.markup',
-      'client.default_terms'
-    ]);
-
-    try {
-      
-
-      // 0) Onboarding
-      if ((userProfile && userProfile.onboarding_in_progress) || input.toLowerCase().includes('start onboarding')) {
-        const response = await handleOnboarding(from, input, userProfile, ownerId, res);
-        await logEvent(tenantId, userId, 'onboarding', { input, response });
-        await saveConvoState(tenantId, userId, {
-          history: [...(convo.history || []).slice(-4), { input, response, intent: 'onboarding' }]
-        });
-        ensureReply(res, `Welcome to Chief AI! Quick question — what's your name?`);
-        return;
-      }
-
-      // 0.5) Owner approval
-      if (/^approve\s+/i.test(input)) {
-        const handled = await handleOwnerApproval(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-        if (handled !== false) {
-          await logEvent(tenantId, userId, 'owner_approval', { input });
-          await saveConvoState(tenantId, userId, {
-            history: [...(convo.history || []).slice(-4), { input, response: 'Approval processed.', intent: 'owner_approval' }]
-          });
-          if (!res.headersSent) ensureReply(res, 'Approval processed.');
-          return;
-        }
-      }
-
-      // 1) Upgrade flow (Stripe)
-      {
-        const lc = input.toLowerCase();
-        const wantsUpgrade = lc.includes('upgrade to pro') || lc.includes('upgrade to enterprise');
-        if (wantsUpgrade) {
-          try {
-            if (userProfile?.stripe_subscription_id) {
-              await sendMessage(from, `⚠️ You already have an active ${userProfile.subscription_tier} subscription. Contact support to change plans.`);
-              ensureReply(res, 'Already subscribed!');
-              return;
-            }
-            const tier = lc.includes('pro') ? 'pro' : 'enterprise';
-            const priceId = tier === 'pro' ? process.env.PRO_PRICE_ID : process.env.ENTERPRISE_PRICE_ID;
-            const priceText = tier === 'pro' ? '$29' : '$99'
-            const customer = await stripe.customers.create({ phone: from, metadata: { user_id: userProfile.user_id } });
-            const paymentLink = await stripe.paymentLinks.create({
-              line_items: [{ price: priceId, quantity: 1 }],
-              metadata: { user_id: userProfile.user_id }
-            });
-
-            await query(`UPDATE users SET stripe_customer_id=$1, subscription_tier=$2 WHERE user_id=$3`,
-              [customer.id, tier, userProfile.user_id]
-            );
-
-            await sendTemplateMessage(from, process.env.HEX_UPGRADE_NOW, [`Upgrade to ${tier} for ${priceText}/month CAD: ${paymentLink.url}`]);
-            await logEvent(tenantId, userId, 'upgrade', { tier, link: paymentLink.url });
-            await saveConvoState(tenantId, userId, {
-              history: [...(convo.history || []).slice(-4), { input, response: 'Upgrade link sent!', intent: 'upgrade' }]
-            });
-            ensureReply(res, 'Upgrade link sent!');
-            return;
-          } catch (err) {
-            console.error('[UPGRADE] error:', err?.message);
-            return next(err);
-          }
-        }
-      }
-
-      // 2) DeepDive / historical upload
-      {
-        const lc = input.toLowerCase();
-        const triggersDeepDive = lc.includes('upload history') || lc.includes('historical data') || lc.includes('deepdive') || lc.includes('deep dive');
-
-        const tierLimits = {
-          starter:     { years: 7, transactions:  5000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_STARTER,     parsingPriceText: '$19' },
-          pro:         { years: 7, transactions: 20000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_PRO,         parsingPriceText: '$49' },
-          enterprise:  { years: 7, transactions: 50000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_ENTERPRISE,  parsingPriceText: '$99' }
-        };
-        const tier = (userProfile?.subscription_tier || 'starter').toLowerCase();
-        const limit = tierLimits[tier] || tierLimits.starter;
-
-        if (triggersDeepDive) {
-          await setPendingTransactionState(from, {
-            historicalDataUpload: true,
-            deepDiveUpload: true,
-            maxTransactions: limit.transactions,
-            uploadType: 'csv'
-          });
-
-          if (mediaUrl && mediaType && ['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType)) {
-            try {
-              if (!userProfile?.historical_parsing_purchased) {
-                const paymentLink = await stripe.paymentLinks.create({
-                  line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
-                  metadata: { user_id: userProfile.user_id, type: 'historical_parsing' }
-                });
-                await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
-                  `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`
-                ]);
-                await logEvent(tenantId, userId, 'deepdive_paylink', { link: paymentLink.url, tier });
-                ensureReply(res, 'DeepDive payment link sent!');
-                return;
-              }
-            } catch (err) {
-              console.error('[DEEPDIVE] payment init error:', err?.message);
-              return next(err);
-            }
-          }
-
-          const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
-          await logEvent(tenantId, userId, 'deepdive_init', { tier, maxTransactions: limit.transactions });
-          await saveConvoState(tenantId, userId, {
-            history: [...(convo.history || []).slice(-4), { input, response: `Ready to upload historical data…`, intent: 'deepdive' }]
-          });
-          ensureReply(res, `Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: ${dashUrl}`);
-          return;
-        }
-
-        const deepDiveState = await getPendingTransactionState(from);
-        const isInDeepDiveUpload = deepDiveState?.deepDiveUpload === true || deepDiveState?.historicalDataUpload === true;
-
-        if (isInDeepDiveUpload && mediaUrl && mediaType) {
-          try {
-            const allowed = [
-              'application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg',
-              'text/csv', 'application/vnd.ms-excel',
-              'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            ];
-            if (!allowed.includes(mediaType)) {
-              ensureReply(res, 'Unsupported file type. Please upload a PDF, image, audio, CSV, or Excel.');
-              return;
-            }
-
-            if (['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType) && !userProfile?.historical_parsing_purchased) {
-              const paymentLink = await stripe.paymentLinks.create({
-                line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
-                metadata: { user_id: userProfile.user_id, type: 'historical_parsing' }
-              });
-              await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
-                `To parse PDFs/images/audio, unlock DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}. CSV/Excel uploads remain free (${limit.transactions} transactions).`
-              ]);
-              await logEvent(tenantId, userId, 'deepdive_blocked_payment_required', { link: paymentLink.url });
-              ensureReply(res, 'DeepDive payment link sent!');
-              return;
-            }
-
-            const fileResp = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
-            const buffer = Buffer.from(fileResp.data);
-            const filename = mediaUrl.split('/').pop() || 'upload';
-
-            const summary = await parseUpload(
-              buffer,
-              filename,
-              from,
-              mediaType,
-              deepDiveState.uploadType || 'csv',
-              userProfile?.fiscal_year_start
-            );
-
-            if (deepDiveState.historicalDataUpload) {
-              const transactionCount = summary?.transactions?.length || 0;
-              if (transactionCount > (deepDiveState.maxTransactions || limit.transactions)) {
-                ensureReply(res, `Upload exceeds ${deepDiveState.maxTransactions || limit.transactions} transactions. Contact support for larger datasets.`);
-                return;
-              }
-              const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
-              await logEvent(tenantId, userId, 'deepdive_upload', { transactionCount, mediaType });
-              await saveConvoState(tenantId, userId, {
-                history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: `✅ ${transactionCount} new transactions processed.`, intent: 'deepdive_upload' }]
-              });
-              ensureReply(res, `✅ ${transactionCount} new transactions processed. Track progress on your dashboard: ${dashUrl}`);
-              deepDiveState.historicalDataUpload = false;
-              deepDiveState.deepDiveUpload = false;
-              await setPendingTransactionState(from, deepDiveState);
-              return;
-            }
-
-            await logEvent(tenantId, userId, 'deepdive_file_processed', { mediaType, filename });
-            ensureReply(res, `File received and processed. ${summary ? 'Summary: ' + JSON.stringify(summary) : 'OK'}.`);
-            deepDiveState.deepDiveUpload = false;
-            await setPendingTransactionState(from, deepDiveState);
-            return;
-          } catch (err) {
-            console.error('[DEEPDIVE] parse error:', err?.message);
-            return next(err);
-          }
-        }
-      }
-// 3.05) ASSIGNMENT SHORT-CIRCUIT (TEXT)
-try {
-  if (typeof input === 'string' && looksLikeAssignment(input)) {
-    const pendingState = await getPendingTransactionState(from);
-    const ctx = {
-      pendingTaskNo: pendingState?.pendingReminder?.taskNo || null,
-      lastTaskNo: pendingState?.lastTaskNo || null, // if you track this
-    };
-
-    const assignHit = parseAssignmentUtterance(input, ctx);
-    if (assignHit && assignHit.taskNo && assignHit.assigneeName) {
-      res.locals = res.locals || {};
-      res.locals.intentArgs = {
-        action: 'assign',
-        taskNo: assignHit.taskNo,
-        assigneeName: assignHit.assigneeName
-      };
-
-      const tasksFn = getHandler && getHandler('tasks');
-      if (typeof tasksFn === 'function') {
-        const normalized = `task assign #${assignHit.taskNo} @${assignHit.assigneeName}`;
-        const handled = await tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-        if (!res.headersSent && handled !== false) {
-          ensureReply(res, `✅ Assigned task #${assignHit.taskNo} to ${assignHit.assigneeName}.`);
-        }
-        return; // ✅ handled
-      }
-    }
-  }
-} catch (e) {
-  console.warn('[ASSIGN] skipped:', e?.message);
+// ---------- INTENT-GUARD: skip system flows/routers if a fast-path already decided ----------
+if (shouldSkipRouters(res)) {
+  // A fast-path handled (or decided) this turn. Stop here.
+  return;
 }
 
+/* ================= SYSTEM FLOWS (run BEFORE routers) ================= */
 
-   // 3.1) Fast-path tasks AFTER transcript feed-in
+// 0) Onboarding
 try {
-  const tasksFn = getHandler && getHandler('tasks');
-  if (typeof input === 'string' && typeof tasksFn === 'function') {
-    const cleaned = cleanSpokenCommand(input);
+  const lc0 = String(input || '').toLowerCase();
+  if ((userProfile && userProfile.onboarding_in_progress) || lc0.includes('start onboarding')) {
+    const response = await handleOnboarding(from, input, userProfile, ownerId, res);
+    await logEvent(tenantId, userId, 'onboarding', { input, response });
+    await saveConvoState(tenantId, userId, {
+      history: [...(convo.history || []).slice(-4), { input, response, intent: 'onboarding' }]
+    });
+    ensureReply(res, `Welcome to Chief AI! Quick question — what's your name?`);
+    return;
+  }
+} catch (e) {
+  console.warn('[ONBOARDING] skipped:', e?.message);
+}
 
-    if (
-      /^task\b/i.test(cleaned) ||                    // explicit
-      (looksLikeTask(cleaned) && !looksLikeQuestion(cleaned)) // implicit but not a question
-    ) {
-      const tz = getUserTz(userProfile);
-      const args = parseTaskUtterance(cleaned, { tz, now: new Date() });
-
-      console.log('[TASK FAST-PATH] parsed', { title: args.title, dueAt: args.dueAt, assignee: args.assignee });
-
-      res.locals = res.locals || {};
-      res.locals.intentArgs = args;
-
-      const handled = await tasksFn(
-        from,
-        `task - ${args.title}`,
-        userProfile,
-        ownerId,
-        ownerProfile,
-        isOwner,
-        res
-      );
-      if (!res.headersSent && handled !== false) ensureReply(res, 'Task created!');
+// 0.5) Owner approval
+try {
+  if (/^approve\s+/i.test(input || '')) {
+    const handled = await handleOwnerApproval(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+    if (handled !== false) {
+      await logEvent(tenantId, userId, 'owner_approval', { input });
+      await saveConvoState(tenantId, userId, {
+        history: [...(convo.history || []).slice(-4), { input, response: 'Approval processed.', intent: 'owner_approval' }]
+      });
+      if (!res.headersSent) ensureReply(res, 'Approval processed.');
       return;
     }
   }
 } catch (e) {
-  console.warn('[TASK FAST-PATH] skipped:', e?.message);
+  console.warn('[OWNER APPROVAL] skipped:', e?.message);
 }
 
-      // 3.5) Fast-path for pending timeclock prompts
-      try {
-        const pending = await getPendingPrompt(ownerId);
-        if (pending) {
-          const normalized = normalizeTimeclockInput(input, userProfile);
-          const handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-          await logEvent(tenantId, userId, 'timeclock_prompt_reply', { input, normalized, pending_kind: pending.kind });
-          if (!res.headersSent) ensureReply(res, handled ? '' : '');
-          return;
-        }
-      } catch (e) {
-        console.warn('[WEBHOOK] pending prompt check failed:', e?.message);
-      }
-
-      // 3.6) PRIORITY: Direct timeclock route on explicit timeclock language
-      if (isTimeclockMessage(input)) {
-        const normalized = normalizeTimeclockInput(input, userProfile);
-        await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-        await logEvent(tenantId, userId, 'timeclock_direct', { normalized });
-        if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
+// 1) Upgrade flow (Stripe)
+try {
+  const lc1 = String(input || '').toLowerCase();
+  const wantsUpgrade = lc1.includes('upgrade to pro') || lc1.includes('upgrade to enterprise');
+  if (wantsUpgrade) {
+    try {
+      if (userProfile?.stripe_subscription_id) {
+        await sendMessage(from, `⚠️ You already have an active ${userProfile.subscription_tier} subscription. Contact support to change plans.`);
+        ensureReply(res, 'Already subscribed!');
         return;
       }
-// If we had an incoming audio but still have no input by here, never fall into helpers
-if (hadIncomingAudio && (!input || !input.trim())) {
-  console.log('[GUARD] had incoming audio, but no transcript → sending cannot-understand message');
-  ensureReply(res, `⚠️ I couldn’t understand the audio. Try again, or text me: "task - buy tape".`);
-  return;
+      const tier = lc1.includes('pro') ? 'pro' : 'enterprise';
+      const priceId   = tier === 'pro' ? process.env.PRO_PRICE_ID : process.env.ENTERPRISE_PRICE_ID;
+      const priceText = tier === 'pro' ? '$29' : '$99';
+
+      const customer = await stripe.customers.create({ phone: from, metadata: { user_id: userProfile.user_id } });
+      const paymentLink = await stripe.paymentLinks.create({
+        line_items: [{ price: priceId, quantity: 1 }],
+        metadata: { user_id: userProfile.user_id }
+      });
+
+      await query(
+        `UPDATE users SET stripe_customer_id=$1, subscription_tier=$2 WHERE user_id=$3`,
+        [customer.id, tier, userProfile.user_id]
+      );
+
+      await sendTemplateMessage(from, process.env.HEX_UPGRADE_NOW, [
+        `Upgrade to ${tier} for ${priceText}/month CAD: ${paymentLink.url}`
+      ]);
+      await logEvent(tenantId, userId, 'upgrade', { tier, link: paymentLink.url });
+      await saveConvoState(tenantId, userId, {
+        history: [...(convo.history || []).slice(-4), { input, response: 'Upgrade link sent!', intent: 'upgrade' }]
+      });
+      ensureReply(res, 'Upgrade link sent!');
+      return;
+    } catch (err) {
+      console.error('[UPGRADE] error:', err?.message);
+      return next(err);
+    }
+  }
+} catch (e) {
+  console.warn('[UPGRADE] skipped:', e?.message);
 }
 
-// 3.7) Follow-up modifier: "assign this/it to <name>"
+// 2) DeepDive / historical upload
 try {
-  // only if it's a question / follow-up, not a command
-  if (looksLikeQuestion(input)) {
-    const m = /\bassign\s+(?:this|it)?\s*(?:to|@)\s*([a-z][\w\s.'-]{1,50})\??$/i.exec(input.trim());
-    if (m) {
-      const assignee = m[1].trim();
+  const lc2 = String(input || '').toLowerCase();
+  const triggersDeepDive = lc2.includes('upload history') || lc2.includes('historical data') ||
+                           lc2.includes('deepdive') || lc2.includes('deep dive');
 
-      // Hand off to tasks handler in "assign" mode targeting the last created task
-      const tasksFn = getHandler && getHandler('tasks');
-      if (typeof tasksFn === 'function') {
-        res.locals = res.locals || {};
-        res.locals.intentArgs = {
-          action: 'assign',
-          taskRef: 'last',            // let your tasks handler interpret 'last' → last created/active task
-          assigneeName: assignee
-        };
+  const tierLimits = {
+    starter:     { years: 7, transactions:  5000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_STARTER,     parsingPriceText: '$19' },
+    pro:         { years: 7, transactions: 20000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_PRO,         parsingPriceText: '$49' },
+    enterprise:  { years: 7, transactions: 50000, parsingPriceId: process.env.HISTORICAL_PARSING_PRICE_ENTERPRISE,  parsingPriceText: '$99' }
+  };
+  const tier = (userProfile?.subscription_tier || 'starter').toLowerCase();
+  const limit = tierLimits[tier] || tierLimits.starter;
 
-        // Use a normalized command string your tasks handler understands for assignment
-        const normalized = `task assign @${assignee}`;
+  if (triggersDeepDive) {
+    await setPendingTransactionState(from, {
+      historicalDataUpload: true,
+      deepDiveUpload: true,
+      maxTransactions: limit.transactions,
+      uploadType: 'csv'
+    });
 
-        const handled = await tasksFn(
-          from,
-          normalized,
-          userProfile,
-          ownerId,
-          ownerProfile,
-          isOwner,
-          res
-        );
-
-        if (!res.headersSent && handled !== false) {
-          ensureReply(res, `Assigned to ${assignee}.`);
+    if (mediaUrl && mediaType && ['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType)) {
+      try {
+        if (!userProfile?.historical_parsing_purchased) {
+          const paymentLink = await stripe.paymentLinks.create({
+            line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
+            metadata: { user_id: userProfile.user_id, type: 'historical_parsing' }
+          });
+          await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
+            `Upload up to 7 years of historical data via CSV/Excel for free (${limit.transactions} transactions). For historical image/audio parsing, unlock Chief AI’s DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}`
+          ]);
+          await logEvent(tenantId, userId, 'deepdive_paylink', { link: paymentLink.url, tier });
+          ensureReply(res, 'DeepDive payment link sent!');
+          return;
         }
-        return; // ✅ handled as a follow-up modification
+      } catch (err) {
+        console.error('[DEEPDIVE] payment init error:', err?.message);
+        return next(err);
+      }
+    }
+
+    const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
+    await logEvent(tenantId, userId, 'deepdive_init', { tier, maxTransactions: limit.transactions });
+    await saveConvoState(tenantId, userId, {
+      history: [...(convo.history || []).slice(-4), { input, response: `Ready to upload historical data…`, intent: 'deepdive' }]
+    });
+    ensureReply(res, `Ready to upload historical data (up to ${limit.years} years, ${limit.transactions} transactions). Send CSV/Excel for free or PDFs/images/audio for ${limit.parsingPriceText} via DeepDive. Track progress on your dashboard: ${dashUrl}`);
+    return;
+  }
+
+  const deepDiveState = await getPendingTransactionState(from);
+  const isInDeepDiveUpload = deepDiveState?.deepDiveUpload === true || deepDiveState?.historicalDataUpload === true;
+
+  if (isInDeepDiveUpload && mediaUrl && mediaType) {
+    try {
+      const allowed = [
+        'application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg',
+        'text/csv', 'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      ];
+      if (!allowed.includes(mediaType)) {
+        ensureReply(res, 'Unsupported file type. Please upload a PDF, image, audio, CSV, or Excel.');
+        return;
+      }
+
+      if (['application/pdf', 'image/jpeg', 'image/png', 'audio/mpeg'].includes(mediaType) && !userProfile?.historical_parsing_purchased) {
+        const paymentLink = await stripe.paymentLinks.create({
+          line_items: [{ price: limit.parsingPriceId, quantity: 1 }],
+          metadata: { user_id: userProfile.user_id, type: 'historical_parsing' }
+        });
+        await sendTemplateMessage(from, process.env.HEX_DEEPDIVE_CONFIRMATION, [
+          `To parse PDFs/images/audio, unlock DeepDive for ${limit.parsingPriceText}: ${paymentLink.url}. CSV/Excel uploads remain free (${limit.transactions} transactions).`
+        ]);
+        await logEvent(tenantId, userId, 'deepdive_blocked_payment_required', { link: paymentLink.url });
+        ensureReply(res, 'DeepDive payment link sent!');
+        return;
+      }
+
+      const fileResp = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+      const buffer = Buffer.from(fileResp.data);
+      const filename = mediaUrl.split('/').pop() || 'upload';
+
+      const summary = await parseUpload(
+        buffer,
+        filename,
+        from,
+        mediaType,
+        deepDiveState.uploadType || 'csv',
+        userProfile?.fiscal_year_start
+      );
+
+      if (deepDiveState.historicalDataUpload) {
+        const transactionCount = summary?.transactions?.length || 0;
+        if (transactionCount > (deepDiveState.maxTransactions || limit.transactions)) {
+          ensureReply(res, `Upload exceeds ${deepDiveState.maxTransactions || limit.transactions} transactions. Contact support for larger datasets.`);
+          return;
+        }
+        const dashUrl = `/dashboard/${from}?token=${userProfile?.dashboard_token || ''}`;
+        await logEvent(tenantId, userId, 'deepdive_upload', { transactionCount, mediaType });
+        await saveConvoState(tenantId, userId, {
+          history: [...(convo.history || []).slice(-4), { input: `file:${mediaType}`, response: `✅ ${transactionCount} new transactions processed.`, intent: 'deepdive_upload' }]
+        });
+        ensureReply(res, `✅ ${transactionCount} new transactions processed. Track progress on your dashboard: ${dashUrl}`);
+        deepDiveState.historicalDataUpload = false;
+        deepDiveState.deepDiveUpload = false;
+        await setPendingTransactionState(from, deepDiveState);
+        return;
+      }
+
+      await logEvent(tenantId, userId, 'deepdive_file_processed', { mediaType, filename });
+      ensureReply(res, `File received and processed. ${summary ? 'Summary: ' + JSON.stringify(summary) : 'OK'}.`);
+      deepDiveState.deepDiveUpload = false;
+      await setPendingTransactionState(from, deepDiveState);
+      return;
+    } catch (err) {
+      console.error('[DEEPDIVE] parse error:', err?.message);
+      return next(err);
+    }
+  }
+} catch (e) {
+  console.warn('[DEEPDIVE] skipped:', e?.message);
+}
+
+// 3.5) Fast-path for pending timeclock prompts
+try {
+  const pending = await getPendingPrompt(ownerId);
+  if (pending) {
+    const normalized = normalizeTimeclockInput(input, userProfile);
+    const handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+    await logEvent(tenantId, userId, 'timeclock_prompt_reply', { input, normalized, pending_kind: pending.kind });
+    if (!res.headersSent) ensureReply(res, handled ? '' : '');
+    return;
+  }
+} catch (e) {
+  console.warn('[TIMECLOCK PROMPT] skipped:', e?.message);
+}
+
+// 3.6) PRIORITY: Direct timeclock route on explicit timeclock language
+try {
+  if (isTimeclockMessage(input)) {
+    const normalized = normalizeTimeclockInput(input, userProfile);
+    await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+    await logEvent(tenantId, userId, 'timeclock_direct', { normalized });
+    if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
+    return;
+  }
+} catch (e) {
+  console.warn('[TIMECLOCK DIRECT] skipped:', e?.message);
+}
+
+/* ================= END SYSTEM FLOWS ================= */
+
+// ---------- INTENT-GUARD again, just before routers ----------
+if (shouldSkipRouters(res)) return;
+
+/* ---------- Conversational router ---------- */
+try {
+  const conv = await converseAndRoute(input, { userProfile, ownerId: tenantId, convoState: state });
+
+  const extractMsg = (twimlStr) => {
+    if (!twimlStr) return '';
+    const m = twimlStr.match(/<Message>([\s\S]*?)<\/Message>/);
+    return m ? m[1] : '';
+    };
+
+  if (conv?.handled && conv.twiml) {
+    const responseText = extractMsg(conv.twiml);
+    await logEvent(tenantId, userId, 'clarify', { input, response: responseText, intent: conv.intent || null });
+    await saveConvoState(tenantId, userId, {
+      last_intent: conv.intent || convo.last_intent || null,
+      last_args: conv.args || convo.last_args || {},
+      history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
+    });
+    res.status(200).type('text/xml').send(conv.twiml);
+    return;
+  }
+
+  if (conv && conv.route && conv.normalized) {
+    let responseText = extractMsg(conv.twiml);
+    let handled = false;
+
+    if (conv.route === 'tasks') {
+      const tasksFn = getHandler('tasks');
+      if (typeof tasksFn === 'function') {
+        handled = await tasksFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+        responseText = responseText || 'Task created!';
+        await logEvent(tenantId, userId, 'tasks.create', { normalized: conv.normalized, args: conv.args || {} });
+      }
+    } else if (conv.route === 'expense') {
+      const expenseFn = getHandler('expense');
+      if (typeof expenseFn === 'function') {
+        handled = await expenseFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+        responseText = responseText || 'Expense logged!';
+        await logEvent(tenantId, userId, 'expense.add', { normalized: conv.normalized, args: conv.args || {} });
+        if (conv.args?.alias && (conv.args.vendor || conv.args.job)) {
+          await upsertMemory(tenantId, userId, `alias.vendor.${conv.args.alias.toLowerCase()}`, { name: conv.args.vendor || conv.args.job });
+        }
+        if (conv.args?.bucket === 'Overhead') {
+          await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
+        }
+      }
+    } else if (conv.route === 'timeclock') {
+      const normalizedTC = normalizeTimeclockInput(conv.normalized, userProfile);
+      handled = await handleTimeclock(from, normalizedTC, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+      responseText = responseText || '✅ Timeclock request received.';
+      await logEvent(tenantId, userId, 'timeclock', { normalized: normalizedTC, args: conv.args || {} });
+      if (conv.args?.job || conv.args?.job_id) {
+        await saveConvoState(tenantId, userId, {
+          active_job: conv.args.job || convo.active_job || null,
+          active_job_id: conv.args.job_id || convo.active_job_id || null
+        });
+      }
+    } else if (conv.route === 'job') {
+      const jobFn = getHandler('job');
+      if (typeof jobFn === 'function') {
+        handled = await jobFn(from, conv.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+        responseText = responseText || 'Job created!';
+        await logEvent(tenantId, userId, 'job.create', { normalized: conv.normalized, args: conv.args || {} });
+      }
+    }
+
+    if (handled) {
+      await saveConvoState(tenantId, userId, {
+        last_intent: conv.intent || convo.last_intent || null,
+        last_args: conv.args || convo.last_args || {},
+        history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: conv.intent || null }]
+      });
+      if (!res.headersSent && conv.twiml) res.status(200).type('text/xml').send(conv.twiml);
+      return;
+    }
+  }
+} catch (e) {
+  console.warn('[Conversational Router] error:', e?.message);
+}
+
+/* ---------- AI intent router (tool-calls) ---------- */
+try {
+  if (!shouldSkipRouters(res)) {
+    const ai = await routeWithAI(input, { userProfile });
+    if (ai) {
+      let handled = false;
+      let responseText = 'Action completed!';
+      let normalizedForLog = null;
+
+      if (ai.intent === 'timeclock.clock_in') {
+        const who = ai.args.person || userProfile?.name || 'Unknown';
+        const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
+        const t = ai.args.time ? ` at ${ai.args.time}` : '';
+        const normalized = `${who} punched in${jobHint}${t}`;
+        normalizedForLog = normalized;
+        handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+        responseText = `Punched in${jobHint}! What’s next?`;
+      } else if (ai.intent === 'timeclock.clock_out') {
+        const who = ai.args.person || userProfile?.name || 'Unknown';
+        const t = ai.args.time ? ` at ${ai.args.time}` : '';
+        const normalized = `${who} punched out${t}`;
+        normalizedForLog = normalized;
+        handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+        responseText = `Clocked out${t}! Anything else?`;
+      } else if (ai.intent === 'job.create') {
+        const name = ai.args.name?.trim();
+        if (name && typeof commands.job === 'function') {
+          const normalized = `create job ${name}`;
+          normalizedForLog = normalized;
+          handled = await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = `Created job: ${name}. Need tasks for it?`;
+        }
+      } else if (ai.intent === 'expense.add') {
+        const amt = ai.args.amount;
+        const cat = ai.args.category ? ` ${ai.args.category}` : '';
+        const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
+        const normalized = `expense $${amt}${cat}${fromWho}`.trim();
+        normalizedForLog = normalized;
+        const expenseFn = getHandler('expense');
+        if (typeof expenseFn === 'function') {
+          handled = await expenseFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = `Logged $${amt}${fromWho}! Got more expenses?`;
+          if (ai.args.merchant) {
+            await upsertMemory(tenantId, userId, `alias.vendor.${ai.args.merchant.toLowerCase()}`, { name: ai.args.merchant });
+          }
+        }
+      }
+
+      if (handled) {
+        await logEvent(tenantId, userId, ai.intent, { normalized: normalizedForLog, args: ai.args });
+        await saveConvoState(tenantId, userId, {
+          last_intent: ai.intent,
+          last_args: ai.args,
+          history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: ai.intent }]
+        });
+        if (!res.headersSent) ensureReply(res, responseText);
+        return;
       }
     }
   }
 } catch (e) {
-  console.warn('[TASK ASSIGN FOLLOW-UP] failed:', e?.message);
+  console.warn('[AI Router] skipped due to error:', e?.message);
 }
 
-      // 5) Timeclock (direct keywords) — backup path
-      if (isTimeclockMessage(input)) {
-        const normalized = normalizeTimeclockInput(input, userProfile);
-        await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-        await logEvent(tenantId, userId, 'timeclock', { normalized });
-        if (!res.headersSent) ensureReply(res, '✅ Timeclock request received.');
-        return;
+/* ---------- Legacy NLP routing (conversation.js) ---------- */
+try {
+  if (!shouldSkipRouters(res)) {
+    const routed = await converseAndRoute(input, {
+      userProfile,
+      ownerId: tenantId,
+      convoState: state,
+      memory
+    });
+
+    if (routed) {
+      if (routed.handled && routed.twiml) {
+        return res.status(200).type('text/xml').send(routed.twiml);
       }
 
-      // 7) Fast intent router for jobs
-      if (/^\s*(create|new|add)\s+job\b/i.test(input) || /^\s*(start|pause|resume|finish|summarize)\s+job\b/i.test(input)) {
-        if (typeof commands.job === 'function') {
-          try {
-            const handled = await commands.job(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-            if (handled !== false) {
-              await logEvent(tenantId, userId, 'job', { input });
-              await saveConvoState(tenantId, userId, {
-                history: [...(convo.history || []).slice(-4), { input, response: 'Job action completed.', intent: 'job' }]
-              });
-              if (!res.headersSent) ensureReply(res, '');
-              return;
-            }
-          } catch (e) {
-            console.error('[ERROR] job handler threw:', e?.message);
+      const route = routed.route;
+      if (!routed.handled && route) {
+        let handled = false;
+        let responseText = '';
+
+        res.locals = res.locals || {};
+        res.locals.intentArgs = routed.args || null;
+
+        if (route === 'tasks') {
+          handled = await tasksHandler(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+          responseText = 'Task created!';
+          if (handled !== false) {
+            await logEvent(tenantId, userId, 'tasks.create', { normalized: routed.normalized, args: routed.args || {} });
           }
-        } else {
-          console.warn('[WARN] commands.job not callable; exports:', Object.keys(commands || {}));
+        } else if (route === 'expense') {
+          const expenseFn = getHandler('expense');
+          if (typeof expenseFn === 'function') {
+            handled = await expenseFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            responseText = 'Expense logged!';
+            if (handled !== false) {
+              await logEvent(tenantId, userId, 'expense.add', { normalized: routed.normalized, args: routed.args || {} });
+              if (routed.args?.alias && (routed.args.vendor || routed.args.job)) {
+                await upsertMemory(tenantId, userId, `alias.vendor.${routed.args.alias.toLowerCase()}`, { name: routed.args.vendor || routed.args.job });
+              }
+              if (routed.args?.bucket === 'Overhead') {
+                await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
+              }
+            }
+          }
+        } else if (route === 'timeclock') {
+          const normalized = normalizeTimeclockInput(routed.normalized, userProfile);
+          handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+          responseText = '✅ Timeclock request received.';
+          if (handled !== false) {
+            await logEvent(tenantId, userId, 'timeclock', { normalized, args: routed.args || {} });
+            if (routed.args?.job || routed.args?.job_id) {
+              await saveConvoState(tenantId, userId, {
+                active_job: routed.args.job || convo.active_job || null,
+                active_job_id: routed.args.job_id || convo.active_job_id || null
+              });
+            }
+          }
+        } else if (route === 'job') {
+          const jobFn = getHandler('job');
+          if (typeof jobFn === 'function') {
+            handled = await jobFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            responseText = 'Job created!';
+            if (handled !== false) {
+              await logEvent(tenantId, userId, 'job.create', { normalized: routed.normalized, args: routed.args || {} });
+            }
+          }
         }
-      }
 
-      // 8) General dispatch (with internal timeclock guard)
-      {
-        const handled = await dispatchCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
         if (handled) {
-          await logEvent(tenantId, userId, 'dispatch', { input });
           await saveConvoState(tenantId, userId, {
-            history: [...(convo.history || []).slice(-4), { input, response: 'Action completed.', intent: 'dispatch' }]
+            last_intent: routed.intent || convo.last_intent || null,
+            last_args: routed.args || convo.last_args || {},
+            history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: routed.intent || route || null }]
           });
+          if (!res.headersSent) ensureReply(res, responseText);
           return;
         }
       }
+    }
+  }
 
-      // 9) Legacy combined handler
-      if (typeof commands.handleCommands === 'function') {
-        try {
-          const handled = await commands.handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
-          if (handled !== false) {
-            await logEvent(tenantId, userId, 'legacy', { input });
-            await saveConvoState(tenantId, userId, {
-              history: [...(convo.history || []).slice(-4), { input, response: 'Action completed.', intent: 'legacy' }]
-            });
-            return;
-          }
-        } catch (e) {
-          console.error('[ERROR] handleCommands threw:', e?.message);
-        }
-      }
 
       // Fallback
       const response = "I'm here to help! Try 'expense $100 tools', 'create job Roof Repair', 'task - buy tape', or 'help'.";

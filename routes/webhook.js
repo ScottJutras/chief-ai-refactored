@@ -630,21 +630,34 @@ router.post(
 
 // Make sure these exist BEFORE any router blocks reference them
 // (prevents "Cannot access 'tenantId' before initialization" / 'state' errors)
-const tenantId = ownerId;  // normalize naming so routers can use tenantId
-const state = await getConvoState(tenantId, userId).catch(() => ({}));
+const tenantId = ownerId;            // normalized name used by routers
+const userId = from;                 // normalized user id (WhatsApp phone)
 
-// ---- helpers ----
-function twiml(text) { return `<Response><Message>${text}</Message></Response>`; }
-function getUserTz(userProfile) {
-  return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
-}
-function ensureReply(res, text) {
-  if (!res.headersSent) res.status(200).type('text/xml').send(twiml(text));
-}
+// Pull current convo state once; reuse it everywhere
+const convo = await getConvoState(tenantId, userId).catch(() => ({}));
+
+// Build the light "state" object routers expect
+const state = {
+  user_id: userId,
+  tenant_id: tenantId,
+  active_job: convo.active_job || null,
+  active_job_id: convo.active_job_id || null,
+  aliases: convo.aliases || {},
+  history: Array.isArray(convo.history) ? convo.history.slice(-5) : []
+};
+
+// tiny helpers (safe to keep here)
 function shouldSkipRouters(res) {
   if (!res || res.headersSent) return true;
   const args = (res.locals && res.locals.intentArgs) || {};
   return args.doneTaskNo != null || args.deleteTaskNo != null || args.assignTaskNo != null || !!args.title;
+}
+function ensureReply(res, text) {
+  if (!res.headersSent) res.status(200).type('text/xml').send(`<Response><Message>${text}</Message></Response>`);
+}
+function twiml(text) { return `<Response><Message>${text}</Message></Response>`; }
+function getUserTz(userProfile) {
+  return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 }
 
 // ========== EARLY MICRO-FLOWS ==========
@@ -1325,20 +1338,6 @@ try {
 // === END TEAM SHORT-CIRCUIT ===
 
 
-
-    // ---------- memory bootstrapping ----------
-    const tenantId = ownerId;
-    const userId = from;
-    let convo = await getConvoState(tenantId, userId);
-    const state = {
-      user_id: userId,
-      tenant_id: tenantId,
-      active_job: convo.active_job || null,
-      active_job_id: convo.active_job_id || null,
-      aliases: convo.aliases || {},
-      history: Array.isArray(convo.history) ? convo.history.slice(-5) : []
-    };
-
     // Optional fetch of defaults you may use in your nlp/router
     const memory = await getMemory(tenantId, userId, [
       'default.expense.bucket',
@@ -1734,20 +1733,20 @@ try {
       const response = "I'm here to help! Try 'expense $100 tools', 'create job Roof Repair', 'task - buy tape', or 'help'.";
       await logEvent(tenantId, userId, 'fallback', { input, response });
       await saveConvoState(tenantId, userId, {
-        last_intent: null,
-        last_args: {},
-        history: [...(convo.history || []).slice(-4), { input, response, intent: null }]
+      last_intent: null,
+      last_args: {},
+      history: [...(convo.history || []).slice(-4), { input, response, intent: null }]
       });
       if (!res.headersSent) ensureReply(res, response);
       return;
 
     } catch (error) {
-      console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
-      const tenantId = ownerId;
-      const userId = from;
-      try { await logEvent(tenantId, userId, 'error', { input, error: error.message }); } catch {}
-      return next(error);
+    console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
+    try { await logEvent(tenantId, userId, 'error', { input, error: error.message }); } catch {}
+    return next(error);
     } finally {
+  
+
       try {
         await releaseLock(req.lockKey, req.lockToken);
         console.log('[LOCK] released for', req.lockKey);

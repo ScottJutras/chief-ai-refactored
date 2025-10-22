@@ -628,87 +628,92 @@ router.post(
 
     // ================= TEXT PATH BEGINS =================
 
-    // Early YES/NO handler for task offers (unchanged)
-    try {
-      const lc = String(input || '').trim().toLowerCase();
-      if (lc === 'yes' || lc === 'no') {
-        const ps = await getPendingTransactionState(from); // "from" is the replier
-        if (ps?.pendingTaskOffer?.taskNo && ps?.pendingTaskOffer?.ownerId) {
-          const { taskNo, ownerId, title } = ps.pendingTaskOffer;
-          const accepted = (lc === 'yes');
+// Make sure these exist BEFORE any router blocks reference them
+// (prevents "Cannot access 'tenantId' before initialization" / 'state' errors)
+const tenantId = ownerId;  // normalize naming so routers can use tenantId
+const state = await getConvoState(tenantId, userId).catch(() => ({}));
 
-          const assigneeId = String(from).replace(/\D/g, ''); // normalize assignee
-          const ownerDigits = String(ownerId).replace(/\D/g, ''); // normalize owner
+// ---- helpers ----
+function twiml(text) { return `<Response><Message>${text}</Message></Response>`; }
+function getUserTz(userProfile) {
+  return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
+}
+function ensureReply(res, text) {
+  if (!res.headersSent) res.status(200).type('text/xml').send(twiml(text));
+}
+function shouldSkipRouters(res) {
+  if (!res || res.headersSent) return true;
+  const args = (res.locals && res.locals.intentArgs) || {};
+  return args.doneTaskNo != null || args.deleteTaskNo != null || args.assignTaskNo != null || !!args.title;
+}
 
-          await query(
-            `UPDATE public.tasks
-                SET acceptance_status = $4, updated_at = NOW()
-              WHERE owner_id = $1 AND task_no = $2 AND assigned_to = $3`,
-            [ownerId, taskNo, assigneeId, accepted ? 'accepted' : 'declined']
-          );
+// ========== EARLY MICRO-FLOWS ==========
 
-          try {
-            await sendMessage(
-              ownerDigits,
-              `📣 ${assigneeId} ${accepted ? 'accepted' : 'declined'} task #${taskNo}${title ? `: ${title}` : ''}`
-            );
-          } catch {}
-
-          await sendMessage(from, accepted ? '👍 Accepted — thanks!' : '👌 Declined — got it.');
-          const { pendingTaskOffer, ...rest } = ps;
-          await setPendingTransactionState(from, rest);
-
-          return res.status(200).type('text/xml').send('<Response></Response>');
-        }
-      }
-    } catch (e) {
-      console.warn('[task-offer yes/no] skipped:', e?.message);
-    }
-
-    // ---- ASSIGN FAST-PATH (must run BEFORE any task-creation fast-path) ----
-    try {
-      if (typeof input === 'string' && looksLikeAssign(input)) {
-        const parsed = parseAssignUtterance(input);
-        if (parsed) {
-          let { taskNo, assignee } = parsed;
-
-          if (taskNo === 'last') {
-            try {
-              const ps = await getPendingTransactionState(from);
-              if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
-            } catch (_) {}
-          }
-
-          if (!taskNo || Number.isNaN(Number(taskNo))) {
-            return res.status(200).type('text/xml')
-              .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
-          }
-
-          res.locals = res.locals || {};
-          res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
-
-          const handled = await tasksHandler(
-            from,
-            `__assign__ #${taskNo} to ${assignee}`,
-            userProfile,
-            ownerId,
-            ownerProfile,
-            isOwner,
-            res
-          );
-          if (!res.headersSent && handled !== false) ensureReply(res, `Assigning task #${taskNo} to ${assignee}…`);
-          return;
-        }
-      }
-    } catch (e) {
-      console.warn('[ASSIGN FAST-PATH] skipped:', e?.message);
-    }
-    // ---- END ASSIGN FAST-PATH ----
-
-    // ---- COMPLETE FAST-PATH (must run BEFORE any task-creation fast-path) ----
+// Early YES/NO handler for task offers
 try {
-  if (typeof input === 'string' && looksLikeComplete(normalizeForControl(input))) {  // <— probe here
-    const hit = parseCompleteUtterance(input);  // parse reads normalized internally
+  const lc = String(input || '').trim().toLowerCase();
+  if (lc === 'yes' || lc === 'no') {
+    const ps = await getPendingTransactionState(from);
+    if (ps?.pendingTaskOffer?.taskNo && ps?.pendingTaskOffer?.ownerId) {
+      const { taskNo, ownerId: offerOwnerId, title } = ps.pendingTaskOffer;
+      const accepted = (lc === 'yes');
+      const assigneeId = String(from).replace(/\D/g, '');
+      const ownerDigits = String(offerOwnerId).replace(/\D/g, '');
+
+      await query(
+        `UPDATE public.tasks
+            SET acceptance_status = $4, updated_at = NOW()
+          WHERE owner_id = $1 AND task_no = $2 AND assigned_to = $3`,
+        [offerOwnerId, taskNo, assigneeId, accepted ? 'accepted' : 'declined']
+      );
+      try {
+        await sendMessage(ownerDigits, `📣 ${assigneeId} ${accepted ? 'accepted' : 'declined'} task #${taskNo}${title ? `: ${title}` : ''}`);
+      } catch {}
+      await sendMessage(from, accepted ? '👍 Accepted — thanks!' : '👌 Declined — got it.');
+
+      const { pendingTaskOffer, ...rest } = ps;
+      await setPendingTransactionState(from, rest);
+      return res.status(200).type('text/xml').send('<Response></Response>');
+    }
+  }
+} catch (e) {
+  console.warn('[task-offer yes/no] skipped:', e?.message);
+}
+
+// ========== CONTROL FAST-PATHS (ORDER MATTERS) ==========
+
+// 1) ASSIGN — must run before any create
+try {
+  if (typeof input === 'string' && looksLikeAssign(input)) {
+    const parsed = parseAssignUtterance(input);
+    if (parsed) {
+      let { taskNo, assignee } = parsed;
+      if (taskNo === 'last') {
+        try {
+          const ps = await getPendingTransactionState(from);
+          if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+        } catch (_) {}
+      }
+      if (!taskNo || Number.isNaN(Number(taskNo))) {
+        return res.status(200).type('text/xml').send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
+      }
+
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName: assignee };
+
+      const handled = await tasksHandler(from, `__assign__ #${taskNo} to ${assignee}`, userProfile, ownerId, ownerProfile, isOwner, res);
+      if (!res.headersSent && handled !== false) ensureReply(res, `Assigning task #${taskNo} to ${assignee}…`);
+      return;
+    }
+  }
+} catch (e) {
+  console.warn('[ASSIGN FAST-PATH] skipped:', e?.message);
+}
+
+// 2) COMPLETE — must run before any create
+try {
+  if (typeof input === 'string' && looksLikeComplete(normalizeForControl(input))) {
+    const hit = parseCompleteUtterance(input);
     if (hit) {
       let { taskNo } = hit;
       if (taskNo === 'last') {
@@ -718,8 +723,7 @@ try {
         } catch (_) {}
       }
       if (!taskNo || Number.isNaN(Number(taskNo))) {
-        return res.status(200).type('text/xml')
-          .send(twiml(`I couldn’t tell which task to complete. Try “done #12”.`));
+        return res.status(200).type('text/xml').send(twiml(`I couldn’t tell which task to complete. Try “done #12”.`));
       }
       res.locals = res.locals || {};
       res.locals.intentArgs = { doneTaskNo: Number(taskNo) };
@@ -732,11 +736,10 @@ try {
 } catch (e) {
   console.warn('[COMPLETE FAST-PATH] skipped:', e?.message);
 }
-// ---- END COMPLETE FAST-PATH ----
 
-    // ---- DELETE FAST-PATH (must run BEFORE task-creation fast-path) ----
+// 3) DELETE — must run before any create
 try {
-  if (typeof input === 'string' && looksLikeDelete(normalizeForControl(input))) {  // <— probe here
+  if (typeof input === 'string' && looksLikeDelete(normalizeForControl(input))) {
     const hit = parseDeleteUtterance(input);
     if (hit) {
       let { taskNo } = hit;
@@ -747,8 +750,7 @@ try {
         } catch (_) {}
       }
       if (!taskNo || Number.isNaN(Number(taskNo))) {
-        return res.status(200).type('text/xml')
-          .send(twiml(`I couldn’t tell which task to delete. Try “delete #12”.`));
+        return res.status(200).type('text/xml').send(twiml(`I couldn’t tell which task to delete. Try “delete #12”.`));
       }
       res.locals = res.locals || {};
       res.locals.intentArgs = { deleteTaskNo: Number(taskNo) };
@@ -760,58 +762,44 @@ try {
 } catch (e) {
   console.warn('[DELETE FAST-PATH] skipped:', e?.message);
 }
-// ---- END DELETE FAST-PATH ----
 
-    // ---------- FAST-PATH TASKS (text-only) ----------
+// 4) CREATE — last, and only if NOT a control phrase
 try {
   const bodyTxt = String(input || '');
-  const controlProbe = normalizeForControl(bodyTxt);   // <— NEW
+  const controlProbe = normalizeForControl(bodyTxt);
 
-  // IMPORTANT: Never treat control phrases as new tasks
   if (
     !mediaUrl &&
-    !looksLikeAnyControl(controlProbe) &&              // <— probe here
-    (/^task\b/i.test(bodyTxt) ||
-      (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
+    !looksLikeAnyControl(controlProbe) &&
+    (/^task\b/i.test(bodyTxt) || (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
   ) {
+    try { await deletePendingTransactionState(from); } catch (_) {}
 
-        try { await deletePendingTransactionState(from); } catch (_) {}
+    const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
+    console.log('[TASK FAST-PATH] parsed', parsed); // ← keep this while debugging
 
-        const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
-        if (!parsed) throw new Error('Could not parse task intent');
+    if (!parsed) throw new Error('Could not parse task intent');
 
-        res.locals = res.locals || {};
-        res.locals.intentArgs = {
-          title: parsed.title,
-          dueAt: parsed.dueAt,
-          assigneeName: parsed.assignee
-        };
-        console.log('[CREATE] fast-path create for', from, '→', bodyTxt);
-        return tasksHandler(from, bodyTxt, userProfile, ownerId, ownerProfile, isOwner, res);
-      }
-    } catch (e) {
-      console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
-    }
-    // ---------- END FAST-PATH TASKS ----------
-
-// Guard helper so we don't redeclare consts or duplicate logic
-function shouldSkipRouters(res) {
-  if (!res) return false;
-  if (res.headersSent) return true;
-  const args = (res.locals && res.locals.intentArgs) || {};
-  return (
-    args.doneTaskNo != null ||
-    args.deleteTaskNo != null ||
-    args.assignTaskNo != null ||
-    !!args.title
-  );
+    res.locals = res.locals || {};
+    res.locals.intentArgs = {
+      title: parsed.title,
+      dueAt: parsed.dueAt,
+      assigneeName: parsed.assignee
+    };
+    console.log('[CREATE] fast-path create for', from, '→', bodyTxt);
+    return tasksHandler(from, bodyTxt, userProfile, ownerId, ownerProfile, isOwner, res);
+  }
+} catch (e) {
+  console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
 }
 
-/* ===================== ROUTERS (in order) ===================== */
+// ===== If a fast-path set intentArgs or replied, skip routers =====
+if (shouldSkipRouters(res)) {
+  // A fast-path handled (or decided) this turn.
+} else {
 
-// 4) Conversational router first
-try {
-  if (!shouldSkipRouters(res)) {
+  /* ---------- Conversational router ---------- */
+  try {
     const conv = await converseAndRoute(input, { userProfile, ownerId: tenantId, convoState: state });
 
     const extractMsg = (twimlStr) => {
@@ -886,160 +874,168 @@ try {
         return;
       }
     }
-  } // end shouldSkipRouters guard
-} catch (e) {
-  console.warn('[Conversational Router] error:', e?.message);
-}
+  } catch (e) {
+    console.warn('[Conversational Router] error:', e?.message);
+  }
 
-/* 6) AI intent router (tool-calls) */
-try {
-  if (!shouldSkipRouters(res)) {
-    const ai = await routeWithAI(input, { userProfile });
-    if (ai) {
-      let handled = false;
-      let responseText = 'Action completed!';
-      let normalizedForLog = null;
-
-      if (ai.intent === 'timeclock.clock_in') {
-        const who = ai.args.person || userProfile?.name || 'Unknown';
-        const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
-        const t = ai.args.time ? ` at ${ai.args.time}` : '';
-        const normalized = `${who} punched in${jobHint}${t}`;
-        normalizedForLog = normalized;
-        handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-        responseText = `Punched in${jobHint}! What’s next?`;
-      } else if (ai.intent === 'timeclock.clock_out') {
-        const who = ai.args.person || userProfile?.name || 'Unknown';
-        const t = ai.args.time ? ` at ${ai.args.time}` : '';
-        const normalized = `${who} punched out${t}`;
-        normalizedForLog = normalized;
-        handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-        responseText = `Clocked out${t}! Anything else?`;
-      } else if (ai.intent === 'job.create') {
-        const name = ai.args.name?.trim();
-        if (name && typeof commands.job === 'function') {
-          const normalized = `create job ${name}`;
-          normalizedForLog = normalized;
-          handled = await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-          responseText = `Created job: ${name}. Need tasks for it?`;
-        }
-      } else if (ai.intent === 'expense.add') {
-        const amt = ai.args.amount;
-        const cat = ai.args.category ? ` ${ai.args.category}` : '';
-        const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
-        const normalized = `expense $${amt}${cat}${fromWho}`.trim();
-        normalizedForLog = normalized;
-        const expenseFn = getHandler('expense');
-        if (typeof expenseFn === 'function') {
-          handled = await expenseFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-          responseText = `Logged $${amt}${fromWho}! Got more expenses?`;
-          if (ai.args.merchant) {
-            await upsertMemory(tenantId, userId, `alias.vendor.${ai.args.merchant.toLowerCase()}`, { name: ai.args.merchant });
-          }
-        }
-      }
-
-      if (handled) {
-        await logEvent(tenantId, userId, ai.intent, { normalized: normalizedForLog, args: ai.args });
-        await saveConvoState(tenantId, userId, {
-          last_intent: ai.intent,
-          last_args: ai.args,
-          history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: ai.intent }]
-        });
-        if (!res.headersSent) ensureReply(res, responseText);
-        return;
-      }
-    }
-  } // end shouldSkipRouters guard
-} catch (e) {
-  console.warn('[AI Router] skipped due to error:', e?.message);
-}
-
-/* 0.25) NLP routing (conversation.js) — legacy fallback after AI */
-try {
-  if (!shouldSkipRouters(res)) {
-    const routed = await converseAndRoute(input, {
-      userProfile,
-      ownerId,
-      convoState: state,
-      memory
-    });
-
-    if (routed) {
-      if (routed.handled && routed.twiml) {
-        return res.status(200).type('text/xml').send(routed.twiml);
-      }
-
-      const route = routed.route;
-      if (!routed.handled && route) {
+  /* ---------- AI intent router (tool-calls) ---------- */
+  try {
+    if (!shouldSkipRouters(res)) {
+      const ai = await routeWithAI(input, { userProfile });
+      if (ai) {
         let handled = false;
-        let responseText = '';
+        let responseText = 'Action completed!';
+        let normalizedForLog = null;
 
-        res.locals = res.locals || {};
-        res.locals.intentArgs = routed.args || null;
-
-        if (route === 'tasks') {
-          handled = await tasksHandler(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-          responseText = 'Task created!';
-          if (handled !== false) {
-            await logEvent(tenantId, userId, 'tasks.create', { normalized: routed.normalized, args: routed.args || {} });
+        if (ai.intent === 'timeclock.clock_in') {
+          const who = ai.args.person || userProfile?.name || 'Unknown';
+          const jobHint = ai.args.job ? ` @ ${ai.args.job}` : '';
+          const t = ai.args.time ? ` at ${ai.args.time}` : '';
+          const normalized = `${who} punched in${jobHint}${t}`;
+          normalizedForLog = normalized;
+          handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+          responseText = `Punched in${jobHint}! What’s next?`;
+        } else if (ai.intent === 'timeclock.clock_out') {
+          const who = ai.args.person || userProfile?.name || 'Unknown';
+          const t = ai.args.time ? ` at ${ai.args.time}` : '';
+          const normalized = `${who} punched out${t}`;
+          normalizedForLog = normalized;
+          handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+          responseText = `Clocked out${t}! Anything else?`;
+        } else if (ai.intent === 'job.create') {
+          const name = ai.args.name?.trim();
+          if (name && typeof commands.job === 'function') {
+            const normalized = `create job ${name}`;
+            normalizedForLog = normalized;
+            handled = await commands.job(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            responseText = `Created job: ${name}. Need tasks for it?`;
           }
-        } else if (route === 'expense') {
+        } else if (ai.intent === 'expense.add') {
+          const amt = ai.args.amount;
+          const cat = ai.args.category ? ` ${ai.args.category}` : '';
+          const fromWho = ai.args.merchant ? ` from ${ai.args.merchant}` : '';
+          const normalized = `expense $${amt}${cat}${fromWho}`.trim();
+          normalizedForLog = normalized;
           const expenseFn = getHandler('expense');
           if (typeof expenseFn === 'function') {
-            handled = await expenseFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-            responseText = 'Expense logged!';
-            if (handled !== false) {
-              await logEvent(tenantId, userId, 'expense.add', { normalized: routed.normalized, args: routed.args || {} });
-              if (routed.args?.alias && (routed.args.vendor || routed.args.job)) {
-                await upsertMemory(tenantId, userId, `alias.vendor.${routed.args.alias.toLowerCase()}`, { name: routed.args.vendor || routed.args.job });
-              }
-              if (routed.args?.bucket === 'Overhead') {
-                await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
-              }
-            }
-          }
-        } else if (route === 'timeclock') {
-          const normalized = normalizeTimeclockInput(routed.normalized, userProfile);
-          handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
-          responseText = '✅ Timeclock request received.';
-          if (handled !== false) {
-            await logEvent(tenantId, userId, 'timeclock', { normalized, args: routed.args || {} });
-            if (routed.args?.job || routed.args?.job_id) {
-              await saveConvoState(tenantId, userId, {
-                active_job: routed.args.job || convo.active_job || null,
-                active_job_id: routed.args.job_id || convo.active_job_id || null
-              });
-            }
-          }
-        } else if (route === 'job') {
-          const jobFn = getHandler('job');
-          if (typeof jobFn === 'function') {
-            handled = await jobFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
-            responseText = 'Job created!';
-            if (handled !== false) {
-              await logEvent(tenantId, userId, 'job.create', { normalized: routed.normalized, args: routed.args || {} });
+            handled = await expenseFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            responseText = `Logged $${amt}${fromWho}! Got more expenses?`;
+            if (ai.args.merchant) {
+              await upsertMemory(tenantId, userId, `alias.vendor.${ai.args.merchant.toLowerCase()}`, { name: ai.args.merchant });
             }
           }
         }
 
         if (handled) {
+          await logEvent(tenantId, userId, ai.intent, { normalized: normalizedForLog, args: ai.args });
           await saveConvoState(tenantId, userId, {
-            last_intent: routed.intent || convo.last_intent || null,
-            last_args: routed.args || convo.last_args || {},
-            history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: routed.intent || route || null }]
+            last_intent: ai.intent,
+            last_args: ai.args,
+            history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: ai.intent }]
           });
           if (!res.headersSent) ensureReply(res, responseText);
           return;
         }
       }
     }
-  } // end shouldSkipRouters guard
-} catch (e) {
-  console.warn('[WEBHOOK] NLP route skip:', e?.message);
-}
-/* =================== END ROUTERS =================== */
+  } catch (e) {
+    console.warn('[AI Router] skipped due to error:', e?.message);
+  }
 
+  /* ---------- Legacy NLP routing (conversation.js) ---------- */
+  try {
+    if (!shouldSkipRouters(res)) {
+      const memory = await getMemory(tenantId, userId, [
+        'default.expense.bucket',
+        'labor_rate',
+        'default.markup',
+        'client.default_terms'
+      ]).catch(() => ({}));
+
+      const routed = await converseAndRoute(input, {
+        userProfile,
+        ownerId: tenantId,
+        convoState: state,
+        memory
+      });
+
+      if (routed) {
+        if (routed.handled && routed.twiml) {
+          return res.status(200).type('text/xml').send(routed.twiml);
+        }
+
+        const route = routed.route;
+        if (!routed.handled && route) {
+          let handled = false;
+          let responseText = '';
+
+          res.locals = res.locals || {};
+          res.locals.intentArgs = routed.args || null;
+
+          if (route === 'tasks') {
+            handled = await tasksHandler(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+            responseText = 'Task created!';
+            if (handled !== false) {
+              await logEvent(tenantId, userId, 'tasks.create', { normalized: routed.normalized, args: routed.args || {} });
+            }
+          } else if (route === 'expense') {
+            const expenseFn = getHandler('expense');
+            if (typeof expenseFn === 'function') {
+              handled = await expenseFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              responseText = 'Expense logged!';
+              if (handled !== false) {
+                await logEvent(tenantId, userId, 'expense.add', { normalized: routed.normalized, args: routed.args || {} });
+                if (routed.args?.alias && (routed.args.vendor || routed.args.job)) {
+                  await upsertMemory(tenantId, userId, `alias.vendor.${routed.args.alias.toLowerCase()}`, { name: routed.args.vendor || routed.args.job });
+                }
+                if (routed.args?.bucket === 'Overhead') {
+                  await upsertMemory(tenantId, userId, 'default.expense.bucket', { bucket: 'Overhead' });
+                }
+              }
+            }
+          } else if (route === 'timeclock') {
+            const normalized = normalizeTimeclockInput(routed.normalized, userProfile);
+            handled = await handleTimeclock(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res, extras);
+            responseText = '✅ Timeclock request received.';
+            if (handled !== false) {
+              await logEvent(tenantId, userId, 'timeclock', { normalized, args: routed.args || {} });
+              if (routed.args?.job || routed.args?.job_id) {
+                await saveConvoState(tenantId, userId, {
+                  active_job: routed.args.job || convo.active_job || null,
+                  active_job_id: routed.args.job_id || convo.active_job_id || null
+                });
+              }
+            }
+          } else if (route === 'job') {
+            const jobFn = getHandler('job');
+            if (typeof jobFn === 'function') {
+              handled = await jobFn(from, routed.normalized, userProfile, ownerId, ownerProfile, isOwner, res);
+              responseText = 'Job created!';
+              if (handled !== false) {
+                await logEvent(tenantId, userId, 'job.create', { normalized: routed.normalized, args: routed.args || {} });
+              }
+            }
+          }
+
+          if (handled) {
+            await saveConvoState(tenantId, userId, {
+              last_intent: routed.intent || convo.last_intent || null,
+              last_args: routed.args || convo.last_args || {},
+              history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: routed.intent || route || null }]
+            });
+            if (!res.headersSent) ensureReply(res, responseText);
+            return;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[WEBHOOK] NLP route skip:', e?.message);
+  }
+
+} // end else shouldSkipRouters
+
+// ================= END TEXT PATH =================
 
     // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
     try {

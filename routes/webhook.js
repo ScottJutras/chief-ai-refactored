@@ -170,12 +170,26 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
   return false;
 }
 
-async function createReminder({ ownerId, userId, taskNo, taskTitle, remindAt }) {
-  await query(
-    `insert into reminders (owner_id, user_id, task_no, title, remind_at, status, created_at)
-     values ($1, $2, $3, $4, $5::timestamptz, 'pending', now())`,
-    [ownerId, userId, taskNo, taskTitle || null, remindAt]
-  );
+async function createReminder({ ownerId, userId, taskNo, remindAt, taskTitle }) {
+  // Try schema WITH "title"; if that column doesn’t exist, fall back
+  try {
+    await query(
+      `INSERT INTO reminders (owner_id, user_id, task_no, title, remind_at, status, created_at)
+       VALUES ($1, $2, $3, $4, $5::timestamptz, 'pending', NOW())`,
+      [ownerId, userId, taskNo, taskTitle || null, remindAt]
+    );
+  } catch (e) {
+    // Postgres undefined_column error → fall back to schema WITHOUT "title"
+    if (/column\s+"?title"?\s+of\s+relation\s+"?reminders"?\s+does\s+not\s+exist/i.test(e?.message || '')) {
+      await query(
+        `INSERT INTO reminders (owner_id, user_id, task_no, remind_at, status, created_at)
+         VALUES ($1, $2, $3, $4::timestamptz, 'pending', NOW())`,
+        [ownerId, userId, taskNo, remindAt]
+      );
+    } else {
+      throw e;
+    }
+  }
 }
 /* ---------- Normalization helpers (top-level!) ---------- */
 
@@ -537,35 +551,79 @@ router.post(
             }
             // ---------- END ASSIGNMENT SHORT-CIRCUIT (AUDIO) ----------
 
-            // ---------- REMIND SHORT-CIRCUIT (TEXT) ----------
-            try {
-              const s = stripInvisible(String(input || '')).trim();
-              const lc = s.toLowerCase();
+            // ---- REMIND SHORT-CIRCUIT (explicit command) ----
+try {
+  // defensively normalize
+  const _strip = (typeof stripInvisible === 'function') ? stripInvisible : (x) => x;
+  const raw = _strip(String(input || '')).trim();
+  const lc  = raw.toLowerCase();
 
-              if (/^(remind\b|set\s+(a\s+)?reminder\b)/i.test(lc)) {
-                const tz = getUserTz(userProfile);
-                const offsetMinutes = getTzOffsetMinutes(tz);
-                const m = s.match(/(?:task\s*)?#\s*(\d+)/i);
-                const taskNo = m ? parseInt(m[1], 10) : null;
+  // e.g., "remind me about task #28 in 10 minutes", "set a reminder #5 at 7pm"
+  if (/^(remind\b|set\s+(a\s+)?reminder\b)/i.test(lc)) {
+    const tz = getUserTz(userProfile);
+    const offsetMinutes = getTzOffsetMinutes(tz);
 
-                const chrono = require('chrono-node');
-                const results = chrono.parse(s, new Date(), { timezone: offsetMinutes, forwardDate: true });
-                if (!taskNo || !results[0]) {
-                  return res.status(200).type('text/xml')
-                    .send(twiml(`Tell me which task and when. e.g.\n"remind me about task #28 in 10 minutes"`));
-                }
+    // Normalize time-y glitches: "in2min" -> "in 2 minutes", strip fillers, etc.
+    const maybeNormalized =
+      (typeof normalizeTimePhrase === 'function') ? normalizeTimePhrase(raw) : raw;
+    const cleaned =
+      (typeof cleanSpokenCommand === 'function') ? cleanSpokenCommand(maybeNormalized) : maybeNormalized;
 
-                const remindAtIso = results[0].date().toISOString();
-                await createReminder({ ownerId, userId: from, taskNo, taskTitle: `Task #${taskNo}`, remindAt: remindAtIso });
+    // Try to find an explicit task number like "#28"
+    let m = cleaned.match(/(?:task\s*)?#\s*(\d+)/i);
+    let taskNo = m ? parseInt(m[1], 10) : null;
 
-                const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
-                return res.status(200).type('text/xml')
-                  .send(twiml(`⏰ Reminder set for task #${taskNo} at ${whenStr}.`));
-              }
-            } catch (e) {
-              console.warn('[REMIND SHORT-CIRCUIT] skipped:', e?.message);
-            }
-            // ---------- END REMIND SHORT-CIRCUIT ----------
+    // If no explicit #, fall back to last known task if available
+    if (!taskNo) {
+      try {
+        const ps = await getPendingTransactionState(from);
+        if (ps?.lastTaskNo != null) taskNo = ps.lastTaskNo;
+      } catch (_) {}
+    }
+
+    // Parse a time using chrono in the user's TZ
+    const chrono = require('chrono-node');
+    const results = chrono.parse(cleaned, new Date(), { timezone: offsetMinutes, forwardDate: true });
+
+    if (!taskNo || !results[0]) {
+      return res.status(200).type('text/xml')
+        .send(twiml(
+          `Tell me which task and when. For example:\n` +
+          `• "remind me about task #28 in 10 minutes"\n` +
+          `• "set a reminder #12 at 7pm"`
+        ));
+    }
+
+    const remindAtIso = results[0].date().toISOString();
+
+    await createReminder({
+      ownerId,
+      userId: from,
+      taskNo,
+      taskTitle: `Task #${taskNo}`,
+      remindAt: remindAtIso
+    });
+
+    const whenStr = new Date(remindAtIso).toLocaleString('en-CA', { timeZone: tz });
+
+    // Log after successful insert
+    console.log('[REMINDER] created', {
+      ownerId,
+      userId: from,
+      taskNo,
+      remindAtIso,
+      whenLocal: whenStr
+    });
+
+    return res.status(200).type('text/xml')
+      .send(twiml(`⏰ Reminder set for task #${taskNo} at ${whenStr}.`));
+  }
+} catch (e) {
+  console.warn('[REMIND SHORT-CIRCUIT] skipped:', e?.message);
+}
+// ---- END REMIND SHORT-CIRCUIT ----
+
+
 
             // 🚀 IMMEDIATE TASK FAST-PATH for audio transcripts (not a question)
             try {

@@ -1621,7 +1621,7 @@ async function listMyTasks({ ownerId, userId, status = 'open' }) {
 }
 
 /**
- * Unassigned tasks for the tenant.
+ * Unassigned tasks for the tenant (inbox).
  */
 async function listInboxTasks({ ownerId, status = 'open' }) {
   const owner = _digits(ownerId);
@@ -1769,7 +1769,47 @@ async function reopenTask({ ownerId, taskNo, actorId, isOwner }) {
   throw new Error('Task not found');
 }
 
-// --- Exports ---
+/**
+ * (Restored) Current status helper used elsewhere.
+ */
+async function getCurrentStatus(ownerId, employeeName) {
+  const res = await query(
+    `
+    SELECT type, timestamp
+      FROM public.time_entries
+     WHERE owner_id = $1
+       AND employee_name = $2
+     ORDER BY timestamp DESC
+     LIMIT 2
+    `,
+    [_digits(ownerId), employeeName]
+  );
+
+  let onShift = false;
+  let onBreak = false;
+  let lastShiftStart = null;
+  let lastBreakStart = null;
+
+  for (const entry of res.rows) {
+    if (entry.type === 'punch_in') {
+      onShift = true;
+      lastShiftStart = entry.timestamp;
+      break;
+    } else if (entry.type === 'punch_out') {
+      onShift = false;
+      break;
+    } else if (entry.type === 'break_start') {
+      onBreak = true;
+      lastBreakStart = entry.timestamp;
+    } else if (entry.type === 'break_end') {
+      onBreak = false;
+    }
+  }
+
+  return { onShift, onBreak, lastShiftStart, lastBreakStart };
+}
+
+// --- Exports (ensure everything referenced elsewhere is here) ---
 module.exports = {
   pool,
   query,
@@ -1800,7 +1840,7 @@ module.exports = {
   saveUserProfile,
   getUserProfile,
   getOwnerProfile,
-  getCurrentStatus,
+  getCurrentStatus,            // ✅ restored
   parseFinancialFile,
   parseReceiptText,
   generateOTP,
@@ -1823,11 +1863,13 @@ module.exports = {
   // tasks API
   createTask,
   listMyTasks,
+  listInboxTasks,
+  listTasksForUser,
+  listAllOpenTasksByAssignee,  // ✅ export for "Team tasks"
   markTaskDone,
   reopenTask,
   createTimeEditRequestTask,
-  listInboxTasks,
-  listTasksForUser,
+
   getUserBasic,
   getUserByName,
   normalizePhoneNumber,

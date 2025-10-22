@@ -627,23 +627,80 @@ try {
   console.warn('[task-offer yes/no] skipped:', e?.message);
 }
 
+// ---------- FAST-PATH ASSIGN (text) ----------
+// Must run BEFORE the task-creation fast-path
+try {
+  // Normalize light punctuation/speech fillers if you have this helper
+  const s = typeof cleanSpokenCommand === 'function'
+    ? cleanSpokenCommand(String(input || ''))
+    : String(input || '').trim();
 
+  // Use your existing helpers (names may already be: looksLikeAssignment / parseAssignmentUtterance)
+  if (typeof looksLikeAssignment === 'function' && looksLikeAssignment(s)) {
+    // Pull context so "assign this/last" resolves to the most recent task you created
+    const prev = await getPendingTransactionState(from).catch(() => ({}));
+    const ctx = {
+      lastTaskNo: prev?.lastTaskNo || prev?.pendingReminder?.taskNo || null,
+      pendingTaskNo: prev?.pendingReminder?.taskNo || null,
+    };
 
-    // ---------- FAST-PATH TASKS (text-only) ----------
-    try {
-      const bodyTxt = String(input || '');
-      if (!mediaUrl && (/^task\b/i.test(bodyTxt) || looksLikeTask(bodyTxt))) {
-        try { await deletePendingTransactionState(from); } catch (_) {}
-        const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
-        if (!parsed) throw new Error('Could not parse task intent');
-        res.locals = res.locals || {};
-        res.locals.intentArgs = { title: parsed.title, dueAt: parsed.dueAt, assigneeName: parsed.assignee };
-        return tasksHandler(from, bodyTxt, userProfile, ownerId, ownerProfile, isOwner, res);
+    const hit = typeof parseAssignmentUtterance === 'function'
+      ? parseAssignmentUtterance(s, ctx)
+      : null;
+
+    // Expect shape: { taskNo, assigneeName } — if your helper returns { assignee }, map it to assigneeName
+    if (hit && (hit.taskNo || ctx.lastTaskNo) && (hit.assigneeName || hit.assignee)) {
+      const taskNo = hit.taskNo || ctx.lastTaskNo;
+      const assigneeName = hit.assigneeName || hit.assignee;
+
+      // Hand off to tasks handler with structured intent args
+      res.locals = res.locals || {};
+      res.locals.intentArgs = { assignTaskNo: Number(taskNo), assigneeName };
+
+      const tasksFn = getHandler && getHandler('tasks');
+      if (typeof tasksFn === 'function') {
+        // Any placeholder string is fine; the handler will read res.locals.intentArgs
+        const normalized = `task assign #${taskNo} @${assigneeName}`;
+        return tasksFn(from, normalized, userProfile, ownerId, ownerProfile, isOwner, res);
       }
-    } catch (e) {
-      console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
+
+      ensureReply(res, `⚠️ Couldn't assign task #${taskNo} right now.`);
+      return;
     }
-    // ---------- END FAST-PATH TASKS ----------
+  }
+} catch (e) {
+  console.warn('[WEBHOOK] fast-path assign failed:', e?.message);
+}
+// ---------- END FAST-PATH ASSIGN (text) ----------
+
+
+// ---------- FAST-PATH TASKS (text-only) ----------
+// Guarded so "assign ..." does not create a new task by mistake
+try {
+  const bodyTxt = String(input || '');
+  if (
+    !mediaUrl &&
+    (typeof looksLikeAssignment !== 'function' || !looksLikeAssignment(bodyTxt)) && // <-- guard
+    (/^task\b/i.test(bodyTxt) || (typeof looksLikeTask === 'function' && looksLikeTask(bodyTxt)))
+  ) {
+    try { await deletePendingTransactionState(from); } catch (_) {}
+
+    const parsed = parseTaskUtterance(bodyTxt, { tz: getUserTz(userProfile), now: new Date() });
+    if (!parsed) throw new Error('Could not parse task intent');
+
+    res.locals = res.locals || {};
+    res.locals.intentArgs = {
+      title: parsed.title,
+      dueAt: parsed.dueAt,
+      assigneeName: parsed.assignee
+    };
+
+    return tasksHandler(from, bodyTxt, userProfile, ownerId, ownerProfile, isOwner, res);
+  }
+} catch (e) {
+  console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
+}
+// ---------- END FAST-PATH TASKS ----------
 
     // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
 try {

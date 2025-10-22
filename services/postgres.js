@@ -1808,6 +1808,31 @@ async function getCurrentStatus(ownerId, employeeName) {
 
   return { onShift, onBreak, lastShiftStart, lastBreakStart };
 }
+// Create a "time edit request" task tied to a specific time entry (optional)
+async function createTimeEditRequestTask({
+  ownerId,
+  requesterId,
+  title,
+  body,
+  relatedEntryId = null,
+}) {
+  try {
+    // relies on createTask defined earlier in this file
+    const task = await createTask({
+      ownerId,
+      createdBy: requesterId,
+      assignedTo: null,               // goes to inbox by default
+      title,
+      body,
+      type: 'time_edit_request',      // so you can filter/report on these
+      relatedEntryId,                 // nullable
+    });
+    return task;
+  } catch (error) {
+    console.error('[ERROR] createTimeEditRequestTask failed:', error.message);
+    throw error;
+  }
+}
 
 // --- Exports (ensure everything referenced elsewhere is here) ---
 module.exports = {
@@ -1869,7 +1894,6 @@ module.exports = {
   markTaskDone,
   reopenTask,
   createTimeEditRequestTask,
-
   getUserBasic,
   getUserByName,
   normalizePhoneNumber,

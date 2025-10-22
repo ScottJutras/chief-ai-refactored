@@ -202,6 +202,15 @@ async function getTeamMembers(ownerId) {
   return rows || [];
 }
 
+function canDeleteTask(userProfile, from, taskRow) {
+  if (isOwnerOrBoard(userProfile)) return true;
+  const me = String(from).replace(/\D/g, '');
+  const createdBy = String(taskRow?.created_by || '').replace(/\D/g, '');
+  return me && createdBy && me === createdBy;
+}
+
+
+
 // ---------- ASSIGN PARSERS ----------
 function _looksLikeAssign(body = '') {
   return /^\s*assign\b/i.test(String(body || ''));
@@ -255,6 +264,24 @@ async function dbUpdateTaskAcceptance(ownerId, taskNo, assigneeUserId, status) {
      WHERE owner_id = $1 AND task_no = $2 AND assigned_to = $3
   `;
   await query(sql, [ownerId, Number(taskNo), assigneeUserId, status]);
+}
+// --- DB HELPERS (add/extend) ---
+async function dbGetTaskByNo(ownerId, taskNo) {
+  const sql = `
+    SELECT task_no, title, assigned_to, created_by
+    FROM public.tasks
+    WHERE owner_id = $1 AND task_no = $2
+    LIMIT 1
+  `;
+  const { rows } = await query(sql, [ownerId, Number(taskNo)]);
+  return rows[0] || null;
+}
+
+async function dbDeleteTask(ownerId, taskNo) {
+  // Best-effort: remove pending reminders for this task too
+  await query(`DELETE FROM public.reminders WHERE owner_id=$1 AND task_no=$2 AND status='pending'`, [ownerId, Number(taskNo)]);
+  const { rowCount } = await query(`DELETE FROM public.tasks WHERE owner_id=$1 AND task_no=$2`, [ownerId, Number(taskNo)]);
+  return rowCount > 0;
 }
 
 // ---------- ASSIGN FAST-PATH (MUST RUN BEFORE CREATION PATHS) ----------
@@ -506,31 +533,55 @@ if (m) {
   }
 }
 
-    // --- DONE / REOPEN
-    {
-      let m = body.match(/^(?:done|close)\s+#?(\d+)$/i);
-      if (m) {
-        const taskNo = parseInt(m[1], 10);
-        try {
-          const t = await markTaskDone({ ownerId, taskNo, actorId: from });
-          return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
-        } catch (e) {
-          if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
-          throw e;
-        }
-      }
-      m = body.match(/^reopen\s+#?(\d+)$/i);
-      if (m) {
-        const taskNo = parseInt(m[1], 10);
-        try {
-          const t = await reopenTask({ ownerId, taskNo, actorId: from });
-          return res.send(RESP(`↩️ Task #${taskNo} reopened: ${cap(t.title)}`));
-        } catch (e) {
-          if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
-          throw e;
-        }
-      }
+    // --- DONE / REOPEN / COMPLETE / FINISH ---
+{
+  // done / complete / finish / close
+  let m = body.match(/^(?:done|complete|finish|close)\s+(?:task\s*)?#?(\d+)$/i);
+  if (m) {
+    const taskNo = parseInt(m[1], 10);
+    try {
+      const t = await markTaskDone({ ownerId, taskNo, actorId: from });
+      return res.send(RESP(`✅ Task #${taskNo} marked done: ${cap(t.title)}`));
+    } catch (e) {
+      if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
+      throw e;
     }
+  }
+
+  // reopen
+  m = body.match(/^reopen\s+(?:task\s*)?#?(\d+)$/i);
+  if (m) {
+    const taskNo = parseInt(m[1], 10);
+    try {
+      const t = await reopenTask({ ownerId, taskNo, actorId: from });
+      return res.send(RESP(`↩️ Task #${taskNo} reopened: ${cap(t.title)}`));
+    } catch (e) {
+      if (e.message?.includes('Task not found')) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
+      throw e;
+    }
+  }
+}
+// --- DELETE TASK ---
+{
+  const m = body.match(/^(?:delete|remove|trash)\s+(?:task\s*)?#?(\d+)$/i);
+  if (m) {
+    const taskNo = parseInt(m[1], 10);
+
+    // Load task for permission + title
+    const t = await dbGetTaskByNo(ownerId, taskNo);
+    if (!t) return res.send(RESP(`⚠️ Task #${taskNo} not found.`));
+
+    if (!canDeleteTask(userProfile, from, t)) {
+      return res.send(RESP(`⚠️ Only the owner or the task creator can delete task #${taskNo}.`));
+    }
+
+    const ok = await dbDeleteTask(ownerId, taskNo);
+    if (!ok) return res.send(RESP(`⚠️ Couldn’t delete task #${taskNo}.`));
+
+    return res.send(RESP(`🗑️ Deleted task #${taskNo}: ${cap(t.title)}`));
+  }
+}
+
 
     // --- ASSIGN EXISTING TASK (fast-path & text) — must be BEFORE any create paths
     {
@@ -794,9 +845,9 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
     }
 
     // --- Quick help for near-misses
-    if (/^task\b/i.test(body) || /\btasks?\b/i.test(body)) {
-      return res.send(
-        RESP(
+if (/^task\b/i.test(body) || /\btasks?\b/i.test(body)) {
+  return res.send(
+    RESP(
 `Try:
 - "tasks" or "my tasks" or "my tasks done"
 - "task - buy tape" or "task buy tape for Jon due tomorrow"
@@ -805,17 +856,19 @@ Add them with "add teammate <Name> <Phone>", then try assigning again.`
 - "assign task #12 to Justin" or "assign last task to Justin"
 - "inbox tasks" (owner/board)
 - "tasks for Jon" (owner/board)
-- "done 12" or "reopen 12"`
-        )
-      );
-    }
+- "done 12" / "complete 12" / "finish 12" or "reopen 12"
+- "delete 12" or "remove task 12"`
+    )
+  );
+}
 
-    // Not handled
-    return false;
-  } catch (e) {
-    console.error('[tasks] error:', e.message);
-    return res.send(RESP('⚠️ Task error: ' + e.message + '. Please try again.'));
-  }
+// Not handled
+return false;
+} catch (e) {
+  console.error('[tasks] error:', e.message);
+  return res.send(RESP('⚠️ Task error: ' + e.message + '. Please try again.'));
+}
+
 };
 module.exports = {
   tasksHandler,               

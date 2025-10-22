@@ -171,25 +171,55 @@ async function dispatchCommands(from, input, userProfile, ownerId, ownerProfile,
 }
 
 async function createReminder({ ownerId, userId, taskNo, remindAt, taskTitle }) {
-  // Try schema WITH "title"; if that column doesn’t exist, fall back
-  try {
-    await query(
-      `INSERT INTO reminders (owner_id, user_id, task_no, title, remind_at, status, created_at)
-       VALUES ($1, $2, $3, $4, $5::timestamptz, 'pending', NOW())`,
-      [ownerId, userId, taskNo, taskTitle || null, remindAt]
-    );
-  } catch (e) {
-    // Postgres undefined_column error → fall back to schema WITHOUT "title"
-    if (/column\s+"?title"?\s+of\s+relation\s+"?reminders"?\s+does\s+not\s+exist/i.test(e?.message || '')) {
-      await query(
-        `INSERT INTO reminders (owner_id, user_id, task_no, remind_at, status, created_at)
-         VALUES ($1, $2, $3, $4::timestamptz, 'pending', NOW())`,
-        [ownerId, userId, taskNo, remindAt]
-      );
-    } else {
+  // Ordered fallbacks: full schema → no created_at → no title → minimal
+  const attempts = [
+    {
+      sql: `INSERT INTO reminders (owner_id, user_id, task_no, title, remind_at, status, created_at)
+            VALUES ($1, $2, $3, $4, $5::timestamptz, 'pending', NOW())`,
+      params: [ownerId, userId, taskNo, taskTitle || null, remindAt],
+      tolerate: [/column\s+"?title"?\s+of\s+relation/i, /column\s+"?created_at"?\s+of\s+relation/i, /column\s+"?status"?\s+of\s+relation/i],
+    },
+    {
+      sql: `INSERT INTO reminders (owner_id, user_id, task_no, title, remind_at, status)
+            VALUES ($1, $2, $3, $4, $5::timestamptz, 'pending')`,
+      params: [ownerId, userId, taskNo, taskTitle || null, remindAt],
+      tolerate: [/column\s+"?title"?\s+of\s+relation/i, /column\s+"?status"?\s+of\s+relation/i],
+    },
+    {
+      sql: `INSERT INTO reminders (owner_id, user_id, task_no, remind_at, status)
+            VALUES ($1, $2, $3, $4::timestamptz, 'pending')`,
+      params: [ownerId, userId, taskNo, remindAt],
+      tolerate: [/column\s+"?status"?\s+of\s+relation/i],
+    },
+    {
+      sql: `INSERT INTO reminders (owner_id, user_id, task_no, remind_at)
+            VALUES ($1, $2, $3, $4::timestamptz)`,
+      params: [ownerId, userId, taskNo, remindAt],
+      tolerate: [],
+    },
+  ];
+
+  let lastErr = null;
+  for (const step of attempts) {
+    try {
+      await query(step.sql, step.params);
+      // success
+      return;
+    } catch (e) {
+      const msg = e?.message || '';
+      const tolerated =
+        step.tolerate && step.tolerate.some((re) => re.test(msg));
+      if (tolerated) {
+        // try next shape
+        lastErr = e;
+        continue;
+      }
+      // not a tolerated schema error → surface it
       throw e;
     }
   }
+  // All attempts failed; surface the last one
+  if (lastErr) throw lastErr;
 }
 /* ---------- Normalization helpers (top-level!) ---------- */
 

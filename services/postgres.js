@@ -462,53 +462,118 @@ async function deletePricingItem(ownerId, itemName) {
   }
 }
 
-// --- Jobs ---
+// --- Jobs (dual-schema compatible) ---
 async function getActiveJob(ownerId) {
   try {
+    // Prefer new status, but support legacy `active = true`
     const res = await query(
-      `SELECT job_name FROM public.jobs WHERE owner_id=$1 AND active=true LIMIT 1`,
+      `
+      SELECT
+        COALESCE(name, job_name) AS name
+      FROM public.jobs
+      WHERE owner_id = $1
+        AND (
+          status = 'active'
+          OR (active IS TRUE)
+        )
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT 1
+      `,
       [ownerId]
     );
-    return res.rows[0]?.job_name || 'Uncategorized';
+    return res.rows[0]?.name || 'Uncategorized';
   } catch (error) {
     console.error('[ERROR] getActiveJob failed:', error.message);
     return 'Uncategorized';
   }
 }
 
+/**
+ * Create a job for an owner and return { id, owner_id, job_no, name, status }.
+ * Uses a per-owner advisory lock so job_no increments safely under concurrency.
+ */
 async function createJob(ownerId, jobName) {
   try {
-    await query(
-      `INSERT INTO public.jobs (owner_id, job_name, active, created_at)
-       VALUES ($1, $2, false, NOW())`,
-      [ownerId, jobName]
-    );
+    const cleanName = String(jobName || '').trim();
+    if (!ownerId || !cleanName) throw new Error('createJob requires ownerId and jobName');
+
+    const row = await withClient(async (client) => {
+      // Lock per owner to avoid job_no races
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [ownerId]);
+
+      // Next job number in this tenant
+      const next = await client.query(
+        `SELECT COALESCE(MAX(job_no), 0) + 1 AS next_no
+           FROM public.jobs
+          WHERE owner_id = $1`,
+        [ownerId]
+      );
+      const nextNo = next.rows[0]?.next_no || 1;
+
+      // Insert into BOTH schemas:
+      // - new: (owner_id, job_no, name, status)
+      // - legacy: (job_name, active, start_date)
+      const ins = await client.query(
+        `
+        INSERT INTO public.jobs
+          (owner_id, job_no, name, status, job_name, active, start_date, created_at, updated_at)
+        VALUES
+          ($1, $2, $3, 'paused', $3, false, NOW(), NOW(), NOW())
+        RETURNING id, owner_id, job_no, name, status
+        `,
+        [ownerId, nextNo, cleanName]
+      );
+
+      const created = ins.rows[0];
+      if (!created || created.job_no == null) {
+        throw new Error('Job creation succeeded but job_no is missing');
+      }
+      return created;
+    }, { useTransaction: true });
+
+    return row;
   } catch (error) {
     console.error('[ERROR] createJob failed:', error.message);
     throw error;
   }
 }
 
-async function saveJob(ownerId, jobName, startDate) {
-  try {
-    await query(
-      `INSERT INTO public.jobs (owner_id, job_name, start_date, active, created_at)
-       VALUES ($1, $2, $3, true, NOW())`,
-      [ownerId, jobName, startDate || new Date()]
-    );
-  } catch (error) {
-    console.error('[ERROR] saveJob failed:', error.message);
-    throw error;
-  }
-}
-
 async function setActiveJob(ownerId, jobName) {
   try {
-    await query(`UPDATE public.jobs SET active=false WHERE owner_id=$1`, [ownerId]);
+    const name = String(jobName || '').trim();
+    if (!ownerId || !name) throw new Error('setActiveJob requires ownerId and jobName');
+
+    // Deactivate all existing jobs for this owner (new + legacy flags)
     await query(
-      `UPDATE public.jobs SET active=true, start_date=NOW() WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName]
+      `
+      UPDATE public.jobs
+         SET status = CASE WHEN status <> 'finished' THEN 'paused' ELSE status END,
+             active = FALSE,
+             updated_at = NOW()
+       WHERE owner_id = $1
+      `,
+      [ownerId]
     );
+
+    // Activate the target job by name (match new.name OR legacy.job_name)
+    const upd = await query(
+      `
+      UPDATE public.jobs
+         SET status = 'active',
+             active = TRUE,
+             start_date = COALESCE(start_date, NOW()),
+             updated_at = NOW()
+       WHERE owner_id = $1
+         AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
+      RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status
+      `,
+      [ownerId, name]
+    );
+
+    if (upd.rowCount === 0) {
+      throw new Error(`No job found named "${name}" for this owner`);
+    }
+    return upd.rows[0];
   } catch (error) {
     console.error('[ERROR] setActiveJob failed:', error.message);
     throw error;
@@ -517,11 +582,20 @@ async function setActiveJob(ownerId, jobName) {
 
 async function finishJob(ownerId, jobName) {
   try {
+    const name = String(jobName || '').trim();
+    if (!ownerId || !name) throw new Error('finishJob requires ownerId and jobName');
+
     await query(
-      `UPDATE public.jobs
-       SET active=false, end_date=NOW()
-       WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName]
+      `
+      UPDATE public.jobs
+         SET status = 'finished',
+             active = FALSE,
+             end_date = NOW(),
+             updated_at = NOW()
+       WHERE owner_id = $1
+         AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
+      `,
+      [ownerId, name]
     );
   } catch (error) {
     console.error('[ERROR] finishJob failed:', error.message);
@@ -529,23 +603,21 @@ async function finishJob(ownerId, jobName) {
   }
 }
 
-async function finalizeJobCreation(ownerId, jobName, activate) {
-  try {
-    await createJob(ownerId, jobName);
-    if (activate) {
-      await setActiveJob(ownerId, jobName);
-    }
-  } catch (error) {
-    console.error('[ERROR] finalizeJobCreation failed:', error.message);
-    throw error;
-  }
-}
-
 async function pauseJob(ownerId, jobName) {
   try {
+    const name = String(jobName || '').trim();
+    if (!ownerId || !name) throw new Error('pauseJob requires ownerId and jobName');
+
     await query(
-      `UPDATE public.jobs SET active=false WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName]
+      `
+      UPDATE public.jobs
+         SET status = CASE WHEN status <> 'finished' THEN 'paused' ELSE status END,
+             active = FALSE,
+             updated_at = NOW()
+       WHERE owner_id = $1
+         AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
+      `,
+      [ownerId, name]
     );
   } catch (error) {
     console.error('[ERROR] pauseJob failed:', error.message);
@@ -555,9 +627,19 @@ async function pauseJob(ownerId, jobName) {
 
 async function resumeJob(ownerId, jobName) {
   try {
+    const name = String(jobName || '').trim();
+    if (!ownerId || !name) throw new Error('resumeJob requires ownerId and jobName');
+
     await query(
-      `UPDATE public.jobs SET active=true WHERE owner_id=$1 AND job_name=$2`,
-      [ownerId, jobName]
+      `
+      UPDATE public.jobs
+         SET status = 'active',
+             active = TRUE,
+             updated_at = NOW()
+       WHERE owner_id = $1
+         AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
+      `,
+      [ownerId, name]
     );
   } catch (error) {
     console.error('[ERROR] resumeJob failed:', error.message);
@@ -567,77 +649,144 @@ async function resumeJob(ownerId, jobName) {
 
 async function listOpenJobs(ownerId, limit = 3) {
   try {
-    const sql = `
-      SELECT job_name
-      FROM public.jobs
-      WHERE owner_id = $1 AND (active = true OR end_date IS NULL)
-      ORDER BY created_at DESC
-      LIMIT $2
-    `;
+    const sql =
+      `
+      SELECT COALESCE(name, job_name) AS name, job_no, status, created_at
+        FROM public.jobs
+       WHERE owner_id = $1
+         AND (status IS DISTINCT FROM 'finished' OR end_date IS NULL)
+       ORDER BY created_at DESC
+       LIMIT $2
+      `;
     const res = await query(sql, [ownerId, limit]);
-    return res.rows.map(row => ({ name: row.job_name }));
+    return res.rows.map(r => ({ name: r.name, job_no: r.job_no ?? null, status: r.status }));
   } catch (error) {
     console.error('[ERROR] listOpenJobs failed:', error.message);
     throw error;
   }
 }
 
+/**
+ * Summarize a job by name.
+ * Prefers new tables/columns (expenses/revenue/time_entries.job_no).
+ * Falls back to legacy transactions/job_name if job_no cannot be found.
+ */
 async function summarizeJob(ownerId, jobName) {
   try {
+    const name = String(jobName || '').trim();
+    if (!ownerId || !name) throw new Error('summarizeJob requires ownerId and jobName');
+
+    // Fetch the job row (get job_no + dates from either schema)
     const jobRes = await query(
-      `SELECT start_date, end_date FROM public.jobs
-       WHERE owner_id=$1 AND job_name=$2 LIMIT 1`,
-      [ownerId, jobName]
-    );
-    const { start_date, end_date } = jobRes.rows[0] || {};
-    const start = start_date ? new Date(start_date) : new Date();
-    const end = end_date ? new Date(end_date) : new Date();
-    const durationDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24));
-
-    const expRes = await query(
-      `SELECT COALESCE(SUM(amount::numeric),0) AS total_expenses
-       FROM public.transactions
-       WHERE owner_id=$1 AND job_name=$2 AND (type='expense' OR type='bill')`,
-      [ownerId, jobName]
-    );
-    const revRes = await query(
-      `SELECT COALESCE(SUM(amount::numeric),0) AS total_revenue
-       FROM public.transactions
-       WHERE owner_id=$1 AND job_name=$2 AND type='revenue'`,
-      [ownerId, jobName]
+      `
+      SELECT
+        id,
+        job_no,
+        COALESCE(name, job_name) AS name,
+        start_date,
+        end_date,
+        created_at,
+        updated_at
+      FROM public.jobs
+      WHERE owner_id = $1
+        AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
+      ORDER BY updated_at DESC, created_at DESC
+      LIMIT 1
+      `,
+      [ownerId, name]
     );
 
-    const materialCost = parseFloat(expRes.rows[0].total_expenses);
-    const revenue = parseFloat(revRes.rows[0].total_revenue);
-    const profit = revenue - materialCost;
-    const profitMargin = revenue > 0 ? profit / revenue : 0;
+    if (jobRes.rowCount === 0) {
+      throw new Error(`Job "${name}" not found`);
+    }
 
-    const timeRes = await query(
-      `SELECT COALESCE(SUM(hours),0) AS hours FROM (
-         SELECT
-           CASE
-             WHEN type = 'punch_in' THEN
-               EXTRACT(EPOCH FROM (
-                 (LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_name ORDER BY timestamp)) - timestamp
-               )) / 3600.0
-             ELSE 0
-           END AS hours
-         FROM public.time_entries
-         WHERE owner_id = $1 AND job_name = $2
-       ) x`,
-      [ownerId, jobName]
-    );
-    const labourHours = parseFloat(timeRes.rows[0].hours) || 0;
+    const j = jobRes.rows[0];
+    const start = j.start_date || j.created_at || new Date();
+    const end = j.end_date || new Date();
+    const durationDays = Math.max(1, Math.ceil((new Date(end) - new Date(start)) / (1000 * 60 * 60 * 24)));
 
+    let materialCost = 0, revenue = 0, labourHours = 0;
+
+    if (j.job_no != null) {
+      // New path: use job_no in expenses / revenue / time_entries
+      const expRes = await query(
+        `SELECT COALESCE(SUM(amount::numeric),0) AS total FROM public.expenses WHERE owner_id = $1 AND job_no = $2`,
+        [ownerId, j.job_no]
+      );
+      const revRes = await query(
+        `SELECT COALESCE(SUM(amount::numeric),0) AS total FROM public.revenue  WHERE owner_id = $1 AND job_no = $2`,
+        [ownerId, j.job_no]
+      );
+      materialCost = parseFloat(expRes.rows[0]?.total || 0);
+      revenue = parseFloat(revRes.rows[0]?.total || 0);
+
+      const timeRes = await query(
+        `
+        SELECT COALESCE(SUM(hours),0) AS hours FROM (
+          SELECT CASE
+                   WHEN type = 'punch_in' THEN
+                     EXTRACT(EPOCH FROM (
+                       LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_no ORDER BY timestamp) - timestamp
+                     )) / 3600.0
+                   ELSE 0
+                 END AS hours
+          FROM public.time_entries
+          WHERE owner_id = $1
+            AND job_no   = $2
+        ) x
+        `,
+        [ownerId, j.job_no]
+      );
+      labourHours = parseFloat(timeRes.rows[0]?.hours || 0);
+    } else {
+      // Legacy fallback: use transactions + job_name and time_entries.job_name
+      const expRes = await query(
+        `SELECT COALESCE(SUM(amount::numeric),0) AS total_expenses
+           FROM public.transactions
+          WHERE owner_id=$1 AND job_name=$2 AND (type='expense' OR type='bill')`,
+        [ownerId, name]
+      );
+      const revRes = await query(
+        `SELECT COALESCE(SUM(amount::numeric),0) AS total_revenue
+           FROM public.transactions
+          WHERE owner_id=$1 AND job_name=$2 AND type='revenue'`,
+        [ownerId, name]
+      );
+      materialCost = parseFloat(expRes.rows[0]?.total_expenses || 0);
+      revenue = parseFloat(revRes.rows[0]?.total_revenue || 0);
+
+      const timeRes = await query(
+        `
+        SELECT COALESCE(SUM(hours),0) AS hours FROM (
+          SELECT CASE
+                   WHEN type = 'punch_in' THEN
+                     EXTRACT(EPOCH FROM (
+                       LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_name ORDER BY timestamp) - timestamp
+                     )) / 3600.0
+                   ELSE 0
+                 END AS hours
+          FROM public.time_entries
+          WHERE owner_id = $1
+            AND job_name = $2
+        ) x
+        `,
+        [ownerId, name]
+      );
+      labourHours = parseFloat(timeRes.rows[0]?.hours || 0);
+    }
+
+    // Labour rate (optional)
     const rateRes = await query(
-      `SELECT unit_cost FROM public.pricing_items
-       WHERE owner_id=$1 AND category='labour' LIMIT 1`,
+      `SELECT unit_cost FROM public.pricing_items WHERE owner_id=$1 AND category='labour' LIMIT 1`,
       [ownerId]
     );
-    const labourRate = parseFloat(rateRes.rows[0]?.unit_cost) || 0;
+    const labourRate = parseFloat(rateRes.rows[0]?.unit_cost || 0);
     const labourCost = labourHours * labourRate;
 
-    return { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin };
+    const profit = revenue - (materialCost + labourCost);
+    const profitMargin = revenue > 0 ? profit / revenue : 0;
+
+    return { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin, job_no: j.job_no ?? null, name: j.name };
   } catch (error) {
     console.error('[ERROR] summarizeJob failed:', error.message);
     throw error;

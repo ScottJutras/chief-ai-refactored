@@ -114,6 +114,107 @@ function computeEmployeeSummary(rows) {
   };
 }
 
+// ---------- Job Context + Wrappers (DROP-IN) ----------
+
+const DIGITS = x => String(x || '').replace(/\D/g, '');
+
+/**
+ * Find-or-create a job by name for a tenant.
+ * Uses both `name` and legacy `job_name` for compatibility.
+ */
+async function ensureJobByName(ownerId, name) {
+  const owner = DIGITS(ownerId);
+  const jobName = String(name || '').trim();
+  if (!jobName) return null;
+
+  // try new `name`
+  let r = await query(
+    `SELECT job_no, name, active AS is_active
+       FROM public.jobs
+      WHERE owner_id = $1 AND lower(name) = lower($2)
+      LIMIT 1`,
+    [owner, jobName]
+  );
+  if (r.rowCount) return r.rows[0];
+
+  // try legacy `job_name`
+  r = await query(
+    `SELECT job_no, job_name AS name, active AS is_active
+       FROM public.jobs
+      WHERE owner_id = $1 AND lower(job_name) = lower($2)
+      LIMIT 1`,
+    [owner, jobName]
+  );
+  if (r.rowCount) return r.rows[0];
+
+  // create new active job
+  const ins = await query(
+    `INSERT INTO public.jobs (owner_id, job_name, name, active, start_date, created_at, updated_at)
+     VALUES ($1, $2, $2, true, now(), now(), now())
+     RETURNING job_no, name, active AS is_active`,
+    [owner, jobName]
+  );
+  return ins.rows[0];
+}
+
+/**
+ * Resolve a job context for create-flows.
+ * Priority: explicit name -> current active job -> optional fallback -> null/throw.
+ */
+async function resolveJobContext(ownerId, opts = {}) {
+  const owner = DIGITS(ownerId);
+  const { explicitJobName, require = false, fallbackName = null } = opts;
+
+  if (explicitJobName) {
+    const j = await ensureJobByName(owner, explicitJobName);
+    if (j) return j;
+  }
+
+  // current active job
+  const act = await query(
+    `SELECT job_no, COALESCE(name, job_name) AS name
+       FROM public.jobs
+      WHERE owner_id = $1 AND active = true
+      ORDER BY COALESCE(updated_at, created_at) DESC, job_no DESC
+      LIMIT 1`,
+    [owner]
+  );
+  if (act.rowCount) return act.rows[0];
+
+  if (fallbackName) {
+    const j = await ensureJobByName(owner, fallbackName);
+    if (j) return j;
+  }
+
+  if (require) throw new Error('No active job set');
+  return null;
+}
+
+/**
+ * Wrapper: create task while attaching job_no (if resolvable).
+ * Expects your existing createTask({ ownerId, createdBy, assignedTo, title, body, dueAt, type, jobNo }).
+ */
+async function createTaskWithJob({
+  ownerId, createdBy, assignedTo, title, body = null, dueAt = null, type = 'general', jobName = null
+}) {
+  const job = await resolveJobContext(ownerId, { explicitJobName: jobName });
+  const jobNo = job?.job_no || null;
+  console.log('[createTaskWithJob]', { ownerId, jobName, resolvedJobNo: job?.job_no });
+  return await createTask({ ownerId, createdBy, assignedTo, title, body, dueAt, type, jobNo });
+}
+
+/**
+ * Wrapper: log time while attaching job_no (if resolvable).
+ * Matches your existing logTimeEntry signature that already accepts jobNo.
+ */
+async function logTimeEntryWithJob(ownerId, employeeName, entryType, timestamp = new Date(), jobName = null, tz = null, extras = {}) {
+  const job = await resolveJobContext(ownerId, { explicitJobName: jobName });
+  const jobNo = job?.job_no || null;
+  console.log('[logTimeEntryWithJob]', { ownerId, employeeName, entryType, jobName, resolvedJobNo: job?.job_no });
+  return await logTimeEntry(ownerId, employeeName, entryType, timestamp, jobNo, tz, extras);
+}
+
+
 // ---------- OTP & verification ----------
 async function generateOTP(userId) {
   const normalizedId = normalizePhoneNumber(userId);
@@ -693,9 +794,9 @@ function enforceNoFarFuture(timestampIso) {
 async function logTimeEntry(
   ownerId,
   employeeName,
-  type,
-  timestamp,
-  jobName = null,
+  type,                 // 'punch_in' | 'punch_out' | 'break_start' | 'break_end' | ...
+  timestamp,           // ISO string
+  jobNo = null,        // <— NEW: resolved by logTimeEntryWithJob wrapper
   tz = 'America/Toronto',
   extras = {}
 ) {
@@ -707,7 +808,6 @@ async function logTimeEntry(
     }
     if (!isValidIsoTimestamp(timestamp)) throw new Error('Invalid timestamp');
     enforceNoFarFuture(timestamp);
-    if (jobName && jobName.length > 200) throw new Error('Job name too long');
 
     const ts = new Date(timestamp);
     const tsIso = ts.toISOString();
@@ -718,6 +818,11 @@ async function logTimeEntry(
     let address = extras.address ?? null;
     const createdBy = extras.requester_id || extras.created_by || null;
 
+    // Accept optional legacy name for compatibility if you still display job_name somewhere
+    const legacyJobName = extras.jobNameForLegacy || null;
+
+    // --- Dupe guard (same owner/employee/type within window) ---
+    const DUPE_WINDOW_SECONDS = 20; // keep your existing constant if defined elsewhere
     const dupeQ = `
       SELECT id
       FROM public.time_entries
@@ -731,28 +836,30 @@ async function logTimeEntry(
     const dupe = await query(dupeQ, [ownerId, employeeName, type, tsIso]);
     if (dupe.rows.length) return dupe.rows[0].id;
 
-    const hasCreatedBy = await hasCreatedByColumn();
-    let ins, params;
+    // --- Build INSERT dynamically to include created_by if column exists ---
+    const hasCreatedBy = await hasCreatedByColumn(); // you already have this helper
+    let q, params;
+
     if (hasCreatedBy) {
-      ins = `
+      q = `
         INSERT INTO public.time_entries
-          (owner_id, employee_name, type, timestamp, job_name, tz, local_time, lat, lng, address, created_by, created_at)
-        VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,$9,$10,$11,NOW())
+          (owner_id, employee_name, type, timestamp, job_no, job_name, tz, local_time, lat, lng, address, created_by, created_at)
+        VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7,$8::timestamp,$9,$10,$11,$12, now())
         RETURNING id`;
-      params = [ownerId, employeeName, type, tsIso, jobName || null, tz, localStr, lat, lng, address, createdBy];
+      params = [ownerId, employeeName, type, tsIso, jobNo, legacyJobName, tz, localStr, lat, lng, address, createdBy];
     } else {
-      ins = `
+      q = `
         INSERT INTO public.time_entries
-          (owner_id, employee_name, type, timestamp, job_name, tz, local_time, lat, lng, address, created_at)
-        VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,$9,$10,NOW())
+          (owner_id, employee_name, type, timestamp, job_no, job_name, tz, local_time, lat, lng, address, created_at)
+        VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7,$8::timestamp,$9,$10,$11, now())
         RETURNING id`;
-      params = [ownerId, employeeName, type, tsIso, jobName || null, tz, localStr, lat, lng, address];
+      params = [ownerId, employeeName, type, tsIso, jobNo, legacyJobName, tz, localStr, lat, lng, address];
     }
 
-    const { rows } = await query(ins, params);
+    const { rows } = await query(q, params);
     const insertedId = rows[0].id;
 
-    // 🔻 Lazy-load geocoder only if we need it (breaks postgres <-> geocode cycle)
+    // Lazy reverse geocode if we have lat/lng but not address
     if ((lat != null && lng != null) && !address) {
       try {
         const { reverseGeocode } = require('./geocode');
@@ -771,6 +878,7 @@ async function logTimeEntry(
     throw error;
   }
 }
+
 
 
 async function moveLastEntryToJob(ownerId, employeeName, jobName) {
@@ -1537,6 +1645,7 @@ async function getUserByName(ownerId, nameLike) {
   }
 }
 
+// DROP-IN: replaces your current createTask
 async function createTask({
   ownerId,
   createdBy,
@@ -1546,30 +1655,33 @@ async function createTask({
   type = 'general',
   relatedEntryId = null,
   dueAt = null,
+  jobNo = null,              // <— NEW (set by createTaskWithJob)
 }) {
   if (!ownerId || !createdBy || !title) throw new Error('Missing required fields');
 
+  const q = `
+    INSERT INTO public.tasks
+      (owner_id, created_by, assigned_to, title, body, status, type, related_entry_id, due_at, job_no, created_at, updated_at)
+    VALUES
+      ($1, $2, $3, $4, $5, 'open', $6, $7, $8, $9, now(), now())
+    RETURNING id, task_no, owner_id, created_by, assigned_to, title, due_at, status, type, related_entry_id, job_no, created_at, updated_at
+  `;
+
+  const params = [
+    ownerId,
+    normalizePhoneNumber(createdBy),
+    assignedTo ? normalizePhoneNumber(assignedTo) : null,
+    title,
+    body,
+    type,
+    relatedEntryId,
+    dueAt,
+    jobNo, // <— actually persisted now
+  ];
+
   try {
-    const { rows } = await query(
-      `
-      INSERT INTO public.tasks
-        (owner_id, created_by, assigned_to, title, body, status, type, related_entry_id, due_at)
-      VALUES
-        ($1, $2, $3, $4, $5, 'open', $6, $7, $8)
-      RETURNING id, task_no, owner_id, created_by, assigned_to, title, due_at, status, type, related_entry_id, created_at, updated_at
-      `,
-      [
-        ownerId,
-        normalizePhoneNumber(createdBy),
-        assignedTo ? normalizePhoneNumber(assignedTo) : null,
-        title,
-        body,
-        type,
-        relatedEntryId,
-        dueAt,
-      ]
-    );
-    return rows[0]; // includes task_no
+    const { rows } = await query(q, params);
+    return rows[0];
   } catch (error) {
     console.error('[ERROR] createTask failed:', error.message);
     throw error;
@@ -1900,4 +2012,9 @@ module.exports = {
   checkTimeEntryLimit,
   checkActorLimit,
   hasCreatedByColumn,
+  ensureJobByName,
+  resolveJobContext,
+  createTaskWithJob,
+  logTimeEntryWithJob,
+
 };

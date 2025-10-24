@@ -18,6 +18,7 @@ const {
   getEntriesBetween,
   getCurrentStatus,
   getUserByName,
+  logTimeEntryWithJob,
 } = require('../../services/postgres');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
@@ -401,10 +402,11 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userP
         /* no-op in batch pre-check */
       }
 
-      await logTimeEntry(ownerId, name, 'break_start', breakStart.toISOString(), jobName || null, tz, extras);
-      await logTimeEntry(ownerId, name, 'break_end', breakEnd.toISOString(), jobName || null, tz, extras);
-      await logTimeEntry(ownerId, name, 'break_start', lunchStart.toISOString(), jobName || null, tz, extras);
-      await logTimeEntry(ownerId, name, 'break_end', lunchEnd.toISOString(), jobName || null, tz, extras);
+      await logTimeEntryWithJob(ownerId, name, 'break_start', breakStart.toISOString(), jobName || null, tz, extras);
+      await logTimeEntryWithJob(ownerId, name, 'break_end',   breakEnd.toISOString(),   jobName || null, tz, extras);
+      await logTimeEntryWithJob(ownerId, name, 'break_start', lunchStart.toISOString(), jobName || null, tz, extras);
+      await logTimeEntryWithJob(ownerId, name, 'break_end',   lunchEnd.toISOString(),   jobName || null, tz, extras);
+
 
       whenAny ||= lunchEnd;
     }
@@ -436,8 +438,9 @@ async function handleBatchBreaksOrLunch(raw, tz, ownerId, jobName, extras, userP
         /* no-op batch pre-check */
       }
 
-      await logTimeEntry(ownerId, name, 'break_start', start.toISOString(), jobName || null, tz, extras);
-      await logTimeEntry(ownerId, name, 'break_end', end.toISOString(), jobName || null, tz, extras);
+      await logTimeEntryWithJob(ownerId, name, 'break_start', start.toISOString(), jobName || null, tz, extras);
+      await logTimeEntryWithJob(ownerId, name, 'break_end',   end.toISOString(),   jobName || null, tz, extras);
+
 
       whenAny ||= end;
     }
@@ -661,7 +664,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `${who} already has an open break started at ${fmtInTz(new Date(existingBreak.timestamp), tz)}. End it first (e.g., "${who} break end").`;
         return res.send(twiml(msg));
       }
-      await logTimeEntry(ownerId, who, 'break_start', whenUtc.toISOString(), jobName || null, tz, xtras);
+      await logTimeEntryWithJob(ownerId, who, 'break_start', whenUtc.toISOString(), jobName || null, tz, xtras);
       const reply = `✅ Break start logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(twiml(reply));
     }
@@ -701,7 +704,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       const punchOutUtcIso = t.toISOString();
 
       if (shiftStartIso) await closeOpenBreakIfAny(ownerId, employeeName, shiftStartIso, punchOutUtcIso, tz);
-      await logTimeEntry(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null, tz, xtras);
+      await logTimeEntryWithJob(ownerId, titleCase(employeeName), 'punch_out', punchOutUtcIso, jobName || null, tz, xtras);
       await clearPrompt(pending.id);
 
       const windowEntries = await getEntriesBetween(ownerId, employeeName, shiftStartIso || punchOutUtcIso, punchOutUtcIso);
@@ -884,7 +887,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `I see you’re trying to clock-in ${who}, but they weren’t clocked out from the last shift (started ${openLocal}). Reply with their clock-out time (e.g., "5:45pm yesterday").`;
         return res.send(twiml(msg));
       }
-      await logTimeEntry(ownerId, who, 'punch_in', whenIso, jobName || null, tz, xtras);
+      await logTimeEntryWithJob(ownerId, who, 'punch_in', whenIso, jobName || null, tz, xtras);
       const reply = `✅ Punch in logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(twiml(reply));
     }
@@ -896,7 +899,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       }
       const open = await getOpenShift(ownerId, who);
       await closeOpenBreakIfAny(ownerId, who, open.timestamp, whenIso, tz);
-      await logTimeEntry(ownerId, who, 'punch_out', whenIso, jobName || null, tz, xtras);
+      await logTimeEntryWithJob(ownerId, who, 'punch_out', whenIso, jobName || null, tz, xtras);
 
       const windowEntries = await getEntriesBetween(ownerId, who, open.timestamp, whenIso);
       const { shiftHours, breakMinutes } = summarizeShiftFromEntries(windowEntries, open.timestamp, whenIso);
@@ -917,7 +920,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `${who} already has an open break started at ${fmtInTz(new Date(existingBreak.timestamp), tz)}. End it first (e.g., "${who} break end").`;
         return res.send(twiml(msg));
       }
-      await logTimeEntry(ownerId, who, 'break_start', whenIso, jobName || null, tz, xtras);
+      await logTimeEntryWithJob(ownerId, who, 'break_start', whenIso, jobName || null, tz, xtras);
       const reply = `✅ Break start logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(twiml(reply));
     }
@@ -928,12 +931,12 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
         const msg = `I don’t see an open break for ${who}. Start one first (e.g., "${who} break start at 10:15").`;
         return res.send(twiml(msg));
       }
-      await logTimeEntry(ownerId, who, 'break_end', whenIso, jobName || null, tz, xtras);
+      await logTimeEntryWithJob(ownerId, who, 'break_end', whenIso, jobName || null, tz, xtras);
       const reply = `✅ Break end logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
       return res.send(twiml(reply));
     }
 
-    await logTimeEntry(ownerId, who, action, whenIso, jobName || null, tz, xtras);
+    await logTimeEntryWithJob(ownerId, who, action, whenIso, jobName || null, tz, xtras);
     const reply = `✅ ${action.replace('_', ' ')} logged for ${who} at ${fmtInTz(whenUtc, tz)}${jobName ? ` on ${jobName}` : ''}`;
     return res.send(twiml(reply));
   } catch (error) {

@@ -19,6 +19,7 @@ const {
   listTasksForUser,
   markTaskDone,
   reopenTask,
+  createTaskWithJob,
 } = require('../../services/postgres');
 const { getUserBasic, getUserByName } = require('../../services/users');
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : '');
@@ -593,15 +594,17 @@ return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
         let createdCount = 0;
         const taskNos = [];
         for (const tm of teammates) {
-          const task = await createTask({
-            ownerId,
-            createdBy: from,
-            assignedTo: tm.user_id,
-            title: titleForAll,
-            body: null,
-            type: 'general',
-            dueAt: null,
-          });
+          const task = await createTaskWithJob({
+  ownerId,
+  createdBy: from,
+  assignedTo: tm.user_id,
+  title: titleForAll,
+  body: null,
+  type: 'general',
+  dueAt: null,
+  jobName: routed?.job || state?.lastCreatedJobName || null
+});
+
           if (task?.task_no != null) {
             createdCount++;
             taskNos.push(task.task_no);
@@ -664,15 +667,17 @@ return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
         }
       }
 
-      const task = await createTask({
-        ownerId,
-        createdBy: from,
-        assignedTo: resolvedAssignee,
-        title,
-        body: null,
-        type: 'general',
-        dueAt: routed.dueAt || null,
-      });
+      const task = await createTaskWithJob({
+  ownerId,
+  createdBy: from,
+  assignedTo: resolvedAssignee,
+  title,
+  body: null,
+  type: 'general',
+  dueAt: routed.dueAt || null,
+  jobName: routed?.job || state?.lastCreatedJobName || null
+});
+
 
       if (!task || task.task_no == null) {
         console.error('[tasks] createTask failed: missing task_no');
@@ -807,15 +812,17 @@ if (/^\s*task\s*#?\s*\d+\s+(?:(?:is|id|\'s|’s)\s+)?(?:complete|completed|done|
           assigneeLabel = userProfile?.name || from;
         }
 
-        const task = await createTask({
-          ownerId,
-          createdBy: from,
-          assignedTo: resolvedAssignee,
-          title,
-          body: null,
-          type: 'general',
-          dueAt,
-        });
+        const task = await createTaskWithJob({
+  ownerId,
+  createdBy: from,
+  assignedTo: resolvedAssignee,
+  title,
+  body: null,
+  type: 'general',
+  dueAt,
+  jobName: routed?.job || state?.lastCreatedJobName || null
+});
+
 
         if (!task || task.task_no == null) {
           console.error('[tasks] createTask failed: missing task_no');
@@ -1047,15 +1054,17 @@ return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
         let createdCount = 0;
         const taskNos = [];
         for (const tm of teammates) {
-          const task = await createTask({
-            ownerId,
-            createdBy: from,
-            assignedTo: tm.user_id,
-            title: titleForAll,
-            body: null,
-            type: 'general',
-            dueAt: null,
-          });
+          const task = await createTaskWithJob({
+  ownerId,
+  createdBy: from,
+  assignedTo: tm.user_id,
+  title: titleForAll,
+  body: null,
+  type: 'general',
+  dueAt: null,
+  jobName: routed?.job || state?.lastCreatedJobName || null
+});
+
           createdCount++;
           taskNos.push(task.task_no);
 
@@ -1113,15 +1122,16 @@ return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
         }
       }
 
-      const task = await createTask({
-        ownerId,
-        createdBy: from,
-        assignedTo: resolvedAssignee,
-        title,
-        body: null,
-        type: 'general',
-        dueAt: routed.dueAt || null,
-      });
+      const task = await createTaskWithJob({
+  ownerId,
+  createdBy: from,
+  assignedTo: resolvedAssignee,
+  title,
+  body: null,
+  type: 'general',
+  dueAt: routed.dueAt || null,
+  jobName: routed?.job || state?.lastCreatedJobName || null
+});
 
       let reply = `✅ Task #${task.task_no} created: ${cap(task.title)}`;
       if (resolvedAssignee !== from) {
@@ -1250,15 +1260,17 @@ return res.send(RESP(`🗑️ Task #${taskNo} deleted.`));
       assigneeLabel = userProfile?.name || from;
     }
 
-    const task = await createTask({
-      ownerId,
-      createdBy: from,
-      assignedTo: resolvedAssignee,
-      title,
-      body: null,
-      type: 'general',
-      dueAt,
-    });
+    const task = await createTaskWithJob({
+  ownerId,
+  createdBy: from,
+  assignedTo: resolvedAssignee,
+  title,
+  body: null,
+  type: 'general',
+  dueAt,
+  jobName: routed?.job || state?.lastCreatedJobName || null
+});
+
 
     if (!task || task.task_no == null) {
       console.error('[tasks] createTask failed: missing task_no');

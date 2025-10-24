@@ -110,31 +110,32 @@ async function handleJob(from, input, userProfile, ownerId, ownerProfile, isOwne
   }
 
   if (wantsCreate) {
-    const jobName = state.jobFlow.name;
-    delete state.jobFlow;
-    try {
-      const job = await createJob(ownerId, jobName);
-      if (!job || job.job_no == null) throw new Error('Job creation succeeded but job_no is missing');
+  const jobName = state.jobFlow.name;
+  delete state.jobFlow;
+  try {
+    const job = await createJob(ownerId, jobName);
+    if (!job || job.job_no == null) throw new Error('Job creation succeeded but job_no is missing');
 
-      // Immediately set active (your template says "Starting job …")
-      await setActiveJob(ownerId, jobName);
+    // Immediately set active (template says "Starting job …")
+    await setActiveJob(ownerId, jobName);
 
-      state.lastCreatedJobName = jobName;
-      state.lastCreatedJobNo = job.job_no;
-      await setPendingTransactionState(from, state);
+    // Save context + clean any stale reminder
+    state.lastCreatedJobName = jobName;
+    state.lastCreatedJobNo = job.job_no;
+    if (state.pendingReminder) delete state.pendingReminder;
+    await setPendingTransactionState(from, state);
 
-      // Confirmation back (plain text is fine now; we already used the template above)
-      await sendQuickReply(
-        from,
-        `▶️ Job #${job.job_no} (${cap(jobName)}) is now active.\nYou can Clock in, add Expenses, log Hours, Pause/Finish when done.`,
-        ['Clock in', 'Add expense', 'Log hours', 'Pause job', 'Finish job', 'Dashboard']
-      );
-    } catch (err) {
-      console.error('[ERROR] createJob failed:', err?.message);
-      await sendMessage(from, `⚠️ I couldn't create "${cap(state.jobFlow?.name || 'that job')}". Try a different name.`);
-    }
-    return ack(res);
+    await sendQuickReply(
+      from,
+      `▶️ Job #${job.job_no} (${cap(jobName)}) is now active.\nYou can Clock in, add Expenses, log Hours, Pause/Finish when done.`,
+      ['Clock in', 'Add expense', 'Log hours', 'Pause job', 'Finish job', 'Dashboard']
+    );
+  } catch (err) {
+    console.error('[ERROR] createJob failed:', err?.message);
+    await sendMessage(from, `⚠️ I couldn't create "${cap(jobName)}". Try a different name.`);
   }
+  return ack(res);
+}
 
   // Still waiting — send your Twilio template quick reply
   await sendTemplateQuickReply(from, {
@@ -148,6 +149,10 @@ async function handleJob(from, input, userProfile, ownerId, ownerProfile, isOwne
 const createdName = parseCreateJob(msg);
 if (createdName) {
   state.jobFlow = { action: 'create', name: createdName };
+
+  // 🔧 Optional hygiene: clear any old reminder prompt now
+  if (state.pendingReminder) delete state.pendingReminder;
+
   await setPendingTransactionState(from, state);
 
   await sendTemplateQuickReply(from, {

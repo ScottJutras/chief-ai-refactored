@@ -1106,8 +1106,18 @@ try {
   const pendingState = await getPendingTransactionState(from);
   const isTextOnly = !mediaUrl && !!input;
 
-  if (pendingState?.pendingReminder && isTextOnly) {
-    const { pendingReminder } = pendingState; // <-- you need this
+  // 🚫 NEW: if a job create/confirm flow is in progress, do NOT let reminders intercept
+  if (
+    isTextOnly &&
+    pendingState?.jobFlow &&
+    pendingState.jobFlow.action === 'create' &&
+    pendingState.jobFlow.name
+  ) {
+    console.log('[REMINDER] skip: jobFlow active → letting job handler process:', input);
+    // Just fall through and let downstream routers/handlers take this message.
+  } else if (pendingState?.pendingReminder && isTextOnly) {
+    // (existing logic) Only run the reminder intercept when no jobFlow is active
+    const { pendingReminder } = pendingState;
     console.log('[REMINDER] intercept for', from, 'input =', input);
 
     // 1) Normalize common voice-typo patterns like "in2min" → "in 2 minutes"
@@ -1414,10 +1424,13 @@ try {
 // === CONTEXTUAL HELP (FAQ intercept) — must run BEFORE generic helpers/NLP ===
 try {
   const pending = await getPendingTransactionState(from).catch(() => null);
-  if (pending?.helpTopic?.key && looksLikeHelpFollowup(input)) {
+
+  // 👇 Guard: do not intercept while job confirmation is active
+  if (pending?.jobFlow && pending.jobFlow.action === 'create' && pending.jobFlow.name) {
+    // fall through to normal router
+  } else if (pending?.helpTopic?.key && looksLikeHelpFollowup(input)) {
     const { key, context } = pending.helpTopic;
     const article = HELP_ARTICLES[key];
-
     if (typeof article === 'function') {
       try { await setPendingTransactionState(from, { ...pending, helpTopic: null }); } catch {}
       return res.status(200).type('text/xml').send(twiml(article(context)));

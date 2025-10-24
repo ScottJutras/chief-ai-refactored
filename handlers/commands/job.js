@@ -87,81 +87,84 @@ function summarizeToText(name, s) {
 // -----------------------------
 // Main handler
 // -----------------------------
-async function handleJob(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
-  const msg = String(input || '').trim();
-  const state = (await getPendingTransactionState(from)) || {};
-
-  if (state.jobFlow && state.jobFlow.action === 'create' && state.jobFlow.name) {
-  const wantsCreate = /^(create|yes|y|confirm|ok|👍)$/i.test(msg);
-  const wantsCancel = /^(cancel|no|n|stop|abort|✖️)$/i.test(msg);
+// 1) Pending "create job" confirmation
+if (state.jobFlow && state.jobFlow.action === 'create' && state.jobFlow.name) {
+  const wantsCreate = /^(create|yes|y|confirm|ok|okay|👍)$/i.test(msg);
+  const wantsCancel = /^(cancel|no|n|stop|abort|✖️|❌)$/i.test(msg);
   const wantsEdit   = /^(edit|change|rename)$/i.test(msg);
 
   if (wantsCancel) {
     delete state.jobFlow;
+    // hygiene: also clear any leftover reminder prompt to avoid later intercepts
+    if (state.pendingReminder) delete state.pendingReminder;
     await setPendingTransactionState(from, state);
     await sendMessage(from, `❌ Got it — I won't create that job.`);
     return ack(res);
   }
 
   if (wantsEdit) {
-    // Ask for the new name; stay in the flow
+    // Keep jobFlow, ask for new name explicitly
     await sendMessage(from, `What should I rename it to? Reply "create job <new name>" or just the name.`);
     return ack(res);
   }
 
   if (wantsCreate) {
-  const jobName = state.jobFlow.name;
-  delete state.jobFlow;
-  try {
-    const job = await createJob(ownerId, jobName);
-    if (!job || job.job_no == null) throw new Error('Job creation succeeded but job_no is missing');
+    const jobName = state.jobFlow.name;
+    delete state.jobFlow;
+    if (state.pendingReminder) delete state.pendingReminder; // belt & suspenders
+    try {
+      const job = await createJob(ownerId, jobName);
+      if (!job || job.job_no == null) throw new Error('Job creation succeeded but job_no is missing');
 
-    // Immediately set active (template says "Starting job …")
-    await setActiveJob(ownerId, jobName);
+      // Make it active immediately (your template copy says “Starting job …”)
+      await setActiveJob(ownerId, jobName);
 
-    // Save context + clean any stale reminder
-    state.lastCreatedJobName = jobName;
-    state.lastCreatedJobNo = job.job_no;
-    if (state.pendingReminder) delete state.pendingReminder;
-    await setPendingTransactionState(from, state);
+      // Save last-created for convenience
+      state.lastCreatedJobName = jobName;
+      state.lastCreatedJobNo = job.job_no;
+      await setPendingTransactionState(from, state);
 
-    await sendQuickReply(
-      from,
-      `▶️ Job #${job.job_no} (${cap(jobName)}) is now active.\nYou can Clock in, add Expenses, log Hours, Pause/Finish when done.`,
-      ['Clock in', 'Add expense', 'Log hours', 'Pause job', 'Finish job', 'Dashboard']
-    );
-  } catch (err) {
-    console.error('[ERROR] createJob failed:', err?.message);
-    await sendMessage(from, `⚠️ I couldn't create "${cap(jobName)}". Try a different name.`);
+      // Follow-up quick actions (plain quick reply — NOT a reminder)
+      await sendQuickReply(
+        from,
+        `▶️ Job #${job.job_no} (${cap(jobName)}) is now active.\nYou can Clock in, add Expenses, log Hours, Pause/Finish when done.`,
+        ['Clock in', 'Add expense', 'Log hours', 'Pause job', 'Finish job']
+      );
+    } catch (err) {
+      console.error('[ERROR] createJob failed:', err?.message);
+      await sendMessage(from, `⚠️ I couldn't create "${cap(state.jobFlow?.name || jobName || 'that job')}". Try a different name.`);
+    }
+    return ack(res);
   }
+
+  // Still waiting — re-send the template (always pass explicit var { '1': jobName })
+  await sendTemplateQuickReply(
+    from,
+    'HXd14a878175fd4b24cee0c0ca6061da96',
+    { '1': cap(state.jobFlow.name) }
+  );
   return ack(res);
 }
 
-  // Still waiting — send your Twilio template quick reply
-  await sendTemplateQuickReply(from, {
-    templateId: 'HXd14a878175fd4b24cee0c0ca6061da96', // hex_start_job
-    text: startJobTemplateText(state.jobFlow.name),
-    buttons: ['Yes', 'Edit', 'No'],
-  });
-  return ack(res);
-}
-  // 2) New "create job ..." request
+// 2) New "create job ..." request
 const createdName = parseCreateJob(msg);
 if (createdName) {
   state.jobFlow = { action: 'create', name: createdName };
 
-  // 🔧 Optional hygiene: clear any old reminder prompt now
+  // hygiene: clear any old reminder prompt now so it never intercepts this flow
   if (state.pendingReminder) delete state.pendingReminder;
 
   await setPendingTransactionState(from, state);
 
-  await sendTemplateQuickReply(from, {
-    templateId: 'HXd14a878175fd4b24cee0c0ca6061da96', // hex_start_job
-    text: startJobTemplateText(createdName),
-    buttons: ['Yes', 'Edit', 'No'],
-  });
+  // Send the *template* with explicit { '1': job name }
+  await sendTemplateQuickReply(
+    from,
+    'HXd14a878175fd4b24cee0c0ca6061da96',
+    { '1': cap(createdName) }
+  );
   return ack(res);
 }
+
 
   // 3) Verb-based commands: start/pause/resume/finish/summarize
   const parsed = parseVerbJob(msg);

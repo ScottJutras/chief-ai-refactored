@@ -19,30 +19,19 @@ const client = twilio(
 );
 
 // -------- Template shapes (whitelist) --------
-// Keys are Twilio Content SIDs. Values are the numbered placeholders the template expects.
 const TEMPLATE_VAR_SHAPES = {
-  // Location confirm example you already had:
-  'HX0280df498999848aaff04cc079e16c31': ['1', '2'],
-
-  // Start Job template (hex_start_job)
-  // Body:
-  //   Starting job '{{1}}'. All entries will be assigned to this job until you say 'go to job (Name) or 'New job'. Confirm?
-  // Buttons: Yes, Edit, No
-  'HXd14a878175fd4b24cee0c0ca6061da96': ['1'],
+  'HX0280df498999848aaff04cc079e16c31': ['1', '2'], // location confirm
+  'HXd14a878175fd4b24cee0c0ca6061da96': ['1'],      // hex_start_job: {{1}} = job name
 };
 
-// Normalize to WhatsApp E.164 every time
 function wa(to) {
   const raw = String(to || '').replace(/^whatsapp:/i, '').trim();
   const e164 = raw.startsWith('+') ? raw : `+${raw}`;
   return `whatsapp:${e164}`;
 }
 
-// -------- helper to coerce/shape variables --------
 function shapeTemplateVars(contentSid, inputVars = {}) {
   const allowed = TEMPLATE_VAR_SHAPES[contentSid];
-
-  // Convert array form → object {"1": "...","2":"..."} while preserving order
   let vars = {};
   if (Array.isArray(inputVars)) {
     inputVars.forEach((v, i) => { vars[String(i + 1)] = v; });
@@ -63,14 +52,13 @@ function shapeTemplateVars(contentSid, inputVars = {}) {
     return shaped;
   }
 
-  // Unknown template shape → coerce all values to strings
   for (const k of Object.keys(vars)) {
     vars[k] = (vars[k] == null) ? '' : String(vars[k]);
   }
   return vars;
 }
 
-// ---------------- base senders ----------------
+// ---- base senders
 async function sendMessage(to, body) {
   try {
     const message = await client.messages.create({
@@ -102,7 +90,7 @@ async function sendQuickReply(to, body, replies = []) {
   }
 }
 
-// -------- template sender (kept as-is, with shaping) --------
+// ---- template senders
 async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
   try {
     if (!contentSid) throw new Error('Missing ContentSid');
@@ -124,53 +112,28 @@ async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
   }
 }
 
-// -------- NEW: high-level helper for template quick replies --------
-// Uses a real Content Template if provided (buttons come from the template).
-// If anything is missing/fails, falls back to a standard quick-reply (text + buttons).
-async function sendTemplateQuickReply(
-  to,
-  {
-    templateId,            // Content SID (e.g., HXd14a... for hex_start_job)
-    text = '',             // optional fallback text (also used to infer vars when needed)
-    buttons = [],          // optional fallback quick-reply buttons
-    variables = {},        // optional map or array for template placeholders
-    forceFallback = false, // set true to skip template usage and send a plain quick reply
-  } = {}
-) {
-  try {
-    if (!forceFallback && templateId) {
-      let vars = variables;
-
-      // If no variables provided but we know the template needs {{1}},
-      // try to infer from the text "Starting job 'XYZ'..."
-      if ((!vars || (Array.isArray(vars) && vars.length === 0) || (typeof vars === 'object' && Object.keys(vars).length === 0))
-          && templateId === 'HXd14a878175fd4b24cee0c0ca6061da96'
-          && typeof text === 'string' && text) {
-        const m = text.match(/Starting job\s+['"]([^'"]+)['"]/i);
-        if (m && m[1]) {
-          // We’ll pass as object {"1": "<job name>"} so shapeTemplateVars can validate
-          vars = { '1': m[1] };
-          console.log('[DEBUG] Inferred template var {1} from text for hex_start_job:', m[1]);
-        }
-      }
-
-      // Shape & send as a true template
-      const shaped = shapeTemplateVars(templateId, vars || {});
-      return await sendTemplateMessage(to, templateId, shaped);
-    }
-
-    // Fallback – normal quick reply (non-template)
-    return await sendQuickReply(to, text, buttons);
-  } catch (err) {
-    console.warn('[WARN] sendTemplateQuickReply fell back to quick reply:', err?.message);
-    // Last-resort fallback
-    return await sendQuickReply(to, text, buttons);
+// ✅ Simple template quick-reply: (to, contentSid, { '1': value, ... })
+async function sendTemplateQuickReply(to, contentSid, contentVariablesObj) {
+  if (!contentSid) throw new Error('Missing ContentSid for template');
+  if (!contentVariablesObj || typeof contentVariablesObj !== 'object') {
+    throw new Error('contentVariables must be an object map like {"1":"..."}');
   }
+  const shaped = shapeTemplateVars(contentSid, contentVariablesObj);
+  console.log('[DEBUG] sendTemplateQuickReply', { contentSid, shaped });
+
+  const message = await client.messages.create({
+    contentSid,
+    contentVariables: JSON.stringify(shaped),
+    from: process.env.TWILIO_WHATSAPP_NUMBER,
+    to: wa(to),
+  });
+  console.log(`[✅ SUCCESS] Template quick-reply sent: ${message.sid} -> ${wa(to)} contentSid=${contentSid}`);
+  return message.sid;
 }
 
 module.exports = {
   sendMessage,
   sendQuickReply,
   sendTemplateMessage,
-  sendTemplateQuickReply, // <— new export
+  sendTemplateQuickReply,
 };

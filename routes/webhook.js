@@ -1101,6 +1101,30 @@ try {
   console.warn('[WEBHOOK] fast-path tasks failed:', e?.message);
 }
 
+// === JOB CONFIRM SHORT-CIRCUIT (must be early) ===
+try {
+  const pending = await getPendingTransactionState(from).catch(() => null);
+  const isTextOnly = !mediaUrl && !!input;
+  if (
+    isTextOnly &&
+    pending?.jobFlow &&
+    pending.jobFlow.action === 'create' &&
+    pending.jobFlow.name
+  ) {
+    const lc = String(input || '').trim().toLowerCase();
+    const yes  = /^(yes|y|create|ok|okay|👍)$/i.test(lc);
+    const no   = /^(no|n|cancel|stop|abort|✖️|❌)$/i.test(lc);
+    const edit = /^(edit|change|rename)$/i.test(lc);
+
+    if (yes || no || edit) {
+      await handleJob(from, input, userProfile, ownerId, ownerProfile, isOwner, res);
+      return; // do not let any other intercept/router process this
+    }
+  }
+} catch (e) {
+  console.warn('[JOB CONFIRM INTERCEPT] failed:', e?.message);
+}
+
  // === REMINDERS-FIRST & PENDING SHORT-CIRCUITS ===
 try {
   const pendingState = await getPendingTransactionState(from);

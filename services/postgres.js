@@ -462,25 +462,23 @@ async function deletePricingItem(ownerId, itemName) {
   }
 }
 
-// --- Jobs (dual-schema compatible) ---
+// --- Jobs (new/compat) ---
 async function getActiveJob(ownerId) {
   try {
-    // Prefer new status, but support legacy `active = true`
-    const res = await query(
-      `
-      SELECT
-        COALESCE(name, job_name) AS name
-      FROM public.jobs
-      WHERE owner_id = $1
-        AND (
-          status = 'active'
-          OR (active IS TRUE)
-        )
-      ORDER BY updated_at DESC, created_at DESC
-      LIMIT 1
-      `,
-      [ownerId]
-    );
+    const sql = `
+      SELECT job_no,
+             COALESCE(name, job_name) AS name,
+             status,
+             active
+        FROM public.jobs
+       WHERE owner_id = $1
+         AND (status = 'active' OR active = true)
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC
+       LIMIT 1
+    `;
+    const res = await query(sql, [ownerId]);
+    // Back-compat: many callers expect just a string; keep that behavior if needed.
+    // Prefer returning a string name (fallback "Uncategorized") because your older code uses it.
     return res.rows[0]?.name || 'Uncategorized';
   } catch (error) {
     console.error('[ERROR] getActiveJob failed:', error.message);
@@ -489,177 +487,198 @@ async function getActiveJob(ownerId) {
 }
 
 /**
- * Create a job for an owner and return { id, owner_id, job_no, name, status }.
- * Uses a per-owner advisory lock so job_no increments safely under concurrency.
+ * Create a job with a new sequential job_no for the owner.
+ * Populates BOTH (name, status) and legacy (job_name, active/start_date) to stay compatible.
+ * Returns: { id, owner_id, job_no, name, status }
  */
 async function createJob(ownerId, jobName) {
   try {
-    const cleanName = String(jobName || '').trim();
-    if (!ownerId || !cleanName) throw new Error('createJob requires ownerId and jobName');
+    // 1) Compute next job_no per owner
+    const nextNoSql = `
+      SELECT COALESCE(MAX(job_no), 0) + 1 AS next_no
+        FROM public.jobs
+       WHERE owner_id = $1
+    `;
+    const nextNoRes = await query(nextNoSql, [ownerId]);
+    const jobNo = Number(nextNoRes.rows[0]?.next_no || 1);
 
-    const row = await withClient(async (client) => {
-      // Lock per owner to avoid job_no races
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [ownerId]);
-
-      // Next job number in this tenant
-      const next = await client.query(
-        `SELECT COALESCE(MAX(job_no), 0) + 1 AS next_no
-           FROM public.jobs
-          WHERE owner_id = $1`,
-        [ownerId]
-      );
-      const nextNo = next.rows[0]?.next_no || 1;
-
-      // Insert into BOTH schemas:
-      // - new: (owner_id, job_no, name, status)
-      // - legacy: (job_name, active, start_date)
-      const ins = await client.query(
-        `
-        INSERT INTO public.jobs
-          (owner_id, job_no, name, status, job_name, active, start_date, created_at, updated_at)
-        VALUES
-          ($1, $2, $3, 'paused', $3, false, NOW(), NOW(), NOW())
-        RETURNING id, owner_id, job_no, name, status
-        `,
-        [ownerId, nextNo, cleanName]
-      );
-
-      const created = ins.rows[0];
-      if (!created || created.job_no == null) {
-        throw new Error('Job creation succeeded but job_no is missing');
-      }
-      return created;
-    }, { useTransaction: true });
-
-    return row;
+    // 2) Insert new row. Use explicit, non-ambiguous params so Postgres doesn't try to infer mixed types.
+    const insSql = `
+      INSERT INTO public.jobs (
+        owner_id, job_no, name, job_name, status, active, start_date, created_at, updated_at
+      )
+      VALUES ($1, $2::int, $3::text, $3::text, 'active', true, NOW(), NOW(), NOW())
+      ON CONFLICT (owner_id, job_no) DO UPDATE
+         SET name       = EXCLUDED.name,
+             job_name   = EXCLUDED.job_name,
+             status     = 'active',
+             active     = true,
+             start_date = COALESCE(public.jobs.start_date, NOW()),
+             updated_at = NOW()
+      RETURNING id, owner_id, job_no, name, status
+    `;
+    const insRes = await query(insSql, [ownerId, jobNo, jobName]);
+    return insRes.rows[0];
   } catch (error) {
     console.error('[ERROR] createJob failed:', error.message);
     throw error;
   }
 }
 
-async function setActiveJob(ownerId, jobName) {
-  try {
-    const name = String(jobName || '').trim();
-    if (!ownerId || !name) throw new Error('setActiveJob requires ownerId and jobName');
+/**
+ * Find a job record by name or job_no.
+ * Accepts strings; matches name OR legacy job_name OR numeric job_no.
+ * Returns the row (or null).
+ */
+async function findJob(ownerId, identifier) {
+  const name = String(identifier || '').trim();
+  const maybeNo = Number.isFinite(+name) ? parseInt(name, 10) : null;
 
-    // Deactivate all existing jobs for this owner (new + legacy flags)
+  const sql = `
+    SELECT id, owner_id, job_no, COALESCE(name, job_name) AS name, status, active
+      FROM public.jobs
+     WHERE owner_id = $1
+       AND (
+             ($2::text IS NOT NULL AND (name = $2::text OR job_name = $2::text))
+             OR ($3::int IS NOT NULL AND job_no = $3::int)
+           )
+     ORDER BY updated_at DESC NULLS LAST, created_at DESC
+     LIMIT 1
+  `;
+  const res = await query(sql, [ownerId, name || null, maybeNo]);
+  return res.rows[0] || null;
+}
+
+/**
+ * Mark a job active (by name or number). If it doesn't exist yet, create then activate.
+ */
+async function setActiveJob(ownerId, nameOrNo) {
+  try {
+    // Make everything else inactive first
     await query(
-      `
-      UPDATE public.jobs
-         SET status = CASE WHEN status <> 'finished' THEN 'paused' ELSE status END,
-             active = FALSE,
-             updated_at = NOW()
-       WHERE owner_id = $1
-      `,
+      `UPDATE public.jobs SET active = false, status = CASE WHEN status='active' THEN 'paused' ELSE status END, updated_at = NOW()
+        WHERE owner_id = $1`,
       [ownerId]
     );
 
-    // Activate the target job by name (match new.name OR legacy.job_name)
-    const upd = await query(
-      `
+    // Try to find existing
+    let job = await findJob(ownerId, nameOrNo);
+
+    // If missing, create it
+    if (!job) {
+      job = await createJob(ownerId, String(nameOrNo || '').trim());
+    }
+
+    // Activate this one (set both new & legacy fields)
+    const sql = `
       UPDATE public.jobs
-         SET status = 'active',
-             active = TRUE,
+         SET active = true,
+             status = 'active',
              start_date = COALESCE(start_date, NOW()),
              updated_at = NOW()
        WHERE owner_id = $1
-         AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
+         AND job_no   = $2
       RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status
-      `,
-      [ownerId, name]
-    );
-
-    if (upd.rowCount === 0) {
-      throw new Error(`No job found named "${name}" for this owner`);
-    }
-    return upd.rows[0];
+    `;
+    const r = await query(sql, [ownerId, job.job_no]);
+    return r.rows[0] || job;
   } catch (error) {
     console.error('[ERROR] setActiveJob failed:', error.message);
     throw error;
   }
 }
 
-async function finishJob(ownerId, jobName) {
+async function pauseJob(ownerId, nameOrNo) {
   try {
-    const name = String(jobName || '').trim();
-    if (!ownerId || !name) throw new Error('finishJob requires ownerId and jobName');
+    const job = await findJob(ownerId, nameOrNo);
+    if (!job) return null;
 
-    await query(
-      `
+    const sql = `
       UPDATE public.jobs
-         SET status = 'finished',
-             active = FALSE,
-             end_date = NOW(),
+         SET active = false,
+             status = 'paused',
              updated_at = NOW()
        WHERE owner_id = $1
-         AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
-      `,
-      [ownerId, name]
-    );
-  } catch (error) {
-    console.error('[ERROR] finishJob failed:', error.message);
-    throw error;
-  }
-}
-
-async function pauseJob(ownerId, jobName) {
-  try {
-    const name = String(jobName || '').trim();
-    if (!ownerId || !name) throw new Error('pauseJob requires ownerId and jobName');
-
-    await query(
-      `
-      UPDATE public.jobs
-         SET status = CASE WHEN status <> 'finished' THEN 'paused' ELSE status END,
-             active = FALSE,
-             updated_at = NOW()
-       WHERE owner_id = $1
-         AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
-      `,
-      [ownerId, name]
-    );
+         AND job_no   = $2
+      RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status
+    `;
+    const r = await query(sql, [ownerId, job.job_no]);
+    return r.rows[0] || null;
   } catch (error) {
     console.error('[ERROR] pauseJob failed:', error.message);
     throw error;
   }
 }
 
-async function resumeJob(ownerId, jobName) {
+async function resumeJob(ownerId, nameOrNo) {
   try {
-    const name = String(jobName || '').trim();
-    if (!ownerId || !name) throw new Error('resumeJob requires ownerId and jobName');
+    const job = await findJob(ownerId, nameOrNo);
+    if (!job) return null;
 
+    // Make others inactive; keep behavior consistent with "only one active"
     await query(
-      `
+      `UPDATE public.jobs SET active = false, status = CASE WHEN status='active' THEN 'paused' ELSE status END, updated_at = NOW()
+        WHERE owner_id = $1`,
+      [ownerId]
+    );
+
+    const sql = `
       UPDATE public.jobs
-         SET status = 'active',
-             active = TRUE,
+         SET active = true,
+             status = 'active',
              updated_at = NOW()
        WHERE owner_id = $1
-         AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
-      `,
-      [ownerId, name]
-    );
+         AND job_no   = $2
+      RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status
+    `;
+    const r = await query(sql, [ownerId, job.job_no]);
+    return r.rows[0] || null;
   } catch (error) {
     console.error('[ERROR] resumeJob failed:', error.message);
     throw error;
   }
 }
 
+async function finishJob(ownerId, nameOrNo) {
+  try {
+    const job = await findJob(ownerId, nameOrNo);
+    if (!job) return null;
+
+    const sql = `
+      UPDATE public.jobs
+         SET active = false,
+             status = 'finished',
+             end_date = NOW(),
+             updated_at = NOW()
+       WHERE owner_id = $1
+         AND job_no   = $2
+      RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status, end_date
+    `;
+    const r = await query(sql, [ownerId, job.job_no]);
+    return r.rows[0] || null;
+  } catch (error) {
+    console.error('[ERROR] finishJob failed:', error.message);
+    throw error;
+  }
+}
+
 async function listOpenJobs(ownerId, limit = 3) {
   try {
-    const sql =
-      `
-      SELECT COALESCE(name, job_name) AS name, job_no, status, created_at
+    const sql = `
+      SELECT job_no, COALESCE(name, job_name) AS name, status, active
         FROM public.jobs
        WHERE owner_id = $1
-         AND (status IS DISTINCT FROM 'finished' OR end_date IS NULL)
-       ORDER BY created_at DESC
+         AND (status <> 'finished' OR end_date IS NULL)
+       ORDER BY active DESC, updated_at DESC NULLS LAST, created_at DESC
        LIMIT $2
-      `;
+    `;
     const res = await query(sql, [ownerId, limit]);
-    return res.rows.map(r => ({ name: r.name, job_no: r.job_no ?? null, status: r.status }));
+    return res.rows.map(r => ({
+      job_no: r.job_no,
+      name: r.name,
+      status: r.status,
+      active: r.active,
+    }));
   } catch (error) {
     console.error('[ERROR] listOpenJobs failed:', error.message);
     throw error;
@@ -667,134 +686,104 @@ async function listOpenJobs(ownerId, limit = 3) {
 }
 
 /**
- * Summarize a job by name.
- * Prefers new tables/columns (expenses/revenue/time_entries.job_no).
- * Falls back to legacy transactions/job_name if job_no cannot be found.
+ * summarizeJob: prefer job_no (if present), but also tolerate legacy job_name.
+ * Aggregates from your new `expenses` / `revenue` tables (by job_no),
+ * and from `time_entries` (by job_no, with a legacy job_name fallback).
  */
-async function summarizeJob(ownerId, jobName) {
+async function summarizeJob(ownerId, nameOrNo) {
   try {
-    const name = String(jobName || '').trim();
-    if (!ownerId || !name) throw new Error('summarizeJob requires ownerId and jobName');
+    const job = await findJob(ownerId, nameOrNo);
+    if (!job) return { durationDays: 0, labourHours: 0, labourCost: 0, materialCost: 0, revenue: 0, profit: 0, profitMargin: 0 };
 
-    // Fetch the job row (get job_no + dates from either schema)
-    const jobRes = await query(
-      `
-      SELECT
-        id,
-        job_no,
-        COALESCE(name, job_name) AS name,
-        start_date,
-        end_date,
-        created_at,
-        updated_at
-      FROM public.jobs
-      WHERE owner_id = $1
-        AND (LOWER(name) = LOWER($2) OR LOWER(job_name) = LOWER($2))
-      ORDER BY updated_at DESC, created_at DESC
-      LIMIT 1
-      `,
-      [ownerId, name]
+    const jobNo = job.job_no;
+    const jobName = job.name;
+
+    // basic timing
+    const jRes = await query(
+      `SELECT COALESCE(start_date, created_at) AS start_date, end_date
+         FROM public.jobs
+        WHERE owner_id=$1 AND job_no=$2`,
+      [ownerId, jobNo]
+    );
+    const { start_date, end_date } = jRes.rows[0] || {};
+    const start = start_date ? new Date(start_date) : new Date();
+    const end   = end_date   ? new Date(end_date)   : new Date();
+    const durationDays = Math.max(0, Math.ceil((end - start) / (1000 * 60 * 60 * 24)));
+
+    // money: expenses/revenue use job_no now
+    const expRes = await query(
+      `SELECT COALESCE(SUM(amount::numeric),0) AS total_expenses
+         FROM public.expenses
+        WHERE owner_id=$1 AND job_no=$2`,
+      [ownerId, jobNo]
+    );
+    const revRes = await query(
+      `SELECT COALESCE(SUM(amount::numeric),0) AS total_revenue
+         FROM public.revenue
+        WHERE owner_id=$1 AND job_no=$2`,
+      [ownerId, jobNo]
     );
 
-    if (jobRes.rowCount === 0) {
-      throw new Error(`Job "${name}" not found`);
+    // time: prefer job_no, fallback to legacy job_name if any rows exist that way
+    const timeByNo = await query(
+      `SELECT COALESCE(SUM(hours),0) AS hours FROM (
+         SELECT CASE
+                  WHEN type = 'punch_in' THEN
+                    EXTRACT(EPOCH FROM (
+                      (LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_no ORDER BY timestamp)) - timestamp
+                    )) / 3600.0
+                  ELSE 0
+                END AS hours
+           FROM public.time_entries
+          WHERE owner_id = $1 AND job_no = $2
+       ) t`,
+      [ownerId, jobNo]
+    );
+
+    let labourHours = parseFloat(timeByNo.rows[0].hours) || 0;
+
+    if (labourHours === 0) {
+      const timeByName = await query(
+        `SELECT COALESCE(SUM(hours),0) AS hours FROM (
+           SELECT CASE
+                    WHEN type = 'punch_in' THEN
+                      EXTRACT(EPOCH FROM (
+                        (LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_name ORDER BY timestamp)) - timestamp
+                      )) / 3600.0
+                    ELSE 0
+                  END AS hours
+             FROM public.time_entries
+            WHERE owner_id = $1 AND job_name = $2
+         ) t`,
+        [ownerId, jobName]
+      );
+      labourHours = parseFloat(timeByName.rows[0].hours) || 0;
     }
 
-    const j = jobRes.rows[0];
-    const start = j.start_date || j.created_at || new Date();
-    const end = j.end_date || new Date();
-    const durationDays = Math.max(1, Math.ceil((new Date(end) - new Date(start)) / (1000 * 60 * 60 * 24)));
-
-    let materialCost = 0, revenue = 0, labourHours = 0;
-
-    if (j.job_no != null) {
-      // New path: use job_no in expenses / revenue / time_entries
-      const expRes = await query(
-        `SELECT COALESCE(SUM(amount::numeric),0) AS total FROM public.expenses WHERE owner_id = $1 AND job_no = $2`,
-        [ownerId, j.job_no]
-      );
-      const revRes = await query(
-        `SELECT COALESCE(SUM(amount::numeric),0) AS total FROM public.revenue  WHERE owner_id = $1 AND job_no = $2`,
-        [ownerId, j.job_no]
-      );
-      materialCost = parseFloat(expRes.rows[0]?.total || 0);
-      revenue = parseFloat(revRes.rows[0]?.total || 0);
-
-      const timeRes = await query(
-        `
-        SELECT COALESCE(SUM(hours),0) AS hours FROM (
-          SELECT CASE
-                   WHEN type = 'punch_in' THEN
-                     EXTRACT(EPOCH FROM (
-                       LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_no ORDER BY timestamp) - timestamp
-                     )) / 3600.0
-                   ELSE 0
-                 END AS hours
-          FROM public.time_entries
-          WHERE owner_id = $1
-            AND job_no   = $2
-        ) x
-        `,
-        [ownerId, j.job_no]
-      );
-      labourHours = parseFloat(timeRes.rows[0]?.hours || 0);
-    } else {
-      // Legacy fallback: use transactions + job_name and time_entries.job_name
-      const expRes = await query(
-        `SELECT COALESCE(SUM(amount::numeric),0) AS total_expenses
-           FROM public.transactions
-          WHERE owner_id=$1 AND job_name=$2 AND (type='expense' OR type='bill')`,
-        [ownerId, name]
-      );
-      const revRes = await query(
-        `SELECT COALESCE(SUM(amount::numeric),0) AS total_revenue
-           FROM public.transactions
-          WHERE owner_id=$1 AND job_name=$2 AND type='revenue'`,
-        [ownerId, name]
-      );
-      materialCost = parseFloat(expRes.rows[0]?.total_expenses || 0);
-      revenue = parseFloat(revRes.rows[0]?.total_revenue || 0);
-
-      const timeRes = await query(
-        `
-        SELECT COALESCE(SUM(hours),0) AS hours FROM (
-          SELECT CASE
-                   WHEN type = 'punch_in' THEN
-                     EXTRACT(EPOCH FROM (
-                       LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_name ORDER BY timestamp) - timestamp
-                     )) / 3600.0
-                   ELSE 0
-                 END AS hours
-          FROM public.time_entries
-          WHERE owner_id = $1
-            AND job_name = $2
-        ) x
-        `,
-        [ownerId, name]
-      );
-      labourHours = parseFloat(timeRes.rows[0]?.hours || 0);
-    }
-
-    // Labour rate (optional)
     const rateRes = await query(
-      `SELECT unit_cost FROM public.pricing_items WHERE owner_id=$1 AND category='labour' LIMIT 1`,
+      `SELECT unit_cost FROM public.pricing_items
+        WHERE owner_id=$1 AND category='labour' LIMIT 1`,
       [ownerId]
     );
-    const labourRate = parseFloat(rateRes.rows[0]?.unit_cost || 0);
-    const labourCost = labourHours * labourRate;
 
-    const profit = revenue - (materialCost + labourCost);
+    const materialCost = parseFloat(expRes.rows[0].total_expenses) || 0;
+    const revenue      = parseFloat(revRes.rows[0].total_revenue) || 0;
+    const profit       = revenue - materialCost;
     const profitMargin = revenue > 0 ? profit / revenue : 0;
 
-    return { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin, job_no: j.job_no ?? null, name: j.name };
+    const labourRate   = parseFloat(rateRes.rows[0]?.unit_cost) || 0;
+    const labourCost   = labourHours * labourRate;
+
+    return { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin };
   } catch (error) {
     console.error('[ERROR] summarizeJob failed:', error.message);
     throw error;
   }
 }
-// --- Back-compat shims (do NOT remove until all callers are updated) ---
+
+// --- Back-compat shims (keep until all callers are updated) ---
 async function saveJob(ownerId, jobName, startDate = null) {
-  // Old behavior: create the job and mark it active; honor provided startDate
+  // Old call pattern: create + mark active; honor startDate if provided.
   const created = await createJob(ownerId, jobName);
   if (startDate) {
     await query(
@@ -805,7 +794,7 @@ async function saveJob(ownerId, jobName, startDate = null) {
     );
   }
   await setActiveJob(ownerId, jobName);
-  return created; // { id, owner_id, job_no, name, status }
+  return created;
 }
 
 async function finalizeJobCreation(ownerId, jobName, activate = false) {

@@ -792,6 +792,29 @@ async function summarizeJob(ownerId, jobName) {
     throw error;
   }
 }
+// --- Back-compat shims (do NOT remove until all callers are updated) ---
+async function saveJob(ownerId, jobName, startDate = null) {
+  // Old behavior: create the job and mark it active; honor provided startDate
+  const created = await createJob(ownerId, jobName);
+  if (startDate) {
+    await query(
+      `UPDATE public.jobs
+          SET start_date = $3, updated_at = NOW()
+        WHERE owner_id = $1 AND job_no = $2`,
+      [ownerId, created.job_no, startDate]
+    );
+  }
+  await setActiveJob(ownerId, jobName);
+  return created; // { id, owner_id, job_no, name, status }
+}
+
+async function finalizeJobCreation(ownerId, jobName, activate = false) {
+  const created = await createJob(ownerId, jobName);
+  if (activate) {
+    await setActiveJob(ownerId, jobName);
+  }
+  return created;
+}
 
 // --- Users ---
 async function createUserProfile({ user_id, ownerId, onboarding_in_progress = false }) {

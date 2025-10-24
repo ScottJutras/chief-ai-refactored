@@ -5,7 +5,7 @@ const twilio = require('twilio');
 const requiredEnvVars = [
   'TWILIO_ACCOUNT_SID',
   'TWILIO_AUTH_TOKEN',
-  'TWILIO_WHATSAPP_NUMBER', // NOTE: this may be your real WA number, not the sandbox. The comment below can be removed if you're not using sandbox.
+  'TWILIO_WHATSAPP_NUMBER',
 ];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
@@ -18,13 +18,17 @@ const client = twilio(
   process.env.TWILIO_AUTH_TOKEN
 );
 
-// -------- NEW: expected var shapes per template (whitelist) --------
-// For your location confirm template: "We detected your location as {{1}}, {{2}}."
-// Convention: {1} = province, {2} = country  (match your Step-1 code)
+// -------- Template shapes (whitelist) --------
+// Keys are Twilio Content SIDs. Values are the numbered placeholders the template expects.
 const TEMPLATE_VAR_SHAPES = {
-  'HX0280df498999848aaff04cc079e16c31': ['1', '2'], // location confirm
-  // Add other templates here as you create them, e.g.:
-  // 'HXa885f78d7654642672bfccfae98d57cb': [], // no vars
+  // Location confirm example you already had:
+  'HX0280df498999848aaff04cc079e16c31': ['1', '2'],
+
+  // Start Job template (hex_start_job)
+  // Body:
+  //   Starting job '{{1}}'. All entries will be assigned to this job until you say 'go to job (Name) or 'New job'. Confirm?
+  // Buttons: Yes, Edit, No
+  'HXd14a878175fd4b24cee0c0ca6061da96': ['1'],
 };
 
 // Normalize to WhatsApp E.164 every time
@@ -34,7 +38,7 @@ function wa(to) {
   return `whatsapp:${e164}`;
 }
 
-// -------- NEW: helper to coerce/shape variables --------
+// -------- helper to coerce/shape variables --------
 function shapeTemplateVars(contentSid, inputVars = {}) {
   const allowed = TEMPLATE_VAR_SHAPES[contentSid];
 
@@ -46,15 +50,12 @@ function shapeTemplateVars(contentSid, inputVars = {}) {
     vars = { ...inputVars };
   }
 
-  // If we know the shape, enforce:
   if (Array.isArray(allowed)) {
-    // Drop extras, keep only allowed keys, coerce to string, fill missing with ""
     const shaped = {};
     for (const k of allowed) {
       const val = vars[k];
       shaped[k] = (val == null) ? '' : String(val);
     }
-
     const extras = Object.keys(vars).filter(k => !allowed.includes(k));
     if (extras.length) {
       console.warn('[WARN] sendTemplateMessage dropping extra vars', { contentSid, extras });
@@ -62,14 +63,14 @@ function shapeTemplateVars(contentSid, inputVars = {}) {
     return shaped;
   }
 
-  // Unknown template shape → best effort: coerce all values to strings
+  // Unknown template shape → coerce all values to strings
   for (const k of Object.keys(vars)) {
     vars[k] = (vars[k] == null) ? '' : String(vars[k]);
   }
   return vars;
 }
 
-// ---------------- existing senders ----------------
+// ---------------- base senders ----------------
 async function sendMessage(to, body) {
   try {
     const message = await client.messages.create({
@@ -101,7 +102,7 @@ async function sendQuickReply(to, body, replies = []) {
   }
 }
 
-// -------- UPDATED: enforce template shapes + log shaped vars --------
+// -------- template sender (kept as-is, with shaping) --------
 async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
   try {
     if (!contentSid) throw new Error('Missing ContentSid');
@@ -123,4 +124,53 @@ async function sendTemplateMessage(to, contentSid, contentVariables = {}) {
   }
 }
 
-module.exports = { sendMessage, sendQuickReply, sendTemplateMessage };
+// -------- NEW: high-level helper for template quick replies --------
+// Uses a real Content Template if provided (buttons come from the template).
+// If anything is missing/fails, falls back to a standard quick-reply (text + buttons).
+async function sendTemplateQuickReply(
+  to,
+  {
+    templateId,            // Content SID (e.g., HXd14a... for hex_start_job)
+    text = '',             // optional fallback text (also used to infer vars when needed)
+    buttons = [],          // optional fallback quick-reply buttons
+    variables = {},        // optional map or array for template placeholders
+    forceFallback = false, // set true to skip template usage and send a plain quick reply
+  } = {}
+) {
+  try {
+    if (!forceFallback && templateId) {
+      let vars = variables;
+
+      // If no variables provided but we know the template needs {{1}},
+      // try to infer from the text "Starting job 'XYZ'..."
+      if ((!vars || (Array.isArray(vars) && vars.length === 0) || (typeof vars === 'object' && Object.keys(vars).length === 0))
+          && templateId === 'HXd14a878175fd4b24cee0c0ca6061da96'
+          && typeof text === 'string' && text) {
+        const m = text.match(/Starting job\s+['"]([^'"]+)['"]/i);
+        if (m && m[1]) {
+          // We’ll pass as object {"1": "<job name>"} so shapeTemplateVars can validate
+          vars = { '1': m[1] };
+          console.log('[DEBUG] Inferred template var {1} from text for hex_start_job:', m[1]);
+        }
+      }
+
+      // Shape & send as a true template
+      const shaped = shapeTemplateVars(templateId, vars || {});
+      return await sendTemplateMessage(to, templateId, shaped);
+    }
+
+    // Fallback – normal quick reply (non-template)
+    return await sendQuickReply(to, text, buttons);
+  } catch (err) {
+    console.warn('[WARN] sendTemplateQuickReply fell back to quick reply:', err?.message);
+    // Last-resort fallback
+    return await sendQuickReply(to, text, buttons);
+  }
+}
+
+module.exports = {
+  sendMessage,
+  sendQuickReply,
+  sendTemplateMessage,
+  sendTemplateQuickReply, // <— new export
+};

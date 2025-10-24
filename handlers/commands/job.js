@@ -1,4 +1,4 @@
-const { sendQuickReply, sendMessage } = require('../../services/twilio');
+const { sendQuickReply, sendMessage, sendTemplateQuickReply } = require('../../services/twilio');
 const {
   getPendingTransactionState,
   setPendingTransactionState,
@@ -25,6 +25,12 @@ function cap(s = '') {
     .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(' ');
 }
+
+function startJobTemplateText(name) {
+  const n = cap(name);
+  return `Starting job '${n}'. All entries will be assigned to this job until you say 'go to job (Name) or 'New job'. Confirm?`;
+}
+
 
 function toMoney(n) {
   const num = Number(n || 0);
@@ -85,59 +91,72 @@ async function handleJob(from, input, userProfile, ownerId, ownerProfile, isOwne
   const msg = String(input || '').trim();
   const state = (await getPendingTransactionState(from)) || {};
 
-  // 1) Confirmation for pending "create job"
   if (state.jobFlow && state.jobFlow.action === 'create' && state.jobFlow.name) {
-    const wantsCreate = /^(create|yes|y|confirm|ok|okay|👍)$/i.test(msg);
-    const wantsCancel = /^(cancel|no|n|stop|abort|✖️|❌)$/i.test(msg);
+  const wantsCreate = /^(create|yes|y|confirm|ok|👍)$/i.test(msg);
+  const wantsCancel = /^(cancel|no|n|stop|abort|✖️)$/i.test(msg);
+  const wantsEdit   = /^(edit|change|rename)$/i.test(msg);
 
-    if (wantsCancel) {
-      delete state.jobFlow;
-      await setPendingTransactionState(from, state);
-      await sendMessage(from, `❌ Got it — I won't create that job.`);
-      return ack(res);
-    }
-
-    if (wantsCreate) {
-      const jobName = state.jobFlow.name;
-      delete state.jobFlow;
-      try {
-        const job = await createJob(ownerId, jobName);
-        if (!job || job.job_no == null) throw new Error('Job creation succeeded but job_no is missing');
-        state.lastCreatedJobName = jobName;
-        state.lastCreatedJobNo = job.job_no;
-        await setPendingTransactionState(from, state);
-
-        const text = confirmationTemplates?.createJob
-          ? confirmationTemplates.createJob({ job_no: job.job_no, job_name: cap(jobName) })
-          : `✅ Created job #${job.job_no}: ${cap(jobName)}.`;
-
-        await sendQuickReply(from, `${text} What would you like to do next?`, [
-          'Start job',
-          'Add expense',
-          'Log hours',
-          'Finish job',
-          'Dashboard',
-        ]);
-      } catch (err) {
-        console.error('[ERROR] createJob failed:', err?.message);
-        await sendMessage(from, `⚠️ I couldn't create "${cap(jobName)}". Please try again or choose a different name.`);
-      }
-      return ack(res);
-    }
-
-    // Still waiting for a clear response
-    await sendQuickReply(from, `Create job "${cap(state.jobFlow.name)}"?`, ['Create', 'Cancel']);
-    return ack(res);
-  }
-
-  // 2) New "create job ..." request
-  const createdName = parseCreateJob(msg);
-  if (createdName) {
-    state.jobFlow = { action: 'create', name: createdName };
+  if (wantsCancel) {
+    delete state.jobFlow;
     await setPendingTransactionState(from, state);
-    await sendQuickReply(from, `Just to confirm — create job "${cap(createdName)}"?`, ['Create', 'Cancel']);
+    await sendMessage(from, `❌ Got it — I won't create that job.`);
     return ack(res);
   }
+
+  if (wantsEdit) {
+    // Ask for the new name; stay in the flow
+    await sendMessage(from, `What should I rename it to? Reply "create job <new name>" or just the name.`);
+    return ack(res);
+  }
+
+  if (wantsCreate) {
+    const jobName = state.jobFlow.name;
+    delete state.jobFlow;
+    try {
+      const job = await createJob(ownerId, jobName);
+      if (!job || job.job_no == null) throw new Error('Job creation succeeded but job_no is missing');
+
+      // Immediately set active (your template says "Starting job …")
+      await setActiveJob(ownerId, jobName);
+
+      state.lastCreatedJobName = jobName;
+      state.lastCreatedJobNo = job.job_no;
+      await setPendingTransactionState(from, state);
+
+      // Confirmation back (plain text is fine now; we already used the template above)
+      await sendQuickReply(
+        from,
+        `▶️ Job #${job.job_no} (${cap(jobName)}) is now active.\nYou can Clock in, add Expenses, log Hours, Pause/Finish when done.`,
+        ['Clock in', 'Add expense', 'Log hours', 'Pause job', 'Finish job', 'Dashboard']
+      );
+    } catch (err) {
+      console.error('[ERROR] createJob failed:', err?.message);
+      await sendMessage(from, `⚠️ I couldn't create "${cap(state.jobFlow?.name || 'that job')}". Try a different name.`);
+    }
+    return ack(res);
+  }
+
+  // Still waiting — send your Twilio template quick reply
+  await sendTemplateQuickReply(from, {
+    templateId: 'HXd14a878175fd4b24cee0c0ca6061da96', // hex_start_job
+    text: startJobTemplateText(state.jobFlow.name),
+    buttons: ['Yes', 'Edit', 'No'],
+  });
+  return ack(res);
+}
+  // 2) New "create job ..." request
+const createdName = parseCreateJob(msg);
+if (createdName) {
+  state.jobFlow = { action: 'create', name: createdName };
+  await setPendingTransactionState(from, state);
+
+  await sendTemplateQuickReply(from, {
+    templateId: 'HXd14a878175fd4b24cee0c0ca6061da96', // hex_start_job
+    text: startJobTemplateText(createdName),
+    buttons: ['Yes', 'Edit', 'No'],
+  });
+  return ack(res);
+}
 
   // 3) Verb-based commands: start/pause/resume/finish/summarize
   const parsed = parseVerbJob(msg);

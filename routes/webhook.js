@@ -11,6 +11,7 @@ const { handleMedia } = require('../handlers/media');
 const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
 const { handleOwnerApproval } = require('../handlers/commands/owner_approval');
+const handleJob = require('../handlers/commands/job');
 
 // Middleware
 const { lockMiddleware, releaseLock } = require('../middleware/lock');

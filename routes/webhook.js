@@ -19,15 +19,15 @@ const { userProfileMiddleware } = require('../middleware/userProfile');
 const { tokenMiddleware } = require('../middleware/token');
 const { errorMiddleware } = require('../middleware/error');
 
-// Services
+// Services — keep only what this file actually uses
 const {
   query,
-  listMyTasks,
-  getPendingPrompt,
-  logTimeEntry,
-  getActiveJob,
-  appendToUserSpreadsheet,
-  generateTimesheet,
+  listMyTasks,        // used in "My tasks" block
+  getPendingPrompt,   // used for pending prompt checks
+  logTimeEntry,       // used for timeclock logs
+  getActiveJob,       // used in job-aware flows
+  appendToUserSpreadsheet, // used for sheet append actions
+  generateTimesheet,  // used in export flows
 } = require('../services/postgres');
 
 const { sendMessage, sendTemplateMessage } = require('../services/twilio');
@@ -39,6 +39,7 @@ const {
 } = require('../utils/stateManager');
 
 
+
 // AI routers
 const { routeWithAI } = require('../nlp/intentRouter'); // tool-calls (strict)
 const { converseAndRoute } = require('../nlp/conversation');
@@ -48,9 +49,6 @@ const { looksLikeTask, parseTaskUtterance } = require('../nlp/task_intents');
 
 // Memory
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
-
-// DB helpers
-const { getPendingPrompt, logTimeEntry, getActiveJob, appendToUserSpreadsheet, generateTimesheet } = require('../services/postgres');
 
 const router = express.Router();
 const fromDigits = String(from).replace(/\D/g,'');

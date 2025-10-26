@@ -51,7 +51,6 @@ const { looksLikeTask, parseTaskUtterance } = require('../nlp/task_intents');
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
 const router = express.Router();
-const fromDigits = String(from).replace(/\D/g,'');
 // ----------------- helpers -----------------
 function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';

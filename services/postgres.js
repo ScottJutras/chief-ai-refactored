@@ -75,6 +75,10 @@ function normalizePhoneNumber(phone = '') {
   return noWa.replace(/^\+/, '').replace(/\D/g, '').trim();
 }
 
+function _digits(x) {
+  return String(x || '').replace(/\D/g, '');
+}
+
 
 function toAmount(x) {
   return parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
@@ -115,10 +119,6 @@ function computeEmployeeSummary(rows) {
   };
 }
 
-// Local, cycle-safe normalizer (avoid importing normalizePhoneNumber here)
-function _digits(x) {
-  return String(x || '').replace(/\D/g, '');
-}
 
 // Fetch a task by its friendly number for the owner
 async function getTaskByNo(ownerId, taskNo) {
@@ -1908,6 +1908,7 @@ async function listMyTasks({ ownerId, userId, status = 'open' }) {
 }
 
 
+
 /**
  * Unassigned tasks for the tenant (inbox).
  */
@@ -2021,6 +2022,7 @@ async function markTaskDone({ ownerId, taskNo, actorId, isOwner }) {
   if (exists?.rowCount > 0) throw new Error('Permission denied');
   throw new Error('Task not found');
 }
+
 
 /**
  * Owners can reopen ANY task; non-owners only tasks they created or that are assigned to them.

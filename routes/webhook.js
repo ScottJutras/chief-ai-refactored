@@ -20,10 +20,24 @@ const { tokenMiddleware } = require('../middleware/token');
 const { errorMiddleware } = require('../middleware/error');
 
 // Services
-const { query } = require('../services/postgres');
+const {
+  query,
+  listMyTasks,
+  getPendingPrompt,
+  logTimeEntry,
+  getActiveJob,
+  appendToUserSpreadsheet,
+  generateTimesheet,
+} = require('../services/postgres');
+
 const { sendMessage, sendTemplateMessage } = require('../services/twilio');
 const { parseUpload } = require('../services/deepDive');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../utils/stateManager');
+const {
+  getPendingTransactionState,
+  setPendingTransactionState,
+  deletePendingTransactionState
+} = require('../utils/stateManager');
+
 
 // AI routers
 const { routeWithAI } = require('../nlp/intentRouter'); // tool-calls (strict)
@@ -39,7 +53,7 @@ const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = req
 const { getPendingPrompt, logTimeEntry, getActiveJob, appendToUserSpreadsheet, generateTimesheet } = require('../services/postgres');
 
 const router = express.Router();
-
+const fromDigits = String(from).replace(/\D/g,'');
 // ----------------- helpers -----------------
 function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';
@@ -360,14 +374,9 @@ function parseAssignmentUtteranceCompat(s = '', opts = {}) { return parseAssignU
 const parseAssignmentUtteranceExport = parseAssignmentUtteranceCompat;
 
 /* ---------- COMPLETE ---------- */
-function looksLikeComplete(s = '') {
-  const t = _trimLower(normalizeForControl(s));
-  if (/^(done|complete|completed|finish|finished|close|closed)\b/.test(t)) return true;
-  if (/^this\s+task\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
-  if (/^task\s*#?\s*\d+\s+(?:has\s+)?(?:been\s+)?(?:completed|done|finished|closed)\b/.test(t)) return true;
-  if (/^#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/.test(t)) return true;
-  if (/^task\s*#?\s*\d+\s+(?:is|id|\'s|’s)\s+(?:complete|completed|done|finished|closed)\b/.test(t)) return true;
-  return false;
+function looksLikeComplete(s=''){ 
+  const t = String(s).toLowerCase();
+  return /(?:^|\s)#?\d+/.test(t) && /\b(done|complete|completed|finished|fin)\b/.test(t);
 }
 function parseCompleteUtterance(s = '') {
   const t = normalizeForControl(_sanitize(s).trim());
@@ -761,59 +770,6 @@ async function _displayName(userId) {
   return __nameCache[k];
 }
 
-// ---------- SQL helpers (NO LIMITS) ----------
-
-// REPLACE your existing listMyTasks with this version (keeps the same signature)
-async function listMyTasks({ ownerId, userId, status = 'open' }) {
-  try {
-    // normalize phone/digits – use your normalizePhoneNumber if you prefer
-    const me = normalizePhoneNumber ? normalizePhoneNumber(userId) : _digits(userId);
-    const owner = normalizePhoneNumber ? normalizePhoneNumber(ownerId) : _digits(ownerId);
-
-    // “My” = assigned_to == me OR created_by == me
-    // status=open → anything not done/deleted (keeps “open” semantics without hardcoding your enum).
-    const { rows } = await query(
-      `
-      SELECT
-        t.task_no,
-        t.title,
-        t.due_at,
-        t.status,
-        t.assigned_to,
-        t.created_by,
-        t.created_at
-      FROM public.tasks t
-      WHERE t.owner_id = $1
-        AND (t.status NOT IN ('done','deleted'))
-        AND (t.assigned_to = $2 OR t.created_by = $2)
-      ORDER BY
-        COALESCE(t.due_at, to_timestamp(0)) NULLS LAST,
-        t.created_at DESC
-      `,
-      [owner, me]
-    );
-    return rows || [];
-  } catch (error) {
-    console.error('[ERROR] listMyTasks failed:', error.message);
-    throw error;
-  }
-}
-
-// Team-wide open tasks (no limit). If you already have something similar, you can reuse it.
-async function dbSelectTeamOpenTasks(ownerId) {
-  const owner = normalizePhoneNumber ? normalizePhoneNumber(ownerId) : _digits(ownerId);
-  const { rows } = await query(
-    `
-    SELECT task_no, title, status, due_at, assigned_to, created_by, created_at
-    FROM public.tasks
-    WHERE owner_id = $1
-      AND status NOT IN ('done','deleted')
-    ORDER BY assigned_to NULLS LAST, created_at DESC
-    `,
-    [owner]
-  );
-  return rows || [];
-}
 
 // ---------- formatters ----------
 function formatMyLine(t, tz) {
@@ -1004,7 +960,8 @@ try {
         } catch (_) {}
       }
       if (!taskNo || Number.isNaN(Number(taskNo))) {
-        return res.status(200).type('text/xml').send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
+        return res.status(200).type('text/xml')
+          .send(twiml(`I couldn’t tell which task to assign. Try “assign task #12 to Justin”.`));
       }
 
       res.locals = res.locals || {};
@@ -1032,10 +989,13 @@ try {
         } catch (_) {}
       }
       if (!taskNo || Number.isNaN(Number(taskNo))) {
-        return res.status(200).type('text/xml').send(twiml(`I couldn’t tell which task to complete. Try “done #12”.`));
+        return res.status(200).type('text/xml')
+          .send(twiml(`I couldn’t tell which task to complete. Try “done #12”.`));
       }
+
       res.locals = res.locals || {};
       res.locals.intentArgs = { doneTaskNo: Number(taskNo) };
+
       const handled = await tasksHandler(from, `__done__ #${taskNo}`, userProfile, ownerId, ownerProfile, isOwner, res);
       if (!res.headersSent && handled !== false) ensureReply(res, `Completing task #${taskNo}…`);
       console.log('[CONTROL] completing via fast-path for', from, '→', input);
@@ -1045,7 +1005,6 @@ try {
 } catch (e) {
   console.warn('[COMPLETE FAST-PATH] skipped:', e?.message);
 }
-
 
 // 3) DELETE — must run before any create
 try {
@@ -1060,10 +1019,13 @@ try {
         } catch (_) {}
       }
       if (!taskNo || Number.isNaN(Number(taskNo))) {
-        return res.status(200).type('text/xml').send(twiml(`I couldn’t tell which task to delete. Try “delete #12”.`));
+        return res.status(200).type('text/xml')
+          .send(twiml(`I couldn’t tell which task to delete. Try “delete #12”.`));
       }
+
       res.locals = res.locals || {};
       res.locals.intentArgs = { deleteTaskNo: Number(taskNo) };
+
       const handled = await tasksHandler(from, `__delete__ #${taskNo}`, userProfile, ownerId, ownerProfile, isOwner, res);
       if (!res.headersSent && handled !== false) ensureReply(res, `Deleting task #${taskNo}…`);
       return;
@@ -1072,32 +1034,6 @@ try {
 } catch (e) {
   console.warn('[DELETE FAST-PATH] skipped:', e?.message);
 }
-
-// === TASK COMPLETE FAST-PATH (must run before task create fast-path) ===
-try {
-  const bodyTxt = String(input || '');
-  const isTextOnly = !mediaUrl && !!input;
-
-  // Examples: "#4 complete", "task #4 done", "#12 close", "#7 finish", "#3 resolve"
-  const m = bodyTxt.match(/^(?:task\s*)?#\s*(\d+)\s*(?:complete|done|close|finish|resolve)\b/i);
-  if (isTextOnly && m) {
-    const taskNo = parseInt(m[1], 10);
-    const { completeTask, getTaskByNo } = require('../services/postgres'); // adjust path if needed
-
-    const t = await getTaskByNo(ownerId, taskNo);
-    if (!t) {
-      return res.status(200).type('text/xml')
-        .send(twiml(`I couldn't find task #${taskNo}. Try "tasks" to list them.`));
-    }
-
-    const completed = await completeTask(ownerId, taskNo, from);
-    return res.status(200).type('text/xml')
-      .send(twiml(`✅ Marked task #${completed.task_no} “${completed.title}” as completed.`));
-  }
-} catch (e) {
-  console.warn('[TASK COMPLETE FAST-PATH] failed:', e?.message);
-}
-
 
 // 4) CREATE — last, and only if NOT a control phrase
 try {
@@ -1398,32 +1334,32 @@ try {
     }
 
     // --- MY TASKS ---
-    if (/^\s*(my\s+tasks|tasks\s+mine|show\s+my\s+tasks)\s*$/i.test(lc)) {
-      const { listMyTasks } = require('../services/postgres'); // path as in your project
-      const tz = getUserTz(userProfile);
-      const me = from;
+if (/^\s*(my\s+tasks|tasks\s+mine|show\s+my\s+tasks)\s*$/i.test(lc)) {
+  const tz = getUserTz(userProfile);
+  const me = from;
 
-      let rows = [];
-      try {
-        rows = await listMyTasks({ ownerId, userId: me, status: 'open' });
-      } catch (e) {
-        console.warn('[MY TASKS] failed:', e?.message);
-      }
+  let rows = [];
+  try {
+    rows = await listMyTasks({ ownerId, userId: me, status: 'open' });
+  } catch (e) {
+    console.warn('[MY TASKS] failed:', e?.message);
+  }
 
-      if (!rows || rows.length === 0) {
-        return res.status(200).type('text/xml')
-          .send(twiml(`✅ You're all caught up! (no open tasks)`));
-      }
+  if (!rows || rows.length === 0) {
+    return res.status(200).type('text/xml')
+      .send(twiml(`✅ You're all caught up! (no open tasks)`));
+  }
 
-      const lines = rows.map(t => {
-        const due = _fmtDue(t.due_at, tz);
-        const dueTxt = due ? ` (due ${due})` : '';
-        return `• #${t.task_no} ${t.title}${dueTxt}`;
-      });
+  const lines = rows.map(t => {
+    const due = _fmtDue(t.due_at, tz);              // keep your existing formatter
+    const dueTxt = due ? ` (due ${due})` : '';
+    return `• #${t.task_no} ${t.title}${dueTxt}`;
+  });
 
-      await _sendChunked(from, `✅ Here's what's on your plate:`, lines, 18);
-      return res.status(200).type('text/xml').send('<Response></Response>');
-    }
+  await _sendChunked(from, `✅ Here's what's on your plate:`, lines, 18);
+  return res.status(200).type('text/xml').send('<Response></Response>');
+}
+
 
     // --- TEAM TASKS ---
     if (/^\s*(team\s+tasks|tasks\s+team|show\s+team\s+tasks)\s*$/i.test(lc)) {

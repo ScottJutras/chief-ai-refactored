@@ -115,6 +115,11 @@ function computeEmployeeSummary(rows) {
   };
 }
 
+// Local, cycle-safe normalizer (avoid importing normalizePhoneNumber here)
+function _digits(x) {
+  return String(x || '').replace(/\D/g, '');
+}
+
 // Fetch a task by its friendly number for the owner
 async function getTaskByNo(ownerId, taskNo) {
   const sql = `
@@ -1865,11 +1870,6 @@ async function createTask({
 
 // ---------- TASK LISTING + STATUS HELPERS (DB-safe, no external normalizer) ----------
 
-// Local, cycle-safe normalizer (avoid importing normalizePhoneNumber here)
-function _digits(x) {
-  return String(x || '').replace(/\D/g, '');
-}
-
 /**
  * Returns ALL tasks for a given user (both created_by OR assigned_to),
  * defaulting to "open" = status NOT IN ('done','deleted').
@@ -1906,6 +1906,7 @@ async function listMyTasks({ ownerId, userId, status = 'open' }) {
   );
   return rows;
 }
+
 
 /**
  * Unassigned tasks for the tenant (inbox).

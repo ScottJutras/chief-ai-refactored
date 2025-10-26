@@ -25,8 +25,8 @@ const { getUserBasic, getUserByName } = require('../../services/users');
 const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : '');
 const { sendMessage, sendTemplateMessage } = require('../../services/twilio');
 const {
+  getPendingTransactionState,
   setPendingTransactionState,
-  getPendingTransactionState
 } = require('../../utils/stateManager');
 
 const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
@@ -483,6 +483,7 @@ async function maybeHandleAssignmentFastPath({ ownerId, from, body, res, userPro
 }
 
  async function tasksHandler(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
+  const state = (await getPendingTransactionState(from)) || {};
   try {
     const body = (typeof norm === 'function') ? norm(input) : String(input || '').trim();
     const tier = userProfile?.subscription_tier || 'starter';

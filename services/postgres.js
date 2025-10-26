@@ -72,8 +72,9 @@ async function withClient(fn, { useTransaction = true } = {}) {
 function normalizePhoneNumber(phone = '') {
   const val = String(phone || '');
   const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
-  return noWa.replace(/^\+/, '').trim();
+  return noWa.replace(/^\+/, '').replace(/\D/g, '').trim();
 }
+
 
 function toAmount(x) {
   return parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
@@ -112,6 +113,19 @@ function computeEmployeeSummary(rows) {
     driveHours: +driveHours.toFixed(2),
     breakMinutes: Math.round(breakMinutes),
   };
+}
+
+// Fetch a task by its friendly number for the owner
+async function getTaskByNo(ownerId, taskNo) {
+  const sql = `
+    SELECT id, task_no, owner_id, title, status, assigned_to, created_by
+      FROM public.tasks
+     WHERE owner_id = $1
+       AND task_no  = $2
+     LIMIT 1
+  `;
+  const r = await query(sql, [ownerId, taskNo]);
+  return r.rows[0] || null;
 }
 
 // ---------- Job Context + Wrappers (DROP-IN) ----------
@@ -2138,7 +2152,7 @@ module.exports = {
   saveUserProfile,
   getUserProfile,
   getOwnerProfile,
-  getCurrentStatus,            // ✅ restored
+  getCurrentStatus,            
   parseFinancialFile,
   parseReceiptText,
   generateOTP,
@@ -2177,5 +2191,6 @@ module.exports = {
   resolveJobContext,
   createTaskWithJob,
   logTimeEntryWithJob,
+  getTaskByNo,
 
 };

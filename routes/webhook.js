@@ -1072,6 +1072,32 @@ try {
   console.warn('[DELETE FAST-PATH] skipped:', e?.message);
 }
 
+// === TASK COMPLETE FAST-PATH (must run before task create fast-path) ===
+try {
+  const bodyTxt = String(input || '');
+  const isTextOnly = !mediaUrl && !!input;
+
+  // Examples: "#4 complete", "task #4 done", "#12 close", "#7 finish", "#3 resolve"
+  const m = bodyTxt.match(/^(?:task\s*)?#\s*(\d+)\s*(?:complete|done|close|finish|resolve)\b/i);
+  if (isTextOnly && m) {
+    const taskNo = parseInt(m[1], 10);
+    const { completeTask, getTaskByNo } = require('../services/postgres'); // adjust path if needed
+
+    const t = await getTaskByNo(ownerId, taskNo);
+    if (!t) {
+      return res.status(200).type('text/xml')
+        .send(twiml(`I couldn't find task #${taskNo}. Try "tasks" to list them.`));
+    }
+
+    const completed = await completeTask(ownerId, taskNo, from);
+    return res.status(200).type('text/xml')
+      .send(twiml(`✅ Marked task #${completed.task_no} “${completed.title}” as completed.`));
+  }
+} catch (e) {
+  console.warn('[TASK COMPLETE FAST-PATH] failed:', e?.message);
+}
+
+
 // 4) CREATE — last, and only if NOT a control phrase
 try {
   const bodyTxt = String(input || '');

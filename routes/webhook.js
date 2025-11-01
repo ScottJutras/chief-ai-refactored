@@ -12,6 +12,12 @@ const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
 const { handleOwnerApproval } = require('../handlers/commands/owner_approval');
 const handleJob = require('../handlers/commands/job');
+const { runAgent } = require('../services/agent');
+const { timeclockTool } = require('../services/tools/timeclock');
+const { tasksTool } = require('../services/tools/tasks');
+const { jobTool } = require('../services/tools/job');
+const { ragTool } = require('../services/tools/rag');
+
 
 // Middleware
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
@@ -235,11 +241,18 @@ async function createReminder({ ownerId, userId, taskNo, remindAt, taskTitle }) 
 }
 /* ---------- Normalization helpers (top-level!) ---------- */
 
+// Text/voice “ask/do” detector used to decide when to send a message to the agent
+function looksLikeAskOrDo(txt='') {
+  return /^(who|what|where|when|why|how|does|do|can|should|is|are|will|quote|task|clock|job|expense|revenue)\b/i
+    .test(String(txt || '').trim());
+}
+
 // Strips hidden bidi/formatting chars that often sneak in before '+'
 function stripInvisible(s = '') {
   return String(s).replace(/[\u200E\u200F\u202A-\u202E]/g, '');
 }
 
+// Clean up typical speech transcription quirks so your existing handlers parse better
 function cleanSpokenCommand(s = '') {
   let t = stripInvisible(String(s || ''));
 
@@ -263,6 +276,7 @@ function cleanSpokenCommand(s = '') {
   return t;
 }
 
+// Voice “remind me in 2m” → “remind me in 2 minutes” style normalizer
 function normalizeTimePhrase(s = '') {
   let t = String(s);
 
@@ -282,6 +296,7 @@ function normalizeTimePhrase(s = '') {
   return t;
 }
 
+// Lightweight “question” detector (used by some of your fast-paths)
 function looksLikeQuestion(s = '') {
   const t = String(s || '').trim().toLowerCase();
   if (!t) return false;
@@ -290,6 +305,7 @@ function looksLikeQuestion(s = '') {
   if (/\b(is it (ok|okay|possible)|can i|could i|should i|do you|does it)\b/.test(t)) return true;
   return false;
 }
+
 
 // ==== CONTEXTUAL HELP (module-scope helpers) ====
 
@@ -1702,6 +1718,34 @@ try {
 
 // ---------- INTENT-GUARD again, just before routers ----------
 if (shouldSkipRouters(res)) return;
+// ========= AGENT “ASK/DO” GATE (before Conversational router) =========
+try {
+  const hasMedia = !!(mediaUrl && mediaType);
+  if (!hasMedia && typeof input === 'string' && looksLikeAskOrDo(input)) {
+    // Use your convo state if present; fall back to null
+    const activeJob = (state && (state.active_job || state.active_job_id)) 
+      ? (state.active_job || state.active_job_id) 
+      : null;
+
+    const reply = await runAgent({
+      ownerId,
+      fromPhone: from,
+      text: input,
+      activeJob,
+      tools: [timeclockTool, tasksTool, jobTool, ragTool]
+ // add more tools as you build them
+    });
+
+    if (reply && typeof reply === 'string' && reply.trim()) {
+      return res.status(200).type('text/xml').send(twiml(reply));
+
+    }
+    // If agent returns nothing, fall through to existing routers
+  }
+} catch (e) {
+  console.warn('[AGENT GATE] skipped:', e?.message);
+}
+// ========= END AGENT GATE =========
 
 /* ---------- Conversational router ---------- */
 try {

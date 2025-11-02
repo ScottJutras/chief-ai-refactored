@@ -799,68 +799,83 @@ if (/^\s*(help|explain)\b/i.test(raw)) {
     }
 
     // 10) Single action entry
-    let match = null,
-      action = null;
-    for (const { type, re } of RE_NAME_FIRST) {
-      const m = raw.match(re);
-      if (m) {
-        match = m;
-        action = type;
-        dbgMatch(`${type}:name-first`, m);
-        break;
-      }
-    }
-    if (!match) {
-      for (const { type, re } of RE_ACTION_FIRST) {
-        const m = raw.match(re);
-        if (m) {
-          match = m;
-          action = type;
-          dbgMatch(`${type}:action-first`, m);
-          break;
-        }
-      }
-    }
+let match = null, action = null;
 
-    if (!match || !action) {
-      console.log(`[timeclock] no match for input:`, { raw, lc });
-      return res.send(twiml('⚠️ Invalid time entry. Try "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".'));
-    }
+// Try “name first”:  "<Name> punched in ..." etc.
+for (const { type, re } of RE_NAME_FIRST) {
+  const m = raw.match(re);
+  if (m) {
+    match = m;
+    action = type;
+    dbgMatch(`${type}:name-first`, m);
+    break;
+  }
+}
 
-    // Safer intent override: only allow related action swaps
-    const rawIntent = inferIntentFromText(raw);
-    const relatedActions = {
-      punch_in: ['punch_out'],
-      punch_out: ['punch_in'],
-      break_start: ['break_end'],
-      break_end: ['break_start'],
-      drive_start: ['drive_end'],
-      drive_end: ['drive_start'],
-    };
-    if (rawIntent && rawIntent !== action && relatedActions[action]?.includes(rawIntent)) {
-      console.log(`[timeclock] intent override allowed`, { matched: action, override: rawIntent, input: raw });
-      action = rawIntent;
-    } else if (rawIntent && rawIntent !== action) {
-      console.log(`[timeclock] intent override blocked`, { matched: action, proposed: rawIntent, input: raw });
+// If not found, try “action first”: "punched in <Name> ..." etc.
+if (!match) {
+  for (const { type, re } of RE_ACTION_FIRST) {
+    const m = raw.match(re);
+    if (m) {
+      match = m;
+      action = type;
+      dbgMatch(`${type}:action-first`, m);
+      break;
     }
+  }
+}
 
-    // Avoid sender fallback if another person is mentioned
-    const tokensContainOtherPerson =
-      /\bfor\s+[a-z]/i.test(raw) ||
-      /\b(?:clock|punch)\s+(?:in|out)\s+[a-z]/i.test(raw) ||
-      /^[a-z].*\b(?:clock|punch|work|shift|break|drive)\b/i.test(raw);
-    const whoRaw = match.groups?.name || (!tokensContainOtherPerson ? userProfile?.name : '') || 'Unknown';
-    // Quick stopword guard to avoid “how/does/work/clock/in” false-positives as a person’s name
+if (!match || !action) {
+  console.log(`[timeclock] no match for input:`, { raw, lc });
+  return res.send(
+    twiml('⚠️ Invalid time entry. Try "Scott punched in at 9am", "hours week", or "Scott took a 15 minute break at 4:30pm".')
+  );
+}
+
+// Safer intent override: only allow related action swaps
+const rawIntent = inferIntentFromText(raw);
+const relatedActions = {
+  punch_in:   ['punch_out'],
+  punch_out:  ['punch_in'],
+  break_start:['break_end'],
+  break_end:  ['break_start'],
+  drive_start:['drive_end'],
+  drive_end:  ['drive_start'],
+};
+if (rawIntent && rawIntent !== action && relatedActions[action]?.includes(rawIntent)) {
+  console.log(`[timeclock] intent override allowed`, { matched: action, override: rawIntent, input: raw });
+  action = rawIntent;
+} else if (rawIntent && rawIntent !== action) {
+  console.log(`[timeclock] intent override blocked`, { matched: action, proposed: rawIntent, input: raw });
+}
+
+// ---------- PLACE THE NAME GUARD RIGHT HERE ----------
+
+// Avoid sender fallback if another person is mentioned
+const tokensContainOtherPerson =
+  /\bfor\s+[a-z]/i.test(raw) ||
+  /\b(?:clock|punch)\s+(?:in|out)\s+[a-z]/i.test(raw) ||
+  /^[a-z].*\b(?:clock|punch|work|shift|break|drive)\b/i.test(raw);
+
+// Prefer the explicit name captured by the regex; otherwise fallback to sender (if no other person token found)
+const whoRaw = match?.groups?.name || (!tokensContainOtherPerson ? (userProfile?.name || '') : '') || 'Unknown';
+
+// Stopword guard so “how/does/work/clock/in …” doesn’t get treated as a person name
 if (/\b(how|does|do|work|clock|punch|in|out|break|drive|shift|help|explain)\b/i.test(whoRaw)) {
-  return res.send(twiml('⚠️ If you’re asking how to use timeclock, try: "help timeclock" or "how do I clock in?".'));
+  return res.send(
+    twiml('⚠️ If you’re asking how to use timeclock, try: "help timeclock" or "how do I clock in?".')
+  );
 }
 
 const who = cleanPersonName(whoRaw);
 if (who === 'Unknown') {
-  return res.send(twiml('⚠️ Who should I log this for? Try "Clock in Justin" or "Scott break start".'));
+  return res.send(
+    twiml('⚠️ Who should I log this for? Try "Clock in Justin" or "Scott break start".')
+  );
 }
 
-    // Disambiguate name with getUserByName
+// Disambiguate name with getUserByName
+
     const resolved = await getUserByName(ownerId, who);
     console.log(`[timeclock] getUserByName result:`, { who, resolved });
     if (!resolved) {

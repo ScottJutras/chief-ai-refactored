@@ -1,12 +1,30 @@
 // services/agent/index.js
-// Thin shim that routes Q&A to your RAG tool if present, with a safe fallback.
+// Thin shim that routes Q&A to your RAG tool if present, with topic-aware fallback.
 
 let rag = null;
 try {
-  // Prefer your existing RAG tool if available
-  rag = require('../tools/rag'); // adapt if your path differs
+  // Your indexed-RAG lives here per your repo layout
+  rag = require('../tools/rag');
 } catch (_) {
   rag = null;
+}
+
+/** Pick one topic from text/hints */
+function pickTopic(text = '', hints = []) {
+  const lc = String(text || '').toLowerCase();
+
+  // If hints include a clear topic, prefer that
+  if (hints.includes('jobs')) return 'jobs';
+  if (hints.includes('tasks')) return 'tasks';
+  if (hints.includes('timeclock')) return 'timeclock';
+
+  // Otherwise infer from the text
+  if (/\bjob(s)?\b|active job|\bset active\b|\blist jobs\b|\bclose job\b|\bmove last log\b/.test(lc)) return 'jobs';
+  if (/\btask(s)?\b|\bmy tasks\b|\bassign\b|\bdue date\b|\bdone #?\d+\b/.test(lc)) return 'tasks';
+  if (/\bclock|punch|break|drive|timesheet|hours\b/.test(lc)) return 'timeclock';
+
+  // No strong signal -> null (lets RAG try broad)
+  return null;
 }
 
 /**
@@ -15,25 +33,51 @@ try {
  * @returns {Promise<string>}
  */
 async function ask({ from, text, topicHints = [] }) {
+  const topic = pickTopic(text, topicHints);
+
+  // Prefer RAG if present
   if (rag) {
-    if (typeof rag.answer === 'function') {
-      return rag.answer({ from, query: text, hints: topicHints });
-    }
-    if (typeof rag.ask === 'function') {
-      return rag.ask({ from, query: text, hints: topicHints });
-    }
-    if (typeof rag.query === 'function') {
-      return rag.query({ from, query: text, topics: topicHints });
+    const fn = rag.answer || rag.ask || rag.query;
+    if (typeof fn === 'function') {
+      // Pass topic in hints so your RAG can bias retrieval
+      const hints = topic ? Array.from(new Set([topic, ...topicHints])) : topicHints;
+      const out = await fn({ from, query: text, hints });
+      if (out && typeof out === 'string' && out.trim()) return out;
     }
   }
-  const hint = (topicHints && topicHints.length) ? topicHints.join(', ') : 'docs';
+
+  // Topic-aware fallback (if RAG missing or returned nothing)
+  if (topic === 'jobs') {
+    return [
+      'Jobs — quick guide:',
+      '• create job <name>',
+      '• list jobs',
+      '• set active job <name>',
+      '• active job?',
+      '• close job <name>',
+      '• move last log to <name>',
+    ].join('\n');
+  }
+
+  if (topic === 'tasks') {
+    return [
+      'Tasks — quick guide:',
+      '• task – buy nails  (adds to active job)',
+      '• task Roof Repair – order shingles  (explicit job)',
+      '• task @Justin – pick up materials  (assign)',
+      '• tasks  /  my tasks  (list)',
+      '• done #4  (mark done)',
+      '• add due date Friday to task 3',
+    ].join('\n');
+  }
+
+  // Default to timeclock help
   return [
-    `Here’s what to know (${hint}):`,
-    '',
-    '• **Clock in** – “clock in” uses your active job, or say “clock in @ Roof Repair 7am”.',
-    '• **Clock out** – “clock out” ends the open shift. If I need the time, I’ll ask.',
+    'Here’s what to know (timeclock):',
+    '• **Clock in** – “clock in” uses your active job, or “clock in @ Roof Repair 7am”.',
+    '• **Clock out** – “clock out” ends the open shift. If a time is missing, I’ll ask.',
     '• **Break/Drive** – “start break”, “end break”, “start drive”, “end drive”.',
-    '• For another user – “clock in Justin @ Roof Repair 5pm” (Owner/Board only).',
+    '• **Another user** – “clock in Justin @ Roof Repair 5pm” (Owner/Board only).',
   ].join('\n');
 }
 

@@ -93,19 +93,28 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
     console.log(`[DEBUG] Attempting command processing for ${from}: "${input}"`);
     const lcInput = String(input || '').toLowerCase();
 
- // ask-or-do gate
-if (qLike.test(input || '')) {
-  const answer = await safeAgentAsk(from, input, ['timeclock', 'jobs', 'tasks', 'shared_contracts']);
-  await sendMessage(from, answer);
-  return res.send('<Response></Response>');
-}
+     // --------------------------------------------
+    // ask-or-do gate (questions -> agent/RAG)
+    // --------------------------------------------
+    const qLike = /[?]$|\b(how|what|when|why|where|explain|help)\b/i;
 
-// explicit help/explain
-if (/^\s*(help|explain)\b/i.test(input || '')) {
-  const answer = await safeAgentAsk(from, input, ['timeclock','jobs','tasks']);
-  await sendMessage(from, answer);
-  return res.send('<Response></Response>');
-}
+    if (qLike.test(input || '')) {
+      const answer = await safeAgentAsk(from, input, ['timeclock', 'jobs', 'tasks', 'shared_contracts']);
+      return res
+        .status(200)
+        .type('text/xml')
+        .send(`<Response><Message>${answer}</Message></Response>`);
+    }
+
+    // explicit help/explain -> agent with hints
+    if (/^\s*(help|explain)\b/i.test(input || '')) {
+      const answer = await safeAgentAsk(from, input, ['timeclock', 'jobs', 'tasks']);
+      return res
+        .status(200)
+        .type('text/xml')
+        .send(`<Response><Message>${answer}</Message></Response>`);
+    }
+
 
 
 

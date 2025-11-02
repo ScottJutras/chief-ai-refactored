@@ -34,6 +34,22 @@ function pickTopic(text = '', hints = []) {
  */
 async function ask({ from, text, topicHints = [] }) {
   const topic = pickTopic(text, topicHints);
+  
+  // If nothing in text or hints screams a topic, show a concise menu
+  const isGeneric =
+    !topic &&
+    /\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(String(text || '').toLowerCase());
+
+  if (isGeneric) {
+    return [
+      'Here’s what I can help with:',
+      '',
+      '• **Jobs** — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>',
+      '• **Tasks** — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3',
+      '• **Timeclock** — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm',
+    ].join('\n');
+  }
+
 
   // Prefer RAG if present
   if (rag) {

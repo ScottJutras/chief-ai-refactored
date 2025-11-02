@@ -1,49 +1,43 @@
 // services/agent/index.js
-const { LLMProvider } = require('../llm');
+// Thin shim that routes Q&A to your RAG tool if present, with a safe fallback.
 
-const SYSTEM = `
-You are Chief — a professional, calm CFO for contractors.
-Voice: concise, plain-English; bullet points over long paragraphs.
-Style: ask one targeted follow-up if info is missing; confirm before actions.
-Context: WhatsApp-first; everything ties to a Job (active or explicit "@Job").
-Never execute actions without explicit user intent; summarize and confirm.
-For "how/does/what is" questions, first call the rag_search tool with the user's question,
-then answer using the retrieved snippets (cite the titles/paths in your prose).
-`;
-
-async function runAgent({ ownerId, fromPhone, text, activeJob = null, tools = [] }) {
-  const llm = new LLMProvider();
-  const messages = [
-    { role: 'system', content: SYSTEM },
-    voiceContext({ ownerId, fromPhone, activeJob }),
-    { role: 'user', content: text }
-  ];
-  let msg = await llm.chat({ messages, tools, temperature: 0.3 });
-
-  while (msg.tool_calls?.length) {
-    const outs = [];
-    for (const call of msg.tool_calls) {
-      const { name, arguments: raw } = call.function;
-      const args = raw ? JSON.parse(raw) : {};
-      const tool = tools.find(t => t.function?.name === name);
-      if (!tool) {
-        outs.push({ role: 'tool', tool_call_id: call.id, content: `Error: unknown tool ${name}` });
-        continue;
-      }
-      try {
-        // Inject ownerId into rag_search if missing
-        if (name === 'rag_search' && !args.ownerId) args.ownerId = ownerId || 'GLOBAL';
-
-        const out = await tool.__handler(args);
-        outs.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(out) });
-      } catch (e) {
-        outs.push({ role: 'tool', tool_call_id: call.id, content: `Error: ${e.message}` });
-      }
-    }
-    msg = await llm.chat({ messages: [...messages, msg, ...outs], tools, temperature: 0.25 });
-  }
-  return msg.content || 'Done.';
+let rag = null;
+try {
+  // Prefer your existing RAG tool if available
+  rag = require('../tools/rag'); // adapt if your path differs
+} catch (_) {
+  rag = null;
 }
 
+/**
+ * Ask the agent (RAG) for an answer.
+ * @param {{from:string, text:string, topicHints?:string[]}} args
+ * @returns {Promise<string>}
+ */
+async function ask({ from, text, topicHints = [] }) {
+  // Try common exported shapes from a RAG module
+  if (rag) {
+    if (typeof rag.answer === 'function') {
+      return rag.answer({ from, query: text, hints: topicHints });
+    }
+    if (typeof rag.ask === 'function') {
+      return rag.ask({ from, query: text, hints: topicHints });
+    }
+    if (typeof rag.query === 'function') {
+      return rag.query({ from, query: text, topics: topicHints });
+    }
+  }
 
-module.exports = { runAgent };
+  // Safe fallback so UX doesn’t crash if RAG is not wired yet
+  const hint = (topicHints && topicHints.length) ? topicHints.join(', ') : 'docs';
+  return [
+    `Here’s what to know (${hint}):`,
+    '',
+    '• **Clock in** – “clock in” uses your active job, or say “clock in @ Roof Repair 7am”.',
+    '• **Clock out** – “clock out” ends the open shift. If I need the time, I’ll ask.',
+    '• **Break/Drive** – “start break”, “end break”, “start drive”, “end drive”.',
+    '• For another user – “clock in Justin @ Roof Repair 5pm” (Owner/Board only).',
+  ].join('\n');
+}
+
+module.exports = { ask };

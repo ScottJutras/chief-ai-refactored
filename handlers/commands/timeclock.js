@@ -23,8 +23,8 @@ const {
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
 const { inferIntentFromText } = require('../../utils/intent');
-
-const agent = require('../../services/agent'); 
+const { ask: agentAsk } = require('../../services/agent');
+ 
 
 
 
@@ -595,7 +595,7 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     console.log(`[timeclock] input:`, { raw, lc, from });
     // If the user is asking a question about timeclock, route to agent/docs
 if (/[?]$|\b(how|what|when|why|where|explain|help)\b/i.test(raw)) {
-  const answer = await agent.ask({
+  const answer = await agentAsk({
     from,
     text: raw,
     topicHints: ['timeclock'],
@@ -604,7 +604,7 @@ if (/[?]$|\b(how|what|when|why|where|explain|help)\b/i.test(raw)) {
 }
 // explicit "help ..." or "explain ..." → agent with hints
 if (/^\s*(help|explain)\b/i.test(raw)) {
-  const answer = await agent.ask({
+  const answer = await agentAsk({
     from,
     text: raw,
     topicHints: ['timeclock'],

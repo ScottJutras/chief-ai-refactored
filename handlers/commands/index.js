@@ -5,7 +5,7 @@ const { handleRevenue } = require('./revenue');
 const { handleBill } = require('./bill');
 
 const handleJob = require('./job');
-const agent = require('../../services/agent'); // ← add this
+const { ask: agentAsk } = require('../../services/agent');
 const { handleQuote } = require('./quote');
 const { handleMetrics } = require('./metrics');
 const { handleTax } = require('./tax');
@@ -88,7 +88,7 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
    // ask-or-do gate: questions go to RAG
 const qLike = /[?]$|\b(how|what|when|why|where|explain|help)\b/i;
 if (qLike.test(input || '')) {
-  const answer = await agent.ask({
+  const answer = await agentAsk({
     from,
     text: input,
     topicHints: ['timeclock', 'jobs', 'tasks', 'shared_contracts'],
@@ -99,7 +99,7 @@ if (qLike.test(input || '')) {
 
 // explicit "help ..." or "explain ..." → agent with hints
 if (/^\s*(help|explain)\b/i.test(input || '')) {
-  const answer = await agent.ask({
+  const answer = await agentAsk({
     from,
     text: input,
     topicHints: ['timeclock','jobs','tasks'],

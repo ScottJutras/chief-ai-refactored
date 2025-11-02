@@ -1983,7 +1983,8 @@ try {
       }
     }
   }
-// ----- Last-resort fallback (no one replied) -----
+
+  // ----- Last-resort fallback (no one replied) -----
   if (!res.headersSent) {
     console.warn('[WEBHOOK] No handler replied; sending default menu.');
     return sendTwiml(res,
@@ -2006,6 +2007,7 @@ try {
     console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
   }
 }
+
   },
   errorMiddleware
 );

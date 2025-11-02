@@ -20,19 +20,21 @@ function pickTopic(text = '', hints = []) {
   if (hintSet.has('tasks')) return 'tasks';
   if (hintSet.has('timeclock')) return 'timeclock';
 
-  // Direct keyword checks
+  // Direct keyword checks (stronger matches first)
   if (/\b(job|jobs|active job|set active|close job|list jobs|move last log)\b/.test(t)) return 'jobs';
   if (/\b(task|tasks|due date|assign|my tasks|done #?\d+|mark done)\b/.test(t)) return 'tasks';
   if (/\b(clock in|punch in|clock out|punch out|break|drive|timesheet|hours)\b/.test(t)) return 'timeclock';
 
-  // “How do I use X?” forms
-  if (/\bhow (do|to)\b.*\bjob(s)?\b/.test(t)) return 'jobs';
-  if (/\bhow (do|to)\b.*\btask(s)?\b/.test(t)) return 'tasks';
+  // “How do I use X?” forms — require full phrase after "how"
+  if (/\bhow (do|to)\b.*\b(job|jobs)\b/.test(t)) return 'jobs';
+  if (/\bhow (do|to)\b.*\b(task|tasks)\b/.test(t)) return 'tasks';
   if (/\bhow (do|to)\b.*\b(clock|time|break|drive|timesheet|hours)\b/.test(t)) return 'timeclock';
+
+  // Generic help phrases — check EARLY to block topic matches
+  if (/\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(t)) return null;
 
   return null; // generic / menu
 }
-
 /**
  * Ask the agent (RAG) for an answer.
  * @param {{from:string, text:string, topicHints?:string[]}} args

@@ -1727,32 +1727,40 @@ if (shouldSkipRouters(res)) return;
 // ========= AGENT “ASK/DO” GATE (before Conversational router) =========
 try {
   const hasMedia = !!(mediaUrl && mediaType);
-  if (!hasMedia && typeof input === 'string' && looksLikeAskOrDo(input)) {
-    const activeJob = (state && (state.active_job || state.active_job_id))
-      ? (state.active_job || state.active_job_id)
-      : null;
+  const isAsk = (str) => {
+    const s = String(str || '');
+    const qLike = /[?]$|\b(how|what|when|why|where|explain|help|what can i do( here)?|what now)\b/i;
+    return qLike.test(s);
+  };
 
-    // NOTE: runAgent is a thin shim that calls ask()
-    const reply = await runAgent({
-      ownerId,
-      fromPhone: from,
+  if (!hasMedia && typeof input === 'string' && looksLikeAskOrDo(input) && isAsk(input)) {
+    const defaultMenu =
+      'Here’s what I can help with:\n\n' +
+      '• Jobs — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>\n' +
+      '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
+      '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm';
+
+    const reply = await agentAsk({
+      from: from,
       text: input,
-      activeJob,
-      tools: [timeclockTool, tasksTool, jobTool, ragTool]
+      topicHints: ['timeclock', 'jobs', 'tasks', 'shared_contracts'],
     });
 
     const out = (reply && typeof reply === 'string') ? reply.trim() : '';
-    console.log('[AGENT GATE:webhook] reply len:', out.length);
-
-    // ALWAYS send something if we entered this gate
-    const finalText = out || 'Here’s what I can help with:\n\n• Jobs — create/list/set active/close/move last log\n• Tasks — add/list/assign/due date/done\n• Timeclock — clock in/out, break/drive, timesheets';
-    return sendTwiml(res, finalText);
+    return sendTwiml(res, out || defaultMenu); // <-- ALWAYS reply here
   }
 } catch (e) {
   console.warn('[AGENT GATE] error:', e?.message);
-  return sendTwiml(res, 'Quick help:\n• Jobs — create job <name>\n• Tasks — task – buy nails\n• Timeclock — clock in / out');
+  const fallback =
+    'Quick help:\n' +
+    '• Jobs — create job <name>\n' +
+    '• Tasks — task – buy nails\n' +
+    '• Timeclock — clock in / out';
+  return sendTwiml(res, fallback); // <-- ALWAYS reply on error too
 }
 // ========= END AGENT GATE =========
+
+
 
 
 

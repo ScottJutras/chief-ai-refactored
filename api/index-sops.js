@@ -1,22 +1,16 @@
 // api/index-sops.js
-import { searchRag } from '../services/tools/rag.js';
-import { ragTool } from '../services/tools/rag.js';
+const fs = require('fs');
+const path = require('path');
+const OpenAI = require('openai');
+const { Pool } = require('pg');
 
-export const config = { api: { bodyParser: false } };
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-export default async function handler(req, res) {
-  if (req.method !== 'GET') return res.status(405).end();
+module.exports = async (req, res) => {
+  if (req.method !== 'GET') return res.status(405).send('Method Not Allowed');
 
   try {
-    // Re-use your existing chunking logic
-    const fs = require('fs');
-    const path = require('path');
-    const OpenAI = require('openai');
-    const { Pool } = require('pg');
-
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-
     const sops = [
       { file: 'docs/howto/jobs.md', title: 'Jobs SOP' },
       { file: 'docs/howto/tasks.md', title: 'Tasks SOP' },
@@ -38,10 +32,10 @@ export default async function handler(req, res) {
           input: chunk,
         });
         await pool.query(
-          `INSERT INTO doc_chunks (owner_id, doc_id, content, embedding)
-           VALUES ($1, $2, $3, $4)
-           ON CONFLICT DO NOTHING`,
-          ['GLOBAL', title, chunk, e.data[0].embedding]
+          `INSERT INTO doc_chunks (owner_id, doc_id, content, embedding, metadata)
+           VALUES ($1, $2, $3, $4, $5)
+           ON CONFLICT (owner_id, doc_id, content) DO NOTHING`,
+          ['GLOBAL', title, chunk, e.data[0].embedding, { source: file }]
         );
         indexed++;
       }
@@ -49,6 +43,7 @@ export default async function handler(req, res) {
 
     res.status(200).json({ success: true, indexed });
   } catch (err) {
+    console.error('Indexer error:', err);
     res.status(500).json({ error: err.message });
   }
-}
+};

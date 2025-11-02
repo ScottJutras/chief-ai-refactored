@@ -3,28 +3,33 @@
 
 let rag = null;
 try {
-  // Your indexed-RAG lives here per your repo layout
+  // Your indexed-RAG lives here per your repo layout (services/tools/rag.js)
   rag = require('../tools/rag');
 } catch (_) {
   rag = null;
 }
 
-/** Pick one topic from text/hints */
+// --- Topic detector ---------------------------------------------------------
 function pickTopic(text = '', hints = []) {
-  const lc = String(text || '').toLowerCase();
+  const t = String(text || '').toLowerCase();
 
-  // If hints include a clear topic, prefer that
-  if (hints.includes('jobs')) return 'jobs';
-  if (hints.includes('tasks')) return 'tasks';
-  if (hints.includes('timeclock')) return 'timeclock';
+  // Normalize hints and prefer explicit ones
+  const hintSet = new Set((hints || []).map(h => String(h).toLowerCase()));
+  if (hintSet.has('jobs')) return 'jobs';
+  if (hintSet.has('tasks')) return 'tasks';
+  if (hintSet.has('timeclock')) return 'timeclock';
 
-  // Otherwise infer from the text
-  if (/\bjob(s)?\b|active job|\bset active\b|\blist jobs\b|\bclose job\b|\bmove last log\b/.test(lc)) return 'jobs';
-  if (/\btask(s)?\b|\bmy tasks\b|\bassign\b|\bdue date\b|\bdone #?\d+\b/.test(lc)) return 'tasks';
-  if (/\bclock|punch|break|drive|timesheet|hours\b/.test(lc)) return 'timeclock';
+  // Direct keyword checks
+  if (/\b(job|jobs|active job|set active|close job|list jobs|move last log)\b/.test(t)) return 'jobs';
+  if (/\b(task|tasks|due date|assign|my tasks|done #?\d+|mark done)\b/.test(t)) return 'tasks';
+  if (/\b(clock in|punch in|clock out|punch out|break|drive|timesheet|hours)\b/.test(t)) return 'timeclock';
 
-  // No strong signal -> null (lets RAG try broad)
-  return null;
+  // “How do I use X?” forms
+  if (/\bhow (do|to)\b.*\bjob(s)?\b/.test(t)) return 'jobs';
+  if (/\bhow (do|to)\b.*\btask(s)?\b/.test(t)) return 'tasks';
+  if (/\bhow (do|to)\b.*\b(clock|time|break|drive|timesheet|hours)\b/.test(t)) return 'timeclock';
+
+  return null; // generic / menu
 }
 
 /**
@@ -34,7 +39,8 @@ function pickTopic(text = '', hints = []) {
  */
 async function ask({ from, text, topicHints = [] }) {
   const topic = pickTopic(text, topicHints);
-  
+  console.log('[AGENT] topic:', topic || 'generic', 'text:', text);
+
   // If nothing in text or hints screams a topic, show a concise menu
   const isGeneric =
     !topic &&
@@ -44,12 +50,11 @@ async function ask({ from, text, topicHints = [] }) {
     return [
       'Here’s what I can help with:',
       '',
-      '• **Jobs** — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>',
+      '• **Jobs** — create job <name>, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>',
       '• **Tasks** — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3',
       '• **Timeclock** — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm',
     ].join('\n');
   }
-
 
   // Prefer RAG if present
   if (rag) {

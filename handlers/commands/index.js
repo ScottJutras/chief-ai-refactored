@@ -37,6 +37,15 @@ const { getAuthorizedClient } = require('../../services/postgres.js');
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// ---- Twilio TwiML helper (centralized) ----
+function sendTwiml(res, body) {
+  return res
+    .status(200)
+    .set('Content-Type', 'application/xml')
+    .send(`<Response><Message>${body}</Message></Response>`);
+}
+
+
 // Optional helpers (if your code references them). Safe fallbacks if module is absent.
 let categorizeEntry, appendToUserSpreadsheet, getActiveJob, getLastQuery, addPricingItem, detectErrors, correctErrorsWithAI;
 try {
@@ -93,28 +102,23 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
     console.log(`[DEBUG] Attempting command processing for ${from}: "${input}"`);
     const lcInput = String(input || '').toLowerCase();
 
-     // --------------------------------------------
-    // ask-or-do gate (questions -> agent/RAG)
     // --------------------------------------------
-    const qLike = /[?]$|\b(how|what|when|why|where|explain|help)\b/i;
+// ask-or-do gate (questions -> agent/RAG)
+// --------------------------------------------
+const qLike = /[?]$|\b(how|what|when|why|where|explain|help)\b/i;
 
-    if (qLike.test(input || '')) {
-      const answer = await safeAgentAsk(from, input, ['timeclock', 'jobs', 'tasks', 'shared_contracts']);
-      return res
-        .status(200)
-        .type('text/xml')
-        .send(`<Response><Message>${answer}</Message></Response>`);
-    }
+if (qLike.test(input || '')) {
+  const answer = await safeAgentAsk(from, input, ['timeclock', 'jobs', 'tasks', 'shared_contracts']);
+  console.log('[GATE:index.js] answering via agent:', { answerLen: (answer||'').length });
+  return sendTwiml(res, answer);
+}
 
-    // explicit help/explain -> agent with hints
-    if (/^\s*(help|explain)\b/i.test(input || '')) {
-      const answer = await safeAgentAsk(from, input, ['timeclock', 'jobs', 'tasks']);
-      return res
-        .status(200)
-        .type('text/xml')
-        .send(`<Response><Message>${answer}</Message></Response>`);
-    }
-
+// explicit help/explain -> agent with hints
+if (/^\s*(help|explain)\b/i.test(input || '')) {
+  const answer = await safeAgentAsk(from, input, ['timeclock', 'jobs', 'tasks']);
+  console.log('[GATE:index.js] help/explain via agent:', { answerLen: (answer||'').length });
+  return sendTwiml(res, answer);
+}
 
 
 

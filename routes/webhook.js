@@ -80,6 +80,12 @@ function shouldSkipRouters(res) {
 }
 
 function twiml(text) { return `<Response><Message>${text}</Message></Response>`; }
+function sendTwiml(res, body) {
+  return res
+    .status(200)
+    .set('Content-Type', 'application/xml')
+    .send(`<Response><Message>${body}</Message></Response>`);
+}
 
 function getUserTz(userProfile) {
   return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
@@ -1722,27 +1728,32 @@ if (shouldSkipRouters(res)) return;
 try {
   const hasMedia = !!(mediaUrl && mediaType);
   if (!hasMedia && typeof input === 'string' && looksLikeAskOrDo(input)) {
-    // Use your convo state if present; fall back to null
     const activeJob = (state && (state.active_job || state.active_job_id))
       ? (state.active_job || state.active_job_id)
       : null;
 
-    // topic hints: be generous here so your SOPs get used
-    const answer = await agentAsk({
-      from: from,
+    // NOTE: runAgent is a thin shim that calls ask()
+    const reply = await runAgent({
+      ownerId,
+      fromPhone: from,
       text: input,
-      topicHints: ['timeclock','jobs','tasks','shared_contracts']
+      activeJob,
+      tools: [timeclockTool, tasksTool, jobTool, ragTool]
     });
 
-    if (answer && typeof answer === 'string' && answer.trim()) {
-      return res.status(200).type('text/xml').send(twiml(answer));
-    }
-    // If agent returns nothing, fall through to existing routers
+    const out = (reply && typeof reply === 'string') ? reply.trim() : '';
+    console.log('[AGENT GATE:webhook] reply len:', out.length);
+
+    // ALWAYS send something if we entered this gate
+    const finalText = out || 'Here’s what I can help with:\n\n• Jobs — create/list/set active/close/move last log\n• Tasks — add/list/assign/due date/done\n• Timeclock — clock in/out, break/drive, timesheets';
+    return sendTwiml(res, finalText);
   }
 } catch (e) {
-  console.warn('[AGENT GATE] skipped:', e?.message);
+  console.warn('[AGENT GATE] error:', e?.message);
+  return sendTwiml(res, 'Quick help:\n• Jobs — create job <name>\n• Tasks — task – buy nails\n• Timeclock — clock in / out');
 }
 // ========= END AGENT GATE =========
+
 
 
 /* ---------- Conversational router ---------- */
@@ -1969,6 +1980,16 @@ try {
       }
     }
   }
+// ----- Last-resort fallback (no one replied) -----
+if (!res.headersSent) {
+  console.warn('[WEBHOOK] No handler replied; sending default menu.');
+  return sendTwiml(res,
+    'Here’s what I can help with:\n\n' +
+    '• Jobs — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>\n' +
+    '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
+    '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm'
+  );
+}
 
 
       // Fallback
@@ -1999,6 +2020,8 @@ try {
   },
   errorMiddleware
 );
+
+
 
 // ---- Reminders Cron (simple polling) ----
 router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) => {

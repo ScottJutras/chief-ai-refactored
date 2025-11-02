@@ -25,7 +25,7 @@ const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones
 const { inferIntentFromText } = require('../../utils/intent');
 
 const agent = require('../../services/agent'); 
-const twiml = (s) => `<Response><Message>${s}</Message></Response>`;
+
 
 
 

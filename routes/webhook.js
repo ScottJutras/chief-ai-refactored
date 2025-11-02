@@ -1911,6 +1911,7 @@ try {
     });
 
     if (routed) {
+      // If a downstream handler already produced TwiML:
       if (routed.handled && routed.twiml) {
         return res.status(200).type('text/xml').send(routed.twiml);
       }
@@ -1974,49 +1975,37 @@ try {
             last_args: routed.args || convo.last_args || {},
             history: [...(convo.history || []).slice(-4), { input, response: responseText, intent: routed.intent || route || null }]
           });
-          if (!res.headersSent) ensureReply(res, responseText);
+          if (!res.headersSent) {
+            return res.status(200).type('text/xml').send(`<Response><Message>${responseText}</Message></Response>`);
+          }
           return;
         }
       }
     }
   }
 // ----- Last-resort fallback (no one replied) -----
-if (!res.headersSent) {
-  console.warn('[WEBHOOK] No handler replied; sending default menu.');
-  return sendTwiml(res,
-    'Here’s what I can help with:\n\n' +
-    '• Jobs — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>\n' +
-    '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
-    '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm'
-  );
+  if (!res.headersSent) {
+    console.warn('[WEBHOOK] No handler replied; sending default menu.');
+    return sendTwiml(res,
+      'Here’s what I can help with:\n\n' +
+      '• Jobs — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>\n' +
+      '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
+      '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm'
+    );
+  }
+
+} catch (error) {
+  console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
+  try { await logEvent(tenantId, userId, 'error', { input, error: error.message }); } catch {}
+  return next(error);
+} finally {
+  try {
+    await releaseLock(req.lockKey, req.lockToken);
+    console.log('[LOCK] released for', req.lockKey);
+  } catch (e) {
+    console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
+  }
 }
-
-
-      // Fallback
-      const response = "I'm here to help! Try 'expense $100 tools', 'create job Roof Repair', 'task - buy tape', or 'help'.";
-      await logEvent(tenantId, userId, 'fallback', { input, response });
-      await saveConvoState(tenantId, userId, {
-      last_intent: null,
-      last_args: {},
-      history: [...(convo.history || []).slice(-4), { input, response, intent: null }]
-      });
-      if (!res.headersSent) ensureReply(res, response);
-      return;
-
-    } catch (error) {
-    console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
-    try { await logEvent(tenantId, userId, 'error', { input, error: error.message }); } catch {}
-    return next(error);
-    } finally {
-  
-
-      try {
-        await releaseLock(req.lockKey, req.lockToken);
-        console.log('[LOCK] released for', req.lockKey);
-      } catch (e) {
-        console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
-      }
-    }
   },
   errorMiddleware
 );

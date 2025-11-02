@@ -15,7 +15,6 @@ try {
  * @returns {Promise<string>}
  */
 async function ask({ from, text, topicHints = [] }) {
-  // Try common exported shapes from a RAG module
   if (rag) {
     if (typeof rag.answer === 'function') {
       return rag.answer({ from, query: text, hints: topicHints });
@@ -27,8 +26,6 @@ async function ask({ from, text, topicHints = [] }) {
       return rag.query({ from, query: text, topics: topicHints });
     }
   }
-
-  // Safe fallback so UX doesn’t crash if RAG is not wired yet
   const hint = (topicHints && topicHints.length) ? topicHints.join(', ') : 'docs';
   return [
     `Here’s what to know (${hint}):`,
@@ -40,4 +37,15 @@ async function ask({ from, text, topicHints = [] }) {
   ].join('\n');
 }
 
-module.exports = { ask };
+/**
+ * Back-compat shim for older call sites that used runAgent({...}).
+ * Accepts shapes like: { ownerId, fromPhone, text, topicHints }
+ */
+async function runAgent(opts = {}) {
+  const from = opts.fromPhone || opts.from || '';
+  const text = opts.text || opts.query || '';
+  const topicHints = opts.topicHints || opts.hints || [];
+  return ask({ from, text, topicHints });
+}
+
+module.exports = { ask, runAgent };

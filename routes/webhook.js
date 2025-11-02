@@ -12,7 +12,7 @@ const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
 const { handleOwnerApproval } = require('../handlers/commands/owner_approval');
 const handleJob = require('../handlers/commands/job');
-const { runAgent } = require('../services/agent');
+const { ask: agentAsk } = require('../services/agent');
 const { timeclockTool } = require('../services/tools/timeclock');
 const { tasksTool } = require('../services/tools/tasks');
 const { jobTool } = require('../services/tools/job');
@@ -1723,22 +1723,19 @@ try {
   const hasMedia = !!(mediaUrl && mediaType);
   if (!hasMedia && typeof input === 'string' && looksLikeAskOrDo(input)) {
     // Use your convo state if present; fall back to null
-    const activeJob = (state && (state.active_job || state.active_job_id)) 
-      ? (state.active_job || state.active_job_id) 
+    const activeJob = (state && (state.active_job || state.active_job_id))
+      ? (state.active_job || state.active_job_id)
       : null;
 
-    const reply = await runAgent({
-      ownerId,
-      fromPhone: from,
+    // topic hints: be generous here so your SOPs get used
+    const answer = await agentAsk({
+      from: from,
       text: input,
-      activeJob,
-      tools: [timeclockTool, tasksTool, jobTool, ragTool]
- // add more tools as you build them
+      topicHints: ['timeclock','jobs','tasks','shared_contracts']
     });
 
-    if (reply && typeof reply === 'string' && reply.trim()) {
-      return res.status(200).type('text/xml').send(twiml(reply));
-
+    if (answer && typeof answer === 'string' && answer.trim()) {
+      return res.status(200).type('text/xml').send(twiml(answer));
     }
     // If agent returns nothing, fall through to existing routers
   }
@@ -1746,6 +1743,7 @@ try {
   console.warn('[AGENT GATE] skipped:', e?.message);
 }
 // ========= END AGENT GATE =========
+
 
 /* ---------- Conversational router ---------- */
 try {

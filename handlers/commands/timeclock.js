@@ -24,6 +24,11 @@ const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-t
 const { getUserTzFromProfile, suggestTimezone } = require('../../utils/timezones');
 const { inferIntentFromText } = require('../../utils/intent');
 
+const agent = require('../../services/agent'); 
+const twiml = (s) => `<Response><Message>${s}</Message></Response>`;
+
+
+
 // ---------- Subscription tier limits ----------
 const TIME_ENTRY_LIMITS = {
   starter: { maxEntriesPerDay: 50 },
@@ -588,6 +593,26 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     const xtras = { ...extras, created_by: from };
 
     console.log(`[timeclock] input:`, { raw, lc, from });
+    // If the user is asking a question about timeclock, route to agent/docs
+if (/[?]$|\b(how|what|when|why|where|explain|help)\b/i.test(raw)) {
+  const answer = await agent.ask({
+    from,
+    text: raw,
+    topicHints: ['timeclock'],
+  });
+  return res.send(twiml(answer));
+}
+// explicit "help ..." or "explain ..." → agent with hints
+if (/^\s*(help|explain)\b/i.test(raw)) {
+  const answer = await agent.ask({
+    from,
+    text: raw,
+    topicHints: ['timeclock'],
+  });
+  return res.send(twiml(answer));
+}
+
+
 
     // 1) Approval gate
     if (!isApproved(userProfile, isOwner)) {
@@ -825,10 +850,15 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
       /\b(?:clock|punch)\s+(?:in|out)\s+[a-z]/i.test(raw) ||
       /^[a-z].*\b(?:clock|punch|work|shift|break|drive)\b/i.test(raw);
     const whoRaw = match.groups?.name || (!tokensContainOtherPerson ? userProfile?.name : '') || 'Unknown';
-    const who = cleanPersonName(whoRaw);
-    if (who === 'Unknown') {
-      return res.send(twiml(`⚠️ Who should I log this for? Try "Clock in Justin" or "Scott break start".`));
-    }
+    // Quick stopword guard to avoid “how/does/work/clock/in” false-positives as a person’s name
+if (/\b(how|does|do|work|clock|punch|in|out|break|drive|shift|help|explain)\b/i.test(whoRaw)) {
+  return res.send(twiml('⚠️ If you’re asking how to use timeclock, try: "help timeclock" or "how do I clock in?".'));
+}
+
+const who = cleanPersonName(whoRaw);
+if (who === 'Unknown') {
+  return res.send(twiml('⚠️ Who should I log this for? Try "Clock in Justin" or "Scott break start".'));
+}
 
     // Disambiguate name with getUserByName
     const resolved = await getUserByName(ownerId, who);

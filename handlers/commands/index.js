@@ -5,13 +5,14 @@ const { handleRevenue } = require('./revenue');
 const { handleBill } = require('./bill');
 
 const handleJob = require('./job');
-
+const agent = require('../../services/agent'); // ← add this
 const { handleQuote } = require('./quote');
 const { handleMetrics } = require('./metrics');
 const { handleTax } = require('./tax');
 const { handleReceipt } = require('./receipt');
 const { handleTimeclock } = require('./timeclock');
 const { tasksHandler } = require('./tasks');
+
 // --- Robust import for team handler (supports both export styles) ---
 const teamMod = require('./team');
 const teamFn = (typeof teamMod === 'function') ? teamMod : teamMod.handleTeam;
@@ -26,18 +27,21 @@ const {
 const { saveUserProfile } = require('../../services/postgres.js');
 const { sendTemplateMessage, sendMessage } = require('../../services/twilio');
 const { confirmationTemplates } = require('../../config');
+
+// Some projects import these; keep only if you actually use them in this file
+// (harmless if left here; just avoid unused-var lint errors)
 const OpenAI = require('openai');
 const { google } = require('googleapis');
 const { getAuthorizedClient } = require('../../services/postgres.js');
+
 const Stripe = require('stripe');
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-// NOTE: if you reference helpers like categorizeEntry / appendToUserSpreadsheet / getActiveJob / getLastQuery,
-// ensure they are imported where they actually live in your codebase.
+
+// Optional helpers (if your code references them). Safe fallbacks if module is absent.
 let categorizeEntry, appendToUserSpreadsheet, getActiveJob, getLastQuery, addPricingItem, detectErrors, correctErrorsWithAI;
 try {
-  // adjust paths as needed:
   ({ categorizeEntry, appendToUserSpreadsheet, getActiveJob, getLastQuery, addPricingItem, detectErrors, correctErrorsWithAI } =
-    require('../../services/postgres_extras')); // <— put the real module here
+    require('../../services/postgres_extras')); // <— put the real module here if you have it
 } catch {
   categorizeEntry = async () => 'Uncategorized';
   appendToUserSpreadsheet = async () => {};
@@ -47,6 +51,7 @@ try {
   detectErrors = () => null;
   correctErrorsWithAI = async () => null;
 }
+
 
 // ---------- Generic AI fallback ----------
 async function handleGenericQuery(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
@@ -79,6 +84,31 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
   try {
     console.log(`[DEBUG] Attempting command processing for ${from}: "${input}"`);
     const lcInput = String(input || '').toLowerCase();
+
+   // ask-or-do gate: questions go to RAG
+const qLike = /[?]$|\b(how|what|when|why|where|explain|help)\b/i;
+if (qLike.test(input || '')) {
+  const answer = await agent.ask({
+    from,
+    text: input,
+    topicHints: ['timeclock', 'jobs', 'tasks', 'shared_contracts'],
+  });
+  await sendMessage(from, answer);
+  return res.send('<Response></Response>');
+}
+
+// explicit "help ..." or "explain ..." → agent with hints
+if (/^\s*(help|explain)\b/i.test(input || '')) {
+  const answer = await agent.ask({
+    from,
+    text: input,
+    topicHints: ['timeclock','jobs','tasks'],
+  });
+  await sendMessage(from, answer);
+  return res.send('<Response></Response>');
+}
+
+
 
     // Check pending transaction confirmation
     const pendingState = await getPendingTransactionState(from);

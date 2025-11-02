@@ -89,6 +89,15 @@ function guardFutureOrExplain(whenUtc, tz, res, subject = 'That time') {
   }
   return false;
 }
+async function safeAgentAsk(from, text, topicHints) {
+  try {
+    return await agentAsk({ from, text, topicHints });
+  } catch (e) {
+    console.warn('[agentAsk] failed (timeclock):', e?.message);
+    return 'Timeclock help:\n• “clock in” or “clock in @ Roof Repair 7am”\n• “clock out”\n• “start break” / “end break”; “start drive” / “end drive”\n• “clock in Justin @ Roof Repair 5pm” (Owner/Board only)';
+  }
+}
+
 
 // ---------- Access control ----------
 function normalizeName(s = '') {
@@ -595,20 +604,13 @@ async function handleTimeclock(from, input, userProfile, ownerId, ownerProfile, 
     console.log(`[timeclock] input:`, { raw, lc, from });
     // If the user is asking a question about timeclock, route to agent/docs
 if (/[?]$|\b(how|what|when|why|where|explain|help)\b/i.test(raw)) {
-  const answer = await agentAsk({
-    from,
-    text: raw,
-    topicHints: ['timeclock'],
-  });
+  const answer = await safeAgentAsk(from, raw, ['timeclock']);
   return res.send(twiml(answer));
 }
+
 // explicit "help ..." or "explain ..." → agent with hints
 if (/^\s*(help|explain)\b/i.test(raw)) {
-  const answer = await agentAsk({
-    from,
-    text: raw,
-    topicHints: ['timeclock'],
-  });
+  const answer = await safeAgentAsk(from, raw, ['timeclock']);
   return res.send(twiml(answer));
 }
 

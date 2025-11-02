@@ -76,7 +76,15 @@ async function handleGenericQuery(from, input, userProfile, ownerId, ownerProfil
   }
 }
 
-
+// Safe wrapper so help never throws
+async function safeAgentAsk(from, text, topicHints) {
+  try {
+    return await agentAsk({ from, text, topicHints });
+  } catch (e) {
+    console.warn('[agentAsk] failed:', e?.message);
+    return 'Here’s the quick guide:\n• clock in — uses your active job; or “clock in @ Roof Repair 7am”\n• clock out — end the open shift\n• start break / end break; start drive / end drive\n• for another user — “clock in Justin @ Roof Repair 5pm” (Owner/Board only)';
+  }
+}
 // ---------- Your main commands aggregator (keep this; don't import another) ----------
 async function handleCommands(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lockKey = `lock:${from}`;
@@ -85,28 +93,20 @@ async function handleCommands(from, input, userProfile, ownerId, ownerProfile, i
     console.log(`[DEBUG] Attempting command processing for ${from}: "${input}"`);
     const lcInput = String(input || '').toLowerCase();
 
-   // ask-or-do gate: questions go to RAG
-const qLike = /[?]$|\b(how|what|when|why|where|explain|help)\b/i;
+ // ask-or-do gate
 if (qLike.test(input || '')) {
-  const answer = await agentAsk({
-    from,
-    text: input,
-    topicHints: ['timeclock', 'jobs', 'tasks', 'shared_contracts'],
-  });
+  const answer = await safeAgentAsk(from, input, ['timeclock', 'jobs', 'tasks', 'shared_contracts']);
   await sendMessage(from, answer);
   return res.send('<Response></Response>');
 }
 
-// explicit "help ..." or "explain ..." → agent with hints
+// explicit help/explain
 if (/^\s*(help|explain)\b/i.test(input || '')) {
-  const answer = await agentAsk({
-    from,
-    text: input,
-    topicHints: ['timeclock','jobs','tasks'],
-  });
+  const answer = await safeAgentAsk(from, input, ['timeclock','jobs','tasks']);
   await sendMessage(from, answer);
   return res.send('<Response></Response>');
 }
+
 
 
 

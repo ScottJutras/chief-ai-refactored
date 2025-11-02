@@ -3,9 +3,10 @@
 
 let rag = null;
 try {
-  // Your indexed-RAG lives here per your repo layout (services/tools/rag.js)
   rag = require('../tools/rag');
-} catch (_) {
+  console.log('[AGENT] RAG loaded successfully');
+} catch (err) {
+  console.error('[AGENT] Failed to load RAG:', err.message);
   rag = null;
 }
 
@@ -43,27 +44,34 @@ async function ask({ from, text, topicHints = [] }) {
 
   // If nothing in text or hints screams a topic, show a concise menu
   const isGeneric =
-    !topic &&
-    /\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(String(text || '').toLowerCase());
+  !topic &&
+  /\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(String(text || '').toLowerCase());
 
-  if (isGeneric) {
-    return [
-      'Here’s what I can help with:',
-      '',
-      '• **Jobs** — create job <name>, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>',
-      '• **Tasks** — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3',
-      '• **Timeclock** — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm',
-    ].join('\n');
-  }
+if (isGeneric) {
+  return [
+    'PocketCFO — What I can do:',
+    '• **Jobs**: create job, set active job, list jobs, close job',
+    '• **Tasks**: task – buy nails, my tasks, done #4, due #3 Friday',
+    '• **Timeclock**: clock in, clock out, start break, timesheet',
+    '• **Money**: expense $50, revenue $500, bill $200',
+    '• **Reports**: metrics, tax, quotes',
+    '• Ask me anything — I’ll search your SOPs!'
+  ].join('\n');
+}
 
-  // Prefer RAG if present
+    // Prefer RAG if present
   if (rag) {
     const fn = rag.answer || rag.ask || rag.query;
     if (typeof fn === 'function') {
+      console.log('[AGENT] RAG available:', !!rag);
+      console.log('[AGENT] Calling RAG with query:', text);
       // Pass topic in hints so your RAG can bias retrieval
       const hints = topic ? Array.from(new Set([topic, ...topicHints])) : topicHints;
       const out = await fn({ from, query: text, hints });
-      if (out && typeof out === 'string' && out.trim()) return out;
+      if (out && typeof out === 'string' && out.trim()) {
+        console.log('[AGENT] RAG returned:', out.slice(0, 200) + '...');
+        return out;
+      }
     }
   }
 

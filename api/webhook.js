@@ -5,7 +5,7 @@ const webhookRouter = require('../routes/webhook');
 
 const app = express();
 
-// 0) Log every invocation before anything else
+// Log every invocation
 app.use((req, res, next) => {
   console.log('[SVLESS] hit', {
     url: req.originalUrl,
@@ -16,7 +16,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// 1) 9s global watchdog — guarantees a reply before Twilio’s 15s SLA
+// HARD FAST-PATH for GET /  (Twilio sometimes does GET; reply TwiML immediately)
+app.get('/', (_req, res) => {
+  return res
+    .status(200)
+    .type('text/xml')
+    .send('<Response><Message>OK</Message></Response>');
+});
+
+// 9s global watchdog (guarantee a reply for everything else)
 app.use((req, res, next) => {
   if (!res.locals._svlessWatchdog) {
     res.locals._svlessWatchdog = setTimeout(() => {
@@ -27,9 +35,9 @@ app.use((req, res, next) => {
           .type('text/xml')
           .send(
             '<Response><Message>Here’s what I can help with:\n\n' +
-              '• Jobs — create job, list jobs, set active job &lt;name&gt;, active job?, close job &lt;name&gt;, move last log to &lt;name&gt;\n' +
-              '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
-              '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm' +
+            '• Jobs — create job, list jobs, set active job &lt;name&gt;, active job?, close job &lt;name&gt;, move last log to &lt;name&gt;\n' +
+            '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
+            '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm' +
             '</Message></Response>'
           );
       }
@@ -40,8 +48,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// IMPORTANT: no body parsers here.
-// Route EVERYTHING to the webhook router.
+// Mount the actual webhook router for everything else
 app.all('*', webhookRouter);
 
 module.exports = serverless(app);

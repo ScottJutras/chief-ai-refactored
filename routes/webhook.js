@@ -49,7 +49,7 @@ const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = req
 const router = express.Router();
 const querystring = require('querystring');
 
-// A) 9s router-level safety reply (in case deeper logic stalls)
+// 0) Router-level 9s safety (belt & suspenders)
 router.use((req, res, next) => {
   if (!res.locals._routerSafety) {
     res.locals._routerSafety = setTimeout(() => {
@@ -73,25 +73,25 @@ router.use((req, res, next) => {
   next();
 });
 
-// B) Fix Content-Length BEFORE touching the stream
+// 1) Content-Length guard BEFORE touching stream
 router.use((req, _res, next) => {
   const cl = req.headers['content-length'];
   if (cl) {
     const len = parseInt(cl, 10);
     if (!Number.isFinite(len) || len <= 0 || len > 1_000_000) {
-      delete req.headers['content-length']; // force unknown length
+      delete req.headers['content-length']; // force unknown
     }
   }
   next();
 });
 
-// C) Manual tolerant parser for Twilio POST (x-www-form-urlencoded)
+// 2) Manual tolerant parser for Twilio POST (x-www-form-urlencoded)
 router.use((req, _res, next) => {
   const ct = (req.headers['content-type'] || '').toLowerCase();
   const isForm = ct.includes('application/x-www-form-urlencoded');
 
   if (req.method !== 'POST' || !isForm) return next();
-  if (req.body && Object.keys(req.body).length) return next(); // already parsed
+  if (req.body && Object.keys(req.body).length) return next();
 
   let raw = '';
   req.setEncoding('utf8');
@@ -99,7 +99,7 @@ router.use((req, _res, next) => {
   req.on('data', (chunk) => {
     raw += chunk;
     if (raw.length > 1_000_000) {
-      console.warn('[WEBHOOK] raw body exceeded 1MB, aborting read');
+      console.warn('[WEBHOOK] raw body exceeded 1MB, aborting');
       try { req.destroy(); } catch {}
     }
   });
@@ -108,21 +108,19 @@ router.use((req, _res, next) => {
     req.rawBody = raw;
     try {
       req.body = raw ? querystring.parse(raw) : {};
-    } catch (e) {
-      console.warn('[WEBHOOK] form parse failed:', e?.message);
+    } catch {
       req.body = {};
     }
     next();
   });
 
-  req.on('error', (e) => {
-    console.warn('[WEBHOOK] stream error:', e?.message);
+  req.on('error', () => {
     req.body = req.body || {};
     next();
   });
 });
 
-// D) Mirror query into body for ANY method if body empty (GET-safe)
+// 3) Mirror query into body for any method if body empty (GET-safe)
 router.use((req, _res, next) => {
   if (!req.body || !Object.keys(req.body).length) {
     if (req.query && Object.keys(req.query).length) {
@@ -132,7 +130,7 @@ router.use((req, _res, next) => {
   next();
 });
 
-// E) Early request log (you'll always see this if the function is reached)
+// 4) Early ingress log (so you can prove the request reached the router)
 router.use((req, _res, next) => {
   console.log('[WEBHOOK] hit', {
     method: req.method,
@@ -144,7 +142,7 @@ router.use((req, _res, next) => {
   next();
 });
 
-// F) Ultra-fast “generic help” short-circuit (no DB/AI needed)
+// 5) Super-fast generic help short-circuit
 router.use((req, res, next) => {
   const text = String((req.body && (req.body.Body || req.body.body)) || '').toLowerCase();
   const generic = /\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(text);
@@ -165,6 +163,19 @@ router.use((req, res, next) => {
   }
   next();
 });
+
+// 6) FINAL SAFETY: if no handler replies by the end of router chain
+router.use((req, res, next) => {
+  if (!res.headersSent) {
+    console.warn('[WEBHOOK] fell through — sending fallback TwiML');
+    return res
+      .status(200)
+      .type('text/xml')
+      .send('<Response><Message>OK</Message></Response>');
+  }
+  next();
+});
+
 
 
 // ----------------- helpers -----------------

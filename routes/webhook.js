@@ -48,11 +48,11 @@ const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = req
 
 const router = express.Router();
 
+// Fix bad Content-Length BEFORE any parser
 router.use((req, _res, next) => {
   const cl = req.headers['content-length'];
-  if (cl && !/^\d+$/.test(cl)) {
-    delete req.headers['content-length'];
-  } else if (cl) {
+  if (cl && !/^\d+$/.test(cl)) delete req.headers['content-length'];
+  else if (cl) {
     const n = parseInt(cl, 10);
     if (!Number.isFinite(n) || n < 0) delete req.headers['content-length'];
   }

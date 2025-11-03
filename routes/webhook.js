@@ -57,6 +57,16 @@ const { looksLikeTask, parseTaskUtterance } = require('../nlp/task_intents');
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
 const router = express.Router();
+// Fix: Twilio malformed payload
+router.use((req, res, next) => {
+  if (req.headers['content-length'] && req.headers['content-length'] !== '0') {
+    const len = parseInt(req.headers['content-length'], 10);
+    if (isNaN(len) || len < 0) {
+      req.headers['content-length'] = '0';
+    }
+  }
+  next();
+});
 // ----------------- helpers -----------------
 function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';

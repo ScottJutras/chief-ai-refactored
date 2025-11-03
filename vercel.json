@@ -1,17 +1,39 @@
 {
   "version": 2,
   "functions": {
-    "api/index-sops.js": { "includeFiles": "docs/howto/**", "memory": 1024 },
-    "api/webhook.js": { "memory": 1024 },
-    "api/index.js": { "memory": 1024 }
-    
+    "api/webhook.js": {
+      "memory": 1024,
+      "maxDuration": 10,
+      "excludeFiles": [
+        "docs/**",
+        "public/**",
+        "dashboard/**",
+        "parse/**",
+        "deep-dive/**",
+        "api/index-sops.js",
+        "api/index.js",
+        "node_modules/pdfkit/**",
+        "node_modules/exceljs/**",
+        "node_modules/@google-cloud/**",
+        "node_modules/google-auth-library/**"
+      ]
+    },
+    "api/index-sops.js": {
+      "memory": 1024,
+      "maxDuration": 10,
+      "includeFiles": "docs/howto/**"
+    },
+    "api/index.js": {
+      "memory": 1024,
+      "maxDuration": 10
+    }
   },
   "routes": [
-    { "src": "/api/index-sops", "dest": "/api/index-sops.js" },
-    { "src": "/api/webhook/reminders/cron/.*", "dest": "/api/webhook.js" },
-    { "src": "/api/webhook", "dest": "/api/webhook.js" },
-    { "src": "/webhook", "dest": "/api/webhook.js" },
-    { "src": "/(.*)", "dest": "/api/index.js" }
+    { "src": "^/api/index-sops$", "dest": "/api/index-sops.js" },
+    { "src": "^/api/webhook/reminders/cron/(.*)$", "dest": "/api/webhook.js" },
+    { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
+    { "src": "^/webhook$", "dest": "/api/webhook.js" },
+    { "src": "^/(.*)$", "dest": "/api/index.js" }
   ],
   "crons": [
     {

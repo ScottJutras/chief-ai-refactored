@@ -73,19 +73,20 @@ async function ask({ from, text, topicHints = [] }) {
 
   // Prefer RAG if present
   const ragMod = getRag();
-  if (ragMod) {
-    const fn = ragMod.answer || ragMod.ask || ragMod.query;
-    if (typeof fn === 'function') {
-      try {
-        console.log('[AGENT] Calling RAG with query:', text);
-        const hints = topic ? Array.from(new Set([topic, ...topicHints])) : topicHints;
-        const out = await fn({ from, query: text, hints });
-        if (out && typeof out === 'string' && out.trim()) {
-          console.log('[AGENT] RAG returned:', out.slice(0, 200) + '...');
-          return out;
-        }
-      } catch (e) {
-        console.warn('[AGENT] RAG call failed:', e?.message);
+if (ragMod) {
+  const fn = ragMod.answer || ragMod.ask || ragMod.query;
+  if (typeof fn === 'function') {
+    try {
+      console.log('[AGENT] Calling RAG with query:', text);
+      const hints = topic ? Array.from(new Set([topic, ...topicHints])) : topicHints;
+      // add ownerId if you have it in scope; otherwise skip it (rag defaults to GLOBAL)
+      const out = await fn({ from, query: text, hints /*, ownerId*/ });
+      if (out && typeof out === 'string' && out.trim()) {
+        console.log('[AGENT] RAG returned:', out.slice(0, 200) + '...');
+        return out;
+      }
+    } catch (e) {
+      console.warn('[AGENT] RAG call failed:', e?.message);
       }
     }
   }

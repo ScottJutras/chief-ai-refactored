@@ -3,9 +3,20 @@ const serverless = require('serverless-http');
 const express = require('express');
 const webhookRouter = require('../routes/webhook');
 
-// Build a tiny app that just mounts the router.
-// Do NOT attach json/urlencoded parsers here — the router does its own urlencoded.
 const app = express();
+
+// Early, unconditional log so we know every invocation made it this far
+app.use((req, _res, next) => {
+  console.log('[SVLESS] hit', {
+    url: req.originalUrl,
+    method: req.method,
+    ct: req.headers['content-type'] || null,
+    cl: req.headers['content-length'] || null
+  });
+  next();
+});
+
+// Mount router (router does its own tolerant parsing)
 app.use('/', webhookRouter);
 
 // Optional health

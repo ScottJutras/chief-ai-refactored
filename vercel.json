@@ -1,21 +1,15 @@
 {
   "version": 2,
   "functions": {
-    "api/index-sops.js": {
-      "includeFiles": "docs/howto/**",
-      "memory": 1024
-    },
-    "api/webhook.js": {
-      "memory": 1024
-    },
-    "api/index.js": {
-      "memory": 1024
-    }
+    "api/index-sops.js": { "includeFiles": "docs/howto/**", "memory": 1024 },
+    "api/webhook.js": { "memory": 1024 },
+    "api/index.js": { "memory": 1024 }
   },
   "routes": [
     { "src": "/api/index-sops", "dest": "/api/index-sops.js" },
     { "src": "/api/webhook/reminders/cron/.*", "dest": "/api/webhook.js" },
     { "src": "/api/webhook", "dest": "/api/webhook.js" },
+    { "src": "/webhook", "dest": "/api/webhook.js" },
     { "src": "/(.*)", "dest": "/api/index.js" }
   ],
   "crons": [

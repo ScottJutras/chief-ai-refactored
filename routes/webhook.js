@@ -49,7 +49,32 @@ const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = req
 const router = express.Router();
 const querystring = require('querystring');
 
-// 1) Fix Content-Length BEFORE touching the stream
+// ---- 0) 15s safety: always reply something
+router.use((req, res, next) => {
+  // if someone already set one, respect it
+  if (!res.locals._safetyTimer) {
+    res.locals._safetyTimer = setTimeout(() => {
+      if (!res.headersSent) {
+        console.warn('[WEBHOOK] Safety reply fired (no handler responded in time).');
+        res
+          .status(200)
+          .type('text/xml')
+          .send(
+            '<Response><Message>Here’s what I can help with:\n\n' +
+              '• Jobs — create job, list jobs, set active job &lt;name&gt;, active job?, close job &lt;name&gt;, move last log to &lt;name&gt;\n' +
+              '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
+              '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm' +
+            '</Message></Response>'
+          );
+      }
+    }, 15000); // 15s
+    res.on('finish', () => clearTimeout(res.locals._safetyTimer));
+    res.on('close',  () => clearTimeout(res.locals._safetyTimer));
+  }
+  next();
+});
+
+// ---- 1) Fix Content-Length BEFORE touching the stream
 router.use((req, _res, next) => {
   const cl = req.headers['content-length'];
   if (cl) {
@@ -61,48 +86,64 @@ router.use((req, _res, next) => {
   next();
 });
 
-// 2) Manual tolerant parser for Twilio (POST form-encoded)
-router.use((req, res, next) => {
-  // Only parse POST form bodies that are form-encoded
+// ---- 2) Manual tolerant parser for Twilio (POST form-encoded only)
+router.use((req, _res, next) => {
   const ct = (req.headers['content-type'] || '').toLowerCase();
   const isForm = ct.includes('application/x-www-form-urlencoded');
 
   if (req.method !== 'POST' || !isForm) return next();
-
-  // If some upstream already parsed, keep it
-  if (req.body && Object.keys(req.body).length) return next();
+  if (req.body && Object.keys(req.body).length) return next(); // something already parsed it
 
   let raw = '';
   req.setEncoding('utf8');
 
   req.on('data', (chunk) => {
     raw += chunk;
-    if (raw.length > 1_000_000) { // 1MB guardrail
-      raw = '';
+    if (raw.length > 1_000_000) { // 1MB guard
+      console.warn('[WEBHOOK] raw body exceeded 1MB, aborting read');
       try { req.destroy(); } catch {}
     }
   });
 
   req.on('end', () => {
-    req.rawBody = raw; // keep for Twilio signature checks
+    req.rawBody = raw; // keep for Twilio signature checks if you use them
     try {
       req.body = raw ? querystring.parse(raw) : {};
-    } catch {
+    } catch (e) {
+      console.warn('[WEBHOOK] form parse failed:', e?.message);
       req.body = {};
     }
     next();
   });
 
-  req.on('error', () => next());
+  req.on('error', (e) => {
+    console.warn('[WEBHOOK] stream error:', e?.message);
+    // fall back to query if available
+    req.body = req.body || {};
+    next();
+  });
 });
 
-// 3) Fallback: if POST had no body (rare), mirror query params into body
+// ---- 3) Fallback: if POST had no body, mirror query params (Twilio safe)
 router.use((req, _res, next) => {
   if (req.method === 'POST' && (!req.body || !Object.keys(req.body).length) && req.query) {
     req.body = { ...req.query };
   }
   next();
 });
+
+// ---- 4) Early request log
+router.use((req, _res, next) => {
+  console.log('[WEBHOOK] hit', {
+    method: req.method,
+    url: req.originalUrl,
+    ct: req.headers['content-type'] || null,
+    cl: req.headers['content-length'] || null,
+    hasBody: !!(req.body && Object.keys(req.body).length)
+  });
+  next();
+});
+
 
 // ----------------- helpers -----------------
 function maskPhone(p) {

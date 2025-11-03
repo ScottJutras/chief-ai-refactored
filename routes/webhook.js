@@ -1,5 +1,4 @@
 // routes/webhook.js
-// Serverless-safe WhatsApp webhook router for Vercel + Express (conversational + memory)
 const express = require('express');
 const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
@@ -18,22 +17,20 @@ const { tasksTool } = require('../services/tools/tasks');
 const { jobTool } = require('../services/tools/job');
 const { ragTool } = require('../services/tools/rag');
 
-
 // Middleware
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
 const { userProfileMiddleware } = require('../middleware/userProfile');
 const { tokenMiddleware } = require('../middleware/token');
 const { errorMiddleware } = require('../middleware/error');
 
-// Services — keep only what this file actually uses
 const {
   query,
-  listMyTasks,        // used in "My tasks" block
-  getPendingPrompt,   // used for pending prompt checks
-  logTimeEntry,       // used for timeclock logs
-  getActiveJob,       // used in job-aware flows
-  appendToUserSpreadsheet, // used for sheet append actions
-  generateTimesheet,  // used in export flows
+  listMyTasks,
+  getPendingPrompt,
+  logTimeEntry,
+  getActiveJob,
+  appendToUserSpreadsheet,
+  generateTimesheet,
 } = require('../services/postgres');
 
 const { sendMessage, sendTemplateMessage } = require('../services/twilio');
@@ -41,39 +38,30 @@ const { parseUpload } = require('../services/deepDive');
 const {
   getPendingTransactionState,
   setPendingTransactionState,
-  deletePendingTransactionState
+  deletePendingTransactionState,
 } = require('../utils/stateManager');
 
-
-
-// AI routers
-const { routeWithAI } = require('../nlp/intentRouter'); // tool-calls (strict)
+const { routeWithAI } = require('../nlp/intentRouter');
 const { converseAndRoute } = require('../nlp/conversation');
-
-// NLP task helpers
 const { looksLikeTask, parseTaskUtterance } = require('../nlp/task_intents');
-
-// Memory
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
 const router = express.Router();
-// --- Fix: Twilio malformed payload / bad Content-Length (must be before any parsers) ---
+
 router.use((req, _res, next) => {
   const cl = req.headers['content-length'];
   if (cl && !/^\d+$/.test(cl)) {
-    // non-numeric -> drop header so body parsers fall back safely
     delete req.headers['content-length'];
   } else if (cl) {
-    const len = parseInt(cl, 10);
-    if (!Number.isFinite(len) || len < 0) {
-      delete req.headers['content-length'];
-    }
+    const n = parseInt(cl, 10);
+    if (!Number.isFinite(n) || n < 0) delete req.headers['content-length'];
   }
   next();
 });
-// 2. Body parsers (after guard)
+
 router.use(express.urlencoded({ extended: false }));
-router.use(express.json());
+
+
 // ----------------- helpers -----------------
 function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';

@@ -4,6 +4,7 @@
     "api/index-sops.js": { "includeFiles": "docs/howto/**", "memory": 1024 },
     "api/webhook.js": { "memory": 1024 },
     "api/index.js": { "memory": 1024 }
+    
   },
   "routes": [
     { "src": "/api/index-sops", "dest": "/api/index-sops.js" },

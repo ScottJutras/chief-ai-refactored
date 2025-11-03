@@ -23,9 +23,9 @@
   "routes": [
     { "src": "^/api/index-sops$", "dest": "/api/index-sops.js" },
     { "src": "^/api/webhook/reminders/cron/(.*)$", "dest": "/api/webhook.js" },
-    { "src": "^/api/webhook$", "dest": "/api/webhook_raw.js" },   // TEMP route to raw handler
-    { "src": "^/webhook$", "dest": "/api/webhook_raw.js" },       // TEMP alias to raw handler
-    { "src": "^/api/ping$", "dest": "/api/ping.js" },             // NEW: ping endpoint
+    { "src": "^/api/webhook$", "dest": "/api/webhook_raw.js" },   
+    { "src": "^/webhook$", "dest": "/api/webhook_raw.js" },       
+    { "src": "^/api/ping$", "dest": "/api/ping.js" },             
     { "src": "^/(.*)$", "dest": "/api/index.js" }
   ],
   "crons": [

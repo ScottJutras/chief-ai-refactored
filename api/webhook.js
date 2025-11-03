@@ -5,10 +5,10 @@ const webhookRouter = require('../routes/webhook');
 
 const app = express();
 
-// 0) Wrapper-level log (very early)
+// Very early log (note: Vercel strips /api/webhook before this app)
 app.use((req, _res, next) => {
   console.log('[SVLESS] hit', {
-    url: req.originalUrl,
+    route: '/api/webhook' + (req.originalUrl || '/'),
     method: req.method,
     ct: req.headers['content-type'] || null,
     cl: req.headers['content-length'] || null,
@@ -16,18 +16,15 @@ app.use((req, _res, next) => {
   next();
 });
 
-// 1) Hard short-circuit: ANY GET → fast TwiML (prevents 11200 on probes / misrouted GETs)
-app.get('/*', (_req, res) => {
-  return res
-    .status(200)
-    .type('application/xml')
-    .send('<Response><Message>OK</Message></Response>');
-});
-
-// 2) POST and others go to the webhook router (which has tolerant parsing)
+// Mount the webhook router (it handles tolerant parsing + non-POST '/')
 app.use('/', webhookRouter);
 
-// 3) Final safeguard: if nothing handled it, send OK TwiML.
+// Optional: health check for GET '/' (does NOT catch other paths)
+app.get('/', (_req, res) => {
+  res.status(200).type('text/plain').send('Webhook OK');
+});
+
+// Final safeguard (rare)
 app.use((req, res) => {
   if (!res.headersSent) {
     console.warn('[SVLESS] fell-through final safeguard');

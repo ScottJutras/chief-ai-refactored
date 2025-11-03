@@ -51,6 +51,7 @@ const querystring = require('querystring');
 
 /**
  * 0) Router-level 9s safety: if nothing responds, send a helpful menu so Twilio gets 200.
+ *    This is secondary to the wrapper GET short-circuit.
  */
 router.use((req, res, next) => {
   if (!res.locals._routerSafety) {
@@ -69,9 +70,7 @@ router.use((req, res, next) => {
           );
       }
     }, 9000);
-    const clear = () => {
-      try { clearTimeout(res.locals._routerSafety); } catch {}
-    };
+    const clear = () => { try { clearTimeout(res.locals._routerSafety); } catch {} };
     res.on('finish', clear);
     res.on('close', clear);
   }
@@ -80,17 +79,17 @@ router.use((req, res, next) => {
 
 /**
  * 1) Content-Length guards BEFORE touching the stream.
- *    - For NON-POST, strip content-length to prevent the platform waiting on a body.
+ *    - For NON-POST, strip content-length to avoid serverless waiting for a body.
  *    - For POST, keep sanity checks.
  */
 router.use((req, _res, next) => {
-  const rawCl = req.headers['content-length'];
+  const cl = req.headers['content-length'];
   if (req.method !== 'POST') {
-    if (rawCl != null) delete req.headers['content-length']; // critical for GET-with-body edge cases
+    if (cl != null) delete req.headers['content-length']; // critical for GET-with-body edge cases
     return next();
   }
-  if (rawCl != null) {
-    const len = parseInt(rawCl, 10);
+  if (cl != null) {
+    const len = parseInt(cl, 10);
     if (!Number.isFinite(len) || len <= 0 || len > 1_000_000) {
       delete req.headers['content-length']; // force unknown / ignore bad
     }
@@ -157,7 +156,7 @@ router.use((req, _res, next) => {
 });
 
 /**
- * 5) Super-fast generic help short-circuit for “what can I do / help / how to / what now”.
+ * 5) Fast generic help short-circuit for “what can I do / help / how to / what now”.
  */
 router.use((req, res, next) => {
   const text = String((req.body && (req.body.Body || req.body.body)) || '').toLowerCase().trim();
@@ -180,16 +179,6 @@ router.use((req, res, next) => {
   next();
 });
 
-/**
- * 6) FINAL FALLBACK — if nothing replied by end of chain, send OK (prevents 11200).
- */
-router.use((req, res, next) => {
-  if (!res.headersSent) {
-    console.warn('[WEBHOOK] fell through — sending fallback TwiML');
-    return res.status(200).type('text/xml').send('<Response><Message>OK</Message></Response>');
-  }
-  next();
-});
 
 
 // ----------------- helpers -----------------
@@ -2131,15 +2120,16 @@ try {
   }
 
   // ----- Last-resort fallback (no one replied) -----
-  if (!res.headersSent) {
-    console.warn('[WEBHOOK] No handler replied; sending default menu.');
-    return sendTwiml(res,
-      'Here’s what I can help with:\n\n' +
+if (!res.headersSent) {
+  console.warn('[WEBHOOK] No handler replied; sending default menu.');
+  return sendTwiml(
+    res,
+    'Here’s what I can help with:\n\n' +
       '• Jobs — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>\n' +
       '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
       '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm'
-    );
-  }
+  );
+}
 
 } catch (error) {
   console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
@@ -2154,10 +2144,9 @@ try {
   }
 }
 
-  },
-  errorMiddleware
+},
+errorMiddleware
 );
-
 
 
 // ---- Reminders Cron (simple polling) ----
@@ -2170,7 +2159,8 @@ router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) 
     });
 
     const isVercelCron = req.headers['x-vercel-cron'] === '1';
-    const slugOk = !!req.params.slug && (!process.env.CRON_SECRET || req.params.slug === process.env.CRON_SECRET);
+    const slugOk =
+      !!req.params.slug && (!process.env.CRON_SECRET || req.params.slug === process.env.CRON_SECRET);
 
     if (!isVercelCron && !slugOk) {
       return res.status(403).send('Forbidden');
@@ -2200,4 +2190,15 @@ router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) 
   }
 });
 
+
+// ---- Final safety: prevent Twilio 11200 on any fall-through ----
+router.use((req, res, next) => {
+  if (!res.headersSent) {
+    console.warn('[WEBHOOK] fell through — sending fallback TwiML');
+    return res.status(200).type('text/xml').send('<Response><Message>OK</Message></Response>');
+  }
+  next();
+});
+
 module.exports = router;
+

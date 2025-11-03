@@ -1,7 +1,6 @@
 // api/webhook.js
 const serverless = require('serverless-http');
 const express = require('express');
-const webhookRouter = require('../routes/webhook');
 
 const app = express();
 
@@ -36,8 +35,28 @@ app.all('/', (req, res, next) => {
     .send('<Response><Message>OK</Message></Response>');
 });
 
-// Mount the webhook router (it has tolerant POST parsing etc.)
-app.use('/', webhookRouter);
+// ---------- Lazy mount the heavy router ----------
+let _router = null;
+function getRouter() {
+  if (_router) return _router;
+  try {
+    _router = require('../routes/webhook');
+  } catch (e) {
+    console.error('[SVLESS] failed to load routes/webhook:', e?.message);
+    const r = express.Router();
+    r.post('/', (_req, res) =>
+      res
+        .status(200)
+        .type('application/xml')
+        .send('<Response><Message>Temporarily unavailable. Try again.</Message></Response>')
+    );
+    _router = r;
+  }
+  return _router;
+}
+
+// Mount via delegator so require happens only when needed
+app.use('/', (req, res, next) => getRouter().handle(req, res, next));
 
 // Optional health (kept exact-path and below router, harmless)
 app.get('/', (_req, res) => {

@@ -1,13 +1,19 @@
 // services/agent/index.js
 // Thin shim that routes Q&A to your RAG tool if present, with topic-aware fallback.
 
-let rag = null;
-try {
-  rag = require('../tools/rag');
-  console.log('[AGENT] RAG loaded successfully');
-} catch (err) {
-  console.error('[AGENT] Failed to load RAG:', err.message);
-  rag = null;
+// ----- Lazy RAG loader (prevents cold-start hangs at module load) -----
+let rag = null, ragTried = false;
+function getRag() {
+  if (ragTried) return rag;
+  ragTried = true;
+  try {
+    rag = require('../tools/rag');
+    console.log('[AGENT] RAG loaded successfully');
+  } catch (err) {
+    console.warn('[AGENT] No RAG available:', err?.message);
+    rag = null;
+  }
+  return rag;
 }
 
 // --- Topic detector ---------------------------------------------------------
@@ -37,6 +43,7 @@ function pickTopic(text = '', hints = []) {
 
   return null; // generic / menu
 }
+
 /**
  * Ask the agent (RAG) for an answer.
  * @param {{from:string, text:string, topicHints?:string[]}} args
@@ -48,8 +55,8 @@ async function ask({ from, text, topicHints = [] }) {
   // 1) Generic help phrases -> show menu EARLY (ignore hints)
   const isGeneric = /\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(lc);
   if (isGeneric) {
-  console.log('[AGENT] generic menu path hit');
-  return [
+    console.log('[AGENT] generic menu path hit');
+    return [
       'PocketCFO — What I can do:',
       '• **Jobs**: create job, set active job, list jobs, close job',
       '• **Tasks**: task – buy nails, my tasks, done #4, due #3 Friday',
@@ -65,16 +72,20 @@ async function ask({ from, text, topicHints = [] }) {
   console.log('[AGENT] topic:', topic || 'generic', 'text:', text);
 
   // Prefer RAG if present
-  if (rag) {
-    const fn = rag.answer || rag.ask || rag.query;
+  const ragMod = getRag();
+  if (ragMod) {
+    const fn = ragMod.answer || ragMod.ask || ragMod.query;
     if (typeof fn === 'function') {
-      console.log('[AGENT] RAG available:', !!rag);
-      console.log('[AGENT] Calling RAG with query:', text);
-      const hints = topic ? Array.from(new Set([topic, ...topicHints])) : topicHints;
-      const out = await fn({ from, query: text, hints });
-      if (out && typeof out === 'string' && out.trim()) {
-        console.log('[AGENT] RAG returned:', out.slice(0, 200) + '...');
-        return out;
+      try {
+        console.log('[AGENT] Calling RAG with query:', text);
+        const hints = topic ? Array.from(new Set([topic, ...topicHints])) : topicHints;
+        const out = await fn({ from, query: text, hints });
+        if (out && typeof out === 'string' && out.trim()) {
+          console.log('[AGENT] RAG returned:', out.slice(0, 200) + '...');
+          return out;
+        }
+      } catch (e) {
+        console.warn('[AGENT] RAG call failed:', e?.message);
       }
     }
   }

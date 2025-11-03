@@ -4,19 +4,7 @@
     "api/webhook.js": {
       "memory": 1024,
       "maxDuration": 10,
-      "excludeFiles": [
-        "docs/**",
-        "public/**",
-        "dashboard/**",
-        "parse/**",
-        "deep-dive/**",
-        "api/index-sops.js",
-        "api/index.js",
-        "node_modules/pdfkit/**",
-        "node_modules/exceljs/**",
-        "node_modules/@google-cloud/**",
-        "node_modules/google-auth-library/**"
-      ]
+      "excludeFiles": "{docs/**,public/**,dashboard/**,parse/**,deep-dive/**,api/index-sops.js,api/index.js,node_modules/pdfkit/**,node_modules/exceljs/**,node_modules/@google-cloud/**,node_modules/google-auth-library/**}"
     },
     "api/index-sops.js": {
       "memory": 1024,

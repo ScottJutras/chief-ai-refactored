@@ -26,9 +26,9 @@ router.use((req, _res, next) => {
 });
 
 // --------- quick safety + version ping before any heavy logic ----------
-router.post('/', async (req, res, next) => {
+router.post('*', async (req, res, next) => {
   try {
-    // 8s safety: ensure Twilio gets 200 even if something stalls
+    // 8s safety…
     if (!res.locals._safety) {
       res.locals._safety = setTimeout(() => {
         if (!res.headersSent) {

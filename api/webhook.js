@@ -5,14 +5,22 @@ module.exports = (req, res) => {
     res.setHeader('Content-Type', 'application/xml');
     return res.end('<Response><Message>OK</Message></Response>');
   }
+
   let handler;
   try {
-    handler = require('../routes/webhook');
+    handler = require('../routes/webhook'); // must export (req,res)
   } catch (e) {
     console.error('[WEBHOOK] router load failed:', e && e.message);
     res.statusCode = 200;
     res.setHeader('Content-Type', 'application/xml');
     return res.end('<Response><Message>Temporarily unavailable. Try again.</Message></Response>');
   }
+
+  // Normalize path so router.post('/') matches
+  try {
+    req.url = '/';
+    req.originalUrl = '/';
+  } catch {}
+
   return handler(req, res);
 };

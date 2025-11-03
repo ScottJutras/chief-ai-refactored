@@ -1,12 +1,11 @@
+// api/webhook.js
 const serverless = require('serverless-http');
 const express = require('express');
-const bodyParser = require('body-parser');
 const webhookRouter = require('../routes/webhook');
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false, limit: '50mb' }));
-app.use(bodyParser.json({ limit: '50mb' }));
 
+// Do NOT add body parsers here; the router handles Twilio's urlencoded already.
 app.use('/', webhookRouter);
 app.get('/', (_req, res) => res.status(200).send('Webhook OK'));
 

@@ -11,11 +11,15 @@ const { handleOnboarding } = require('../handlers/onboarding');
 const { handleTimeclock } = require('../handlers/commands/timeclock');
 const { handleOwnerApproval } = require('../handlers/commands/owner_approval');
 const handleJob = require('../handlers/commands/job');
-const { ask: agentAsk } = require('../services/agent');
-const { timeclockTool } = require('../services/tools/timeclock');
-const { tasksTool } = require('../services/tools/tasks');
-const { jobTool } = require('../services/tools/job');
-const { ragTool } = require('../services/tools/rag');
+
+// Lazy agent getter (prevents cold-start hangs during require)
+let _agentAsk = null;
+function agentAskLazy() {
+  if (_agentAsk) return _agentAsk;
+  try { ({ ask: _agentAsk } = require('../services/agent')); }
+  catch { _agentAsk = async () => ''; }
+  return _agentAsk;
+}
 
 // middleware (keep yours) …
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
@@ -132,7 +136,6 @@ router.use((req, _res, next) => {
   const isForm = ct.includes('application/x-www-form-urlencoded');
   if (req.method !== 'POST' || !isForm) return next();
   if (req.body && Object.keys(req.body).length) return next();
-
   let raw = '';
   req.setEncoding('utf8');
   req.on('data', (chunk) => {
@@ -597,9 +600,13 @@ router.post(
   '/',
   // 0) Basic guards (with trace + correct content-length parse)
   (req, res, next) => {
+    // router.post guarantees POST, but keep the guard cheap
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+
     const len = parseInt(req.headers['content-length'] || '0', 10);
-    if (len > 5 * 1024 * 1024) return res.status(413).send('Payload too large');
+    if (Number.isFinite(len) && len > 5 * 1024 * 1024) {
+      return res.status(413).send('Payload too large');
+    }
 
     console.log('[WEBHOOK] hit', {
       url: req.originalUrl,
@@ -613,8 +620,8 @@ router.post(
 
   // 0.1) Version ping BEFORE heavy middlewares
   (req, res, next) => {
-    const body = (req.body?.Body || '').trim().toLowerCase();
-    if (body === 'version') {
+    const bodyText = String(req.body?.Body || '').trim().toLowerCase();
+    if (bodyText === 'version') {
       const v = process.env.VERCEL_GIT_COMMIT_SHA || process.env.COMMIT_SHA || 'dev-local';
       return res
         .status(200)
@@ -623,62 +630,97 @@ router.post(
     }
     next();
   },
+  // 0.2) 9s router safety reply (so Twilio gets a 200 even if something hangs)
+  (req, res, next) => {
+    if (!res.locals._routerSafety) {
+      res.locals._routerSafety = setTimeout(() => {
+        if (!res.headersSent) {
+          console.warn('[WEBHOOK] 9s router safety reply');
+          res
+            .status(200)
+            .type('text/xml')
+            .send(
+              '<Response><Message>' +
+                'Here’s what I can help with:\n\n' +
+                '• Jobs — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>\n' +
+                '• Tasks — task – buy nails, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
+                '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week' +
+              '</Message></Response>'
+            );
+        }
+      }, 9000);
 
-  // 1) Your existing middlewares
+      const clear = () => { try { clearTimeout(res.locals._routerSafety); } catch {} };
+      res.on('finish', clear);
+      res.on('close', clear);
+    }
+    next();
+  },
+
+  // 1) Your existing middlewares — these now see a parsed req.body
   userProfileMiddleware,
   lockMiddleware,
   tokenMiddleware,
 
   // 2) Main handler
-  async (req, res, next) => {
-    // NOTE: from/tenantId/userId are defined outside the big try so they're visible to catch/finally
-    const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
-    const from = req.from || String(From || '').replace(/^whatsapp:/, '').replace(/\D/g, '');
-    let input = (Body || '').trim();         // let: we may replace with transcript
-    let mediaUrl = MediaUrl0 || null;        // let: we may override via pickFirstMedia()
-    let mediaType = MediaContentType0 || null;
+async (req, res, next) => {
+  // --- tiny helper so we can safely echo text in TwiML ---
+  const escapeXml = (s) =>
+    String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
 
-    // WhatsApp location payload (optional extras)
-    const isLocation = (!!req.body.Latitude && !!req.body.Longitude) ||
-      (req.body.MessageType && String(req.body.MessageType).toLowerCase() === 'location');
-    const extras = {};
-    if (isLocation) {
-      const lat = parseFloat(req.body.Latitude);
-      const lng = parseFloat(req.body.Longitude);
-      if (!Number.isNaN(lat) && !Number.isNaN(lng)) { extras.lat = lat; extras.lng = lng; }
-      if (req.body.Address) extras.address = String(req.body.Address).trim() || undefined;
-      console.log('[WEBHOOK] location payload:', { lat: extras.lat, lng: extras.lng, address: extras.address || null });
-    }
+  // Basic fields from Twilio
+  const { From, Body, MediaUrl0, MediaContentType0 } = req.body || {};
+  const from = req.from || String(From || '').replace(/^whatsapp:/, '').replace(/\D/g, '');
 
-    const { userProfile, ownerId, ownerProfile, isOwner } = req;
+  // Text + media (we may override these below)
+  let input     = (Body || '').trim();
+  let mediaUrl  = MediaUrl0 || null;
+  let mediaType = MediaContentType0 || null;
 
-    // ---- Twilio media extraction (robust) ----
-    function pickFirstMedia(reqBody = {}) {
-      const n = parseInt(reqBody.NumMedia || '0', 10) || 0;
-      if (n <= 0) return { mediaUrl: null, mediaType: null, num: 0 };
-      const url = reqBody.MediaUrl0 || reqBody.MediaUrl || null;
-      const typ = reqBody.MediaContentType0 || reqBody.MediaContentType || null;
-      return { mediaUrl: url, mediaType: typ, num: n };
-    }
+  // WhatsApp location payload (optional extras)
+  const isLocation =
+    (!!req.body?.Latitude && !!req.body?.Longitude) ||
+    (req.body?.MessageType && String(req.body.MessageType).toLowerCase() === 'location');
 
-    const picked = pickFirstMedia(req.body);
-    if (!mediaUrl && picked.mediaUrl)   mediaUrl  = picked.mediaUrl;
-    if (!mediaType && picked.mediaType) mediaType = picked.mediaType;
+  const extras = {};
+  if (isLocation) {
+    const lat = parseFloat(req.body.Latitude);
+    const lng = parseFloat(req.body.Longitude);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) { extras.lat = lat; extras.lng = lng; }
+    if (req.body.Address) extras.address = String(req.body.Address).trim() || undefined;
+    console.log('[WEBHOOK] location payload:', { lat: extras.lat, lng: extras.lng, address: extras.address || null });
+  }
 
-    console.log('[WEBHOOK][MEDIA-IN]', {
-      NumMedia: req.body.NumMedia,
-      MediaUrl0: req.body.MediaUrl0,
-      MediaContentType0: req.body.MediaContentType0,
-      MediaUrl: req.body.MediaUrl,
-      MediaContentType: req.body.MediaContentType,
-      decidedMediaUrl: mediaUrl,
-      decidedMediaType: mediaType,
-      bodyLen: (req.body.Body || '').length,
-    });
+  // ---- Twilio media extraction (robust) ----
+  function pickFirstMedia(reqBody = {}) {
+    const n = parseInt(reqBody.NumMedia || '0', 10) || 0;
+    if (n <= 0) return { mediaUrl: null, mediaType: null, num: 0 };
+    const url = reqBody.MediaUrl0 || reqBody.MediaUrl || null;
+    const typ = reqBody.MediaContentType0 || reqBody.MediaContentType || null;
+    return { mediaUrl: url, mediaType: typ, num: n };
+  }
 
-    // Track if this request included audio so we can guard fallbacks later
-    const ctInit = String(mediaType || '').split(';')[0].trim().toLowerCase();
-    const hadIncomingAudio = !!(mediaUrl && /^audio\//.test(ctInit));
+  const picked = pickFirstMedia(req.body || {});
+  if (!mediaUrl  && picked.mediaUrl)  mediaUrl  = picked.mediaUrl;
+  if (!mediaType && picked.mediaType) mediaType = picked.mediaType;
+
+  console.log('[WEBHOOK][MEDIA-IN]', {
+    NumMedia: req.body?.NumMedia,
+    MediaUrl0: req.body?.MediaUrl0,
+    MediaContentType0: req.body?.MediaContentType0,
+    MediaUrl: req.body?.MediaUrl,
+    MediaContentType: req.body?.MediaContentType,
+    decidedMediaUrl: mediaUrl,
+    decidedMediaType: mediaType,
+    bodyLen: (req.body?.Body || '').length,
+  });
+
+  // Track if this request included audio so we can guard fallbacks later
+  const ctInit = String(mediaType || '').split(';')[0].trim().toLowerCase();
+  const hadIncomingAudio = !!(mediaUrl && /^audio\//.test(ctInit));
 
 
     // ---------- MEDIA FIRST (AUDIO ONLY): transcribe audio and handle simple commands ----------
@@ -2135,34 +2177,54 @@ try {
   }
 
   // ----- Last-resort fallback (no one replied) -----
-if (!res.headersSent) {
-  console.warn('[WEBHOOK] No handler replied; sending default menu.');
-  return sendTwiml(
-    res,
-    'Here’s what I can help with:\n\n' +
-      '• Jobs — create job, list jobs, set active job <name>, active job?, close job <name>, move last log to <name>\n' +
-      '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
-      '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm'
-  );
-}
+      if (!res.headersSent) {
+        console.warn('[WEBHOOK] No handler replied; sending default menu.');
+        return res
+          .status(200)
+          .type('text/xml')
+          .send(
+            '<Response><Message>' +
+              'Here’s what I can help with:\n\n' +
+              '• Jobs — create job, list jobs, set active job &lt;name&gt;, active job?, close job &lt;name&gt;, move last log to &lt;name&gt;\n' +
+              '• Tasks — task – buy nails, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
+              '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm' +
+            '</Message></Response>'
+          );
+      }
 
-} catch (error) {
-  console.error(`[ERROR] Webhook processing failed for ${maskPhone(from)}:`, error.message);
-  try { await logEvent(tenantId, userId, 'error', { input, error: error.message }); } catch {}
-  return next(error);
-} finally {
-  try {
-    await releaseLock(req.lockKey, req.lockToken);
-    console.log('[LOCK] released for', req.lockKey);
-  } catch (e) {
-    console.error('[WARN] Failed to release lock for', req.lockKey, ':', e.message);
-  }
-}
+    } catch (error) {
+      // Make logging robust even if some vars are undefined
+      const safeFrom = typeof from === 'string' ? from : '';
+      const maskedFrom = safeFrom
+        ? safeFrom.replace(/^(\+?\d{0,2})\d+(\d{2})$/, '$1***$2')
+        : 'unknown';
 
-},
-errorMiddleware
+      console.error(`[ERROR] Webhook processing failed for ${maskedFrom}:`, error?.message);
+
+      // Best-effort event log; ignore failures
+      try {
+        if (typeof logEvent === 'function' && tenantId && userId) {
+          await logEvent(tenantId, userId, 'error', { input, error: error?.message });
+        }
+      } catch (_) {}
+
+      return next(error);
+    } finally {
+      // Always try to release the lock if it was taken
+      try {
+        if (req.lockKey && req.lockToken && typeof releaseLock === 'function') {
+          await releaseLock(req.lockKey, req.lockToken);
+          console.log('[LOCK] released for', req.lockKey);
+        }
+      } catch (e) {
+        console.error('[WARN] Failed to release lock for', req.lockKey, ':', e?.message);
+      }
+    }
+  },
+
+  // 3) Error middleware last (Express will call it on thrown/rejected errors)
+  errorMiddleware
 );
-
 
 // ---- Reminders Cron (simple polling) ----
 router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) => {
@@ -2205,7 +2267,6 @@ router.get(['/reminders/cron', '/reminders/cron/:slug'], async (req, res, next) 
   }
 });
 
-
 // ---- Final safety: prevent Twilio 11200 on any fall-through ----
 router.use((req, res, next) => {
   if (!res.headersSent) {
@@ -2216,4 +2277,5 @@ router.use((req, res, next) => {
 });
 
 module.exports = router;
+
 

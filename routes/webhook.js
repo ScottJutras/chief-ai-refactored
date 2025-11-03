@@ -49,13 +49,12 @@ const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = req
 const router = express.Router();
 const querystring = require('querystring');
 
-// ---- 0) 15s safety: always reply something
+// A) 9s router-level safety reply (in case deeper logic stalls)
 router.use((req, res, next) => {
-  // if someone already set one, respect it
-  if (!res.locals._safetyTimer) {
-    res.locals._safetyTimer = setTimeout(() => {
+  if (!res.locals._routerSafety) {
+    res.locals._routerSafety = setTimeout(() => {
       if (!res.headersSent) {
-        console.warn('[WEBHOOK] Safety reply fired (no handler responded in time).');
+        console.warn('[WEBHOOK] 9s router safety reply');
         res
           .status(200)
           .type('text/xml')
@@ -67,14 +66,14 @@ router.use((req, res, next) => {
             '</Message></Response>'
           );
       }
-    }, 15000); // 15s
-    res.on('finish', () => clearTimeout(res.locals._safetyTimer));
-    res.on('close',  () => clearTimeout(res.locals._safetyTimer));
+    }, 9000);
+    res.on('finish', () => clearTimeout(res.locals._routerSafety));
+    res.on('close',  () => clearTimeout(res.locals._routerSafety));
   }
   next();
 });
 
-// ---- 1) Fix Content-Length BEFORE touching the stream
+// B) Fix Content-Length BEFORE touching the stream
 router.use((req, _res, next) => {
   const cl = req.headers['content-length'];
   if (cl) {
@@ -86,27 +85,27 @@ router.use((req, _res, next) => {
   next();
 });
 
-// ---- 2) Manual tolerant parser for Twilio (POST form-encoded only)
+// C) Manual tolerant parser for Twilio POST (x-www-form-urlencoded)
 router.use((req, _res, next) => {
   const ct = (req.headers['content-type'] || '').toLowerCase();
   const isForm = ct.includes('application/x-www-form-urlencoded');
 
   if (req.method !== 'POST' || !isForm) return next();
-  if (req.body && Object.keys(req.body).length) return next(); // something already parsed it
+  if (req.body && Object.keys(req.body).length) return next(); // already parsed
 
   let raw = '';
   req.setEncoding('utf8');
 
   req.on('data', (chunk) => {
     raw += chunk;
-    if (raw.length > 1_000_000) { // 1MB guard
+    if (raw.length > 1_000_000) {
       console.warn('[WEBHOOK] raw body exceeded 1MB, aborting read');
       try { req.destroy(); } catch {}
     }
   });
 
   req.on('end', () => {
-    req.rawBody = raw; // keep for Twilio signature checks if you use them
+    req.rawBody = raw;
     try {
       req.body = raw ? querystring.parse(raw) : {};
     } catch (e) {
@@ -118,21 +117,22 @@ router.use((req, _res, next) => {
 
   req.on('error', (e) => {
     console.warn('[WEBHOOK] stream error:', e?.message);
-    // fall back to query if available
     req.body = req.body || {};
     next();
   });
 });
 
-// ---- 3) Fallback: if POST had no body, mirror query params (Twilio safe)
+// D) Mirror query into body for ANY method if body empty (GET-safe)
 router.use((req, _res, next) => {
-  if (req.method === 'POST' && (!req.body || !Object.keys(req.body).length) && req.query) {
-    req.body = { ...req.query };
+  if (!req.body || !Object.keys(req.body).length) {
+    if (req.query && Object.keys(req.query).length) {
+      req.body = { ...req.query };
+    }
   }
   next();
 });
 
-// ---- 4) Early request log
+// E) Early request log (you'll always see this if the function is reached)
 router.use((req, _res, next) => {
   console.log('[WEBHOOK] hit', {
     method: req.method,
@@ -141,6 +141,28 @@ router.use((req, _res, next) => {
     cl: req.headers['content-length'] || null,
     hasBody: !!(req.body && Object.keys(req.body).length)
   });
+  next();
+});
+
+// F) Ultra-fast “generic help” short-circuit (no DB/AI needed)
+router.use((req, res, next) => {
+  const text = String((req.body && (req.body.Body || req.body.body)) || '').toLowerCase();
+  const generic = /\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(text);
+  if (generic) {
+    return res
+      .status(200)
+      .type('text/xml')
+      .send(
+        '<Response><Message>PocketCFO — What I can do:\n' +
+          '• Jobs: create job, set active job, list jobs, close job\n' +
+          '• Tasks: task – buy nails, my tasks, done #4, due #3 Friday\n' +
+          '• Timeclock: clock in, clock out, start break, timesheet\n' +
+          '• Money: expense $50, revenue $500, bill $200\n' +
+          '• Reports: metrics, tax, quotes\n' +
+          '• Ask me anything — I’ll search your SOPs!\n' +
+        '</Message></Response>'
+      );
+  }
   next();
 });
 

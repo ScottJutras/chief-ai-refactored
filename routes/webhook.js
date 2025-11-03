@@ -645,6 +645,7 @@ router.post(
       contentLength: len,
       vercelId: req.headers['x-vercel-id'] || null,
     });
+    console.log('[WEBHOOK] proto:', req.headers['x-forwarded-proto']);
     next();
   },
 

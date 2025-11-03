@@ -600,9 +600,6 @@ router.get('/', (_req, res) => {
     .send('<Response><Message>OK</Message></Response>');
 });
 
-// --- tolerant urlencoded parser for Twilio form posts ---
-const querystring = require('querystring');
-
 router.use((req, _res, next) => {
   // Only handle POST form bodies; leave everything else alone
   const ct = String(req.headers['content-type'] || '').toLowerCase();

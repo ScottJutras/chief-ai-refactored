@@ -3,7 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
-// Handlers / services
+// Handlers / services (unchanged)
 const commands = require('../handlers/commands');
 const { tasksHandler } = require('../handlers/commands/tasks');
 const { handleMedia } = require('../handlers/media');
@@ -17,7 +17,7 @@ const { tasksTool } = require('../services/tools/tasks');
 const { jobTool } = require('../services/tools/job');
 const { ragTool } = require('../services/tools/rag');
 
-// Middleware
+// Middleware (unchanged)
 const { lockMiddleware, releaseLock } = require('../middleware/lock');
 const { userProfileMiddleware } = require('../middleware/userProfile');
 const { tokenMiddleware } = require('../middleware/token');
@@ -49,10 +49,12 @@ const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = req
 const router = express.Router();
 const querystring = require('querystring');
 
-/** 0) Router-level 9s safety (secondary to wrapper safety) */
+/**
+ * 0) Router-level 9s safety: if nothing responds, send a helpful menu so Twilio gets 200.
+ */
 router.use((req, res, next) => {
-  if (!res.locals._routerSafetyTimer) {
-    res.locals._routerSafetyTimer = setTimeout(() => {
+  if (!res.locals._routerSafety) {
+    res.locals._routerSafety = setTimeout(() => {
       if (!res.headersSent) {
         console.warn('[WEBHOOK] 9s router safety reply');
         res
@@ -67,35 +69,49 @@ router.use((req, res, next) => {
           );
       }
     }, 9000);
-    const clear = () => clearTimeout(res.locals._routerSafetyTimer);
+    const clear = () => {
+      try { clearTimeout(res.locals._routerSafety); } catch {}
+    };
     res.on('finish', clear);
     res.on('close', clear);
   }
   next();
 });
 
-/** 1) Content-Length guard */
+/**
+ * 1) Content-Length guards BEFORE touching the stream.
+ *    - For NON-POST, strip content-length to prevent the platform waiting on a body.
+ *    - For POST, keep sanity checks.
+ */
 router.use((req, _res, next) => {
-  const cl = req.headers['content-length'];
-  if (cl) {
-    const len = parseInt(cl, 10);
+  const rawCl = req.headers['content-length'];
+  if (req.method !== 'POST') {
+    if (rawCl != null) delete req.headers['content-length']; // critical for GET-with-body edge cases
+    return next();
+  }
+  if (rawCl != null) {
+    const len = parseInt(rawCl, 10);
     if (!Number.isFinite(len) || len <= 0 || len > 1_000_000) {
-      delete req.headers['content-length'];
+      delete req.headers['content-length']; // force unknown / ignore bad
     }
   }
   next();
 });
 
-/** 2) Manual tolerant parser for POST x-www-form-urlencoded (no express.json here) */
+/**
+ * 2) Manual tolerant parser for Twilio (POST + x-www-form-urlencoded only).
+ *    No express.json() anywhere on this router.
+ */
 router.use((req, _res, next) => {
   const ct = (req.headers['content-type'] || '').toLowerCase();
   const isForm = ct.includes('application/x-www-form-urlencoded');
 
   if (req.method !== 'POST' || !isForm) return next();
-  if (req.body && Object.keys(req.body).length) return next();
+  if (req.body && Object.keys(req.body).length) return next(); // already parsed upstream
 
   let raw = '';
   req.setEncoding('utf8');
+
   req.on('data', (chunk) => {
     raw += chunk;
     if (raw.length > 1_000_000) {
@@ -103,16 +119,20 @@ router.use((req, _res, next) => {
       try { req.destroy(); } catch {}
     }
   });
+
   req.on('end', () => {
-    req.rawBody = raw;
+    req.rawBody = raw; // optional (for Twilio signature checks)
     try { req.body = raw ? querystring.parse(raw) : {}; }
     catch { req.body = {}; }
     next();
   });
+
   req.on('error', () => { req.body = req.body || {}; next(); });
 });
 
-/** 3) Mirror query into body when body empty (covers GET probes) */
+/**
+ * 3) If no body parsed, mirror query → body (covers GET probes / unusual proxies).
+ */
 router.use((req, _res, next) => {
   if (!req.body || !Object.keys(req.body).length) {
     if (req.query && Object.keys(req.query).length) {
@@ -122,7 +142,9 @@ router.use((req, _res, next) => {
   next();
 });
 
-/** 4) Early ingress log */
+/**
+ * 4) Early ingress log — proves we’re inside the router and what we parsed.
+ */
 router.use((req, _res, next) => {
   console.log('[WEBHOOK] in-router', {
     method: req.method,
@@ -134,10 +156,12 @@ router.use((req, _res, next) => {
   next();
 });
 
-/** 5) Fast generic help short-circuit */
+/**
+ * 5) Super-fast generic help short-circuit for “what can I do / help / how to / what now”.
+ */
 router.use((req, res, next) => {
-  const text = String((req.body && (req.body.Body || req.body.body)) || '').toLowerCase();
-  const generic = /\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(text);
+  const text = String((req.body && (req.body.Body || req.body.body)) || '').toLowerCase().trim();
+  const generic = /\b(what can i do|what can i do here|help\??|how to|how do i|what now)\b/i.test(text);
   if (generic) {
     return res
       .status(200)
@@ -157,8 +181,7 @@ router.use((req, res, next) => {
 });
 
 /**
- * 6) Final safety: if nothing replied by end of chain, send OK.
- * (Normally unreachable, but prevents 11200 on any future slip.)
+ * 6) FINAL FALLBACK — if nothing replied by end of chain, send OK (prevents 11200).
  */
 router.use((req, res, next) => {
   if (!res.headersSent) {

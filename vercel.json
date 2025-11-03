@@ -1,14 +1,19 @@
 {
   "version": 2,
   "builds": [
+    { "src": "index.js", "use": "@vercel/node" },
     { "src": "api/index-sops.js", "use": "@vercel/node" },
-    { "src": "api/webhook.js", "use": "@vercel/node" },
-    { "src": "index.js", "use": "@vercel/node" }
+    { "src": "api/webhook.js", "use": "@vercel/node" }
   ],
+  "functions": {
+    "api/index-sops.js": {
+      "includeFiles": "docs/howto/**"
+    }
+  },
   "routes": [
     { "src": "/api/index-sops", "dest": "/api/index-sops.js" },
-    { "src": "/api/webhook/reminders/cron/.*", "dest": "/api/webhook.js" },
     { "src": "/api/webhook", "dest": "/api/webhook.js" },
+    { "src": "/api/webhook/reminders/cron/.*", "dest": "/api/webhook.js" },
     { "src": "/(.*)", "dest": "/index.js" }
   ],
   "crons": [

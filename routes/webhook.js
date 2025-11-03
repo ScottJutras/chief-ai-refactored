@@ -57,12 +57,16 @@ const { looksLikeTask, parseTaskUtterance } = require('../nlp/task_intents');
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
 const router = express.Router();
-// Fix: Twilio malformed payload
-router.use((req, res, next) => {
-  if (req.headers['content-length'] && req.headers['content-length'] !== '0') {
-    const len = parseInt(req.headers['content-length'], 10);
-    if (isNaN(len) || len < 0) {
-      req.headers['content-length'] = '0';
+// --- Fix: Twilio malformed payload / bad Content-Length (must be before any parsers) ---
+router.use((req, _res, next) => {
+  const cl = req.headers['content-length'];
+  if (cl && !/^\d+$/.test(cl)) {
+    // non-numeric -> drop header so body parsers fall back safely
+    delete req.headers['content-length'];
+  } else if (cl) {
+    const len = parseInt(cl, 10);
+    if (!Number.isFinite(len) || len < 0) {
+      delete req.headers['content-length'];
     }
   }
   next();

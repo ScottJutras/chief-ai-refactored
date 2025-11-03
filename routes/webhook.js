@@ -71,6 +71,9 @@ router.use((req, _res, next) => {
   }
   next();
 });
+// 2. Body parsers (after guard)
+router.use(express.urlencoded({ extended: false }));
+router.use(express.json());
 // ----------------- helpers -----------------
 function maskPhone(p) {
   return p ? String(p).replace(/^(\d{4})\d+(\d{2})$/, '$1…$2') : '';

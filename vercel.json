@@ -1,13 +1,14 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "index.js", "use": "@vercel/node" },
-    { "src": "api/index-sops.js", "use": "@vercel/node" },
-    { "src": "api/webhook.js", "use": "@vercel/node" }
-  ],
   "functions": {
     "api/index-sops.js": {
       "includeFiles": "docs/howto/**"
+    },
+    "api/webhook.js": {
+      "memory": 1024
+    },
+    "index.js": {
+      "memory": 1024
     }
   },
   "routes": [

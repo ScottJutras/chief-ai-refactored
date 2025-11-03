@@ -28,7 +28,7 @@ router.use((req, _res, next) => {
 // --------- quick safety + version ping before any heavy logic ----------
 router.post('*', async (req, res, next) => {
   try {
-    // 8s safety…
+    // 8s safety: ensure Twilio gets 200 even if something stalls
     if (!res.locals._safety) {
       res.locals._safety = setTimeout(() => {
         if (!res.headersSent) {
@@ -40,7 +40,10 @@ router.post('*', async (req, res, next) => {
       res.on('finish', clear); res.on('close', clear);
     }
 
-    // Fast "version" path
+    // DEBUG (temp): log path + body seen by router
+    console.log('[ROUTER.POST*]', { url: req.originalUrl, bodyBody: req.body?.Body });
+
+    // "version" fast-path
     const bodyText = String(req.body?.Body || '').trim().toLowerCase();
     if (bodyText === 'version') {
       const v = process.env.VERCEL_GIT_COMMIT_SHA || process.env.COMMIT_SHA || 'dev-local';

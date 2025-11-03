@@ -1,6 +1,10 @@
 {
   "version": 2,
   "functions": {
+    "api/webhook_raw.js": {
+      "memory": 1024,
+      "maxDuration": 10
+    },
     "api/webhook.js": {
       "memory": 2048,
       "maxDuration": 15,
@@ -19,8 +23,9 @@
   "routes": [
     { "src": "^/api/index-sops$", "dest": "/api/index-sops.js" },
     { "src": "^/api/webhook/reminders/cron/(.*)$", "dest": "/api/webhook.js" },
-    { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
-    { "src": "^/webhook$", "dest": "/api/webhook.js" },
+    { "src": "^/api/webhook$", "dest": "/api/webhook_raw.js" },   // TEMP route to raw handler
+    { "src": "^/webhook$", "dest": "/api/webhook_raw.js" },       // TEMP alias to raw handler
+    { "src": "^/api/ping$", "dest": "/api/ping.js" },             // NEW: ping endpoint
     { "src": "^/(.*)$", "dest": "/api/index.js" }
   ],
   "crons": [

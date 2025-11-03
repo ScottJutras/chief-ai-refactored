@@ -47,20 +47,62 @@ const { looksLikeTask, parseTaskUtterance } = require('../nlp/task_intents');
 const { logEvent, getConvoState, saveConvoState, getMemory, upsertMemory } = require('../services/memory');
 
 const router = express.Router();
+const querystring = require('querystring');
 
-// Fix bad Content-Length BEFORE any parser
+// 1) Fix Content-Length BEFORE touching the stream
 router.use((req, _res, next) => {
   const cl = req.headers['content-length'];
-  if (cl && !/^\d+$/.test(cl)) delete req.headers['content-length'];
-  else if (cl) {
-    const n = parseInt(cl, 10);
-    if (!Number.isFinite(n) || n < 0) delete req.headers['content-length'];
+  if (cl) {
+    const len = parseInt(cl, 10);
+    if (!Number.isFinite(len) || len <= 0 || len > 1_000_000) {
+      delete req.headers['content-length']; // force unknown length
+    }
   }
   next();
 });
 
-router.use(express.urlencoded({ extended: false }));
+// 2) Manual tolerant parser for Twilio (POST form-encoded)
+router.use((req, res, next) => {
+  // Only parse POST form bodies that are form-encoded
+  const ct = (req.headers['content-type'] || '').toLowerCase();
+  const isForm = ct.includes('application/x-www-form-urlencoded');
 
+  if (req.method !== 'POST' || !isForm) return next();
+
+  // If some upstream already parsed, keep it
+  if (req.body && Object.keys(req.body).length) return next();
+
+  let raw = '';
+  req.setEncoding('utf8');
+
+  req.on('data', (chunk) => {
+    raw += chunk;
+    if (raw.length > 1_000_000) { // 1MB guardrail
+      raw = '';
+      try { req.destroy(); } catch {}
+    }
+  });
+
+  req.on('end', () => {
+    req.rawBody = raw; // keep for Twilio signature checks
+    try {
+      req.body = raw ? querystring.parse(raw) : {};
+    } catch {
+      req.body = {};
+    }
+    next();
+  });
+
+  req.on('error', () => next());
+});
+
+// 3) Fallback: if POST had no body (rare), mirror query params into body
+router.use((req, _res, next) => {
+  if (req.method === 'POST' && (!req.body || !Object.keys(req.body).length) && req.query) {
+    req.body = { ...req.query };
+  }
+  next();
+});
 
 // ----------------- helpers -----------------
 function maskPhone(p) {

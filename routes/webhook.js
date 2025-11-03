@@ -77,64 +77,67 @@ router.all('/', (req, res, next) => {
 // ---------- keep your existing POST-only tolerant parser middleware below ----------
 
 
-// 0) Router-level 9s safety reply (so Twilio gets a 200 even if something hangs)
+/**
+ * 0) Router-level 9s safety: if nothing responds, send a helpful menu so Twilio gets 200.
+ */
 router.use((req, res, next) => {
   if (!res.locals._routerSafety) {
     res.locals._routerSafety = setTimeout(() => {
       if (!res.headersSent) {
         console.warn('[WEBHOOK] 9s router safety reply');
-        res.status(200).type('text/xml').send(
-          '<Response><Message>Here’s what I can help with:\n\n' +
-            '• Jobs — create job, list jobs, set active job &lt;name&gt;, active job?, close job &lt;name&gt;, move last log to &lt;name&gt;\n' +
-            '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
-            '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm' +
-          '</Message></Response>'
-        );
+        res
+          .status(200)
+          .type('text/xml')
+          .send(
+            '<Response><Message>Here’s what I can help with:\n\n' +
+              '• Jobs — create job, list jobs, set active job &lt;name&gt;, active job?, close job &lt;name&gt;, move last log to &lt;name&gt;\n' +
+              '• Tasks — task – buy nails, task Roof Repair – order shingles, task @Justin – pick up materials, tasks / my tasks, done #4, add due date Friday to task 3\n' +
+              '• Timeclock — clock in/out, start/end break, start/end drive, timesheet week, clock in Justin @ Roof Repair 5pm' +
+            '</Message></Response>'
+          );
       }
     }, 9000);
-    const clear = () => { try { clearTimeout(res.locals._routerSafety); } catch(_){} };
+    const clear = () => clearTimeout(res.locals._routerSafety);
     res.on('finish', clear);
     res.on('close', clear);
   }
   next();
 });
 
-// 1) Non-POST requests: strip content-length and DRAIN any body to prevent platform waits
+/**
+ * 1) Content-Length guards BEFORE touching the stream.
+ *    - For NON-POST, strip content-length entirely to prevent platform waiting on a body.
+ *    - For POST, keep sanity checks.
+ */
 router.use((req, _res, next) => {
+  const cl = req.headers['content-length'];
   if (req.method !== 'POST') {
-    if (req.headers['content-length']) delete req.headers['content-length'];
-    // Drain any unread data immediately; don’t parse it.
-    try {
-      req.on('error', () => {});
-      req.resume();           // consume and discard
-    } catch(_) {}
+    if (cl) delete req.headers['content-length']; // critical for GET-with-body edge cases
+    return next();
   }
-  next();
-});
-
-// 2) POST: content-length sanity checks (avoid weird values)
-router.use((req, _res, next) => {
-  if (req.method === 'POST') {
-    const cl = req.headers['content-length'];
-    if (cl) {
-      const len = parseInt(cl, 10);
-      if (!Number.isFinite(len) || len <= 0 || len > 1_000_000) {
-        delete req.headers['content-length'];
-      }
+  if (cl) {
+    const len = parseInt(cl, 10);
+    if (!Number.isFinite(len) || len <= 0 || len > 1_000_000) {
+      delete req.headers['content-length']; // force unknown / ignore bad
     }
   }
   next();
 });
 
-// 3) Manual tolerant parser for POST form bodies (no express.json() on this router)
+/**
+ * 2) Manual tolerant parser for Twilio (POST + x-www-form-urlencoded only).
+ *    No express.json() anywhere on this router.
+ */
 router.use((req, _res, next) => {
   const ct = (req.headers['content-type'] || '').toLowerCase();
   const isForm = ct.includes('application/x-www-form-urlencoded');
+
   if (req.method !== 'POST' || !isForm) return next();
-  if (req.body && Object.keys(req.body).length) return next();
+  if (req.body && Object.keys(req.body).length) return next(); // already parsed upstream
 
   let raw = '';
   req.setEncoding('utf8');
+
   req.on('data', (chunk) => {
     raw += chunk;
     if (raw.length > 1_000_000) {
@@ -142,16 +145,20 @@ router.use((req, _res, next) => {
       try { req.destroy(); } catch {}
     }
   });
+
   req.on('end', () => {
-    req.rawBody = raw;
+    req.rawBody = raw; // optional (for Twilio signature checks)
     try { req.body = raw ? querystring.parse(raw) : {}; }
     catch { req.body = {}; }
     next();
   });
+
   req.on('error', () => { req.body = req.body || {}; next(); });
 });
 
-// 4) If body empty, mirror query → body (covers GET probes / odd proxies)
+/**
+ * 3) If no body parsed, mirror query → body (covers GET probes / unusual proxies).
+ */
 router.use((req, _res, next) => {
   if (!req.body || !Object.keys(req.body).length) {
     if (req.query && Object.keys(req.query).length) {
@@ -161,7 +168,9 @@ router.use((req, _res, next) => {
   next();
 });
 
-// 5) Early ingress log (note: Vercel strips /api/webhook, so url is '/')
+/**
+ * 4) Early ingress log — proves we’re inside the router and what we parsed.
+ */
 router.use((req, _res, next) => {
   console.log('[WEBHOOK] in-router', {
     method: req.method,
@@ -173,10 +182,12 @@ router.use((req, _res, next) => {
   next();
 });
 
-// 6) Ultra-fast generic help for “what can I do / help / how to / what now”
+/**
+ * 5) Super-fast generic help short-circuit for “what can I do / help / how to / what now”.
+ */
 router.use((req, res, next) => {
-  const text = String((req.body && (req.body.Body || req.body.body)) || '').toLowerCase().trim();
-  const generic = /\b(what can i do|what can i do here|help\??|how to|how do i|what now)\b/i.test(text);
+  const text = String((req.body && (req.body.Body || req.body.body)) || '').toLowerCase();
+  const generic = /\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(text);
   if (generic) {
     return res
       .status(200)
@@ -194,6 +205,7 @@ router.use((req, res, next) => {
   }
   next();
 });
+
 
 
 // ----------------- helpers -----------------

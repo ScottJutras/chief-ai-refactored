@@ -1,7 +1,5 @@
 // api/index.js
-const { VercelRequest, VercelResponse } = require('@vercel/node');
-const expressApp = require('../index'); // adjust path if necessary
+// Vercel Serverless Function Handler
+// Exports your Express app directly
 
-module.exports = (req, res) => {
-  expressApp(req, res);
-};
+module.exports = require('../index');

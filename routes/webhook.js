@@ -91,6 +91,7 @@ router.use((req, res, next) => {
 
 // ---------- Fast-path: version ----------
 router.post('*', (req, res, next) => {
+  console.log('[ROUTER] version');   // 👈 add here
   const bodyText = String(req.body?.Body || '').trim().toLowerCase();
   if (bodyText === 'version') {
     const v = process.env.VERCEL_GIT_COMMIT_SHA || process.env.COMMIT_SHA || 'dev-local';
@@ -118,6 +119,7 @@ router.use((req, res, next) => {
 
 // ---------- Media Handler ----------
 router.post('*', async (req, res, next) => {
+  console.log('[ROUTER] media');
   const { n, url, type } = pickFirstMedia(req.body || {});
   if (n <= 0) return next();
 
@@ -173,6 +175,7 @@ router.post('*', async (req, res, next) => {
 
 // ---------- TEXT ROUTING ----------
 router.post('*', async (req, res, next) => {
+  console.log('[ROUTER] text');
   try {
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();

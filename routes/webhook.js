@@ -180,9 +180,18 @@ router.post('*', async (req, res, next) => {
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();
 
-    const looksTask = /^task\b/.test(lc) || /\btasks?\b/.test(lc);
-    const looksJob  = /\b(job|jobs|active job|set active|close job|list jobs|move last log)\b/.test(lc);
-    const looksTime = /\b(clock|punch|break|drive|timesheet|hours)\b/.test(lc);
+    // Heuristic: user is asking for help/how-to
+    const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc);
+
+    // Intent detectors
+    let looksTask = /^task\b/.test(lc) || /\btasks?\b/.test(lc);
+    let looksJob  = /\b(job|jobs|active job|set active|close job|list jobs|move last log)\b/.test(lc);
+    let looksTime = /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc);
+
+    // Nudge intents when user literally asks how to use a module
+    if (askingHow && /\btasks?\b/.test(lc)) looksTask = true;
+    if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc)) looksTime = true;
+    if (askingHow && /\bjobs?\b/.test(lc)) looksJob = true;
 
     const topicHints = [
       looksTask ? 'tasks' : null,
@@ -190,29 +199,68 @@ router.post('*', async (req, res, next) => {
       looksTime ? 'timeclock' : null,
     ].filter(Boolean);
 
+    // Quick SOP fallbacks for "how do I use …" when a handler doesn't write a response
+    const SOP = {
+      tasks:
+        'Tasks — Quick guide:\n' +
+        '• Create: task - buy nails\n' +
+        '• List mine: my tasks\n' +
+        '• Complete: done #4\n' +
+        '• Assign: task @<phone> - pickup shingles\n' +
+        '• Due date: task - call client | due tomorrow 4pm',
+      timeclock:
+        'Timeclock — Quick guide:\n' +
+        '• Clock in: clock in (uses active job) or clock in @ Roof Job\n' +
+        '• Break/Drive: break start/stop; drive start/stop\n' +
+        '• Clock out: clock out\n' +
+        '• Timesheet: timesheet week',
+      jobs:
+        'Jobs — Quick guide:\n' +
+        '• Create: create job Roof Repair\n' +
+        '• Set active: set active job Roof Repair\n' +
+        '• List: list jobs\n' +
+        '• Close: close job Roof Repair',
+    };
+
     const cmds = require('../handlers/commands');
-    const tasksHandler   = cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
-    const handleJob      = cmds.job || require('../handlers/commands/job');
-    const handleTimeclock= cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
+    const tasksHandler    = cmds.tasks     || require('../handlers/commands/tasks').tasksHandler;
+    const handleJob       = cmds.job       || require('../handlers/commands/job');
+    const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
 
     // TASKS
     if (looksTask && typeof tasksHandler === 'function') {
-      await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
-      if (!res.headersSent) return ok(res, 'Task handled.');
+      const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      if (!res.headersSent) {
+        // Prefer handler text; else SOP if askingHow; else generic
+        const msg = (typeof out === 'string' && out.trim())
+          ? out.trim()
+          : (askingHow ? SOP.tasks : 'Task handled.');
+        return ok(res, msg);
+      }
       return;
     }
 
     // JOBS
     if (looksJob && typeof handleJob === 'function') {
-      await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
-      if (!res.headersSent) return ok(res, 'Job handled.');
+      const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      if (!res.headersSent) {
+        const msg = (typeof out === 'string' && out.trim())
+          ? out.trim()
+          : (askingHow ? SOP.jobs : 'Job handled.');
+        return ok(res, msg);
+      }
       return;
     }
 
     // TIMECLOCK
     if (looksTime && typeof handleTimeclock === 'function') {
-      await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
-      if (!res.headersSent) return ok(res, 'Time logged.');
+      const out = await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      if (!res.headersSent) {
+        const msg = (typeof out === 'string' && out.trim())
+          ? out.trim()
+          : (askingHow ? SOP.timeclock : 'Time logged.');
+        return ok(res, msg);
+      }
       return;
     }
 
@@ -223,7 +271,7 @@ router.post('*', async (req, res, next) => {
         if (typeof ask === 'function') {
           const answer = await Promise.race([
             ask({ from: req.from, text, topicHints }),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000))
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000)),
           ]).catch(() => '');
           if (answer?.trim()) return ok(res, answer);
         }

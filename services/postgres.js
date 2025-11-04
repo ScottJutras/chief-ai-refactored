@@ -355,6 +355,7 @@ module.exports = {
   // Time
   logTimeEntry,
   checkTimeEntryLimit,
+  checkActorLimit: checkTimeEntryLimit,
 
   // Exports
   exportTimesheetXlsx,

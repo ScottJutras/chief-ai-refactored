@@ -1,14 +1,16 @@
 // services/postgres.js
-// ---------------------------------------------------------------
-// Central Postgres service – pool, retry, timeout, helpers.
-// All DB calls are RLS‑guarded in the schema.
-// ---------------------------------------------------------------
+// ------------------------------------------------------------
+// Central Postgres service – pool, retry, helpers, lazy heavy deps
+// ------------------------------------------------------------
 const { Pool } = require('pg');
-const ExcelJS = require('exceljs');
 const crypto = require('crypto');
-const PDFDocument = require('pdfkit');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 
+// ---------- Lazy heavy dependencies ----------
+let ExcelJS = null;      // will be required only in exportTimesheetXlsx
+let PDFDocument = null;  // will be required only in exportTimesheetPdf
+
+// ---------- Pool ----------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
@@ -19,9 +21,8 @@ const pool = new Pool({
 });
 pool.on('error', err => console.error('[PG] idle client error:', err?.message));
 
-async function query(text, params) {
-  return await queryWithRetry(text, params);
-}
+// ---------- Core query helpers ----------
+async function query(text, params) { return queryWithRetry(text, params); }
 async function queryWithRetry(text, params, attempt = 1) {
   try { return await pool.query(text, params); }
   catch (e) {
@@ -53,12 +54,12 @@ async function withClient(fn, { useTransaction = true } = {}) {
   } finally { client.release(); }
 }
 
-// ---------- Helpers ----------
+// ---------- Simple utilities ----------
 const DIGITS = x => String(x || '').replace(/\D/g, '');
 const toAmount = x => parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
 const isValidIso = ts => !!ts && !Number.isNaN(new Date(ts).getTime());
 
-// ---------- Job wrappers ----------
+// ---------- Job helpers (unchanged) ----------
 async function ensureJobByName(ownerId, name) {
   const owner = DIGITS(ownerId);
   const jobName = String(name || '').trim();
@@ -140,7 +141,7 @@ async function verifyOTP(userId, otp) {
   return ok;
 }
 
-// ---------- User ----------
+// ---------- Users ----------
 async function createUserProfile({ user_id, ownerId, onboarding_in_progress = false }) {
   const uid = DIGITS(user_id);
   const oid = DIGITS(ownerId || uid);
@@ -156,7 +157,7 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
 }
 async function saveUserProfile(p) {
   const uid = DIGITS(p.user_id);
-  const keyshoz = Object.keys(p);
+  const keys = Object.keys(p);
   const vals = Object.values(p);
   const insCols = keys.join(', ');
   const insVals = keys.map((_, i) => `$${i + 1}`).join(', ');
@@ -211,8 +212,11 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   return rows[0].id;
 }
 
-// ---------- Exports ----------
+// ---------- EXCEL EXPORT (lazy load) ----------
 async function exportTimesheetXlsx(opts) {
+  // ----- lazy require -----
+  if (!ExcelJS) ExcelJS = require('exceljs');
+
   const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
   const params = employeeName ? [ownerId, startIso, endIso, tz, employeeName] : [ownerId, startIso, endIso, tz];
   const { rows } = await queryWithTimeout(
@@ -223,6 +227,7 @@ async function exportTimesheetXlsx(opts) {
       ORDER BY employee_name, timestamp`,
     params, 15000
   );
+
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Timesheet');
   ws.columns = [
@@ -232,17 +237,25 @@ async function exportTimesheetXlsx(opts) {
     { header: 'Job', key: 'job_name' },
   ];
   rows.forEach(r => ws.addRow(r));
+
   const buf = await wb.xlsx.writeBuffer();
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}.xlsx`;
+  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}${employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''}.xlsx`;
+
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
      VALUES ($1,$2,$3,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',$4,NOW())`,
     [id, ownerId, filename, Buffer.from(buf)]
   );
-  return { url: `${process.env.PUBLIC_BASE_URL || ''}/exports/${id}`, id, filename };
+  const base = process.env.PUBLIC_BASE_URL || '';
+  return { url: `${base}/exports/${id}`, id, filename };
 }
+
+// ---------- PDF EXPORT (lazy load) ----------
 async function exportTimesheetPdf(opts) {
+  // ----- lazy require -----
+  if (!PDFDocument) PDFDocument = require('pdfkit');
+
   const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
   const params = employeeName ? [ownerId, startIso, endIso, tz, employeeName] : [ownerId, startIso, endIso, tz];
   const { rows } = await queryWithTimeout(
@@ -253,10 +266,12 @@ async function exportTimesheetPdf(opts) {
       ORDER BY employee_name, timestamp`,
     params, 15000
   );
+
   const doc = new PDFDocument({ margin: 40 });
   const chunks = [];
   doc.on('data', d => chunks.push(d));
   const done = new Promise(r => doc.on('end', r));
+
   doc.fontSize(16).text(`Timesheet ${startIso.slice(0,10)} – ${endIso.slice(0,10)}`, { align: 'center' }).moveDown();
   rows.forEach(r => {
     const ts = new Date(r.timestamp);
@@ -267,17 +282,20 @@ async function exportTimesheetPdf(opts) {
   doc.end();
   await done;
   const buf = Buffer.concat(chunks);
+
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}.pdf`;
+  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}${employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''}.pdf`;
+
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
      VALUES ($1,$2,$3,'application/pdf',$4,NOW())`,
     [id, ownerId, filename, buf]
   );
-  return { url: `${process.env.PUBLIC_BASE_URL || ''}/exports/${id}`, id, filename };
+  const base = process.env.PUBLIC_BASE_URL || '';
+  return { url: `${base}/exports/${id}`, id, filename };
 }
 
-// ---------- Export all ----------
+// ---------- Export everything ----------
 module.exports = {
   pool, query, queryWithTimeout, withClient,
   normalizePhoneNumber: x => DIGITS(x),
@@ -288,6 +306,7 @@ module.exports = {
   createUserProfile, saveUserProfile, getUserProfile, getOwnerProfile,
   createTask, getTaskByNo,
   logTimeEntry,
-  exportTimesheetXlsx, exportTimesheetPdf,
-  // Add any other helpers you already use (listMyTasks, etc.) here
+  exportTimesheetXlsx,
+  exportTimesheetPdf,
+  // …add any other helpers you already export (listMyTasks, etc.)
 };

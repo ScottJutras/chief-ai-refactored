@@ -1,264 +1,214 @@
-const { sendQuickReply, sendMessage, sendTemplateQuickReply } = require('../../services/twilio');
+// handlers/commands/job.js
+// ---------------------------------------------------------------
+// Job commands – create, set active, pause/resume/finish, list,
+// move‑last‑log, summary. All DB calls via services/postgres.
+// ---------------------------------------------------------------
+const pg = require('../../services/postgres');
+const { releaseLock } = require('../../middleware/lock');
 const {
   getPendingTransactionState,
   setPendingTransactionState,
+  deletePendingTransactionState,
 } = require('../../utils/stateManager');
-const {
-  createJob,
-  setActiveJob,
-  pauseJob,
-  resumeJob,
-  finishJob,
-  summarizeJob,
-} = require('../../services/postgres');
-const { confirmationTemplates } = require('../../config');
-const { ack } = require('../../utils/http');
+const { sendQuickReply, sendMessage } = require('../../services/twilio');
 
+const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
 
-// -----------------------------
-// Helpers
-// -----------------------------
-function cap(s = '') {
-  return String(s)
-    .trim()
-    .replace(/\s+/g, ' ')
-    .split(' ')
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join(' ');
-}
-
-function startJobTemplateText(name) {
-  const n = cap(name);
-  return `Starting job '${n}'. All entries will be assigned to this job until you say 'go to job (Name) or 'New job'. Confirm?`;
-}
-
-
-function toMoney(n) {
-  const num = Number(n || 0);
-  return num.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function toHours(n) {
-  const num = Number(n || 0);
-  return Number.isFinite(num) ? num.toFixed(2).replace(/\.00$/, '') : '0';
-}
-
-function pct(n) {
-  const num = Number(n || 0) * 100;
-  return Number.isFinite(num) ? num.toFixed(1).replace(/\.0$/, '') + '%' : '0%';
-}
-
-// Accepts: "create job X", "new job 'X'", "add job \"X\""
-function parseCreateJob(text = '') {
-  const m = /^\s*(create|new|add)\s+job\s+(.+?)\s*$/i.exec(text);
-  if (!m) return null;
-  let name = m[2].trim();
-  // strip surrounding quotes if present
-  if ((name.startsWith('"') && name.endsWith('"')) || (name.startsWith("'") && name.endsWith("'"))) {
-    name = name.slice(1, -1).trim();
-  }
-  return name.length >= 2 ? name : null;
-}
-
-// Accepts: "start/pause/resume/finish/summarize job X" and synonyms like "end/close"
-function parseVerbJob(text = '') {
-  const alias = { end: 'finish', close: 'finish', complete: 'finish', stop: 'pause' };
-  const m = /^\s*(start|pause|resume|finish|summarize|end|close|complete|stop)\s+(?:job\s*)?(.*)$/i.exec(text);
-  if (!m) return null;
-  const verb0 = m[1].toLowerCase();
-  const verb = alias[verb0] || verb0;
-  const name = (m[2] || '').trim() || null;
-  return { verb, name };
-}
-
-function summarizeToText(name, s) {
-  if (!s || typeof s !== 'object') {
-    return `\u26a0\ufe0f I couldn't fetch a summary for "${cap(name)}".`;
-  }
-  const lines = [
-    `Duration: ${s.durationDays ?? '—'} days`,
-    `Labour: ${toHours(s.labourHours)}h / $${toMoney(s.labourCost)}`,
-    `Materials: $${toMoney(s.materialCost)}`,
-    `Revenue: $${toMoney(s.revenue)}`,
-    `Profit: $${toMoney(s.profit)} (${pct(s.profitMargin)})`,
-  ];
-  return lines.join('\n');
-}
-
-// -----------------------------
-// Main handler
-// -----------------------------
-async function handleJob(from, input, userProfile, ownerId, ownerProfile, isOwner, res) {
-  const msg = String(input || '').trim();
+async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
+  const lc = String(text || '').toLowerCase().trim();
   const state = (await getPendingTransactionState(from)) || {};
 
-  const sendStartTemplate = async (name) => {
-    await sendTemplateQuickReply(
-      from,
-      'HXd14a878175fd4b24cee0c0ca6061da96', // hex_start_job
-      { '1': cap(name) }
-    );
-  };
-
-  // 0) If user typed a brand-new "create job ____" at ANY time, override pending name and re-template
-  const newNameFromMsg = parseCreateJob(msg);
-  if (newNameFromMsg) {
-    state.jobFlow = { action: 'create', name: newNameFromMsg };
-    if (state.pendingReminder) delete state.pendingReminder; // avoid reminder intercepts
-    await setPendingTransactionState(from, state);
-    await sendStartTemplate(newNameFromMsg);
-    return ack(res);
-  }
-
-  // 0b) If we are in "rename mode" (after pressing Edit), accept a bare name (or "create job X")
-  if (state.jobFlow?.action === 'create' && state.jobFlow?.expectRename) {
-    const rename = parseCreateJob(msg) || msg; // allow "create job ..." OR just a bare name
-    const clean = String(rename || '').trim();
-    if (clean) {
-      state.jobFlow = { action: 'create', name: clean }; // clear expectRename by replacing obj
-      if (state.pendingReminder) delete state.pendingReminder;
-      await setPendingTransactionState(from, state);
-      await sendStartTemplate(clean);
-      return ack(res);
-    }
-    // If they sent something empty, ask again
-    await sendMessage(from, `What should I rename it to? Reply "create job <new name>" or just the name.`);
-    return ack(res);
-  }
-
-  // 1) Pending "create job" confirmation
-  if (state.jobFlow && state.jobFlow.action === 'create' && state.jobFlow.name) {
-    const wantsCreate = /^(create|yes|y|confirm|ok|okay|👍)$/i.test(msg);
-    const wantsCancel = /^(cancel|no|n|stop|abort|✖️|❌)$/i.test(msg);
-    const wantsEdit   = /^(edit|change|rename)$/i.test(msg);
-
-    if (wantsCancel) {
-      delete state.jobFlow;
-      if (state.pendingReminder) delete state.pendingReminder;
-      await setPendingTransactionState(from, state);
-      await sendMessage(from, `❌ Got it — I won't create that job.`);
-      return ack(res);
-    }
-
-    if (wantsEdit) {
-      // enter rename mode and prompt
-      state.jobFlow.expectRename = true;
-      await setPendingTransactionState(from, state);
-      await sendMessage(from, `What should I rename it to? Reply "create job <new name>" or just the name.`);
-      return ack(res);
-    }
-
-    if (wantsCreate) {
-      const jobName = state.jobFlow.name;
-      delete state.jobFlow;
-      if (state.pendingReminder) delete state.pendingReminder;
-
-      try {
-        const job = await createJob(ownerId, jobName);
-        if (!job || job.job_no == null) throw new Error('Job creation succeeded but job_no is missing');
-
-        await setActiveJob(ownerId, jobName);
-
-        state.lastCreatedJobName = jobName;
-        state.lastCreatedJobNo = job.job_no;
+  try {
+    // -------------------------------------------------
+    // 1. CREATE JOB <name> (with confirmation)
+    // -------------------------------------------------
+    {
+      const m = lc.match(/^create\s+job\s+(.+)$/i);
+      if (m) {
+        const name = m[1].trim();
+        if (!name) {
+          res.status(200).type('application/xml').send(RESP(`Please provide a job name.`));
+          return true;
+        }
+        // Store pending create
+        state.jobFlow = { action: 'create', name };
         await setPendingTransactionState(from, state);
-
         await sendQuickReply(
           from,
-          `▶️ Job #${job.job_no} (${cap(jobName)}) is now active.\nYou can Clock in, add Expenses, log Hours, Pause/Finish when done.`,
-          ['Clock in', 'Add expense', 'Log hours', 'Pause job', 'Finish job']
+          `Create job **${name}**? All future entries will go here until you switch.`,
+          ['Yes', 'No', 'Rename']
         );
-      } catch (err) {
-        console.error('[ERROR] createJob failed:', err?.message);
-        await sendMessage(from, `⚠️ I couldn't create "${cap(jobName)}". Try a different name.`);
-      }
-      return ack(res);
-    }
-
-    // Still waiting — repeat template with the CURRENT pending name
-    await sendStartTemplate(state.jobFlow.name);
-    return ack(res);
-  }
-
-  // 2) Verb-based commands: start/pause/resume/finish/summarize (unchanged)
-  const parsed = parseVerbJob(msg);
-  if (parsed) {
-    const { verb } = parsed;
-    let name = parsed.name;
-
-    if (!name && verb === 'start') {
-      name = state.lastCreatedJobName || null;
-      if (!name) {
-        await sendMessage(from, `Which job should I start? Try: "start job <name>".`);
-        return ack(res);
+        return true;
       }
     }
 
-    if (!name) {
-      await sendMessage(from, `Please specify the job name. E.g., "${verb} job Roof Repair".`);
-      return ack(res);
-    }
-
-    try {
-      if (verb === 'start') {
-        let jobNo = null;
+    // Pending create confirmation
+    if (state.jobFlow?.action === 'create' && state.jobFlow.name) {
+      if (/^yes$/i.test(lc)) {
+        const name = state.jobFlow.name;
+        delete state.jobFlow;
         try {
-          await setActiveJob(ownerId, name);
-        } catch {
-          const job = await createJob(ownerId, name);
-          if (!job || job.job_no == null) throw new Error('Job creation succeeded but job_no is missing');
-          await setActiveJob(ownerId, name);
-          jobNo = job.job_no;
+          const job = await pg.createJob(ownerId, name);
+          await pg.setActiveJob(ownerId, name);
+          state.lastCreatedJobName = name;
           state.lastCreatedJobNo = job.job_no;
+          await setPendingTransactionState(from, state);
+          await sendQuickReply(
+            from,
+            `Job **${name}** (#${job.job_no}) created and set active.`,
+            ['Clock in', 'Add expense', 'Finish job']
+          );
+        } catch (e) {
+          console.warn('[job] create failed:', e?.message);
+          await sendMessage(from, `Couldn’t create job “${name}”.`);
         }
-        state.lastCreatedJobName = name;
+        return true;
+      }
+      if (/^no$/i.test(lc)) {
+        delete state.jobFlow;
         await setPendingTransactionState(from, state);
-
-        if (jobNo != null) {
-          await sendMessage(from, `▶️ Job #${jobNo} ("${cap(name)}") is now active. You can Clock in, add Expenses, or Pause/Finish when done.`);
-        } else {
-          await sendMessage(from, `▶️ "${cap(name)}" is now active. You can Clock in, add Expenses, or Pause/Finish when done.`);
+        await sendMessage(from, `Job creation cancelled.`);
+        return true;
+      }
+      if (/^rename$/i.test(lc)) {
+        state.jobFlow.expectRename = true;
+        await setPendingTransactionState(from, state);
+        await sendMessage(from, `What should the job be called?`);
+        return true;
+      }
+      if (state.jobFlow.expectRename) {
+        const newName = text.trim();
+        if (!newName) {
+          await sendMessage(from, `Please provide a name.`);
+          return true;
         }
-        return ack(res);
+        state.jobFlow.name = newName;
+        delete state.jobFlow.expectRename;
+        await setPendingTransactionState(from, state);
+        await sendQuickReply(
+          from,
+          `Create job **${newName}**?`,
+          ['Yes', 'No']
+        );
+        return true;
       }
-
-      if (verb === 'pause') {
-        await pauseJob(ownerId, name);
-        await sendQuickReply(from, `⏸️ Paused "${cap(name)}". Resume later?`, [`Resume job ${cap(name)}`, 'Log hours', 'Add expense']);
-        return ack(res);
-      }
-
-      if (verb === 'resume') {
-        await resumeJob(ownerId, name);
-        await sendQuickReply(from, `▶️ Resumed "${cap(name)}".`, ['Clock in', 'Add expense', 'Finish job']);
-        return ack(res);
-      }
-
-      if (verb === 'finish') {
-        await finishJob(ownerId, name);
-        let s = null;
-        try { s = await summarizeJob(ownerId, name); } catch {}
-        const summary = summarizeToText(name, s);
-        await sendQuickReply(from, `✅ Finished "${cap(name)}".\n${summary}`, ['Create invoice', 'Dashboard', 'New job']);
-        return ack(res);
-      }
-
-      if (verb === 'summarize') {
-        let s = null;
-        try { s = await summarizeJob(ownerId, name); } catch {}
-        const summary = summarizeToText(name, s);
-        await sendQuickReply(from, `📋 Recap for "${cap(name)}":\n${summary}`, ['Add expense', 'Log hours', `Finish job ${cap(name)}`]);
-        return ack(res);
-      }
-    } catch (err) {
-      console.error(`[ERROR] ${verb} job failed:`, err?.message);
-      await sendMessage(from, `⚠️ I couldn't ${verb} "${cap(name)}". Please try again.`);
-      return ack(res);
+      // Repeat prompt
+      await sendQuickReply(
+        from,
+        `Create job **${state.jobFlow.name}**?`,
+        ['Yes', 'No', 'Rename']
+      );
+      return true;
     }
-  }
 
-  // 4) Not handled here → let upstream router try others
-  return false;
+    // -------------------------------------------------
+    // 2. SET ACTIVE JOB <name|#no>
+    // -------------------------------------------------
+    {
+      const m = lc.match(/^(?:set\s+)?active\s+job\s+(.+)$/i);
+      if (m) {
+        const ident = m[1].trim();
+        try {
+          const job = await pg.setActiveJob(ownerId, ident);
+          await sendMessage(from, `Active job set to **${job.name}** (#${job.job_no}).`);
+        } catch (e) {
+          console.warn('[job] set-active failed:', e?.message);
+          await sendMessage(from, `Couldn’t set active job “${ident}”.`);
+        }
+        return true;
+      }
+    }
+
+    // -------------------------------------------------
+    // 3. PAUSE / RESUME / FINISH JOB
+    // -------------------------------------------------
+    {
+      const verbMap = { pause: 'pauseJob', resume: 'resumeJob', finish: 'finishJob' };
+      for (const [verb, fn] of Object.entries(verbMap)) {
+        const m = lc.match(new RegExp(`^${verb}\\s+job\\s+(.+)$`, 'i'));
+        if (m) {
+          const ident = m[1].trim();
+          try {
+            const job = await pg[fn](ownerId, ident);
+            if (!job) throw new Error('not found');
+            const action = verb.charAt(0).toUpperCase() + verb.slice(1) + 'd';
+            await sendMessage(from, `${action} job **${job.name}**.`);
+          } catch (e) {
+            console.warn(`[job] ${verb} failed:`, e?.message);
+            await sendMessage(from, `Couldn’t ${verb} job “${ident}”.`);
+          }
+          return true;
+        }
+      }
+    }
+
+    // -------------------------------------------------
+    // 4. LIST OPEN JOBS
+    // -------------------------------------------------
+    if (/^list\s+jobs?$/i.test(lc)) {
+      try {
+        const jobs = await pg.listOpenJobs(ownerId, 5);
+        if (!jobs.length) {
+          res.status(200).type('application/xml').send(RESP(`No open jobs.`));
+          return true;
+        }
+        const lines = jobs.map(j => `• **${j.name}** (#${j.job_no})${j.active ? ' (active)' : ''}`);
+        res.status(200).type('application/xml').send(RESP(`Open jobs:\n${lines.join('\n')}`));
+        return true;
+      } catch (e) {
+        console.warn('[job] list failed:', e?.message);
+        res.status(200).type('application/xml').send(RESP(`Couldn’t list jobs.`));
+        return true;
+      }
+    }
+
+    // -------------------------------------------------
+    // 5. ACTIVE JOB?
+    // -------------------------------------------------
+    if (/^active\s+job\??$/i.test(lc)) {
+      try {
+        const name = await pg.getActiveJob(ownerId);
+        const msg = name === 'Uncategorized' ? 'No active job set.' : `Active job: **${name}**.`;
+        res.status(200).type('application/xml').send(RESP(msg));
+        return true;
+      } catch (e) {
+        console.warn('[job] active? failed:', e?.message);
+        res.status(200).type('application/xml').send(RESP(`Couldn’t fetch active job.`));
+        return true;
+      }
+    }
+
+    // -------------------------------------------------
+    // 6. MOVE LAST LOG TO <job>
+    // -------------------------------------------------
+    {
+      const m = lc.match(/^move\s+last\s+log\s+to\s+(.+)$/i);
+      if (m) {
+        const target = m[1].trim();
+        try {
+          const job = await pg.findJob(ownerId, target);
+          if (!job) throw new Error('job not found');
+          const employee = userProfile?.name || from;
+          const updated = await pg.moveLastEntryToJob(ownerId, employee, job.name);
+          if (!updated) throw new Error('no entry');
+          res.status(200).type('application/xml').send(RESP(`Last log moved to **${job.name}**.`));
+          return true;
+        } catch (e) {
+          console.warn('[job] move-last failed:', e?.message);
+          res.status(200).type('application/xml').send(RESP(`Couldn’t move last log to “${target}”.`));
+          return true;
+        }
+      }
+    }
+
+    return false; // fall through
+  } catch (e) {
+    console.error('[job] error:', e?.message);
+    res.status(200).type('application/xml').send(RESP(`Job error. Try again.`));
+    return true;
+  } finally {
+    await releaseLock(`lock:${ownerId || from}`);
+  }
 }
 
 module.exports = handleJob;

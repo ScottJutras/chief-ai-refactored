@@ -1,33 +1,47 @@
-const { sendMessage, sendTemplateMessage } = require('../services/twilio');
-const { query } = require('../services/postgres');
+// handlers/commands/teamSetup.js
+// Onboarding: "yes/no" → add employees → finish stage.
+const pg = require('../../services/postgres');
+const { sendQuickReply } = require('../../services/twilio');
 
+const RESP = (t) => `<Response><Message>${t}</Message></Response>`;
 
-async function handleTeamSetup(from, body, userProfile, ownerId, ownerProfile, isOwner) {
-  if (!isOwner) {
-    return `<Response><Message>⚠️ Only owners can manage team setup. Contact your owner.</Message></Response>`;
+module.exports = async function handleTeamSetup(
+  from, input, userProfile, ownerId, _ownerProfile, isOwner, res
+) {
+  if (!isOwner) return res.send(RESP(`Only owners can set up the team.`));
+  const lc = String(input || '').toLowerCase().trim();
+
+  // YES → start adding employees
+  if (lc === 'yes') {
+    await pg.query(`UPDATE users SET current_stage='addEmployees' WHERE user_id=$1`, [ownerId]);
+    return res.send(RESP(`Great! Add employees: "John, Manager"`));
   }
-  const lowerBody = body.toLowerCase();
-  if (lowerBody === 'yes') {
-    await query(`UPDATE users SET current_stage = $1 WHERE phone = $2`, ['addEmployees', from]);
-    return `<Response><Message>Great! Add employees by replying with their name and role (e.g., "John, Manager").</Message></Response>`;
-  } else if (lowerBody === 'no') {
-    await query(`UPDATE users SET current_stage = $1, onboarding_in_progress = $2 WHERE phone = $3`, ['training', false, from]);
-    return `<Response><Message>Skipping employee setup. Reply ‘start training’ to learn how to use PocketCFO.</Message></Response>`;
-  } else if (userProfile.current_stage === 'addEmployees') {
-    const [name, role] = body.split(',').map(s => s.trim());
-    if (!name || !role) {
-      return `<Response><Message>Please provide employee name and role (e.g., "John, Manager").</Message></Response>`;
-    }
-    await query(
-      `INSERT INTO employees (owner_id, name, role, created_at) VALUES ($1, $2, $3, $4)`,
-      [ownerId, name, role, new Date().toISOString()]
+
+  // NO → skip to training
+  if (lc === 'no') {
+    await pg.query(
+      `UPDATE users SET current_stage='training', onboarding_in_progress=false WHERE user_id=$1`,
+      [ownerId]
     );
-    await sendTemplateMessage(from, [{
-      type: 'text',
-      text: `Added ${name} as ${role}. Add another employee?`
-    }], process.env.HEX_ADD_EMPLOYEES);
-    return `<Response></Response>`;
+    return res.send(RESP(`Skipping team setup. Reply "start training" to learn.`));
   }
-  return `<Response><Message>Invalid input. Reply ‘yes’ or ‘no’ to add employees, or try ‘help’.</Message></Response>`;
-}
-module.exports = { handleTeamSetup };
+
+  // ADD EMPLOYEE (current_stage = addEmployees)
+  if (userProfile.current_stage === 'addEmployees') {
+    const [name, role] = input.split(',').map(s => s.trim());
+    if (!name || !role) return res.send(RESP(`Format: "John, Manager"`));
+    await pg.query(
+      `INSERT INTO employees (owner_id, name, role, created_at)
+       VALUES ($1,$2,$3,NOW())`,
+      [ownerId, name, role]
+    );
+    await sendQuickReply(
+      from,
+      `Added **${name}** as ${role}. Add another?`,
+      ['Yes', 'No']
+    );
+    return res.send(`<Response></Response>`);
+  }
+
+  return res.send(RESP(`Reply "yes" or "no" to add employees.`));
+};

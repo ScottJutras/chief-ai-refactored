@@ -1,0 +1,255 @@
+North Star
+Absolutely — here’s a tightened, upgraded “North Star” that keeps all the good stuff you already have and layers in the missing pieces teams usually trip over later (CIL JSON schemas, state machines, error contracts, SLOs, DR/backup, security runbook, and concrete tool specs so GPT/Grok can act, not just chat). I’ve preserved your useful content and folded it into a single, cohesive spec. Re-added any potentially dropped items from prior versions (e.g., explicit onboarding flows, teammate addition, undo/move-last-log, timezone defaults, SOP indexing, vendor lock avoidance, async pitfalls, RAG cost controls, responsible AI details, and SOC 2 mappings). Added tenant data training: a dedicated section on ethical, compliant LM fine-tuning using anonymized aggregates.
+
+PocketCFO — North Star PRD & Architecture (Beta & Beyond)
+0) Mission
+A WhatsApp-first personal CFO that ingests text, voice, and images; turns them into structured financial records tied to a Job; answers and explains like a seasoned CFO; and produces quotes → contracts → invoices → receipts, KPIs, and exports — fast, reliably, and securely.
+
+1) Non-negotiables (guardrails)
+* Latency SLOs: P95 < 1.5s (tasks/timeclock), < 3s (RAG), < 6s (media ack). Enforce with function timeouts + async offloading.
+* Reliability: Every inbound gets 200/TwiML within 8s (safety timer). All writes are idempotent and audited.
+* Data isolation: Postgres RLS on owner_id; handler-level permission checks; no cross-tenant joins.
+* Everything is a Job: All entities attachable to a Job. Dashboard aggregates by Job. If Job ambiguous, prompt user (e.g., "Attach to Roof Repair?").
+* LLM abstraction: Agent Service only (schema-validated tool calls; provider switchable OpenAI/Grok/mock).
+* Cost & abuse: Subscription gates (Agent/exports/media), per-owner rate limits, per-tenant LLM/token budgets.
+* Observability: Trace IDs, structured logs, counters, latency histograms, DLQ.
+* Responsible AI: PII redaction in prompts/logs, bias guardrails, human-in-loop for high-stakes (e.g., sending quotes).
+* SOC 2 ready: Audit on every mutation, vendor due diligence, yearly pen test, privacy policy + sub-processor list.
+
+2) Core user journeys (beta scope)
+2.1 Capture
+* Text: e.g., task - buy nails, clock in @ Roof Repair 7am, expense $84.12 @ Home Depot for nails, job Roof Repair.
+  → Normalize → CIL (see §6) → persist; if Job ambiguous, ask and then persist. Reply with confirmation + ID (e.g., "Task #42 added to Roof Repair").
+* Voice: A single clip may include customer + materials + labour + price + job.
+  → ASR → intent extraction → CIL → Draft Quote + summary reply (Send? Edit?).
+* Image: Receipt photo → OCR → transactions(type=expense); PDF/IMG attachments stored & linked to Job.
+
+2.2 Operate
+* Timeclock: in/out; break/drive; overlap guard; approvals; weekly timesheet.
+* Tasks: create/list (mine/team/inbox), complete, assign, delete, due dates, reminders.
+* Jobs: create/activate/close; “move last log to ”; per-job ledger.
+* Contracts: Quotes → Contracts → Invoices → Receipts with PDFs; WhatsApp links; statuses tracked.
+* Dashboard: Per-job tiles: revenue, cost, margin, labour hours, AR, unbilled time, vendor spend, etc.
+
+2.3 Ask (CFO Q&A)
+* “Which jobs are underwater?” “What’s margin on Jane Roof?”
+  → Agent uses tools (DB KPIs), cites assumptions, never fabricates fields.
+
+3) System architecture
+Ingress: Twilio → api/webhook (Vercel)
+Router: Express micro, lazy requires, Twilio signature, profile, locks, 8s safety
+Domain services: timeclock, tasks, jobs, money, quotes/contracts/invoices, uploads
+Agent Service: RAG + tools, provider-agnostic, 2s soft timeout + tier gates
+Data: Postgres/Supabase (RLS), Storage (Supabase/GCS signed URLs)
+Async: Queue (cron + job table now; Upstash/Cloud Tasks later): ASR/OCR/PDF/reminders
+Exports: Separate function(s) for PDFs (kept out of webhook bundle)
+Observability: TraceId, metrics, DLQ, audit table
+Scaling: Serverless auto-scale; per-function configs (e.g., webhook: low-memory/fast; PDF: high-memory/long-duration). Avoid state in functions; use DB for sessions.
+
+4) State machines (prevent logic drift)
+4.1 Quote → Contract → Invoice
+* Quote.status: draft → sent → accepted | rejected (terminal)
+* Contract.status: draft → sent → signed (terminal)
+  Creation paths: Quote.accepted → Contract(draft) or bypass (optional)
+* Invoice.status: draft → sent → paid | overdue
+  Transition guards:
+  * send: requires pdf_url ready
+  * paid: requires receipts.total ≥ invoice.total
+  * overdue: system transition (now > due_date && status=sent && not paid)
+
+4.2 Timeclock entry
+* kind: shift | break | drive
+* shift.start allowed only if no open shift for user; breaks/drives must be nested within open shift.
+
+5) Errors & idempotency (contracts)
+Idempotency-Key header (or (owner_id, source_msg_id)) on writes.
+Error envelope (for Agent/tool & HTTP JSON APIs):
+```json
+{ "ok": false, "error": { "code": "PERMISSION_DENIED", "message": "Owner-only action", "hint": "Ask an owner to assign", "traceId": "abc123" } }
+```
+Common codes: VALIDATION, NOT_FOUND, CONFLICT, RATE_LIMIT, TIMEOUT, INTERNAL.
+User-facing TwiML always replies with a short, actionable sentence.
+
+6) Canonical Intermediate Language (CIL) — JSON Schemas (critical)
+All ingress (regex/ASR/OCR/RAG tools) must produce one of these objects; domain handlers accept only CIL.
+```json
+// CreateTask
+{ "type":"CreateTask","title":"Buy nails","due_at":"2025-11-05T13:00:00-05:00","assignee":"Justin","job":"Roof Repair" }
+
+// CompleteTask / AssignTask / DeleteTask
+{ "type":"CompleteTask","task_no":12 }
+{ "type":"AssignTask","task_no":12,"assignee":"Justin" }
+{ "type":"DeleteTask","task_no":12 }
+
+// Clock
+{ "type":"Clock","action":"in|out|break_start|break_end|drive_start|drive_end","at":"2025-11-03T07:00:00-05:00","job":"Roof Repair","target_user":null }
+
+// Expense (from text or OCR)
+{ "type":"Expense","amount_cents":8412,"currency":"CAD","vendor":"Home Depot","tax_cents":1095,"occurred_at":"2025-11-03","job":"Roof Repair","note":"nails","media_url":null }
+
+// Quote (voice multi-intent)
+{
+  "type":"Quote",
+  "job":"Jane Roof",
+  "customer":{"name":"Jane Smith","phone":"+1905...","email":null,"address":"..."},
+  "line_items":[{"name":"Shingles Timberline HDZ","qty":20,"unit":"sq","unit_price_cents":4500}],
+  "labor_hours":16,
+  "labor_rate_cents":6500,
+  "tax_code":"HST_ON",
+  "terms":"50% deposit, balance on completion"
+}
+```
+Validation rules: amounts in cents, ISO datetimes, phone normalized E.164, job by name or id (resolver below).
+
+7) Job resolution strategy (avoids “lost” records)
+* If CIL has job by name:
+  1. Exact name (case-insensitive) for owner_id.
+  2. If multiple close matches (Levenshtein ≤ 2), ask user with options.
+  3. If none, offer: create job <name>? (store pending state).
+* If no job in CIL, check active job for user; else ask.
+
+8) RAG design (durable & cost-safe)
+* Collections: Product/SOP (global help, Timeclock/Tasks/Jobs SOPs) — static, versioned chunks.
+  Tenant Knowledge (per-owner: job notes, materials catalogs, price lists, customer notes) — dynamic, scoped by owner_id.
+  Schemas/Contracts (read-only structured docs that describe the DB and tool contracts — improves tool use).
+* Retriever: Hybrid (BM25 + embeddings); chunk at 512 tokens with 128 overlap; top-8–12 chunks. Use hybrid search for accuracy.
+* Prompt frame: “You are Chief, a CFO. First, decide if a tool solves this. If not, answer from the provided context. If uncertain, ask a clarifying question. Prefer numbers, mention assumptions, cite snippets briefly.”
+* Citations: Include doc titles or job names in answers (not URLs). Use min_score_threshold=0.18 for relevance.
+* Caching: Cache Q&A with `(ownerId, normalized_question)` key for 10–60 min; invalidate on relevant writes.
+* Cost controls: Token limits per call (≤4k in / ≤2k out), daily quotas per tier.
+
+9) Agent Service (tools spec) — what GPT/Grok can call
+Entry: ask({ from, ownerId, text, topicHints?, tools? })\
+Guardrails: 2s soft timeout → “Try again or use: tasks / clock in”.\
+Tools (minimal v1):
+```ts
+// 1) get_job_kpis
+input: { job?: string, window?: "MTD"|"YTD"|"ALL" }
+output: {
+  ok: true,
+  job: { id: string, name: string },
+  metrics: {
+    revenue_cents: number, cost_cents: number, margin_pct: number,
+    labour_hours: number, unbilled_hours: number, ar_cents: number
+  }
+}
+
+// 2) list_jobs
+input: { status?: "open"|"closed"|"all" }
+output: { ok: true, jobs: Array<{id:string,name:string,status:string,created_at:string}> }
+
+// 3) create_quote
+input: Quote CIL (see §6)
+output: { ok:true, quote_id:string, summary:string }
+
+// 4) persist_expense
+input: Expense CIL
+output: { ok:true, transaction_id:string }
+
+// 5) list_tasks / my_tasks
+input: { assignee?: "me"|string, status?: "open"|"done" }
+output: { ok:true, tasks: Array<{task_no:number,title:string,due_at?:string,assigned_to?:string}> }
+```
+Note: Tools must return owner-scoped results only; enforce via service layer.
+
+10) Data model (evolvable; additive-only)
+(Your tables retained; added a couple of helpful columns and indexes.)
+* Add source_msg_id TEXT NULL to transactions/uploads/quotes for idempotency.
+* Add GIN index on uploads(parsed) and transactions(parsed) for OCR/AI enrich queries.
+* KPI materialized views:
+  * job_kpis_mv (revenue/cost/margin/labour/AR) with REFRESH ... CONCURRENTLY.
+
+11) Security model (practical, SOC2-aligned)
+* Twilio signature verify with req.rawBody + canonical URL; reject on mismatch.
+* RLS: (owner_id = current_setting('request.jwt.claims')::json->>'owner_id'); role-based exceptions for assigned_to reads where appropriate. Test with psql roles.
+* Rate limiting: Per `ownerId` token bucket (e.g., 10/second burst, 100/min). Hard drop with “Slow down” message.
+* Idempotency: For media and writes, use `(owner_id, source_msg_id)` unique key when possible.
+* Audit: Insert into `audit` on every mutating action (actor, target, payload digest). Immutable; retain 7 years for SOC 2.
+* Vendor management: Due diligence on Twilio/OpenAI (SLAs, DPAs); sub-processor list in privacy policy.
+* Controls mapping: Security (firewalls, encryption-at-rest); Availability (multi-region DB); Integrity (idempotency, validations); Confidentiality (PII redaction in logs); Privacy (GDPR consent flows).
+
+12) KPIs & dashboards
+* Per Job: revenue, costs, gross margin, labour hours, cost/hour, burn vs estimate, AR, unbilled time.
+* Company: cash in/out MTD/YTD, top 5 margins, aged AR, labour utilization, vendor spend, quote win-rate.
+* Delivery: simple web dashboard (token auth) + Agent tool get_job_kpis. Use materialized views for query speed.
+
+13) Latency budgets
+* Router + fast DB: 80–250ms
+* RAG answer: 800–2200ms (fallback at 2s)
+* Media ack: 500–1500ms (async enrich)
+* PDF: 1–4s (separate function, async “ready” ping)
+
+14) Testing & QA
+* Contract tests (tools): validate schemas + amounts in cents.
+* Golden files: text/voice/receipt samples.
+* RLS tests: Simulate employee role request context; assert zero leakage.
+* Webhook smoke: Version, tasks help, done/assign/delete, timeclock, media audio/image.
+* Load: 50 RPS burst, 30s (no PDF/OCR paths).
+* SOC2 prep: gap analysis checklists; audit inserts verified.
+
+15) DR, backups, and data lifecycle (often missed)
+* Backups: PITR or daily full + 7/30/365 retention tiers.
+* RPO/RTO: RPO ≤ 15m, RTO ≤ 2h (beta targets).
+* Disaster mode: flip read replicas to primary (runbook), freeze Agent calls, show “read-only” banner.
+* Data retention: configurable per tenant (legal hold flags); right-to-erasure process.
+
+16) Feature flags & migrations
+* Flags: agent_enabled, ocr_async, pdf_new_template, quote_v2_pricing.
+* Migration rule: additive only; put experiments in parsed JSONB → backfill → hard schema. Use Supabase migrations for versioning.
+
+17) Rollout to Beta
+* P0 (done): hardened router, lazy requires, signature, safety replies.
+* P1: Domain flows via CIL adapters; verify fast-paths (done/assign/delete).
+* P2: Media → Expense/Quote (voice+receipt), idempotency keys, async enrich.
+* P3: Agent/RAG with tools and tier gates, cache hot answers.
+* P4: PDF gen + send flows; WhatsApp templates.
+* P5: Dashboard tiles + job drilldowns; onboarding link.
+* P6: Reminders cron + alerting; beta cohort enable.
+* P7: RAG tuning, hybrid search evals; SOC2 mock audit.
+
+18) Implementation checklists (actionable)
+18.1 CIL module
+* JSON Schema validation (Ajv or zod) for all CIL types.
+* Resolver: job by name → id (+ disambiguate).
+* Single applyCIL(cil, ctx) to call domain services.
+
+18.2 Agent tools
+* Implement get_job_kpis, create_quote, persist_expense, list_jobs, list_tasks.
+* Provider router (OpenAI/Grok/mock); cost caps per tenant/day.
+* Prompt with tool list and example responses (few-shot).
+
+18.3 Media service
+* transcribe(url); parseReceipt(url); attachUpload(...).
+* Store raw → parse → link; enqueue enrich; notify on completion.
+
+18.4 Security & ops
+* Twilio signature middleware wired, fail-closed.
+* Rate limiter per owner; LLM limiter per tier.
+* Audit inserts for each mutator.
+* Backups configured; DR runbook.
+
+19) Example end-to-end (voice → quote → invoice)
+1. User: sends voice with customer + materials + labour + price + job.
+2. Media svc: ASR → text → Agent extracts Quote CIL (+ possible Expense CIL lines for materials).
+3. CIL apply: create_quote → quotes row (status=draft); PDF job enqueued.
+4. Reply: summary + actions: Preview PDF | Send to <customer_phone> | Edit | Convert to invoice.
+5. Send: PDF ready? If not, “preparing…” then follow-up with the link; update status=sent.
+6. Convert: Quote.accepted → Contract(optional) → Invoice(draft→sent). Payment receipts recorded; status=paid.
+
+20) “Don’t forgets”
+* Default timezone America/Toronto everywhere; store UTC, render local.
+* “Undo last” (timeclock) & “move last log to ”.
+* “Add teammate” flow via text (“add teammate Justin +1905…”).
+* SOPs indexed in RAG (gold for help).
+* Subscription gates for Agent/Exports to prevent free-tier abuse.
+* Vendor-lock avoidance: provider adapters for LLM/storage/PDF.
+* Async pitfalls: DLQ for failed jobs; retry with backoff; user notifications on long-running (e.g., “Quote PDF ready: [link]”).
+
+21) Tenant data for LM training (new; ethical & compliant)
+* **Opt-in only:** Tenant consent required (e.g., via dashboard toggle + privacy notice: “Anonymized aggregates may train our global CFO model for better answers”).
+* **Anonymization:** Strip PII (names, phones, amounts > thresholds, locations); aggregate KPIs/metrics across cohorts (e.g., avg margin by industry, no per-job).
+* **Usage:** Fine-tune global models (e.g., Grok/OpenAI custom) on sanitized datasets for CFO persona (insights, assumptions). Never use raw tenant data in production queries.
+* **Compliance:** GDPR/SOC2: Data processing agreements; right-to-opt-out/deletion cascades to training sets; audit training runs.
+* **Implementation:** Async exporter job (per-opted tenant) → anonymize → S3/GCS bucket → periodic fine-tune pipeline (e.g., Hugging Face or OpenAI fine-tuning API).
+
+This North Star is your dev compass: **CIL decouples ingest from logic**; **Agent tools for extensibility**; **serverless-first with async heavy-lifts**; everything scoped/audited for SOC 2. Build to this, and scaling to enterprise (e.g., multi-tenant, custom RAG) won’t require refactors. If we hit roadblocks, reference section IDs in queries. If you want, I can drop this into your repo as a /docs/architecture/pocketcfo-north-star.md and add stub JSON Schemas + TypeScript types for the CIL and tools so the Agent integration is plug-and-play.

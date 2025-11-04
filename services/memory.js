@@ -1,3 +1,4 @@
+// services/memory.js
 const { query } = require('./postgres');
 
 async function logEvent(tenantId, userId, kind, payload) {
@@ -7,18 +8,16 @@ async function logEvent(tenantId, userId, kind, payload) {
     [tenantId, userId, kind, payload]
   );
 }
-
 async function getMemory(tenantId, userId, keys = []) {
   if (!keys.length) return {};
   const { rows } = await query(
-    `SELECT key, value FROM user_memory WHERE tenant_id=$1 AND user_id=$2 AND key = ANY($3)`,
+    `SELECT key, value FROM user_memory WHERE tenant_id=$1 AND user_id=$2 AND key=ANY($3)`,
     [tenantId, userId, keys]
   );
   const out = {};
   for (const r of rows) out[r.key] = r.value;
   return out;
 }
-
 async function upsertMemory(tenantId, userId, key, value) {
   await query(
     `INSERT INTO user_memory (tenant_id, user_id, key, value, updated_at)
@@ -28,7 +27,6 @@ async function upsertMemory(tenantId, userId, key, value) {
     [tenantId, userId, key, value]
   );
 }
-
 async function getConvoState(tenantId, userId) {
   const { rows } = await query(
     `SELECT active_job, active_job_id, aliases, last_intent, last_args, history
@@ -36,11 +34,9 @@ async function getConvoState(tenantId, userId) {
     [tenantId, userId]
   );
   return rows[0] || {
-    active_job: null, active_job_id: null, aliases: {},
-    last_intent: null, last_args: {}, history: []
+    active_job: null, active_job_id: null, aliases: {}, last_intent: null, last_args: {}, history: []
   };
 }
-
 async function saveConvoState(tenantId, userId, patch = {}) {
   const current = await getConvoState(tenantId, userId);
   const next = {
@@ -69,7 +65,6 @@ async function saveConvoState(tenantId, userId, patch = {}) {
   );
   return next;
 }
-
 async function getEntitySummary(tenantId, entityType, entityId) {
   const { rows } = await query(
     `SELECT summary FROM entity_summary WHERE tenant_id=$1 AND entity_type=$2 AND entity_id=$3`,
@@ -77,7 +72,6 @@ async function getEntitySummary(tenantId, entityType, entityId) {
   );
   return rows[0]?.summary || null;
 }
-
 async function upsertEntitySummary(tenantId, entityType, entityId, summary) {
   await query(
     `INSERT INTO entity_summary (tenant_id, entity_type, entity_id, summary, updated_at)
@@ -87,7 +81,6 @@ async function upsertEntitySummary(tenantId, entityType, entityId, summary) {
     [tenantId, entityType, entityId, summary]
   );
 }
-
 module.exports = {
   logEvent, getMemory, upsertMemory,
   getConvoState, saveConvoState,

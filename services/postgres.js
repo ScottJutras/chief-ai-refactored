@@ -1,2199 +1,293 @@
+// services/postgres.js
+// ---------------------------------------------------------------
+// Central Postgres service – pool, retry, timeout, helpers.
+// All DB calls are RLS‑guarded in the schema.
+// ---------------------------------------------------------------
 const { Pool } = require('pg');
 const ExcelJS = require('exceljs');
 const crypto = require('crypto');
 const PDFDocument = require('pdfkit');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
 
-// Initialize ONE Postgres pool with optimized settings
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 20,                 // handle higher load
+  max: 20,
   connectionTimeoutMillis: 20000,
   idleTimeoutMillis: 60000,
   keepAlive: true,
 });
+pool.on('error', err => console.error('[PG] idle client error:', err?.message));
 
-pool.on('error', (err) => {
-  console.error('[PG] Idle client error:', err?.message || err);
-});
-
-// Core query with retry
-async function query(sql, params) {
-  try {
-    return await queryWithRetry(sql, params);
-  } catch (error) {
-    console.error(`[ERROR] Query failed: ${error.message}`, { tag: 'postgres.js', stack: error.stack });
-    throw error;
-  }
+async function query(text, params) {
+  return await queryWithRetry(text, params);
 }
-
 async function queryWithRetry(text, params, attempt = 1) {
-  try {
-    return await pool.query(text, params);
-  } catch (e) {
+  try { return await pool.query(text, params); }
+  catch (e) {
     const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET/i.test(e.message || '');
     if (transient && attempt < 3) {
-      console.warn(`[WARN] Transient error, retry ${attempt + 1}: ${e.message}`);
+      console.warn(`[PG] retry ${attempt + 1}: ${e.message}`);
       await new Promise(r => setTimeout(r, attempt * 200));
       return queryWithRetry(text, params, attempt + 1);
     }
     throw e;
   }
 }
-
-// Per-query statement timeout for heavy queries/exports
-async function queryWithTimeout(sql, params, timeoutMs = 9000) {
-  return withClient(async (client) => {
-    await client.query('SET LOCAL statement_timeout = $1', [timeoutMs]);
+async function queryWithTimeout(sql, params, ms = 9000) {
+  return withClient(async client => {
+    await client.query('SET LOCAL statement_timeout = $1', [ms]);
     return client.query(sql, params);
   }, { useTransaction: true });
 }
-
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await pool.connect();
   try {
     if (useTransaction) await client.query('BEGIN');
-    const result = await fn(client);
+    const res = await fn(client);
     if (useTransaction) await client.query('COMMIT');
-    return result;
+    return res;
   } catch (err) {
-    if (useTransaction) {
-      try { await client.query('ROLLBACK'); } catch (_) {}
-    }
-    console.error(`[ERROR] withClient failed: ${err.message}`, { stack: err.stack });
+    if (useTransaction) await client.query('ROLLBACK').catch(() => {});
     throw err;
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 }
 
 // ---------- Helpers ----------
-function normalizePhoneNumber(phone = '') {
-  const val = String(phone || '');
-  const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
-  return noWa.replace(/^\+/, '').replace(/\D/g, '').trim();
-}
-
-function _digits(x) {
-  return String(x || '').replace(/\D/g, '');
-}
-
-
-function toAmount(x) {
-  return parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
-}
-
-function isValidIsoTimestamp(ts) {
-  if (!ts || (typeof ts !== 'string' && !(ts instanceof Date))) return false;
-  const d = new Date(ts);
-  return !Number.isNaN(d.getTime());
-}
-
-function groupBy(arr, key) {
-  return arr.reduce((m, x) => ((m[x[key]] ||= []).push(x), m), {});
-}
-
-function computeEmployeeSummary(rows) {
-  let totalHours = 0, driveHours = 0, breakMinutes = 0;
-  let lastIn = null, lastDrive = null, lastBreak = null;
-  const sorted = [...rows].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-
-  for (const r of sorted) {
-    const t = new Date(r.timestamp);
-    if (r.type === 'punch_in') lastIn = t;
-    if (r.type === 'punch_out' && lastIn) { totalHours += (t - lastIn) / 3600000; lastIn = null; }
-    if (r.type === 'drive_start') lastDrive = t;
-    if (r.type === 'drive_end' && lastDrive) { driveHours += (t - lastDrive) / 3600000; lastDrive = null; }
-    if (r.type === 'break_start') lastBreak = t;
-    if (r.type === 'break_end' && lastBreak) { breakMinutes += (t - lastBreak) / 60000; lastBreak = null; }
-  }
-  if (lastBreak) {
-    const last = sorted.length ? new Date(sorted[sorted.length - 1].timestamp) : new Date();
-    breakMinutes += Math.max(0, (last - lastBreak) / 60000);
-  }
-  return {
-    totalHours: +totalHours.toFixed(2),
-    driveHours: +driveHours.toFixed(2),
-    breakMinutes: Math.round(breakMinutes),
-  };
-}
-
-
-// Fetch a task by its friendly number for the owner
-async function getTaskByNo(ownerId, taskNo) {
-  const sql = `
-    SELECT id, task_no, owner_id, title, status, assigned_to, created_by
-      FROM public.tasks
-     WHERE owner_id = $1
-       AND task_no  = $2
-     LIMIT 1
-  `;
-  const r = await query(sql, [ownerId, taskNo]);
-  return r.rows[0] || null;
-}
-
-// ---------- Job Context + Wrappers (DROP-IN) ----------
-
 const DIGITS = x => String(x || '').replace(/\D/g, '');
+const toAmount = x => parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
+const isValidIso = ts => !!ts && !Number.isNaN(new Date(ts).getTime());
 
-/**
- * Find-or-create a job by name for a tenant.
- * Uses both `name` and legacy `job_name` for compatibility.
- */
+// ---------- Job wrappers ----------
 async function ensureJobByName(ownerId, name) {
   const owner = DIGITS(ownerId);
   const jobName = String(name || '').trim();
   if (!jobName) return null;
-
-  // try new `name`
   let r = await query(
     `SELECT job_no, name, active AS is_active
        FROM public.jobs
-      WHERE owner_id = $1 AND lower(name) = lower($2)
-      LIMIT 1`,
+      WHERE owner_id=$1 AND lower(name)=lower($2) LIMIT 1`,
     [owner, jobName]
   );
   if (r.rowCount) return r.rows[0];
-
-  // try legacy `job_name`
   r = await query(
     `SELECT job_no, job_name AS name, active AS is_active
        FROM public.jobs
-      WHERE owner_id = $1 AND lower(job_name) = lower($2)
-      LIMIT 1`,
+      WHERE owner_id=$1 AND lower(job_name)=lower($2) LIMIT 1`,
     [owner, jobName]
   );
   if (r.rowCount) return r.rows[0];
-
-  // create new active job
   const ins = await query(
     `INSERT INTO public.jobs (owner_id, job_name, name, active, start_date, created_at, updated_at)
-     VALUES ($1, $2, $2, true, now(), now(), now())
+     VALUES ($1,$2,$2,true,NOW(),NOW(),NOW())
      RETURNING job_no, name, active AS is_active`,
     [owner, jobName]
   );
   return ins.rows[0];
 }
-
-/**
- * Resolve a job context for create-flows.
- * Priority: explicit name -> current active job -> optional fallback -> null/throw.
- */
-async function resolveJobContext(ownerId, opts = {}) {
+async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
   const owner = DIGITS(ownerId);
-  const { explicitJobName, require = false, fallbackName = null } = opts;
-
   if (explicitJobName) {
     const j = await ensureJobByName(owner, explicitJobName);
     if (j) return j;
   }
-
-  // current active job
   const act = await query(
     `SELECT job_no, COALESCE(name, job_name) AS name
        FROM public.jobs
-      WHERE owner_id = $1 AND active = true
-      ORDER BY COALESCE(updated_at, created_at) DESC, job_no DESC
+      WHERE owner_id=$1 AND active=true
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC
       LIMIT 1`,
     [owner]
   );
   if (act.rowCount) return act.rows[0];
-
   if (fallbackName) {
     const j = await ensureJobByName(owner, fallbackName);
     if (j) return j;
   }
-
-  if (require) throw new Error('No active job set');
+  if (require) throw new Error('No active job');
   return null;
 }
-
-/**
- * Wrapper: create task while attaching job_no (if resolvable).
- * Expects your existing createTask({ ownerId, createdBy, assignedTo, title, body, dueAt, type, jobNo }).
- */
-async function createTaskWithJob({
-  ownerId, createdBy, assignedTo, title, body = null, dueAt = null, type = 'general', jobName = null
-}) {
+async function createTaskWithJob(opts) {
+  const job = await resolveJobContext(opts.ownerId, { explicitJobName: opts.jobName });
+  opts.jobNo = job?.job_no || null;
+  return await createTask(opts);
+}
+async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras) {
   const job = await resolveJobContext(ownerId, { explicitJobName: jobName });
-  const jobNo = job?.job_no || null;
-  console.log('[createTaskWithJob]', { ownerId, jobName, resolvedJobNo: job?.job_no });
-  return await createTask({ ownerId, createdBy, assignedTo, title, body, dueAt, type, jobNo });
+  return await logTimeEntry(ownerId, employeeName, type, ts, job?.job_no || null, tz, extras);
 }
 
-/**
- * Wrapper: log time while attaching job_no (if resolvable).
- * Matches your existing logTimeEntry signature that already accepts jobNo.
- */
-async function logTimeEntryWithJob(ownerId, employeeName, entryType, timestamp = new Date(), jobName = null, tz = null, extras = {}) {
-  const job = await resolveJobContext(ownerId, { explicitJobName: jobName });
-  const jobNo = job?.job_no || null;
-  console.log('[logTimeEntryWithJob]', { ownerId, employeeName, entryType, jobName, resolvedJobNo: job?.job_no });
-  return await logTimeEntry(ownerId, employeeName, entryType, timestamp, jobNo, tz, extras);
-}
-
-
-// ---------- OTP & verification ----------
+// ---------- OTP ----------
 async function generateOTP(userId) {
-  const normalizedId = normalizePhoneNumber(userId);
-  try {
-    const otp = crypto.randomInt(100000, 1000000).toString(); // 6-digit, uniform
-    const expiry = new Date(Date.now() + 10 * 60 * 1000);
-    await query(
-      `UPDATE public.users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
-      [otp, expiry, normalizedId]
-    );
-    return otp;
-  } catch (error) {
-    console.error('[ERROR] generateOTP failed:', error.message);
-    throw error;
-  }
+  const uid = DIGITS(userId);
+  const otp = crypto.randomInt(100000, 1000000).toString();
+  const expiry = new Date(Date.now() + 10 * 60 * 1000);
+  await query(
+    `UPDATE public.users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
+    [otp, expiry, uid]
+  );
+  return otp;
 }
-
 async function verifyOTP(userId, otp) {
-  const normalizedId = normalizePhoneNumber(userId);
-  try {
-    const res = await query(
-      `SELECT otp, otp_expiry FROM public.users WHERE user_id=$1`,
-      [normalizedId]
-    );
-    const user = res.rows[0];
-    const isValid = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
-    if (!isValid) return false;
-    await query(`UPDATE public.users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [normalizedId]);
-    return true;
-  } catch (error) {
-    console.error('[ERROR] verifyOTP failed:', error.message);
-    throw error;
-  }
+  const uid = DIGITS(userId);
+  const { rows } = await query(
+    `SELECT otp, otp_expiry FROM public.users WHERE user_id=$1`,
+    [uid]
+  );
+  const user = rows[0];
+  const ok = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
+  if (ok) await query(`UPDATE public.users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [uid]);
+  return ok;
 }
 
-// ---------- Transactions / Expenses / Bills / Revenue / Quotes ----------
-async function appendToUserSpreadsheet(ownerId, data) {
-  try {
-    const [date, item, amount, store, jobName, type, category, mediaUrl, userName] = data;
-    const sql = `
-      INSERT INTO public.transactions
-        (owner_id, date, item, amount, store, job_name, type, category, media_url, user_name, created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
-      RETURNING id`;
-    const result = await query(sql, [
-      ownerId,
-      date,
-      item,
-      toAmount(amount),
-      store,
-      jobName,
-      type,
-      category,
-      mediaUrl || null,
-      userName
-    ]);
-    return result.rows[0].id;
-  } catch (error) {
-    console.error('[ERROR] appendToUserSpreadsheet failed:', error.message);
-    throw error;
-  }
-}
-
-async function saveExpense({ ownerId, date, item, amount, store, jobName, category, user, mediaUrl }) {
-  try {
-    await query(
-      `INSERT INTO public.transactions (owner_id, type, date, item, amount, store, job_name, category, user_name, media_url, created_at)
-       VALUES ($1,'expense',$2,$3,$4,$5,$6,$7,$8,$9,NOW())`,
-      [ownerId, date, item, toAmount(amount), store, jobName, category, user, mediaUrl || null]
-    );
-  } catch (error) {
-    console.error('[ERROR] saveExpense failed:', error.message);
-    throw error;
-  }
-}
-
-async function deleteExpense(ownerId, criteria) {
-  try {
-    const res = await query(
-      `DELETE FROM public.transactions
-       WHERE owner_id = $1 AND type='expense' AND item=$2 AND amount=$3 AND store=$4
-       RETURNING *`,
-      [ownerId, criteria.item, toAmount(criteria.amount), criteria.store]
-    );
-    return res.rows.length > 0;
-  } catch (error) {
-    console.error('[ERROR] deleteExpense failed:', error.message);
-    return false;
-  }
-}
-
-async function saveBill(ownerId, billData) {
-  try {
-    await query(
-      `INSERT INTO public.transactions (owner_id, type, date, item, amount, recurrence, job_name, category, created_at)
-       VALUES ($1,'bill',$2,$3,$4,$5,$6,$7,NOW())`,
-      [
-        ownerId,
-        billData.date,
-        billData.billName,
-        toAmount(billData.amount),
-        billData.recurrence,
-        billData.jobName,
-        billData.category
-      ]
-    );
-  } catch (error) {
-    console.error('[ERROR] saveBill failed:', error.message);
-    throw error;
-  }
-}
-
-async function updateBill(ownerId, billData) {
-  try {
-    const res = await query(
-      `UPDATE public.transactions
-       SET amount = COALESCE($1, amount),
-           recurrence = COALESCE($2, recurrence),
-           date = COALESCE($3, date),
-           updated_at = NOW()
-       WHERE owner_id=$4 AND type='bill' AND item=$5
-       RETURNING *`,
-      [
-        billData.amount != null ? toAmount(billData.amount) : null,
-        billData.recurrence || null,
-        billData.date || null,
-        ownerId,
-        billData.billName
-      ]
-    );
-    return res.rows.length > 0;
-  } catch (error) {
-    console.error('[ERROR] updateBill failed:', error.message);
-    return false;
-  }
-}
-
-async function deleteBill(ownerId, billName) {
-  try {
-    const res = await query(
-      `DELETE FROM public.transactions WHERE owner_id=$1 AND type='bill' AND item=$2 RETURNING *`,
-      [ownerId, billName]
-    );
-    return res.rows.length > 0;
-  } catch (error) {
-    console.error('[ERROR] deleteBill failed:', error.message);
-    return false;
-  }
-}
-
-async function saveRevenue(ownerId, revenueData) {
-  try {
-    await query(
-      `INSERT INTO public.transactions (owner_id, type, amount, item, store, category, date, job_name, created_at)
-       VALUES ($1,'revenue',$2,$3,$4,$5,$6,$7,NOW())`,
-      [
-        ownerId,
-        toAmount(revenueData.amount),
-        revenueData.description,
-        revenueData.source,
-        revenueData.category,
-        revenueData.date,
-        revenueData.jobName
-      ]
-    );
-  } catch (error) {
-    console.error('[ERROR] saveRevenue failed:', error.message);
-    throw error;
-  }
-}
-
-async function saveQuote(ownerId, quoteData) {
-  try {
-    await query(
-      `INSERT INTO public.quotes (owner_id, amount, description, client, job_name, created_at)
-       VALUES ($1,$2,$3,$4,$5,NOW())`,
-      [ownerId, toAmount(quoteData.amount), quoteData.description, quoteData.client, quoteData.jobName]
-    );
-  } catch (error) {
-    console.error('[ERROR] saveQuote failed:', error.message);
-    throw error;
-  }
-}
-
-// --- Pricing Items ---
-async function addPricingItem(ownerId, itemName, unitCost, unit = 'each', category = 'material') {
-  try {
-    const res = await query(
-      `INSERT INTO public.pricing_items
-        (owner_id, item_name, unit_cost, unit, category, created_at)
-       VALUES ($1,$2,$3,$4,$5,NOW())
-       RETURNING item_name, unit_cost, unit, category`,
-      [ownerId, itemName, toAmount(unitCost), unit, category]
-    );
-    return res.rows[0];
-  } catch (error) {
-    console.error('[ERROR] addPricingItem failed:', error.message);
-    throw error;
-  }
-}
-
-async function getPricingItems(ownerId) {
-  try {
-    const res = await query(
-      `SELECT item_name, unit_cost, unit, category
-       FROM public.pricing_items
-       WHERE owner_id=$1
-       ORDER BY item_name ASC`,
-      [ownerId]
-    );
-    return res.rows;
-  } catch (error) {
-    console.error('[ERROR] getPricingItems failed:', error.message);
-    throw error;
-  }
-}
-
-async function updatePricingItem(ownerId, itemName, unitCost) {
-  try {
-    const res = await query(
-      `UPDATE public.pricing_items
-       SET unit_cost=$1, updated_at=NOW()
-       WHERE owner_id=$2 AND item_name=$3
-       RETURNING item_name, unit_cost, unit, category`,
-      [toAmount(unitCost), ownerId, itemName]
-    );
-    return res.rows[0] || null;
-  } catch (error) {
-    console.error('[ERROR] updatePricingItem failed:', error.message);
-    throw error;
-  }
-}
-
-async function deletePricingItem(ownerId, itemName) {
-  try {
-    await query(
-      `DELETE FROM public.pricing_items
-       WHERE owner_id=$1 AND item_name=$2`,
-      [ownerId, itemName]
-    );
-    return true;
-  } catch (error) {
-    console.error('[ERROR] deletePricingItem failed:', error.message);
-    throw error;
-  }
-}
-
-// --- Jobs (new/compat) ---
-async function getActiveJob(ownerId) {
-  try {
-    const sql = `
-      SELECT job_no,
-             COALESCE(name, job_name) AS name,
-             status,
-             active
-        FROM public.jobs
-       WHERE owner_id = $1
-         AND (status = 'active' OR active = true)
-       ORDER BY updated_at DESC NULLS LAST, created_at DESC
-       LIMIT 1
-    `;
-    const res = await query(sql, [ownerId]);
-    // Back-compat: many callers expect just a string; keep that behavior if needed.
-    // Prefer returning a string name (fallback "Uncategorized") because your older code uses it.
-    return res.rows[0]?.name || 'Uncategorized';
-  } catch (error) {
-    console.error('[ERROR] getActiveJob failed:', error.message);
-    return 'Uncategorized';
-  }
-}
-
-/**
- * Create a job with a new sequential job_no for the owner.
- * Populates BOTH (name, status) and legacy (job_name, active/start_date) to stay compatible.
- * Returns: { id, owner_id, job_no, name, status }
- */
-async function createJob(ownerId, jobName) {
-  try {
-    // 1) Compute next job_no per owner
-    const nextNoSql = `
-      SELECT COALESCE(MAX(job_no), 0) + 1 AS next_no
-        FROM public.jobs
-       WHERE owner_id = $1
-    `;
-    const nextNoRes = await query(nextNoSql, [ownerId]);
-    const jobNo = Number(nextNoRes.rows[0]?.next_no || 1);
-
-    // 2) Insert new row. Use explicit, non-ambiguous params so Postgres doesn't try to infer mixed types.
-    const insSql = `
-      INSERT INTO public.jobs (
-        owner_id, job_no, name, job_name, status, active, start_date, created_at, updated_at
-      )
-      VALUES ($1, $2::int, $3::text, $3::text, 'active', true, NOW(), NOW(), NOW())
-      ON CONFLICT (owner_id, job_no) DO UPDATE
-         SET name       = EXCLUDED.name,
-             job_name   = EXCLUDED.job_name,
-             status     = 'active',
-             active     = true,
-             start_date = COALESCE(public.jobs.start_date, NOW()),
-             updated_at = NOW()
-      RETURNING id, owner_id, job_no, name, status
-    `;
-    const insRes = await query(insSql, [ownerId, jobNo, jobName]);
-    return insRes.rows[0];
-  } catch (error) {
-    console.error('[ERROR] createJob failed:', error.message);
-    throw error;
-  }
-}
-
-/**
- * Find a job record by name or job_no.
- * Accepts strings; matches name OR legacy job_name OR numeric job_no.
- * Returns the row (or null).
- */
-async function findJob(ownerId, identifier) {
-  const name = String(identifier || '').trim();
-  const maybeNo = Number.isFinite(+name) ? parseInt(name, 10) : null;
-
-  const sql = `
-    SELECT id, owner_id, job_no, COALESCE(name, job_name) AS name, status, active
-      FROM public.jobs
-     WHERE owner_id = $1
-       AND (
-             ($2::text IS NOT NULL AND (name = $2::text OR job_name = $2::text))
-             OR ($3::int IS NOT NULL AND job_no = $3::int)
-           )
-     ORDER BY updated_at DESC NULLS LAST, created_at DESC
-     LIMIT 1
-  `;
-  const res = await query(sql, [ownerId, name || null, maybeNo]);
-  return res.rows[0] || null;
-}
-
-/**
- * Mark a job active (by name or number). If it doesn't exist yet, create then activate.
- */
-async function setActiveJob(ownerId, nameOrNo) {
-  try {
-    // Make everything else inactive first
-    await query(
-      `UPDATE public.jobs SET active = false, status = CASE WHEN status='active' THEN 'paused' ELSE status END, updated_at = NOW()
-        WHERE owner_id = $1`,
-      [ownerId]
-    );
-
-    // Try to find existing
-    let job = await findJob(ownerId, nameOrNo);
-
-    // If missing, create it
-    if (!job) {
-      job = await createJob(ownerId, String(nameOrNo || '').trim());
-    }
-
-    // Activate this one (set both new & legacy fields)
-    const sql = `
-      UPDATE public.jobs
-         SET active = true,
-             status = 'active',
-             start_date = COALESCE(start_date, NOW()),
-             updated_at = NOW()
-       WHERE owner_id = $1
-         AND job_no   = $2
-      RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status
-    `;
-    const r = await query(sql, [ownerId, job.job_no]);
-    return r.rows[0] || job;
-  } catch (error) {
-    console.error('[ERROR] setActiveJob failed:', error.message);
-    throw error;
-  }
-}
-
-async function pauseJob(ownerId, nameOrNo) {
-  try {
-    const job = await findJob(ownerId, nameOrNo);
-    if (!job) return null;
-
-    const sql = `
-      UPDATE public.jobs
-         SET active = false,
-             status = 'paused',
-             updated_at = NOW()
-       WHERE owner_id = $1
-         AND job_no   = $2
-      RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status
-    `;
-    const r = await query(sql, [ownerId, job.job_no]);
-    return r.rows[0] || null;
-  } catch (error) {
-    console.error('[ERROR] pauseJob failed:', error.message);
-    throw error;
-  }
-}
-
-async function resumeJob(ownerId, nameOrNo) {
-  try {
-    const job = await findJob(ownerId, nameOrNo);
-    if (!job) return null;
-
-    // Make others inactive; keep behavior consistent with "only one active"
-    await query(
-      `UPDATE public.jobs SET active = false, status = CASE WHEN status='active' THEN 'paused' ELSE status END, updated_at = NOW()
-        WHERE owner_id = $1`,
-      [ownerId]
-    );
-
-    const sql = `
-      UPDATE public.jobs
-         SET active = true,
-             status = 'active',
-             updated_at = NOW()
-       WHERE owner_id = $1
-         AND job_no   = $2
-      RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status
-    `;
-    const r = await query(sql, [ownerId, job.job_no]);
-    return r.rows[0] || null;
-  } catch (error) {
-    console.error('[ERROR] resumeJob failed:', error.message);
-    throw error;
-  }
-}
-
-async function finishJob(ownerId, nameOrNo) {
-  try {
-    const job = await findJob(ownerId, nameOrNo);
-    if (!job) return null;
-
-    const sql = `
-      UPDATE public.jobs
-         SET active = false,
-             status = 'finished',
-             end_date = NOW(),
-             updated_at = NOW()
-       WHERE owner_id = $1
-         AND job_no   = $2
-      RETURNING id, owner_id, job_no, COALESCE(name, job_name) AS name, status, end_date
-    `;
-    const r = await query(sql, [ownerId, job.job_no]);
-    return r.rows[0] || null;
-  } catch (error) {
-    console.error('[ERROR] finishJob failed:', error.message);
-    throw error;
-  }
-}
-
-async function listOpenJobs(ownerId, limit = 3) {
-  try {
-    const sql = `
-      SELECT job_no, COALESCE(name, job_name) AS name, status, active
-        FROM public.jobs
-       WHERE owner_id = $1
-         AND (status <> 'finished' OR end_date IS NULL)
-       ORDER BY active DESC, updated_at DESC NULLS LAST, created_at DESC
-       LIMIT $2
-    `;
-    const res = await query(sql, [ownerId, limit]);
-    return res.rows.map(r => ({
-      job_no: r.job_no,
-      name: r.name,
-      status: r.status,
-      active: r.active,
-    }));
-  } catch (error) {
-    console.error('[ERROR] listOpenJobs failed:', error.message);
-    throw error;
-  }
-}
-
-/**
- * summarizeJob: prefer job_no (if present), but also tolerate legacy job_name.
- * Aggregates from your new `expenses` / `revenue` tables (by job_no),
- * and from `time_entries` (by job_no, with a legacy job_name fallback).
- */
-async function summarizeJob(ownerId, nameOrNo) {
-  try {
-    const job = await findJob(ownerId, nameOrNo);
-    if (!job) return { durationDays: 0, labourHours: 0, labourCost: 0, materialCost: 0, revenue: 0, profit: 0, profitMargin: 0 };
-
-    const jobNo = job.job_no;
-    const jobName = job.name;
-
-    // basic timing
-    const jRes = await query(
-      `SELECT COALESCE(start_date, created_at) AS start_date, end_date
-         FROM public.jobs
-        WHERE owner_id=$1 AND job_no=$2`,
-      [ownerId, jobNo]
-    );
-    const { start_date, end_date } = jRes.rows[0] || {};
-    const start = start_date ? new Date(start_date) : new Date();
-    const end   = end_date   ? new Date(end_date)   : new Date();
-    const durationDays = Math.max(0, Math.ceil((end - start) / (1000 * 60 * 60 * 24)));
-
-    // money: expenses/revenue use job_no now
-    const expRes = await query(
-      `SELECT COALESCE(SUM(amount::numeric),0) AS total_expenses
-         FROM public.expenses
-        WHERE owner_id=$1 AND job_no=$2`,
-      [ownerId, jobNo]
-    );
-    const revRes = await query(
-      `SELECT COALESCE(SUM(amount::numeric),0) AS total_revenue
-         FROM public.revenue
-        WHERE owner_id=$1 AND job_no=$2`,
-      [ownerId, jobNo]
-    );
-
-    // time: prefer job_no, fallback to legacy job_name if any rows exist that way
-    const timeByNo = await query(
-      `SELECT COALESCE(SUM(hours),0) AS hours FROM (
-         SELECT CASE
-                  WHEN type = 'punch_in' THEN
-                    EXTRACT(EPOCH FROM (
-                      (LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_no ORDER BY timestamp)) - timestamp
-                    )) / 3600.0
-                  ELSE 0
-                END AS hours
-           FROM public.time_entries
-          WHERE owner_id = $1 AND job_no = $2
-       ) t`,
-      [ownerId, jobNo]
-    );
-
-    let labourHours = parseFloat(timeByNo.rows[0].hours) || 0;
-
-    if (labourHours === 0) {
-      const timeByName = await query(
-        `SELECT COALESCE(SUM(hours),0) AS hours FROM (
-           SELECT CASE
-                    WHEN type = 'punch_in' THEN
-                      EXTRACT(EPOCH FROM (
-                        (LEAD(timestamp) OVER (PARTITION BY owner_id, employee_name, job_name ORDER BY timestamp)) - timestamp
-                      )) / 3600.0
-                    ELSE 0
-                  END AS hours
-             FROM public.time_entries
-            WHERE owner_id = $1 AND job_name = $2
-         ) t`,
-        [ownerId, jobName]
-      );
-      labourHours = parseFloat(timeByName.rows[0].hours) || 0;
-    }
-
-    const rateRes = await query(
-      `SELECT unit_cost FROM public.pricing_items
-        WHERE owner_id=$1 AND category='labour' LIMIT 1`,
-      [ownerId]
-    );
-
-    const materialCost = parseFloat(expRes.rows[0].total_expenses) || 0;
-    const revenue      = parseFloat(revRes.rows[0].total_revenue) || 0;
-    const profit       = revenue - materialCost;
-    const profitMargin = revenue > 0 ? profit / revenue : 0;
-
-    const labourRate   = parseFloat(rateRes.rows[0]?.unit_cost) || 0;
-    const labourCost   = labourHours * labourRate;
-
-    return { durationDays, labourHours, labourCost, materialCost, revenue, profit, profitMargin };
-  } catch (error) {
-    console.error('[ERROR] summarizeJob failed:', error.message);
-    throw error;
-  }
-}
-
-// --- Back-compat shims (keep until all callers are updated) ---
-async function saveJob(ownerId, jobName, startDate = null) {
-  // Old call pattern: create + mark active; honor startDate if provided.
-  const created = await createJob(ownerId, jobName);
-  if (startDate) {
-    await query(
-      `UPDATE public.jobs
-          SET start_date = $3, updated_at = NOW()
-        WHERE owner_id = $1 AND job_no = $2`,
-      [ownerId, created.job_no, startDate]
-    );
-  }
-  await setActiveJob(ownerId, jobName);
-  return created;
-}
-
-async function finalizeJobCreation(ownerId, jobName, activate = false) {
-  const created = await createJob(ownerId, jobName);
-  if (activate) {
-    await setActiveJob(ownerId, jobName);
-  }
-  return created;
-}
-
-// --- Users ---
+// ---------- User ----------
 async function createUserProfile({ user_id, ownerId, onboarding_in_progress = false }) {
-  const normalizedId = normalizePhoneNumber(user_id);
-  const normalizedOwnerId = normalizePhoneNumber(ownerId);
-  try {
-    const dashboard_token = crypto.randomBytes(16).toString('hex');
-    const result = await query(
-      `INSERT INTO public.users
-         (user_id, owner_id, onboarding_in_progress, onboarding_completed, subscription_tier, dashboard_token, created_at)
-       VALUES
-         ($1,$2,$3,$4,$5,$6,NOW())
-       ON CONFLICT (user_id) DO UPDATE
-         SET onboarding_in_progress = EXCLUDED.onboarding_in_progress
-       RETURNING *`,
-      [normalizedId, normalizedOwnerId, onboarding_in_progress, false, 'basic', dashboard_token]
-    );
-    return result.rows[0];
-  } catch (error) {
-    console.error('[ERROR] createUserProfile failed:', error.message);
-    throw error;
-  }
-}
-
-async function saveUserProfile(profile) {
-  const normalizedId = normalizePhoneNumber(profile.user_id);
-  const data = { ...profile, user_id: normalizedId };
-  const keys = Object.keys(data);
-  const values = Object.values(data);
-  const insertCols = keys.join(', ');
-  const insertVals = keys.map((_, i) => `$${i + 1}`).join(', ');
-  const updateSet = keys
-    .filter(k => k !== 'user_id')
-    .map(k => `${k}=EXCLUDED.${k}`)
-    .join(', ');
-  const sql = `
-    INSERT INTO public.users (${insertCols})
-    VALUES (${insertVals})
-    ON CONFLICT (user_id) DO UPDATE SET ${updateSet}
-    RETURNING *`;
-  try {
-    const result = await query(sql, values);
-    return result.rows[0];
-  } catch (error) {
-    console.error('[ERROR] saveUserProfile failed:', error.message);
-    throw error;
-  }
-}
-
-async function getUserProfile(userId) {
-  const normalizedId = normalizePhoneNumber(userId);
-  try {
-    const res = await query('SELECT * FROM public.users WHERE user_id=$1', [normalizedId]);
-    return res.rows[0] || null;
-  } catch (error) {
-    console.error('[ERROR] getUserProfile failed:', error.message);
-    throw error;
-  }
-}
-
-async function getOwnerProfile(ownerId) {
-  const normalizedId = normalizePhoneNumber(ownerId);
-  try {
-    const res = await query('SELECT * FROM public.users WHERE user_id=$1', [normalizedId]);
-    return res.rows[0] || null;
-  } catch (error) {
-    console.error('[ERROR] getOwnerProfile failed:', error.message);
-    throw error;
-  }
-}
-
-// --- File parsing ---
-async function parseFinancialFile(fileBuffer, fileType) {
-  try {
-    let data = [];
-    if (fileType === 'text/csv') {
-      const csvText = fileBuffer.toString('utf-8');
-      data = require('papaparse').parse(csvText, { header: true, skipEmptyLines: true }).data;
-    } else {
-      const workbook = new ExcelJS.Workbook();
-      await workbook.xlsx.load(fileBuffer);
-      const ws = workbook.worksheets[0];
-      data = [];
-      ws.eachRow({ includeEmpty: false }, (row, idx) => {
-        if (idx === 1) return;
-        const obj = {};
-        row.eachCell((cell, col) => {
-          const header = ws.getRow(1).getCell(col).value;
-          obj[header] = cell.value;
-        });
-        data.push(obj);
-      });
-    }
-    const result = data.map(r => ({
-      date: r.Date || r.date || new Date().toISOString().split('T')[0],
-      amount: parseFloat(r.Amount || r.amount || 0).toFixed(2),
-      description: r.Description || r.description || r.Item || 'Unknown',
-      source: r.Source || r.source || r.Store || 'Unknown',
-      type: toAmount(r.Amount || r.amount) >= 0 ? 'revenue' : 'expense',
-    }));
-    return result;
-  } catch (error) {
-    console.error('[ERROR] parseFinancialFile failed:', error.message);
-    throw error;
-  }
-}
-
-async function parseReceiptText(text) {
-  try {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    const amt = lines.find(l => l.match(/\$?\d+\.\d{2}/));
-    const amount = amt ? (amt.match(/\$?(\d+\.\d{2})/)?.[1] || '0.00') : '0.00';
-    const store = lines.find(l => !l.match(/\$?\d+\.\d{2}/)) || 'Unknown';
-    return {
-      date: new Date().toISOString().split('T')[0],
-      item: store,
-      amount: `$${amount}`,
-      store,
-    };
-  } catch (error) {
-    console.error('[ERROR] parseReceiptText failed:', error.message);
-    throw error;
-  }
-}
-
-// --- Time entries / Timesheets (TZ-safe) ---
-const VALID_TYPES = new Set([
-  'punch_in',
-  'punch_out',
-  'break_start',
-  'break_end',
-  'drive_start',
-  'drive_end',
-]);
-
-const DUPE_WINDOW_SECONDS = Number(process.env.DUPE_WINDOW_SECONDS || 90);
-const MAX_FUTURE_MINUTES = Number(process.env.MAX_FUTURE_MINUTES || 10);
-
-function enforceNoFarFuture(timestampIso) {
-  const now = Date.now();
-  const ts = new Date(timestampIso).getTime();
-  if ((ts - now) > MAX_FUTURE_MINUTES * 60 * 1000) {
-    const err = new Error(`Timestamp is more than ${MAX_FUTURE_MINUTES} minutes in the future`);
-    err.code = 'FUTURE_TS';
-    throw err;
-  }
-}
-
-async function logTimeEntry(
-  ownerId,
-  employeeName,
-  type,                 // 'punch_in' | 'punch_out' | 'break_start' | 'break_end' | ...
-  timestamp,           // ISO string
-  jobNo = null,        // <— NEW: resolved by logTimeEntryWithJob wrapper
-  tz = 'America/Toronto',
-  extras = {}
-) {
-  try {
-    if (!ownerId) throw new Error('Missing ownerId');
-    if (!VALID_TYPES.has(type)) throw new Error('Invalid time entry type');
-    if (!employeeName || typeof employeeName !== 'string' || employeeName.length > 100) {
-      throw new Error('Invalid employee name');
-    }
-    if (!isValidIsoTimestamp(timestamp)) throw new Error('Invalid timestamp');
-    enforceNoFarFuture(timestamp);
-
-    const ts = new Date(timestamp);
-    const tsIso = ts.toISOString();
-    const localStr = formatInTimeZone(ts, tz, 'yyyy-MM-dd HH:mm:ss');
-
-    const lat = extras.lat ?? null;
-    const lng = extras.lng ?? null;
-    let address = extras.address ?? null;
-    const createdBy = extras.requester_id || extras.created_by || null;
-
-    // Accept optional legacy name for compatibility if you still display job_name somewhere
-    const legacyJobName = extras.jobNameForLegacy || null;
-
-    // --- Dupe guard (same owner/employee/type within window) ---
-    const DUPE_WINDOW_SECONDS = 20; // keep your existing constant if defined elsewhere
-    const dupeQ = `
-      SELECT id
-      FROM public.time_entries
-      WHERE owner_id=$1
-        AND employee_name=$2
-        AND type=$3
-        AND timestamp BETWEEN ($4::timestamptz - INTERVAL '${DUPE_WINDOW_SECONDS} seconds')
-                           AND ($4::timestamptz + INTERVAL '${DUPE_WINDOW_SECONDS} seconds')
-      ORDER BY id DESC
-      LIMIT 1`;
-    const dupe = await query(dupeQ, [ownerId, employeeName, type, tsIso]);
-    if (dupe.rows.length) return dupe.rows[0].id;
-
-    // --- Build INSERT dynamically to include created_by if column exists ---
-    const hasCreatedBy = await hasCreatedByColumn(); // you already have this helper
-    let q, params;
-
-    if (hasCreatedBy) {
-      q = `
-        INSERT INTO public.time_entries
-          (owner_id, employee_name, type, timestamp, job_no, job_name, tz, local_time, lat, lng, address, created_by, created_at)
-        VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7,$8::timestamp,$9,$10,$11,$12, now())
-        RETURNING id`;
-      params = [ownerId, employeeName, type, tsIso, jobNo, legacyJobName, tz, localStr, lat, lng, address, createdBy];
-    } else {
-      q = `
-        INSERT INTO public.time_entries
-          (owner_id, employee_name, type, timestamp, job_no, job_name, tz, local_time, lat, lng, address, created_at)
-        VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7,$8::timestamp,$9,$10,$11, now())
-        RETURNING id`;
-      params = [ownerId, employeeName, type, tsIso, jobNo, legacyJobName, tz, localStr, lat, lng, address];
-    }
-
-    const { rows } = await query(q, params);
-    const insertedId = rows[0].id;
-
-    // Lazy reverse geocode if we have lat/lng but not address
-    if ((lat != null && lng != null) && !address) {
-      try {
-        const { reverseGeocode } = require('./geocode');
-        address = await reverseGeocode(lat, lng);
-        if (address) {
-          await query(`UPDATE public.time_entries SET address=$1 WHERE id=$2`, [address, insertedId]);
-        }
-      } catch (e) {
-        console.warn('[WARN] reverseGeocode failed:', e.message);
-      }
-    }
-
-    return insertedId;
-  } catch (error) {
-    console.error('[ERROR] logTimeEntry failed:', error.message);
-    throw error;
-  }
-}
-
-
-
-async function moveLastEntryToJob(ownerId, employeeName, jobName) {
-  const q = `
-    UPDATE public.time_entries t
-    SET job_name = $1
-    WHERE t.id = (
-      SELECT id FROM public.time_entries
-      WHERE owner_id = $2 AND employee_name = $3
-      ORDER BY timestamp DESC
-      LIMIT 1
-    )
-    RETURNING id, type, timestamp, job_name
-  `;
-  const { rows } = await query(q, [jobName || null, ownerId, employeeName]);
-  return rows[0] || null;
-}
-
-async function getTimeEntries(ownerId, employeeName, period = 'week', date = new Date(), tz = 'America/Toronto') {
-  try {
-    const validPeriods = new Set(['day', 'week', 'month']);
-    if (!validPeriods.has(period)) throw new Error('Invalid period');
-
-    const dateLocal = formatInTimeZone(new Date(date), tz, 'yyyy-MM-dd');
-    let filter;
-    if (period === 'day') {
-      filter = `DATE(local_time) = $2`;
-    } else if (period === 'week') {
-      filter = `DATE(local_time) BETWEEN $2 AND $2::date + INTERVAL '6 days'`;
-    } else {
-      filter = `DATE_TRUNC('month', local_time) = DATE_TRUNC('month', $2::date)`;
-    }
-
-    const q = `
-      SELECT *, COALESCE(tz, $4) AS tz
-      FROM public.time_entries
-      WHERE owner_id = $1
-        AND employee_name = $3
-        AND ${filter}
-      ORDER BY timestamp`;
-    const res = await query(q, [ownerId, dateLocal, employeeName, tz]);
-    return res.rows;
-  } catch (error) {
-    console.error('[ERROR] getTimeEntries failed:', error.message);
-    throw error;
-  }
-}
-
-async function getEntriesBetween(ownerId, employeeName, startIso, endIso) {
-  try {
-    const q = `
-      SELECT *
-      FROM public.time_entries
-      WHERE owner_id = $1
-        AND employee_name = $2
-        AND timestamp >= $3::timestamptz
-        AND timestamp <= $4::timestamptz
-      ORDER BY timestamp`;
-    const { rows } = await query(q, [ownerId, employeeName, startIso, endIso]);
-    return rows;
-  } catch (error) {
-    console.error('[ERROR] getEntriesBetween failed:', error.message);
-    throw error;
-  }
-}
-
-async function getWorkAndDriveIntervals({ ownerId, employeeName, startUtc, endUtc }) {
-  const q = `
-  WITH params AS (
-    SELECT $1::text AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e
-  ),
-  base AS (
-    SELECT t.*
-    FROM public.time_entries t, params p
-    WHERE t.owner_id=p.owner_id
-      AND t.employee_name=p.emp
-      AND t.timestamp < p.e
-      AND t.timestamp >= (p.s - INTERVAL '35 days')
-  ),
-  punch_pairs AS (
-    SELECT
-      i.timestamp AS in_ts,
-      (
-        SELECT o.timestamp
-        FROM public.time_entries o, params p2
-        WHERE o.owner_id = i.owner_id
-          AND o.employee_name = i.employee_name
-          AND o.type = 'punch_out'
-          AND o.timestamp > i.timestamp
-        ORDER BY o.timestamp
-        LIMIT 1
-      ) AS out_ts
-    FROM base i
-    WHERE i.type = 'punch_in'
-  ),
-  drive_pairs AS (
-    SELECT
-      i.timestamp AS start_ts,
-      (
-        SELECT o.timestamp
-        FROM public.time_entries o
-        WHERE o.owner_id = i.owner_id
-          AND o.employee_name = i.employee_name
-          AND o.type = 'drive_end'
-          AND o.timestamp > i.timestamp
-        ORDER BY o.timestamp
-        LIMIT 1
-      ) AS end_ts
-    FROM base i
-    WHERE i.type = 'drive_start'
-  ),
-  work_intervals AS (
-    SELECT
-      GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
-      LEAST(out_ts, (SELECT e FROM params)) AS end_utc
-    FROM punch_pairs
-    WHERE out_ts IS NOT NULL
-      AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
-  ),
-  drive_intervals AS (
-    SELECT
-      GREATEST(start_ts, (SELECT s FROM params)) AS start_utc,
-      LEAST(end_ts, (SELECT e FROM params)) AS end_utc
-    FROM drive_pairs
-    WHERE end_ts IS NOT NULL
-      AND GREATEST(start_ts, (SELECT s FROM params)) < LEAST(end_ts, (SELECT e FROM params))
-  )
-  SELECT
-    (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))),0) FROM work_intervals) AS work_seconds,
-    (SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (end_utc - start_utc))),0) FROM drive_intervals) AS drive_seconds;
-  `;
-  const { rows: [r] } = await query(q, [ownerId, employeeName, startUtc, endUtc]);
-  return {
-    workSeconds: Number(r.work_seconds) || 0,
-    driveSeconds: Number(r.drive_seconds) || 0,
-  };
-}
-
-async function getWeekDayBuckets({ ownerId, employeeName, startUtc, endUtc, tz }) {
-  const q = `
-    WITH params AS (
-      SELECT $1::text AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e, $5::text AS tz
-    ),
-    week_days AS (
-      SELECT gs::date AS d
-      FROM params,
-      LATERAL generate_series(
-        date_trunc('week', (s AT TIME ZONE tz))::date,
-        (date_trunc('week', (s AT TIME ZONE tz))::date + 6),
-        INTERVAL '1 day'
-      ) gs
-    ),
-    punch_pairs AS (
-      SELECT
-        i.timestamp AS in_ts,
-        (
-          SELECT o.timestamp
-          FROM public.time_entries o, params p2
-          WHERE o.owner_id = i.owner_id
-            AND o.employee_name = i.employee_name
-            AND o.type = 'punch_out'
-            AND o.timestamp > i.timestamp
-          ORDER BY o.timestamp
-          LIMIT 1
-        ) AS out_ts
-      FROM public.time_entries i, params p
-      WHERE i.owner_id=p.owner_id
-        AND i.employee_name=p.emp
-        AND i.type='punch_in'
-        AND i.timestamp < p.e
-        AND i.timestamp >= (p.s - INTERVAL '35 days')
-    ),
-    work_intervals AS (
-      SELECT
-        GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
-        LEAST(out_ts, (SELECT e FROM params)) AS end_utc,
-        (SELECT tz FROM params) AS tz
-      FROM punch_pairs
-      WHERE out_ts IS NOT NULL
-        AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
-    ),
-    day_buckets AS (
-      SELECT
-        wd.d AS local_day,
-        COALESCE(SUM(
-          GREATEST(0, EXTRACT(EPOCH FROM (
-            LEAST(w.end_utc, (wd.d + INTERVAL '1 day') AT TIME ZONE w.tz) -
-            GREATEST(w.start_utc, (wd.d AT TIME ZONE w.tz))
-          )))
-        ),0) AS seconds
-      FROM week_days wd
-      LEFT JOIN work_intervals w
-        ON w.start_utc < ((wd.d + INTERVAL '1 day') AT TIME ZONE w.tz)
-       AND w.end_utc > (wd.d AT TIME ZONE w.tz)
-      GROUP BY 1
-      ORDER BY 1
-    )
-    SELECT local_day, seconds FROM day_buckets;
-  `;
-  const { rows } = await query(q, [ownerId, employeeName, startUtc, endUtc, tz]);
-  return rows.map(r => ({ day: String(r.local_day), seconds: Number(r.seconds) || 0 }));
-}
-
-async function getMonthWeekBuckets({ ownerId, employeeName, startUtc, endUtc, tz }) {
-  const q = `
-    WITH params AS (
-      SELECT $1::text AS owner_id, $2::text AS emp, $3::timestamptz AS s, $4::timestamptz AS e, $5::text AS tz
-    ),
-    month_start AS (
-      SELECT date_trunc('month', (s AT TIME ZONE tz))::date AS mstart FROM params
-    ),
-    week_starts AS (
-      SELECT gs::date AS ws
-      FROM month_start m,
-      params p,
-      LATERAL generate_series(
-        date_trunc('week', m.mstart),
-        (p.e AT TIME ZONE p.tz)::date,
-        INTERVAL '7 day'
-      ) gs
-    ),
-    week_ranges AS (
-      SELECT ws AS week_start, (ws + INTERVAL '7 day') AS week_end
-      FROM week_starts
-    ),
-    punch_pairs AS (
-      SELECT
-        i.timestamp AS in_ts,
-        (
-          SELECT o.timestamp
-          FROM public.time_entries o, params p2
-          WHERE o.owner_id = i.owner_id
-            AND o.employee_name = i.employee_name
-            AND o.type = 'punch_out'
-            AND o.timestamp > i.timestamp
-          ORDER BY o.timestamp
-          LIMIT 1
-        ) AS out_ts
-      FROM public.time_entries i, params p
-      WHERE i.owner_id=p.owner_id
-        AND i.employee_name=p.emp
-        AND i.type='punch_in'
-        AND i.timestamp < p.e
-        AND i.timestamp >= (p.s - INTERVAL '40 days')
-    ),
-    work_intervals AS (
-      SELECT
-        GREATEST(in_ts, (SELECT s FROM params)) AS start_utc,
-        LEAST(out_ts, (SELECT e FROM params)) AS end_utc,
-        (SELECT tz FROM params) AS tz
-      FROM punch_pairs
-      WHERE out_ts IS NOT NULL
-        AND GREATEST(in_ts, (SELECT s FROM params)) < LEAST(out_ts, (SELECT e FROM params))
-    ),
-    weekly AS (
-      SELECT
-        wr.week_start,
-        COALESCE(SUM(
-          GREATEST(0, EXTRACT(EPOCH FROM (
-            LEAST(w.end_utc, (wr.week_end AT TIME ZONE w.tz)) -
-            GREATEST(w.start_utc, (wr.week_start AT TIME ZONE w.tz))
-          )))
-        ),0) AS seconds
-      FROM week_ranges wr
-      LEFT JOIN work_intervals w
-        ON w.start_utc < (wr.week_end AT TIME ZONE w.tz)
-       AND w.end_utc > (wr.week_start AT TIME ZONE w.tz)
-      GROUP BY 1
-      ORDER BY 1
-    )
-    SELECT week_start, seconds FROM weekly;
-  `;
-  const { rows } = await query(q, [ownerId, employeeName, startUtc, endUtc, tz]);
-  return rows.map((r, i) => ({ idx: i + 1, weekStart: String(r.week_start), seconds: Number(r.seconds) || 0 }));
-}
-
-function startOfLocalDay(date, tz) {
-  const z = utcToZonedTime(date, tz);
-  z.setHours(0, 0, 0, 0);
-  const y = z.getFullYear(), m = z.getMonth() + 1, d = z.getDate();
-  return zonedTimeToUtc(`${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')} 00:00:00`, tz);
-}
-
-function endOfLocalDay(date, tz) {
-  const z = utcToZonedTime(date, tz);
-  z.setHours(23, 59, 59, 999);
-  const y = z.getFullYear(), m = z.getMonth() + 1, d = z.getDate();
-  return zonedTimeToUtc(`${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')} 23:59:59.999`, tz);
-}
-
-function startOfLocalWeek(date, tz, weekStartsOn = 1) {
-  const z = utcToZonedTime(date, tz);
-  const day = z.getDay();
-  const diff = (day - weekStartsOn + 7) % 7;
-  z.setDate(z.getDate() - diff);
-  return startOfLocalDay(z, tz);
-}
-
-function startOfLocalMonth(date, tz) {
-  const z = utcToZonedTime(date, tz);
-  z.setDate(1);
-  return startOfLocalDay(z, tz);
-}
-
-async function generateTimesheet(arg1, arg2, arg3, arg4, arg5) {
-  if (typeof arg1 === 'object' && arg1 !== null && !Array.isArray(arg1)) {
-    const {
-      ownerId,
-      person,
-      period,
-      tz = 'America/Toronto',
-      now = new Date(),
-    } = arg1;
-
-    if (!ownerId || !person) {
-      throw new Error('generateTimesheet(options): ownerId and person are required');
-    }
-
-    let startUtc, endUtc;
-    if (period === 'day') {
-      startUtc = startOfLocalDay(now, tz);
-      endUtc = endOfLocalDay(now, tz);
-    } else if (period === 'week') {
-      startUtc = startOfLocalWeek(now, tz, 1);
-      const sixDaysLater = new Date(startUtc.getTime() + 6 * 24 * 60 * 60 * 1000);
-      endUtc = endOfLocalDay(sixDaysLater, tz);
-    } else if (period === 'month') {
-      startUtc = startOfLocalMonth(now, tz);
-      endUtc = endOfLocalDay(now, tz);
-    } else {
-      throw new Error('period must be "day", "week", or "month"');
-    }
-
-    const { workSeconds, driveSeconds } = await getWorkAndDriveIntervals({
-      ownerId, employeeName: person, startUtc, endUtc,
-    });
-
-    let breakdownLines = [];
-    if (period === 'week') {
-      const dayBuckets = await getWeekDayBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
-      const toDateSafe = (v) => {
-        if (v instanceof Date) return v;
-        const parsed = Date.parse(v);
-        if (!Number.isNaN(parsed)) return new Date(parsed);
-        return new Date(`${String(v).slice(0, 10)}T00:00:00Z`);
-      };
-      breakdownLines = dayBuckets.map((b) => {
-        const d = toDateSafe(b.day);
-        const label = formatInTimeZone(d, tz, 'EEEE');
-        const hrs = (b.seconds / 3600).toFixed(2);
-        return `${label} ${hrs} hours`;
-      });
-    } else if (period === 'month') {
-      const weeks = await getMonthWeekBuckets({ ownerId, employeeName: person, startUtc, endUtc, tz });
-      breakdownLines = weeks.map(w => `Week ${w.idx}: ${(w.seconds / 3600).toFixed(2)} hours`);
-    }
-
-    const totalHours = (workSeconds / 3600).toFixed(2);
-    const driveHours = (driveSeconds / 3600).toFixed(2);
-    const startLabel = formatInTimeZone(startUtc, tz, 'MMM d, yyyy');
-    const endLabel = formatInTimeZone(endUtc, tz, 'MMM d, yyyy');
-
-    let message = `${person} worked ${totalHours} hours`;
-    if (period === 'day') {
-      message = `${person} worked ${totalHours} hours today (${startLabel}).`;
-    } else if (period === 'week') {
-      message = `${person} worked ${totalHours} hours this week (${startLabel}–${endLabel}):\n` + breakdownLines.join('\n');
-    } else if (period === 'month') {
-      message = `${person} worked ${totalHours} hours so far this month (as of ${endLabel}):\n` + breakdownLines.join('\n');
-    }
-    message += `\nDrive Hours: ${driveHours}`;
-
-    return {
-      message,
-      totalHours: Number(totalHours),
-      driveHours: Number(driveHours),
-      startUtc: startUtc.toISOString(),
-      endUtc: endUtc.toISOString(),
-      period,
-      person,
-    };
-  }
-
-  const ownerId = arg1, employeeName = arg2, period = arg3, date = arg4, tz = arg5 || 'America/Toronto';
-  const entries = await getTimeEntries(ownerId, employeeName, period, date, tz);
-
-  let totalHours = 0;
-  let driveHours = 0;
-  let lastPunchIn = null;
-  let lastDriveStart = null;
-  for (const e of entries) {
-    const ts = new Date(e.timestamp);
-    if (e.type === 'punch_in') lastPunchIn = ts;
-    else if (e.type === 'punch_out' && lastPunchIn) {
-      totalHours += (ts - lastPunchIn) / 3600000;
-      lastPunchIn = null;
-    } else if (e.type === 'drive_start') lastDriveStart = ts;
-    else if (e.type === 'drive_end' && lastDriveStart) {
-      driveHours += (ts - lastDriveStart) / 3600000;
-      lastDriveStart = null;
-    }
-  }
-
-  return {
-    employeeName,
-    period,
-    startDate: new Date(date || new Date()).toISOString().split('T')[0],
-    totalHours,
-    driveHours,
-    entriesByDay: {},
-  };
-}
-
-async function createTimePrompt(ownerId, employeeName, kind, context = {}) {
-  const q = `
-    INSERT INTO public.timeclock_prompts (owner_id, employee_name, kind, context)
-    VALUES ($1,$2,$3,$4::jsonb)
-    RETURNING *`;
-  const { rows } = await query(q, [ownerId, employeeName, kind, JSON.stringify(context)]);
+  const uid = DIGITS(user_id);
+  const oid = DIGITS(ownerId || uid);
+  const token = crypto.randomBytes(16).toString('hex');
+  const { rows } = await query(
+    `INSERT INTO public.users (user_id, owner_id, onboarding_in_progress, subscription_tier, dashboard_token, created_at)
+     VALUES ($1,$2,$3,'basic',$4,NOW())
+     ON CONFLICT (user_id) DO UPDATE SET onboarding_in_progress=EXCLUDED.onboarding_in_progress
+     RETURNING *`,
+    [uid, oid, onboarding_in_progress, token]
+  );
   return rows[0];
 }
-
-async function getPendingPrompt(ownerId) {
-  await query(`DELETE FROM public.timeclock_prompts WHERE expires_at < now() AND owner_id = $1`, [ownerId]);
+async function saveUserProfile(p) {
+  const uid = DIGITS(p.user_id);
+  const keyshoz = Object.keys(p);
+  const vals = Object.values(p);
+  const insCols = keys.join(', ');
+  const insVals = keys.map((_, i) => `$${i + 1}`).join(', ');
+  const upd = keys.filter(k => k !== 'user_id').map(k => `${k}=EXCLUDED.${k}`).join(', ');
   const { rows } = await query(
-    `SELECT * FROM public.timeclock_prompts
-     WHERE owner_id = $1 AND (expires_at IS NULL OR expires_at >= now())
-     ORDER BY created_at DESC
-     LIMIT 1`,
-    [ownerId]
+    `INSERT INTO public.users (${insCols}) VALUES (${insVals})
+     ON CONFLICT (user_id) DO UPDATE SET ${upd}
+     RETURNING *`,
+    vals
   );
-  return rows?.[0] || null;
+  return rows[0];
 }
-
-async function clearPrompt(id) {
-  await query(`DELETE FROM public.timeclock_prompts WHERE id = $1`, [id]);
+async function getUserProfile(userId) {
+  const { rows } = await query(`SELECT * FROM public.users WHERE user_id=$1`, [DIGITS(userId)]);
+  return rows[0] || null;
 }
-
-async function getOpenShift(ownerId, employeeName) {
-  const q = `
-    SELECT t.*, job_name
-    FROM public.time_entries t
-    WHERE t.owner_id = $1
-      AND t.employee_name = $2
-      AND t.type = 'punch_in'
-      AND NOT EXISTS (
-        SELECT 1 FROM public.time_entries o
-        WHERE o.owner_id = t.owner_id
-          AND o.employee_name = t.employee_name
-          AND o.type = 'punch_out'
-          AND o.timestamp > t.timestamp
-      )
-    ORDER BY t.timestamp DESC
-    LIMIT 1`;
-  const { rows } = await query(q, [ownerId, employeeName]);
+async function getOwnerProfile(ownerId) {
+  const { rows } = await query(`SELECT * FROM public.users WHERE user_id=$1`, [DIGITS(ownerId)]);
   return rows[0] || null;
 }
 
-async function getOpenBreakSince(ownerId, employeeName, sinceUtcIso) {
-  const q = `
-    SELECT b.*, job_name
-    FROM public.time_entries b
-    WHERE b.owner_id = $1
-      AND b.employee_name = $2
-      AND b.type = 'break_start'
-      AND b.timestamp >= $3::timestamptz
-      AND NOT EXISTS (
-        SELECT 1 FROM public.time_entries e
-        WHERE e.owner_id = b.owner_id
-          AND e.employee_name = b.employee_name
-          AND e.type = 'break_end'
-          AND e.timestamp > b.timestamp
-      )
-    ORDER BY b.timestamp DESC
-    LIMIT 1`;
-  const { rows } = await query(q, [ownerId, employeeName, sinceUtcIso]);
+// ---------- Tasks ----------
+async function createTask({ ownerId, createdBy, assignedTo, title, body, type = 'general', dueAt, jobNo }) {
+  const { rows } = await query(
+    `INSERT INTO public.tasks
+       (owner_id, created_by, assigned_to, title, body, type, due_at, job_no, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
+     RETURNING *`,
+    [DIGITS(ownerId), DIGITS(createdBy), assignedTo ? DIGITS(assignedTo) : null, title, body, type, dueAt, jobNo]
+  );
+  return rows[0];
+}
+async function getTaskByNo(ownerId, taskNo) {
+  const { rows } = await query(
+    `SELECT * FROM public.tasks WHERE owner_id=$1 AND task_no=$2 LIMIT 1`,
+    [DIGITS(ownerId), taskNo]
+  );
   return rows[0] || null;
 }
 
-async function closeOpenBreakIfAny(ownerId, employeeName, sinceUtcIso, endUtcIso, tz = 'America/Toronto') {
-  const open = await getOpenBreakSince(ownerId, employeeName, sinceUtcIso);
-  if (!open) return null;
-  const localStr = formatInTimeZone(new Date(endUtcIso), tz, 'yyyy-MM-dd HH:mm:ss');
-  const q = `
-    INSERT INTO public.time_entries (owner_id, employee_name, type, timestamp, job_name, tz, local_time, created_at)
-    VALUES ($1,$2,'break_end',$3::timestamptz,$4,$5,$6::timestamp,NOW())
-    RETURNING id`;
-  const { rows } = await query(q, [ownerId, employeeName, endUtcIso, open.job_name || null, tz, localStr]);
-  return rows[0] || null;
-}
-
-// --- Time Entries: limits & audit ---
-const TIER_LIMITS = { starter: 50, pro: 200, enterprise: 1000 };
-function tierLimitFor(tier) {
-  const key = String(tier || 'starter').toLowerCase();
-  return { tierKey: key, tierLimit: TIER_LIMITS[key] ?? TIER_LIMITS.starter };
-}
-
-let HAS_CREATED_BY_CACHE = null;
-async function hasCreatedByColumn() {
-  if (HAS_CREATED_BY_CACHE !== null) return HAS_CREATED_BY_CACHE;
-  try {
-    const { rows } = await query(
-      `SELECT 1
-         FROM information_schema.columns
-        WHERE table_name = 'time_entries'
-          AND column_name = 'created_by'
-        LIMIT 1`
-    );
-    HAS_CREATED_BY_CACHE = rows && rows.length > 0;
-  } catch {
-    HAS_CREATED_BY_CACHE = false;
-  }
-  return HAS_CREATED_BY_CACHE;
-}
-
-async function checkTimeEntryLimit(ownerId, tier) {
-  const { tierKey, tierLimit } = tierLimitFor(tier);
+// ---------- Time ----------
+async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
+  const tsIso = new Date(ts).toISOString();
+  const local = formatInTimeZone(tsIso, tz, 'yyyy-MM-dd HH:mm:ss');
   const { rows } = await query(
-    `SELECT COUNT(*) AS count
-       FROM public.time_entries
-      WHERE owner_id = $1
-        AND DATE(timestamp AT TIME ZONE 'UTC') = CURRENT_DATE`,
-    [ownerId]
+    `INSERT INTO public.time_entries
+       (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_by, created_at)
+     VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,NOW())
+     RETURNING id`,
+    [DIGITS(ownerId), employeeName, type, tsIso, jobNo, tz, local, extras.requester_id || null]
   );
-  const count = parseInt(rows?.[0]?.count || '0', 10);
-  return { ok: count < tierLimit, tierKey, tierLimit, count };
+  return rows[0].id;
 }
 
-async function checkActorLimit(ownerId, actorId) {
-  if (!(await hasCreatedByColumn())) return true;
-  const { rows } = await query(
-    `SELECT COUNT(*) AS count
-       FROM public.time_entries
-      WHERE owner_id = $1
-        AND created_by = $2
-        AND DATE(timestamp AT TIME ZONE 'UTC') = CURRENT_DATE`,
-    [ownerId, String(actorId)]
-  );
-  const n = parseInt(rows?.[0]?.count || '0', 10);
-  return n < 100;
-}
-
-async function generateReport(ownerId, tier) {
-  try {
-    const res = await queryWithTimeout(
-      `SELECT
-         COALESCE(SUM(CASE WHEN type='revenue' THEN amount::numeric ELSE 0 END),0) AS revenue,
-         COALESCE(SUM(CASE WHEN type IN ('expense','bill') THEN amount::numeric ELSE 0 END),0) AS expenses
-       FROM public.transactions
-       WHERE owner_id=$1`,
-      [ownerId],
-      15000
-    );
-    const revenue = parseFloat(res.rows[0].revenue) || 0;
-    const expenses = parseFloat(res.rows[0].expenses) || 0;
-    const report = { revenue, expenses, profit: revenue - expenses, tier };
-    const reportId = crypto.randomBytes(8).toString('hex');
-    await query(
-      `INSERT INTO public.reports (owner_id, report_id, data, created_at)
-       VALUES ($1,$2,$3::jsonb,NOW())`,
-      [ownerId, reportId, JSON.stringify(report)]
-    );
-    const url = `https://chief-ai-refactored.vercel.app/reports/${reportId}`;
-    return { url };
-  } catch (error) {
-    console.error('[ERROR] generateReport failed:', error.message);
-    throw error;
-  }
-}
-
-async function exportTimesheetXlsx({ ownerId, startIso, endIso, employeeName = null, tz = 'America/Toronto' }) {
-  const params = employeeName
-    ? [ownerId, startIso, endIso, tz, employeeName]
-    : [ownerId, startIso, endIso, tz];
-
+// ---------- Exports ----------
+async function exportTimesheetXlsx(opts) {
+  const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
+  const params = employeeName ? [ownerId, startIso, endIso, tz, employeeName] : [ownerId, startIso, endIso, tz];
   const { rows } = await queryWithTimeout(
     `SELECT employee_name, type, timestamp, COALESCE(job_name,'') AS job_name, COALESCE(tz,$4) AS tz
-     FROM public.time_entries
-     WHERE owner_id = $1
-       AND timestamp >= $2::timestamptz
-       AND timestamp <= $3::timestamptz
-       ${employeeName ? 'AND employee_name = $5' : ''}
-     ORDER BY employee_name, timestamp ASC`,
-    params,
-    15000
+       FROM public.time_entries
+      WHERE owner_id=$1 AND timestamp>=$2::timestamptz AND timestamp<=$3::timestamptz
+      ${employeeName ? 'AND employee_name=$5' : ''}
+      ORDER BY employee_name, timestamp`,
+    params, 15000
   );
-
   const wb = new ExcelJS.Workbook();
-  const byEmp = groupBy(rows, 'employee_name');
-
-  const sum = wb.addWorksheet('Summary');
-  sum.columns = [
-    { header: 'Employee', key: 'employee', width: 24 },
-    { header: 'Entries', key: 'entries', width: 10 },
-    { header: 'Shift Hours', key: 'hours', width: 14 },
-    { header: 'Drive Hours', key: 'drive', width: 14 },
-    { header: 'Break Minutes', key: 'breaks', width: 16 },
-    { header: 'Start', key: 'start', width: 12 },
-    { header: 'End', key: 'end', width: 12 },
+  const ws = wb.addWorksheet('Timesheet');
+  ws.columns = [
+    { header: 'Employee', key: 'employee_name' },
+    { header: 'Type', key: 'type' },
+    { header: 'Timestamp', key: 'timestamp' },
+    { header: 'Job', key: 'job_name' },
   ];
-  const startStr = (startIso || '').slice(0, 10);
-  const endStr = (endIso || '').slice(0, 10);
-  for (const emp of Object.keys(byEmp)) {
-    const summary = computeEmployeeSummary(byEmp[emp]);
-    sum.addRow({
-      employee: emp,
-      entries: byEmp[emp].length,
-      hours: summary.totalHours,
-      drive: summary.driveHours,
-      breaks: summary.breakMinutes,
-      start: startStr,
-      end: endStr,
-    });
-  }
-  sum.getRow(1).font = { bold: true };
-
-  for (const emp of Object.keys(byEmp)) {
-    const safeName = String(emp).slice(0, 31).replace(/[\\/?*[\]:]/g, ' ');
-    const ws = wb.addWorksheet(safeName || 'Employee');
-    ws.columns = [
-      { header: 'Date', key: 'date', width: 12 },
-      { header: 'Local Time', key: 'local', width: 20 },
-      { header: 'UTC Time', key: 'utc', width: 20 },
-      { header: 'Type', key: 'type', width: 16 },
-      { header: 'Job', key: 'job', width: 28 },
-    ];
-    for (const r of byEmp[emp]) {
-      const ts = new Date(r.timestamp);
-      ws.addRow({
-        date: ts.toISOString().slice(0, 10),
-        local: formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm'),
-        utc: ts.toISOString().slice(11, 19) + 'Z',
-        type: r.type,
-        job: r.job_name || '',
-      });
-    }
-    ws.getRow(1).font = { bold: true };
-  }
-
+  rows.forEach(r => ws.addRow(r));
   const buf = await wb.xlsx.writeBuffer();
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startStr}_${endStr}${employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''}.xlsx`;
-  const contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-
+  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}.xlsx`;
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
-     VALUES ($1,$2,$3,$4,$5,NOW())`,
-    [id, ownerId, filename, contentType, Buffer.from(buf)]
+     VALUES ($1,$2,$3,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',$4,NOW())`,
+    [id, ownerId, filename, Buffer.from(buf)]
   );
-
-  const baseUrl = process.env.PUBLIC_BASE_URL || 'https://chief-ai-refactored.vercel.app';
-  return { url: `${baseUrl}/exports/${id}`, id, filename, contentType };
+  return { url: `${process.env.PUBLIC_BASE_URL || ''}/exports/${id}`, id, filename };
 }
-
-async function exportTimesheetPdf({ ownerId, startIso, endIso, employeeName = null, tz = 'America/Toronto' }) {
-  const params = employeeName
-    ? [ownerId, startIso, endIso, tz, employeeName]
-    : [ownerId, startIso, endIso, tz];
-
+async function exportTimesheetPdf(opts) {
+  const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
+  const params = employeeName ? [ownerId, startIso, endIso, tz, employeeName] : [ownerId, startIso, endIso, tz];
   const { rows } = await queryWithTimeout(
     `SELECT employee_name, type, timestamp, COALESCE(job_name,'') AS job_name, COALESCE(tz,$4) AS tz
-     FROM public.time_entries
-     WHERE owner_id = $1
-       AND timestamp >= $2::timestamptz
-       AND timestamp <= $3::timestamptz
-       ${employeeName ? 'AND employee_name = $5' : ''}
-     ORDER BY employee_name, timestamp ASC`,
-    params,
-    15000
+       FROM public.time_entries
+      WHERE owner_id=$1 AND timestamp>=$2::timestamptz AND timestamp<=$3::timestamptz
+      ${employeeName ? 'AND employee_name=$5' : ''}
+      ORDER BY employee_name, timestamp`,
+    params, 15000
   );
-
-  const byEmp = groupBy(rows, 'employee_name');
-
-  const doc = new PDFDocument({ size: 'LETTER', margin: 40 });
+  const doc = new PDFDocument({ margin: 40 });
   const chunks = [];
   doc.on('data', d => chunks.push(d));
-  const done = new Promise(res => doc.on('end', res));
-
-  const title = `Timesheet ${startIso.slice(0, 10)} → ${endIso.slice(0, 10)}`;
-  doc.fontSize(16).text(title, { align: 'center' }).moveDown();
-
-  for (const emp of Object.keys(byEmp)) {
-    doc.fontSize(13).text(emp, { underline: true }).moveDown(0.5);
-    const summary = computeEmployeeSummary(byEmp[emp]);
+  const done = new Promise(r => doc.on('end', r));
+  doc.fontSize(16).text(`Timesheet ${startIso.slice(0,10)} – ${endIso.slice(0,10)}`, { align: 'center' }).moveDown();
+  rows.forEach(r => {
+    const ts = new Date(r.timestamp);
     doc.fontSize(10).text(
-      `Shift Hours: ${summary.totalHours.toFixed(2)}   ` +
-      `Drive Hours: ${summary.driveHours.toFixed(2)}   ` +
-      `Break Minutes: ${summary.breakMinutes}`
-    ).moveDown(0.4);
-
-    doc.fontSize(10)
-      .text('Date', 40)
-      .text('Local Time', 130)
-      .text('UTC', 240)
-      .text('Type', 320)
-      .text('Job', 420)
-      .moveDown(0.2);
-    doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke().moveDown(0.3);
-
-    for (const r of byEmp[emp]) {
-      const ts = new Date(r.timestamp);
-      doc.text(ts.toISOString().slice(0, 10), 40)
-         .text(formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm'), 130)
-         .text(ts.toISOString().slice(11, 19) + 'Z', 240)
-         .text(r.type, 320)
-         .text(r.job_name || '', 420)
-         .moveDown(0.1);
-      if (doc.y > 720) doc.addPage();
-    }
-
-    doc.moveDown(0.6);
-    doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke().moveDown(0.6);
-  }
-
+      `${r.employee_name} | ${r.type} | ${formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm')} | ${r.job_name || ''}`
+    );
+  });
   doc.end();
   await done;
-  const buffer = Buffer.concat(chunks);
-
+  const buf = Buffer.concat(chunks);
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''}.pdf`;
-  const contentType = 'application/pdf';
-
+  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}.pdf`;
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
-     VALUES ($1,$2,$3,$4,$5,NOW())`,
-    [id, ownerId, filename, contentType, buffer]
+     VALUES ($1,$2,$3,'application/pdf',$4,NOW())`,
+    [id, ownerId, filename, buf]
   );
-
-  const baseUrl = process.env.PUBLIC_BASE_URL || 'https://chief-ai-refactored.vercel.app';
-  return { url: `${baseUrl}/exports/${id}`, id, filename, contentType };
+  return { url: `${process.env.PUBLIC_BASE_URL || ''}/exports/${id}`, id, filename };
 }
 
-async function getUserBasic(userId) {
-  const uid = normalizePhoneNumber(userId);
-  try {
-    const { rows } = await query(
-      `SELECT user_id, owner_id, name, role, can_edit_time
-       FROM public.users
-       WHERE user_id=$1`,
-      [uid]
-    );
-    return rows[0] || null;
-  } catch (error) {
-    console.error('[ERROR] getUserBasic failed:', error.message);
-    throw error;
-  }
-}
-
-async function getUserByName(ownerId, nameLike) {
-  try {
-    const { rows } = await query(
-      `SELECT user_id, name, role
-       FROM public.users
-       WHERE owner_id=$1 AND name ILIKE $2
-       ORDER BY (CASE WHEN name ILIKE $3 THEN 0 ELSE 1 END), name ASC
-       LIMIT 1`,
-      [ownerId, `${nameLike}%`, nameLike]
-    );
-    return rows[0] || null;
-  } catch (error) {
-    console.error('[ERROR] getUserByName failed:', error.message);
-    throw error;
-  }
-}
-
-// DROP-IN: replaces your current createTask
-async function createTask({
-  ownerId,
-  createdBy,
-  assignedTo = null,
-  title,
-  body = null,
-  type = 'general',
-  relatedEntryId = null,
-  dueAt = null,
-  jobNo = null,              // <— NEW (set by createTaskWithJob)
-}) {
-  if (!ownerId || !createdBy || !title) throw new Error('Missing required fields');
-
-  const q = `
-    INSERT INTO public.tasks
-      (owner_id, created_by, assigned_to, title, body, status, type, related_entry_id, due_at, job_no, created_at, updated_at)
-    VALUES
-      ($1, $2, $3, $4, $5, 'open', $6, $7, $8, $9, now(), now())
-    RETURNING id, task_no, owner_id, created_by, assigned_to, title, due_at, status, type, related_entry_id, job_no, created_at, updated_at
-  `;
-
-  const params = [
-    ownerId,
-    normalizePhoneNumber(createdBy),
-    assignedTo ? normalizePhoneNumber(assignedTo) : null,
-    title,
-    body,
-    type,
-    relatedEntryId,
-    dueAt,
-    jobNo, // <— actually persisted now
-  ];
-
-  try {
-    const { rows } = await query(q, params);
-    return rows[0];
-  } catch (error) {
-    console.error('[ERROR] createTask failed:', error.message);
-    throw error;
-  }
-}
-
-// ---------- TASK LISTING + STATUS HELPERS (DB-safe, no external normalizer) ----------
-
-/**
- * Returns ALL tasks for a given user (both created_by OR assigned_to),
- * defaulting to "open" = status NOT IN ('done','deleted').
- */
-async function listMyTasks({ ownerId, userId, status = 'open' }) {
-  const owner = _digits(ownerId);
-  const user  = _digits(userId);
-
-  const statusClause = (status === 'open')
-    ? `t.status NOT IN ('done','deleted')`
-    : `t.status = $3`;
-  const params = (status === 'open') ? [owner, user] : [owner, user, status];
-
-  const { rows } = await query(
-    `
-    SELECT
-      t.task_no,
-      t.title,
-      t.due_at,
-      t.status,
-      t.created_at,
-      t.assigned_to,
-      COALESCE(a.name, t.assigned_to) AS assignee_name,
-      COALESCE(c.name, t.created_by)  AS creator_name
-    FROM public.tasks t
-    LEFT JOIN public.users a ON a.user_id = t.assigned_to
-    LEFT JOIN public.users c ON c.user_id = t.created_by
-    WHERE t.owner_id = $1
-      AND (t.assigned_to = $2 OR t.created_by = $2)
-      AND ${statusClause}
-    ORDER BY t.due_at ASC NULLS LAST, t.task_no ASC
-    `,
-    params
-  );
-  return rows;
-}
-
-
-
-/**
- * Unassigned tasks for the tenant (inbox).
- */
-async function listInboxTasks({ ownerId, status = 'open' }) {
-  const owner = _digits(ownerId);
-
-  const statusClause = (status === 'open')
-    ? `t.status NOT IN ('done','deleted')`
-    : `t.status = $2`;
-  const params = (status === 'open') ? [owner] : [owner, status];
-
-  const { rows } = await query(
-    `
-    SELECT
-      t.task_no,
-      t.title,
-      t.due_at,
-      t.status,
-      t.created_at,
-      t.created_by,
-      COALESCE(c.name, t.created_by) AS creator_name
-    FROM public.tasks t
-    LEFT JOIN public.users c ON c.user_id = t.created_by
-    WHERE t.owner_id = $1
-      AND t.assigned_to IS NULL
-      AND ${statusClause}
-    ORDER BY t.due_at ASC NULLS LAST, t.task_no ASC
-    `,
-    params
-  );
-  return rows;
-}
-
-/**
- * Look up a teammate by name or phone, then reuse listMyTasks.
- */
-async function listTasksForUser({ ownerId, nameOrId, status = 'open' }) {
-  let userRow = null;
-  if (/^\+?\d{10,15}$/.test(String(nameOrId))) {
-    userRow = await getUserBasic(nameOrId);
-  } else {
-    userRow = await getUserByName(ownerId, nameOrId);
-  }
-  if (!userRow || !userRow.user_id) return [];
-  return await listMyTasks({ ownerId, userId: userRow.user_id, status });
-}
-
-/**
- * All open tasks grouped by assignee (for "Team tasks").
- */
-async function listAllOpenTasksByAssignee({ ownerId }) {
-  const owner = _digits(ownerId);
-  const { rows } = await query(
-    `
-    SELECT
-      t.task_no,
-      t.title,
-      t.due_at,
-      t.status,
-      t.created_at,
-      t.assigned_to,
-      COALESCE(a.name, t.assigned_to) AS assignee_name,
-      COALESCE(c.name, t.created_by)  AS creator_name
-    FROM public.tasks t
-    LEFT JOIN public.users a ON a.user_id = t.assigned_to
-    LEFT JOIN public.users c ON c.user_id = t.created_by
-    WHERE t.owner_id = $1
-      AND t.status NOT IN ('done','deleted')
-    ORDER BY
-      (CASE WHEN t.assigned_to IS NULL THEN 1 ELSE 0 END),   -- Unassigned first
-      assignee_name NULLS LAST,
-      t.created_at ASC NULLS LAST,
-      t.task_no ASC
-    `,
-    [owner]
-  );
-  return rows;
-}
-
-/**
- * Owners can mark ANY task done; non-owners only tasks they created or that are assigned to them.
- */
-async function markTaskDone({ ownerId, taskNo, actorId, isOwner }) {
-  const ownerDigits = _digits(ownerId);
-  const actorDigits = _digits(actorId);
-  const actorIsOwner = (typeof isOwner === 'boolean') ? isOwner : (actorDigits === ownerDigits);
-
-  let sql = `
-    UPDATE public.tasks
-       SET status = 'done',
-           updated_at = NOW()
-     WHERE owner_id = $1
-       AND task_no  = $2
-  `;
-  const params = [ownerDigits, Number(taskNo)];
-
-  if (!actorIsOwner) {
-    sql += ` AND (assigned_to = $3 OR created_by = $3)`;
-    params.push(actorDigits);
-  }
-
-  sql += ` RETURNING task_no, title, status, assigned_to, created_by;`;
-
-  const result = await query(sql, params);
-  if (result?.rowCount > 0) return result.rows[0];
-
-  const exists = await query(
-    `SELECT 1 FROM public.tasks WHERE owner_id = $1 AND task_no = $2 LIMIT 1`,
-    [ownerDigits, Number(taskNo)]
-  );
-  if (exists?.rowCount > 0) throw new Error('Permission denied');
-  throw new Error('Task not found');
-}
-
-
-/**
- * Owners can reopen ANY task; non-owners only tasks they created or that are assigned to them.
- */
-async function reopenTask({ ownerId, taskNo, actorId, isOwner }) {
-  const ownerDigits = _digits(ownerId);
-  const actorDigits = _digits(actorId);
-  const actorIsOwner = (typeof isOwner === 'boolean') ? isOwner : (actorDigits === ownerDigits);
-
-  let sql = `
-    UPDATE public.tasks
-       SET status = 'open',
-           updated_at = NOW()
-     WHERE owner_id = $1
-       AND task_no  = $2
-  `;
-  const params = [ownerDigits, Number(taskNo)];
-
-  if (!actorIsOwner) {
-    sql += ` AND (assigned_to = $3 OR created_by = $3)`;
-    params.push(actorDigits);
-  }
-
-  sql += ` RETURNING task_no, title, status, assigned_to, created_by;`;
-
-  const result = await query(sql, params);
-  if (result?.rowCount > 0) return result.rows[0];
-
-  const exists = await query(
-    `SELECT 1 FROM public.tasks WHERE owner_id = $1 AND task_no = $2 LIMIT 1`,
-    [ownerDigits, Number(taskNo)]
-  );
-  if (exists?.rowCount > 0) throw new Error('Permission denied');
-  throw new Error('Task not found');
-}
-
-/**
- * (Restored) Current status helper used elsewhere.
- */
-async function getCurrentStatus(ownerId, employeeName) {
-  const res = await query(
-    `
-    SELECT type, timestamp
-      FROM public.time_entries
-     WHERE owner_id = $1
-       AND employee_name = $2
-     ORDER BY timestamp DESC
-     LIMIT 2
-    `,
-    [_digits(ownerId), employeeName]
-  );
-
-  let onShift = false;
-  let onBreak = false;
-  let lastShiftStart = null;
-  let lastBreakStart = null;
-
-  for (const entry of res.rows) {
-    if (entry.type === 'punch_in') {
-      onShift = true;
-      lastShiftStart = entry.timestamp;
-      break;
-    } else if (entry.type === 'punch_out') {
-      onShift = false;
-      break;
-    } else if (entry.type === 'break_start') {
-      onBreak = true;
-      lastBreakStart = entry.timestamp;
-    } else if (entry.type === 'break_end') {
-      onBreak = false;
-    }
-  }
-
-  return { onShift, onBreak, lastShiftStart, lastBreakStart };
-}
-// Create a "time edit request" task tied to a specific time entry (optional)
-async function createTimeEditRequestTask({
-  ownerId,
-  requesterId,
-  title,
-  body,
-  relatedEntryId = null,
-}) {
-  try {
-    // relies on createTask defined earlier in this file
-    const task = await createTask({
-      ownerId,
-      createdBy: requesterId,
-      assignedTo: null,               // goes to inbox by default
-      title,
-      body,
-      type: 'time_edit_request',      // so you can filter/report on these
-      relatedEntryId,                 // nullable
-    });
-    return task;
-  } catch (error) {
-    console.error('[ERROR] createTimeEditRequestTask failed:', error.message);
-    throw error;
-  }
-}
-
-// --- Exports (ensure everything referenced elsewhere is here) ---
+// ---------- Export all ----------
 module.exports = {
-  pool,
-  query,
-  withClient,
-  appendToUserSpreadsheet,
-  saveExpense,
-  deleteExpense,
-  saveBill,
-  updateBill,
-  deleteBill,
-  saveRevenue,
-  saveQuote,
-  addPricingItem,
-  getPricingItems,
-  updatePricingItem,
-  deletePricingItem,
-  getActiveJob,
-  saveJob,
-  setActiveJob,
-  finishJob,
-  createJob,
-  finalizeJobCreation,
-  pauseJob,
-  resumeJob,
-  listOpenJobs,
-  summarizeJob,
-  createUserProfile,
-  saveUserProfile,
-  getUserProfile,
-  getOwnerProfile,
-  getCurrentStatus,            
-  parseFinancialFile,
-  parseReceiptText,
-  generateOTP,
-  verifyOTP,
+  pool, query, queryWithTimeout, withClient,
+  normalizePhoneNumber: x => DIGITS(x),
+  toAmount, isValidIso,
+  ensureJobByName, resolveJobContext,
+  createTaskWithJob, logTimeEntryWithJob,
+  generateOTP, verifyOTP,
+  createUserProfile, saveUserProfile, getUserProfile, getOwnerProfile,
+  createTask, getTaskByNo,
   logTimeEntry,
-  moveLastEntryToJob,
-  getTimeEntries,
-  getEntriesBetween,
-  generateTimesheet,
-  createTimePrompt,
-  getPendingPrompt,
-  clearPrompt,
-  getOpenShift,
-  getOpenBreakSince,
-  closeOpenBreakIfAny,
-  generateReport,
-  exportTimesheetXlsx,
-  exportTimesheetPdf,
-
-  // tasks API
-  createTask,
-  listMyTasks,
-  listInboxTasks,
-  listTasksForUser,
-  listAllOpenTasksByAssignee,  // ✅ export for "Team tasks"
-  markTaskDone,
-  reopenTask,
-  createTimeEditRequestTask,
-  getUserBasic,
-  getUserByName,
-  normalizePhoneNumber,
-  checkTimeEntryLimit,
-  checkActorLimit,
-  hasCreatedByColumn,
-  ensureJobByName,
-  resolveJobContext,
-  createTaskWithJob,
-  logTimeEntryWithJob,
-  getTaskByNo,
-
+  exportTimesheetXlsx, exportTimesheetPdf,
+  // Add any other helpers you already use (listMyTasks, etc.) here
 };

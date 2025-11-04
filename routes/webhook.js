@@ -1,19 +1,21 @@
 // routes/webhook.js
+// Single Express router that owns raw-body parsing, Twilio-friendly responses,
+// lightweight middlewares, and tolerant fallbacks.
+
 const express = require('express');
 const app = express();
 const router = express.Router();
 const querystring = require('querystring');
 
 // ---------- Helpers ----------
-/* =========================
- * Small helpers
- * =======================*/
 const xml = (s = '') => `<Response><Message>${String(s)}</Message></Response>`;
 const ok = (res, text = 'OK') => {
   if (res.headersSent) return;
   res.status(200).type('application/xml').send(xml(text));
 };
-const normalizePhone = (raw = '') => String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
+const normalizePhone = (raw = '') =>
+  String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
+
 function pickFirstMedia(body = {}) {
   const n = parseInt(body.NumMedia || '0', 10) || 0;
   if (n <= 0) return { n: 0, url: null, type: null };
@@ -21,22 +23,28 @@ function pickFirstMedia(body = {}) {
   const typ = body.MediaContentType0 || body.MediaContentType || null;
   return { n, url, type: typ ? String(typ).toLowerCase() : null };
 }
+
 function canUseAgent(profile) {
   const tier = (profile?.subscription_tier || profile?.plan || '').toLowerCase();
   return tier && tier !== 'basic' && tier !== 'free';
 }
 
-// ---------- Raw body parser (for Twilio signature) ----------
+// ---------- Raw body parser (Twilio signature needs original payload) ----------
 router.use((req, _res, next) => {
   if (req.method !== 'POST') return next();
+
   const ct = String(req.headers['content-type'] || '').toLowerCase();
-  if (!ct.includes('application/x-www-form-urlencoded')) return next();
+  const isForm = ct.includes('application/x-www-form-urlencoded');
+  if (!isForm) return next();
+
+  // If something upstream already set rawBody + body, don't re-parse.
   if (req.body && Object.keys(req.body).length && typeof req.rawBody === 'string') return next();
 
   let raw = '';
   req.setEncoding('utf8');
   req.on('data', chunk => {
     raw += chunk;
+    // Hard cap ~1MB
     if (raw.length > 1_000_000) req.destroy();
   });
   req.on('end', () => {
@@ -60,6 +68,7 @@ router.use((req, _res, next) => {
   req.ownerId = req.from || 'GLOBAL';
   const proto = req.headers['x-forwarded-proto'] || 'https';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
+  // Keep this exactly in sync with your Twilio console webhook URL
   req.twilioUrl = `${proto}://${host}/api/webhook`;
   next();
 });
@@ -118,7 +127,8 @@ router.post('/', async (req, res, next) => {
     // AUDIO → transcribe
     if (contentType.startsWith('audio/')) {
       let transcript = '';
-      const transcribe = media.transcribe || media.transcriber || media.transcribeAudio || media.handleMedia;
+      const transcribe =
+        media.transcribe || media.transcriber || media.transcribeAudio || media.handleMedia;
       if (typeof transcribe === 'function') {
         transcript = await transcribe(url, { from: req.from, ownerId: req.ownerId });
       }
@@ -177,32 +187,32 @@ router.post('/', async (req, res, next) => {
     ].filter(Boolean);
 
     const cmds = require('../handlers/commands');
-    const tasksHandler = cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
-    const handleJob = cmds.job || require('../handlers/commands/job');
-    const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
+    const tasksHandler   = cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
+    const handleJob      = cmds.job || require('../handlers/commands/job');
+    const handleTimeclock= cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
 
     // TASKS
     if (looksTask && typeof tasksHandler === 'function') {
-      const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) return ok(res, 'Task handled.');
       return;
     }
 
     // JOBS
     if (looksJob && typeof handleJob === 'function') {
-      const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) return ok(res, 'Job handled.');
       return;
     }
 
     // TIMECLOCK
     if (looksTime && typeof handleTimeclock === 'function') {
-      const out = await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) return ok(res, 'Time logged.');
       return;
     }
 
-    // AGENT
+    // AGENT (subscription-gated)
     if (canUseAgent(req.userProfile)) {
       try {
         const { ask } = require('../services/agent');
@@ -230,9 +240,7 @@ router.post('/', async (req, res, next) => {
   }
 });
 
-/* =========================
- * Final fallback – always return 200 TwiML if nothing else did
- * =======================*/
+// ---------- Final fallback – always 200 TwiML ----------
 router.use((req, res, next) => {
   if (!res.headersSent) {
     console.warn('[WEBHOOK] fell-through fallback');
@@ -241,16 +249,14 @@ router.use((req, res, next) => {
   next();
 });
 
-/* =========================
- * Error middleware – tolerant (lazy load)
- * =======================*/
+// ---------- Error middleware – tolerant (lazy load) ----------
 try {
   const { errorMiddleware } = require('../middleware/error');
   router.use(errorMiddleware);
-} catch { /* no-op – keep the webhook alive */ }
+} catch {
+  // no-op – keep the webhook alive
+}
 
-/* =========================
- * Export as plain Node handler (delegator consumes)
- * =======================*/
+// ---------- Export as plain Node handler (Vercel default export consumes this) ----------
 app.use('/', router);
 module.exports = (req, res) => app.handle(req, res);

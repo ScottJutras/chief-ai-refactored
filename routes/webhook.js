@@ -57,7 +57,7 @@ router.use((req, _res, next) => {
 });
 
 // ---------- Non-POST guard ----------
-router.all('/', (req, res, next) => {
+router.all('*', (req, res, next) => {
   if (req.method === 'POST') return next();
   return ok(res, 'OK');
 });
@@ -66,12 +66,13 @@ router.all('/', (req, res, next) => {
 router.use((req, _res, next) => {
   req.from = req.body?.From ? normalizePhone(req.body.From) : null;
   req.ownerId = req.from || 'GLOBAL';
-  const proto = req.headers['x-forwarded-proto'] || 'https';
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
-  // Keep this exactly in sync with your Twilio console webhook URL
-  req.twilioUrl = `${proto}://${host}/api/webhook`;
-  next();
-});
+  const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
+  const host  = (req.headers['x-forwarded-host']  || req.headers.host || '').split(',')[0].trim();
+  // Use the *actual* path+query Twilio called (what it signs)
+  const path  = req.originalUrl || req.url || '/api/webhook';
+  req.twilioUrl = `${proto}://${host}${path}`;
+   next();
+ });
 
 // ---------- 8s Safety Timer ----------
 router.use((req, res, next) => {
@@ -116,7 +117,7 @@ router.use((req, res, next) => {
 });
 
 // ---------- Media Handler ----------
-router.post('/', async (req, res, next) => {
+router.post('*', async (req, res, next) => {
   const { n, url, type } = pickFirstMedia(req.body || {});
   if (n <= 0) return next();
 
@@ -171,7 +172,7 @@ router.post('/', async (req, res, next) => {
 });
 
 // ---------- TEXT ROUTING ----------
-router.post('/', async (req, res, next) => {
+router.post('*', async (req, res, next) => {
   try {
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();

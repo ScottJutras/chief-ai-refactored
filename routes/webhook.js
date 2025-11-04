@@ -199,14 +199,14 @@ router.post('*', async (req, res, next) => {
       looksTime ? 'timeclock' : null,
     ].filter(Boolean);
 
-    // Quick SOP fallbacks for "how do I use …" when a handler doesn't write a response
+    // SOP fallbacks (AVOID angle brackets in XML)
     const SOP = {
       tasks:
         'Tasks — Quick guide:\n' +
         '• Create: task - buy nails\n' +
         '• List mine: my tasks\n' +
         '• Complete: done #4\n' +
-        '• Assign: task @<phone> - pickup shingles\n' +
+        '• Assign: task @PHONE - pickup shingles\n' +   // ← no <phone>
         '• Due date: task - call client | due tomorrow 4pm',
       timeclock:
         'Timeclock — Quick guide:\n' +
@@ -231,7 +231,6 @@ router.post('*', async (req, res, next) => {
     if (looksTask && typeof tasksHandler === 'function') {
       const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
-        // Prefer handler text; else SOP if askingHow; else generic
         const msg = (typeof out === 'string' && out.trim())
           ? out.trim()
           : (askingHow ? SOP.tasks : 'Task handled.');

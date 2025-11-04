@@ -54,30 +54,42 @@ async function withClient(fn, { useTransaction = true } = {}) {
   } finally { client.release(); }
 }
 // ---------- Time Limits & Audit (tolerant) ----------
-// Simple anti-spam guard: limit time entries per user in a short window.
-// Keep it permissive for MVP; tighten later with config.
+// Anti-spam guard. If schema lacks created_by, fall back to owner-only window.
 async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  const actor = String(createdBy || owner).replace(/\D/g, '');
+  const window = Number(windowSec) || 30;
+
+  // Try with created_by; on error (e.g., missing column), fall back.
   try {
-    const owner = String(ownerId || '').replace(/\D/g, '');
-    const actor = String(createdBy || owner).replace(/\D/g, '');
     const { rows } = await query(
       `SELECT COUNT(*)::int AS n
          FROM public.time_entries
         WHERE owner_id=$1
           AND COALESCE(created_by,$2::text) = $2::text
           AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-      [owner, actor, windowSec]
+      [owner, actor, window]
     );
     const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec: window };
   } catch (e) {
-    console.warn('[PG] checkTimeEntryLimit failed:', e?.message);
-    // Fail-open to avoid blocking users if DB hiccups
-    return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+    console.warn('[PG] checkTimeEntryLimit fallback:', e?.message);
+    try {
+      const { rows } = await query(
+        `SELECT COUNT(*)::int AS n
+           FROM public.time_entries
+          WHERE owner_id=$1
+            AND created_at >= NOW() - ($2 || ' seconds')::interval`,
+        [owner, window]
+      );
+      const n = rows?.[0]?.n ?? 0;
+      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec: window };
+    } catch (e2) {
+      console.warn('[PG] checkTimeEntryLimit fail-open:', e2?.message);
+      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+    }
   }
 }
-
-
 
 // ---------- Simple utilities ----------
 const DIGITS = x => String(x || '').replace(/\D/g, '');

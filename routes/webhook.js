@@ -1,7 +1,8 @@
-// routes/webhook.js
+// routes/webhook.js (top-level snippet)
 const express = require('express');
 const app = express();
 const router = express.Router();
+  res.status(200).type('application/xml').send(`<Response><Message>${txt}</Message></Response>`);
 
 /* =========================
  * Small helpers
@@ -88,15 +89,38 @@ router.use((req, res, next) => {
 });
 
 /* =========================
- * Version fast-path (no DB, no handlers)
+ * Fast-path: version
  * =======================*/
 router.post('*', (req, res, next) => {
   const bodyText = String(req.body?.Body || '').trim().toLowerCase();
+
   if (bodyText === 'version') {
     const v = process.env.VERCEL_GIT_COMMIT_SHA || process.env.COMMIT_SHA || 'dev-local';
-    return ok(res, `build ${String(v).slice(0,7)} OK`);
+    return ok(res, `build ${String(v).slice(0, 7)} OK`);
   }
+
   return next();
+});
+
+/* =========================
+ * 8-second safety timer (prevents Twilio 11200)
+ * =======================*/
+router.use((req, res, next) => {
+  if (!res.locals._safety) {
+    res.locals._safety = setTimeout(() => {
+      if (!res.headersSent) {
+        console.warn('[WEBHOOK] 8s safety reply');
+        ok(res, 'OK');
+      }
+    }, 8000);
+
+    const clear = () => {
+      try { clearTimeout(res.locals._safety); } catch {}
+    };
+    res.on('finish', clear);
+    res.on('close', clear);
+  }
+  next();
 });
 
 /* =========================

@@ -1,23 +1,31 @@
-// api/webhook.js — tiny delegator (no express, no serverless-http)
-module.exports = (req, res) => {
-  // Instantly 200 for non-POST (Twilio GET probes / redirects)
+// api/webhook.js
+import express from 'express';
+const app = express();
+
+// MUST BE FIRST
+app.use(express.urlencoded({ extended: true })); // ← fixes Twilio signature
+app.use(express.json());
+
+// Export as .handler for Vercel
+module.exports.handler = (req, res) => {
+  // Handle Twilio GET probes / non-POST
   if (req.method !== 'POST') {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'application/xml');
     return res.end('<Response><Message>OK</Message></Response>');
   }
 
-  // Lazy load the real router only on POST (keeps cold start tiny)
-  let handler;
+  // Lazy-load real router
+  let router;
   try {
-    handler = require('../routes/webhook'); // must export a (req,res) handler
+    router = require('../routes/webhook');
   } catch (e) {
-    console.error('[WEBHOOK] router load failed:', e && e.message);
+    console.error('[WEBHOOK] Failed to load router:', e?.message);
     res.statusCode = 200;
     res.setHeader('Content-Type', 'application/xml');
-    return res.end('<Response><Message>Temporarily unavailable. Try again.</Message></Response>');
+    return res.end('<Response><Message>Service unavailable. Try again.</Message></Response>');
   }
 
-  // Hand off to the Express app handler exported by routes/webhook.js
-  return handler(req, res);
+  // Delegate to Express router
+  return router(req, res);
 };

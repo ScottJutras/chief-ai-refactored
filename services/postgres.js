@@ -53,28 +53,53 @@ async function withClient(fn, { useTransaction = true } = {}) {
     throw err;
   } finally { client.release(); }
 }
-// ---------- Time Limits & Audit (tolerant) ----------
-// Anti-spam guard. If schema lacks created_by, fall back to owner-only window.
+// ---------- Time Limits & Audit (schema-aware, tolerant) ----------
+
+// Cache whether public.time_entries has a created_by column
+let SUPPORTS_CREATED_BY = null; // null = unknown, true/false after first probe
+async function detectTimeEntriesCapabilities() {
+  if (SUPPORTS_CREATED_BY !== null) return SUPPORTS_CREATED_BY;
+  try {
+    const { rows } = await query(
+      `SELECT 1
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'time_entries'
+          AND column_name  = 'created_by'
+        LIMIT 1`
+    );
+    SUPPORTS_CREATED_BY = !!rows?.length;
+  } catch {
+    SUPPORTS_CREATED_BY = false; // fail-closed on capability detection
+  }
+  return SUPPORTS_CREATED_BY;
+}
+
+/**
+ * Anti-spam guard. If schema lacks created_by, fall back to owner-only window.
+ * Never throws. No warnings once schema is detected.
+ */
 async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   const actor = String(createdBy || owner).replace(/\D/g, '');
   const window = Number(windowSec) || 30;
 
-  // Try with created_by; on error (e.g., missing column), fall back.
+  // Probe once and cache
+  const hasCreatedBy = await detectTimeEntriesCapabilities();
+
   try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND COALESCE(created_by,$2::text) = $2::text
-          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-      [owner, actor, window]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec: window };
-  } catch (e) {
-    console.warn('[PG] checkTimeEntryLimit fallback:', e?.message);
-    try {
+    if (hasCreatedBy) {
+      const { rows } = await query(
+        `SELECT COUNT(*)::int AS n
+           FROM public.time_entries
+          WHERE owner_id=$1
+            AND COALESCE(created_by,$2::text) = $2::text
+            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+        [owner, actor, window]
+      );
+      const n = rows?.[0]?.n ?? 0;
+      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec: window };
+    } else {
       const { rows } = await query(
         `SELECT COUNT(*)::int AS n
            FROM public.time_entries
@@ -84,12 +109,13 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
       );
       const n = rows?.[0]?.n ?? 0;
       return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec: window };
-    } catch (e2) {
-      console.warn('[PG] checkTimeEntryLimit fail-open:', e2?.message);
-      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
     }
+  } catch {
+    // Fail-open to avoid blocking users if DB hiccups
+    return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
   }
 }
+
 
 // ---------- Simple utilities ----------
 const DIGITS = x => String(x || '').replace(/\D/g, '');

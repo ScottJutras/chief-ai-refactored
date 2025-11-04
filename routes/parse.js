@@ -8,7 +8,7 @@ const {
   parseJobMessage,
   parseQuoteMessage,
 } = require('../utils/aiErrorHandler');
-const { tokenMiddleware } = require('../middleware/token');
+const { tokenMiddleware } = require('../middleware/token'); // ← only this
 const { userProfileMiddleware } = require('../middleware/userProfile');
 const { errorMiddleware } = require('../middleware/error');
 
@@ -23,7 +23,7 @@ router.post(
     const { ownerId } = req;
 
     if (!input) return res.status(400).json({ error: 'Missing input' });
-    if (!['expense','revenue','bill','job','quote'].includes(type)) {
+    if (!['expense', 'revenue', 'bill', 'job', 'quote'].includes(type)) {
       return res.status(400).json({ error: 'Invalid type' });
     }
 
@@ -45,14 +45,16 @@ router.post(
 
     try {
       const { data, reply, confirmed } = await handleInputWithAI(ownerId, input, type, parseFn, defaultData);
-      console.log('[parse] success', { ownerId, type, input });
+      console.log('[parse] success', { ownerId, type, input: input.slice(0, 50) });
       res.json({ data, reply, confirmed });
-    } catch (e) {
-      console.error('[parse] error:', e?.message);
-      next(e);
+    } catch (error) {
+      // This will now be caught by errorMiddleware
+      next(error);
     }
-  },
-  errorMiddleware
+  }
 );
+
+// ← errorMiddleware must be LAST and have 4 args
+router.use(errorMiddleware);
 
 module.exports = router;

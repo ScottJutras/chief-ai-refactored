@@ -53,6 +53,31 @@ async function withClient(fn, { useTransaction = true } = {}) {
     throw err;
   } finally { client.release(); }
 }
+// ---------- Time Limits & Audit (tolerant) ----------
+// Simple anti-spam guard: limit time entries per user in a short window.
+// Keep it permissive for MVP; tighten later with config.
+async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
+  try {
+    const owner = String(ownerId || '').replace(/\D/g, '');
+    const actor = String(createdBy || owner).replace(/\D/g, '');
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND COALESCE(created_by,$2::text) = $2::text
+          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+      [owner, actor, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+  } catch (e) {
+    console.warn('[PG] checkTimeEntryLimit failed:', e?.message);
+    // Fail-open to avoid blocking users if DB hiccups
+    return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+  }
+}
+
+
 
 // ---------- Simple utilities ----------
 const DIGITS = x => String(x || '').replace(/\D/g, '');
@@ -317,6 +342,7 @@ module.exports = {
 
   // Time
   logTimeEntry,
+  checkTimeEntryLimit,
 
   // Exports
   exportTimesheetXlsx,

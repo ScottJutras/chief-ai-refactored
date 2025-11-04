@@ -5,6 +5,9 @@ const router = express.Router();
 const querystring = require('querystring');
 
 // ---------- Helpers ----------
+/* =========================
+ * Small helpers
+ * =======================*/
 const xml = (s = '') => `<Response><Message>${String(s)}</Message></Response>`;
 const ok = (res, text = 'OK') => {
   if (res.headersSent) return;
@@ -227,7 +230,9 @@ router.post('/', async (req, res, next) => {
   }
 });
 
-// ---------- Final fallback ----------
+/* =========================
+ * Final fallback – always return 200 TwiML if nothing else did
+ * =======================*/
 router.use((req, res, next) => {
   if (!res.headersSent) {
     console.warn('[WEBHOOK] fell-through fallback');
@@ -236,12 +241,16 @@ router.use((req, res, next) => {
   next();
 });
 
-// ---------- Error middleware ----------
+/* =========================
+ * Error middleware – tolerant (lazy load)
+ * =======================*/
 try {
   const { errorMiddleware } = require('../middleware/error');
   router.use(errorMiddleware);
-} catch { /* no-op */ }
+} catch { /* no-op – keep the webhook alive */ }
 
-// ---------- Export handler ----------
+/* =========================
+ * Export as plain Node handler (delegator consumes)
+ * =======================*/
 app.use('/', router);
 module.exports = (req, res) => app.handle(req, res);

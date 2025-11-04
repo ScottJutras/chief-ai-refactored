@@ -6,9 +6,9 @@ const app = express();
 app.use(express.urlencoded({ extended: true })); // ← fixes Twilio signature
 app.use(express.json());
 
-// Export as .handler for Vercel
+// Export as .handler
 module.exports.handler = (req, res) => {
-  // Handle Twilio GET probes / non-POST
+  // Handle non-POST (Twilio probes)
   if (req.method !== 'POST') {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'application/xml');
@@ -26,6 +26,6 @@ module.exports.handler = (req, res) => {
     return res.end('<Response><Message>Service unavailable. Try again.</Message></Response>');
   }
 
-  // Delegate to Express router
+  // Delegate
   return router(req, res);
 };

@@ -295,6 +295,8 @@ async function exportTimesheetPdf(opts) {
   return { url: `${base}/exports/${id}`, id, filename };
 }
 
+// ... keep everything above as-is ...
+
 // ---------- Export everything ----------
 module.exports = {
   pool, query, queryWithTimeout, withClient,
@@ -303,9 +305,20 @@ module.exports = {
   ensureJobByName, resolveJobContext,
   createTaskWithJob, logTimeEntryWithJob,
   generateOTP, verifyOTP,
+
+  // Users
   createUserProfile, saveUserProfile, getUserProfile, getOwnerProfile,
+
+  // Compat alias so middleware expecting getUserBasic keeps working
+  getUserBasic: getUserProfile,
+
+  // Tasks
   createTask, getTaskByNo,
+
+  // Time
   logTimeEntry,
+
+  // Exports
   exportTimesheetXlsx,
   exportTimesheetPdf,
   // …add any other helpers you already export (listMyTasks, etc.)

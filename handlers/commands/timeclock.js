@@ -156,11 +156,42 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
       }
     }
 
-    // Timesheet (MVP placeholder)
-    if (isTimesheet) {
-      // Future: generate link to XLSX/PDF export once UX finalized.
-      return reply('Timesheet (week) is coming soon. For now, use: timesheet export in the dashboard.');
-    }
+    // Timesheet (XLSX export link)
+if (isTimesheet) {
+  try {
+    const tz = userProfile?.tz || userProfile?.timezone || 'America/Toronto';
+
+    // Compute week window (Mon–Sun in user tz)
+    const now = new Date();
+    // Normalize to local midnight by tz using simple ISO trick (good enough for MVP)
+    const localMidnight = new Date(
+      new Date(now).toLocaleString('en-CA', { timeZone: tz })
+        .replace(/,.*$/, '') // drop time
+    );
+    // JS Sun=0..Sat=6 → make Mon=0..Sun=6
+    const dow = (localMidnight.getDay() + 6) % 7;
+    const monday = new Date(localMidnight); monday.setDate(localMidnight.getDate() - dow);
+    const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+
+    const startIso = new Date(monday.getTime()).toISOString().slice(0, 10) + 'T00:00:00.000Z';
+    const endIso   = new Date(sunday.getTime()).toISOString().slice(0, 10) + 'T23:59:59.999Z';
+
+    // Generate XLSX, store in file_exports, get public URL
+    const { url, filename } = await pg.exportTimesheetXlsx({
+      ownerId,
+      startIso,
+      endIso,
+      employeeName: (userProfile?.name || from),
+      tz,
+    });
+
+    return `Timesheet ready: ${url}\n(${filename})`;
+  } catch (e) {
+    console.warn('[timeclock] timesheet export failed:', e?.message);
+    return 'Couldn’t build timesheet right now. Try again later.';
+  }
+}
+
 
     // Fallback SOP
     return reply(SOP_TIMECLOCK);

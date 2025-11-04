@@ -8,11 +8,23 @@ const router = express.Router();
 const querystring = require('querystring');
 
 // ---------- Helpers ----------
-const xml = (s = '') => `<Response><Message>${String(s)}</Message></Response>`;
+/* =========================
+ * Small helpers
+ * =======================*/
+function xmlEsc(s = '') {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+const xml = (s = '') => `<Response><Message>${xmlEsc(s)}</Message></Response>`;
+
 const ok = (res, text = 'OK') => {
   if (res.headersSent) return;
-  res.status(200).type('application/xml').send(xml(text));
+  res.status(200).type('application/xml; charset=utf-8').send(xml(text));
 };
+
 const normalizePhone = (raw = '') =>
   String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
 
@@ -26,7 +38,7 @@ function pickFirstMedia(body = {}) {
 
 function canUseAgent(profile) {
   const tier = (profile?.subscription_tier || profile?.plan || '').toLowerCase();
-  return tier && tier !== 'basic' && tier !== 'free';
+  return !!tier && tier !== 'basic' && tier !== 'free';
 }
 
 // ---------- Raw body parser (Twilio signature needs original payload) ----------

@@ -53,6 +53,18 @@ async function withClient(fn, { useTransaction = true } = {}) {
     throw err;
   } finally { client.release(); }
 }
+// ---------- File Exports (fetch) ----------
+async function getFileExport(id) {
+  const { rows } = await query(
+    `SELECT filename, content_type, bytes
+       FROM public.file_exports
+      WHERE id = $1
+      LIMIT 1`,
+    [String(id)]
+  );
+  return rows[0] || null;
+}
+
 // ---------- Time Limits & Audit (schema-aware, tolerant) ----------
 
 // Cache whether public.time_entries has a created_by column
@@ -386,5 +398,6 @@ module.exports = {
   // Exports
   exportTimesheetXlsx,
   exportTimesheetPdf,
+  getFileExport,
   // …add any other helpers you already export (listMyTasks, etc.)
 };

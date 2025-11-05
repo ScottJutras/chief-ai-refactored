@@ -179,7 +179,7 @@ async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz,
   }
 }
 
-// ---------- Time (resilient INSERT + debug) ----------
+// ---------- Time (resilient INSERT: ALWAYS include user_id if column exists) ----------
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
@@ -188,11 +188,16 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   const ownerDigits = String(ownerId ?? '').replace(/\D/g, '');
   const actorDigits = String(extras?.requester_id ?? ownerId ?? '').replace(/\D/g, '');
 
-  // Hard fallbacks so we never pass NULL
+  // Never pass NULLs to NOT NULL columns
   const ownerSafe = ownerDigits || actorDigits || '0';
   const actorSafe = actorDigits || ownerDigits || '0';
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
+
+  // Ensure capability flags are populated (cached)
+  if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null) {
+    try { await detectTimeEntriesCapabilities(); } catch {}
+  }
 
   async function insertWith({ includeUserId, includeCreatedBy }) {
     const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
@@ -201,24 +206,21 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
     if (includeUserId)    { cols.push('user_id');    vals.push(actorSafe); }
     if (includeCreatedBy) { cols.push('created_by'); vals.push(actorSafe); }
 
+    // Append created_at (NOW()) as the last column (no param)
     cols.push('created_at');
-    const placeholders = cols.map((_, i) => (i < vals.length ? `$${i + 1}` : 'NOW()'));
+
+    // Param placeholders for all values, then NOW() for created_at
+    const placeholders = vals.map((_, i) => `$${i + 1}`).concat('NOW()');
 
     const sql = `
       INSERT INTO public.time_entries (${cols.join(', ')})
       VALUES (${placeholders.join(', ')})
       RETURNING id`;
 
-    console.info('[PG/logTimeEntry] cols=', cols, 'vals(sample)=', {
-      owner_id: vals[0],
-      employee_name: vals[1],
-      type: vals[2],
-      timestamp: vals[3],
-      job_no: vals[4],
-      tz: vals[5],
-      local_time: vals[6],
-      user_id: includeUserId ? actorSafe : undefined,
-      created_by: includeCreatedBy ? actorSafe : undefined,
+    console.info('[PG/logTimeEntry] executing', {
+      cols,
+      user_id: includeUserId ? actorSafe : 'SKIP',
+      created_by: includeCreatedBy ? actorSafe : 'SKIP'
     });
 
     const { rows } = await query(sql, vals);
@@ -226,44 +228,33 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   }
 
   try {
-    // Try both columns first
-    return await insertWith({ includeUserId: true, includeCreatedBy: true });
-  } catch (e1) {
-    const msg = String(e1?.message || '').toLowerCase();
-    console.error('[PG/logTimeEntry] first attempt failed:', msg);
+    // Fast paths based on detected capabilities (user_id first because it's NOT NULL in your schema)
+    if (SUPPORTS_USER_ID && SUPPORTS_CREATED_BY) {
+      return await insertWith({ includeUserId: true, includeCreatedBy: true });
+    }
+    if (SUPPORTS_USER_ID) {
+      return await insertWith({ includeUserId: true, includeCreatedBy: false });
+    }
+    if (SUPPORTS_CREATED_BY) {
+      return await insertWith({ includeUserId: false, includeCreatedBy: true });
+    }
+    // Legacy schema (neither column)
+    return await insertWith({ includeUserId: false, includeCreatedBy: false });
 
-    if (msg.includes('column "user_id" does not exist')) {
-      try {
-        // Retry without user_id, keep created_by
-        return await insertWith({ includeUserId: false, includeCreatedBy: true });
-      } catch (e2) {
-        const msg2 = String(e2?.message || '').toLowerCase();
-        console.error('[PG/logTimeEntry] retry (no user_id) failed:', msg2);
-        if (msg2.includes('column "created_by" does not exist')) {
-          // Final retry: neither column
-          return await insertWith({ includeUserId: false, includeCreatedBy: false });
-        }
-        throw e2;
-      }
+  } catch (e) {
+    const msg = String(e?.message || '').toLowerCase();
+    console.error('[PG/logTimeEntry] insert failed:', msg);
+
+    // Update caches if we learned something new
+    if (msg.includes('column "user_id" does not exist'))      SUPPORTS_USER_ID = false;
+    if (msg.includes('column "created_by" does not exist'))   SUPPORTS_CREATED_BY = false;
+
+    // If DB complains about NULL user_id, surface a clear error (requester_id missing)
+    if (msg.includes('null value in column "user_id"')) {
+      throw new Error('[PG] user_id is NOT NULL but no value provided. Ensure requester_id is set.');
     }
 
-    if (msg.includes('column "created_by" does not exist')) {
-      try {
-        // Retry without created_by, keep user_id
-        return await insertWith({ includeUserId: true, includeCreatedBy: false });
-      } catch (e3) {
-        const msg3 = String(e3?.message || '').toLowerCase();
-        console.error('[PG/logTimeEntry] retry (no created_by) failed:', msg3);
-        if (msg3.includes('column "user_id" does not exist')) {
-          // Final retry: neither column
-          return await insertWith({ includeUserId: false, includeCreatedBy: false });
-        }
-        throw e3;
-      }
-    }
-
-    // Different error — do NOT try a path without user_id (prevents NOT NULL violation)
-    throw e1;
+    throw e;
   }
 }
 

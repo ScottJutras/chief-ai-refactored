@@ -97,45 +97,47 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
   const owner = String(ownerId || '').replace(/\D/g, '');
   const actor = String(createdBy || owner).replace(/\D/g, '');
 
-  // Detect available columns
-  let caps = { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
-  if (caps.SUPPORTS_CREATED_BY === null || caps.SUPPORTS_USER_ID === null) {
-    caps = await detectTimeEntriesCapabilities().catch(() => ({
-      SUPPORTS_CREATED_BY: false,
-      SUPPORTS_USER_ID: false,
-    }));
+  // Prefer per-actor (user_id) if available
+  try {
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND user_id=$2
+          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+      [owner, actor, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+  } catch (eUser) {
+    const msg = String(eUser?.message || '').toLowerCase();
+    if (!msg.includes('column "user_id" does not exist')) {
+      // If it's some other DB error, fail-open
+      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+    }
   }
 
+  // Fallback to created_by if user_id missing
   try {
-    if (caps.SUPPORTS_USER_ID) {
-      // Most precise: per-actor via user_id
-      const { rows } = await query(
-        `SELECT COUNT(*)::int AS n
-           FROM public.time_entries
-          WHERE owner_id=$1
-            AND user_id=$2
-            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-        [owner, actor, windowSec]
-      );
-      const n = rows?.[0]?.n ?? 0;
-      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND COALESCE(created_by,$2::text) = $2::text
+          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+      [owner, actor, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+  } catch (eCreated) {
+    const msg = String(eCreated?.message || '').toLowerCase();
+    if (!msg.includes('column "created_by" does not exist')) {
+      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
     }
+  }
 
-    if (caps.SUPPORTS_CREATED_BY) {
-      // Fallback: per-actor via created_by
-      const { rows } = await query(
-        `SELECT COUNT(*)::int AS n
-           FROM public.time_entries
-          WHERE owner_id=$1
-            AND COALESCE(created_by,$2::text) = $2::text
-            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-        [owner, actor, windowSec]
-      );
-      const n = rows?.[0]?.n ?? 0;
-      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-    }
-
-    // Last resort: per-owner only
+  // Last resort: per-owner window
+  try {
     const { rows } = await query(
       `SELECT COUNT(*)::int AS n
          FROM public.time_entries
@@ -146,12 +148,12 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
     const n = rows?.[0]?.n ?? 0;
     return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
   } catch {
-    // Fail-open to avoid blocking users if DB hiccups
     return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
   }
 }
 
-// ---------- Time (schema-aware INSERT for user_id & created_by) ----------
+
+// ---------- Time (resilient INSERT: try user_id/created_by, retry if columns missing) ----------
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
@@ -166,31 +168,60 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  // Detect available columns
-  const caps = await detectTimeEntriesCapabilities().catch(() => ({
-    SUPPORTS_CREATED_BY: false,
-    SUPPORTS_USER_ID: false,
-  }));
+  // Helper to assemble and run an INSERT with chosen extra cols
+  async function insertWith({ includeUserId, includeCreatedBy }) {
+    const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
+    const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
 
-  // Build dynamic INSERT
-  const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
-  const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
+    if (includeUserId)    { cols.push('user_id');    vals.push(actorSafe); }
+    if (includeCreatedBy) { cols.push('created_by'); vals.push(actorSafe); }
 
-  if (caps.SUPPORTS_USER_ID)    { cols.push('user_id');    vals.push(actorSafe); }
-  if (caps.SUPPORTS_CREATED_BY) { cols.push('created_by'); vals.push(actorSafe); }
+    cols.push('created_at');
+    const placeholders = cols.map((_, i) => (i < vals.length ? `$${i + 1}` : 'NOW()'));
 
-  cols.push('created_at');
-  const placeholders = cols.map((_, i) => (i < vals.length ? `$${i + 1}` : 'NOW()'));
+    const sql = `
+      INSERT INTO public.time_entries (${cols.join(', ')})
+      VALUES (${placeholders.join(', ')})
+      RETURNING id`;
 
-  const sql = `
-    INSERT INTO public.time_entries (${cols.join(', ')})
-    VALUES (${placeholders.join(', ')})
-    RETURNING id`;
+    const { rows } = await query(sql, vals);
+    return rows[0].id;
+  }
 
-  const { rows } = await query(sql, vals);
-  return rows[0].id;
+  // Try the most complete shape first; then gracefully degrade
+  try {
+    return await insertWith({ includeUserId: true, includeCreatedBy: true });
+  } catch (e1) {
+    const msg = String(e1?.message || '').toLowerCase();
+    if (msg.includes('column "user_id" does not exist')) {
+      try {
+        // Retry without user_id, keep created_by
+        return await insertWith({ includeUserId: false, includeCreatedBy: true });
+      } catch (e2) {
+        const msg2 = String(e2?.message || '').toLowerCase();
+        if (msg2.includes('column "created_by" does not exist')) {
+          // Retry without either column
+          return await insertWith({ includeUserId: false, includeCreatedBy: false });
+        }
+        throw e2;
+      }
+    }
+    if (msg.includes('column "created_by" does not exist')) {
+      try {
+        // Retry without created_by, keep user_id
+        return await insertWith({ includeUserId: true, includeCreatedBy: false });
+      } catch (e3) {
+        const msg3 = String(e3?.message || '').toLowerCase();
+        if (msg3.includes('column "user_id" does not exist')) {
+          // Retry without either column
+          return await insertWith({ includeUserId: false, includeCreatedBy: false });
+        }
+        throw e3;
+      }
+    }
+    throw e1; // different error — bubble up
+  }
 }
-
 
 
 // ---------- Simple utilities ----------

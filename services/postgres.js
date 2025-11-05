@@ -2,6 +2,7 @@
 // ------------------------------------------------------------
 // Central Postgres service – pool, retry, helpers, lazy heavy deps
 // ------------------------------------------------------------
+
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
@@ -53,16 +54,6 @@ async function withClient(fn, { useTransaction = true } = {}) {
     throw err;
   } finally { client.release(); }
 }
-// Run detection ONCE at startup
-detectTimeEntriesCapabilities().then(() => {
-  console.info('[PG] time_entries schema ready:', { SUPPORTS_USER_ID, SUPPORTS_CREATED_BY });
-}).catch(() => {
-  console.warn('[PG] schema detection failed — defaulting to safe mode');
-  SUPPORTS_USER_ID = false;
-  SUPPORTS_CREATED_BY = false;
-});
-
-
 // ---------- File Exports (fetch) ----------
 async function getFileExport(id) {
   const { rows } = await query(
@@ -86,7 +77,7 @@ async function detectTimeEntriesCapabilities() {
     return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
   }
   try {
-    const { rows } = await query(
+    const { rows } = await queryWithRetry(
       `SELECT column_name
          FROM information_schema.columns
         WHERE table_schema = 'public'
@@ -94,55 +85,70 @@ async function detectTimeEntriesCapabilities() {
     );
     const names = new Set(rows.map(r => String(r.column_name).toLowerCase()));
     SUPPORTS_CREATED_BY = names.has('created_by');
-    SUPPORTS_USER_ID    = names.has('user_id');
-  } catch {
-    // Conservative defaults if detection fails
-    SUPPORTS_CREATED_BY = false;
-    SUPPORTS_USER_ID    = false;
+    SUPPORTS_USER_ID = names.has('user_id');
+    console.info('[PG] detection success:', { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID });
+  } catch (e) {
+    console.warn('[PG] detection error:', e?.message);
+    throw e;
   }
   return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
 }
+
+// Run detection ONCE at startup — no set on fail
+detectTimeEntriesCapabilities().then(() => {
+  console.info('[PG] time_entries schema ready:', { SUPPORTS_USER_ID, SUPPORTS_CREATED_BY });
+}).catch(e => {
+  console.warn('[PG] startup schema detection failed:', e?.message);
+  // Leave null — functions will retry
+});
 
 async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   const actor = String(createdBy || owner).replace(/\D/g, '');
 
-  // Prefer per-actor (user_id) if available
-  try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND user_id=$2
-          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-      [owner, actor, windowSec]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-  } catch (eUser) {
-    const msg = String(eUser?.message || '').toLowerCase();
-    if (!msg.includes('column "user_id" does not exist')) {
-      // If it's some other DB error, fail-open
-      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+  // Prefer per-actor (user_id) if supported
+  if (SUPPORTS_USER_ID) {
+    try {
+      const { rows } = await query(
+        `SELECT COUNT(*)::int AS n
+           FROM public.time_entries
+          WHERE owner_id=$1
+            AND user_id=$2
+            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+        [owner, actor, windowSec]
+      );
+      const n = rows?.[0]?.n ?? 0;
+      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+    } catch (eUser) {
+      const msg = String(eUser?.message || '').toLowerCase();
+      if (msg.includes('column "user_id" does not exist')) {
+        SUPPORTS_USER_ID = false; // Update cache
+      } else {
+        return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+      }
     }
   }
 
-  // Fallback to created_by if user_id missing
-  try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND COALESCE(created_by,$2::text) = $2::text
-          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-      [owner, actor, windowSec]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-  } catch (eCreated) {
-    const msg = String(eCreated?.message || '').toLowerCase();
-    if (!msg.includes('column "created_by" does not exist')) {
-      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+  // Fallback to created_by if supported
+  if (SUPPORTS_CREATED_BY) {
+    try {
+      const { rows } = await query(
+        `SELECT COUNT(*)::int AS n
+           FROM public.time_entries
+          WHERE owner_id=$1
+            AND COALESCE(created_by,$2::text) = $2::text
+            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+        [owner, actor, windowSec]
+      );
+      const n = rows?.[0]?.n ?? 0;
+      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+    } catch (eCreated) {
+      const msg = String(eCreated?.message || '').toLowerCase();
+      if (msg.includes('column "created_by" does not exist')) {
+        SUPPORTS_CREATED_BY = false; // Update cache
+      } else {
+        return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+      }
     }
   }
 
@@ -179,53 +185,43 @@ async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz,
     console.warn('[PG/logTimeEntryWithJob] job resolve failed:', e?.message);
   }
 
-  // Always delegate to the resilient writer so user_id/created_by are included
-  try {
-    const id = await logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras);
-    return id;
-  } catch (e) {
-    console.error('[PG/logTimeEntryWithJob] insert failed:', e?.message);
-    throw e;
-  }
+  // Delegate to resilient writer
+  return await logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras);
 }
 
-// ---------- Time (FORCE user_id if exists; resilient) ----------
+// ---------- Time (resilient INSERT: user_id ALWAYS bound if exists) ----------
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
 
-  // Normalize identifiers (digits only)
   const ownerDigits = String(ownerId ?? '').replace(/\D/g, '');
   const actorDigits = String(extras?.requester_id ?? ownerId ?? '').replace(/\D/g, '');
 
-  // Never let these be null
   const ownerSafe = ownerDigits || actorDigits || '0';
-  const actorSafe = actorDigits || ownerDigits || '0';
+  const actorSafe = actorDigits || ownerDigits || '0'; // NEVER NULL
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  // Ensure detection has run at least once
+  // Ensure detection (retry on null)
   if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null) {
-    try { await detectTimeEntriesCapabilities(); } catch {}
+    await detectTimeEntriesCapabilities().catch(e => console.error('[PG/logTimeEntry] detection failed:', e?.message));
   }
 
-  // Build column/value lists
   const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
-  const vals = [ownerSafe, employeeName,        type,  tsIso,       jobNo,   zone,  local];
+  const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
 
-  // FORCE user_id if the column exists
+  // FORCE user_id if column exists
   if (SUPPORTS_USER_ID) {
     cols.push('user_id');
     vals.push(actorSafe);
   }
 
-  // Optional: created_by if present
+  // Optional: created_by
   if (SUPPORTS_CREATED_BY) {
     cols.push('created_by');
     vals.push(actorSafe);
   }
 
-  // created_at is always NOW()
   cols.push('created_at');
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
 
@@ -234,33 +230,21 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
     VALUES (${placeholders})
     RETURNING id`;
 
-  console.info('[PG/logTimeEntry] FINAL SQL shape', {
+  console.info('[PG/logTimeEntry] EXECUTING', {
     cols,
-    hasUserId: SUPPORTS_USER_ID,
-    hasCreatedBy: SUPPORTS_CREATED_BY,
-    actorSafe
+    vals: [...vals, 'NOW()'],
+    actorSafe,
+    sql: sql.replace(/\s+/g, ' ').slice(0, 300)
   });
 
   try {
     const { rows } = await query(sql, vals);
     return rows[0].id;
   } catch (e) {
-    const msg = String(e?.message || '').toLowerCase();
-    console.error('[PG/logTimeEntry] INSERT failed:', msg);
-
-    // Update cache flags on structural errors
-    if (msg.includes('column "user_id" does not exist')) SUPPORTS_USER_ID = false;
-    if (msg.includes('column "created_by" does not exist')) SUPPORTS_CREATED_BY = false;
-
-    // If user_id is NOT NULL and we somehow skipped it, fail loudly
-    if (msg.includes('null value in column "user_id"')) {
-      throw new Error(`[PG] user_id required but not inserted (actorSafe='${actorSafe}', SUPPORTS_USER_ID=${SUPPORTS_USER_ID}).`);
-    }
-
+    console.error('[PG/logTimeEntry] FAILED:', e?.message);
     throw e;
   }
 }
-
 
 // ---------- Simple utilities ----------
 const DIGITS = x => String(x || '').replace(/\D/g, '');
@@ -321,11 +305,6 @@ async function createTaskWithJob(opts) {
   opts.jobNo = job?.job_no || null;
   return await createTask(opts);
 }
-async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras) {
-  const job = await resolveJobContext(ownerId, { explicitJobName: jobName });
-  return await logTimeEntry(ownerId, employeeName, type, ts, job?.job_no || null, tz, extras);
-}
-
 
 // ---------- OTP ----------
 async function generateOTP(userId) {
@@ -406,51 +385,6 @@ async function getTaskByNo(ownerId, taskNo) {
   );
   return rows[0] || null;
 }
-
-// ---------- Time (schema-aware INSERT for created_by) ----------
-
-// Reuse the capability probe if you already added it above.
-// If not present yet, include the detectTimeEntriesCapabilities() function
-// from the limiter section. We assume SUPPORTS_CREATED_BY is shared.
-
-/**
- * Insert a time entry, tolerating schemas without created_by.
- * Never throws because of a missing created_by column.
- */
-async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
-  const tsIso = new Date(ts).toISOString();
-
-  // Ensure the capability flag is populated (cached)
-  if (typeof SUPPORTS_CREATED_BY === 'undefined' || SUPPORTS_CREATED_BY === null) {
-    await detectTimeEntriesCapabilities().catch(() => { SUPPORTS_CREATED_BY = false; });
-  }
-
-  const owner = String(ownerId || '').replace(/\D/g, '');
-  const local = formatInTimeZone(tsIso, tz || 'America/Toronto', 'yyyy-MM-dd HH:mm:ss');
-
-  if (SUPPORTS_CREATED_BY) {
-    // Schema WITH created_by
-    const { rows } = await query(
-      `INSERT INTO public.time_entries
-         (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_by, created_at)
-       VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,NOW())
-       RETURNING id`,
-      [owner, employeeName, type, tsIso, jobNo, tz, local, extras.requester_id || null]
-    );
-    return rows[0].id;
-  } else {
-    // Schema WITHOUT created_by
-    const { rows } = await query(
-      `INSERT INTO public.time_entries
-         (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_at)
-       VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,NOW())
-       RETURNING id`,
-      [owner, employeeName, type, tsIso, jobNo, tz, local]
-    );
-    return rows[0].id;
-  }
-}
-
 
 // ---------- EXCEL EXPORT (lazy load) ----------
 async function exportTimesheetXlsx(opts) {
@@ -535,60 +469,37 @@ async function exportTimesheetPdf(opts) {
   return { url: `${base}/exports/${id}`, id, filename };
 }
 
-
 // ---- Safe limiter exports (avoid undefined symbol at module.exports time)
 const __checkLimit =
   (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
   (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
 
-// Detect time_entries capabilities once at startup (cache flags)
-(async () => {
-  try {
-    const caps = await detectTimeEntriesCapabilities();
-    console.info('[PG] time_entries schema detected:', caps);
-  } catch (e) {
-    console.warn('[PG] schema detect failed, safe defaults', e?.message);
-    // Prefer safe defaults that match your current schema (user_id NOT NULL)
-    SUPPORTS_USER_ID = true;
-    SUPPORTS_CREATED_BY = false;
-  }
-})();
-
 module.exports = {
   // Core
-  pool,
-  query,
-  queryWithTimeout,
-  withClient,
+  pool, query, queryWithTimeout, withClient,
   normalizePhoneNumber: x => DIGITS(x),
-  toAmount,
-  isValidIso,
+  toAmount, isValidIso,
 
   // Jobs / context
-  ensureJobByName,
-  resolveJobContext,
-  createTaskWithJob,
-  logTimeEntryWithJob,
+  ensureJobByName, resolveJobContext,
+  createTaskWithJob, logTimeEntryWithJob,
 
   // Users
-  generateOTP,
-  verifyOTP,
-  createUserProfile,
-  saveUserProfile,
-  getUserProfile,
-  getOwnerProfile,
+  generateOTP, verifyOTP,
+  createUserProfile, saveUserProfile, getUserProfile, getOwnerProfile,
 
   // Tasks
-  createTask,
-  getTaskByNo,
+  createTask, getTaskByNo,
 
   // Time
   logTimeEntry,
-  checkTimeEntryLimit: __checkLimit, // safe export
-  checkActorLimit: __checkLimit,     // compat alias
+  checkTimeEntryLimit: __checkLimit, // <= safe export
+  checkActorLimit: __checkLimit,     // <= compat alias
 
   // Exports
   exportTimesheetXlsx,
   exportTimesheetPdf,
   getFileExport,
+
+  // …add any other helpers you already export (listMyTasks, etc.)
 };

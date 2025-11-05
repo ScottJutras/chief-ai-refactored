@@ -87,47 +87,42 @@ async function detectTimeEntriesCapabilities() {
   return SUPPORTS_CREATED_BY;
 }
 
-
-/**
- * Anti-spam guard. If schema lacks created_by, fall back to owner-only window.
- * Never throws. No warnings once schema is detected.
- */
-async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
+// ---------- Time (schema-aware INSERT for created_by) ----------
+async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
+  const tsIso = new Date(ts).toISOString();
   const owner = String(ownerId || '').replace(/\D/g, '');
-  const actor = String(createdBy || owner).replace(/\D/g, '');
-  const window = Number(windowSec) || 30;
+  const zone = tz || 'America/Toronto';
 
-  // Probe once and cache
-  const hasCreatedBy = await detectTimeEntriesCapabilities();
+  // Ensure the capability flag is populated (cached)
+  if (SUPPORTS_CREATED_BY === null) {
+    await detectTimeEntriesCapabilities().catch(() => { SUPPORTS_CREATED_BY = false; });
+  }
 
-  try {
-    if (hasCreatedBy) {
-      const { rows } = await query(
-        `SELECT COUNT(*)::int AS n
-           FROM public.time_entries
-          WHERE owner_id=$1
-            AND COALESCE(created_by,$2::text) = $2::text
-            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-        [owner, actor, window]
-      );
-      const n = rows?.[0]?.n ?? 0;
-      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec: window };
-    } else {
-      const { rows } = await query(
-        `SELECT COUNT(*)::int AS n
-           FROM public.time_entries
-          WHERE owner_id=$1
-            AND created_at >= NOW() - ($2 || ' seconds')::interval`,
-        [owner, window]
-      );
-      const n = rows?.[0]?.n ?? 0;
-      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec: window };
-    }
-  } catch {
-    // Fail-open to avoid blocking users if DB hiccups
-    return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+  const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
+
+  if (SUPPORTS_CREATED_BY) {
+    // Schema WITH created_by
+    const { rows } = await query(
+      `INSERT INTO public.time_entries
+         (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_by, created_at)
+       VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,NOW())
+       RETURNING id`,
+      [owner, employeeName, type, tsIso, jobNo, zone, local, extras.requester_id || null]
+    );
+    return rows[0].id;
+  } else {
+    // Schema WITHOUT created_by
+    const { rows } = await query(
+      `INSERT INTO public.time_entries
+         (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_at)
+       VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,NOW())
+       RETURNING id`,
+      [owner, employeeName, type, tsIso, jobNo, zone, local]
+    );
+    return rows[0].id;
   }
 }
+
 
 
 // ---------- Simple utilities ----------

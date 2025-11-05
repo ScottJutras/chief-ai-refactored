@@ -189,62 +189,78 @@ async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz,
   }
 }
 
-// ---------- Time (FINAL: user_id ALWAYS bound if exists) ----------
+// ---------- Time (FORCE user_id if exists; resilient) ----------
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
 
+  // Normalize identifiers (digits only)
   const ownerDigits = String(ownerId ?? '').replace(/\D/g, '');
   const actorDigits = String(extras?.requester_id ?? ownerId ?? '').replace(/\D/g, '');
 
+  // Never let these be null
   const ownerSafe = ownerDigits || actorDigits || '0';
   const actorSafe = actorDigits || ownerDigits || '0';
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  // Ensure detection
+  // Ensure detection has run at least once
   if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null) {
-    await detectTimeEntriesCapabilities().catch(() => {});
+    try { await detectTimeEntriesCapabilities(); } catch {}
   }
 
-  // Build columns and values
+  // Build column/value lists
   const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
-  const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
+  const vals = [ownerSafe, employeeName,        type,  tsIso,       jobNo,   zone,  local];
 
+  // FORCE user_id if the column exists
   if (SUPPORTS_USER_ID) {
     cols.push('user_id');
     vals.push(actorSafe);
   }
 
+  // Optional: created_by if present
   if (SUPPORTS_CREATED_BY) {
     cols.push('created_by');
     vals.push(actorSafe);
   }
 
+  // created_at is always NOW()
   cols.push('created_at');
+  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
 
-  // ALL values are bound — NOW() is NOT a placeholder
-  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
   const sql = `
     INSERT INTO public.time_entries (${cols.join(', ')})
-    VALUES (${placeholders}, NOW())
+    VALUES (${placeholders})
     RETURNING id`;
 
-  console.info('[PG/logTimeEntry] FINAL INSERT', {
+  console.info('[PG/logTimeEntry] FINAL SQL shape', {
     cols,
-    vals: [...vals, 'NOW()'],
-    actorSafe,
-    sql: sql.replace(/\s+/g, ' ').slice(0, 300)
+    hasUserId: SUPPORTS_USER_ID,
+    hasCreatedBy: SUPPORTS_CREATED_BY,
+    actorSafe
   });
 
   try {
     const { rows } = await query(sql, vals);
     return rows[0].id;
   } catch (e) {
-    console.error('[PG/logTimeEntry] FAILED:', e?.message);
+    const msg = String(e?.message || '').toLowerCase();
+    console.error('[PG/logTimeEntry] INSERT failed:', msg);
+
+    // Update cache flags on structural errors
+    if (msg.includes('column "user_id" does not exist')) SUPPORTS_USER_ID = false;
+    if (msg.includes('column "created_by" does not exist')) SUPPORTS_CREATED_BY = false;
+
+    // If user_id is NOT NULL and we somehow skipped it, fail loudly
+    if (msg.includes('null value in column "user_id"')) {
+      throw new Error(`[PG] user_id required but not inserted (actorSafe='${actorSafe}', SUPPORTS_USER_ID=${SUPPORTS_USER_ID}).`);
+    }
+
     throw e;
   }
 }
+
 
 // ---------- Simple utilities ----------
 const DIGITS = x => String(x || '').replace(/\D/g, '');

@@ -82,10 +82,11 @@ async function detectTimeEntriesCapabilities() {
     );
     SUPPORTS_CREATED_BY = !!rows?.length;
   } catch {
-    SUPPORTS_CREATED_BY = false; // fail-closed on capability detection
+    SUPPORTS_CREATED_BY = false; // conservative default
   }
   return SUPPORTS_CREATED_BY;
 }
+
 
 /**
  * Anti-spam guard. If schema lacks created_by, fall back to owner-only window.
@@ -273,19 +274,50 @@ async function getTaskByNo(ownerId, taskNo) {
   return rows[0] || null;
 }
 
-// ---------- Time ----------
+// ---------- Time (schema-aware INSERT for created_by) ----------
+
+// Reuse the capability probe if you already added it above.
+// If not present yet, include the detectTimeEntriesCapabilities() function
+// from the limiter section. We assume SUPPORTS_CREATED_BY is shared.
+
+/**
+ * Insert a time entry, tolerating schemas without created_by.
+ * Never throws because of a missing created_by column.
+ */
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
-  const local = formatInTimeZone(tsIso, tz, 'yyyy-MM-dd HH:mm:ss');
-  const { rows } = await query(
-    `INSERT INTO public.time_entries
-       (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_by, created_at)
-     VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,NOW())
-     RETURNING id`,
-    [DIGITS(ownerId), employeeName, type, tsIso, jobNo, tz, local, extras.requester_id || null]
-  );
-  return rows[0].id;
+
+  // Ensure the capability flag is populated (cached)
+  if (typeof SUPPORTS_CREATED_BY === 'undefined' || SUPPORTS_CREATED_BY === null) {
+    await detectTimeEntriesCapabilities().catch(() => { SUPPORTS_CREATED_BY = false; });
+  }
+
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  const local = formatInTimeZone(tsIso, tz || 'America/Toronto', 'yyyy-MM-dd HH:mm:ss');
+
+  if (SUPPORTS_CREATED_BY) {
+    // Schema WITH created_by
+    const { rows } = await query(
+      `INSERT INTO public.time_entries
+         (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_by, created_at)
+       VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,NOW())
+       RETURNING id`,
+      [owner, employeeName, type, tsIso, jobNo, tz, local, extras.requester_id || null]
+    );
+    return rows[0].id;
+  } else {
+    // Schema WITHOUT created_by
+    const { rows } = await query(
+      `INSERT INTO public.time_entries
+         (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_at)
+       VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,NOW())
+       RETURNING id`,
+      [owner, employeeName, type, tsIso, jobNo, tz, local]
+    );
+    return rows[0].id;
+  }
 }
+
 
 // ---------- EXCEL EXPORT (lazy load) ----------
 async function exportTimesheetXlsx(opts) {

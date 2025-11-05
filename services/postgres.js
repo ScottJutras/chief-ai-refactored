@@ -66,9 +66,7 @@ async function getFileExport(id) {
 }
 
 // ---------- Time Limits & Audit (schema-aware, tolerant) ----------
-
-// Cache whether public.time_entries has a created_by column
-let SUPPORTS_CREATED_BY = null; // null = unknown, true/false after first probe
+let SUPPORTS_CREATED_BY = null;
 async function detectTimeEntriesCapabilities() {
   if (SUPPORTS_CREATED_BY !== null) return SUPPORTS_CREATED_BY;
   try {
@@ -82,10 +80,43 @@ async function detectTimeEntriesCapabilities() {
     );
     SUPPORTS_CREATED_BY = !!rows?.length;
   } catch {
-    SUPPORTS_CREATED_BY = false; // conservative default
+    SUPPORTS_CREATED_BY = false;
   }
   return SUPPORTS_CREATED_BY;
 }
+
+async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  const actor = String(createdBy || owner).replace(/\D/g, '');
+  const hasCreatedBy = await detectTimeEntriesCapabilities();
+  try {
+    if (hasCreatedBy) {
+      const { rows } = await query(
+        `SELECT COUNT(*)::int AS n
+           FROM public.time_entries
+          WHERE owner_id=$1
+            AND COALESCE(created_by,$2::text) = $2::text
+            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+        [owner, actor, windowSec]
+      );
+      const n = rows?.[0]?.n ?? 0;
+      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+    } else {
+      const { rows } = await query(
+        `SELECT COUNT(*)::int AS n
+           FROM public.time_entries
+          WHERE owner_id=$1
+            AND created_at >= NOW() - ($2 || ' seconds')::interval`,
+        [owner, windowSec]
+      );
+      const n = rows?.[0]?.n ?? 0;
+      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+    }
+  } catch {
+    return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+  }
+}
+
 
 // ---------- Time (schema-aware INSERT for created_by) ----------
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
@@ -399,32 +430,37 @@ async function exportTimesheetPdf(opts) {
 
 // ... keep everything above as-is ...
 
-// ---------- Export everything ----------
+// ---- Safe limiter exports (avoid undefined symbol at module.exports time)
+const __checkLimit =
+  (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
+  (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
+
 module.exports = {
+  // Core
   pool, query, queryWithTimeout, withClient,
   normalizePhoneNumber: x => DIGITS(x),
   toAmount, isValidIso,
+
+  // Jobs / context
   ensureJobByName, resolveJobContext,
   createTaskWithJob, logTimeEntryWithJob,
-  generateOTP, verifyOTP,
 
   // Users
+  generateOTP, verifyOTP,
   createUserProfile, saveUserProfile, getUserProfile, getOwnerProfile,
-
-  // Compat alias so middleware expecting getUserBasic keeps working
-  getUserBasic: getUserProfile,
 
   // Tasks
   createTask, getTaskByNo,
 
   // Time
   logTimeEntry,
-  checkTimeEntryLimit,
-  checkActorLimit: checkTimeEntryLimit,
+  checkTimeEntryLimit: __checkLimit, // <= safe export
+  checkActorLimit: __checkLimit,     // <= compat alias
 
   // Exports
   exportTimesheetXlsx,
   exportTimesheetPdf,
   getFileExport,
+
   // …add any other helpers you already export (listMyTasks, etc.)
 };

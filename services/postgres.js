@@ -179,12 +179,12 @@ async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz,
   }
 }
 
-// ---------- Time (resilient INSERT: ALWAYS include user_id if column exists) ----------
+// ---------- Time (resilient INSERT: user_id REQUIRED if column exists) ----------
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
 
-  // Normalize identifiers (digits only)
+  // Normalize identifiers
   const ownerDigits = String(ownerId ?? '').replace(/\D/g, '');
   const actorDigits = String(extras?.requester_id ?? ownerId ?? '').replace(/\D/g, '');
 
@@ -194,31 +194,35 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  // Ensure capability flags are populated (cached)
+  // Ensure capability flags are known
   if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null) {
     try { await detectTimeEntriesCapabilities(); } catch {}
   }
 
-  async function insertWith({ includeUserId, includeCreatedBy }) {
-    const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
-    const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
+  // Helper to build and run INSERT. IMPORTANT: created_at uses NOW() (not a param).
+  async function runInsert({ includeUserId, includeCreatedBy }) {
+    const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time', 'created_at'];
+    const vals = [ownerSafe,       employeeName,     type,   tsIso,      jobNo,   zone,  local                 ];
+    const ph   = ['$1',            '$2',             '$3',   '$4',       '$5',    '$6',  '$7',                 'NOW()'];
 
-    if (includeUserId)    { cols.push('user_id');    vals.push(actorSafe); }
-    if (includeCreatedBy) { cols.push('created_by'); vals.push(actorSafe); }
-
-    // Append created_at (NOW()) as the last column (no param)
-    cols.push('created_at');
-
-    // Param placeholders for all values, then NOW() for created_at
-    const placeholders = vals.map((_, i) => `$${i + 1}`).concat('NOW()');
+    if (includeUserId) {
+      cols.splice(7, 0, 'user_id'); // insert before created_at
+      vals.push(actorSafe);
+      ph.splice(7, 0, `$${vals.length}`); // next param index
+    }
+    if (includeCreatedBy) {
+      cols.splice(7 + (includeUserId ? 1 : 0), 0, 'created_by');
+      vals.push(actorSafe);
+      ph.splice(7 + (includeUserId ? 1 : 0), 0, `$${vals.length}`);
+    }
 
     const sql = `
       INSERT INTO public.time_entries (${cols.join(', ')})
-      VALUES (${placeholders.join(', ')})
+      VALUES (${ph.join(', ')})
       RETURNING id`;
 
-    console.info('[PG/logTimeEntry] executing', {
-      cols,
+    console.info('[PG/logTimeEntry] INSERT', {
+      includeUserId, includeCreatedBy,
       user_id: includeUserId ? actorSafe : 'SKIP',
       created_by: includeCreatedBy ? actorSafe : 'SKIP'
     });
@@ -228,36 +232,44 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   }
 
   try {
-    // Fast paths based on detected capabilities (user_id first because it's NOT NULL in your schema)
+    // Primary path: include user_id if present (your schema has NOT NULL)
     if (SUPPORTS_USER_ID && SUPPORTS_CREATED_BY) {
-      return await insertWith({ includeUserId: true, includeCreatedBy: true });
+      return await runInsert({ includeUserId: true, includeCreatedBy: true });
     }
     if (SUPPORTS_USER_ID) {
-      return await insertWith({ includeUserId: true, includeCreatedBy: false });
+      return await runInsert({ includeUserId: true, includeCreatedBy: false });
     }
     if (SUPPORTS_CREATED_BY) {
-      return await insertWith({ includeUserId: false, includeCreatedBy: true });
+      return await runInsert({ includeUserId: false, includeCreatedBy: true });
     }
-    // Legacy schema (neither column)
-    return await insertWith({ includeUserId: false, includeCreatedBy: false });
+    // Legacy fallback: neither column exists
+    return await runInsert({ includeUserId: false, includeCreatedBy: false });
 
   } catch (e) {
     const msg = String(e?.message || '').toLowerCase();
     console.error('[PG/logTimeEntry] insert failed:', msg);
 
-    // Update caches if we learned something new
-    if (msg.includes('column "user_id" does not exist'))      SUPPORTS_USER_ID = false;
-    if (msg.includes('column "created_by" does not exist'))   SUPPORTS_CREATED_BY = false;
+    // Update capability flags if we learned something
+    if (msg.includes('column "user_id" does not exist'))    SUPPORTS_USER_ID = false;
+    if (msg.includes('column "created_by" does not exist')) SUPPORTS_CREATED_BY = false;
 
-    // If DB complains about NULL user_id, surface a clear error (requester_id missing)
+    // If DB complains about NULL user_id we must surface it (requester_id missing)
     if (msg.includes('null value in column "user_id"')) {
-      throw new Error('[PG] user_id is NOT NULL but no value provided. Ensure requester_id is set.');
+      throw new Error(`[PG] user_id is NOT NULL but missing. actorSafe='${actorSafe}' SUPPORTS_USER_ID=${SUPPORTS_USER_ID}`);
+    }
+
+    // If our flags were wrong (e.g., we tried with user_id but column missing), retry once without it.
+    if (msg.includes('column "user_id" does not exist')) {
+      try {
+        return await runInsert({ includeUserId: false, includeCreatedBy: SUPPORTS_CREATED_BY === true });
+      } catch (e2) {
+        throw e2;
+      }
     }
 
     throw e;
   }
 }
-
 
 
 // ---------- Simple utilities ----------
@@ -323,6 +335,7 @@ async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz,
   const job = await resolveJobContext(ownerId, { explicitJobName: jobName });
   return await logTimeEntry(ownerId, employeeName, type, ts, job?.job_no || null, tz, extras);
 }
+
 
 // ---------- OTP ----------
 async function generateOTP(userId) {
@@ -532,12 +545,24 @@ async function exportTimesheetPdf(opts) {
   return { url: `${base}/exports/${id}`, id, filename };
 }
 
-// ... keep everything above as-is ...
 
 // ---- Safe limiter exports (avoid undefined symbol at module.exports time)
 const __checkLimit =
   (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
   (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
+
+  // Detect time_entries capabilities once at startup (cache flags)
+(async () => {
+  try {
+    const caps = await detectTimeEntriesCapabilities();
+    console.info('[PG] time_entries schema detected:', caps);
+  } catch (e) {
+    console.warn('[PG] schema detect failed, safe defaults', e?.message);
+    SUPPORTS_USER_ID = true;      // your schema has NOT NULL user_id
+    SUPPORTS_CREATED_BY = false;
+  }
+})();
+
 
 module.exports = {
   // Core

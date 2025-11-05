@@ -155,21 +155,29 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
-  const owner = String(ownerId || '').replace(/\D/g, '');
-  const actor = String(extras.requester_id || ownerId || '').replace(/\D/g, ''); // phone-id for user_id/created_by
+
+  // Normalize identifiers (digits only)
+  const ownerDigits = String(ownerId ?? '').replace(/\D/g, '');
+  const actorDigits = String(extras?.requester_id ?? ownerId ?? '').replace(/\D/g, '');
+
+  // Hard fallbacks so we never pass NULL
+  const ownerSafe = ownerDigits || actorDigits || '0';
+  const actorSafe = actorDigits || ownerDigits || '0';
+
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
+  // Detect available columns
   const caps = await detectTimeEntriesCapabilities().catch(() => ({
     SUPPORTS_CREATED_BY: false,
     SUPPORTS_USER_ID: false,
   }));
 
-  // Build INSERT dynamically based on detected columns
+  // Build dynamic INSERT
   const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
-  const vals = [owner, employeeName, type, tsIso, jobNo, zone, local];
+  const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
 
-  if (caps.SUPPORTS_USER_ID)    { cols.push('user_id');    vals.push(actor || owner); }
-  if (caps.SUPPORTS_CREATED_BY) { cols.push('created_by'); vals.push(actor || owner); }
+  if (caps.SUPPORTS_USER_ID)    { cols.push('user_id');    vals.push(actorSafe); }
+  if (caps.SUPPORTS_CREATED_BY) { cols.push('created_by'); vals.push(actorSafe); }
 
   cols.push('created_at');
   const placeholders = cols.map((_, i) => (i < vals.length ? `$${i + 1}` : 'NOW()'));

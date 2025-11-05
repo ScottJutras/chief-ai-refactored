@@ -79,86 +79,108 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
     const isTimesheet = /^timesheet\s+week$/.test(lc);
 
     // --- Actions ---
+const now = new Date();
+
+if (isClockIn) {
+  console.info('[timeclock] write', { ownerId, employeeName, type: 'clock_in', jobName, tz, actorId });
+  const id = await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_in', now, jobName, tz, { requester_id: actorId });
+  console.info('[timeclock] ok', { type: 'clock_in', id });
+  return reply('Clocked in.');
+}
+
+if (isClockOut) {
+  console.info('[timeclock] write', { ownerId, employeeName, type: 'clock_out', jobName, tz, actorId });
+  const id = await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_out', now, jobName, tz, { requester_id: actorId });
+  console.info('[timeclock] ok', { type: 'clock_out', id });
+  return reply('Clocked out.');
+}
+
+if (isBreakOn) {
+  console.info('[timeclock] write', { ownerId, employeeName, type: 'break_start', jobName: null, tz, actorId });
+  const id = await pg.logTimeEntry(ownerId, employeeName, 'break_start', now, null, tz, { requester_id: actorId });
+  console.info('[timeclock] ok', { type: 'break_start', id });
+  return reply('Break started.');
+}
+
+if (isBreakOff) {
+  console.info('[timeclock] write', { ownerId, employeeName, type: 'break_stop', jobName: null, tz, actorId });
+  const id = await pg.logTimeEntry(ownerId, employeeName, 'break_stop', now, null, tz, { requester_id: actorId });
+  console.info('[timeclock] ok', { type: 'break_stop', id });
+  return reply('Break stopped.');
+}
+
+if (isDriveOn) {
+  console.info('[timeclock] write', { ownerId, employeeName, type: 'drive_start', jobName: null, tz, actorId });
+  const id = await pg.logTimeEntry(ownerId, employeeName, 'drive_start', now, null, tz, { requester_id: actorId });
+  console.info('[timeclock] ok', { type: 'drive_start', id });
+  return reply('Drive started.');
+}
+
+if (isDriveOff) {
+  console.info('[timeclock] write', { ownerId, employeeName, type: 'drive_stop', jobName: null, tz, actorId });
+  const id = await pg.logTimeEntry(ownerId, employeeName, 'drive_stop', now, null, tz, { requester_id: actorId });
+  console.info('[timeclock] ok', { type: 'drive_stop', id });
+  return reply('Drive stopped.');
+}
+
+// Undo last
+if (isUndoLast) {
+  try {
+    console.info('[timeclock] undo attempt', { ownerId, employeeName });
+    const del = await pg.query(
+      `DELETE FROM public.time_entries
+         WHERE owner_id = $1 AND employee_name = $2
+         ORDER BY timestamp DESC
+         LIMIT 1
+         RETURNING type`,
+      [String(ownerId).replace(/\D/g, ''), employeeName]
+    );
+    if (!del.rowCount) {
+      console.info('[timeclock] undo none', { ownerId, employeeName });
+      return reply('Nothing to undo.');
+    }
+    const type = (del.rows[0]?.type || '').replace('_', ' ');
+    console.info('[timeclock] undo ok', { ownerId, employeeName, type });
+    return reply(`Undid last ${type || 'entry'}.`);
+  } catch (e) {
+    console.warn('[timeclock] undo failed:', e?.message);
+    return reply('Nothing to undo.');
+  }
+}
+
+// Timesheet (XLSX export link)
+if (isTimesheet) {
+  try {
+    console.info('[timeclock] timesheet start', { ownerId, employeeName, tz });
+    // Compute Mon–Sun window in user tz (simple MVP approach)
     const now = new Date();
+    const local = new Date(now.toLocaleString('en-CA', { timeZone: tz }));
+    const dow = (local.getDay() + 6) % 7; // Mon=0..Sun=6
+    const monday = new Date(local); monday.setDate(local.getDate() - dow); monday.setHours(0,0,0,0);
+    const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6); sunday.setHours(23,59,59,999);
 
-    if (isClockIn) {
-      await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_in', now, jobName, tz, { requester_id: actorId });
-      return reply('Clocked in.');
-    }
-    if (isClockOut) {
-      await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_out', now, jobName, tz, { requester_id: actorId });
-      return reply('Clocked out.');
-    }
-    if (isBreakOn) {
-      await pg.logTimeEntry(ownerId, employeeName, 'break_start', now, null, tz, { requester_id: actorId });
-      return reply('Break started.');
-    }
-    if (isBreakOff) {
-      await pg.logTimeEntry(ownerId, employeeName, 'break_stop', now, null, tz, { requester_id: actorId });
-      return reply('Break stopped.');
-    }
-    if (isDriveOn) {
-      await pg.logTimeEntry(ownerId, employeeName, 'drive_start', now, null, tz, { requester_id: actorId });
-      return reply('Drive started.');
-    }
-    if (isDriveOff) {
-      await pg.logTimeEntry(ownerId, employeeName, 'drive_stop', now, null, tz, { requester_id: actorId });
-      return reply('Drive stopped.');
-    }
+    const startIso = new Date(monday).toISOString();
+    const endIso   = new Date(sunday).toISOString();
 
-    // Undo last
-    if (isUndoLast) {
-      try {
-        const del = await pg.query(
-          `DELETE FROM public.time_entries
-            WHERE owner_id = $1 AND employee_name = $2
-            ORDER BY timestamp DESC
-            LIMIT 1
-            RETURNING type`,
-          [String(ownerId).replace(/\D/g, ''), employeeName]
-        );
-        if (!del.rowCount) return reply('Nothing to undo.');
-        const type = (del.rows[0]?.type || '').replace('_', ' ');
-        return reply(`Undid last ${type || 'entry'}.`);
-      } catch (e) {
-        console.warn('[timeclock] undo failed:', e?.message);
-        return reply('Nothing to undo.');
-      }
-    }
+    const { id, url, filename } = await pg.exportTimesheetXlsx({
+      ownerId,
+      startIso,
+      endIso,
+      employeeName,
+      tz,
+    });
 
-    // Timesheet (XLSX export link)
-    if (isTimesheet) {
-      try {
-        // Compute Mon–Sun window in user tz (simple MVP approach)
-        const now = new Date();
-        const local = new Date(now.toLocaleString('en-CA', { timeZone: tz }));
-        const dow = (local.getDay() + 6) % 7; // Mon=0..Sun=6
-        const monday = new Date(local); monday.setDate(local.getDate() - dow); monday.setHours(0,0,0,0);
-        const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6); sunday.setHours(23,59,59,999);
+    const base = process.env.PUBLIC_BASE_URL || '';
+    const apiUrl = base ? `${base}/api/exports/${id}` : `/api/exports/${id}`;
+    console.info('[timeclock] timesheet ok', { id, filename, apiUrl });
 
-        const startIso = new Date(monday).toISOString();
-        const endIso   = new Date(sunday).toISOString();
+    return reply(`Timesheet ready: ${apiUrl}\n(${filename})`);
+  } catch (e) {
+    console.warn('[timeclock] timesheet export failed:', e?.message);
+    return reply('Couldn’t build timesheet right now. Try again later.');
+  }
+}
 
-        const { id, url, filename } = await pg.exportTimesheetXlsx({
-          ownerId,
-          startIso,
-          endIso,
-          employeeName,
-          tz,
-        });
-
-        // Prefer our API route so links work regardless of PUBLIC_BASE_URL
-        const base = process.env.PUBLIC_BASE_URL || '';
-        const apiUrl = base
-          ? `${base}/api/exports/${id}`
-          : `/api/exports/${id}`;
-
-        return reply(`Timesheet ready: ${apiUrl}\n(${filename})`);
-      } catch (e) {
-        console.warn('[timeclock] timesheet export failed:', e?.message);
-        return reply('Couldn’t build timesheet right now. Try again later.');
-      }
-    }
 
     // Fallback SOP
     return reply(SOP_TIMECLOCK);

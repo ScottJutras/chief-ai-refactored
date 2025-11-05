@@ -152,8 +152,34 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
   }
 }
 
+// ---------- Job-aware time entry (delegates to resilient logTimeEntry) ----------
+async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras = {}) {
+  // Resolve job context (prefer explicit name; otherwise active job)
+  let jobNo = null;
 
-// ---------- Time (resilient INSERT: try user_id/created_by, retry if columns missing) ----------
+  try {
+    if (jobName && String(jobName).trim()) {
+      const j = await ensureJobByName(ownerId, jobName);
+      jobNo = j?.job_no ?? null;
+    } else {
+      const j = await resolveJobContext(ownerId, { require: false });
+      jobNo = j?.job_no ?? null;
+    }
+  } catch (e) {
+    console.warn('[PG/logTimeEntryWithJob] job resolve failed:', e?.message);
+  }
+
+  // Always delegate to the resilient writer so user_id/created_by are included
+  try {
+    const id = await logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras);
+    return id;
+  } catch (e) {
+    console.error('[PG/logTimeEntryWithJob] insert failed:', e?.message);
+    throw e;
+  }
+}
+
+// ---------- Time (resilient INSERT + debug) ----------
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
@@ -168,7 +194,6 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  // Helper to assemble and run an INSERT with chosen extra cols
   async function insertWith({ includeUserId, includeCreatedBy }) {
     const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
     const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
@@ -184,44 +209,64 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
       VALUES (${placeholders.join(', ')})
       RETURNING id`;
 
+    console.info('[PG/logTimeEntry] cols=', cols, 'vals(sample)=', {
+      owner_id: vals[0],
+      employee_name: vals[1],
+      type: vals[2],
+      timestamp: vals[3],
+      job_no: vals[4],
+      tz: vals[5],
+      local_time: vals[6],
+      user_id: includeUserId ? actorSafe : undefined,
+      created_by: includeCreatedBy ? actorSafe : undefined,
+    });
+
     const { rows } = await query(sql, vals);
     return rows[0].id;
   }
 
-  // Try the most complete shape first; then gracefully degrade
   try {
+    // Try both columns first
     return await insertWith({ includeUserId: true, includeCreatedBy: true });
   } catch (e1) {
     const msg = String(e1?.message || '').toLowerCase();
+    console.error('[PG/logTimeEntry] first attempt failed:', msg);
+
     if (msg.includes('column "user_id" does not exist')) {
       try {
         // Retry without user_id, keep created_by
         return await insertWith({ includeUserId: false, includeCreatedBy: true });
       } catch (e2) {
         const msg2 = String(e2?.message || '').toLowerCase();
+        console.error('[PG/logTimeEntry] retry (no user_id) failed:', msg2);
         if (msg2.includes('column "created_by" does not exist')) {
-          // Retry without either column
+          // Final retry: neither column
           return await insertWith({ includeUserId: false, includeCreatedBy: false });
         }
         throw e2;
       }
     }
+
     if (msg.includes('column "created_by" does not exist')) {
       try {
         // Retry without created_by, keep user_id
         return await insertWith({ includeUserId: true, includeCreatedBy: false });
       } catch (e3) {
         const msg3 = String(e3?.message || '').toLowerCase();
+        console.error('[PG/logTimeEntry] retry (no created_by) failed:', msg3);
         if (msg3.includes('column "user_id" does not exist')) {
-          // Retry without either column
+          // Final retry: neither column
           return await insertWith({ includeUserId: false, includeCreatedBy: false });
         }
         throw e3;
       }
     }
-    throw e1; // different error — bubble up
+
+    // Different error — do NOT try a path without user_id (prevents NOT NULL violation)
+    throw e1;
   }
 }
+
 
 
 // ---------- Simple utilities ----------

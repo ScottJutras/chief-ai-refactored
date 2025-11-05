@@ -1,5 +1,5 @@
 // middleware/userProfile.js
-const { getUserBasic, createUserProfile, getOwnerProfile } = require('../services/postgres');
+const { getUserProfile, createUserProfile, getOwnerProfile } = require('../services/postgres');
 
 function normalizeFrom(raw) {
   return String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
@@ -34,17 +34,14 @@ async function userProfileMiddleware(req, _res, next) {
       return next();
     }
 
-    // Load or create the user
-    let profile = await getUserBasic(from);
-    if (!profile) {
-      profile = await createUserProfile({
-        user_id: from,
-        ownerId: from,
-        onboarding_in_progress: true,
-      });
-      console.log('[userProfile] created new user', from);
-    }
-    profile = shapeProfile(profile, from);
+   // Load or create the user
+let profile = await getUserProfile(from);
+if (!profile) {
+  profile = await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
+  console.log('[userProfile] created new user', from);
+}
+profile = shapeProfile(profile, from); // ← ensure consistent shape
+
 
     // Also fetch the owner profile (your handlers receive this)
     let ownerProfile = null;

@@ -66,31 +66,63 @@ async function getFileExport(id) {
 }
 
 // ---------- Time Limits & Audit (schema-aware, tolerant) ----------
-let SUPPORTS_CREATED_BY = null;
+
+// Cache detected columns on public.time_entries
+let SUPPORTS_CREATED_BY = null; // null=unknown, then true/false
+let SUPPORTS_USER_ID    = null;
+
 async function detectTimeEntriesCapabilities() {
-  if (SUPPORTS_CREATED_BY !== null) return SUPPORTS_CREATED_BY;
+  if (SUPPORTS_CREATED_BY !== null && SUPPORTS_USER_ID !== null) {
+    return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
+  }
   try {
     const { rows } = await query(
-      `SELECT 1
+      `SELECT column_name
          FROM information_schema.columns
         WHERE table_schema = 'public'
-          AND table_name   = 'time_entries'
-          AND column_name  = 'created_by'
-        LIMIT 1`
+          AND table_name   = 'time_entries'`
     );
-    SUPPORTS_CREATED_BY = !!rows?.length;
+    const names = new Set(rows.map(r => String(r.column_name).toLowerCase()));
+    SUPPORTS_CREATED_BY = names.has('created_by');
+    SUPPORTS_USER_ID    = names.has('user_id');
   } catch {
+    // Conservative defaults if detection fails
     SUPPORTS_CREATED_BY = false;
+    SUPPORTS_USER_ID    = false;
   }
-  return SUPPORTS_CREATED_BY;
+  return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
 }
 
 async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   const actor = String(createdBy || owner).replace(/\D/g, '');
-  const hasCreatedBy = await detectTimeEntriesCapabilities();
+
+  // Detect available columns
+  let caps = { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
+  if (caps.SUPPORTS_CREATED_BY === null || caps.SUPPORTS_USER_ID === null) {
+    caps = await detectTimeEntriesCapabilities().catch(() => ({
+      SUPPORTS_CREATED_BY: false,
+      SUPPORTS_USER_ID: false,
+    }));
+  }
+
   try {
-    if (hasCreatedBy) {
+    if (caps.SUPPORTS_USER_ID) {
+      // Most precise: per-actor via user_id
+      const { rows } = await query(
+        `SELECT COUNT(*)::int AS n
+           FROM public.time_entries
+          WHERE owner_id=$1
+            AND user_id=$2
+            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+        [owner, actor, windowSec]
+      );
+      const n = rows?.[0]?.n ?? 0;
+      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+    }
+
+    if (caps.SUPPORTS_CREATED_BY) {
+      // Fallback: per-actor via created_by
       const { rows } = await query(
         `SELECT COUNT(*)::int AS n
            FROM public.time_entries
@@ -101,57 +133,54 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
       );
       const n = rows?.[0]?.n ?? 0;
       return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-    } else {
-      const { rows } = await query(
-        `SELECT COUNT(*)::int AS n
-           FROM public.time_entries
-          WHERE owner_id=$1
-            AND created_at >= NOW() - ($2 || ' seconds')::interval`,
-        [owner, windowSec]
-      );
-      const n = rows?.[0]?.n ?? 0;
-      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
     }
+
+    // Last resort: per-owner only
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND created_at >= NOW() - ($2 || ' seconds')::interval`,
+      [owner, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
   } catch {
+    // Fail-open to avoid blocking users if DB hiccups
     return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
   }
 }
 
-
-// ---------- Time (schema-aware INSERT for created_by) ----------
+// ---------- Time (schema-aware INSERT for user_id & created_by) ----------
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
+  const zone  = tz || 'America/Toronto';
   const owner = String(ownerId || '').replace(/\D/g, '');
-  const zone = tz || 'America/Toronto';
-
-  // Ensure the capability flag is populated (cached)
-  if (SUPPORTS_CREATED_BY === null) {
-    await detectTimeEntriesCapabilities().catch(() => { SUPPORTS_CREATED_BY = false; });
-  }
-
+  const actor = String(extras.requester_id || ownerId || '').replace(/\D/g, ''); // phone-id for user_id/created_by
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  if (SUPPORTS_CREATED_BY) {
-    // Schema WITH created_by
-    const { rows } = await query(
-      `INSERT INTO public.time_entries
-         (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_by, created_at)
-       VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,$8,NOW())
-       RETURNING id`,
-      [owner, employeeName, type, tsIso, jobNo, zone, local, extras.requester_id || null]
-    );
-    return rows[0].id;
-  } else {
-    // Schema WITHOUT created_by
-    const { rows } = await query(
-      `INSERT INTO public.time_entries
-         (owner_id, employee_name, type, timestamp, job_no, tz, local_time, created_at)
-       VALUES ($1,$2,$3,$4::timestamptz,$5,$6,$7::timestamp,NOW())
-       RETURNING id`,
-      [owner, employeeName, type, tsIso, jobNo, zone, local]
-    );
-    return rows[0].id;
-  }
+  const caps = await detectTimeEntriesCapabilities().catch(() => ({
+    SUPPORTS_CREATED_BY: false,
+    SUPPORTS_USER_ID: false,
+  }));
+
+  // Build INSERT dynamically based on detected columns
+  const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
+  const vals = [owner, employeeName, type, tsIso, jobNo, zone, local];
+
+  if (caps.SUPPORTS_USER_ID)    { cols.push('user_id');    vals.push(actor || owner); }
+  if (caps.SUPPORTS_CREATED_BY) { cols.push('created_by'); vals.push(actor || owner); }
+
+  cols.push('created_at');
+  const placeholders = cols.map((_, i) => (i < vals.length ? `$${i + 1}` : 'NOW()'));
+
+  const sql = `
+    INSERT INTO public.time_entries (${cols.join(', ')})
+    VALUES (${placeholders.join(', ')})
+    RETURNING id`;
+
+  const { rows } = await query(sql, vals);
+  return rows[0].id;
 }
 
 

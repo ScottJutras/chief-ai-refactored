@@ -23,13 +23,15 @@ const pool = new Pool({
 pool.on('error', err => console.error('[PG] idle client error:', err?.message));
 
 // ---------- Core query helpers ----------
-async function query(text, params) { return queryWithRetry(text, params); }
+async function query(text, params) {
+  return queryWithRetry(text, params);
+}
 
 async function queryWithRetry(text, params, attempt = 1) {
   try {
     return await pool.query(text, params);
   } catch (e) {
-    const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET|Connection terminated/i.test(e.message || '');
+    const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET|connection terminated/i.test(e.message || '');
     if (transient && attempt < 3) {
       console.warn(`[PG] retry ${attempt + 1}: ${e.message}`);
       await new Promise(r => setTimeout(r, attempt * 200));
@@ -63,7 +65,35 @@ async function withClient(fn, { useTransaction = true } = {}) {
   }
 }
 
-// --- NEW: activate a job by name (upsert + set active, deactivate others)
+// ---------- Job helpers (fixed) ----------
+// Find or create a job by name. IMPORTANT: distinct placeholders ($2/$3) to avoid 42P08
+async function ensureJobByName(ownerId, name) {
+  const owner   = DIGITS(ownerId);
+  const jobName = String(name || '').trim();
+  if (!jobName) return null;
+
+  // Try either column (schemas may use name OR job_name)
+  let r = await query(
+    `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+       FROM public.jobs
+      WHERE owner_id = $1
+        AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
+      LIMIT 1`,
+    [owner, jobName]
+  );
+  if (r.rowCount) return r.rows[0];
+
+  // Insert with separate params for text/varchar targets
+  const ins = await query(
+    `INSERT INTO public.jobs (owner_id, job_name, name, active, start_date, created_at, updated_at)
+     VALUES ($1, $2, $3, true, NOW(), NOW(), NOW())
+     RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
+    [owner, jobName, jobName]
+  );
+  return ins.rows[0];
+}
+
+// Upsert a job by name, deactivate others, and activate this one
 async function activateJobByName(ownerId, rawName) {
   const owner = DIGITS(ownerId);
   const name  = String(rawName || '').trim();
@@ -74,7 +104,7 @@ async function activateJobByName(ownerId, rawName) {
   const jobNo = j?.job_no;
   if (!jobNo) throw new Error('Failed to create/resolve job');
 
-  // deactivate others, activate this one
+  // deactivate others, then activate this one
   await withClient(async (client) => {
     await client.query(
       `UPDATE public.jobs
@@ -84,7 +114,8 @@ async function activateJobByName(ownerId, rawName) {
     );
     await client.query(
       `UPDATE public.jobs
-         SET active=true, updated_at=NOW(), name=COALESCE(name, $3), job_name=COALESCE(job_name, $3)
+         SET active=true, updated_at=NOW(),
+             name=COALESCE(name, $3), job_name=COALESCE(job_name, $3)
        WHERE owner_id=$1 AND job_no=$2`,
       [owner, jobNo, name]
     );
@@ -101,6 +132,7 @@ async function activateJobByName(ownerId, rawName) {
   return rows[0] || { job_no: jobNo, name, active: true };
 }
 module.exports.activateJobByName = activateJobByName;
+
 
 
 // ---------- File Exports (fetch) ----------
@@ -573,33 +605,44 @@ const __checkLimit =
 
 module.exports = {
   // Core
-  pool, query, queryWithTimeout, withClient,
+  pool,
+  query,
+  queryWithTimeout,
+  withClient,
   normalizePhoneNumber: x => DIGITS(x),
-  toAmount, isValidIso,
+  toAmount,
+  isValidIso,
 
   // Jobs / context
-  ensureJobByName, resolveJobContext,
-  createTaskWithJob, logTimeEntryWithJob,
+  ensureJobByName,
+  resolveJobContext,
+  createTaskWithJob,
+  logTimeEntryWithJob,
   activateJobByName,
 
   // Users
-  generateOTP, verifyOTP,
-  createUserProfile, saveUserProfile, getUserProfile, getOwnerProfile,
+  generateOTP,
+  verifyOTP,
+  createUserProfile,
+  saveUserProfile,
+  getUserProfile,
+  getOwnerProfile,
 
   // Tasks
-  createTask, getTaskByNo,
+  createTask,
+  getTaskByNo,
 
   // Time
   logTimeEntry,
-  checkTimeEntryLimit: __checkLimit, // <= safe export
-  checkActorLimit: __checkLimit,     // <= compat alias
+  checkTimeEntryLimit: __checkLimit, // safe export
+  checkActorLimit: __checkLimit,     // compat alias
 
   // Exports
   exportTimesheetXlsx,
   exportTimesheetPdf,
   getFileExport,
 
-  // Pending actions
+  // Pending actions (serverless-safe confirmations)
   savePendingAction,
   getPendingAction,
   deletePendingAction,

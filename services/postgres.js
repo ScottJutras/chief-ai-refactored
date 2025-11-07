@@ -158,14 +158,16 @@ async function activateJobByName(ownerId, rawName) {
   });
 
   // fetch final state (best effort)
-  const { rows } = await query(
-    `SELECT job_no, COALESCE(name, job_name) AS name, active, updated_at
-       FROM public.jobs
-      WHERE owner_id=$1 AND job_no=$2
-      LIMIT 1`,
-    [owner, jobNo]
-  );
-  return rows[0] || { job_no: jobNo, name, active: true };
+const { rows } = await query(
+  `SELECT job_no, COALESCE(name, job_name) AS name, active, updated_at
+     FROM public.jobs
+    WHERE owner_id=$1 AND job_no=$2
+    LIMIT 1`,
+  [owner, jobNo]
+);
+const final = rows[0] || { job_no: jobNo, name, active: true };
+console.info('[PG] activated job', { owner, job_no: final.job_no, name: final.name });
+return final;
 }
 module.exports.activateJobByName = activateJobByName;
 

@@ -317,38 +317,34 @@ const DIGITS = x => String(x || '').replace(/\D/g, '');
 const toAmount = x => parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
 const isValidIso = ts => !!ts && !Number.isNaN(new Date(ts).getTime());
 
-// ---------- Job helpers ----------
+// Find or create a job by name (handles schemas using either name or job_name).
+// IMPORTANT: use distinct placeholders for job_name vs name to avoid 42P08.
 async function ensureJobByName(ownerId, name) {
-  const owner = DIGITS(ownerId);
+  const owner   = DIGITS(ownerId);
   const jobName = String(name || '').trim();
   if (!jobName) return null;
 
+  // Try either column (schemas may use name OR job_name)
   let r = await query(
-    `SELECT job_no, name, active AS is_active
+    `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
        FROM public.jobs
-      WHERE owner_id=$1 AND lower(name)=lower($2)
+      WHERE owner_id = $1
+        AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
       LIMIT 1`,
     [owner, jobName]
   );
   if (r.rowCount) return r.rows[0];
 
-  r = await query(
-    `SELECT job_no, job_name AS name, active AS is_active
-       FROM public.jobs
-      WHERE owner_id=$1 AND lower(job_name)=lower($2)
-      LIMIT 1`,
-    [owner, jobName]
-  );
-  if (r.rowCount) return r.rows[0];
-
+  // Insert with separate params ($2 for job_name, $3 for name).
   const ins = await query(
     `INSERT INTO public.jobs (owner_id, job_name, name, active, start_date, created_at, updated_at)
-     VALUES ($1,$2,$2,true,NOW(),NOW(),NOW())
-     RETURNING job_no, name, active AS is_active`,
-    [owner, jobName]
+     VALUES ($1, $2, $3, true, NOW(), NOW(), NOW())
+     RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
+    [owner, jobName, jobName]
   );
   return ins.rows[0];
 }
+
 
 async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
   const owner = DIGITS(ownerId);

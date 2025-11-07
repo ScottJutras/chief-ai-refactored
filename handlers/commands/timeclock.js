@@ -1,194 +1,239 @@
 // handlers/commands/timeclock.js
 // -------------------------------------------------------------------
-// Timeclock (MVP, North Star–aligned)
-// - Tolerant: never hard-fail user flows
-// - Role gate: create a task to notify owner if user not approved
-// - Rate limit: uses pg.checkTimeEntryLimit (with alias) to avoid spam
-// - Job context: supports "@ Job Name" hint; resolves active job fallback
-// - Actions: clock in/out, break start/stop, drive start/stop, undo last
-// - Timesheet week: returns a public XLSX link via /api/exports/:id
-// - Returns strings; router is responsible for TwiML + sending
+// Timeclock — State Machine (North Star §4.2)
+// Prevents invalid states (e.g., clock out without clock in; break without shift).
+// Break/lunch pauses shift; drive runs in parallel (does not pause shift).
+// Auto-closes open break/drive on clock_out (with nudge).
+// Always sends helpful replies (no generic dead-ends).
 // -------------------------------------------------------------------
 
 const pg = require('../../services/postgres');
 
-// Compat alias: older code may call pg.checkActorLimit
-const checkLimit =
-  pg.checkActorLimit ||
-  pg.checkTimeEntryLimit ||
-  (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
+// --- mini helpers ---------------------------------------------------
+const DIGITS = (x) => String(x || '').replace(/\D/g, '');
+const fmtLocal = (ts, tz) =>
+  new Date(ts).toLocaleString('en-CA', { timeZone: tz || 'America/Toronto', hour12: false });
 
-const SOP_TIMECLOCK =
-  'Timeclock — Quick guide:\n' +
-  'Try: "clock in" or "clock out"\n' +
-  '• Break/Drive: break start/stop; drive start/stop\n' +
-  '• Clock out: clock out\n' +
-  '• Timesheet: timesheet week';
+function reply(text) {
+  // Single place to format "friendly" answers.
+  return String(text || '').trim();
+}
 
-function extractJobHint(lc) {
-  const m = lc.match(/@\s*([^\n\r]+)/);
+function pickJobHint(text = '') {
+  const m = String(text).match(/@\s*([^\n\r]+)/);
   return m ? m[1].trim() : null;
 }
-function reply(msg, fallback = 'Timeclock error. Try again.') {
-  try { return String(msg || '').trim() || fallback; } catch { return fallback; }
+
+// --- current state snapshot ----------------------------------------
+/**
+ * Reads the last relevant events for this employee to infer open/closed states.
+ * We look at more than one record to properly flip flags.
+ */
+async function getCurrentState(ownerId, employeeName) {
+  const { rows } = await pg.query(
+    `SELECT type, timestamp
+       FROM public.time_entries
+      WHERE owner_id = $1 AND employee_name = $2
+      ORDER BY timestamp DESC
+      LIMIT 50`,
+    [DIGITS(ownerId), employeeName]
+  );
+
+  let hasOpenShift = false;
+  let openBreak = false;
+  let openDrive = false;
+  let lastShiftStart = null;
+  let lastBreakStart = null;
+  let lastDriveStart = null;
+
+  for (const r of rows) {
+    // Walk newest → oldest and flip flags on first unmatched opener
+    if (r.type === 'clock_in' && !hasOpenShift) {
+      hasOpenShift = true;
+      lastShiftStart = r.timestamp;
+    } else if (r.type === 'clock_out' && hasOpenShift) {
+      hasOpenShift = false;
+      lastShiftStart = null;
+    } else if (r.type === 'break_start' && hasOpenShift && !openBreak) {
+      openBreak = true;
+      lastBreakStart = r.timestamp;
+    } else if (r.type === 'break_stop' && openBreak) {
+      openBreak = false;
+      lastBreakStart = null;
+    } else if (r.type === 'drive_start' && hasOpenShift && !openDrive) {
+      openDrive = true;
+      lastDriveStart = r.timestamp;
+    } else if (r.type === 'drive_stop' && openDrive) {
+      openDrive = false;
+      lastDriveStart = null;
+    }
+  }
+
+  return { hasOpenShift, openBreak, openDrive, lastShiftStart, lastBreakStart, lastDriveStart };
 }
 
+// --- intent detection ----------------------------------------------
+function detectIntent(lc) {
+  return {
+    clockIn:     /\b(clock ?in|start shift|punch ?in)\b/.test(lc),
+    clockOut:    /\b(clock ?out|end shift|punch ?out)\b/.test(lc),
+    breakStart:  /\b(break|lunch)\s*(start|on|begin)\b/.test(lc) || /\b(start|begin)\s*(break|lunch)\b/.test(lc),
+    breakStop:   /\b(break|lunch)\s*(stop|off|end)\b/.test(lc)   || /\b(end|stop)\s*(break|lunch)\b/.test(lc),
+    driveStart:  /\bdrive\s*(start|on|begin)\b/.test(lc) || /\b(start|begin)\s*drive\b/.test(lc),
+    driveStop:   /\bdrive\s*(stop|off|end)\b/.test(lc)   || /\b(end|stop)\s*drive\b/.test(lc),
+    undo:        /^\s*undo\s+last\s*$/i.test(lc),
+    help:        /\b(what can i do|help|how to|how do i|what now)\b/i.test(lc),
+  };
+}
+
+// --- main handler ---------------------------------------------------
 async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lc = String(text || '').toLowerCase().trim();
+  const tz = userProfile?.tz || 'America/Toronto';
+  const employeeName = userProfile?.name || from;
+  const actorId = from;
+  const now = new Date();
 
   try {
-    // --- Context ---
-    const tz = userProfile?.tz || userProfile?.timezone || 'America/Toronto';
-    const employeeName = userProfile?.name || from;
-    const actorId = from;
-    const plan = (userProfile?.plan || userProfile?.subscription_tier || 'free').toLowerCase();
-    const role = (userProfile?.role || 'team').toLowerCase();
+    // Rate-limit (North Star: abuse/cost guard)
+    const limit = await pg.checkTimeEntryLimit(ownerId, actorId, { max: 8, windowSec: 30 });
+    if (!limit.ok) {
+      return reply('Too many actions in a short time — please wait a moment and try again.');
+    }
 
-    // --- Role/approval gate ---
-    if (!isOwner && !['owner', 'board', 'team', 'employee'].includes(role)) {
-      try {
-        await pg.createTask({
-          ownerId,
-          createdBy: actorId,
-          assignedTo: ownerId,
-          title: `Approval needed for ${employeeName}`,
-          body: `Approve user ${employeeName} (${from}) to use timeclock.`,
-          type: 'admin',
-        });
-      } catch (e) {
-        console.warn('[timeclock] approval task create failed:', e?.message);
+    // Quick SOP help
+    const intent = detectIntent(lc);
+    if (intent.help) {
+      return reply([
+        'PocketCFO — Timeclock:',
+        '• clock in / clock out',
+        '• break start / break stop',
+        '• drive start / drive stop',
+        '• undo last',
+        'Tip: add job context with @ Job Name (e.g., "clock in @ Jane Roof").'
+      ].join('\n'));
+    }
+
+    const jobName = pickJobHint(text);
+    const state = await getCurrentState(ownerId, employeeName);
+
+    // ------------- CLOCK IN -------------
+    if (intent.clockIn) {
+      if (state.hasOpenShift) {
+        const since = state.lastShiftStart ? fmtLocal(state.lastShiftStart, tz) : 'earlier';
+        return reply(`Already clocked in since ${since}. If needed, you can start a break or drive.`);
       }
-      return reply('You’re not approved yet. I’ve notified the owner.');
+      await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_in', now, jobName, tz, { requester_id: actorId });
+      return reply(`✅ ${employeeName} is clocked in at ${fmtLocal(now, tz)}${jobName ? ` @ ${jobName}` : ''}`);
     }
 
-    // --- Rate limit (anti-spam) ---
-    const limit = await checkLimit(ownerId, actorId, { windowSec: 30, maxInWindow: 8 });
-    if (!limit?.ok) return reply('Too many time actions — try again shortly.');
+    // ------------- CLOCK OUT -------------
+    if (intent.clockOut) {
+      if (!state.hasOpenShift) {
+        return reply(`Not clocked in — use "clock in" first.`);
+      }
 
-    // --- Job context ---
-    const jobName = extractJobHint(lc) || null;
+      // Auto-close open break/drive BEFORE shift closes
+      let autocloseNotes = [];
+      if (state.openBreak) {
+        await pg.logTimeEntry(ownerId, employeeName, 'break_stop', now, null, tz, { requester_id: actorId });
+        autocloseNotes.push('ended break');
+      }
+      if (state.openDrive) {
+        await pg.logTimeEntry(ownerId, employeeName, 'drive_stop', now, null, tz, { requester_id: actorId });
+        autocloseNotes.push('ended drive');
+      }
 
-    // --- Intents ---
-    const isClockIn   = /\b(clock ?in|start shift)\b/.test(lc);
-    const isClockOut  = /\b(clock ?out|end shift)\b/.test(lc);
-    const isBreakOn   = /\bbreak (start|on)\b/.test(lc);
-    const isBreakOff  = /\bbreak (stop|off|end)\b/.test(lc);
-    const isDriveOn   = /\bdrive (start|on)\b/.test(lc);
-    const isDriveOff  = /\bdrive (stop|off|end)\b/.test(lc);
-    const isUndoLast  = /^undo\s+last$/.test(lc);
-    const isTimesheet = /^timesheet\s+week$/.test(lc);
+      await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_out', now, jobName, tz, { requester_id: actorId });
 
-    // --- Actions ---
-const now = new Date();
-
-if (isClockIn) {
-  console.info('[timeclock] write', { ownerId, employeeName, type: 'clock_in', jobName, tz, actorId });
-  const id = await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_in', now, jobName, tz, { requester_id: actorId });
-  console.info('[timeclock] ok', { type: 'clock_in', id });
-  return reply('Clocked in.');
-}
-
-if (isClockOut) {
-  console.info('[timeclock] write', { ownerId, employeeName, type: 'clock_out', jobName, tz, actorId });
-  const id = await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_out', now, jobName, tz, { requester_id: actorId });
-  console.info('[timeclock] ok', { type: 'clock_out', id });
-  return reply('Clocked out.');
-}
-
-if (isBreakOn) {
-  console.info('[timeclock] write', { ownerId, employeeName, type: 'break_start', jobName: null, tz, actorId });
-  const id = await pg.logTimeEntry(ownerId, employeeName, 'break_start', now, null, tz, { requester_id: actorId });
-  console.info('[timeclock] ok', { type: 'break_start', id });
-  return reply('Break started.');
-}
-
-if (isBreakOff) {
-  console.info('[timeclock] write', { ownerId, employeeName, type: 'break_stop', jobName: null, tz, actorId });
-  const id = await pg.logTimeEntry(ownerId, employeeName, 'break_stop', now, null, tz, { requester_id: actorId });
-  console.info('[timeclock] ok', { type: 'break_stop', id });
-  return reply('Break stopped.');
-}
-
-if (isDriveOn) {
-  console.info('[timeclock] write', { ownerId, employeeName, type: 'drive_start', jobName: null, tz, actorId });
-  const id = await pg.logTimeEntry(ownerId, employeeName, 'drive_start', now, null, tz, { requester_id: actorId });
-  console.info('[timeclock] ok', { type: 'drive_start', id });
-  return reply('Drive started.');
-}
-
-if (isDriveOff) {
-  console.info('[timeclock] write', { ownerId, employeeName, type: 'drive_stop', jobName: null, tz, actorId });
-  const id = await pg.logTimeEntry(ownerId, employeeName, 'drive_stop', now, null, tz, { requester_id: actorId });
-  console.info('[timeclock] ok', { type: 'drive_stop', id });
-  return reply('Drive stopped.');
-}
-
-// Undo last
-if (isUndoLast) {
-  try {
-    console.info('[timeclock] undo attempt', { ownerId, employeeName });
-    const del = await pg.query(
-      `DELETE FROM public.time_entries
-         WHERE owner_id = $1 AND employee_name = $2
-         ORDER BY timestamp DESC
-         LIMIT 1
-         RETURNING type`,
-      [String(ownerId).replace(/\D/g, ''), employeeName]
-    );
-    if (!del.rowCount) {
-      console.info('[timeclock] undo none', { ownerId, employeeName });
-      return reply('Nothing to undo.');
+      const suffix = autocloseNotes.length ? ` (auto-${autocloseNotes.join(' & ')})` : '';
+      return reply(`✅ ${employeeName} is clocked out at ${fmtLocal(now, tz)}${suffix}`);
     }
-    const type = (del.rows[0]?.type || '').replace('_', ' ');
-    console.info('[timeclock] undo ok', { ownerId, employeeName, type });
-    return reply(`Undid last ${type || 'entry'}.`);
+
+    // ------------- BREAK START -------------
+    if (intent.breakStart) {
+      if (!state.hasOpenShift) {
+        return reply(`Cannot start break — you are not clocked in.`);
+      }
+      if (state.openBreak) {
+        const since = state.lastBreakStart ? fmtLocal(state.lastBreakStart, tz) : 'already';
+        return reply(`Break already started (${since}).`);
+      }
+      await pg.logTimeEntry(ownerId, employeeName, 'break_start', now, null, tz, { requester_id: actorId });
+      return reply(`✅ ${employeeName} started break at ${fmtLocal(now, tz)} (shift is paused).`);
+    }
+
+    // ------------- BREAK STOP -------------
+    if (intent.breakStop) {
+      if (!state.hasOpenShift) {
+        return reply(`Cannot end break — you are not clocked in.`);
+      }
+      if (!state.openBreak) {
+        return reply(`No active break to stop.`);
+      }
+      await pg.logTimeEntry(ownerId, employeeName, 'break_stop', now, null, tz, { requester_id: actorId });
+      return reply(`✅ ${employeeName} ended break at ${fmtLocal(now, tz)} (shift resumed).`);
+    }
+
+    // ------------- DRIVE START -------------
+    if (intent.driveStart) {
+      if (!state.hasOpenShift) {
+        return reply(`Cannot start drive — you are not clocked in.`);
+      }
+      if (state.openDrive) {
+        const since = state.lastDriveStart ? fmtLocal(state.lastDriveStart, tz) : 'already';
+        return reply(`Drive already started (${since}).`);
+      }
+      await pg.logTimeEntry(ownerId, employeeName, 'drive_start', now, null, tz, { requester_id: actorId });
+      return reply(`✅ ${employeeName} started drive at ${fmtLocal(now, tz)} (shift continues; drive is tracked separately).`);
+    }
+
+    // ------------- DRIVE STOP -------------
+    if (intent.driveStop) {
+      if (!state.openDrive) {
+        return reply(`No active drive to stop.`);
+      }
+      await pg.logTimeEntry(ownerId, employeeName, 'drive_stop', now, null, tz, { requester_id: actorId });
+      return reply(`✅ ${employeeName} ended drive at ${fmtLocal(now, tz)}.`);
+    }
+
+    // ------------- UNDO LAST -------------
+    if (intent.undo) {
+      const del = await pg.query(
+        `DELETE FROM public.time_entries
+          WHERE id IN (
+            SELECT id FROM public.time_entries
+             WHERE owner_id = $1 AND employee_name = $2
+             ORDER BY timestamp DESC
+             LIMIT 1
+          )
+          RETURNING type, timestamp`,
+        [DIGITS(ownerId), employeeName]
+      );
+      if (!del.rowCount) return reply('Nothing to undo.');
+      const at = fmtLocal(del.rows[0].timestamp, tz);
+      return reply(`Undid "${del.rows[0].type.replace('_',' ')}" at ${at}.`);
+    }
+
+    // If we reach here, we didn’t match a concrete action — give smart SOPs
+    return reply([
+      'Timeclock — I can help with:',
+      '• clock in / clock out',
+      '• break start / break stop',
+      '• drive start / drive stop',
+      '• undo last',
+      'Add @ Job Name for context (e.g., "clock in @ Jane Roof").'
+    ].join('\n'));
   } catch (e) {
-    console.warn('[timeclock] undo failed:', e?.message);
-    return reply('Nothing to undo.');
-  }
-}
-
-// Timesheet (XLSX export link)
-if (isTimesheet) {
-  try {
-    console.info('[timeclock] timesheet start', { ownerId, employeeName, tz });
-    // Compute Mon–Sun window in user tz (simple MVP approach)
-    const now = new Date();
-    const local = new Date(now.toLocaleString('en-CA', { timeZone: tz }));
-    const dow = (local.getDay() + 6) % 7; // Mon=0..Sun=6
-    const monday = new Date(local); monday.setDate(local.getDate() - dow); monday.setHours(0,0,0,0);
-    const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6); sunday.setHours(23,59,59,999);
-
-    const startIso = new Date(monday).toISOString();
-    const endIso   = new Date(sunday).toISOString();
-
-    const { id, url, filename } = await pg.exportTimesheetXlsx({
-      ownerId,
-      startIso,
-      endIso,
-      employeeName,
-      tz,
-    });
-
-    const base = process.env.PUBLIC_BASE_URL || '';
-    const apiUrl = base ? `${base}/api/exports/${id}` : `/api/exports/${id}`;
-    console.info('[timeclock] timesheet ok', { id, filename, apiUrl });
-
-    return reply(`Timesheet ready: ${apiUrl}\n(${filename})`);
-  } catch (e) {
-    console.warn('[timeclock] timesheet export failed:', e?.message);
-    return reply('Couldn’t build timesheet right now. Try again later.');
-  }
-}
-
-
-    // Fallback SOP
-    return reply(SOP_TIMECLOCK);
-  } catch (e) {
-    console.error('[timeclock] error:', e?.message || e);
-    return reply('Timeclock error. Try again.');
+    // We still avoid dead-ends: we explain what to try instead of a generic error.
+    console.error('[timeclock] error:', e?.message);
+    return reply([
+      'I hit a hiccup saving that time entry.',
+      'Try again in a moment, or send "undo last" if you think a duplicate was added.'
+    ].join(' '));
   } finally {
-    try { typeof res?.req?.releaseLock === 'function' && res.req.releaseLock(); } catch {}
+    // release lock if your middleware attached one
+    try { res?.req?.releaseLock?.(); } catch {}
   }
 }
 

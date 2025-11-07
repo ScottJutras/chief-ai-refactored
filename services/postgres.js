@@ -5,11 +5,11 @@
 
 const { Pool } = require('pg');
 const crypto = require('crypto');
-const { zonedTimeToUtc, utcToZonedTime, formatInTimeZone } = require('date-fns-tz');
+const { formatInTimeZone } = require('date-fns-tz');
 
 // ---------- Lazy heavy dependencies ----------
-let ExcelJS = null;      // will be required only in exportTimesheetXlsx
-let PDFDocument = null;  // will be required only in exportTimesheetPdf
+let ExcelJS = null;      // required only in exportTimesheetXlsx
+let PDFDocument = null;  // required only in exportTimesheetPdf
 
 // ---------- Pool ----------
 const pool = new Pool({
@@ -24,10 +24,12 @@ pool.on('error', err => console.error('[PG] idle client error:', err?.message));
 
 // ---------- Core query helpers ----------
 async function query(text, params) { return queryWithRetry(text, params); }
+
 async function queryWithRetry(text, params, attempt = 1) {
-  try { return await pool.query(text, params); }
-  catch (e) {
-    const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET/i.test(e.message || '');
+  try {
+    return await pool.query(text, params);
+  } catch (e) {
+    const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET|Connection terminated/i.test(e.message || '');
     if (transient && attempt < 3) {
       console.warn(`[PG] retry ${attempt + 1}: ${e.message}`);
       await new Promise(r => setTimeout(r, attempt * 200));
@@ -36,12 +38,16 @@ async function queryWithRetry(text, params, attempt = 1) {
     throw e;
   }
 }
+
 async function queryWithTimeout(sql, params, ms = 9000) {
   return withClient(async client => {
-    await client.query('SET LOCAL statement_timeout = $1', [ms]);
+    // NOTE: SET LOCAL cannot be parameterized
+    const timeoutMs = Math.max(0, Number(ms) | 0);
+    await client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
     return client.query(sql, params);
   }, { useTransaction: true });
 }
+
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await pool.connect();
   try {
@@ -52,8 +58,11 @@ async function withClient(fn, { useTransaction = true } = {}) {
   } catch (err) {
     if (useTransaction) await client.query('ROLLBACK').catch(() => {});
     throw err;
-  } finally { client.release(); }
+  } finally {
+    client.release();
+  }
 }
+
 // ---------- File Exports (fetch) ----------
 async function getFileExport(id) {
   const { rows } = await query(
@@ -85,18 +94,18 @@ async function detectTimeEntriesCapabilities() {
     );
     const names = new Set(rows.map(r => String(r.column_name).toLowerCase()));
     SUPPORTS_CREATED_BY = names.has('created_by');
-    SUPPORTS_USER_ID = names.has('user_id');
+    SUPPORTS_USER_ID    = names.has('user_id');
   } catch {
     // Conservative defaults if detection fails
     SUPPORTS_CREATED_BY = false;
-    SUPPORTS_USER_ID = false;
+    SUPPORTS_USER_ID    = false;
   }
   return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
 }
 
 async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
-  const owner = String(ownerId || '').replace(/\D/g, '');
-  const actor = String(createdBy || owner).replace(/\D/g, '');
+  const owner = DIGITS(ownerId);
+  const actor = DIGITS(createdBy || owner);
 
   // Prefer per-actor (user_id) if available
   try {
@@ -179,8 +188,8 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
 
-  const ownerDigits = String(ownerId ?? '').replace(/\D/g, '');
-  const actorDigits = String(extras?.requester_id ?? ownerId ?? '').replace(/\D/g, '');
+  const ownerDigits = DIGITS(ownerId);
+  const actorDigits = DIGITS(extras?.requester_id || ownerId);
 
   const ownerSafe = ownerDigits || actorDigits || '0';
   const actorSafe = actorDigits || ownerDigits || '0'; // NEVER NULL
@@ -217,7 +226,7 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
 
   console.info('[PG/logTimeEntry] EXECUTING', {
     cols,
-    vals: [...vals, 'NOW()'],
+    params_preview: [...vals.slice(0, 5), '…', zone, local],
     actorSafe,
     sql: sql.replace(/\s+/g, ' ').slice(0, 300)
   });
@@ -236,25 +245,30 @@ const DIGITS = x => String(x || '').replace(/\D/g, '');
 const toAmount = x => parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
 const isValidIso = ts => !!ts && !Number.isNaN(new Date(ts).getTime());
 
-// ---------- Job helpers (unchanged) ----------
+// ---------- Job helpers ----------
 async function ensureJobByName(ownerId, name) {
   const owner = DIGITS(ownerId);
   const jobName = String(name || '').trim();
   if (!jobName) return null;
+
   let r = await query(
     `SELECT job_no, name, active AS is_active
        FROM public.jobs
-      WHERE owner_id=$1 AND lower(name)=lower($2) LIMIT 1`,
+      WHERE owner_id=$1 AND lower(name)=lower($2)
+      LIMIT 1`,
     [owner, jobName]
   );
   if (r.rowCount) return r.rows[0];
+
   r = await query(
     `SELECT job_no, job_name AS name, active AS is_active
        FROM public.jobs
-      WHERE owner_id=$1 AND lower(job_name)=lower($2) LIMIT 1`,
+      WHERE owner_id=$1 AND lower(job_name)=lower($2)
+      LIMIT 1`,
     [owner, jobName]
   );
   if (r.rowCount) return r.rows[0];
+
   const ins = await query(
     `INSERT INTO public.jobs (owner_id, job_name, name, active, start_date, created_at, updated_at)
      VALUES ($1,$2,$2,true,NOW(),NOW(),NOW())
@@ -263,6 +277,7 @@ async function ensureJobByName(ownerId, name) {
   );
   return ins.rows[0];
 }
+
 async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
   const owner = DIGITS(ownerId);
   if (explicitJobName) {
@@ -285,6 +300,7 @@ async function resolveJobContext(ownerId, { explicitJobName, require = false, fa
   if (require) throw new Error('No active job');
   return null;
 }
+
 async function createTaskWithJob(opts) {
   const job = await resolveJobContext(opts.ownerId, { explicitJobName: opts.jobName });
   opts.jobNo = job?.job_no || null;
@@ -302,6 +318,7 @@ async function generateOTP(userId) {
   );
   return otp;
 }
+
 async function verifyOTP(userId, otp) {
   const uid = DIGITS(userId);
   const { rows } = await query(
@@ -328,6 +345,7 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
   );
   return rows[0];
 }
+
 async function saveUserProfile(p) {
   const uid = DIGITS(p.user_id);
   const keys = Object.keys(p);
@@ -343,10 +361,12 @@ async function saveUserProfile(p) {
   );
   return rows[0];
 }
+
 async function getUserProfile(userId) {
   const { rows } = await query(`SELECT * FROM public.users WHERE user_id=$1`, [DIGITS(userId)]);
   return rows[0] || null;
 }
+
 async function getOwnerProfile(ownerId) {
   const { rows } = await query(`SELECT * FROM public.users WHERE user_id=$1`, [DIGITS(ownerId)]);
   return rows[0] || null;
@@ -363,6 +383,7 @@ async function createTask({ ownerId, createdBy, assignedTo, title, body, type = 
   );
   return rows[0];
 }
+
 async function getTaskByNo(ownerId, taskNo) {
   const { rows } = await query(
     `SELECT * FROM public.tasks WHERE owner_id=$1 AND task_no=$2 LIMIT 1`,
@@ -373,27 +394,37 @@ async function getTaskByNo(ownerId, taskNo) {
 
 // ---------- EXCEL EXPORT (lazy load) ----------
 async function exportTimesheetXlsx(opts) {
-  // ----- lazy require -----
   if (!ExcelJS) ExcelJS = require('exceljs');
 
   const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
-  const params = employeeName ? [ownerId, startIso, endIso, tz, employeeName] : [ownerId, startIso, endIso, tz];
+  const owner = DIGITS(ownerId);
+  const params = employeeName ? [owner, startIso, endIso, tz, employeeName] : [owner, startIso, endIso, tz];
+
   const { rows } = await queryWithTimeout(
-    `SELECT employee_name, type, timestamp, COALESCE(job_name,'') AS job_name, COALESCE(tz,$4) AS tz
-       FROM public.time_entries
-      WHERE owner_id=$1 AND timestamp>=$2::timestamptz AND timestamp<=$3::timestamptz
-      ${employeeName ? 'AND employee_name=$5' : ''}
-      ORDER BY employee_name, timestamp`,
-    params, 15000
+    `SELECT te.employee_name,
+            te.type,
+            te.timestamp,
+            COALESCE(j.name, j.job_name, '') AS job_name,
+            COALESCE(te.tz, $4)              AS tz
+       FROM public.time_entries te
+       LEFT JOIN public.jobs j
+         ON j.owner_id = $1 AND j.job_no = te.job_no
+      WHERE te.owner_id = $1
+        AND te.timestamp >= $2::timestamptz
+        AND te.timestamp <= $3::timestamptz
+        ${employeeName ? 'AND te.employee_name = $5' : ''}
+      ORDER BY te.employee_name, te.timestamp`,
+    params,
+    15000
   );
 
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Timesheet');
   ws.columns = [
-    { header: 'Employee', key: 'employee_name' },
-    { header: 'Type', key: 'type' },
+    { header: 'Employee',  key: 'employee_name' },
+    { header: 'Type',      key: 'type' },
     { header: 'Timestamp', key: 'timestamp' },
-    { header: 'Job', key: 'job_name' },
+    { header: 'Job',       key: 'job_name' },
   ];
   rows.forEach(r => ws.addRow(r));
 
@@ -404,7 +435,7 @@ async function exportTimesheetXlsx(opts) {
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
      VALUES ($1,$2,$3,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',$4,NOW())`,
-    [id, ownerId, filename, Buffer.from(buf)]
+    [id, owner, filename, Buffer.from(buf)]
   );
   const base = process.env.PUBLIC_BASE_URL || '';
   return { url: `${base}/exports/${id}`, id, filename };
@@ -412,18 +443,28 @@ async function exportTimesheetXlsx(opts) {
 
 // ---------- PDF EXPORT (lazy load) ----------
 async function exportTimesheetPdf(opts) {
-  // ----- lazy require -----
   if (!PDFDocument) PDFDocument = require('pdfkit');
 
   const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
-  const params = employeeName ? [ownerId, startIso, endIso, tz, employeeName] : [ownerId, startIso, endIso, tz];
+  const owner = DIGITS(ownerId);
+  const params = employeeName ? [owner, startIso, endIso, tz, employeeName] : [owner, startIso, endIso, tz];
+
   const { rows } = await queryWithTimeout(
-    `SELECT employee_name, type, timestamp, COALESCE(job_name,'') AS job_name, COALESCE(tz,$4) AS tz
-       FROM public.time_entries
-      WHERE owner_id=$1 AND timestamp>=$2::timestamptz AND timestamp<=$3::timestamptz
-      ${employeeName ? 'AND employee_name=$5' : ''}
-      ORDER BY employee_name, timestamp`,
-    params, 15000
+    `SELECT te.employee_name,
+            te.type,
+            te.timestamp,
+            COALESCE(j.name, j.job_name, '') AS job_name,
+            COALESCE(te.tz, $4)              AS tz
+       FROM public.time_entries te
+       LEFT JOIN public.jobs j
+         ON j.owner_id = $1 AND j.job_no = te.job_no
+      WHERE te.owner_id = $1
+        AND te.timestamp >= $2::timestamptz
+        AND te.timestamp <= $3::timestamptz
+        ${employeeName ? 'AND te.employee_name = $5' : ''}
+      ORDER BY te.employee_name, te.timestamp`,
+    params,
+    15000
   );
 
   const doc = new PDFDocument({ margin: 40 });
@@ -438,6 +479,7 @@ async function exportTimesheetPdf(opts) {
       `${r.employee_name} | ${r.type} | ${formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm')} | ${r.job_name || ''}`
     );
   });
+
   doc.end();
   await done;
   const buf = Buffer.concat(chunks);
@@ -448,29 +490,26 @@ async function exportTimesheetPdf(opts) {
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
      VALUES ($1,$2,$3,'application/pdf',$4,NOW())`,
-    [id, ownerId, filename, buf]
+    [id, owner, filename, buf]
   );
   const base = process.env.PUBLIC_BASE_URL || '';
   return { url: `${base}/exports/${id}`, id, filename };
 }
 
-// ---- Safe limiter exports (avoid undefined symbol at module.exports time)
-const __checkLimit =
-  (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
-  (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
-
-// --- Pending confirmations (serverless-safe; DB-backed) ---
+// ---------- Pending actions (confirmations, serverless-safe, TTL) ----------
 const PENDING_TTL_MIN = 10;
+
 async function savePendingAction({ ownerId, userId, kind, payload }) {
   const id = crypto.randomUUID();
   await query(
     `INSERT INTO public.pending_actions (id, owner_id, user_id, kind, payload, expires_at, created_at)
      VALUES ($1,$2,$3,$4,$5, NOW() + ($6 || ' minutes')::interval, NOW())
      ON CONFLICT (id) DO NOTHING`,
-    [id, String(ownerId), String(userId), kind, payload, String(PENDING_TTL_MIN)]
+    [id, String(ownerId), String(userId), String(kind), payload, String(PENDING_TTL_MIN)]
   );
   return id;
 }
+
 async function getPendingAction({ ownerId, userId }) {
   const { rows } = await query(
     `SELECT id, kind, payload
@@ -482,9 +521,15 @@ async function getPendingAction({ ownerId, userId }) {
   );
   return rows[0] || null;
 }
+
 async function deletePendingAction(id) {
-  await query(`DELETE FROM public.pending_actions WHERE id=$1`, [id]);
+  await query(`DELETE FROM public.pending_actions WHERE id=$1`, [String(id)]);
 }
+
+// ---- Safe limiter exports (avoid undefined symbol at module.exports time)
+const __checkLimit =
+  (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
+  (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
 
 module.exports = {
   // Core
@@ -517,6 +562,4 @@ module.exports = {
   savePendingAction,
   getPendingAction,
   deletePendingAction,
-
-  // …add any other helpers you already export (listMyTasks, etc.)
 };

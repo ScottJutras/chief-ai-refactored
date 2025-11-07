@@ -18,10 +18,15 @@
       "memory": 1024,
       "maxDuration": 30,
       "includeFiles": "{scripts/rag_loader.js,docs/howto/**}"
+    },
+    "api/cron/cleanup_pending.js": {
+      "memory": 512,
+      "maxDuration": 10
     }
   },
   "routes": [
     { "src": "^/api/cron/refresh_docs$", "dest": "/api/cron/refresh_docs.js" },
+    { "src": "^/api/cron/cleanup-pending$", "dest": "/api/cron/cleanup_pending.js" },
 
     { "src": "^/api/webhook/reminders/cron/(.*)$", "dest": "/api/webhook.js" },
     { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
@@ -34,6 +39,10 @@
     {
       "path": "/api/cron/refresh_docs",
       "schedule": "0 3 * * 1"
+    },
+    {
+      "path": "/api/cron/cleanup-pending",
+      "schedule": "5 3 * * 1"
     }
   ]
 }

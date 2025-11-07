@@ -1,7 +1,8 @@
 // handlers/commands/job.js
 // ---------------------------------------------------------------
-// Job commands – create, set active, start/activate, pause/resume/finish, list,
-// move-last-log, summary. All DB calls via services/postgres.
+// Job commands – start/activate, create (with confirm), set active,
+// pause/resume/finish, list, move-last-log, active?.
+// All DB calls via services/postgres.
 // ---------------------------------------------------------------
 const { formatInTimeZone } = require('date-fns-tz');
 const pg = require('../../services/postgres');
@@ -19,33 +20,26 @@ const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
 /** Parse job name for “start/activate job …” style commands */
 function parseStartActivateName(text) {
   const s = String(text || '').trim();
-  const patterns = [
-    /^start\s+job\s+(.+)$/i,
-    /^activate\s+job\s+(.+)$/i,
-    /^set\s+job\s+(.+?)\s+(?:active|on)$/i,
-    /^job\s+start\s+(.+)$/i,
-  ];
-  for (const re of patterns) {
-    const m = s.match(re);
-    if (m && m[1]) return m[1].trim();
-  }
-  // Gentle fallback: message contains "job" and starts with "start"
-  if (/^\s*start\s+/i.test(s) && /job/i.test(s)) {
-    const m2 = s.match(/job\s+(.+)/i);
-    if (m2 && m2[1]) return m2[1].trim();
-  }
+  // Accept:
+  // "start job 1556 MedwayPark Dr", "start 1556 MedwayPark Dr"
+  // "activate job Kitchen Reno", "activate Kitchen Reno"
+  // "set job <name> active"
+  let m = s.match(/^(?:start|activate)(?:\s+job)?\s+(.+)$/i);
+  if (m && m[1]) return m[1].trim();
+  m = s.match(/^set\s+job\s+(.+?)\s+(?:active|on)$/i);
+  if (m && m[1]) return m[1].trim();
   return null;
 }
 
 async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lc = String(text || '').toLowerCase().trim();
   const state = (await getPendingTransactionState(from)) || {};
-  const zone = userProfile?.tz || TZ_DEFAULT;
+  const zone = userProfile?.tz || ownerProfile?.tz || TZ_DEFAULT;
 
   try {
     // -------------------------------------------------
-    // 0. START / ACTIVATE JOB <name>
-    // (Explicit confirmation reply with ✅ + timestamp)
+    // 0) START / ACTIVATE JOB <name>
+    //    (Explicit confirmation reply with ✅ + timestamp)
     // -------------------------------------------------
     {
       const name = parseStartActivateName(text);
@@ -63,7 +57,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
     }
 
     // -------------------------------------------------
-    // 1. CREATE JOB <name> (with confirmation)
+    // 1) CREATE JOB <name>  (with confirmation)
     // -------------------------------------------------
     {
       const m = lc.match(/^create\s+job\s+(.+)$/i);
@@ -73,7 +67,6 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
           res.status(200).type('application/xml').send(RESP(`Please provide a job name.`));
           return true;
         }
-        // Store pending create
         state.jobFlow = { action: 'create', name };
         await setPendingTransactionState(from, state);
         await sendQuickReply(
@@ -107,7 +100,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
         }
         return true;
       }
-      if (/^no$/i.test(lc)) {
+      if (/^(no|cancel)$/i.test(lc)) {
         delete state.jobFlow;
         await setPendingTransactionState(from, state);
         await sendMessage(from, `Job creation cancelled.`);
@@ -120,7 +113,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
         return true;
       }
       if (state.jobFlow.expectRename) {
-        const newName = text.trim();
+        const newName = String(text || '').trim();
         if (!newName) {
           await sendMessage(from, `Please provide a name.`);
           return true;
@@ -128,14 +121,10 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
         state.jobFlow.name = newName;
         delete state.jobFlow.expectRename;
         await setPendingTransactionState(from, state);
-        await sendQuickReply(
-          from,
-          `Create job **${newName}**?`,
-          ['Yes', 'No']
-        );
+        await sendQuickReply(from, `Create job **${newName}**?`, ['Yes', 'No']);
         return true;
       }
-      // Repeat prompt
+      // Repeat prompt (safety)
       await sendQuickReply(
         from,
         `Create job **${state.jobFlow.name}**?`,
@@ -145,7 +134,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
     }
 
     // -------------------------------------------------
-    // 2. SET ACTIVE JOB <name|#no> (legacy phrasing)
+    // 2) SET ACTIVE JOB <name|#no> (legacy phrasing)
     // -------------------------------------------------
     {
       const m = lc.match(/^(?:set\s+)?active\s+job\s+(.+)$/i);
@@ -163,7 +152,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
     }
 
     // -------------------------------------------------
-    // 3. PAUSE / RESUME / FINISH JOB
+    // 3) PAUSE / RESUME / FINISH JOB
     // -------------------------------------------------
     {
       const verbMap = { pause: 'pauseJob', resume: 'resumeJob', finish: 'finishJob' };
@@ -186,7 +175,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
     }
 
     // -------------------------------------------------
-    // 4. LIST OPEN JOBS
+    // 4) LIST OPEN JOBS
     // -------------------------------------------------
     if (/^list\s+jobs?$/i.test(lc)) {
       try {
@@ -206,7 +195,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
     }
 
     // -------------------------------------------------
-    // 5. ACTIVE JOB?
+    // 5) ACTIVE JOB?
     // -------------------------------------------------
     if (/^active\s+job\??$/i.test(lc)) {
       try {
@@ -222,7 +211,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
     }
 
     // -------------------------------------------------
-    // 6. MOVE LAST LOG TO <job>
+    // 6) MOVE LAST LOG TO <job>
     // -------------------------------------------------
     {
       const m = lc.match(/^move\s+last\s+log\s+to\s+(.+)$/i);
@@ -244,7 +233,8 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
       }
     }
 
-    return false; // fall through
+    // fall-through
+    return false;
   } catch (e) {
     console.error('[job] error:', e?.message);
     res.status(200).type('application/xml').send(RESP(`Job error. Try again.`));

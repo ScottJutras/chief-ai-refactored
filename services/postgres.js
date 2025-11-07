@@ -580,6 +580,7 @@ module.exports = {
   // Jobs / context
   ensureJobByName, resolveJobContext,
   createTaskWithJob, logTimeEntryWithJob,
+  activateJobByName,
 
   // Users
   generateOTP, verifyOTP,

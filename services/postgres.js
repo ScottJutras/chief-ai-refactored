@@ -319,12 +319,13 @@ const isValidIso = ts => !!ts && !Number.isNaN(new Date(ts).getTime());
 
 // Find or create a job by name (handles schemas using either name or job_name).
 // IMPORTANT: use distinct placeholders for job_name vs name to avoid 42P08.
+// Also resilient to 23505 (job_no unique) by re-selecting after a collision.
 async function ensureJobByName(ownerId, name) {
   const owner   = DIGITS(ownerId);
   const jobName = String(name || '').trim();
   if (!jobName) return null;
 
-  // Try either column (schemas may use name OR job_name)
+  // 1) Try to find by either column (some schemas store in name, others in job_name)
   let r = await query(
     `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
        FROM public.jobs
@@ -335,15 +336,33 @@ async function ensureJobByName(ownerId, name) {
   );
   if (r.rowCount) return r.rows[0];
 
-  // Insert with separate params ($2 for job_name, $3 for name).
-  const ins = await query(
-    `INSERT INTO public.jobs (owner_id, job_name, name, active, start_date, created_at, updated_at)
-     VALUES ($1, $2, $3, true, NOW(), NOW(), NOW())
-     RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
-    [owner, jobName, jobName]
-  );
-  return ins.rows[0];
+  // 2) Try to insert; on 23505 (unique violation), re-select and return.
+  try {
+    const ins = await query(
+      `INSERT INTO public.jobs (owner_id, job_name, name, active, start_date, created_at, updated_at)
+       VALUES ($1, $2, $3, true, NOW(), NOW(), NOW())
+       RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
+      [owner, jobName, jobName]
+    );
+    return ins.rows[0];
+  } catch (e) {
+    // If a concurrent insert or sequence hiccup caused a duplicate job_no,
+    // re-select and return (idempotent behavior).
+    if (e && e.code === '23505') {
+      const again = await query(
+        `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+           FROM public.jobs
+          WHERE owner_id = $1
+            AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
+          LIMIT 1`,
+        [owner, jobName]
+      );
+      if (again.rowCount) return again.rows[0];
+    }
+    throw e;
+  }
 }
+
 
 
 async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {

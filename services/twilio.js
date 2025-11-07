@@ -1,84 +1,179 @@
 // services/twilio.js
-require('dotenv').config();
-const twilio = require('twilio');
+// Twilio wrapper with dev-safe mock and back-compat for old env names & helpers.
+//
+// Exports:
+//   - sendWhatsApp(to, body, mediaUrls?)
+//   - sendSMS(to, body)
+//   - sendMessage(to, body)                  // alias for WA text
+//   - sendQuickReply(to, body, replies[])    // WA buttons (<=3)
+//   - sendTemplateMessage(to, contentSid, vars?)
+//   - sendTemplateQuickReply(to, contentSid, vars?) // alias to template (Twilio limitation)
+//   - verifyTwilioSignature(options?)        // express middleware
+//
+// Env (any of these work):
+//   TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
+//   TWILIO_WHATSAPP_FROM (e.g. "whatsapp:+1XXXXXXXXXX")
+//   TWILIO_SMS_FROM      (e.g. "+1XXXXXXXXXX")
+//   TWILIO_WHATSAPP_NUMBER (legacy; e.g. "whatsapp:+1XXXXXXXXXX" or "+1XXXXXXXXXX")
+//   TWILIO_MESSAGING_SERVICE_SID (optional; used instead of from=)
+//   MOCK_TWILIO=1 for local mock
+
+const crypto = require('crypto');
 
 const {
+  NODE_ENV,
+  MOCK_TWILIO,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
-  TWILIO_WHATSAPP_NUMBER,
+  TWILIO_WHATSAPP_FROM,
+  TWILIO_SMS_FROM,
+  TWILIO_WHATSAPP_NUMBER,          // legacy
+  TWILIO_MESSAGING_SERVICE_SID     // optional
 } = process.env;
 
-if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_NUMBER) {
-  throw new Error('Missing required Twilio env vars');
+const isProd = NODE_ENV === 'production';
+const resolvedWhatsAppFrom = normalizeWhatsAppFrom(TWILIO_WHATSAPP_FROM || TWILIO_WHATSAPP_NUMBER);
+const hasCreds = !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && (resolvedWhatsAppFrom || TWILIO_SMS_FROM || TWILIO_MESSAGING_SERVICE_SID));
+const useMock = !isProd && (!hasCreds || String(MOCK_TWILIO) === '1');
+
+let twilioClient = null;
+
+// --------- helpers ----------
+function normalizeWhatsAppFrom(v) {
+  if (!v) return '';
+  const s = String(v).trim();
+  if (s.toLowerCase().startsWith('whatsapp:')) return s;
+  // assume number
+  const e164 = s.startsWith('+') ? s : `+${s}`;
+  return `whatsapp:${e164}`;
 }
-
-const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
-
-// Template variable whitelist
-const TEMPLATE_VARS = {
-  'HX0280df498999848aaff04cc079e16c31': ['1', '2'], // location confirm
-  'HXd14a878175fd4b24cee0c0ca6061da96': ['1'],      // start job
-};
-
-function wa(to) {
+function toWhatsApp(to) {
   const clean = String(to || '').replace(/^whatsapp:/i, '').trim();
   const e164 = clean.startsWith('+') ? clean : `+${clean}`;
   return `whatsapp:${e164}`;
 }
-function shapeVars(sid, input = {}) {
-  const allowed = TEMPLATE_VARS[sid] || [];
-  const shaped = {};
-  for (const k of allowed) shaped[k] = String(input[k] ?? '');
-  const extra = Object.keys(input).filter(k => !allowed.includes(k));
-  if (extra.length) console.warn('[twilio] dropping extra vars', { sid, extra });
-  return shaped;
+
+// ---------- Mock client (dev) ----------
+function makeMockClient() {
+  const log = (...args) => console.log('[TWILIO:MOCK]', ...args);
+  return {
+    messages: {
+      create: async (opts) => {
+        const sid = 'SM' + crypto.randomBytes(16).toString('hex');
+        log('messages.create', { ...opts, sid });
+        return { sid, status: 'queued', mock: true };
+      }
+    }
+  };
 }
 
-// Plain message
+// ---------- Real client ----------
+function makeRealClient() {
+  const real = require('twilio')(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+  return real;
+}
+
+if (useMock) {
+  console.warn('[TWILIO] Using MOCK client (local dev). Set env to use real Twilio.');
+  twilioClient = makeMockClient();
+} else {
+  if (!hasCreds) throw new Error('Missing required Twilio env vars');
+  twilioClient = makeRealClient();
+}
+
+// ---------- Core senders ----------
+async function sendWhatsApp(to, body, mediaUrls) {
+  const payload = {
+    to: toWhatsApp(to),
+    body
+  };
+
+  // Prefer Messaging Service if provided
+  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
+    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+  } else {
+    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
+  }
+
+  if (mediaUrls && mediaUrls.length) payload.mediaUrl = mediaUrls;
+  return twilioClient.messages.create(payload);
+}
+
+async function sendSMS(to, body) {
+  const payload = { to, body };
+  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
+    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+  } else {
+    payload.from = useMock ? '+10000000000' : TWILIO_SMS_FROM;
+    if (!payload.from && !useMock) {
+      throw new Error('TWILIO_SMS_FROM is required when Messaging Service SID is not set');
+    }
+  }
+  return twilioClient.messages.create(payload);
+}
+
+// ---------- Convenience (back-compat) ----------
 async function sendMessage(to, body) {
-  const msg = await client.messages.create({
-    body,
-    from: TWILIO_WHATSAPP_NUMBER,
-    to: wa(to),
-  });
-  console.log(`[twilio] sent ${msg.sid} → ${wa(to)}`);
-  return msg.sid;
+  return sendWhatsApp(to, body);
 }
 
-// Quick-reply (up to 3 buttons)
 async function sendQuickReply(to, body, replies = []) {
-  const buttons = replies.slice(0, 3).map(r => `reply?text=${encodeURIComponent(r)}`);
-  const msg = await client.messages.create({
-    body,
-    from: TWILIO_WHATSAPP_NUMBER,
-    to: wa(to),
+  // Up to 3 quick-reply buttons via persistentAction
+  const buttons = (replies || []).slice(0, 3).map(r => `reply?text=${encodeURIComponent(String(r))}`);
+  const payload = {
+    to: toWhatsApp(to),
     persistentAction: buttons,
-  });
-  console.log(`[twilio] quick-reply ${msg.sid} → ${wa(to)}`);
-  return msg.sid;
+    body
+  };
+
+  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
+    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+  } else {
+    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
+  }
+
+  return twilioClient.messages.create(payload);
 }
 
-// Template message
 async function sendTemplateMessage(to, contentSid, vars = {}) {
-  const shaped = shapeVars(contentSid, vars);
-  const msg = await client.messages.create({
+  // Vars must be string-keyed object
+  const payload = {
+    to: toWhatsApp(to),
     contentSid,
-    contentVariables: JSON.stringify(shaped),
-    from: TWILIO_WHATSAPP_NUMBER,
-    to: wa(to),
-  });
-  console.log(`[twilio] template ${msg.sid} → ${wa(to)} sid=${contentSid}`);
-  return msg.sid;
+    contentVariables: JSON.stringify(vars || {})
+  };
+
+  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
+    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+  } else {
+    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
+  }
+
+  return twilioClient.messages.create(payload);
 }
 
-// Template + quick-reply (no persistentAction – Twilio limitation)
+// Twilio limitation: templates + QR need Content API; no extra buttons param.
 async function sendTemplateQuickReply(to, contentSid, vars = {}) {
   return sendTemplateMessage(to, contentSid, vars);
 }
 
+// ---------- Signature verification middleware ----------
+function verifyTwilioSignature(options = {}) {
+  if (!useMock && TWILIO_AUTH_TOKEN) {
+    const twilio = require('twilio');
+    return twilio.webhook({ validate: true, ...options });
+  }
+  return function devBypass(_req, _res, next) { next(); };
+}
+
 module.exports = {
+  // Core
+  sendWhatsApp,
+  sendSMS,
+  verifyTwilioSignature,
+  // Back-compat convenience
   sendMessage,
   sendQuickReply,
   sendTemplateMessage,
-  sendTemplateQuickReply,
+  sendTemplateQuickReply
 };

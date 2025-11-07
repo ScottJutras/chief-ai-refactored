@@ -1,8 +1,9 @@
 // handlers/commands/job.js
 // ---------------------------------------------------------------
-// Job commands – create, set active, pause/resume/finish, list,
-// move‑last‑log, summary. All DB calls via services/postgres.
+// Job commands – create, set active, start/activate, pause/resume/finish, list,
+// move-last-log, summary. All DB calls via services/postgres.
 // ---------------------------------------------------------------
+const { formatInTimeZone } = require('date-fns-tz');
 const pg = require('../../services/postgres');
 const { releaseLock } = require('../../middleware/lock');
 const {
@@ -12,13 +13,55 @@ const {
 } = require('../../utils/stateManager');
 const { sendQuickReply, sendMessage } = require('../../services/twilio');
 
+const TZ_DEFAULT = 'America/Toronto';
 const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
+
+/** Parse job name for “start/activate job …” style commands */
+function parseStartActivateName(text) {
+  const s = String(text || '').trim();
+  const patterns = [
+    /^start\s+job\s+(.+)$/i,
+    /^activate\s+job\s+(.+)$/i,
+    /^set\s+job\s+(.+?)\s+(?:active|on)$/i,
+    /^job\s+start\s+(.+)$/i,
+  ];
+  for (const re of patterns) {
+    const m = s.match(re);
+    if (m && m[1]) return m[1].trim();
+  }
+  // Gentle fallback: message contains "job" and starts with "start"
+  if (/^\s*start\s+/i.test(s) && /job/i.test(s)) {
+    const m2 = s.match(/job\s+(.+)/i);
+    if (m2 && m2[1]) return m2[1].trim();
+  }
+  return null;
+}
 
 async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lc = String(text || '').toLowerCase().trim();
   const state = (await getPendingTransactionState(from)) || {};
+  const zone = userProfile?.tz || TZ_DEFAULT;
 
   try {
+    // -------------------------------------------------
+    // 0. START / ACTIVATE JOB <name>
+    // (Explicit confirmation reply with ✅ + timestamp)
+    // -------------------------------------------------
+    {
+      const name = parseStartActivateName(text);
+      if (name) {
+        try {
+          const j = await pg.activateJobByName(ownerId, name);
+          const when = formatInTimeZone(new Date(), zone, 'yyyy-MM-dd HH:mm:ss');
+          await sendMessage(from, `✅ Job started: **${j.name}** (#${j.job_no}) at ${when} ${zone}`);
+        } catch (e) {
+          console.warn('[job] start/activate failed:', e?.message);
+          await sendMessage(from, `Sorry—couldn’t start that job. ${e?.message || ''}`.trim());
+        }
+        return true;
+      }
+    }
+
     // -------------------------------------------------
     // 1. CREATE JOB <name> (with confirmation)
     // -------------------------------------------------
@@ -102,7 +145,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
     }
 
     // -------------------------------------------------
-    // 2. SET ACTIVE JOB <name|#no>
+    // 2. SET ACTIVE JOB <name|#no> (legacy phrasing)
     // -------------------------------------------------
     {
       const m = lc.match(/^(?:set\s+)?active\s+job\s+(.+)$/i);

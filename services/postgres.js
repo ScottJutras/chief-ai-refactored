@@ -63,6 +63,46 @@ async function withClient(fn, { useTransaction = true } = {}) {
   }
 }
 
+// --- NEW: activate a job by name (upsert + set active, deactivate others)
+async function activateJobByName(ownerId, rawName) {
+  const owner = DIGITS(ownerId);
+  const name  = String(rawName || '').trim();
+  if (!name) throw new Error('Missing job name');
+
+  // ensure the job exists (resolves job_no)
+  const j = await ensureJobByName(owner, name);
+  const jobNo = j?.job_no;
+  if (!jobNo) throw new Error('Failed to create/resolve job');
+
+  // deactivate others, activate this one
+  await withClient(async (client) => {
+    await client.query(
+      `UPDATE public.jobs
+         SET active=false, updated_at=NOW()
+       WHERE owner_id=$1 AND active=true AND job_no<>$2`,
+      [owner, jobNo]
+    );
+    await client.query(
+      `UPDATE public.jobs
+         SET active=true, updated_at=NOW(), name=COALESCE(name, $3), job_name=COALESCE(job_name, $3)
+       WHERE owner_id=$1 AND job_no=$2`,
+      [owner, jobNo, name]
+    );
+  });
+
+  // fetch final state (best effort)
+  const { rows } = await query(
+    `SELECT job_no, COALESCE(name, job_name) AS name, active, updated_at
+       FROM public.jobs
+      WHERE owner_id=$1 AND job_no=$2
+      LIMIT 1`,
+    [owner, jobNo]
+  );
+  return rows[0] || { job_no: jobNo, name, active: true };
+}
+module.exports.activateJobByName = activateJobByName;
+
+
 // ---------- File Exports (fetch) ----------
 async function getFileExport(id) {
   const { rows } = await query(

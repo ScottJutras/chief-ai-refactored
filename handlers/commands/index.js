@@ -1,7 +1,7 @@
 // handlers/commands/index.js
 // ---------------------------------------------------------------
 // Central command orchestrator – keeps the router fast & safe.
-// Falls back to per‑file handlers; handles onboarding, pending
+// Falls back to per-file handlers; handles onboarding, pending
 // confirmations, subscription gates, lock release, and audit.
 // ---------------------------------------------------------------
 const pg = require('../../services/postgres');
@@ -10,13 +10,13 @@ const { getPendingTransactionState, setPendingTransactionState, deletePendingTra
 const { sendTemplateMessage } = require('../../services/twilio');
 const confirmationTemplates = require('../../config').confirmationTemplates;
 
-// Lazy‑load per‑file handlers (router already does this, we just expose them)
+// Lazy-load per-file handlers
 let tasksHandler, handleTimeclock, handleJob;
 try { ({ tasksHandler } = require('./tasks')); } catch {}
 try { ({ handleTimeclock } = require('./timeclock')); } catch {}
 try { handleJob = require('./job'); } catch {}
 
-/** Helper – safe lock release + audit */
+/** Helper – safe lock release */
 async function safeCleanup(req) {
   const lockKey = `lock:${req.ownerId || req.from || 'GLOBAL'}`;
   try { await releaseLock(lockKey); } catch {}
@@ -33,15 +33,13 @@ module.exports = async function handleCommands(
   from, text, userProfile, ownerId, ownerProfile, isOwner, res
 ) {
   const lc = String(text || '').toLowerCase().trim();
-  const lockKey = `lock:${from}`;
 
   try {
     // -------------------------------------------------
     // 1. ONBOARDING INTERCEPT
     // -------------------------------------------------
     if (userProfile?.onboarding_in_progress) {
-      // Let a dedicated onboarding flow own the response
-      const onboarding = require('./onboarding'); // create this file if you need multi‑step
+      const onboarding = require('./onboarding');
       const handled = await onboarding.handle(from, text, userProfile, ownerId, res);
       if (handled) {
         await safeCleanup({ ownerId: from });
@@ -83,9 +81,7 @@ module.exports = async function handleCommands(
         await safeCleanup({ ownerId: from });
         return true;
       }
-      // Default prompt
-      const prompt = `Reply **yes**, **no**, or **edit** to confirm the ${type}.`;
-      await twiml(res, prompt);
+      await twiml(res, `Reply **yes**, **no**, or **edit** to confirm the ${type}.`);
       await safeCleanup({ ownerId: from });
       return true;
     }
@@ -104,7 +100,7 @@ module.exports = async function handleCommands(
     }
 
     // -------------------------------------------------
-    // 4. FALLBACK TO PER‑FILE HANDLERS
+    // 4. FALLBACK TO PER-FILE HANDLERS
     // -------------------------------------------------
     if (tasksHandler && await tasksHandler(from, text, userProfile, ownerId, ownerProfile, isOwner, res)) {
       await safeCleanup({ ownerId: from });
@@ -131,7 +127,7 @@ module.exports = async function handleCommands(
     }
 
     // Nothing matched
-    await twiml(res, `PocketCFO – try "task …", "clock in", or "create job …".`);
+    await twiml(res, `PocketCFO – try "task …", "clock in", or "start job <name>".`);
     await safeCleanup({ ownerId: from });
     return true;
   } catch (err) {

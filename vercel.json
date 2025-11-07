@@ -4,12 +4,7 @@
     "api/webhook.js": {
       "memory": 2048,
       "maxDuration": 15,
-      "excludeFiles": "{docs/**,public/**,dashboard/**,parse/**,deep-dive/**,api/index-sops.js,api/index.js,node_modules/pdfkit/**,node_modules/exceljs/**,node_modules/@google-cloud/**,node_modules/google-auth-library/**}"
-    },
-    "api/index-sops.js": {
-      "memory": 1024,
-      "maxDuration": 10,
-      "includeFiles": "docs/howto/**"
+      "excludeFiles": "{docs/**,public/**,dashboard/**,parse/**,deep-dive/**,api/index.js,node_modules/pdfkit/**,node_modules/exceljs/**,node_modules/@google-cloud/**,node_modules/google-auth-library/**}"
     },
     "api/index.js": {
       "memory": 1024,
@@ -18,10 +13,19 @@
     "api/ping.js": {
       "memory": 256,
       "maxDuration": 5
+    },
+    "api/cron/refresh_docs.js": {
+      "memory": 768,
+      "maxDuration": 30,
+      "includeFiles": [
+        "scripts/rag_loader.js",
+        "docs/howto/**",
+        "docs/sops/**"
+      ]
     }
   },
   "routes": [
-    { "src": "^/api/index-sops$", "dest": "/api/index-sops.js" },
+    { "src": "^/api/cron/refresh_docs$", "dest": "/api/cron/refresh_docs.js" },
     { "src": "^/api/webhook/reminders/cron/(.*)$", "dest": "/api/webhook.js" },
     { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
     { "src": "^/webhook$", "dest": "/api/webhook.js" },
@@ -32,6 +36,10 @@
     {
       "path": "/api/webhook/reminders/cron/4bf3e4de8ccc4713119b79959f0ac990af24ca2ea5e348ff462b1d7958ae424e",
       "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/refresh_docs?token=REPLACE_WITH_YOUR_CRON_TOKEN",
+      "schedule": "0 9 * * 1"
     }
   ]
 }

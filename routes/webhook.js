@@ -1,12 +1,10 @@
 // routes/webhook.js
 // Single Express router that owns raw-body parsing, Twilio-friendly responses,
 // lightweight middlewares, and tolerant fallbacks.
-
 const express = require('express');
 const app = express();
 const router = express.Router();
 const querystring = require('querystring');
-
 // ---------- Helpers ----------
 /* =========================
  * Small helpers
@@ -17,17 +15,13 @@ function xmlEsc(s = '') {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
-
 const xml = (s = '') => `<Response><Message>${xmlEsc(s)}</Message></Response>`;
-
 const ok = (res, text = 'OK') => {
   if (res.headersSent) return;
   res.status(200).type('application/xml; charset=utf-8').send(xml(text));
 };
-
 const normalizePhone = (raw = '') =>
   String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
-
 function pickFirstMedia(body = {}) {
   const n = parseInt(body.NumMedia || '0', 10) || 0;
   if (n <= 0) return { n: 0, url: null, type: null };
@@ -35,23 +29,18 @@ function pickFirstMedia(body = {}) {
   const typ = body.MediaContentType0 || body.MediaContentType || null;
   return { n, url, type: typ ? String(typ).toLowerCase() : null };
 }
-
 function canUseAgent(profile) {
   const tier = (profile?.subscription_tier || profile?.plan || '').toLowerCase();
   return !!tier && tier !== 'basic' && tier !== 'free';
 }
-
 // ---------- Raw body parser (Twilio signature needs original payload) ----------
 router.use((req, _res, next) => {
   if (req.method !== 'POST') return next();
-
   const ct = String(req.headers['content-type'] || '').toLowerCase();
   const isForm = ct.includes('application/x-www-form-urlencoded');
   if (!isForm) return next();
-
   // If something upstream already set rawBody + body, don't re-parse.
   if (req.body && Object.keys(req.body).length && typeof req.rawBody === 'string') return next();
-
   let raw = '';
   req.setEncoding('utf8');
   req.on('data', chunk => {
@@ -67,25 +56,22 @@ router.use((req, _res, next) => {
   });
   req.on('error', () => { req.rawBody = raw || ''; req.body = {}; next(); });
 });
-
 // ---------- Non-POST guard ----------
 router.all('*', (req, res, next) => {
   if (req.method === 'POST') return next();
   return ok(res, 'OK');
 });
-
 // ---------- Identity & canonical URL ----------
 router.use((req, _res, next) => {
   req.from = req.body?.From ? normalizePhone(req.body.From) : null;
   req.ownerId = req.from || 'GLOBAL';
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
-  const host  = (req.headers['x-forwarded-host']  || req.headers.host || '').split(',')[0].trim();
+  const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
   // Use the *actual* path+query Twilio called (what it signs)
-  const path  = req.originalUrl || req.url || '/api/webhook';
+  const path = req.originalUrl || req.url || '/api/webhook';
   req.twilioUrl = `${proto}://${host}${path}`;
    next();
  });
-
 // ---------- 8s Safety Timer ----------
 router.use((req, res, next) => {
   if (res.locals._safety) return next();
@@ -100,10 +86,9 @@ router.use((req, res, next) => {
   res.on('close', clear);
   next();
 });
-
 // ---------- Fast-path: version ----------
 router.post('*', (req, res, next) => {
-  console.log('[ROUTER] version');   // 👈 add here
+  console.log('[ROUTER] version'); // 👈 add here
   const bodyText = String(req.body?.Body || '').trim().toLowerCase();
   if (bodyText === 'version') {
     const v = process.env.VERCEL_GIT_COMMIT_SHA || process.env.COMMIT_SHA || 'dev-local';
@@ -111,7 +96,6 @@ router.post('*', (req, res, next) => {
   }
   next();
 });
-
 // ---------- Light middlewares (lazy) ----------
 router.use((req, res, next) => {
   try {
@@ -128,17 +112,14 @@ router.use((req, res, next) => {
     next();
   }
 });
-
 // ---------- Media Handler ----------
 router.post('*', async (req, res, next) => {
   console.log('[ROUTER] media');
   const { n, url, type } = pickFirstMedia(req.body || {});
   if (n <= 0) return next();
-
   try {
     const media = require('../handlers/media');
     const contentType = (type || '').split(';')[0];
-
     // AUDIO → transcribe
     if (contentType.startsWith('audio/')) {
       let transcript = '';
@@ -153,7 +134,6 @@ router.post('*', async (req, res, next) => {
       }
       return ok(res, `I couldn't understand that audio. Try texting.`);
     }
-
     // IMAGE → parse receipt
     if (contentType.startsWith('image/')) {
       let parsed = null;
@@ -177,40 +157,33 @@ router.post('*', async (req, res, next) => {
       }
       return ok(res, 'Got your image — thanks!');
     }
-
     return ok(res, 'File received.');
   } catch (e) {
     console.error('[MEDIA] error:', e?.message);
     return ok(res, 'Media processed.');
   }
 });
-
 // ---------- TEXT ROUTING ----------
 router.post('*', async (req, res, next) => {
   console.log('[ROUTER] text');
   try {
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();
-
     // Heuristic: user is asking for help/how-to
     const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc);
-
     // Intent detectors
     let looksTask = /^task\b/.test(lc) || /\btasks?\b/.test(lc);
-    let looksJob  = /\b(job|jobs|active job|set active|close job|list jobs|move last log)\b/.test(lc);
+    let looksJob = /\b(job|jobs|active job|set active|close job|list jobs|move last log)\b/.test(lc);
     let looksTime = /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc);
-
     // Nudge intents when user literally asks how to use a module
     if (askingHow && /\btasks?\b/.test(lc)) looksTask = true;
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc)) looksTime = true;
     if (askingHow && /\bjobs?\b/.test(lc)) looksJob = true;
-
     const topicHints = [
       looksTask ? 'tasks' : null,
-      looksJob  ? 'jobs' : null,
+      looksJob ? 'jobs' : null,
       looksTime ? 'timeclock' : null,
     ].filter(Boolean);
-
     // SOP fallbacks (AVOID angle brackets in XML)
     const SOP = {
       tasks:
@@ -218,7 +191,7 @@ router.post('*', async (req, res, next) => {
         '• Create: task - buy nails\n' +
         '• List mine: my tasks\n' +
         '• Complete: done #4\n' +
-        '• Assign: task @PHONE - pickup shingles\n' +   // ← no <phone>
+        '• Assign: task @PHONE - pickup shingles\n' + // ← no <phone>
         '• Due date: task - call client | due tomorrow 4pm',
       timeclock:
         'Timeclock — Quick guide:\n' +
@@ -233,12 +206,10 @@ router.post('*', async (req, res, next) => {
         '• List: list jobs\n' +
         '• Close: close job Roof Repair',
     };
-
     const cmds = require('../handlers/commands');
-    const tasksHandler    = cmds.tasks     || require('../handlers/commands/tasks').tasksHandler;
-    const handleJob       = cmds.job       || require('../handlers/commands/job');
+    const tasksHandler = cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
+    const handleJob = cmds.job || require('../handlers/commands/job');
     const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
-
     // TASKS
     if (looksTask && typeof tasksHandler === 'function') {
       const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
@@ -250,7 +221,6 @@ router.post('*', async (req, res, next) => {
       }
       return;
     }
-
     // JOBS
     if (looksJob && typeof handleJob === 'function') {
       const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
@@ -262,7 +232,6 @@ router.post('*', async (req, res, next) => {
       }
       return;
     }
-
     // TIMECLOCK
     if (looksTime && typeof handleTimeclock === 'function') {
       const out = await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
@@ -274,7 +243,6 @@ router.post('*', async (req, res, next) => {
       }
       return;
     }
-
     // AGENT (subscription-gated)
     if (canUseAgent(req.userProfile)) {
       try {
@@ -290,7 +258,6 @@ router.post('*', async (req, res, next) => {
         console.warn('[AGENT] failed:', e?.message);
       }
     }
-
     // DEFAULT HELP
     return ok(res,
       'PocketCFO — What I can do:\n' +
@@ -302,7 +269,6 @@ router.post('*', async (req, res, next) => {
     return next(err);
   }
 });
-
 // ---------- Final fallback – always 200 TwiML ----------
 router.use((req, res, next) => {
   if (!res.headersSent) {
@@ -311,7 +277,6 @@ router.use((req, res, next) => {
   }
   next();
 });
-
 // ---------- Error middleware – tolerant (lazy load) ----------
 try {
   const { errorMiddleware } = require('../middleware/error');
@@ -319,7 +284,6 @@ try {
 } catch {
   // no-op – keep the webhook alive
 }
-
 // ---------- Export as plain Node handler (Vercel default export consumes this) ----------
 app.use('/', router);
 module.exports = (req, res) => app.handle(req, res);

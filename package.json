@@ -37,6 +37,7 @@
     "node-fetch": "^2.7.0",
     "openai": "^4.104.0",
     "papaparse": "^5.5.2",
+    "pdf-parse": "^2.4.5",
     "pdfkit": "^0.16.0",
     "pg": "^8.16.3",
     "pgvector": "^0.2.1",
@@ -45,7 +46,8 @@
     "stripe": "^18.4.0",
     "twilio": "^5.4.0",
     "uuid": "^13.0.0",
-    "winston": "^3.17.0"
+    "winston": "^3.17.0",
+    "yargs": "^18.0.0"
   },
   "devDependencies": {
     "jest": "^29.7.0",

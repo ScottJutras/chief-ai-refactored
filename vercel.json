@@ -15,31 +15,25 @@
       "maxDuration": 5
     },
     "api/cron/refresh_docs.js": {
-      "memory": 768,
+      "memory": 1024,
       "maxDuration": 30,
-      "includeFiles": [
-        "scripts/rag_loader.js",
-        "docs/howto/**",
-        "docs/sops/**"
-      ]
+      "includeFiles": "{scripts/rag_loader.js,docs/howto/**}"
     }
   },
   "routes": [
     { "src": "^/api/cron/refresh_docs$", "dest": "/api/cron/refresh_docs.js" },
+
     { "src": "^/api/webhook/reminders/cron/(.*)$", "dest": "/api/webhook.js" },
     { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
     { "src": "^/webhook$", "dest": "/api/webhook.js" },
+
     { "src": "^/api/ping$", "dest": "/api/ping.js" },
     { "src": "^/(.*)$", "dest": "/api/index.js" }
   ],
   "crons": [
     {
-      "path": "/api/webhook/reminders/cron/4bf3e4de8ccc4713119b79959f0ac990af24ca2ea5e348ff462b1d7958ae424e",
-      "schedule": "* * * * *"
-    },
-    {
-      "path": "/api/cron/refresh_docs?token=REPLACE_WITH_YOUR_CRON_TOKEN",
-      "schedule": "0 9 * * 1"
+      "path": "/api/cron/refresh_docs",
+      "schedule": "0 3 * * 1"
     }
   ]
 }

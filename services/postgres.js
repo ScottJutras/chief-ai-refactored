@@ -65,14 +65,14 @@ async function withClient(fn, { useTransaction = true } = {}) {
   }
 }
 
-// ---------- Job helpers (fixed) ----------
-// Find or create a job by name. IMPORTANT: distinct placeholders ($2/$3) to avoid 42P08
+// Find or create a job by name (case-insensitive on name or job_name).
+// Robust against races and job_no duplicates: we allocate job_no under an advisory lock.
 async function ensureJobByName(ownerId, name) {
   const owner   = DIGITS(ownerId);
   const jobName = String(name || '').trim();
   if (!jobName) return null;
 
-  // Try either column (schemas may use name OR job_name)
+  // 1) Try to find existing by either column
   let r = await query(
     `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
        FROM public.jobs
@@ -83,14 +83,50 @@ async function ensureJobByName(ownerId, name) {
   );
   if (r.rowCount) return r.rows[0];
 
-  // Insert with separate params for text/varchar targets
-  const ins = await query(
-    `INSERT INTO public.jobs (owner_id, job_name, name, active, start_date, created_at, updated_at)
-     VALUES ($1, $2, $3, true, NOW(), NOW(), NOW())
-     RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
-    [owner, jobName, jobName]
-  );
-  return ins.rows[0];
+  // 2) Create safely with explicit job_no in a serialized transaction
+  return await withClient(async (client) => {
+    // serialize all allocations for this owner only
+    await withOwnerAllocLock(owner, client);
+
+    // re-check inside the txn (avoid TOCTOU)
+    const again = await client.query(
+      `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+         FROM public.jobs
+        WHERE owner_id = $1
+          AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
+        LIMIT 1`,
+      [owner, jobName]
+    );
+    if (again.rowCount) return again.rows[0];
+
+    // allocate a fresh job_no and insert explicitly
+    const nextNo = await allocateNextJobNo(owner, client);
+
+    // NOTE: separate params for text/varchar columns (name vs job_name)
+    try {
+      const ins = await client.query(
+        `INSERT INTO public.jobs (owner_id, job_no, job_name, name, active, start_date, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, true, NOW(), NOW(), NOW())
+         RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
+        [owner, nextNo, jobName, jobName]
+      );
+      return ins.rows[0];
+    } catch (e) {
+      // if some concurrent path still beat us, fall back to re-select
+      if (e && e.code === '23505') {
+        const final = await client.query(
+          `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+             FROM public.jobs
+            WHERE owner_id = $1
+              AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
+            LIMIT 1`,
+          [owner, jobName]
+        );
+        if (final.rowCount) return final.rows[0];
+      }
+      throw e;
+    }
+  });
 }
 
 // Upsert a job by name, deactivate others, and activate this one

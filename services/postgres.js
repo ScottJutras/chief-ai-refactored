@@ -77,7 +77,7 @@ async function detectTimeEntriesCapabilities() {
     return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
   }
   try {
-    const { rows } = await queryWithRetry(
+    const { rows } = await query(
       `SELECT column_name
          FROM information_schema.columns
         WHERE table_schema = 'public'
@@ -86,69 +86,54 @@ async function detectTimeEntriesCapabilities() {
     const names = new Set(rows.map(r => String(r.column_name).toLowerCase()));
     SUPPORTS_CREATED_BY = names.has('created_by');
     SUPPORTS_USER_ID = names.has('user_id');
-    console.info('[PG] detection success:', { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID });
-  } catch (e) {
-    console.warn('[PG] detection error:', e?.message);
-    throw e;
+  } catch {
+    // Conservative defaults if detection fails
+    SUPPORTS_CREATED_BY = false;
+    SUPPORTS_USER_ID = false;
   }
   return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
 }
-
-// Run detection ONCE at startup — no set on fail
-detectTimeEntriesCapabilities().then(() => {
-  console.info('[PG] time_entries schema ready:', { SUPPORTS_USER_ID, SUPPORTS_CREATED_BY });
-}).catch(e => {
-  console.warn('[PG] startup schema detection failed:', e?.message);
-  // Leave null — functions will retry
-});
 
 async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   const actor = String(createdBy || owner).replace(/\D/g, '');
 
-  // Prefer per-actor (user_id) if supported
-  if (SUPPORTS_USER_ID) {
-    try {
-      const { rows } = await query(
-        `SELECT COUNT(*)::int AS n
-           FROM public.time_entries
-          WHERE owner_id=$1
-            AND user_id=$2
-            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-        [owner, actor, windowSec]
-      );
-      const n = rows?.[0]?.n ?? 0;
-      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-    } catch (eUser) {
-      const msg = String(eUser?.message || '').toLowerCase();
-      if (msg.includes('column "user_id" does not exist')) {
-        SUPPORTS_USER_ID = false; // Update cache
-      } else {
-        return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
-      }
+  // Prefer per-actor (user_id) if available
+  try {
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND user_id=$2
+          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+      [owner, actor, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+  } catch (eUser) {
+    const msg = String(eUser?.message || '').toLowerCase();
+    if (!msg.includes('column "user_id" does not exist')) {
+      // If it's some other DB error, fail-open
+      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
     }
   }
 
-  // Fallback to created_by if supported
-  if (SUPPORTS_CREATED_BY) {
-    try {
-      const { rows } = await query(
-        `SELECT COUNT(*)::int AS n
-           FROM public.time_entries
-          WHERE owner_id=$1
-            AND COALESCE(created_by,$2::text) = $2::text
-            AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-        [owner, actor, windowSec]
-      );
-      const n = rows?.[0]?.n ?? 0;
-      return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-    } catch (eCreated) {
-      const msg = String(eCreated?.message || '').toLowerCase();
-      if (msg.includes('column "created_by" does not exist')) {
-        SUPPORTS_CREATED_BY = false; // Update cache
-      } else {
-        return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
-      }
+  // Fallback to created_by if user_id missing
+  try {
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND COALESCE(created_by,$2::text) = $2::text
+          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+      [owner, actor, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+  } catch (eCreated) {
+    const msg = String(eCreated?.message || '').toLowerCase();
+    if (!msg.includes('column "created_by" does not exist')) {
+      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
     }
   }
 
@@ -474,6 +459,33 @@ const __checkLimit =
   (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
   (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
 
+// --- Pending confirmations (serverless-safe; DB-backed) ---
+const PENDING_TTL_MIN = 10;
+async function savePendingAction({ ownerId, userId, kind, payload }) {
+  const id = crypto.randomUUID();
+  await query(
+    `INSERT INTO public.pending_actions (id, owner_id, user_id, kind, payload, expires_at, created_at)
+     VALUES ($1,$2,$3,$4,$5, NOW() + ($6 || ' minutes')::interval, NOW())
+     ON CONFLICT (id) DO NOTHING`,
+    [id, String(ownerId), String(userId), kind, payload, String(PENDING_TTL_MIN)]
+  );
+  return id;
+}
+async function getPendingAction({ ownerId, userId }) {
+  const { rows } = await query(
+    `SELECT id, kind, payload
+       FROM public.pending_actions
+      WHERE owner_id=$1 AND user_id=$2 AND expires_at > NOW()
+      ORDER BY created_at DESC
+      LIMIT 1`,
+    [String(ownerId), String(userId)]
+  );
+  return rows[0] || null;
+}
+async function deletePendingAction(id) {
+  await query(`DELETE FROM public.pending_actions WHERE id=$1`, [id]);
+}
+
 module.exports = {
   // Core
   pool, query, queryWithTimeout, withClient,
@@ -500,6 +512,11 @@ module.exports = {
   exportTimesheetXlsx,
   exportTimesheetPdf,
   getFileExport,
+
+  // Pending actions
+  savePendingAction,
+  getPendingAction,
+  deletePendingAction,
 
   // …add any other helpers you already export (listMyTasks, etc.)
 };

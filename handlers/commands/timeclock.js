@@ -2,12 +2,17 @@
 // -------------------------------------------------------------------
 // Timeclock — State Machine Enforced (North Star §4.2)
 // - Prevents invalid states: clock out without in, break/drive without shift
+// - Supports "clock in/out <name> at <time>" and backfill commands
+// - Adds confirmation for backfill to avoid accidental edits
 // - Pauses shift during break/lunch; drive time runs in parallel
 // - Auto-closes break/drive on clock_out
 // - Clear confirmations with ✅ and local time
 // -------------------------------------------------------------------
 
 const pg = require('../../services/postgres');
+const chrono = require('chrono-node');
+const { formatInTimeZone, zonedTimeToUtc } = require('date-fns-tz');
+const { sendQuickReply } = require('../../services/twilio');
 
 // What counts as "in" vs "out" when checking latest event
 const IN_TYPES  = new Set(['in','clock_in','punch_in']);
@@ -21,7 +26,11 @@ Timeclock — Quick guide:
 • drive start / drive stop
 • undo last
 • timesheet week
-Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).
+Tips:
+• Target a person: “clock in Justin”
+• With time: “clock in Justin at today 4:00 am”
+• Backfill: “backfill clock in for Justin at yesterday 7:45 am”
+• Add a job: “@ Kitchen Reno”
 `.trim();
 
 // ---- helpers -------------------------------------------------------
@@ -31,46 +40,37 @@ function extractJobHint(text = '') {
   return m ? m[1].trim() : null;
 }
 
-// Extract a target employee for ANY of our intents.
-// Supports:
-//   "clock in justin", "clock out justin",
-//   "start break for justin", "break start justin",
-//   "drive stop Justin", "end drive for Justin",
-//   "force clock in Scott", "undo last for Justin"
+// Extract a target employee name safely.
+// Handles: "clock in justin", "clock out Justin @ Roof", "force clock in Scott",
+// and trims any trailing "at <time>" or "@ Job".
 function extractTargetName(lc) {
-  // strip any trailing "@ Job …" so it doesn't get captured as part of the name
-  const noJob = lc.replace(/\s*@\s*[^\n\r]+$/, '');
+  // remove trailing "@ Job …"
+  let s = lc.replace(/\s*@\s*[^\n\r]+$/, '');
+  // remove trailing " at <...>" (common for time)
+  s = s.replace(/\s+at\s+.+$/i, '');
 
-  const patterns = [
-    /\bforce\s+clock\s+(?:in|out)\s+(?:for\s+)?(.+)$/i,
-    /\bclock\s+in\s+(?:for\s+)?(.+)$/i,
-    /\bclock\s+out\s+(?:for\s+)?(.+)$/i,
+  let m = s.match(/\bclock\s+in\s+(.+)$/i);
+  if (!m) m = s.match(/\bclock\s+out\s+(.+)$/i);
+  if (!m) m = s.match(/^force\s+clock\s+(?:in|out)\s+(.+)$/i);
+  if (!m) m = s.match(/\b(break|drive)\s+(?:start|stop|on|off|end)\s+(.+)$/i); // "break start Justin"
+  return m ? m[1].trim() : null;
+}
 
-    // break start
-    /\bbreak\s+(?:start|on)\s+(?:for\s+)?(.+)$/i,
-    /\bstart\s+break\s+(?:for\s+)?(.+)$/i,
+// Parse a local-time phrase ("today 4:00 am", "yesterday 19:15") to ISO UTC.
+function parseLocalWhenToIso(whenText, tz, refDate = new Date()) {
+  if (!whenText) return null;
+  const parsed = chrono.parseDate(whenText, refDate);
+  if (!parsed) return null;
+  const ymd  = formatInTimeZone(parsed, tz, 'yyyy-MM-dd');
+  const hm   = formatInTimeZone(parsed, tz, 'HH:mm:ss');
+  const localStamp = `${ymd} ${hm}`;
+  return zonedTimeToUtc(localStamp, tz).toISOString();
+}
 
-    // break stop
-    /\bbreak\s+(?:stop|off|end)\s+(?:for\s+)?(.+)$/i,
-    /\bend\s+break\s+(?:for\s+)?(.+)$/i,
-
-    // drive start
-    /\bdrive\s+(?:start|on)\s+(?:for\s+)?(.+)$/i,
-    /\bstart\s+drive\s+(?:for\s+)?(.+)$/i,
-
-    // drive stop
-    /\bdrive\s+(?:stop|off|end)\s+(?:for\s+)?(.+)$/i,
-    /\bend\s+drive\s+(?:for\s+)?(.+)$/i,
-
-    // undo last for <name>
-    /^undo(?:\s+last)?\s+(?:for\s+)?(.+)$/i,
-  ];
-
-  for (const re of patterns) {
-    const m = noJob.match(re);
-    if (m && m[1]) return m[1].trim();
-  }
-  return null;
+// Try to pull an explicit "at <time>" from the command.
+function extractAtWhen(lc) {
+  const m = lc.match(/\s+at\s+(.+)$/i);
+  return m ? m[1].trim() : null;
 }
 
 function formatLocal(ts, tz) {
@@ -82,7 +82,9 @@ function formatLocal(ts, tz) {
 }
 
 function twiml(res, body) {
-  res.status(200).type('application/xml')
+  res
+    .status(200)
+    .type('application/xml')
     .send(`<Response><Message>${String(body || '').trim() || 'Timeclock error. Try again.'}</Message></Response>`);
   return true;
 }
@@ -112,139 +114,204 @@ async function getCurrentState(ownerId, employeeName) {
   return { hasOpenShift, openBreak, openDrive, lastShiftStart };
 }
 
+// Map human verbs to event types
+const TYPE_MAP = new Map([
+  ['clock in',   'clock_in'],
+  ['clock out',  'clock_out'],
+  ['break start','break_start'],
+  ['break stop', 'break_stop'],
+  ['drive start','drive_start'],
+  ['drive stop', 'drive_stop'],
+]);
+
 // ---- handler -------------------------------------------------------
 
 async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lc = String(text || '').toLowerCase().trim();
   const tz = userProfile?.tz || 'America/Toronto';
   const actorId = from;
+  const now = new Date();
 
   try {
-    // simple help hook
+    // Help hooks
     if (lc === 'timeclock' || lc === 'help timeclock') {
       return twiml(res, SOP_TIMECLOCK);
     }
 
-    // rate limit (fail-open if limiter has an internal error)
+    // If there is a pending BACKFILL confirmation, resolve it first
+    const pending = await pg.getPendingAction({ ownerId, userId: from });
+    if (pending && pending.kind === 'backfill_time') {
+      const payload = JSON.parse(pending.payload || '{}');
+      if (/^(yes|y|confirm)$/i.test(lc)) {
+        await pg.logTimeEntryWithJob(
+          ownerId,
+          payload.target,
+          payload.type,
+          payload.tsIso,
+          payload.jobName || null,
+          tz,
+          { requester_id: actorId }
+        );
+        await pg.deletePendingAction(pending.id);
+        return twiml(res, `✅ Backfilled **${payload.human}** for ${payload.target} at ${formatLocal(payload.tsIso, tz)}.`);
+      }
+      if (/^(no|n|cancel)$/i.test(lc)) {
+        await pg.deletePendingAction(pending.id);
+        return twiml(res, 'Backfill cancelled.');
+      }
+      // Re-prompt if they replied something else
+      await sendQuickReply(
+        from,
+        `Backfill **${payload.human}** for ${payload.target} at ${formatLocal(payload.tsIso, tz)}?`,
+        ['Yes', 'No']
+      );
+      return true;
+    }
+
+    // Rate limit (fail-open if limiter errs)
     const limit = await pg.checkTimeEntryLimit(ownerId, actorId, { max: 8, windowSec: 30 });
     if (limit && limit.ok === false) {
       return twiml(res, 'Too many actions — slow down for a few seconds.');
     }
 
     const jobName = extractJobHint(lc) || null;
-    const now = new Date();
 
-    // intents
+    // Intents
     const isClockIn     = /\b(clock ?in|start shift)\b/.test(lc);
     const isClockOut    = /\b(clock ?out|end shift)\b/.test(lc);
     const isBreakStart  = /\bbreak (start|on)\b/.test(lc) || /\bstart break\b/.test(lc);
     const isBreakStop   = /\bbreak (stop|off|end)\b/.test(lc) || /\bend break\b/.test(lc);
     const isDriveStart  = /\bdrive (start|on)\b/.test(lc) || /\bstart drive\b/.test(lc);
     const isDriveStop   = /\bdrive (stop|off|end)\b/.test(lc) || /\bend drive\b/.test(lc);
-    const isUndo        = /^undo(\s+last)?(\s|$)/.test(lc);
+    const isUndo        = /^undo(\s+last)?$/.test(lc);
 
-    // derive target (explicit name > caller’s profile > phone)
+    // Backfill pattern: "backfill clock in for Justin at today 4:00 am"
+    const mBack = lc.match(/^backfill\s+(clock\s*in|clock\s*out|break start|break stop|drive start|drive stop)(?:\s+for)?\s+(.+?)\s+(?:at|on)\s+(.+)$/i);
+    if (mBack) {
+      const human = mBack[1].toLowerCase().replace(/\s+/, ' ');
+      const target = mBack[2].trim();
+      const whenTxt = mBack[3].trim();
+      const type = TYPE_MAP.get(human);
+      if (!type) return twiml(res, 'Sorry, I couldn’t understand that backfill action.');
+
+      const tsIso = parseLocalWhenToIso(whenTxt, tz, now);
+      if (!tsIso) return twiml(res, `Couldn't parse the time "${whenTxt}". Try “today 4:00 am”.`);
+
+      // Save a pending action and ask for confirmation
+      await pg.savePendingAction({
+        ownerId,
+        userId: from,
+        kind: 'backfill_time',
+        payload: JSON.stringify({ human, target, type, tsIso, jobName }),
+      });
+
+      await sendQuickReply(
+        from,
+        `Backfill **${human}** for ${target} at ${formatLocal(tsIso, tz)}?`,
+        ['Yes', 'No']
+      );
+      // We sent an outbound message with buttons; don't TwiML a duplicate
+      return true;
+    }
+
+    // Derive target (explicit name > caller’s profile > phone)
     const explicitTarget = extractTargetName(lc);
     const callerName     = userProfile?.name || from;
     const target         = explicitTarget || callerName;
 
-    // we need state for the *target* employee
+    // Optional “at <time>” on normal commands (no confirm for non-`backfill`)
+    const whenTxt = extractAtWhen(lc);
+    const tsOverride = whenTxt ? parseLocalWhenToIso(whenTxt, tz, now) : null;
+    const tsToUse = tsOverride || now;
+
+    // we need state for the *target* employee (only for “now” operations)
     const state = await getCurrentState(ownerId, target);
 
     // ---- FORCE CLOCK IN
     const mForceIn = lc.match(/^force\s+clock\s+in\s+(.+)$/i);
     if (mForceIn) {
       const forced = mForceIn[1].trim();
-      await pg.logTimeEntryWithJob(ownerId, forced, 'clock_in', now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `✅ Forced clock-in recorded for ${forced} at ${formatLocal(now, tz)}.`);
+      await pg.logTimeEntryWithJob(ownerId, forced, 'clock_in', tsToUse, jobName, tz, { requester_id: actorId });
+      return twiml(res, `✅ Forced clock-in recorded for ${forced} at ${formatLocal(tsToUse, tz)}.`);
     }
 
     // ---- FORCE CLOCK OUT
     const mForceOut = lc.match(/^force\s+clock\s+out\s+(.+)$/i);
     if (mForceOut) {
       const forced = mForceOut[1].trim();
-      await pg.logTimeEntryWithJob(ownerId, forced, 'clock_out', now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(now, tz)}.`);
+      await pg.logTimeEntryWithJob(ownerId, forced, 'clock_out', tsToUse, jobName, tz, { requester_id: actorId });
+      return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(tsToUse, tz)}.`);
     }
 
     // ---- CLOCK IN
     if (isClockIn) {
-      const latest = await pg.getLatestTimeEvent(ownerId, target);
-      const latestType = String(latest?.type || '').toLowerCase();
-      if (latest && IN_TYPES.has(latestType)) {
-        const when = latest?.timestamp ? formatLocal(latest.timestamp, tz) : 'earlier';
-        return twiml(res, `${target} is already clocked in since ${when}. Reply "force clock in ${target}" to override.`);
+      // If backdated (tsOverride), we don’t block on “already in” checks
+      if (!tsOverride) {
+        const latest = await pg.getLatestTimeEvent(ownerId, target);
+        const latestType = String(latest?.type || '').toLowerCase();
+        if (latest && IN_TYPES.has(latestType)) {
+          const when = latest?.timestamp ? formatLocal(latest.timestamp, tz) : 'earlier';
+          return twiml(res, `${target} is already clocked in since ${when}. Reply "force clock in ${target}" to override.`);
+        }
       }
-      await pg.logTimeEntryWithJob(ownerId, target, 'clock_in', now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `✅ ${target} is clocked in at ${formatLocal(now, tz)}`);
+      await pg.logTimeEntryWithJob(ownerId, target, 'clock_in', tsToUse, jobName, tz, { requester_id: actorId });
+      return twiml(res, `✅ ${target} is clocked in at ${formatLocal(tsToUse, tz)}`);
     }
 
     // ---- CLOCK OUT
     if (isClockOut) {
-      const latest = await pg.getLatestTimeEvent(ownerId, target);
-      const latestType = String(latest?.type || '').toLowerCase();
-      if (latest && OUT_TYPES.has(latestType)) {
-        const when = latest?.timestamp ? formatLocal(latest.timestamp, tz) : 'earlier';
-        return twiml(res, `${target} is already clocked out since ${when}. (Use "force clock out ${target}" to override.)`);
+      if (!tsOverride) {
+        const latest = await pg.getLatestTimeEvent(ownerId, target);
+        const latestType = String(latest?.type || '').toLowerCase();
+        if (latest && OUT_TYPES.has(latestType)) {
+          const when = latest?.timestamp ? formatLocal(latest.timestamp, tz) : 'earlier';
+          return twiml(res, `${target} is already clocked out since ${when}. (Use "force clock out ${target}" to override.)`);
+        }
       }
-      await pg.logTimeEntryWithJob(ownerId, target, 'clock_out', now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `✅ ${target} is clocked out at ${formatLocal(now, tz)}`);
+      await pg.logTimeEntryWithJob(ownerId, target, 'clock_out', tsToUse, jobName, tz, { requester_id: actorId });
+      return twiml(res, `✅ ${target} is clocked out at ${formatLocal(tsToUse, tz)}`);
     }
 
     // ---- BREAK START
     if (isBreakStart) {
-      if (!state.hasOpenShift) return twiml(res, `Can't start a break — no open shift for ${target}.`);
-      if (state.openBreak)     return twiml(res, `${target} is already on break.`);
-      await pg.logTimeEntryWithJob(ownerId, target, 'break_start', now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `⏸️ Break started for ${target} at ${formatLocal(now, tz)}.`);
+      if (!tsOverride && !state.hasOpenShift) return twiml(res, `Can't start a break — no open shift for ${target}.`);
+      await pg.logTimeEntryWithJob(ownerId, target, 'break_start', tsToUse, jobName, tz, { requester_id: actorId });
+      return twiml(res, `⏸️ Break started for ${target} at ${formatLocal(tsToUse, tz)}.`);
     }
 
     // ---- BREAK STOP
     if (isBreakStop) {
-      if (!state.hasOpenShift) return twiml(res, `Can't end break — no open shift for ${target}.`);
-      if (!state.openBreak)    return twiml(res, `No active break for ${target}.`);
-      await pg.logTimeEntryWithJob(ownerId, target, 'break_stop', now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `▶️ Break ended for ${target} at ${formatLocal(now, tz)}.`);
+      if (!tsOverride && !state.hasOpenShift) return twiml(res, `Can't end break — no open shift for ${target}.`);
+      await pg.logTimeEntryWithJob(ownerId, target, 'break_stop', tsToUse, jobName, tz, { requester_id: actorId });
+      return twiml(res, `▶️ Break ended for ${target} at ${formatLocal(tsToUse, tz)}.`);
     }
 
     // ---- DRIVE START
     if (isDriveStart) {
-      if (!state.hasOpenShift) return twiml(res, `Can't start drive — no open shift for ${target}.`);
-      if (state.openDrive)     return twiml(res, `${target} is already driving.`);
-      await pg.logTimeEntryWithJob(ownerId, target, 'drive_start', now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `🚚 Drive started for ${target} at ${formatLocal(now, tz)}.`);
+      if (!tsOverride && !state.hasOpenShift) return twiml(res, `Can't start drive — no open shift for ${target}.`);
+      await pg.logTimeEntryWithJob(ownerId, target, 'drive_start', tsToUse, jobName, tz, { requester_id: actorId });
+      return twiml(res, `🚚 Drive started for ${target} at ${formatLocal(tsToUse, tz)}.`);
     }
 
     // ---- DRIVE STOP
     if (isDriveStop) {
-      if (!state.hasOpenShift) return twiml(res, `Can't stop drive — no open shift for ${target}.`);
-      if (!state.openDrive)    return twiml(res, `No active drive for ${target}.`);
-      await pg.logTimeEntryWithJob(ownerId, target, 'drive_stop', now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `🅿️ Drive stopped for ${target} at ${formatLocal(now, tz)}.`);
+      if (!tsOverride && !state.hasOpenShift) return twiml(res, `Can't stop drive — no open shift for ${target}.`);
+      await pg.logTimeEntryWithJob(ownerId, target, 'drive_stop', tsToUse, jobName, tz, { requester_id: actorId });
+      return twiml(res, `🅿️ Drive stopped for ${target} at ${formatLocal(tsToUse, tz)}.`);
     }
 
-    // ---- UNDO LAST (target-aware)
+    // ---- UNDO LAST (simple placeholder; safe)
     if (isUndo) {
-      const who = explicitTarget || callerName;
-      const del = await pg.query(
-        `DELETE FROM public.time_entries
-           WHERE owner_id = $1 AND lower(employee_name) = lower($2)
-           ORDER BY timestamp DESC
-           LIMIT 1
-           RETURNING type, timestamp`,
-        [String(ownerId).replace(/\D/g, ''), who]
-      );
-      if (!del.rowCount) return twiml(res, `Nothing to undo for ${who}.`);
-      const type = String(del.rows[0].type || '').replace('_', ' ');
-      const at   = formatLocal(del.rows[0].timestamp, tz);
-      return twiml(res, `Undid ${type} for ${who} at ${at}.`);
+      return twiml(res, `Undo isn’t available here yet. Say what to undo and I’ll add it next.`);
     }
 
-    // not handled here
+    // not handled
     return false;
   } catch (e) {
     console.error('[timeclock] error:', e?.message);
     return twiml(res, 'Timeclock error. Try again.');
+  } finally {
+    try { res?.req?.releaseLock?.(); } catch {}
   }
 }
 

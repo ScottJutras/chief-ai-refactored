@@ -1,11 +1,10 @@
 // handlers/commands/timeclock.js
 // -------------------------------------------------------------------
 // Timeclock — State Machine Enforced (North Star §4.2)
-// - Prevents invalid states: clock out without in, break/drive without shift
-// - Pauses shift during break/lunch; drive time runs in parallel
-// - Auto-closes break/drive on clock_out
-// - Clear confirmations with ✅ and local time
-// - Backfill-safe with quick-reply confirmation
+// - Validates states (no out without in; break/drive need open shift)
+// - Break pauses shift; drive runs parallel
+// - Backfill-safe: confirmation for older timestamps
+// - Robust narrative + command parsing (won’t treat “today …” as a name)
 // -------------------------------------------------------------------
 
 const pg = require('../../services/postgres');
@@ -13,66 +12,61 @@ const chrono = require('chrono-node');
 const { formatInTimeZone, zonedTimeToUtc } = require('date-fns-tz');
 const { sendQuickReply } = require('../../services/twilio');
 
-// What counts as "in" vs "out" when checking latest event
 const IN_TYPES  = new Set(['in','clock_in','punch_in']);
 const OUT_TYPES = new Set(['out','clock_out','punch_out','end','finish']);
 
 const TIME_WORDS = new Set([
-  'today','yesterday','tomorrow','tonight','this morning','this afternoon','this evening',
+  'today','yesterday','tomorrow','tonight',
+  'this morning','this afternoon','this evening',
   'morning','afternoon','evening','night','now','later'
 ]);
 
 const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
 
-// ---- helpers -------------------------------------------------------
+// ---------------- helpers ----------------
 
 function extractJobHint(text = '') {
   const m = String(text).match(/@\s*([^\n\r]+)/);
   return m ? m[1].trim() : null;
 }
 
-// Extract a target employee name from commands like:
-// "clock in justin", "clock out Justin @ Roof", "force clock in Scott"
-function extractTargetName(lc) {
-  // strip any trailing "@ Job …" so it doesn't get captured as part of the name
-  const noJob = lc.replace(/\s*@\s*[^\n\r]+$/, '');
-  let m = noJob.match(/\bclock\s+in\s+(.+)$/i);
-  if (!m) m = noJob.match(/\bclock\s+out\s+(.+)$/i);
-  if (!m) m = noJob.match(/^force\s+clock\s+(?:in|out)\s+(.+)$/i);
+// Command-style extractor (STRICT): only if message STARTS with the command.
+// Examples that match:
+//   "clock in justin"
+//   "clock out Justin @ Roof"
+// Won’t trigger on: "Justin forgot to clock in …"
+function extractTargetFromCommandStart(textLC) {
+  const mIn  = textLC.match(/^\s*clock\s+in\s+(.+?)\s*(?:$|@|\?|\.|,|!|;|:)/i);
+  const mOut = textLC.match(/^\s*clock\s+out\s+(.+?)\s*(?:$|@|\?|\.|,|!|;|:)/i);
+  const m = mIn || mOut;
   return m ? m[1].trim() : null;
 }
 
-// Natural language narrative: "<name> forgot/didn't/needs to clock in/out ..."
+// Narrative: "<name> forgot/didn't/needs to clock in/out ..."
 function extractNarrative(text) {
-  // Unicode-aware and case-insensitive
   const m = String(text).match(
     /^([\p{L}\p{M}.'-]+(?:\s+[\p{L}\p{M}.'-]+){0,2})\s+(?:forgot|did\s*not|didn't|needs|need)\s+to\s+clock\s+(in|out)\b/iu
   );
-  if (!m) return null;
-  return { name: m[1].trim(), action: m[2].toLowerCase() }; // 'in' | 'out'
+  return m ? { name: m[1].trim(), action: m[2].toLowerCase() } : null;
 }
 
-// Pull a trailing "at <when>" phrase; keep it tight to end or punctuation
+// Trailing "at <when>" at end of sentence
 function extractAtWhen(text) {
-  const m = String(text).match(/\bat\s+([^.,;!?]+)$/i);
+  const m = String(text).match(/\bat\s+([^.,;!?]+)\s*$/i);
   return m ? m[1].trim() : null;
 }
 
-// Build a UTC ISO timestamp by interpreting the phrase IN tz (not server TZ)
+// Build a UTC ISO timestamp by interpreting the phrase IN tz
 function parseLocalWhenToIso(whenText, tz, refDate = new Date()) {
   if (!whenText) return null;
-
-  // Use chrono.parse for components (so "today", "yesterday", etc. work)
   const results = chrono.parse(whenText, refDate);
   if (!results.length) return null;
   const start = results[0].start;
 
-  // Reference Y-M-D in the user's timezone (e.g., "today" should be today in tz)
   const refY = Number(formatInTimeZone(refDate, tz, 'yyyy'));
   const refM = Number(formatInTimeZone(refDate, tz, 'MM'));
   const refD = Number(formatInTimeZone(refDate, tz, 'dd'));
 
-  // Use parsed components when certain; otherwise fall back to ref Y/M/D
   const year  = start.isCertain('year')  ? start.get('year')  : refY;
   const month = start.isCertain('month') ? start.get('month') : refM; // 1..12
   const day   = start.isCertain('day')   ? start.get('day')   : refD;
@@ -83,8 +77,6 @@ function parseLocalWhenToIso(whenText, tz, refDate = new Date()) {
 
   const pad = n => String(n).padStart(2, '0');
   const localStamp = `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)}`;
-
-  // Convert "localStamp in tz" -> UTC ISO
   return zonedTimeToUtc(localStamp, tz).toISOString();
 }
 
@@ -98,11 +90,11 @@ function formatLocal(ts, tz) {
 
 function twiml(res, body) {
   res.status(200).type('application/xml')
-    .send(`<Response><Message>${String(body || '').trim() || 'Timeclock error. Try again.'}</Message></Response>`);
+    .send(RESP(String(body || '').trim() || 'Timeclock error. Try again.'));
   return true;
 }
 
-// --- Get current state (use case-insensitive match on employee name) ---
+// State for a specific employee (case-insensitive name)
 async function getCurrentState(ownerId, employeeName) {
   const { rows } = await pg.query(
     `SELECT type, timestamp
@@ -127,7 +119,7 @@ async function getCurrentState(ownerId, employeeName) {
   return { hasOpenShift, openBreak, openDrive, lastShiftStart };
 }
 
-// ---- handler -------------------------------------------------------
+// --------------- main handler ---------------
 
 async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lc = String(text || '').toLowerCase().trim();
@@ -136,8 +128,8 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
   const now = new Date();
 
   try {
-    // Help
-    if (lc === 'timeclock' || lc === 'help timeclock') {
+    // Quick help
+    if (/^(timeclock|help\s+timeclock)$/i.test(lc)) {
       return twiml(res, `Timeclock — Quick guide:
 • clock in / clock out
 • break start / break stop
@@ -147,7 +139,7 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
 Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
     }
 
-    // Check for pending backfill confirmation
+    // Pending backfill confirmation
     const pending = await pg.getPendingAction({ ownerId: String(ownerId).replace(/\D/g, ''), userId: from });
     if (pending && /^confirm$/i.test(lc)) {
       try {
@@ -173,7 +165,7 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       return twiml(res, `Backfill cancelled.`);
     }
 
-    // Rate limit (fail-open if limiter has an internal error)
+    // Rate limit
     const limit = await pg.checkTimeEntryLimit(ownerId, actorId, { max: 8, windowSec: 30 });
     if (limit && limit.ok === false) {
       return twiml(res, 'Too many actions — slow down for a few seconds.');
@@ -181,7 +173,7 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
 
     const jobName = extractJobHint(text) || null;
 
-    // intents
+    // Intents
     let isClockIn     = /\b(clock ?in|start shift)\b/i.test(text);
     let isClockOut    = /\b(clock ?out|end shift)\b/i.test(text);
     const isBreakStart  = /\bbreak (start|on)\b/i.test(text) || /\bstart break\b/i.test(text);
@@ -190,27 +182,54 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
     const isDriveStop   = /\bdrive (stop|off|end)\b/i.test(text) || /\bend drive\b/i.test(text);
     const isUndo        = /^undo(\s+last)?$/i.test(lc);
 
-    // Derive target (explicit > narrative > caller’s profile > phone)
-    const explicitTarget = extractTargetName(lc);
+    // 1) Narrative first
     const narrative = extractNarrative(text);
-    let target = explicitTarget || (narrative?.name) || (userProfile?.name) || from;
+    let target = null;
+    if (narrative) {
+      target = narrative.name;
+      if (!isClockIn && !isClockOut) {
+        isClockIn = narrative.action === 'in';
+        isClockOut = narrative.action === 'out';
+      }
+    } else {
+      // 2) Strict command-style (only if message starts with the command)
+      target = extractTargetFromCommandStart(lc);
+    }
+
+    // 3) Fallback: caller
+    if (!target) target = userProfile?.name || from;
 
     // Guard against time words/pronouns being mistaken for names
     if (TIME_WORDS.has(String(target).toLowerCase()) || /^me|myself|my$/i.test(target)) {
       target = userProfile?.name || from;
     }
 
-    // If narrative defined an action, adopt it unless already explicit
-    if (narrative && !isClockIn && !isClockOut) {
-      if (narrative.action === 'in')  isClockIn = true;
-      if (narrative.action === 'out') isClockOut = true;
+    // Time override
+    let whenTxt = extractAtWhen(text);
+    let tsOverride = whenTxt ? parseLocalWhenToIso(whenTxt, tz, now) : null;
+
+    // If no trailing "at …" found, try full-sentence chrono (captures “today at 4:00 am” anywhere)
+    if (!tsOverride) {
+      const parsed = chrono.parse(text, now);
+      if (parsed && parsed.length) {
+        const start = parsed[0].start;
+        // Only accept if we actually got a time of day
+        if (start && (start.isCertain('hour') || start.isCertain('minute'))) {
+          const year  = start.isCertain('year')  ? start.get('year')  : Number(formatInTimeZone(now, tz, 'yyyy'));
+          const month = start.isCertain('month') ? start.get('month') : Number(formatInTimeZone(now, tz, 'MM'));
+          const day   = start.isCertain('day')   ? start.get('day')   : Number(formatInTimeZone(now, tz, 'dd'));
+          const hour   = start.isCertain('hour')   ? start.get('hour')   : 0;
+          const minute = start.isCertain('minute') ? start.get('minute') : 0;
+          const second = start.isCertain('second') ? start.get('second') : 0;
+          const pad = n => String(n).padStart(2, '0');
+          const localStamp = `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}:${pad(second)}`;
+          tsOverride = zonedTimeToUtc(localStamp, tz).toISOString();
+          whenTxt = `${year}-${pad(month)}-${pad(day)} ${pad(hour)}:${pad(minute)}`;
+        }
+      }
     }
 
-    // Optional "at <when>" override (Toronto-aware)
-    const whenTxt = extractAtWhen(text);
-    const tsOverride = whenTxt ? parseLocalWhenToIso(whenTxt, tz, now) : null;
-
-    // Log resolved command
+    // Log command resolution
     console.info('[timeclock cmd]', {
       ownerId,
       actor: from,
@@ -227,7 +246,7 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       tz
     });
 
-    // If we have a backfill timestamp (> 2 minutes from now), require confirmation
+    // Backfill confirmation if > 2 minutes away from now
     if (tsOverride) {
       const diffMin = Math.abs((new Date(tsOverride).getTime() - now.getTime()) / 60000);
       if (diffMin > 2) {
@@ -241,7 +260,7 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
           null;
 
         if (type) {
-          const id = await pg.savePendingAction({
+          await pg.savePendingAction({
             ownerId: String(ownerId).replace(/\D/g, ''),
             userId: from,
             kind: 'backfill_time',
@@ -257,26 +276,30 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       }
     }
 
-    // we need state for the *target* employee
+    // Fetch state for *target*
     const state = await getCurrentState(ownerId, target);
 
-    // ---- FORCE CLOCK IN
-    const mForceIn = lc.match(/^force\s+clock\s+in\s+(.+)$/i);
-    if (mForceIn) {
-      const forced = mForceIn[1].trim();
-      await pg.logTimeEntryWithJob(ownerId, forced, 'clock_in', tsOverride || now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `✅ Forced clock-in recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
+    // FORCE CLOCK IN
+    {
+      const m = lc.match(/^force\s+clock\s+in\s+(.+)$/i);
+      if (m) {
+        const forced = m[1].trim();
+        await pg.logTimeEntryWithJob(ownerId, forced, 'clock_in', tsOverride || now, jobName, tz, { requester_id: actorId });
+        return twiml(res, `✅ Forced clock-in recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
+      }
     }
 
-    // ---- FORCE CLOCK OUT
-    const mForceOut = lc.match(/^force\s+clock\s+out\s+(.+)$/i);
-    if (mForceOut) {
-      const forced = mForceOut[1].trim();
-      await pg.logTimeEntryWithJob(ownerId, forced, 'clock_out', tsOverride || now, jobName, tz, { requester_id: actorId });
-      return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
+    // FORCE CLOCK OUT
+    {
+      const m = lc.match(/^force\s+clock\s+out\s+(.+)$/i);
+      if (m) {
+        const forced = m[1].trim();
+        await pg.logTimeEntryWithJob(ownerId, forced, 'clock_out', tsOverride || now, jobName, tz, { requester_id: actorId });
+        return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
+      }
     }
 
-    // ---- CLOCK IN
+    // CLOCK IN
     if (isClockIn) {
       const latest = await pg.getLatestTimeEvent(ownerId, target);
       const latestType = String(latest?.type || '').toLowerCase();
@@ -288,7 +311,7 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       return twiml(res, `✅ ${target} is clocked in at ${formatLocal(tsOverride || now, tz)}`);
     }
 
-    // ---- CLOCK OUT
+    // CLOCK OUT
     if (isClockOut) {
       const latest = await pg.getLatestTimeEvent(ownerId, target);
       const latestType = String(latest?.type || '').toLowerCase();
@@ -296,12 +319,11 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
         const when = latest?.timestamp ? formatLocal(latest.timestamp, tz) : 'earlier';
         return twiml(res, `${target} is already clocked out since ${when}. (Use "force clock out ${target}" to override.)`);
       }
-      // write out (auto-closes subordinate segments in reporting)
       await pg.logTimeEntryWithJob(ownerId, target, 'clock_out', tsOverride || now, jobName, tz, { requester_id: actorId });
       return twiml(res, `✅ ${target} is clocked out at ${formatLocal(tsOverride || now, tz)}`);
     }
 
-    // ---- BREAK START
+    // BREAK START
     if (isBreakStart) {
       if (!state.hasOpenShift) return twiml(res, `Can't start a break — no open shift for ${target}.`);
       if (!tsOverride && state.openBreak)     return twiml(res, `${target} is already on break.`);
@@ -309,7 +331,7 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       return twiml(res, `⏸️ Break started for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
     }
 
-    // ---- BREAK STOP
+    // BREAK STOP
     if (isBreakStop) {
       if (!state.hasOpenShift) return twiml(res, `Can't end break — no open shift for ${target}.`);
       if (!tsOverride && !state.openBreak)    return twiml(res, `No active break for ${target}.`);
@@ -317,7 +339,7 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       return twiml(res, `▶️ Break ended for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
     }
 
-    // ---- DRIVE START
+    // DRIVE START
     if (isDriveStart) {
       if (!state.hasOpenShift) return twiml(res, `Can't start drive — no open shift for ${target}.`);
       if (!tsOverride && state.openDrive)     return twiml(res, `${target} is already driving.`);
@@ -325,15 +347,15 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       return twiml(res, `🚚 Drive started for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
     }
 
-    // ---- DRIVE STOP
+    // DRIVE STOP
     if (isDriveStop) {
-      if (!state.hasOpenShift) return twiml(res, `Can't stop drive — no open shift for ${target}.`);
+      if (!state.hasOpenShift) return twiml(res, `Can't stop drive — no open shift for ${target}..`);
       if (!tsOverride && !state.openDrive)    return twiml(res, `No active drive for ${target}.`);
       await pg.logTimeEntryWithJob(ownerId, target, 'drive_stop', tsOverride || now, jobName, tz, { requester_id: actorId });
       return twiml(res, `🅿️ Drive stopped for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
     }
 
-    // ---- UNDO LAST (targeted)
+    // UNDO LAST (targeted)
     if (isUndo) {
       const del = await pg.query(
         `DELETE FROM public.time_entries
@@ -352,7 +374,7 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       return twiml(res, `Undid ${type} at ${at} for ${target}.`);
     }
 
-    // not handled
+    // Not handled
     return false;
   } catch (e) {
     console.error('[timeclock] error:', e?.message);

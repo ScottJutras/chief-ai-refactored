@@ -31,15 +31,46 @@ function extractJobHint(text = '') {
   return m ? m[1].trim() : null;
 }
 
-// Extract a target employee name from commands like:
-// "clock in justin", "clock out Justin @ Roof", "force clock in Scott"
+// Extract a target employee for ANY of our intents.
+// Supports:
+//   "clock in justin", "clock out justin",
+//   "start break for justin", "break start justin",
+//   "drive stop Justin", "end drive for Justin",
+//   "force clock in Scott", "undo last for Justin"
 function extractTargetName(lc) {
   // strip any trailing "@ Job …" so it doesn't get captured as part of the name
   const noJob = lc.replace(/\s*@\s*[^\n\r]+$/, '');
-  let m = noJob.match(/\bclock\s+in\s+(.+)$/i);
-  if (!m) m = noJob.match(/\bclock\s+out\s+(.+)$/i);
-  if (!m) m = noJob.match(/^force\s+clock\s+(?:in|out)\s+(.+)$/i);
-  return m ? m[1].trim() : null;
+
+  const patterns = [
+    /\bforce\s+clock\s+(?:in|out)\s+(?:for\s+)?(.+)$/i,
+    /\bclock\s+in\s+(?:for\s+)?(.+)$/i,
+    /\bclock\s+out\s+(?:for\s+)?(.+)$/i,
+
+    // break start
+    /\bbreak\s+(?:start|on)\s+(?:for\s+)?(.+)$/i,
+    /\bstart\s+break\s+(?:for\s+)?(.+)$/i,
+
+    // break stop
+    /\bbreak\s+(?:stop|off|end)\s+(?:for\s+)?(.+)$/i,
+    /\bend\s+break\s+(?:for\s+)?(.+)$/i,
+
+    // drive start
+    /\bdrive\s+(?:start|on)\s+(?:for\s+)?(.+)$/i,
+    /\bstart\s+drive\s+(?:for\s+)?(.+)$/i,
+
+    // drive stop
+    /\bdrive\s+(?:stop|off|end)\s+(?:for\s+)?(.+)$/i,
+    /\bend\s+drive\s+(?:for\s+)?(.+)$/i,
+
+    // undo last for <name>
+    /^undo(?:\s+last)?\s+(?:for\s+)?(.+)$/i,
+  ];
+
+  for (const re of patterns) {
+    const m = noJob.match(re);
+    if (m && m[1]) return m[1].trim();
+  }
+  return null;
 }
 
 function formatLocal(ts, tz) {
@@ -110,7 +141,7 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
     const isBreakStop   = /\bbreak (stop|off|end)\b/.test(lc) || /\bend break\b/.test(lc);
     const isDriveStart  = /\bdrive (start|on)\b/.test(lc) || /\bstart drive\b/.test(lc);
     const isDriveStop   = /\bdrive (stop|off|end)\b/.test(lc) || /\bend drive\b/.test(lc);
-    const isUndo        = /^undo(\s+last)?$/.test(lc);
+    const isUndo        = /^undo(\s+last)?(\s|$)/.test(lc);
 
     // derive target (explicit name > caller’s profile > phone)
     const explicitTarget = extractTargetName(lc);
@@ -156,7 +187,6 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
         const when = latest?.timestamp ? formatLocal(latest.timestamp, tz) : 'earlier';
         return twiml(res, `${target} is already clocked out since ${when}. (Use "force clock out ${target}" to override.)`);
       }
-      // Auto-close subordinate segments (break/drive) by writing the out first
       await pg.logTimeEntryWithJob(ownerId, target, 'clock_out', now, jobName, tz, { requester_id: actorId });
       return twiml(res, `✅ ${target} is clocked out at ${formatLocal(now, tz)}`);
     }
@@ -193,13 +223,24 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
       return twiml(res, `🅿️ Drive stopped for ${target} at ${formatLocal(now, tz)}.`);
     }
 
-    // ---- UNDO LAST (optional: keep simple message for now)
+    // ---- UNDO LAST (target-aware)
     if (isUndo) {
-      // If you have a delete/undo endpoint, call it here. Otherwise:
-      return twiml(res, `Undo isn't available yet here. Say what to undo and I'll add it next.`);
+      const who = explicitTarget || callerName;
+      const del = await pg.query(
+        `DELETE FROM public.time_entries
+           WHERE owner_id = $1 AND lower(employee_name) = lower($2)
+           ORDER BY timestamp DESC
+           LIMIT 1
+           RETURNING type, timestamp`,
+        [String(ownerId).replace(/\D/g, ''), who]
+      );
+      if (!del.rowCount) return twiml(res, `Nothing to undo for ${who}.`);
+      const type = String(del.rows[0].type || '').replace('_', ' ');
+      const at   = formatLocal(del.rows[0].timestamp, tz);
+      return twiml(res, `Undid ${type} for ${who} at ${at}.`);
     }
 
-    // not handled
+    // not handled here
     return false;
   } catch (e) {
     console.error('[timeclock] error:', e?.message);

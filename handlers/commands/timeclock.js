@@ -26,6 +26,37 @@ const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
 
 // ---- helpers -------------------------------------------------------
 
+function toHumanTime(ts, tz) {
+  // e.g., "6:15am" (lowercase am/pm)
+  const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true });
+  return f.format(new Date(ts)).replace(' AM','am').replace(' PM','pm');
+}
+function toHumanDate(ts, tz) {
+  // e.g., "11-08-2025" (dd-MM-yyyy)
+  const d = new Date(ts);
+  const dd = formatInTimeZone(d, tz, 'dd');
+  const MM = formatInTimeZone(d, tz, 'MM');
+  const yyyy = formatInTimeZone(d, tz, 'yyyy');
+  return `${dd}-${MM}-${yyyy}`;
+}
+function humanVerb(type) {
+  switch (type) {
+    case 'clock_in':    return 'clocked in';
+    case 'clock_out':   return 'clocked out';
+    case 'break_start': return 'started their break';   // ← was "his"
+    case 'break_stop':  return 'ended their break';     // ← was "his"
+    case 'drive_start': return 'started driving';
+    case 'drive_stop':  return 'stopped driving';
+    default:            return type.replace('_',' ');
+  }
+}
+
+function humanLine(type, target, ts, tz) {
+  // "Justin ended his break 6:15am on 11-08-2025"
+  return `${target} ${humanVerb(type)} ${toHumanTime(ts, tz)} on ${toHumanDate(ts, tz)}`;
+}
+
+
 function extractJobHint(text = '') {
   const m = String(text).match(/@\s*([^\n\r]+)/);
   return m ? m[1].trim() : null;
@@ -262,31 +293,34 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
       tz
     });
 
-    // If we have a backfill timestamp (> 2 minutes from "now"), require confirmation
-    if (tsOverride) {
-      const diffMin = Math.abs((new Date(tsOverride).getTime() - now.getTime()) / 60000);
-      if (diffMin > 2) {
-        const type = resolvedType;
-        if (type) {
-          await pg.savePendingAction({
-            ownerId: String(ownerId).replace(/\D/g,''),
-            userId: from,
-            kind: 'backfill_time',
-            payload: { target, type, tsOverride, jobName }  // jsonb object
-          });
+    // If we have a backfill timestamp (> 2 minutes from now), require confirmation
+  if (tsOverride) {
+    const diffMin = Math.abs((new Date(tsOverride).getTime() - now.getTime()) / 60000);
+    if (diffMin > 2) {
+      const type = resolvedType;
+      if (type) {
+        await pg.savePendingAction({
+          ownerId: String(ownerId).replace(/\D/g,''),
+          userId: from,
+          kind: 'backfill_time',
+          payload: { target, type, tsOverride, jobName }  // jsonb object
+        });
 
-          try {
-            await sendBackfillConfirm(
-              from,
-              `${target} ${type.replace('_',' ')} at ${formatLocal(tsOverride, tz)}?`,
-              { preferTemplate: true } // template first, fallback to quick replies
-            );
-          } catch (_) { /* no-op */ }
+        const line = humanLine(type, target, tsOverride, tz);
 
-          return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
-        }
+        try {
+          await sendBackfillConfirm(
+            from,
+            line,
+            { preferTemplate: true } // template first, fallback to quick replies
+          );
+        } catch (_) { /* no-op */ }
+
+        return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
       }
     }
+  }
+
 
     // we need state for the *target* employee
     const state = await getCurrentState(ownerId, target);

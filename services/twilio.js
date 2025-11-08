@@ -10,12 +10,18 @@ const {
   TWILIO_WHATSAPP_FROM,
   TWILIO_SMS_FROM,
   TWILIO_WHATSAPP_NUMBER,          // legacy
-  TWILIO_MESSAGING_SERVICE_SID,    // preferred
-  HEX_BACKFILL_CLOCKIN,            // Content API template SID for backfill confirm
+  TWILIO_MESSAGING_SERVICE_SID,    // optional
+  HEX_BACKFILL_GENERIC             // <- single template used for all backfills
 } = process.env;
 
 const isProd = NODE_ENV === 'production';
+const resolvedWhatsAppFrom = normalizeWhatsAppFrom(TWILIO_WHATSAPP_FROM || TWILIO_WHATSAPP_NUMBER);
+const hasCreds = !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && (resolvedWhatsAppFrom || TWILIO_SMS_FROM || TWILIO_MESSAGING_SERVICE_SID));
+const useMock = !isProd && (!hasCreds || String(MOCK_TWILIO) === '1');
 
+let twilioClient = null;
+
+// --------- helpers ----------
 function normalizeWhatsAppFrom(v) {
   if (!v) return '';
   const s = String(v).trim();
@@ -23,18 +29,11 @@ function normalizeWhatsAppFrom(v) {
   const e164 = s.startsWith('+') ? s : `+${s}`;
   return `whatsapp:${e164}`;
 }
-
 function toWhatsApp(to) {
   const clean = String(to || '').replace(/^whatsapp:/i, '').trim();
   const e164 = clean.startsWith('+') ? clean : `+${clean}`;
   return `whatsapp:${e164}`;
 }
-
-const resolvedWhatsAppFrom = normalizeWhatsAppFrom(TWILIO_WHATSAPP_FROM || TWILIO_WHATSAPP_NUMBER);
-const hasCreds = !!(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && (resolvedWhatsAppFrom || TWILIO_SMS_FROM || TWILIO_MESSAGING_SERVICE_SID));
-const useMock = !isProd && (!hasCreds || String(MOCK_TWILIO) === '1');
-
-let twilioClient = null;
 
 // ---------- Mock client (dev) ----------
 function makeMockClient() {
@@ -64,100 +63,100 @@ if (useMock) {
   twilioClient = makeRealClient();
 }
 
-// ---------- Common payload builder ----------
-function applyFromOrService(payload) {
+// ---------- Core senders ----------
+async function sendWhatsApp(to, body, mediaUrls) {
+  const payload = {
+    to: toWhatsApp(to),
+    body
+  };
   if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
     payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
   } else {
-    // Fallback to explicit FROM numbers
-    if (!payload.from) {
-      payload.from = useMock
-        ? (payload.to?.startsWith('whatsapp:') ? 'whatsapp:+10000000000' : '+10000000000')
-        : (payload.to?.startsWith('whatsapp:') ? (resolvedWhatsAppFrom || 'whatsapp:+10000000000') : TWILIO_SMS_FROM);
-    }
+    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
   }
-  return payload;
-}
-
-// ---------- Core senders ----------
-async function sendWhatsApp(to, body, mediaUrls) {
-  const payload = applyFromOrService({
-    to: toWhatsApp(to),
-    body
-  });
   if (mediaUrls && mediaUrls.length) payload.mediaUrl = mediaUrls;
   return twilioClient.messages.create(payload);
 }
 
 async function sendSMS(to, body) {
-  const payload = applyFromOrService({ to, body });
-  if (!payload.messagingServiceSid && !useMock && !payload.from) {
-    throw new Error('TWILIO_SMS_FROM is required when Messaging Service SID is not set');
+  const payload = { to, body };
+  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
+    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+  } else {
+    payload.from = useMock ? '+10000000000' : TWILIO_SMS_FROM;
+    if (!payload.from && !useMock) {
+      throw new Error('TWILIO_SMS_FROM is required when Messaging Service SID is not set');
+    }
   }
   return twilioClient.messages.create(payload);
 }
 
-// Convenience alias
+// ---------- Convenience (back-compat) ----------
 async function sendMessage(to, body) {
   return sendWhatsApp(to, body);
 }
 
-// ---------- Quick replies (persistentAction) ----------
 async function sendQuickReply(to, body, replies = []) {
-  // Twilio supports up to 3 persistent reply actions
   const buttons = (replies || []).slice(0, 3).map(r => `reply?text=${encodeURIComponent(String(r))}`);
-  const payload = applyFromOrService({
+  const payload = {
     to: toWhatsApp(to),
-    body,
-    persistentAction: buttons
-  });
+    persistentAction: buttons,
+    body
+  };
+  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
+    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+  } else {
+    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
+  }
   return twilioClient.messages.create(payload);
 }
 
-// ---------- Content API (templates) ----------
 async function sendTemplateMessage(to, contentSid, vars = {}) {
-  const payload = applyFromOrService({
+  const payload = {
     to: toWhatsApp(to),
     contentSid,
     contentVariables: JSON.stringify(vars || {})
-  });
+  };
+  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
+    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
+  } else {
+    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
+  }
   return twilioClient.messages.create(payload);
 }
 
-// Twilio limitation: templates + buttons are defined on the Content SID; no extra buttons param here.
+// Twilio limitation: templates + QR need Content API; no extra buttons param.
 async function sendTemplateQuickReply(to, contentSid, vars = {}) {
   return sendTemplateMessage(to, contentSid, vars);
 }
 
-// ---------- Purpose-built helper: backfill confirm (Confirm / Cancel) ----------
 /**
- * Send a confirm/cancel for a backfill summary.
- * Strategy:
- *  - If a Content Template SID (HEX_BACKFILL_CLOCKIN) is configured or preferTemplate=true, use Content API.
- *  - Otherwise, send persistentAction quick replies (<=3) and append "Reply: Confirm | Cancel" for clarity.
- *
- * @param {string} to E.164 or whatsapp:+E164
- * @param {string} summary Human-readable line e.g. "Justin clocked in at 04:00 on 2025-11-08"
- * @param {object} opts { preferTemplate?: boolean, replies?: string[] }
+ * sendBackfillConfirm
+ * Template-first confirm for any backfill action with fallback to WA quick replies.
+ * Env HEX_BACKFILL_GENERIC should be a Content Template that accepts:
+ *   {{1}} -> human line (e.g., "Justin ended his break 6:15am on 11-08-2025")
+ * Template should contain two buttons: Confirm / Cancel.
  */
-async function sendBackfillConfirm(to, summary, opts = {}) {
-  const { preferTemplate = true, replies = ['Confirm', 'Cancel'] } = opts;
+async function sendBackfillConfirm(to, humanLine, opts = {}) {
+  const preferTemplate = !!opts.preferTemplate;
+  const canTemplate = !!HEX_BACKFILL_GENERIC && !useMock;
 
-  // If template SID is available (or we explicitly prefer it), try Content API first.
-  if ((preferTemplate || HEX_BACKFILL_CLOCKIN) && HEX_BACKFILL_CLOCKIN && !useMock) {
+  // 1) Template first (if enabled + requested)
+  if (preferTemplate && canTemplate) {
     try {
-      // Template body example: "Updated clock-in: {{1}}\nPlease confirm the clock-in entry."
-      // Buttons are defined on the Content SID (labels: Confirm / Cancel).
-      return await sendTemplateQuickReply(to, HEX_BACKFILL_CLOCKIN, { '1': summary });
+      return await sendTemplateQuickReply(to, HEX_BACKFILL_GENERIC, { 1: humanLine });
     } catch (e) {
-      console.warn('[TWILIO] Template send failed; falling back to quick reply:', e?.message);
-      // fall through to fallback
+      console.warn('[TWILIO] Template send failed, falling back:', e?.message);
+      // fall through to quick replies
     }
   }
 
-  // Fallback: persistentAction quick replies
-  const body = `Confirm backfill: ${summary}\nReply: ${replies.join(' | ')}`;
-  return sendQuickReply(to, body, replies);
+  // 2) Fallback: native WhatsApp quick-replies
+  return sendQuickReply(
+    to,
+    `Confirm backfill: ${humanLine}`,
+    ['Confirm', 'Cancel']
+  );
 }
 
 // ---------- Signature verification middleware ----------
@@ -166,7 +165,6 @@ function verifyTwilioSignature(options = {}) {
     const twilio = require('twilio');
     return twilio.webhook({ validate: true, ...options });
   }
-  // Dev bypass
   return function devBypass(_req, _res, next) { next(); };
 }
 
@@ -175,13 +173,10 @@ module.exports = {
   sendWhatsApp,
   sendSMS,
   verifyTwilioSignature,
-
   // Convenience
   sendMessage,
   sendQuickReply,
   sendTemplateMessage,
   sendTemplateQuickReply,
-
-  // Purpose-built helper
-  sendBackfillConfirm,
+  sendBackfillConfirm
 };

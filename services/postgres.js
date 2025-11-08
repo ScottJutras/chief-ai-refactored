@@ -128,6 +128,20 @@ async function ensureJobByName(ownerId, name) {
     }
   });
 }
+async function getLatestTimeEvent(ownerId, employeeName) {
+  const { rows } = await query(
+    `SELECT type, timestamp
+       FROM public.time_entries
+      WHERE owner_id=$1 AND lower(employee_name)=lower($2)
+      ORDER BY timestamp DESC
+      LIMIT 1`,
+    [String(DIGITS(ownerId)), String(employeeName || '').trim()]
+  );
+  return rows[0] || null;
+}
+module.exports.getLatestTimeEvent = getLatestTimeEvent;
+
+
 
 // Upsert a job by name, deactivate others, and activate this one
 async function activateJobByName(ownerId, rawName) {
@@ -727,7 +741,8 @@ module.exports = {
   // Time
   logTimeEntry,
   checkTimeEntryLimit: __checkLimit, // safe export
-  checkActorLimit: __checkLimit,     // compat alias
+  checkActorLimit: __checkLimit, 
+  getLatestTimeEvent,
 
   // Exports
   exportTimesheetXlsx,

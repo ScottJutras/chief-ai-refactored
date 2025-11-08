@@ -118,16 +118,55 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
     const isDriveStop   = /\bdrive (stop|off|end)\b/.test(lc) || /\bend drive\b/.test(lc);
     const isUndo        = /^undo\s+last$/.test(lc) || /^undo$/.test(lc);
 
-    // CLOCK IN
-    if (isClockIn) {
-      if (state.hasOpenShift) {
-        const since = state.lastShiftStart ? formatLocal(state.lastShiftStart, tz) : 'earlier';
-        return reply(`Already clocked in since ${since}. If needed, you can start a break or drive.`);
-      }
-      await pg.logTimeEntryWithJob(ownerId, employeeName, 'clock_in', now, jobName, tz, { requester_id: actorId });
-      const at = formatLocal(now, tz);
-      return reply(`✅ ${employeeName} is clocked in at ${at}`);
-    }
+  // Normalize what counts as "in" vs "out"
+const IN_TYPES  = new Set(['in','clock_in','punch_in']);
+const OUT_TYPES = new Set(['out','clock_out','punch_out','end','finish']);
+
+// ---- FORCE CLOCK IN (handles: "force clock in <name>")
+const mForceIn = lc.match(/^force\s+clock\s+in\s+(.+)$/i);
+if (mForceIn) {
+  const forcedTarget = mForceIn[1].trim();
+  await pg.logTimeEntryWithJob(
+    ownerId,
+    forcedTarget,
+    'clock_in',
+    now,
+    jobName, // allow null; resolver will pick active job
+    tz,
+    { requester_id: actorId }
+  );
+  const at = formatLocal(now, tz);
+  return reply(`✅ Forced clock-in recorded for ${forcedTarget} at ${at}.`);
+}
+
+// ---- CLOCK IN (supports "clock in" and "clock in <name>")
+if (isClockIn) {
+  const target = (employeeName || '').trim() || (userProfile?.name || from);
+
+  // Check latest *for the target employee*
+  const latest = await pg.getLatestTimeEvent(ownerId, target);
+  const latestType = String(latest?.type || '').toLowerCase();
+
+  if (latest && IN_TYPES.has(latestType)) {
+    const when = latest?.timestamp ? formatLocal(latest.timestamp, tz) : 'earlier';
+    return reply(`${target} is already clocked in since ${when}. (Use "force clock in ${target}" to override.)`);
+  }
+
+  // Log normal clock in
+  await pg.logTimeEntryWithJob(
+    ownerId,
+    target,
+    'clock_in',
+    now,
+    jobName, // may be null; resolver uses active job
+    tz,
+    { requester_id: actorId }
+  );
+  const at = formatLocal(now, tz);
+  return reply(`✅ ${target} is clocked in at ${at}`);
+}
+
+
 
     // CLOCK OUT
     if (isClockOut) {

@@ -38,23 +38,27 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner
 
   try {
     // -------------------------------------------------
-    // 0) START / ACTIVATE JOB <name>
-    //    (Explicit confirmation reply with ✅ + timestamp)
-    // -------------------------------------------------
-    {
-      const name = parseStartActivateName(text);
-      if (name) {
-        try {
-          const j = await pg.activateJobByName(ownerId, name);
-          const when = formatInTimeZone(new Date(), zone, 'yyyy-MM-dd HH:mm:ss');
-          await sendMessage(from, `✅ Job started: **${j.name}** (#${j.job_no}) at ${when} ${zone}`);
-        } catch (e) {
-          console.warn('[job] start/activate failed:', e?.message);
-          await sendMessage(from, `Sorry—couldn’t start that job. ${e?.message || ''}`.trim());
-        }
-        return true;
-      }
+// 0. START / ACTIVATE JOB <name>
+// (Reply via TwiML so the user sees it immediately)
+// -------------------------------------------------
+{
+  const name = parseStartActivateName(text);
+  if (name) {
+    try {
+      const j = await pg.activateJobByName(ownerId, name);
+      const when = formatInTimeZone(new Date(), zone, 'yyyy-MM-dd HH:mm:ss');
+      // Reply inline (TwiML), not an outbound send
+      res.status(200).type('application/xml')
+        .send(RESP(`✅ Job started: **${j.name}** (#${j.job_no}) at ${when} ${zone}`));
+    } catch (e) {
+      console.warn('[job] start/activate failed:', e?.message);
+      res.status(200).type('application/xml')
+        .send(RESP(`Sorry—couldn’t start that job. ${e?.message || ''}`.trim()));
     }
+    return true;
+  }
+}
+
 
     // -------------------------------------------------
     // 1) CREATE JOB <name>  (with confirmation)

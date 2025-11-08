@@ -680,7 +680,7 @@ const PENDING_TTL_MIN = 10;
 async function savePendingAction({ ownerId, userId, kind, payload }) {
   const { rows } = await query(
     `insert into public.pending_actions (owner_id, user_id, kind, payload, created_at)
-     values ($1,$2,$3,$4, now())
+     values ($1,$2,$3,$4::jsonb, now())
      on conflict (owner_id, user_id, kind)
      do update set
        payload    = EXCLUDED.payload,

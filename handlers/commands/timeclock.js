@@ -148,32 +148,6 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
 Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
     }
 
-    // Check for pending backfill confirmation
-    const pending = await pg.getPendingAction({ ownerId: String(ownerId).replace(/\D/g, ''), userId: from });
-    if (pending && /^confirm$/i.test(lc)) {
-      try {
-        const payload = JSON.parse(pending.payload || '{}');
-        await pg.logTimeEntryWithJob(
-          ownerId,
-          payload.target,
-          payload.type,
-          payload.tsOverride,
-          payload.jobName || null,
-          tz,
-          { requester_id: actorId }
-        );
-        await pg.deletePendingAction(pending.id);
-        return twiml(res, `✅ ${payload.target} ${payload.type.replace('_',' ')} at ${formatLocal(payload.tsOverride, tz)} (backfilled).`);
-      } catch (e) {
-        await pg.deletePendingAction(pending.id).catch(()=>{});
-        return twiml(res, `Backfill failed. ${e?.message || ''}`.trim());
-      }
-    }
-    if (pending && /^(cancel|no)$/i.test(lc)) {
-      await pg.deletePendingAction(pending.id).catch(()=>{});
-      return twiml(res, `Backfill cancelled.`);
-    }
-
     // Rate limit (fail-open if limiter has an internal error)
     const limit = await pg.checkTimeEntryLimit(ownerId, actorId, { max: 8, windowSec: 30 });
     if (limit && limit.ok === false) {
@@ -229,42 +203,38 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
     });
 
     // If we have a backfill timestamp (> 2 minutes from now), require confirmation
-    if (tsOverride) {
-      const diffMin = Math.abs((new Date(tsOverride).getTime() - now.getTime()) / 60000);
-      if (diffMin > 2) {
-        const type =
-          isClockIn ? 'clock_in' :
-          isClockOut ? 'clock_out' :
-          isBreakStart ? 'break_start' :
-          isBreakStop  ? 'break_stop'  :
-          isDriveStart ? 'drive_start' :
-          isDriveStop  ? 'drive_stop'  :
-          null;
+if (tsOverride) {
+  const diffMin = Math.abs((new Date(tsOverride).getTime() - now.getTime()) / 60000);
+  if (diffMin > 2) {
+    const type =
+      isClockIn ? 'clock_in' :
+      isClockOut ? 'clock_out' :
+      isBreakStart ? 'break_start' :
+      isBreakStop  ? 'break_stop'  :
+      isDriveStart ? 'drive_start' :
+      isDriveStop  ? 'drive_stop'  :
+      null;
 
-        if (type) {
-          const id = await pg.savePendingAction({
-  ownerId: String(ownerId).replace(/\D/g, ''),
-  userId: from,
-  kind: 'backfill_time',
-  payload: JSON.stringify({ target, type, tsOverride, jobName })
-});
+    if (type) {
+      await pg.savePendingAction({
+        ownerId: String(ownerId).replace(/\D/g,''),
+        userId: from,
+        kind: 'backfill_time',
+        payload: { target, type, tsOverride, jobName }  // <-- object, not JSON.stringify
+      });
 
-// Try interactive quick reply if your Twilio helper supports it; otherwise it’s just info-level.
-try {
-  await sendQuickReply(
-    from,
-    `Confirm backfill: **${target}** ${type.replace('_',' ')} at ${formatLocal(tsOverride, tz)}?\nReply: Confirm | Cancel`,
-    ['Confirm', 'Cancel']
-  );
-} catch (_) {
-  // No-op; we still send the TwiML response below.
+      try {
+        await sendQuickReply(
+          from,
+          `Confirm backfill: **${target}** ${type.replace('_',' ')} at ${formatLocal(tsOverride, tz)}?\nReply: Confirm | Cancel`,
+          ['Confirm','Cancel']
+        );
+      } catch (_) {}
+      return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
+    }
+  }
 }
 
-return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
-
-        }
-      }
-    }
 
     // we need state for the *target* employee
     const state = await getCurrentState(ownerId, target);

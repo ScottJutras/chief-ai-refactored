@@ -5,13 +5,13 @@
 // - Pauses shift during break/lunch; drive time runs in parallel
 // - Auto-closes break/drive on clock_out
 // - Clear confirmations with ✅ and local time
-// - Backfill-safe with quick-reply confirmation
+// - Backfill-safe with Ask → Confirm → Execute, tolerant NLP
 // -------------------------------------------------------------------
 
 const pg = require('../../services/postgres');
 const chrono = require('chrono-node');
 const { formatInTimeZone, zonedTimeToUtc } = require('date-fns-tz');
-const { sendQuickReply } = require('../../services/twilio');
+const { sendBackfillConfirm, sendQuickReply } = require('../../services/twilio');
 
 // What counts as "in" vs "out" when checking latest event
 const IN_TYPES  = new Set(['in','clock_in','punch_in']);
@@ -46,10 +46,23 @@ function extractTargetName(lc) {
 function extractNarrative(text) {
   // Unicode-aware and case-insensitive
   const m = String(text).match(
-    /^([\p{L}\p{M}.'-]+(?:\s+[\p{L}\p{M}.'-]+){0,2})\s+(?:forgot|did\s*not|didn't|needs|need)\s+to\s+clock\s+(in|out)\b/iu
+    /^([\p{L}\p{M}.'-]+(?:\s+[\p{L}\p{M}.'-]+){0,2})\s+(?:forgot|did\s*not|didn't|needs?|need)\s+to\s+clock\s+(in|out)\b/iu
   );
   if (!m) return null;
   return { name: m[1].trim(), action: m[2].toLowerCase() }; // 'in' | 'out'
+}
+
+// Narrative for break/drive: "<name> forgot to start/stop (his|her|their) break/drive ..."
+function extractSegmentNarrative(text) {
+  const m = String(text).match(
+    /^([\p{L}\p{M}.'-]+(?:\s+[\p{L}\p{M}.'-]+){0,2})\s+(?:forgot|did\s*not|didn't|needs?|need)\s+to\s+(start|stop|end)\s+(?:his|her|their|the)?\s*(break|drive)\b/iu
+  );
+  if (!m) return null;
+  const name = m[1].trim();
+  const act  = m[2].toLowerCase();           // start | stop | end
+  const seg  = m[3].toLowerCase();           // break | drive
+  const action = (act === 'end' || act === 'stop') ? 'stop' : 'start';
+  return { name, seg, action };              // e.g., { name:"Justin", seg:"break", action:"start" }
 }
 
 // Pull a trailing "at <when>" phrase; keep it tight to end or punctuation
@@ -156,26 +169,54 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
 
     const jobName = extractJobHint(text) || null;
 
-    // intents
-    let isClockIn     = /\b(clock ?in|start shift)\b/i.test(text);
-    let isClockOut    = /\b(clock ?out|end shift)\b/i.test(text);
-    const isBreakStart  = /\bbreak (start|on)\b/i.test(text) || /\bstart break\b/i.test(text);
-    const isBreakStop   = /\bbreak (stop|off|end)\b/i.test(text) || /\bend break\b/i.test(text);
-    const isDriveStart  = /\bdrive (start|on)\b/i.test(text) || /\bstart drive\b/i.test(text);
-    const isDriveStop   = /\bdrive (stop|off|end)\b/i.test(text) || /\bend drive\b/i.test(text);
-    const isUndo        = /^undo(\s+last)?$/i.test(lc);
+    // intents (tolerant to "start his/her/their break", "stop the break", etc.)
+    let isClockIn   = /\b(clock ?in|start shift)\b/i.test(text);
+    let isClockOut  = /\b(clock ?out|end shift)\b/i.test(text);
+
+    let isBreakStart =
+      /\bbreak\s*(start|on)\b/i.test(text) ||
+      /\bstart(?:ing)?\s+(?:his|her|their|the)?\s*break\b/i.test(text);
+
+    let isBreakStop =
+      /\bbreak\s*(stop|off|end)\b/i.test(text) ||
+      /\bend(?:ing)?\s+(?:his|her|their|the)?\s*break\b/i.test(text) ||
+      /\bstop(?:ping)?\s+(?:his|her|their|the)?\s*break\b/i.test(text);
+
+    let isDriveStart =
+      /\bdrive\s*(start|on)\b/i.test(text) ||
+      /\bstart(?:ing)?\s+(?:his|her|their|the)?\s*drive\b/i.test(text);
+
+    let isDriveStop =
+      /\bdrive\s*(stop|off|end)\b/i.test(text) ||
+      /\bend(?:ing)?\s+(?:his|her|their|the)?\s*drive\b/i.test(text) ||
+      /\bstop(?:ping)?\s+(?:his|her|their|the)?\s*drive\b/i.test(text);
+
+    const isUndo = /^undo(\s+last)?$/i.test(lc);
 
     // Derive target (explicit > narrative > caller’s profile > phone)
     const explicitTarget = extractTargetName(lc);
     const narrative = extractNarrative(text);
     let target = explicitTarget || (narrative?.name) || (userProfile?.name) || from;
 
+    // Segment narrative (e.g., "Justin forgot to start his break ...")
+    const segNarr = extractSegmentNarrative(text);
+    if (segNarr) {
+      target = explicitTarget || segNarr.name || target;
+      if (segNarr.seg === 'break') {
+        if (segNarr.action === 'start') { isBreakStart = true; isBreakStop = false; }
+        else                            { isBreakStop  = true; isBreakStart = false; }
+      } else if (segNarr.seg === 'drive') {
+        if (segNarr.action === 'start') { isDriveStart = true; isDriveStop = false; }
+        else                            { isDriveStop  = true; isDriveStart = false; }
+      }
+    }
+
     // Guard against time words/pronouns being mistaken for names
     if (TIME_WORDS.has(String(target).toLowerCase()) || /^me|myself|my$/i.test(target)) {
       target = userProfile?.name || from;
     }
 
-    // If narrative defined an action, adopt it unless already explicit
+    // If narrative defined a clock in/out action, adopt it unless already explicit
     if (narrative && !isClockIn && !isClockOut) {
       if (narrative.action === 'in')  isClockIn = true;
       if (narrative.action === 'out') isClockOut = true;
@@ -185,56 +226,67 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
     const whenTxt = extractAtWhen(text);
     const tsOverride = whenTxt ? parseLocalWhenToIso(whenTxt, tz, now) : null;
 
-    // Log resolved command
+    // Resolve a type if already clear
+    let resolvedType =
+      isClockIn ? 'clock_in' :
+      isClockOut ? 'clock_out' :
+      isBreakStart ? 'break_start' :
+      isBreakStop ? 'break_stop' :
+      isDriveStart ? 'drive_start' :
+      isDriveStop ? 'drive_stop' : null;
+
+    // Repair: If we see 'break' or 'drive' but not the direction, ask Start/Stop
+    if (!resolvedType) {
+      const hasBreak = /\bbreak\b/i.test(text);
+      const hasDrive = /\bdrive\b/i.test(text);
+      if (hasBreak || hasDrive) {
+        const seg = hasBreak ? 'Break' : 'Drive';
+        // Ask user to choose start/stop via quick replies (labels match our detectors)
+        await sendQuickReply(
+          from,
+          `Do you want me to ${seg.toLowerCase()} **start** or **stop** for ${target}${tsOverride ? ' at ' + formatLocal(tsOverride, tz) : ''}?`,
+          [`${seg} Start`, `${seg} Stop`, 'Cancel']
+        );
+        return twiml(res, 'Choose an option above.');
+      }
+    }
+
+    // Log resolved command (pre-confirm)
     console.info('[timeclock cmd]', {
       ownerId,
       actor: from,
       target,
-      action: isClockIn ? 'clock_in' : isClockOut ? 'clock_out'
-            : isBreakStart ? 'break_start'
-            : isBreakStop  ? 'break_stop'
-            : isDriveStart ? 'drive_start'
-            : isDriveStop  ? 'drive_stop'
-            : isUndo       ? 'undo'
-            : 'unknown',
+      action: resolvedType || (isUndo ? 'undo' : 'unknown'),
       whenTxt,
       tsOverride,
       tz
     });
 
-    // If we have a backfill timestamp (> 2 minutes from now), require confirmation
-if (tsOverride) {
-  const diffMin = Math.abs((new Date(tsOverride).getTime() - now.getTime()) / 60000);
-  if (diffMin > 2) {
-    const type =
-      isClockIn ? 'clock_in' :
-      isClockOut ? 'clock_out' :
-      isBreakStart ? 'break_start' :
-      isBreakStop  ? 'break_stop'  :
-      isDriveStart ? 'drive_start' :
-      isDriveStop  ? 'drive_stop'  :
-      null;
+    // If we have a backfill timestamp (> 2 minutes from "now"), require confirmation
+    if (tsOverride) {
+      const diffMin = Math.abs((new Date(tsOverride).getTime() - now.getTime()) / 60000);
+      if (diffMin > 2) {
+        const type = resolvedType;
+        if (type) {
+          await pg.savePendingAction({
+            ownerId: String(ownerId).replace(/\D/g,''),
+            userId: from,
+            kind: 'backfill_time',
+            payload: { target, type, tsOverride, jobName }  // jsonb object
+          });
 
-    if (type) {
-      await pg.savePendingAction({
-        ownerId: String(ownerId).replace(/\D/g,''),
-        userId: from,
-        kind: 'backfill_time',
-        payload: { target, type, tsOverride, jobName }  // <-- object, not JSON.stringify
-      });
+          try {
+            await sendBackfillConfirm(
+              from,
+              `${target} ${type.replace('_',' ')} at ${formatLocal(tsOverride, tz)}?`,
+              { preferTemplate: true } // template first, fallback to quick replies
+            );
+          } catch (_) { /* no-op */ }
 
-      try {
-        await sendQuickReply(
-          from,
-          `Confirm backfill: **${target}** ${type.replace('_',' ')} at ${formatLocal(tsOverride, tz)}?\nReply: Confirm | Cancel`,
-          ['Confirm','Cancel']
-        );
-      } catch (_) {}
-      return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
+          return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
+        }
+      }
     }
-  }
-}
-
 
     // we need state for the *target* employee
     const state = await getCurrentState(ownerId, target);
@@ -254,6 +306,14 @@ if (tsOverride) {
       await pg.logTimeEntryWithJob(ownerId, forced, 'clock_out', tsOverride || now, jobName, tz, { requester_id: actorId });
       return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
     }
+
+    // Normalize booleans from resolvedType (so the rest of code paths still work)
+    isClockIn     = resolvedType === 'clock_in';
+    isClockOut    = resolvedType === 'clock_out';
+    isBreakStart  = resolvedType === 'break_start';
+    isBreakStop   = resolvedType === 'break_stop';
+    isDriveStart  = resolvedType === 'drive_start';
+    isDriveStop   = resolvedType === 'drive_stop';
 
     // ---- CLOCK IN
     if (isClockIn) {
@@ -275,7 +335,6 @@ if (tsOverride) {
         const when = latest?.timestamp ? formatLocal(latest.timestamp, tz) : 'earlier';
         return twiml(res, `${target} is already clocked out since ${when}. (Use "force clock out ${target}" to override.)`);
       }
-      // write out (auto-closes subordinate segments in reporting)
       await pg.logTimeEntryWithJob(ownerId, target, 'clock_out', tsOverride || now, jobName, tz, { requester_id: actorId });
       return twiml(res, `✅ ${target} is clocked out at ${formatLocal(tsOverride || now, tz)}`);
     }

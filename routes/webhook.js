@@ -173,6 +173,24 @@ router.post('*', async (req, res, next) => {
     return ok(res, 'Media processed.');
   }
 });
+
+// Normalize “interactive button” taps into Body text if present.
+router.post('*', (req, _res, next) => {
+  const b = req.body || {};
+  // Twilio sends the label in Body for many accounts already; if not, check extras:
+  const interactiveText = b.ButtonText || b.PostbackText || b.InteractiveResponseText;
+  const interactivePayload = b.ButtonPayload || b.PostbackData || b.InteractiveResponseId;
+
+  // If Body is empty but we have an interactive label, promote it to Body.
+  if ((!b.Body || !String(b.Body).trim()) && (interactiveText || interactivePayload)) {
+    // Prefer the human-readable label; fall back to payload.
+    req.body.Body = String(interactiveText || interactivePayload);
+  }
+  next();
+});
+
+
+
 // ---------- TEXT ROUTING ----------
 router.post('*', async (req, res, next) => {
   console.log('[ROUTER] text');

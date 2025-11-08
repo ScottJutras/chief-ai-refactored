@@ -678,24 +678,21 @@ async function exportTimesheetPdf(opts) {
 const PENDING_TTL_MIN = 10;
 
 async function savePendingAction({ ownerId, userId, kind, payload }) {
-  // Nuke older pendings for this user/owner to keep confirm UX clean
-  await query(
-    `delete from public.pending_actions
-      where owner_id=$1 and user_id=$2
-        and created_at > now() - ($3 || ' minutes')::interval`,
-    [String(ownerId).replace(/\D/g,''), String(userId), String(PENDING_TTL_MIN)]
-  );
-
   const { rows } = await query(
-    `insert into public.pending_actions (owner_id, user_id, kind, payload)
-     values ($1,$2,$3,$4)
+    `insert into public.pending_actions (owner_id, user_id, kind, payload, created_at)
+     values ($1,$2,$3,$4, now())
+     on conflict (owner_id, user_id, kind)
+     do update set
+       payload    = EXCLUDED.payload,
+       created_at = now()
      returning id`,
-    [String(ownerId).replace(/\D/g,''), String(userId), String(kind), payload]
+    [DIGITS(ownerId), String(userId), String(kind), payload]
   );
   const id = rows[0].id;
-  console.info('[pending] saved', { id, ownerId: String(ownerId).replace(/\D/g,''), userId, kind });
+  console.info('[pending] saved', { id, ownerId: DIGITS(ownerId), userId, kind });
   return id;
 }
+
 
 async function getPendingAction({ ownerId, userId }) {
   const { rows } = await query(

@@ -674,35 +674,39 @@ async function exportTimesheetPdf(opts) {
   return { url: `${base}/exports/${id}`, id, filename };
 }
 
-// ---------- Pending actions (confirmations, serverless-safe, TTL) ----------
+// ---------- Pending actions (confirmations, serverless-safe, TTL via created_at) ----------
 const PENDING_TTL_MIN = 10;
 
 async function savePendingAction({ ownerId, userId, kind, payload }) {
-  const id = crypto.randomUUID();
-  await query(
-    `INSERT INTO public.pending_actions (id, owner_id, user_id, kind, payload, expires_at, created_at)
-     VALUES ($1,$2,$3,$4,$5, NOW() + ($6 || ' minutes')::interval, NOW())
-     ON CONFLICT (id) DO NOTHING`,
-    [id, String(ownerId), String(userId), String(kind), payload, String(PENDING_TTL_MIN)]
+  const { rows } = await query(
+    `insert into public.pending_actions (owner_id, user_id, kind, payload)
+     values ($1,$2,$3,$4) returning id`,
+    [String(ownerId).replace(/\D/g, ''), String(userId), String(kind), payload]
   );
+  const id = rows[0].id;
+  console.info('[pending] saved', { id, ownerId: String(ownerId).replace(/\D/g, ''), userId, kind });
   return id;
 }
 
 async function getPendingAction({ ownerId, userId }) {
   const { rows } = await query(
-    `SELECT id, kind, payload
-       FROM public.pending_actions
-      WHERE owner_id=$1 AND user_id=$2 AND expires_at > NOW()
-      ORDER BY created_at DESC
-      LIMIT 1`,
-    [String(ownerId), String(userId)]
+    `select id, kind, payload, created_at
+       from public.pending_actions
+      where owner_id=$1 and user_id=$2
+        and created_at > now() - ($3 || ' minutes')::interval
+      order by created_at desc
+      limit 1`,
+    [String(ownerId).replace(/\D/g, ''), String(userId), String(PENDING_TTL_MIN)]
   );
   return rows[0] || null;
 }
 
 async function deletePendingAction(id) {
-  await query(`DELETE FROM public.pending_actions WHERE id=$1`, [String(id)]);
+  await query(`delete from public.pending_actions where id=$1`, [id]);
 }
+module.exports.savePendingAction   = savePendingAction;
+module.exports.getPendingAction    = getPendingAction;
+module.exports.deletePendingAction = deletePendingAction;
 
 // ---- Safe limiter exports (avoid undefined symbol at module.exports time)
 const __checkLimit =

@@ -5,6 +5,7 @@ const express = require('express');
 const app = express();
 const router = express.Router();
 const querystring = require('querystring');
+const { pendingActionMiddleware } = require('../middleware/pendingAction');
 // ---------- Helpers ----------
 /* =========================
  * Small helpers
@@ -96,12 +97,12 @@ router.post('*', (req, res, next) => {
   }
   next();
 });
-// ---------- Light middlewares (lazy) ----------
+/// ---------- Light middlewares (lazy) ----------
 router.use((req, res, next) => {
   try {
     const token = require('../middleware/token');
-    const prof = require('../middleware/userProfile');
-    const lock = require('../middleware/lock');
+    const prof  = require('../middleware/userProfile');
+    const lock  = require('../middleware/lock');
     token.tokenMiddleware(req, res, () =>
       prof.userProfileMiddleware(req, res, () =>
         lock.lockMiddleware(req, res, next)
@@ -112,6 +113,15 @@ router.use((req, res, next) => {
     next();
   }
 });
+
+// ---------- Pending-action interceptor (must run BEFORE media/text routing) ----------
+try {
+  const { pendingActionMiddleware } = require('../middleware/pendingAction');
+  router.post('*', pendingActionMiddleware);
+} catch (e) {
+  console.warn('[WEBHOOK] pendingActionMiddleware unavailable:', e?.message);
+}
+
 // ---------- Media Handler ----------
 router.post('*', async (req, res, next) => {
   console.log('[ROUTER] media');

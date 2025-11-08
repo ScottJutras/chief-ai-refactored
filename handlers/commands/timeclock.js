@@ -243,17 +243,25 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
 
         if (type) {
           const id = await pg.savePendingAction({
-            ownerId: String(ownerId).replace(/\D/g, ''),
-            userId: from,
-            kind: 'backfill_time',
-            payload: JSON.stringify({ target, type, tsOverride, jobName })
-          });
-          await sendQuickReply(
-            from,
-            `Confirm backfill: **${target}** ${type.replace('_',' ')} at ${formatLocal(tsOverride, tz)}?`,
-            ['Confirm', 'Cancel']
-          );
-          return twiml(res, 'I sent a confirmation — tap **Confirm** or **Cancel**.');
+  ownerId: String(ownerId).replace(/\D/g, ''),
+  userId: from,
+  kind: 'backfill_time',
+  payload: JSON.stringify({ target, type, tsOverride, jobName })
+});
+
+// Try interactive quick reply if your Twilio helper supports it; otherwise it’s just info-level.
+try {
+  await sendQuickReply(
+    from,
+    `Confirm backfill: **${target}** ${type.replace('_',' ')} at ${formatLocal(tsOverride, tz)}?\nReply: Confirm | Cancel`,
+    ['Confirm', 'Cancel']
+  );
+} catch (_) {
+  // No-op; we still send the TwiML response below.
+}
+
+return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
+
         }
       }
     }

@@ -9,7 +9,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "jest tests"
+    "test": "jest tests",
+    "worker:kpi": "node services/kpiWorker.js"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.10",

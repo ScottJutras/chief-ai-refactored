@@ -132,32 +132,37 @@ async function sendTemplateQuickReply(to, contentSid, vars = {}) {
 
 /**
  * sendBackfillConfirm
- * Template-first confirm for any backfill action with fallback to WA quick replies.
- * Env HEX_BACKFILL_GENERIC should be a Content Template that accepts:
- *   {{1}} -> human line (e.g., "Justin ended his break 6:15am on 11-08-2025")
- * Template should contain two buttons: Confirm / Cancel.
+ * Template-first confirm for any backfill action with fallback to WA quick replies,
+ * and a final plain-text fallback with typed instructions.
  */
 async function sendBackfillConfirm(to, humanLine, opts = {}) {
   const preferTemplate = !!opts.preferTemplate;
   const canTemplate = !!HEX_BACKFILL_GENERIC && !useMock;
 
-  // 1) Template first (if enabled + requested)
+  // 1) Template first
   if (preferTemplate && canTemplate) {
     try {
       return await sendTemplateQuickReply(to, HEX_BACKFILL_GENERIC, { 1: humanLine });
     } catch (e) {
       console.warn('[TWILIO] Template send failed, falling back:', e?.message);
-      // fall through to quick replies
+      // fall through
     }
   }
 
-  // 2) Fallback: native WhatsApp quick-replies
-  return sendQuickReply(
-    to,
-    `Confirm backfill: ${humanLine}`,
-    ['Confirm', 'Cancel']
-  );
+  // 2) Quick-replies
+  try {
+    return await sendQuickReply(
+      to,
+      `Confirm backfill: ${humanLine}\nReply: "Confirm" or "Cancel"`,
+      ['Confirm', 'Cancel']
+    );
+  } catch (e2) {
+    console.warn('[TWILIO] Quick-replies failed, final fallback to plain text:', e2?.message);
+    // 3) Plain text final fallback
+    return sendWhatsApp(to, `Confirm backfill: ${humanLine}\nReply: "Confirm" or "Cancel"`);
+  }
 }
+
 
 // ---------- Signature verification middleware ----------
 function verifyTwilioSignature(options = {}) {

@@ -197,21 +197,35 @@ router.post('*', async (req, res, next) => {
   try {
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();
+
     // Heuristic: user is asking for help/how-to
     const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc);
+
     // Intent detectors
     let looksTask = /^task\b/.test(lc) || /\btasks?\b/.test(lc);
-    let looksJob = /\b(job|jobs|active job|set active|close job|list jobs|move last log)\b/.test(lc);
-    let looksTime = /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc);
+
+    let looksJob =
+      /\b(?:job|jobs)\b/.test(lc) ||
+      /\bactive job\??\b/.test(lc) ||
+      /\bwhat'?s\s+my\s+active\s+job\??\b/.test(lc) ||
+      /\bset\s+active\b/.test(lc) ||
+      /\b(list|create|start|activate|pause|resume|finish)\s+job\b/.test(lc) ||
+      /\bmove\s+last\s+log\s+to\b/.test(lc);
+
+    let looksTime =
+      /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc);
+
     // Nudge intents when user literally asks how to use a module
     if (askingHow && /\btasks?\b/.test(lc)) looksTask = true;
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc)) looksTime = true;
     if (askingHow && /\bjobs?\b/.test(lc)) looksJob = true;
+
     const topicHints = [
       looksTask ? 'tasks' : null,
       looksJob ? 'jobs' : null,
       looksTime ? 'timeclock' : null,
     ].filter(Boolean);
+
     // SOP fallbacks (AVOID angle brackets in XML)
     const SOP = {
       tasks:
@@ -232,12 +246,15 @@ router.post('*', async (req, res, next) => {
         '• Create: create job Roof Repair\n' +
         '• Set active: set active job Roof Repair\n' +
         '• List: list jobs\n' +
-        '• Close: close job Roof Repair',
+        '• Close: finish job Roof Repair\n' +
+        '• Move: move last log to Front Porch [for Justin]',
     };
+
     const cmds = require('../handlers/commands');
     const tasksHandler = cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
-    const handleJob = cmds.job || require('../handlers/commands/job');
+    const { handleJob } = cmds.job || require('../handlers/commands/job');
     const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
+
     // TASKS
     if (looksTask && typeof tasksHandler === 'function') {
       const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
@@ -249,6 +266,7 @@ router.post('*', async (req, res, next) => {
       }
       return;
     }
+
     // JOBS
     if (looksJob && typeof handleJob === 'function') {
       const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
@@ -260,6 +278,7 @@ router.post('*', async (req, res, next) => {
       }
       return;
     }
+
     // TIMECLOCK
     if (looksTime && typeof handleTimeclock === 'function') {
       const out = await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
@@ -271,6 +290,7 @@ router.post('*', async (req, res, next) => {
       }
       return;
     }
+
     // AGENT (subscription-gated)
     if (canUseAgent(req.userProfile)) {
       try {
@@ -286,10 +306,11 @@ router.post('*', async (req, res, next) => {
         console.warn('[AGENT] failed:', e?.message);
       }
     }
+
     // DEFAULT HELP
     return ok(res,
       'PocketCFO — What I can do:\n' +
-      '• Jobs: create job Roof Repair, set active job Roof Repair\n' +
+      '• Jobs: create job Roof Repair, set active job Roof Repair, move last log to Front Porch\n' +
       '• Tasks: task - buy nails, my tasks, done #4\n' +
       '• Time: clock in, clock out, timesheet week'
     );
@@ -297,6 +318,7 @@ router.post('*', async (req, res, next) => {
     return next(err);
   }
 });
+
 // ---------- Final fallback – always 200 TwiML ----------
 router.use((req, res, next) => {
   if (!res.headersSent) {

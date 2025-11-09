@@ -1,26 +1,77 @@
 // services/postgres.js
 // ------------------------------------------------------------
 // Central Postgres service – pool, retry, helpers, lazy heavy deps
+// North Star: resilient pool, short timeouts, idempotent-friendly
 // ------------------------------------------------------------
 
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const { formatInTimeZone } = require('date-fns-tz');
 
-// ---------- Lazy heavy dependencies ----------
-let ExcelJS = null;      // required only in exportTimesheetXlsx
-let PDFDocument = null;  // required only in exportTimesheetPdf
+// ---------- Lazy heavy dependencies (loaded only when needed) ----------
+let ExcelJS = null;      // used in exportTimesheetXlsx
+let PDFDocument = null;  // used in exportTimesheetPdf
 
-// ---------- Pool ----------
+// ---------- Environment ----------
+const {
+  DATABASE_URL,
+  PGHOST,
+  PGPORT,
+  PGDATABASE,
+  PGUSER,
+  PGPASSWORD,
+  PGSSLMODE,     // e.g., 'require' for Supabase
+  NODE_ENV
+} = process.env;
+
+const isProd = NODE_ENV === 'production';
+const useUrl = !!DATABASE_URL;
+
+// Hosted DBs usually need SSL. Local 127.0.0.1 usually does not.
+const shouldSSL =
+  PGSSLMODE === 'require' ||
+  (useUrl && /supabase\.co|render\.com|herokuapp\.com|aws|gcp|azure/i.test(DATABASE_URL || ''));
+
+const ssl = shouldSSL ? { rejectUnauthorized: false } : false;
+
+// Base pool config from either URL or discrete vars
+const basePoolConfig = useUrl
+  ? { connectionString: DATABASE_URL, ssl }
+  : {
+      host: PGHOST || '127.0.0.1',
+      port: Number(PGPORT || 5432),
+      database: PGDATABASE || 'postgres',
+      user: PGUSER || 'postgres',
+      password: PGPASSWORD || '',
+      ssl
+    };
+
+// ---------- Pool (sane limits + timeouts) ----------
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ...basePoolConfig,
+  // Pool sizing: conservative for serverless; override with PG* env if needed
   max: 20,
-  connectionTimeoutMillis: 20000,
-  idleTimeoutMillis: 60000,
+  min: 0,
+  idleTimeoutMillis: 60_000,       // free idle clients quickly
+  connectionTimeoutMillis: 20_000, // fail fast on bad networks
   keepAlive: true,
+  application_name: 'chief-ai'     // shows up in pg_stat_activity
 });
-pool.on('error', err => console.error('[PG] idle client error:', err?.message));
+
+pool.on('connect', async (client) => {
+  try {
+    // Keep timestamps in UTC at the DB layer; render local times in app
+    await client.query(`SET TIME ZONE 'UTC'`);
+    await client.query(`SET intervalstyle = 'iso_8601'`);
+  } catch (e) {
+    // Non-fatal
+    console.warn('[PG] connect session prep failed:', e?.message);
+  }
+});
+
+pool.on('error', (err) => {
+  console.error('[PG] idle client error:', err?.message);
+});
 
 // ---------- Core query helpers ----------
 async function query(text, params) {
@@ -31,25 +82,38 @@ async function queryWithRetry(text, params, attempt = 1) {
   try {
     return await pool.query(text, params);
   } catch (e) {
-    const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET|connection terminated/i.test(e.message || '');
+    // Retry a couple times on transient network issues
+    const msg = e?.message || '';
+    const transient = /ECONNRESET|EPIPE|timeout|terminat(ed|ing)|Connection terminated|read ECONNRESET/i.test(msg);
     if (transient && attempt < 3) {
-      console.warn(`[PG] retry ${attempt + 1}: ${e.message}`);
-      await new Promise(r => setTimeout(r, attempt * 200));
+      const backoffMs = attempt * 200;
+      console.warn(`[PG] retry ${attempt + 1} in ${backoffMs}ms: ${msg}`);
+      await new Promise((r) => setTimeout(r, backoffMs));
       return queryWithRetry(text, params, attempt + 1);
     }
     throw e;
   }
 }
 
-async function queryWithTimeout(sql, params, ms = 9000) {
-  return withClient(async client => {
-    // NOTE: SET LOCAL cannot be parameterized
+/**
+ * queryWithTimeout
+ * Runs a single statement within a per-transaction statement_timeout.
+ * Uses SET LOCAL so the timeout only applies to this txn.
+ */
+async function queryWithTimeout(sql, params, ms = 9_000) {
+  return withClient(async (client) => {
     const timeoutMs = Math.max(0, Number(ms) | 0);
+    // SET LOCAL cannot be parameterized
     await client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
     return client.query(sql, params);
   }, { useTransaction: true });
 }
 
+/**
+ * withClient
+ * Borrow a client with optional transaction wrapper.
+ * Ensures COMMIT/ROLLBACK and release no matter what.
+ */
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await pool.connect();
   try {
@@ -58,12 +122,26 @@ async function withClient(fn, { useTransaction = true } = {}) {
     if (useTransaction) await client.query('COMMIT');
     return res;
   } catch (err) {
-    if (useTransaction) await client.query('ROLLBACK').catch(() => {});
+    if (useTransaction) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
     throw err;
   } finally {
     client.release();
   }
 }
+
+// ---------- Small utility helpers used across services ----------
+function DIGITS(v) {
+  return String(v || '').replace(/\D/g, '');
+}
+
+// Example: commonly used today-in-tz helper for rollups/touches
+function todayInTZ(tz = 'America/Toronto') {
+  const d = new Date();
+  return formatInTimeZone(d, tz, 'yyyy-MM-dd');
+}
+
 
 // Find or create a job by name (case-insensitive on name or job_name).
 // Robust against races and job_no duplicates: we allocate job_no under an advisory lock.
@@ -140,7 +218,75 @@ async function getLatestTimeEvent(ownerId, employeeName) {
   return rows[0] || null;
 }
 module.exports.getLatestTimeEvent = getLatestTimeEvent;
+// ---- JOB HELPERS (additive) ---------------------------------------
 
+async function getOrCreateJob(ownerId, name) {
+  const owner = String(ownerId).replace(/\D/g,'');
+  const jobName = String(name).trim();
+  const sel = await query(
+    `select id from public.jobs where owner_id=$1 and lower(name)=lower($2) limit 1`,
+    [owner, jobName]
+  );
+  if (sel.rowCount) return sel.rows[0].id;
+
+  const ins = await query(
+    `insert into public.jobs (owner_id, name) values ($1,$2) returning id`,
+    [owner, jobName]
+  );
+  return ins.rows[0].id;
+}
+
+async function setActiveJob(ownerId, userId, jobId) {
+  const owner = String(ownerId).replace(/\D/g,'');
+  await query(
+    `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
+     values ($1,$2,$3,now())
+     on conflict (owner_id,user_id) do update set job_id=excluded.job_id, updated_at=now()`,
+    [owner, String(userId), jobId]
+  );
+  return true;
+}
+
+async function getActiveJob(ownerId, userId) {
+  const owner = String(ownerId).replace(/\D/g,'');
+  const { rows } = await query(
+    `select j.id, j.name, j.status
+       from public.user_active_job u
+       join public.jobs j on j.id=u.job_id
+      where u.owner_id=$1 and u.user_id=$2`,
+    [owner, String(userId)]
+  );
+  return rows[0] || null;
+}
+
+// If your time_entries uses job_no (int) instead of job_id (uuid),
+// adapt this function accordingly. Assumes a job_id (uuid) column exists OR
+// you map job_id -> job_no elsewhere.
+async function moveLastLogToJob(ownerId, userName, jobId) {
+  const owner = String(ownerId).replace(/\D/g,'');
+  // Update the most recent row for that employee
+  const { rows } = await query(
+    `update public.time_entries t
+        set job_id=$1
+      where t.id = (
+        select id from public.time_entries
+         where owner_id=$2 and lower(employee_name)=lower($3)
+         order by timestamp desc limit 1
+      )
+      returning id, type, timestamp`,
+    [jobId, owner, String(userName)]
+  );
+  return rows[0] || null;
+}
+
+async function enqueueKpiTouch(ownerId, jobId, isoDate) {
+  const owner = String(ownerId).replace(/\D/g,'');
+  const day = isoDate ? isoDate.slice(0,10) : new Date().toISOString().slice(0,10);
+  await query(
+    `insert into public.kpi_touches (owner_id, job_id, day) values ($1,$2,$3)`,
+    [owner, jobId || null, day]
+  );
+}
 
 
 // Upsert a job by name, deactivate others, and activate this one
@@ -720,23 +866,26 @@ const __checkLimit =
   (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
 
 module.exports = {
-  // Core
+  // ---------- Core ----------
   pool,
   query,
+  queryWithRetry,
   queryWithTimeout,
   withClient,
-  normalizePhoneNumber: x => DIGITS(x),
+
+  // ---------- Utils ----------
+  DIGITS,
+  todayInTZ,
+  normalizePhoneNumber: (x) => DIGITS(x),
   toAmount,
   isValidIso,
 
-  // Jobs / context
-  ensureJobByName,
-  resolveJobContext,
-  createTaskWithJob,
-  logTimeEntryWithJob,
-  activateJobByName,
+  // ---------- Pending actions (serverless-safe confirmations) ----------
+  savePendingAction,
+  getPendingAction,
+  deletePendingAction,
 
-  // Users
+  // ---------- Users ----------
   generateOTP,
   verifyOTP,
   createUserProfile,
@@ -744,23 +893,31 @@ module.exports = {
   getUserProfile,
   getOwnerProfile,
 
-  // Tasks
+  // ---------- Tasks ----------
   createTask,
   getTaskByNo,
+  createTaskWithJob,      // (kept for back-compat if you use it)
 
-  // Time
+  // ---------- Jobs / context ----------
+  ensureJobByName,
+  activateJobByName,
+  resolveJobContext,
+  getOrCreateJob,
+  setActiveJob,
+  getActiveJob,
+  moveLastLogToJob,
+  enqueueKpiTouch,
+
+  // ---------- Time ----------
   logTimeEntry,
-  checkTimeEntryLimit: __checkLimit, // safe export
-  checkActorLimit: __checkLimit, 
+  logTimeEntryWithJob,
   getLatestTimeEvent,
+  checkTimeEntryLimit: __checkLimit, // alias; keep external API stable
+  checkActorLimit: __checkLimit,
 
-  // Exports
+  // ---------- Exports ----------
   exportTimesheetXlsx,
   exportTimesheetPdf,
   getFileExport,
-
-  // Pending actions (serverless-safe confirmations)
-  savePendingAction,
-  getPendingAction,
-  deletePendingAction,
 };
+

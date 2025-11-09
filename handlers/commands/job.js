@@ -1,14 +1,23 @@
 // handlers/commands/job.js
 // ---------------------------------------------------------------
 // Job commands — create, start/activate, set-active, pause/resume/finish,
-// list, active?, move-last-log [for <name>].
+// list, active?, move-last-log [for <name>] with Ask → Confirm → Execute.
 // All DB calls go through services/postgres.
 // ---------------------------------------------------------------
 const pg = require('../../services/postgres');
 const { formatInTimeZone } = require('date-fns-tz');
+const { sendQuickReply } = require('../../services/twilio');
 
 const TZ_DEFAULT = 'America/Toronto';
 const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
+
+function tzOf(userProfile, ownerProfile) {
+  return userProfile?.tz || ownerProfile?.tz || TZ_DEFAULT;
+}
+function sendXml(res, text) {
+  res.status(200).type('application/xml').send(RESP(text));
+  return true;
+}
 
 // ---------- parsing helpers ----------
 function parseStartActivateName(text) {
@@ -17,7 +26,7 @@ function parseStartActivateName(text) {
     /^start\s+job\s+(.+)$/i,
     /^activate\s+job\s+(.+)$/i,
     /^job\s+start\s+(.+)$/i,
-    /^(?:start|activate)\s+(.+)$/i, // "start Kitchen" (no 'job')
+    /^(?:start|activate)\s+(.+)$/i, // "start Kitchen"
   ];
   for (const re of patterns) {
     const m = s.match(re);
@@ -42,15 +51,6 @@ function parseMoveLast(textLC) {
   const jobName = (m[1] || '').trim();
   const forName = (m[2] || '').trim();
   return { jobName, forName: forName || null };
-}
-
-function tzOf(userProfile, ownerProfile) {
-  return userProfile?.tz || ownerProfile?.tz || TZ_DEFAULT;
-}
-
-function sendXml(res, text) {
-  res.status(200).type('application/xml').send(RESP(text));
-  return true;
 }
 
 // ---------- small DB helpers (via pg.query) ----------
@@ -156,35 +156,8 @@ async function resumeJob(ownerId, ident) {
   if (ident.jobNo) {
     return activateByJobNo(owner, ident.jobNo);
   } else {
-    // reuse your robust activation path
-    return pg.activateJobByName(owner, ident.name);
+    return pg.activateJobByName(owner, ident.name); // robust path you added
   }
-}
-
-async function moveLastEntryToJob(ownerId, employeeName, targetJobName) {
-  const owner = String(ownerId).replace(/\D/g, '');
-  const target = await pg.ensureJobByName(owner, targetJobName);
-  if (!target) throw new Error('target job not found');
-
-  // find last entry for employee
-  const { rows } = await pg.query(
-    `SELECT id
-       FROM public.time_entries
-      WHERE owner_id=$1 AND lower(employee_name)=lower($2)
-      ORDER BY timestamp DESC
-      LIMIT 1`,
-    [owner, String(employeeName || '').trim()]
-  );
-  const last = rows[0];
-  if (!last) return { updated: 0, job: target };
-
-  const upd = await pg.query(
-    `UPDATE public.time_entries
-        SET job_no = $1
-      WHERE id = $2`,
-    [target.job_no, last.id]
-  );
-  return { updated: upd.rowCount || 0, job: target };
 }
 
 // ---------- main handler ----------
@@ -193,9 +166,9 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, _isOwne
   const zone = tzOf(userProfile, ownerProfile);
   const now  = formatInTimeZone(new Date(), zone, 'yyyy-MM-dd HH:mm:ss');
   const actorId = from;
+  const actorName = userProfile?.name || from;
 
   try {
-    // trace breadcrumb
     console.info('[job] cmd', { ownerId, from, lc, at: now });
 
     // lightweight rate-limit (fail-open if internal error)
@@ -205,7 +178,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, _isOwne
     }
 
     // explicit help
-    if (/^(job\s+help|help\s+job)$/i.test(lc)) {
+    if (/^(job\s+help|help\s+job|jobs|job)$/i.test(lc)) {
       return sendXml(res,
         'Jobs:\n' +
         '• start job <name>\n' +
@@ -325,7 +298,7 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, _isOwne
     }
 
     // 5) ACTIVE JOB?
-    if (/^active\s+job\??$/i.test(lc)) {
+    if (/^(active\s+job\??|what'?s\s+my\s+active\s+job\??)$/i.test(lc)) {
       try {
         const j = await getActiveJobRow(ownerId);
         if (!j) return sendXml(res, 'No active job set.');
@@ -336,19 +309,29 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, _isOwne
       }
     }
 
-    // 6) MOVE LAST LOG TO <job> [for <name>]
+    // 6) MOVE LAST LOG TO <job> [for <name>] — Ask → Confirm → Execute via pendingAction
     {
       const mm = parseMoveLast(lc);
       if (mm && mm.jobName) {
+        const employee = mm.forName || (userProfile?.name || from);
+
+        // Save a pending action; middleware will apply on "Confirm"
+        await pg.savePendingAction({
+          ownerId: String(ownerId).replace(/\D/g,''),
+          userId: from,
+          kind: 'move_last_log',
+          payload: { target: employee, jobName: mm.jobName }
+        });
+
         try {
-          const employee = mm.forName || (userProfile?.name || from);
-          const resMove = await moveLastEntryToJob(ownerId, employee, mm.jobName);
-          if (!resMove.updated) throw new Error('no entry');
-          return sendXml(res, `Last log for **${employee}** moved to **${resMove.job.name}** (#${resMove.job.job_no}).`);
-        } catch (e) {
-          console.warn('[job] move-last failed:', e?.message);
-          return sendXml(res, `Couldn’t move last log to “${mm.jobName}”.`);
-        }
+          await sendQuickReply(
+            from,
+            `Move last time entry for **${employee}** to "${mm.jobName}"?\nReply: Confirm | Cancel`,
+            ['Confirm', 'Cancel']
+          );
+        } catch (_) {}
+
+        return sendXml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
       }
     }
 
@@ -357,7 +340,6 @@ async function handleJob(from, text, userProfile, ownerId, ownerProfile, _isOwne
     console.error('[job] error:', e?.message);
     return sendXml(res, 'Job error. Try again.');
   } finally {
-    // release per-request lock if present (serverless safety)
     try { res?.req?.releaseLock?.(); } catch {}
   }
 }

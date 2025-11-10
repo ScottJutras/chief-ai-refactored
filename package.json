@@ -10,7 +10,9 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "test": "jest tests",
-    "worker:kpi": "node services/kpiWorker.js"
+    "worker:kpi": "node services/kpiWorker.js",
+    "sql": "node scripts/runSql.js",
+    "ingest:rag": "node scripts/ingestRAG.js data/rag/contractor_terms.csv"
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.10",
@@ -23,6 +25,7 @@
     "chartjs-node-canvas": "^5.0.0",
     "chrono-node": "^2.7.8",
     "cors": "^2.8.5",
+    "csv-parse": "^6.1.0",
     "date-fns": "^2.29.3",
     "date-fns-tz": "^1.3.8",
     "dotenv": "^16.6.1",

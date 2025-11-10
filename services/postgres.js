@@ -1,70 +1,70 @@
-// services/postgres.js
+// services/postgres.js (ENV + Pool drop-in)
 // ------------------------------------------------------------
-// Central Postgres service – pool, retry, helpers, lazy heavy deps
-// North Star: resilient pool, short timeouts, idempotent-friendly
-// ------------------------------------------------------------
-
 const { Pool } = require('pg');
 const crypto = require('crypto');
+
+// Load date-fns-tz ONCE here; other places should reuse helpers below.
 const { formatInTimeZone } = require('date-fns-tz');
 
-// ---------- Lazy heavy dependencies (loaded only when needed) ----------
-let ExcelJS = null;      // used in exportTimesheetXlsx
-let PDFDocument = null;  // used in exportTimesheetPdf
+/* ---------- Environment (robust) ---------- */
+const env = process.env;
 
-// ---------- Environment ----------
-const {
-  DATABASE_URL,
-  PGHOST,
-  PGPORT,
-  PGDATABASE,
-  PGUSER,
-  PGPASSWORD,
-  PGSSLMODE,     // e.g., 'require' for Supabase
-  NODE_ENV
-} = process.env;
+// Prefer DATABASE_URL; allow common alternates for hosts that rename it
+const DB_URL =
+  (env.DATABASE_URL && String(env.DATABASE_URL).trim()) ||
+  (env.POSTGRES_URL && String(env.POSTGRES_URL).trim()) ||
+  (env.SUPABASE_DB_URL && String(env.SUPABASE_DB_URL).trim()) ||
+  '';
 
+const NODE_ENV = env.NODE_ENV || 'development';
 const isProd = NODE_ENV === 'production';
-const useUrl = !!DATABASE_URL;
 
 // Hosted DBs usually need SSL. Local 127.0.0.1 usually does not.
+const PGSSLMODE = (env.PGSSLMODE || '').toLowerCase();
 const shouldSSL =
   PGSSLMODE === 'require' ||
-  (useUrl && /supabase\.co|render\.com|herokuapp\.com|aws|gcp|azure/i.test(DATABASE_URL || ''));
+  /supabase\.co|render\.com|herokuapp\.com|aws|gcp|azure/i.test(DB_URL);
 
 const ssl = shouldSSL ? { rejectUnauthorized: false } : false;
 
-// Base pool config from either URL or discrete vars
-const basePoolConfig = useUrl
-  ? { connectionString: DATABASE_URL, ssl }
-  : {
-      host: PGHOST || '127.0.0.1',
-      port: Number(PGPORT || 5432),
-      database: PGDATABASE || 'postgres',
-      user: PGUSER || 'postgres',
-      password: PGPASSWORD || '',
-      ssl
-    };
+// Build pool config
+let poolConfig;
+if (DB_URL) {
+  // connectionString path (best for hosted DBs)
+  poolConfig = { connectionString: DB_URL, ssl };
+} else {
+  // Fallback to discrete vars (local dev)
+  const host = env.PGHOST || '127.0.0.1';
+  const port = Number(env.PGPORT || 5432);
+  const database = env.PGDATABASE || 'postgres';
+  const user = env.PGUSER || 'postgres';
+  const password = env.PGPASSWORD || '';
+  poolConfig = { host, port, database, user, password, ssl };
+}
 
-// ---------- Pool (sane limits + timeouts) ----------
+// Fail fast with a clear message if NOTHING was configured
+if (!DB_URL && (!poolConfig.host || !poolConfig.database)) {
+  throw new Error(
+    "Postgres not configured. Set DATABASE_URL in config/.env or PGHOST/PGDATABASE/etc."
+  );
+}
+
+/* ---------- Pool (sane limits + timeouts) ---------- */
 const pool = new Pool({
-  ...basePoolConfig,
-  // Pool sizing: conservative for serverless; override with PG* env if needed
+  ...poolConfig,
   max: 20,
   min: 0,
-  idleTimeoutMillis: 60_000,       // free idle clients quickly
-  connectionTimeoutMillis: 20_000, // fail fast on bad networks
+  idleTimeoutMillis: 60_000,
+  connectionTimeoutMillis: 20_000,
   keepAlive: true,
-  application_name: 'chief-ai'     // shows up in pg_stat_activity
+  application_name: 'chief-ai'
 });
 
 pool.on('connect', async (client) => {
   try {
-    // Keep timestamps in UTC at the DB layer; render local times in app
     await client.query(`SET TIME ZONE 'UTC'`);
     await client.query(`SET intervalstyle = 'iso_8601'`);
   } catch (e) {
-    // Non-fatal
     console.warn('[PG] connect session prep failed:', e?.message);
   }
 });
@@ -72,7 +72,6 @@ pool.on('connect', async (client) => {
 pool.on('error', (err) => {
   console.error('[PG] idle client error:', err?.message);
 });
-
 // ---------- Core query helpers ----------
 async function query(text, params) {
   return queryWithRetry(text, params);
@@ -82,38 +81,18 @@ async function queryWithRetry(text, params, attempt = 1) {
   try {
     return await pool.query(text, params);
   } catch (e) {
-    // Retry a couple times on transient network issues
-    const msg = e?.message || '';
-    const transient = /ECONNRESET|EPIPE|timeout|terminat(ed|ing)|Connection terminated|read ECONNRESET/i.test(msg);
+    const msg = String(e?.message || '');
+    const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET|connection terminated|TimeoutError/i.test(msg);
     if (transient && attempt < 3) {
-      const backoffMs = attempt * 200;
-      console.warn(`[PG] retry ${attempt + 1} in ${backoffMs}ms: ${msg}`);
-      await new Promise((r) => setTimeout(r, backoffMs));
+      console.warn(`[PG] retry ${attempt + 1}: ${msg}`);
+      await new Promise(r => setTimeout(r, attempt * 200));
       return queryWithRetry(text, params, attempt + 1);
     }
     throw e;
   }
 }
 
-/**
- * queryWithTimeout
- * Runs a single statement within a per-transaction statement_timeout.
- * Uses SET LOCAL so the timeout only applies to this txn.
- */
-async function queryWithTimeout(sql, params, ms = 9_000) {
-  return withClient(async (client) => {
-    const timeoutMs = Math.max(0, Number(ms) | 0);
-    // SET LOCAL cannot be parameterized
-    await client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
-    return client.query(sql, params);
-  }, { useTransaction: true });
-}
-
-/**
- * withClient
- * Borrow a client with optional transaction wrapper.
- * Ensures COMMIT/ROLLBACK and release no matter what.
- */
+// Use a client + per-query statement timeout; optional local transaction
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await pool.connect();
   try {
@@ -122,25 +101,44 @@ async function withClient(fn, { useTransaction = true } = {}) {
     if (useTransaction) await client.query('COMMIT');
     return res;
   } catch (err) {
-    if (useTransaction) {
-      try { await client.query('ROLLBACK'); } catch (_) {}
-    }
+    if (useTransaction) await client.query('ROLLBACK').catch(() => {});
     throw err;
   } finally {
     client.release();
   }
 }
 
-// ---------- Small utility helpers used across services ----------
-function DIGITS(v) {
-  return String(v || '').replace(/\D/g, '');
+async function queryWithTimeout(sql, params, ms = 9000) {
+  return withClient(async client => {
+    // NOTE: SET LOCAL cannot be parameterized
+    const timeoutMs = Math.max(0, Number(ms) | 0);
+    await client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
+    return client.query(sql, params);
+  }, { useTransaction: true });
 }
 
-// Example: commonly used today-in-tz helper for rollups/touches
-function todayInTZ(tz = 'America/Toronto') {
-  const d = new Date();
-  return formatInTimeZone(d, tz, 'yyyy-MM-dd');
+/* ---------- Utilities (single source of truth) ---------- */
+const DIGITS = (x) => String(x ?? '').replace(/\D/g, '');
+
+// Canonical cents converter; keep ONE definition
+function toCents(v) {
+  if (v == null || v === '') return 0;
+  const n = typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.-]/g, ''));
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 100);
 }
+const toAmount = toCents; // back-compat alias
+
+const isValidIso = (ts) => !!ts && !Number.isNaN(new Date(ts).getTime());
+
+// YYYY-MM-DD in target TZ (used for day keys)
+function todayInTZ(tz = 'America/Toronto') {
+  return formatInTimeZone(new Date(), tz, 'yyyy-MM-dd');
+}
+
+// Optional: export this name if other files import it
+const normalizePhoneNumber = (x) => DIGITS(x);
+
 
 
 // Find or create a job by name (case-insensitive on name or job_name).
@@ -218,6 +216,7 @@ async function getLatestTimeEvent(ownerId, employeeName) {
   return rows[0] || null;
 }
 module.exports.getLatestTimeEvent = getLatestTimeEvent;
+
 // ---- JOB HELPERS (additive) ---------------------------------------
 
 async function getOrCreateJob(ownerId, name) {
@@ -529,11 +528,6 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
     throw e;
   }
 }
-
-// ---------- Simple utilities ----------
-const DIGITS = x => String(x || '').replace(/\D/g, '');
-const toAmount = x => parseFloat(String(x ?? '0').replace(/[$,]/g, '')) || 0;
-const isValidIso = ts => !!ts && !Number.isNaN(new Date(ts).getTime());
 
 // Find or create a job by name (case-insensitive on name or job_name).
 // Robust against races and job_no duplicates: we allocate job_no under an advisory lock.
@@ -877,7 +871,8 @@ module.exports = {
   DIGITS,
   todayInTZ,
   normalizePhoneNumber: (x) => DIGITS(x),
-  toAmount,
+  toCents,   // exported explicitly if you want to use it by name
+  toAmount,  // back-compat alias (returns cents)
   isValidIso,
 
   // ---------- Pending actions (serverless-safe confirmations) ----------
@@ -896,7 +891,7 @@ module.exports = {
   // ---------- Tasks ----------
   createTask,
   getTaskByNo,
-  createTaskWithJob,      // (kept for back-compat if you use it)
+  createTaskWithJob, // kept for back-compat
 
   // ---------- Jobs / context ----------
   ensureJobByName,
@@ -912,7 +907,7 @@ module.exports = {
   logTimeEntry,
   logTimeEntryWithJob,
   getLatestTimeEvent,
-  checkTimeEntryLimit: __checkLimit, // alias; keep external API stable
+  checkTimeEntryLimit: __checkLimit, // alias; keep API stable
   checkActorLimit: __checkLimit,
 
   // ---------- Exports ----------
@@ -920,4 +915,6 @@ module.exports = {
   exportTimesheetPdf,
   getFileExport,
 };
+
+
 

@@ -33,5 +33,33 @@ async function markReminderSent(id) {
     [id]
   );
 }
+async function createLunchReminder({ ownerId, userId, shiftId, remindAt }) {
+  const { rows } = await query(
+    `INSERT INTO public.reminders
+       (owner_id, user_id, shift_id, remind_at, kind)
+     VALUES ($1,$2,$3,$4,'lunch_reminder')
+     RETURNING id`,
+    [ownerId, userId, shiftId, remindAt]
+  );
+  return rows[0].id;
+}
 
-module.exports = { createReminder, getDueReminders, markReminderSent };
+async function getDueLunchReminders({ now = new Date() } = {}) {
+  const { rows } = await query(
+    `SELECT id, owner_id, user_id, shift_id, remind_at
+       FROM public.reminders
+      WHERE sent = false
+        AND canceled = false
+        AND kind = 'lunch_reminder'
+        AND remind_at <= $1
+      ORDER BY remind_at ASC
+      LIMIT 500`,
+    [now.toISOString()]
+  );
+  return rows;
+}
+
+module.exports = {
+  createReminder, getDueReminders, markReminderSent,
+  createLunchReminder, getDueLunchReminders
+};

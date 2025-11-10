@@ -12,6 +12,10 @@ const pg = require('../../services/postgres');
 const chrono = require('chrono-node');
 const { formatInTimeZone, zonedTimeToUtc } = require('date-fns-tz');
 const { sendBackfillConfirm, sendQuickReply } = require('../../services/twilio');
+const { ClockCIL } = require('../../schemas/cil.clock');
+const { computeShiftCalc } = require('../../services/timecalc');
+const db = new Pool({ connectionString: process.env.DATABASE_URL });
+
 
 // What counts as "in" vs "out" when checking latest event
 const IN_TYPES  = new Set(['in','clock_in','punch_in']);
@@ -51,6 +55,58 @@ function humanLine(type, target, ts, tz) {
 }
 
 const RESP = (text) => `<Response><Message>${text}</Message></Response>`;
+
+async function getOpenShift(owner_id, user_id) {
+const { rows } = await db.query(
+`SELECT * FROM time_entries WHERE owner_id=$1 AND user_id=$2 AND kind='shift' AND end_at_utc IS NULL ORDER BY start_at_utc DESC LIMIT 1`,
+[owner_id, user_id]
+);
+return rows[0] || null;
+}
+
+
+async function ensureNoOverlapChild(owner_id, parent_id, kind) {
+await db.query(
+`UPDATE time_entries SET end_at_utc = now() WHERE owner_id=$1 AND parent_id=$2 AND kind=$3 AND end_at_utc IS NULL`,
+[owner_id, parent_id, kind]
+);
+}
+
+
+async function insertEntry(row) {
+const cols = ['owner_id','user_id','job_id','parent_id','kind','start_at_utc','end_at_utc','meta','created_by'];
+const vals = cols.map((c,i)=>`$${i+1}`);
+const params = [row.owner_id,row.user_id,row.job_id,row.parent_id,row.kind,row.start_at_utc,row.end_at_utc,row.meta||{},row.created_by];
+const { rows } = await db.query(`INSERT INTO time_entries (${cols.join(',')}) VALUES (${vals.join(',')}) RETURNING *`, params);
+return rows[0];
+}
+
+
+async function closeEntryById(owner_id, id) {
+const { rows } = await db.query(`UPDATE time_entries SET end_at_utc = now(), updated_at = now() WHERE owner_id=$1 AND id=$2 AND end_at_utc IS NULL RETURNING *`, [owner_id, id]);
+return rows[0] || null;
+}
+
+
+async function fetchPolicy(owner_id){
+const { rows } = await db.query(`SELECT * FROM employer_policies WHERE owner_id=$1`, [owner_id]);
+return rows[0] || { paid_break_minutes:30, lunch_paid:true, paid_lunch_minutes:30, drive_is_paid:true };
+}
+
+
+async function entriesForShift(owner_id, shift_id){
+const { rows } = await db.query(`
+SELECT kind, EXTRACT(EPOCH FROM (end_at_utc - start_at_utc))/60 AS minutes
+FROM time_entries
+WHERE owner_id=$1 AND (id=$2 OR parent_id=$2) AND end_at_utc IS NOT NULL
+`,[owner_id, shift_id]);
+return rows;
+}
+
+
+async function touchKPI(owner_id, job_id, day){
+await db.query(`INSERT INTO kpi_touches (owner_id, job_id, day) VALUES ($1,$2,$3)`, [owner_id, job_id, day]);
+}
 
 // ---- parsers -------------------------------------------------------------------
 
@@ -160,7 +216,69 @@ async function getCurrentState(ownerId, employeeName) {
   }
   return { hasOpenShift, openBreak, openDrive, lastShiftStart };
 }
+// Public handler (message -> CIL already parsed outside)
+async function handleClock(ctx, cil) {
+const parsed = ClockCIL.parse(cil); // throws on invalid
+const nowIso = new Date().toISOString();
+const at = parsed.at || nowIso;
+const { owner_id, user_id, job_id, created_by } = ctx; // assume resolvers filled these
 
+
+if (parsed.action === 'in') {
+const open = await getOpenShift(owner_id, user_id);
+if (open) return { text: `You’re already clocked in since ${open.start_at_utc}.` };
+const shift = await insertEntry({ owner_id, user_id, job_id, parent_id:null, kind:'shift', start_at_utc:at, created_by, meta:{} });
+return { text: `✅ Clocked in for ${ctx.job_name} at ${new Date(at).toLocaleTimeString()}.` };
+}
+
+
+if (parsed.action === 'out') {
+const shift = await getOpenShift(owner_id, user_id);
+if (!shift) return { text: `You’re not clocked in.` };
+// autoclose nested
+await db.query(`UPDATE time_entries SET end_at_utc=$3 WHERE owner_id=$1 AND parent_id=$2 AND end_at_utc IS NULL`, [owner_id, shift.id, at]);
+const closed = await closeEntryById(owner_id, shift.id);
+
+
+// compute calc and stamp
+const policy = await fetchPolicy(owner_id);
+const entries = await entriesForShift(owner_id, shift.id);
+const calc = computeShiftCalc(entries, policy);
+await db.query(`UPDATE time_entries SET meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{calc}', $3::jsonb) WHERE id=$1 AND owner_id=$2`, [shift.id, owner_id, JSON.stringify(calc)]);
+
+
+// kpi touch
+const day = new Date(shift.start_at_utc).toISOString().slice(0,10);
+await touchKPI(owner_id, shift.job_id, day);
+
+
+const msg = calc.unpaidLunch > 0 || calc.unpaidBreak > 0
+? `⏱️ Paid ${Math.floor(calc.paidMinutes/60)}h ${calc.paidMinutes%60}m (policy deducted lunch ${calc.unpaidLunch}m, breaks ${calc.unpaidBreak}m).`
+: `⏱️ Paid ${Math.floor(calc.paidMinutes/60)}h ${calc.paidMinutes%60}m.`;
+return { text: `✅ Clocked out. ${msg}` };
+}
+
+
+// nested events
+const shift = await getOpenShift(owner_id, user_id);
+if (!shift) return { text: `You need an open shift. Try: clock in.` };
+
+
+if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed.action === 'drive_start') {
+const kind = parsed.action.split('_')[0];
+await ensureNoOverlapChild(owner_id, shift.id, kind);
+await insertEntry({ owner_id, user_id, job_id: shift.job_id, parent_id: shift.id, kind, start_at_utc: at, created_by });
+
+
+// lunch reminder scheduling hint (actual scheduling done in webhook or worker layer)
+if (kind === 'lunch') {
+const policy = await fetchPolicy(owner_id);
+const dueAt = new Date(new Date(at).getTime() + (policy.paid_lunch_minutes||0)*60000).toISOString();
+ctx.enqueueReminder && ctx.enqueueReminder({ type:'lunch_reminder', owner_id, user_id, shift_id: shift.id, due_at: dueAt });
+}
+return { text: `▶️ ${kind} started.` };
+}
+}
 // ---- handler -------------------------------------------------------------------
 async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lc = String(text || '').toLowerCase().trim();
@@ -415,4 +533,4 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`);
   }
 }
 
-module.exports = { handleTimeclock };
+module.exports = { handleTimeclock, handleClock };

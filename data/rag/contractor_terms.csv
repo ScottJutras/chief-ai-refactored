@@ -1,0 +1,18 @@
+Term,Meaning (contractor),CFO Equivalent,Suggested Insight Nudge
+Draw Schedule,"Milestone-based payments as work progresses",Cash flow timing / AR turnover,"Match payroll/material outflows to upcoming draws; flag gaps 2 weeks ahead"
+Holdback / Retainage,"% of invoice withheld until completion or warranty",Working capital drag,"Unreleased holdbacks are tying up cash; plan payroll coverage before next draw"
+Progress Billing,"Invoice for work-to-date",Recurring revenue cadence,"Compare progress % to actual costs to catch slippage early"
+Change Order,"Approved scope change with pricing delta",Revenue expansion / margin rescue,"Track CO approval-to-bill cycle; unpaid COs = AR risk"
+Scope Creep,"Untracked additions to scope",Margin erosion,"Log micro-changes or create a CO to protect margin"
+Overhead Recovery,"Allocate company overhead into job price",Fixed cost allocation,"Price for profit: ensure overhead recovery % is on every quote"
+Labour Burden,"True hourly cost incl. taxes/benefits/vehicles",Fully-loaded labour cost,"Your hourly burden is $X; markup labour accordingly"
+Slippage,"Profit fades from estimate to actual",Gross margin variance,"Job slipping by $X; adjust crew plan or issue CO"
+Back Charge,"Deduct for errors/rework",Negative revenue adjustment,"Track back charges separately; learn + update SOP"
+Retention Release,"When holdback is paid after sign-off",Deferred inflow,"Forecast release dates to cover slow weeks"
+Mobilization,"Upfront start costs (labour/equipment)",Upfront cash outlay,"Front-load draw #1 to cover mobilization"
+Demobilization,"Wrap-up/site clear costs",Close-out cash drain,"Budget demob time; avoid end-of-job margin leaks"
+Bid Spread,"Gap vs competitors’ bids",Pricing precision,"If you’re 20% low vs market, review estimate assumptions"
+Dead Time,"Paid time with no productive work",Labour efficiency loss,"Flag dead time; reschedule or move crew to profit tasks"
+Cash Front-Loading,"Early draws cover early costs",Working capital tactic,"Push for bigger first draw to offset materials"
+Punch List Profit,"Small fixes at end that eat margin",Micro-leakage,"Track punch hours; bill legitimate extras"
+

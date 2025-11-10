@@ -1,0 +1,11 @@
+{
+  "tiles": [
+    { "key": "gross_profit", "label": "Gross Profit", "tooltip": "Revenue minus job costs (materials, subs, labour)."},
+    { "key": "gross_margin_pct", "label": "Gross Margin %", "tooltip": "Gross Profit as a percentage of revenue."},
+    { "key": "holdbacks", "label": "Unreleased Holdbacks", "tooltip": "Retainage not yet released — ties up cash."},
+    { "key": "change_orders", "label": "Change Orders (Approved)", "tooltip": "Approved scope changes impacting revenue."},
+    { "key": "ar_open", "label": "Open A/R", "tooltip": "Invoices sent but not paid yet."},
+    { "key": "ap_open", "label": "Open A/P", "tooltip": "Bills entered but not paid yet."},
+    { "key": "slippage", "label": "Profit vs Estimate", "tooltip": "How actual profit compares to the estimate (slippage)."}
+  ]
+}

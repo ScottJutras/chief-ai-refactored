@@ -1,133 +1,300 @@
 // handlers/commands/index.js
-// ---------------------------------------------------------------
-// Central command orchestrator – keeps the router fast & safe.
-// Falls back to per-file handlers; handles onboarding, pending
-// confirmations, subscription gates, lock release, and audit.
-// ---------------------------------------------------------------
-const pg = require('../../services/postgres');
 const { releaseLock } = require('../../middleware/lock');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
+const { getPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
 const { sendTemplateMessage } = require('../../services/twilio');
+const { applyCIL } = require('../../services/cilRouter');
 const confirmationTemplates = require('../../config').confirmationTemplates;
 
 // Lazy-load per-file handlers
 let tasksHandler, handleTimeclock, handleJob;
 try { ({ tasksHandler } = require('./tasks')); } catch {}
 try { ({ handleTimeclock } = require('./timeclock')); } catch {}
-try { handleJob = require('./job'); } catch {}
+try { ({ handleJob } = require('./job')); } catch {}
 
-/** Helper – safe lock release */
-async function safeCleanup(req) {
-  const lockKey = `lock:${req.ownerId || req.from || 'GLOBAL'}`;
-  try { await releaseLock(lockKey); } catch {}
-}
-
-/** Helper – friendly TwiML */
 function twiml(res, body) {
-  return res.status(200).type('application/xml')
+  return res
+    .status(200)
+    .type('application/xml')
     .send(`<Response><Message>${body}</Message></Response>`);
 }
 
-/** Main orchestrator – returns true when it fully responded */
+async function safeCleanup(req) {
+  try {
+    await releaseLock(`lock:${req.ownerId || req.from || 'GLOBAL'}`);
+  } catch {}
+}
+
+// Tiny bootstrap mapper → CIL
+function simpleTextToCIL(raw) {
+  const lc = String(raw || '').toLowerCase().trim();
+
+  // new lead (very simple)
+  if (lc === 'new lead' || /^lead(?:\s|$)/.test(lc)) {
+    return { type: 'CreateLead', customer: { name: 'Unknown' } };
+  }
+
+  // expense: "expense $100 nails from Home Depot"
+  {
+    const m = raw.match(/^expense\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
+    if (m) {
+      return {
+        type: 'LogExpense',
+        item: m[2].trim(),
+        amount_cents: Math.round(parseFloat(m[1]) * 100),
+        store: (m[3] || '').trim() || undefined,
+      };
+    }
+  }
+
+  // revenue: "revenue $500 deposit from Lauren"
+  {
+    const m = raw.match(/^revenue\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
+    if (m) {
+      return {
+        type: 'LogRevenue',
+        description: m[2].trim(),
+        source: (m[3] || '').trim() || undefined,
+        amount_cents: Math.round(parseFloat(m[1]) * 100),
+      };
+    }
+  }
+
+  // pricing
+  {
+    let m = raw.match(/^add material\s+(.+)\s+at\s+\$(\d+(?:\.\d{1,2})?)$/i);
+    if (m) {
+      return {
+        type: 'AddPricingItem',
+        item_name: m[1].trim(),
+        unit: 'each',
+        unit_cost_cents: Math.round(parseFloat(m[2]) * 100),
+      };
+    }
+    m = raw.match(/^update material\s+(.+)\s+to\s+\$(\d+(?:\.\d{1,2})?)$/i);
+    if (m) {
+      return {
+        type: 'UpdatePricingItem',
+        item_name: m[1].trim(),
+        unit_cost_cents: Math.round(parseFloat(m[2]) * 100),
+      };
+    }
+    m = raw.match(/^delete material\s+(.+)$/i);
+    if (m) {
+      return {
+        type: 'DeletePricingItem',
+        item_name: m[1].trim(),
+      };
+    }
+  }
+
+  return null;
+}
+
+function toCents(amt) {
+  if (amt == null) return 0;
+  const n = parseFloat(String(amt).replace(/[^\d.]/g, ''));
+  if (!isFinite(n) || n < 0) return 0;
+  return Math.round(n * 100);
+}
+
 module.exports = async function handleCommands(
-  from, text, userProfile, ownerId, ownerProfile, isOwner, res
+  from,
+  text,
+  userProfile,
+  ownerId,
+  ownerProfile,
+  isOwner,
+  res
 ) {
   const lc = String(text || '').toLowerCase().trim();
 
   try {
-    // -------------------------------------------------
-    // 1. ONBOARDING INTERCEPT
-    // -------------------------------------------------
+    // 1) Onboarding intercept
     if (userProfile?.onboarding_in_progress) {
       const onboarding = require('./onboarding');
-      const handled = await onboarding.handle(from, text, userProfile, ownerId, res);
+      const handled = await onboarding(from, text, userProfile, ownerId, res);
       if (handled) {
         await safeCleanup({ ownerId: from });
         return true;
       }
     }
 
-    // -------------------------------------------------
-    // 2. PENDING CONFIRMATIONS (expense / revenue / bill)
-    // -------------------------------------------------
+    // 2) Pending confirmations (now write into transactions via CIL)
     const pending = await getPendingTransactionState(from);
     if (pending?.pendingExpense || pending?.pendingRevenue || pending?.pendingBill) {
-      const type = pending.pendingExpense ? 'expense' :
-                   pending.pendingRevenue ? 'revenue' : 'bill';
-      const data = pending[`pending${type.charAt(0).toUpperCase() + type.slice(1)}`];
+      const type = pending.pendingExpense
+        ? 'expense'
+        : pending.pendingRevenue
+        ? 'revenue'
+        : 'bill';
 
-      if (lc === 'yes') {
-        const activeJob = await pg.getActiveJob(ownerId) || 'Uncategorized';
-        const category = data.suggestedCategory || await pg.categorizeEntry?.(type, data) || 'Uncategorized';
-        await pg.appendToUserSpreadsheet(ownerId, [
-          data.date, data.item || data.description || data.billName,
-          data.amount, data.store || data.source || '',
-          activeJob, type, category, data.mediaUrl || '', userProfile.name || 'Unknown'
-        ]);
-        await deletePendingTransactionState(from);
-        await twiml(res, `Expense logged: ${data.amount} for ${data.item || data.description} from ${data.store || data.source} (Category: ${category})`);
+      const yes = lc === 'yes' || lc === 'y';
+      const no = lc === 'no' || lc === 'n' || lc === 'cancel';
+      const edit = lc === 'edit';
+
+      if (yes) {
+        const ctx = {
+          owner_id: ownerId,
+          actor_phone: from,
+          source_msg_id:
+            res?.locals?.MessageSid ||
+            res?.locals?.SmsMessageSid ||
+            `${from}:${Date.now()}`,
+        };
+
+        let cil = null;
+
+        if (type === 'expense' && pending.pendingExpense) {
+          const d = pending.pendingExpense;
+          cil = {
+            type: 'LogExpense',
+            item: d.item || d.description || d.billName || 'Expense',
+            amount_cents: toCents(d.amount),
+            store: d.store || d.vendor || undefined,
+            date: d.date || undefined,
+            category: d.category || undefined,
+            media_url: d.mediaUrl || undefined,
+          };
+        } else if (type === 'revenue' && pending.pendingRevenue) {
+          const d = pending.pendingRevenue;
+          cil = {
+            type: 'LogRevenue',
+            description: d.description || 'Revenue',
+            amount_cents: toCents(d.amount),
+            source: d.source || undefined,
+            date: d.date || undefined,
+            category: d.category || undefined,
+            media_url: d.mediaUrl || undefined,
+          };
+        } else if (type === 'bill' && pending.pendingBill) {
+          const d = pending.pendingBill;
+          cil = {
+            type: 'LogExpense',
+            item: d.billName || d.item || d.description || 'Bill',
+            amount_cents: toCents(d.amount),
+            store: d.vendor || d.store || undefined,
+            date: d.date || undefined,
+            category: d.category || 'Bill',
+            media_url: d.mediaUrl || undefined,
+          };
+        }
+
+        if (!cil) {
+          await deletePendingTransactionState(from);
+          await twiml(res, `I lost the details. Please resend the ${type}.`);
+          await safeCleanup({ ownerId: from });
+          return true;
+        }
+
+        try {
+          const result = await applyCIL(cil, ctx);
+          await deletePendingTransactionState(from);
+          await twiml(res, result?.summary || `${type} logged.`);
+        } catch (e) {
+          console.error('[commands] applyCIL failed for pending:', e?.message);
+          await deletePendingTransactionState(from);
+          await twiml(res, `⚠️ I couldn't log that ${type}. Please try again.`);
+        }
+
         await safeCleanup({ ownerId: from });
         return true;
       }
-      if (lc === 'no' || lc === 'cancel') {
+
+      if (no) {
         await deletePendingTransactionState(from);
-        await twiml(res, `${type.charAt(0).toUpperCase() + type.slice(1)} cancelled.`);
+        await twiml(
+          res,
+          `${type.charAt(0).toUpperCase() + type.slice(1)} cancelled.`
+        );
         await safeCleanup({ ownerId: from });
         return true;
       }
-      if (lc === 'edit') {
+
+      if (edit) {
         await deletePendingTransactionState(from);
-        await twiml(res, `Please resend the ${type} details.`);
+        await twiml(
+          res,
+          `${type.charAt(0).toUpperCase() + type.slice(1)} — please resend details.`
+        );
         await safeCleanup({ ownerId: from });
         return true;
       }
-      await twiml(res, `Reply **yes**, **no**, or **edit** to confirm the ${type}.`);
+
+      await twiml(
+        res,
+        `Reply yes / no / edit to confirm the ${type}.`
+      );
       await safeCleanup({ ownerId: from });
       return true;
     }
 
-    // -------------------------------------------------
-    // 3. SUBSCRIPTION GATING (Agent / heavy media)
-    // -------------------------------------------------
+    // 3) Subscription gating (unchanged)
     const tier = (userProfile?.subscription_tier || 'basic').toLowerCase();
     const needsPro = /agent|deepdive|quote|metrics|receipt|team|pricing/i.test(lc);
     if (needsPro && !['pro', 'enterprise'].includes(tier)) {
-      const sent = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, {
-        "1": `This feature requires Pro or Enterprise.`
-      });
+      const sent = await sendTemplateMessage(
+        from,
+        confirmationTemplates.upgradeNow,
+        { '1': `This feature requires Pro or Enterprise.` }
+      );
       await safeCleanup({ ownerId: from });
-      return sent ? res.send('<Response></Response>') : twiml(res, `Upgrade to Pro to use this feature.`);
+      return sent
+        ? res.send('<Response></Response>')
+        : twiml(res, `Upgrade to Pro to use this feature.`);
     }
 
-    // -------------------------------------------------
-    // 4. FALLBACK TO PER-FILE HANDLERS
-    // -------------------------------------------------
-    if (tasksHandler && await tasksHandler(from, text, userProfile, ownerId, ownerProfile, isOwner, res)) {
-      await safeCleanup({ ownerId: from });
-      return true;
-    }
-    if (handleTimeclock && await handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res)) {
-      await safeCleanup({ ownerId: from });
-      return true;
-    }
-    if (handleJob && await handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner, res)) {
+    // 4) CIL first-pass
+    const cil = simpleTextToCIL(text);
+    if (cil) {
+      const ctx = {
+        owner_id: ownerId,
+        source_msg_id:
+          res?.locals?.MessageSid ||
+          res?.locals?.SmsMessageSid ||
+          `${from}:${Date.now()}`,
+        actor_phone: from,
+      };
+      const result = await applyCIL(cil, ctx);
+      await twiml(res, result.summary);
       await safeCleanup({ ownerId: from });
       return true;
     }
 
-    // -------------------------------------------------
-    // 5. FINAL HELP / AGENT FALLBACK
-    // -------------------------------------------------
+    // 5) Fallback to per-file handlers
+    if (
+      tasksHandler &&
+      (await tasksHandler(from, text, userProfile, ownerId, ownerProfile, isOwner, res))
+    ) {
+      await safeCleanup({ ownerId: from });
+      return true;
+    }
+    if (
+      handleTimeclock &&
+      (await handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res))
+    ) {
+      await safeCleanup({ ownerId: from });
+      return true;
+    }
+    if (
+      handleJob &&
+      (await handleJob(from, text, userProfile, ownerId, ownerProfile, isOwner, res))
+    ) {
+      await safeCleanup({ ownerId: from });
+      return true;
+    }
+
+    // 6) Agent fallback
     const { ask } = require('../../services/agent');
-    const answer = await ask({ from, ownerId, text, topicHints: ['tasks', 'timeclock', 'jobs'] });
-    if (answer) {
-      await twiml(res, answer);
-      await safeCleanup({ ownerId: from });
-      return true;
-    }
-
-    // Nothing matched
-    await twiml(res, `PocketCFO – try "task …", "clock in", or "start job <name>".`);
+    const answer = await ask({
+      from,
+      ownerId,
+      text,
+      topicHints: ['tasks', 'timeclock', 'jobs'],
+    });
+    await twiml(
+      res,
+      answer || `Try "new lead", "expense $100 tools", or "clock in".`
+    );
     await safeCleanup({ ownerId: from });
     return true;
   } catch (err) {

@@ -45,6 +45,7 @@
     "pdfkit": "^0.16.0",
     "pg": "^8.16.3",
     "pgvector": "^0.2.1",
+    "recharts": "^3.4.1",
     "serve-favicon": "^2.5.1",
     "serverless-http": "^3.2.0",
     "stripe": "^18.4.0",

@@ -10,6 +10,11 @@ const { findClosestTerm } = require('../services/ragTerms');
 const { flags } = require('../config/flags');
 const { handleClock } = require('../handlers/commands/timeclock');
 const { handleForecast } = require('../handlers/commands/forecast');
+const { applyCIL } = require('../services/cilRouter');
+const { getOwnerUuidForPhone } = require('../services/owners'); // implement: map phone -> uuid
+const { getPendingTransactionState } = require('../utils/stateManager');
+const { handleMedia } = require('../handlers/media');
+
 // ---------- Small helpers ----------
 function xmlEsc(s = '') {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -126,67 +131,123 @@ try {
   console.warn('[WEBHOOK] pendingActionMiddleware unavailable:', e?.message);
 }
 
-// ---------- Media ingestion (audio → transcript; image → receipt parse) ----------
+// ---------- Media ingestion (audio/image → handleMedia) ----------
 router.post('*', async (req, res, next) => {
   const { n, url, type } = pickFirstMedia(req.body || {});
   if (n <= 0) return next();
 
   try {
-    const media = require('../handlers/media');
-    const contentType = (type || '').split(';')[0];
+    const { handleMedia } = require('../handlers/media');
+    const bodyText = String(req.body?.Body || '').trim();
 
-    if (contentType.startsWith('audio/')) {
-      const transcribe =
-        media.transcribe || media.transcriber || media.transcribeAudio || media.handleMedia;
-      if (typeof transcribe === 'function') {
-        const transcript = await transcribe(url, { from: req.from, ownerId: req.ownerId });
-        if (transcript?.trim()) {
-          req.body.Body = transcript.trim();
-          return next(); // continue into text routing
-        }
-      }
-      return ok(res, `I couldn't understand that audio. Try texting.`);
+    const result = await handleMedia(
+      req.from,             // normalized phone
+      bodyText,             // any caption text
+      req.userProfile || {},// profile from middleware
+      req.ownerId,          // owner id (UUID after mapping)
+      url,
+      type
+    );
+
+    // Case 1: TwiML string
+    if (typeof result === 'string' && result && !res.headersSent) {
+      return res
+        .status(200)
+        .type('application/xml; charset=utf-8')
+        .send(result);
     }
 
-    if (contentType.startsWith('image/')) {
-      let parsed = null;
-      if (typeof media.parseReceipt === 'function') {
-        parsed = await media.parseReceipt(url, { from: req.from, ownerId: req.ownerId });
-      } else {
-        try {
-          const deep = require('../services/deepDive');
-          if (typeof deep.parseUpload === 'function') {
-            parsed = await deep.parseUpload(url, { from: req.from, ownerId: req.ownerId });
-          }
-        } catch {}
-      }
-      if (parsed && typeof parsed === 'object') {
-        const lines = [
-          'Receipt captured:',
-          parsed.date ? `• ${parsed.date}` : null,
-          parsed.store ? `• ${parsed.store}` : null,
-          parsed.item ? `• ${parsed.item}` : null,
-          parsed.amount ? `• ${parsed.amount}` : null,
-        ].filter(Boolean).join('\n');
-        return ok(res, lines || 'Receipt captured.');
-      }
-      return ok(res, 'Got your image — thanks!');
+    // Case 2: object with transcript → push into text pipeline
+    if (result && typeof result === 'object' && result.transcript) {
+      req.body.Body = result.transcript;  // overwrite with STT text
+      return next();                      // continue into text routing
     }
 
-    return ok(res, 'File received.');
+    // If handleMedia chose not to respond, fall through to text routing
+    return next();
   } catch (e) {
     console.error('[MEDIA] error:', e?.message);
-    return ok(res, 'Media processed.');
+    if (!res.headersSent) {
+      return ok(res, 'Media processed.');
+    }
   }
 });
 
+// ---------- Main text router (tasks / jobs / timeclock / agent) ----------
 router.post('*', async (req, res, next) => {
+  // Map phone → UUID owner id as early as possible (for CIL/domain)
+  if (!req.ownerId || /^[0-9]+$/.test(String(req.ownerId))) {
+    try {
+      const mapped = await getOwnerUuidForPhone(req.from);
+      if (mapped) req.ownerId = mapped;
+    } catch (e) {
+      console.warn('[WEBHOOK] owner uuid map failed:', e?.message);
+    }
+  }
+
   try {
+    // 1) If this user has a pending *media* flow, let handlers/media.js
+    // resolve the "yes/no/today/this week…" reply first.
+    const pending = await getPendingTransactionState(req.from);
+    const hasPendingMedia = pending && pending.pendingMedia;
+    const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
+
+    if (hasPendingMedia && numMedia === 0) {
+      const bodyText = String(req.body?.Body || '').trim();
+      const result = await handleMedia(
+        req.from,
+        bodyText,
+        req.userProfile || {},
+        req.ownerId,
+        null, // no mediaUrl
+        null  // no mediaType
+      );
+
+      if (result) {
+        // case 1: handleMedia returned a full TwiML response string
+        if (typeof result === 'string' && !res.headersSent) {
+          return res
+            .status(200)
+            .type('application/xml; charset=utf-8')
+            .send(result);
+        }
+
+        // case 2: handleMedia returned transcript only → allow task/job/timeclock/agent to continue
+        if (result.transcript && !result.twiml) {
+          req.body.Body = result.transcript;
+          // Fall through into the existing logic below
+        } else {
+          // Did something, but didn't return explicit XML, so stop
+          return;
+        }
+      }
+    }
+
+    // 2) Normal text pipeline
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();
 
+    // --- SPECIAL: "How did the XYZ job do?" → job KPIs ---
+    if (/how\b.*\bjob\b/.test(lc)) {
+      try {
+        const { handleJobInsights } = require('../handlers/commands/job_insights');
+        const msg = await handleJobInsights({
+          ownerId: req.ownerId,
+          text,
+        });
+
+        return res
+          .status(200)
+          .type('application/xml; charset=utf-8')
+          .send(`<Response><Message>${msg}</Message></Response>`);
+      } catch (e) {
+        console.error('[WEBHOOK] job_insights failed:', e?.message);
+        // fall through to normal handlers/agent if something blows up
+      }
+    }
+
     async function glossaryNudgeFrom(str) {
-      const { findClosestTerm } = require('../services/glossary'); // if this is where it lives
+      const { findClosestTerm } = require('../services/glossary');
       const words = String(str || '').toLowerCase().match(/[a-z0-9_-]+/g) || [];
       for (const w of words) {
         const hit = await findClosestTerm(w);
@@ -197,7 +258,10 @@ router.post('*', async (req, res, next) => {
 
     const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc);
 
-    let looksTask = /^task\b/.test(lc) || /\btasks?\b/.test(lc);
+    let looksTask =
+      /^task\b/.test(lc) ||
+      /\btasks?\b/.test(lc);
+
     let looksJob =
       /\b(?:job|jobs)\b/.test(lc) ||
       /\bactive job\??\b/.test(lc) ||
@@ -205,8 +269,10 @@ router.post('*', async (req, res, next) => {
       /\bset\s+active\b/.test(lc) ||
       /\b(list|create|start|activate|pause|resume|finish)\s+job\b/.test(lc) ||
       /\bmove\s+last\s+log\s+to\b/.test(lc);
+
     let looksTime =
       /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc);
+
     let looksKpi = /^kpis?\s+for\b/.test(lc);
 
     if (askingHow && /\btasks?\b/.test(lc)) looksTask = true;
@@ -243,10 +309,40 @@ router.post('*', async (req, res, next) => {
     };
 
     const cmds = require('../handlers/commands');
-    const tasksHandler = cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
-    const { handleJob } = cmds.job || require('../handlers/commands/job');
-    const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
+    const tasksHandler =
+      cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
+    const { handleJob } =
+      cmds.job || require('../handlers/commands/job');
+    const handleTimeclock =
+      cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
 
+
+    // 4) Try explicit handlers first
+    if (tasksHandler &&
+        await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) {
+      return;
+    }
+
+    if (handleTimeclock &&
+        await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) {
+      return;
+    }
+
+    if (handleJob &&
+        await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) {
+      return;
+    }
+
+    // 5) Agent fallback (pass topicHints so Chief knows what to look up)
+    const { ask } = require('../services/agent');
+    const answer = await ask({
+      from: req.from,
+      ownerId: req.ownerId,
+      text,
+      topicHints,
+    });
+
+    
     // --- Forecast (fast path; no ctx object) ---------------------------------
     if (/^forecast\b/i.test(lc)) {
       const handled = await handleForecast({

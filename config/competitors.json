@@ -1,0 +1,20 @@
+{
+  "servicetitan": {
+    "displayName": "ServiceTitan",
+    "category": "Job Management",
+    "positioning": "Enterprise field-service platform; powerful but heavy and best for larger teams.",
+    "pocketcfoAngle": "Keep ServiceTitan for operations; use PocketCFO to make sense of profits, cash flow, and pricing."
+  },
+  "jobber": {
+    "displayName": "Jobber",
+    "category": "Job Management",
+    "positioning": "Simple, clean scheduling and invoicing for small/mid-sized contractors.",
+    "pocketcfoAngle": "Jobber organises your day; PocketCFO shows whether the jobs you scheduled are actually profitable."
+  },
+  "housecall_pro": {
+    "displayName": "Housecall Pro",
+    "category": "Job Management",
+    "positioning": "Scheduling and routing for door-to-door service work, with customer notifications.",
+    "pocketcfoAngle": "Housecall Pro helps you get to the job; PocketCFO helps you get paid properly and keep more of it."
+  }
+}

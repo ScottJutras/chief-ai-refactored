@@ -854,6 +854,218 @@ module.exports.savePendingAction   = savePendingAction;
 module.exports.getPendingAction    = getPendingAction;
 module.exports.deletePendingAction = deletePendingAction;
 
+// -------------------- Finance helpers (transactions + pricing_items) --------------------
+
+/**
+ * Fetch pricing catalog for an owner.
+ *
+ * @param {string} ownerId owner UUID or phone; we compare as text
+ */
+async function getOwnerPricingItems(ownerId) {
+  const ownerKey = String(ownerId);
+
+  const { rows } = await query(
+    `
+      select id, item_name, unit, unit_cost_cents, kind, created_at
+      from pricing_items
+      where owner_id::text = $1
+      order by lower(item_name)
+    `,
+    [ownerKey]
+  );
+  return rows;
+}
+
+/**
+ * Summarize revenue / expense / profit for an owner, optionally scoped to a job.
+ *
+ * @param {string} ownerId owner/tenant id (uuid or phone; we compare as text)
+ * @param {string|null} jobId optional job UUID (null = all jobs)
+ */
+async function getJobFinanceSnapshot(ownerId, jobId = null) {
+  const ownerKey = String(ownerId);
+  const params = [ownerKey];
+  let where = 'owner_id::text = $1';
+
+  if (jobId) {
+    params.push(String(jobId));
+    where += ' AND job_id::text = $2';
+  }
+
+  const { rows } = await query(
+    `
+      select kind, coalesce(sum(amount_cents), 0) as amount_cents
+      from transactions
+      where ${where}
+      group by kind
+    `,
+    params
+  );
+
+  let totalExpense = 0;
+  let totalRevenue = 0;
+
+  for (const r of rows) {
+    const kind = (r.kind || '').toLowerCase();
+    const cents = Number(r.amount_cents) || 0;
+    if (kind === 'expense') totalExpense += cents;
+    if (kind === 'revenue') totalRevenue += cents;
+  }
+
+  const profit = totalRevenue - totalExpense;
+  const marginPct =
+    totalRevenue > 0 ? Math.round((profit / totalRevenue) * 1000) / 10 : null;
+
+  return {
+    total_expense_cents: totalExpense,
+    total_revenue_cents: totalRevenue,
+    profit_cents: profit,
+    margin_pct: marginPct,
+  };
+}
+
+/**
+ * List all jobs for an owner with basic finance (revenue / expense / profit).
+ * This powers the main "Jobs" dashboard list.
+ */
+async function getOwnerJobsFinance(ownerId) {
+  const ownerKey = String(ownerId);
+
+  const { rows } = await query(
+    `
+      select
+        j.id,
+        j.name,
+        j.status,
+        j.created_at,
+        j.completed_at,
+        -- roll up from transactions
+        coalesce(sum(case when t.kind = 'revenue' then t.amount_cents end), 0) as revenue_cents,
+        coalesce(sum(case when t.kind = 'expense' then t.amount_cents end), 0) as expense_cents
+      from jobs j
+      left join transactions t
+        on t.owner_id::text = j.owner_id::text
+       and t.job_id        = j.id
+      where j.owner_id::text = $1
+      group by j.id
+      order by j.created_at desc
+    `,
+    [ownerKey]
+  );
+
+  return rows.map((r) => {
+    const revenue = Number(r.revenue_cents) || 0;
+    const expense = Number(r.expense_cents) || 0;
+    const profit  = revenue - expense;
+    const margin_pct =
+      revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
+
+    return {
+      job_id: r.id,
+      name: r.name,
+      status: r.status,
+      created_at: r.created_at,
+      completed_at: r.completed_at,
+      revenue_cents: revenue,
+      expense_cents: expense,
+      profit_cents: profit,
+      margin_pct,
+    };
+  });
+}
+
+/**
+ * Summarize a single calendar month for an owner.
+ *
+ * @param {string} ownerId
+ * @param {string} monthStart ISO date 'YYYY-MM-01'
+ */
+async function getOwnerMonthlyFinance(ownerId, monthStart) {
+  const ownerKey = String(ownerId);
+  const start = monthStart;
+
+  const { rows } = await query(
+    `
+      select
+        kind,
+        coalesce(sum(amount_cents), 0) as amount_cents
+      from transactions
+      where owner_id::text = $1
+        and date >= $2::date
+        and date <  ($2::date + interval '1 month')
+      group by kind
+    `,
+    [ownerKey, start]
+  );
+
+  let revenue = 0;
+  let expense = 0;
+  for (const r of rows) {
+    const k = (r.kind || '').toLowerCase();
+    const cents = Number(r.amount_cents) || 0;
+    if (k === 'revenue') revenue += cents;
+    if (k === 'expense') expense += cents;
+  }
+
+  const profit = revenue - expense;
+  const margin_pct =
+    revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
+
+  return {
+    month_start: start,
+    revenue_cents: revenue,
+    expense_cents: expense,
+    profit_cents: profit,
+    margin_pct,
+  };
+}
+
+/**
+ * Category breakdown (expenses and/or revenue) for a given date range.
+ *
+ * @param {string} ownerId
+ * @param {string} fromDate ISO 'YYYY-MM-DD'
+ * @param {string} toDate   ISO 'YYYY-MM-DD' (exclusive)
+ * @param {('expense'|'revenue'|null)} kindFilter optional
+ */
+async function getOwnerCategoryBreakdown(ownerId, fromDate, toDate, kindFilter = null) {
+  const ownerKey = String(ownerId);
+
+  const params = [ownerKey, fromDate, toDate];
+  let where = `
+    owner_id::text = $1
+    and date >= $2::date
+    and date <  $3::date
+  `;
+
+  if (kindFilter) {
+    params.push(kindFilter);
+    where += ` and kind = $4`;
+  }
+
+  const { rows } = await query(
+    `
+      select
+        coalesce(nullif(category, ''), 'Uncategorized') as category,
+        coalesce(sum(amount_cents), 0) as amount_cents
+      from transactions
+      where ${where}
+      group by coalesce(nullif(category, ''), 'Uncategorized')
+      order by amount_cents desc
+    `,
+    params
+  );
+
+  return rows.map((r) => ({
+    category: r.category,
+    amount_cents: Number(r.amount_cents) || 0,
+  }));
+}
+
+
+
+
+
 // ---- Safe limiter exports (avoid undefined symbol at module.exports time)
 const __checkLimit =
   (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
@@ -909,6 +1121,11 @@ module.exports = {
   getLatestTimeEvent,
   checkTimeEntryLimit: __checkLimit, // alias; keep API stable
   checkActorLimit: __checkLimit,
+  getJobFinanceSnapshot,
+  getOwnerPricingItems,
+  getOwnerJobsFinance,
+  getOwnerMonthlyFinance,
+  getOwnerCategoryBreakdown,
 
   // ---------- Exports ----------
   exportTimesheetXlsx,

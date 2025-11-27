@@ -1,54 +1,59 @@
 // utils/visionService.js
-require('dotenv').config();
-const axios = require('axios');
-const vision = require('@google-cloud/vision');
+// Safe, dev-friendly wrapper for Google Vision OCR.
+// In production, you can wire this to @google-cloud/vision.
+// For now, if credentials are missing, we just return empty text so media
+// handling never crashes the server.
 
-// Load & parse your key JSON from env
-if (!process.env.GOOGLE_VISION_CREDENTIALS_BASE64) {
-  throw new Error(
-    "[ERROR] GOOGLE_VISION_CREDENTIALS_BASE64 is missing. Cannot authenticate Google Vision API."
-  );
-}
-const googleVisionCredentials = JSON.parse(
-  Buffer.from(process.env.GOOGLE_VISION_CREDENTIALS_BASE64, 'base64').toString('utf-8')
-);
-
-// Instantiate a single Vision client with explicit creds
-const visionClient = new vision.ImageAnnotatorClient({
-  credentials: googleVisionCredentials
-});
+const hasVisionCreds = !!process.env.GOOGLE_VISION_CREDENTIALS_BASE64;
 
 /**
- * Download an image (using Twilio auth) and extract text with Vision API.
+ * Extract text from an image URL (Twilio media URL).
  *
- * @param {string} imageSource - URL of the receipt image.
- * @returns {Promise<{ text: string }>} The full OCR text.
+ * For now this is a stub in local/dev: if Vision credentials are not present,
+ * it logs a warning and returns { text: "" } so the caller can fall back.
+ *
+ * @param {string} imageUrl
+ * @returns {Promise<{ text: string }>}
  */
-async function extractTextFromImage(imageSource) {
+async function extractTextFromImage(imageUrl) {
+  if (!hasVisionCreds) {
+    console.warn(
+      '[visionService] GOOGLE_VISION_CREDENTIALS_BASE64 missing. ' +
+        'Skipping OCR and returning empty text (dev mode).'
+    );
+    return { text: '' };
+  }
+
+  // ─── Production path (optional, when you’re ready to wire real OCR) ───
+  // NOTE: You can uncomment and complete this when you have Vision creds
+  // and want real OCR. For now, this function will never hit this block
+  // because hasVisionCreds is false locally.
+
+  
   try {
-    // 1) fetch the bytes
-    console.log(`[DEBUG] Downloading image from: ${imageSource}`);
-    const resp = await axios.get(imageSource, {
-      responseType: "arraybuffer",
-      auth: {
-        username: process.env.TWILIO_ACCOUNT_SID,
-        password: process.env.TWILIO_AUTH_TOKEN,
-      },
-    });
-    const imageBuffer = resp.data;
+    const { ImageAnnotatorClient } = require('@google-cloud/vision');
 
-    // 2) documentTextDetection runs both page‐ and layout‐level OCR
-    const [result] = await visionClient.documentTextDetection({
-      image: { content: imageBuffer },
-    });
+    // Decode base64 credentials JSON
+    const credsJson = Buffer.from(
+      process.env.GOOGLE_VISION_CREDENTIALS_BASE64,
+      'base64'
+    ).toString('utf8');
+    const credentials = JSON.parse(credsJson);
 
-    const fullText = result.fullTextAnnotation?.text || "";
-    console.log("[DEBUG] Vision OCR extracted text length:", fullText.length);
+    const client = new ImageAnnotatorClient({ credentials });
+
+    const [result] = await client.textDetection(imageUrl);
+    const detections = result.textAnnotations || [];
+    const fullText = detections[0]?.description || '';
+
     return { text: fullText };
   } catch (err) {
-    console.error("[ERROR] Vision OCR failed:", err.message);
-    return { text: "" };
+    console.error('[visionService] Vision OCR failed:', err?.message);
+    return { text: '' };
   }
+  
 }
 
-module.exports = { extractTextFromImage };
+module.exports = {
+  extractTextFromImage,
+};

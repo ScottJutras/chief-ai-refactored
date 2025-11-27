@@ -5,7 +5,6 @@ const { extractTextFromImage } = require('../utils/visionService');
 const { transcribeAudio } = require('../utils/transcriptionService');
 const {
   getActiveJob,
-  appendToUserSpreadsheet,
   generateTimesheet,
 } = require('../services/postgres');
 const { handleTimeclock } = require('./commands/timeclock');
@@ -14,6 +13,8 @@ const {
   setPendingTransactionState,
   deletePendingTransactionState
 } = require('../utils/stateManager');
+const { applyCIL } = require('../services/cilRouter');
+
 
 /* ---------------- helpers ---------------- */
 
@@ -154,116 +155,116 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     /* ---------- Pending confirmation (text-only replies) ---------- */
-    {
-      const pendingState = await getPendingTransactionState(from);
-      if (pendingState?.pendingMedia && !mediaUrl) {
-        const { type } = pendingState.pendingMedia;
-        const rawInput = String(input || '');
-        const lcInput = rawInput.toLowerCase().trim().replace(/[.!?]$/, '');
-        const isYes = lcInput === 'yes' || lcInput === 'y';
-        const isNo = lcInput === 'no' || lcInput === 'n' || lcInput === 'cancel';
-        const label = friendlyTypeLabel(type);
+{
+  const pendingState = await getPendingTransactionState(from);
+  if (pendingState?.pendingMedia && !mediaUrl) {
+    const { type } = pendingState.pendingMedia;
+    const rawInput = String(input || '');
+    const lcInput = rawInput.toLowerCase().trim().replace(/[.!?]$/, '');
+    const isYes = lcInput === 'yes' || lcInput === 'y';
+    const isNo  = lcInput === 'no'  || lcInput === 'n' || lcInput === 'cancel';
 
-        if (type != null) {
-          if (isYes) {
-            if (type === 'expense' && pendingState.pendingExpense) {
-              const data = pendingState.pendingExpense;
-              await appendToUserSpreadsheet(ownerId, [
-                data.date,
-                data.item,
-                data.amount,
-                data.store,
-                (await getActiveJob(ownerId)) || 'Uncategorized',
-                'expense',
-                data.category,
-                data.mediaUrl || null,
-                userProfile.name || 'Unknown',
-              ]);
-              await deletePendingTransactionState(from);
-              return twiml(`✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${data.category})`);
-            }
-            if (type === 'revenue' && pendingState.pendingRevenue) {
-              const data = pendingState.pendingRevenue;
-              await appendToUserSpreadsheet(ownerId, [
-                data.date,
-                data.description,
-                data.amount,
-                data.source,
-                (await getActiveJob(ownerId)) || 'Uncategorized',
-                'revenue',
-                data.category,
-                data.mediaUrl || null,
-                userProfile.name || 'Unknown',
-              ]);
-              await deletePendingTransactionState(from);
-              return twiml(`✅ Revenue logged: ${data.amount} from ${data.source} (Category: ${data.category})`);
-            }
-            if (type === 'time_entry' && pendingState.pendingTimeEntry) {
-              const { employeeName, type: entryType, timestamp, job } = pendingState.pendingTimeEntry;
-              const tz = getUserTz(userProfile);
-              const hhmm = toAmPm(timestamp, tz);
-              let normalized;
-              if (entryType === 'punch_in') normalized = `${employeeName} punched in at ${hhmm}`;
-              else if (entryType === 'punch_out') normalized = `${employeeName} punched out at ${hhmm}`;
-              else if (entryType === 'break_start') normalized = `start break for ${employeeName} at ${hhmm}`;
-              else if (entryType === 'break_end') normalized = `end break for ${employeeName} at ${hhmm}`;
-              else if (entryType === 'drive_start') normalized = `start drive for ${employeeName} at ${hhmm}`;
-              else if (entryType === 'drive_end') normalized = `end drive for ${employeeName} at ${hhmm}`;
-              else normalized = `${employeeName} punched in at ${hhmm}`;
-              const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
-              await deletePendingTransactionState(from);
-              if (typeof tw === 'string' && tw.trim()) return tw;
-              return twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}${job ? ` on ${job}` : ''}`);
-            }
-            if (type === 'hours_inquiry') {
-              await deletePendingTransactionState(from);
-              return twiml(`Please specify: today, this week, or this month.`);
-            }
-            await deletePendingTransactionState(from);
-            return twiml(`Hmm, I lost the details for that ${label}. Please resend.`);
-          }
+    const toCents = (amt) => Math.round(parseFloat(String(amt).replace(/[^\d.]/g,'')) * 100);
 
-          if (isNo) {
-            await deletePendingTransactionState(from);
-            return twiml(`❌ ${label} cancelled.`);
-          }
+    if (type != null) {
+      if (isYes) {
+        if (type === 'expense' && pendingState.pendingExpense) {
+          const d = pendingState.pendingExpense;
+          const out = await applyCIL({
+            type: 'LogExpense',
+            item: d.item,
+            amount_cents: toCents(d.amount),
+            store: d.store || undefined,
+            date: d.date || undefined,
+            category: d.category || undefined,
+            media_url: d.mediaUrl || undefined,
+          }, { owner_id: ownerId, actor_phone: from, source_msg_id: from + Date.now() });
 
-          if (lcInput === 'edit') {
-            await deletePendingTransactionState(from);
-            return twiml(`Please resend the ${label} details.`);
-          }
-
-          if (type === 'hours_inquiry') {
-            let periodWord =
-              lcInput.match(/\b(today|day|this\s*week|week|this\s*month|month|now)\b/i)?.[1]?.toLowerCase() ||
-              (/\bthisweek\b/i.test(lcInput) ? 'this week' : null) ||
-              (/\bthismonth\b/i.test(lcInput) ? 'this month' : null);
-            if (periodWord) {
-              if (periodWord === 'now') periodWord = 'day';
-              if (periodWord === 'this week') periodWord = 'week';
-              if (periodWord === 'this month') periodWord = 'month';
-              const period = periodWord === 'today' ? 'day' : periodWord;
-              const tz = getUserTz(userProfile);
-              const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
-              const { message } = await generateTimesheet({
-                ownerId,
-                person: name,
-                period,
-                tz,
-                now: new Date()
-              });
-              await deletePendingTransactionState(from);
-              return twiml(message);
-            }
-            return twiml(`Got it. Do you want **today**, **this week**, or **this month** for ${pendingState.pendingHours?.employeeName || 'them'}?`);
-          }
-
-          return twiml(`⚠️ Reply 'yes', 'no', or 'edit' to confirm or cancel the ${label}.`);
-        } else if (type == null && !mediaUrl) {
-          return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
+          await deletePendingTransactionState(from);
+          return twiml(out.summary);
         }
+
+        if (type === 'revenue' && pendingState.pendingRevenue) {
+          const d = pendingState.pendingRevenue;
+          const out = await applyCIL({
+            type: 'LogRevenue',
+            description: d.description,
+            amount_cents: toCents(d.amount),
+            source: d.source || undefined,
+            date: d.date || undefined,
+            category: d.category || undefined,
+            media_url: d.mediaUrl || undefined,
+          }, { owner_id: ownerId, actor_phone: from, source_msg_id: from + Date.now() });
+
+          await deletePendingTransactionState(from);
+          return twiml(out.summary);
+        }
+
+        if (type === 'time_entry' && pendingState.pendingTimeEntry) {
+          const { employeeName, type: entryType, timestamp } = pendingState.pendingTimeEntry;
+          const tz = getUserTz(userProfile);
+          const hhmm = toAmPm(timestamp, tz);
+
+          let normalized;
+          if (entryType === 'punch_in') normalized = `${employeeName} punched in at ${hhmm}`;
+          else if (entryType === 'punch_out') normalized = `${employeeName} punched out at ${hhmm}`;
+          else if (entryType === 'break_start') normalized = `start break for ${employeeName} at ${hhmm}`;
+          else if (entryType === 'break_end') normalized = `end break for ${employeeName} at ${hhmm}`;
+          else if (entryType === 'drive_start') normalized = `start drive for ${employeeName} at ${hhmm}`;
+          else if (entryType === 'drive_end') normalized = `end drive for ${employeeName} at ${hhmm}`;
+          else normalized = `${employeeName} punched in at ${hhmm}`;
+
+          const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
+          await deletePendingTransactionState(from);
+          if (typeof tw === 'string' && tw.trim()) return tw;
+          return twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}`);
+        }
+
+        if (type === 'hours_inquiry') {
+          await deletePendingTransactionState(from);
+          return twiml(`Please specify: today, this week, or this month.`);
+        }
+
+        await deletePendingTransactionState(from);
+        return twiml(`Hmm, I lost the details. Please resend.`);
       }
+
+      if (isNo) {
+        await deletePendingTransactionState(from);
+        return twiml(`❌ Cancelled.`);
+      }
+
+      if (lcInput === 'edit') {
+        await deletePendingTransactionState(from);
+        return twiml(`Please resend the details.`);
+      }
+
+      if (type === 'hours_inquiry') {
+        let periodWord =
+          lcInput.match(/\b(today|day|this\s*week|week|this\s*month|month|now)\b/i)?.[1]?.toLowerCase() ||
+          (/\bthisweek\b/i.test(lcInput) ? 'this week' : null) ||
+          (/\bthismonth\b/i.test(lcInput) ? 'this month' : null);
+        if (periodWord) {
+          if (periodWord === 'now') periodWord = 'day';
+          if (periodWord === 'this week') periodWord = 'week';
+          if (periodWord === 'this month') periodWord = 'month';
+          const period = periodWord === 'today' ? 'day' : periodWord;
+          const tz = getUserTz(userProfile);
+          const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
+          const { message } = await generateTimesheet({ ownerId, person: name, period, tz, now: new Date() });
+          await deletePendingTransactionState(from);
+          return twiml(message);
+        }
+        return twiml(`Got it. Do you want **today**, **this week**, or **this month**?`);
+      }
+
+      return twiml(`⚠️ Reply 'yes', 'no', or 'edit' to confirm or cancel.`);
+    } else if (type == null && !mediaUrl) {
+      return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
     }
+  }
+}
+
 
     /* ---------- Build text from media ---------- */
 let extractedText = String(input || '').trim();
@@ -474,4 +475,5 @@ try {
   }
 }
 
-module.exports = { handleMedia };
+module.exports.handleMedia = handleMedia;
+

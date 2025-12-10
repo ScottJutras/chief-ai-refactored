@@ -226,8 +226,4 @@ async function transcribeAudio(audioBuffer, mimeType, engine = 'google') {
     console.log('[DEBUG] Final transcription OK:', transcript);
     return transcript;
   }
-  console.log('[DEBUG] No transcription produced');
-  return null;
-}
-
-module.exports = { transcribeAudio };
+  console.log('[DEBUG] No transcription produced');}

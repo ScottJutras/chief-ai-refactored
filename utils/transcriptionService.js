@@ -1,12 +1,11 @@
-// utils/transcriptionService.js
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { SpeechClient } = require('@google-cloud/speech').v1;
 const OpenAI = require('openai');
 
 let speechClient = null;
 let openai = null;
+let SpeechClientCtor = null; // Lazy-loaded constructor
 
 /* --------- Credentials helpers --------- */
 function loadGoogleCreds() {
@@ -27,13 +26,31 @@ function loadGoogleCreds() {
 
 function getSpeechClient() {
   if (speechClient) return speechClient;
+
+  if (!SpeechClientCtor) {
+    try {
+      const speech = require('@google-cloud/speech');
+      SpeechClientCtor = (speech.v1 && speech.v1.SpeechClient) || speech.SpeechClient;
+    } catch (e) {
+      console.error(
+        '[ERROR] @google-cloud/speech is not available; voice transcription disabled:',
+        e.message
+      );
+      SpeechClientCtor = null;
+      return null;
+    }
+  }
+
   const creds = loadGoogleCreds();
   try {
-    speechClient = creds ? new SpeechClient({ credentials: creds }) : new SpeechClient();
+    speechClient = creds
+      ? new SpeechClientCtor({ credentials: creds })
+      : new SpeechClientCtor();
   } catch (e) {
     console.error('[ERROR] Could not init Google Speech client:', e.message);
     speechClient = null;
   }
+
   return speechClient;
 }
 

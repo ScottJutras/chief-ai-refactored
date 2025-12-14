@@ -213,6 +213,68 @@ router.post('*', async (req, res, next) => {
     const messageSid =
       String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() ||
       `${req.from}:${Date.now()}`;
+// If user is mid-confirmation / edit flow, route follow-ups back to the same handler
+
+// Pending REVENUE follow-ups (yes/edit/cancel/today/cheque/etc)
+if (pending?.pendingRevenue) {
+  try {
+    const { handleRevenue } = require('../handlers/commands/revenue');
+    const twiml = await handleRevenue(
+      req.from,
+      text,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid
+    );
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] pending revenue handler failed:', e?.message);
+  }
+}
+
+// Pending EXPENSE follow-ups (yes/edit/cancel/etc)
+if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
+  try {
+    const { handleExpense } = require('../handlers/commands/expense');
+    const twiml = await handleExpense(
+      req.from,
+      text,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid
+    );
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] pending expense handler failed:', e?.message);
+  }
+}
+
+// --- REVENUE FAST PATH (TwiML-returning handler) -------------------------
+// Keep strict for now: only run when message starts with "revenue" or "received"
+const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
+if (looksRevenue) {
+  try {
+    const { handleRevenue } = require('../handlers/commands/revenue');
+    const twiml = await handleRevenue(
+      req.from,
+      text,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid
+    );
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+    // fall through
+  }
+}
+
 
     // --- EXPENSE FAST PATH (TwiML-returning handler) -------------------------
     // NOTE: expense handler returns TwiML string; we must res.send it here.
@@ -235,27 +297,6 @@ router.post('*', async (req, res, next) => {
         // fall through
       }
     }
-// --- REVENUE FAST PATH (TwiML-returning handler) -------------------------
-// Keep strict for now: only run when message starts with "revenue" or "received"
-const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
-if (looksRevenue) {
-  try {
-    const { handleRevenue } = require('../handlers/commands/revenue');
-    const twiml = await handleRevenue(
-      req.from,
-      text,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid
-    );
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-    // fall through
-  }
-}
 
     // --- SPECIAL: "How did the XYZ job do?" → job KPIs ---
     if (/how\b.*\bjob\b/.test(lc)) {

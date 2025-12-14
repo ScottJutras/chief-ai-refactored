@@ -150,12 +150,19 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}) {
     const corrections = await correctErrorsWithAI(`Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)}`, type);
 
     if (corrections) {
-      await stateManager.setPendingTransactionState(from, {
-        pendingData: data,
-        pendingCorrection: true,
-        suggestedCorrections: corrections,
-        type
-      });
+      const pendingKey =
+  type === 'expense' ? 'pendingExpense' :
+  type === 'revenue' ? 'pendingRevenue' :
+  type === 'bill'    ? 'pendingBill' :
+  type === 'quote'   ? 'pendingQuote' :
+  'pendingData';
+
+await stateManager.setPendingTransactionState(from, {
+  [pendingKey]: data,
+  pendingCorrection: true,
+  suggestedCorrections: corrections,
+  type
+});
 
       const text = Object.entries(corrections)
         .map(([k, v]) => `${k}: ${data[k] || 'missing'} → ${v}`)

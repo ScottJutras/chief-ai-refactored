@@ -198,11 +198,16 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       if (lcInput === 'edit' || lcInput === 'no') {
-        reply = '✏️ Okay — resend the correct payment (e.g., "revenue $100 from Client").';
-        await setPendingTransactionState(from, { isEditing: true, type: 'revenue' });
-        await deletePendingTransactionState(from);
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
+  await setPendingTransactionState(from, {
+    pendingRevenue: pending.pendingRevenue,
+    isEditing: true,
+    type: 'revenue'
+  });
+  reply = '✏️ Okay — resend the revenue in one line (e.g., "revenue $100 from John").';
+  return `<Response><Message>${reply}</Message></Response>`;
+}
+
+
 
       if (lcInput === 'cancel') {
         await deletePendingTransactionState(from);

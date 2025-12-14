@@ -267,8 +267,13 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     reply = '⚠️ Error logging payment. Please try again.';
     return `<Response><Message>${reply}</Message></Response>`;
   } finally {
-    await require('../middleware/lock').releaseLock(lockKey);
+  try {
+    // handlers/commands/* -> ../../middleware/lock
+    await require('../../middleware/lock').releaseLock(lockKey);
+  } catch {
+    // If lock middleware isn't available in serverless bundle, never hard-fail
   }
+}
 }
 
 module.exports = { handleRevenue };

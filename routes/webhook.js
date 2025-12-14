@@ -273,14 +273,23 @@ if (looksRevenue) {
     }
 
     async function glossaryNudgeFrom(str) {
-      const { findClosestTerm } = require('../services/glossary');
-      const words = String(str || '').toLowerCase().match(/[a-z0-9_-]+/g) || [];
-      for (const w of words) {
-        const hit = await findClosestTerm(w);
-        if (hit?.nudge) return `\n\nTip: ${hit.nudge}`;
-      }
-      return '';
+  try {
+    const glossary = require('../services/glossary'); // optional
+    const findClosestTerm = glossary?.findClosestTerm;
+    if (typeof findClosestTerm !== 'function') return '';
+
+    const words = String(str || '').toLowerCase().match(/[a-z0-9_-]+/g) || [];
+    for (const w of words) {
+      const hit = await findClosestTerm(w);
+      if (hit?.nudge) return `\n\nTip: ${hit.nudge}`;
     }
+    return '';
+  } catch {
+    // glossary service not bundled / not implemented yet
+    return '';
+  }
+}
+
 
     const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc);
 

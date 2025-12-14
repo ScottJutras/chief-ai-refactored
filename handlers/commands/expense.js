@@ -383,8 +383,13 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     reply = `⚠️ Failed to process expense: ${error.message}`;
     return `<Response><Message>${reply}</Message></Response>`;
   } finally {
-    await require('../middleware/lock').releaseLock(lockKey);
+  try {
+    await require('../../middleware/lock').releaseLock(lockKey);
+  } catch {
+    // If lock middleware isn't available in serverless bundle, never hard-fail
   }
+}
+
 }
 
 module.exports = { handleExpense };

@@ -167,6 +167,7 @@ router.post('*', async (req, res, next) => {
 
 // ---------- Main text router (tasks / jobs / timeclock / agent) ----------
 router.post('*', async (req, res, next) => {
+  // Owner mapping: phone -> owner uuid (or text owner_id in DB)
   if (!req.ownerId || /^[0-9]+$/.test(String(req.ownerId))) {
     try {
       const mapped = await getOwnerUuidForPhone(req.from);
@@ -181,6 +182,7 @@ router.post('*', async (req, res, next) => {
     const hasPendingMedia = pending && pending.pendingMedia;
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
+    // If we were waiting for media but none came, let media handler interpret text-only follow-up
     if (hasPendingMedia && numMedia === 0) {
       const bodyText = String(req.body?.Body || '').trim();
       const result = await handleMedia(
@@ -205,7 +207,7 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // 2) Normal text pipeline
+    // Normal text pipeline
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();
 
@@ -213,84 +215,93 @@ router.post('*', async (req, res, next) => {
     const messageSid =
       String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() ||
       `${req.from}:${Date.now()}`;
-// If user is mid-confirmation / edit flow, route follow-ups back to the same handler
 
-// Pending REVENUE follow-ups (yes/edit/cancel/today/cheque/etc)
-if (pending?.pendingRevenue) {
-  try {
-    const { handleRevenue } = require('../handlers/commands/revenue');
-    const twiml = await handleRevenue(
-      req.from,
-      text,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid
-    );
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] pending revenue handler failed:', e?.message);
-  }
-}
+    // -----------------------------------------------------------------------
+    // (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
+    // -----------------------------------------------------------------------
+    // Route follow-ups to revenue/expense handlers whenever we are in:
+    // - confirm flow (pendingRevenue/pendingExpense)
+    // - AI clarification flow (awaitingRevenueClarification/awaitingExpenseClarification)
+    // - delete flow (pendingDelete)
+    // - aiErrorHandler correction flow (pendingCorrection + type)
+    //
+    // Important: aiErrorHandler can store pendingData and expects the handler to normalize.
+    // Important: clarification messages like "2025-12-12" MUST go here or they'll fall into menu/agent.
+    const pendingRevenueLike =
+      !!pending?.pendingRevenue ||
+      !!pending?.awaitingRevenueClarification ||
+      (pending?.pendingCorrection && pending?.type === 'revenue');
 
-// Pending EXPENSE follow-ups (yes/edit/cancel/etc)
-if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
-  try {
-    const { handleExpense } = require('../handlers/commands/expense');
-    const twiml = await handleExpense(
-      req.from,
-      text,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid
-    );
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] pending expense handler failed:', e?.message);
-  }
-}
+    if (pendingRevenueLike) {
+      try {
+        const { handleRevenue } = require('../handlers/commands/revenue');
+        const twiml = await handleRevenue(
+          req.from,
+          text,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          // preserve stable idempotency: if handler stored revenueSourceMsgId it will use it;
+          // we still pass messageSid for completeness
+          messageSid
+        );
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
+        // fall through (never hard-fail)
+      }
+    }
 
-// Pending AI correction follow-ups from aiErrorHandler (pendingData/type)
-if (pending?.pendingCorrection && pending?.type === 'revenue') {
-  const { handleRevenue } = require('../handlers/commands/revenue');
-  const twiml = await handleRevenue(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
-  return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-}
+    const pendingExpenseLike =
+      !!pending?.pendingExpense ||
+      !!pending?.awaitingExpenseClarification ||
+      pending?.pendingDelete?.type === 'expense' ||
+      (pending?.pendingCorrection && pending?.type === 'expense');
 
-if (pending?.pendingCorrection && pending?.type === 'expense') {
-  const { handleExpense } = require('../handlers/commands/expense');
-  const twiml = await handleExpense(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
-  return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-}
+    if (pendingExpenseLike) {
+      try {
+        const { handleExpense } = require('../handlers/commands/expense');
+        const twiml = await handleExpense(
+          req.from,
+          text,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
+        // fall through
+      }
+    }
 
-// --- REVENUE FAST PATH (TwiML-returning handler) -------------------------
-// Keep strict for now: only run when message starts with "revenue" or "received"
-const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
-if (looksRevenue) {
-  try {
-    const { handleRevenue } = require('../handlers/commands/revenue');
-    const twiml = await handleRevenue(
-      req.from,
-      text,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid
-    );
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-    // fall through
-  }
-}
+    // -----------------------------------------------------------------------
+    // (B) FAST PATHS — REVENUE/EXPENSE TWI ML HANDLERS
+    // -----------------------------------------------------------------------
+    // Keep strict: only run when message starts with the keyword.
+    const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
+    if (looksRevenue) {
+      try {
+        const { handleRevenue } = require('../handlers/commands/revenue');
+        const twiml = await handleRevenue(
+          req.from,
+          text,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+        // fall through
+      }
+    }
 
-
-    // --- EXPENSE FAST PATH (TwiML-returning handler) -------------------------
-    // NOTE: expense handler returns TwiML string; we must res.send it here.
     const looksExpense = /^(?:expense|exp)\b/.test(lc);
     if (looksExpense) {
       try {
@@ -320,30 +331,29 @@ if (looksRevenue) {
         return res
           .status(200)
           .type('application/xml; charset=utf-8')
-          .send(`<Response><Message>${msg}</Message></Response>`);
+          .send(`<Response><Message>${xmlEsc(msg)}</Message></Response>`);
       } catch (e) {
         console.error('[WEBHOOK] job_insights failed:', e?.message);
       }
     }
 
     async function glossaryNudgeFrom(str) {
-  try {
-    const glossary = require('../services/glossary'); // optional
-    const findClosestTerm = glossary?.findClosestTerm;
-    if (typeof findClosestTerm !== 'function') return '';
+      try {
+        const glossary = require('../services/glossary'); // optional
+        const findClosestTerm = glossary?.findClosestTerm;
+        if (typeof findClosestTerm !== 'function') return '';
 
-    const words = String(str || '').toLowerCase().match(/[a-z0-9_-]+/g) || [];
-    for (const w of words) {
-      const hit = await findClosestTerm(w);
-      if (hit?.nudge) return `\n\nTip: ${hit.nudge}`;
+        const words = String(str || '').toLowerCase().match(/[a-z0-9_-]+/g) || [];
+        for (const w of words) {
+          const hit = await findClosestTerm(w);
+          if (hit?.nudge) return `\n\nTip: ${hit.nudge}`;
+        }
+        return '';
+      } catch {
+        // glossary service not bundled / not implemented yet
+        return '';
+      }
     }
-    return '';
-  } catch {
-    // glossary service not bundled / not implemented yet
-    return '';
-  }
-}
-
 
     const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc);
 
@@ -395,12 +405,12 @@ if (looksRevenue) {
     const { handleJob } = cmds.job || require('../handlers/commands/job');
     const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
 
-    // 4) Try explicit handlers first (BOOLEAN-handled style)
+    // Try explicit handlers first (BOOLEAN-handled style)
     if (tasksHandler && await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
     if (handleTimeclock && await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
     if (handleJob && await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
 
-    // --- Forecast (fast path; no ctx object) ---------------------------------
+    // Forecast (fast path; no ctx object)
     if (/^forecast\b/i.test(lc)) {
       const handled = await handleForecast({
         text,
@@ -411,7 +421,7 @@ if (looksRevenue) {
       if (handled) return;
     }
 
-    // --- Timeclock v2 (optional fast path behind flag) -----------------------
+    // Timeclock v2 (optional fast path behind flag)
     if (flags.timeclock_v2) {
       const cil = (() => {
         if (/^clock in\b/.test(lc)) return { type:'Clock', action:'in' };
@@ -440,7 +450,7 @@ if (looksRevenue) {
       }
     }
 
-    // --- KPI command (unchanged) --------------------------------------------
+    // KPI command (unchanged)
     const KPI_ENABLED = (process.env.FEATURE_FINANCE_KPIS || '1') === '1';
     const hasSub = canUseAgent(req.userProfile);
     if (looksKpi && KPI_ENABLED && hasSub) {
@@ -460,7 +470,7 @@ if (looksRevenue) {
       }
     }
 
-    // --- TASKS ---------------------------------------------------------------
+    // TASKS
     if (looksTask && typeof tasksHandler === 'function') {
       const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
@@ -471,7 +481,7 @@ if (looksRevenue) {
       return;
     }
 
-    // --- JOBS ----------------------------------------------------------------
+    // JOBS
     if (looksJob && typeof handleJob === 'function') {
       const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
@@ -482,7 +492,7 @@ if (looksRevenue) {
       return;
     }
 
-    // --- TIMECLOCK (legacy) --------------------------------------------------
+    // TIMECLOCK (legacy)
     if (looksTime && typeof handleTimeclock === 'function') {
       const out = await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
@@ -493,7 +503,7 @@ if (looksRevenue) {
       return;
     }
 
-    // --- Agent (unchanged) ---------------------------------------------------
+    // Agent (unchanged)
     if (canUseAgent(req.userProfile)) {
       try {
         const { ask } = require('../services/agent');
@@ -513,7 +523,7 @@ if (looksRevenue) {
       }
     }
 
-    // --- Default help --------------------------------------------------------
+    // Default help
     let msg =
       'PocketCFO — What I can do:\n' +
       '• Jobs: create job Roof Repair, set active job Roof Repair, move last log to Front Porch\n' +

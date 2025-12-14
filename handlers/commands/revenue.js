@@ -1,5 +1,5 @@
 // handlers/commands/revenue.js
-const { query, getActiveJob } = require('../../services/postgres');
+const { query } = require('../../services/postgres');
 const {
   getPendingTransactionState,
   setPendingTransactionState,
@@ -61,6 +61,10 @@ function toDollars(amountStr) {
   return n;
 }
 
+function looksLikeUuid(str) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+}
+
 function todayInTimeZone(tz) {
   try {
     const dtf = new Intl.DateTimeFormat('en-CA', {
@@ -97,6 +101,52 @@ function parseNaturalDate(s, tz) {
 
   const parsed = Date.parse(s);
   if (!Number.isNaN(parsed)) return new Date(parsed).toISOString().split('T')[0];
+
+  return null;
+}
+
+/**
+ * Resolve active job name safely (avoid int=uuid comparisons).
+ * Priority:
+ *  1) userProfile.active_job_name
+ *  2) userProfile.active_job_id (uuid) -> jobs.id
+ *  3) userProfile.active_job_id numeric -> jobs.job_no
+ */
+async function resolveActiveJobName({ ownerId, userProfile }) {
+  const ownerParam = String(ownerId || '').trim();
+  const name = userProfile?.active_job_name || userProfile?.activeJobName || null;
+  if (name && String(name).trim()) return String(name).trim();
+
+  const ref = userProfile?.active_job_id ?? userProfile?.activeJobId ?? null;
+  if (ref == null) return null;
+
+  const s = String(ref).trim();
+
+  // UUID jobs.id
+  if (looksLikeUuid(s)) {
+    try {
+      const r = await query(
+        `select job_name from jobs where owner_id = $1 and id = $2::uuid limit 1`,
+        [ownerParam, s]
+      );
+      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
+    } catch (e) {
+      console.warn('[revenue] resolveActiveJobName uuid failed:', e?.message);
+    }
+  }
+
+  // Integer jobs.job_no
+  if (/^\d+$/.test(s)) {
+    try {
+      const r = await query(
+        `select job_name from jobs where owner_id = $1 and job_no = $2::int limit 1`,
+        [ownerParam, Number(s)]
+      );
+      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
+    } catch (e) {
+      console.warn('[revenue] resolveActiveJobName job_no failed:', e?.message);
+    }
+  }
 
   return null;
 }
@@ -146,13 +196,16 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 }
 
 /**
- * Persist to your actual transactions table:
- * columns: owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at
- * (and amount, if present)
+ * Persist to transactions:
+ * columns (confirmed by you): owner_id(text), kind, date, description, amount_cents, source, job_name(text), category, user_name, source_msg_id, created_at
+ * optional: amount (numeric)
  */
 async function saveRevenue({ ownerId, date, description, amount, source, jobName, category, user, sourceMsgId }) {
   const amountCents = toCents(amount);
   if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+
+  const ownerParam = String(ownerId || '').trim();
+  const msgParam = String(sourceMsgId || '').trim();
 
   const canUseMsgId = await hasSourceMsgIdColumn();
   const canUseAmount = await hasAmountColumn();
@@ -164,7 +217,7 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
         insert into transactions
           (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, source_msg_id, created_at)
         values
-          ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, $10, now())
+          ($1::text, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, $10, now())
         on conflict do nothing
         returning id
       `
@@ -172,34 +225,34 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
         insert into transactions
           (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at)
         values
-          ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
+          ($1::text, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
         on conflict do nothing
         returning id
       `;
 
     const params = canUseAmount
       ? [
-          ownerId,
+          ownerParam,
           date,
           String(description || '').trim() || 'Unknown',
           amountCents,
           amountDollars,
           String(source || '').trim() || 'Unknown',
-          String(jobName || '').trim() || null,
-          String(category || '').trim() || null,
-          String(user || '').trim() || null,
-          String(sourceMsgId || '').trim()
+          jobName ? String(jobName).trim() : null,
+          category ? String(category).trim() : null,
+          user ? String(user).trim() : null,
+          msgParam
         ]
       : [
-          ownerId,
+          ownerParam,
           date,
           String(description || '').trim() || 'Unknown',
           amountCents,
           String(source || '').trim() || 'Unknown',
-          String(jobName || '').trim() || null,
-          String(category || '').trim() || null,
-          String(user || '').trim() || null,
-          String(sourceMsgId || '').trim()
+          jobName ? String(jobName).trim() : null,
+          category ? String(category).trim() : null,
+          user ? String(user).trim() : null,
+          msgParam
         ];
 
     const res = await query(sql, params);
@@ -207,41 +260,42 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
     return { inserted: true, id: res.rows[0].id };
   }
 
+  // non-idempotent fallback
   const sql = canUseAmount
     ? `
       insert into transactions
         (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, created_at)
       values
-        ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
+        ($1::text, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
     `
     : `
       insert into transactions
         (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, created_at)
       values
-        ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, now())
+        ($1::text, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, now())
     `;
 
   const params = canUseAmount
     ? [
-        ownerId,
+        ownerParam,
         date,
         String(description || '').trim() || 'Unknown',
         amountCents,
         amountDollars,
         String(source || '').trim() || 'Unknown',
-        String(jobName || '').trim() || null,
-        String(category || '').trim() || null,
-        String(user || '').trim() || null
+        jobName ? String(jobName).trim() : null,
+        category ? String(category).trim() : null,
+        user ? String(user).trim() : null
       ]
     : [
-        ownerId,
+        ownerParam,
         date,
         String(description || '').trim() || 'Unknown',
         amountCents,
         String(source || '').trim() || 'Unknown',
-        String(jobName || '').trim() || null,
-        String(category || '').trim() || null,
-        String(user || '').trim() || null
+        jobName ? String(jobName).trim() : null,
+        category ? String(category).trim() : null,
+        user ? String(user).trim() : null
       ];
 
   await query(sql, params);
@@ -255,8 +309,9 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
   let reply;
 
   try {
+    const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
     const defaultData = {
-      date: todayInTimeZone(userProfile?.timezone || userProfile?.tz || 'UTC'),
+      date: todayInTimeZone(tz),
       description: 'Unknown',
       amount: '$0.00',
       source: 'Unknown'
@@ -264,7 +319,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
     let pending = await getPendingTransactionState(from);
 
-    // --- Normalize aiErrorHandler pendingCorrection -> pendingRevenue ---
+    // Normalize aiErrorHandler pendingCorrection -> pendingRevenue
     if (pending?.pendingCorrection && pending?.type === 'revenue' && pending?.pendingData) {
       const data = pending.pendingData;
       await setPendingTransactionState(from, {
@@ -275,18 +330,13 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       pending = await getPendingTransactionState(from);
     }
 
-    // --- Follow-up for "AI asked a question" (date, etc.) ---
+    // Follow-up: revenue clarification (date, etc.)
     if (pending?.awaitingRevenueClarification) {
-      const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
       const maybeDate = parseNaturalDate(input, tz);
-
       if (maybeDate) {
         const draft = pending.revenueDraftText || '';
         const parsed = parseRevenueMessage(draft) || {};
-        const merged = {
-          ...parsed,
-          date: maybeDate
-        };
+        const merged = { ...parsed, date: maybeDate };
 
         await setPendingTransactionState(from, {
           ...pending,
@@ -302,7 +352,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // --- CONFIRM FLOW ---
+    // CONFIRM FLOW
     if (pending?.pendingRevenue) {
       if (!isOwner) {
         await deletePendingTransactionState(from);
@@ -311,13 +361,14 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const lcInput = input.toLowerCase().trim();
+      const stableMsgId = pending.revenueSourceMsgId || msgId;
 
       if (lcInput === 'yes') {
         const data = pending.pendingRevenue;
         const category = data.suggestedCategory || await categorizeEntry('revenue', data, ownerProfile);
-        const jobName = await getActiveJob(ownerId) || 'Uncategorized';
+        const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || 'Uncategorized';
 
-        const gate = assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: (pending.revenueSourceMsgId || msgId) });
+        const gate = assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: stableMsgId });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
         const result = await saveRevenue({
@@ -328,8 +379,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           source: data.source,
           jobName,
           category,
-          user: userProfile.name || 'Unknown User',
-          sourceMsgId: (pending.revenueSourceMsgId || msgId)
+          user: userProfile?.name || 'Unknown User',
+          sourceMsgId: stableMsgId
         });
 
         reply = (result.inserted === false)
@@ -341,11 +392,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       if (lcInput === 'edit') {
-        await setPendingTransactionState(from, {
-          ...pending,
-          isEditing: true,
-          type: 'revenue'
-        });
+        await setPendingTransactionState(from, { ...pending, isEditing: true, type: 'revenue' });
         reply = '✏️ Okay — resend the revenue in one line (e.g., "revenue $100 from John today").';
         return `<Response><Message>${reply}</Message></Response>`;
       }
@@ -360,7 +407,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // --- AI PARSE PATH ---
+    // AI PARSE PATH
     const { data, reply: aiReply, confirmed } = await handleInputWithAI(
       from,
       input,
@@ -386,9 +433,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       const category = await categorizeEntry('revenue', data, ownerProfile);
       data.suggestedCategory = category;
 
-      // If clean + confirmed => write
       if (confirmed && !errors) {
-        const jobName = await getActiveJob(ownerId) || 'Uncategorized';
+        const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || 'Uncategorized';
 
         const gate = assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
@@ -401,7 +447,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           source: data.source,
           jobName,
           category,
-          user: userProfile.name || 'Unknown User',
+          user: userProfile?.name || 'Unknown User',
           sourceMsgId: msgId
         });
 
@@ -412,7 +458,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      // Otherwise ask confirm
       await setPendingTransactionState(from, {
         pendingRevenue: data,
         revenueSourceMsgId: msgId,

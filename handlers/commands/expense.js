@@ -1,5 +1,5 @@
 // handlers/commands/expense.js
-const { query, getActiveJob } = require('../../services/postgres');
+const { query } = require('../../services/postgres');
 const {
   getPendingTransactionState,
   setPendingTransactionState,
@@ -61,6 +61,50 @@ function toDollars(amountStr) {
   return n;
 }
 
+function looksLikeUuid(str) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+}
+
+/**
+ * Resolve active job name safely (avoid int=uuid comparisons).
+ */
+async function resolveActiveJobName({ ownerId, userProfile }) {
+  const ownerParam = String(ownerId || '').trim();
+  const name = userProfile?.active_job_name || userProfile?.activeJobName || null;
+  if (name && String(name).trim()) return String(name).trim();
+
+  const ref = userProfile?.active_job_id ?? userProfile?.activeJobId ?? null;
+  if (ref == null) return null;
+
+  const s = String(ref).trim();
+
+  if (looksLikeUuid(s)) {
+    try {
+      const r = await query(
+        `select job_name from jobs where owner_id = $1 and id = $2::uuid limit 1`,
+        [ownerParam, s]
+      );
+      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
+    } catch (e) {
+      console.warn('[expense] resolveActiveJobName uuid failed:', e?.message);
+    }
+  }
+
+  if (/^\d+$/.test(s)) {
+    try {
+      const r = await query(
+        `select job_name from jobs where owner_id = $1 and job_no = $2::int limit 1`,
+        [ownerParam, Number(s)]
+      );
+      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
+    } catch (e) {
+      console.warn('[expense] resolveActiveJobName job_no failed:', e?.message);
+    }
+  }
+
+  return null;
+}
+
 function buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
 
@@ -107,6 +151,9 @@ async function saveExpense({ ownerId, date, item, amount, store, jobName, catego
   const amountCents = toCents(amount);
   if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
 
+  const ownerParam = String(ownerId || '').trim();
+  const msgParam = String(sourceMsgId || '').trim();
+
   const canUseMsgId = await hasSourceMsgIdColumn();
   const canUseAmount = await hasAmountColumn();
   const amountDollars = toDollars(amount);
@@ -120,7 +167,7 @@ async function saveExpense({ ownerId, date, item, amount, store, jobName, catego
         insert into transactions
           (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, source_msg_id, created_at)
         values
-          ($1, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, $10, now())
+          ($1::text, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, $10, now())
         on conflict do nothing
         returning id
       `
@@ -128,34 +175,34 @@ async function saveExpense({ ownerId, date, item, amount, store, jobName, catego
         insert into transactions
           (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at)
         values
-          ($1, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
+          ($1::text, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
         on conflict do nothing
         returning id
       `;
 
     const params = canUseAmount
       ? [
-          ownerId,
+          ownerParam,
           date,
           description,
           amountCents,
           amountDollars,
           source,
-          String(jobName || '').trim() || null,
-          String(category || '').trim() || null,
-          String(user || '').trim() || null,
-          String(sourceMsgId || '').trim()
+          jobName ? String(jobName).trim() : null,
+          category ? String(category).trim() : null,
+          user ? String(user).trim() : null,
+          msgParam
         ]
       : [
-          ownerId,
+          ownerParam,
           date,
           description,
           amountCents,
           source,
-          String(jobName || '').trim() || null,
-          String(category || '').trim() || null,
-          String(user || '').trim() || null,
-          String(sourceMsgId || '').trim()
+          jobName ? String(jobName).trim() : null,
+          category ? String(category).trim() : null,
+          user ? String(user).trim() : null,
+          msgParam
         ];
 
     const res = await query(sql, params);
@@ -163,41 +210,42 @@ async function saveExpense({ ownerId, date, item, amount, store, jobName, catego
     return { inserted: true, id: res.rows[0].id };
   }
 
+  // non-idempotent fallback
   const sql = canUseAmount
     ? `
       insert into transactions
         (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, created_at)
       values
-        ($1, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
+        ($1::text, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
     `
     : `
       insert into transactions
         (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, created_at)
       values
-        ($1, 'expense', $2::date, $3, $4, $5, $6, $7, $8, now())
+        ($1::text, 'expense', $2::date, $3, $4, $5, $6, $7, $8, now())
     `;
 
   const params = canUseAmount
     ? [
-        ownerId,
+        ownerParam,
         date,
         description,
         amountCents,
         amountDollars,
         source,
-        String(jobName || '').trim() || null,
-        String(category || '').trim() || null,
-        String(user || '').trim() || null
+        jobName ? String(jobName).trim() : null,
+        category ? String(category).trim() : null,
+        user ? String(user).trim() : null
       ]
     : [
-        ownerId,
+        ownerParam,
         date,
         description,
         amountCents,
         source,
-        String(jobName || '').trim() || null,
-        String(category || '').trim() || null,
-        String(user || '').trim() || null
+        jobName ? String(jobName).trim() : null,
+        category ? String(category).trim() : null,
+        user ? String(user).trim() : null
       ];
 
   await query(sql, params);
@@ -205,20 +253,23 @@ async function saveExpense({ ownerId, date, item, amount, store, jobName, catego
 }
 
 async function deleteExpense(ownerId, criteria) {
-  // Note: your table no longer has item/store, so delete by description/source/amount_cents
   try {
+    const ownerParam = String(ownerId || '').trim();
     const amountCents = toCents(criteria.amount);
+    const description = String(criteria.item || '').trim();
+    const source = String(criteria.store || '').trim();
+
     const res = await query(
       `
       delete from transactions
-       where owner_id = $1
+       where owner_id = $1::text
          and kind = 'expense'
          and description = $2
          and amount_cents = $3
          and source = $4
        returning id
       `,
-      [ownerId, String(criteria.item || '').trim(), amountCents, String(criteria.store || '').trim()]
+      [ownerParam, description, amountCents, source]
     );
     return res.rows.length > 0;
   } catch {
@@ -255,7 +306,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
     let pending = await getPendingTransactionState(from);
 
-    // --- Normalize aiErrorHandler pendingCorrection -> pendingExpense ---
+    // Normalize aiErrorHandler pendingCorrection -> pendingExpense
     if (pending?.pendingCorrection && pending?.type === 'expense' && pending?.pendingData) {
       const data = pending.pendingData;
       await setPendingTransactionState(from, {
@@ -266,7 +317,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       pending = await getPendingTransactionState(from);
     }
 
-    // --- Pending confirm/edit/delete flow ---
+    // (Optional) You can support awaitingExpenseClarification here later if your AI asks for date/vendor, etc.
+    // For now, your deterministic expense parse already fills date today, so this is usually unnecessary.
+
+    // Pending confirm/edit/delete flow
     if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
       if (!isOwner) {
         await deletePendingTransactionState(from);
@@ -275,13 +329,14 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const lc = input.toLowerCase().trim();
+      const stableMsgId = pending.expenseSourceMsgId || msgId;
 
       if (lc === 'yes' && pending.pendingExpense) {
         const data = pending.pendingExpense;
         const category = data.suggestedCategory || await categorizeEntry('expense', data, ownerProfile);
-        const jobName = await getActiveJob(ownerId) || 'Uncategorized';
+        const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || 'Uncategorized';
 
-        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: (pending.expenseSourceMsgId || msgId) });
+        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: stableMsgId });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
         const result = await saveExpense({
@@ -292,8 +347,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           store: data.store,
           jobName,
           category,
-          user: userProfile.name || 'Unknown User',
-          sourceMsgId: (pending.expenseSourceMsgId || msgId)
+          user: userProfile?.name || 'Unknown User',
+          sourceMsgId: stableMsgId
         });
 
         reply = (result && result.inserted === false)
@@ -315,11 +370,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       if (lc === 'edit') {
-        await setPendingTransactionState(from, {
-          ...pending,
-          isEditing: true,
-          type: 'expense'
-        });
+        await setPendingTransactionState(from, { ...pending, isEditing: true, type: 'expense' });
         reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
         return `<Response><Message>${reply}</Message></Response>`;
       }
@@ -356,7 +407,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     if (m) {
       const [, amount, item, store] = m;
       const date = new Date().toISOString().split('T')[0];
-      const jobName = await getActiveJob(ownerId) || 'Uncategorized';
+      const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || 'Uncategorized';
       const data = { date, item, amount: `$${parseFloat(amount).toFixed(2)}`, store: store || 'Unknown Store' };
       const category = await categorizeEntry('expense', data, ownerProfile);
 
@@ -371,7 +422,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         store: data.store,
         jobName,
         category,
-        user: userProfile.name || 'Unknown User',
+        user: userProfile?.name || 'Unknown User',
         sourceMsgId: msgId
       });
 
@@ -392,7 +443,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     );
 
     if (aiReply) {
-      // IMPORTANT: do NOT set revenue fields here; this is expense.
       await setPendingTransactionState(from, {
         pendingExpense: null,
         awaitingExpenseClarification: true,
@@ -410,7 +460,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       data.suggestedCategory = category;
 
       if (confirmed && !errors) {
-        const jobName = await getActiveJob(ownerId) || 'Uncategorized';
+        const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || 'Uncategorized';
 
         const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
@@ -423,7 +473,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           store: data.store,
           jobName,
           category,
-          user: userProfile.name || 'Unknown User',
+          user: userProfile?.name || 'Unknown User',
           sourceMsgId: msgId
         });
 

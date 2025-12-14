@@ -1,0 +1,124 @@
+CHIEFOS MVP EXECUTION CONTRACT
+Status: LOCKED ON APPROVAL
+Audience: Product, Engineering, Security, Investors
+Purpose: Define the smallest enforceable slice of ChiefOS that must work end-to-end to deliver the MVP magic moment without eroding trust, privacy, or system integrity.
+
+1) MVP GOAL (NON-NEGOTIABLE)
+Within 5–10 minutes, a business owner can:
+1. Upload messy, real business data
+2. Stream a few real activities via WhatsApp
+3. Ask an unscripted question about their business
+4. Receive either:
+   - a truthful, grounded answer based only on ingested data, or
+   - an explicit admission of missing or insufficient data
+
+If the system answers confidently without sufficient data, the MVP has failed.
+Trust is the product.
+
+2) CORE PRINCIPLES (ENFORCED, NOT ASPIRATIONAL)
+2.1 One Mind, Many Senses
+- Exactly ONE reasoning interface (Chief) per business
+- Unlimited ingestion identities (employees, contractors)
+- No multi-user chat
+- No reasoning in ingestion channels
+
+2.2 Separation of Duties
+- Ingestion captures facts only
+- Chief performs all reasoning, explanations, and summaries
+- Ingestion channels may confirm what was recorded, nothing more
+
+2.3 Trust Over Cleverness
+- No data fabrication
+- No inferred facts without explicit labeling
+- Missing data must be stated clearly
+- Uncertainty is surfaced, not hidden
+
+2.4 Privacy & Security by Default
+- Strict tenant isolation
+- Least-privilege ingestion identities
+- Full audit trail on every mutation
+- No cross-tenant reasoning or retrieval
+
+3) MVP SYSTEM BOUNDARIES
+3.1 Included in MVP
+
+A) Ingestion Layer (The Senses)
+- WhatsApp (Twilio)
+  - Text messages
+  - Images (receipts)
+- Document upload (PDFs, images, spreadsheets)
+
+Ingestion responsibilities:
+- Normalize input
+- Produce Canonical Intermediate Language (CIL)
+- Persist records
+- Return confirmation with record IDs
+
+B) Chief (The Brain)
+- Single web interface (owner only)
+- Read-only advisory mode
+- Unscripted natural-language questions
+- Tool-based reasoning only
+
+3.2 Explicitly Out of Scope (MVP)
+Not allowed in MVP, even if “easy”:
+- Multi-user reasoning or chat
+- Employee questions or analytics
+- Forecasting or projections
+- AI suggestions without data grounding
+- Auto-actions (sending invoices, moving money)
+- Broad dashboards or KPI libraries
+- Integrations beyond WhatsApp + uploads
+
+4) THE MVP MAGIC MOMENT (TESTABLE)
+The MVP must pass this real-world test:
+1. Owner uploads 10–30 real business files (receipts, invoices, spreadsheets)
+2. Owner or employee sends 5–10 WhatsApp messages (expenses, time, notes)
+3. Owner asks Chief:
+   - “Which jobs are making me money?” or
+   - “Why does cash feel tight this month?”
+4. Chief responds with:
+   - A structured explanation grounded only in ingested records
+   - Explicit assumptions and data gaps
+   - Zero hallucinated facts
+
+If this cannot be demoed reliably, the MVP is incomplete.
+
+5) DATA TRUST GUARANTEE
+Chief may only reason over:
+- Uploaded documents
+- WhatsApp-ingested activity
+- Explicit owner input
+
+Chief must not:
+- Use priors about “typical businesses”
+- Infer totals without complete data
+- Smooth over missing information
+
+Required pattern when data is insufficient:
+“I don’t have enough data to answer that yet. Here’s what’s missing…”
+
+6) TECHNICAL ENFORCEMENTS (MVP MINIMUM)
+Build-blocking requirements:
+- Idempotent ingestion (source_msg_id)
+- Postgres with strict Row Level Security (owner_id)
+- Append-only audit table
+- Canonical Intermediate Language (CIL) for all ingress
+- Tool-only reasoning (no free-text DB access)
+- Provider-agnostic LLM abstraction
+- Rate limits and per-tenant budgets
+
+7) SUCCESS CRITERIA
+MVP is successful when:
+- Owners trust answers more than dashboards
+- The system refuses to answer when it should
+- Engineers cannot accidentally break trust guarantees
+- The product feels boringly correct, not impressively clever
+
+8) LOCK STATEMENT
+Once approved, this Execution Contract:
+- Cannot be overridden by engineering shortcuts
+- Cannot be expanded without explicit re-approval
+- Serves as the source of truth for scope disputes
+
+ChiefOS MVP builds understanding — not features.

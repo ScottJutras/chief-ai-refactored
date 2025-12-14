@@ -9,7 +9,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
-    "test": "jest tests",
+    "db:bootstrap": "docker exec -i chief-db-1 psql -U sherpa -d sherpa_test < scripts/bootstrap-local-db.sql",
+    "test": "jest",
     "worker:kpi": "node services/kpiWorker.js",
     "sql": "node scripts/runSql.js",
     "ingest:rag": "node scripts/ingestRAG.js data/rag/contractor_terms.csv"
@@ -43,7 +44,6 @@
     "papaparse": "^5.5.2",
     "pdf-parse": "^2.4.5",
     "pdfkit": "^0.16.0",
-    "pg": "^8.16.3",
     "pgvector": "^0.2.1",
     "recharts": "^3.4.1",
     "serve-favicon": "^2.5.1",
@@ -57,6 +57,8 @@
   },
   "devDependencies": {
     "jest": "^29.7.0",
-    "nodemon": "^3.1.0"
+    "nodemon": "^3.1.0",
+    "pg": "^8.16.3",
+    "supertest": "^7.1.4"
   }
 }

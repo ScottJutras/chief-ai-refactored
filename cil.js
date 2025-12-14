@@ -1,3 +1,4 @@
+// LEGACY CIL (PocketCFO). Do not extend. ChiefOS CIL lives in /src/cil
 // cil.js
 const { z } = require('zod');
 

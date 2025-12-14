@@ -1,9 +1,7 @@
 // index.js
 // Main Express app for Chief AI (webhook + parse + deep-dive + dashboard)
 
-if (!process.env.VERCEL) {
-  require('dotenv').config(); // local only
-}
+require('./config/env');
 
 const express = require('express');
 const cors = require('cors');
@@ -58,9 +56,10 @@ app.use('/deep-dive', deepDiveRouter);
 app.use('/api', dashboardRouter);
 
 /* ---------------- Local dev only ---------------- */
-if (!process.env.VERCEL) {
+if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
 }
+
 
 module.exports = app;

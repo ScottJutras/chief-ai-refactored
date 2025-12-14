@@ -5,6 +5,7 @@
 // ------------------------------------------------------------
 
 const { LLMProvider } = require('../llm');
+const { CHIEF_SYSTEM_PROMPT } = require('../../prompts/chief.system');
 
 // ----- Subscription gate (free/basic can't use Agent) -----
 function canUseAgent(userProfile) {
@@ -229,20 +230,17 @@ async function ask({ from, ownerId, text, topicHints = [], userProfile } = {}) {
 
   const topicPrompt = topic ? `Focus on ${topic}.` : '';
   const seed = [
-    {
-      role: 'system',
-      content: [
-        `You are Chief, a concise CFO and field-ops copilot.`,
-        `When user intent is actionable and details are sufficient:`,
-        ` • Execute via tools; then reply with: "✅ <short confirmation>" (+ IDs when applicable).`,
-        `When details are missing:`,
-        ` • Ask exactly ONE clarifying question (no execution yet).`,
-        `Never say "timeclock error" or generic errors; always give a helpful next step.`,
-        `Prefer short answers. ${topicPrompt}`.trim()
-      ].join('\n')
-    },
-    { role: 'user', content: text }
-  ];
+  {
+    role: 'system',
+    content: `${CHIEF_SYSTEM_PROMPT}
+
+Execution rules:
+- If details are sufficient: use tools, then reply with "✅ <short confirmation>" (+ IDs if relevant).
+- If details are missing: ask exactly ONE clarifying question (do not execute yet).
+- Never dead-end; always offer the next best action.`
+  },
+  { role: 'user', content: text }
+];
 
   try {
     return await runToolsLoop({ llm, seedMessages: seed, ownerId, from });

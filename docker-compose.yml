@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  db:
+    image: postgres:14
+    environment:
+      POSTGRES_PASSWORD: mysecret
+      POSTGRES_USER: sherpa
+      POSTGRES_DB: sherpa_test
+    ports:
+      - 5432:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sherpa"]
+      interval: 10s
+      timeout: 5s
+      retries: 5

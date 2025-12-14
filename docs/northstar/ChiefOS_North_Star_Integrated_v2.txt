@@ -1,0 +1,315 @@
+CHIEFOS — NORTH STAR (INTEGRATED, PRIVACY & SECURITY FIRST)
+Version: v2.0-integrated
+Audience: Product, Engineering, Security, Investors
+Status: Authoritative Compass (Execution + Architecture)
+
+==================================================
+0) MISSION
+==================================================
+
+ChiefOS is a trust-first operating system for small businesses with ONE mind and MANY senses.
+
+ChiefOS consists of:
+- Chief: a single, authoritative reasoning seat (web now, app later) used by the owner/operator.
+- Ingestion Layer (WhatsApp-first): a sensing and recording system used by employees and contractors to stream real-world activity.
+
+ChiefOS ingests text, voice, images, and documents; turns them into structured, auditable records tied to Jobs; and enables CFO-grade questions and explanations grounded only in tenant data.
+
+Understanding, privacy, and correctness come before speed or convenience.
+
+==================================================
+1) NON-NEGOTIABLES (GUARDRAILS)
+==================================================
+
+- One Mind, Many Senses:
+  Exactly ONE reasoning seat per tenant. No multi-user chat. Scaling happens via ingestion identities, not chat seats.
+
+- Separation of Duties:
+  Ingestion identities record facts only. All reasoning, exports, and global insights happen in Chief.
+
+- Latency SLOs:
+  P95 < 1.5s (tasks/timeclock), < 3s (RAG), < 6s (media acknowledgement).
+  Enforced via timeouts and async offloading.
+
+- Reliability:
+  Every inbound message receives a 200/TwiML within 8 seconds.
+  All writes are idempotent and audited.
+
+- Data Isolation:
+  Strict Postgres RLS by owner_id.
+  No cross-tenant joins. No cross-job aggregation outside authorized tools.
+
+- Within-Tenant Least Privilege:
+  Ingestion identities only access records they created or were assigned.
+  No default access to company-wide KPIs, AR, margins, or exports.
+
+- Everything Is a Job:
+  All entities attachable to a Job.
+  If Job is ambiguous, Chief must prompt before persisting.
+
+- LLM Abstraction:
+  All reasoning through Agent Service with schema-validated tools.
+  Provider-agnostic (OpenAI/Grok/mock).
+
+- Cost & Abuse Control:
+  Subscription gates by tier.
+  Per-tenant and per-ingestion-identity rate limits.
+  Daily LLM/token budgets enforced.
+
+- Responsible AI:
+  No fabrication.
+  Explicit uncertainty.
+  Human-in-the-loop for high-stakes actions.
+
+- SOC 2 / Security Ready:
+  Full audit trail on every mutation.
+  Vendor due diligence.
+  Yearly pen tests.
+  Published privacy policy and sub-processor list.
+
+==================================================
+2) CORE USER JOURNEYS
+==================================================
+
+2.1 Capture (Ingestion Layer)
+
+- Text:
+  "clock in @ Roof Repair 7am"
+  "expense $84.12 @ Home Depot for nails job Roof Repair"
+  Normalize -> CIL -> persist -> confirm with ID.
+
+- Voice:
+  Single clip may include customer, materials, labour, price.
+  ASR -> intent extraction -> CIL -> Draft Quote.
+  Reply with summary and actions.
+
+- Image:
+  Receipt photo -> OCR -> Expense CIL.
+  Media stored, linked, auditable.
+
+Ingestion channels confirm only what was recorded.
+They do not answer business-wide questions.
+
+2.2 Operate
+
+- Timeclock:
+  in/out, breaks, drive, overlap guards, approvals, weekly timesheets.
+
+- Tasks:
+  create, assign, complete, delete, reminders.
+
+- Jobs:
+  create, activate, close, move last log, per-job ledger.
+
+- Contracts Flow:
+  Quote -> Contract -> Invoice -> Receipt.
+  PDFs, WhatsApp links, status tracking.
+
+2.3 Ask (Chief Only)
+
+- All CFO reasoning happens in Chief (web/app).
+- Examples:
+  "Which jobs are underwater?"
+  "What changed since last month?"
+- Agent uses tools, cites assumptions, never fabricates.
+
+==================================================
+3) SYSTEM ARCHITECTURE
+==================================================
+
+Ingress:
+  Twilio -> Webhook (Vercel)
+  Signature verification, safety timers.
+
+Router:
+  Express micro-router.
+  Lazy requires.
+  Locks.
+  8s safety replies.
+
+Domain Services:
+  timeclock, tasks, jobs, money, contracts, uploads.
+
+Agent Service:
+  RAG + tools.
+  Provider-agnostic.
+  2s soft timeout with fallback messaging.
+
+Data:
+  Postgres (Supabase) with RLS.
+  Storage (Supabase/GCS) via signed URLs.
+
+Async:
+  Queue + job table.
+  OCR, ASR, PDF, reminders.
+
+Observability:
+  Trace IDs, structured logs, metrics, DLQ, audit table.
+
+Scaling:
+  Serverless-first.
+  Stateless functions.
+  Heavy work async.
+
+==================================================
+4) STATE MACHINES (DRIFT PREVENTION)
+==================================================
+
+Quote:
+  draft -> sent -> accepted | rejected
+
+Contract:
+  draft -> sent -> signed
+
+Invoice:
+  draft -> sent -> paid | overdue
+
+Guards:
+- send requires PDF ready
+- paid requires receipts >= invoice total
+
+Timeclock:
+- no overlapping shifts
+- breaks/drives nested within shifts
+
+==================================================
+5) ERRORS & IDEMPOTENCY
+==================================================
+
+Idempotency:
+  (owner_id, source_msg_id)
+
+Error Envelope:
+{
+  ok: false,
+  error: {
+    code: "PERMISSION_DENIED",
+    message: "Owner-only action",
+    hint: "Ask the owner to perform this action",
+    traceId: "abc123"
+  }
+}
+
+==================================================
+6) CANONICAL INTERMEDIATE LANGUAGE (CIL)
+==================================================
+
+All ingress must produce validated CIL objects.
+Domain services accept CIL only.
+
+Examples include:
+- CreateTask
+- Clock
+- Expense
+- Quote
+
+Amounts in cents.
+ISO datetimes.
+Phones normalized E.164.
+
+==================================================
+7) JOB RESOLUTION STRATEGY
+==================================================
+
+1. Exact name match.
+2. Fuzzy match (prompt user).
+3. Offer job creation.
+4. If none, use active job or ask.
+
+==================================================
+8) RAG DESIGN (COST-SAFE & PRIVATE)
+==================================================
+
+Collections:
+- Global SOPs (static).
+- Tenant Knowledge (owner-scoped).
+- Schemas/Contracts (read-only).
+
+Retriever:
+  Hybrid BM25 + embeddings.
+
+Prompt Rules:
+- Prefer tools.
+- Cite assumptions.
+- Ask clarifying questions if unsure.
+
+Caching:
+  (ownerId, normalized_question) 10–60 min.
+
+==================================================
+9) AGENT TOOLS (MINIMAL v1)
+==================================================
+
+- get_job_kpis
+- list_jobs
+- create_quote
+- persist_expense
+- list_tasks
+
+All tools owner-scoped.
+No raw SQL from LLM.
+
+==================================================
+10) DATA MODEL PRINCIPLES
+==================================================
+
+- Additive-only migrations.
+- Append-only audit.
+- Parsed JSONB for AI enrichments.
+- Materialized views for KPIs.
+
+==================================================
+11) SECURITY MODEL (SOC2-ALIGNED)
+==================================================
+
+- Twilio signature verification (fail closed).
+- Ingestion identity allowlist (phone numbers).
+- Capability-based permissions per identity.
+- Rate limiting per owner and per identity.
+- Encryption at rest and in transit.
+- Immutable audit logs (7-year retention).
+
+==================================================
+12) PRIVACY & RESPONSIBLE AI
+==================================================
+
+- Prompt minimization (structured data preferred).
+- PII redaction in logs/prompts.
+- Default no-training on tenant data.
+- Explicit opt-in for anonymized aggregates.
+- Right-to-erasure respected across systems.
+
+==================================================
+13) DR, BACKUPS, DATA LIFECYCLE
+==================================================
+
+- PITR backups.
+- RPO <= 15 minutes.
+- RTO <= 2 hours.
+- Disaster mode: read-only + Agent disabled.
+- Configurable retention + legal hold.
+
+==================================================
+14) IMPLEMENTATION PRINCIPLES
+==================================================
+
+- Ingestion decoupled from reasoning.
+- Tools before text.
+- Async before blocking.
+- Privacy by default.
+- Trust over cleverness.
+
+==================================================
+FINAL STATEMENT
+==================================================
+
+ChiefOS exists so a business owner can ask:
+"What is really happening in my business?"
+
+And receive an answer that is:
+- grounded in reality
+- explainable
+- private
+- and trustworthy.
+
+Build to this.

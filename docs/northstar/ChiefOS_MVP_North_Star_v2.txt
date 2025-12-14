@@ -1,0 +1,58 @@
+CHIEFOS — MVP NORTH STAR (v2.0)
+Status: LOCKED FOR MVP BUILD
+Audience: Product, Engineering, Investors
+
+1. WHAT CHIEFOS IS (ONE SENTENCE)
+ChiefOS is an AI-native operating system that lets a small business owner upload and stream real business activity, then have a truthful, CFO-level conversation with their business — grounded only in real data.
+
+2. THE CORE PROBLEM
+Small businesses do not lack data.
+They lack understanding.
+
+Their reality is fragmented across receipts, time logs, job notes, invoices, messages, spreadsheets, photos, and voice notes.
+
+Existing software records fragments.
+No system maintains context, explains cause and effect, or helps owners understand what actually matters.
+
+3. THE CHIEFOS SOLUTION
+ChiefOS separates a business into two fundamental layers:
+
+A) Chief (The Brain)
+- A single, authoritative reasoning interface
+- Exactly one seat per business
+- Web-based (and future app-based)
+- Answers questions
+- Explains tradeoffs
+- Maintains long-term business memory
+
+B) The Ingestion Layer (The Senses)
+- How reality enters the system
+- WhatsApp-first in MVP
+- Used by employees, contractors, and operators
+- Captures facts only — no reasoning
+
+ChiefOS does not give everyone a brain.
+It gives the business many senses and one mind.
+
+4. THE MAGIC MOMENT (MVP DEFINITION)
+The MVP magic moment happens when:
+1. A user uploads a folder of messy business files
+2. Streams a few days of real activity via WhatsApp
+3. Asks an unscripted question
+4. Receives an answer that makes them say:
+“Oh shit… it actually understands my business.”
+
+This must happen within 5–10 minutes of first use.
+
+5. DATA TRUST GUARANTEE (NON-NEGOTIABLE)
+Chief must only answer using uploaded documents, ingested activity, and explicit user input.
+If data is missing or ambiguous, Chief must say so.
+Trust is the product.
+
+6. MVP PRODUCT SHAPE
+Exactly one reasoning seat.
+Multiple ingestion inputs.
+No multi-user chat.
+
+7. MVP NORTH STAR STATEMENT
+ChiefOS lets a business owner talk to their business — and actually get answers.

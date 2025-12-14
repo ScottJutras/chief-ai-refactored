@@ -1,12 +1,38 @@
-# never commit these
-**/node_modules/
+# Node
 node_modules/
-.env*
-.DS_Store
-*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+dist/
+build/
 .vercel/
+.next/
+out/
+
+# Local environment files
+.env
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Continue.dev
+.continue/
+continue.log
+
+# VS Code
 .vscode/
-legacy/
-scripts/
-tests/
-?????????????????????????????????????
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+.DS_Store
+
+# Dashboard app
+dashboard/node_modules/
+dashboard/dist/
+dashboard/build/

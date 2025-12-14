@@ -141,41 +141,32 @@ router.post('*', async (req, res, next) => {
     const bodyText = String(req.body?.Body || '').trim();
 
     const result = await handleMedia(
-      req.from,             // normalized phone
-      bodyText,             // any caption text
-      req.userProfile || {},// profile from middleware
-      req.ownerId,          // owner id (UUID after mapping)
+      req.from,
+      bodyText,
+      req.userProfile || {},
+      req.ownerId,
       url,
       type
     );
 
-    // Case 1: TwiML string
     if (typeof result === 'string' && result && !res.headersSent) {
-      return res
-        .status(200)
-        .type('application/xml; charset=utf-8')
-        .send(result);
+      return res.status(200).type('application/xml; charset=utf-8').send(result);
     }
 
-    // Case 2: object with transcript → push into text pipeline
     if (result && typeof result === 'object' && result.transcript) {
-      req.body.Body = result.transcript;  // overwrite with STT text
-      return next();                      // continue into text routing
+      req.body.Body = result.transcript;
+      return next();
     }
 
-    // If handleMedia chose not to respond, fall through to text routing
     return next();
   } catch (e) {
     console.error('[MEDIA] error:', e?.message);
-    if (!res.headersSent) {
-      return ok(res, 'Media processed.');
-    }
+    if (!res.headersSent) return ok(res, 'Media processed.');
   }
 });
 
 // ---------- Main text router (tasks / jobs / timeclock / agent) ----------
 router.post('*', async (req, res, next) => {
-  // Map phone → UUID owner id as early as possible (for CIL/domain)
   if (!req.ownerId || /^[0-9]+$/.test(String(req.ownerId))) {
     try {
       const mapped = await getOwnerUuidForPhone(req.from);
@@ -186,8 +177,6 @@ router.post('*', async (req, res, next) => {
   }
 
   try {
-    // 1) If this user has a pending *media* flow, let handlers/media.js
-    // resolve the "yes/no/today/this week…" reply first.
     const pending = await getPendingTransactionState(req.from);
     const hasPendingMedia = pending && pending.pendingMedia;
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
@@ -199,25 +188,18 @@ router.post('*', async (req, res, next) => {
         bodyText,
         req.userProfile || {},
         req.ownerId,
-        null, // no mediaUrl
-        null  // no mediaType
+        null,
+        null
       );
 
       if (result) {
-        // case 1: handleMedia returned a full TwiML response string
         if (typeof result === 'string' && !res.headersSent) {
-          return res
-            .status(200)
-            .type('application/xml; charset=utf-8')
-            .send(result);
+          return res.status(200).type('application/xml; charset=utf-8').send(result);
         }
 
-        // case 2: handleMedia returned transcript only → allow task/job/timeclock/agent to continue
         if (result.transcript && !result.twiml) {
           req.body.Body = result.transcript;
-          // Fall through into the existing logic below
         } else {
-          // Did something, but didn't return explicit XML, so stop
           return;
         }
       }
@@ -227,14 +209,59 @@ router.post('*', async (req, res, next) => {
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();
 
+    // Canonical idempotency key for ingestion (Twilio)
+    const messageSid =
+      String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() ||
+      `${req.from}:${Date.now()}`;
+
+    // --- EXPENSE FAST PATH (TwiML-returning handler) -------------------------
+    // NOTE: expense handler returns TwiML string; we must res.send it here.
+    const looksExpense = /^(?:expense|exp)\b/.test(lc);
+    if (looksExpense) {
+      try {
+        const { handleExpense } = require('../handlers/commands/expense');
+        const twiml = await handleExpense(
+          req.from,
+          text,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] expense handler failed:', e?.message);
+        // fall through
+      }
+    }
+// --- REVENUE FAST PATH (TwiML-returning handler) -------------------------
+// Keep strict for now: only run when message starts with "revenue" or "received"
+const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
+if (looksRevenue) {
+  try {
+    const { handleRevenue } = require('../handlers/commands/revenue');
+    const twiml = await handleRevenue(
+      req.from,
+      text,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid
+    );
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+    // fall through
+  }
+}
+
     // --- SPECIAL: "How did the XYZ job do?" → job KPIs ---
     if (/how\b.*\bjob\b/.test(lc)) {
       try {
         const { handleJobInsights } = require('../handlers/commands/job_insights');
-        const msg = await handleJobInsights({
-          ownerId: req.ownerId,
-          text,
-        });
+        const msg = await handleJobInsights({ ownerId: req.ownerId, text });
 
         return res
           .status(200)
@@ -242,7 +269,6 @@ router.post('*', async (req, res, next) => {
           .send(`<Response><Message>${msg}</Message></Response>`);
       } catch (e) {
         console.error('[WEBHOOK] job_insights failed:', e?.message);
-        // fall through to normal handlers/agent if something blows up
       }
     }
 
@@ -258,9 +284,7 @@ router.post('*', async (req, res, next) => {
 
     const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc);
 
-    let looksTask =
-      /^task\b/.test(lc) ||
-      /\btasks?\b/.test(lc);
+    let looksTask = /^task\b/.test(lc) || /\btasks?\b/.test(lc);
 
     let looksJob =
       /\b(?:job|jobs)\b/.test(lc) ||
@@ -270,8 +294,7 @@ router.post('*', async (req, res, next) => {
       /\b(list|create|start|activate|pause|resume|finish)\s+job\b/.test(lc) ||
       /\bmove\s+last\s+log\s+to\b/.test(lc);
 
-    let looksTime =
-      /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc);
+    let looksTime = /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc);
 
     let looksKpi = /^kpis?\s+for\b/.test(lc);
 
@@ -279,11 +302,7 @@ router.post('*', async (req, res, next) => {
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc)) looksTime = true;
     if (askingHow && /\bjobs?\b/.test(lc)) looksJob = true;
 
-    const topicHints = [
-      looksTask ? 'tasks' : null,
-      looksJob ? 'jobs' : null,
-      looksTime ? 'timeclock' : null,
-    ].filter(Boolean);
+    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(Boolean);
 
     const SOP = {
       tasks:
@@ -309,40 +328,15 @@ router.post('*', async (req, res, next) => {
     };
 
     const cmds = require('../handlers/commands');
-    const tasksHandler =
-      cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
-    const { handleJob } =
-      cmds.job || require('../handlers/commands/job');
-    const handleTimeclock =
-      cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
+    const tasksHandler = cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
+    const { handleJob } = cmds.job || require('../handlers/commands/job');
+    const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
 
+    // 4) Try explicit handlers first (BOOLEAN-handled style)
+    if (tasksHandler && await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
+    if (handleTimeclock && await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
+    if (handleJob && await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
 
-    // 4) Try explicit handlers first
-    if (tasksHandler &&
-        await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) {
-      return;
-    }
-
-    if (handleTimeclock &&
-        await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) {
-      return;
-    }
-
-    if (handleJob &&
-        await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) {
-      return;
-    }
-
-    // 5) Agent fallback (pass topicHints so Chief knows what to look up)
-    const { ask } = require('../services/agent');
-    const answer = await ask({
-      from: req.from,
-      ownerId: req.ownerId,
-      text,
-      topicHints,
-    });
-
-    
     // --- Forecast (fast path; no ctx object) ---------------------------------
     if (/^forecast\b/i.test(lc)) {
       const handled = await handleForecast({
@@ -407,9 +401,7 @@ router.post('*', async (req, res, next) => {
     if (looksTask && typeof tasksHandler === 'function') {
       const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
-        let msg = (typeof out === 'string' && out.trim())
-          ? out.trim()
-          : (askingHow ? SOP.tasks : 'Task handled.');
+        let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.tasks : 'Task handled.');
         msg += await glossaryNudgeFrom(text);
         return ok(res, msg);
       }
@@ -420,9 +412,7 @@ router.post('*', async (req, res, next) => {
     if (looksJob && typeof handleJob === 'function') {
       const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
-        let msg = (typeof out === 'string' && out.trim())
-          ? out.trim()
-          : (askingHow ? SOP.jobs : 'Job handled.');
+        let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.jobs : 'Job handled.');
         msg += await glossaryNudgeFrom(text);
         return ok(res, msg);
       }
@@ -433,9 +423,7 @@ router.post('*', async (req, res, next) => {
     if (looksTime && typeof handleTimeclock === 'function') {
       const out = await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
-        let msg = (typeof out === 'string' && out.trim())
-          ? out.trim()
-          : (askingHow ? SOP.timeclock : 'Time logged.');
+        let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.timeclock : 'Time logged.');
         msg += await glossaryNudgeFrom(text);
         return ok(res, msg);
       }

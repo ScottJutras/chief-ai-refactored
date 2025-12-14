@@ -1,0 +1,36 @@
+CHIEFOS — NORTH STAR (FINISHED PRODUCT v2.0)
+Status: Canonical Vision Document
+Audience: Product, Engineering, Investors, Operators
+
+1. WHAT CHIEFOS IS (ONE SENTENCE)
+ChiefOS is an AI-native operating system that lets a business owner have an ongoing, truthful, CFO-level conversation with their business — grounded entirely in their real data.
+
+2. THE CORE INSIGHT
+Businesses do not fail because they lack tools.
+They fail because no system truly understands them.
+
+Traditional software records transactions and shows dashboards.
+ChiefOS builds understanding, maintains memory, and explains cause and effect.
+
+3. THE CHIEFOS PROMISE
+ChiefOS never invents data, hides uncertainty, or prioritizes confidence over correctness.
+Trust is the product.
+
+4. THE MENTAL MODEL
+One business.
+One mind.
+Many senses.
+
+5. THE TWO CORE SYSTEMS
+Chief: one reasoning seat, full context, advisory only.
+Ingestion Layer: many inputs, no reasoning, continuous reality capture.
+
+6. THE MAGIC MOMENT
+The owner can ask any question about the business and trust the answer.
+
+7. SUCCESS
+ChiefOS changes how owners think about their business.
+It becomes irreplaceable.
+
+8. FINAL NORTH STAR
+ChiefOS lets you sit down and talk to your business — and get answers you can actually trust.

@@ -253,6 +253,19 @@ if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
   }
 }
 
+// Pending AI correction follow-ups from aiErrorHandler (pendingData/type)
+if (pending?.pendingCorrection && pending?.type === 'revenue') {
+  const { handleRevenue } = require('../handlers/commands/revenue');
+  const twiml = await handleRevenue(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
+  return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+}
+
+if (pending?.pendingCorrection && pending?.type === 'expense') {
+  const { handleExpense } = require('../handlers/commands/expense');
+  const twiml = await handleExpense(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
+  return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+}
+
 // --- REVENUE FAST PATH (TwiML-returning handler) -------------------------
 // Keep strict for now: only run when message starts with "revenue" or "received"
 const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);

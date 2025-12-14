@@ -13,29 +13,92 @@ const {
 } = require('../../utils/aiErrorHandler');
 const { validateCIL } = require('../../cil');
 
-// Cache whether transactions.source_msg_id exists (you confirmed it does, but keep safe)
+// ---- column presence caches (safe in serverless) ----
 let _hasSourceMsgIdCol = null;
+let _hasAmountCol = null;
+
+async function hasColumn(table, col) {
+  const r = await query(
+    `select 1
+       from information_schema.columns
+      where table_name = $1
+        and column_name = $2
+      limit 1`,
+    [table, col]
+  );
+  return (r?.rows?.length || 0) > 0;
+}
+
 async function hasSourceMsgIdColumn() {
   if (_hasSourceMsgIdCol !== null) return _hasSourceMsgIdCol;
   try {
-    const r = await query(
-      `select 1
-         from information_schema.columns
-        where table_name = 'transactions'
-          and column_name = 'source_msg_id'
-        limit 1`
-    );
-    _hasSourceMsgIdCol = (r?.rows?.length || 0) > 0;
+    _hasSourceMsgIdCol = await hasColumn('transactions', 'source_msg_id');
   } catch {
     _hasSourceMsgIdCol = false;
   }
   return _hasSourceMsgIdCol;
 }
 
+async function hasAmountColumn() {
+  if (_hasAmountCol !== null) return _hasAmountCol;
+  try {
+    _hasAmountCol = await hasColumn('transactions', 'amount');
+  } catch {
+    _hasAmountCol = false;
+  }
+  return _hasAmountCol;
+}
+
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
   if (!Number.isFinite(n)) return null;
   return Math.round(n * 100);
+}
+
+function toDollars(amountStr) {
+  const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function todayInTimeZone(tz) {
+  try {
+    const dtf = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    });
+    return dtf.format(new Date()); // YYYY-MM-DD
+  } catch {
+    return new Date().toISOString().split('T')[0];
+  }
+}
+
+function parseNaturalDate(s, tz) {
+  const t = String(s || '').trim().toLowerCase();
+  const today = todayInTimeZone(tz);
+
+  if (!t || t === 'today') return today;
+
+  if (t === 'yesterday') {
+    const d = new Date(`${today}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 1);
+    return d.toISOString().split('T')[0];
+  }
+
+  if (t === 'tomorrow') {
+    const d = new Date(`${today}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().split('T')[0];
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+
+  const parsed = Date.parse(s);
+  if (!Number.isNaN(parsed)) return new Date(parsed).toISOString().split('T')[0];
+
+  return null;
 }
 
 /**
@@ -72,7 +135,7 @@ function buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, 
 function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   try {
     const cil = buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
-    validateCIL(cil); // payment is now supported in schema.js
+    validateCIL(cil);
     return { ok: true, cil };
   } catch {
     return {
@@ -85,26 +148,92 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 /**
  * Persist to your actual transactions table:
  * columns: owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at
+ * (and amount, if present)
  */
 async function saveRevenue({ ownerId, date, description, amount, source, jobName, category, user, sourceMsgId }) {
   const amountCents = toCents(amount);
   if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
 
   const canUseMsgId = await hasSourceMsgIdColumn();
+  const canUseAmount = await hasAmountColumn();
+  const amountDollars = toDollars(amount);
 
   if (canUseMsgId) {
-    // Requires a partial unique index like:
-    // ON transactions(owner_id, source_msg_id) WHERE kind='revenue'
-    const res = await query(
+    const sql = canUseAmount
+      ? `
+        insert into transactions
+          (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, source_msg_id, created_at)
+        values
+          ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, $10, now())
+        on conflict do nothing
+        returning id
       `
+      : `
+        insert into transactions
+          (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at)
+        values
+          ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
+        on conflict do nothing
+        returning id
+      `;
+
+    const params = canUseAmount
+      ? [
+          ownerId,
+          date,
+          String(description || '').trim() || 'Unknown',
+          amountCents,
+          amountDollars,
+          String(source || '').trim() || 'Unknown',
+          String(jobName || '').trim() || null,
+          String(category || '').trim() || null,
+          String(user || '').trim() || null,
+          String(sourceMsgId || '').trim()
+        ]
+      : [
+          ownerId,
+          date,
+          String(description || '').trim() || 'Unknown',
+          amountCents,
+          String(source || '').trim() || 'Unknown',
+          String(jobName || '').trim() || null,
+          String(category || '').trim() || null,
+          String(user || '').trim() || null,
+          String(sourceMsgId || '').trim()
+        ];
+
+    const res = await query(sql, params);
+    if (!res.rows.length) return { inserted: false };
+    return { inserted: true, id: res.rows[0].id };
+  }
+
+  const sql = canUseAmount
+    ? `
       insert into transactions
-        (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at)
+        (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, created_at)
       values
         ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
-      on conflict do nothing
-      returning id
-      `,
-      [
+    `
+    : `
+      insert into transactions
+        (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, created_at)
+      values
+        ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, now())
+    `;
+
+  const params = canUseAmount
+    ? [
+        ownerId,
+        date,
+        String(description || '').trim() || 'Unknown',
+        amountCents,
+        amountDollars,
+        String(source || '').trim() || 'Unknown',
+        String(jobName || '').trim() || null,
+        String(category || '').trim() || null,
+        String(user || '').trim() || null
+      ]
+    : [
         ownerId,
         date,
         String(description || '').trim() || 'Unknown',
@@ -112,34 +241,10 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
         String(source || '').trim() || 'Unknown',
         String(jobName || '').trim() || null,
         String(category || '').trim() || null,
-        String(user || '').trim() || null,
-        String(sourceMsgId || '').trim()
-      ]
-    );
+        String(user || '').trim() || null
+      ];
 
-    if (!res.rows.length) return { inserted: false };
-    return { inserted: true, id: res.rows[0].id };
-  }
-
-  await query(
-    `
-    insert into transactions
-      (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, created_at)
-    values
-      ($1, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, now())
-    `,
-    [
-      ownerId,
-      date,
-      String(description || '').trim() || 'Unknown',
-      amountCents,
-      String(source || '').trim() || 'Unknown',
-      String(jobName || '').trim() || null,
-      String(category || '').trim() || null,
-      String(user || '').trim() || null
-    ]
-  );
-
+  await query(sql, params);
   return { inserted: true };
 }
 
@@ -151,15 +256,53 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
   try {
     const defaultData = {
-      date: new Date().toISOString().split('T')[0],
+      date: todayInTimeZone(userProfile?.timezone || userProfile?.tz || 'UTC'),
       description: 'Unknown',
       amount: '$0.00',
       source: 'Unknown'
     };
 
-    const pending = await getPendingTransactionState(from);
+    let pending = await getPendingTransactionState(from);
 
-    // CONFIRM FLOW
+    // --- Normalize aiErrorHandler pendingCorrection -> pendingRevenue ---
+    if (pending?.pendingCorrection && pending?.type === 'revenue' && pending?.pendingData) {
+      const data = pending.pendingData;
+      await setPendingTransactionState(from, {
+        ...pending,
+        pendingRevenue: data,
+        pendingCorrection: false
+      });
+      pending = await getPendingTransactionState(from);
+    }
+
+    // --- Follow-up for "AI asked a question" (date, etc.) ---
+    if (pending?.awaitingRevenueClarification) {
+      const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
+      const maybeDate = parseNaturalDate(input, tz);
+
+      if (maybeDate) {
+        const draft = pending.revenueDraftText || '';
+        const parsed = parseRevenueMessage(draft) || {};
+        const merged = {
+          ...parsed,
+          date: maybeDate
+        };
+
+        await setPendingTransactionState(from, {
+          ...pending,
+          pendingRevenue: merged,
+          awaitingRevenueClarification: false
+        });
+
+        reply = `Please confirm: Payment ${merged.amount} from ${merged.source} on ${merged.date}. Reply yes/edit/cancel.`;
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      reply = `What date was this payment? (e.g., 2025-12-12 or "today")`;
+      return `<Response><Message>${reply}</Message></Response>`;
+    }
+
+    // --- CONFIRM FLOW ---
     if (pending?.pendingRevenue) {
       if (!isOwner) {
         await deletePendingTransactionState(from);
@@ -174,7 +317,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         const category = data.suggestedCategory || await categorizeEntry('revenue', data, ownerProfile);
         const jobName = await getActiveJob(ownerId) || 'Uncategorized';
 
-        const gate = assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
+        const gate = assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: (pending.revenueSourceMsgId || msgId) });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
         const result = await saveRevenue({
@@ -186,7 +329,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           jobName,
           category,
           user: userProfile.name || 'Unknown User',
-          sourceMsgId: msgId
+          sourceMsgId: (pending.revenueSourceMsgId || msgId)
         });
 
         reply = (result.inserted === false)
@@ -197,19 +340,17 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      if (lcInput === 'edit' || lcInput === 'no') {
-  await setPendingTransactionState(from, {
-    pendingRevenue: pending.pendingRevenue,
-    isEditing: true,
-    type: 'revenue'
-  });
-  reply = '✏️ Okay — resend the revenue in one line (e.g., "revenue $100 from John").';
-  return `<Response><Message>${reply}</Message></Response>`;
-}
+      if (lcInput === 'edit') {
+        await setPendingTransactionState(from, {
+          ...pending,
+          isEditing: true,
+          type: 'revenue'
+        });
+        reply = '✏️ Okay — resend the revenue in one line (e.g., "revenue $100 from John today").';
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
 
-
-
-      if (lcInput === 'cancel') {
+      if (lcInput === 'cancel' || lcInput === 'no') {
         await deletePendingTransactionState(from);
         reply = '❌ Payment cancelled.';
         return `<Response><Message>${reply}</Message></Response>`;
@@ -219,7 +360,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // AI PARSE PATH
+    // --- AI PARSE PATH ---
     const { data, reply: aiReply, confirmed } = await handleInputWithAI(
       from,
       input,
@@ -227,13 +368,25 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       parseRevenueMessage,
       defaultData
     );
-    if (aiReply) return `<Response><Message>${aiReply}</Message></Response>`;
+
+    if (aiReply) {
+      await setPendingTransactionState(from, {
+        pendingRevenue: null,
+        awaitingRevenueClarification: true,
+        revenueClarificationPrompt: aiReply,
+        revenueDraftText: input,
+        revenueSourceMsgId: msgId,
+        type: 'revenue'
+      });
+      return `<Response><Message>${aiReply}</Message></Response>`;
+    }
 
     if (data && data.amount && data.amount !== '$0.00' && data.description && data.source) {
       const errors = await detectErrors(data, 'revenue');
       const category = await categorizeEntry('revenue', data, ownerProfile);
       data.suggestedCategory = category;
 
+      // If clean + confirmed => write
       if (confirmed && !errors) {
         const jobName = await getActiveJob(ownerId) || 'Uncategorized';
 
@@ -259,26 +412,29 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      // If not confirmed or errors exist, ask confirm (optional — keep simple)
-      await setPendingTransactionState(from, { pendingRevenue: data });
-      reply = `Please confirm: Payment ${data.amount} from ${data.source} (${data.description}). Reply yes/edit/cancel.`;
+      // Otherwise ask confirm
+      await setPendingTransactionState(from, {
+        pendingRevenue: data,
+        revenueSourceMsgId: msgId,
+        type: 'revenue'
+      });
+      reply = `Please confirm: Payment ${data.amount} from ${data.source} on ${data.date}. Reply yes/edit/cancel.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    reply = `🤔 Couldn’t parse a payment from "${input}". Try "revenue $100 from Client".`;
+    reply = `🤔 Couldn’t parse a payment from "${input}". Try "revenue $100 from John today".`;
     return `<Response><Message>${reply}</Message></Response>`;
   } catch (error) {
     console.error(`[ERROR] handleRevenue failed for ${from}:`, error.message);
     reply = '⚠️ Error logging payment. Please try again.';
     return `<Response><Message>${reply}</Message></Response>`;
   } finally {
-  try {
-    // handlers/commands/* -> ../../middleware/lock
-    await require('../../middleware/lock').releaseLock(lockKey);
-  } catch {
-    // If lock middleware isn't available in serverless bundle, never hard-fail
+    try {
+      await require('../../middleware/lock').releaseLock(lockKey);
+    } catch {
+      // never hard-fail
+    }
   }
-}
 }
 
 module.exports = { handleRevenue };

@@ -1,132 +1,64 @@
+// handlers/commands/expense.js
 const { query, getActiveJob } = require('../../services/postgres');
-const { getPendingTransactionState, setPendingTransactionState, deletePendingTransactionState } = require('../../utils/stateManager');
-const { handleInputWithAI, parseExpenseMessage, detectErrors, categorizeEntry } = require('../../utils/aiErrorHandler');
-const { validateCIL } = require('../../cil'); // src/cil/index.js -> exports validateCIL
+const {
+  getPendingTransactionState,
+  setPendingTransactionState,
+  deletePendingTransactionState
+} = require('../../utils/stateManager');
+const {
+  handleInputWithAI,
+  parseExpenseMessage,
+  detectErrors,
+  categorizeEntry
+} = require('../../utils/aiErrorHandler');
+const { validateCIL } = require('../../cil');
 
-/**
- * --- Step 3.4 (DB idempotency) ---
- * We'll attempt to write source_msg_id if the column exists.
- * If it doesn't exist, we fall back to the legacy insert.
- *
- * You SHOULD still add:
- *  - ALTER TABLE transactions ADD COLUMN source_msg_id text;
- *  - CREATE UNIQUE INDEX ... ON transactions(owner_id, source_msg_id) WHERE type='expense';
- */
-
-// Cache whether transactions.source_msg_id exists
+// ---- column presence caches ----
 let _hasSourceMsgIdCol = null;
+let _hasAmountCol = null;
+
+async function hasColumn(table, col) {
+  const r = await query(
+    `select 1
+       from information_schema.columns
+      where table_name = $1
+        and column_name = $2
+      limit 1`,
+    [table, col]
+  );
+  return (r?.rows?.length || 0) > 0;
+}
+
 async function hasSourceMsgIdColumn() {
   if (_hasSourceMsgIdCol !== null) return _hasSourceMsgIdCol;
   try {
-    const r = await query(
-      `select 1
-         from information_schema.columns
-        where table_name = 'transactions'
-          and column_name = 'source_msg_id'
-        limit 1`
-    );
-    _hasSourceMsgIdCol = r?.rows?.length > 0;
+    _hasSourceMsgIdCol = await hasColumn('transactions', 'source_msg_id');
   } catch {
     _hasSourceMsgIdCol = false;
   }
   return _hasSourceMsgIdCol;
 }
 
-async function saveExpense({ ownerId, date, item, amount, store, jobName, category, user, sourceMsgId }) {
-  console.log(`[DEBUG] saveExpense called for ownerId: ${ownerId}`);
-  const amt = parseFloat(String(amount).replace('$', ''));
-
+async function hasAmountColumn() {
+  if (_hasAmountCol !== null) return _hasAmountCol;
   try {
-    const canUseMsgId = await hasSourceMsgIdColumn();
-
-    if (canUseMsgId) {
-      // Idempotent insert (no dupes if Twilio retries)
-      // Requires unique index on (owner_id, source_msg_id) for type='expense'
-      const res = await query(
-        `INSERT INTO transactions (owner_id, type, date, item, amount, store, job_name, category, user_name, source_msg_id, created_at)
-         VALUES ($1, 'expense', $2, $3, $4, $5, $6, $7, $8, $9, NOW())
-         ON CONFLICT DO NOTHING
-         RETURNING id`,
-        [ownerId, date, item, amt, store, jobName, category, user, String(sourceMsgId || '')]
-      );
-
-      // If conflict happened, rows will be empty (already processed)
-      if (!res.rows.length) {
-        console.log(`[DEBUG] saveExpense idempotent no-op (duplicate msg): ${sourceMsgId}`);
-        return { inserted: false };
-      }
-
-      console.log(`[DEBUG] saveExpense success for ${ownerId} id=${res.rows[0].id}`);
-      return { inserted: true, id: res.rows[0].id };
-    }
-
-    // Legacy insert (non-idempotent)
-    await query(
-      `INSERT INTO transactions (owner_id, type, date, item, amount, store, job_name, category, user_name, created_at)
-       VALUES ($1, 'expense', $2, $3, $4, $5, $6, $7, $8, NOW())`,
-      [ownerId, date, item, amt, store, jobName, category, user]
-    );
-    console.log(`[DEBUG] saveExpense success for ${ownerId} (legacy insert)`);
-    return { inserted: true };
-  } catch (error) {
-    console.error(`[ERROR] saveExpense failed for ${ownerId}:`, error.message);
-    throw error;
+    _hasAmountCol = await hasColumn('transactions', 'amount');
+  } catch {
+    _hasAmountCol = false;
   }
+  return _hasAmountCol;
 }
 
-async function deleteExpense(ownerId, criteria) {
-  console.log(`[DEBUG] deleteExpense called for ownerId: ${ownerId}, criteria:`, criteria);
-  try {
-    const res = await query(
-      `DELETE FROM transactions
-       WHERE owner_id = $1 AND type = 'expense' AND item = $2 AND amount = $3 AND store = $4
-       RETURNING *`,
-      [ownerId, criteria.item, parseFloat(String(criteria.amount).replace('$', '')), criteria.store]
-    );
-    console.log(`[DEBUG] deleteExpense result:`, res.rows[0]);
-    return res.rows.length > 0;
-  } catch (error) {
-    console.error(`[ERROR] deleteExpense failed for ${ownerId}:`, error.message);
-    return false;
-  }
-}
-
-async function saveUserProfile(userProfile) {
-  console.log(`[DEBUG] saveUserProfile called for userId: ${userProfile.user_id}`);
-  try {
-    await query(
-      `UPDATE users
-       SET industry = $1, updated_at = NOW()
-       WHERE user_id = $2`,
-      [userProfile.industry, userProfile.user_id]
-    );
-    console.log(`[DEBUG] saveUserProfile success for ${userProfile.user_id}`);
-  } catch (error) {
-    console.error(`[ERROR] saveUserProfile failed for ${userProfile.user_id}:`, error.message);
-    throw error;
-  }
-}
-
-function parseDeleteRequest(input) {
-  const match = input.match(/^delete expense\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
-  if (!match) return { type: null, criteria: null };
-  return {
-    type: 'expense',
-    criteria: {
-      amount: `$${parseFloat(match[1]).toFixed(2)}`,
-      item: match[2].trim(),
-      store: match[3]?.trim() || 'Unknown Store'
-    }
-  };
-}
-
-/**
- * CIL helpers (Step 2.3 gate)
- */
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
   if (!Number.isFinite(n)) return null;
   return Math.round(n * 100);
+}
+
+function toDollars(amountStr) {
+  const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
+  if (!Number.isFinite(n)) return null;
+  return n;
 }
 
 function buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
@@ -163,7 +95,7 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
     const cil = buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
     validateCIL(cil);
     return { ok: true, cil };
-  } catch (e) {
+  } catch {
     return {
       ok: false,
       reply: `⚠️ Couldn't log that expense yet. Try: "expense 84.12 nails from Home Depot".`
@@ -171,14 +103,144 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   }
 }
 
-/**
- * NOTE: handleExpense returns TwiML string.
- * Webhook must res.send() it (which you already fixed).
- */
+async function saveExpense({ ownerId, date, item, amount, store, jobName, category, user, sourceMsgId }) {
+  const amountCents = toCents(amount);
+  if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+
+  const canUseMsgId = await hasSourceMsgIdColumn();
+  const canUseAmount = await hasAmountColumn();
+  const amountDollars = toDollars(amount);
+
+  const description = String(item || '').trim() || 'Unknown';
+  const source = String(store || '').trim() || 'Unknown';
+
+  if (canUseMsgId) {
+    const sql = canUseAmount
+      ? `
+        insert into transactions
+          (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, source_msg_id, created_at)
+        values
+          ($1, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, $10, now())
+        on conflict do nothing
+        returning id
+      `
+      : `
+        insert into transactions
+          (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at)
+        values
+          ($1, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
+        on conflict do nothing
+        returning id
+      `;
+
+    const params = canUseAmount
+      ? [
+          ownerId,
+          date,
+          description,
+          amountCents,
+          amountDollars,
+          source,
+          String(jobName || '').trim() || null,
+          String(category || '').trim() || null,
+          String(user || '').trim() || null,
+          String(sourceMsgId || '').trim()
+        ]
+      : [
+          ownerId,
+          date,
+          description,
+          amountCents,
+          source,
+          String(jobName || '').trim() || null,
+          String(category || '').trim() || null,
+          String(user || '').trim() || null,
+          String(sourceMsgId || '').trim()
+        ];
+
+    const res = await query(sql, params);
+    if (!res.rows.length) return { inserted: false };
+    return { inserted: true, id: res.rows[0].id };
+  }
+
+  const sql = canUseAmount
+    ? `
+      insert into transactions
+        (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, created_at)
+      values
+        ($1, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
+    `
+    : `
+      insert into transactions
+        (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, created_at)
+      values
+        ($1, 'expense', $2::date, $3, $4, $5, $6, $7, $8, now())
+    `;
+
+  const params = canUseAmount
+    ? [
+        ownerId,
+        date,
+        description,
+        amountCents,
+        amountDollars,
+        source,
+        String(jobName || '').trim() || null,
+        String(category || '').trim() || null,
+        String(user || '').trim() || null
+      ]
+    : [
+        ownerId,
+        date,
+        description,
+        amountCents,
+        source,
+        String(jobName || '').trim() || null,
+        String(category || '').trim() || null,
+        String(user || '').trim() || null
+      ];
+
+  await query(sql, params);
+  return { inserted: true };
+}
+
+async function deleteExpense(ownerId, criteria) {
+  // Note: your table no longer has item/store, so delete by description/source/amount_cents
+  try {
+    const amountCents = toCents(criteria.amount);
+    const res = await query(
+      `
+      delete from transactions
+       where owner_id = $1
+         and kind = 'expense'
+         and description = $2
+         and amount_cents = $3
+         and source = $4
+       returning id
+      `,
+      [ownerId, String(criteria.item || '').trim(), amountCents, String(criteria.store || '').trim()]
+    );
+    return res.rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function parseDeleteRequest(input) {
+  const match = input.match(/^delete expense\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
+  if (!match) return { type: null, criteria: null };
+  return {
+    type: 'expense',
+    criteria: {
+      amount: `$${parseFloat(match[1]).toFixed(2)}`,
+      item: match[2].trim(),
+      store: match[3]?.trim() || 'Unknown Store'
+    }
+  };
+}
+
 async function handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
-
-  // Step 3.3: canonical msgId used everywhere
   const msgId = String(sourceMsgId || '').trim() || `${from}:${Date.now()}`;
 
   let reply;
@@ -191,7 +253,20 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       store: 'Unknown Store'
     };
 
-    const pending = await getPendingTransactionState(from);
+    let pending = await getPendingTransactionState(from);
+
+    // --- Normalize aiErrorHandler pendingCorrection -> pendingExpense ---
+    if (pending?.pendingCorrection && pending?.type === 'expense' && pending?.pendingData) {
+      const data = pending.pendingData;
+      await setPendingTransactionState(from, {
+        ...pending,
+        pendingExpense: data,
+        pendingCorrection: false
+      });
+      pending = await getPendingTransactionState(from);
+    }
+
+    // --- Pending confirm/edit/delete flow ---
     if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
       if (!isOwner) {
         await deletePendingTransactionState(from);
@@ -201,16 +276,13 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const lc = input.toLowerCase().trim();
 
-      // CONFIRM EXPENSE
       if (lc === 'yes' && pending.pendingExpense) {
         const data = pending.pendingExpense;
         const category = data.suggestedCategory || await categorizeEntry('expense', data, ownerProfile);
         const jobName = await getActiveJob(ownerId) || 'Uncategorized';
 
-        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
-        if (!gate.ok) {
-          return `<Response><Message>${gate.reply}</Message></Response>`;
-        }
+        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: (pending.expenseSourceMsgId || msgId) });
+        if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
         const result = await saveExpense({
           ownerId,
@@ -221,21 +293,17 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           jobName,
           category,
           user: userProfile.name || 'Unknown User',
-          sourceMsgId: msgId
+          sourceMsgId: (pending.expenseSourceMsgId || msgId)
         });
 
-        // If duplicate, treat as already logged
-        if (result && result.inserted === false) {
-          reply = `✅ Already logged that expense (duplicate message).`;
-        } else {
-          reply = `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${category})`;
-        }
+        reply = (result && result.inserted === false)
+          ? '✅ Already logged that expense (duplicate message).'
+          : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${category})`;
 
         await deletePendingTransactionState(from);
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      // CONFIRM DELETE
       if (lc === 'yes' && pending.pendingDelete?.type === 'expense') {
         const criteria = pending.pendingDelete;
         const success = await deleteExpense(ownerId, criteria);
@@ -246,22 +314,23 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      if (['no', 'cancel'].includes(lc)) {
+      if (lc === 'edit') {
+        await setPendingTransactionState(from, {
+          ...pending,
+          isEditing: true,
+          type: 'expense'
+        });
+        reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      if (lc === 'cancel' || lc === 'no') {
         await deletePendingTransactionState(from);
         reply = '❌ Operation cancelled.';
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      if (lc === 'edit') {
-        await setPendingTransactionState(from, { isEditing: true, type: 'expense' });
-        reply = '✏️ Okay, please resend the correct expense details.';
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
-
-      // fallback confirm prompt
-      reply = pending.pendingExpense
-        ? `Please confirm: Expense ${pending.pendingExpense.amount} for ${pending.pendingExpense.item}\n⚠️ Please reply "yes", "no", or "edit".`
-        : `Please confirm: Delete expense ${pending.pendingDelete.amount} for ${pending.pendingDelete.item}\n⚠️ Please reply "yes", "no", or "edit".`;
+      reply = `⚠️ Please reply "yes", "edit", or "cancel".`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
@@ -278,21 +347,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       await setPendingTransactionState(from, { pendingDelete: { type: 'expense', ...req.criteria } });
-      reply = `Please confirm: Delete expense ${req.criteria.amount} for ${req.criteria.item}? Reply yes/no.`;
-      return `<Response><Message>${reply}</Message></Response>`;
-    }
-
-    // INDUSTRY GATE
-    if (!userProfile.industry) {
-      await setPendingTransactionState(from, { pendingIndustry: true });
-      reply = 'Please provide your industry (e.g., Construction, Freelancer).';
-      return `<Response><Message>${reply}</Message></Response>`;
-    }
-    if (pending?.pendingIndustry) {
-      userProfile.industry = input;
-      await saveUserProfile(userProfile);
-      reply = `Got it, ${userProfile.name}! Industry set to ${input}. Now, let's log that expense.`;
-      await deletePendingTransactionState(from);
+      reply = `Please confirm: Delete expense ${req.criteria.amount} for ${req.criteria.item}? Reply yes/cancel.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
@@ -306,27 +361,23 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const category = await categorizeEntry('expense', data, ownerProfile);
 
       const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
-      if (!gate.ok) {
-        return `<Response><Message>${gate.reply}</Message></Response>`;
-      }
+      if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
       const result = await saveExpense({
         ownerId,
         date,
         item,
         amount: data.amount,
-        store: store || 'Unknown Store',
+        store: data.store,
         jobName,
         category,
         user: userProfile.name || 'Unknown User',
         sourceMsgId: msgId
       });
 
-      if (result && result.inserted === false) {
-        reply = `✅ Already logged that expense (duplicate message).`;
-      } else {
-        reply = `✅ Expense logged: ${data.amount} for ${item} from ${store || 'Unknown Store'} on ${jobName} (Category: ${category})`;
-      }
+      reply = (result && result.inserted === false)
+        ? '✅ Already logged that expense (duplicate message).'
+        : `✅ Expense logged: ${data.amount} for ${item} from ${data.store} on ${jobName} (Category: ${category})`;
 
       return `<Response><Message>${reply}</Message></Response>`;
     }
@@ -339,20 +390,30 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       parseExpenseMessage,
       defaultData
     );
+
     if (aiReply) {
+      // IMPORTANT: do NOT set revenue fields here; this is expense.
+      await setPendingTransactionState(from, {
+        pendingExpense: null,
+        awaitingExpenseClarification: true,
+        expenseClarificationPrompt: aiReply,
+        expenseDraftText: input,
+        expenseSourceMsgId: msgId,
+        type: 'expense'
+      });
       return `<Response><Message>${aiReply}</Message></Response>`;
     }
 
     if (data && data.amount && data.amount !== '$0.00' && data.item && data.store) {
+      const errors = await detectErrors(data, 'expense');
       const category = await categorizeEntry('expense', data, ownerProfile);
+      data.suggestedCategory = category;
 
-      if (confirmed) {
+      if (confirmed && !errors) {
         const jobName = await getActiveJob(ownerId) || 'Uncategorized';
 
         const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
-        if (!gate.ok) {
-          return `<Response><Message>${gate.reply}</Message></Response>`;
-        }
+        if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
         const result = await saveExpense({
           ownerId,
@@ -366,30 +427,35 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           sourceMsgId: msgId
         });
 
-        if (result && result.inserted === false) {
-          reply = `✅ Already logged that expense (duplicate message).`;
-        } else {
-          reply = `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName} (Category: ${category})`;
-        }
+        reply = (result && result.inserted === false)
+          ? '✅ Already logged that expense (duplicate message).'
+          : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName} (Category: ${category})`;
 
         return `<Response><Message>${reply}</Message></Response>`;
       }
+
+      await setPendingTransactionState(from, {
+        pendingExpense: data,
+        expenseSourceMsgId: msgId,
+        type: 'expense'
+      });
+      reply = `Please confirm: Expense ${data.amount} for ${data.item} from ${data.store} on ${data.date}. Reply yes/edit/cancel.`;
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    reply = `🤔 Couldn’t parse an expense from "${input}". Try "expense $100 tools from Home Depot".`;
+    reply = `🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`;
     return `<Response><Message>${reply}</Message></Response>`;
   } catch (error) {
     console.error(`[ERROR] handleExpense failed for ${from}:`, error.message);
     reply = `⚠️ Failed to process expense: ${error.message}`;
     return `<Response><Message>${reply}</Message></Response>`;
   } finally {
-  try {
-    await require('../../middleware/lock').releaseLock(lockKey);
-  } catch {
-    // If lock middleware isn't available in serverless bundle, never hard-fail
+    try {
+      await require('../../middleware/lock').releaseLock(lockKey);
+    } catch {
+      // never hard-fail
+    }
   }
-}
-
 }
 
 module.exports = { handleExpense };

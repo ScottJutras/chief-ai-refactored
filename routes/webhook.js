@@ -216,67 +216,59 @@ router.post('*', async (req, res, next) => {
       String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() ||
       `${req.from}:${Date.now()}`;
 
-    // -----------------------------------------------------------------------
-    // (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
-    // -----------------------------------------------------------------------
-    // Route follow-ups to revenue/expense handlers whenever we are in:
-    // - confirm flow (pendingRevenue/pendingExpense)
-    // - AI clarification flow (awaitingRevenueClarification/awaitingExpenseClarification)
-    // - delete flow (pendingDelete)
-    // - aiErrorHandler correction flow (pendingCorrection + type)
-    //
-    // Important: aiErrorHandler can store pendingData and expects the handler to normalize.
-    // Important: clarification messages like "2025-12-12" MUST go here or they'll fall into menu/agent.
-    const pendingRevenueLike =
-      !!pending?.pendingRevenue ||
-      !!pending?.awaitingRevenueClarification ||
-      (pending?.pendingCorrection && pending?.type === 'revenue');
+   // -----------------------------------------------------------------------
+// (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
+// -----------------------------------------------------------------------
+const isNewRevenueCmd = /^(?:revenue|rev|received)\b/.test(lc);
+const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc);
 
-    if (pendingRevenueLike) {
-      try {
-        const { handleRevenue } = require('../handlers/commands/revenue');
-        const twiml = await handleRevenue(
-          req.from,
-          text,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          // preserve stable idempotency: if handler stored revenueSourceMsgId it will use it;
-          // we still pass messageSid for completeness
-          messageSid
-        );
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-      } catch (e) {
-        console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
-        // fall through (never hard-fail)
-      }
-    }
+const pendingRevenueLike =
+  !!pending?.awaitingRevenueClarification ||
+  (pending?.pendingCorrection && pending?.type === 'revenue') ||
+  (!!pending?.pendingRevenue && !isNewRevenueCmd);
 
-    const pendingExpenseLike =
-      !!pending?.pendingExpense ||
-      !!pending?.awaitingExpenseClarification ||
-      pending?.pendingDelete?.type === 'expense' ||
-      (pending?.pendingCorrection && pending?.type === 'expense');
+const pendingExpenseLike =
+  !!pending?.awaitingExpenseClarification ||
+  pending?.pendingDelete?.type === 'expense' ||
+  (pending?.pendingCorrection && pending?.type === 'expense') ||
+  (!!pending?.pendingExpense && !isNewExpenseCmd);
 
-    if (pendingExpenseLike) {
-      try {
-        const { handleExpense } = require('../handlers/commands/expense');
-        const twiml = await handleExpense(
-          req.from,
-          text,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-      } catch (e) {
-        console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
-        // fall through
-      }
-    }
+if (pendingRevenueLike) {
+  try {
+    const { handleRevenue } = require('../handlers/commands/revenue');
+    const twiml = await handleRevenue(
+      req.from,
+      text,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid
+    );
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
+  }
+}
+
+if (pendingExpenseLike) {
+  try {
+    const { handleExpense } = require('../handlers/commands/expense');
+    const twiml = await handleExpense(
+      req.from,
+      text,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid
+    );
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
+  }
+}
+
 
     // -----------------------------------------------------------------------
     // (B) FAST PATHS — REVENUE/EXPENSE TWI ML HANDLERS

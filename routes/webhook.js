@@ -39,6 +39,27 @@ function canUseAgent(profile) {
   const tier = (profile?.subscription_tier || profile?.plan || '').toLowerCase();
   return !!tier && tier !== 'basic' && tier !== 'free';
 }
+function looksHardCommand(lc) {
+  return (
+    /^(create|new)\s+job\b/.test(lc) ||
+    /^(jobs|list jobs|show jobs)\b/.test(lc) ||
+    /^active\s+job\b/.test(lc) ||
+    /^set\s+active\b/.test(lc) ||
+    /^switch\s+job\b/.test(lc) ||
+    /^task\b/.test(lc) ||
+    /^my\s+tasks\b/.test(lc) ||
+    /^team\s+tasks\b/.test(lc) ||
+    /^done\s*#?\d+/.test(lc) ||
+    /^clock\b/.test(lc) ||
+    /^break\b/.test(lc) ||
+    /^drive\b/.test(lc) ||
+    /^expense\b/.test(lc) ||
+    /^revenue\b/.test(lc)
+  );
+}
+
+
+
 
 // ---------- Raw urlencoded parser (Twilio signature expects original body) ----------
 router.use((req, _res, next) => {

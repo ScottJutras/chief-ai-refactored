@@ -35,7 +35,7 @@ async function listJobs(ownerId) {
     `SELECT
         id,
         job_no,
-        COALESCE(job_name, name) AS job_name,
+        COALESCE(name, job_name) AS job_name,
         status,
         created_at
        FROM public.jobs
@@ -77,6 +77,26 @@ Try starting from WhatsApp with "Hi Chief" so I can link your number.`
 
   const msg = String(text || '').trim();
 
+  // Active job (switch context)
+  if (/^(active\s+job|set\s+active|switch\s+job)\b/i.test(msg)) {
+    const name = msg.replace(/^(active\s+job|set\s+active|switch\s+job)\b/i, '').trim();
+    if (!name) return respond(res, `Which job should I set active? Try: "active job Oak Street"`);
+
+    const j = await pg.activateJobByName(owner, name);
+    const jobName = j?.name || name;
+    const jobNo = j?.job_no ?? '?';
+
+    return respond(
+      res,
+      `✅ Active job set to: "${jobName}" (Job #${jobNo}).
+
+Now you can:
+- "clock in"
+- "expense 84.12 nails"
+- "task - order shingles due tomorrow"`
+    );
+  }
+
   // List jobs
   if (/^(jobs|list jobs|show jobs)\b/i.test(msg)) {
     const reply = await listJobs(owner);
@@ -89,29 +109,49 @@ Try starting from WhatsApp with "Hi Chief" so I can link your number.`
 
     const out = await pg.createJobIdempotent({
       ownerId: owner,
-      jobName: name,
+      name,
       sourceMsgId,
-      status: 'open',
-      active: true,
     });
 
-    const job = out?.job;
-    if (!job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
+    if (!out?.job) {
+      return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
+    }
 
-    const jobName = job.job_name || job.name || name || 'Untitled Job';
-    const jobNo = (job.job_no != null) ? job.job_no : '?';
+    const jobName = out.job.job_name || name || 'Untitled Job';
+    const jobNo = out.job.job_no ?? '?';
 
-    const reply = out.inserted
-      ? `✅ Created job: "${jobName}" (Job #${jobNo}).\n\nNext:\n- Set active: "active job ${jobName}"\n- Log time: "clock in @ ${jobName}"\n- Log expense: "expense 84.12 nails from Home Depot"`
-      : `✅ Already created that job (duplicate message): "${jobName}" (Job #${jobNo}).`;
+    if (out.inserted) {
+      return respond(
+        res,
+        `✅ Created job: "${jobName}" (Job #${jobNo}).
 
-    return respond(res, reply);
+Next:
+- Set active: "active job ${jobName}"
+- Log time: "clock in @ ${jobName}"
+- Log expense: "expense 84.12 nails from Home Depot"`
+      );
+    }
+
+    if (out.reason === 'already_exists') {
+      return respond(
+        res,
+        `✅ That job already exists: "${jobName}" (Job #${jobNo}).
+
+Want to switch to it? Reply: "active job ${jobName}"`
+      );
+    }
+
+    // duplicate Twilio message / retry
+    return respond(
+      res,
+      `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`
+    );
   }
 
   const help = `Job commands you can use:
 
 - "create job Oak Street re-roof"
-- "new job 12 Elm siding"
+- "active job Oak Street re-roof"
 - "list jobs"`;
 
   return respond(res, help);

@@ -1,6 +1,6 @@
 // middleware/pendingAction.js
-// Handles simple "Confirm"/"Cancel" replies for pending actions BEFORE command routing.
-// North Star: clear confirmations, local-time echo, tolerant fallbacks, auditability.
+// Handles confirm/cancel replies + “pending nudge” BEFORE command routing.
+// North Star: clear confirmations, tolerant fallbacks, auditability.
 
 const pg = require('../services/postgres');
 
@@ -8,11 +8,57 @@ function xmlMsg(s = '') {
   const esc = String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   return `<Response><Message>${esc}</Message></Response>`;
 }
+
 const digits = (s='') => String(s || '').replace(/\D/g, '');
 
-const ALLOWED_TYPES = new Set([
-  'clock_in','clock_out','break_start','break_stop','drive_start','drive_stop',
-]);
+// Hard commands we want to allow *even if* something is pending — but we nudge first.
+// Keep this aligned with routes/webhook.js patterns.
+function looksHardCommand(lc) {
+  return (
+    /^(create|new)\s+job\b/.test(lc) ||
+    /^(jobs|list jobs|show jobs)\b/.test(lc) ||
+    /^active\s+job\b/.test(lc) ||
+    /^set\s+active\b/.test(lc) ||
+    /^switch\s+job\b/.test(lc) ||
+    /^task\b/.test(lc) ||
+    /^my\s+tasks\b/.test(lc) ||
+    /^team\s+tasks\b/.test(lc) ||
+    /^done\s*#?\d+/.test(lc) ||
+    /^clock\b/.test(lc) ||
+    /^break\b/.test(lc) ||
+    /^drive\b/.test(lc) ||
+    /^expense\b/.test(lc) ||
+    /^revenue\b/.test(lc)
+  );
+}
+
+function pendingNudgeMessage(pending) {
+  const kind = pending.kind || 'entry';
+
+  // Try to build a short preview from payload
+  let preview = '';
+  try {
+    const raw = pending.payload;
+    const payload = (typeof raw === 'string') ? JSON.parse(raw || '{}') : (raw || {});
+    preview =
+      payload?.preview ||
+      payload?.text ||
+      payload?.taskTitle ||
+      payload?.title ||
+      '';
+  } catch {}
+
+  const line = preview ? `It looks like you still have a pending ${kind}: ${preview}` : `It looks like you still have a pending ${kind}.`;
+
+  return `${line}
+
+Reply:
+- "yes" to submit
+- "edit" to change it
+- "cancel" to discard
+
+Or reply "skip" to leave it pending and continue.`;
+}
 
 // Optional: simple debounce — ignore duplicate confirm within 2 seconds
 function maybeDebounce(req, res) {
@@ -28,6 +74,10 @@ function maybeDebounce(req, res) {
   } catch {}
   return false;
 }
+
+const ALLOWED_TYPES = new Set([
+  'clock_in','clock_out','break_start','break_stop','drive_start','drive_stop',
+]);
 
 function toHumanTime(ts, tz) {
   const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, hour: 'numeric', minute: '2-digit', hour12: true });
@@ -58,24 +108,44 @@ function humanLine(type, target, ts, tz) {
 
 async function pendingActionMiddleware(req, res, next) {
   try {
-    const text = (req.body?.Body || '').trim();
-    if (!/^(confirm|cancel|no)$/i.test(text)) return next();
+    const textRaw = (req.body?.Body || '').trim();
+    const lc = textRaw.toLowerCase();
 
-    if (maybeDebounce(req, res)) return; // fast exit on immediate dup
+    // If user explicitly says skip, let the message flow through without touching pending.
+    if (lc === 'skip') return next();
 
     const from    = req.profile?.from || req.userProfile?.from || req.from;
     const ownerId = digits(req.profile?.ownerId || req.userProfile?.ownerId || req.ownerId || '');
     const tz      = req.profile?.tz || req.userProfile?.tz || 'America/Toronto';
     if (!from || !ownerId) return next();
 
+    // Look up any pending action for this user
     const pending = await pg.getPendingAction({ ownerId, userId: from });
     if (!pending) return next();
 
+    // If user is trying a hard command while something is pending, nudge them.
+    // (But DO NOT block “yes/edit/cancel” which should be handled elsewhere.)
+    const isConfirm = /^(yes|confirm)$/i.test(textRaw);
+    const isCancel  = /^(cancel|no)$/i.test(textRaw);
+    const isEdit    = /^edit$/i.test(textRaw);
+
+    if (!isConfirm && !isCancel && !isEdit && looksHardCommand(lc)) {
+      return res.status(200).type('application/xml').send(xmlMsg(pendingNudgeMessage(pending)));
+    }
+
+    // Only this middleware handles confirm/cancel for the kinds it knows.
+    // If it’s edit, let the normal router handle it (your revenue/expense flow).
+    if (isEdit) return next();
+
+    if (!isConfirm && !isCancel) return next();
+
+    if (maybeDebounce(req, res)) return;
+
     // Cancel
-    if (/^(cancel|no)$/i.test(text)) {
+    if (isCancel) {
       await pg.deletePendingAction(pending.id).catch(() => {});
       console.info('[pending] cancelled', { id: pending.id, ownerId, from });
-      return res.status(200).type('application/xml').send(xmlMsg('Backfill cancelled.'));
+      return res.status(200).type('application/xml').send(xmlMsg('✅ Cancelled.'));
     }
 
     // Confirm
@@ -85,18 +155,16 @@ async function pendingActionMiddleware(req, res, next) {
 
     // Branch: MOVE LAST LOG
     if (pending.kind === 'move_last_log') {
-      const target  = payload?.target;   // employee name (e.g., "Justin")
+      const target  = payload?.target;
       const jobName = payload?.jobName;
       if (!target || !jobName) {
         await pg.deletePendingAction(pending.id).catch(()=>{});
         return res.status(200).type('application/xml').send(xmlMsg('Move failed — missing data.'));
       }
 
-      // Resolve/create target job by name against legacy jobs table (job_no)
-      const j = await pg.ensureJobByName(ownerId, jobName); // returns { job_no, name, is_active }
+      const j = await pg.ensureJobByName(ownerId, jobName);
       const jobNo = j?.job_no;
 
-      // Update the employee's most recent time_entries row to that job_no
       const upd = await pg.query(
         `UPDATE public.time_entries t
             SET job_no = $1
@@ -119,7 +187,6 @@ async function pendingActionMiddleware(req, res, next) {
 
       const moved = upd.rows[0];
       const day = new Date(moved.timestamp).toISOString().slice(0,10);
-      // Touch KPI day (job_id nullable in your table; day still helps worker)
       try { await pg.enqueueKpiTouch(ownerId, null, day); } catch {}
 
       return res.status(200).type('application/xml')

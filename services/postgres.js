@@ -224,6 +224,122 @@ async function enqueueKpiTouch(ownerId, jobId, isoDate) {
 }
 
 
+async function getJobByName(ownerId, name) {
+  const owner = DIGITS(ownerId);
+  const jobName = String(name || '').trim();
+  if (!owner || !jobName) return null;
+
+  const { rows } = await query(
+    `
+    select
+      id,
+      job_no,
+      coalesce(name, job_name) as job_name,
+      source_msg_id
+    from public.jobs
+    where owner_id = $1
+      and (
+        lower(name) = lower($2)
+        or lower(job_name) = lower($2)
+      )
+    order by created_at desc
+    limit 1
+    `,
+    [owner, jobName]
+  );
+
+  return rows[0] || null;
+}
+
+
+async function getJobBySourceMsg(ownerId, sourceMsgId) {
+  const owner = DIGITS(ownerId);
+  const sm = String(sourceMsgId || '').trim();
+  if (!owner || !sm) return null;
+
+  const { rows } = await query(
+    `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
+       from public.jobs
+      where owner_id = $1 and source_msg_id = $2
+      limit 1`,
+    [owner, sm]
+  );
+  return rows[0] || null;
+}
+
+async function createJobIdempotent({ ownerId, name, sourceMsgId }) {
+  const owner = DIGITS(ownerId);
+  const cleanName = String(name || '').trim() || 'Untitled Job';
+  const msgId = String(sourceMsgId || '').trim() || null;
+
+  if (!owner) throw new Error('Missing ownerId');
+
+  // 1) True idempotency by message id
+  if (msgId) {
+    const existingByMsg = await getJobBySourceMsg(owner, msgId);
+    if (existingByMsg) return { inserted: false, job: existingByMsg, reason: 'duplicate_message' };
+  }
+
+  // 2) User-level idempotency: same name already exists
+  const existingByName = await getJobByName(owner, cleanName);
+  if (existingByName) return { inserted: false, job: existingByName, reason: 'already_exists' };
+
+  // 3) Create safely under per-owner lock + explicit job_no
+  return await withClient(async (client) => {
+    await withOwnerAllocLock(owner, client);
+
+    // Re-check under lock (race-safe)
+    if (msgId) {
+      const againMsg = await client.query(
+        `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
+           from public.jobs
+          where owner_id = $1 and source_msg_id = $2
+          limit 1`,
+        [owner, msgId]
+      );
+      if (againMsg.rowCount) return { inserted: false, job: againMsg.rows[0], reason: 'duplicate_message' };
+    }
+
+    const againName = await client.query(
+      `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
+         from public.jobs
+        where owner_id = $1 and lower(coalesce(name, job_name)) = lower($2)
+        limit 1`,
+      [owner, cleanName]
+    );
+    if (againName.rowCount) return { inserted: false, job: againName.rows[0], reason: 'already_exists' };
+
+    const nextNo = await allocateNextJobNo(owner, client);
+
+    try {
+      const ins = await client.query(
+        `insert into public.jobs
+           (owner_id, job_no, job_name, name, status, active, start_date, created_at, updated_at, source_msg_id)
+         values
+           ($1, $2, $3, $3, 'open', true, now(), now(), now(), $4)
+         returning id, job_no, coalesce(name, job_name) as job_name, source_msg_id`,
+        [owner, nextNo, cleanName, msgId]
+      );
+      return { inserted: true, job: ins.rows[0], reason: 'created' };
+    } catch (e) {
+      // If we collided with unique constraints, return the existing job instead of throwing
+      if (e && e.code === '23505') {
+        const fallback = await client.query(
+          `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
+             from public.jobs
+            where owner_id = $1 and lower(coalesce(name, job_name)) = lower($2)
+            order by created_at desc
+            limit 1`,
+          [owner, cleanName]
+        );
+        if (fallback.rowCount) return { inserted: false, job: fallback.rows[0], reason: 'already_exists' };
+      }
+      throw e;
+    }
+  });
+}
+
+
 // Upsert a job by name, deactivate others, and activate this one
 async function activateJobByName(ownerId, rawName) {
   const owner = DIGITS(ownerId);
@@ -1102,12 +1218,18 @@ async function getOwnerCategoryBreakdown(ownerId, fromDate, toDate, kindFilter =
   }));
 }
 
-
-
 // ---- Safe limiter exports (avoid undefined symbol at module.exports time)
 const __checkLimit =
   (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
   (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
+
+function _legacyNotSupported(fnName) {
+  return async () => {
+    throw new Error(
+      `[LEGACY] ${fnName} uses job_id; current schema uses job_no. Do not call this.`
+    );
+  };
+}
 
 module.exports = {
   // ---------- Core ----------
@@ -1149,9 +1271,10 @@ module.exports = {
   activateJobByName,
   resolveJobContext,
   getOrCreateJob,
-  setActiveJob,
-  getActiveJob,
-  moveLastLogToJob,
+
+  setActiveJob: _legacyNotSupported('setActiveJob'),
+  getActiveJob: _legacyNotSupported('getActiveJob'),
+  moveLastLogToJob: _legacyNotSupported('moveLastLogToJob'),
   enqueueKpiTouch,
 
   // ---------- Time ----------

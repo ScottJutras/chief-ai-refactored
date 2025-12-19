@@ -365,27 +365,39 @@ router.post('*', async (req, res, next) => {
 
     // -----------------------------------------------------------------------
     // (B) FAST PATHS — REVENUE/EXPENSE TWI ML HANDLERS
-    // -----------------------------------------------------------------------
-    // Keep strict: only run when message starts with the keyword.
-    const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
-    if (looksRevenue) {
-      try {
-        const { handleRevenue } = require('../handlers/commands/revenue');
-        const twiml = await handleRevenue(
-          req.from,
-          text,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-      } catch (e) {
-        console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-        // fall through
-      }
-    }
+// -----------------------------------------------------------------------
+const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
+if (looksRevenue) {
+  try {
+    const { handleRevenue } = require('../handlers/commands/revenue');
+
+    const timeoutMs = 8000;
+    const timeoutTwiml = `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please reply "yes" again in a few seconds.</Message></Response>`;
+
+    const twiml = await Promise.race([
+      handleRevenue(
+        req.from,
+        text,
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        messageSid
+      ),
+      new Promise(resolve =>
+        setTimeout(() => {
+          console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
+          resolve(timeoutTwiml);
+        }, timeoutMs)
+      )
+    ]);
+
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+    // fall through
+  }
+}
 
     const looksExpense = /^(?:expense|exp)\b/.test(lc);
     if (looksExpense) {

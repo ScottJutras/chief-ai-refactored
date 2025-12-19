@@ -261,18 +261,66 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   }
 }
 
-async function saveRevenue({ ownerId, date, description, amount, source, jobName, category, user, sourceMsgId, from }) {
+async function saveRevenue({
+  ownerId,
+  date,
+  description,
+  amount,
+  source,
+  jobName,
+  category,
+  user,
+  sourceMsgId,
+  from
+}) {
+  // ✅ PROBE 0: prove we entered saveRevenue + show key inputs
+  const ownerParam = String(ownerId || '').trim();
+  const msgParam = String(sourceMsgId || '').trim() || null;
+
+  console.info('[REVENUE] saveRevenue entered', {
+    ownerId: ownerParam,
+    from,
+    sourceMsgId: msgParam,
+    date,
+    amount,
+    jobName
+  });
+
   const amountCents = toCents(amount);
   const amountDollars = toDollars(amount);
 
   if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
   if (!Number.isFinite(amountDollars) || amountDollars <= 0) throw new Error('Invalid amount');
 
-  const ownerParam = String(ownerId || '').trim();
-  const msgParam = String(sourceMsgId || '').trim() || null;
+  // ✅ PROBE 1: isolate hangs in information_schema checks
+  console.info('[REVENUE] saveRevenue pre-hasColumns', { ownerId: ownerParam, sourceMsgId: msgParam });
 
-  const canUseMsgId = await hasSourceMsgIdColumn();
-  const canUseAmount = await hasAmountColumn();
+  const canUseMsgId = await withTimeout(
+    hasSourceMsgIdColumn(),
+    2000,
+    '__HASCOL_TIMEOUT__'
+  );
+  if (canUseMsgId === '__HASCOL_TIMEOUT__') {
+    console.error('[REVENUE] hasSourceMsgIdColumn TIMEOUT', { ownerId: ownerParam, sourceMsgId: msgParam });
+    throw new Error('DB timeout checking columns (source_msg_id)');
+  }
+
+  const canUseAmount = await withTimeout(
+    hasAmountColumn(),
+    2000,
+    '__HASCOL_TIMEOUT__'
+  );
+  if (canUseAmount === '__HASCOL_TIMEOUT__') {
+    console.error('[REVENUE] hasAmountColumn TIMEOUT', { ownerId: ownerParam, sourceMsgId: msgParam });
+    throw new Error('DB timeout checking columns (amount)');
+  }
+
+  console.info('[REVENUE] saveRevenue post-hasColumns', {
+    ownerId: ownerParam,
+    sourceMsgId: msgParam,
+    canUseMsgId,
+    canUseAmount
+  });
 
   const payer = String(source || '').trim() || 'Unknown';
   const job = jobName ? String(jobName).trim() : null;
@@ -326,6 +374,7 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
   const meta = {
     ownerId: ownerParam,
     from,
+    sourceMsgId: msgParam,
     canUseMsgId,
     canUseAmount,
     colsCount: cols.length + 1, // + created_at
@@ -362,6 +411,7 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
     throw e;
   }
 }
+
 
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
@@ -466,18 +516,23 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
   console.info('[REVENUE] post-category', { stableMsgId, category });
   console.info('[REVENUE] pre-insert', { stableMsgId, ownerId, date: data.date, amount: data.amount, jobName });
+  console.info('[REVENUE] pre-gate', { stableMsgId });
 
-  const gate = assertRevenueCILOrClarify({
-    ownerId,
-    from,
-    userProfile,
-    data,
-    jobName,
-    category,
-    sourceMsgId: stableMsgId
-  });
-  if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+const gate = assertRevenueCILOrClarify({
+  ownerId,
+  from,
+  userProfile,
+  data,
+  jobName,
+  category,
+  sourceMsgId: stableMsgId
+});
 
+console.info('[REVENUE] post-gate', { stableMsgId, ok: gate?.ok });
+
+if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+
+console.info('[REVENUE] calling saveRevenue', { stableMsgId });
   // ✅ HARD TIMEOUT AROUND THE DB WRITE (prevents “no reply after yes”)
   const result = await withTimeout(
     saveRevenue({

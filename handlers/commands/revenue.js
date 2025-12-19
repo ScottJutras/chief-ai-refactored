@@ -277,8 +277,6 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
   const payer = String(source || '').trim() || 'Unknown';
   const job = jobName ? String(jobName).trim() : null;
 
-  // NOTE: we do NOT include created_at in cols/vals.
-  // We always set created_at = now() in SQL to avoid mismatched column/value counts.
   const cols = [
     'owner_id',
     'kind',
@@ -303,7 +301,7 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
     amountCents,
     payer,
     job,
-    job, // job_name mirrors job for compatibility
+    job, // job_name mirrors job
     category ? String(category).trim() : null,
     user ? String(user).trim() : null,
     ...(canUseMsgId ? [msgParam] : [])
@@ -311,9 +309,6 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
 
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
 
-  // Use ON CONFLICT only when source_msg_id exists (idempotency).
-  // Because your unique index is partial (WHERE source_msg_id IS NOT NULL),
-  // match it with a conflict target that includes the WHERE clause.
   const sql = canUseMsgId
     ? `
       insert into public.transactions (${cols.join(', ')}, created_at)
@@ -328,14 +323,37 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
       returning id
     `;
 
+  const meta = {
+    ownerId: ownerParam,
+    from,
+    canUseMsgId,
+    canUseAmount,
+    colsCount: cols.length + 1, // + created_at
+    valsCount: vals.length
+  };
+
   try {
-    const res = await query(sql, vals);
+    console.info('[REVENUE] db insert start', meta);
+
+    // HARD TIMEOUT: prevent Twilio/Vercel hang
+    const res = await withTimeout(
+      query(sql, vals),
+      4000, // 4s: keep webhook responsive
+      '__DB_TIMEOUT__'
+    );
+
+    if (res === '__DB_TIMEOUT__') {
+      console.error('[REVENUE] db insert TIMEOUT', meta);
+      throw new Error('DB timeout inserting revenue');
+    }
+
+    console.info('[REVENUE] db insert done', { ...meta, rows: res?.rows?.length || 0 });
+
     if (!res?.rows?.length) return { inserted: false };
     return { inserted: true, id: res.rows[0].id };
   } catch (e) {
     console.error('[REVENUE] insert failed', {
-      ownerId: ownerParam,
-      from,
+      ...meta,
       code: e?.code,
       detail: e?.detail,
       constraint: e?.constraint,

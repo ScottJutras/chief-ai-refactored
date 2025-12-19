@@ -39,6 +39,7 @@ function canUseAgent(profile) {
   const tier = (profile?.subscription_tier || profile?.plan || '').toLowerCase();
   return !!tier && tier !== 'basic' && tier !== 'free';
 }
+
 function looksHardCommand(lc) {
   return (
     /^(create|new)\s+job\b/.test(lc) ||
@@ -58,8 +59,42 @@ function looksHardCommand(lc) {
   );
 }
 
+function isYesEditCancelOrSkip(lc) {
+  return /^(yes|y|confirm|edit|cancel|no|skip|stop)\b/.test(lc);
+}
 
+function pendingTxnNudgeMessage(pending) {
+  const type = pending?.type || pending?.kind || 'entry';
+  return `It looks like you still have a pending ${type}.
 
+Reply:
+- "yes" to submit
+- "edit" to change it
+- "cancel" (or "stop") to discard
+
+Or reply "skip" to leave it pending and continue.`;
+}
+
+// Try to clear pending txn state if your stateManager exports any of these.
+// We keep this tolerant because your file names / exports may differ.
+async function tryClearPendingTxn(from) {
+  try {
+    const sm = require('../utils/stateManager');
+    if (typeof sm.clearPendingTransactionState === 'function') {
+      await sm.clearPendingTransactionState(from);
+      return true;
+    }
+    if (typeof sm.clearPendingState === 'function') {
+      await sm.clearPendingState(from);
+      return true;
+    }
+    if (typeof sm.clearPending === 'function') {
+      await sm.clearPending(from);
+      return true;
+    }
+  } catch {}
+  return false;
+}
 
 // ---------- Raw urlencoded parser (Twilio signature expects original body) ----------
 router.use((req, _res, next) => {
@@ -200,8 +235,58 @@ router.post('*', async (req, res, next) => {
 
   try {
     const pending = await getPendingTransactionState(req.from);
+
     const hasPendingMedia = pending && pending.pendingMedia;
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
+
+    // Normal text pipeline (define EARLY so we can use it for nudges)
+    const text = String(req.body?.Body || '').trim();
+    const lc = text.toLowerCase();
+
+    // ------------------------------------------------------------
+    // PENDING TXN NUDGE (revenue/expense flows)
+    // Prevent "create job ..." from being treated as a job-name answer.
+    // ------------------------------------------------------------
+    const pendingRevenueFlow =
+      !!pending?.pendingRevenue ||
+      !!pending?.awaitingRevenueJob ||
+      !!pending?.awaitingRevenueClarification;
+
+    const pendingExpenseFlow =
+      !!pending?.pendingExpense ||
+      !!pending?.awaitingExpenseJob ||
+      !!pending?.awaitingExpenseClarification;
+
+    if (pendingRevenueFlow) {
+      // cancel/stop/no cancels revenue at ANY step
+      if (/^(cancel|stop|no)\b/.test(lc)) {
+        await tryClearPendingTxn(req.from);
+        return ok(res, `❌ Revenue cancelled.`);
+      }
+
+      // "skip" means: leave it pending and continue with other commands
+      if (lc === 'skip') {
+        return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
+      }
+
+      // If they try a hard command while revenue is waiting for an answer, nudge them
+      if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) {
+        return ok(res, pendingTxnNudgeMessage({ type: 'revenue' }));
+      }
+    }
+
+    if (pendingExpenseFlow) {
+      if (/^(cancel|stop|no)\b/.test(lc)) {
+        await tryClearPendingTxn(req.from);
+        return ok(res, `❌ Expense cancelled.`);
+      }
+      if (lc === 'skip') {
+        return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
+      }
+      if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) {
+        return ok(res, pendingTxnNudgeMessage({ type: 'expense' }));
+      }
+    }
 
     // If we were waiting for media but none came, let media handler interpret text-only follow-up
     if (hasPendingMedia && numMedia === 0) {
@@ -228,85 +313,72 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // Normal text pipeline
-    const text = String(req.body?.Body || '').trim();
-    const lc = text.toLowerCase();
-
     // Canonical idempotency key for ingestion (Twilio)
     const crypto = require('crypto');
 
-const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-const messageSid = rawSid || crypto
-  .createHash('sha256')
-  .update(`${req.from}|${req.body?.Body || ''}`) // stable-ish for retries
-  .digest('hex')
-  .slice(0, 32);
+    const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
+    const messageSid = rawSid || crypto
+      .createHash('sha256')
+      .update(`${req.from}|${req.body?.Body || ''}`) // stable-ish for retries
+      .digest('hex')
+      .slice(0, 32);
 
+    // -----------------------------------------------------------------------
+    // (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
+    // -----------------------------------------------------------------------
+    const isNewRevenueCmd = /^(?:revenue|rev|received)\b/.test(lc);
+    const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc);
 
-  // -----------------------------------------------------------------------
-// (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
-// -----------------------------------------------------------------------
-const isNewRevenueCmd = /^(?:revenue|rev|received)\b/.test(lc);
-const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc);
+    const pendingRevenueLike =
+      !!pending?.awaitingRevenueClarification ||
+      !!pending?.awaitingRevenueJob ||
+      (pending?.pendingCorrection && pending?.type === 'revenue') ||
+      (!!pending?.pendingRevenue && !isNewRevenueCmd);
 
-const pendingRevenueLike =
-  // clarification replies like "today" or "2025-12-12"
-  !!pending?.awaitingRevenueClarification ||
-  // NEW: job resolution replies like "Roof Repair" or "Overhead"
-  !!pending?.awaitingRevenueJob ||
-  // correction flow should route
-  (pending?.pendingCorrection && pending?.type === 'revenue') ||
-  // confirm flow should route only if user isn't sending a fresh revenue command
-  (!!pending?.pendingRevenue && !isNewRevenueCmd);
+    const pendingExpenseLike =
+      !!pending?.awaitingExpenseClarification ||
+      !!pending?.awaitingExpenseJob ||
+      pending?.pendingDelete?.type === 'expense' ||
+      (pending?.pendingCorrection && pending?.type === 'expense') ||
+      (!!pending?.pendingExpense && !isNewExpenseCmd);
 
-const pendingExpenseLike =
-  // clarification replies (if you implemented it in expense.js)
-  !!pending?.awaitingExpenseClarification ||
-  // delete flow
-  pending?.pendingDelete?.type === 'expense' ||
-  // correction flow
-  (pending?.pendingCorrection && pending?.type === 'expense') ||
-  // confirm flow should route only if user isn't sending a fresh expense command
-  (!!pending?.pendingExpense && !isNewExpenseCmd);
+    if (pendingRevenueLike) {
+      try {
+        const { handleRevenue } = require('../handlers/commands/revenue');
+        const twiml = await handleRevenue(
+          req.from,
+          text,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
+        // fall through (never hard-fail)
+      }
+    }
 
-if (pendingRevenueLike) {
-  try {
-    const { handleRevenue } = require('../handlers/commands/revenue');
-    const twiml = await handleRevenue(
-      req.from,
-      text,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid
-    );
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
-    // fall through (never hard-fail)
-  }
-}
-
-if (pendingExpenseLike) {
-  try {
-    const { handleExpense } = require('../handlers/commands/expense');
-    const twiml = await handleExpense(
-      req.from,
-      text,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid
-    );
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
-    // fall through
-  }
-}
-
+    if (pendingExpenseLike) {
+      try {
+        const { handleExpense } = require('../handlers/commands/expense');
+        const twiml = await handleExpense(
+          req.from,
+          text,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
+        // fall through
+      }
+    }
 
     // -----------------------------------------------------------------------
     // (B) FAST PATHS — REVENUE/EXPENSE TWI ML HANDLERS

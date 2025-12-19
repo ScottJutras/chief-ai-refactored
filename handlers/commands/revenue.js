@@ -256,7 +256,24 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
     const cil = buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
     validateCIL(cil);
     return { ok: true, cil };
-  } catch {
+  } catch (e) {
+    console.warn('[REVENUE] CIL validate failed', {
+      message: e?.message,
+      name: e?.name,
+      details: e?.errors || e?.issues || e?.cause || null,
+      // super helpful: see what we were validating
+      cil: {
+        tenant_id: String(ownerId),
+        source_msg_id: String(sourceMsgId),
+        amount_cents: toCents(data?.amount),
+        currency: 'CAD',
+        jobName,
+        payer: data?.source,
+        memo: data?.description,
+        category
+      }
+    });
+
     return { ok: false, reply: `⚠️ Couldn't log that payment yet. Try: "received 2500 for <job> today".` };
   }
 }
@@ -530,7 +547,14 @@ const gate = assertRevenueCILOrClarify({
 
 console.info('[REVENUE] post-gate', { stableMsgId, ok: gate?.ok });
 
-if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+if (!gate.ok) {
+  console.warn('[REVENUE] gate FAILED', {
+    stableMsgId,
+    reply: gate.reply
+  });
+  return `<Response><Message>${String(gate.reply || '⚠️ Could not log that payment yet.').slice(0, 1500)}</Message></Response>`;
+}
+
 
 console.info('[REVENUE] calling saveRevenue', { stableMsgId });
   // ✅ HARD TIMEOUT AROUND THE DB WRITE (prevents “no reply after yes”)

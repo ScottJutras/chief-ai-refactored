@@ -1,39 +1,113 @@
 // services/jobs.js
-const { getOne, insertOneReturning } = require('./db');
-const { v4: uuidv4 } = require('uuid');
+// ------------------------------------------------------------
+// Legacy compatibility wrapper.
+// Canonical job logic lives in services/postgres.js.
+// This file exists so older callers don't break.
+// ------------------------------------------------------------
+const pg = require('./postgres');
 
-function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str);
+function looksLikeInt(x) {
+  return /^\d+$/.test(String(x || '').trim());
 }
 
 /**
  * Resolve job_ref (id/name) to a job row.
- * If allowCreate is true and no job exists, create a draft Job.
+ *
+ * Supported job_ref shapes:
+ *  - { id: 123 }            -> resolves by integer jobs.id (NOT uuid)
+ *  - { job_no: 7 }          -> resolves by (owner_id, job_no)
+ *  - { name: 'Oak Street' } -> resolves by job_name/name (fuzzy-ish)
+ *
+ * If allowCreate is true and no job exists, creates one (draft/open).
  */
-async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultName } = {}) {
+async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultName, sourceMsgId = null } = {}) {
+  const owner = pg.DIGITS(owner_id);
+  if (!owner) throw new Error('Missing owner_id');
+
+  // If nothing provided, optionally create
   if (!job_ref) {
     if (!allowCreate) return null;
     const name = defaultName || 'Untitled Job';
-    return await createDraftJob(owner_id, name);
+    const created = await pg.createJobIdempotent({
+      ownerId: owner,
+      jobName: name,
+      sourceMsgId,
+      status: 'draft',
+      active: true
+    });
+    return created.job;
   }
 
-  if (job_ref.id && looksLikeUuid(job_ref.id)) {
-    const job = await getOne(
-      'SELECT * FROM jobs WHERE owner_id = $1 AND id = $2',
-      [owner_id, job_ref.id]
+  // 1) Resolve by integer jobs.id
+  if (job_ref.id && looksLikeInt(job_ref.id)) {
+    const { rows } = await pg.query(
+      `SELECT id, owner_id, job_no,
+              COALESCE(job_name, name) AS job_name,
+              name, status, active, created_at, updated_at, source_msg_id
+         FROM public.jobs
+        WHERE owner_id = $1 AND id = $2
+        LIMIT 1`,
+      [owner, Number(job_ref.id)]
     );
-    if (job) return job;
+    if (rows[0]) return rows[0];
   }
 
+  // 2) Resolve by job_no
+  if (job_ref.job_no && looksLikeInt(job_ref.job_no)) {
+    const { rows } = await pg.query(
+      `SELECT id, owner_id, job_no,
+              COALESCE(job_name, name) AS job_name,
+              name, status, active, created_at, updated_at, source_msg_id
+         FROM public.jobs
+        WHERE owner_id = $1 AND job_no = $2
+        LIMIT 1`,
+      [owner, Number(job_ref.job_no)]
+    );
+    if (rows[0]) return rows[0];
+  }
+
+  // 3) Resolve by name (prefer exact-ish, otherwise ILIKE)
   if (job_ref.name) {
-    const job = await getOne(
-      'SELECT * FROM jobs WHERE owner_id = $1 AND name ILIKE $2 ORDER BY created_at DESC LIMIT 1',
-      [owner_id, `%${job_ref.name}%`]
-    );
-    if (job) return job;
+    const needle = String(job_ref.name).trim();
+    if (needle) {
+      // Try exact match first
+      const exact = await pg.query(
+        `SELECT id, owner_id, job_no,
+                COALESCE(job_name, name) AS job_name,
+                name, status, active, created_at, updated_at, source_msg_id
+           FROM public.jobs
+          WHERE owner_id = $1
+            AND (lower(job_name) = lower($2) OR lower(name) = lower($2))
+          ORDER BY updated_at DESC NULLS LAST, created_at DESC
+          LIMIT 1`,
+        [owner, needle]
+      );
+      if (exact.rowCount) return exact.rows[0];
 
-    if (allowCreate) {
-      return await createDraftJob(owner_id, job_ref.name);
+      // Then fuzzy
+      const like = await pg.query(
+        `SELECT id, owner_id, job_no,
+                COALESCE(job_name, name) AS job_name,
+                name, status, active, created_at, updated_at, source_msg_id
+           FROM public.jobs
+          WHERE owner_id = $1
+            AND (job_name ILIKE $2 OR name ILIKE $2)
+          ORDER BY updated_at DESC NULLS LAST, created_at DESC
+          LIMIT 1`,
+        [owner, `%${needle}%`]
+      );
+      if (like.rowCount) return like.rows[0];
+
+      if (allowCreate) {
+        const created = await pg.createJobIdempotent({
+          ownerId: owner,
+          jobName: needle,
+          sourceMsgId,
+          status: 'draft',
+          active: true
+        });
+        return created.job;
+      }
     }
   }
 
@@ -42,13 +116,19 @@ async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultNa
   throw err;
 }
 
-async function createDraftJob(owner_id, name) {
-  return await insertOneReturning(
-    `INSERT INTO jobs (id, owner_id, name, status)
-     VALUES ($1, $2, $3, 'draft')
-     RETURNING *`,
-    [uuidv4(), owner_id, name]
-  );
+async function createDraftJob(owner_id, name, { sourceMsgId = null } = {}) {
+  const owner = pg.DIGITS(owner_id);
+  const jobName = String(name || '').trim() || 'Untitled Job';
+
+  const created = await pg.createJobIdempotent({
+    ownerId: owner,
+    jobName,
+    sourceMsgId,
+    status: 'draft',
+    active: true
+  });
+
+  return created.job;
 }
 
 module.exports = { resolveJobRef, createDraftJob };

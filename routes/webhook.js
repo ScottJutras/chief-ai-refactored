@@ -212,25 +212,40 @@ router.post('*', async (req, res, next) => {
     const lc = text.toLowerCase();
 
     // Canonical idempotency key for ingestion (Twilio)
-    const messageSid =
-      String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() ||
-      `${req.from}:${Date.now()}`;
+    const crypto = require('crypto');
 
-   // -----------------------------------------------------------------------
+const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
+const messageSid = rawSid || crypto
+  .createHash('sha256')
+  .update(`${req.from}|${req.body?.Body || ''}`) // stable-ish for retries
+  .digest('hex')
+  .slice(0, 32);
+
+
+  // -----------------------------------------------------------------------
 // (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
 // -----------------------------------------------------------------------
 const isNewRevenueCmd = /^(?:revenue|rev|received)\b/.test(lc);
 const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc);
 
 const pendingRevenueLike =
+  // clarification replies like "today" or "2025-12-12"
   !!pending?.awaitingRevenueClarification ||
+  // NEW: job resolution replies like "Roof Repair" or "Overhead"
+  !!pending?.awaitingRevenueJob ||
+  // correction flow should route
   (pending?.pendingCorrection && pending?.type === 'revenue') ||
+  // confirm flow should route only if user isn't sending a fresh revenue command
   (!!pending?.pendingRevenue && !isNewRevenueCmd);
 
 const pendingExpenseLike =
+  // clarification replies (if you implemented it in expense.js)
   !!pending?.awaitingExpenseClarification ||
+  // delete flow
   pending?.pendingDelete?.type === 'expense' ||
+  // correction flow
   (pending?.pendingCorrection && pending?.type === 'expense') ||
+  // confirm flow should route only if user isn't sending a fresh expense command
   (!!pending?.pendingExpense && !isNewExpenseCmd);
 
 if (pendingRevenueLike) {
@@ -248,6 +263,7 @@ if (pendingRevenueLike) {
     return res.status(200).type('application/xml; charset=utf-8').send(twiml);
   } catch (e) {
     console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
+    // fall through (never hard-fail)
   }
 }
 
@@ -266,6 +282,7 @@ if (pendingExpenseLike) {
     return res.status(200).type('application/xml; charset=utf-8').send(twiml);
   } catch (e) {
     console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
+    // fall through
   }
 }
 
@@ -400,7 +417,7 @@ if (pendingExpenseLike) {
     // Try explicit handlers first (BOOLEAN-handled style)
     if (tasksHandler && await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
     if (handleTimeclock && await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
-    if (handleJob && await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
+    if (handleJob && await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid)) return;
 
     // Forecast (fast path; no ctx object)
     if (/^forecast\b/i.test(lc)) {
@@ -464,7 +481,7 @@ if (pendingExpenseLike) {
 
     // TASKS
     if (looksTask && typeof tasksHandler === 'function') {
-      const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (!res.headersSent) {
         let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.tasks : 'Task handled.');
         msg += await glossaryNudgeFrom(text);
@@ -475,7 +492,7 @@ if (pendingExpenseLike) {
 
     // JOBS
     if (looksJob && typeof handleJob === 'function') {
-      const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (!res.headersSent) {
         let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.jobs : 'Job handled.');
         msg += await glossaryNudgeFrom(text);

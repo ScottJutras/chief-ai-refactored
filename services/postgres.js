@@ -285,6 +285,77 @@ async function allocateNextJobNo(owner, client) {
   );
   return Number(rows?.[0]?.next_no || 1);
 }
+/**
+ * Create a job idempotently, safely allocating job_no per owner.
+ * Requires:
+ *  - jobs has UNIQUE(owner_id, job_no) (you do: uq_jobs_owner_jobno)
+ *  - jobs has UNIQUE(owner_id, source_msg_id) (you created jobs_owner_source_msg_uidx)
+ *
+ * Returns:
+ *  { inserted: boolean, job: { id, job_no, job_name, name, active, status, source_msg_id } | null }
+ */
+async function createJobIdempotent({ ownerId, jobName, sourceMsgId, status = 'open', active = true } = {}) {
+  const owner = DIGITS(ownerId);
+  const name = String(jobName || '').trim() || 'Untitled Job';
+  const msgId = String(sourceMsgId || '').trim() || null;
+
+  if (!owner) throw new Error('Missing ownerId');
+
+  // If no sourceMsgId, we cannot be idempotent — still allocate job_no safely.
+  return await withClient(async (client) => {
+    // serialize all allocs for this owner only
+    await withOwnerAllocLock(owner, client);
+
+    // 1) If we have a message id, first check if this job was already created for that msg
+    if (msgId) {
+      const existing = await client.query(
+        `SELECT id, owner_id, job_no,
+                COALESCE(job_name, name) AS job_name,
+                name, active, status, source_msg_id
+           FROM public.jobs
+          WHERE owner_id = $1 AND source_msg_id = $2
+          LIMIT 1`,
+        [owner, msgId]
+      );
+      if (existing.rowCount) return { inserted: false, job: existing.rows[0] };
+    }
+
+    // 2) Allocate next job_no under the lock
+    const nextNo = await allocateNextJobNo(owner, client);
+
+    // 3) Insert. If source_msg_id exists + is unique, this is idempotent.
+    //    If another request beats us with same source_msg_id, we fetch it afterwards.
+    try {
+      const ins = await client.query(
+        `INSERT INTO public.jobs
+           (owner_id, job_no, job_name, name, status, active, start_date, created_at, updated_at, source_msg_id)
+         VALUES
+           ($1, $2, $3, $4, $5, $6, NOW(), NOW(), NOW(), $7)
+         RETURNING id, owner_id, job_no,
+                   COALESCE(job_name, name) AS job_name,
+                   name, active, status, source_msg_id`,
+        [owner, nextNo, name, name, String(status || 'open'), !!active, msgId]
+      );
+      return { inserted: true, job: ins.rows[0] };
+    } catch (e) {
+      // If unique (owner_id, source_msg_id) raced, fetch it.
+      // 23505 covers unique violations (could be either job_no or source_msg_id).
+      if (e && e.code === '23505' && msgId) {
+        const existing = await client.query(
+          `SELECT id, owner_id, job_no,
+                  COALESCE(job_name, name) AS job_name,
+                  name, active, status, source_msg_id
+             FROM public.jobs
+            WHERE owner_id = $1 AND source_msg_id = $2
+            LIMIT 1`,
+          [owner, msgId]
+        );
+        if (existing.rowCount) return { inserted: false, job: existing.rows[0] };
+      }
+      throw e;
+    }
+  });
+}
 
 
 
@@ -303,13 +374,20 @@ async function getFileExport(id) {
 // ---------- Time Limits & Audit (schema-aware, tolerant) ----------
 
 // Cache detected columns on public.time_entries
-let SUPPORTS_CREATED_BY = null; // null=unknown, then true/false
-let SUPPORTS_USER_ID    = null;
+let SUPPORTS_CREATED_BY    = null; // null=unknown, then true/false
+let SUPPORTS_USER_ID       = null;
+let SUPPORTS_SOURCE_MSG_ID = null;
+
 
 async function detectTimeEntriesCapabilities() {
-  if (SUPPORTS_CREATED_BY !== null && SUPPORTS_USER_ID !== null) {
-    return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
+  if (
+    SUPPORTS_CREATED_BY !== null &&
+    SUPPORTS_USER_ID !== null &&
+    SUPPORTS_SOURCE_MSG_ID !== null
+  ) {
+    return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
   }
+
   try {
     const { rows } = await query(
       `SELECT column_name
@@ -318,14 +396,16 @@ async function detectTimeEntriesCapabilities() {
           AND table_name   = 'time_entries'`
     );
     const names = new Set(rows.map(r => String(r.column_name).toLowerCase()));
-    SUPPORTS_CREATED_BY = names.has('created_by');
-    SUPPORTS_USER_ID    = names.has('user_id');
+    SUPPORTS_CREATED_BY    = names.has('created_by');
+    SUPPORTS_USER_ID       = names.has('user_id');
+    SUPPORTS_SOURCE_MSG_ID = names.has('source_msg_id');
   } catch {
-    // Conservative defaults if detection fails
-    SUPPORTS_CREATED_BY = false;
-    SUPPORTS_USER_ID    = false;
+    SUPPORTS_CREATED_BY    = false;
+    SUPPORTS_USER_ID       = false;
+    SUPPORTS_SOURCE_MSG_ID = false;
   }
-  return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID };
+
+  return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
 }
 
 async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
@@ -389,7 +469,6 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
 
 // ---------- Job-aware time entry (delegates to resilient logTimeEntry) ----------
 async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras = {}) {
-  // Resolve job context (prefer explicit name; otherwise active job)
   let jobNo = null;
 
   try {
@@ -404,11 +483,10 @@ async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz,
     console.warn('[PG/logTimeEntryWithJob] job resolve failed:', e?.message);
   }
 
-  // Delegate to resilient writer
   return await logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras);
 }
 
-// ---------- Time (resilient INSERT: user_id ALWAYS bound if exists) ----------
+
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
@@ -422,14 +500,20 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
   // Ensure detection (retry on null)
-  if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null) {
-    await detectTimeEntriesCapabilities().catch(e => console.error('[PG/logTimeEntry] detection failed:', e?.message));
+  if (
+    SUPPORTS_USER_ID === null ||
+    SUPPORTS_CREATED_BY === null ||
+    SUPPORTS_SOURCE_MSG_ID === null
+  ) {
+    await detectTimeEntriesCapabilities().catch(e =>
+      console.error('[PG/logTimeEntry] detection failed:', e?.message)
+    );
   }
 
   const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
   const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
 
-  // FORCE user_id if column exists
+  // FORCE user_id if column exists (your unique index uses this)
   if (SUPPORTS_USER_ID) {
     cols.push('user_id');
     vals.push(actorSafe);
@@ -441,29 +525,49 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
     vals.push(actorSafe);
   }
 
+  // Optional: idempotency
+  const sourceMsgId = String(extras?.source_msg_id || '').trim() || null;
+  if (SUPPORTS_SOURCE_MSG_ID && sourceMsgId) {
+    cols.push('source_msg_id');
+    vals.push(sourceMsgId);
+  }
+
   cols.push('created_at');
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
 
-  const sql = `
-    INSERT INTO public.time_entries (${cols.join(', ')})
-    VALUES (${placeholders})
-    RETURNING id`;
+  // If we have source_msg_id + user_id, we can safely "do nothing" on duplicates
+  const canIdempotent =
+    SUPPORTS_SOURCE_MSG_ID &&
+    SUPPORTS_USER_ID &&
+    sourceMsgId;
+
+  const sql = canIdempotent
+    ? `
+      INSERT INTO public.time_entries (${cols.join(', ')})
+      VALUES (${placeholders})
+      ON CONFLICT (owner_id, user_id, source_msg_id) DO NOTHING
+      RETURNING id
+    `
+    : `
+      INSERT INTO public.time_entries (${cols.join(', ')})
+      VALUES (${placeholders})
+      RETURNING id
+    `;
 
   console.info('[PG/logTimeEntry] EXECUTING', {
     cols,
-    params_preview: [...vals.slice(0, 5), '…', zone, local],
     actorSafe,
-    sql: sql.replace(/\s+/g, ' ').slice(0, 300)
+    ownerSafe,
+    sourceMsgId: sourceMsgId || undefined,
+    idempotent: !!canIdempotent
   });
 
-  try {
-    const { rows } = await query(sql, vals);
-    return rows[0].id;
-  } catch (e) {
-    console.error('[PG/logTimeEntry] FAILED:', e?.message);
-    throw e;
-  }
+  const { rows } = await query(sql, vals);
+
+  // Duplicate message -> no insert -> return null (caller can treat as already processed)
+  return rows?.[0]?.id || null;
 }
+
 
 // Find or create a job by name (case-insensitive on name or job_name).
 // Robust against races and job_no duplicates: we allocate job_no under an advisory lock.
@@ -1000,8 +1104,6 @@ async function getOwnerCategoryBreakdown(ownerId, fromDate, toDate, kindFilter =
 
 
 
-
-
 // ---- Safe limiter exports (avoid undefined symbol at module.exports time)
 const __checkLimit =
   (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
@@ -1043,6 +1145,7 @@ module.exports = {
 
   // ---------- Jobs / context ----------
   ensureJobByName,
+  createJobIdempotent,
   activateJobByName,
   resolveJobContext,
   getOrCreateJob,

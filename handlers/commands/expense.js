@@ -65,8 +65,42 @@ function looksLikeUuid(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
 }
 
+function todayIso() {
+  return new Date().toISOString().split('T')[0];
+}
+
+function parseNaturalDate(s) {
+  const t = String(s || '').trim().toLowerCase();
+  const today = todayIso();
+
+  if (!t || t === 'today') return today;
+
+  if (t === 'yesterday') {
+    const d = new Date(`${today}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 1);
+    return d.toISOString().split('T')[0];
+  }
+
+  if (t === 'tomorrow') {
+    const d = new Date(`${today}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + 1);
+    return d.toISOString().split('T')[0];
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
+
+  const parsed = Date.parse(s);
+  if (!Number.isNaN(parsed)) return new Date(parsed).toISOString().split('T')[0];
+
+  return null;
+}
+
 /**
  * Resolve active job name safely (avoid int=uuid comparisons).
+ * Priority:
+ *  1) userProfile.active_job_name
+ *  2) userProfile.active_job_id (uuid) -> jobs.id
+ *  3) userProfile.active_job_id numeric -> jobs.job_no
  */
 async function resolveActiveJobName({ ownerId, userProfile }) {
   const ownerParam = String(ownerId || '').trim();
@@ -78,6 +112,7 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
 
   const s = String(ref).trim();
 
+  // UUID jobs.id
   if (looksLikeUuid(s)) {
     try {
       const r = await query(
@@ -90,6 +125,7 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
     }
   }
 
+  // Integer jobs.job_no
   if (/^\d+$/.test(s)) {
     try {
       const r = await query(
@@ -298,7 +334,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
   try {
     const defaultData = {
-      date: new Date().toISOString().split('T')[0],
+      date: todayIso(),
       item: 'Unknown',
       amount: '$0.00',
       store: 'Unknown Store'
@@ -312,15 +348,51 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       await setPendingTransactionState(from, {
         ...pending,
         pendingExpense: data,
-        pendingCorrection: false
+        pendingCorrection: false,
+        expenseSourceMsgId: pending.expenseSourceMsgId || msgId
       });
       pending = await getPendingTransactionState(from);
     }
 
-    // (Optional) You can support awaitingExpenseClarification here later if your AI asks for date/vendor, etc.
-    // For now, your deterministic expense parse already fills date today, so this is usually unnecessary.
+    // Follow-up: expense clarification (date, etc.)
+    if (pending?.awaitingExpenseClarification) {
+      const maybeDate = parseNaturalDate(input);
 
-    // Pending confirm/edit/delete flow
+      if (maybeDate) {
+        const draft = pending.expenseDraftText || '';
+        const parsed = parseExpenseMessage(draft) || {};
+        const merged = { ...parsed, date: maybeDate };
+
+        await setPendingTransactionState(from, {
+          ...pending,
+          pendingExpense: merged,
+          awaitingExpenseClarification: false
+        });
+
+        reply = `Please confirm: Expense ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date}. Reply yes/edit/cancel.`;
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      reply = `What date was this expense? (e.g., 2025-12-12 or "today")`;
+      return `<Response><Message>${reply}</Message></Response>`;
+    }
+
+    // Follow-up: job resolution (contractor-first)
+    if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
+      const jobReply = String(input || '').trim();
+      const merged = { ...pending.pendingExpense, jobName: jobReply };
+
+      await setPendingTransactionState(from, {
+        ...pending,
+        pendingExpense: merged,
+        awaitingExpenseJob: false
+      });
+
+      reply = `Please confirm: Expense ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date} for ${merged.jobName}. Reply yes/edit/cancel.`;
+      return `<Response><Message>${reply}</Message></Response>`;
+    }
+
+    // --- CONFIRM / DELETE FLOW ---
     if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
       if (!isOwner) {
         await deletePendingTransactionState(from);
@@ -328,69 +400,105 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      const lc = input.toLowerCase().trim();
-      const stableMsgId = pending.expenseSourceMsgId || msgId;
+      const lc = String(input || '').toLowerCase().trim();
+      const stableMsgId = String(pending.expenseSourceMsgId || msgId).trim();
 
-      if (lc === 'yes' && pending.pendingExpense) {
-        const data = pending.pendingExpense;
-        const category = data.suggestedCategory || await categorizeEntry('expense', data, ownerProfile);
-        const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || 'Uncategorized';
-
-        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: stableMsgId });
-        if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
-
-        const result = await saveExpense({
-          ownerId,
-          date: data.date,
-          item: data.item,
-          amount: data.amount,
-          store: data.store,
-          jobName,
-          category,
-          user: userProfile?.name || 'Unknown User',
-          sourceMsgId: stableMsgId
-        });
-
-        reply = (result && result.inserted === false)
-          ? '✅ Already logged that expense (duplicate message).'
-          : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} (Category: ${category})`;
-
+      // ✅ NEW: If user sends a fresh expense command while waiting for yes/edit/cancel,
+      // treat it as a new command: clear pending and continue into parse flow below.
+      if (/^(?:expense|exp)\b/.test(lc) && pending?.pendingExpense) {
         await deletePendingTransactionState(from);
+        pending = null;
+      } else {
+        if (lc === 'yes' && pending?.pendingExpense) {
+          const data = pending.pendingExpense;
+
+          const category =
+            data.suggestedCategory || (await categorizeEntry('expense', data, ownerProfile));
+
+          // prefer job from pending (job resolution flow), else active job
+          const jobName =
+            (data.jobName && String(data.jobName).trim()) ||
+            (await resolveActiveJobName({ ownerId, userProfile })) ||
+            null;
+
+          // ✅ enforce job (contractor-first)
+          if (!jobName) {
+            await setPendingTransactionState(from, {
+              ...pending,
+              pendingExpense: data,
+              awaitingExpenseJob: true,
+              expenseSourceMsgId: stableMsgId
+            });
+            reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
+            return `<Response><Message>${reply}</Message></Response>`;
+          }
+
+          const gate = assertExpenseCILOrClarify({
+            ownerId,
+            from,
+            userProfile,
+            data,
+            jobName,
+            category,
+            sourceMsgId: stableMsgId
+          });
+          if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+
+          const result = await saveExpense({
+            ownerId,
+            date: data.date,
+            item: data.item,
+            amount: data.amount,
+            store: data.store,
+            jobName,
+            category,
+            user: userProfile?.name || 'Unknown User',
+            sourceMsgId: stableMsgId
+          });
+
+          reply =
+            result && result.inserted === false
+              ? '✅ Already logged that expense (duplicate message).'
+              : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName} (Category: ${category})`;
+
+          await deletePendingTransactionState(from);
+          return `<Response><Message>${reply}</Message></Response>`;
+        }
+
+        if (lc === 'yes' && pending?.pendingDelete?.type === 'expense') {
+          const criteria = pending.pendingDelete;
+          const success = await deleteExpense(ownerId, criteria);
+          reply = success
+            ? `✅ Deleted expense ${criteria.amount} for ${criteria.item} from ${criteria.store}.`
+            : `⚠️ Expense not found or deletion failed.`;
+          await deletePendingTransactionState(from);
+          return `<Response><Message>${reply}</Message></Response>`;
+        }
+
+        if (lc === 'edit') {
+          await setPendingTransactionState(from, { ...pending, isEditing: true, type: 'expense' });
+          reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
+          return `<Response><Message>${reply}</Message></Response>`;
+        }
+
+        if (lc === 'cancel' || lc === 'no') {
+          await deletePendingTransactionState(from);
+          reply = '❌ Operation cancelled.';
+          return `<Response><Message>${reply}</Message></Response>`;
+        }
+
+        reply = `⚠️ Please reply "yes", "edit", or "cancel".`;
         return `<Response><Message>${reply}</Message></Response>`;
       }
-
-      if (lc === 'yes' && pending.pendingDelete?.type === 'expense') {
-        const criteria = pending.pendingDelete;
-        const success = await deleteExpense(ownerId, criteria);
-        reply = success
-          ? `✅ Deleted expense ${criteria.amount} for ${criteria.item} from ${criteria.store}.`
-          : `⚠️ Expense not found or deletion failed.`;
-        await deletePendingTransactionState(from);
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
-
-      if (lc === 'edit') {
-        await setPendingTransactionState(from, { ...pending, isEditing: true, type: 'expense' });
-        reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
-
-      if (lc === 'cancel' || lc === 'no') {
-        await deletePendingTransactionState(from);
-        reply = '❌ Operation cancelled.';
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
-
-      reply = `⚠️ Please reply "yes", "edit", or "cancel".`;
-      return `<Response><Message>${reply}</Message></Response>`;
     }
 
     // DELETE EXPENSE REQUEST
-    if (input.toLowerCase().startsWith('delete expense')) {
+    if (String(input || '').toLowerCase().startsWith('delete expense')) {
       if (!isOwner) {
         reply = '⚠️ Only the owner can delete expense entries.';
         return `<Response><Message>${reply}</Message></Response>`;
       }
+
       const req = parseDeleteRequest(input);
       if (req.type !== 'expense') {
         reply = `⚠️ Invalid delete request. Try "delete expense $100 tools from Home Depot".`;
@@ -403,13 +511,32 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     }
 
     // DIRECT PARSE PATH
-    const m = input.match(/^(?:expense\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
+    const m = String(input || '').match(/^(?:expense\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
     if (m) {
       const [, amount, item, store] = m;
-      const date = new Date().toISOString().split('T')[0];
-      const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || 'Uncategorized';
-      const data = { date, item, amount: `$${parseFloat(amount).toFixed(2)}`, store: store || 'Unknown Store' };
+      const date = todayIso();
+      const data = {
+        date,
+        item,
+        amount: `$${parseFloat(amount).toFixed(2)}`,
+        store: store || 'Unknown Store'
+      };
+
       const category = await categorizeEntry('expense', data, ownerProfile);
+
+      const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || null;
+
+      // ✅ enforce job (contractor-first)
+      if (!jobName) {
+        await setPendingTransactionState(from, {
+          pendingExpense: data,
+          awaitingExpenseJob: true,
+          expenseSourceMsgId: msgId,
+          type: 'expense'
+        });
+        reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
 
       const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
       if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
@@ -426,9 +553,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         sourceMsgId: msgId
       });
 
-      reply = (result && result.inserted === false)
-        ? '✅ Already logged that expense (duplicate message).'
-        : `✅ Expense logged: ${data.amount} for ${item} from ${data.store} on ${jobName} (Category: ${category})`;
+      reply =
+        result && result.inserted === false
+          ? '✅ Already logged that expense (duplicate message).'
+          : `✅ Expense logged: ${data.amount} for ${item} from ${data.store} on ${jobName} (Category: ${category})`;
 
       return `<Response><Message>${reply}</Message></Response>`;
     }
@@ -459,9 +587,21 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const category = await categorizeEntry('expense', data, ownerProfile);
       data.suggestedCategory = category;
 
-      if (confirmed && !errors) {
-        const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || 'Uncategorized';
+      const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
+      // ✅ enforce job (contractor-first)
+      if (!jobName) {
+        await setPendingTransactionState(from, {
+          pendingExpense: data,
+          awaitingExpenseJob: true,
+          expenseSourceMsgId: msgId,
+          type: 'expense'
+        });
+        reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      if (confirmed && !errors) {
         const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
@@ -477,9 +617,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           sourceMsgId: msgId
         });
 
-        reply = (result && result.inserted === false)
-          ? '✅ Already logged that expense (duplicate message).'
-          : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName} (Category: ${category})`;
+        reply =
+          result && result.inserted === false
+            ? '✅ Already logged that expense (duplicate message).'
+            : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName} (Category: ${category})`;
 
         return `<Response><Message>${reply}</Message></Response>`;
       }

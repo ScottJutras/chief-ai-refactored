@@ -434,77 +434,97 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       const stableMsgId = String(pending.revenueSourceMsgId || safeMsgId).trim(); // always defined
 
       if (lcInput === 'yes') {
-        console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
+  console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
 
-        const data = pending.pendingRevenue || {};
+  const data = pending.pendingRevenue || {};
 
-        // job required (or Overhead)
-        let jobName = (data.jobName && String(data.jobName).trim()) || null;
-        if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
+  // job required (or Overhead)
+  let jobName = (data.jobName && String(data.jobName).trim()) || null;
+  if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-        if (!jobName) {
-          await setPendingTransactionState(from, {
-            ...pending,
-            pendingRevenue: data,
-            awaitingRevenueJob: true,
-            revenueSourceMsgId: stableMsgId,
-            type: 'revenue'
-          });
-          reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
-          return `<Response><Message>${reply}</Message></Response>`;
-        }
+  if (!jobName) {
+    await setPendingTransactionState(from, {
+      ...pending,
+      pendingRevenue: data,
+      awaitingRevenueJob: true,
+      revenueSourceMsgId: stableMsgId,
+      type: 'revenue'
+    });
+    reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
+    return `<Response><Message>${reply}</Message></Response>`;
+  }
 
-        console.info('[REVENUE] pre-category', { stableMsgId });
+  console.info('[REVENUE] pre-category', { stableMsgId });
 
-        const category =
-          data.suggestedCategory ||
-          (await withTimeout(
-            Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
-            1200,
-            null
-          )) ||
-          null;
+  const category =
+    data.suggestedCategory ||
+    (await withTimeout(
+      Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
+      1200,
+      null
+    ));
 
-        console.info('[REVENUE] post-category', { stableMsgId, category });
-        console.info('[REVENUE] pre-insert', { stableMsgId, ownerId, date: data.date, amount: data.amount, jobName });
+  console.info('[REVENUE] post-category', { stableMsgId, category });
+  console.info('[REVENUE] pre-insert', { stableMsgId, ownerId, date: data.date, amount: data.amount, jobName });
 
-        const gate = assertRevenueCILOrClarify({
-          ownerId,
-          from,
-          userProfile,
-          data,
-          jobName,
-          category,
-          sourceMsgId: stableMsgId
-        });
-        if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+  const gate = assertRevenueCILOrClarify({
+    ownerId,
+    from,
+    userProfile,
+    data,
+    jobName,
+    category,
+    sourceMsgId: stableMsgId
+  });
+  if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
-        const result = await saveRevenue({
-          ownerId,
-          date: data.date || todayInTimeZone(tz),
-          description: data.description,
-          amount: data.amount,
-          source: data.source,
-          jobName,
-          category,
-          user: userProfile?.name || 'Unknown User',
-          sourceMsgId: stableMsgId,
-          from
-        });
+  // ✅ HARD TIMEOUT AROUND THE DB WRITE (prevents “no reply after yes”)
+  const result = await withTimeout(
+    saveRevenue({
+      ownerId,
+      date: data.date || todayInTimeZone(tz),
+      description: data.description,
+      amount: data.amount,
+      source: data.source,
+      jobName,
+      category,
+      user: userProfile?.name || 'Unknown User',
+      sourceMsgId: stableMsgId,
+      from
+    }),
+    4000,
+    '__DB_TIMEOUT__'
+  );
 
-        console.info('[REVENUE] post-insert', { stableMsgId, inserted: result?.inserted });
+  if (result === '__DB_TIMEOUT__') {
+    console.error('[REVENUE] db write TIMEOUT', { stableMsgId });
 
-        const payerPart =
-          data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+    // IMPORTANT: keep it pending so the user can resend "yes" without losing the draft
+    await setPendingTransactionState(from, {
+      ...pending,
+      pendingRevenue: { ...data, jobName, suggestedCategory: category || data.suggestedCategory },
+      revenueSourceMsgId: stableMsgId,
+      type: 'revenue'
+    });
 
-        reply =
-          result.inserted === false
-            ? '✅ Already logged that payment (duplicate message).'
-            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+    reply = `⚠️ Saving is taking longer than expected (database slow). Please reply "yes" again in a few seconds.`;
+    return `<Response><Message>${reply}</Message></Response>`;
+  }
 
-        await deletePendingTransactionState(from);
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
+  console.info('[REVENUE] post-insert', { stableMsgId, inserted: result?.inserted });
+
+  const payerPart =
+    data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+
+  reply =
+    result.inserted === false
+      ? '✅ Already logged that payment (duplicate message).'
+      : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+
+  await deletePendingTransactionState(from);
+  return `<Response><Message>${reply}</Message></Response>`;
+}
+
 
       if (lcInput === 'edit' || lcInput === 'no') {
         await setPendingTransactionState(from, {

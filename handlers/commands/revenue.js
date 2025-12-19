@@ -6,6 +6,7 @@ const {
   deletePendingTransactionState
 } = require('../../utils/stateManager');
 const ai = require('../../utils/aiErrorHandler');
+
 // Optional: log once if detectErrors isn't available (we'll fail-open)
 if (typeof ai.detectErrors !== 'function' && typeof ai.detectError !== 'function') {
   console.warn('[REVENUE] aiErrorHandler has no detectErrors; skipping error detection (fail-open).');
@@ -24,7 +25,6 @@ const detectErrors =
 const categorizeEntry =
   (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) ||
   (async () => null); // fail-open
-
 
 const { validateCIL } = require('../../cil');
 
@@ -147,13 +147,13 @@ async function findJobByName(ownerId, name) {
     return null;
   }
 }
+
 function withTimeout(promise, ms, fallbackValue = null) {
   return Promise.race([
     promise,
     new Promise(resolve => setTimeout(() => resolve(fallbackValue), ms))
   ]);
 }
-
 
 /**
  * Deterministic parse:
@@ -164,7 +164,6 @@ function withTimeout(promise, ms, fallbackValue = null) {
  */
 async function deterministicRevenueParse({ ownerId, input, tz }) {
   const raw = String(input || '').trim();
-  const lc = raw.toLowerCase();
 
   // amount
   const amtMatch =
@@ -346,11 +345,10 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
   }
 }
 
-
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
   const msgId = String(sourceMsgId || '').trim() || `${from}:${Date.now()}`;
-
+  const safeMsgId = String(sourceMsgId || msgId || '').trim(); // always defined
   let reply;
 
   try {
@@ -381,8 +379,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         reply = `Please confirm: Payment ${merged.amount} on ${merged.date}. Reply yes/edit/cancel.`;
         return `<Response><Message>${reply}</Message></Response>`;
       }
-      
-
 
       reply = `What date was this payment? (e.g., 2025-12-12 or "today")`;
       return `<Response><Message>${reply}</Message></Response>`;
@@ -407,131 +403,114 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       reply = `Please confirm: Payment ${merged.amount}${payerPart} on ${merged.date} for ${merged.jobName}. Reply yes/edit/cancel.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
-console.info('[REVENUE] pre-category', { stableMsgId });
-
-
 
     // --- CONFIRM FLOW ---
-if (pending?.pendingRevenue) {
-  if (!isOwner) {
-    await deletePendingTransactionState(from);
-    reply = '⚠️ Only the owner can manage revenue.';
-    return `<Response><Message>${reply}</Message></Response>`;
-  }
-
-  const lcInput = String(input || '').toLowerCase().trim();
-  const stableMsgId = String(pending.revenueSourceMsgId || msgId).trim();
-
-  // If user sends a fresh revenue command while we're waiting for yes/edit/cancel,
-  // treat it as a NEW command: clear pending and fall through into parse flow.
-  if (/^(revenue|rev|received)\b/.test(lcInput)) {
-    await deletePendingTransactionState(from);
-  } else {
-    if (lcInput === 'yes') {
-      console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
-
-      const data = pending.pendingRevenue || {};
-
-      // --- job required (contractor-first) ---
-      let jobName = (data.jobName && String(data.jobName).trim()) || null;
-      if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
-
-      if (!jobName) {
-        await setPendingTransactionState(from, {
-          ...pending,
-          pendingRevenue: data,
-          awaitingRevenueJob: true,
-          revenueSourceMsgId: stableMsgId,
-          type: 'revenue'
-        });
-        reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
+    if (pending?.pendingRevenue) {
+      if (!isOwner) {
+        await deletePendingTransactionState(from);
+        reply = '⚠️ Only the owner can manage revenue.';
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      // --- categorize (bounded) ---
-      console.info('[REVENUE] pre-category', { stableMsgId });
-      const category =
-        data.suggestedCategory ||
-        (await withTimeout(
-          Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
-          1200,
-          null
-        ));
-      console.info('[REVENUE] post-category', { stableMsgId, category });
+      const lcInput = String(input || '').toLowerCase().trim();
+      const stableMsgId = String(pending.revenueSourceMsgId || safeMsgId).trim(); // always defined
 
-      // --- CIL gate ---
-      const gate = assertRevenueCILOrClarify({
-        ownerId,
-        from,
-        userProfile,
-        data,
-        jobName,
-        category,
-        sourceMsgId: stableMsgId
-      });
-      if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+      if (lcInput === 'yes') {
+        console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
 
-      // --- insert (log around DB call) ---
-      console.info('[REVENUE] pre-insert', {
-        stableMsgId,
-        ownerId,
-        date: data.date || todayInTimeZone(tz),
-        amount: data.amount,
-        jobName
-      });
+        const data = pending.pendingRevenue || {};
 
-      const result = await saveRevenue({
-        ownerId,
-        date: data.date || todayInTimeZone(tz),
-        description: data.description,
-        amount: data.amount,
-        source: data.source,
-        jobName,
-        category,
-        user: userProfile?.name || 'Unknown User',
-        sourceMsgId: stableMsgId,
-        from
-      });
+        // job required (or Overhead)
+        let jobName = (data.jobName && String(data.jobName).trim()) || null;
+        if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-      console.info('[REVENUE] post-insert', { stableMsgId, inserted: result?.inserted });
+        if (!jobName) {
+          await setPendingTransactionState(from, {
+            ...pending,
+            pendingRevenue: data,
+            awaitingRevenueJob: true,
+            revenueSourceMsgId: stableMsgId,
+            type: 'revenue'
+          });
+          reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
+          return `<Response><Message>${reply}</Message></Response>`;
+        }
 
-      const payerPart =
-        data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+        console.info('[REVENUE] pre-category', { stableMsgId });
 
-      reply =
-        result.inserted === false
-          ? '✅ Already logged that payment (duplicate message).'
-          : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+        const category =
+          data.suggestedCategory ||
+          (await withTimeout(
+            Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
+            1200,
+            null
+          )) ||
+          null;
 
-      await deletePendingTransactionState(from);
+        console.info('[REVENUE] post-category', { stableMsgId, category });
+        console.info('[REVENUE] pre-insert', { stableMsgId, ownerId, date: data.date, amount: data.amount, jobName });
+
+        const gate = assertRevenueCILOrClarify({
+          ownerId,
+          from,
+          userProfile,
+          data,
+          jobName,
+          category,
+          sourceMsgId: stableMsgId
+        });
+        if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+
+        const result = await saveRevenue({
+          ownerId,
+          date: data.date || todayInTimeZone(tz),
+          description: data.description,
+          amount: data.amount,
+          source: data.source,
+          jobName,
+          category,
+          user: userProfile?.name || 'Unknown User',
+          sourceMsgId: stableMsgId,
+          from
+        });
+
+        console.info('[REVENUE] post-insert', { stableMsgId, inserted: result?.inserted });
+
+        const payerPart =
+          data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+
+        reply =
+          result.inserted === false
+            ? '✅ Already logged that payment (duplicate message).'
+            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+
+        await deletePendingTransactionState(from);
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      if (lcInput === 'edit' || lcInput === 'no') {
+        await setPendingTransactionState(from, {
+          ...pending,
+          isEditing: true,
+          type: 'revenue',
+          pendingCorrection: false,
+          awaitingRevenueClarification: false,
+          awaitingRevenueJob: false
+        });
+
+        reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      if (lcInput === 'cancel') {
+        await deletePendingTransactionState(from);
+        reply = '❌ Payment cancelled.';
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      reply = `⚠️ Please respond with 'yes', 'edit', or 'cancel'.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
-
-    if (lcInput === 'edit' || lcInput === 'no') {
-      await setPendingTransactionState(from, {
-        ...pending,
-        isEditing: true,
-        type: 'revenue',
-        pendingCorrection: false,
-        awaitingRevenueClarification: false,
-        awaitingRevenueJob: false
-      });
-
-      reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
-      return `<Response><Message>${reply}</Message></Response>`;
-    }
-
-    if (lcInput === 'cancel' || /^(stop)\b/.test(lcInput)) {
-      await deletePendingTransactionState(from);
-      reply = '❌ Payment cancelled.';
-      return `<Response><Message>${reply}</Message></Response>`;
-    }
-
-    reply = `⚠️ Please respond with 'yes', 'edit', or 'cancel'.`;
-    return `<Response><Message>${reply}</Message></Response>`;
-  }
-}
-
 
     // --- PARSE PATH (Deterministic first, AI fallback) ---
     const deterministic = await deterministicRevenueParse({ ownerId, input, tz });
@@ -541,15 +520,15 @@ if (pending?.pendingRevenue) {
     let aiReply = null;
 
     if (!data) {
-      const ai = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, {
+      const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, {
         date: todayInTimeZone(tz),
         description: 'Unknown',
         amount: '$0.00',
         source: 'Unknown'
       });
-      data = ai?.data || null;
-      confirmed = !!ai?.confirmed;
-      aiReply = ai?.reply || null;
+      data = aiRes?.data || null;
+      confirmed = !!aiRes?.confirmed;
+      aiReply = aiRes?.reply || null;
     }
 
     if (aiReply) {
@@ -558,7 +537,7 @@ if (pending?.pendingRevenue) {
         awaitingRevenueClarification: true,
         revenueClarificationPrompt: aiReply,
         revenueDraftText: input,
-        revenueSourceMsgId: msgId,
+        revenueSourceMsgId: safeMsgId,
         type: 'revenue'
       });
       return `<Response><Message>${aiReply}</Message></Response>`;
@@ -568,25 +547,33 @@ if (pending?.pendingRevenue) {
       if (!data.date) data.date = todayInTimeZone(tz);
 
       // ignore client/source missing errors for contractor revenue
-let errors = null;
-try {
-  // support both detectErrors(data, kind) and detectErrors(kind, data)
-  errors = await detectErrors(data, 'revenue');
-  if (errors == null) {
-    // try alternate signature if the implementation expects (kind, data)
-    errors = await detectErrors('revenue', data);
-  }
-} catch (e) {
-  console.warn('[REVENUE] detectErrors threw; ignoring (fail-open):', e?.message);
-  errors = null;
-}
+      let errors = null;
+      try {
+        // support both detectErrors(data, kind) and detectErrors(kind, data)
+        errors = await detectErrors(data, 'revenue');
+        if (errors == null) {
+          // try alternate signature if the implementation expects (kind, data)
+          errors = await detectErrors('revenue', data);
+        }
+      } catch (e) {
+        console.warn('[REVENUE] detectErrors threw; ignoring (fail-open):', e?.message);
+        errors = null;
+      }
 
-if (errors) {
-  const s = String(errors);
-  if (/client:\s*missing|source:\s*missing/i.test(s)) errors = null;
-}
+      if (errors) {
+        const s = String(errors);
+        if (/client:\s*missing|source:\s*missing/i.test(s)) errors = null;
+      }
 
-      const category = await categorizeEntry('revenue', data, ownerProfile);
+      // TIMEOUT categorization here too (prevents hangs on parse-path)
+      const category =
+        (await withTimeout(
+          Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
+          1200,
+          null
+        )) ||
+        null;
+
       data.suggestedCategory = category;
 
       // require job (or overhead)
@@ -597,7 +584,7 @@ if (errors) {
         await setPendingTransactionState(from, {
           pendingRevenue: data,
           awaitingRevenueJob: true,
-          revenueSourceMsgId: msgId,
+          revenueSourceMsgId: safeMsgId,
           type: 'revenue'
         });
         reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
@@ -607,7 +594,7 @@ if (errors) {
       // confirmed + clean => write
       if (confirmed && !errors) {
         const gate = assertRevenueCILOrClarify({
-          ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId
+          ownerId, from, userProfile, data, jobName, category, sourceMsgId: safeMsgId
         });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
@@ -620,7 +607,7 @@ if (errors) {
           jobName,
           category,
           user: userProfile?.name || 'Unknown User',
-          sourceMsgId: msgId,
+          sourceMsgId: safeMsgId,
           from
         });
 
@@ -630,16 +617,15 @@ if (errors) {
         reply =
           result.inserted === false
             ? '✅ Already logged that payment (duplicate message).'
-            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName} (Category: ${category})`;
+            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
         return `<Response><Message>${reply}</Message></Response>`;
       }
-console.info('[REVENUE] post-category', { stableMsgId, category });
 
       // else confirm
       await setPendingTransactionState(from, {
         pendingRevenue: { ...data, jobName },
-        revenueSourceMsgId: msgId,
+        revenueSourceMsgId: safeMsgId,
         type: 'revenue'
       });
 

@@ -147,6 +147,13 @@ async function findJobByName(ownerId, name) {
     return null;
   }
 }
+function withTimeout(promise, ms, fallbackValue = null) {
+  return Promise.race([
+    promise,
+    new Promise(resolve => setTimeout(() => resolve(fallbackValue), ms))
+  ]);
+}
+
 
 /**
  * Deterministic parse:
@@ -258,7 +265,9 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 async function saveRevenue({ ownerId, date, description, amount, source, jobName, category, user, sourceMsgId, from }) {
   const amountCents = toCents(amount);
   const amountDollars = toDollars(amount);
+
   if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+  if (!Number.isFinite(amountDollars) || amountDollars <= 0) throw new Error('Invalid amount');
 
   const ownerParam = String(ownerId || '').trim();
   const msgParam = String(sourceMsgId || '').trim() || null;
@@ -269,31 +278,56 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
   const payer = String(source || '').trim() || 'Unknown';
   const job = jobName ? String(jobName).trim() : null;
 
+  // NOTE: we do NOT include created_at in cols/vals.
+  // We always set created_at = now() in SQL to avoid mismatched column/value counts.
   const cols = [
-    'owner_id','kind','date','description',
+    'owner_id',
+    'kind',
+    'date',
+    'description',
     ...(canUseAmount ? ['amount'] : []),
-    'amount_cents','source','job','job_name','category','user_name',
-    ...(canUseMsgId ? ['source_msg_id'] : []),
-    'created_at'
+    'amount_cents',
+    'source',
+    'job',
+    'job_name',
+    'category',
+    'user_name',
+    ...(canUseMsgId ? ['source_msg_id'] : [])
   ];
 
   const vals = [
-    ownerParam,'revenue',date,String(description || '').trim() || 'Unknown',
+    ownerParam,
+    'revenue',
+    date,
+    String(description || '').trim() || 'Unknown',
     ...(canUseAmount ? [amountDollars] : []),
-    amountCents,payer,job,job,category ? String(category).trim() : null,
+    amountCents,
+    payer,
+    job,
+    job, // job_name mirrors job for compatibility
+    category ? String(category).trim() : null,
     user ? String(user).trim() : null,
-    ...(canUseMsgId ? [msgParam] : []),
+    ...(canUseMsgId ? [msgParam] : [])
   ];
 
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+
+  // Use ON CONFLICT only when source_msg_id exists (idempotency).
+  // Because your unique index is partial (WHERE source_msg_id IS NOT NULL),
+  // match it with a conflict target that includes the WHERE clause.
   const sql = canUseMsgId
-    ? `insert into public.transactions (${cols.join(', ')})
-       values (${placeholders}, now())
-       on conflict do nothing
-       returning id`
-    : `insert into public.transactions (${cols.join(', ')})
-       values (${placeholders}, now())
-       returning id`;
+    ? `
+      insert into public.transactions (${cols.join(', ')}, created_at)
+      values (${placeholders}, now())
+      on conflict (owner_id, source_msg_id) where source_msg_id is not null
+      do nothing
+      returning id
+    `
+    : `
+      insert into public.transactions (${cols.join(', ')}, created_at)
+      values (${placeholders}, now())
+      returning id
+    `;
 
   try {
     const res = await query(sql, vals);
@@ -311,6 +345,7 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
     throw e;
   }
 }
+
 
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
@@ -346,6 +381,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         reply = `Please confirm: Payment ${merged.amount} on ${merged.date}. Reply yes/edit/cancel.`;
         return `<Response><Message>${reply}</Message></Response>`;
       }
+      
+
 
       reply = `What date was this payment? (e.g., 2025-12-12 or "today")`;
       return `<Response><Message>${reply}</Message></Response>`;
@@ -370,93 +407,131 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       reply = `Please confirm: Payment ${merged.amount}${payerPart} on ${merged.date} for ${merged.jobName}. Reply yes/edit/cancel.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
+console.info('[REVENUE] pre-category', { stableMsgId });
+
+
 
     // --- CONFIRM FLOW ---
-    if (pending?.pendingRevenue) {
-      if (!isOwner) {
-        await deletePendingTransactionState(from);
-        reply = '⚠️ Only the owner can manage revenue.';
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
+if (pending?.pendingRevenue) {
+  if (!isOwner) {
+    await deletePendingTransactionState(from);
+    reply = '⚠️ Only the owner can manage revenue.';
+    return `<Response><Message>${reply}</Message></Response>`;
+  }
 
-      const lcInput = String(input || '').toLowerCase().trim();
-      const stableMsgId = String(pending.revenueSourceMsgId || msgId).trim();
+  const lcInput = String(input || '').toLowerCase().trim();
+  const stableMsgId = String(pending.revenueSourceMsgId || msgId).trim();
 
-      if (lcInput === 'yes') {
-        console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
+  // If user sends a fresh revenue command while we're waiting for yes/edit/cancel,
+  // treat it as a NEW command: clear pending and fall through into parse flow.
+  if (/^(revenue|rev|received)\b/.test(lcInput)) {
+    await deletePendingTransactionState(from);
+  } else {
+    if (lcInput === 'yes') {
+      console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
 
-        const data = pending.pendingRevenue || {};
-        const category =
-          data.suggestedCategory || (await categorizeEntry('revenue', data, ownerProfile));
+      const data = pending.pendingRevenue || {};
 
-        let jobName = (data.jobName && String(data.jobName).trim()) || null;
-        if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
+      // --- job required (contractor-first) ---
+      let jobName = (data.jobName && String(data.jobName).trim()) || null;
+      if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-        if (!jobName) {
-          await setPendingTransactionState(from, {
-            ...pending,
-            pendingRevenue: data,
-            awaitingRevenueJob: true,
-            revenueSourceMsgId: stableMsgId,
-            type: 'revenue'
-          });
-          reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
-          return `<Response><Message>${reply}</Message></Response>`;
-        }
-
-        const gate = assertRevenueCILOrClarify({
-          ownerId, from, userProfile, data, jobName, category, sourceMsgId: stableMsgId
-        });
-        if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
-
-        const result = await saveRevenue({
-          ownerId,
-          date: data.date || todayInTimeZone(tz),
-          description: data.description,
-          amount: data.amount,
-          source: data.source,
-          jobName,
-          category,
-          user: userProfile?.name || 'Unknown User',
-          sourceMsgId: stableMsgId,
-          from
-        });
-
-        const payerPart =
-          data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
-
-        reply =
-          result.inserted === false
-            ? '✅ Already logged that payment (duplicate message).'
-            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName} (Category: ${category})`;
-
-        await deletePendingTransactionState(from);
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
-
-      if (lcInput === 'edit' || lcInput === 'no') {
+      if (!jobName) {
         await setPendingTransactionState(from, {
           ...pending,
-          isEditing: true,
-          type: 'revenue',
-          pendingCorrection: false,
-          awaitingRevenueClarification: false,
-          awaitingRevenueJob: false
+          pendingRevenue: data,
+          awaitingRevenueJob: true,
+          revenueSourceMsgId: stableMsgId,
+          type: 'revenue'
         });
-
-        reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
+        reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      if (lcInput === 'cancel') {
-        await deletePendingTransactionState(from);
-        reply = '❌ Payment cancelled.';
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
+      // --- categorize (bounded) ---
+      console.info('[REVENUE] pre-category', { stableMsgId });
+      const category =
+        data.suggestedCategory ||
+        (await withTimeout(
+          Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
+          1200,
+          null
+        ));
+      console.info('[REVENUE] post-category', { stableMsgId, category });
 
-      reply = `⚠️ Please respond with 'yes', 'edit', or 'cancel'.`;
+      // --- CIL gate ---
+      const gate = assertRevenueCILOrClarify({
+        ownerId,
+        from,
+        userProfile,
+        data,
+        jobName,
+        category,
+        sourceMsgId: stableMsgId
+      });
+      if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+
+      // --- insert (log around DB call) ---
+      console.info('[REVENUE] pre-insert', {
+        stableMsgId,
+        ownerId,
+        date: data.date || todayInTimeZone(tz),
+        amount: data.amount,
+        jobName
+      });
+
+      const result = await saveRevenue({
+        ownerId,
+        date: data.date || todayInTimeZone(tz),
+        description: data.description,
+        amount: data.amount,
+        source: data.source,
+        jobName,
+        category,
+        user: userProfile?.name || 'Unknown User',
+        sourceMsgId: stableMsgId,
+        from
+      });
+
+      console.info('[REVENUE] post-insert', { stableMsgId, inserted: result?.inserted });
+
+      const payerPart =
+        data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+
+      reply =
+        result.inserted === false
+          ? '✅ Already logged that payment (duplicate message).'
+          : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+
+      await deletePendingTransactionState(from);
       return `<Response><Message>${reply}</Message></Response>`;
     }
+
+    if (lcInput === 'edit' || lcInput === 'no') {
+      await setPendingTransactionState(from, {
+        ...pending,
+        isEditing: true,
+        type: 'revenue',
+        pendingCorrection: false,
+        awaitingRevenueClarification: false,
+        awaitingRevenueJob: false
+      });
+
+      reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
+      return `<Response><Message>${reply}</Message></Response>`;
+    }
+
+    if (lcInput === 'cancel' || /^(stop)\b/.test(lcInput)) {
+      await deletePendingTransactionState(from);
+      reply = '❌ Payment cancelled.';
+      return `<Response><Message>${reply}</Message></Response>`;
+    }
+
+    reply = `⚠️ Please respond with 'yes', 'edit', or 'cancel'.`;
+    return `<Response><Message>${reply}</Message></Response>`;
+  }
+}
+
 
     // --- PARSE PATH (Deterministic first, AI fallback) ---
     const deterministic = await deterministicRevenueParse({ ownerId, input, tz });
@@ -559,6 +634,7 @@ if (errors) {
 
         return `<Response><Message>${reply}</Message></Response>`;
       }
+console.info('[REVENUE] post-category', { stableMsgId, category });
 
       // else confirm
       await setPendingTransactionState(from, {

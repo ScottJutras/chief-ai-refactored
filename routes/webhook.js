@@ -235,11 +235,10 @@ router.post('*', async (req, res, next) => {
 
   try {
     const pending = await getPendingTransactionState(req.from);
-
     const hasPendingMedia = pending && pending.pendingMedia;
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // Normal text pipeline (define EARLY so we can use it for nudges)
+    // ✅ DEFINE TEXT EARLY (so "yes" / hard-command nudge can work)
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();
 
@@ -252,15 +251,12 @@ router.post('*', async (req, res, next) => {
       !!pending?.awaitingRevenueJob ||
       !!pending?.awaitingRevenueClarification;
 
-    const pendingExpenseFlow =
-      !!pending?.pendingExpense ||
-      !!pending?.awaitingExpenseJob ||
-      !!pending?.awaitingExpenseClarification;
-
     if (pendingRevenueFlow) {
       // cancel/stop/no cancels revenue at ANY step
       if (/^(cancel|stop|no)\b/.test(lc)) {
-        await tryClearPendingTxn(req.from);
+        try {
+          await require('../utils/stateManager').deletePendingTransactionState?.(req.from);
+        } catch {}
         return ok(res, `❌ Revenue cancelled.`);
       }
 
@@ -275,25 +271,11 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    if (pendingExpenseFlow) {
-      if (/^(cancel|stop|no)\b/.test(lc)) {
-        await tryClearPendingTxn(req.from);
-        return ok(res, `❌ Expense cancelled.`);
-      }
-      if (lc === 'skip') {
-        return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
-      }
-      if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) {
-        return ok(res, pendingTxnNudgeMessage({ type: 'expense' }));
-      }
-    }
-
     // If we were waiting for media but none came, let media handler interpret text-only follow-up
     if (hasPendingMedia && numMedia === 0) {
-      const bodyText = String(req.body?.Body || '').trim();
       const result = await handleMedia(
         req.from,
-        bodyText,
+        text,
         req.userProfile || {},
         req.ownerId,
         null,
@@ -312,6 +294,7 @@ router.post('*', async (req, res, next) => {
         }
       }
     }
+
 
     // Canonical idempotency key for ingestion (Twilio)
     const crypto = require('crypto');

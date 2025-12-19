@@ -15,7 +15,6 @@ const { validateCIL } = require('../../cil');
 
 // ---- column presence caches (safe in serverless) ----
 let _hasSourceMsgIdCol = null;
-// NOTE: your schema shows "amount" exists and is NOT NULL, but keep cache for safety
 let _hasAmountCol = null;
 
 async function hasColumn(table, col) {
@@ -33,25 +32,17 @@ async function hasColumn(table, col) {
 
 async function hasSourceMsgIdColumn() {
   if (_hasSourceMsgIdCol !== null) return _hasSourceMsgIdCol;
-  try {
-    _hasSourceMsgIdCol = await hasColumn('transactions', 'source_msg_id');
-  } catch {
-    _hasSourceMsgIdCol = false;
-  }
+  try { _hasSourceMsgIdCol = await hasColumn('transactions', 'source_msg_id'); }
+  catch { _hasSourceMsgIdCol = false; }
   return _hasSourceMsgIdCol;
 }
 
 async function hasAmountColumn() {
   if (_hasAmountCol !== null) return _hasAmountCol;
-  try {
-    _hasAmountCol = await hasColumn('transactions', 'amount');
-  } catch {
-    _hasAmountCol = false;
-  }
+  try { _hasAmountCol = await hasColumn('transactions', 'amount'); }
+  catch { _hasAmountCol = false; }
   return _hasAmountCol;
 }
-
-// ------------------ money + date helpers ------------------
 
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
@@ -65,19 +56,10 @@ function toDollars(amountStr) {
   return n;
 }
 
-function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(str || '')
-  );
-}
-
 function todayInTimeZone(tz) {
   try {
     const dtf = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
     });
     return dtf.format(new Date()); // YYYY-MM-DD
   } catch {
@@ -90,42 +72,30 @@ function parseNaturalDate(s, tz) {
   const today = todayInTimeZone(tz);
 
   if (!t || t === 'today') return today;
-
   if (t === 'yesterday') {
     const d = new Date(`${today}T12:00:00Z`);
     d.setUTCDate(d.getUTCDate() - 1);
     return d.toISOString().split('T')[0];
   }
-
   if (t === 'tomorrow') {
     const d = new Date(`${today}T12:00:00Z`);
     d.setUTCDate(d.getUTCDate() + 1);
     return d.toISOString().split('T')[0];
   }
-
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
 
   const parsed = Date.parse(s);
   if (!Number.isNaN(parsed)) return new Date(parsed).toISOString().split('T')[0];
-
   return null;
 }
 
-// ------------------ contractor-first job helpers ------------------
+// ---------- contractor-first parsing helpers ----------
 
 function normalizeJobAnswer(text) {
   let s = String(text || '').trim();
-
-  // Strip common prefixes
   s = s.replace(/^(job\s*name|job)\s*[:\-]?\s*/i, '');
-
-  // If user accidentally types a command while answering the job question,
-  // do NOT create anything here; just use the remainder as the job name.
   s = s.replace(/^(create|new)\s+job\s+/i, '');
-
-  // Trim trailing punctuation like '?'
   s = s.replace(/[?]+$/g, '').trim();
-
   return s;
 }
 
@@ -134,11 +104,10 @@ function looksLikeOverhead(s) {
   return t === 'overhead' || t === 'oh';
 }
 
-// very light "address-like" heuristic (helps for "from 1556 Medway Park Dr")
 function looksLikeAddress(s) {
   const t = String(s || '').trim();
   if (!/\d/.test(t)) return false;
-  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pk|pkwy|park)\b/i.test(t);
+  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pkwy|park)\b/i.test(t);
 }
 
 async function findJobByName(ownerId, name) {
@@ -152,103 +121,91 @@ async function findJobByName(ownerId, name) {
       select job_no, coalesce(name, job_name) as job_name
         from public.jobs
        where owner_id = $1
-         and (
-           lower(coalesce(name, job_name)) = lower($2)
-           or lower(name) = lower($2)
-           or lower(job_name) = lower($2)
-         )
+         and lower(coalesce(name, job_name)) = lower($2)
        order by created_at desc
        limit 1
       `,
       [ownerParam, n]
     );
     return rows?.[0] || null;
-  } catch (e) {
-    console.warn('[revenue] findJobByName failed:', e?.message);
+  } catch {
     return null;
   }
 }
 
 /**
- * If a parsed "source" looks like a job (matches existing job or looks like an address),
- * treat it as jobName (contractor-first) and make payer optional.
+ * Deterministic parse:
+ * - amount: $100 or 100
+ * - date: today/yesterday/tomorrow/YYYY-MM-DD
+ * - job: "for <job>" OR "on <job>" OR "job <job>" OR address-like token after "from" if it looks like job/address
+ * - payer optional: only if it DOESN’T look like address/job
  */
-async function coerceSourceToJobIfLikely({ ownerId, data }) {
-  if (!data) return data;
-  const out = { ...data };
+async function deterministicRevenueParse({ ownerId, input, tz }) {
+  const raw = String(input || '').trim();
+  const lc = raw.toLowerCase();
 
-  const source = String(out.source || '').trim();
-  const hasJobAlready = !!(out.jobName && String(out.jobName).trim());
+  // amount
+  const amtMatch =
+    raw.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/) ||
+    raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
 
-  if (!hasJobAlready && source && source.toLowerCase() !== 'unknown') {
-    const jobHit = await findJobByName(ownerId, source);
+  if (!amtMatch) return null;
 
-    // If it matches an existing job OR looks like an address, treat it as the job
-    if (jobHit || looksLikeAddress(source)) {
-      out.jobName = source;
-      // payer/client becomes optional; don’t force it
-      out.source = 'Unknown';
-      // description stays as-is (memo)
+  const amountNum = amtMatch[1];
+  const amount = `$${Number(amountNum).toFixed(2)}`;
+
+  // date
+  let date = null;
+  if (/\btoday\b/i.test(raw)) date = parseNaturalDate('today', tz);
+  else if (/\byesterday\b/i.test(raw)) date = parseNaturalDate('yesterday', tz);
+  else if (/\btomorrow\b/i.test(raw)) date = parseNaturalDate('tomorrow', tz);
+  else {
+    const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+    if (iso) date = iso[1];
+  }
+  if (!date) date = todayInTimeZone(tz);
+
+  // job patterns
+  let jobName = null;
+
+  const forMatch = raw.match(/\bfor\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
+  if (forMatch?.[1]) jobName = normalizeJobAnswer(forMatch[1]);
+
+  if (!jobName) {
+    const onMatch = raw.match(/\bon\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
+    if (onMatch?.[1]) jobName = normalizeJobAnswer(onMatch[1]);
+  }
+
+  if (!jobName) {
+    const jobMatch = raw.match(/\bjob\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
+    if (jobMatch?.[1]) jobName = normalizeJobAnswer(jobMatch[1]);
+  }
+
+  // "from X" might be job/address or payer
+  let source = 'Unknown';
+  const fromMatch = raw.match(/\bfrom\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
+  if (fromMatch?.[1]) {
+    const token = normalizeJobAnswer(fromMatch[1]);
+    const jobHit = await findJobByName(ownerId, token);
+    if (jobHit || looksLikeAddress(token)) {
+      jobName = jobName || token; // treat as job
+      source = 'Unknown';
+    } else {
+      source = token; // treat as payer
     }
   }
 
-  return out;
+  // overhead normalization
+  if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
+
+  return {
+    date,
+    description: 'Unknown',
+    amount,
+    source,
+    jobName
+  };
 }
-
-/**
- * Resolve active job name safely (avoid int=uuid comparisons).
- * Priority:
- *  1) userProfile.active_job_name
- *  2) userProfile.active_job_id (uuid) -> jobs.id
- *  3) userProfile.active_job_id numeric -> jobs.job_no
- */
-async function resolveActiveJobName({ ownerId, userProfile }) {
-  const ownerParam = String(ownerId || '').trim();
-
-  const name = userProfile?.active_job_name || userProfile?.activeJobName || null;
-  if (name && String(name).trim()) return String(name).trim();
-
-  const ref = userProfile?.active_job_id ?? userProfile?.activeJobId ?? null;
-  if (ref == null) return null;
-
-  const s = String(ref).trim();
-
-  // UUID jobs.id
-  if (looksLikeUuid(s)) {
-    try {
-      const r = await query(
-        `select coalesce(name, job_name) as job_name
-           from public.jobs
-          where owner_id = $1 and id = $2::uuid
-          limit 1`,
-        [ownerParam, s]
-      );
-      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
-    } catch (e) {
-      console.warn('[revenue] resolveActiveJobName uuid failed:', e?.message);
-    }
-  }
-
-  // Integer jobs.job_no
-  if (/^\d+$/.test(s)) {
-    try {
-      const r = await query(
-        `select coalesce(name, job_name) as job_name
-           from public.jobs
-          where owner_id = $1 and job_no = $2::int
-          limit 1`,
-        [ownerParam, Number(s)]
-      );
-      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
-    } catch (e) {
-      console.warn('[revenue] resolveActiveJobName job_no failed:', e?.message);
-    }
-  }
-
-  return null;
-}
-
-// ------------------ CIL ------------------
 
 function buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
@@ -258,21 +215,15 @@ function buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, 
     tenant_id: String(ownerId),
     source: 'whatsapp',
     source_msg_id: String(sourceMsgId),
-
     actor: {
       actor_id: String(userProfile?.user_id || from || 'unknown'),
-      role: 'owner',
-      phone_e164: from && String(from).startsWith('+') ? String(from) : undefined
+      role: 'owner'
     },
-
     occurred_at: new Date().toISOString(),
     job: jobName ? { job_name: String(jobName) } : null,
     needs_job_resolution: !jobName,
-
     amount_cents: cents,
     currency: 'CAD',
-
-    // payer is OPTIONAL now (contractor-first)
     payer: data.source && data.source !== 'Unknown' ? String(data.source) : undefined,
     memo: data.description && data.description !== 'Unknown' ? String(data.description) : undefined,
     category: category ? String(category) : undefined
@@ -285,93 +236,49 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
     validateCIL(cil);
     return { ok: true, cil };
   } catch {
-    return {
-      ok: false,
-      // contractor-first copy
-      reply: `⚠️ Couldn't log that payment yet. Try: "revenue 2500 for <job>" (payer optional).`
-    };
+    return { ok: false, reply: `⚠️ Couldn't log that payment yet. Try: "received 2500 for <job> today".` };
   }
 }
 
-// ------------------ DB write ------------------
-
-/**
- * Persist to transactions (based on your schema dump):
- * id (serial), owner_id (varchar, FK to users.user_id), kind, date, description, amount (numeric), amount_cents (bigint),
- * source, job (varchar), job_name (text), category, user_name, source_msg_id, created_at
- *
- * We write BOTH job and job_name for maximum compatibility.
- */
-async function saveRevenue({ ownerId, date, description, amount, source, jobName, category, user, sourceMsgId, from, messageSid }) {
+async function saveRevenue({ ownerId, date, description, amount, source, jobName, category, user, sourceMsgId, from }) {
   const amountCents = toCents(amount);
   const amountDollars = toDollars(amount);
-
   if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
-  if (!amountDollars || amountDollars <= 0) throw new Error('Invalid amount');
 
   const ownerParam = String(ownerId || '').trim();
   const msgParam = String(sourceMsgId || '').trim() || null;
 
-  // payer is optional; keep Unknown if absent
-  const payer = String(source || '').trim() || 'Unknown';
+  const canUseMsgId = await hasSourceMsgIdColumn();
+  const canUseAmount = await hasAmountColumn();
 
-  // job is required for your contractor flow (allow "Overhead")
+  const payer = String(source || '').trim() || 'Unknown';
   const job = jobName ? String(jobName).trim() : null;
 
-  // detect columns
-  const canUseMsgId = await hasSourceMsgIdColumn();
-  const canUseAmount = await hasAmountColumn(); // should be true in your DB
-
   const cols = [
-    'owner_id',
-    'kind',
-    'date',
-    'description',
-    'amount_cents',
-    'source',
-    'job',
-    'job_name',
-    'category',
-    'user_name',
+    'owner_id','kind','date','description',
+    ...(canUseAmount ? ['amount'] : []),
+    'amount_cents','source','job','job_name','category','user_name',
+    ...(canUseMsgId ? ['source_msg_id'] : []),
     'created_at'
   ];
+
   const vals = [
-    ownerParam,
-    'revenue',
-    date,
-    String(description || '').trim() || 'Unknown',
-    amountCents,
-    payer,
-    job,
-    job, // job_name mirrors job
-    category ? String(category).trim() : null,
-    user ? String(user).trim() : null
+    ownerParam,'revenue',date,String(description || '').trim() || 'Unknown',
+    ...(canUseAmount ? [amountDollars] : []),
+    amountCents,payer,job,job,category ? String(category).trim() : null,
+    user ? String(user).trim() : null,
+    ...(canUseMsgId ? [msgParam] : []),
   ];
 
-  if (canUseAmount) {
-    cols.splice(4, 0, 'amount');      // insert amount before amount_cents
-    vals.splice(4, 0, amountDollars); // keep alignment
-  }
-
-  if (canUseMsgId) {
-    cols.splice(cols.length - 1, 0, 'source_msg_id');
-    vals.splice(vals.length - 1, 0, msgParam);
-  }
-
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
-
   const sql = canUseMsgId
-    ? `
-      insert into public.transactions (${cols.join(', ')})
-      values (${placeholders})
-      on conflict do nothing
-      returning id
-    `
-    : `
-      insert into public.transactions (${cols.join(', ')})
-      values (${placeholders})
-      returning id
-    `;
+    ? `insert into public.transactions (${cols.join(', ')})
+       values (${placeholders}, now())
+       on conflict do nothing
+       returning id`
+    : `insert into public.transactions (${cols.join(', ')})
+       values (${placeholders}, now())
+       returning id`;
 
   try {
     const res = await query(sql, vals);
@@ -381,45 +288,14 @@ async function saveRevenue({ ownerId, date, description, amount, source, jobName
     console.error('[REVENUE] insert failed', {
       ownerId: ownerParam,
       from,
-      messageSid,
       code: e?.code,
       detail: e?.detail,
       constraint: e?.constraint,
-      table: e?.table,
-      column: e?.column,
       message: e?.message
     });
     throw e;
   }
 }
-
-// ------------------ pending job requirement ------------------
-
-async function ensureJobOrAsk(from, pending, data, msgId) {
-  const stableMsgId = String(pending?.revenueSourceMsgId || msgId).trim();
-
-  const jobCandidate =
-    (data?.jobName && String(data.jobName).trim()) ||
-    null;
-
-  if (jobCandidate) return { ok: true, jobName: jobCandidate, stableMsgId };
-
-  await setPendingTransactionState(from, {
-    ...(pending || {}),
-    pendingRevenue: data,
-    awaitingRevenueJob: true,
-    revenueSourceMsgId: stableMsgId,
-    type: 'revenue'
-  });
-
-  return {
-    ok: false,
-    reply: `Which job is this payment for? Reply with the job name (or "Overhead").`,
-    stableMsgId
-  };
-}
-
-// ------------------ main handler ------------------
 
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
@@ -429,41 +305,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
   try {
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
-    const defaultData = {
-      date: todayInTimeZone(tz),
-      description: 'Unknown',
-      amount: '$0.00',
-      source: 'Unknown'
-    };
-
     let pending = await getPendingTransactionState(from);
 
-    console.log('[REVENUE] pending keys:', {
-      pendingRevenue: !!pending?.pendingRevenue,
-      awaitingRevenueClarification: !!pending?.awaitingRevenueClarification,
-      awaitingRevenueJob: !!pending?.awaitingRevenueJob,
-      pendingCorrection: !!pending?.pendingCorrection,
-      isEditing: !!pending?.isEditing,
-      type: pending?.type
-    });
-
-    // ✅ If user previously hit "edit", treat this message as brand new revenue input
+    // If user previously hit "edit", treat this message as brand new revenue command.
     if (pending?.isEditing && pending?.type === 'revenue') {
       await deletePendingTransactionState(from);
       pending = null;
-    }
-
-    // Normalize aiErrorHandler pendingCorrection -> pendingRevenue
-    if (pending?.pendingCorrection && pending?.type === 'revenue' && pending?.pendingData) {
-      const data = pending.pendingData;
-      await setPendingTransactionState(from, {
-        ...pending,
-        pendingRevenue: data,
-        pendingCorrection: false,
-        revenueSourceMsgId: pending.revenueSourceMsgId || msgId,
-        type: 'revenue'
-      });
-      pending = await getPendingTransactionState(from);
     }
 
     // Follow-up: revenue clarification (date, etc.)
@@ -481,7 +328,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           awaitingRevenueClarification: false
         });
 
-        // contractor-first copy (payer optional, job next)
         reply = `Please confirm: Payment ${merged.amount} on ${merged.date}. Reply yes/edit/cancel.`;
         return `<Response><Message>${reply}</Message></Response>`;
       }
@@ -493,8 +339,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     // Follow-up: ask for job
     if (pending?.awaitingRevenueJob && pending?.pendingRevenue) {
       const jobReply = normalizeJobAnswer(input);
-
-      // Allow "Overhead"
       const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : jobReply;
 
       const merged = { ...pending.pendingRevenue, jobName: finalJob };
@@ -505,7 +349,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         awaitingRevenueJob: false
       });
 
-      // payer optional; show it only if present and not Unknown
       const payerPart =
         merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
 
@@ -524,112 +367,100 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       const lcInput = String(input || '').toLowerCase().trim();
       const stableMsgId = String(pending.revenueSourceMsgId || msgId).trim();
 
-      // If user sends a fresh revenue command while waiting for yes/edit/cancel,
-      // treat as new command: clear pending and fall through into parse.
-      if (/^(revenue|rev|received)\b/.test(lcInput)) {
-        await deletePendingTransactionState(from);
-        pending = null;
-      } else {
-        if (lcInput === 'yes') {
-          const data0 = pending.pendingRevenue || {};
+      if (lcInput === 'yes') {
+        console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
 
-          // contractor-first coercion (if source looks like job)
-          const data = await coerceSourceToJobIfLikely({ ownerId, data: data0 });
+        const data = pending.pendingRevenue || {};
+        const category =
+          data.suggestedCategory || (await categorizeEntry('revenue', data, ownerProfile));
 
-          // enforce job required
-          const resolvedActive = await resolveActiveJobName({ ownerId, userProfile });
-          let jobName =
-            (data.jobName && String(data.jobName).trim()) ||
-            (resolvedActive && String(resolvedActive).trim()) ||
-            null;
+        let jobName = (data.jobName && String(data.jobName).trim()) || null;
+        if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-          if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
-
-          if (!jobName) {
-            await setPendingTransactionState(from, {
-              ...pending,
-              pendingRevenue: data,
-              awaitingRevenueJob: true,
-              revenueSourceMsgId: stableMsgId,
-              type: 'revenue'
-            });
-            reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
-            return `<Response><Message>${reply}</Message></Response>`;
-          }
-
-          const category =
-            data.suggestedCategory || (await categorizeEntry('revenue', data, ownerProfile));
-
-          const gate = assertRevenueCILOrClarify({
-            ownerId,
-            from,
-            userProfile,
-            data,
-            jobName,
-            category,
-            sourceMsgId: stableMsgId
-          });
-          if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
-
-          const result = await saveRevenue({
-            ownerId,
-            date: data.date || todayInTimeZone(tz),
-            description: data.description,
-            amount: data.amount,
-            source: data.source, // optional
-            jobName,
-            category,
-            user: userProfile?.name || 'Unknown User',
-            sourceMsgId: stableMsgId,
-            from,
-            messageSid: stableMsgId
-          });
-
-          const payerPart =
-            data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
-
-          reply =
-            result.inserted === false
-              ? '✅ Already logged that payment (duplicate message).'
-              : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName} (Category: ${category})`;
-
-          await deletePendingTransactionState(from);
-          return `<Response><Message>${reply}</Message></Response>`;
-        }
-
-        if (lcInput === 'edit' || lcInput === 'no') {
+        if (!jobName) {
           await setPendingTransactionState(from, {
             ...pending,
-            isEditing: true,
-            type: 'revenue',
-            pendingCorrection: false,
-            awaitingRevenueClarification: false,
-            awaitingRevenueJob: false
+            pendingRevenue: data,
+            awaitingRevenueJob: true,
+            revenueSourceMsgId: stableMsgId,
+            type: 'revenue'
           });
-
-          reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
+          reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
           return `<Response><Message>${reply}</Message></Response>`;
         }
 
-        if (lcInput === 'cancel') {
-          await deletePendingTransactionState(from);
-          reply = '❌ Payment cancelled.';
-          return `<Response><Message>${reply}</Message></Response>`;
-        }
+        const gate = assertRevenueCILOrClarify({
+          ownerId, from, userProfile, data, jobName, category, sourceMsgId: stableMsgId
+        });
+        if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
-        reply = `⚠️ Please respond with 'yes', 'edit', or 'cancel'.`;
+        const result = await saveRevenue({
+          ownerId,
+          date: data.date || todayInTimeZone(tz),
+          description: data.description,
+          amount: data.amount,
+          source: data.source,
+          jobName,
+          category,
+          user: userProfile?.name || 'Unknown User',
+          sourceMsgId: stableMsgId,
+          from
+        });
+
+        const payerPart =
+          data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+
+        reply =
+          result.inserted === false
+            ? '✅ Already logged that payment (duplicate message).'
+            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName} (Category: ${category})`;
+
+        await deletePendingTransactionState(from);
         return `<Response><Message>${reply}</Message></Response>`;
       }
+
+      if (lcInput === 'edit' || lcInput === 'no') {
+        await setPendingTransactionState(from, {
+          ...pending,
+          isEditing: true,
+          type: 'revenue',
+          pendingCorrection: false,
+          awaitingRevenueClarification: false,
+          awaitingRevenueJob: false
+        });
+
+        reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      if (lcInput === 'cancel') {
+        await deletePendingTransactionState(from);
+        reply = '❌ Payment cancelled.';
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
+
+      reply = `⚠️ Please respond with 'yes', 'edit', or 'cancel'.`;
+      return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // --- AI PARSE PATH ---
-    const { data: rawData, reply: aiReply, confirmed } = await handleInputWithAI(
-      from,
-      input,
-      'revenue',
-      parseRevenueMessage,
-      defaultData
-    );
+    // --- PARSE PATH (Deterministic first, AI fallback) ---
+    const deterministic = await deterministicRevenueParse({ ownerId, input, tz });
+
+    let data = deterministic;
+    let confirmed = true;
+    let aiReply = null;
+
+    if (!data) {
+      const ai = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, {
+        date: todayInTimeZone(tz),
+        description: 'Unknown',
+        amount: '$0.00',
+        source: 'Unknown'
+      });
+      data = ai?.data || null;
+      confirmed = !!ai?.confirmed;
+      aiReply = ai?.reply || null;
+    }
 
     if (aiReply) {
       await setPendingTransactionState(from, {
@@ -643,55 +474,38 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${aiReply}</Message></Response>`;
     }
 
-    // contractor-first coercion (if source looks like job)
-    const data = await coerceSourceToJobIfLikely({ ownerId, data: rawData });
-
-    // Make payer/client optional: do NOT require data.source to exist
     if (data && data.amount && data.amount !== '$0.00') {
-      // If date missing, default it
       if (!data.date) data.date = todayInTimeZone(tz);
 
-      // detectErrors may complain about client/source — ignore those for revenue
+      // ignore client/source missing errors for contractor revenue
       let errors = await detectErrors(data, 'revenue');
       if (errors) {
         const s = String(errors);
-        // strip common "client/source missing" warnings from blocking the flow
         if (/client:\s*missing|source:\s*missing/i.test(s)) errors = null;
       }
 
       const category = await categorizeEntry('revenue', data, ownerProfile);
       data.suggestedCategory = category;
 
-      // Resolve job: explicit jobName on data, else active job
-      const resolvedActive = await resolveActiveJobName({ ownerId, userProfile });
-      let jobName =
-        (data.jobName && String(data.jobName).trim()) ||
-        (resolvedActive && String(resolvedActive).trim()) ||
-        null;
-
+      // require job (or overhead)
+      let jobName = (data.jobName && String(data.jobName).trim()) || null;
       if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-      // If clean + confirmed => enforce job, then write
-      if (confirmed && !errors) {
-        if (!jobName) {
-          await setPendingTransactionState(from, {
-            pendingRevenue: data,
-            awaitingRevenueJob: true,
-            revenueSourceMsgId: msgId,
-            type: 'revenue'
-          });
-          reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
-          return `<Response><Message>${reply}</Message></Response>`;
-        }
+      if (!jobName) {
+        await setPendingTransactionState(from, {
+          pendingRevenue: data,
+          awaitingRevenueJob: true,
+          revenueSourceMsgId: msgId,
+          type: 'revenue'
+        });
+        reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
 
+      // confirmed + clean => write
+      if (confirmed && !errors) {
         const gate = assertRevenueCILOrClarify({
-          ownerId,
-          from,
-          userProfile,
-          data,
-          jobName,
-          category,
-          sourceMsgId: msgId
+          ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId
         });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
@@ -700,13 +514,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           date: data.date,
           description: data.description,
           amount: data.amount,
-          source: data.source, // optional
+          source: data.source,
           jobName,
           category,
           user: userProfile?.name || 'Unknown User',
           sourceMsgId: msgId,
-          from,
-          messageSid: msgId
+          from
         });
 
         const payerPart =
@@ -720,18 +533,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      // Otherwise: enforce job before confirm prompt (contractor UX)
-      if (!jobName) {
-        await setPendingTransactionState(from, {
-          pendingRevenue: data,
-          awaitingRevenueJob: true,
-          revenueSourceMsgId: msgId,
-          type: 'revenue'
-        });
-        reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
-
+      // else confirm
       await setPendingTransactionState(from, {
         pendingRevenue: { ...data, jobName },
         revenueSourceMsgId: msgId,
@@ -758,9 +560,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
   } finally {
     try {
       await require('../../middleware/lock').releaseLock(lockKey);
-    } catch {
-      // never hard-fail
-    }
+    } catch {}
   }
 }
 

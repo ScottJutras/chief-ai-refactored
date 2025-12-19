@@ -198,6 +198,15 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}) {
   let errors = null;
   try {
     errors = await detectErrorsImpl(data, type);
+    // ✅ contractor-first: revenue payer/client is optional
+if (type === 'revenue' && errors) {
+  const s = JSON.stringify(errors);
+  if (/client|payer|source/i.test(s) && /missing/i.test(s)) {
+    // remove client/source missing complaints from blocking revenue ingestion
+    errors = null;
+  }
+}
+
   } catch (e) {
     console.warn(`[WARN] detectErrors failed for ${type}:`, e?.message);
     errors = null;
@@ -258,7 +267,7 @@ async function categorizeEntry(type, data, userProfile, categories) {
  * Deterministic parsers (keep these simple; they feed the CIL gate)
  */
 function parseExpenseMessage(input) {
-  const match = input.match(/^(?:expense\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
+  const match = input.match(/^(?:expense\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:from|at)\s+(.+))?$/i);
   if (!match) return null;
   return {
     date: new Date().toISOString().split('T')[0],
@@ -326,6 +335,8 @@ function parseRevenueMessage(input) {
   // 1) "revenue $100 from John today"
   // 2) "revenue from John $100 today"
   // 3) "received $100 from John"
+  // 4) "received $100 from job 1556 Medway Park Dr today"
+  // 5) "received $100 for 1556 Medway Park Dr today"
   const lower = text.toLowerCase();
   if (!/^(revenue|rev|received)\b/i.test(lower)) return null;
 
@@ -334,29 +345,88 @@ function parseRevenueMessage(input) {
 
   // Peel off trailing date token (today / on YYYY-MM-DD / Dec 12 2025)
   const { rest, date } = stripDateTail(body);
+  const d = date || new Date().toISOString().split('T')[0];
 
-  // Pattern A: "$100 from John"
-  let m = rest.match(/^\$?(?<amt>\d+(?:\.\d{1,2})?)\s+(?:from\s+)?(?<src>.+)$/i);
+  // Helpers
+  const asAmount = (amt) => `$${parseFloat(amt).toFixed(2)}`;
+  const normalizeJobPrefix = (s) =>
+    String(s || '')
+      .trim()
+      .replace(/^(job|job\s*name)\s*[:\-]?\s*/i, '')
+      .trim();
+
+  // Pattern A: "$100 from X" OR "$100 for X"
+  let m = rest.match(/^\$?(?<amt>\d+(?:\.\d{1,2})?)\s+(?:(?<kw>from|for)\s+)?(?<src>.+)$/i);
   if (m?.groups?.amt && m?.groups?.src) {
-    const src = m.groups.src.trim();
-    const d = date || new Date().toISOString().split('T')[0];
+    let src = m.groups.src.trim();
+    const kw = (m.groups.kw || '').toLowerCase();
+
+    // If "for ..." treat as job
+    if (kw === 'for') {
+      const jobName = normalizeJobPrefix(src);
+      return {
+        date: d,
+        description: `Payment for ${jobName}`,
+        amount: asAmount(m.groups.amt),
+        source: 'Unknown',
+        jobName
+      };
+    }
+
+    // If "from job ..." treat as job; otherwise treat as payer
+    const srcLc = src.toLowerCase();
+    if (srcLc.startsWith('job ') || srcLc.startsWith('jobname ') || srcLc.startsWith('job:')) {
+      const jobName = normalizeJobPrefix(src.replace(/^jobname\b/i, 'job'));
+      return {
+        date: d,
+        description: `Payment for ${jobName}`,
+        amount: asAmount(m.groups.amt),
+        source: 'Unknown',
+        jobName
+      };
+    }
+
     return {
       date: d,
       description: `Payment from ${src}`,
-      amount: `$${parseFloat(m.groups.amt).toFixed(2)}`,
+      amount: asAmount(m.groups.amt),
       source: src
     };
   }
 
-  // Pattern B: "from John $100"
-  m = rest.match(/^(?:from\s+)?(?<src>.+?)\s+\$?(?<amt>\d+(?:\.\d{1,2})?)$/i);
+  // Pattern B: "from X $100" OR "for X $100"
+  m = rest.match(/^(?:(?<kw>from|for)\s+)?(?<src>.+?)\s+\$?(?<amt>\d+(?:\.\d{1,2})?)$/i);
   if (m?.groups?.amt && m?.groups?.src) {
-    const src = m.groups.src.trim();
-    const d = date || new Date().toISOString().split('T')[0];
+    let src = m.groups.src.trim();
+    const kw = (m.groups.kw || '').toLowerCase();
+
+    if (kw === 'for') {
+      const jobName = normalizeJobPrefix(src);
+      return {
+        date: d,
+        description: `Payment for ${jobName}`,
+        amount: asAmount(m.groups.amt),
+        source: 'Unknown',
+        jobName
+      };
+    }
+
+    const srcLc = src.toLowerCase();
+    if (srcLc.startsWith('job ') || srcLc.startsWith('jobname ') || srcLc.startsWith('job:')) {
+      const jobName = normalizeJobPrefix(src.replace(/^jobname\b/i, 'job'));
+      return {
+        date: d,
+        description: `Payment for ${jobName}`,
+        amount: asAmount(m.groups.amt),
+        source: 'Unknown',
+        jobName
+      };
+    }
+
     return {
       date: d,
       description: `Payment from ${src}`,
-      amount: `$${parseFloat(m.groups.amt).toFixed(2)}`,
+      amount: asAmount(m.groups.amt),
       source: src
     };
   }
@@ -376,7 +446,7 @@ function parseQuoteMessage(input) {
 }
 
 function parseJobMessage(input) {
-  const match = input.match(/^(start job|create job)\s+(.+)/i);
+  const match = input.match(/^(start job|create job|new job|add job)\s+(.+)/i);
   if (!match) return null;
   return { jobName: match[2].trim() };
 }
@@ -387,7 +457,10 @@ module.exports = {
   correctErrorsWithAI,
   categorizeEntry,
 
-  // date utils (exported so revenue.js can reuse tz-aware parsing if you want)
+  // ✅ add this line
+  detectErrors: detectErrorsImpl,
+
+  // date utils
   todayInTimeZone,
   parseNaturalDate,
   stripDateTail,
@@ -399,3 +472,4 @@ module.exports = {
   parseQuoteMessage,
   parseJobMessage,
 };
+

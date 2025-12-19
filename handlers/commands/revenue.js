@@ -5,12 +5,27 @@ const {
   setPendingTransactionState,
   deletePendingTransactionState
 } = require('../../utils/stateManager');
-const {
-  handleInputWithAI,
-  parseRevenueMessage,
-  detectErrors,
-  categorizeEntry
-} = require('../../utils/aiErrorHandler');
+const ai = require('../../utils/aiErrorHandler');
+// Optional: log once if detectErrors isn't available (we'll fail-open)
+if (typeof ai.detectErrors !== 'function' && typeof ai.detectError !== 'function') {
+  console.warn('[REVENUE] aiErrorHandler has no detectErrors; skipping error detection (fail-open).');
+}
+
+// Serverless-safe / backwards-compatible imports
+const handleInputWithAI = ai.handleInputWithAI;
+const parseRevenueMessage = ai.parseRevenueMessage;
+
+// detectErrors has been named differently in some versions
+const detectErrors =
+  (typeof ai.detectErrors === 'function' && ai.detectErrors) ||
+  (typeof ai.detectError === 'function' && ai.detectError) ||
+  (async () => null); // fail-open: don't block logging
+
+const categorizeEntry =
+  (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) ||
+  (async () => null); // fail-open
+
+
 const { validateCIL } = require('../../cil');
 
 // ---- column presence caches (safe in serverless) ----
@@ -478,11 +493,23 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       if (!data.date) data.date = todayInTimeZone(tz);
 
       // ignore client/source missing errors for contractor revenue
-      let errors = await detectErrors(data, 'revenue');
-      if (errors) {
-        const s = String(errors);
-        if (/client:\s*missing|source:\s*missing/i.test(s)) errors = null;
-      }
+let errors = null;
+try {
+  // support both detectErrors(data, kind) and detectErrors(kind, data)
+  errors = await detectErrors(data, 'revenue');
+  if (errors == null) {
+    // try alternate signature if the implementation expects (kind, data)
+    errors = await detectErrors('revenue', data);
+  }
+} catch (e) {
+  console.warn('[REVENUE] detectErrors threw; ignoring (fail-open):', e?.message);
+  errors = null;
+}
+
+if (errors) {
+  const s = String(errors);
+  if (/client:\s*missing|source:\s*missing/i.test(s)) errors = null;
+}
 
       const category = await categorizeEntry('revenue', data, ownerProfile);
       data.suggestedCategory = category;

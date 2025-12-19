@@ -178,5 +178,16 @@ const cilSchemas = {
   UpdatePricingItem: pricingUpdateSchema,
   DeletePricingItem: pricingDeleteSchema,
 };
+function validateCIL(rawCil) {
+  if (!rawCil || typeof rawCil !== 'object') throw new Error('CIL must be an object');
+  if (!rawCil.type) throw new Error('CIL missing type');
 
-module.exports = { cilSchemas, lineItemSchema, jobRefSchema };
+  const schema = cilSchemas[rawCil.type];
+  if (!schema) throw new Error(`Unsupported CIL type: ${rawCil.type}`);
+
+  // will throw if invalid
+  return schema.parse(rawCil);
+}
+
+module.exports = { cilSchemas, lineItemSchema, jobRefSchema, validateCIL };
+

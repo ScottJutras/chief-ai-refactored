@@ -26,7 +26,23 @@ const categorizeEntry =
   (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) ||
   (async () => null); // fail-open
 
-const { validateCIL } = require('../../cil');
+const cilMod = require('../../cil');
+
+const validateCIL =
+  (cilMod && typeof cilMod.validateCIL === 'function' && cilMod.validateCIL) ||
+  (cilMod && typeof cilMod.validateCil === 'function' && cilMod.validateCil) ||
+  (cilMod && typeof cilMod.validate === 'function' && cilMod.validate) ||
+  (typeof cilMod === 'function' && cilMod) ||
+  null;
+
+console.info('[REVENUE] cil export keys', {
+  keys: Object.keys(cilMod || {}),
+  validateCILType: typeof validateCIL
+});
+
+if (!validateCIL) {
+  console.warn('[REVENUE] validateCIL not found in ../../cil export; CIL gate will be fail-open until fixed.');
+}
 
 // ---- column presence caches (safe in serverless) ----
 let _hasSourceMsgIdCol = null;
@@ -220,63 +236,60 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
   return {
-    date,
-    description: 'Unknown',
-    amount,
-    source,
-    jobName
-  };
+  date,
+  description: 'Payment received',
+  amount,
+  source,
+  jobName
+};
+
 }
 
-function buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
+function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
+
+  // IMPORTANT: legacy schema requires description min(1)
+  const description =
+    String(data.description || '').trim() && data.description !== 'Unknown'
+      ? String(data.description).trim()
+      : 'Payment received';
+
   return {
-    cil_version: '1.0',
-    type: 'payment',
-    tenant_id: String(ownerId),
-    source: 'whatsapp',
-    source_msg_id: String(sourceMsgId),
-    actor: {
-      actor_id: String(userProfile?.user_id || from || 'unknown'),
-      role: 'owner'
-    },
-    occurred_at: new Date().toISOString(),
-    job: jobName ? { job_name: String(jobName) } : null,
-    needs_job_resolution: !jobName,
+    type: 'LogRevenue',
+    job: jobName ? String(jobName) : undefined,
+    description,
     amount_cents: cents,
-    currency: 'CAD',
-    payer: data.source && data.source !== 'Unknown' ? String(data.source) : undefined,
-    memo: data.description && data.description !== 'Unknown' ? String(data.description) : undefined,
-    category: category ? String(category) : undefined
+    source: data.source && data.source !== 'Unknown' ? String(data.source) : undefined,
+    date: data.date ? String(data.date) : undefined,
+    category: category ? String(category) : undefined,
+    source_msg_id: sourceMsgId ? String(sourceMsgId) : undefined,
+    actor_phone: from ? String(from) : undefined
   };
 }
 
 function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   try {
     const cil = buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
+
+    // FAIL-OPEN if validator missing (prevents blocking ingestion)
+    if (typeof validateCIL !== 'function') {
+      console.warn('[REVENUE] validateCIL missing; skipping CIL validation (fail-open).');
+      return { ok: true, cil, skipped: true };
+    }
+
     validateCIL(cil);
     return { ok: true, cil };
   } catch (e) {
     console.warn('[REVENUE] CIL validate failed', {
       message: e?.message,
       name: e?.name,
-      details: e?.errors || e?.issues || e?.cause || null,
-      // super helpful: see what we were validating
-      cil: {
-        tenant_id: String(ownerId),
-        source_msg_id: String(sourceMsgId),
-        amount_cents: toCents(data?.amount),
-        currency: 'CAD',
-        jobName,
-        payer: data?.source,
-        memo: data?.description,
-        category
-      }
+      details: e?.errors || e?.issues || e?.cause || null
     });
 
     return { ok: false, reply: `⚠️ Couldn't log that payment yet. Try: "received 2500 for <job> today".` };
   }
 }
+
 
 async function saveRevenue({
   ownerId,

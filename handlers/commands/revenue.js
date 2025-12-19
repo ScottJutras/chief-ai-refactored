@@ -15,13 +15,15 @@ const { validateCIL } = require('../../cil');
 
 // ---- column presence caches (safe in serverless) ----
 let _hasSourceMsgIdCol = null;
+// NOTE: your schema shows "amount" exists and is NOT NULL, but keep cache for safety
 let _hasAmountCol = null;
 
 async function hasColumn(table, col) {
   const r = await query(
     `select 1
        from information_schema.columns
-      where table_name = $1
+      where table_schema = 'public'
+        and table_name = $1
         and column_name = $2
       limit 1`,
     [table, col]
@@ -48,6 +50,8 @@ async function hasAmountColumn() {
   }
   return _hasAmountCol;
 }
+
+// ------------------ money + date helpers ------------------
 
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
@@ -107,6 +111,90 @@ function parseNaturalDate(s, tz) {
   return null;
 }
 
+// ------------------ contractor-first job helpers ------------------
+
+function normalizeJobAnswer(text) {
+  let s = String(text || '').trim();
+
+  // Strip common prefixes
+  s = s.replace(/^(job\s*name|job)\s*[:\-]?\s*/i, '');
+
+  // If user accidentally types a command while answering the job question,
+  // do NOT create anything here; just use the remainder as the job name.
+  s = s.replace(/^(create|new)\s+job\s+/i, '');
+
+  // Trim trailing punctuation like '?'
+  s = s.replace(/[?]+$/g, '').trim();
+
+  return s;
+}
+
+function looksLikeOverhead(s) {
+  const t = String(s || '').trim().toLowerCase();
+  return t === 'overhead' || t === 'oh';
+}
+
+// very light "address-like" heuristic (helps for "from 1556 Medway Park Dr")
+function looksLikeAddress(s) {
+  const t = String(s || '').trim();
+  if (!/\d/.test(t)) return false;
+  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pk|pkwy|park)\b/i.test(t);
+}
+
+async function findJobByName(ownerId, name) {
+  const ownerParam = String(ownerId || '').trim();
+  const n = String(name || '').trim();
+  if (!ownerParam || !n) return null;
+
+  try {
+    const { rows } = await query(
+      `
+      select job_no, coalesce(name, job_name) as job_name
+        from public.jobs
+       where owner_id = $1
+         and (
+           lower(coalesce(name, job_name)) = lower($2)
+           or lower(name) = lower($2)
+           or lower(job_name) = lower($2)
+         )
+       order by created_at desc
+       limit 1
+      `,
+      [ownerParam, n]
+    );
+    return rows?.[0] || null;
+  } catch (e) {
+    console.warn('[revenue] findJobByName failed:', e?.message);
+    return null;
+  }
+}
+
+/**
+ * If a parsed "source" looks like a job (matches existing job or looks like an address),
+ * treat it as jobName (contractor-first) and make payer optional.
+ */
+async function coerceSourceToJobIfLikely({ ownerId, data }) {
+  if (!data) return data;
+  const out = { ...data };
+
+  const source = String(out.source || '').trim();
+  const hasJobAlready = !!(out.jobName && String(out.jobName).trim());
+
+  if (!hasJobAlready && source && source.toLowerCase() !== 'unknown') {
+    const jobHit = await findJobByName(ownerId, source);
+
+    // If it matches an existing job OR looks like an address, treat it as the job
+    if (jobHit || looksLikeAddress(source)) {
+      out.jobName = source;
+      // payer/client becomes optional; don’t force it
+      out.source = 'Unknown';
+      // description stays as-is (memo)
+    }
+  }
+
+  return out;
+}
+
 /**
  * Resolve active job name safely (avoid int=uuid comparisons).
  * Priority:
@@ -129,7 +217,10 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   if (looksLikeUuid(s)) {
     try {
       const r = await query(
-        `select job_name from jobs where owner_id = $1 and id = $2::uuid limit 1`,
+        `select coalesce(name, job_name) as job_name
+           from public.jobs
+          where owner_id = $1 and id = $2::uuid
+          limit 1`,
         [ownerParam, s]
       );
       if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
@@ -142,7 +233,10 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   if (/^\d+$/.test(s)) {
     try {
       const r = await query(
-        `select job_name from jobs where owner_id = $1 and job_no = $2::int limit 1`,
+        `select coalesce(name, job_name) as job_name
+           from public.jobs
+          where owner_id = $1 and job_no = $2::int
+          limit 1`,
         [ownerParam, Number(s)]
       );
       if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
@@ -154,9 +248,8 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
-/**
- * CIL: revenue is "payment" received
- */
+// ------------------ CIL ------------------
+
 function buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
   return {
@@ -179,6 +272,7 @@ function buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, 
     amount_cents: cents,
     currency: 'CAD',
 
+    // payer is OPTIONAL now (contractor-first)
     payer: data.source && data.source !== 'Unknown' ? String(data.source) : undefined,
     memo: data.description && data.description !== 'Unknown' ? String(data.description) : undefined,
     category: category ? String(category) : undefined
@@ -193,119 +287,114 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   } catch {
     return {
       ok: false,
-      reply: `⚠️ Couldn't log that payment yet. Try: "revenue 2500 from Client".`
+      // contractor-first copy
+      reply: `⚠️ Couldn't log that payment yet. Try: "revenue 2500 for <job>" (payer optional).`
     };
   }
 }
 
+// ------------------ DB write ------------------
+
 /**
- * Persist to transactions:
- * columns (confirmed by you): owner_id(text), kind, date, description, amount_cents, source, job_name(text), category, user_name, source_msg_id, created_at
- * optional: amount (numeric)
+ * Persist to transactions (based on your schema dump):
+ * id (serial), owner_id (varchar, FK to users.user_id), kind, date, description, amount (numeric), amount_cents (bigint),
+ * source, job (varchar), job_name (text), category, user_name, source_msg_id, created_at
+ *
+ * We write BOTH job and job_name for maximum compatibility.
  */
-async function saveRevenue({ ownerId, date, description, amount, source, jobName, category, user, sourceMsgId }) {
+async function saveRevenue({ ownerId, date, description, amount, source, jobName, category, user, sourceMsgId, from, messageSid }) {
   const amountCents = toCents(amount);
-  if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
-
-  const ownerParam = String(ownerId || '').trim();
-  const msgParam = String(sourceMsgId || '').trim();
-
-  const canUseMsgId = await hasSourceMsgIdColumn();
-  const canUseAmount = await hasAmountColumn();
   const amountDollars = toDollars(amount);
 
-  if (canUseMsgId) {
-    const sql = canUseAmount
-      ? `
-        insert into transactions
-          (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, source_msg_id, created_at)
-        values
-          ($1::text, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, $10, now())
-        on conflict do nothing
-        returning id
-      `
-      : `
-        insert into transactions
-          (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at)
-        values
-          ($1::text, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
-        on conflict do nothing
-        returning id
-      `;
+  if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+  if (!amountDollars || amountDollars <= 0) throw new Error('Invalid amount');
 
-    const params = canUseAmount
-      ? [
-          ownerParam,
-          date,
-          String(description || '').trim() || 'Unknown',
-          amountCents,
-          amountDollars,
-          String(source || '').trim() || 'Unknown',
-          jobName ? String(jobName).trim() : null,
-          category ? String(category).trim() : null,
-          user ? String(user).trim() : null,
-          msgParam
-        ]
-      : [
-          ownerParam,
-          date,
-          String(description || '').trim() || 'Unknown',
-          amountCents,
-          String(source || '').trim() || 'Unknown',
-          jobName ? String(jobName).trim() : null,
-          category ? String(category).trim() : null,
-          user ? String(user).trim() : null,
-          msgParam
-        ];
+  const ownerParam = String(ownerId || '').trim();
+  const msgParam = String(sourceMsgId || '').trim() || null;
 
-    const res = await query(sql, params);
-    if (!res.rows.length) return { inserted: false };
-    return { inserted: true, id: res.rows[0].id };
+  // payer is optional; keep Unknown if absent
+  const payer = String(source || '').trim() || 'Unknown';
+
+  // job is required for your contractor flow (allow "Overhead")
+  const job = jobName ? String(jobName).trim() : null;
+
+  // detect columns
+  const canUseMsgId = await hasSourceMsgIdColumn();
+  const canUseAmount = await hasAmountColumn(); // should be true in your DB
+
+  const cols = [
+    'owner_id',
+    'kind',
+    'date',
+    'description',
+    'amount_cents',
+    'source',
+    'job',
+    'job_name',
+    'category',
+    'user_name',
+    'created_at'
+  ];
+  const vals = [
+    ownerParam,
+    'revenue',
+    date,
+    String(description || '').trim() || 'Unknown',
+    amountCents,
+    payer,
+    job,
+    job, // job_name mirrors job
+    category ? String(category).trim() : null,
+    user ? String(user).trim() : null
+  ];
+
+  if (canUseAmount) {
+    cols.splice(4, 0, 'amount');      // insert amount before amount_cents
+    vals.splice(4, 0, amountDollars); // keep alignment
   }
 
-  // non-idempotent fallback
-  const sql = canUseAmount
+  if (canUseMsgId) {
+    cols.splice(cols.length - 1, 0, 'source_msg_id');
+    vals.splice(vals.length - 1, 0, msgParam);
+  }
+
+  const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+
+  const sql = canUseMsgId
     ? `
-      insert into transactions
-        (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, created_at)
-      values
-        ($1::text, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
+      insert into public.transactions (${cols.join(', ')})
+      values (${placeholders})
+      on conflict do nothing
+      returning id
     `
     : `
-      insert into transactions
-        (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, created_at)
-      values
-        ($1::text, 'revenue', $2::date, $3, $4, $5, $6, $7, $8, now())
+      insert into public.transactions (${cols.join(', ')})
+      values (${placeholders})
+      returning id
     `;
 
-  const params = canUseAmount
-    ? [
-        ownerParam,
-        date,
-        String(description || '').trim() || 'Unknown',
-        amountCents,
-        amountDollars,
-        String(source || '').trim() || 'Unknown',
-        jobName ? String(jobName).trim() : null,
-        category ? String(category).trim() : null,
-        user ? String(user).trim() : null
-      ]
-    : [
-        ownerParam,
-        date,
-        String(description || '').trim() || 'Unknown',
-        amountCents,
-        String(source || '').trim() || 'Unknown',
-        jobName ? String(jobName).trim() : null,
-        category ? String(category).trim() : null,
-        user ? String(user).trim() : null
-      ];
-
-  await query(sql, params);
-  return { inserted: true };
+  try {
+    const res = await query(sql, vals);
+    if (!res?.rows?.length) return { inserted: false };
+    return { inserted: true, id: res.rows[0].id };
+  } catch (e) {
+    console.error('[REVENUE] insert failed', {
+      ownerId: ownerParam,
+      from,
+      messageSid,
+      code: e?.code,
+      detail: e?.detail,
+      constraint: e?.constraint,
+      table: e?.table,
+      column: e?.column,
+      message: e?.message
+    });
+    throw e;
+  }
 }
 
-// --- tiny helper: job is required for contractors ---
+// ------------------ pending job requirement ------------------
+
 async function ensureJobOrAsk(from, pending, data, msgId) {
   const stableMsgId = String(pending?.revenueSourceMsgId || msgId).trim();
 
@@ -329,6 +418,8 @@ async function ensureJobOrAsk(from, pending, data, msgId) {
     stableMsgId
   };
 }
+
+// ------------------ main handler ------------------
 
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
@@ -356,10 +447,10 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       type: pending?.type
     });
 
-    // ✅ NEW: If user previously hit "edit", treat this message as a brand new revenue command.
+    // ✅ If user previously hit "edit", treat this message as brand new revenue input
     if (pending?.isEditing && pending?.type === 'revenue') {
       await deletePendingTransactionState(from);
-      pending = null; // fall through into parse flow
+      pending = null;
     }
 
     // Normalize aiErrorHandler pendingCorrection -> pendingRevenue
@@ -390,7 +481,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           awaitingRevenueClarification: false
         });
 
-        reply = `Please confirm: Payment ${merged.amount} from ${merged.source} on ${merged.date}. Reply yes/edit/cancel.`;
+        // contractor-first copy (payer optional, job next)
+        reply = `Please confirm: Payment ${merged.amount} on ${merged.date}. Reply yes/edit/cancel.`;
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
@@ -400,8 +492,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
     // Follow-up: ask for job
     if (pending?.awaitingRevenueJob && pending?.pendingRevenue) {
-      const jobReply = String(input || '').trim();
-      const merged = { ...pending.pendingRevenue, jobName: jobReply };
+      const jobReply = normalizeJobAnswer(input);
+
+      // Allow "Overhead"
+      const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : jobReply;
+
+      const merged = { ...pending.pendingRevenue, jobName: finalJob };
 
       await setPendingTransactionState(from, {
         ...pending,
@@ -409,7 +505,11 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         awaitingRevenueJob: false
       });
 
-      reply = `Please confirm: Payment ${merged.amount} from ${merged.source} on ${merged.date} for ${merged.jobName}. Reply yes/edit/cancel.`;
+      // payer optional; show it only if present and not Unknown
+      const payerPart =
+        merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
+
+      reply = `Please confirm: Payment ${merged.amount}${payerPart} on ${merged.date} for ${merged.jobName}. Reply yes/edit/cancel.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
@@ -424,21 +524,26 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       const lcInput = String(input || '').toLowerCase().trim();
       const stableMsgId = String(pending.revenueSourceMsgId || msgId).trim();
 
-      // If user sends a fresh revenue command while we're waiting for yes/edit/cancel,
-      // treat it as a new command: clear pending and continue into parse flow below.
+      // If user sends a fresh revenue command while waiting for yes/edit/cancel,
+      // treat as new command: clear pending and fall through into parse.
       if (/^(revenue|rev|received)\b/.test(lcInput)) {
         await deletePendingTransactionState(from);
         pending = null;
       } else {
         if (lcInput === 'yes') {
-          const data = pending.pendingRevenue;
+          const data0 = pending.pendingRevenue || {};
 
-          // ✅ enforce job required even in confirm "yes" path
+          // contractor-first coercion (if source looks like job)
+          const data = await coerceSourceToJobIfLikely({ ownerId, data: data0 });
+
+          // enforce job required
           const resolvedActive = await resolveActiveJobName({ ownerId, userProfile });
-          const jobName =
+          let jobName =
             (data.jobName && String(data.jobName).trim()) ||
             (resolvedActive && String(resolvedActive).trim()) ||
             null;
+
+          if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
           if (!jobName) {
             await setPendingTransactionState(from, {
@@ -468,20 +573,25 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
           const result = await saveRevenue({
             ownerId,
-            date: data.date,
+            date: data.date || todayInTimeZone(tz),
             description: data.description,
             amount: data.amount,
-            source: data.source,
+            source: data.source, // optional
             jobName,
             category,
             user: userProfile?.name || 'Unknown User',
-            sourceMsgId: stableMsgId
+            sourceMsgId: stableMsgId,
+            from,
+            messageSid: stableMsgId
           });
+
+          const payerPart =
+            data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
 
           reply =
             result.inserted === false
               ? '✅ Already logged that payment (duplicate message).'
-              : `✅ Payment logged: ${data.amount} from ${data.source} on ${jobName} (Category: ${category})`;
+              : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName} (Category: ${category})`;
 
           await deletePendingTransactionState(from);
           return `<Response><Message>${reply}</Message></Response>`;
@@ -492,14 +602,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
             ...pending,
             isEditing: true,
             type: 'revenue',
-
-            // prevent "edit" from being treated as date/job reply
             pendingCorrection: false,
             awaitingRevenueClarification: false,
             awaitingRevenueJob: false
           });
 
-          reply = '✏️ Okay — resend the revenue in one line (e.g., "revenue $100 from John today").';
+          reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
           return `<Response><Message>${reply}</Message></Response>`;
         }
 
@@ -515,7 +623,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     }
 
     // --- AI PARSE PATH ---
-    const { data, reply: aiReply, confirmed } = await handleInputWithAI(
+    const { data: rawData, reply: aiReply, confirmed } = await handleInputWithAI(
       from,
       input,
       'revenue',
@@ -535,17 +643,33 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${aiReply}</Message></Response>`;
     }
 
-    if (data && data.amount && data.amount !== '$0.00' && data.description && data.source) {
-      const errors = await detectErrors(data, 'revenue');
+    // contractor-first coercion (if source looks like job)
+    const data = await coerceSourceToJobIfLikely({ ownerId, data: rawData });
+
+    // Make payer/client optional: do NOT require data.source to exist
+    if (data && data.amount && data.amount !== '$0.00') {
+      // If date missing, default it
+      if (!data.date) data.date = todayInTimeZone(tz);
+
+      // detectErrors may complain about client/source — ignore those for revenue
+      let errors = await detectErrors(data, 'revenue');
+      if (errors) {
+        const s = String(errors);
+        // strip common "client/source missing" warnings from blocking the flow
+        if (/client:\s*missing|source:\s*missing/i.test(s)) errors = null;
+      }
+
       const category = await categorizeEntry('revenue', data, ownerProfile);
       data.suggestedCategory = category;
 
-      // Resolve job: prefer explicit jobName on data, else active job
+      // Resolve job: explicit jobName on data, else active job
       const resolvedActive = await resolveActiveJobName({ ownerId, userProfile });
-      const jobName =
+      let jobName =
         (data.jobName && String(data.jobName).trim()) ||
         (resolvedActive && String(resolvedActive).trim()) ||
         null;
+
+      if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
       // If clean + confirmed => enforce job, then write
       if (confirmed && !errors) {
@@ -576,22 +700,27 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           date: data.date,
           description: data.description,
           amount: data.amount,
-          source: data.source,
+          source: data.source, // optional
           jobName,
           category,
           user: userProfile?.name || 'Unknown User',
-          sourceMsgId: msgId
+          sourceMsgId: msgId,
+          from,
+          messageSid: msgId
         });
+
+        const payerPart =
+          data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
 
         reply =
           result.inserted === false
             ? '✅ Already logged that payment (duplicate message).'
-            : `✅ Payment logged: ${data.amount} from ${data.source} on ${jobName} (Category: ${category})`;
+            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName} (Category: ${category})`;
 
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      // Otherwise: enforce job before confirm prompt (better UX for contractors)
+      // Otherwise: enforce job before confirm prompt (contractor UX)
       if (!jobName) {
         await setPendingTransactionState(from, {
           pendingRevenue: data,
@@ -609,14 +738,21 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         type: 'revenue'
       });
 
-      reply = `Please confirm: Payment ${data.amount} from ${data.source} on ${data.date} for ${jobName}. Reply yes/edit/cancel.`;
+      const payerPart =
+        data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+
+      reply = `Please confirm: Payment ${data.amount}${payerPart} on ${data.date} for ${jobName}. Reply yes/edit/cancel.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    reply = `🤔 Couldn’t parse a payment from "${input}". Try "revenue $100 from John today".`;
+    reply = `🤔 Couldn’t parse a payment from "${input}". Try "received $100 for 1556 Medway Park Dr today".`;
     return `<Response><Message>${reply}</Message></Response>`;
   } catch (error) {
-    console.error(`[ERROR] handleRevenue failed for ${from}:`, error.message);
+    console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {
+      code: error?.code,
+      detail: error?.detail,
+      constraint: error?.constraint
+    });
     reply = '⚠️ Error logging payment. Please try again.';
     return `<Response><Message>${reply}</Message></Response>`;
   } finally {

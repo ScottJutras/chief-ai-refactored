@@ -1,68 +1,56 @@
 // handlers/commands/expense.js
-const { query } = require('../../services/postgres');
 const {
-  getPendingTransactionState,
-  setPendingTransactionState,
-  deletePendingTransactionState
-} = require('../../utils/stateManager');
-const {
-  handleInputWithAI,
-  parseExpenseMessage,
-  detectErrors,
-  categorizeEntry
-} = require('../../utils/aiErrorHandler');
-const { validateCIL } = require('../../cil');
+  query,
+  insertTransaction,
+} = require('../../services/postgres');
 
-// ---- column presence caches ----
-let _hasSourceMsgIdCol = null;
-let _hasAmountCol = null;
+const state = require('../../utils/stateManager');
+const getPendingTransactionState = state.getPendingTransactionState;
+const deletePendingTransactionState = state.deletePendingTransactionState;
 
-async function hasColumn(table, col) {
-  const r = await query(
-    `select 1
-       from information_schema.columns
-      where table_name = $1
-        and column_name = $2
-      limit 1`,
-    [table, col]
-  );
-  return (r?.rows?.length || 0) > 0;
+// Prefer mergePendingTransactionState; fall back to setPendingTransactionState with merge:true
+const mergePendingTransactionState =
+  state.mergePendingTransactionState ||
+  (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
+
+const ai = require('../../utils/aiErrorHandler');
+
+// Serverless-safe / backwards-compatible imports
+const handleInputWithAI = ai.handleInputWithAI;
+const parseExpenseMessage = ai.parseExpenseMessage;
+
+const detectErrors =
+  (typeof ai.detectErrors === 'function' && ai.detectErrors) ||
+  (typeof ai.detectError === 'function' && ai.detectError) ||
+  (async () => null); // fail-open
+
+const categorizeEntry =
+  (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) ||
+  (async () => null); // fail-open
+
+// ---- CIL validator (fail-open) ----
+const cilMod = require('../../cil');
+const validateCIL =
+  (cilMod && typeof cilMod.validateCIL === 'function' && cilMod.validateCIL) ||
+  (cilMod && typeof cilMod.validateCil === 'function' && cilMod.validateCil) ||
+  (cilMod && typeof cilMod.validate === 'function' && cilMod.validate) ||
+  (typeof cilMod === 'function' && cilMod) ||
+  null;
+
+// ---- Media limits (Option A truncation) ----
+const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
+function truncateText(str, maxChars) {
+  if (!str) return null;
+  const s = String(str);
+  if (s.length <= maxChars) return s;
+  return s.slice(0, maxChars);
 }
 
-async function hasSourceMsgIdColumn() {
-  if (_hasSourceMsgIdCol !== null) return _hasSourceMsgIdCol;
-  try {
-    _hasSourceMsgIdCol = await hasColumn('transactions', 'source_msg_id');
-  } catch {
-    _hasSourceMsgIdCol = false;
-  }
-  return _hasSourceMsgIdCol;
-}
-
-async function hasAmountColumn() {
-  if (_hasAmountCol !== null) return _hasAmountCol;
-  try {
-    _hasAmountCol = await hasColumn('transactions', 'amount');
-  } catch {
-    _hasAmountCol = false;
-  }
-  return _hasAmountCol;
-}
-
+// ---- basic parsing helpers ----
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
   if (!Number.isFinite(n)) return null;
   return Math.round(n * 100);
-}
-
-function toDollars(amountStr) {
-  const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
-  if (!Number.isFinite(n)) return null;
-  return n;
-}
-
-function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
 }
 
 function todayIso() {
@@ -95,6 +83,10 @@ function parseNaturalDate(s) {
   return null;
 }
 
+function looksLikeUuid(str) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+}
+
 /**
  * Resolve active job name safely (avoid int=uuid comparisons).
  * Priority:
@@ -116,7 +108,10 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   if (looksLikeUuid(s)) {
     try {
       const r = await query(
-        `select job_name from jobs where owner_id = $1 and id = $2::uuid limit 1`,
+        `select coalesce(name, job_name) as job_name
+           from public.jobs
+          where owner_id = $1 and id = $2::uuid
+          limit 1`,
         [ownerParam, s]
       );
       if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
@@ -129,7 +124,10 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   if (/^\d+$/.test(s)) {
     try {
       const r = await query(
-        `select job_name from jobs where owner_id = $1 and job_no = $2::int limit 1`,
+        `select coalesce(name, job_name) as job_name
+           from public.jobs
+          where owner_id = $1 and job_no = $2::int
+          limit 1`,
         [ownerParam, Number(s)]
       );
       if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
@@ -141,6 +139,7 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
+// Minimal CIL build (your current shape) — fail-open if validator missing
 function buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
 
@@ -173,119 +172,32 @@ function buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, 
 function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   try {
     const cil = buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
+
+    // FAIL-OPEN if validator missing
+    if (typeof validateCIL !== 'function') {
+      console.warn('[EXPENSE] validateCIL missing; skipping CIL validation (fail-open).');
+      return { ok: true, cil, skipped: true };
+    }
+
     validateCIL(cil);
     return { ok: true, cil };
   } catch {
-    return {
-      ok: false,
-      reply: `⚠️ Couldn't log that expense yet. Try: "expense 84.12 nails from Home Depot".`
-    };
+    return { ok: false, reply: `⚠️ Couldn't log that expense yet. Try: "expense 84.12 nails from Home Depot".` };
   }
 }
 
-async function saveExpense({ ownerId, date, item, amount, store, jobName, category, user, sourceMsgId }) {
-  const amountCents = toCents(amount);
-  if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+// Clear ONLY media meta after successful write so it doesn't attach to next txn
+async function clearPendingMediaMeta(from, pending) {
+  try {
+    if (!pending) return;
+    if (!pending.pendingMediaMeta && !pending.pendingMedia) return;
 
-  const ownerParam = String(ownerId || '').trim();
-  const msgParam = String(sourceMsgId || '').trim();
-
-  const canUseMsgId = await hasSourceMsgIdColumn();
-  const canUseAmount = await hasAmountColumn();
-  const amountDollars = toDollars(amount);
-
-  const description = String(item || '').trim() || 'Unknown';
-  const source = String(store || '').trim() || 'Unknown';
-
-  if (canUseMsgId) {
-    const sql = canUseAmount
-      ? `
-        insert into transactions
-          (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, source_msg_id, created_at)
-        values
-          ($1::text, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, $10, now())
-        on conflict do nothing
-        returning id
-      `
-      : `
-        insert into transactions
-          (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, source_msg_id, created_at)
-        values
-          ($1::text, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
-        on conflict do nothing
-        returning id
-      `;
-
-    const params = canUseAmount
-      ? [
-          ownerParam,
-          date,
-          description,
-          amountCents,
-          amountDollars,
-          source,
-          jobName ? String(jobName).trim() : null,
-          category ? String(category).trim() : null,
-          user ? String(user).trim() : null,
-          msgParam
-        ]
-      : [
-          ownerParam,
-          date,
-          description,
-          amountCents,
-          source,
-          jobName ? String(jobName).trim() : null,
-          category ? String(category).trim() : null,
-          user ? String(user).trim() : null,
-          msgParam
-        ];
-
-    const res = await query(sql, params);
-    if (!res.rows.length) return { inserted: false };
-    return { inserted: true, id: res.rows[0].id };
-  }
-
-  // non-idempotent fallback
-  const sql = canUseAmount
-    ? `
-      insert into transactions
-        (owner_id, kind, date, description, amount_cents, amount, source, job_name, category, user_name, created_at)
-      values
-        ($1::text, 'expense', $2::date, $3, $4, $5, $6, $7, $8, $9, now())
-    `
-    : `
-      insert into transactions
-        (owner_id, kind, date, description, amount_cents, source, job_name, category, user_name, created_at)
-      values
-        ($1::text, 'expense', $2::date, $3, $4, $5, $6, $7, $8, now())
-    `;
-
-  const params = canUseAmount
-    ? [
-        ownerParam,
-        date,
-        description,
-        amountCents,
-        amountDollars,
-        source,
-        jobName ? String(jobName).trim() : null,
-        category ? String(category).trim() : null,
-        user ? String(user).trim() : null
-      ]
-    : [
-        ownerParam,
-        date,
-        description,
-        amountCents,
-        source,
-        jobName ? String(jobName).trim() : null,
-        category ? String(category).trim() : null,
-        user ? String(user).trim() : null
-      ];
-
-  await query(sql, params);
-  return { inserted: true };
+    await mergePendingTransactionState(from, {
+      ...(pending || {}),
+      pendingMediaMeta: null,
+      pendingMedia: false
+    });
+  } catch {}
 }
 
 async function deleteExpense(ownerId, criteria) {
@@ -297,7 +209,7 @@ async function deleteExpense(ownerId, criteria) {
 
     const res = await query(
       `
-      delete from transactions
+      delete from public.transactions
        where owner_id = $1::text
          and kind = 'expense'
          and description = $2
@@ -307,7 +219,7 @@ async function deleteExpense(ownerId, criteria) {
       `,
       [ownerParam, description, amountCents, source]
     );
-    return res.rows.length > 0;
+    return (res?.rows?.length || 0) > 0;
   } catch {
     return false;
   }
@@ -329,6 +241,7 @@ function parseDeleteRequest(input) {
 async function handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
   const msgId = String(sourceMsgId || '').trim() || `${from}:${Date.now()}`;
+  const safeMsgId = String(sourceMsgId || msgId || '').trim();
 
   let reply;
 
@@ -342,16 +255,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
     let pending = await getPendingTransactionState(from);
 
-    // Normalize aiErrorHandler pendingCorrection -> pendingExpense
-    if (pending?.pendingCorrection && pending?.type === 'expense' && pending?.pendingData) {
-      const data = pending.pendingData;
-      await mergePendingTransactionState(from, {
-        ...pending,
-        pendingExpense: data,
-        pendingCorrection: false,
-        expenseSourceMsgId: pending.expenseSourceMsgId || msgId
-      });
-      pending = await getPendingTransactionState(from);
+    // If user previously hit "edit", treat next message as brand new
+    if (pending?.isEditing && pending?.type === 'expense') {
+      await deletePendingTransactionState(from);
+      pending = null;
     }
 
     // Follow-up: expense clarification (date, etc.)
@@ -380,7 +287,9 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     // Follow-up: job resolution (contractor-first)
     if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
       const jobReply = String(input || '').trim();
-      const merged = { ...pending.pendingExpense, jobName: jobReply };
+      const finalJob = jobReply || null;
+
+      const merged = { ...pending.pendingExpense, jobName: finalJob };
 
       await mergePendingTransactionState(from, {
         ...pending,
@@ -401,33 +310,35 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const lc = String(input || '').toLowerCase().trim();
-      const stableMsgId = String(pending.expenseSourceMsgId || msgId).trim();
+      const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim(); // always defined
 
-      // ✅ NEW: If user sends a fresh expense command while waiting for yes/edit/cancel,
-      // treat it as a new command: clear pending and continue into parse flow below.
+      // If user sends a fresh expense command while waiting, treat as new command
       if (/^(?:expense|exp)\b/.test(lc) && pending?.pendingExpense) {
         await deletePendingTransactionState(from);
         pending = null;
       } else {
         if (lc === 'yes' && pending?.pendingExpense) {
-          const data = pending.pendingExpense;
+          const data = pending.pendingExpense || {};
+          const mediaMeta = pending?.pendingMediaMeta || null;
 
+          // Category: prefer suggested, else compute (timeout-safe-ish via Promise.race if you want later)
           const category =
-            data.suggestedCategory || (await categorizeEntry('expense', data, ownerProfile));
+            data.suggestedCategory ||
+            (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null));
 
-          // prefer job from pending (job resolution flow), else active job
+          // job required: from data.jobName OR active job
           const jobName =
             (data.jobName && String(data.jobName).trim()) ||
             (await resolveActiveJobName({ ownerId, userProfile })) ||
             null;
 
-          // ✅ enforce job (contractor-first)
           if (!jobName) {
             await mergePendingTransactionState(from, {
               ...pending,
               pendingExpense: data,
               awaitingExpenseJob: true,
-              expenseSourceMsgId: stableMsgId
+              expenseSourceMsgId: stableMsgId,
+              type: 'expense'
             });
             reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
             return `<Response><Message>${reply}</Message></Response>`;
@@ -444,22 +355,37 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           });
           if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
-          const result = await saveExpense({
+          // ✅ CANONICAL INSERT PATH
+          const amountCents = toCents(data.amount);
+          if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+
+          const result = await insertTransaction({
             ownerId,
-            date: data.date,
-            item: data.item,
-            amount: data.amount,
-            store: data.store,
-            jobName,
-            category,
-            user: userProfile?.name || 'Unknown User',
-            sourceMsgId: stableMsgId
+            kind: 'expense',
+            date: data.date || todayIso(),
+            description: String(data.item || '').trim() || 'Unknown',
+            amount_cents: amountCents,
+            amount: null, // optional legacy numeric amount column handled inside insertTransaction if present
+            source: String(data.store || '').trim() || 'Unknown',
+            job: jobName,
+            job_name: jobName,
+            category: category ? String(category).trim() : null,
+            user_name: userProfile?.name || 'Unknown User',
+            source_msg_id: stableMsgId,
+            mediaMeta: mediaMeta
+              ? {
+                  url: mediaMeta.url || null,
+                  type: mediaMeta.type || null,
+                  transcript: truncateText(mediaMeta.transcript, MAX_MEDIA_TRANSCRIPT_CHARS),
+                  confidence: mediaMeta.confidence ?? null
+                }
+              : null
           });
 
           reply =
-            result && result.inserted === false
+            result?.inserted === false
               ? '✅ Already logged that expense (duplicate message).'
-              : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName} (Category: ${category})`;
+              : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
           await deletePendingTransactionState(from);
           return `<Response><Message>${reply}</Message></Response>`;
@@ -476,7 +402,13 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         }
 
         if (lc === 'edit') {
-          await mergePendingTransactionState(from, { ...pending, isEditing: true, type: 'expense' });
+          await mergePendingTransactionState(from, {
+            ...(pending || {}),
+            isEditing: true,
+            type: 'expense',
+            awaitingExpenseClarification: false,
+            awaitingExpenseJob: false
+          });
           reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
           return `<Response><Message>${reply}</Message></Response>`;
         }
@@ -510,7 +442,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // DIRECT PARSE PATH
+    // DIRECT PARSE PATH (simple deterministic)
     const m = String(input || '').match(/^(?:expense\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
     if (m) {
       const [, amount, item, store] = m;
@@ -522,79 +454,103 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         store: store || 'Unknown Store'
       };
 
-      const category = await categorizeEntry('expense', data, ownerProfile);
+      const category =
+        (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) || null;
 
       const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
-      // ✅ enforce job (contractor-first)
       if (!jobName) {
         await mergePendingTransactionState(from, {
+          ...(pending || {}),
           pendingExpense: data,
           awaitingExpenseJob: true,
-          expenseSourceMsgId: msgId,
+          expenseSourceMsgId: safeMsgId,
           type: 'expense'
         });
         reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
+      const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: safeMsgId });
       if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
-      const result = await saveExpense({
+      const amountCents = toCents(data.amount);
+      const mediaMeta = pending?.pendingMediaMeta || null;
+
+      const result = await insertTransaction({
         ownerId,
-        date,
-        item,
-        amount: data.amount,
-        store: data.store,
-        jobName,
-        category,
-        user: userProfile?.name || 'Unknown User',
-        sourceMsgId: msgId
+        kind: 'expense',
+        date: data.date,
+        description: String(data.item || '').trim() || 'Unknown',
+        amount_cents: amountCents,
+        source: String(data.store || '').trim() || 'Unknown',
+        job: jobName,
+        job_name: jobName,
+        category: category ? String(category).trim() : null,
+        user_name: userProfile?.name || 'Unknown User',
+        source_msg_id: safeMsgId,
+        mediaMeta: mediaMeta
+          ? {
+              url: mediaMeta.url || null,
+              type: mediaMeta.type || null,
+              transcript: truncateText(mediaMeta.transcript, MAX_MEDIA_TRANSCRIPT_CHARS),
+              confidence: mediaMeta.confidence ?? null
+            }
+          : null
       });
 
       reply =
-        result && result.inserted === false
+        result?.inserted === false
           ? '✅ Already logged that expense (duplicate message).'
-          : `✅ Expense logged: ${data.amount} for ${item} from ${data.store} on ${jobName} (Category: ${category})`;
+          : `✅ Expense logged: ${data.amount} for ${item} from ${data.store} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+
+      // Prevent media meta from attaching to the next transaction
+      await clearPendingMediaMeta(from, pending);
 
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
     // AI PATH
-    const { data, reply: aiReply, confirmed } = await handleInputWithAI(
-      from,
-      input,
-      'expense',
-      parseExpenseMessage,
-      defaultData
-    );
+    const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData);
+    const data = aiRes?.data || null;
+    const aiReply = aiRes?.reply || null;
+    const confirmed = !!aiRes?.confirmed;
 
     if (aiReply) {
       await mergePendingTransactionState(from, {
+        ...(pending || {}),
         pendingExpense: null,
         awaitingExpenseClarification: true,
         expenseClarificationPrompt: aiReply,
         expenseDraftText: input,
-        expenseSourceMsgId: msgId,
+        expenseSourceMsgId: safeMsgId,
         type: 'expense'
       });
       return `<Response><Message>${aiReply}</Message></Response>`;
     }
 
     if (data && data.amount && data.amount !== '$0.00' && data.item && data.store) {
-      const errors = await detectErrors(data, 'expense');
-      const category = await categorizeEntry('expense', data, ownerProfile);
+      let errors = null;
+      try {
+        errors = await detectErrors(data, 'expense');
+        if (errors == null) errors = await detectErrors('expense', data);
+      } catch (e) {
+        console.warn('[EXPENSE] detectErrors threw; ignoring (fail-open):', e?.message);
+        errors = null;
+      }
+
+      const category =
+        (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) || null;
       data.suggestedCategory = category;
 
       const jobName = (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
-      // ✅ enforce job (contractor-first)
       if (!jobName) {
         await mergePendingTransactionState(from, {
+          ...(pending || {}),
           pendingExpense: data,
           awaitingExpenseJob: true,
-          expenseSourceMsgId: msgId,
+          expenseSourceMsgId: safeMsgId,
           type: 'expense'
         });
         reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
@@ -602,34 +558,52 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       if (confirmed && !errors) {
-        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: msgId });
+        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: safeMsgId });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
-        const result = await saveExpense({
+        const amountCents = toCents(data.amount);
+        const mediaMeta = pending?.pendingMediaMeta || null;
+
+        const result = await insertTransaction({
           ownerId,
-          date: data.date,
-          item: data.item,
-          amount: data.amount,
-          store: data.store,
-          jobName,
-          category,
-          user: userProfile?.name || 'Unknown User',
-          sourceMsgId: msgId
+          kind: 'expense',
+          date: data.date || todayIso(),
+          description: String(data.item || '').trim() || 'Unknown',
+          amount_cents: amountCents,
+          source: String(data.store || '').trim() || 'Unknown',
+          job: jobName,
+          job_name: jobName,
+          category: category ? String(category).trim() : null,
+          user_name: userProfile?.name || 'Unknown User',
+          source_msg_id: safeMsgId,
+          mediaMeta: mediaMeta
+            ? {
+                url: mediaMeta.url || null,
+                type: mediaMeta.type || null,
+                transcript: truncateText(mediaMeta.transcript, MAX_MEDIA_TRANSCRIPT_CHARS),
+                confidence: mediaMeta.confidence ?? null
+              }
+            : null
         });
 
         reply =
-          result && result.inserted === false
+          result?.inserted === false
             ? '✅ Already logged that expense (duplicate message).'
-            : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName} (Category: ${category})`;
+            : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+
+        // Prevent media meta from attaching to the next transaction
+        await clearPendingMediaMeta(from, pending);
 
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
       await mergePendingTransactionState(from, {
-        pendingExpense: data,
-        expenseSourceMsgId: msgId,
+        ...(pending || {}),
+        pendingExpense: { ...data, jobName },
+        expenseSourceMsgId: safeMsgId,
         type: 'expense'
       });
+
       reply = `Please confirm: Expense ${data.amount} for ${data.item} from ${data.store} on ${data.date}. Reply yes/edit/cancel.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
@@ -637,8 +611,12 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     reply = `🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`;
     return `<Response><Message>${reply}</Message></Response>`;
   } catch (error) {
-    console.error(`[ERROR] handleExpense failed for ${from}:`, error.message);
-    reply = `⚠️ Failed to process expense: ${error.message}`;
+    console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
+      code: error?.code,
+      detail: error?.detail,
+      constraint: error?.constraint
+    });
+    reply = '⚠️ Error logging expense. Please try again.';
     return `<Response><Message>${reply}</Message></Response>`;
   } finally {
     try {

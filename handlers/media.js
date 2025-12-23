@@ -6,7 +6,8 @@ const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
 
 const {
-  getActiveJob,
+  // NOTE: getActiveJob is legacy-stubbed in your postgres.js export and can throw.
+  // We intentionally do NOT import or use it here.
   generateTimesheet,
 } = require('../services/postgres');
 
@@ -14,13 +15,15 @@ const state = require('../utils/stateManager');
 const getPendingTransactionState = state.getPendingTransactionState;
 const deletePendingTransactionState = state.deletePendingTransactionState;
 
-// Prefer mergePendingTransactionState; fall back to setPendingTransactionState
+// Prefer mergePendingTransactionState; fall back to setPendingTransactionState (older builds)
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
-  (async (userId, patch) => state.setPendingTransactionState(userId, patch));
+  (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
+// Be tolerant about how transcriptionService exports
 const transcribeAudio =
   (transcriptionMod && typeof transcriptionMod.transcribeAudio === 'function' && transcriptionMod.transcribeAudio) ||
+  (transcriptionMod && typeof transcriptionMod.default === 'function' && transcriptionMod.default) ||
   (typeof transcriptionMod === 'function' ? transcriptionMod : null);
 
 /* ---------------- helpers ---------------- */
@@ -132,6 +135,10 @@ function normalizeTranscriptionResult(res) {
   return { transcript: '', confidence: null };
 }
 
+/**
+ * Attach media meta to pending state so expense/revenue can persist it after confirmation.
+ * Safe merge; never blocks.
+ */
 async function attachPendingMediaMeta(from, meta) {
   try {
     const url = String(meta?.url || '').trim() || null;
@@ -151,26 +158,44 @@ async function attachPendingMediaMeta(from, meta) {
   }
 }
 
+/**
+ * IMPORTANT:
+ * If this is text-only (no mediaUrl), and we're in a finance confirm flow,
+ * do NOT "handle as media". Return transcript and let webhook route it to revenue.js/expense.js.
+ */
+async function maybePassThroughFinanceTextOnly(from, input) {
+  if (!String(input || '').trim()) return null;
+
+  const pendingState = await getPendingTransactionState(from);
+  const pendingType =
+    pendingState?.pendingMedia?.type ||
+    pendingState?.type ||
+    null;
+
+  if (pendingType === 'expense' || pendingType === 'revenue') {
+    return { transcript: String(input || '').trim(), twiml: null };
+  }
+  return null;
+}
+
 /* ---------------- main ---------------- */
 
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType) {
   let reply;
   try {
-    console.log(`[MEDIA] incoming`, { from, mediaType, hasUrl: !!mediaUrl, inputLen: (input || '').length });
+    console.log('[MEDIA] incoming', { from, mediaType, hasUrl: !!mediaUrl, inputLen: (input || '').length });
 
-    // ✅ FIX 1: handle TEXT-ONLY follow-ups BEFORE media-type validation
-    // If user replies "yes/edit/cancel" to an expense/revenue confirmation, we want webhook routing
-    // to send this to expense.js/revenue.js (not treat as "media").
+    // ✅ FIX: Text-only replies MUST be allowed through (especially finance confirm "yes/edit/cancel")
     if (!mediaUrl) {
-      const pendingState = await getPendingTransactionState(from);
-      const pendingType = pendingState?.pendingMedia?.type || pendingState?.type || null;
+      const pass = await maybePassThroughFinanceTextOnly(from, input);
+      if (pass) return pass;
 
-      if (pendingType === 'expense' || pendingType === 'revenue') {
-        // Let webhook.js treat this as a normal text message.
-        return { transcript: String(input || '').trim(), twiml: null };
-      }
+      // If it's text-only but not a finance confirm, treat it as plain text
+      // so webhook/router can handle it normally.
+      return { transcript: String(input || '').trim(), twiml: null };
     }
 
+    // From here: we DO have mediaUrl, so validate media types
     const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
 
     const baseType = normalizeContentType(mediaType);
@@ -182,103 +207,13 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     const isAudioFamily = baseType.startsWith('audio/');
     const isSupportedAudio = isAudioFamily;
 
-    // ✅ If it’s NOT media (no mediaUrl) and not a pending finance confirm, treat as plain text route.
-    if (!mediaUrl && !isSupportedImage && !isSupportedAudio) {
-      return { transcript: String(input || '').trim(), twiml: null };
-    }
-
-    if (mediaUrl && !isSupportedImage && !isSupportedAudio) {
+    if (!isSupportedImage && !isSupportedAudio) {
       reply = `⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio/voice note.`;
       return twiml(reply);
     }
 
-    /* ---------- Pending confirmation for NON-finance flows only ---------- */
-    {
-      const pendingState = await getPendingTransactionState(from);
-
-      if (pendingState?.pendingMedia && !mediaUrl) {
-        const pendingType = pendingState?.pendingMedia?.type || null;
-
-        // Finance confirmations are handled by webhook → expense/revenue
-        if (pendingType === 'expense' || pendingType === 'revenue') {
-          return { transcript: String(input || '').trim(), twiml: null };
-        }
-
-        const rawInput = String(input || '');
-        const lcInput = rawInput.toLowerCase().trim().replace(/[.!?]$/, '');
-        const isYes = lcInput === 'yes' || lcInput === 'y';
-        const isNo  = lcInput === 'no'  || lcInput === 'n' || lcInput === 'cancel';
-
-        if (pendingType != null) {
-          if (isYes) {
-            if (pendingType === 'time_entry' && pendingState.pendingTimeEntry) {
-              const { employeeName, type: entryType, timestamp } = pendingState.pendingTimeEntry;
-              const tz = getUserTz(userProfile);
-              const hhmm = toAmPm(timestamp, tz);
-
-              let normalized;
-              if (entryType === 'punch_in') normalized = `${employeeName} punched in at ${hhmm}`;
-              else if (entryType === 'punch_out') normalized = `${employeeName} punched out at ${hhmm}`;
-              else if (entryType === 'break_start') normalized = `start break for ${employeeName} at ${hhmm}`;
-              else if (entryType === 'break_end') normalized = `end break for ${employeeName} at ${hhmm}`;
-              else if (entryType === 'drive_start') normalized = `start drive for ${employeeName} at ${hhmm}`;
-              else if (entryType === 'drive_end') normalized = `end drive for ${employeeName} at ${hhmm}`;
-              else normalized = `${employeeName} punched in at ${hhmm}`;
-
-              const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
-              await deletePendingTransactionState(from);
-              if (typeof tw === 'string' && tw.trim()) return tw;
-              return twiml(`✅ ${entryType.replace('_', ' ')} logged for ${employeeName} at ${fmtLocal(timestamp, tz)}`);
-            }
-
-            if (pendingType === 'hours_inquiry') {
-              await deletePendingTransactionState(from);
-              return twiml(`Please specify: today, this week, or this month.`);
-            }
-
-            await deletePendingTransactionState(from);
-            return twiml(`Hmm, I lost the details. Please resend.`);
-          }
-
-          if (isNo) {
-            await deletePendingTransactionState(from);
-            return twiml(`❌ Cancelled.`);
-          }
-
-          if (lcInput === 'edit') {
-            await deletePendingTransactionState(from);
-            return twiml(`Please resend the details.`);
-          }
-
-          if (pendingType === 'hours_inquiry') {
-            let periodWord =
-              lcInput.match(/\b(today|day|this\s*week|week|this\s*month|month|now)\b/i)?.[1]?.toLowerCase() ||
-              (/\bthisweek\b/i.test(lcInput) ? 'this week' : null) ||
-              (/\bthismonth\b/i.test(lcInput) ? 'this month' : null);
-
-            if (periodWord) {
-              if (periodWord === 'now') periodWord = 'day';
-              if (periodWord === 'this week') periodWord = 'week';
-              if (periodWord === 'this month') periodWord = 'month';
-              const period = periodWord === 'today' ? 'day' : periodWord;
-
-              const tz = getUserTz(userProfile);
-              const name = pendingState.pendingHours?.employeeName || userProfile?.name || '';
-              const { message } = await generateTimesheet({ ownerId, person: name, period, tz, now: new Date() });
-              await deletePendingTransactionState(from);
-              return twiml(message);
-            }
-            return twiml(`Got it. Do you want **today**, **this week**, or **this month**?`);
-          }
-
-          return twiml(`⚠️ Reply 'yes', 'no', or 'edit' to confirm or cancel.`);
-        }
-      }
-    }
-
     /* ---------- Build text from media ---------- */
     let extractedText = String(input || '').trim();
-
     const normType = normalizeContentType(mediaType);
 
     let mediaMeta = {
@@ -321,6 +256,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
         console.log('[MEDIA] transcript bytes', transcript ? transcript.length : 0);
 
+        // OGG/Opus sometimes needs a different label for some engines
         if (!transcript && normType === 'audio/ogg') {
           try {
             console.log('[MEDIA] retry transcription with fallback mime: audio/webm');
@@ -354,12 +290,12 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       const looksRevenue = /\b(revenue|payment|paid|deposit|sale|received)\b/.test(lc);
       const timeclockIntent = inferIntentFromText(transcript);
 
+      // If it smells like finance/timeclock/hours, attach meta and parse it.
       if (timeclockIntent || looksHours || looksExpense || looksRevenue) {
-        // attach meta for the finance/time flows
         await attachPendingMediaMeta(from, mediaMeta);
         extractedText = transcript.trim();
       } else {
-        // task/general: let webhook handle
+        // Otherwise, treat as normal voice message (not finance)
         return { transcript: transcript.trim(), twiml: null };
       }
     }
@@ -373,6 +309,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = null;
 
+      // Images are audit-relevant → attach meta
       await attachPendingMediaMeta(from, mediaMeta);
     }
 
@@ -486,8 +423,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         console.warn('[MEDIA] timesheet summary failed:', e.message);
       }
 
-      const activeJob = await getActiveJob(ownerId);
-      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName || userProfile?.name || 'Unknown'} at ${humanTime}${activeJob && activeJob !== 'Uncategorized' ? ` on ${activeJob}` : ''}.${summaryTail}`;
+      reply = `✅ ${type.replace('_', ' ')} logged for ${employeeName || userProfile?.name || 'Unknown'} at ${humanTime}.${summaryTail}`;
       return twiml(reply);
     }
 

@@ -144,7 +144,6 @@ const normalizePhoneNumber = (x) => DIGITS(x);
 /*  ✅ Media transcript truncation + transactions schema capabilities   */
 /* ------------------------------------------------------------------ */
 
-// Option A: truncate transcript for DB storage
 const MEDIA_TRANSCRIPT_MAX_CHARS = 8000;
 
 function truncateText(s, maxChars = MEDIA_TRANSCRIPT_MAX_CHARS) {
@@ -175,6 +174,10 @@ let TX_HAS_MEDIA_TYPE    = null;
 let TX_HAS_MEDIA_TXT     = null;
 let TX_HAS_MEDIA_CONF    = null;
 
+// Cache whether an owner_id+source_msg_id unique constraint exists.
+// (If not, ON CONFLICT (...) will error.)
+let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
+
 async function detectTransactionsCapabilities() {
   if (
     TX_HAS_SOURCE_MSG_ID !== null &&
@@ -195,7 +198,6 @@ async function detectTransactionsCapabilities() {
   }
 
   try {
-    // Prefer a single query for all columns (faster than multiple hasColumn calls)
     const { rows } = await query(
       `select column_name
          from information_schema.columns
@@ -231,13 +233,42 @@ async function detectTransactionsCapabilities() {
   };
 }
 
+async function detectTransactionsUniqueOwnerSourceMsg() {
+  if (TX_HAS_OWNER_SOURCEMSG_UNIQUE !== null) return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
+
+  // Best-effort: look for any UNIQUE index/constraint that includes both owner_id and source_msg_id.
+  // If this query fails for any reason, we fail-open to "false" and use select-before-insert idempotency.
+  try {
+    const { rows } = await query(
+      `
+      select i.relname as index_name, pg_get_indexdef(ix.indexrelid) as def
+        from pg_class t
+        join pg_namespace n on n.oid=t.relnamespace
+        join pg_index ix on ix.indrelid=t.oid
+        join pg_class i on i.oid=ix.indexrelid
+       where n.nspname='public'
+         and t.relname='transactions'
+         and ix.indisunique=true
+      `
+    );
+
+    const defs = rows.map(r => String(r.def || '').toLowerCase());
+    TX_HAS_OWNER_SOURCEMSG_UNIQUE = defs.some(d => d.includes('(owner_id') && d.includes('source_msg_id'));
+  } catch (e) {
+    console.warn('[PG/transactions] detect unique(owner_id,source_msg_id) failed (fail-open):', e?.message);
+    TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
+  }
+
+  return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
+}
+
 function normalizeMediaMeta(mediaMeta) {
   if (!mediaMeta || typeof mediaMeta !== 'object') return null;
 
   const url = String(mediaMeta.url || mediaMeta.media_url || '').trim() || null;
   const type = String(mediaMeta.type || mediaMeta.media_type || '').trim() || null;
 
-  // transcript can be huge; Option A truncation
+  // transcript can be huge; truncate
   const transcriptRaw = mediaMeta.transcript || mediaMeta.media_transcript || null;
   const transcript = transcriptRaw ? truncateText(transcriptRaw, MEDIA_TRANSCRIPT_MAX_CHARS) : null;
 
@@ -258,7 +289,9 @@ function normalizeMediaMeta(mediaMeta) {
 /**
  * ✅ insertTransaction()
  * Schema-aware insert into public.transactions with optional media fields.
- * Safe idempotency if (owner_id, source_msg_id) exists (your revenue.js uses this).
+ * Safe idempotency:
+ *  - If unique(owner_id, source_msg_id) exists -> ON CONFLICT DO NOTHING
+ *  - Else -> SELECT-before-insert using (owner_id, source_msg_id) to prevent duplicates
  *
  * Expected opts:
  *  ownerId, kind ('revenue'|'expense'|...), date (YYYY-MM-DD), description,
@@ -288,6 +321,21 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
   const caps = await detectTransactionsCapabilities();
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
+
+  // If we have source_msg_id but no unique constraint, still do an idempotency pre-check.
+  if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+    try {
+      const exists = await queryWithTimeout(
+        `select id from public.transactions where owner_id=$1 and source_msg_id=$2 limit 1`,
+        [owner, sourceMsgId],
+        Math.min(2500, timeoutMs)
+      );
+      if (exists?.rows?.length) return { inserted: false, id: exists.rows[0].id };
+    } catch (e) {
+      // fail-open: if the check fails, we still try to insert
+      console.warn('[PG/transactions] idempotency pre-check failed (ignored):', e?.message);
+    }
+  }
 
   const cols = [
     'owner_id',
@@ -325,17 +373,21 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     ...(caps.TX_HAS_MEDIA_URL ? [media?.media_url || null] : []),
     ...(caps.TX_HAS_MEDIA_TYPE ? [media?.media_type || null] : []),
     ...(caps.TX_HAS_MEDIA_TXT ? [media?.media_transcript || null] : []),
-    ...(caps.TX_HAS_MEDIA_CONF ? [media?.media_confidence ?? null] : []),
+    ...(caps.TX_HAS_MEDIA_CONF ? [media?.media_confidence ?? null] : [])
   ];
 
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
-  const canIdempotent = caps.TX_HAS_SOURCE_MSG_ID && !!sourceMsgId;
+
+  const canIdempotent =
+    caps.TX_HAS_SOURCE_MSG_ID &&
+    !!sourceMsgId &&
+    (await detectTransactionsUniqueOwnerSourceMsg());
 
   const sql = canIdempotent
     ? `
       insert into public.transactions (${cols.join(', ')})
       values (${placeholders}, now())
-      on conflict (owner_id, source_msg_id) where source_msg_id is not null
+      on conflict (owner_id, source_msg_id)
       do nothing
       returning id
     `
@@ -345,10 +397,36 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       returning id
     `;
 
-  const res = await queryWithTimeout(sql, vals, timeoutMs);
-  if (!res?.rows?.length) return { inserted: false, id: null };
-  return { inserted: true, id: res.rows[0].id };
+  try {
+    const res = await queryWithTimeout(sql, vals, timeoutMs);
+    if (!res?.rows?.length) return { inserted: false, id: null };
+    return { inserted: true, id: res.rows[0].id };
+  } catch (e) {
+    // If ON CONFLICT failed because constraint doesn't exist, retry without ON CONFLICT.
+    const msg = String(e?.message || '').toLowerCase();
+    const code = String(e?.code || '');
+    const looksConflictUnsupported =
+      canIdempotent &&
+      (code === '42P10' || msg.includes('there is no unique or exclusion constraint') || msg.includes('on conflict'));
+
+    if (looksConflictUnsupported) {
+      console.warn('[PG/transactions] ON CONFLICT unsupported; retrying without conflict clause');
+      TX_HAS_OWNER_SOURCEMSG_UNIQUE = false; // cache
+      const sql2 = `
+        insert into public.transactions (${cols.join(', ')})
+        values (${placeholders}, now())
+        returning id
+      `;
+      const res2 = await queryWithTimeout(sql2, vals, timeoutMs);
+      if (!res2?.rows?.length) return { inserted: false, id: null };
+      return { inserted: true, id: res2.rows[0].id };
+    }
+
+    throw e;
+  }
 }
+
+/* -------------------- Time helpers -------------------- */
 
 async function getLatestTimeEvent(ownerId, employeeName) {
   const { rows } = await query(
@@ -361,65 +439,389 @@ async function getLatestTimeEvent(ownerId, employeeName) {
   );
   return rows[0] || null;
 }
-module.exports.getLatestTimeEvent = getLatestTimeEvent;
 
-// ---- JOB HELPERS (additive) ---------------------------------------
+/* -------------------- JOB HELPERS -------------------- */
 
-async function getOrCreateJob(ownerId, name) {
-  const owner = String(ownerId).replace(/\D/g,'');
-  const jobName = String(name).trim();
-  const sel = await query(
-    `select id from public.jobs where owner_id=$1 and lower(name)=lower($2) limit 1`,
-    [owner, jobName]
-  );
-  if (sel.rowCount) return sel.rows[0].id;
-
-  const ins = await query(
-    `insert into public.jobs (owner_id, name) values ($1,$2) returning id`,
-    [owner, jobName]
-  );
-  return ins.rows[0].id;
+// ---------- Per-owner safe job_no allocator ----------
+async function withOwnerAllocLock(owner, client) {
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [String(owner)]);
 }
 
-async function setActiveJob(ownerId, userId, jobId) {
-  const owner = String(ownerId).replace(/\D/g,'');
-  await query(
-    `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
-     values ($1,$2,$3,now())
-     on conflict (owner_id,user_id) do update set job_id=excluded.job_id, updated_at=now()`,
-    [owner, String(userId), jobId]
+async function allocateNextJobNo(owner, client) {
+  const { rows } = await client.query(
+    `SELECT COALESCE(MAX(job_no), 0) + 1 AS next_no
+       FROM public.jobs
+      WHERE owner_id = $1`,
+    [String(owner)]
   );
+  return Number(rows?.[0]?.next_no || 1);
+}
+
+// Find or create a job by name (case-insensitive on name or job_name).
+// Robust against races and job_no duplicates: allocate job_no under advisory lock.
+async function ensureJobByName(ownerId, name) {
+  const owner   = DIGITS(ownerId);
+  const jobName = String(name || '').trim();
+  if (!jobName) return null;
+
+  // 1) Try to find existing by either column
+  let r = await query(
+    `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+       FROM public.jobs
+      WHERE owner_id = $1
+        AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
+      LIMIT 1`,
+    [owner, jobName]
+  );
+  if (r.rowCount) return r.rows[0];
+
+  // 2) Create safely with explicit job_no in a serialized transaction
+  return await withClient(async (client) => {
+    await withOwnerAllocLock(owner, client);
+
+    const again = await client.query(
+      `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+         FROM public.jobs
+        WHERE owner_id = $1
+          AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
+        LIMIT 1`,
+      [owner, jobName]
+    );
+    if (again.rowCount) return again.rows[0];
+
+    const nextNo = await allocateNextJobNo(owner, client);
+
+    try {
+      const ins = await client.query(
+        `INSERT INTO public.jobs (owner_id, job_no, job_name, name, active, start_date, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, true, NOW(), NOW(), NOW())
+         RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
+        [owner, nextNo, jobName, jobName]
+      );
+      return ins.rows[0];
+    } catch (e) {
+      if (e && e.code === '23505') {
+        const final = await client.query(
+          `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+             FROM public.jobs
+            WHERE owner_id = $1
+              AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
+            LIMIT 1`,
+          [owner, jobName]
+        );
+        if (final.rowCount) return final.rows[0];
+      }
+      throw e;
+    }
+  });
+}
+
+async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
+  const owner = DIGITS(ownerId);
+  if (explicitJobName) {
+    const j = await ensureJobByName(owner, explicitJobName);
+    if (j) return j;
+  }
+  const act = await query(
+    `SELECT job_no, COALESCE(name, job_name) AS name
+       FROM public.jobs
+      WHERE owner_id=$1 AND active=true
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC
+      LIMIT 1`,
+    [owner]
+  );
+  if (act.rowCount) return act.rows[0];
+  if (fallbackName) {
+    const j = await ensureJobByName(owner, fallbackName);
+    if (j) return j;
+  }
+  if (require) throw new Error('No active job');
+  return null;
+}
+
+/**
+ * ✅ createJobIdempotent (CANONICAL)
+ * - supports { jobName } or { name }
+ * - idempotent by sourceMsgId if unique constraint exists (best effort)
+ * - also avoids duplicates by (owner_id, job_name case-insensitive) if already exists
+ * - allocates job_no under per-owner advisory lock
+ */
+async function createJobIdempotent({ ownerId, jobName, name, sourceMsgId, status = 'open', active = true } = {}) {
+  const owner = DIGITS(ownerId);
+  const cleanName = String(jobName || name || '').trim() || 'Untitled Job';
+  const msgId = String(sourceMsgId || '').trim() || null;
+
+  if (!owner) throw new Error('Missing ownerId');
+
+  return await withClient(async (client) => {
+    await withOwnerAllocLock(owner, client);
+
+    // 1) If msgId, check if job already created for that msg
+    if (msgId) {
+      const existing = await client.query(
+        `SELECT id, owner_id, job_no,
+                COALESCE(job_name, name) AS job_name,
+                name, active, status, source_msg_id
+           FROM public.jobs
+          WHERE owner_id = $1 AND source_msg_id = $2
+          LIMIT 1`,
+        [owner, msgId]
+      );
+      if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
+    }
+
+    // 2) If same name exists, return it
+    const existingByName = await client.query(
+      `SELECT id, owner_id, job_no,
+              COALESCE(job_name, name) AS job_name,
+              name, active, status, source_msg_id
+         FROM public.jobs
+        WHERE owner_id = $1 AND lower(COALESCE(job_name, name)) = lower($2)
+        LIMIT 1`,
+      [owner, cleanName]
+    );
+    if (existingByName.rowCount) return { inserted: false, job: existingByName.rows[0], reason: 'already_exists' };
+
+    // 3) allocate next job_no
+    const nextNo = await allocateNextJobNo(owner, client);
+
+    // 4) insert
+    try {
+      const ins = await client.query(
+        `INSERT INTO public.jobs
+           (owner_id, job_no, job_name, name, status, active, start_date, created_at, updated_at, source_msg_id)
+         VALUES
+           ($1, $2, $3, $3, $4, $5, NOW(), NOW(), NOW(), $6)
+         RETURNING id, owner_id, job_no,
+                   COALESCE(job_name, name) AS job_name,
+                   name, active, status, source_msg_id`,
+        [owner, nextNo, cleanName, String(status || 'open'), !!active, msgId]
+      );
+      return { inserted: true, job: ins.rows[0], reason: 'created' };
+    } catch (e) {
+      // If msg id raced, fetch it
+      if (e && e.code === '23505' && msgId) {
+        const existing = await client.query(
+          `SELECT id, owner_id, job_no,
+                  COALESCE(job_name, name) AS job_name,
+                  name, active, status, source_msg_id
+             FROM public.jobs
+            WHERE owner_id = $1 AND source_msg_id = $2
+            LIMIT 1`,
+          [owner, msgId]
+        );
+        if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
+      }
+      // If name raced, fetch by name
+      if (e && e.code === '23505') {
+        const byName = await client.query(
+          `SELECT id, owner_id, job_no,
+                  COALESCE(job_name, name) AS job_name,
+                  name, active, status, source_msg_id
+             FROM public.jobs
+            WHERE owner_id = $1 AND lower(COALESCE(job_name, name)) = lower($2)
+            LIMIT 1`,
+          [owner, cleanName]
+        );
+        if (byName.rowCount) return { inserted: false, job: byName.rows[0], reason: 'already_exists' };
+      }
+      throw e;
+    }
+  });
+}
+
+// Upsert a job by name, deactivate others, and activate this one
+async function activateJobByName(ownerId, rawName) {
+  const owner = DIGITS(ownerId);
+  const name  = String(rawName || '').trim();
+  if (!name) throw new Error('Missing job name');
+
+  const j = await ensureJobByName(owner, name);
+  const jobNo = j?.job_no;
+  if (!jobNo) throw new Error('Failed to create/resolve job');
+
+  await withClient(async (client) => {
+    await client.query(
+      `UPDATE public.jobs
+         SET active=false, updated_at=NOW()
+       WHERE owner_id=$1 AND active=true AND job_no<>$2`,
+      [owner, jobNo]
+    );
+    await client.query(
+      `UPDATE public.jobs
+         SET active=true, updated_at=NOW(),
+             name=COALESCE(name, $3), job_name=COALESCE(job_name, $3)
+       WHERE owner_id=$1 AND job_no=$2`,
+      [owner, jobNo, name]
+    );
+  });
+
+  const { rows } = await query(
+    `SELECT job_no, COALESCE(name, job_name) AS name, active, updated_at
+       FROM public.jobs
+      WHERE owner_id=$1 AND job_no=$2
+      LIMIT 1`,
+    [owner, jobNo]
+  );
+  const final = rows[0] || { job_no: jobNo, name, active: true };
+  console.info('[PG] activated job', { owner, job_no: final.job_no, name: final.name });
+  return final;
+}
+
+/**
+ * ✅ getActiveJob (compat)
+ * - If user_active_job exists and userId provided -> use it
+ * - Else -> fallback to jobs.active=true (latest)
+ * Returns:
+ *  - if userId provided: { job_no, name } or null
+ *  - if userId omitted: string job name or null (back-compat with handlers/media.js)
+ */
+let _HAS_USER_ACTIVE_JOB_TABLE = null;
+
+async function detectUserActiveJobTable() {
+  if (_HAS_USER_ACTIVE_JOB_TABLE !== null) return _HAS_USER_ACTIVE_JOB_TABLE;
+  try {
+    const r = await query(
+      `select 1
+         from information_schema.tables
+        where table_schema='public'
+          and table_name='user_active_job'
+        limit 1`
+    );
+    _HAS_USER_ACTIVE_JOB_TABLE = (r?.rows?.length || 0) > 0;
+  } catch {
+    _HAS_USER_ACTIVE_JOB_TABLE = false;
+  }
+  return _HAS_USER_ACTIVE_JOB_TABLE;
+}
+
+async function getActiveJob(ownerId, userId = null) {
+  const owner = DIGITS(ownerId);
+  if (!owner) return null;
+
+  // Prefer per-user active job if available
+  if (userId && (await detectUserActiveJobTable())) {
+    try {
+      const { rows } = await query(
+        `select j.job_no, coalesce(j.name, j.job_name) as name
+           from public.user_active_job u
+           join public.jobs j
+             on j.owner_id=u.owner_id and j.id=u.job_id
+          where u.owner_id=$1 and u.user_id=$2
+          limit 1`,
+        [owner, String(userId)]
+      );
+      if (rows[0]) return rows[0];
+    } catch (e) {
+      // fail-open to owner-wide active below
+      console.warn('[PG/getActiveJob] user_active_job lookup failed (ignored):', e?.message);
+    }
+  }
+
+  // Owner-wide active job (job_no schema)
+  const act = await query(
+    `select coalesce(name, job_name) as name, job_no
+       from public.jobs
+      where owner_id=$1 and active=true
+      order by updated_at desc nulls last, created_at desc
+      limit 1`,
+    [owner]
+  );
+
+  const row = act.rows?.[0] || null;
+  if (!row) return userId ? null : null;
+
+  // Back-compat: media.js expects a string job name when calling getActiveJob(ownerId)
+  if (!userId) return row.name || null;
+
+  return { job_no: row.job_no, name: row.name };
+}
+
+/**
+ * ✅ setActiveJob (compat)
+ * If your system is using owner-wide "jobs.active", we activate by job_no/name.
+ * If your system is using user_active_job, it will still work when table exists.
+ *
+ * Accepts:
+ *  - jobId (uuid) if user_active_job uses jobs.id
+ *  - OR jobNo (int)
+ *  - OR jobName (string)
+ */
+async function setActiveJob(ownerId, userId, jobRef) {
+  const owner = DIGITS(ownerId);
+  if (!owner) throw new Error('Missing ownerId');
+
+  // If user_active_job exists and caller gave a uuid id, try to use it
+  if (userId && (await detectUserActiveJobTable())) {
+    const ref = String(jobRef || '').trim();
+    const looksUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ref);
+    if (looksUuid) {
+      await query(
+        `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
+         values ($1,$2,$3,now())
+         on conflict (owner_id,user_id) do update
+           set job_id=excluded.job_id, updated_at=now()`,
+        [owner, String(userId), ref]
+      );
+      return true;
+    }
+  }
+
+  // Otherwise: owner-wide active job activation by name/job_no
+  // Resolve to a job via name or job_no
+  let jobNo = null;
+  const s = String(jobRef || '').trim();
+  if (/^\d+$/.test(s)) {
+    jobNo = Number(s);
+  } else if (s) {
+    const j = await ensureJobByName(owner, s);
+    jobNo = j?.job_no || null;
+  }
+
+  if (!jobNo) throw new Error('Could not resolve job');
+
+  await withClient(async (client) => {
+    await client.query(
+      `update public.jobs set active=false, updated_at=now()
+        where owner_id=$1 and active=true and job_no<>$2`,
+      [owner, jobNo]
+    );
+    await client.query(
+      `update public.jobs set active=true, updated_at=now()
+        where owner_id=$1 and job_no=$2`,
+      [owner, jobNo]
+    );
+  });
+
   return true;
 }
 
-async function getActiveJob(ownerId, userId) {
-  const owner = String(ownerId).replace(/\D/g,'');
-  const { rows } = await query(
-    `select j.id, j.name, j.status
-       from public.user_active_job u
-       join public.jobs j on j.id=u.job_id
-      where u.owner_id=$1 and u.user_id=$2`,
-    [owner, String(userId)]
-  );
-  return rows[0] || null;
-}
+/**
+ * ✅ moveLastLogToJob (job_no schema)
+ * Updates most recent time_entries row for employee to new job_no.
+ * Accepts jobRef as name or job_no.
+ */
+async function moveLastLogToJob(ownerId, userName, jobRef) {
+  const owner = DIGITS(ownerId);
+  if (!owner) throw new Error('Missing ownerId');
 
-// If your time_entries uses job_no (int) instead of job_id (uuid),
-// adapt this function accordingly. Assumes a job_id (uuid) column exists OR
-// you map job_id -> job_no elsewhere.
-async function moveLastLogToJob(ownerId, userName, jobId) {
-  const owner = String(ownerId).replace(/\D/g,'');
-  // Update the most recent row for that employee
+  let jobNo = null;
+  const s = String(jobRef || '').trim();
+  if (/^\d+$/.test(s)) jobNo = Number(s);
+  else if (s) jobNo = (await ensureJobByName(owner, s))?.job_no || null;
+
+  if (!jobNo) throw new Error('Could not resolve job');
+
   const { rows } = await query(
     `update public.time_entries t
-        set job_id=$1
+        set job_no=$1
       where t.id = (
         select id from public.time_entries
          where owner_id=$2 and lower(employee_name)=lower($3)
          order by timestamp desc limit 1
       )
       returning id, type, timestamp`,
-    [jobId, owner, String(userName)]
+    [jobNo, owner, String(userName)]
   );
   return rows[0] || null;
 }
@@ -433,6 +835,7 @@ async function enqueueKpiTouch(ownerId, jobId, isoDate) {
   );
 }
 
+// ---- JOB BY NAME/SOURCE HELPERS (kept) ----
 async function getJobByName(ownerId, name) {
   const owner = DIGITS(ownerId);
   const jobName = String(name || '').trim();
@@ -475,225 +878,7 @@ async function getJobBySourceMsg(ownerId, sourceMsgId) {
   return rows[0] || null;
 }
 
-async function createJobIdempotent({ ownerId, name, sourceMsgId }) {
-  const owner = DIGITS(ownerId);
-  const cleanName = String(name || '').trim() || 'Untitled Job';
-  const msgId = String(sourceMsgId || '').trim() || null;
-
-  if (!owner) throw new Error('Missing ownerId');
-
-  // 1) True idempotency by message id
-  if (msgId) {
-    const existingByMsg = await getJobBySourceMsg(owner, msgId);
-    if (existingByMsg) return { inserted: false, job: existingByMsg, reason: 'duplicate_message' };
-  }
-
-  // 2) User-level idempotency: same name already exists
-  const existingByName = await getJobByName(owner, cleanName);
-  if (existingByName) return { inserted: false, job: existingByName, reason: 'already_exists' };
-
-  // 3) Create safely under per-owner lock + explicit job_no
-  return await withClient(async (client) => {
-    await withOwnerAllocLock(owner, client);
-
-    // Re-check under lock (race-safe)
-    if (msgId) {
-      const againMsg = await client.query(
-        `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
-           from public.jobs
-          where owner_id = $1 and source_msg_id = $2
-          limit 1`,
-        [owner, msgId]
-      );
-      if (againMsg.rowCount) return { inserted: false, job: againMsg.rows[0], reason: 'duplicate_message' };
-    }
-
-    const againName = await client.query(
-      `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
-         from public.jobs
-        where owner_id = $1 and lower(coalesce(name, job_name)) = lower($2)
-        limit 1`,
-      [owner, cleanName]
-    );
-    if (againName.rowCount) return { inserted: false, job: againName.rows[0], reason: 'already_exists' };
-
-    const nextNo = await allocateNextJobNo(owner, client);
-
-    try {
-      const ins = await client.query(
-        `insert into public.jobs
-           (owner_id, job_no, job_name, name, status, active, start_date, created_at, updated_at, source_msg_id)
-         values
-           ($1, $2, $3, $3, 'open', true, now(), now(), now(), $4)
-         returning id, job_no, coalesce(name, job_name) as job_name, source_msg_id`,
-        [owner, nextNo, cleanName, msgId]
-      );
-      return { inserted: true, job: ins.rows[0], reason: 'created' };
-    } catch (e) {
-      // If we collided with unique constraints, return the existing job instead of throwing
-      if (e && e.code === '23505') {
-        const fallback = await client.query(
-          `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
-             from public.jobs
-            where owner_id = $1 and lower(coalesce(name, job_name)) = lower($2)
-            order by created_at desc
-            limit 1`,
-          [owner, cleanName]
-        );
-        if (fallback.rowCount) return { inserted: false, job: fallback.rows[0], reason: 'already_exists' };
-      }
-      throw e;
-    }
-  });
-}
-
-// Upsert a job by name, deactivate others, and activate this one
-async function activateJobByName(ownerId, rawName) {
-  const owner = DIGITS(ownerId);
-  const name  = String(rawName || '').trim();
-  if (!name) throw new Error('Missing job name');
-
-  // ensure the job exists (resolves job_no)
-  const j = await ensureJobByName(owner, name);
-  const jobNo = j?.job_no;
-  if (!jobNo) throw new Error('Failed to create/resolve job');
-
-  // deactivate others, then activate this one
-  await withClient(async (client) => {
-    await client.query(
-      `UPDATE public.jobs
-         SET active=false, updated_at=NOW()
-       WHERE owner_id=$1 AND active=true AND job_no<>$2`,
-      [owner, jobNo]
-    );
-    await client.query(
-      `UPDATE public.jobs
-         SET active=true, updated_at=NOW(),
-             name=COALESCE(name, $3), job_name=COALESCE(job_name, $3)
-       WHERE owner_id=$1 AND job_no=$2`,
-      [owner, jobNo, name]
-    );
-  });
-
-  // fetch final state (best effort)
-  const { rows } = await query(
-    `SELECT job_no, COALESCE(name, job_name) AS name, active, updated_at
-       FROM public.jobs
-      WHERE owner_id=$1 AND job_no=$2
-      LIMIT 1`,
-    [owner, jobNo]
-  );
-  const final = rows[0] || { job_no: jobNo, name, active: true };
-  console.info('[PG] activated job', { owner, job_no: final.job_no, name: final.name });
-  return final;
-}
-module.exports.activateJobByName = activateJobByName;
-
-// ---------- Per-owner safe job_no allocator ----------
-// Uses an advisory *transaction* lock keyed by owner to serialize allocation.
-// Then computes next job_no and inserts explicitly with that value.
-
-async function withOwnerAllocLock(owner, client) {
-  // lock key is a stable hash of owner so different owners don't block each other
-  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [String(owner)]);
-}
-
-async function allocateNextJobNo(owner, client) {
-  // After we hold the advisory lock, it’s safe to read max and add 1
-  const { rows } = await client.query(
-    `SELECT COALESCE(MAX(job_no), 0) + 1 AS next_no
-       FROM public.jobs
-      WHERE owner_id = $1`,
-    [String(owner)]
-  );
-  return Number(rows?.[0]?.next_no || 1);
-}
-
-/**
- * Create a job idempotently, safely allocating job_no per owner.
- * Requires:
- *  - jobs has UNIQUE(owner_id, job_no) (you do: uq_jobs_owner_jobno)
- *  - jobs has UNIQUE(owner_id, source_msg_id) (you created jobs_owner_source_msg_uidx)
- *
- * Returns:
- *  { inserted: boolean, job: { id, job_no, job_name, name, active, status, source_msg_id } | null }
- */
-async function createJobIdempotent({ ownerId, jobName, sourceMsgId, status = 'open', active = true } = {}) {
-  const owner = DIGITS(ownerId);
-  const name = String(jobName || '').trim() || 'Untitled Job';
-  const msgId = String(sourceMsgId || '').trim() || null;
-
-  if (!owner) throw new Error('Missing ownerId');
-
-  // If no sourceMsgId, we cannot be idempotent — still allocate job_no safely.
-  return await withClient(async (client) => {
-    // serialize all allocs for this owner only
-    await withOwnerAllocLock(owner, client);
-
-    // 1) If we have a message id, first check if this job was already created for that msg
-    if (msgId) {
-      const existing = await client.query(
-        `SELECT id, owner_id, job_no,
-                COALESCE(job_name, name) AS job_name,
-                name, active, status, source_msg_id
-           FROM public.jobs
-          WHERE owner_id = $1 AND source_msg_id = $2
-          LIMIT 1`,
-        [owner, msgId]
-      );
-      if (existing.rowCount) return { inserted: false, job: existing.rows[0] };
-    }
-
-    // 2) Allocate next job_no under the lock
-    const nextNo = await allocateNextJobNo(owner, client);
-
-    // 3) Insert. If source_msg_id exists + is unique, this is idempotent.
-    //    If another request beats us with same source_msg_id, we fetch it afterwards.
-    try {
-      const ins = await client.query(
-        `INSERT INTO public.jobs
-           (owner_id, job_no, job_name, name, status, active, start_date, created_at, updated_at, source_msg_id)
-         VALUES
-           ($1, $2, $3, $4, $5, $6, NOW(), NOW(), NOW(), $7)
-         RETURNING id, owner_id, job_no,
-                   COALESCE(job_name, name) AS job_name,
-                   name, active, status, source_msg_id`,
-        [owner, nextNo, name, name, String(status || 'open'), !!active, msgId]
-      );
-      return { inserted: true, job: ins.rows[0] };
-    } catch (e) {
-      // If unique (owner_id, source_msg_id) raced, fetch it.
-      // 23505 covers unique violations (could be either job_no or source_msg_id).
-      if (e && e.code === '23505' && msgId) {
-        const existing = await client.query(
-          `SELECT id, owner_id, job_no,
-                  COALESCE(job_name, name) AS job_name,
-                  name, active, status, source_msg_id
-             FROM public.jobs
-            WHERE owner_id = $1 AND source_msg_id = $2
-            LIMIT 1`,
-          [owner, msgId]
-        );
-        if (existing.rowCount) return { inserted: false, job: existing.rows[0] };
-      }
-      throw e;
-    }
-  });
-}
-
-// ---------- File Exports (fetch) ----------
-async function getFileExport(id) {
-  const { rows } = await query(
-    `SELECT filename, content_type, bytes
-       FROM public.file_exports
-      WHERE id = $1
-      LIMIT 1`,
-    [String(id)]
-  );
-  return rows[0] || null;
-}
-
-// ---------- Time Limits & Audit (schema-aware, tolerant) ----------
+/* -------------------- Time Limits & Audit (schema-aware, tolerant) -------------------- */
 
 // Cache detected columns on public.time_entries
 let SUPPORTS_CREATED_BY    = null; // null=unknown, then true/false
@@ -748,7 +933,6 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
   } catch (eUser) {
     const msg = String(eUser?.message || '').toLowerCase();
     if (!msg.includes('column "user_id" does not exist')) {
-      // If it's some other DB error, fail-open
       return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
     }
   }
@@ -819,7 +1003,7 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  // Ensure detection (retry on null)
+  // Ensure detection
   if (
     SUPPORTS_USER_ID === null ||
     SUPPORTS_CREATED_BY === null ||
@@ -855,7 +1039,6 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   cols.push('created_at');
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
 
-  // If we have source_msg_id + user_id, we can safely "do nothing" on duplicates
   const canIdempotent =
     SUPPORTS_SOURCE_MSG_ID &&
     SUPPORTS_USER_ID &&
@@ -884,102 +1067,10 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
 
   const { rows } = await query(sql, vals);
 
-  // Duplicate message -> no insert -> return null (caller can treat as already processed)
   return rows?.[0]?.id || null;
 }
 
-// Find or create a job by name (case-insensitive on name or job_name).
-// Robust against races and job_no duplicates: we allocate job_no under an advisory lock.
-async function ensureJobByName(ownerId, name) {
-  const owner   = DIGITS(ownerId);
-  const jobName = String(name || '').trim();
-  if (!jobName) return null;
-
-  // 1) Try to find existing by either column
-  let r = await query(
-    `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
-       FROM public.jobs
-      WHERE owner_id = $1
-        AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
-      LIMIT 1`,
-    [owner, jobName]
-  );
-  if (r.rowCount) return r.rows[0];
-
-  // 2) Create safely with explicit job_no in a serialized transaction
-  return await withClient(async (client) => {
-    // serialize all allocs for this owner only
-    await withOwnerAllocLock(owner, client);
-
-    // re-check inside the txn (avoid TOCTOU)
-    const again = await client.query(
-      `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
-         FROM public.jobs
-        WHERE owner_id = $1
-          AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
-        LIMIT 1`,
-      [owner, jobName]
-    );
-    if (again.rowCount) return again.rows[0];
-
-    // allocate a fresh job_no and insert explicitly
-    const nextNo = await allocateNextJobNo(owner, client);
-
-    // NOTE: separate params for text/varchar columns (name vs job_name)
-    try {
-      const ins = await client.query(
-        `INSERT INTO public.jobs (owner_id, job_no, job_name, name, active, start_date, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, true, NOW(), NOW(), NOW())
-         RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
-        [owner, nextNo, jobName, jobName]
-      );
-      return ins.rows[0];
-    } catch (e) {
-      // If some concurrent path still beat us, fall back to re-select
-      if (e && e.code === '23505') {
-        const final = await client.query(
-          `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
-             FROM public.jobs
-            WHERE owner_id = $1
-              AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
-            LIMIT 1`,
-          [owner, jobName]
-        );
-        if (final.rowCount) return final.rows[0];
-      }
-      throw e;
-    }
-  });
-}
-
-async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
-  const owner = DIGITS(ownerId);
-  if (explicitJobName) {
-    const j = await ensureJobByName(owner, explicitJobName);
-    if (j) return j;
-  }
-  const act = await query(
-    `SELECT job_no, COALESCE(name, job_name) AS name
-       FROM public.jobs
-      WHERE owner_id=$1 AND active=true
-      ORDER BY updated_at DESC NULLS LAST, created_at DESC
-      LIMIT 1`,
-    [owner]
-  );
-  if (act.rowCount) return act.rows[0];
-  if (fallbackName) {
-    const j = await ensureJobByName(owner, fallbackName);
-    if (j) return j;
-  }
-  if (require) throw new Error('No active job');
-  return null;
-}
-
-async function createTaskWithJob(opts) {
-  const job = await resolveJobContext(opts.ownerId, { explicitJobName: opts.jobName });
-  opts.jobNo = job?.job_no || null;
-  return await createTask(opts);
-}
+/* -------------------- OTP / Users / Tasks / Exports / Pending Actions -------------------- */
 
 // ---------- OTP ----------
 async function generateOTP(userId) {
@@ -1021,7 +1112,6 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
 }
 
 async function saveUserProfile(p) {
-  const uid = DIGITS(p.user_id);
   const keys = Object.keys(p);
   const vals = Object.values(p);
   const insCols = keys.join(', ');
@@ -1064,6 +1154,12 @@ async function getTaskByNo(ownerId, taskNo) {
     [DIGITS(ownerId), taskNo]
   );
   return rows[0] || null;
+}
+
+async function createTaskWithJob(opts) {
+  const job = await resolveJobContext(opts.ownerId, { explicitJobName: opts.jobName });
+  opts.jobNo = job?.job_no || null;
+  return await createTask(opts);
 }
 
 // ---------- EXCEL EXPORT (lazy load) ----------
@@ -1172,6 +1268,18 @@ async function exportTimesheetPdf(opts) {
   return { url: `${base}/exports/${id}`, id, filename };
 }
 
+// ---------- File Exports (fetch) ----------
+async function getFileExport(id) {
+  const { rows } = await query(
+    `SELECT filename, content_type, bytes
+       FROM public.file_exports
+      WHERE id = $1
+      LIMIT 1`,
+    [String(id)]
+  );
+  return rows[0] || null;
+}
+
 // ---------- Pending actions (confirmations, serverless-safe, TTL via created_at) ----------
 const PENDING_TTL_MIN = 10;
 
@@ -1207,11 +1315,9 @@ async function getPendingAction({ ownerId, userId }) {
 async function deletePendingAction(id) {
   await query(`delete from public.pending_actions where id=$1`, [id]);
 }
-module.exports.savePendingAction   = savePendingAction;
-module.exports.getPendingAction    = getPendingAction;
-module.exports.deletePendingAction = deletePendingAction;
 
 // -------------------- Finance helpers (transactions + pricing_items) --------------------
+// (unchanged from your file)
 
 async function getOwnerPricingItems(ownerId) {
   const ownerKey = String(ownerId);
@@ -1281,7 +1387,6 @@ async function getOwnerJobsFinance(ownerId) {
         j.status,
         j.created_at,
         j.completed_at,
-        -- roll up from transactions
         coalesce(sum(case when t.kind = 'revenue' then t.amount_cents end), 0) as revenue_cents,
         coalesce(sum(case when t.kind = 'expense' then t.amount_cents end), 0) as expense_cents
       from jobs j
@@ -1395,14 +1500,6 @@ const __checkLimit =
   (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
   (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
 
-function _legacyNotSupported(fnName) {
-  return async () => {
-    throw new Error(
-      `[LEGACY] ${fnName} uses job_id; current schema uses job_no. Do not call this.`
-    );
-  };
-}
-
 module.exports = {
   // ---------- Core ----------
   pool,
@@ -1415,8 +1512,8 @@ module.exports = {
   DIGITS,
   todayInTZ,
   normalizePhoneNumber: (x) => DIGITS(x),
-  toCents,   // exported explicitly if you want to use it by name
-  toAmount,  // back-compat alias (returns cents)
+  toCents,
+  toAmount,
   isValidIso,
 
   // ✅ Media/Transactions helpers
@@ -1426,7 +1523,7 @@ module.exports = {
   insertTransaction,
   normalizeMediaMeta,
 
-  // ---------- Pending actions (serverless-safe confirmations) ----------
+  // ---------- Pending actions ----------
   savePendingAction,
   getPendingAction,
   deletePendingAction,
@@ -1442,25 +1539,25 @@ module.exports = {
   // ---------- Tasks ----------
   createTask,
   getTaskByNo,
-  createTaskWithJob, // kept for back-compat
+  createTaskWithJob,
 
   // ---------- Jobs / context ----------
   ensureJobByName,
   createJobIdempotent,
   activateJobByName,
   resolveJobContext,
-  getOrCreateJob,
 
-  setActiveJob: _legacyNotSupported('setActiveJob'),
-  getActiveJob: _legacyNotSupported('getActiveJob'),
-  moveLastLogToJob: _legacyNotSupported('moveLastLogToJob'),
+  // ✅ restored compat exports (these were previously "legacy not supported")
+  setActiveJob,
+  getActiveJob,
+  moveLastLogToJob,
   enqueueKpiTouch,
 
   // ---------- Time ----------
   logTimeEntry,
   logTimeEntryWithJob,
   getLatestTimeEvent,
-  checkTimeEntryLimit: __checkLimit, // alias; keep API stable
+  checkTimeEntryLimit: __checkLimit,
   checkActorLimit: __checkLimit,
 
   // ---------- Finance ----------

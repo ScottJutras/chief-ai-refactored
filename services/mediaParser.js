@@ -1,5 +1,7 @@
 // services/mediaParser.js
+
 function clean(s) { return String(s || '').trim(); }
+
 function titleCase(s) {
   return String(s || '')
     .split(/\s+/)
@@ -7,12 +9,56 @@ function titleCase(s) {
     .join(' ')
     .trim();
 }
+
 function sanitizeName(s) {
   return String(s || '').replace(/[^\p{L}\p{N}\s.'-]/gu, '').replace(/\s+/g, ' ').trim();
 }
+
 function escapeRegExp(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+function todayIso() {
+  return new Date().toISOString().split('T')[0];
+}
+
+function parseNaturalDateLoose(text) {
+  const s = String(text || '').toLowerCase();
+  if (/\btoday\b/.test(s)) return todayIso();
+  if (/\byesterday\b/.test(s)) {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return d.toISOString().split('T')[0];
+  }
+  if (/\btomorrow\b/.test(s)) {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return d.toISOString().split('T')[0];
+  }
+  const m = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (m) return m[1];
+  return null;
+}
+
+function looksLikeAddress(s) {
+  const t = String(s || '').trim();
+  if (!/\d/.test(t)) return false;
+  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trl|trail|pkwy|park)\b/i.test(t);
+}
+
+function normalizeJobToken(s) {
+  let t = String(s || '').trim();
+  t = t.replace(/^(?:job\s*[:\-]?\s*)/i, '');   // "job 123", "job: 123"
+  t = t.replace(/[.?!]+$/g, '').trim();
+  return t;
+}
+
+function moneyToFixed(amountStr) {
+  const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
+  if (!Number.isFinite(n)) return null;
+  return `$${n.toFixed(2)}`;
+}
+
 function extractTimePhrase(text) {
   const s = String(text || '').toLowerCase();
   let m = s.match(/\bat\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\b/i);
@@ -21,6 +67,7 @@ function extractTimePhrase(text) {
   if (m) return 'now';
   return null;
 }
+
 function buildTimestampFromText(clockText) {
   if (!clockText) return new Date().toISOString();
   const t = String(clockText).toLowerCase().trim();
@@ -37,6 +84,9 @@ function buildTimestampFromText(clockText) {
     Math.min(Math.max(hour, 0), 23), Math.min(Math.max(min, 0), 59), 0, 0);
   return dt.toISOString();
 }
+
+/* ---------------- TIME ---------------- */
+
 function tryParseTimeEntry(rawText) {
   let original = clean(rawText);
   const timeWord = extractTimePhrase(original);
@@ -94,6 +144,7 @@ function tryParseTimeEntry(rawText) {
 
   return null;
 }
+
 function tryParseHoursInquiry(text) {
   const s = String(text || '').trim().toLowerCase();
   if (!/\bhours?\b/.test(s)) return null;
@@ -114,43 +165,143 @@ function tryParseHoursInquiry(text) {
   }
   return null;
 }
+
+/* ---------------- EXPENSE ---------------- */
+
 function tryParseExpense(text) {
-  const joined = String(text || '').split('\n').map(l => l.trim()).filter(Boolean).join(' ');
-  const amtMatch = joined.match(/\$?\b(\d+(?:\.\d{2})?)\b/);
+  const s = clean(text).replace(/\s+/g, ' ');
+  const lc = s.toLowerCase();
+
+  // Voice-style patterns
+  const verb = /\b(spent|paid|bought|purchased|purchase)\b/.test(lc);
+  if (!verb && !/\bexpense\b/.test(lc) && !/\breceipt\b/.test(lc)) return null;
+
+  const amtMatch = s.match(/\$?\b(\d+(?:\.\d{1,2})?)\b/);
   if (!amtMatch) return null;
-  const likely = /\b(receipt|bought|purchase|total|tax|visa|mastercard|debit|store|coffee|fuel|gas|hardware|tools?)\b/i.test(joined);
-  if (!likely) return null;
-  const amount = `$${amtMatch[1]}`;
-  const store = (joined.split(/\s+/).find(w => !/\$?\d+(\.\d{2})?/.test(w)) || 'Unknown').trim();
+
+  const amount = moneyToFixed(amtMatch[1]);
+  if (!amount) return null;
+
+  const date = parseNaturalDateLoose(s) || todayIso();
+
+  // Store heuristics: "at Home Depot" / "from Home Depot"
+  let store =
+    s.match(/\b(?:at|from)\s+([a-z0-9][a-z0-9&.' -]{1,60})\b/i)?.[1] ||
+    null;
+
+  store = store ? titleCase(sanitizeName(store)) : 'Unknown Store';
+
+  // Item heuristic: if they said "on lumber/materials/tools" we can pick it up
+  let item =
+    s.match(/\bon\s+([a-z][a-z0-9&.' -]{1,60})\b/i)?.[1] ||
+    s.match(/\bfor\s+([a-z][a-z0-9&.' -]{1,60})\b/i)?.[1] ||
+    null;
+
+  item = item ? titleCase(sanitizeName(item)) : 'Materials';
+
   return {
     type: 'expense',
-    data: { date: new Date().toISOString().split('T')[0], item: store, amount, store, category: 'Miscellaneous' }
+    data: {
+      date,
+      item,
+      amount,
+      store,
+      category: null,
+      jobName: null
+    }
   };
 }
+
+/* ---------------- REVENUE ---------------- */
+
 function tryParseRevenue(text) {
-  const s = String(text || '');
-  const amtMatch = s.match(/\$?\b(\d+(?:\.\d{2})?)\b/);
+  const s = clean(text).replace(/\s+/g, ' ');
+  const lc = s.toLowerCase();
+
+  // Match revenue-ish intent
+  const verb = /\b(received|got paid|got payed|paid|deposit|deposited|payment|revenue|invoice paid)\b/.test(lc);
+  if (!verb && !/\brevenue\b/.test(lc)) return null;
+
+  const amtMatch = s.match(/\$?\b(\d+(?:\.\d{1,2})?)\b/);
   if (!amtMatch) return null;
-  const m = s.match(/\bfrom\s+([^\n]+)$/i);
-  if (!m) return null;
-  const amount = `$${amtMatch[1]}`;
-  const source = m[1].trim();
+
+  const amount = moneyToFixed(amtMatch[1]);
+  if (!amount) return null;
+
+  const date = parseNaturalDateLoose(s) || todayIso();
+
+  // Job candidates:
+  // - "for <job>"
+  // - "on <job>"
+  // - "from job <job>"
+  // - "from <address-like>"  (treat as job)
+  let jobName = null;
+
+  const forMatch = s.match(/\bfor\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
+  if (forMatch?.[1]) jobName = normalizeJobToken(forMatch[1]);
+
+  if (!jobName) {
+    const onMatch = s.match(/\bon\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
+    if (onMatch?.[1]) jobName = normalizeJobToken(onMatch[1]);
+  }
+
+  // "from X" might be payer OR job/address
+  let source = 'Unknown';
+  const fromMatch = s.match(/\bfrom\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
+  if (fromMatch?.[1]) {
+    const raw = String(fromMatch[1]).trim();
+    const cleaned = normalizeJobToken(raw);
+
+    const isExplicitJob = /^\s*job\b/i.test(raw);
+    const isAddr = looksLikeAddress(cleaned) || looksLikeAddress(raw);
+
+    if (!jobName && (isExplicitJob || isAddr)) {
+      jobName = cleaned;
+      source = 'Unknown';
+    } else if (!isExplicitJob && !isAddr) {
+      source = titleCase(sanitizeName(cleaned));
+    }
+  }
+
+  // If jobName looks like overhead, normalize it
+  if (jobName) {
+    const t = String(jobName).trim().toLowerCase();
+    if (t === 'overhead' || t === 'oh') jobName = 'Overhead';
+  }
+
   return {
     type: 'revenue',
-    data: { date: new Date().toISOString().split('T')[0], description: source, amount, source, category: 'Service' }
+    data: {
+      date,
+      description: 'Payment received',
+      amount,
+      source,
+      category: null,
+      jobName: jobName || null
+    }
   };
 }
+
+/* ---------------- MAIN ---------------- */
+
 async function parseMediaText(text) {
   const t = clean(text);
   console.log('[mediaParser] input:', t);
+
   const time = tryParseTimeEntry(t);
   if (time) return time;
+
   const hours = tryParseHoursInquiry(t);
   if (hours) return hours;
+
   const exp = tryParseExpense(t);
   if (exp) return exp;
+
   const rev = tryParseRevenue(t);
   if (rev) return rev;
-  throw new Error('Invalid media format');
+
+  // ✅ Do not throw — let media handler fall back cleanly
+  return { type: 'unknown', data: {} };
 }
+
 module.exports = { parseMediaText };

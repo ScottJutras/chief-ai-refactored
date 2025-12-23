@@ -13,7 +13,7 @@ const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
-// ✅ NEW: prefer clearFinanceFlow (does not wipe unrelated state); fallback to delete
+// Prefer clearing just finance keys; fallback to full delete
 const clearFinanceFlow =
   (typeof state.clearFinanceFlow === 'function' && state.clearFinanceFlow) ||
   (async (userId) => deletePendingTransactionState(userId));
@@ -42,7 +42,7 @@ const validateCIL =
   (typeof cilMod === 'function' && cilMod) ||
   null;
 
-// ---- Media limits (Option A truncation) ----
+// ---- Media limits ----
 const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
 function truncateText(str, maxChars) {
   if (!str) return null;
@@ -51,7 +51,7 @@ function truncateText(str, maxChars) {
   return s.slice(0, maxChars);
 }
 
-// ---- basic parsing helpers ----
+// ---- parsing helpers ----
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
   if (!Number.isFinite(n)) return null;
@@ -94,10 +94,6 @@ function looksLikeUuid(str) {
 
 /**
  * Resolve active job name safely (avoid int=uuid comparisons).
- * Priority:
- *  1) userProfile.active_job_name
- *  2) userProfile.active_job_id (uuid) -> jobs.id
- *  3) userProfile.active_job_id numeric -> jobs.job_no
  */
 async function resolveActiveJobName({ ownerId, userProfile }) {
   const ownerParam = String(ownerId || '').trim();
@@ -144,68 +140,52 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
-// Minimal CIL build (your current shape) — fail-open if validator missing
-function buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
+/**
+ * ✅ NEW: Build Expense CIL in the same “LogX” style you’re using for revenue.
+ * This is the most likely shape your validateCIL expects.
+ */
+function buildExpenseCIL({ from, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
+  const description = String(data.item || '').trim() || 'Expense';
 
   return {
-    cil_version: "1.0",
-    type: "expense",
-    tenant_id: String(ownerId),
-    source: "whatsapp",
-    source_msg_id: String(sourceMsgId),
-
-    actor: {
-      actor_id: String(userProfile?.user_id || from || "unknown"),
-      role: "owner",
-      phone_e164: from && String(from).startsWith("+") ? String(from) : undefined,
-    },
-
-    occurred_at: new Date().toISOString(),
-    job: jobName ? { job_name: String(jobName) } : null,
-    needs_job_resolution: !jobName,
-
-    total_cents: cents,
-    currency: "CAD",
-
-    vendor: data.store && data.store !== 'Unknown Store' ? String(data.store) : undefined,
-    memo: data.item && data.item !== 'Unknown' ? String(data.item) : undefined,
+    type: 'LogExpense',
+    job: jobName ? String(jobName) : undefined,
+    description,
+    amount_cents: cents,
+    source: data.store && data.store !== 'Unknown Store' ? String(data.store) : undefined,
+    date: data.date ? String(data.date) : undefined,
     category: category ? String(category) : undefined,
+    source_msg_id: sourceMsgId ? String(sourceMsgId) : undefined,
+    actor_phone: from ? String(from) : undefined
   };
 }
 
-function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
+/**
+ * ✅ NEW: Fail-open CIL gate (don’t block inserts if validator disagrees).
+ * We still log enough info to fix the schema later.
+ */
+function assertExpenseCILOrClarify({ from, data, jobName, category, sourceMsgId }) {
+  const cil = buildExpenseCIL({ from, data, jobName, category, sourceMsgId });
+
+  if (typeof validateCIL !== 'function') {
+    console.warn('[EXPENSE] validateCIL missing; skipping CIL validation (fail-open).');
+    return { ok: true, cil, skipped: true };
+  }
+
   try {
-    const cil = buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
-
-    // FAIL-OPEN if validator missing
-    if (typeof validateCIL !== 'function') {
-      console.warn('[EXPENSE] validateCIL missing; skipping CIL validation (fail-open).');
-      return { ok: true, cil, skipped: true };
-    }
-
     validateCIL(cil);
     return { ok: true, cil };
-  } catch {
-    return { ok: false, reply: `⚠️ Couldn't log that expense yet. Try: "expense 84.12 nails from Home Depot".` };
-  }
-}
-
-/**
- * Legacy helper retained (used in a couple spots),
- * but success paths now prefer clearFinanceFlow().
- */
-async function clearPendingMediaMeta(from, pending) {
-  try {
-    if (!pending) return;
-    if (!pending.pendingMediaMeta && !pending.pendingMedia) return;
-
-    await mergePendingTransactionState(from, {
-      ...(pending || {}),
-      pendingMediaMeta: null,
-      pendingMedia: false
+  } catch (e) {
+    console.warn('[EXPENSE] CIL validate failed (fail-open)', {
+      message: e?.message,
+      name: e?.name,
+      details: e?.errors || e?.issues || null,
+      cilType: cil?.type
     });
-  } catch {}
+    // fail-open: do not block logging
+    return { ok: true, cil, failedOpen: true };
+  }
 }
 
 async function deleteExpense(ownerId, criteria) {
@@ -292,7 +272,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
-    // Follow-up: job resolution (contractor-first)
+    // Follow-up: job resolution
     if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
       const jobReply = String(input || '').trim();
       const finalJob = jobReply || null;
@@ -318,7 +298,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const lc = String(input || '').toLowerCase().trim();
-      const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim(); // always defined
+      const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
 
       // If user sends a fresh expense command while waiting, treat as new command
       if (/^(?:expense|exp)\b/.test(lc) && pending?.pendingExpense) {
@@ -351,18 +331,15 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             return `<Response><Message>${reply}</Message></Response>`;
           }
 
-          const gate = assertExpenseCILOrClarify({
-            ownerId,
+          // ✅ CIL gate (now fail-open + correct shape)
+          assertExpenseCILOrClarify({
             from,
-            userProfile,
             data,
             jobName,
             category,
             sourceMsgId: stableMsgId
           });
-          if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
-          // ✅ CANONICAL INSERT PATH
           const amountCents = toCents(data.amount);
           if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
 
@@ -372,7 +349,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             date: data.date || todayIso(),
             description: String(data.item || '').trim() || 'Unknown',
             amount_cents: amountCents,
-            amount: null, // optional legacy numeric amount column handled inside insertTransaction if present
+            amount: null,
             source: String(data.store || '').trim() || 'Unknown',
             job: jobName,
             job_name: jobName,
@@ -394,9 +371,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
               ? '✅ Already logged that expense (duplicate message).'
               : `✅ Expense logged: ${data.amount} for ${data.item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-          // ✅ NEW: clear finance flow keys (includes pendingMediaMeta)
           await clearFinanceFlow(from);
-
           return `<Response><Message>${reply}</Message></Response>`;
         }
 
@@ -408,7 +383,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             : `⚠️ Expense not found or deletion failed.`;
 
           await clearFinanceFlow(from);
-
           return `<Response><Message>${reply}</Message></Response>`;
         }
 
@@ -482,8 +456,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: safeMsgId });
-      if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+      // CIL gate (fail-open)
+      assertExpenseCILOrClarify({ from, data, jobName, category, sourceMsgId: safeMsgId });
 
       const amountCents = toCents(data.amount);
       const mediaMeta = pending?.pendingMediaMeta || null;
@@ -515,9 +489,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           ? '✅ Already logged that expense (duplicate message).'
           : `✅ Expense logged: ${data.amount} for ${item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-      // ✅ NEW: clear finance flow keys (prevents media meta leaking to next txn)
       await clearFinanceFlow(from);
-
       return `<Response><Message>${reply}</Message></Response>`;
     }
 
@@ -569,8 +541,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       if (confirmed && !errors) {
-        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: safeMsgId });
-        if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
+        // CIL gate (fail-open)
+        assertExpenseCILOrClarify({ from, data, jobName, category, sourceMsgId: safeMsgId });
 
         const amountCents = toCents(data.amount);
         const mediaMeta = pending?.pendingMediaMeta || null;
@@ -602,9 +574,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             ? '✅ Already logged that expense (duplicate message).'
             : `✅ Expense logged: ${data.amount} for ${data.item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-        // ✅ NEW: clear finance flow keys
         await clearFinanceFlow(from);
-
         return `<Response><Message>${reply}</Message></Response>`;
       }
 

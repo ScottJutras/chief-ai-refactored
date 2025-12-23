@@ -90,23 +90,22 @@ function normalizeExpenseFromTranscript(t) {
   let store = null;
   let item = null;
 
-  // store: "at Home Depot"
-  const mStore = s.match(/\bat\s+([A-Za-z0-9&.'\- ]{2,60})(?:\s+on|\s+for|\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
+  // store: "at Home Depot" OR "from Home Depot"
+  const mStore = s.match(/\b(?:at|from)\s+([A-Za-z0-9&.'\- ]{2,60})(?:\s+on|\s+for|\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
   if (mStore?.[1]) store = mStore[1].trim();
 
-  // item: "on lumber"
-  const mItem = s.match(/\bon\s+(.+?)(?:\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
+  // item: "on lumber" or "for lumber"
+  const mItem = s.match(/\b(?:on|for)\s+(.+?)(?:\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
   if (mItem?.[1]) item = mItem[1].trim();
 
-  // date keywords (let expense.js handle natural date too if you prefer)
   let dateToken = '';
   if (/\btoday\b/i.test(s)) dateToken = ' today';
   else if (/\byesterday\b/i.test(s)) dateToken = ' yesterday';
 
-  // Build a line your expense.js deterministic regex will catch:
-  // "expense 452 lumber from Home Depot"
   const safeItem = item || 'items';
   const safeStore = store || 'Unknown Store';
+
+  // Your expense.js deterministic regex: "expense 452 nails from Home Depot"
   return `expense ${amt} ${safeItem} from ${safeStore}${dateToken}`;
 }
 
@@ -116,10 +115,18 @@ function normalizeRevenueFromTranscript(t) {
   if (!mAmt) return null;
   const amt = mAmt[1];
 
-  // job-ish token
+  // job-ish token: for/on/job <...> OR from job <...>
   let job = null;
+
+  // prefer "for/on"
   const mJob = s.match(/\b(?:for|on|job)\s+(.+?)(?:\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
   if (mJob?.[1]) job = mJob[1].trim();
+
+  // handle "from job 1556 ..."
+  if (!job) {
+    const mFromJob = s.match(/\bfrom\s+job\s+(.+?)(?:\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
+    if (mFromJob?.[1]) job = mFromJob[1].trim();
+  }
 
   let dateToken = '';
   if (/\btoday\b/i.test(s)) dateToken = ' today';
@@ -128,7 +135,6 @@ function normalizeRevenueFromTranscript(t) {
   if (!job) return `received $${amt}${dateToken}`;
   return `received $${amt} for ${job}${dateToken}`;
 }
-
 
 function truncateText(str, maxChars) {
   if (!str) return null;
@@ -231,12 +237,15 @@ async function maybePassThroughFinanceTextOnly(from, input) {
   if (!String(input || '').trim()) return null;
 
   const pendingState = await getPendingTransactionState(from);
-  const pendingType =
-    pendingState?.pendingMedia?.type ||
+
+  // pendingMedia can be boolean OR object in different builds. Be defensive.
+  const pendingMedia = pendingState?.pendingMedia;
+  const pendingMediaType =
+    (pendingMedia && typeof pendingMedia === 'object' ? pendingMedia.type : null) ||
     pendingState?.type ||
     null;
 
-  if (pendingType === 'expense' || pendingType === 'revenue') {
+  if (pendingMediaType === 'expense' || pendingMediaType === 'revenue') {
     return { transcript: String(input || '').trim(), twiml: null };
   }
   return null;
@@ -354,8 +363,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       const lc = transcript.toLowerCase();
       const looksHours   = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
-      const looksExpense = /\b(expense|receipt|spent|cost)\b/.test(lc);
-      const looksRevenue = /\b(revenue|payment|paid|deposit|sale|received)\b/.test(lc);
+      const looksExpense = /\b(expense|receipt|spent|cost|paid|bought|purchase|purchased)\b/.test(lc);
+      const looksRevenue = /\b(revenue|payment|paid|deposit|sale|received|got paid)\b/.test(lc);
       const timeclockIntent = inferIntentFromText(transcript);
 
       // If it smells like finance/timeclock/hours, attach meta and parse it.
@@ -394,36 +403,32 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     /* ---------- Parse ---------- */
     console.log('[MEDIA] parseMediaText()', { excerpt: (extractedText || '').slice(0, 80) });
 
-    let result;
-try {
-  result = await parseMediaText(extractedText);
-} catch (e) {
-  console.error('[MEDIA] parseMediaText failed:', e.message);
+    // ✅ parseMediaText now returns {type:'unknown'} instead of throwing (new drop-in mediaParser)
+    const result = await parseMediaText(extractedText);
 
-  const lc = String(extractedText || '').toLowerCase();
-  const looksExpense = /\b(expense|receipt|spent|cost)\b/.test(lc);
-  const looksRevenue = /\b(revenue|payment|paid|deposit|sale|received)\b/.test(lc);
+    // If parser returned unknown, try a last-mile normalize into a command (helps older flows)
+    if (!result || result.type === 'unknown') {
+      const lc = String(extractedText || '').toLowerCase();
+      const looksExpense = /\b(expense|receipt|spent|cost|paid|bought|purchase|purchased)\b/.test(lc);
+      const looksRevenue = /\b(revenue|payment|deposit|sale|received|got paid)\b/.test(lc);
 
-  // ✅ NEW: if it clearly looks like expense/revenue, normalize into a command and pass through
-  if (looksExpense) {
-    const norm = normalizeExpenseFromTranscript(extractedText);
-    if (norm) return { transcript: norm, twiml: null };
-  }
-  if (looksRevenue) {
-    const norm = normalizeRevenueFromTranscript(extractedText);
-    if (norm) return { transcript: norm, twiml: null };
-  }
+      if (looksExpense) {
+        const norm = normalizeExpenseFromTranscript(extractedText);
+        if (norm) return { transcript: norm, twiml: null };
+      }
+      if (looksRevenue) {
+        const norm = normalizeRevenueFromTranscript(extractedText);
+        if (norm) return { transcript: norm, twiml: null };
+      }
 
-  // otherwise keep old behavior
-  const msg = `I couldn’t read that. Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
-  const pending = await getPendingTransactionState(from);
-  await mergePendingTransactionState(from, {
-    ...(pending || {}),
-    pendingMedia: { url: mediaUrl, type: null }
-  });
-  return twiml(msg);
-}
-
+      const msg = `I couldn’t read that. Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
+      const pending = await getPendingTransactionState(from);
+      await mergePendingTransactionState(from, {
+        ...(pending || {}),
+        pendingMedia: { url: mediaUrl, type: null }
+      });
+      return twiml(msg);
+    }
 
     /* ---------- Handle parse result ---------- */
 
@@ -527,7 +532,7 @@ try {
         expenseSourceMsgId: stableMediaMsgId
       });
 
-      reply = `Please confirm: Log expense ${amount} for ${item}${store ? ` from ${store}` : ''} on ${date}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
+      reply = `Please confirm: Log expense ${amount} for ${item}${store ? ` from ${store}` : ''} on ${date}${jobName ? ` for ${jobName}` : ''}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
       return twiml(reply);
     }
 
@@ -546,7 +551,11 @@ try {
         revenueSourceMsgId: stableMediaMsgId
       });
 
-      reply = `Please confirm: Payment ${amount}${source ? ` from ${source}` : ''} on ${date}${jobName ? ` for ${jobName}` : ''}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
+      const srcPart = (source && String(source).trim() && String(source).trim().toLowerCase() !== 'unknown')
+        ? ` from ${source}`
+        : '';
+
+      reply = `Please confirm: Payment ${amount}${srcPart} on ${date}${jobName ? ` for ${jobName}` : ''}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
       return twiml(reply);
     }
 

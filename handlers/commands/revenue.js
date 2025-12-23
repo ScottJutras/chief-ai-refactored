@@ -531,6 +531,28 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${aiReply}</Message></Response>`;
     }
 
+    // ✅ NEW: normalize "source" that actually contains a job/address
+    // Example: "Received $500 from job 1556 Medway Park Drive today."
+    // Many parsers put "job 1556..." into source. If jobName is missing, treat that as jobName.
+    if (data) {
+      const existingJob = String(data.jobName || '').trim();
+      const srcRaw = String(data.source || '').trim();
+
+      if (!existingJob && srcRaw) {
+        const srcClean = normalizeJobAnswer(srcRaw); // strips leading "job", "job:" etc.
+
+        const srcLooksJob =
+          /^\s*job\b/i.test(srcRaw) ||
+          looksLikeAddress(srcClean) ||
+          looksLikeAddress(srcRaw);
+
+        if (srcLooksJob) {
+          data.jobName = looksLikeOverhead(srcClean) ? 'Overhead' : srcClean;
+          data.source = 'Unknown';
+        }
+      }
+    }
+
     if (data && data.amount && data.amount !== '$0.00') {
       if (!data.date) data.date = todayInTimeZone(tz);
 
@@ -565,8 +587,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       if (!jobName) {
         await mergePendingTransactionState(from, {
           ...(pending || {}),
+
+          // keep the parsed data as-is so the user can just reply with a job name
           pendingRevenue: data,
           awaitingRevenueJob: true,
+
+          // IMPORTANT: keep source_msg_id stable so confirm->insert is idempotent
           revenueSourceMsgId: safeMsgId,
           type: 'revenue'
         });
@@ -574,8 +600,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      // If confirmed and no errors, you could auto-write here.
-      // For contractor UX + safety, we keep the confirm step.
+      // For contractor UX + safety, keep the confirm step.
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingRevenue: { ...data, jobName },

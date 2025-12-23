@@ -136,6 +136,19 @@ function normalizeTranscriptionResult(res) {
 }
 
 /**
+ * Attempt to extract Twilio MediaSid from the mediaUrl query params.
+ * This gives you a stable id for idempotency instead of `${from}:${Date.now()}`.
+ */
+function getTwilioMediaSid(mediaUrl) {
+  try {
+    const u = new URL(String(mediaUrl || ''));
+    return u.searchParams.get('MediaSid') || u.searchParams.get('mediaSid') || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Attach media meta to pending state so expense/revenue can persist it after confirmation.
  * Safe merge; never blocks.
  */
@@ -185,7 +198,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
   try {
     console.log('[MEDIA] incoming', { from, mediaType, hasUrl: !!mediaUrl, inputLen: (input || '').length });
 
-    // ✅ FIX: Text-only replies MUST be allowed through (especially finance confirm "yes/edit/cancel")
+    // ✅ Text-only replies MUST be allowed through (especially finance confirm "yes/edit/cancel")
     if (!mediaUrl) {
       const pass = await maybePassThroughFinanceTextOnly(from, input);
       if (pass) return pass;
@@ -211,6 +224,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       reply = `⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio/voice note.`;
       return twiml(reply);
     }
+
+    // Stable id for idempotency: use MediaSid when available
+    const mediaSid = getTwilioMediaSid(mediaUrl);
+    const stableMediaMsgId = mediaSid ? `${from}:${mediaSid}` : `${from}:${Date.now()}`;
 
     /* ---------- Build text from media ---------- */
     let extractedText = String(input || '').trim();
@@ -437,7 +454,9 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         pendingMedia: { type: 'expense' },
         pendingExpense: { item, amount, store, date, category, jobName },
         type: 'expense',
-        expenseSourceMsgId: `${from}:${Date.now()}`
+
+        // ✅ stable id for idempotency across confirm flow
+        expenseSourceMsgId: stableMediaMsgId
       });
 
       reply = `Please confirm: Log expense ${amount} for ${item}${store ? ` from ${store}` : ''} on ${date}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
@@ -454,7 +473,9 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         pendingMedia: { type: 'revenue' },
         pendingRevenue: { description, amount, source, date, category, jobName },
         type: 'revenue',
-        revenueSourceMsgId: `${from}:${Date.now()}`
+
+        // ✅ stable id for idempotency across confirm flow
+        revenueSourceMsgId: stableMediaMsgId
       });
 
       reply = `Please confirm: Payment ${amount}${source ? ` from ${source}` : ''} on ${date}${jobName ? ` for ${jobName}` : ''}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;

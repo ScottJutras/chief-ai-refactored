@@ -1,5 +1,22 @@
 // utils/transcriptionService.js
-require('dotenv').config();
+// Drop-in: quieter logs + fail-open to Whisper when Google STT isn't available,
+// and (optionally) returns { transcript, confidence, engine } when requested.
+//
+// Key changes vs your version:
+// - Missing @google-cloud/speech is now a WARN (logged once), not an ERROR spam.
+// - If Google STT client/module isn't available, we silently fall back to Whisper (when engine='both').
+// - Google confidence is captured when available (alternatives[0].confidence).
+// - More defensive normalization + less noisy logging in production.
+
+let dotenvLoaded = false;
+try {
+  // In serverless, dotenv is usually unnecessary; keep it but don't hard-fail.
+  require('dotenv').config();
+  dotenvLoaded = true;
+} catch {
+  // ignore
+}
+
 const fs = require('fs');
 const path = require('path');
 const OpenAI = require('openai');
@@ -7,6 +24,17 @@ const OpenAI = require('openai');
 let speechClient = null;
 let openai = null;
 let SpeechClientCtor = null; // Lazy-loaded constructor
+let GOOGLE_SPEECH_IMPORT_FAILED = false;
+let GOOGLE_SPEECH_INIT_FAILED = false;
+
+// log-once helpers (avoid Vercel spam)
+const __logged = new Set();
+function logOnce(level, key, ...args) {
+  if (__logged.has(key)) return;
+  __logged.add(key);
+  // eslint-disable-next-line no-console
+  console[level](...args);
+}
 
 /* --------- Credentials helpers --------- */
 function loadGoogleCreds() {
@@ -20,45 +48,65 @@ function loadGoogleCreds() {
     const json = Buffer.from(b64, 'base64').toString('utf-8');
     return JSON.parse(json);
   } catch (e) {
-    console.error('[ERROR] Failed to parse Google credentials BASE64:', e.message);
+    logOnce('warn', 'google_creds_parse_failed',
+      '[WARN] Failed to parse Google credentials BASE64 (voice will fallback to Whisper):',
+      e?.message
+    );
     return null;
   }
 }
 
 function getSpeechClient() {
   if (speechClient) return speechClient;
+  if (GOOGLE_SPEECH_IMPORT_FAILED || GOOGLE_SPEECH_INIT_FAILED) return null;
 
   if (!SpeechClientCtor) {
     try {
+      // Lazy import (important for serverless bundles)
       const speech = require('@google-cloud/speech');
-      SpeechClientCtor = (speech.v1 && speech.v1.SpeechClient) || speech.SpeechClient;
+      SpeechClientCtor = (speech.v1 && speech.v1.SpeechClient) || speech.SpeechClient || null;
+      if (!SpeechClientCtor) {
+        GOOGLE_SPEECH_IMPORT_FAILED = true;
+        logOnce(
+          'warn',
+          'google_speech_ctor_missing',
+          '[WARN] @google-cloud/speech loaded but SpeechClient constructor not found; falling back to Whisper.'
+        );
+        return null;
+      }
     } catch (e) {
-      console.error(
-        '[ERROR] @google-cloud/speech is not available; voice transcription disabled:',
-        e.message
+      GOOGLE_SPEECH_IMPORT_FAILED = true;
+      logOnce(
+        'warn',
+        'google_speech_module_missing',
+        '[WARN] @google-cloud/speech not available; falling back to Whisper. Details:',
+        e?.message
       );
-      SpeechClientCtor = null;
       return null;
     }
   }
 
   const creds = loadGoogleCreds();
   try {
-    speechClient = creds
-      ? new SpeechClientCtor({ credentials: creds })
-      : new SpeechClientCtor();
+    speechClient = creds ? new SpeechClientCtor({ credentials: creds }) : new SpeechClientCtor();
+    return speechClient;
   } catch (e) {
-    console.error('[ERROR] Could not init Google Speech client:', e.message);
+    GOOGLE_SPEECH_INIT_FAILED = true;
+    logOnce(
+      'warn',
+      'google_speech_init_failed',
+      '[WARN] Could not init Google Speech client; falling back to Whisper. Details:',
+      e?.message
+    );
     speechClient = null;
+    return null;
   }
-
-  return speechClient;
 }
 
 function getOpenAI() {
   if (openai) return openai;
   if (!process.env.OPENAI_API_KEY) {
-    console.warn('[WARN] OPENAI_API_KEY not set; Whisper fallback disabled.');
+    logOnce('warn', 'openai_key_missing', '[WARN] OPENAI_API_KEY not set; Whisper disabled.');
     return null;
   }
   openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -92,10 +140,9 @@ function encodingForMime(mimeType) {
   const m = normalizeContentType(mimeType);
 
   // Opus in container (WhatsApp voice notes)
-  if (m.includes('ogg'))  return { encoding: 'OGG_OPUS',  sampleRateHertz: 48000 };
+  if (m.includes('ogg')) return { encoding: 'OGG_OPUS', sampleRateHertz: 48000 };
   if (m.includes('webm')) return { encoding: 'WEBM_OPUS', sampleRateHertz: 48000 };
-  // Raw/unknown opus (rare)
-  if (m.includes('opus')) return { encoding: 'OGG_OPUS',  sampleRateHertz: 48000 };
+  if (m.includes('opus')) return { encoding: 'OGG_OPUS', sampleRateHertz: 48000 };
 
   // MP3 / WAV
   if (m.includes('mpeg') || m.includes('mp3')) return { encoding: 'MP3' };
@@ -103,13 +150,13 @@ function encodingForMime(mimeType) {
     return { encoding: 'LINEAR16', sampleRateHertz: 16000 };
   }
 
-  // AMR / 3GPP (Android voice)
+  // AMR / 3GPP
   if (m.includes('amr-wb')) return { encoding: 'AMR_WB', sampleRateHertz: 16000 };
   if (m.includes('3gpp') || m.includes('amr-nb') || m.includes('amr')) {
     return { encoding: 'AMR', sampleRateHertz: 8000 };
   }
 
-  // AAC in MP4/M4A containers – Google often struggles with raw AAC here.
+  // AAC in MP4/M4A containers – Google often struggles here.
   if (m.includes('mp4') || m.includes('m4a') || m.includes('aac')) {
     return { encoding: 'ENCODING_UNSPECIFIED' };
   }
@@ -117,17 +164,29 @@ function encodingForMime(mimeType) {
   return { encoding: 'ENCODING_UNSPECIFIED' };
 }
 
+/* --------- text normalization --------- */
+function normalizeTranscript(t) {
+  if (!t) return '';
+  return String(t)
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function alnumLen(s) {
+  const t = normalizeTranscript(s).replace(/[^\w]/g, '');
+  return t.length;
+}
+
 /* --------- Google STT --------- */
 async function transcribeWithGoogle(audioBuffer, mimeType) {
   try {
     const client = getSpeechClient();
-    if (!client) {
-      console.error('[ERROR] Google STT client unavailable');
-      return null;
-    }
+    if (!client) return null;
 
     const { encoding, sampleRateHertz } = encodingForMime(mimeType);
     const audio = { content: audioBuffer.toString('base64') };
+
     const config = {
       encoding,
       ...(sampleRateHertz ? { sampleRateHertz } : {}),
@@ -143,32 +202,46 @@ async function transcribeWithGoogle(audioBuffer, mimeType) {
           'drive start', 'drive end', 'hours', 'timesheet', 'time sheet', 'timeclock',
           'clock Justin in', 'clock in Justin', 'punch Justin in',
           'clock-in', 'clock-out', 'clock in now', 'clock out now', 'punch in now', 'punch out now',
-          'start break', 'end break', 'Justin', 'Scott', 'Jutras'
+          'start break', 'end break', 'Justin', 'Scott', 'Jutras',
+          // contractor finance words help too:
+          'received', 'payment', 'deposit', 'revenue', 'expense', 'invoice', 'job'
         ],
         boost: 20
       }],
     };
 
-    // DEFENSIVE: ensure Opus sample rate is set
     if ((config.encoding === 'OGG_OPUS' || config.encoding === 'WEBM_OPUS') && !config.sampleRateHertz) {
       config.sampleRateHertz = 48000;
     }
 
-    console.log('[DEBUG] Google STT config:', JSON.stringify({
-      encoding: config.encoding,
-      sampleRateHertz: config.sampleRateHertz
-    }));
+    if (process.env.LOG_STT_DEBUG === '1') {
+      console.log('[DEBUG] Google STT config:', JSON.stringify({
+        encoding: config.encoding,
+        sampleRateHertz: config.sampleRateHertz
+      }));
+    }
 
     const [response] = await client.recognize({ audio, config });
-    const transcription = (response.results || [])
-      .map(r => r.alternatives?.[0]?.transcript || '')
-      .filter(Boolean)
-      .join(' ');
 
-    console.log('[DEBUG] Google STT transcription length:', transcription.length, 'text:', transcription || '(none)');
-    return transcription || null;
+    const parts = (response.results || [])
+      .map(r => ({
+        text: r.alternatives?.[0]?.transcript || '',
+        confidence: typeof r.alternatives?.[0]?.confidence === 'number' ? r.alternatives[0].confidence : null
+      }))
+      .filter(x => x.text);
+
+    const transcription = normalizeTranscript(parts.map(p => p.text).join(' '));
+    const confidence = parts.length ? (parts[0].confidence ?? null) : null;
+
+    if (process.env.LOG_STT_DEBUG === '1') {
+      console.log('[DEBUG] Google STT transcription length:', transcription.length, 'text:', transcription || '(none)');
+    }
+
+    if (!transcription) return null;
+    return { transcript: transcription, confidence };
   } catch (err) {
-    console.error('[ERROR] Google STT failed:', err.message || err);
+    // Don’t scream ERROR here; google may be optional and we have Whisper.
+    logOnce('warn', 'google_stt_failed_once', '[WARN] Google STT failed; will fallback when possible. Details:', err?.message || err);
     return null;
   }
 }
@@ -176,10 +249,7 @@ async function transcribeWithGoogle(audioBuffer, mimeType) {
 /* --------- Whisper STT --------- */
 async function transcribeWithWhisper(audioBuffer, mimeType) {
   const ai = getOpenAI();
-  if (!ai) {
-    console.error('[ERROR] OpenAI client unavailable; Whisper disabled');
-    return null;
-  }
+  if (!ai) return null;
 
   let tmpName;
   let fileStream;
@@ -196,16 +266,19 @@ async function transcribeWithWhisper(audioBuffer, mimeType) {
       file: fileStream,
       model,
       language: 'en',
-      // lightweight biasing
       prompt:
-        'time clock, timesheet, punch in, punch out, break start, break end, lunch start, lunch end, drive start, drive end, hours, Justin, Scott, Jutras'
+        'time clock, timesheet, punch in, punch out, break start, break end, lunch start, lunch end, drive start, drive end, hours, received, payment, deposit, revenue, expense, invoice, job, Justin, Scott, Jutras'
     });
 
-    const text = (resp && (resp.text || resp?.data?.text)) || '';
-    console.log('[DEBUG] Whisper transcription length:', text.length, 'text:', text || '(none)');
+    const text = normalizeTranscript((resp && (resp.text || resp?.data?.text)) || '');
+
+    if (process.env.LOG_STT_DEBUG === '1') {
+      console.log('[DEBUG] Whisper transcription length:', text.length, 'text:', text || '(none)');
+    }
+
     return text || null;
   } catch (err) {
-    console.error('[ERROR] Whisper fallback failed:', err.message || err);
+    logOnce('warn', 'whisper_failed_once', '[WARN] Whisper transcription failed. Details:', err?.message || err);
     return null;
   } finally {
     try { if (fileStream) fileStream.close(); } catch {}
@@ -222,18 +295,17 @@ async function transcribeWithWhisper(audioBuffer, mimeType) {
  * @param {'google'|'whisper'|'both'} engine
  * @returns {Promise<string|{transcript:string,confidence:number|null,engine:string}|null>}
  *
- * NOTE: For backward compatibility with callers:
- * - By default we return a STRING transcript (like your older code).
- * - If RETURN_TRANSCRIPTION_OBJECT=1, we return an object with transcript/confidence/engine.
+ * NOTE: Backward compatibility:
+ * - Default returns a STRING transcript.
+ * - If RETURN_TRANSCRIPTION_OBJECT=1, returns object with transcript/confidence/engine.
  */
 async function transcribeAudio(audioBuffer, mimeType, engine = 'google') {
   const m = normalizeContentType(mimeType);
 
-  // Prefer Whisper for these containers/codecs
-  const mimeSuggestsWhisper = (
+  // Prefer Whisper for these containers/codecs (Google often struggles)
+  const mimeSuggestsWhisper =
     m.includes('mp4') || m.includes('m4a') || m.includes('aac') ||
-    m.includes('3gpp') || m.includes('amr')
-  );
+    m.includes('3gpp') || m.includes('amr');
 
   // Also prefer Whisper when Google’s encoding would be unspecified
   const { encoding } = encodingForMime(mimeType);
@@ -242,53 +314,79 @@ async function transcribeAudio(audioBuffer, mimeType, engine = 'google') {
   const preferWhisper = mimeSuggestsWhisper || encodingSuggestsWhisper;
 
   let transcript = null;
+  let confidence = null;
   let usedEngine = null;
 
-  if (engine === 'whisper' || preferWhisper) {
+  const wantObj = String(process.env.RETURN_TRANSCRIPTION_OBJECT || '').trim() === '1';
+
+  // Helper to format return consistently
+  function finish(t, c, eng) {
+    const text = normalizeTranscript(t);
+    if (!text) return null;
+    if (wantObj) return { transcript: text, confidence: (Number.isFinite(Number(c)) ? Number(c) : null), engine: eng || 'unknown' };
+    return text;
+  }
+
+  // If caller forces whisper
+  if (engine === 'whisper') {
     usedEngine = 'whisper';
     transcript = await transcribeWithWhisper(audioBuffer, mimeType);
+    return finish(transcript, null, usedEngine);
+  }
 
-    // If it fails and engine was 'both', try Google
-    if (!transcript && engine === 'both') {
-      usedEngine = 'google';
-      transcript = await transcribeWithGoogle(audioBuffer, mimeType);
-    }
-  } else if (engine === 'google' || engine === 'both') {
+  // If caller forces google
+  if (engine === 'google') {
     usedEngine = 'google';
-    transcript = await transcribeWithGoogle(audioBuffer, mimeType);
+    const g = await transcribeWithGoogle(audioBuffer, mimeType);
+    if (g && g.transcript) return finish(g.transcript, g.confidence, usedEngine);
+    return null;
+  }
 
-    // If short/ambiguous, try Whisper (when engine === 'both')
-    const normalized = transcript
-      ? transcript.toLowerCase().replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim()
-      : '';
-    const isShort = !transcript || normalized.replace(/[^\w]/g, '').length < 7;
-    const isNowOnly = normalized ? /^\s*now[\s.!?\-–—]*$/i.test(normalized) : false;
+  // engine === 'both'
+  if (preferWhisper) {
+    // Try Whisper first (better for tricky formats)
+    const w = await transcribeWithWhisper(audioBuffer, mimeType);
+    if (w) return finish(w, null, 'whisper');
 
-    if ((engine === 'both') && (isShort || isNowOnly)) {
-      console.log('[DEBUG] Retrying with Whisper due to short/ambiguous Google result');
-      const whisper = await transcribeWithWhisper(audioBuffer, mimeType);
-      const wn = whisper ? whisper.toLowerCase().replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim() : '';
-      if (whisper && wn.replace(/[^\w]/g, '').length > normalized.replace(/[^\w]/g, '').length) {
-        transcript = whisper;
-        usedEngine = 'whisper';
+    // Whisper failed, try Google (if available)
+    const g = await transcribeWithGoogle(audioBuffer, mimeType);
+    if (g && g.transcript) return finish(g.transcript, g.confidence, 'google');
+    return null;
+  }
+
+  // Default: try Google first, then Whisper if Google is unavailable or short/ambiguous
+  const g = await transcribeWithGoogle(audioBuffer, mimeType);
+  if (g && g.transcript) {
+    const gText = normalizeTranscript(g.transcript);
+    const isShort = alnumLen(gText) < 7;
+    const isNowOnly = /^\s*now[\s.!?\-–—]*$/i.test(gText || '');
+
+    if (process.env.LOG_STT_DEBUG === '1') {
+      console.log('[DEBUG] Google result check', { len: gText.length, alnumLen: alnumLen(gText), isShort, isNowOnly });
+    }
+
+    if (!isShort && !isNowOnly) {
+      return finish(gText, g.confidence, 'google');
+    }
+
+    // short/ambiguous => try Whisper and pick better
+    const w = await transcribeWithWhisper(audioBuffer, mimeType);
+    const wText = normalizeTranscript(w);
+
+    if (wText && alnumLen(wText) > alnumLen(gText)) {
+      if (process.env.LOG_STT_DEBUG === '1') {
+        console.log('[DEBUG] Retrying with Whisper due to short/ambiguous Google result');
       }
+      return finish(wText, null, 'whisper');
     }
-  } else {
-    throw new Error('Unsupported STT engine');
+
+    return finish(gText, g.confidence, 'google');
   }
 
-  if (transcript && transcript.trim()) {
-    transcript = transcript.replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim();
-    console.log('[DEBUG] Final transcription OK:', transcript);
+  // Google unavailable/failed => try Whisper
+  const w = await transcribeWithWhisper(audioBuffer, mimeType);
+  if (w) return finish(w, null, 'whisper');
 
-    const wantObj = String(process.env.RETURN_TRANSCRIPTION_OBJECT || '').trim() === '1';
-    if (wantObj) {
-      return { transcript, confidence: null, engine: usedEngine || 'unknown' };
-    }
-    return transcript;
-  }
-
-  console.log('[DEBUG] No transcription produced');
   return null;
 }
 
@@ -305,4 +403,5 @@ module.exports = {
   // exported for tests/debugging
   _encodingForMime: encodingForMime,
   _normalizeContentType: normalizeContentType,
+  _normalizeTranscript: normalizeTranscript,
 };

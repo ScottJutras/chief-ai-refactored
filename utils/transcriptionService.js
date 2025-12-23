@@ -1,3 +1,4 @@
+// utils/transcriptionService.js
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
@@ -81,9 +82,14 @@ function pickTempExtension(mime) {
   return '.bin';
 }
 
+// Normalize media content-type (strip params like "; codecs=opus")
+function normalizeContentType(mime) {
+  return String(mime || '').split(';')[0].trim().toLowerCase();
+}
+
 // --- MIME → encoding map (force 48k for Opus) ---
-function encodingForMime(mime) {
-  const m = String(mime || '').toLowerCase();
+function encodingForMime(mimeType) {
+  const m = normalizeContentType(mimeType);
 
   // Opus in container (WhatsApp voice notes)
   if (m.includes('ogg'))  return { encoding: 'OGG_OPUS',  sampleRateHertz: 48000 };
@@ -115,7 +121,10 @@ function encodingForMime(mime) {
 async function transcribeWithGoogle(audioBuffer, mimeType) {
   try {
     const client = getSpeechClient();
-    if (!client) { console.error('[ERROR] Google STT client unavailable'); return null; }
+    if (!client) {
+      console.error('[ERROR] Google STT client unavailable');
+      return null;
+    }
 
     const { encoding, sampleRateHertz } = encodingForMime(mimeType);
     const audio = { content: audioBuffer.toString('base64') };
@@ -123,18 +132,18 @@ async function transcribeWithGoogle(audioBuffer, mimeType) {
       encoding,
       ...(sampleRateHertz ? { sampleRateHertz } : {}),
       languageCode: 'en-US',
-      alternativeLanguageCodes: ['en-CA','en-GB'],
+      alternativeLanguageCodes: ['en-CA', 'en-GB'],
       enableAutomaticPunctuation: true,
       ...(process.env.GOOGLE_SPEECH_USE_ENHANCED === '1' ? { useEnhanced: true } : {}),
       ...(process.env.GOOGLE_SPEECH_MODEL ? { model: process.env.GOOGLE_SPEECH_MODEL } : {}),
       speechContexts: [{
         phrases: [
-          'punch in','punch out','clock in','clock out',
-          'break start','break end','lunch start','lunch end',
-          'drive start','drive end','hours','timesheet','time sheet','timeclock',
-          'clock Justin in','clock in Justin','punch Justin in',
-          'clock-in','clock-out','clock in now','clock out now','punch in now','punch out now',
-          'start break','end break','Justin','Scott','Jutras'
+          'punch in', 'punch out', 'clock in', 'clock out',
+          'break start', 'break end', 'lunch start', 'lunch end',
+          'drive start', 'drive end', 'hours', 'timesheet', 'time sheet', 'timeclock',
+          'clock Justin in', 'clock in Justin', 'punch Justin in',
+          'clock-in', 'clock-out', 'clock in now', 'clock out now', 'punch in now', 'punch out now',
+          'start break', 'end break', 'Justin', 'Scott', 'Jutras'
         ],
         boost: 20
       }],
@@ -145,12 +154,17 @@ async function transcribeWithGoogle(audioBuffer, mimeType) {
       config.sampleRateHertz = 48000;
     }
 
-    console.log('[DEBUG] Google STT config:', JSON.stringify({ encoding: config.encoding, sampleRateHertz: config.sampleRateHertz }));
+    console.log('[DEBUG] Google STT config:', JSON.stringify({
+      encoding: config.encoding,
+      sampleRateHertz: config.sampleRateHertz
+    }));
+
     const [response] = await client.recognize({ audio, config });
     const transcription = (response.results || [])
       .map(r => r.alternatives?.[0]?.transcript || '')
       .filter(Boolean)
       .join(' ');
+
     console.log('[DEBUG] Google STT transcription length:', transcription.length, 'text:', transcription || '(none)');
     return transcription || null;
   } catch (err) {
@@ -166,8 +180,10 @@ async function transcribeWithWhisper(audioBuffer, mimeType) {
     console.error('[ERROR] OpenAI client unavailable; Whisper disabled');
     return null;
   }
+
   let tmpName;
   let fileStream;
+
   try {
     const ext = pickTempExtension(mimeType);
     tmpName = path.join(process.env.TMPDIR || '/tmp', `audio_${Date.now()}${ext}`);
@@ -175,13 +191,16 @@ async function transcribeWithWhisper(audioBuffer, mimeType) {
     fileStream = fs.createReadStream(tmpName);
 
     const model = process.env.OPENAI_TRANSCRIBE_MODEL || 'whisper-1';
+
     const resp = await ai.audio.transcriptions.create({
       file: fileStream,
       model,
       language: 'en',
       // lightweight biasing
-      prompt: 'time clock, timesheet, punch in, punch out, break start, break end, lunch start, lunch end, drive start, drive end, hours, Justin, Scott, Jutras'
+      prompt:
+        'time clock, timesheet, punch in, punch out, break start, break end, lunch start, lunch end, drive start, drive end, hours, Justin, Scott, Jutras'
     });
+
     const text = (resp && (resp.text || resp?.data?.text)) || '';
     console.log('[DEBUG] Whisper transcription length:', text.length, 'text:', text || '(none)');
     return text || null;
@@ -195,8 +214,20 @@ async function transcribeWithWhisper(audioBuffer, mimeType) {
 }
 
 /* --------- Unified API --------- */
+/**
+ * Transcribe audio.
+ *
+ * @param {Buffer} audioBuffer
+ * @param {string} mimeType
+ * @param {'google'|'whisper'|'both'} engine
+ * @returns {Promise<string|{transcript:string,confidence:number|null,engine:string}|null>}
+ *
+ * NOTE: For backward compatibility with callers:
+ * - By default we return a STRING transcript (like your older code).
+ * - If RETURN_TRANSCRIPTION_OBJECT=1, we return an object with transcript/confidence/engine.
+ */
 async function transcribeAudio(audioBuffer, mimeType, engine = 'google') {
-  const m = String(mimeType || '').toLowerCase();
+  const m = normalizeContentType(mimeType);
 
   // Prefer Whisper for these containers/codecs
   const mimeSuggestsWhisper = (
@@ -211,18 +242,25 @@ async function transcribeAudio(audioBuffer, mimeType, engine = 'google') {
   const preferWhisper = mimeSuggestsWhisper || encodingSuggestsWhisper;
 
   let transcript = null;
+  let usedEngine = null;
 
   if (engine === 'whisper' || preferWhisper) {
-    // Try Whisper first; if it fails and engine was 'both', try Google
+    usedEngine = 'whisper';
     transcript = await transcribeWithWhisper(audioBuffer, mimeType);
+
+    // If it fails and engine was 'both', try Google
     if (!transcript && engine === 'both') {
+      usedEngine = 'google';
       transcript = await transcribeWithGoogle(audioBuffer, mimeType);
     }
   } else if (engine === 'google' || engine === 'both') {
+    usedEngine = 'google';
     transcript = await transcribeWithGoogle(audioBuffer, mimeType);
 
     // If short/ambiguous, try Whisper (when engine === 'both')
-    const normalized = transcript ? transcript.toLowerCase().replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim() : '';
+    const normalized = transcript
+      ? transcript.toLowerCase().replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim()
+      : '';
     const isShort = !transcript || normalized.replace(/[^\w]/g, '').length < 7;
     const isNowOnly = normalized ? /^\s*now[\s.!?\-–—]*$/i.test(normalized) : false;
 
@@ -232,6 +270,7 @@ async function transcribeAudio(audioBuffer, mimeType, engine = 'google') {
       const wn = whisper ? whisper.toLowerCase().replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim() : '';
       if (whisper && wn.replace(/[^\w]/g, '').length > normalized.replace(/[^\w]/g, '').length) {
         transcript = whisper;
+        usedEngine = 'whisper';
       }
     }
   } else {
@@ -241,6 +280,29 @@ async function transcribeAudio(audioBuffer, mimeType, engine = 'google') {
   if (transcript && transcript.trim()) {
     transcript = transcript.replace(/\s+/g, ' ').replace(/\u00A0/g, ' ').trim();
     console.log('[DEBUG] Final transcription OK:', transcript);
+
+    const wantObj = String(process.env.RETURN_TRANSCRIPTION_OBJECT || '').trim() === '1';
+    if (wantObj) {
+      return { transcript, confidence: null, engine: usedEngine || 'unknown' };
+    }
     return transcript;
   }
-  console.log('[DEBUG] No transcription produced');}
+
+  console.log('[DEBUG] No transcription produced');
+  return null;
+}
+
+/**
+ * Back-compat alias. Some files might import { transcribe } instead of { transcribeAudio }.
+ */
+async function transcribe(audioBuffer, mimeType, engine = 'google') {
+  return transcribeAudio(audioBuffer, mimeType, engine);
+}
+
+module.exports = {
+  transcribeAudio,
+  transcribe, // alias
+  // exported for tests/debugging
+  _encodingForMime: encodingForMime,
+  _normalizeContentType: normalizeContentType,
+};

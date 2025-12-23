@@ -2,15 +2,32 @@
 const axios = require('axios');
 const { parseMediaText } = require('../services/mediaParser');
 const { extractTextFromImage } = require('../utils/visionService');
-const { transcribeAudio } = require('../utils/transcriptionService');
+
+// ✅ Backwards-compatible transcription import (fixes: "transcribeAudio is not a function")
+const tsMod = require('../utils/transcriptionService');
+const transcribeAudio =
+  (tsMod && typeof tsMod.transcribeAudio === 'function' && tsMod.transcribeAudio) ||
+  (tsMod && typeof tsMod.transcribe === 'function' && tsMod.transcribe) ||
+  (typeof tsMod === 'function' && tsMod) ||
+  null;
+
+if (!transcribeAudio) {
+  console.warn('[MEDIA] transcriptionService export missing: expected transcribeAudio()', {
+    type: typeof tsMod,
+    keys: Object.keys(tsMod || {})
+  });
+}
+
 const {
   getActiveJob,
   generateTimesheet,
 } = require('../services/postgres');
+
 const { handleTimeclock } = require('./commands/timeclock');
+
 const {
   getPendingTransactionState,
-  setPendingTransactionState,
+  mergePendingTransactionState,
   deletePendingTransactionState
 } = require('../utils/stateManager');
 
@@ -136,12 +153,12 @@ async function attachPendingMediaMeta(from, pending, meta) {
     const confidence = Number.isFinite(Number(meta?.confidence)) ? Number(meta.confidence) : null;
 
     // Nothing useful to store
-    if (!url && !type && !transcript) return;
+    if (!url && !type && !transcript && confidence == null) return;
 
     await mergePendingTransactionState(from, {
       ...(pending || {}),
       pendingMediaMeta: { url, type, transcript, confidence },
-      // Keep/clear pendingMedia depending on the flow; caller decides.
+      // pendingMedia stays as-is; caller decides its lifecycle
     });
   } catch (e) {
     console.warn('[MEDIA] attachPendingMediaMeta failed (ignored):', e?.message);
@@ -306,6 +323,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
     // AUDIO
     if (isAudioFamily) {
+      if (!transcribeAudio) {
+        return twiml(`⚠️ Audio transcription isn’t configured yet (server). Please text the details for now.`);
+      }
+
       const urlLen = (mediaUrl || '').length;
       console.log('[MEDIA] starting transcription', { mediaType, normType, urlLen });
 
@@ -454,13 +475,15 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     if (result.type === 'time_entry') {
-      let { employeeName, type, timestamp, job } = result.data;
+      let { employeeName, type, timestamp } = result.data;
 
       const inferred = inferIntentFromText(extractedText);
       if (inferred === 'punch_in'    && type === 'punch_out')  type = 'punch_in';
       if (inferred === 'punch_out'   && type === 'punch_in')   type = 'punch_out';
       if (inferred === 'break_start' && type === 'break_end')  type = 'break_start';
       if (inferred === 'break_end'   && type === 'break_start')type = 'break_end';
+      if (inferred === 'drive_start' && type === 'drive_end')  type = 'drive_start';
+      if (inferred === 'drive_end'   && type === 'drive_start')type = 'drive_end';
 
       let hasName = !!(employeeName && String(employeeName).trim());
       if (!hasName) {
@@ -476,7 +499,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       let normalized;
       if (hasName) {
-        const who = employeeName || userProfile.name || 'Unknown';
+        const who = employeeName || userProfile?.name || 'Unknown';
         if (type === 'punch_in')          normalized = `${who} punched in${timeSuffix}`;
         else if (type === 'punch_out')    normalized = `${who} punched out${timeSuffix}`;
         else if (type === 'break_start')  normalized = `start break for ${who}${timeSuffix}`;
@@ -518,21 +541,13 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     if (result.type === 'expense') {
       const { item, amount, store, date, category, jobName } = result.data;
 
-      // Attach meta already stored earlier; also ensure pendingMedia is present so webhook can do text-only follow-up handling.
+      // Ensure pendingMedia exists so webhook can route text-only follow-ups.
       const pending = await getPendingTransactionState(from);
 
-      // Store state in a way expense.js can use later (confirm flow)
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingMedia: { type: 'expense' },
-        pendingExpense: {
-          item,
-          amount,
-          store,
-          date,
-          category,
-          jobName
-        },
+        pendingExpense: { item, amount, store, date, category, jobName },
         type: 'expense',
         expenseSourceMsgId: `${from}:${Date.now()}`
       });
@@ -547,18 +562,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       const pending = await getPendingTransactionState(from);
 
-      // Store state in the shape revenue.js expects
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingMedia: { type: 'revenue' },
-        pendingRevenue: {
-          description,
-          amount,
-          source,
-          date,
-          category,
-          jobName
-        },
+        pendingRevenue: { description, amount, source, date, category, jobName },
         type: 'revenue',
         revenueSourceMsgId: `${from}:${Date.now()}`
       });
@@ -569,13 +576,11 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
     // Fallback
     reply = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
-    {
-      const pending = await getPendingTransactionState(from);
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingMedia: { url: mediaUrl, type: null }
-      });
-    }
+    const pending = await getPendingTransactionState(from);
+    await mergePendingTransactionState(from, {
+      ...(pending || {}),
+      pendingMedia: { url: mediaUrl, type: null }
+    });
     return twiml(reply);
 
   } catch (error) {

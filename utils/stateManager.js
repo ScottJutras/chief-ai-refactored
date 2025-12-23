@@ -28,9 +28,23 @@ function mergeState(prev, patch) {
   const a = safeObject(prev) || {};
   const b = safeObject(patch) || {};
 
+  // Special handling for legacy boolean pendingMedia:
+  // If previous has pendingMedia=true and patch provides an object, keep the object.
+  // If patch provides pendingMedia=true and previous is an object, keep the object.
+  const aPendingMedia = a.pendingMedia;
+  const bPendingMedia = b.pendingMedia;
+
   const out = { ...a, ...b };
 
+  // If either side is boolean true, but the other side is an object, keep the object.
+  if (aPendingMedia === true && bPendingMedia && typeof bPendingMedia === 'object' && !Array.isArray(bPendingMedia)) {
+    out.pendingMedia = { ...bPendingMedia };
+  } else if (bPendingMedia === true && aPendingMedia && typeof aPendingMedia === 'object' && !Array.isArray(aPendingMedia)) {
+    out.pendingMedia = { ...aPendingMedia };
+  }
+
   // Common nested objects where we want object-merge (not replace)
+  // NOTE: include pendingAction-style buckets if you add them later.
   const nestedKeys = [
     'pendingRevenue',
     'pendingExpense',
@@ -41,12 +55,14 @@ function mergeState(prev, patch) {
   ];
 
   for (const k of nestedKeys) {
+    const av = a[k];
+    const bv = b[k];
     if (
-      a[k] && b[k] &&
-      typeof a[k] === 'object' && typeof b[k] === 'object' &&
-      !Array.isArray(a[k]) && !Array.isArray(b[k])
+      av && bv &&
+      typeof av === 'object' && typeof bv === 'object' &&
+      !Array.isArray(av) && !Array.isArray(bv)
     ) {
-      out[k] = { ...a[k], ...b[k] };
+      out[k] = { ...av, ...bv };
     }
   }
 
@@ -141,6 +157,32 @@ async function clearPendingMediaMeta(userId) {
 }
 
 /**
+ * clearFinanceFlow(userId)
+ * Clears the finance-related pending flow keys but keeps other state (e.g., hours inquiries).
+ * Use after a successful expense/revenue commit or an explicit cancel.
+ */
+async function clearFinanceFlow(userId) {
+  return clearStateKeys(userId, [
+    'pendingRevenue',
+    'pendingExpense',
+    'awaitingRevenueJob',
+    'awaitingExpenseJob',
+    'awaitingRevenueClarification',
+    'awaitingExpenseClarification',
+    'revenueClarificationPrompt',
+    'expenseClarificationPrompt',
+    'revenueDraftText',
+    'expenseDraftText',
+    'revenueSourceMsgId',
+    'expenseSourceMsgId',
+    'pendingMedia',
+    'pendingMediaMeta',
+    'type',
+    'kind',
+  ]);
+}
+
+/**
  * Optional: clear a subset of keys (handy for "cleanup after success").
  * Example: clearStateKeys(from, ['pendingMedia','pendingExpense','pendingMediaMeta'])
  */
@@ -168,4 +210,5 @@ module.exports = {
 
   clearPendingMediaMeta,
   clearStateKeys,
+  clearFinanceFlow,
 };

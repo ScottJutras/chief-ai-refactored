@@ -13,6 +13,11 @@ const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
+// ✅ NEW: prefer clearFinanceFlow (does not wipe unrelated state); fallback to delete
+const clearFinanceFlow =
+  (typeof state.clearFinanceFlow === 'function' && state.clearFinanceFlow) ||
+  (async (userId) => deletePendingTransactionState(userId));
+
 const ai = require('../../utils/aiErrorHandler');
 
 // Serverless-safe / backwards-compatible imports
@@ -186,7 +191,10 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   }
 }
 
-// Clear ONLY media meta after successful write so it doesn't attach to next txn
+/**
+ * Legacy helper retained (used in a couple spots),
+ * but success paths now prefer clearFinanceFlow().
+ */
 async function clearPendingMediaMeta(from, pending) {
   try {
     if (!pending) return;
@@ -304,7 +312,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     // --- CONFIRM / DELETE FLOW ---
     if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
       if (!isOwner) {
-        await deletePendingTransactionState(from);
+        await clearFinanceFlow(from);
         reply = '⚠️ Only the owner can manage expenses.';
         return `<Response><Message>${reply}</Message></Response>`;
       }
@@ -321,7 +329,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           const data = pending.pendingExpense || {};
           const mediaMeta = pending?.pendingMediaMeta || null;
 
-          // Category: prefer suggested, else compute (timeout-safe-ish via Promise.race if you want later)
           const category =
             data.suggestedCategory ||
             (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null));
@@ -385,9 +392,11 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           reply =
             result?.inserted === false
               ? '✅ Already logged that expense (duplicate message).'
-              : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+              : `✅ Expense logged: ${data.amount} for ${data.item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-          await deletePendingTransactionState(from);
+          // ✅ NEW: clear finance flow keys (includes pendingMediaMeta)
+          await clearFinanceFlow(from);
+
           return `<Response><Message>${reply}</Message></Response>`;
         }
 
@@ -397,7 +406,9 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           reply = success
             ? `✅ Deleted expense ${criteria.amount} for ${criteria.item} from ${criteria.store}.`
             : `⚠️ Expense not found or deletion failed.`;
-          await deletePendingTransactionState(from);
+
+          await clearFinanceFlow(from);
+
           return `<Response><Message>${reply}</Message></Response>`;
         }
 
@@ -414,7 +425,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         }
 
         if (lc === 'cancel' || lc === 'no') {
-          await deletePendingTransactionState(from);
+          await clearFinanceFlow(from);
           reply = '❌ Operation cancelled.';
           return `<Response><Message>${reply}</Message></Response>`;
         }
@@ -502,10 +513,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       reply =
         result?.inserted === false
           ? '✅ Already logged that expense (duplicate message).'
-          : `✅ Expense logged: ${data.amount} for ${item} from ${data.store} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+          : `✅ Expense logged: ${data.amount} for ${item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-      // Prevent media meta from attaching to the next transaction
-      await clearPendingMediaMeta(from, pending);
+      // ✅ NEW: clear finance flow keys (prevents media meta leaking to next txn)
+      await clearFinanceFlow(from);
 
       return `<Response><Message>${reply}</Message></Response>`;
     }
@@ -589,10 +600,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         reply =
           result?.inserted === false
             ? '✅ Already logged that expense (duplicate message).'
-            : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+            : `✅ Expense logged: ${data.amount} for ${data.item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-        // Prevent media meta from attaching to the next transaction
-        await clearPendingMediaMeta(from, pending);
+        // ✅ NEW: clear finance flow keys
+        await clearFinanceFlow(from);
 
         return `<Response><Message>${reply}</Message></Response>`;
       }

@@ -6,14 +6,19 @@ const express = require('express');
 const querystring = require('querystring');
 const router = express.Router();
 const app = express();
-const { findClosestTerm } = require('../services/ragTerms');
+
 const { flags } = require('../config/flags');
 const { handleClock } = require('../handlers/commands/timeclock');
 const { handleForecast } = require('../handlers/commands/forecast');
-const { applyCIL } = require('../services/cilRouter');
-const { getOwnerUuidForPhone } = require('../services/owners'); // implement: map phone -> uuid
-const { getPendingTransactionState } = require('../utils/stateManager');
-const { handleMedia } = require('../handlers/media');
+
+const { getOwnerUuidForPhone } = require('../services/owners'); // map phone -> uuid
+const stateManager = require('../utils/stateManager');
+const { getPendingTransactionState } = stateManager;
+
+// Prefer mergePendingTransactionState; fall back to setPendingTransactionState (older builds)
+const mergePendingTransactionState =
+  stateManager.mergePendingTransactionState ||
+  (async (userId, patch) => stateManager.setPendingTransactionState(userId, patch, { merge: true }));
 
 // ---------- Small helpers ----------
 function xmlEsc(s = '') {
@@ -165,7 +170,6 @@ router.use((req, res, next) => {
   next();
 });
 
-
 // ---------- Quick version check ----------
 router.post('*', (req, res, next) => {
   const bodyText = String(req.body?.Body || '').trim().toLowerCase();
@@ -176,6 +180,7 @@ router.post('*', (req, res, next) => {
   next();
 });
 
+// ---------- Lightweight middlewares (tolerant) ----------
 router.use((req, res, next) => {
   try {
     const token = require('../middleware/token');
@@ -214,6 +219,8 @@ router.post('*', async (req, res, next) => {
 
   try {
     const { handleMedia } = require('../handlers/media');
+
+    // IMPORTANT: Body is usually empty on media; still pass it along.
     const bodyText = String(req.body?.Body || '').trim();
 
     const result = await handleMedia(
@@ -225,33 +232,35 @@ router.post('*', async (req, res, next) => {
       type
     );
 
+    // If handler returns TwiML directly, send it.
     if (typeof result === 'string' && result && !res.headersSent) {
       return res.status(200).type('application/xml; charset=utf-8').send(result);
     }
 
-        if (result && typeof result === 'object' && result.transcript) {
-      // 1) turn audio into normal text input
+    // If handler returns transcript, convert to text message and continue routing.
+    if (result && typeof result === 'object' && result.transcript) {
       req.body.Body = result.transcript;
 
-      // 2) persist traceability for later save (Option 2)
+      // Persist media meta for later save (revenue/expense confirmation)
       try {
-        const sm = require('../utils/stateManager');
-        const pending = await sm.getPendingTransactionState(req.from);
+        const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
+        const pending = await getPendingTransactionState(req.from);
 
         const mediaMeta = {
           url,
           type,
-          // prefer Twilio's message sid for the media message (not the follow-up "yes")
-          messageSid: String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null,
+          messageSid: rawSid || null, // media message SID
           confidence: result.confidence ?? null,
           transcript: result.transcript
         };
 
-        await sm.setPendingTransactionState(req.from, {
+        await mergePendingTransactionState(req.from, {
           ...(pending || {}),
           pendingMediaMeta: mediaMeta,
-          // optional: mark that media was just ingested (handy for debugging)
-          pendingMedia: true
+          // Keep a consistent shape (object), but never break older code that expects boolean.
+          pendingMedia: typeof pending?.pendingMedia === 'object'
+            ? { ...(pending.pendingMedia || {}), hasMedia: true }
+            : pending?.pendingMedia || null
         });
       } catch (e) {
         console.warn('[MEDIA] could not persist pendingMediaMeta:', e?.message);
@@ -281,10 +290,9 @@ router.post('*', async (req, res, next) => {
 
   try {
     const pending = await getPendingTransactionState(req.from);
-    const hasPendingMedia = pending && pending.pendingMedia;
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // ✅ DEFINE TEXT EARLY (so "yes" / hard-command nudge can work)
+    // ✅ DEFINE TEXT EARLY
     const text = String(req.body?.Body || '').trim();
     const lc = text.toLowerCase();
 
@@ -297,28 +305,36 @@ router.post('*', async (req, res, next) => {
       !!pending?.awaitingRevenueJob ||
       !!pending?.awaitingRevenueClarification;
 
+    const pendingExpenseFlow =
+      !!pending?.pendingExpense ||
+      !!pending?.awaitingExpenseJob ||
+      !!pending?.awaitingExpenseClarification;
+
     if (pendingRevenueFlow) {
-      // cancel/stop/no cancels revenue at ANY step
       if (/^(cancel|stop|no)\b/.test(lc)) {
-        try {
-          await require('../utils/stateManager').deletePendingTransactionState?.(req.from);
-        } catch {}
+        try { await require('../utils/stateManager').deletePendingTransactionState?.(req.from); } catch {}
         return ok(res, `❌ Revenue cancelled.`);
       }
-
-      // "skip" means: leave it pending and continue with other commands
-      if (lc === 'skip') {
-        return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
-      }
-
-      // If they try a hard command while revenue is waiting for an answer, nudge them
-      if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) {
-        return ok(res, pendingTxnNudgeMessage({ type: 'revenue' }));
-      }
+      if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
+      if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) return ok(res, pendingTxnNudgeMessage({ type: 'revenue' }));
     }
 
-    // If we were waiting for media but none came, let media handler interpret text-only follow-up
+    if (pendingExpenseFlow) {
+      if (/^(cancel|stop|no)\b/.test(lc)) {
+        try { await require('../utils/stateManager').deletePendingTransactionState?.(req.from); } catch {}
+        return ok(res, `❌ Expense cancelled.`);
+      }
+      if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
+      if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) return ok(res, pendingTxnNudgeMessage({ type: 'expense' }));
+    }
+
+    // -----------------------------------------------------------------------
+    // If prior step set pendingMedia (waiting for user follow-up) and this is text-only,
+    // let media.js interpret the follow-up and/or pass it through.
+    // -----------------------------------------------------------------------
+    const hasPendingMedia = !!pending?.pendingMedia || !!pending?.pendingMediaMeta;
     if (hasPendingMedia && numMedia === 0) {
+      const { handleMedia } = require('../handlers/media');
       const result = await handleMedia(
         req.from,
         text,
@@ -328,35 +344,39 @@ router.post('*', async (req, res, next) => {
         null
       );
 
-      if (result) {
-        if (typeof result === 'string' && !res.headersSent) {
-          return res.status(200).type('application/xml; charset=utf-8').send(result);
-        }
-
-        if (result.transcript && !result.twiml) {
-          req.body.Body = result.transcript;
-        } else {
-          return;
-        }
+      // If media handler returns TwiML, send it.
+      if (typeof result === 'string' && result && !res.headersSent) {
+        return res.status(200).type('application/xml; charset=utf-8').send(result);
       }
+
+      // If it returns a transcript pass-through, rewrite Body and continue.
+      if (result && typeof result === 'object' && result.transcript && !result.twiml) {
+        req.body.Body = result.transcript;
+      } else if (result && typeof result === 'object' && result.twiml) {
+        // media.js sometimes returns { transcript, twiml } — if it provides twiml, honor it
+        return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
+      }
+      // refresh text/lc after rewrite
     }
 
+    // refresh after any rewrite
+    const text2 = String(req.body?.Body || '').trim();
+    const lc2 = text2.toLowerCase();
 
     // Canonical idempotency key for ingestion (Twilio)
     const crypto = require('crypto');
-
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid = rawSid || crypto
       .createHash('sha256')
-      .update(`${req.from}|${req.body?.Body || ''}`) // stable-ish for retries
+      .update(`${req.from}|${req.body?.Body || ''}`)
       .digest('hex')
       .slice(0, 32);
 
     // -----------------------------------------------------------------------
     // (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
     // -----------------------------------------------------------------------
-    const isNewRevenueCmd = /^(?:revenue|rev|received)\b/.test(lc);
-    const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc);
+    const isNewRevenueCmd = /^(?:revenue|rev|received)\b/.test(lc2);
+    const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc2);
 
     const pendingRevenueLike =
       !!pending?.awaitingRevenueClarification ||
@@ -376,7 +396,7 @@ router.post('*', async (req, res, next) => {
         const { handleRevenue } = require('../handlers/commands/revenue');
         const twiml = await handleRevenue(
           req.from,
-          text,
+          text2,
           req.userProfile,
           req.ownerId,
           req.ownerProfile,
@@ -386,7 +406,6 @@ router.post('*', async (req, res, next) => {
         return res.status(200).type('application/xml; charset=utf-8').send(twiml);
       } catch (e) {
         console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
-        // fall through (never hard-fail)
       }
     }
 
@@ -395,7 +414,7 @@ router.post('*', async (req, res, next) => {
         const { handleExpense } = require('../handlers/commands/expense');
         const twiml = await handleExpense(
           req.from,
-          text,
+          text2,
           req.userProfile,
           req.ownerId,
           req.ownerProfile,
@@ -405,69 +424,77 @@ router.post('*', async (req, res, next) => {
         return res.status(200).type('application/xml; charset=utf-8').send(twiml);
       } catch (e) {
         console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
-        // fall through
       }
     }
 
-   // -----------------------------------------------------------------------
-// (B) FAST PATHS — REVENUE/EXPENSE TWI ML HANDLERS
-// -----------------------------------------------------------------------
-const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
-if (looksRevenue) {
-  try {
-    const { handleRevenue } = require('../handlers/commands/revenue');
+    // -----------------------------------------------------------------------
+    // (B) FAST PATHS — REVENUE/EXPENSE
+    // -----------------------------------------------------------------------
+    const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc2);
+    if (looksRevenue) {
+      try {
+        const { handleRevenue } = require('../handlers/commands/revenue');
 
-    const timeoutMs = 8000;
-    const timeoutTwiml = `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please reply "yes" again in a few seconds.</Message></Response>`;
+        const timeoutMs = 8000;
+        const timeoutTwiml =
+          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please reply "yes" again in a few seconds.</Message></Response>`;
 
-    let timeoutId = null;
+        let timeoutId = null;
+        const timeoutPromise = new Promise(resolve => {
+          timeoutId = setTimeout(() => {
+            console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
+            resolve(timeoutTwiml);
+          }, timeoutMs);
+        });
 
-    const timeoutPromise = new Promise(resolve => {
-      timeoutId = setTimeout(() => {
-        console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
-        resolve(timeoutTwiml);
-      }, timeoutMs);
-    });
+        const twiml = await Promise.race([
+          handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+          timeoutPromise
+        ]).finally(() => {
+          if (timeoutId) clearTimeout(timeoutId);
+        });
 
-    const twiml = await Promise.race([
-      handleRevenue(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-      timeoutPromise
-    ]).finally(() => {
-      if (timeoutId) clearTimeout(timeoutId);
-    });
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+      }
+    }
 
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-  }
-}
-
-
-    const looksExpense = /^(?:expense|exp)\b/.test(lc);
+    const looksExpense = /^(?:expense|exp)\b/.test(lc2);
     if (looksExpense) {
       try {
         const { handleExpense } = require('../handlers/commands/expense');
-        const twiml = await handleExpense(
-          req.from,
-          text,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
+
+        const timeoutMs = 8000;
+        const timeoutTwiml =
+          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please reply "yes" again in a few seconds.</Message></Response>`;
+
+        let timeoutId = null;
+        const timeoutPromise = new Promise(resolve => {
+          timeoutId = setTimeout(() => {
+            console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
+            resolve(timeoutTwiml);
+          }, timeoutMs);
+        });
+
+        const twiml = await Promise.race([
+          handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+          timeoutPromise
+        ]).finally(() => {
+          if (timeoutId) clearTimeout(timeoutId);
+        });
+
         return res.status(200).type('application/xml; charset=utf-8').send(twiml);
       } catch (e) {
         console.warn('[WEBHOOK] expense handler failed:', e?.message);
-        // fall through
       }
     }
 
     // --- SPECIAL: "How did the XYZ job do?" → job KPIs ---
-    if (/how\b.*\bjob\b/.test(lc)) {
+    if (/how\b.*\bjob\b/.test(lc2)) {
       try {
         const { handleJobInsights } = require('../handlers/commands/job_insights');
-        const msg = await handleJobInsights({ ownerId: req.ownerId, text });
+        const msg = await handleJobInsights({ ownerId: req.ownerId, text: text2 });
 
         return res
           .status(200)
@@ -491,30 +518,29 @@ if (looksRevenue) {
         }
         return '';
       } catch {
-        // glossary service not bundled / not implemented yet
         return '';
       }
     }
 
-    const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc);
+    const askingHow = /\b(how (do|to) i|how to|help with|how do i use|how can i use)\b/.test(lc2);
 
-    let looksTask = /^task\b/.test(lc) || /\btasks?\b/.test(lc);
+    let looksTask = /^task\b/.test(lc2) || /\btasks?\b/.test(lc2);
 
     let looksJob =
-      /\b(?:job|jobs)\b/.test(lc) ||
-      /\bactive job\??\b/.test(lc) ||
-      /\bwhat'?s\s+my\s+active\s+job\??\b/.test(lc) ||
-      /\bset\s+active\b/.test(lc) ||
-      /\b(list|create|start|activate|pause|resume|finish)\s+job\b/.test(lc) ||
-      /\bmove\s+last\s+log\s+to\b/.test(lc);
+      /\b(?:job|jobs)\b/.test(lc2) ||
+      /\bactive job\??\b/.test(lc2) ||
+      /\bwhat'?s\s+my\s+active\s+job\??\b/.test(lc2) ||
+      /\bset\s+active\b/.test(lc2) ||
+      /\b(list|create|start|activate|pause|resume|finish)\s+job\b/.test(lc2) ||
+      /\bmove\s+last\s+log\s+to\b/.test(lc2);
 
-    let looksTime = /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc);
+    let looksTime = /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc2);
 
-    let looksKpi = /^kpis?\s+for\b/.test(lc);
+    let looksKpi = /^kpis?\s+for\b/.test(lc2);
 
-    if (askingHow && /\btasks?\b/.test(lc)) looksTask = true;
-    if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc)) looksTime = true;
-    if (askingHow && /\bjobs?\b/.test(lc)) looksJob = true;
+    if (askingHow && /\btasks?\b/.test(lc2)) looksTask = true;
+    if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc2)) looksTime = true;
+    if (askingHow && /\bjobs?\b/.test(lc2)) looksJob = true;
 
     const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(Boolean);
 
@@ -547,14 +573,14 @@ if (looksRevenue) {
     const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
 
     // Try explicit handlers first (BOOLEAN-handled style)
-    if (tasksHandler && await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
-    if (handleTimeclock && await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
-    if (handleJob && await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid)) return;
+    if (tasksHandler && await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
+    if (handleTimeclock && await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
+    if (handleJob && await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid)) return;
 
     // Forecast (fast path; no ctx object)
-    if (/^forecast\b/i.test(lc)) {
+    if (/^forecast\b/i.test(lc2)) {
       const handled = await handleForecast({
-        text,
+        text: text2,
         ownerId: req.ownerId,
         jobId: req.userProfile?.active_job_id || null,
         jobName: req.userProfile?.active_job_name || 'All Jobs'
@@ -565,14 +591,14 @@ if (looksRevenue) {
     // Timeclock v2 (optional fast path behind flag)
     if (flags.timeclock_v2) {
       const cil = (() => {
-        if (/^clock in\b/.test(lc)) return { type:'Clock', action:'in' };
-        if (/^clock out\b/.test(lc)) return { type:'Clock', action:'out' };
-        if (/^break start\b/.test(lc)) return { type:'Clock', action:'break_start' };
-        if (/^break stop\b/.test(lc)) return { type:'Clock', action:'break_end' };
-        if (/^lunch start\b/.test(lc)) return { type:'Clock', action:'lunch_start' };
-        if (/^lunch stop\b/.test(lc)) return { type:'Clock', action:'lunch_end' };
-        if (/^drive start\b/.test(lc)) return { type:'Clock', action:'drive_start' };
-        if (/^drive stop\b/.test(lc)) return { type:'Clock', action:'drive_end' };
+        if (/^clock in\b/.test(lc2)) return { type:'Clock', action:'in' };
+        if (/^clock out\b/.test(lc2)) return { type:'Clock', action:'out' };
+        if (/^break start\b/.test(lc2)) return { type:'Clock', action:'break_start' };
+        if (/^break stop\b/.test(lc2)) return { type:'Clock', action:'break_end' };
+        if (/^lunch start\b/.test(lc2)) return { type:'Clock', action:'lunch_start' };
+        if (/^lunch stop\b/.test(lc2)) return { type:'Clock', action:'lunch_end' };
+        if (/^drive start\b/.test(lc2)) return { type:'Clock', action:'drive_start' };
+        if (/^drive stop\b/.test(lc2)) return { type:'Clock', action:'drive_end' };
         return null;
       })();
 
@@ -586,7 +612,7 @@ if (looksRevenue) {
         };
         const reply = await handleClock(ctx, cil);
         let msg = reply?.text || 'Time logged.';
-        msg += await glossaryNudgeFrom(text);
+        msg += await glossaryNudgeFrom(text2);
         return ok(res, msg);
       }
     }
@@ -598,10 +624,10 @@ if (looksRevenue) {
       try {
         const { handleJobKpis } = require('../handlers/commands/job_kpis');
         if (typeof handleJobKpis === 'function') {
-          const out = await handleJobKpis(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+          const out = await handleJobKpis(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
           if (!res.headersSent) {
             let msg = (typeof out === 'string' && out.trim()) ? out.trim() : 'KPI shown.';
-            msg += await glossaryNudgeFrom(text);
+            msg += await glossaryNudgeFrom(text2);
             return ok(res, msg);
           }
           return;
@@ -613,10 +639,10 @@ if (looksRevenue) {
 
     // TASKS
     if (looksTask && typeof tasksHandler === 'function') {
-      const out = await tasksHandler(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+      const out = await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (!res.headersSent) {
         let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.tasks : 'Task handled.');
-        msg += await glossaryNudgeFrom(text);
+        msg += await glossaryNudgeFrom(text2);
         return ok(res, msg);
       }
       return;
@@ -624,10 +650,10 @@ if (looksRevenue) {
 
     // JOBS
     if (looksJob && typeof handleJob === 'function') {
-      const out = await handleJob(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+      const out = await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (!res.headersSent) {
         let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.jobs : 'Job handled.');
-        msg += await glossaryNudgeFrom(text);
+        msg += await glossaryNudgeFrom(text2);
         return ok(res, msg);
       }
       return;
@@ -635,10 +661,10 @@ if (looksRevenue) {
 
     // TIMECLOCK (legacy)
     if (looksTime && typeof handleTimeclock === 'function') {
-      const out = await handleTimeclock(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
+      const out = await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
         let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.timeclock : 'Time logged.');
-        msg += await glossaryNudgeFrom(text);
+        msg += await glossaryNudgeFrom(text2);
         return ok(res, msg);
       }
       return;
@@ -650,12 +676,12 @@ if (looksRevenue) {
         const { ask } = require('../services/agent');
         if (typeof ask === 'function') {
           const answer = await Promise.race([
-            ask({ from: req.from, text, topicHints }),
+            ask({ from: req.from, text: text2, topicHints }),
             new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000)),
           ]).catch(() => '');
           if (answer?.trim()) {
             let msg = answer.trim();
-            msg += await glossaryNudgeFrom(text);
+            msg += await glossaryNudgeFrom(text2);
             return ok(res, msg);
           }
         }
@@ -670,7 +696,7 @@ if (looksRevenue) {
       '• Jobs: create job Roof Repair, set active job Roof Repair, move last log to Front Porch\n' +
       '• Tasks: task - buy nails, my tasks, done #4\n' +
       '• Time: clock in, clock out, timesheet week';
-    msg += await glossaryNudgeFrom(text);
+    msg += await glossaryNudgeFrom(text2);
     return ok(res, msg);
 
   } catch (err) {

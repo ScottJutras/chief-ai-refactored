@@ -15,6 +15,11 @@ const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
+// ✅ NEW: prefer clearFinanceFlow (does not wipe unrelated state), fallback to delete
+const clearFinanceFlow =
+  (typeof state.clearFinanceFlow === 'function' && state.clearFinanceFlow) ||
+  (async (userId) => deletePendingTransactionState(userId));
+
 const ai = require('../../utils/aiErrorHandler');
 
 // Optional: log once if detectErrors isn't available (we'll fail-open)
@@ -172,18 +177,11 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 }
 
 /**
- * Deterministic parse:
- * - amount: $100 or 100
- * - date: today/yesterday/tomorrow/YYYY-MM-DD
- * - job: "for <job>" OR "on <job>" OR "job <job>" OR address-like token after "from" if it looks like job/address
- * - payer optional: only if it DOESN’T look like address/job
- *
- * NOTE: "from <job>" is common; we'll treat address-like from as job.
+ * Deterministic parse
  */
 async function deterministicRevenueParse({ ownerId, input, tz }) {
   const raw = String(input || '').trim();
 
-  // amount
   const amtMatch =
     raw.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/) ||
     raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
@@ -193,7 +191,6 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
   const amountNum = amtMatch[1];
   const amount = `$${Number(amountNum).toFixed(2)}`;
 
-  // date
   let date = null;
   if (/\btoday\b/i.test(raw)) date = parseNaturalDate('today', tz);
   else if (/\byesterday\b/i.test(raw)) date = parseNaturalDate('yesterday', tz);
@@ -204,7 +201,6 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
   }
   if (!date) date = todayInTimeZone(tz);
 
-  // job patterns
   let jobName = null;
 
   const forMatch = raw.match(/\bfor\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
@@ -220,7 +216,6 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
     if (jobMatch?.[1]) jobName = normalizeJobAnswer(jobMatch[1]);
   }
 
-  // "from X" might be job/address or payer
   let source = 'Unknown';
   const fromMatch = raw.match(/\bfrom\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
   if (fromMatch?.[1]) {
@@ -229,11 +224,10 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
       jobName = jobName || token;
       source = 'Unknown';
     } else {
-      source = token; // payer
+      source = token;
     }
   }
 
-  // overhead normalization
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
   return {
@@ -246,7 +240,7 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
 }
 
 /**
- * Canonical insert: delegates to services/postgres.insertTransaction()
+ * Canonical insert
  */
 async function writeRevenueViaCanonicalInsert({
   ownerId,
@@ -277,8 +271,6 @@ async function writeRevenueViaCanonicalInsert({
 
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
-  // If you want to suppress "Service" unless user explicitly said it, change this to:
-  // if (c.toLowerCase() === 'service') return null;
   const safeCategory = (() => {
     const c = String(category || '').trim();
     if (!c) return null;
@@ -291,7 +283,7 @@ async function writeRevenueViaCanonicalInsert({
     date: String(data.date || '').trim() || todayInTimeZone(tz),
     description: String(data.description || 'Payment received').trim() || 'Payment received',
     amount_cents: amountCents,
-    amount: toNumberAmount(data.amount), // optional numeric (schema-aware in insertTransaction)
+    amount: toNumberAmount(data.amount),
     source: (data.source && data.source !== 'Unknown') ? String(data.source).trim() : 'Unknown',
     job: jobName ? String(jobName).trim() : null,
     job_name: jobName ? String(jobName).trim() : null,
@@ -303,20 +295,6 @@ async function writeRevenueViaCanonicalInsert({
   };
 
   return await insertTransaction(payload, { timeoutMs: 4500 });
-}
-
-// Clear ONLY media meta after successful write so it doesn't attach to next txn
-async function clearPendingMediaMeta(from, pending) {
-  try {
-    if (!pending) return;
-    if (!pending.pendingMediaMeta && !pending.pendingMedia) return;
-
-    await mergePendingTransactionState(from, {
-      ...(pending || {}),
-      pendingMediaMeta: null,
-      pendingMedia: false
-    });
-  } catch {}
 }
 
 /* ---------------- main handler ---------------- */
@@ -331,7 +309,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
     let pending = await getPendingTransactionState(from);
 
-    // If user previously hit "edit", treat this message as brand new revenue command.
     if (pending?.isEditing && pending?.type === 'revenue') {
       await deletePendingTransactionState(from);
       pending = null;
@@ -383,7 +360,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     // --- CONFIRM FLOW ---
     if (pending?.pendingRevenue) {
       if (!isOwner) {
-        await deletePendingTransactionState(from);
+        await clearFinanceFlow(from);
         reply = '⚠️ Only the owner can manage revenue.';
         return `<Response><Message>${reply}</Message></Response>`;
       }
@@ -397,7 +374,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         const data = pending.pendingRevenue || {};
         const pendingMediaMeta = pending?.pendingMediaMeta || null;
 
-        // job required (or Overhead)
         let jobName = (data.jobName && String(data.jobName).trim()) || null;
         if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
@@ -451,7 +427,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         );
 
         if (result === '__DB_TIMEOUT__') {
-          // keep pending so they can resend "yes"
           await mergePendingTransactionState(from, {
             ...pending,
             pendingRevenue: { ...data, jobName, suggestedCategory: category || data.suggestedCategory },
@@ -469,10 +444,11 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         reply =
           result?.inserted === false
             ? '✅ Already logged that payment (duplicate message).'
-            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+            : `✅ Payment logged: ${data.amount}${payerPart} for ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-        // Clear everything (includes media meta)
-        await deletePendingTransactionState(from);
+        // ✅ NEW: clear finance flow keys (includes media meta); safer than wiping all state
+        await clearFinanceFlow(from);
+
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
@@ -490,7 +466,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       if (lcInput === 'cancel') {
-        await deletePendingTransactionState(from);
+        await clearFinanceFlow(from);
         reply = '❌ Payment cancelled.';
         return `<Response><Message>${reply}</Message></Response>`;
       }
@@ -531,15 +507,13 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       return `<Response><Message>${aiReply}</Message></Response>`;
     }
 
-    // ✅ NEW: normalize "source" that actually contains a job/address
-    // Example: "Received $500 from job 1556 Medway Park Drive today."
-    // Many parsers put "job 1556..." into source. If jobName is missing, treat that as jobName.
+    // ✅ normalize "source" that actually contains a job/address
     if (data) {
       const existingJob = String(data.jobName || '').trim();
       const srcRaw = String(data.source || '').trim();
 
       if (!existingJob && srcRaw) {
-        const srcClean = normalizeJobAnswer(srcRaw); // strips leading "job", "job:" etc.
+        const srcClean = normalizeJobAnswer(srcRaw);
 
         const srcLooksJob =
           /^\s*job\b/i.test(srcRaw) ||
@@ -580,19 +554,14 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
       data.suggestedCategory = category;
 
-      // require job (or overhead)
       let jobName = (data.jobName && String(data.jobName).trim()) || null;
       if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
       if (!jobName) {
         await mergePendingTransactionState(from, {
           ...(pending || {}),
-
-          // keep the parsed data as-is so the user can just reply with a job name
           pendingRevenue: data,
           awaitingRevenueJob: true,
-
-          // IMPORTANT: keep source_msg_id stable so confirm->insert is idempotent
           revenueSourceMsgId: safeMsgId,
           type: 'revenue'
         });
@@ -600,7 +569,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      // For contractor UX + safety, keep the confirm step.
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingRevenue: { ...data, jobName },

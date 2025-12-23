@@ -72,6 +72,7 @@ pool.on('connect', async (client) => {
 pool.on('error', (err) => {
   console.error('[PG] idle client error:', err?.message);
 });
+
 // ---------- Core query helpers ----------
 async function query(text, params) {
   return queryWithRetry(text, params);
@@ -139,6 +140,215 @@ function todayInTZ(tz = 'America/Toronto') {
 // Optional: export this name if other files import it
 const normalizePhoneNumber = (x) => DIGITS(x);
 
+/* ------------------------------------------------------------------ */
+/*  ✅ Media transcript truncation + transactions schema capabilities   */
+/* ------------------------------------------------------------------ */
+
+// Option A: truncate transcript for DB storage
+const MEDIA_TRANSCRIPT_MAX_CHARS = 8000;
+
+function truncateText(s, maxChars = MEDIA_TRANSCRIPT_MAX_CHARS) {
+  const str = String(s ?? '');
+  if (!str) return null;
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return null;
+  return str.length > maxChars ? str.slice(0, maxChars) : str;
+}
+
+async function hasColumn(table, col) {
+  const r = await query(
+    `select 1
+       from information_schema.columns
+      where table_schema='public'
+        and table_name=$1
+        and column_name=$2
+      limit 1`,
+    [table, col]
+  );
+  return (r?.rows?.length || 0) > 0;
+}
+
+// Cache detected columns on public.transactions
+let TX_HAS_SOURCE_MSG_ID = null;
+let TX_HAS_AMOUNT        = null;
+let TX_HAS_MEDIA_URL     = null;
+let TX_HAS_MEDIA_TYPE    = null;
+let TX_HAS_MEDIA_TXT     = null;
+let TX_HAS_MEDIA_CONF    = null;
+
+async function detectTransactionsCapabilities() {
+  if (
+    TX_HAS_SOURCE_MSG_ID !== null &&
+    TX_HAS_AMOUNT !== null &&
+    TX_HAS_MEDIA_URL !== null &&
+    TX_HAS_MEDIA_TYPE !== null &&
+    TX_HAS_MEDIA_TXT !== null &&
+    TX_HAS_MEDIA_CONF !== null
+  ) {
+    return {
+      TX_HAS_SOURCE_MSG_ID,
+      TX_HAS_AMOUNT,
+      TX_HAS_MEDIA_URL,
+      TX_HAS_MEDIA_TYPE,
+      TX_HAS_MEDIA_TXT,
+      TX_HAS_MEDIA_CONF
+    };
+  }
+
+  try {
+    // Prefer a single query for all columns (faster than multiple hasColumn calls)
+    const { rows } = await query(
+      `select column_name
+         from information_schema.columns
+        where table_schema='public'
+          and table_name='transactions'`
+    );
+    const names = new Set(rows.map(r => String(r.column_name).toLowerCase()));
+
+    TX_HAS_SOURCE_MSG_ID = names.has('source_msg_id');
+    TX_HAS_AMOUNT        = names.has('amount');
+    TX_HAS_MEDIA_URL     = names.has('media_url');
+    TX_HAS_MEDIA_TYPE    = names.has('media_type');
+    TX_HAS_MEDIA_TXT     = names.has('media_transcript');
+    TX_HAS_MEDIA_CONF    = names.has('media_confidence');
+  } catch (e) {
+    // Fail-open (don’t break ingestion just because information_schema had a bad day)
+    console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
+    TX_HAS_SOURCE_MSG_ID = false;
+    TX_HAS_AMOUNT        = false;
+    TX_HAS_MEDIA_URL     = false;
+    TX_HAS_MEDIA_TYPE    = false;
+    TX_HAS_MEDIA_TXT     = false;
+    TX_HAS_MEDIA_CONF    = false;
+  }
+
+  return {
+    TX_HAS_SOURCE_MSG_ID,
+    TX_HAS_AMOUNT,
+    TX_HAS_MEDIA_URL,
+    TX_HAS_MEDIA_TYPE,
+    TX_HAS_MEDIA_TXT,
+    TX_HAS_MEDIA_CONF
+  };
+}
+
+function normalizeMediaMeta(mediaMeta) {
+  if (!mediaMeta || typeof mediaMeta !== 'object') return null;
+
+  const url = String(mediaMeta.url || mediaMeta.media_url || '').trim() || null;
+  const type = String(mediaMeta.type || mediaMeta.media_type || '').trim() || null;
+
+  // transcript can be huge; Option A truncation
+  const transcriptRaw = mediaMeta.transcript || mediaMeta.media_transcript || null;
+  const transcript = transcriptRaw ? truncateText(transcriptRaw, MEDIA_TRANSCRIPT_MAX_CHARS) : null;
+
+  const conf = mediaMeta.confidence ?? mediaMeta.media_confidence ?? null;
+  const confidence = Number.isFinite(Number(conf)) ? Number(conf) : null;
+
+  // If nothing meaningful, return null so we don’t insert noise
+  if (!url && !type && !transcript && confidence == null) return null;
+
+  return {
+    media_url: url,
+    media_type: type,
+    media_transcript: transcript,
+    media_confidence: confidence
+  };
+}
+
+/**
+ * ✅ insertTransaction()
+ * Schema-aware insert into public.transactions with optional media fields.
+ * Safe idempotency if (owner_id, source_msg_id) exists (your revenue.js uses this).
+ *
+ * Expected opts:
+ *  ownerId, kind ('revenue'|'expense'|...), date (YYYY-MM-DD), description,
+ *  amount_cents, amount (optional numeric), source, job, job_name, category, user_name,
+ *  source_msg_id (optional), mediaMeta (optional)
+ */
+async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
+  const owner = DIGITS(opts.ownerId || opts.owner_id);
+  const kind = String(opts.kind || '').trim();
+  const date = String(opts.date || '').trim();
+  const description = String(opts.description || '').trim() || 'Unknown';
+
+  const amountCents = Number(opts.amount_cents ?? opts.amountCents ?? 0) || 0;
+  const amountMaybe = opts.amount;
+
+  const source = String(opts.source || '').trim() || 'Unknown';
+  const job = (opts.job == null ? null : String(opts.job).trim() || null);
+  const jobName = (opts.job_name ?? opts.jobName ?? job);
+  const category = (opts.category == null ? null : String(opts.category).trim() || null);
+  const userName = (opts.user_name ?? opts.userName ?? null);
+  const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
+
+  if (!owner) throw new Error('insertTransaction missing ownerId');
+  if (!kind) throw new Error('insertTransaction missing kind');
+  if (!date) throw new Error('insertTransaction missing date');
+  if (!amountCents || amountCents <= 0) throw new Error('insertTransaction invalid amount_cents');
+
+  const caps = await detectTransactionsCapabilities();
+  const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
+
+  const cols = [
+    'owner_id',
+    'kind',
+    'date',
+    'description',
+    ...(caps.TX_HAS_AMOUNT ? ['amount'] : []),
+    'amount_cents',
+    'source',
+    'job',
+    'job_name',
+    'category',
+    'user_name',
+    ...(caps.TX_HAS_SOURCE_MSG_ID ? ['source_msg_id'] : []),
+    ...(caps.TX_HAS_MEDIA_URL ? ['media_url'] : []),
+    ...(caps.TX_HAS_MEDIA_TYPE ? ['media_type'] : []),
+    ...(caps.TX_HAS_MEDIA_TXT ? ['media_transcript'] : []),
+    ...(caps.TX_HAS_MEDIA_CONF ? ['media_confidence'] : []),
+    'created_at'
+  ];
+
+  const vals = [
+    owner,
+    kind,
+    date,
+    description,
+    ...(caps.TX_HAS_AMOUNT ? [Number.isFinite(Number(amountMaybe)) ? Number(amountMaybe) : null] : []),
+    amountCents,
+    source,
+    job,
+    jobName ? String(jobName).trim() : null,
+    category,
+    userName ? String(userName).trim() : null,
+    ...(caps.TX_HAS_SOURCE_MSG_ID ? [sourceMsgId] : []),
+    ...(caps.TX_HAS_MEDIA_URL ? [media?.media_url || null] : []),
+    ...(caps.TX_HAS_MEDIA_TYPE ? [media?.media_type || null] : []),
+    ...(caps.TX_HAS_MEDIA_TXT ? [media?.media_transcript || null] : []),
+    ...(caps.TX_HAS_MEDIA_CONF ? [media?.media_confidence ?? null] : []),
+  ];
+
+  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
+  const canIdempotent = caps.TX_HAS_SOURCE_MSG_ID && !!sourceMsgId;
+
+  const sql = canIdempotent
+    ? `
+      insert into public.transactions (${cols.join(', ')})
+      values (${placeholders}, now())
+      on conflict (owner_id, source_msg_id) where source_msg_id is not null
+      do nothing
+      returning id
+    `
+    : `
+      insert into public.transactions (${cols.join(', ')})
+      values (${placeholders}, now())
+      returning id
+    `;
+
+  const res = await queryWithTimeout(sql, vals, timeoutMs);
+  if (!res?.rows?.length) return { inserted: false, id: null };
+  return { inserted: true, id: res.rows[0].id };
+}
 
 async function getLatestTimeEvent(ownerId, employeeName) {
   const { rows } = await query(
@@ -223,7 +433,6 @@ async function enqueueKpiTouch(ownerId, jobId, isoDate) {
   );
 }
 
-
 async function getJobByName(ownerId, name) {
   const owner = DIGITS(ownerId);
   const jobName = String(name || '').trim();
@@ -250,7 +459,6 @@ async function getJobByName(ownerId, name) {
 
   return rows[0] || null;
 }
-
 
 async function getJobBySourceMsg(ownerId, sourceMsgId) {
   const owner = DIGITS(ownerId);
@@ -339,7 +547,6 @@ async function createJobIdempotent({ ownerId, name, sourceMsgId }) {
   });
 }
 
-
 // Upsert a job by name, deactivate others, and activate this one
 async function activateJobByName(ownerId, rawName) {
   const owner = DIGITS(ownerId);
@@ -369,16 +576,16 @@ async function activateJobByName(ownerId, rawName) {
   });
 
   // fetch final state (best effort)
-const { rows } = await query(
-  `SELECT job_no, COALESCE(name, job_name) AS name, active, updated_at
-     FROM public.jobs
-    WHERE owner_id=$1 AND job_no=$2
-    LIMIT 1`,
-  [owner, jobNo]
-);
-const final = rows[0] || { job_no: jobNo, name, active: true };
-console.info('[PG] activated job', { owner, job_no: final.job_no, name: final.name });
-return final;
+  const { rows } = await query(
+    `SELECT job_no, COALESCE(name, job_name) AS name, active, updated_at
+       FROM public.jobs
+      WHERE owner_id=$1 AND job_no=$2
+      LIMIT 1`,
+    [owner, jobNo]
+  );
+  const final = rows[0] || { job_no: jobNo, name, active: true };
+  console.info('[PG] activated job', { owner, job_no: final.job_no, name: final.name });
+  return final;
 }
 module.exports.activateJobByName = activateJobByName;
 
@@ -401,6 +608,7 @@ async function allocateNextJobNo(owner, client) {
   );
   return Number(rows?.[0]?.next_no || 1);
 }
+
 /**
  * Create a job idempotently, safely allocating job_no per owner.
  * Requires:
@@ -473,8 +681,6 @@ async function createJobIdempotent({ ownerId, jobName, sourceMsgId, status = 'op
   });
 }
 
-
-
 // ---------- File Exports (fetch) ----------
 async function getFileExport(id) {
   const { rows } = await query(
@@ -493,7 +699,6 @@ async function getFileExport(id) {
 let SUPPORTS_CREATED_BY    = null; // null=unknown, then true/false
 let SUPPORTS_USER_ID       = null;
 let SUPPORTS_SOURCE_MSG_ID = null;
-
 
 async function detectTimeEntriesCapabilities() {
   if (
@@ -602,7 +807,6 @@ async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz,
   return await logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras);
 }
 
-
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
   const zone  = tz || 'America/Toronto';
@@ -684,7 +888,6 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   return rows?.[0]?.id || null;
 }
 
-
 // Find or create a job by name (case-insensitive on name or job_name).
 // Robust against races and job_no duplicates: we allocate job_no under an advisory lock.
 async function ensureJobByName(ownerId, name) {
@@ -748,9 +951,6 @@ async function ensureJobByName(ownerId, name) {
     }
   });
 }
-
-
-
 
 async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
   const owner = DIGITS(ownerId);
@@ -867,6 +1067,7 @@ async function getTaskByNo(ownerId, taskNo) {
 }
 
 // ---------- EXCEL EXPORT (lazy load) ----------
+let ExcelJS = null;
 async function exportTimesheetXlsx(opts) {
   if (!ExcelJS) ExcelJS = require('exceljs');
 
@@ -916,6 +1117,7 @@ async function exportTimesheetXlsx(opts) {
 }
 
 // ---------- PDF EXPORT (lazy load) ----------
+let PDFDocument = null;
 async function exportTimesheetPdf(opts) {
   if (!PDFDocument) PDFDocument = require('pdfkit');
 
@@ -989,7 +1191,6 @@ async function savePendingAction({ ownerId, userId, kind, payload }) {
   return id;
 }
 
-
 async function getPendingAction({ ownerId, userId }) {
   const { rows } = await query(
     `select id, kind, payload, created_at
@@ -1012,11 +1213,6 @@ module.exports.deletePendingAction = deletePendingAction;
 
 // -------------------- Finance helpers (transactions + pricing_items) --------------------
 
-/**
- * Fetch pricing catalog for an owner.
- *
- * @param {string} ownerId owner UUID or phone; we compare as text
- */
 async function getOwnerPricingItems(ownerId) {
   const ownerKey = String(ownerId);
 
@@ -1032,12 +1228,6 @@ async function getOwnerPricingItems(ownerId) {
   return rows;
 }
 
-/**
- * Summarize revenue / expense / profit for an owner, optionally scoped to a job.
- *
- * @param {string} ownerId owner/tenant id (uuid or phone; we compare as text)
- * @param {string|null} jobId optional job UUID (null = all jobs)
- */
 async function getJobFinanceSnapshot(ownerId, jobId = null) {
   const ownerKey = String(ownerId);
   const params = [ownerKey];
@@ -1080,10 +1270,6 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
   };
 }
 
-/**
- * List all jobs for an owner with basic finance (revenue / expense / profit).
- * This powers the main "Jobs" dashboard list.
- */
 async function getOwnerJobsFinance(ownerId) {
   const ownerKey = String(ownerId);
 
@@ -1130,12 +1316,6 @@ async function getOwnerJobsFinance(ownerId) {
   });
 }
 
-/**
- * Summarize a single calendar month for an owner.
- *
- * @param {string} ownerId
- * @param {string} monthStart ISO date 'YYYY-MM-01'
- */
 async function getOwnerMonthlyFinance(ownerId, monthStart) {
   const ownerKey = String(ownerId);
   const start = monthStart;
@@ -1176,14 +1356,6 @@ async function getOwnerMonthlyFinance(ownerId, monthStart) {
   };
 }
 
-/**
- * Category breakdown (expenses and/or revenue) for a given date range.
- *
- * @param {string} ownerId
- * @param {string} fromDate ISO 'YYYY-MM-DD'
- * @param {string} toDate   ISO 'YYYY-MM-DD' (exclusive)
- * @param {('expense'|'revenue'|null)} kindFilter optional
- */
 async function getOwnerCategoryBreakdown(ownerId, fromDate, toDate, kindFilter = null) {
   const ownerKey = String(ownerId);
 
@@ -1247,6 +1419,13 @@ module.exports = {
   toAmount,  // back-compat alias (returns cents)
   isValidIso,
 
+  // ✅ Media/Transactions helpers
+  MEDIA_TRANSCRIPT_MAX_CHARS,
+  truncateText,
+  detectTransactionsCapabilities,
+  insertTransaction,
+  normalizeMediaMeta,
+
   // ---------- Pending actions (serverless-safe confirmations) ----------
   savePendingAction,
   getPendingAction,
@@ -1283,6 +1462,8 @@ module.exports = {
   getLatestTimeEvent,
   checkTimeEntryLimit: __checkLimit, // alias; keep API stable
   checkActorLimit: __checkLimit,
+
+  // ---------- Finance ----------
   getJobFinanceSnapshot,
   getOwnerPricingItems,
   getOwnerJobsFinance,
@@ -1294,6 +1475,3 @@ module.exports = {
   exportTimesheetPdf,
   getFileExport,
 };
-
-
-

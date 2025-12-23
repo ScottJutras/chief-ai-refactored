@@ -345,7 +345,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     // Normalize aiErrorHandler pendingCorrection -> pendingExpense
     if (pending?.pendingCorrection && pending?.type === 'expense' && pending?.pendingData) {
       const data = pending.pendingData;
-      await setPendingTransactionState(from, {
+      await mergePendingTransactionState(from, {
         ...pending,
         pendingExpense: data,
         pendingCorrection: false,
@@ -363,7 +363,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         const parsed = parseExpenseMessage(draft) || {};
         const merged = { ...parsed, date: maybeDate };
 
-        await setPendingTransactionState(from, {
+        await mergePendingTransactionState(from, {
           ...pending,
           pendingExpense: merged,
           awaitingExpenseClarification: false
@@ -382,7 +382,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const jobReply = String(input || '').trim();
       const merged = { ...pending.pendingExpense, jobName: jobReply };
 
-      await setPendingTransactionState(from, {
+      await mergePendingTransactionState(from, {
         ...pending,
         pendingExpense: merged,
         awaitingExpenseJob: false
@@ -423,7 +423,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
           // ✅ enforce job (contractor-first)
           if (!jobName) {
-            await setPendingTransactionState(from, {
+            await mergePendingTransactionState(from, {
               ...pending,
               pendingExpense: data,
               awaitingExpenseJob: true,
@@ -476,7 +476,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         }
 
         if (lc === 'edit') {
-          await setPendingTransactionState(from, { ...pending, isEditing: true, type: 'expense' });
+          await mergePendingTransactionState(from, { ...pending, isEditing: true, type: 'expense' });
           reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
           return `<Response><Message>${reply}</Message></Response>`;
         }
@@ -505,7 +505,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      await setPendingTransactionState(from, { pendingDelete: { type: 'expense', ...req.criteria } });
+      await mergePendingTransactionState(from, { pendingDelete: { type: 'expense', ...req.criteria } });
       reply = `Please confirm: Delete expense ${req.criteria.amount} for ${req.criteria.item}? Reply yes/cancel.`;
       return `<Response><Message>${reply}</Message></Response>`;
     }
@@ -528,7 +528,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       // ✅ enforce job (contractor-first)
       if (!jobName) {
-        await setPendingTransactionState(from, {
+        await mergePendingTransactionState(from, {
           pendingExpense: data,
           awaitingExpenseJob: true,
           expenseSourceMsgId: msgId,
@@ -571,7 +571,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     );
 
     if (aiReply) {
-      await setPendingTransactionState(from, {
+      await mergePendingTransactionState(from, {
         pendingExpense: null,
         awaitingExpenseClarification: true,
         expenseClarificationPrompt: aiReply,
@@ -591,7 +591,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       // ✅ enforce job (contractor-first)
       if (!jobName) {
-        await setPendingTransactionState(from, {
+        await mergePendingTransactionState(from, {
           pendingExpense: data,
           awaitingExpenseJob: true,
           expenseSourceMsgId: msgId,
@@ -625,7 +625,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
-      await setPendingTransactionState(from, {
+      await mergePendingTransactionState(from, {
         pendingExpense: data,
         expenseSourceMsgId: msgId,
         type: 'expense'

@@ -1,10 +1,12 @@
 // handlers/commands/revenue.js
+
 const { query } = require('../../services/postgres');
 const {
   getPendingTransactionState,
   setPendingTransactionState,
   deletePendingTransactionState
 } = require('../../utils/stateManager');
+
 const ai = require('../../utils/aiErrorHandler');
 
 // Optional: log once if detectErrors isn't available (we'll fail-open)
@@ -26,6 +28,7 @@ const categorizeEntry =
   (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) ||
   (async () => null); // fail-open
 
+// ---- CIL validator (fail-open) ----
 const cilMod = require('../../cil');
 
 const validateCIL =
@@ -44,9 +47,25 @@ if (!validateCIL) {
   console.warn('[REVENUE] validateCIL not found in ../../cil export; CIL gate will be fail-open until fixed.');
 }
 
+// ---- Media limits (Option A truncation) ----
+const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
+
+function truncateText(str, maxChars) {
+  if (!str) return null;
+  const s = String(str);
+  if (s.length <= maxChars) return s;
+  return s.slice(0, maxChars);
+}
+
 // ---- column presence caches (safe in serverless) ----
 let _hasSourceMsgIdCol = null;
 let _hasAmountCol = null;
+
+// media columns
+let _hasMediaUrlCol = null;
+let _hasMediaTypeCol = null;
+let _hasTranscriptCol = null;
+let _hasTranscriptConfCol = null;
 
 async function hasColumn(table, col) {
   const r = await query(
@@ -75,6 +94,35 @@ async function hasAmountColumn() {
   return _hasAmountCol;
 }
 
+async function hasMediaUrlColumn() {
+  if (_hasMediaUrlCol !== null) return _hasMediaUrlCol;
+  try { _hasMediaUrlCol = await hasColumn('transactions', 'media_url'); }
+  catch { _hasMediaUrlCol = false; }
+  return _hasMediaUrlCol;
+}
+
+async function hasMediaTypeColumn() {
+  if (_hasMediaTypeCol !== null) return _hasMediaTypeCol;
+  try { _hasMediaTypeCol = await hasColumn('transactions', 'media_type'); }
+  catch { _hasMediaTypeCol = false; }
+  return _hasMediaTypeCol;
+}
+
+async function hasTranscriptColumn() {
+  if (_hasTranscriptCol !== null) return _hasTranscriptCol;
+  try { _hasTranscriptCol = await hasColumn('transactions', 'media_transcript'); }
+  catch { _hasTranscriptCol = false; }
+  return _hasTranscriptCol;
+}
+
+async function hasTranscriptConfidenceColumn() {
+  if (_hasTranscriptConfCol !== null) return _hasTranscriptConfCol;
+  try { _hasTranscriptConfCol = await hasColumn('transactions', 'media_confidence'); }
+  catch { _hasTranscriptConfCol = false; }
+  return _hasTranscriptConfCol;
+}
+
+// ---- basic parsing helpers ----
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
   if (!Number.isFinite(n)) return null;
@@ -119,8 +167,6 @@ function parseNaturalDate(s, tz) {
   if (!Number.isNaN(parsed)) return new Date(parsed).toISOString().split('T')[0];
   return null;
 }
-
-// ---------- contractor-first parsing helpers ----------
 
 function normalizeJobAnswer(text) {
   let s = String(text || '').trim();
@@ -236,19 +282,17 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
   return {
-  date,
-  description: 'Payment received',
-  amount,
-  source,
-  jobName
-};
-
+    date,
+    description: 'Payment received',
+    amount,
+    source,
+    jobName
+  };
 }
 
 function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
 
-  // IMPORTANT: legacy schema requires description min(1)
   const description =
     String(data.description || '').trim() && data.description !== 'Unknown'
       ? String(data.description).trim()
@@ -290,7 +334,7 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   }
 }
 
-
+// ✅ Patch B + Option A truncation: saveRevenue accepts mediaMeta and inserts it if DB has columns
 async function saveRevenue({
   ownerId,
   date,
@@ -301,9 +345,9 @@ async function saveRevenue({
   category,
   user,
   sourceMsgId,
-  from
+  from,
+  mediaMeta
 }) {
-  // ✅ PROBE 0: prove we entered saveRevenue + show key inputs
   const ownerParam = String(ownerId || '').trim();
   const msgParam = String(sourceMsgId || '').trim() || null;
 
@@ -313,7 +357,9 @@ async function saveRevenue({
     sourceMsgId: msgParam,
     date,
     amount,
-    jobName
+    jobName,
+    hasMediaMeta: !!mediaMeta,
+    mediaType: mediaMeta?.type || null
   });
 
   const amountCents = toCents(amount);
@@ -322,38 +368,42 @@ async function saveRevenue({
   if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
   if (!Number.isFinite(amountDollars) || amountDollars <= 0) throw new Error('Invalid amount');
 
-  // ✅ PROBE 1: isolate hangs in information_schema checks
   console.info('[REVENUE] saveRevenue pre-hasColumns', { ownerId: ownerParam, sourceMsgId: msgParam });
 
-  const canUseMsgId = await withTimeout(
-    hasSourceMsgIdColumn(),
-    2000,
-    '__HASCOL_TIMEOUT__'
-  );
+  const canUseMsgId = await withTimeout(hasSourceMsgIdColumn(), 2000, '__HASCOL_TIMEOUT__');
   if (canUseMsgId === '__HASCOL_TIMEOUT__') {
     console.error('[REVENUE] hasSourceMsgIdColumn TIMEOUT', { ownerId: ownerParam, sourceMsgId: msgParam });
     throw new Error('DB timeout checking columns (source_msg_id)');
   }
 
-  const canUseAmount = await withTimeout(
-    hasAmountColumn(),
-    2000,
-    '__HASCOL_TIMEOUT__'
-  );
+  const canUseAmount = await withTimeout(hasAmountColumn(), 2000, '__HASCOL_TIMEOUT__');
   if (canUseAmount === '__HASCOL_TIMEOUT__') {
     console.error('[REVENUE] hasAmountColumn TIMEOUT', { ownerId: ownerParam, sourceMsgId: msgParam });
     throw new Error('DB timeout checking columns (amount)');
   }
 
+  // media columns (timeboxed, fail-open)
+  const canUseMediaUrl = await withTimeout(hasMediaUrlColumn(), 2000, false);
+  const canUseMediaType = await withTimeout(hasMediaTypeColumn(), 2000, false);
+  const canUseTranscript = await withTimeout(hasTranscriptColumn(), 2000, false);
+  const canUseConfidence = await withTimeout(hasTranscriptConfidenceColumn(), 2000, false);
+
   console.info('[REVENUE] saveRevenue post-hasColumns', {
     ownerId: ownerParam,
     sourceMsgId: msgParam,
     canUseMsgId,
-    canUseAmount
+    canUseAmount,
+    canUseMediaUrl,
+    canUseMediaType,
+    canUseTranscript,
+    canUseConfidence
   });
 
   const payer = String(source || '').trim() || 'Unknown';
   const job = jobName ? String(jobName).trim() : null;
+
+  // Option A truncation
+  const safeTranscript = truncateText(mediaMeta?.transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
 
   const cols = [
     'owner_id',
@@ -367,7 +417,12 @@ async function saveRevenue({
     'job_name',
     'category',
     'user_name',
-    ...(canUseMsgId ? ['source_msg_id'] : [])
+    ...(canUseMsgId ? ['source_msg_id'] : []),
+
+    ...(canUseMediaUrl ? ['media_url'] : []),
+    ...(canUseMediaType ? ['media_type'] : []),
+    ...(canUseTranscript ? ['media_transcript'] : []),
+    ...(canUseConfidence ? ['media_confidence'] : [])
   ];
 
   const vals = [
@@ -382,7 +437,12 @@ async function saveRevenue({
     job, // job_name mirrors job
     category ? String(category).trim() : null,
     user ? String(user).trim() : null,
-    ...(canUseMsgId ? [msgParam] : [])
+    ...(canUseMsgId ? [msgParam] : []),
+
+    ...(canUseMediaUrl ? [String(mediaMeta?.url || '').trim() || null] : []),
+    ...(canUseMediaType ? [String(mediaMeta?.type || '').trim() || null] : []),
+    ...(canUseTranscript ? [safeTranscript || null] : []),
+    ...(canUseConfidence ? [Number.isFinite(Number(mediaMeta?.confidence)) ? Number(mediaMeta.confidence) : null] : [])
   ];
 
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
@@ -407,6 +467,10 @@ async function saveRevenue({
     sourceMsgId: msgParam,
     canUseMsgId,
     canUseAmount,
+    canUseMediaUrl,
+    canUseMediaType,
+    canUseTranscript,
+    canUseConfidence,
     colsCount: cols.length + 1, // + created_at
     valsCount: vals.length
   };
@@ -414,10 +478,9 @@ async function saveRevenue({
   try {
     console.info('[REVENUE] db insert start', meta);
 
-    // HARD TIMEOUT: prevent Twilio/Vercel hang
     const res = await withTimeout(
       query(sql, vals),
-      4000, // 4s: keep webhook responsive
+      4000,
       '__DB_TIMEOUT__'
     );
 
@@ -442,6 +505,19 @@ async function saveRevenue({
   }
 }
 
+// Helper: clear ONLY media meta after successful write so it doesn't attach to next txn
+async function clearPendingMediaMeta(from, pending) {
+  try {
+    if (!pending) return;
+    if (!pending.pendingMediaMeta && !pending.pendingMedia) return;
+
+    await mergePendingTransactionState(from, {
+      ...(pending || {}),
+      pendingMediaMeta: null,
+      pendingMedia: false
+    });
+  } catch {}
+}
 
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
@@ -468,7 +544,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         const parsed = parseRevenueMessage(draft) || {};
         const merged = { ...parsed, date: maybeDate };
 
-        await setPendingTransactionState(from, {
+        await mergePendingTransactionState(from, {
           ...pending,
           pendingRevenue: merged,
           awaitingRevenueClarification: false
@@ -489,7 +565,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
       const merged = { ...pending.pendingRevenue, jobName: finalJob };
 
-      await setPendingTransactionState(from, {
+      await mergePendingTransactionState(from, {
         ...pending,
         pendingRevenue: merged,
         awaitingRevenueJob: false
@@ -514,112 +590,110 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       const stableMsgId = String(pending.revenueSourceMsgId || safeMsgId).trim(); // always defined
 
       if (lcInput === 'yes') {
-  console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
+        console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
 
-  const data = pending.pendingRevenue || {};
+        const data = pending.pendingRevenue || {};
+        const mediaMeta = pending?.pendingMediaMeta || null;
 
-  // job required (or Overhead)
-  let jobName = (data.jobName && String(data.jobName).trim()) || null;
-  if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
+        // job required (or Overhead)
+        let jobName = (data.jobName && String(data.jobName).trim()) || null;
+        if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-  if (!jobName) {
-    await setPendingTransactionState(from, {
-      ...pending,
-      pendingRevenue: data,
-      awaitingRevenueJob: true,
-      revenueSourceMsgId: stableMsgId,
-      type: 'revenue'
-    });
-    reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
-    return `<Response><Message>${reply}</Message></Response>`;
-  }
+        if (!jobName) {
+          await mergePendingTransactionState(from, {
+            ...pending,
+            pendingRevenue: data,
+            awaitingRevenueJob: true,
+            revenueSourceMsgId: stableMsgId,
+            type: 'revenue'
+          });
+          reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
+          return `<Response><Message>${reply}</Message></Response>`;
+        }
 
-  console.info('[REVENUE] pre-category', { stableMsgId });
+        console.info('[REVENUE] pre-category', { stableMsgId });
 
-  const category =
-    data.suggestedCategory ||
-    (await withTimeout(
-      Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
-      1200,
-      null
-    ));
+        const category =
+          data.suggestedCategory ||
+          (await withTimeout(
+            Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
+            1200,
+            null
+          ));
 
-  console.info('[REVENUE] post-category', { stableMsgId, category });
-  console.info('[REVENUE] pre-insert', { stableMsgId, ownerId, date: data.date, amount: data.amount, jobName });
-  console.info('[REVENUE] pre-gate', { stableMsgId });
+        console.info('[REVENUE] post-category', { stableMsgId, category });
+        console.info('[REVENUE] pre-insert', { stableMsgId, ownerId, date: data.date, amount: data.amount, jobName });
+        console.info('[REVENUE] pre-gate', { stableMsgId });
 
-const gate = assertRevenueCILOrClarify({
-  ownerId,
-  from,
-  userProfile,
-  data,
-  jobName,
-  category,
-  sourceMsgId: stableMsgId
-});
+        const gate = assertRevenueCILOrClarify({
+          ownerId,
+          from,
+          userProfile,
+          data,
+          jobName,
+          category,
+          sourceMsgId: stableMsgId
+        });
 
-console.info('[REVENUE] post-gate', { stableMsgId, ok: gate?.ok });
+        console.info('[REVENUE] post-gate', { stableMsgId, ok: gate?.ok });
 
-if (!gate.ok) {
-  console.warn('[REVENUE] gate FAILED', {
-    stableMsgId,
-    reply: gate.reply
-  });
-  return `<Response><Message>${String(gate.reply || '⚠️ Could not log that payment yet.').slice(0, 1500)}</Message></Response>`;
-}
+        if (!gate.ok) {
+          console.warn('[REVENUE] gate FAILED', { stableMsgId, reply: gate.reply });
+          return `<Response><Message>${String(gate.reply || '⚠️ Could not log that payment yet.').slice(0, 1500)}</Message></Response>`;
+        }
 
+        console.info('[REVENUE] calling saveRevenue', { stableMsgId });
 
-console.info('[REVENUE] calling saveRevenue', { stableMsgId });
-  // ✅ HARD TIMEOUT AROUND THE DB WRITE (prevents “no reply after yes”)
-  const result = await withTimeout(
-    saveRevenue({
-      ownerId,
-      date: data.date || todayInTimeZone(tz),
-      description: data.description,
-      amount: data.amount,
-      source: data.source,
-      jobName,
-      category,
-      user: userProfile?.name || 'Unknown User',
-      sourceMsgId: stableMsgId,
-      from
-    }),
-    4000,
-    '__DB_TIMEOUT__'
-  );
+        const result = await withTimeout(
+          saveRevenue({
+            ownerId,
+            date: data.date || todayInTimeZone(tz),
+            description: data.description,
+            amount: data.amount,
+            source: data.source,
+            jobName,
+            category,
+            user: userProfile?.name || 'Unknown User',
+            sourceMsgId: stableMsgId,
+            from,
+            mediaMeta
+          }),
+          4000,
+          '__DB_TIMEOUT__'
+        );
 
-  if (result === '__DB_TIMEOUT__') {
-    console.error('[REVENUE] db write TIMEOUT', { stableMsgId });
+        if (result === '__DB_TIMEOUT__') {
+          console.error('[REVENUE] db write TIMEOUT', { stableMsgId });
 
-    // IMPORTANT: keep it pending so the user can resend "yes" without losing the draft
-    await setPendingTransactionState(from, {
-      ...pending,
-      pendingRevenue: { ...data, jobName, suggestedCategory: category || data.suggestedCategory },
-      revenueSourceMsgId: stableMsgId,
-      type: 'revenue'
-    });
+          // keep pending so they can resend "yes"
+          await mergePendingTransactionState(from, {
+            ...pending,
+            pendingRevenue: { ...data, jobName, suggestedCategory: category || data.suggestedCategory },
+            revenueSourceMsgId: stableMsgId,
+            type: 'revenue'
+          });
 
-    reply = `⚠️ Saving is taking longer than expected (database slow). Please reply "yes" again in a few seconds.`;
-    return `<Response><Message>${reply}</Message></Response>`;
-  }
+          reply = `⚠️ Saving is taking longer than expected (database slow). Please reply "yes" again in a few seconds.`;
+          return `<Response><Message>${reply}</Message></Response>`;
+        }
 
-  console.info('[REVENUE] post-insert', { stableMsgId, inserted: result?.inserted });
+        console.info('[REVENUE] post-insert', { stableMsgId, inserted: result?.inserted });
 
-  const payerPart =
-    data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+        const payerPart =
+          data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
 
-  reply =
-    result.inserted === false
-      ? '✅ Already logged that payment (duplicate message).'
-      : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+        reply =
+          result.inserted === false
+            ? '✅ Already logged that payment (duplicate message).'
+            : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-  await deletePendingTransactionState(from);
-  return `<Response><Message>${reply}</Message></Response>`;
-}
-
+        // Clear everything (includes media meta)
+        await deletePendingTransactionState(from);
+        return `<Response><Message>${reply}</Message></Response>`;
+      }
 
       if (lcInput === 'edit' || lcInput === 'no') {
-        await setPendingTransactionState(from, {
+        await mergePendingTransactionState(from, {
           ...pending,
           isEditing: true,
           type: 'revenue',
@@ -662,7 +736,8 @@ console.info('[REVENUE] calling saveRevenue', { stableMsgId });
     }
 
     if (aiReply) {
-      await setPendingTransactionState(from, {
+      await mergePendingTransactionState(from, {
+        ...(pending || {}),
         pendingRevenue: null,
         awaitingRevenueClarification: true,
         revenueClarificationPrompt: aiReply,
@@ -679,12 +754,8 @@ console.info('[REVENUE] calling saveRevenue', { stableMsgId });
       // ignore client/source missing errors for contractor revenue
       let errors = null;
       try {
-        // support both detectErrors(data, kind) and detectErrors(kind, data)
         errors = await detectErrors(data, 'revenue');
-        if (errors == null) {
-          // try alternate signature if the implementation expects (kind, data)
-          errors = await detectErrors('revenue', data);
-        }
+        if (errors == null) errors = await detectErrors('revenue', data);
       } catch (e) {
         console.warn('[REVENUE] detectErrors threw; ignoring (fail-open):', e?.message);
         errors = null;
@@ -695,14 +766,13 @@ console.info('[REVENUE] calling saveRevenue', { stableMsgId });
         if (/client:\s*missing|source:\s*missing/i.test(s)) errors = null;
       }
 
-      // TIMEOUT categorization here too (prevents hangs on parse-path)
+      // TIMEOUT categorization here too
       const category =
         (await withTimeout(
           Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
           1200,
           null
-        )) ||
-        null;
+        )) || null;
 
       data.suggestedCategory = category;
 
@@ -711,7 +781,8 @@ console.info('[REVENUE] calling saveRevenue', { stableMsgId });
       if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
       if (!jobName) {
-        await setPendingTransactionState(from, {
+        await mergePendingTransactionState(from, {
+          ...(pending || {}),
           pendingRevenue: data,
           awaitingRevenueJob: true,
           revenueSourceMsgId: safeMsgId,
@@ -728,6 +799,9 @@ console.info('[REVENUE] calling saveRevenue', { stableMsgId });
         });
         if (!gate.ok) return `<Response><Message>${gate.reply}</Message></Response>`;
 
+        // ✅ If audio happened immediately before this message, media meta is sitting in pending
+        const mediaMeta = pending?.pendingMediaMeta || null;
+
         const result = await saveRevenue({
           ownerId,
           date: data.date,
@@ -738,7 +812,8 @@ console.info('[REVENUE] calling saveRevenue', { stableMsgId });
           category,
           user: userProfile?.name || 'Unknown User',
           sourceMsgId: safeMsgId,
-          from
+          from,
+          mediaMeta
         });
 
         const payerPart =
@@ -749,11 +824,15 @@ console.info('[REVENUE] calling saveRevenue', { stableMsgId });
             ? '✅ Already logged that payment (duplicate message).'
             : `✅ Payment logged: ${data.amount}${payerPart} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
+        // ✅ Prevent media meta from attaching to the next transaction
+        await clearPendingMediaMeta(from, pending);
+
         return `<Response><Message>${reply}</Message></Response>`;
       }
 
       // else confirm
-      await setPendingTransactionState(from, {
+      await mergePendingTransactionState(from, {
+        ...(pending || {}),
         pendingRevenue: { ...data, jobName },
         revenueSourceMsgId: safeMsgId,
         type: 'revenue'

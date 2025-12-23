@@ -137,20 +137,34 @@ router.use((req, _res, next) => {
   next();
 });
 
+// ---------- Phase tracker (debug) ----------
+router.use((req, res, next) => {
+  if (!res.locals.phase) res.locals.phase = 'start';
+  res.locals.phaseAt = Date.now();
+  next();
+});
+
 // ---------- 8s Safety Timer ----------
 router.use((req, res, next) => {
   if (res.locals._safety) return next();
   res.locals._safety = setTimeout(() => {
     if (!res.headersSent) {
-      console.warn('[WEBHOOK] 8s safety reply');
+      console.warn('[WEBHOOK] 8s safety reply', {
+        phase: res.locals.phase,
+        msInPhase: Date.now() - (res.locals.phaseAt || Date.now()),
+        from: req.from,
+        messageSid: req.body?.MessageSid || req.body?.SmsMessageSid
+      });
       ok(res, 'OK');
     }
   }, 8000);
+
   const clear = () => clearTimeout(res.locals._safety);
   res.on('finish', clear);
   res.on('close', clear);
   next();
 });
+
 
 // ---------- Quick version check ----------
 router.post('*', (req, res, next) => {
@@ -162,17 +176,23 @@ router.post('*', (req, res, next) => {
   next();
 });
 
-// ---------- Light middlewares (lazy import; never hard-fail) ----------
 router.use((req, res, next) => {
   try {
     const token = require('../middleware/token');
     const prof  = require('../middleware/userProfile');
     const lock  = require('../middleware/lock');
-    token.tokenMiddleware(req, res, () =>
-      prof.userProfileMiddleware(req, res, () =>
-        lock.lockMiddleware(req, res, next)
-      )
-    );
+
+    res.locals.phase = 'token'; res.locals.phaseAt = Date.now();
+    token.tokenMiddleware(req, res, () => {
+      res.locals.phase = 'userProfile'; res.locals.phaseAt = Date.now();
+      prof.userProfileMiddleware(req, res, () => {
+        res.locals.phase = 'lock'; res.locals.phaseAt = Date.now();
+        lock.lockMiddleware(req, res, () => {
+          res.locals.phase = 'router'; res.locals.phaseAt = Date.now();
+          next();
+        });
+      });
+    });
   } catch (e) {
     console.warn('[WEBHOOK] light middlewares skipped:', e?.message);
     next();
@@ -209,8 +229,34 @@ router.post('*', async (req, res, next) => {
       return res.status(200).type('application/xml; charset=utf-8').send(result);
     }
 
-    if (result && typeof result === 'object' && result.transcript) {
+        if (result && typeof result === 'object' && result.transcript) {
+      // 1) turn audio into normal text input
       req.body.Body = result.transcript;
+
+      // 2) persist traceability for later save (Option 2)
+      try {
+        const sm = require('../utils/stateManager');
+        const pending = await sm.getPendingTransactionState(req.from);
+
+        const mediaMeta = {
+          url,
+          type,
+          // prefer Twilio's message sid for the media message (not the follow-up "yes")
+          messageSid: String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null,
+          confidence: result.confidence ?? null,
+          transcript: result.transcript
+        };
+
+        await sm.setPendingTransactionState(req.from, {
+          ...(pending || {}),
+          pendingMediaMeta: mediaMeta,
+          // optional: mark that media was just ingested (handy for debugging)
+          pendingMedia: true
+        });
+      } catch (e) {
+        console.warn('[MEDIA] could not persist pendingMediaMeta:', e?.message);
+      }
+
       return next();
     }
 
@@ -363,8 +409,8 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // -----------------------------------------------------------------------
-    // (B) FAST PATHS — REVENUE/EXPENSE TWI ML HANDLERS
+   // -----------------------------------------------------------------------
+// (B) FAST PATHS — REVENUE/EXPENSE TWI ML HANDLERS
 // -----------------------------------------------------------------------
 const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc);
 if (looksRevenue) {
@@ -374,30 +420,28 @@ if (looksRevenue) {
     const timeoutMs = 8000;
     const timeoutTwiml = `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please reply "yes" again in a few seconds.</Message></Response>`;
 
+    let timeoutId = null;
+
+    const timeoutPromise = new Promise(resolve => {
+      timeoutId = setTimeout(() => {
+        console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
+        resolve(timeoutTwiml);
+      }, timeoutMs);
+    });
+
     const twiml = await Promise.race([
-      handleRevenue(
-        req.from,
-        text,
-        req.userProfile,
-        req.ownerId,
-        req.ownerProfile,
-        req.isOwner,
-        messageSid
-      ),
-      new Promise(resolve =>
-        setTimeout(() => {
-          console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
-          resolve(timeoutTwiml);
-        }, timeoutMs)
-      )
-    ]);
+      handleRevenue(req.from, text, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+      timeoutPromise
+    ]).finally(() => {
+      if (timeoutId) clearTimeout(timeoutId);
+    });
 
     return res.status(200).type('application/xml; charset=utf-8').send(twiml);
   } catch (e) {
     console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-    // fall through
   }
 }
+
 
     const looksExpense = /^(?:expense|exp)\b/.test(lc);
     if (looksExpense) {

@@ -2,34 +2,26 @@
 const axios = require('axios');
 const { parseMediaText } = require('../services/mediaParser');
 const { extractTextFromImage } = require('../utils/visionService');
-
-// ✅ Backwards-compatible transcription import (fixes: "transcribeAudio is not a function")
-const tsMod = require('../utils/transcriptionService');
-const transcribeAudio =
-  (tsMod && typeof tsMod.transcribeAudio === 'function' && tsMod.transcribeAudio) ||
-  (tsMod && typeof tsMod.transcribe === 'function' && tsMod.transcribe) ||
-  (typeof tsMod === 'function' && tsMod) ||
-  null;
-
-if (!transcribeAudio) {
-  console.warn('[MEDIA] transcriptionService export missing: expected transcribeAudio()', {
-    type: typeof tsMod,
-    keys: Object.keys(tsMod || {})
-  });
-}
+const transcriptionMod = require('../utils/transcriptionService');
+const { handleTimeclock } = require('./commands/timeclock');
 
 const {
   getActiveJob,
   generateTimesheet,
 } = require('../services/postgres');
 
-const { handleTimeclock } = require('./commands/timeclock');
+const state = require('../utils/stateManager');
+const getPendingTransactionState = state.getPendingTransactionState;
+const deletePendingTransactionState = state.deletePendingTransactionState;
 
-const {
-  getPendingTransactionState,
-  mergePendingTransactionState,
-  deletePendingTransactionState
-} = require('../utils/stateManager');
+// Prefer mergePendingTransactionState; fall back to setPendingTransactionState
+const mergePendingTransactionState =
+  state.mergePendingTransactionState ||
+  (async (userId, patch) => state.setPendingTransactionState(userId, patch));
+
+const transcribeAudio =
+  (transcriptionMod && typeof transcriptionMod.transcribeAudio === 'function' && transcriptionMod.transcribeAudio) ||
+  (typeof transcriptionMod === 'function' ? transcriptionMod : null);
 
 /* ---------------- helpers ---------------- */
 
@@ -124,14 +116,11 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   return payload;
 }
 
-// Normalize media content-type (strip params like "; codecs=opus")
 function normalizeContentType(mediaType) {
   return String(mediaType || '').split(';')[0].trim().toLowerCase();
 }
 
-// Try to interpret transcribeAudio return values tolerantly:
-// - string
-// - { transcript } / { text } / { confidence }
+// handle string OR { transcript/text/confidence }
 function normalizeTranscriptionResult(res) {
   if (!res) return { transcript: '', confidence: null };
   if (typeof res === 'string') return { transcript: res, confidence: null };
@@ -143,22 +132,19 @@ function normalizeTranscriptionResult(res) {
   return { transcript: '', confidence: null };
 }
 
-// Store media meta into pending state so revenue/expense handlers can persist it later.
-// This is fail-open and never blocks the user flow.
-async function attachPendingMediaMeta(from, pending, meta) {
+async function attachPendingMediaMeta(from, meta) {
   try {
     const url = String(meta?.url || '').trim() || null;
     const type = String(meta?.type || '').trim() || null;
     const transcript = truncateText(meta?.transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
     const confidence = Number.isFinite(Number(meta?.confidence)) ? Number(meta.confidence) : null;
 
-    // Nothing useful to store
     if (!url && !type && !transcript && confidence == null) return;
 
+    const pending = await getPendingTransactionState(from);
     await mergePendingTransactionState(from, {
       ...(pending || {}),
-      pendingMediaMeta: { url, type, transcript, confidence },
-      // pendingMedia stays as-is; caller decides its lifecycle
+      pendingMediaMeta: { url, type, transcript, confidence }
     });
   } catch (e) {
     console.warn('[MEDIA] attachPendingMediaMeta failed (ignored):', e?.message);
@@ -172,29 +158,20 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
   try {
     console.log(`[MEDIA] incoming`, { from, mediaType, hasUrl: !!mediaUrl, inputLen: (input || '').length });
 
-    const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    // ✅ FIX 1: handle TEXT-ONLY follow-ups BEFORE media-type validation
+    // If user replies "yes/edit/cancel" to an expense/revenue confirmation, we want webhook routing
+    // to send this to expense.js/revenue.js (not treat as "media").
+    if (!mediaUrl) {
+      const pendingState = await getPendingTransactionState(from);
+      const pendingType = pendingState?.pendingMedia?.type || pendingState?.type || null;
 
-    // Normalized allow-list for audio (params like "; codecs=opus" are stripped below)
-    const validAudioTypes = new Set([
-      'audio/mpeg',
-      'audio/mp3',
-      'audio/wav',
-      'audio/vnd.wave',
-      'audio/ogg',
-      'audio/webm',
-      'audio/mp4',
-      'audio/x-m4a',
-      'audio/aac',
-      'audio/3gpp',
-      'audio/3gpp2',
-      'audio/basic',
-      'audio/l24',
-      'audio/vnd.rn-realaudio',
-      'audio/ac3',
-      'audio/amr-nb',
-      'audio/amr',
-      'audio/opus',
-    ]);
+      if (pendingType === 'expense' || pendingType === 'revenue') {
+        // Let webhook.js treat this as a normal text message.
+        return { transcript: String(input || '').trim(), twiml: null };
+      }
+    }
+
+    const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
 
     const baseType = normalizeContentType(mediaType);
     console.log('[MEDIA] normalized content-type', { original: mediaType, baseType });
@@ -203,32 +180,26 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
     // Be resilient: accept any audio/*
     const isAudioFamily = baseType.startsWith('audio/');
-    const isWhitelistedAudio = validAudioTypes.has(baseType);
     const isSupportedAudio = isAudioFamily;
 
-    if (!isSupportedImage && !isSupportedAudio) {
+    // ✅ If it’s NOT media (no mediaUrl) and not a pending finance confirm, treat as plain text route.
+    if (!mediaUrl && !isSupportedImage && !isSupportedAudio) {
+      return { transcript: String(input || '').trim(), twiml: null };
+    }
+
+    if (mediaUrl && !isSupportedImage && !isSupportedAudio) {
       reply = `⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio/voice note.`;
       return twiml(reply);
     }
-    if (isAudioFamily && !isWhitelistedAudio) {
-      console.warn('[MEDIA] audio/* accepted but not on allow-list', { baseType });
-    }
 
-    /* ---------- Pending confirmation (text-only replies) ----------
-       IMPORTANT:
-       - For expense/revenue confirmation we want webhook.js to route into expense.js/revenue.js.
-       - So when pendingMedia exists and this is a text-only reply (no mediaUrl),
-         we return { transcript: input } and let the main router handle it.
-    */
+    /* ---------- Pending confirmation for NON-finance flows only ---------- */
     {
       const pendingState = await getPendingTransactionState(from);
 
-      // Only if we were expecting media follow-up and we got text-only
       if (pendingState?.pendingMedia && !mediaUrl) {
         const pendingType = pendingState?.pendingMedia?.type || null;
 
-        // If it’s finance confirmations, DO NOT handle here.
-        // Let webhook → expense/revenue handler process "yes/edit/cancel".
+        // Finance confirmations are handled by webhook → expense/revenue
         if (pendingType === 'expense' || pendingType === 'revenue') {
           return { transcript: String(input || '').trim(), twiml: null };
         }
@@ -301,8 +272,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
           }
 
           return twiml(`⚠️ Reply 'yes', 'no', or 'edit' to confirm or cancel.`);
-        } else if (pendingType == null && !mediaUrl) {
-          return twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`);
         }
       }
     }
@@ -310,10 +279,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     /* ---------- Build text from media ---------- */
     let extractedText = String(input || '').trim();
 
-    // Normalize once
     const normType = normalizeContentType(mediaType);
 
-    // We’ll collect mediaMeta for auditability + DB persistence
     let mediaMeta = {
       url: mediaUrl || null,
       type: normType || null,
@@ -323,8 +290,9 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
     // AUDIO
     if (isAudioFamily) {
-      if (!transcribeAudio) {
-        return twiml(`⚠️ Audio transcription isn’t configured yet (server). Please text the details for now.`);
+      if (typeof transcribeAudio !== 'function') {
+        console.error('[MEDIA] transcribeAudio is not a function (check utils/transcriptionService exports)');
+        return twiml(`⚠️ Voice transcription isn’t available right now. Please type the details like "received $500 for <job> today".`);
       }
 
       const urlLen = (mediaUrl || '').length;
@@ -334,20 +302,18 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       let confidence = null;
 
       try {
-        // Twilio media requires Basic Auth
         const resp = await axios.get(mediaUrl, {
           responseType: 'arraybuffer',
           auth: {
             username: process.env.TWILIO_ACCOUNT_SID,
             password: process.env.TWILIO_AUTH_TOKEN
           },
-          maxContentLength: 8 * 1024 * 1024, // 8MB cap
+          maxContentLength: 8 * 1024 * 1024,
         });
 
         const audioBuf = Buffer.from(resp.data);
         console.log('[MEDIA] audio bytes', audioBuf?.length || 0, 'mime', mediaType, 'norm', normType, 'baseType', baseType);
 
-        // Attempt 1: normalized mime
         const r1 = await transcribeAudio(audioBuf, normType, 'both');
         const n1 = normalizeTranscriptionResult(r1);
         transcript = n1.transcript;
@@ -355,7 +321,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
         console.log('[MEDIA] transcript bytes', transcript ? transcript.length : 0);
 
-        // Fallback: OGG/Opus sometimes needs a different label
         if (!transcript && normType === 'audio/ogg') {
           try {
             console.log('[MEDIA] retry transcription with fallback mime: audio/webm');
@@ -376,48 +341,39 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       if (!transcript) {
         return twiml(
-          `⚠️ I couldn’t understand the audio. Try again, or text me the details like "received $100 for 1556 Medway Park Dr today".`
+          `⚠️ I couldn’t understand the audio. Try again, or text me the details like "received $500 for 1556 Medway Park Dr today".`
         );
       }
 
-      // Store transcript in meta (truncated)
       mediaMeta.transcript = truncateText(transcript.trim(), MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
 
-      // Decide whether to pass transcript into the main webhook pipeline
       const lc = transcript.toLowerCase();
       const looksHours   = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
       const looksExpense = /\b(expense|receipt|spent|cost)\b/.test(lc);
       const looksRevenue = /\b(revenue|payment|paid|deposit|sale|received)\b/.test(lc);
       const timeclockIntent = inferIntentFromText(transcript);
 
-      // If it smells like finance/timeclock/hours, fall through and attach meta to pending state
       if (timeclockIntent || looksHours || looksExpense || looksRevenue) {
-        // Attach meta now so revenue/expense can persist it after parse/confirm
-        const pending = await getPendingTransactionState(from);
-        await attachPendingMediaMeta(from, pending, mediaMeta);
-
+        // attach meta for the finance/time flows
+        await attachPendingMediaMeta(from, mediaMeta);
         extractedText = transcript.trim();
       } else {
-        // Voice task / general: DO NOT attach mediaMeta (prevents mis-attachment to next transaction)
+        // task/general: let webhook handle
         return { transcript: transcript.trim(), twiml: null };
       }
     }
 
     // IMAGE
     if (isSupportedImage) {
-      // NOTE: ensure extractTextFromImage fetches Twilio media with Basic Auth as well
       const { text } = await extractTextFromImage(mediaUrl);
       console.log('[MEDIA] OCR text length', (text || '').length);
       extractedText = (text || extractedText || '').trim();
 
-      // Store OCR text as transcript for auditability
       mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = null;
 
-      // Attach meta now (images are overwhelmingly finance receipts / audit-relevant)
-      const pending = await getPendingTransactionState(from);
-      await attachPendingMediaMeta(from, pending, mediaMeta);
+      await attachPendingMediaMeta(from, mediaMeta);
     }
 
     if (!extractedText) {
@@ -482,8 +438,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       if (inferred === 'punch_out'   && type === 'punch_in')   type = 'punch_out';
       if (inferred === 'break_start' && type === 'break_end')  type = 'break_start';
       if (inferred === 'break_end'   && type === 'break_start')type = 'break_end';
-      if (inferred === 'drive_start' && type === 'drive_end')  type = 'drive_start';
-      if (inferred === 'drive_end'   && type === 'drive_start')type = 'drive_end';
 
       let hasName = !!(employeeName && String(employeeName).trim());
       if (!hasName) {
@@ -499,7 +453,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       let normalized;
       if (hasName) {
-        const who = employeeName || userProfile?.name || 'Unknown';
+        const who = employeeName || userProfile.name || 'Unknown';
         if (type === 'punch_in')          normalized = `${who} punched in${timeSuffix}`;
         else if (type === 'punch_out')    normalized = `${who} punched out${timeSuffix}`;
         else if (type === 'break_start')  normalized = `start break for ${who}${timeSuffix}`;
@@ -537,13 +491,11 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(reply);
     }
 
-    // EXPENSE (parsed from media)
+    // EXPENSE parsed from media → confirm via expense.js
     if (result.type === 'expense') {
       const { item, amount, store, date, category, jobName } = result.data;
 
-      // Ensure pendingMedia exists so webhook can route text-only follow-ups.
       const pending = await getPendingTransactionState(from);
-
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingMedia: { type: 'expense' },
@@ -556,12 +508,11 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(reply);
     }
 
-    // REVENUE (parsed from media)
+    // REVENUE parsed from media → confirm via revenue.js
     if (result.type === 'revenue') {
       const { description, amount, source, date, category, jobName } = result.data;
 
       const pending = await getPendingTransactionState(from);
-
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingMedia: { type: 'revenue' },
@@ -576,11 +527,13 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
     // Fallback
     reply = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
-    const pending = await getPendingTransactionState(from);
-    await mergePendingTransactionState(from, {
-      ...(pending || {}),
-      pendingMedia: { url: mediaUrl, type: null }
-    });
+    {
+      const pending = await getPendingTransactionState(from);
+      await mergePendingTransactionState(from, {
+        ...(pending || {}),
+        pendingMedia: { url: mediaUrl, type: null }
+      });
+    }
     return twiml(reply);
 
   } catch (error) {

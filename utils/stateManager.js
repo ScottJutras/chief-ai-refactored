@@ -41,7 +41,11 @@ function mergeState(prev, patch) {
   ];
 
   for (const k of nestedKeys) {
-    if (a[k] && b[k] && typeof a[k] === 'object' && typeof b[k] === 'object' && !Array.isArray(a[k]) && !Array.isArray(b[k])) {
+    if (
+      a[k] && b[k] &&
+      typeof a[k] === 'object' && typeof b[k] === 'object' &&
+      !Array.isArray(a[k]) && !Array.isArray(b[k])
+    ) {
       out[k] = { ...a[k], ...b[k] };
     }
   }
@@ -59,10 +63,14 @@ async function getPendingTransactionState(userId) {
  * setPendingTransactionState(userId, state, options?)
  *
  * Backwards-compatible:
- * - default behavior is FULL REPLACE (same as your current implementation)
+ * - default behavior is FULL REPLACE (same as legacy)
  *
  * New behavior:
  * - pass { merge: true } to merge into existing state rather than overwrite it.
+ *
+ * Notes:
+ * - We always normalize the key for storage.
+ * - Merge path reads existing state and merges in JS (simple + predictable).
  */
 async function setPendingTransactionState(userId, state, options = null) {
   const normalizedId = normalizePhoneNumber(userId);
@@ -82,7 +90,7 @@ async function setPendingTransactionState(userId, state, options = null) {
     return;
   }
 
-  // Merge path: read existing state and merge in JS (simple + predictable)
+  // Merge path: read existing state (with normalized user id)
   const prev = await getPendingTransactionState(normalizedId);
   const merged = mergeState(prev, state);
 
@@ -99,7 +107,9 @@ async function setPendingTransactionState(userId, state, options = null) {
 }
 
 /**
- * Merge a patch into state (recommended for “surgical” updates).
+ * mergePendingTransactionState(userId, patch)
+ *
+ * Recommended API for "surgical" state updates (prevents wiping other keys).
  */
 async function mergePendingTransactionState(userId, patch) {
   return setPendingTransactionState(userId, patch, { merge: true });
@@ -115,7 +125,8 @@ async function clearUserState(userId) {
 }
 
 /**
- * Optional helper: clears pendingMediaMeta without wiping the rest of the state.
+ * clearPendingMediaMeta(userId)
+ * Clears only pendingMediaMeta without wiping the rest of the state.
  */
 async function clearPendingMediaMeta(userId) {
   const normalizedId = normalizePhoneNumber(userId);
@@ -124,16 +135,37 @@ async function clearPendingMediaMeta(userId) {
   if (!obj || typeof obj !== 'object') return;
 
   obj.pendingMediaMeta = null;
-  // also common: pendingMedia sometimes used as a “waiting” flag
-  // leave pendingMedia alone unless you explicitly want it cleared elsewhere
+
+  // Keep legacy semantics: full replace with the edited object
+  await setPendingTransactionState(normalizedId, obj);
+}
+
+/**
+ * Optional: clear a subset of keys (handy for "cleanup after success").
+ * Example: clearStateKeys(from, ['pendingMedia','pendingExpense','pendingMediaMeta'])
+ */
+async function clearStateKeys(userId, keys = []) {
+  const normalizedId = normalizePhoneNumber(userId);
+  const prev = await getPendingTransactionState(normalizedId);
+  const obj = safeObject(prev) || {};
+  if (!obj || typeof obj !== 'object') return;
+
+  for (const k of keys) obj[k] = null;
+
   await setPendingTransactionState(normalizedId, obj);
 }
 
 module.exports = {
+  normalizePhoneNumber, // exported for convenience + reuse
+  safeObject,
+  mergeState,
+
   getPendingTransactionState,
   setPendingTransactionState,
   mergePendingTransactionState,
   deletePendingTransactionState,
   clearUserState,
+
   clearPendingMediaMeta,
+  clearStateKeys,
 };

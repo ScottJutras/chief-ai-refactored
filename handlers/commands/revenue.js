@@ -178,13 +178,14 @@ function normalizeDecisionToken(input) {
 /* ---------------- helpers ---------------- */
 
 function toCents(amountStr) {
-  const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
+  // now supports commas: "$8,436.10"
+  const n = Number(String(amountStr || '').replace(/[^0-9.,]/g, '').replace(/,/g, ''));
   if (!Number.isFinite(n)) return null;
   return Math.round(n * 100);
 }
 
 function toNumberAmount(amountStr) {
-  const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
+  const n = Number(String(amountStr || '').replace(/[^0-9.,]/g, '').replace(/,/g, ''));
   if (!Number.isFinite(n)) return null;
   return n;
 }
@@ -248,6 +249,29 @@ async function withTimeout(promise, ms, fallbackValue = null) {
   ]);
 }
 
+function normalizeRevenueData(data, tz) {
+  const d = { ...(data || {}) };
+
+  // amount normalization (force $X.XX)
+  if (d.amount != null) {
+    const n = toNumberAmount(d.amount);
+    if (Number.isFinite(n) && n > 0) d.amount = `$${n.toFixed(2)}`;
+  }
+
+  d.date = String(d.date || '').trim() || todayInTimeZone(tz);
+  d.description = String(d.description || '').trim() || 'Revenue received';
+
+  const src = String(d.source || '').trim();
+  d.source = src || 'Unknown';
+
+  if (d.jobName != null) {
+    const j = String(d.jobName).trim();
+    d.jobName = j || null;
+  }
+
+  return d;
+}
+
 function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
 
@@ -287,30 +311,43 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
       name: e?.name,
       details: e?.errors || e?.issues || e?.cause || null
     });
-    return { ok: false, reply: `⚠️ Couldn't log that Revenue log yet. Try: "received 2500 for <job> today".` };
+    return { ok: false, reply: `⚠️ Couldn't log that Revenue yet. Try: "received $2500 for <job> today".` };
   }
 }
 
 /**
- * Deterministic parse (FIXED for voice transcripts with addresses + $ amounts)
+ * Deterministic parse (VOICE FIX):
+ * - supports $8,436
+ * - prefers $ amounts over bare numbers
+ * - avoids grabbing address number as amount
  */
 async function deterministicRevenueParse({ input, tz }) {
   const raw = String(input || '').trim();
 
-  // amount: prefer $ amounts (with commas) and choose LAST $ amount; fallback to first bare number
-  const dollarMatches = [...raw.matchAll(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/g)];
-  let amountNum = null;
+  // 1) collect all $ amounts (with commas)
+  const dollarMatches = [...raw.matchAll(/\$\s*([0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?|[0-9]+(?:\.\d{1,2})?)/g)];
+  let amountVal = null;
 
   if (dollarMatches.length) {
-    amountNum = dollarMatches[dollarMatches.length - 1][1];
+    // choose the largest $ amount (safer than "last" in long transcripts)
+    let best = null;
+    for (const m of dollarMatches) {
+      const v = Number(String(m[1]).replace(/,/g, ''));
+      if (!Number.isFinite(v)) continue;
+      if (best == null || v > best) best = v;
+    }
+    amountVal = best;
   } else {
-    const bare = raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
-    if (bare) amountNum = bare[1];
+    // 2) fallback: only accept bare number if "dollars/bucks" nearby
+    const nearMoney = raw.match(/\b([0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\b\s*(?:dollars|bucks)\b/i);
+    if (nearMoney?.[1]) {
+      const v = Number(String(nearMoney[1]).replace(/,/g, ''));
+      if (Number.isFinite(v)) amountVal = v;
+    }
   }
 
-  if (!amountNum) return null;
+  if (!Number.isFinite(amountVal) || amountVal <= 0) return null;
 
-  const amountVal = Number(String(amountNum).replace(/,/g, ''));
   const amount = `$${amountVal.toFixed(2)}`;
 
   // date
@@ -331,9 +368,7 @@ async function deterministicRevenueParse({ input, tz }) {
   if (forMatch?.[1]) {
     const candidate = normalizeJobAnswer(forMatch[1]);
     // If candidate is basically a dollar amount, ignore it as "job"
-    if (!/^\$?\s*\d[\d,]*(?:\.\d{1,2})?$/.test(candidate)) {
-      jobName = candidate;
-    }
+    if (!/^\$?\s*\d[\d,]*(?:\.\d{1,2})?$/.test(candidate)) jobName = candidate;
   }
 
   if (!jobName) {
@@ -361,13 +396,13 @@ async function deterministicRevenueParse({ input, tz }) {
 
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-  return {
+  return normalizeRevenueData({
     date,
     description: 'Revenue received',
     amount,
     source,
     jobName
-  };
+  }, tz);
 }
 
 /**
@@ -455,7 +490,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       if (maybeDate) {
         const draft = pending.revenueDraftText || '';
         const parsed = parseRevenueMessage(draft) || {};
-        const merged = { ...parsed, date: maybeDate };
+        const backstop = await deterministicRevenueParse({ input: draft, tz }) || {};
+        const merged = normalizeRevenueData({ ...backstop, ...parsed, date: maybeDate }, tz);
 
         await mergePendingTransactionState(from, {
           ...pending,
@@ -478,7 +514,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       const jobReply = normalizeJobAnswer(input);
       const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : jobReply;
 
-      const merged = { ...pending.pendingRevenue, jobName: finalJob };
+      const merged = normalizeRevenueData({ ...pending.pendingRevenue, jobName: finalJob }, tz);
 
       await mergePendingTransactionState(from, {
         ...pending,
@@ -506,8 +542,10 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       if (token === 'yes') {
         console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
 
-        const data = pending.pendingRevenue || {};
         const pendingMediaMeta = pending?.pendingMediaMeta || null;
+
+        // normalize before using
+        const data = normalizeRevenueData(pending.pendingRevenue || {}, tz);
 
         let jobName = (data.jobName && String(data.jobName).trim()) || null;
         if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
@@ -623,6 +661,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       });
       data = aiRes?.data || null;
       aiReply = aiRes?.reply || null;
+      if (data) data = normalizeRevenueData(data, tz);
     }
 
     if (aiReply) {

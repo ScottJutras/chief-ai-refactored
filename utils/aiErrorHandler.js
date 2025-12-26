@@ -165,6 +165,15 @@ Rules:
   return null;
 }
 
+function stripUndefined(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
+
 /**
  * Main ingestion helper:
  * - Try regex parseFn first
@@ -191,22 +200,23 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}) {
 
   // 2b) Apply default fields if missing (non-destructive)
   if (defaultData && typeof defaultData === 'object') {
-    data = { ...defaultData, ...data };
+    data = { ...defaultData, ...stripUndefined(data) };
+  } else {
+    data = stripUndefined(data);
   }
 
   // 3) Detect structural errors (missing fields etc.)
   let errors = null;
   try {
     errors = await detectErrorsImpl(data, type);
-    // ✅ contractor-first: revenue payer/client is optional
-if (type === 'revenue' && errors) {
-  const s = JSON.stringify(errors);
-  if (/client|payer|source/i.test(s) && /missing/i.test(s)) {
-    // remove client/source missing complaints from blocking revenue ingestion
-    errors = null;
-  }
-}
 
+    // ✅ contractor-first: revenue payer/client is optional
+    if (type === 'revenue' && errors) {
+      const s = JSON.stringify(errors);
+      if (/client|payer|source/i.test(s) && /missing/i.test(s)) {
+        errors = null;
+      }
+    }
   } catch (e) {
     console.warn(`[WARN] detectErrors failed for ${type}:`, e?.message);
     errors = null;
@@ -263,47 +273,62 @@ async function categorizeEntry(type, data, userProfile, categories) {
   return require('../services/openAI').categorizeEntry(type, data, userProfile, categories);
 }
 
+/* ---------------- Deterministic parsers ---------------- */
+
+function toMoneyNumber(val) {
+  if (val == null) return null;
+  const n = Number(String(val).replace(/[^0-9.,]/g, '').replace(/,/g, ''));
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function formatMoney(n) {
+  const v = toMoneyNumber(n);
+  if (!Number.isFinite(v)) return null;
+  return `$${v.toFixed(2)}`;
+}
+
+function looksLikeAddress(str) {
+  const t = String(str || '').trim();
+  if (!t) return false;
+  if (!/\d/.test(t)) return false;
+  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pkwy|park)\b/i.test(t);
+}
+
 /**
- * Deterministic parsers (keep these simple; they feed the CIL gate)
+ * Extract a likely $ amount from free text:
+ * - prefers explicit $ amounts
+ * - supports commas ($8,436.10)
+ * - avoids grabbing address numbers
  */
-function parseExpenseMessage(input) {
-  const match = input.match(/^(?:expense\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:from|at)\s+(.+))?$/i);
-  if (!match) return null;
-  return {
-    date: new Date().toISOString().split('T')[0],
-    item: match[2].trim(),
-    amount: `$${parseFloat(match[1]).toFixed(2)}`,
-    store: match[3]?.trim() || 'Unknown Store'
-  };
+function extractDollarAmount(text) {
+  const s = String(text || '');
+
+  // all $ amounts
+  const dollarMatches = [...s.matchAll(/\$\s*([0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?|[0-9]+(?:\.\d{1,2})?)/g)];
+  if (dollarMatches.length) {
+    // pick largest $ amount (safer for long transcripts)
+    let best = null;
+    for (const m of dollarMatches) {
+      const v = toMoneyNumber(m[1]);
+      if (!Number.isFinite(v)) continue;
+      if (best == null || v > best) best = v;
+    }
+    return best;
+  }
+
+  // fallback: "489 dollars/bucks"
+  const nearMoney = s.match(/\b([0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\b\s*(?:dollars|bucks)\b/i);
+  if (nearMoney?.[1]) return toMoneyNumber(nearMoney[1]);
+
+  return null;
 }
 
-function parseBillMessage(input) {
-  const match = input.match(
-    /^bill\s+(.+?)\s+\$?(\d+(?:\.\d{1,2})?)(?:\s+(yearly|monthly|weekly|bi-weekly|one-time))?(?:\s+due\s+(.+))?$/i
-  );
-  if (!match) return null;
-
-  const dueRaw = match[4];
-  const dueIso = dueRaw ? parseNaturalDate(dueRaw) : null;
-
-  return {
-    date: dueIso || new Date().toISOString().split('T')[0],
-    billName: match[1].trim(),
-    amount: `$${parseFloat(match[2]).toFixed(2)}`,
-    recurrence: match[3]?.toLowerCase() || 'one-time'
-  };
-}
-
-function stripDateTail(raw = '') {
-  // Pull a trailing date-ish token off the end, if present.
-  // Examples:
-  //   "... today"
-  //   "... on today"
-  //   "... 2025-12-12"
-  //   "... on 2025-12-12"
-  //   "... Dec 12, 2025"
-  // NOTE: timezone cannot be applied here unless you pass tz through;
-  // follow-up handling in revenue.js should do tz-aware resolution.
+/**
+ * stripDateTail(raw, tz?)
+ * Pull a trailing date-ish token off the end, if present.
+ */
+function stripDateTail(raw = '', tz) {
   const s = String(raw).trim();
 
   // ISO at end, optionally preceded by "on"
@@ -315,17 +340,127 @@ function stripDateTail(raw = '') {
   // today/yesterday/tomorrow at end, optionally preceded by "on"
   const mWord = s.match(/\s+(?:on\s+)?(?<date>today|yesterday|tomorrow)\s*$/i);
   if (mWord?.groups?.date) {
-    return { rest: s.slice(0, mWord.index).trim(), date: parseNaturalDate(mWord.groups.date) };
+    return { rest: s.slice(0, mWord.index).trim(), date: parseNaturalDate(mWord.groups.date, tz) };
   }
 
   // Try natural language date at the end (best-effort)
   const mTail = s.match(/\s+(?:on\s+)?(?<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s*$/);
   if (mTail?.groups?.date) {
-    const d = parseNaturalDate(mTail.groups.date);
+    const d = parseNaturalDate(mTail.groups.date, tz);
     if (d) return { rest: s.slice(0, mTail.index).trim(), date: d };
   }
 
   return { rest: s, date: null };
+}
+
+/**
+ * parseExpenseMessage(input)
+ * Supports both:
+ * - "expense 84.12 nails from Home Depot"
+ * - "I bought $489.78 worth of Lumber from Home Depot today for 1556 Medway Park Dr"
+ */
+function parseExpenseMessage(input) {
+  const text = String(input || '').trim();
+  if (!text) return null;
+
+  // 1) tz-aware date tail peel is not possible here unless caller passes tz;
+  //    so we do best-effort with server timezone.
+  //    (Expense handler can still override date later.)
+  const { rest, date } = stripDateTail(text);
+  const d = date || new Date().toISOString().split('T')[0];
+
+  // 2) amount
+  const amountNum = extractDollarAmount(rest);
+  if (!Number.isFinite(amountNum) || amountNum <= 0) {
+    // fallback to strict "expense 84.12 ..."
+    const strict = rest.match(/^(?:expense|exp)\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:from|at)\s+(.+))?$/i);
+    if (!strict) return null;
+    return stripUndefined({
+      date: d,
+      item: strict[2]?.trim() || 'Unknown',
+      amount: formatMoney(strict[1]) || '$0.00',
+      store: strict[3]?.trim() || 'Unknown Store'
+    });
+  }
+
+  // 3) store/vendor: "from X" or "at X"
+  // capture "from Home Depot" / "at Home Depot"
+  let store = null;
+  let base = rest;
+
+  const storeMatch = base.match(/\b(?:from|at)\s+([^,]+?)(?=(\s+\b(for|on|today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$))/i);
+  if (storeMatch?.[1]) {
+    store = storeMatch[1].trim();
+    // remove that segment from base to make item extraction cleaner
+    base = base.replace(storeMatch[0], ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  // 4) job hint: trailing "for <something>" where it looks like an address/job token
+  // NOTE: expense.js may still ask job; this helps auto-fill.
+  let jobName = null;
+  const jobMatch = base.match(/\bfor\s+(.+)\s*$/i);
+  if (jobMatch?.[1]) {
+    const candidate = jobMatch[1].trim();
+    if (looksLikeAddress(candidate) || /\bjob\b/i.test(candidate)) {
+      jobName = candidate.replace(/^job\s*[:\-]?\s*/i, '').trim();
+      base = base.slice(0, jobMatch.index).trim();
+    }
+  }
+
+  // 5) item/memo:
+  // Try "worth of Lumber" or "for Lumber"
+  let item = null;
+
+  const worth = base.match(/\bworth\s+of\s+(.+?)\b/i);
+  if (worth?.[1]) item = worth[1].trim();
+
+  if (!item) {
+    // "bought $X lumber" / "paid $X for lumber"
+    // remove common verbs, keep remainder after amount
+    // remove $ amount token(s)
+    let cleaned = base.replace(/\$\s*[0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?/g, ' ');
+    cleaned = cleaned.replace(/\b(i\s+)?(bought|buy|purchased|purchase|spent|spend|paid|pay|picked\s*up|got|ordered|charge|charged)\b/ig, ' ');
+    cleaned = cleaned.replace(/\b(worth\s+of)\b/ig, ' ');
+    cleaned = cleaned.replace(/\s+/g, ' ').trim();
+
+    // also strip leading "expense"/"exp"
+    cleaned = cleaned.replace(/^(expense|exp)\b\s*/i, '').trim();
+
+    // if still contains "for ..." and we didn't treat it as job, use it as item
+    const forItem = cleaned.match(/\bfor\s+(.+)\s*$/i);
+    if (forItem?.[1] && !jobName) {
+      item = forItem[1].trim();
+    } else {
+      item = cleaned;
+    }
+  }
+
+  if (!item) item = 'Unknown';
+
+  return stripUndefined({
+    date: d,
+    item,
+    amount: formatMoney(amountNum) || '$0.00',
+    store: store || 'Unknown Store',
+    jobName: jobName || undefined
+  });
+}
+
+function parseBillMessage(input) {
+  const match = input.match(
+    /^bill\s+(.+?)\s+\$?(\d+(?:\.\d{1,2})?)(?:\s+(yearly|monthly|weekly|bi-weekly|one-time))?(?:\s+due\s+(.+))?$/i
+  );
+  if (!match) return null;
+
+  const dueRaw = match[4];
+  const dueIso = dueRaw ? parseNaturalDate(dueRaw) : null;
+
+  return stripUndefined({
+    date: dueIso || new Date().toISOString().split('T')[0],
+    billName: match[1].trim(),
+    amount: `$${parseFloat(match[2]).toFixed(2)}`,
+    recurrence: match[3]?.toLowerCase() || 'one-time'
+  });
 }
 
 function parseRevenueMessage(input) {
@@ -364,34 +499,34 @@ function parseRevenueMessage(input) {
     // If "for ..." treat as job
     if (kw === 'for') {
       const jobName = normalizeJobPrefix(src);
-      return {
+      return stripUndefined({
         date: d,
         description: `Payment for ${jobName}`,
         amount: asAmount(m.groups.amt),
         source: 'Unknown',
         jobName
-      };
+      });
     }
 
     // If "from job ..." treat as job; otherwise treat as payer
     const srcLc = src.toLowerCase();
     if (srcLc.startsWith('job ') || srcLc.startsWith('jobname ') || srcLc.startsWith('job:')) {
       const jobName = normalizeJobPrefix(src.replace(/^jobname\b/i, 'job'));
-      return {
+      return stripUndefined({
         date: d,
         description: `Payment for ${jobName}`,
         amount: asAmount(m.groups.amt),
         source: 'Unknown',
         jobName
-      };
+      });
     }
 
-    return {
+    return stripUndefined({
       date: d,
       description: `Payment from ${src}`,
       amount: asAmount(m.groups.amt),
       source: src
-    };
+    });
   }
 
   // Pattern B: "from X $100" OR "for X $100"
@@ -402,33 +537,33 @@ function parseRevenueMessage(input) {
 
     if (kw === 'for') {
       const jobName = normalizeJobPrefix(src);
-      return {
+      return stripUndefined({
         date: d,
         description: `Payment for ${jobName}`,
         amount: asAmount(m.groups.amt),
         source: 'Unknown',
         jobName
-      };
+      });
     }
 
     const srcLc = src.toLowerCase();
     if (srcLc.startsWith('job ') || srcLc.startsWith('jobname ') || srcLc.startsWith('job:')) {
       const jobName = normalizeJobPrefix(src.replace(/^jobname\b/i, 'job'));
-      return {
+      return stripUndefined({
         date: d,
         description: `Payment for ${jobName}`,
         amount: asAmount(m.groups.amt),
         source: 'Unknown',
         jobName
-      };
+      });
     }
 
-    return {
+    return stripUndefined({
       date: d,
       description: `Payment from ${src}`,
       amount: asAmount(m.groups.amt),
       source: src
-    };
+    });
   }
 
   return null;
@@ -437,18 +572,18 @@ function parseRevenueMessage(input) {
 function parseQuoteMessage(input) {
   const match = input.match(/^quote\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:to|for)\s+(.+))?$/i);
   if (!match) return null;
-  return {
+  return stripUndefined({
     amount: parseFloat(match[1]),
     description: match[2].trim(),
     client: match[3]?.trim() || 'Unknown',
     jobName: match[2].trim()
-  };
+  });
 }
 
 function parseJobMessage(input) {
   const match = input.match(/^(start job|create job|new job|add job)\s+(.+)/i);
   if (!match) return null;
-  return { jobName: match[2].trim() };
+  return stripUndefined({ jobName: match[2].trim() });
 }
 
 module.exports = {
@@ -457,7 +592,7 @@ module.exports = {
   correctErrorsWithAI,
   categorizeEntry,
 
-  // ✅ add this line
+  // keep compat
   detectErrors: detectErrorsImpl,
 
   // date utils
@@ -472,4 +607,3 @@ module.exports = {
   parseQuoteMessage,
   parseJobMessage,
 };
-

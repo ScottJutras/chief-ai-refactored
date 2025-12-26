@@ -6,14 +6,11 @@ const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
 
 const {
-  // NOTE: getActiveJob is legacy-stubbed in your postgres.js export and can throw.
-  // We intentionally do NOT import or use it here.
   generateTimesheet,
 } = require('../services/postgres');
 
 const state = require('../utils/stateManager');
 const getPendingTransactionState = state.getPendingTransactionState;
-const deletePendingTransactionState = state.deletePendingTransactionState;
 
 // Prefer mergePendingTransactionState; fall back to setPendingTransactionState (older builds)
 const mergePendingTransactionState =
@@ -79,61 +76,95 @@ function inferIntentFromText(s = '') {
   return null;
 }
 
+// COMMA-SAFE $ amount
+const MONEY_RE_GLOBAL = /\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/g;
+function lastMoneyNumber(text) {
+  const s = String(text || '');
+  const matches = [...s.matchAll(MONEY_RE_GLOBAL)];
+  if (!matches.length) return null;
+  const raw = matches[matches.length - 1][1];
+  const n = Number(String(raw).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
 function normalizeExpenseFromTranscript(t) {
   const s = String(t || '').trim();
+  if (!s) return null;
 
-  // Try to grab amount
-  const mAmt = s.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/i) || s.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
-  if (!mAmt) return null;
+  // Prefer $ amounts with commas; choose LAST
+  let amtNum = lastMoneyNumber(s);
+  if (amtNum == null) {
+    const m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:dollars|bucks)\b/i);
+    if (m?.[1]) {
+      const n = Number(String(m[1]).replace(/,/g, ''));
+      if (Number.isFinite(n)) amtNum = n;
+    }
+  }
+  if (amtNum == null || amtNum <= 0) return null;
 
-  const amt = mAmt[1];
+  // store: "at X" OR "from X"
   let store = null;
-  let item = null;
-
-  // store: "at Home Depot" OR "from Home Depot"
-  const mStore = s.match(/\b(?:at|from)\s+([A-Za-z0-9&.'\- ]{2,60})(?:\s+on|\s+for|\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
+  const mStore = s.match(/\b(?:at|from)\s+(.+?)(?:\s+\b(on\s+)?(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i);
   if (mStore?.[1]) store = mStore[1].trim();
 
-  // item: "on lumber" or "for lumber"
-  const mItem = s.match(/\b(?:on|for)\s+(.+?)(?:\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
-  if (mItem?.[1]) item = mItem[1].trim();
+  // item: prefer "worth of X"
+  let item = null;
+  const mWorth = s.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i);
+  if (mWorth?.[1]) item = mWorth[1].trim();
+
+  // job: "for job X" OR "for X"
+  let job = null;
+  const mJob = s.match(/\bfor\s+(?:job\s+)?(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+  if (mJob?.[1]) job = mJob[1].trim();
 
   let dateToken = '';
   if (/\btoday\b/i.test(s)) dateToken = ' today';
   else if (/\byesterday\b/i.test(s)) dateToken = ' yesterday';
+  else if (/\btomorrow\b/i.test(s)) dateToken = ' tomorrow';
 
-  const safeItem = item || 'items';
+  const safeItem = item || 'purchase';
   const safeStore = store || 'Unknown Store';
 
-  // Your expense.js deterministic regex: "expense 452 nails from Home Depot"
-  return `expense ${amt} ${safeItem} from ${safeStore}${dateToken}`;
+  // IMPORTANT: include "for <job>" if present so expense.js picks it up
+  const jobPart = job ? ` for ${job}` : '';
+
+  return `expense ${amtNum.toFixed(2)} ${safeItem} from ${safeStore}${dateToken}${jobPart}`.trim();
 }
 
 function normalizeRevenueFromTranscript(t) {
   const s = String(t || '').trim();
-  const mAmt = s.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/i) || s.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
-  if (!mAmt) return null;
-  const amt = mAmt[1];
+  if (!s) return null;
+
+  let amtNum = lastMoneyNumber(s);
+  if (amtNum == null) {
+    const m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:dollars|bucks)\b/i);
+    if (m?.[1]) {
+      const n = Number(String(m[1]).replace(/,/g, ''));
+      if (Number.isFinite(n)) amtNum = n;
+    }
+  }
+  if (amtNum == null || amtNum <= 0) return null;
 
   // job-ish token: for/on/job <...> OR from job <...>
   let job = null;
 
-  // prefer "for/on"
-  const mJob = s.match(/\b(?:for|on|job)\s+(.+?)(?:\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
+  // prefer "for/on/job"
+  const mJob = s.match(/\b(?:for|on|job)\s+(.+?)(?:\s+today|\s+yesterday|\s+tomorrow|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
   if (mJob?.[1]) job = mJob[1].trim();
 
   // handle "from job 1556 ..."
   if (!job) {
-    const mFromJob = s.match(/\bfrom\s+job\s+(.+?)(?:\s+today|\s+yesterday|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
+    const mFromJob = s.match(/\bfrom\s+job\s+(.+?)(?:\s+today|\s+yesterday|\s+tomorrow|\s+\d{4}-\d{2}-\d{2}|[.?!]|$)/i);
     if (mFromJob?.[1]) job = mFromJob[1].trim();
   }
 
   let dateToken = '';
   if (/\btoday\b/i.test(s)) dateToken = ' today';
   else if (/\byesterday\b/i.test(s)) dateToken = ' yesterday';
+  else if (/\btomorrow\b/i.test(s)) dateToken = ' tomorrow';
 
-  if (!job) return `received $${amt}${dateToken}`;
-  return `received $${amt} for ${job}${dateToken}`;
+  if (!job) return `received $${amtNum.toFixed(2)}${dateToken}`.trim();
+  return `received $${amtNum.toFixed(2)} for ${job}${dateToken}`.trim();
 }
 
 function truncateText(str, maxChars) {
@@ -238,7 +269,6 @@ async function maybePassThroughFinanceTextOnly(from, input) {
 
   const pendingState = await getPendingTransactionState(from);
 
-  // pendingMedia can be boolean OR object in different builds. Be defensive.
   const pendingMedia = pendingState?.pendingMedia;
   const pendingMediaType =
     (pendingMedia && typeof pendingMedia === 'object' ? pendingMedia.type : null) ||
@@ -263,12 +293,11 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       const pass = await maybePassThroughFinanceTextOnly(from, input);
       if (pass) return pass;
 
-      // If it's text-only but not a finance confirm, treat it as plain text
-      // so webhook/router can handle it normally.
+      // text-only: let webhook/router handle it
       return { transcript: String(input || '').trim(), twiml: null };
     }
 
-    // From here: we DO have mediaUrl, so validate media types
+    // From here: we DO have mediaUrl
     const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
 
     const baseType = normalizeContentType(mediaType);
@@ -293,7 +322,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     let extractedText = String(input || '').trim();
     const normType = normalizeContentType(mediaType);
 
-    let mediaMeta = {
+    const mediaMeta = {
       url: mediaUrl || null,
       type: normType || null,
       transcript: null,
@@ -333,7 +362,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
         console.log('[MEDIA] transcript bytes', transcript ? transcript.length : 0);
 
-        // OGG/Opus sometimes needs a different label for some engines
         if (!transcript && normType === 'audio/ogg') {
           try {
             console.log('[MEDIA] retry transcription with fallback mime: audio/webm');
@@ -362,7 +390,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
 
       const lc = transcript.toLowerCase();
-      const looksHours   = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
+      const looksHours = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
       const looksExpense = /\b(expense|receipt|spent|cost|paid|bought|purchase|purchased)\b/.test(lc);
       const looksRevenue = /\b(revenue|payment|paid|deposit|sale|received|got paid)\b/.test(lc);
       const timeclockIntent = inferIntentFromText(transcript);
@@ -372,7 +400,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         await attachPendingMediaMeta(from, mediaMeta);
         extractedText = transcript.trim();
       } else {
-        // Otherwise, treat as normal voice message (not finance)
+        // Otherwise, treat as normal voice message
         return { transcript: transcript.trim(), twiml: null };
       }
     }
@@ -403,10 +431,9 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     /* ---------- Parse ---------- */
     console.log('[MEDIA] parseMediaText()', { excerpt: (extractedText || '').slice(0, 80) });
 
-    // ✅ parseMediaText now returns {type:'unknown'} instead of throwing (new drop-in mediaParser)
     const result = await parseMediaText(extractedText);
 
-    // If parser returned unknown, try a last-mile normalize into a command (helps older flows)
+    // If parser returned unknown, normalize into a clean command and let webhook route it.
     if (!result || result.type === 'unknown') {
       const lc = String(extractedText || '').toLowerCase();
       const looksExpense = /\b(expense|receipt|spent|cost|paid|bought|purchase|purchased)\b/.test(lc);
@@ -414,11 +441,17 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       if (looksExpense) {
         const norm = normalizeExpenseFromTranscript(extractedText);
-        if (norm) return { transcript: norm, twiml: null };
+        if (norm) {
+          console.info('[MEDIA] normalized voice→expense command', { from, norm: norm.slice(0, 140) });
+          return { transcript: norm, twiml: null };
+        }
       }
       if (looksRevenue) {
         const norm = normalizeRevenueFromTranscript(extractedText);
-        if (norm) return { transcript: norm, twiml: null };
+        if (norm) {
+          console.info('[MEDIA] normalized voice→revenue command', { from, norm: norm.slice(0, 140) });
+          return { transcript: norm, twiml: null };
+        }
       }
 
       const msg = `I couldn’t read that. Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
@@ -461,10 +494,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       let { employeeName, type, timestamp } = result.data;
 
       const inferred = inferIntentFromText(extractedText);
-      if (inferred === 'punch_in'    && type === 'punch_out')  type = 'punch_in';
-      if (inferred === 'punch_out'   && type === 'punch_in')   type = 'punch_out';
-      if (inferred === 'break_start' && type === 'break_end')  type = 'break_start';
-      if (inferred === 'break_end'   && type === 'break_start')type = 'break_end';
+      if (inferred === 'punch_in' && type === 'punch_out') type = 'punch_in';
+      if (inferred === 'punch_out' && type === 'punch_in') type = 'punch_out';
+      if (inferred === 'break_start' && type === 'break_end') type = 'break_start';
+      if (inferred === 'break_end' && type === 'break_start') type = 'break_end';
 
       let hasName = !!(employeeName && String(employeeName).trim());
       if (!hasName) {
@@ -481,13 +514,13 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       let normalized;
       if (hasName) {
         const who = employeeName || userProfile.name || 'Unknown';
-        if (type === 'punch_in')          normalized = `${who} punched in${timeSuffix}`;
-        else if (type === 'punch_out')    normalized = `${who} punched out${timeSuffix}`;
-        else if (type === 'break_start')  normalized = `start break for ${who}${timeSuffix}`;
-        else if (type === 'break_end')    normalized = `end break for ${who}${timeSuffix}`;
-        else if (type === 'drive_start')  normalized = `start drive for ${who}${timeSuffix}`;
-        else if (type === 'drive_end')    normalized = `end drive for ${who}${timeSuffix}`;
-        else                              normalized = `${who} punched in${timeSuffix}`;
+        if (type === 'punch_in') normalized = `${who} punched in${timeSuffix}`;
+        else if (type === 'punch_out') normalized = `${who} punched out${timeSuffix}`;
+        else if (type === 'break_start') normalized = `start break for ${who}${timeSuffix}`;
+        else if (type === 'break_end') normalized = `end break for ${who}${timeSuffix}`;
+        else if (type === 'drive_start') normalized = `start drive for ${who}${timeSuffix}`;
+        else if (type === 'drive_end') normalized = `end drive for ${who}${timeSuffix}`;
+        else normalized = `${who} punched in${timeSuffix}`;
       } else {
         normalized = extractedText;
       }
@@ -517,37 +550,55 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return twiml(reply);
     }
 
-    // EXPENSE parsed from media → confirm via expense.js
+    // EXPENSE parsed from media → prefer letting webhook route transcript
+    // BUT keep old path if parseMediaText can reliably return structured expense
     if (result.type === 'expense') {
-      const { item, amount, store, date, category, jobName } = result.data;
+      const { item, amount, store, date, category, jobName } = result.data || {};
+
+      // Ensure amount is comma-safe numeric
+      const amtNum = lastMoneyNumber(String(amount || '')) ?? lastMoneyNumber(extractedText);
+      const amtStr = Number.isFinite(amtNum) ? `$${amtNum.toFixed(2)}` : String(amount || '').trim();
 
       const pending = await getPendingTransactionState(from);
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingMedia: { type: 'expense' },
-        pendingExpense: { item, amount, store, date, category, jobName },
+        pendingExpense: {
+          item: item || 'Unknown',
+          amount: amtStr || '$0.00',
+          store: store || 'Unknown Store',
+          date: date || null,
+          category: category || null,
+          jobName: jobName || null
+        },
         type: 'expense',
-
-        // ✅ stable id for idempotency across confirm flow
         expenseSourceMsgId: stableMediaMsgId
       });
 
-      reply = `Please confirm: Log expense ${amount} for ${item}${store ? ` from ${store}` : ''} on ${date}${jobName ? ` for ${jobName}` : ''}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
+      reply = `Please confirm: Log expense ${amtStr || '$0.00'} for ${item || 'Unknown'}${store ? ` from ${store}` : ''}${date ? ` on ${date}` : ''}${jobName ? ` for ${jobName}` : ''}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
       return twiml(reply);
     }
 
     // REVENUE parsed from media → confirm via revenue.js
     if (result.type === 'revenue') {
-      const { description, amount, source, date, category, jobName } = result.data;
+      const { description, amount, source, date, category, jobName } = result.data || {};
+
+      const amtNum = lastMoneyNumber(String(amount || '')) ?? lastMoneyNumber(extractedText);
+      const amtStr = Number.isFinite(amtNum) ? `$${amtNum.toFixed(2)}` : String(amount || '').trim();
 
       const pending = await getPendingTransactionState(from);
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingMedia: { type: 'revenue' },
-        pendingRevenue: { description, amount, source, date, category, jobName },
+        pendingRevenue: {
+          description: description || 'Revenue received',
+          amount: amtStr || '$0.00',
+          source: source || 'Unknown',
+          date: date || null,
+          category: category || null,
+          jobName: jobName || null
+        },
         type: 'revenue',
-
-        // ✅ stable id for idempotency across confirm flow
         revenueSourceMsgId: stableMediaMsgId
       });
 
@@ -555,7 +606,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         ? ` from ${source}`
         : '';
 
-      reply = `Please confirm: Payment ${amount}${srcPart} on ${date}${jobName ? ` for ${jobName}` : ''}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
+      reply = `Please confirm: Payment ${amtStr || '$0.00'}${srcPart}${date ? ` on ${date}` : ''}${jobName ? ` for ${jobName}` : ''}${category ? ` (Category: ${category})` : ''}. Reply yes/edit/cancel.`;
       return twiml(reply);
     }
 

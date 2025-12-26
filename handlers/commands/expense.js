@@ -23,7 +23,7 @@ const todayInTimeZone =
 
 const parseNaturalDateTz =
   (typeof ai.parseNaturalDate === 'function' && ai.parseNaturalDate) ||
-  ((s) => {
+  ((s, tz) => {
     const t = String(s || '').trim().toLowerCase();
     const today = new Date().toISOString().split('T')[0];
     if (!t || t === 'today') return today;
@@ -187,9 +187,21 @@ function truncateText(str, maxChars) {
   return s.slice(0, maxChars);
 }
 
+// ---- money helpers (COMMA-SAFE) ----
+const MONEY_RE_GLOBAL = /\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/g;
+
+function lastMoneyNumber(text) {
+  const s = String(text || '');
+  const matches = [...s.matchAll(MONEY_RE_GLOBAL)];
+  if (!matches.length) return null;
+  const raw = matches[matches.length - 1][1];
+  const n = Number(String(raw).replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
 // ---- basic parsing helpers ----
 function toCents(amountStr) {
-  const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
+  const n = Number(String(amountStr || '').replace(/[^0-9.,]/g, '').replace(/,/g, ''));
   if (!Number.isFinite(n)) return null;
   return Math.round(n * 100);
 }
@@ -209,11 +221,6 @@ function normalizeJobAnswer(text) {
   s = s.replace(/^(create|new)\s+job\s+/i, '');
   s = s.replace(/[?]+$/g, '').trim();
   return s;
-}
-
-function safeDateForUser(userProfile) {
-  const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
-  return todayInTimeZone(tz);
 }
 
 /**
@@ -266,21 +273,25 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
 
 /**
  * Deterministic NL expense parse (backstop)
- * Handles: "I bought $489.78 worth of Lumber from Home Depot today for 1556 Medway Park Dr"
+ * Handles: "I bought $3,427.87 worth of bricks from Convoy Supply today for job 1556 Medway Park Dr"
  */
 function deterministicExpenseParse(input, userProfile) {
   const raw = String(input || '').trim();
   if (!raw) return null;
 
-  // amount: allow commas
-  const money =
-    raw.match(/\$\s*([0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?)/) ||
-    raw.match(/\b([0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\s*(?:dollars|bucks)\b/i);
-
-  if (!money?.[1]) return null;
-
-  const amtNum = Number(String(money[1]).replace(/,/g, ''));
-  if (!Number.isFinite(amtNum) || amtNum <= 0) return null;
+  // amount: allow commas and choose LAST $ amount if multiple
+  let amtNum = lastMoneyNumber(raw);
+  if (amtNum == null) {
+    // "3427 dollars" / "3,427.87 dollars"
+    const m =
+      raw.match(/\b([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:dollars|bucks)\b/i) ||
+      raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\s*(?:dollars|bucks)\b/i);
+    if (m?.[1]) {
+      const n = Number(String(m[1]).replace(/,/g, ''));
+      if (Number.isFinite(n)) amtNum = n;
+    }
+  }
+  if (amtNum == null || amtNum <= 0) return null;
 
   const amount = `$${amtNum.toFixed(2)}`;
 
@@ -296,19 +307,24 @@ function deterministicExpenseParse(input, userProfile) {
   }
   if (!date) date = todayInTimeZone(tz);
 
-  // vendor/store: prefer "from X" or "at X"
+  // vendor/store: "from X" or "at X"
   let store = null;
   const fromMatch = raw.match(/\b(?:from|at)\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|$)/i);
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
-  // item: "worth of X" or "bought ... X"
+  // item: "worth of X" OR "bought X from ..."
   let item = null;
-  const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\bfrom\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|$)/i);
+  const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|$)/i);
   if (worthOf?.[1]) item = String(worthOf[1]).trim();
 
-  // jobName: "for <job>" at end
+  if (!item) {
+    const bought = raw.match(/\b(?:bought|buy|purchased|purchase|picked\s*up|got)\b\s+(.+?)(?:\s+\b(from|at)\b|\s+\bworth\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|$)/i);
+    if (bought?.[1]) item = String(bought[1]).trim();
+  }
+
+  // jobName: allow "for job X" OR "for X"
   let jobName = null;
-  const forMatch = raw.match(/\bfor\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
+  const forMatch = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
   if (forMatch?.[1]) jobName = String(forMatch[1]).trim();
 
   return {
@@ -366,9 +382,8 @@ function inferExpenseCategoryHeuristic(data) {
 
 /**
  * Build two possible CIL shapes:
- * 1) "LogExpense" style (common in your new flows)
- * 2) Legacy "expense" style (your current one)
- * Validate-first → fallback.
+ * 1) "LogExpense" style
+ * 2) Legacy "expense" style
  */
 function buildExpenseCIL_LogExpense({ from, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
@@ -655,7 +670,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return twimlText(reply);
     }
 
-    // DIRECT PARSE PATH (simple formats)
+    // DIRECT PARSE PATH (simple formats) — COMMA-SAFE amount
     const m = String(input || '').match(/^(?:expense\s+|exp\s+)?\$?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
     if (m) {
       const [, amountRaw, item, store] = m;
@@ -703,7 +718,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
-    // NL BACKSTOP FIRST (so your exact sentence works even if AI parser is flaky)
+    // NL BACKSTOP FIRST
     const backstop = deterministicExpenseParse(input, userProfile);
     if (backstop && backstop.amount) {
       const data = normalizeExpenseData(backstop, userProfile);
@@ -735,12 +750,12 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
-    // AI PATH (only ask follow-ups if we truly lack core fields)
+    // AI PATH
     const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData);
     let data = aiRes?.data || null;
     let aiReply = aiRes?.reply || null;
 
-    // If AI is asking for "category", ignore that — we infer category ourselves
+    // Ignore category ask — we infer it
     if (aiReply && /\bcategory\b/i.test(aiReply)) {
       aiReply = null;
     }
@@ -756,12 +771,11 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       !data.store ||
       data.store === 'Unknown Store';
 
-    // If AI wants clarification AND core missing: store draft & ask
     if (aiReply && missingCore) {
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingExpense: null,
-        awaitingExpenseClarification: true, // DATE follow-up only (your expense.js is date-only flow)
+        awaitingExpenseClarification: true,
         expenseClarificationPrompt: aiReply,
         expenseDraftText: input,
         expenseSourceMsgId: safeMsgId,
@@ -770,7 +784,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return twimlText(aiReply);
     }
 
-    // If we have usable data: suggest category and go to confirm
     if (data && data.amount && data.amount !== '$0.00') {
       const category =
         (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) ||

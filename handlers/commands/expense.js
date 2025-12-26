@@ -606,9 +606,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         }
 
         reply =
-          writeResult?.inserted === false
-            ? '✅ Already logged that expense (duplicate message).'
-            : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+  writeResult?.inserted === false
+    ? '✅ Already logged that expense (duplicate message).'
+    : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}${category ? ` (Category: ${category})` : ''}`;
+
 
         await deletePendingTransactionState(from);
         return twimlText(reply);

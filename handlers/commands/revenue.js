@@ -15,11 +15,6 @@ const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
-// ✅ NEW: prefer clearFinanceFlow (does not wipe unrelated state), fallback to delete
-const clearFinanceFlow =
-  (typeof state.clearFinanceFlow === 'function' && state.clearFinanceFlow) ||
-  (async (userId) => deletePendingTransactionState(userId));
-
 const ai = require('../../utils/aiErrorHandler');
 
 // Optional: log once if detectErrors isn't available (we'll fail-open)
@@ -58,6 +53,70 @@ console.info('[REVENUE] cil export keys', {
 
 if (!validateCIL) {
   console.warn('[REVENUE] validateCIL not found in ../../cil export; CIL gate will be fail-open until fixed.');
+}
+
+/* ---------------- Twilio Content Template (Quick Reply Buttons) ---------------- */
+
+// Put the SID in Vercel env vars. This handler tries a few common names.
+// Recommended: TWILIO_REVENUE_CONFIRM_TEMPLATE_SID=HX...
+function getRevenueConfirmTemplateSid() {
+  return (
+    process.env.TWILIO_REVENUE_CONFIRM_TEMPLATE_SID ||
+    process.env.REVENUE_CONFIRM_TEMPLATE_SID ||
+    process.env.TWILIO_TEMPLATE_REVENUE_CONFIRM_SID ||
+    null
+  );
+}
+
+function xmlEsc(s = '') {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function twimlText(msg) {
+  return `<Response><Message>${xmlEsc(msg)}</Message></Response>`;
+}
+
+// Twilio Content Template TwiML:
+// <Message>
+//   <Content sid="HX...">
+//     <Parameter name="1">...</Parameter>
+//   </Content>
+// </Message>
+function twimlConfirmRevenue(summaryLine) {
+  const sid = getRevenueConfirmTemplateSid();
+  if (!sid) {
+    // fallback (still works)
+    return twimlText(`Please confirm this Revenue:\n${summaryLine}\n\nReply yes/edit/cancel.`);
+  }
+
+  return (
+    `<Response><Message>` +
+      `<Content sid="${xmlEsc(sid)}">` +
+        `<Parameter name="1">${xmlEsc(summaryLine)}</Parameter>` +
+      `</Content>` +
+    `</Message></Response>`
+  );
+}
+
+function normalizeDecisionToken(input) {
+  const s = String(input || '').trim().toLowerCase();
+
+  // button text often arrives as "Yes"/"Edit"/"Cancel"
+  if (s === 'yes' || s === 'y') return 'yes';
+  if (s === 'edit') return 'edit';
+  if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
+
+  // sometimes payload-like values leak into Body
+  if (/\byes\b/.test(s) && s.length <= 12) return 'yes';
+  if (/\bedit\b/.test(s) && s.length <= 12) return 'edit';
+  if (/\bcancel\b/.test(s) && s.length <= 12) return 'cancel';
+
+  return s;
 }
 
 /* ---------------- helpers ---------------- */
@@ -177,11 +236,18 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 }
 
 /**
- * Deterministic parse
+ * Deterministic parse:
+ * - amount: $100 or 100
+ * - date: today/yesterday/tomorrow/YYYY-MM-DD
+ * - job: "for <job>" OR "on <job>" OR "job <job>" OR address-like token after "from" if it looks like job/address
+ * - payer optional: only if it DOESN’T look like address/job
+ *
+ * NOTE: "from <job>" is common; we'll treat address-like from as job.
  */
 async function deterministicRevenueParse({ ownerId, input, tz }) {
   const raw = String(input || '').trim();
 
+  // amount
   const amtMatch =
     raw.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/) ||
     raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
@@ -191,6 +257,7 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
   const amountNum = amtMatch[1];
   const amount = `$${Number(amountNum).toFixed(2)}`;
 
+  // date
   let date = null;
   if (/\btoday\b/i.test(raw)) date = parseNaturalDate('today', tz);
   else if (/\byesterday\b/i.test(raw)) date = parseNaturalDate('yesterday', tz);
@@ -201,6 +268,7 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
   }
   if (!date) date = todayInTimeZone(tz);
 
+  // job patterns
   let jobName = null;
 
   const forMatch = raw.match(/\bfor\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
@@ -216,6 +284,7 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
     if (jobMatch?.[1]) jobName = normalizeJobAnswer(jobMatch[1]);
   }
 
+  // "from X" might be job/address or payer
   let source = 'Unknown';
   const fromMatch = raw.match(/\bfrom\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
   if (fromMatch?.[1]) {
@@ -224,10 +293,11 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
       jobName = jobName || token;
       source = 'Unknown';
     } else {
-      source = token;
+      source = token; // payer
     }
   }
 
+  // overhead normalization
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
   return {
@@ -240,7 +310,7 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
 }
 
 /**
- * Canonical insert
+ * Canonical insert: delegates to services/postgres.insertTransaction()
  */
 async function writeRevenueViaCanonicalInsert({
   ownerId,
@@ -283,7 +353,7 @@ async function writeRevenueViaCanonicalInsert({
     date: String(data.date || '').trim() || todayInTimeZone(tz),
     description: String(data.description || 'Payment received').trim() || 'Payment received',
     amount_cents: amountCents,
-    amount: toNumberAmount(data.amount),
+    amount: toNumberAmount(data.amount), // optional numeric (schema-aware in insertTransaction)
     source: (data.source && data.source !== 'Unknown') ? String(data.source).trim() : 'Unknown',
     job: jobName ? String(jobName).trim() : null,
     job_name: jobName ? String(jobName).trim() : null,
@@ -309,6 +379,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
     let pending = await getPendingTransactionState(from);
 
+    // If user previously hit "edit", treat this message as brand new revenue command.
     if (pending?.isEditing && pending?.type === 'revenue') {
       await deletePendingTransactionState(from);
       pending = null;
@@ -329,12 +400,14 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           awaitingRevenueClarification: false
         });
 
-        reply = `Please confirm: Payment ${merged.amount} on ${merged.date}. Reply yes/edit/cancel.`;
-        return `<Response><Message>${reply}</Message></Response>`;
+        const payerPart =
+          merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
+        const summaryLine = `You received ${merged.amount}${payerPart} on ${merged.date}${merged.jobName ? ` for ${merged.jobName}` : ''}.`;
+        return twimlConfirmRevenue(summaryLine);
       }
 
       reply = `What date was this payment? (e.g., 2025-12-12 or "today")`;
-      return `<Response><Message>${reply}</Message></Response>`;
+      return twimlText(reply);
     }
 
     // Follow-up: ask for job
@@ -352,28 +425,28 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
       const payerPart =
         merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
-
-      reply = `Please confirm: Payment ${merged.amount}${payerPart} on ${merged.date} for ${merged.jobName}. Reply yes/edit/cancel.`;
-      return `<Response><Message>${reply}</Message></Response>`;
+      const summaryLine = `You received ${merged.amount}${payerPart} on ${merged.date} for ${merged.jobName}.`;
+      return twimlConfirmRevenue(summaryLine);
     }
 
     // --- CONFIRM FLOW ---
     if (pending?.pendingRevenue) {
       if (!isOwner) {
-        await clearFinanceFlow(from);
+        await deletePendingTransactionState(from);
         reply = '⚠️ Only the owner can manage revenue.';
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
-      const lcInput = String(input || '').toLowerCase().trim();
+      const token = normalizeDecisionToken(input);
       const stableMsgId = String(pending.revenueSourceMsgId || safeMsgId).trim();
 
-      if (lcInput === 'yes') {
+      if (token === 'yes') {
         console.info('[REVENUE] confirm YES', { from, ownerId, stableMsgId });
 
         const data = pending.pendingRevenue || {};
         const pendingMediaMeta = pending?.pendingMediaMeta || null;
 
+        // job required (or Overhead)
         let jobName = (data.jobName && String(data.jobName).trim()) || null;
         if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
@@ -386,7 +459,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
             type: 'revenue'
           });
           reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
-          return `<Response><Message>${reply}</Message></Response>`;
+          return twimlText(reply);
         }
 
         const category =
@@ -408,7 +481,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         });
 
         if (!gate.ok) {
-          return `<Response><Message>${String(gate.reply || '⚠️ Could not log that payment yet.').slice(0, 1500)}</Message></Response>`;
+          return twimlText(String(gate.reply || '⚠️ Could not log that payment yet.').slice(0, 1500));
         }
 
         const result = await withTimeout(
@@ -427,6 +500,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         );
 
         if (result === '__DB_TIMEOUT__') {
+          // keep pending so they can resend "yes"
           await mergePendingTransactionState(from, {
             ...pending,
             pendingRevenue: { ...data, jobName, suggestedCategory: category || data.suggestedCategory },
@@ -434,8 +508,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
             type: 'revenue'
           });
 
-          reply = `⚠️ Saving is taking longer than expected (database slow). Please reply "yes" again in a few seconds.`;
-          return `<Response><Message>${reply}</Message></Response>`;
+          reply = `⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.`;
+          return twimlText(reply);
         }
 
         const payerPart =
@@ -446,13 +520,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
             ? '✅ Already logged that payment (duplicate message).'
             : `✅ Payment logged: ${data.amount}${payerPart} for ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-        // ✅ NEW: clear finance flow keys (includes media meta); safer than wiping all state
-        await clearFinanceFlow(from);
-
-        return `<Response><Message>${reply}</Message></Response>`;
+        // Clear everything (includes media meta)
+        await deletePendingTransactionState(from);
+        return twimlText(reply);
       }
 
-      if (lcInput === 'edit' || lcInput === 'no') {
+      if (token === 'edit') {
         await mergePendingTransactionState(from, {
           ...pending,
           isEditing: true,
@@ -462,17 +535,17 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         });
 
         reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
-      if (lcInput === 'cancel') {
-        await clearFinanceFlow(from);
+      if (token === 'cancel') {
+        await deletePendingTransactionState(from);
         reply = '❌ Payment cancelled.';
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
-      reply = `⚠️ Please respond with 'yes', 'edit', or 'cancel'.`;
-      return `<Response><Message>${reply}</Message></Response>`;
+      reply = `⚠️ Please choose Yes, Edit, or Cancel.`;
+      return twimlText(reply);
     }
 
     // --- PARSE PATH (Deterministic first, AI fallback) ---
@@ -504,10 +577,10 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         revenueSourceMsgId: safeMsgId,
         type: 'revenue'
       });
-      return `<Response><Message>${aiReply}</Message></Response>`;
+      return twimlText(aiReply);
     }
 
-    // ✅ normalize "source" that actually contains a job/address
+    // normalize "source" that actually contains a job/address
     if (data) {
       const existingJob = String(data.jobName || '').trim();
       const srcRaw = String(data.source || '').trim();
@@ -530,7 +603,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     if (data && data.amount && data.amount !== '$0.00') {
       if (!data.date) data.date = todayInTimeZone(tz);
 
-      // ignore client/source missing errors for contractor revenue
       let errors = null;
       try {
         errors = await detectErrors(data, 'revenue');
@@ -566,9 +638,10 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           type: 'revenue'
         });
         reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
+      // Keep the confirm step → now uses quick reply buttons.
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingRevenue: { ...data, jobName },
@@ -578,13 +651,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
       const payerPart =
         data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
-
-      reply = `Please confirm: Payment ${data.amount}${payerPart} on ${data.date} for ${jobName}. Reply yes/edit/cancel.`;
-      return `<Response><Message>${reply}</Message></Response>`;
+      const summaryLine = `You received ${data.amount}${payerPart} on ${data.date} for ${jobName}.`;
+      return twimlConfirmRevenue(summaryLine);
     }
 
     reply = `🤔 Couldn’t parse a payment from "${input}". Try "received $100 for 1556 Medway Park Dr today".`;
-    return `<Response><Message>${reply}</Message></Response>`;
+    return twimlText(reply);
   } catch (error) {
     console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {
       code: error?.code,
@@ -592,7 +664,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       constraint: error?.constraint
     });
     reply = '⚠️ Error logging payment. Please try again.';
-    return `<Response><Message>${reply}</Message></Response>`;
+    return twimlText(reply);
   } finally {
     try {
       await require('../../middleware/lock').releaseLock(lockKey);

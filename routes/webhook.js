@@ -101,6 +101,30 @@ async function tryClearPendingTxn(from) {
   return false;
 }
 
+/**
+ * ✅ NEW: Twilio WhatsApp template buttons / quick replies.
+ * For content templates with buttons, Twilio commonly includes:
+ * - ButtonPayload (best: often your ID like "yes"/"edit"/"cancel")
+ * - ButtonText (fallback: "Yes"/"Edit"/"Cancel")
+ * - Body (sometimes empty, sometimes repeats text)
+ */
+function getInboundText(body = {}) {
+  const payload = String(body.ButtonPayload || body.buttonPayload || '').trim();
+  if (payload) return payload;
+
+  const btnText = String(body.ButtonText || body.buttonText || '').trim();
+  if (btnText) return btnText;
+
+  // Some variants (rare): Interactive payload keys. Keep fail-open.
+  const interactiveId = String(body.ListId || body.listId || '').trim();
+  if (interactiveId) return interactiveId;
+
+  const interactiveTitle = String(body.ListTitle || body.listTitle || '').trim();
+  if (interactiveTitle) return interactiveTitle;
+
+  return String(body.Body || '').trim();
+}
+
 // ---------- Raw urlencoded parser (Twilio signature expects original body) ----------
 router.use((req, _res, next) => {
   if (req.method !== 'POST') return next();
@@ -172,7 +196,7 @@ router.use((req, res, next) => {
 
 // ---------- Quick version check ----------
 router.post('*', (req, res, next) => {
-  const bodyText = String(req.body?.Body || '').trim().toLowerCase();
+  const bodyText = getInboundText(req.body || {}).toLowerCase();
   if (bodyText === 'version') {
     const v = process.env.VERCEL_GIT_COMMIT_SHA || process.env.COMMIT_SHA || 'dev-local';
     return ok(res, `build ${String(v).slice(0, 7)} OK`);
@@ -221,7 +245,7 @@ router.post('*', async (req, res, next) => {
     const { handleMedia } = require('../handlers/media');
 
     // IMPORTANT: Body is usually empty on media; still pass it along.
-    const bodyText = String(req.body?.Body || '').trim();
+    const bodyText = getInboundText(req.body || {});
 
     const result = await handleMedia(
       req.from,
@@ -292,8 +316,8 @@ router.post('*', async (req, res, next) => {
     const pending = await getPendingTransactionState(req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // ✅ DEFINE TEXT EARLY
-    const text = String(req.body?.Body || '').trim();
+    // ✅ DEFINE TEXT EARLY (now respects button payloads)
+    const text = getInboundText(req.body || {});
     const lc = text.toLowerCase();
 
     // ------------------------------------------------------------
@@ -360,7 +384,7 @@ router.post('*', async (req, res, next) => {
     }
 
     // refresh after any rewrite
-    const text2 = String(req.body?.Body || '').trim();
+    const text2 = String(req.body?.Body || '').trim() || text;
     const lc2 = text2.toLowerCase();
 
     // Canonical idempotency key for ingestion (Twilio)
@@ -368,7 +392,7 @@ router.post('*', async (req, res, next) => {
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid = rawSid || crypto
       .createHash('sha256')
-      .update(`${req.from}|${req.body?.Body || ''}`)
+      .update(`${req.from}|${text2}`)
       .digest('hex')
       .slice(0, 32);
 
@@ -437,7 +461,7 @@ router.post('*', async (req, res, next) => {
 
         const timeoutMs = 8000;
         const timeoutTwiml =
-          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please reply "yes" again in a few seconds.</Message></Response>`;
+          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
 
         let timeoutId = null;
         const timeoutPromise = new Promise(resolve => {
@@ -467,7 +491,7 @@ router.post('*', async (req, res, next) => {
 
         const timeoutMs = 8000;
         const timeoutTwiml =
-          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please reply "yes" again in a few seconds.</Message></Response>`;
+          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
 
         let timeoutId = null;
         const timeoutPromise = new Promise(resolve => {

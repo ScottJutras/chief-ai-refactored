@@ -13,11 +13,6 @@ const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
-// Prefer clearing just finance keys; fallback to full delete
-const clearFinanceFlow =
-  (typeof state.clearFinanceFlow === 'function' && state.clearFinanceFlow) ||
-  (async (userId) => deletePendingTransactionState(userId));
-
 const ai = require('../../utils/aiErrorHandler');
 
 // Serverless-safe / backwards-compatible imports
@@ -42,7 +37,62 @@ const validateCIL =
   (typeof cilMod === 'function' && cilMod) ||
   null;
 
-// ---- Media limits ----
+/* ---------------- Twilio Content Template (Quick Reply Buttons) ---------------- */
+
+// Put the SID in Vercel env vars. This handler tries a few common names.
+// Recommended: TWILIO_EXPENSE_CONFIRM_TEMPLATE_SID=HX...
+function getExpenseConfirmTemplateSid() {
+  return (
+    process.env.TWILIO_EXPENSE_CONFIRM_TEMPLATE_SID ||
+    process.env.EXPENSE_CONFIRM_TEMPLATE_SID ||
+    process.env.TWILIO_TEMPLATE_EXPENSE_CONFIRM_SID ||
+    null
+  );
+}
+
+function xmlEsc(s = '') {
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function twimlText(msg) {
+  return `<Response><Message>${xmlEsc(msg)}</Message></Response>`;
+}
+
+function twimlConfirmExpense(summaryLine) {
+  const sid = getExpenseConfirmTemplateSid();
+  if (!sid) {
+    return twimlText(`Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.`);
+  }
+
+  return (
+    `<Response><Message>` +
+      `<Content sid="${xmlEsc(sid)}">` +
+        `<Parameter name="1">${xmlEsc(summaryLine)}</Parameter>` +
+      `</Content>` +
+    `</Message></Response>`
+  );
+}
+
+function normalizeDecisionToken(input) {
+  const s = String(input || '').trim().toLowerCase();
+
+  if (s === 'yes' || s === 'y') return 'yes';
+  if (s === 'edit') return 'edit';
+  if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
+
+  if (/\byes\b/.test(s) && s.length <= 12) return 'yes';
+  if (/\bedit\b/.test(s) && s.length <= 12) return 'edit';
+  if (/\bcancel\b/.test(s) && s.length <= 12) return 'cancel';
+
+  return s;
+}
+
+// ---- Media limits (Option A truncation) ----
 const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
 function truncateText(str, maxChars) {
   if (!str) return null;
@@ -51,7 +101,7 @@ function truncateText(str, maxChars) {
   return s.slice(0, maxChars);
 }
 
-// ---- parsing helpers ----
+// ---- basic parsing helpers ----
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.]/g, ''));
   if (!Number.isFinite(n)) return null;
@@ -94,6 +144,10 @@ function looksLikeUuid(str) {
 
 /**
  * Resolve active job name safely (avoid int=uuid comparisons).
+ * Priority:
+ *  1) userProfile.active_job_name
+ *  2) userProfile.active_job_id (uuid) -> jobs.id
+ *  3) userProfile.active_job_id numeric -> jobs.job_no
  */
 async function resolveActiveJobName({ ownerId, userProfile }) {
   const ownerParam = String(ownerId || '').trim();
@@ -140,52 +194,65 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
-/**
- * ✅ NEW: Build Expense CIL in the same “LogX” style you’re using for revenue.
- * This is the most likely shape your validateCIL expects.
- */
-function buildExpenseCIL({ from, data, jobName, category, sourceMsgId }) {
+// Minimal CIL build (your current shape) — fail-open if validator missing
+function buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
-  const description = String(data.item || '').trim() || 'Expense';
 
   return {
-    type: 'LogExpense',
-    job: jobName ? String(jobName) : undefined,
-    description,
-    amount_cents: cents,
-    source: data.store && data.store !== 'Unknown Store' ? String(data.store) : undefined,
-    date: data.date ? String(data.date) : undefined,
+    cil_version: "1.0",
+    type: "expense",
+    tenant_id: String(ownerId),
+    source: "whatsapp",
+    source_msg_id: String(sourceMsgId),
+
+    actor: {
+      actor_id: String(userProfile?.user_id || from || "unknown"),
+      role: "owner",
+      phone_e164: from && String(from).startsWith("+") ? String(from) : undefined,
+    },
+
+    occurred_at: new Date().toISOString(),
+    job: jobName ? { job_name: String(jobName) } : null,
+    needs_job_resolution: !jobName,
+
+    total_cents: cents,
+    currency: "CAD",
+
+    vendor: data.store && data.store !== 'Unknown Store' ? String(data.store) : undefined,
+    memo: data.item && data.item !== 'Unknown' ? String(data.item) : undefined,
     category: category ? String(category) : undefined,
-    source_msg_id: sourceMsgId ? String(sourceMsgId) : undefined,
-    actor_phone: from ? String(from) : undefined
   };
 }
 
-/**
- * ✅ NEW: Fail-open CIL gate (don’t block inserts if validator disagrees).
- * We still log enough info to fix the schema later.
- */
-function assertExpenseCILOrClarify({ from, data, jobName, category, sourceMsgId }) {
-  const cil = buildExpenseCIL({ from, data, jobName, category, sourceMsgId });
-
-  if (typeof validateCIL !== 'function') {
-    console.warn('[EXPENSE] validateCIL missing; skipping CIL validation (fail-open).');
-    return { ok: true, cil, skipped: true };
-  }
-
+function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   try {
+    const cil = buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
+
+    // FAIL-OPEN if validator missing
+    if (typeof validateCIL !== 'function') {
+      console.warn('[EXPENSE] validateCIL missing; skipping CIL validation (fail-open).');
+      return { ok: true, cil, skipped: true };
+    }
+
     validateCIL(cil);
     return { ok: true, cil };
-  } catch (e) {
-    console.warn('[EXPENSE] CIL validate failed (fail-open)', {
-      message: e?.message,
-      name: e?.name,
-      details: e?.errors || e?.issues || null,
-      cilType: cil?.type
-    });
-    // fail-open: do not block logging
-    return { ok: true, cil, failedOpen: true };
+  } catch {
+    return { ok: false, reply: `⚠️ Couldn't log that expense yet. Try: "expense 84.12 nails from Home Depot".` };
   }
+}
+
+// Clear ONLY media meta after successful write so it doesn't attach to next txn
+async function clearPendingMediaMeta(from, pending) {
+  try {
+    if (!pending) return;
+    if (!pending.pendingMediaMeta && !pending.pendingMedia) return;
+
+    await mergePendingTransactionState(from, {
+      ...(pending || {}),
+      pendingMediaMeta: null,
+      pendingMedia: false
+    });
+  } catch {}
 }
 
 async function deleteExpense(ownerId, criteria) {
@@ -264,15 +331,15 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           awaitingExpenseClarification: false
         });
 
-        reply = `Please confirm: Expense ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date}. Reply yes/edit/cancel.`;
-        return `<Response><Message>${reply}</Message></Response>`;
+        const summaryLine = `Expense: ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date}.`;
+        return twimlConfirmExpense(summaryLine);
       }
 
       reply = `What date was this expense? (e.g., 2025-12-12 or "today")`;
-      return `<Response><Message>${reply}</Message></Response>`;
+      return twimlText(reply);
     }
 
-    // Follow-up: job resolution
+    // Follow-up: job resolution (contractor-first)
     if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
       const jobReply = String(input || '').trim();
       const finalJob = jobReply || null;
@@ -285,27 +352,27 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         awaitingExpenseJob: false
       });
 
-      reply = `Please confirm: Expense ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date} for ${merged.jobName}. Reply yes/edit/cancel.`;
-      return `<Response><Message>${reply}</Message></Response>`;
+      const summaryLine = `Expense: ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date} for ${merged.jobName}.`;
+      return twimlConfirmExpense(summaryLine);
     }
 
     // --- CONFIRM / DELETE FLOW ---
     if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
       if (!isOwner) {
-        await clearFinanceFlow(from);
+        await deletePendingTransactionState(from);
         reply = '⚠️ Only the owner can manage expenses.';
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
-      const lc = String(input || '').toLowerCase().trim();
-      const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
+      const token = normalizeDecisionToken(input);
+      const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim(); // always defined
 
       // If user sends a fresh expense command while waiting, treat as new command
-      if (/^(?:expense|exp)\b/.test(lc) && pending?.pendingExpense) {
+      if (/^(?:expense|exp)\b/.test(String(input || '').toLowerCase()) && pending?.pendingExpense) {
         await deletePendingTransactionState(from);
         pending = null;
       } else {
-        if (lc === 'yes' && pending?.pendingExpense) {
+        if (token === 'yes' && pending?.pendingExpense) {
           const data = pending.pendingExpense || {};
           const mediaMeta = pending?.pendingMediaMeta || null;
 
@@ -313,7 +380,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             data.suggestedCategory ||
             (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null));
 
-          // job required: from data.jobName OR active job
           const jobName =
             (data.jobName && String(data.jobName).trim()) ||
             (await resolveActiveJobName({ ownerId, userProfile })) ||
@@ -328,17 +394,19 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
               type: 'expense'
             });
             reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
-            return `<Response><Message>${reply}</Message></Response>`;
+            return twimlText(reply);
           }
 
-          // ✅ CIL gate (now fail-open + correct shape)
-          assertExpenseCILOrClarify({
+          const gate = assertExpenseCILOrClarify({
+            ownerId,
             from,
+            userProfile,
             data,
             jobName,
             category,
             sourceMsgId: stableMsgId
           });
+          if (!gate.ok) return twimlText(gate.reply);
 
           const amountCents = toCents(data.amount);
           if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
@@ -369,24 +437,23 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           reply =
             result?.inserted === false
               ? '✅ Already logged that expense (duplicate message).'
-              : `✅ Expense logged: ${data.amount} for ${data.item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
+              : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-          await clearFinanceFlow(from);
-          return `<Response><Message>${reply}</Message></Response>`;
+          await deletePendingTransactionState(from);
+          return twimlText(reply);
         }
 
-        if (lc === 'yes' && pending?.pendingDelete?.type === 'expense') {
+        if (token === 'yes' && pending?.pendingDelete?.type === 'expense') {
           const criteria = pending.pendingDelete;
           const success = await deleteExpense(ownerId, criteria);
           reply = success
             ? `✅ Deleted expense ${criteria.amount} for ${criteria.item} from ${criteria.store}.`
             : `⚠️ Expense not found or deletion failed.`;
-
-          await clearFinanceFlow(from);
-          return `<Response><Message>${reply}</Message></Response>`;
+          await deletePendingTransactionState(from);
+          return twimlText(reply);
         }
 
-        if (lc === 'edit') {
+        if (token === 'edit') {
           await mergePendingTransactionState(from, {
             ...(pending || {}),
             isEditing: true,
@@ -395,17 +462,17 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             awaitingExpenseJob: false
           });
           reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
-          return `<Response><Message>${reply}</Message></Response>`;
+          return twimlText(reply);
         }
 
-        if (lc === 'cancel' || lc === 'no') {
-          await clearFinanceFlow(from);
+        if (token === 'cancel') {
+          await deletePendingTransactionState(from);
           reply = '❌ Operation cancelled.';
-          return `<Response><Message>${reply}</Message></Response>`;
+          return twimlText(reply);
         }
 
-        reply = `⚠️ Please reply "yes", "edit", or "cancel".`;
-        return `<Response><Message>${reply}</Message></Response>`;
+        reply = `⚠️ Please choose Yes, Edit, or Cancel.`;
+        return twimlText(reply);
       }
     }
 
@@ -413,18 +480,18 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     if (String(input || '').toLowerCase().startsWith('delete expense')) {
       if (!isOwner) {
         reply = '⚠️ Only the owner can delete expense entries.';
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
       const req = parseDeleteRequest(input);
       if (req.type !== 'expense') {
         reply = `⚠️ Invalid delete request. Try "delete expense $100 tools from Home Depot".`;
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
       await mergePendingTransactionState(from, { pendingDelete: { type: 'expense', ...req.criteria } });
       reply = `Please confirm: Delete expense ${req.criteria.amount} for ${req.criteria.item}? Reply yes/cancel.`;
-      return `<Response><Message>${reply}</Message></Response>`;
+      return twimlText(reply);
     }
 
     // DIRECT PARSE PATH (simple deterministic)
@@ -453,44 +520,21 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           type: 'expense'
         });
         reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
-      // CIL gate (fail-open)
-      assertExpenseCILOrClarify({ from, data, jobName, category, sourceMsgId: safeMsgId });
+      const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: safeMsgId });
+      if (!gate.ok) return twimlText(gate.reply);
 
-      const amountCents = toCents(data.amount);
-      const mediaMeta = pending?.pendingMediaMeta || null;
-
-      const result = await insertTransaction({
-        ownerId,
-        kind: 'expense',
-        date: data.date,
-        description: String(data.item || '').trim() || 'Unknown',
-        amount_cents: amountCents,
-        source: String(data.store || '').trim() || 'Unknown',
-        job: jobName,
-        job_name: jobName,
-        category: category ? String(category).trim() : null,
-        user_name: userProfile?.name || 'Unknown User',
-        source_msg_id: safeMsgId,
-        mediaMeta: mediaMeta
-          ? {
-              url: mediaMeta.url || null,
-              type: mediaMeta.type || null,
-              transcript: truncateText(mediaMeta.transcript, MAX_MEDIA_TRANSCRIPT_CHARS),
-              confidence: mediaMeta.confidence ?? null
-            }
-          : null
+      await mergePendingTransactionState(from, {
+        ...(pending || {}),
+        pendingExpense: { ...data, jobName, suggestedCategory: category },
+        expenseSourceMsgId: safeMsgId,
+        type: 'expense'
       });
 
-      reply =
-        result?.inserted === false
-          ? '✅ Already logged that expense (duplicate message).'
-          : `✅ Expense logged: ${data.amount} for ${item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
-
-      await clearFinanceFlow(from);
-      return `<Response><Message>${reply}</Message></Response>`;
+      const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}.`;
+      return twimlConfirmExpense(summaryLine);
     }
 
     // AI PATH
@@ -509,7 +553,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         expenseSourceMsgId: safeMsgId,
         type: 'expense'
       });
-      return `<Response><Message>${aiReply}</Message></Response>`;
+      return twimlText(aiReply);
     }
 
     if (data && data.amount && data.amount !== '$0.00' && data.item && data.store) {
@@ -537,47 +581,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           type: 'expense'
         });
         reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
-        return `<Response><Message>${reply}</Message></Response>`;
+        return twimlText(reply);
       }
 
-      if (confirmed && !errors) {
-        // CIL gate (fail-open)
-        assertExpenseCILOrClarify({ from, data, jobName, category, sourceMsgId: safeMsgId });
-
-        const amountCents = toCents(data.amount);
-        const mediaMeta = pending?.pendingMediaMeta || null;
-
-        const result = await insertTransaction({
-          ownerId,
-          kind: 'expense',
-          date: data.date || todayIso(),
-          description: String(data.item || '').trim() || 'Unknown',
-          amount_cents: amountCents,
-          source: String(data.store || '').trim() || 'Unknown',
-          job: jobName,
-          job_name: jobName,
-          category: category ? String(category).trim() : null,
-          user_name: userProfile?.name || 'Unknown User',
-          source_msg_id: safeMsgId,
-          mediaMeta: mediaMeta
-            ? {
-                url: mediaMeta.url || null,
-                type: mediaMeta.type || null,
-                transcript: truncateText(mediaMeta.transcript, MAX_MEDIA_TRANSCRIPT_CHARS),
-                confidence: mediaMeta.confidence ?? null
-              }
-            : null
-        });
-
-        reply =
-          result?.inserted === false
-            ? '✅ Already logged that expense (duplicate message).'
-            : `✅ Expense logged: ${data.amount} for ${data.item}${data.store ? ` from ${data.store}` : ''} on ${jobName}${category ? ` (Category: ${category})` : ''}`;
-
-        await clearFinanceFlow(from);
-        return `<Response><Message>${reply}</Message></Response>`;
-      }
-
+      // Keep confirm step → now uses quick reply buttons
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingExpense: { ...data, jobName },
@@ -585,12 +592,12 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         type: 'expense'
       });
 
-      reply = `Please confirm: Expense ${data.amount} for ${data.item} from ${data.store} on ${data.date}. Reply yes/edit/cancel.`;
-      return `<Response><Message>${reply}</Message></Response>`;
+      const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${data.date || todayIso()} for ${jobName}.`;
+      return twimlConfirmExpense(summaryLine);
     }
 
     reply = `🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`;
-    return `<Response><Message>${reply}</Message></Response>`;
+    return twimlText(reply);
   } catch (error) {
     console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
       code: error?.code,
@@ -598,7 +605,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       constraint: error?.constraint
     });
     reply = '⚠️ Error logging expense. Please try again.';
-    return `<Response><Message>${reply}</Message></Response>`;
+    return twimlText(reply);
   } finally {
     try {
       await require('../../middleware/lock').releaseLock(lockKey);

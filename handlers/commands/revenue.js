@@ -254,7 +254,7 @@ function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
   const description =
     String(data.description || '').trim() && data.description !== 'Unknown'
       ? String(data.description).trim()
-      : 'Payment received';
+      : 'Revenue Logged';
 
   return {
     type: 'LogRevenue',
@@ -287,25 +287,33 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
       name: e?.name,
       details: e?.errors || e?.issues || e?.cause || null
     });
-    return { ok: false, reply: `⚠️ Couldn't log that payment yet. Try: "received 2500 for <job> today".` };
+    return { ok: false, reply: `⚠️ Couldn't log that Revenue log yet. Try: "received 2500 for <job> today".` };
   }
 }
 
 /**
- * Deterministic parse
+ * Deterministic parse (FIXED for voice transcripts with addresses + $ amounts)
  */
 async function deterministicRevenueParse({ input, tz }) {
   const raw = String(input || '').trim();
 
-  const amtMatch =
-    raw.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/) ||
-    raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
+  // amount: prefer $ amounts (with commas) and choose LAST $ amount; fallback to first bare number
+  const dollarMatches = [...raw.matchAll(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+(?:\.[0-9]{1,2})?)/g)];
+  let amountNum = null;
 
-  if (!amtMatch) return null;
+  if (dollarMatches.length) {
+    amountNum = dollarMatches[dollarMatches.length - 1][1];
+  } else {
+    const bare = raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
+    if (bare) amountNum = bare[1];
+  }
 
-  const amountNum = amtMatch[1];
-  const amount = `$${Number(amountNum).toFixed(2)}`;
+  if (!amountNum) return null;
 
+  const amountVal = Number(String(amountNum).replace(/,/g, ''));
+  const amount = `$${amountVal.toFixed(2)}`;
+
+  // date
   let date = null;
   if (/\btoday\b/i.test(raw)) date = parseNaturalDate('today', tz);
   else if (/\byesterday\b/i.test(raw)) date = parseNaturalDate('yesterday', tz);
@@ -316,10 +324,17 @@ async function deterministicRevenueParse({ input, tz }) {
   }
   if (!date) date = todayInTimeZone(tz);
 
+  // job patterns
   let jobName = null;
 
   const forMatch = raw.match(/\bfor\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
-  if (forMatch?.[1]) jobName = normalizeJobAnswer(forMatch[1]);
+  if (forMatch?.[1]) {
+    const candidate = normalizeJobAnswer(forMatch[1]);
+    // If candidate is basically a dollar amount, ignore it as "job"
+    if (!/^\$?\s*\d[\d,]*(?:\.\d{1,2})?$/.test(candidate)) {
+      jobName = candidate;
+    }
+  }
 
   if (!jobName) {
     const onMatch = raw.match(/\bon\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
@@ -331,6 +346,7 @@ async function deterministicRevenueParse({ input, tz }) {
     if (jobMatch?.[1]) jobName = normalizeJobAnswer(jobMatch[1]);
   }
 
+  // "from X" might be job/address or payer
   let source = 'Unknown';
   const fromMatch = raw.match(/\bfrom\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
   if (fromMatch?.[1]) {
@@ -339,7 +355,7 @@ async function deterministicRevenueParse({ input, tz }) {
       jobName = jobName || token;
       source = 'Unknown';
     } else {
-      source = token;
+      source = token; // payer
     }
   }
 
@@ -347,7 +363,7 @@ async function deterministicRevenueParse({ input, tz }) {
 
   return {
     date,
-    description: 'Payment received',
+    description: 'Revenue received',
     amount,
     source,
     jobName
@@ -398,7 +414,7 @@ async function writeRevenueViaCanonicalInsert({
     ownerId: owner,
     kind: 'revenue',
     date: String(data.date || '').trim() || todayInTimeZone(tz),
-    description: String(data.description || 'Payment received').trim() || 'Payment received',
+    description: String(data.description || 'Revenue received').trim() || 'Revenue received',
     amount_cents: amountCents,
     amount: toNumberAmount(data.amount),
     source: (data.source && data.source !== 'Unknown') ? String(data.source).trim() : 'Unknown',
@@ -453,7 +469,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return await sendConfirmRevenueOrFallback(from, summaryLine);
       }
 
-      reply = `What date was this payment? (e.g., 2025-12-12 or "today")`;
+      reply = `What date was this Revenue received? (e.g., 2025-12-12 or "today")`;
       return twimlText(reply);
     }
 
@@ -504,7 +520,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
             revenueSourceMsgId: stableMsgId,
             type: 'revenue'
           });
-          reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
+          reply = `Which job is this Revenue for? Reply with the job name (or "Overhead").`;
           return twimlText(reply);
         }
 
@@ -527,7 +543,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         });
 
         if (!gate.ok) {
-          return twimlText(String(gate.reply || '⚠️ Could not log that payment yet.').slice(0, 1500));
+          return twimlText(String(gate.reply || '⚠️ Could not log that Revenue yet.').slice(0, 1500));
         }
 
         const result = await withTimeout(
@@ -562,8 +578,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
         reply =
           result?.inserted === false
-            ? '✅ Already logged that payment (duplicate message).'
-            : `✅ Payment logged: ${data.amount}${payerPart} for ${jobName}${category ? ` (Category: ${category})` : ''}`;
+            ? '✅ Already logged that Revenue (duplicate message).'
+            : `✅ Revenue logged: ${data.amount}${payerPart} for ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
         await deletePendingTransactionState(from);
         return twimlText(reply);
@@ -578,13 +594,13 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           awaitingRevenueJob: false
         });
 
-        reply = '✏️ Okay — resend the payment in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
+        reply = '✏️ Okay — resend the Revenue details in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
         return twimlText(reply);
       }
 
       if (token === 'cancel') {
         await deletePendingTransactionState(from);
-        reply = '❌ Payment cancelled.';
+        reply = '❌ Revenue entry cancelled.';
         return twimlText(reply);
       }
 
@@ -679,7 +695,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           revenueSourceMsgId: safeMsgId,
           type: 'revenue'
         });
-        reply = `Which job is this payment for? Reply with the job name (or "Overhead").`;
+        reply = `Which job is this Revenue for? Reply with the job name (or "Overhead").`;
         return twimlText(reply);
       }
 
@@ -697,7 +713,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmRevenueOrFallback(from, summaryLine);
     }
 
-    reply = `🤔 Couldn’t parse a payment from "${input}". Try "received $100 for 1556 Medway Park Dr today".`;
+    reply = `🤔 Couldn’t parse Revenue from "${input}". Try "received $100 for 1556 Medway Park Dr today".`;
     return twimlText(reply);
 
   } catch (error) {
@@ -706,7 +722,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       detail: error?.detail,
       constraint: error?.constraint
     });
-    reply = '⚠️ Error logging payment. Please try again.';
+    reply = '⚠️ Error logging Revenue. Please try again.';
     return twimlText(reply);
   } finally {
     try {

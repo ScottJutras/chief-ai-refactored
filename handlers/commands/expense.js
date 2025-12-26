@@ -145,13 +145,13 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
 function normalizeDecisionToken(input) {
   const s = String(input || '').trim().toLowerCase();
 
-  if (s === 'yes' || s === 'y') return 'yes';
+  if (s === 'yes' || s === 'y' || s === 'confirm') return 'yes';
   if (s === 'edit') return 'edit';
   if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
 
-  if (/\byes\b/.test(s) && s.length <= 12) return 'yes';
-  if (/\bedit\b/.test(s) && s.length <= 12) return 'edit';
-  if (/\bcancel\b/.test(s) && s.length <= 12) return 'cancel';
+  if (/\byes\b/.test(s) && s.length <= 20) return 'yes';
+  if (/\bedit\b/.test(s) && s.length <= 20) return 'edit';
+  if (/\bcancel\b/.test(s) && s.length <= 20) return 'cancel';
 
   return s;
 }
@@ -254,33 +254,27 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
-// Minimal CIL build — fail-open if validator missing
+/**
+ * Expense CIL (FIXED): match the same style as revenue CIL so validateCIL accepts it.
+ */
 function buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
 
+  const description =
+    String(data.item || '').trim() && data.item !== 'Unknown'
+      ? String(data.item).trim()
+      : 'Expense';
+
   return {
-    cil_version: "1.0",
-    type: "expense",
-    tenant_id: String(ownerId),
-    source: "whatsapp",
-    source_msg_id: String(sourceMsgId),
-
-    actor: {
-      actor_id: String(userProfile?.user_id || from || "unknown"),
-      role: "owner",
-      phone_e164: from && String(from).startsWith("+") ? String(from) : undefined,
-    },
-
-    occurred_at: new Date().toISOString(),
-    job: jobName ? { job_name: String(jobName) } : null,
-    needs_job_resolution: !jobName,
-
-    total_cents: cents,
-    currency: "CAD",
-
-    vendor: data.store && data.store !== 'Unknown Store' ? String(data.store) : undefined,
-    memo: data.item && data.item !== 'Unknown' ? String(data.item) : undefined,
+    type: 'LogExpense',
+    job: jobName ? String(jobName) : undefined,
+    description,
+    amount_cents: cents,
+    source: data.store && data.store !== 'Unknown Store' ? String(data.store) : undefined,
+    date: data.date ? String(data.date) : undefined,
     category: category ? String(category) : undefined,
+    source_msg_id: sourceMsgId ? String(sourceMsgId) : undefined,
+    actor_phone: from ? String(from) : undefined
   };
 }
 
@@ -295,7 +289,12 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 
     validateCIL(cil);
     return { ok: true, cil };
-  } catch {
+  } catch (e) {
+    console.warn('[EXPENSE] CIL validate failed', {
+      message: e?.message,
+      name: e?.name,
+      details: e?.errors || e?.issues || e?.cause || null
+    });
     return { ok: false, reply: `⚠️ Couldn't log that expense yet. Try: "expense 84.12 nails from Home Depot".` };
   }
 }

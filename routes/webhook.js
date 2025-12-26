@@ -453,69 +453,149 @@ const lc2 = text2.toLowerCase();
         console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
       }
     }
+function hasMoneyAmount(str) {
+  const s = String(str || '');
+
+  // $489, $489.78, $8,436, $8,436.10
+  const hasDollar = /\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/.test(s);
+
+  // 8436 dollars, 8,436 bucks, 8436 cad
+  const hasWordAmount =
+    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*(?:dollars|bucks|cad|usd)\b/i.test(s);
+
+  // plain-ish numbers (avoid matching years / addresses):
+  // requires a hint word nearby: "for", "paid", "spent", "received", "cost"
+  const hasBareNumberWithHint =
+    /\b(?:for|paid|spent|received|cost|total)\s+\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b/i.test(s) ||
+    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s+\b(?:for|paid|spent|received|cost|total)\b/i.test(s);
+
+  return hasDollar || hasWordAmount || hasBareNumberWithHint;
+}
+
+function looksExpenseNl(str) {
+  const s = String(str || '').trim().toLowerCase();
+
+  // must have a money amount
+  if (!hasMoneyAmount(s)) return false;
+
+  // expense-ish verbs / phrases
+  const verb =
+    /\b(bought|buy|purchased|purchase|spent|spend|paid|pay|picked\s*up|cost|ordered|charge|charged)\b/.test(s) ||
+    /\b(on|for)\b/.test(s); // often "spent $X on Y" or "paid $X for Y"
+
+  if (!verb) return false;
+
+  // avoid common revenue phrasing
+  if (/\b(received|got paid|payment|deposit)\b/.test(s)) return false;
+
+  // avoid job/time/task hard commands (extra safety)
+  if (
+    /^(create|new)\s+job\b/.test(s) ||
+    /^active\s+job\b/.test(s) ||
+    /^set\s+active\b/.test(s) ||
+    /^switch\s+job\b/.test(s) ||
+    /^clock\b/.test(s) ||
+    /^break\b/.test(s) ||
+    /^drive\b/.test(s) ||
+    /^task\b/.test(s) ||
+    /^my\s+tasks\b/.test(s)
+  ) return false;
+
+  return true;
+}
+
+function looksRevenueNl(str) {
+  const s = String(str || '').trim().toLowerCase();
+
+  if (!hasMoneyAmount(s)) return false;
+
+  // revenue-ish verbs / phrases
+  if (/\b(received|revenue|rev|got paid|payment|deposit)\b/.test(s)) return true;
+
+  // also catch "client paid me $X" patterns
+  if (/\b(paid)\b/.test(s) && /\b(from|client|customer)\b/.test(s)) return true;
+
+  return false;
+}
 
     // -----------------------------------------------------------------------
-    // (B) FAST PATHS — REVENUE/EXPENSE
-    // -----------------------------------------------------------------------
-    const looksRevenue = /^(?:revenue|rev|received)\b/.test(lc2);
-    if (looksRevenue) {
-      try {
-        const { handleRevenue } = require('../handlers/commands/revenue');
+// (B) FAST PATHS — REVENUE/EXPENSE
+// -----------------------------------------------------------------------
 
-        const timeoutMs = 8000;
-        const timeoutTwiml =
-          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
+const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
+const revenueNl = !revenuePrefix && looksRevenueNl(text2);
+const looksRevenue = revenuePrefix || revenueNl;
 
-        let timeoutId = null;
-        const timeoutPromise = new Promise(resolve => {
-          timeoutId = setTimeout(() => {
-            console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
-            resolve(timeoutTwiml);
-          }, timeoutMs);
-        });
+if (looksRevenue) {
+  if (revenueNl) {
+    console.info('[WEBHOOK] NL revenue detected', { from: req.from, text2: text2.slice(0, 120) });
+  }
 
-        const twiml = await Promise.race([
-          handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-          timeoutPromise
-        ]).finally(() => {
-          if (timeoutId) clearTimeout(timeoutId);
-        });
+  try {
+    const { handleRevenue } = require('../handlers/commands/revenue');
 
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-      } catch (e) {
-        console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-      }
-    }
+    const timeoutMs = 8000;
+    const timeoutTwiml =
+      `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
 
-    const looksExpense = /^(?:expense|exp)\b/.test(lc2);
-    if (looksExpense) {
-      try {
-        const { handleExpense } = require('../handlers/commands/expense');
+    let timeoutId = null;
+    const timeoutPromise = new Promise(resolve => {
+      timeoutId = setTimeout(() => {
+        console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
+        resolve(timeoutTwiml);
+      }, timeoutMs);
+    });
 
-        const timeoutMs = 8000;
-        const timeoutTwiml =
-          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
+    const twiml = await Promise.race([
+      handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+      timeoutPromise
+    ]).finally(() => {
+      if (timeoutId) clearTimeout(timeoutId);
+    });
 
-        let timeoutId = null;
-        const timeoutPromise = new Promise(resolve => {
-          timeoutId = setTimeout(() => {
-            console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
-            resolve(timeoutTwiml);
-          }, timeoutMs);
-        });
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+  }
+}
 
-        const twiml = await Promise.race([
-          handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-          timeoutPromise
-        ]).finally(() => {
-          if (timeoutId) clearTimeout(timeoutId);
-        });
+const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
+const expenseNl = !expensePrefix && looksExpenseNl(text2);
+const looksExpense = expensePrefix || expenseNl;
 
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-      } catch (e) {
-        console.warn('[WEBHOOK] expense handler failed:', e?.message);
-      }
-    }
+if (looksExpense) {
+  if (expenseNl) {
+    console.info('[WEBHOOK] NL expense detected', { from: req.from, text2: text2.slice(0, 120) });
+  }
+
+  try {
+    const { handleExpense } = require('../handlers/commands/expense');
+
+    const timeoutMs = 8000;
+    const timeoutTwiml =
+      `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
+
+    let timeoutId = null;
+    const timeoutPromise = new Promise(resolve => {
+      timeoutId = setTimeout(() => {
+        console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
+        resolve(timeoutTwiml);
+      }, timeoutMs);
+    });
+
+    const twiml = await Promise.race([
+      handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+      timeoutPromise
+    ]).finally(() => {
+      if (timeoutId) clearTimeout(timeoutId);
+    });
+
+    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+  } catch (e) {
+    console.warn('[WEBHOOK] expense handler failed:', e?.message);
+  }
+}
+
 
     // --- SPECIAL: "How did the XYZ job do?" → job KPIs ---
     if (/how\b.*\bjob\b/.test(lc2)) {

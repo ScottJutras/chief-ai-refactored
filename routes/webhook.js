@@ -20,15 +20,21 @@ const mergePendingTransactionState =
   stateManager.mergePendingTransactionState ||
   (async (userId, patch) => stateManager.setPendingTransactionState(userId, patch, { merge: true }));
 
-// ---------- Small helpers ----------
+/* ---------------- Small helpers ---------------- */
+
 function xmlEsc(s = '') {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 const xml = (s = '') => `<Response><Message>${xmlEsc(s)}</Message></Response>`;
+
 const ok = (res, text = 'OK') => {
   if (res.headersSent) return;
   res.status(200).type('application/xml; charset=utf-8').send(xml(text));
 };
+
 const normalizePhone = (raw = '') =>
   String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
 
@@ -102,7 +108,7 @@ async function tryClearPendingTxn(from) {
 }
 
 /**
- * ✅ NEW: Twilio WhatsApp template buttons / quick replies.
+ * ✅ Twilio WhatsApp template buttons / quick replies.
  * For content templates with buttons, Twilio commonly includes:
  * - ButtonPayload (best: often your ID like "yes"/"edit"/"cancel")
  * - ButtonText (fallback: "Yes"/"Edit"/"Cancel")
@@ -125,7 +131,70 @@ function getInboundText(body = {}) {
   return String(body.Body || '').trim();
 }
 
-// ---------- Raw urlencoded parser (Twilio signature expects original body) ----------
+/* ---------------- NL heuristics for expense/revenue ---------------- */
+
+function hasMoneyAmount(str) {
+  const s = String(str || '');
+
+  // $489, $489.78, $8,436, $8,436.10
+  const hasDollar = /\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/.test(s);
+
+  // 8436 dollars, 8,436 bucks, 8436 cad
+  const hasWordAmount =
+    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*(?:dollars|bucks|cad|usd)\b/i.test(s);
+
+  // plain-ish numbers (avoid matching years / addresses):
+  // requires a hint word nearby: "for", "paid", "spent", "received", "cost"
+  const hasBareNumberWithHint =
+    /\b(?:for|paid|spent|received|cost|total)\s+\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b/i.test(s) ||
+    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s+\b(?:for|paid|spent|received|cost|total)\b/i.test(s);
+
+  return hasDollar || hasWordAmount || hasBareNumberWithHint;
+}
+
+function looksExpenseNl(str) {
+  const s = String(str || '').trim().toLowerCase();
+
+  if (!hasMoneyAmount(s)) return false;
+
+  const verb =
+    /\b(bought|buy|purchased|purchase|spent|spend|paid|pay|picked\s*up|cost|ordered|charge|charged)\b/.test(s) ||
+    /\b(on|for)\b/.test(s);
+
+  if (!verb) return false;
+
+  // avoid revenue phrasing
+  if (/\b(received|got paid|payment|deposit)\b/.test(s)) return false;
+
+  // avoid hard commands
+  if (
+    /^(create|new)\s+job\b/.test(s) ||
+    /^active\s+job\b/.test(s) ||
+    /^set\s+active\b/.test(s) ||
+    /^switch\s+job\b/.test(s) ||
+    /^clock\b/.test(s) ||
+    /^break\b/.test(s) ||
+    /^drive\b/.test(s) ||
+    /^task\b/.test(s) ||
+    /^my\s+tasks\b/.test(s)
+  ) return false;
+
+  return true;
+}
+
+function looksRevenueNl(str) {
+  const s = String(str || '').trim().toLowerCase();
+  if (!hasMoneyAmount(s)) return false;
+
+  if (/\b(received|revenue|rev|got paid|payment|deposit)\b/.test(s)) return true;
+
+  if (/\b(paid)\b/.test(s) && /\b(from|client|customer)\b/.test(s)) return true;
+
+  return false;
+}
+
+/* ---------------- Raw urlencoded parser (Twilio signature expects original body) ---------------- */
+
 router.use((req, _res, next) => {
   if (req.method !== 'POST') return next();
   const ct = String(req.headers['content-type'] || '').toLowerCase();
@@ -148,13 +217,15 @@ router.use((req, _res, next) => {
   req.on('error', () => { req.rawBody = raw || ''; req.body = {}; next(); });
 });
 
-// ---------- Non-POST guard ----------
+/* ---------------- Non-POST guard ---------------- */
+
 router.all('*', (req, res, next) => {
   if (req.method === 'POST') return next();
   return ok(res, 'OK');
 });
 
-// ---------- Identity + canonical URL (for Twilio signature verification) ----------
+/* ---------------- Identity + canonical URL (for Twilio signature verification) ---------------- */
+
 router.use((req, _res, next) => {
   req.from = req.body?.From ? normalizePhone(req.body.From) : null;
   req.ownerId = req.from || 'GLOBAL';
@@ -166,14 +237,16 @@ router.use((req, _res, next) => {
   next();
 });
 
-// ---------- Phase tracker (debug) ----------
+/* ---------------- Phase tracker (debug) ---------------- */
+
 router.use((req, res, next) => {
   if (!res.locals.phase) res.locals.phase = 'start';
   res.locals.phaseAt = Date.now();
   next();
 });
 
-// ---------- 8s Safety Timer ----------
+/* ---------------- 8s Safety Timer ---------------- */
+
 router.use((req, res, next) => {
   if (res.locals._safety) return next();
   res.locals._safety = setTimeout(() => {
@@ -194,9 +267,10 @@ router.use((req, res, next) => {
   next();
 });
 
-// ---------- Quick version check ----------
+/* ---------------- Quick version check ---------------- */
+
 router.post('*', (req, res, next) => {
-  const bodyText = getInboundText(req.body || {}).toLowerCase();
+  const bodyText = String(getInboundText(req.body || {}) || '').toLowerCase();
   if (bodyText === 'version') {
     const v = process.env.VERCEL_GIT_COMMIT_SHA || process.env.COMMIT_SHA || 'dev-local';
     return ok(res, `build ${String(v).slice(0, 7)} OK`);
@@ -204,7 +278,8 @@ router.post('*', (req, res, next) => {
   next();
 });
 
-// ---------- Lightweight middlewares (tolerant) ----------
+/* ---------------- Lightweight middlewares (tolerant) ---------------- */
+
 router.use((req, res, next) => {
   try {
     const token = require('../middleware/token');
@@ -228,7 +303,8 @@ router.use((req, res, next) => {
   }
 });
 
-// ---------- Pending Action interceptor (confirm/undo) ----------
+/* ---------------- Pending Action interceptor (confirm/undo) ---------------- */
+
 try {
   const { pendingActionMiddleware } = require('../middleware/pendingAction');
   router.post('*', pendingActionMiddleware);
@@ -236,7 +312,8 @@ try {
   console.warn('[WEBHOOK] pendingActionMiddleware unavailable:', e?.message);
 }
 
-// ---------- Media ingestion (audio/image → handleMedia) ----------
+/* ---------------- Media ingestion (audio/image → handleMedia) ---------------- */
+
 router.post('*', async (req, res, next) => {
   const { n, url, type } = pickFirstMedia(req.body || {});
   if (n <= 0) return next();
@@ -244,7 +321,7 @@ router.post('*', async (req, res, next) => {
   try {
     const { handleMedia } = require('../handlers/media');
 
-    // IMPORTANT: Body is usually empty on media; still pass it along.
+    // IMPORTANT: Body is usually empty on media; still pass it along (button-aware)
     const bodyText = getInboundText(req.body || {});
 
     const result = await handleMedia(
@@ -256,41 +333,30 @@ router.post('*', async (req, res, next) => {
       type
     );
 
-    // If handler returns TwiML directly, send it.
-    if (typeof result === 'string' && result && !res.headersSent) {
-      return res.status(200).type('application/xml; charset=utf-8').send(result);
-    }
-
     // If handler returns transcript, convert to text message and continue routing.
     if (result && typeof result === 'object' && result.transcript) {
       req.body.Body = result.transcript;
-
-      // Persist media meta for later save (revenue/expense confirmation)
-      try {
-        const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-        const pending = await getPendingTransactionState(req.from);
-
-        const mediaMeta = {
-          url,
-          type,
-          messageSid: rawSid || null, // media message SID
-          confidence: result.confidence ?? null,
-          transcript: result.transcript
-        };
-
-        await mergePendingTransactionState(req.from, {
-          ...(pending || {}),
-          pendingMediaMeta: mediaMeta,
-          // Keep a consistent shape (object), but never break older code that expects boolean.
-          pendingMedia: typeof pending?.pendingMedia === 'object'
-            ? { ...(pending.pendingMedia || {}), hasMedia: true }
-            : pending?.pendingMedia || null
-        });
-      } catch (e) {
-        console.warn('[MEDIA] could not persist pendingMediaMeta:', e?.message);
-      }
-
       return next();
+    }
+
+    // ✅ Key fix: if media handler returned TwiML (older behavior),
+    // prefer continuing the pipeline using the stored transcript (so expense.js can send template quick replies).
+    if (typeof result === 'string' && result && !res.headersSent) {
+      try {
+        const pending = await getPendingTransactionState(req.from);
+        const transcript =
+          String(pending?.pendingMediaMeta?.transcript || '').trim() ||
+          String(pending?.pendingMediaMeta?.text || '').trim() ||
+          '';
+
+        if (transcript) {
+          req.body.Body = transcript;
+          return next();
+        }
+      } catch {}
+
+      // If we truly can't recover a transcript, fall back to responding with TwiML.
+      return res.status(200).type('application/xml; charset=utf-8').send(result);
     }
 
     return next();
@@ -300,7 +366,8 @@ router.post('*', async (req, res, next) => {
   }
 });
 
-// ---------- Main text router (tasks / jobs / timeclock / agent) ----------
+/* ---------------- Main text router (tasks / jobs / timeclock / agent) ---------------- */
+
 router.post('*', async (req, res, next) => {
   // Owner mapping: phone -> owner uuid (or text owner_id in DB)
   if (!req.ownerId || /^[0-9]+$/.test(String(req.ownerId))) {
@@ -313,18 +380,18 @@ router.post('*', async (req, res, next) => {
   }
 
   try {
-    const pending = await getPendingTransactionState(req.from);
+    let pending = await getPendingTransactionState(req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // ✅ DEFINE TEXT EARLY (now respects button payloads)
-    const text = String(getInboundText(req.body || {}) || '');
-    const lc = text.toLowerCase();
+    // ✅ DEFINE TEXT EARLY (button-aware)
+    let text = String(getInboundText(req.body || {}) || '').trim();
+    let lc = text.toLowerCase();
 
+    /* ------------------------------------------------------------
+     * PENDING TXN NUDGE (revenue/expense flows)
+     * Prevent "create job ..." from being treated as a job-name answer.
+     * ------------------------------------------------------------ */
 
-    // ------------------------------------------------------------
-    // PENDING TXN NUDGE (revenue/expense flows)
-    // Prevent "create job ..." from being treated as a job-name answer.
-    // ------------------------------------------------------------
     const pendingRevenueFlow =
       !!pending?.pendingRevenue ||
       !!pending?.awaitingRevenueJob ||
@@ -353,10 +420,10 @@ router.post('*', async (req, res, next) => {
       if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) return ok(res, pendingTxnNudgeMessage({ type: 'expense' }));
     }
 
-    // -----------------------------------------------------------------------
-    // If prior step set pendingMedia (waiting for user follow-up) and this is text-only,
-    // let media.js interpret the follow-up and/or pass it through.
-    // -----------------------------------------------------------------------
+    /* -----------------------------------------------------------------------
+     * If prior step set pendingMedia (waiting for user follow-up) and this is text-only,
+     * let media.js interpret the follow-up and/or pass it through.
+     * ----------------------------------------------------------------------- */
     const hasPendingMedia = !!pending?.pendingMedia || !!pending?.pendingMediaMeta;
     if (hasPendingMedia && numMedia === 0) {
       const { handleMedia } = require('../handlers/media');
@@ -369,26 +436,27 @@ router.post('*', async (req, res, next) => {
         null
       );
 
-      // If media handler returns TwiML, send it.
       if (typeof result === 'string' && result && !res.headersSent) {
         return res.status(200).type('application/xml; charset=utf-8').send(result);
       }
 
-      // If it returns a transcript pass-through, rewrite Body and continue.
       if (result && typeof result === 'object' && result.transcript && !result.twiml) {
         req.body.Body = result.transcript;
       } else if (result && typeof result === 'object' && result.twiml) {
-        // media.js sometimes returns { transcript, twiml } — if it provides twiml, honor it
         return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
       }
-      // refresh text/lc after rewrite
+
+      // refresh text after rewrite
+      text = String(getInboundText(req.body || {}) || '').trim();
+      lc = text.toLowerCase();
+
+      // refresh pending too (media handler may have changed it)
+      pending = await getPendingTransactionState(req.from);
     }
 
     // refresh after any rewrite (button-aware)
-const text2 = String(getInboundText(req.body || {}) || '').trim();
-const lc2 = text2.toLowerCase();
-
-
+    const text2 = String(getInboundText(req.body || {}) || '').trim();
+    const lc2 = text2.toLowerCase();
 
     // Canonical idempotency key for ingestion (Twilio)
     const crypto = require('crypto');
@@ -399,9 +467,10 @@ const lc2 = text2.toLowerCase();
       .digest('hex')
       .slice(0, 32);
 
-    // -----------------------------------------------------------------------
-    // (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
-    // -----------------------------------------------------------------------
+    /* -----------------------------------------------------------------------
+     * (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
+     * ----------------------------------------------------------------------- */
+
     const isNewRevenueCmd = /^(?:revenue|rev|received)\b/.test(lc2);
     const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc2);
 
@@ -453,149 +522,84 @@ const lc2 = text2.toLowerCase();
         console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
       }
     }
-function hasMoneyAmount(str) {
-  const s = String(str || '');
 
-  // $489, $489.78, $8,436, $8,436.10
-  const hasDollar = /\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/.test(s);
+    /* -----------------------------------------------------------------------
+     * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
+     * ----------------------------------------------------------------------- */
 
-  // 8436 dollars, 8,436 bucks, 8436 cad
-  const hasWordAmount =
-    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*(?:dollars|bucks|cad|usd)\b/i.test(s);
+    const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
+    const revenueNl = !revenuePrefix && looksRevenueNl(text2);
+    const looksRevenue = revenuePrefix || revenueNl;
 
-  // plain-ish numbers (avoid matching years / addresses):
-  // requires a hint word nearby: "for", "paid", "spent", "received", "cost"
-  const hasBareNumberWithHint =
-    /\b(?:for|paid|spent|received|cost|total)\s+\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b/i.test(s) ||
-    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s+\b(?:for|paid|spent|received|cost|total)\b/i.test(s);
+    if (looksRevenue) {
+      if (revenueNl) {
+        console.info('[WEBHOOK] NL revenue detected', { from: req.from, text2: text2.slice(0, 120) });
+      }
 
-  return hasDollar || hasWordAmount || hasBareNumberWithHint;
-}
+      try {
+        const { handleRevenue } = require('../handlers/commands/revenue');
 
-function looksExpenseNl(str) {
-  const s = String(str || '').trim().toLowerCase();
+        const timeoutMs = 8000;
+        const timeoutTwiml =
+          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
 
-  // must have a money amount
-  if (!hasMoneyAmount(s)) return false;
+        let timeoutId = null;
+        const timeoutPromise = new Promise(resolve => {
+          timeoutId = setTimeout(() => {
+            console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
+            resolve(timeoutTwiml);
+          }, timeoutMs);
+        });
 
-  // expense-ish verbs / phrases
-  const verb =
-    /\b(bought|buy|purchased|purchase|spent|spend|paid|pay|picked\s*up|cost|ordered|charge|charged)\b/.test(s) ||
-    /\b(on|for)\b/.test(s); // often "spent $X on Y" or "paid $X for Y"
+        const twiml = await Promise.race([
+          handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+          timeoutPromise
+        ]).finally(() => {
+          if (timeoutId) clearTimeout(timeoutId);
+        });
 
-  if (!verb) return false;
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+      }
+    }
 
-  // avoid common revenue phrasing
-  if (/\b(received|got paid|payment|deposit)\b/.test(s)) return false;
+    const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
+    const expenseNl = !expensePrefix && looksExpenseNl(text2);
+    const looksExpense = expensePrefix || expenseNl;
 
-  // avoid job/time/task hard commands (extra safety)
-  if (
-    /^(create|new)\s+job\b/.test(s) ||
-    /^active\s+job\b/.test(s) ||
-    /^set\s+active\b/.test(s) ||
-    /^switch\s+job\b/.test(s) ||
-    /^clock\b/.test(s) ||
-    /^break\b/.test(s) ||
-    /^drive\b/.test(s) ||
-    /^task\b/.test(s) ||
-    /^my\s+tasks\b/.test(s)
-  ) return false;
+    if (looksExpense) {
+      if (expenseNl) {
+        console.info('[WEBHOOK] NL expense detected', { from: req.from, text2: text2.slice(0, 120) });
+      }
 
-  return true;
-}
+      try {
+        const { handleExpense } = require('../handlers/commands/expense');
 
-function looksRevenueNl(str) {
-  const s = String(str || '').trim().toLowerCase();
+        const timeoutMs = 8000;
+        const timeoutTwiml =
+          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
 
-  if (!hasMoneyAmount(s)) return false;
+        let timeoutId = null;
+        const timeoutPromise = new Promise(resolve => {
+          timeoutId = setTimeout(() => {
+            console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
+            resolve(timeoutTwiml);
+          }, timeoutMs);
+        });
 
-  // revenue-ish verbs / phrases
-  if (/\b(received|revenue|rev|got paid|payment|deposit)\b/.test(s)) return true;
+        const twiml = await Promise.race([
+          handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+          timeoutPromise
+        ]).finally(() => {
+          if (timeoutId) clearTimeout(timeoutId);
+        });
 
-  // also catch "client paid me $X" patterns
-  if (/\b(paid)\b/.test(s) && /\b(from|client|customer)\b/.test(s)) return true;
-
-  return false;
-}
-
-    // -----------------------------------------------------------------------
-// (B) FAST PATHS — REVENUE/EXPENSE
-// -----------------------------------------------------------------------
-
-const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
-const revenueNl = !revenuePrefix && looksRevenueNl(text2);
-const looksRevenue = revenuePrefix || revenueNl;
-
-if (looksRevenue) {
-  if (revenueNl) {
-    console.info('[WEBHOOK] NL revenue detected', { from: req.from, text2: text2.slice(0, 120) });
-  }
-
-  try {
-    const { handleRevenue } = require('../handlers/commands/revenue');
-
-    const timeoutMs = 8000;
-    const timeoutTwiml =
-      `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
-
-    let timeoutId = null;
-    const timeoutPromise = new Promise(resolve => {
-      timeoutId = setTimeout(() => {
-        console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
-        resolve(timeoutTwiml);
-      }, timeoutMs);
-    });
-
-    const twiml = await Promise.race([
-      handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-      timeoutPromise
-    ]).finally(() => {
-      if (timeoutId) clearTimeout(timeoutId);
-    });
-
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-  }
-}
-
-const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
-const expenseNl = !expensePrefix && looksExpenseNl(text2);
-const looksExpense = expensePrefix || expenseNl;
-
-if (looksExpense) {
-  if (expenseNl) {
-    console.info('[WEBHOOK] NL expense detected', { from: req.from, text2: text2.slice(0, 120) });
-  }
-
-  try {
-    const { handleExpense } = require('../handlers/commands/expense');
-
-    const timeoutMs = 8000;
-    const timeoutTwiml =
-      `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
-
-    let timeoutId = null;
-    const timeoutPromise = new Promise(resolve => {
-      timeoutId = setTimeout(() => {
-        console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
-        resolve(timeoutTwiml);
-      }, timeoutMs);
-    });
-
-    const twiml = await Promise.race([
-      handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-      timeoutPromise
-    ]).finally(() => {
-      if (timeoutId) clearTimeout(timeoutId);
-    });
-
-    return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-  } catch (e) {
-    console.warn('[WEBHOOK] expense handler failed:', e?.message);
-  }
-}
-
+        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+      } catch (e) {
+        console.warn('[WEBHOOK] expense handler failed:', e?.message);
+      }
+    }
 
     // --- SPECIAL: "How did the XYZ job do?" → job KPIs ---
     if (/how\b.*\bjob\b/.test(lc2)) {
@@ -811,7 +815,8 @@ if (looksExpense) {
   }
 });
 
-// ---------- Final fallback (always 200) ----------
+/* ---------------- Final fallback (always 200) ---------------- */
+
 router.use((req, res, next) => {
   if (!res.headersSent) {
     console.warn('[WEBHOOK] fell-through fallback');
@@ -820,12 +825,14 @@ router.use((req, res, next) => {
   next();
 });
 
-// ---------- Error middleware (lazy) ----------
+/* ---------------- Error middleware (lazy) ---------------- */
+
 try {
   const { errorMiddleware } = require('../middleware/error');
   router.use(errorMiddleware);
 } catch { /* no-op */ }
 
-// ---------- Export ----------
+/* ---------------- Export ---------------- */
+
 app.use('/', router);
 module.exports = (req, res) => app.handle(req, res);

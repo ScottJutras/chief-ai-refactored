@@ -5,18 +5,15 @@ const state = require('../../utils/stateManager');
 const getPendingTransactionState = state.getPendingTransactionState;
 const deletePendingTransactionState = state.deletePendingTransactionState;
 
-// Prefer mergePendingTransactionState; fall back to setPendingTransactionState with merge:true
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
 const ai = require('../../utils/aiErrorHandler');
 
-// Serverless-safe / backwards-compatible imports
 const handleInputWithAI = ai.handleInputWithAI;
 const parseExpenseMessage = ai.parseExpenseMessage;
 
-// Prefer tz-aware helpers from aiErrorHandler if available
 const todayInTimeZone =
   (typeof ai.todayInTimeZone === 'function' && ai.todayInTimeZone) ||
   (() => new Date().toISOString().split('T')[0]);
@@ -43,14 +40,9 @@ const parseNaturalDateTz =
     return null;
   });
 
-const detectErrors =
-  (typeof ai.detectErrors === 'function' && ai.detectErrors) ||
-  (typeof ai.detectError === 'function' && ai.detectError) ||
-  (async () => null); // fail-open
-
 const categorizeEntry =
   (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) ||
-  (async () => null); // fail-open
+  (async () => null);
 
 // ---- CIL validator (fail-open) ----
 const cilMod = require('../../cil');
@@ -61,7 +53,7 @@ const validateCIL =
   (typeof cilMod === 'function' && cilMod) ||
   null;
 
-/* ---------------- Twilio Content Template (WhatsApp Quick Reply Buttons) ---------------- */
+/* ---------------- Twilio Content Template ---------------- */
 
 function xmlEsc(s = '') {
   return String(s)
@@ -144,18 +136,13 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
   const sid = getExpenseConfirmTemplateSid();
   const to = waTo(from);
 
-  console.info('[EXPENSE] confirm template attempt', {
-    from,
-    to,
-    hasSid: !!sid,
-    sid: sid || null
-  });
+  console.info('[EXPENSE] confirm template attempt', { from, to, hasSid: !!sid, sid: sid || null });
 
   if (sid && to) {
     try {
       await sendWhatsAppTemplate({ to, templateSid: sid, summaryLine });
       console.info('[EXPENSE] confirm template sent OK', { to, sid });
-      return twimlEmpty(); // IMPORTANT: don't also send TwiML message
+      return twimlEmpty();
     } catch (e) {
       console.warn('[EXPENSE] template send failed; falling back to TwiML:', e?.message);
     }
@@ -164,21 +151,8 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
   return twimlText(`Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.`);
 }
 
-function normalizeDecisionToken(input) {
-  const s = String(input || '').trim().toLowerCase();
+/* ---------------- helpers ---------------- */
 
-  if (s === 'yes' || s === 'y' || s === 'confirm') return 'yes';
-  if (s === 'edit') return 'edit';
-  if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
-
-  if (/\byes\b/.test(s) && s.length <= 20) return 'yes';
-  if (/\bedit\b/.test(s) && s.length <= 20) return 'edit';
-  if (/\bcancel\b/.test(s) && s.length <= 20) return 'cancel';
-
-  return s;
-}
-
-// ---- Media limits (Option A truncation) ----
 const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
 function truncateText(str, maxChars) {
   if (!str) return null;
@@ -187,19 +161,17 @@ function truncateText(str, maxChars) {
   return s.slice(0, maxChars);
 }
 
-// ---- money helpers (COMMA-SAFE) ----
-const MONEY_RE_GLOBAL = /\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/g;
-
-function lastMoneyNumber(text) {
-  const s = String(text || '');
-  const matches = [...s.matchAll(MONEY_RE_GLOBAL)];
-  if (!matches.length) return null;
-  const raw = matches[matches.length - 1][1];
-  const n = Number(String(raw).replace(/,/g, ''));
-  return Number.isFinite(n) ? n : null;
+function normalizeDecisionToken(input) {
+  const s = String(input || '').trim().toLowerCase();
+  if (s === 'yes' || s === 'y' || s === 'confirm') return 'yes';
+  if (s === 'edit') return 'edit';
+  if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
+  if (/\byes\b/.test(s) && s.length <= 20) return 'yes';
+  if (/\bedit\b/.test(s) && s.length <= 20) return 'edit';
+  if (/\bcancel\b/.test(s) && s.length <= 20) return 'cancel';
+  return s;
 }
 
-// ---- basic parsing helpers ----
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.,]/g, '').replace(/,/g, ''));
   if (!Number.isFinite(n)) return null;
@@ -223,9 +195,6 @@ function normalizeJobAnswer(text) {
   return s;
 }
 
-/**
- * Resolve active job name safely (avoid int=uuid comparisons).
- */
 async function resolveActiveJobName({ ownerId, userProfile }) {
   const ownerParam = String(ownerId || '').trim();
   const name = userProfile?.active_job_name || userProfile?.activeJobName || null;
@@ -236,7 +205,6 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
 
   const s = String(ref).trim();
 
-  // UUID jobs.id
   if (looksLikeUuid(s)) {
     try {
       const r = await query(
@@ -252,7 +220,6 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
     }
   }
 
-  // Integer jobs.job_no
   if (/^\d+$/.test(s)) {
     try {
       const r = await query(
@@ -271,76 +238,24 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
-/**
- * Deterministic NL expense parse (backstop)
- * Handles: "I bought $3,427.87 worth of bricks from Convoy Supply today for job 1556 Medway Park Dr"
- */
-function deterministicExpenseParse(input, userProfile) {
-  const raw = String(input || '').trim();
-  if (!raw) return null;
+function inferExpenseCategoryHeuristic(data) {
+  const memo = `${data?.item || ''} ${data?.store || ''}`.toLowerCase();
 
-  // amount: allow commas and choose LAST $ amount if multiple
-  let amtNum = lastMoneyNumber(raw);
-  if (amtNum == null) {
-    // "3427 dollars" / "3,427.87 dollars"
-    const m =
-      raw.match(/\b([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:dollars|bucks)\b/i) ||
-      raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\s*(?:dollars|bucks)\b/i);
-    if (m?.[1]) {
-      const n = Number(String(m[1]).replace(/,/g, ''));
-      if (Number.isFinite(n)) amtNum = n;
-    }
+  if (/\b(lumber|plywood|2x4|2x6|drywall|shingle|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?)\b/.test(memo)) {
+    return 'Materials';
   }
-  if (amtNum == null || amtNum <= 0) return null;
+  if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
+  if (/\b(tool|saw|drill|blade|bit|ladder|hammer)\b/.test(memo)) return 'Tools';
+  if (/\b(subcontract|sub-contractor|subcontractor)\b/.test(memo)) return 'Subcontractors';
+  if (/\b(office|paper|printer|ink|stationery)\b/.test(memo)) return 'Office Supplies';
 
-  const amount = `$${amtNum.toFixed(2)}`;
-
-  // date (tz-aware)
-  const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
-  let date = null;
-  if (/\btoday\b/i.test(raw)) date = parseNaturalDateTz('today', tz);
-  else if (/\byesterday\b/i.test(raw)) date = parseNaturalDateTz('yesterday', tz);
-  else if (/\btomorrow\b/i.test(raw)) date = parseNaturalDateTz('tomorrow', tz);
-  else {
-    const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
-    if (iso) date = iso[1];
-  }
-  if (!date) date = todayInTimeZone(tz);
-
-  // vendor/store: "from X" or "at X"
-  let store = null;
-  const fromMatch = raw.match(/\b(?:from|at)\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|$)/i);
-  if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
-
-  // item: "worth of X" OR "bought X from ..."
-  let item = null;
-  const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|$)/i);
-  if (worthOf?.[1]) item = String(worthOf[1]).trim();
-
-  if (!item) {
-    const bought = raw.match(/\b(?:bought|buy|purchased|purchase|picked\s*up|got)\b\s+(.+?)(?:\s+\b(from|at)\b|\s+\bworth\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|$)/i);
-    if (bought?.[1]) item = String(bought[1]).trim();
-  }
-
-  // jobName: allow "for job X" OR "for X"
-  let jobName = null;
-  const forMatch = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
-  if (forMatch?.[1]) jobName = String(forMatch[1]).trim();
-
-  return {
-    date,
-    amount,
-    item: item || 'Unknown',
-    store: store || 'Unknown Store',
-    jobName: jobName || null
-  };
+  return null;
 }
 
 function normalizeExpenseData(data, userProfile) {
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
   const d = { ...(data || {}) };
 
-  // normalize amount
   if (d.amount != null) {
     const amt = String(d.amount).trim();
     if (amt) {
@@ -366,25 +281,115 @@ function normalizeExpenseData(data, userProfile) {
   return d;
 }
 
-function inferExpenseCategoryHeuristic(data) {
-  const memo = `${data?.item || ''} ${data?.store || ''}`.toLowerCase();
+/* --------- NL money/date helpers (aligned with mediaParser) --------- */
 
-  if (/\b(lumber|plywood|2x4|2x6|drywall|shingle|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?)\b/.test(memo)) {
-    return 'Materials';
-  }
-  if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
-  if (/\b(tool|saw|drill|blade|bit|ladder|hammer)\b/.test(memo)) return 'Tools';
-  if (/\b(subcontract|sub-contractor|subcontractor)\b/.test(memo)) return 'Subcontractors';
-  if (/\b(office|paper|printer|ink|stationery)\b/.test(memo)) return 'Office Supplies';
+function extractMoneyToken(input) {
+  const s = String(input || '');
+
+  // Prefer $ amount
+  let m = s.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
+  if (m?.[1]) return m[1];
+
+  // Thousands comma
+  m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?)\b/);
+  if (m?.[1]) return m[1];
+
+  // >=4 digits
+  m = s.match(/\b([0-9]{4,}(?:\.[0-9]{1,2})?)\b/);
+  if (m?.[1]) return m[1];
+
+  // small number with decimals
+  m = s.match(/\b([0-9]{1,3}\.[0-9]{1,2})\b/);
+  if (m?.[1]) return m[1];
 
   return null;
 }
 
+function moneyToFixed(token) {
+  const raw = String(token || '').trim();
+  if (!raw) return null;
+  const cleaned = raw.replace(/[^0-9.,]/g, '');
+  if (!cleaned) return null;
+  const normalized = cleaned.replace(/,/g, '');
+  const n = Number(normalized);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return `$${n.toFixed(2)}`;
+}
+
 /**
- * Build two possible CIL shapes:
- * 1) "LogExpense" style
- * 2) Legacy "expense" style
+ * Deterministic NL expense parse (voice transcript backstop)
+ * Supports:
+ * - "$3,484.72" or "3,484.72" or "3484.72"
+ * - "on December 22, 2025"
+ * - "for job 1556 Medway Park Drive"
+ * - "worth of bricks"
+ * - "from Convoy Supply"
  */
+function deterministicExpenseParse(input, userProfile) {
+  const raw = String(input || '').trim();
+  if (!raw) return null;
+
+  // amount
+  const token = extractMoneyToken(raw);
+  if (!token) return null;
+
+  const amount = moneyToFixed(token);
+  if (!amount) return null;
+
+  const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
+
+  // date (tz-aware)
+  let date = null;
+
+  if (/\btoday\b/i.test(raw)) date = parseNaturalDateTz('today', tz);
+  else if (/\byesterday\b/i.test(raw)) date = parseNaturalDateTz('yesterday', tz);
+  else if (/\btomorrow\b/i.test(raw)) date = parseNaturalDateTz('tomorrow', tz);
+
+  if (!date) {
+    const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+    if (iso?.[1]) date = iso[1];
+  }
+
+  if (!date) {
+    const mNat = raw.match(/\bon\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/i);
+    if (mNat?.[1]) date = parseNaturalDateTz(mNat[1], tz);
+  }
+
+  if (!date) date = todayInTimeZone(tz);
+
+  // store: "from X" or "at X"
+  let store = null;
+  const fromMatch = raw.match(/\b(?:from|at)\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i);
+  if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
+
+  // item: "worth of X" or "on X"
+  let item = null;
+  const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i);
+  if (worthOf?.[1]) item = String(worthOf[1]).trim();
+
+  if (!item) {
+    const onMatch = raw.match(/\bon\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+    if (onMatch?.[1]) item = String(onMatch[1]).trim();
+  }
+
+  // jobName: "for job X" or "for X"
+  let jobName = null;
+  const forMatch = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+  if (forMatch?.[1]) jobName = String(forMatch[1]).trim();
+
+  if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
+
+  return {
+    date,
+    amount,
+    item: item || 'Unknown',
+    store: store || 'Unknown Store',
+    jobName: jobName || null
+  };
+}
+
+/* ---------------- CIL builders ---------------- */
+
 function buildExpenseCIL_LogExpense({ from, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
   return {
@@ -435,13 +440,11 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
       return { ok: true, cil: null, skipped: true };
     }
 
-    // Try LogExpense first
     const cil1 = buildExpenseCIL_LogExpense({ from, data, jobName, category, sourceMsgId });
     try {
       validateCIL(cil1);
       return { ok: true, cil: cil1, variant: 'LogExpense' };
-    } catch (e1) {
-      // Fall back to legacy
+    } catch {
       const cil2 = buildExpenseCIL_Legacy({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
       validateCIL(cil2);
       return { ok: true, cil: cil2, variant: 'Legacy' };
@@ -467,8 +470,9 @@ async function withTimeout(promise, ms, fallbackValue = '__TIMEOUT__') {
 
 async function handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
+
   const msgId = String(sourceMsgId || '').trim() || `${from}:${Date.now()}`;
-  const safeMsgId = String(sourceMsgId || msgId || '').trim();
+  const safeMsgId = String(msgId).trim();
 
   let reply;
 
@@ -487,44 +491,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     if (pending?.isEditing && pending?.type === 'expense') {
       await deletePendingTransactionState(from);
       pending = null;
-    }
-
-    // Follow-up: expense clarification (DATE only)
-    if (pending?.awaitingExpenseClarification) {
-      const maybeDate = parseNaturalDateTz(input, tz);
-
-      if (maybeDate) {
-        const draft = pending.expenseDraftText || '';
-
-        const parsed = parseExpenseMessage(draft) || {};
-        const backstop = deterministicExpenseParse(draft, userProfile) || {};
-
-        // Force defaults so confirm never prints undefined
-        const merged = normalizeExpenseData(
-          {
-            ...backstop,
-            ...parsed,
-            date: maybeDate,
-            item: parsed.item || backstop.item || 'Unknown',
-            amount: parsed.amount || backstop.amount || '$0.00',
-            store: parsed.store || backstop.store || 'Unknown Store',
-            jobName: parsed.jobName ?? backstop.jobName ?? null
-          },
-          userProfile
-        );
-
-        await mergePendingTransactionState(from, {
-          ...(pending || {}),
-          pendingExpense: merged,
-          awaitingExpenseClarification: false
-        });
-
-        const summaryLine = `Expense: ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date}.`;
-        return await sendConfirmExpenseOrFallback(from, summaryLine);
-      }
-
-      reply = `What date was this expense? (e.g., 2025-12-12 or "today")`;
-      return twimlText(reply);
     }
 
     // Follow-up: job resolution
@@ -553,6 +519,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const token = normalizeDecisionToken(input);
+
+      // ✅ ALIGNMENT: use stable id from media.js if present
       const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
 
       if (token === 'yes' && pending?.pendingExpense) {
@@ -561,7 +529,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
         const data = normalizeExpenseData(rawData, userProfile);
 
-        // Prefer AI category, but always have a fallback suggestion
         const category =
           data.suggestedCategory ||
           (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) ||
@@ -627,7 +594,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         );
 
         if (writeResult === '__DB_TIMEOUT__') {
-          // Preserve pending so user can tap "yes" again
           await mergePendingTransactionState(from, {
             ...(pending || {}),
             pendingExpense: { ...data, jobName, suggestedCategory: category },
@@ -653,7 +619,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           ...(pending || {}),
           isEditing: true,
           type: 'expense',
-          awaitingExpenseClarification: false,
           awaitingExpenseJob: false
         });
         reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
@@ -670,7 +635,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return twimlText(reply);
     }
 
-    // DIRECT PARSE PATH (simple formats) — COMMA-SAFE amount
+    // DIRECT PARSE PATH (simple formats)
     const m = String(input || '').match(/^(?:expense\s+|exp\s+)?\$?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
     if (m) {
       const [, amountRaw, item, store] = m;
@@ -695,30 +660,24 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         (await resolveActiveJobName({ ownerId, userProfile })) ||
         null;
 
-      if (!jobName) {
-        await mergePendingTransactionState(from, {
-          ...(pending || {}),
-          pendingExpense: { ...data, suggestedCategory: category },
-          awaitingExpenseJob: true,
-          expenseSourceMsgId: safeMsgId,
-          type: 'expense'
-        });
-        reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
-        return twimlText(reply);
-      }
-
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingExpense: { ...data, jobName, suggestedCategory: category },
         expenseSourceMsgId: safeMsgId,
-        type: 'expense'
+        type: 'expense',
+        awaitingExpenseJob: !jobName
       });
+
+      if (!jobName) {
+        reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
+        return twimlText(reply);
+      }
 
       const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}.`;
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
-    // NL BACKSTOP FIRST
+    // NL BACKSTOP (voice transcript)
     const backstop = deterministicExpenseParse(input, userProfile);
     if (backstop && backstop.amount) {
       const data = normalizeExpenseData(backstop, userProfile);
@@ -750,16 +709,12 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
-    // AI PATH
+    // AI PATH (fallback)
     const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData);
     let data = aiRes?.data || null;
     let aiReply = aiRes?.reply || null;
 
-    // Ignore category ask — we infer it
-    if (aiReply && /\bcategory\b/i.test(aiReply)) {
-      aiReply = null;
-    }
-
+    if (aiReply && /\bcategory\b/i.test(aiReply)) aiReply = null;
     if (data) data = normalizeExpenseData(data, userProfile);
 
     const missingCore =
@@ -775,10 +730,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingExpense: null,
-        awaitingExpenseClarification: true,
-        expenseClarificationPrompt: aiReply,
-        expenseDraftText: input,
-        expenseSourceMsgId: safeMsgId,
+        isEditing: true,
         type: 'expense'
       });
       return twimlText(aiReply);
@@ -790,8 +742,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         inferExpenseCategoryHeuristic(data) ||
         null;
 
-      data.suggestedCategory = category;
-
       const jobName =
         data.jobName ||
         (await resolveActiveJobName({ ownerId, userProfile })) ||
@@ -799,7 +749,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
-        pendingExpense: { ...data, jobName },
+        pendingExpense: { ...data, jobName, suggestedCategory: category },
         expenseSourceMsgId: safeMsgId,
         type: 'expense',
         awaitingExpenseJob: !jobName

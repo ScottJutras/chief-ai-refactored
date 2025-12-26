@@ -104,7 +104,7 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const payload = {
     to: toClean,
     contentSid: templateSid,
-    contentVariables: JSON.stringify({ "1": String(summaryLine || '').slice(0, 900) })
+    contentVariables: JSON.stringify({ '1': String(summaryLine || '').slice(0, 900) })
   };
 
   if (waFrom) payload.from = waFrom;
@@ -117,7 +117,7 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const TIMEOUT_MS = 2500;
   const msg = await Promise.race([
     client.messages.create(payload),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS)),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
   ]);
 
   console.info('[TEMPLATE] sent', {
@@ -172,14 +172,29 @@ function normalizeDecisionToken(input) {
   return s;
 }
 
+function stripExpensePrefixes(input) {
+  let s = String(input || '').trim();
+  s = s.replace(/^(edit\s+)?expense\s*:\s*/i, '');
+  s = s.replace(/^edit\s*:\s*/i, '');
+  return s.trim();
+}
+
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.,]/g, '').replace(/,/g, ''));
   if (!Number.isFinite(n)) return null;
   return Math.round(n * 100);
 }
 
+function toNumberAmount(amountStr) {
+  const n = Number(String(amountStr || '').replace(/[^0-9.,]/g, '').replace(/,/g, ''));
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
 function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(str || '')
+  );
 }
 
 function looksLikeOverhead(s) {
@@ -241,7 +256,11 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
 function inferExpenseCategoryHeuristic(data) {
   const memo = `${data?.item || ''} ${data?.store || ''}`.toLowerCase();
 
-  if (/\b(lumber|plywood|2x4|2x6|drywall|shingle|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?)\b/.test(memo)) {
+  if (
+    /\b(lumber|plywood|2x4|2x6|drywall|shingle|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?)\b/.test(
+      memo
+    )
+  ) {
     return 'Materials';
   }
   if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
@@ -252,16 +271,25 @@ function inferExpenseCategoryHeuristic(data) {
   return null;
 }
 
+function formatMoneyDisplay(n) {
+  try {
+    const fmt = new Intl.NumberFormat('en-CA', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+    return `$${fmt.format(n)}`;
+  } catch {
+    return `$${n.toFixed(2)}`;
+  }
+}
+
 function normalizeExpenseData(data, userProfile) {
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
   const d = { ...(data || {}) };
 
   if (d.amount != null) {
-    const amt = String(d.amount).trim();
-    if (amt) {
-      const n = Number(amt.replace(/[^0-9.,]/g, '').replace(/,/g, ''));
-      if (Number.isFinite(n) && n > 0) d.amount = `$${n.toFixed(2)}`;
-    }
+    const n = toNumberAmount(d.amount);
+    if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
   }
 
   d.date = String(d.date || '').trim() || todayInTimeZone(tz);
@@ -286,19 +314,15 @@ function normalizeExpenseData(data, userProfile) {
 function extractMoneyToken(input) {
   const s = String(input || '');
 
-  // Prefer $ amount
   let m = s.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
   if (m?.[1]) return m[1];
 
-  // Thousands comma
   m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?)\b/);
   if (m?.[1]) return m[1];
 
-  // >=4 digits
   m = s.match(/\b([0-9]{4,}(?:\.[0-9]{1,2})?)\b/);
   if (m?.[1]) return m[1];
 
-  // small number with decimals
   m = s.match(/\b([0-9]{1,3}\.[0-9]{1,2})\b/);
   if (m?.[1]) return m[1];
 
@@ -313,17 +337,11 @@ function moneyToFixed(token) {
   const normalized = cleaned.replace(/,/g, '');
   const n = Number(normalized);
   if (!Number.isFinite(n) || n <= 0) return null;
-  return `$${n.toFixed(2)}`;
+  return formatMoneyDisplay(n); // ✅ commas
 }
 
 /**
  * Deterministic NL expense parse (voice transcript backstop)
- * Supports:
- * - "$3,484.72" or "3,484.72" or "3484.72"
- * - "on December 22, 2025"
- * - "for job 1556 Medway Park Drive"
- * - "worth of bricks"
- * - "from Convoy Supply"
  */
 function deterministicExpenseParse(input, userProfile) {
   const raw = String(input || '').trim();
@@ -333,7 +351,7 @@ function deterministicExpenseParse(input, userProfile) {
   const token = extractMoneyToken(raw);
   if (!token) return null;
 
-  const amount = moneyToFixed(token);
+  const amount = moneyToFixed(token); // ✅ FIX: no amtNum bug, commas supported
   if (!amount) return null;
 
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
@@ -359,22 +377,30 @@ function deterministicExpenseParse(input, userProfile) {
 
   // store: "from X" or "at X"
   let store = null;
-  const fromMatch = raw.match(/\b(?:from|at)\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i);
+  const fromMatch = raw.match(
+    /\b(?:from|at)\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i
+  );
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
   // item: "worth of X" or "on X"
   let item = null;
-  const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i);
+  const worthOf = raw.match(
+    /\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i
+  );
   if (worthOf?.[1]) item = String(worthOf[1]).trim();
 
   if (!item) {
-    const onMatch = raw.match(/\bon\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+    const onMatch = raw.match(
+      /\bon\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+    );
     if (onMatch?.[1]) item = String(onMatch[1]).trim();
   }
 
   // jobName: "for job X" or "for X"
   let jobName = null;
-  const forMatch = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+  const forMatch = raw.match(
+    /\bfor\s+(?:job\s+)?(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+  );
   if (forMatch?.[1]) jobName = String(forMatch[1]).trim();
 
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
@@ -408,16 +434,16 @@ function buildExpenseCIL_LogExpense({ from, data, jobName, category, sourceMsgId
 function buildExpenseCIL_Legacy({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
   return {
-    cil_version: "1.0",
-    type: "expense",
+    cil_version: '1.0',
+    type: 'expense',
     tenant_id: String(ownerId),
-    source: "whatsapp",
+    source: 'whatsapp',
     source_msg_id: String(sourceMsgId),
 
     actor: {
-      actor_id: String(userProfile?.user_id || from || "unknown"),
-      role: "owner",
-      phone_e164: from && String(from).startsWith("+") ? String(from) : undefined,
+      actor_id: String(userProfile?.user_id || from || 'unknown'),
+      role: 'owner',
+      phone_e164: from && String(from).startsWith('+') ? String(from) : undefined
     },
 
     occurred_at: new Date().toISOString(),
@@ -425,11 +451,11 @@ function buildExpenseCIL_Legacy({ ownerId, from, userProfile, data, jobName, cat
     needs_job_resolution: !jobName,
 
     total_cents: cents,
-    currency: "CAD",
+    currency: 'CAD',
 
     vendor: data.store && data.store !== 'Unknown Store' ? String(data.store) : undefined,
     memo: data.item && data.item !== 'Unknown' ? String(data.item) : undefined,
-    category: category ? String(category) : undefined,
+    category: category ? String(category) : undefined
   };
 }
 
@@ -460,19 +486,18 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 }
 
 async function withTimeout(promise, ms, fallbackValue = '__TIMEOUT__') {
-  return Promise.race([
-    promise,
-    new Promise(resolve => setTimeout(() => resolve(fallbackValue), ms))
-  ]);
+  return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms))]);
 }
 
 /* ---------------- main handler ---------------- */
 
 async function handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
+  input = stripExpensePrefixes(input);
+
   const lockKey = `lock:${from}`;
 
   const msgId = String(sourceMsgId || '').trim() || `${from}:${Date.now()}`;
-  const safeMsgId = String(msgId).trim();
+  const safeMsgId = String(sourceMsgId || msgId || '').trim();
 
   let reply;
 
@@ -496,7 +521,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     // Follow-up: job resolution
     if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
       const jobReply = normalizeJobAnswer(input);
-      const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : (jobReply || null);
+      const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : jobReply || null;
 
       const merged = normalizeExpenseData({ ...pending.pendingExpense, jobName: finalJob }, userProfile);
 
@@ -506,7 +531,9 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         awaitingExpenseJob: false
       });
 
-      const summaryLine = `Expense: ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date}${merged.jobName ? ` for ${merged.jobName}` : ''}.`;
+      const summaryLine = `Expense: ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date}${
+        merged.jobName ? ` for ${merged.jobName}` : ''
+      }.`;
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
@@ -520,7 +547,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const token = normalizeDecisionToken(input);
 
-      // ✅ ALIGNMENT: use stable id from media.js if present
+      // ✅ prefer stable id from media.js if present
       const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
 
       if (token === 'yes' && pending?.pendingExpense) {
@@ -573,7 +600,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             date: data.date || todayInTimeZone(tz),
             description: String(data.item || '').trim() || 'Unknown',
             amount_cents: amountCents,
-            amount: null,
+            amount: toNumberAmount(data.amount), // ✅ keep numeric amount too (if your schema uses it)
             source: String(data.store || '').trim() || 'Unknown',
             job: jobName,
             job_name: jobName,
@@ -606,23 +633,21 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         }
 
         reply =
-  writeResult?.inserted === false
-    ? '✅ Already logged that expense (duplicate message).'
-    : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}${category ? ` (Category: ${category})` : ''}`;
-
+          writeResult?.inserted === false
+            ? '✅ Already logged that expense (duplicate message).'
+            : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}${
+                category ? ` (Category: ${category})` : ''
+              }`;
 
         await deletePendingTransactionState(from);
         return twimlText(reply);
       }
 
       if (token === 'edit') {
-        await mergePendingTransactionState(from, {
-          ...(pending || {}),
-          isEditing: true,
-          type: 'expense',
-          awaitingExpenseJob: false
-        });
-        reply = '✏️ Okay — resend the expense in one line (e.g., "expense 84.12 nails from Home Depot").';
+        // ✅ clear pending so the replacement message doesn't get "pending-nudged"
+        await deletePendingTransactionState(from);
+
+        reply = '✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").';
         return twimlText(reply);
       }
 
@@ -637,29 +662,31 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     }
 
     // DIRECT PARSE PATH (simple formats)
-    const m = String(input || '').match(/^(?:expense\s+|exp\s+)?\$?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
+    const m = String(input || '').match(
+      /^(?:expense\s+|exp\s+)?\$?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i
+    );
     if (m) {
       const [, amountRaw, item, store] = m;
 
       const n = Number(String(amountRaw).replace(/,/g, ''));
-      const amount = Number.isFinite(n) ? `$${n.toFixed(2)}` : '$0.00';
+      const amount = Number.isFinite(n) && n > 0 ? formatMoneyDisplay(n) : '$0.00'; // ✅ commas
 
-      const data = normalizeExpenseData({
-        date: todayInTimeZone(tz),
-        item,
-        amount,
-        store: store || 'Unknown Store'
-      }, userProfile);
+      const data = normalizeExpenseData(
+        {
+          date: todayInTimeZone(tz),
+          item,
+          amount,
+          store: store || 'Unknown Store'
+        },
+        userProfile
+      );
 
       const category =
         (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) ||
         inferExpenseCategoryHeuristic(data) ||
         null;
 
-      const jobName =
-        data.jobName ||
-        (await resolveActiveJobName({ ownerId, userProfile })) ||
-        null;
+      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
@@ -688,10 +715,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         inferExpenseCategoryHeuristic(data) ||
         null;
 
-      const jobName =
-        data.jobName ||
-        (await resolveActiveJobName({ ownerId, userProfile })) ||
-        null;
+      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
@@ -743,10 +767,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         inferExpenseCategoryHeuristic(data) ||
         null;
 
-      const jobName =
-        data.jobName ||
-        (await resolveActiveJobName({ ownerId, userProfile })) ||
-        null;
+      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
@@ -761,13 +782,14 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return twimlText(reply);
       }
 
-      const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${data.date || todayInTimeZone(tz)} for ${jobName}.`;
+      const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${
+        data.date || todayInTimeZone(tz)
+      } for ${jobName}.`;
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
     reply = `🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`;
     return twimlText(reply);
-
   } catch (error) {
     console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
       code: error?.code,

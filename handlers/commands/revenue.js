@@ -1,10 +1,6 @@
 // handlers/commands/revenue.js
 
-const {
-  insertTransaction,
-  normalizeMediaMeta,
-  DIGITS
-} = require('../../services/postgres');
+const { insertTransaction, normalizeMediaMeta, DIGITS } = require('../../services/postgres');
 
 const state = require('../../utils/stateManager');
 const getPendingTransactionState = state.getPendingTransactionState;
@@ -97,18 +93,14 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   if (!to) throw new Error('Missing "to"');
   if (!templateSid) throw new Error('Missing templateSid');
 
-  // Twilio expects: to="whatsapp:+E164"
-  const toClean = String(to).startsWith('whatsapp:')
-    ? String(to)
-    : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
+  const toClean = String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
 
   const payload = {
     to: toClean,
     contentSid: templateSid,
-    contentVariables: JSON.stringify({ "1": String(summaryLine || '').slice(0, 900) }),
+    contentVariables: JSON.stringify({ '1': String(summaryLine || '').slice(0, 900) })
   };
 
-  // For WhatsApp templates: prefer explicit WhatsApp sender
   if (waFrom) payload.from = waFrom;
   else if (messagingServiceSid) payload.messagingServiceSid = messagingServiceSid;
   else throw new Error('Missing TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID');
@@ -116,11 +108,10 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const twilio = require('twilio');
   const client = twilio(accountSid, authToken);
 
-  // Prevent webhook hangs: hard timeout around Twilio call
   const TIMEOUT_MS = 2500;
   const msg = await Promise.race([
     client.messages.create(payload),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS)),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
   ]);
 
   console.info('[TEMPLATE] sent', {
@@ -187,10 +178,25 @@ function toNumberAmount(amountStr) {
   return n;
 }
 
+function formatMoneyDisplay(n) {
+  try {
+    const fmt = new Intl.NumberFormat('en-CA', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+    return `$${fmt.format(n)}`;
+  } catch {
+    return `$${n.toFixed(2)}`;
+  }
+}
+
 function todayInTimeZone(tz) {
   try {
     const dtf = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
     });
     return dtf.format(new Date()); // YYYY-MM-DD
   } catch {
@@ -222,11 +228,9 @@ function parseNaturalDate(s, tz) {
   }
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
 
-  // ISO anywhere
   const iso = t.match(/\b(\d{4}-\d{2}-\d{2})\b/);
   if (iso?.[1]) return iso[1];
 
-  // "on December 22, 2025" / "December 22 2025"
   const mNat = raw.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/);
   if (mNat?.[1]) {
     const parsed = Date.parse(mNat[1]);
@@ -255,14 +259,13 @@ function looksLikeOverhead(s) {
 function looksLikeAddress(s) {
   const t = String(s || '').trim();
   if (!/\d/.test(t)) return false;
-  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pkwy|park)\b/i.test(t);
+  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pkwy|park)\b/i.test(
+    t
+  );
 }
 
 async function withTimeout(promise, ms, fallbackValue = null) {
-  return Promise.race([
-    promise,
-    new Promise(resolve => setTimeout(() => resolve(fallbackValue), ms))
-  ]);
+  return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms))]);
 }
 
 function normalizeRevenueData(data, tz) {
@@ -270,7 +273,7 @@ function normalizeRevenueData(data, tz) {
 
   if (d.amount != null) {
     const n = toNumberAmount(d.amount);
-    if (Number.isFinite(n) && n > 0) d.amount = `$${n.toFixed(2)}`;
+    if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n); // ✅ commas
   }
 
   d.date = String(d.date || '').trim() || todayInTimeZone(tz);
@@ -339,19 +342,15 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 function extractMoneyToken(raw) {
   const s = String(raw || '');
 
-  // Prefer $ amount
   let m = s.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
   if (m?.[1]) return m[1];
 
-  // Thousands comma
   m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?)\b/);
   if (m?.[1]) return m[1];
 
-  // >=4 digits
   m = s.match(/\b([0-9]{4,}(?:\.[0-9]{1,2})?)\b/);
   if (m?.[1]) return m[1];
 
-  // small number with decimals
   m = s.match(/\b([0-9]{1,3}\.[0-9]{1,2})\b/);
   if (m?.[1]) return m[1];
 
@@ -363,33 +362,32 @@ function moneyToFixed(token) {
   if (!cleaned) return null;
   const n = Number(cleaned.replace(/,/g, ''));
   if (!Number.isFinite(n) || n <= 0) return null;
-  return `$${n.toFixed(2)}`;
+  return formatMoneyDisplay(n); // ✅ commas
 }
 
 /**
  * Deterministic parse:
  * - supports $8,436.10 / 8,436.10 / 8436.10
- * - avoids grabbing address numbers as amount by not accepting bare integers like "1556"
+ * - avoids grabbing address numbers as amount by not accepting bare integers like "1556" unless clearly money
  * - supports "on December 22, 2025"
  */
 async function deterministicRevenueParse({ input, tz }) {
   const raw = String(input || '').trim();
   if (!raw) return null;
 
-  // Amount: prefer explicit dollars. If no $, accept comma/decimal/4+ digits/decimal patterns
   const token = extractMoneyToken(raw);
 
-  // Extra safety: if token is a 4+ digit integer and appears right after "job" or looks like address number, ignore
   if (token && /^\d{4,}$/.test(String(token).replace(/,/g, ''))) {
-    // If it's literally the first number in something like "job 1556", don't treat as amount
     const jobNum = raw.match(/\bjob\s+(\d{3,6})\b/i)?.[1];
     if (jobNum && String(jobNum) === String(token).replace(/,/g, '')) {
-      // try again with only $ matches
       const dollarOnly = raw.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
       if (dollarOnly?.[1]) {
         const amt = moneyToFixed(dollarOnly[1]);
         if (!amt) return null;
-        return normalizeRevenueData({ amount: amt, date: todayInTimeZone(tz), description: 'Revenue received', source: 'Unknown', jobName: null }, tz);
+        return normalizeRevenueData(
+          { amount: amt, date: todayInTimeZone(tz), description: 'Revenue received', source: 'Unknown', jobName: null },
+          tz
+        );
       }
       return null;
     }
@@ -416,25 +414,33 @@ async function deterministicRevenueParse({ input, tz }) {
   // Job patterns
   let jobName = null;
 
-  const forMatch = raw.match(/\bfor\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+  const forMatch = raw.match(
+    /\bfor\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+  );
   if (forMatch?.[1]) {
     const candidate = normalizeJobAnswer(forMatch[1]);
     if (!/^\$?\s*\d[\d,]*(?:\.\d{1,2})?$/.test(candidate)) jobName = candidate;
   }
 
   if (!jobName) {
-    const onMatch = raw.match(/\bon\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+    const onMatch = raw.match(
+      /\bon\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+    );
     if (onMatch?.[1]) jobName = normalizeJobAnswer(onMatch[1]);
   }
 
   if (!jobName) {
-    const jobMatch = raw.match(/\bjob\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+    const jobMatch = raw.match(
+      /\bjob\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+    );
     if (jobMatch?.[1]) jobName = normalizeJobAnswer(jobMatch[1]);
   }
 
   // "from X" might be job/address or payer
   let source = 'Unknown';
-  const fromMatch = raw.match(/\bfrom\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
+  const fromMatch = raw.match(
+    /\bfrom\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+  );
   if (fromMatch?.[1]) {
     const token2 = normalizeJobAnswer(fromMatch[1]);
     if (looksLikeAddress(token2) || looksLikeAddress(fromMatch[1])) {
@@ -447,28 +453,22 @@ async function deterministicRevenueParse({ input, tz }) {
 
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-  return normalizeRevenueData({
-    date,
-    description: 'Revenue received',
-    amount,
-    source,
-    jobName
-  }, tz);
+  return normalizeRevenueData(
+    {
+      date,
+      description: 'Revenue received',
+      amount,
+      source,
+      jobName
+    },
+    tz
+  );
 }
 
 /**
  * Canonical insert
  */
-async function writeRevenueViaCanonicalInsert({
-  ownerId,
-  from,
-  userProfile,
-  data,
-  jobName,
-  category,
-  sourceMsgId,
-  pendingMediaMeta
-}) {
+async function writeRevenueViaCanonicalInsert({ ownerId, from, userProfile, data, jobName, category, sourceMsgId, pendingMediaMeta }) {
   const ownerStr = String(ownerId || '').trim();
   const owner = /^\d+$/.test(ownerStr) ? DIGITS(ownerStr) : ownerStr;
   if (!owner) throw new Error('Missing ownerId');
@@ -502,7 +502,7 @@ async function writeRevenueViaCanonicalInsert({
     description: String(data.description || 'Revenue received').trim() || 'Revenue received',
     amount_cents: amountCents,
     amount: toNumberAmount(data.amount),
-    source: (data.source && data.source !== 'Unknown') ? String(data.source).trim() : 'Unknown',
+    source: data.source && data.source !== 'Unknown' ? String(data.source).trim() : 'Unknown',
     job: jobName ? String(jobName).trim() : null,
     job_name: jobName ? String(jobName).trim() : null,
     category: safeCategory,
@@ -512,7 +512,6 @@ async function writeRevenueViaCanonicalInsert({
     mediaMeta: mediaMeta ? { ...mediaMeta } : null
   };
 
-  // Some versions of insertTransaction accept options; others ignore it.
   return await insertTransaction(payload, { timeoutMs: 4500 });
 }
 
@@ -521,10 +520,8 @@ async function writeRevenueViaCanonicalInsert({
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   const lockKey = `lock:${from}`;
 
-  // IMPORTANT: stableMsgId is set by media.js into pending.revenueSourceMsgId;
-  // this safeMsgId is just a fallback for text-only entry.
   const msgId = String(sourceMsgId || '').trim() || `${from}:${Date.now()}`;
-  const safeMsgId = String(msgId).trim();
+  const safeMsgId = String(sourceMsgId || msgId || '').trim();
 
   let reply;
 
@@ -545,7 +542,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       if (maybeDate) {
         const draft = pending.revenueDraftText || '';
         const parsed = parseRevenueMessage(draft) || {};
-        const backstop = await deterministicRevenueParse({ input: draft, tz }) || {};
+        const backstop = (await deterministicRevenueParse({ input: draft, tz })) || {};
         const merged = normalizeRevenueData({ ...backstop, ...parsed, date: maybeDate }, tz);
 
         await mergePendingTransactionState(from, {
@@ -554,9 +551,10 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           awaitingRevenueClarification: false
         });
 
-        const payerPart =
-          merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
-        const summaryLine = `You received ${merged.amount}${payerPart} on ${merged.date}${merged.jobName ? ` for ${merged.jobName}` : ''}.`;
+        const payerPart = merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
+        const summaryLine = `You received ${merged.amount}${payerPart} on ${merged.date}${
+          merged.jobName ? ` for ${merged.jobName}` : ''
+        }.`;
         return await sendConfirmRevenueOrFallback(from, summaryLine);
       }
 
@@ -567,7 +565,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     // Follow-up: ask for job
     if (pending?.awaitingRevenueJob && pending?.pendingRevenue) {
       const jobReply = normalizeJobAnswer(input);
-      const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : (jobReply || null);
+      const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : jobReply || null;
 
       const merged = normalizeRevenueData({ ...pending.pendingRevenue, jobName: finalJob }, tz);
 
@@ -577,9 +575,10 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         awaitingRevenueJob: false
       });
 
-      const payerPart =
-        merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
-      const summaryLine = `You received ${merged.amount}${payerPart} on ${merged.date}${merged.jobName ? ` for ${merged.jobName}` : ''}.`;
+      const payerPart = merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
+      const summaryLine = `You received ${merged.amount}${payerPart} on ${merged.date}${
+        merged.jobName ? ` for ${merged.jobName}` : ''
+      }.`;
       return await sendConfirmRevenueOrFallback(from, summaryLine);
     }
 
@@ -593,7 +592,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
       const token = normalizeDecisionToken(input);
 
-      // ✅ ALIGNMENT: prefer stable id from media.js
+      // ✅ prefer stable id from media.js
       const stableMsgId = String(pending.revenueSourceMsgId || safeMsgId).trim();
 
       if (token === 'yes') {
@@ -619,11 +618,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
         const category =
           data.suggestedCategory ||
-          (await withTimeout(
-            Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
-            1200,
-            null
-          )) || null;
+          (await withTimeout(Promise.resolve(categorizeEntry('revenue', data, ownerProfile)), 1200, null)) ||
+          null;
 
         const gate = assertRevenueCILOrClarify({
           ownerId,
@@ -666,8 +662,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           return twimlText(reply);
         }
 
-        const payerPart =
-          data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+        const payerPart = data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
 
         reply =
           result?.inserted === false
@@ -679,13 +674,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       if (token === 'edit') {
-        await mergePendingTransactionState(from, {
-          ...pending,
-          isEditing: true,
-          type: 'revenue',
-          awaitingRevenueClarification: false,
-          awaitingRevenueJob: false
-        });
+        // ✅ ALIGNMENT: clear pending immediately to prevent "pending-nudge" confusion
+        await deletePendingTransactionState(from);
 
         reply = '✏️ Okay — resend the Revenue details in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
         return twimlText(reply);
@@ -739,10 +729,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       if (!existingJob && srcRaw) {
         const srcClean = normalizeJobAnswer(srcRaw);
 
-        const srcLooksJob =
-          /^\s*job\b/i.test(srcRaw) ||
-          looksLikeAddress(srcClean) ||
-          looksLikeAddress(srcRaw);
+        const srcLooksJob = /^\s*job\b/i.test(srcRaw) || looksLikeAddress(srcClean) || looksLikeAddress(srcRaw);
 
         if (srcLooksJob) {
           data.jobName = looksLikeOverhead(srcClean) ? 'Overhead' : srcClean;
@@ -769,11 +756,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const category =
-        (await withTimeout(
-          Promise.resolve(categorizeEntry('revenue', data, ownerProfile)),
-          1200,
-          null
-        )) || null;
+        (await withTimeout(Promise.resolve(categorizeEntry('revenue', data, ownerProfile)), 1200, null)) || null;
 
       data.suggestedCategory = category;
 
@@ -792,7 +775,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return twimlText(reply);
       }
 
-      // Confirm step → send WhatsApp template buttons outbound
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingRevenue: { ...data, jobName },
@@ -800,15 +782,13 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         type: 'revenue'
       });
 
-      const payerPart =
-        data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
+      const payerPart = data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
       const summaryLine = `You received ${data.amount}${payerPart} on ${data.date} for ${jobName}.`;
       return await sendConfirmRevenueOrFallback(from, summaryLine);
     }
 
     reply = `🤔 Couldn’t parse Revenue from "${input}". Try "received $100 for 1556 Medway Park Dr today".`;
     return twimlText(reply);
-
   } catch (error) {
     console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {
       code: error?.code,

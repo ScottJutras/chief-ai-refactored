@@ -81,20 +81,38 @@ function normalizeJobToken(s) {
  * - 3,484
  * Returns "$3484.72"
  */
+function formatMoneyDisplay(n) {
+  try {
+    // en-CA gives you comma grouping and dot decimals
+    const fmt = new Intl.NumberFormat('en-CA', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+    return `$${fmt.format(n)}`;
+  } catch {
+    return `$${n.toFixed(2)}`;
+  }
+}
+
+/**
+ * Money parsing that supports:
+ * - $3,484.72
+ * - 3484.72
+ * - 3,484
+ * Returns "$3,484.72"
+ */
 function moneyToFixed(amountStr) {
   const raw = String(amountStr || '').trim();
   if (!raw) return null;
 
-  // strip non-numeric except dot/comma
   const cleaned = raw.replace(/[^0-9.,]/g, '');
   if (!cleaned) return null;
 
-  // remove thousands commas
   const normalized = cleaned.replace(/,/g, '');
   const n = Number(normalized);
   if (!Number.isFinite(n) || n <= 0) return null;
 
-  return `$${n.toFixed(2)}`;
+  return formatMoneyDisplay(n);
 }
 
 /**

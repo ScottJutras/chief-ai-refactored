@@ -17,11 +17,6 @@ const mergePendingTransactionState =
 
 const ai = require('../../utils/aiErrorHandler');
 
-// Optional: log once if detectErrors isn't available (we'll fail-open)
-if (typeof ai.detectErrors !== 'function' && typeof ai.detectError !== 'function') {
-  console.warn('[REVENUE] aiErrorHandler has no detectErrors; skipping error detection (fail-open).');
-}
-
 // Serverless-safe / backwards-compatible imports
 const handleInputWithAI = ai.handleInputWithAI;
 const parseRevenueMessage = ai.parseRevenueMessage;
@@ -38,7 +33,6 @@ const categorizeEntry =
 
 // ---- CIL validator (fail-open) ----
 const cilMod = require('../../cil');
-
 const validateCIL =
   (cilMod && typeof cilMod.validateCIL === 'function' && cilMod.validateCIL) ||
   (cilMod && typeof cilMod.validateCil === 'function' && cilMod.validateCil) ||
@@ -55,18 +49,7 @@ if (!validateCIL) {
   console.warn('[REVENUE] validateCIL not found in ../../cil export; CIL gate will be fail-open until fixed.');
 }
 
-/* ---------------- Twilio Content Template (Quick Reply Buttons) ---------------- */
-
-// Put the SID in Vercel env vars. This handler tries a few common names.
-// Recommended: TWILIO_REVENUE_CONFIRM_TEMPLATE_SID=HX...
-function getRevenueConfirmTemplateSid() {
-  return (
-    process.env.TWILIO_REVENUE_CONFIRM_TEMPLATE_SID ||
-    process.env.REVENUE_CONFIRM_TEMPLATE_SID ||
-    process.env.TWILIO_TEMPLATE_REVENUE_CONFIRM_SID ||
-    null
-  );
-}
+/* ---------------- Twilio Content Template (WhatsApp Quick Reply Buttons) ---------------- */
 
 function xmlEsc(s = '') {
   return String(s)
@@ -81,40 +64,113 @@ function twimlText(msg) {
   return `<Response><Message>${xmlEsc(msg)}</Message></Response>`;
 }
 
-// Twilio Content Template TwiML:
-// <Message>
-//   <Content sid="HX...">
-//     <Parameter name="1">...</Parameter>
-//   </Content>
-// </Message>
-function twimlConfirmRevenue(summaryLine) {
+function twimlEmpty() {
+  return `<Response></Response>`;
+}
+
+function getRevenueConfirmTemplateSid() {
+  return (
+    process.env.TWILIO_REVENUE_CONFIRM_TEMPLATE_SID ||
+    process.env.REVENUE_CONFIRM_TEMPLATE_SID ||
+    process.env.TWILIO_TEMPLATE_REVENUE_CONFIRM_SID ||
+    null
+  );
+}
+
+function waTo(from) {
+  const d = String(from || '').replace(/\D/g, '');
+  return d ? `whatsapp:+${d}` : null;
+}
+
+/**
+ * Sends WhatsApp Content Template via Twilio REST API.
+ * IMPORTANT: This is NOT TwiML Content tag; this is outbound REST send.
+ */
+async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+  const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID || null;
+  const waFrom = process.env.TWILIO_WHATSAPP_FROM || null;
+
+  if (!accountSid || !authToken) throw new Error('Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN');
+  if (!to) throw new Error('Missing "to"');
+  if (!templateSid) throw new Error('Missing templateSid');
+
+  // Twilio expects: to="whatsapp:+E164"
+  const toClean = String(to).startsWith('whatsapp:')
+    ? String(to)
+    : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
+
+  const payload = {
+    to: toClean,
+    contentSid: templateSid,
+    contentVariables: JSON.stringify({ "1": String(summaryLine || '').slice(0, 900) }),
+  };
+
+  // For WhatsApp templates: prefer explicit WhatsApp sender
+  if (waFrom) payload.from = waFrom;
+  else if (messagingServiceSid) payload.messagingServiceSid = messagingServiceSid;
+  else throw new Error('Missing TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID');
+
+  const twilio = require('twilio');
+  const client = twilio(accountSid, authToken);
+
+  // Prevent webhook hangs: hard timeout around Twilio call
+  const TIMEOUT_MS = 2500;
+  const msg = await Promise.race([
+    client.messages.create(payload),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS)),
+  ]);
+
+  console.info('[TEMPLATE] sent', {
+    to: payload.to,
+    from: payload.from || null,
+    messagingServiceSid: payload.messagingServiceSid || null,
+    contentSid: payload.contentSid,
+    sid: msg?.sid || null,
+    status: msg?.status || null
+  });
+
+  return msg;
+}
+
+async function sendConfirmRevenueOrFallback(from, summaryLine) {
   const sid = getRevenueConfirmTemplateSid();
-  if (!sid) {
-    // fallback (still works)
-    return twimlText(`Please confirm this Revenue:\n${summaryLine}\n\nReply yes/edit/cancel.`);
+  const to = waTo(from);
+
+  console.info('[REVENUE] confirm template attempt', {
+    from,
+    to,
+    hasSid: !!sid,
+    sid: sid || null
+  });
+
+  if (sid && to) {
+    try {
+      await sendWhatsAppTemplate({ to, templateSid: sid, summaryLine });
+      console.info('[REVENUE] confirm template sent OK', { to, sid });
+      return twimlEmpty(); // do NOT also send TwiML text
+    } catch (e) {
+      console.warn('[REVENUE] template send failed; falling back to TwiML:', e?.message);
+    }
   }
 
-  return (
-    `<Response><Message>` +
-      `<Content sid="${xmlEsc(sid)}">` +
-        `<Parameter name="1">${xmlEsc(summaryLine)}</Parameter>` +
-      `</Content>` +
-    `</Message></Response>`
-  );
+  return twimlText(`Please confirm this Revenue:\n${summaryLine}\n\nReply yes/edit/cancel.`);
 }
 
 function normalizeDecisionToken(input) {
   const s = String(input || '').trim().toLowerCase();
 
-  // button text often arrives as "Yes"/"Edit"/"Cancel"
-  if (s === 'yes' || s === 'y') return 'yes';
+  // button payload/text often arrives as "yes"/"edit"/"cancel" (or "Yes")
+  if (s === 'yes' || s === 'y' || s === 'confirm') return 'yes';
   if (s === 'edit') return 'edit';
   if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
 
-  // sometimes payload-like values leak into Body
-  if (/\byes\b/.test(s) && s.length <= 12) return 'yes';
-  if (/\bedit\b/.test(s) && s.length <= 12) return 'edit';
-  if (/\bcancel\b/.test(s) && s.length <= 12) return 'cancel';
+  // safety for payload-like strings
+  if (/\byes\b/.test(s) && s.length <= 20) return 'yes';
+  if (/\bedit\b/.test(s) && s.length <= 20) return 'edit';
+  if (/\bcancel\b/.test(s) && s.length <= 20) return 'cancel';
 
   return s;
 }
@@ -217,7 +273,7 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   try {
     const cil = buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
 
-    // FAIL-OPEN if validator missing (prevents blocking ingestion)
+    // FAIL-OPEN if validator missing
     if (typeof validateCIL !== 'function') {
       console.warn('[REVENUE] validateCIL missing; skipping CIL validation (fail-open).');
       return { ok: true, cil, skipped: true };
@@ -236,18 +292,11 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
 }
 
 /**
- * Deterministic parse:
- * - amount: $100 or 100
- * - date: today/yesterday/tomorrow/YYYY-MM-DD
- * - job: "for <job>" OR "on <job>" OR "job <job>" OR address-like token after "from" if it looks like job/address
- * - payer optional: only if it DOESN’T look like address/job
- *
- * NOTE: "from <job>" is common; we'll treat address-like from as job.
+ * Deterministic parse
  */
-async function deterministicRevenueParse({ ownerId, input, tz }) {
+async function deterministicRevenueParse({ input, tz }) {
   const raw = String(input || '').trim();
 
-  // amount
   const amtMatch =
     raw.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/) ||
     raw.match(/\b([0-9]+(?:\.[0-9]{1,2})?)\b/);
@@ -257,7 +306,6 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
   const amountNum = amtMatch[1];
   const amount = `$${Number(amountNum).toFixed(2)}`;
 
-  // date
   let date = null;
   if (/\btoday\b/i.test(raw)) date = parseNaturalDate('today', tz);
   else if (/\byesterday\b/i.test(raw)) date = parseNaturalDate('yesterday', tz);
@@ -268,7 +316,6 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
   }
   if (!date) date = todayInTimeZone(tz);
 
-  // job patterns
   let jobName = null;
 
   const forMatch = raw.match(/\bfor\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
@@ -284,7 +331,6 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
     if (jobMatch?.[1]) jobName = normalizeJobAnswer(jobMatch[1]);
   }
 
-  // "from X" might be job/address or payer
   let source = 'Unknown';
   const fromMatch = raw.match(/\bfrom\s+(.+?)(?:\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$)/i);
   if (fromMatch?.[1]) {
@@ -293,11 +339,10 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
       jobName = jobName || token;
       source = 'Unknown';
     } else {
-      source = token; // payer
+      source = token;
     }
   }
 
-  // overhead normalization
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
   return {
@@ -310,7 +355,7 @@ async function deterministicRevenueParse({ ownerId, input, tz }) {
 }
 
 /**
- * Canonical insert: delegates to services/postgres.insertTransaction()
+ * Canonical insert
  */
 async function writeRevenueViaCanonicalInsert({
   ownerId,
@@ -322,7 +367,9 @@ async function writeRevenueViaCanonicalInsert({
   sourceMsgId,
   pendingMediaMeta
 }) {
-  const owner = DIGITS(ownerId || '');
+  // ownerId might be UUID; only DIGITS() if numeric
+  const ownerStr = String(ownerId || '').trim();
+  const owner = /^\d+$/.test(ownerStr) ? DIGITS(ownerStr) : ownerStr;
   if (!owner) throw new Error('Missing ownerId');
 
   const amountCents = toCents(data.amount);
@@ -353,7 +400,7 @@ async function writeRevenueViaCanonicalInsert({
     date: String(data.date || '').trim() || todayInTimeZone(tz),
     description: String(data.description || 'Payment received').trim() || 'Payment received',
     amount_cents: amountCents,
-    amount: toNumberAmount(data.amount), // optional numeric (schema-aware in insertTransaction)
+    amount: toNumberAmount(data.amount),
     source: (data.source && data.source !== 'Unknown') ? String(data.source).trim() : 'Unknown',
     job: jobName ? String(jobName).trim() : null,
     job_name: jobName ? String(jobName).trim() : null,
@@ -403,7 +450,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         const payerPart =
           merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
         const summaryLine = `You received ${merged.amount}${payerPart} on ${merged.date}${merged.jobName ? ` for ${merged.jobName}` : ''}.`;
-        return twimlConfirmRevenue(summaryLine);
+        return await sendConfirmRevenueOrFallback(from, summaryLine);
       }
 
       reply = `What date was this payment? (e.g., 2025-12-12 or "today")`;
@@ -426,7 +473,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       const payerPart =
         merged.source && merged.source !== 'Unknown' ? ` from ${merged.source}` : '';
       const summaryLine = `You received ${merged.amount}${payerPart} on ${merged.date} for ${merged.jobName}.`;
-      return twimlConfirmRevenue(summaryLine);
+      return await sendConfirmRevenueOrFallback(from, summaryLine);
     }
 
     // --- CONFIRM FLOW ---
@@ -446,7 +493,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         const data = pending.pendingRevenue || {};
         const pendingMediaMeta = pending?.pendingMediaMeta || null;
 
-        // job required (or Overhead)
         let jobName = (data.jobName && String(data.jobName).trim()) || null;
         if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
@@ -500,7 +546,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         );
 
         if (result === '__DB_TIMEOUT__') {
-          // keep pending so they can resend "yes"
           await mergePendingTransactionState(from, {
             ...pending,
             pendingRevenue: { ...data, jobName, suggestedCategory: category || data.suggestedCategory },
@@ -520,7 +565,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
             ? '✅ Already logged that payment (duplicate message).'
             : `✅ Payment logged: ${data.amount}${payerPart} for ${jobName}${category ? ` (Category: ${category})` : ''}`;
 
-        // Clear everything (includes media meta)
         await deletePendingTransactionState(from);
         return twimlText(reply);
       }
@@ -549,10 +593,9 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     }
 
     // --- PARSE PATH (Deterministic first, AI fallback) ---
-    const deterministic = await deterministicRevenueParse({ ownerId, input, tz });
+    const deterministic = await deterministicRevenueParse({ input, tz });
 
     let data = deterministic;
-    let confirmed = true;
     let aiReply = null;
 
     if (!data) {
@@ -563,7 +606,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         source: 'Unknown'
       });
       data = aiRes?.data || null;
-      confirmed = !!aiRes?.confirmed;
       aiReply = aiRes?.reply || null;
     }
 
@@ -641,7 +683,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return twimlText(reply);
       }
 
-      // Keep the confirm step → now uses quick reply buttons.
+      // Confirm step → send WhatsApp template buttons outbound
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingRevenue: { ...data, jobName },
@@ -652,11 +694,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       const payerPart =
         data.source && data.source !== 'Unknown' ? ` from ${data.source}` : '';
       const summaryLine = `You received ${data.amount}${payerPart} on ${data.date} for ${jobName}.`;
-      return twimlConfirmRevenue(summaryLine);
+      return await sendConfirmRevenueOrFallback(from, summaryLine);
     }
 
     reply = `🤔 Couldn’t parse a payment from "${input}". Try "received $100 for 1556 Medway Park Dr today".`;
     return twimlText(reply);
+
   } catch (error) {
     console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {
       code: error?.code,

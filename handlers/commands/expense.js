@@ -37,18 +37,7 @@ const validateCIL =
   (typeof cilMod === 'function' && cilMod) ||
   null;
 
-/* ---------------- Twilio Content Template (Quick Reply Buttons) ---------------- */
-
-// Put the SID in Vercel env vars. This handler tries a few common names.
-// Recommended: TWILIO_EXPENSE_CONFIRM_TEMPLATE_SID=HX...
-function getExpenseConfirmTemplateSid() {
-  return (
-    process.env.TWILIO_EXPENSE_CONFIRM_TEMPLATE_SID ||
-    process.env.EXPENSE_CONFIRM_TEMPLATE_SID ||
-    process.env.TWILIO_TEMPLATE_EXPENSE_CONFIRM_SID ||
-    null
-  );
-}
+/* ---------------- Twilio Content Template (WhatsApp Quick Reply Buttons) ---------------- */
 
 function xmlEsc(s = '') {
   return String(s)
@@ -63,19 +52,94 @@ function twimlText(msg) {
   return `<Response><Message>${xmlEsc(msg)}</Message></Response>`;
 }
 
-function twimlConfirmExpense(summaryLine) {
+function twimlEmpty() {
+  return `<Response></Response>`;
+}
+
+function getExpenseConfirmTemplateSid() {
+  return (
+    process.env.TWILIO_EXPENSE_CONFIRM_TEMPLATE_SID ||
+    process.env.EXPENSE_CONFIRM_TEMPLATE_SID ||
+    process.env.TWILIO_TEMPLATE_EXPENSE_CONFIRM_SID ||
+    null
+  );
+}
+
+function waTo(from) {
+  const d = String(from || '').replace(/\D/g, '');
+  return d ? `whatsapp:+${d}` : null;
+}
+
+async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+  const messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID || null;
+  const waFrom = process.env.TWILIO_WHATSAPP_FROM || null;
+
+  if (!accountSid || !authToken) throw new Error('Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN');
+  if (!to) throw new Error('Missing "to"');
+  if (!templateSid) throw new Error('Missing templateSid');
+
+  // Twilio expects whatsapp:+E164
+  const toClean = String(to).startsWith('whatsapp:')
+    ? String(to)
+    : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
+
+  const payload = {
+    to: toClean,
+    contentSid: templateSid,
+    contentVariables: JSON.stringify({ "1": String(summaryLine || '').slice(0, 900) })
+  };
+
+  // For WhatsApp templates: prefer explicit WhatsApp sender
+  if (waFrom) payload.from = waFrom;
+  else if (messagingServiceSid) payload.messagingServiceSid = messagingServiceSid;
+  else throw new Error('Missing TWILIO_WHATSAPP_FROM or TWILIO_MESSAGING_SERVICE_SID');
+
+  const twilio = require('twilio');
+  const client = twilio(accountSid, authToken);
+
+  const TIMEOUT_MS = 2500;
+  const msg = await Promise.race([
+    client.messages.create(payload),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS)),
+  ]);
+
+  console.info('[TEMPLATE] sent', {
+    to: payload.to,
+    from: payload.from || null,
+    messagingServiceSid: payload.messagingServiceSid || null,
+    contentSid: payload.contentSid,
+    sid: msg?.sid || null,
+    status: msg?.status || null
+  });
+
+  return msg;
+}
+
+async function sendConfirmExpenseOrFallback(from, summaryLine) {
   const sid = getExpenseConfirmTemplateSid();
-  if (!sid) {
-    return twimlText(`Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.`);
+  const to = waTo(from);
+
+  console.info('[EXPENSE] confirm template attempt', {
+    from,
+    to,
+    hasSid: !!sid,
+    sid: sid || null
+  });
+
+  if (sid && to) {
+    try {
+      await sendWhatsAppTemplate({ to, templateSid: sid, summaryLine });
+      console.info('[EXPENSE] confirm template sent OK', { to, sid });
+      return twimlEmpty(); // IMPORTANT: don't also send TwiML message
+    } catch (e) {
+      console.warn('[EXPENSE] template send failed; falling back to TwiML:', e?.message);
+    }
   }
 
-  return (
-    `<Response><Message>` +
-      `<Content sid="${xmlEsc(sid)}">` +
-        `<Parameter name="1">${xmlEsc(summaryLine)}</Parameter>` +
-      `</Content>` +
-    `</Message></Response>`
-  );
+  return twimlText(`Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.`);
 }
 
 function normalizeDecisionToken(input) {
@@ -144,10 +208,6 @@ function looksLikeUuid(str) {
 
 /**
  * Resolve active job name safely (avoid int=uuid comparisons).
- * Priority:
- *  1) userProfile.active_job_name
- *  2) userProfile.active_job_id (uuid) -> jobs.id
- *  3) userProfile.active_job_id numeric -> jobs.job_no
  */
 async function resolveActiveJobName({ ownerId, userProfile }) {
   const ownerParam = String(ownerId || '').trim();
@@ -194,7 +254,7 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
-// Minimal CIL build (your current shape) — fail-open if validator missing
+// Minimal CIL build — fail-open if validator missing
 function buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
 
@@ -228,7 +288,6 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   try {
     const cil = buildExpenseCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
 
-    // FAIL-OPEN if validator missing
     if (typeof validateCIL !== 'function') {
       console.warn('[EXPENSE] validateCIL missing; skipping CIL validation (fail-open).');
       return { ok: true, cil, skipped: true };
@@ -239,20 +298,6 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   } catch {
     return { ok: false, reply: `⚠️ Couldn't log that expense yet. Try: "expense 84.12 nails from Home Depot".` };
   }
-}
-
-// Clear ONLY media meta after successful write so it doesn't attach to next txn
-async function clearPendingMediaMeta(from, pending) {
-  try {
-    if (!pending) return;
-    if (!pending.pendingMediaMeta && !pending.pendingMedia) return;
-
-    await mergePendingTransactionState(from, {
-      ...(pending || {}),
-      pendingMediaMeta: null,
-      pendingMedia: false
-    });
-  } catch {}
 }
 
 async function deleteExpense(ownerId, criteria) {
@@ -310,7 +355,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
     let pending = await getPendingTransactionState(from);
 
-    // If user previously hit "edit", treat next message as brand new
     if (pending?.isEditing && pending?.type === 'expense') {
       await deletePendingTransactionState(from);
       pending = null;
@@ -332,14 +376,14 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         });
 
         const summaryLine = `Expense: ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date}.`;
-        return twimlConfirmExpense(summaryLine);
+        return await sendConfirmExpenseOrFallback(from, summaryLine);
       }
 
       reply = `What date was this expense? (e.g., 2025-12-12 or "today")`;
       return twimlText(reply);
     }
 
-    // Follow-up: job resolution (contractor-first)
+    // Follow-up: job resolution
     if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
       const jobReply = String(input || '').trim();
       const finalJob = jobReply || null;
@@ -353,7 +397,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       });
 
       const summaryLine = `Expense: ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date} for ${merged.jobName}.`;
-      return twimlConfirmExpense(summaryLine);
+      return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
     // --- CONFIRM / DELETE FLOW ---
@@ -365,7 +409,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const token = normalizeDecisionToken(input);
-      const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim(); // always defined
+      const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
 
       // If user sends a fresh expense command while waiting, treat as new command
       if (/^(?:expense|exp)\b/.test(String(input || '').toLowerCase()) && pending?.pendingExpense) {
@@ -494,7 +538,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return twimlText(reply);
     }
 
-    // DIRECT PARSE PATH (simple deterministic)
+    // DIRECT PARSE PATH
     const m = String(input || '').match(/^(?:expense\s+)?\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i);
     if (m) {
       const [, amount, item, store] = m;
@@ -534,14 +578,13 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       });
 
       const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}.`;
-      return twimlConfirmExpense(summaryLine);
+      return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
     // AI PATH
     const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData);
     const data = aiRes?.data || null;
     const aiReply = aiRes?.reply || null;
-    const confirmed = !!aiRes?.confirmed;
 
     if (aiReply) {
       await mergePendingTransactionState(from, {
@@ -557,13 +600,11 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     }
 
     if (data && data.amount && data.amount !== '$0.00' && data.item && data.store) {
-      let errors = null;
       try {
-        errors = await detectErrors(data, 'expense');
+        let errors = await detectErrors(data, 'expense');
         if (errors == null) errors = await detectErrors('expense', data);
       } catch (e) {
         console.warn('[EXPENSE] detectErrors threw; ignoring (fail-open):', e?.message);
-        errors = null;
       }
 
       const category =
@@ -584,7 +625,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return twimlText(reply);
       }
 
-      // Keep confirm step → now uses quick reply buttons
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingExpense: { ...data, jobName },
@@ -593,11 +633,12 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       });
 
       const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${data.date || todayIso()} for ${jobName}.`;
-      return twimlConfirmExpense(summaryLine);
+      return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
     reply = `🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`;
     return twimlText(reply);
+
   } catch (error) {
     console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
       code: error?.code,
@@ -609,9 +650,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
   } finally {
     try {
       await require('../../middleware/lock').releaseLock(lockKey);
-    } catch {
-      // never hard-fail
-    }
+    } catch {}
   }
 }
 

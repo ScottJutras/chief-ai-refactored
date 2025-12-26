@@ -317,8 +317,9 @@ router.post('*', async (req, res, next) => {
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
     // ✅ DEFINE TEXT EARLY (now respects button payloads)
-    const text = getInboundText(req.body || {});
+    const text = String(getInboundText(req.body || {}) || '');
     const lc = text.toLowerCase();
+
 
     // ------------------------------------------------------------
     // PENDING TXN NUDGE (revenue/expense flows)
@@ -383,9 +384,11 @@ router.post('*', async (req, res, next) => {
       // refresh text/lc after rewrite
     }
 
-    // refresh after any rewrite
-    const text2 = String(req.body?.Body || '').trim() || text;
-    const lc2 = text2.toLowerCase();
+    // refresh after any rewrite (button-aware)
+const text2 = String(getInboundText(req.body || {}) || '').trim();
+const lc2 = text2.toLowerCase();
+
+
 
     // Canonical idempotency key for ingestion (Twilio)
     const crypto = require('crypto');

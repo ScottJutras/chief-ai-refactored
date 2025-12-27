@@ -1,5 +1,5 @@
 // handlers/commands/expense.js
-const { query, insertTransaction } = require('../../services/postgres');
+const { query, insertTransaction, listOpenJobs, normalizeVendorName } = require('../../services/postgres');
 
 const state = require('../../utils/stateManager');
 const getPendingTransactionState = state.getPendingTransactionState;
@@ -10,7 +10,6 @@ const mergePendingTransactionState =
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
 const ai = require('../../utils/aiErrorHandler');
-
 const handleInputWithAI = ai.handleInputWithAI;
 const parseExpenseMessage = ai.parseExpenseMessage;
 
@@ -210,6 +209,40 @@ function normalizeJobAnswer(text) {
   return s;
 }
 
+/**
+ * ✅ Fix "for for" (and related duplication):
+ * - If item starts with "for ", strip it.
+ * - Collapse whitespace.
+ */
+function cleanExpenseItemForDisplay(item) {
+  let s = String(item || '').trim();
+  s = s.replace(/^for\s+/i, '');
+  s = s.replace(/\s+/g, ' ').trim();
+  return s || 'Unknown';
+}
+
+/**
+ * ✅ One canonical line builder for templates + final replies.
+ * Avoids double "for", "on", etc. if item already contains fragments.
+ */
+function buildExpenseSummaryLine({ amount, item, store, date, jobName }) {
+  const amt = String(amount || '').trim();
+  const it = cleanExpenseItemForDisplay(item);
+  const st = String(store || '').trim() || 'Unknown Store';
+  const dt = String(date || '').trim();
+  const jb = jobName ? String(jobName).trim() : '';
+
+  const itLower = it.toLowerCase();
+  const parts = [];
+  parts.push(`Expense: ${amt} for ${it}`);
+
+  if (st && st !== 'Unknown Store' && !itLower.includes(`from ${st.toLowerCase()}`)) parts.push(`from ${st}`);
+  if (dt && !itLower.includes(dt.toLowerCase())) parts.push(`on ${dt}`);
+  if (jb && !itLower.includes(jb.toLowerCase())) parts.push(`for ${jb}`);
+
+  return parts.join(' ') + '.';
+}
+
 async function resolveActiveJobName({ ownerId, userProfile }) {
   const ownerParam = String(ownerId || '').trim();
   const name = userProfile?.active_job_name || userProfile?.activeJobName || null;
@@ -293,7 +326,10 @@ function normalizeExpenseData(data, userProfile) {
   }
 
   d.date = String(d.date || '').trim() || todayInTimeZone(tz);
-  d.item = String(d.item || '').trim() || 'Unknown';
+
+  // ✅ normalize item to avoid "for for" downstream
+  d.item = cleanExpenseItemForDisplay(d.item);
+
   d.store = String(d.store || '').trim() || 'Unknown Store';
 
   if (d.jobName != null) {
@@ -337,28 +373,31 @@ function moneyToFixed(token) {
   const normalized = cleaned.replace(/,/g, '');
   const n = Number(normalized);
   if (!Number.isFinite(n) || n <= 0) return null;
-  return formatMoneyDisplay(n); // ✅ commas
+  return formatMoneyDisplay(n);
+}
+
+function isIsoDateToken(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim());
 }
 
 /**
  * Deterministic NL expense parse (voice transcript backstop)
+ * Canonical: "$X for ITEM from VENDOR on DATE for JOB"
  */
 function deterministicExpenseParse(input, userProfile) {
   const raw = String(input || '').trim();
   if (!raw) return null;
 
-  // amount
   const token = extractMoneyToken(raw);
   if (!token) return null;
 
-  const amount = moneyToFixed(token); // ✅ FIX: no amtNum bug, commas supported
+  const amount = moneyToFixed(token);
   if (!amount) return null;
 
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
-  // date (tz-aware)
+  // date
   let date = null;
-
   if (/\btoday\b/i.test(raw)) date = parseNaturalDateTz('today', tz);
   else if (/\byesterday\b/i.test(raw)) date = parseNaturalDateTz('yesterday', tz);
   else if (/\btomorrow\b/i.test(raw)) date = parseNaturalDateTz('tomorrow', tz);
@@ -367,48 +406,47 @@ function deterministicExpenseParse(input, userProfile) {
     const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
     if (iso?.[1]) date = iso[1];
   }
-
   if (!date) {
     const mNat = raw.match(/\bon\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/i);
     if (mNat?.[1]) date = parseNaturalDateTz(mNat[1], tz);
   }
-
   if (!date) date = todayInTimeZone(tz);
 
-  // store: "from X" or "at X"
+  // job: prefer trailing "for <job>"
+  let jobName = null;
+  const forJob = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:[.?!]|$)/i);
+  if (forJob?.[1]) {
+    const cand = String(forJob[1]).trim();
+    if (cand && !isIsoDateToken(cand)) jobName = cand;
+  }
+  if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
+
+  // store: "from|at <vendor>" stopping before on/for/date/end
   let store = null;
   const fromMatch = raw.match(
-    /\b(?:from|at)\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i
+    /\b(?:from|at)\s+(.+?)(?:\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
   );
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
-  // item: "worth of X" or "on X"
+  // item: prefer "for <item> from|at"
   let item = null;
-  const worthOf = raw.match(
-    /\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|\s+\bfor\b|[.?!]|$)/i
+  const itemMatch = raw.match(
+    /\bfor\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
   );
-  if (worthOf?.[1]) item = String(worthOf[1]).trim();
-
-  if (!item) {
-    const onMatch = raw.match(
-      /\bon\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-    );
-    if (onMatch?.[1]) item = String(onMatch[1]).trim();
+  if (itemMatch?.[1]) {
+    const cand = String(itemMatch[1]).trim();
+    if (cand && !isIsoDateToken(cand)) item = cand;
   }
 
-  // jobName: "for job X" or "for X"
-  let jobName = null;
-  const forMatch = raw.match(
-    /\bfor\s+(?:job\s+)?(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-  );
-  if (forMatch?.[1]) jobName = String(forMatch[1]).trim();
-
-  if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
+  if (!item) {
+    const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i);
+    if (worthOf?.[1]) item = String(worthOf[1]).trim();
+  }
 
   return {
     date,
     amount,
-    item: item || 'Unknown',
+    item: cleanExpenseItemForDisplay(item || 'Unknown'),
     store: store || 'Unknown Store',
     jobName: jobName || null
   };
@@ -489,6 +527,15 @@ async function withTimeout(promise, ms, fallbackValue = '__TIMEOUT__') {
   return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms))]);
 }
 
+async function buildJobPrompt(ownerId) {
+  const jobs = await listOpenJobs(ownerId, { limit: 8 });
+  if (jobs.length) {
+    const shown = jobs.map((j) => `"${j}"`).join(', ');
+    return `Which job is this expense for? You currently have these jobs on-the-go: ${shown}\nReply with one of them, or "Overhead".`;
+  }
+  return `Which job is this expense for?\nStart your first job by replying with the job name for this entry (or "Overhead").`;
+}
+
 /* ---------------- main handler ---------------- */
 
 async function handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
@@ -524,6 +571,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : jobReply || null;
 
       const merged = normalizeExpenseData({ ...pending.pendingExpense, jobName: finalJob }, userProfile);
+      merged.store = await normalizeVendorName(ownerId, merged.store);
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
@@ -531,9 +579,13 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         awaitingExpenseJob: false
       });
 
-      const summaryLine = `Expense: ${merged.amount} for ${merged.item} from ${merged.store} on ${merged.date}${
-        merged.jobName ? ` for ${merged.jobName}` : ''
-      }.`;
+      const summaryLine = buildExpenseSummaryLine({
+        amount: merged.amount,
+        item: merged.item,
+        store: merged.store,
+        date: merged.date,
+        jobName: merged.jobName
+      });
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
@@ -546,15 +598,16 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const token = normalizeDecisionToken(input);
-
-      // ✅ prefer stable id from media.js if present
       const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
 
       if (token === 'yes' && pending?.pendingExpense) {
         const rawData = pending.pendingExpense || {};
         const mediaMeta = pending?.pendingMediaMeta || null;
 
-        const data = normalizeExpenseData(rawData, userProfile);
+        let data = normalizeExpenseData(rawData, userProfile);
+
+        // ✅ vendor normalization (snap to known vendors)
+        data.store = await normalizeVendorName(ownerId, data.store);
 
         const category =
           data.suggestedCategory ||
@@ -575,7 +628,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             expenseSourceMsgId: stableMsgId,
             type: 'expense'
           });
-          reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
+          reply = await buildJobPrompt(ownerId);
           return twimlText(reply);
         }
 
@@ -600,7 +653,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             date: data.date || todayInTimeZone(tz),
             description: String(data.item || '').trim() || 'Unknown',
             amount_cents: amountCents,
-            amount: toNumberAmount(data.amount), // ✅ keep numeric amount too (if your schema uses it)
+            amount: toNumberAmount(data.amount),
             source: String(data.store || '').trim() || 'Unknown',
             job: jobName,
             job_name: jobName,
@@ -632,21 +685,25 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           return twimlText(reply);
         }
 
+        const summaryLine = buildExpenseSummaryLine({
+          amount: data.amount,
+          item: data.item,
+          store: data.store,
+          date: data.date || todayInTimeZone(tz),
+          jobName
+        });
+
         reply =
           writeResult?.inserted === false
             ? '✅ Already logged that expense (duplicate message).'
-            : `✅ Expense logged: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}${
-                category ? ` (Category: ${category})` : ''
-              }`;
+            : `✅ Expense logged: ${summaryLine}${category ? ` (Category: ${category})` : ''}`;
 
         await deletePendingTransactionState(from);
         return twimlText(reply);
       }
 
       if (token === 'edit') {
-        // ✅ clear pending so the replacement message doesn't get "pending-nudged"
         await deletePendingTransactionState(from);
-
         reply = '✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").';
         return twimlText(reply);
       }
@@ -669,9 +726,9 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const [, amountRaw, item, store] = m;
 
       const n = Number(String(amountRaw).replace(/,/g, ''));
-      const amount = Number.isFinite(n) && n > 0 ? formatMoneyDisplay(n) : '$0.00'; // ✅ commas
+      const amount = Number.isFinite(n) && n > 0 ? formatMoneyDisplay(n) : '$0.00';
 
-      const data = normalizeExpenseData(
+      const data0 = normalizeExpenseData(
         {
           date: todayInTimeZone(tz),
           item,
@@ -681,56 +738,72 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         userProfile
       );
 
+      data0.store = await normalizeVendorName(ownerId, data0.store);
+
       const category =
-        (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) ||
-        inferExpenseCategoryHeuristic(data) ||
+        (await Promise.resolve(categorizeEntry('expense', data0, ownerProfile)).catch(() => null)) ||
+        inferExpenseCategoryHeuristic(data0) ||
         null;
 
-      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
+      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
-        pendingExpense: { ...data, jobName, suggestedCategory: category },
+        pendingExpense: { ...data0, jobName, suggestedCategory: category },
         expenseSourceMsgId: safeMsgId,
         type: 'expense',
         awaitingExpenseJob: !jobName
       });
 
       if (!jobName) {
-        reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
+        reply = await buildJobPrompt(ownerId);
         return twimlText(reply);
       }
 
-      const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}.`;
+      const summaryLine = buildExpenseSummaryLine({
+        amount: data0.amount,
+        item: data0.item,
+        store: data0.store,
+        date: data0.date,
+        jobName
+      });
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
     // NL BACKSTOP (voice transcript)
     const backstop = deterministicExpenseParse(input, userProfile);
     if (backstop && backstop.amount) {
-      const data = normalizeExpenseData(backstop, userProfile);
+      const data0 = normalizeExpenseData(backstop, userProfile);
+
+      data0.store = await normalizeVendorName(ownerId, data0.store);
 
       const category =
-        (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) ||
-        inferExpenseCategoryHeuristic(data) ||
+        (await Promise.resolve(categorizeEntry('expense', data0, ownerProfile)).catch(() => null)) ||
+        inferExpenseCategoryHeuristic(data0) ||
         null;
 
-      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
+      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
-        pendingExpense: { ...data, jobName, suggestedCategory: category },
+        pendingExpense: { ...data0, jobName, suggestedCategory: category },
         expenseSourceMsgId: safeMsgId,
         type: 'expense',
         awaitingExpenseJob: !jobName
       });
 
       if (!jobName) {
-        reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
+        reply = await buildJobPrompt(ownerId);
         return twimlText(reply);
       }
 
-      const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${data.date} for ${jobName}.`;
+      const summaryLine = buildExpenseSummaryLine({
+        amount: data0.amount,
+        item: data0.item,
+        store: data0.store,
+        date: data0.date,
+        jobName
+      });
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
@@ -762,6 +835,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     }
 
     if (data && data.amount && data.amount !== '$0.00') {
+      data.store = await normalizeVendorName(ownerId, data.store);
+
       const category =
         (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) ||
         inferExpenseCategoryHeuristic(data) ||
@@ -778,13 +853,17 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       });
 
       if (!jobName) {
-        reply = `Which job is this expense for? Reply with the job name (or "Overhead").`;
+        reply = await buildJobPrompt(ownerId);
         return twimlText(reply);
       }
 
-      const summaryLine = `Expense: ${data.amount} for ${data.item} from ${data.store} on ${
-        data.date || todayInTimeZone(tz)
-      } for ${jobName}.`;
+      const summaryLine = buildExpenseSummaryLine({
+        amount: data.amount,
+        item: data.item,
+        store: data.store,
+        date: data.date || todayInTimeZone(tz),
+        jobName
+      });
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 

@@ -30,10 +30,8 @@ const ssl = shouldSSL ? { rejectUnauthorized: false } : false;
 // Build pool config
 let poolConfig;
 if (DB_URL) {
-  // connectionString path (best for hosted DBs)
   poolConfig = { connectionString: DB_URL, ssl };
 } else {
-  // Fallback to discrete vars (local dev)
   const host = env.PGHOST || '127.0.0.1';
   const port = Number(env.PGPORT || 5432);
   const database = env.PGDATABASE || 'postgres';
@@ -42,7 +40,6 @@ if (DB_URL) {
   poolConfig = { host, port, database, user, password, ssl };
 }
 
-// Fail fast with a clear message if NOTHING was configured
 if (!DB_URL && (!poolConfig.host || !poolConfig.database)) {
   throw new Error(
     "Postgres not configured. Set DATABASE_URL in config/.env or PGHOST/PGDATABASE/etc."
@@ -93,7 +90,6 @@ async function queryWithRetry(text, params, attempt = 1) {
   }
 }
 
-// Use a client + per-query statement timeout; optional local transaction
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await pool.connect();
   try {
@@ -111,7 +107,6 @@ async function withClient(fn, { useTransaction = true } = {}) {
 
 async function queryWithTimeout(sql, params, ms = 9000) {
   return withClient(async client => {
-    // NOTE: SET LOCAL cannot be parameterized
     const timeoutMs = Math.max(0, Number(ms) | 0);
     await client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
     return client.query(sql, params);
@@ -121,23 +116,20 @@ async function queryWithTimeout(sql, params, ms = 9000) {
 /* ---------- Utilities (single source of truth) ---------- */
 const DIGITS = (x) => String(x ?? '').replace(/\D/g, '');
 
-// Canonical cents converter; keep ONE definition
 function toCents(v) {
   if (v == null || v === '') return 0;
   const n = typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.-]/g, ''));
   if (!Number.isFinite(n)) return 0;
   return Math.round(n * 100);
 }
-const toAmount = toCents; // back-compat alias
+const toAmount = toCents;
 
 const isValidIso = (ts) => !!ts && !Number.isNaN(new Date(ts).getTime());
 
-// YYYY-MM-DD in target TZ (used for day keys)
 function todayInTZ(tz = 'America/Toronto') {
   return formatInTimeZone(new Date(), tz, 'yyyy-MM-dd');
 }
 
-// Optional: export this name if other files import it
 const normalizePhoneNumber = (x) => DIGITS(x);
 
 /* ------------------------------------------------------------------ */
@@ -166,7 +158,6 @@ async function hasColumn(table, col) {
   return (r?.rows?.length || 0) > 0;
 }
 
-// Cache detected columns on public.transactions
 let TX_HAS_SOURCE_MSG_ID = null;
 let TX_HAS_AMOUNT        = null;
 let TX_HAS_MEDIA_URL     = null;
@@ -174,8 +165,6 @@ let TX_HAS_MEDIA_TYPE    = null;
 let TX_HAS_MEDIA_TXT     = null;
 let TX_HAS_MEDIA_CONF    = null;
 
-// Cache whether an owner_id+source_msg_id unique constraint exists.
-// (If not, ON CONFLICT (...) will error.)
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
 async function detectTransactionsCapabilities() {
@@ -213,7 +202,6 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_TXT     = names.has('media_transcript');
     TX_HAS_MEDIA_CONF    = names.has('media_confidence');
   } catch (e) {
-    // Fail-open (don’t break ingestion just because information_schema had a bad day)
     console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
     TX_HAS_SOURCE_MSG_ID = false;
     TX_HAS_AMOUNT        = false;
@@ -236,8 +224,6 @@ async function detectTransactionsCapabilities() {
 async function detectTransactionsUniqueOwnerSourceMsg() {
   if (TX_HAS_OWNER_SOURCEMSG_UNIQUE !== null) return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
 
-  // Best-effort: look for any UNIQUE index/constraint that includes both owner_id and source_msg_id.
-  // If this query fails for any reason, we fail-open to "false" and use select-before-insert idempotency.
   try {
     const { rows } = await query(
       `
@@ -268,14 +254,12 @@ function normalizeMediaMeta(mediaMeta) {
   const url = String(mediaMeta.url || mediaMeta.media_url || '').trim() || null;
   const type = String(mediaMeta.type || mediaMeta.media_type || '').trim() || null;
 
-  // transcript can be huge; truncate
   const transcriptRaw = mediaMeta.transcript || mediaMeta.media_transcript || null;
   const transcript = transcriptRaw ? truncateText(transcriptRaw, MEDIA_TRANSCRIPT_MAX_CHARS) : null;
 
   const conf = mediaMeta.confidence ?? mediaMeta.media_confidence ?? null;
   const confidence = Number.isFinite(Number(conf)) ? Number(conf) : null;
 
-  // If nothing meaningful, return null so we don’t insert noise
   if (!url && !type && !transcript && confidence == null) return null;
 
   return {
@@ -289,14 +273,6 @@ function normalizeMediaMeta(mediaMeta) {
 /**
  * ✅ insertTransaction()
  * Schema-aware insert into public.transactions with optional media fields.
- * Safe idempotency:
- *  - If unique(owner_id, source_msg_id) exists -> ON CONFLICT DO NOTHING
- *  - Else -> SELECT-before-insert using (owner_id, source_msg_id) to prevent duplicates
- *
- * Expected opts:
- *  ownerId, kind ('revenue'|'expense'|...), date (YYYY-MM-DD), description,
- *  amount_cents, amount (optional numeric), source, job, job_name, category, user_name,
- *  source_msg_id (optional), mediaMeta (optional)
  */
 async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const owner = DIGITS(opts.ownerId || opts.owner_id);
@@ -322,7 +298,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const caps = await detectTransactionsCapabilities();
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
 
-  // If we have source_msg_id but no unique constraint, still do an idempotency pre-check.
   if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
     try {
       const exists = await queryWithTimeout(
@@ -332,7 +307,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       );
       if (exists?.rows?.length) return { inserted: false, id: exists.rows[0].id };
     } catch (e) {
-      // fail-open: if the check fails, we still try to insert
       console.warn('[PG/transactions] idempotency pre-check failed (ignored):', e?.message);
     }
   }
@@ -402,7 +376,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     if (!res?.rows?.length) return { inserted: false, id: null };
     return { inserted: true, id: res.rows[0].id };
   } catch (e) {
-    // If ON CONFLICT failed because constraint doesn't exist, retry without ON CONFLICT.
     const msg = String(e?.message || '').toLowerCase();
     const code = String(e?.code || '');
     const looksConflictUnsupported =
@@ -411,7 +384,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
     if (looksConflictUnsupported) {
       console.warn('[PG/transactions] ON CONFLICT unsupported; retrying without conflict clause');
-      TX_HAS_OWNER_SOURCEMSG_UNIQUE = false; // cache
+      TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
       const sql2 = `
         insert into public.transactions (${cols.join(', ')})
         values (${placeholders}, now())
@@ -713,7 +686,6 @@ async function getActiveJob(ownerId, userId = null) {
       );
       if (rows[0]) return rows[0];
     } catch (e) {
-      // fail-open to owner-wide active below
       console.warn('[PG/getActiveJob] user_active_job lookup failed (ignored):', e?.message);
     }
   }
@@ -729,7 +701,7 @@ async function getActiveJob(ownerId, userId = null) {
   );
 
   const row = act.rows?.[0] || null;
-  if (!row) return userId ? null : null;
+  if (!row) return null;
 
   // Back-compat: media.js expects a string job name when calling getActiveJob(ownerId)
   if (!userId) return row.name || null;
@@ -754,7 +726,8 @@ async function setActiveJob(ownerId, userId, jobRef) {
   // If user_active_job exists and caller gave a uuid id, try to use it
   if (userId && (await detectUserActiveJobTable())) {
     const ref = String(jobRef || '').trim();
-    const looksUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ref);
+    const looksUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ref);
     if (looksUuid) {
       await query(
         `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
@@ -768,7 +741,6 @@ async function setActiveJob(ownerId, userId, jobRef) {
   }
 
   // Otherwise: owner-wide active job activation by name/job_no
-  // Resolve to a job via name or job_no
   let jobNo = null;
   const s = String(jobRef || '').trim();
   if (/^\d+$/.test(s)) {
@@ -827,12 +799,13 @@ async function moveLastLogToJob(ownerId, userName, jobRef) {
 }
 
 async function enqueueKpiTouch(ownerId, jobId, isoDate) {
-  const owner = String(ownerId).replace(/\D/g,'');
-  const day = isoDate ? isoDate.slice(0,10) : new Date().toISOString().slice(0,10);
-  await query(
-    `insert into public.kpi_touches (owner_id, job_id, day) values ($1,$2,$3)`,
-    [owner, jobId || null, day]
-  );
+  const owner = String(ownerId).replace(/\D/g, '');
+  const day = isoDate ? isoDate.slice(0, 10) : new Date().toISOString().slice(0, 10);
+  await query(`insert into public.kpi_touches (owner_id, job_id, day) values ($1,$2,$3)`, [
+    owner,
+    jobId || null,
+    day
+  ]);
 }
 
 // ---- JOB BY NAME/SOURCE HELPERS (kept) ----
@@ -881,16 +854,12 @@ async function getJobBySourceMsg(ownerId, sourceMsgId) {
 /* -------------------- Time Limits & Audit (schema-aware, tolerant) -------------------- */
 
 // Cache detected columns on public.time_entries
-let SUPPORTS_CREATED_BY    = null; // null=unknown, then true/false
-let SUPPORTS_USER_ID       = null;
+let SUPPORTS_CREATED_BY = null;
+let SUPPORTS_USER_ID = null;
 let SUPPORTS_SOURCE_MSG_ID = null;
 
 async function detectTimeEntriesCapabilities() {
-  if (
-    SUPPORTS_CREATED_BY !== null &&
-    SUPPORTS_USER_ID !== null &&
-    SUPPORTS_SOURCE_MSG_ID !== null
-  ) {
+  if (SUPPORTS_CREATED_BY !== null && SUPPORTS_USER_ID !== null && SUPPORTS_SOURCE_MSG_ID !== null) {
     return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
   }
 
@@ -901,13 +870,13 @@ async function detectTimeEntriesCapabilities() {
         WHERE table_schema = 'public'
           AND table_name   = 'time_entries'`
     );
-    const names = new Set(rows.map(r => String(r.column_name).toLowerCase()));
-    SUPPORTS_CREATED_BY    = names.has('created_by');
-    SUPPORTS_USER_ID       = names.has('user_id');
+    const names = new Set(rows.map((r) => String(r.column_name).toLowerCase()));
+    SUPPORTS_CREATED_BY = names.has('created_by');
+    SUPPORTS_USER_ID = names.has('user_id');
     SUPPORTS_SOURCE_MSG_ID = names.has('source_msg_id');
   } catch {
-    SUPPORTS_CREATED_BY    = false;
-    SUPPORTS_USER_ID       = false;
+    SUPPORTS_CREATED_BY = false;
+    SUPPORTS_USER_ID = false;
     SUPPORTS_SOURCE_MSG_ID = false;
   }
 
@@ -993,7 +962,7 @@ async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz,
 
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
   const tsIso = new Date(ts).toISOString();
-  const zone  = tz || 'America/Toronto';
+  const zone = tz || 'America/Toronto';
 
   const ownerDigits = DIGITS(ownerId);
   const actorDigits = DIGITS(extras?.requester_id || ownerId);
@@ -1003,13 +972,8 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  // Ensure detection
-  if (
-    SUPPORTS_USER_ID === null ||
-    SUPPORTS_CREATED_BY === null ||
-    SUPPORTS_SOURCE_MSG_ID === null
-  ) {
-    await detectTimeEntriesCapabilities().catch(e =>
+  if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null || SUPPORTS_SOURCE_MSG_ID === null) {
+    await detectTimeEntriesCapabilities().catch((e) =>
       console.error('[PG/logTimeEntry] detection failed:', e?.message)
     );
   }
@@ -1017,19 +981,16 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
   const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
 
-  // FORCE user_id if column exists (your unique index uses this)
   if (SUPPORTS_USER_ID) {
     cols.push('user_id');
     vals.push(actorSafe);
   }
 
-  // Optional: created_by
   if (SUPPORTS_CREATED_BY) {
     cols.push('created_by');
     vals.push(actorSafe);
   }
 
-  // Optional: idempotency
   const sourceMsgId = String(extras?.source_msg_id || '').trim() || null;
   if (SUPPORTS_SOURCE_MSG_ID && sourceMsgId) {
     cols.push('source_msg_id');
@@ -1039,10 +1000,7 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   cols.push('created_at');
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
 
-  const canIdempotent =
-    SUPPORTS_SOURCE_MSG_ID &&
-    SUPPORTS_USER_ID &&
-    sourceMsgId;
+  const canIdempotent = SUPPORTS_SOURCE_MSG_ID && SUPPORTS_USER_ID && sourceMsgId;
 
   const sql = canIdempotent
     ? `
@@ -1066,7 +1024,6 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   });
 
   const { rows } = await query(sql, vals);
-
   return rows?.[0]?.id || null;
 }
 
@@ -1077,19 +1034,13 @@ async function generateOTP(userId) {
   const uid = DIGITS(userId);
   const otp = crypto.randomInt(100000, 1000000).toString();
   const expiry = new Date(Date.now() + 10 * 60 * 1000);
-  await query(
-    `UPDATE public.users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`,
-    [otp, expiry, uid]
-  );
+  await query(`UPDATE public.users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`, [otp, expiry, uid]);
   return otp;
 }
 
 async function verifyOTP(userId, otp) {
   const uid = DIGITS(userId);
-  const { rows } = await query(
-    `SELECT otp, otp_expiry FROM public.users WHERE user_id=$1`,
-    [uid]
-  );
+  const { rows } = await query(`SELECT otp, otp_expiry FROM public.users WHERE user_id=$1`, [uid]);
   const user = rows[0];
   const ok = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
   if (ok) await query(`UPDATE public.users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [uid]);
@@ -1116,7 +1067,7 @@ async function saveUserProfile(p) {
   const vals = Object.values(p);
   const insCols = keys.join(', ');
   const insVals = keys.map((_, i) => `$${i + 1}`).join(', ');
-  const upd = keys.filter(k => k !== 'user_id').map(k => `${k}=EXCLUDED.${k}`).join(', ');
+  const upd = keys.filter((k) => k !== 'user_id').map((k) => `${k}=EXCLUDED.${k}`).join(', ');
   const { rows } = await query(
     `INSERT INTO public.users (${insCols}) VALUES (${insVals})
      ON CONFLICT (user_id) DO UPDATE SET ${upd}
@@ -1149,10 +1100,10 @@ async function createTask({ ownerId, createdBy, assignedTo, title, body, type = 
 }
 
 async function getTaskByNo(ownerId, taskNo) {
-  const { rows } = await query(
-    `SELECT * FROM public.tasks WHERE owner_id=$1 AND task_no=$2 LIMIT 1`,
-    [DIGITS(ownerId), taskNo]
-  );
+  const { rows } = await query(`SELECT * FROM public.tasks WHERE owner_id=$1 AND task_no=$2 LIMIT 1`, [
+    DIGITS(ownerId),
+    taskNo
+  ]);
   return rows[0] || null;
 }
 
@@ -1192,16 +1143,18 @@ async function exportTimesheetXlsx(opts) {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Timesheet');
   ws.columns = [
-    { header: 'Employee',  key: 'employee_name' },
-    { header: 'Type',      key: 'type' },
+    { header: 'Employee', key: 'employee_name' },
+    { header: 'Type', key: 'type' },
     { header: 'Timestamp', key: 'timestamp' },
-    { header: 'Job',       key: 'job_name' },
+    { header: 'Job', key: 'job_name' }
   ];
-  rows.forEach(r => ws.addRow(r));
+  rows.forEach((r) => ws.addRow(r));
 
   const buf = await wb.xlsx.writeBuffer();
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}${employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''}.xlsx`;
+  const filename = `timesheet_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${
+    employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''
+  }.xlsx`;
 
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
@@ -1241,15 +1194,18 @@ async function exportTimesheetPdf(opts) {
 
   const doc = new PDFDocument({ margin: 40 });
   const chunks = [];
-  doc.on('data', d => chunks.push(d));
-  const done = new Promise(r => doc.on('end', r));
+  doc.on('data', (d) => chunks.push(d));
+  const done = new Promise((r) => doc.on('end', r));
 
-  doc.fontSize(16).text(`Timesheet ${startIso.slice(0,10)} – ${endIso.slice(0,10)}`, { align: 'center' }).moveDown();
-  rows.forEach(r => {
+  doc
+    .fontSize(16)
+    .text(`Timesheet ${startIso.slice(0, 10)} – ${endIso.slice(0, 10)}`, { align: 'center' })
+    .moveDown();
+  rows.forEach((r) => {
     const ts = new Date(r.timestamp);
-    doc.fontSize(10).text(
-      `${r.employee_name} | ${r.type} | ${formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm')} | ${r.job_name || ''}`
-    );
+    doc
+      .fontSize(10)
+      .text(`${r.employee_name} | ${r.type} | ${formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm')} | ${r.job_name || ''}`);
   });
 
   doc.end();
@@ -1257,7 +1213,9 @@ async function exportTimesheetPdf(opts) {
   const buf = Buffer.concat(chunks);
 
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startIso.slice(0,10)}_${endIso.slice(0,10)}${employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''}.pdf`;
+  const filename = `timesheet_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${
+    employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''
+  }.pdf`;
 
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
@@ -1317,7 +1275,6 @@ async function deletePendingAction(id) {
 }
 
 // -------------------- Finance helpers (transactions + pricing_items) --------------------
-// (unchanged from your file)
 
 async function getOwnerPricingItems(ownerId) {
   const ownerKey = String(ownerId);
@@ -1365,14 +1322,13 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
   }
 
   const profit = totalRevenue - totalExpense;
-  const marginPct =
-    totalRevenue > 0 ? Math.round((profit / totalRevenue) * 1000) / 10 : null;
+  const marginPct = totalRevenue > 0 ? Math.round((profit / totalRevenue) * 1000) / 10 : null;
 
   return {
     total_expense_cents: totalExpense,
     total_revenue_cents: totalRevenue,
     profit_cents: profit,
-    margin_pct: marginPct,
+    margin_pct: marginPct
   };
 }
 
@@ -1403,9 +1359,8 @@ async function getOwnerJobsFinance(ownerId) {
   return rows.map((r) => {
     const revenue = Number(r.revenue_cents) || 0;
     const expense = Number(r.expense_cents) || 0;
-    const profit  = revenue - expense;
-    const margin_pct =
-      revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
+    const profit = revenue - expense;
+    const margin_pct = revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
 
     return {
       job_id: r.id,
@@ -1416,7 +1371,7 @@ async function getOwnerJobsFinance(ownerId) {
       revenue_cents: revenue,
       expense_cents: expense,
       profit_cents: profit,
-      margin_pct,
+      margin_pct
     };
   });
 }
@@ -1449,15 +1404,14 @@ async function getOwnerMonthlyFinance(ownerId, monthStart) {
   }
 
   const profit = revenue - expense;
-  const margin_pct =
-    revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
+  const margin_pct = revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
 
   return {
     month_start: start,
     revenue_cents: revenue,
     expense_cents: expense,
     profit_cents: profit,
-    margin_pct,
+    margin_pct
   };
 }
 
@@ -1491,7 +1445,48 @@ async function getOwnerCategoryBreakdown(ownerId, fromDate, toDate, kindFilter =
 
   return rows.map((r) => ({
     category: r.category,
+    amount_cents: Number(r.amount_cents) || 0
+  }));
+}
+
+/**
+ * ✅ Vendor breakdown (NO schema change required)
+ * Uses transactions.source as vendor label but normalizes for grouping.
+ * Your dashboard can call this today.
+ */
+async function getOwnerVendorBreakdown(ownerId, fromDate, toDate, kindFilter = 'expense') {
+  const ownerKey = String(ownerId);
+  const params = [ownerKey, fromDate, toDate];
+  let where = `
+    owner_id::text = $1
+    and date >= $2::date
+    and date <  $3::date
+  `;
+
+  if (kindFilter) {
+    params.push(kindFilter);
+    where += ` and kind = $4`;
+  }
+
+  // Normalize vendor for grouping: trim, collapse whitespace, lower
+  const { rows } = await query(
+    `
+      select
+        coalesce(nullif(regexp_replace(lower(trim(source)), '\\s+', ' ', 'g'), ''), 'Unknown') as vendor_key,
+        coalesce(sum(amount_cents), 0) as amount_cents,
+        count(*)::int as txn_count
+      from transactions
+      where ${where}
+      group by coalesce(nullif(regexp_replace(lower(trim(source)), '\\s+', ' ', 'g'), ''), 'Unknown')
+      order by amount_cents desc
+    `,
+    params
+  );
+
+  return rows.map((r) => ({
+    vendor_key: r.vendor_key,
     amount_cents: Number(r.amount_cents) || 0,
+    txn_count: Number(r.txn_count) || 0
   }));
 }
 
@@ -1547,7 +1542,7 @@ module.exports = {
   activateJobByName,
   resolveJobContext,
 
-  // ✅ restored compat exports (these were previously "legacy not supported")
+  // ✅ restored compat exports
   setActiveJob,
   getActiveJob,
   moveLastLogToJob,
@@ -1566,9 +1561,10 @@ module.exports = {
   getOwnerJobsFinance,
   getOwnerMonthlyFinance,
   getOwnerCategoryBreakdown,
+  getOwnerVendorBreakdown,
 
   // ---------- Exports ----------
   exportTimesheetXlsx,
   exportTimesheetPdf,
-  getFileExport,
+  getFileExport
 };

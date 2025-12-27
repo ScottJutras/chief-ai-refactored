@@ -1489,12 +1489,48 @@ async function getOwnerVendorBreakdown(ownerId, fromDate, toDate, kindFilter = '
     txn_count: Number(r.txn_count) || 0
   }));
 }
-/**
- * Vendor normalization (fail-open).
- * - Trims, collapses whitespace
- * - Strips common suffix noise
- * - Optional: maps known aliases to a canonical name
- */
+
+/* ------------------------------------------------------------------ */
+/* ✅ Category Rules (learned per-owner vendor/keyword categorization) */
+/* ------------------------------------------------------------------ */
+
+let _HAS_CATEGORY_RULES = null;
+
+async function detectCategoryRulesTable() {
+  if (_HAS_CATEGORY_RULES !== null) return _HAS_CATEGORY_RULES;
+  try {
+    const r = await query(
+      `select 1
+         from information_schema.tables
+        where table_schema='public'
+          and table_name='category_rules'
+        limit 1`
+    );
+    _HAS_CATEGORY_RULES = (r?.rows?.length || 0) > 0;
+  } catch {
+    _HAS_CATEGORY_RULES = false;
+  }
+  return _HAS_CATEGORY_RULES;
+}
+
+// Canonicalize category strings so the DB stays clean (Layer B)
+function normalizeCategoryString(category) {
+  const s = String(category || '').trim();
+  if (!s) return null;
+
+  const t = s.toLowerCase();
+
+  // very small synonym map (expand later)
+  if (t === 'material' || t === 'materials' || t === 'mat') return 'Materials';
+  if (t === 'fuel' || t === 'gas') return 'Fuel';
+  if (t === 'tool' || t === 'tools' || t === 'equipment') return 'Tools';
+  if (t === 'sub' || t === 'subs' || t === 'subcontractor' || t === 'subcontractors') return 'Subcontractors';
+  if (t === 'office' || t === 'office supplies') return 'Office Supplies';
+
+  // Title-case fallback
+  return s.replace(/\s+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 function normalizeVendorString(v) {
   let s = String(v || '').trim();
   s = s.replace(/\s+/g, ' ');
@@ -1530,6 +1566,177 @@ function normalizeVendorString(v) {
  */
 async function normalizeVendorName(_ownerId, vendor) {
   return normalizeVendorString(vendor);
+}
+
+/**
+ * ✅ upsertCategoryRule()
+ * Store a per-owner learned rule:
+ * - vendor_norm: canonical vendor name
+ * - keyword: optional keyword (e.g., "siding", "shingles")
+ * - category: canonical category (Materials, Fuel, Tools, etc.)
+ */
+async function upsertCategoryRule({ ownerId, kind = 'expense', vendor, keyword = null, category, weight = 10 } = {}) {
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  const k = String(kind || 'expense').trim() || 'expense';
+
+  const vendorNorm = vendor ? normalizeVendorString(vendor) : null;
+  const kw = keyword ? String(keyword).trim().toLowerCase() : null;
+
+  const cat = normalizeCategoryString(category);
+  const w = Number.isFinite(Number(weight)) ? Number(weight) : 10;
+
+  if (!owner) throw new Error('upsertCategoryRule missing ownerId');
+  if (!cat) throw new Error('upsertCategoryRule missing category');
+
+  // fail-open if table missing
+  if (!(await detectCategoryRulesTable())) return { ok: false, skipped: true };
+
+  // We don't have a unique constraint here; do a soft-upsert:
+  // if same (owner,kind,vendor_norm,keyword) exists -> update
+  // else -> insert
+  const { rows } = await query(
+    `
+    with existing as (
+      select id
+        from public.category_rules
+       where owner_id = $1
+         and kind = $2
+         and (
+           (vendor_norm is null and $3 is null) or vendor_norm = $3
+         )
+         and (
+           (keyword is null and $4 is null) or keyword = $4
+         )
+       order by weight desc, created_at desc
+       limit 1
+    )
+    update public.category_rules r
+       set category = $5,
+           weight = $6
+      from existing e
+     where r.id = e.id
+    returning r.id
+    `,
+    [owner, k, vendorNorm, kw, cat, w]
+  );
+
+  if (rows?.[0]?.id) return { ok: true, id: rows[0].id, updated: true };
+
+  const ins = await query(
+    `
+    insert into public.category_rules (owner_id, kind, vendor_norm, keyword, category, weight, created_at)
+    values ($1,$2,$3,$4,$5,$6,now())
+    returning id
+    `,
+    [owner, k, vendorNorm, kw, cat, w]
+  );
+
+  return { ok: true, id: ins?.rows?.[0]?.id || null, inserted: true };
+}
+
+/**
+ * ✅ getCategorySuggestion(ownerId, kind, vendor, itemText)
+ * Returns: { category, matched_on, rule_id } or null
+ *
+ * Priority:
+ * 1) vendor+keyword match (keyword present in itemText)
+ * 2) vendor-only rules
+ * 3) keyword-only rules
+ */
+async function getCategorySuggestion(ownerId, kind = 'expense', vendor, itemText) {
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  if (!owner) return null;
+
+  if (!(await detectCategoryRulesTable())) return null;
+
+  const k = String(kind || 'expense').trim() || 'expense';
+  const vendorNorm = vendor ? normalizeVendorString(vendor) : null;
+  const text = String(itemText || '').toLowerCase();
+
+  try {
+    // 1) vendor + keyword (keyword contained in itemText)
+    if (vendorNorm && text) {
+      const r1 = await query(
+        `
+        select id, category, weight, vendor_norm, keyword
+          from public.category_rules
+         where owner_id=$1
+           and kind=$2
+           and vendor_norm=$3
+           and keyword is not null
+         order by weight desc, created_at desc
+        `,
+        [owner, k, vendorNorm]
+      );
+
+      for (const row of (r1.rows || [])) {
+        const kw = String(row.keyword || '').trim().toLowerCase();
+        if (kw && text.includes(kw)) {
+          return {
+            category: normalizeCategoryString(row.category),
+            matched_on: 'vendor+keyword',
+            rule_id: row.id
+          };
+        }
+      }
+    }
+
+    // 2) vendor only
+    if (vendorNorm) {
+      const r2 = await query(
+        `
+        select id, category
+          from public.category_rules
+         where owner_id=$1
+           and kind=$2
+           and vendor_norm=$3
+           and keyword is null
+         order by weight desc, created_at desc
+         limit 1
+        `,
+        [owner, k, vendorNorm]
+      );
+      if (r2.rows?.[0]) {
+        return {
+          category: normalizeCategoryString(r2.rows[0].category),
+          matched_on: 'vendor',
+          rule_id: r2.rows[0].id
+        };
+      }
+    }
+
+    // 3) keyword only
+    if (text) {
+      const r3 = await query(
+        `
+        select id, category, keyword
+          from public.category_rules
+         where owner_id=$1
+           and kind=$2
+           and vendor_norm is null
+           and keyword is not null
+         order by weight desc, created_at desc
+        `,
+        [owner, k]
+      );
+
+      for (const row of (r3.rows || [])) {
+        const kw = String(row.keyword || '').trim().toLowerCase();
+        if (kw && text.includes(kw)) {
+          return {
+            category: normalizeCategoryString(row.category),
+            matched_on: 'keyword',
+            rule_id: row.id
+          };
+        }
+      }
+    }
+
+    return null;
+  } catch (e) {
+    console.warn('[PG/getCategorySuggestion] failed (fail-open):', e?.message);
+    return null;
+  }
 }
 
 /**
@@ -1634,6 +1841,10 @@ module.exports = {
   listOpenJobs,
   normalizeVendorName,
 
+  // ✅ Category rules (NEW)
+  normalizeCategoryString,
+  upsertCategoryRule,
+  getCategorySuggestion,
 
   // ✅ restored compat exports
   setActiveJob,

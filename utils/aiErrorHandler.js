@@ -174,20 +174,34 @@ function stripUndefined(obj) {
   return out;
 }
 
+function buildPendingKey(type) {
+  return (
+    type === 'expense' ? 'pendingExpense' :
+    type === 'revenue' ? 'pendingRevenue' :
+    type === 'bill'    ? 'pendingBill' :
+    type === 'quote'   ? 'pendingQuote' :
+    'pendingData'
+  );
+}
+
 /**
  * Main ingestion helper:
- * - Try regex parseFn first
+ * - Try deterministic parseFn first
  * - If parseFn fails => ask AI for clarification response
  * - If parseFn succeeds => run detectErrors; if errors => optionally AI suggests corrections + sets pending state
  * - Otherwise return confirmed:true with parsed data
+ *
+ * ctx is optional (ex: { tz }) and will be passed to parseFn if parseFn accepts 2 args.
  */
-async function handleInputWithAI(from, input, type, parseFn, defaultData = {}) {
+async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, ctx = {}) {
   console.log(`[DEBUG] Ingestion parse (${type}): "${input}"`);
 
   // 1) Attempt deterministic parse first
   let data = null;
   try {
-    data = parseFn(input);
+    if (typeof parseFn === 'function') {
+      data = parseFn.length >= 2 ? parseFn(input, ctx) : parseFn(input);
+    }
   } catch (e) {
     console.warn(`[WARN] parseFn threw for ${type}:`, e?.message);
     data = null;
@@ -208,7 +222,8 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}) {
   // 3) Detect structural errors (missing fields etc.)
   let errors = null;
   try {
-    errors = await detectErrorsImpl(data, type);
+    // ✅ key patch: pass ctx through
+    errors = await detectErrorsImpl(data, type, ctx);
 
     // ✅ contractor-first: revenue payer/client is optional
     if (type === 'revenue' && errors) {
@@ -225,17 +240,12 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}) {
   // 4) If errors exist, ask AI for correction suggestions (optional) and save pending state
   if (errors) {
     const corrections = await correctErrorsWithAI(
-      `Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)}`,
+      `Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)} Ctx=${JSON.stringify(ctx || {})}`,
       type
     );
 
     if (corrections) {
-      const pendingKey =
-        type === 'expense' ? 'pendingExpense' :
-        type === 'revenue' ? 'pendingRevenue' :
-        type === 'bill'    ? 'pendingBill' :
-        type === 'quote'   ? 'pendingQuote' :
-        'pendingData';
+      const pendingKey = buildPendingKey(type);
 
       await stateManager.setPendingTransactionState(from, {
         [pendingKey]: data,
@@ -245,7 +255,7 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}) {
       });
 
       const text = Object.entries(corrections)
-        .map(([k, v]) => `${k}: ${data[k] || 'missing'} → ${v}`)
+        .map(([k, v]) => `${k}: ${data?.[k] ?? 'missing'} → ${v}`)
         .join('\n');
 
       return {
@@ -354,26 +364,28 @@ function stripDateTail(raw = '', tz) {
 }
 
 /**
- * parseExpenseMessage(input)
- * Supports both:
+ * parseExpenseMessage(input, ctx?)
+ * Supports:
  * - "expense 84.12 nails from Home Depot"
  * - "I bought $489.78 worth of Lumber from Home Depot today for 1556 Medway Park Dr"
  */
-function parseExpenseMessage(input) {
+function parseExpenseMessage(input, ctx = {}) {
   const text = String(input || '').trim();
   if (!text) return null;
 
-  // 1) tz-aware date tail peel is not possible here unless caller passes tz;
-  //    so we do best-effort with server timezone.
-  //    (Expense handler can still override date later.)
-  const { rest, date } = stripDateTail(text);
-  const d = date || new Date().toISOString().split('T')[0];
+  const tz = ctx?.tz || ctx?.timezone || null;
 
-  // 2) amount
+  // tz-aware date tail peel
+  const { rest, date } = stripDateTail(text, tz);
+  const d = date || todayInTimeZone(tz || 'UTC');
+
+  // amount
   const amountNum = extractDollarAmount(rest);
   if (!Number.isFinite(amountNum) || amountNum <= 0) {
     // fallback to strict "expense 84.12 ..."
-    const strict = rest.match(/^(?:expense|exp)\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:from|at)\s+(.+))?$/i);
+    const strict = rest.match(
+      /^(?:expense|exp)\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:from|at)\s+(.+))?$/i
+    );
     if (!strict) return null;
     return stripUndefined({
       date: d,
@@ -383,20 +395,19 @@ function parseExpenseMessage(input) {
     });
   }
 
-  // 3) store/vendor: "from X" or "at X"
-  // capture "from Home Depot" / "at Home Depot"
+  // store/vendor: "from X" or "at X"
   let store = null;
   let base = rest;
 
-  const storeMatch = base.match(/\b(?:from|at)\s+([^,]+?)(?=(\s+\b(for|on|today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$))/i);
+  const storeMatch = base.match(
+    /\b(?:from|at)\s+([^,]+?)(?=(\s+\b(for|on|today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|$))/i
+  );
   if (storeMatch?.[1]) {
     store = storeMatch[1].trim();
-    // remove that segment from base to make item extraction cleaner
     base = base.replace(storeMatch[0], ' ').replace(/\s+/g, ' ').trim();
   }
 
-  // 4) job hint: trailing "for <something>" where it looks like an address/job token
-  // NOTE: expense.js may still ask job; this helps auto-fill.
+  // job hint: trailing "for <something>" where it looks like an address/job token
   let jobName = null;
   const jobMatch = base.match(/\bfor\s+(.+)\s*$/i);
   if (jobMatch?.[1]) {
@@ -407,26 +418,22 @@ function parseExpenseMessage(input) {
     }
   }
 
-  // 5) item/memo:
-  // Try "worth of Lumber" or "for Lumber"
+  // item/memo:
   let item = null;
 
   const worth = base.match(/\bworth\s+of\s+(.+?)\b/i);
   if (worth?.[1]) item = worth[1].trim();
 
   if (!item) {
-    // "bought $X lumber" / "paid $X for lumber"
-    // remove common verbs, keep remainder after amount
-    // remove $ amount token(s)
     let cleaned = base.replace(/\$\s*[0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?/g, ' ');
-    cleaned = cleaned.replace(/\b(i\s+)?(bought|buy|purchased|purchase|spent|spend|paid|pay|picked\s*up|got|ordered|charge|charged)\b/ig, ' ');
+    cleaned = cleaned.replace(
+      /\b(i\s+)?(bought|buy|purchased|purchase|spent|spend|paid|pay|picked\s*up|got|ordered|charge|charged)\b/ig,
+      ' '
+    );
     cleaned = cleaned.replace(/\b(worth\s+of)\b/ig, ' ');
     cleaned = cleaned.replace(/\s+/g, ' ').trim();
-
-    // also strip leading "expense"/"exp"
     cleaned = cleaned.replace(/^(expense|exp)\b\s*/i, '').trim();
 
-    // if still contains "for ..." and we didn't treat it as job, use it as item
     const forItem = cleaned.match(/\bfor\s+(.+)\s*$/i);
     if (forItem?.[1] && !jobName) {
       item = forItem[1].trim();
@@ -463,26 +470,23 @@ function parseBillMessage(input) {
   });
 }
 
-function parseRevenueMessage(input) {
+/**
+ * parseRevenueMessage(input, ctx?)
+ * NOTE: revenue parsing currently does not use tz for date tail unless you add it (optional).
+ */
+function parseRevenueMessage(input, ctx = {}) {
   const text = String(input || '').trim();
 
-  // Support:
-  // 1) "revenue $100 from John today"
-  // 2) "revenue from John $100 today"
-  // 3) "received $100 from John"
-  // 4) "received $100 from job 1556 Medway Park Dr today"
-  // 5) "received $100 for 1556 Medway Park Dr today"
   const lower = text.toLowerCase();
   if (!/^(revenue|rev|received)\b/i.test(lower)) return null;
 
-  // Remove leading keyword
+  const tz = ctx?.tz || ctx?.timezone || null;
+
   const body = text.replace(/^(revenue|rev|received)\b\s*/i, '').trim();
 
-  // Peel off trailing date token (today / on YYYY-MM-DD / Dec 12 2025)
-  const { rest, date } = stripDateTail(body);
-  const d = date || new Date().toISOString().split('T')[0];
+  const { rest, date } = stripDateTail(body, tz);
+  const d = date || todayInTimeZone(tz || 'UTC');
 
-  // Helpers
   const asAmount = (amt) => `$${parseFloat(amt).toFixed(2)}`;
   const normalizeJobPrefix = (s) =>
     String(s || '')
@@ -490,13 +494,11 @@ function parseRevenueMessage(input) {
       .replace(/^(job|job\s*name)\s*[:\-]?\s*/i, '')
       .trim();
 
-  // Pattern A: "$100 from X" OR "$100 for X"
   let m = rest.match(/^\$?(?<amt>\d+(?:\.\d{1,2})?)\s+(?:(?<kw>from|for)\s+)?(?<src>.+)$/i);
   if (m?.groups?.amt && m?.groups?.src) {
     let src = m.groups.src.trim();
     const kw = (m.groups.kw || '').toLowerCase();
 
-    // If "for ..." treat as job
     if (kw === 'for') {
       const jobName = normalizeJobPrefix(src);
       return stripUndefined({
@@ -508,7 +510,6 @@ function parseRevenueMessage(input) {
       });
     }
 
-    // If "from job ..." treat as job; otherwise treat as payer
     const srcLc = src.toLowerCase();
     if (srcLc.startsWith('job ') || srcLc.startsWith('jobname ') || srcLc.startsWith('job:')) {
       const jobName = normalizeJobPrefix(src.replace(/^jobname\b/i, 'job'));
@@ -529,7 +530,6 @@ function parseRevenueMessage(input) {
     });
   }
 
-  // Pattern B: "from X $100" OR "for X $100"
   m = rest.match(/^(?:(?<kw>from|for)\s+)?(?<src>.+?)\s+\$?(?<amt>\d+(?:\.\d{1,2})?)$/i);
   if (m?.groups?.amt && m?.groups?.src) {
     let src = m.groups.src.trim();
@@ -605,5 +605,5 @@ module.exports = {
   parseBillMessage,
   parseRevenueMessage,
   parseQuoteMessage,
-  parseJobMessage,
+  parseJobMessage
 };

@@ -4,6 +4,11 @@
 const pg = require('../../services/postgres');
 const { query, insertTransaction, listOpenJobs } = pg;
 
+// ✅ Optional rule-based category suggestion (fail-open if not implemented yet)
+const getCategorySuggestion =
+  (typeof pg.getCategorySuggestion === 'function' && pg.getCategorySuggestion) ||
+  (async () => null);
+
 // ✅ Vendor normalizer (fail-open)
 const normalizeVendorName =
   (typeof pg.normalizeVendorName === 'function' && pg.normalizeVendorName) ||
@@ -288,14 +293,24 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
+function vendorDefaultCategory(store) {
+  const s = String(store || '').toLowerCase();
+
+  // Materials yards / suppliers
+  if (/(home depot|homedepot|rona|lowe|lowes|home hardware|convoy|gentek|groupe|abc supply|beacon|roofmart|kent)/i.test(s)) {
+    return 'Materials';
+  }
+
+  // Fuel
+  if (/(esso|shell|petro|ultramar|pioneer|circle\s*k)/i.test(s)) return 'Fuel';
+
+  return null;
+}
+
 function inferExpenseCategoryHeuristic(data) {
   const memo = `${data?.item || ''} ${data?.store || ''}`.toLowerCase();
 
-  if (
-    /\b(lumber|plywood|2x4|2x6|drywall|shingle|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?)\b/.test(
-      memo
-    )
-  ) {
+  if (/\b(lumber|plywood|drywall|shingle|shingles|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?|siding|vinyl\s*siding|soffit|fascia|eavestrough|gutter|flashing|wrap|tyvek|house\s*wrap|sheathing|osb|studs|joists|truss|paint|primer|stain)\b/.test(memo)) {
     return 'Materials';
   }
   if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
@@ -400,7 +415,8 @@ function deterministicExpenseParse(input, userProfile) {
     const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
     if (iso?.[1]) date = iso[1];
   }
-    if (!date) {
+
+  if (!date) {
     // Support ordinal day suffix: "December 12th, 2025"
     const mNat = raw.match(
       /\bon\s+([A-Za-z]{3,9}\s+\d{1,2})(st|nd|rd|th)?\,?\s+(\d{4})\b/i
@@ -427,7 +443,7 @@ function deterministicExpenseParse(input, userProfile) {
   );
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
-    // item: prefer "worth of <item>" first (voice transcripts commonly use this)
+  // item: prefer "worth of <item>" first
   let item = null;
 
   const worthOf = raw.match(
@@ -446,7 +462,6 @@ function deterministicExpenseParse(input, userProfile) {
       if (cand && !isIsoDateToken(cand) && !looksLikeJobPhrase) item = cand;
     }
   }
-
 
   return {
     date,
@@ -541,6 +556,48 @@ async function buildJobPrompt(ownerId) {
   return `Which job is this expense for?\nStart your first job by replying with the job name for this entry (or "Overhead").`;
 }
 
+/**
+ * Central category resolver for expense.
+ * Order:
+ * - data.suggestedCategory
+ * - DB rule suggestion (category_rules) via pg.getCategorySuggestion
+ * - vendorDefaultCategory
+ * - AI categorizeEntry
+ * - heuristic keywords
+ * - null
+ */
+async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
+  const vendor = String(data?.store || '').trim() || 'Unknown Store';
+  const itemText = String(data?.item || '').trim();
+
+  // 1) pending/previous suggestion wins
+  if (data?.suggestedCategory && String(data.suggestedCategory).trim()) {
+    return String(data.suggestedCategory).trim();
+  }
+
+  // 2) DB category rules (if implemented)
+  try {
+    const fromRules = await getCategorySuggestion(ownerId, 'expense', vendor, itemText);
+    if (fromRules && String(fromRules).trim()) return String(fromRules).trim();
+  } catch (e) {
+    console.warn('[EXPENSE] getCategorySuggestion failed (ignored):', e?.message);
+  }
+
+  // 3) vendor defaults
+  const fromVendor = vendorDefaultCategory(vendor);
+  if (fromVendor) return fromVendor;
+
+  // 4) AI categorizer (existing behavior)
+  const fromAI = await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null);
+  if (fromAI && String(fromAI).trim()) return String(fromAI).trim();
+
+  // 5) heuristics
+  const fromHeur = inferExpenseCategoryHeuristic(data);
+  if (fromHeur) return fromHeur;
+
+  return null;
+}
+
 /* ---------------- main handler ---------------- */
 
 async function handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
@@ -609,11 +666,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         let data = normalizeExpenseData(rawData, userProfile);
         data.store = await normalizeVendorName(ownerId, data.store);
 
-        const category =
-          data.suggestedCategory ||
-          (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) ||
-          inferExpenseCategoryHeuristic(data) ||
-          null;
+        const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
         const jobName =
           (data.jobName && String(data.jobName).trim()) ||
@@ -718,6 +771,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return twimlText(reply);
     }
 
+    // Quick strict-ish pattern
     const m = String(input || '').match(
       /^(?:expense\s+|exp\s+)?\$?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i
     );
@@ -734,10 +788,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       data0.store = await normalizeVendorName(ownerId, data0.store);
 
-      const category =
-        (await Promise.resolve(categorizeEntry('expense', data0, ownerProfile)).catch(() => null)) ||
-        inferExpenseCategoryHeuristic(data0) ||
-        null;
+      const category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
 
       const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
@@ -764,15 +815,13 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
+    // Backstop deterministic parse
     const backstop = deterministicExpenseParse(input, userProfile);
     if (backstop && backstop.amount) {
       const data0 = normalizeExpenseData(backstop, userProfile);
       data0.store = await normalizeVendorName(ownerId, data0.store);
 
-      const category =
-        (await Promise.resolve(categorizeEntry('expense', data0, ownerProfile)).catch(() => null)) ||
-        inferExpenseCategoryHeuristic(data0) ||
-        null;
+      const category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
 
       const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
 
@@ -799,7 +848,16 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
-    const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData);
+    // AI ingestion fallback (now tz-aware via handleInputWithAI ctx)
+    const aiRes = await handleInputWithAI(
+      from,
+      input,
+      'expense',
+      parseExpenseMessage,
+      defaultData,
+      { tz }
+    );
+
     let data = aiRes?.data || null;
     let aiReply = aiRes?.reply || null;
 
@@ -816,17 +874,19 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       data.store === 'Unknown Store';
 
     if (aiReply && missingCore) {
-      await mergePendingTransactionState(from, { ...(pending || {}), pendingExpense: null, isEditing: true, type: 'expense' });
+      await mergePendingTransactionState(from, {
+        ...(pending || {}),
+        pendingExpense: null,
+        isEditing: true,
+        type: 'expense'
+      });
       return twimlText(aiReply);
     }
 
     if (data && data.amount && data.amount !== '$0.00') {
       data.store = await normalizeVendorName(ownerId, data.store);
 
-      const category =
-        (await Promise.resolve(categorizeEntry('expense', data, ownerProfile)).catch(() => null)) ||
-        inferExpenseCategoryHeuristic(data) ||
-        null;
+      const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
       const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
 

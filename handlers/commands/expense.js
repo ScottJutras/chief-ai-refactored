@@ -400,10 +400,17 @@ function deterministicExpenseParse(input, userProfile) {
     const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
     if (iso?.[1]) date = iso[1];
   }
-  if (!date) {
-    const mNat = raw.match(/\bon\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/i);
-    if (mNat?.[1]) date = parseNaturalDateTz(mNat[1], tz);
+    if (!date) {
+    // Support ordinal day suffix: "December 12th, 2025"
+    const mNat = raw.match(
+      /\bon\s+([A-Za-z]{3,9}\s+\d{1,2})(st|nd|rd|th)?\,?\s+(\d{4})\b/i
+    );
+    if (mNat?.[1] && mNat?.[3]) {
+      const normalized = `${mNat[1]} ${mNat[3]}`; // drop the "th"
+      date = parseNaturalDateTz(normalized, tz);
+    }
   }
+
   if (!date) date = todayInTimeZone(tz);
 
   let jobName = null;
@@ -420,19 +427,26 @@ function deterministicExpenseParse(input, userProfile) {
   );
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
+    // item: prefer "worth of <item>" first (voice transcripts commonly use this)
   let item = null;
-  const itemMatch = raw.match(
-    /\bfor\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+
+  const worthOf = raw.match(
+    /\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
   );
-  if (itemMatch?.[1]) {
-    const cand = String(itemMatch[1]).trim();
-    if (cand && !isIsoDateToken(cand)) item = cand;
+  if (worthOf?.[1]) item = String(worthOf[1]).trim();
+
+  // If not found, try "for <item> ..." but DO NOT accept "for job <...>" as the item.
+  if (!item) {
+    const itemMatch = raw.match(
+      /\bfor\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+    );
+    if (itemMatch?.[1]) {
+      const cand = String(itemMatch[1]).trim();
+      const looksLikeJobPhrase = /^\s*job\b/i.test(cand);
+      if (cand && !isIsoDateToken(cand) && !looksLikeJobPhrase) item = cand;
+    }
   }
 
-  if (!item) {
-    const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i);
-    if (worthOf?.[1]) item = String(worthOf[1]).trim();
-  }
 
   return {
     date,

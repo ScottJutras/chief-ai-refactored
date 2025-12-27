@@ -1516,6 +1516,8 @@ function normalizeVendorString(v) {
     'rona': 'RONA',
     'lowes': "Lowe's",
     'lowe’s': "Lowe's"
+    'gentek': 'Gentek',
+    'gentech': 'Gentek',
   };
 
   return ALIASES[key] || s;

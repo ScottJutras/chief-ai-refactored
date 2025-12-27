@@ -7,12 +7,21 @@ const pg = require('../../services/postgres');
 const state = require('../../utils/stateManager');
 
 const getPendingTransactionState = state.getPendingTransactionState;
+const deletePendingTransactionState = state.deletePendingTransactionState;
+
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
-const deletePendingTransactionState = state.deletePendingTransactionState;
 
-/* ---------------- TwiML helpers ---------------- */
+/* ---------------- helpers ---------------- */
+
+function normaliseOwnerId(ownerId, fromPhone) {
+  // NOTE: ownerId is likely a UUID (preferred). Do NOT DIGITS() it here.
+  // Just stringify and trust upstream mapping (webhook maps phone->uuid).
+  const base = ownerId || fromPhone;
+  if (!base) return null;
+  return String(base).trim();
+}
 
 function escapeXml(str = '') {
   return String(str)
@@ -39,18 +48,61 @@ function respond(res, message) {
   return twiml;
 }
 
-/* ---------------- WhatsApp helpers ---------------- */
-
-function isWhatsAppFrom(fromPhone) {
-  return /^whatsapp:/i.test(String(fromPhone || '').trim());
-}
-
 function waTo(fromPhone) {
-  // expects "whatsapp:+1555..." OR "+1555..." OR "1555..."
+  // expects "+1555..." OR "1555..." OR "whatsapp:+1555..."
   const s = String(fromPhone || '').trim();
+  if (!s) return null;
   if (s.startsWith('whatsapp:')) return s;
   const digits = s.replace(/\D/g, '');
   return digits ? `whatsapp:+${digits}` : null;
+}
+
+function stableHash(str) {
+  let h = 2166136261;
+  const s = String(str || '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+function dedupeJobs(list) {
+  const out = [];
+  const seen = new Set();
+  for (const j of list || []) {
+    const s = String(j || '').trim();
+    if (!s) continue;
+    const key = s.toLowerCase().replace(/\s+/g, ' ');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
+}
+
+/* ---------------- Twilio list-picker content helpers ---------------- */
+
+const ENABLE_LIST_PICKER =
+  String(process.env.TWILIO_ENABLE_LIST_PICKER || '').trim().toLowerCase() === 'true';
+
+const CONTENT_API_BASE = 'https://content.twilio.com/v1/Content';
+
+// in-memory cache (best-effort)
+const _contentSidCache = new Map(); // key -> { sid, at }
+const CONTENT_SID_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+
+function _cacheGet(key) {
+  const v = _contentSidCache.get(key);
+  if (!v) return null;
+  if (Date.now() - v.at > CONTENT_SID_CACHE_TTL_MS) {
+    _contentSidCache.delete(key);
+    return null;
+  }
+  return v.sid;
+}
+function _cacheSet(key, sid) {
+  _contentSidCache.set(key, { sid, at: Date.now() });
 }
 
 function getTwilioClient() {
@@ -70,22 +122,71 @@ function getSendFromConfig() {
   return { waFrom, messagingServiceSid };
 }
 
-async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections }) {
-  const client = getTwilioClient();
-  const { waFrom, messagingServiceSid } = getSendFromConfig();
+async function createListPickerContent({ friendlyName, body, button, items }) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  if (!accountSid || !authToken) throw new Error('Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN');
 
   const payload = {
-    to,
-    ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
-    interactive: {
-      type: 'list',
-      body: { text: String(bodyText || '').slice(0, 1024) },
-      action: {
-        button: String(buttonText || 'Pick a job').slice(0, 20),
-        sections
+    friendly_name: friendlyName || `active_job_picker_${Date.now()}`,
+    language: 'en',
+    types: {
+      'twilio/list-picker': {
+        body: String(body || '').slice(0, 1024),
+        button: String(button || 'Select').slice(0, 20),
+        items: (items || []).slice(0, 10).map((it) => ({
+          item: String(it.item || '').slice(0, 24),
+          id: String(it.id || '').slice(0, 200),
+          description: String(it.description || '').slice(0, 72)
+        }))
       }
     }
   };
+
+  const res = await fetch(CONTENT_API_BASE, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64')
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const txt = await res.text();
+  if (!res.ok) throw new Error(`Content API create failed (${res.status}): ${txt?.slice(0, 300)}`);
+
+  const json = JSON.parse(txt);
+  if (!json?.sid) throw new Error('Content API create returned no sid');
+  return json.sid;
+}
+
+async function sendWhatsAppListPicker({ to, body, button, items, cacheKey }) {
+  const client = getTwilioClient();
+  const { waFrom, messagingServiceSid } = getSendFromConfig();
+
+  const toClean = String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to)}`;
+
+  const key = cacheKey || stableHash(JSON.stringify({ body, button, items }));
+  let contentSid = _cacheGet(key);
+
+  if (!contentSid) {
+    contentSid = await createListPickerContent({
+      friendlyName: `active_job_picker_${key}`,
+      body,
+      button,
+      items
+    });
+    _cacheSet(key, contentSid);
+  }
+
+  const payload = {
+    to: toClean,
+    contentSid,
+    contentVariables: JSON.stringify({})
+  };
+
+  if (waFrom) payload.from = waFrom;
+  else payload.messagingServiceSid = messagingServiceSid;
 
   const TIMEOUT_MS = 3000;
   const msg = await Promise.race([
@@ -93,10 +194,11 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
     new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
   ]);
 
-  console.info('[JOB] interactive list sent', {
+  console.info('[JOB_LIST_PICKER] sent', {
     to: payload.to,
     from: payload.from || null,
     messagingServiceSid: payload.messagingServiceSid || null,
+    contentSid: payload.contentSid,
     sid: msg?.sid || null,
     status: msg?.status || null
   });
@@ -104,221 +206,177 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
   return msg;
 }
 
-/* ---------------- tolerant owner id ---------------- */
+/* ---------------- DB helpers ---------------- */
 
-function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(str || '')
+async function listJobs(ownerId) {
+  const { rows } = await pg.query(
+    `SELECT
+        id,
+        job_no,
+        COALESCE(name, job_name) AS job_name,
+        status,
+        created_at
+       FROM public.jobs
+      WHERE owner_id = $1
+      ORDER BY created_at DESC
+      LIMIT 10`,
+    [String(ownerId)]
   );
-}
 
-function normaliseOwnerId(ownerId, fromPhone) {
-  // Preferred: UUID ownerId (newer flow)
-  if (ownerId && looksLikeUuid(ownerId)) return String(ownerId);
+  if (!rows.length) {
+    return `You don't have any jobs yet.
 
-  // Otherwise keep whatever string we got (some installs use text IDs)
-  if (ownerId && String(ownerId).trim()) return String(ownerId).trim();
-
-  // Last resort: digits from phone (older installs)
-  const digits = String(fromPhone || '').replace(/^whatsapp:/i, '').replace(/\D/g, '');
-  return digits || null;
-}
-
-/* ---------------- job list picker logic ---------------- */
-
-const ENABLE_INTERACTIVE_LIST = (() => {
-  const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? 'true';
-  return String(raw).trim().toLowerCase() !== 'false';
-})();
-
-function stableHash(str) {
-  let h = 2166136261;
-  const s = String(str || '');
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
+Try:
+- "create job Oak Street re-roof"
+- "create job 12 Elm - siding"
+and then log time/expenses to those jobs.`;
   }
-  return (h >>> 0).toString(16);
+
+  const lines = rows.map((j, idx) => {
+    const status = j.status || 'unknown';
+    const date = j.created_at ? new Date(j.created_at).toLocaleDateString('en-CA') : 'n/a';
+    const no = j.job_no != null ? `#${j.job_no} ` : '';
+    return `${idx + 1}. ${no}${j.job_name} (${status}, created ${date})`;
+  });
+
+  return `Here are your recent jobs:\n\n${lines.join('\n')}`;
 }
 
-function dedupeJobs(list) {
-  const out = [];
-  const seen = new Set();
-  for (const j of list || []) {
-    const s = String(j || '').trim();
-    if (!s) continue;
-    const k = s.toLowerCase();
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(s);
+async function listActiveJobNames(ownerId, { limit = 50 } = {}) {
+  if (typeof pg.listOpenJobs === 'function') {
+    const out = await pg.listOpenJobs(String(ownerId), { limit });
+    return Array.isArray(out) ? out : [];
   }
-  return out;
+
+  const { rows } = await pg.query(
+    `SELECT COALESCE(name, job_name) AS job_name
+       FROM public.jobs
+      WHERE owner_id = $1
+        AND (status IS NULL OR status IN ('open','active','draft'))
+      ORDER BY updated_at DESC NULLS LAST, created_at DESC
+      LIMIT $2`,
+    [String(ownerId), Number(limit)]
+  );
+
+  return rows.map((r) => r.job_name).filter(Boolean);
 }
 
-function buildTextJobPrompt(jobs, page, pageSize) {
-  const start = page * pageSize;
-  const slice = jobs.slice(start, start + pageSize);
+/* ---------------- picker rendering + state ---------------- */
+
+function buildTextPicker(jobs, page, perPage) {
+  const start = page * perPage;
+  const slice = jobs.slice(start, start + perPage);
   const lines = slice.map((j, i) => `${start + i + 1}) ${j}`);
-  const hasMore = start + pageSize < jobs.length;
-
+  const hasMore = start + perPage < jobs.length;
   const more = hasMore ? `\nReply "more" for more jobs.` : '';
   return `Which job should I set active?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}`;
 }
 
-function buildPickerMaps(jobs, page, pageSize) {
-  const start = page * pageSize;
-  const slice = jobs.slice(start, start + pageSize);
-
-  const idMap = {};   // rowId -> jobName or special
-  const nameMap = {}; // lower(title/desc) -> jobName or special
-  const numMap = {};  // "12" -> jobName (absolute index)
+function buildPickerMap(jobs, page, perPage) {
+  const start = page * perPage;
+  const slice = jobs.slice(start, start + perPage);
+  const map = {};
 
   for (let i = 0; i < slice.length; i++) {
-    const absIdx = start + i + 1;
-    const full = slice[i];
-    const rowId = `job_${absIdx}_${stableHash(full)}`;
-
-    idMap[rowId] = full;
-    numMap[String(absIdx)] = full;
-
-    nameMap[String(full).toLowerCase()] = full;
-    nameMap[String(full).slice(0, 24).toLowerCase()] = full;
+    const idx = start + i + 1; // absolute number
+    map[String(idx)] = slice[i];
   }
 
-  idMap['overhead'] = 'Overhead';
-  idMap['more'] = '__MORE__';
-
-  nameMap['overhead'] = 'Overhead';
-  nameMap['more jobs…'] = '__MORE__';
-  nameMap['more jobs'] = '__MORE__';
-  nameMap['more'] = '__MORE__';
-
-  return { idMap, nameMap, numMap };
-}
-
-async function listActiveJobNames(ownerId, { limit = 50 } = {}) {
-  // Use existing helper if available (your expense.js uses this)
-  if (typeof pg.listOpenJobs === 'function') {
-    const out = await pg.listOpenJobs(ownerId, { limit });
-    return Array.isArray(out) ? out : [];
+  for (const j of slice) {
+    map[String(j).toLowerCase()] = j;
   }
 
-  // Fallback query
-  const { rows } = await pg.query(
-    `select coalesce(name, job_name) as job_name
-       from public.jobs
-      where owner_id = $1
-        and (status is null or status in ('open','active','draft'))
-      order by updated_at desc nulls last, created_at desc
-      limit $2`,
-    [ownerId, Number(limit)]
-  );
-
-  return rows.map(r => r.job_name).filter(Boolean);
+  return map;
 }
 
-async function sendActiveJobsPickerOrFallback(fromPhone, ownerId, page = 0, pageSize = 8) {
+async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobs, page = 0, perPage = 8 }) {
   const to = waTo(fromPhone);
-  const all = dedupeJobs(await listActiveJobNames(ownerId, { limit: 50 }));
-  const JOBS_PER_PAGE = Math.min(pageSize, 8);
+  const uniq = dedupeJobs(jobs);
 
-  const start = page * JOBS_PER_PAGE;
-  const slice = all.slice(start, start + JOBS_PER_PAGE);
-  const hasMore = start + JOBS_PER_PAGE < all.length;
+  const start = page * perPage;
+  const slice = uniq.slice(start, start + perPage);
+  const hasMore = start + perPage < uniq.length;
 
-  const { idMap, nameMap, numMap } = buildPickerMaps(all, page, JOBS_PER_PAGE);
+  const pickerMap = buildPickerMap(uniq, page, perPage);
 
-  // Store in pending state so we can resolve list replies
   await mergePendingTransactionState(fromPhone, {
     awaitingActiveJobPick: true,
     activeJobPickPage: page,
-    activeJobPickIdMap: idMap,
-    activeJobPickNameMap: nameMap,
-    activeJobPickNumMap: numMap,
+    activeJobPickMap: pickerMap,
     activeJobPickHasMore: hasMore,
-    activeJobPickTotal: all.length
+    activeJobPickTotal: uniq.length
   });
 
-  if (!isWhatsAppFrom(fromPhone) || !ENABLE_INTERACTIVE_LIST || !to) {
-    const fallback = all.length
-      ? buildTextJobPrompt(all, page, JOBS_PER_PAGE)
-      : `You don’t have any active jobs yet.\n\nReply: "create job <name>" (or "list jobs").`;
-    return twimlText(fallback);
+  // If list picker is disabled or we can't build a WhatsApp "to", fallback to text
+  if (!ENABLE_LIST_PICKER || !to) {
+    return respond(res, buildTextPicker(uniq, page, perPage));
   }
 
-  const rows = [];
-
-  for (let i = 0; i < slice.length; i++) {
+  // Build list-picker items (max 10)
+  const items = [];
+  for (let i = 0; i < slice.length && items.length < 10; i++) {
     const absIdx = start + i + 1;
     const full = slice[i];
-    const rowId = `job_${absIdx}_${stableHash(full)}`;
-    rows.push({
-      id: rowId,
-      title: String(full).slice(0, 24),
+    items.push({
+      item: `#${absIdx} ${String(full).slice(0, 20)}`.slice(0, 24),
+      id: `job_${absIdx}_${stableHash(full)}`,
       description: String(full).slice(0, 72)
     });
   }
 
-  rows.push({
-    id: 'overhead',
-    title: 'Overhead',
-    description: 'Not tied to a job'
-  });
-
-  if (hasMore) {
-    rows.push({
-      id: 'more',
-      title: 'More jobs…',
-      description: `Show jobs ${start + JOBS_PER_PAGE + 1}+`
-    });
+  // Overhead
+  if (items.length < 10) {
+    items.push({ item: 'Overhead', id: 'overhead', description: 'Not tied to a job' });
   }
 
-  const bodyText =
-    `Pick the job you want to set as Active (${start + 1}-${Math.min(start + JOBS_PER_PAGE, all.length)} of ${all.length}).`;
+  // More
+  if (hasMore && items.length < 10) {
+    items.push({ item: 'More jobs…', id: 'more', description: 'Show the next page' });
+  }
+
+  const body = `Pick your active job (${start + 1}-${Math.min(start + perPage, uniq.length)} of ${uniq.length}).`;
+  const button = 'Pick job';
 
   try {
-    await sendWhatsAppInteractiveList({
+    await sendWhatsAppListPicker({
       to,
-      bodyText,
-      buttonText: 'Pick a job',
-      sections: [{ title: 'Active Jobs', rows }]
+      body,
+      button,
+      items,
+      cacheKey: `active_jobs:${ownerId}:${page}:${stableHash(JSON.stringify(items))}`
     });
+
+    // IMPORTANT: return empty TwiML to avoid double-sending
+    if (res && typeof res.send === 'function' && !res.headersSent) {
+      res.type('text/xml').send(twimlEmpty());
+    }
     return twimlEmpty();
   } catch (e) {
-    console.warn('[JOB] interactive list failed; falling back to text:', e?.message);
-    const fallback = all.length
-      ? buildTextJobPrompt(all, page, JOBS_PER_PAGE)
-      : `You don’t have any active jobs yet.\n\nReply: "create job <name>" (or "list jobs").`;
-    return twimlText(fallback);
+    console.warn('[JOB] list-picker send failed; falling back to text:', e?.message);
+    return respond(res, buildTextPicker(uniq, page, perPage));
   }
 }
 
-/* ---------------- resolve job selection reply ---------------- */
+function resolvePickerReply(raw, pending) {
+  const s = String(raw || '').trim();
+  const lc = s.toLowerCase();
 
-function resolvePickedJob(input, pending) {
-  const t = String(input || '').trim();
-  if (!t) return null;
-
-  const lc = t.toLowerCase();
-
-  // typed paging
+  if (!s) return null;
   if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return '__MORE__';
   if (lc === 'overhead' || lc === 'oh') return 'Overhead';
 
-  // interactive list row id
-  if (pending?.activeJobPickIdMap && pending.activeJobPickIdMap[t]) return pending.activeJobPickIdMap[t];
+  // list-picker ids: job_<N>_<hash>
+  const m = s.match(/^job_(\d+)_/i);
+  if (m?.[1]) return pending?.activeJobPickMap?.[String(m[1])] || null;
 
-  // numeric (absolute)
-  if (/^\d+$/.test(t) && pending?.activeJobPickNumMap?.[t]) return pending.activeJobPickNumMap[t];
+  // number
+  if (/^\d+$/.test(s)) return pending?.activeJobPickMap?.[s] || null;
 
-  // interactive title
-  if (pending?.activeJobPickNameMap) {
-    const hit = pending.activeJobPickNameMap[lc];
-    if (hit) return hit;
-  }
+  // job name (case-insensitive)
+  if (pending?.activeJobPickMap?.[lc]) return pending.activeJobPickMap[lc];
 
-  // fall back to treating as job name
-  return t;
+  // free text job name
+  return s;
 }
 
 /* ---------------- main handler ---------------- */
@@ -328,168 +386,142 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
   if (!owner) {
     return respond(
       res,
-      `I couldn't figure out which account this belongs to yet.\n\nTry starting from WhatsApp with "Hi Chief" so I can link your number.`
+      `I couldn't figure out which account this belongs to yet.
+
+Try starting from WhatsApp with "Hi Chief" so I can link your number.`
     );
   }
 
   const msg = String(text || '').trim();
   const lc = msg.toLowerCase();
 
-  // 1) If we're awaiting a job pick, interpret the reply first
+  // ✅ If we're awaiting a pick, handle the reply first
   const pending = await getPendingTransactionState(fromPhone);
   if (pending?.awaitingActiveJobPick) {
-    const picked = resolvePickedJob(msg, pending);
+    const resolved = resolvePickerReply(msg, pending);
 
-    if (picked === '__MORE__') {
+    if (resolved === '__MORE__') {
+      const all = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
       const nextPage = Number(pending.activeJobPickPage || 0) + 1;
-      const twiml = await sendActiveJobsPickerOrFallback(fromPhone, owner, nextPage, 8);
-      if (res && !res.headersSent) return res.type('text/xml').send(twiml);
-      return twiml;
+      return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs: all, page: nextPage, perPage: 8 });
     }
 
-    // Clear picker state (keep other pending fields, if any)
+    const jobName = resolved && String(resolved).trim() ? String(resolved).trim() : null;
+
     await mergePendingTransactionState(fromPhone, {
       awaitingActiveJobPick: false,
       activeJobPickPage: null,
-      activeJobPickIdMap: null,
-      activeJobPickNameMap: null,
-      activeJobPickNumMap: null,
+      activeJobPickMap: null,
       activeJobPickHasMore: null,
       activeJobPickTotal: null
     });
 
-    const name = picked || null;
-    if (!name) return respond(res, `Which job should I set active? Try "change job".`);
-
-    // Set active job (best effort)
-    try {
-      if (typeof pg.activateJobByName === 'function') {
-        const j = await pg.activateJobByName(owner, name);
-        const jobName = j?.name || j?.job_name || name;
-        const jobNo = j?.job_no ?? '';
-        return respond(
-          res,
-          `✅ Active job set to: "${jobName}"${jobNo ? ` (Job #${jobNo})` : ''}.\n\nNow you can:\n- "clock in"\n- "expense 84.12 nails"\n- "task - order shingles due tomorrow"`
-        );
-      }
-    } catch (e) {
-      console.warn('[JOB] activateJobByName failed:', e?.message);
+    if (!jobName || jobName === 'Overhead') {
+      return respond(res, `✅ Okay — no active job set (Overhead).`);
     }
 
-    // If activate helper not available
-    return respond(res, `✅ Got it — I’ll treat "${name}" as your active job for now.\n\nNext: "clock in" or log an expense.`);
-  }
-
-  // 2) GLOBAL COMMANDS: change job / show active jobs
-  if (/^(change\s+job|switch\s+job|pick\s+job|show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs)\b/i.test(msg)) {
-    const twiml = await sendActiveJobsPickerOrFallback(fromPhone, owner, 0, 8);
-    if (res && !res.headersSent) return res.type('text/xml').send(twiml);
-    return twiml;
-  }
-
-  // 3) Active job set directly by name: "active job Roof Repair"
-  if (/^(active\s+job|set\s+active)\b/i.test(msg)) {
-    const name = msg.replace(/^(active\s+job|set\s+active)\b/i, '').trim();
-    if (!name) {
-      const twiml = await sendActiveJobsPickerOrFallback(fromPhone, owner, 0, 8);
-      if (res && !res.headersSent) return res.type('text/xml').send(twiml);
-      return twiml;
-    }
-
+    // activate
     try {
-      if (typeof pg.activateJobByName === 'function') {
-        const j = await pg.activateJobByName(owner, name);
-        const jobName = j?.name || j?.job_name || name;
-        const jobNo = j?.job_no ?? '';
-        return respond(
-          res,
-          `✅ Active job set to: "${jobName}"${jobNo ? ` (Job #${jobNo})` : ''}.\n\nNow you can:\n- "clock in"\n- "expense 84.12 nails"\n- "task - order shingles due tomorrow"`
-        );
-      }
-    } catch (e) {
-      console.warn('[JOB] activateJobByName failed:', e?.message);
-    }
+      const j = await pg.activateJobByName(owner, jobName);
+      const finalName = j?.name || j?.job_name || jobName;
+      const jobNo = j?.job_no ?? '?';
 
-    return respond(res, `✅ Active job set to: "${name}".`);
-  }
+      return respond(
+        res,
+        `✅ Active job set to: "${finalName}" (Job #${jobNo}).
 
-  // 4) List jobs (recent)
-  if (/^(jobs|list jobs|show jobs)\b/i.test(msg)) {
-    try {
-      const { rows } = await pg.query(
-        `SELECT id, job_no, COALESCE(name, job_name) AS job_name, status, created_at
-           FROM public.jobs
-          WHERE owner_id = $1
-          ORDER BY created_at DESC
-          LIMIT 10`,
-        [owner]
+Now you can:
+- "clock in"
+- "expense 84.12 nails"
+- "task - order shingles due tomorrow"`
       );
-
-      if (!rows.length) {
-        return respond(
-          res,
-          `You don't have any jobs yet.\n\nTry:\n- "create job Oak Street re-roof"\n- "create job 12 Elm - siding"`
-        );
-      }
-
-      const lines = rows.map((j, idx) => {
-        const status = j.status || 'unknown';
-        const date = j.created_at ? new Date(j.created_at).toLocaleDateString('en-CA') : 'n/a';
-        const no = j.job_no != null ? `#${j.job_no} ` : '';
-        return `${idx + 1}. ${no}${j.job_name} (${status}, created ${date})`;
-      });
-
-      return respond(res, `Here are your recent jobs:\n\n${lines.join('\n')}\n\nTip: "change job" to set your active job.`);
     } catch (e) {
-      console.warn('[JOB] list jobs failed:', e?.message);
-      return respond(res, `⚠️ I couldn’t list jobs right now. Try again.`);
+      console.warn('[JOB] activateJobByName failed:', e?.message);
+      return respond(res, `⚠️ I couldn't set that active job. Try: "active job ${jobName}"`);
     }
   }
 
-  // 5) Create job
+  // ✅ Global job picker commands
+  if (/^(show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs|pick\s+job|change\s+job)\b/i.test(msg)) {
+    const jobs = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
+    return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs, page: 0, perPage: 8 });
+  }
+
+  // Active job by name (direct)
+  if (/^(active\s+job|set\s+active|switch\s+job)\b/i.test(msg)) {
+    const name = msg.replace(/^(active\s+job|set\s+active|switch\s+job)\b/i, '').trim();
+    if (!name) return respond(res, `Which job should I set active? Try: "active job Oak Street"`);
+
+    const j = await pg.activateJobByName(owner, name);
+    const jobName = j?.name || j?.job_name || name;
+    const jobNo = j?.job_no ?? '?';
+
+    return respond(
+      res,
+      `✅ Active job set to: "${jobName}" (Job #${jobNo}).
+
+Now you can:
+- "clock in"
+- "expense 84.12 nails"
+- "task - order shingles due tomorrow"`
+    );
+  }
+
+  // List jobs
+  if (/^(jobs|list jobs|show jobs)\b/i.test(msg)) {
+    const reply = await listJobs(owner);
+    return respond(res, reply);
+  }
+
+  // Create job
   if (/^(create|new)\s+job\b/i.test(msg)) {
     const name = msg.replace(/^(create|new)\s+job\b/i, '').trim();
 
-    try {
-      if (typeof pg.createJobIdempotent === 'function') {
-        const out = await pg.createJobIdempotent({
-          ownerId: owner,
-          name,
-          sourceMsgId
-        });
+    const out = await pg.createJobIdempotent({
+      ownerId: owner,
+      name,
+      sourceMsgId
+    });
 
-        if (!out?.job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
-
-        const jobName = out.job.job_name || out.job.name || name || 'Untitled Job';
-        const jobNo = out.job.job_no ?? '';
-
-        if (out.inserted) {
-          return respond(
-            res,
-            `✅ Created job: "${jobName}"${jobNo ? ` (Job #${jobNo})` : ''}.\n\nNext:\n- Set active: "active job ${jobName}"\n- Log time: "clock in @ ${jobName}"\n- Log expense: "expense 84.12 nails from Home Depot"`
-          );
-        }
-
-        if (out.reason === 'already_exists') {
-          return respond(res, `✅ That job already exists: "${jobName}"${jobNo ? ` (Job #${jobNo})` : ''}.\n\nWant to switch to it? Reply: "active job ${jobName}"`);
-        }
-
-        return respond(res, `✅ Already handled that message: "${jobName}"${jobNo ? ` (Job #${jobNo})` : ''}.`);
-      }
-
-      // If helper missing, fall back to telling user
-      return respond(res, `⚠️ Job creation isn’t wired on this build yet.`);
-    } catch (e) {
-      console.warn('[JOB] create job failed:', e?.message);
+    if (!out?.job) {
       return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
     }
+
+    const jobName = out.job.job_name || out.job.name || name || 'Untitled Job';
+    const jobNo = out.job.job_no ?? '?';
+
+    if (out.inserted) {
+      return respond(
+        res,
+        `✅ Created job: "${jobName}" (Job #${jobNo}).
+
+Next:
+- Set active: "change job" (or "active job ${jobName}")
+- Log time: "clock in @ ${jobName}"
+- Log expense: "expense 84.12 nails from Home Depot"`
+      );
+    }
+
+    if (out.reason === 'already_exists') {
+      return respond(
+        res,
+        `✅ That job already exists: "${jobName}" (Job #${jobNo}).
+
+Want to switch to it? Reply: "active job ${jobName}"`
+      );
+    }
+
+    return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
   }
 
-  // Help
-  return respond(
-    res,
-    `Job commands you can use:\n\n- "create job Oak Street re-roof"\n- "change job"\n- "active job Oak Street re-roof"\n- "list jobs"\n- "show active jobs"`
-  );
+  const help = `Job commands you can use:
+
+- "create job Oak Street re-roof"
+- "change job" (shows active jobs picker)
+- "active job Oak Street re-roof"
+- "list jobs"`;
+
+  return respond(res, help);
 }
 
 module.exports = { handleJob };

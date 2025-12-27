@@ -1,4 +1,7 @@
 // handlers/commands/expense.js
+// Drop-in replacement: FREE-FORM WhatsApp Interactive List (dynamic job picker)
+// + "change job" support during confirm + job-prompt steps
+// + Removes Twilio Content API list-picker (template-ish) approach
 
 // ✅ Robust import: postgres exports differ across versions
 const pg = require('../../services/postgres');
@@ -69,7 +72,7 @@ const validateCIL =
   (typeof cilMod === 'function' && cilMod) ||
   null;
 
-/* ---------------- Twilio Content Template / Messaging helpers ---------------- */
+/* ---------------- Twilio Template / Messaging helpers ---------------- */
 
 function xmlEsc(s = '') {
   return String(s)
@@ -173,42 +176,26 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
     }
   }
 
-  return twimlText(`Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.`);
+  return twimlText(`Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.\nTip: reply "change job" to pick a different job.`);
 }
 
-/* ---------------- List Picker: create Content + send ---------------- */
-/**
- * Twilio list-picker constraints:
- * - max 10 items
- * - only available during an active 24h session
- * (handled by Twilio/WhatsApp; we just best-effort send and fallback)
+/* ---------------- WhatsApp Interactive List (FREE-FORM, dynamic) ----------------
+ * This is the real WhatsApp interactive list picker UI.
+ * Works only inside the WhatsApp 24-hour window. Outside window -> Twilio will reject,
+ * and we fall back to plain text prompt.
  */
 
-const ENABLE_LIST_PICKER =
-  String(process.env.TWILIO_ENABLE_LIST_PICKER || '').trim().toLowerCase() === 'true';
-
-const CONTENT_API_BASE = 'https://content.twilio.com/v1/Content';
-
-// tiny in-memory cache so we don't create a new content SID on every request
-// (best-effort; safe if it resets on deploy)
-const _contentSidCache = new Map(); // key -> { sid, at }
-const CONTENT_SID_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
-
-function _cacheGet(key) {
-  const v = _contentSidCache.get(key);
-  if (!v) return null;
-  if (Date.now() - v.at > CONTENT_SID_CACHE_TTL_MS) {
-    _contentSidCache.delete(key);
-    return null;
-  }
-  return v.sid;
-}
-function _cacheSet(key, sid) {
-  _contentSidCache.set(key, { sid, at: Date.now() });
-}
+// Back-compat: allow turning off interactive list if needed
+const ENABLE_INTERACTIVE_LIST = (() => {
+  const raw =
+    process.env.TWILIO_ENABLE_INTERACTIVE_LIST ??
+    process.env.TWILIO_ENABLE_LIST_PICKER ??
+    'true';
+  return String(raw).trim().toLowerCase() !== 'false';
+})();
 
 function stableHash(str) {
-  // fast non-crypto hash for caching keys
+  // fast non-crypto hash
   let h = 2166136261;
   const s = String(str || '');
   for (let i = 0; i < s.length; i++) {
@@ -216,96 +203,6 @@ function stableHash(str) {
     h = Math.imul(h, 16777619);
   }
   return (h >>> 0).toString(16);
-}
-
-async function createListPickerContent({ friendlyName, body, button, items }) {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
-  if (!accountSid || !authToken) throw new Error('Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN');
-
-  const payload = {
-    friendly_name: friendlyName || `job_picker_${Date.now()}`,
-    language: 'en',
-    types: {
-      'twilio/list-picker': {
-        body: String(body || '').slice(0, 1024),
-        button: String(button || 'Select').slice(0, 20),
-        items: (items || []).slice(0, 10).map((it) => ({
-          item: String(it.item || '').slice(0, 24),
-          id: String(it.id || '').slice(0, 200),
-          description: String(it.description || '').slice(0, 72)
-        }))
-      }
-    }
-  };
-
-  const res = await fetch(CONTENT_API_BASE, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Basic ' + Buffer.from(`${accountSid}:${authToken}`).toString('base64')
-    },
-    body: JSON.stringify(payload)
-  });
-
-  const txt = await res.text();
-  if (!res.ok) {
-    throw new Error(`Content API create failed (${res.status}): ${txt?.slice(0, 300)}`);
-  }
-
-  const json = JSON.parse(txt);
-  if (!json?.sid) throw new Error('Content API create returned no sid');
-  return json.sid;
-}
-
-async function sendWhatsAppListPicker({ to, body, button, items, cacheKey }) {
-  const client = getTwilioClient();
-  const { waFrom, messagingServiceSid } = getSendFromConfig();
-
-  const toClean = String(to).startsWith('whatsapp:')
-    ? String(to)
-    : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
-
-  // cache by items+body (so paging creates distinct templates)
-  const key = cacheKey || stableHash(JSON.stringify({ body, button, items }));
-  let contentSid = _cacheGet(key);
-
-  if (!contentSid) {
-    contentSid = await createListPickerContent({
-      friendlyName: `job_picker_${key}`,
-      body,
-      button,
-      items
-    });
-    _cacheSet(key, contentSid);
-  }
-
-  const payload = {
-    to: toClean,
-    contentSid,
-    // no variables needed (we're creating the template with real items)
-    contentVariables: JSON.stringify({})
-  };
-
-  if (waFrom) payload.from = waFrom;
-  else payload.messagingServiceSid = messagingServiceSid;
-
-  const TIMEOUT_MS = 3000;
-  const msg = await Promise.race([
-    client.messages.create(payload),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
-  ]);
-
-  console.info('[LIST_PICKER] sent', {
-    to: payload.to,
-    from: payload.from || null,
-    messagingServiceSid: payload.messagingServiceSid || null,
-    contentSid: payload.contentSid,
-    sid: msg?.sid || null,
-    status: msg?.status || null
-  });
-
-  return msg;
 }
 
 function dedupeJobs(list) {
@@ -329,109 +226,150 @@ function buildTextJobPrompt(jobs, page, pageSize) {
   const hasMore = start + pageSize < jobs.length;
 
   const more = hasMore ? `\nReply "more" for more jobs.` : '';
-  return `Which job is this expense for?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}`;
+  return `Which job is this expense for?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
 }
 
 function buildJobPickerMapping(jobs, page, pageSize) {
   const start = page * pageSize;
   const slice = jobs.slice(start, start + pageSize);
-  const map = {}; // token -> jobName
 
-  // 1..N absolute index mapping (so "12" works on later pages too)
+  const idMap = {};   // rowId -> jobName
+  const nameMap = {}; // lower(title/desc) -> jobName
+
   for (let i = 0; i < slice.length; i++) {
-    const idx = start + i + 1;
-    map[String(idx)] = slice[i];
+    const absIdx = start + i + 1;
+    const fullName = slice[i];
+    const rowId = `job_${absIdx}_${stableHash(fullName)}`;
+
+    idMap[rowId] = fullName;
+
+    // Help resolve if Twilio sends back title instead of id.
+    nameMap[String(fullName).toLowerCase()] = fullName;
+    nameMap[String(fullName).slice(0, 24).toLowerCase()] = fullName;
   }
 
-  // also map exact job names (case-insensitive lookup later)
-  for (const j of slice) {
-    map[String(j).toLowerCase()] = j;
-  }
+  // Special rows
+  idMap['overhead'] = 'Overhead';
+  idMap['more'] = '__MORE__';
 
-  return map;
+  nameMap['overhead'] = 'Overhead';
+  nameMap['more jobs…'] = '__MORE__';
+  nameMap['more jobs'] = '__MORE__';
+  nameMap['more'] = '__MORE__';
+
+  return { idMap, nameMap };
+}
+
+async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections }) {
+  const client = getTwilioClient();
+  const { waFrom, messagingServiceSid } = getSendFromConfig();
+
+  // IMPORTANT: Twilio expects interactive payload keys for WhatsApp.
+  // If Twilio rejects (outside 24h), caller will catch & fallback.
+  const payload = {
+    to,
+    ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
+    interactive: {
+      type: 'list',
+      body: { text: String(bodyText || '').slice(0, 1024) },
+      action: {
+        button: String(buttonText || 'Pick a job').slice(0, 20),
+        sections
+      }
+    }
+  };
+
+  const TIMEOUT_MS = 3000;
+  const msg = await Promise.race([
+    client.messages.create(payload),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
+  ]);
+
+  console.info('[INTERACTIVE_LIST] sent', {
+    to: payload.to,
+    from: payload.from || null,
+    messagingServiceSid: payload.messagingServiceSid || null,
+    sid: msg?.sid || null,
+    status: msg?.status || null
+  });
+
+  return msg;
 }
 
 async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize = 8) {
   const to = waTo(from);
   const uniq = dedupeJobs(jobs);
 
-  // Keep list-picker within 10 items; we’ll reserve space for special rows.
-  const maxItems = 10;
-
-  // We'll show up to 8 jobs per page so we can add:
-  // - Overhead
-  // - More jobs… (if needed)
   const JOBS_PER_PAGE = Math.min(pageSize, 8);
-
   const start = page * JOBS_PER_PAGE;
   const slice = uniq.slice(start, start + JOBS_PER_PAGE);
   const hasMore = start + JOBS_PER_PAGE < uniq.length;
 
-  // mapping so we can resolve numeric replies reliably
-  const pickerMap = buildJobPickerMapping(uniq, page, JOBS_PER_PAGE);
+  const { idMap, nameMap } = buildJobPickerMapping(uniq, page, JOBS_PER_PAGE);
 
   // Save mapping + pagination state in pending state
   await mergePendingTransactionState(from, {
     awaitingExpenseJob: true,
     awaitingExpenseJobPage: page,
-    expenseJobPickerMap: pickerMap,
+    expenseJobPickerIdMap: idMap,
+    expenseJobPickerNameMap: nameMap,
     expenseJobPickerHasMore: hasMore,
     expenseJobPickerTotal: uniq.length
   });
 
-  if (!ENABLE_LIST_PICKER || !to) {
+  // If interactive is disabled or no WhatsApp destination, fallback to text
+  if (!ENABLE_INTERACTIVE_LIST || !to) {
     return twimlText(buildTextJobPrompt(uniq, page, JOBS_PER_PAGE));
   }
 
-  // Build list-picker items (max 10)
-  // item <= 24 chars, description <= 72 chars
-  const items = [];
-  for (let i = 0; i < slice.length && items.length < maxItems; i++) {
+  // Build interactive list rows
+  const rows = [];
+
+  for (let i = 0; i < slice.length; i++) {
     const absIdx = start + i + 1;
     const full = slice[i];
-    const item = `#${absIdx} ${String(full).slice(0, 20)}`.slice(0, 24);
-    items.push({
-      item,
-      id: `job_${absIdx}_${stableHash(full)}`,
+    const rowId = `job_${absIdx}_${stableHash(full)}`;
+
+    rows.push({
+      id: rowId,
+      title: String(full).slice(0, 24),
       description: String(full).slice(0, 72)
     });
   }
 
-  // Add Overhead
-  if (items.length < maxItems) {
-    items.push({
-      item: 'Overhead',
-      id: 'overhead',
-      description: 'Not tied to a job'
-    });
-  }
+  // Overhead
+  rows.push({
+    id: 'overhead',
+    title: 'Overhead',
+    description: 'Not tied to a job'
+  });
 
-  // Add "More"
-  if (hasMore && items.length < maxItems) {
-    items.push({
-      item: 'More jobs…',
+  // More
+  if (hasMore) {
+    rows.push({
       id: 'more',
-      description: 'Show the next page'
+      title: 'More jobs…',
+      description: `Show jobs ${start + JOBS_PER_PAGE + 1}+`
     });
   }
 
-  const body = `Select the job for this expense (${start + 1}-${Math.min(
-    start + JOBS_PER_PAGE,
-    uniq.length
-  )} of ${uniq.length}).`;
-  const button = 'Pick job';
+  const bodyText =
+    `Here are your active jobs (${start + 1}-${Math.min(start + JOBS_PER_PAGE, uniq.length)} of ${uniq.length}).\n` +
+    `Pick one to assign this expense.\n\n` +
+    `Tip: You can switch your current job anytime.`;
+
+  const sections = [{ title: 'Active Jobs', rows }];
 
   try {
-    await sendWhatsAppListPicker({
+    await sendWhatsAppInteractiveList({
       to,
-      body,
-      button,
-      items,
-      cacheKey: `jobs:${ownerId}:${page}:${stableHash(JSON.stringify(items))}`
+      bodyText,
+      buttonText: 'Pick a job',
+      sections
     });
     return twimlEmpty();
   } catch (e) {
-    console.warn('[EXPENSE] list-picker send failed; falling back to text:', e?.message);
+    console.warn('[EXPENSE] interactive list failed; falling back to text:', e?.message);
     return twimlText(buildTextJobPrompt(uniq, page, JOBS_PER_PAGE));
   }
 }
@@ -451,6 +389,11 @@ function normalizeDecisionToken(input) {
   if (s === 'yes' || s === 'y' || s === 'confirm') return 'yes';
   if (s === 'edit') return 'edit';
   if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
+
+  // ✅ allow job switching while confirming / prompting
+  if (s === 'change job' || s === 'switch job') return 'change_job';
+  if (/\bchange\s+job\b/.test(s) && s.length <= 40) return 'change_job';
+
   if (/\byes\b/.test(s) && s.length <= 20) return 'yes';
   if (/\bedit\b/.test(s) && s.length <= 20) return 'edit';
   if (/\bcancel\b/.test(s) && s.length <= 20) return 'cancel';
@@ -508,35 +451,25 @@ function escapeRegExp(x) {
 }
 
 /**
- * ✅ NEW: strip embedded "on <date>" and "for <job>" tails from item/memo
- * to prevent summary duplication like:
- * "insulation from Gentek on 2025-12-13 for Job 200 Happy St ..."
+ * ✅ strip embedded "on <date>" and "for <job>" tails from item/memo
  */
 function stripEmbeddedDateAndJobFromItem(item, { date, jobName } = {}) {
   let s = String(item || '').trim();
 
-  // remove "on YYYY-MM-DD" anywhere
   if (date) {
     const d = String(date).trim();
-    if (d) {
-      s = s.replace(new RegExp(`\\bon\\s+${escapeRegExp(d)}\\b`, 'ig'), ' ');
-    }
+    if (d) s = s.replace(new RegExp(`\\bon\\s+${escapeRegExp(d)}\\b`, 'ig'), ' ');
   }
 
-  // remove "for Job ..." or "for <jobName>" tails
   if (jobName) {
     const j = String(jobName).trim();
     if (j) {
-      // generic "for job <anything>" at end
       s = s.replace(/\bfor\s+job\s+.+$/i, ' ');
-      // specific "for <jobName>" at end
       s = s.replace(new RegExp(`\\bfor\\s+${escapeRegExp(j)}\\b.*$`, 'i'), ' ');
     }
   }
 
-  // also remove a stray "for a job" artifact
   s = s.replace(/\bfor\s+a\s+job\b/ig, ' ');
-
   s = s.replace(/\s+/g, ' ').trim();
   return s || 'Unknown';
 }
@@ -843,13 +776,6 @@ async function withTimeout(promise, ms, fallbackValue = '__TIMEOUT__') {
 
 /**
  * Central category resolver for expense.
- * Order:
- * - data.suggestedCategory
- * - DB rule suggestion (category_rules) via pg.getCategorySuggestion
- * - vendorDefaultCategory
- * - AI categorizeEntry
- * - heuristic keywords
- * - null
  */
 async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   const vendor = String(data?.store || '').trim() || 'Unknown Store';
@@ -878,6 +804,13 @@ async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   return null;
 }
 
+/**
+ * Resolve job selection from:
+ * - interactive list row ID (best)
+ * - interactive list title (fallback)
+ * - "more"/"Overhead"
+ * - typed job name
+ */
 function resolveJobFromReply(input, pending) {
   const raw = normalizeJobAnswer(input);
   const t = String(raw || '').trim();
@@ -885,18 +818,29 @@ function resolveJobFromReply(input, pending) {
 
   if (looksLikeOverhead(t)) return 'Overhead';
 
-  // paging control
+  // paging control (typed)
   if (t.toLowerCase() === 'more' || t.toLowerCase() === 'more jobs' || t.toLowerCase() === 'more jobs…') {
     return '__MORE__';
   }
 
-  // numeric selection
+  // ✅ interactive list row id
+  if (pending?.expenseJobPickerIdMap && pending.expenseJobPickerIdMap[t]) {
+    return pending.expenseJobPickerIdMap[t];
+  }
+
+  // ✅ interactive list title (common)
+  if (pending?.expenseJobPickerNameMap) {
+    const mapped = pending.expenseJobPickerNameMap[String(t).toLowerCase()];
+    if (mapped) return mapped;
+  }
+
+  // Legacy numeric selection (if user saw text list)
   if (/^\d+$/.test(t) && pending?.expenseJobPickerMap) {
     const mapped = pending.expenseJobPickerMap[String(t)];
     if (mapped) return mapped;
   }
 
-  // match by job name (case-insensitive)
+  // Legacy name selection (text)
   if (pending?.expenseJobPickerMap) {
     const mapped = pending.expenseJobPickerMap[String(t).toLowerCase()];
     if (mapped) return mapped;
@@ -933,8 +877,17 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       pending = null;
     }
 
-    // Awaiting job selection (list picker or text)
+    // Awaiting job selection (interactive list or text)
     if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
+      const tok = normalizeDecisionToken(input);
+
+      // ✅ if user explicitly asks to change job, re-send picker for current page (or page 0)
+      if (tok === 'change_job') {
+        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
+        const page = Number(pending.awaitingExpenseJobPage || 0) || 0;
+        return await sendJobPickerOrFallback(from, ownerId, all, page, 8);
+      }
+
       const resolved = resolveJobFromReply(input, pending);
 
       // user asked for "More jobs…"
@@ -956,6 +909,9 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         ...(pending || {}),
         pendingExpense: merged,
         awaitingExpenseJob: false,
+        // clear all picker maps (new + legacy)
+        expenseJobPickerIdMap: null,
+        expenseJobPickerNameMap: null,
         expenseJobPickerMap: null,
         expenseJobPickerHasMore: null,
         expenseJobPickerTotal: null
@@ -981,6 +937,18 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const token = normalizeDecisionToken(input);
       const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
+
+      // ✅ allow changing job during confirm step
+      if (token === 'change_job' && pending?.pendingExpense) {
+        await mergePendingTransactionState(from, {
+          ...(pending || {}),
+          awaitingExpenseJob: true,
+          awaitingExpenseJobPage: 0
+        });
+
+        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
+        return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
+      }
 
       if (token === 'yes' && pending?.pendingExpense) {
         const rawData = pending.pendingExpense || {};
@@ -1095,7 +1063,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return twimlText(reply);
       }
 
-      reply = `⚠️ Please choose Yes, Edit, or Cancel.`;
+      reply = `⚠️ Please choose Yes, Edit, or Cancel.\nTip: reply "change job" to pick a different job.`;
       return twimlText(reply);
     }
 

@@ -1,6 +1,10 @@
 // routes/webhook.js
-// Serverless-safe WhatsApp webhook router (Twilio form posts)
-// Aligned with North Star: tolerant, lazy deps, quick fallbacks, confirm/undo friendly.
+// Drop-in replacement (aligned with expense.js + job.js interactive picker)
+// Key fixes:
+// - Robust inbound text extraction for WhatsApp interactive list replies (ListId/ListTitle + InteractiveResponseJson)
+// - Allow "change job"/"active jobs"/list picks to flow even when an expense/revenue is pending (no nudge-block)
+// - Ensure pending-flow handlers run before fast-path routing, but still allow job picker during pending flows
+// - Keep 8s safety timer + tolerant middlewares + media transcript passthrough
 
 const express = require('express');
 const querystring = require('querystring');
@@ -23,10 +27,7 @@ const mergePendingTransactionState =
 /* ---------------- Small helpers ---------------- */
 
 function xmlEsc(s = '') {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 const xml = (s = '') => `<Response><Message>${xmlEsc(s)}</Message></Response>`;
 
@@ -58,6 +59,8 @@ function looksHardCommand(lc) {
     /^active\s+job\b/.test(lc) ||
     /^set\s+active\b/.test(lc) ||
     /^switch\s+job\b/.test(lc) ||
+    /^change\s+job\b/.test(lc) ||
+    /^(show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs|pick\s+job)\b/.test(lc) ||
     /^task\b/.test(lc) ||
     /^my\s+tasks\b/.test(lc) ||
     /^team\s+tasks\b/.test(lc) ||
@@ -70,8 +73,28 @@ function looksHardCommand(lc) {
   );
 }
 
-function isYesEditCancelOrSkip(lc) {
-  return /^(yes|y|confirm|edit|cancel|no|skip|stop)\b/.test(lc);
+// ✅ Treat these as "allowed" while a pending expense/revenue exists
+// (so we don't nudge-block them)
+function isAllowedWhilePending(lc) {
+  return /^(yes|y|confirm|edit|cancel|no|skip|stop|more|overhead)\b/.test(lc);
+}
+
+// ✅ "global job picker intents" (typed commands)
+function isJobPickerIntent(lc) {
+  return /^(change\s+job|switch\s+job|pick\s+job|show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs)\b/.test(
+    lc
+  );
+}
+
+// ✅ "list-picker reply-like" tokens (IDs we generate typically start with job_)
+// Also accept Twilio "more"/"overhead" typed.
+function looksLikeJobPickerReplyToken(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return false;
+  if (/^(more|overhead|oh)$/i.test(s)) return true;
+  if (/^\d+$/.test(s)) return true;
+  if (/^job_\d+_[0-9a-f]+$/i.test(s)) return true;
+  return false;
 }
 
 function pendingTxnNudgeMessage(pending) {
@@ -87,7 +110,6 @@ Or reply "skip" to leave it pending and continue.`;
 }
 
 // Try to clear pending txn state if your stateManager exports any of these.
-// We keep this tolerant because your file names / exports may differ.
 async function tryClearPendingTxn(from) {
   try {
     const sm = require('../utils/stateManager');
@@ -108,11 +130,13 @@ async function tryClearPendingTxn(from) {
 }
 
 /**
- * ✅ Twilio WhatsApp template buttons / quick replies.
- * For content templates with buttons, Twilio commonly includes:
- * - ButtonPayload (best: often your ID like "yes"/"edit"/"cancel")
- * - ButtonText (fallback: "Yes"/"Edit"/"Cancel")
- * - Body (sometimes empty, sometimes repeats text)
+ * ✅ Inbound text normalization (button-aware + interactive list-aware)
+ *
+ * We attempt:
+ * - ButtonPayload / ButtonText
+ * - InteractiveResponseJson (Twilio sometimes embeds list reply here)
+ * - ListId/ListTitle + variants
+ * - Body
  */
 function getInboundText(body = {}) {
   const payload = String(body.ButtonPayload || body.buttonPayload || '').trim();
@@ -121,12 +145,49 @@ function getInboundText(body = {}) {
   const btnText = String(body.ButtonText || body.buttonText || '').trim();
   if (btnText) return btnText;
 
-  // Some variants (rare): Interactive payload keys. Keep fail-open.
-  const interactiveId = String(body.ListId || body.listId || '').trim();
-  if (interactiveId) return interactiveId;
+  // Twilio sometimes sends an "InteractiveResponseJson" payload (stringified)
+  // which can include list_reply.id / list_reply.title.
+  const irj = body.InteractiveResponseJson || body.interactiveResponseJson || null;
+  if (irj) {
+    try {
+      const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
+      const id =
+        json?.list_reply?.id ||
+        json?.listReply?.id ||
+        json?.interactive?.list_reply?.id ||
+        '';
+      const title =
+        json?.list_reply?.title ||
+        json?.listReply?.title ||
+        json?.interactive?.list_reply?.title ||
+        '';
+      const picked = String(id || title || '').trim();
+      if (picked) return picked;
+    } catch {}
+  }
 
-  const interactiveTitle = String(body.ListTitle || body.listTitle || '').trim();
-  if (interactiveTitle) return interactiveTitle;
+  // Interactive list variants (ID is best)
+  const listId = String(
+    body.ListId ||
+      body.listId ||
+      body.ListItemId ||
+      body.listItemId ||
+      body.ListReplyId ||
+      body.listReplyId ||
+      ''
+  ).trim();
+  if (listId) return listId;
+
+  const listTitle = String(
+    body.ListTitle ||
+      body.listTitle ||
+      body.ListItemTitle ||
+      body.listItemTitle ||
+      body.ListReplyTitle ||
+      body.listReplyTitle ||
+      ''
+  ).trim();
+  if (listTitle) return listTitle;
 
   return String(body.Body || '').trim();
 }
@@ -136,15 +197,10 @@ function getInboundText(body = {}) {
 function hasMoneyAmount(str) {
   const s = String(str || '');
 
-  // $489, $489.78, $8,436, $8,436.10
   const hasDollar = /\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/.test(s);
-
-  // 8436 dollars, 8,436 bucks, 8436 cad
   const hasWordAmount =
     /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*(?:dollars|bucks|cad|usd)\b/i.test(s);
 
-  // plain-ish numbers (avoid matching years / addresses):
-  // requires a hint word nearby: "for", "paid", "spent", "received", "cost"
   const hasBareNumberWithHint =
     /\b(?:for|paid|spent|received|cost|total)\s+\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b/i.test(s) ||
     /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s+\b(?:for|paid|spent|received|cost|total)\b/i.test(s);
@@ -163,21 +219,23 @@ function looksExpenseNl(str) {
 
   if (!verb) return false;
 
-  // avoid revenue phrasing
   if (/\b(received|got paid|payment|deposit)\b/.test(s)) return false;
 
-  // avoid hard commands
+  // avoid routing obvious job/time/task commands as expense NL
   if (
     /^(create|new)\s+job\b/.test(s) ||
     /^active\s+job\b/.test(s) ||
     /^set\s+active\b/.test(s) ||
     /^switch\s+job\b/.test(s) ||
+    /^change\s+job\b/.test(s) ||
+    /^(show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs|pick\s+job)\b/.test(s) ||
     /^clock\b/.test(s) ||
     /^break\b/.test(s) ||
     /^drive\b/.test(s) ||
     /^task\b/.test(s) ||
     /^my\s+tasks\b/.test(s)
-  ) return false;
+  )
+    return false;
 
   return true;
 }
@@ -204,17 +262,24 @@ router.use((req, _res, next) => {
 
   let raw = '';
   req.setEncoding('utf8');
-  req.on('data', chunk => {
+  req.on('data', (chunk) => {
     raw += chunk;
     if (raw.length > 1_000_000) req.destroy(); // 1MB guard
   });
   req.on('end', () => {
     req.rawBody = raw;
-    try { req.body = raw ? querystring.parse(raw) : {}; }
-    catch { req.body = {}; }
+    try {
+      req.body = raw ? querystring.parse(raw) : {};
+    } catch {
+      req.body = {};
+    }
     next();
   });
-  req.on('error', () => { req.rawBody = raw || ''; req.body = {}; next(); });
+  req.on('error', () => {
+    req.rawBody = raw || '';
+    req.body = {};
+    next();
+  });
 });
 
 /* ---------------- Non-POST guard ---------------- */
@@ -224,7 +289,7 @@ router.all('*', (req, res, next) => {
   return ok(res, 'OK');
 });
 
-/* ---------------- Identity + canonical URL (for Twilio signature verification) ---------------- */
+/* ---------------- Identity + canonical URL ---------------- */
 
 router.use((req, _res, next) => {
   req.from = req.body?.From ? normalizePhone(req.body.From) : null;
@@ -283,16 +348,20 @@ router.post('*', (req, res, next) => {
 router.use((req, res, next) => {
   try {
     const token = require('../middleware/token');
-    const prof  = require('../middleware/userProfile');
-    const lock  = require('../middleware/lock');
+    const prof = require('../middleware/userProfile');
+    const lock = require('../middleware/lock');
 
-    res.locals.phase = 'token'; res.locals.phaseAt = Date.now();
+    res.locals.phase = 'token';
+    res.locals.phaseAt = Date.now();
     token.tokenMiddleware(req, res, () => {
-      res.locals.phase = 'userProfile'; res.locals.phaseAt = Date.now();
+      res.locals.phase = 'userProfile';
+      res.locals.phaseAt = Date.now();
       prof.userProfileMiddleware(req, res, () => {
-        res.locals.phase = 'lock'; res.locals.phaseAt = Date.now();
+        res.locals.phase = 'lock';
+        res.locals.phaseAt = Date.now();
         lock.lockMiddleware(req, res, () => {
-          res.locals.phase = 'router'; res.locals.phaseAt = Date.now();
+          res.locals.phase = 'router';
+          res.locals.phaseAt = Date.now();
           next();
         });
       });
@@ -321,26 +390,15 @@ router.post('*', async (req, res, next) => {
   try {
     const { handleMedia } = require('../handlers/media');
 
-    // IMPORTANT: Body is usually empty on media; still pass it along (button-aware)
     const bodyText = getInboundText(req.body || {});
 
-    const result = await handleMedia(
-      req.from,
-      bodyText,
-      req.userProfile || {},
-      req.ownerId,
-      url,
-      type
-    );
+    const result = await handleMedia(req.from, bodyText, req.userProfile || {}, req.ownerId, url, type);
 
-    // If handler returns transcript, convert to text message and continue routing.
     if (result && typeof result === 'object' && result.transcript) {
       req.body.Body = result.transcript;
       return next();
     }
 
-    // ✅ Key fix: if media handler returned TwiML (older behavior),
-    // prefer continuing the pipeline using the stored transcript (so expense.js can send template quick replies).
     if (typeof result === 'string' && result && !res.headersSent) {
       try {
         const pending = await getPendingTransactionState(req.from);
@@ -355,7 +413,6 @@ router.post('*', async (req, res, next) => {
         }
       } catch {}
 
-      // If we truly can't recover a transcript, fall back to responding with TwiML.
       return res.status(200).type('application/xml; charset=utf-8').send(result);
     }
 
@@ -383,58 +440,58 @@ router.post('*', async (req, res, next) => {
     let pending = await getPendingTransactionState(req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // ✅ DEFINE TEXT EARLY (button-aware)
+    // ✅ DEFINE TEXT EARLY (button-aware + list-aware)
     let text = String(getInboundText(req.body || {}) || '').trim();
     let lc = text.toLowerCase();
 
     /* ------------------------------------------------------------
      * PENDING TXN NUDGE (revenue/expense flows)
-     * Prevent "create job ..." from being treated as a job-name answer.
      * ------------------------------------------------------------ */
 
     const pendingRevenueFlow =
-      !!pending?.pendingRevenue ||
-      !!pending?.awaitingRevenueJob ||
-      !!pending?.awaitingRevenueClarification;
+      !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
 
     const pendingExpenseFlow =
-      !!pending?.pendingExpense ||
-      !!pending?.awaitingExpenseJob ||
-      !!pending?.awaitingExpenseClarification;
+      !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
+
+    // ✅ allow global job picking while pending:
+    const allowJobPickerThrough =
+      isJobPickerIntent(lc) || looksLikeJobPickerReplyToken(text) || !!pending?.awaitingActiveJobPick;
 
     if (pendingRevenueFlow) {
       if (/^(cancel|stop|no)\b/.test(lc)) {
-        try { await require('../utils/stateManager').deletePendingTransactionState?.(req.from); } catch {}
+        try {
+          await require('../utils/stateManager').deletePendingTransactionState?.(req.from);
+        } catch {}
         return ok(res, `❌ Revenue cancelled.`);
       }
       if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
-      if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) return ok(res, pendingTxnNudgeMessage({ type: 'revenue' }));
+      if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+        return ok(res, pendingTxnNudgeMessage({ type: 'revenue' }));
+      }
     }
 
     if (pendingExpenseFlow) {
       if (/^(cancel|stop|no)\b/.test(lc)) {
-        try { await require('../utils/stateManager').deletePendingTransactionState?.(req.from); } catch {}
+        try {
+          await require('../utils/stateManager').deletePendingTransactionState?.(req.from);
+        } catch {}
         return ok(res, `❌ Expense cancelled.`);
       }
       if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
-      if (!isYesEditCancelOrSkip(lc) && looksHardCommand(lc)) return ok(res, pendingTxnNudgeMessage({ type: 'expense' }));
+      if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+        return ok(res, pendingTxnNudgeMessage({ type: 'expense' }));
+      }
     }
 
     /* -----------------------------------------------------------------------
-     * If prior step set pendingMedia (waiting for user follow-up) and this is text-only,
+     * If prior step set pendingMedia and this is text-only,
      * let media.js interpret the follow-up and/or pass it through.
      * ----------------------------------------------------------------------- */
     const hasPendingMedia = !!pending?.pendingMedia || !!pending?.pendingMediaMeta;
     if (hasPendingMedia && numMedia === 0) {
       const { handleMedia } = require('../handlers/media');
-      const result = await handleMedia(
-        req.from,
-        text,
-        req.userProfile || {},
-        req.ownerId,
-        null,
-        null
-      );
+      const result = await handleMedia(req.from, text, req.userProfile || {}, req.ownerId, null, null);
 
       if (typeof result === 'string' && result && !res.headersSent) {
         return res.status(200).type('application/xml; charset=utf-8').send(result);
@@ -454,18 +511,44 @@ router.post('*', async (req, res, next) => {
       pending = await getPendingTransactionState(req.from);
     }
 
-    // refresh after any rewrite (button-aware)
+    // refresh after any rewrite (button-aware + list-aware)
     const text2 = String(getInboundText(req.body || {}) || '').trim();
     const lc2 = text2.toLowerCase();
 
     // Canonical idempotency key for ingestion (Twilio)
     const crypto = require('crypto');
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-    const messageSid = rawSid || crypto
-      .createHash('sha256')
-      .update(`${req.from}|${text2}`)
-      .digest('hex')
-      .slice(0, 32);
+    const messageSid =
+      rawSid ||
+      crypto.createHash('sha256').update(`${req.from}|${text2}`).digest('hex').slice(0, 32);
+
+    /* -----------------------------------------------------------------------
+     * (A0) ACTIVE JOB PICKER FLOW (global) — run BEFORE expense/revenue pending flows
+     * ----------------------------------------------------------------------- */
+    if (pending?.awaitingActiveJobPick || isJobPickerIntent(lc2) || looksLikeJobPickerReplyToken(text2)) {
+      try {
+        const cmds = require('../handlers/commands');
+        const { handleJob } = cmds.job || require('../handlers/commands/job');
+        if (typeof handleJob === 'function') {
+          const twiml = await handleJob(
+            req.from,
+            text2,
+            req.userProfile,
+            req.ownerId,
+            req.ownerProfile,
+            req.isOwner,
+            res,
+            messageSid
+          );
+          if (!res.headersSent && typeof twiml === 'string') {
+            return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+          }
+          if (res.headersSent) return;
+        }
+      } catch (e) {
+        console.warn('[WEBHOOK] job picker handler failed:', e?.message);
+      }
+    }
 
     /* -----------------------------------------------------------------------
      * (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
@@ -544,7 +627,7 @@ router.post('*', async (req, res, next) => {
           `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
 
         let timeoutId = null;
-        const timeoutPromise = new Promise(resolve => {
+        const timeoutPromise = new Promise((resolve) => {
           timeoutId = setTimeout(() => {
             console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
             resolve(timeoutTwiml);
@@ -581,7 +664,7 @@ router.post('*', async (req, res, next) => {
           `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
 
         let timeoutId = null;
-        const timeoutPromise = new Promise(resolve => {
+        const timeoutPromise = new Promise((resolve) => {
           timeoutId = setTimeout(() => {
             console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
             resolve(timeoutTwiml);
@@ -639,6 +722,7 @@ router.post('*', async (req, res, next) => {
 
     let looksJob =
       /\b(?:job|jobs)\b/.test(lc2) ||
+      /^(change\s+job|switch\s+job|pick\s+job|show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs)\b/.test(lc2) ||
       /\bactive job\??\b/.test(lc2) ||
       /\bwhat'?s\s+my\s+active\s+job\??\b/.test(lc2) ||
       /\bset\s+active\b/.test(lc2) ||
@@ -653,7 +737,9 @@ router.post('*', async (req, res, next) => {
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc2)) looksTime = true;
     if (askingHow && /\bjobs?\b/.test(lc2)) looksJob = true;
 
-    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(Boolean);
+    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(
+      Boolean
+    );
 
     const SOP = {
       tasks:
@@ -672,10 +758,10 @@ router.post('*', async (req, res, next) => {
       jobs:
         'Jobs — Quick guide:\n' +
         '• Create: create job Roof Repair\n' +
-        '• Set active: set active job Roof Repair\n' +
+        '• Set active: change job (or active job Roof Repair)\n' +
         '• List: list jobs\n' +
         '• Close: finish job Roof Repair\n' +
-        '• Move: move last log to Front Porch [for Justin]',
+        '• Move: move last log to Front Porch [for Justin]'
     };
 
     const cmds = require('../handlers/commands');
@@ -683,41 +769,47 @@ router.post('*', async (req, res, next) => {
     const { handleJob } = cmds.job || require('../handlers/commands/job');
     const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
 
-    // Try explicit handlers first (BOOLEAN-handled style)
-    if (tasksHandler && await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
-    if (handleTimeclock && await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)) return;
-    if (handleJob && await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid)) return;
+    // Prefer explicit handlers first (BOOLEAN-handled style)
+    if (tasksHandler && (await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)))
+      return;
+    if (handleTimeclock && (await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)))
+      return;
+    if (handleJob && (await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid)))
+      return;
 
-    // Forecast (fast path; no ctx object)
+    // Forecast
     if (/^forecast\b/i.test(lc2)) {
-      const handled = await handleForecast({
-        text: text2,
-        ownerId: req.ownerId,
-        jobId: req.userProfile?.active_job_id || null,
-        jobName: req.userProfile?.active_job_name || 'All Jobs'
-      }, res);
+      const handled = await handleForecast(
+        {
+          text: text2,
+          ownerId: req.ownerId,
+          jobId: req.userProfile?.active_job_id || null,
+          jobName: req.userProfile?.active_job_name || 'All Jobs'
+        },
+        res
+      );
       if (handled) return;
     }
 
-    // Timeclock v2 (optional fast path behind flag)
+    // Timeclock v2 (optional)
     if (flags.timeclock_v2) {
       const cil = (() => {
-        if (/^clock in\b/.test(lc2)) return { type:'Clock', action:'in' };
-        if (/^clock out\b/.test(lc2)) return { type:'Clock', action:'out' };
-        if (/^break start\b/.test(lc2)) return { type:'Clock', action:'break_start' };
-        if (/^break stop\b/.test(lc2)) return { type:'Clock', action:'break_end' };
-        if (/^lunch start\b/.test(lc2)) return { type:'Clock', action:'lunch_start' };
-        if (/^lunch stop\b/.test(lc2)) return { type:'Clock', action:'lunch_end' };
-        if (/^drive start\b/.test(lc2)) return { type:'Clock', action:'drive_start' };
-        if (/^drive stop\b/.test(lc2)) return { type:'Clock', action:'drive_end' };
+        if (/^clock in\b/.test(lc2)) return { type: 'Clock', action: 'in' };
+        if (/^clock out\b/.test(lc2)) return { type: 'Clock', action: 'out' };
+        if (/^break start\b/.test(lc2)) return { type: 'Clock', action: 'break_start' };
+        if (/^break stop\b/.test(lc2)) return { type: 'Clock', action: 'break_end' };
+        if (/^lunch start\b/.test(lc2)) return { type: 'Clock', action: 'lunch_start' };
+        if (/^lunch stop\b/.test(lc2)) return { type: 'Clock', action: 'lunch_end' };
+        if (/^drive start\b/.test(lc2)) return { type: 'Clock', action: 'drive_start' };
+        if (/^drive stop\b/.test(lc2)) return { type: 'Clock', action: 'drive_end' };
         return null;
       })();
 
       if (cil) {
         const ctx = {
           owner_id: req.ownerId,
-          user_id:  req.userProfile?.id,
-          job_id:   req.userProfile?.active_job_id || null,
+          user_id: req.userProfile?.id,
+          job_id: req.userProfile?.active_job_id || null,
           job_name: req.userProfile?.active_job_name || 'Active Job',
           created_by: req.userProfile?.id
         };
@@ -728,7 +820,7 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // KPI command (unchanged)
+    // KPI command
     const KPI_ENABLED = (process.env.FEATURE_FINANCE_KPIS || '1') === '1';
     const hasSub = canUseAgent(req.userProfile);
     if (looksKpi && KPI_ENABLED && hasSub) {
@@ -737,7 +829,7 @@ router.post('*', async (req, res, next) => {
         if (typeof handleJobKpis === 'function') {
           const out = await handleJobKpis(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
           if (!res.headersSent) {
-            let msg = (typeof out === 'string' && out.trim()) ? out.trim() : 'KPI shown.';
+            let msg = typeof out === 'string' && out.trim() ? out.trim() : 'KPI shown.';
             msg += await glossaryNudgeFrom(text2);
             return ok(res, msg);
           }
@@ -752,7 +844,7 @@ router.post('*', async (req, res, next) => {
     if (looksTask && typeof tasksHandler === 'function') {
       const out = await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (!res.headersSent) {
-        let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.tasks : 'Task handled.');
+        let msg = typeof out === 'string' && out.trim() ? out.trim() : askingHow ? SOP.tasks : 'Task handled.';
         msg += await glossaryNudgeFrom(text2);
         return ok(res, msg);
       }
@@ -763,7 +855,7 @@ router.post('*', async (req, res, next) => {
     if (looksJob && typeof handleJob === 'function') {
       const out = await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (!res.headersSent) {
-        let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.jobs : 'Job handled.');
+        let msg = typeof out === 'string' && out.trim() ? out.trim() : askingHow ? SOP.jobs : 'Job handled.';
         msg += await glossaryNudgeFrom(text2);
         return ok(res, msg);
       }
@@ -774,7 +866,7 @@ router.post('*', async (req, res, next) => {
     if (looksTime && typeof handleTimeclock === 'function') {
       const out = await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
       if (!res.headersSent) {
-        let msg = (typeof out === 'string' && out.trim()) ? out.trim() : (askingHow ? SOP.timeclock : 'Time logged.');
+        let msg = typeof out === 'string' && out.trim() ? out.trim() : askingHow ? SOP.timeclock : 'Time logged.';
         msg += await glossaryNudgeFrom(text2);
         return ok(res, msg);
       }
@@ -788,8 +880,9 @@ router.post('*', async (req, res, next) => {
         if (typeof ask === 'function') {
           const answer = await Promise.race([
             ask({ from: req.from, text: text2, topicHints }),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000)),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000))
           ]).catch(() => '');
+
           if (answer?.trim()) {
             let msg = answer.trim();
             msg += await glossaryNudgeFrom(text2);
@@ -804,12 +897,11 @@ router.post('*', async (req, res, next) => {
     // Default help
     let msg =
       'PocketCFO — What I can do:\n' +
-      '• Jobs: create job Roof Repair, set active job Roof Repair, move last log to Front Porch\n' +
+      '• Jobs: create job Roof Repair, change job, set active job Roof Repair\n' +
       '• Tasks: task - buy nails, my tasks, done #4\n' +
       '• Time: clock in, clock out, timesheet week';
     msg += await glossaryNudgeFrom(text2);
     return ok(res, msg);
-
   } catch (err) {
     return next(err);
   }
@@ -830,7 +922,9 @@ router.use((req, res, next) => {
 try {
   const { errorMiddleware } = require('../middleware/error');
   router.use(errorMiddleware);
-} catch { /* no-op */ }
+} catch {
+  /* no-op */
+}
 
 /* ---------------- Export ---------------- */
 

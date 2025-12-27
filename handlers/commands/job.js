@@ -19,10 +19,12 @@ const mergePendingTransactionState =
 
 /* ---------------- helpers ---------------- */
 
-function normaliseOwnerId(ownerId, fromPhone) {
+function ownerDigits(ownerId, fromPhone) {
   const base = ownerId || fromPhone;
-  if (!base) return null;
-  return String(base).trim();
+  const s = String(base || '').trim();
+  if (!s) return null;
+  // handle "whatsapp:+1555..." or "+1..." or "1555..."
+  return String(s).replace(/\D/g, '') || null;
 }
 
 function escapeXml(str = '') {
@@ -234,53 +236,99 @@ async function sendWhatsAppListPicker({ to, body, button, items, cacheKey }) {
   return msg;
 }
 
-/* ---------------- Active job persistence (CRITICAL for expense auto-attach) ---------------- */
-
+/* ---------------- Active job persistence (ALIGNED with services/postgres.js) ---------------- */
+/**
+ * Goal: make expense.js auto-attach by ensuring we persist the active job.
+ *
+ * Your postgres.js exports `setActiveJob(ownerId, userId, jobRef)` where jobRef can be:
+ * - uuid jobId (if user_active_job exists)
+ * - job_no (int) or numeric string
+ * - job name (string)
+ *
+ * This function tries pg.setActiveJob first, then any legacy helpers, then direct SQL best-effort.
+ */
 async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNameFallback }) {
+  const owner = String(ownerId || '').replace(/\D/g, '');
   const userId =
     userProfile?.id ||
     userProfile?.user_id ||
     userProfile?.userId ||
+    userProfile?.phone ||
+    userProfile?.from ||
     null;
 
-  if (!userId) {
-    console.warn('[JOB] persistActiveJobBestEffort: missing userId on userProfile');
+  if (!owner || !userId) {
+    console.warn('[JOB] persistActiveJobBestEffort: missing owner/user', { ownerId, userId });
     return false;
   }
 
   const jobId = jobRow?.id || jobRow?.job_id || null;
-  const jobName = (jobRow?.name || jobRow?.job_name || jobNameFallback || '').trim();
+  const jobNo = jobRow?.job_no ?? jobRow?.jobNo ?? null;
+  const jobName = String(jobRow?.name || jobRow?.job_name || jobNameFallback || '').trim() || null;
 
-  // Prefer known helper functions if they exist in services/postgres
+  // Best reference order:
+  // 1) uuid jobId (enables per-user active job if user_active_job table exists)
+  // 2) job_no
+  // 3) job name
+  const jobRef = jobId || jobNo || jobName;
+
+  // 1) Canonical: pg.setActiveJob(ownerId, userId, jobRef)
+  if (typeof pg.setActiveJob === 'function' && jobRef) {
+    try {
+      await pg.setActiveJob(owner, String(userId), String(jobRef));
+      console.info('[JOB] persisted active job via pg.setActiveJob', { owner, userId, jobRef });
+      return true;
+    } catch (e) {
+      console.warn('[JOB] pg.setActiveJob failed:', e?.message);
+    }
+  }
+
+  // 2) Legacy helper candidates (unknown signatures; try safe call patterns)
   const fnCandidates = [
     'setActiveJobForUser',
     'setUserActiveJob',
     'updateUserActiveJob',
-    'saveActiveJob',
-    'setActiveJob'
+    'saveActiveJob'
   ];
 
   for (const fn of fnCandidates) {
-    if (typeof pg[fn] === 'function') {
+    if (typeof pg[fn] !== 'function') continue;
+
+    try {
+      // Try (owner, user, jobId, jobName) (older patterns)
+      await pg[fn](owner, String(userId), jobId || null, jobName || null);
+      console.info('[JOB] persisted active job via pg.' + fn, { owner, userId, jobId, jobName });
+      return true;
+    } catch (e1) {
       try {
-        await pg[fn](String(ownerId), String(userId), jobId, jobName);
-        console.info('[JOB] persisted active job via pg.' + fn, { ownerId, userId, jobId, jobName });
+        // Try (owner, user, jobRef) (newer patterns)
+        await pg[fn](owner, String(userId), String(jobRef || ''));
+        console.info('[JOB] persisted active job via pg.' + fn, { owner, userId, jobRef });
         return true;
-      } catch (e) {
-        console.warn('[JOB] pg.' + fn + ' failed:', e?.message);
+      } catch (e2) {
+        console.warn('[JOB] pg.' + fn + ' failed:', e2?.message || e1?.message);
       }
     }
   }
 
-  // Fall back to direct SQL attempts (fail-open across schema variants)
+  // 3) Fall back to direct SQL attempts (fail-open across schema variants)
+  // Note: jobId might be null if you only have job_no/name. We still store name if possible.
   const sqlAttempts = [
     {
-      label: 'public.users',
+      label: 'public.users (id)',
       sql: `UPDATE public.users
               SET active_job_id = COALESCE($3, active_job_id),
                   active_job_name = COALESCE(NULLIF($4,''), active_job_name),
                   updated_at = NOW()
             WHERE owner_id = $1 AND id = $2`
+    },
+    {
+      label: 'public.users (user_id)',
+      sql: `UPDATE public.users
+              SET active_job_id = COALESCE($3, active_job_id),
+                  active_job_name = COALESCE(NULLIF($4,''), active_job_name),
+                  updated_at = NOW()
+            WHERE owner_id = $1 AND user_id = $2`
     },
     {
       label: 'public.user_profiles',
@@ -302,9 +350,9 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNam
 
   for (const a of sqlAttempts) {
     try {
-      const r = await pg.query(a.sql, [String(ownerId), String(userId), jobId, jobName]);
+      const r = await pg.query(a.sql, [owner, String(userId), jobId, jobName]);
       if (r?.rowCount) {
-        console.info('[JOB] persisted active job via SQL', { table: a.label, ownerId, userId, jobId, jobName });
+        console.info('[JOB] persisted active job via SQL', { table: a.label, owner, userId, jobId, jobName });
         return true;
       }
     } catch {
@@ -498,7 +546,7 @@ function resolvePickerReply(raw, pending) {
 /* ---------------- main handler ---------------- */
 
 async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId) {
-  const owner = normaliseOwnerId(ownerId, fromPhone);
+  const owner = ownerDigits(ownerId, fromPhone);
   if (!owner) {
     return respond(res, `I couldn't figure out which account this belongs to yet.`);
   }
@@ -525,7 +573,14 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
     if (resolved === '__MORE__') {
       const all = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
       const nextPage = Number(pending.activeJobPickPage || 0) + 1;
-      return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs: all, page: nextPage, perPage: 8 });
+      return await sendActiveJobPickerOrFallback({
+        res,
+        fromPhone,
+        ownerId: owner,
+        jobs: all,
+        page: nextPage,
+        perPage: 8
+      });
     }
 
     const jobName = resolved && String(resolved).trim() ? String(resolved).trim() : null;
@@ -538,16 +593,19 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
       return respond(res, `⚠️ Reply with a number or a job name from the list (or "cancel").`);
     }
 
+    // ✅ close picker regardless
     await clearPickerState(fromPhone);
 
+    // ✅ overhead = do NOT attempt activation
     if (jobName === 'Overhead') {
-      return respond(res, `✅ Okay — no active job set (Overhead).`);
+      // Optional: clear persisted active job if you later support it
+      return respond(res, `✅ Okay — using Overhead (no active job).`);
     }
 
     try {
       const j = await pg.activateJobByName(owner, jobName);
 
-      // ✅ CRITICAL: persist active job onto user profile so expense.js can auto-attach
+      // ✅ CRITICAL: persist active job (ALIGNED with postgres.js setActiveJob signature)
       await persistActiveJobBestEffort({
         ownerId: owner,
         userProfile,
@@ -586,7 +644,7 @@ Now you can:
 
     const j = await pg.activateJobByName(owner, name);
 
-    // ✅ CRITICAL: persist active job onto user profile so expense.js can auto-attach
+    // ✅ CRITICAL: persist active job (ALIGNED)
     await persistActiveJobBestEffort({
       ownerId: owner,
       userProfile,

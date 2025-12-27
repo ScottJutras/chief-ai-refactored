@@ -1,21 +1,26 @@
 // routes/webhook.js
-// Drop-in replacement (aligned with expense.js + job.js interactive picker)
-// Key fixes:
-// - Robust inbound text extraction for WhatsApp interactive list replies (ListId/ListTitle + InteractiveResponseJson)
-// - Allow "change job"/"active jobs"/list picks to flow even when an expense/revenue is pending (no nudge-block)
-// - Ensure pending-flow handlers run before fast-path routing, but still allow job picker during pending flows
-// - Keep 8s safety timer + tolerant middlewares + media transcript passthrough
+// Drop-in replacement (aligned with expense.js + job.js interactive picker + postgres.js expectations)
+//
+// Key alignment fixes vs your draft:
+// - DO NOT replace req.ownerId with a UUID (your current postgres.js DIGITS() would break). Store uuid separately if needed.
+// - Avoid double-sending TwiML (job.js already sends if res is provided). Always check res.headersSent.
+// - Harden handler loading (different exports across builds) and keep everything fail-open.
+// - Keep rawBody capture BEFORE token middleware (Twilio signature verification).
+// - Robust inbound text extraction for WhatsApp interactive list replies (ListId/ListTitle + InteractiveResponseJson).
+// - Allow job picker flows to pass even when expense/revenue pending (no nudge-block).
+// - Keep 8s safety timer + tolerant middlewares + media transcript passthrough.
 
 const express = require('express');
 const querystring = require('querystring');
+
 const router = express.Router();
 const app = express();
 
 const { flags } = require('../config/flags');
-const { handleClock } = require('../handlers/commands/timeclock');
+const { handleClock } = require('../handlers/commands/timeclock'); // v2 handler (optional)
 const { handleForecast } = require('../handlers/commands/forecast');
 
-const { getOwnerUuidForPhone } = require('../services/owners'); // map phone -> uuid
+const { getOwnerUuidForPhone } = require('../services/owners'); // optional map phone -> uuid (store separately)
 const stateManager = require('../utils/stateManager');
 const { getPendingTransactionState } = stateManager;
 
@@ -73,21 +78,19 @@ function looksHardCommand(lc) {
   );
 }
 
-// ✅ Treat these as "allowed" while a pending expense/revenue exists
-// (so we don't nudge-block them)
+// Allowed while a pending expense/revenue exists (so we don't nudge-block them)
 function isAllowedWhilePending(lc) {
-  return /^(yes|y|confirm|edit|cancel|no|skip|stop|more|overhead)\b/.test(lc);
+  return /^(yes|y|confirm|edit|cancel|no|skip|stop|more|overhead|oh)\b/.test(lc);
 }
 
-// ✅ "global job picker intents" (typed commands)
+// "global job picker intents" (typed commands)
 function isJobPickerIntent(lc) {
   return /^(change\s+job|switch\s+job|pick\s+job|show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs)\b/.test(
     lc
   );
 }
 
-// ✅ "list-picker reply-like" tokens (IDs we generate typically start with job_)
-// Also accept Twilio "more"/"overhead" typed.
+// "list-picker reply-like" tokens (IDs we generate typically start with job_)
 function looksLikeJobPickerReplyToken(raw) {
   const s = String(raw || '').trim();
   if (!s) return false;
@@ -109,34 +112,8 @@ Reply:
 Or reply "skip" to leave it pending and continue.`;
 }
 
-// Try to clear pending txn state if your stateManager exports any of these.
-async function tryClearPendingTxn(from) {
-  try {
-    const sm = require('../utils/stateManager');
-    if (typeof sm.clearPendingTransactionState === 'function') {
-      await sm.clearPendingTransactionState(from);
-      return true;
-    }
-    if (typeof sm.clearPendingState === 'function') {
-      await sm.clearPendingState(from);
-      return true;
-    }
-    if (typeof sm.clearPending === 'function') {
-      await sm.clearPending(from);
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
 /**
  * ✅ Inbound text normalization (button-aware + interactive list-aware)
- *
- * We attempt:
- * - ButtonPayload / ButtonText
- * - InteractiveResponseJson (Twilio sometimes embeds list reply here)
- * - ListId/ListTitle + variants
- * - Body
  */
 function getInboundText(body = {}) {
   const payload = String(body.ButtonPayload || body.buttonPayload || '').trim();
@@ -145,8 +122,6 @@ function getInboundText(body = {}) {
   const btnText = String(body.ButtonText || body.buttonText || '').trim();
   if (btnText) return btnText;
 
-  // Twilio sometimes sends an "InteractiveResponseJson" payload (stringified)
-  // which can include list_reply.id / list_reply.title.
   const irj = body.InteractiveResponseJson || body.interactiveResponseJson || null;
   if (irj) {
     try {
@@ -166,7 +141,6 @@ function getInboundText(body = {}) {
     } catch {}
   }
 
-  // Interactive list variants (ID is best)
   const listId = String(
     body.ListId ||
       body.listId ||
@@ -210,7 +184,6 @@ function hasMoneyAmount(str) {
 
 function looksExpenseNl(str) {
   const s = String(str || '').trim().toLowerCase();
-
   if (!hasMoneyAmount(s)) return false;
 
   const verb =
@@ -218,7 +191,6 @@ function looksExpenseNl(str) {
     /\b(on|for)\b/.test(s);
 
   if (!verb) return false;
-
   if (/\b(received|got paid|payment|deposit)\b/.test(s)) return false;
 
   // avoid routing obvious job/time/task commands as expense NL
@@ -234,8 +206,7 @@ function looksExpenseNl(str) {
     /^drive\b/.test(s) ||
     /^task\b/.test(s) ||
     /^my\s+tasks\b/.test(s)
-  )
-    return false;
+  ) return false;
 
   return true;
 }
@@ -245,7 +216,6 @@ function looksRevenueNl(str) {
   if (!hasMoneyAmount(s)) return false;
 
   if (/\b(received|revenue|rev|got paid|payment|deposit)\b/.test(s)) return true;
-
   if (/\b(paid)\b/.test(s) && /\b(from|client|customer)\b/.test(s)) return true;
 
   return false;
@@ -258,6 +228,8 @@ router.use((req, _res, next) => {
   const ct = String(req.headers['content-type'] || '').toLowerCase();
   const isForm = ct.includes('application/x-www-form-urlencoded');
   if (!isForm) return next();
+
+  // If already parsed AND we have rawBody, keep it
   if (req.body && Object.keys(req.body).length && typeof req.rawBody === 'string') return next();
 
   let raw = '';
@@ -293,8 +265,11 @@ router.all('*', (req, res, next) => {
 
 router.use((req, _res, next) => {
   req.from = req.body?.From ? normalizePhone(req.body.From) : null;
+
+  // IMPORTANT: keep ownerId numeric (aligns with postgres.js DIGITS() calls)
   req.ownerId = req.from || 'GLOBAL';
 
+  // Optionally compute a canonical URL used by token middleware for Twilio signature checks
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
   const path = req.originalUrl || req.url || '/api/webhook';
@@ -391,28 +366,16 @@ router.post('*', async (req, res, next) => {
     const { handleMedia } = require('../handlers/media');
 
     const bodyText = getInboundText(req.body || {});
-
     const result = await handleMedia(req.from, bodyText, req.userProfile || {}, req.ownerId, url, type);
 
+    // If media handler returns a transcript object, pass it through as Body for downstream routing.
     if (result && typeof result === 'object' && result.transcript) {
       req.body.Body = result.transcript;
       return next();
     }
 
+    // If media handler returns TwiML string, send it now.
     if (typeof result === 'string' && result && !res.headersSent) {
-      try {
-        const pending = await getPendingTransactionState(req.from);
-        const transcript =
-          String(pending?.pendingMediaMeta?.transcript || '').trim() ||
-          String(pending?.pendingMediaMeta?.text || '').trim() ||
-          '';
-
-        if (transcript) {
-          req.body.Body = transcript;
-          return next();
-        }
-      } catch {}
-
       return res.status(200).type('application/xml; charset=utf-8').send(result);
     }
 
@@ -423,24 +386,24 @@ router.post('*', async (req, res, next) => {
   }
 });
 
-/* ---------------- Main text router (tasks / jobs / timeclock / agent) ---------------- */
+/* ---------------- Main text router ---------------- */
 
 router.post('*', async (req, res, next) => {
-  // Owner mapping: phone -> owner uuid (or text owner_id in DB)
-  if (!req.ownerId || /^[0-9]+$/.test(String(req.ownerId))) {
-    try {
-      const mapped = await getOwnerUuidForPhone(req.from);
-      if (mapped) req.ownerId = mapped;
-    } catch (e) {
-      console.warn('[WEBHOOK] owner uuid map failed:', e?.message);
-    }
-  }
-
   try {
+    // Optional: map phone -> owner UUID, but DO NOT overwrite numeric ownerId (postgres.js alignment).
+    if (req.from) {
+      try {
+        const mapped = await getOwnerUuidForPhone(req.from);
+        if (mapped) req.ownerUuid = mapped; // keep separate
+      } catch (e) {
+        console.warn('[WEBHOOK] owner uuid map failed:', e?.message);
+      }
+    }
+
     let pending = await getPendingTransactionState(req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // ✅ DEFINE TEXT EARLY (button-aware + list-aware)
+    // Define inbound text early (button-aware + list-aware)
     let text = String(getInboundText(req.body || {}) || '').trim();
     let lc = text.toLowerCase();
 
@@ -454,7 +417,6 @@ router.post('*', async (req, res, next) => {
     const pendingExpenseFlow =
       !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
 
-    // ✅ allow global job picking while pending:
     const allowJobPickerThrough =
       isJobPickerIntent(lc) || looksLikeJobPickerReplyToken(text) || !!pending?.awaitingActiveJobPick;
 
@@ -485,33 +447,36 @@ router.post('*', async (req, res, next) => {
     }
 
     /* -----------------------------------------------------------------------
-     * If prior step set pendingMedia and this is text-only,
-     * let media.js interpret the follow-up and/or pass it through.
+     * If prior step set pendingMedia and this is text-only, let media.js interpret follow-up.
      * ----------------------------------------------------------------------- */
     const hasPendingMedia = !!pending?.pendingMedia || !!pending?.pendingMediaMeta;
     if (hasPendingMedia && numMedia === 0) {
-      const { handleMedia } = require('../handlers/media');
-      const result = await handleMedia(req.from, text, req.userProfile || {}, req.ownerId, null, null);
+      try {
+        const { handleMedia } = require('../handlers/media');
+        const result = await handleMedia(req.from, text, req.userProfile || {}, req.ownerId, null, null);
 
-      if (typeof result === 'string' && result && !res.headersSent) {
-        return res.status(200).type('application/xml; charset=utf-8').send(result);
+        if (typeof result === 'string' && result && !res.headersSent) {
+          return res.status(200).type('application/xml; charset=utf-8').send(result);
+        }
+
+        if (result && typeof result === 'object' && result.transcript && !result.twiml) {
+          req.body.Body = result.transcript;
+        } else if (result && typeof result === 'object' && result.twiml) {
+          return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
+        }
+
+        // refresh text after rewrite
+        text = String(getInboundText(req.body || {}) || '').trim();
+        lc = text.toLowerCase();
+
+        // refresh pending too (media handler may have changed it)
+        pending = await getPendingTransactionState(req.from);
+      } catch (e) {
+        console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
       }
-
-      if (result && typeof result === 'object' && result.transcript && !result.twiml) {
-        req.body.Body = result.transcript;
-      } else if (result && typeof result === 'object' && result.twiml) {
-        return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
-      }
-
-      // refresh text after rewrite
-      text = String(getInboundText(req.body || {}) || '').trim();
-      lc = text.toLowerCase();
-
-      // refresh pending too (media handler may have changed it)
-      pending = await getPendingTransactionState(req.from);
     }
 
-    // refresh after any rewrite (button-aware + list-aware)
+    // refresh after any rewrite
     const text2 = String(getInboundText(req.body || {}) || '').trim();
     const lc2 = text2.toLowerCase();
 
@@ -520,17 +485,21 @@ router.post('*', async (req, res, next) => {
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid =
       rawSid ||
-      crypto.createHash('sha256').update(`${req.from}|${text2}`).digest('hex').slice(0, 32);
+      crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
 
     /* -----------------------------------------------------------------------
-     * (A0) ACTIVE JOB PICKER FLOW (global) — run BEFORE expense/revenue pending flows
+     * (A0) ACTIVE JOB PICKER FLOW — run BEFORE expense/revenue pending flows
      * ----------------------------------------------------------------------- */
     if (pending?.awaitingActiveJobPick || isJobPickerIntent(lc2) || looksLikeJobPickerReplyToken(text2)) {
       try {
         const cmds = require('../handlers/commands');
-        const { handleJob } = cmds.job || require('../handlers/commands/job');
+        const handleJob =
+          (cmds?.job && cmds.job.handleJob) ||
+          cmds?.handleJob ||
+          require('../handlers/commands/job').handleJob;
+
         if (typeof handleJob === 'function') {
-          const twiml = await handleJob(
+          await handleJob(
             req.from,
             text2,
             req.userProfile,
@@ -540,10 +509,11 @@ router.post('*', async (req, res, next) => {
             res,
             messageSid
           );
-          if (!res.headersSent && typeof twiml === 'string') {
-            return res.status(200).type('application/xml; charset=utf-8').send(twiml);
-          }
           if (res.headersSent) return;
+
+          // If handler returned a string but didn’t send, handleJob() (yours) usually sends.
+          // As a last resort, just ACK.
+          return ok(res, 'OK');
         }
       } catch (e) {
         console.warn('[WEBHOOK] job picker handler failed:', e?.message);
@@ -582,7 +552,11 @@ router.post('*', async (req, res, next) => {
           req.isOwner,
           messageSid
         );
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        if (!res.headersSent && typeof twiml === 'string') {
+          return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        }
+        if (!res.headersSent) return ok(res, 'OK');
+        return;
       } catch (e) {
         console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
       }
@@ -600,7 +574,11 @@ router.post('*', async (req, res, next) => {
           req.isOwner,
           messageSid
         );
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        if (!res.headersSent && typeof twiml === 'string') {
+          return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        }
+        if (!res.headersSent) return ok(res, 'OK');
+        return;
       } catch (e) {
         console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
       }
@@ -615,9 +593,7 @@ router.post('*', async (req, res, next) => {
     const looksRevenue = revenuePrefix || revenueNl;
 
     if (looksRevenue) {
-      if (revenueNl) {
-        console.info('[WEBHOOK] NL revenue detected', { from: req.from, text2: text2.slice(0, 120) });
-      }
+      if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
 
       try {
         const { handleRevenue } = require('../handlers/commands/revenue');
@@ -637,11 +613,13 @@ router.post('*', async (req, res, next) => {
         const twiml = await Promise.race([
           handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
           timeoutPromise
-        ]).finally(() => {
-          if (timeoutId) clearTimeout(timeoutId);
-        });
+        ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        if (!res.headersSent && typeof twiml === 'string') {
+          return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        }
+        if (!res.headersSent) return ok(res, 'OK');
+        return;
       } catch (e) {
         console.warn('[WEBHOOK] revenue handler failed:', e?.message);
       }
@@ -652,9 +630,7 @@ router.post('*', async (req, res, next) => {
     const looksExpense = expensePrefix || expenseNl;
 
     if (looksExpense) {
-      if (expenseNl) {
-        console.info('[WEBHOOK] NL expense detected', { from: req.from, text2: text2.slice(0, 120) });
-      }
+      if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
 
       try {
         const { handleExpense } = require('../handlers/commands/expense');
@@ -674,30 +650,21 @@ router.post('*', async (req, res, next) => {
         const twiml = await Promise.race([
           handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
           timeoutPromise
-        ]).finally(() => {
-          if (timeoutId) clearTimeout(timeoutId);
-        });
+        ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        if (!res.headersSent && typeof twiml === 'string') {
+          return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        }
+        if (!res.headersSent) return ok(res, 'OK');
+        return;
       } catch (e) {
         console.warn('[WEBHOOK] expense handler failed:', e?.message);
       }
     }
 
-    // --- SPECIAL: "How did the XYZ job do?" → job KPIs ---
-    if (/how\b.*\bjob\b/.test(lc2)) {
-      try {
-        const { handleJobInsights } = require('../handlers/commands/job_insights');
-        const msg = await handleJobInsights({ ownerId: req.ownerId, text: text2 });
-
-        return res
-          .status(200)
-          .type('application/xml; charset=utf-8')
-          .send(`<Response><Message>${xmlEsc(msg)}</Message></Response>`);
-      } catch (e) {
-        console.error('[WEBHOOK] job_insights failed:', e?.message);
-      }
-    }
+    /* -----------------------------------------------------------------------
+     * (C) Other command routing (tasks / jobs / timeclock / forecast / KPIs / agent)
+     * ----------------------------------------------------------------------- */
 
     async function glossaryNudgeFrom(str) {
       try {
@@ -722,7 +689,7 @@ router.post('*', async (req, res, next) => {
 
     let looksJob =
       /\b(?:job|jobs)\b/.test(lc2) ||
-      /^(change\s+job|switch\s+job|pick\s+job|show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs)\b/.test(lc2) ||
+      isJobPickerIntent(lc2) ||
       /\bactive job\??\b/.test(lc2) ||
       /\bwhat'?s\s+my\s+active\s+job\??\b/.test(lc2) ||
       /\bset\s+active\b/.test(lc2) ||
@@ -730,8 +697,6 @@ router.post('*', async (req, res, next) => {
       /\bmove\s+last\s+log\s+to\b/.test(lc2);
 
     let looksTime = /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc2);
-
-    let looksKpi = /^kpis?\s+for\b/.test(lc2);
 
     if (askingHow && /\btasks?\b/.test(lc2)) looksTask = true;
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc2)) looksTime = true;
@@ -764,31 +729,75 @@ router.post('*', async (req, res, next) => {
         '• Move: move last log to Front Porch [for Justin]'
     };
 
-    const cmds = require('../handlers/commands');
-    const tasksHandler = cmds.tasks || require('../handlers/commands/tasks').tasksHandler;
-    const { handleJob } = cmds.job || require('../handlers/commands/job');
-    const handleTimeclock = cmds.timeclock || require('../handlers/commands/timeclock').handleTimeclock;
+    // Load command handlers defensively (exports vary across builds)
+    let tasksHandler = null;
+    let handleJob = null;
+    let handleTimeclock = null;
 
-    // Prefer explicit handlers first (BOOLEAN-handled style)
-    if (tasksHandler && (await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)))
-      return;
-    if (handleTimeclock && (await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res)))
-      return;
-    if (handleJob && (await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid)))
-      return;
+    try {
+      const cmds = require('../handlers/commands');
+
+      // tasks can be { tasksHandler } or direct function
+      tasksHandler =
+        (cmds?.tasks && (cmds.tasks.tasksHandler || cmds.tasks)) ||
+        require('../handlers/commands/tasks').tasksHandler ||
+        null;
+
+      // job is { handleJob } per your file
+      handleJob =
+        (cmds?.job && cmds.job.handleJob) ||
+        require('../handlers/commands/job').handleJob ||
+        null;
+
+      // timeclock can be { handleTimeclock } legacy; we also have v2 handleClock above
+      handleTimeclock =
+        (cmds?.timeclock && (cmds.timeclock.handleTimeclock || cmds.timeclock)) ||
+        require('../handlers/commands/timeclock').handleTimeclock ||
+        null;
+    } catch (e) {
+      console.warn('[WEBHOOK] commands bundle load failed (ignored):', e?.message);
+    }
+
+    // If handlers return TwiML or send directly, respect that.
+    if (looksTask && typeof tasksHandler === 'function') {
+      const out = await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+      if (res.headersSent) return;
+
+      let msg = '';
+      if (typeof out === 'string' && out.trim()) msg = out.trim();
+      else if (askingHow) msg = SOP.tasks;
+      else if (out === true) return ok(res, 'OK');
+      else msg = 'Task handled.';
+
+      msg += await glossaryNudgeFrom(text2);
+      return ok(res, msg);
+    }
+
+    if (looksJob && typeof handleJob === 'function') {
+      await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+      if (res.headersSent) return;
+      let msg = askingHow ? SOP.jobs : 'Job handled.';
+      msg += await glossaryNudgeFrom(text2);
+      return ok(res, msg);
+    }
 
     // Forecast
     if (/^forecast\b/i.test(lc2)) {
-      const handled = await handleForecast(
-        {
-          text: text2,
-          ownerId: req.ownerId,
-          jobId: req.userProfile?.active_job_id || null,
-          jobName: req.userProfile?.active_job_name || 'All Jobs'
-        },
-        res
-      );
-      if (handled) return;
+      try {
+        const handled = await handleForecast(
+          {
+            text: text2,
+            ownerId: req.ownerId,
+            jobId: req.userProfile?.active_job_id || null,
+            jobName: req.userProfile?.active_job_name || 'All Jobs'
+          },
+          res
+        );
+        if (res.headersSent) return;
+        if (handled) return ok(res, 'OK');
+      } catch (e) {
+        console.warn('[WEBHOOK] forecast failed:', e?.message);
+      }
     }
 
     // Timeclock v2 (optional)
@@ -808,10 +817,10 @@ router.post('*', async (req, res, next) => {
       if (cil) {
         const ctx = {
           owner_id: req.ownerId,
-          user_id: req.userProfile?.id,
+          user_id: req.userProfile?.id || req.userProfile?.user_id || null,
           job_id: req.userProfile?.active_job_id || null,
           job_name: req.userProfile?.active_job_name || 'Active Job',
-          created_by: req.userProfile?.id
+          created_by: req.userProfile?.id || req.userProfile?.user_id || null
         };
         const reply = await handleClock(ctx, cil);
         let msg = reply?.text || 'Time logged.';
@@ -820,57 +829,39 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // KPI command
+    // Timeclock legacy
+    if (looksTime && typeof handleTimeclock === 'function') {
+      const out = await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+      if (res.headersSent) return;
+
+      let msg = '';
+      if (typeof out === 'string' && out.trim()) msg = out.trim();
+      else if (askingHow) msg = SOP.timeclock;
+      else if (out === true) return ok(res, 'OK');
+      else msg = 'Time logged.';
+
+      msg += await glossaryNudgeFrom(text2);
+      return ok(res, msg);
+    }
+
+    // KPI command (optional)
+    const looksKpi = /^kpis?\s+for\b/.test(lc2);
     const KPI_ENABLED = (process.env.FEATURE_FINANCE_KPIS || '1') === '1';
     const hasSub = canUseAgent(req.userProfile);
     if (looksKpi && KPI_ENABLED && hasSub) {
       try {
         const { handleJobKpis } = require('../handlers/commands/job_kpis');
         if (typeof handleJobKpis === 'function') {
-          const out = await handleJobKpis(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
-          if (!res.headersSent) {
-            let msg = typeof out === 'string' && out.trim() ? out.trim() : 'KPI shown.';
-            msg += await glossaryNudgeFrom(text2);
-            return ok(res, msg);
-          }
-          return;
+          const out = await handleJobKpis(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+          if (res.headersSent) return;
+
+          let msg = typeof out === 'string' && out.trim() ? out.trim() : 'KPI shown.';
+          msg += await glossaryNudgeFrom(text2);
+          return ok(res, msg);
         }
       } catch (e) {
         console.warn('[KPI] handler missing:', e?.message);
       }
-    }
-
-    // TASKS
-    if (looksTask && typeof tasksHandler === 'function') {
-      const out = await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
-      if (!res.headersSent) {
-        let msg = typeof out === 'string' && out.trim() ? out.trim() : askingHow ? SOP.tasks : 'Task handled.';
-        msg += await glossaryNudgeFrom(text2);
-        return ok(res, msg);
-      }
-      return;
-    }
-
-    // JOBS
-    if (looksJob && typeof handleJob === 'function') {
-      const out = await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
-      if (!res.headersSent) {
-        let msg = typeof out === 'string' && out.trim() ? out.trim() : askingHow ? SOP.jobs : 'Job handled.';
-        msg += await glossaryNudgeFrom(text2);
-        return ok(res, msg);
-      }
-      return;
-    }
-
-    // TIMECLOCK (legacy)
-    if (looksTime && typeof handleTimeclock === 'function') {
-      const out = await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res);
-      if (!res.headersSent) {
-        let msg = typeof out === 'string' && out.trim() ? out.trim() : askingHow ? SOP.timeclock : 'Time logged.';
-        msg += await glossaryNudgeFrom(text2);
-        return ok(res, msg);
-      }
-      return;
     }
 
     // Agent (unchanged)
@@ -897,7 +888,7 @@ router.post('*', async (req, res, next) => {
     // Default help
     let msg =
       'PocketCFO — What I can do:\n' +
-      '• Jobs: create job Roof Repair, change job, set active job Roof Repair\n' +
+      '• Jobs: create job Roof Repair, change job, active job Roof Repair\n' +
       '• Tasks: task - buy nails, my tasks, done #4\n' +
       '• Time: clock in, clock out, timesheet week';
     msg += await glossaryNudgeFrom(text2);

@@ -132,6 +132,10 @@ function todayInTZ(tz = 'America/Toronto') {
 
 const normalizePhoneNumber = (x) => DIGITS(x);
 
+function looksLikeUuid(str) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+}
+
 /* ------------------------------------------------------------------ */
 /*  ✅ Media transcript truncation + transactions schema capabilities   */
 /* ------------------------------------------------------------------ */
@@ -154,6 +158,18 @@ async function hasColumn(table, col) {
         and column_name=$2
       limit 1`,
     [table, col]
+  );
+  return (r?.rows?.length || 0) > 0;
+}
+
+async function hasTable(table) {
+  const r = await query(
+    `select 1
+       from information_schema.tables
+      where table_schema='public'
+        and table_name=$1
+      limit 1`,
+    [table]
   );
   return (r?.rows?.length || 0) > 0;
 }
@@ -432,6 +448,7 @@ async function allocateNextJobNo(owner, client) {
 
 // Find or create a job by name (case-insensitive on name or job_name).
 // Robust against races and job_no duplicates: allocate job_no under advisory lock.
+// ✅ Modified: returns { id, job_no, name, is_active }
 async function ensureJobByName(ownerId, name) {
   const owner   = DIGITS(ownerId);
   const jobName = String(name || '').trim();
@@ -439,7 +456,7 @@ async function ensureJobByName(ownerId, name) {
 
   // 1) Try to find existing by either column
   let r = await query(
-    `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+    `SELECT id, job_no, COALESCE(name, job_name) AS name, active AS is_active
        FROM public.jobs
       WHERE owner_id = $1
         AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
@@ -453,7 +470,7 @@ async function ensureJobByName(ownerId, name) {
     await withOwnerAllocLock(owner, client);
 
     const again = await client.query(
-      `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+      `SELECT id, job_no, COALESCE(name, job_name) AS name, active AS is_active
          FROM public.jobs
         WHERE owner_id = $1
           AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
@@ -468,14 +485,14 @@ async function ensureJobByName(ownerId, name) {
       const ins = await client.query(
         `INSERT INTO public.jobs (owner_id, job_no, job_name, name, active, start_date, created_at, updated_at)
          VALUES ($1, $2, $3, $4, true, NOW(), NOW(), NOW())
-         RETURNING job_no, COALESCE(name, job_name) AS name, active AS is_active`,
+         RETURNING id, job_no, COALESCE(name, job_name) AS name, active AS is_active`,
         [owner, nextNo, jobName, jobName]
       );
       return ins.rows[0];
     } catch (e) {
       if (e && e.code === '23505') {
         const final = await client.query(
-          `SELECT job_no, COALESCE(name, job_name) AS name, active AS is_active
+          `SELECT id, job_no, COALESCE(name, job_name) AS name, active AS is_active
              FROM public.jobs
             WHERE owner_id = $1
               AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
@@ -496,7 +513,7 @@ async function resolveJobContext(ownerId, { explicitJobName, require = false, fa
     if (j) return j;
   }
   const act = await query(
-    `SELECT job_no, COALESCE(name, job_name) AS name
+    `SELECT id, job_no, COALESCE(name, job_name) AS name
        FROM public.jobs
       WHERE owner_id=$1 AND active=true
       ORDER BY updated_at DESC NULLS LAST, created_at DESC
@@ -630,13 +647,13 @@ async function activateJobByName(ownerId, rawName) {
   });
 
   const { rows } = await query(
-    `SELECT job_no, COALESCE(name, job_name) AS name, active, updated_at
+    `SELECT id, job_no, COALESCE(name, job_name) AS name, active, updated_at
        FROM public.jobs
       WHERE owner_id=$1 AND job_no=$2
       LIMIT 1`,
     [owner, jobNo]
   );
-  const final = rows[0] || { job_no: jobNo, name, active: true };
+  const final = rows[0] || { id: j?.id || null, job_no: jobNo, name, active: true };
   console.info('[PG] activated job', { owner, job_no: final.job_no, name: final.name });
   return final;
 }
@@ -768,263 +785,349 @@ async function setActiveJob(ownerId, userId, jobRef) {
   return true;
 }
 
+/* ------------------------------------------------------------------ */
+/* ✅ Canonical per-identity Active Job (fixes your current bug)        */
+/* ------------------------------------------------------------------ */
+
+let _ACTIVEJOB_CAPS = null;
+async function detectActiveJobCaps() {
+  if (_ACTIVEJOB_CAPS) return _ACTIVEJOB_CAPS;
+
+  const caps = {
+    users_has_active_job_id: false,
+    users_has_active_job_name: false,
+    memberships_has_active_job_id: false,
+    memberships_has_active_job_name: false,
+    user_profiles_has_active_job_id: false,
+    user_profiles_has_active_job_name: false,
+    has_memberships: false,
+    has_user_profiles: false,
+    has_users: false,
+    has_user_active_job: false
+  };
+
+  try {
+    caps.has_users = await hasTable('users');
+    if (caps.has_users) {
+      caps.users_has_active_job_id = await hasColumn('users', 'active_job_id');
+      caps.users_has_active_job_name = await hasColumn('users', 'active_job_name');
+    }
+  } catch {}
+
+  try {
+    caps.has_memberships = await hasTable('memberships');
+    if (caps.has_memberships) {
+      caps.memberships_has_active_job_id = await hasColumn('memberships', 'active_job_id');
+      caps.memberships_has_active_job_name = await hasColumn('memberships', 'active_job_name');
+    }
+  } catch {}
+
+  try {
+    caps.has_user_profiles = await hasTable('user_profiles');
+    if (caps.has_user_profiles) {
+      caps.user_profiles_has_active_job_id = await hasColumn('user_profiles', 'active_job_id');
+      caps.user_profiles_has_active_job_name = await hasColumn('user_profiles', 'active_job_name');
+    }
+  } catch {}
+
+  try {
+    caps.has_user_active_job = await detectUserActiveJobTable();
+  } catch {}
+
+  _ACTIVEJOB_CAPS = caps;
+  return caps;
+}
+
+async function resolveJobIdAndName(ownerId, jobId, jobName) {
+  const owner = DIGITS(ownerId);
+  let id = jobId ? String(jobId).trim() : null;
+  let name = jobName ? String(jobName).trim() : null;
+
+  // If jobName provided, resolve from jobs (best-effort)
+  if (!id && name) {
+    try {
+      const r = await query(
+        `select id, coalesce(name, job_name) as job_name
+           from public.jobs
+          where owner_id=$1
+            and lower(coalesce(name, job_name)) = lower($2)
+          order by updated_at desc nulls last, created_at desc
+          limit 1`,
+        [owner, name]
+      );
+      if (r?.rows?.[0]) {
+        id = r.rows[0].id ? String(r.rows[0].id) : null;
+        name = r.rows[0].job_name ? String(r.rows[0].job_name).trim() : name;
+      }
+    } catch {}
+  }
+
+  // If id provided but no name, resolve name from jobs
+  if (id && !name && looksLikeUuid(id)) {
+    try {
+      const r = await query(
+        `select coalesce(name, job_name) as job_name
+           from public.jobs
+          where owner_id=$1 and id=$2::uuid
+          limit 1`,
+        [owner, id]
+      );
+      if (r?.rows?.[0]?.job_name) name = String(r.rows[0].job_name).trim();
+    } catch {}
+  }
+
+  return { id, name };
+}
+
 /**
- * ✅ moveLastLogToJob (job_no schema)
- * Updates most recent time_entries row for employee to new job_no.
- * Accepts jobRef as name or job_no.
+ * ✅ setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName)
+ * This is the canonical "persist active job" API used by job.js and others.
  */
-async function moveLastLogToJob(ownerId, userName, jobRef) {
+async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   const owner = DIGITS(ownerId);
-  if (!owner) throw new Error('Missing ownerId');
+  const userId = DIGITS(userIdOrPhone);
 
-  let jobNo = null;
-  const s = String(jobRef || '').trim();
-  if (/^\d+$/.test(s)) jobNo = Number(s);
-  else if (s) jobNo = (await ensureJobByName(owner, s))?.job_no || null;
+  if (!owner || !userId) throw new Error('setActiveJobForIdentity missing ownerId/userId');
 
-  if (!jobNo) throw new Error('Could not resolve job');
+  const caps = await detectActiveJobCaps();
+  const resolved = await resolveJobIdAndName(owner, jobId, jobName);
+  const id = resolved.id || null;
+  const name = resolved.name || (jobName ? String(jobName).trim() : null);
 
-  const { rows } = await query(
-    `update public.time_entries t
-        set job_no=$1
-      where t.id = (
-        select id from public.time_entries
-         where owner_id=$2 and lower(employee_name)=lower($3)
-         order by timestamp desc limit 1
-      )
-      returning id, type, timestamp`,
-    [jobNo, owner, String(userName)]
-  );
-  return rows[0] || null;
-}
+  // 1) Preferred: store on public.users if columns exist (this matches your middleware + profiles best)
+  if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
+    try {
+      const sets = [];
+      const params = [owner, userId];
+      let i = 3;
 
-async function enqueueKpiTouch(ownerId, jobId, isoDate) {
-  const owner = String(ownerId).replace(/\D/g, '');
-  const day = isoDate ? isoDate.slice(0, 10) : new Date().toISOString().slice(0, 10);
-  await query(`insert into public.kpi_touches (owner_id, job_id, day) values ($1,$2,$3)`, [
+      if (caps.users_has_active_job_id) {
+        sets.push(`active_job_id = $${i++}`);
+        params.push(id);
+      }
+      if (caps.users_has_active_job_name) {
+        sets.push(`active_job_name = $${i++}`);
+        params.push(name);
+      }
+
+      // update timestamp if it exists
+      const hasUpdatedAt = await hasColumn('users', 'updated_at').catch(() => false);
+      if (hasUpdatedAt) sets.push(`updated_at = now()`);
+
+      if (sets.length) {
+        const r = await query(
+          `update public.users
+              set ${sets.join(', ')}
+            where owner_id = $1 and user_id = $2`,
+          params
+        );
+        if (r?.rowCount) {
+          console.info('[PG/activeJob] set via users', { owner, userId, hasId: !!id, hasName: !!name });
+          return true;
+        }
+      }
+    } catch (e) {
+      console.warn('[PG/activeJob] users update failed (ignored):', e?.message);
+    }
+  }
+
+  // 2) memberships (if present)
+  if (caps.has_memberships && (caps.memberships_has_active_job_id || caps.memberships_has_active_job_name)) {
+    try {
+      const sets = [];
+      const params = [owner, userId];
+      let i = 3;
+
+      if (caps.memberships_has_active_job_id) {
+        sets.push(`active_job_id = $${i++}`);
+        params.push(id);
+      }
+      if (caps.memberships_has_active_job_name) {
+        sets.push(`active_job_name = $${i++}`);
+        params.push(name);
+      }
+
+      const hasUpdatedAt = await hasColumn('memberships', 'updated_at').catch(() => false);
+      if (hasUpdatedAt) sets.push(`updated_at = now()`);
+
+      if (sets.length) {
+        const r = await query(
+          `update public.memberships
+              set ${sets.join(', ')}
+            where owner_id = $1 and user_id = $2`,
+          params
+        );
+        if (r?.rowCount) {
+          console.info('[PG/activeJob] set via memberships', { owner, userId, hasId: !!id, hasName: !!name });
+          return true;
+        }
+      }
+    } catch (e) {
+      console.warn('[PG/activeJob] memberships update failed (ignored):', e?.message);
+    }
+  }
+
+  // 3) user_profiles (if present)
+  if (caps.has_user_profiles && (caps.user_profiles_has_active_job_id || caps.user_profiles_has_active_job_name)) {
+    try {
+      const sets = [];
+      const params = [owner, userId];
+      let i = 3;
+
+      if (caps.user_profiles_has_active_job_id) {
+        sets.push(`active_job_id = $${i++}`);
+        params.push(id);
+      }
+      if (caps.user_profiles_has_active_job_name) {
+        sets.push(`active_job_name = $${i++}`);
+        params.push(name);
+      }
+
+      const hasUpdatedAt = await hasColumn('user_profiles', 'updated_at').catch(() => false);
+      if (hasUpdatedAt) sets.push(`updated_at = now()`);
+
+      if (sets.length) {
+        const r = await query(
+          `update public.user_profiles
+              set ${sets.join(', ')}
+            where owner_id = $1 and user_id = $2`,
+          params
+        );
+        if (r?.rowCount) {
+          console.info('[PG/activeJob] set via user_profiles', { owner, userId, hasId: !!id, hasName: !!name });
+          return true;
+        }
+      }
+    } catch (e) {
+      console.warn('[PG/activeJob] user_profiles update failed (ignored):', e?.message);
+    }
+  }
+
+  // 4) user_active_job (if present and we have a UUID job id)
+  if (caps.has_user_active_job && id && looksLikeUuid(id)) {
+    try {
+      await query(
+        `insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
+         values ($1,$2,$3,now())
+         on conflict (owner_id,user_id) do update
+           set job_id=excluded.job_id, updated_at=now()`,
+        [owner, String(userId), id]
+      );
+      console.info('[PG/activeJob] set via user_active_job', { owner, userId, jobId: id });
+      return true;
+    } catch (e) {
+      console.warn('[PG/activeJob] user_active_job upsert failed (ignored):', e?.message);
+    }
+  }
+
+  console.warn('[PG/activeJob] setActiveJobForIdentity: no persistence route succeeded', {
     owner,
-    jobId || null,
-    day
-  ]);
-}
-
-// ---- JOB BY NAME/SOURCE HELPERS (kept) ----
-async function getJobByName(ownerId, name) {
-  const owner = DIGITS(ownerId);
-  const jobName = String(name || '').trim();
-  if (!owner || !jobName) return null;
-
-  const { rows } = await query(
-    `
-    select
-      id,
-      job_no,
-      coalesce(name, job_name) as job_name,
-      source_msg_id
-    from public.jobs
-    where owner_id = $1
-      and (
-        lower(name) = lower($2)
-        or lower(job_name) = lower($2)
-      )
-    order by created_at desc
-    limit 1
-    `,
-    [owner, jobName]
-  );
-
-  return rows[0] || null;
-}
-
-async function getJobBySourceMsg(ownerId, sourceMsgId) {
-  const owner = DIGITS(ownerId);
-  const sm = String(sourceMsgId || '').trim();
-  if (!owner || !sm) return null;
-
-  const { rows } = await query(
-    `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
-       from public.jobs
-      where owner_id = $1 and source_msg_id = $2
-      limit 1`,
-    [owner, sm]
-  );
-  return rows[0] || null;
-}
-
-/* -------------------- Time Limits & Audit (schema-aware, tolerant) -------------------- */
-
-// Cache detected columns on public.time_entries
-let SUPPORTS_CREATED_BY = null;
-let SUPPORTS_USER_ID = null;
-let SUPPORTS_SOURCE_MSG_ID = null;
-
-async function detectTimeEntriesCapabilities() {
-  if (SUPPORTS_CREATED_BY !== null && SUPPORTS_USER_ID !== null && SUPPORTS_SOURCE_MSG_ID !== null) {
-    return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
-  }
-
-  try {
-    const { rows } = await query(
-      `SELECT column_name
-         FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name   = 'time_entries'`
-    );
-    const names = new Set(rows.map((r) => String(r.column_name).toLowerCase()));
-    SUPPORTS_CREATED_BY = names.has('created_by');
-    SUPPORTS_USER_ID = names.has('user_id');
-    SUPPORTS_SOURCE_MSG_ID = names.has('source_msg_id');
-  } catch {
-    SUPPORTS_CREATED_BY = false;
-    SUPPORTS_USER_ID = false;
-    SUPPORTS_SOURCE_MSG_ID = false;
-  }
-
-  return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
-}
-
-async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
-  const owner = DIGITS(ownerId);
-  const actor = DIGITS(createdBy || owner);
-
-  // Prefer per-actor (user_id) if available
-  try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND user_id=$2
-          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-      [owner, actor, windowSec]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-  } catch (eUser) {
-    const msg = String(eUser?.message || '').toLowerCase();
-    if (!msg.includes('column "user_id" does not exist')) {
-      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
-    }
-  }
-
-  // Fallback to created_by if user_id missing
-  try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND COALESCE(created_by,$2::text) = $2::text
-          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
-      [owner, actor, windowSec]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-  } catch (eCreated) {
-    const msg = String(eCreated?.message || '').toLowerCase();
-    if (!msg.includes('column "created_by" does not exist')) {
-      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
-    }
-  }
-
-  // Last resort: per-owner window
-  try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND created_at >= NOW() - ($2 || ' seconds')::interval`,
-      [owner, windowSec]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-  } catch {
-    return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
-  }
-}
-
-// ---------- Job-aware time entry (delegates to resilient logTimeEntry) ----------
-async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras = {}) {
-  let jobNo = null;
-
-  try {
-    if (jobName && String(jobName).trim()) {
-      const j = await ensureJobByName(ownerId, jobName);
-      jobNo = j?.job_no ?? null;
-    } else {
-      const j = await resolveJobContext(ownerId, { require: false });
-      jobNo = j?.job_no ?? null;
-    }
-  } catch (e) {
-    console.warn('[PG/logTimeEntryWithJob] job resolve failed:', e?.message);
-  }
-
-  return await logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras);
-}
-
-async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
-  const tsIso = new Date(ts).toISOString();
-  const zone = tz || 'America/Toronto';
-
-  const ownerDigits = DIGITS(ownerId);
-  const actorDigits = DIGITS(extras?.requester_id || ownerId);
-
-  const ownerSafe = ownerDigits || actorDigits || '0';
-  const actorSafe = actorDigits || ownerDigits || '0'; // NEVER NULL
-
-  const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
-
-  if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null || SUPPORTS_SOURCE_MSG_ID === null) {
-    await detectTimeEntriesCapabilities().catch((e) =>
-      console.error('[PG/logTimeEntry] detection failed:', e?.message)
-    );
-  }
-
-  const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
-  const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
-
-  if (SUPPORTS_USER_ID) {
-    cols.push('user_id');
-    vals.push(actorSafe);
-  }
-
-  if (SUPPORTS_CREATED_BY) {
-    cols.push('created_by');
-    vals.push(actorSafe);
-  }
-
-  const sourceMsgId = String(extras?.source_msg_id || '').trim() || null;
-  if (SUPPORTS_SOURCE_MSG_ID && sourceMsgId) {
-    cols.push('source_msg_id');
-    vals.push(sourceMsgId);
-  }
-
-  cols.push('created_at');
-  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
-
-  const canIdempotent = SUPPORTS_SOURCE_MSG_ID && SUPPORTS_USER_ID && sourceMsgId;
-
-  const sql = canIdempotent
-    ? `
-      INSERT INTO public.time_entries (${cols.join(', ')})
-      VALUES (${placeholders})
-      ON CONFLICT (owner_id, user_id, source_msg_id) DO NOTHING
-      RETURNING id
-    `
-    : `
-      INSERT INTO public.time_entries (${cols.join(', ')})
-      VALUES (${placeholders})
-      RETURNING id
-    `;
-
-  console.info('[PG/logTimeEntry] EXECUTING', {
-    cols,
-    actorSafe,
-    ownerSafe,
-    sourceMsgId: sourceMsgId || undefined,
-    idempotent: !!canIdempotent
+    userId,
+    hasId: !!id,
+    hasName: !!name
   });
+  return false;
+}
 
-  const { rows } = await query(sql, vals);
-  return rows?.[0]?.id || null;
+/**
+ * ✅ getActiveJobForIdentity(ownerId, userIdOrPhone)
+ * Canonical "read active job" API used by middleware/userProfile.js.
+ */
+async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
+  const owner = DIGITS(ownerId);
+  const userId = DIGITS(userIdOrPhone);
+  if (!owner || !userId) return null;
+
+  const caps = await detectActiveJobCaps();
+
+  // 1) users table (preferred if columns exist)
+  if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
+    try {
+      const cols = [];
+      if (caps.users_has_active_job_id) cols.push('active_job_id');
+      if (caps.users_has_active_job_name) cols.push('active_job_name');
+      const r = await query(
+        `select ${cols.join(', ')}
+           from public.users
+          where owner_id=$1 and user_id=$2
+          limit 1`,
+        [owner, userId]
+      );
+      const row = r?.rows?.[0];
+      if (row && (row.active_job_id != null || row.active_job_name != null)) {
+        return { active_job_id: row.active_job_id ?? null, active_job_name: row.active_job_name ?? null };
+      }
+    } catch (e) {
+      console.warn('[PG/activeJob] users read failed (ignored):', e?.message);
+    }
+  }
+
+  // 2) memberships
+  if (caps.has_memberships && (caps.memberships_has_active_job_id || caps.memberships_has_active_job_name)) {
+    try {
+      const cols = [];
+      if (caps.memberships_has_active_job_id) cols.push('active_job_id');
+      if (caps.memberships_has_active_job_name) cols.push('active_job_name');
+      const r = await query(
+        `select ${cols.join(', ')}
+           from public.memberships
+          where owner_id=$1 and user_id=$2
+          limit 1`,
+        [owner, userId]
+      );
+      const row = r?.rows?.[0];
+      if (row && (row.active_job_id != null || row.active_job_name != null)) {
+        return { active_job_id: row.active_job_id ?? null, active_job_name: row.active_job_name ?? null };
+      }
+    } catch (e) {
+      console.warn('[PG/activeJob] memberships read failed (ignored):', e?.message);
+    }
+  }
+
+  // 3) user_profiles
+  if (caps.has_user_profiles && (caps.user_profiles_has_active_job_id || caps.user_profiles_has_active_job_name)) {
+    try {
+      const cols = [];
+      if (caps.user_profiles_has_active_job_id) cols.push('active_job_id');
+      if (caps.user_profiles_has_active_job_name) cols.push('active_job_name');
+      const r = await query(
+        `select ${cols.join(', ')}
+           from public.user_profiles
+          where owner_id=$1 and user_id=$2
+          limit 1`,
+        [owner, userId]
+      );
+      const row = r?.rows?.[0];
+      if (row && (row.active_job_id != null || row.active_job_name != null)) {
+        return { active_job_id: row.active_job_id ?? null, active_job_name: row.active_job_name ?? null };
+      }
+    } catch (e) {
+      console.warn('[PG/activeJob] user_profiles read failed (ignored):', e?.message);
+    }
+  }
+
+  // 4) user_active_job -> resolve to name
+  if (caps.has_user_active_job) {
+    try {
+      const r = await query(
+        `select j.id as active_job_id, coalesce(j.name, j.job_name) as active_job_name
+           from public.user_active_job u
+           join public.jobs j
+             on j.owner_id=u.owner_id and j.id=u.job_id
+          where u.owner_id=$1 and u.user_id=$2
+          limit 1`,
+        [owner, String(userId)]
+      );
+      const row = r?.rows?.[0];
+      if (row && (row.active_job_id != null || row.active_job_name != null)) {
+        return { active_job_id: row.active_job_id ?? null, active_job_name: row.active_job_name ?? null };
+      }
+    } catch (e) {
+      console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
+    }
+  }
+
+  return null;
 }
 
 /* -------------------- OTP / Users / Tasks / Exports / Pending Actions -------------------- */
@@ -1052,6 +1155,7 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
   const uid = DIGITS(user_id);
   const oid = DIGITS(ownerId || uid);
   const token = crypto.randomBytes(16).toString('hex');
+
   const { rows } = await query(
     `INSERT INTO public.users (user_id, owner_id, onboarding_in_progress, subscription_tier, dashboard_token, created_at)
      VALUES ($1,$2,$3,'basic',$4,NOW())
@@ -1452,7 +1556,6 @@ async function getOwnerCategoryBreakdown(ownerId, fromDate, toDate, kindFilter =
 /**
  * ✅ Vendor breakdown (NO schema change required)
  * Uses transactions.source as vendor label but normalizes for grouping.
- * Your dashboard can call this today.
  */
 async function getOwnerVendorBreakdown(ownerId, fromDate, toDate, kindFilter = 'expense') {
   const ownerKey = String(ownerId);
@@ -1562,19 +1665,11 @@ function normalizeVendorString(v) {
 /**
  * ✅ normalizeVendorName(ownerId, vendor)
  * Signature matches what expense.js expects today.
- * You can later upgrade this to query a vendor table per owner.
  */
 async function normalizeVendorName(_ownerId, vendor) {
   return normalizeVendorString(vendor);
 }
 
-/**
- * ✅ upsertCategoryRule()
- * Store a per-owner learned rule:
- * - vendor_norm: canonical vendor name
- * - keyword: optional keyword (e.g., "siding", "shingles")
- * - category: canonical category (Materials, Fuel, Tools, etc.)
- */
 async function upsertCategoryRule({ ownerId, kind = 'expense', vendor, keyword = null, category, weight = 10 } = {}) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   const k = String(kind || 'expense').trim() || 'expense';
@@ -1588,12 +1683,8 @@ async function upsertCategoryRule({ ownerId, kind = 'expense', vendor, keyword =
   if (!owner) throw new Error('upsertCategoryRule missing ownerId');
   if (!cat) throw new Error('upsertCategoryRule missing category');
 
-  // fail-open if table missing
   if (!(await detectCategoryRulesTable())) return { ok: false, skipped: true };
 
-  // We don't have a unique constraint here; do a soft-upsert:
-  // if same (owner,kind,vendor_norm,keyword) exists -> update
-  // else -> insert
   const { rows } = await query(
     `
     with existing as (
@@ -1634,15 +1725,6 @@ async function upsertCategoryRule({ ownerId, kind = 'expense', vendor, keyword =
   return { ok: true, id: ins?.rows?.[0]?.id || null, inserted: true };
 }
 
-/**
- * ✅ getCategorySuggestion(ownerId, kind, vendor, itemText)
- * Returns: { category, matched_on, rule_id } or null
- *
- * Priority:
- * 1) vendor+keyword match (keyword present in itemText)
- * 2) vendor-only rules
- * 3) keyword-only rules
- */
 async function getCategorySuggestion(ownerId, kind = 'expense', vendor, itemText) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   if (!owner) return null;
@@ -1654,7 +1736,7 @@ async function getCategorySuggestion(ownerId, kind = 'expense', vendor, itemText
   const text = String(itemText || '').toLowerCase();
 
   try {
-    // 1) vendor + keyword (keyword contained in itemText)
+    // 1) vendor + keyword
     if (vendorNorm && text) {
       const r1 = await query(
         `
@@ -1742,14 +1824,11 @@ async function getCategorySuggestion(ownerId, kind = 'expense', vendor, itemText
 /**
  * ✅ listOpenJobs(ownerId, { limit })
  * Returns an array of job display names.
- * Uses jobs.status if present, otherwise falls back to "completed_at is null"
- * and excludes closed/archived-ish statuses.
  */
 async function listOpenJobs(ownerId, { limit = 8 } = {}) {
   const owner = String(ownerId || '').trim();
-  const lim = Math.max(1, Math.min(Number(limit) || 8, 25));
+  const lim = Math.max(1, Math.min(Number(limit) || 8, 50));
 
-  // Try status-based first (many schemas have status)
   try {
     const { rows } = await query(
       `
@@ -1767,7 +1846,6 @@ async function listOpenJobs(ownerId, { limit = 8 } = {}) {
     console.warn('[PG/listOpenJobs] status query failed; falling back:', e?.message);
   }
 
-  // Fallback: completed_at null or missing status concept
   try {
     const { rows } = await query(
       `
@@ -1787,10 +1865,283 @@ async function listOpenJobs(ownerId, { limit = 8 } = {}) {
   }
 }
 
+/* -------------------- Time Limits & Audit (schema-aware, tolerant) -------------------- */
+
+// Cache detected columns on public.time_entries
+let SUPPORTS_CREATED_BY = null;
+let SUPPORTS_USER_ID = null;
+let SUPPORTS_SOURCE_MSG_ID = null;
+
+async function detectTimeEntriesCapabilities() {
+  if (SUPPORTS_CREATED_BY !== null && SUPPORTS_USER_ID !== null && SUPPORTS_SOURCE_MSG_ID !== null) {
+    return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
+  }
+
+  try {
+    const { rows } = await query(
+      `SELECT column_name
+         FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name   = 'time_entries'`
+    );
+    const names = new Set(rows.map((r) => String(r.column_name).toLowerCase()));
+    SUPPORTS_CREATED_BY = names.has('created_by');
+    SUPPORTS_USER_ID = names.has('user_id');
+    SUPPORTS_SOURCE_MSG_ID = names.has('source_msg_id');
+  } catch {
+    SUPPORTS_CREATED_BY = false;
+    SUPPORTS_USER_ID = false;
+    SUPPORTS_SOURCE_MSG_ID = false;
+  }
+
+  return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
+}
+
+async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
+  const owner = DIGITS(ownerId);
+  const actor = DIGITS(createdBy || owner);
+
+  try {
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND user_id=$2
+          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+      [owner, actor, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+  } catch (eUser) {
+    const msg = String(eUser?.message || '').toLowerCase();
+    if (!msg.includes('column "user_id" does not exist')) {
+      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+    }
+  }
+
+  try {
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND COALESCE(created_by,$2::text) = $2::text
+          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+      [owner, actor, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+  } catch (eCreated) {
+    const msg = String(eCreated?.message || '').toLowerCase();
+    if (!msg.includes('column "created_by" does not exist')) {
+      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+    }
+  }
+
+  try {
+    const { rows } = await query(
+      `SELECT COUNT(*)::int AS n
+         FROM public.time_entries
+        WHERE owner_id=$1
+          AND created_at >= NOW() - ($2 || ' seconds')::interval`,
+      [owner, windowSec]
+    );
+    const n = rows?.[0]?.n ?? 0;
+    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
+  } catch {
+    return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
+  }
+}
+
+// ---------- Job-aware time entry (delegates to resilient logTimeEntry) ----------
+async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras = {}) {
+  let jobNo = null;
+
+  try {
+    if (jobName && String(jobName).trim()) {
+      const j = await ensureJobByName(ownerId, jobName);
+      jobNo = j?.job_no ?? null;
+    } else {
+      const j = await resolveJobContext(ownerId, { require: false });
+      jobNo = j?.job_no ?? null;
+    }
+  } catch (e) {
+    console.warn('[PG/logTimeEntryWithJob] job resolve failed:', e?.message);
+  }
+
+  return await logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras);
+}
+
+async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
+  const tsIso = new Date(ts).toISOString();
+  const zone = tz || 'America/Toronto';
+
+  const ownerDigits = DIGITS(ownerId);
+  const actorDigits = DIGITS(extras?.requester_id || ownerId);
+
+  const ownerSafe = ownerDigits || actorDigits || '0';
+  const actorSafe = actorDigits || ownerDigits || '0'; // NEVER NULL
+
+  const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
+
+  if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null || SUPPORTS_SOURCE_MSG_ID === null) {
+    await detectTimeEntriesCapabilities().catch((e) =>
+      console.error('[PG/logTimeEntry] detection failed:', e?.message)
+    );
+  }
+
+  const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
+  const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
+
+  if (SUPPORTS_USER_ID) {
+    cols.push('user_id');
+    vals.push(actorSafe);
+  }
+
+  if (SUPPORTS_CREATED_BY) {
+    cols.push('created_by');
+    vals.push(actorSafe);
+  }
+
+  const sourceMsgId = String(extras?.source_msg_id || '').trim() || null;
+  if (SUPPORTS_SOURCE_MSG_ID && sourceMsgId) {
+    cols.push('source_msg_id');
+    vals.push(sourceMsgId);
+  }
+
+  cols.push('created_at');
+  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
+
+  const canIdempotent = SUPPORTS_SOURCE_MSG_ID && SUPPORTS_USER_ID && sourceMsgId;
+
+  const sql = canIdempotent
+    ? `
+      INSERT INTO public.time_entries (${cols.join(', ')})
+      VALUES (${placeholders})
+      ON CONFLICT (owner_id, user_id, source_msg_id) DO NOTHING
+      RETURNING id
+    `
+    : `
+      INSERT INTO public.time_entries (${cols.join(', ')})
+      VALUES (${placeholders})
+      RETURNING id
+    `;
+
+  console.info('[PG/logTimeEntry] EXECUTING', {
+    cols,
+    actorSafe,
+    ownerSafe,
+    sourceMsgId: sourceMsgId || undefined,
+    idempotent: !!canIdempotent
+  });
+
+  const { rows } = await query(sql, vals);
+  return rows?.[0]?.id || null;
+}
+
+async function moveLastLogToJob(ownerId, userName, jobRef) {
+  const owner = DIGITS(ownerId);
+  if (!owner) throw new Error('Missing ownerId');
+
+  let jobNo = null;
+  const s = String(jobRef || '').trim();
+  if (/^\d+$/.test(s)) jobNo = Number(s);
+  else if (s) jobNo = (await ensureJobByName(owner, s))?.job_no || null;
+
+  if (!jobNo) throw new Error('Could not resolve job');
+
+  const { rows } = await query(
+    `update public.time_entries t
+        set job_no=$1
+      where t.id = (
+        select id from public.time_entries
+         where owner_id=$2 and lower(employee_name)=lower($3)
+         order by timestamp desc limit 1
+      )
+      returning id, type, timestamp`,
+    [jobNo, owner, String(userName)]
+  );
+  return rows[0] || null;
+}
+
+async function enqueueKpiTouch(ownerId, jobId, isoDate) {
+  const owner = String(ownerId).replace(/\D/g, '');
+  const day = isoDate ? isoDate.slice(0, 10) : new Date().toISOString().slice(0, 10);
+  await query(`insert into public.kpi_touches (owner_id, job_id, day) values ($1,$2,$3)`, [
+    owner,
+    jobId || null,
+    day
+  ]);
+}
+
+// ---- JOB BY NAME/SOURCE HELPERS (kept) ----
+async function getJobByName(ownerId, name) {
+  const owner = DIGITS(ownerId);
+  const jobName = String(name || '').trim();
+  if (!owner || !jobName) return null;
+
+  const { rows } = await query(
+    `
+    select
+      id,
+      job_no,
+      coalesce(name, job_name) as job_name,
+      source_msg_id
+    from public.jobs
+    where owner_id = $1
+      and (
+        lower(name) = lower($2)
+        or lower(job_name) = lower($2)
+      )
+    order by created_at desc
+    limit 1
+    `,
+    [owner, jobName]
+  );
+
+  return rows[0] || null;
+}
+
+async function getJobBySourceMsg(ownerId, sourceMsgId) {
+  const owner = DIGITS(ownerId);
+  const sm = String(sourceMsgId || '').trim();
+  if (!owner || !sm) return null;
+
+  const { rows } = await query(
+    `select id, job_no, coalesce(name, job_name) as job_name, source_msg_id
+       from public.jobs
+      where owner_id = $1 and source_msg_id = $2
+      limit 1`,
+    [owner, sm]
+  );
+  return rows[0] || null;
+}
+
 // ---- Safe limiter exports (avoid undefined symbol at module.exports time)
 const __checkLimit =
   (typeof checkTimeEntryLimit === 'function' && checkTimeEntryLimit) ||
   (async () => ({ ok: true, n: 0, limit: Infinity, windowSec: 0 })); // fail-open
+
+/* ------------------------------------------------------------------ */
+/* ✅ Aliases expected by job.js “best effort persist”                  */
+/* ------------------------------------------------------------------ */
+
+async function setActiveJobForUser(ownerId, userId, jobId, jobName) {
+  return setActiveJobForIdentity(ownerId, userId, jobId, jobName);
+}
+async function setUserActiveJob(ownerId, userId, jobId, jobName) {
+  return setActiveJobForIdentity(ownerId, userId, jobId, jobName);
+}
+async function updateUserActiveJob(ownerId, userId, jobId, jobName) {
+  return setActiveJobForIdentity(ownerId, userId, jobId, jobName);
+}
+async function saveActiveJob(ownerId, userId, jobId, jobName) {
+  return setActiveJobForIdentity(ownerId, userId, jobId, jobName);
+}
+async function setActiveJobForPhone(ownerId, fromPhone, jobId, jobName) {
+  return setActiveJobForIdentity(ownerId, fromPhone, jobId, jobName);
+}
+
+/* -------------------- module exports -------------------- */
 
 module.exports = {
   // ---------- Core ----------
@@ -1841,7 +2192,7 @@ module.exports = {
   listOpenJobs,
   normalizeVendorName,
 
-  // ✅ Category rules (NEW)
+  // ✅ Category rules
   normalizeCategoryString,
   upsertCategoryRule,
   getCategorySuggestion,
@@ -1851,6 +2202,17 @@ module.exports = {
   getActiveJob,
   moveLastLogToJob,
   enqueueKpiTouch,
+
+  // ✅ Canonical active job per identity (NEW)
+  setActiveJobForIdentity,
+  getActiveJobForIdentity,
+
+  // ✅ Aliases job.js may try (NEW)
+  setActiveJobForUser,
+  setUserActiveJob,
+  updateUserActiveJob,
+  saveActiveJob,
+  setActiveJobForPhone,
 
   // ---------- Time ----------
   logTimeEntry,

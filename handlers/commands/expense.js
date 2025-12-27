@@ -1,18 +1,15 @@
 // handlers/commands/expense.js
 // Drop-in replacement: FREE-FORM WhatsApp Interactive List (dynamic job picker)
 // + "change job" support during confirm + job-prompt steps
-// + Removes Twilio Content API list-picker (template-ish) approach
+// + Active-job DB fallback resolution (so expenses auto-attach after job picker)
+// + Filters garbage job names ("cancel", "show active jobs", etc.) from pickers
 
-// ✅ Robust import: postgres exports differ across versions
 const pg = require('../../services/postgres');
 const { query, insertTransaction, listOpenJobs } = pg;
 
-// ✅ Optional rule-based category suggestion (fail-open if not implemented yet)
 const getCategorySuggestion =
-  (typeof pg.getCategorySuggestion === 'function' && pg.getCategorySuggestion) ||
-  (async () => null);
+  (typeof pg.getCategorySuggestion === 'function' && pg.getCategorySuggestion) || (async () => null);
 
-// ✅ Vendor normalizer (fail-open)
 const normalizeVendorName =
   (typeof pg.normalizeVendorName === 'function' && pg.normalizeVendorName) ||
   (typeof pg.normalizeVendor === 'function' && pg.normalizeVendor) ||
@@ -34,8 +31,7 @@ const handleInputWithAI = ai.handleInputWithAI;
 const parseExpenseMessage = ai.parseExpenseMessage;
 
 const todayInTimeZone =
-  (typeof ai.todayInTimeZone === 'function' && ai.todayInTimeZone) ||
-  (() => new Date().toISOString().split('T')[0]);
+  (typeof ai.todayInTimeZone === 'function' && ai.todayInTimeZone) || (() => new Date().toISOString().split('T')[0]);
 
 const parseNaturalDateTz =
   (typeof ai.parseNaturalDate === 'function' && ai.parseNaturalDate) ||
@@ -59,9 +55,7 @@ const parseNaturalDateTz =
     return null;
   });
 
-const categorizeEntry =
-  (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) ||
-  (async () => null);
+const categorizeEntry = (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) || (async () => null);
 
 // ---- CIL validator (fail-open) ----
 const cilMod = require('../../cil');
@@ -129,9 +123,7 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   if (!to) throw new Error('Missing "to"');
   if (!templateSid) throw new Error('Missing templateSid');
 
-  const toClean = String(to).startsWith('whatsapp:')
-    ? String(to)
-    : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
+  const toClean = String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
 
   const payload = {
     to: toClean,
@@ -176,26 +168,19 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
     }
   }
 
-  return twimlText(`Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.\nTip: reply "change job" to pick a different job.`);
+  return twimlText(
+    `Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.\nTip: reply "change job" to pick a different job.`
+  );
 }
 
-/* ---------------- WhatsApp Interactive List (FREE-FORM, dynamic) ----------------
- * This is the real WhatsApp interactive list picker UI.
- * Works only inside the WhatsApp 24-hour window. Outside window -> Twilio will reject,
- * and we fall back to plain text prompt.
- */
+/* ---------------- WhatsApp Interactive List (FREE-FORM, dynamic) ---------------- */
 
-// Back-compat: allow turning off interactive list if needed
 const ENABLE_INTERACTIVE_LIST = (() => {
-  const raw =
-    process.env.TWILIO_ENABLE_INTERACTIVE_LIST ??
-    process.env.TWILIO_ENABLE_LIST_PICKER ??
-    'true';
+  const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? process.env.TWILIO_ENABLE_LIST_PICKER ?? 'true';
   return String(raw).trim().toLowerCase() !== 'false';
 })();
 
 function stableHash(str) {
-  // fast non-crypto hash
   let h = 2166136261;
   const s = String(str || '');
   for (let i = 0; i < s.length; i++) {
@@ -205,12 +190,25 @@ function stableHash(str) {
   return (h >>> 0).toString(16);
 }
 
+function isGarbageJobName(name) {
+  const lc = String(name || '').trim().toLowerCase();
+  return (
+    lc === 'cancel' ||
+    lc === 'show active jobs' ||
+    lc === 'active jobs' ||
+    lc === 'change job' ||
+    lc === 'switch job' ||
+    lc === 'pick job'
+  );
+}
+
 function dedupeJobs(list) {
   const out = [];
   const seen = new Set();
   for (const j of list || []) {
     const s = String(j || '').trim();
     if (!s) continue;
+    if (isGarbageJobName(s)) continue;
     const key = s.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -233,7 +231,7 @@ function buildJobPickerMapping(jobs, page, pageSize) {
   const start = page * pageSize;
   const slice = jobs.slice(start, start + pageSize);
 
-  const idMap = {};   // rowId -> jobName
+  const idMap = {}; // rowId -> jobName
   const nameMap = {}; // lower(title/desc) -> jobName
 
   for (let i = 0; i < slice.length; i++) {
@@ -243,12 +241,10 @@ function buildJobPickerMapping(jobs, page, pageSize) {
 
     idMap[rowId] = fullName;
 
-    // Help resolve if Twilio sends back title instead of id.
     nameMap[String(fullName).toLowerCase()] = fullName;
     nameMap[String(fullName).slice(0, 24).toLowerCase()] = fullName;
   }
 
-  // Special rows
   idMap['overhead'] = 'Overhead';
   idMap['more'] = '__MORE__';
 
@@ -264,8 +260,6 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
   const client = getTwilioClient();
   const { waFrom, messagingServiceSid } = getSendFromConfig();
 
-  // IMPORTANT: Twilio expects interactive payload keys for WhatsApp.
-  // If Twilio rejects (outside 24h), caller will catch & fallback.
   const payload = {
     to,
     ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
@@ -307,7 +301,6 @@ async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize =
 
   const { idMap, nameMap } = buildJobPickerMapping(uniq, page, JOBS_PER_PAGE);
 
-  // Save mapping + pagination state in pending state
   await mergePendingTransactionState(from, {
     awaitingExpenseJob: true,
     awaitingExpenseJobPage: page,
@@ -317,12 +310,10 @@ async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize =
     expenseJobPickerTotal: uniq.length
   });
 
-  // If interactive is disabled or no WhatsApp destination, fallback to text
   if (!ENABLE_INTERACTIVE_LIST || !to) {
     return twimlText(buildTextJobPrompt(uniq, page, JOBS_PER_PAGE));
   }
 
-  // Build interactive list rows
   const rows = [];
 
   for (let i = 0; i < slice.length; i++) {
@@ -337,14 +328,12 @@ async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize =
     });
   }
 
-  // Overhead
   rows.push({
     id: 'overhead',
     title: 'Overhead',
     description: 'Not tied to a job'
   });
 
-  // More
   if (hasMore) {
     rows.push({
       id: 'more',
@@ -390,7 +379,6 @@ function normalizeDecisionToken(input) {
   if (s === 'edit') return 'edit';
   if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
 
-  // ✅ allow job switching while confirming / prompting
   if (s === 'change job' || s === 'switch job') return 'change_job';
   if (/\bchange\s+job\b/.test(s) && s.length <= 40) return 'change_job';
 
@@ -420,9 +408,7 @@ function toNumberAmount(amountStr) {
 }
 
 function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(str || '')
-  );
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
 }
 
 function looksLikeOverhead(s) {
@@ -438,7 +424,6 @@ function normalizeJobAnswer(text) {
   return s;
 }
 
-// ✅ Fix "for for" / duplication
 function cleanExpenseItemForDisplay(item) {
   let s = String(item || '').trim();
   s = s.replace(/^for\s+/i, '');
@@ -450,9 +435,6 @@ function escapeRegExp(x) {
   return String(x).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * ✅ strip embedded "on <date>" and "for <job>" tails from item/memo
- */
 function stripEmbeddedDateAndJobFromItem(item, { date, jobName } = {}) {
   let s = String(item || '').trim();
 
@@ -490,12 +472,144 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName }) {
   return parts.join(' ') + '.';
 }
 
-async function resolveActiveJobName({ ownerId, userProfile }) {
-  const ownerParam = String(ownerId || '').trim();
-  const name = userProfile?.active_job_name || userProfile?.activeJobName || null;
-  if (name && String(name).trim()) return String(name).trim();
+/* ---------------- Active job resolution (now with DB fallback) ---------------- */
 
-  const ref = userProfile?.active_job_id ?? userProfile?.activeJobId ?? null;
+function extractUserId(userProfile, fromPhone) {
+  return (
+    userProfile?.id ||
+    userProfile?.user_id ||
+    userProfile?.userId ||
+    userProfile?.member_id ||
+    userProfile?.membership_id ||
+    fromPhone ||
+    null
+  );
+}
+
+function normalizeE164ish(fromPhone) {
+  const raw = String(fromPhone || '').trim();
+  if (!raw) return null;
+  if (raw.startsWith('+')) return raw;
+  const digits = raw.replace(/\D/g, '');
+  return digits ? `+${digits}` : null;
+}
+
+async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, fromPhone }) {
+  const ownerParam = String(ownerId || '').trim();
+  const userId = extractUserId(userProfile, fromPhone);
+  const phone = normalizeE164ish(fromPhone);
+
+  // Prefer a helper if you add it later
+  if (typeof pg.getActiveJobForIdentity === 'function') {
+    try {
+      const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
+      if (out?.active_job_name || out?.activeJobName) {
+        return {
+          active_job_name: String(out.active_job_name || out.activeJobName).trim(),
+          active_job_id: out.active_job_id ?? out.activeJobId ?? null
+        };
+      }
+      if (out?.active_job_id || out?.activeJobId) {
+        return { active_job_name: null, active_job_id: out.active_job_id ?? out.activeJobId };
+      }
+    } catch (e) {
+      console.warn('[EXPENSE] pg.getActiveJobForIdentity failed (ignored):', e?.message);
+    }
+  }
+
+  // Best-effort across likely tables/columns.
+  // All queries are wrapped so missing table/cols fail-open.
+  const attempts = [
+    // memberships by user_id
+    {
+      label: 'memberships by user_id',
+      sql: `SELECT active_job_id, active_job_name
+              FROM public.memberships
+             WHERE owner_id = $1 AND user_id = $2
+             LIMIT 1`,
+      params: [ownerParam, String(userId)]
+    },
+    // memberships by phone
+    {
+      label: 'memberships by phone',
+      sql: `SELECT active_job_id, active_job_name
+              FROM public.memberships
+             WHERE owner_id = $1 AND (phone = $2 OR phone_e164 = $2 OR member_phone = $2)
+             LIMIT 1`,
+      params: [ownerParam, phone]
+    },
+    // users by id
+    {
+      label: 'users by id',
+      sql: `SELECT active_job_id, active_job_name
+              FROM public.users
+             WHERE owner_id = $1 AND id = $2
+             LIMIT 1`,
+      params: [ownerParam, String(userId)]
+    },
+    // users by phone
+    {
+      label: 'users by phone',
+      sql: `SELECT active_job_id, active_job_name
+              FROM public.users
+             WHERE owner_id = $1 AND (phone = $2 OR phone_e164 = $2)
+             LIMIT 1`,
+      params: [ownerParam, phone]
+    },
+    // user_profiles by user_id
+    {
+      label: 'user_profiles by user_id',
+      sql: `SELECT active_job_id, active_job_name
+              FROM public.user_profiles
+             WHERE owner_id = $1 AND user_id = $2
+             LIMIT 1`,
+      params: [ownerParam, String(userId)]
+    }
+  ];
+
+  for (const a of attempts) {
+    if (!a.params?.[1]) continue;
+    if (a.params?.[1] == null) continue;
+    try {
+      const r = await query(a.sql, a.params);
+      const row = r?.rows?.[0];
+      if (!row) continue;
+      const name = row.active_job_name != null ? String(row.active_job_name).trim() : null;
+      const id = row.active_job_id != null ? row.active_job_id : null;
+      if (name || id) {
+        console.info('[EXPENSE] active job fetched from DB', { where: a.label, hasName: !!name, hasId: !!id });
+        return { active_job_name: name || null, active_job_id: id };
+      }
+    } catch {
+      // ignore missing schema/table/columns
+    }
+  }
+
+  return null;
+}
+
+async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
+  const ownerParam = String(ownerId || '').trim();
+
+  const directName = userProfile?.active_job_name || userProfile?.activeJobName || null;
+  if (directName && String(directName).trim()) return String(directName).trim();
+
+  const directRef = userProfile?.active_job_id ?? userProfile?.activeJobId ?? null;
+
+  // If not present in userProfile, try DB fallback
+  let ref = directRef;
+  let name = null;
+
+  if (ref == null) {
+    const fetched = await bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, fromPhone });
+    if (fetched?.active_job_name && String(fetched.active_job_name).trim()) {
+      return String(fetched.active_job_name).trim();
+    }
+    ref = fetched?.active_job_id ?? null;
+    name = fetched?.active_job_name ?? null;
+  }
+
+  if (name && String(name).trim()) return String(name).trim();
   if (ref == null) return null;
 
   const s = String(ref).trim();
@@ -533,9 +647,13 @@ async function resolveActiveJobName({ ownerId, userProfile }) {
   return null;
 }
 
+/* ---------------- category heuristics ---------------- */
+
 function vendorDefaultCategory(store) {
   const s = String(store || '').toLowerCase();
-  if (/(home depot|homedepot|rona|lowe|lowes|home hardware|convoy|gentek|groupe|abc supply|beacon|roofmart|kent)/i.test(s)) {
+  if (
+    /(home depot|homedepot|rona|lowe|lowes|home hardware|convoy|gentek|groupe|abc supply|beacon|roofmart|kent)/i.test(s)
+  ) {
     return 'Materials';
   }
   if (/(esso|shell|petro|ultramar|pioneer|circle\s*k)/i.test(s)) return 'Fuel';
@@ -545,7 +663,11 @@ function vendorDefaultCategory(store) {
 function inferExpenseCategoryHeuristic(data) {
   const memo = `${data?.item || ''} ${data?.store || ''}`.toLowerCase();
 
-  if (/\b(lumber|plywood|drywall|shingle|shingles|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?|siding|vinyl\s*siding|soffit|fascia|eavestrough|gutter|flashing|wrap|tyvek|house\s*wrap|sheathing|osb|studs|joists|truss|paint|primer|stain)\b/.test(memo)) {
+  if (
+    /\b(lumber|plywood|drywall|shingle|shingles|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?|siding|vinyl\s*siding|soffit|fascia|eavestrough|gutter|flashing|wrap|tyvek|house\s*wrap|sheathing|osb|studs|joists|truss|paint|primer|stain)\b/.test(
+      memo
+    )
+  ) {
     return 'Materials';
   }
   if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
@@ -594,7 +716,7 @@ function normalizeExpenseData(data, userProfile) {
   return d;
 }
 
-/* --------- NL money/date helpers (aligned with mediaParser) --------- */
+/* --------- NL money/date helpers --------- */
 
 function extractMoneyToken(input) {
   const s = String(input || '');
@@ -649,14 +771,6 @@ function deterministicExpenseParse(input, userProfile) {
   if (!date) {
     const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
     if (iso?.[1]) date = iso[1];
-  }
-
-  if (!date) {
-    const mNat = raw.match(/\bon\s+([A-Za-z]{3,9}\s+\d{1,2})(st|nd|rd|th)?\,?\s+(\d{4})\b/i);
-    if (mNat?.[1] && mNat?.[3]) {
-      const normalized = `${mNat[1]} ${mNat[3]}`;
-      date = parseNaturalDateTz(normalized, tz);
-    }
   }
 
   if (!date) date = todayInTimeZone(tz);
@@ -774,9 +888,6 @@ async function withTimeout(promise, ms, fallbackValue = '__TIMEOUT__') {
   return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms))]);
 }
 
-/**
- * Central category resolver for expense.
- */
 async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   const vendor = String(data?.store || '').trim() || 'Unknown Store';
   const itemText = String(data?.item || '').trim();
@@ -804,13 +915,6 @@ async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   return null;
 }
 
-/**
- * Resolve job selection from:
- * - interactive list row ID (best)
- * - interactive list title (fallback)
- * - "more"/"Overhead"
- * - typed job name
- */
 function resolveJobFromReply(input, pending) {
   const raw = normalizeJobAnswer(input);
   const t = String(raw || '').trim();
@@ -818,29 +922,24 @@ function resolveJobFromReply(input, pending) {
 
   if (looksLikeOverhead(t)) return 'Overhead';
 
-  // paging control (typed)
   if (t.toLowerCase() === 'more' || t.toLowerCase() === 'more jobs' || t.toLowerCase() === 'more jobs…') {
     return '__MORE__';
   }
 
-  // ✅ interactive list row id
   if (pending?.expenseJobPickerIdMap && pending.expenseJobPickerIdMap[t]) {
     return pending.expenseJobPickerIdMap[t];
   }
 
-  // ✅ interactive list title (common)
   if (pending?.expenseJobPickerNameMap) {
     const mapped = pending.expenseJobPickerNameMap[String(t).toLowerCase()];
     if (mapped) return mapped;
   }
 
-  // Legacy numeric selection (if user saw text list)
   if (/^\d+$/.test(t) && pending?.expenseJobPickerMap) {
     const mapped = pending.expenseJobPickerMap[String(t)];
     if (mapped) return mapped;
   }
 
-  // Legacy name selection (text)
   if (pending?.expenseJobPickerMap) {
     const mapped = pending.expenseJobPickerMap[String(t).toLowerCase()];
     if (mapped) return mapped;
@@ -881,7 +980,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
       const tok = normalizeDecisionToken(input);
 
-      // ✅ if user explicitly asks to change job, re-send picker for current page (or page 0)
       if (tok === 'change_job') {
         const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
         const page = Number(pending.awaitingExpenseJobPage || 0) || 0;
@@ -890,7 +988,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const resolved = resolveJobFromReply(input, pending);
 
-      // user asked for "More jobs…"
       if (resolved === '__MORE__') {
         const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
         const nextPage = Number(pending.awaitingExpenseJobPage || 0) + 1;
@@ -902,14 +999,12 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const merged = normalizeExpenseData({ ...pending.pendingExpense, jobName: finalJob }, userProfile);
       merged.store = await normalizeVendorName(ownerId, merged.store);
 
-      // ✅ CLEAN the item after job/date are known
       merged.item = stripEmbeddedDateAndJobFromItem(merged.item, { date: merged.date, jobName: merged.jobName });
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingExpense: merged,
         awaitingExpenseJob: false,
-        // clear all picker maps (new + legacy)
         expenseJobPickerIdMap: null,
         expenseJobPickerNameMap: null,
         expenseJobPickerMap: null,
@@ -938,7 +1033,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const token = normalizeDecisionToken(input);
       const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
 
-      // ✅ allow changing job during confirm step
       if (token === 'change_job' && pending?.pendingExpense) {
         await mergePendingTransactionState(from, {
           ...(pending || {}),
@@ -961,7 +1055,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
         const jobName =
           (data.jobName && String(data.jobName).trim()) ||
-          (await resolveActiveJobName({ ownerId, userProfile })) ||
+          (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) ||
           null;
 
         if (!jobName) {
@@ -978,7 +1072,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
           return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
         }
 
-        // ✅ CLEAN item once job/date are known (pre-CIL, pre-DB, pre-summary)
         data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 
         const gate = assertExpenseCILOrClarify({
@@ -1077,18 +1170,14 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const n = Number(String(amountRaw).replace(/,/g, ''));
       const amount = Number.isFinite(n) && n > 0 ? formatMoneyDisplay(n) : '$0.00';
 
-      const data0 = normalizeExpenseData(
-        { date: todayInTimeZone(tz), item, amount, store: store || 'Unknown Store' },
-        userProfile
-      );
+      const data0 = normalizeExpenseData({ date: todayInTimeZone(tz), item, amount, store: store || 'Unknown Store' }, userProfile);
 
       data0.store = await normalizeVendorName(ownerId, data0.store);
 
       const category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
 
-      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
+      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
 
-      // ✅ CLEAN item if job is already known
       if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
 
       await mergePendingTransactionState(from, {
@@ -1123,9 +1212,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
 
-      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
+      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
 
-      // ✅ CLEAN item if job is already known
       if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
 
       await mergePendingTransactionState(from, {
@@ -1185,9 +1273,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
-      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile })) || null;
+      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
 
-      // ✅ CLEAN item if job is already known
       if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 
       await mergePendingTransactionState(from, {

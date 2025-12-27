@@ -68,12 +68,26 @@ function stableHash(str) {
   return (h >>> 0).toString(16);
 }
 
+function isGarbageJobName(name) {
+  const lc = String(name || '').trim().toLowerCase();
+  return (
+    lc === 'cancel' ||
+    lc === 'show active jobs' ||
+    lc === 'active jobs' ||
+    lc === 'change job' ||
+    lc === 'switch job' ||
+    lc === 'pick job'
+  );
+}
+
 function dedupeJobs(list) {
   const out = [];
   const seen = new Set();
   for (const j of list || []) {
     const s = String(j || '').trim();
     if (!s) continue;
+    if (isGarbageJobName(s)) continue;
+
     const key = s.toLowerCase().replace(/\s+/g, ' ');
     if (seen.has(key)) continue;
     seen.add(key);
@@ -220,6 +234,88 @@ async function sendWhatsAppListPicker({ to, body, button, items, cacheKey }) {
   return msg;
 }
 
+/* ---------------- Active job persistence (CRITICAL for expense auto-attach) ---------------- */
+
+async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNameFallback }) {
+  const userId =
+    userProfile?.id ||
+    userProfile?.user_id ||
+    userProfile?.userId ||
+    null;
+
+  if (!userId) {
+    console.warn('[JOB] persistActiveJobBestEffort: missing userId on userProfile');
+    return false;
+  }
+
+  const jobId = jobRow?.id || jobRow?.job_id || null;
+  const jobName = (jobRow?.name || jobRow?.job_name || jobNameFallback || '').trim();
+
+  // Prefer known helper functions if they exist in services/postgres
+  const fnCandidates = [
+    'setActiveJobForUser',
+    'setUserActiveJob',
+    'updateUserActiveJob',
+    'saveActiveJob',
+    'setActiveJob'
+  ];
+
+  for (const fn of fnCandidates) {
+    if (typeof pg[fn] === 'function') {
+      try {
+        await pg[fn](String(ownerId), String(userId), jobId, jobName);
+        console.info('[JOB] persisted active job via pg.' + fn, { ownerId, userId, jobId, jobName });
+        return true;
+      } catch (e) {
+        console.warn('[JOB] pg.' + fn + ' failed:', e?.message);
+      }
+    }
+  }
+
+  // Fall back to direct SQL attempts (fail-open across schema variants)
+  const sqlAttempts = [
+    {
+      label: 'public.users',
+      sql: `UPDATE public.users
+              SET active_job_id = COALESCE($3, active_job_id),
+                  active_job_name = COALESCE(NULLIF($4,''), active_job_name),
+                  updated_at = NOW()
+            WHERE owner_id = $1 AND id = $2`
+    },
+    {
+      label: 'public.user_profiles',
+      sql: `UPDATE public.user_profiles
+              SET active_job_id = COALESCE($3, active_job_id),
+                  active_job_name = COALESCE(NULLIF($4,''), active_job_name),
+                  updated_at = NOW()
+            WHERE owner_id = $1 AND user_id = $2`
+    },
+    {
+      label: 'public.memberships',
+      sql: `UPDATE public.memberships
+              SET active_job_id = COALESCE($3, active_job_id),
+                  active_job_name = COALESCE(NULLIF($4,''), active_job_name),
+                  updated_at = NOW()
+            WHERE owner_id = $1 AND user_id = $2`
+    }
+  ];
+
+  for (const a of sqlAttempts) {
+    try {
+      const r = await pg.query(a.sql, [String(ownerId), String(userId), jobId, jobName]);
+      if (r?.rowCount) {
+        console.info('[JOB] persisted active job via SQL', { table: a.label, ownerId, userId, jobId, jobName });
+        return true;
+      }
+    } catch {
+      // ignore missing schema/table/columns
+    }
+  }
+
+  console.warn('[JOB] persistActiveJobBestEffort: no persistence route succeeded');
+  return false;
+}
+
 /* ---------------- DB helpers ---------------- */
 
 async function listJobs(ownerId) {
@@ -290,10 +386,13 @@ function buildPickerMap(jobs, page, perPage) {
   const slice = jobs.slice(start, start + perPage);
   const map = {};
 
+  // absolute numeric indices
   for (let i = 0; i < slice.length; i++) {
     const idx = start + i + 1;
     map[String(idx)] = slice[i];
   }
+
+  // names
   for (const j of slice) {
     map[String(j).toLowerCase()] = j;
   }
@@ -329,7 +428,6 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobs, pa
     activeJobPickTotal: uniq.length
   });
 
-  // ---- IMPORTANT DEBUG LOGS ----
   console.info('[JOB_PICKER] render', {
     enableListPicker: ENABLE_LIST_PICKER,
     hasTo: !!to,
@@ -410,6 +508,7 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
 
   // ✅ If picker is open, DO NOT treat "cancel"/"show active jobs"/"change job" as a job name.
   const pending = await getPendingTransactionState(fromPhone);
+
   if (pending?.awaitingActiveJobPick) {
     if (isCancelLike(lc)) {
       await clearPickerState(fromPhone);
@@ -417,7 +516,6 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
     }
 
     if (isPickerOpenCommand(lc)) {
-      // user asked again → re-render picker (page 0)
       const jobs = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
       return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs, page: 0, perPage: 8 });
     }
@@ -432,12 +530,10 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
 
     const jobName = resolved && String(resolved).trim() ? String(resolved).trim() : null;
 
-    // If the reply is unknown, DON'T activate it. Ask again.
     if (!jobName) {
       return respond(res, `⚠️ I didn’t catch that. Reply with a number, job name, "Overhead", or "more".`);
     }
 
-    // Guard: prevent activating obvious command strings
     if (isPickerOpenCommand(jobName.toLowerCase()) || isCancelLike(jobName.toLowerCase())) {
       return respond(res, `⚠️ Reply with a number or a job name from the list (or "cancel").`);
     }
@@ -450,6 +546,15 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
 
     try {
       const j = await pg.activateJobByName(owner, jobName);
+
+      // ✅ CRITICAL: persist active job onto user profile so expense.js can auto-attach
+      await persistActiveJobBestEffort({
+        ownerId: owner,
+        userProfile,
+        jobRow: j,
+        jobNameFallback: jobName
+      });
+
       const finalName = j?.name || j?.job_name || jobName;
       const jobNo = j?.job_no ?? '?';
 
@@ -480,6 +585,15 @@ Now you can:
     if (!name) return respond(res, `Which job should I set active? Try: "active job Oak Street"`);
 
     const j = await pg.activateJobByName(owner, name);
+
+    // ✅ CRITICAL: persist active job onto user profile so expense.js can auto-attach
+    await persistActiveJobBestEffort({
+      ownerId: owner,
+      userProfile,
+      jobRow: j,
+      jobNameFallback: name
+    });
+
     const jobName = j?.name || j?.job_name || name;
     const jobNo = j?.job_no ?? '?';
 

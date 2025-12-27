@@ -6,6 +6,10 @@
 const pg = require('../../services/postgres');
 const state = require('../../utils/stateManager');
 
+// ✅ fetch polyfill so list-picker doesn't silently fall back if fetch isn't present
+// If you're on Node 18+ this is already available, but this keeps it bulletproof.
+const fetch = global.fetch || require('node-fetch');
+
 const getPendingTransactionState = state.getPendingTransactionState;
 const deletePendingTransactionState =
   state.deletePendingTransactionState ||
@@ -266,10 +270,6 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNam
   const jobNo = jobRow?.job_no ?? jobRow?.jobNo ?? null;
   const jobName = String(jobRow?.name || jobRow?.job_name || jobNameFallback || '').trim() || null;
 
-  // Best reference order:
-  // 1) uuid jobId (enables per-user active job if user_active_job table exists)
-  // 2) job_no
-  // 3) job name
   const jobRef = jobId || jobNo || jobName;
 
   // 1) Canonical: pg.setActiveJob(ownerId, userId, jobRef)
@@ -284,24 +284,17 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNam
   }
 
   // 2) Legacy helper candidates (unknown signatures; try safe call patterns)
-  const fnCandidates = [
-    'setActiveJobForUser',
-    'setUserActiveJob',
-    'updateUserActiveJob',
-    'saveActiveJob'
-  ];
+  const fnCandidates = ['setActiveJobForUser', 'setUserActiveJob', 'updateUserActiveJob', 'saveActiveJob'];
 
   for (const fn of fnCandidates) {
     if (typeof pg[fn] !== 'function') continue;
 
     try {
-      // Try (owner, user, jobId, jobName) (older patterns)
       await pg[fn](owner, String(userId), jobId || null, jobName || null);
       console.info('[JOB] persisted active job via pg.' + fn, { owner, userId, jobId, jobName });
       return true;
     } catch (e1) {
       try {
-        // Try (owner, user, jobRef) (newer patterns)
         await pg[fn](owner, String(userId), String(jobRef || ''));
         console.info('[JOB] persisted active job via pg.' + fn, { owner, userId, jobRef });
         return true;
@@ -312,7 +305,6 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNam
   }
 
   // 3) Fall back to direct SQL attempts (fail-open across schema variants)
-  // Note: jobId might be null if you only have job_no/name. We still store name if possible.
   const sqlAttempts = [
     {
       label: 'public.users (id)',
@@ -554,7 +546,6 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
   const msg = String(text || '').trim();
   const lc = msg.toLowerCase();
 
-  // ✅ If picker is open, DO NOT treat "cancel"/"show active jobs"/"change job" as a job name.
   const pending = await getPendingTransactionState(fromPhone);
 
   if (pending?.awaitingActiveJobPick) {
@@ -593,19 +584,15 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
       return respond(res, `⚠️ Reply with a number or a job name from the list (or "cancel").`);
     }
 
-    // ✅ close picker regardless
     await clearPickerState(fromPhone);
 
-    // ✅ overhead = do NOT attempt activation
     if (jobName === 'Overhead') {
-      // Optional: clear persisted active job if you later support it
       return respond(res, `✅ Okay — using Overhead (no active job).`);
     }
 
     try {
       const j = await pg.activateJobByName(owner, jobName);
 
-      // ✅ CRITICAL: persist active job (ALIGNED with postgres.js setActiveJob signature)
       await persistActiveJobBestEffort({
         ownerId: owner,
         userProfile,
@@ -631,20 +618,17 @@ Now you can:
     }
   }
 
-  // ✅ Picker commands (global)
   if (isPickerOpenCommand(lc)) {
     const jobs = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
     return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs, page: 0, perPage: 8 });
   }
 
-  // Active job by name (direct)
   if (/^(active\s+job|set\s+active|switch\s+job)\b/i.test(msg)) {
     const name = msg.replace(/^(active\s+job|set\s+active|switch\s+job)\b/i, '').trim();
     if (!name) return respond(res, `Which job should I set active? Try: "active job Oak Street"`);
 
     const j = await pg.activateJobByName(owner, name);
 
-    // ✅ CRITICAL: persist active job (ALIGNED)
     await persistActiveJobBestEffort({
       ownerId: owner,
       userProfile,
@@ -666,13 +650,11 @@ Now you can:
     );
   }
 
-  // List jobs
   if (/^(jobs|list jobs|show jobs)\b/i.test(msg)) {
     const reply = await listJobs(owner);
     return respond(res, reply);
   }
 
-  // Create job
   if (/^(create|new)\s+job\b/i.test(msg)) {
     const name = msg.replace(/^(create|new)\s+job\b/i, '').trim();
 
@@ -695,7 +677,7 @@ Now you can:
 Next:
 - Switch: "change job"
 - Time: "clock in @ ${jobName}"
-- Expense: "expense 84.12 nails from Home Depot"`
+- Expense: "expense 84.12 nails from Home Depot today"`
       );
     }
 

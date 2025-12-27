@@ -3,6 +3,7 @@
 // + "change job" support during confirm + job-prompt steps
 // + Active-job DB fallback resolution (so expenses auto-attach after job picker)
 // + Filters garbage job names ("cancel", "show active jobs", etc.) from pickers
+// + IMPORTANT: stores numeric map so replying "1" works reliably
 
 const pg = require('../../services/postgres');
 const { query, insertTransaction, listOpenJobs } = pg;
@@ -227,12 +228,14 @@ function buildTextJobPrompt(jobs, page, pageSize) {
   return `Which job is this expense for?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
 }
 
+// ✅ IMPORTANT: includes numeric map so replying "1" works reliably
 function buildJobPickerMapping(jobs, page, pageSize) {
   const start = page * pageSize;
   const slice = jobs.slice(start, start + pageSize);
 
-  const idMap = {}; // rowId -> jobName
+  const idMap = {};   // rowId -> jobName
   const nameMap = {}; // lower(title/desc) -> jobName
+  const numMap = {};  // "1" -> jobName (absolute index)
 
   for (let i = 0; i < slice.length; i++) {
     const absIdx = start + i + 1;
@@ -240,6 +243,7 @@ function buildJobPickerMapping(jobs, page, pageSize) {
     const rowId = `job_${absIdx}_${stableHash(fullName)}`;
 
     idMap[rowId] = fullName;
+    numMap[String(absIdx)] = fullName;
 
     nameMap[String(fullName).toLowerCase()] = fullName;
     nameMap[String(fullName).slice(0, 24).toLowerCase()] = fullName;
@@ -253,7 +257,10 @@ function buildJobPickerMapping(jobs, page, pageSize) {
   nameMap['more jobs'] = '__MORE__';
   nameMap['more'] = '__MORE__';
 
-  return { idMap, nameMap };
+  numMap['overhead'] = 'Overhead';
+  numMap['more'] = '__MORE__';
+
+  return { idMap, nameMap, numMap };
 }
 
 async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections }) {
@@ -299,13 +306,14 @@ async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize =
   const slice = uniq.slice(start, start + JOBS_PER_PAGE);
   const hasMore = start + JOBS_PER_PAGE < uniq.length;
 
-  const { idMap, nameMap } = buildJobPickerMapping(uniq, page, JOBS_PER_PAGE);
+  const { idMap, nameMap, numMap } = buildJobPickerMapping(uniq, page, JOBS_PER_PAGE);
 
   await mergePendingTransactionState(from, {
     awaitingExpenseJob: true,
     awaitingExpenseJobPage: page,
     expenseJobPickerIdMap: idMap,
     expenseJobPickerNameMap: nameMap,
+    expenseJobPickerNumMap: numMap, // ✅ store numeric map
     expenseJobPickerHasMore: hasMore,
     expenseJobPickerTotal: uniq.length
   });
@@ -499,7 +507,6 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
   const userId = extractUserId(userProfile, fromPhone);
   const phone = normalizeE164ish(fromPhone);
 
-  // Prefer a helper if you add it later
   if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
       const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
@@ -517,10 +524,7 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
     }
   }
 
-  // Best-effort across likely tables/columns.
-  // All queries are wrapped so missing table/cols fail-open.
   const attempts = [
-    // memberships by user_id
     {
       label: 'memberships by user_id',
       sql: `SELECT active_job_id, active_job_name
@@ -529,7 +533,6 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
              LIMIT 1`,
       params: [ownerParam, String(userId)]
     },
-    // memberships by phone
     {
       label: 'memberships by phone',
       sql: `SELECT active_job_id, active_job_name
@@ -538,7 +541,6 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
              LIMIT 1`,
       params: [ownerParam, phone]
     },
-    // users by id
     {
       label: 'users by id',
       sql: `SELECT active_job_id, active_job_name
@@ -547,7 +549,6 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
              LIMIT 1`,
       params: [ownerParam, String(userId)]
     },
-    // users by phone
     {
       label: 'users by phone',
       sql: `SELECT active_job_id, active_job_name
@@ -556,7 +557,6 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
              LIMIT 1`,
       params: [ownerParam, phone]
     },
-    // user_profiles by user_id
     {
       label: 'user_profiles by user_id',
       sql: `SELECT active_job_id, active_job_name
@@ -569,7 +569,6 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
 
   for (const a of attempts) {
     if (!a.params?.[1]) continue;
-    if (a.params?.[1] == null) continue;
     try {
       const r = await query(a.sql, a.params);
       const row = r?.rows?.[0];
@@ -580,9 +579,7 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
         console.info('[EXPENSE] active job fetched from DB', { where: a.label, hasName: !!name, hasId: !!id });
         return { active_job_name: name || null, active_job_id: id };
       }
-    } catch {
-      // ignore missing schema/table/columns
-    }
+    } catch {}
   }
 
   return null;
@@ -596,7 +593,6 @@ async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
 
   const directRef = userProfile?.active_job_id ?? userProfile?.activeJobId ?? null;
 
-  // If not present in userProfile, try DB fallback
   let ref = directRef;
   let name = null;
 
@@ -651,9 +647,7 @@ async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
 
 function vendorDefaultCategory(store) {
   const s = String(store || '').toLowerCase();
-  if (
-    /(home depot|homedepot|rona|lowe|lowes|home hardware|convoy|gentek|groupe|abc supply|beacon|roofmart|kent)/i.test(s)
-  ) {
+  if (/(home depot|homedepot|rona|lowe|lowes|home hardware|convoy|gentek|groupe|abc supply|beacon|roofmart|kent)/i.test(s)) {
     return 'Materials';
   }
   if (/(esso|shell|petro|ultramar|pioneer|circle\s*k)/i.test(s)) return 'Fuel';
@@ -667,9 +661,7 @@ function inferExpenseCategoryHeuristic(data) {
     /\b(lumber|plywood|drywall|shingle|shingles|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?|siding|vinyl\s*siding|soffit|fascia|eavestrough|gutter|flashing|wrap|tyvek|house\s*wrap|sheathing|osb|studs|joists|truss|paint|primer|stain)\b/.test(
       memo
     )
-  ) {
-    return 'Materials';
-  }
+  ) return 'Materials';
   if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
   if (/\b(tool|saw|drill|blade|bit|ladder|hammer)\b/.test(memo)) return 'Tools';
   if (/\b(subcontract|sub-contractor|subcontractor)\b/.test(memo)) return 'Subcontractors';
@@ -680,10 +672,7 @@ function inferExpenseCategoryHeuristic(data) {
 
 function formatMoneyDisplay(n) {
   try {
-    const fmt = new Intl.NumberFormat('en-CA', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2
-    });
+    const fmt = new Intl.NumberFormat('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return `$${fmt.format(n)}`;
   } catch {
     return `$${n.toFixed(2)}`;
@@ -922,26 +911,22 @@ function resolveJobFromReply(input, pending) {
 
   if (looksLikeOverhead(t)) return 'Overhead';
 
-  if (t.toLowerCase() === 'more' || t.toLowerCase() === 'more jobs' || t.toLowerCase() === 'more jobs…') {
-    return '__MORE__';
-  }
+  const lc = t.toLowerCase();
+  if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return '__MORE__';
 
+  // list ids / interactive ids
   if (pending?.expenseJobPickerIdMap && pending.expenseJobPickerIdMap[t]) {
     return pending.expenseJobPickerIdMap[t];
   }
 
+  // numeric picks (absolute index)
+  if (/^\d+$/.test(t) && pending?.expenseJobPickerNumMap?.[t]) {
+    return pending.expenseJobPickerNumMap[t];
+  }
+
+  // name matches
   if (pending?.expenseJobPickerNameMap) {
     const mapped = pending.expenseJobPickerNameMap[String(t).toLowerCase()];
-    if (mapped) return mapped;
-  }
-
-  if (/^\d+$/.test(t) && pending?.expenseJobPickerMap) {
-    const mapped = pending.expenseJobPickerMap[String(t)];
-    if (mapped) return mapped;
-  }
-
-  if (pending?.expenseJobPickerMap) {
-    const mapped = pending.expenseJobPickerMap[String(t).toLowerCase()];
     if (mapped) return mapped;
   }
 
@@ -998,16 +983,16 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const merged = normalizeExpenseData({ ...pending.pendingExpense, jobName: finalJob }, userProfile);
       merged.store = await normalizeVendorName(ownerId, merged.store);
-
       merged.item = stripEmbeddedDateAndJobFromItem(merged.item, { date: merged.date, jobName: merged.jobName });
 
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingExpense: merged,
         awaitingExpenseJob: false,
+        awaitingExpenseJobPage: null,
         expenseJobPickerIdMap: null,
         expenseJobPickerNameMap: null,
-        expenseJobPickerMap: null,
+        expenseJobPickerNumMap: null,
         expenseJobPickerHasMore: null,
         expenseJobPickerTotal: null
       });
@@ -1158,50 +1143,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       reply = `⚠️ Please choose Yes, Edit, or Cancel.\nTip: reply "change job" to pick a different job.`;
       return twimlText(reply);
-    }
-
-    // Quick strict-ish pattern
-    const m = String(input || '').match(
-      /^(?:expense\s+|exp\s+)?\$?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i
-    );
-    if (m) {
-      const [, amountRaw, item, store] = m;
-
-      const n = Number(String(amountRaw).replace(/,/g, ''));
-      const amount = Number.isFinite(n) && n > 0 ? formatMoneyDisplay(n) : '$0.00';
-
-      const data0 = normalizeExpenseData({ date: todayInTimeZone(tz), item, amount, store: store || 'Unknown Store' }, userProfile);
-
-      data0.store = await normalizeVendorName(ownerId, data0.store);
-
-      const category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
-
-      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-
-      if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
-
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingExpense: { ...data0, jobName, suggestedCategory: category },
-        expenseSourceMsgId: safeMsgId,
-        type: 'expense',
-        awaitingExpenseJob: !jobName,
-        awaitingExpenseJobPage: 0
-      });
-
-      if (!jobName) {
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
-      }
-
-      const summaryLine = buildExpenseSummaryLine({
-        amount: data0.amount,
-        item: data0.item,
-        store: data0.store,
-        date: data0.date,
-        jobName
-      });
-      return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
     // Backstop deterministic parse

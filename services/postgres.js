@@ -80,10 +80,13 @@ async function queryWithRetry(text, params, attempt = 1) {
     return await pool.query(text, params);
   } catch (e) {
     const msg = String(e?.message || '');
-    const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET|connection terminated|TimeoutError/i.test(msg);
+    const transient =
+      /terminated|ECONNRESET|EPIPE|read ECONNRESET|connection terminated|TimeoutError/i.test(
+        msg
+      );
     if (transient && attempt < 3) {
       console.warn(`[PG] retry ${attempt + 1}: ${msg}`);
-      await new Promise(r => setTimeout(r, attempt * 200));
+      await new Promise((r) => setTimeout(r, attempt * 200));
       return queryWithRetry(text, params, attempt + 1);
     }
     throw e;
@@ -106,11 +109,14 @@ async function withClient(fn, { useTransaction = true } = {}) {
 }
 
 async function queryWithTimeout(sql, params, ms = 9000) {
-  return withClient(async client => {
-    const timeoutMs = Math.max(0, Number(ms) | 0);
-    await client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
-    return client.query(sql, params);
-  }, { useTransaction: true });
+  return withClient(
+    async (client) => {
+      const timeoutMs = Math.max(0, Number(ms) | 0);
+      await client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
+      return client.query(sql, params);
+    },
+    { useTransaction: true }
+  );
 }
 
 /* ---------- Utilities (single source of truth) ---------- */
@@ -118,7 +124,8 @@ const DIGITS = (x) => String(x ?? '').replace(/\D/g, '');
 
 function toCents(v) {
   if (v == null || v === '') return 0;
-  const n = typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.-]/g, ''));
+  const n =
+    typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.-]/g, ''));
   if (!Number.isFinite(n)) return 0;
   return Math.round(n * 100);
 }
@@ -133,7 +140,48 @@ function todayInTZ(tz = 'America/Toronto') {
 const normalizePhoneNumber = (x) => DIGITS(x);
 
 function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(str || '')
+  );
+}
+
+/* ---------- schema helpers (cached) ---------- */
+const _TABLE_CACHE = new Map(); // table -> bool
+const _COL_CACHE = new Map(); // `${table}.${col}` -> bool
+
+async function hasColumn(table, col) {
+  const key = `${String(table)}.${String(col)}`;
+  if (_COL_CACHE.has(key)) return _COL_CACHE.get(key);
+
+  const r = await query(
+    `select 1
+       from information_schema.columns
+      where table_schema='public'
+        and table_name=$1
+        and column_name=$2
+      limit 1`,
+    [table, col]
+  );
+  const ok = (r?.rows?.length || 0) > 0;
+  _COL_CACHE.set(key, ok);
+  return ok;
+}
+
+async function hasTable(table) {
+  const t = String(table);
+  if (_TABLE_CACHE.has(t)) return _TABLE_CACHE.get(t);
+
+  const r = await query(
+    `select 1
+       from information_schema.tables
+      where table_schema='public'
+        and table_name=$1
+      limit 1`,
+    [t]
+  );
+  const ok = (r?.rows?.length || 0) > 0;
+  _TABLE_CACHE.set(t, ok);
+  return ok;
 }
 
 /* ------------------------------------------------------------------ */
@@ -149,37 +197,12 @@ function truncateText(s, maxChars = MEDIA_TRANSCRIPT_MAX_CHARS) {
   return str.length > maxChars ? str.slice(0, maxChars) : str;
 }
 
-async function hasColumn(table, col) {
-  const r = await query(
-    `select 1
-       from information_schema.columns
-      where table_schema='public'
-        and table_name=$1
-        and column_name=$2
-      limit 1`,
-    [table, col]
-  );
-  return (r?.rows?.length || 0) > 0;
-}
-
-async function hasTable(table) {
-  const r = await query(
-    `select 1
-       from information_schema.tables
-      where table_schema='public'
-        and table_name=$1
-      limit 1`,
-    [table]
-  );
-  return (r?.rows?.length || 0) > 0;
-}
-
 let TX_HAS_SOURCE_MSG_ID = null;
-let TX_HAS_AMOUNT        = null;
-let TX_HAS_MEDIA_URL     = null;
-let TX_HAS_MEDIA_TYPE    = null;
-let TX_HAS_MEDIA_TXT     = null;
-let TX_HAS_MEDIA_CONF    = null;
+let TX_HAS_AMOUNT = null;
+let TX_HAS_MEDIA_URL = null;
+let TX_HAS_MEDIA_TYPE = null;
+let TX_HAS_MEDIA_TXT = null;
+let TX_HAS_MEDIA_CONF = null;
 
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
@@ -209,22 +232,27 @@ async function detectTransactionsCapabilities() {
         where table_schema='public'
           and table_name='transactions'`
     );
-    const names = new Set(rows.map(r => String(r.column_name).toLowerCase()));
+    const names = new Set(
+      (rows || []).map((r) => String(r.column_name).toLowerCase())
+    );
 
     TX_HAS_SOURCE_MSG_ID = names.has('source_msg_id');
-    TX_HAS_AMOUNT        = names.has('amount');
-    TX_HAS_MEDIA_URL     = names.has('media_url');
-    TX_HAS_MEDIA_TYPE    = names.has('media_type');
-    TX_HAS_MEDIA_TXT     = names.has('media_transcript');
-    TX_HAS_MEDIA_CONF    = names.has('media_confidence');
+    TX_HAS_AMOUNT = names.has('amount');
+    TX_HAS_MEDIA_URL = names.has('media_url');
+    TX_HAS_MEDIA_TYPE = names.has('media_type');
+    TX_HAS_MEDIA_TXT = names.has('media_transcript');
+    TX_HAS_MEDIA_CONF = names.has('media_confidence');
   } catch (e) {
-    console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
+    console.warn(
+      '[PG/transactions] detect capabilities failed (fail-open):',
+      e?.message
+    );
     TX_HAS_SOURCE_MSG_ID = false;
-    TX_HAS_AMOUNT        = false;
-    TX_HAS_MEDIA_URL     = false;
-    TX_HAS_MEDIA_TYPE    = false;
-    TX_HAS_MEDIA_TXT     = false;
-    TX_HAS_MEDIA_CONF    = false;
+    TX_HAS_AMOUNT = false;
+    TX_HAS_MEDIA_URL = false;
+    TX_HAS_MEDIA_TYPE = false;
+    TX_HAS_MEDIA_TXT = false;
+    TX_HAS_MEDIA_CONF = false;
   }
 
   return {
@@ -238,7 +266,8 @@ async function detectTransactionsCapabilities() {
 }
 
 async function detectTransactionsUniqueOwnerSourceMsg() {
-  if (TX_HAS_OWNER_SOURCEMSG_UNIQUE !== null) return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
+  if (TX_HAS_OWNER_SOURCEMSG_UNIQUE !== null)
+    return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
 
   try {
     const { rows } = await query(
@@ -254,10 +283,15 @@ async function detectTransactionsUniqueOwnerSourceMsg() {
       `
     );
 
-    const defs = rows.map(r => String(r.def || '').toLowerCase());
-    TX_HAS_OWNER_SOURCEMSG_UNIQUE = defs.some(d => d.includes('(owner_id') && d.includes('source_msg_id'));
+    const defs = (rows || []).map((r) => String(r.def || '').toLowerCase());
+    TX_HAS_OWNER_SOURCEMSG_UNIQUE = defs.some(
+      (d) => d.includes('(owner_id') && d.includes('source_msg_id')
+    );
   } catch (e) {
-    console.warn('[PG/transactions] detect unique(owner_id,source_msg_id) failed (fail-open):', e?.message);
+    console.warn(
+      '[PG/transactions] detect unique(owner_id,source_msg_id) failed (fail-open):',
+      e?.message
+    );
     TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
   }
 
@@ -267,11 +301,16 @@ async function detectTransactionsUniqueOwnerSourceMsg() {
 function normalizeMediaMeta(mediaMeta) {
   if (!mediaMeta || typeof mediaMeta !== 'object') return null;
 
-  const url = String(mediaMeta.url || mediaMeta.media_url || '').trim() || null;
-  const type = String(mediaMeta.type || mediaMeta.media_type || '').trim() || null;
+  const url =
+    String(mediaMeta.url || mediaMeta.media_url || '').trim() || null;
+  const type =
+    String(mediaMeta.type || mediaMeta.media_type || '').trim() || null;
 
-  const transcriptRaw = mediaMeta.transcript || mediaMeta.media_transcript || null;
-  const transcript = transcriptRaw ? truncateText(transcriptRaw, MEDIA_TRANSCRIPT_MAX_CHARS) : null;
+  const transcriptRaw =
+    mediaMeta.transcript || mediaMeta.media_transcript || null;
+  const transcript = transcriptRaw
+    ? truncateText(transcriptRaw, MEDIA_TRANSCRIPT_MAX_CHARS)
+    : null;
 
   const conf = mediaMeta.confidence ?? mediaMeta.media_confidence ?? null;
   const confidence = Number.isFinite(Number(conf)) ? Number(conf) : null;
@@ -300,20 +339,24 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const amountMaybe = opts.amount;
 
   const source = String(opts.source || '').trim() || 'Unknown';
-  const job = (opts.job == null ? null : String(opts.job).trim() || null);
-  const jobName = (opts.job_name ?? opts.jobName ?? job);
-  const category = (opts.category == null ? null : String(opts.category).trim() || null);
-  const userName = (opts.user_name ?? opts.userName ?? null);
-  const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
+  const job = opts.job == null ? null : String(opts.job).trim() || null;
+  const jobName = opts.job_name ?? opts.jobName ?? job;
+  const category =
+    opts.category == null ? null : String(opts.category).trim() || null;
+  const userName = opts.user_name ?? opts.userName ?? null;
+  const sourceMsgId =
+    String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
 
   if (!owner) throw new Error('insertTransaction missing ownerId');
   if (!kind) throw new Error('insertTransaction missing kind');
   if (!date) throw new Error('insertTransaction missing date');
-  if (!amountCents || amountCents <= 0) throw new Error('insertTransaction invalid amount_cents');
+  if (!amountCents || amountCents <= 0)
+    throw new Error('insertTransaction invalid amount_cents');
 
   const caps = await detectTransactionsCapabilities();
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
 
+  // best-effort idempotency pre-check (even if ON CONFLICT not available)
   if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
     try {
       const exists = await queryWithTimeout(
@@ -321,9 +364,13 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
         [owner, sourceMsgId],
         Math.min(2500, timeoutMs)
       );
-      if (exists?.rows?.length) return { inserted: false, id: exists.rows[0].id };
+      if (exists?.rows?.length)
+        return { inserted: false, id: exists.rows[0].id };
     } catch (e) {
-      console.warn('[PG/transactions] idempotency pre-check failed (ignored):', e?.message);
+      console.warn(
+        '[PG/transactions] idempotency pre-check failed (ignored):',
+        e?.message
+      );
     }
   }
 
@@ -352,7 +399,9 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     kind,
     date,
     description,
-    ...(caps.TX_HAS_AMOUNT ? [Number.isFinite(Number(amountMaybe)) ? Number(amountMaybe) : null] : []),
+    ...(caps.TX_HAS_AMOUNT
+      ? [Number.isFinite(Number(amountMaybe)) ? Number(amountMaybe) : null]
+      : []),
     amountCents,
     source,
     job,
@@ -396,10 +445,14 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     const code = String(e?.code || '');
     const looksConflictUnsupported =
       canIdempotent &&
-      (code === '42P10' || msg.includes('there is no unique or exclusion constraint') || msg.includes('on conflict'));
+      (code === '42P10' ||
+        msg.includes('there is no unique or exclusion constraint') ||
+        msg.includes('on conflict'));
 
     if (looksConflictUnsupported) {
-      console.warn('[PG/transactions] ON CONFLICT unsupported; retrying without conflict clause');
+      console.warn(
+        '[PG/transactions] ON CONFLICT unsupported; retrying without conflict clause'
+      );
       TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
       const sql2 = `
         insert into public.transactions (${cols.join(', ')})
@@ -433,7 +486,9 @@ async function getLatestTimeEvent(ownerId, employeeName) {
 
 // ---------- Per-owner safe job_no allocator ----------
 async function withOwnerAllocLock(owner, client) {
-  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [String(owner)]);
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [
+    String(owner)
+  ]);
 }
 
 async function allocateNextJobNo(owner, client) {
@@ -448,9 +503,9 @@ async function allocateNextJobNo(owner, client) {
 
 // Find or create a job by name (case-insensitive on name or job_name).
 // Robust against races and job_no duplicates: allocate job_no under advisory lock.
-// ✅ Modified: returns { id, job_no, name, is_active }
+// ✅ returns { id, job_no, name, is_active }
 async function ensureJobByName(ownerId, name) {
-  const owner   = DIGITS(ownerId);
+  const owner = DIGITS(ownerId);
   const jobName = String(name || '').trim();
   if (!jobName) return null;
 
@@ -506,7 +561,10 @@ async function ensureJobByName(ownerId, name) {
   });
 }
 
-async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
+async function resolveJobContext(
+  ownerId,
+  { explicitJobName, require = false, fallbackName } = {}
+) {
   const owner = DIGITS(ownerId);
   if (explicitJobName) {
     const j = await ensureJobByName(owner, explicitJobName);
@@ -536,7 +594,14 @@ async function resolveJobContext(ownerId, { explicitJobName, require = false, fa
  * - also avoids duplicates by (owner_id, job_name case-insensitive) if already exists
  * - allocates job_no under per-owner advisory lock
  */
-async function createJobIdempotent({ ownerId, jobName, name, sourceMsgId, status = 'open', active = true } = {}) {
+async function createJobIdempotent({
+  ownerId,
+  jobName,
+  name,
+  sourceMsgId,
+  status = 'open',
+  active = true
+} = {}) {
   const owner = DIGITS(ownerId);
   const cleanName = String(jobName || name || '').trim() || 'Untitled Job';
   const msgId = String(sourceMsgId || '').trim() || null;
@@ -557,7 +622,12 @@ async function createJobIdempotent({ ownerId, jobName, name, sourceMsgId, status
           LIMIT 1`,
         [owner, msgId]
       );
-      if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
+      if (existing.rowCount)
+        return {
+          inserted: false,
+          job: existing.rows[0],
+          reason: 'duplicate_message'
+        };
     }
 
     // 2) If same name exists, return it
@@ -570,7 +640,12 @@ async function createJobIdempotent({ ownerId, jobName, name, sourceMsgId, status
         LIMIT 1`,
       [owner, cleanName]
     );
-    if (existingByName.rowCount) return { inserted: false, job: existingByName.rows[0], reason: 'already_exists' };
+    if (existingByName.rowCount)
+      return {
+        inserted: false,
+        job: existingByName.rows[0],
+        reason: 'already_exists'
+      };
 
     // 3) allocate next job_no
     const nextNo = await allocateNextJobNo(owner, client);
@@ -600,7 +675,12 @@ async function createJobIdempotent({ ownerId, jobName, name, sourceMsgId, status
             LIMIT 1`,
           [owner, msgId]
         );
-        if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
+        if (existing.rowCount)
+          return {
+            inserted: false,
+            job: existing.rows[0],
+            reason: 'duplicate_message'
+          };
       }
       // If name raced, fetch by name
       if (e && e.code === '23505') {
@@ -613,7 +693,12 @@ async function createJobIdempotent({ ownerId, jobName, name, sourceMsgId, status
             LIMIT 1`,
           [owner, cleanName]
         );
-        if (byName.rowCount) return { inserted: false, job: byName.rows[0], reason: 'already_exists' };
+        if (byName.rowCount)
+          return {
+            inserted: false,
+            job: byName.rows[0],
+            reason: 'already_exists'
+          };
       }
       throw e;
     }
@@ -623,7 +708,7 @@ async function createJobIdempotent({ ownerId, jobName, name, sourceMsgId, status
 // Upsert a job by name, deactivate others, and activate this one
 async function activateJobByName(ownerId, rawName) {
   const owner = DIGITS(ownerId);
-  const name  = String(rawName || '').trim();
+  const name = String(rawName || '').trim();
   if (!name) throw new Error('Missing job name');
 
   const j = await ensureJobByName(owner, name);
@@ -653,8 +738,13 @@ async function activateJobByName(ownerId, rawName) {
       LIMIT 1`,
     [owner, jobNo]
   );
-  const final = rows[0] || { id: j?.id || null, job_no: jobNo, name, active: true };
-  console.info('[PG] activated job', { owner, job_no: final.job_no, name: final.name });
+  const final =
+    rows[0] || { id: j?.id || null, job_no: jobNo, name, active: true };
+  console.info('[PG] activated job', {
+    owner,
+    job_no: final.job_no,
+    name: final.name
+  });
   return final;
 }
 
@@ -671,14 +761,7 @@ let _HAS_USER_ACTIVE_JOB_TABLE = null;
 async function detectUserActiveJobTable() {
   if (_HAS_USER_ACTIVE_JOB_TABLE !== null) return _HAS_USER_ACTIVE_JOB_TABLE;
   try {
-    const r = await query(
-      `select 1
-         from information_schema.tables
-        where table_schema='public'
-          and table_name='user_active_job'
-        limit 1`
-    );
-    _HAS_USER_ACTIVE_JOB_TABLE = (r?.rows?.length || 0) > 0;
+    _HAS_USER_ACTIVE_JOB_TABLE = await hasTable('user_active_job');
   } catch {
     _HAS_USER_ACTIVE_JOB_TABLE = false;
   }
@@ -703,7 +786,10 @@ async function getActiveJob(ownerId, userId = null) {
       );
       if (rows[0]) return rows[0];
     } catch (e) {
-      console.warn('[PG/getActiveJob] user_active_job lookup failed (ignored):', e?.message);
+      console.warn(
+        '[PG/getActiveJob] user_active_job lookup failed (ignored):',
+        e?.message
+      );
     }
   }
 
@@ -743,9 +829,7 @@ async function setActiveJob(ownerId, userId, jobRef) {
   // If user_active_job exists and caller gave a uuid id, try to use it
   if (userId && (await detectUserActiveJobTable())) {
     const ref = String(jobRef || '').trim();
-    const looksUuid =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(ref);
-    if (looksUuid) {
+    if (looksLikeUuid(ref)) {
       await query(
         `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
          values ($1,$2,$3,now())
@@ -810,23 +894,38 @@ async function detectActiveJobCaps() {
     caps.has_users = await hasTable('users');
     if (caps.has_users) {
       caps.users_has_active_job_id = await hasColumn('users', 'active_job_id');
-      caps.users_has_active_job_name = await hasColumn('users', 'active_job_name');
+      caps.users_has_active_job_name = await hasColumn(
+        'users',
+        'active_job_name'
+      );
     }
   } catch {}
 
   try {
     caps.has_memberships = await hasTable('memberships');
     if (caps.has_memberships) {
-      caps.memberships_has_active_job_id = await hasColumn('memberships', 'active_job_id');
-      caps.memberships_has_active_job_name = await hasColumn('memberships', 'active_job_name');
+      caps.memberships_has_active_job_id = await hasColumn(
+        'memberships',
+        'active_job_id'
+      );
+      caps.memberships_has_active_job_name = await hasColumn(
+        'memberships',
+        'active_job_name'
+      );
     }
   } catch {}
 
   try {
     caps.has_user_profiles = await hasTable('user_profiles');
     if (caps.has_user_profiles) {
-      caps.user_profiles_has_active_job_id = await hasColumn('user_profiles', 'active_job_id');
-      caps.user_profiles_has_active_job_name = await hasColumn('user_profiles', 'active_job_name');
+      caps.user_profiles_has_active_job_id = await hasColumn(
+        'user_profiles',
+        'active_job_id'
+      );
+      caps.user_profiles_has_active_job_name = await hasColumn(
+        'user_profiles',
+        'active_job_name'
+      );
     }
   } catch {}
 
@@ -881,20 +980,21 @@ async function resolveJobIdAndName(ownerId, jobId, jobName) {
 
 /**
  * ✅ setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName)
- * This is the canonical "persist active job" API used by job.js and others.
+ * Canonical "persist active job" API used by job.js and others.
  */
 async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   const owner = DIGITS(ownerId);
   const userId = DIGITS(userIdOrPhone);
 
-  if (!owner || !userId) throw new Error('setActiveJobForIdentity missing ownerId/userId');
+  if (!owner || !userId)
+    throw new Error('setActiveJobForIdentity missing ownerId/userId');
 
   const caps = await detectActiveJobCaps();
   const resolved = await resolveJobIdAndName(owner, jobId, jobName);
   const id = resolved.id || null;
   const name = resolved.name || (jobName ? String(jobName).trim() : null);
 
-  // 1) Preferred: store on public.users if columns exist (this matches your middleware + profiles best)
+  // 1) Preferred: store on public.users if columns exist
   if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
     try {
       const sets = [];
@@ -910,9 +1010,9 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
         params.push(name);
       }
 
-      // update timestamp if it exists
-      const hasUpdatedAt = await hasColumn('users', 'updated_at').catch(() => false);
-      if (hasUpdatedAt) sets.push(`updated_at = now()`);
+      if (await hasColumn('users', 'updated_at').catch(() => false)) {
+        sets.push(`updated_at = now()`);
+      }
 
       if (sets.length) {
         const r = await query(
@@ -922,7 +1022,12 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
           params
         );
         if (r?.rowCount) {
-          console.info('[PG/activeJob] set via users', { owner, userId, hasId: !!id, hasName: !!name });
+          console.info('[PG/activeJob] set via users', {
+            owner,
+            userId,
+            hasId: !!id,
+            hasName: !!name
+          });
           return true;
         }
       }
@@ -947,8 +1052,9 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
         params.push(name);
       }
 
-      const hasUpdatedAt = await hasColumn('memberships', 'updated_at').catch(() => false);
-      if (hasUpdatedAt) sets.push(`updated_at = now()`);
+      if (await hasColumn('memberships', 'updated_at').catch(() => false)) {
+        sets.push(`updated_at = now()`);
+      }
 
       if (sets.length) {
         const r = await query(
@@ -958,12 +1064,20 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
           params
         );
         if (r?.rowCount) {
-          console.info('[PG/activeJob] set via memberships', { owner, userId, hasId: !!id, hasName: !!name });
+          console.info('[PG/activeJob] set via memberships', {
+            owner,
+            userId,
+            hasId: !!id,
+            hasName: !!name
+          });
           return true;
         }
       }
     } catch (e) {
-      console.warn('[PG/activeJob] memberships update failed (ignored):', e?.message);
+      console.warn(
+        '[PG/activeJob] memberships update failed (ignored):',
+        e?.message
+      );
     }
   }
 
@@ -983,8 +1097,9 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
         params.push(name);
       }
 
-      const hasUpdatedAt = await hasColumn('user_profiles', 'updated_at').catch(() => false);
-      if (hasUpdatedAt) sets.push(`updated_at = now()`);
+      if (await hasColumn('user_profiles', 'updated_at').catch(() => false)) {
+        sets.push(`updated_at = now()`);
+      }
 
       if (sets.length) {
         const r = await query(
@@ -994,12 +1109,20 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
           params
         );
         if (r?.rowCount) {
-          console.info('[PG/activeJob] set via user_profiles', { owner, userId, hasId: !!id, hasName: !!name });
+          console.info('[PG/activeJob] set via user_profiles', {
+            owner,
+            userId,
+            hasId: !!id,
+            hasName: !!name
+          });
           return true;
         }
       }
     } catch (e) {
-      console.warn('[PG/activeJob] user_profiles update failed (ignored):', e?.message);
+      console.warn(
+        '[PG/activeJob] user_profiles update failed (ignored):',
+        e?.message
+      );
     }
   }
 
@@ -1013,19 +1136,24 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
            set job_id=excluded.job_id, updated_at=now()`,
         [owner, String(userId), id]
       );
-      console.info('[PG/activeJob] set via user_active_job', { owner, userId, jobId: id });
+      console.info('[PG/activeJob] set via user_active_job', {
+        owner,
+        userId,
+        jobId: id
+      });
       return true;
     } catch (e) {
-      console.warn('[PG/activeJob] user_active_job upsert failed (ignored):', e?.message);
+      console.warn(
+        '[PG/activeJob] user_active_job upsert failed (ignored):',
+        e?.message
+      );
     }
   }
 
-  console.warn('[PG/activeJob] setActiveJobForIdentity: no persistence route succeeded', {
-    owner,
-    userId,
-    hasId: !!id,
-    hasName: !!name
-  });
+  console.warn(
+    '[PG/activeJob] setActiveJobForIdentity: no persistence route succeeded',
+    { owner, userId, hasId: !!id, hasName: !!name }
+  );
   return false;
 }
 
@@ -1040,7 +1168,7 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
 
   const caps = await detectActiveJobCaps();
 
-  // 1) users table (preferred if columns exist)
+  // 1) users
   if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
     try {
       const cols = [];
@@ -1055,7 +1183,10 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       );
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        return { active_job_id: row.active_job_id ?? null, active_job_name: row.active_job_name ?? null };
+        return {
+          active_job_id: row.active_job_id ?? null,
+          active_job_name: row.active_job_name ?? null
+        };
       }
     } catch (e) {
       console.warn('[PG/activeJob] users read failed (ignored):', e?.message);
@@ -1077,10 +1208,16 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       );
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        return { active_job_id: row.active_job_id ?? null, active_job_name: row.active_job_name ?? null };
+        return {
+          active_job_id: row.active_job_id ?? null,
+          active_job_name: row.active_job_name ?? null
+        };
       }
     } catch (e) {
-      console.warn('[PG/activeJob] memberships read failed (ignored):', e?.message);
+      console.warn(
+        '[PG/activeJob] memberships read failed (ignored):',
+        e?.message
+      );
     }
   }
 
@@ -1099,10 +1236,16 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       );
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        return { active_job_id: row.active_job_id ?? null, active_job_name: row.active_job_name ?? null };
+        return {
+          active_job_id: row.active_job_id ?? null,
+          active_job_name: row.active_job_name ?? null
+        };
       }
     } catch (e) {
-      console.warn('[PG/activeJob] user_profiles read failed (ignored):', e?.message);
+      console.warn(
+        '[PG/activeJob] user_profiles read failed (ignored):',
+        e?.message
+      );
     }
   }
 
@@ -1120,10 +1263,16 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       );
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        return { active_job_id: row.active_job_id ?? null, active_job_name: row.active_job_name ?? null };
+        return {
+          active_job_id: row.active_job_id ?? null,
+          active_job_name: row.active_job_name ?? null
+        };
       }
     } catch (e) {
-      console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
+      console.warn(
+        '[PG/activeJob] user_active_job read failed (ignored):',
+        e?.message
+      );
     }
   }
 
@@ -1137,16 +1286,26 @@ async function generateOTP(userId) {
   const uid = DIGITS(userId);
   const otp = crypto.randomInt(100000, 1000000).toString();
   const expiry = new Date(Date.now() + 10 * 60 * 1000);
-  await query(`UPDATE public.users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`, [otp, expiry, uid]);
+  await query(`UPDATE public.users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`, [
+    otp,
+    expiry,
+    uid
+  ]);
   return otp;
 }
 
 async function verifyOTP(userId, otp) {
   const uid = DIGITS(userId);
-  const { rows } = await query(`SELECT otp, otp_expiry FROM public.users WHERE user_id=$1`, [uid]);
+  const { rows } = await query(
+    `SELECT otp, otp_expiry FROM public.users WHERE user_id=$1`,
+    [uid]
+  );
   const user = rows[0];
   const ok = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
-  if (ok) await query(`UPDATE public.users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [uid]);
+  if (ok)
+    await query(`UPDATE public.users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [
+      uid
+    ]);
   return ok;
 }
 
@@ -1171,7 +1330,10 @@ async function saveUserProfile(p) {
   const vals = Object.values(p);
   const insCols = keys.join(', ');
   const insVals = keys.map((_, i) => `$${i + 1}`).join(', ');
-  const upd = keys.filter((k) => k !== 'user_id').map((k) => `${k}=EXCLUDED.${k}`).join(', ');
+  const upd = keys
+    .filter((k) => k !== 'user_id')
+    .map((k) => `${k}=EXCLUDED.${k}`)
+    .join(', ');
   const { rows } = await query(
     `INSERT INTO public.users (${insCols}) VALUES (${insVals})
      ON CONFLICT (user_id) DO UPDATE SET ${upd}
@@ -1182,37 +1344,61 @@ async function saveUserProfile(p) {
 }
 
 async function getUserProfile(userId) {
-  const { rows } = await query(`SELECT * FROM public.users WHERE user_id=$1`, [DIGITS(userId)]);
+  const { rows } = await query(`SELECT * FROM public.users WHERE user_id=$1`, [
+    DIGITS(userId)
+  ]);
   return rows[0] || null;
 }
 
 async function getOwnerProfile(ownerId) {
-  const { rows } = await query(`SELECT * FROM public.users WHERE user_id=$1`, [DIGITS(ownerId)]);
+  const { rows } = await query(`SELECT * FROM public.users WHERE user_id=$1`, [
+    DIGITS(ownerId)
+  ]);
   return rows[0] || null;
 }
 
 // ---------- Tasks ----------
-async function createTask({ ownerId, createdBy, assignedTo, title, body, type = 'general', dueAt, jobNo }) {
+async function createTask({
+  ownerId,
+  createdBy,
+  assignedTo,
+  title,
+  body,
+  type = 'general',
+  dueAt,
+  jobNo
+}) {
   const { rows } = await query(
     `INSERT INTO public.tasks
        (owner_id, created_by, assigned_to, title, body, type, due_at, job_no, created_at, updated_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
      RETURNING *`,
-    [DIGITS(ownerId), DIGITS(createdBy), assignedTo ? DIGITS(assignedTo) : null, title, body, type, dueAt, jobNo]
+    [
+      DIGITS(ownerId),
+      DIGITS(createdBy),
+      assignedTo ? DIGITS(assignedTo) : null,
+      title,
+      body,
+      type,
+      dueAt,
+      jobNo
+    ]
   );
   return rows[0];
 }
 
 async function getTaskByNo(ownerId, taskNo) {
-  const { rows } = await query(`SELECT * FROM public.tasks WHERE owner_id=$1 AND task_no=$2 LIMIT 1`, [
-    DIGITS(ownerId),
-    taskNo
-  ]);
+  const { rows } = await query(
+    `SELECT * FROM public.tasks WHERE owner_id=$1 AND task_no=$2 LIMIT 1`,
+    [DIGITS(ownerId), taskNo]
+  );
   return rows[0] || null;
 }
 
 async function createTaskWithJob(opts) {
-  const job = await resolveJobContext(opts.ownerId, { explicitJobName: opts.jobName });
+  const job = await resolveJobContext(opts.ownerId, {
+    explicitJobName: opts.jobName
+  });
   opts.jobNo = job?.job_no || null;
   return await createTask(opts);
 }
@@ -1222,9 +1408,12 @@ let ExcelJS = null;
 async function exportTimesheetXlsx(opts) {
   if (!ExcelJS) ExcelJS = require('exceljs');
 
-  const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
+  const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } =
+    opts;
   const owner = DIGITS(ownerId);
-  const params = employeeName ? [owner, startIso, endIso, tz, employeeName] : [owner, startIso, endIso, tz];
+  const params = employeeName
+    ? [owner, startIso, endIso, tz, employeeName]
+    : [owner, startIso, endIso, tz];
 
   const { rows } = await queryWithTimeout(
     `SELECT te.employee_name,
@@ -1252,7 +1441,7 @@ async function exportTimesheetXlsx(opts) {
     { header: 'Timestamp', key: 'timestamp' },
     { header: 'Job', key: 'job_name' }
   ];
-  rows.forEach((r) => ws.addRow(r));
+  (rows || []).forEach((r) => ws.addRow(r));
 
   const buf = await wb.xlsx.writeBuffer();
   const id = crypto.randomBytes(12).toString('hex');
@@ -1274,9 +1463,12 @@ let PDFDocument = null;
 async function exportTimesheetPdf(opts) {
   if (!PDFDocument) PDFDocument = require('pdfkit');
 
-  const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
+  const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } =
+    opts;
   const owner = DIGITS(ownerId);
-  const params = employeeName ? [owner, startIso, endIso, tz, employeeName] : [owner, startIso, endIso, tz];
+  const params = employeeName
+    ? [owner, startIso, endIso, tz, employeeName]
+    : [owner, startIso, endIso, tz];
 
   const { rows } = await queryWithTimeout(
     `SELECT te.employee_name,
@@ -1303,13 +1495,22 @@ async function exportTimesheetPdf(opts) {
 
   doc
     .fontSize(16)
-    .text(`Timesheet ${startIso.slice(0, 10)} – ${endIso.slice(0, 10)}`, { align: 'center' })
+    .text(`Timesheet ${startIso.slice(0, 10)} – ${endIso.slice(0, 10)}`, {
+      align: 'center'
+    })
     .moveDown();
-  rows.forEach((r) => {
+
+  (rows || []).forEach((r) => {
     const ts = new Date(r.timestamp);
     doc
       .fontSize(10)
-      .text(`${r.employee_name} | ${r.type} | ${formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm')} | ${r.job_name || ''}`);
+      .text(
+        `${r.employee_name} | ${r.type} | ${formatInTimeZone(
+          ts,
+          r.tz,
+          'yyyy-MM-dd HH:mm'
+        )} | ${r.job_name || ''}`
+      );
   });
 
   doc.end();
@@ -1362,11 +1563,12 @@ async function savePendingAction({ ownerId, userId, kind, payload }) {
 }
 
 async function getPendingAction({ ownerId, userId }) {
+  // ✅ FIX: interval concatenation must be text
   const { rows } = await query(
     `select id, kind, payload, created_at
        from public.pending_actions
       where owner_id=$1 and user_id=$2
-        and created_at > now() - ($3 || ' minutes')::interval
+        and created_at > now() - (($3::text || ' minutes')::interval)
       order by created_at desc
       limit 1`,
     [String(ownerId).replace(/\D/g, ''), String(userId), String(PENDING_TTL_MIN)]
@@ -1378,7 +1580,7 @@ async function deletePendingAction(id) {
   await query(`delete from public.pending_actions where id=$1`, [id]);
 }
 
-// -------------------- Finance helpers (transactions + pricing_items) --------------------
+/* -------------------- Finance helpers (transactions + pricing_items) -------------------- */
 
 async function getOwnerPricingItems(ownerId) {
   const ownerKey = String(ownerId);
@@ -1426,7 +1628,8 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
   }
 
   const profit = totalRevenue - totalExpense;
-  const marginPct = totalRevenue > 0 ? Math.round((profit / totalRevenue) * 1000) / 10 : null;
+  const marginPct =
+    totalRevenue > 0 ? Math.round((profit / totalRevenue) * 1000) / 10 : null;
 
   return {
     total_expense_cents: totalExpense,
@@ -1464,7 +1667,8 @@ async function getOwnerJobsFinance(ownerId) {
     const revenue = Number(r.revenue_cents) || 0;
     const expense = Number(r.expense_cents) || 0;
     const profit = revenue - expense;
-    const margin_pct = revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
+    const margin_pct =
+      revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
 
     return {
       job_id: r.id,
@@ -1508,7 +1712,8 @@ async function getOwnerMonthlyFinance(ownerId, monthStart) {
   }
 
   const profit = revenue - expense;
-  const margin_pct = revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
+  const margin_pct =
+    revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
 
   return {
     month_start: start,
@@ -1571,7 +1776,6 @@ async function getOwnerVendorBreakdown(ownerId, fromDate, toDate, kindFilter = '
     where += ` and kind = $4`;
   }
 
-  // Normalize vendor for grouping: trim, collapse whitespace, lower
   const { rows } = await query(
     `
       select
@@ -1602,14 +1806,7 @@ let _HAS_CATEGORY_RULES = null;
 async function detectCategoryRulesTable() {
   if (_HAS_CATEGORY_RULES !== null) return _HAS_CATEGORY_RULES;
   try {
-    const r = await query(
-      `select 1
-         from information_schema.tables
-        where table_schema='public'
-          and table_name='category_rules'
-        limit 1`
-    );
-    _HAS_CATEGORY_RULES = (r?.rows?.length || 0) > 0;
+    _HAS_CATEGORY_RULES = await hasTable('category_rules');
   } catch {
     _HAS_CATEGORY_RULES = false;
   }
@@ -1627,11 +1824,14 @@ function normalizeCategoryString(category) {
   if (t === 'material' || t === 'materials' || t === 'mat') return 'Materials';
   if (t === 'fuel' || t === 'gas') return 'Fuel';
   if (t === 'tool' || t === 'tools' || t === 'equipment') return 'Tools';
-  if (t === 'sub' || t === 'subs' || t === 'subcontractor' || t === 'subcontractors') return 'Subcontractors';
+  if (t === 'sub' || t === 'subs' || t === 'subcontractor' || t === 'subcontractors')
+    return 'Subcontractors';
   if (t === 'office' || t === 'office supplies') return 'Office Supplies';
 
   // Title-case fallback
-  return s.replace(/\s+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  return s
+    .replace(/\s+/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function normalizeVendorString(v) {
@@ -1639,24 +1839,22 @@ function normalizeVendorString(v) {
   s = s.replace(/\s+/g, ' ');
   if (!s) return 'Unknown Store';
 
-  // remove some common trailing junk (optional / conservative)
-  s = s.replace(/\s+#\d+$/i, '');                 // "Home Depot #123"
+  s = s.replace(/\s+#\d+$/i, ''); // "Home Depot #123"
   s = s.replace(/\s+(inc|ltd|limited)\.?$/i, ''); // "Convoy Supply Ltd"
   s = s.trim();
 
-  // Simple alias map (add your common vendors here)
   const key = s.toLowerCase();
   const ALIASES = {
     'home depot': 'Home Depot',
     'the home depot': 'Home Depot',
-    'homedepot': 'Home Depot',
+    homedepot: 'Home Depot',
     'convoy supply': 'Convoy Supply',
-    'convoy': 'Convoy Supply',
-    'rona': 'RONA',
-    'lowes': "Lowe's",
+    convoy: 'Convoy Supply',
+    rona: 'RONA',
+    lowes: "Lowe's",
     'lowe’s': "Lowe's",
-    'gentek': 'Gentek',
-    'gentech': 'Gentek'
+    gentek: 'Gentek',
+    gentech: 'Gentek'
   };
 
   return ALIASES[key] || s;
@@ -1670,7 +1868,14 @@ async function normalizeVendorName(_ownerId, vendor) {
   return normalizeVendorString(vendor);
 }
 
-async function upsertCategoryRule({ ownerId, kind = 'expense', vendor, keyword = null, category, weight = 10 } = {}) {
+async function upsertCategoryRule({
+  ownerId,
+  kind = 'expense',
+  vendor,
+  keyword = null,
+  category,
+  weight = 10
+} = {}) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   const k = String(kind || 'expense').trim() || 'expense';
 
@@ -1751,7 +1956,7 @@ async function getCategorySuggestion(ownerId, kind = 'expense', vendor, itemText
         [owner, k, vendorNorm]
       );
 
-      for (const row of (r1.rows || [])) {
+      for (const row of r1.rows || []) {
         const kw = String(row.keyword || '').trim().toLowerCase();
         if (kw && text.includes(kw)) {
           return {
@@ -1802,7 +2007,7 @@ async function getCategorySuggestion(ownerId, kind = 'expense', vendor, itemText
         [owner, k]
       );
 
-      for (const row of (r3.rows || [])) {
+      for (const row of r3.rows || []) {
         const kw = String(row.keyword || '').trim().toLowerCase();
         if (kw && text.includes(kw)) {
           return {
@@ -1841,7 +2046,7 @@ async function listOpenJobs(ownerId, { limit = 8 } = {}) {
       `,
       [owner, lim]
     );
-    return (rows || []).map(r => r.job_name).filter(Boolean);
+    return (rows || []).map((r) => r.job_name).filter(Boolean);
   } catch (e) {
     console.warn('[PG/listOpenJobs] status query failed; falling back:', e?.message);
   }
@@ -1858,7 +2063,7 @@ async function listOpenJobs(ownerId, { limit = 8 } = {}) {
       `,
       [owner, lim]
     );
-    return (rows || []).map(r => r.job_name).filter(Boolean);
+    return (rows || []).map((r) => r.job_name).filter(Boolean);
   } catch (e) {
     console.warn('[PG/listOpenJobs] fallback query failed:', e?.message);
     return [];
@@ -1872,8 +2077,15 @@ let SUPPORTS_CREATED_BY = null;
 let SUPPORTS_USER_ID = null;
 let SUPPORTS_SOURCE_MSG_ID = null;
 
+// Cache whether we can safely use ON CONFLICT (owner_id,user_id,source_msg_id)
+let TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = null;
+
 async function detectTimeEntriesCapabilities() {
-  if (SUPPORTS_CREATED_BY !== null && SUPPORTS_USER_ID !== null && SUPPORTS_SOURCE_MSG_ID !== null) {
+  if (
+    SUPPORTS_CREATED_BY !== null &&
+    SUPPORTS_USER_ID !== null &&
+    SUPPORTS_SOURCE_MSG_ID !== null
+  ) {
     return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
   }
 
@@ -1884,7 +2096,7 @@ async function detectTimeEntriesCapabilities() {
         WHERE table_schema = 'public'
           AND table_name   = 'time_entries'`
     );
-    const names = new Set(rows.map((r) => String(r.column_name).toLowerCase()));
+    const names = new Set((rows || []).map((r) => String(r.column_name).toLowerCase()));
     SUPPORTS_CREATED_BY = names.has('created_by');
     SUPPORTS_USER_ID = names.has('user_id');
     SUPPORTS_SOURCE_MSG_ID = names.has('source_msg_id');
@@ -1897,17 +2109,45 @@ async function detectTimeEntriesCapabilities() {
   return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
 }
 
+async function detectTimeEntriesUniqueOwnerUserSourceMsg() {
+  if (TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE !== null) return TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE;
+  try {
+    const { rows } = await query(
+      `
+      select pg_get_indexdef(ix.indexrelid) as def
+        from pg_class t
+        join pg_namespace n on n.oid=t.relnamespace
+        join pg_index ix on ix.indrelid=t.oid
+       where n.nspname='public'
+         and t.relname='time_entries'
+         and ix.indisunique=true
+      `
+    );
+    const defs = (rows || []).map((r) => String(r.def || '').toLowerCase());
+    TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = defs.some(
+      (d) => d.includes('(owner_id') && d.includes('user_id') && d.includes('source_msg_id')
+    );
+  } catch {
+    TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = false;
+  }
+  return TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE;
+}
+
 async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
   const owner = DIGITS(ownerId);
   const actor = DIGITS(createdBy || owner);
 
+  // ✅ FIX: interval concat must be text
+  const windowIntervalExpr = `(($3::text || ' seconds')::interval)`;
+
+  // Prefer user_id if available
   try {
     const { rows } = await query(
       `SELECT COUNT(*)::int AS n
          FROM public.time_entries
         WHERE owner_id=$1
           AND user_id=$2
-          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+          AND created_at >= NOW() - ${windowIntervalExpr}`,
       [owner, actor, windowSec]
     );
     const n = rows?.[0]?.n ?? 0;
@@ -1919,13 +2159,14 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
     }
   }
 
+  // Fallback created_by
   try {
     const { rows } = await query(
       `SELECT COUNT(*)::int AS n
          FROM public.time_entries
         WHERE owner_id=$1
           AND COALESCE(created_by,$2::text) = $2::text
-          AND created_at >= NOW() - ($3 || ' seconds')::interval`,
+          AND created_at >= NOW() - ${windowIntervalExpr}`,
       [owner, actor, windowSec]
     );
     const n = rows?.[0]?.n ?? 0;
@@ -1937,12 +2178,13 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
     }
   }
 
+  // Last fallback owner-wide
   try {
     const { rows } = await query(
       `SELECT COUNT(*)::int AS n
          FROM public.time_entries
         WHERE owner_id=$1
-          AND created_at >= NOW() - ($2 || ' seconds')::interval`,
+          AND created_at >= NOW() - ${windowIntervalExpr}`,
       [owner, windowSec]
     );
     const n = rows?.[0]?.n ?? 0;
@@ -1952,7 +2194,7 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
   }
 }
 
-// ---------- Job-aware time entry (delegates to resilient logTimeEntry) ----------
+// ---------- Job-aware time entry ----------
 async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras = {}) {
   let jobNo = null;
 
@@ -2011,7 +2253,12 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   cols.push('created_at');
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
 
-  const canIdempotent = SUPPORTS_SOURCE_MSG_ID && SUPPORTS_USER_ID && sourceMsgId;
+  // ✅ FIX: Only use ON CONFLICT if (a) cols exist AND (b) unique constraint exists
+  const canIdempotent =
+    SUPPORTS_SOURCE_MSG_ID &&
+    SUPPORTS_USER_ID &&
+    !!sourceMsgId &&
+    (await detectTimeEntriesUniqueOwnerUserSourceMsg().catch(() => false));
 
   const sql = canIdempotent
     ? `
@@ -2034,8 +2281,25 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
     idempotent: !!canIdempotent
   });
 
-  const { rows } = await query(sql, vals);
-  return rows?.[0]?.id || null;
+  try {
+    const { rows } = await query(sql, vals);
+    return rows?.[0]?.id || null;
+  } catch (e) {
+    // if ON CONFLICT unsupported (missing unique index), retry once without it
+    const msg = String(e?.message || '').toLowerCase();
+    const code = String(e?.code || '');
+    if (canIdempotent && (code === '42P10' || msg.includes('there is no unique') || msg.includes('on conflict'))) {
+      TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = false;
+      const sql2 = `
+        INSERT INTO public.time_entries (${cols.join(', ')})
+        VALUES (${placeholders})
+        RETURNING id
+      `;
+      const { rows: rows2 } = await query(sql2, vals);
+      return rows2?.[0]?.id || null;
+    }
+    throw e;
+  }
 }
 
 async function moveLastLogToJob(ownerId, userName, jobRef) {
@@ -2154,7 +2418,7 @@ module.exports = {
   // ---------- Utils ----------
   DIGITS,
   todayInTZ,
-  normalizePhoneNumber: (x) => DIGITS(x),
+  normalizePhoneNumber,
   toCents,
   toAmount,
   isValidIso,

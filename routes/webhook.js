@@ -8,6 +8,7 @@
 // - Keep rawBody capture BEFORE token middleware (Twilio signature verification).
 // - Robust inbound text extraction for WhatsApp interactive list replies (ListId/ListTitle + InteractiveResponseJson).
 // - Allow job picker flows to pass even when expense/revenue pending (no nudge-block).
+// - IMPORTANT FIX: do NOT treat numeric replies as job picker replies unless awaitingActiveJobPick is true.
 // - Keep 8s safety timer + tolerant middlewares + media transcript passthrough.
 
 const express = require('express');
@@ -91,6 +92,8 @@ function isJobPickerIntent(lc) {
 }
 
 // "list-picker reply-like" tokens (IDs we generate typically start with job_)
+// NOTE: numeric replies should ONLY be treated as job-picker tokens when awaitingActiveJobPick is true.
+// This helper still exists, but webhook must gate its use.
 function looksLikeJobPickerReplyToken(raw) {
   const s = String(raw || '').trim();
   if (!s) return false;
@@ -126,16 +129,9 @@ function getInboundText(body = {}) {
   if (irj) {
     try {
       const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
-      const id =
-        json?.list_reply?.id ||
-        json?.listReply?.id ||
-        json?.interactive?.list_reply?.id ||
-        '';
+      const id = json?.list_reply?.id || json?.listReply?.id || json?.interactive?.list_reply?.id || '';
       const title =
-        json?.list_reply?.title ||
-        json?.listReply?.title ||
-        json?.interactive?.list_reply?.title ||
-        '';
+        json?.list_reply?.title || json?.listReply?.title || json?.interactive?.list_reply?.title || '';
       const picked = String(id || title || '').trim();
       if (picked) return picked;
     } catch {}
@@ -172,8 +168,7 @@ function hasMoneyAmount(str) {
   const s = String(str || '');
 
   const hasDollar = /\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/.test(s);
-  const hasWordAmount =
-    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*(?:dollars|bucks|cad|usd)\b/i.test(s);
+  const hasWordAmount = /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*(?:dollars|bucks|cad|usd)\b/i.test(s);
 
   const hasBareNumberWithHint =
     /\b(?:for|paid|spent|received|cost|total)\s+\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b/i.test(s) ||
@@ -206,7 +201,8 @@ function looksExpenseNl(str) {
     /^drive\b/.test(s) ||
     /^task\b/.test(s) ||
     /^my\s+tasks\b/.test(s)
-  ) return false;
+  )
+    return false;
 
   return true;
 }
@@ -417,8 +413,10 @@ router.post('*', async (req, res, next) => {
     const pendingExpenseFlow =
       !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
 
-    const allowJobPickerThrough =
-      isJobPickerIntent(lc) || looksLikeJobPickerReplyToken(text) || !!pending?.awaitingActiveJobPick;
+    // ✅ IMPORTANT FIX:
+    // Only allow numeric/job_* tokens to route to job picker IF awaitingActiveJobPick is true.
+    // Otherwise expense/revenue pickers should consume "1", "2", etc.
+    const allowJobPickerThrough = isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick;
 
     if (pendingRevenueFlow) {
       if (/^(cancel|stop|no)\b/.test(lc)) {
@@ -484,35 +482,25 @@ router.post('*', async (req, res, next) => {
     const crypto = require('crypto');
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid =
-      rawSid ||
-      crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
+      rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
 
     /* -----------------------------------------------------------------------
      * (A0) ACTIVE JOB PICKER FLOW — run BEFORE expense/revenue pending flows
      * ----------------------------------------------------------------------- */
-    if (pending?.awaitingActiveJobPick || isJobPickerIntent(lc2) || looksLikeJobPickerReplyToken(text2)) {
+    // ✅ IMPORTANT FIX:
+    // Do NOT route numeric tokens to job.js unless awaitingActiveJobPick is true.
+    // isJobPickerIntent() is fine; it explicitly opens the job picker.
+    if (pending?.awaitingActiveJobPick || isJobPickerIntent(lc2)) {
       try {
         const cmds = require('../handlers/commands');
         const handleJob =
-          (cmds?.job && cmds.job.handleJob) ||
-          cmds?.handleJob ||
-          require('../handlers/commands/job').handleJob;
+          (cmds?.job && cmds.job.handleJob) || cmds?.handleJob || require('../handlers/commands/job').handleJob;
 
         if (typeof handleJob === 'function') {
-          await handleJob(
-            req.from,
-            text2,
-            req.userProfile,
-            req.ownerId,
-            req.ownerProfile,
-            req.isOwner,
-            res,
-            messageSid
-          );
+          await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
           if (res.headersSent) return;
 
-          // If handler returned a string but didn’t send, handleJob() (yours) usually sends.
-          // As a last resort, just ACK.
+          // If handler didn't send, ACK.
           return ok(res, 'OK');
         }
       } catch (e) {
@@ -543,15 +531,7 @@ router.post('*', async (req, res, next) => {
     if (pendingRevenueLike) {
       try {
         const { handleRevenue } = require('../handlers/commands/revenue');
-        const twiml = await handleRevenue(
-          req.from,
-          text2,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
+        const twiml = await handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
         if (!res.headersSent && typeof twiml === 'string') {
           return res.status(200).type('application/xml; charset=utf-8').send(twiml);
         }
@@ -565,15 +545,7 @@ router.post('*', async (req, res, next) => {
     if (pendingExpenseLike) {
       try {
         const { handleExpense } = require('../handlers/commands/expense');
-        const twiml = await handleExpense(
-          req.from,
-          text2,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
+        const twiml = await handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
         if (!res.headersSent && typeof twiml === 'string') {
           return res.status(200).type('application/xml; charset=utf-8').send(twiml);
         }
@@ -702,9 +674,7 @@ router.post('*', async (req, res, next) => {
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc2)) looksTime = true;
     if (askingHow && /\bjobs?\b/.test(lc2)) looksJob = true;
 
-    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(
-      Boolean
-    );
+    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(Boolean);
 
     const SOP = {
       tasks:
@@ -737,19 +707,13 @@ router.post('*', async (req, res, next) => {
     try {
       const cmds = require('../handlers/commands');
 
-      // tasks can be { tasksHandler } or direct function
       tasksHandler =
         (cmds?.tasks && (cmds.tasks.tasksHandler || cmds.tasks)) ||
         require('../handlers/commands/tasks').tasksHandler ||
         null;
 
-      // job is { handleJob } per your file
-      handleJob =
-        (cmds?.job && cmds.job.handleJob) ||
-        require('../handlers/commands/job').handleJob ||
-        null;
+      handleJob = (cmds?.job && cmds.job.handleJob) || require('../handlers/commands/job').handleJob || null;
 
-      // timeclock can be { handleTimeclock } legacy; we also have v2 handleClock above
       handleTimeclock =
         (cmds?.timeclock && (cmds.timeclock.handleTimeclock || cmds.timeclock)) ||
         require('../handlers/commands/timeclock').handleTimeclock ||

@@ -1,5 +1,17 @@
 // handlers/commands/expense.js
-const { query, insertTransaction, listOpenJobs, normalizeVendorName } = require('../../services/postgres');
+
+// ✅ Robust import: postgres exports differ across versions
+const pg = require('../../services/postgres');
+const { query, insertTransaction, listOpenJobs } = pg;
+
+// ✅ Vendor normalizer (fail-open)
+const normalizeVendorName =
+  (typeof pg.normalizeVendorName === 'function' && pg.normalizeVendorName) ||
+  (typeof pg.normalizeVendor === 'function' && pg.normalizeVendor) ||
+  (async (_ownerId, vendor) => {
+    const s = String(vendor || '').trim();
+    return s || 'Unknown Store';
+  });
 
 const state = require('../../utils/stateManager');
 const getPendingTransactionState = state.getPendingTransactionState;
@@ -209,11 +221,7 @@ function normalizeJobAnswer(text) {
   return s;
 }
 
-/**
- * ✅ Fix "for for" (and related duplication):
- * - If item starts with "for ", strip it.
- * - Collapse whitespace.
- */
+// ✅ Fix "for for" / duplication
 function cleanExpenseItemForDisplay(item) {
   let s = String(item || '').trim();
   s = s.replace(/^for\s+/i, '');
@@ -221,10 +229,6 @@ function cleanExpenseItemForDisplay(item) {
   return s || 'Unknown';
 }
 
-/**
- * ✅ One canonical line builder for templates + final replies.
- * Avoids double "for", "on", etc. if item already contains fragments.
- */
 function buildExpenseSummaryLine({ amount, item, store, date, jobName }) {
   const amt = String(amount || '').trim();
   const it = cleanExpenseItemForDisplay(item);
@@ -235,11 +239,9 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName }) {
   const itLower = it.toLowerCase();
   const parts = [];
   parts.push(`Expense: ${amt} for ${it}`);
-
   if (st && st !== 'Unknown Store' && !itLower.includes(`from ${st.toLowerCase()}`)) parts.push(`from ${st}`);
   if (dt && !itLower.includes(dt.toLowerCase())) parts.push(`on ${dt}`);
   if (jb && !itLower.includes(jb.toLowerCase())) parts.push(`for ${jb}`);
-
   return parts.join(' ') + '.';
 }
 
@@ -326,10 +328,7 @@ function normalizeExpenseData(data, userProfile) {
   }
 
   d.date = String(d.date || '').trim() || todayInTimeZone(tz);
-
-  // ✅ normalize item to avoid "for for" downstream
   d.item = cleanExpenseItemForDisplay(d.item);
-
   d.store = String(d.store || '').trim() || 'Unknown Store';
 
   if (d.jobName != null) {
@@ -380,10 +379,6 @@ function isIsoDateToken(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim());
 }
 
-/**
- * Deterministic NL expense parse (voice transcript backstop)
- * Canonical: "$X for ITEM from VENDOR on DATE for JOB"
- */
 function deterministicExpenseParse(input, userProfile) {
   const raw = String(input || '').trim();
   if (!raw) return null;
@@ -396,7 +391,6 @@ function deterministicExpenseParse(input, userProfile) {
 
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
-  // date
   let date = null;
   if (/\btoday\b/i.test(raw)) date = parseNaturalDateTz('today', tz);
   else if (/\byesterday\b/i.test(raw)) date = parseNaturalDateTz('yesterday', tz);
@@ -412,7 +406,6 @@ function deterministicExpenseParse(input, userProfile) {
   }
   if (!date) date = todayInTimeZone(tz);
 
-  // job: prefer trailing "for <job>"
   let jobName = null;
   const forJob = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:[.?!]|$)/i);
   if (forJob?.[1]) {
@@ -421,14 +414,12 @@ function deterministicExpenseParse(input, userProfile) {
   }
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-  // store: "from|at <vendor>" stopping before on/for/date/end
   let store = null;
   const fromMatch = raw.match(
     /\b(?:from|at)\s+(.+?)(?:\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
   );
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
-  // item: prefer "for <item> from|at"
   let item = null;
   const itemMatch = raw.match(
     /\bfor\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
@@ -559,13 +550,11 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
     let pending = await getPendingTransactionState(from);
 
-    // If user previously hit "edit", treat next message as brand new
     if (pending?.isEditing && pending?.type === 'expense') {
       await deletePendingTransactionState(from);
       pending = null;
     }
 
-    // Follow-up: job resolution
     if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
       const jobReply = normalizeJobAnswer(input);
       const finalJob = looksLikeOverhead(jobReply) ? 'Overhead' : jobReply || null;
@@ -589,7 +578,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
-    // --- CONFIRM FLOW ---
     if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
       if (!isOwner) {
         await deletePendingTransactionState(from);
@@ -605,8 +593,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         const mediaMeta = pending?.pendingMediaMeta || null;
 
         let data = normalizeExpenseData(rawData, userProfile);
-
-        // ✅ vendor normalization (snap to known vendors)
         data.store = await normalizeVendorName(ownerId, data.store);
 
         const category =
@@ -718,7 +704,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return twimlText(reply);
     }
 
-    // DIRECT PARSE PATH (simple formats)
     const m = String(input || '').match(
       /^(?:expense\s+|exp\s+)?\$?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\s+(.+?)(?:\s+from\s+(.+))?$/i
     );
@@ -729,12 +714,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       const amount = Number.isFinite(n) && n > 0 ? formatMoneyDisplay(n) : '$0.00';
 
       const data0 = normalizeExpenseData(
-        {
-          date: todayInTimeZone(tz),
-          item,
-          amount,
-          store: store || 'Unknown Store'
-        },
+        { date: todayInTimeZone(tz), item, amount, store: store || 'Unknown Store' },
         userProfile
       );
 
@@ -770,11 +750,9 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
-    // NL BACKSTOP (voice transcript)
     const backstop = deterministicExpenseParse(input, userProfile);
     if (backstop && backstop.amount) {
       const data0 = normalizeExpenseData(backstop, userProfile);
-
       data0.store = await normalizeVendorName(ownerId, data0.store);
 
       const category =
@@ -807,7 +785,6 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       return await sendConfirmExpenseOrFallback(from, summaryLine);
     }
 
-    // AI PATH (fallback)
     const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData);
     let data = aiRes?.data || null;
     let aiReply = aiRes?.reply || null;
@@ -825,12 +802,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       data.store === 'Unknown Store';
 
     if (aiReply && missingCore) {
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingExpense: null,
-        isEditing: true,
-        type: 'expense'
-      });
+      await mergePendingTransactionState(from, { ...(pending || {}), pendingExpense: null, isEditing: true, type: 'expense' });
       return twimlText(aiReply);
     }
 

@@ -1489,6 +1489,94 @@ async function getOwnerVendorBreakdown(ownerId, fromDate, toDate, kindFilter = '
     txn_count: Number(r.txn_count) || 0
   }));
 }
+/**
+ * Vendor normalization (fail-open).
+ * - Trims, collapses whitespace
+ * - Strips common suffix noise
+ * - Optional: maps known aliases to a canonical name
+ */
+function normalizeVendorString(v) {
+  let s = String(v || '').trim();
+  s = s.replace(/\s+/g, ' ');
+  if (!s) return 'Unknown Store';
+
+  // remove some common trailing junk (optional / conservative)
+  s = s.replace(/\s+#\d+$/i, '');                 // "Home Depot #123"
+  s = s.replace(/\s+(inc|ltd|limited)\.?$/i, ''); // "Convoy Supply Ltd"
+  s = s.trim();
+
+  // Simple alias map (add your common vendors here)
+  const key = s.toLowerCase();
+  const ALIASES = {
+    'home depot': 'Home Depot',
+    'the home depot': 'Home Depot',
+    'homedepot': 'Home Depot',
+    'convoy supply': 'Convoy Supply',
+    'convoy': 'Convoy Supply',
+    'rona': 'RONA',
+    'lowes': "Lowe's",
+    'lowe’s': "Lowe's"
+  };
+
+  return ALIASES[key] || s;
+}
+
+/**
+ * ✅ normalizeVendorName(ownerId, vendor)
+ * Signature matches what expense.js expects today.
+ * You can later upgrade this to query a vendor table per owner.
+ */
+async function normalizeVendorName(_ownerId, vendor) {
+  return normalizeVendorString(vendor);
+}
+
+/**
+ * ✅ listOpenJobs(ownerId, { limit })
+ * Returns an array of job display names.
+ * Uses jobs.status if present, otherwise falls back to "completed_at is null"
+ * and excludes closed/archived-ish statuses.
+ */
+async function listOpenJobs(ownerId, { limit = 8 } = {}) {
+  const owner = String(ownerId || '').trim();
+  const lim = Math.max(1, Math.min(Number(limit) || 8, 25));
+
+  // Try status-based first (many schemas have status)
+  try {
+    const { rows } = await query(
+      `
+      select coalesce(name, job_name) as job_name
+      from public.jobs
+      where owner_id::text = $1
+        and coalesce(nullif(status,''), 'open') not in ('closed','done','completed','archived','canceled','cancelled')
+      order by active desc nulls last, updated_at desc nulls last, created_at desc
+      limit $2
+      `,
+      [owner, lim]
+    );
+    return (rows || []).map(r => r.job_name).filter(Boolean);
+  } catch (e) {
+    console.warn('[PG/listOpenJobs] status query failed; falling back:', e?.message);
+  }
+
+  // Fallback: completed_at null or missing status concept
+  try {
+    const { rows } = await query(
+      `
+      select coalesce(name, job_name) as job_name
+      from public.jobs
+      where owner_id::text = $1
+        and completed_at is null
+      order by active desc nulls last, updated_at desc nulls last, created_at desc
+      limit $2
+      `,
+      [owner, lim]
+    );
+    return (rows || []).map(r => r.job_name).filter(Boolean);
+  } catch (e) {
+    console.warn('[PG/listOpenJobs] fallback query failed:', e?.message);
+    return [];
+  }
+}
 
 // ---- Safe limiter exports (avoid undefined symbol at module.exports time)
 const __checkLimit =
@@ -1541,6 +1629,9 @@ module.exports = {
   createJobIdempotent,
   activateJobByName,
   resolveJobContext,
+  listOpenJobs,
+  normalizeVendorName,
+
 
   // ✅ restored compat exports
   setActiveJob,

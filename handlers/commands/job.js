@@ -1,5 +1,13 @@
 // handlers/commands/job.js
-// WhatsApp / SMS "job" command handler
+// COMPLETE DROP-IN (aligned to latest postgres.js + expense.js expectations)
+//
+// Key alignments:
+// - ENABLE_LIST_PICKER default now matches expense.js behavior (true unless explicitly "false")
+// - Uses pg.setActiveJobForIdentity / pg.setActiveJob aliases if present (canonical path)
+// - Keeps best-effort legacy SQL fallback for active job persistence
+// - Stores a robust picker map (numeric + name + id -> job name) so replying "1" or selecting works
+// - Safe Twilio Content list-picker (Content API) with caching
+//
 // Signature:
 //   handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId)
 
@@ -7,7 +15,6 @@ const pg = require('../../services/postgres');
 const state = require('../../utils/stateManager');
 
 // ✅ fetch polyfill so list-picker doesn't silently fall back if fetch isn't present
-// If you're on Node 18+ this is already available, but this keeps it bulletproof.
 const fetch = global.fetch || require('node-fetch');
 
 const getPendingTransactionState = state.getPendingTransactionState;
@@ -27,7 +34,6 @@ function ownerDigits(ownerId, fromPhone) {
   const base = ownerId || fromPhone;
   const s = String(base || '').trim();
   if (!s) return null;
-  // handle "whatsapp:+1555..." or "+1..." or "1555..."
   return String(s).replace(/\D/g, '') || null;
 }
 
@@ -103,7 +109,6 @@ function dedupeJobs(list) {
 }
 
 function isPickerOpenCommand(lc) {
-  // Commands that should (re)open the picker, even if we were awaiting a selection.
   return /^(show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs|pick\s+job|change\s+job)\b/.test(lc);
 }
 
@@ -117,8 +122,11 @@ function isMoreLike(lc) {
 
 /* ---------------- Twilio list-picker content helpers ---------------- */
 
-const ENABLE_LIST_PICKER =
-  String(process.env.TWILIO_ENABLE_LIST_PICKER || '').trim().toLowerCase() === 'true';
+// Align with expense.js: enable unless explicitly false
+const ENABLE_LIST_PICKER = (() => {
+  const raw = process.env.TWILIO_ENABLE_LIST_PICKER ?? process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? 'true';
+  return String(raw).trim().toLowerCase() !== 'false';
+})();
 
 const CONTENT_API_BASE = 'https://content.twilio.com/v1/Content';
 
@@ -242,61 +250,83 @@ async function sendWhatsAppListPicker({ to, body, button, items, cacheKey }) {
 
 /* ---------------- Active job persistence (ALIGNED with services/postgres.js) ---------------- */
 /**
- * Goal: make expense.js auto-attach by ensuring we persist the active job.
+ * Canonical: pg.setActiveJobForIdentity(ownerId, identity, jobId, jobName)
+ * Aliases: pg.setActiveJob / pg.setActiveJobForUser / pg.saveActiveJob / etc.
  *
- * Your postgres.js exports `setActiveJob(ownerId, userId, jobRef)` where jobRef can be:
- * - uuid jobId (if user_active_job exists)
- * - job_no (int) or numeric string
- * - job name (string)
- *
- * This function tries pg.setActiveJob first, then any legacy helpers, then direct SQL best-effort.
+ * We also keep SQL best-effort fallbacks to avoid "works in dev, breaks in prod" schema drift.
  */
-async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNameFallback }) {
+async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, jobRow, jobNameFallback }) {
   const owner = String(ownerId || '').replace(/\D/g, '');
+
+  const identity =
+    fromPhone ||
+    userProfile?.from ||
+    userProfile?.phone ||
+    userProfile?.phone_e164 ||
+    userProfile?.user_id ||
+    userProfile?.id ||
+    userProfile?.userId ||
+    null;
+
   const userId =
     userProfile?.id ||
     userProfile?.user_id ||
     userProfile?.userId ||
     userProfile?.phone ||
-    userProfile?.from ||
+    fromPhone ||
     null;
 
-  if (!owner || !userId) {
-    console.warn('[JOB] persistActiveJobBestEffort: missing owner/user', { ownerId, userId });
+  if (!owner || !identity) {
+    console.warn('[JOB] persistActiveJobBestEffort: missing owner/identity', { ownerId, identity, userId });
     return false;
   }
 
   const jobId = jobRow?.id || jobRow?.job_id || null;
   const jobNo = jobRow?.job_no ?? jobRow?.jobNo ?? null;
-  const jobName = String(jobRow?.name || jobRow?.job_name || jobNameFallback || '').trim() || null;
+  const jobName =
+    String(jobRow?.name || jobRow?.job_name || jobNameFallback || '').trim() || null;
 
+  // prefer a stable ref if postgres.js supports it
   const jobRef = jobId || jobNo || jobName;
 
-  // 1) Canonical: pg.setActiveJob(ownerId, userId, jobRef)
+  // 1) Canonical identity-based setter
+  if (typeof pg.setActiveJobForIdentity === 'function') {
+    try {
+      await pg.setActiveJobForIdentity(owner, String(identity), jobId || null, jobName || null);
+      console.info('[JOB] persisted active job via pg.setActiveJobForIdentity', { owner, identity, jobId, jobName });
+      return true;
+    } catch (e) {
+      console.warn('[JOB] pg.setActiveJobForIdentity failed:', e?.message);
+    }
+  }
+
+  // 2) Canonical setActiveJob(ownerId, userId, jobRef/jobName)
   if (typeof pg.setActiveJob === 'function' && jobRef) {
     try {
-      await pg.setActiveJob(owner, String(userId), String(jobRef));
-      console.info('[JOB] persisted active job via pg.setActiveJob', { owner, userId, jobRef });
+      await pg.setActiveJob(owner, String(userId || identity), String(jobRef));
+      console.info('[JOB] persisted active job via pg.setActiveJob', { owner, userId: String(userId || identity), jobRef });
       return true;
     } catch (e) {
       console.warn('[JOB] pg.setActiveJob failed:', e?.message);
     }
   }
 
-  // 2) Legacy helper candidates (unknown signatures; try safe call patterns)
-  const fnCandidates = ['setActiveJobForUser', 'setUserActiveJob', 'updateUserActiveJob', 'saveActiveJob'];
+  // 3) Legacy helper candidates
+  const fnCandidates = ['setActiveJobForUser', 'setUserActiveJob', 'updateUserActiveJob', 'saveActiveJob', 'setActiveJobForPhone'];
 
   for (const fn of fnCandidates) {
     if (typeof pg[fn] !== 'function') continue;
 
     try {
-      await pg[fn](owner, String(userId), jobId || null, jobName || null);
-      console.info('[JOB] persisted active job via pg.' + fn, { owner, userId, jobId, jobName });
+      // common signature (owner, identity, jobId, jobName)
+      await pg[fn](owner, String(userId || identity), jobId || null, jobName || null);
+      console.info('[JOB] persisted active job via pg.' + fn, { owner, userId: String(userId || identity), jobId, jobName });
       return true;
     } catch (e1) {
       try {
-        await pg[fn](owner, String(userId), String(jobRef || ''));
-        console.info('[JOB] persisted active job via pg.' + fn, { owner, userId, jobRef });
+        // alternate signature (owner, identity, jobRef)
+        await pg[fn](owner, String(userId || identity), String(jobRef || ''));
+        console.info('[JOB] persisted active job via pg.' + fn, { owner, userId: String(userId || identity), jobRef });
         return true;
       } catch (e2) {
         console.warn('[JOB] pg.' + fn + ' failed:', e2?.message || e1?.message);
@@ -304,7 +334,7 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNam
     }
   }
 
-  // 3) Fall back to direct SQL attempts (fail-open across schema variants)
+  // 4) Fall back to direct SQL attempts (fail-open across schema variants)
   const sqlAttempts = [
     {
       label: 'public.users (id)',
@@ -340,16 +370,16 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, jobRow, jobNam
     }
   ];
 
+  const userKey = String(userId || identity);
+
   for (const a of sqlAttempts) {
     try {
-      const r = await pg.query(a.sql, [owner, String(userId), jobId, jobName]);
+      const r = await pg.query(a.sql, [owner, userKey, jobId, jobName]);
       if (r?.rowCount) {
-        console.info('[JOB] persisted active job via SQL', { table: a.label, owner, userId, jobId, jobName });
+        console.info('[JOB] persisted active job via SQL', { table: a.label, owner, userKey, jobId, jobName });
         return true;
       }
-    } catch {
-      // ignore missing schema/table/columns
-    }
+    } catch {}
   }
 
   console.warn('[JOB] persistActiveJobBestEffort: no persistence route succeeded');
@@ -418,24 +448,43 @@ function buildTextPicker(jobs, page, perPage) {
   const lines = slice.map((j, i) => `${start + i + 1}) ${j}`);
   const hasMore = start + perPage < jobs.length;
   const more = hasMore ? `\nReply "more" for more jobs.` : '';
-  return `Which job should I set active?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}`;
+  return `Which job should I set active?\n\n${lines.join(
+    '\n'
+  )}\n\nReply with a number, job name, or "Overhead".${more}`;
 }
 
 function buildPickerMap(jobs, page, perPage) {
   const start = page * perPage;
   const slice = jobs.slice(start, start + perPage);
-  const map = {};
 
-  // absolute numeric indices
+  // We store a *rich* map so resolve can support:
+  // - "1" (absolute)
+  // - job_<N>_<hash> (list-picker id)
+  // - exact name / lower name
+  const map = {
+    num: {},
+    name: {},
+    id: {}
+  };
+
   for (let i = 0; i < slice.length; i++) {
-    const idx = start + i + 1;
-    map[String(idx)] = slice[i];
+    const absIdx = start + i + 1;
+    const full = slice[i];
+    const rowId = `job_${absIdx}_${stableHash(full)}`;
+
+    map.num[String(absIdx)] = full;
+    map.name[String(full).toLowerCase()] = full;
+    map.name[String(full).slice(0, 24).toLowerCase()] = full;
+    map.id[rowId] = full;
   }
 
-  // names
-  for (const j of slice) {
-    map[String(j).toLowerCase()] = j;
-  }
+  map.name.overhead = 'Overhead';
+  map.num.overhead = 'Overhead';
+  map.id.overhead = 'Overhead';
+
+  map.name.more = '__MORE__';
+  map.num.more = '__MORE__';
+  map.id.more = '__MORE__';
 
   return map;
 }
@@ -524,13 +573,20 @@ function resolvePickerReply(raw, pending) {
   if (isMoreLike(lc)) return '__MORE__';
   if (lc === 'overhead' || lc === 'oh') return 'Overhead';
 
+  const map = pending?.activeJobPickMap || null;
+
+  // list-picker ids
+  if (map?.id && map.id[s]) return map.id[s];
+
   // list-picker ids: job_<N>_<hash>
   const m = s.match(/^job_(\d+)_/i);
-  if (m?.[1]) return pending?.activeJobPickMap?.[String(m[1])] || null;
+  if (m?.[1] && map?.num?.[String(m[1])]) return map.num[String(m[1])];
 
-  if (/^\d+$/.test(s)) return pending?.activeJobPickMap?.[s] || null;
+  // numeric
+  if (/^\d+$/.test(s) && map?.num?.[s]) return map.num[s];
 
-  if (pending?.activeJobPickMap?.[lc]) return pending.activeJobPickMap[lc];
+  // name matches
+  if (map?.name?.[lc]) return map.name[lc];
 
   return s;
 }
@@ -548,6 +604,7 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
 
   const pending = await getPendingTransactionState(fromPhone);
 
+  // --- Awaiting picker selection ---
   if (pending?.awaitingActiveJobPick) {
     if (isCancelLike(lc)) {
       await clearPickerState(fromPhone);
@@ -587,6 +644,7 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
     await clearPickerState(fromPhone);
 
     if (jobName === 'Overhead') {
+      // optional: you could also clear active job in DB, but leaving as-is keeps backward behavior
       return respond(res, `✅ Okay — using Overhead (no active job).`);
     }
 
@@ -596,6 +654,7 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
       await persistActiveJobBestEffort({
         ownerId: owner,
         userProfile,
+        fromPhone,
         jobRow: j,
         jobNameFallback: jobName
       });
@@ -618,11 +677,13 @@ Now you can:
     }
   }
 
+  // --- Open picker ---
   if (isPickerOpenCommand(lc)) {
     const jobs = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
     return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs, page: 0, perPage: 8 });
   }
 
+  // --- Direct set active job ---
   if (/^(active\s+job|set\s+active|switch\s+job)\b/i.test(msg)) {
     const name = msg.replace(/^(active\s+job|set\s+active|switch\s+job)\b/i, '').trim();
     if (!name) return respond(res, `Which job should I set active? Try: "active job Oak Street"`);
@@ -632,6 +693,7 @@ Now you can:
     await persistActiveJobBestEffort({
       ownerId: owner,
       userProfile,
+      fromPhone,
       jobRow: j,
       jobNameFallback: name
     });
@@ -650,11 +712,13 @@ Now you can:
     );
   }
 
+  // --- List jobs ---
   if (/^(jobs|list jobs|show jobs)\b/i.test(msg)) {
     const reply = await listJobs(owner);
     return respond(res, reply);
   }
 
+  // --- Create job (idempotent) ---
   if (/^(create|new)\s+job\b/i.test(msg)) {
     const name = msg.replace(/^(create|new)\s+job\b/i, '').trim();
 

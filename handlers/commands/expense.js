@@ -1,9 +1,10 @@
 // handlers/commands/expense.js
-// Drop-in replacement: FREE-FORM WhatsApp Interactive List (dynamic job picker)
-// + "change job" support during confirm + job-prompt steps
-// + Active-job DB fallback resolution (so expenses auto-attach after job picker)
-// + Filters garbage job names ("cancel", "show active jobs", etc.) from pickers
-// + IMPORTANT: stores numeric map so replying "1" works reliably
+// COMPLETE DROP-IN (aligned to latest postgres.js + idempotent writes + active-job fix)
+// - Uses pg.todayInTZ if available
+// - Uses pg.MEDIA_TRANSCRIPT_MAX_CHARS + pg.normalizeMediaMeta if available
+// - Keeps Interactive List + numeric map
+// - Uses pg.getActiveJobForIdentity canonical path when present
+// - Removes unused vars & makes behavior consistent
 
 const pg = require('../../services/postgres');
 const { query, insertTransaction, listOpenJobs } = pg;
@@ -32,7 +33,9 @@ const handleInputWithAI = ai.handleInputWithAI;
 const parseExpenseMessage = ai.parseExpenseMessage;
 
 const todayInTimeZone =
-  (typeof ai.todayInTimeZone === 'function' && ai.todayInTimeZone) || (() => new Date().toISOString().split('T')[0]);
+  (typeof pg.todayInTZ === 'function' && pg.todayInTZ) ||
+  (typeof ai.todayInTimeZone === 'function' && ai.todayInTimeZone) ||
+  (() => new Date().toISOString().split('T')[0]);
 
 const parseNaturalDateTz =
   (typeof ai.parseNaturalDate === 'function' && ai.parseNaturalDate) ||
@@ -124,7 +127,9 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   if (!to) throw new Error('Missing "to"');
   if (!templateSid) throw new Error('Missing templateSid');
 
-  const toClean = String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
+  const toClean = String(to).startsWith('whatsapp:')
+    ? String(to)
+    : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
 
   const payload = {
     to: toClean,
@@ -177,7 +182,10 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
 /* ---------------- WhatsApp Interactive List (FREE-FORM, dynamic) ---------------- */
 
 const ENABLE_INTERACTIVE_LIST = (() => {
-  const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? process.env.TWILIO_ENABLE_LIST_PICKER ?? 'true';
+  const raw =
+    process.env.TWILIO_ENABLE_INTERACTIVE_LIST ??
+    process.env.TWILIO_ENABLE_LIST_PICKER ??
+    'true';
   return String(raw).trim().toLowerCase() !== 'false';
 })();
 
@@ -225,7 +233,9 @@ function buildTextJobPrompt(jobs, page, pageSize) {
   const hasMore = start + pageSize < jobs.length;
 
   const more = hasMore ? `\nReply "more" for more jobs.` : '';
-  return `Which job is this expense for?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
+  return `Which job is this expense for?\n\n${lines.join(
+    '\n'
+  )}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
 }
 
 // ✅ IMPORTANT: includes numeric map so replying "1" works reliably
@@ -233,9 +243,9 @@ function buildJobPickerMapping(jobs, page, pageSize) {
   const start = page * pageSize;
   const slice = jobs.slice(start, start + pageSize);
 
-  const idMap = {};   // rowId -> jobName
+  const idMap = {}; // rowId -> jobName
   const nameMap = {}; // lower(title/desc) -> jobName
-  const numMap = {};  // "1" -> jobName (absolute index)
+  const numMap = {}; // "1" -> jobName (absolute index)
 
   for (let i = 0; i < slice.length; i++) {
     const absIdx = start + i + 1;
@@ -249,16 +259,16 @@ function buildJobPickerMapping(jobs, page, pageSize) {
     nameMap[String(fullName).slice(0, 24).toLowerCase()] = fullName;
   }
 
-  idMap['overhead'] = 'Overhead';
-  idMap['more'] = '__MORE__';
+  idMap.overhead = 'Overhead';
+  idMap.more = '__MORE__';
 
-  nameMap['overhead'] = 'Overhead';
+  nameMap.overhead = 'Overhead';
   nameMap['more jobs…'] = '__MORE__';
   nameMap['more jobs'] = '__MORE__';
-  nameMap['more'] = '__MORE__';
+  nameMap.more = '__MORE__';
 
-  numMap['overhead'] = 'Overhead';
-  numMap['more'] = '__MORE__';
+  numMap.overhead = 'Overhead';
+  numMap.more = '__MORE__';
 
   return { idMap, nameMap, numMap };
 }
@@ -313,7 +323,7 @@ async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize =
     awaitingExpenseJobPage: page,
     expenseJobPickerIdMap: idMap,
     expenseJobPickerNameMap: nameMap,
-    expenseJobPickerNumMap: numMap, // ✅ store numeric map
+    expenseJobPickerNumMap: numMap,
     expenseJobPickerHasMore: hasMore,
     expenseJobPickerTotal: uniq.length
   });
@@ -351,7 +361,9 @@ async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize =
   }
 
   const bodyText =
-    `Here are your active jobs (${start + 1}-${Math.min(start + JOBS_PER_PAGE, uniq.length)} of ${uniq.length}).\n` +
+    `Here are your active jobs (${start + 1}-${Math.min(start + JOBS_PER_PAGE, uniq.length)} of ${
+      uniq.length
+    }).\n` +
     `Pick one to assign this expense.\n\n` +
     `Tip: You can switch your current job anytime.`;
 
@@ -373,13 +385,17 @@ async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize =
 
 /* ---------------- helpers ---------------- */
 
-const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
-function truncateText(str, maxChars) {
-  if (!str) return null;
-  const s = String(str);
-  if (s.length <= maxChars) return s;
-  return s.slice(0, maxChars);
-}
+const MAX_MEDIA_TRANSCRIPT_CHARS =
+  (typeof pg.MEDIA_TRANSCRIPT_MAX_CHARS === 'number' && pg.MEDIA_TRANSCRIPT_MAX_CHARS) || 8000;
+
+const truncateText =
+  (typeof pg.truncateText === 'function' && pg.truncateText) ||
+  ((str, maxChars) => {
+    if (!str) return null;
+    const s = String(str);
+    if (s.length <= maxChars) return s;
+    return s.slice(0, maxChars);
+  });
 
 function normalizeDecisionToken(input) {
   const s = String(input || '').trim().toLowerCase();
@@ -416,7 +432,9 @@ function toNumberAmount(amountStr) {
 }
 
 function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(str || '')
+  );
 }
 
 function looksLikeOverhead(s) {
@@ -459,7 +477,7 @@ function stripEmbeddedDateAndJobFromItem(item, { date, jobName } = {}) {
     }
   }
 
-  s = s.replace(/\bfor\s+a\s+job\b/ig, ' ');
+  s = s.replace(/\bfor\s+a\s+job\b/gi, ' ');
   s = s.replace(/\s+/g, ' ').trim();
   return s || 'Unknown';
 }
@@ -474,13 +492,14 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName }) {
   const itLower = it.toLowerCase();
   const parts = [];
   parts.push(`Expense: ${amt} for ${it}`);
-  if (st && st !== 'Unknown Store' && !itLower.includes(`from ${st.toLowerCase()}`)) parts.push(`from ${st}`);
+  if (st && st !== 'Unknown Store' && !itLower.includes(`from ${st.toLowerCase()}`))
+    parts.push(`from ${st}`);
   if (dt && !itLower.includes(dt.toLowerCase())) parts.push(`on ${dt}`);
   if (jb && !itLower.includes(jb.toLowerCase())) parts.push(`for ${jb}`);
   return parts.join(' ') + '.';
 }
 
-/* ---------------- Active job resolution (now with DB fallback) ---------------- */
+/* ---------------- Active job resolution (now aligned to postgres.js) ---------------- */
 
 function extractUserId(userProfile, fromPhone) {
   return (
@@ -507,6 +526,7 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
   const userId = extractUserId(userProfile, fromPhone);
   const phone = normalizeE164ish(fromPhone);
 
+  // ✅ Canonical in postgres.js
   if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
       const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
@@ -524,6 +544,7 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
     }
   }
 
+  // Legacy best-effort fallbacks (safe if schemas still exist)
   const attempts = [
     {
       label: 'memberships by user_id',
@@ -576,7 +597,11 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
       const name = row.active_job_name != null ? String(row.active_job_name).trim() : null;
       const id = row.active_job_id != null ? row.active_job_id : null;
       if (name || id) {
-        console.info('[EXPENSE] active job fetched from DB', { where: a.label, hasName: !!name, hasId: !!id });
+        console.info('[EXPENSE] active job fetched from DB', {
+          where: a.label,
+          hasName: !!name,
+          hasId: !!id
+        });
         return { active_job_name: name || null, active_job_id: id };
       }
     } catch {}
@@ -610,6 +635,7 @@ async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
 
   const s = String(ref).trim();
 
+  // If uuid ref, try uuid join
   if (looksLikeUuid(s)) {
     try {
       const r = await query(
@@ -625,6 +651,7 @@ async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
     }
   }
 
+  // If job_no ref, try job_no
   if (/^\d+$/.test(s)) {
     try {
       const r = await query(
@@ -647,7 +674,11 @@ async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
 
 function vendorDefaultCategory(store) {
   const s = String(store || '').toLowerCase();
-  if (/(home depot|homedepot|rona|lowe|lowes|home hardware|convoy|gentek|groupe|abc supply|beacon|roofmart|kent)/i.test(s)) {
+  if (
+    /(home depot|homedepot|rona|lowe|lowes|home hardware|convoy|gentek|groupe|abc supply|beacon|roofmart|kent)/i.test(
+      s
+    )
+  ) {
     return 'Materials';
   }
   if (/(esso|shell|petro|ultramar|pioneer|circle\s*k)/i.test(s)) return 'Fuel';
@@ -661,7 +692,8 @@ function inferExpenseCategoryHeuristic(data) {
     /\b(lumber|plywood|drywall|shingle|shingles|nails|screws|concrete|rebar|insulation|caulk|adhesive|materials?|siding|vinyl\s*siding|soffit|fascia|eavestrough|gutter|flashing|wrap|tyvek|house\s*wrap|sheathing|osb|studs|joists|truss|paint|primer|stain)\b/.test(
       memo
     )
-  ) return 'Materials';
+  )
+    return 'Materials';
   if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
   if (/\b(tool|saw|drill|blade|bit|ladder|hammer)\b/.test(memo)) return 'Tools';
   if (/\b(subcontract|sub-contractor|subcontractor)\b/.test(memo)) return 'Subcontractors';
@@ -672,7 +704,10 @@ function inferExpenseCategoryHeuristic(data) {
 
 function formatMoneyDisplay(n) {
   try {
-    const fmt = new Intl.NumberFormat('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const fmt = new Intl.NumberFormat('en-CA', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
     return `$${fmt.format(n)}`;
   } catch {
     return `$${n.toFixed(2)}`;
@@ -914,17 +949,14 @@ function resolveJobFromReply(input, pending) {
   const lc = t.toLowerCase();
   if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return '__MORE__';
 
-  // list ids / interactive ids
   if (pending?.expenseJobPickerIdMap && pending.expenseJobPickerIdMap[t]) {
     return pending.expenseJobPickerIdMap[t];
   }
 
-  // numeric picks (absolute index)
   if (/^\d+$/.test(t) && pending?.expenseJobPickerNumMap?.[t]) {
     return pending.expenseJobPickerNumMap[t];
   }
 
-  // name matches
   if (pending?.expenseJobPickerNameMap) {
     const mapped = pending.expenseJobPickerNameMap[String(t).toLowerCase()];
     if (mapped) return mapped;
@@ -933,15 +965,39 @@ function resolveJobFromReply(input, pending) {
   return t;
 }
 
+/* ---------------- media normalization (aligned) ---------------- */
+
+function normalizeMediaMetaForTx(pendingMediaMeta) {
+  if (!pendingMediaMeta) return null;
+
+  // If postgres.js provides normalizeMediaMeta, use it (keeps consistent columns)
+  if (typeof pg.normalizeMediaMeta === 'function') {
+    try {
+      return pg.normalizeMediaMeta({
+        url: pendingMediaMeta.url || null,
+        type: pendingMediaMeta.type || null,
+        transcript: truncateText(pendingMediaMeta.transcript, MAX_MEDIA_TRANSCRIPT_CHARS),
+        confidence: pendingMediaMeta.confidence ?? null
+      });
+    } catch {}
+  }
+
+  // fallback shape expected by insertTransaction wrapper
+  return {
+    url: pendingMediaMeta.url || null,
+    type: pendingMediaMeta.type || null,
+    transcript: truncateText(pendingMediaMeta.transcript, MAX_MEDIA_TRANSCRIPT_CHARS),
+    confidence: pendingMediaMeta.confidence ?? null
+  };
+}
+
 /* ---------------- main handler ---------------- */
 
 async function handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   input = stripExpensePrefixes(input);
 
   const lockKey = `lock:${from}`;
-
-  const msgId = String(sourceMsgId || '').trim() || `${from}:${Date.now()}`;
-  const safeMsgId = String(sourceMsgId || msgId || '').trim();
+  const safeMsgId = String(sourceMsgId || `${from}:${Date.now()}`).trim();
 
   let reply;
 
@@ -1031,7 +1087,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       if (token === 'yes' && pending?.pendingExpense) {
         const rawData = pending.pendingExpense || {};
-        const mediaMeta = pending?.pendingMediaMeta || null;
+        const mediaMeta = normalizeMediaMetaForTx(pending?.pendingMediaMeta || null);
 
         let data = normalizeExpenseData(rawData, userProfile);
         data.store = await normalizeVendorName(ownerId, data.store);
@@ -1087,14 +1143,9 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             category: category ? String(category).trim() : null,
             user_name: userProfile?.name || 'Unknown User',
             source_msg_id: stableMsgId,
+            // pg.insertTransaction expects mediaMeta and will schema-map it;
+            // we pass the normalized object (or null).
             mediaMeta: mediaMeta
-              ? {
-                  url: mediaMeta.url || null,
-                  type: mediaMeta.type || null,
-                  transcript: truncateText(mediaMeta.transcript, MAX_MEDIA_TRANSCRIPT_CHARS),
-                  confidence: mediaMeta.confidence ?? null
-                }
-              : null
           }),
           5000,
           '__DB_TIMEOUT__'
@@ -1131,7 +1182,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       if (token === 'edit') {
         await deletePendingTransactionState(from);
-        reply = '✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").';
+        reply =
+          '✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").';
         return twimlText(reply);
       }
 
@@ -1153,7 +1205,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
 
-      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+      const jobName =
+        data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
 
       if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
 
@@ -1214,7 +1267,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
-      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+      const jobName =
+        data.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
 
       if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 

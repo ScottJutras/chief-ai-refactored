@@ -1,6 +1,21 @@
 // handlers/commands/revenue.js
+// COMPLETE DROP-IN (aligned with latest postgres.js + expense.js + job.js patterns)
+//
+// Alignments included:
+// - Uses pg.insertTransaction canonical path with idempotency via source_msg_id (if supported in postgres.js)
+// - Uses pg.normalizeMediaMeta (already imported) for consistent media payloads
+// - Stable confirm template send (Twilio Content Template) with TwiML fallback
+// - Deterministic parse first (money/date/job) then AI fallback
+// - Confirm flow mirrors expense.js: "db timeout" -> keep pending and ask user to tap Yes again
+// - "edit" clears pending immediately (prevents confusing stuck state)
+// - Addresses/job number heuristics to avoid treating addresses as money
+// - "source" can represent payer; if it looks like an address/job we shift it into jobName
+//
+// Signature expected by router:
+//   handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId)
 
-const { insertTransaction, normalizeMediaMeta, DIGITS } = require('../../services/postgres');
+const pg = require('../../services/postgres');
+const { insertTransaction, normalizeMediaMeta, DIGITS } = pg;
 
 const state = require('../../utils/stateManager');
 const getPendingTransactionState = state.getPendingTransactionState;
@@ -36,15 +51,6 @@ const validateCIL =
   (typeof cilMod === 'function' && cilMod) ||
   null;
 
-console.info('[REVENUE] cil export keys', {
-  keys: Object.keys(cilMod || {}),
-  validateCILType: typeof validateCIL
-});
-
-if (!validateCIL) {
-  console.warn('[REVENUE] validateCIL not found in ../../cil export; CIL gate will be fail-open until fixed.');
-}
-
 /* ---------------- Twilio Content Template (WhatsApp Quick Reply Buttons) ---------------- */
 
 function xmlEsc(s = '') {
@@ -79,8 +85,7 @@ function waTo(from) {
 }
 
 /**
- * Sends WhatsApp Content Template via Twilio REST API.
- * IMPORTANT: This is NOT TwiML Content tag; this is outbound REST send.
+ * Sends WhatsApp Content Template via Twilio REST API (outbound REST send).
  */
 async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -180,10 +185,7 @@ function toNumberAmount(amountStr) {
 
 function formatMoneyDisplay(n) {
   try {
-    const fmt = new Intl.NumberFormat('en-CA', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2
-    });
+    const fmt = new Intl.NumberFormat('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return `$${fmt.format(n)}`;
   } catch {
     return `$${n.toFixed(2)}`;
@@ -198,7 +200,7 @@ function todayInTimeZone(tz) {
       month: '2-digit',
       day: '2-digit'
     });
-    return dtf.format(new Date()); // YYYY-MM-DD
+    return dtf.format(new Date()); // YYYY-MM-DD in en-CA
   } catch {
     return new Date().toISOString().split('T')[0];
   }
@@ -208,7 +210,7 @@ function todayInTimeZone(tz) {
  * Parse:
  * - today/yesterday/tomorrow
  * - YYYY-MM-DD
- * - "December 22, 2025" / "Dec 22 2025" / "December 22 2025"
+ * - "December 22, 2025" / "Dec 22 2025"
  */
 function parseNaturalDate(s, tz) {
   const raw = String(s || '').trim();
@@ -259,9 +261,7 @@ function looksLikeOverhead(s) {
 function looksLikeAddress(s) {
   const t = String(s || '').trim();
   if (!/\d/.test(t)) return false;
-  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pkwy|park)\b/i.test(
-    t
-  );
+  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pkwy|park)\b/i.test(t);
 }
 
 async function withTimeout(promise, ms, fallbackValue = null) {
@@ -273,7 +273,7 @@ function normalizeRevenueData(data, tz) {
 
   if (d.amount != null) {
     const n = toNumberAmount(d.amount);
-    if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n); // ✅ commas
+    if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
   }
 
   d.date = String(d.date || '').trim() || todayInTimeZone(tz);
@@ -294,6 +294,8 @@ function normalizeRevenueData(data, tz) {
 
   return d;
 }
+
+/* ---------------- CIL (fail-open) ---------------- */
 
 function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
@@ -337,7 +339,7 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
   }
 }
 
-/* --------- Deterministic parse (aligned with expense/mediaParser) --------- */
+/* --------- Deterministic parse (aligned with expense.js) --------- */
 
 function extractMoneyToken(raw) {
   const s = String(raw || '');
@@ -362,7 +364,7 @@ function moneyToFixed(token) {
   if (!cleaned) return null;
   const n = Number(cleaned.replace(/,/g, ''));
   if (!Number.isFinite(n) || n <= 0) return null;
-  return formatMoneyDisplay(n); // ✅ commas
+  return formatMoneyDisplay(n);
 }
 
 /**
@@ -377,20 +379,10 @@ async function deterministicRevenueParse({ input, tz }) {
 
   const token = extractMoneyToken(raw);
 
+  // If token is a big bare integer, could be job # or address — require $ form to accept.
   if (token && /^\d{4,}$/.test(String(token).replace(/,/g, ''))) {
-    const jobNum = raw.match(/\bjob\s+(\d{3,6})\b/i)?.[1];
-    if (jobNum && String(jobNum) === String(token).replace(/,/g, '')) {
-      const dollarOnly = raw.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
-      if (dollarOnly?.[1]) {
-        const amt = moneyToFixed(dollarOnly[1]);
-        if (!amt) return null;
-        return normalizeRevenueData(
-          { amount: amt, date: todayInTimeZone(tz), description: 'Revenue received', source: 'Unknown', jobName: null },
-          tz
-        );
-      }
-      return null;
-    }
+    const hasDollar = /\$\s*\d/.test(raw);
+    if (!hasDollar) return null;
   }
 
   const amount = moneyToFixed(token);
@@ -423,20 +415,13 @@ async function deterministicRevenueParse({ input, tz }) {
   }
 
   if (!jobName) {
-    const onMatch = raw.match(
-      /\bon\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-    );
-    if (onMatch?.[1]) jobName = normalizeJobAnswer(onMatch[1]);
-  }
-
-  if (!jobName) {
     const jobMatch = raw.match(
       /\bjob\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
     );
     if (jobMatch?.[1]) jobName = normalizeJobAnswer(jobMatch[1]);
   }
 
-  // "from X" might be job/address or payer
+  // Payer "from X"
   let source = 'Unknown';
   const fromMatch = raw.match(
     /\bfrom\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
@@ -447,7 +432,7 @@ async function deterministicRevenueParse({ input, tz }) {
       jobName = jobName || token2;
       source = 'Unknown';
     } else {
-      source = token2; // payer
+      source = token2;
     }
   }
 
@@ -466,9 +451,18 @@ async function deterministicRevenueParse({ input, tz }) {
 }
 
 /**
- * Canonical insert
+ * Canonical insert wrapper aligned to postgres.js insertTransaction signature.
  */
-async function writeRevenueViaCanonicalInsert({ ownerId, from, userProfile, data, jobName, category, sourceMsgId, pendingMediaMeta }) {
+async function writeRevenueViaCanonicalInsert({
+  ownerId,
+  from,
+  userProfile,
+  data,
+  jobName,
+  category,
+  sourceMsgId,
+  pendingMediaMeta
+}) {
   const ownerStr = String(ownerId || '').trim();
   const owner = /^\d+$/.test(ownerStr) ? DIGITS(ownerStr) : ownerStr;
   if (!owner) throw new Error('Missing ownerId');
@@ -488,13 +482,12 @@ async function writeRevenueViaCanonicalInsert({ ownerId, from, userProfile, data
   );
 
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
-
   const safeCategory = (() => {
     const c = String(category || '').trim();
-    if (!c) return null;
-    return c;
+    return c ? c : null;
   })();
 
+  // NOTE: keep payload keys consistent with your postgres.js insertTransaction.
   const payload = {
     ownerId: owner,
     kind: 'revenue',
@@ -512,7 +505,16 @@ async function writeRevenueViaCanonicalInsert({ ownerId, from, userProfile, data
     mediaMeta: mediaMeta ? { ...mediaMeta } : null
   };
 
-  return await insertTransaction(payload, { timeoutMs: 4500 });
+  // Some versions accept (payload) only; others accept (payload, opts)
+  try {
+    return await insertTransaction(payload, { timeoutMs: 4500 });
+  } catch (e) {
+    // fallback to legacy signature if needed
+    if (/too many arguments|expected 1 argument/i.test(String(e?.message || ''))) {
+      return await insertTransaction(payload);
+    }
+    throw e;
+  }
 }
 
 /* ---------------- main handler ---------------- */
@@ -535,7 +537,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       pending = null;
     }
 
-    // Follow-up: revenue clarification (date, etc.)
+    // Follow-up: revenue clarification
     if (pending?.awaitingRevenueClarification) {
       const maybeDate = parseNaturalDate(input, tz);
 
@@ -592,7 +594,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
       const token = normalizeDecisionToken(input);
 
-      // ✅ prefer stable id from media.js
+      // ✅ stable id across retries (idempotency)
       const stableMsgId = String(pending.revenueSourceMsgId || safeMsgId).trim();
 
       if (token === 'yes') {
@@ -674,9 +676,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       if (token === 'edit') {
-        // ✅ ALIGNMENT: clear pending immediately to prevent "pending-nudge" confusion
         await deletePendingTransactionState(from);
-
         reply = '✏️ Okay — resend the Revenue details in one line (e.g., "received $100 for 1556 Medway Park Dr today").';
         return twimlText(reply);
       }
@@ -708,6 +708,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       if (data) data = normalizeRevenueData(data, tz);
     }
 
+    // If AI asked a clarification question, store it as "awaitingRevenueClarification"
     if (aiReply) {
       await mergePendingTransactionState(from, {
         ...(pending || {}),
@@ -728,7 +729,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
       if (!existingJob && srcRaw) {
         const srcClean = normalizeJobAnswer(srcRaw);
-
         const srcLooksJob = /^\s*job\b/i.test(srcRaw) || looksLikeAddress(srcClean) || looksLikeAddress(srcRaw);
 
         if (srcLooksJob) {
@@ -750,6 +750,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         errors = null;
       }
 
+      // ignore "missing source/client" if we consider it optional
       if (errors) {
         const s = String(errors);
         if (/client:\s*missing|source:\s*missing/i.test(s)) errors = null;

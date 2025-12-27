@@ -1515,9 +1515,9 @@ function normalizeVendorString(v) {
     'convoy': 'Convoy Supply',
     'rona': 'RONA',
     'lowes': "Lowe's",
-    'lowe’s': "Lowe's"
+    'lowe’s': "Lowe's",
     'gentek': 'Gentek',
-    'gentech': 'Gentek',
+    'gentech': 'Gentek'
   };
 
   return ALIASES[key] || s;

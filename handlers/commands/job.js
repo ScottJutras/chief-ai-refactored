@@ -7,7 +7,11 @@ const pg = require('../../services/postgres');
 const state = require('../../utils/stateManager');
 
 const getPendingTransactionState = state.getPendingTransactionState;
-const deletePendingTransactionState = state.deletePendingTransactionState;
+const deletePendingTransactionState =
+  state.deletePendingTransactionState ||
+  state.deletePendingState ||
+  state.clearPendingTransactionState ||
+  null;
 
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
@@ -16,8 +20,6 @@ const mergePendingTransactionState =
 /* ---------------- helpers ---------------- */
 
 function normaliseOwnerId(ownerId, fromPhone) {
-  // NOTE: ownerId is likely a UUID (preferred). Do NOT DIGITS() it here.
-  // Just stringify and trust upstream mapping (webhook maps phone->uuid).
   const base = ownerId || fromPhone;
   if (!base) return null;
   return String(base).trim();
@@ -49,7 +51,6 @@ function respond(res, message) {
 }
 
 function waTo(fromPhone) {
-  // expects "+1555..." OR "1555..." OR "whatsapp:+1555..."
   const s = String(fromPhone || '').trim();
   if (!s) return null;
   if (s.startsWith('whatsapp:')) return s;
@@ -79,6 +80,19 @@ function dedupeJobs(list) {
     out.push(s);
   }
   return out;
+}
+
+function isPickerOpenCommand(lc) {
+  // Commands that should (re)open the picker, even if we were awaiting a selection.
+  return /^(show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs|pick\s+job|change\s+job)\b/.test(lc);
+}
+
+function isCancelLike(lc) {
+  return /^(cancel|stop|no)\b/.test(lc);
+}
+
+function isMoreLike(lc) {
+  return /^(more|more jobs|more jobs…)\b/.test(lc);
 }
 
 /* ---------------- Twilio list-picker content helpers ---------------- */
@@ -228,8 +242,7 @@ async function listJobs(ownerId) {
 
 Try:
 - "create job Oak Street re-roof"
-- "create job 12 Elm - siding"
-and then log time/expenses to those jobs.`;
+- "create job 12 Elm - siding"`;
   }
 
   const lines = rows.map((j, idx) => {
@@ -278,15 +291,24 @@ function buildPickerMap(jobs, page, perPage) {
   const map = {};
 
   for (let i = 0; i < slice.length; i++) {
-    const idx = start + i + 1; // absolute number
+    const idx = start + i + 1;
     map[String(idx)] = slice[i];
   }
-
   for (const j of slice) {
     map[String(j).toLowerCase()] = j;
   }
 
   return map;
+}
+
+async function clearPickerState(fromPhone) {
+  await mergePendingTransactionState(fromPhone, {
+    awaitingActiveJobPick: false,
+    activeJobPickPage: null,
+    activeJobPickMap: null,
+    activeJobPickHasMore: null,
+    activeJobPickTotal: null
+  });
 }
 
 async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobs, page = 0, perPage = 8 }) {
@@ -307,12 +329,19 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobs, pa
     activeJobPickTotal: uniq.length
   });
 
-  // If list picker is disabled or we can't build a WhatsApp "to", fallback to text
+  // ---- IMPORTANT DEBUG LOGS ----
+  console.info('[JOB_PICKER] render', {
+    enableListPicker: ENABLE_LIST_PICKER,
+    hasTo: !!to,
+    page,
+    perPage,
+    total: uniq.length
+  });
+
   if (!ENABLE_LIST_PICKER || !to) {
     return respond(res, buildTextPicker(uniq, page, perPage));
   }
 
-  // Build list-picker items (max 10)
   const items = [];
   for (let i = 0; i < slice.length && items.length < 10; i++) {
     const absIdx = start + i + 1;
@@ -324,15 +353,8 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobs, pa
     });
   }
 
-  // Overhead
-  if (items.length < 10) {
-    items.push({ item: 'Overhead', id: 'overhead', description: 'Not tied to a job' });
-  }
-
-  // More
-  if (hasMore && items.length < 10) {
-    items.push({ item: 'More jobs…', id: 'more', description: 'Show the next page' });
-  }
+  if (items.length < 10) items.push({ item: 'Overhead', id: 'overhead', description: 'Not tied to a job' });
+  if (hasMore && items.length < 10) items.push({ item: 'More jobs…', id: 'more', description: 'Show the next page' });
 
   const body = `Pick your active job (${start + 1}-${Math.min(start + perPage, uniq.length)} of ${uniq.length}).`;
   const button = 'Pick job';
@@ -346,7 +368,6 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobs, pa
       cacheKey: `active_jobs:${ownerId}:${page}:${stableHash(JSON.stringify(items))}`
     });
 
-    // IMPORTANT: return empty TwiML to avoid double-sending
     if (res && typeof res.send === 'function' && !res.headersSent) {
       res.type('text/xml').send(twimlEmpty());
     }
@@ -362,20 +383,17 @@ function resolvePickerReply(raw, pending) {
   const lc = s.toLowerCase();
 
   if (!s) return null;
-  if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return '__MORE__';
+  if (isMoreLike(lc)) return '__MORE__';
   if (lc === 'overhead' || lc === 'oh') return 'Overhead';
 
   // list-picker ids: job_<N>_<hash>
   const m = s.match(/^job_(\d+)_/i);
   if (m?.[1]) return pending?.activeJobPickMap?.[String(m[1])] || null;
 
-  // number
   if (/^\d+$/.test(s)) return pending?.activeJobPickMap?.[s] || null;
 
-  // job name (case-insensitive)
   if (pending?.activeJobPickMap?.[lc]) return pending.activeJobPickMap[lc];
 
-  // free text job name
   return s;
 }
 
@@ -384,20 +402,26 @@ function resolvePickerReply(raw, pending) {
 async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId) {
   const owner = normaliseOwnerId(ownerId, fromPhone);
   if (!owner) {
-    return respond(
-      res,
-      `I couldn't figure out which account this belongs to yet.
-
-Try starting from WhatsApp with "Hi Chief" so I can link your number.`
-    );
+    return respond(res, `I couldn't figure out which account this belongs to yet.`);
   }
 
   const msg = String(text || '').trim();
   const lc = msg.toLowerCase();
 
-  // ✅ If we're awaiting a pick, handle the reply first
+  // ✅ If picker is open, DO NOT treat "cancel"/"show active jobs"/"change job" as a job name.
   const pending = await getPendingTransactionState(fromPhone);
   if (pending?.awaitingActiveJobPick) {
+    if (isCancelLike(lc)) {
+      await clearPickerState(fromPhone);
+      return respond(res, `❌ Cancelled. (No active job changed.)`);
+    }
+
+    if (isPickerOpenCommand(lc)) {
+      // user asked again → re-render picker (page 0)
+      const jobs = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
+      return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs, page: 0, perPage: 8 });
+    }
+
     const resolved = resolvePickerReply(msg, pending);
 
     if (resolved === '__MORE__') {
@@ -408,19 +432,22 @@ Try starting from WhatsApp with "Hi Chief" so I can link your number.`
 
     const jobName = resolved && String(resolved).trim() ? String(resolved).trim() : null;
 
-    await mergePendingTransactionState(fromPhone, {
-      awaitingActiveJobPick: false,
-      activeJobPickPage: null,
-      activeJobPickMap: null,
-      activeJobPickHasMore: null,
-      activeJobPickTotal: null
-    });
+    // If the reply is unknown, DON'T activate it. Ask again.
+    if (!jobName) {
+      return respond(res, `⚠️ I didn’t catch that. Reply with a number, job name, "Overhead", or "more".`);
+    }
 
-    if (!jobName || jobName === 'Overhead') {
+    // Guard: prevent activating obvious command strings
+    if (isPickerOpenCommand(jobName.toLowerCase()) || isCancelLike(jobName.toLowerCase())) {
+      return respond(res, `⚠️ Reply with a number or a job name from the list (or "cancel").`);
+    }
+
+    await clearPickerState(fromPhone);
+
+    if (jobName === 'Overhead') {
       return respond(res, `✅ Okay — no active job set (Overhead).`);
     }
 
-    // activate
     try {
       const j = await pg.activateJobByName(owner, jobName);
       const finalName = j?.name || j?.job_name || jobName;
@@ -441,8 +468,8 @@ Now you can:
     }
   }
 
-  // ✅ Global job picker commands
-  if (/^(show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs|pick\s+job|change\s+job)\b/i.test(msg)) {
+  // ✅ Picker commands (global)
+  if (isPickerOpenCommand(lc)) {
     const jobs = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
     return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs, page: 0, perPage: 8 });
   }
@@ -483,9 +510,7 @@ Now you can:
       sourceMsgId
     });
 
-    if (!out?.job) {
-      return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
-    }
+    if (!out?.job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
 
     const jobName = out.job.job_name || out.job.name || name || 'Untitled Job';
     const jobNo = out.job.job_no ?? '?';
@@ -496,32 +521,28 @@ Now you can:
         `✅ Created job: "${jobName}" (Job #${jobNo}).
 
 Next:
-- Set active: "change job" (or "active job ${jobName}")
-- Log time: "clock in @ ${jobName}"
-- Log expense: "expense 84.12 nails from Home Depot"`
+- Switch: "change job"
+- Time: "clock in @ ${jobName}"
+- Expense: "expense 84.12 nails from Home Depot"`
       );
     }
 
     if (out.reason === 'already_exists') {
-      return respond(
-        res,
-        `✅ That job already exists: "${jobName}" (Job #${jobNo}).
-
-Want to switch to it? Reply: "active job ${jobName}"`
-      );
+      return respond(res, `✅ That job already exists: "${jobName}" (Job #${jobNo}).`);
     }
 
     return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
   }
 
-  const help = `Job commands you can use:
+  return respond(
+    res,
+    `Job commands you can use:
 
 - "create job Oak Street re-roof"
 - "change job" (shows active jobs picker)
 - "active job Oak Street re-roof"
-- "list jobs"`;
-
-  return respond(res, help);
+- "list jobs"`
+  );
 }
 
 module.exports = { handleJob };

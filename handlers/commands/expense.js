@@ -789,21 +789,28 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
   const client = getTwilioClient();
   const { waFrom, messagingServiceSid } = getSendFromConfig();
 
+  if (!to) throw new Error('Missing "to"');
+
   const payload = {
-    to,
+    to: String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`,
     ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
     body: String(bodyText || '').slice(0, 1600),
-    interactive: {
-      type: 'list',
-      body: { text: String(bodyText || '').slice(0, 1024) },
-      action: {
-        button: String(buttonText || 'Pick a job').slice(0, 20),
-        sections
-      }
-    }
+
+    // ✅ WhatsApp interactive list for Twilio Messaging API:
+    // Use persistentAction with "action=" + JSON string.
+    persistentAction: [
+      `action=${JSON.stringify({
+        type: 'list',
+        body: { text: String(bodyText || '').slice(0, 1024) },
+        action: {
+          button: String(buttonText || 'Pick a job').slice(0, 20),
+          sections: Array.isArray(sections) ? sections : []
+        }
+      })}`
+    ]
   };
 
-  const TIMEOUT_MS = 3000;
+  const TIMEOUT_MS = 3500;
   const msg = await Promise.race([
     client.messages.create(payload),
     new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
@@ -812,6 +819,7 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
   console.info('[INTERACTIVE_LIST] sent', { to: payload.to, sid: msg?.sid || null, status: msg?.status || null });
   return msg;
 }
+
 
 function buildTextJobPrompt(jobOptions, page, pageSize) {
   const start = page * pageSize;
@@ -894,21 +902,41 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   }
 }
 
-/* ---------------- Active job resolution (aligned) ---------------- */
+/* ---------------- Active job resolution (aligned + self-disabling) ---------------- */
+
+// cache: null = unknown, false = don't call, true = ok
+let _ACTIVE_JOB_IDENTITY_OK = null;
 
 async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
   const directName = userProfile?.active_job_name || userProfile?.activeJobName || null;
   if (directName && String(directName).trim()) return String(directName).trim();
 
+  if (_ACTIVE_JOB_IDENTITY_OK === false) return null;
+
   if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
       const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
+      _ACTIVE_JOB_IDENTITY_OK = true;
+
       const n = out?.active_job_name || out?.activeJobName || null;
       if (n && String(n).trim()) return String(n).trim();
-    } catch {}
+    } catch (e) {
+      const msg = String(e?.message || '').toLowerCase();
+      const code = String(e?.code || '');
+
+      // If memberships table is missing, permanently stop calling to avoid log spam.
+      if (code === '42P01' || msg.includes('relation "public.memberships" does not exist') || msg.includes('public.memberships')) {
+        _ACTIVE_JOB_IDENTITY_OK = false;
+        return null;
+      }
+
+      // otherwise: fail open
+    }
   }
+
   return null;
 }
+
 
 /* ---------------- CIL builders (kept) ---------------- */
 

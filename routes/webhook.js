@@ -12,6 +12,7 @@
 // ✅ Tightens job-picker stealing: numeric/job_* tokens will not be routed to job.js if expense pending_actions exist.
 // ✅ Keeps ownerId numeric (phone digits). ownerUuid can be stored separately if you map it.
 // ✅ Avoids double-send TwiML and keeps the 8s safety timer.
+// ✅ NEW: Global "cancel/stop" hard clears pending_actions + legacy state so Cancel never falls through to menu.
 
 const express = require('express');
 const querystring = require('querystring');
@@ -223,10 +224,16 @@ function looksRevenueNl(str) {
 const PA_KIND_PICK_JOB_EXPENSE = 'pick_job_for_expense';
 const PA_KIND_CONFIRM_EXPENSE = 'confirm_expense';
 
+// optional (if you add revenue Option A later)
+const PA_KIND_PICK_JOB_REVENUE = 'pick_job_for_revenue';
+const PA_KIND_CONFIRM_REVENUE = 'confirm_revenue';
+
 // ✅ IMPORTANT: Only use getPendingActionByKind if it exists.
-// DO NOT fall back to pg.getPendingAction for kind queries (your pg.getPendingAction is NOT kind-aware).
 const pgGetPendingActionByKind =
   (typeof pg.getPendingActionByKind === 'function' && pg.getPendingActionByKind) || null;
+
+const pgDeletePendingActionByKind =
+  (typeof pg.deletePendingActionByKind === 'function' && pg.deletePendingActionByKind) || null;
 
 // TTL minutes for SQL fallback. Should match services/postgres.js PENDING_TTL_MIN.
 const PA_TTL_MIN = Number(process.env.PENDING_TTL_MIN || 10);
@@ -241,7 +248,6 @@ async function getPA({ ownerId, userId, kind }) {
     try {
       const r = await pgGetPendingActionByKind({ ownerId: owner, userId: user, kind: k });
       if (!r) return null;
-      // normalize payload (some helpers return payload directly)
       if (r.payload != null) return r;
       if (typeof r === 'object') return { payload: r };
       return null;
@@ -250,7 +256,6 @@ async function getPA({ ownerId, userId, kind }) {
     }
   }
 
-  // SQL fallback (TTL via created_at)
   try {
     const r = await query(
       `
@@ -269,6 +274,53 @@ async function getPA({ ownerId, userId, kind }) {
   } catch {
     return null;
   }
+}
+
+async function deletePA({ ownerId, userId, kind }) {
+  const owner = String(ownerId || '').trim();
+  const user = String(userId || '').trim();
+  const k = String(kind || '').trim();
+  if (!owner || !user || !k) return;
+
+  if (pgDeletePendingActionByKind) {
+    try {
+      await pgDeletePendingActionByKind({ ownerId: owner, userId: user, kind: k });
+      return;
+    } catch {
+      // fall through
+    }
+  }
+
+  try {
+    await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [owner, user, k]);
+  } catch {
+    // ignore
+  }
+}
+
+async function clearAllPendingForUser({ ownerId, from }) {
+  const kinds = [
+    PA_KIND_CONFIRM_EXPENSE,
+    PA_KIND_PICK_JOB_EXPENSE,
+    PA_KIND_CONFIRM_REVENUE,
+    PA_KIND_PICK_JOB_REVENUE,
+    'timeclock.confirm'
+  ];
+
+  await Promise.all(kinds.map((k) => deletePA({ ownerId, userId: from, kind: k }).catch(() => null)));
+
+  // legacy state cleanup (safe)
+  try {
+    if (typeof stateManager.clearFinanceFlow === 'function') {
+      await stateManager.clearFinanceFlow(from).catch(() => null);
+    }
+  } catch {}
+
+  try {
+    if (typeof stateManager.deletePendingTransactionState === 'function') {
+      await stateManager.deletePendingTransactionState(from).catch(() => null);
+    }
+  } catch {}
 }
 
 async function hasExpensePA(ownerId, from) {
@@ -292,14 +344,13 @@ router.use((req, _res, next) => {
   const isForm = ct.includes('application/x-www-form-urlencoded');
   if (!isForm) return next();
 
-  // If already parsed AND we have rawBody, keep it
   if (req.body && Object.keys(req.body).length && typeof req.rawBody === 'string') return next();
 
   let raw = '';
   req.setEncoding('utf8');
   req.on('data', (chunk) => {
     raw += chunk;
-    if (raw.length > 1_000_000) req.destroy(); // 1MB guard
+    if (raw.length > 1_000_000) req.destroy();
   });
   req.on('end', () => {
     req.rawBody = raw;
@@ -328,11 +379,8 @@ router.all('*', (req, res, next) => {
 
 router.use((req, _res, next) => {
   req.from = req.body?.From ? normalizePhone(req.body.From) : null;
-
-  // IMPORTANT: keep ownerId numeric (aligns with postgres.js DIGITS() calls).
   req.ownerId = req.from || null;
 
-  // canonical URL used by token middleware for Twilio signature checks
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
   const path = req.originalUrl || req.url || '/api/webhook';
@@ -441,7 +489,6 @@ router.post('*', async (req, res, next) => {
       sourceMsgId
     );
 
-    // ✅ handlers/media.js returns { transcript, twiml }.
     if (result && typeof result === 'object') {
       if (result.twiml && !res.headersSent) {
         return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
@@ -452,7 +499,6 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // Back-compat: if a handler returns a plain TwiML string
     if (typeof result === 'string' && result && !res.headersSent) {
       return res.status(200).type('application/xml; charset=utf-8').send(result);
     }
@@ -468,11 +514,10 @@ router.post('*', async (req, res, next) => {
 
 router.post('*', async (req, res, next) => {
   try {
-    // Optional: map phone -> owner UUID, but DO NOT overwrite numeric ownerId (postgres.js alignment).
     if (req.from) {
       try {
         const mapped = await getOwnerUuidForPhone(req.from);
-        if (mapped) req.ownerUuid = mapped; // keep separate
+        if (mapped) req.ownerUuid = mapped;
       } catch (e) {
         console.warn('[WEBHOOK] owner uuid map failed:', e?.message);
       }
@@ -481,14 +526,23 @@ router.post('*', async (req, res, next) => {
     let pending = await getPendingTransactionState(req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // Define inbound text early (button-aware + list-aware)
     let text = String(getInboundText(req.body || {}) || '').trim();
     let lc = text.toLowerCase();
 
-    // Canonical idempotency key for ingestion (Twilio)
     const crypto = require('crypto');
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid = rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
+
+    /* -----------------------------------------------------------------------
+     * ✅ GLOBAL HARD CANCEL (NEW)
+     * -----------------------------------------------------------------------
+     * Ensures "cancel/stop/no" never falls through to the help menu.
+     * Clears Option A pending_actions + legacy state.
+     */
+    if (/^(cancel|stop|no)\b/.test(lc)) {
+      await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
+      return ok(res, '❌ Cancelled. You’re cleared.');
+    }
 
     // ✅ Option A: check pending_actions FIRST (so "1"/"job_1_*"/"yes" go to expense.js, not job.js)
     const expensePA = await hasExpensePA(req.ownerId, req.from);
@@ -504,20 +558,11 @@ router.post('*', async (req, res, next) => {
     const pendingExpenseFlowLegacy =
       !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
 
-    // If expense.js Option A is in play, treat it as pending expense even if stateManager is empty.
     const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
 
-    // ✅ IMPORTANT:
-    // Only allow numeric/job_* tokens to route to job.js IF awaitingActiveJobPick is true AND NOT in an expense pending_actions flow.
     const allowJobPickerThrough = (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
 
     if (pendingRevenueFlow) {
-      if (/^(cancel|stop|no)\b/.test(lc)) {
-        try {
-          await require('../utils/stateManager').deletePendingTransactionState?.(req.from);
-        } catch {}
-        return ok(res, `❌ Revenue cancelled.`);
-      }
       if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
       if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
         return ok(res, pendingTxnNudgeMessage({ type: 'revenue' }));
@@ -525,13 +570,6 @@ router.post('*', async (req, res, next) => {
     }
 
     if (pendingExpenseFlow) {
-      // For Option A flows, expense.js itself handles cancel/edit; still support legacy cancel shortcut.
-      if (/^(cancel|stop|no)\b/.test(lc) && pendingExpenseFlowLegacy) {
-        try {
-          await require('../utils/stateManager').deletePendingTransactionState?.(req.from);
-        } catch {}
-        return ok(res, `❌ Expense cancelled.`);
-      }
       if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
       if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
         return ok(res, pendingTxnNudgeMessage({ type: 'expense' }));
@@ -545,39 +583,23 @@ router.post('*', async (req, res, next) => {
     if (hasPendingMedia && numMedia === 0) {
       try {
         const { handleMedia } = require('../handlers/media');
-        const result = await handleMedia(
-          req.from,
-          text,
-          req.userProfile || {},
-          req.ownerId,
-          null,
-          null,
-          messageSid
-        );
+        const result = await handleMedia(req.from, text, req.userProfile || {}, req.ownerId, null, null, messageSid);
 
         if (result && typeof result === 'object') {
-          if (result.twiml) {
-            return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
-          }
-          if (result.transcript && !result.twiml) {
-            req.body.Body = result.transcript;
-          }
+          if (result.twiml) return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
+          if (result.transcript && !result.twiml) req.body.Body = result.transcript;
         } else if (typeof result === 'string' && result) {
           return res.status(200).type('application/xml; charset=utf-8').send(result);
         }
 
-        // refresh text after rewrite
         text = String(getInboundText(req.body || {}) || '').trim();
         lc = text.toLowerCase();
-
-        // refresh pending too
         pending = await getPendingTransactionState(req.from);
       } catch (e) {
         console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
       }
     }
 
-    // refresh after any rewrite
     const text2 = String(getInboundText(req.body || {}) || '').trim();
     const lc2 = text2.toLowerCase();
     const isPickerToken = looksLikeJobPickerReplyToken(text2);
@@ -587,7 +609,6 @@ router.post('*', async (req, res, next) => {
      * AND NOT blocked by expense pending_actions.
      * ----------------------------------------------------------------------- */
     if (!hasExpensePendingActions && (isJobPickerIntent(lc2) || pending?.awaitingActiveJobPick)) {
-      // If the inbound is a picker-token, ONLY let it route here when awaitingActiveJobPick is set.
       if (isPickerToken && !pending?.awaitingActiveJobPick) {
         // fall through
       } else {
@@ -620,8 +641,6 @@ router.post('*', async (req, res, next) => {
       (pending?.pendingCorrection && pending?.type === 'revenue') ||
       (!!pending?.pendingRevenue && !isNewRevenueCmd);
 
-    // ✅ For expense, include Option A pending_actions triggers.
-    // IMPORTANT: only route to expense when input looks like a reply-ish token or explicit expense prefix.
     const expensePendingActionsLike =
       hasExpensePendingActions && (isPickerToken || isAllowedWhilePending(lc2) || /^(expense|exp)\b/.test(lc2));
 
@@ -745,7 +764,7 @@ router.post('*', async (req, res, next) => {
 
     async function glossaryNudgeFrom(str) {
       try {
-        const glossary = require('../services/glossary'); // optional
+        const glossary = require('../services/glossary');
         const findClosestTerm = glossary?.findClosestTerm;
         if (typeof findClosestTerm !== 'function') return '';
 
@@ -781,7 +800,6 @@ router.post('*', async (req, res, next) => {
 
     const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(Boolean);
 
-    // Load command handlers defensively (exports vary across builds)
     let tasksHandler = null;
     let handleJob = null;
     let handleTimeclock = null;
@@ -841,8 +859,6 @@ router.post('*', async (req, res, next) => {
       return ok(res, msg);
     }
 
-    // ✅ If expense pending_actions exist, do NOT let job.js steal numeric/list tokens.
-    // Still allow explicit job intents like "change job" (but those were handled earlier).
     if (looksJob && typeof handleJob === 'function') {
       if (looksLikeJobPickerReplyToken(text2) && !isJobPickerIntent(lc2) && !pending?.awaitingActiveJobPick) {
         // fall through to agent/help
@@ -855,7 +871,6 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // Forecast
     if (/^forecast\b/i.test(lc2)) {
       try {
         const handled = await handleForecast(
@@ -874,7 +889,6 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // Timeclock v2 (optional)
     if (flags.timeclock_v2) {
       const cil = (() => {
         if (/^clock in\b/.test(lc2)) return { type: 'Clock', action: 'in' };
@@ -903,7 +917,6 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // Timeclock legacy
     if (looksTime && typeof handleTimeclock === 'function') {
       const out = await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (res.headersSent) return;
@@ -918,7 +931,6 @@ router.post('*', async (req, res, next) => {
       return ok(res, msg);
     }
 
-    // KPI command (optional)
     const looksKpi = /^kpis?\s+for\b/.test(lc2);
     const KPI_ENABLED = (process.env.FEATURE_FINANCE_KPIS || '1') === '1';
     const hasSub = canUseAgent(req.userProfile);
@@ -938,7 +950,6 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // Agent (unchanged)
     if (canUseAgent(req.userProfile)) {
       try {
         const { ask } = require('../services/agent');
@@ -959,7 +970,6 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    // Default help
     let msg =
       'PocketCFO — What I can do:\n' +
       '• Jobs: create job Roof Repair, change job, active job Roof Repair\n' +

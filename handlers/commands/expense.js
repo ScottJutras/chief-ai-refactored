@@ -1,10 +1,17 @@
 // handlers/commands/expense.js
 // COMPLETE DROP-IN (Option A): pending_actions-driven confirm + job picker
-// Fixes:
-// - middleware stealing confirm_expense (handled by middleware change)
-// - deletePendingAction wrong shape (uses deleteByKind)
-// - jobName duplication (sanity checks)
-// - "Gentek" -> "Gen Tech", "siding" -> "sighting" (post-transcript corrections)
+//
+// ✅ Fixes in this drop-in:
+// - ✅ FIX: numeric reply "1" no longer becomes job_id="1" (maps to UUID from stored jobOptions)
+// - ✅ FIX: interactive list row ids now carry the *job UUID* (job_1_<uuid>) when available
+// - ✅ FIX: if list picker UI fails to display, fallback message includes job names (so user can still pick)
+// - ✅ Keep: trade-term correction layer (Gentek, siding, soffit/fascia/eavestrough)
+// - ✅ Keep: uses deletePendingActionByKind + kind-aware pending action helpers
+// - ✅ Keep: confirm template sending + TwiML fallback
+//
+// Notes:
+// - We only pass job_id to insertTransaction when it is a UUID.
+// - If your DB/jobs table truly uses UUID ids (as your error indicates), listOpenJobsDetailed must return those UUIDs.
 
 const pg = require('../../services/postgres');
 const { query, insertTransaction } = pg;
@@ -177,7 +184,6 @@ async function deletePA({ ownerId, userId, kind }) {
 function correctTradeTerms(text) {
   let s = String(text || '');
 
-  // Normalize common STT splits/mis-hears
   // Gentek
   s = s.replace(/\bgen\s*tech\b/gi, 'Gentek');
   s = s.replace(/\bgentech\b/gi, 'Gentek');
@@ -186,12 +192,11 @@ function correctTradeTerms(text) {
   // Siding
   s = s.replace(/\bsighting\b/gi, 'siding');
 
-  // Other common contractor terms (optional but helpful)
+  // Other common contractor terms
   s = s.replace(/\bsoffet\b/gi, 'soffit');
   s = s.replace(/\bfacia\b/gi, 'fascia');
   s = s.replace(/\beaves\s*trough\b/gi, 'eavestrough');
 
-  // collapse repeated whitespace
   s = s.replace(/\s+/g, ' ').trim();
   return s;
 }
@@ -309,7 +314,9 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
 
 function normalizeDecisionToken(input) {
   const s = String(input || '').trim().toLowerCase();
-  if (s === 'yes' || s === 'y' || s === 'confirm') return 'yes';
+
+  // Button payloads / friendly variants
+  if (s === 'yes' || s === 'y' || s === 'confirm' || s === '✅ yes' || s === '✅yes') return 'yes';
   if (s === 'edit') return 'edit';
   if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
 
@@ -345,7 +352,7 @@ function toNumberAmount(amountStr) {
 
 function looksLikeUuid(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(str || '')
+    String(str || '').trim()
   );
 }
 
@@ -396,24 +403,19 @@ function stripEmbeddedDateAndJobFromItem(item, { date, jobName } = {}) {
 
 /**
  * ✅ Prevent jobName becoming a copy of the description:
- * Reject if it contains money/date/connector words typically found in the sentence body.
  */
 function sanitizeJobNameCandidate(candidate) {
   const s = String(candidate || '').trim();
   if (!s) return null;
   const lc = s.toLowerCase();
 
-  // Too "sentence-like"
   if (lc.includes('$') || /\b\d{4}-\d{2}-\d{2}\b/.test(lc)) return null;
   if (/\b(from|at|on|today|yesterday|tomorrow|worth|purchased|bought|paid|spent|received)\b/.test(lc)) return null;
 
-  // If it contains multiple connectors, likely not a job name
   const connectors = (lc.match(/\b(from|at|on|for)\b/g) || []).length;
   if (connectors >= 2) return null;
 
-  // Length guard
   if (s.length > 80) return null;
-
   return s;
 }
 
@@ -446,7 +448,11 @@ function vendorDefaultCategory(store) {
 
 function inferExpenseCategoryHeuristic(data) {
   const memo = `${data?.item || ''} ${data?.store || ''}`.toLowerCase();
-  if (/\b(materials?|siding|vinyl\s*siding|soffit|fascia|gutter|eavestrough|shingle|shingles|drywall|plywood|lumber|osb|wrap|tyvek|flashing|nails|screws|concrete|rebar|insulation|caulk|adhesive)\b/.test(memo))
+  if (
+    /\b(materials?|siding|vinyl\s*siding|soffit|fascia|gutter|eavestrough|shingle|shingles|drywall|plywood|lumber|osb|wrap|tyvek|flashing|nails|screws|concrete|rebar|insulation|caulk|adhesive)\b/.test(
+      memo
+    )
+  )
     return 'Materials';
   if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
   if (/\b(tool|saw|drill|blade|bit|ladder|hammer)\b/.test(memo)) return 'Tools';
@@ -477,7 +483,6 @@ function normalizeExpenseData(data, userProfile) {
   d.item = cleanExpenseItemForDisplay(d.item);
   d.store = String(d.store || '').trim() || 'Unknown Store';
 
-  // ✅ sanitize jobName
   if (d.jobName != null) d.jobName = sanitizeJobNameCandidate(d.jobName);
 
   if (d.suggestedCategory != null) {
@@ -541,7 +546,6 @@ function deterministicExpenseParse(input, userProfile) {
   }
   if (!date) date = todayInTimeZone(tz);
 
-  // Try explicit "for <job>" but sanitize heavily
   let jobName = null;
   const forJob = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:[.?!]|$)/i);
   if (forJob?.[1]) {
@@ -685,6 +689,10 @@ async function listOpenJobsDetailed(ownerId, limit = 50) {
   return [];
 }
 
+function looksLikeUuid(str) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+}
+
 function normalizeJobOptions(jobRows) {
   const out = [];
   const seen = new Set();
@@ -698,8 +706,13 @@ function normalizeJobOptions(jobRows) {
     if (seen.has(key)) continue;
     seen.add(key);
 
+    // ✅ IMPORTANT: your jobs.id is integer text ("1"), but transactions.job_id is UUID.
+    // So we only keep id if it's a UUID; otherwise null.
+    const rawId = j?.id != null ? String(j.id) : null;
+    const safeUuidId = rawId && looksLikeUuid(rawId) ? rawId : null;
+
     out.push({
-      id: j?.id ? String(j.id) : null,
+      id: safeUuidId, // ✅ null in your current schema, and that's correct
       job_no: j?.job_no != null ? Number(j.job_no) : null,
       name
     });
@@ -707,6 +720,13 @@ function normalizeJobOptions(jobRows) {
   return out;
 }
 
+
+/**
+ * ✅ Robust: resolve job selection from:
+ * - "job_3_<uuid>" interactive id
+ * - "3" numeric
+ * - job name
+ */
 function resolveJobOptionFromReply(input, jobOptions) {
   const raw = normalizeJobAnswer(input);
   const t = String(raw || '').trim();
@@ -714,6 +734,34 @@ function resolveJobOptionFromReply(input, jobOptions) {
 
   if (looksLikeOverhead(t)) return { kind: 'overhead' };
   if (t.toLowerCase() === 'more') return { kind: 'more' };
+
+  // interactive form: job_<n>_<uuid> OR job_<n>_<hashFallback>
+  const m = t.match(/^job_(\d+)_([0-9a-f-]{36}|[0-9a-f]{6,})$/i);
+  if (m) {
+    const idx = Number(m[1]);
+    const tail = String(m[2] || '').trim();
+
+    // If it's a UUID, trust it
+    if (looksLikeUuid(tail)) {
+      // Try to find matching option by id (preferred)
+      const optById = (jobOptions || []).find((j) => j?.id && String(j.id).toLowerCase() === tail.toLowerCase()) || null;
+      if (optById) return { kind: 'job', job: optById };
+
+      // Otherwise fall back to numeric index
+      const optByIdx = (jobOptions || [])[idx - 1] || null;
+      if (optByIdx) return { kind: 'job', job: { ...optByIdx, id: tail } };
+
+      // Last resort: job with id only
+      return { kind: 'job', job: { id: tail, job_no: null, name: null } };
+    }
+
+    // hash fallback: map numeric index
+    if (/^\d+$/.test(String(idx))) {
+      const opt = (jobOptions || [])[idx - 1] || null;
+      if (opt) return { kind: 'job', job: opt };
+    }
+    return null;
+  }
 
   if (/^\d+$/.test(t)) {
     const idx = Number(t);
@@ -776,6 +824,16 @@ function buildTextJobPrompt(jobOptions, page, pageSize) {
   )}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
 }
 
+/**
+ * ✅ If the list-picker UI fails to show, the user still sees job names right in the message.
+ */
+function buildBodyTextWithNames(jobOptions, start, count) {
+  const slice = (jobOptions || []).slice(start, start + count);
+  const lines = slice.map((j, i) => `${start + i + 1}) ${j?.name || 'Untitled Job'}`);
+  const extra = lines.length ? `\n\n${lines.join('\n')}` : '';
+  return extra;
+}
+
 async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
   const to = waTo(from);
   const JOBS_PER_PAGE = Math.min(Number(pageSize || 8), 8);
@@ -783,6 +841,7 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   const slice = (jobOptions || []).slice(start, start + JOBS_PER_PAGE);
   const hasMore = start + JOBS_PER_PAGE < (jobOptions || []).length;
 
+  // ✅ Store the exact jobOptions list so "1" can map to the correct UUID later.
   await upsertPA({
     ownerId,
     userId: from,
@@ -796,11 +855,14 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   }
 
   const rows = [];
-
   for (let i = 0; i < slice.length; i++) {
     const absIdx = start + i + 1;
     const full = slice[i]?.name || 'Untitled Job';
-    const rowId = `job_${absIdx}_${stableHash(full)}`;
+    const jobId = slice[i]?.id ? String(slice[i].id).trim() : null;
+
+    // ✅ Critical: embed UUID in row id when available so webhook can return it
+    const rowTail = jobId && looksLikeUuid(jobId) ? jobId : stableHash(full);
+    const rowId = `job_${absIdx}_${rowTail}`;
 
     rows.push({
       id: rowId,
@@ -815,10 +877,16 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   const bodyText =
     `Here are your active jobs (${start + 1}-${Math.min(start + JOBS_PER_PAGE, jobOptions.length)} of ${
       jobOptions.length
-    }).\nPick one to assign this expense.\n\nTip: You can reply with a number too (like "1").`;
+    }).\nPick one to assign this expense.\n\nTip: You can reply with a number too (like "1").` +
+    buildBodyTextWithNames(jobOptions, start, Math.min(JOBS_PER_PAGE, 8));
 
   try {
-    await sendWhatsAppInteractiveList({ to, bodyText, buttonText: 'Pick a job', sections: [{ title: 'Active Jobs', rows }] });
+    await sendWhatsAppInteractiveList({
+      to,
+      bodyText,
+      buttonText: 'Pick a job',
+      sections: [{ title: 'Active Jobs', rows }]
+    });
     return twimlEmpty();
   } catch (e) {
     console.warn('[EXPENSE] interactive list failed; falling back:', e?.message);
@@ -904,13 +972,11 @@ async function withTimeout(promise, ms, fallbackValue = '__TIMEOUT__') {
 /* ---------------- main handler ---------------- */
 
 async function handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
-  // ✅ apply correction layer BEFORE any parsing
   input = correctTradeTerms(stripExpensePrefixes(input));
 
   const lockKey = `lock:${from}`;
   const safeMsgId = String(sourceMsgId || `${from}:${Date.now()}`).trim();
 
-  // best-effort lock acquire
   try {
     const lock = require('../../middleware/lock');
     if (lock?.acquireLock) await lock.acquireLock(lockKey, 8000).catch(() => null);
@@ -934,11 +1000,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
       }
 
-      const raw = String(input || '').trim();
-      const m = raw.match(/^job_(\d+)_/i);
-      const numericFromRowId = m?.[1] || null;
-
-      const resolved = resolveJobOptionFromReply(numericFromRowId || input, jobOptions);
+      const resolved = resolveJobOptionFromReply(input, jobOptions);
       if (!resolved) return twimlText('Please reply with a number, job name, "Overhead", or "more".');
 
       const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
@@ -950,13 +1012,19 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       if (resolved.kind === 'overhead') {
         confirm.payload.draft.jobName = 'Overhead';
         confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
-      } else if (resolved.kind === 'job' && resolved.job?.name) {
-        confirm.payload.draft.jobName = String(resolved.job.name).trim();
+        confirm.payload.draft.job_id = null;
+      } else if (resolved.kind === 'job') {
+        const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
+        const jobId = resolved.job?.id ? String(resolved.job.id).trim() : null;
+
+        // ✅ Only keep UUIDs as job_id
+        confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
         confirm.payload.draft.job = {
-          id: resolved.job.id ? String(resolved.job.id) : null,
-          job_no: resolved.job.job_no != null ? Number(resolved.job.job_no) : null,
-          name: String(resolved.job.name).trim()
+          id: jobId && looksLikeUuid(jobId) ? jobId : null,
+          job_no: resolved.job?.job_no != null ? Number(resolved.job.job_no) : null,
+          name: jobName || null
         };
+        confirm.payload.draft.job_id = jobId && looksLikeUuid(jobId) ? jobId : null;
       } else if (resolved.kind === 'more') {
         return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
       } else {
@@ -977,118 +1045,170 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     }
 
     // ---- 2) Confirm/edit/cancel ----
-    const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    if (confirmPA?.payload?.draft) {
-      if (!isOwner) {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        return twimlText('⚠️ Only the owner can manage expenses.');
-      }
+const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+if (confirmPA?.payload?.draft) {
+  if (!isOwner) {
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    return twimlText('⚠️ Only the owner can manage expenses.');
+  }
 
-      const token = normalizeDecisionToken(input);
-      const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId).trim();
+  const token = normalizeDecisionToken(input);
+  const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId).trim();
 
-      if (token === 'change_job') {
-        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-        if (!jobs.length) return twimlText('No jobs found. Reply "Overhead" or create a job first.');
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-      }
+  if (token === 'change_job') {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    if (!jobs.length) return twimlText('No jobs found. Reply "Overhead" or create a job first.');
+    return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+  }
 
-      if (token === 'edit') {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        return twimlText('✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").');
-      }
+  if (token === 'edit') {
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    return twimlText(
+      '✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").'
+    );
+  }
 
-      if (token === 'cancel') {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        return twimlText('❌ Operation cancelled.');
-      }
+  if (token === 'cancel') {
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    return twimlText('❌ Operation cancelled.');
+  }
 
-      if (token === 'yes') {
-        const rawDraft = confirmPA.payload.draft || {};
-        let data = normalizeExpenseData(rawDraft, userProfile);
-        data.store = await normalizeVendorName(ownerId, data.store);
+  if (token === 'yes') {
+    // NOTE: work on a shallow copy so we can safely mutate guard fields without corrupting confirmPA reference
+    const rawDraft = { ...(confirmPA.payload.draft || {}) };
 
-        const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+    // 🔒 HARD GUARD: your jobs table uses integer ids ("1"), but transactions.job_id is UUID.
+    // If job.id/job_id is numeric, force it to null so we never attempt to insert "1" into uuid column.
+    const rawDraftJobId =
+      rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
 
-        const pickedJobName = rawDraft.jobName && String(rawDraft.jobName).trim() ? String(rawDraft.jobName).trim() : null;
-        const jobName = pickedJobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-
-        if (!jobName) {
-          const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-          await upsertPA({
-            ownerId,
-            userId: from,
-            kind: PA_KIND_CONFIRM,
-            payload: { ...confirmPA.payload, draft: { ...data, suggestedCategory: category }, sourceMsgId: stableMsgId },
-            ttlSeconds: 600
-          });
-          return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-        }
-
-        data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
-
-        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: stableMsgId });
-        if (!gate.ok) return twimlText(String(gate.reply || '').slice(0, 1500));
-
-        const amountCents = toCents(data.amount);
-        if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
-
-        const maybeJobId =
-          rawDraft?.job?.id && looksLikeUuid(String(rawDraft.job.id)) ? String(rawDraft.job.id) : null;
-
-        const writeResult = await withTimeout(
-          insertTransaction(
-            {
-              ownerId,
-              kind: 'expense',
-              date: data.date || todayInTimeZone(tz),
-              description: String(data.item || '').trim() || 'Unknown',
-              amount_cents: amountCents,
-              amount: toNumberAmount(data.amount),
-              source: String(data.store || '').trim() || 'Unknown',
-              job: jobName,
-              job_name: jobName,
-              job_id: maybeJobId || null,
-              category: category ? String(category).trim() : null,
-              user_name: userProfile?.name || 'Unknown User',
-              source_msg_id: stableMsgId
-            },
-            { timeoutMs: 4500 }
-          ),
-          5200,
-          '__DB_TIMEOUT__'
-        );
-
-        if (writeResult === '__DB_TIMEOUT__') {
-          await upsertPA({
-            ownerId,
-            userId: from,
-            kind: PA_KIND_CONFIRM,
-            payload: { ...confirmPA.payload, draft: { ...data, jobName, suggestedCategory: category }, sourceMsgId: stableMsgId },
-            ttlSeconds: 600
-          });
-          return twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.');
-        }
-
-        const summaryLine = buildExpenseSummaryLine({
-          amount: data.amount,
-          item: data.item,
-          store: data.store,
-          date: data.date || todayInTimeZone(tz),
-          jobName
-        });
-
-        const reply =
-          writeResult?.inserted === false
-            ? '✅ Already logged that expense (duplicate message).'
-            : `✅ Expense logged: ${summaryLine}${category ? ` (Category: ${category})` : ''}`;
-
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        return twimlText(reply);
-      }
-
-      return twimlText('⚠️ Please choose Yes, Edit, or Cancel.\nTip: reply "change job" to pick a different job.');
+    if (rawDraftJobId != null && /^\d+$/.test(String(rawDraftJobId).trim())) {
+      console.warn('[EXPENSE] refusing numeric job id; forcing null', { job_id: rawDraftJobId });
+      if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
+      rawDraft.job_id = null;
+      rawDraft.jobId = null;
     }
+
+    // ✅ Only keep UUID job_id
+    const maybeJobId =
+      rawDraftJobId != null && looksLikeUuid(String(rawDraftJobId)) ? String(rawDraftJobId) : null;
+
+    // Normalize expense payload
+    let data = normalizeExpenseData(rawDraft, userProfile);
+    data.store = await normalizeVendorName(ownerId, data.store);
+
+    const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+
+    const pickedJobName =
+      rawDraft.jobName && String(rawDraft.jobName).trim() ? String(rawDraft.jobName).trim() : null;
+
+    const jobName =
+      pickedJobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+
+    if (!jobName) {
+      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+
+      // Re-save confirm draft (but NEVER store numeric job_id)
+      await upsertPA({
+        ownerId,
+        userId: from,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...confirmPA.payload,
+          draft: {
+            ...data,
+            suggestedCategory: category,
+            job_id: maybeJobId // UUID or null only
+          },
+          sourceMsgId: stableMsgId
+        },
+        ttlSeconds: 600
+      });
+
+      return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+    }
+
+    data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
+
+    const gate = assertExpenseCILOrClarify({
+      ownerId,
+      from,
+      userProfile,
+      data,
+      jobName,
+      category,
+      sourceMsgId: stableMsgId
+    });
+    if (!gate.ok) return twimlText(String(gate.reply || '').slice(0, 1500));
+
+    const amountCents = toCents(data.amount);
+    if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+
+    const writeResult = await withTimeout(
+      insertTransaction(
+        {
+          ownerId,
+          kind: 'expense',
+          date: data.date || todayInTimeZone(tz),
+          description: String(data.item || '').trim() || 'Unknown',
+          amount_cents: amountCents,
+          amount: toNumberAmount(data.amount),
+          source: String(data.store || '').trim() || 'Unknown',
+          job: jobName,
+          job_name: jobName,
+
+          // ✅ KEY: UUID only, otherwise null
+          job_id: maybeJobId || null,
+
+          category: category ? String(category).trim() : null,
+          user_name: userProfile?.name || 'Unknown User',
+          source_msg_id: stableMsgId
+        },
+        { timeoutMs: 4500 }
+      ),
+      5200,
+      '__DB_TIMEOUT__'
+    );
+
+    if (writeResult === '__DB_TIMEOUT__') {
+      await upsertPA({
+        ownerId,
+        userId: from,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...confirmPA.payload,
+          draft: {
+            ...data,
+            jobName,
+            suggestedCategory: category,
+            job_id: maybeJobId || null
+          },
+          sourceMsgId: stableMsgId
+        },
+        ttlSeconds: 600
+      });
+      return twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.');
+    }
+
+    const summaryLine = buildExpenseSummaryLine({
+      amount: data.amount,
+      item: data.item,
+      store: data.store,
+      date: data.date || todayInTimeZone(tz),
+      jobName
+    });
+
+    const reply =
+      writeResult?.inserted === false
+        ? '✅ Already logged that expense (duplicate message).'
+        : `✅ Expense logged: ${summaryLine}${category ? ` (Category: ${category})` : ''}`;
+
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    return twimlText(reply);
+  }
+
+  return twimlText('⚠️ Please choose Yes, Edit, or Cancel.\nTip: reply "change job" to pick a different job.');
+}
 
     // ---- 3) New expense parse (deterministic first) ----
     const backstop = deterministicExpenseParse(input, userProfile);
@@ -1110,7 +1230,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             ...data0,
             jobName,
             suggestedCategory: category,
-            job: jobName ? { id: null, job_no: null, name: jobName } : null
+            job: jobName ? { id: null, job_no: null, name: jobName } : null,
+            job_id: null
           },
           sourceMsgId: safeMsgId,
           type: 'expense'
@@ -1177,7 +1298,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             ...data,
             jobName,
             suggestedCategory: category,
-            job: jobName ? { id: null, job_no: null, name: jobName } : null
+            job: jobName ? { id: null, job_no: null, name: jobName } : null,
+            job_id: null
           },
           sourceMsgId: safeMsgId,
           type: 'expense'

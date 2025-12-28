@@ -425,7 +425,12 @@ async function resolveJobRow(ownerId, jobRefOrName) {
 /**
  * ✅ insertTransaction()
  * Schema-aware insert into public.transactions with optional media fields.
- * ✅ FIX: If transactions.job_id exists, we populate it (prevents "logged but not attached to job" issues).
+ *
+ * HARD GUARANTEE:
+ * - transactions.job_id is UUID in your schema
+ * - jobs.id is INTEGER in your schema
+ * => NEVER insert jobs.id into transactions.job_id
+ * => Only insert job_id when it is a UUID
  */
 async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const owner = DIGITS(opts.ownerId || opts.owner_id);
@@ -445,8 +450,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       ? String(opts.job_name ?? opts.jobName ?? opts.job_title).trim()
       : null;
 
-  const explicitJobId = opts.job_id ?? opts.jobId ?? null;
-  const explicitJobNo = opts.job_no ?? opts.jobNo ?? null;
+  const explicitJobId = opts.job_id ?? opts.jobId ?? null; // should be UUID if present
+  const explicitJobNo = opts.job_no ?? opts.jobNo ?? null; // number-like
 
   const category = opts.category == null ? null : String(opts.category).trim() || null;
   const userName = opts.user_name ?? opts.userName ?? null;
@@ -461,42 +466,80 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
 
   // ✅ Resolve job_id/job_no/job_name best-effort, but never hard fail
+  // IMPORTANT: resolvedJobId must ALWAYS be UUID or null
   let resolvedJobId = null;
   let resolvedJobNo = null;
-  let resolvedJobName = jobNameInput || (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
+  let resolvedJobName =
+    jobNameInput ||
+    (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
 
   try {
-    // Prefer explicit job_id if passed
-    if (explicitJobId && looksLikeUuid(String(explicitJobId))) {
+    // 1) Prefer explicit job_id if caller gave UUID
+    if (explicitJobId != null && looksLikeUuid(String(explicitJobId))) {
       resolvedJobId = String(explicitJobId);
+
+      // resolveJobRow should accept UUID job_id and return job_name/job_no if it can
       const row = await resolveJobRow(owner, resolvedJobId);
       if (row) {
-        resolvedJobNo = row.job_no ?? null;
+        resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
       }
-    } else if (explicitJobNo != null && String(explicitJobNo).trim() !== '') {
+    } else if (explicitJobId != null && /^\d+$/.test(String(explicitJobId).trim())) {
+      // 🔒 Explicitly refuse numeric "job_id"
+      console.warn('[PG/transactions] refusing numeric explicit job_id; ignoring', { explicitJobId });
+    }
+
+    // 2) If job_no passed, resolve name/no, but DO NOT copy jobs.id into transactions.job_id
+    if (!resolvedJobId && explicitJobNo != null && String(explicitJobNo).trim() !== '') {
       const n = Number(explicitJobNo);
       if (Number.isFinite(n)) {
         resolvedJobNo = n;
-        const row = await resolveJobRow(owner, String(n));
+        const row = await resolveJobRow(owner, String(n)); // this may return row.id (INTEGER), row.job_name
         if (row) {
-          resolvedJobId = row.id ? String(row.id) : null;
+          // 🔒 NEVER set resolvedJobId from row.id unless it is UUID
+          const candidate = row.id != null ? String(row.id) : null;
+          if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+          else if (candidate) {
+            // In your schema this will be "1" etc; ignore
+            resolvedJobId = null;
+          }
+
+          resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
           resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
         }
       }
-    } else if (jobRef) {
-      // jobRef might be uuid, job_no, or name
+    }
+
+    // 3) If jobRef passed (could be uuid, job_no, or name)
+    if (!resolvedJobId && jobRef) {
       const row = await resolveJobRow(owner, jobRef);
       if (row) {
-        resolvedJobId = row.id ? String(row.id) : null;
-        resolvedJobNo = row.job_no ?? null;
+        const candidate = row.id != null ? String(row.id) : null;
+        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+        else resolvedJobId = null; // 🔒 ignore integer ids
+
+        resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+      } else {
+        // If jobRef is a number-like string, treat as job_no for job_name resolution only
+        if (/^\d+$/.test(String(jobRef).trim())) {
+          const n = Number(jobRef);
+          if (Number.isFinite(n)) resolvedJobNo = resolvedJobNo ?? n;
+        } else if (!resolvedJobName) {
+          resolvedJobName = String(jobRef).trim();
+        }
       }
-    } else if (resolvedJobName) {
+    }
+
+    // 4) If only name known, try resolving it
+    if (!resolvedJobId && resolvedJobName) {
       const row = await resolveJobRow(owner, resolvedJobName);
       if (row) {
-        resolvedJobId = row.id ? String(row.id) : null;
-        resolvedJobNo = row.job_no ?? null;
+        const candidate = row.id != null ? String(row.id) : null;
+        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+        else resolvedJobId = null; // 🔒 ignore integer ids
+
+        resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
       }
     }
@@ -504,8 +547,14 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     // ignore
   }
 
+  // 🔒 FINAL HARD GUARD: job_id MUST be UUID or null
+  if (resolvedJobId && !looksLikeUuid(String(resolvedJobId))) {
+    console.warn('[PG/transactions] dropping non-uuid resolvedJobId', { resolvedJobId });
+    resolvedJobId = null;
+  }
+
   // Keep job "string" field for back-compat with older schemas/handlers.
-  // If we have a uuid job_id, set job = uuid; else set job = job_name (or job_no as string).
+  // Prefer: jobRef (caller), else uuid job_id, else job_name, else job_no string.
   const job =
     jobRef != null
       ? jobRef
@@ -533,6 +582,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     }
   }
 
+  // IMPORTANT: do NOT include created_at in cols if you are injecting now() in SQL
+  // (your previous version included created_at but didn't add a value -> misalignment)
   const cols = [
     'owner_id',
     'kind',
@@ -541,9 +592,9 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     ...(caps.TX_HAS_AMOUNT ? ['amount'] : []),
     'amount_cents',
     'source',
-    ...(caps.TX_HAS_JOB_ID ? ['job_id'] : []), // ✅
-    ...(caps.TX_HAS_JOB_NO ? ['job_no'] : []), // optional
-    'job', // back-compat string
+    ...(caps.TX_HAS_JOB_ID ? ['job_id'] : []), // ✅ UUID only
+    ...(caps.TX_HAS_JOB_NO ? ['job_no'] : []),
+    'job',
     'job_name',
     'category',
     'user_name',
@@ -573,7 +624,9 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     ...(caps.TX_HAS_MEDIA_URL ? [media?.media_url || null] : []),
     ...(caps.TX_HAS_MEDIA_TYPE ? [media?.media_type || null] : []),
     ...(caps.TX_HAS_MEDIA_TXT ? [media?.media_transcript || null] : []),
-    ...(caps.TX_HAS_MEDIA_CONF ? [media?.media_confidence ?? null] : [])
+    ...(caps.TX_HAS_MEDIA_CONF ? [media?.media_confidence ?? null] : []),
+    // created_at value
+    new Date()
   ];
 
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
@@ -584,14 +637,14 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const sql = canIdempotent
     ? `
       insert into public.transactions (${cols.join(', ')})
-      values (${placeholders}, now())
+      values (${placeholders})
       on conflict (owner_id, source_msg_id)
       do nothing
       returning id
     `
     : `
       insert into public.transactions (${cols.join(', ')})
-      values (${placeholders}, now())
+      values (${placeholders})
       returning id
     `;
 
@@ -611,9 +664,10 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     if (looksConflictUnsupported) {
       console.warn('[PG/transactions] ON CONFLICT unsupported; retrying without conflict clause');
       TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
+
       const sql2 = `
         insert into public.transactions (${cols.join(', ')})
-        values (${placeholders}, now())
+        values (${placeholders})
         returning id
       `;
       const res2 = await queryWithTimeout(sql2, vals, timeoutMs);

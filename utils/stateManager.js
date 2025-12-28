@@ -7,8 +7,7 @@ function normalizePhoneNumber(userId = '') {
   return noWa.replace(/^\+/, '').replace(/\D/g, '').trim();
 }
 
-// Be tolerant: the JSONB column should return an object, but older rows or bugs
-// might have strings/nulls.
+// Ensure we always work with plain objects for jsonb state
 function safeObject(x) {
   if (!x) return null;
   if (typeof x === 'object' && !Array.isArray(x)) return x;
@@ -21,30 +20,28 @@ function safeObject(x) {
   return null;
 }
 
-// Merge strategy:
-// - shallow merge at root
-// - for known nested “buckets”, merge objects instead of overwrite
+// Shallow merge at root, merge known nested buckets
 function mergeState(prev, patch) {
   const a = safeObject(prev) || {};
   const b = safeObject(patch) || {};
 
-  // Special handling for legacy boolean pendingMedia:
-  // If previous has pendingMedia=true and patch provides an object, keep the object.
-  // If patch provides pendingMedia=true and previous is an object, keep the object.
+  const out = { ...a, ...b };
+
+  // Special handling for legacy pendingMedia boolean
   const aPendingMedia = a.pendingMedia;
   const bPendingMedia = b.pendingMedia;
 
-  const out = { ...a, ...b };
-
-  // If either side is boolean true, but the other side is an object, keep the object.
   if (aPendingMedia === true && bPendingMedia && typeof bPendingMedia === 'object' && !Array.isArray(bPendingMedia)) {
     out.pendingMedia = { ...bPendingMedia };
-  } else if (bPendingMedia === true && aPendingMedia && typeof aPendingMedia === 'object' && !Array.isArray(aPendingMedia)) {
+  } else if (
+    bPendingMedia === true &&
+    aPendingMedia &&
+    typeof aPendingMedia === 'object' &&
+    !Array.isArray(aPendingMedia)
+  ) {
     out.pendingMedia = { ...aPendingMedia };
   }
 
-  // Common nested objects where we want object-merge (not replace)
-  // NOTE: include pendingAction-style buckets if you add them later.
   const nestedKeys = [
     'pendingRevenue',
     'pendingExpense',
@@ -52,16 +49,14 @@ function mergeState(prev, patch) {
     'pendingHours',
     'pendingMedia',
     'pendingMediaMeta',
+    'pendingDelete',
+    'pendingCorrection',
   ];
 
   for (const k of nestedKeys) {
     const av = a[k];
     const bv = b[k];
-    if (
-      av && bv &&
-      typeof av === 'object' && typeof bv === 'object' &&
-      !Array.isArray(av) && !Array.isArray(bv)
-    ) {
+    if (av && bv && typeof av === 'object' && typeof bv === 'object' && !Array.isArray(av) && !Array.isArray(bv)) {
       out[k] = { ...av, ...bv };
     }
   }
@@ -72,22 +67,10 @@ function mergeState(prev, patch) {
 async function getPendingTransactionState(userId) {
   const normalizedId = normalizePhoneNumber(userId);
   const res = await query(`SELECT state FROM public.states WHERE user_id = $1`, [normalizedId]);
-  return res.rows[0]?.state || null;
+  const raw = res.rows[0]?.state || null;
+  return safeObject(raw) || raw || null;
 }
 
-/**
- * setPendingTransactionState(userId, state, options?)
- *
- * Backwards-compatible:
- * - default behavior is FULL REPLACE (same as legacy)
- *
- * New behavior:
- * - pass { merge: true } to merge into existing state rather than overwrite it.
- *
- * Notes:
- * - We always normalize the key for storage.
- * - Merge path reads existing state and merges in JS (simple + predictable).
- */
 async function setPendingTransactionState(userId, state, options = null) {
   const normalizedId = normalizePhoneNumber(userId);
   const merge = !!options?.merge;
@@ -106,7 +89,6 @@ async function setPendingTransactionState(userId, state, options = null) {
     return;
   }
 
-  // Merge path: read existing state (with normalized user id)
   const prev = await getPendingTransactionState(normalizedId);
   const merged = mergeState(prev, state);
 
@@ -122,11 +104,6 @@ async function setPendingTransactionState(userId, state, options = null) {
   );
 }
 
-/**
- * mergePendingTransactionState(userId, patch)
- *
- * Recommended API for "surgical" state updates (prevents wiping other keys).
- */
 async function mergePendingTransactionState(userId, patch) {
   return setPendingTransactionState(userId, patch, { merge: true });
 }
@@ -140,27 +117,22 @@ async function clearUserState(userId) {
   await deletePendingTransactionState(userId);
 }
 
-/**
- * clearPendingMediaMeta(userId)
- * Clears only pendingMediaMeta without wiping the rest of the state.
- */
 async function clearPendingMediaMeta(userId) {
   const normalizedId = normalizePhoneNumber(userId);
   const prev = await getPendingTransactionState(normalizedId);
   const obj = safeObject(prev) || {};
-  if (!obj || typeof obj !== 'object') return;
-
   obj.pendingMediaMeta = null;
-
-  // Keep legacy semantics: full replace with the edited object
   await setPendingTransactionState(normalizedId, obj);
 }
 
-/**
- * clearFinanceFlow(userId)
- * Clears the finance-related pending flow keys but keeps other state (e.g., hours inquiries).
- * Use after a successful expense/revenue commit or an explicit cancel.
- */
+async function clearStateKeys(userId, keys = []) {
+  const normalizedId = normalizePhoneNumber(userId);
+  const prev = await getPendingTransactionState(normalizedId);
+  const obj = safeObject(prev) || {};
+  for (const k of keys) obj[k] = null;
+  await setPendingTransactionState(normalizedId, obj);
+}
+
 async function clearFinanceFlow(userId) {
   return clearStateKeys(userId, [
     'pendingRevenue',
@@ -182,23 +154,12 @@ async function clearFinanceFlow(userId) {
   ]);
 }
 
-/**
- * Optional: clear a subset of keys (handy for "cleanup after success").
- * Example: clearStateKeys(from, ['pendingMedia','pendingExpense','pendingMediaMeta'])
- */
-async function clearStateKeys(userId, keys = []) {
-  const normalizedId = normalizePhoneNumber(userId);
-  const prev = await getPendingTransactionState(normalizedId);
-  const obj = safeObject(prev) || {};
-  if (!obj || typeof obj !== 'object') return;
-
-  for (const k of keys) obj[k] = null;
-
-  await setPendingTransactionState(normalizedId, obj);
-}
+// ✅ Compatibility aliases (older files may call these)
+const deletePendingState = deletePendingTransactionState;
+const clearPendingTransactionState = deletePendingTransactionState;
 
 module.exports = {
-  normalizePhoneNumber, // exported for convenience + reuse
+  normalizePhoneNumber,
   safeObject,
   mergeState,
 
@@ -206,8 +167,10 @@ module.exports = {
   setPendingTransactionState,
   mergePendingTransactionState,
   deletePendingTransactionState,
-  clearUserState,
+  deletePendingState,
+  clearPendingTransactionState,
 
+  clearUserState,
   clearPendingMediaMeta,
   clearStateKeys,
   clearFinanceFlow,

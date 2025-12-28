@@ -1279,48 +1279,56 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   return false;
 }
 
-async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
-  const owner = DIGITS(ownerId);
-  const userId = DIGITS(userIdOrPhone);
-  if (!owner || !userId) return null;
+async function getActiveJobForIdentity(ownerId, userId) {
+  // Example: pull active_job_id/name from memberships (adjust table as needed)
+  const r = await query(
+    `SELECT active_job_id, active_job_name
+       FROM public.memberships
+      WHERE owner_id = $1 AND user_id = $2
+      LIMIT 1`,
+    [String(ownerId), String(userId)]
+  );
 
-  const caps = await detectActiveJobCaps();
+  const row = r?.rows?.[0];
+  if (!row) return null;
 
-  async function enrichIfNeeded(active_job_id, active_job_name, sourceLabel) {
-    let id = active_job_id ?? null;
-    let name = active_job_name ?? null;
+  const activeId = row.active_job_id;
+  let activeName = row.active_job_name ? String(row.active_job_name).trim() : null;
 
-    if ((name == null || name === '') && id != null) {
-      try {
-        if (looksLikeUuid(String(id))) {
-          const r = await query(
-            `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and id=$2::uuid limit 1`,
-            [owner, String(id)]
-          );
-          if (r?.rows?.[0]?.job_name) name = String(r.rows[0].job_name).trim();
-        } else if (/^\d+$/.test(String(id))) {
-          const r = await query(
-            `select id as job_id, coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and job_no=$2 limit 1`,
-            [owner, Number(id)]
-          );
-          if (r?.rows?.[0]) {
-            id = r.rows[0].job_id ? String(r.rows[0].job_id) : id;
-            name = r.rows[0].job_name ? String(r.rows[0].job_name).trim() : name;
-          }
-        }
-      } catch {}
+  // If name missing, resolve from jobs table without type mismatch
+  if (!activeName && activeId != null) {
+    const s = String(activeId).trim();
+
+    // UUID job id
+    if (looksLikeUuid(s)) {
+      const j = await query(
+        `SELECT COALESCE(name, job_name) AS job_name
+           FROM public.jobs
+          WHERE owner_id=$1 AND id=$2::uuid
+          LIMIT 1`,
+        [String(ownerId), s]
+      );
+      activeName = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
     }
 
-    if (id == null && name) {
-      try {
-        const row = await resolveJobRow(owner, name);
-        if (row?.id) id = String(row.id);
-      } catch {}
+    // numeric job_no
+    if (!activeName && /^\d+$/.test(s)) {
+      const j = await query(
+        `SELECT COALESCE(name, job_name) AS job_name
+           FROM public.jobs
+          WHERE owner_id=$1 AND job_no=$2::int
+          LIMIT 1`,
+        [String(ownerId), Number(s)]
+      );
+      activeName = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
     }
-
-    if (id == null && name == null) return null;
-    return { active_job_id: id ?? null, active_job_name: name ?? null, _source: sourceLabel };
   }
+
+  return {
+    active_job_id: activeId ?? null,
+    active_job_name: activeName ?? null
+  };
+
 
   // 1) users
   if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
@@ -1670,6 +1678,47 @@ async function getPendingAction({ ownerId, userId }) {
 
 async function deletePendingAction(id) {
   await query(`delete from public.pending_actions where id=$1`, [id]);
+}
+/* ---------- Pending Actions (Kind-aware helpers) ---------- */
+
+async function getPendingActionByKind({ ownerId, userId, kind }) {
+  const owner = DIGITS(ownerId);
+  const user = String(userId);
+  const k = String(kind || '').trim();
+  if (!owner || !user || !k) return null;
+
+  const { rows } = await query(
+    `
+    SELECT id, kind, payload, created_at
+      FROM public.pending_actions
+     WHERE owner_id = $1
+       AND user_id = $2
+       AND kind = $3
+       AND created_at > now() - (($4::text || ' minutes')::interval)
+     ORDER BY created_at DESC
+     LIMIT 1
+    `,
+    [owner, user, k, String(PENDING_TTL_MIN)]
+  );
+
+  return rows[0] || null;
+}
+
+async function deletePendingActionByKind({ ownerId, userId, kind }) {
+  const owner = DIGITS(ownerId);
+  const user = String(userId);
+  const k = String(kind || '').trim();
+  if (!owner || !user || !k) return;
+
+  await query(
+    `
+    DELETE FROM public.pending_actions
+     WHERE owner_id = $1
+       AND user_id = $2
+       AND kind = $3
+    `,
+    [owner, user, k]
+  );
 }
 
 /* -------------------- Finance helpers -------------------- */
@@ -2541,6 +2590,9 @@ module.exports = {
   exportTimesheetXlsx,
   exportTimesheetPdf,
   getFileExport,
+  getPendingActionByKind,
+  deletePendingActionByKind,
+
 
   // kept helpers (if other files import them)
   getJobByName,

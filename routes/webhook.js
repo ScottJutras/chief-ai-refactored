@@ -1,15 +1,14 @@
 // routes/webhook.js
-// Drop-in replacement (aligned with expense.js + job.js interactive picker + postgres.js expectations)
+// COMPLETE DROP-IN (aligned with expense.js Option A pending_actions + job.js picker + postgres.js expectations)
 //
-// Key alignment fixes vs your draft:
-// - DO NOT replace req.ownerId with a UUID (your current postgres.js DIGITS() would break). Store uuid separately if needed.
-// - Avoid double-sending TwiML (job.js already sends if res is provided). Always check res.headersSent.
-// - Harden handler loading (different exports across builds) and keep everything fail-open.
-// - Keep rawBody capture BEFORE token middleware (Twilio signature verification).
-// - Robust inbound text extraction for WhatsApp interactive list replies (ListId/ListTitle + InteractiveResponseJson).
-// - Allow job picker flows to pass even when expense/revenue pending (no nudge-block).
-// - IMPORTANT FIX: do NOT treat numeric replies as job picker replies unless awaitingActiveJobPick is true.
-// - Keep 8s safety timer + tolerant middlewares + media transcript passthrough.
+// Key alignments:
+// - Keeps req.ownerId numeric (phone digits) — DO NOT overwrite with UUID.
+// - Preserves rawBody before token middleware (Twilio signature verification).
+// - Robust inbound text extraction for WhatsApp interactive list replies.
+// - ✅ Integrates Option A pending_actions gating so expense job-picks + confirms consume "1"/"job_1_*"/"yes" BEFORE job.js.
+// - ✅ Numeric / job_* replies ONLY route to job.js active-job picker when awaitingActiveJobPick is true AND no expense pending_actions are active.
+// - Keeps 8s safety timer + tolerant middlewares + media transcript passthrough.
+// - Avoids double-sending TwiML: always check res.headersSent.
 
 const express = require('express');
 const querystring = require('querystring');
@@ -24,6 +23,9 @@ const { handleForecast } = require('../handlers/commands/forecast');
 const { getOwnerUuidForPhone } = require('../services/owners'); // optional map phone -> uuid (store separately)
 const stateManager = require('../utils/stateManager');
 const { getPendingTransactionState } = stateManager;
+
+const pg = require('../services/postgres');
+const { query } = pg;
 
 // Prefer mergePendingTransactionState; fall back to setPendingTransactionState (older builds)
 const mergePendingTransactionState =
@@ -91,9 +93,7 @@ function isJobPickerIntent(lc) {
   );
 }
 
-// "list-picker reply-like" tokens (IDs we generate typically start with job_)
-// NOTE: numeric replies should ONLY be treated as job-picker tokens when awaitingActiveJobPick is true.
-// This helper still exists, but webhook must gate its use.
+// "list-picker reply-like" tokens
 function looksLikeJobPickerReplyToken(raw) {
   const s = String(raw || '').trim();
   if (!s) return false;
@@ -188,7 +188,6 @@ function looksExpenseNl(str) {
   if (!verb) return false;
   if (/\b(received|got paid|payment|deposit)\b/.test(s)) return false;
 
-  // avoid routing obvious job/time/task commands as expense NL
   if (
     /^(create|new)\s+job\b/.test(s) ||
     /^active\s+job\b/.test(s) ||
@@ -215,6 +214,73 @@ function looksRevenueNl(str) {
   if (/\b(paid)\b/.test(s) && /\b(from|client|customer)\b/.test(s)) return true;
 
   return false;
+}
+
+/* ---------------- Pending Actions (Option A) ---------------- */
+
+const PA_KIND_PICK_JOB_EXPENSE = 'pick_job_for_expense';
+const PA_KIND_CONFIRM_EXPENSE = 'confirm_expense';
+
+// Prefer getPendingActionByKind (aligned with postgres.js), fall back to older names if present.
+const pgGetPendingActionByKind =
+  (typeof pg.getPendingActionByKind === 'function' && pg.getPendingActionByKind) ||
+  (typeof pg.getPendingAction === 'function' && pg.getPendingAction) ||
+  (typeof pg.readPendingAction === 'function' && pg.readPendingAction) ||
+  (typeof pg.fetchPendingAction === 'function' && pg.fetchPendingAction) ||
+  null;
+
+// TTL minutes for SQL fallback. Should match services/postgres.js PENDING_TTL_MIN.
+const PA_TTL_MIN = Number(process.env.PENDING_TTL_MIN || 10);
+
+async function getPA({ ownerId, userId, kind }) {
+  const owner = String(ownerId || '').trim();
+  const user = String(userId || '').trim();
+  const k = String(kind || '').trim();
+  if (!owner || !user || !k) return null;
+
+  if (pgGetPendingActionByKind) {
+    try {
+      const r = await pgGetPendingActionByKind({ ownerId: owner, userId: user, kind: k });
+      if (!r) return null;
+      if (r.payload) return r;
+      if (typeof r === 'object') return { payload: r };
+      return null;
+    } catch {
+      // fall through
+    }
+  }
+
+  // SQL fallback (TTL via created_at)
+  try {
+    const r = await query(
+      `
+      SELECT id, kind, payload, created_at
+        FROM public.pending_actions
+       WHERE owner_id = $1
+         AND user_id = $2
+         AND kind = $3
+         AND created_at > now() - (($4::text || ' minutes')::interval)
+       ORDER BY created_at DESC
+       LIMIT 1
+      `,
+      [owner, user, k, String(PA_TTL_MIN)]
+    );
+    return r?.rows?.[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function hasExpensePA(ownerId, from) {
+  try {
+    const [pick, conf] = await Promise.all([
+      getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB_EXPENSE }),
+      getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM_EXPENSE })
+    ]);
+    return { pick, conf, hasAny: !!(pick?.payload || conf?.payload) };
+  } catch {
+    return { pick: null, conf: null, hasAny: false };
+  }
 }
 
 /* ---------------- Raw urlencoded parser (Twilio signature expects original body) ---------------- */
@@ -262,8 +328,9 @@ router.all('*', (req, res, next) => {
 router.use((req, _res, next) => {
   req.from = req.body?.From ? normalizePhone(req.body.From) : null;
 
-  // IMPORTANT: keep ownerId numeric (aligns with postgres.js DIGITS() calls)
-  req.ownerId = req.from || 'GLOBAL';
+  // IMPORTANT: keep ownerId numeric (aligns with postgres.js DIGITS() calls).
+  // Do NOT set to 'GLOBAL' — lots of code calls DIGITS(ownerId).
+  req.ownerId = req.from || null;
 
   // Optionally compute a canonical URL used by token middleware for Twilio signature checks
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
@@ -403,20 +470,32 @@ router.post('*', async (req, res, next) => {
     let text = String(getInboundText(req.body || {}) || '').trim();
     let lc = text.toLowerCase();
 
+    // Canonical idempotency key for ingestion (Twilio)
+    const crypto = require('crypto');
+    const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
+    const messageSid =
+      rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
+
+    // ✅ Option A: check pending_actions FIRST (so "1"/"job_1_*"/"yes" go to expense.js, not job.js)
+    const expensePA = await hasExpensePA(req.ownerId, req.from);
+    const hasExpensePendingActions = !!expensePA.hasAny;
+
     /* ------------------------------------------------------------
-     * PENDING TXN NUDGE (revenue/expense flows)
+     * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
      * ------------------------------------------------------------ */
 
     const pendingRevenueFlow =
       !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
 
-    const pendingExpenseFlow =
+    const pendingExpenseFlowLegacy =
       !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
 
-    // ✅ IMPORTANT FIX:
-    // Only allow numeric/job_* tokens to route to job picker IF awaitingActiveJobPick is true.
-    // Otherwise expense/revenue pickers should consume "1", "2", etc.
-    const allowJobPickerThrough = isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick;
+    // If expense.js Option A is in play, treat it as pending expense even if stateManager is empty.
+    const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
+
+    // ✅ IMPORTANT:
+    // Only allow numeric/job_* tokens to route to job.js IF awaitingActiveJobPick is true AND NOT in an expense pending_actions flow.
+    const allowJobPickerThrough = (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
 
     if (pendingRevenueFlow) {
       if (/^(cancel|stop|no)\b/.test(lc)) {
@@ -432,7 +511,8 @@ router.post('*', async (req, res, next) => {
     }
 
     if (pendingExpenseFlow) {
-      if (/^(cancel|stop|no)\b/.test(lc)) {
+      // For Option A flows, expense.js itself handles cancel/edit; still support legacy cancel shortcut.
+      if (/^(cancel|stop|no)\b/.test(lc) && pendingExpenseFlowLegacy) {
         try {
           await require('../utils/stateManager').deletePendingTransactionState?.(req.from);
         } catch {}
@@ -467,7 +547,7 @@ router.post('*', async (req, res, next) => {
         text = String(getInboundText(req.body || {}) || '').trim();
         lc = text.toLowerCase();
 
-        // refresh pending too (media handler may have changed it)
+        // refresh pending too
         pending = await getPendingTransactionState(req.from);
       } catch (e) {
         console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
@@ -477,34 +557,39 @@ router.post('*', async (req, res, next) => {
     // refresh after any rewrite
     const text2 = String(getInboundText(req.body || {}) || '').trim();
     const lc2 = text2.toLowerCase();
-
-    // Canonical idempotency key for ingestion (Twilio)
-    const crypto = require('crypto');
-    const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-    const messageSid =
-      rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
+    const isPickerToken = looksLikeJobPickerReplyToken(text2);
 
     /* -----------------------------------------------------------------------
-     * (A0) ACTIVE JOB PICKER FLOW — run BEFORE expense/revenue pending flows
+     * (A0) ACTIVE JOB PICKER FLOW — Only if awaitingActiveJobPick OR explicit intent
+     * AND NOT blocked by expense pending_actions.
      * ----------------------------------------------------------------------- */
-    // ✅ IMPORTANT FIX:
-    // Do NOT route numeric tokens to job.js unless awaitingActiveJobPick is true.
-    // isJobPickerIntent() is fine; it explicitly opens the job picker.
-    if (pending?.awaitingActiveJobPick || isJobPickerIntent(lc2)) {
-      try {
-        const cmds = require('../handlers/commands');
-        const handleJob =
-          (cmds?.job && cmds.job.handleJob) || cmds?.handleJob || require('../handlers/commands/job').handleJob;
+    if (!hasExpensePendingActions && (isJobPickerIntent(lc2) || pending?.awaitingActiveJobPick)) {
+      // If the inbound is a picker-token, ONLY let it route here when awaitingActiveJobPick is set.
+      if (isPickerToken && !pending?.awaitingActiveJobPick) {
+        // fall through
+      } else {
+        try {
+          const cmds = require('../handlers/commands');
+          const handleJob =
+            (cmds?.job && cmds.job.handleJob) || cmds?.handleJob || require('../handlers/commands/job').handleJob;
 
-        if (typeof handleJob === 'function') {
-          await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
-          if (res.headersSent) return;
-
-          // If handler didn't send, ACK.
-          return ok(res, 'OK');
+          if (typeof handleJob === 'function') {
+            await handleJob(
+              req.from,
+              text2,
+              req.userProfile,
+              req.ownerId,
+              req.ownerProfile,
+              req.isOwner,
+              res,
+              messageSid
+            );
+            if (res.headersSent) return;
+            return ok(res, 'OK');
+          }
+        } catch (e) {
+          console.warn('[WEBHOOK] job picker handler failed:', e?.message);
         }
-      } catch (e) {
-        console.warn('[WEBHOOK] job picker handler failed:', e?.message);
       }
     }
 
@@ -521,7 +606,14 @@ router.post('*', async (req, res, next) => {
       (pending?.pendingCorrection && pending?.type === 'revenue') ||
       (!!pending?.pendingRevenue && !isNewRevenueCmd);
 
+    // ✅ For expense, include Option A pending_actions triggers.
+    // IMPORTANT: DO NOT make this always-true; only route to expense when the input looks like a reply.
+    const expensePendingActionsLike =
+      hasExpensePendingActions &&
+      (isPickerToken || isAllowedWhilePending(lc2) || /^(expense|exp)\b/.test(lc2));
+
     const pendingExpenseLike =
+      expensePendingActionsLike ||
       !!pending?.awaitingExpenseClarification ||
       !!pending?.awaitingExpenseJob ||
       pending?.pendingDelete?.type === 'expense' ||
@@ -531,7 +623,15 @@ router.post('*', async (req, res, next) => {
     if (pendingRevenueLike) {
       try {
         const { handleRevenue } = require('../handlers/commands/revenue');
-        const twiml = await handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
+        const twiml = await handleRevenue(
+          req.from,
+          text2,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
         if (!res.headersSent && typeof twiml === 'string') {
           return res.status(200).type('application/xml; charset=utf-8').send(twiml);
         }
@@ -545,7 +645,15 @@ router.post('*', async (req, res, next) => {
     if (pendingExpenseLike) {
       try {
         const { handleExpense } = require('../handlers/commands/expense');
-        const twiml = await handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
+        const twiml = await handleExpense(
+          req.from,
+          text2,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
         if (!res.headersSent && typeof twiml === 'string') {
           return res.status(200).type('application/xml; charset=utf-8').send(twiml);
         }
@@ -674,7 +782,9 @@ router.post('*', async (req, res, next) => {
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc2)) looksTime = true;
     if (askingHow && /\bjobs?\b/.test(lc2)) looksJob = true;
 
-    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(Boolean);
+    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(
+      Boolean
+    );
 
     const SOP = {
       tasks:
@@ -722,9 +832,17 @@ router.post('*', async (req, res, next) => {
       console.warn('[WEBHOOK] commands bundle load failed (ignored):', e?.message);
     }
 
-    // If handlers return TwiML or send directly, respect that.
     if (looksTask && typeof tasksHandler === 'function') {
-      const out = await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+      const out = await tasksHandler(
+        req.from,
+        text2,
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        res,
+        messageSid
+      );
       if (res.headersSent) return;
 
       let msg = '';
@@ -737,12 +855,28 @@ router.post('*', async (req, res, next) => {
       return ok(res, msg);
     }
 
+    // ✅ If expense pending_actions exist, do NOT let job.js steal numeric/list tokens.
+    // Still allow explicit job intents like "change job" (but those were handled earlier).
     if (looksJob && typeof handleJob === 'function') {
-      await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
-      if (res.headersSent) return;
-      let msg = askingHow ? SOP.jobs : 'Job handled.';
-      msg += await glossaryNudgeFrom(text2);
-      return ok(res, msg);
+      // If a user sends "1" or "job_1_*" and we got here, it's NOT a job picker flow.
+      if (looksLikeJobPickerReplyToken(text2) && !isJobPickerIntent(lc2) && !pending?.awaitingActiveJobPick) {
+        // fall through to help/agent
+      } else {
+        await handleJob(
+          req.from,
+          text2,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          res,
+          messageSid
+        );
+        if (res.headersSent) return;
+        let msg = askingHow ? SOP.jobs : 'Job handled.';
+        msg += await glossaryNudgeFrom(text2);
+        return ok(res, msg);
+      }
     }
 
     // Forecast
@@ -795,7 +929,16 @@ router.post('*', async (req, res, next) => {
 
     // Timeclock legacy
     if (looksTime && typeof handleTimeclock === 'function') {
-      const out = await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+      const out = await handleTimeclock(
+        req.from,
+        text2,
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        res,
+        messageSid
+      );
       if (res.headersSent) return;
 
       let msg = '';
@@ -816,7 +959,16 @@ router.post('*', async (req, res, next) => {
       try {
         const { handleJobKpis } = require('../handlers/commands/job_kpis');
         if (typeof handleJobKpis === 'function') {
-          const out = await handleJobKpis(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+          const out = await handleJobKpis(
+            req.from,
+            text2,
+            req.userProfile,
+            req.ownerId,
+            req.ownerProfile,
+            req.isOwner,
+            res,
+            messageSid
+          );
           if (res.headersSent) return;
 
           let msg = typeof out === 'string' && out.trim() ? out.trim() : 'KPI shown.';

@@ -1,16 +1,18 @@
 // handlers/commands/expense.js
-// COMPLETE DROP-IN (aligned to latest postgres.js + idempotent writes + active-job fix)
+// COMPLETE DROP-IN (Option A): store jobOptions (id/job_no/name) in pending_actions
+// - Fixes "invalid input syntax for uuid: '1'" by mapping numeric replies -> job object (never uuid-cast)
+// - Fixes Twilio Interactive List error by including TOP-LEVEL `body` in create(payload)
+// - Keeps your existing parsing + category + CIL validation + template confirm + lock + idempotent insertTransaction
 //
-// Key alignments:
-// - Uses pg.getActiveJobForIdentity() when present (canonical per-identity active job)
-// - Uses pg.insertTransaction() which now schema-maps media + can populate transactions.job_id
-// - Keeps Interactive List + numeric map
-// - Adds robust pending-state deletion fallbacks (state manager naming drift)
-// - Adds best-effort lock acquire + always releases
-// - Fail-open everywhere (never hard-fail on schema mismatch)
+// REQUIRED in postgres.js (preferred):
+//   - upsertPendingAction({ ownerId, userId, kind, payload, ttlSeconds })
+//   - getPendingAction({ ownerId, userId, kind })   (or readPendingAction / fetchPendingAction / etc.)
+//   - deletePendingAction({ ownerId, userId, kind })
+//
+// If those are not present, this file will try direct SQL against public.pending_actions as a fallback.
 
 const pg = require('../../services/postgres');
-const { query, insertTransaction, listOpenJobs } = pg;
+const { query, insertTransaction } = pg;
 
 const getCategorySuggestion =
   (typeof pg.getCategorySuggestion === 'function' && pg.getCategorySuggestion) || (async () => null);
@@ -22,25 +24,6 @@ const normalizeVendorName =
     const s = String(vendor || '').trim();
     return s || 'Unknown Store';
   });
-
-const state = require('../../utils/stateManager');
-
-const getPendingTransactionState =
-  state.getPendingTransactionState ||
-  state.getPendingState ||
-  (async () => null);
-
-// ✅ robust delete (stateManager naming drift)
-const deletePendingTransactionState =
-  state.deletePendingTransactionState ||
-  state.deletePendingState ||
-  state.clearPendingTransactionState ||
-  state.clearPendingState ||
-  (async (_key) => {});
-
-const mergePendingTransactionState =
-  state.mergePendingTransactionState ||
-  (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
 const ai = require('../../utils/aiErrorHandler');
 const handleInputWithAI = ai.handleInputWithAI;
@@ -83,6 +66,116 @@ const validateCIL =
   (cilMod && typeof cilMod.validate === 'function' && cilMod.validate) ||
   (typeof cilMod === 'function' && cilMod) ||
   null;
+
+/* ---------------- Pending Actions (Option A) ---------------- */
+
+const PA_KIND_PICK_JOB = 'pick_job_for_expense';
+const PA_KIND_CONFIRM = 'confirm_expense';
+
+const pgUpsertPendingAction =
+  (typeof pg.upsertPendingAction === 'function' && pg.upsertPendingAction) ||
+  (typeof pg.savePendingAction === 'function' && pg.savePendingAction) ||
+  null;
+
+const pgGetPendingAction =
+  (typeof pg.getPendingAction === 'function' && pg.getPendingAction) ||
+  (typeof pg.readPendingAction === 'function' && pg.readPendingAction) ||
+  (typeof pg.fetchPendingAction === 'function' && pg.fetchPendingAction) ||
+  null;
+
+const pgDeletePendingAction =
+  (typeof pg.deletePendingAction === 'function' && pg.deletePendingAction) ||
+  (typeof pg.clearPendingAction === 'function' && pg.clearPendingAction) ||
+  null;
+
+async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = 600 }) {
+  const owner = String(ownerId || '').trim();
+  const user = String(userId || '').trim();
+  if (!owner || !user || !kind) return;
+
+  if (pgUpsertPendingAction) {
+    await pgUpsertPendingAction({ ownerId: owner, userId: user, kind, payload, ttlSeconds });
+    return;
+  }
+
+  // Fallback SQL (expects: public.pending_actions(owner_id,user_id,kind,payload,expires_at,created_at/updated_at))
+  try {
+    await query(
+      `
+      INSERT INTO public.pending_actions (owner_id, user_id, kind, payload, expires_at)
+      VALUES ($1, $2, $3, $4::jsonb, NOW() + ($5 || ' seconds')::interval)
+      ON CONFLICT (owner_id, user_id, kind)
+      DO UPDATE SET payload = EXCLUDED.payload,
+                    expires_at = EXCLUDED.expires_at
+      `,
+      [owner, user, String(kind), JSON.stringify(payload || {}), Number(ttlSeconds || 600)]
+    );
+  } catch (e) {
+    console.warn('[PA] upsert fallback failed (ignored):', e?.message);
+  }
+}
+
+async function getPA({ ownerId, userId, kind }) {
+  const owner = String(ownerId || '').trim();
+  const user = String(userId || '').trim();
+  if (!owner || !user || !kind) return null;
+
+  if (pgGetPendingAction) {
+    try {
+      const r = await pgGetPendingAction({ ownerId: owner, userId: user, kind });
+      // allow either {payload} or the payload itself
+      if (!r) return null;
+      if (r.payload) return r;
+      if (typeof r === 'object') return { payload: r };
+      return null;
+    } catch (e) {
+      console.warn('[PA] getPendingAction failed (ignored):', e?.message);
+    }
+  }
+
+  try {
+    const r = await query(
+      `
+      SELECT payload
+        FROM public.pending_actions
+       WHERE owner_id = $1
+         AND user_id = $2
+         AND kind = $3
+         AND (expires_at IS NULL OR expires_at > NOW())
+       LIMIT 1
+      `,
+      [owner, user, String(kind)]
+    );
+    const row = r?.rows?.[0];
+    if (!row) return null;
+    return { payload: row.payload || null };
+  } catch (e) {
+    return null;
+  }
+}
+
+async function deletePA({ ownerId, userId, kind }) {
+  const owner = String(ownerId || '').trim();
+  const user = String(userId || '').trim();
+  if (!owner || !user || !kind) return;
+
+  if (pgDeletePendingAction) {
+    try {
+      await pgDeletePendingAction({ ownerId: owner, userId: user, kind });
+      return;
+    } catch (e) {
+      console.warn('[PA] deletePendingAction failed (ignored):', e?.message);
+    }
+  }
+
+  try {
+    await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [
+      owner,
+      user,
+      String(kind)
+    ]);
+  } catch {}
+}
 
 /* ---------------- Twilio Template / Messaging helpers ---------------- */
 
@@ -193,13 +286,10 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
   );
 }
 
-/* ---------------- WhatsApp Interactive List (FREE-FORM, dynamic) ---------------- */
+/* ---------------- WhatsApp Interactive List ---------------- */
 
 const ENABLE_INTERACTIVE_LIST = (() => {
-  const raw =
-    process.env.TWILIO_ENABLE_INTERACTIVE_LIST ??
-    process.env.TWILIO_ENABLE_LIST_PICKER ??
-    'true';
+  const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? process.env.TWILIO_ENABLE_LIST_PICKER ?? 'true';
   return String(raw).trim().toLowerCase() !== 'false';
 })();
 
@@ -225,66 +315,16 @@ function isGarbageJobName(name) {
   );
 }
 
-function dedupeJobs(list) {
-  const out = [];
-  const seen = new Set();
-  for (const j of list || []) {
-    const s = String(j || '').trim();
-    if (!s) continue;
-    if (isGarbageJobName(s)) continue;
-    const key = s.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(s);
-  }
-  return out;
-}
-
-function buildTextJobPrompt(jobs, page, pageSize) {
+function buildTextJobPrompt(jobOptions, page, pageSize) {
   const start = page * pageSize;
-  const slice = jobs.slice(start, start + pageSize);
-  const lines = slice.map((j, i) => `${start + i + 1}) ${j}`);
-  const hasMore = start + pageSize < jobs.length;
+  const slice = (jobOptions || []).slice(start, start + pageSize);
+  const lines = slice.map((j, i) => `${start + i + 1}) ${j?.name || 'Untitled Job'}`);
+  const hasMore = start + pageSize < (jobOptions || []).length;
 
   const more = hasMore ? `\nReply "more" for more jobs.` : '';
   return `Which job is this expense for?\n\n${lines.join(
     '\n'
   )}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
-}
-
-// ✅ IMPORTANT: includes numeric map so replying "1" works reliably
-function buildJobPickerMapping(jobs, page, pageSize) {
-  const start = page * pageSize;
-  const slice = jobs.slice(start, start + pageSize);
-
-  const idMap = {}; // rowId -> jobName
-  const nameMap = {}; // lower(title/desc) -> jobName
-  const numMap = {}; // "1" -> jobName (absolute index)
-
-  for (let i = 0; i < slice.length; i++) {
-    const absIdx = start + i + 1;
-    const fullName = slice[i];
-    const rowId = `job_${absIdx}_${stableHash(fullName)}`;
-
-    idMap[rowId] = fullName;
-    numMap[String(absIdx)] = fullName;
-
-    nameMap[String(fullName).toLowerCase()] = fullName;
-    nameMap[String(fullName).slice(0, 24).toLowerCase()] = fullName;
-  }
-
-  idMap.overhead = 'Overhead';
-  idMap.more = '__MORE__';
-
-  nameMap.overhead = 'Overhead';
-  nameMap['more jobs…'] = '__MORE__';
-  nameMap['more jobs'] = '__MORE__';
-  nameMap.more = '__MORE__';
-
-  numMap.overhead = 'Overhead';
-  numMap.more = '__MORE__';
-
-  return { idMap, nameMap, numMap };
 }
 
 async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections }) {
@@ -294,6 +334,10 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
   const payload = {
     to,
     ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
+
+    // ✅ Fix: Twilio requires either `body` or media in the message create call
+    body: String(bodyText || '').slice(0, 1600),
+
     interactive: {
       type: 'list',
       body: { text: String(bodyText || '').slice(0, 1024) },
@@ -321,82 +365,6 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
   return msg;
 }
 
-async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize = 8) {
-  const to = waTo(from);
-  const uniq = dedupeJobs(jobs);
-
-  const JOBS_PER_PAGE = Math.min(pageSize, 8);
-  const start = page * JOBS_PER_PAGE;
-  const slice = uniq.slice(start, start + JOBS_PER_PAGE);
-  const hasMore = start + JOBS_PER_PAGE < uniq.length;
-
-  const { idMap, nameMap, numMap } = buildJobPickerMapping(uniq, page, JOBS_PER_PAGE);
-
-  await mergePendingTransactionState(from, {
-    awaitingExpenseJob: true,
-    awaitingExpenseJobPage: page,
-    expenseJobPickerIdMap: idMap,
-    expenseJobPickerNameMap: nameMap,
-    expenseJobPickerNumMap: numMap,
-    expenseJobPickerHasMore: hasMore,
-    expenseJobPickerTotal: uniq.length
-  });
-
-  if (!ENABLE_INTERACTIVE_LIST || !to) {
-    return twimlText(buildTextJobPrompt(uniq, page, JOBS_PER_PAGE));
-  }
-
-  const rows = [];
-
-  for (let i = 0; i < slice.length; i++) {
-    const absIdx = start + i + 1;
-    const full = slice[i];
-    const rowId = `job_${absIdx}_${stableHash(full)}`;
-
-    rows.push({
-      id: rowId,
-      title: String(full).slice(0, 24),
-      description: String(full).slice(0, 72)
-    });
-  }
-
-  rows.push({
-    id: 'overhead',
-    title: 'Overhead',
-    description: 'Not tied to a job'
-  });
-
-  if (hasMore) {
-    rows.push({
-      id: 'more',
-      title: 'More jobs…',
-      description: `Show jobs ${start + JOBS_PER_PAGE + 1}+`
-    });
-  }
-
-  const bodyText =
-    `Here are your active jobs (${start + 1}-${Math.min(start + JOBS_PER_PAGE, uniq.length)} of ${
-      uniq.length
-    }).\n` +
-    `Pick one to assign this expense.\n\n` +
-    `Tip: You can switch your current job anytime.`;
-
-  const sections = [{ title: 'Active Jobs', rows }];
-
-  try {
-    await sendWhatsAppInteractiveList({
-      to,
-      bodyText,
-      buttonText: 'Pick a job',
-      sections
-    });
-    return twimlEmpty();
-  } catch (e) {
-    console.warn('[EXPENSE] interactive list failed; falling back to text:', e?.message);
-    return twimlText(buildTextJobPrompt(uniq, page, JOBS_PER_PAGE));
-  }
-}
-
 /* ---------------- helpers ---------------- */
 
 const MAX_MEDIA_TRANSCRIPT_CHARS =
@@ -419,6 +387,8 @@ function normalizeDecisionToken(input) {
 
   if (s === 'change job' || s === 'switch job') return 'change_job';
   if (/\bchange\s+job\b/.test(s) && s.length <= 40) return 'change_job';
+
+  if (s === 'more' || s === 'more jobs' || s === 'more jobs…') return 'more';
 
   if (/\byes\b/.test(s) && s.length <= 20) return 'yes';
   if (/\bedit\b/.test(s) && s.length <= 20) return 'edit';
@@ -506,123 +476,13 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName }) {
   const itLower = it.toLowerCase();
   const parts = [];
   parts.push(`Expense: ${amt} for ${it}`);
-  if (st && st !== 'Unknown Store' && !itLower.includes(`from ${st.toLowerCase()}`))
-    parts.push(`from ${st}`);
+  if (st && st !== 'Unknown Store' && !itLower.includes(`from ${st.toLowerCase()}`)) parts.push(`from ${st}`);
   if (dt && !itLower.includes(dt.toLowerCase())) parts.push(`on ${dt}`);
   if (jb && !itLower.includes(jb.toLowerCase())) parts.push(`for ${jb}`);
   return parts.join(' ') + '.';
 }
 
-/* ---------------- Active job resolution (aligned to postgres.js) ---------------- */
-
-function extractUserId(userProfile, fromPhone) {
-  return (
-    userProfile?.id ||
-    userProfile?.user_id ||
-    userProfile?.userId ||
-    userProfile?.member_id ||
-    userProfile?.membership_id ||
-    fromPhone ||
-    null
-  );
-}
-
-function normalizeE164ish(fromPhone) {
-  const raw = String(fromPhone || '').trim();
-  if (!raw) return null;
-  if (raw.startsWith('+')) return raw;
-  const digits = raw.replace(/\D/g, '');
-  return digits ? `+${digits}` : null;
-}
-
-async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, fromPhone }) {
-  const ownerParam = String(ownerId || '').trim();
-  const userId = extractUserId(userProfile, fromPhone);
-  const phone = normalizeE164ish(fromPhone);
-
-  // ✅ Canonical in postgres.js
-  if (typeof pg.getActiveJobForIdentity === 'function') {
-    try {
-      const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
-      if (out?.active_job_name || out?.activeJobName) {
-        return {
-          active_job_name: String(out.active_job_name || out.activeJobName).trim(),
-          active_job_id: out.active_job_id ?? out.activeJobId ?? null
-        };
-      }
-      if (out?.active_job_id || out?.activeJobId) {
-        return { active_job_name: null, active_job_id: out.active_job_id ?? out.activeJobId };
-      }
-    } catch (e) {
-      console.warn('[EXPENSE] pg.getActiveJobForIdentity failed (ignored):', e?.message);
-    }
-  }
-
-  // Legacy best-effort fallbacks (safe if schemas still exist)
-  const attempts = [
-    {
-      label: 'memberships by user_id',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.memberships
-             WHERE owner_id = $1 AND user_id = $2
-             LIMIT 1`,
-      params: [ownerParam, String(userId)]
-    },
-    {
-      label: 'memberships by phone',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.memberships
-             WHERE owner_id = $1 AND (phone = $2 OR phone_e164 = $2 OR member_phone = $2)
-             LIMIT 1`,
-      params: [ownerParam, phone]
-    },
-    {
-      label: 'users by id',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.users
-             WHERE owner_id = $1 AND user_id = $2
-             LIMIT 1`,
-      params: [ownerParam, String(userId)]
-    },
-    {
-      label: 'users by phone',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.users
-             WHERE owner_id = $1 AND (phone = $2 OR phone_e164 = $2)
-             LIMIT 1`,
-      params: [ownerParam, phone]
-    },
-    {
-      label: 'user_profiles by user_id',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.user_profiles
-             WHERE owner_id = $1 AND user_id = $2
-             LIMIT 1`,
-      params: [ownerParam, String(userId)]
-    }
-  ];
-
-  for (const a of attempts) {
-    if (!a.params?.[1]) continue;
-    try {
-      const r = await query(a.sql, a.params);
-      const row = r?.rows?.[0];
-      if (!row) continue;
-      const name = row.active_job_name != null ? String(row.active_job_name).trim() : null;
-      const id = row.active_job_id != null ? row.active_job_id : null;
-      if (name || id) {
-        console.info('[EXPENSE] active job fetched from DB', {
-          where: a.label,
-          hasName: !!name,
-          hasId: !!id
-        });
-        return { active_job_name: name || null, active_job_id: id };
-      }
-    } catch {}
-  }
-
-  return null;
-}
+/* ---------------- Active job resolution (aligned) ---------------- */
 
 async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
   const ownerParam = String(ownerId || '').trim();
@@ -630,54 +490,39 @@ async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
   const directName = userProfile?.active_job_name || userProfile?.activeJobName || null;
   if (directName && String(directName).trim()) return String(directName).trim();
 
-  const directRef = userProfile?.active_job_id ?? userProfile?.activeJobId ?? null;
-
-  let ref = directRef;
-  let name = null;
-
-  if (ref == null) {
-    const fetched = await bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, fromPhone });
-    if (fetched?.active_job_name && String(fetched.active_job_name).trim()) {
-      return String(fetched.active_job_name).trim();
-    }
-    ref = fetched?.active_job_id ?? null;
-    name = fetched?.active_job_name ?? null;
-  }
-
-  if (name && String(name).trim()) return String(name).trim();
-  if (ref == null) return null;
-
-  const s = String(ref).trim();
-
-  // If uuid ref, try uuid join
-  if (looksLikeUuid(s)) {
+  // Canonical in postgres.js (NOTE: your postgres.js replacement expects (ownerId, userId), so we pass fromPhone)
+  if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
-      const r = await query(
-        `select coalesce(name, job_name) as job_name
-           from public.jobs
-          where owner_id = $1 and id = $2::uuid
-          limit 1`,
-        [ownerParam, s]
-      );
-      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
-    } catch (e) {
-      console.warn('[expense] resolveActiveJobName uuid failed:', e?.message);
-    }
-  }
+      const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
+      const n = out?.active_job_name || out?.activeJobName || null;
+      if (n && String(n).trim()) return String(n).trim();
 
-  // If job_no ref, try job_no
-  if (/^\d+$/.test(s)) {
-    try {
-      const r = await query(
-        `select coalesce(name, job_name) as job_name
-           from public.jobs
-          where owner_id = $1 and job_no = $2::int
-          limit 1`,
-        [ownerParam, Number(s)]
-      );
-      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
+      const ref = out?.active_job_id ?? out?.activeJobId ?? null;
+      if (ref != null) {
+        const s = String(ref).trim();
+        if (looksLikeUuid(s)) {
+          const r = await query(
+            `select coalesce(name, job_name) as job_name
+               from public.jobs
+              where owner_id = $1 and id = $2::uuid
+              limit 1`,
+            [ownerParam, s]
+          );
+          if (r?.rows?.[0]?.job_name) return String(r.rows[0].job_name).trim();
+        }
+        if (/^\d+$/.test(s)) {
+          const r = await query(
+            `select coalesce(name, job_name) as job_name
+               from public.jobs
+              where owner_id = $1 and job_no = $2::int
+              limit 1`,
+            [ownerParam, Number(s)]
+          );
+          if (r?.rows?.[0]?.job_name) return String(r.rows[0].job_name).trim();
+        }
+      }
     } catch (e) {
-      console.warn('[expense] resolveActiveJobName job_no failed:', e?.message);
+      console.warn('[EXPENSE] resolveActiveJobName failed (ignored):', e?.message);
     }
   }
 
@@ -953,30 +798,193 @@ async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   return null;
 }
 
-function resolveJobFromReply(input, pending) {
+/* ---------------- Job list + Option A mapping ---------------- */
+
+async function listOpenJobsDetailed(ownerId, limit = 50) {
+  // Prefer a postgres.js helper if you have one
+  const fn =
+    (typeof pg.listOpenJobsDetailed === 'function' && pg.listOpenJobsDetailed) ||
+    (typeof pg.listJobsOpen === 'function' && pg.listJobsOpen) ||
+    null;
+
+  if (fn) {
+    try {
+      const r = await fn(ownerId, { limit });
+      if (Array.isArray(r) && r.length) {
+        return r
+          .map((j) => ({
+            id: j.id || j.job_id || null,
+            job_no: j.job_no || j.jobNo || null,
+            name: j.name || j.job_name || j.jobName || null
+          }))
+          .filter((j) => j.name && !isGarbageJobName(j.name));
+      }
+    } catch {}
+  }
+
+  // SQL fallback (best-effort; adjust status column in DB later if needed)
+  try {
+    const r = await query(
+      `
+      SELECT id, job_no, COALESCE(name, job_name) AS name
+        FROM public.jobs
+       WHERE owner_id = $1
+       ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+       LIMIT $2
+      `,
+      [String(ownerId), Number(limit)]
+    );
+    const rows = r?.rows || [];
+    return rows
+      .map((x) => ({
+        id: x.id || null,
+        job_no: x.job_no ?? null,
+        name: x.name ? String(x.name).trim() : null
+      }))
+      .filter((j) => j.name && !isGarbageJobName(j.name));
+  } catch {
+    // Last resort: your old listOpenJobs if present
+    if (typeof pg.listOpenJobs === 'function') {
+      try {
+        const names = await pg.listOpenJobs(ownerId, { limit });
+        return (names || [])
+          .map((n) => ({ id: null, job_no: null, name: String(n || '').trim() }))
+          .filter((j) => j.name && !isGarbageJobName(j.name));
+      } catch {}
+    }
+  }
+
+  return [];
+}
+
+function normalizeJobOptions(jobRows) {
+  const out = [];
+  const seen = new Set();
+
+  for (const j of jobRows || []) {
+    const name = String(j?.name || '').trim();
+    if (!name) continue;
+    if (isGarbageJobName(name)) continue;
+
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      id: j?.id ? String(j.id) : null,
+      job_no: j?.job_no != null ? Number(j.job_no) : null,
+      name
+    });
+  }
+
+  return out;
+}
+
+function resolveJobOptionFromReply(input, jobOptions) {
   const raw = normalizeJobAnswer(input);
   const t = String(raw || '').trim();
   if (!t) return null;
 
-  if (looksLikeOverhead(t)) return 'Overhead';
+  if (looksLikeOverhead(t)) return { kind: 'overhead' };
+  if (t.toLowerCase() === 'more' || t.toLowerCase() === 'more jobs' || t.toLowerCase() === 'more jobs…')
+    return { kind: 'more' };
 
+  // numeric: "1" means first row shown (absolute index)
+  if (/^\d+$/.test(t)) {
+    const idx = Number(t);
+    const opt = (jobOptions || [])[idx - 1] || null;
+    if (opt) return { kind: 'job', job: opt };
+    return null;
+  }
+
+  // match by name (case-insensitive)
   const lc = t.toLowerCase();
-  if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return '__MORE__';
+  const opt =
+    (jobOptions || []).find((j) => String(j.name || '').toLowerCase() === lc) ||
+    (jobOptions || []).find((j) => String(j.name || '').toLowerCase().startsWith(lc.slice(0, 24))) ||
+    null;
 
-  if (pending?.expenseJobPickerIdMap && pending.expenseJobPickerIdMap[t]) {
-    return pending.expenseJobPickerIdMap[t];
+  if (opt) return { kind: 'job', job: opt };
+
+  // allow raw name input as "job"
+  return { kind: 'job', job: { id: null, job_no: null, name: t } };
+}
+
+async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
+  const to = waTo(from);
+  const JOBS_PER_PAGE = Math.min(Number(pageSize || 8), 8);
+  const start = page * JOBS_PER_PAGE;
+  const slice = (jobOptions || []).slice(start, start + JOBS_PER_PAGE);
+  const hasMore = start + JOBS_PER_PAGE < (jobOptions || []).length;
+
+  // Persist picker context in pending_actions (Option A)
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_PICK_JOB,
+    payload: {
+      jobOptions,
+      page,
+      pageSize: JOBS_PER_PAGE,
+      hasMore,
+      shownAt: Date.now()
+    },
+    ttlSeconds: 600
+  });
+
+  if (!ENABLE_INTERACTIVE_LIST || !to) {
+    return twimlText(buildTextJobPrompt(jobOptions, page, JOBS_PER_PAGE));
   }
 
-  if (/^\d+$/.test(t) && pending?.expenseJobPickerNumMap?.[t]) {
-    return pending.expenseJobPickerNumMap[t];
+  const rows = [];
+
+  for (let i = 0; i < slice.length; i++) {
+    const absIdx = start + i + 1;
+    const full = slice[i]?.name || 'Untitled Job';
+    const rowId = `job_${absIdx}_${stableHash(full)}`;
+
+    rows.push({
+      id: rowId, // we still accept list row id, but numeric mapping uses absIdx
+      title: String(full).slice(0, 24),
+      description: (slice[i]?.job_no != null ? `#${slice[i].job_no} ` : '') + String(full).slice(0, 72)
+    });
   }
 
-  if (pending?.expenseJobPickerNameMap) {
-    const mapped = pending.expenseJobPickerNameMap[String(t).toLowerCase()];
-    if (mapped) return mapped;
+  rows.push({
+    id: 'overhead',
+    title: 'Overhead',
+    description: 'Not tied to a job'
+  });
+
+  if (hasMore) {
+    rows.push({
+      id: 'more',
+      title: 'More jobs…',
+      description: `Show jobs ${start + JOBS_PER_PAGE + 1}+`
+    });
   }
 
-  return t;
+  const bodyText =
+    `Here are your active jobs (${start + 1}-${Math.min(start + JOBS_PER_PAGE, jobOptions.length)} of ${
+      jobOptions.length
+    }).\n` +
+    `Pick one to assign this expense.\n\n` +
+    `Tip: You can reply with a number too (like "1").`;
+
+  const sections = [{ title: 'Active Jobs', rows }];
+
+  try {
+    await sendWhatsAppInteractiveList({
+      to,
+      bodyText,
+      buttonText: 'Pick a job',
+      sections
+    });
+    return twimlEmpty();
+  } catch (e) {
+    console.warn('[EXPENSE] interactive list failed; falling back to text:', e?.message);
+    return twimlText(buildTextJobPrompt(jobOptions, page, JOBS_PER_PAGE));
+  }
 }
 
 /* ---------------- media normalization (aligned) ---------------- */
@@ -984,7 +992,7 @@ function resolveJobFromReply(input, pending) {
 function normalizeMediaMetaForTx(pendingMediaMeta) {
   if (!pendingMediaMeta) return null;
 
-  // If postgres.js provides normalizeMediaMeta, use it (keeps consistent columns)
+  // If postgres.js provides normalizeMediaMeta, use it
   if (typeof pg.normalizeMediaMeta === 'function') {
     try {
       return pg.normalizeMediaMeta({
@@ -996,7 +1004,6 @@ function normalizeMediaMetaForTx(pendingMediaMeta) {
     } catch {}
   }
 
-  // fallback shape
   return {
     url: pendingMediaMeta.url || null,
     type: pendingMediaMeta.type || null,
@@ -1032,108 +1039,192 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       store: 'Unknown Store'
     };
 
-    let pending = await getPendingTransactionState(from);
-
-    if (pending?.isEditing && pending?.type === 'expense') {
-      await deletePendingTransactionState(from);
-      pending = null;
-    }
-
-    // Awaiting job selection (interactive list or text)
-    if (pending?.awaitingExpenseJob && pending?.pendingExpense) {
+    // ---- 1) If we're awaiting a job pick (Option A) ----
+    const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+    if (pickPA?.payload?.jobOptions && (pickPA.payload?.awaiting === true || true)) {
       const tok = normalizeDecisionToken(input);
 
+      const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
+      const page = Number(pickPA.payload.page || 0) || 0;
+      const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
+      const hasMore = !!pickPA.payload.hasMore;
+
       if (tok === 'change_job') {
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        const page = Number(pending.awaitingExpenseJobPage || 0) || 0;
-        return await sendJobPickerOrFallback(from, ownerId, all, page, 8);
+        // resend same page
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
       }
 
-      const resolved = resolveJobFromReply(input, pending);
-
-      if (resolved === '__MORE__') {
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        const nextPage = Number(pending.awaitingExpenseJobPage || 0) + 1;
-        return await sendJobPickerOrFallback(from, ownerId, all, nextPage, 8);
+      if (tok === 'more') {
+        if (!hasMore) {
+          return twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".');
+        }
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
       }
 
-      const finalJob = resolved || null;
+      // Also support WhatsApp list row ids: "job_3_abcd", "overhead", "more"
+      const raw = String(input || '').trim();
+      if (raw === 'overhead') {
+        // continue to confirm
+        const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        if (confirm?.payload?.draft) {
+          confirm.payload.draft.jobName = 'Overhead';
+          confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
+          await upsertPA({
+            ownerId,
+            userId: from,
+            kind: PA_KIND_CONFIRM,
+            payload: confirm.payload,
+            ttlSeconds: 600
+          });
+          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
 
-      const merged = normalizeExpenseData({ ...pending.pendingExpense, jobName: finalJob }, userProfile);
-      merged.store = await normalizeVendorName(ownerId, merged.store);
-      merged.item = stripEmbeddedDateAndJobFromItem(merged.item, { date: merged.date, jobName: merged.jobName });
+          const s = buildExpenseSummaryLine({
+            amount: confirm.payload.draft.amount,
+            item: confirm.payload.draft.item,
+            store: confirm.payload.draft.store,
+            date: confirm.payload.draft.date,
+            jobName: 'Overhead'
+          });
+          return await sendConfirmExpenseOrFallback(from, s);
+        }
+        // if confirm missing, just ack and clear picker
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+        return twimlText('Got it. Now resend the expense details.');
+      }
 
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingExpense: merged,
-        awaitingExpenseJob: false,
-        awaitingExpenseJobPage: null,
-        expenseJobPickerIdMap: null,
-        expenseJobPickerNameMap: null,
-        expenseJobPickerNumMap: null,
-        expenseJobPickerHasMore: null,
-        expenseJobPickerTotal: null
-      });
+      if (raw === 'more') {
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
+      }
 
-      const summaryLine = buildExpenseSummaryLine({
-        amount: merged.amount,
-        item: merged.item,
-        store: merged.store,
-        date: merged.date,
-        jobName: merged.jobName
-      });
-      return await sendConfirmExpenseOrFallback(from, summaryLine);
+      // If list row id like job_1_hash, parse its number prefix
+      let numericFromRowId = null;
+      const m = raw.match(/^job_(\d+)_/i);
+      if (m?.[1]) numericFromRowId = m[1];
+
+      const resolved = resolveJobOptionFromReply(numericFromRowId || input, jobOptions);
+      if (resolved?.kind === 'more') {
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
+      }
+
+      if (resolved?.kind === 'overhead') {
+        // same handling as above
+        const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        if (confirm?.payload?.draft) {
+          confirm.payload.draft.jobName = 'Overhead';
+          confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
+          await upsertPA({
+            ownerId,
+            userId: from,
+            kind: PA_KIND_CONFIRM,
+            payload: confirm.payload,
+            ttlSeconds: 600
+          });
+          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+
+          const s = buildExpenseSummaryLine({
+            amount: confirm.payload.draft.amount,
+            item: confirm.payload.draft.item,
+            store: confirm.payload.draft.store,
+            date: confirm.payload.draft.date,
+            jobName: 'Overhead'
+          });
+          return await sendConfirmExpenseOrFallback(from, s);
+        }
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+        return twimlText('Got it. Now resend the expense details.');
+      }
+
+      if (resolved?.kind === 'job' && resolved.job?.name) {
+        const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        if (confirm?.payload?.draft) {
+          confirm.payload.draft.jobName = String(resolved.job.name).trim();
+          confirm.payload.draft.job = {
+            id: resolved.job.id ? String(resolved.job.id) : null,
+            job_no: resolved.job.job_no != null ? Number(resolved.job.job_no) : null,
+            name: String(resolved.job.name).trim()
+          };
+
+          await upsertPA({
+            ownerId,
+            userId: from,
+            kind: PA_KIND_CONFIRM,
+            payload: confirm.payload,
+            ttlSeconds: 600
+          });
+
+          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+
+          const s = buildExpenseSummaryLine({
+            amount: confirm.payload.draft.amount,
+            item: confirm.payload.draft.item,
+            store: confirm.payload.draft.store,
+            date: confirm.payload.draft.date,
+            jobName: confirm.payload.draft.jobName
+          });
+          return await sendConfirmExpenseOrFallback(from, s);
+        }
+
+        // If confirm is missing, we can’t continue; clear picker and ask to resend
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+        return twimlText('Got it. Now resend the expense details.');
+      }
+
+      return twimlText('Please reply with a number, job name, "Overhead", or "more".');
     }
 
-    // Confirm/edit/cancel flow
-    if (pending?.pendingExpense || pending?.pendingDelete?.type === 'expense') {
+    // ---- 2) Confirm/edit/cancel flow (Option A) ----
+    const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    if (confirmPA?.payload?.draft) {
       if (!isOwner) {
-        await deletePendingTransactionState(from);
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
         reply = '⚠️ Only the owner can manage expenses.';
         return twimlText(reply);
       }
 
       const token = normalizeDecisionToken(input);
-      const stableMsgId = String(pending?.expenseSourceMsgId || safeMsgId).trim();
+      const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId).trim();
 
-      if (token === 'change_job' && pending?.pendingExpense) {
-        await mergePendingTransactionState(from, {
-          ...(pending || {}),
-          awaitingExpenseJob: true,
-          awaitingExpenseJobPage: 0
-        });
-
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
+      if (token === 'change_job') {
+        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+        if (!jobs.length) return twimlText('No jobs found. Reply "Overhead" or create a job first.');
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
       }
 
-      if (token === 'yes' && pending?.pendingExpense) {
-        const rawData = pending.pendingExpense || {};
-        const mediaMeta = normalizeMediaMetaForTx(pending?.pendingMediaMeta || null);
+      if (token === 'edit') {
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        return twimlText('✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").');
+      }
 
-        let data = normalizeExpenseData(rawData, userProfile);
+      if (token === 'cancel') {
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        return twimlText('❌ Operation cancelled.');
+      }
+
+      if (token === 'yes') {
+        const rawDraft = confirmPA.payload.draft || {};
+        const mediaMeta = normalizeMediaMetaForTx(confirmPA.payload.pendingMediaMeta || null);
+
+        let data = normalizeExpenseData(rawDraft, userProfile);
         data.store = await normalizeVendorName(ownerId, data.store);
 
         const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
-        // ✅ Resolve job by: pending -> canonical active-job -> null
-        const jobName =
-          (data.jobName && String(data.jobName).trim()) ||
-          (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) ||
-          null;
+        // If the draft already has a picked job, use it. Else fall back to active job, else pick.
+        const pickedJobName = rawDraft.jobName && String(rawDraft.jobName).trim() ? String(rawDraft.jobName).trim() : null;
+        const pickedJob = rawDraft.job && typeof rawDraft.job === 'object' ? rawDraft.job : null;
+
+        const jobName = pickedJobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
 
         if (!jobName) {
-          await mergePendingTransactionState(from, {
-            ...(pending || {}),
-            pendingExpense: { ...data, suggestedCategory: category },
-            awaitingExpenseJob: true,
-            awaitingExpenseJobPage: 0,
-            expenseSourceMsgId: stableMsgId,
-            type: 'expense'
+          const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+          await upsertPA({
+            ownerId,
+            userId: from,
+            kind: PA_KIND_CONFIRM,
+            payload: { ...confirmPA.payload, draft: { ...data, suggestedCategory: category }, sourceMsgId: stableMsgId },
+            ttlSeconds: 600
           });
-
-          const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-          return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
+          return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
         }
 
         data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
@@ -1152,7 +1243,10 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         const amountCents = toCents(data.amount);
         if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
 
-        // ✅ idempotent write by source_msg_id (when schema supports it)
+        // Pass job info. insertTransaction can resolve job_id from job/job_name;
+        // if you have job_id support, include picked uuid when present.
+        const maybeJobId = pickedJob?.id && looksLikeUuid(String(pickedJob.id)) ? String(pickedJob.id) : null;
+
         const writeResult = await withTimeout(
           insertTransaction(
             {
@@ -1163,9 +1257,11 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
               amount_cents: amountCents,
               amount: toNumberAmount(data.amount),
               source: String(data.store || '').trim() || 'Unknown',
-              // IMPORTANT: pass jobName both ways; postgres.js will resolve and populate job_id if possible
+
               job: jobName,
               job_name: jobName,
+              job_id: maybeJobId || null,
+
               category: category ? String(category).trim() : null,
               user_name: userProfile?.name || 'Unknown User',
               source_msg_id: stableMsgId,
@@ -1178,15 +1274,14 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         );
 
         if (writeResult === '__DB_TIMEOUT__') {
-          await mergePendingTransactionState(from, {
-            ...(pending || {}),
-            pendingExpense: { ...data, jobName, suggestedCategory: category },
-            expenseSourceMsgId: stableMsgId,
-            type: 'expense'
+          await upsertPA({
+            ownerId,
+            userId: from,
+            kind: PA_KIND_CONFIRM,
+            payload: { ...confirmPA.payload, draft: { ...data, jobName, suggestedCategory: category }, sourceMsgId: stableMsgId },
+            ttlSeconds: 600
           });
-
-          reply = `⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.`;
-          return twimlText(reply);
+          return twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.');
         }
 
         const summaryLine = buildExpenseSummaryLine({
@@ -1202,28 +1297,15 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
             ? '✅ Already logged that expense (duplicate message).'
             : `✅ Expense logged: ${summaryLine}${category ? ` (Category: ${category})` : ''}`;
 
-        await deletePendingTransactionState(from);
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
         return twimlText(reply);
       }
 
-      if (token === 'edit') {
-        await deletePendingTransactionState(from);
-        reply =
-          '✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").';
-        return twimlText(reply);
-      }
-
-      if (token === 'cancel') {
-        await deletePendingTransactionState(from);
-        reply = '❌ Operation cancelled.';
-        return twimlText(reply);
-      }
-
-      reply = `⚠️ Please choose Yes, Edit, or Cancel.\nTip: reply "change job" to pick a different job.`;
-      return twimlText(reply);
+      return twimlText('⚠️ Please choose Yes, Edit, or Cancel.\nTip: reply "change job" to pick a different job.');
     }
 
-    // Backstop deterministic parse
+    // ---- 3) No pending actions: parse a new expense ----
+
     const backstop = deterministicExpenseParse(input, userProfile);
     if (backstop && backstop.amount) {
       const data0 = normalizeExpenseData(backstop, userProfile);
@@ -1231,23 +1313,26 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
 
-      const jobName =
-        data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-
+      // prefer explicit job in text, else active job
+      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
       if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
 
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingExpense: { ...data0, jobName, suggestedCategory: category },
-        expenseSourceMsgId: safeMsgId,
-        type: 'expense',
-        awaitingExpenseJob: !jobName,
-        awaitingExpenseJobPage: 0
+      // Save confirm state in pending_actions
+      await upsertPA({
+        ownerId,
+        userId: from,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          draft: { ...data0, jobName, suggestedCategory: category, job: jobName ? { id: null, job_no: null, name: jobName } : null },
+          sourceMsgId: safeMsgId,
+          type: 'expense'
+        },
+        ttlSeconds: 600
       });
 
       if (!jobName) {
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
+        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
       }
 
       const summaryLine = buildExpenseSummaryLine({
@@ -1279,12 +1364,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
       data.store === 'Unknown Store';
 
     if (aiReply && missingCore) {
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingExpense: null,
-        isEditing: true,
-        type: 'expense'
-      });
+      // Treat as "needs clarification"
       return twimlText(aiReply);
     }
 
@@ -1293,23 +1373,24 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
       const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
-      const jobName =
-        data.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-
+      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
       if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingExpense: { ...data, jobName, suggestedCategory: category },
-        expenseSourceMsgId: safeMsgId,
-        type: 'expense',
-        awaitingExpenseJob: !jobName,
-        awaitingExpenseJobPage: 0
+      await upsertPA({
+        ownerId,
+        userId: from,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          draft: { ...data, jobName, suggestedCategory: category, job: jobName ? { id: null, job_no: null, name: jobName } : null },
+          sourceMsgId: safeMsgId,
+          type: 'expense'
+        },
+        ttlSeconds: 600
       });
 
       if (!jobName) {
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
+        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
       }
 
       const summaryLine = buildExpenseSummaryLine({

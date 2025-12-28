@@ -1676,9 +1676,57 @@ async function getPendingAction({ ownerId, userId }) {
   return rows[0] || null;
 }
 
-async function deletePendingAction(id) {
-  await query(`delete from public.pending_actions where id=$1`, [id]);
+// ✅ SMART delete:
+// - deletePendingAction(uuid) works
+// - deletePendingAction({ ownerId, userId, kind }) also works (routes to deletePendingActionByKind)
+// - deletePendingAction(pendingRow) also works (uses .id or .owner_id + .user_id + .kind)
+async function deletePendingAction(arg) {
+  // simple uuid string
+  const looksUuid = (s) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(s || '').trim());
+
+  // 1) If passed an id string, delete by id
+  if (typeof arg === 'string' || typeof arg === 'number') {
+    const id = String(arg).trim();
+    if (looksUuid(id)) {
+      await query(`delete from public.pending_actions where id=$1`, [id]);
+      return;
+    }
+    // If someone passes "123" or "[object Object]" accidentally, do nothing safely
+    console.warn('[pending_actions] deletePendingAction received non-uuid id (ignored):', id);
+    return;
+  }
+
+  // 2) If passed an object: try delete by kind OR by embedded id
+  if (arg && typeof arg === 'object') {
+    const id = arg.id || arg.pending_id || null;
+    if (id && looksUuid(id)) {
+      await query(`delete from public.pending_actions where id=$1`, [String(id)]);
+      return;
+    }
+
+    const ownerId = arg.ownerId ?? arg.owner_id ?? null;
+    const userId = arg.userId ?? arg.user_id ?? null;
+    const kind = arg.kind ?? null;
+
+    if (ownerId && userId && kind && typeof deletePendingActionByKind === 'function') {
+      await deletePendingActionByKind({ ownerId, userId, kind });
+      return;
+    }
+
+    console.warn('[pending_actions] deletePendingAction received object but insufficient keys (ignored):', {
+      hasOwnerId: !!ownerId,
+      hasUserId: !!userId,
+      hasKind: !!kind,
+      hasId: !!id
+    });
+    return;
+  }
+
+  // 3) null/undefined etc
+  return;
 }
+
 /* ---------- Pending Actions (Kind-aware helpers) ---------- */
 
 async function getPendingActionByKind({ ownerId, userId, kind }) {
@@ -1720,6 +1768,16 @@ async function deletePendingActionByKind({ ownerId, userId, kind }) {
     [owner, user, k]
   );
 }
+// ✅ Compatibility aliases (some newer files expect these names)
+async function upsertPendingAction({ ownerId, userId, kind, payload, ttlSeconds } = {}) {
+  // Your schema uses created_at TTL, not expires_at. We ignore ttlSeconds safely.
+  return savePendingAction({ ownerId, userId, kind, payload });
+}
+
+async function clearPendingAction({ ownerId, userId, kind } = {}) {
+  return deletePendingActionByKind({ ownerId, userId, kind });
+}
+
 
 /* -------------------- Finance helpers -------------------- */
 async function getOwnerPricingItems(ownerId) {
@@ -2537,6 +2595,7 @@ module.exports = {
   savePendingAction,
   getPendingAction,
   deletePendingAction,
+  clearPendingAction,
 
   generateOTP,
   verifyOTP,
@@ -2590,6 +2649,8 @@ module.exports = {
   exportTimesheetXlsx,
   exportTimesheetPdf,
   getFileExport,
+  upsertPendingAction,
+  deletePendingAction,
   getPendingActionByKind,
   deletePendingActionByKind,
 

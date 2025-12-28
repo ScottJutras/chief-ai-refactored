@@ -1,16 +1,14 @@
 // handlers/media.js
-// COMPLETE DROP-IN (aligned with latest expense.js / revenue.js / timeclock.js / tasks.js + router patterns)
+// COMPLETE DROP-IN (aligned with expense.js Option A + webhook passthrough + timeclock signature)
 //
-// Alignments included:
-// - Never “logs” expense/revenue inside media.js. Instead: attaches pendingMediaMeta + returns transcript
-//   so expense.js / revenue.js can run their normal confirm + idempotent insert flows.
-// - Uses stable idempotency key for media: prefers Twilio MediaSid, falls back to MessageSid, then time.
-// - Fixes timeclock invocation: your handleTimeclock signature is (from, text, userProfile, ownerId, ownerProfile, isOwner, res)
-//   (your prior stub passed extra args).
-// - Safer TwiML escaping and consistent return shape: { transcript, twiml }.
-// - Text-only messages: pass through to router (don’t treat as “media”).
-// - Pending finance type markers set in state so confirm replies route correctly.
-// - Conservative intent detection for receipts vs timeclock.
+// Fixes included:
+// ✅ Central "trade-term correction" layer after transcription/OCR (Gentek/Gen Tech, siding/sighting, etc.)
+// ✅ Corrections applied to BOTH returned transcript AND pendingMediaMeta transcript
+// ✅ Stable idempotency key for media: prefers Twilio MediaSid, falls back to MessageSid, then time
+// ✅ Never logs expense/revenue here; attaches pendingMediaMeta + returns transcript to router
+// ✅ Marks pending finance kind + stores stableMediaMsgId in pending state
+// ✅ Text-only messages pass through (not treated as media)
+// ✅ Safer TwiML escaping and consistent return shape: { transcript, twiml }
 
 const axios = require('axios');
 const { parseMediaText } = require('../services/mediaParser');
@@ -19,7 +17,6 @@ const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
 
 // Some builds export generateTimesheet from postgres; some from pg service layer.
-// Keep compatibility.
 let generateTimesheet = null;
 try {
   ({ generateTimesheet } = require('../services/postgres'));
@@ -31,15 +28,12 @@ try {
 }
 
 const state = require('../utils/stateManager');
-const getPendingTransactionState =
-  state.getPendingTransactionState ||
-  (async () => null);
+const getPendingTransactionState = state.getPendingTransactionState || (async () => null);
 
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
-// Be tolerant about how transcriptionService exports
 const transcribeAudio =
   (transcriptionMod && typeof transcriptionMod.transcribeAudio === 'function' && transcriptionMod.transcribeAudio) ||
   (transcriptionMod && typeof transcriptionMod.default === 'function' && transcriptionMod.default) ||
@@ -85,9 +79,7 @@ function toAmPm(tsIso, tz) {
       .toLocaleString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' })
       .toLowerCase();
   } catch {
-    return new Date(tsIso)
-      .toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })
-      .toLowerCase();
+    return new Date(tsIso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase();
   }
 }
 
@@ -110,14 +102,12 @@ function truncateText(str, maxChars) {
   return s.slice(0, maxChars);
 }
 
-// Keep aligned with expense.js MAX_MEDIA_TRANSCRIPT_CHARS default (or pg constant, but pg is not imported here)
 const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
 
 function normalizeContentType(mediaType) {
   return String(mediaType || '').split(';')[0].trim().toLowerCase();
 }
 
-// handle string OR { transcript/text/confidence }
 function normalizeTranscriptionResult(res) {
   if (!res) return { transcript: '', confidence: null };
   if (typeof res === 'string') return { transcript: res, confidence: null };
@@ -130,9 +120,27 @@ function normalizeTranscriptionResult(res) {
 }
 
 /**
- * Attempt to extract Twilio MediaSid from the mediaUrl query params.
- * This gives you a stable id for idempotency instead of `${from}:${Date.now()}`.
+ * ✅ Trade-term correction layer (centralized).
  */
+function correctTradeTerms(text) {
+  let s = String(text || '');
+
+  // Gentek variants
+  s = s.replace(/\bgen\s*tech\b/gi, 'Gentek');
+  s = s.replace(/\bgentech\b/gi, 'Gentek');
+  s = s.replace(/\bgentek\b/gi, 'Gentek');
+
+  // siding mis-hear
+  s = s.replace(/\bsighting\b/gi, 'siding');
+
+  // other common trade terms
+  s = s.replace(/\bsoffet\b/gi, 'soffit');
+  s = s.replace(/\bfacia\b/gi, 'fascia');
+  s = s.replace(/\beaves\s*trough\b/gi, 'eavestrough');
+
+  return s.replace(/\s+/g, ' ').trim();
+}
+
 function getTwilioMediaSid(mediaUrl) {
   try {
     const u = new URL(String(mediaUrl || ''));
@@ -142,39 +150,32 @@ function getTwilioMediaSid(mediaUrl) {
   }
 }
 
-/**
- * Attach media meta to pending state so expense/revenue can persist it after confirmation.
- * Safe merge; never blocks.
- */
 async function attachPendingMediaMeta(from, meta) {
   try {
     const url = String(meta?.url || '').trim() || null;
     const type = String(meta?.type || '').trim() || null;
     const transcript = truncateText(meta?.transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
     const confidence = Number.isFinite(Number(meta?.confidence)) ? Number(meta.confidence) : null;
+    const source_msg_id = meta?.source_msg_id ? String(meta.source_msg_id) : null;
 
-    if (!url && !type && !transcript && confidence == null) return;
+    if (!url && !type && !transcript && confidence == null && !source_msg_id) return;
 
     const pending = await getPendingTransactionState(from);
     await mergePendingTransactionState(from, {
       ...(pending || {}),
-      pendingMediaMeta: { url, type, transcript, confidence }
+      pendingMediaMeta: { url, type, transcript, confidence, source_msg_id }
     });
   } catch (e) {
     console.warn('[MEDIA] attachPendingMediaMeta failed (ignored):', e?.message);
   }
 }
 
-/**
- * Finance intent classifier used for media ONLY.
- * The actual parsing + confirmation is done by expense.js / revenue.js.
- */
 function financeIntentFromText(text) {
   const lc = String(text || '').toLowerCase();
 
   const looksExpense =
     /\b(expense|receipt|spent|cost|paid|bought|buy|purchase|purchased|ordered|charge|charged)\b/.test(lc) ||
-    /\b(home\s*depot|rona|lowe'?s|home\s*hardware|beacon|abc\s*supply|convoy)\b/.test(lc);
+    /\b(home\s*depot|rona|lowe'?s|home\s*hardware|beacon|abc\s*supply|convoy|gentek)\b/.test(lc);
 
   const looksRevenue =
     /\b(revenue|payment|paid\s+by|deposit|deposited|sale|received|got\s+paid|invoice\s+paid)\b/.test(lc);
@@ -189,9 +190,6 @@ function financeIntentFromText(text) {
   return { kind: null };
 }
 
-/**
- * Mark pending flow type + stable source msg id key used by expense.js / revenue.js
- */
 async function markPendingFinance({ from, kind, stableMediaMsgId }) {
   try {
     const pending = await getPendingTransactionState(from);
@@ -199,29 +197,24 @@ async function markPendingFinance({ from, kind, stableMediaMsgId }) {
       ...(pending || {}),
       type: kind,
       pendingMedia: { type: kind },
-      expenseSourceMsgId: kind === 'expense' ? stableMediaMsgId : (pending?.expenseSourceMsgId || null),
-      revenueSourceMsgId: kind === 'revenue' ? stableMediaMsgId : (pending?.revenueSourceMsgId || null)
+      expenseSourceMsgId: kind === 'expense' ? stableMediaMsgId : pending?.expenseSourceMsgId || null,
+      revenueSourceMsgId: kind === 'revenue' ? stableMediaMsgId : pending?.revenueSourceMsgId || null,
+      mediaSourceMsgId: stableMediaMsgId
     });
   } catch (e) {
     console.warn('[MEDIA] markPendingFinance failed (ignored):', e?.message);
   }
 }
 
-/**
- * IMPORTANT:
- * If this is text-only (no mediaUrl), do NOT handle as media.
- * Return transcript and let webhook/router route it to revenue.js/expense.js/etc.
- */
-async function passThroughTextOnly(from, input) {
+async function passThroughTextOnly(_from, input) {
   const t = String(input || '').trim();
   if (!t) return { transcript: '', twiml: null };
-  return { transcript: t, twiml: null };
+  return { transcript: correctTradeTerms(t), twiml: null };
 }
 
 async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   let payload = null;
 
-  // Determine isOwner best-effort (don’t block correctness; timeclock has its own permissions)
   const up = userProfile || {};
   const ownerIdFromProfile = up.owner_id || up.ownerId || ownerId || null;
 
@@ -249,7 +242,7 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   };
 
   try {
-    // NOTE: signature: (from, text, userProfile, ownerId, ownerProfile, isOwner, res)
+    // signature: (from, text, userProfile, ownerId, ownerProfile, isOwner, res)
     await handleTimeclock(from, normalized, userProfile, ownerIdFromProfile || ownerId, null, isOwner, resStub);
   } catch (e) {
     console.error('[MEDIA] handleTimeclock failed:', e?.message);
@@ -261,30 +254,18 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
 
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType, sourceMsgId) {
   try {
-    console.log('[MEDIA] incoming', {
-      from,
-      mediaType,
-      hasUrl: !!mediaUrl,
-      inputLen: (input || '').length
-    });
-
-    // ✅ Text-only: let webhook/router handle it
     if (!mediaUrl) return await passThroughTextOnly(from, input);
 
     const baseType = normalizeContentType(mediaType);
     const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
     const isSupportedImage = validImageTypes.includes(baseType);
-
-    // Be resilient: accept any audio/*
     const isAudioFamily = baseType.startsWith('audio/');
     const isSupportedAudio = isAudioFamily;
 
     if (!isSupportedImage && !isSupportedAudio) {
       return {
         transcript: null,
-        twiml: twiml(
-          `⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio/voice note.`
-        )
+        twiml: twiml(`⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio note.`)
       };
     }
 
@@ -295,7 +276,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       (String(sourceMsgId || '').trim() ? `${from}:${String(sourceMsgId).trim()}` : null) ||
       `${from}:${Date.now()}`;
 
-    /* ---------- Build text from media ---------- */
     let extractedText = String(input || '').trim();
     const normType = baseType;
 
@@ -303,18 +283,14 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       url: mediaUrl || null,
       type: normType || null,
       transcript: null,
-      confidence: null
+      confidence: null,
+      source_msg_id: stableMediaMsgId
     };
 
     // AUDIO
     if (isAudioFamily) {
       if (typeof transcribeAudio !== 'function') {
-        return {
-          transcript: null,
-          twiml: twiml(
-            `⚠️ Voice transcription isn’t available right now. Please type: "expense $84.12 nails from Home Depot".`
-          )
-        };
+        return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
       }
 
       let transcript = '';
@@ -323,10 +299,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       try {
         const resp = await axios.get(mediaUrl, {
           responseType: 'arraybuffer',
-          auth: {
-            username: process.env.TWILIO_ACCOUNT_SID,
-            password: process.env.TWILIO_AUTH_TOKEN
-          },
+          auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
           maxContentLength: 8 * 1024 * 1024
         });
 
@@ -337,7 +310,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         transcript = n1.transcript;
         confidence = n1.confidence;
 
-        // Some engines need a different label for ogg/opus
         if (!transcript && normType === 'audio/ogg') {
           try {
             const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
@@ -354,32 +326,26 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       transcript = String(transcript || '').trim();
       if (!transcript) {
-        return {
-          transcript: null,
-          twiml: twiml(
-            `⚠️ I couldn’t understand the audio. Try again, or text: "expense $500 materials from Home Depot today".`
-          )
-        };
+        return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
       }
+
+      transcript = correctTradeTerms(transcript);
 
       mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
 
-      // Attach media meta for audit + later persistence by expense/revenue confirm
       await attachPendingMediaMeta(from, mediaMeta);
 
-      // Finance voice -> return transcript to router + mark pending kind (so "yes" uses stable ids)
-      const fin = financeIntentFromText(transcript);
-      if (fin.kind === 'expense' || fin.kind === 'revenue') {
-        await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
-        return { transcript, twiml: null };
-      }
-
-      // Timeclock/hours -> run timeclock pipeline; otherwise pass-through transcript
+      // ✅ Avoid misclassifying time-related voice as finance
       const tc = inferTimeclockIntentFromText(transcript);
-      if (tc === 'hours_inquiry' || tc) {
-        extractedText = transcript;
+      if (tc) {
+        extractedText = transcript; // let parser/timeclock flow decide
       } else {
+        const fin = financeIntentFromText(transcript);
+        if (fin.kind === 'expense' || fin.kind === 'revenue') {
+          await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
+          return { transcript, twiml: null };
+        }
         return { transcript, twiml: null };
       }
     }
@@ -394,15 +360,13 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         console.warn('[MEDIA] extractTextFromImage failed:', e?.message);
       }
 
-      extractedText = (ocrText || extractedText || '').trim();
+      extractedText = correctTradeTerms((ocrText || extractedText || '').trim());
 
       mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = null;
 
-      // Attach for audit
       await attachPendingMediaMeta(from, mediaMeta);
 
-      // If clearly finance, just pass transcript to router
       const fin = financeIntentFromText(extractedText);
       if (fin.kind === 'expense' || fin.kind === 'revenue') {
         await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
@@ -414,7 +378,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       const pending = await getPendingTransactionState(from);
       await mergePendingTransactionState(from, {
         ...(pending || {}),
-        pendingMedia: { url: mediaUrl, type: null }
+        pendingMedia: { url: mediaUrl, type: null },
+        mediaSourceMsgId: stableMediaMsgId
       });
 
       return {
@@ -423,7 +388,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       };
     }
 
-    /* ---------- Parse ---------- */
     const result = await parseMediaText(extractedText);
 
     // HOURS inquiry
@@ -432,13 +396,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       const tz = getUserTz(userProfile);
 
       if (result?.data?.period && typeof generateTimesheet === 'function') {
-        const { message } = await generateTimesheet({
-          ownerId,
-          person: name,
-          period: result.data.period,
-          tz,
-          now: new Date()
-        });
+        const { message } = await generateTimesheet({ ownerId, person: name, period: result.data.period, tz, now: new Date() });
         return { transcript: null, twiml: twiml(message) };
       }
 
@@ -446,18 +404,14 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingMedia: { type: 'hours_inquiry' },
-        pendingHours: { employeeName: name }
+        pendingHours: { employeeName: name },
+        mediaSourceMsgId: stableMediaMsgId
       });
 
-      return {
-        transcript: null,
-        twiml: twiml(
-          `Looks like you’re asking about ${name}’s hours. Do you want **today**, **this week**, or **this month**?`
-        )
-      };
+      return { transcript: null, twiml: twiml(`Looks like you’re asking about ${name}’s hours. Do you want today, this week, or this month?`) };
     }
 
-    // TIME entry
+    // TIME entry (from parser)
     if (result?.type === 'time_entry') {
       const data = result.data || {};
       let { employeeName, type, timestamp } = data;
@@ -486,19 +440,17 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       if (typeof tw === 'string' && tw.trim()) return { transcript: null, twiml: tw };
 
       const when = timestamp ? fmtLocal(timestamp, tz) : 'now';
-      return { transcript: null, twiml: twiml(`✅ ${type.replace('_', ' ')} logged for ${who} at ${when}.`) };
+      return { transcript: null, twiml: twiml(`✅ ${String(type || '').replace('_', ' ')} logged for ${who} at ${when}.`) };
     }
 
     // Expense / Revenue detected by parser
     if (result?.type === 'expense' || result?.type === 'revenue') {
-      const kind = result.type;
-      await markPendingFinance({ from, kind, stableMediaMsgId });
+      await markPendingFinance({ from, kind: result.type, stableMediaMsgId });
       return { transcript: extractedText, twiml: null };
     }
 
-    // Otherwise: pass transcript to router (agent can handle)
+    // Otherwise: pass transcript to router
     return { transcript: extractedText, twiml: null };
-
   } catch (error) {
     console.error(`[MEDIA] handleMedia failed for ${from}:`, error?.message);
     return { transcript: null, twiml: twiml(`⚠️ Failed to process media. Please try again.`) };

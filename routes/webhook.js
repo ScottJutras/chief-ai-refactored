@@ -1,14 +1,17 @@
 // routes/webhook.js
-// COMPLETE DROP-IN (aligned with expense.js Option A pending_actions + job.js picker + postgres.js expectations)
+// COMPLETE DROP-IN (aligned with:
+// - expense.js Option A pending_actions (pick_job_for_expense + confirm_expense)
+// - pendingActionMiddleware (confirm/cancel/edit/skip)
+// - handlers/media.js (trade-term correction + stableMediaMsgId + returns { transcript, twiml })
 //
-// Key alignments:
-// - Keeps req.ownerId numeric (phone digits) — DO NOT overwrite with UUID.
-// - Preserves rawBody before token middleware (Twilio signature verification).
-// - Robust inbound text extraction for WhatsApp interactive list replies.
-// - ✅ Integrates Option A pending_actions gating so expense job-picks + confirms consume "1"/"job_1_*"/"yes" BEFORE job.js.
-// - ✅ Numeric / job_* replies ONLY route to job.js active-job picker when awaitingActiveJobPick is true AND no expense pending_actions are active.
-// - Keeps 8s safety timer + tolerant middlewares + media transcript passthrough.
-// - Avoids double-sending TwiML: always check res.headersSent.
+// Fixes vs your current file:
+// ✅ Correctly passes sourceMsgId into handleMedia (media + text follow-ups) so idempotency is stable.
+// ✅ Correctly handles media.js returning { twiml } (your current file only handled string).
+// ✅ Fixes pending_actions lookup: DO NOT call pg.getPendingAction for "by kind" (your pg.getPendingAction is NOT kind-aware).
+//    We now use pg.getPendingActionByKind when present; otherwise SQL fallback.
+// ✅ Tightens job-picker stealing: numeric/job_* tokens will not be routed to job.js if expense pending_actions exist.
+// ✅ Keeps ownerId numeric (phone digits). ownerUuid can be stored separately if you map it.
+// ✅ Avoids double-send TwiML and keeps the 8s safety timer.
 
 const express = require('express');
 const querystring = require('querystring');
@@ -44,8 +47,7 @@ const ok = (res, text = 'OK') => {
   res.status(200).type('application/xml; charset=utf-8').send(xml(text));
 };
 
-const normalizePhone = (raw = '') =>
-  String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
+const normalizePhone = (raw = '') => String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
 
 function pickFirstMedia(body = {}) {
   const n = parseInt(body.NumMedia || '0', 10) || 0;
@@ -221,13 +223,10 @@ function looksRevenueNl(str) {
 const PA_KIND_PICK_JOB_EXPENSE = 'pick_job_for_expense';
 const PA_KIND_CONFIRM_EXPENSE = 'confirm_expense';
 
-// Prefer getPendingActionByKind (aligned with postgres.js), fall back to older names if present.
+// ✅ IMPORTANT: Only use getPendingActionByKind if it exists.
+// DO NOT fall back to pg.getPendingAction for kind queries (your pg.getPendingAction is NOT kind-aware).
 const pgGetPendingActionByKind =
-  (typeof pg.getPendingActionByKind === 'function' && pg.getPendingActionByKind) ||
-  (typeof pg.getPendingAction === 'function' && pg.getPendingAction) ||
-  (typeof pg.readPendingAction === 'function' && pg.readPendingAction) ||
-  (typeof pg.fetchPendingAction === 'function' && pg.fetchPendingAction) ||
-  null;
+  (typeof pg.getPendingActionByKind === 'function' && pg.getPendingActionByKind) || null;
 
 // TTL minutes for SQL fallback. Should match services/postgres.js PENDING_TTL_MIN.
 const PA_TTL_MIN = Number(process.env.PENDING_TTL_MIN || 10);
@@ -242,7 +241,8 @@ async function getPA({ ownerId, userId, kind }) {
     try {
       const r = await pgGetPendingActionByKind({ ownerId: owner, userId: user, kind: k });
       if (!r) return null;
-      if (r.payload) return r;
+      // normalize payload (some helpers return payload directly)
+      if (r.payload != null) return r;
       if (typeof r === 'object') return { payload: r };
       return null;
     } catch {
@@ -277,7 +277,8 @@ async function hasExpensePA(ownerId, from) {
       getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB_EXPENSE }),
       getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM_EXPENSE })
     ]);
-    return { pick, conf, hasAny: !!(pick?.payload || conf?.payload) };
+    const hasAny = !!(pick?.payload || conf?.payload);
+    return { pick, conf, hasAny };
   } catch {
     return { pick: null, conf: null, hasAny: false };
   }
@@ -329,10 +330,9 @@ router.use((req, _res, next) => {
   req.from = req.body?.From ? normalizePhone(req.body.From) : null;
 
   // IMPORTANT: keep ownerId numeric (aligns with postgres.js DIGITS() calls).
-  // Do NOT set to 'GLOBAL' — lots of code calls DIGITS(ownerId).
   req.ownerId = req.from || null;
 
-  // Optionally compute a canonical URL used by token middleware for Twilio signature checks
+  // canonical URL used by token middleware for Twilio signature checks
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
   const path = req.originalUrl || req.url || '/api/webhook';
@@ -410,7 +410,7 @@ router.use((req, res, next) => {
   }
 });
 
-/* ---------------- Pending Action interceptor (confirm/undo) ---------------- */
+/* ---------------- Pending Action interceptor (confirm/cancel/edit/skip) ---------------- */
 
 try {
   const { pendingActionMiddleware } = require('../middleware/pendingAction');
@@ -429,15 +429,30 @@ router.post('*', async (req, res, next) => {
     const { handleMedia } = require('../handlers/media');
 
     const bodyText = getInboundText(req.body || {});
-    const result = await handleMedia(req.from, bodyText, req.userProfile || {}, req.ownerId, url, type);
+    const sourceMsgId = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
 
-    // If media handler returns a transcript object, pass it through as Body for downstream routing.
-    if (result && typeof result === 'object' && result.transcript) {
-      req.body.Body = result.transcript;
-      return next();
+    const result = await handleMedia(
+      req.from,
+      bodyText,
+      req.userProfile || {},
+      req.ownerId,
+      url,
+      type,
+      sourceMsgId
+    );
+
+    // ✅ handlers/media.js returns { transcript, twiml }.
+    if (result && typeof result === 'object') {
+      if (result.twiml && !res.headersSent) {
+        return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
+      }
+      if (result.transcript) {
+        req.body.Body = result.transcript;
+        return next();
+      }
     }
 
-    // If media handler returns TwiML string, send it now.
+    // Back-compat: if a handler returns a plain TwiML string
     if (typeof result === 'string' && result && !res.headersSent) {
       return res.status(200).type('application/xml; charset=utf-8').send(result);
     }
@@ -473,8 +488,7 @@ router.post('*', async (req, res, next) => {
     // Canonical idempotency key for ingestion (Twilio)
     const crypto = require('crypto');
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-    const messageSid =
-      rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
+    const messageSid = rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
 
     // ✅ Option A: check pending_actions FIRST (so "1"/"job_1_*"/"yes" go to expense.js, not job.js)
     const expensePA = await hasExpensePA(req.ownerId, req.from);
@@ -531,16 +545,25 @@ router.post('*', async (req, res, next) => {
     if (hasPendingMedia && numMedia === 0) {
       try {
         const { handleMedia } = require('../handlers/media');
-        const result = await handleMedia(req.from, text, req.userProfile || {}, req.ownerId, null, null);
+        const result = await handleMedia(
+          req.from,
+          text,
+          req.userProfile || {},
+          req.ownerId,
+          null,
+          null,
+          messageSid
+        );
 
-        if (typeof result === 'string' && result && !res.headersSent) {
+        if (result && typeof result === 'object') {
+          if (result.twiml) {
+            return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
+          }
+          if (result.transcript && !result.twiml) {
+            req.body.Body = result.transcript;
+          }
+        } else if (typeof result === 'string' && result) {
           return res.status(200).type('application/xml; charset=utf-8').send(result);
-        }
-
-        if (result && typeof result === 'object' && result.transcript && !result.twiml) {
-          req.body.Body = result.transcript;
-        } else if (result && typeof result === 'object' && result.twiml) {
-          return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
         }
 
         // refresh text after rewrite
@@ -574,16 +597,7 @@ router.post('*', async (req, res, next) => {
             (cmds?.job && cmds.job.handleJob) || cmds?.handleJob || require('../handlers/commands/job').handleJob;
 
           if (typeof handleJob === 'function') {
-            await handleJob(
-              req.from,
-              text2,
-              req.userProfile,
-              req.ownerId,
-              req.ownerProfile,
-              req.isOwner,
-              res,
-              messageSid
-            );
+            await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
             if (res.headersSent) return;
             return ok(res, 'OK');
           }
@@ -607,10 +621,9 @@ router.post('*', async (req, res, next) => {
       (!!pending?.pendingRevenue && !isNewRevenueCmd);
 
     // ✅ For expense, include Option A pending_actions triggers.
-    // IMPORTANT: DO NOT make this always-true; only route to expense when the input looks like a reply.
+    // IMPORTANT: only route to expense when input looks like a reply-ish token or explicit expense prefix.
     const expensePendingActionsLike =
-      hasExpensePendingActions &&
-      (isPickerToken || isAllowedWhilePending(lc2) || /^(expense|exp)\b/.test(lc2));
+      hasExpensePendingActions && (isPickerToken || isAllowedWhilePending(lc2) || /^(expense|exp)\b/.test(lc2));
 
     const pendingExpenseLike =
       expensePendingActionsLike ||
@@ -623,17 +636,9 @@ router.post('*', async (req, res, next) => {
     if (pendingRevenueLike) {
       try {
         const { handleRevenue } = require('../handlers/commands/revenue');
-        const twiml = await handleRevenue(
-          req.from,
-          text2,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
-        if (!res.headersSent && typeof twiml === 'string') {
-          return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        const tw = await handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
+        if (!res.headersSent && typeof tw === 'string') {
+          return res.status(200).type('application/xml; charset=utf-8').send(tw);
         }
         if (!res.headersSent) return ok(res, 'OK');
         return;
@@ -645,17 +650,9 @@ router.post('*', async (req, res, next) => {
     if (pendingExpenseLike) {
       try {
         const { handleExpense } = require('../handlers/commands/expense');
-        const twiml = await handleExpense(
-          req.from,
-          text2,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
-        if (!res.headersSent && typeof twiml === 'string') {
-          return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        const tw = await handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
+        if (!res.headersSent && typeof tw === 'string') {
+          return res.status(200).type('application/xml; charset=utf-8').send(tw);
         }
         if (!res.headersSent) return ok(res, 'OK');
         return;
@@ -690,13 +687,13 @@ router.post('*', async (req, res, next) => {
           }, timeoutMs);
         });
 
-        const twiml = await Promise.race([
+        const tw = await Promise.race([
           handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
           timeoutPromise
         ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        if (!res.headersSent && typeof twiml === 'string') {
-          return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        if (!res.headersSent && typeof tw === 'string') {
+          return res.status(200).type('application/xml; charset=utf-8').send(tw);
         }
         if (!res.headersSent) return ok(res, 'OK');
         return;
@@ -727,13 +724,13 @@ router.post('*', async (req, res, next) => {
           }, timeoutMs);
         });
 
-        const twiml = await Promise.race([
+        const tw = await Promise.race([
           handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
           timeoutPromise
         ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        if (!res.headersSent && typeof twiml === 'string') {
-          return res.status(200).type('application/xml; charset=utf-8').send(twiml);
+        if (!res.headersSent && typeof tw === 'string') {
+          return res.status(200).type('application/xml; charset=utf-8').send(tw);
         }
         if (!res.headersSent) return ok(res, 'OK');
         return;
@@ -782,32 +779,7 @@ router.post('*', async (req, res, next) => {
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc2)) looksTime = true;
     if (askingHow && /\bjobs?\b/.test(lc2)) looksJob = true;
 
-    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(
-      Boolean
-    );
-
-    const SOP = {
-      tasks:
-        'Tasks — Quick guide:\n' +
-        '• Create: task - buy nails\n' +
-        '• List mine: my tasks\n' +
-        '• Complete: done #4\n' +
-        '• Assign: task @PHONE - pickup shingles\n' +
-        '• Due date: task - call client | due tomorrow 4pm',
-      timeclock:
-        'Timeclock — Quick guide:\n' +
-        '• Clock in: clock in (uses active job) or clock in @ Roof Job\n' +
-        '• Break/Drive: break start/stop; drive start/stop\n' +
-        '• Clock out: clock out\n' +
-        '• Timesheet: timesheet week',
-      jobs:
-        'Jobs — Quick guide:\n' +
-        '• Create: create job Roof Repair\n' +
-        '• Set active: change job (or active job Roof Repair)\n' +
-        '• List: list jobs\n' +
-        '• Close: finish job Roof Repair\n' +
-        '• Move: move last log to Front Porch [for Justin]'
-    };
+    const topicHints = [looksTask ? 'tasks' : null, looksJob ? 'jobs' : null, looksTime ? 'timeclock' : null].filter(Boolean);
 
     // Load command handlers defensively (exports vary across builds)
     let tasksHandler = null;
@@ -832,17 +804,31 @@ router.post('*', async (req, res, next) => {
       console.warn('[WEBHOOK] commands bundle load failed (ignored):', e?.message);
     }
 
+    const SOP = {
+      tasks:
+        'Tasks — Quick guide:\n' +
+        '• Create: task - buy nails\n' +
+        '• List mine: my tasks\n' +
+        '• Complete: done #4\n' +
+        '• Assign: task @PHONE - pickup shingles\n' +
+        '• Due date: task - call client | due tomorrow 4pm',
+      timeclock:
+        'Timeclock — Quick guide:\n' +
+        '• Clock in: clock in (uses active job) or clock in @ Roof Job\n' +
+        '• Break/Drive: break start/stop; drive start/stop\n' +
+        '• Clock out: clock out\n' +
+        '• Timesheet: timesheet week',
+      jobs:
+        'Jobs — Quick guide:\n' +
+        '• Create: create job Roof Repair\n' +
+        '• Set active: change job (or active job Roof Repair)\n' +
+        '• List: list jobs\n' +
+        '• Close: finish job Roof Repair\n' +
+        '• Move: move last log to Front Porch [for Justin]'
+    };
+
     if (looksTask && typeof tasksHandler === 'function') {
-      const out = await tasksHandler(
-        req.from,
-        text2,
-        req.userProfile,
-        req.ownerId,
-        req.ownerProfile,
-        req.isOwner,
-        res,
-        messageSid
-      );
+      const out = await tasksHandler(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (res.headersSent) return;
 
       let msg = '';
@@ -858,20 +844,10 @@ router.post('*', async (req, res, next) => {
     // ✅ If expense pending_actions exist, do NOT let job.js steal numeric/list tokens.
     // Still allow explicit job intents like "change job" (but those were handled earlier).
     if (looksJob && typeof handleJob === 'function') {
-      // If a user sends "1" or "job_1_*" and we got here, it's NOT a job picker flow.
       if (looksLikeJobPickerReplyToken(text2) && !isJobPickerIntent(lc2) && !pending?.awaitingActiveJobPick) {
-        // fall through to help/agent
+        // fall through to agent/help
       } else {
-        await handleJob(
-          req.from,
-          text2,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          res,
-          messageSid
-        );
+        await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
         if (res.headersSent) return;
         let msg = askingHow ? SOP.jobs : 'Job handled.';
         msg += await glossaryNudgeFrom(text2);
@@ -929,16 +905,7 @@ router.post('*', async (req, res, next) => {
 
     // Timeclock legacy
     if (looksTime && typeof handleTimeclock === 'function') {
-      const out = await handleTimeclock(
-        req.from,
-        text2,
-        req.userProfile,
-        req.ownerId,
-        req.ownerProfile,
-        req.isOwner,
-        res,
-        messageSid
-      );
+      const out = await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (res.headersSent) return;
 
       let msg = '';
@@ -959,16 +926,7 @@ router.post('*', async (req, res, next) => {
       try {
         const { handleJobKpis } = require('../handlers/commands/job_kpis');
         if (typeof handleJobKpis === 'function') {
-          const out = await handleJobKpis(
-            req.from,
-            text2,
-            req.userProfile,
-            req.ownerId,
-            req.ownerProfile,
-            req.isOwner,
-            res,
-            messageSid
-          );
+          const out = await handleJobKpis(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
           if (res.headersSent) return;
 
           let msg = typeof out === 'string' && out.trim() ? out.trim() : 'KPI shown.';

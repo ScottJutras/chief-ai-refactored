@@ -1,5 +1,6 @@
 // middleware/pendingAction.js
 // Handles confirm/cancel replies + pending nudge BEFORE command routing.
+// IMPORTANT: Does NOT intercept expense/revenue confirm flows handled by command handlers.
 
 const pg = require('../services/postgres');
 
@@ -104,6 +105,14 @@ function humanLine(type, target, ts, tz) {
   return `${target} ${humanVerb(type)} ${toHumanTime(ts, tz)} on ${toHumanDate(ts, tz)}`;
 }
 
+// Kinds that MUST be handled by the command handlers, not this middleware.
+const HANDLER_OWNED_KINDS = new Set([
+  'confirm_expense',
+  'pick_job_for_expense',
+  'confirm_revenue',
+  'pick_job_for_revenue'
+]);
+
 async function pendingActionMiddleware(req, res, next) {
   try {
     const textRaw = (req.body?.Body || '').trim();
@@ -118,6 +127,11 @@ async function pendingActionMiddleware(req, res, next) {
 
     const pending = await pg.getPendingAction({ ownerId, userId: from });
     if (!pending) return next();
+
+    // ✅ DO NOT intercept expense/revenue confirm flows (they are handled in expense.js/revenue.js)
+    if (pending?.kind && HANDLER_OWNED_KINDS.has(String(pending.kind))) {
+      return next();
+    }
 
     const isConfirm = /^(yes|confirm)$/i.test(textRaw);
     const isCancel = /^(cancel|no)$/i.test(textRaw);
@@ -152,7 +166,6 @@ async function pendingActionMiddleware(req, res, next) {
         return res.status(200).type('application/xml').send(xmlMsg('Move failed — missing data.'));
       }
 
-      // Keep logic centralized
       const moved = await pg.moveLastLogToJob(ownerId, target, jobName).catch(() => null);
 
       await pg.deletePendingAction(pending.id).catch(() => {});

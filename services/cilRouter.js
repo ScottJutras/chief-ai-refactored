@@ -1,55 +1,56 @@
 // services/cilRouter.js
+// Central CIL dispatcher:
+// - Validates payload with the correct Zod schema
+// - Normalizes ctx (owner_id, actor_phone, source_msg_id)
+// - Attaches normalized media meta for domain handlers
+// - Returns a consistent { ok, type, summary, ... } envelope
+
 const { cilSchemas } = require('../cil');
 
 // Domain handlers
-const { createLead }        = require('../domain/lead');
-const { createQuote }       = require('../domain/quote');
-const { createAgreement }   = require('../domain/agreement');
-const { createInvoice }     = require('../domain/invoice');
+const { createLead } = require('../domain/lead');
+const { createQuote } = require('../domain/quote');
+const { createAgreement } = require('../domain/agreement');
+const { createInvoice } = require('../domain/invoice');
 const { createChangeOrder } = require('../domain/changeOrder');
 const { logExpense, logRevenue } = require('../domain/transactions');
-const {
-  addPricingItem,
-  updatePricingItem,
-  deletePricingItem
-} = require('../domain/pricing');
+const { addPricingItem, updatePricingItem, deletePricingItem } = require('../domain/pricing');
 
-// ✅ Pull in media normalization + truncation logic from the DB layer
+// Prefer postgres.normalizeMediaMeta if present (your newer postgres.js has it)
 let normalizeMediaMeta = null;
 try {
-  // Available after your postgres.js drop-in
   ({ normalizeMediaMeta } = require('./postgres'));
 } catch {
   // fail-open
-  normalizeMediaMeta = (m) => m || null;
+  normalizeMediaMeta = (m) => (m && typeof m === 'object' ? m : null);
 }
 
 const schemaMap = {
-  CreateLead:        cilSchemas.CreateLead,
-  CreateQuote:       cilSchemas.CreateQuote,
-  CreateAgreement:   cilSchemas.CreateAgreement,
-  CreateInvoice:     cilSchemas.CreateInvoice,
-  CreateChangeOrder: cilSchemas.CreateChangeOrder,
+  CreateLead: cilSchemas?.CreateLead,
+  CreateQuote: cilSchemas?.CreateQuote,
+  CreateAgreement: cilSchemas?.CreateAgreement,
+  CreateInvoice: cilSchemas?.CreateInvoice,
+  CreateChangeOrder: cilSchemas?.CreateChangeOrder,
 
-  LogExpense:        cilSchemas.LogExpense,
-  LogRevenue:        cilSchemas.LogRevenue,
+  LogExpense: cilSchemas?.LogExpense,
+  LogRevenue: cilSchemas?.LogRevenue,
 
-  AddPricingItem:    cilSchemas.AddPricingItem,
-  UpdatePricingItem: cilSchemas.UpdatePricingItem,
-  DeletePricingItem: cilSchemas.DeletePricingItem,
+  AddPricingItem: cilSchemas?.AddPricingItem,
+  UpdatePricingItem: cilSchemas?.UpdatePricingItem,
+  DeletePricingItem: cilSchemas?.DeletePricingItem,
 };
 
 const handlerMap = {
-  CreateLead:        createLead,
-  CreateQuote:       createQuote,
-  CreateAgreement:   createAgreement,
-  CreateInvoice:     createInvoice,
+  CreateLead: createLead,
+  CreateQuote: createQuote,
+  CreateAgreement: createAgreement,
+  CreateInvoice: createInvoice,
   CreateChangeOrder: createChangeOrder,
 
-  LogExpense:        logExpense,
-  LogRevenue:        logRevenue,
+  LogExpense: logExpense,
+  LogRevenue: logRevenue,
 
-  AddPricingItem:    addPricingItem,
+  AddPricingItem: addPricingItem,
   UpdatePricingItem: updatePricingItem,
   DeletePricingItem: deletePricingItem,
 };
@@ -60,52 +61,58 @@ function safeStr(x) {
 }
 
 function buildMediaMetaFromCil(rawCil) {
-  // If legacy CIL includes media_url only, still treat it as media meta
+  // Accept legacy naming variants (do NOT force into schema fields)
   const url = safeStr(rawCil?.media_url || rawCil?.mediaUrl);
   const type = safeStr(rawCil?.media_type || rawCil?.mediaType);
   const transcript = rawCil?.media_transcript || rawCil?.mediaTranscript || null;
-  const confidence = rawCil?.media_confidence ?? rawCil?.mediaConfidence ?? null;
+  const confidence =
+    rawCil?.media_confidence ?? rawCil?.mediaConfidence ?? null;
 
   if (!url && !type && !transcript && confidence == null) return null;
   return { url, type, transcript, confidence };
 }
 
-// Entry point
 async function applyCIL(rawCil, ctx) {
-  if (!rawCil || !rawCil.type) {
+  if (!rawCil || typeof rawCil !== 'object') {
+    throw new Error('CIL payload missing');
+  }
+  if (!rawCil.type) {
     throw new Error('CIL missing type');
   }
 
   const schema = schemaMap[rawCil.type];
-  if (!schema) throw new Error(`Unsupported CIL type: ${rawCil.type}`);
+  if (!schema || typeof schema.parse !== 'function') {
+    throw new Error(`Unsupported CIL type: ${rawCil.type}`);
+  }
 
-  // ✅ Normalize ctx (fail-open; don’t crash if caller forgets something)
   const baseCtx = ctx && typeof ctx === 'object' ? ctx : {};
 
+  // Tenant safety: require owner_id (UUID/text supported)
   const owner_id =
     safeStr(baseCtx.owner_id) ||
     safeStr(baseCtx.ownerId) ||
     safeStr(rawCil.owner_id) ||
+    safeStr(rawCil.ownerId) ||
     null;
 
   if (!owner_id) {
-    // Keeping this strict is good for tenant safety.
     throw new Error('Missing ctx.owner_id');
   }
 
-  // These aren’t always present, but we standardize them for auditability
   const actor_phone =
     safeStr(baseCtx.actor_phone) ||
     safeStr(baseCtx.actorPhone) ||
     safeStr(baseCtx.from) ||
+    safeStr(baseCtx.actor) ||
     null;
 
   const source_msg_id =
     safeStr(baseCtx.source_msg_id) ||
     safeStr(baseCtx.sourceMsgId) ||
+    safeStr(baseCtx.messageSid) ||
     null;
 
-  // ✅ Media meta: prefer ctx.mediaMeta / ctx.pendingMediaMeta; fall back to any media fields in rawCil
+  // Prefer ctx media meta (pendingMediaMeta from state) then fall back to CIL embedded fields
   const ctxMedia =
     baseCtx.mediaMeta ||
     baseCtx.pendingMediaMeta ||
@@ -116,53 +123,57 @@ async function applyCIL(rawCil, ctx) {
 
   const mediaMetaNormalized = normalizeMediaMeta(ctxMedia || cilMedia);
 
-  // ✅ Only set media_url onto the CIL payload if the schema already supports it.
-  // (We do NOT add media_type/transcript/confidence to CIL because schemas likely don’t include them.)
+  // Only fill media_url if the schema supports it AND caller omitted it.
   const effectiveMediaUrl =
     safeStr(rawCil?.media_url || rawCil?.mediaUrl) ||
     safeStr(mediaMetaNormalized?.media_url) ||
+    safeStr(mediaMetaNormalized?.url) ||
     null;
 
-  // Build the object that goes through schema.parse (keep it schema-friendly)
   const cilInput = {
     ...rawCil,
     owner_id,
   };
 
-  // Best-effort: if this CIL type supports media_url and caller omitted it, fill it
+  // Best-effort: add media_url only if undefined (don’t override intentional null)
   if (effectiveMediaUrl && typeof cilInput.media_url === 'undefined') {
     cilInput.media_url = effectiveMediaUrl;
   }
 
   // Validate & coerce
-  const cil = schema.parse(cilInput);
+  let cil;
+  try {
+    cil = schema.parse(cilInput);
+  } catch (e) {
+    const msg = e?.message || 'CIL schema validation failed';
+    const err = new Error(msg);
+    err.cil_type = rawCil.type;
+    throw err;
+  }
 
-  // Dispatch
   const fn = handlerMap[cil.type];
   if (!fn) throw new Error(`No handler for CIL type: ${cil.type}`);
 
-  // ✅ Provide standardized ctx to domain layer (audit + attachments)
   const ctxOut = {
     ...baseCtx,
     owner_id,
     actor_phone,
     source_msg_id,
 
-    // Preferred: domain handlers can use this to persist media_url/type/transcript/confidence
+    // Preferred: domain handlers can persist full attachment meta
     mediaMetaNormalized,
 
-    // Back-compat conveniences (some older handlers might look here)
+    // Back-compat conveniences
     media_url: effectiveMediaUrl,
   };
 
-  const res = await fn(cil, ctxOut);
+  const result = await fn(cil, ctxOut);
 
-  // Return a unified summary for WhatsApp replies
   return {
     ok: true,
     type: cil.type,
-    ...res,
-    summary: res?.summary || `${cil.type} processed.`,
+    ...(result || {}),
+    summary: result?.summary || `${cil.type} processed.`,
   };
 }
 

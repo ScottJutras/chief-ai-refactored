@@ -1,14 +1,39 @@
 // handlers/media.js
+// COMPLETE DROP-IN (aligned with latest expense.js / revenue.js / timeclock.js / tasks.js + router patterns)
+//
+// Alignments included:
+// - Never “logs” expense/revenue inside media.js. Instead: attaches pendingMediaMeta + returns transcript
+//   so expense.js / revenue.js can run their normal confirm + idempotent insert flows.
+// - Uses stable idempotency key for media: prefers Twilio MediaSid, falls back to MessageSid, then time.
+// - Fixes timeclock invocation: your handleTimeclock signature is (from, text, userProfile, ownerId, ownerProfile, isOwner, res)
+//   (your prior stub passed extra args).
+// - Safer TwiML escaping and consistent return shape: { transcript, twiml }.
+// - Text-only messages: pass through to router (don’t treat as “media”).
+// - Pending finance type markers set in state so confirm replies route correctly.
+// - Conservative intent detection for receipts vs timeclock.
+
 const axios = require('axios');
 const { parseMediaText } = require('../services/mediaParser');
 const { extractTextFromImage } = require('../utils/visionService');
 const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
 
-const { generateTimesheet } = require('../services/postgres');
+// Some builds export generateTimesheet from postgres; some from pg service layer.
+// Keep compatibility.
+let generateTimesheet = null;
+try {
+  ({ generateTimesheet } = require('../services/postgres'));
+} catch {
+  try {
+    const pg = require('../services/postgres');
+    generateTimesheet = pg.generateTimesheet || null;
+  } catch {}
+}
 
 const state = require('../utils/stateManager');
-const getPendingTransactionState = state.getPendingTransactionState;
+const getPendingTransactionState =
+  state.getPendingTransactionState ||
+  (async () => null);
 
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
@@ -32,7 +57,7 @@ function xmlEsc(s = '') {
 }
 
 function twiml(text) {
-  return `<Response><Message>${xmlEsc(text)}</Message></Response>`;
+  return `<Response><Message>${xmlEsc(String(text || '').trim())}</Message></Response>`;
 }
 
 function getUserTz(userProfile) {
@@ -44,7 +69,10 @@ function fmtLocal(tsIso, tz) {
     return new Date(tsIso).toLocaleString('en-CA', {
       timeZone: tz,
       hour: 'numeric',
-      minute: '2-digit'
+      minute: '2-digit',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
     });
   } catch {
     return new Date(tsIso).toLocaleString();
@@ -63,14 +91,15 @@ function toAmPm(tsIso, tz) {
   }
 }
 
-function inferIntentFromText(s = '') {
+function inferTimeclockIntentFromText(s = '') {
   const lc = String(s).toLowerCase();
   if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift)\b/.test(lc)) return 'punch_in';
   if (/\b(clock|punch)\s+out\b/.test(lc) || /\b(end|finish|stop)\s+(work|shift)\b/.test(lc)) return 'punch_out';
   if (/\b(start|begin)\s+(break|lunch)\b/.test(lc) || /\bon\s+break\b/.test(lc)) return 'break_start';
-  if (/\b(end|finish)\s+(break|lunch)\b/.test(lc) || /\boff\s+break\b/.test(lc)) return 'break_end';
+  if (/\b(end|finish|stop)\s+(break|lunch)\b/.test(lc) || /\boff\s+break\b/.test(lc)) return 'break_end';
   if (/\b(start|begin)\s+drive\b/.test(lc)) return 'drive_start';
-  if (/\b(end|finish)\s+drive\b/.test(lc)) return 'drive_end';
+  if (/\b(end|finish|stop)\s+drive\b/.test(lc)) return 'drive_end';
+  if (/\b(timesheet|hours\s+for|how\s+many\s+hours)\b/.test(lc)) return 'hours_inquiry';
   return null;
 }
 
@@ -81,54 +110,8 @@ function truncateText(str, maxChars) {
   return s.slice(0, maxChars);
 }
 
+// Keep aligned with expense.js MAX_MEDIA_TRANSCRIPT_CHARS default (or pg constant, but pg is not imported here)
 const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
-
-async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
-  let payload = null;
-
-  // NOTE: ownerId may be UUID in your system. For timeclock we keep legacy behavior:
-  // derive "isOwner" by comparing digit-only strings if possible, but pass through ownerId untouched.
-  const up = userProfile || {};
-  const ownerIdFromProfile = up.owner_id || up.ownerId || ownerId || null;
-
-  const isOwner = (() => {
-    try {
-      const a = String(up.user_id || '').replace(/\D/g, '');
-      const b = String(ownerIdFromProfile || '').replace(/\D/g, '');
-      if (!a || !b) return false;
-      return a === b;
-    } catch {
-      return false;
-    }
-  })();
-
-  const resStub = {
-    headersSent: false,
-    status() { return this; },
-    type() { return this; },
-    send(body) {
-      payload = String(body || '');
-      this.headersSent = true;
-      return this;
-    }
-  };
-
-  try {
-    await handleTimeclock(
-      from,
-      normalized,
-      userProfile,
-      ownerIdFromProfile || ownerId,
-      null,
-      isOwner,
-      resStub,
-      {}
-    );
-  } catch (e) {
-    console.error('[MEDIA] handleTimeclock failed:', e?.message);
-  }
-  return payload;
-}
 
 function normalizeContentType(mediaType) {
   return String(mediaType || '').split(';')[0].trim().toLowerCase();
@@ -183,41 +166,16 @@ async function attachPendingMediaMeta(from, meta) {
 }
 
 /**
- * IMPORTANT:
- * If this is text-only (no mediaUrl), and we're in a finance confirm flow,
- * do NOT "handle as media". Return transcript and let webhook route it to revenue.js/expense.js.
- */
-async function maybePassThroughFinanceTextOnly(from, input) {
-  if (!String(input || '').trim()) return null;
-
-  const pendingState = await getPendingTransactionState(from);
-
-  // pendingMedia can be boolean OR object in different builds. Be defensive.
-  const pendingMedia = pendingState?.pendingMedia;
-  const pendingMediaType =
-    (pendingMedia && typeof pendingMedia === 'object' ? pendingMedia.type : null) ||
-    pendingState?.type ||
-    null;
-
-  if (pendingMediaType === 'expense' || pendingMediaType === 'revenue') {
-    return { transcript: String(input || '').trim(), twiml: null };
-  }
-  return null;
-}
-
-/**
  * Finance intent classifier used for media ONLY.
- * NOTE: We intentionally keep this lightweight and deterministic.
  * The actual parsing + confirmation is done by expense.js / revenue.js.
  */
 function financeIntentFromText(text) {
   const lc = String(text || '').toLowerCase();
 
-  // Expense-ish words
   const looksExpense =
-    /\b(expense|receipt|spent|cost|paid|bought|buy|purchase|purchased|ordered|charge|charged)\b/.test(lc);
+    /\b(expense|receipt|spent|cost|paid|bought|buy|purchase|purchased|ordered|charge|charged)\b/.test(lc) ||
+    /\b(home\s*depot|rona|lowe'?s|home\s*hardware|beacon|abc\s*supply|convoy)\b/.test(lc);
 
-  // Revenue-ish words
   const looksRevenue =
     /\b(revenue|payment|paid\s+by|deposit|deposited|sale|received|got\s+paid|invoice\s+paid)\b/.test(lc);
 
@@ -225,27 +183,83 @@ function financeIntentFromText(text) {
     if (/\b(received|deposit|deposited|got\s+paid|invoice\s+paid)\b/.test(lc)) return { kind: 'revenue' };
     return { kind: 'expense' };
   }
-
   if (looksExpense) return { kind: 'expense' };
   if (looksRevenue) return { kind: 'revenue' };
+
   return { kind: null };
 }
 
+/**
+ * Mark pending flow type + stable source msg id key used by expense.js / revenue.js
+ */
 async function markPendingFinance({ from, kind, stableMediaMsgId }) {
-  const pending = await getPendingTransactionState(from);
-  await mergePendingTransactionState(from, {
-    ...(pending || {}),
-    type: kind,
-    pendingMedia: { type: kind },
-    // ✅ alignment: handlers use these as the stable idempotency keys
-    expenseSourceMsgId: kind === 'expense' ? stableMediaMsgId : (pending?.expenseSourceMsgId || null),
-    revenueSourceMsgId: kind === 'revenue' ? stableMediaMsgId : (pending?.revenueSourceMsgId || null),
-  });
+  try {
+    const pending = await getPendingTransactionState(from);
+    await mergePendingTransactionState(from, {
+      ...(pending || {}),
+      type: kind,
+      pendingMedia: { type: kind },
+      expenseSourceMsgId: kind === 'expense' ? stableMediaMsgId : (pending?.expenseSourceMsgId || null),
+      revenueSourceMsgId: kind === 'revenue' ? stableMediaMsgId : (pending?.revenueSourceMsgId || null)
+    });
+  } catch (e) {
+    console.warn('[MEDIA] markPendingFinance failed (ignored):', e?.message);
+  }
+}
+
+/**
+ * IMPORTANT:
+ * If this is text-only (no mediaUrl), do NOT handle as media.
+ * Return transcript and let webhook/router route it to revenue.js/expense.js/etc.
+ */
+async function passThroughTextOnly(from, input) {
+  const t = String(input || '').trim();
+  if (!t) return { transcript: '', twiml: null };
+  return { transcript: t, twiml: null };
+}
+
+async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
+  let payload = null;
+
+  // Determine isOwner best-effort (don’t block correctness; timeclock has its own permissions)
+  const up = userProfile || {};
+  const ownerIdFromProfile = up.owner_id || up.ownerId || ownerId || null;
+
+  const isOwner = (() => {
+    try {
+      const a = String(up.user_id || up.id || '').replace(/\D/g, '');
+      const b = String(ownerIdFromProfile || '').replace(/\D/g, '');
+      if (!a || !b) return false;
+      return a === b;
+    } catch {
+      return false;
+    }
+  })();
+
+  const resStub = {
+    headersSent: false,
+    req: { body: {} },
+    status() { return this; },
+    type() { return this; },
+    send(body) {
+      payload = String(body || '');
+      this.headersSent = true;
+      return this;
+    }
+  };
+
+  try {
+    // NOTE: signature: (from, text, userProfile, ownerId, ownerProfile, isOwner, res)
+    await handleTimeclock(from, normalized, userProfile, ownerIdFromProfile || ownerId, null, isOwner, resStub);
+  } catch (e) {
+    console.error('[MEDIA] handleTimeclock failed:', e?.message);
+  }
+  return payload;
 }
 
 /* ---------------- main ---------------- */
 
-async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType) {
+async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType, sourceMsgId) {
   try {
     console.log('[MEDIA] incoming', {
       from,
@@ -255,18 +269,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     });
 
     // ✅ Text-only: let webhook/router handle it
-    if (!mediaUrl) {
-      const pass = await maybePassThroughFinanceTextOnly(from, input);
-      if (pass) return pass;
-      return { transcript: String(input || '').trim(), twiml: null };
-    }
-
-    // From here: we DO have mediaUrl, so validate media types
-    const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (!mediaUrl) return await passThroughTextOnly(from, input);
 
     const baseType = normalizeContentType(mediaType);
-    console.log('[MEDIA] normalized content-type', { original: mediaType, baseType });
-
+    const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
     const isSupportedImage = validImageTypes.includes(baseType);
 
     // Be resilient: accept any audio/*
@@ -276,17 +282,22 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     if (!isSupportedImage && !isSupportedAudio) {
       return {
         transcript: null,
-        twiml: twiml(`⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio/voice note.`)
+        twiml: twiml(
+          `⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio/voice note.`
+        )
       };
     }
 
-    // Stable id for idempotency: use MediaSid when available
+    // Stable idempotency key: prefer MediaSid, else webhook MessageSid, else time.
     const mediaSid = getTwilioMediaSid(mediaUrl);
-    const stableMediaMsgId = mediaSid ? `${from}:${mediaSid}` : `${from}:${Date.now()}`;
+    const stableMediaMsgId =
+      (mediaSid ? `${from}:${mediaSid}` : null) ||
+      (String(sourceMsgId || '').trim() ? `${from}:${String(sourceMsgId).trim()}` : null) ||
+      `${from}:${Date.now()}`;
 
     /* ---------- Build text from media ---------- */
     let extractedText = String(input || '').trim();
-    const normType = normalizeContentType(mediaType);
+    const normType = baseType;
 
     const mediaMeta = {
       url: mediaUrl || null,
@@ -300,12 +311,11 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       if (typeof transcribeAudio !== 'function') {
         return {
           transcript: null,
-          twiml: twiml(`⚠️ Voice transcription isn’t available right now. Please type: "expense $84.12 nails from Home Depot".`)
+          twiml: twiml(
+            `⚠️ Voice transcription isn’t available right now. Please type: "expense $84.12 nails from Home Depot".`
+          )
         };
       }
-
-      const urlLen = (mediaUrl || '').length;
-      console.log('[MEDIA] starting transcription', { mediaType, normType, urlLen });
 
       let transcript = '';
       let confidence = null;
@@ -317,124 +327,111 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
             username: process.env.TWILIO_ACCOUNT_SID,
             password: process.env.TWILIO_AUTH_TOKEN
           },
-          maxContentLength: 8 * 1024 * 1024,
+          maxContentLength: 8 * 1024 * 1024
         });
 
         const audioBuf = Buffer.from(resp.data);
-        console.log('[MEDIA] audio bytes', audioBuf?.length || 0, 'mime', mediaType, 'norm', normType, 'baseType', baseType);
 
         const r1 = await transcribeAudio(audioBuf, normType, 'both');
         const n1 = normalizeTranscriptionResult(r1);
         transcript = n1.transcript;
         confidence = n1.confidence;
 
-        // OGG/Opus sometimes needs a different label for some engines
+        // Some engines need a different label for ogg/opus
         if (!transcript && normType === 'audio/ogg') {
           try {
-            console.log('[MEDIA] retry transcription with fallback mime: audio/webm');
             const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
             const n2 = normalizeTranscriptionResult(r2);
             transcript = n2.transcript;
             confidence = confidence ?? n2.confidence;
           } catch (e2) {
-            console.warn('[MEDIA] fallback transcribe failed:', e2.message);
+            console.warn('[MEDIA] fallback transcribe failed:', e2?.message);
           }
         }
-
-        console.log('[MEDIA] transcript text', transcript || '(none)');
       } catch (e) {
-        console.error('[MEDIA] transcribe fetch/exec failed:', e.message);
+        console.error('[MEDIA] transcribe fetch/exec failed:', e?.message);
       }
 
+      transcript = String(transcript || '').trim();
       if (!transcript) {
         return {
           transcript: null,
-          twiml: twiml(`⚠️ I couldn’t understand the audio. Try again, or text: "expense $500 materials from Home Depot today".`)
+          twiml: twiml(
+            `⚠️ I couldn’t understand the audio. Try again, or text: "expense $500 materials from Home Depot today".`
+          )
         };
       }
 
-      mediaMeta.transcript = truncateText(transcript.trim(), MAX_MEDIA_TRANSCRIPT_CHARS);
+      mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
 
-      // Always attach meta for audit trail
+      // Attach media meta for audit + later persistence by expense/revenue confirm
       await attachPendingMediaMeta(from, mediaMeta);
 
-      const timeclockIntent = inferIntentFromText(transcript);
-      const intent = financeIntentFromText(transcript);
-      const lc = String(transcript).toLowerCase();
-      const looksHours = /\bhours?\b/.test(lc) || /\btimesheet\b/.test(lc);
-
-      // ✅ Finance voice → return transcript (so expense.js/revenue.js sends template quick replies)
-      if (intent.kind === 'expense' || intent.kind === 'revenue') {
-        await markPendingFinance({ from, kind: intent.kind, stableMediaMsgId });
-        return { transcript: transcript.trim(), twiml: null };
+      // Finance voice -> return transcript to router + mark pending kind (so "yes" uses stable ids)
+      const fin = financeIntentFromText(transcript);
+      if (fin.kind === 'expense' || fin.kind === 'revenue') {
+        await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
+        return { transcript, twiml: null };
       }
 
-      // Timeclock/hours → keep parsing path
-      if (timeclockIntent || looksHours) {
-        extractedText = transcript.trim();
+      // Timeclock/hours -> run timeclock pipeline; otherwise pass-through transcript
+      const tc = inferTimeclockIntentFromText(transcript);
+      if (tc === 'hours_inquiry' || tc) {
+        extractedText = transcript;
       } else {
-        // General voice note: pass transcript to normal router
-        return { transcript: transcript.trim(), twiml: null };
+        return { transcript, twiml: null };
       }
     }
 
     // IMAGE
     if (isSupportedImage) {
-      const { text } = await extractTextFromImage(mediaUrl);
-      console.log('[MEDIA] OCR text length', (text || '').length);
+      let ocrText = '';
+      try {
+        const out = await extractTextFromImage(mediaUrl);
+        ocrText = String(out?.text || '').trim();
+      } catch (e) {
+        console.warn('[MEDIA] extractTextFromImage failed:', e?.message);
+      }
 
-      extractedText = (text || extractedText || '').trim();
+      extractedText = (ocrText || extractedText || '').trim();
 
       mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = null;
 
-      // Images are audit-relevant
+      // Attach for audit
       await attachPendingMediaMeta(from, mediaMeta);
 
-      // Try to detect if OCR likely represents a receipt/payment
-      const intent = financeIntentFromText(extractedText);
-
-      // ✅ Image finance → return transcript to router
-      if (intent.kind === 'expense' || intent.kind === 'revenue') {
-        await markPendingFinance({ from, kind: intent.kind, stableMediaMsgId });
-        return { transcript: extractedText, twiml: null };
-      }
-
-      // Extra: receipts often lack explicit "expense" words; give a hint using parser result too
-      // (We do NOT mark pending finance here unless parser says so.)
-      const parsed = await parseMediaText(extractedText);
-      if (parsed?.type === 'expense' || parsed?.type === 'revenue') {
-        // If your router supports direct "expense" / "revenue" commands only,
-        // you can still just return extractedText and let the router decide.
-        // We do NOT force kind here to avoid false positives.
+      // If clearly finance, just pass transcript to router
+      const fin = financeIntentFromText(extractedText);
+      if (fin.kind === 'expense' || fin.kind === 'revenue') {
+        await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
         return { transcript: extractedText, twiml: null };
       }
     }
 
     if (!extractedText) {
-      const msg = `Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`;
       const pending = await getPendingTransactionState(from);
       await mergePendingTransactionState(from, {
         ...(pending || {}),
         pendingMedia: { url: mediaUrl, type: null }
       });
-      return { transcript: null, twiml: twiml(msg) };
+
+      return {
+        transcript: null,
+        twiml: twiml(`Is this an expense receipt, revenue, or timesheet? Reply "expense", "revenue", or "timesheet".`)
+      };
     }
 
     /* ---------- Parse ---------- */
-    console.log('[MEDIA] parseMediaText()', { excerpt: (extractedText || '').slice(0, 80) });
-
-    // parseMediaText returns {type:'unknown'} instead of throwing (per your mediaParser.js)
     const result = await parseMediaText(extractedText);
 
-    /* ---------- Handle parse result ---------- */
-
+    // HOURS inquiry
     if (result?.type === 'hours_inquiry') {
-      const name = result.data.employeeName || userProfile?.name || '';
+      const name = result?.data?.employeeName || userProfile?.name || '';
       const tz = getUserTz(userProfile);
 
-      if (result.data.period) {
+      if (result?.data?.period && typeof generateTimesheet === 'function') {
         const { message } = await generateTimesheet({
           ownerId,
           person: name,
@@ -454,64 +451,58 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       return {
         transcript: null,
-        twiml: twiml(`Looks like you’re asking about ${name}’s hours. Do you want **today**, **this week**, or **this month**?`)
+        twiml: twiml(
+          `Looks like you’re asking about ${name}’s hours. Do you want **today**, **this week**, or **this month**?`
+        )
       };
     }
 
+    // TIME entry
     if (result?.type === 'time_entry') {
-      let { employeeName, type, timestamp } = result.data;
+      const data = result.data || {};
+      let { employeeName, type, timestamp } = data;
 
-      const inferred = inferIntentFromText(extractedText);
+      const inferred = inferTimeclockIntentFromText(extractedText);
       if (inferred === 'punch_in' && type === 'punch_out') type = 'punch_in';
       if (inferred === 'punch_out' && type === 'punch_in') type = 'punch_out';
       if (inferred === 'break_start' && type === 'break_end') type = 'break_start';
       if (inferred === 'break_end' && type === 'break_start') type = 'break_end';
 
       const tz = getUserTz(userProfile);
-      const timeSuffix = /T/.test(timestamp) ? ` at ${toAmPm(timestamp, tz)}` : '';
-
       const who = employeeName || userProfile?.name || 'Unknown';
 
+      const timeSuffix = timestamp && /T/.test(timestamp) ? ` at ${toAmPm(timestamp, tz)}` : '';
       let normalized;
-      if (type === 'punch_in') normalized = `${who} punched in${timeSuffix}`;
-      else if (type === 'punch_out') normalized = `${who} punched out${timeSuffix}`;
-      else if (type === 'break_start') normalized = `start break for ${who}${timeSuffix}`;
-      else if (type === 'break_end') normalized = `end break for ${who}${timeSuffix}`;
-      else if (type === 'drive_start') normalized = `start drive for ${who}${timeSuffix}`;
-      else if (type === 'drive_end') normalized = `end drive for ${who}${timeSuffix}`;
-      else normalized = `${who} punched in${timeSuffix}`;
+
+      if (type === 'punch_in') normalized = `${who} clock in${timeSuffix}`;
+      else if (type === 'punch_out') normalized = `${who} clock out${timeSuffix}`;
+      else if (type === 'break_start') normalized = `break start for ${who}${timeSuffix}`;
+      else if (type === 'break_end') normalized = `break stop for ${who}${timeSuffix}`;
+      else if (type === 'drive_start') normalized = `drive start for ${who}${timeSuffix}`;
+      else if (type === 'drive_end') normalized = `drive stop for ${who}${timeSuffix}`;
+      else normalized = `${who} clock in${timeSuffix}`;
 
       const tw = await runTimeclockPipeline(from, normalized, userProfile, ownerId);
       if (typeof tw === 'string' && tw.trim()) return { transcript: null, twiml: tw };
 
-      const humanTime = fmtLocal(timestamp, tz);
-      return { transcript: null, twiml: twiml(`✅ ${type.replace('_', ' ')} logged for ${who} at ${humanTime}.`) };
+      const when = timestamp ? fmtLocal(timestamp, tz) : 'now';
+      return { transcript: null, twiml: twiml(`✅ ${type.replace('_', ' ')} logged for ${who} at ${when}.`) };
     }
 
-    // If parser detected expense/revenue here (non-media keywords), do NOT handle inside media.js;
-    // return transcript and let router send confirm templates.
+    // Expense / Revenue detected by parser
     if (result?.type === 'expense' || result?.type === 'revenue') {
       const kind = result.type;
       await markPendingFinance({ from, kind, stableMediaMsgId });
       return { transcript: extractedText, twiml: null };
     }
 
-    // Unknown / other
-    const pending = await getPendingTransactionState(from);
-    await mergePendingTransactionState(from, {
-      ...(pending || {}),
-      pendingMedia: { url: mediaUrl, type: null }
-    });
-
-    return {
-      transcript: null,
-      twiml: twiml(`Is this an expense receipt, revenue, or timesheet? Reply 'expense', 'revenue', or 'timesheet'.`)
-    };
+    // Otherwise: pass transcript to router (agent can handle)
+    return { transcript: extractedText, twiml: null };
 
   } catch (error) {
-    console.error(`[MEDIA] handleMedia failed for ${from}:`, error.message);
-    return { transcript: null, twiml: twiml(`⚠️ Failed to process media: ${error.message}`) };
+    console.error(`[MEDIA] handleMedia failed for ${from}:`, error?.message);
+    return { transcript: null, twiml: twiml(`⚠️ Failed to process media. Please try again.`) };
   }
 }
 
-module.exports.handleMedia = handleMedia;
+module.exports = { handleMedia };

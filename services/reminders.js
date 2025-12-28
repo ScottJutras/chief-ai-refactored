@@ -4,10 +4,22 @@
 // Works for task reminders + lunch reminders.
 // Schema-aware + idempotent with (owner_id, source_msg_id) unique index.
 // ------------------------------------------------------------
-const { query } = require('./postgres');
+//
+// ✅ Alignment fix: DO NOT strip digits from ownerId (your system may use UUID/text owner_id now).
+// We keep ownerId as String().trim() everywhere.
 
-// ---- small utils ----
-const DIGITS = (x) => String(x ?? '').replace(/\D/g, '');
+const pg = require('./postgres');
+const query = pg.query || pg.pool?.query || pg.db?.query;
+
+function OWNER(x) {
+  const s = String(x ?? '').trim();
+  return s || null;
+}
+
+function USER(x) {
+  const s = String(x ?? '').trim();
+  return s || null;
+}
 
 function toIsoOrNull(dt) {
   if (!dt) return null;
@@ -16,7 +28,6 @@ function toIsoOrNull(dt) {
   return d.toISOString();
 }
 
-// ---- schema capability cache (serverless-safe) ----
 let _caps = null;
 
 async function hasColumn(table, col) {
@@ -61,20 +72,13 @@ async function detectReminderCaps() {
     caps.hasSent = await hasColumn(table, 'sent');
     caps.hasSentAt = await hasColumn(table, 'sent_at');
   } catch {
-    // fail-open: assume minimal columns exist
+    // fail-open
   }
 
   _caps = caps;
   return caps;
 }
 
-/**
- * Create a task reminder.
- * Idempotent if:
- *  - source_msg_id column exists
- *  - you provide sourceMsgId
- *  - you have unique index: (owner_id, source_msg_id) WHERE source_msg_id IS NOT NULL
- */
 async function createReminder({
   ownerId,
   userId,
@@ -86,8 +90,8 @@ async function createReminder({
 }) {
   const caps = await detectReminderCaps();
 
-  const owner = DIGITS(ownerId);
-  const user = String(userId || '').trim();
+  const owner = OWNER(ownerId);
+  const user = USER(userId);
   const atIso = toIsoOrNull(remindAt);
 
   if (!owner) throw new Error('Missing ownerId');
@@ -97,38 +101,14 @@ async function createReminder({
   const cols = ['owner_id', 'user_id', 'remind_at'];
   const vals = [owner, user, atIso];
 
-  // Keep status consistent with your schema usage
-  if (caps.hasStatus) {
-    cols.push('status');
-    vals.push('pending');
-  }
-
-  // Ensure sent is false on insert if column exists (it defaults false anyway)
-  if (caps.hasSent) {
-    cols.push('sent');
-    vals.push(false);
-  }
-
-  if (caps.hasKind) {
-    cols.push('kind');
-    vals.push(String(kind || 'task').trim() || 'task');
-  }
-
-  if (caps.hasTaskNo) {
-    cols.push('task_no');
-    vals.push(taskNo != null ? Number(taskNo) : null);
-  }
-
-  if (caps.hasTaskTitle) {
-    cols.push('task_title');
-    vals.push(taskTitle ? String(taskTitle).trim() : null);
-  }
+  if (caps.hasStatus) { cols.push('status'); vals.push('pending'); }
+  if (caps.hasSent) { cols.push('sent'); vals.push(false); }
+  if (caps.hasKind) { cols.push('kind'); vals.push(String(kind || 'task').trim() || 'task'); }
+  if (caps.hasTaskNo) { cols.push('task_no'); vals.push(taskNo != null ? Number(taskNo) : null); }
+  if (caps.hasTaskTitle) { cols.push('task_title'); vals.push(taskTitle ? String(taskTitle).trim() : null); }
 
   const sm = caps.hasSourceMsgId ? (String(sourceMsgId || '').trim() || null) : null;
-  if (caps.hasSourceMsgId) {
-    cols.push('source_msg_id');
-    vals.push(sm);
-  }
+  if (caps.hasSourceMsgId) { cols.push('source_msg_id'); vals.push(sm); }
 
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
   const smProvided = caps.hasSourceMsgId && !!sm;
@@ -148,17 +128,10 @@ async function createReminder({
     `;
 
   const res = await query(sql, vals);
-  if (res.rowCount) return { inserted: true, id: res.rows[0].id };
-
-  // Duplicate (idempotent) — return inserted:false
+  if (res?.rowCount) return { inserted: true, id: res.rows[0].id };
   return { inserted: false, id: null };
 }
 
-/**
- * Fetch due (task) reminders.
- * Uses: sent=false, canceled=false, status='pending', remind_at<=now
- * Excludes lunch reminders by kind (if kind exists).
- */
 async function getDueReminders({ now = new Date(), limit = 500 } = {}) {
   const caps = await detectReminderCaps();
   const nowIso = toIsoOrNull(now) || new Date().toISOString();
@@ -166,8 +139,6 @@ async function getDueReminders({ now = new Date(), limit = 500 } = {}) {
 
   const whereCanceled = caps.hasCanceled ? `and canceled = false` : ``;
   const whereStatus = caps.hasStatus ? `and status = 'pending'` : ``;
-
-  // If you have kind column, exclude lunch reminders from “task reminders” query
   const whereKind = caps.hasKind ? `and (kind is null or kind <> 'lunch_reminder')` : ``;
 
   const { rows } = await query(
@@ -195,9 +166,6 @@ async function getDueReminders({ now = new Date(), limit = 500 } = {}) {
   return rows || [];
 }
 
-/**
- * Mark sent — aligns with your schema.
- */
 async function markReminderSent(id) {
   const caps = await detectReminderCaps();
 
@@ -217,10 +185,6 @@ async function markReminderSent(id) {
   return true;
 }
 
-/**
- * Cancel reminder (preferred) — if canceled column exists.
- * Otherwise falls back to mark sent (so it won't fire again).
- */
 async function cancelReminder(id) {
   const caps = await detectReminderCaps();
 
@@ -246,14 +210,11 @@ async function cancelReminder(id) {
   return { ok: true, mode: 'canceled' };
 }
 
-/**
- * Lunch reminders (explicit).
- */
 async function createLunchReminder({ ownerId, userId, shiftId, remindAt, sourceMsgId = null }) {
   const caps = await detectReminderCaps();
 
-  const owner = DIGITS(ownerId);
-  const user = String(userId || '').trim();
+  const owner = OWNER(ownerId);
+  const user = USER(userId);
   const atIso = toIsoOrNull(remindAt);
 
   if (!owner) throw new Error('Missing ownerId');
@@ -263,28 +224,13 @@ async function createLunchReminder({ ownerId, userId, shiftId, remindAt, sourceM
   const cols = ['owner_id', 'user_id', 'remind_at'];
   const vals = [owner, user, atIso];
 
-  if (caps.hasStatus) {
-    cols.push('status');
-    vals.push('pending');
-  }
-  if (caps.hasSent) {
-    cols.push('sent');
-    vals.push(false);
-  }
-  if (caps.hasKind) {
-    cols.push('kind');
-    vals.push('lunch_reminder');
-  }
-  if (caps.hasShiftId) {
-    cols.push('shift_id');
-    vals.push(shiftId != null ? String(shiftId) : null);
-  }
+  if (caps.hasStatus) { cols.push('status'); vals.push('pending'); }
+  if (caps.hasSent) { cols.push('sent'); vals.push(false); }
+  if (caps.hasKind) { cols.push('kind'); vals.push('lunch_reminder'); }
+  if (caps.hasShiftId) { cols.push('shift_id'); vals.push(shiftId != null ? String(shiftId) : null); }
 
   const sm = caps.hasSourceMsgId ? (String(sourceMsgId || '').trim() || null) : null;
-  if (caps.hasSourceMsgId) {
-    cols.push('source_msg_id');
-    vals.push(sm);
-  }
+  if (caps.hasSourceMsgId) { cols.push('source_msg_id'); vals.push(sm); }
 
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
   const smProvided = caps.hasSourceMsgId && !!sm;
@@ -304,7 +250,7 @@ async function createLunchReminder({ ownerId, userId, shiftId, remindAt, sourceM
     `;
 
   const res = await query(sql, vals);
-  if (res.rowCount) return { inserted: true, id: res.rows[0].id };
+  if (res?.rowCount) return { inserted: true, id: res.rows[0].id };
   return { inserted: false, id: null };
 }
 
@@ -315,8 +261,6 @@ async function getDueLunchReminders({ now = new Date(), limit = 500 } = {}) {
 
   const whereCanceled = caps.hasCanceled ? `and canceled = false` : ``;
   const whereStatus = caps.hasStatus ? `and status = 'pending'` : ``;
-
-  // Only lunch reminders if kind exists; otherwise you can't reliably distinguish.
   const whereKind = caps.hasKind ? `and kind = 'lunch_reminder'` : ``;
 
   const { rows } = await query(

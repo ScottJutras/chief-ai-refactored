@@ -3,14 +3,15 @@ const pg = require('../services/postgres');
 const { getUserProfile, createUserProfile, getOwnerProfile } = pg;
 
 /**
- * Normalizes inbound "From" / owner identifiers to the ID shape your DB expects.
- * Your current system uses digits-only identity (no whatsapp:, no +).
+ * Digits-only identity (no whatsapp:, no +).
  */
 function normalizeId(raw) {
-  return String(raw || '')
-    .replace(/^whatsapp:/i, '')
-    .replace(/\D/g, '')
-    .trim() || null;
+  return (
+    String(raw || '')
+      .replace(/^whatsapp:/i, '')
+      .replace(/\D/g, '')
+      .trim() || null
+  );
 }
 
 function shapeProfile(p, from) {
@@ -22,13 +23,14 @@ function shapeProfile(p, from) {
     user_id,
     owner_id,
     ownerId: owner_id,
+    from, // ✅ convenient for downstream middleware
     phone: p?.phone || user_id,
     name: p?.name || p?.display_name || null,
     subscription_tier: plan,
     plan,
     onboarding_in_progress: Boolean(p?.onboarding_in_progress || p?.onboardingPending || false),
 
-    // active job (will be hydrated best-effort below)
+    // active job (hydrated best-effort below)
     active_job_id: p?.active_job_id ?? p?.activeJobId ?? null,
     active_job_name: p?.active_job_name ?? p?.activeJobName ?? null,
 
@@ -37,27 +39,34 @@ function shapeProfile(p, from) {
 }
 
 function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(str || '')
+  );
 }
 
 /**
  * Best-effort: get active job fields for this identity.
- * Prefers pg.getActiveJobForIdentity if you implement it later.
- * Otherwise tries memberships/users/user_profiles.
+ * Prefers pg.getActiveJobForIdentity() if present.
  *
  * Returns: { active_job_id, active_job_name } | null
  */
 async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
-  const ownerParam = String(ownerId || '').trim();
-  const userId = String(userProfile?.user_id || userProfile?.id || from || '').trim();
+  const ownerParam = normalizeId(ownerId);
+  const userId = normalizeId(userProfile?.user_id || userProfile?.id || from);
 
   if (!ownerParam || !userId) return null;
 
-  // Preferred: a real helper (clean canonical source)
+  // Preferred canonical helper
   if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
-      const out = await pg.getActiveJobForIdentity(ownerParam, String(from));
-      if (out && (out.active_job_id != null || out.active_job_name != null || out.activeJobId != null || out.activeJobName != null)) {
+      const out = await pg.getActiveJobForIdentity(ownerParam, userId);
+      if (
+        out &&
+        (out.active_job_id != null ||
+          out.active_job_name != null ||
+          out.activeJobId != null ||
+          out.activeJobName != null)
+      ) {
         return {
           active_job_id: out.active_job_id ?? out.activeJobId ?? null,
           active_job_name: out.active_job_name ?? out.activeJobName ?? null
@@ -68,7 +77,7 @@ async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
     }
   }
 
-  // Best-effort SQL attempts (fail-open on missing tables/columns)
+  // Fallback SQL attempts (fail-open on missing tables/columns)
   const attempts = [
     {
       label: 'memberships (owner_id + user_id)',
@@ -79,10 +88,11 @@ async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
       params: [ownerParam, userId]
     },
     {
-      label: 'users (owner_id + id)',
+      // ✅ FIX: users table is keyed by user_id in your project
+      label: 'users (owner_id + user_id)',
       sql: `SELECT active_job_id, active_job_name
               FROM public.users
-             WHERE owner_id = $1 AND id = $2
+             WHERE owner_id = $1 AND user_id = $2
              LIMIT 1`,
       params: [ownerParam, userId]
     },
@@ -106,11 +116,6 @@ async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
       const active_job_name = row.active_job_name != null ? String(row.active_job_name).trim() : null;
 
       if (active_job_id != null || (active_job_name && active_job_name.length > 0)) {
-        console.info('[userProfile] active job fetched', {
-          where: a.label,
-          hasId: active_job_id != null,
-          hasName: !!active_job_name
-        });
         return { active_job_id, active_job_name };
       }
     } catch {
@@ -127,7 +132,7 @@ async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
  */
 async function resolveJobNameFromJobsTable({ ownerId, active_job_id }) {
   if (active_job_id == null) return null;
-  const ownerParam = String(ownerId || '').trim();
+  const ownerParam = normalizeId(ownerId);
   const s = String(active_job_id).trim();
   if (!ownerParam || !s) return null;
 
@@ -143,9 +148,7 @@ async function resolveJobNameFromJobsTable({ ownerId, active_job_id }) {
       );
       const name = r?.rows?.[0]?.job_name;
       return name ? String(name).trim() : null;
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   // numeric job_no
@@ -160,9 +163,7 @@ async function resolveJobNameFromJobsTable({ ownerId, active_job_id }) {
       );
       const name = r?.rows?.[0]?.job_name;
       return name ? String(name).trim() : null;
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   return null;
@@ -173,7 +174,7 @@ async function userProfileMiddleware(req, _res, next) {
     const from = normalizeId(req.body?.From || req.from);
     req.from = from;
 
-    // Normalize ownerId too (if upstream sets it from phone / whatsapp:)
+    // Normalize ownerId too
     const ownerFromReq = normalizeId(req.ownerId);
     req.ownerId = ownerFromReq || from || 'GLOBAL';
 
@@ -190,9 +191,9 @@ async function userProfileMiddleware(req, _res, next) {
       profile = await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
       console.log('[userProfile] created new user', from);
     }
-    profile = shapeProfile(profile, from); // ensure consistent shape
+    profile = shapeProfile(profile, from);
 
-    // Also fetch the owner profile (your handlers receive this)
+    // Owner profile (handlers receive this)
     let ownerProfile = null;
     try {
       ownerProfile = await getOwnerProfile(req.ownerId);
@@ -201,7 +202,7 @@ async function userProfileMiddleware(req, _res, next) {
     }
     if (ownerProfile) ownerProfile = shapeProfile(ownerProfile, req.ownerId);
 
-    // ✅ Hydrate active job into userProfile (canonical for downstream handlers)
+    // ✅ Hydrate active job (best-effort, fail-open)
     try {
       const hasActiveAlready =
         (profile.active_job_name && String(profile.active_job_name).trim()) || profile.active_job_id != null;
@@ -214,7 +215,6 @@ async function userProfileMiddleware(req, _res, next) {
         }
       }
 
-      // If we got an id but no name, resolve name from jobs table
       if ((!profile.active_job_name || !String(profile.active_job_name).trim()) && profile.active_job_id != null) {
         const resolvedName = await resolveJobNameFromJobsTable({
           ownerId: req.ownerId,
@@ -229,13 +229,8 @@ async function userProfileMiddleware(req, _res, next) {
     req.userProfile = profile;
     req.ownerProfile = ownerProfile;
 
-    // You currently treat owner as: user_id === ownerId
+    // Owner = user_id === ownerId
     req.isOwner = String(profile.user_id) === String(req.ownerId);
-
-    if (profile.onboarding_in_progress) {
-      console.log('[userProfile] onboarding pending for', from);
-      // (Optional) short-circuit to onboarding flow here
-    }
 
     return next();
   } catch (e) {

@@ -10,6 +10,11 @@ function looksLikeInt(x) {
   return /^\d+$/.test(String(x || '').trim());
 }
 
+function OWNER(x) {
+  const s = String(x ?? '').trim();
+  return s || null;
+}
+
 /**
  * Resolve job_ref (id/name) to a job row.
  *
@@ -20,22 +25,26 @@ function looksLikeInt(x) {
  *
  * If allowCreate is true and no job exists, creates one (draft/open).
  */
-async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultName, sourceMsgId = null } = {}) {
-  const owner = pg.DIGITS(owner_id);
+async function resolveJobRef(
+  owner_id,
+  job_ref,
+  { allowCreate = false, defaultName, sourceMsgId = null } = {}
+) {
+  const owner = OWNER(owner_id);
   if (!owner) throw new Error('Missing owner_id');
 
   // If nothing provided, optionally create
   if (!job_ref) {
     if (!allowCreate) return null;
-    const name = defaultName || 'Untitled Job';
+    const name = String(defaultName || 'Untitled Job').trim() || 'Untitled Job';
     const created = await pg.createJobIdempotent({
       ownerId: owner,
       jobName: name,
       sourceMsgId,
       status: 'draft',
-      active: true
+      active: true,
     });
-    return created.job;
+    return created?.job || null;
   }
 
   // 1) Resolve by integer jobs.id
@@ -49,7 +58,7 @@ async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultNa
         LIMIT 1`,
       [owner, Number(job_ref.id)]
     );
-    if (rows[0]) return rows[0];
+    if (rows?.[0]) return rows[0];
   }
 
   // 2) Resolve by job_no
@@ -63,14 +72,13 @@ async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultNa
         LIMIT 1`,
       [owner, Number(job_ref.job_no)]
     );
-    if (rows[0]) return rows[0];
+    if (rows?.[0]) return rows[0];
   }
 
   // 3) Resolve by name (prefer exact-ish, otherwise ILIKE)
   if (job_ref.name) {
     const needle = String(job_ref.name).trim();
     if (needle) {
-      // Try exact match first
       const exact = await pg.query(
         `SELECT id, owner_id, job_no,
                 COALESCE(job_name, name) AS job_name,
@@ -82,9 +90,8 @@ async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultNa
           LIMIT 1`,
         [owner, needle]
       );
-      if (exact.rowCount) return exact.rows[0];
+      if (exact?.rowCount) return exact.rows[0];
 
-      // Then fuzzy
       const like = await pg.query(
         `SELECT id, owner_id, job_no,
                 COALESCE(job_name, name) AS job_name,
@@ -96,7 +103,7 @@ async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultNa
           LIMIT 1`,
         [owner, `%${needle}%`]
       );
-      if (like.rowCount) return like.rows[0];
+      if (like?.rowCount) return like.rows[0];
 
       if (allowCreate) {
         const created = await pg.createJobIdempotent({
@@ -104,9 +111,9 @@ async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultNa
           jobName: needle,
           sourceMsgId,
           status: 'draft',
-          active: true
+          active: true,
         });
-        return created.job;
+        return created?.job || null;
       }
     }
   }
@@ -117,18 +124,19 @@ async function resolveJobRef(owner_id, job_ref, { allowCreate = false, defaultNa
 }
 
 async function createDraftJob(owner_id, name, { sourceMsgId = null } = {}) {
-  const owner = pg.DIGITS(owner_id);
-  const jobName = String(name || '').trim() || 'Untitled Job';
+  const owner = OWNER(owner_id);
+  if (!owner) throw new Error('Missing owner_id');
 
+  const jobName = String(name || '').trim() || 'Untitled Job';
   const created = await pg.createJobIdempotent({
     ownerId: owner,
     jobName,
     sourceMsgId,
     status: 'draft',
-    active: true
+    active: true,
   });
 
-  return created.job;
+  return created?.job || null;
 }
 
 module.exports = { resolveJobRef, createDraftJob };

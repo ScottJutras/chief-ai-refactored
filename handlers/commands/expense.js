@@ -1,10 +1,13 @@
 // handlers/commands/expense.js
 // COMPLETE DROP-IN (aligned to latest postgres.js + idempotent writes + active-job fix)
-// - Uses pg.todayInTZ if available
-// - Uses pg.MEDIA_TRANSCRIPT_MAX_CHARS + pg.normalizeMediaMeta if available
+//
+// Key alignments:
+// - Uses pg.getActiveJobForIdentity() when present (canonical per-identity active job)
+// - Uses pg.insertTransaction() which now schema-maps media + can populate transactions.job_id
 // - Keeps Interactive List + numeric map
-// - Uses pg.getActiveJobForIdentity canonical path when present
-// - Removes unused vars & makes behavior consistent
+// - Adds robust pending-state deletion fallbacks (state manager naming drift)
+// - Adds best-effort lock acquire + always releases
+// - Fail-open everywhere (never hard-fail on schema mismatch)
 
 const pg = require('../../services/postgres');
 const { query, insertTransaction, listOpenJobs } = pg;
@@ -21,8 +24,19 @@ const normalizeVendorName =
   });
 
 const state = require('../../utils/stateManager');
-const getPendingTransactionState = state.getPendingTransactionState;
-const deletePendingTransactionState = state.deletePendingTransactionState;
+
+const getPendingTransactionState =
+  state.getPendingTransactionState ||
+  state.getPendingState ||
+  (async () => null);
+
+// ✅ robust delete (stateManager naming drift)
+const deletePendingTransactionState =
+  state.deletePendingTransactionState ||
+  state.deletePendingState ||
+  state.clearPendingTransactionState ||
+  state.clearPendingState ||
+  (async (_key) => {});
 
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
@@ -39,7 +53,7 @@ const todayInTimeZone =
 
 const parseNaturalDateTz =
   (typeof ai.parseNaturalDate === 'function' && ai.parseNaturalDate) ||
-  ((s, tz) => {
+  ((s, _tz) => {
     const t = String(s || '').trim().toLowerCase();
     const today = new Date().toISOString().split('T')[0];
     if (!t || t === 'today') return today;
@@ -499,7 +513,7 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName }) {
   return parts.join(' ') + '.';
 }
 
-/* ---------------- Active job resolution (now aligned to postgres.js) ---------------- */
+/* ---------------- Active job resolution (aligned to postgres.js) ---------------- */
 
 function extractUserId(userProfile, fromPhone) {
   return (
@@ -566,7 +580,7 @@ async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, from
       label: 'users by id',
       sql: `SELECT active_job_id, active_job_name
               FROM public.users
-             WHERE owner_id = $1 AND id = $2
+             WHERE owner_id = $1 AND user_id = $2
              LIMIT 1`,
       params: [ownerParam, String(userId)]
     },
@@ -982,7 +996,7 @@ function normalizeMediaMetaForTx(pendingMediaMeta) {
     } catch {}
   }
 
-  // fallback shape expected by insertTransaction wrapper
+  // fallback shape
   return {
     url: pendingMediaMeta.url || null,
     type: pendingMediaMeta.type || null,
@@ -998,6 +1012,14 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
   const lockKey = `lock:${from}`;
   const safeMsgId = String(sourceMsgId || `${from}:${Date.now()}`).trim();
+
+  // best-effort lock acquire
+  try {
+    const lock = require('../../middleware/lock');
+    if (lock?.acquireLock) {
+      await lock.acquireLock(lockKey, 8000).catch(() => null);
+    }
+  } catch {}
 
   let reply;
 
@@ -1094,6 +1116,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
 
         const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
+        // ✅ Resolve job by: pending -> canonical active-job -> null
         const jobName =
           (data.jobName && String(data.jobName).trim()) ||
           (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) ||
@@ -1129,25 +1152,28 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         const amountCents = toCents(data.amount);
         if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
 
+        // ✅ idempotent write by source_msg_id (when schema supports it)
         const writeResult = await withTimeout(
-          insertTransaction({
-            ownerId,
-            kind: 'expense',
-            date: data.date || todayInTimeZone(tz),
-            description: String(data.item || '').trim() || 'Unknown',
-            amount_cents: amountCents,
-            amount: toNumberAmount(data.amount),
-            source: String(data.store || '').trim() || 'Unknown',
-            job: jobName,
-            job_name: jobName,
-            category: category ? String(category).trim() : null,
-            user_name: userProfile?.name || 'Unknown User',
-            source_msg_id: stableMsgId,
-            // pg.insertTransaction expects mediaMeta and will schema-map it;
-            // we pass the normalized object (or null).
-            mediaMeta: mediaMeta
-          }),
-          5000,
+          insertTransaction(
+            {
+              ownerId,
+              kind: 'expense',
+              date: data.date || todayInTimeZone(tz),
+              description: String(data.item || '').trim() || 'Unknown',
+              amount_cents: amountCents,
+              amount: toNumberAmount(data.amount),
+              source: String(data.store || '').trim() || 'Unknown',
+              // IMPORTANT: pass jobName both ways; postgres.js will resolve and populate job_id if possible
+              job: jobName,
+              job_name: jobName,
+              category: category ? String(category).trim() : null,
+              user_name: userProfile?.name || 'Unknown User',
+              source_msg_id: stableMsgId,
+              mediaMeta: mediaMeta
+            },
+            { timeoutMs: 4500 }
+          ),
+          5200,
           '__DB_TIMEOUT__'
         );
 
@@ -1308,7 +1334,8 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     return twimlText(reply);
   } finally {
     try {
-      await require('../../middleware/lock').releaseLock(lockKey);
+      const lock = require('../../middleware/lock');
+      if (lock?.releaseLock) await lock.releaseLock(lockKey);
     } catch {}
   }
 }

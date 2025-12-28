@@ -1,4 +1,4 @@
-// services/postgres.js (DROP-IN)
+// services/postgres.js (DROP-IN) — aligned w/ handlers/commands/timeclock.js
 // ------------------------------------------------------------
 const { Pool } = require('pg');
 const crypto = require('crypto');
@@ -16,13 +16,14 @@ const DB_URL =
 const NODE_ENV = env.NODE_ENV || 'development';
 const isProd = NODE_ENV === 'production';
 
+// Hosted DBs usually need SSL. Local 127.0.0.1 usually does not.
 const PGSSLMODE = (env.PGSSLMODE || '').toLowerCase();
 const shouldSSL =
-  PGSSLMODE === 'require' ||
-  /supabase\.co|render\.com|herokuapp\.com|aws|gcp|azure/i.test(DB_URL);
+  PGSSLMODE === 'require' || /supabase\.co|render\.com|herokuapp\.com|aws|gcp|azure/i.test(DB_URL);
 
 const ssl = shouldSSL ? { rejectUnauthorized: false } : false;
 
+// Build pool config
 let poolConfig;
 if (DB_URL) {
   poolConfig = { connectionString: DB_URL, ssl };
@@ -36,9 +37,7 @@ if (DB_URL) {
 }
 
 if (!DB_URL && (!poolConfig.host || !poolConfig.database)) {
-  throw new Error(
-    "Postgres not configured. Set DATABASE_URL in config/.env or PGHOST/PGDATABASE/etc."
-  );
+  throw new Error("Postgres not configured. Set DATABASE_URL in config/.env or PGHOST/PGDATABASE/etc.");
 }
 
 /* ---------- Pool (sane limits + timeouts) ---------- */
@@ -75,10 +74,7 @@ async function queryWithRetry(text, params, attempt = 1) {
     return await pool.query(text, params);
   } catch (e) {
     const msg = String(e?.message || '');
-    const transient =
-      /terminated|ECONNRESET|EPIPE|read ECONNRESET|connection terminated|TimeoutError/i.test(
-        msg
-      );
+    const transient = /terminated|ECONNRESET|EPIPE|read ECONNRESET|connection terminated|TimeoutError/i.test(msg);
     if (transient && attempt < 3) {
       console.warn(`[PG] retry ${attempt + 1}: ${msg}`);
       await new Promise((r) => setTimeout(r, attempt * 200));
@@ -119,8 +115,7 @@ const DIGITS = (x) => String(x ?? '').replace(/\D/g, '');
 
 function toCents(v) {
   if (v == null || v === '') return 0;
-  const n =
-    typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.-]/g, ''));
+  const n = typeof v === 'number' ? v : Number(String(v).replace(/[^0-9.-]/g, ''));
   if (!Number.isFinite(n)) return 0;
   return Math.round(n * 100);
 }
@@ -135,14 +130,13 @@ function todayInTZ(tz = 'America/Toronto') {
 const normalizePhoneNumber = (x) => DIGITS(x);
 
 function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(str || '')
-  );
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
 }
 
 /* ---------- schema helpers (cached) ---------- */
 const _TABLE_CACHE = new Map();
 const _COL_CACHE = new Map();
+const _COL_TYPE_CACHE = new Map();
 
 async function hasColumn(table, col) {
   const key = `${String(table)}.${String(col)}`;
@@ -179,6 +173,29 @@ async function hasTable(table) {
   return ok;
 }
 
+async function getColumnDataType(table, col) {
+  const key = `${String(table)}.${String(col)}.type`;
+  if (_COL_TYPE_CACHE.has(key)) return _COL_TYPE_CACHE.get(key);
+
+  try {
+    const r = await query(
+      `select data_type
+         from information_schema.columns
+        where table_schema='public'
+          and table_name=$1
+          and column_name=$2
+        limit 1`,
+      [String(table), String(col)]
+    );
+    const t = String(r?.rows?.[0]?.data_type || '').toLowerCase() || null;
+    _COL_TYPE_CACHE.set(key, t);
+    return t;
+  } catch {
+    _COL_TYPE_CACHE.set(key, null);
+    return null;
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* ✅ user_active_job job_id type detection (FIXES integer = uuid)      */
 /* ------------------------------------------------------------------ */
@@ -198,8 +215,7 @@ async function detectUserActiveJobJobIdType() {
       limit 1
       `
     );
-    _USER_ACTIVE_JOB_JOB_ID_TYPE =
-      String(r?.rows?.[0]?.data_type || '').toLowerCase() || 'unknown';
+    _USER_ACTIVE_JOB_JOB_ID_TYPE = String(r?.rows?.[0]?.data_type || '').toLowerCase() || 'unknown';
   } catch {
     _USER_ACTIVE_JOB_JOB_ID_TYPE = 'unknown';
   }
@@ -209,7 +225,6 @@ async function detectUserActiveJobJobIdType() {
 
 async function userActiveJobJoinMode() {
   const t = await detectUserActiveJobJobIdType();
-  // common: integer, bigint, uuid, text
   if (t.includes('uuid')) return 'uuid';
   if (t.includes('int') || t.includes('bigint') || t.includes('smallint')) return 'job_no';
   // fail-safe: if not uuid, prefer job_no (prevents uuid cast errors)
@@ -234,6 +249,8 @@ let TX_HAS_MEDIA_URL = null;
 let TX_HAS_MEDIA_TYPE = null;
 let TX_HAS_MEDIA_TXT = null;
 let TX_HAS_MEDIA_CONF = null;
+let TX_HAS_JOB_ID = null; // ✅ IMPORTANT: job_id column support
+let TX_HAS_JOB_NO = null; // optional
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
 async function detectTransactionsCapabilities() {
@@ -243,7 +260,9 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_URL !== null &&
     TX_HAS_MEDIA_TYPE !== null &&
     TX_HAS_MEDIA_TXT !== null &&
-    TX_HAS_MEDIA_CONF !== null
+    TX_HAS_MEDIA_CONF !== null &&
+    TX_HAS_JOB_ID !== null &&
+    TX_HAS_JOB_NO !== null
   ) {
     return {
       TX_HAS_SOURCE_MSG_ID,
@@ -251,7 +270,9 @@ async function detectTransactionsCapabilities() {
       TX_HAS_MEDIA_URL,
       TX_HAS_MEDIA_TYPE,
       TX_HAS_MEDIA_TXT,
-      TX_HAS_MEDIA_CONF
+      TX_HAS_MEDIA_CONF,
+      TX_HAS_JOB_ID,
+      TX_HAS_JOB_NO
     };
   }
 
@@ -262,9 +283,7 @@ async function detectTransactionsCapabilities() {
         where table_schema='public'
           and table_name='transactions'`
     );
-    const names = new Set(
-      (rows || []).map((r) => String(r.column_name).toLowerCase())
-    );
+    const names = new Set((rows || []).map((r) => String(r.column_name).toLowerCase()));
 
     TX_HAS_SOURCE_MSG_ID = names.has('source_msg_id');
     TX_HAS_AMOUNT = names.has('amount');
@@ -272,6 +291,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_TYPE = names.has('media_type');
     TX_HAS_MEDIA_TXT = names.has('media_transcript');
     TX_HAS_MEDIA_CONF = names.has('media_confidence');
+    TX_HAS_JOB_ID = names.has('job_id'); // ✅
+    TX_HAS_JOB_NO = names.has('job_no'); // optional
   } catch (e) {
     console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
     TX_HAS_SOURCE_MSG_ID = false;
@@ -280,6 +301,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_TYPE = false;
     TX_HAS_MEDIA_TXT = false;
     TX_HAS_MEDIA_CONF = false;
+    TX_HAS_JOB_ID = false;
+    TX_HAS_JOB_NO = false;
   }
 
   return {
@@ -288,7 +311,9 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_URL,
     TX_HAS_MEDIA_TYPE,
     TX_HAS_MEDIA_TXT,
-    TX_HAS_MEDIA_CONF
+    TX_HAS_MEDIA_CONF,
+    TX_HAS_JOB_ID,
+    TX_HAS_JOB_NO
   };
 }
 
@@ -310,14 +335,9 @@ async function detectTransactionsUniqueOwnerSourceMsg() {
     );
 
     const defs = (rows || []).map((r) => String(r.def || '').toLowerCase());
-    TX_HAS_OWNER_SOURCEMSG_UNIQUE = defs.some(
-      (d) => d.includes('(owner_id') && d.includes('source_msg_id')
-    );
+    TX_HAS_OWNER_SOURCEMSG_UNIQUE = defs.some((d) => d.includes('(owner_id') && d.includes('source_msg_id'));
   } catch (e) {
-    console.warn(
-      '[PG/transactions] detect unique(owner_id,source_msg_id) failed (fail-open):',
-      e?.message
-    );
+    console.warn('[PG/transactions] detect unique(owner_id,source_msg_id) failed (fail-open):', e?.message);
     TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
   }
 
@@ -331,9 +351,7 @@ function normalizeMediaMeta(mediaMeta) {
   const type = String(mediaMeta.type || mediaMeta.media_type || '').trim() || null;
 
   const transcriptRaw = mediaMeta.transcript || mediaMeta.media_transcript || null;
-  const transcript = transcriptRaw
-    ? truncateText(transcriptRaw, MEDIA_TRANSCRIPT_MAX_CHARS)
-    : null;
+  const transcript = transcriptRaw ? truncateText(transcriptRaw, MEDIA_TRANSCRIPT_MAX_CHARS) : null;
 
   const conf = mediaMeta.confidence ?? mediaMeta.media_confidence ?? null;
   const confidence = Number.isFinite(Number(conf)) ? Number(conf) : null;
@@ -348,9 +366,66 @@ function normalizeMediaMeta(mediaMeta) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* ✅ Job resolution helpers used by insertTransaction                  */
+/* ------------------------------------------------------------------ */
+async function resolveJobRow(ownerId, jobRefOrName) {
+  const owner = DIGITS(ownerId);
+  const ref = jobRefOrName == null ? '' : String(jobRefOrName).trim();
+  if (!owner || !ref) return null;
+
+  // If caller passed uuid job_id
+  if (looksLikeUuid(ref)) {
+    try {
+      const r = await query(
+        `select id, job_no, coalesce(name, job_name) as job_name
+           from public.jobs
+          where owner_id=$1 and id=$2::uuid
+          limit 1`,
+        [owner, ref]
+      );
+      return r?.rows?.[0] || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // If caller passed numeric job_no
+  if (/^\d+$/.test(ref)) {
+    try {
+      const r = await query(
+        `select id, job_no, coalesce(name, job_name) as job_name
+           from public.jobs
+          where owner_id=$1 and job_no=$2
+          limit 1`,
+        [owner, Number(ref)]
+      );
+      return r?.rows?.[0] || null;
+    } catch {
+      return null;
+    }
+  }
+
+  // Else treat as name
+  try {
+    const r = await query(
+      `select id, job_no, coalesce(name, job_name) as job_name
+         from public.jobs
+        where owner_id=$1 and lower(coalesce(name, job_name)) = lower($2)
+        order by updated_at desc nulls last, created_at desc
+        limit 1`,
+      [owner, ref]
+    );
+    return r?.rows?.[0] || null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * ✅ insertTransaction()
  * Schema-aware insert into public.transactions with optional media fields.
+ * ✅ FIX: If transactions.job_id exists, we populate it (prevents "logged but not attached to job" issues).
  */
 async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const owner = DIGITS(opts.ownerId || opts.owner_id);
@@ -362,10 +437,18 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const amountMaybe = opts.amount;
 
   const source = String(opts.source || '').trim() || 'Unknown';
-  const job = opts.job == null ? null : String(opts.job).trim() || null;
-  const jobName = opts.job_name ?? opts.jobName ?? job;
-  const category =
-    opts.category == null ? null : String(opts.category).trim() || null;
+
+  // job signals from callers
+  const jobRef = opts.job == null ? null : String(opts.job).trim() || null;
+  const jobNameInput =
+    (opts.job_name ?? opts.jobName ?? opts.job_title ?? null) != null
+      ? String(opts.job_name ?? opts.jobName ?? opts.job_title).trim()
+      : null;
+
+  const explicitJobId = opts.job_id ?? opts.jobId ?? null;
+  const explicitJobNo = opts.job_no ?? opts.jobNo ?? null;
+
+  const category = opts.category == null ? null : String(opts.category).trim() || null;
   const userName = opts.user_name ?? opts.userName ?? null;
   const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
 
@@ -376,6 +459,65 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
   const caps = await detectTransactionsCapabilities();
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
+
+  // ✅ Resolve job_id/job_no/job_name best-effort, but never hard fail
+  let resolvedJobId = null;
+  let resolvedJobNo = null;
+  let resolvedJobName = jobNameInput || (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
+
+  try {
+    // Prefer explicit job_id if passed
+    if (explicitJobId && looksLikeUuid(String(explicitJobId))) {
+      resolvedJobId = String(explicitJobId);
+      const row = await resolveJobRow(owner, resolvedJobId);
+      if (row) {
+        resolvedJobNo = row.job_no ?? null;
+        resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+      }
+    } else if (explicitJobNo != null && String(explicitJobNo).trim() !== '') {
+      const n = Number(explicitJobNo);
+      if (Number.isFinite(n)) {
+        resolvedJobNo = n;
+        const row = await resolveJobRow(owner, String(n));
+        if (row) {
+          resolvedJobId = row.id ? String(row.id) : null;
+          resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+        }
+      }
+    } else if (jobRef) {
+      // jobRef might be uuid, job_no, or name
+      const row = await resolveJobRow(owner, jobRef);
+      if (row) {
+        resolvedJobId = row.id ? String(row.id) : null;
+        resolvedJobNo = row.job_no ?? null;
+        resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+      }
+    } else if (resolvedJobName) {
+      const row = await resolveJobRow(owner, resolvedJobName);
+      if (row) {
+        resolvedJobId = row.id ? String(row.id) : null;
+        resolvedJobNo = row.job_no ?? null;
+        resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // Keep job "string" field for back-compat with older schemas/handlers.
+  // If we have a uuid job_id, set job = uuid; else set job = job_name (or job_no as string).
+  const job =
+    jobRef != null
+      ? jobRef
+      : resolvedJobId
+      ? String(resolvedJobId)
+      : resolvedJobName
+      ? String(resolvedJobName)
+      : resolvedJobNo != null
+      ? String(resolvedJobNo)
+      : null;
+
+  const jobName = resolvedJobName ? String(resolvedJobName).trim() : null;
 
   // best-effort idempotency pre-check
   if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
@@ -399,7 +541,9 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     ...(caps.TX_HAS_AMOUNT ? ['amount'] : []),
     'amount_cents',
     'source',
-    'job',
+    ...(caps.TX_HAS_JOB_ID ? ['job_id'] : []), // ✅
+    ...(caps.TX_HAS_JOB_NO ? ['job_no'] : []), // optional
+    'job', // back-compat string
     'job_name',
     'category',
     'user_name',
@@ -416,13 +560,13 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     kind,
     date,
     description,
-    ...(caps.TX_HAS_AMOUNT
-      ? [Number.isFinite(Number(amountMaybe)) ? Number(amountMaybe) : null]
-      : []),
+    ...(caps.TX_HAS_AMOUNT ? [Number.isFinite(Number(amountMaybe)) ? Number(amountMaybe) : null] : []),
     amountCents,
     source,
+    ...(caps.TX_HAS_JOB_ID ? [resolvedJobId ? String(resolvedJobId) : null] : []),
+    ...(caps.TX_HAS_JOB_NO ? [resolvedJobNo != null ? Number(resolvedJobNo) : null] : []),
     job,
-    jobName ? String(jobName).trim() : null,
+    jobName,
     category,
     userName ? String(userName).trim() : null,
     ...(caps.TX_HAS_SOURCE_MSG_ID ? [sourceMsgId] : []),
@@ -435,9 +579,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
 
   const canIdempotent =
-    caps.TX_HAS_SOURCE_MSG_ID &&
-    !!sourceMsgId &&
-    (await detectTransactionsUniqueOwnerSourceMsg());
+    caps.TX_HAS_SOURCE_MSG_ID && !!sourceMsgId && (await detectTransactionsUniqueOwnerSourceMsg());
 
   const sql = canIdempotent
     ? `
@@ -621,8 +763,7 @@ async function createJobIdempotent({
           LIMIT 1`,
         [owner, msgId]
       );
-      if (existing.rowCount)
-        return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
+      if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
     }
 
     const existingByName = await client.query(
@@ -634,8 +775,7 @@ async function createJobIdempotent({
         LIMIT 1`,
       [owner, cleanName]
     );
-    if (existingByName.rowCount)
-      return { inserted: false, job: existingByName.rows[0], reason: 'already_exists' };
+    if (existingByName.rowCount) return { inserted: false, job: existingByName.rows[0], reason: 'already_exists' };
 
     const nextNo = await allocateNextJobNo(owner, client);
 
@@ -662,8 +802,7 @@ async function createJobIdempotent({
             LIMIT 1`,
           [owner, msgId]
         );
-        if (existing.rowCount)
-          return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
+        if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
       }
       if (e && e.code === '23505') {
         const byName = await client.query(
@@ -675,8 +814,7 @@ async function createJobIdempotent({
             LIMIT 1`,
           [owner, cleanName]
         );
-        if (byName.rowCount)
-          return { inserted: false, job: byName.rows[0], reason: 'already_exists' };
+        if (byName.rowCount) return { inserted: false, job: byName.rows[0], reason: 'already_exists' };
       }
       throw e;
     }
@@ -738,6 +876,7 @@ async function getActiveJob(ownerId, userId = null) {
   const owner = DIGITS(ownerId);
   if (!owner) return null;
 
+  // per-user active job if available
   if (userId && (await detectUserActiveJobTable())) {
     try {
       const mode = await userActiveJobJoinMode();
@@ -763,6 +902,7 @@ async function getActiveJob(ownerId, userId = null) {
     }
   }
 
+  // owner-wide active job fallback
   const act = await query(
     `select coalesce(name, job_name) as name, job_no
        from public.jobs
@@ -775,6 +915,7 @@ async function getActiveJob(ownerId, userId = null) {
   const row = act.rows?.[0] || null;
   if (!row) return null;
 
+  // back-compat: some callers expect name string when userId omitted
   if (!userId) return row.name || null;
   return { job_no: row.job_no, name: row.name };
 }
@@ -853,6 +994,7 @@ async function setActiveJob(ownerId, userId, jobRef) {
 /* ✅ Canonical per-identity Active Job                                */
 /* ------------------------------------------------------------------ */
 let _ACTIVEJOB_CAPS = null;
+let _ACTIVEJOB_ID_TYPES = null; // ✅ cache active_job_id column types
 
 async function detectActiveJobCaps() {
   if (_ACTIVEJOB_CAPS) return _ACTIVEJOB_CAPS;
@@ -902,15 +1044,54 @@ async function detectActiveJobCaps() {
   return caps;
 }
 
+async function detectActiveJobIdColumnTypes() {
+  if (_ACTIVEJOB_ID_TYPES) return _ACTIVEJOB_ID_TYPES;
+  const out = {
+    users: null,
+    memberships: null,
+    user_profiles: null
+  };
+  try {
+    if (await hasTable('users')) out.users = await getColumnDataType('users', 'active_job_id');
+  } catch {}
+  try {
+    if (await hasTable('memberships')) out.memberships = await getColumnDataType('memberships', 'active_job_id');
+  } catch {}
+  try {
+    if (await hasTable('user_profiles')) out.user_profiles = await getColumnDataType('user_profiles', 'active_job_id');
+  } catch {}
+  _ACTIVEJOB_ID_TYPES = out;
+  return out;
+}
+
+function coerceActiveJobIdValue(colType, { jobUuid, jobNo }) {
+  const t = String(colType || '').toLowerCase();
+  if (!t) return jobUuid || jobNo || null;
+
+  if (t.includes('uuid')) return jobUuid && looksLikeUuid(jobUuid) ? jobUuid : null;
+  if (t.includes('int') || t.includes('bigint') || t.includes('smallint')) {
+    if (jobNo == null) return null;
+    const n = Number(jobNo);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // text/other: store uuid if present, else job_no as string
+  if (jobUuid) return String(jobUuid);
+  if (jobNo != null) return String(jobNo);
+  return null;
+}
+
 async function resolveJobIdAndName(ownerId, jobId, jobName) {
   const owner = DIGITS(ownerId);
   let id = jobId ? String(jobId).trim() : null;
   let name = jobName ? String(jobName).trim() : null;
+  let jobNo = null;
 
+  // if jobName provided, resolve id from jobs (best-effort)
   if (!id && name) {
     try {
       const r = await query(
-        `select id, coalesce(name, job_name) as job_name
+        `select id, job_no, coalesce(name, job_name) as job_name
            from public.jobs
           where owner_id=$1
             and lower(coalesce(name, job_name)) = lower($2)
@@ -920,25 +1101,42 @@ async function resolveJobIdAndName(ownerId, jobId, jobName) {
       );
       if (r?.rows?.[0]) {
         id = r.rows[0].id ? String(r.rows[0].id) : null;
+        jobNo = r.rows[0].job_no ?? null;
         name = r.rows[0].job_name ? String(r.rows[0].job_name).trim() : name;
       }
     } catch {}
   }
 
+  // if id provided but no name, resolve name from jobs
   if (id && !name && looksLikeUuid(id)) {
     try {
       const r = await query(
-        `select coalesce(name, job_name) as job_name
+        `select job_no, coalesce(name, job_name) as job_name
            from public.jobs
           where owner_id=$1 and id=$2::uuid
           limit 1`,
         [owner, id]
       );
-      if (r?.rows?.[0]?.job_name) name = String(r.rows[0].job_name).trim();
+      if (r?.rows?.[0]) {
+        jobNo = r.rows[0].job_no ?? jobNo;
+        if (r.rows[0].job_name) name = String(r.rows[0].job_name).trim();
+      }
     } catch {}
   }
 
-  return { id, name };
+  // if neither id nor jobNo, but name exists, ensure a job row exists (optional, but helps)
+  if (!id && jobNo == null && name) {
+    try {
+      const j = await ensureJobByName(owner, name);
+      if (j) {
+        id = j.id ? String(j.id) : id;
+        jobNo = j.job_no ?? jobNo;
+        name = j.name ? String(j.name).trim() : name;
+      }
+    } catch {}
+  }
+
+  return { id, name, jobNo };
 }
 
 async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
@@ -948,9 +1146,12 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   if (!owner || !userId) throw new Error('setActiveJobForIdentity missing ownerId/userId');
 
   const caps = await detectActiveJobCaps();
+  const types = await detectActiveJobIdColumnTypes();
   const resolved = await resolveJobIdAndName(owner, jobId, jobName);
+
   const id = resolved.id || null;
   const name = resolved.name || (jobName ? String(jobName).trim() : null);
+  const jobNo = resolved.jobNo ?? null;
 
   // 1) users
   if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
@@ -960,8 +1161,9 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       let i = 3;
 
       if (caps.users_has_active_job_id) {
+        const v = coerceActiveJobIdValue(types.users, { jobUuid: id, jobNo });
         sets.push(`active_job_id = $${i++}`);
-        params.push(id);
+        params.push(v);
       }
       if (caps.users_has_active_job_name) {
         sets.push(`active_job_name = $${i++}`);
@@ -970,10 +1172,7 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       if (await hasColumn('users', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
 
       if (sets.length) {
-        const r = await query(
-          `update public.users set ${sets.join(', ')} where owner_id=$1 and user_id=$2`,
-          params
-        );
+        const r = await query(`update public.users set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
         if (r?.rowCount) return true;
       }
     } catch (e) {
@@ -989,8 +1188,9 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       let i = 3;
 
       if (caps.memberships_has_active_job_id) {
+        const v = coerceActiveJobIdValue(types.memberships, { jobUuid: id, jobNo });
         sets.push(`active_job_id = $${i++}`);
-        params.push(id);
+        params.push(v);
       }
       if (caps.memberships_has_active_job_name) {
         sets.push(`active_job_name = $${i++}`);
@@ -1018,15 +1218,15 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       let i = 3;
 
       if (caps.user_profiles_has_active_job_id) {
+        const v = coerceActiveJobIdValue(types.user_profiles, { jobUuid: id, jobNo });
         sets.push(`active_job_id = $${i++}`);
-        params.push(id);
+        params.push(v);
       }
       if (caps.user_profiles_has_active_job_name) {
         sets.push(`active_job_name = $${i++}`);
         params.push(name);
       }
-      if (await hasColumn('user_profiles', 'updated_at').catch(() => false))
-        sets.push(`updated_at = now()`);
+      if (await hasColumn('user_profiles', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
 
       if (sets.length) {
         const r = await query(
@@ -1044,6 +1244,7 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   if (caps.has_user_active_job) {
     try {
       const mode = await userActiveJobJoinMode();
+
       if (mode === 'uuid' && id && looksLikeUuid(id)) {
         await query(
           `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
@@ -1054,17 +1255,18 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
         );
         return true;
       }
+
       if (mode === 'job_no') {
         // store job_no in job_id
-        const j = name ? await ensureJobByName(owner, name) : null;
-        const jobNo = j?.job_no ?? null;
-        if (jobNo != null) {
+        let n = jobNo;
+        if (n == null && name) n = (await ensureJobByName(owner, name))?.job_no ?? null;
+        if (n != null) {
           await query(
             `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
              values ($1,$2,$3,now())
              on conflict (owner_id,user_id) do update
                set job_id=excluded.job_id, updated_at=now()`,
-            [owner, String(userId), Number(jobNo)]
+            [owner, String(userId), Number(n)]
           );
           return true;
         }
@@ -1084,6 +1286,42 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
 
   const caps = await detectActiveJobCaps();
 
+  async function enrichIfNeeded(active_job_id, active_job_name, sourceLabel) {
+    let id = active_job_id ?? null;
+    let name = active_job_name ?? null;
+
+    if ((name == null || name === '') && id != null) {
+      try {
+        if (looksLikeUuid(String(id))) {
+          const r = await query(
+            `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and id=$2::uuid limit 1`,
+            [owner, String(id)]
+          );
+          if (r?.rows?.[0]?.job_name) name = String(r.rows[0].job_name).trim();
+        } else if (/^\d+$/.test(String(id))) {
+          const r = await query(
+            `select id as job_id, coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and job_no=$2 limit 1`,
+            [owner, Number(id)]
+          );
+          if (r?.rows?.[0]) {
+            id = r.rows[0].job_id ? String(r.rows[0].job_id) : id;
+            name = r.rows[0].job_name ? String(r.rows[0].job_name).trim() : name;
+          }
+        }
+      } catch {}
+    }
+
+    if (id == null && name) {
+      try {
+        const row = await resolveJobRow(owner, name);
+        if (row?.id) id = String(row.id);
+      } catch {}
+    }
+
+    if (id == null && name == null) return null;
+    return { active_job_id: id ?? null, active_job_name: name ?? null, _source: sourceLabel };
+  }
+
   // 1) users
   if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
     try {
@@ -1097,10 +1335,8 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       );
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        return {
-          active_job_id: row.active_job_id ?? null,
-          active_job_name: row.active_job_name ?? null
-        };
+        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'users');
+        if (out) return out;
       }
     } catch (e) {
       console.warn('[PG/activeJob] users read failed (ignored):', e?.message);
@@ -1120,10 +1356,8 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       );
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        return {
-          active_job_id: row.active_job_id ?? null,
-          active_job_name: row.active_job_name ?? null
-        };
+        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'memberships');
+        if (out) return out;
       }
     } catch (e) {
       console.warn('[PG/activeJob] memberships read failed (ignored):', e?.message);
@@ -1143,10 +1377,8 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       );
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        return {
-          active_job_id: row.active_job_id ?? null,
-          active_job_name: row.active_job_name ?? null
-        };
+        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_profiles');
+        if (out) return out;
       }
     } catch (e) {
       console.warn('[PG/activeJob] user_profiles read failed (ignored):', e?.message);
@@ -1173,10 +1405,8 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       const r = await query(sql, [owner, String(userId)]);
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        return {
-          active_job_id: row.active_job_id ?? null,
-          active_job_name: row.active_job_name ?? null
-        };
+        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
+        if (out) return out;
       }
     } catch (e) {
       console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
@@ -1192,23 +1422,16 @@ async function generateOTP(userId) {
   const uid = DIGITS(userId);
   const otp = crypto.randomInt(100000, 1000000).toString();
   const expiry = new Date(Date.now() + 10 * 60 * 1000);
-  await query(`UPDATE public.users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`, [
-    otp,
-    expiry,
-    uid
-  ]);
+  await query(`UPDATE public.users SET otp=$1, otp_expiry=$2 WHERE user_id=$3`, [otp, expiry, uid]);
   return otp;
 }
 
 async function verifyOTP(userId, otp) {
   const uid = DIGITS(userId);
-  const { rows } = await query(`SELECT otp, otp_expiry FROM public.users WHERE user_id=$1`, [
-    uid
-  ]);
+  const { rows } = await query(`SELECT otp, otp_expiry FROM public.users WHERE user_id=$1`, [uid]);
   const user = rows[0];
   const ok = !!user && user.otp === otp && new Date() <= new Date(user.otp_expiry);
-  if (ok)
-    await query(`UPDATE public.users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [uid]);
+  if (ok) await query(`UPDATE public.users SET otp=NULL, otp_expiry=NULL WHERE user_id=$1`, [uid]);
   return ok;
 }
 
@@ -1257,16 +1480,7 @@ async function getOwnerProfile(ownerId) {
 }
 
 // ---------- Tasks ----------
-async function createTask({
-  ownerId,
-  createdBy,
-  assignedTo,
-  title,
-  body,
-  type = 'general',
-  dueAt,
-  jobNo
-}) {
+async function createTask({ ownerId, createdBy, assignedTo, title, body, type = 'general', dueAt, jobNo }) {
   const { rows } = await query(
     `INSERT INTO public.tasks
        (owner_id, created_by, assigned_to, title, body, type, due_at, job_no, created_at, updated_at)
@@ -1287,10 +1501,10 @@ async function createTask({
 }
 
 async function getTaskByNo(ownerId, taskNo) {
-  const { rows } = await query(
-    `SELECT * FROM public.tasks WHERE owner_id=$1 AND task_no=$2 LIMIT 1`,
-    [DIGITS(ownerId), taskNo]
-  );
+  const { rows } = await query(`SELECT * FROM public.tasks WHERE owner_id=$1 AND task_no=$2 LIMIT 1`, [
+    DIGITS(ownerId),
+    taskNo
+  ]);
   return rows[0] || null;
 }
 
@@ -1384,21 +1598,14 @@ async function exportTimesheetPdf(opts) {
   doc.on('data', (d) => chunks.push(d));
   const done = new Promise((r) => doc.on('end', r));
 
-  doc
-    .fontSize(16)
-    .text(`Timesheet ${startIso.slice(0, 10)} – ${endIso.slice(0, 10)}`, { align: 'center' })
-    .moveDown();
+  doc.fontSize(16).text(`Timesheet ${startIso.slice(0, 10)} – ${endIso.slice(0, 10)}`, { align: 'center' }).moveDown();
 
   (rows || []).forEach((r) => {
     const ts = new Date(r.timestamp);
     doc
       .fontSize(10)
       .text(
-        `${r.employee_name} | ${r.type} | ${formatInTimeZone(
-          ts,
-          r.tz,
-          'yyyy-MM-dd HH:mm'
-        )} | ${r.job_name || ''}`
+        `${r.employee_name} | ${r.type} | ${formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm')} | ${r.job_name || ''}`
       );
   });
 
@@ -1487,7 +1694,10 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
 
   if (jobId) {
     params.push(String(jobId));
-    where += ' AND job_id::text = $2';
+    // Prefer job_id if present, else fall back to job string field matching
+    const caps = await detectTransactionsCapabilities().catch(() => ({ TX_HAS_JOB_ID: false }));
+    if (caps?.TX_HAS_JOB_ID) where += ' AND job_id::text = $2';
+    else where += ' AND job::text = $2';
   }
 
   const { rows } = await query(
@@ -1523,6 +1733,40 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
 
 async function getOwnerJobsFinance(ownerId) {
   const ownerKey = String(ownerId);
+
+  // If transactions.job_id is missing, this join will fail. We fallback gracefully.
+  const caps = await detectTransactionsCapabilities().catch(() => ({ TX_HAS_JOB_ID: false }));
+
+  if (!caps?.TX_HAS_JOB_ID) {
+    const { rows } = await query(
+      `
+      select
+        j.id,
+        j.name,
+        j.status,
+        j.created_at,
+        j.completed_at,
+        0::bigint as revenue_cents,
+        0::bigint as expense_cents
+      from jobs j
+      where j.owner_id::text = $1
+      order by j.created_at desc
+      `,
+      [ownerKey]
+    );
+
+    return rows.map((r) => ({
+      job_id: r.id,
+      name: r.name,
+      status: r.status,
+      created_at: r.created_at,
+      completed_at: r.completed_at,
+      revenue_cents: 0,
+      expense_cents: 0,
+      profit_cents: 0,
+      margin_pct: null
+    }));
+  }
 
   const { rows } = await query(
     `
@@ -1696,13 +1940,10 @@ function normalizeCategoryString(category) {
   if (t === 'material' || t === 'materials' || t === 'mat') return 'Materials';
   if (t === 'fuel' || t === 'gas') return 'Fuel';
   if (t === 'tool' || t === 'tools' || t === 'equipment') return 'Tools';
-  if (t === 'sub' || t === 'subs' || t === 'subcontractor' || t === 'subcontractors')
-    return 'Subcontractors';
+  if (t === 'sub' || t === 'subs' || t === 'subcontractor' || t === 'subcontractors') return 'Subcontractors';
   if (t === 'office' || t === 'office supplies') return 'Office Supplies';
 
-  return s
-    .replace(/\s+/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return s.replace(/\s+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function normalizeVendorString(v) {
@@ -1735,14 +1976,7 @@ async function normalizeVendorName(_ownerId, vendor) {
   return normalizeVendorString(vendor);
 }
 
-async function upsertCategoryRule({
-  ownerId,
-  kind = 'expense',
-  vendor,
-  keyword = null,
-  category,
-  weight = 10
-} = {}) {
+async function upsertCategoryRule({ ownerId, kind = 'expense', vendor, keyword = null, category, weight = 10 } = {}) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   const k = String(kind || 'expense').trim() || 'expense';
 
@@ -1918,7 +2152,7 @@ async function listOpenJobs(ownerId, { limit = 8 } = {}) {
   }
 }
 
-/* -------------------- Time Limits & Audit (kept as-is from your file) -------------------- */
+/* -------------------- Time Limits & Audit -------------------- */
 // Cache detected columns on public.time_entries
 let SUPPORTS_CREATED_BY = null;
 let SUPPORTS_USER_ID = null;
@@ -1926,11 +2160,7 @@ let SUPPORTS_SOURCE_MSG_ID = null;
 let TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = null;
 
 async function detectTimeEntriesCapabilities() {
-  if (
-    SUPPORTS_CREATED_BY !== null &&
-    SUPPORTS_USER_ID !== null &&
-    SUPPORTS_SOURCE_MSG_ID !== null
-  ) {
+  if (SUPPORTS_CREATED_BY !== null && SUPPORTS_USER_ID !== null && SUPPORTS_SOURCE_MSG_ID !== null) {
     return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
   }
 
@@ -1941,9 +2171,7 @@ async function detectTimeEntriesCapabilities() {
         WHERE table_schema = 'public'
           AND table_name   = 'time_entries'`
     );
-    const names = new Set(
-      (rows || []).map((r) => String(r.column_name).toLowerCase())
-    );
+    const names = new Set((rows || []).map((r) => String(r.column_name).toLowerCase()));
     SUPPORTS_CREATED_BY = names.has('created_by');
     SUPPORTS_USER_ID = names.has('user_id');
     SUPPORTS_SOURCE_MSG_ID = names.has('source_msg_id');
@@ -1980,7 +2208,11 @@ async function detectTimeEntriesUniqueOwnerUserSourceMsg() {
   return TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE;
 }
 
-async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWindow = 8 } = {}) {
+// ✅ aligned with timeclock.js: accepts { max } OR { maxInWindow }
+async function checkTimeEntryLimit(ownerId, createdBy, opts = {}) {
+  const windowSec = Number(opts.windowSec ?? 30);
+  const maxInWindow = Number(opts.maxInWindow ?? opts.max ?? 8);
+
   const owner = DIGITS(ownerId);
   const actor = DIGITS(createdBy || owner);
   const windowIntervalExpr = `(($3::text || ' seconds')::interval)`;
@@ -2036,6 +2268,7 @@ async function checkTimeEntryLimit(ownerId, createdBy, { windowSec = 30, maxInWi
   }
 }
 
+// ---------- Job-aware time entry ----------
 async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras = {}) {
   let jobNo = null;
 
@@ -2066,11 +2299,7 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
 
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
-  if (
-    SUPPORTS_USER_ID === null ||
-    SUPPORTS_CREATED_BY === null ||
-    SUPPORTS_SOURCE_MSG_ID === null
-  ) {
+  if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null || SUPPORTS_SOURCE_MSG_ID === null) {
     await detectTimeEntriesCapabilities().catch((e) =>
       console.error('[PG/logTimeEntry] detection failed:', e?.message)
     );
@@ -2123,10 +2352,7 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   } catch (e) {
     const msg = String(e?.message || '').toLowerCase();
     const code = String(e?.code || '');
-    if (
-      canIdempotent &&
-      (code === '42P10' || msg.includes('there is no unique') || msg.includes('on conflict'))
-    ) {
+    if (canIdempotent && (code === '42P10' || msg.includes('there is no unique') || msg.includes('on conflict'))) {
       TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = false;
       const sql2 = `
         INSERT INTO public.time_entries (${cols.join(', ')})
@@ -2168,12 +2394,10 @@ async function moveLastLogToJob(ownerId, userName, jobRef) {
 async function enqueueKpiTouch(ownerId, jobId, isoDate) {
   const owner = String(ownerId).replace(/\D/g, '');
   const day = isoDate ? isoDate.slice(0, 10) : new Date().toISOString().slice(0, 10);
-  await query(
-    `insert into public.kpi_touches (owner_id, job_id, day) values ($1,$2,$3)`,
-    [owner, jobId || null, day]
-  );
+  await query(`insert into public.kpi_touches (owner_id, job_id, day) values ($1,$2,$3)`, [owner, jobId || null, day]);
 }
 
+// ---- JOB BY NAME/SOURCE HELPERS (kept) ----
 async function getJobByName(ownerId, name) {
   const owner = DIGITS(ownerId);
   const jobName = String(name || '').trim();
@@ -2320,5 +2544,13 @@ module.exports = {
 
   // kept helpers (if other files import them)
   getJobByName,
-  getJobBySourceMsg
+  getJobBySourceMsg,
+
+  // optional: debugging / inspection
+  detectUserActiveJobJobIdType,
+  userActiveJobJoinMode,
+
+  // internal helpers occasionally useful
+  resolveJobRow,
+  getColumnDataType
 };

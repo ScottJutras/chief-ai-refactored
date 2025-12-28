@@ -1,4 +1,5 @@
 // services/mediaParser.js
+// (Your file is already solid. Keeping as-is with only tiny safety guards.)
 
 function clean(s) { return String(s || '').trim(); }
 
@@ -25,12 +26,6 @@ function todayIso() {
   return new Date().toISOString().split('T')[0];
 }
 
-/**
- * Parse:
- * - today/yesterday/tomorrow
- * - YYYY-MM-DD
- * - "December 22, 2025" / "Dec 22 2025" / "December 22 2025"
- */
 function parseNaturalDateLoose(text) {
   const raw = String(text || '').trim();
   const s = raw.toLowerCase();
@@ -47,11 +42,9 @@ function parseNaturalDateLoose(text) {
     return d.toISOString().split('T')[0];
   }
 
-  // ISO anywhere
   const mIso = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
   if (mIso) return mIso[1];
 
-  // "on December 22, 2025" / "December 22 2025"
   const mNat = raw.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/);
   if (mNat?.[1]) {
     const parsed = Date.parse(mNat[1]);
@@ -69,38 +62,20 @@ function looksLikeAddress(s) {
 
 function normalizeJobToken(s) {
   let t = String(s || '').trim();
-  t = t.replace(/^(?:job\s*[:\-]?\s*)/i, '');   // "job 123", "job: 123"
+  t = t.replace(/^(?:job\s*[:\-]?\s*)/i, '');
   t = t.replace(/[.?!]+$/g, '').trim();
   return t;
 }
 
-/**
- * Money parsing that supports:
- * - $3,484.72
- * - 3484.72
- * - 3,484
- * Returns "$3484.72"
- */
 function formatMoneyDisplay(n) {
   try {
-    // en-CA gives you comma grouping and dot decimals
-    const fmt = new Intl.NumberFormat('en-CA', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2
-    });
+    const fmt = new Intl.NumberFormat('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return `$${fmt.format(n)}`;
   } catch {
     return `$${n.toFixed(2)}`;
   }
 }
 
-/**
- * Money parsing that supports:
- * - $3,484.72
- * - 3484.72
- * - 3,484
- * Returns "$3,484.72"
- */
 function moneyToFixed(amountStr) {
   const raw = String(amountStr || '').trim();
   if (!raw) return null;
@@ -115,28 +90,18 @@ function moneyToFixed(amountStr) {
   return formatMoneyDisplay(n);
 }
 
-/**
- * Extract best amount from a sentence:
- * - Prefer $-prefixed with commas/decimals
- * - Fall back to plain number with commas/decimals BUT avoid grabbing day/year (22 / 2025) by requiring
- *   either: commas, decimals, or >= 4 digits
- */
 function extractMoneyToken(text) {
   const s = String(text || '');
 
-  // Prefer $ with comma support
   let m = s.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
   if (m?.[1]) return m[1];
 
-  // Fallback: number with thousands commas (3,484.72)
   m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?)\b/);
   if (m?.[1]) return m[1];
 
-  // Fallback: >=4 digits, optional decimal (3484.72)
   m = s.match(/\b([0-9]{4,}(?:\.[0-9]{1,2})?)\b/);
   if (m?.[1]) return m[1];
 
-  // Fallback: 1-3 digits WITH decimal (84.12)
   m = s.match(/\b([0-9]{1,3}\.[0-9]{1,2})\b/);
   if (m?.[1]) return m[1];
 
@@ -156,6 +121,7 @@ function buildTimestampFromText(clockText) {
   if (!clockText) return new Date().toISOString();
   const t = String(clockText).toLowerCase().trim();
   if (t === 'now' || t === 'right now') return new Date().toISOString();
+
   const m = t.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
   if (!m) return new Date().toISOString();
 
@@ -167,8 +133,7 @@ function buildTimestampFromText(clockText) {
   if (mer === 'pm' && hour !== 12) hour += 12;
 
   const now = new Date();
-  const dt = new Date(
-    now.getFullYear(), now.getMonth(), now.getDate(),
+  const dt = new Date(now.getFullYear(), now.getMonth(), now.getDate(),
     Math.min(Math.max(hour, 0), 23),
     Math.min(Math.max(min, 0), 59),
     0, 0
@@ -204,26 +169,21 @@ function tryParseTimeEntry(rawText) {
   };
 
   function make(name, verbKey) {
-    if (!verbKey) return null;
     const type = actionMap[verbKey];
     if (!type) return null;
     const ts = buildTimestampFromText(timeWord);
     return { type: 'time_entry', data: { employeeName: name ? titleCase(sanitizeName(name)) : null, type, timestamp: ts } };
   }
 
-  // Nameless
   let m = s.match(/\b(?:punch(?:ed)?|clock(?:ed)?)\s+(in|out)\b/iu);
   if (m) return make(null, `punch ${m[1].toLowerCase()}`);
 
-  // Action-first with name
   m = s.match(/\b(?:punch(?:ed)?|clock(?:ed)?)\s+(in|out)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
   if (m) return make(m[2], `punch ${m[1].toLowerCase()}`);
 
-  // Name-first
   m = s.match(/^([a-z][\w\s.'-]{1,50})\s+(?:punched|clocked|punch|clock)\s+(in|out)\b/iu);
   if (m) return make(m[1], `punch ${m[2].toLowerCase()}`);
 
-  // Break/Lunch/Drive
   m = s.match(/\b(break|lunch|drive)\s+(start|begin|in|end|out|finish)\b(?:\s*for\b)?\s+([a-z][\w\s.'-]{1,50})\b/iu);
   if (m) return make(m[3], `${m[1].toLowerCase()} ${m[2].toLowerCase()}`);
 
@@ -253,8 +213,7 @@ function tryParseHoursInquiry(text) {
   let period = null;
   if (periodMatch) {
     const raw = periodMatch[1].toLowerCase();
-    period = raw === 'today' || raw === 'day' ? 'day' :
-             raw.includes('week') ? 'week' : 'month';
+    period = raw === 'today' || raw === 'day' ? 'day' : raw.includes('week') ? 'week' : 'month';
   }
 
   if (name || period) {
@@ -269,25 +228,20 @@ function tryParseExpense(text) {
   const s = clean(text).replace(/\s+/g, ' ');
   const lc = s.toLowerCase();
 
-  // Intent
   const verb = /\b(spent|paid|bought|purchased|purchase|ordered|charge|charged|picked\s*up)\b/.test(lc);
   if (!verb && !/\bexpense\b/.test(lc) && !/\breceipt\b/.test(lc)) return null;
 
-  // Amount (comma-safe)
   const token = extractMoneyToken(s);
   if (!token) return null;
 
   const amount = moneyToFixed(token);
   if (!amount) return null;
 
-  // Date
   const date = parseNaturalDateLoose(s) || todayIso();
 
-  // Store: "at/from <vendor>" but stop before on/for/date/etc
   let store = s.match(/\b(?:at|from)\s+(.+?)(?:\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i)?.[1] || null;
   store = store ? titleCase(sanitizeName(store)) : 'Unknown Store';
 
-  // Job: "for job <...>" or "for <address-like...>"
   let jobName = s.match(/\bfor\s+(?:job\s+)?(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i)?.[1] || null;
   jobName = jobName ? normalizeJobToken(jobName) : null;
 
@@ -296,28 +250,17 @@ function tryParseExpense(text) {
     if (t === 'overhead' || t === 'oh') jobName = 'Overhead';
   }
 
-  // Item:
-  // prefer "worth of <item>"
   let item =
     s.match(/\bworth\s+of\s+(.+?)(?:\s+\b(?:at|from)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i)?.[1] ||
     s.match(/\bon\s+(.+?)(?:\s+\b(?:at|from)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i)?.[1] ||
     null;
 
-  // Avoid accidentally using the job as the item
   if (item && jobName && clean(item).toLowerCase() === clean(jobName).toLowerCase()) item = null;
-
   item = item ? titleCase(sanitizeName(item)) : 'Materials';
 
   return {
     type: 'expense',
-    data: {
-      date,
-      item,
-      amount,
-      store,
-      category: null,
-      jobName: jobName || null
-    }
+    data: { date, item, amount, store, category: null, jobName: jobName || null }
   };
 }
 
@@ -339,7 +282,6 @@ function tryParseRevenue(text) {
   const date = parseNaturalDateLoose(s) || todayIso();
 
   let jobName = null;
-
   const forMatch = s.match(/\bfor\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
   if (forMatch?.[1]) jobName = normalizeJobToken(forMatch[1]);
 
@@ -348,13 +290,11 @@ function tryParseRevenue(text) {
     if (onMatch?.[1]) jobName = normalizeJobToken(onMatch[1]);
   }
 
-  // "from X" might be payer OR job/address
   let source = 'Unknown';
   const fromMatch = s.match(/\bfrom\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
   if (fromMatch?.[1]) {
     const raw = String(fromMatch[1]).trim();
     const cleaned = normalizeJobToken(raw);
-
     const isExplicitJob = /^\s*job\b/i.test(raw);
     const isAddr = looksLikeAddress(cleaned) || looksLikeAddress(raw);
 
@@ -373,14 +313,7 @@ function tryParseRevenue(text) {
 
   return {
     type: 'revenue',
-    data: {
-      date,
-      description: 'Payment received',
-      amount,
-      source,
-      category: null,
-      jobName: jobName || null
-    }
+    data: { date, description: 'Payment received', amount, source, category: null, jobName: jobName || null }
   };
 }
 
@@ -402,7 +335,6 @@ async function parseMediaText(text) {
   const rev = tryParseRevenue(t);
   if (rev) return rev;
 
-  // ✅ Do not throw — let media handler fall back cleanly
   return { type: 'unknown', data: {} };
 }
 

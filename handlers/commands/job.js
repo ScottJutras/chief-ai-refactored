@@ -109,7 +109,7 @@ function dedupeJobs(list) {
 }
 
 function isPickerOpenCommand(lc) {
-  return /^(show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs|pick\s+job|change\s+job)\b/.test(lc);
+  return /^(show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs|pick\s+job|change\s+job|show\s+job\s+list|job\s+list)\b/.test(lc);
 }
 
 function isCancelLike(lc) {
@@ -682,7 +682,6 @@ Now you can:
     const jobs = dedupeJobs(await listActiveJobNames(owner, { limit: 50 }));
     return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobs, page: 0, perPage: 8 });
   }
-
   // --- Direct set active job ---
   if (/^(active\s+job|set\s+active|switch\s+job)\b/i.test(msg)) {
     const name = msg.replace(/^(active\s+job|set\s+active|switch\s+job)\b/i, '').trim();
@@ -713,13 +712,13 @@ Now you can:
   }
 
   // --- List jobs ---
-  if (/^(jobs|list jobs|show jobs)\b/i.test(msg)) {
+  if (/^(jobs|list jobs|show jobs|show job list|job list)\b/i.test(msg)) {
     const reply = await listJobs(owner);
     return respond(res, reply);
   }
 
   // --- Create job (idempotent) ---
-  if (/^(create|new)\s+job\b/i.test(msg)) {
+  if (/^(create|new|start)\s+job\b/i.test(msg)) {
     const name = msg.replace(/^(create|new)\s+job\b/i, '').trim();
 
     const out = await pg.createJobIdempotent({

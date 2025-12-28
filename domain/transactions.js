@@ -1,8 +1,6 @@
 // domain/transactions.js
 const { query, insertTransaction } = require('../services/postgres');
 
-// ---------------- helpers ----------------
-
 function isoDateOrToday(d) {
   try {
     return d ? new Date(d).toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
@@ -16,10 +14,8 @@ function safeStr(x) {
   return s || null;
 }
 
-// Best-effort: only used for nicer summaries (NOT required for DB insert)
 async function resolveJobName(owner_id, jobRef) {
   if (!owner_id || !jobRef) return null;
-
   const ref = String(jobRef).trim();
   if (!ref) return null;
 
@@ -61,24 +57,17 @@ async function resolveJobName(owner_id, jobRef) {
 }
 
 function buildMediaMeta(ctx, cil) {
-  const fromCtx =
-    ctx?.mediaMetaNormalized ||
-    ctx?.mediaMeta ||
-    ctx?.pendingMediaMeta ||
-    null;
+  const fromCtx = ctx?.mediaMetaNormalized || ctx?.mediaMeta || ctx?.pendingMediaMeta || null;
 
   const fromCil = {
     url: cil?.media_url || cil?.mediaUrl || null,
     type: cil?.media_type || cil?.mediaType || null,
     transcript: cil?.media_transcript || cil?.mediaTranscript || null,
-    confidence: cil?.media_confidence ?? cil?.mediaConfidence ?? null,
+    confidence: cil?.media_confidence ?? cil?.mediaConfidence ?? null
   };
 
-  // Prefer ctx media (it usually came from Twilio attachment pipeline)
   return fromCtx || fromCil || null;
 }
-
-// ---------------- main handlers ----------------
 
 async function logExpense(cil, ctx) {
   const ownerId = safeStr(ctx?.owner_id);
@@ -100,18 +89,18 @@ async function logExpense(cil, ctx) {
 
   const mediaMeta = buildMediaMeta(ctx, cil);
 
-  // ✅ Canonical insert path
   const result = await insertTransaction(
     {
       ownerId,
       kind: 'expense',
       date,
-      description: item,                // canonical mapping
+      description: item,
       amount_cents: amountCents,
-      // Optional numeric "amount" if present in CIL (rare for expense)
       amount: cil?.amount != null ? Number(cil.amount) : undefined,
-      source: store || 'Unknown',       // canonical mapping (store -> source)
+      source: store || 'Unknown',
       job: jobRef || null,
+      job_id: cil?.job_id ?? null, // ✅ pass-through if caller has it
+      job_no: cil?.job_no ?? null, // ✅ pass-through if caller has it
       job_name: jobNameForSummary || jobRef || null,
       category,
       user_name: userName,
@@ -152,7 +141,6 @@ async function logRevenue(cil, ctx) {
 
   const mediaMeta = buildMediaMeta(ctx, cil);
 
-  // ✅ Canonical insert path
   const result = await insertTransaction(
     {
       ownerId,
@@ -160,10 +148,11 @@ async function logRevenue(cil, ctx) {
       date,
       description,
       amount_cents: amountCents,
-      // Optional numeric "amount" if present in CIL
       amount: cil?.amount != null ? Number(cil.amount) : undefined,
       source,
       job: jobRef || null,
+      job_id: cil?.job_id ?? null,
+      job_no: cil?.job_no ?? null,
       job_name: jobNameForSummary || jobRef || null,
       category,
       user_name: userName,

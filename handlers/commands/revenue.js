@@ -1,41 +1,29 @@
 // handlers/commands/revenue.js
-// COMPLETE DROP-IN (aligned to latest postgres.js + expense.js patterns)
+// COMPLETE DROP-IN (aligned to expense.js patterns + postgres.js insertTransaction)
 //
-// Alignments included:
-// - Uses pg.todayInTZ if available (TZ-safe dates)
-// - Uses pg.insertTransaction canonical path with idempotency via source_msg_id (if supported)
-// - Uses pg.normalizeMediaMeta + transcript truncation (schema-aware media columns)
-// - Mirrors expense.js confirm flow: "db timeout" => keep pending + ask user to tap Yes again
-// - Adds "change job" + Interactive List job picker + numeric map (same UX as expense.js)
-// - Uses pg.getActiveJobForIdentity canonical path when present (active-job fix)
-// - Deterministic parse first (money/date/job) then AI fallback
+// ✅ Alignments in this drop-in:
+// - Uses pending_actions (PA) confirm flow like expense.js (PA_KIND_CONFIRM + PA_KIND_PICK_JOB)
+// - Job picker supports:
+//    • WhatsApp interactive list row ids: jobno_<job_no>
+//    • numeric replies ("2")
+//    • exact job name
+//    • "overhead" + "more" + "change job"
+// - Uses pg.insertTransaction with source_msg_id idempotency (if supported)
+// - Wires OCR/media into revenue insert via opts.mediaMeta (schema-aware)
+// - Consumes pendingMediaMeta from stateManager (your media.js/transcription pipeline)
+// - DB timeout UX: keep confirm PA and ask user to tap Yes again
 //
 // Signature expected by router:
 //   handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId)
 
 const pg = require('../../services/postgres');
-const { query, insertTransaction, listOpenJobs } = pg;
+const { insertTransaction } = pg;
 
 const state = require('../../utils/stateManager');
-const getPendingTransactionState = state.getPendingTransactionState;
-const deletePendingTransactionState =
-  state.deletePendingTransactionState ||
-  state.deletePendingState ||
-  state.clearPendingTransactionState ||
-  null;
-
-const mergePendingTransactionState =
-  state.mergePendingTransactionState ||
-  (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
 const ai = require('../../utils/aiErrorHandler');
 const handleInputWithAI = ai.handleInputWithAI;
 const parseRevenueMessage = ai.parseRevenueMessage;
-
-const detectErrors =
-  (typeof ai.detectErrors === 'function' && ai.detectErrors) ||
-  (typeof ai.detectError === 'function' && ai.detectError) ||
-  (async () => null); // fail-open
 
 const categorizeEntry =
   (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) || (async () => null); // fail-open
@@ -48,6 +36,21 @@ const validateCIL =
   (cilMod && typeof cilMod.validate === 'function' && cilMod.validate) ||
   (typeof cilMod === 'function' && cilMod) ||
   null;
+
+/* ---------------- Pending Actions (DB) ---------------- */
+
+const PA_KIND_CONFIRM = 'confirm_revenue';
+const PA_KIND_PICK_JOB = 'pick_job_for_revenue';
+
+const getPA = pg.getPendingAction || pg.getPA;
+const upsertPA = pg.upsertPendingAction || pg.upsertPA;
+const deletePA = pg.deletePendingAction || pg.deletePA;
+
+if (typeof getPA !== 'function' || typeof upsertPA !== 'function' || typeof deletePA !== 'function') {
+  console.warn(
+    '[REVENUE] Missing pending_actions helpers on pg (getPA/upsertPA/deletePA). This file expects them.'
+  );
+}
 
 /* ---------------- Twilio Template / Messaging helpers ---------------- */
 
@@ -106,9 +109,7 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   if (!to) throw new Error('Missing "to"');
   if (!templateSid) throw new Error('Missing templateSid');
 
-  const toClean = String(to).startsWith('whatsapp:')
-    ? String(to)
-    : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
+  const toClean = String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
 
   const payload = {
     to: toClean,
@@ -125,15 +126,6 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
     new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
   ]);
 
-  console.info('[TEMPLATE] sent', {
-    to: payload.to,
-    from: payload.from || null,
-    messagingServiceSid: payload.messagingServiceSid || null,
-    contentSid: payload.contentSid,
-    sid: msg?.sid || null,
-    status: msg?.status || null
-  });
-
   return msg;
 }
 
@@ -141,12 +133,9 @@ async function sendConfirmRevenueOrFallback(from, summaryLine) {
   const sid = getRevenueConfirmTemplateSid();
   const to = waTo(from);
 
-  console.info('[REVENUE] confirm template attempt', { from, to, hasSid: !!sid, sid: sid || null });
-
   if (sid && to) {
     try {
       await sendWhatsAppTemplate({ to, templateSid: sid, summaryLine });
-      console.info('[REVENUE] confirm template sent OK', { to, sid });
       return twimlEmpty();
     } catch (e) {
       console.warn('[REVENUE] template send failed; falling back to TwiML:', e?.message);
@@ -154,195 +143,8 @@ async function sendConfirmRevenueOrFallback(from, summaryLine) {
   }
 
   return twimlText(
-    `Please confirm this Revenue:\n${summaryLine}\n\nReply yes/edit/cancel.\nTip: reply "change job" to pick a different job.`
-  );
-}
-
-/* ---------------- WhatsApp Interactive List (job picker) ---------------- */
-
-const ENABLE_INTERACTIVE_LIST = (() => {
-  const raw =
-    process.env.TWILIO_ENABLE_INTERACTIVE_LIST ??
-    process.env.TWILIO_ENABLE_LIST_PICKER ??
-    'true';
-  return String(raw).trim().toLowerCase() !== 'false';
-})();
-
-function stableHash(str) {
-  let h = 2166136261;
-  const s = String(str || '');
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0).toString(16);
-}
-
-function isGarbageJobName(name) {
-  const lc = String(name || '').trim().toLowerCase();
-  return (
-    lc === 'cancel' ||
-    lc === 'show active jobs' ||
-    lc === 'active jobs' ||
-    lc === 'change job' ||
-    lc === 'switch job' ||
-    lc === 'pick job'
-  );
-}
-
-function dedupeJobs(list) {
-  const out = [];
-  const seen = new Set();
-  for (const j of list || []) {
-    const s = String(j || '').trim();
-    if (!s) continue;
-    if (isGarbageJobName(s)) continue;
-    const key = s.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(s);
-  }
-  return out;
-}
-
-function buildTextJobPrompt(jobs, page, pageSize) {
-  const start = page * pageSize;
-  const slice = jobs.slice(start, start + pageSize);
-  const lines = slice.map((j, i) => `${start + i + 1}) ${j}`);
-  const hasMore = start + pageSize < jobs.length;
-
-  const more = hasMore ? `\nReply "more" for more jobs.` : '';
-  return `Which job is this revenue for?\n\n${lines.join(
-    '\n'
-  )}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
-}
-
-function buildJobPickerMapping(jobs, page, pageSize) {
-  const start = page * pageSize;
-  const slice = jobs.slice(start, start + pageSize);
-
-  const idMap = {}; // rowId -> jobName
-  const nameMap = {}; // lower(title/desc) -> jobName
-  const numMap = {}; // "1" -> jobName (absolute index)
-
-  for (let i = 0; i < slice.length; i++) {
-    const absIdx = start + i + 1;
-    const fullName = slice[i];
-    const rowId = `job_${absIdx}_${stableHash(fullName)}`;
-
-    idMap[rowId] = fullName;
-    numMap[String(absIdx)] = fullName;
-
-    nameMap[String(fullName).toLowerCase()] = fullName;
-    nameMap[String(fullName).slice(0, 24).toLowerCase()] = fullName;
-  }
-
-  idMap.overhead = 'Overhead';
-  idMap.more = '__MORE__';
-
-  nameMap.overhead = 'Overhead';
-  nameMap['more jobs…'] = '__MORE__';
-  nameMap['more jobs'] = '__MORE__';
-  nameMap.more = '__MORE__';
-
-  numMap.overhead = 'Overhead';
-  numMap.more = '__MORE__';
-
-  return { idMap, nameMap, numMap };
-}
-
-async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections }) {
-  const client = getTwilioClient();
-  const { waFrom, messagingServiceSid } = getSendFromConfig();
-
-  const payload = {
-    to,
-    ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
-    interactive: {
-      type: 'list',
-      body: { text: String(bodyText || '').slice(0, 1024) },
-      action: {
-        button: String(buttonText || 'Pick a job').slice(0, 20),
-        sections
-      }
-    }
-  };
-
-  const TIMEOUT_MS = 3000;
-  const msg = await Promise.race([
-    client.messages.create(payload),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
-  ]);
-
-  console.info('[INTERACTIVE_LIST] sent', {
-    to: payload.to,
-    from: payload.from || null,
-    messagingServiceSid: payload.messagingServiceSid || null,
-    sid: msg?.sid || null,
-    status: msg?.status || null
-  });
-
-  return msg;
-}
-
-async function sendJobPickerOrFallback(from, ownerId, jobs, page = 0, pageSize = 8) {
-  const to = waTo(from);
-  const uniq = dedupeJobs(jobs);
-
-  const JOBS_PER_PAGE = Math.min(pageSize, 8);
-  const start = page * JOBS_PER_PAGE;
-  const slice = uniq.slice(start, start + JOBS_PER_PAGE);
-  const hasMore = start + JOBS_PER_PAGE < uniq.length;
-
-  const { idMap, nameMap, numMap } = buildJobPickerMapping(uniq, page, JOBS_PER_PAGE);
-
-  await mergePendingTransactionState(from, {
-    awaitingRevenueJob: true,
-    awaitingRevenueJobPage: page,
-    revenueJobPickerIdMap: idMap,
-    revenueJobPickerNameMap: nameMap,
-    revenueJobPickerNumMap: numMap,
-    revenueJobPickerHasMore: hasMore,
-    revenueJobPickerTotal: uniq.length
-  });
-
-  if (!ENABLE_INTERACTIVE_LIST || !to) {
-    return twimlText(buildTextJobPrompt(uniq, page, JOBS_PER_PAGE));
-  }
-
-  const rows = [];
-  for (let i = 0; i < slice.length; i++) {
-    const absIdx = start + i + 1;
-    const full = slice[i];
-    const rowId = `job_${absIdx}_${stableHash(full)}`;
-
-    rows.push({
-      id: rowId,
-      title: String(full).slice(0, 24),
-      description: String(full).slice(0, 72)
-    });
-  }
-
-  rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
-
-  if (hasMore) {
-    rows.push({ id: 'more', title: 'More jobs…', description: `Show jobs ${start + JOBS_PER_PAGE + 1}+` });
-  }
-
-  const bodyText =
-    `Here are your active jobs (${start + 1}-${Math.min(start + JOBS_PER_PAGE, uniq.length)} of ${
-      uniq.length
-    }).\n` + `Pick one to assign this revenue.\n\nTip: You can switch your current job anytime.`;
-
-  const sections = [{ title: 'Active Jobs', rows }];
-
-  try {
-    await sendWhatsAppInteractiveList({ to, bodyText, buttonText: 'Pick a job', sections });
-    return twimlEmpty();
-  } catch (e) {
-    console.warn('[REVENUE] interactive list failed; falling back to text:', e?.message);
-    return twimlText(buildTextJobPrompt(uniq, page, JOBS_PER_PAGE));
-  }
+  `✅ Confirm revenue\n${summaryLine}\n\nReply: yes / edit / cancel / change job`
+);
 }
 
 /* ---------------- Utilities ---------------- */
@@ -363,28 +165,6 @@ const todayInTimeZone =
     } catch {
       return new Date().toISOString().split('T')[0];
     }
-  });
-
-const parseNaturalDateTz =
-  (typeof ai.parseNaturalDate === 'function' && ai.parseNaturalDate) ||
-  ((s, tz) => {
-    const t = String(s || '').trim().toLowerCase();
-    const today = todayInTimeZone(tz);
-    if (!t || t === 'today') return today;
-    if (t === 'yesterday') {
-      const d = new Date(`${today}T12:00:00Z`);
-      d.setUTCDate(d.getUTCDate() - 1);
-      return d.toISOString().split('T')[0];
-    }
-    if (t === 'tomorrow') {
-      const d = new Date(`${today}T12:00:00Z`);
-      d.setUTCDate(d.getUTCDate() + 1);
-      return d.toISOString().split('T')[0];
-    }
-    if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
-    const parsed = Date.parse(s);
-    if (!Number.isNaN(parsed)) return new Date(parsed).toISOString().split('T')[0];
-    return null;
   });
 
 function normalizeDecisionToken(input) {
@@ -427,10 +207,7 @@ function toNumberAmount(amountStr) {
 
 function formatMoneyDisplay(n) {
   try {
-    const fmt = new Intl.NumberFormat('en-CA', {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2
-    });
+    const fmt = new Intl.NumberFormat('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return `$${fmt.format(n)}`;
   } catch {
     return `$${n.toFixed(2)}`;
@@ -451,17 +228,7 @@ function looksLikeOverhead(s) {
 }
 
 function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(str || '')
-  );
-}
-
-function looksLikeAddress(s) {
-  const t = String(s || '').trim();
-  if (!/\d/.test(t)) return false;
-  return /\b(st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pkwy|park)\b/i.test(
-    t
-  );
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
 }
 
 function normalizeRevenueData(data, tz) {
@@ -495,178 +262,26 @@ async function withTimeout(promise, ms, fallbackValue = '__TIMEOUT__') {
   return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms))]);
 }
 
-/* ---------------- Active job resolution (aligned to postgres.js) ---------------- */
-
-function extractUserId(userProfile, fromPhone) {
-  return (
-    userProfile?.id ||
-    userProfile?.user_id ||
-    userProfile?.userId ||
-    userProfile?.member_id ||
-    userProfile?.membership_id ||
-    fromPhone ||
-    null
-  );
-}
-
-function normalizeE164ish(fromPhone) {
-  const raw = String(fromPhone || '').trim();
-  if (!raw) return null;
-  if (raw.startsWith('+')) return raw;
-  const digits = raw.replace(/\D/g, '');
-  return digits ? `+${digits}` : null;
-}
-
-async function bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, fromPhone }) {
-  // ✅ Canonical in postgres.js
-  if (typeof pg.getActiveJobForIdentity === 'function') {
-    try {
-      const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
-      if (out?.active_job_name || out?.activeJobName) {
-        return {
-          active_job_name: String(out.active_job_name || out.activeJobName).trim(),
-          active_job_id: out.active_job_id ?? out.activeJobId ?? null
-        };
-      }
-      if (out?.active_job_id || out?.activeJobId) {
-        return { active_job_name: null, active_job_id: out.active_job_id ?? out.activeJobId };
-      }
-    } catch (e) {
-      console.warn('[REVENUE] pg.getActiveJobForIdentity failed (ignored):', e?.message);
-    }
-  }
-
-  // Legacy best-effort fallbacks (safe if schemas still exist)
-  const ownerParam = String(ownerId || '').trim();
-  const userId = extractUserId(userProfile, fromPhone);
-  const phone = normalizeE164ish(fromPhone);
-
-  const attempts = [
-    {
-      label: 'memberships by user_id',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.memberships
-             WHERE owner_id = $1 AND user_id = $2
-             LIMIT 1`,
-      params: [ownerParam, String(userId)]
-    },
-    {
-      label: 'memberships by phone',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.memberships
-             WHERE owner_id = $1 AND (phone = $2 OR phone_e164 = $2 OR member_phone = $2)
-             LIMIT 1`,
-      params: [ownerParam, phone]
-    },
-    {
-      label: 'users by id',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.users
-             WHERE owner_id = $1 AND id = $2
-             LIMIT 1`,
-      params: [ownerParam, String(userId)]
-    },
-    {
-      label: 'users by phone',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.users
-             WHERE owner_id = $1 AND (phone = $2 OR phone_e164 = $2)
-             LIMIT 1`,
-      params: [ownerParam, phone]
-    },
-    {
-      label: 'user_profiles by user_id',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.user_profiles
-             WHERE owner_id = $1 AND user_id = $2
-             LIMIT 1`,
-      params: [ownerParam, String(userId)]
-    }
-  ];
-
-  for (const a of attempts) {
-    if (!a.params?.[1]) continue;
-    try {
-      const r = await query(a.sql, a.params);
-      const row = r?.rows?.[0];
-      if (!row) continue;
-      const name = row.active_job_name != null ? String(row.active_job_name).trim() : null;
-      const id = row.active_job_id != null ? row.active_job_id : null;
-      if (name || id) {
-        console.info('[REVENUE] active job fetched from DB', {
-          where: a.label,
-          hasName: !!name,
-          hasId: !!id
-        });
-        return { active_job_name: name || null, active_job_id: id };
-      }
-    } catch {}
-  }
-
-  return null;
-}
+/* ---------------- Active job resolution ---------------- */
 
 async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
-  const ownerParam = String(ownerId || '').trim();
-
   const directName = userProfile?.active_job_name || userProfile?.activeJobName || null;
   if (directName && String(directName).trim()) return String(directName).trim();
 
-  const directRef = userProfile?.active_job_id ?? userProfile?.activeJobId ?? null;
-
-  let ref = directRef;
-  let name = null;
-
-  if (ref == null) {
-    const fetched = await bestEffortFetchActiveJobFieldsFromDb({ ownerId, userProfile, fromPhone });
-    if (fetched?.active_job_name && String(fetched.active_job_name).trim()) {
-      return String(fetched.active_job_name).trim();
-    }
-    ref = fetched?.active_job_id ?? null;
-    name = fetched?.active_job_name ?? null;
-  }
-
-  if (name && String(name).trim()) return String(name).trim();
-  if (ref == null) return null;
-
-  const s = String(ref).trim();
-
-  // If uuid ref, try uuid join
-  if (looksLikeUuid(s)) {
+  // Canonical helper if present
+  if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
-      const r = await query(
-        `select coalesce(name, job_name) as job_name
-           from public.jobs
-          where owner_id = $1 and id = $2::uuid
-          limit 1`,
-        [ownerParam, s]
-      );
-      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
-    } catch (e) {
-      console.warn('[revenue] resolveActiveJobName uuid failed:', e?.message);
-    }
+      const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
+      const nm = out?.active_job_name ?? out?.activeJobName ?? null;
+      if (nm && String(nm).trim()) return String(nm).trim();
+    } catch {}
   }
 
-  // If job_no ref, try job_no
-  if (/^\d+$/.test(s)) {
-    try {
-      const r = await query(
-        `select coalesce(name, job_name) as job_name
-           from public.jobs
-          where owner_id = $1 and job_no = $2::int
-          limit 1`,
-        [ownerParam, Number(s)]
-      );
-      if (r?.rows?.[0]?.job_name) return r.rows[0].job_name;
-    } catch (e) {
-      console.warn('[revenue] resolveActiveJobName job_no failed:', e?.message);
-    }
-  }
-
+  // As a last resort, don’t guess.
   return null;
 }
 
-/* ---------------- Media normalization (aligned to postgres.js) ---------------- */
+/* ---------------- Media: consume pendingMediaMeta from stateManager ---------------- */
 
 const MAX_MEDIA_TRANSCRIPT_CHARS =
   (typeof pg.MEDIA_TRANSCRIPT_MAX_CHARS === 'number' && pg.MEDIA_TRANSCRIPT_MAX_CHARS) || 8000;
@@ -680,33 +295,42 @@ const truncateText =
     return s.slice(0, maxChars);
   });
 
-function normalizeMediaMetaForTx(pendingMediaMeta) {
-  if (!pendingMediaMeta) return null;
+async function consumePendingMediaMeta(from) {
+  try {
+    const getPending =
+      state.getPendingTransactionState ||
+      state.getPendingState ||
+      (async () => null);
 
-  if (typeof pg.normalizeMediaMeta === 'function') {
-    try {
-      return pg.normalizeMediaMeta({
-        url: pendingMediaMeta.url || pendingMediaMeta.media_url || null,
-        type: pendingMediaMeta.type || pendingMediaMeta.media_type || null,
-        transcript: truncateText(
-          pendingMediaMeta.transcript || pendingMediaMeta.media_transcript || null,
-          MAX_MEDIA_TRANSCRIPT_CHARS
-        ),
-        confidence: pendingMediaMeta.confidence ?? pendingMediaMeta.media_confidence ?? null
-      });
-    } catch {}
+    const mergePending =
+      state.mergePendingTransactionState ||
+      (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
+
+    const pending = await getPending(from);
+    const m = pending?.pendingMediaMeta || null;
+    if (!m) return null;
+
+    const raw = {
+      url: m.url || m.media_url || null,
+      type: m.type || m.media_type || null,
+      transcript: truncateText(m.transcript || m.media_transcript || null, MAX_MEDIA_TRANSCRIPT_CHARS),
+      confidence: m.confidence ?? m.media_confidence ?? null
+    };
+
+    const mediaMeta =
+      typeof pg.normalizeMediaMeta === 'function'
+        ? pg.normalizeMediaMeta(raw)
+        : raw;
+
+    const source_msg_id = m.source_msg_id ? String(m.source_msg_id) : null;
+
+    // Clear so it doesn't attach to the next transaction accidentally
+    await mergePending(from, { pendingMediaMeta: null });
+
+    return { mediaMeta, source_msg_id };
+  } catch {
+    return null;
   }
-
-  // fallback (insertTransaction handles or ignores depending on schema)
-  return {
-    url: pendingMediaMeta.url || pendingMediaMeta.media_url || null,
-    type: pendingMediaMeta.type || pendingMediaMeta.media_type || null,
-    transcript: truncateText(
-      pendingMediaMeta.transcript || pendingMediaMeta.media_transcript || null,
-      MAX_MEDIA_TRANSCRIPT_CHARS
-    ),
-    confidence: pendingMediaMeta.confidence ?? pendingMediaMeta.media_confidence ?? null
-  };
 }
 
 /* ---------------- CIL (fail-open) ---------------- */
@@ -732,12 +356,11 @@ function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
   };
 }
 
-function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
+function assertRevenueCILOrClarify({ from, data, jobName, category, sourceMsgId }) {
   try {
-    const cil = buildRevenueCIL({ ownerId, from, userProfile, data, jobName, category, sourceMsgId });
+    const cil = buildRevenueCIL({ from, data, jobName, category, sourceMsgId });
 
     if (typeof validateCIL !== 'function') {
-      console.warn('[REVENUE] validateCIL missing; skipping CIL validation (fail-open).');
       return { ok: true, cil, skipped: true };
     }
 
@@ -752,285 +375,448 @@ function assertRevenueCILOrClarify({ ownerId, from, userProfile, data, jobName, 
     return { ok: false, reply: `⚠️ Couldn't log that Revenue yet. Try: "received $2500 for <job> today".` };
   }
 }
-
-/* --------- Deterministic parse --------- */
-
-function extractMoneyToken(input) {
-  const s = String(input || '');
-
-  let m = s.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
-  if (m?.[1]) return m[1];
-
-  m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?)\b/);
-  if (m?.[1]) return m[1];
-
-  m = s.match(/\b([0-9]{4,}(?:\.[0-9]{1,2})?)\b/);
-  if (m?.[1]) return m[1];
-
-  m = s.match(/\b([0-9]{1,3}\.[0-9]{1,2})\b/);
-  if (m?.[1]) return m[1];
-
-  return null;
+function formatDisplayDate(isoDate, tz = 'America/Toronto') {
+  const s = String(isoDate || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return s || '';
+  try {
+    const d = new Date(`${s}T12:00:00Z`);
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric'
+    }).format(d);
+  } catch {
+    return s;
+  }
 }
 
-function moneyToFixed(token) {
-  const cleaned = String(token || '').trim().replace(/[^0-9.,]/g, '');
-  if (!cleaned) return null;
-  const n = Number(cleaned.replace(/,/g, ''));
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return formatMoneyDisplay(n);
-}
 
-function deterministicRevenueParse(input, tz) {
-  const raw = String(input || '').trim();
-  if (!raw) return null;
+/* ---------------- Job options + picker ---------------- */
 
-  const token = extractMoneyToken(raw);
-
-  // If token is a big bare integer, could be job # or address — require $ form to accept.
-  if (token && /^\d{4,}$/.test(String(token).replace(/,/g, ''))) {
-    const hasDollar = /\$\s*\d/.test(raw);
-    if (!hasDollar) return null;
+// expects listOpenJobsDetailed if you have it, otherwise derives from listOpenJobs
+async function listOpenJobsDetailedBestEffort(ownerId, limit = 50) {
+  if (typeof pg.listOpenJobsDetailed === 'function') {
+    try {
+      const rows = await pg.listOpenJobsDetailed(ownerId, limit);
+      return Array.isArray(rows) ? rows : [];
+    } catch {}
   }
 
-  const amount = moneyToFixed(token);
-  if (!amount) return null;
+  // fallback: listOpenJobs may return strings (names)
+  if (typeof pg.listOpenJobs === 'function') {
+    try {
+      const rows = await pg.listOpenJobs(ownerId, { limit });
+      if (!Array.isArray(rows)) return [];
+      // if strings, wrap them
+      if (typeof rows[0] === 'string') return rows.map((name) => ({ name, job_name: name }));
+      return rows;
+    } catch {}
+  }
 
-  // Date
-  let date = null;
-  if (/\btoday\b/i.test(raw)) date = parseNaturalDateTz('today', tz);
-  else if (/\byesterday\b/i.test(raw)) date = parseNaturalDateTz('yesterday', tz);
-  else if (/\btomorrow\b/i.test(raw)) date = parseNaturalDateTz('tomorrow', tz);
-  else {
-    const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
-    if (iso?.[1]) date = iso[1];
-    if (!date) {
-      const nat = raw.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/);
-      if (nat?.[1]) date = parseNaturalDateTz(nat[1], tz);
+  return [];
+}
+
+function normalizeJobOptions(jobRows) {
+  const out = [];
+  const seen = new Set();
+
+  for (const r of jobRows || []) {
+    const name = String(r?.name || r?.job_name || r || '').trim();
+    if (!name) continue;
+    const job_no = r?.job_no != null && Number.isFinite(Number(r.job_no)) ? Number(r.job_no) : null;
+
+    const key = `${String(job_no ?? '').trim()}::${name.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({
+      id: r?.id != null ? String(r.id) : null, // may be integer in your jobs table (do NOT use as tx.job_id)
+      job_no,
+      name
+    });
+  }
+
+  return out;
+}
+
+function buildTextJobPrompt(jobOptions, page, pageSize) {
+  const p = Math.max(0, Number(page || 0));
+  const ps = Math.min(8, Math.max(1, Number(pageSize || 8)));
+
+  const start = p * ps;
+  const slice = (jobOptions || []).slice(start, start + ps);
+
+  // IMPORTANT: numbers shown are 1..N for THIS PAGE
+  const lines = slice.map((j, i) => {
+    const name = String(j?.name || j?.job_name || 'Untitled Job').trim();
+    const jobNo = j?.job_no != null ? Number(j.job_no) : null;
+    const prefix = jobNo != null && Number.isFinite(jobNo) ? `#${jobNo} ` : '';
+    return `${i + 1}) ${prefix}${name}`;
+  });
+
+  const hasMore = start + ps < (jobOptions || []).length;
+  const more = hasMore ? `\nReply "more" for more jobs.` : '';
+
+  return `Which job is this revenue for?\n\n${lines.join(
+    '\n'
+  )}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
+}
+
+
+const ENABLE_INTERACTIVE_LIST = (() => {
+  const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? process.env.TWILIO_ENABLE_LIST_PICKER ?? 'true';
+  return String(raw).trim().toLowerCase() !== 'false';
+})();
+
+function stableHash(str) {
+  let h = 2166136261;
+  const s = String(str || '');
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16);
+}
+
+async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections }) {
+  const client = getTwilioClient();
+  const { waFrom, messagingServiceSid } = getSendFromConfig();
+
+  const payload = {
+    to,
+    ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
+    interactive: {
+      type: 'list',
+      body: { text: String(bodyText || '').slice(0, 1024) },
+      action: { button: String(buttonText || 'Pick a job').slice(0, 20), sections }
     }
-  }
-  if (!date) date = todayInTimeZone(tz);
+  };
 
-  // Job patterns
-  let jobName = null;
+  const TIMEOUT_MS = 3000;
+  const msg = await Promise.race([
+    client.messages.create(payload),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
+  ]);
 
-  const forMatch = raw.match(
-    /\bfor\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-  );
-  if (forMatch?.[1]) {
-    const candidate = normalizeJobAnswer(forMatch[1]);
-    if (!/^\$?\s*\d[\d,]*(?:\.\d{1,2})?$/.test(candidate)) jobName = candidate;
-  }
-
-  if (!jobName) {
-    const jobMatch = raw.match(
-      /\bjob\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-    );
-    if (jobMatch?.[1]) jobName = normalizeJobAnswer(jobMatch[1]);
-  }
-
-  // Payer "from X"
-  let source = 'Unknown';
-  const fromMatch = raw.match(
-    /\bfrom\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-  );
-  if (fromMatch?.[1]) {
-    const token2 = normalizeJobAnswer(fromMatch[1]);
-    if (looksLikeAddress(token2) || looksLikeAddress(fromMatch[1])) {
-      jobName = jobName || token2;
-      source = 'Unknown';
-    } else {
-      source = token2;
-    }
-  }
-
-  if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
-
-  return normalizeRevenueData(
-    {
-      date,
-      description: 'Revenue received',
-      amount,
-      source,
-      jobName: jobName || null
-    },
-    tz
-  );
+  return msg;
 }
 
-function buildRevenueSummaryLine({ amount, source, date, jobName }) {
-  const amt = String(amount || '').trim();
-  const src = String(source || '').trim();
-  const dt = String(date || '').trim();
-  const jb = jobName ? String(jobName).trim() : '';
+async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
+  const to = waTo(from);
+  const JOBS_PER_PAGE = Math.min(8, Math.max(1, Number(pageSize || 8)));
+  const p = Math.max(0, Number(page || 0));
+  const start = p * JOBS_PER_PAGE;
 
-  const parts = [];
-  parts.push(`Revenue: ${amt}`);
-  if (src && src !== 'Unknown') parts.push(`from ${src}`);
-  if (dt) parts.push(`on ${dt}`);
-  if (jb) parts.push(`for ${jb}`);
-  return parts.join(' ') + '.';
+  // job_no-only
+  const clean = (jobOptions || []).filter((j) => {
+    const n = j?.job_no != null ? Number(j.job_no) : null;
+    return n != null && Number.isFinite(n);
+  });
+
+  const slice = clean.slice(start, start + JOBS_PER_PAGE);
+  const hasMore = start + JOBS_PER_PAGE < clean.length;
+
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_PICK_JOB,
+    payload: { jobOptions: clean, page: p, pageSize: JOBS_PER_PAGE, hasMore, shownAt: Date.now() },
+    ttlSeconds: 600
+  });
+
+  if (!ENABLE_INTERACTIVE_LIST || !to) {
+    return twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE));
+  }
+
+  const rows = [];
+  for (let i = 0; i < slice.length; i++) {
+    const fullName = String(slice[i]?.name || slice[i]?.job_name || 'Untitled Job').trim();
+    const jobNo = Number(slice[i].job_no);
+
+    rows.push({
+      id: `jobno_${jobNo}`,
+      title: fullName.slice(0, 24),
+      description: `#${jobNo} ${fullName.slice(0, 72)}`
+    });
+  }
+
+  rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
+  if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: `Show next page` });
+
+  const bodyText =
+    `Pick a job (${start + 1}-${Math.min(start + JOBS_PER_PAGE, clean.length)} of ${clean.length}).` +
+    `\n\nTip: You can also reply with a number like "1".`;
+
+  try {
+    await sendWhatsAppInteractiveList({
+      to,
+      bodyText,
+      buttonText: 'Pick a job',
+      sections: [{ title: 'Active Jobs', rows }]
+    });
+    return twimlEmpty();
+  } catch (e) {
+    console.warn('[REVENUE] interactive list failed; falling back:', e?.message);
+    return twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE));
+  }
 }
 
-function resolveJobFromReply(input, pending) {
+
+function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 } = {}) {
   const raw = normalizeJobAnswer(input);
   const t = String(raw || '').trim();
   if (!t) return null;
 
-  if (looksLikeOverhead(t)) return 'Overhead';
-
   const lc = t.toLowerCase();
-  if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return '__MORE__';
+  if (looksLikeOverhead(t)) return { kind: 'overhead' };
+  if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return { kind: 'more' };
 
-  if (pending?.revenueJobPickerIdMap && pending.revenueJobPickerIdMap[t]) {
-    return pending.revenueJobPickerIdMap[t];
+  const p = Math.max(0, Number(page || 0));
+  const ps = Math.min(8, Math.max(1, Number(pageSize || 8)));
+
+  // jobno_<job_no>
+  const mJobNo = t.match(/^jobno_(\d{1,10})$/i);
+  if (mJobNo?.[1]) {
+    const jobNo = Number(mJobNo[1]);
+    if (!Number.isFinite(jobNo)) return null;
+
+    const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
+    if (!opt) return null;
+
+    return { kind: 'job', job: opt };
   }
 
-  if (/^\d+$/.test(t) && pending?.revenueJobPickerNumMap?.[t]) {
-    return pending.revenueJobPickerNumMap[t];
+  // numeric reply: current page 1..N
+  if (/^\d+$/.test(t)) {
+    const n = Number(t);
+    if (!Number.isFinite(n) || n <= 0) return null;
+
+    const start = p * ps;
+    const idx = start + (n - 1);
+    const opt = (jobOptions || [])[idx] || null;
+    if (!opt) return null;
+
+    const jobNo = opt?.job_no != null ? Number(opt.job_no) : null;
+    if (jobNo == null || !Number.isFinite(jobNo)) return null;
+
+    return { kind: 'job', job: opt };
   }
 
-  if (pending?.revenueJobPickerNameMap) {
-    const mapped = pending.revenueJobPickerNameMap[String(t).toLowerCase()];
-    if (mapped) return mapped;
+  // name match
+  const opt =
+    (jobOptions || []).find((j) => String(j?.name || j?.job_name || '').trim().toLowerCase() === lc) ||
+    (jobOptions || []).find((j) =>
+      String(j?.name || j?.job_name || '').trim().toLowerCase().startsWith(lc.slice(0, 24))
+    ) ||
+    null;
+
+  if (opt) {
+    const jobNo = opt?.job_no != null ? Number(opt.job_no) : null;
+    if (jobNo == null || !Number.isFinite(jobNo)) return null;
+    return { kind: 'job', job: opt };
   }
 
-  return t;
+  return null;
 }
+
+
+function buildRevenueSummaryLine({ amount, source, date, jobName, tz }) {
+  const amt = String(amount || '').trim();
+  const src = String(source || '').trim();
+  const dt = formatDisplayDate(date, tz);
+  const jb = jobName ? String(jobName).trim() : '';
+
+  const lines = [];
+  lines.push(`💰 ${amt}`);
+  if (src && src !== 'Unknown') lines.push(`👤 ${src}`);
+  if (dt) lines.push(`📅 ${dt}`);
+  if (jb) lines.push(`🧰 ${jb}`);
+
+  return lines.join('\n');
+}
+
+
 
 /* ---------------- main handler ---------------- */
 
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
   input = stripRevenuePrefixes(input);
 
-  const lockKey = `lock:${from}`;
   const safeMsgId = String(sourceMsgId || `${from}:${Date.now()}`).trim();
-
-  let reply;
+  const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
 
   try {
-    const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
-
-    const defaultData = {
-      date: todayInTimeZone(tz),
-      description: 'Revenue received',
-      amount: '$0.00',
-      source: 'Unknown'
-    };
-
-    let pending = await getPendingTransactionState(from);
-
-    if (pending?.isEditing && pending?.type === 'revenue') {
-      if (typeof deletePendingTransactionState === 'function') await deletePendingTransactionState(from);
-      pending = null;
-    }
-
-    // Awaiting job selection (interactive list or text)
-    if (pending?.awaitingRevenueJob && pending?.pendingRevenue) {
+    // ---------------- 1) Awaiting job pick ----------------
+    const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+    if (pickPA?.payload?.jobOptions) {
       const tok = normalizeDecisionToken(input);
+      const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
+      const page = Number(pickPA.payload.page || 0) || 0;
+      const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
+      const hasMore = !!pickPA.payload.hasMore;
 
-      if (tok === 'change_job') {
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        const page = Number(pending.awaitingRevenueJobPage || 0) || 0;
-        return await sendJobPickerOrFallback(from, ownerId, all, page, 8);
+      if (tok === 'change_job') return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
+
+      if (tok === 'more') {
+        if (!hasMore) return twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".');
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
       }
 
-      const resolved = resolveJobFromReply(input, pending);
+      const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize });
+      if (!resolved) return twimlText('Please reply with a number, job name, "Overhead", or "more".');
 
-      if (resolved === '__MORE__') {
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        const nextPage = Number(pending.awaitingRevenueJobPage || 0) + 1;
-        return await sendJobPickerOrFallback(from, ownerId, all, nextPage, 8);
+      const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+      if (!confirm?.payload?.draft) {
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+        return twimlText('Got it. Now resend the revenue details.');
       }
 
-      const finalJob = resolved || null;
+      if (resolved.kind === 'overhead') {
+        confirm.payload.draft.jobName = 'Overhead';
+        confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
+        confirm.payload.draft.job_id = null;
+      } else if (resolved.kind === 'job') {
+        const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
+        const jobId = resolved.job?.id ? String(resolved.job.id).trim() : null;
 
-      const merged = normalizeRevenueData({ ...pending.pendingRevenue, jobName: finalJob }, tz);
+        // ✅ Only keep UUIDs as job_id (in your schema, jobs.id is integer)
+        confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
+        confirm.payload.draft.job = {
+          id: jobId && looksLikeUuid(jobId) ? jobId : null,
+          job_no: resolved.job?.job_no != null ? Number(resolved.job.job_no) : null,
+          name: jobName || null
+        };
+        confirm.payload.draft.job_id = jobId && looksLikeUuid(jobId) ? jobId : null;
+      } else if (resolved.kind === 'more') {
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
+      } else {
+        return twimlText('Please reply with a number, job name, "Overhead", or "more".');
+      }
 
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingRevenue: merged,
-        awaitingRevenueJob: false,
-        awaitingRevenueJobPage: null,
-        revenueJobPickerIdMap: null,
-        revenueJobPickerNameMap: null,
-        revenueJobPickerNumMap: null,
-        revenueJobPickerHasMore: null,
-        revenueJobPickerTotal: null
+      await upsertPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM, payload: confirm.payload, ttlSeconds: 600 });
+      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+
+      const s = buildRevenueSummaryLine({
+       amount: confirm.payload.draft.amount,
+       source: confirm.payload.draft.source,
+       date: confirm.payload.draft.date,
+       jobName: confirm.payload.draft.jobName,
+       tz
       });
 
-      const summaryLine = buildRevenueSummaryLine({
-        amount: merged.amount,
-        source: merged.source,
-        date: merged.date,
-        jobName: merged.jobName
-      });
 
-      return await sendConfirmRevenueOrFallback(from, summaryLine);
+      return await sendConfirmRevenueOrFallback(from, s);
     }
 
-    // Confirm/edit/cancel flow
-    if (pending?.pendingRevenue) {
+    // ---------------- 2) Confirm/edit/cancel ----------------
+    const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
+    if (confirmPA?.payload?.draft) {
       if (!isOwner) {
-        if (typeof deletePendingTransactionState === 'function') await deletePendingTransactionState(from);
-        reply = '⚠️ Only the owner can manage revenue.';
-        return twimlText(reply);
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        return twimlText('⚠️ Only the owner can manage revenue.');
       }
 
       const token = normalizeDecisionToken(input);
-      const stableMsgId = String(pending?.revenueSourceMsgId || safeMsgId).trim();
+      const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId || '').trim() || null;
 
       if (token === 'change_job') {
-        await mergePendingTransactionState(from, {
-          ...(pending || {}),
-          awaitingRevenueJob: true,
-          awaitingRevenueJobPage: 0
-        });
+        const jobs = normalizeJobOptions(await listOpenJobsDetailedBestEffort(ownerId, 50));
+        if (!jobs.length) return twimlText('No jobs found. Reply "Overhead" or create a job first.');
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+      }
 
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
+      if (token === 'edit') {
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        return twimlText(
+  `✏️ Edit revenue\nResend it in one line like:\nreceived $2500 from ClientName "date/today" for <job>`
+);
+
+      }
+
+      if (token === 'cancel') {
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        try {
+          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+        } catch {}
+        return twimlText('❌ Operation cancelled.');
       }
 
       if (token === 'yes') {
-        const rawData = pending.pendingRevenue || {};
-        const mediaMeta = normalizeMediaMetaForTx(pending?.pendingMediaMeta || null);
+        // Work on a copy so we can mutate safely
+        const rawDraft = { ...(confirmPA.payload.draft || {}) };
 
-        let data = normalizeRevenueData(rawData, tz);
+        // Pull media (OCR/transcript) and optionally override msg id
+        const consumed = await consumePendingMediaMeta(from);
+        const mediaMeta = consumed?.mediaMeta || null;
+        const stableMsgId2 = String(consumed?.source_msg_id || stableMsgId || safeMsgId).trim();
 
+        // Pull *any* job id signal
+        const rawJobId =
+          rawDraft?.job_id ??
+          rawDraft?.jobId ??
+          rawDraft?.job?.id ??
+          rawDraft?.job?.job_id ??
+          null;
+
+        // 🔒 HARD GUARD: refuse numeric ids (your jobs.id is integer; tx.job_id is UUID)
+        if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
+          console.warn('[REVENUE] refusing numeric job id; forcing null', { job_id: rawJobId });
+          if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
+          rawDraft.job_id = null;
+          rawDraft.jobId = null;
+        }
+
+        // ✅ Keep UUID only
+        const maybeJobId = rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
+
+        let data = normalizeRevenueData(rawDraft, tz);
+
+        // Category (fail-open)
         let category =
           data.suggestedCategory ||
           (await withTimeout(Promise.resolve(categorizeEntry('revenue', data, ownerProfile)), 1200, null)) ||
           null;
         if (category && String(category).trim()) category = String(category).trim();
+         else category = null;
 
-        let jobName = (data.jobName && String(data.jobName).trim()) || null;
-        if (!jobName) {
-          jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-        }
+
+        const pickedJobName = data.jobName && String(data.jobName).trim() ? String(data.jobName).trim() : null;
+
+        let jobName = pickedJobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+
         if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
+        // If still no jobName, ask them to pick one
         if (!jobName) {
-          await mergePendingTransactionState(from, {
-            ...(pending || {}),
-            pendingRevenue: { ...data, suggestedCategory: category },
-            awaitingRevenueJob: true,
-            awaitingRevenueJobPage: 0,
-            revenueSourceMsgId: stableMsgId,
-            type: 'revenue'
+          const jobs = normalizeJobOptions(await listOpenJobsDetailedBestEffort(ownerId, 50));
+
+          await upsertPA({
+            ownerId,
+            userId: from,
+            kind: PA_KIND_CONFIRM,
+            payload: {
+              ...confirmPA.payload,
+              draft: {
+                ...data,
+                suggestedCategory: category,
+                job_id: maybeJobId || null
+              },
+              sourceMsgId: stableMsgId2
+            },
+            ttlSeconds: 600
           });
 
-          const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-          return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
+          return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
         }
 
         const gate = assertRevenueCILOrClarify({
-          ownerId,
           from,
-          userProfile,
           data,
           jobName,
           category,
-          sourceMsgId: stableMsgId
+          sourceMsgId: stableMsgId2
         });
         if (!gate.ok) return twimlText(String(gate.reply || '').slice(0, 1500));
 
@@ -1040,7 +826,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         const writeResult = await withTimeout(
           insertTransaction(
             {
-              ownerId,
+              ownerId: DIGITS(ownerId),
               kind: 'revenue',
               date: data.date || todayInTimeZone(tz),
               description: String(data.description || '').trim() || 'Revenue received',
@@ -1049,109 +835,77 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
               source: String(data.source || '').trim() || 'Unknown',
               job: jobName,
               job_name: jobName,
+
+              // ✅ UUID only (or null)
+              job_id: maybeJobId || null,
+
               category: category ? String(category).trim() : null,
               user_name: userProfile?.name || 'Unknown User',
-              source_msg_id: stableMsgId,
-              mediaMeta: mediaMeta
+              source_msg_id: stableMsgId2,
+
+              // ✅ OCR/media wiring (insertTransaction is schema-aware)
+              ...(mediaMeta ? { mediaMeta } : {})
             },
             { timeoutMs: 4500 }
           ),
-          5000,
+          5200,
           '__DB_TIMEOUT__'
         );
 
         if (writeResult === '__DB_TIMEOUT__') {
-          await mergePendingTransactionState(from, {
-            ...(pending || {}),
-            pendingRevenue: { ...data, jobName, suggestedCategory: category },
-            revenueSourceMsgId: stableMsgId,
-            type: 'revenue'
+          await upsertPA({
+            ownerId,
+            userId: from,
+            kind: PA_KIND_CONFIRM,
+            payload: {
+              ...confirmPA.payload,
+              draft: {
+                ...data,
+                jobName,
+                suggestedCategory: category,
+                job_id: maybeJobId || null
+              },
+              sourceMsgId: stableMsgId2
+            },
+            ttlSeconds: 600
           });
 
-          reply = `⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.`;
-          return twimlText(reply);
+          return twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.');
         }
 
         const summaryLine = buildRevenueSummaryLine({
-          amount: data.amount,
-          source: data.source,
-          date: data.date || todayInTimeZone(tz),
-          jobName
-        });
+         amount: data.amount,
+         source: data.source,
+         date: data.date || todayInTimeZone(tz),
+         jobName,
+         tz
+      });
 
-        reply =
+
+        const reply =
           writeResult?.inserted === false
             ? '✅ Already logged that revenue (duplicate message).'
             : `✅ Revenue logged: ${summaryLine}${category ? ` (Category: ${category})` : ''}`;
 
-        if (typeof deletePendingTransactionState === 'function') await deletePendingTransactionState(from);
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        try {
+          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+        } catch {}
+
         return twimlText(reply);
       }
 
-      if (token === 'edit') {
-        if (typeof deletePendingTransactionState === 'function') await deletePendingTransactionState(from);
-        reply =
-          '✏️ Okay — resend the revenue in one line (e.g., "received $2500 from ClientName today for <job>").';
-        return twimlText(reply);
-      }
-
-      if (token === 'cancel') {
-        if (typeof deletePendingTransactionState === 'function') await deletePendingTransactionState(from);
-        reply = '❌ Operation cancelled.';
-        return twimlText(reply);
-      }
-
-      reply = `⚠️ Please choose Yes, Edit, or Cancel.\nTip: reply "change job" to pick a different job.`;
-      return twimlText(reply);
+      return twimlText('⚠️ Please choose Yes, Edit, Cancel or Change Job.\nTip: reply "change job" to pick a different job.');
     }
 
-    // Backstop deterministic parse
-    const backstop = deterministicRevenueParse(input, tz);
-    if (backstop && backstop.amount) {
-      const data0 = normalizeRevenueData(backstop, tz);
+    // ---------------- 3) First-pass parse (deterministic, then AI fallback) ----------------
 
-      // normalize "source" that actually contains a job/address
-      const existingJob = String(data0.jobName || '').trim();
-      const srcRaw = String(data0.source || '').trim();
-      if (!existingJob && srcRaw) {
-        const srcClean = normalizeJobAnswer(srcRaw);
-        const srcLooksJob =
-          /^\s*job\b/i.test(srcRaw) || looksLikeAddress(srcClean) || looksLikeAddress(srcRaw);
-        if (srcLooksJob) {
-          data0.jobName = looksLikeOverhead(srcClean) ? 'Overhead' : srcClean;
-          data0.source = 'Unknown';
-        }
-      }
-
-      const category =
-        (await withTimeout(Promise.resolve(categorizeEntry('revenue', data0, ownerProfile)), 1200, null)) ||
-        null;
-
-      let jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-      if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
-
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingRevenue: { ...data0, jobName, suggestedCategory: category },
-        revenueSourceMsgId: safeMsgId,
-        type: 'revenue',
-        awaitingRevenueJob: !jobName,
-        awaitingRevenueJobPage: 0
-      });
-
-      if (!jobName) {
-        const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-        return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
-      }
-
-      const summaryLine = buildRevenueSummaryLine({
-        amount: data0.amount,
-        source: data0.source,
-        date: data0.date,
-        jobName
-      });
-      return await sendConfirmRevenueOrFallback(from, summaryLine);
-    }
+    const defaultData = {
+      date: todayInTimeZone(tz),
+      description: 'Revenue received',
+      amount: '$0.00',
+      source: 'Unknown'
+    };
 
     // AI ingestion fallback (tz-aware)
     const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
@@ -1162,88 +916,72 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
     if (data) data = normalizeRevenueData(data, tz);
 
     if (aiReply) {
-      // If AI asks a clarification question, store as edit flow (matches expense.js “don’t hard fail”)
-      await mergePendingTransactionState(from, {
-        ...(pending || {}),
-        pendingRevenue: null,
-        isEditing: true,
-        type: 'revenue'
-      });
+      // If AI asks a clarification question, fail-open with a human-facing message
       return twimlText(aiReply);
     }
 
     const missingCore = !data || !data.amount || data.amount === '$0.00';
-
     if (missingCore) {
-      reply = `🤔 Couldn’t parse a revenue from "${input}". Try "received $2500 from ClientName today for <job>".`;
-      return twimlText(reply);
+      return twimlText(`🤔 Couldn’t parse a revenue from "${input}". Try "received $2500 from ClientName date/today for <job>".`);
     }
 
-    // Optional sanity checks (fail-open)
-    try {
-      let errors = await detectErrors(data, 'revenue');
-      if (errors == null) errors = await detectErrors('revenue', data);
-      if (errors) {
-        const s = String(errors);
-        if (!/client:\s*missing|source:\s*missing/i.test(s)) {
-          // ignore optional payer/source missing; otherwise allow AI flow to still proceed
-        }
-      }
-    } catch {}
-
-    // normalize "source" that actually contains a job/address
-    const existingJob = String(data.jobName || '').trim();
-    const srcRaw = String(data.source || '').trim();
-    if (!existingJob && srcRaw) {
-      const srcClean = normalizeJobAnswer(srcRaw);
-      const srcLooksJob =
-        /^\s*job\b/i.test(srcRaw) || looksLikeAddress(srcClean) || looksLikeAddress(srcRaw);
-      if (srcLooksJob) {
-        data.jobName = looksLikeOverhead(srcClean) ? 'Overhead' : srcClean;
-        data.source = 'Unknown';
-      }
-    }
-
-    const category =
+    let category =
       (await withTimeout(Promise.resolve(categorizeEntry('revenue', data, ownerProfile)), 1200, null)) || null;
 
     let jobName = (data.jobName && String(data.jobName).trim()) || null;
-    if (!jobName) jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-    if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
+let jobSource = jobName ? 'typed' : 'unknown';
 
-    await mergePendingTransactionState(from, {
-      ...(pending || {}),
-      pendingRevenue: { ...data, jobName, suggestedCategory: category },
-      revenueSourceMsgId: safeMsgId,
-      type: 'revenue',
-      awaitingRevenueJob: !jobName,
-      awaitingRevenueJobPage: 0
+if (!jobName) {
+  jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+  if (jobName) jobSource = 'active';
+}
+
+if (jobName && looksLikeOverhead(jobName)) {
+  jobName = 'Overhead';
+  jobSource = 'overhead';
+}
+
+
+    // Create confirm PA
+    await upsertPA({
+      ownerId,
+      userId: from,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        draft: { ...data, jobName, jobSource, suggestedCategory: category },
+        sourceMsgId: safeMsgId
+      },
+      ttlSeconds: 600
     });
 
+    // If we still need a job, show picker
     if (!jobName) {
-      const all = dedupeJobs(await listOpenJobs(ownerId, { limit: 50 }));
-      return await sendJobPickerOrFallback(from, ownerId, all, 0, 8);
+      const jobs = normalizeJobOptions(await listOpenJobsDetailedBestEffort(ownerId, 50));
+      return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
     }
+const activeHint =
+  jobSource === 'active'
+    ? `\n\n🧠 Using active job: ${jobName}\nTip: reply "change job" to pick another`
+    : '';
 
-    const summaryLine = buildRevenueSummaryLine({
-      amount: data.amount,
-      source: data.source,
-      date: data.date || todayInTimeZone(tz),
-      jobName
-    });
-    return await sendConfirmRevenueOrFallback(from, summaryLine);
+const summaryLine = buildRevenueSummaryLine({
+  amount: data.amount,
+  source: data.source,
+  date: data.date || todayInTimeZone(tz),
+  jobName,
+  tz
+});
+
+return await sendConfirmRevenueOrFallback(from, `${summaryLine}${activeHint}`);
+
+
   } catch (error) {
     console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {
       code: error?.code,
       detail: error?.detail,
       constraint: error?.constraint
     });
-    reply = '⚠️ Error logging revenue. Please try again.';
-    return twimlText(reply);
-  } finally {
-    try {
-      await require('../../middleware/lock').releaseLock(lockKey);
-    } catch {}
+    return twimlText('⚠️ Error logging revenue. Please try again.');
   }
 }
 

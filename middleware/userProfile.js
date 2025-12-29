@@ -23,7 +23,7 @@ function shapeProfile(p, from) {
     user_id,
     owner_id,
     ownerId: owner_id,
-    from, // ✅ convenient for downstream middleware
+    from,
     phone: p?.phone || user_id,
     name: p?.name || p?.display_name || null,
     subscription_tier: plan,
@@ -56,7 +56,6 @@ async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
 
   if (!ownerParam || !userId) return null;
 
-  // Preferred canonical helper
   if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
       const out = await pg.getActiveJobForIdentity(ownerParam, userId);
@@ -73,56 +72,12 @@ async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
         };
       }
     } catch (e) {
+      // fail-open
       console.warn('[userProfile] pg.getActiveJobForIdentity failed (ignored):', e?.message);
     }
   }
 
-  // Fallback SQL attempts (fail-open on missing tables/columns)
-  const attempts = [
-    {
-      label: 'memberships (owner_id + user_id)',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.memberships
-             WHERE owner_id = $1 AND user_id = $2
-             LIMIT 1`,
-      params: [ownerParam, userId]
-    },
-    {
-      // ✅ FIX: users table is keyed by user_id in your project
-      label: 'users (owner_id + user_id)',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.users
-             WHERE owner_id = $1 AND user_id = $2
-             LIMIT 1`,
-      params: [ownerParam, userId]
-    },
-    {
-      label: 'user_profiles (owner_id + user_id)',
-      sql: `SELECT active_job_id, active_job_name
-              FROM public.user_profiles
-             WHERE owner_id = $1 AND user_id = $2
-             LIMIT 1`,
-      params: [ownerParam, userId]
-    }
-  ];
-
-  for (const a of attempts) {
-    try {
-      const r = await pg.query(a.sql, a.params);
-      const row = r?.rows?.[0];
-      if (!row) continue;
-
-      const active_job_id = row.active_job_id ?? null;
-      const active_job_name = row.active_job_name != null ? String(row.active_job_name).trim() : null;
-
-      if (active_job_id != null || (active_job_name && active_job_name.length > 0)) {
-        return { active_job_id, active_job_name };
-      }
-    } catch {
-      // ignore schema mismatch
-    }
-  }
-
+  // No legacy SQL fallbacks here. postgres.js already handles memberships/users/user_profiles safely.
   return null;
 }
 
@@ -174,7 +129,6 @@ async function userProfileMiddleware(req, _res, next) {
     const from = normalizeId(req.body?.From || req.from);
     req.from = from;
 
-    // Normalize ownerId too
     const ownerFromReq = normalizeId(req.ownerId);
     req.ownerId = ownerFromReq || from || 'GLOBAL';
 
@@ -202,7 +156,7 @@ async function userProfileMiddleware(req, _res, next) {
     }
     if (ownerProfile) ownerProfile = shapeProfile(ownerProfile, req.ownerId);
 
-    // ✅ Hydrate active job (best-effort, fail-open)
+    // Hydrate active job (best-effort, fail-open)
     try {
       const hasActiveAlready =
         (profile.active_job_name && String(profile.active_job_name).trim()) || profile.active_job_id != null;
@@ -228,8 +182,6 @@ async function userProfileMiddleware(req, _res, next) {
 
     req.userProfile = profile;
     req.ownerProfile = ownerProfile;
-
-    // Owner = user_id === ownerId
     req.isOwner = String(profile.user_id) === String(req.ownerId);
 
     return next();

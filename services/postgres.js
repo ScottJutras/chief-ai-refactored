@@ -195,6 +195,7 @@ async function getColumnDataType(table, col) {
     return null;
   }
 }
+let _MEMBERSHIPS_OK = null; 
 
 /* ------------------------------------------------------------------ */
 /* ✅ user_active_job job_id type detection (FIXES integer = uuid)      */
@@ -221,14 +222,6 @@ async function detectUserActiveJobJobIdType() {
   }
 
   return _USER_ACTIVE_JOB_JOB_ID_TYPE;
-}
-
-async function userActiveJobJoinMode() {
-  const t = await detectUserActiveJobJobIdType();
-  if (t.includes('uuid')) return 'uuid';
-  if (t.includes('int') || t.includes('bigint') || t.includes('smallint')) return 'job_no';
-  // fail-safe: if not uuid, prefer job_no (prevents uuid cast errors)
-  return 'job_no';
 }
 
 /* ------------------------------------------------------------------ */
@@ -635,18 +628,19 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     caps.TX_HAS_SOURCE_MSG_ID && !!sourceMsgId && (await detectTransactionsUniqueOwnerSourceMsg());
 
   const sql = canIdempotent
-    ? `
+  ? `
       insert into public.transactions (${cols.join(', ')})
       values (${placeholders})
-      on conflict (owner_id, source_msg_id)
+      on conflict (owner_id, source_msg_id) where source_msg_id is not null
       do nothing
       returning id
     `
-    : `
+  : `
       insert into public.transactions (${cols.join(', ')})
       values (${placeholders})
       returning id
     `;
+
 
   try {
     const res = await queryWithTimeout(sql, vals, timeoutMs);
@@ -933,24 +927,18 @@ async function getActiveJob(ownerId, userId = null) {
   // per-user active job if available
   if (userId && (await detectUserActiveJobTable())) {
     try {
-      const mode = await userActiveJobJoinMode();
-      const sql =
-        mode === 'uuid'
-          ? `select j.job_no, coalesce(j.name, j.job_name) as name
-               from public.user_active_job u
-               join public.jobs j
-                 on j.owner_id=u.owner_id and j.id=u.job_id
-              where u.owner_id=$1 and u.user_id=$2
-              limit 1`
-          : `select j.job_no, coalesce(j.name, j.job_name) as name
-               from public.user_active_job u
-               join public.jobs j
-                 on j.owner_id=u.owner_id and j.job_no = u.job_id
-              where u.owner_id=$1 and u.user_id=$2
-              limit 1`;
-
+      const sql = `
+        select j.job_no, coalesce(j.name, j.job_name) as name
+          from public.user_active_job u
+          join public.jobs j
+            on j.owner_id = u.owner_id
+           and j.job_no  = u.job_id
+         where u.owner_id = $1
+           and u.user_id  = $2
+         limit 1
+      `;
       const { rows } = await query(sql, [owner, String(userId)]);
-      if (rows[0]) return rows[0];
+      if (rows?.[0]) return rows[0];
     } catch (e) {
       console.warn('[PG/getActiveJob] user_active_job lookup failed (ignored):', e?.message);
     }
@@ -969,50 +957,45 @@ async function getActiveJob(ownerId, userId = null) {
   const row = act.rows?.[0] || null;
   if (!row) return null;
 
-  // back-compat: some callers expect name string when userId omitted
   if (!userId) return row.name || null;
   return { job_no: row.job_no, name: row.name };
 }
 
+
 /**
- * ✅ setActiveJob (compat) — now schema-aware for user_active_job.job_id
+ * ✅ setActiveJob (compat) — FORCE job_no mode for user_active_job.job_id
+ * In today's schema:
+ * - jobs.job_no is INT
+ * - user_active_job.job_id stores job_no (INT)
+ * - jobs.id is NOT compatible with user_active_job.job_id
  */
 async function setActiveJob(ownerId, userId, jobRef) {
   const owner = DIGITS(ownerId);
   if (!owner) throw new Error('Missing ownerId');
 
-  if (userId && (await detectUserActiveJobTable())) {
-    const ref = String(jobRef || '').trim();
-    const mode = await userActiveJobJoinMode();
+  const ref = String(jobRef || '').trim();
 
+  // 1) Per-user active job (preferred) if table exists
+  if (userId && (await detectUserActiveJobTable())) {
     try {
-      if (mode === 'uuid' && looksLikeUuid(ref)) {
+      let jobNo = null;
+
+      if (/^\d+$/.test(ref)) {
+        jobNo = Number(ref);
+      } else if (ref) {
+        // Resolve by name -> create if needed (your helper)
+        jobNo = (await ensureJobByName(owner, ref))?.job_no ?? null;
+      }
+
+      if (jobNo != null && Number.isFinite(Number(jobNo))) {
         await query(
           `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
            values ($1,$2,$3,now())
            on conflict (owner_id,user_id) do update
              set job_id=excluded.job_id, updated_at=now()`,
-          [owner, String(userId), ref]
+          [owner, String(userId), Number(jobNo)]
         );
         return true;
-      }
-
-      // if job_id is integer-based (job_no), store numeric job_no
-      if (mode === 'job_no') {
-        let jobNo = null;
-        if (/^\d+$/.test(ref)) jobNo = Number(ref);
-        else if (ref) jobNo = (await ensureJobByName(owner, ref))?.job_no || null;
-
-        if (jobNo != null) {
-          await query(
-            `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
-             values ($1,$2,$3,now())
-             on conflict (owner_id,user_id) do update
-               set job_id=excluded.job_id, updated_at=now()`,
-            [owner, String(userId), Number(jobNo)]
-          );
-          return true;
-        }
       }
     } catch (e) {
       console.warn('[PG/setActiveJob] user_active_job upsert failed (ignored):', e?.message);
@@ -1020,11 +1003,10 @@ async function setActiveJob(ownerId, userId, jobRef) {
     }
   }
 
-  // owner-wide activation
+  // 2) Owner-wide activation fallback (jobs.active=true)
   let jobNo = null;
-  const s = String(jobRef || '').trim();
-  if (/^\d+$/.test(s)) jobNo = Number(s);
-  else if (s) jobNo = (await ensureJobByName(owner, s))?.job_no || null;
+  if (/^\d+$/.test(ref)) jobNo = Number(ref);
+  else if (ref) jobNo = (await ensureJobByName(owner, ref))?.job_no ?? null;
 
   if (!jobNo) throw new Error('Could not resolve job');
 
@@ -1032,17 +1014,18 @@ async function setActiveJob(ownerId, userId, jobRef) {
     await client.query(
       `update public.jobs set active=false, updated_at=now()
         where owner_id=$1 and active=true and job_no<>$2`,
-      [owner, jobNo]
+      [owner, Number(jobNo)]
     );
     await client.query(
       `update public.jobs set active=true, updated_at=now()
         where owner_id=$1 and job_no=$2`,
-      [owner, jobNo]
+      [owner, Number(jobNo)]
     );
   });
 
   return true;
 }
+
 
 /* ------------------------------------------------------------------ */
 /* ✅ Canonical per-identity Active Job                                */
@@ -1161,19 +1144,36 @@ async function resolveJobIdAndName(ownerId, jobId, jobName) {
     } catch {}
   }
 
-  // if id provided but no name, resolve name from jobs
-  if (id && !name && looksLikeUuid(id)) {
+    // if id provided but no name, resolve name:
+  // - if uuid: lookup by id::uuid (future schema)
+  // - else if numeric: treat as job_no (today’s schema)
+  if (id && !name) {
+    const s = String(id).trim();
     try {
-      const r = await query(
-        `select job_no, coalesce(name, job_name) as job_name
-           from public.jobs
-          where owner_id=$1 and id=$2::uuid
-          limit 1`,
-        [owner, id]
-      );
-      if (r?.rows?.[0]) {
-        jobNo = r.rows[0].job_no ?? jobNo;
-        if (r.rows[0].job_name) name = String(r.rows[0].job_name).trim();
+      if (looksLikeUuid(s)) {
+        const r = await query(
+          `select job_no, coalesce(name, job_name) as job_name
+             from public.jobs
+            where owner_id=$1 and id=$2::uuid
+            limit 1`,
+          [owner, s]
+        );
+        if (r?.rows?.[0]) {
+          jobNo = r.rows[0].job_no ?? jobNo;
+          if (r.rows[0].job_name) name = String(r.rows[0].job_name).trim();
+        }
+      } else if (/^\d+$/.test(s)) {
+        const r = await query(
+          `select job_no, coalesce(name, job_name) as job_name
+             from public.jobs
+            where owner_id=$1 and job_no=$2::int
+            limit 1`,
+          [owner, Number(s)]
+        );
+        if (r?.rows?.[0]) {
+          jobNo = r.rows[0].job_no ?? jobNo;
+          if (r.rows[0].job_name) name = String(r.rows[0].job_name).trim();
+        }
       }
     } catch {}
   }
@@ -1192,6 +1192,7 @@ async function resolveJobIdAndName(ownerId, jobId, jobName) {
 
   return { id, name, jobNo };
 }
+
 
 async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   const owner = DIGITS(ownerId);
@@ -1294,95 +1295,80 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
     }
   }
 
-  // 4) user_active_job (schema-aware)
-  if (caps.has_user_active_job) {
-    try {
-      const mode = await userActiveJobJoinMode();
+  // 4) user_active_job (FORCE job_no mode)
+if (caps.has_user_active_job) {
+  try {
+    let n = jobNo;
 
-      if (mode === 'uuid' && id && looksLikeUuid(id)) {
-        await query(
-          `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
-           values ($1,$2,$3,now())
-           on conflict (owner_id,user_id) do update
-             set job_id=excluded.job_id, updated_at=now()`,
-          [owner, String(userId), id]
-        );
-        return true;
-      }
+    // If jobNo missing but we have name, resolve/create and use its job_no
+    if (n == null && name) n = (await ensureJobByName(owner, name))?.job_no ?? null;
 
-      if (mode === 'job_no') {
-        // store job_no in job_id
-        let n = jobNo;
-        if (n == null && name) n = (await ensureJobByName(owner, name))?.job_no ?? null;
-        if (n != null) {
-          await query(
-            `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
-             values ($1,$2,$3,now())
-             on conflict (owner_id,user_id) do update
-               set job_id=excluded.job_id, updated_at=now()`,
-            [owner, String(userId), Number(n)]
-          );
-          return true;
-        }
-      }
-    } catch (e) {
-      console.warn('[PG/activeJob] user_active_job upsert failed (ignored):', e?.message);
+    if (n != null && Number.isFinite(Number(n))) {
+      await query(
+        `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
+         values ($1,$2,$3,now())
+         on conflict (owner_id,user_id) do update
+           set job_id=excluded.job_id, updated_at=now()`,
+        [owner, String(userId), Number(n)]
+      );
+      return true;
     }
+  } catch (e) {
+    console.warn('[PG/activeJob] user_active_job upsert failed (ignored):', e?.message);
   }
-
+}
   return false;
 }
 
-async function getActiveJobForIdentity(ownerId, userId) {
-  // Example: pull active_job_id/name from memberships (adjust table as needed)
-  const r = await query(
-    `SELECT active_job_id, active_job_name
-       FROM public.memberships
-      WHERE owner_id = $1 AND user_id = $2
-      LIMIT 1`,
-    [String(ownerId), String(userId)]
-  );
+async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
+  const owner = DIGITS(ownerId);
+  const userId = DIGITS(userIdOrPhone);
+  if (!owner || !userId) return null;
 
-  const row = r?.rows?.[0];
-  if (!row) return null;
+  const caps = await detectActiveJobCaps();
 
-  const activeId = row.active_job_id;
-  let activeName = row.active_job_name ? String(row.active_job_name).trim() : null;
+  // helper: if id present but no name, resolve via jobs table (UUID or job_no)
+  async function enrichIfNeeded(activeId, activeName, source) {
+    const id = activeId != null ? activeId : null;
+    let name = activeName != null ? String(activeName).trim() : null;
 
-  // If name missing, resolve from jobs table without type mismatch
-  if (!activeName && activeId != null) {
-    const s = String(activeId).trim();
+    if (name) return { active_job_id: id, active_job_name: name, source };
+    if (id == null) return { active_job_id: null, active_job_name: null, source };
 
-    // UUID job id
-    if (looksLikeUuid(s)) {
-      const j = await query(
-        `SELECT COALESCE(name, job_name) AS job_name
-           FROM public.jobs
-          WHERE owner_id=$1 AND id=$2::uuid
-          LIMIT 1`,
-        [String(ownerId), s]
-      );
-      activeName = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
+    const s = String(id).trim();
+
+    try {
+      // Future schema: UUID job id
+      if (looksLikeUuid(s)) {
+        const j = await query(
+          `select coalesce(name, job_name) as job_name
+             from public.jobs
+            where owner_id=$1 and id=$2::uuid
+            limit 1`,
+          [owner, s]
+        );
+        name = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
+        return { active_job_id: id, active_job_name: name, source };
+      }
+
+      // Current schema: numeric job_no
+      if (/^\d+$/.test(s)) {
+        const j = await query(
+          `select coalesce(name, job_name) as job_name
+             from public.jobs
+            where owner_id=$1 and job_no=$2::int
+            limit 1`,
+          [owner, Number(s)]
+        );
+        name = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
+        return { active_job_id: id, active_job_name: name, source };
+      }
+    } catch {
+      // ignore
     }
 
-    // numeric job_no
-    if (!activeName && /^\d+$/.test(s)) {
-      const j = await query(
-        `SELECT COALESCE(name, job_name) AS job_name
-           FROM public.jobs
-          WHERE owner_id=$1 AND job_no=$2::int
-          LIMIT 1`,
-        [String(ownerId), Number(s)]
-      );
-      activeName = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
-    }
+    return { active_job_id: id, active_job_name: null, source };
   }
-
-  return {
-    active_job_id: activeId ?? null,
-    active_job_name: activeName ?? null
-  };
-
 
   // 1) users
   if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
@@ -1395,34 +1381,57 @@ async function getActiveJobForIdentity(ownerId, userId) {
         `select ${cols.join(', ')} from public.users where owner_id=$1 and user_id=$2 limit 1`,
         [owner, userId]
       );
+
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
         const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'users');
-        if (out) return out;
+        if (out?.active_job_id != null || out?.active_job_name) return out;
       }
     } catch (e) {
       console.warn('[PG/activeJob] users read failed (ignored):', e?.message);
     }
   }
 
-  // 2) memberships
-  if (caps.has_memberships && (caps.memberships_has_active_job_id || caps.memberships_has_active_job_name)) {
+  // 2) memberships (self-disabling)
+  if (
+    _MEMBERSHIPS_OK !== false &&
+    caps.has_memberships &&
+    (caps.memberships_has_active_job_id || caps.memberships_has_active_job_name)
+  ) {
     try {
-      const cols = [];
-      if (caps.memberships_has_active_job_id) cols.push('active_job_id');
-      if (caps.memberships_has_active_job_name) cols.push('active_job_name');
+      const membershipsExists = await hasTable('memberships').catch(() => false);
+      if (!membershipsExists) {
+        _MEMBERSHIPS_OK = false; // permanently stop trying
+      } else {
+        _MEMBERSHIPS_OK = true;
 
-      const r = await query(
-        `select ${cols.join(', ')} from public.memberships where owner_id=$1 and user_id=$2 limit 1`,
-        [owner, userId]
-      );
-      const row = r?.rows?.[0];
-      if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'memberships');
-        if (out) return out;
+        const cols = [];
+        if (caps.memberships_has_active_job_id) cols.push('active_job_id');
+        if (caps.memberships_has_active_job_name) cols.push('active_job_name');
+
+        if (cols.length) {
+          const r = await query(
+            `select ${cols.join(', ')} from public.memberships where owner_id=$1 and user_id=$2 limit 1`,
+            [owner, userId]
+          );
+
+          const row = r?.rows?.[0];
+          if (row && (row.active_job_id != null || row.active_job_name != null)) {
+            const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'memberships');
+            if (out?.active_job_id != null || out?.active_job_name) return out;
+          }
+        }
       }
     } catch (e) {
-      console.warn('[PG/activeJob] memberships read failed (ignored):', e?.message);
+      const msg = String(e?.message || '').toLowerCase();
+      const code = String(e?.code || '');
+
+      if (code === '42P01' || (msg.includes('memberships') && msg.includes('does not exist'))) {
+        _MEMBERSHIPS_OK = false; // permanently stop trying
+        // swallow
+      } else {
+        console.warn('[PG/activeJob] memberships read failed (ignored):', e?.message);
+      }
     }
   }
 
@@ -1437,38 +1446,36 @@ async function getActiveJobForIdentity(ownerId, userId) {
         `select ${cols.join(', ')} from public.user_profiles where owner_id=$1 and user_id=$2 limit 1`,
         [owner, userId]
       );
+
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
         const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_profiles');
-        if (out) return out;
+        if (out?.active_job_id != null || out?.active_job_name) return out;
       }
     } catch (e) {
       console.warn('[PG/activeJob] user_profiles read failed (ignored):', e?.message);
     }
   }
 
-  // 4) user_active_job (schema-aware join)
+  // 4) user_active_job (FORCE job_no mode for your current schema)
   if (caps.has_user_active_job) {
     try {
-      const mode = await userActiveJobJoinMode();
-      const sql =
-        mode === 'uuid'
-          ? `select j.id as active_job_id, coalesce(j.name, j.job_name) as active_job_name
-               from public.user_active_job u
-               join public.jobs j on j.owner_id=u.owner_id and j.id=u.job_id
-              where u.owner_id=$1 and u.user_id=$2
-              limit 1`
-          : `select j.id as active_job_id, coalesce(j.name, j.job_name) as active_job_name
-               from public.user_active_job u
-               join public.jobs j on j.owner_id=u.owner_id and j.job_no = u.job_id
-              where u.owner_id=$1 and u.user_id=$2
-              limit 1`;
+      const r = await query(
+        `select u.job_id as active_job_id,
+                coalesce(j.name, j.job_name) as active_job_name
+           from public.user_active_job u
+           join public.jobs j
+             on j.owner_id=u.owner_id
+            and j.job_no = u.job_id
+          where u.owner_id=$1 and u.user_id=$2
+          limit 1`,
+        [owner, String(userId)]
+      );
 
-      const r = await query(sql, [owner, String(userId)]);
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
         const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
-        if (out) return out;
+        if (out?.active_job_id != null || out?.active_job_name) return out;
       }
     } catch (e) {
       console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
@@ -1477,6 +1484,7 @@ async function getActiveJobForIdentity(ownerId, userId) {
 
   return null;
 }
+
 
 /* -------------------- OTP / Users / Tasks / Exports / Pending Actions -------------------- */
 // ---------- OTP ----------

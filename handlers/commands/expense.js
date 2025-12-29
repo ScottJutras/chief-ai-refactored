@@ -306,8 +306,8 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
   }
 
   return twimlText(
-    `Please confirm this Expense:\n${summaryLine}\n\nReply yes/edit/cancel.\nTip: reply "change job" to pick a different job.`
-  );
+  `✅ Confirm expense\n${summaryLine}\n\nReply: yes / edit / cancel / change job`
+);
 }
 
 /* ---------------- helpers ---------------- */
@@ -400,6 +400,49 @@ function stripEmbeddedDateAndJobFromItem(item, { date, jobName } = {}) {
   s = s.replace(/\s+/g, ' ').trim();
   return s || 'Unknown';
 }
+function inferExpenseItemFallback(text = '') {
+  const s = String(text || '').trim();
+  if (!s) return null;
+
+  // Common: "purchased $383 of lumber today at Convoy Supply"
+  // Capture after "of" up to a stop word.
+  const m1 = s.match(/\bof\s+([^.,;]+?)(?:\s+\b(today|yesterday|on|at|from|for)\b|[.,;]|$)/i);
+  if (m1 && m1[1]) return String(m1[1]).trim();
+
+  // Another common: "spent $50 on nails"
+  const m2 = s.match(/\bon\s+([^.,;]+?)(?:\s+\b(today|yesterday|on|at|from|for)\b|[.,;]|$)/i);
+  if (m2 && m2[1]) return String(m2[1]).trim();
+
+  // Another: "$50 nails at Home Depot"
+  const m3 = s.match(/\$\s*\d[\d,]*(?:\.\d{1,2})?\s+([^.,;]+?)(?:\s+\b(at|from|for|today|yesterday|on)\b|[.,;]|$)/i);
+  if (m3 && m3[1]) return String(m3[1]).trim();
+
+  return null;
+}
+async function consumePendingMediaMeta(state, from) {
+  try {
+    const pending = await state.getPendingTransactionState(from);
+    const m = pending?.pendingMediaMeta || null;
+    if (!m) return null;
+
+    // OPTIONAL: clear after consuming so it doesn't leak into next txn
+    // If you prefer "merge" only, set to null fields.
+    if (typeof state.mergePendingTransactionState === 'function') {
+      await state.mergePendingTransactionState(from, { pendingMediaMeta: null });
+    }
+
+    return {
+      media_url: m.url || null,
+      media_type: m.type || null,
+      media_transcript: m.transcript || null,
+      media_confidence: m.confidence ?? null,
+      source_msg_id: m.source_msg_id || null
+    };
+  } catch {
+    return null;
+  }
+}
+
 
 /**
  * ✅ Prevent jobName becoming a copy of the description:
@@ -419,21 +462,38 @@ function sanitizeJobNameCandidate(candidate) {
   return s;
 }
 
-function buildExpenseSummaryLine({ amount, item, store, date, jobName }) {
+function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz }) {
   const amt = String(amount || '').trim();
   const it = cleanExpenseItemForDisplay(item);
   const st = String(store || '').trim() || 'Unknown Store';
-  const dt = String(date || '').trim();
+  const dt = formatDisplayDate(date, tz);
   const jb = jobName ? String(jobName).trim() : '';
 
-  const itLower = it.toLowerCase();
-  const parts = [];
-  parts.push(`Expense: ${amt} for ${it}`);
-  if (st && st !== 'Unknown Store' && !itLower.includes(`from ${st.toLowerCase()}`)) parts.push(`from ${st}`);
-  if (dt && !itLower.includes(dt.toLowerCase())) parts.push(`on ${dt}`);
-  if (jb && !itLower.includes(jb.toLowerCase())) parts.push(`for ${jb}`);
-  return parts.join(' ') + '.';
+  const lines = [];
+  lines.push(`💸 ${amt} — ${it}`);
+  if (st && st !== 'Unknown Store') lines.push(`🏪 ${st}`);
+  if (dt) lines.push(`📅 ${dt}`);
+  if (jb) lines.push(`🧰 ${jb}`);
+
+  return lines.join('\n');
 }
+
+function formatDisplayDate(isoDate, tz = 'America/Toronto') {
+  const s = String(isoDate || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return s || '';
+  try {
+    const d = new Date(`${s}T12:00:00Z`);
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric'
+    }).format(d);
+  } catch {
+    return s;
+  }
+}
+
 
 /* ---------------- category heuristics ---------------- */
 
@@ -446,20 +506,38 @@ function vendorDefaultCategory(store) {
   return null;
 }
 
-function inferExpenseCategoryHeuristic(data) {
-  const memo = `${data?.item || ''} ${data?.store || ''}`.toLowerCase();
-  if (
-    /\b(materials?|siding|vinyl\s*siding|soffit|fascia|gutter|eavestrough|shingle|shingles|drywall|plywood|lumber|osb|wrap|tyvek|flashing|nails|screws|concrete|rebar|insulation|caulk|adhesive)\b/.test(
-      memo
-    )
-  )
-    return 'Materials';
-  if (/\b(gas|diesel|fuel|petro|esso|shell)\b/.test(memo)) return 'Fuel';
-  if (/\b(tool|saw|drill|blade|bit|ladder|hammer)\b/.test(memo)) return 'Tools';
-  if (/\b(subcontract|sub-contractor|subcontractor)\b/.test(memo)) return 'Subcontractors';
-  if (/\b(office|paper|printer|ink|stationery)\b/.test(memo)) return 'Office Supplies';
+function inferExpenseItemFallback(text) {
+  const t = String(text || '').toLowerCase();
+
+  // Most common trade materials
+  const rules = [
+    { re: /\blumber\b|\b2x4\b|\b2x6\b|\bplywood\b|\bosb\b|\bstud(s)?\b/, item: 'Lumber' },
+    { re: /\bshingle(s)?\b|\broofing\b|\bunderlayment\b|\bice\s*&?\s*water\b/, item: 'Roofing materials' },
+    { re: /\bnail(s)?\b|\bscrew(s)?\b|\bfastener(s)?\b|\bdeck\s*screw(s)?\b/, item: 'Fasteners' },
+    { re: /\bcaulk\b|\bsealant\b|\badhesive\b|\bglue\b/, item: 'Sealants/adhesives' },
+    { re: /\bconcrete\b|\bmortar\b|\bgrout\b|\bquikrete\b/, item: 'Concrete' },
+    { re: /\binsulation\b|\bfoam\b|\bvapou?r\s*barrier\b/, item: 'Insulation' },
+    { re: /\bpaint\b|\bprimer\b|\bstain\b/, item: 'Paint' },
+    { re: /\btool(s)?\b|\bblade(s)?\b|\bbit(s)?\b|\bsaw\b/, item: 'Tools/supplies' },
+  ];
+
+  for (const r of rules) {
+    if (r.re.test(t)) return r.item;
+  }
+
+  // Pattern: "$123 of X"
+  const m = t.match(/\bof\s+([a-z0-9][a-z0-9\s\-]{2,40})\b/);
+  if (m?.[1]) {
+    const guess = m[1].trim();
+    if (!guess.includes('unknown') && !guess.includes('stuff')) {
+      // title-case-ish
+      return guess.replace(/\s+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+    }
+  }
+
   return null;
 }
+
 
 function formatMoneyDisplay(n) {
   try {
@@ -471,7 +549,7 @@ function formatMoneyDisplay(n) {
 }
 
 function normalizeExpenseData(data, userProfile) {
-  const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
+  const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
   const d = { ...(data || {}) };
 
   if (d.amount != null) {
@@ -727,58 +805,87 @@ function normalizeJobOptions(jobRows) {
  * - "3" numeric
  * - job name
  */
-function resolveJobOptionFromReply(input, jobOptions) {
+function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 } = {}) {
   const raw = normalizeJobAnswer(input);
   const t = String(raw || '').trim();
   if (!t) return null;
 
-  if (looksLikeOverhead(t)) return { kind: 'overhead' };
-  if (t.toLowerCase() === 'more') return { kind: 'more' };
-
-  // interactive form: job_<n>_<uuid> OR job_<n>_<hashFallback>
-  const m = t.match(/^job_(\d+)_([0-9a-f-]{36}|[0-9a-f]{6,})$/i);
-  if (m) {
-    const idx = Number(m[1]);
-    const tail = String(m[2] || '').trim();
-
-    // If it's a UUID, trust it
-    if (looksLikeUuid(tail)) {
-      // Try to find matching option by id (preferred)
-      const optById = (jobOptions || []).find((j) => j?.id && String(j.id).toLowerCase() === tail.toLowerCase()) || null;
-      if (optById) return { kind: 'job', job: optById };
-
-      // Otherwise fall back to numeric index
-      const optByIdx = (jobOptions || [])[idx - 1] || null;
-      if (optByIdx) return { kind: 'job', job: { ...optByIdx, id: tail } };
-
-      // Last resort: job with id only
-      return { kind: 'job', job: { id: tail, job_no: null, name: null } };
-    }
-
-    // hash fallback: map numeric index
-    if (/^\d+$/.test(String(idx))) {
-      const opt = (jobOptions || [])[idx - 1] || null;
-      if (opt) return { kind: 'job', job: opt };
-    }
-    return null;
-  }
-
-  if (/^\d+$/.test(t)) {
-    const idx = Number(t);
-    const opt = (jobOptions || [])[idx - 1] || null;
-    if (opt) return { kind: 'job', job: opt };
-    return null;
-  }
-
   const lc = t.toLowerCase();
+
+  // --- special tokens ---
+  if (looksLikeOverhead(t)) return { kind: 'overhead' };
+  if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return { kind: 'more' };
+
+  const p = Math.max(0, Number(page || 0));
+  const ps = Math.min(8, Math.max(1, Number(pageSize || 8)));
+
+  // --- interactive id: jobno_<job_no> ---
+  const mJobNo = t.match(/^jobno_(\d{1,10})$/i);
+  if (mJobNo?.[1]) {
+    const jobNo = Number(mJobNo[1]);
+    if (!Number.isFinite(jobNo)) return null;
+
+    const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
+    if (!opt) return null;
+
+    return {
+      kind: 'job',
+      job: {
+        job_no: Number(opt.job_no),
+        name: String(opt.name || opt.job_name || '').trim() || null
+      }
+    };
+  }
+
+  // --- numeric reply: maps to CURRENT PAGE (1..N on that page) ---
+  if (/^\d+$/.test(t)) {
+    const n = Number(t);
+    if (!Number.isFinite(n) || n <= 0) return null;
+
+    const start = p * ps;
+    const idx = start + (n - 1);
+
+    const opt = (jobOptions || [])[idx] || null;
+    if (!opt) return null;
+
+    const jobNo = opt?.job_no != null ? Number(opt.job_no) : null;
+    if (jobNo == null || !Number.isFinite(jobNo)) return null;
+
+    return {
+      kind: 'job',
+      job: {
+        job_no: jobNo,
+        name: String(opt.name || opt.job_name || '').trim() || null
+      }
+    };
+  }
+
+  // --- typed name lookup (exact or prefix) ---
   const opt =
-    (jobOptions || []).find((j) => String(j.name || '').toLowerCase() === lc) ||
-    (jobOptions || []).find((j) => String(j.name || '').toLowerCase().startsWith(lc.slice(0, 24))) ||
+    (jobOptions || []).find((j) => String(j?.name || j?.job_name || '').trim().toLowerCase() === lc) ||
+    (jobOptions || []).find((j) =>
+      String(j?.name || j?.job_name || '').trim().toLowerCase().startsWith(lc.slice(0, 24))
+    ) ||
     null;
 
-  if (opt) return { kind: 'job', job: opt };
-  return { kind: 'job', job: { id: null, job_no: null, name: t } };
+  if (opt) {
+    const jobNo = opt?.job_no != null ? Number(opt.job_no) : null;
+    if (jobNo == null || !Number.isFinite(jobNo)) return null;
+
+    return {
+      kind: 'job',
+      job: {
+        job_no: jobNo,
+        name: String(opt.name || opt.job_name || '').trim() || null
+      }
+    };
+  }
+
+  // job_no-only mode: if it doesn't match, reprompt
+  return null;
 }
+
+
 
 const ENABLE_INTERACTIVE_LIST = (() => {
   const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? process.env.TWILIO_ENABLE_LIST_PICKER ?? 'true';
@@ -822,15 +929,28 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
 
 
 function buildTextJobPrompt(jobOptions, page, pageSize) {
-  const start = page * pageSize;
-  const slice = (jobOptions || []).slice(start, start + pageSize);
-  const lines = slice.map((j, i) => `${start + i + 1}) ${j?.name || 'Untitled Job'}`);
-  const hasMore = start + pageSize < (jobOptions || []).length;
+  const p = Math.max(0, Number(page || 0));
+  const ps = Math.min(8, Math.max(1, Number(pageSize || 8)));
+
+  const start = p * ps;
+  const slice = (jobOptions || []).slice(start, start + ps);
+
+  // IMPORTANT: numbers displayed are 1..N *for this page*
+  const lines = slice.map((j, i) => {
+    const name = String(j?.name || j?.job_name || 'Untitled Job').trim();
+    const jobNo = j?.job_no != null ? Number(j.job_no) : null;
+    const prefix = jobNo != null && Number.isFinite(jobNo) ? `#${jobNo} ` : '';
+    return `${i + 1}) ${prefix}${name}`;
+  });
+
+  const hasMore = start + ps < (jobOptions || []).length;
   const more = hasMore ? `\nReply "more" for more jobs.` : '';
+
   return `Which job is this expense for?\n\n${lines.join(
     '\n'
   )}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
 }
+
 
 /**
  * ✅ If the list-picker UI fails to show, the user still sees job names right in the message.
@@ -844,63 +964,81 @@ function buildBodyTextWithNames(jobOptions, start, count) {
 
 async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
   const to = waTo(from);
-  const JOBS_PER_PAGE = Math.min(Number(pageSize || 8), 8);
-  const start = page * JOBS_PER_PAGE;
-  const slice = (jobOptions || []).slice(start, start + JOBS_PER_PAGE);
-  const hasMore = start + JOBS_PER_PAGE < (jobOptions || []).length;
+  const JOBS_PER_PAGE = Math.min(8, Math.max(1, Number(pageSize || 8)));
+  const p = Math.max(0, Number(page || 0));
+  const start = p * JOBS_PER_PAGE;
 
-  // ✅ Store the exact jobOptions list so "1" can map to the correct UUID later.
+  // job_no-only: only include jobs with a usable job_no
+  const clean = (jobOptions || []).filter((j) => {
+    const n = j?.job_no != null ? Number(j.job_no) : null;
+    return n != null && Number.isFinite(n);
+  });
+
+  const slice = clean.slice(start, start + JOBS_PER_PAGE);
+  const hasMore = start + JOBS_PER_PAGE < clean.length;
+
+  // ✅ Persist picker context so replies resolve correctly
   await upsertPA({
     ownerId,
     userId: from,
     kind: PA_KIND_PICK_JOB,
-    payload: { jobOptions, page, pageSize: JOBS_PER_PAGE, hasMore, shownAt: Date.now() },
+    payload: {
+      jobOptions: clean,          // IMPORTANT: store filtered list
+      page: p,
+      pageSize: JOBS_PER_PAGE,
+      hasMore,
+      shownAt: Date.now()
+    },
     ttlSeconds: 600
   });
 
+  // Text fallback
   if (!ENABLE_INTERACTIVE_LIST || !to) {
-    return twimlText(buildTextJobPrompt(jobOptions, page, JOBS_PER_PAGE));
+    return twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE));
   }
 
   const rows = [];
   for (let i = 0; i < slice.length; i++) {
-    const absIdx = start + i + 1;
-    const full = slice[i]?.name || 'Untitled Job';
-    const jobId = slice[i]?.id ? String(slice[i].id).trim() : null;
-
-    // ✅ Critical: embed UUID in row id when available so webhook can return it
-    const rowTail = jobId && looksLikeUuid(jobId) ? jobId : stableHash(full);
-    const rowId = `job_${absIdx}_${rowTail}`;
+    const full = String(slice[i]?.name || slice[i]?.job_name || 'Untitled Job').trim();
+    const jobNo = Number(slice[i].job_no);
 
     rows.push({
-      id: rowId,
-      title: String(full).slice(0, 24),
-      description: (slice[i]?.job_no != null ? `#${slice[i].job_no} ` : '') + String(full).slice(0, 72)
+      id: `jobno_${jobNo}`,
+      title: full.slice(0, 24),
+      description: `#${jobNo} ${full.slice(0, 72)}`
     });
   }
 
   rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
-  if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: `Show jobs ${start + JOBS_PER_PAGE + 1}+` });
+  if (hasMore) {
+    rows.push({
+      id: 'more',
+      title: 'More jobs…',
+      description: `Show next page`
+    });
+  }
 
   const bodyText =
-    `Here are your active jobs (${start + 1}-${Math.min(start + JOBS_PER_PAGE, jobOptions.length)} of ${
-      jobOptions.length
-    }).\nPick one to assign this expense.\n\nTip: You can reply with a number too (like "1").` +
-    buildBodyTextWithNames(jobOptions, start, Math.min(JOBS_PER_PAGE, 8));
+    `Pick a job (${start + 1}-${Math.min(start + JOBS_PER_PAGE, clean.length)} of ${clean.length}).` +
+    `\n\nTip: You can also reply with a number (like "1").`;
 
   try {
-    await sendWhatsAppInteractiveList({
+    const r = await sendWhatsAppInteractiveList({
       to,
       bodyText,
       buttonText: 'Pick a job',
       sections: [{ title: 'Active Jobs', rows }]
     });
+
+    console.info('[JOB_PICKER] interactive sent', { to, ok: true, sid: r?.sid || null });
     return twimlEmpty();
   } catch (e) {
-    console.warn('[EXPENSE] interactive list failed; falling back:', e?.message);
-    return twimlText(buildTextJobPrompt(jobOptions, page, JOBS_PER_PAGE));
+    console.warn('[JOB_PICKER] interactive list failed; falling back:', e?.message);
+    return twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE));
   }
 }
+
+
 
 /* ---------------- Active job resolution (aligned + self-disabling) ---------------- */
 
@@ -1028,7 +1166,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
       }
 
-      const resolved = resolveJobOptionFromReply(input, jobOptions);
+      const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize });
       if (!resolved) return twimlText('Please reply with a number, job name, "Overhead", or "more".');
 
       const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
@@ -1041,18 +1179,24 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         confirm.payload.draft.jobName = 'Overhead';
         confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
         confirm.payload.draft.job_id = null;
-      } else if (resolved.kind === 'job') {
-        const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
-        const jobId = resolved.job?.id ? String(resolved.job.id).trim() : null;
+     } else if (resolved.kind === 'job') {
+  const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
+  const jobNo =
+    resolved.job?.job_no != null && Number.isFinite(Number(resolved.job.job_no))
+      ? Number(resolved.job.job_no)
+      : null;
 
-        // ✅ Only keep UUIDs as job_id
-        confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
-        confirm.payload.draft.job = {
-          id: jobId && looksLikeUuid(jobId) ? jobId : null,
-          job_no: resolved.job?.job_no != null ? Number(resolved.job.job_no) : null,
-          name: jobName || null
-        };
-        confirm.payload.draft.job_id = jobId && looksLikeUuid(jobId) ? jobId : null;
+  confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
+
+  confirm.payload.draft.job = {
+    id: null,
+    job_no: jobNo,
+    name: jobName || null
+  };
+
+  // job_no-only: never set tx.job_id from the picker
+  confirm.payload.draft.job_id = null;
+
       } else if (resolved.kind === 'more') {
         return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
       } else {
@@ -1067,13 +1211,15 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         item: confirm.payload.draft.item,
         store: confirm.payload.draft.store,
         date: confirm.payload.draft.date,
-        jobName: confirm.payload.draft.jobName
+        jobName: confirm.payload.draft.jobName,
+        tz
       });
       return await sendConfirmExpenseOrFallback(from, s);
     }
 
     // ---- 2) Confirm/edit/cancel ----
 const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
 if (confirmPA?.payload?.draft) {
   if (!isOwner) {
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
@@ -1081,73 +1227,112 @@ if (confirmPA?.payload?.draft) {
   }
 
   const token = normalizeDecisionToken(input);
-  const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId).trim();
+  const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId || '').trim() || null;
 
   if (token === 'change_job') {
     const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
     if (!jobs.length) return twimlText('No jobs found. Reply "Overhead" or create a job first.');
+    // IMPORTANT: this will return twimlEmpty() if interactive list was sent successfully
     return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
   }
 
   if (token === 'edit') {
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
     return twimlText(
-      '✏️ Okay — resend the expense in one line (e.g., "expense $84.12 nails from Home Depot today for <job>").'
-    );
+  `✏️ Edit expense\nResend it in one line like:\nexpense $84.12 nails from Home Depot "date/today" for <job>`
+);
+
   }
 
   if (token === 'cancel') {
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    // Also clear the picker PA (prevents “cancel didn’t work” feel)
+    try {
+      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+    } catch {}
     return twimlText('❌ Operation cancelled.');
   }
 
   if (token === 'yes') {
-    // NOTE: work on a shallow copy so we can safely mutate guard fields without corrupting confirmPA reference
+    // Work on a copy so we can mutate safely
     const rawDraft = { ...(confirmPA.payload.draft || {}) };
 
-    // 🔒 HARD GUARD: your jobs table uses integer ids ("1"), but transactions.job_id is UUID.
-    // If job.id/job_id is numeric, force it to null so we never attempt to insert "1" into uuid column.
-    const rawDraftJobId =
-      rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
+    // Pull *any* job id signal
+    const rawJobId =
+      rawDraft?.job_id ??
+      rawDraft?.jobId ??
+      rawDraft?.job?.id ??
+      rawDraft?.job?.job_id ??
+      null;
 
-    if (rawDraftJobId != null && /^\d+$/.test(String(rawDraftJobId).trim())) {
-      console.warn('[EXPENSE] refusing numeric job id; forcing null', { job_id: rawDraftJobId });
+    // 🔒 HARD GUARD: refuse numeric ids (your jobs.id is integer; tx.job_id is UUID)
+    if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
+      console.warn('[EXPENSE] refusing numeric job id; forcing null', { job_id: rawJobId });
       if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
       rawDraft.job_id = null;
       rawDraft.jobId = null;
     }
 
-    // ✅ Only keep UUID job_id
+    // ✅ Keep UUID only
     const maybeJobId =
-      rawDraftJobId != null && looksLikeUuid(String(rawDraftJobId)) ? String(rawDraftJobId) : null;
+      rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
 
     // Normalize expense payload
     let data = normalizeExpenseData(rawDraft, userProfile);
+
+    // Fallback item inference ("$383 of lumber ...")
+    if (!data.item || !String(data.item).trim() || String(data.item).trim().toLowerCase() === 'unknown') {
+      const src =
+        rawDraft?.draftText ||
+        rawDraft?.originalText ||
+        rawDraft?.text ||
+        rawDraft?.media_transcript ||
+        rawDraft?.mediaTranscript ||
+        '';
+      const inferred = inferExpenseItemFallback(src);
+      if (inferred) data.item = inferred;
+    }
+
     data.store = await normalizeVendorName(ownerId, data.store);
 
     const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
     const pickedJobName =
-      rawDraft.jobName && String(rawDraft.jobName).trim() ? String(rawDraft.jobName).trim() : null;
+  rawDraft.jobName && String(rawDraft.jobName).trim() ? String(rawDraft.jobName).trim() : null;
 
-    const jobName =
-      pickedJobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+let jobName = pickedJobName || null;
+let jobSource = jobName ? 'typed' : null;
 
+if (!jobName) {
+  jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+  if (jobName) jobSource = 'active';
+}
+
+if (jobName && looksLikeOverhead(jobName)) {
+  jobName = 'Overhead';
+  jobSource = 'overhead';
+}
+
+
+    // If still no jobName, ask them to pick one
     if (!jobName) {
       const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
 
-      // Re-save confirm draft (but NEVER store numeric job_id)
       await upsertPA({
         ownerId,
         userId: from,
         kind: PA_KIND_CONFIRM,
         payload: {
           ...confirmPA.payload,
+          // Keep the draft in PA, but never store numeric job_id
           draft: {
-            ...data,
-            suggestedCategory: category,
-            job_id: maybeJobId // UUID or null only
-          },
+  ...data,
+  jobName,
+  jobSource,
+  suggestedCategory: category,
+  job_id: maybeJobId || null
+},
+
           sourceMsgId: stableMsgId
         },
         ttlSeconds: 600
@@ -1156,6 +1341,7 @@ if (confirmPA?.payload?.draft) {
       return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
     }
 
+    // Ensure item doesn’t include embedded job/date
     data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 
     const gate = assertExpenseCILOrClarify({
@@ -1185,8 +1371,10 @@ if (confirmPA?.payload?.draft) {
           job: jobName,
           job_name: jobName,
 
-          // ✅ KEY: UUID only, otherwise null
-          job_id: maybeJobId || null,
+          // ✅ UUID only, otherwise null
+          job_id: null,
+          job_no: rawDraft?.job?.job_no != null ? Number(rawDraft.job.job_no) : null,
+
 
           category: category ? String(category).trim() : null,
           user_name: userProfile?.name || 'Unknown User',
@@ -1206,152 +1394,220 @@ if (confirmPA?.payload?.draft) {
         payload: {
           ...confirmPA.payload,
           draft: {
-            ...data,
-            jobName,
-            suggestedCategory: category,
-            job_id: maybeJobId || null
-          },
+  ...data,
+  jobName,
+  jobSource,
+  suggestedCategory: category,
+  job_id: maybeJobId || null
+},
+
           sourceMsgId: stableMsgId
         },
         ttlSeconds: 600
       });
+
       return twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.');
     }
+const activeHint =
+  jobSource === 'active'
+    ? `\n\n🧠 Using active job: ${jobName}\nTip: reply "change job" to pick another`
+    : '';
 
     const summaryLine = buildExpenseSummaryLine({
       amount: data.amount,
       item: data.item,
       store: data.store,
       date: data.date || todayInTimeZone(tz),
-      jobName
+      jobName,
+      tz
     });
 
-    const reply =
-      writeResult?.inserted === false
-        ? '✅ Already logged that expense (duplicate message).'
-        : `✅ Expense logged: ${summaryLine}${category ? ` (Category: ${category})` : ''}`;
+   const reply =
+  writeResult?.inserted === false
+    ? `✅ Already logged (duplicate message).`
+    : `✅ Logged expense\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${activeHint}`;
+
+
 
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    // Cleanup picker too
+    try {
+      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+    } catch {}
+
     return twimlText(reply);
   }
 
-  return twimlText('⚠️ Please choose Yes, Edit, or Cancel.\nTip: reply "change job" to pick a different job.');
+  return twimlText('⚠️ Please choose Yes, Edit, Cancel, or Change Job.\nTip: reply "change job" to pick a different job.');
 }
 
     // ---- 3) New expense parse (deterministic first) ----
-    const backstop = deterministicExpenseParse(input, userProfile);
-    if (backstop && backstop.amount) {
-      const data0 = normalizeExpenseData(backstop, userProfile);
-      data0.store = await normalizeVendorName(ownerId, data0.store);
+const backstop = deterministicExpenseParse(input, userProfile);
+if (backstop && backstop.amount) {
+  const data0 = normalizeExpenseData(backstop, userProfile);
+  data0.store = await normalizeVendorName(ownerId, data0.store);
 
-      const category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
+  let category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
+  if (category && String(category).trim()) category = String(category).trim();
+  else category = null;
 
-      const jobName = data0.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-      if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
+  // Job resolution + source
+  let jobName = data0.jobName || null;
+  let jobSource = jobName ? 'typed' : 'unknown';
 
-      await upsertPA({
-        ownerId,
-        userId: from,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          draft: {
-            ...data0,
-            jobName,
-            suggestedCategory: category,
-            job: jobName ? { id: null, job_no: null, name: jobName } : null,
-            job_id: null
-          },
-          sourceMsgId: safeMsgId,
-          type: 'expense'
-        },
-        ttlSeconds: 600
-      });
+  if (!jobName) {
+    jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+    if (jobName) jobSource = 'active';
+  }
 
-      if (!jobName) {
-        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-      }
+  if (jobName && looksLikeOverhead(jobName)) {
+    jobName = 'Overhead';
+    jobSource = 'overhead';
+  }
 
-      const summaryLine = buildExpenseSummaryLine({
-        amount: data0.amount,
-        item: data0.item,
-        store: data0.store,
-        date: data0.date,
-        jobName
-      });
+  // ✅ Strip embedded date/job from item once jobName is known
+  if (jobName) {
+    data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
+  }
 
-      return await sendConfirmExpenseOrFallback(from, summaryLine);
-    }
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      draft: {
+        ...data0,
+        jobName,
+        jobSource,
+        suggestedCategory: category,
+        job: jobName ? { id: null, job_no: null, name: jobName } : null,
+        job_id: null
+      },
+      sourceMsgId: safeMsgId,
+      type: 'expense'
+    },
+    ttlSeconds: 600
+  });
 
-    // ---- 4) AI parsing fallback ----
-    const defaultData = {
-      date: todayInTimeZone(tz),
-      item: 'Unknown',
-      amount: '$0.00',
-      store: 'Unknown Store'
-    };
+  if (!jobName) {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+  }
 
-    const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData, { tz });
+  const activeHint =
+    jobSource === 'active'
+      ? `\n\n🧠 Using active job: ${jobName}\nTip: reply "change job" to pick another`
+      : '';
 
-    let data = aiRes?.data || null;
-    let aiReply = aiRes?.reply || null;
+  const summaryLine = buildExpenseSummaryLine({
+    amount: data0.amount,
+    item: data0.item,
+    store: data0.store,
+    date: data0.date,
+    jobName,
+    tz
+  });
 
-    if (data) data = normalizeExpenseData(data, userProfile);
-    if (data?.jobName) data.jobName = sanitizeJobNameCandidate(data.jobName);
+  return await sendConfirmExpenseOrFallback(from, `${summaryLine}${activeHint}`);
+}
 
-    const missingCore =
-      !data ||
-      !data.amount ||
-      data.amount === '$0.00' ||
-      !data.item ||
-      data.item === 'Unknown' ||
-      !data.store ||
-      data.store === 'Unknown Store';
+// ---- 4) AI parsing fallback ----
+const defaultData = {
+  date: todayInTimeZone(tz),
+  item: 'Unknown',
+  amount: '$0.00',
+  store: 'Unknown Store'
+};
 
-    if (aiReply && missingCore) return twimlText(aiReply);
+const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData, { tz });
 
-    if (data && data.amount && data.amount !== '$0.00') {
-      data.store = await normalizeVendorName(ownerId, data.store);
-      const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+let data = aiRes?.data || null;
+let aiReply = aiRes?.reply || null;
 
-      const jobName = data.jobName || (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-      if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
+if (data) data = normalizeExpenseData(data, userProfile);
+if (data?.jobName) data.jobName = sanitizeJobNameCandidate(data.jobName);
 
-      await upsertPA({
-        ownerId,
-        userId: from,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          draft: {
-            ...data,
-            jobName,
-            suggestedCategory: category,
-            job: jobName ? { id: null, job_no: null, name: jobName } : null,
-            job_id: null
-          },
-          sourceMsgId: safeMsgId,
-          type: 'expense'
-        },
-        ttlSeconds: 600
-      });
+const missingCore =
+  !data ||
+  !data.amount ||
+  data.amount === '$0.00' ||
+  !data.item ||
+  data.item === 'Unknown' ||
+  !data.store ||
+  data.store === 'Unknown Store';
 
-      if (!jobName) {
-        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-      }
+if (aiReply && missingCore) return twimlText(aiReply);
 
-      const summaryLine = buildExpenseSummaryLine({
-        amount: data.amount,
-        item: data.item,
-        store: data.store,
-        date: data.date || todayInTimeZone(tz),
-        jobName
-      });
+if (data && data.amount && data.amount !== '$0.00') {
+  data.store = await normalizeVendorName(ownerId, data.store);
 
-      return await sendConfirmExpenseOrFallback(from, summaryLine);
-    }
+  let category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+  if (category && String(category).trim()) category = String(category).trim();
+  else category = null;
 
-    return twimlText(`🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`);
+  // Job resolution + source (same logic as deterministic path)
+  let jobName = data.jobName || null;
+  let jobSource = jobName ? 'typed' : 'unknown';
+
+  if (!jobName) {
+    jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+    if (jobName) jobSource = 'active';
+  }
+
+  if (jobName && looksLikeOverhead(jobName)) {
+    jobName = 'Overhead';
+    jobSource = 'overhead';
+  }
+
+  // ✅ Strip embedded date/job from item once jobName is known
+  if (jobName) {
+    data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
+  }
+
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      draft: {
+        ...data,
+        jobName,
+        jobSource,
+        suggestedCategory: category,
+
+        // expense schema: job_id stays null (UUID-only); job_no comes from picker later
+        job_id: null
+      },
+      sourceMsgId: safeMsgId,
+      type: 'expense'
+    },
+    ttlSeconds: 600
+  });
+
+  if (!jobName) {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+  }
+
+  const activeHint =
+    jobSource === 'active'
+      ? `\n\n🧠 Using active job: ${jobName}\nTip: reply "change job" to pick another`
+      : '';
+
+  const summaryLine = buildExpenseSummaryLine({
+    amount: data.amount,
+    item: data.item,
+    store: data.store,
+    date: data.date || todayInTimeZone(tz),
+    jobName,
+    tz
+  });
+
+  return await sendConfirmExpenseOrFallback(from, `${summaryLine}${activeHint}`);
+}
+
+return twimlText(`🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`);
+
   } catch (error) {
     console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
       code: error?.code,

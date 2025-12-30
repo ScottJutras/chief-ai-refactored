@@ -102,23 +102,26 @@ async function getPA({ ownerId, userId, kind }) {
   }
 }
 
-async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds }) {
+async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SEC }) {
   const owner = String(ownerId || '').trim();
   const user = String(userId || '').trim();
   const k = String(kind || '').trim();
   if (!owner || !user || !k) return;
 
+  console.info('[PA] upsert', {
+    ownerId: String(owner).replace(/\D/g, ''),
+    userId: String(user),
+    kind: k
+  });
+
   const ttl = Number(ttlSeconds || PA_TTL_SEC) || PA_TTL_SEC;
 
   if (pgUpsertPendingActionByKind) {
     try {
-      // supports both signatures:
-      // - upsertPendingActionByKind({ ownerId, userId, kind, payload, ttlSeconds })
-      // - upsertPendingAction({ ownerId, userId, kind, payload, ttlSeconds })
       await pgUpsertPendingActionByKind({ ownerId: owner, userId: user, kind: k, payload, ttlSeconds: ttl });
       return;
-    } catch {
-      // fall through
+    } catch (e) {
+      console.warn('[PA] upsertPendingActionByKind failed; falling back:', e?.message);
     }
   }
 
@@ -223,6 +226,16 @@ function getRevenueConfirmTemplateSid() {
   );
 }
 
+function toTemplateVar(str) {
+  return (
+    String(str || '')
+      .replace(/[\r\n\t]+/g, ' ')     // no newlines/tabs
+      .replace(/\s{2,}/g, ' ')        // collapse spaces
+      .trim()
+      .slice(0, 900) || '—'
+  );
+}
+
 async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const client = getTwilioClient();
   const { waFrom, messagingServiceSid } = getSendFromConfig();
@@ -235,7 +248,7 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const payload = {
     to: toClean,
     contentSid: templateSid,
-    contentVariables: JSON.stringify({ '1': String(summaryLine || '').slice(0, 900) })
+    contentVariables: JSON.stringify({ '1': toTemplateVar(summaryLine) })
   };
 
   if (waFrom) payload.from = waFrom;
@@ -249,6 +262,7 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
 
   return msg;
 }
+
 
 function buildActiveJobHint(jobName, jobSource) {
   if (jobSource !== 'active' || !jobName) return '';
@@ -646,10 +660,10 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
       buttonText: 'Pick a job',
       sections: [{ title: 'Active Jobs', rows }]
     });
-    return twimlEmpty();
+    return out(twimlEmpty(), true);
   } catch (e) {
-    console.warn('[REVENUE] interactive list failed; falling back:', e?.message);
-    return twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE));
+    console.warn('[JOB_PICKER] interactive list failed; falling back:', e?.message);
+    return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 }
 

@@ -101,10 +101,12 @@ function looksHardCommand(lc) {
   );
 }
 
+
 // Allowed while a pending expense/revenue exists (so we don't nudge-block them)
 function isAllowedWhilePending(lc) {
-  return /^(yes|y|confirm|edit|cancel|no|skip|stop|more|overhead|oh)\b/.test(lc);
+  return /^(yes|y|confirm|edit|cancel|no|skip|stop|more|overhead|oh|change job|switch job|pick job|change_job)\b/.test(lc);
 }
+
 
 // "global job picker intents" (typed commands)
 function isJobPickerIntent(lc) {
@@ -614,6 +616,66 @@ router.post('*', async (req, res, next) => {
     const text2 = String(getInboundText(req.body || {}) || '').trim();
     const lc2 = text2.toLowerCase();
     const isPickerToken = looksLikeJobPickerReplyToken(text2);
+            // ✅ Pending-actions router (must run early)
+    // Only use kind-aware / most-recent helper — DO NOT fall back to pg.getPendingAction (not kind-aware).
+    const pa =
+      typeof pg.getMostRecentPendingActionForUser === 'function'
+        ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
+        : null;
+
+    // Only intercept kinds we explicitly support here (ignore debug_test etc.)
+    const paKind = pa?.kind ? String(pa.kind).trim() : '';
+    const isExpensePA = paKind === 'confirm_expense' || paKind === 'pick_job_for_expense';
+    const isRevenuePA = paKind === 'confirm_revenue' || paKind === 'pick_job_for_revenue';
+
+    if (isExpensePA) {
+      try {
+        const { handleExpense } = require('../handlers/commands/expense');
+        const tw = await handleExpense(
+          req.from,
+          text2,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
+
+        if (!res.headersSent) {
+          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+          return ok(res); // empty
+        }
+        return;
+      } catch (e) {
+        console.warn('[WEBHOOK] expense PA router failed (ignored):', e?.message);
+      }
+    }
+
+    if (isRevenuePA) {
+      try {
+        const { handleRevenue } = require('../handlers/commands/revenue');
+        const tw = await handleRevenue(
+          req.from,
+          text2,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid
+        );
+
+        if (!res.headersSent) {
+          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+          return ok(res); // empty
+        }
+        return;
+      } catch (e) {
+        console.warn('[WEBHOOK] revenue PA router failed (ignored):', e?.message);
+      }
+    }
+
 
     /* -----------------------------------------------------------------------
      * (A0) ACTIVE JOB PICKER FLOW — Only if awaitingActiveJobPick OR explicit intent

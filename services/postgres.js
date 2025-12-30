@@ -68,6 +68,28 @@ pool.on('error', (err) => {
 // - "rls": new behavior if you introduced a new join path
 const userActiveJobJoinMode = String(env.USER_ACTIVE_JOB_JOIN_MODE || 'legacy').toLowerCase();
 
+async function getMostRecentPendingActionForUser({ ownerId, userId }) {
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  const user = String(userId || '').trim();
+  if (!owner || !user) return null;
+
+  const ttlMin = Number(process.env.PENDING_TTL_MIN || 10);
+
+  const r = await query(
+    `
+    SELECT kind, payload, created_at
+      FROM public.pending_actions
+     WHERE owner_id = $1
+       AND user_id = $2
+       AND created_at > now() - (($3::text || ' minutes')::interval)
+     ORDER BY created_at DESC
+     LIMIT 1
+    `,
+    [owner, user, String(ttlMin)]
+  );
+
+  return r?.rows?.[0] || null;
+}
 
 
 // ---------- Core query helpers ----------
@@ -1301,29 +1323,42 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
     }
   }
 
-  // 4) user_active_job (FORCE job_no mode)
+  // 4) user_active_job (supports either numeric job_no OR uuid job id)
 if (caps.has_user_active_job) {
   try {
-    let n = jobNo;
+    const r = await query(
+      `
+      select
+        u.job_id as active_job_id,
+        coalesce(j.name, j.job_name) as active_job_name
+      from public.user_active_job u
+      join public.jobs j
+        on j.owner_id = u.owner_id
+       and (
+            -- job_id stored as numeric job_no
+            (u.job_id::text ~ '^\\d+$' and j.job_no = (u.job_id::text)::int)
+            or
+            -- job_id stored as uuid job id
+            (u.job_id::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+             and j.id = (u.job_id::text)::uuid)
+          )
+      where u.owner_id = $1 and u.user_id = $2
+      limit 1
+      `,
+      [owner, String(userId)]
+    );
 
-    // If jobNo missing but we have name, resolve/create and use its job_no
-    if (n == null && name) n = (await ensureJobByName(owner, name))?.job_no ?? null;
-
-    if (n != null && Number.isFinite(Number(n))) {
-      await query(
-        `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
-         values ($1,$2,$3,now())
-         on conflict (owner_id,user_id) do update
-           set job_id=excluded.job_id, updated_at=now()`,
-        [owner, String(userId), Number(n)]
-      );
-      return true;
+    const row = r?.rows?.[0];
+    if (row && (row.active_job_id != null || row.active_job_name != null)) {
+      const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
+      if (out?.active_job_id != null || out?.active_job_name) return out;
     }
   } catch (e) {
-    console.warn('[PG/activeJob] user_active_job upsert failed (ignored):', e?.message);
+    console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
   }
 }
-  return false;
+
+  return null;
 }
 
 async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
@@ -2721,6 +2756,7 @@ module.exports = {
   deletePendingAction,
   getPendingActionByKind,
   deletePendingActionByKind,
+  getMostRecentPendingActionForUser,
 
 
   // kept helpers (if other files import them)

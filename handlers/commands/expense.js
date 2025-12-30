@@ -139,6 +139,12 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
   const k = String(kind || '').trim();
   if (!owner || !user || !k) return;
 
+  console.info('[PA] upsert', {
+    ownerId: String(owner).replace(/\D/g, ''),
+    userId: String(user),
+    kind: k
+  });
+
   const ttl = Number(ttlSeconds || PA_TTL_SEC) || PA_TTL_SEC;
 
   if (pgUpsertPendingActionByKind) {
@@ -149,7 +155,6 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
       console.warn('[PA] upsertPendingActionByKind failed; falling back:', e?.message);
     }
   }
-
   if (typeof query !== 'function') return;
 
   try {
@@ -277,6 +282,16 @@ function getExpenseConfirmTemplateSid() {
   );
 }
 
+function toTemplateVar(str) {
+  return (
+    String(str || '')
+      .replace(/[\r\n\t]+/g, ' ')     // no newlines/tabs
+      .replace(/\s{2,}/g, ' ')        // collapse spaces
+      .trim()
+      .slice(0, 900) || '—'
+  );
+}
+
 async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const client = getTwilioClient();
   const { waFrom, messagingServiceSid } = getSendFromConfig();
@@ -289,7 +304,7 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const payload = {
     to: toClean,
     contentSid: templateSid,
-    contentVariables: JSON.stringify({ '1': String(summaryLine || '').slice(0, 900) })
+    contentVariables: JSON.stringify({ '1': toTemplateVar(summaryLine) })
   };
 
   if (waFrom) payload.from = waFrom;
@@ -303,6 +318,7 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
 
   return msg;
 }
+
 
 function buildActiveJobHint(jobName, jobSource) {
   if (jobSource !== 'active' || !jobName) return '';
@@ -810,25 +826,19 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
   const client = getTwilioClient();
   const { waFrom, messagingServiceSid } = getSendFromConfig();
 
-  if (!to) throw new Error('Missing "to"');
+  const toClean = String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
 
   const payload = {
-    to: String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`,
+    to: toClean,
     ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
-    body: String(bodyText || '').slice(0, 1600),
-    persistentAction: [
-      `action=${JSON.stringify({
-        type: 'list',
-        body: { text: String(bodyText || '').slice(0, 1024) },
-        action: {
-          button: String(buttonText || 'Pick a job').slice(0, 20),
-          sections: Array.isArray(sections) ? sections : []
-        }
-      })}`
-    ]
+    interactive: {
+      type: 'list',
+      body: { text: String(bodyText || '').slice(0, 1024) },
+      action: { button: String(buttonText || 'Pick a job').slice(0, 20), sections }
+    }
   };
 
-  const TIMEOUT_MS = 3500;
+  const TIMEOUT_MS = 3000;
   const msg = await Promise.race([
     client.messages.create(payload),
     new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
@@ -836,6 +846,7 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections 
 
   return msg;
 }
+
 
 function buildTextJobPrompt(jobOptions, page, pageSize) {
   const p = Math.max(0, Number(page || 0));

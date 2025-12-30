@@ -63,6 +63,12 @@ pool.on('connect', async (client) => {
 pool.on('error', (err) => {
   console.error('[PG] idle client error:', err?.message);
 });
+// Active job resolution join mode
+// - "legacy": old behavior
+// - "rls": new behavior if you introduced a new join path
+const userActiveJobJoinMode = String(env.USER_ACTIVE_JOB_JOIN_MODE || 'legacy').toLowerCase();
+
+
 
 // ---------- Core query helpers ----------
 async function query(text, params) {

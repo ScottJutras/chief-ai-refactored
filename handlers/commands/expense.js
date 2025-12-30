@@ -16,6 +16,17 @@
 //   handleExpense(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId)
 
 const pg = require('../../services/postgres');
+// Twilio helpers (WhatsApp list + fallback text)
+const {
+  sendWhatsAppInteractiveList,
+  sendWhatsApp,
+  sendQuickReply,
+  sendTemplateMessage,
+  sendTemplateQuickReply,
+  toWhatsApp,
+  toTemplateVar
+} = require('../../services/twilio');
+
 const { query, insertTransaction } = pg;
 
 const getCategorySuggestion =

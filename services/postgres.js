@@ -1230,11 +1230,40 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
 
   const caps = await detectActiveJobCaps();
   const types = await detectActiveJobIdColumnTypes();
-  const resolved = await resolveJobIdAndName(owner, jobId, jobName);
 
-  const id = resolved.id || null;
+  // Resolve to a jobNo + name (jobNo-first)
+  const resolved = await resolveJobIdAndName(owner, jobId, jobName);
   const name = resolved.name || (jobName ? String(jobName).trim() : null);
-  const jobNo = resolved.jobNo ?? null;
+
+  // Prefer numeric job_no whenever possible
+  const jobNo =
+    resolved.jobNo != null && Number.isFinite(Number(resolved.jobNo)) ? Number(resolved.jobNo) :
+    (jobId != null && /^\d+$/.test(String(jobId).trim())) ? Number(jobId) :
+    null;
+
+  // Fallback: if we only have a name, attempt to lookup job_no by name (optional best-effort)
+  let finalJobNo = jobNo;
+  if (!Number.isFinite(finalJobNo) && name) {
+    try {
+      const r = await query(
+        `
+        select job_no
+          from public.jobs
+         where owner_id = $1
+           and lower(coalesce(name, job_name)) = lower($2)
+         order by job_no desc
+         limit 1
+        `,
+        [owner, String(name)]
+      );
+      const n = r?.rows?.[0]?.job_no;
+      if (n != null && Number.isFinite(Number(n))) finalJobNo = Number(n);
+    } catch {}
+  }
+
+  // If we still can't resolve a jobNo, fail soft: clear active job in user_active_job if present
+  // (but do not throw, keeps UX resilient)
+  const jobNoText = Number.isFinite(finalJobNo) ? String(finalJobNo) : null;
 
   // 1) users
   if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
@@ -1244,7 +1273,8 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       let i = 3;
 
       if (caps.users_has_active_job_id) {
-        const v = coerceActiveJobIdValue(types.users, { jobUuid: id, jobNo });
+        // ✅ coerce based on column type; supply jobNo (preferred) and (optional) uuid if needed
+        const v = coerceActiveJobIdValue(types.users, { jobUuid: null, jobNo: finalJobNo });
         sets.push(`active_job_id = $${i++}`);
         params.push(v);
       }
@@ -1256,7 +1286,9 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
 
       if (sets.length) {
         const r = await query(`update public.users set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
-        if (r?.rowCount) return true;
+        if (r?.rowCount) {
+          // keep going; we still want to update user_active_job
+        }
       }
     } catch (e) {
       console.warn('[PG/activeJob] users update failed (ignored):', e?.message);
@@ -1271,7 +1303,7 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       let i = 3;
 
       if (caps.memberships_has_active_job_id) {
-        const v = coerceActiveJobIdValue(types.memberships, { jobUuid: id, jobNo });
+        const v = coerceActiveJobIdValue(types.memberships, { jobUuid: null, jobNo: finalJobNo });
         sets.push(`active_job_id = $${i++}`);
         params.push(v);
       }
@@ -1282,11 +1314,7 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       if (await hasColumn('memberships', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
 
       if (sets.length) {
-        const r = await query(
-          `update public.memberships set ${sets.join(', ')} where owner_id=$1 and user_id=$2`,
-          params
-        );
-        if (r?.rowCount) return true;
+        await query(`update public.memberships set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
       }
     } catch (e) {
       console.warn('[PG/activeJob] memberships update failed (ignored):', e?.message);
@@ -1301,7 +1329,7 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       let i = 3;
 
       if (caps.user_profiles_has_active_job_id) {
-        const v = coerceActiveJobIdValue(types.user_profiles, { jobUuid: id, jobNo });
+        const v = coerceActiveJobIdValue(types.user_profiles, { jobUuid: null, jobNo: finalJobNo });
         sets.push(`active_job_id = $${i++}`);
         params.push(v);
       }
@@ -1312,54 +1340,41 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       if (await hasColumn('user_profiles', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
 
       if (sets.length) {
-        const r = await query(
-          `update public.user_profiles set ${sets.join(', ')} where owner_id=$1 and user_id=$2`,
-          params
-        );
-        if (r?.rowCount) return true;
+        await query(`update public.user_profiles set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
       }
     } catch (e) {
       console.warn('[PG/activeJob] user_profiles update failed (ignored):', e?.message);
     }
   }
 
-  // 4) user_active_job (supports either numeric job_no OR uuid job id)
-if (caps.has_user_active_job) {
-  try {
-    const r = await query(
-      `
-      select
-        u.job_id as active_job_id,
-        coalesce(j.name, j.job_name) as active_job_name
-      from public.user_active_job u
-      join public.jobs j
-        on j.owner_id = u.owner_id
-       and (
-            -- job_id stored as numeric job_no
-            (u.job_id::text ~ '^\\d+$' and j.job_no = (u.job_id::text)::int)
-            or
-            -- job_id stored as uuid job id
-            (u.job_id::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-             and j.id = (u.job_id::text)::uuid)
-          )
-      where u.owner_id = $1 and u.user_id = $2
-      limit 1
-      `,
-      [owner, String(userId)]
-    );
+  // 4) user_active_job (✅ store job_no as text; avoids integer=uuid joins forever)
+  if (caps.has_user_active_job) {
+    try {
+      if (!jobNoText) {
+        // clear
+        await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
+        return { active_job_id: null, active_job_name: null, source: 'user_active_job' };
+      }
 
-    const row = r?.rows?.[0];
-    if (row && (row.active_job_id != null || row.active_job_name != null)) {
-      const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
-      if (out?.active_job_id != null || out?.active_job_name) return out;
+      await query(
+        `
+        insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
+        values ($1, $2, $3::text, now())
+        on conflict (owner_id, user_id)
+        do update set job_id = excluded.job_id, updated_at = now()
+        `,
+        [owner, String(userId), jobNoText]
+      );
+
+      return { active_job_id: jobNoText, active_job_name: name || null, source: 'user_active_job' };
+    } catch (e) {
+      console.warn('[PG/activeJob] user_active_job write failed (ignored):', e?.message);
     }
-  } catch (e) {
-    console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
   }
+
+  return { active_job_id: jobNoText, active_job_name: name || null, source: 'unknown' };
 }
 
-  return null;
-}
 
 async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
   const owner = DIGITS(ownerId);
@@ -1498,38 +1513,35 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
     }
   }
 
-    // 4) user_active_job (supports either numeric job_no OR uuid job id) — SAFE text compare
-  if (caps.has_user_active_job) {
-    try {
-      const r = await query(
-        `
-        select
-          u.job_id as active_job_id,
-          coalesce(j.name, j.job_name) as active_job_name
-        from public.user_active_job u
-        join public.jobs j
-          on j.owner_id = u.owner_id
-         and (
-              (u.job_id::text ~ '^\\d+$' and j.job_no = (u.job_id::text)::int)
-              or
-              (u.job_id::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-               and j.id::text = u.job_id::text)
-            )
-        where u.owner_id = $1 and u.user_id = $2
-        limit 1
-        `,
-        [owner, String(userId)]
-      );
+    // 4) user_active_job (job_no stored as text)
+if (caps.has_user_active_job) {
+  try {
+    const r = await query(
+      `
+      select
+        u.job_id as active_job_id,
+        coalesce(j.name, j.job_name) as active_job_name
+      from public.user_active_job u
+      join public.jobs j
+        on j.owner_id = u.owner_id
+       and (u.job_id::text ~ '^\\d+$')
+       and j.job_no = (u.job_id::text)::int
+      where u.owner_id = $1 and u.user_id = $2
+      limit 1
+      `,
+      [owner, String(userId)]
+    );
 
-      const row = r?.rows?.[0];
-      if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
-        if (out?.active_job_id != null || out?.active_job_name) return out;
-      }
-    } catch (e) {
-      console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
+    const row = r?.rows?.[0];
+    if (row && (row.active_job_id != null || row.active_job_name != null)) {
+      const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
+      if (out?.active_job_id != null || out?.active_job_name) return out;
     }
+  } catch (e) {
+    console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
   }
+}
+
   return null;
 }
 

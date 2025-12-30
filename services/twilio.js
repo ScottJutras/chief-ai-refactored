@@ -1,10 +1,5 @@
 // services/twilio.js
 // Twilio wrapper with dev-safe mock, Messaging Service-first, and WhatsApp-first helpers.
-// Alignments:
-// - Harden env validation + safe fallbacks (never crash local dev)
-// - Keep your sendBackfillConfirm behavior
-// - Provide a stable toWhatsApp() transformer
-// - verifyTwilioSignature remains dev-bypass when mock/no auth token
 
 const crypto = require('crypto');
 
@@ -22,6 +17,16 @@ function toWhatsApp(to) {
   return `whatsapp:${e164}`;
 }
 
+function toTemplateVar(str) {
+  return (
+    String(str || '')
+      .replace(/[\r\n\t]+/g, ' ')
+      .replace(/\s{2,}/g, ' ')
+      .trim()
+      .slice(0, 900) || '—'
+  );
+}
+
 const {
   NODE_ENV,
   MOCK_TWILIO,
@@ -32,8 +37,13 @@ const {
   TWILIO_WHATSAPP_NUMBER, // legacy
   TWILIO_MESSAGING_SERVICE_SID, // optional
   HEX_BACKFILL_GENERIC, // template SID
+  // Optional: if you ever implement list-picker via content templates:
+  TWILIO_WA_JOB_PICKER_CONTENT_SID, // optional template sid for list picker
 } = process.env;
-
+console.info(
+  '[TWILIO] job picker content sid present?',
+  !!process.env.TWILIO_WA_JOB_PICKER_CONTENT_SID
+);
 const isProd = NODE_ENV === 'production';
 const resolvedWhatsAppFrom = normalizeWhatsAppFrom(TWILIO_WHATSAPP_FROM || TWILIO_WHATSAPP_NUMBER);
 
@@ -72,17 +82,20 @@ if (useMock) {
   twilioClient = makeRealClient();
 }
 
-async function sendWhatsApp(to, body, mediaUrls) {
-  const payload = {
-    to: toWhatsApp(to),
-    body: String(body || ''),
-  };
-
+function applyFromOrService(payload) {
   if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
     payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
   } else {
     payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
   }
+  return payload;
+}
+
+async function sendWhatsApp(to, body, mediaUrls) {
+  const payload = applyFromOrService({
+    to: toWhatsApp(to),
+    body: String(body || '')
+  });
 
   if (mediaUrls && mediaUrls.length) payload.mediaUrl = mediaUrls;
   return twilioClient.messages.create(payload);
@@ -113,41 +126,43 @@ async function sendMessage(to, body) {
  * This helper keeps your existing persistentAction approach (best-effort).
  */
 async function sendQuickReply(to, body, replies = []) {
-  const actions = (replies || []).slice(0, 3).map(r => `reply?text=${encodeURIComponent(String(r))}`);
+  const actions = (replies || []).slice(0, 3).map((r) => `reply?text=${encodeURIComponent(String(r))}`);
 
-  const payload = {
+  const payload = applyFromOrService({
     to: toWhatsApp(to),
     body: String(body || ''),
-    persistentAction: actions,
-  };
-
-  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
-    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
-  } else {
-    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
-  }
+    persistentAction: actions
+  });
 
   return twilioClient.messages.create(payload);
 }
 
-async function sendTemplateMessage(to, contentSid, vars = {}) {
-  const payload = {
-    to: toWhatsApp(to),
-    contentSid,
+/**
+ * Template sender (Twilio Content API).
+ * ✅ HARDENED: always includes a body fallback, and if contentSid is missing, sends plain WhatsApp.
+ */
+async function sendTemplateMessage(to, contentSid, vars = {}, fallbackBody = '') {
+  const toW = toWhatsApp(to);
+
+  // If no contentSid (or blank), fail-open to a normal message (prevents 21619)
+  if (!contentSid || !String(contentSid).trim()) {
+    const body = String(fallbackBody || '').trim() || Object.values(vars || {}).map(String).join(' ').trim() || '—';
+    return sendWhatsApp(toW, body);
+  }
+
+  const payload = applyFromOrService({
+    to: toW,
+    contentSid: String(contentSid).trim(),
     contentVariables: JSON.stringify(vars || {}),
-  };
-
-  if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
-    payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
-  } else {
-    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
-  }
+    // ✅ safety net: Twilio accepts body alongside templates; prevents 21619 in weird edge cases
+    body: String(fallbackBody || '').trim() || ' '
+  });
 
   return twilioClient.messages.create(payload);
 }
 
-async function sendTemplateQuickReply(to, contentSid, vars = {}) {
-  return sendTemplateMessage(to, contentSid, vars);
+async function sendTemplateQuickReply(to, contentSid, vars = {}, fallbackBody = '') {
+  return sendTemplateMessage(to, contentSid, vars, fallbackBody);
 }
 
 async function sendBackfillConfirm(to, humanLine, opts = {}) {
@@ -156,7 +171,12 @@ async function sendBackfillConfirm(to, humanLine, opts = {}) {
 
   if (preferTemplate && canTemplate) {
     try {
-      return await sendTemplateQuickReply(to, HEX_BACKFILL_GENERIC, { 1: String(humanLine || '') });
+      return await sendTemplateQuickReply(
+        to,
+        HEX_BACKFILL_GENERIC,
+        { 1: toTemplateVar(humanLine) },
+        `Confirm backfill: ${String(humanLine || '')}\nReply: "Confirm" or "Cancel"`
+      );
     } catch (e) {
       console.warn('[TWILIO] Template send failed, falling back:', e?.message);
     }
@@ -174,12 +194,63 @@ async function sendBackfillConfirm(to, humanLine, opts = {}) {
   }
 }
 
+/**
+ * ✅ NEW: Interactive list sender (best-effort).
+ *
+ * IMPORTANT:
+ * - Twilio's basic Messages API does NOT support WhatsApp "List" objects directly.
+ * - So this function:
+ *   (1) tries a Content Template SID if you provide one (TWILIO_WA_JOB_PICKER_CONTENT_SID),
+ *   (2) otherwise sends a normal text body (which your expense.js already builds).
+ *
+ * This still fixes your 21619 by guaranteeing body/contentSid exists.
+ */
+async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections, contentSid } = {}) {
+  const safeBody = String(bodyText || '').trim() || '—';
+
+  const sid =
+    (contentSid && String(contentSid).trim()) ||
+    (process.env.TWILIO_WA_JOB_PICKER_CONTENT_SID && String(process.env.TWILIO_WA_JOB_PICKER_CONTENT_SID).trim()) ||
+    (process.env.TWILIO_ACTIVE_JOBS_LIST_TEMPLATE_SID && String(process.env.TWILIO_ACTIVE_JOBS_LIST_TEMPLATE_SID).trim()) ||
+    null;
+
+  console.info('[TWILIO] sendWhatsAppInteractiveList', {
+    hasSid: !!sid,
+    sid: sid ? `${sid.slice(0, 6)}…` : null,
+    hasBody: !!safeBody
+  });
+
+  if (!sid) {
+    console.warn('[TWILIO] Interactive list requested but no Content SID configured. Sending plain text.', {
+      to: String(to || '').slice(0, 8) + '…',
+      hasSections: Array.isArray(sections) && sections.length > 0
+    });
+    return sendWhatsApp(to, safeBody);
+  }
+
+  const vars = {
+    1: toTemplateVar(safeBody),
+    2: toTemplateVar(buttonText || 'Pick'),
+    3: toTemplateVar(JSON.stringify(sections || []).slice(0, 900))
+  };
+
+  try {
+    return await sendTemplateMessage(to, sid, vars, safeBody);
+  } catch (e) {
+    console.warn('[TWILIO] interactive list template failed; falling back to plain text:', e?.message);
+    return sendWhatsApp(to, safeBody);
+  }
+}
+
+
 function verifyTwilioSignature(options = {}) {
   if (!useMock && TWILIO_AUTH_TOKEN) {
     const twilio = require('twilio');
     return twilio.webhook({ validate: true, ...options });
   }
-  return function devBypass(_req, _res, next) { next(); };
+  return function devBypass(_req, _res, next) {
+    next();
+  };
 }
 
 module.exports = {
@@ -191,4 +262,7 @@ module.exports = {
   sendTemplateMessage,
   sendTemplateQuickReply,
   sendBackfillConfirm,
+  sendWhatsAppInteractiveList,
+  toWhatsApp,
+  toTemplateVar
 };

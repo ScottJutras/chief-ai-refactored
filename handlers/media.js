@@ -2,7 +2,8 @@
 // COMPLETE DROP-IN (aligned with expense.js Option A + webhook passthrough + timeclock signature)
 //
 // Fixes included:
-// ✅ Central "trade-term correction" layer after transcription/OCR (Gentek/Gen Tech, siding/sighting, etc.)
+// ✅ Central "trade-term correction" layer after transcription/OCR
+// ✅ Adds "common transcription typo fixes" (e.g., lotters→ladders)
 // ✅ Corrections applied to BOTH returned transcript AND pendingMediaMeta transcript
 // ✅ Stable idempotency key for media: prefers Twilio MediaSid, falls back to MessageSid, then time
 // ✅ Never logs expense/revenue here; attaches pendingMediaMeta + returns transcript to router
@@ -141,6 +142,30 @@ function correctTradeTerms(text) {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * ✅ Common transcription typo fixes (ultra conservative).
+ * Keep this list SHORT and only for “obvious” mistakes you’ve actually seen.
+ */
+function fixCommonTranscriptionTypos(text) {
+  let s = String(text || '');
+
+  // Your real example:
+  s = s.replace(/\blotters\b/gi, 'ladders');
+  s = s.replace(/\blotter\b/gi, 'ladder');
+
+  // A few common contractor audio mis-hears (keep conservative):
+  s = s.replace(/\bshingle's\b/gi, 'shingles');
+  s = s.replace(/\bhome\s*hardwear\b/gi, 'Home Hardware');
+  s = s.replace(/\bmedway\s*park\s*drive\b/gi, 'Medway Park Dr');
+
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeHumanText(text) {
+  // Apply typo fixes first, then trade-term normalization
+  return correctTradeTerms(fixCommonTranscriptionTypos(text));
+}
+
 function getTwilioMediaSid(mediaUrl) {
   try {
     const u = new URL(String(mediaUrl || ''));
@@ -209,7 +234,7 @@ async function markPendingFinance({ from, kind, stableMediaMsgId }) {
 async function passThroughTextOnly(_from, input) {
   const t = String(input || '').trim();
   if (!t) return { transcript: '', twiml: null };
-  return { transcript: correctTradeTerms(t), twiml: null };
+  return { transcript: normalizeHumanText(t), twiml: null };
 }
 
 async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
@@ -329,7 +354,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
       }
 
-      transcript = correctTradeTerms(transcript);
+      transcript = normalizeHumanText(transcript);
 
       mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
@@ -360,7 +385,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         console.warn('[MEDIA] extractTextFromImage failed:', e?.message);
       }
 
-      extractedText = correctTradeTerms((ocrText || extractedText || '').trim());
+      extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 
       mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = null;

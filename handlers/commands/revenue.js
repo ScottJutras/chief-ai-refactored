@@ -587,28 +587,38 @@ const ENABLE_INTERACTIVE_LIST = (() => {
   return String(raw).trim().toLowerCase() !== 'false';
 })();
 
-async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections }) {
+async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const client = getTwilioClient();
   const { waFrom, messagingServiceSid } = getSendFromConfig();
 
+  if (!to) throw new Error('Missing "to"');
+
+  const toClean = String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
+  const safeBody = String(summaryLine || '').trim().slice(0, 1500) || '—';
+
+  // ✅ If templateSid missing, send plain text (prevents 21619)
+  if (!templateSid || !String(templateSid).trim()) {
+    const payload = { to: toClean, body: safeBody };
+    if (waFrom) payload.from = waFrom;
+    else payload.messagingServiceSid = messagingServiceSid;
+    return client.messages.create(payload);
+  }
+
+  // Normal template path
   const payload = {
-    to,
-    ...(waFrom ? { from: waFrom } : { messagingServiceSid }),
-    interactive: {
-      type: 'list',
-      body: { text: String(bodyText || '').slice(0, 1024) },
-      action: { button: String(buttonText || 'Pick a job').slice(0, 20), sections }
-    }
+    to: toClean,
+    contentSid: String(templateSid).trim(),
+    // ✅ Also include body as a safety net (optional but helpful)
+    body: safeBody,
+    contentVariables: JSON.stringify({ '1': toTemplateVar(summaryLine) })
   };
 
-  const TIMEOUT_MS = 3000;
-  const msg = await Promise.race([
-    client.messages.create(payload),
-    new Promise((_, rej) => setTimeout(() => rej(new Error('Twilio send timeout')), TIMEOUT_MS))
-  ]);
+  if (waFrom) payload.from = waFrom;
+  else payload.messagingServiceSid = messagingServiceSid;
 
-  return msg;
+  return client.messages.create(payload);
 }
+
 
 async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
   const to = waTo(from);

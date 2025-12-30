@@ -1498,18 +1498,26 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
     }
   }
 
-  // 4) user_active_job (FORCE job_no mode for your current schema)
+    // 4) user_active_job (supports either numeric job_no OR uuid job id) — SAFE text compare
   if (caps.has_user_active_job) {
     try {
       const r = await query(
-        `select u.job_id as active_job_id,
-                coalesce(j.name, j.job_name) as active_job_name
-           from public.user_active_job u
-           join public.jobs j
-             on j.owner_id=u.owner_id
-            and j.job_no = u.job_id
-          where u.owner_id=$1 and u.user_id=$2
-          limit 1`,
+        `
+        select
+          u.job_id as active_job_id,
+          coalesce(j.name, j.job_name) as active_job_name
+        from public.user_active_job u
+        join public.jobs j
+          on j.owner_id = u.owner_id
+         and (
+              (u.job_id::text ~ '^\\d+$' and j.job_no = (u.job_id::text)::int)
+              or
+              (u.job_id::text ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+               and j.id::text = u.job_id::text)
+            )
+        where u.owner_id = $1 and u.user_id = $2
+        limit 1
+        `,
         [owner, String(userId)]
       );
 
@@ -1522,7 +1530,6 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
     }
   }
-
   return null;
 }
 

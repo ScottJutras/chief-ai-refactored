@@ -25,6 +25,11 @@
     }
   },
   "routes": [
+    { "handle": "filesystem" },
+
+    { "src": "^/favicon\\.ico$", "dest": "/favicon.ico" },
+    { "src": "^/favicon\\.png$", "dest": "/favicon.png" },
+
     { "src": "^/api/cron/refresh_docs$", "dest": "/api/cron/refresh_docs.js" },
     { "src": "^/api/cron/cleanup-pending$", "dest": "/api/cron/cleanup_pending.js" },
 
@@ -33,6 +38,7 @@
     { "src": "^/webhook$", "dest": "/api/webhook.js" },
 
     { "src": "^/api/ping$", "dest": "/api/ping.js" },
+
     { "src": "^/(.*)$", "dest": "/api/index.js" }
   ],
   "crons": [

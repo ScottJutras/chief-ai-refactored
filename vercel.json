@@ -42,13 +42,7 @@
     { "src": "^/(.*)$", "dest": "/api/index.js" }
   ],
   "crons": [
-    {
-      "path": "/api/cron/refresh_docs",
-      "schedule": "0 3 * * 1"
-    },
-    {
-      "path": "/api/cron/cleanup-pending",
-      "schedule": "5 3 * * 1"
-    }
+    { "path": "/api/cron/refresh_docs", "schedule": "0 3 * * 1" },
+    { "path": "/api/cron/cleanup-pending", "schedule": "5 3 * * 1" }
   ]
 }

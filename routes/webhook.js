@@ -13,6 +13,9 @@
 // ✅ Keeps ownerId numeric (phone digits). ownerUuid can be stored separately if you map it.
 // ✅ Avoids double-send TwiML and keeps the 8s safety timer.
 // ✅ NEW: Global "cancel/stop" hard clears pending_actions + legacy state so Cancel never falls through to menu.
+// ✅ NEW: "ok(...)" is now SAFE by default (empty TwiML). Pass text only when you want a visible message bubble.
+// ✅ Fix: Revenue fast path now calls handleRevenue (your pasted file accidentally called handleExpense).
+// ✅ Future-proof: revenue handler path supports object return { twiml }.
 
 const express = require('express');
 const querystring = require('querystring');
@@ -41,12 +44,26 @@ const mergePendingTransactionState =
 function xmlEsc(s = '') {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-const xml = (s = '') => `<Response><Message>${xmlEsc(s)}</Message></Response>`;
 
-const ok = (res, text = 'OK') => {
+const xml = (s = '') => `<Response><Message>${xmlEsc(s)}</Message></Response>`;
+const emptyTwiml = () => `<Response></Response>`;
+
+const sendTwiml = (res, twiml) => {
   if (res.headersSent) return;
-  res.status(200).type('application/xml; charset=utf-8').send(xml(text));
+  return res.status(200).type('application/xml; charset=utf-8').send(twiml || emptyTwiml());
 };
+
+// Safer: if you pass null/empty, it returns empty TwiML (no visible Message bubble)
+const ok2 = (res, text) => {
+  if (res.headersSent) return;
+  if (!text) return sendTwiml(res, emptyTwiml());
+  return sendTwiml(res, xml(text));
+};
+
+// ✅ IMPORTANT: redefine ok to be safe by default.
+// - ok(res) -> empty TwiML
+// - ok(res, "text") -> visible bubble
+const ok = (res, text = null) => ok2(res, text);
 
 const normalizePhone = (raw = '') => String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
 
@@ -91,18 +108,21 @@ function isAllowedWhilePending(lc) {
 
 // "global job picker intents" (typed commands)
 function isJobPickerIntent(lc) {
-  return /^(change\s+job|switch\s+job|pick\s+job|show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs)\b/.test(
-    lc
-  );
+  return /^(change\s+job|switch\s+job|pick\s+job|show\s+active\s+jobs|active\s+jobs|list\s+active\s+jobs)\b/.test(lc);
 }
 
-// "list-picker reply-like" tokens
 function looksLikeJobPickerReplyToken(raw) {
   const s = String(raw || '').trim();
   if (!s) return false;
   if (/^(more|overhead|oh)$/i.test(s)) return true;
   if (/^\d+$/.test(s)) return true;
+
+  // ✅ expense.js / job picker uses "jobno_<job_no>"
+  if (/^jobno_\d+$/i.test(s)) return true;
+
+  // Keep legacy format if anything still emits it
   if (/^job_\d+_[0-9a-f]+$/i.test(s)) return true;
+
   return false;
 }
 
@@ -133,8 +153,7 @@ function getInboundText(body = {}) {
     try {
       const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
       const id = json?.list_reply?.id || json?.listReply?.id || json?.interactive?.list_reply?.id || '';
-      const title =
-        json?.list_reply?.title || json?.listReply?.title || json?.interactive?.list_reply?.title || '';
+      const title = json?.list_reply?.title || json?.listReply?.title || json?.interactive?.list_reply?.title || '';
       const picked = String(id || title || '').trim();
       if (picked) return picked;
     } catch {}
@@ -175,7 +194,7 @@ function hasMoneyAmount(str) {
 
   const hasBareNumberWithHint =
     /\b(?:for|paid|spent|received|cost|total)\s+\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b/i.test(s) ||
-    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s+\b(?:for|paid|spent|received|cost|total)\b/i.test(s);
+    /\\b\\d{1,3}(?:,\\d{3})*(?:\\.\\d{1,2})?\\s+\\b(?:for|paid|spent|received|cost|total)\\b/i.test(s);
 
   return hasDollar || hasWordAmount || hasBareNumberWithHint;
 }
@@ -203,8 +222,9 @@ function looksExpenseNl(str) {
     /^drive\b/.test(s) ||
     /^task\b/.test(s) ||
     /^my\s+tasks\b/.test(s)
-  )
+  ) {
     return false;
+  }
 
   return true;
 }
@@ -372,7 +392,7 @@ router.use((req, _res, next) => {
 
 router.all('*', (req, res, next) => {
   if (req.method === 'POST') return next();
-  return ok(res, 'OK');
+  return ok(res); // empty TwiML
 });
 
 /* ---------------- Identity + canonical URL ---------------- */
@@ -408,7 +428,7 @@ router.use((req, res, next) => {
         from: req.from,
         messageSid: req.body?.MessageSid || req.body?.SmsMessageSid
       });
-      ok(res, 'OK');
+      ok(res); // empty TwiML (no bubble)
     }
   }, 8000);
 
@@ -479,19 +499,11 @@ router.post('*', async (req, res, next) => {
     const bodyText = getInboundText(req.body || {});
     const sourceMsgId = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
 
-    const result = await handleMedia(
-      req.from,
-      bodyText,
-      req.userProfile || {},
-      req.ownerId,
-      url,
-      type,
-      sourceMsgId
-    );
+    const result = await handleMedia(req.from, bodyText, req.userProfile || {}, req.ownerId, url, type, sourceMsgId);
 
     if (result && typeof result === 'object') {
       if (result.twiml && !res.headersSent) {
-        return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
+        return sendTwiml(res, result.twiml);
       }
       if (result.transcript) {
         req.body.Body = result.transcript;
@@ -500,7 +512,7 @@ router.post('*', async (req, res, next) => {
     }
 
     if (typeof result === 'string' && result && !res.headersSent) {
-      return res.status(200).type('application/xml; charset=utf-8').send(result);
+      return sendTwiml(res, result);
     }
 
     return next();
@@ -531,20 +543,18 @@ router.post('*', async (req, res, next) => {
 
     const crypto = require('crypto');
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-    const messageSid = rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
+    const messageSid =
+      rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
 
     /* -----------------------------------------------------------------------
      * ✅ GLOBAL HARD CANCEL (NEW)
-     * -----------------------------------------------------------------------
-     * Ensures "cancel/stop/no" never falls through to the help menu.
-     * Clears Option A pending_actions + legacy state.
-     */
+     * ----------------------------------------------------------------------- */
     if (/^(cancel|stop|no)\b/.test(lc)) {
       await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
       return ok(res, '❌ Cancelled. You’re cleared.');
     }
 
-    // ✅ Option A: check pending_actions FIRST (so "1"/"job_1_*"/"yes" go to expense.js, not job.js)
+    // ✅ Option A: check pending_actions FIRST (so "1"/"jobno_123"/"yes" go to expense.js, not job.js)
     const expensePA = await hasExpensePA(req.ownerId, req.from);
     const hasExpensePendingActions = !!expensePA.hasAny;
 
@@ -560,7 +570,8 @@ router.post('*', async (req, res, next) => {
 
     const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
 
-    const allowJobPickerThrough = (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
+    const allowJobPickerThrough =
+      (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
 
     if (pendingRevenueFlow) {
       if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
@@ -586,10 +597,10 @@ router.post('*', async (req, res, next) => {
         const result = await handleMedia(req.from, text, req.userProfile || {}, req.ownerId, null, null, messageSid);
 
         if (result && typeof result === 'object') {
-          if (result.twiml) return res.status(200).type('application/xml; charset=utf-8').send(result.twiml);
+          if (result.twiml) return sendTwiml(res, result.twiml);
           if (result.transcript && !result.twiml) req.body.Body = result.transcript;
         } else if (typeof result === 'string' && result) {
-          return res.status(200).type('application/xml; charset=utf-8').send(result);
+          return sendTwiml(res, result);
         }
 
         text = String(getInboundText(req.body || {}) || '').trim();
@@ -620,7 +631,7 @@ router.post('*', async (req, res, next) => {
           if (typeof handleJob === 'function') {
             await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
             if (res.headersSent) return;
-            return ok(res, 'OK');
+            return ok(res); // empty TwiML
           }
         } catch (e) {
           console.warn('[WEBHOOK] job picker handler failed:', e?.message);
@@ -656,10 +667,12 @@ router.post('*', async (req, res, next) => {
       try {
         const { handleRevenue } = require('../handlers/commands/revenue');
         const tw = await handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
-        if (!res.headersSent && typeof tw === 'string') {
-          return res.status(200).type('application/xml; charset=utf-8').send(tw);
+
+        if (!res.headersSent) {
+          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+          return ok(res); // empty
         }
-        if (!res.headersSent) return ok(res, 'OK');
         return;
       } catch (e) {
         console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
@@ -670,10 +683,12 @@ router.post('*', async (req, res, next) => {
       try {
         const { handleExpense } = require('../handlers/commands/expense');
         const tw = await handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
-        if (!res.headersSent && typeof tw === 'string') {
-          return res.status(200).type('application/xml; charset=utf-8').send(tw);
+
+        if (!res.headersSent) {
+          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+          return ok(res); // empty
         }
-        if (!res.headersSent) return ok(res, 'OK');
         return;
       } catch (e) {
         console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
@@ -711,10 +726,11 @@ router.post('*', async (req, res, next) => {
           timeoutPromise
         ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        if (!res.headersSent && typeof tw === 'string') {
-          return res.status(200).type('application/xml; charset=utf-8').send(tw);
+        if (!res.headersSent) {
+          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+          return ok(res); // empty
         }
-        if (!res.headersSent) return ok(res, 'OK');
         return;
       } catch (e) {
         console.warn('[WEBHOOK] revenue handler failed:', e?.message);
@@ -748,10 +764,11 @@ router.post('*', async (req, res, next) => {
           timeoutPromise
         ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        if (!res.headersSent && typeof tw === 'string') {
-          return res.status(200).type('application/xml; charset=utf-8').send(tw);
+        if (!res.headersSent) {
+          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+          return ok(res); // empty
         }
-        if (!res.headersSent) return ok(res, 'OK');
         return;
       } catch (e) {
         console.warn('[WEBHOOK] expense handler failed:', e?.message);
@@ -852,7 +869,7 @@ router.post('*', async (req, res, next) => {
       let msg = '';
       if (typeof out === 'string' && out.trim()) msg = out.trim();
       else if (askingHow) msg = SOP.tasks;
-      else if (out === true) return ok(res, 'OK');
+      else if (out === true) return ok(res); // empty
       else msg = 'Task handled.';
 
       msg += await glossaryNudgeFrom(text2);
@@ -883,7 +900,7 @@ router.post('*', async (req, res, next) => {
           res
         );
         if (res.headersSent) return;
-        if (handled) return ok(res, 'OK');
+        if (handled) return ok(res); // empty
       } catch (e) {
         console.warn('[WEBHOOK] forecast failed:', e?.message);
       }
@@ -924,7 +941,7 @@ router.post('*', async (req, res, next) => {
       let msg = '';
       if (typeof out === 'string' && out.trim()) msg = out.trim();
       else if (askingHow) msg = SOP.timeclock;
-      else if (out === true) return ok(res, 'OK');
+      else if (out === true) return ok(res); // empty
       else msg = 'Time logged.';
 
       msg += await glossaryNudgeFrom(text2);
@@ -987,7 +1004,7 @@ router.post('*', async (req, res, next) => {
 router.use((req, res, next) => {
   if (!res.headersSent) {
     console.warn('[WEBHOOK] fell-through fallback');
-    return ok(res, 'OK');
+    return ok(res); // empty
   }
   next();
 });

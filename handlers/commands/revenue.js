@@ -1,16 +1,18 @@
 // handlers/commands/revenue.js
-// COMPLETE DROP-IN (aligned to expense.js patterns + postgres.js insertTransaction)
+// COMPLETE DROP-IN (aligned to expense.js Option A + webhook.js expectations)
 //
 // ✅ Alignments in this drop-in:
 // - Uses pending_actions (PA) confirm flow like expense.js (PA_KIND_CONFIRM + PA_KIND_PICK_JOB)
+// - Pending-actions access is KIND-AWARE:
+//    • Uses pg.getPendingActionByKind / upsertPendingActionByKind / deletePendingActionByKind when present
+//    • Otherwise falls back to SQL on public.pending_actions with TTL window
 // - Job picker supports:
 //    • WhatsApp interactive list row ids: jobno_<job_no>
 //    • numeric replies ("2")
-//    • exact job name
+//    • exact job name / prefix match
 //    • "overhead" + "more" + "change job"
 // - Uses pg.insertTransaction with source_msg_id idempotency (if supported)
-// - Wires OCR/media into revenue insert via opts.mediaMeta (schema-aware)
-// - Consumes pendingMediaMeta from stateManager (your media.js/transcription pipeline)
+// - Consumes pendingMediaMeta from stateManager (media.js/transcription pipeline)
 // - DB timeout UX: keep confirm PA and ask user to tap Yes again
 //
 // Signature expected by router:
@@ -42,12 +44,135 @@ const validateCIL =
 const PA_KIND_CONFIRM = 'confirm_revenue';
 const PA_KIND_PICK_JOB = 'pick_job_for_revenue';
 
-const getPA = pg.getPendingAction || pg.getPA;
-const upsertPA = pg.upsertPendingAction || pg.upsertPA;
-const deletePA = pg.deletePendingAction || pg.deletePA;
+// TTL minutes should match webhook.js / postgres.js config
+const PA_TTL_MIN = Number(process.env.PENDING_TTL_MIN || 10);
+const PA_TTL_SEC = PA_TTL_MIN * 60;
 
-if (typeof getPA !== 'function' || typeof upsertPA !== 'function' || typeof deletePA !== 'function') {
-  console.warn('[REVENUE] Missing pending_actions helpers on pg (getPA/upsertPA/deletePA). This file expects them.');
+// Prefer pg query if present
+const { query } = pg;
+
+// Prefer kind-aware helpers if present
+const pgGetPendingActionByKind =
+  (typeof pg.getPendingActionByKind === 'function' && pg.getPendingActionByKind) || null;
+const pgUpsertPendingActionByKind =
+  (typeof pg.upsertPendingActionByKind === 'function' && pg.upsertPendingActionByKind) ||
+  (typeof pg.upsertPendingAction === 'function' && pg.upsertPendingAction) ||
+  null;
+const pgDeletePendingActionByKind =
+  (typeof pg.deletePendingActionByKind === 'function' && pg.deletePendingActionByKind) || null;
+
+// Best-effort KIND-aware PA access with SQL fallback
+async function getPA({ ownerId, userId, kind }) {
+  const owner = String(ownerId || '').trim();
+  const user = String(userId || '').trim();
+  const k = String(kind || '').trim();
+  if (!owner || !user || !k) return null;
+
+  if (pgGetPendingActionByKind) {
+    try {
+      const r = await pgGetPendingActionByKind({ ownerId: owner, userId: user, kind: k });
+      if (!r) return null;
+      if (r.payload != null) return r;
+      if (typeof r === 'object') return { payload: r };
+      return null;
+    } catch {
+      // fall through
+    }
+  }
+
+  if (typeof query !== 'function') return null;
+
+  try {
+    const r = await query(
+      `
+      SELECT id, kind, payload, created_at
+        FROM public.pending_actions
+       WHERE owner_id = $1
+         AND user_id = $2
+         AND kind = $3
+         AND created_at > now() - (($4::text || ' minutes')::interval)
+       ORDER BY created_at DESC
+       LIMIT 1
+      `,
+      [owner, user, k, String(PA_TTL_MIN)]
+    );
+    return r?.rows?.[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds }) {
+  const owner = String(ownerId || '').trim();
+  const user = String(userId || '').trim();
+  const k = String(kind || '').trim();
+  if (!owner || !user || !k) return;
+
+  const ttl = Number(ttlSeconds || PA_TTL_SEC) || PA_TTL_SEC;
+
+  if (pgUpsertPendingActionByKind) {
+    try {
+      // supports both signatures:
+      // - upsertPendingActionByKind({ ownerId, userId, kind, payload, ttlSeconds })
+      // - upsertPendingAction({ ownerId, userId, kind, payload, ttlSeconds })
+      await pgUpsertPendingActionByKind({ ownerId: owner, userId: user, kind: k, payload, ttlSeconds: ttl });
+      return;
+    } catch {
+      // fall through
+    }
+  }
+
+  if (typeof query !== 'function') return;
+
+  try {
+    // Assumes you have (owner_id,user_id,kind) unique OR this will error and we fall back to delete+insert
+    await query(
+      `
+      INSERT INTO public.pending_actions (owner_id, user_id, kind, payload, created_at)
+      VALUES ($1, $2, $3, $4, now())
+      ON CONFLICT (owner_id, user_id, kind)
+      DO UPDATE SET payload = EXCLUDED.payload, created_at = now()
+      `,
+      [owner, user, k, payload || {}]
+    );
+  } catch {
+    try {
+      await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [owner, user, k]);
+      await query(
+        `
+        INSERT INTO public.pending_actions (owner_id, user_id, kind, payload, created_at)
+        VALUES ($1, $2, $3, $4, now())
+        `,
+        [owner, user, k, payload || {}]
+      );
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function deletePA({ ownerId, userId, kind }) {
+  const owner = String(ownerId || '').trim();
+  const user = String(userId || '').trim();
+  const k = String(kind || '').trim();
+  if (!owner || !user || !k) return;
+
+  if (pgDeletePendingActionByKind) {
+    try {
+      await pgDeletePendingActionByKind({ ownerId: owner, userId: user, kind: k });
+      return;
+    } catch {
+      // fall through
+    }
+  }
+
+  if (typeof query !== 'function') return;
+
+  try {
+    await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [owner, user, k]);
+  } catch {
+    // ignore
+  }
 }
 
 /* ---------------- Twilio Template / Messaging helpers ---------------- */
@@ -302,7 +427,8 @@ async function consumePendingMediaMeta(from) {
     const getPending = state.getPendingTransactionState || state.getPendingState || (async () => null);
 
     const mergePending =
-      state.mergePendingTransactionState || (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
+      state.mergePendingTransactionState ||
+      (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
     const pending = await getPending(from);
     const m = pending?.pendingMediaMeta || null;
@@ -489,7 +615,7 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
     userId: from,
     kind: PA_KIND_PICK_JOB,
     payload: { jobOptions: clean, page: p, pageSize: JOBS_PER_PAGE, hasMore, shownAt: Date.now() },
-    ttlSeconds: 600
+    ttlSeconds: PA_TTL_SEC
   });
 
   if (!ENABLE_INTERACTIVE_LIST || !to) {
@@ -653,7 +779,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         return twimlText('Please reply with a number, job name, "Overhead", or "more".');
       }
 
-      await upsertPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM, payload: confirm.payload, ttlSeconds: 600 });
+      await upsertPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM, payload: confirm.payload, ttlSeconds: PA_TTL_SEC });
       await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
 
       const summaryLine = buildRevenueSummaryLine({
@@ -664,7 +790,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         tz
       });
 
-      // picker implies picked/overhead; hint will be empty unless you force 'active' (you shouldn't)
       const summaryLineWithHint = `${summaryLine}${buildActiveJobHint(confirm.payload.draft.jobName, confirm.payload.draft.jobSource)}`;
       return await sendConfirmRevenueOrFallback(from, summaryLineWithHint);
     }
@@ -709,6 +834,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
         const rawJobId = rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
 
+        // Never allow numeric job_id to be written into tx.job_id
         if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
           console.warn('[REVENUE] refusing numeric job id; forcing null', { job_id: rawJobId });
           if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
@@ -763,7 +889,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
               },
               sourceMsgId: stableMsgId2
             },
-            ttlSeconds: 600
+            ttlSeconds: PA_TTL_SEC
           });
 
           return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
@@ -815,7 +941,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
               },
               sourceMsgId: stableMsgId2
             },
-            ttlSeconds: 600
+            ttlSeconds: PA_TTL_SEC
           });
 
           return twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.');
@@ -894,7 +1020,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         draft: { ...data, jobName, jobSource: jobSource || null, suggestedCategory: category },
         sourceMsgId: safeMsgId
       },
-      ttlSeconds: 600
+      ttlSeconds: PA_TTL_SEC
     });
 
     if (!jobName) {

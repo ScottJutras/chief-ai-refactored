@@ -86,10 +86,12 @@ const validateCIL =
 /* ---------------- Pending Actions (KIND-AWARE) ---------------- */
 
 const PA_KIND_PICK_JOB = 'pick_job_for_expense';
+exports.PA_KIND_PICK_JOB = PA_KIND_PICK_JOB;
 const PA_KIND_CONFIRM = 'confirm_expense';
 
 const PA_TTL_MIN = Number(process.env.PENDING_TTL_MIN || 10);
 const PA_TTL_SEC = PA_TTL_MIN * 60;
+exports.PA_TTL_SEC = PA_TTL_SEC;
 
 const pgGetPendingActionByKind =
   (typeof pg.getPendingActionByKind === 'function' && pg.getPendingActionByKind) || null;
@@ -199,6 +201,7 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
     console.warn('[PA] upsert fallback failed (ignored):', e?.message);
   }
 }
+exports.upsertPA = upsertPA;
 
 async function deletePA({ ownerId, userId, kind }) {
   const owner = String(ownerId || '').trim();
@@ -255,20 +258,24 @@ function xmlEsc(s = '') {
 function twimlText(msg) {
   return `<Response><Message>${xmlEsc(msg)}</Message></Response>`;
 }
+exports.twimlText = twimlText;
 
 function twimlEmpty() {
   return `<Response></Response>`;
 }
+exports.twimlEmpty = twimlEmpty;
 
 // Structured return (router can also just do res.send(r.twiml))
 function out(twiml, sentOutOfBand = false) {
   return { twiml, sentOutOfBand: !!sentOutOfBand };
 }
+exports.out = out;
 
 function waTo(from) {
   const d = String(from || '').replace(/\D/g, '');
   return d ? `whatsapp:+${d}` : null;
 }
+exports.waTo = waTo;
 
 function getTwilioClient() {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -832,6 +839,7 @@ const ENABLE_INTERACTIVE_LIST = (() => {
   const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? process.env.TWILIO_ENABLE_LIST_PICKER ?? 'true';
   return String(raw).trim().toLowerCase() !== 'false';
 })();
+exports.ENABLE_INTERACTIVE_LIST = ENABLE_INTERACTIVE_LIST;
 
 async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   const client = getTwilioClient();
@@ -886,7 +894,18 @@ function buildTextJobPrompt(jobOptions, page, pageSize) {
 
   return `Which job is this expense for?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
 }
+exports.buildTextJobPrompt = buildTextJobPrompt;
+function looksLikeNewExpenseText(s = '') {
+  const lc = String(s || '').trim().toLowerCase();
+  if (!lc) return false;
 
+  // strong prefix
+  if (/^(expense|exp)\b/.test(lc)) return true;
+
+  // NL expense signals (keep it simple, fast, low false-positive)
+  return /\b(spent|bought|purchase|purchased|paid|receipt|cost|home\s*depot|rona|lowe'?s|home\s*hardware|beacon)\b/.test(lc)
+    && /\$?\s*\d+(\.\d{1,2})?\b/.test(lc);
+}
 async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
   const to = waTo(from);
   const JOBS_PER_PAGE = Math.min(8, Math.max(1, Number(pageSize || 8)));
@@ -909,10 +928,13 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
     ttlSeconds: PA_TTL_SEC
   });
 
-  if (!ENABLE_INTERACTIVE_LIST || !to) return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
+  if (!ENABLE_INTERACTIVE_LIST || !to) {
+    // plain text (TwiML) fallback
+    return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
+  }
 
   const rows = slice.map((j) => {
-    const full = String(j?.name || 'Untitled Job').trim();
+    const full = String(j?.name || j?.job_name || 'Untitled Job').trim();
     const jobNo = Number(j.job_no);
     return { id: `jobno_${jobNo}`, title: full.slice(0, 24), description: `#${jobNo} ${full.slice(0, 72)}` };
   });
@@ -931,12 +953,17 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
       buttonText: 'Pick a job',
       sections: [{ title: 'Active Jobs', rows }]
     });
+
+    // ✅ IMPORTANT (Mode B):
+    // Do NOT send a second plain-text WhatsApp message here.
+    // Twilio-level DOUBLE_SEND_LIST_FALLBACK will do that when enabled.
     return out(twimlEmpty(), true);
   } catch (e) {
     console.warn('[JOB_PICKER] interactive list failed; falling back:', e?.message);
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 }
+
 
 /* ---------------- Active job resolution ---------------- */
 
@@ -1045,73 +1072,97 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
     // ---- 1) Awaiting job pick ----
-    const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-    if (pickPA?.payload?.jobOptions) {
-      const tok = normalizeDecisionToken(input);
-      const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
-      const page = Number(pickPA.payload.page || 0) || 0;
-      const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
-      const hasMore = !!pickPA.payload.hasMore;
+const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
 
-      if (tok === 'change_job') return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
+if (pickPA?.payload?.jobOptions) {
+  // If the user sent a brand new expense while we were waiting for a job pick,
+  // clear state and fall through to normal parsing (do NOT return).
+  if (looksLikeNewExpenseText(input)) {
+    console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM }); } catch {}
+  } else {
+    const tok = normalizeDecisionToken(input);
 
-      if (tok === 'more') {
-        if (!hasMore) return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
-      }
+    const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
+    const page = Number(pickPA.payload.page || 0) || 0;
+    const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
+    const hasMore = !!pickPA.payload.hasMore;
 
-      const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize });
-      if (!resolved) return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-
-      const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-      if (!confirm?.payload?.draft) {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-        return out(twimlText('Got it. Now resend the expense details.'), false);
-      }
-
-      if (resolved.kind === 'overhead') {
-        confirm.payload.draft.jobName = 'Overhead';
-        confirm.payload.draft.jobSource = 'overhead';
-        confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
-        confirm.payload.draft.job_id = null;
-        confirm.payload.draft.job_no = null;
-      } else if (resolved.kind === 'job') {
-        const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
-        const jobNo =
-          resolved.job?.job_no != null && Number.isFinite(Number(resolved.job.job_no))
-            ? Number(resolved.job.job_no)
-            : null;
-
-        confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
-        confirm.payload.draft.jobSource = 'picked';
-        confirm.payload.draft.job_no = jobNo;
-
-        confirm.payload.draft.job = { id: null, job_no: jobNo, name: jobName || null };
-        confirm.payload.draft.job_id = null; // job_no-first
-      } else {
-        return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-      }
-
-      await upsertPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM, payload: confirm.payload, ttlSeconds: PA_TTL_SEC });
-      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-
-      const summaryLine = buildExpenseSummaryLine({
-        amount: confirm.payload.draft.amount,
-        item: confirm.payload.draft.item,
-        store: confirm.payload.draft.store,
-        date: confirm.payload.draft.date,
-        jobName: confirm.payload.draft.jobName,
-        tz
-      });
-
-      return await sendConfirmExpenseOrFallback(
-        from,
-        `${summaryLine}${buildActiveJobHint(confirm.payload.draft.jobName, confirm.payload.draft.jobSource)}`
-      );
+    if (tok === 'change_job') {
+      return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
     }
 
-    // ---- 2) Confirm/edit/cancel ----
+    if (tok === 'more') {
+      if (!hasMore) {
+        return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
+      }
+      return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
+    }
+
+    const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize });
+    if (!resolved) {
+      return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+    }
+
+    const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    if (!confirm?.payload?.draft) {
+      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+      return out(twimlText('Got it. Now resend the expense details.'), false);
+    }
+
+    if (resolved.kind === 'overhead') {
+      confirm.payload.draft.jobName = 'Overhead';
+      confirm.payload.draft.jobSource = 'overhead';
+      confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
+      confirm.payload.draft.job_id = null;
+      confirm.payload.draft.job_no = null;
+    } else if (resolved.kind === 'job') {
+      const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
+      const jobNo =
+        resolved.job?.job_no != null && Number.isFinite(Number(resolved.job.job_no))
+          ? Number(resolved.job.job_no)
+          : null;
+
+      confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
+      confirm.payload.draft.jobSource = 'picked';
+      confirm.payload.draft.job_no = jobNo;
+
+      // job_no-first: never stuff numeric jobs.id into job_id
+      confirm.payload.draft.job = { id: null, job_no: jobNo, name: jobName || null };
+      confirm.payload.draft.job_id = null;
+    } else {
+      return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+    }
+
+    await upsertPA({
+      ownerId,
+      userId: from,
+      kind: PA_KIND_CONFIRM,
+      payload: confirm.payload,
+      ttlSeconds: PA_TTL_SEC
+    });
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+
+    const summaryLine = buildExpenseSummaryLine({
+      amount: confirm.payload.draft.amount,
+      item: confirm.payload.draft.item,
+      store: confirm.payload.draft.store,
+      date: confirm.payload.draft.date,
+      jobName: confirm.payload.draft.jobName,
+      tz
+    });
+
+    return await sendConfirmExpenseOrFallback(
+      from,
+      `${summaryLine}${buildActiveJobHint(confirm.payload.draft.jobName, confirm.payload.draft.jobSource)}`
+    );
+  }
+}
+
+// ---- 2) Confirm/edit/cancel ----
 const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
 if (confirmPA?.payload?.draft) {
   if (!isOwner) {
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
@@ -1137,9 +1188,7 @@ if (confirmPA?.payload?.draft) {
 
   if (token === 'cancel') {
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    try {
-      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-    } catch {}
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
     return out(twimlText('❌ Operation cancelled.'), false);
   }
 
@@ -1305,9 +1354,7 @@ if (confirmPA?.payload?.draft) {
         : `✅ Logged expense\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${buildActiveJobHint(jobName, jobSource)}`;
 
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    try {
-      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-    } catch {}
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
 
     return out(twimlText(reply), false);
   }
@@ -1317,6 +1364,7 @@ if (confirmPA?.payload?.draft) {
     false
   );
 }
+
 
 
     // ---- 3) New expense parse (deterministic first) ----

@@ -54,7 +54,7 @@ console.info(
   '[TWILIO] job picker content sid present?',
   !!(TWILIO_WA_JOB_PICKER_CONTENT_SID || TWILIO_ACTIVE_JOBS_LIST_TEMPLATE_SID)
 );
-
+const DOUBLE_SEND_LIST_FALLBACK = String(process.env.DOUBLE_SEND_LIST_FALLBACK || '') === '1';
 const isProd = NODE_ENV === 'production';
 const resolvedWhatsAppFrom = normalizeWhatsAppFrom(TWILIO_WHATSAPP_FROM || TWILIO_WHATSAPP_NUMBER);
 
@@ -98,26 +98,23 @@ if (useMock) {
  * `channel` controls the fallback "from" value format.
  */
 function applyFromOrService(payload, channel = 'whatsapp') {
+  const wantWhatsAppFrom = channel === 'whatsapp' && resolvedWhatsAppFrom;
+
+  // ✅ Prefer explicit WhatsApp from for WA + templates
+  if (wantWhatsAppFrom) {
+    payload.from = useMock ? 'whatsapp:+10000000000' : resolvedWhatsAppFrom;
+    return payload;
+  }
+
   if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
     payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
-    return payload;
+  } else {
+    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
   }
-
-  if (channel === 'sms') {
-    payload.from = useMock ? '+10000000000' : TWILIO_SMS_FROM;
-    if (!payload.from && !useMock) {
-      throw new Error('TWILIO_SMS_FROM is required when Messaging Service SID is not set');
-    }
-    return payload;
-  }
-
-  // whatsapp default
-  payload.from = useMock
-    ? 'whatsapp:+10000000000'
-    : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
 
   return payload;
 }
+
 
 /**
  * ✅ HARDENED: Never send Twilio a message with no Body and no Media.
@@ -199,12 +196,12 @@ async function sendTemplateMessage(to, contentSid, vars = {}, fallbackBody = '')
   const safeFallback = String(fallbackBody || '').trim() || ' ';
 
   const payload = applyFromOrService({
-    to: toWhatsApp(to),
-    contentSid: sid,
-    contentVariables: JSON.stringify(vars || {}),
-    // Safety net: keep a non-empty body so Twilio never rejects (21619)
-    body: safeFallback
-  });
+  to: toWhatsApp(to),
+  contentSid: sid,
+  contentVariables: JSON.stringify(vars || {}),
+  body: safeFallback
+}, 'whatsapp');
+
 
   console.info('[TWILIO] sendTemplateMessage messages.create payload', {
     to: payload.to,
@@ -265,6 +262,9 @@ async function sendBackfillConfirm(to, humanLine, opts = {}) {
 /**
  * Interactive list sender (via Content Templates).
  * If no Content SID is configured, falls back to a plain text message.
+ *
+ * If DOUBLE_SEND_LIST_FALLBACK=1, also sends a plain-text backup after the template
+ * (helps when template delivery is flaky / user is on web client).
  */
 async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections, contentSid } = {}) {
   const safeBody = safeBodyOrDash(bodyText);
@@ -278,7 +278,8 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
   console.info('[TWILIO] sendWhatsAppInteractiveList', {
     hasSid: !!sid,
     sid: sid ? `${sid.slice(0, 6)}…` : null,
-    hasBody: !!safeBody
+    hasBody: !!safeBody,
+    doubleSend: DOUBLE_SEND_LIST_FALLBACK
   });
 
   if (!sid) {
@@ -296,12 +297,24 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
   };
 
   try {
-    return await sendTemplateMessage(to, sid, vars, safeBody);
+    const result = await sendTemplateMessage(to, sid, vars, safeBody);
+
+    // Optional: send a plain-text backup so the user always sees *something*
+    if (DOUBLE_SEND_LIST_FALLBACK) {
+      try {
+        await sendWhatsApp(to, safeBody);
+      } catch (e2) {
+        console.warn('[TWILIO] double-send fallback failed (ignored):', e2?.message);
+      }
+    }
+
+    return result;
   } catch (e) {
     console.warn('[TWILIO] interactive list template failed; falling back to plain text:', e?.message);
     return sendWhatsApp(to, safeBody);
   }
 }
+
 
 function verifyTwilioSignature(options = {}) {
   if (!useMock && TWILIO_AUTH_TOKEN) {

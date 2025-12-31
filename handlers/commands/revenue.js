@@ -44,6 +44,7 @@ const categorizeEntry =
 
 // ---- CIL validator (fail-open) ----
 const cilMod = require('../../cil');
+const { waTo, upsertPA, PA_KIND_PICK_JOB, PA_TTL_SEC, ENABLE_INTERACTIVE_LIST, out, twimlText, buildTextJobPrompt, twimlEmpty } = require('./expense');
 const validateCIL =
   (cilMod && typeof cilMod.validateCIL === 'function' && cilMod.validateCIL) ||
   (cilMod && typeof cilMod.validateCil === 'function' && cilMod.validateCil) ||
@@ -631,6 +632,16 @@ async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
   return client.messages.create(payload);
 }
 
+function looksLikeNewRevenueText(s = '') {
+  const lc = String(s || '').trim().toLowerCase();
+  if (!lc) return false;
+
+  if (/^(revenue|rev|received|deposit|paid|payment)\b/.test(lc)) return true;
+
+  return /\b(received|deposit|paid|payment|etransfer|e-transfer|interac|invoice|cheque|check)\b/.test(lc)
+    && /\$?\s*\d+(\.\d{1,2})?\b/.test(lc);
+}
+
 
 async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
   const to = waTo(from);
@@ -655,25 +666,22 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   });
 
   if (!ENABLE_INTERACTIVE_LIST || !to) {
-    return twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE));
+    // plain text (TwiML) fallback
+    return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 
-  const rows = [];
-  for (let i = 0; i < slice.length; i++) {
-    const fullName = String(slice[i]?.name || slice[i]?.job_name || 'Untitled Job').trim();
-    const jobNo = Number(slice[i].job_no);
-
-    rows.push({
-      id: `jobno_${jobNo}`,
-      title: fullName.slice(0, 24),
-      description: `#${jobNo} ${fullName.slice(0, 72)}`
-    });
-  }
+  const rows = slice.map((j) => {
+    const full = String(j?.name || j?.job_name || 'Untitled Job').trim();
+    const jobNo = Number(j.job_no);
+    return { id: `jobno_${jobNo}`, title: full.slice(0, 24), description: `#${jobNo} ${full.slice(0, 72)}` };
+  });
 
   rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
-  if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: `Show next page` });
+  if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: 'Show next page' });
 
-  const bodyText = `Pick a job (${start + 1}-${Math.min(start + JOBS_PER_PAGE, clean.length)} of ${clean.length}).\n\nTip: You can also reply with a number like "1".`;
+  const bodyText =
+    `Pick a job (${start + 1}-${Math.min(start + JOBS_PER_PAGE, clean.length)} of ${clean.length}).` +
+    `\n\nTip: You can also reply with a number (like "1").`;
 
   try {
     await sendWhatsAppInteractiveList({
@@ -682,12 +690,17 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
       buttonText: 'Pick a job',
       sections: [{ title: 'Active Jobs', rows }]
     });
+
+    // ✅ IMPORTANT (Mode B):
+    // Do NOT send a second plain-text WhatsApp message here.
+    // Twilio-level DOUBLE_SEND_LIST_FALLBACK will do that when enabled.
     return out(twimlEmpty(), true);
   } catch (e) {
     console.warn('[JOB_PICKER] interactive list failed; falling back:', e?.message);
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 }
+
 
 function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 } = {}) {
   const raw = normalizeJobAnswer(input);
@@ -765,72 +778,88 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
 
   try {
-    // ---------------- 1) Awaiting job pick ----------------
-    const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-    if (pickPA?.payload?.jobOptions) {
-      const tok = normalizeDecisionToken(input);
-      const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
-      const page = Number(pickPA.payload.page || 0) || 0;
-      const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
-      const hasMore = !!pickPA.payload.hasMore;
+   // ---- 1) Awaiting job pick ----
+const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
 
-      if (tok === 'change_job') return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
+if (pickPA?.payload?.jobOptions) {
+  // If the user sent brand new revenue while we were waiting for a job pick,
+  // clear state and fall through to normal parsing (do NOT return).
+  if (looksLikeNewRevenueText(input)) {
+    console.info('[REVENUE] pick-job bypass: new revenue detected, clearing PAs');
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM }); } catch {}
+  } else {
+    const tok = normalizeDecisionToken(input);
 
-      if (tok === 'more') {
-        if (!hasMore) return twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".');
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
-      }
+    const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
+    const page = Number(pickPA.payload.page || 0) || 0;
+    const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
+    const hasMore = !!pickPA.payload.hasMore;
 
-      const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize });
-      if (!resolved) return twimlText('Please reply with a number, job name, "Overhead", or "more".');
-
-      const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-      if (!confirm?.payload?.draft) {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-        return twimlText('Got it. Now resend the revenue details.');
-      }
-
-      if (resolved.kind === 'overhead') {
-        confirm.payload.draft.jobName = 'Overhead';
-        confirm.payload.draft.jobSource = 'overhead';
-        confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
-        confirm.payload.draft.job_id = null;
-      } else if (resolved.kind === 'job') {
-        const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
-        const jobId = resolved.job?.id ? String(resolved.job.id).trim() : null;
-
-        confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
-        confirm.payload.draft.jobSource = 'picked';
-
-        confirm.payload.draft.job = {
-          id: jobId && looksLikeUuid(jobId) ? jobId : null,
-          job_no: resolved.job?.job_no != null ? Number(resolved.job.job_no) : null,
-          name: jobName || null
-        };
-
-        confirm.payload.draft.job_id = jobId && looksLikeUuid(jobId) ? jobId : null;
-      } else if (resolved.kind === 'more') {
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
-      } else {
-        return twimlText('Please reply with a number, job name, "Overhead", or "more".');
-      }
-
-      await upsertPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM, payload: confirm.payload, ttlSeconds: PA_TTL_SEC });
-      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-
-      const summaryLine = buildRevenueSummaryLine({
-        amount: confirm.payload.draft.amount,
-        source: confirm.payload.draft.source,
-        date: confirm.payload.draft.date,
-        jobName: confirm.payload.draft.jobName,
-        tz
-      });
-
-      const summaryLineWithHint = `${summaryLine}${buildActiveJobHint(confirm.payload.draft.jobName, confirm.payload.draft.jobSource)}`;
-      return await sendConfirmRevenueOrFallback(from, summaryLineWithHint);
+    if (tok === 'change_job') {
+      return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
     }
 
-    // ---------------- 2) Confirm/edit/cancel ----------------
+    if (tok === 'more') {
+      if (!hasMore) return twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".');
+      return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
+    }
+
+    const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize });
+    if (!resolved) return twimlText('Please reply with a number, job name, "Overhead", or "more".');
+
+    const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    if (!confirm?.payload?.draft) {
+      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+      return twimlText('Got it. Now resend the revenue details.');
+    }
+
+    if (resolved.kind === 'overhead') {
+      confirm.payload.draft.jobName = 'Overhead';
+      confirm.payload.draft.jobSource = 'overhead';
+      confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
+      confirm.payload.draft.job_id = null;
+    } else if (resolved.kind === 'job') {
+      const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
+      const jobId = resolved.job?.id ? String(resolved.job.id).trim() : null;
+
+      confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
+      confirm.payload.draft.jobSource = 'picked';
+
+      confirm.payload.draft.job = {
+        id: jobId && looksLikeUuid(jobId) ? jobId : null,
+        job_no: resolved.job?.job_no != null ? Number(resolved.job.job_no) : null,
+        name: jobName || null
+      };
+
+      confirm.payload.draft.job_id = jobId && looksLikeUuid(jobId) ? jobId : null;
+    } else {
+      return twimlText('Please reply with a number, job name, "Overhead", or "more".');
+    }
+
+    await upsertPA({
+      ownerId,
+      userId: from,
+      kind: PA_KIND_CONFIRM,
+      payload: confirm.payload,
+      ttlSeconds: PA_TTL_SEC
+    });
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+
+    const summaryLine = buildRevenueSummaryLine({
+      amount: confirm.payload.draft.amount,
+      source: confirm.payload.draft.source,
+      date: confirm.payload.draft.date,
+      jobName: confirm.payload.draft.jobName,
+      tz
+    });
+
+    const summaryLineWithHint = `${summaryLine}${buildActiveJobHint(confirm.payload.draft.jobName, confirm.payload.draft.jobSource)}`;
+    return await sendConfirmRevenueOrFallback(from, summaryLineWithHint);
+  }
+}
+
+// ---- 2) Confirm/edit/cancel ----
 const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
 if (confirmPA?.payload?.draft) {
@@ -855,9 +884,7 @@ if (confirmPA?.payload?.draft) {
 
   if (token === 'cancel') {
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    try {
-      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-    } catch {}
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
     return twimlText('❌ Operation cancelled.');
   }
 
@@ -871,7 +898,6 @@ if (confirmPA?.payload?.draft) {
     const rawJobId =
       rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
 
-    // Never allow numeric job_id to be written into tx.job_id
     if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
       console.warn('[REVENUE] refusing numeric job id; forcing null', { job_id: rawJobId });
       if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
@@ -892,17 +918,14 @@ if (confirmPA?.payload?.draft) {
 
     const pickedJobName = data.jobName && String(data.jobName).trim() ? String(data.jobName).trim() : null;
 
-    // Prefer what we already knew from PA (picker/overhead/etc.)
     let jobName = pickedJobName || rawDraft?.jobName || null;
     let jobSource = rawDraft?.jobSource || (pickedJobName ? 'typed' : null);
 
-    // Only resolve active job if we still don't have a job
     if (!jobName) {
       jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
       if (jobName) jobSource = 'active';
     }
 
-    // Overhead normalization always wins
     if (jobName && looksLikeOverhead(jobName)) {
       jobName = 'Overhead';
       jobSource = 'overhead';
@@ -1001,9 +1024,7 @@ if (confirmPA?.payload?.draft) {
         : `✅ Logged revenue\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${activeHint}`;
 
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    try {
-      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-    } catch {}
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
 
     return twimlText(reply);
   }

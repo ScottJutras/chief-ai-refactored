@@ -27,7 +27,6 @@ const {
   sendTemplateMessage,
   sendTemplateQuickReply,
   toWhatsApp,
-  toTemplateVar
 } = require('../../services/twilio');
 const { toTemplateVar: twilioToTemplateVar, ...rest } = require('../../services/twilio');
 

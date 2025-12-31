@@ -367,11 +367,28 @@ function formatMoneyDisplay(n) {
 
 function normalizeJobAnswer(text) {
   let s = String(text || '').trim();
+  if (!s) return s;
+
+  // ✅ Preserve job picker tokens (do this BEFORE stripping "job ..." prefixes)
+  // 1) Our canonical token
+  if (/^jobno_\d+$/i.test(s)) return s;
+
+  // 2) Twilio list id format you actually receive: job_<jobno>_<hash>
+  // Example: job_4_b1133803 -> jobno_4
+  const mTw = s.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+  if (mTw?.[1]) return `jobno_${mTw[1]}`;
+
+  // 3) If Twilio sends "#4 Name" as Body/ListTitle, keep it for the resolver
+  // (resolver already handles leading #num)
+  // no-op here
+
+  // Existing cleanup (safe now)
   s = s.replace(/^(job\s*name|job)\s*[:\-]?\s*/i, '');
   s = s.replace(/^(create|new)\s+job\s+/i, '');
   s = s.replace(/[?]+$/g, '').trim();
   return s;
 }
+
 
 function looksLikeOverhead(s) {
   const t = String(s || '').trim().toLowerCase();

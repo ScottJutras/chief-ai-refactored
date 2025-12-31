@@ -457,7 +457,8 @@ function normDedupeStr(v) {
     .trim()
     .toLowerCase()
     .replace(/\s+/g, ' ')
-    .replace(/[^\p{L}\p{N}\s\.\-\&]/, ''); 
+    // keep: a-z 0-9 space . - &
+    .replace(/[^a-z0-9 .\-&]/g, '');
 }
 
 function buildTxnDedupeHash({ owner, kind, date, amountCents, source, description, jobNo, jobName }) {

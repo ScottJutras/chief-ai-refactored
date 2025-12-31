@@ -714,6 +714,7 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
   const p = Math.max(0, Number(page || 0));
   const ps = Math.min(8, Math.max(1, Number(pageSize || 8)));
 
+  // 1) jobno_123
   const mJobNo = t.match(/^jobno_(\d{1,10})$/i);
   if (mJobNo?.[1]) {
     const jobNo = Number(mJobNo[1]);
@@ -725,6 +726,17 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
     return { kind: 'job', job: opt };
   }
 
+  // 2) "#6 Happy Street" OR "6 Happy Street" -> job_no = 6
+  const mHash = t.match(/^#?\s*(\d{1,10})\b/);
+  if (mHash?.[1]) {
+    const jobNo = Number(mHash[1]);
+    if (Number.isFinite(jobNo)) {
+      const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
+      if (opt) return { kind: 'job', job: opt };
+    }
+  }
+
+  // 3) Page index selection
   if (/^\d+$/.test(t)) {
     const n = Number(t);
     if (!Number.isFinite(n) || n <= 0) return null;
@@ -740,6 +752,7 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
     return { kind: 'job', job: opt };
   }
 
+  // 4) Name match
   const opt =
     (jobOptions || []).find((j) => String(j?.name || j?.job_name || '').trim().toLowerCase() === lc) ||
     (jobOptions || []).find((j) => String(j?.name || j?.job_name || '').trim().toLowerCase().startsWith(lc.slice(0, 24))) ||
@@ -753,6 +766,7 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
 
   return null;
 }
+
 
 function buildRevenueSummaryLine({ amount, source, date, jobName, tz }) {
   const amt = String(amount || '').trim();

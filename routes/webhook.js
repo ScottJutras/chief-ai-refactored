@@ -129,17 +129,20 @@ function isJobPickerIntent(lc) {
 function looksLikeJobPickerReplyToken(raw) {
   const s = String(raw || '').trim();
   if (!s) return false;
+
   if (/^(more|overhead|oh)$/i.test(s)) return true;
   if (/^\d+$/.test(s)) return true;
-
-  // ✅ expense.js / job picker uses "jobno_<job_no>"
   if (/^jobno_\d+$/i.test(s)) return true;
 
-  // Keep legacy format if anything still emits it
+  // NEW: "#6 Happy Street" / "#6"
+  if (/^#?\s*\d+\b/.test(s)) return true;
+
+  // legacy
   if (/^job_\d+_[0-9a-f]+$/i.test(s)) return true;
 
   return false;
 }
+
 
 function pendingTxnNudgeMessage(pending) {
   const type = pending?.type || pending?.kind || 'entry';
@@ -161,44 +164,71 @@ Or reply "skip" to leave it pending and continue.`;
  * 3) InteractiveResponseJson list_reply.id/title
  * 4) Twilio WhatsApp List fields (prefer row id)
  * 5) Body
+ *
+ * ALSO:
+ * - If we only get a "row title" like "#6 Happy Street", normalize to "jobno_6"
  */
 function getInboundText(body = {}) {
+  const normalizeListPick = (raw) => {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+
+    // already-canonical
+    if (/^jobno_\d+$/i.test(s)) return s;
+
+    // allow plain number
+    if (/^\d+$/.test(s)) return s;
+
+    // common list title format: "#6 Happy Street" or "#6"
+    const m = s.match(/^#?\s*(\d+)\b/);
+    if (m && m[1]) return `jobno_${m[1]}`;
+
+    return s;
+  };
+
   // 1) Buttons / quick replies
   const payload = String(body.ButtonPayload || body.buttonPayload || '').trim();
-  if (payload) return payload;
+  if (payload) return normalizeListPick(payload);
 
   const btnText = String(body.ButtonText || body.buttonText || '').trim();
-  if (btnText) return btnText;
+  if (btnText) return normalizeListPick(btnText);
 
   // 2) InteractiveResponseJson (some Twilio flows use this)
   const irj = body.InteractiveResponseJson || body.interactiveResponseJson || null;
   if (irj) {
     try {
       const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
+
+      // try multiple possible shapes
       const id =
         json?.list_reply?.id ||
         json?.listReply?.id ||
         json?.interactive?.list_reply?.id ||
+        json?.interactive?.listReply?.id ||
         '';
+
       const title =
         json?.list_reply?.title ||
         json?.listReply?.title ||
         json?.interactive?.list_reply?.title ||
+        json?.interactive?.listReply?.title ||
         '';
+
       const picked = String(id || title || '').trim();
-      if (picked) return picked;
-    } catch {}
+      if (picked) return normalizeListPick(picked);
+    } catch {
+      // ignore parse errors
+    }
   }
 
   // 3) Twilio list picker fields (MOST IMPORTANT: ListRowId)
-  const listRowId = String(body.ListRowId || body.listRowId || body.ListRowID || '').trim();
-  if (listRowId) return listRowId;
+  const listRowId = String(body.ListRowId || body.listRowId || body.ListRowID || body.listRowID || '').trim();
+  if (listRowId) return normalizeListPick(listRowId);
 
   const listRowTitle = String(body.ListRowTitle || body.listRowTitle || '').trim();
-  // Only use title if we *don't* have an id
-  if (listRowTitle) return listRowTitle;
+  if (listRowTitle) return normalizeListPick(listRowTitle);
 
-  // 4) Other Twilio variants you already had
+  // 4) Other Twilio variants
   const listId = String(
     body.ListId ||
       body.listId ||
@@ -208,7 +238,7 @@ function getInboundText(body = {}) {
       body.listReplyId ||
       ''
   ).trim();
-  if (listId) return listId;
+  if (listId) return normalizeListPick(listId);
 
   const listTitle = String(
     body.ListTitle ||
@@ -219,11 +249,12 @@ function getInboundText(body = {}) {
       body.listReplyTitle ||
       ''
   ).trim();
-  if (listTitle) return listTitle;
+  if (listTitle) return normalizeListPick(listTitle);
 
   // 5) Fallback
-  return String(body.Body || '').trim();
+  return normalizeListPick(String(body.Body || '').trim());
 }
+
 
 
 /* ---------------- NL heuristics for expense/revenue ---------------- */
@@ -495,48 +526,80 @@ router.post('*', (req, _res, next) => {
     if (!INBOUND_LIST_DEBUG) return next();
 
     const b = req.body || {};
-    const hasListish =
-      !!b.InteractiveResponseJson ||
-      !!b.ListRowId ||
-      !!b.ListRowTitle ||
-      !!b.ListId ||
-      !!b.ListTitle ||
-      !!b.ListReplyId ||
-      !!b.ListReplyTitle ||
-      !!b.ListItemId ||
-      !!b.ListItemTitle;
+
+    const get = (...keys) => {
+      for (const k of keys) {
+        if (b[k] != null && String(b[k]).trim() !== '') return b[k];
+      }
+      return undefined;
+    };
+
+    const listRowId = get('ListRowId', 'ListRowID', 'listRowId', 'listRowID');
+    const listRowTitle = get('ListRowTitle', 'listRowTitle');
+    const listId = get('ListId', 'listId', 'ListItemId', 'listItemId', 'ListReplyId', 'listReplyId');
+    const listTitle = get('ListTitle', 'listTitle', 'ListItemTitle', 'listItemTitle', 'ListReplyTitle', 'listReplyTitle');
+    const irj = get('InteractiveResponseJson', 'interactiveResponseJson');
+    const btnPayload = get('ButtonPayload', 'buttonPayload');
+    const btnText = get('ButtonText', 'buttonText');
+
+    const hasListish = !!(irj || listRowId || listRowTitle || listId || listTitle);
+    const hasButtonish = !!(btnPayload || btnText);
 
     // Only log when it looks like a list/interactive click OR a button payload
-    if (!hasListish && !b.ButtonPayload && !b.ButtonText) return next();
+    if (!hasListish && !hasButtonish) return next();
+
+    // Helpful: show what getInboundText() resolved to (safe: doesn't mutate)
+    let resolvedInbound = '';
+    try {
+      resolvedInbound = typeof getInboundText === 'function' ? String(getInboundText(b) || '') : '';
+    } catch {
+      resolvedInbound = '';
+    }
+
+    const trunc = (v, n = 400) => {
+      const s = String(v ?? '');
+      if (s.length <= n) return s;
+      return s.slice(0, n) + `…(+${s.length - n} chars)`;
+    };
+
+    // compact "which keys exist" list
+    const present = Object.keys(b)
+      .filter((k) => b[k] != null && String(b[k]).trim() !== '')
+      .slice(0, 60);
 
     console.info('[INBOUND_LIST_DEBUG]', {
       MessageSid: b.MessageSid,
       SmsMessageSid: b.SmsMessageSid,
       From: b.From,
+      WaId: b.WaId,
+      ProfileName: b.ProfileName,
       Body: b.Body,
 
       // Most important for your case:
-      ListRowId: b.ListRowId,
-      ListRowTitle: b.ListRowTitle,
+      ListRowId: listRowId,
+      ListRowTitle: listRowTitle,
 
-      // Common Twilio variants:
-      ListId: b.ListId,
-      ListTitle: b.ListTitle,
-      ListReplyId: b.ListReplyId,
-      ListReplyTitle: b.ListReplyTitle,
-      ListItemId: b.ListItemId,
-      ListItemTitle: b.ListItemTitle,
+      // Other list variants:
+      ListId: listId,
+      ListTitle: listTitle,
 
-      // Other interactive/button fields:
-      InteractiveResponseJson: b.InteractiveResponseJson,
-      ButtonPayload: b.ButtonPayload,
-      ButtonText: b.ButtonText
+      // Interactive/button fields:
+      ButtonPayload: btnPayload,
+      ButtonText: btnText,
+      InteractiveResponseJson: irj ? trunc(irj, 800) : undefined,
+
+      // What your router will see after normalization:
+      ResolvedInboundText: resolvedInbound,
+
+      // Quick glance at available keys:
+      KeysPresent: present
     });
   } catch (e) {
     console.warn('[INBOUND_LIST_DEBUG] failed:', e?.message);
   }
   next();
 });
+
 
 
 /* ---------------- Quick version check ---------------- */

@@ -806,25 +806,47 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
   const p = Math.max(0, Number(page || 0));
   const ps = Math.min(8, Math.max(1, Number(pageSize || 8)));
 
+  // 1) jobno_123 (best case from list picker)
   const mJobNo = t.match(/^jobno_(\d{1,10})$/i);
   if (mJobNo?.[1]) {
     const jobNo = Number(mJobNo[1]);
     if (!Number.isFinite(jobNo)) return null;
+
     const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
     if (!opt) return null;
+
     return { kind: 'job', job: { job_no: Number(opt.job_no), name: String(opt.name || '').trim() || null } };
   }
 
+    //2)  Accept list-row titles like "#6 Happy Street" (convert to jobno_6)
+  const mHashNo = t.match(/^#?\s*(\d{1,10})\b/);
+  if (mHashNo?.[1]) {
+    const jobNo = Number(mHashNo[1]);
+    if (Number.isFinite(jobNo)) {
+      const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
+      if (opt) {
+        // expense.js shape:
+        return { kind: 'job', job: { job_no: Number(opt.job_no), name: String(opt.name || '').trim() || null } };
+        // revenue.js shape: return { kind: 'job', job: opt };
+      }
+    }
+  }
+
+
+  // 3) Plain number (page index: "1" means first item on current page)
   if (/^\d+$/.test(t)) {
     const n = Number(t);
     if (!Number.isFinite(n) || n <= 0) return null;
+
     const start = p * ps;
     const idx = start + (n - 1);
     const opt = (jobOptions || [])[idx] || null;
     if (!opt) return null;
+
     return { kind: 'job', job: { job_no: Number(opt.job_no), name: String(opt.name || '').trim() || null } };
   }
 
+  // 4) Name match
   const opt =
     (jobOptions || []).find((j) => String(j?.name || '').trim().toLowerCase() === lc) ||
     (jobOptions || []).find((j) => String(j?.name || '').trim().toLowerCase().startsWith(lc.slice(0, 24))) ||
@@ -834,6 +856,7 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
 
   return null;
 }
+
 
 const ENABLE_INTERACTIVE_LIST = (() => {
   const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? process.env.TWILIO_ENABLE_LIST_PICKER ?? 'true';

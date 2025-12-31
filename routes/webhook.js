@@ -155,25 +155,50 @@ Or reply "skip" to leave it pending and continue.`;
 
 /**
  * ✅ Inbound text normalization (button-aware + interactive list-aware)
+ * Priority:
+ * 1) ButtonPayload (best: deterministic)
+ * 2) ButtonText
+ * 3) InteractiveResponseJson list_reply.id/title
+ * 4) Twilio WhatsApp List fields (prefer row id)
+ * 5) Body
  */
 function getInboundText(body = {}) {
+  // 1) Buttons / quick replies
   const payload = String(body.ButtonPayload || body.buttonPayload || '').trim();
   if (payload) return payload;
 
   const btnText = String(body.ButtonText || body.buttonText || '').trim();
   if (btnText) return btnText;
 
+  // 2) InteractiveResponseJson (some Twilio flows use this)
   const irj = body.InteractiveResponseJson || body.interactiveResponseJson || null;
   if (irj) {
     try {
       const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
-      const id = json?.list_reply?.id || json?.listReply?.id || json?.interactive?.list_reply?.id || '';
-      const title = json?.list_reply?.title || json?.listReply?.title || json?.interactive?.list_reply?.title || '';
+      const id =
+        json?.list_reply?.id ||
+        json?.listReply?.id ||
+        json?.interactive?.list_reply?.id ||
+        '';
+      const title =
+        json?.list_reply?.title ||
+        json?.listReply?.title ||
+        json?.interactive?.list_reply?.title ||
+        '';
       const picked = String(id || title || '').trim();
       if (picked) return picked;
     } catch {}
   }
 
+  // 3) Twilio list picker fields (MOST IMPORTANT: ListRowId)
+  const listRowId = String(body.ListRowId || body.listRowId || body.ListRowID || '').trim();
+  if (listRowId) return listRowId;
+
+  const listRowTitle = String(body.ListRowTitle || body.listRowTitle || '').trim();
+  // Only use title if we *don't* have an id
+  if (listRowTitle) return listRowTitle;
+
+  // 4) Other Twilio variants you already had
   const listId = String(
     body.ListId ||
       body.listId ||
@@ -196,8 +221,10 @@ function getInboundText(body = {}) {
   ).trim();
   if (listTitle) return listTitle;
 
+  // 5) Fallback
   return String(body.Body || '').trim();
 }
+
 
 /* ---------------- NL heuristics for expense/revenue ---------------- */
 

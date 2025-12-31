@@ -676,9 +676,21 @@ function deterministicExpenseParse(input, userProfile) {
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
   let item = null;
+
+  // 1) "worth of <item>"
   const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i);
   if (worthOf?.[1]) item = String(worthOf[1]).trim();
 
+  // ✅ 2) "$4000 -Degreaser at Home Hardware ..." OR "$4000 - tar removal materials at ..."
+  // (handles both hyphen styles; keeps it conservative so we don’t eat store/date/job)
+  if (!item) {
+    const dashItem = raw.match(
+      /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
+    );
+    if (dashItem?.[1]) item = String(dashItem[1]).trim();
+  }
+
+  // 3) "for <item> from/at <store>" (but avoid "for job X")
   if (!item) {
     const itemMatch = raw.match(
       /\bfor\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
@@ -698,6 +710,7 @@ function deterministicExpenseParse(input, userProfile) {
     jobName: jobName || null
   };
 }
+
 
 async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   const vendor = String(data?.store || '').trim() || 'Unknown Store';
@@ -957,10 +970,19 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   const p = Math.max(0, Number(page || 0));
   const start = p * JOBS_PER_PAGE;
 
-  const clean = (jobOptions || []).filter((j) => {
+  // ✅ Filter + de-dupe by job_no (job_no must behave like a key for jobno_<n>)
+  // This prevents jobno_6 mapping to "the wrong job" when duplicates exist.
+  const seen = new Set();
+  const clean = [];
+  for (const j of (jobOptions || [])) {
     const n = j?.job_no != null ? Number(j.job_no) : null;
-    return n != null && Number.isFinite(n);
-  });
+    if (n == null || !Number.isFinite(n)) continue;
+
+    if (seen.has(n)) continue; // keep first
+    seen.add(n);
+
+    clean.push(j);
+  }
 
   const slice = clean.slice(start, start + JOBS_PER_PAGE);
   const hasMore = start + JOBS_PER_PAGE < clean.length;
@@ -981,7 +1003,12 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   const rows = slice.map((j) => {
     const full = String(j?.name || j?.job_name || 'Untitled Job').trim();
     const jobNo = Number(j.job_no);
-    return { id: `jobno_${jobNo}`, title: full.slice(0, 24), description: `#${jobNo} ${full.slice(0, 72)}` };
+
+    return {
+      id: `jobno_${jobNo}`,                 // ✅ stable token for resolver
+      title: full.slice(0, 24),
+      description: `#${jobNo} ${full.slice(0, 72)}`
+    };
   });
 
   rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
@@ -1008,6 +1035,7 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 }
+
 
 
 /* ---------------- Active job resolution ---------------- */
@@ -1116,7 +1144,7 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
   try {
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
-    // ---- 1) Awaiting job pick ----
+   // ---- 1) Awaiting job pick ----
 const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
 
 if (pickPA?.payload?.jobOptions) {
@@ -1146,14 +1174,55 @@ if (pickPA?.payload?.jobOptions) {
     }
 
     const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize });
-    if (!resolved) {
-      return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-    }
+if (!resolved) {
+  return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+}
+
+// 🔍 ADD THIS LOG RIGHT HERE
+console.info('[EXPENSE] pick-job resolved', {
+  input,
+  resolved,
+  page,
+  pageSize,
+  firstOptions: (jobOptions || []).slice(0, 12).map(j => ({
+    job_no: j?.job_no,
+    name: j?.name
+  }))
+});
 
     const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
     if (!confirm?.payload?.draft) {
       await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
       return out(twimlText('Got it. Now resend the expense details.'), false);
+    }
+
+    // ✅ Preserve text source for later inference
+    // IMPORTANT: do NOT overwrite with picker token (e.g., "jobno_6")
+    const existingOriginal =
+      confirm.payload.draft.originalText ||
+      confirm.payload.draft.draftText ||
+      confirm.payload.draft.text ||
+      confirm.payload.draft.media_transcript ||
+      confirm.payload.draft.mediaTranscript ||
+      null;
+
+    if (!existingOriginal) {
+      // Only set if we truly have nothing — and even then, avoid setting picker tokens
+      const maybePickerish = String(input || '').trim();
+      const isPickerToken =
+        /^jobno_\d+$/i.test(maybePickerish) ||
+        /^job_\d+_[0-9a-z]+$/i.test(maybePickerish) ||
+        maybePickerish === 'overhead' ||
+        maybePickerish === 'more';
+
+      if (!isPickerToken) {
+        confirm.payload.draft.originalText = maybePickerish;
+        confirm.payload.draft.draftText = maybePickerish;
+      }
+    } else {
+      // Normalize presence (keep what we already have)
+      confirm.payload.draft.originalText = confirm.payload.draft.originalText || existingOriginal;
+      confirm.payload.draft.draftText = confirm.payload.draft.draftText || existingOriginal;
     }
 
     if (resolved.kind === 'overhead') {
@@ -1205,6 +1274,7 @@ if (pickPA?.payload?.jobOptions) {
   }
 }
 
+
 // ---- 2) Confirm/edit/cancel ----
 const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
@@ -1255,17 +1325,28 @@ if (confirmPA?.payload?.draft) {
 
     let data = normalizeExpenseData(rawDraft, userProfile);
 
-    if (!data.item || !String(data.item).trim() || String(data.item).trim().toLowerCase() === 'unknown') {
-      const src =
-        rawDraft?.draftText ||
-        rawDraft?.originalText ||
-        rawDraft?.text ||
-        rawDraft?.media_transcript ||
-        rawDraft?.mediaTranscript ||
-        '';
-      const inferred = inferExpenseItemFallback(src);
-      if (inferred) data.item = inferred;
-    }
+// ✅ Strong Unknown handling (covers "Unknown", "Unknown ...", empty, etc.)
+if (isUnknownItem(data.item)) {
+  const src =
+    rawDraft?.draftText ||
+    rawDraft?.originalText ||
+    rawDraft?.text ||
+    rawDraft?.media_transcript ||
+    rawDraft?.mediaTranscript ||
+    rawDraft?.input ||
+    '';
+
+  // Try rule-based fallback first
+  let inferred = inferExpenseItemFallback(src);
+
+  // If we still didn't infer, try from the *current message text* when available
+  // (helps when drafts didn’t store originalText for some reason)
+  if (!inferred) {
+    inferred = inferExpenseItemFallback(input);
+  }
+
+  if (inferred) data.item = inferred;
+}
 
     data.store = await normalizeVendorName(ownerId, data.store);
     const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
@@ -1444,16 +1525,28 @@ if (backstop && backstop.amount) {
       if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
 
       await upsertPA({
-        ownerId,
-        userId: from,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          draft: { ...data0, jobName, jobSource, suggestedCategory: category, job_id: null, job_no: null },
-          sourceMsgId: safeMsgId,
-          type: 'expense'
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
+  ownerId,
+  userId: from,
+  kind: PA_KIND_CONFIRM,
+  payload: {
+    draft: {
+      ...data0,
+      jobName,
+      jobSource,
+      suggestedCategory: category,
+      job_id: null,
+      job_no: null,
+
+      // ✅ Persist a text source so YES-path can recover item names reliably
+      originalText: input,
+      draftText: input
+    },
+    sourceMsgId: safeMsgId,
+    type: 'expense'
+  },
+  ttlSeconds: PA_TTL_SEC
+});
+
 
       if (!jobName) {
         const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
@@ -1522,16 +1615,28 @@ if (data && isUnknownItem(data.item)) {
       if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 
       await upsertPA({
-        ownerId,
-        userId: from,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          draft: { ...data, jobName, jobSource, suggestedCategory: category, job_id: null, job_no: null },
-          sourceMsgId: safeMsgId,
-          type: 'expense'
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
+  ownerId,
+  userId: from,
+  kind: PA_KIND_CONFIRM,
+  payload: {
+    draft: {
+      ...data,
+      jobName,
+      jobSource,
+      suggestedCategory: category,
+      job_id: null,
+      job_no: null,
+
+      // ✅ Persist source text (fixes "Edit -> Unknown" regressions)
+      originalText: input,
+      draftText: input
+    },
+    sourceMsgId: safeMsgId,
+    type: 'expense'
+  },
+  ttlSeconds: PA_TTL_SEC
+});
+
 
       if (!jobName) {
         const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));

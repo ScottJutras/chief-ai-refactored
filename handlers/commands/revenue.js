@@ -666,10 +666,18 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   const p = Math.max(0, Number(page || 0));
   const start = p * JOBS_PER_PAGE;
 
-  const clean = (jobOptions || []).filter((j) => {
+  // ✅ Filter + de-dupe by job_no (job_no must behave like a key for jobno_<n>)
+  const seen = new Set();
+  const clean = [];
+  for (const j of (jobOptions || [])) {
     const n = j?.job_no != null ? Number(j.job_no) : null;
-    return n != null && Number.isFinite(n);
-  });
+    if (n == null || !Number.isFinite(n)) continue;
+
+    if (seen.has(n)) continue; // keep first
+    seen.add(n);
+
+    clean.push(j);
+  }
 
   const slice = clean.slice(start, start + JOBS_PER_PAGE);
   const hasMore = start + JOBS_PER_PAGE < clean.length;
@@ -690,7 +698,12 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   const rows = slice.map((j) => {
     const full = String(j?.name || j?.job_name || 'Untitled Job').trim();
     const jobNo = Number(j.job_no);
-    return { id: `jobno_${jobNo}`, title: full.slice(0, 24), description: `#${jobNo} ${full.slice(0, 72)}` };
+
+    return {
+      id: `jobno_${jobNo}`,
+      title: full.slice(0, 24),
+      description: `#${jobNo} ${full.slice(0, 72)}`
+    };
   });
 
   rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
@@ -708,15 +721,13 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
       sections: [{ title: 'Active Jobs', rows }]
     });
 
-    // ✅ IMPORTANT (Mode B):
-    // Do NOT send a second plain-text WhatsApp message here.
-    // Twilio-level DOUBLE_SEND_LIST_FALLBACK will do that when enabled.
     return out(twimlEmpty(), true);
   } catch (e) {
     console.warn('[JOB_PICKER] interactive list failed; falling back:', e?.message);
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 }
+
 
 
 function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 } = {}) {

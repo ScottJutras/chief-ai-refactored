@@ -42,30 +42,43 @@ const mergePendingTransactionState =
 /* ---------------- Small helpers ---------------- */
 
 function xmlEsc(s = '') {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
-const xml = (s = '') => `<Response><Message>${xmlEsc(s)}</Message></Response>`;
-const emptyTwiml = () => `<Response></Response>`;
+function twimlText(s = '') {
+  const safe = String(s || '');
+  return `<Response><Message>${xmlEsc(safe)}</Message></Response>`;
+}
+
+// ✅ single source of truth
+function twimlEmpty() {
+  return '<Response></Response>';
+}
 
 const sendTwiml = (res, twiml) => {
   if (res.headersSent) return;
-  return res.status(200).type('application/xml; charset=utf-8').send(twiml || emptyTwiml());
+
+  const out = String(twiml || '').trim();
+  // Always return valid XML
+  const payload = out ? out : twimlEmpty();
+
+  return res.status(200).type('text/xml; charset=utf-8').send(payload);
 };
 
-// Safer: if you pass null/empty, it returns empty TwiML (no visible Message bubble)
-const ok2 = (res, text) => {
+// Safe default:
+// ok(res) -> empty TwiML
+// ok(res, "text") -> visible bubble
+const ok = (res, text = null) => {
   if (res.headersSent) return;
-  if (!text) return sendTwiml(res, emptyTwiml());
-  return sendTwiml(res, xml(text));
+  if (!text) return sendTwiml(res, twimlEmpty());
+  return sendTwiml(res, twimlText(text));
 };
 
-// ✅ IMPORTANT: redefine ok to be safe by default.
-// - ok(res) -> empty TwiML
-// - ok(res, "text") -> visible bubble
-const ok = (res, text = null) => ok2(res, text);
-
-const normalizePhone = (raw = '') => String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
+const normalizePhone = (raw = '') =>
+  String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
 
 function pickFirstMedia(body = {}) {
   const n = parseInt(body.NumMedia || '0', 10) || 0;
@@ -503,24 +516,27 @@ router.post('*', async (req, res, next) => {
 
     const result = await handleMedia(req.from, bodyText, req.userProfile || {}, req.ownerId, url, type, sourceMsgId);
 
+    // result object shape: { transcript, twiml }
     if (result && typeof result === 'object') {
-      if (result.twiml && !res.headersSent) {
+      if (typeof result.twiml === 'string' && !res.headersSent) {
+        // ✅ even if twiml is '', sendTwiml will emit <Response></Response>
         return sendTwiml(res, result.twiml);
       }
+
       if (result.transcript) {
         req.body.Body = result.transcript;
         return next();
       }
     }
 
-    if (typeof result === 'string' && result && !res.headersSent) {
+    if (typeof result === 'string' && !res.headersSent) {
       return sendTwiml(res, result);
     }
 
     return next();
   } catch (e) {
     console.error('[MEDIA] error:', e?.message);
-    if (!res.headersSent) return ok(res, 'Media processed.');
+    if (!res.headersSent) return ok(res, null); // empty TwiML
   }
 });
 
@@ -758,84 +774,96 @@ router.post('*', async (req, res, next) => {
     }
 
     /* -----------------------------------------------------------------------
-     * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
-     * ----------------------------------------------------------------------- */
+ * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
+ * ----------------------------------------------------------------------- */
 
-    const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
-    const revenueNl = !revenuePrefix && looksRevenueNl(text2);
-    const looksRevenue = revenuePrefix || revenueNl;
+const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
+const revenueNl = !revenuePrefix && looksRevenueNl(text2);
+const looksRevenue = revenuePrefix || revenueNl;
 
-    if (looksRevenue) {
-      if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
+if (looksRevenue) {
+  if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
 
-      try {
-        const { handleRevenue } = require('../handlers/commands/revenue');
+  try {
+    const { handleRevenue } = require('../handlers/commands/revenue');
 
-        const timeoutMs = 8000;
-        const timeoutTwiml =
-          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
+    const timeoutMs = 8000;
+    const timeoutTwiml = twimlText(
+      '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
+    );
 
-        let timeoutId = null;
-        const timeoutPromise = new Promise((resolve) => {
-          timeoutId = setTimeout(() => {
-            console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
-            resolve(timeoutTwiml);
-          }, timeoutMs);
-        });
+    let timeoutId = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
+        resolve(timeoutTwiml);
+      }, timeoutMs);
+    });
 
-        const tw = await Promise.race([
-          handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-          timeoutPromise
-        ]).finally(() => timeoutId && clearTimeout(timeoutId));
+    const result = await Promise.race([
+      handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+      timeoutPromise
+    ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        if (!res.headersSent) {
-          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          return ok(res); // empty
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-      }
+    if (!res.headersSent) {
+      const twiml =
+        typeof result === 'string'
+          ? result
+          : (result && typeof result.twiml === 'string' ? result.twiml : null);
+
+      return sendTwiml(res, twiml); // null -> <Response></Response>
     }
+    return;
+  } catch (e) {
+    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+    if (!res.headersSent) return ok(res, null);
+    return;
+  }
+}
 
-    const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
-    const expenseNl = !expensePrefix && looksExpenseNl(text2);
-    const looksExpense = expensePrefix || expenseNl;
+const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
+const expenseNl = !expensePrefix && looksExpenseNl(text2);
+const looksExpense = expensePrefix || expenseNl;
 
-    if (looksExpense) {
-      if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
+if (looksExpense) {
+  if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
 
-      try {
-        const { handleExpense } = require('../handlers/commands/expense');
+  try {
+    const { handleExpense } = require('../handlers/commands/expense');
 
-        const timeoutMs = 8000;
-        const timeoutTwiml =
-          `<Response><Message>⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.</Message></Response>`;
+    const timeoutMs = 8000;
+    const timeoutTwiml = twimlText(
+      '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
+    );
 
-        let timeoutId = null;
-        const timeoutPromise = new Promise((resolve) => {
-          timeoutId = setTimeout(() => {
-            console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
-            resolve(timeoutTwiml);
-          }, timeoutMs);
-        });
+    let timeoutId = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
+        resolve(timeoutTwiml);
+      }, timeoutMs);
+    });
 
-        const tw = await Promise.race([
-          handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-          timeoutPromise
-        ]).finally(() => timeoutId && clearTimeout(timeoutId));
+    const result = await Promise.race([
+      handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+      timeoutPromise
+    ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        if (!res.headersSent) {
-          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          return ok(res); // empty
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] expense handler failed:', e?.message);
-      }
+    if (!res.headersSent) {
+      const twiml =
+        typeof result === 'string'
+          ? result
+          : (result && typeof result.twiml === 'string' ? result.twiml : null);
+
+      return sendTwiml(res, twiml); // null -> <Response></Response>
     }
+    return;
+  } catch (e) {
+    console.warn('[WEBHOOK] expense handler failed:', e?.message);
+    if (!res.headersSent) return ok(res, null);
+    return;
+  }
+}
 
     /* -----------------------------------------------------------------------
      * (C) Other command routing (tasks / jobs / timeclock / forecast / KPIs / agent)

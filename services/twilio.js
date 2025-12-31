@@ -177,33 +177,56 @@ async function sendQuickReply(to, body, replies = []) {
 /**
  * Template sender (Twilio Content API).
  * ✅ HARDENED: never sends an empty-body, and falls back to sendWhatsApp if sid missing.
+ * ✅ LOGGED: prints payload summary + result sid/status + errors
  */
 async function sendTemplateMessage(to, contentSid, vars = {}, fallbackBody = '') {
   const sid = String(contentSid || '').trim();
 
-  // No SID -> plain message
+  // No SID -> plain message (prevents 21619)
   if (!sid) {
     const body =
       String(fallbackBody || '').trim() ||
-      Object.values(vars || {}).map((v) => String(v || '')).join(' ').trim() ||
+      Object.values(vars || {})
+        .map((v) => String(v || ''))
+        .join(' ')
+        .trim() ||
       '—';
+
+    console.warn('[TWILIO] sendTemplateMessage: missing contentSid; falling back to body');
     return sendWhatsApp(to, body);
   }
 
   const safeFallback = String(fallbackBody || '').trim() || ' ';
 
-  const payload = applyFromOrService(
-    {
-      to: toWhatsApp(to),
-      contentSid: sid,
-      contentVariables: JSON.stringify(vars || {}),
-      // Safety net: keep a non-empty body so Twilio never rejects (21619)
-      body: safeFallback
-    },
-    'whatsapp'
-  );
+  const payload = applyFromOrService({
+    to: toWhatsApp(to),
+    contentSid: sid,
+    contentVariables: JSON.stringify(vars || {}),
+    // Safety net: keep a non-empty body so Twilio never rejects (21619)
+    body: safeFallback
+  });
 
-  return twilioClient.messages.create(payload);
+  console.info('[TWILIO] sendTemplateMessage messages.create payload', {
+    to: payload.to,
+    hasFrom: !!payload.from,
+    hasMessagingServiceSid: !!payload.messagingServiceSid,
+    hasContentSid: !!payload.contentSid,
+    hasContentVariables: !!payload.contentVariables,
+    hasBody: !!payload.body
+  });
+
+  try {
+    const msg = await twilioClient.messages.create(payload);
+    console.info('[TWILIO] sendTemplateMessage messages.create result', { sid: msg?.sid, status: msg?.status });
+    return msg;
+  } catch (e) {
+    console.warn('[TWILIO] sendTemplateMessage messages.create failed', {
+      message: e?.message,
+      code: e?.code,
+      status: e?.status
+    });
+    throw e; // let callers decide fallback (your interactive list does)
+  }
 }
 
 async function sendTemplateQuickReply(to, contentSid, vars = {}, fallbackBody = '') {

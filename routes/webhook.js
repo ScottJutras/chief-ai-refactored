@@ -131,17 +131,17 @@ function looksLikeJobPickerReplyToken(raw) {
   if (!s) return false;
 
   if (/^(more|overhead|oh)$/i.test(s)) return true;
-  if (/^\d+$/.test(s)) return true;
+  if (/^\d+$/i.test(s)) return true;
+
+  // ✅ current picker id format
   if (/^jobno_\d+$/i.test(s)) return true;
 
-  // NEW: "#6 Happy Street" / "#6"
-  if (/^#?\s*\d+\b/.test(s)) return true;
-
-  // legacy
+  // ✅ Twilio legacy id format arriving in your logs
   if (/^job_\d+_[0-9a-f]+$/i.test(s)) return true;
 
   return false;
 }
+
 
 
 function pendingTxnNudgeMessage(pending) {
@@ -158,102 +158,97 @@ Or reply "skip" to leave it pending and continue.`;
 
 /**
  * ✅ Inbound text normalization (button-aware + interactive list-aware)
- * Priority:
- * 1) ButtonPayload (best: deterministic)
- * 2) ButtonText
- * 3) InteractiveResponseJson list_reply.id/title
- * 4) Twilio WhatsApp List fields (prefer row id)
- * 5) Body
+ * Your Twilio payload shows list clicks arriving as:
+ *   Body:   job_1_abcd1234
+ *   ListId: job_1_abcd1234
+ *   ListTitle: "#1 Some Job"
  *
- * ALSO:
- * - If we only get a "row title" like "#6 Happy Street", normalize to "jobno_6"
+ * We normalize that to "jobno_1" so expense/revenue job pickers accept it.
  */
 function getInboundText(body = {}) {
-  const normalizeListPick = (raw) => {
-    const s = String(raw || '').trim();
-    if (!s) return '';
+  const b = body || {};
 
-    // already-canonical
-    if (/^jobno_\d+$/i.test(s)) return s;
+  // 1) Buttons / quick replies (best: deterministic)
+  const payload = String(b.ButtonPayload || b.buttonPayload || '').trim();
+  if (payload) return payload;
 
-    // allow plain number
-    if (/^\d+$/.test(s)) return s;
-
-    // common list title format: "#6 Happy Street" or "#6"
-    const m = s.match(/^#?\s*(\d+)\b/);
-    if (m && m[1]) return `jobno_${m[1]}`;
-
-    return s;
-  };
-
-  // 1) Buttons / quick replies
-  const payload = String(body.ButtonPayload || body.buttonPayload || '').trim();
-  if (payload) return normalizeListPick(payload);
-
-  const btnText = String(body.ButtonText || body.buttonText || '').trim();
-  if (btnText) return normalizeListPick(btnText);
+  const btnText = String(b.ButtonText || b.buttonText || '').trim();
+  if (btnText) return btnText;
 
   // 2) InteractiveResponseJson (some Twilio flows use this)
-  const irj = body.InteractiveResponseJson || body.interactiveResponseJson || null;
+  const irj = b.InteractiveResponseJson || b.interactiveResponseJson || null;
   if (irj) {
     try {
       const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
-
-      // try multiple possible shapes
       const id =
         json?.list_reply?.id ||
         json?.listReply?.id ||
         json?.interactive?.list_reply?.id ||
-        json?.interactive?.listReply?.id ||
         '';
-
       const title =
         json?.list_reply?.title ||
         json?.listReply?.title ||
         json?.interactive?.list_reply?.title ||
-        json?.interactive?.listReply?.title ||
         '';
-
       const picked = String(id || title || '').trim();
-      if (picked) return normalizeListPick(picked);
-    } catch {
-      // ignore parse errors
-    }
+      if (picked) return normalizeListPickToken(picked);
+    } catch {}
   }
 
-  // 3) Twilio list picker fields (MOST IMPORTANT: ListRowId)
-  const listRowId = String(body.ListRowId || body.listRowId || body.ListRowID || body.listRowID || '').trim();
-  if (listRowId) return normalizeListPick(listRowId);
+  // 3) Twilio list picker fields
+  const listRowId = String(b.ListRowId || b.ListRowID || b.listRowId || b.listRowID || '').trim();
+  if (listRowId) return normalizeListPickToken(listRowId);
 
-  const listRowTitle = String(body.ListRowTitle || body.listRowTitle || '').trim();
-  if (listRowTitle) return normalizeListPick(listRowTitle);
+  const listRowTitle = String(b.ListRowTitle || b.listRowTitle || '').trim();
+  if (listRowTitle) return normalizeListPickToken(listRowTitle);
 
-  // 4) Other Twilio variants
+  // 4) Your case: Twilio is using ListId/ListTitle
   const listId = String(
-    body.ListId ||
-      body.listId ||
-      body.ListItemId ||
-      body.listItemId ||
-      body.ListReplyId ||
-      body.listReplyId ||
+    b.ListId ||
+      b.listId ||
+      b.ListItemId ||
+      b.listItemId ||
+      b.ListReplyId ||
+      b.listReplyId ||
       ''
   ).trim();
-  if (listId) return normalizeListPick(listId);
+  if (listId) return normalizeListPickToken(listId);
 
   const listTitle = String(
-    body.ListTitle ||
-      body.listTitle ||
-      body.ListItemTitle ||
-      body.listItemTitle ||
-      body.ListReplyTitle ||
-      body.listReplyTitle ||
+    b.ListTitle ||
+      b.listTitle ||
+      b.ListItemTitle ||
+      b.listItemTitle ||
+      b.ListReplyTitle ||
+      b.listReplyTitle ||
       ''
   ).trim();
-  if (listTitle) return normalizeListPick(listTitle);
+  if (listTitle) return normalizeListPickToken(listTitle);
 
-  // 5) Fallback
-  return normalizeListPick(String(body.Body || '').trim());
+  // 5) Fallback to Body (ALSO normalize because your Body is "job_1_hash")
+  const rawBody = String(b.Body || '').trim();
+  return normalizeListPickToken(rawBody);
 }
+
+/**
+ * Normalize list click tokens into what your pickers understand.
+ * - "job_1_deadbeef" => "jobno_1"   (your real Twilio payload)
+ * - "#1 Happy Road"  => "#1 Happy Road" (resolver can parse it)
+ * - "jobno_7"        => "jobno_7"
+ */
+function normalizeListPickToken(raw = '') {
+  const s = String(raw || '').trim();
+  if (!s) return s;
+
+  // ✅ Most important: Twilio sends this format for list clicks
+  // Example: "job_1_694ca083" where 1 corresponds to the job number shown in ListTitle "#1 ..."
+  const mLegacy = s.match(/^job_(\d{1,10})_[0-9a-f]+$/i);
+  if (mLegacy?.[1]) return `jobno_${mLegacy[1]}`;
+
+  // Keep as-is for your existing patterns
+  return s;
+}
+
 
 
 

@@ -526,6 +526,11 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz }) {
 }
 
 /* ---------------- category heuristics ---------------- */
+function isUnknownItem(x) {
+  const s = String(x || '').trim().toLowerCase();
+  return !s || s === 'unknown' || s.startsWith('unknown ');
+}
+
 
 function vendorDefaultCategory(store) {
   const s = String(store || '').toLowerCase();
@@ -1392,11 +1397,18 @@ if (confirmPA?.payload?.draft) {
 
     // ---- 3) New expense parse (deterministic first) ----
     const backstop = deterministicExpenseParse(input, userProfile);
-    if (backstop && backstop.amount) {
-      const data0 = normalizeExpenseData(backstop, userProfile);
-      data0.store = await normalizeVendorName(ownerId, data0.store);
+if (backstop && backstop.amount) {
+  const data0 = normalizeExpenseData(backstop, userProfile);
+  data0.store = await normalizeVendorName(ownerId, data0.store);
 
-      let category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
+  // ✅ add this block right here
+  if (isUnknownItem(data0.item)) {
+    const inferred = inferExpenseItemFallback(input);
+    if (inferred) data0.item = inferred;
+  }
+
+  let category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
+
       category = category && String(category).trim() ? String(category).trim() : null;
 
       let jobName = data0.jobName || null;
@@ -1451,7 +1463,14 @@ if (confirmPA?.payload?.draft) {
     let aiReply = aiRes?.reply || null;
 
     if (data) data = normalizeExpenseData(data, userProfile);
-    if (data?.jobName) data.jobName = sanitizeJobNameCandidate(data.jobName);
+if (data?.jobName) data.jobName = sanitizeJobNameCandidate(data.jobName);
+
+// ✅ add this block right here
+if (data && isUnknownItem(data.item)) {
+  const inferred = inferExpenseItemFallback(input);
+  if (inferred) data.item = inferred;
+}
+
 
     const missingCore =
       !data ||

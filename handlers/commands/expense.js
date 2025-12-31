@@ -26,6 +26,8 @@ const {
   toWhatsApp,
   toTemplateVar
 } = require('../../services/twilio');
+const { toTemplateVar: twilioToTemplateVar, ...rest } = require('../../services/twilio');
+
 
 const { query, insertTransaction } = pg;
 
@@ -1110,192 +1112,213 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     }
 
     // ---- 2) Confirm/edit/cancel ----
-    const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    if (confirmPA?.payload?.draft) {
-      if (!isOwner) {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
-      }
+const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+if (confirmPA?.payload?.draft) {
+  if (!isOwner) {
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
+  }
 
-      const token = normalizeDecisionToken(input);
-      const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId || '').trim() || null;
+  const token = normalizeDecisionToken(input);
+  const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId || '').trim() || null;
 
-      if (token === 'change_job') {
-        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-        if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-      }
+  if (token === 'change_job') {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+    return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+  }
 
-      if (token === 'edit') {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        return out(
-          twimlText(`✏️ Edit expense\nResend it in one line like:\nexpense $84.12 nails from Home Depot today for <job>`),
-          false
-        );
-      }
+  if (token === 'edit') {
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    return out(
+      twimlText('✏️ Edit expense\nResend it in one line like:\nexpense $84.12 nails from Home Depot today for <job>'),
+      false
+    );
+  }
 
-      if (token === 'cancel') {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        try {
-          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-        } catch {}
-        return out(twimlText('❌ Operation cancelled.'), false);
-      }
+  if (token === 'cancel') {
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    try {
+      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+    } catch {}
+    return out(twimlText('❌ Operation cancelled.'), false);
+  }
 
-      if (token === 'yes') {
-        const rawDraft = { ...(confirmPA.payload.draft || {}) };
+  if (token === 'yes') {
+    const rawDraft = { ...(confirmPA.payload.draft || {}) };
 
-        // Never allow numeric job_id to be written into tx.job_id
-        const rawJobId = rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
-        if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
-          console.warn('[EXPENSE] refusing numeric job id; forcing null', { job_id: rawJobId });
-          if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
-          rawDraft.job_id = null;
-          rawDraft.jobId = null;
-        }
+    // Never allow numeric job_id to be written into tx.job_id
+    const rawJobId =
+      rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
 
-        const maybeJobId = rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
+    if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
+      console.warn('[EXPENSE] refusing numeric job id; forcing null', { job_id: rawJobId });
+      if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
+      rawDraft.job_id = null;
+      rawDraft.jobId = null;
+    }
 
-        let data = normalizeExpenseData(rawDraft, userProfile);
+    const maybeJobId = rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
 
-        if (!data.item || !String(data.item).trim() || String(data.item).trim().toLowerCase() === 'unknown') {
-          const src =
-            rawDraft?.draftText ||
-            rawDraft?.originalText ||
-            rawDraft?.text ||
-            rawDraft?.media_transcript ||
-            rawDraft?.mediaTranscript ||
-            '';
-          const inferred = inferExpenseItemFallback(src);
-          if (inferred) data.item = inferred;
-        }
+    let data = normalizeExpenseData(rawDraft, userProfile);
 
-        data.store = await normalizeVendorName(ownerId, data.store);
-        const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+    if (!data.item || !String(data.item).trim() || String(data.item).trim().toLowerCase() === 'unknown') {
+      const src =
+        rawDraft?.draftText ||
+        rawDraft?.originalText ||
+        rawDraft?.text ||
+        rawDraft?.media_transcript ||
+        rawDraft?.mediaTranscript ||
+        '';
+      const inferred = inferExpenseItemFallback(src);
+      if (inferred) data.item = inferred;
+    }
 
-        const pickedJobName = data.jobName && String(data.jobName).trim() ? String(data.jobName).trim() : null;
-        let jobName = pickedJobName || rawDraft?.jobName || null;
-        let jobSource = rawDraft?.jobSource || (pickedJobName ? 'typed' : null);
+    data.store = await normalizeVendorName(ownerId, data.store);
+    const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
-        let jobNo =
-          rawDraft?.job_no != null && Number.isFinite(Number(rawDraft.job_no))
-            ? Number(rawDraft.job_no)
-            : rawDraft?.job?.job_no != null && Number.isFinite(Number(rawDraft.job.job_no))
-              ? Number(rawDraft.job.job_no)
-              : null;
+    const pickedJobName = data.jobName && String(data.jobName).trim() ? String(data.jobName).trim() : null;
+    let jobName = pickedJobName || rawDraft?.jobName || null;
+    let jobSource = rawDraft?.jobSource || (pickedJobName ? 'typed' : null);
 
-        if (!jobName) {
-          jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-          if (jobName) jobSource = 'active';
-        }
+    let jobNo =
+      rawDraft?.job_no != null && Number.isFinite(Number(rawDraft.job_no))
+        ? Number(rawDraft.job_no)
+        : rawDraft?.job?.job_no != null && Number.isFinite(Number(rawDraft.job.job_no))
+          ? Number(rawDraft.job.job_no)
+          : null;
 
-        if (jobName && looksLikeOverhead(jobName)) {
-          jobName = 'Overhead';
-          jobSource = 'overhead';
-          jobNo = null;
-        }
+    if (!jobName) {
+      jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+      if (jobName) jobSource = 'active';
+    }
 
-        if (!jobName) {
-          const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-          await upsertPA({
-            ownerId,
-            userId: from,
-            kind: PA_KIND_CONFIRM,
-            payload: {
-              ...confirmPA.payload,
-              draft: {
-                ...data,
-                jobName: null,
-                jobSource: jobSource || null,
-                suggestedCategory: category,
-                job_id: maybeJobId || null,
-                job_no: jobNo
-              },
-              sourceMsgId: stableMsgId
-            },
-            ttlSeconds: PA_TTL_SEC
-          });
+    if (jobName && looksLikeOverhead(jobName)) {
+      jobName = 'Overhead';
+      jobSource = 'overhead';
+      jobNo = null;
+    }
 
-          return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-        }
+    // If still no job, keep confirm PA and show picker
+    if (!jobName) {
+      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+      await upsertPA({
+        ownerId,
+        userId: from,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...confirmPA.payload,
+          draft: {
+            ...data,
+            jobName: null,
+            jobSource: jobSource || null,
+            suggestedCategory: category,
+            job_id: maybeJobId || null,
+            job_no: jobNo
+          },
+          sourceMsgId: stableMsgId
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
 
-        data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
+      if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+      return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+    }
 
-        const gate = assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, category, sourceMsgId: stableMsgId });
-        if (!gate.ok) return out(twimlText(String(gate.reply || '').slice(0, 1500)), false);
+    data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 
-        const amountCents = toCents(data.amount);
-        if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+    const gate = assertExpenseCILOrClarify({
+      ownerId,
+      from,
+      userProfile,
+      data,
+      jobName,
+      category,
+      sourceMsgId: stableMsgId
+    });
+    if (!gate.ok) return out(twimlText(String(gate.reply || '').slice(0, 1500)), false);
 
-        const writeResult = await withTimeout(
-          insertTransaction(
-            {
-              ownerId,
-              kind: 'expense',
-              date: data.date || todayInTimeZone(tz),
-              description: String(data.item || '').trim() || 'Unknown',
-              amount_cents: amountCents,
-              amount: toNumberAmount(data.amount),
-              source: String(data.store || '').trim() || 'Unknown',
-              job: jobName,
-              job_name: jobName,
-              job_id: maybeJobId || null, // UUID only
-              job_no: jobNo, // job_no-first
-              category: category ? String(category).trim() : null,
-              user_name: userProfile?.name || 'Unknown User',
-              source_msg_id: stableMsgId
-            },
-            { timeoutMs: 4500 }
-          ),
-          5200,
-          '__DB_TIMEOUT__'
-        );
+    const amountCents = toCents(data.amount);
+    if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
 
-        if (writeResult === '__DB_TIMEOUT__') {
-          await upsertPA({
-            ownerId,
-            userId: from,
-            kind: PA_KIND_CONFIRM,
-            payload: {
-              ...confirmPA.payload,
-              draft: { ...data, jobName, jobSource, suggestedCategory: category, job_id: maybeJobId || null, job_no: jobNo },
-              sourceMsgId: stableMsgId
-            },
-            ttlSeconds: PA_TTL_SEC
-          });
-          return out(
-            twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
-            false
-          );
-        }
-
-        const summaryLine = buildExpenseSummaryLine({
-          amount: data.amount,
-          item: data.item,
-          store: data.store,
+    const writeResult = await withTimeout(
+      insertTransaction(
+        {
+          ownerId,
+          kind: 'expense',
           date: data.date || todayInTimeZone(tz),
-          jobName,
-          tz
-        });
+          description: String(data.item || '').trim() || 'Unknown',
+          amount_cents: amountCents,
+          amount: toNumberAmount(data.amount),
+          source: String(data.store || '').trim() || 'Unknown',
+          job: jobName,
+          job_name: jobName,
+          job_id: maybeJobId || null, // UUID only
+          job_no: jobNo,              // job_no-first
+          category: category ? String(category).trim() : null,
+          user_name: userProfile?.name || 'Unknown User',
+          source_msg_id: stableMsgId
+        },
+        { timeoutMs: 4500 }
+      ),
+      5200,
+      '__DB_TIMEOUT__'
+    );
 
-        const reply =
-          writeResult?.inserted === false
-            ? `✅ Already logged (duplicate message).`
-            : `✅ Logged expense\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${buildActiveJobHint(jobName, jobSource)}`;
-
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        try {
-          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-        } catch {}
-
-        return out(twimlText(reply), false);
-      }
+    if (writeResult === '__DB_TIMEOUT__') {
+      await upsertPA({
+        ownerId,
+        userId: from,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...confirmPA.payload,
+          draft: {
+            ...data,
+            jobName,
+            jobSource,
+            suggestedCategory: category,
+            job_id: maybeJobId || null,
+            job_no: jobNo
+          },
+          sourceMsgId: stableMsgId
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
 
       return out(
-        twimlText('⚠️ Please choose Yes, Edit, Cancel, or Change Job.\nTip: reply "change job" to pick a different job.'),
+        twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
         false
       );
     }
+
+    const summaryLine = buildExpenseSummaryLine({
+      amount: data.amount,
+      item: data.item,
+      store: data.store,
+      date: data.date || todayInTimeZone(tz),
+      jobName,
+      tz
+    });
+
+    const reply =
+      writeResult?.inserted === false
+        ? '✅ Already logged (duplicate message).'
+        : `✅ Logged expense\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${buildActiveJobHint(jobName, jobSource)}`;
+
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    try {
+      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+    } catch {}
+
+    return out(twimlText(reply), false);
+  }
+
+  return out(
+    twimlText('⚠️ Please choose Yes, Edit, Cancel, or Change Job.\nTip: reply "change job" to pick a different job.'),
+    false
+  );
+}
+
 
     // ---- 3) New expense parse (deterministic first) ----
     const backstop = deterministicExpenseParse(input, userProfile);

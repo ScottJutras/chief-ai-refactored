@@ -263,7 +263,8 @@ function truncateText(s, maxChars = MEDIA_TRANSCRIPT_MAX_CHARS) {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return null;
   return str.length > maxChars ? str.slice(0, maxChars) : str;
 }
-
+// add this near your other TX_HAS_* globals
+let TX_HAS_DEDUPE_HASH = null;
 let TX_HAS_SOURCE_MSG_ID = null;
 let TX_HAS_AMOUNT = null;
 let TX_HAS_MEDIA_URL = null;
@@ -274,6 +275,8 @@ let TX_HAS_JOB_ID = null; // ✅ IMPORTANT: job_id column support
 let TX_HAS_JOB_NO = null; // optional
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
+
+
 async function detectTransactionsCapabilities() {
   if (
     TX_HAS_SOURCE_MSG_ID !== null &&
@@ -283,7 +286,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_TXT !== null &&
     TX_HAS_MEDIA_CONF !== null &&
     TX_HAS_JOB_ID !== null &&
-    TX_HAS_JOB_NO !== null
+    TX_HAS_JOB_NO !== null &&
+    TX_HAS_DEDUPE_HASH !== null
   ) {
     return {
       TX_HAS_SOURCE_MSG_ID,
@@ -293,7 +297,8 @@ async function detectTransactionsCapabilities() {
       TX_HAS_MEDIA_TXT,
       TX_HAS_MEDIA_CONF,
       TX_HAS_JOB_ID,
-      TX_HAS_JOB_NO
+      TX_HAS_JOB_NO,
+      TX_HAS_DEDUPE_HASH
     };
   }
 
@@ -312,8 +317,9 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_TYPE = names.has('media_type');
     TX_HAS_MEDIA_TXT = names.has('media_transcript');
     TX_HAS_MEDIA_CONF = names.has('media_confidence');
-    TX_HAS_JOB_ID = names.has('job_id'); // ✅
-    TX_HAS_JOB_NO = names.has('job_no'); // optional
+    TX_HAS_JOB_ID = names.has('job_id');
+    TX_HAS_JOB_NO = names.has('job_no');
+    TX_HAS_DEDUPE_HASH = names.has('dedupe_hash'); // ✅ NEW
   } catch (e) {
     console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
     TX_HAS_SOURCE_MSG_ID = false;
@@ -324,6 +330,7 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_CONF = false;
     TX_HAS_JOB_ID = false;
     TX_HAS_JOB_NO = false;
+    TX_HAS_DEDUPE_HASH = false; // ✅ NEW
   }
 
   return {
@@ -334,9 +341,11 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_TXT,
     TX_HAS_MEDIA_CONF,
     TX_HAS_JOB_ID,
-    TX_HAS_JOB_NO
+    TX_HAS_JOB_NO,
+    TX_HAS_DEDUPE_HASH
   };
 }
+
 
 async function detectTransactionsUniqueOwnerSourceMsg() {
   if (TX_HAS_OWNER_SOURCEMSG_UNIQUE !== null) return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
@@ -442,6 +451,52 @@ async function resolveJobRow(ownerId, jobRefOrName) {
     return null;
   }
 }
+const crypto = require('crypto');
+
+function normDedupeStr(v) {
+  return String(v || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s\.\-\&]/gu, ''); // keep letters/numbers/space . - &
+}
+
+function buildTxnDedupeHash({ owner, kind, date, amountCents, source, description, jobNo, jobName }) {
+  // Keep it stable + cheap. Prefer jobNo when available.
+  const payload = [
+    String(owner || ''),
+    normDedupeStr(kind),
+    String(date || ''),
+    String(Number(amountCents || 0) || 0),
+    normDedupeStr(source),
+    normDedupeStr(description),
+    jobNo != null && Number.isFinite(Number(jobNo)) ? `jobno:${Number(jobNo)}` : `job:${normDedupeStr(jobName)}`
+  ].join('|');
+
+  return crypto.createHash('sha256').update(payload).digest('hex');
+}
+
+// Cache whether the unique index exists (so we can safely use ON CONFLICT)
+let TX_HAS_OWNER_DEDUPE_UNIQUE = null;
+
+async function detectTransactionsUniqueOwnerDedupeHash() {
+  if (TX_HAS_OWNER_DEDUPE_UNIQUE != null) return TX_HAS_OWNER_DEDUPE_UNIQUE;
+
+  try {
+    const r = await query(`
+      select 1
+      from pg_indexes
+      where schemaname='public'
+        and tablename='transactions'
+        and indexname='transactions_owner_dedupe_hash_uq'
+      limit 1
+    `);
+    TX_HAS_OWNER_DEDUPE_UNIQUE = !!r?.rows?.length;
+  } catch {
+    TX_HAS_OWNER_DEDUPE_UNIQUE = false;
+  }
+  return TX_HAS_OWNER_DEDUPE_UNIQUE;
+}
 
 /**
  * ✅ insertTransaction()
@@ -491,8 +546,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   let resolvedJobId = null;
   let resolvedJobNo = null;
   let resolvedJobName =
-    jobNameInput ||
-    (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
+    jobNameInput || (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
 
   try {
     // 1) Prefer explicit job_id if caller gave UUID
@@ -515,15 +569,12 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       const n = Number(explicitJobNo);
       if (Number.isFinite(n)) {
         resolvedJobNo = n;
-        const row = await resolveJobRow(owner, String(n)); // this may return row.id (INTEGER), row.job_name
+        const row = await resolveJobRow(owner, String(n)); // may return row.id (INTEGER), row.job_name
         if (row) {
           // 🔒 NEVER set resolvedJobId from row.id unless it is UUID
           const candidate = row.id != null ? String(row.id) : null;
           if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
-          else if (candidate) {
-            // In your schema this will be "1" etc; ignore
-            resolvedJobId = null;
-          }
+          else if (candidate) resolvedJobId = null;
 
           resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
           resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
@@ -580,14 +631,30 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     jobRef != null
       ? jobRef
       : resolvedJobId
-      ? String(resolvedJobId)
-      : resolvedJobName
-      ? String(resolvedJobName)
-      : resolvedJobNo != null
-      ? String(resolvedJobNo)
-      : null;
+        ? String(resolvedJobId)
+        : resolvedJobName
+          ? String(resolvedJobName)
+          : resolvedJobNo != null
+            ? String(resolvedJobNo)
+            : null;
 
   const jobName = resolvedJobName ? String(resolvedJobName).trim() : null;
+
+  // ✅ (2.1) Content-based dedupe hash (expense/revenue only)
+  const shouldDedupeByContent = kind === 'expense' || kind === 'revenue';
+  const dedupeHash =
+    shouldDedupeByContent
+      ? buildTxnDedupeHash({
+          owner,
+          kind,
+          date,
+          amountCents,
+          source,
+          description,
+          jobNo: resolvedJobNo,
+          jobName
+        })
+      : null;
 
   // best-effort idempotency pre-check
   if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
@@ -624,6 +691,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     ...(caps.TX_HAS_MEDIA_TYPE ? ['media_type'] : []),
     ...(caps.TX_HAS_MEDIA_TXT ? ['media_transcript'] : []),
     ...(caps.TX_HAS_MEDIA_CONF ? ['media_confidence'] : []),
+    // ✅ (2.2) dedupe_hash column
+    ...(caps.TX_HAS_DEDUPE_HASH ? ['dedupe_hash'] : []),
     'created_at'
   ];
 
@@ -646,6 +715,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     ...(caps.TX_HAS_MEDIA_TYPE ? [media?.media_type || null] : []),
     ...(caps.TX_HAS_MEDIA_TXT ? [media?.media_transcript || null] : []),
     ...(caps.TX_HAS_MEDIA_CONF ? [media?.media_confidence ?? null] : []),
+    // ✅ (2.3) dedupe_hash value
+    ...(caps.TX_HAS_DEDUPE_HASH ? [dedupeHash] : []),
     // created_at value
     new Date()
   ];
@@ -655,20 +726,29 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const canIdempotent =
     caps.TX_HAS_SOURCE_MSG_ID && !!sourceMsgId && (await detectTransactionsUniqueOwnerSourceMsg());
 
-  const sql = canIdempotent
-  ? `
+  // ✅ (2.4) owner_id + dedupe_hash ON CONFLICT (only if unique partial index exists)
+  const canDedupeHash =
+    caps.TX_HAS_DEDUPE_HASH && !!dedupeHash && (await detectTransactionsUniqueOwnerDedupeHash());
+
+  const conflictTarget = canIdempotent
+    ? `(owner_id, source_msg_id) where source_msg_id is not null`
+    : canDedupeHash
+      ? `(owner_id, dedupe_hash) where dedupe_hash is not null`
+      : null;
+
+  const sql = conflictTarget
+    ? `
       insert into public.transactions (${cols.join(', ')})
       values (${placeholders})
-      on conflict (owner_id, source_msg_id) where source_msg_id is not null
+      on conflict ${conflictTarget}
       do nothing
       returning id
     `
-  : `
+    : `
       insert into public.transactions (${cols.join(', ')})
       values (${placeholders})
       returning id
     `;
-
 
   try {
     const res = await queryWithTimeout(sql, vals, timeoutMs);
@@ -677,15 +757,20 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   } catch (e) {
     const msg = String(e?.message || '').toLowerCase();
     const code = String(e?.code || '');
+
+    // ✅ (2.5) Treat either conflict path as potentially unsupported
     const looksConflictUnsupported =
-      canIdempotent &&
+      (canIdempotent || canDedupeHash) &&
       (code === '42P10' ||
         msg.includes('there is no unique or exclusion constraint') ||
         msg.includes('on conflict'));
 
     if (looksConflictUnsupported) {
       console.warn('[PG/transactions] ON CONFLICT unsupported; retrying without conflict clause');
-      TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
+
+      // if either uniqueness probe was wrong, stop using it going forward
+      if (canIdempotent) TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
+      if (canDedupeHash) TX_HAS_OWNER_DEDUPE_UNIQUE = false;
 
       const sql2 = `
         insert into public.transactions (${cols.join(', ')})
@@ -700,6 +785,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     throw e;
   }
 }
+
 
 /* -------------------- Time helpers -------------------- */
 async function getLatestTimeEvent(ownerId, employeeName) {

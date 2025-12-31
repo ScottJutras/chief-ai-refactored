@@ -480,6 +480,65 @@ router.use((req, res, next) => {
   next();
 });
 
+/* ---------------- Inbound debug (TEMP) ----------------
+ * Fix B: log the exact Twilio payload fields on list-row clicks.
+ * Placement: after req.body is parsed, BEFORE any getInboundText() usage,
+ * pendingActionMiddleware, or media ingestion mutates Body/transcript.
+ *
+ * Set INBOUND_LIST_DEBUG=1 to enable.
+ */
+
+const INBOUND_LIST_DEBUG = String(process.env.INBOUND_LIST_DEBUG || '') === '1';
+
+router.post('*', (req, _res, next) => {
+  try {
+    if (!INBOUND_LIST_DEBUG) return next();
+
+    const b = req.body || {};
+    const hasListish =
+      !!b.InteractiveResponseJson ||
+      !!b.ListRowId ||
+      !!b.ListRowTitle ||
+      !!b.ListId ||
+      !!b.ListTitle ||
+      !!b.ListReplyId ||
+      !!b.ListReplyTitle ||
+      !!b.ListItemId ||
+      !!b.ListItemTitle;
+
+    // Only log when it looks like a list/interactive click OR a button payload
+    if (!hasListish && !b.ButtonPayload && !b.ButtonText) return next();
+
+    console.info('[INBOUND_LIST_DEBUG]', {
+      MessageSid: b.MessageSid,
+      SmsMessageSid: b.SmsMessageSid,
+      From: b.From,
+      Body: b.Body,
+
+      // Most important for your case:
+      ListRowId: b.ListRowId,
+      ListRowTitle: b.ListRowTitle,
+
+      // Common Twilio variants:
+      ListId: b.ListId,
+      ListTitle: b.ListTitle,
+      ListReplyId: b.ListReplyId,
+      ListReplyTitle: b.ListReplyTitle,
+      ListItemId: b.ListItemId,
+      ListItemTitle: b.ListItemTitle,
+
+      // Other interactive/button fields:
+      InteractiveResponseJson: b.InteractiveResponseJson,
+      ButtonPayload: b.ButtonPayload,
+      ButtonText: b.ButtonText
+    });
+  } catch (e) {
+    console.warn('[INBOUND_LIST_DEBUG] failed:', e?.message);
+  }
+  next();
+});
+
+
 /* ---------------- Quick version check ---------------- */
 
 router.post('*', (req, res, next) => {

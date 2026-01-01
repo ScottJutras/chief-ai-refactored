@@ -414,21 +414,24 @@ function normalizeJobAnswer(text) {
   let s = String(text || '').trim();
   if (!s) return s;
 
-  // ✅ Preserve job picker tokens (do this BEFORE stripping "job ..." prefixes)
-  // 1) Our canonical token
+  // ✅ 0) If Twilio ListTitle contains stamped job number like "J8", trust it.
+  // Example inbound ListTitle: "#3 J8 1559 MedwayPark Dr"
+  const mStamp = s.match(/\bJ(\d{1,10})\b/i);
+  if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
+
+  // ✅ 1) Preserve canonical job_no token
   if (/^jobno_\d+$/i.test(s)) return s;
 
-  // 2) Twilio list id format you actually receive: job_<jobno>_<hash>
-  // Example: job_4_b1133803 -> jobno_4
+  // ✅ 2) Twilio list id format from Content Template:
+  // Example: "job_3_552e375c" -> this "3" is the ROW INDEX, not job_no.
   const mTw = s.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
-  if (mTw?.[1]) return `jobno_${mTw[1]}`;
+  if (mTw?.[1]) return `jobix_${mTw[1]}`; // ✅ treat as index token
 
-  // 3) If Twilio sends "#4 Name" as Body/ListTitle, keep it for the resolver
-  // (resolver already handles leading #num)
+  // Keep "#3 ..." for resolver (it may be index)
   // no-op here
 
-  // Existing cleanup (safe now)
-  s = s.replace(/^(job\s*name|job)\s*[:\-]?\s*/i, '');
+  // Existing cleanup
+  s = s.replace(/^(job\s*name|job)\s*[:-]?\s*/i, '');
   s = s.replace(/^(create|new)\s+job\s+/i, '');
   s = s.replace(/[?]+$/g, '').trim();
   return s;
@@ -841,34 +844,68 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
   const p = Math.max(0, Number(page || 0));
   const ps = Math.min(8, Math.max(1, Number(pageSize || 8)));
 
-  // 1) jobno_123 (best case from list picker)
+  // Helper: build a consistent job result
+  const toJobResult = (opt) => {
+    if (!opt) return null;
+    return {
+      kind: 'job',
+      job: {
+        job_no: Number(opt.job_no),
+        name: String(opt.name || '').trim() || null
+      }
+    };
+  };
+
+  // 1) jobno_123 (canonical token)
   const mJobNo = t.match(/^jobno_(\d{1,10})$/i);
   if (mJobNo?.[1]) {
     const jobNo = Number(mJobNo[1]);
     if (!Number.isFinite(jobNo)) return null;
 
     const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
-    if (!opt) return null;
-
-    return { kind: 'job', job: { job_no: Number(opt.job_no), name: String(opt.name || '').trim() || null } };
+    return toJobResult(opt);
   }
 
-    //2)  Accept list-row titles like "#6 Happy Street" (convert to jobno_6)
-  const mHashNo = t.match(/^#?\s*(\d{1,10})\b/);
-  if (mHashNo?.[1]) {
-    const jobNo = Number(mHashNo[1]);
-    if (Number.isFinite(jobNo)) {
-      const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
-      if (opt) {
-        // expense.js shape:
-        return { kind: 'job', job: { job_no: Number(opt.job_no), name: String(opt.name || '').trim() || null } };
-        // revenue.js shape: return { kind: 'job', job: opt };
-      }
+  // 2) Stamped token in visible text: "J8"
+  // This must be BEFORE index parsing like "#3 ..." or "3"
+  const mStamp = t.match(/\bJ(\d{1,10})\b/i);
+  if (mStamp?.[1]) {
+    const jobNo = Number(mStamp[1]);
+    if (!Number.isFinite(jobNo)) return null;
+
+    const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
+    return toJobResult(opt);
+  }
+
+  // 3) jobix_3 (index on current page, 1-based)
+  const mJobIx = t.match(/^jobix_(\d{1,10})$/i);
+  if (mJobIx?.[1]) {
+    const n = Number(mJobIx[1]);
+    if (!Number.isFinite(n) || n <= 0) return null;
+
+    const start = p * ps;
+    const idx = start + (n - 1);
+    const opt = (jobOptions || [])[idx] || null;
+    return toJobResult(opt);
+  }
+
+  // 4) Titles like "#3 Something" from Twilio templates are usually *row index*.
+  // Prefer page index if it exists; otherwise fall back to treating it as job_no.
+  const mHash = t.match(/^#\s*(\d{1,10})\b/);
+  if (mHash?.[1]) {
+    const n = Number(mHash[1]);
+    if (Number.isFinite(n) && n > 0) {
+      const start = p * ps;
+      const idx = start + (n - 1);
+      const byIndex = (jobOptions || [])[idx] || null;
+      if (byIndex) return toJobResult(byIndex);
+
+      const byJobNo = (jobOptions || []).find((j) => Number(j?.job_no) === n) || null;
+      if (byJobNo) return toJobResult(byJobNo);
     }
   }
 
-
-  // 3) Plain number (page index: "1" means first item on current page)
+  // 5) Plain number (treat as page index)
   if (/^\d+$/.test(t)) {
     const n = Number(t);
     if (!Number.isFinite(n) || n <= 0) return null;
@@ -876,21 +913,20 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
     const start = p * ps;
     const idx = start + (n - 1);
     const opt = (jobOptions || [])[idx] || null;
-    if (!opt) return null;
-
-    return { kind: 'job', job: { job_no: Number(opt.job_no), name: String(opt.name || '').trim() || null } };
+    return toJobResult(opt);
   }
 
-  // 4) Name match
+  // 6) Name match (exact then prefix)
   const opt =
     (jobOptions || []).find((j) => String(j?.name || '').trim().toLowerCase() === lc) ||
     (jobOptions || []).find((j) => String(j?.name || '').trim().toLowerCase().startsWith(lc.slice(0, 24))) ||
     null;
 
-  if (opt) return { kind: 'job', job: { job_no: Number(opt.job_no), name: String(opt.name || '').trim() || null } };
+  if (opt) return toJobResult(opt);
 
   return null;
 }
+
 
 
 const ENABLE_INTERACTIVE_LIST = (() => {
@@ -1000,16 +1036,19 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 
-  const rows = slice.map((j) => {
-    const full = String(j?.name || j?.job_name || 'Untitled Job').trim();
-    const jobNo = Number(j.job_no);
+const rows = slice.map((j) => {
+  const full = String(j?.name || j?.job_name || 'Untitled Job').trim();
+  const jobNo = Number(j.job_no);
 
-    return {
-      id: `jobno_${jobNo}`,                 // ✅ stable token for resolver
-      title: full.slice(0, 24),
-      description: `#${jobNo} ${full.slice(0, 72)}`
-    };
-  });
+const stamped = `J${jobNo} ${full}`;
+return {
+  id: `jobno_${jobNo}`,
+  title: stamped.slice(0, 24),
+  description: full.slice(0, 72)
+};
+
+});
+
 
   rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
   if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: 'Show next page' });
@@ -1490,7 +1529,6 @@ if (isUnknownItem(data.item)) {
     false
   );
 }
-
 
 
     // ---- 3) New expense parse (deterministic first) ----

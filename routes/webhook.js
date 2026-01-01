@@ -1,21 +1,15 @@
 // routes/webhook.js
-// COMPLETE DROP-IN (aligned with:
-// - expense.js Option A pending_actions (pick_job_for_expense + confirm_expense)
-// - pendingActionMiddleware (confirm/cancel/edit/skip)
-// - handlers/media.js (trade-term correction + stableMediaMsgId + returns { transcript, twiml })
 //
-// Fixes vs your current file:
-// ✅ Correctly passes sourceMsgId into handleMedia (media + text follow-ups) so idempotency is stable.
-// ✅ Correctly handles media.js returning { twiml } (your current file only handled string).
-// ✅ Fixes pending_actions lookup: DO NOT call pg.getPendingAction for "by kind" (your pg.getPendingAction is NOT kind-aware).
-//    We now use pg.getPendingActionByKind when present; otherwise SQL fallback.
-// ✅ Tightens job-picker stealing: numeric/job_* tokens will not be routed to job.js if expense pending_actions exist.
-// ✅ Keeps ownerId numeric (phone digits). ownerUuid can be stored separately if you map it.
-// ✅ Avoids double-send TwiML and keeps the 8s safety timer.
-// ✅ NEW: Global "cancel/stop" hard clears pending_actions + legacy state so Cancel never falls through to menu.
-// ✅ NEW: "ok(...)" is now SAFE by default (empty TwiML). Pass text only when you want a visible message bubble.
-// ✅ Fix: Revenue fast path now calls handleRevenue (your pasted file accidentally called handleExpense).
-// ✅ Future-proof: revenue handler path supports object return { twiml }.
+// ✅ COMPLETE DROP-IN (updated to fix Twilio list picker "index vs job_no" bug)
+//
+// Key changes vs your current webhook.js:
+// ✅ getInboundText() now returns `jobix_<index>` for Content-Template list clicks like `job_3_552e375c`
+//    (instead of incorrectly returning `jobno_3`).
+// ✅ If ListTitle contains a stamped job number like `J8`, getInboundText() returns `jobno_8`.
+// ✅ looksLikeJobPickerReplyToken() recognizes `jobix_`.
+// ✅ Fixes multiple syntax issues in the pasted file (missing backticks, broken template strings, bad regex escapes).
+// ✅ Keeps all your existing routing: pending_actions first, then legacy pending state, then fast paths, then other commands.
+// ✅ Preserves 8s safety timer and safe empty TwiML defaults.
 
 const express = require('express');
 const querystring = require('querystring');
@@ -26,18 +20,18 @@ const app = express();
 const { flags } = require('../config/flags');
 const { handleClock } = require('../handlers/commands/timeclock'); // v2 handler (optional)
 const { handleForecast } = require('../handlers/commands/forecast');
-
 const { getOwnerUuidForPhone } = require('../services/owners'); // optional map phone -> uuid (store separately)
+
 const stateManager = require('../utils/stateManager');
 const { getPendingTransactionState } = stateManager;
-
-const pg = require('../services/postgres');
-const { query } = pg;
 
 // Prefer mergePendingTransactionState; fall back to setPendingTransactionState (older builds)
 const mergePendingTransactionState =
   stateManager.mergePendingTransactionState ||
   (async (userId, patch) => stateManager.setPendingTransactionState(userId, patch, { merge: true }));
+
+const pg = require('../services/postgres');
+const { query } = pg;
 
 /* ---------------- Small helpers ---------------- */
 
@@ -60,11 +54,9 @@ function twimlEmpty() {
 
 const sendTwiml = (res, twiml) => {
   if (res.headersSent) return;
-
   const out = String(twiml || '').trim();
   // Always return valid XML
   const payload = out ? out : twimlEmpty();
-
   return res.status(200).type('text/xml; charset=utf-8').send(payload);
 };
 
@@ -114,12 +106,10 @@ function looksHardCommand(lc) {
   );
 }
 
-
 // Allowed while a pending expense/revenue exists (so we don't nudge-block them)
 function isAllowedWhilePending(lc) {
   return /^(yes|y|confirm|edit|cancel|no|skip|stop|more|overhead|oh|change job|switch job|pick job|change_job)\b/.test(lc);
 }
-
 
 // "global job picker intents" (typed commands)
 function isJobPickerIntent(lc) {
@@ -133,49 +123,58 @@ function looksLikeJobPickerReplyToken(raw) {
   if (/^(more|overhead|oh)$/i.test(s)) return true;
   if (/^\d+$/i.test(s)) return true;
 
-  // ✅ current picker id format
+  // ✅ canonical tokens
   if (/^jobno_\d+$/i.test(s)) return true;
+  if (/^jobix_\d+$/i.test(s)) return true;
 
-  // ✅ Twilio legacy id format arriving in your logs
-  if (/^job_\d+_[0-9a-f]+$/i.test(s)) return true;
+  // ✅ Twilio Content Template inbound format
+  if (/^job_\d+_[0-9a-z]+$/i.test(s)) return true;
 
   return false;
 }
-
-
 
 function pendingTxnNudgeMessage(pending) {
   const type = pending?.type || pending?.kind || 'entry';
   return `It looks like you still have a pending ${type}.
 
 Reply:
-- "yes" to submit
-- "edit" to change it
-- "cancel" (or "stop") to discard
+"yes" to submit
+"edit" to change it
+"cancel" (or "stop") to discard
 
 Or reply "skip" to leave it pending and continue.`;
 }
 
-/**
+/* -----------------------------------------------------------------------
  * ✅ Inbound text normalization (button-aware + interactive list-aware)
- * Your Twilio payload shows list clicks arriving as:
- *   Body:   job_1_abcd1234
- *   ListId: job_1_abcd1234
- *   ListTitle: "#1 Some Job"
  *
- * We normalize that to "jobno_1" so expense/revenue job pickers accept it.
- */
-function getInboundText(body = {}) {
-  const b = body || {};
+ * Your Twilio Content Template list clicks arrive as:
+ *   Body:      job_3_552e375c
+ *   ListId:    job_3_552e375c
+ *   ListTitle: "#3 1559 MedwayPark Dr"
+ *
+ * IMPORTANT:
+ *   job_3_* and "#3 ..." are ROW INDEX tokens, NOT job_no.
+ *
+ * We normalize:
+ *   job_3_*  -> jobix_3
+ *
+ * If ListTitle contains a stamped token like "J8", we can recover job_no:
+ *   "#3 J8 1559..." -> jobno_8
+ * ----------------------------------------------------------------------- */
 
-  // 1) Buttons / quick replies (best: deterministic)
+function resolveTwilioInboundText(body = {}) {
+  const b = body || {};
+  const rawBody = String(b.Body || '').trim();
+
+  // 1) Buttons / quick replies
   const payload = String(b.ButtonPayload || b.buttonPayload || '').trim();
-  if (payload) return payload;
+  if (payload) return payload.toLowerCase();
 
   const btnText = String(b.ButtonText || b.buttonText || '').trim();
-  if (btnText) return btnText;
+  if (btnText && btnText.length <= 40) return btnText.toLowerCase();
 
-  // 2) InteractiveResponseJson (some Twilio flows use this)
+  // 2) InteractiveResponseJson (some flows)
   const irj = b.InteractiveResponseJson || b.interactiveResponseJson || null;
   if (irj) {
     try {
@@ -191,18 +190,13 @@ function getInboundText(body = {}) {
         json?.interactive?.list_reply?.title ||
         '';
       const picked = String(id || title || '').trim();
-      if (picked) return normalizeListPickToken(picked);
+      if (picked) return normalizeListPickToken(picked, { listTitle: String(title || '').trim() });
     } catch {}
   }
 
   // 3) Twilio list picker fields
   const listRowId = String(b.ListRowId || b.ListRowID || b.listRowId || b.listRowID || '').trim();
-  if (listRowId) return normalizeListPickToken(listRowId);
-
   const listRowTitle = String(b.ListRowTitle || b.listRowTitle || '').trim();
-  if (listRowTitle) return normalizeListPickToken(listRowTitle);
-
-  // 4) Your case: Twilio is using ListId/ListTitle
   const listId = String(
     b.ListId ||
       b.listId ||
@@ -212,8 +206,6 @@ function getInboundText(body = {}) {
       b.listReplyId ||
       ''
   ).trim();
-  if (listId) return normalizeListPickToken(listId);
-
   const listTitle = String(
     b.ListTitle ||
       b.listTitle ||
@@ -223,34 +215,56 @@ function getInboundText(body = {}) {
       b.listReplyTitle ||
       ''
   ).trim();
-  if (listTitle) return normalizeListPickToken(listTitle);
 
-  // 5) Fallback to Body (ALSO normalize because your Body is "job_1_hash")
-  const rawBody = String(b.Body || '').trim();
-  return normalizeListPickToken(rawBody);
+  // Prefer IDs over titles if present
+  const candidateId = listRowId || listId || rawBody;
+  const candidateTitle = listRowTitle || listTitle;
+
+  // If we have a title, allow stamped J<num> recovery
+  if (candidateTitle) {
+    const mStamp = String(candidateTitle).match(/\bJ(\d{1,10})\b/i);
+    if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
+  }
+
+  // Normalize the ID/body token
+  const normalized = normalizeListPickToken(candidateId, { listTitle: candidateTitle });
+
+  // If normalization did nothing but we have a title, fall back to title
+  if (!normalized && candidateTitle) return candidateTitle;
+  if (normalized) return normalized;
+
+  return rawBody;
 }
 
 /**
  * Normalize list click tokens into what your pickers understand.
- * - "job_1_deadbeef" => "jobno_1"   (your real Twilio payload)
- * - "#1 Happy Road"  => "#1 Happy Road" (resolver can parse it)
- * - "jobno_7"        => "jobno_7"
+ *
+ * - "job_3_deadbeef" => "jobix_3"  (ROW INDEX token from Content Template)
+ * - "jobno_8"        => "jobno_8"  (already canonical)
+ * - "#3 Something"   => "#3 Something" (expense.js will treat as index safely)
  */
-function normalizeListPickToken(raw = '') {
+function normalizeListPickToken(raw = '', { listTitle = '' } = {}) {
   const s = String(raw || '').trim();
   if (!s) return s;
 
-  // ✅ Most important: Twilio sends this format for list clicks
-  // Example: "job_1_694ca083" where 1 corresponds to the job number shown in ListTitle "#1 ..."
-  const mLegacy = s.match(/^job_(\d{1,10})_[0-9a-f]+$/i);
-  if (mLegacy?.[1]) return `jobno_${mLegacy[1]}`;
+  // ✅ If title contains stamped job number like "J8", trust job_no directly
+  const mStamp = String(listTitle || s).match(/\bJ(\d{1,10})\b/i);
+  if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
 
-  // Keep as-is for your existing patterns
+  // ✅ Content-template list click format: job_<index>_<nonce>  (index, not job_no!)
+  const mLegacy = s.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+  if (mLegacy?.[1]) return `jobix_${mLegacy[1]}`;
+
   return s;
 }
 
-
-
+/**
+ * Public getter used everywhere else in this router.
+ * (Keeps your previous name but uses the fixed logic.)
+ */
+function getInboundText(body = {}) {
+  return resolveTwilioInboundText(body || {});
+}
 
 /* ---------------- NL heuristics for expense/revenue ---------------- */
 
@@ -258,11 +272,11 @@ function hasMoneyAmount(str) {
   const s = String(str || '');
 
   const hasDollar = /\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?/.test(s);
-  const hasWordAmount = /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s*(?:dollars|bucks|cad|usd)\b/i.test(s);
+  const hasWordAmount = /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s(?:dollars|bucks|cad|usd)\b/i.test(s);
 
   const hasBareNumberWithHint =
     /\b(?:for|paid|spent|received|cost|total)\s+\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\b/i.test(s) ||
-    /\\b\\d{1,3}(?:,\\d{3})*(?:\\.\\d{1,2})?\\s+\\b(?:for|paid|spent|received|cost|total)\\b/i.test(s);
+    /\b\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?\s+\b(?:for|paid|spent|received|cost|total)\b/i.test(s);
 
   return hasDollar || hasWordAmount || hasBareNumberWithHint;
 }
@@ -300,10 +314,8 @@ function looksExpenseNl(str) {
 function looksRevenueNl(str) {
   const s = String(str || '').trim().toLowerCase();
   if (!hasMoneyAmount(s)) return false;
-
   if (/\b(received|revenue|rev|got paid|payment|deposit)\b/.test(s)) return true;
   if (/\b(paid)\b/.test(s) && /\b(from|client|customer)\b/.test(s)) return true;
-
   return false;
 }
 
@@ -319,7 +331,6 @@ const PA_KIND_CONFIRM_REVENUE = 'confirm_revenue';
 // ✅ IMPORTANT: Only use getPendingActionByKind if it exists.
 const pgGetPendingActionByKind =
   (typeof pg.getPendingActionByKind === 'function' && pg.getPendingActionByKind) || null;
-
 const pgDeletePendingActionByKind =
   (typeof pg.deletePendingActionByKind === 'function' && pg.deletePendingActionByKind) || null;
 
@@ -380,7 +391,11 @@ async function deletePA({ ownerId, userId, kind }) {
   }
 
   try {
-    await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [owner, user, k]);
+    await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [
+      owner,
+      user,
+      k
+    ]);
   } catch {
     // ignore
   }
@@ -428,6 +443,7 @@ async function hasExpensePA(ownerId, from) {
 
 router.use((req, _res, next) => {
   if (req.method !== 'POST') return next();
+
   const ct = String(req.headers['content-type'] || '').toLowerCase();
   const isForm = ct.includes('application/x-www-form-urlencoded');
   if (!isForm) return next();
@@ -436,10 +452,12 @@ router.use((req, _res, next) => {
 
   let raw = '';
   req.setEncoding('utf8');
+
   req.on('data', (chunk) => {
     raw += chunk;
     if (raw.length > 1_000_000) req.destroy();
   });
+
   req.on('end', () => {
     req.rawBody = raw;
     try {
@@ -449,6 +467,7 @@ router.use((req, _res, next) => {
     }
     next();
   });
+
   req.on('error', () => {
     req.rawBody = raw || '';
     req.body = {};
@@ -472,6 +491,7 @@ router.use((req, _res, next) => {
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
   const path = req.originalUrl || req.url || '/api/webhook';
+
   req.twilioUrl = `${proto}://${host}${path}`;
   next();
 });
@@ -488,6 +508,7 @@ router.use((req, res, next) => {
 
 router.use((req, res, next) => {
   if (res.locals._safety) return next();
+
   res.locals._safety = setTimeout(() => {
     if (!res.headersSent) {
       console.warn('[WEBHOOK] 8s safety reply', {
@@ -503,16 +524,11 @@ router.use((req, res, next) => {
   const clear = () => clearTimeout(res.locals._safety);
   res.on('finish', clear);
   res.on('close', clear);
+
   next();
 });
 
-/* ---------------- Inbound debug (TEMP) ----------------
- * Fix B: log the exact Twilio payload fields on list-row clicks.
- * Placement: after req.body is parsed, BEFORE any getInboundText() usage,
- * pendingActionMiddleware, or media ingestion mutates Body/transcript.
- *
- * Set INBOUND_LIST_DEBUG=1 to enable.
- */
+/* ---------------- Inbound debug (TEMP) ---------------- */
 
 const INBOUND_LIST_DEBUG = String(process.env.INBOUND_LIST_DEBUG || '') === '1';
 
@@ -539,11 +555,8 @@ router.post('*', (req, _res, next) => {
 
     const hasListish = !!(irj || listRowId || listRowTitle || listId || listTitle);
     const hasButtonish = !!(btnPayload || btnText);
-
-    // Only log when it looks like a list/interactive click OR a button payload
     if (!hasListish && !hasButtonish) return next();
 
-    // Helpful: show what getInboundText() resolved to (safe: doesn't mutate)
     let resolvedInbound = '';
     try {
       resolvedInbound = typeof getInboundText === 'function' ? String(getInboundText(b) || '') : '';
@@ -557,7 +570,6 @@ router.post('*', (req, _res, next) => {
       return s.slice(0, n) + `…(+${s.length - n} chars)`;
     };
 
-    // compact "which keys exist" list
     const present = Object.keys(b)
       .filter((k) => b[k] != null && String(b[k]).trim() !== '')
       .slice(0, 60);
@@ -570,23 +582,16 @@ router.post('*', (req, _res, next) => {
       ProfileName: b.ProfileName,
       Body: b.Body,
 
-      // Most important for your case:
       ListRowId: listRowId,
       ListRowTitle: listRowTitle,
-
-      // Other list variants:
       ListId: listId,
       ListTitle: listTitle,
 
-      // Interactive/button fields:
       ButtonPayload: btnPayload,
       ButtonText: btnText,
       InteractiveResponseJson: irj ? trunc(irj, 800) : undefined,
 
-      // What your router will see after normalization:
       ResolvedInboundText: resolvedInbound,
-
-      // Quick glance at available keys:
       KeysPresent: present
     });
   } catch (e) {
@@ -594,8 +599,6 @@ router.post('*', (req, _res, next) => {
   }
   next();
 });
-
-
 
 /* ---------------- Quick version check ---------------- */
 
@@ -618,12 +621,15 @@ router.use((req, res, next) => {
 
     res.locals.phase = 'token';
     res.locals.phaseAt = Date.now();
+
     token.tokenMiddleware(req, res, () => {
       res.locals.phase = 'userProfile';
       res.locals.phaseAt = Date.now();
+
       prof.userProfileMiddleware(req, res, () => {
         res.locals.phase = 'lock';
         res.locals.phaseAt = Date.now();
+
         lock.lockMiddleware(req, res, () => {
           res.locals.phase = 'router';
           res.locals.phaseAt = Date.now();
@@ -658,12 +664,19 @@ router.post('*', async (req, res, next) => {
     const bodyText = getInboundText(req.body || {});
     const sourceMsgId = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
 
-    const result = await handleMedia(req.from, bodyText, req.userProfile || {}, req.ownerId, url, type, sourceMsgId);
+    const result = await handleMedia(
+      req.from,
+      bodyText,
+      req.userProfile || {},
+      req.ownerId,
+      url,
+      type,
+      sourceMsgId
+    );
 
     // result object shape: { transcript, twiml }
     if (result && typeof result === 'object') {
       if (typeof result.twiml === 'string' && !res.headersSent) {
-        // ✅ even if twiml is '', sendTwiml will emit <Response></Response>
         return sendTwiml(res, result.twiml);
       }
 
@@ -709,21 +722,20 @@ router.post('*', async (req, res, next) => {
       rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
 
     /* -----------------------------------------------------------------------
-     * ✅ GLOBAL HARD CANCEL (NEW)
+     * ✅ GLOBAL HARD CANCEL
      * ----------------------------------------------------------------------- */
     if (/^(cancel|stop|no)\b/.test(lc)) {
       await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
       return ok(res, '❌ Cancelled. You’re cleared.');
     }
 
-    // ✅ Option A: check pending_actions FIRST (so "1"/"jobno_123"/"yes" go to expense.js, not job.js)
+    // ✅ Option A: check pending_actions FIRST (so job picker tokens go to expense.js, not job.js)
     const expensePA = await hasExpensePA(req.ownerId, req.from);
     const hasExpensePendingActions = !!expensePA.hasAny;
 
     /* ------------------------------------------------------------
      * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
      * ------------------------------------------------------------ */
-
     const pendingRevenueFlow =
       !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
 
@@ -750,7 +762,7 @@ router.post('*', async (req, res, next) => {
     }
 
     /* -----------------------------------------------------------------------
-     * If prior step set pendingMedia and this is text-only, let media.js interpret follow-up.
+     * Media follow-up: if prior step set pendingMedia and this is text-only
      * ----------------------------------------------------------------------- */
     const hasPendingMedia = !!pending?.pendingMedia || !!pending?.pendingMediaMeta;
     if (hasPendingMedia && numMedia === 0) {
@@ -776,14 +788,15 @@ router.post('*', async (req, res, next) => {
     const text2 = String(getInboundText(req.body || {}) || '').trim();
     const lc2 = text2.toLowerCase();
     const isPickerToken = looksLikeJobPickerReplyToken(text2);
-            // ✅ Pending-actions router (must run early)
-    // Only use kind-aware / most-recent helper — DO NOT fall back to pg.getPendingAction (not kind-aware).
+
+    /* -----------------------------------------------------------------------
+     * ✅ Pending-actions router (must run early)
+     * ----------------------------------------------------------------------- */
     const pa =
       typeof pg.getMostRecentPendingActionForUser === 'function'
         ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
         : null;
 
-    // Only intercept kinds we explicitly support here (ignore debug_test etc.)
     const paKind = pa?.kind ? String(pa.kind).trim() : '';
     const isExpensePA = paKind === 'confirm_expense' || paKind === 'pick_job_for_expense';
     const isRevenuePA = paKind === 'confirm_revenue' || paKind === 'pick_job_for_revenue';
@@ -836,9 +849,8 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-
     /* -----------------------------------------------------------------------
-     * (A0) ACTIVE JOB PICKER FLOW — Only if awaitingActiveJobPick OR explicit intent
+     * (A0) ACTIVE JOB PICKER FLOW — only if awaitingActiveJobPick OR explicit intent
      * AND NOT blocked by expense pending_actions.
      * ----------------------------------------------------------------------- */
     if (!hasExpensePendingActions && (isJobPickerIntent(lc2) || pending?.awaitingActiveJobPick)) {
@@ -864,7 +876,6 @@ router.post('*', async (req, res, next) => {
     /* -----------------------------------------------------------------------
      * (A) PENDING FLOW ROUTER — MUST RUN BEFORE ANY FAST PATH OR AGENT
      * ----------------------------------------------------------------------- */
-
     const isNewRevenueCmd = /^(?:revenue|rev|received)\b/.test(lc2);
     const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc2);
 
@@ -893,7 +904,7 @@ router.post('*', async (req, res, next) => {
         if (!res.headersSent) {
           if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
           if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          return ok(res); // empty
+          return ok(res);
         }
         return;
       } catch (e) {
@@ -909,7 +920,7 @@ router.post('*', async (req, res, next) => {
         if (!res.headersSent) {
           if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
           if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          return ok(res); // empty
+          return ok(res);
         }
         return;
       } catch (e) {
@@ -918,96 +929,95 @@ router.post('*', async (req, res, next) => {
     }
 
     /* -----------------------------------------------------------------------
- * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
- * ----------------------------------------------------------------------- */
+     * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
+     * ----------------------------------------------------------------------- */
+    const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
+    const revenueNl = !revenuePrefix && looksRevenueNl(text2);
+    const looksRevenue = revenuePrefix || revenueNl;
 
-const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
-const revenueNl = !revenuePrefix && looksRevenueNl(text2);
-const looksRevenue = revenuePrefix || revenueNl;
+    if (looksRevenue) {
+      if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
 
-if (looksRevenue) {
-  if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
+      try {
+        const { handleRevenue } = require('../handlers/commands/revenue');
 
-  try {
-    const { handleRevenue } = require('../handlers/commands/revenue');
+        const timeoutMs = 8000;
+        const timeoutTwiml = twimlText(
+          '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
+        );
 
-    const timeoutMs = 8000;
-    const timeoutTwiml = twimlText(
-      '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
-    );
+        let timeoutId = null;
+        const timeoutPromise = new Promise((resolve) => {
+          timeoutId = setTimeout(() => {
+            console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
+            resolve(timeoutTwiml);
+          }, timeoutMs);
+        });
 
-    let timeoutId = null;
-    const timeoutPromise = new Promise((resolve) => {
-      timeoutId = setTimeout(() => {
-        console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
-        resolve(timeoutTwiml);
-      }, timeoutMs);
-    });
+        const result = await Promise.race([
+          handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+          timeoutPromise
+        ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-    const result = await Promise.race([
-      handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-      timeoutPromise
-    ]).finally(() => timeoutId && clearTimeout(timeoutId));
+        if (!res.headersSent) {
+          const twiml =
+            typeof result === 'string'
+              ? result
+              : (result && typeof result.twiml === 'string' ? result.twiml : null);
 
-    if (!res.headersSent) {
-      const twiml =
-        typeof result === 'string'
-          ? result
-          : (result && typeof result.twiml === 'string' ? result.twiml : null);
-
-      return sendTwiml(res, twiml); // null -> <Response></Response>
+          return sendTwiml(res, twiml); // null -> <Response></Response>
+        }
+        return;
+      } catch (e) {
+        console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+        if (!res.headersSent) return ok(res, null);
+        return;
+      }
     }
-    return;
-  } catch (e) {
-    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-    if (!res.headersSent) return ok(res, null);
-    return;
-  }
-}
 
-const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
-const expenseNl = !expensePrefix && looksExpenseNl(text2);
-const looksExpense = expensePrefix || expenseNl;
+    const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
+    const expenseNl = !expensePrefix && looksExpenseNl(text2);
+    const looksExpense = expensePrefix || expenseNl;
 
-if (looksExpense) {
-  if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
+    if (looksExpense) {
+      if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
 
-  try {
-    const { handleExpense } = require('../handlers/commands/expense');
+      try {
+        const { handleExpense } = require('../handlers/commands/expense');
 
-    const timeoutMs = 8000;
-    const timeoutTwiml = twimlText(
-      '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
-    );
+        const timeoutMs = 8000;
+        const timeoutTwiml = twimlText(
+          '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
+        );
 
-    let timeoutId = null;
-    const timeoutPromise = new Promise((resolve) => {
-      timeoutId = setTimeout(() => {
-        console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
-        resolve(timeoutTwiml);
-      }, timeoutMs);
-    });
+        let timeoutId = null;
+        const timeoutPromise = new Promise((resolve) => {
+          timeoutId = setTimeout(() => {
+            console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
+            resolve(timeoutTwiml);
+          }, timeoutMs);
+        });
 
-    const result = await Promise.race([
-      handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-      timeoutPromise
-    ]).finally(() => timeoutId && clearTimeout(timeoutId));
+        const result = await Promise.race([
+          handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
+          timeoutPromise
+        ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-    if (!res.headersSent) {
-      const twiml =
-        typeof result === 'string'
-          ? result
-          : (result && typeof result.twiml === 'string' ? result.twiml : null);
+        if (!res.headersSent) {
+          const twiml =
+            typeof result === 'string'
+              ? result
+              : (result && typeof result.twiml === 'string' ? result.twiml : null);
 
-      return sendTwiml(res, twiml); // null -> <Response></Response>
+          return sendTwiml(res, twiml); // null -> <Response></Response>
+        }
+        return;
+      } catch (e) {
+        console.warn('[WEBHOOK] expense handler failed:', e?.message);
+        if (!res.headersSent) return ok(res, null);
+        return;
+      }
     }
-    return;
-  } catch (e) {
-    console.warn('[WEBHOOK] expense handler failed:', e?.message);
-    if (!res.headersSent) return ok(res, null);
-    return;
-  }
-}
 
     /* -----------------------------------------------------------------------
      * (C) Other command routing (tasks / jobs / timeclock / forecast / KPIs / agent)
@@ -1103,7 +1113,7 @@ if (looksExpense) {
       let msg = '';
       if (typeof out === 'string' && out.trim()) msg = out.trim();
       else if (askingHow) msg = SOP.tasks;
-      else if (out === true) return ok(res); // empty
+      else if (out === true) return ok(res);
       else msg = 'Task handled.';
 
       msg += await glossaryNudgeFrom(text2);
@@ -1116,6 +1126,7 @@ if (looksExpense) {
       } else {
         await handleJob(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
         if (res.headersSent) return;
+
         let msg = askingHow ? SOP.jobs : 'Job handled.';
         msg += await glossaryNudgeFrom(text2);
         return ok(res, msg);
@@ -1133,8 +1144,9 @@ if (looksExpense) {
           },
           res
         );
+
         if (res.headersSent) return;
-        if (handled) return ok(res); // empty
+        if (handled) return ok(res);
       } catch (e) {
         console.warn('[WEBHOOK] forecast failed:', e?.message);
       }
@@ -1161,6 +1173,7 @@ if (looksExpense) {
           job_name: req.userProfile?.active_job_name || 'Active Job',
           created_by: req.userProfile?.id || req.userProfile?.user_id || null
         };
+
         const reply = await handleClock(ctx, cil);
         let msg = reply?.text || 'Time logged.';
         msg += await glossaryNudgeFrom(text2);
@@ -1175,7 +1188,7 @@ if (looksExpense) {
       let msg = '';
       if (typeof out === 'string' && out.trim()) msg = out.trim();
       else if (askingHow) msg = SOP.timeclock;
-      else if (out === true) return ok(res); // empty
+      else if (out === true) return ok(res);
       else msg = 'Time logged.';
 
       msg += await glossaryNudgeFrom(text2);
@@ -1185,6 +1198,7 @@ if (looksExpense) {
     const looksKpi = /^kpis?\s+for\b/.test(lc2);
     const KPI_ENABLED = (process.env.FEATURE_FINANCE_KPIS || '1') === '1';
     const hasSub = canUseAgent(req.userProfile);
+
     if (looksKpi && KPI_ENABLED && hasSub) {
       try {
         const { handleJobKpis } = require('../handlers/commands/job_kpis');
@@ -1226,6 +1240,7 @@ if (looksExpense) {
       '• Jobs: create job Roof Repair, change job, active job Roof Repair\n' +
       '• Tasks: task - buy nails, my tasks, done #4\n' +
       '• Time: clock in, clock out, timesheet week';
+
     msg += await glossaryNudgeFrom(text2);
     return ok(res, msg);
   } catch (err) {

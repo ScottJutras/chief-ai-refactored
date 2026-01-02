@@ -1049,10 +1049,13 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
     });
   }
 
+  // ✅ CRITICAL: enforce deterministic order so interactive list == plain text == resolver
+  clean.sort((a, b) => Number(a.job_no) - Number(b.job_no));
+
   const slice = clean.slice(start, start + JOBS_PER_PAGE);
 
   // ✅ exact row order that the user sees (1-based index mapping)
-  const displayedJobNos = (slice || [])
+  const displayedJobNos = slice
     .map((j) => (j?.job_no != null ? Number(j.job_no) : null))
     .filter((n) => Number.isFinite(n));
 
@@ -1084,14 +1087,13 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
     const stamped = `J${jobNo} ${full}`;
 
     return {
-      // IMPORTANT: list row ids should be stable
+      // NOTE: Twilio may not echo this id back (template systems often don’t),
+      // but the ordering is now deterministic so jobix_N mapping is correct.
       id: `jobno_${jobNo}`,
       title: stamped.slice(0, 24),
       description: full.slice(0, 72)
     };
   });
-
-
 
   rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
   if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: 'Show next page' });
@@ -1108,16 +1110,12 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
       sections: [{ title: 'Active Jobs', rows }]
     });
 
-    // ✅ IMPORTANT (Mode B):
-    // Do NOT send a second plain-text WhatsApp message here.
-    // Twilio-level DOUBLE_SEND_LIST_FALLBACK will do that when enabled.
     return out(twimlEmpty(), true);
   } catch (e) {
     console.warn('[JOB_PICKER] interactive list failed; falling back:', e?.message);
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 }
-
 
 
 /* ---------------- Active job resolution ---------------- */

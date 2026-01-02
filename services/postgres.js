@@ -1456,10 +1456,10 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
     }
   }
 
-  // 4) user_active_job (supports uuid OR text job_id)
+  // 4) user_active_job (supports uuid OR text schema)
 if (caps.has_user_active_job) {
   try {
-    // detect job_id type (uuid vs text/int)
+    // detect job_id type once per cold start
     let jobIdType = 'text';
     try {
       const t = await query(
@@ -1478,28 +1478,48 @@ if (caps.has_user_active_job) {
       if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
     } catch {}
 
-    // clear if no job_no
-    if (!jobNoText) {
+    // If clearing
+    if (!jobNoText && !name) {
       await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
       return { active_job_id: null, active_job_name: null, source: 'user_active_job' };
     }
 
     // UUID schema: store jobs.id
     if (jobIdType === 'uuid') {
+      // resolve UUID from job_no first, then name
       let jobUuid = null;
 
-      // prefer job_no lookup
-      try {
-        const r = await query(
-          `select id from public.jobs where owner_id=$1 and job_no=$2::int limit 1`,
-          [owner, Number(jobNoText)]
-        );
-        const id = r?.rows?.[0]?.id;
-        if (id && looksLikeUuid(String(id))) jobUuid = String(id);
-      } catch {}
+      if (Number.isFinite(finalJobNo)) {
+        try {
+          const r = await query(
+            `select id from public.jobs where owner_id=$1 and job_no=$2::int limit 1`,
+            [owner, Number(finalJobNo)]
+          );
+          const id = r?.rows?.[0]?.id;
+          if (id && looksLikeUuid(String(id))) jobUuid = String(id);
+        } catch {}
+      }
 
+      if (!jobUuid && name) {
+        try {
+          const r = await query(
+            `
+            select id
+              from public.jobs
+             where owner_id=$1
+               and lower(coalesce(name, job_name)) = lower($2)
+             order by job_no desc
+             limit 1
+            `,
+            [owner, String(name)]
+          );
+          const id = r?.rows?.[0]?.id;
+          if (id && looksLikeUuid(String(id))) jobUuid = String(id);
+        } catch {}
+      }
+
+      // can't resolve UUID => clear (don't store junk)
       if (!jobUuid) {
-        // fail-soft: don’t persist junk
         await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
         return { active_job_id: null, active_job_name: effectiveName || null, source: 'user_active_job' };
       }
@@ -1518,6 +1538,11 @@ if (caps.has_user_active_job) {
     }
 
     // text schema: store job_no as text
+    if (!jobNoText) {
+      await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
+      return { active_job_id: null, active_job_name: effectiveName || null, source: 'user_active_job' };
+    }
+
     await query(
       `
       insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
@@ -1533,6 +1558,7 @@ if (caps.has_user_active_job) {
     console.warn('[PG/activeJob] user_active_job write failed (ignored):', e?.message);
   }
 }
+
 
 
   return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'unknown' };
@@ -1677,9 +1703,10 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
     }
   }
 
-   // 4) user_active_job (supports uuid OR text job_id) ✅ READ ONLY
+   // 4) user_active_job (supports uuid OR text job_id)
 if (caps.has_user_active_job) {
   try {
+    // detect job_id type
     let jobIdType = 'text';
     try {
       const t = await query(
@@ -1698,54 +1725,42 @@ if (caps.has_user_active_job) {
       if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
     } catch {}
 
-    if (jobIdType === 'uuid') {
-      const r = await query(
-        `
-        select
-          u.job_id as active_job_id,
-          coalesce(j.name, j.job_name) as active_job_name
-        from public.user_active_job u
-        join public.jobs j
-          on j.owner_id = u.owner_id
-         and j.id = u.job_id
-        where u.owner_id = $1 and u.user_id = $2
-        limit 1
-        `,
-        [owner, String(userId)]
-      );
+    const r = await query(
+      `select job_id from public.user_active_job where owner_id=$1 and user_id=$2 limit 1`,
+      [owner, userId]
+    );
+    const row = r?.rows?.[0];
+    if (!row?.job_id) return null;
 
-      const row = r?.rows?.[0];
-      if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
-        if (out?.active_job_id != null || out?.active_job_name) return out;
-      }
-    } else {
-      const r = await query(
-        `
-        select
-          u.job_id as active_job_id,
-          coalesce(j.name, j.job_name) as active_job_name
-        from public.user_active_job u
-        join public.jobs j
-          on j.owner_id = u.owner_id
-         and (u.job_id::text ~ '^\\d+$')
-         and j.job_no = (u.job_id::text)::int
-        where u.owner_id = $1 and u.user_id = $2
-        limit 1
-        `,
-        [owner, String(userId)]
-      );
+    const jid = String(row.job_id).trim();
 
-      const row = r?.rows?.[0];
-      if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
-        if (out?.active_job_id != null || out?.active_job_name) return out;
-      }
+    // UUID schema => resolve by jobs.id
+    if (jobIdType === 'uuid' && looksLikeUuid(jid)) {
+      const j = await query(
+        `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and id=$2::uuid limit 1`,
+        [owner, jid]
+      );
+      const nm = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
+      return { active_job_id: jid, active_job_name: nm, source: 'user_active_job' };
     }
+
+    // text schema => treat as job_no if numeric
+    if (/^\d+$/.test(jid)) {
+      const j = await query(
+        `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and job_no=$2::int limit 1`,
+        [owner, Number(jid)]
+      );
+      const nm = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
+      return { active_job_id: jid, active_job_name: nm, source: 'user_active_job' };
+    }
+
+    // otherwise return id only
+    return { active_job_id: jid, active_job_name: null, source: 'user_active_job' };
   } catch (e) {
     console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
   }
 }
+
 
   return null;
 }

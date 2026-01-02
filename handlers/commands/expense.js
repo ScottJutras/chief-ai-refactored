@@ -751,13 +751,23 @@ function sanitizeJobLabel(s) {
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
+function normalizeIdentityDigits(x) {
+  const s = String(x || '').trim();
+  if (!s) return null;
+  return s.replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '') || null;
+}
+// Back-compat alias (some code calls normalizeIdentity)
+function normalizeIdentity(x) {
+  return normalizeIdentityDigits(x);
+}
 
 // Token / garbage job names that should NEVER be shown or selected
 function looksLikeJobTokenName(name) {
   const t = String(name || '').trim().toLowerCase();
   if (!t) return true;
 
-  // picker/interaction tokens (never a real job name)
+  if (t === 'overhead' || t === 'oh') return false;
+
   if (/^jobix_\d+$/i.test(t)) return true;
   if (/^jobno_\d+$/i.test(t)) return true;
   if (/^job_\d+_[0-9a-z]+$/i.test(t)) return true;
@@ -765,6 +775,7 @@ function looksLikeJobTokenName(name) {
 
   return false;
 }
+
 
 function isGarbageJobName(name) {
   const lc = String(name || '').trim().toLowerCase();
@@ -1133,40 +1144,81 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
 
 let _ACTIVE_JOB_IDENTITY_OK = null;
 
-function normalizeIdentityDigits(x) {
-  const s = String(x || '').trim();
-  if (!s) return null;
-  return s.replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '') || null;
+function pickActiveJobNameFromAny(out) {
+  const candidates = [
+    out?.active_job_name,
+    out?.activeJobName,
+    out?.name,
+    out?.job_name,
+    out?.jobName,
+    out?.job?.name,
+    out?.job?.job_name
+  ];
+
+  for (const c of candidates) {
+    const s = String(c || '').trim();
+    if (!s) continue;
+    if (looksLikeJobTokenName(s)) continue; // never accept token garbage
+    if (/^overhead$/i.test(s)) return 'Overhead';
+    return s;
+  }
+  return null;
 }
-// Back-compat alias (some code still calls normalizeIdentity)
-function normalizeIdentity(x) {
-  return normalizeIdentityDigits(x);
+async function persistActiveJobFromExpense({ ownerId, fromPhone, userProfile, jobNo, jobName }) {
+  try {
+    const owner = normalizeIdentityDigits(ownerId);
+    const identity =
+      normalizeIdentityDigits(fromPhone) ||
+      normalizeIdentityDigits(userProfile?.phone_e164) ||
+      normalizeIdentityDigits(userProfile?.phone) ||
+      normalizeIdentityDigits(userProfile?.from) ||
+      normalizeIdentityDigits(userProfile?.user_id) ||
+      normalizeIdentityDigits(userProfile?.id) ||
+      normalizeIdentityDigits(userProfile?.userId) ||
+      null;
+
+    if (!owner || !identity) return false;
+
+    const safeName =
+      jobName && !looksLikeJobTokenName(jobName) ? String(jobName).trim() : null;
+
+    const n = jobNo != null && Number.isFinite(Number(jobNo)) ? Number(jobNo) : null;
+
+    // don’t persist overhead unless you explicitly want it
+    if (safeName && /^overhead$/i.test(safeName)) return false;
+
+    if (typeof pg.setActiveJobForIdentity === 'function') {
+      // IMPORTANT: your postgres.js treats numeric jobId as job_no (job_no-first)
+      await pg.setActiveJobForIdentity(owner, identity, n != null ? String(n) : null, safeName);
+      console.info('[EXPENSE] persisted active job after log', { owner, identity, jobNo: n, jobName: safeName });
+      return true;
+    }
+
+    // legacy fallback
+    if (typeof pg.setActiveJob === 'function') {
+      const jobRef = safeName || (n != null ? String(n) : null);
+      if (!jobRef) return false;
+      await pg.setActiveJob(owner, identity, jobRef);
+      console.info('[EXPENSE] persisted active job via pg.setActiveJob after log', { owner, identity, jobRef });
+      return true;
+    }
+
+    return false;
+  } catch (e) {
+    console.warn('[EXPENSE] persistActiveJobFromExpense failed (ignored):', e?.message);
+    return false;
+  }
 }
 
-function looksLikeBadJobName(name) {
-  const t = String(name || '').trim();
-  if (!t) return true;
-  const lc = t.toLowerCase();
-
-  if (/^jobix_\d+$/i.test(lc)) return true;
-  if (/^jobno_\d+$/i.test(lc)) return true;
-  if (/^job_\d+_[0-9a-z]+$/i.test(lc)) return true;
-  if (/^#\s*\d+\b/.test(lc)) return true;
-
-  // allow overhead
-  if (lc === 'overhead') return false;
-
-  return false;
-}
 
 async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
   // 0) profile direct (but reject token garbage)
   const directName = userProfile?.active_job_name || userProfile?.activeJobName || null;
-  if (directName && !looksLikeBadJobName(directName)) return String(directName).trim();
+  if (directName && !looksLikeJobTokenName(directName)) return String(directName).trim();
 
   if (_ACTIVE_JOB_IDENTITY_OK === false) return null;
 
-  const owner = String(ownerId || '').replace(/\D/g, '');
+  const owner = normalizeIdentityDigits(ownerId);
   const identity =
     normalizeIdentityDigits(fromPhone) ||
     normalizeIdentityDigits(userProfile?.phone_e164) ||
@@ -1179,96 +1231,42 @@ async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
 
   if (!owner || !identity) return null;
 
+  // 1) Preferred: identity-based getter
   if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
       const out = await pg.getActiveJobForIdentity(owner, identity);
       _ACTIVE_JOB_IDENTITY_OK = true;
 
-      const n = out?.active_job_name || out?.activeJobName || null;
-      if (n && !looksLikeBadJobName(n)) return String(n).trim();
+      const n = pickActiveJobNameFromAny(out);
+      if (n) return n;
 
-      // if DB contains token garbage, treat as no active job
       return null;
     } catch (e) {
       const msg = String(e?.message || '').toLowerCase();
       const code = String(e?.code || '');
+      // disable on schema/table missing patterns
       if (code === '42P01' || msg.includes('memberships')) {
         _ACTIVE_JOB_IDENTITY_OK = false;
-        return null;
       }
       // fail-open
     }
   }
 
-  return null;
-}
-
-
-async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
-  // 0) If profile already has it, use it (but reject token garbage)
-  const directName = userProfile?.active_job_name || userProfile?.activeJobName || null;
-  if (directName && !looksLikeBadActiveJobName(directName)) return String(directName).trim();
-
-  const owner = String(ownerId || '').replace(/\D/g, '');
-  const identity =
-    normalizeIdentity(fromPhone) ||
-    normalizeIdentity(userProfile?.phone_e164) ||
-    normalizeIdentity(userProfile?.phone) ||
-    normalizeIdentity(userProfile?.from) ||
-    normalizeIdentity(userProfile?.user_id) ||
-    normalizeIdentity(userProfile?.id) ||
-    normalizeIdentity(userProfile?.userId) ||
-    null;
-
-  if (!owner || !identity) return null;
-
-  // 1) Preferred: identity-based getter (if table exists)
-  if (_ACTIVE_JOB_IDENTITY_OK !== false && typeof pg.getActiveJobForIdentity === 'function') {
-    try {
-      const out = await pg.getActiveJobForIdentity(String(owner), String(identity));
-      _ACTIVE_JOB_IDENTITY_OK = true;
-
-      const n = pickActiveJobNameFromAny(out);
-      if (n) return n;
-    } catch (e) {
-      const msg = String(e?.message || '').toLowerCase();
-      const code = String(e?.code || '');
-      // if this is a schema/table-missing failure, disable identity getter
-      if (code === '42P01' || msg.includes('public.memberships')) {
-        _ACTIVE_JOB_IDENTITY_OK = false;
-      }
-      // fail-open to fallbacks below
-    }
-  }
-
-  // 2) Fallback: try other pg helpers (these often exist in your postgres.js)
-  const fallbackFns = [
-    // common in your codebase
-    'getActiveJobForPhone',
-    'getActiveJobForUser',
-    'getActiveJob',
-    'getUserActiveJob'
-  ];
+  // 2) Optional fallbacks (safe no-ops if missing)
+  const fallbackFns = ['getActiveJobForPhone', 'getActiveJobForUser', 'getActiveJob', 'getUserActiveJob'];
 
   for (const fn of fallbackFns) {
     if (typeof pg[fn] !== 'function') continue;
     try {
-      // Try (owner, identity)
       const out1 = await pg[fn](String(owner), String(identity));
       const n1 = pickActiveJobNameFromAny(out1);
       if (n1) return n1;
-
-      // Try ({ ownerId, userId }) style
-      const out2 = await pg[fn]({ ownerId: String(owner), userId: String(identity) });
-      const n2 = pickActiveJobNameFromAny(out2);
-      if (n2) return n2;
-    } catch {
-      // ignore and continue
-    }
+    } catch {}
   }
 
   return null;
 }
+
 
 /* ---------------- CIL builders ---------------- */
 
@@ -1561,6 +1559,7 @@ if (confirmPA?.payload?.draft) {
 
     let data = normalizeExpenseData(rawDraft, userProfile);
 
+
 // ✅ Strong Unknown handling (covers "Unknown", "Unknown ...", empty, etc.)
 if (isUnknownItem(data.item)) {
   const src =
@@ -1573,11 +1572,7 @@ if (isUnknownItem(data.item)) {
     '';
 
   let inferred = inferExpenseItemFallback(src);
-
-  if (!inferred) {
-    inferred = inferExpenseItemFallback(input);
-  }
-
+  if (!inferred) inferred = inferExpenseItemFallback(input);
   if (inferred) data.item = inferred;
 }
 
@@ -1597,31 +1592,6 @@ if (!data.item || isUnknownItem(data.item)) {
 
 // final safety
 if (!data.item || isUnknownItem(data.item)) data.item = 'Unknown';
-
-
-
-// ✅ Strong Unknown handling (covers "Unknown", "Unknown ...", empty, etc.)
-if (isUnknownItem(data.item)) {
-  const src =
-    rawDraft?.draftText ||
-    rawDraft?.originalText ||
-    rawDraft?.text ||
-    rawDraft?.media_transcript ||
-    rawDraft?.mediaTranscript ||
-    rawDraft?.input ||
-    '';
-
-  // Try rule-based fallback first
-  let inferred = inferExpenseItemFallback(src);
-
-  // If we still didn't infer, try from the *current message text* when available
-  // (helps when drafts didn’t store originalText for some reason)
-  if (!inferred) {
-    inferred = inferExpenseItemFallback(input);
-  }
-
-  if (inferred) data.item = inferred;
-}
 
     data.store = await normalizeVendorName(ownerId, data.store);
     const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
@@ -1691,73 +1661,83 @@ if (isUnknownItem(data.item)) {
     if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
 
     const writeResult = await withTimeout(
-      insertTransaction(
-        {
-          ownerId,
-          kind: 'expense',
-          date: data.date || todayInTimeZone(tz),
-          description: String(data.item || '').trim() || 'Unknown',
-          amount_cents: amountCents,
-          amount: toNumberAmount(data.amount),
-          source: String(data.store || '').trim() || 'Unknown',
-          job: jobName,
-          job_name: jobName,
-          job_id: maybeJobId || null, // UUID only
-          job_no: jobNo,              // job_no-first
-          category: category ? String(category).trim() : null,
-          user_name: userProfile?.name || 'Unknown User',
-          source_msg_id: stableMsgId
-        },
-        { timeoutMs: 4500 }
-      ),
-      5200,
-      '__DB_TIMEOUT__'
-    );
-
-    if (writeResult === '__DB_TIMEOUT__') {
-      await upsertPA({
-        ownerId,
-        userId: from,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...confirmPA.payload,
-          draft: {
-            ...data,
-            jobName,
-            jobSource,
-            suggestedCategory: category,
-            job_id: maybeJobId || null,
-            job_no: jobNo
-          },
-          sourceMsgId: stableMsgId
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-
-      return out(
-        twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
-        false
-      );
-    }
-
-    const summaryLine = buildExpenseSummaryLine({
-      amount: data.amount,
-      item: data.item,
-      store: data.store,
+  insertTransaction(
+    {
+      ownerId,
+      kind: 'expense',
       date: data.date || todayInTimeZone(tz),
-      jobName,
-      tz
-    });
+      description: String(data.item || '').trim() || 'Unknown',
+      amount_cents: amountCents,
+      amount: toNumberAmount(data.amount),
+      source: String(data.store || '').trim() || 'Unknown',
+      job: jobName,
+      job_name: jobName,
+      job_id: maybeJobId || null, // UUID only
+      job_no: jobNo,              // job_no-first
+      category: category ? String(category).trim() : null,
+      user_name: userProfile?.name || 'Unknown User',
+      source_msg_id: stableMsgId
+    },
+    { timeoutMs: 4500 }
+  ),
+  5200,
+  '__DB_TIMEOUT__'
+);
 
-    const reply =
-      writeResult?.inserted === false
-        ? '✅ Already logged (duplicate message).'
-        : `✅ Logged expense\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${buildActiveJobHint(jobName, jobSource)}`;
+if (writeResult === '__DB_TIMEOUT__') {
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      ...confirmPA.payload,
+      draft: {
+        ...data,
+        jobName,
+        jobSource,
+        suggestedCategory: category,
+        job_id: maybeJobId || null,
+        job_no: jobNo
+      },
+      sourceMsgId: stableMsgId
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
 
-    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+  return out(
+    twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
+    false
+  );
+}
 
-    return out(twimlText(reply), false);
+// ✅ Persist active job after a successful log (even if duplicate)
+await persistActiveJobFromExpense({
+  ownerId,
+  fromPhone: from,
+  userProfile,
+  jobNo,
+  jobName
+});
+
+const summaryLine = buildExpenseSummaryLine({
+  amount: data.amount,
+  item: data.item,
+  store: data.store,
+  date: data.date || todayInTimeZone(tz),
+  jobName,
+  tz
+});
+
+const reply =
+  writeResult?.inserted === false
+    ? '✅ Already logged (duplicate message).'
+    : `✅ Logged expense\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${buildActiveJobHint(jobName, jobSource)}`;
+
+await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+
+return out(twimlText(reply), false);
+
   }
 
   return out(

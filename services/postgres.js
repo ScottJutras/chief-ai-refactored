@@ -1042,14 +1042,18 @@ async function getActiveJob(ownerId, userId = null) {
   if (userId && (await detectUserActiveJobTable())) {
     try {
       const sql = `
-        select j.job_no, coalesce(j.name, j.job_name) as name
-          from public.user_active_job u
-          join public.jobs j
-            on j.owner_id = u.owner_id
-           and j.job_no  = u.job_id
-         where u.owner_id = $1
-           and u.user_id  = $2
-         limit 1
+        select
+          u.job_id as active_job_id,
+          coalesce(j.name, j.job_name) as name,
+          j.job_no
+        from public.user_active_job u
+        join public.jobs j
+          on j.owner_id = u.owner_id
+         and (u.job_id::text ~ '^\\d+$')
+         and j.job_no = (u.job_id::text)::int
+        where u.owner_id = $1
+          and u.user_id  = $2
+        limit 1
       `;
       const { rows } = await query(sql, [owner, String(userId)]);
       if (rows?.[0]) return rows[0];

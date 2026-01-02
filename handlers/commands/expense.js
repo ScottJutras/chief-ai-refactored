@@ -746,13 +746,33 @@ async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
 /* ---------------- Job list + picker mapping (JOB_NO-FIRST) ---------------- */
 function sanitizeJobLabel(s) {
   return String(s || '')
-    .replace(/\u00A0/g, ' ')           // NBSP -> normal space
+    .replace(/\u00A0/g, ' ') // NBSP -> normal space
     .replace(/[\r\n\t]+/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
+
+// Token / garbage job names that should NEVER be shown or selected
+function looksLikeJobTokenName(name) {
+  const t = String(name || '').trim().toLowerCase();
+  if (!t) return true;
+
+  // picker/interaction tokens (never a real job name)
+  if (/^jobix_\d+$/i.test(t)) return true;
+  if (/^jobno_\d+$/i.test(t)) return true;
+  if (/^job_\d+_[0-9a-z]+$/i.test(t)) return true;
+  if (/^#\s*\d+\b/.test(t)) return true;
+
+  return false;
+}
+
 function isGarbageJobName(name) {
   const lc = String(name || '').trim().toLowerCase();
+
+  // ✅ reject token garbage first
+  if (looksLikeJobTokenName(lc)) return true;
+
+  // reject obvious command-y “names”
   return (
     lc === 'cancel' ||
     lc === 'show active jobs' ||
@@ -762,6 +782,7 @@ function isGarbageJobName(name) {
     lc === 'pick job'
   );
 }
+
 
 async function listOpenJobsDetailed(ownerId, limit = 50) {
   const fn =
@@ -841,7 +862,7 @@ function normalizeJobOptions(jobRows) {
 }
 
 
-function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 } = {}) {
+function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8, displayedJobNos = null } = {}) {
   const raw = normalizeJobAnswer(input);
   const t = String(raw || '').trim();
   if (!t) return null;
@@ -878,16 +899,27 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
 
 
   // 2) jobix_3 (index on current page, 1-based)
-  const mJobIx = t.match(/^jobix_(\d{1,10})$/i);
-  if (mJobIx?.[1]) {
-    const n = Number(mJobIx[1]);
-    if (!Number.isFinite(n) || n <= 0) return null;
+const mJobIx = t.match(/^jobix_(\d{1,10})$/i);
+if (mJobIx?.[1]) {
+  const n = Number(mJobIx[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
 
-    const start = p * ps;
-    const idx = start + (n - 1);
-    const opt = (jobOptions || [])[idx] || null;
-    return toJobResult(opt);
+  // ✅ If we have an exact “what we rendered” list, use it (most correct)
+  if (Array.isArray(displayedJobNos) && displayedJobNos.length) {
+    const jobNo = displayedJobNos[n - 1] ?? null;
+    if (jobNo != null && Number.isFinite(Number(jobNo))) {
+      const opt = (jobOptions || []).find((j) => Number(j?.job_no) === Number(jobNo)) || null;
+      return toJobResult(opt);
+    }
+    return null;
   }
+
+  // fallback behavior
+  const start = p * ps;
+  const idx = start + (n - 1);
+  const opt = (jobOptions || [])[idx] || null;
+  return toJobResult(opt);
+}
 
   // 3) Titles like "#3 Something" from Twilio templates are usually *row index*.
   // Prefer page index if it exists; otherwise fall back to treating it as job_no.
@@ -1006,47 +1038,67 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   const p = Math.max(0, Number(page || 0));
   const start = p * JOBS_PER_PAGE;
 
-  // ✅ Filter + de-dupe by job_no (job_no must behave like a key for jobno_<n>)
-  // This prevents jobno_6 mapping to "the wrong job" when duplicates exist.
+  // ✅ Filter + de-dupe by job_no, and drop token-garbage names
   const seen = new Set();
   const clean = [];
   for (const j of (jobOptions || [])) {
     const n = j?.job_no != null ? Number(j.job_no) : null;
     if (n == null || !Number.isFinite(n)) continue;
 
-    if (seen.has(n)) continue; // keep first
+    const nm = String(j?.name || j?.job_name || '').trim();
+    if (!nm || isGarbageJobName(nm)) continue;
+
+    if (seen.has(n)) continue;
     seen.add(n);
 
-    clean.push(j);
+    clean.push({
+      ...j,
+      job_no: n,
+      name: nm
+    });
   }
 
   const slice = clean.slice(start, start + JOBS_PER_PAGE);
+
+  // ✅ exact row order that the user sees (1-based index mapping)
+  const displayedJobNos = (slice || [])
+    .map((j) => (j?.job_no != null ? Number(j.job_no) : null))
+    .filter((n) => Number.isFinite(n));
+
   const hasMore = start + JOBS_PER_PAGE < clean.length;
 
   await upsertPA({
     ownerId,
     userId: from,
     kind: PA_KIND_PICK_JOB,
-    payload: { jobOptions: clean, page: p, pageSize: JOBS_PER_PAGE, hasMore, shownAt: Date.now() },
+    payload: {
+      jobOptions: clean,
+      page: p,
+      pageSize: JOBS_PER_PAGE,
+      hasMore,
+      displayedJobNos,
+      shownAt: Date.now()
+    },
     ttlSeconds: PA_TTL_SEC
   });
 
   if (!ENABLE_INTERACTIVE_LIST || !to) {
-    // plain text (TwiML) fallback
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 
-const rows = slice.map((j) => {
-  const full = sanitizeJobLabel(j?.name || j?.job_name || 'Untitled Job');
-  const jobNo = Number(j?.job_no);
+  const rows = slice.map((j) => {
+    const full = sanitizeJobLabel(j?.name || j?.job_name || 'Untitled Job');
+    const jobNo = Number(j?.job_no);
 
-  const stamped = `J${jobNo} ${full}`;
-  return {
-    id: `jobno_${jobNo}`,
-    title: stamped.slice(0, 24),
-    description: full.slice(0, 72)
-  };
-});
+    const stamped = `J${jobNo} ${full}`;
+
+    return {
+      // IMPORTANT: list row ids should be stable
+      id: `jobno_${jobNo}`,
+      title: stamped.slice(0, 24),
+      description: full.slice(0, 72)
+    };
+  });
 
 
 
@@ -1312,7 +1364,6 @@ function looksLikeJobPickerAnswer(raw = '') {
   if (/^#\s*\d{1,10}\b/.test(s)) return true;
   if (/\bJ\d{1,10}\b/i.test(s)) return true;
 
-  // allow name attempts, reject obvious commands
   if (/^[a-z0-9][a-z0-9 _.'-]{2,}$/i.test(s)) {
     const lc = s.toLowerCase();
     if (/^(yes|no|edit|cancel|stop|change job|switch job|pick job|active jobs|show jobs|jobs)$/i.test(lc)) return false;
@@ -1323,8 +1374,6 @@ function looksLikeJobPickerAnswer(raw = '') {
 }
 
 if (pickPA?.payload?.jobOptions) {
-  // If the user sent a brand new expense while we were waiting for a job pick,
-  // clear state and fall through to normal parsing (do NOT return).
   if (looksLikeNewExpenseText(input)) {
     console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
     try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
@@ -1336,15 +1385,16 @@ if (pickPA?.payload?.jobOptions) {
     const page = Number(pickPA.payload.page || 0) || 0;
     const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
     const hasMore = !!pickPA.payload.hasMore;
+    const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : null;
 
-    // ✅ PLACE THIS LOG RIGHT HERE (after page/pageSize/jobOptions computed)
     console.info('[EXPENSE] pick-job inbound', {
       input,
       rawInput: String(input || '').trim(),
       normalized: normalizeJobAnswer(input),
       page,
       pageSize,
-      jobsCount: jobOptions.length
+      jobsCount: jobOptions.length,
+      displayedJobNosCount: Array.isArray(displayedJobNos) ? displayedJobNos.length : 0
     });
 
     if (tok === 'change_job') {
@@ -1364,7 +1414,7 @@ if (pickPA?.payload?.jobOptions) {
       return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
     }
 
-    const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize });
+    const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
 
     if (!resolved) {
       // ✅ If user tapped a list row, don't force a second reply.

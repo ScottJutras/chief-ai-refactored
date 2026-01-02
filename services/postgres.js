@@ -1456,29 +1456,84 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
     }
   }
 
-  // 4) user_active_job (store job_no as text)
-  if (caps.has_user_active_job) {
+  // 4) user_active_job (supports uuid OR text job_id)
+if (caps.has_user_active_job) {
+  try {
+    // detect job_id type (uuid vs text/int)
+    let jobIdType = 'text';
     try {
-      if (!jobNoText) {
+      const t = await query(
+        `
+        select data_type, udt_name
+          from information_schema.columns
+         where table_schema='public'
+           and table_name='user_active_job'
+           and column_name='job_id'
+         limit 1
+        `
+      );
+      const row = t?.rows?.[0];
+      const dt = String(row?.data_type || '').toLowerCase();
+      const udt = String(row?.udt_name || '').toLowerCase();
+      if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
+    } catch {}
+
+    // clear if no job_no
+    if (!jobNoText) {
+      await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
+      return { active_job_id: null, active_job_name: null, source: 'user_active_job' };
+    }
+
+    // UUID schema: store jobs.id
+    if (jobIdType === 'uuid') {
+      let jobUuid = null;
+
+      // prefer job_no lookup
+      try {
+        const r = await query(
+          `select id from public.jobs where owner_id=$1 and job_no=$2::int limit 1`,
+          [owner, Number(jobNoText)]
+        );
+        const id = r?.rows?.[0]?.id;
+        if (id && looksLikeUuid(String(id))) jobUuid = String(id);
+      } catch {}
+
+      if (!jobUuid) {
+        // fail-soft: don’t persist junk
         await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
-        return { active_job_id: null, active_job_name: null, source: 'user_active_job' };
+        return { active_job_id: null, active_job_name: effectiveName || null, source: 'user_active_job' };
       }
 
       await query(
         `
         insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
-        values ($1, $2, $3::text, now())
+        values ($1, $2, $3::uuid, now())
         on conflict (owner_id, user_id)
         do update set job_id = excluded.job_id, updated_at = now()
         `,
-        [owner, String(userId), jobNoText]
+        [owner, String(userId), jobUuid]
       );
 
-      return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'user_active_job' };
-    } catch (e) {
-      console.warn('[PG/activeJob] user_active_job write failed (ignored):', e?.message);
+      return { active_job_id: jobUuid, active_job_name: effectiveName || null, source: 'user_active_job' };
     }
+
+    // text schema: store job_no as text
+    await query(
+      `
+      insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
+      values ($1, $2, $3::text, now())
+      on conflict (owner_id, user_id)
+      do update set job_id = excluded.job_id, updated_at = now()
+      `,
+      [owner, String(userId), jobNoText]
+    );
+
+    return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'user_active_job' };
+  } catch (e) {
+    console.warn('[PG/activeJob] user_active_job write failed (ignored):', e?.message);
   }
+}
+
 
   return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'unknown' };
 }
@@ -1622,10 +1677,9 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
     }
   }
 
-   // 4) user_active_job (supports uuid OR text job_id)  ✅ READ ONLY
+   // 4) user_active_job (supports uuid OR text job_id) ✅ READ ONLY
 if (caps.has_user_active_job) {
   try {
-    // detect job_id type (uuid vs text/int)
     let jobIdType = 'text';
     try {
       const t = await query(
@@ -1642,13 +1696,9 @@ if (caps.has_user_active_job) {
       const dt = String(row?.data_type || '').toLowerCase();
       const udt = String(row?.udt_name || '').toLowerCase();
       if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
-      else jobIdType = 'text';
-    } catch {
-      // default to text
-    }
+    } catch {}
 
     if (jobIdType === 'uuid') {
-      // UUID schema: u.job_id references jobs.id
       const r = await query(
         `
         select
@@ -1670,7 +1720,6 @@ if (caps.has_user_active_job) {
         if (out?.active_job_id != null || out?.active_job_name) return out;
       }
     } else {
-      // Text/numeric schema: u.job_id stores job_no (as text), join by job_no
       const r = await query(
         `
         select
@@ -1697,6 +1746,7 @@ if (caps.has_user_active_job) {
     console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
   }
 }
+
   return null;
 }
 

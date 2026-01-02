@@ -873,99 +873,79 @@ function normalizeJobOptions(jobRows) {
 }
 
 
-function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8, displayedJobNos = null } = {}) {
-  const raw = normalizeJobAnswer(input);
-  const t = String(raw || '').trim();
-  if (!t) return null;
+function resolveJobOptionFromReply(rawInput, jobOptions, opts = {}) {
+  const s = String(rawInput || '').trim();
 
-  const lc = t.toLowerCase();
+  const jobList = Array.isArray(jobOptions) ? jobOptions : [];
+  const page = Number(opts.page || 0) || 0;
+  const pageSize = Number(opts.pageSize || 8) || 8;
 
-  if (looksLikeOverhead(t)) return { kind: 'overhead' };
-  if (lc === 'more' || lc === 'more jobs' || lc === 'more jobs…') return { kind: 'more' };
+  // ✅ the exact job_nos that were shown on screen (1..N mapping)
+  const displayedJobNos = Array.isArray(opts.displayedJobNos) ? opts.displayedJobNos : null;
 
-  const p = Math.max(0, Number(page || 0));
-  const ps = Math.min(8, Math.max(1, Number(pageSize || 8)));
+  // overhead
+  if (/^(overhead|oh)$/i.test(s)) return { kind: 'overhead' };
 
-  // Helper: build a consistent job result
-  const toJobResult = (opt) => {
-    if (!opt) return null;
-    return {
-      kind: 'job',
-      job: {
-        job_no: Number(opt.job_no),
-        name: String(opt.name || '').trim() || null
+  // "more"
+  if (/^more(\s+jobs)?…?$/i.test(s)) return { kind: 'more' };
+
+  // ---- A) Twilio list tap token: jobix_N ----
+  // ✅ THIS is where you were wrong before.
+  const mIx = s.match(/^jobix_(\d{1,10})$/i);
+  if (mIx) {
+    const ix = Number(mIx[1]);
+    if (Number.isFinite(ix) && ix >= 1) {
+      // Prefer the displayed mapping first
+      if (displayedJobNos && displayedJobNos.length >= ix) {
+        const jobNo = Number(displayedJobNos[ix - 1]);
+        const job = jobList.find(j => Number(j?.job_no) === jobNo);
+        if (job) return { kind: 'job', job: { job_no: Number(job.job_no), name: job.name || job.job_name || null } };
+        return null;
       }
-    };
-  };
 
-  // 1) jobno_123 (canonical token)
-  const mJobNo = t.match(/^jobno_(\d{1,10})$/i);
-  if (mJobNo?.[1]) {
-    const jobNo = Number(mJobNo[1]);
-    if (!Number.isFinite(jobNo)) return null;
-
-    const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
-    return toJobResult(opt);
-  }
-
-
-  // 2) jobix_3 (index on current page, 1-based)
-const mJobIx = t.match(/^jobix_(\d{1,10})$/i);
-if (mJobIx?.[1]) {
-  const n = Number(mJobIx[1]);
-  if (!Number.isFinite(n) || n <= 0) return null;
-
-  // ✅ If we have an exact “what we rendered” list, use it (most correct)
-  if (Array.isArray(displayedJobNos) && displayedJobNos.length) {
-    const jobNo = displayedJobNos[n - 1] ?? null;
-    if (jobNo != null && Number.isFinite(Number(jobNo))) {
-      const opt = (jobOptions || []).find((j) => Number(j?.job_no) === Number(jobNo)) || null;
-      return toJobResult(opt);
+      // fallback: old behavior (page-local index), but less safe
+      const start = page * pageSize;
+      const candidate = jobList[start + (ix - 1)];
+      if (candidate?.job_no != null) {
+        return { kind: 'job', job: { job_no: Number(candidate.job_no), name: candidate.name || candidate.job_name || null } };
+      }
     }
     return null;
   }
 
-  // fallback behavior
-  const start = p * ps;
-  const idx = start + (n - 1);
-  const opt = (jobOptions || [])[idx] || null;
-  return toJobResult(opt);
-}
+  // ---- B) stable token jobno_<job_no> ----
+  const mNo = s.match(/^jobno_(\d{1,10})$/i);
+  if (mNo) {
+    const jobNo = Number(mNo[1]);
+    const job = jobList.find(j => Number(j?.job_no) === jobNo);
+    return job ? { kind: 'job', job: { job_no: Number(job.job_no), name: job.name || job.job_name || null } } : null;
+  }
 
-  // 3) Titles like "#3 Something" from Twilio templates are usually *row index*.
-  // Prefer page index if it exists; otherwise fall back to treating it as job_no.
-  const mHash = t.match(/^#\s*(\d{1,10})\b/);
-  if (mHash?.[1]) {
-    const n = Number(mHash[1]);
-    if (Number.isFinite(n) && n > 0) {
-      const start = p * ps;
-      const idx = start + (n - 1);
-      const byIndex = (jobOptions || [])[idx] || null;
-      if (byIndex) return toJobResult(byIndex);
+  // ---- C) numeric reply "1" means row 1 of *displayed slice* ----
+  if (/^\d{1,10}$/.test(s)) {
+    const ix = Number(s);
+    if (Number.isFinite(ix) && ix >= 1) {
+      if (displayedJobNos && displayedJobNos.length >= ix) {
+        const jobNo = Number(displayedJobNos[ix - 1]);
+        const job = jobList.find(j => Number(j?.job_no) === jobNo);
+        return job ? { kind: 'job', job: { job_no: Number(job.job_no), name: job.name || job.job_name || null } } : null;
+      }
 
-      const byJobNo = (jobOptions || []).find((j) => Number(j?.job_no) === n) || null;
-      if (byJobNo) return toJobResult(byJobNo);
+      const start = page * pageSize;
+      const candidate = jobList[start + (ix - 1)];
+      if (candidate?.job_no != null) {
+        return { kind: 'job', job: { job_no: Number(candidate.job_no), name: candidate.name || candidate.job_name || null } };
+      }
     }
+    return null;
   }
 
-  // 4) Plain number (treat as page index)
-  if (/^\d+$/.test(t)) {
-    const n = Number(t);
-    if (!Number.isFinite(n) || n <= 0) return null;
-
-    const start = p * ps;
-    const idx = start + (n - 1);
-    const opt = (jobOptions || [])[idx] || null;
-    return toJobResult(opt);
+  // ---- D) name match (case-insensitive) ----
+  const lc = s.toLowerCase();
+  const byName = jobList.find(j => String(j?.name || j?.job_name || '').trim().toLowerCase() === lc);
+  if (byName?.job_no != null) {
+    return { kind: 'job', job: { job_no: Number(byName.job_no), name: byName.name || byName.job_name || null } };
   }
-
-  // 5) Name match (exact then prefix)
-  const opt =
-    (jobOptions || []).find((j) => String(j?.name || '').trim().toLowerCase() === lc) ||
-    (jobOptions || []).find((j) => String(j?.name || '').trim().toLowerCase().startsWith(lc.slice(0, 24))) ||
-    null;
-
-  if (opt) return toJobResult(opt);
 
   return null;
 }
@@ -1353,15 +1333,19 @@ function looksLikeJobPickerAnswer(raw = '') {
   if (/^(overhead|oh)$/i.test(s)) return true;
   if (/^more(\s+jobs)?…?$/i.test(s)) return true;
 
+  // numeric reply (row index)
   if (/^\d{1,10}$/.test(s)) return true;
 
+  // stable tokens
   if (/^jobno_\d{1,10}$/i.test(s)) return true;
   if (/^jobix_\d{1,10}$/i.test(s)) return true;
 
+  // other legacy-ish tokens
   if (/^job_\d{1,10}_[0-9a-z]+$/i.test(s)) return true;
   if (/^#\s*\d{1,10}\b/.test(s)) return true;
   if (/\bJ\d{1,10}\b/i.test(s)) return true;
 
+  // allow name attempts, reject obvious commands
   if (/^[a-z0-9][a-z0-9 _.'-]{2,}$/i.test(s)) {
     const lc = s.toLowerCase();
     if (/^(yes|no|edit|cancel|stop|change job|switch job|pick job|active jobs|show jobs|jobs)$/i.test(lc)) return false;
@@ -1372,6 +1356,8 @@ function looksLikeJobPickerAnswer(raw = '') {
 }
 
 if (pickPA?.payload?.jobOptions) {
+  // If the user sent a brand new expense while we were waiting for a job pick,
+  // clear state and fall through to normal parsing (do NOT return).
   if (looksLikeNewExpenseText(input)) {
     console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
     try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
@@ -1385,10 +1371,11 @@ if (pickPA?.payload?.jobOptions) {
     const hasMore = !!pickPA.payload.hasMore;
     const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : null;
 
+    const rawInput = String(input || '').trim();
+
     console.info('[EXPENSE] pick-job inbound', {
-      input,
-      rawInput: String(input || '').trim(),
-      normalized: normalizeJobAnswer(input),
+      input: rawInput,
+      normalized: normalizeJobAnswer(rawInput),
       page,
       pageSize,
       jobsCount: jobOptions.length,
@@ -1406,17 +1393,15 @@ if (pickPA?.payload?.jobOptions) {
       return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
     }
 
-    const rawInput = String(input || '').trim();
-
     if (!looksLikeJobPickerAnswer(rawInput)) {
       return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
     }
 
+    // ✅ IMPORTANT: pass displayedJobNos so jobix_N maps to the exact rendered rows
     const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
 
     if (!resolved) {
-      // ✅ If user tapped a list row, don't force a second reply.
-      // Re-send the picker instead (stale PA / list changed / template weirdness).
+      // If user tapped a list row, don't force a second reply: re-show picker.
       const looksLikeListTap =
         /^jobix_\d{1,10}$/i.test(rawInput) ||
         /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
@@ -1438,12 +1423,7 @@ if (pickPA?.payload?.jobOptions) {
       return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
     }
 
-    console.info('[EXPENSE] pick-job resolved', {
-      input: rawInput,
-      resolved,
-      page,
-      pageSize
-    });
+    console.info('[EXPENSE] pick-job resolved', { input: rawInput, resolved, page, pageSize });
 
     if (resolved.kind === 'overhead') {
       const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
@@ -1487,8 +1467,7 @@ if (pickPA?.payload?.jobOptions) {
 
       try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
 
-      // NOTE: confirmPA variable above is the one you fetched before upsert.
-      // If you want the freshest draft values, re-fetch confirmPA here.
+      // re-fetch to build the freshest humanLine
       const confirmPA2 = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
       const humanLine =
@@ -1507,6 +1486,7 @@ if (pickPA?.payload?.jobOptions) {
     return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
   }
 }
+
 
 
 // ---- 2) Confirm/edit/cancel ----

@@ -414,26 +414,27 @@ function normalizeJobAnswer(text) {
   let s = String(text || '').trim();
   if (!s) return s;
 
-  // ✅ 0) If Twilio ListTitle contains stamped job number like "J8", trust it.
+  // ✅ 0) Preserve canonical tokens FIRST (prevents "jobix_6" -> "ix_6")
+  if (/^jobno_\d{1,10}$/i.test(s)) return s.toLowerCase();
+  if (/^jobix_\d{1,10}$/i.test(s)) return s.toLowerCase();
+
+  // ✅ 1) If visible text contains stamped job number like "J8", convert to jobno_8
   // Example inbound ListTitle: "#3 J8 1559 MedwayPark Dr"
   const mStamp = s.match(/\bJ(\d{1,10})\b/i);
   if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
 
-  // ✅ 1) Preserve canonical job_no token
-  if (/^jobno_\d+$/i.test(s)) return s;
-
-  // ✅ 2) Twilio list id format from Content Template:
-  // Example: "job_3_552e375c" -> this "3" is the ROW INDEX, not job_no.
+  // ✅ 2) Twilio template list id format from Content Template:
+  // Example: "job_6_112407c4" -> this "6" is the ROW INDEX, not job_no.
   const mTw = s.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
-  if (mTw?.[1]) return `jobix_${mTw[1]}`; // ✅ treat as index token
+  if (mTw?.[1]) return `jobix_${mTw[1]}`;
 
-  // Keep "#3 ..." for resolver (it may be index)
-  // no-op here
+  // Keep "#3 ..." for resolver (it may be index). No-op.
 
-  // Existing cleanup
+  // Existing cleanup (safe now because tokens are already returned above)
   s = s.replace(/^(job\s*name|job)\s*[:-]?\s*/i, '');
   s = s.replace(/^(create|new)\s+job\s+/i, '');
   s = s.replace(/[?]+$/g, '').trim();
+
   return s;
 }
 
@@ -1188,27 +1189,19 @@ function looksLikeJobPickerAnswer(raw = '') {
   const s = String(raw || '').trim();
   if (!s) return false;
 
-  // decision tokens handled earlier (tok)
   if (/^(overhead|oh)$/i.test(s)) return true;
   if (/^more(\s+jobs)?…?$/i.test(s)) return true;
 
-  // numeric index
   if (/^\d{1,10}$/.test(s)) return true;
 
-  // stable token forms
   if (/^jobno_\d{1,10}$/i.test(s)) return true;
   if (/^jobix_\d{1,10}$/i.test(s)) return true;
 
-  // Twilio template list id format (if it slips through un-normalized)
   if (/^job_\d{1,10}_[0-9a-z]+$/i.test(s)) return true;
-
-  // "#3 ..." titles
   if (/^#\s*\d{1,10}\b/.test(s)) return true;
-
-  // stamped (should normally be converted by normalizeJobAnswer already)
   if (/\bJ\d{1,10}\b/i.test(s)) return true;
 
-  // finally: allow a plausible job name attempt (letters/numbers/spaces), but reject single-word commands
+  // allow name attempts, reject obvious commands
   if (/^[a-z0-9][a-z0-9 _.'-]{2,}$/i.test(s)) {
     const lc = s.toLowerCase();
     if (/^(yes|no|edit|cancel|stop|change job|switch job|pick job|active jobs|show jobs|jobs)$/i.test(lc)) return false;
@@ -1232,15 +1225,16 @@ if (pickPA?.payload?.jobOptions) {
     const page = Number(pickPA.payload.page || 0) || 0;
     const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
     const hasMore = !!pickPA.payload.hasMore;
-    console.info('[EXPENSE] pick-job inbound', {
-  input,
-  rawInput: String(input || '').trim(),
-  normalized: normalizeJobAnswer(input),
-  page: pickPA?.payload?.page,
-  pageSize: pickPA?.payload?.pageSize,
-  jobsCount: Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions.length : 0
-});
 
+    // ✅ PLACE THIS LOG RIGHT HERE (after page/pageSize/jobOptions computed)
+    console.info('[EXPENSE] pick-job inbound', {
+      input,
+      rawInput: String(input || '').trim(),
+      normalized: normalizeJobAnswer(input),
+      page,
+      pageSize,
+      jobsCount: jobOptions.length
+    });
 
     if (tok === 'change_job') {
       return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
@@ -1255,59 +1249,44 @@ if (pickPA?.payload?.jobOptions) {
 
     const rawInput = String(input || '').trim();
 
-    // ✅ IMPORTANT: do not reject jobix_ tokens from list taps
     if (!looksLikeJobPickerAnswer(rawInput)) {
       return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
     }
 
     const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize });
 
-if (!resolved) {
-  // ✅ If user tapped a list row, don't force a second reply.
-  // Re-send the picker instead (stale PA / list changed / template weirdness).
-  const looksLikeListTap =
-    /^jobix_\d{1,10}$/i.test(rawInput) ||
-    /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-    /^#\s*\d{1,10}\b/.test(rawInput);
+    if (!resolved) {
+      // ✅ If user tapped a list row, don't force a second reply.
+      // Re-send the picker instead (stale PA / list changed / template weirdness).
+      const looksLikeListTap =
+        /^jobix_\d{1,10}$/i.test(rawInput) ||
+        /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+        /^#\s*\d{1,10}\b/.test(rawInput);
 
-  console.warn('[EXPENSE] pick-job could not resolve selection; reshowing picker', {
-    rawInput,
-    page,
-    pageSize,
-    hasMore,
-    firstOptions: (jobOptions || []).slice(0, 12).map(j => ({ job_no: j?.job_no, name: j?.name }))
-  });
+      console.warn('[EXPENSE] pick-job could not resolve selection; reshowing picker', {
+        rawInput,
+        normalized: normalizeJobAnswer(rawInput),
+        page,
+        pageSize,
+        hasMore,
+        firstOptions: (jobOptions || []).slice(0, 12).map(j => ({ job_no: j?.job_no, name: j?.name }))
+      });
 
-  if (looksLikeListTap) {
-    return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
-  }
+      if (looksLikeListTap) {
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
+      }
 
-  // fallback for typed garbage
-  return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-}
-
+      return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+    }
 
     console.info('[EXPENSE] pick-job resolved', {
       input: rawInput,
       resolved,
       page,
-      pageSize,
-      firstOptions: (jobOptions || []).slice(0, 12).map((j) => ({
-        job_no: j?.job_no,
-        name: j?.name
-      }))
+      pageSize
     });
 
-   
-    if (resolved.kind === 'more') {
-      if (!hasMore) {
-        return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
-      }
-      return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
-    }
-
     if (resolved.kind === 'overhead') {
-      // store overhead selection into confirm draft, then re-show confirm
       const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
       if (confirmPA?.payload?.draft) {
         await upsertPA({
@@ -1316,7 +1295,7 @@ if (!resolved) {
           kind: PA_KIND_CONFIRM,
           payload: {
             ...confirmPA.payload,
-            draft: { ...(confirmPA.payload.draft || {}), jobName: 'Overhead', jobSource: 'overhead', job_no: null },
+            draft: { ...(confirmPA.payload.draft || {}), jobName: 'Overhead', jobSource: 'overhead', job_no: null }
           },
           ttlSeconds: PA_TTL_SEC
         });
@@ -1347,15 +1326,18 @@ if (!resolved) {
         });
       }
 
-      // job chosen -> clear pick job PA and show confirm again
       try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+
+      // NOTE: confirmPA variable above is the one you fetched before upsert.
+      // If you want the freshest draft values, re-fetch confirmPA here.
+      const confirmPA2 = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
       const humanLine =
         buildExpenseSummaryLine({
-          amount: confirmPA?.payload?.draft?.amount,
-          item: confirmPA?.payload?.draft?.item,
-          store: confirmPA?.payload?.draft?.store,
-          date: confirmPA?.payload?.draft?.date,
+          amount: confirmPA2?.payload?.draft?.amount,
+          item: confirmPA2?.payload?.draft?.item,
+          store: confirmPA2?.payload?.draft?.store,
+          date: confirmPA2?.payload?.draft?.date,
           jobName: resolved.job.name || null,
           tz
         }) || 'Confirm expense?';
@@ -1363,7 +1345,6 @@ if (!resolved) {
       return await sendConfirmExpenseOrFallback(from, humanLine);
     }
 
-    // fallback
     return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
   }
 }

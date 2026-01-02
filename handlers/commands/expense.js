@@ -715,6 +715,7 @@ function deterministicExpenseParse(input, userProfile) {
 }
 
 
+
 async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   const vendor = String(data?.store || '').trim() || 'Unknown Store';
   const itemText = String(data?.item || '').trim();
@@ -741,7 +742,13 @@ async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
 }
 
 /* ---------------- Job list + picker mapping (JOB_NO-FIRST) ---------------- */
-
+function sanitizeJobLabel(s) {
+  return String(s || '')
+    .replace(/\u00A0/g, ' ')           // NBSP -> normal space
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
 function isGarbageJobName(name) {
   const lc = String(name || '').trim().toLowerCase();
   return (
@@ -811,7 +818,7 @@ function normalizeJobOptions(jobRows) {
   const seen = new Set();
 
   for (const j of jobRows || []) {
-    const name = String(j?.name || '').trim();
+    const name = sanitizeJobLabel(j?.name || j?.job_name || j?.jobName);
     if (!name) continue;
     if (isGarbageJobName(name)) continue;
 
@@ -819,10 +826,10 @@ function normalizeJobOptions(jobRows) {
     if (seen.has(key)) continue;
     seen.add(key);
 
-    const jobNo = j?.job_no != null ? Number(j.job_no) : null;
+    const jobNo = j?.job_no != null ? Number(j.job_no) : (j?.jobNo != null ? Number(j.jobNo) : null);
     if (jobNo == null || !Number.isFinite(jobNo)) continue;
 
-    const rawId = j?.id != null ? String(j.id) : null;
+    const rawId = j?.id != null ? String(j.id) : (j?.job_id != null ? String(j.job_id) : null);
     const safeUuidId = rawId && looksLikeUuid(rawId) ? rawId : null;
 
     out.push({ id: safeUuidId, job_no: jobNo, name });
@@ -830,6 +837,7 @@ function normalizeJobOptions(jobRows) {
 
   return out;
 }
+
 
 function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 } = {}) {
   const raw = normalizeJobAnswer(input);
@@ -866,18 +874,8 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
     return toJobResult(opt);
   }
 
-  // 2) Stamped token in visible text: "J8"
-  // This must be BEFORE index parsing like "#3 ..." or "3"
-  const mStamp = t.match(/\bJ(\d{1,10})\b/i);
-  if (mStamp?.[1]) {
-    const jobNo = Number(mStamp[1]);
-    if (!Number.isFinite(jobNo)) return null;
 
-    const opt = (jobOptions || []).find((j) => Number(j?.job_no) === jobNo) || null;
-    return toJobResult(opt);
-  }
-
-  // 3) jobix_3 (index on current page, 1-based)
+  // 2) jobix_3 (index on current page, 1-based)
   const mJobIx = t.match(/^jobix_(\d{1,10})$/i);
   if (mJobIx?.[1]) {
     const n = Number(mJobIx[1]);
@@ -889,7 +887,7 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
     return toJobResult(opt);
   }
 
-  // 4) Titles like "#3 Something" from Twilio templates are usually *row index*.
+  // 3) Titles like "#3 Something" from Twilio templates are usually *row index*.
   // Prefer page index if it exists; otherwise fall back to treating it as job_no.
   const mHash = t.match(/^#\s*(\d{1,10})\b/);
   if (mHash?.[1]) {
@@ -905,7 +903,7 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
     }
   }
 
-  // 5) Plain number (treat as page index)
+  // 4) Plain number (treat as page index)
   if (/^\d+$/.test(t)) {
     const n = Number(t);
     if (!Number.isFinite(n) || n <= 0) return null;
@@ -916,7 +914,7 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 8 }
     return toJobResult(opt);
   }
 
-  // 6) Name match (exact then prefix)
+  // 5) Name match (exact then prefix)
   const opt =
     (jobOptions || []).find((j) => String(j?.name || '').trim().toLowerCase() === lc) ||
     (jobOptions || []).find((j) => String(j?.name || '').trim().toLowerCase().startsWith(lc.slice(0, 24))) ||
@@ -1037,15 +1035,16 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   }
 
 const rows = slice.map((j) => {
-  const full = String(j?.name || j?.job_name || 'Untitled Job').trim();
   const jobNo = Number(j.job_no);
+  const full = sanitizeJobLabel(j?.name || j?.job_name || 'Untitled Job');
 
-const stamped = `J${jobNo} ${full}`;
-return {
-  id: `jobno_${jobNo}`,
-  title: stamped.slice(0, 24),
-  description: full.slice(0, 72)
-};
+  const stamped = `J${jobNo} ${full}`;
+
+  return {
+    id: `jobno_${jobNo}`,
+    title: stamped.slice(0, 24),
+    description: full.slice(0, 72)
+  };
 
 });
 
@@ -1186,6 +1185,40 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
    // ---- 1) Awaiting job pick ----
 const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
 
+function looksLikeJobPickerAnswer(raw = '') {
+  const s = String(raw || '').trim();
+  if (!s) return false;
+
+  // decision tokens handled earlier (tok)
+  if (/^(overhead|oh)$/i.test(s)) return true;
+  if (/^more(\s+jobs)?…?$/i.test(s)) return true;
+
+  // numeric index
+  if (/^\d{1,10}$/.test(s)) return true;
+
+  // stable token forms
+  if (/^jobno_\d{1,10}$/i.test(s)) return true;
+  if (/^jobix_\d{1,10}$/i.test(s)) return true;
+
+  // Twilio template list id format (if it slips through un-normalized)
+  if (/^job_\d{1,10}_[0-9a-z]+$/i.test(s)) return true;
+
+  // "#3 ..." titles
+  if (/^#\s*\d{1,10}\b/.test(s)) return true;
+
+  // stamped (should normally be converted by normalizeJobAnswer already)
+  if (/\bJ\d{1,10}\b/i.test(s)) return true;
+
+  // finally: allow a plausible job name attempt (letters/numbers/spaces), but reject single-word commands
+  if (/^[a-z0-9][a-z0-9 _.'-]{2,}$/i.test(s)) {
+    const lc = s.toLowerCase();
+    if (/^(yes|no|edit|cancel|stop|change job|switch job|pick job|active jobs|show jobs|jobs)$/i.test(lc)) return false;
+    return true;
+  }
+
+  return false;
+}
+
 if (pickPA?.payload?.jobOptions) {
   // If the user sent a brand new expense while we were waiting for a job pick,
   // clear state and fall through to normal parsing (do NOT return).
@@ -1212,104 +1245,97 @@ if (pickPA?.payload?.jobOptions) {
       return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
     }
 
-    const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize });
-if (!resolved) {
-  return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-}
+    const rawInput = String(input || '').trim();
 
-// 🔍 ADD THIS LOG RIGHT HERE
-console.info('[EXPENSE] pick-job resolved', {
-  input,
-  resolved,
-  page,
-  pageSize,
-  firstOptions: (jobOptions || []).slice(0, 12).map(j => ({
-    job_no: j?.job_no,
-    name: j?.name
-  }))
-});
-
-    const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    if (!confirm?.payload?.draft) {
-      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-      return out(twimlText('Got it. Now resend the expense details.'), false);
-    }
-
-    // ✅ Preserve text source for later inference
-    // IMPORTANT: do NOT overwrite with picker token (e.g., "jobno_6")
-    const existingOriginal =
-      confirm.payload.draft.originalText ||
-      confirm.payload.draft.draftText ||
-      confirm.payload.draft.text ||
-      confirm.payload.draft.media_transcript ||
-      confirm.payload.draft.mediaTranscript ||
-      null;
-
-    if (!existingOriginal) {
-      // Only set if we truly have nothing — and even then, avoid setting picker tokens
-      const maybePickerish = String(input || '').trim();
-      const isPickerToken =
-        /^jobno_\d+$/i.test(maybePickerish) ||
-        /^job_\d+_[0-9a-z]+$/i.test(maybePickerish) ||
-        maybePickerish === 'overhead' ||
-        maybePickerish === 'more';
-
-      if (!isPickerToken) {
-        confirm.payload.draft.originalText = maybePickerish;
-        confirm.payload.draft.draftText = maybePickerish;
-      }
-    } else {
-      // Normalize presence (keep what we already have)
-      confirm.payload.draft.originalText = confirm.payload.draft.originalText || existingOriginal;
-      confirm.payload.draft.draftText = confirm.payload.draft.draftText || existingOriginal;
-    }
-
-    if (resolved.kind === 'overhead') {
-      confirm.payload.draft.jobName = 'Overhead';
-      confirm.payload.draft.jobSource = 'overhead';
-      confirm.payload.draft.job = { id: null, job_no: null, name: 'Overhead' };
-      confirm.payload.draft.job_id = null;
-      confirm.payload.draft.job_no = null;
-    } else if (resolved.kind === 'job') {
-      const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
-      const jobNo =
-        resolved.job?.job_no != null && Number.isFinite(Number(resolved.job.job_no))
-          ? Number(resolved.job.job_no)
-          : null;
-
-      confirm.payload.draft.jobName = jobName || confirm.payload.draft.jobName || null;
-      confirm.payload.draft.jobSource = 'picked';
-      confirm.payload.draft.job_no = jobNo;
-
-      // job_no-first: never stuff numeric jobs.id into job_id
-      confirm.payload.draft.job = { id: null, job_no: jobNo, name: jobName || null };
-      confirm.payload.draft.job_id = null;
-    } else {
+    // ✅ IMPORTANT: do not reject jobix_ tokens from list taps
+    if (!looksLikeJobPickerAnswer(rawInput)) {
       return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
     }
 
-    await upsertPA({
-      ownerId,
-      userId: from,
-      kind: PA_KIND_CONFIRM,
-      payload: confirm.payload,
-      ttlSeconds: PA_TTL_SEC
-    });
-    await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+    const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize });
 
-    const summaryLine = buildExpenseSummaryLine({
-      amount: confirm.payload.draft.amount,
-      item: confirm.payload.draft.item,
-      store: confirm.payload.draft.store,
-      date: confirm.payload.draft.date,
-      jobName: confirm.payload.draft.jobName,
-      tz
+    if (!resolved) {
+      return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+    }
+
+    console.info('[EXPENSE] pick-job resolved', {
+      input: rawInput,
+      resolved,
+      page,
+      pageSize,
+      firstOptions: (jobOptions || []).slice(0, 12).map((j) => ({
+        job_no: j?.job_no,
+        name: j?.name
+      }))
     });
 
-    return await sendConfirmExpenseOrFallback(
-      from,
-      `${summaryLine}${buildActiveJobHint(confirm.payload.draft.jobName, confirm.payload.draft.jobSource)}`
-    );
+   
+    if (resolved.kind === 'more') {
+      if (!hasMore) {
+        return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
+      }
+      return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
+    }
+
+    if (resolved.kind === 'overhead') {
+      // store overhead selection into confirm draft, then re-show confirm
+      const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+      if (confirmPA?.payload?.draft) {
+        await upsertPA({
+          ownerId,
+          userId: from,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...confirmPA.payload,
+            draft: { ...(confirmPA.payload.draft || {}), jobName: 'Overhead', jobSource: 'overhead', job_no: null },
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
+      }
+      try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+      const line = confirmPA?.payload?.humanLine || confirmPA?.payload?.summaryLine || null;
+      return await sendConfirmExpenseOrFallback(from, line || 'Confirm expense?');
+    }
+
+    if (resolved.kind === 'job' && resolved.job?.job_no) {
+      const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
+      if (confirmPA?.payload?.draft) {
+        await upsertPA({
+          ownerId,
+          userId: from,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...confirmPA.payload,
+            draft: {
+              ...(confirmPA.payload.draft || {}),
+              jobName: resolved.job.name || null,
+              jobSource: 'picked',
+              job_no: Number(resolved.job.job_no)
+            }
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
+      }
+
+      // job chosen -> clear pick job PA and show confirm again
+      try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+
+      const humanLine =
+        buildExpenseSummaryLine({
+          amount: confirmPA?.payload?.draft?.amount,
+          item: confirmPA?.payload?.draft?.item,
+          store: confirmPA?.payload?.draft?.store,
+          date: confirmPA?.payload?.draft?.date,
+          jobName: resolved.job.name || null,
+          tz
+        }) || 'Confirm expense?';
+
+      return await sendConfirmExpenseOrFallback(from, humanLine);
+    }
+
+    // fallback
+    return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
   }
 }
 
@@ -1363,6 +1389,45 @@ if (confirmPA?.payload?.draft) {
     const maybeJobId = rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
 
     let data = normalizeExpenseData(rawDraft, userProfile);
+
+// ✅ Strong Unknown handling (covers "Unknown", "Unknown ...", empty, etc.)
+if (isUnknownItem(data.item)) {
+  const src =
+    rawDraft?.draftText ||
+    rawDraft?.originalText ||
+    rawDraft?.text ||
+    rawDraft?.media_transcript ||
+    rawDraft?.mediaTranscript ||
+    rawDraft?.input ||
+    '';
+
+  let inferred = inferExpenseItemFallback(src);
+
+  if (!inferred) {
+    inferred = inferExpenseItemFallback(input);
+  }
+
+  if (inferred) data.item = inferred;
+}
+
+// ✅ Ensure item survives confirm->yes even if draft used "description"/"memo"
+if (!data.item || isUnknownItem(data.item)) {
+  const fallbackDesc =
+    rawDraft?.item ||
+    rawDraft?.description ||
+    rawDraft?.desc ||
+    rawDraft?.memo ||
+    '';
+
+  if (fallbackDesc && !isUnknownItem(fallbackDesc)) {
+    data.item = cleanExpenseItemForDisplay(String(fallbackDesc).trim());
+  }
+}
+
+// final safety
+if (!data.item || isUnknownItem(data.item)) data.item = 'Unknown';
+
+
 
 // ✅ Strong Unknown handling (covers "Unknown", "Unknown ...", empty, etc.)
 if (isUnknownItem(data.item)) {

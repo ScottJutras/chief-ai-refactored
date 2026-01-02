@@ -1590,77 +1590,94 @@ if (!data.item || isUnknownItem(data.item)) {
   }
 }
 
+// ✅ Strong Unknown handling (covers "Unknown", "Unknown ...", empty, etc.)
+if (!data.item || isUnknownItem(data.item)) {
+  const src =
+    rawDraft?.draftText ||
+    rawDraft?.originalText ||
+    rawDraft?.text ||
+    rawDraft?.media_transcript ||
+    rawDraft?.mediaTranscript ||
+    rawDraft?.input ||
+    '';
+
+  let inferred = inferExpenseItemFallback(src);
+  if (!inferred) inferred = inferExpenseItemFallback(input);
+  if (inferred) data.item = inferred;
+}
+
 // final safety
 if (!data.item || isUnknownItem(data.item)) data.item = 'Unknown';
 
-    data.store = await normalizeVendorName(ownerId, data.store);
-    const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+data.store = await normalizeVendorName(ownerId, data.store);
+const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
-    const pickedJobName = data.jobName && String(data.jobName).trim() ? String(data.jobName).trim() : null;
-    let jobName = pickedJobName || rawDraft?.jobName || null;
-    let jobSource = rawDraft?.jobSource || (pickedJobName ? 'typed' : null);
+const pickedJobName = data.jobName && String(data.jobName).trim() ? String(data.jobName).trim() : null;
+let jobName = pickedJobName || rawDraft?.jobName || null;
+let jobSource = rawDraft?.jobSource || (pickedJobName ? 'typed' : null);
 
-    let jobNo =
-      rawDraft?.job_no != null && Number.isFinite(Number(rawDraft.job_no))
-        ? Number(rawDraft.job_no)
-        : rawDraft?.job?.job_no != null && Number.isFinite(Number(rawDraft.job.job_no))
-          ? Number(rawDraft.job.job_no)
-          : null;
+let jobNo =
+  rawDraft?.job_no != null && Number.isFinite(Number(rawDraft.job_no))
+    ? Number(rawDraft.job_no)
+    : rawDraft?.job?.job_no != null && Number.isFinite(Number(rawDraft.job.job_no))
+      ? Number(rawDraft.job.job_no)
+      : null;
 
-    if (!jobName) {
-      jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-      if (jobName) jobSource = 'active';
-    }
+if (!jobName) {
+  jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+  if (jobName) jobSource = 'active';
+}
 
-    if (jobName && looksLikeOverhead(jobName)) {
-      jobName = 'Overhead';
-      jobSource = 'overhead';
-      jobNo = null;
-    }
+if (jobName && looksLikeOverhead(jobName)) {
+  jobName = 'Overhead';
+  jobSource = 'overhead';
+  jobNo = null;
+}
 
-    // If still no job, keep confirm PA and show picker
-    if (!jobName) {
-      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-      await upsertPA({
-        ownerId,
-        userId: from,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...confirmPA.payload,
-          draft: {
-            ...data,
-            jobName: null,
-            jobSource: jobSource || null,
-            suggestedCategory: category,
-            job_id: maybeJobId || null,
-            job_no: jobNo
-          },
-          sourceMsgId: stableMsgId
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
+// If still no job, keep confirm PA and show picker
+if (!jobName) {
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
 
-      if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-      return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-    }
-
-    data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
-
-    const gate = assertExpenseCILOrClarify({
-      ownerId,
-      from,
-      userProfile,
-      data,
-      jobName,
-      category,
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      ...confirmPA.payload,
+      draft: {
+        ...data,
+        jobName: null,
+        jobSource: jobSource || null,
+        suggestedCategory: category,
+        job_id: maybeJobId || null,
+        job_no: jobNo
+      },
       sourceMsgId: stableMsgId
-    });
-    if (!gate.ok) return out(twimlText(String(gate.reply || '').slice(0, 1500)), false);
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
 
-    const amountCents = toCents(data.amount);
-    if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+  if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+  return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+}
 
-    const writeResult = await withTimeout(
+data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
+
+const gate = assertExpenseCILOrClarify({
+  ownerId,
+  from,
+  userProfile,
+  data,
+  jobName,
+  category,
+  sourceMsgId: stableMsgId
+});
+if (!gate.ok) return out(twimlText(String(gate.reply || '').slice(0, 1500)), false);
+
+const amountCents = toCents(data.amount);
+if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+
+const writeResult = await withTimeout(
   insertTransaction(
     {
       ownerId,
@@ -1709,6 +1726,20 @@ if (writeResult === '__DB_TIMEOUT__') {
     false
   );
 }
+
+// ✅ Persist active job after a successful log (even if duplicate)
+try {
+  await persistActiveJobFromExpense({
+    ownerId,
+    fromPhone: from,
+    userProfile,
+    jobNo,
+    jobName
+  });
+} catch (e) {
+  console.warn('[EXPENSE] persistActiveJobFromExpense failed (ignored):', e?.message);
+}
+
 
 // ✅ Persist active job after a successful log (even if duplicate)
 await persistActiveJobFromExpense({

@@ -1086,6 +1086,10 @@ function normalizeIdentityDigits(x) {
   if (!s) return null;
   return s.replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '') || null;
 }
+// Back-compat alias (some code still calls normalizeIdentity)
+function normalizeIdentity(x) {
+  return normalizeIdentityDigits(x);
+}
 
 function looksLikeBadJobName(name) {
   const t = String(name || '').trim();

@@ -682,7 +682,8 @@ function deterministicExpenseParse(input, userProfile) {
   let item = null;
 
   // 1) "worth of <item>"
-  const worthOf = raw.match(/\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i);
+  const worthOf = raw.match(
+  /\bworth\s+of\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);
   if (worthOf?.[1]) item = String(worthOf[1]).trim();
 
   // ✅ 2) "$4000 -Degreaser at Home Hardware ..." OR "$4000 - tar removal materials at ..."
@@ -1080,27 +1081,133 @@ const rows = slice.map((j) => {
 
 let _ACTIVE_JOB_IDENTITY_OK = null;
 
+function normalizeIdentityDigits(x) {
+  const s = String(x || '').trim();
+  if (!s) return null;
+  return s.replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '') || null;
+}
+
+function looksLikeBadJobName(name) {
+  const t = String(name || '').trim();
+  if (!t) return true;
+  const lc = t.toLowerCase();
+
+  if (/^jobix_\d+$/i.test(lc)) return true;
+  if (/^jobno_\d+$/i.test(lc)) return true;
+  if (/^job_\d+_[0-9a-z]+$/i.test(lc)) return true;
+  if (/^#\s*\d+\b/.test(lc)) return true;
+
+  // allow overhead
+  if (lc === 'overhead') return false;
+
+  return false;
+}
+
 async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
+  // 0) profile direct (but reject token garbage)
   const directName = userProfile?.active_job_name || userProfile?.activeJobName || null;
-  if (directName && String(directName).trim()) return String(directName).trim();
+  if (directName && !looksLikeBadJobName(directName)) return String(directName).trim();
 
   if (_ACTIVE_JOB_IDENTITY_OK === false) return null;
 
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  const identity =
+    normalizeIdentityDigits(fromPhone) ||
+    normalizeIdentityDigits(userProfile?.phone_e164) ||
+    normalizeIdentityDigits(userProfile?.phone) ||
+    normalizeIdentityDigits(userProfile?.from) ||
+    normalizeIdentityDigits(userProfile?.user_id) ||
+    normalizeIdentityDigits(userProfile?.id) ||
+    normalizeIdentityDigits(userProfile?.userId) ||
+    null;
+
+  if (!owner || !identity) return null;
+
   if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
-      const out = await pg.getActiveJobForIdentity(String(ownerId), String(fromPhone));
+      const out = await pg.getActiveJobForIdentity(owner, identity);
       _ACTIVE_JOB_IDENTITY_OK = true;
 
       const n = out?.active_job_name || out?.activeJobName || null;
-      if (n && String(n).trim()) return String(n).trim();
+      if (n && !looksLikeBadJobName(n)) return String(n).trim();
+
+      // if DB contains token garbage, treat as no active job
+      return null;
     } catch (e) {
       const msg = String(e?.message || '').toLowerCase();
       const code = String(e?.code || '');
-      if (code === '42P01' || msg.includes('public.memberships')) {
+      if (code === '42P01' || msg.includes('memberships')) {
         _ACTIVE_JOB_IDENTITY_OK = false;
         return null;
       }
       // fail-open
+    }
+  }
+
+  return null;
+}
+
+
+async function resolveActiveJobName({ ownerId, userProfile, fromPhone }) {
+  // 0) If profile already has it, use it (but reject token garbage)
+  const directName = userProfile?.active_job_name || userProfile?.activeJobName || null;
+  if (directName && !looksLikeBadActiveJobName(directName)) return String(directName).trim();
+
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  const identity =
+    normalizeIdentity(fromPhone) ||
+    normalizeIdentity(userProfile?.phone_e164) ||
+    normalizeIdentity(userProfile?.phone) ||
+    normalizeIdentity(userProfile?.from) ||
+    normalizeIdentity(userProfile?.user_id) ||
+    normalizeIdentity(userProfile?.id) ||
+    normalizeIdentity(userProfile?.userId) ||
+    null;
+
+  if (!owner || !identity) return null;
+
+  // 1) Preferred: identity-based getter (if table exists)
+  if (_ACTIVE_JOB_IDENTITY_OK !== false && typeof pg.getActiveJobForIdentity === 'function') {
+    try {
+      const out = await pg.getActiveJobForIdentity(String(owner), String(identity));
+      _ACTIVE_JOB_IDENTITY_OK = true;
+
+      const n = pickActiveJobNameFromAny(out);
+      if (n) return n;
+    } catch (e) {
+      const msg = String(e?.message || '').toLowerCase();
+      const code = String(e?.code || '');
+      // if this is a schema/table-missing failure, disable identity getter
+      if (code === '42P01' || msg.includes('public.memberships')) {
+        _ACTIVE_JOB_IDENTITY_OK = false;
+      }
+      // fail-open to fallbacks below
+    }
+  }
+
+  // 2) Fallback: try other pg helpers (these often exist in your postgres.js)
+  const fallbackFns = [
+    // common in your codebase
+    'getActiveJobForPhone',
+    'getActiveJobForUser',
+    'getActiveJob',
+    'getUserActiveJob'
+  ];
+
+  for (const fn of fallbackFns) {
+    if (typeof pg[fn] !== 'function') continue;
+    try {
+      // Try (owner, identity)
+      const out1 = await pg[fn](String(owner), String(identity));
+      const n1 = pickActiveJobNameFromAny(out1);
+      if (n1) return n1;
+
+      // Try ({ ownerId, userId }) style
+      const out2 = await pg[fn]({ ownerId: String(owner), userId: String(identity) });
+      const n2 = pickActiveJobNameFromAny(out2);
+      if (n2) return n2;
+    } catch {
+      // ignore and continue
     }
   }
 

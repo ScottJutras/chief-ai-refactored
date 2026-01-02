@@ -250,30 +250,40 @@ async function sendWhatsAppListPicker({ to, body, button, items, cacheKey }) {
 
 /* ---------------- Active job persistence (ALIGNED with services/postgres.js) ---------------- */
 /**
- * Canonical: pg.setActiveJobForIdentity(ownerId, identity, jobId, jobName)
+ * Canonical: pg.setActiveJobForIdentity(ownerId, identityDigits, jobId(uuid|null), jobName|null)
  * Aliases: pg.setActiveJob / pg.setActiveJobForUser / pg.saveActiveJob / etc.
  *
- * We also keep SQL best-effort fallbacks to avoid "works in dev, breaks in prod" schema drift.
+ * Goals:
+ *  - NEVER write non-UUID into job_id / active_job_id columns.
+ *  - NEVER persist jobName tokens like "jobix_1" / "jobno_3".
+ *  - Best-effort resolve a canonical job row from (id uuid) OR (job_no) OR (name).
+ *  - ALWAYS normalize identity to DIGITS so reads/writes match getActiveJobForIdentity().
  */
 async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, jobRow, jobNameFallback }) {
   const owner = String(ownerId || '').replace(/\D/g, '');
 
+  const digits = (x) =>
+    String(x || '')
+      .replace(/^whatsapp:/i, '')
+      .replace(/^\+/, '')
+      .replace(/\D/g, '') || null;
+
+  // ✅ IMPORTANT: identity should match getActiveJobForIdentity(ownerId, fromPhone)
+  // Prefer the inbound phone (WaId) so reads/writes align.
   const identity =
-    fromPhone ||
-    userProfile?.from ||
-    userProfile?.phone ||
-    userProfile?.phone_e164 ||
-    userProfile?.user_id ||
-    userProfile?.id ||
-    userProfile?.userId ||
+    digits(fromPhone) ||
+    digits(userProfile?.phone_e164) ||
+    digits(userProfile?.phone) ||
+    digits(userProfile?.from) ||
     null;
 
+  // In your system, userId for active-job is basically identity.
+  // Keep this digits-only and aligned.
   const userId =
-    userProfile?.id ||
-    userProfile?.user_id ||
-    userProfile?.userId ||
-    userProfile?.phone ||
-    fromPhone ||
+    digits(userProfile?.user_id) ||
+    digits(userProfile?.id) ||
+    digits(userProfile?.userId) ||
+    identity ||
     null;
 
   if (!owner || !identity) {
@@ -281,30 +291,178 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
     return false;
   }
 
-  const jobId = jobRow?.id || jobRow?.job_id || null;
-  const jobNo = jobRow?.job_no ?? jobRow?.jobNo ?? null;
-  const jobName =
-    String(jobRow?.name || jobRow?.job_name || jobNameFallback || '').trim() || null;
+  // Local UUID guard
+  const isUuid = (x) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(x || ''));
 
-  // prefer a stable ref if postgres.js supports it
-  const jobRef = jobId || jobNo || jobName;
+  // Avoid persisting tokens as "job names"
+  const isBadJobNameToken = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return true;
+    const lc = t.toLowerCase();
+
+    // common tokens
+    if (/^jobix_\d+$/i.test(lc)) return true;
+    if (/^jobno_\d+$/i.test(lc)) return true;
+    if (/^job_\d+_[0-9a-z]+$/i.test(lc)) return true;
+    if (/^#\s*\d+\b/.test(lc)) return true;
+
+    // ✅ normalized variants we saw in logs (normalizeJobAnswer -> "ix_6")
+    if (/^ix_\d+$/i.test(lc)) return true;
+
+    // loose variants
+    if (/^jobix\s*\d+$/i.test(lc)) return true;
+    if (/^jobno\s*\d+$/i.test(lc)) return true;
+
+    return false;
+  };
+
+  // Raw fields
+  const rawId = jobRow?.id ?? jobRow?.job_id ?? null;
+  const rawJobNo = jobRow?.job_no ?? jobRow?.jobNo ?? null;
+
+  const rawNameRow = String(jobRow?.name || jobRow?.job_name || '').trim() || null;
+  const rawNameFallback = String(jobNameFallback || '').trim() || null;
+
+  // Only accept UUID for "jobId"
+  const initialJobUuid = rawId && isUuid(rawId) ? String(rawId) : null;
+
+  // Accept numeric job_no
+  const initialJobNo = rawJobNo != null && Number.isFinite(Number(rawJobNo)) ? Number(rawJobNo) : null;
+
+  // Prefer jobRow name; fallback only if it isn’t a token
+  const initialName =
+    (rawNameRow && !isBadJobNameToken(rawNameRow) ? rawNameRow : null) ||
+    (rawNameFallback && !isBadJobNameToken(rawNameFallback) ? rawNameFallback : null) ||
+    null;
+
+  // Best-effort canonical job lookup
+  async function resolveCanonicalJob({ jobUuid, jobNo, jobName }) {
+    // 0) already canonical enough
+    if (jobUuid && isUuid(jobUuid) && jobName) {
+      return { id: String(jobUuid), job_no: jobNo ?? null, name: String(jobName).trim() || null };
+    }
+
+    // 1) lookup by UUID
+    if (jobUuid && isUuid(jobUuid) && typeof pg.query === 'function') {
+      try {
+        const r = await pg.query(
+          `
+          SELECT id, job_no, COALESCE(name, job_name) AS name
+            FROM public.jobs
+           WHERE owner_id = $1 AND id = $2::uuid
+           LIMIT 1
+          `,
+          [owner, String(jobUuid)]
+        );
+        const row = r?.rows?.[0];
+        if (row?.id && isUuid(row.id)) {
+          const nm = row?.name ? String(row.name).trim() : null;
+          return { id: String(row.id), job_no: row.job_no ?? null, name: nm && !isBadJobNameToken(nm) ? nm : null };
+        }
+      } catch {}
+    }
+
+    // 2) lookup by job_no
+    if (jobNo != null && Number.isFinite(Number(jobNo)) && typeof pg.query === 'function') {
+      try {
+        const r = await pg.query(
+          `
+          SELECT id, job_no, COALESCE(name, job_name) AS name
+            FROM public.jobs
+           WHERE owner_id = $1 AND job_no = $2::int
+           LIMIT 1
+          `,
+          [owner, Number(jobNo)]
+        );
+        const row = r?.rows?.[0];
+        if (row?.id && isUuid(row.id)) {
+          const nm = row?.name ? String(row.name).trim() : null;
+          return { id: String(row.id), job_no: row.job_no ?? null, name: nm && !isBadJobNameToken(nm) ? nm : null };
+        }
+      } catch {}
+    }
+
+    // 3) lookup by name
+    if (jobName && !isBadJobNameToken(jobName) && typeof pg.query === 'function') {
+      try {
+        const r = await pg.query(
+          `
+          SELECT id, job_no, COALESCE(name, job_name) AS name
+            FROM public.jobs
+           WHERE owner_id = $1
+             AND LOWER(COALESCE(name, job_name)) = LOWER($2)
+           LIMIT 1
+          `,
+          [owner, String(jobName).trim()]
+        );
+        const row = r?.rows?.[0];
+        if (row?.id && isUuid(row.id)) {
+          const nm = row?.name ? String(row.name).trim() : null;
+          return { id: String(row.id), job_no: row.job_no ?? null, name: nm && !isBadJobNameToken(nm) ? nm : null };
+        }
+      } catch {}
+    }
+
+    // fallback: return safe pieces
+    return {
+      id: jobUuid && isUuid(jobUuid) ? String(jobUuid) : null,
+      job_no: jobNo ?? null,
+      name: jobName && !isBadJobNameToken(jobName) ? String(jobName).trim() : null
+    };
+  }
+
+  const canonical = await resolveCanonicalJob({
+    jobUuid: initialJobUuid,
+    jobNo: initialJobNo,
+    jobName: initialName
+  });
+
+  const jobUuid = canonical?.id && isUuid(canonical.id) ? canonical.id : null;
+  const jobNo = canonical?.job_no != null && Number.isFinite(Number(canonical.job_no)) ? Number(canonical.job_no) : null;
+  const jobName = canonical?.name && !isBadJobNameToken(canonical.name) ? String(canonical.name).trim() : null;
+
+  // If we couldn’t resolve a meaningful job, do not persist junk
+  if (!jobUuid && jobNo == null && !jobName) {
+    console.warn('[JOB] persistActiveJobBestEffort: could not resolve canonical job', {
+      owner,
+      identity,
+      initial: { rawId, rawJobNo, rawNameRow, rawNameFallback },
+      canonical
+    });
+    return false;
+  }
+
+  // Legacy setters should receive a human ref (name or job_no), NOT UUID
+  const jobRef = jobName || (jobNo != null ? String(jobNo) : null);
 
   // 1) Canonical identity-based setter
   if (typeof pg.setActiveJobForIdentity === 'function') {
     try {
-      await pg.setActiveJobForIdentity(owner, String(identity), jobId || null, jobName || null);
-      console.info('[JOB] persisted active job via pg.setActiveJobForIdentity', { owner, identity, jobId, jobName });
+      await pg.setActiveJobForIdentity(owner, String(identity), jobUuid || null, jobName || null);
+      console.info('[JOB] persisted active job via pg.setActiveJobForIdentity', {
+        owner,
+        identity,
+        jobId: jobUuid,
+        jobNo,
+        jobName
+      });
       return true;
     } catch (e) {
       console.warn('[JOB] pg.setActiveJobForIdentity failed:', e?.message);
     }
   }
 
-  // 2) Canonical setActiveJob(ownerId, userId, jobRef/jobName)
+  // 2) setActiveJob(ownerId, identityDigits, jobRef)
+  // ✅ IMPORTANT: use identity digits so it aligns with reads.
   if (typeof pg.setActiveJob === 'function' && jobRef) {
     try {
-      await pg.setActiveJob(owner, String(userId || identity), String(jobRef));
-      console.info('[JOB] persisted active job via pg.setActiveJob', { owner, userId: String(userId || identity), jobRef });
+      await pg.setActiveJob(owner, String(identity), String(jobRef));
+      console.info('[JOB] persisted active job via pg.setActiveJob', {
+        owner,
+        userId: String(identity),
+        jobRef
+      });
       return true;
     } catch (e) {
       console.warn('[JOB] pg.setActiveJob failed:', e?.message);
@@ -318,15 +476,24 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
     if (typeof pg[fn] !== 'function') continue;
 
     try {
-      // common signature (owner, identity, jobId, jobName)
-      await pg[fn](owner, String(userId || identity), jobId || null, jobName || null);
-      console.info('[JOB] persisted active job via pg.' + fn, { owner, userId: String(userId || identity), jobId, jobName });
+      await pg[fn](owner, String(identity), jobUuid || null, jobName || null);
+      console.info('[JOB] persisted active job via pg.' + fn, {
+        owner,
+        userId: String(identity),
+        jobId: jobUuid,
+        jobNo,
+        jobName
+      });
       return true;
     } catch (e1) {
       try {
-        // alternate signature (owner, identity, jobRef)
-        await pg[fn](owner, String(userId || identity), String(jobRef || ''));
-        console.info('[JOB] persisted active job via pg.' + fn, { owner, userId: String(userId || identity), jobRef });
+        if (!jobRef) throw new Error('missing jobRef');
+        await pg[fn](owner, String(identity), String(jobRef));
+        console.info('[JOB] persisted active job via pg.' + fn, {
+          owner,
+          userId: String(identity),
+          jobRef
+        });
         return true;
       } catch (e2) {
         console.warn('[JOB] pg.' + fn + ' failed:', e2?.message || e1?.message);
@@ -334,20 +501,12 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
     }
   }
 
-  // 4) Fall back to direct SQL attempts (fail-open across schema variants)
+  // 4) Best-effort SQL (UUID ONLY)
   const sqlAttempts = [
-    {
-      label: 'public.users (id)',
-      sql: `UPDATE public.users
-              SET active_job_id = COALESCE($3, active_job_id),
-                  active_job_name = COALESCE(NULLIF($4,''), active_job_name),
-                  updated_at = NOW()
-            WHERE owner_id = $1 AND id = $2`
-    },
     {
       label: 'public.users (user_id)',
       sql: `UPDATE public.users
-              SET active_job_id = COALESCE($3, active_job_id),
+              SET active_job_id = COALESCE($3::uuid, active_job_id),
                   active_job_name = COALESCE(NULLIF($4,''), active_job_name),
                   updated_at = NOW()
             WHERE owner_id = $1 AND user_id = $2`
@@ -355,7 +514,7 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
     {
       label: 'public.user_profiles',
       sql: `UPDATE public.user_profiles
-              SET active_job_id = COALESCE($3, active_job_id),
+              SET active_job_id = COALESCE($3::uuid, active_job_id),
                   active_job_name = COALESCE(NULLIF($4,''), active_job_name),
                   updated_at = NOW()
             WHERE owner_id = $1 AND user_id = $2`
@@ -363,28 +522,48 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
     {
       label: 'public.memberships',
       sql: `UPDATE public.memberships
-              SET active_job_id = COALESCE($3, active_job_id),
+              SET active_job_id = COALESCE($3::uuid, active_job_id),
                   active_job_name = COALESCE(NULLIF($4,''), active_job_name),
                   updated_at = NOW()
             WHERE owner_id = $1 AND user_id = $2`
     }
   ];
 
-  const userKey = String(userId || identity);
+  // ✅ SQL should target identity digits (not random profile ids)
+  const userKey = String(identity);
 
-  for (const a of sqlAttempts) {
-    try {
-      const r = await pg.query(a.sql, [owner, userKey, jobId, jobName]);
-      if (r?.rowCount) {
-        console.info('[JOB] persisted active job via SQL', { table: a.label, owner, userKey, jobId, jobName });
-        return true;
-      }
-    } catch {}
+  if (jobUuid && typeof pg.query === 'function') {
+    for (const a of sqlAttempts) {
+      try {
+        const r = await pg.query(a.sql, [owner, userKey, jobUuid, jobName || '']);
+        if (r?.rowCount) {
+          console.info('[JOB] persisted active job via SQL', {
+            table: a.label,
+            owner,
+            userKey,
+            jobId: jobUuid,
+            jobNo,
+            jobName
+          });
+          return true;
+        }
+      } catch {}
+    }
   }
 
-  console.warn('[JOB] persistActiveJobBestEffort: no persistence route succeeded');
+  console.warn('[JOB] persistActiveJobBestEffort: no persistence route succeeded', {
+    owner,
+    identity,
+    userKey,
+    jobId: jobUuid,
+    jobNo,
+    jobName,
+    jobRef
+  });
+
   return false;
 }
+
 
 /* ---------------- DB helpers ---------------- */
 

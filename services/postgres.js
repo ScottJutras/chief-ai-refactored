@@ -1317,17 +1317,37 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   const caps = await detectActiveJobCaps();
   const types = await detectActiveJobIdColumnTypes();
 
+  const isBadJobNameToken = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return true;
+    const lc = t.toLowerCase();
+    if (/^jobix_\d+$/i.test(lc)) return true;
+    if (/^jobno_\d+$/i.test(lc)) return true;
+    if (/^job_\d+_[0-9a-z]+$/i.test(lc)) return true;
+    if (/^#\s*\d+\b/.test(lc)) return true;
+    return false;
+  };
+
   // Resolve to a jobNo + name (jobNo-first)
   const resolved = await resolveJobIdAndName(owner, jobId, jobName);
-  const name = resolved.name || (jobName ? String(jobName).trim() : null);
+
+  // Only accept a real name (never token garbage)
+  const resolvedName = resolved?.name ? String(resolved.name).trim() : null;
+  const inputName = jobName ? String(jobName).trim() : null;
+  const name =
+    (resolvedName && !isBadJobNameToken(resolvedName) ? resolvedName : null) ||
+    (inputName && !isBadJobNameToken(inputName) ? inputName : null) ||
+    null;
 
   // Prefer numeric job_no whenever possible
   const jobNo =
-    resolved.jobNo != null && Number.isFinite(Number(resolved.jobNo)) ? Number(resolved.jobNo) :
-    (jobId != null && /^\d+$/.test(String(jobId).trim())) ? Number(jobId) :
-    null;
+    resolved?.jobNo != null && Number.isFinite(Number(resolved.jobNo))
+      ? Number(resolved.jobNo)
+      : jobId != null && /^\d+$/.test(String(jobId).trim())
+        ? Number(jobId)
+        : null;
 
-  // Fallback: if we only have a name, attempt to lookup job_no by name (optional best-effort)
+  // Fallback: if we only have a non-token name, attempt to lookup job_no by name
   let finalJobNo = jobNo;
   if (!Number.isFinite(finalJobNo) && name) {
     try {
@@ -1347,9 +1367,12 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
     } catch {}
   }
 
-  // If we still can't resolve a jobNo, fail soft: clear active job in user_active_job if present
-  // (but do not throw, keeps UX resilient)
   const jobNoText = Number.isFinite(finalJobNo) ? String(finalJobNo) : null;
+
+  // If we can’t resolve a jobNo, treat as "clear active job" (fail soft)
+  // Keep UX resilient; do not throw.
+  // We still update name columns to NULL to avoid persisting junk.
+  const effectiveName = jobNoText ? name : null;
 
   // 1) users
   if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
@@ -1359,22 +1382,18 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       let i = 3;
 
       if (caps.users_has_active_job_id) {
-        // ✅ coerce based on column type; supply jobNo (preferred) and (optional) uuid if needed
         const v = coerceActiveJobIdValue(types.users, { jobUuid: null, jobNo: finalJobNo });
         sets.push(`active_job_id = $${i++}`);
         params.push(v);
       }
       if (caps.users_has_active_job_name) {
         sets.push(`active_job_name = $${i++}`);
-        params.push(name);
+        params.push(effectiveName);
       }
       if (await hasColumn('users', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
 
       if (sets.length) {
-        const r = await query(`update public.users set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
-        if (r?.rowCount) {
-          // keep going; we still want to update user_active_job
-        }
+        await query(`update public.users set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
       }
     } catch (e) {
       console.warn('[PG/activeJob] users update failed (ignored):', e?.message);
@@ -1395,7 +1414,7 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       }
       if (caps.memberships_has_active_job_name) {
         sets.push(`active_job_name = $${i++}`);
-        params.push(name);
+        params.push(effectiveName);
       }
       if (await hasColumn('memberships', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
 
@@ -1421,7 +1440,7 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
       }
       if (caps.user_profiles_has_active_job_name) {
         sets.push(`active_job_name = $${i++}`);
-        params.push(name);
+        params.push(effectiveName);
       }
       if (await hasColumn('user_profiles', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
 
@@ -1433,11 +1452,10 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
     }
   }
 
-  // 4) user_active_job (✅ store job_no as text; avoids integer=uuid joins forever)
+  // 4) user_active_job (store job_no as text)
   if (caps.has_user_active_job) {
     try {
       if (!jobNoText) {
-        // clear
         await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
         return { active_job_id: null, active_job_name: null, source: 'user_active_job' };
       }
@@ -1452,14 +1470,15 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
         [owner, String(userId), jobNoText]
       );
 
-      return { active_job_id: jobNoText, active_job_name: name || null, source: 'user_active_job' };
+      return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'user_active_job' };
     } catch (e) {
       console.warn('[PG/activeJob] user_active_job write failed (ignored):', e?.message);
     }
   }
 
-  return { active_job_id: jobNoText, active_job_name: name || null, source: 'unknown' };
+  return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'unknown' };
 }
+
 
 
 async function getActiveJobForIdentity(ownerId, userIdOrPhone) {

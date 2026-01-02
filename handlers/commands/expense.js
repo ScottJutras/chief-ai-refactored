@@ -1035,18 +1035,17 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   }
 
 const rows = slice.map((j) => {
-  const jobNo = Number(j.job_no);
   const full = sanitizeJobLabel(j?.name || j?.job_name || 'Untitled Job');
+  const jobNo = Number(j?.job_no);
 
   const stamped = `J${jobNo} ${full}`;
-
   return {
     id: `jobno_${jobNo}`,
     title: stamped.slice(0, 24),
     description: full.slice(0, 72)
   };
-
 });
+
 
 
   rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
@@ -1233,6 +1232,15 @@ if (pickPA?.payload?.jobOptions) {
     const page = Number(pickPA.payload.page || 0) || 0;
     const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
     const hasMore = !!pickPA.payload.hasMore;
+    console.info('[EXPENSE] pick-job inbound', {
+  input,
+  rawInput: String(input || '').trim(),
+  normalized: normalizeJobAnswer(input),
+  page: pickPA?.payload?.page,
+  pageSize: pickPA?.payload?.pageSize,
+  jobsCount: Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions.length : 0
+});
+
 
     if (tok === 'change_job') {
       return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
@@ -1254,9 +1262,30 @@ if (pickPA?.payload?.jobOptions) {
 
     const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize });
 
-    if (!resolved) {
-      return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-    }
+if (!resolved) {
+  // ✅ If user tapped a list row, don't force a second reply.
+  // Re-send the picker instead (stale PA / list changed / template weirdness).
+  const looksLikeListTap =
+    /^jobix_\d{1,10}$/i.test(rawInput) ||
+    /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+    /^#\s*\d{1,10}\b/.test(rawInput);
+
+  console.warn('[EXPENSE] pick-job could not resolve selection; reshowing picker', {
+    rawInput,
+    page,
+    pageSize,
+    hasMore,
+    firstOptions: (jobOptions || []).slice(0, 12).map(j => ({ job_no: j?.job_no, name: j?.name }))
+  });
+
+  if (looksLikeListTap) {
+    return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
+  }
+
+  // fallback for typed garbage
+  return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+}
+
 
     console.info('[EXPENSE] pick-job resolved', {
       input: rawInput,

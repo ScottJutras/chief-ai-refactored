@@ -1622,35 +1622,81 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
     }
   }
 
-    // 4) user_active_job (job_no stored as text)
+   // 4) user_active_job (supports uuid OR text job_id)  ✅ READ ONLY
 if (caps.has_user_active_job) {
   try {
-    const r = await query(
-      `
-      select
-        u.job_id as active_job_id,
-        coalesce(j.name, j.job_name) as active_job_name
-      from public.user_active_job u
-      join public.jobs j
-        on j.owner_id = u.owner_id
-       and (u.job_id::text ~ '^\\d+$')
-       and j.job_no = (u.job_id::text)::int
-      where u.owner_id = $1 and u.user_id = $2
-      limit 1
-      `,
-      [owner, String(userId)]
-    );
+    // detect job_id type (uuid vs text/int)
+    let jobIdType = 'text';
+    try {
+      const t = await query(
+        `
+        select data_type, udt_name
+          from information_schema.columns
+         where table_schema='public'
+           and table_name='user_active_job'
+           and column_name='job_id'
+         limit 1
+        `
+      );
+      const row = t?.rows?.[0];
+      const dt = String(row?.data_type || '').toLowerCase();
+      const udt = String(row?.udt_name || '').toLowerCase();
+      if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
+      else jobIdType = 'text';
+    } catch {
+      // default to text
+    }
 
-    const row = r?.rows?.[0];
-    if (row && (row.active_job_id != null || row.active_job_name != null)) {
-      const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
-      if (out?.active_job_id != null || out?.active_job_name) return out;
+    if (jobIdType === 'uuid') {
+      // UUID schema: u.job_id references jobs.id
+      const r = await query(
+        `
+        select
+          u.job_id as active_job_id,
+          coalesce(j.name, j.job_name) as active_job_name
+        from public.user_active_job u
+        join public.jobs j
+          on j.owner_id = u.owner_id
+         and j.id = u.job_id
+        where u.owner_id = $1 and u.user_id = $2
+        limit 1
+        `,
+        [owner, String(userId)]
+      );
+
+      const row = r?.rows?.[0];
+      if (row && (row.active_job_id != null || row.active_job_name != null)) {
+        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
+        if (out?.active_job_id != null || out?.active_job_name) return out;
+      }
+    } else {
+      // Text/numeric schema: u.job_id stores job_no (as text), join by job_no
+      const r = await query(
+        `
+        select
+          u.job_id as active_job_id,
+          coalesce(j.name, j.job_name) as active_job_name
+        from public.user_active_job u
+        join public.jobs j
+          on j.owner_id = u.owner_id
+         and (u.job_id::text ~ '^\\d+$')
+         and j.job_no = (u.job_id::text)::int
+        where u.owner_id = $1 and u.user_id = $2
+        limit 1
+        `,
+        [owner, String(userId)]
+      );
+
+      const row = r?.rows?.[0];
+      if (row && (row.active_job_id != null || row.active_job_name != null)) {
+        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_active_job');
+        if (out?.active_job_id != null || out?.active_job_name) return out;
+      }
     }
   } catch (e) {
     console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
   }
 }
-
   return null;
 }
 

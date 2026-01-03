@@ -107,6 +107,15 @@ const pgDeletePendingActionByKind =
 // postgres.js also has deletePendingAction(arg) which can route by {ownerId,userId,kind}
 const pgDeletePendingActionSmart = (typeof pg.deletePendingAction === 'function' && pg.deletePendingAction) || null;
 
+function DIGITS_ID(v) {
+  return String(v || '')
+    .replace(/^whatsapp:/i, '')
+    .replace(/^\+/, '')
+    .replace(/\D/g, '')
+    .trim();
+}
+
+
 async function getPA({ ownerId, userId, kind }) {
   const owner = String(ownerId || '').trim();
   const user = String(userId || '').trim();
@@ -151,7 +160,6 @@ async function getPA({ ownerId, userId, kind }) {
   }
 }
 exports.getPA = getPA;
-
 
 async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SEC }) {
   const owner = String(ownerId || '').trim();

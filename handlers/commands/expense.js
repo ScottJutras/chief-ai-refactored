@@ -1663,23 +1663,36 @@ if (pickPA?.payload?.jobOptions) {
   }
 }
 
-    /* ---- 2) Confirm/edit/cancel ---- */
-    const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    // ---- 2) Confirm/edit/cancel ----
+let confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
-    if (confirmPA?.payload?.draft) {
-      if (!isOwner) {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
-      }
+// ✅ If user sends a brand new revenue message while confirm draft exists,
+// pause and ask them to cancel explicitly (instead of mis-parsing)
+if (confirmPA?.payload?.draft && looksLikeNewRevenueText(input)) {
+  console.info('[REVENUE] confirm pause: new revenue detected while confirm pending');
 
-      const token = normalizeDecisionToken(input);
-      const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId || '').trim() || null;
+  return out(
+    twimlText(
+      'Hang on one sec 🙂 It looks like you were in the middle of logging something.\n' +
+      'If you want to start fresh, just reply "Cancel".'
+    ),
+    false
+  );
+}
 
-      if (token === 'change_job') {
-        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-        if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-      }
+if (confirmPA?.payload?.draft) {
+  if (!isOwner) {
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    return out(twimlText('⚠️ Only the owner can manage revenue.'), false);
+  }
+
+  const token = normalizeDecisionToken(input);
+
+  if (token === 'change_job') {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+    return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+  }
 
       if (token === 'edit') {
         await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });

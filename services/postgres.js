@@ -519,8 +519,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
   const source = String(opts.source || '').trim() || 'Unknown';
 
-  // job signals from callers
   const jobRef = opts.job == null ? null : String(opts.job).trim() || null;
+
   const jobNameInput =
     (opts.job_name ?? opts.jobName ?? opts.job_title ?? null) != null
       ? String(opts.job_name ?? opts.jobName ?? opts.job_title).trim()
@@ -541,83 +541,269 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const caps = await detectTransactionsCapabilities();
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
 
-  // ✅ Resolve job_id/job_no/job_name best-effort, but never hard fail
-  // IMPORTANT: resolvedJobId must ALWAYS be UUID or null
-  let resolvedJobId = null;
+  let resolvedJobId = null; // UUID only
   let resolvedJobNo = null;
   let resolvedJobName =
-    jobNameInput || (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
+    jobNameInput ||
+    (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
+
+  function isPoisonJobName(name) {
+    const s = String(name || '').trim();
+    if (!s) return false;
+    const lc = s.toLowerCase();
+
+    const tokenOrCommand =
+      /^jobix_\d+$/i.test(lc) ||
+      /^jobno_\d+$/i.test(lc) ||
+      /^job_\d+_[0-9a-z]+$/i.test(lc) ||
+      /^#\s*\d+\b/.test(lc) ||
+      lc === 'cancel' ||
+      lc === 'show active jobs' ||
+      lc === 'active jobs' ||
+      lc === 'change job' ||
+      lc === 'switch job' ||
+      lc === 'pick job' ||
+      lc === 'more';
+
+    const errorish =
+      lc.includes('should succeed') ||
+      lc.includes('owner_id') ||
+      lc.includes('missing owner') ||
+      lc.includes('missing ownerid') ||
+      lc.includes('assert') ||
+      lc.includes('operator does not exist') ||
+      lc.includes('require stack') ||
+      lc.includes('stack') ||
+      lc.includes('exception') ||
+      lc.includes('error') ||
+      lc.includes('failed') ||
+      lc.includes('counter should stamp');
+
+    const sentenceLike =
+      lc.includes('$') ||
+      /\b\d{4}-\d{2}-\d{2}\b/.test(lc) ||
+      /\b(expense|revenue|paid|spent|bought|purchased|received|worth|from|at|today|yesterday|tomorrow)\b/.test(lc);
+
+    return tokenOrCommand || errorish || sentenceLike;
+  }
+
+  if (resolvedJobName && isPoisonJobName(resolvedJobName)) {
+    console.warn('[PG/transactions] dropping poison resolvedJobName', { resolvedJobName });
+    resolvedJobName = null;
+  }
 
   try {
-    // 1) Prefer explicit job_id if caller gave UUID
+    // 1) explicit UUID job_id
     if (explicitJobId != null && looksLikeUuid(String(explicitJobId))) {
       resolvedJobId = String(explicitJobId);
-
-      // resolveJobRow should accept UUID job_id and return job_name/job_no if it can
       const row = await resolveJobRow(owner, resolvedJobId);
       if (row) {
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
-        resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+        const nm = row.job_name ? String(row.job_name).trim() : null;
+        if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
       }
     } else if (explicitJobId != null && /^\d+$/.test(String(explicitJobId).trim())) {
-      // 🔒 Explicitly refuse numeric "job_id"
       console.warn('[PG/transactions] refusing numeric explicit job_id; ignoring', { explicitJobId });
     }
 
-    // 2) If job_no passed, resolve name/no, but DO NOT copy jobs.id into transactions.job_id
+    // 2) explicit job_no
     if (!resolvedJobId && explicitJobNo != null && String(explicitJobNo).trim() !== '') {
       const n = Number(explicitJobNo);
       if (Number.isFinite(n)) {
         resolvedJobNo = n;
-        const row = await resolveJobRow(owner, String(n)); // may return row.id (INTEGER), row.job_name
+        const row = await resolveJobRow(owner, String(n));
         if (row) {
-          // 🔒 NEVER set resolvedJobId from row.id unless it is UUID
           const candidate = row.id != null ? String(row.id) : null;
-          if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
-          else if (candidate) resolvedJobId = null;
-
+          if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate; // only if uuid
           resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
-          resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+          const nm = row.job_name ? String(row.job_name).trim() : null;
+          if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
         }
       }
     }
 
-    // 3) If jobRef passed (could be uuid, job_no, or name)
+    // 3) jobRef (uuid/job_no/name)
     if (!resolvedJobId && jobRef) {
       const row = await resolveJobRow(owner, jobRef);
       if (row) {
         const candidate = row.id != null ? String(row.id) : null;
-        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
-        else resolvedJobId = null; // 🔒 ignore integer ids
-
+        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate; // only if uuid
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
-        resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+        const nm = row.job_name ? String(row.job_name).trim() : null;
+        if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
       } else {
-        // If jobRef is a number-like string, treat as job_no for job_name resolution only
         if (/^\d+$/.test(String(jobRef).trim())) {
           const n = Number(jobRef);
           if (Number.isFinite(n)) resolvedJobNo = resolvedJobNo ?? n;
         } else if (!resolvedJobName) {
-          resolvedJobName = String(jobRef).trim();
+          const nm = String(jobRef).trim();
+          if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
         }
       }
     }
 
-    // 4) If only name known, try resolving it
+    // 4) resolve name-only
     if (!resolvedJobId && resolvedJobName) {
       const row = await resolveJobRow(owner, resolvedJobName);
       if (row) {
         const candidate = row.id != null ? String(row.id) : null;
-        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
-        else resolvedJobId = null; // 🔒 ignore integer ids
-
+        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate; // only if uuid
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
-        resolvedJobName = row.job_name ? String(row.job_name).trim() : resolvedJobName;
+        const nm = row.job_name ? String(row.job_name).trim() : null;
+        if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
       }
     }
-  } catch {
-    // ignore
+  } catch (e) {
+    console.warn('[PG/transactions] job resolution failed (ignored):', e?.message);
   }
+
+  // hard guard: UUID or null
+  if (resolvedJobId && !looksLikeUuid(String(resolvedJobId))) {
+    console.warn('[PG/transactions] dropping non-uuid resolvedJobId', { resolvedJobId });
+    resolvedJobId = null;
+  }
+
+  if (resolvedJobName && isPoisonJobName(resolvedJobName)) {
+    console.warn('[PG/transactions] dropping poison resolvedJobName (post-resolve)', { resolvedJobName });
+    resolvedJobName = null;
+  }
+
+  const jobNo = resolvedJobNo != null && Number.isFinite(Number(resolvedJobNo)) ? Number(resolvedJobNo) : null;
+  const jobName = resolvedJobName ? String(resolvedJobName).trim() : null;
+
+  // Prefer caller jobRef for legacy "job" string, else name, else jobNo, else uuid
+  const job =
+    jobRef != null
+      ? jobRef
+      : jobName
+        ? jobName
+        : jobNo != null
+          ? String(jobNo)
+          : resolvedJobId
+            ? String(resolvedJobId)
+            : null;
+
+  const shouldDedupeByContent = kind === 'expense' || kind === 'revenue';
+  const dedupeHash =
+    shouldDedupeByContent && typeof buildTxnDedupeHash === 'function'
+      ? buildTxnDedupeHash({
+          owner,
+          kind,
+          date,
+          amountCents,
+          source,
+          description,
+          jobNo,
+          jobName
+        })
+      : null;
+
+  // idempotency pre-check (source_msg_id)
+  if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+    try {
+      const exists = await queryWithTimeout(
+        `select id from public.transactions where owner_id=$1 and source_msg_id=$2 limit 1`,
+        [owner, sourceMsgId],
+        Math.min(2500, timeoutMs)
+      );
+      if (exists?.rows?.length) return { inserted: false, id: exists.rows[0].id };
+    } catch (e) {
+      console.warn('[PG/transactions] idempotency pre-check failed (ignored):', e?.message);
+    }
+  }
+
+  const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
+
+  // Build insert cols/vals based on caps
+  const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
+  const vals = [owner, kind, date, description, amountCents, source];
+
+  if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
+    cols.push('amount');
+    vals.push(amountMaybe);
+  }
+
+  if (caps.TX_HAS_JOB) {
+    cols.push('job');
+    vals.push(job);
+  }
+  if (caps.TX_HAS_JOB_NAME) {
+    cols.push('job_name');
+    vals.push(jobName);
+  }
+  if (caps.TX_HAS_JOB_NO) {
+    cols.push('job_no');
+    vals.push(jobNo);
+  }
+  if (caps.TX_HAS_JOB_ID) {
+    cols.push('job_id');
+    vals.push(resolvedJobId); // UUID or null only
+  }
+
+  if (caps.TX_HAS_CATEGORY) {
+    cols.push('category');
+    vals.push(category);
+  }
+
+  if (caps.TX_HAS_USER_NAME) {
+    cols.push('user_name');
+    vals.push(userName);
+  }
+
+  if (caps.TX_HAS_SOURCE_MSG_ID) {
+    cols.push('source_msg_id');
+    vals.push(sourceMsgId);
+  }
+
+  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
+    cols.push('dedupe_hash');
+    vals.push(dedupeHash);
+  }
+
+  if (caps.TX_HAS_MEDIA_META && media) {
+    cols.push('media_meta');
+    vals.push(JSON.stringify(media));
+  }
+
+  if (caps.TX_HAS_CREATED_AT) {
+    cols.push('created_at');
+    vals.push(new Date());
+  }
+  if (caps.TX_HAS_UPDATED_AT) {
+    cols.push('updated_at');
+    vals.push(new Date());
+  }
+
+  const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+
+  let conflictSql = '';
+  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash && hasOwnerDedupeUnique) {
+    conflictSql = ' on conflict (owner_id, dedupe_hash) do nothing ';
+  }
+
+  const sql = `
+    insert into public.transactions (${cols.join(', ')})
+    values (${placeholders})
+    ${conflictSql}
+    returning id
+  `;
+
+  try {
+    const r = await queryWithTimeout(sql, vals, timeoutMs);
+    const id = r?.rows?.[0]?.id ?? null;
+
+    if (!id) return { inserted: false, id: null };
+    return { inserted: true, id };
+  } catch (e) {
+    const code = String(e?.code || '');
+    if (code === '23505') {
+      console.warn('[PG/transactions] insert conflict treated as duplicate:', e?.message);
+      return { inserted: false, id: null };
+    }
+    throw e;
+  }
+}
+
 
   // 🔒 FINAL HARD GUARD: job_id MUST be UUID or null
   if (resolvedJobId && !looksLikeUuid(String(resolvedJobId))) {
@@ -639,6 +825,40 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
             : null;
 
   const jobName = resolvedJobName ? String(resolvedJobName).trim() : null;
+    // ✅ Guardrail: refuse to create/find jobs from tokens, commands, or error/debug strings
+  const lc = jobName.toLowerCase();
+
+  const looksLikeTokenGarbage =
+    /^jobix_\d+$/i.test(lc) ||
+    /^jobno_\d+$/i.test(lc) ||
+    /^job_\d+_[0-9a-z]+$/i.test(lc) ||
+    /^#\s*\d+\b/.test(lc) ||
+    lc === 'cancel' ||
+    lc === 'show active jobs' ||
+    lc === 'active jobs' ||
+    lc === 'change job' ||
+    lc === 'switch job' ||
+    lc === 'pick job';
+
+  const looksLikeErrorText =
+    lc.includes('should succeed') ||
+    lc.includes('owner_id') ||
+    lc.includes('missing owner') ||
+    lc.includes('missing ownerid') ||
+    lc.includes('assert') ||
+    lc.includes('operator does not exist') ||
+    lc.includes('require stack') ||
+    lc.includes('stack') ||
+    lc.includes('exception') ||
+    lc.includes('error') ||
+    lc.includes('failed') ||
+    lc.includes('counter should stamp');
+
+  if (looksLikeTokenGarbage || looksLikeErrorText) {
+    console.warn('[PG/ensureJobByName] refusing poison job name', { jobName });
+    return null;
+  }
+
 
   // ✅ (2.1) Content-based dedupe hash (expense/revenue only)
   const shouldDedupeByContent = kind === 'expense' || kind === 'revenue';
@@ -784,7 +1004,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
     throw e;
   }
-}
 
 
 /* -------------------- Time helpers -------------------- */
@@ -819,9 +1038,53 @@ async function allocateNextJobNo(owner, client) {
 // Find or create a job by name (case-insensitive on name or job_name).
 async function ensureJobByName(ownerId, name) {
   const owner = DIGITS(ownerId);
-  const jobName = String(name || '').trim();
-  if (!jobName) return null;
+  const jobNameRaw = String(name || '').trim();
+  if (!owner || !jobNameRaw) return null;
 
+  const jobName = jobNameRaw.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+  const lc = jobName.toLowerCase();
+
+  // ✅ HARD GUARDRAIL: refuse poison names (tokens / commands / error/debug strings)
+  const looksLikeTokenGarbage =
+    /^jobix_\d+$/i.test(lc) ||
+    /^jobno_\d+$/i.test(lc) ||
+    /^job_\d+_[0-9a-z]+$/i.test(lc) ||
+    /^#\s*\d+\b/.test(lc) ||
+    lc === 'cancel' ||
+    lc === 'show active jobs' ||
+    lc === 'active jobs' ||
+    lc === 'change job' ||
+    lc === 'switch job' ||
+    lc === 'pick job' ||
+    lc === 'more' ||
+    lc === 'overhead';
+
+  const looksLikeErrorText =
+    lc.includes('should succeed') ||
+    lc.includes('owner_id') ||
+    lc.includes('missing owner') ||
+    lc.includes('missing ownerid') ||
+    lc.includes('assert') ||
+    lc.includes('operator does not exist') ||
+    lc.includes('require stack') ||
+    lc.includes('stack') ||
+    lc.includes('exception') ||
+    lc.includes('error') ||
+    lc.includes('failed') ||
+    lc.includes('counter should stamp');
+
+  // Extra: looks like an expense sentence, not a job name
+  const looksLikeSentence =
+    lc.includes('$') ||
+    /\b\d{4}-\d{2}-\d{2}\b/.test(lc) ||
+    /\b(expense|revenue|paid|spent|bought|purchased|received|worth|from|at|today|yesterday|tomorrow)\b/.test(lc);
+
+  if (looksLikeTokenGarbage || looksLikeErrorText || looksLikeSentence) {
+    console.warn('[PG/ensureJobByName] refusing poison job name', { jobName });
+    return null;
+  }
+
+  // Existing: find first
   let r = await query(
     `SELECT id, job_no, COALESCE(name, job_name) AS name, active AS is_active
        FROM public.jobs
@@ -832,6 +1095,7 @@ async function ensureJobByName(ownerId, name) {
   );
   if (r.rowCount) return r.rows[0];
 
+  // Existing: create under allocation lock
   return await withClient(async (client) => {
     await withOwnerAllocLock(owner, client);
 
@@ -871,6 +1135,7 @@ async function ensureJobByName(ownerId, name) {
     }
   });
 }
+
 
 async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
   const owner = DIGITS(ownerId);
@@ -1297,16 +1562,49 @@ async function resolveJobIdAndName(ownerId, jobId, jobName) {
   }
 
   // if neither id nor jobNo, but name exists, ensure a job row exists (optional, but helps)
-  if (!id && jobNo == null && name) {
+if (!id && jobNo == null && name) {
+  // ✅ Guardrail: never create a job from error text / tokens / weird debug strings
+  const nm = String(name || '').trim();
+  const lc = nm.toLowerCase();
+
+  const looksLikeErrorText =
+    lc.includes('should succeed') ||
+    lc.includes('owner_id') ||
+    lc.includes('assert') ||
+    lc.includes('missing owner') ||
+    lc.includes('missing ownerid') ||
+    lc.includes('error') ||
+    lc.includes('failed') ||
+    lc.includes('exception') ||
+    lc.includes('stack') ||
+    lc.includes('require stack') ||
+    lc.includes('operator does not exist') ||
+    lc.includes('counter should stamp now'); // ✅ add your observed poison string
+
+  const looksLikeTokenGarbage =
+    /^jobix_\d+$/i.test(lc) ||
+    /^jobno_\d+$/i.test(lc) ||
+    /^job_\d+_[0-9a-z]+$/i.test(lc) ||
+    /^#\s*\d+\b/.test(lc) ||
+    lc === 'cancel' ||
+    lc === 'show active jobs' ||
+    lc === 'active jobs' ||
+    lc === 'change job' ||
+    lc === 'switch job' ||
+    lc === 'pick job';
+
+  if (!looksLikeErrorText && !looksLikeTokenGarbage) {
     try {
-      const j = await ensureJobByName(owner, name);
+      const j = await ensureJobByName(owner, nm);
       if (j) {
         id = j.id ? String(j.id) : id;
         jobNo = j.job_no ?? jobNo;
-        name = j.name ? String(j.name).trim() : name;
+        name = j.name ? String(j.name).trim() : nm;
       }
     } catch {}
   }
+}
+
 
   return { id, name, jobNo };
 }

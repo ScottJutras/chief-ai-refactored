@@ -393,10 +393,16 @@ async function detectTransactionsUniqueOwnerSourceMsg() {
     const defs = (rows || []).map((r) => String(r.def || '').toLowerCase());
 
     TX_HAS_OWNER_SOURCEMSG_UNIQUE = defs.some((d) => {
-      // match: (...owner_id..., ...source_msg_id...) in the index key list
-      const keyList = d.match(/on\s+public\.transactions\s+using\s+\w+\s*\(([^)]+)\)/);
-      const keys = String(keyList?.[1] || '');
-      return keys.includes('owner_id') && keys.includes('source_msg_id');
+      // Must have key list (owner_id, source_msg_id)
+      const keyMatch = d.match(/on\s+public\.transactions\s+using\s+\w+\s*\(([^)]+)\)/);
+      const keys = String(keyMatch?.[1] || '');
+      if (!(keys.includes('owner_id') && keys.includes('source_msg_id'))) return false;
+
+      // Accept: no predicate OR predicate includes "source_msg_id is not null"
+      const hasWhere = d.includes(' where ');
+      if (!hasWhere) return true;
+
+      return d.includes('source_msg_id is not null');
     });
   } catch (e) {
     console.warn('[PG/transactions] detect unique(owner_id,source_msg_id) failed:', e?.message);
@@ -405,6 +411,7 @@ async function detectTransactionsUniqueOwnerSourceMsg() {
 
   return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
 }
+
 
 
 function normalizeMediaMeta(mediaMeta) {
@@ -829,24 +836,24 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
 
-      let conflictSql = '';
+    let conflictSql = '';
 
-  // ✅ Partial unique index support:
-  // If the unique index is defined with WHERE <col> IS NOT NULL,
-  // Postgres requires the SAME predicate on the ON CONFLICT target.
-  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
-    const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
-    if (hasOwnerDedupeUnique) {
-      conflictSql = ' on conflict (owner_id, dedupe_hash) where dedupe_hash is not null do nothing ';
-    }
+// Prefer dedupe hash conflict when available
+if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
+  const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
+  if (hasOwnerDedupeUnique) {
+    conflictSql = ' on conflict (owner_id, dedupe_hash) where dedupe_hash is not null do nothing ';
   }
+}
 
-  if (!conflictSql && caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
-    const hasUq = await detectTransactionsUniqueOwnerSourceMsg().catch(() => false);
-    if (hasUq) {
-      conflictSql = ' on conflict (owner_id, source_msg_id) where source_msg_id is not null do nothing ';
-    }
+// Otherwise source_msg_id idempotency
+if (!conflictSql && caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+  const hasUq = await detectTransactionsUniqueOwnerSourceMsg().catch(() => false);
+  if (hasUq) {
+    conflictSql = ' on conflict (owner_id, source_msg_id) where source_msg_id is not null do nothing ';
   }
+}
+
 
 
   const sql = `

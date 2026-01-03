@@ -113,9 +113,13 @@ async function getPA({ ownerId, userId, kind }) {
   const k = String(kind || '').trim();
   if (!owner || !user || !k) return null;
 
+  const ownerKey = DIGITS_ID(owner);
+  const userKey = DIGITS_ID(user);
+  if (!ownerKey || !userKey) return null;
+
   if (pgGetPendingActionByKind) {
     try {
-      const r = await pgGetPendingActionByKind({ ownerId: owner, userId: user, kind: k });
+      const r = await pgGetPendingActionByKind({ ownerId: ownerKey, userId: userKey, kind: k });
       if (!r) return null;
       if (r.payload != null) return r;
       if (typeof r === 'object') return { payload: r };
@@ -139,13 +143,15 @@ async function getPA({ ownerId, userId, kind }) {
        ORDER BY created_at DESC
        LIMIT 1
       `,
-      [String(owner).replace(/\D/g, ''), String(user), k, String(PA_TTL_MIN)]
+      [ownerKey, userKey, String(k), String(PA_TTL_MIN)]
     );
     return r?.rows?.[0] || null;
   } catch {
     return null;
   }
 }
+exports.getPA = getPA;
+
 
 async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SEC }) {
   const owner = String(ownerId || '').trim();
@@ -155,9 +161,15 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
 
   const ttl = Number(ttlSeconds || PA_TTL_SEC) || PA_TTL_SEC;
 
+  // ✅ normalize IDs once
+  const ownerKey = DIGITS_ID(owner);
+  const userKey = DIGITS_ID(user);
+
+  if (!ownerKey || !userKey) return;
+
   if (pgUpsertPendingAction) {
     try {
-      await pgUpsertPendingAction({ ownerId: owner, userId: user, kind: k, payload, ttlSeconds: ttl });
+      await pgUpsertPendingAction({ ownerId: ownerKey, userId: userKey, kind: k, payload, ttlSeconds: ttl });
       return;
     } catch (e) {
       console.warn('[PA] pg.upsertPendingAction failed; falling back:', e?.message);
@@ -175,14 +187,14 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
       DO UPDATE SET payload = EXCLUDED.payload,
                     created_at = NOW()
       `,
-      [String(owner).replace(/\D/g, ''), String(user), String(k), JSON.stringify(payload || {})]
+      [ownerKey, userKey, String(k), JSON.stringify(payload || {})]
     );
   } catch (e) {
     // If no unique index exists, fall back to delete+insert
     try {
       await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [
-        String(owner).replace(/\D/g, ''),
-        String(user),
+        ownerKey,
+        userKey,
         String(k)
       ]);
       await query(
@@ -190,7 +202,7 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
         INSERT INTO public.pending_actions (owner_id, user_id, kind, payload, created_at)
         VALUES ($1, $2, $3, $4::jsonb, NOW())
         `,
-        [String(owner).replace(/\D/g, ''), String(user), String(k), JSON.stringify(payload || {})]
+        [ownerKey, userKey, String(k), JSON.stringify(payload || {})]
       );
     } catch {}
     console.warn('[PA] upsert fallback failed (ignored):', e?.message);
@@ -198,15 +210,20 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
 }
 exports.upsertPA = upsertPA;
 
+
 async function deletePA({ ownerId, userId, kind }) {
   const owner = String(ownerId || '').trim();
   const user = String(userId || '').trim();
   const k = String(kind || '').trim();
   if (!owner || !user || !k) return;
 
+  const ownerKey = DIGITS_ID(owner);
+  const userKey = DIGITS_ID(user);
+  if (!ownerKey || !userKey) return;
+
   if (pgDeletePendingActionByKind) {
     try {
-      await pgDeletePendingActionByKind({ ownerId: owner, userId: user, kind: k });
+      await pgDeletePendingActionByKind({ ownerId: ownerKey, userId: userKey, kind: k });
       return;
     } catch (e) {
       console.warn('[PA] deletePendingActionByKind failed; falling back:', e?.message);
@@ -215,7 +232,7 @@ async function deletePA({ ownerId, userId, kind }) {
 
   if (pgDeletePendingActionSmart) {
     try {
-      await pgDeletePendingActionSmart({ ownerId: owner, userId: user, kind: k });
+      await pgDeletePendingActionSmart({ ownerId: ownerKey, userId: userKey, kind: k });
       return;
     } catch {
       // fall through
@@ -225,12 +242,14 @@ async function deletePA({ ownerId, userId, kind }) {
   if (typeof query !== 'function') return;
   try {
     await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [
-      String(owner).replace(/\D/g, ''),
-      String(user),
+      ownerKey,
+      userKey,
       String(k)
     ]);
   } catch {}
 }
+exports.deletePA = deletePA;
+
 
 /* ---------------- Trade-term correction layer ---------------- */
 
@@ -1499,7 +1518,7 @@ try {
     ownerId,
     userId: from,
     kind: PA_KIND_PICK_JOB,
-    payload: { ...(pickPA.payload || {}), lastInboundText: rawInput },
+    payload: { ...(pickPA.payload || {}), lastInboundTextRaw: input, lastInboundText: rawInput },
     ttlSeconds: PA_TTL_SEC
   });
 } catch {}

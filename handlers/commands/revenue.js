@@ -529,6 +529,17 @@ function assertRevenueCILOrClarify({ from, data, jobName, category, sourceMsgId 
 }
 
 /* ---------------- Job list + picker (JOB_NO-FIRST; deterministic) ---------------- */
+function parseTwilioJobIndexToken(s) {
+  const m = String(s || '').trim().match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+  if (!m?.[1]) return null;
+  const ix = Number(m[1]);
+  return Number.isFinite(ix) && ix >= 1 ? ix : null;
+}
+
+// tiny nonce for “this picker instance”
+function makePickerNonce() {
+  return Math.random().toString(16).slice(2, 10);
+}
 
 function sanitizeJobLabel(s) {
   return String(s || '')
@@ -656,23 +667,23 @@ function normalizeJobAnswer(text) {
   let s = String(text || '').trim();
   if (!s) return s;
 
-  // Preserve canonical tokens first
+  // Keep these tokens exactly (just normalize case)
   if (/^jobno_\d{1,10}$/i.test(s)) return s.toLowerCase();
   if (/^jobix_\d{1,10}$/i.test(s)) return s.toLowerCase();
+  if (/^job_\d{1,10}_[0-9a-z]+$/i.test(s)) return s; // ✅ DO NOT rewrite to jobix_
 
-  // If visible text contains stamped job number like "J8", convert to jobno_8
+  // Allow stamped "J1556 ..." => jobno_1556
   const mStamp = s.match(/\bJ(\d{1,10})\b/i);
   if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
 
-  // Twilio template list id format sometimes: job_<row>_<hash> (row index, not job_no)
-  const mTw = s.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
-  if (mTw?.[1]) return `jobix_${mTw[1]}`;
-
-  // cleanup
-  s = s.replace(/^(job\s*name|job)\s*[:\-]?\s*/i, '');
+  // Clean common prefixes
+  s = s.replace(/^(job\s*name|job)\s*[:-]?\s*/i, '');
+  s = s.replace(/^(create|new)\s+job\s+/i, '');
   s = s.replace(/[?]+$/g, '').trim();
+
   return s;
 }
+
 
 function resolveJobOptionFromReply(rawInput, jobOptions, opts = {}) {
   const s0 = String(rawInput || '').trim();
@@ -685,6 +696,27 @@ function resolveJobOptionFromReply(rawInput, jobOptions, opts = {}) {
 
   if (/^(overhead|oh)$/i.test(s)) return { kind: 'overhead' };
   if (/^more(\s+jobs)?…?$/i.test(s)) return { kind: 'more' };
+
+  // ✅ Twilio list token: job_<ix>_<hash> (INDEX ONLY)
+  const mTw = String(s).match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+  if (mTw?.[1]) {
+    const ix = Number(mTw[1]);
+    if (Number.isFinite(ix) && ix >= 1) {
+      if (displayedJobNos && displayedJobNos.length >= ix) {
+        const jobNo = Number(displayedJobNos[ix - 1]);
+        const job = jobList.find((j) => Number(j?.job_no) === jobNo);
+        return job
+          ? { kind: 'job', job: { job_no: Number(job.job_no), name: job.name || null, id: job.id || null } }
+          : null;
+      }
+      const start = page * pageSize;
+      const candidate = jobList[start + (ix - 1)];
+      if (candidate?.job_no != null) {
+        return { kind: 'job', job: { job_no: Number(candidate.job_no), name: candidate.name || null, id: candidate.id || null } };
+      }
+    }
+    return null;
+  }
 
   // jobix_N (row index)
   const mIx = String(s).match(/^jobix_(\d{1,10})$/i);
@@ -732,7 +764,7 @@ function resolveJobOptionFromReply(rawInput, jobOptions, opts = {}) {
     return null;
   }
 
-  // "#6 ..." or "6 ..." => job_no
+  // "#1556" => job_no
   const mHash = String(s).match(/^#?\s*(\d{1,10})\b/);
   if (mHash?.[1]) {
     const jobNo = Number(mHash[1]);
@@ -749,6 +781,7 @@ function resolveJobOptionFromReply(rawInput, jobOptions, opts = {}) {
 
   return null;
 }
+
 
 async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
   const to = waTo(from);
@@ -784,20 +817,25 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
 
   const hasMore = start + JOBS_PER_PAGE < clean.length;
 
-  await upsertPA({
-    ownerId,
-    userId: from,
-    kind: PA_KIND_PICK_JOB,
-    payload: {
-      jobOptions: clean,          // full cleaned+sorted list
-      page: p,
-      pageSize: JOBS_PER_PAGE,
-      hasMore,
-      displayedJobNos,            // slice rendered
-      shownAt: Date.now()
-    },
-    ttlSeconds: PA_TTL_SEC
-  });
+  const pickerNonce = makePickerNonce();
+
+await upsertPA({
+  ownerId,
+  userId: from,
+  kind: PA_KIND_PICK_JOB,
+  payload: {
+    jobOptions: clean,
+    page: p,
+    pageSize: JOBS_PER_PAGE,
+    hasMore,
+    displayedJobNos,
+    shownAt: Date.now(),
+    pickerNonce,              // ✅ NEW
+    context: 'expense_jobpick' // ✅ NEW (use 'revenue_jobpick' in revenue.js)
+  },
+  ttlSeconds: PA_TTL_SEC
+});
+
 
   if (!ENABLE_INTERACTIVE_LIST || !to) {
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
@@ -890,113 +928,133 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
 
   try {
-    // ---- 1) Awaiting job pick ----
-    const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+  // ---- 1) Awaiting job pick ----
+  const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
 
-    if (pickPA?.payload?.jobOptions) {
-      if (looksLikeNewRevenueText(input)) {
-        console.info('[REVENUE] pick-job bypass: new revenue detected, clearing PAs');
-        try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
-        try { await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM }); } catch {}
-      } else {
-        const tok = normalizeDecisionToken(input);
+  if (pickPA?.payload?.jobOptions) {
+    if (looksLikeNewRevenueText(input)) {
+      console.info('[REVENUE] pick-job bypass: new revenue detected, clearing PAs');
+      try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+      try { await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM }); } catch {}
+    } else {
+      const tok = normalizeDecisionToken(input);
 
-const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
-const page = Number(pickPA.payload.page || 0) || 0;
-const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
-const hasMore = !!pickPA.payload.hasMore;
-const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : null;
+      const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
+      const page = Number(pickPA.payload.page || 0) || 0;
+      const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
+      const hasMore = !!pickPA.payload.hasMore;
+      const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : [];
+      const shownAt = Number(pickPA.payload.shownAt || 0) || 0;
 
-let rawInput = String(input || '').trim();
+      if (!shownAt || (Date.now() - shownAt) > (PA_TTL_SEC * 1000)) {
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: 0, pageSize: 8 });
+      }
 
-// ✅ Coerce router-emitted jobix_# into jobno_<actual job_no>
-rawInput = coerceJobixToJobno(rawInput, displayedJobNos);
+      let rawInput = String(input || '').trim();
 
-// ✅ Optional: remember last inbound picker token (helps debug odd webhook payloads)
-try {
-  await upsertPA({
-    ownerId,
-    userId: from,
-    kind: PA_KIND_PICK_JOB,
-    payload: { ...(pickPA.payload || {}), lastInboundText: rawInput },
-    ttlSeconds: PA_TTL_SEC
-  });
-} catch {}
-
-if (tok === 'change_job') {
-  return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
-}
-
-if (tok === 'more') {
-  if (!hasMore) {
-    return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
-  }
-  return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
-}
-
-const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
-
-if (!resolved) {
-  const looksLikeListTap =
-    /^jobno_\d{1,10}$/i.test(rawInput) ||
-    /^jobix_\d{1,10}$/i.test(rawInput) ||
-    /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-    /^#\s*\d{1,10}\b/.test(rawInput);
-
-  if (looksLikeListTap) {
-    // show the same page again so the user can tap again / see options
-    return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
-  }
-
-  return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-}
-
-        const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        if (!confirm?.payload?.draft) {
-          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-          return out(twimlText('Got it. Now resend the revenue details.'), false);
+      // ✅ Twilio list token -> index-only -> jobno_<actual>
+      const twIx = parseTwilioJobIndexToken(rawInput);
+      if (twIx != null) {
+        if (!displayedJobNos.length || displayedJobNos.length < twIx) {
+          return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
         }
+        rawInput = `jobno_${Number(displayedJobNos[twIx - 1])}`;
+      }
 
-        const draft = { ...(confirm.payload.draft || {}) };
+      // ✅ Coerce router-emitted jobix_#
+      rawInput = coerceJobixToJobno(rawInput, displayedJobNos);
 
-        if (resolved.kind === 'overhead') {
-          draft.jobName = 'Overhead';
-          draft.jobSource = 'overhead';
-          draft.job_no = null;
-          draft.job_id = null;
-        } else if (resolved.kind === 'job' && resolved.job?.job_no != null) {
-          const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
-          draft.jobName = jobName || draft.jobName || null;
-          draft.jobSource = 'picked';
-          draft.job_no = Number(resolved.job.job_no);
-          // NEVER trust non-uuid id for tx.job_id
-          const jobId = resolved.job?.id && looksLikeUuid(resolved.job.id) ? String(resolved.job.id) : null;
-          draft.job_id = jobId;
-        } else {
-          return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-        }
+      console.info('[JOB_PICK_DEBUG]', {
+        input,
+        rawInput,
+        shownAt,
+        page,
+        displayedJobNos: (displayedJobNos || []).slice(0, 8)
+      });
 
+      // ✅ Optional: remember last inbound picker token
+      try {
         await upsertPA({
           ownerId,
           userId: from,
-          kind: PA_KIND_CONFIRM,
-          payload: { ...confirm.payload, draft },
+          kind: PA_KIND_PICK_JOB,
+          payload: { ...(pickPA.payload || {}), lastInboundTextRaw: input, lastInboundText: rawInput },
           ttlSeconds: PA_TTL_SEC
         });
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+      } catch {}
 
-        const summaryLine = buildRevenueSummaryLine({
-          amount: draft.amount,
-          source: draft.source,
-          date: draft.date,
-          jobName: draft.jobName,
-          tz
-        });
-
-        const summaryLineWithHint = `${summaryLine}${buildActiveJobHint(draft.jobName, draft.jobSource)}`;
-        return await sendConfirmRevenueOrFallback(from, summaryLineWithHint);
+      if (tok === 'change_job') {
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
       }
+
+      if (tok === 'more') {
+        if (!hasMore) {
+          return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
+        }
+        return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
+      }
+
+      const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
+
+      if (!resolved) {
+        const looksLikeListTap =
+          /^jobno_\d{1,10}$/i.test(rawInput) ||
+          /^jobix_\d{1,10}$/i.test(rawInput) ||
+          /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+          /^#\s*\d{1,10}\b/.test(rawInput);
+
+        if (looksLikeListTap) {
+          return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
+        }
+
+        return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+      }
+
+      const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+      if (!confirm?.payload?.draft) {
+        await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+        return out(twimlText('Got it. Now resend the revenue details.'), false);
+      }
+
+      const draft = { ...(confirm.payload.draft || {}) };
+
+      if (resolved.kind === 'overhead') {
+        draft.jobName = 'Overhead';
+        draft.jobSource = 'overhead';
+        draft.job_no = null;
+        draft.job_id = null;
+      } else if (resolved.kind === 'job' && resolved.job?.job_no != null) {
+        const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
+        draft.jobName = jobName || draft.jobName || null;
+        draft.jobSource = 'picked';
+        draft.job_no = Number(resolved.job.job_no);
+        const jobId = resolved.job?.id && looksLikeUuid(resolved.job.id) ? String(resolved.job.id) : null;
+        draft.job_id = jobId;
+      } else {
+        return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+      }
+
+      await upsertPA({
+        ownerId,
+        userId: from,
+        kind: PA_KIND_CONFIRM,
+        payload: { ...confirm.payload, draft },
+        ttlSeconds: PA_TTL_SEC
+      });
+      await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+
+      const summaryLine = buildRevenueSummaryLine({
+        amount: draft.amount,
+        source: draft.source,
+        date: draft.date,
+        jobName: draft.jobName,
+        tz
+      });
+
+      const summaryLineWithHint = `${summaryLine}${buildActiveJobHint(draft.jobName, draft.jobSource)}`;
+      return await sendConfirmRevenueOrFallback(from, summaryLineWithHint);
     }
+  }
 
     // ---- 2) Confirm/edit/cancel ----
     const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });

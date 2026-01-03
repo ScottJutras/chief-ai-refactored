@@ -1595,6 +1595,19 @@ if (pickPA?.payload?.jobOptions) {
 
     if (resolved.kind === 'overhead') {
       const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+      // ✅ If user sends a brand new expense while confirm draft exists,
+// pause and ask them to cancel explicitly (instead of mis-parsing)
+if (confirmPA?.payload?.draft && looksLikeNewExpenseText(input)) {
+  console.info('[EXPENSE] confirm pause: new expense detected while confirm pending');
+  return out(
+    twimlText(
+      'Hang on one sec 🙂 It looks like you were in the middle of logging something.\n' +
+      'If you want to start fresh, just reply "Cancel".'
+    ),
+    false
+  );
+}
+
       if (confirmPA?.payload?.draft) {
         await upsertPA({
           ownerId,
@@ -1668,7 +1681,7 @@ let confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
 // ✅ If user sends a brand new revenue message while confirm draft exists,
 // pause and ask them to cancel explicitly (instead of mis-parsing)
-if (confirmPA?.payload?.draft && looksLikeNewRevenueText(input)) {
+if (confirmPA?.payload?.draft && looksLikeNewExpenseText(input)) {
   console.info('[REVENUE] confirm pause: new revenue detected while confirm pending');
 
   return out(

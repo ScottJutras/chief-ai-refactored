@@ -1062,6 +1062,19 @@ function looksLikeNewExpenseText(s = '') {
     /\b(spent|bought|purchase|purchased|paid|receipt|cost|home\s*depot|rona|lowe'?s|home\s*hardware|beacon)\b/.test(lc) &&
     /\$?\s*\d+(\.\d{1,2})?\b/.test(lc)
   );
+}/* ---------------- Job picker helpers ---------------- */
+
+// tiny nonce for “this picker instance”
+function makePickerNonce() {
+  return Math.random().toString(16).slice(2, 10);
+}
+
+// Twilio list token Body/ListId like: job_2_abcd1234 (2 == row index, 1-based)
+function parseTwilioJobIndexToken(s) {
+  const m = String(s || '').trim().match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+  if (!m?.[1]) return null;
+  const ix = Number(m[1]);
+  return Number.isFinite(ix) && ix >= 1 ? ix : null;
 }
 
 async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {

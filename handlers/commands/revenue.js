@@ -1057,22 +1057,39 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
   }
 
     // ---- 2) Confirm/edit/cancel ----
-    const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
-    if (confirmPA?.payload?.draft) {
-      if (!isOwner) {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-        return out(twimlText('⚠️ Only the owner can manage revenue.'), false);
-      }
+if (confirmPA?.payload?.draft) {
+  // If user sends a brand new revenue while confirm draft exists, pause and require cancel/finish explicitly
+  if (looksLikeNewRevenueText(input)) {
+    console.info('[REVENUE] confirm pause: new revenue detected while confirm pending');
+    return out(
+      twimlText(
+        'One sec 🙂 It looks like you still have a revenue draft open.\n' +
+        'Tap Yes/Edit/Change Job/Cancel to finish it. If you want to start over, reply "Cancel".'
+      ),
+      false
+    );
+  }
 
-      const token = normalizeDecisionToken(input);
-      const stableMsgId = String(confirmPA?.payload?.sourceMsgId || safeMsgId || '').trim() || null;
+  if (!isOwner) {
+    await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    return out(twimlText('⚠️ Only the owner can manage revenue.'), false);
+  }
 
-      if (token === 'change_job') {
-        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-        if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-        return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
-      }
+  const token = normalizeDecisionToken(input);
+
+  // Stable msg id for idempotency (prefer stored one)
+  const stableMsgId =
+    String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+    String(sourceMsgId || '').trim() ||
+    String(`${from}:${Date.now()}`).trim();
+
+  if (token === 'change_job') {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+    return await sendJobPickerOrFallback({ from, ownerId, jobOptions: jobs, page: 0, pageSize: 8 });
+  }
 
       if (token === 'edit') {
         await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });

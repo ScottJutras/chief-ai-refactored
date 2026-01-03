@@ -1,21 +1,30 @@
 // handlers/media.js
-// COMPLETE DROP-IN (aligned with expense.js Option A + webhook passthrough + timeclock signature)
+// COMPLETE DROP-IN (BETA-ready; aligned to job.js + revenue.js + expense.js + postgres.js)
 //
-// Fixes included:
-// ✅ Central "trade-term correction" layer after transcription/OCR
-// ✅ Adds "common transcription typo fixes" (e.g., lotters→ladders)
-// ✅ Corrections applied to BOTH returned transcript AND pendingMediaMeta transcript
-// ✅ Stable idempotency key for media: prefers Twilio MediaSid, falls back to MessageSid, then time
-// ✅ Never logs expense/revenue here; attaches pendingMediaMeta + returns transcript to router
-// ✅ Marks pending finance kind + stores stableMediaMsgId in pending state
-// ✅ Text-only messages pass through (not treated as media)
-// ✅ Safer TwiML escaping and consistent return shape: { transcript, twiml }
+// ✅ Alignment / beta-hardening changes (no unnecessary logic loss):
+// - Pending media meta schema matches what revenue.js/expense.js consume:
+//     { url, type, transcript, confidence, source_msg_id }
+// - Stable idempotency key for media: prefers Twilio MediaSid, else MessageSid, else time
+// - Stores mediaSourceMsgId + (expenseSourceMsgId / revenueSourceMsgId) in pending state (same pattern)
+// - Does NOT log expense/revenue; only attaches pendingMediaMeta + returns transcript to router
+// - Conservative finance intent detection; avoids timeclock misclassification
+// - Adds "job picker token scrubber" so we never persist tokens like jobno_6 into transcripts unintentionally
+// - Uses pg.truncateText / pg.normalizeMediaMeta / pg.MEDIA_TRANSCRIPT_MAX_CHARS when available (aligns postgres.js)
+// - Keeps timesheet/hours inquiry support via generateTimesheet (if exported), else defers to router via transcript
+// - Text-only messages pass through (not treated as media)
+//
+// Signature (router/webhook):
+//   handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType, sourceMsgId)
+//
+// Returns:
+//   { transcript: string|null, twiml: string|null }
 
 const axios = require('axios');
 const { parseMediaText } = require('../services/mediaParser');
 const { extractTextFromImage } = require('../utils/visionService');
 const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
+const pg = require('../services/postgres'); // for helpers / optional normalizeMediaMeta / truncateText
 
 // Some builds export generateTimesheet from postgres; some from pg service layer.
 let generateTimesheet = null;
@@ -23,13 +32,13 @@ try {
   ({ generateTimesheet } = require('../services/postgres'));
 } catch {
   try {
-    const pg = require('../services/postgres');
     generateTimesheet = pg.generateTimesheet || null;
   } catch {}
 }
 
 const state = require('../utils/stateManager');
-const getPendingTransactionState = state.getPendingTransactionState || (async () => null);
+const getPendingTransactionState =
+  state.getPendingTransactionState || state.getPendingState || (async () => null);
 
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
@@ -53,6 +62,13 @@ function xmlEsc(s = '') {
 
 function twiml(text) {
   return `<Response><Message>${xmlEsc(String(text || '').trim())}</Message></Response>`;
+}
+
+function DIGITS(x) {
+  return String(x ?? '')
+    .replace(/^whatsapp:/i, '')
+    .replace(/^\+/, '')
+    .replace(/\D/g, '');
 }
 
 function getUserTz(userProfile) {
@@ -96,14 +112,17 @@ function inferTimeclockIntentFromText(s = '') {
   return null;
 }
 
-function truncateText(str, maxChars) {
-  if (!str) return null;
-  const s = String(str);
-  if (s.length <= maxChars) return s;
-  return s.slice(0, maxChars);
-}
+const MAX_MEDIA_TRANSCRIPT_CHARS =
+  (typeof pg.MEDIA_TRANSCRIPT_MAX_CHARS === 'number' && pg.MEDIA_TRANSCRIPT_MAX_CHARS) || 8000;
 
-const MAX_MEDIA_TRANSCRIPT_CHARS = 8000;
+const truncateText =
+  (typeof pg.truncateText === 'function' && pg.truncateText) ||
+  ((str, maxChars) => {
+    if (!str) return null;
+    const s = String(str);
+    if (s.length <= maxChars) return s;
+    return s.slice(0, maxChars);
+  });
 
 function normalizeContentType(mediaType) {
   return String(mediaType || '').split(';')[0].trim().toLowerCase();
@@ -144,7 +163,6 @@ function correctTradeTerms(text) {
 
 /**
  * ✅ Common transcription typo fixes (ultra conservative).
- * Keep this list SHORT and only for “obvious” mistakes you’ve actually seen.
  */
 function fixCommonTranscriptionTypos(text) {
   let s = String(text || '');
@@ -153,7 +171,7 @@ function fixCommonTranscriptionTypos(text) {
   s = s.replace(/\blotters\b/gi, 'ladders');
   s = s.replace(/\blotter\b/gi, 'ladder');
 
-  // A few common contractor audio mis-hears (keep conservative):
+  // Conservative contractor audio mis-hears:
   s = s.replace(/\bshingle's\b/gi, 'shingles');
   s = s.replace(/\bhome\s*hardwear\b/gi, 'Home Hardware');
   s = s.replace(/\bmedway\s*park\s*drive\b/gi, 'Medway Park Dr');
@@ -161,9 +179,22 @@ function fixCommonTranscriptionTypos(text) {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * ✅ Prevent “picker token bleed” into saved transcripts (jobno_ / jobix_ tokens).
+ * We still allow “#6” / “J6” *if it’s part of human text*, but tokens like jobno_6 are UI artifacts.
+ */
+function scrubPickerTokens(text) {
+  let s = String(text || '');
+  // Replace isolated tokens; keep surrounding text intact.
+  s = s.replace(/\bjobno_\d{1,10}\b/gi, (m) => m.replace(/_/g, ' ')); // "jobno_6" -> "jobno 6" (harmless)
+  s = s.replace(/\bjobix_\d{1,10}\b/gi, (m) => m.replace(/_/g, ' '));
+  s = s.replace(/\bjob_\d{1,10}_[0-9a-z]+\b/gi, ''); // legacy row ids are pure UI
+  return s.replace(/\s{2,}/g, ' ').trim();
+}
+
 function normalizeHumanText(text) {
-  // Apply typo fixes first, then trade-term normalization
-  return correctTradeTerms(fixCommonTranscriptionTypos(text));
+  // Apply typo fixes first, then trade-term normalization, then scrub UI tokens
+  return scrubPickerTokens(correctTradeTerms(fixCommonTranscriptionTypos(text)));
 }
 
 function getTwilioMediaSid(mediaUrl) {
@@ -175,20 +206,35 @@ function getTwilioMediaSid(mediaUrl) {
   }
 }
 
+/* ---------------- pending state + meta ---------------- */
+
 async function attachPendingMediaMeta(from, meta) {
   try {
-    const url = String(meta?.url || '').trim() || null;
-    const type = String(meta?.type || '').trim() || null;
-    const transcript = truncateText(meta?.transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
-    const confidence = Number.isFinite(Number(meta?.confidence)) ? Number(meta.confidence) : null;
-    const source_msg_id = meta?.source_msg_id ? String(meta.source_msg_id) : null;
+    const raw = {
+      url: meta?.url || meta?.media_url || null,
+      type: meta?.type || meta?.media_type || null,
+      transcript: truncateText(meta?.transcript || meta?.media_transcript || null, MAX_MEDIA_TRANSCRIPT_CHARS),
+      confidence: meta?.confidence ?? meta?.media_confidence ?? null,
+      source_msg_id: meta?.source_msg_id ? String(meta.source_msg_id) : null
+    };
 
-    if (!url && !type && !transcript && confidence == null && !source_msg_id) return;
+    const normalized = typeof pg.normalizeMediaMeta === 'function' ? pg.normalizeMediaMeta(raw) : raw;
+
+    // Don't store empty blobs
+    if (
+      !normalized?.url &&
+      !normalized?.type &&
+      !normalized?.transcript &&
+      normalized?.confidence == null &&
+      !normalized?.source_msg_id
+    ) {
+      return;
+    }
 
     const pending = await getPendingTransactionState(from);
     await mergePendingTransactionState(from, {
       ...(pending || {}),
-      pendingMediaMeta: { url, type, transcript, confidence, source_msg_id }
+      pendingMediaMeta: normalized
     });
   } catch (e) {
     console.warn('[MEDIA] attachPendingMediaMeta failed (ignored):', e?.message);
@@ -220,6 +266,7 @@ async function markPendingFinance({ from, kind, stableMediaMsgId }) {
     const pending = await getPendingTransactionState(from);
     await mergePendingTransactionState(from, {
       ...(pending || {}),
+      // keep compatibility with earlier state shapes
       type: kind,
       pendingMedia: { type: kind },
       expenseSourceMsgId: kind === 'expense' ? stableMediaMsgId : pending?.expenseSourceMsgId || null,
@@ -245,8 +292,8 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
 
   const isOwner = (() => {
     try {
-      const a = String(up.user_id || up.id || '').replace(/\D/g, '');
-      const b = String(ownerIdFromProfile || '').replace(/\D/g, '');
+      const a = DIGITS(up.user_id || up.id || '');
+      const b = DIGITS(ownerIdFromProfile || '');
       if (!a || !b) return false;
       return a === b;
     } catch {
@@ -279,6 +326,7 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
 
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType, sourceMsgId) {
   try {
+    // text-only messages pass through
     if (!mediaUrl) return await passThroughTextOnly(from, input);
 
     const baseType = normalizeContentType(mediaType);
@@ -335,6 +383,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         transcript = n1.transcript;
         confidence = n1.confidence;
 
+        // Some Twilio notes arrive as audio/ogg but actually need webm decode in downstream services
         if (!transcript && normType === 'audio/ogg') {
           try {
             const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
@@ -380,7 +429,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       let ocrText = '';
       try {
         const out = await extractTextFromImage(mediaUrl);
-        ocrText = String(out?.text || '').trim();
+        ocrText = String(out?.text || out?.transcript || '').trim();
       } catch (e) {
         console.warn('[MEDIA] extractTextFromImage failed:', e?.message);
       }
@@ -399,6 +448,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       }
     }
 
+    // If still nothing, ask user what it is
     if (!extractedText) {
       const pending = await getPendingTransactionState(from);
       await mergePendingTransactionState(from, {
@@ -413,6 +463,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       };
     }
 
+    // Let media parser classify structured intents (time, hours, expense/revenue)
     const result = await parseMediaText(extractedText);
 
     // HOURS inquiry
@@ -420,11 +471,23 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       const name = result?.data?.employeeName || userProfile?.name || '';
       const tz = getUserTz(userProfile);
 
+      // If generateTimesheet exists, answer immediately
       if (result?.data?.period && typeof generateTimesheet === 'function') {
-        const { message } = await generateTimesheet({ ownerId, person: name, period: result.data.period, tz, now: new Date() });
-        return { transcript: null, twiml: twiml(message) };
+        try {
+          const { message } = await generateTimesheet({
+            ownerId,
+            person: name,
+            period: result.data.period,
+            tz,
+            now: new Date()
+          });
+          return { transcript: null, twiml: twiml(message) };
+        } catch (e) {
+          console.warn('[MEDIA] generateTimesheet failed; falling back to prompt:', e?.message);
+        }
       }
 
+      // Otherwise set state for router follow-up
       const pending = await getPendingTransactionState(from);
       await mergePendingTransactionState(from, {
         ...(pending || {}),
@@ -433,7 +496,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         mediaSourceMsgId: stableMediaMsgId
       });
 
-      return { transcript: null, twiml: twiml(`Looks like you’re asking about ${name}’s hours. Do you want today, this week, or this month?`) };
+      return {
+        transcript: null,
+        twiml: twiml(`Looks like you’re asking about ${name}’s hours. Do you want today, this week, or this month?`)
+      };
     }
 
     // TIME entry (from parser)
@@ -474,7 +540,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return { transcript: extractedText, twiml: null };
     }
 
-    // Otherwise: pass transcript to router
+    // Otherwise: pass transcript to router (expense.js / revenue.js will parse & confirm)
     return { transcript: extractedText, twiml: null };
   } catch (error) {
     console.error(`[MEDIA] handleMedia failed for ${from}:`, error?.message);

@@ -380,11 +380,10 @@ async function detectTransactionsUniqueOwnerSourceMsg() {
   try {
     const { rows } = await query(
       `
-      select i.relname as index_name, pg_get_indexdef(ix.indexrelid) as def
+      select pg_get_indexdef(ix.indexrelid) as def
         from pg_class t
         join pg_namespace n on n.oid=t.relnamespace
         join pg_index ix on ix.indrelid=t.oid
-        join pg_class i on i.oid=ix.indexrelid
        where n.nspname='public'
          and t.relname='transactions'
          and ix.indisunique=true
@@ -392,14 +391,21 @@ async function detectTransactionsUniqueOwnerSourceMsg() {
     );
 
     const defs = (rows || []).map((r) => String(r.def || '').toLowerCase());
-    TX_HAS_OWNER_SOURCEMSG_UNIQUE = defs.some((d) => d.includes('(owner_id') && d.includes('source_msg_id'));
+
+    TX_HAS_OWNER_SOURCEMSG_UNIQUE = defs.some((d) => {
+      // match: (...owner_id..., ...source_msg_id...) in the index key list
+      const keyList = d.match(/on\s+public\.transactions\s+using\s+\w+\s*\(([^)]+)\)/);
+      const keys = String(keyList?.[1] || '');
+      return keys.includes('owner_id') && keys.includes('source_msg_id');
+    });
   } catch (e) {
-    console.warn('[PG/transactions] detect unique(owner_id,source_msg_id) failed (fail-open):', e?.message);
+    console.warn('[PG/transactions] detect unique(owner_id,source_msg_id) failed:', e?.message);
     TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
   }
 
   return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
 }
+
 
 function normalizeMediaMeta(mediaMeta) {
   if (!mediaMeta || typeof mediaMeta !== 'object') return null;
@@ -823,14 +829,25 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
 
-  let conflictSql = '';
-  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash && hasOwnerDedupeUnique) {
-    conflictSql = ' on conflict (owner_id, dedupe_hash) do nothing ';
-  } else if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
-    // only if unique(owner_id, source_msg_id) exists (best-effort)
-    const hasUq = await detectTransactionsUniqueOwnerSourceMsg().catch(() => false);
-    if (hasUq) conflictSql = ' on conflict (owner_id, source_msg_id) do nothing ';
+      let conflictSql = '';
+
+  // ✅ Partial unique index support:
+  // If the unique index is defined with WHERE <col> IS NOT NULL,
+  // Postgres requires the SAME predicate on the ON CONFLICT target.
+  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
+    const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
+    if (hasOwnerDedupeUnique) {
+      conflictSql = ' on conflict (owner_id, dedupe_hash) where dedupe_hash is not null do nothing ';
+    }
   }
+
+  if (!conflictSql && caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+    const hasUq = await detectTransactionsUniqueOwnerSourceMsg().catch(() => false);
+    if (hasUq) {
+      conflictSql = ' on conflict (owner_id, source_msg_id) where source_msg_id is not null do nothing ';
+    }
+  }
+
 
   const sql = `
     insert into public.transactions (${cols.join(', ')})

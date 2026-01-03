@@ -756,9 +756,28 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
   const p = Math.max(0, Number(page || 0));
   const start = p * JOBS_PER_PAGE;
 
-  const clean = normalizeJobOptions(jobOptions || []);
+  // Filter + de-dupe by job_no, drop token-garbage names (match expense.js)
+  const seen = new Set();
+  const clean = [];
+  for (const j of jobOptions || []) {
+    const n = j?.job_no != null ? Number(j.job_no) : j?.jobNo != null ? Number(j.jobNo) : null;
+    if (n == null || !Number.isFinite(n)) continue;
+
+    const nm = String(j?.name || j?.job_name || j?.jobName || '').trim();
+    if (!nm || isGarbageJobName(nm)) continue;
+
+    if (seen.has(n)) continue;
+    seen.add(n);
+
+    clean.push({ ...j, job_no: n, name: nm });
+  }
+
+  // ✅ Deterministic order (interactive list == text == resolver)
+  clean.sort((a, b) => Number(a.job_no) - Number(b.job_no));
 
   const slice = clean.slice(start, start + JOBS_PER_PAGE);
+
+  // ✅ Store the exact job_no’s rendered on THIS page (for mapping jobix / numeric replies)
   const displayedJobNos = slice
     .map((j) => (j?.job_no != null ? Number(j.job_no) : null))
     .filter((n) => Number.isFinite(n));
@@ -770,11 +789,11 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
     userId: from,
     kind: PA_KIND_PICK_JOB,
     payload: {
-      jobOptions: clean,
+      jobOptions: clean,          // full cleaned+sorted list
       page: p,
       pageSize: JOBS_PER_PAGE,
       hasMore,
-      displayedJobNos,
+      displayedJobNos,            // slice rendered
       shownAt: Date.now()
     },
     ttlSeconds: PA_TTL_SEC
@@ -784,14 +803,16 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 
+  // ✅ Interactive rows: stable id is jobno_<job_no>
   const rows = slice.map((j) => {
-    const full = sanitizeJobLabel(j?.name || 'Untitled Job');
+    const full = sanitizeJobLabel(j?.name || j?.job_name || 'Untitled Job');
     const jobNo = Number(j?.job_no);
     const stamped = `J${jobNo} ${full}`;
+
     return {
-      id: `jobno_${jobNo}`,            // stable id if Twilio returns it
-      title: stamped.slice(0, 24),     // short
-      description: full.slice(0, 72)   // details
+      id: `jobno_${jobNo}`,          // stable token; if Twilio returns it we win
+      title: stamped.slice(0, 24),
+      description: full.slice(0, 72)
     };
   });
 
@@ -809,12 +830,14 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
       buttonText: 'Pick a job',
       sections: [{ title: 'Active Jobs', rows }]
     });
+
     return out(twimlEmpty(), true);
   } catch (e) {
     console.warn('[REVENUE] interactive list failed; falling back:', e?.message);
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 }
+
 
 /* ---------------- Confirm message builder ---------------- */
 
@@ -878,25 +901,55 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       } else {
         const tok = normalizeDecisionToken(input);
 
-        const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
-        const page = Number(pickPA.payload.page || 0) || 0;
-        const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
-        const hasMore = !!pickPA.payload.hasMore;
-        const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : null;
+const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
+const page = Number(pickPA.payload.page || 0) || 0;
+const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
+const hasMore = !!pickPA.payload.hasMore;
+const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : null;
 
-        if (tok === 'change_job') {
-          return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
-        }
+let rawInput = String(input || '').trim();
 
-        if (tok === 'more') {
-          if (!hasMore) return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
-          return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
-        }
+// ✅ Coerce router-emitted jobix_# into jobno_<actual job_no>
+rawInput = coerceJobixToJobno(rawInput, displayedJobNos);
 
-        const resolved = resolveJobOptionFromReply(input, jobOptions, { page, pageSize, displayedJobNos });
-        if (!resolved) {
-          return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
-        }
+// ✅ Optional: remember last inbound picker token (helps debug odd webhook payloads)
+try {
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_PICK_JOB,
+    payload: { ...(pickPA.payload || {}), lastInboundText: rawInput },
+    ttlSeconds: PA_TTL_SEC
+  });
+} catch {}
+
+if (tok === 'change_job') {
+  return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
+}
+
+if (tok === 'more') {
+  if (!hasMore) {
+    return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
+  }
+  return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page: page + 1, pageSize });
+}
+
+const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
+
+if (!resolved) {
+  const looksLikeListTap =
+    /^jobno_\d{1,10}$/i.test(rawInput) ||
+    /^jobix_\d{1,10}$/i.test(rawInput) ||
+    /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+    /^#\s*\d{1,10}\b/.test(rawInput);
+
+  if (looksLikeListTap) {
+    // show the same page again so the user can tap again / see options
+    return await sendJobPickerOrFallback({ from, ownerId, jobOptions, page, pageSize });
+  }
+
+  return out(twimlText('Please reply with a number, job name, "Overhead", or "more".'), false);
+}
 
         const confirm = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
         if (!confirm?.payload?.draft) {

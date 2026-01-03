@@ -258,13 +258,69 @@ function normalizeListPickToken(raw = '', { listTitle = '' } = {}) {
   return s;
 }
 
-/**
- * Public getter used everywhere else in this router.
- * (Keeps your previous name but uses the fixed logic.)
- */
-function getInboundText(body = {}) {
-  return resolveTwilioInboundText(body || {});
+function getInboundText(b = {}) {
+  const get = (...keys) => {
+    for (const k of keys) {
+      if (b[k] != null && String(b[k]).trim() !== '') return b[k];
+    }
+    return undefined;
+  };
+
+  // 1) Buttons (quick replies / persistentAction)
+  const btnPayload = get('ButtonPayload', 'buttonPayload');
+  const btnText = get('ButtonText', 'buttonText');
+  if (btnPayload) return String(btnPayload).trim();
+  if (btnText) return String(btnText).trim();
+
+  // 2) Interactive list selection IDs (prefer IDs over titles)
+  const listId =
+    get('ListRowId', 'ListRowID', 'listRowId', 'listRowID') ||
+    get('ListId', 'listId', 'ListItemId', 'listItemId', 'ListReplyId', 'listReplyId');
+
+  if (listId) {
+    const id = String(listId).trim();
+
+    // ✅ If we already have a stable ID, return it AS-IS.
+    // This preserves: jobno_1556, job_1_hash, overhead, more, etc.
+    return id;
+  }
+
+  // 3) Some Twilio deliveries put the ID into Body
+  const body = String(get('Body', 'body') || '').trim();
+  if (body) {
+    // If Body looks like an ID token, preserve it.
+    if (/^(jobno_\d{1,10}|jobix_\d{1,10}|job_\d{1,10}_[0-9a-z]+|overhead|more)$/i.test(body)) {
+      return body;
+    }
+    // Otherwise: treat as normal inbound text
+    return body;
+  }
+
+  // 4) As a last resort, try extracting job_no from the title
+  // NEW format often uses "J1556 ..." (your sendJobPickerOrFallback uses that)
+  const listTitle =
+    get('ListRowTitle', 'listRowTitle') ||
+    get('ListTitle', 'listTitle', 'ListItemTitle', 'listItemTitle', 'ListReplyTitle', 'listReplyTitle');
+
+  if (listTitle) {
+    const t = String(listTitle).trim();
+
+    // Prefer J1234 form -> jobno_1234
+    const mJ = t.match(/\bJ(\d{1,10})\b/i);
+    if (mJ?.[1]) return `jobno_${Number(mJ[1])}`;
+
+    // If the title is "Overhead" / "More jobs…"
+    if (/^overhead$/i.test(t)) return 'overhead';
+    if (/^more\b/i.test(t)) return 'more';
+
+    // Avoid converting "#1 Foo" to jobix_1 (that’s the bug).
+    // Just return the title text if nothing else is usable.
+    return t;
+  }
+
+  return '';
 }
+
 
 /* ---------------- NL heuristics for expense/revenue ---------------- */
 

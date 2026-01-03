@@ -1,4 +1,4 @@
-// services/postgres.js (DROP-IN) — aligned w/ handlers/commands/timeclock.js
+// services/postgres.js (DROP-IN) — Beta-ready, schema-aware, safe fallbacks
 // ------------------------------------------------------------
 const { Pool } = require('pg');
 const crypto = require('crypto');
@@ -63,36 +63,13 @@ pool.on('connect', async (client) => {
 pool.on('error', (err) => {
   console.error('[PG] idle client error:', err?.message);
 });
+
 // Active job resolution join mode
 // - "legacy": old behavior
 // - "rls": new behavior if you introduced a new join path
 const userActiveJobJoinMode = String(env.USER_ACTIVE_JOB_JOIN_MODE || 'legacy').toLowerCase();
 
-async function getMostRecentPendingActionForUser({ ownerId, userId }) {
-  const owner = String(ownerId || '').replace(/\D/g, '');
-  const user = String(userId || '').trim();
-  if (!owner || !user) return null;
-
-  const ttlMin = Number(process.env.PENDING_TTL_MIN || 10);
-
-  const r = await query(
-    `
-    SELECT kind, payload, created_at
-      FROM public.pending_actions
-     WHERE owner_id = $1
-       AND user_id = $2
-       AND created_at > now() - (($3::text || ' minutes')::interval)
-     ORDER BY created_at DESC
-     LIMIT 1
-    `,
-    [owner, user, String(ttlMin)]
-  );
-
-  return r?.rows?.[0] || null;
-}
-
-
-// ---------- Core query helpers ----------
+/* ---------- Core query helpers ---------- */
 async function query(text, params) {
   return queryWithRetry(text, params);
 }
@@ -158,7 +135,9 @@ function todayInTZ(tz = 'America/Toronto') {
 const normalizePhoneNumber = (x) => DIGITS(x);
 
 function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(str || ''));
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(str || '')
+  );
 }
 
 /* ---------- schema helpers (cached) ---------- */
@@ -223,7 +202,9 @@ async function getColumnDataType(table, col) {
     return null;
   }
 }
-let _MEMBERSHIPS_OK = null; 
+
+// memberships self-disabling cache
+let _MEMBERSHIPS_OK = null;
 
 /* ------------------------------------------------------------------ */
 /* ✅ user_active_job job_id type detection (FIXES integer = uuid)      */
@@ -253,7 +234,7 @@ async function detectUserActiveJobJobIdType() {
 }
 
 /* ------------------------------------------------------------------ */
-/*  ✅ Media transcript truncation + transactions schema capabilities   */
+/* ✅ Media transcript truncation + transactions schema capabilities    */
 /* ------------------------------------------------------------------ */
 const MEDIA_TRANSCRIPT_MAX_CHARS = 8000;
 
@@ -263,6 +244,7 @@ function truncateText(s, maxChars = MEDIA_TRANSCRIPT_MAX_CHARS) {
   if (!Number.isFinite(maxChars) || maxChars <= 0) return null;
   return str.length > maxChars ? str.slice(0, maxChars) : str;
 }
+
 // add this near your other TX_HAS_* globals
 let TX_HAS_DEDUPE_HASH = null;
 let TX_HAS_SOURCE_MSG_ID = null;
@@ -271,13 +253,20 @@ let TX_HAS_MEDIA_URL = null;
 let TX_HAS_MEDIA_TYPE = null;
 let TX_HAS_MEDIA_TXT = null;
 let TX_HAS_MEDIA_CONF = null;
-let TX_HAS_JOB_ID = null; // ✅ IMPORTANT: job_id column support
-let TX_HAS_JOB_NO = null; // optional
+let TX_HAS_JOB_ID = null; // uuid/text depending schema
+let TX_HAS_JOB_NO = null;
+let TX_HAS_JOB = null;
+let TX_HAS_JOB_NAME = null;
+let TX_HAS_CATEGORY = null;
+let TX_HAS_USER_NAME = null;
+let TX_HAS_MEDIA_META = null; // jsonb single-field meta (if you have it)
+let TX_HAS_CREATED_AT = null;
+let TX_HAS_UPDATED_AT = null;
+
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
-
-
 async function detectTransactionsCapabilities() {
+  // cached
   if (
     TX_HAS_SOURCE_MSG_ID !== null &&
     TX_HAS_AMOUNT !== null &&
@@ -287,7 +276,14 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_CONF !== null &&
     TX_HAS_JOB_ID !== null &&
     TX_HAS_JOB_NO !== null &&
-    TX_HAS_DEDUPE_HASH !== null
+    TX_HAS_DEDUPE_HASH !== null &&
+    TX_HAS_JOB !== null &&
+    TX_HAS_JOB_NAME !== null &&
+    TX_HAS_CATEGORY !== null &&
+    TX_HAS_USER_NAME !== null &&
+    TX_HAS_MEDIA_META !== null &&
+    TX_HAS_CREATED_AT !== null &&
+    TX_HAS_UPDATED_AT !== null
   ) {
     return {
       TX_HAS_SOURCE_MSG_ID,
@@ -298,7 +294,14 @@ async function detectTransactionsCapabilities() {
       TX_HAS_MEDIA_CONF,
       TX_HAS_JOB_ID,
       TX_HAS_JOB_NO,
-      TX_HAS_DEDUPE_HASH
+      TX_HAS_DEDUPE_HASH,
+      TX_HAS_JOB,
+      TX_HAS_JOB_NAME,
+      TX_HAS_CATEGORY,
+      TX_HAS_USER_NAME,
+      TX_HAS_MEDIA_META,
+      TX_HAS_CREATED_AT,
+      TX_HAS_UPDATED_AT
     };
   }
 
@@ -319,9 +322,19 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_CONF = names.has('media_confidence');
     TX_HAS_JOB_ID = names.has('job_id');
     TX_HAS_JOB_NO = names.has('job_no');
-    TX_HAS_DEDUPE_HASH = names.has('dedupe_hash'); // ✅ NEW
+    TX_HAS_DEDUPE_HASH = names.has('dedupe_hash');
+
+    // additional back-compat / optional columns
+    TX_HAS_JOB = names.has('job');
+    TX_HAS_JOB_NAME = names.has('job_name');
+    TX_HAS_CATEGORY = names.has('category');
+    TX_HAS_USER_NAME = names.has('user_name');
+    TX_HAS_MEDIA_META = names.has('media_meta');
+    TX_HAS_CREATED_AT = names.has('created_at');
+    TX_HAS_UPDATED_AT = names.has('updated_at');
   } catch (e) {
     console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
+
     TX_HAS_SOURCE_MSG_ID = false;
     TX_HAS_AMOUNT = false;
     TX_HAS_MEDIA_URL = false;
@@ -330,7 +343,15 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_CONF = false;
     TX_HAS_JOB_ID = false;
     TX_HAS_JOB_NO = false;
-    TX_HAS_DEDUPE_HASH = false; // ✅ NEW
+    TX_HAS_DEDUPE_HASH = false;
+
+    TX_HAS_JOB = false;
+    TX_HAS_JOB_NAME = false;
+    TX_HAS_CATEGORY = false;
+    TX_HAS_USER_NAME = false;
+    TX_HAS_MEDIA_META = false;
+    TX_HAS_CREATED_AT = false;
+    TX_HAS_UPDATED_AT = false;
   }
 
   return {
@@ -342,10 +363,16 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_CONF,
     TX_HAS_JOB_ID,
     TX_HAS_JOB_NO,
-    TX_HAS_DEDUPE_HASH
+    TX_HAS_DEDUPE_HASH,
+    TX_HAS_JOB,
+    TX_HAS_JOB_NAME,
+    TX_HAS_CATEGORY,
+    TX_HAS_USER_NAME,
+    TX_HAS_MEDIA_META,
+    TX_HAS_CREATED_AT,
+    TX_HAS_UPDATED_AT
   };
 }
-
 
 async function detectTransactionsUniqueOwnerSourceMsg() {
   if (TX_HAS_OWNER_SOURCEMSG_UNIQUE !== null) return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
@@ -500,13 +527,11 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
 
 /**
  * ✅ insertTransaction()
- * Schema-aware insert into public.transactions with optional media fields.
+ * Schema-aware insert into public.transactions with optional fields.
  *
  * HARD GUARANTEE:
- * - transactions.job_id is UUID in your schema
- * - jobs.id is INTEGER in your schema
- * => NEVER insert jobs.id into transactions.job_id
- * => Only insert job_id when it is a UUID
+ * - Only insert transactions.job_id when it is a UUID.
+ * - Never accidentally stuff jobs.job_no or jobs.id (int) into a UUID job_id column.
  */
 async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const owner = DIGITS(opts.ownerId || opts.owner_id);
@@ -544,8 +569,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   let resolvedJobId = null; // UUID only
   let resolvedJobNo = null;
   let resolvedJobName =
-    jobNameInput ||
-    (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
+    jobNameInput || (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
 
   function isPoisonJobName(name) {
     const s = String(name || '').trim();
@@ -563,7 +587,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       lc === 'change job' ||
       lc === 'switch job' ||
       lc === 'pick job' ||
-      lc === 'more';
+      lc === 'more' ||
+      lc === 'overhead';
 
     const errorish =
       lc.includes('should succeed') ||
@@ -633,8 +658,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
         if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
       } else {
         if (/^\d+$/.test(String(jobRef).trim())) {
-          const n = Number(jobRef);
-          if (Number.isFinite(n)) resolvedJobNo = resolvedJobNo ?? n;
+          const nn = Number(jobRef);
+          if (Number.isFinite(nn)) resolvedJobNo = resolvedJobNo ?? nn;
         } else if (!resolvedJobName) {
           const nm = String(jobRef).trim();
           if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -671,7 +696,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const jobNo = resolvedJobNo != null && Number.isFinite(Number(resolvedJobNo)) ? Number(resolvedJobNo) : null;
   const jobName = resolvedJobName ? String(resolvedJobName).trim() : null;
 
-  // Prefer caller jobRef for legacy "job" string, else name, else jobNo, else uuid
+  // Keep job "string" field for back-compat with older schemas/handlers.
+  // Prefer: jobRef (caller), else name, else jobNo, else uuid.
   const job =
     jobRef != null
       ? jobRef
@@ -712,6 +738,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     }
   }
 
+  // Prefer dedupe hash unique if it exists; otherwise fall back to normal insert
   const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
 
   // Build insert cols/vals based on caps
@@ -765,6 +792,26 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     vals.push(JSON.stringify(media));
   }
 
+  // legacy discrete media cols if present (optional, safe)
+  if (media) {
+    if (caps.TX_HAS_MEDIA_URL) {
+      cols.push('media_url');
+      vals.push(media.media_url);
+    }
+    if (caps.TX_HAS_MEDIA_TYPE) {
+      cols.push('media_type');
+      vals.push(media.media_type);
+    }
+    if (caps.TX_HAS_MEDIA_TXT) {
+      cols.push('media_transcript');
+      vals.push(media.media_transcript);
+    }
+    if (caps.TX_HAS_MEDIA_CONF) {
+      cols.push('media_confidence');
+      vals.push(media.media_confidence);
+    }
+  }
+
   if (caps.TX_HAS_CREATED_AT) {
     cols.push('created_at');
     vals.push(new Date());
@@ -779,6 +826,10 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   let conflictSql = '';
   if (caps.TX_HAS_DEDUPE_HASH && dedupeHash && hasOwnerDedupeUnique) {
     conflictSql = ' on conflict (owner_id, dedupe_hash) do nothing ';
+  } else if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+    // only if unique(owner_id, source_msg_id) exists (best-effort)
+    const hasUq = await detectTransactionsUniqueOwnerSourceMsg().catch(() => false);
+    if (hasUq) conflictSql = ' on conflict (owner_id, source_msg_id) do nothing ';
   }
 
   const sql = `
@@ -791,7 +842,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   try {
     const r = await queryWithTimeout(sql, vals, timeoutMs);
     const id = r?.rows?.[0]?.id ?? null;
-
     if (!id) return { inserted: false, id: null };
     return { inserted: true, id };
   } catch (e) {
@@ -803,208 +853,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     throw e;
   }
 }
-
-
-  // 🔒 FINAL HARD GUARD: job_id MUST be UUID or null
-  if (resolvedJobId && !looksLikeUuid(String(resolvedJobId))) {
-    console.warn('[PG/transactions] dropping non-uuid resolvedJobId', { resolvedJobId });
-    resolvedJobId = null;
-  }
-
-  // Keep job "string" field for back-compat with older schemas/handlers.
-  // Prefer: jobRef (caller), else uuid job_id, else job_name, else job_no string.
-  const job =
-    jobRef != null
-      ? jobRef
-      : resolvedJobId
-        ? String(resolvedJobId)
-        : resolvedJobName
-          ? String(resolvedJobName)
-          : resolvedJobNo != null
-            ? String(resolvedJobNo)
-            : null;
-
-  const jobName = resolvedJobName ? String(resolvedJobName).trim() : null;
-    // ✅ Guardrail: refuse to create/find jobs from tokens, commands, or error/debug strings
-  const lc = jobName.toLowerCase();
-
-  const looksLikeTokenGarbage =
-    /^jobix_\d+$/i.test(lc) ||
-    /^jobno_\d+$/i.test(lc) ||
-    /^job_\d+_[0-9a-z]+$/i.test(lc) ||
-    /^#\s*\d+\b/.test(lc) ||
-    lc === 'cancel' ||
-    lc === 'show active jobs' ||
-    lc === 'active jobs' ||
-    lc === 'change job' ||
-    lc === 'switch job' ||
-    lc === 'pick job';
-
-  const looksLikeErrorText =
-    lc.includes('should succeed') ||
-    lc.includes('owner_id') ||
-    lc.includes('missing owner') ||
-    lc.includes('missing ownerid') ||
-    lc.includes('assert') ||
-    lc.includes('operator does not exist') ||
-    lc.includes('require stack') ||
-    lc.includes('stack') ||
-    lc.includes('exception') ||
-    lc.includes('error') ||
-    lc.includes('failed') ||
-    lc.includes('counter should stamp');
-
-  if (looksLikeTokenGarbage || looksLikeErrorText) {
-    console.warn('[PG/ensureJobByName] refusing poison job name', { jobName });
-    return null;
-  }
-
-
-  // ✅ (2.1) Content-based dedupe hash (expense/revenue only)
-  const shouldDedupeByContent = kind === 'expense' || kind === 'revenue';
-  const dedupeHash =
-    shouldDedupeByContent
-      ? buildTxnDedupeHash({
-          owner,
-          kind,
-          date,
-          amountCents,
-          source,
-          description,
-          jobNo: resolvedJobNo,
-          jobName
-        })
-      : null;
-
-  // best-effort idempotency pre-check
-  if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
-    try {
-      const exists = await queryWithTimeout(
-        `select id from public.transactions where owner_id=$1 and source_msg_id=$2 limit 1`,
-        [owner, sourceMsgId],
-        Math.min(2500, timeoutMs)
-      );
-      if (exists?.rows?.length) return { inserted: false, id: exists.rows[0].id };
-    } catch (e) {
-      console.warn('[PG/transactions] idempotency pre-check failed (ignored):', e?.message);
-    }
-  }
-
-  // IMPORTANT: do NOT include created_at in cols if you are injecting now() in SQL
-  // (your previous version included created_at but didn't add a value -> misalignment)
-  const cols = [
-    'owner_id',
-    'kind',
-    'date',
-    'description',
-    ...(caps.TX_HAS_AMOUNT ? ['amount'] : []),
-    'amount_cents',
-    'source',
-    ...(caps.TX_HAS_JOB_ID ? ['job_id'] : []), // ✅ UUID only
-    ...(caps.TX_HAS_JOB_NO ? ['job_no'] : []),
-    'job',
-    'job_name',
-    'category',
-    'user_name',
-    ...(caps.TX_HAS_SOURCE_MSG_ID ? ['source_msg_id'] : []),
-    ...(caps.TX_HAS_MEDIA_URL ? ['media_url'] : []),
-    ...(caps.TX_HAS_MEDIA_TYPE ? ['media_type'] : []),
-    ...(caps.TX_HAS_MEDIA_TXT ? ['media_transcript'] : []),
-    ...(caps.TX_HAS_MEDIA_CONF ? ['media_confidence'] : []),
-    // ✅ (2.2) dedupe_hash column
-    ...(caps.TX_HAS_DEDUPE_HASH ? ['dedupe_hash'] : []),
-    'created_at'
-  ];
-
-  const vals = [
-    owner,
-    kind,
-    date,
-    description,
-    ...(caps.TX_HAS_AMOUNT ? [Number.isFinite(Number(amountMaybe)) ? Number(amountMaybe) : null] : []),
-    amountCents,
-    source,
-    ...(caps.TX_HAS_JOB_ID ? [resolvedJobId ? String(resolvedJobId) : null] : []),
-    ...(caps.TX_HAS_JOB_NO ? [resolvedJobNo != null ? Number(resolvedJobNo) : null] : []),
-    job,
-    jobName,
-    category,
-    userName ? String(userName).trim() : null,
-    ...(caps.TX_HAS_SOURCE_MSG_ID ? [sourceMsgId] : []),
-    ...(caps.TX_HAS_MEDIA_URL ? [media?.media_url || null] : []),
-    ...(caps.TX_HAS_MEDIA_TYPE ? [media?.media_type || null] : []),
-    ...(caps.TX_HAS_MEDIA_TXT ? [media?.media_transcript || null] : []),
-    ...(caps.TX_HAS_MEDIA_CONF ? [media?.media_confidence ?? null] : []),
-    // ✅ (2.3) dedupe_hash value
-    ...(caps.TX_HAS_DEDUPE_HASH ? [dedupeHash] : []),
-    // created_at value
-    new Date()
-  ];
-
-  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
-
-  const canIdempotent =
-    caps.TX_HAS_SOURCE_MSG_ID && !!sourceMsgId && (await detectTransactionsUniqueOwnerSourceMsg());
-
-  // ✅ (2.4) owner_id + dedupe_hash ON CONFLICT (only if unique partial index exists)
-  const canDedupeHash =
-    caps.TX_HAS_DEDUPE_HASH && !!dedupeHash && (await detectTransactionsUniqueOwnerDedupeHash());
-
-  const conflictTarget = canIdempotent
-    ? `(owner_id, source_msg_id) where source_msg_id is not null`
-    : canDedupeHash
-      ? `(owner_id, dedupe_hash) where dedupe_hash is not null`
-      : null;
-
-  const sql = conflictTarget
-    ? `
-      insert into public.transactions (${cols.join(', ')})
-      values (${placeholders})
-      on conflict ${conflictTarget}
-      do nothing
-      returning id
-    `
-    : `
-      insert into public.transactions (${cols.join(', ')})
-      values (${placeholders})
-      returning id
-    `;
-
-  try {
-    const res = await queryWithTimeout(sql, vals, timeoutMs);
-    if (!res?.rows?.length) return { inserted: false, id: null };
-    return { inserted: true, id: res.rows[0].id };
-  } catch (e) {
-    const msg = String(e?.message || '').toLowerCase();
-    const code = String(e?.code || '');
-
-    // ✅ (2.5) Treat either conflict path as potentially unsupported
-    const looksConflictUnsupported =
-      (canIdempotent || canDedupeHash) &&
-      (code === '42P10' ||
-        msg.includes('there is no unique or exclusion constraint') ||
-        msg.includes('on conflict'));
-
-    if (looksConflictUnsupported) {
-      console.warn('[PG/transactions] ON CONFLICT unsupported; retrying without conflict clause');
-
-      // if either uniqueness probe was wrong, stop using it going forward
-      if (canIdempotent) TX_HAS_OWNER_SOURCEMSG_UNIQUE = false;
-      if (canDedupeHash) TX_HAS_OWNER_DEDUPE_UNIQUE = false;
-
-      const sql2 = `
-        insert into public.transactions (${cols.join(', ')})
-        values (${placeholders})
-        returning id
-      `;
-      const res2 = await queryWithTimeout(sql2, vals, timeoutMs);
-      if (!res2?.rows?.length) return { inserted: false, id: null };
-      return { inserted: true, id: res2.rows[0].id };
-    }
-
-    throw e;
-  }
-
 
 /* -------------------- Time helpers -------------------- */
 async function getLatestTimeEvent(ownerId, employeeName) {
@@ -1135,7 +983,6 @@ async function ensureJobByName(ownerId, name) {
     }
   });
 }
-
 
 async function resolveJobContext(ownerId, { explicitJobName, require = false, fallbackName } = {}) {
   const owner = DIGITS(ownerId);
@@ -1344,13 +1191,11 @@ async function getActiveJob(ownerId, userId = null) {
   return { job_no: row.job_no, name: row.name };
 }
 
-
 /**
  * ✅ setActiveJob (compat) — FORCE job_no mode for user_active_job.job_id
- * In today's schema:
+ * In today's schema (most common):
  * - jobs.job_no is INT
- * - user_active_job.job_id stores job_no (INT)
- * - jobs.id is NOT compatible with user_active_job.job_id
+ * - user_active_job.job_id stores job_no (INT or TEXT)
  */
 async function setActiveJob(ownerId, userId, jobRef) {
   const owner = DIGITS(ownerId);
@@ -1366,7 +1211,6 @@ async function setActiveJob(ownerId, userId, jobRef) {
       if (/^\d+$/.test(ref)) {
         jobNo = Number(ref);
       } else if (ref) {
-        // Resolve by name -> create if needed (your helper)
         jobNo = (await ensureJobByName(owner, ref))?.job_no ?? null;
       }
 
@@ -1409,12 +1253,11 @@ async function setActiveJob(ownerId, userId, jobRef) {
   return true;
 }
 
-
 /* ------------------------------------------------------------------ */
 /* ✅ Canonical per-identity Active Job                                */
 /* ------------------------------------------------------------------ */
 let _ACTIVEJOB_CAPS = null;
-let _ACTIVEJOB_ID_TYPES = null; // ✅ cache active_job_id column types
+let _ACTIVEJOB_ID_TYPES = null; // cache active_job_id column types
 
 async function detectActiveJobCaps() {
   if (_ACTIVEJOB_CAPS) return _ACTIVEJOB_CAPS;
@@ -1466,11 +1309,7 @@ async function detectActiveJobCaps() {
 
 async function detectActiveJobIdColumnTypes() {
   if (_ACTIVEJOB_ID_TYPES) return _ACTIVEJOB_ID_TYPES;
-  const out = {
-    users: null,
-    memberships: null,
-    user_profiles: null
-  };
+  const out = { users: null, memberships: null, user_profiles: null };
   try {
     if (await hasTable('users')) out.users = await getColumnDataType('users', 'active_job_id');
   } catch {}
@@ -1527,7 +1366,7 @@ async function resolveJobIdAndName(ownerId, jobId, jobName) {
     } catch {}
   }
 
-    // if id provided but no name, resolve name:
+  // if id provided but no name, resolve name:
   // - if uuid: lookup by id::uuid (future schema)
   // - else if numeric: treat as job_no (today’s schema)
   if (id && !name) {
@@ -1562,53 +1401,51 @@ async function resolveJobIdAndName(ownerId, jobId, jobName) {
   }
 
   // if neither id nor jobNo, but name exists, ensure a job row exists (optional, but helps)
-if (!id && jobNo == null && name) {
-  // ✅ Guardrail: never create a job from error text / tokens / weird debug strings
-  const nm = String(name || '').trim();
-  const lc = nm.toLowerCase();
+  if (!id && jobNo == null && name) {
+    // ✅ Guardrail: never create a job from error text / tokens / weird debug strings
+    const nm = String(name || '').trim();
+    const lc = nm.toLowerCase();
 
-  const looksLikeErrorText =
-    lc.includes('should succeed') ||
-    lc.includes('owner_id') ||
-    lc.includes('assert') ||
-    lc.includes('missing owner') ||
-    lc.includes('missing ownerid') ||
-    lc.includes('error') ||
-    lc.includes('failed') ||
-    lc.includes('exception') ||
-    lc.includes('stack') ||
-    lc.includes('require stack') ||
-    lc.includes('operator does not exist') ||
-    lc.includes('counter should stamp now'); // ✅ add your observed poison string
+    const looksLikeErrorText =
+      lc.includes('should succeed') ||
+      lc.includes('owner_id') ||
+      lc.includes('assert') ||
+      lc.includes('missing owner') ||
+      lc.includes('missing ownerid') ||
+      lc.includes('error') ||
+      lc.includes('failed') ||
+      lc.includes('exception') ||
+      lc.includes('stack') ||
+      lc.includes('require stack') ||
+      lc.includes('operator does not exist') ||
+      lc.includes('counter should stamp now');
 
-  const looksLikeTokenGarbage =
-    /^jobix_\d+$/i.test(lc) ||
-    /^jobno_\d+$/i.test(lc) ||
-    /^job_\d+_[0-9a-z]+$/i.test(lc) ||
-    /^#\s*\d+\b/.test(lc) ||
-    lc === 'cancel' ||
-    lc === 'show active jobs' ||
-    lc === 'active jobs' ||
-    lc === 'change job' ||
-    lc === 'switch job' ||
-    lc === 'pick job';
+    const looksLikeTokenGarbage =
+      /^jobix_\d+$/i.test(lc) ||
+      /^jobno_\d+$/i.test(lc) ||
+      /^job_\d+_[0-9a-z]+$/i.test(lc) ||
+      /^#\s*\d+\b/.test(lc) ||
+      lc === 'cancel' ||
+      lc === 'show active jobs' ||
+      lc === 'active jobs' ||
+      lc === 'change job' ||
+      lc === 'switch job' ||
+      lc === 'pick job';
 
-  if (!looksLikeErrorText && !looksLikeTokenGarbage) {
-    try {
-      const j = await ensureJobByName(owner, nm);
-      if (j) {
-        id = j.id ? String(j.id) : id;
-        jobNo = j.job_no ?? jobNo;
-        name = j.name ? String(j.name).trim() : nm;
-      }
-    } catch {}
+    if (!looksLikeErrorText && !looksLikeTokenGarbage) {
+      try {
+        const j = await ensureJobByName(owner, nm);
+        if (j) {
+          id = j.id ? String(j.id) : id;
+          jobNo = j.job_no ?? jobNo;
+          name = j.name ? String(j.name).trim() : nm;
+        }
+      } catch {}
+    }
   }
-}
-
 
   return { id, name, jobNo };
 }
-
 
 async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   const owner = DIGITS(ownerId);
@@ -1672,8 +1509,6 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   const jobNoText = Number.isFinite(finalJobNo) ? String(finalJobNo) : null;
 
   // If we can’t resolve a jobNo, treat as "clear active job" (fail soft)
-  // Keep UX resilient; do not throw.
-  // We still update name columns to NULL to avoid persisting junk.
   const effectiveName = jobNoText ? name : null;
 
   // 1) users
@@ -1755,69 +1590,88 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   }
 
   // 4) user_active_job (supports uuid OR text schema)
-if (caps.has_user_active_job) {
-  try {
-    // detect job_id type once per cold start
-    let jobIdType = 'text';
+  if (caps.has_user_active_job) {
     try {
-      const t = await query(
-        `
-        select data_type, udt_name
-          from information_schema.columns
-         where table_schema='public'
-           and table_name='user_active_job'
-           and column_name='job_id'
-         limit 1
-        `
-      );
-      const row = t?.rows?.[0];
-      const dt = String(row?.data_type || '').toLowerCase();
-      const udt = String(row?.udt_name || '').toLowerCase();
-      if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
-    } catch {}
+      // detect job_id type once per cold start
+      let jobIdType = 'text';
+      try {
+        const t = await query(
+          `
+          select data_type, udt_name
+            from information_schema.columns
+           where table_schema='public'
+             and table_name='user_active_job'
+             and column_name='job_id'
+           limit 1
+          `
+        );
+        const row = t?.rows?.[0];
+        const dt = String(row?.data_type || '').toLowerCase();
+        const udt = String(row?.udt_name || '').toLowerCase();
+        if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
+      } catch {}
 
-    // If clearing
-    if (!jobNoText && !name) {
-      await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
-      return { active_job_id: null, active_job_name: null, source: 'user_active_job' };
-    }
-
-    // UUID schema: store jobs.id
-    if (jobIdType === 'uuid') {
-      // resolve UUID from job_no first, then name
-      let jobUuid = null;
-
-      if (Number.isFinite(finalJobNo)) {
-        try {
-          const r = await query(
-            `select id from public.jobs where owner_id=$1 and job_no=$2::int limit 1`,
-            [owner, Number(finalJobNo)]
-          );
-          const id = r?.rows?.[0]?.id;
-          if (id && looksLikeUuid(String(id))) jobUuid = String(id);
-        } catch {}
+      // If clearing
+      if (!jobNoText && !name) {
+        await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
+        return { active_job_id: null, active_job_name: null, source: 'user_active_job' };
       }
 
-      if (!jobUuid && name) {
-        try {
-          const r = await query(
-            `
-            select id
-              from public.jobs
-             where owner_id=$1
-               and lower(coalesce(name, job_name)) = lower($2)
-             order by job_no desc
-             limit 1
-            `,
-            [owner, String(name)]
-          );
-          const id = r?.rows?.[0]?.id;
-          if (id && looksLikeUuid(String(id))) jobUuid = String(id);
-        } catch {}
+      // UUID schema: store jobs.id
+      if (jobIdType === 'uuid') {
+        // resolve UUID from job_no first, then name
+        let jobUuid = null;
+
+        if (Number.isFinite(finalJobNo)) {
+          try {
+            const r = await query(`select id from public.jobs where owner_id=$1 and job_no=$2::int limit 1`, [
+              owner,
+              Number(finalJobNo)
+            ]);
+            const id = r?.rows?.[0]?.id;
+            if (id && looksLikeUuid(String(id))) jobUuid = String(id);
+          } catch {}
+        }
+
+        if (!jobUuid && name) {
+          try {
+            const r = await query(
+              `
+              select id
+                from public.jobs
+               where owner_id=$1
+                 and lower(coalesce(name, job_name)) = lower($2)
+               order by job_no desc
+               limit 1
+              `,
+              [owner, String(name)]
+            );
+            const id = r?.rows?.[0]?.id;
+            if (id && looksLikeUuid(String(id))) jobUuid = String(id);
+          } catch {}
+        }
+
+        // can't resolve UUID => clear (don't store junk)
+        if (!jobUuid) {
+          await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
+          return { active_job_id: null, active_job_name: effectiveName || null, source: 'user_active_job' };
+        }
+
+        await query(
+          `
+          insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
+          values ($1, $2, $3::uuid, now())
+          on conflict (owner_id, user_id)
+          do update set job_id = excluded.job_id, updated_at = now()
+          `,
+          [owner, String(userId), jobUuid]
+        );
+
+        return { active_job_id: jobUuid, active_job_name: effectiveName || null, source: 'user_active_job' };
       }
 
-      // can't resolve UUID => clear (don't store junk)
-      if (!jobUuid) {
+      // text schema: store job_no as text
+      if (!jobNoText) {
         await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
         return { active_job_id: null, active_job_name: effectiveName || null, source: 'user_active_job' };
       }
@@ -1825,44 +1679,21 @@ if (caps.has_user_active_job) {
       await query(
         `
         insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
-        values ($1, $2, $3::uuid, now())
+        values ($1, $2, $3::text, now())
         on conflict (owner_id, user_id)
         do update set job_id = excluded.job_id, updated_at = now()
         `,
-        [owner, String(userId), jobUuid]
+        [owner, String(userId), jobNoText]
       );
 
-      return { active_job_id: jobUuid, active_job_name: effectiveName || null, source: 'user_active_job' };
+      return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'user_active_job' };
+    } catch (e) {
+      console.warn('[PG/activeJob] user_active_job write failed (ignored):', e?.message);
     }
-
-    // text schema: store job_no as text
-    if (!jobNoText) {
-      await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
-      return { active_job_id: null, active_job_name: effectiveName || null, source: 'user_active_job' };
-    }
-
-    await query(
-      `
-      insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
-      values ($1, $2, $3::text, now())
-      on conflict (owner_id, user_id)
-      do update set job_id = excluded.job_id, updated_at = now()
-      `,
-      [owner, String(userId), jobNoText]
-    );
-
-    return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'user_active_job' };
-  } catch (e) {
-    console.warn('[PG/activeJob] user_active_job write failed (ignored):', e?.message);
   }
-}
-
-
 
   return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'unknown' };
 }
-
-
 
 async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
   const owner = DIGITS(ownerId);
@@ -1921,10 +1752,10 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
       if (caps.users_has_active_job_id) cols.push('active_job_id');
       if (caps.users_has_active_job_name) cols.push('active_job_name');
 
-      const r = await query(
-        `select ${cols.join(', ')} from public.users where owner_id=$1 and user_id=$2 limit 1`,
-        [owner, userId]
-      );
+      const r = await query(`select ${cols.join(', ')} from public.users where owner_id=$1 and user_id=$2 limit 1`, [
+        owner,
+        userId
+      ]);
 
       const row = r?.rows?.[0];
       if (row && (row.active_job_id != null || row.active_job_name != null)) {
@@ -1972,7 +1803,6 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
 
       if (code === '42P01' || (msg.includes('memberships') && msg.includes('does not exist'))) {
         _MEMBERSHIPS_OK = false; // permanently stop trying
-        // swallow
       } else {
         console.warn('[PG/activeJob] memberships read failed (ignored):', e?.message);
       }
@@ -2001,68 +1831,66 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
     }
   }
 
-   // 4) user_active_job (supports uuid OR text job_id)
-if (caps.has_user_active_job) {
-  try {
-    // detect job_id type
-    let jobIdType = 'text';
+  // 4) user_active_job (supports uuid OR text job_id)
+  if (caps.has_user_active_job) {
     try {
-      const t = await query(
-        `
-        select data_type, udt_name
-          from information_schema.columns
-         where table_schema='public'
-           and table_name='user_active_job'
-           and column_name='job_id'
-         limit 1
-        `
-      );
-      const row = t?.rows?.[0];
-      const dt = String(row?.data_type || '').toLowerCase();
-      const udt = String(row?.udt_name || '').toLowerCase();
-      if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
-    } catch {}
+      // detect job_id type
+      let jobIdType = 'text';
+      try {
+        const t = await query(
+          `
+          select data_type, udt_name
+            from information_schema.columns
+           where table_schema='public'
+             and table_name='user_active_job'
+             and column_name='job_id'
+           limit 1
+          `
+        );
+        const row = t?.rows?.[0];
+        const dt = String(row?.data_type || '').toLowerCase();
+        const udt = String(row?.udt_name || '').toLowerCase();
+        if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
+      } catch {}
 
-    const r = await query(
-      `select job_id from public.user_active_job where owner_id=$1 and user_id=$2 limit 1`,
-      [owner, userId]
-    );
-    const row = r?.rows?.[0];
-    if (!row?.job_id) return null;
+      const r = await query(`select job_id from public.user_active_job where owner_id=$1 and user_id=$2 limit 1`, [
+        owner,
+        userId
+      ]);
+      const row = r?.rows?.[0];
+      if (!row?.job_id) return null;
 
-    const jid = String(row.job_id).trim();
+      const jid = String(row.job_id).trim();
 
-    // UUID schema => resolve by jobs.id
-    if (jobIdType === 'uuid' && looksLikeUuid(jid)) {
-      const j = await query(
-        `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and id=$2::uuid limit 1`,
-        [owner, jid]
-      );
-      const nm = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
-      return { active_job_id: jid, active_job_name: nm, source: 'user_active_job' };
+      // UUID schema => resolve by jobs.id
+      if (jobIdType === 'uuid' && looksLikeUuid(jid)) {
+        const j = await query(
+          `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and id=$2::uuid limit 1`,
+          [owner, jid]
+        );
+        const nm = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
+        return { active_job_id: jid, active_job_name: nm, source: 'user_active_job' };
+      }
+
+      // text schema => treat as job_no if numeric
+      if (/^\d+$/.test(jid)) {
+        const j = await query(
+          `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and job_no=$2::int limit 1`,
+          [owner, Number(jid)]
+        );
+        const nm = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
+        return { active_job_id: jid, active_job_name: nm, source: 'user_active_job' };
+      }
+
+      // otherwise return id only
+      return { active_job_id: jid, active_job_name: null, source: 'user_active_job' };
+    } catch (e) {
+      console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
     }
-
-    // text schema => treat as job_no if numeric
-    if (/^\d+$/.test(jid)) {
-      const j = await query(
-        `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and job_no=$2::int limit 1`,
-        [owner, Number(jid)]
-      );
-      const nm = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
-      return { active_job_id: jid, active_job_name: nm, source: 'user_active_job' };
-    }
-
-    // otherwise return id only
-    return { active_job_id: jid, active_job_name: null, source: 'user_active_job' };
-  } catch (e) {
-    console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
   }
-}
-
 
   return null;
 }
-
 
 /* -------------------- OTP / Users / Tasks / Exports / Pending Actions -------------------- */
 // ---------- OTP ----------
@@ -2286,7 +2114,7 @@ async function getFileExport(id) {
   return rows[0] || null;
 }
 
-// ---------- Pending actions ----------
+/* ---------- Pending actions ---------- */
 const PENDING_TTL_MIN = 10;
 
 async function savePendingAction({ ownerId, userId, kind, payload }) {
@@ -2315,59 +2143,6 @@ async function getPendingAction({ ownerId, userId }) {
   );
   return rows[0] || null;
 }
-
-// ✅ SMART delete:
-// - deletePendingAction(uuid) works
-// - deletePendingAction({ ownerId, userId, kind }) also works (routes to deletePendingActionByKind)
-// - deletePendingAction(pendingRow) also works (uses .id or .owner_id + .user_id + .kind)
-async function deletePendingAction(arg) {
-  // simple uuid string
-  const looksUuid = (s) =>
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(s || '').trim());
-
-  // 1) If passed an id string, delete by id
-  if (typeof arg === 'string' || typeof arg === 'number') {
-    const id = String(arg).trim();
-    if (looksUuid(id)) {
-      await query(`delete from public.pending_actions where id=$1`, [id]);
-      return;
-    }
-    // If someone passes "123" or "[object Object]" accidentally, do nothing safely
-    console.warn('[pending_actions] deletePendingAction received non-uuid id (ignored):', id);
-    return;
-  }
-
-  // 2) If passed an object: try delete by kind OR by embedded id
-  if (arg && typeof arg === 'object') {
-    const id = arg.id || arg.pending_id || null;
-    if (id && looksUuid(id)) {
-      await query(`delete from public.pending_actions where id=$1`, [String(id)]);
-      return;
-    }
-
-    const ownerId = arg.ownerId ?? arg.owner_id ?? null;
-    const userId = arg.userId ?? arg.user_id ?? null;
-    const kind = arg.kind ?? null;
-
-    if (ownerId && userId && kind && typeof deletePendingActionByKind === 'function') {
-      await deletePendingActionByKind({ ownerId, userId, kind });
-      return;
-    }
-
-    console.warn('[pending_actions] deletePendingAction received object but insufficient keys (ignored):', {
-      hasOwnerId: !!ownerId,
-      hasUserId: !!userId,
-      hasKind: !!kind,
-      hasId: !!id
-    });
-    return;
-  }
-
-  // 3) null/undefined etc
-  return;
-}
-
-/* ---------- Pending Actions (Kind-aware helpers) ---------- */
 
 async function getPendingActionByKind({ ownerId, userId, kind }) {
   const owner = DIGITS(ownerId);
@@ -2408,9 +2183,59 @@ async function deletePendingActionByKind({ ownerId, userId, kind }) {
     [owner, user, k]
   );
 }
-// ✅ Compatibility aliases (some newer files expect these names)
+
+// ✅ SMART delete:
+// - deletePendingAction(uuid) works
+// - deletePendingAction({ ownerId, userId, kind }) also works (routes to deletePendingActionByKind)
+// - deletePendingAction(pendingRow) also works (uses .id or .owner_id + .user_id + .kind)
+async function deletePendingAction(arg) {
+  const looksUuid = (s) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(s || '').trim());
+
+  // 1) If passed an id string, delete by id
+  if (typeof arg === 'string' || typeof arg === 'number') {
+    const id = String(arg).trim();
+    if (looksUuid(id)) {
+      await query(`delete from public.pending_actions where id=$1`, [id]);
+      return;
+    }
+    console.warn('[pending_actions] deletePendingAction received non-uuid id (ignored):', id);
+    return;
+  }
+
+  // 2) If passed an object: try delete by kind OR by embedded id
+  if (arg && typeof arg === 'object') {
+    const id = arg.id || arg.pending_id || null;
+    if (id && looksUuid(id)) {
+      await query(`delete from public.pending_actions where id=$1`, [String(id)]);
+      return;
+    }
+
+    const ownerId = arg.ownerId ?? arg.owner_id ?? null;
+    const userId = arg.userId ?? arg.user_id ?? null;
+    const kind = arg.kind ?? null;
+
+    if (ownerId && userId && kind) {
+      await deletePendingActionByKind({ ownerId, userId, kind });
+      return;
+    }
+
+    console.warn('[pending_actions] deletePendingAction received object but insufficient keys (ignored):', {
+      hasOwnerId: !!ownerId,
+      hasUserId: !!userId,
+      hasKind: !!kind,
+      hasId: !!id
+    });
+    return;
+  }
+
+  // 3) null/undefined etc
+  return;
+}
+
+// ✅ Compatibility aliases
 async function upsertPendingAction({ ownerId, userId, kind, payload, ttlSeconds } = {}) {
-  // Your schema uses created_at TTL, not expires_at. We ignore ttlSeconds safely.
+  // schema uses created_at TTL; ignore ttlSeconds safely.
   return savePendingAction({ ownerId, userId, kind, payload });
 }
 
@@ -2418,6 +2243,28 @@ async function clearPendingAction({ ownerId, userId, kind } = {}) {
   return deletePendingActionByKind({ ownerId, userId, kind });
 }
 
+async function getMostRecentPendingActionForUser({ ownerId, userId }) {
+  const owner = String(ownerId || '').replace(/\D/g, '');
+  const user = String(userId || '').trim();
+  if (!owner || !user) return null;
+
+  const ttlMin = Number(process.env.PENDING_TTL_MIN || 10);
+
+  const r = await query(
+    `
+    SELECT kind, payload, created_at
+      FROM public.pending_actions
+     WHERE owner_id = $1
+       AND user_id = $2
+       AND created_at > now() - (($3::text || ' minutes')::interval)
+     ORDER BY created_at DESC
+     LIMIT 1
+    `,
+    [owner, user, String(ttlMin)]
+  );
+
+  return r?.rows?.[0] || null;
+}
 
 /* -------------------- Finance helpers -------------------- */
 async function getOwnerPricingItems(ownerId) {
@@ -2442,9 +2289,10 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
   if (jobId) {
     params.push(String(jobId));
     // Prefer job_id if present, else fall back to job string field matching
-    const caps = await detectTransactionsCapabilities().catch(() => ({ TX_HAS_JOB_ID: false }));
+    const caps = await detectTransactionsCapabilities().catch(() => ({ TX_HAS_JOB_ID: false, TX_HAS_JOB: false }));
     if (caps?.TX_HAS_JOB_ID) where += ' AND job_id::text = $2';
-    else where += ' AND job::text = $2';
+    else if (caps?.TX_HAS_JOB) where += ' AND job::text = $2';
+    else where += ' AND 1=0';
   }
 
   const { rows } = await query(
@@ -2478,36 +2326,68 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
   };
 }
 
+let _JOBS_ID_TYPE = null;
+let _TX_JOB_ID_TYPE = null;
+
+async function detectJobsIdType() {
+  if (_JOBS_ID_TYPE !== null) return _JOBS_ID_TYPE;
+  _JOBS_ID_TYPE = (await getColumnDataType('jobs', 'id').catch(() => null)) || 'unknown';
+  return _JOBS_ID_TYPE;
+}
+async function detectTransactionsJobIdType() {
+  if (_TX_JOB_ID_TYPE !== null) return _TX_JOB_ID_TYPE;
+  _TX_JOB_ID_TYPE = (await getColumnDataType('transactions', 'job_id').catch(() => null)) || 'unknown';
+  return _TX_JOB_ID_TYPE;
+}
+
 async function getOwnerJobsFinance(ownerId) {
   const ownerKey = String(ownerId);
+  const caps = await detectTransactionsCapabilities().catch(() => ({ TX_HAS_JOB_ID: false, TX_HAS_JOB_NO: false }));
 
-  // If transactions.job_id is missing, this join will fail. We fallback gracefully.
-  const caps = await detectTransactionsCapabilities().catch(() => ({ TX_HAS_JOB_ID: false }));
+  // If we can't join safely, return zeroed list (but still list jobs)
+  const { rows: jobs } = await query(
+    `
+    select
+      j.id,
+      j.name,
+      j.status,
+      j.created_at,
+      j.completed_at,
+      j.job_no
+    from jobs j
+    where j.owner_id::text = $1
+    order by j.created_at desc
+    `,
+    [ownerKey]
+  );
 
-  if (!caps?.TX_HAS_JOB_ID) {
-    const { rows } = await query(
-      `
-      select
-        j.id,
-        j.name,
-        j.status,
-        j.created_at,
-        j.completed_at,
-        0::bigint as revenue_cents,
-        0::bigint as expense_cents
-      from jobs j
-      where j.owner_id::text = $1
-      order by j.created_at desc
-      `,
-      [ownerKey]
-    );
+  if (!jobs?.length) return [];
 
-    return rows.map((r) => ({
-      job_id: r.id,
-      name: r.name,
-      status: r.status,
-      created_at: r.created_at,
-      completed_at: r.completed_at,
+  // Decide best join strategy
+  let joinMode = 'none';
+
+  if (caps.TX_HAS_JOB_ID) {
+    const jobsIdType = await detectJobsIdType().catch(() => 'unknown');
+    const txJobIdType = await detectTransactionsJobIdType().catch(() => 'unknown');
+
+    const jobsUuid = String(jobsIdType || '').includes('uuid');
+    const txUuid = String(txJobIdType || '').includes('uuid');
+
+    // safe: uuid-to-uuid
+    if (jobsUuid && txUuid) joinMode = 'job_id_uuid';
+  }
+
+  if (joinMode === 'none' && caps.TX_HAS_JOB_NO) {
+    joinMode = 'job_no';
+  }
+
+  if (joinMode === 'none') {
+    return jobs.map((j) => ({
+      job_id: j.id,
+      name: j.name,
+      status: j.status,
+      created_at: j.created_at,
+      completed_at: j.completed_at,
       revenue_cents: 0,
       expense_cents: 0,
       profit_cents: 0,
@@ -2515,39 +2395,49 @@ async function getOwnerJobsFinance(ownerId) {
     }));
   }
 
-  const { rows } = await query(
-    `
+  // Aggregate in one query, then map to jobs
+  let aggSql = '';
+  if (joinMode === 'job_id_uuid') {
+    aggSql = `
       select
-        j.id,
-        j.name,
-        j.status,
-        j.created_at,
-        j.completed_at,
-        coalesce(sum(case when t.kind = 'revenue' then t.amount_cents end), 0) as revenue_cents,
-        coalesce(sum(case when t.kind = 'expense' then t.amount_cents end), 0) as expense_cents
-      from jobs j
-      left join transactions t
-        on t.owner_id::text = j.owner_id::text
-       and t.job_id        = j.id
-      where j.owner_id::text = $1
-      group by j.id
-      order by j.created_at desc
-    `,
-    [ownerKey]
-  );
+        t.job_id::text as key,
+        coalesce(sum(case when t.kind='revenue' then t.amount_cents end),0) as revenue_cents,
+        coalesce(sum(case when t.kind='expense' then t.amount_cents end),0) as expense_cents
+      from transactions t
+      where t.owner_id::text = $1
+        and t.job_id is not null
+      group by t.job_id::text
+    `;
+  } else {
+    aggSql = `
+      select
+        t.job_no::text as key,
+        coalesce(sum(case when t.kind='revenue' then t.amount_cents end),0) as revenue_cents,
+        coalesce(sum(case when t.kind='expense' then t.amount_cents end),0) as expense_cents
+      from transactions t
+      where t.owner_id::text = $1
+        and t.job_no is not null
+      group by t.job_no::text
+    `;
+  }
 
-  return rows.map((r) => {
-    const revenue = Number(r.revenue_cents) || 0;
-    const expense = Number(r.expense_cents) || 0;
+  const { rows: agg } = await query(aggSql, [ownerKey]);
+  const map = new Map((agg || []).map((r) => [String(r.key), r]));
+
+  return jobs.map((j) => {
+    const key = joinMode === 'job_id_uuid' ? String(j.id) : String(j.job_no ?? '');
+    const row = map.get(key);
+    const revenue = Number(row?.revenue_cents) || 0;
+    const expense = Number(row?.expense_cents) || 0;
     const profit = revenue - expense;
     const margin_pct = revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
 
     return {
-      job_id: r.id,
-      name: r.name,
-      status: r.status,
-      created_at: r.created_at,
-      completed_at: r.completed_at,
+      job_id: j.id,
+      name: j.name,
+      status: j.status,
+      created_at: j.created_at,
+      completed_at: j.completed_at,
       revenue_cents: revenue,
       expense_cents: expense,
       profit_cents: profit,
@@ -3047,9 +2937,7 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
   const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
 
   if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null || SUPPORTS_SOURCE_MSG_ID === null) {
-    await detectTimeEntriesCapabilities().catch((e) =>
-      console.error('[PG/logTimeEntry] detection failed:', e?.message)
-    );
+    await detectTimeEntriesCapabilities().catch((e) => console.error('[PG/logTimeEntry] detection failed:', e?.message));
   }
 
   const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
@@ -3289,12 +3177,11 @@ module.exports = {
   exportTimesheetXlsx,
   exportTimesheetPdf,
   getFileExport,
+
   upsertPendingAction,
-  deletePendingAction,
   getPendingActionByKind,
   deletePendingActionByKind,
   getMostRecentPendingActionForUser,
-
 
   // kept helpers (if other files import them)
   getJobByName,

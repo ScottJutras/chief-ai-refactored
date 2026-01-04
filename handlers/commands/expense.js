@@ -829,138 +829,138 @@ function jobNoFromTitle(s) {
   return Number.isFinite(n) ? n : null;
 }
 
-async function resolveJobPickSelection({ ownerId, from, input, twilioMeta }) {
-  const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-  if (!pickPA?.payload) return { ok: false, reason: 'no_pick_state' };
+function parseNewPickerToken(tok) {
+  // jp:<flow>:<nonce>:jn:<jobNo>:h:<hash>
+  const m = String(tok || '').trim().match(/^jp:([0-9a-f]{8}):([0-9a-f]{8}):jn:(\d{1,10}):h:([0-9a-f]{12})$/i);
+  if (!m) return null;
+  return {
+    flow: String(m[1]).toLowerCase(),
+    pickerNonce: String(m[2]).toLowerCase(),
+    jobNo: Number(m[3]),
+    hash: String(m[4]).toLowerCase()
+  };
+}
 
-  const {
-    flow,
-    pickerNonce,
-    displayedJobNos,
-    displayedHash,
-    sentRows,
-    sentAt
-  } = pickPA.payload || {};
+function legacyIndexFromTwilioToken(tok) {
+  // job_<ix>_<hash>
+  const m = String(tok || '').trim().match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+  if (!m) return null;
+  const ix = Number(m[1]);
+  return Number.isFinite(ix) ? ix : null;
+}
 
-  const inboundTitle =
-    twilioMeta?.ListTitle ||
-    twilioMeta?.ListRowTitle ||
-    twilioMeta?.list_title ||
-    '';
+function normalizeListTitle(s) {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[—–-]/g, '-') // normalize dashes
+    .replace(/[^a-z0-9 #:-]/g, ''); // keep minimal safe chars
+}
 
+// expects patterns like "#2 Oak Street Re-roof" OR "2 Oak Street Re-roof"
+function jobNoFromTitle(title) {
+  const t = String(title || '').trim();
+  let m = t.match(/^#\s*(\d{1,10})\b/);
+  if (m) return Number(m[1]);
+  m = t.match(/^(\d{1,10})\b/);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+/**
+ * ✅ PURE selection resolver
+ * - Never references outer vars (including jobOptions)
+ * - Uses only passed-in pickState + inbound twilio meta
+ */
+async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickState }) {
+  const tok = String(input || '').trim();
+  const inboundTitle = String(twilioMeta?.ListTitle || '').trim();
   const inboundTitleNorm = normalizeListTitle(inboundTitle);
 
-  // Expire old picker state (extra safety)
-  const ageMs = sentAt ? Date.now() - Number(sentAt) : null;
-  if (!sentAt || (ageMs != null && ageMs > PA_TTL_SEC * 1000)) {
-    return { ok: false, reason: 'picker_expired' };
-  }
+  const flow = String(pickState?.flow || '').trim() || null;
+  const pickerNonce = String(pickState?.pickerNonce || '').trim() || null;
+  const displayedHash = String(pickState?.displayedHash || '').trim() || null;
+  const displayedJobNos = Array.isArray(pickState?.displayedJobNos) ? pickState.displayedJobNos.map(Number) : [];
+  const sentRows = Array.isArray(pickState?.sentRows) ? pickState.sentRows : [];
 
-  // 1) Preferred: signed jp: row id
-  const parsed = parseRowId(input);
+  // ----------------------------
+  // 1) NEW TOKEN PATH: jp:<flow>:<nonce>:jn:<jobNo>:h:<hash>
+  // ----------------------------
+  const parsed = parseNewPickerToken(tok);
   if (parsed) {
-    const secret = process.env.JOB_PICKER_HMAC_SECRET || 'dev-secret-change-me';
+    // validate flow/nonce/hash if present
+    if (flow && String(parsed.flow) !== String(flow)) return { ok: false, reason: 'flow_mismatch' };
+    if (pickerNonce && String(parsed.pickerNonce) !== String(pickerNonce)) return { ok: false, reason: 'nonce_mismatch' };
+    if (displayedHash && String(parsed.hash) !== String(displayedHash)) return { ok: false, reason: 'hash_mismatch' };
 
-    const base = `${parsed.flow}|${parsed.nonce}|${parsed.jobNo}`;
-    const expected = hmac12(secret, base);
-
-    if (expected !== parsed.sig) return { ok: false, reason: 'bad_sig' };
-    if (parsed.flow !== flow) return { ok: false, reason: 'flow_mismatch' };
-    if (parsed.nonce !== pickerNonce) return { ok: false, reason: 'nonce_mismatch' };
-
-    if (!Array.isArray(displayedJobNos) || !displayedJobNos.includes(parsed.jobNo)) {
-      return { ok: false, reason: 'job_not_in_displayed' };
+    if (displayedJobNos.length && !displayedJobNos.includes(Number(parsed.jobNo))) {
+      return { ok: false, reason: 'jobno_not_in_displayed' };
     }
 
     return {
       ok: true,
-      jobNo: parsed.jobNo,
-      meta: { mode: 'signed', flow, pickerNonce, displayedHash }
+      jobNo: Number(parsed.jobNo),
+      meta: { mode: 'new_token', flow, pickerNonce, displayedHash }
     };
   }
 
-  // 2) Legacy Twilio ids: job_<ix>_<hash>
-const ix = legacyIndexFromTwilioToken(input);
-if (ix != null) {
-  const arr = Array.isArray(displayedJobNos) ? displayedJobNos.map(Number).filter(Number.isFinite) : [];
-  const opts = Array.isArray(jobOptions) ? jobOptions : [];
-  const inboundTitleRaw = String(inboundTitle || '').trim();
-  const inboundTitleNorm = normalizeListTitle(inboundTitleRaw);
+  // ----------------------------
+  // 2) LEGACY PATH: WhatsApp sends Body="job_<ix>_<hash>" + ListTitle="#<jobNo> <name>"
+  // Strategy:
+  //   A) Prefer extracting jobNo from inbound title (most reliable)
+  //   B) If no jobNo in title, fall back to ix mapping + best-effort title/name match
+  // ----------------------------
 
-  // A) If inbound title contains a clear jobNo (rare / best-effort), accept only if it was displayed
-  let titleJobNo = null;
-  if (typeof extractJobNoFromWhatsAppListTitle === 'function') {
-    try { titleJobNo = extractJobNoFromWhatsAppListTitle(inboundTitleRaw); } catch {}
-  } else if (typeof jobNoFromTitle === 'function') {
-    try { titleJobNo = jobNoFromTitle(inboundTitleRaw); } catch {}
-  }
-
+  // (A) Prefer title-derived jobNo
+  const titleJobNo = jobNoFromTitle(inboundTitle);
   if (titleJobNo != null) {
-    const n = Number(titleJobNo);
-    if (Number.isFinite(n) && arr.includes(n)) {
-      return {
-        ok: true,
-        jobNo: n,
-        meta: { mode: 'legacy_title_jobno', ix, flow, pickerNonce, displayedHash }
-      };
+    if (displayedJobNos.length && !displayedJobNos.includes(Number(titleJobNo))) {
+      return { ok: false, reason: 'legacy_jobno_not_in_displayed' };
     }
-    // ignore bogus extraction (eg 1556 from "#1 1556 ...")
-    titleJobNo = null;
+    return {
+      ok: true,
+      jobNo: Number(titleJobNo),
+      meta: { mode: 'legacy_title_jobno', flow, pickerNonce, displayedHash }
+    };
   }
 
-  // B) Prefer matching by the *name* in the inbound ListTitle (strip WhatsApp’s "#2 " prefix)
-  // Example inbound title: "#2 Oak Street Re-roof"  -> "oak street re-roof"
-  const strippedTitleNorm = normalizeListTitle(
-    inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim()
-  );
-
-  if (strippedTitleNorm) {
-    const candidates = opts.filter((j) => {
-      const jn = Number(j?.job_no ?? j?.jobNo);
-      if (!Number.isFinite(jn)) return false;
-      if (arr.length && !arr.includes(jn)) return false; // must have been displayed
-
-      const nameNorm = normalizeListTitle(j?.name || j?.job_name || j?.title || '');
-      if (!nameNorm) return false;
-
-      return (
-        nameNorm === strippedTitleNorm ||
-        nameNorm.includes(strippedTitleNorm) ||
-        strippedTitleNorm.includes(nameNorm)
-      );
-    });
-
-    if (candidates.length === 1) {
-      const picked = Number(candidates[0].job_no ?? candidates[0].jobNo);
-      return {
-        ok: true,
-        jobNo: picked,
-        meta: { mode: 'legacy_title_name_match', ix, flow, pickerNonce, displayedHash }
-      };
+  // (B) Fall back to ix mapping
+  const ix = legacyIndexFromTwilioToken(tok);
+  if (ix != null) {
+    if (!sentRows.length || ix > sentRows.length) {
+      return { ok: false, reason: 'legacy_ix_out_of_range' };
     }
+
+    const expectedRow = sentRows[ix - 1]; // {ix, jobNo, name, title}
+    const expectedNameNorm = normalizeListTitle(expectedRow?.name || '');
+    const expectedTitleNorm = normalizeListTitle(expectedRow?.title || '');
+
+    // Best-effort title match (WhatsApp truncates)
+    const titleOk =
+      (expectedTitleNorm && inboundTitleNorm && expectedTitleNorm.startsWith(inboundTitleNorm)) ||
+      (expectedTitleNorm && inboundTitleNorm && inboundTitleNorm.startsWith(expectedTitleNorm)) ||
+      (expectedNameNorm && inboundTitleNorm && inboundTitleNorm.includes(expectedNameNorm)) ||
+      (expectedNameNorm && inboundTitleNorm && expectedNameNorm.includes(inboundTitleNorm));
+
+    if (inboundTitleNorm && !titleOk) {
+      return { ok: false, reason: 'legacy_title_mismatch' };
+    }
+
+    if (displayedJobNos.length && !displayedJobNos.includes(Number(expectedRow.jobNo))) {
+      return { ok: false, reason: 'legacy_job_not_in_displayed' };
+    }
+
+    return {
+      ok: true,
+      jobNo: Number(expectedRow.jobNo),
+      meta: { mode: 'legacy_index', ix, flow, pickerNonce, displayedHash }
+    };
   }
 
-  // C) Final fallback: ix maps into displayedJobNos (safe but may be wrong on some clients)
-  if (!arr.length || ix > arr.length) {
-    return { ok: false, reason: 'legacy_ix_out_of_range' };
-  }
-
-  const mappedJobNo = Number(arr[ix - 1]);
-  if (!Number.isFinite(mappedJobNo)) {
-    return { ok: false, reason: 'legacy_bad_mapped_jobno' };
-  }
-
-  return {
-    ok: true,
-    jobNo: mappedJobNo,
-    meta: { mode: 'legacy_index_fallback', ix, flow, pickerNonce, displayedHash }
-  };
+  return { ok: false, reason: 'unrecognized_row_id' };
 }
 
-return { ok: false, reason: 'unrecognized_row_id' };
-
-
-}
 
 
 async function rejectAndResendPicker({
@@ -2312,11 +2312,19 @@ async function handleExpense(
         // ----------------------------
         if (looksLikePickerTap) {
           const sel = await resolveJobPickSelection({
-            ownerId,
-            from,
-            input: rawInput,
-            twilioMeta: inboundTwilioMeta
-          });
+  ownerId,
+  from,
+  input: rawInput,
+  twilioMeta: inboundTwilioMeta,
+  pickState: {
+    flow,
+    pickerNonce,
+    displayedHash,
+    displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
+    sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : []
+  }
+});
+
 
           if (!sel.ok) {
             return await rejectAndResendPicker({
@@ -2716,10 +2724,12 @@ async function handleExpense(
     );
   } catch (error) {
     console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
-      code: error?.code,
-      detail: error?.detail,
-      constraint: error?.constraint
-    });
+  stack: error?.stack,
+  code: error?.code,
+  detail: error?.detail,
+  constraint: error?.constraint
+});
+
     return out(twimlText('⚠️ Error logging expense. Please try again.'), false);
   } finally {
     try {

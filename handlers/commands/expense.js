@@ -881,7 +881,6 @@ function jobNoFromTitle(title) {
 async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickState }) {
   const tok = String(input || '').trim();
   const inboundTitle = String(twilioMeta?.ListTitle || '').trim();
-  const inboundTitleNorm = normalizeListTitle(inboundTitle);
 
   const flow = String(pickState?.flow || '').trim() || null;
   const pickerNonce = String(pickState?.pickerNonce || '').trim() || null;
@@ -912,93 +911,70 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
 
   // ----------------------------
 // 2) LEGACY PATH: Body="job_<n>_<hash>" and ListTitle="#<n> <name>"
-// On some clients, <n> acts like JOB NO, not row index.
+// IMPORTANT: When ListTitle starts with "#", that leading number is often a UI index, NOT jobNo.
 // Strategy:
-//   A) Prefer title-derived jobNo IF it exists in pickState.jobOptions (safe)
-//   B) Prefer title/name match against sentRows
-//   C) Fall back to ix mapping into sentRows (best-effort)
+//   1) Prefer matching by title text against sentRows (most reliable)
+//   2) Fall back to ix mapping (job_<ix>_...)
+//   3) ONLY if title does NOT start with "#", allow numeric jobNo fast-path
 // ----------------------------
 
-const inboundTitleRaw = String(inboundTitle || '').trim();
-const opts = Array.isArray(pickState?.jobOptions) ? pickState.jobOptions : [];
-
-// (A) Title-derived jobNo (safe if it exists in jobOptions snapshot)
-const titleJobNo = jobNoFromTitle(inboundTitleRaw);
-if (titleJobNo != null) {
-  const n = Number(titleJobNo);
-  const exists = opts.some((j) => Number(j?.job_no ?? j?.jobNo) === n);
-
-  if (exists) {
-    return {
-      ok: true,
-      jobNo: n,
-      meta: { mode: 'legacy_title_jobno', flow, pickerNonce, displayedHash }
-    };
-  }
-
-  // IMPORTANT:
-  // If not found, that leading number is probably a UI index ("#2") not a jobNo.
-  // Do NOT reject; fall through to title/name matching and ix mapping.
-}
-
-
-// (B/C) ix mapping path
-const ix = legacyIndexFromTwilioToken(tok);
-if (ix != null) {
-  // 1) Prefer matching by NAME/TITLE (ignore "#2 " prefix)
+// legacy path
+  const inboundTitleRaw = inboundTitle; // already trimmed
   const strippedTitleNorm = normalizeListTitle(
     inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim()
   );
 
-  if (strippedTitleNorm && sentRows.length) {
-    const candidates = sentRows
-      .map((r) => {
-        const nameNorm = normalizeListTitle(r?.name || '');
-        const titleNorm = normalizeListTitle(r?.title || '');
-        const jobNo = Number(r?.jobNo);
-        if (!Number.isFinite(jobNo)) return null;
-        if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return null;
+if (strippedTitleNorm && sentRows.length) {
+  const candidates = sentRows
+    .map((r) => {
+      const nameNorm = normalizeListTitle(r?.name || '');
+      const titleNorm = normalizeListTitle(r?.title || '');
+      const jobNo = Number(r?.jobNo);
+      if (!Number.isFinite(jobNo)) return null;
+      if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return null;
 
-        // score: exact > prefix > contains
-        let score = 0;
-        if (nameNorm === strippedTitleNorm || titleNorm === strippedTitleNorm) score = 3;
-        else if (
-          (nameNorm && nameNorm.startsWith(strippedTitleNorm)) ||
-          (titleNorm && titleNorm.startsWith(strippedTitleNorm)) ||
-          (strippedTitleNorm && strippedTitleNorm.startsWith(nameNorm))
-        ) score = 2;
-        else if (
-          (nameNorm && nameNorm.includes(strippedTitleNorm)) ||
-          (titleNorm && titleNorm.includes(strippedTitleNorm)) ||
-          (strippedTitleNorm && strippedTitleNorm.includes(nameNorm))
-        ) score = 1;
+      // score: exact > prefix > contains
+      let score = 0;
+      if (nameNorm === strippedTitleNorm || titleNorm === strippedTitleNorm) score = 3;
+      else if (
+        (nameNorm && nameNorm.startsWith(strippedTitleNorm)) ||
+        (titleNorm && titleNorm.startsWith(strippedTitleNorm)) ||
+        (strippedTitleNorm && strippedTitleNorm.startsWith(nameNorm))
+      ) score = 2;
+      else if (
+        (nameNorm && nameNorm.includes(strippedTitleNorm)) ||
+        (titleNorm && titleNorm.includes(strippedTitleNorm)) ||
+        (strippedTitleNorm && strippedTitleNorm.includes(nameNorm))
+      ) score = 1;
 
-        return score ? { jobNo, score, row: r } : null;
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.score - a.score);
+      return score ? { jobNo, score, row: r } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
 
-    if (candidates.length) {
-      // If top score is unique, accept it
-      const top = candidates[0];
-      const second = candidates[1];
-      if (!second || second.score < top.score) {
-        return {
-          ok: true,
-          jobNo: Number(top.jobNo),
-          meta: { mode: 'legacy_title_name_match', ix, flow, pickerNonce, displayedHash }
-        };
-      }
-      // If tie, fall through to ix mapping
+  if (candidates.length) {
+  const top = candidates[0];
+  const second = candidates[1];
+  if (!second || second.score < top.score) {
+    const result = {
+      ok: true,
+      jobNo: Number(top.jobNo),
+      meta: { mode: 'legacy_title_name_match', flow, pickerNonce, displayedHash }
+    };
+    console.info('[JOB_PICK_RESOLVED]', { tok, inboundTitle: inboundTitleRaw, result });
+    return result;
     }
   }
+}
 
-  // 2) Fall back to ix mapping into sentRows
+// 2) Fall back to ix mapping (Body="job_<ix>_<hash>")
+const ix = legacyIndexFromTwilioToken(tok);
+if (ix != null) {
   if (!sentRows.length || ix > sentRows.length) {
     return { ok: false, reason: 'legacy_ix_out_of_range' };
   }
 
-  const expectedRow = sentRows[ix - 1]; // {ix, jobNo, name, title}
+  const expectedRow = sentRows[ix - 1];
   const expectedJobNo = Number(expectedRow?.jobNo);
 
   if (!Number.isFinite(expectedJobNo)) {
@@ -1016,7 +992,26 @@ if (ix != null) {
   };
 }
 
+// 3) ONLY if title does NOT start with "#", allow numeric jobNo in title
+// (This supports your newer row labels like "10 Test Idempotent 1" without "#")
+const titleStartsWithHash = /^#\s*\d+\b/.test(inboundTitleRaw);
+if (!titleStartsWithHash) {
+  const titleJobNo = jobNoFromTitle(inboundTitleRaw); // "10 ..." -> 10
+  if (titleJobNo != null) {
+    const n = Number(titleJobNo);
+    if (displayedJobNos.length && !displayedJobNos.includes(n)) {
+      return { ok: false, reason: 'legacy_jobno_not_in_displayed' };
+    }
+    return {
+      ok: true,
+      jobNo: n,
+      meta: { mode: 'legacy_title_jobno', flow, pickerNonce, displayedHash }
+    };
+  }
+}
+
 return { ok: false, reason: 'unrecognized_row_id' };
+
 
 }
 
@@ -2393,99 +2388,139 @@ const lockKey = `lock:${paUserId}`;
         }
 
         // ----------------------------
-        // 1) PICKER-TAP PATH (Twilio interactive replies)
-        // ----------------------------
-        if (looksLikePickerTap) {
-          const sel = await resolveJobPickSelection({
-  ownerId,
-  from,
-  input: rawInput,
-  twilioMeta: inboundTwilioMeta,
-  pickState: {
-  flow,
-  pickerNonce,
-  displayedHash,
-  displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
-  sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : [],
-  jobOptions: Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [] // ✅ add
-}
-});
+// 1) PICKER-TAP PATH (Twilio interactive replies)
+// ----------------------------
+if (looksLikePickerTap) {
+  const pickJobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
 
+  const sel = await resolveJobPickSelection({
+    ownerId,
+    from,
+    input: rawInput,
+    twilioMeta: inboundTwilioMeta,
+    pickState: {
+      flow,
+      pickerNonce,
+      displayedHash,
+      displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
+      sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : [],
+      jobOptions: pickJobOptions // ✅ keep
+    }
+  });
 
-          if (!sel.ok) {
-            return await rejectAndResendPicker({
-              from,
-              ownerId,
-              userProfile,
-              confirmFlowId: effectiveConfirmFlowId,
-              jobOptions,
-              confirmDraft,
-              reason: sel.reason,
-              twilioMeta: inboundTwilioMeta
-            });
-          }
+  if (!sel.ok) {
+    return await rejectAndResendPicker({
+      from,
+      ownerId,
+      userProfile,
+      confirmFlowId: effectiveConfirmFlowId,
+      // ✅ resend the same universe of jobs that the picker state represents
+      jobOptions: pickJobOptions.length ? pickJobOptions : jobOptions,
+      confirmDraft,
+      reason: sel.reason,
+      twilioMeta: inboundTwilioMeta
+    });
+  }
 
-          const chosenJobNo = Number(sel.jobNo);
-          const chosen = (jobOptions || []).find((j) => Number(j?.job_no) === chosenJobNo) || null;
+  const chosenJobNo = Number(sel.jobNo);
+  const chosen =
+    pickJobOptions.find((j) => Number(j?.job_no ?? j?.jobNo) === Number(chosenJobNo)) || null;
 
-          if (!chosen) {
-            return await rejectAndResendPicker({
-              from,
-              ownerId,
-              userProfile,
-              confirmFlowId: effectiveConfirmFlowId,
-              jobOptions,
-              confirmDraft,
-              reason: 'job_not_found_in_options',
-              twilioMeta: inboundTwilioMeta
-            });
-          }
+  if (!chosen) {
+    return await rejectAndResendPicker({
+      from,
+      ownerId,
+      userProfile,
+      confirmFlowId: effectiveConfirmFlowId,
+      jobOptions: pickJobOptions.length ? pickJobOptions : jobOptions,
+      confirmDraft,
+      reason: 'job_not_found_in_pick_state',
+      twilioMeta: inboundTwilioMeta
+    });
+  }
 
-          const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  // ✅ Ensure confirm draft exists (rebuild from pickPA.confirmDraft if needed)
+  let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 
-          try {
-            await persistActiveJobBestEffort({
-              ownerId,
-              userProfile,
-              fromPhone: from,
-              jobRow: chosen,
-              jobNameFallback: chosen?.name
-            });
-          } catch {}
+  if (!confirmPA?.payload?.draft) {
+    const fallbackDraft = pickPA?.payload?.confirmDraft || null;
+    if (fallbackDraft) {
+      await upsertPA({
+        ownerId,
+        userId: paUserId,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          draft: fallbackDraft,
+          sourceMsgId: stableMsgId,
+          type: 'expense'
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+      confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    }
+  }
 
-          if (confirmPA?.payload?.draft) {
-            await upsertPA({
-              ownerId,
-              userId: paUserId,
-              kind: PA_KIND_CONFIRM,
-              payload: {
-                ...confirmPA.payload,
-                draft: {
-                  ...(confirmPA.payload.draft || {}),
-                  jobName: getJobDisplayName(chosen),
-                  jobSource: 'picked',
-                  job_no: Number(chosen.job_no)
-                }
-              },
-              ttlSeconds: PA_TTL_SEC
-            });
-          }
+  try {
+    await persistActiveJobBestEffort({
+      ownerId,
+      userProfile,
+      fromPhone: from,
+      jobRow: chosen,
+      jobNameFallback: chosen?.name
+    });
+  } catch {}
 
-          try {
-            await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
-          } catch {}
-          return await resendConfirmExpense({ from, ownerId, tz });
+  if (confirmPA?.payload?.draft) {
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA.payload || {}),
+        draft: {
+          ...(confirmPA.payload?.draft || {}),
+          jobName: getJobDisplayName(chosen),
+          jobSource: 'picked',
+          job_no: Number(chosen.job_no ?? chosen.jobNo)
         }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+  } else {
+    return await rejectAndResendPicker({
+      from,
+      ownerId,
+      userProfile,
+      confirmFlowId: effectiveConfirmFlowId,
+      jobOptions: pickJobOptions.length ? pickJobOptions : jobOptions,
+      confirmDraft,
+      reason: 'missing_confirm_after_pick',
+      twilioMeta: inboundTwilioMeta
+    });
+  }
+
+  try {
+    await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
+  } catch {}
+
+  // ✅ With your current resendConfirmExpense(), this is correct
+  // because you normalize `from = paUserId` at the top of handleExpense
+  return await resendConfirmExpense({ from, ownerId, tz });
+}
+
 
         // ----------------------------
         // 2) TYPED INPUT PATH
         // ----------------------------
         const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : [];
-        const resolved = resolveJobOptionFromReply(rawInput, jobOptions, {
-          page,
-          pageSize,
-          displayedJobNos
-        });
+        const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
+
+console.info('[JOB_PICK_RESOLVED]', {
+  input: rawInput,
+  title: inboundTwilioMeta?.ListTitle,
+  resolved
+});
+
 
         if (!resolved) {
           return out(

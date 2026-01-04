@@ -17,6 +17,8 @@
 
 const pg = require('../../services/postgres');
 const twilioSvc = require('../../services/twilio');
+// --- Node crypto (do NOT rely on variable name "crypto" being unshadowed)
+const nodeCrypto = require('crypto');
 
 const {
   sendWhatsAppInteractiveList,
@@ -680,12 +682,17 @@ function getJobPickerSecret() {
 
 
 function sha8(s) {
-  return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
+  return nodeCrypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
 }
 
 function hmac12(secret, s) {
-  return crypto.createHmac('sha256', secret).update(String(s)).digest('hex').slice(0, 12);
+  return nodeCrypto
+    .createHmac('sha256', String(secret))
+    .update(String(s))
+    .digest('hex')
+    .slice(0, 12);
 }
+
 
 // rowId = jp:<flow>:<nonce>:jn:<jobNo>:h:<sig>
 function makeRowId({ flow, nonce, jobNo, secret }) {
@@ -1446,6 +1453,10 @@ if (!secret) {
 
   // Per-send instance
   const pickerNonce = makePickerNonce();
+console.info('[CRYPTO_DEBUG]', {
+  cryptoType: typeof crypto,
+  nodeCryptoHashFn: typeof nodeCrypto?.createHash
+});
 
   // Flow binding (ties selections to THIS confirm flow)
   const flow = sha8(String(confirmFlowId || '').trim() || `${normalizeIdentityDigits(from) || from}:${Date.now()}`);

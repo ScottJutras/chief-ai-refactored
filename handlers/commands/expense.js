@@ -882,29 +882,65 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta }) {
   // 2) Legacy Twilio ids: job_<ix>_<hash>
 const ix = legacyIndexFromTwilioToken(input);
 if (ix != null) {
-  const arr = Array.isArray(displayedJobNos) ? displayedJobNos : [];
+  const arr = Array.isArray(displayedJobNos) ? displayedJobNos.map(Number).filter(Number.isFinite) : [];
+  const opts = Array.isArray(jobOptions) ? jobOptions : [];
+  const inboundTitleRaw = String(inboundTitle || '').trim();
+  const inboundTitleNorm = normalizeListTitle(inboundTitleRaw);
 
-  // ✅ Try to extract the REAL jobNo from WhatsApp title (best-effort only)
-  let titleJobNo =
-    (typeof extractJobNoFromWhatsAppListTitle === 'function'
-      ? extractJobNoFromWhatsAppListTitle(inboundTitle)
-      : null) ?? null;
+  // A) If inbound title contains a clear jobNo (rare / best-effort), accept only if it was displayed
+  let titleJobNo = null;
+  if (typeof extractJobNoFromWhatsAppListTitle === 'function') {
+    try { titleJobNo = extractJobNoFromWhatsAppListTitle(inboundTitleRaw); } catch {}
+  } else if (typeof jobNoFromTitle === 'function') {
+    try { titleJobNo = jobNoFromTitle(inboundTitleRaw); } catch {}
+  }
 
-  // If extraction returned something bogus (eg 1556 from "#1 1556 ..."), do NOT reject.
-  // Just ignore and fall back to ix->displayedJobNos.
   if (titleJobNo != null) {
     const n = Number(titleJobNo);
-    if (Number.isFinite(n) && arr.length && arr.includes(n)) {
+    if (Number.isFinite(n) && arr.includes(n)) {
       return {
         ok: true,
         jobNo: n,
         meta: { mode: 'legacy_title_jobno', ix, flow, pickerNonce, displayedHash }
       };
     }
-    titleJobNo = null; // ignore and fall back
+    // ignore bogus extraction (eg 1556 from "#1 1556 ...")
+    titleJobNo = null;
   }
 
-  // ✅ Safe fallback: ix maps into displayedJobNos
+  // B) Prefer matching by the *name* in the inbound ListTitle (strip WhatsApp’s "#2 " prefix)
+  // Example inbound title: "#2 Oak Street Re-roof"  -> "oak street re-roof"
+  const strippedTitleNorm = normalizeListTitle(
+    inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim()
+  );
+
+  if (strippedTitleNorm) {
+    const candidates = opts.filter((j) => {
+      const jn = Number(j?.job_no ?? j?.jobNo);
+      if (!Number.isFinite(jn)) return false;
+      if (arr.length && !arr.includes(jn)) return false; // must have been displayed
+
+      const nameNorm = normalizeListTitle(j?.name || j?.job_name || j?.title || '');
+      if (!nameNorm) return false;
+
+      return (
+        nameNorm === strippedTitleNorm ||
+        nameNorm.includes(strippedTitleNorm) ||
+        strippedTitleNorm.includes(nameNorm)
+      );
+    });
+
+    if (candidates.length === 1) {
+      const picked = Number(candidates[0].job_no ?? candidates[0].jobNo);
+      return {
+        ok: true,
+        jobNo: picked,
+        meta: { mode: 'legacy_title_name_match', ix, flow, pickerNonce, displayedHash }
+      };
+    }
+  }
+
+  // C) Final fallback: ix maps into displayedJobNos (safe but may be wrong on some clients)
   if (!arr.length || ix > arr.length) {
     return { ok: false, reason: 'legacy_ix_out_of_range' };
   }

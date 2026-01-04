@@ -2439,25 +2439,62 @@ async function handleExpense(
         }
 
         if (resolved.kind === 'overhead') {
-          const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+         // ✅ Ensure confirm draft exists (rebuild from pickPA.confirmDraft if needed)
+let confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
-          if (confirmPA?.payload?.draft) {
-            await upsertPA({
-              ownerId,
-              userId: from,
-              kind: PA_KIND_CONFIRM,
-              payload: {
-                ...confirmPA.payload,
-                draft: { ...(confirmPA.payload.draft || {}), jobName: 'Overhead', jobSource: 'overhead', job_no: null }
-              },
-              ttlSeconds: PA_TTL_SEC
-            });
-          }
+if (!confirmPA?.payload?.draft) {
+  const fallbackDraft = pickPA?.payload?.confirmDraft || null;
 
-          try {
-            await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-          } catch {}
-          return await resendConfirmExpense({ from, ownerId, tz });
+  if (fallbackDraft) {
+    await upsertPA({
+      ownerId,
+      userId: from,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        draft: fallbackDraft,
+        sourceMsgId: stableMsgId,
+        type: 'expense'
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+  }
+}
+
+// ✅ Update confirm draft with picked job (even if it was rebuilt)
+if (confirmPA?.payload?.draft) {
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      ...(confirmPA.payload || {}),
+      draft: {
+        ...(confirmPA.payload.draft || {}),
+        jobName: getJobDisplayName(chosen),
+        jobSource: 'picked',
+        job_no: Number(chosen.job_no)
+      }
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
+} else {
+  // If we STILL can’t rebuild, treat it as stale and re-send picker
+  return await rejectAndResendPicker({
+    from,
+    ownerId,
+    userProfile,
+    confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+    jobOptions,
+    reason: 'missing_confirm_after_pick',
+    twilioMeta: inboundTwilioMeta
+  });
+}
+
+try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+return await resendConfirmExpense({ from, ownerId, tz });
+
         }
 
         if (resolved.kind === 'job' && resolved.job?.job_no) {

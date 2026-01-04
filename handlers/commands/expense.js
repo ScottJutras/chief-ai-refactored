@@ -449,6 +449,27 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
   // ✅ 3) Final fallback: TwiML
   return out(twimlText(bodyText), false);
 }
+function extractJobNoFromWhatsAppListTitle(listTitle) {
+  // WhatsApp often formats as: "#2 Oak Street Re-roof"
+  // After our change it will be: "#2 9 Oak Street Re-roof" or "#2 4 happy street"
+  const s = String(listTitle || '').trim();
+
+  // Look for "#<rowIndex> <jobNo> ..."
+  const m = s.match(/^#\s*\d+\s+(\d{1,10})\b/);
+  if (m?.[1]) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // Also accept "9 Oak Street..." (if WA ever drops the #2 prefix)
+  const m2 = s.match(/^(\d{1,10})\b/);
+  if (m2?.[1]) {
+    const n = Number(m2[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  return null;
+}
 
 
 async function resendConfirmExpense({ from, ownerId, tz }) {
@@ -866,50 +887,53 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta }) {
   }
 
   // 2) Legacy Twilio ids: job_<ix>_<hash>
-  // Only accept if inbound title matches what we sent for that index.
-  const ix = legacyIndexFromTwilioToken(input);
-  if (ix != null) {
-    if (!Array.isArray(sentRows) || !sentRows.length || ix > sentRows.length) {
-      return { ok: false, reason: 'legacy_ix_out_of_range' };
-    }
+// Twilio/WA often returns Body/ListId like "job_2_abcd1234" where 2 is a *row index* (1-based),
+// BUT WhatsApp can remap the visible row labels (your logs proved this).
+// ✅ Fix: Prefer extracting the REAL jobNo from ListTitle (we now embed it in the row title).
+// ✅ Fallback: map ix -> displayedJobNos (from the picker state).
+const ix = legacyIndexFromTwilioToken(input);
+if (ix != null) {
+  // We need the displayed jobNos mapping to avoid guessing.
+  const arr = Array.isArray(displayedJobNos) ? displayedJobNos : [];
 
-    const expectedRow = sentRows[ix - 1]; // {ix, jobNo, name, title}
-    const expectedTitleNorm = normalizeListTitle(expectedRow?.title || '');
+  // ✅ PRIMARY: parse REAL jobNo from WhatsApp's visible title
+  // Expected after your new row-title format: "#2 9 Oak Street Re-roof" OR "9 Oak Street Re-roof"
+  const titleJobNo =
+    (typeof extractJobNoFromWhatsAppListTitle === 'function' && extractJobNoFromWhatsAppListTitle(inboundTitle)) ||
+    null;
 
-    // Strong validation:
-    // - if inbound title contains "Job #<n>", it MUST match expected jobNo
-    const titleJobNo = jobNoFromTitle(inboundTitle);
-    if (titleJobNo != null && Number(titleJobNo) !== Number(expectedRow.jobNo)) {
-      return { ok: false, reason: 'legacy_title_jobno_mismatch' };
-    }
-
-    // Otherwise require normalized title match (prefix match ok because WhatsApp truncates)
-    // inboundTitle in your logs looks like "#2 Oak Street Re-roof", so also validate by name containment.
-    const expectedNameNorm = normalizeListTitle(expectedRow?.name || '');
-
-    const titleOk =
-      (expectedTitleNorm && inboundTitleNorm && expectedTitleNorm.startsWith(inboundTitleNorm)) ||
-      (expectedTitleNorm && inboundTitleNorm && inboundTitleNorm.startsWith(expectedTitleNorm)) ||
-      (expectedNameNorm && inboundTitleNorm && inboundTitleNorm.includes(expectedNameNorm)) ||
-      (expectedNameNorm && inboundTitleNorm && expectedNameNorm.includes(inboundTitleNorm));
-
-    if (!titleOk) {
-      return { ok: false, reason: 'legacy_title_mismatch' };
-    }
-
-    // Also ensure jobNo was actually displayed
-    if (!Array.isArray(displayedJobNos) || !displayedJobNos.includes(Number(expectedRow.jobNo))) {
-      return { ok: false, reason: 'legacy_job_not_in_displayed' };
+  if (titleJobNo != null) {
+    // Must be one of the jobs we displayed in this picker instance
+    if (!arr.length || !arr.includes(Number(titleJobNo))) {
+      return { ok: false, reason: 'legacy_jobno_not_in_displayed' };
     }
 
     return {
       ok: true,
-      jobNo: Number(expectedRow.jobNo),
-      meta: { mode: 'legacy_index', ix, flow, pickerNonce, displayedHash }
+      jobNo: Number(titleJobNo),
+      meta: { mode: 'legacy_title_jobno', ix, flow, pickerNonce, displayedHash }
     };
   }
 
-  return { ok: false, reason: 'unrecognized_row_id' };
+  // ✅ SECONDARY: fall back to ix -> displayedJobNos mapping (still safe)
+  if (!arr.length || ix > arr.length) {
+    return { ok: false, reason: 'legacy_ix_out_of_range' };
+  }
+
+  const mappedJobNo = Number(arr[ix - 1]);
+  if (!Number.isFinite(mappedJobNo)) {
+    return { ok: false, reason: 'legacy_bad_mapped_jobno' };
+  }
+
+  return {
+    ok: true,
+    jobNo: mappedJobNo,
+    meta: { mode: 'legacy_index_fallback', ix, flow, pickerNonce, displayedHash }
+  };
+}
+
+return { ok: false, reason: 'unrecognized_row_id' };
+
 }
 
 
@@ -1619,11 +1643,15 @@ async function sendJobPickList({
   const flow = sha8(String(confirmFlowId || `${ownerId}:${from}:${Date.now()}`));
 
   const sentRows = slice.map((j, idx) => {
-    const jobNo = Number(j.job_no);
-    const name = sanitizeJobLabel(j.name);
-    const title = `Job #${jobNo} — ${name}`.slice(0, 24);
-    return { ix: idx + 1, jobNo, name, title };
-  });
+  const jobNo = Number(j.job_no);
+  const name = sanitizeJobLabel(j.name);
+
+  // ✅ CRITICAL: embed REAL jobNo as the first token in the visible label
+  const title = `${jobNo} ${name}`.slice(0, 24);
+
+  return { ix: idx + 1, jobNo, name, title };
+});
+
 
   // ✅ store minimal confirmDraft snapshot for E5 recovery
   const confirmDraftSnap = pickConfirmDraftSnapshot(confirmDraft);
@@ -1661,14 +1689,16 @@ async function sendJobPickList({
 
   const secret = process.env.JOB_PICKER_HMAC_SECRET || 'dev-secret-change-me';
   const rows = slice.map((j) => {
-    const jobNo = Number(j.job_no);
-    const name = sanitizeJobLabel(j.name);
-    return {
-      id: makeRowId({ flow, nonce: pickerNonce, jobNo, secret }), // jp:...
-      title: `Job #${jobNo} — ${name}`.slice(0, 24),
-      description: name.slice(0, 72)
-    };
-  });
+  const jobNo = Number(j.job_no);
+  const name = sanitizeJobLabel(j.name);
+
+  return {
+    id: makeRowId({ flow, nonce: pickerNonce, jobNo, secret }), // jp:...
+    title: `${jobNo} ${name}`.slice(0, 24),                     // ✅ embed jobNo
+    description: `Job #${jobNo} — ${name}`.slice(0, 72)         // optional, but helps visibility
+  };
+});
+
 
   const bodyText = context === 'expense_jobpick'
     ? 'Which job is this expense for?'

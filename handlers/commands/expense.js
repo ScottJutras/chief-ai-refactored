@@ -449,27 +449,20 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
   // ✅ 3) Final fallback: TwiML
   return out(twimlText(bodyText), false);
 }
-function extractJobNoFromWhatsAppListTitle(listTitle) {
-  // WhatsApp often formats as: "#2 Oak Street Re-roof"
-  // After our change it will be: "#2 9 Oak Street Re-roof" or "#2 4 happy street"
-  const s = String(listTitle || '').trim();
+function extractJobNoFromWhatsAppListTitle(title) {
+  const s = String(title || '').trim();
 
-  // Look for "#<rowIndex> <jobNo> ..."
-  const m = s.match(/^#\s*\d+\s+(\d{1,10})\b/);
-  if (m?.[1]) {
-    const n = Number(m[1]);
-    return Number.isFinite(n) ? n : null;
-  }
+  // Prefer a leading "#<n>" (WhatsApp often shows this)
+  let m = s.match(/^#\s*(\d{1,6})\b/);
+  if (m) return Number(m[1]);
 
-  // Also accept "9 Oak Street..." (if WA ever drops the #2 prefix)
-  const m2 = s.match(/^(\d{1,10})\b/);
-  if (m2?.[1]) {
-    const n = Number(m2[1]);
-    return Number.isFinite(n) ? n : null;
-  }
+  // Or a leading "<n> " (your new row titles are "9 Oak Street...")
+  m = s.match(/^(\d{1,6})\b/);
+  if (m) return Number(m[1]);
 
   return null;
 }
+
 
 
 async function resendConfirmExpense({ from, ownerId, tz }) {
@@ -887,35 +880,31 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta }) {
   }
 
   // 2) Legacy Twilio ids: job_<ix>_<hash>
-// Twilio/WA often returns Body/ListId like "job_2_abcd1234" where 2 is a *row index* (1-based),
-// BUT WhatsApp can remap the visible row labels (your logs proved this).
-// ✅ Fix: Prefer extracting the REAL jobNo from ListTitle (we now embed it in the row title).
-// ✅ Fallback: map ix -> displayedJobNos (from the picker state).
 const ix = legacyIndexFromTwilioToken(input);
 if (ix != null) {
-  // We need the displayed jobNos mapping to avoid guessing.
   const arr = Array.isArray(displayedJobNos) ? displayedJobNos : [];
 
-  // ✅ PRIMARY: parse REAL jobNo from WhatsApp's visible title
-  // Expected after your new row-title format: "#2 9 Oak Street Re-roof" OR "9 Oak Street Re-roof"
-  const titleJobNo =
-    (typeof extractJobNoFromWhatsAppListTitle === 'function' && extractJobNoFromWhatsAppListTitle(inboundTitle)) ||
-    null;
+  // ✅ Try to extract the REAL jobNo from WhatsApp title (best-effort only)
+  let titleJobNo =
+    (typeof extractJobNoFromWhatsAppListTitle === 'function'
+      ? extractJobNoFromWhatsAppListTitle(inboundTitle)
+      : null) ?? null;
 
+  // If extraction returned something bogus (eg 1556 from "#1 1556 ..."), do NOT reject.
+  // Just ignore and fall back to ix->displayedJobNos.
   if (titleJobNo != null) {
-    // Must be one of the jobs we displayed in this picker instance
-    if (!arr.length || !arr.includes(Number(titleJobNo))) {
-      return { ok: false, reason: 'legacy_jobno_not_in_displayed' };
+    const n = Number(titleJobNo);
+    if (Number.isFinite(n) && arr.length && arr.includes(n)) {
+      return {
+        ok: true,
+        jobNo: n,
+        meta: { mode: 'legacy_title_jobno', ix, flow, pickerNonce, displayedHash }
+      };
     }
-
-    return {
-      ok: true,
-      jobNo: Number(titleJobNo),
-      meta: { mode: 'legacy_title_jobno', ix, flow, pickerNonce, displayedHash }
-    };
+    titleJobNo = null; // ignore and fall back
   }
 
-  // ✅ SECONDARY: fall back to ix -> displayedJobNos mapping (still safe)
+  // ✅ Safe fallback: ix maps into displayedJobNos
   if (!arr.length || ix > arr.length) {
     return { ok: false, reason: 'legacy_ix_out_of_range' };
   }
@@ -933,6 +922,7 @@ if (ix != null) {
 }
 
 return { ok: false, reason: 'unrecognized_row_id' };
+
 
 }
 

@@ -673,6 +673,12 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
 
   return lines.join('\n');
 }
+function getJobPickerSecret() {
+  const s = process.env.JOB_PICKER_HMAC_SECRET;
+  return s && String(s).trim() ? String(s).trim() : null;
+}
+
+
 function sha8(s) {
   return crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 8);
 }
@@ -704,7 +710,12 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta }) {
   const parsed = parseRowId(input);
   if (!parsed) return { ok: false, reason: 'bad_row_id' };
 
-  const secret = getJobPickerSecret();
+  const secret = String(process.env.JOB_PICKER_HMAC_SECRET || '').trim() || null;
+if (!secret) {
+  console.warn('[JOB_PICK] missing JOB_PICKER_HMAC_SECRET; falling back to text picker');
+  return out(twimlText(buildTextJobPrompt(clean, p, ps)), false);
+}
+
   if (!secret) return { ok: false, reason: 'missing_secret' };
 
   const base = `${parsed.flow}|${parsed.nonce}|${parsed.jobNo}`;
@@ -1422,7 +1433,12 @@ async function sendJobPickList({
 
   const hasMore = start + ps < clean.length;
 
-  const secret = getJobPickerSecret();
+  const secret = String(process.env.JOB_PICKER_HMAC_SECRET || '').trim() || null;
+if (!secret) {
+  console.warn('[JOB_PICK] missing JOB_PICKER_HMAC_SECRET; falling back to text picker');
+  return out(twimlText(buildTextJobPrompt(clean, p, ps)), false);
+}
+
   if (!secret) {
     console.warn('[JOB_PICK] missing JOB_PICKER_HMAC_SECRET; falling back to text list (safe)');
     return out(twimlText(buildTextJobPrompt(clean, p, ps)), false);

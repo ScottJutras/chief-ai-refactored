@@ -765,6 +765,175 @@ async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
 
   return null;
 }
+/* ---------------- Active job persistence (expense.js) ---------------- */
+/**
+ * Best-effort persist active job for this identity.
+ *
+ * Prefers:
+ *  - pg.setActiveJobForIdentity(ownerDigits, identityDigits, jobUuid|null, jobName|null)
+ *  - pg.setActiveJob(ownerDigits, identityDigits, jobRef)   (jobRef = jobName OR job_no)
+ *  - SQL fallback using `query` (NOT pg.query)
+ *
+ * Rules:
+ *  - NEVER persist picker tokens (jobno_/jobix_/job_<ix>_<nonce>/#123)
+ *  - NEVER write non-UUID into *_job_id uuid columns
+ *  - identity = normalizeIdentityDigits(fromPhone) (aligns with pg.getActiveJobForIdentity usage)
+ */
+async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, jobRow, jobNameFallback }) {
+  const owner = normalizeIdentityDigits(ownerId);
+  const identity =
+    normalizeIdentityDigits(fromPhone) ||
+    normalizeIdentityDigits(userProfile?.phone_e164) ||
+    normalizeIdentityDigits(userProfile?.phone) ||
+    normalizeIdentityDigits(userProfile?.from) ||
+    normalizeIdentityDigits(userProfile?.user_id) ||
+    normalizeIdentityDigits(userProfile?.id) ||
+    normalizeIdentityDigits(userProfile?.userId) ||
+    null;
+
+  if (!owner || !identity) {
+    console.warn('[JOB] persistActiveJobBestEffort: missing owner/identity', { ownerId, identity });
+    return false;
+  }
+
+  const isBadJobNameToken = (s) => {
+    const t = String(s || '').trim();
+    if (!t) return true;
+    const lc = t.toLowerCase();
+    if (/^jobix_\d+$/i.test(lc)) return true;
+    if (/^jobno_\d+$/i.test(lc)) return true;
+    if (/^job_\d+_[0-9a-z]+$/i.test(lc)) return true;
+    if (/^#\s*\d+\b/.test(lc)) return true;
+    if (/^ix_\d+$/i.test(lc)) return true;
+    return false;
+  };
+
+  const rawId = jobRow?.id ?? jobRow?.job_id ?? jobRow?.jobId ?? null;
+  const rawJobNo = jobRow?.job_no ?? jobRow?.jobNo ?? null;
+
+  const rawNameRow =
+    typeof sanitizeJobLabel === 'function'
+      ? sanitizeJobLabel(jobRow?.name || jobRow?.job_name || jobRow?.jobName || '')
+      : String(jobRow?.name || jobRow?.job_name || jobRow?.jobName || '').trim();
+
+  const rawNameFallback =
+    typeof sanitizeJobLabel === 'function'
+      ? sanitizeJobLabel(jobNameFallback || '')
+      : String(jobNameFallback || '').trim();
+
+  const jobUuid = rawId && looksLikeUuid(rawId) ? String(rawId) : null;
+  const jobNo = rawJobNo != null && Number.isFinite(Number(rawJobNo)) ? Number(rawJobNo) : null;
+
+  const jobName =
+    (rawNameRow && !isBadJobNameToken(rawNameRow) ? rawNameRow : null) ||
+    (rawNameFallback && !isBadJobNameToken(rawNameFallback) ? rawNameFallback : null) ||
+    null;
+
+  // No junk persistence
+  if (!jobUuid && jobNo == null && !jobName) return false;
+
+  // 1) Canonical identity-based setter
+  if (typeof pg.setActiveJobForIdentity === 'function') {
+    try {
+      await pg.setActiveJobForIdentity(owner, String(identity), jobUuid || null, jobName || null);
+      return true;
+    } catch (e) {
+      console.warn('[JOB] pg.setActiveJobForIdentity failed:', e?.message);
+    }
+  }
+
+  // 2) setActiveJob(owner, identity, jobRef) where jobRef is human ref (name or job_no)
+  const jobRef = jobName || (jobNo != null ? String(jobNo) : null);
+  if (typeof pg.setActiveJob === 'function' && jobRef) {
+    try {
+      await pg.setActiveJob(owner, String(identity), String(jobRef));
+      return true;
+    } catch (e) {
+      console.warn('[JOB] pg.setActiveJob failed:', e?.message);
+    }
+  }
+
+  // 3) SQL fallback using `query` (NOT pg.query)
+  if (typeof query === 'function') {
+    // Only write UUIDs into uuid columns
+    const jobUuidOrNull = jobUuid || null;
+    const jobNameOrEmpty = jobName || '';
+
+    const sqlAttempts = [
+      {
+        label: 'public.users',
+        sql: `UPDATE public.users
+                SET active_job_id = $3::uuid,
+                    active_job_name = NULLIF($4,''),
+                    updated_at = NOW()
+              WHERE owner_id = $1 AND user_id = $2`
+      },
+      {
+        label: 'public.user_profiles',
+        sql: `UPDATE public.user_profiles
+                SET active_job_id = $3::uuid,
+                    active_job_name = NULLIF($4,''),
+                    updated_at = NOW()
+              WHERE owner_id = $1 AND user_id = $2`
+      },
+      {
+        label: 'public.memberships',
+        sql: `UPDATE public.memberships
+                SET active_job_id = $3::uuid,
+                    active_job_name = NULLIF($4,''),
+                    updated_at = NOW()
+              WHERE owner_id = $1 AND user_id = $2`
+      }
+    ];
+
+    // If we don't have a uuid, skip uuid writes; only set name
+    const sqlNameOnlyAttempts = [
+      {
+        label: 'public.users(name-only)',
+        sql: `UPDATE public.users
+                SET active_job_name = NULLIF($3,''),
+                    updated_at = NOW()
+              WHERE owner_id = $1 AND user_id = $2`
+      },
+      {
+        label: 'public.user_profiles(name-only)',
+        sql: `UPDATE public.user_profiles
+                SET active_job_name = NULLIF($3,''),
+                    updated_at = NOW()
+              WHERE owner_id = $1 AND user_id = $2`
+      },
+      {
+        label: 'public.memberships(name-only)',
+        sql: `UPDATE public.memberships
+                SET active_job_name = NULLIF($3,''),
+                    updated_at = NOW()
+              WHERE owner_id = $1 AND user_id = $2`
+      }
+    ];
+
+    try {
+      if (jobUuidOrNull) {
+        for (const a of sqlAttempts) {
+          try {
+            const r = await query(a.sql, [owner, String(identity), jobUuidOrNull, jobNameOrEmpty]);
+            if (r?.rowCount) return true;
+          } catch {}
+        }
+      } else if (jobNameOrEmpty) {
+        for (const a of sqlNameOnlyAttempts) {
+          try {
+            const r = await query(a.sql, [owner, String(identity), jobNameOrEmpty]);
+            if (r?.rowCount) return true;
+          } catch {}
+        }
+      }
+    } catch (e) {
+      console.warn('[JOB] SQL fallback persist failed:', e?.message);
+    }
+  }
+
+  return false;
+}
 
 /* ---------------- Job list + picker mapping (JOB_NO-FIRST) ---------------- */
 
@@ -943,6 +1112,8 @@ function coerceJobixToJobno(raw, displayedJobNos) {
 
   return `jobno_${Number(jobNo)}`;
 }
+
+
 /**
  * Deterministic resolver (JOB_NO-first) with belt & suspenders:
  * - Accepts jobno_<job_no>, job_<n>_<hash>, jobix_<ix>, "#1556", "J1556", "1556", "1" (page-local), name.
@@ -1076,18 +1247,29 @@ function buildTextJobPrompt(jobOptions, page, pageSize) {
   const slice = (jobOptions || []).slice(start, start + ps);
 
   const lines = slice.map((j, i) => {
-    const name = String(j?.name || 'Untitled Job').trim();
+    const name = sanitizeJobLabel(String(j?.name || 'Untitled Job').trim());
     const jobNo = j?.job_no != null ? Number(j.job_no) : null;
-    const prefix = jobNo != null && Number.isFinite(jobNo) ? `#${jobNo} ` : '';
-    return `${i + 1}) ${prefix}${name}`;
+
+    // ✅ Make the number semantics unambiguous:
+    // i+1 is the *row index*, jobNo is the *real job number*
+    if (jobNo != null && Number.isFinite(jobNo)) {
+      return `${i + 1}) Job #${jobNo} — ${name}`;
+    }
+    return `${i + 1}) ${name}`;
   });
 
   const hasMore = start + ps < (jobOptions || []).length;
   const more = hasMore ? `\nReply "more" for more jobs.` : '';
 
-  return `Which job is this expense for?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
+  return (
+    `Which job is this expense for?\n\n` +
+    `${lines.join('\n')}\n\n` +
+    `Reply with a number, job name, or "Overhead".${more}\n` +
+    `Tip: reply "change job" to see the picker.`
+  );
 }
 exports.buildTextJobPrompt = buildTextJobPrompt;
+
 
 function looksLikeNewExpenseText(s = '') {
   const lc = String(s || '').trim().toLowerCase();
@@ -1118,7 +1300,14 @@ function parseTwilioJobIndexToken(s) {
   return Number.isFinite(ix) && ix >= 1 ? ix : null;
 }
 
-async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pageSize = 8 }) {
+async function sendJobPickerOrFallback({
+  from,
+  ownerId,
+  jobOptions,
+  page = 0,
+  pageSize = 8,
+  context = 'expense_jobpick' // set 'revenue_jobpick' in revenue.js
+}) {
   const to = waTo(from);
   const JOBS_PER_PAGE = Math.min(8, Math.max(1, Number(pageSize || 8)));
   const p = Math.max(0, Number(page || 0));
@@ -1145,69 +1334,82 @@ async function sendJobPickerOrFallback({ from, ownerId, jobOptions, page = 0, pa
 
   const slice = clean.slice(start, start + JOBS_PER_PAGE);
 
+  // The actual job_nos shown on this page (used for mapping index -> job_no)
   const displayedJobNos = slice
     .map((j) => (j?.job_no != null ? Number(j.job_no) : null))
     .filter((n) => Number.isFinite(n));
 
   const hasMore = start + JOBS_PER_PAGE < clean.length;
 
+  // Nonce for this picker instance
   const pickerNonce = makePickerNonce();
 
-await upsertPA({
-  ownerId,
-  userId: from,
-  kind: PA_KIND_PICK_JOB,
-  payload: {
-    jobOptions: clean,
-    page: p,
-    pageSize: JOBS_PER_PAGE,
-    hasMore,
-    displayedJobNos,
-    shownAt: Date.now(),
-    pickerNonce,              // ✅ NEW
-    context: 'expense_jobpick' // ✅ NEW (use 'revenue_jobpick' in revenue.js)
-  },
-  ttlSeconds: PA_TTL_SEC
-});
+  // Persist picker state BEFORE sending UI
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_PICK_JOB,
+    payload: {
+      jobOptions: clean,
+      page: p,
+      pageSize: JOBS_PER_PAGE,
+      hasMore,
+      displayedJobNos,
+      shownAt: Date.now(),
+      pickerNonce,
+      context
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
 
-
+  // If interactive lists are disabled or no WA destination, send text prompt
   if (!ENABLE_INTERACTIVE_LIST || !to) {
     return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
   }
 
-  const rows = slice.map((j) => {
-    const full = sanitizeJobLabel(j?.name || j?.job_name || 'Untitled Job');
-    const jobNo = Number(j?.job_no);
-    const stamped = `J${jobNo} ${full}`;
+  // ✅ IMPORTANT:
+  // - row.id must be index-based for Twilio (job_<ix>_<nonce>)
+  // - title must show REAL job_no to avoid “#2 vs Job #2” confusion
+  const rows = slice.map((j, idx) => {
+    const jobNo = Number(j.job_no);
+    const name = sanitizeJobLabel(j.name);
 
     return {
-      id: `jobno_${jobNo}`,
-      title: stamped.slice(0, 24),
-      description: full.slice(0, 72)
+      id: `job_${idx + 1}_${pickerNonce}`,                   // index-based
+      title: `Job #${jobNo} — ${name}`.slice(0, 24),         // show real job_no
+      description: name.slice(0, 72)
     };
   });
 
-  rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
-  if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: 'Show next page' });
-
   const bodyText =
-    `Pick a job (${start + 1}-${Math.min(start + JOBS_PER_PAGE, clean.length)} of ${clean.length}).` +
-    `\n\nTip: You can also reply with a number (like "1").`;
+    context === 'revenue_jobpick'
+      ? 'Which job is this revenue for?'
+      : 'Which job is this expense for?';
 
-  try {
-    await sendWhatsAppInteractiveList({
-      to,
-      bodyText,
-      buttonText: 'Pick a job',
-      sections: [{ title: 'Active Jobs', rows }]
-    });
+  const sections = [
+    {
+      title: 'Jobs',
+      rows
+    }
+  ];
+console.info('[JOB_PICK_SEND]', {
+  context,
+  page: p,
+  pickerNonce,
+  displayedJobNos,
+  rows: rows.slice(0, 8).map(r => ({ id: r.id, title: r.title }))
+});
 
-    return out(twimlEmpty(), true);
-  } catch (e) {
-    console.warn('[JOB_PICKER] interactive list failed; falling back:', e?.message);
-    return out(twimlText(buildTextJobPrompt(clean, p, JOBS_PER_PAGE)), false);
-  }
+
+  // Your twilio helper expects JSON sections
+  return await sendWhatsAppInteractiveList({
+    to,
+    bodyText,
+    buttonText: 'Pick job',
+    sections
+  });
 }
+
 
 /* ---------------- Active job resolution ---------------- */
 
@@ -1678,6 +1880,19 @@ if (pickPA?.payload?.jobOptions) {
 
     if (resolved.kind === 'job' && resolved.job?.job_no) {
       const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+      // ✅ Persist active job immediately when user picks it (so Change Job sticks)
+try {
+  await persistActiveJobBestEffort({
+    ownerId,
+    userProfile,
+    fromPhone: from,
+    jobRow: resolved.job,               // has job_no, name, maybe id(uuid)
+    jobNameFallback: resolved.job?.name // safety
+  });
+} catch (e) {
+  console.warn('[EXPENSE] persistActiveJobBestEffort (pick) failed (ignored):', e?.message);
+}
+
       const pickedJobName = getJobDisplayName(resolved.job);
 
       if (confirmPA?.payload?.draft) {
@@ -1960,12 +2175,19 @@ if (confirmPA?.payload?.draft) {
     );
   }
 
-  // Persist active job after success (even if duplicate)
-  try {
-    await persistActiveJobFromExpense({ ownerId, fromPhone: from, userProfile, jobNo, jobName });
-  } catch (e) {
-    console.warn('[EXPENSE] persistActiveJobFromExpense failed (ignored):', e?.message);
-  }
+  // ✅ Persist active job after success (aligned with identity-based lookup)
+try {
+  await persistActiveJobBestEffort({
+    ownerId,
+    userProfile,
+    fromPhone: from,
+    jobRow: { id: maybeJobId || null, job_no: jobNo, name: jobName },
+    jobNameFallback: jobName
+  });
+} catch (e) {
+  console.warn('[EXPENSE] persistActiveJobBestEffort (post-insert) failed (ignored):', e?.message);
+}
+
 
   // ✅ best available source text to recover item if needed
   const srcText =

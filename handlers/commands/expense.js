@@ -260,6 +260,44 @@ async function deletePA({ ownerId, userId, kind }) {
 }
 exports.deletePA = deletePA;
 
+async function ensureConfirmPAExists({ ownerId, from, draft, sourceMsgId }) {
+  const existing = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+  if (existing?.payload?.draft) return;
+
+  await upsertPA({
+    ownerId,
+    userId: from,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      draft,
+      sourceMsgId,
+      type: 'expense'
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
+}
+function pickConfirmDraftSnapshot(d) {
+  if (!d || typeof d !== 'object') return null;
+
+  return {
+    // core confirm fields
+    amount: d.amount ?? null,
+    item: d.item ?? null,
+    store: d.store ?? null,
+    date: d.date ?? null,
+
+    // job-related
+    jobName: d.jobName ?? null,
+    jobSource: d.jobSource ?? null,
+    job_no: d.job_no ?? null,
+    job_id: d.job_id ?? null,
+
+    // helpful recovery text (short)
+    originalText: d.originalText ?? null,
+    draftText: d.draftText ?? null
+  };
+}
+
 
 /* ---------------- Trade-term correction layer ---------------- */
 
@@ -377,20 +415,42 @@ function buildActiveJobHint(jobName, jobSource) {
 }
 
 async function sendConfirmExpenseOrFallback(from, summaryLine) {
-  const sid = getExpenseConfirmTemplateSid();
   const to = waTo(from);
+  const templateSid = getExpenseConfirmTemplateSid();
 
-  if (sid && to) {
+  const bodyText =
+    `✅ Confirm expense\n${summaryLine}\n\n` +
+    `Reply: Yes / Edit / Cancel / Change Job`;
+
+  // ✅ 1) Best path: Content Template with 4 buttons in the template UI
+  // You MUST configure this template in Twilio Content Builder to include 4 quick replies:
+  // Yes, Edit, Cancel, Change Job (in that order).
+  if (to && templateSid) {
     try {
-      await sendWhatsAppTemplate({ to, templateSid: sid, summaryLine });
+      await sendWhatsAppTemplate({ to, templateSid, summaryLine });
       return out(twimlEmpty(), true);
     } catch (e) {
-      console.warn('[EXPENSE] template send failed; falling back to TwiML:', e?.message);
+      console.warn('[EXPENSE] confirm template send failed; falling back:', e?.message);
     }
   }
 
-  return out(twimlText(`✅ Confirm expense\n${summaryLine}\n\nReply: Yes / Edit / Cancel / Change Job`), false);
+  // ✅ 2) Fallback path: persistentAction supports only 3 in our twilio.js wrapper.
+  // We preserve the contract by keeping Change Job available as plain text instruction.
+  if (to) {
+    try {
+      await sendQuickReply(to, `✅ Confirm expense\n${summaryLine}`, ['Yes', 'Edit', 'Cancel']);
+      await sendWhatsApp(to, `🔁 To change the job, reply: "Change Job"`);
+      return out(twimlEmpty(), true);
+    } catch (e2) {
+      console.warn('[EXPENSE] quick replies failed; falling back to TwiML:', e2?.message);
+    }
+  }
+
+  // ✅ 3) Final fallback: TwiML
+  return out(twimlText(bodyText), false);
 }
+
+
 async function resendConfirmExpense({ from, ownerId, tz }) {
   const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
   if (!confirmPA?.payload) return null;
@@ -1521,13 +1581,14 @@ async function sendJobPickList({
   jobOptions,
   page = 0,
   pageSize = 8,
-  context = 'expense_jobpick'
+  context = 'expense_jobpick',
+  confirmDraft = null // ✅ NEW
 }) {
   const to = waTo(from);
   const p = Math.max(0, Number(page) || 0);
   const ps = Math.min(8, Math.max(1, Number(pageSize) || 8));
 
-  // deterministic, job_no-first clean list (you already do something similar)
+  // deterministic, job_no-first clean list
   const seen = new Set();
   const clean = [];
   for (const j of jobOptions || []) {
@@ -1540,7 +1601,6 @@ async function sendJobPickList({
     if (seen.has(jobNo)) continue;
     seen.add(jobNo);
 
-    // keep uuid id if present
     const rawId = j?.id != null ? String(j.id) : j?.job_id != null ? String(j.job_id) : null;
     const safeUuidId = rawId && looksLikeUuid(rawId) ? rawId : null;
 
@@ -1552,19 +1612,21 @@ async function sendJobPickList({
   const start = p * ps;
   const slice = clean.slice(start, start + ps);
   const displayedJobNos = slice.map((j) => Number(j.job_no)).filter(Number.isFinite);
+  const hasMore = start + ps < clean.length;
 
   const displayedHash = sha8(displayedJobNos.join(','));
   const pickerNonce = makePickerNonce();
   const flow = sha8(String(confirmFlowId || `${ownerId}:${from}:${Date.now()}`));
 
-  // We must be able to validate legacy index tokens using ListTitle.
-  // Store what the user should have seen for each row index.
   const sentRows = slice.map((j, idx) => {
     const jobNo = Number(j.job_no);
     const name = sanitizeJobLabel(j.name);
     const title = `Job #${jobNo} — ${name}`.slice(0, 24);
     return { ix: idx + 1, jobNo, name, title };
   });
+
+  // ✅ store minimal confirmDraft snapshot for E5 recovery
+  const confirmDraftSnap = pickConfirmDraftSnapshot(confirmDraft);
 
   await upsertPA({
     ownerId,
@@ -1580,7 +1642,14 @@ async function sendJobPickList({
       displayedJobNos,
       displayedHash,
       sentAt: Date.now(),
-      sentRows // ✅ critical for correctness with legacy job_<ix> replies
+      sentRows,
+
+      // ✅ REQUIRED for handler path
+      jobOptions: clean,
+      hasMore,
+
+      // ✅ E5 recovery source
+      confirmDraft: confirmDraftSnap
     },
     ttlSeconds: PA_TTL_SEC
   });
@@ -1590,7 +1659,6 @@ async function sendJobPickList({
     return out(twimlText(buildTextJobPrompt(clean, p, ps)), false);
   }
 
-  // We *still* send signed ids (future-proof), but Twilio may return legacy ids anyway.
   const secret = process.env.JOB_PICKER_HMAC_SECRET || 'dev-secret-change-me';
   const rows = slice.map((j) => {
     const jobNo = Number(j.job_no);
@@ -1602,7 +1670,10 @@ async function sendJobPickList({
     };
   });
 
-  const bodyText = context === 'revenue_jobpick' ? 'Which job is this revenue for?' : 'Which job is this expense for?';
+  const bodyText = context === 'expense_jobpick'
+    ? 'Which job is this expense for?'
+    : 'Which job is this expense for?';
+
   const sections = [{ title: 'Jobs', rows }];
 
   console.info('[JOB_PICK_SEND]', {
@@ -1623,6 +1694,7 @@ async function sendJobPickList({
     sections
   });
 }
+
 
 
 
@@ -1965,311 +2037,290 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
     /* ---- 1) Awaiting job pick ---- */
-    const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
 
-    function looksLikeJobPickerAnswer(raw = '') {
-      const s = String(raw || '').trim();
-      if (!s) return false;
+if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payload.jobOptions.length) {
+  const tok = normalizeDecisionToken(input);
+  const rawInput = String(input || '').trim();
 
-      if (/^(overhead|oh)$/i.test(s)) return true;
-      if (/^more(\s+jobs)?…?$/i.test(s)) return true;
+  // ✅ use stored picker state ONLY
+  const jobOptions = pickPA.payload.jobOptions;
+  const page = Number(pickPA.payload.page || 0) || 0;
+  const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
+  const hasMore = !!pickPA.payload.hasMore;
 
-      // Signed row ids (new)
-      if (/^jp:[0-9a-f]{8}:/i.test(s)) return true;
+  const flow = String(pickPA.payload.flow || '').trim() || null;
+  const confirmFlowId = String(pickPA.payload.confirmFlowId || '').trim() || null;
+  const sentAt = Number(pickPA.payload.sentAt || 0) || 0;
+  const pickerNonce = pickPA.payload.pickerNonce || null;
+  const displayedHash = pickPA.payload.displayedHash || null;
 
-      // Legacy Twilio list row ids
-      if (/^job_\d{1,10}_[0-9a-z]+$/i.test(s)) return true;
-
-      // Manual/typed forms
-      if (/^\d{1,10}$/.test(s)) return true;
-      if (/^jobno_\d{1,10}$/i.test(s)) return true;
-      if (/^jobix_\d{1,10}$/i.test(s)) return true;
-      if (/^#\s*\d{1,10}\b/.test(s)) return true;
-      if (/\bJ\d{1,10}\b/i.test(s)) return true;
-
-      // Job name-ish (avoid decision tokens)
-      if (/^[a-z0-9][a-z0-9 _.'-]{2,}$/i.test(s)) {
-        const lc = s.toLowerCase();
-        if (/^(yes|no|edit|cancel|stop|change job|switch job|pick job|active jobs|show jobs|jobs)$/i.test(lc)) return false;
-        return true;
-      }
-
-      return false;
+  // If user sent a brand new expense while waiting for job pick, clear state and continue parsing.
+  if (looksLikeNewExpenseText(input)) {
+    console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+    try { await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM }); } catch {}
+  } else {
+    // Stale picker protection → resend page 0
+    if (!sentAt || (Date.now() - sentAt) > (PA_TTL_SEC * 1000)) {
+      return await sendJobPickList({
+        from,
+        ownerId,
+        userProfile,
+        confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+        jobOptions,
+        page: 0,
+        pageSize: 8,
+        context: 'expense_jobpick',
+        confirmDraft: pickPA.payload.confirmDraft || null
+      });
     }
 
-    if (pickPA?.payload?.jobOptions) {
-      // If user sent a brand new expense while waiting for job pick, clear state and continue parsing.
-      if (looksLikeNewExpenseText(input)) {
-        console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
-        try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
-        try { await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM }); } catch {}
+    // Observability
+    console.info('[JOB_PICK_DEBUG]', {
+      input,
+      rawInput,
+      tok,
+      flow,
+      confirmFlowId,
+      sentAt,
+      page,
+      pageSize,
+      pickerNonce,
+      displayedHash,
+      displayedJobNos: (pickPA.payload.displayedJobNos || []).slice(0, 8),
+      inbound: {
+        MessageSid: inboundTwilioMeta?.MessageSid || null,
+        OriginalRepliedMessageSid: inboundTwilioMeta?.OriginalRepliedMessageSid || null,
+        ListId: inboundTwilioMeta?.ListId || null,
+        ListTitle: inboundTwilioMeta?.ListTitle || null
+      }
+    });
+
+    // Optional: remember last inbound picker token (safe, no schema change)
+    try {
+      await upsertPA({
+        ownerId,
+        userId: from,
+        kind: PA_KIND_PICK_JOB,
+        payload: { ...(pickPA.payload || {}), lastInboundTextRaw: input, lastInboundText: rawInput },
+        ttlSeconds: PA_TTL_SEC
+      });
+    } catch {}
+
+    // Helper: detect picker-ish answers
+    const looksLikePickerTap =
+      /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
+      /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+      !!inboundTwilioMeta?.ListTitle ||
+      !!inboundTwilioMeta?.ListId;
+
+    // change job → resend same page
+    if (tok === 'change_job') {
+      return await sendJobPickList({
+        from,
+        ownerId,
+        userProfile,
+        confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+        jobOptions,
+        page,
+        pageSize,
+        context: 'expense_jobpick',
+        confirmDraft: pickPA.payload.confirmDraft || null
+      });
+    }
+
+    // more → next page
+    if (tok === 'more') {
+      if (!hasMore) {
+        return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
+      }
+      return await sendJobPickList({
+        from,
+        ownerId,
+        userProfile,
+        confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+        jobOptions,
+        page: page + 1,
+        pageSize,
+        context: 'expense_jobpick',
+        confirmDraft: pickPA.payload.confirmDraft || null
+      });
+    }
+
+    // ✅ HARD GUARD: if confirm PA is missing but we got a picker reply, re-bootstrap from pickPA.confirmDraft
+    let confirmPAForGuard = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
+    if (!confirmPAForGuard?.payload?.draft && (looksLikePickerTap || looksLikeJobPickerAnswer(rawInput))) {
+      const fallbackDraft = pickPA?.payload?.confirmDraft || null;
+
+      if (fallbackDraft) {
+        await ensureConfirmPAExists({ ownerId, from, draft: fallbackDraft, sourceMsgId: stableMsgId });
+        confirmPAForGuard = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
       } else {
-        const tok = normalizeDecisionToken(input);
-
-        const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
-        const page = Number(pickPA.payload.page || 0) || 0;
-        const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
-        const hasMore = !!pickPA.payload.hasMore;
-
-        // New picker state
-        const flow = String(pickPA.payload.flow || '').trim() || null;
-        const confirmFlowId = String(pickPA.payload.confirmFlowId || '').trim() || null;
-        const sentAt = Number(pickPA.payload.sentAt || 0) || 0;
-        const pickerNonce = pickPA.payload.pickerNonce || null;
-        const displayedHash = pickPA.payload.displayedHash || null;
-
-        // Stale picker protection
-        if (!sentAt || (Date.now() - sentAt) > (PA_TTL_SEC * 1000)) {
-          return await sendJobPickList({
-            from,
-            ownerId,
-            userProfile,
-            confirmFlowId: confirmFlowId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-            jobOptions,
-            page: 0,
-            pageSize: 8,
-            context: 'expense_jobpick'
-          });
-        }
-
-        let rawInput = String(input || '').trim();
-
-        // Observability: what arrived + what picker state we think is active
-        console.info('[JOB_PICK_DEBUG]', {
-          input,
-          rawInput,
-          tok,
-          flow,
-          confirmFlowId,
-          sentAt,
+        // Can't reconstruct → resend picker
+        return await sendJobPickList({
+          from,
+          ownerId,
+          userProfile,
+          confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+          jobOptions,
           page,
           pageSize,
-          pickerNonce,
-          displayedHash,
-          displayedJobNos: (pickPA.payload.displayedJobNos || []).slice(0, 8),
-          inbound: {
-            MessageSid: inboundTwilioMeta?.MessageSid || null,
-            OriginalRepliedMessageSid: inboundTwilioMeta?.OriginalRepliedMessageSid || null,
-            ListId: inboundTwilioMeta?.ListId || null,
-            ListTitle: inboundTwilioMeta?.ListTitle || null
-          }
+          context: 'expense_jobpick'
         });
-
-        // Optional: remember last inbound picker token
-        try {
-          await upsertPA({
-            ownerId,
-            userId: from,
-            kind: PA_KIND_PICK_JOB,
-            payload: { ...(pickPA.payload || {}), lastInboundTextRaw: input, lastInboundText: rawInput },
-            ttlSeconds: PA_TTL_SEC
-          });
-        } catch {}
-
-        // change job → resend same page
-        if (tok === 'change_job') {
-          return await sendJobPickList({
-            from,
-            ownerId,
-            userProfile,
-            confirmFlowId: confirmFlowId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-            jobOptions,
-            page,
-            pageSize,
-            context: 'expense_jobpick'
-          });
-        }
-
-        // more → next page
-        if (tok === 'more') {
-          if (!hasMore) {
-            return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
-          }
-          return await sendJobPickList({
-            from,
-            ownerId,
-            userProfile,
-            confirmFlowId: confirmFlowId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-            jobOptions,
-            page: page + 1,
-            pageSize,
-            context: 'expense_jobpick'
-          });
-        }
-
-        if (!looksLikeJobPickerAnswer(rawInput)) {
-          return out(twimlText('Please reply with a job from the list, a number, job name, "Overhead", or "more".'), false);
-        }
-
-        // ----------------------------
-// 1) PICKER-TAP PATH (Twilio interactive replies)
-// ----------------------------
-const looksLikePickerTap =
-  /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
-  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-  !!inboundTwilioMeta?.ListTitle ||
-  !!inboundTwilioMeta?.ListId;
-
-if (looksLikePickerTap) {
-  const sel = await resolveJobPickSelection({
-    ownerId,
-    from,
-    input: rawInput,
-    twilioMeta: inboundTwilioMeta
-  });
-
-  if (!sel.ok) {
-    return await rejectAndResendPicker({
-      from,
-      ownerId,
-      userProfile,
-      confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-      jobOptions,
-      reason: sel.reason,
-      twilioMeta: inboundTwilioMeta
-    });
-  }
-
-  const chosenJobNo = Number(sel.jobNo);
-  const chosen = (jobOptions || []).find((j) => Number(j?.job_no) === chosenJobNo) || null;
-
-  if (!chosen) {
-    return await rejectAndResendPicker({
-      from,
-      ownerId,
-      userProfile,
-      confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-      jobOptions,
-      reason: 'job_not_found_in_options',
-      twilioMeta: inboundTwilioMeta
-    });
-  }
-
-  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-
-  try {
-    await persistActiveJobBestEffort({
-      ownerId,
-      userProfile,
-      fromPhone: from,
-      jobRow: chosen,
-      jobNameFallback: chosen?.name
-    });
-  } catch {}
-
-  if (confirmPA?.payload?.draft) {
-    await upsertPA({
-      ownerId,
-      userId: from,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        ...confirmPA.payload,
-        draft: {
-          ...(confirmPA.payload.draft || {}),
-          jobName: getJobDisplayName(chosen),
-          jobSource: 'picked',
-          job_no: Number(chosen.job_no)
-        }
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
-  }
-
-  try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
-
-  return await resendConfirmExpense({ from, ownerId, tz });
-}
-
-// ----------------------------
-// 2) TYPED INPUT PATH
-// ----------------------------
-const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos)
-  ? pickPA.payload.displayedJobNos
-  : [];
-
-const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
-
-if (!resolved) {
-  return await resendConfirmExpense({ from, ownerId, tz });
-}
-
-if (resolved.kind === 'overhead') {
-  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-
-  if (confirmPA?.payload?.draft) {
-    await upsertPA({
-      ownerId,
-      userId: from,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        ...confirmPA.payload,
-        draft: {
-          ...(confirmPA.payload.draft || {}),
-          jobName: 'Overhead',
-          jobSource: 'overhead',
-          job_no: null
-        }
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
-  }
-
-  try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
-
-  return await resendConfirmExpense({ from, ownerId, tz });
-}
-
-if (resolved.kind === 'job' && resolved.job?.job_no) {
-  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-
-  try {
-    await persistActiveJobBestEffort({
-      ownerId,
-      userProfile,
-      fromPhone: from,
-      jobRow: resolved.job,
-      jobNameFallback: resolved.job?.name
-    });
-  } catch {}
-
-  if (confirmPA?.payload?.draft) {
-    await upsertPA({
-      ownerId,
-      userId: from,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        ...confirmPA.payload,
-        draft: {
-          ...(confirmPA.payload.draft || {}),
-          jobName: getJobDisplayName(resolved.job),
-          jobSource: 'picked',
-          job_no: Number(resolved.job.job_no)
-        }
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
-  }
-
-  try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
-
-  return await resendConfirmExpense({ from, ownerId, tz });
-}
-
-// Absolute safety net — never text
-return await resendConfirmExpense({ from, ownerId, tz });
-
       }
     }
 
+    // ----------------------------
+    // 1) PICKER-TAP PATH (Twilio interactive replies)
+    // ----------------------------
+    if (looksLikePickerTap) {
+      const sel = await resolveJobPickSelection({
+        ownerId,
+        from,
+        input: rawInput,
+        twilioMeta: inboundTwilioMeta
+      });
 
+      if (!sel.ok) {
+        return await rejectAndResendPicker({
+          from,
+          ownerId,
+          userProfile,
+          confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+          jobOptions,
+          reason: sel.reason,
+          twilioMeta: inboundTwilioMeta
+        });
+      }
+
+      const chosenJobNo = Number(sel.jobNo);
+      const chosen = (jobOptions || []).find((j) => Number(j?.job_no) === chosenJobNo) || null;
+
+      if (!chosen) {
+        return await rejectAndResendPicker({
+          from,
+          ownerId,
+          userProfile,
+          confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+          jobOptions,
+          reason: 'job_not_found_in_options',
+          twilioMeta: inboundTwilioMeta
+        });
+      }
+
+      const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
+      try {
+        await persistActiveJobBestEffort({
+          ownerId,
+          userProfile,
+          fromPhone: from,
+          jobRow: chosen,
+          jobNameFallback: chosen?.name
+        });
+      } catch {}
+
+      if (confirmPA?.payload?.draft) {
+        await upsertPA({
+          ownerId,
+          userId: from,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...confirmPA.payload,
+            draft: {
+              ...(confirmPA.payload.draft || {}),
+              jobName: getJobDisplayName(chosen),
+              jobSource: 'picked',
+              job_no: Number(chosen.job_no)
+            }
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
+      }
+
+      try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+      return await resendConfirmExpense({ from, ownerId, tz });
+    }
+
+    // ----------------------------
+    // 2) TYPED INPUT PATH
+    // ----------------------------
+    const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : [];
+    const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
+
+    if (!resolved) {
+      return out(twimlText('Please reply with a job from the list, a number, job name, "Overhead", or "more".'), false);
+    }
+
+    if (resolved.kind === 'overhead') {
+      const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
+      if (confirmPA?.payload?.draft) {
+        await upsertPA({
+          ownerId,
+          userId: from,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...confirmPA.payload,
+            draft: { ...(confirmPA.payload.draft || {}), jobName: 'Overhead', jobSource: 'overhead', job_no: null }
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
+      }
+
+      try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+      return await resendConfirmExpense({ from, ownerId, tz });
+    }
+
+    if (resolved.kind === 'job' && resolved.job?.job_no) {
+      const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
+      try {
+        await persistActiveJobBestEffort({
+          ownerId,
+          userProfile,
+          fromPhone: from,
+          jobRow: resolved.job,
+          jobNameFallback: resolved.job?.name
+        });
+      } catch {}
+
+      if (confirmPA?.payload?.draft) {
+        await upsertPA({
+          ownerId,
+          userId: from,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...confirmPA.payload,
+            draft: {
+              ...(confirmPA.payload.draft || {}),
+              jobName: getJobDisplayName(resolved.job),
+              jobSource: 'picked',
+              job_no: Number(resolved.job.job_no)
+            }
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
+      }
+
+      try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+      return await resendConfirmExpense({ from, ownerId, tz });
+    }
+
+    // Safety net
+    return await resendConfirmExpense({ from, ownerId, tz });
+  }
+}
 
     // ---- 2) Confirm/edit/cancel ----
 let confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
-// ✅ If user sends a brand new revenue message while confirm draft exists,
+// ✅ If user sends a brand new expense message while confirm draft exists,
 // pause and ask them to cancel explicitly (instead of mis-parsing)
 if (confirmPA?.payload?.draft && looksLikeNewExpenseText(input)) {
-  console.info('[REVENUE] confirm pause: new revenue detected while confirm pending');
+  console.info('[EXPENSE] confirm pause: new expense detected while confirm pending');
 
   return out(
     twimlText(
@@ -2283,25 +2334,28 @@ if (confirmPA?.payload?.draft && looksLikeNewExpenseText(input)) {
 if (confirmPA?.payload?.draft) {
   if (!isOwner) {
     await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-    return out(twimlText('⚠️ Only the owner can manage revenue.'), false);
+    return out(twimlText('⚠️ Only the owner can manage Expense.'), false);
   }
 
   const token = normalizeDecisionToken(input);
 
   if (token === 'change_job') {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-    return await sendJobPickList({
-  from,
-  ownerId,
-  confirmFlowId: stableMsgId,
-  jobOptions: jobs,
-  page: 0,
-  pageSize: 8,
-  context: 'expense_jobpick'
-});
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+  if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
 
-  }
+  return await sendJobPickList({
+    from,
+    ownerId,
+    userProfile,
+    confirmFlowId: stableMsgId,
+    jobOptions: jobs,
+    page: 0,
+    pageSize: 8,
+    context: 'expense_jobpick',
+    confirmDraft: confirmPA?.payload?.draft || null
+  });
+}
+
 
       if (token === 'edit') {
         await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
@@ -2611,20 +2665,21 @@ return out(twimlText(reply), false);
         ttlSeconds: PA_TTL_SEC
       });
 
-      if (!jobName) {
-  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-  if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-  return await sendJobPickList({
-  from,
-  ownerId,
-  confirmFlowId: stableMsgId,
-  jobOptions: jobs,
-  page: 0,
-  pageSize: 8,
-  context: 'expense_jobpick'
-});
+     if (!jobName) {
+  
 
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+  return await sendJobPickList({
+    from,
+    ownerId,
+    confirmFlowId: stableMsgId,
+    jobOptions: jobs,
+    page: 0,
+    pageSize: 8,
+    context: 'expense_jobpick'
+  });
 }
+
 
 // ✅ deterministic parse: the best source is the user input itself
 const summaryLine = buildExpenseSummaryLine({
@@ -2689,40 +2744,50 @@ return await sendConfirmExpenseOrFallback(from, `${summaryLine}${buildActiveJobH
       if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 
       await upsertPA({
-        ownerId,
-        userId: from,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          draft: {
-            ...data,
-            jobName,
-            jobSource,
-            suggestedCategory: category,
-            job_id: null,
-            job_no: null,
-            originalText: input,
-            draftText: input
-          },
-          sourceMsgId: safeMsgId,
-          type: 'expense'
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
+  ownerId,
+  userId: from,
+  kind: PA_KIND_CONFIRM,
+  payload: {
+    draft: {
+      ...data,
+      jobName,                 // will be null if unknown
+      jobSource,
+      suggestedCategory: category,
+      job_id: null,
+      job_no: null,
+      originalText: input,
+      draftText: input
+    },
+    sourceMsgId: safeMsgId,
+    type: 'expense'
+  },
+  ttlSeconds: PA_TTL_SEC
+});
 
-      if (!jobName) {
+if (!jobName) {
   const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
   if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+
   return await sendJobPickList({
   from,
   ownerId,
+  userProfile,
   confirmFlowId: stableMsgId,
   jobOptions: jobs,
   page: 0,
   pageSize: 8,
-  context: 'expense_jobpick'
+  context: 'expense_jobpick',
+  confirmDraft: {
+    ...data0,            // or data
+    jobName: null,
+    jobSource: null,
+    originalText: input,
+    draftText: input
+  }
 });
 
 }
+
 
 // ✅ AI parse: prefer draftText/originalText if you stored it, else input
 const srcText = input;

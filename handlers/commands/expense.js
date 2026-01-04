@@ -261,12 +261,12 @@ async function deletePA({ ownerId, userId, kind }) {
 exports.deletePA = deletePA;
 
 async function ensureConfirmPAExists({ ownerId, from, draft, sourceMsgId }) {
-  const existing = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+  const existing = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
   if (existing?.payload?.draft) return;
 
   await upsertPA({
     ownerId,
-    userId: from,
+    userId: paUserId,
     kind: PA_KIND_CONFIRM,
     payload: {
       draft,
@@ -466,7 +466,7 @@ function extractJobNoFromWhatsAppListTitle(title) {
 
 
 async function resendConfirmExpense({ from, ownerId, tz }) {
-  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+  const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
   if (!confirmPA?.payload) return null;
 
   const draft = confirmPA.payload.draft || {};
@@ -1725,7 +1725,7 @@ async function sendJobPickList({
 
   await upsertPA({
     ownerId,
-    userId: from,
+    userId: paUserId,
     kind: PA_KIND_PICK_JOB,
     payload: {
       context,
@@ -2104,8 +2104,6 @@ async function handleExpense(
 ) {
   input = correctTradeTerms(stripExpensePrefixes(input));
 
-  const lockKey = `lock:${from}`;
-
   // Stable id for idempotency; prefer inbound MessageSid. Always fall back to something deterministic.
   const stableMsgId =
     String(sourceMsgId || '').trim() ||
@@ -2123,14 +2121,28 @@ async function handleExpense(
     twilioMeta?.[String(k).toUpperCase()] ??
     null;
 
-  const inboundTwilioMeta = {
-    MessageSid: getTwilio('MessageSid'),
-    OriginalRepliedMessageSid: getTwilio('OriginalRepliedMessageSid'),
-    Body: getTwilio('Body'),
-    ListId: getTwilio('ListId'),
-    ListTitle: getTwilio('ListTitle'),
-    ButtonPayload: getTwilio('ButtonPayload')
-  };
+  // Build inboundTwilioMeta first
+const inboundTwilioMeta = {
+  MessageSid: getTwilio('MessageSid'),
+  OriginalRepliedMessageSid: getTwilio('OriginalRepliedMessageSid'),
+  Body: getTwilio('Body'),
+  ListId: getTwilio('ListId'),
+  ListTitle: getTwilio('ListTitle'),
+  ButtonPayload: getTwilio('ButtonPayload'),
+  WaId: getTwilio('WaId') || getTwilio('WaID') || getTwilio('waid')
+};
+
+// ✅ Canonical PA key (digits only)
+const paUserId =
+  normalizeIdentityDigits(inboundTwilioMeta?.WaId) ||
+  normalizeIdentityDigits(from) ||
+  String(from || '').trim();
+
+console.info('[PA_KEY]', { from, waId: inboundTwilioMeta?.WaId, paUserId });
+
+// ✅ ONE lock key, canonical
+const lockKey = `lock:${paUserId}`;
+
 
   // ✅ Local helper: reject + resend picker with ZERO reliance on outer scope vars
   async function rejectAndResendPicker({
@@ -2187,7 +2199,7 @@ async function handleExpense(
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
     /* ---- 1) Awaiting job pick ---- */
-    const pickPA = await getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+    const pickPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB })
 
     if (
       pickPA?.payload &&
@@ -2217,10 +2229,10 @@ async function handleExpense(
       if (looksLikeNewExpenseText(input)) {
         console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
         try {
-          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+          await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
         } catch {}
         try {
-          await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+          await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
         } catch {}
       } else {
         // Stale picker protection → resend page 0
@@ -2263,7 +2275,7 @@ async function handleExpense(
         try {
           await upsertPA({
             ownerId,
-            userId: from,
+            userId: paUserId,
             kind: PA_KIND_PICK_JOB,
             payload: { ...(pickPA.payload || {}), lastInboundTextRaw: input, lastInboundText: rawInput },
             ttlSeconds: PA_TTL_SEC
@@ -2315,12 +2327,12 @@ async function handleExpense(
         }
 
         // ✅ HARD GUARD: if confirm PA is missing but we got a picker reply, re-bootstrap from pickPA.confirmDraft
-        let confirmPAForGuard = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        let confirmPAForGuard = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 
         if (!confirmPAForGuard?.payload?.draft && (looksLikePickerTap || looksLikeJobPickerAnswer(rawInput))) {
           if (confirmDraft) {
             await ensureConfirmPAExists({ ownerId, from, draft: confirmDraft, sourceMsgId: stableMsgId });
-            confirmPAForGuard = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+            confirmPAForGuard = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
           } else {
             // Can't reconstruct → resend picker
             return await sendJobPickList({
@@ -2385,7 +2397,7 @@ async function handleExpense(
             });
           }
 
-          const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+          const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 
           try {
             await persistActiveJobBestEffort({
@@ -2400,7 +2412,7 @@ async function handleExpense(
           if (confirmPA?.payload?.draft) {
             await upsertPA({
               ownerId,
-              userId: from,
+              userId: paUserId,
               kind: PA_KIND_CONFIRM,
               payload: {
                 ...confirmPA.payload,
@@ -2416,7 +2428,7 @@ async function handleExpense(
           }
 
           try {
-            await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+            await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
           } catch {}
           return await resendConfirmExpense({ from, ownerId, tz });
         }
@@ -2440,7 +2452,7 @@ async function handleExpense(
 
         if (resolved.kind === 'overhead') {
          // ✅ Ensure confirm draft exists (rebuild from pickPA.confirmDraft if needed)
-let confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 
 if (!confirmPA?.payload?.draft) {
   const fallbackDraft = pickPA?.payload?.confirmDraft || null;
@@ -2448,7 +2460,7 @@ if (!confirmPA?.payload?.draft) {
   if (fallbackDraft) {
     await upsertPA({
       ownerId,
-      userId: from,
+      userId: paUserId,
       kind: PA_KIND_CONFIRM,
       payload: {
         draft: fallbackDraft,
@@ -2458,7 +2470,7 @@ if (!confirmPA?.payload?.draft) {
       ttlSeconds: PA_TTL_SEC
     });
 
-    confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
   }
 }
 
@@ -2466,15 +2478,15 @@ if (!confirmPA?.payload?.draft) {
 if (confirmPA?.payload?.draft) {
   await upsertPA({
     ownerId,
-    userId: from,
+    userId: paUserId,
     kind: PA_KIND_CONFIRM,
     payload: {
       ...(confirmPA.payload || {}),
       draft: {
         ...(confirmPA.payload.draft || {}),
-        jobName: getJobDisplayName(chosen),
-        jobSource: 'picked',
-        job_no: Number(chosen.job_no)
+        jobName: 'Overhead',
+        jobSource: 'overhead',
+        job_no: null
       }
     },
     ttlSeconds: PA_TTL_SEC
@@ -2492,13 +2504,13 @@ if (confirmPA?.payload?.draft) {
   });
 }
 
-try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }); } catch {}
 return await resendConfirmExpense({ from, ownerId, tz });
 
         }
 
         if (resolved.kind === 'job' && resolved.job?.job_no) {
-          const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+          const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 
           try {
             await persistActiveJobBestEffort({
@@ -2513,7 +2525,7 @@ return await resendConfirmExpense({ from, ownerId, tz });
           if (confirmPA?.payload?.draft) {
             await upsertPA({
               ownerId,
-              userId: from,
+              userId: paUserId,
               kind: PA_KIND_CONFIRM,
               payload: {
                 ...confirmPA.payload,
@@ -2529,7 +2541,7 @@ return await resendConfirmExpense({ from, ownerId, tz });
           }
 
           try {
-            await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+            await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
           } catch {}
           return await resendConfirmExpense({ from, ownerId, tz });
         }
@@ -2539,7 +2551,7 @@ return await resendConfirmExpense({ from, ownerId, tz });
     }
 
     // ---- 2) Confirm/edit/cancel ----
-    let confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+    let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 
     // If user sends a brand new expense message while confirm draft exists, pause and ask them to cancel explicitly
     if (confirmPA?.payload?.draft && looksLikeNewExpenseText(input)) {
@@ -2555,7 +2567,7 @@ return await resendConfirmExpense({ from, ownerId, tz });
 
     if (confirmPA?.payload?.draft) {
       if (!isOwner) {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
         return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
       }
 
@@ -2595,9 +2607,9 @@ return await resendConfirmExpense({ from, ownerId, tz });
 
       // ❌ Cancel (delete confirm + pick)
       if (token === 'cancel') {
-        await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+        await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
         try {
-          await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+          await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
         } catch {}
         return out(twimlText('❌ Expense cancelled.'), false);
       }
@@ -2640,7 +2652,7 @@ return await resendConfirmExpense({ from, ownerId, tz });
 
       await upsertPA({
         ownerId,
-        userId: from,
+        userId: paUserId,
         kind: PA_KIND_CONFIRM,
         payload: {
           draft: {
@@ -2736,7 +2748,7 @@ return await resendConfirmExpense({ from, ownerId, tz });
 
       await upsertPA({
         ownerId,
-        userId: from,
+        userId: paUserId,
         kind: PA_KIND_CONFIRM,
         payload: {
           draft: {

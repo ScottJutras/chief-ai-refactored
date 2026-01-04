@@ -391,6 +391,34 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
 
   return out(twimlText(`✅ Confirm expense\n${summaryLine}\n\nReply: Yes / Edit / Cancel / Change Job`), false);
 }
+async function resendConfirmExpense({ from, ownerId, tz }) {
+  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+  if (!confirmPA?.payload) return null;
+
+  const draft = confirmPA.payload.draft || {};
+
+  const srcText =
+    confirmPA.payload.humanLine ||
+    confirmPA.payload.summaryLine ||
+    draft.draftText ||
+    draft.originalText ||
+    '';
+
+  const line =
+    confirmPA.payload.humanLine ||
+    buildExpenseSummaryLine({
+      amount: draft.amount,
+      item: draft.item,
+      store: draft.store,
+      date: draft.date,
+      jobName: draft.jobName,
+      tz,
+      sourceText: srcText
+    }) ||
+    'Confirm expense?';
+
+  return sendConfirmExpenseOrFallback(from, line);
+}
 
 /* ---------------- misc helpers ---------------- */
 
@@ -2074,243 +2102,162 @@ async function handleExpense(from, input, userProfile, ownerId, ownerProfile, is
         }
 
         // ----------------------------
-        // 1) PICKER-TAP PATH (Twilio interactive replies)
-        // ----------------------------
-        const looksLikePickerTap =
-          /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
-          /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-          !!inboundTwilioMeta?.ListTitle ||
-          !!inboundTwilioMeta?.ListId;
+// 1) PICKER-TAP PATH (Twilio interactive replies)
+// ----------------------------
+const looksLikePickerTap =
+  /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
+  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+  !!inboundTwilioMeta?.ListTitle ||
+  !!inboundTwilioMeta?.ListId;
 
-        if (looksLikePickerTap) {
-          const sel = await resolveJobPickSelection({
-            ownerId,
-            from,
-            input: rawInput,
-            twilioMeta: inboundTwilioMeta
-          });
+if (looksLikePickerTap) {
+  const sel = await resolveJobPickSelection({
+    ownerId,
+    from,
+    input: rawInput,
+    twilioMeta: inboundTwilioMeta
+  });
 
-          console.info('[JOB_PICK_IN]', {
-            ok: sel.ok,
-            reason: sel.reason || null,
-            input: rawInput,
-            meta: sel.meta || null,
-            stored: {
-              flow,
-              pickerNonce,
-              displayedHash,
-              displayedJobNos: (pickPA.payload.displayedJobNos || []).slice(0, 8)
-            },
-            inbound: {
-              ListId: inboundTwilioMeta?.ListId || null,
-              ListTitle: inboundTwilioMeta?.ListTitle || null,
-              OriginalRepliedMessageSid: inboundTwilioMeta?.OriginalRepliedMessageSid || null
-            }
-          });
+  if (!sel.ok) {
+    return await rejectAndResendPicker({
+      from,
+      ownerId,
+      userProfile,
+      confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+      jobOptions,
+      reason: sel.reason,
+      twilioMeta: inboundTwilioMeta
+    });
+  }
 
-          if (!sel.ok) {
-            // Fail-safe: don’t guess. Send fresh picker.
-            return await rejectAndResendPicker({
-              from,
-              ownerId,
-              userProfile,
-              confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-              jobOptions,
-              reason: sel.reason,
-              twilioMeta: inboundTwilioMeta
-            });
-          }
+  const chosenJobNo = Number(sel.jobNo);
+  const chosen = (jobOptions || []).find((j) => Number(j?.job_no) === chosenJobNo) || null;
 
-          console.info('[JOB_PICK_ACCEPT]', {
-            mode: sel?.meta?.mode || null,
-            jobNo: sel.jobNo,
-            flow: sel?.meta?.flow || flow,
-            pickerNonce: sel?.meta?.pickerNonce || pickerNonce
-          });
+  if (!chosen) {
+    return await rejectAndResendPicker({
+      from,
+      ownerId,
+      userProfile,
+      confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+      jobOptions,
+      reason: 'job_not_found_in_options',
+      twilioMeta: inboundTwilioMeta
+    });
+  }
 
-          const chosenJobNo = Number(sel.jobNo);
-          const chosen = (jobOptions || []).find((j) => Number(j?.job_no) === chosenJobNo) || null;
+  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
-          if (!chosen) {
-            return await rejectAndResendPicker({
-              from,
-              ownerId,
-              userProfile,
-              confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-              jobOptions,
-              reason: 'job_not_found_in_options',
-              twilioMeta: inboundTwilioMeta
-            });
-          }
+  try {
+    await persistActiveJobBestEffort({
+      ownerId,
+      userProfile,
+      fromPhone: from,
+      jobRow: chosen,
+      jobNameFallback: chosen?.name
+    });
+  } catch {}
 
-          // Apply resolved job
-          const resolved = { kind: 'job', job: chosen };
-
-          const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-
-          try {
-            await persistActiveJobBestEffort({
-              ownerId,
-              userProfile,
-              fromPhone: from,
-              jobRow: resolved.job,
-              jobNameFallback: resolved.job?.name
-            });
-          } catch (e) {
-            console.warn('[EXPENSE] persistActiveJobBestEffort (pick) failed (ignored):', e?.message);
-          }
-
-          const pickedJobName = getJobDisplayName(resolved.job);
-
-          if (confirmPA?.payload?.draft) {
-            await upsertPA({
-              ownerId,
-              userId: from,
-              kind: PA_KIND_CONFIRM,
-              payload: {
-                ...confirmPA.payload,
-                draft: {
-                  ...(confirmPA.payload.draft || {}),
-                  jobName: pickedJobName,
-                  jobSource: 'picked',
-                  job_no: Number(resolved.job.job_no)
-                }
-              },
-              ttlSeconds: PA_TTL_SEC
-            });
-          }
-
-          try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
-
-          const confirmPA2 = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-
-          const srcText =
-            confirmPA2?.payload?.humanLine ||
-            confirmPA2?.payload?.summaryLine ||
-            confirmPA2?.payload?.draft?.draftText ||
-            confirmPA2?.payload?.draft?.originalText ||
-            input ||
-            '';
-
-          const humanLine =
-            buildExpenseSummaryLine({
-              amount: confirmPA2?.payload?.draft?.amount,
-              item: confirmPA2?.payload?.draft?.item,
-              store: confirmPA2?.payload?.draft?.store,
-              date: confirmPA2?.payload?.draft?.date,
-              jobName: pickedJobName,
-              tz,
-              sourceText: srcText
-            }) || 'Confirm expense?';
-
-          return await sendConfirmExpenseOrFallback(from, humanLine);
+  if (confirmPA?.payload?.draft) {
+    await upsertPA({
+      ownerId,
+      userId: from,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...confirmPA.payload,
+        draft: {
+          ...(confirmPA.payload.draft || {}),
+          jobName: getJobDisplayName(chosen),
+          jobSource: 'picked',
+          job_no: Number(chosen.job_no)
         }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+  }
 
-        // ----------------------------
-        // 2) TYPED INPUT PATH (numbers / names / jobno_ / overhead)
-        // ----------------------------
-        const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : [];
-        const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
+  try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
 
-        if (!resolved) {
-          return out(twimlText('Please reply with a job from the list, a number, job name, "Overhead", or "more".'), false);
+  return await resendConfirmExpense({ from, ownerId, tz });
+}
+
+// ----------------------------
+// 2) TYPED INPUT PATH
+// ----------------------------
+const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos)
+  ? pickPA.payload.displayedJobNos
+  : [];
+
+const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
+
+if (!resolved) {
+  return await resendConfirmExpense({ from, ownerId, tz });
+}
+
+if (resolved.kind === 'overhead') {
+  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+
+  if (confirmPA?.payload?.draft) {
+    await upsertPA({
+      ownerId,
+      userId: from,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...confirmPA.payload,
+        draft: {
+          ...(confirmPA.payload.draft || {}),
+          jobName: 'Overhead',
+          jobSource: 'overhead',
+          job_no: null
         }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+  }
 
-        if (resolved.kind === 'overhead') {
-          const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+  try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
 
-          if (confirmPA?.payload?.draft && looksLikeNewExpenseText(input)) {
-            console.info('[EXPENSE] confirm pause: new expense detected while confirm pending');
-            return out(
-              twimlText(
-                'Hang on one sec 🙂 It looks like you were in the middle of logging something.\n' +
-                'Tap Yes/Edit/Change Job/Cancel to finish it. If you want to start fresh, reply "Cancel".'
-              ),
-              false
-            );
-          }
+  return await resendConfirmExpense({ from, ownerId, tz });
+}
 
-          if (confirmPA?.payload?.draft) {
-            await upsertPA({
-              ownerId,
-              userId: from,
-              kind: PA_KIND_CONFIRM,
-              payload: {
-                ...confirmPA.payload,
-                draft: { ...(confirmPA.payload.draft || {}), jobName: 'Overhead', jobSource: 'overhead', job_no: null }
-              },
-              ttlSeconds: PA_TTL_SEC
-            });
-          }
+if (resolved.kind === 'job' && resolved.job?.job_no) {
+  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
 
-          try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
+  try {
+    await persistActiveJobBestEffort({
+      ownerId,
+      userProfile,
+      fromPhone: from,
+      jobRow: resolved.job,
+      jobNameFallback: resolved.job?.name
+    });
+  } catch {}
 
-          const line = confirmPA?.payload?.humanLine || confirmPA?.payload?.summaryLine || null;
-          return await sendConfirmExpenseOrFallback(from, line || 'Confirm expense?');
+  if (confirmPA?.payload?.draft) {
+    await upsertPA({
+      ownerId,
+      userId: from,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...confirmPA.payload,
+        draft: {
+          ...(confirmPA.payload.draft || {}),
+          jobName: getJobDisplayName(resolved.job),
+          jobSource: 'picked',
+          job_no: Number(resolved.job.job_no)
         }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+  }
 
-        if (resolved.kind === 'job' && resolved.job?.job_no) {
-          const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+  try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
 
-          try {
-            await persistActiveJobBestEffort({
-              ownerId,
-              userProfile,
-              fromPhone: from,
-              jobRow: resolved.job,
-              jobNameFallback: resolved.job?.name
-            });
-          } catch (e) {
-            console.warn('[EXPENSE] persistActiveJobBestEffort (pick) failed (ignored):', e?.message);
-          }
+  return await resendConfirmExpense({ from, ownerId, tz });
+}
 
-          const pickedJobName = getJobDisplayName(resolved.job);
+// Absolute safety net — never text
+return await resendConfirmExpense({ from, ownerId, tz });
 
-          if (confirmPA?.payload?.draft) {
-            await upsertPA({
-              ownerId,
-              userId: from,
-              kind: PA_KIND_CONFIRM,
-              payload: {
-                ...confirmPA.payload,
-                draft: {
-                  ...(confirmPA.payload.draft || {}),
-                  jobName: pickedJobName,
-                  jobSource: 'picked',
-                  job_no: Number(resolved.job.job_no)
-                }
-              },
-              ttlSeconds: PA_TTL_SEC
-            });
-          }
-
-          try { await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB }); } catch {}
-
-          const confirmPA2 = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-
-          const srcText =
-            confirmPA2?.payload?.humanLine ||
-            confirmPA2?.payload?.summaryLine ||
-            confirmPA2?.payload?.draft?.draftText ||
-            confirmPA2?.payload?.draft?.originalText ||
-            input ||
-            '';
-
-          const humanLine =
-            buildExpenseSummaryLine({
-              amount: confirmPA2?.payload?.draft?.amount,
-              item: confirmPA2?.payload?.draft?.item,
-              store: confirmPA2?.payload?.draft?.store,
-              date: confirmPA2?.payload?.draft?.date,
-              jobName: pickedJobName,
-              tz,
-              sourceText: srcText
-            }) || 'Confirm expense?';
-
-          return await sendConfirmExpenseOrFallback(from, humanLine);
-        }
-
-        return out(twimlText('Please reply with a job from the list, a number, job name, "Overhead", or "more".'), false);
       }
     }
 
@@ -2599,23 +2546,19 @@ try {
   });
 
   const reply =
-    writeResult?.inserted === false
-      ? '✅ Already logged (duplicate message).'
-      : `✅ Logged expense\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${buildActiveJobHint(jobName, jobSource)}`;
+  writeResult?.inserted === false
+    ? '✅ Already logged (duplicate message).'
+    : `✅ Logged expense\n${summaryLine}${category ? `\nCategory: ${category}` : ''}${buildActiveJobHint(jobName, jobSource)}`;
 
-  await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
-  try {
-    await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
-  } catch {}
+await deletePA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+try {
+  await deletePA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB });
+} catch {}
 
-  return out(twimlText(reply), false);
+return out(twimlText(reply), false);
+
 }
 
-
-      return out(
-        twimlText('⚠️ Please choose Yes, Edit, Cancel, or Change Job.\nTip: reply "change job" to pick a different job.'),
-        false
-      );
     }
 
     /* ---- 3) New expense parse (deterministic first) ---- */

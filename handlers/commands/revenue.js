@@ -214,6 +214,25 @@ function waTo(from) {
   const d = DIGITS(from);
   return d ? `whatsapp:+${d}` : null;
 }
+async function resendConfirmRevenue({ from, ownerId, tz }) {
+  const confirmPA = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
+  if (!confirmPA?.payload) return null;
+
+  const draft = confirmPA.payload.draft || {};
+
+  const line =
+    confirmPA.payload.humanLine ||
+    buildRevenueSummaryLine({
+      amount: draft.amount,
+      source: draft.source,
+      date: draft.date,
+      jobName: draft.jobName,
+      tz
+    }) ||
+    'Confirm revenue?';
+
+  return sendConfirmRevenueOrFallback(from, line);
+}
 
 /* ---------------- Date / money helpers ---------------- */
 
@@ -1235,10 +1254,8 @@ if (confirmPA?.payload?.draft) {
             ttlSeconds: PA_TTL_SEC
           });
 
-          return out(
-            twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
-            false
-          );
+          return await resendConfirmRevenue({ from, ownerId, tz });
+
         }
 
         // Persist active job after successful log (best-effort)
@@ -1265,10 +1282,6 @@ if (confirmPA?.payload?.draft) {
         return out(twimlText(reply), false);
       }
 
-      return out(
-        twimlText('⚠️ Please choose Yes, Edit, Cancel, or Change Job.\nTip: reply "change job" to pick a different job.'),
-        false
-      );
     }
 
     // ---- 3) New revenue parse (AI first-pass; keep behavior; beta hardening) ----

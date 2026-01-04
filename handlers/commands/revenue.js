@@ -921,7 +921,7 @@ function looksLikeNewRevenueText(s = '') {
 
 /* ---------------- main handler ---------------- */
 
-async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId) {
+async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId, twilioMeta = null) {
   input = stripRevenuePrefixes(input);
 
   const safeMsgId = String(sourceMsgId || `${from}:${Date.now()}`).trim();

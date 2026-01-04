@@ -859,16 +859,17 @@ router.post('*', async (req, res, next) => {
 
     if (isExpensePA) {
       try {
-        const { handleExpense } = require('../handlers/commands/expense');
         const tw = await handleExpense(
-          req.from,
-          text2,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
+  req.from,
+  text2,
+  req.userProfile,
+  req.ownerId,
+  req.ownerProfile,
+  req.isOwner,
+  messageSid,
+  req.body // ✅ pass Twilio form payload for ListId/ListTitle/etc
+);
+
 
         if (!res.headersSent) {
           if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
@@ -885,14 +886,15 @@ router.post('*', async (req, res, next) => {
       try {
         const { handleRevenue } = require('../handlers/commands/revenue');
         const tw = await handleRevenue(
-          req.from,
-          text2,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid
-        );
+  req.from,
+  text2,
+  req.userProfile,
+  req.ownerId,
+  req.ownerProfile,
+  req.isOwner,
+  messageSid,
+  req.body // ✅ pass Twilio payload
+);
 
         if (!res.headersSent) {
           if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
@@ -955,7 +957,17 @@ router.post('*', async (req, res, next) => {
     if (pendingRevenueLike) {
       try {
         const { handleRevenue } = require('../handlers/commands/revenue');
-        const tw = await handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
+        const tw = await handleRevenue(
+  req.from,
+  text2,
+  req.userProfile,
+  req.ownerId,
+  req.ownerProfile,
+  req.isOwner,
+  messageSid,
+  req.body // ✅ pass Twilio payload
+);
+
 
         if (!res.headersSent) {
           if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
@@ -971,7 +983,16 @@ router.post('*', async (req, res, next) => {
     if (pendingExpenseLike) {
       try {
         const { handleExpense } = require('../handlers/commands/expense');
-        const tw = await handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid);
+        const tw = await handleExpense(
+  req.from,
+  text2,
+  req.userProfile,
+  req.ownerId,
+  req.ownerProfile,
+  req.isOwner,
+  messageSid,
+  req.body // ✅ pass Twilio payload
+);
 
         if (!res.headersSent) {
           if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
@@ -985,95 +1006,114 @@ router.post('*', async (req, res, next) => {
     }
 
     /* -----------------------------------------------------------------------
-     * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
-     * ----------------------------------------------------------------------- */
-    const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
-    const revenueNl = !revenuePrefix && looksRevenueNl(text2);
-    const looksRevenue = revenuePrefix || revenueNl;
+ * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
+ * ----------------------------------------------------------------------- */
+const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
+const revenueNl = !revenuePrefix && looksRevenueNl(text2);
+const looksRevenue = revenuePrefix || revenueNl;
 
-    if (looksRevenue) {
-      if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
+if (looksRevenue) {
+  if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
 
-      try {
-        const { handleRevenue } = require('../handlers/commands/revenue');
+  try {
+    const { handleRevenue } = require('../handlers/commands/revenue');
 
-        const timeoutMs = 8000;
-        const timeoutTwiml = twimlText(
-          '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
-        );
+    const timeoutMs = 8000;
+    const timeoutTwiml = twimlText(
+      '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
+    );
 
-        let timeoutId = null;
-        const timeoutPromise = new Promise((resolve) => {
-          timeoutId = setTimeout(() => {
-            console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
-            resolve(timeoutTwiml);
-          }, timeoutMs);
-        });
+    let timeoutId = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
+        resolve(timeoutTwiml);
+      }, timeoutMs);
+    });
 
-        const result = await Promise.race([
-          handleRevenue(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-          timeoutPromise
-        ]).finally(() => timeoutId && clearTimeout(timeoutId));
+    const result = await Promise.race([
+      handleRevenue(
+        req.from,
+        text2,
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        messageSid,
+        req.body // ✅ pass Twilio payload
+      ),
+      timeoutPromise
+    ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        if (!res.headersSent) {
-          const twiml =
-            typeof result === 'string'
-              ? result
-              : (result && typeof result.twiml === 'string' ? result.twiml : null);
+    if (!res.headersSent) {
+      const twiml =
+        typeof result === 'string'
+          ? result
+          : (result && typeof result.twiml === 'string' ? result.twiml : null);
 
-          return sendTwiml(res, twiml); // null -> <Response></Response>
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] revenue handler failed:', e?.message);
-        if (!res.headersSent) return ok(res, null);
-        return;
-      }
+      return sendTwiml(res, twiml); // null -> <Response></Response>
     }
+    return;
+  } catch (e) {
+    console.warn('[WEBHOOK] revenue handler failed:', e?.message);
+    if (!res.headersSent) return ok(res, null);
+    return;
+  }
+}
 
-    const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
-    const expenseNl = !expensePrefix && looksExpenseNl(text2);
-    const looksExpense = expensePrefix || expenseNl;
+const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
+const expenseNl = !expensePrefix && looksExpenseNl(text2);
+const looksExpense = expensePrefix || expenseNl;
 
-    if (looksExpense) {
-      if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
+if (looksExpense) {
+  if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
 
-      try {
-        const { handleExpense } = require('../handlers/commands/expense');
+  try {
+    const { handleExpense } = require('../handlers/commands/expense');
 
-        const timeoutMs = 8000;
-        const timeoutTwiml = twimlText(
-          '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
-        );
+    const timeoutMs = 8000;
+    const timeoutTwiml = twimlText(
+      '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
+    );
 
-        let timeoutId = null;
-        const timeoutPromise = new Promise((resolve) => {
-          timeoutId = setTimeout(() => {
-            console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
-            resolve(timeoutTwiml);
-          }, timeoutMs);
-        });
+    let timeoutId = null;
+    const timeoutPromise = new Promise((resolve) => {
+      timeoutId = setTimeout(() => {
+        console.warn('[WEBHOOK] expense handler timeout', { from: req.from, messageSid, timeoutMs });
+        resolve(timeoutTwiml);
+      }, timeoutMs);
+    });
 
-        const result = await Promise.race([
-          handleExpense(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, messageSid),
-          timeoutPromise
-        ]).finally(() => timeoutId && clearTimeout(timeoutId));
+    const result = await Promise.race([
+      handleExpense(
+        req.from,
+        text2,
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        messageSid,
+        req.body // ✅ pass Twilio payload
+      ),
+      timeoutPromise
+    ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
-        if (!res.headersSent) {
-          const twiml =
-            typeof result === 'string'
-              ? result
-              : (result && typeof result.twiml === 'string' ? result.twiml : null);
+    if (!res.headersSent) {
+      const twiml =
+        typeof result === 'string'
+          ? result
+          : (result && typeof result.twiml === 'string' ? result.twiml : null);
 
-          return sendTwiml(res, twiml); // null -> <Response></Response>
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] expense handler failed:', e?.message);
-        if (!res.headersSent) return ok(res, null);
-        return;
-      }
+      return sendTwiml(res, twiml); // null -> <Response></Response>
     }
+    return;
+  } catch (e) {
+    console.warn('[WEBHOOK] expense handler failed:', e?.message);
+    if (!res.headersSent) return ok(res, null);
+    return;
+  }
+}
+
 
     /* -----------------------------------------------------------------------
      * (C) Other command routing (tasks / jobs / timeclock / forecast / KPIs / agent)

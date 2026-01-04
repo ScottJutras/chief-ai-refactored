@@ -858,29 +858,36 @@ router.post('*', async (req, res, next) => {
     const isRevenuePA = paKind === 'confirm_revenue' || paKind === 'pick_job_for_revenue';
 
     if (isExpensePA) {
-      try {
-        const tw = await handleExpense(
-  req.from,
-  text2,
-  req.userProfile,
-  req.ownerId,
-  req.ownerProfile,
-  req.isOwner,
-  messageSid,
-  req.body // ✅ pass Twilio form payload for ListId/ListTitle/etc
-);
+  try {
+    const expenseMod = require('../handlers/commands/expense');
+    const expenseHandler = expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
 
-
-        if (!res.headersSent) {
-          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          return ok(res); // empty
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] expense PA router failed (ignored):', e?.message);
-      }
+    if (!expenseHandler) {
+      throw new Error('expense handler export missing (handleExpense)');
     }
+
+    const tw = await expenseHandler(
+      req.from,
+      text2,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid,
+      req.body // ✅ pass Twilio payload
+    );
+
+    if (!res.headersSent) {
+      if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+      if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+      return ok(res); // empty
+    }
+    return;
+  } catch (e) {
+    console.warn('[WEBHOOK] expense PA router failed (ignored):', e?.message);
+  }
+}
+
 
     if (isRevenuePA) {
       try {
@@ -981,29 +988,36 @@ router.post('*', async (req, res, next) => {
     }
 
     if (pendingExpenseLike) {
-      try {
-        const { handleExpense } = require('../handlers/commands/expense');
-        const tw = await handleExpense(
-  req.from,
-  text2,
-  req.userProfile,
-  req.ownerId,
-  req.ownerProfile,
-  req.isOwner,
-  messageSid,
-  req.body // ✅ pass Twilio payload
-);
+  try {
+    const expenseMod = require('../handlers/commands/expense');
+    const expenseHandler = expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
 
-        if (!res.headersSent) {
-          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          return ok(res);
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
-      }
+    if (!expenseHandler) {
+      throw new Error('expense handler export missing (handleExpense)');
     }
+
+    const tw = await expenseHandler(
+      req.from,
+      text2,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid,
+      req.body // ✅ pass Twilio payload
+    );
+
+    if (!res.headersSent) {
+      if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+      if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+      return ok(res);
+    }
+    return;
+  } catch (e) {
+    console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
+  }
+}
+
 
     /* -----------------------------------------------------------------------
  * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)

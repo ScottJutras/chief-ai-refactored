@@ -2851,28 +2851,50 @@ if (confirmPA?.payload?.draft) {
     if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
 
     const writeResult = await withTimeout(
-      insertTransaction(
-        {
-          ownerId,
-          kind: 'expense',
-          date: data.date || todayInTimeZone(tz),
-          description: String(data.item || '').trim() || 'Unknown',
-          amount_cents: amountCents,
-          amount: toNumberAmount(data.amount),
-          source: String(data.store || '').trim() || 'Unknown',
-          job: jobNo != null ? String(jobNo) : jobName,
-          job_name: jobName,
-          job_id: maybeJobId || null,
-          job_no: jobNo,
-          category: category ? String(category).trim() : null,
-          user_name: userProfile?.name || 'Unknown User',
-          source_msg_id: stableMsgId
-        },
-        { timeoutMs: 4500 }
-      ),
-      5200,
-      '__DB_TIMEOUT__'
-    );
+  insertTransaction(
+    {
+      ownerId,
+      kind: 'expense',
+      date: data.date || todayInTimeZone(tz),
+      description: String(data.item || '').trim() || 'Unknown',
+      amount_cents: amountCents,
+      amount: toNumberAmount(data.amount),
+      source: String(data.store || '').trim() || 'Unknown',
+      job: jobNo != null ? String(jobNo) : jobName,
+      job_name: jobName,
+      job_id: maybeJobId || null,
+      job_no: jobNo,
+      category: category ? String(category).trim() : null,
+      user_name: userProfile?.name || 'Unknown User',
+      source_msg_id: stableMsgId
+    },
+    { timeoutMs: 4500 }
+  ),
+  5200,
+  '__DB_TIMEOUT__'
+);
+
+if (writeResult === '__DB_TIMEOUT__') {
+  await upsertPA({ /* ... */ });
+
+  return out(
+    twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
+    false
+  );
+}
+
+// ✅ Now it’s safe / meaningful to log
+console.info('[EXPENSE_WRITE_RESULT]', {
+  userId: paUserId,
+  inserted: writeResult?.inserted,
+  job_no: jobNo,
+  jobName,
+  amount: data.amount,
+  store: data.store,
+  sourceMsgId: stableMsgId
+});
+
+
 
     if (writeResult === '__DB_TIMEOUT__') {
       await upsertPA({

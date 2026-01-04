@@ -936,9 +936,11 @@ if (titleJobNo != null) {
     };
   }
 
-  // stale/foreign menu (title job no not found in our snapshot)
-  return { ok: false, reason: 'legacy_title_jobno_not_found' };
+  // IMPORTANT:
+  // If not found, that leading number is probably a UI index ("#2") not a jobNo.
+  // Do NOT reject; fall through to title/name matching and ix mapping.
 }
+
 
 // (B/C) ix mapping path
 const ix = legacyIndexFromTwilioToken(tok);

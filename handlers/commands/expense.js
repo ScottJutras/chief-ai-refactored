@@ -910,15 +910,39 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
     };
   }
 
-  // Legacy PATH: Body="job_<n>_<hash>" and ListTitle="#<n> <name>" where <n> is often a UI index, NOT jobNo.
+  // ----------------------------
+// 2) LEGACY PATH: Body="job_<n>_<hash>" and ListTitle="#<n> <name>"
+// On some clients, <n> acts like JOB NO, not row index.
 // Strategy:
-//   1) Prefer matching by inbound title text against sentRows (most reliable)
-//   2) If no title text match, fall back to ix mapping (best-effort)
+//   A) Prefer title-derived jobNo IF it exists in pickState.jobOptions (safe)
+//   B) Prefer title/name match against sentRows
+//   C) Fall back to ix mapping into sentRows (best-effort)
+// ----------------------------
 
+const inboundTitleRaw = String(inboundTitle || '').trim();
+const opts = Array.isArray(pickState?.jobOptions) ? pickState.jobOptions : [];
+
+// (A) Title-derived jobNo (safe if it exists in jobOptions snapshot)
+const titleJobNo = jobNoFromTitle(inboundTitleRaw);
+if (titleJobNo != null) {
+  const n = Number(titleJobNo);
+  const exists = opts.some((j) => Number(j?.job_no ?? j?.jobNo) === n);
+
+  if (exists) {
+    return {
+      ok: true,
+      jobNo: n,
+      meta: { mode: 'legacy_title_jobno', flow, pickerNonce, displayedHash }
+    };
+  }
+
+  // stale/foreign menu (title job no not found in our snapshot)
+  return { ok: false, reason: 'legacy_title_jobno_not_found' };
+}
+
+// (B/C) ix mapping path
 const ix = legacyIndexFromTwilioToken(tok);
 if (ix != null) {
-  const inboundTitleRaw = String(inboundTitle || '').trim();
-
   // 1) Prefer matching by NAME/TITLE (ignore "#2 " prefix)
   const strippedTitleNorm = normalizeListTitle(
     inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim()
@@ -963,11 +987,11 @@ if (ix != null) {
           meta: { mode: 'legacy_title_name_match', ix, flow, pickerNonce, displayedHash }
         };
       }
-      // If tie, we fall through to ix mapping below
+      // If tie, fall through to ix mapping
     }
   }
 
-  // 2) Fall back to ix mapping into sentRows (still best-effort)
+  // 2) Fall back to ix mapping into sentRows
   if (!sentRows.length || ix > sentRows.length) {
     return { ok: false, reason: 'legacy_ix_out_of_range' };
   }
@@ -979,9 +1003,7 @@ if (ix != null) {
     return { ok: false, reason: 'legacy_bad_jobno' };
   }
 
-  // If displayed list exists, enforce it
   if (displayedJobNos.length && !displayedJobNos.includes(expectedJobNo)) {
-    // IMPORTANT: do NOT hard-reject based on the "#2" prefix; just fail safely
     return { ok: false, reason: 'legacy_job_not_in_displayed' };
   }
 
@@ -992,8 +1014,8 @@ if (ix != null) {
   };
 }
 
+return { ok: false, reason: 'unrecognized_row_id' };
 
-  return { ok: false, reason: 'unrecognized_row_id' };
 }
 
 
@@ -1695,6 +1717,8 @@ async function sendJobPickList({
   // deterministic, job_no-first clean list
   const seen = new Set();
   const clean = [];
+  
+
   for (const j of jobOptions || []) {
     const jobNo = j?.job_no != null ? Number(j.job_no) : null;
     if (jobNo == null || !Number.isFinite(jobNo)) continue;
@@ -1710,7 +1734,11 @@ async function sendJobPickList({
 
     clean.push({ id: safeUuidId, job_no: jobNo, name });
   }
-
+// ✅ Put debug HERE (after clean is built)
+console.info('[JOB_PICK_CLEAN]', {
+  total: clean.length,
+  jobNos: clean.map(x => x.job_no).slice(0, 40)
+});
   clean.sort((a, b) => Number(a.job_no) - Number(b.job_no));
 
   const start = p * ps;
@@ -2372,12 +2400,13 @@ const lockKey = `lock:${paUserId}`;
   input: rawInput,
   twilioMeta: inboundTwilioMeta,
   pickState: {
-    flow,
-    pickerNonce,
-    displayedHash,
-    displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
-    sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : []
-  }
+  flow,
+  pickerNonce,
+  displayedHash,
+  displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
+  sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : [],
+  jobOptions: Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [] // ✅ add
+}
 });
 
 

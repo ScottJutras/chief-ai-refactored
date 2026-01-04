@@ -905,58 +905,88 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
     };
   }
 
-  // ----------------------------
-  // 2) LEGACY PATH: WhatsApp sends Body="job_<ix>_<hash>" + ListTitle="#<jobNo> <name>"
-  // Strategy:
-  //   A) Prefer extracting jobNo from inbound title (most reliable)
-  //   B) If no jobNo in title, fall back to ix mapping + best-effort title/name match
-  // ----------------------------
+  // Legacy PATH: Body="job_<n>_<hash>" and ListTitle="#<n> <name>" where <n> is often a UI index, NOT jobNo.
+// Strategy:
+//   1) Prefer matching by inbound title text against sentRows (most reliable)
+//   2) If no title text match, fall back to ix mapping (best-effort)
 
-  // (A) Prefer title-derived jobNo
-  const titleJobNo = jobNoFromTitle(inboundTitle);
-  if (titleJobNo != null) {
-    if (displayedJobNos.length && !displayedJobNos.includes(Number(titleJobNo))) {
-      return { ok: false, reason: 'legacy_jobno_not_in_displayed' };
+const ix = legacyIndexFromTwilioToken(tok);
+if (ix != null) {
+  const inboundTitleRaw = String(inboundTitle || '').trim();
+
+  // 1) Prefer matching by NAME/TITLE (ignore "#2 " prefix)
+  const strippedTitleNorm = normalizeListTitle(
+    inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim()
+  );
+
+  if (strippedTitleNorm && sentRows.length) {
+    const candidates = sentRows
+      .map((r) => {
+        const nameNorm = normalizeListTitle(r?.name || '');
+        const titleNorm = normalizeListTitle(r?.title || '');
+        const jobNo = Number(r?.jobNo);
+        if (!Number.isFinite(jobNo)) return null;
+        if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return null;
+
+        // score: exact > prefix > contains
+        let score = 0;
+        if (nameNorm === strippedTitleNorm || titleNorm === strippedTitleNorm) score = 3;
+        else if (
+          (nameNorm && nameNorm.startsWith(strippedTitleNorm)) ||
+          (titleNorm && titleNorm.startsWith(strippedTitleNorm)) ||
+          (strippedTitleNorm && strippedTitleNorm.startsWith(nameNorm))
+        ) score = 2;
+        else if (
+          (nameNorm && nameNorm.includes(strippedTitleNorm)) ||
+          (titleNorm && titleNorm.includes(strippedTitleNorm)) ||
+          (strippedTitleNorm && strippedTitleNorm.includes(nameNorm))
+        ) score = 1;
+
+        return score ? { jobNo, score, row: r } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+
+    if (candidates.length) {
+      // If top score is unique, accept it
+      const top = candidates[0];
+      const second = candidates[1];
+      if (!second || second.score < top.score) {
+        return {
+          ok: true,
+          jobNo: Number(top.jobNo),
+          meta: { mode: 'legacy_title_name_match', ix, flow, pickerNonce, displayedHash }
+        };
+      }
+      // If tie, we fall through to ix mapping below
     }
-    return {
-      ok: true,
-      jobNo: Number(titleJobNo),
-      meta: { mode: 'legacy_title_jobno', flow, pickerNonce, displayedHash }
-    };
   }
 
-  // (B) Fall back to ix mapping
-  const ix = legacyIndexFromTwilioToken(tok);
-  if (ix != null) {
-    if (!sentRows.length || ix > sentRows.length) {
-      return { ok: false, reason: 'legacy_ix_out_of_range' };
-    }
-
-    const expectedRow = sentRows[ix - 1]; // {ix, jobNo, name, title}
-    const expectedNameNorm = normalizeListTitle(expectedRow?.name || '');
-    const expectedTitleNorm = normalizeListTitle(expectedRow?.title || '');
-
-    // Best-effort title match (WhatsApp truncates)
-    const titleOk =
-      (expectedTitleNorm && inboundTitleNorm && expectedTitleNorm.startsWith(inboundTitleNorm)) ||
-      (expectedTitleNorm && inboundTitleNorm && inboundTitleNorm.startsWith(expectedTitleNorm)) ||
-      (expectedNameNorm && inboundTitleNorm && inboundTitleNorm.includes(expectedNameNorm)) ||
-      (expectedNameNorm && inboundTitleNorm && expectedNameNorm.includes(inboundTitleNorm));
-
-    if (inboundTitleNorm && !titleOk) {
-      return { ok: false, reason: 'legacy_title_mismatch' };
-    }
-
-    if (displayedJobNos.length && !displayedJobNos.includes(Number(expectedRow.jobNo))) {
-      return { ok: false, reason: 'legacy_job_not_in_displayed' };
-    }
-
-    return {
-      ok: true,
-      jobNo: Number(expectedRow.jobNo),
-      meta: { mode: 'legacy_index', ix, flow, pickerNonce, displayedHash }
-    };
+  // 2) Fall back to ix mapping into sentRows (still best-effort)
+  if (!sentRows.length || ix > sentRows.length) {
+    return { ok: false, reason: 'legacy_ix_out_of_range' };
   }
+
+  const expectedRow = sentRows[ix - 1]; // {ix, jobNo, name, title}
+  const expectedJobNo = Number(expectedRow?.jobNo);
+
+  if (!Number.isFinite(expectedJobNo)) {
+    return { ok: false, reason: 'legacy_bad_jobno' };
+  }
+
+  // If displayed list exists, enforce it
+  if (displayedJobNos.length && !displayedJobNos.includes(expectedJobNo)) {
+    // IMPORTANT: do NOT hard-reject based on the "#2" prefix; just fail safely
+    return { ok: false, reason: 'legacy_job_not_in_displayed' };
+  }
+
+  return {
+    ok: true,
+    jobNo: expectedJobNo,
+    meta: { mode: 'legacy_index', ix, flow, pickerNonce, displayedHash }
+  };
+}
+
 
   return { ok: false, reason: 'unrecognized_row_id' };
 }

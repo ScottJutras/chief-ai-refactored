@@ -1,17 +1,18 @@
 // handlers/commands/job.js
-// COMPLETE DROP-IN (BETA-ready; aligned to revenue.js + expense.js + postgres.js)
+// COMPLETE DROP-IN (BETA-ready; aligned to revenue.js + expense.js + timeclock.js + postgres.js)
 //
-// ✅ What this version fixes / aligns:
-// - Job picker IDs now match revenue/expense: `jobno_<job_no>` (stable), plus legacy `job_<n>_<hash>` support
-// - Picker state stores jobOptions + displayedJobNos so replies "1" (page-relative), "#6", "jobno_6", or job name work reliably
-// - Active-job persistence aligns with revenue.js safety rules:
-//   • NEVER write non-UUID into job_id columns
-//   • Prefer pg.setActiveJobForIdentity(owner, identityDigits, jobId(uuid|null), jobName|null)
-//   • Fallback to pg.setActiveJob(owner, identityDigits, jobRef) and other aliases
+// ✅ Alignments included (without dropping beta-critical logic):
+// - ✅ Job picker IDs now match revenue/expense: `jobno_<job_no>` (stable), plus legacy `job_<n>_<hash>` support
+// - ✅ Picker state stores jobOptions + displayedJobNos so replies "1" (page-relative), "#6", "jobno_6", "job_<n>_<hash>", or job name work reliably
+// - ✅ Active-job persistence aligns with safety rules:
+//   • NEVER write non-UUID into job_id / active_job_id columns
+//   • Prefer pg.setActiveJobForIdentity(ownerId, identityDigits, jobId(uuid|null), jobName|null)
+//   • Fallback to pg.setActiveJob(ownerId, identityDigits, jobRef) and other aliases
 //   • Last-resort SQL updates are UUID-only
-// - ENABLE_LIST_PICKER default matches expense.js behavior (true unless explicitly "false")
-// - Uses Twilio interactive list helper if available (services/twilio), otherwise falls back to Twilio Content API list-picker, otherwise text
-// - Keeps existing commands: list jobs, create job idempotent, set active job by name, open picker, cancel, more
+// - ✅ ENABLE_LIST_PICKER default matches expense.js behavior (true unless explicitly "false")
+// - ✅ Uses Twilio interactive list helper if available (services/twilio), otherwise Content API list-picker, otherwise text
+// - ✅ Keeps existing commands: list jobs, create job idempotent, set active job by name, open picker, cancel, more
+// - ✅ OwnerId is UUID/text-safe (DO NOT strip digits from ownerId)
 //
 // Signature:
 //   handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId)
@@ -22,14 +23,19 @@ const state = require('../../utils/stateManager');
 // Twilio helpers (preferred)
 let sendWhatsAppInteractiveList = null;
 try {
+  // eslint-disable-next-line global-require
   const tw = require('../../services/twilio');
-  sendWhatsAppInteractiveList = typeof tw.sendWhatsAppInteractiveList === 'function' ? tw.sendWhatsAppInteractiveList : null;
+  sendWhatsAppInteractiveList =
+    typeof tw.sendWhatsAppInteractiveList === 'function' ? tw.sendWhatsAppInteractiveList : null;
 } catch {}
 
 // ✅ fetch polyfill so Content API list-picker doesn't silently fail
+// Node 18+ has global.fetch. If not, fall back.
 const fetch = global.fetch || require('node-fetch');
 
-const getPendingTransactionState = state.getPendingTransactionState || state.getPendingState || (async () => null);
+const getPendingTransactionState =
+  state.getPendingTransactionState || state.getPendingState || (async () => null);
+
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
@@ -43,11 +49,11 @@ function DIGITS(x) {
     .replace(/\D/g, '');
 }
 
-function ownerDigits(ownerId, fromPhone) {
-  const base = ownerId || fromPhone;
+function OWNER(x, fromPhone) {
+  // ✅ DO NOT strip digits. Owner IDs may be UUID/text now.
+  const base = x || fromPhone;
   const s = String(base || '').trim();
-  if (!s) return null;
-  return DIGITS(s) || null;
+  return s || null;
 }
 
 function escapeXml(str = '') {
@@ -60,7 +66,7 @@ function escapeXml(str = '') {
 }
 
 function twimlText(message) {
-  return `<Response><Message>${escapeXml(message)}</Message></Response>`;
+  return `<Response><Message>${escapeXml(String(message || '').trim())}</Message></Response>`;
 }
 
 function twimlEmpty() {
@@ -68,11 +74,23 @@ function twimlEmpty() {
 }
 
 function respond(res, message) {
-  const twiml = twimlText(message);
-  if (res && typeof res.send === 'function' && !res.headersSent) {
-    res.type('text/xml').send(twiml);
+  const xml = twimlText(message);
+  if (res && typeof res.status === 'function' && typeof res.send === 'function' && !res.headersSent) {
+    res.status(200).type('application/xml').send(xml);
+  } else if (res && typeof res.type === 'function' && typeof res.send === 'function' && !res.headersSent) {
+    res.type('text/xml').send(xml);
   }
-  return twiml;
+  return xml;
+}
+
+function respondEmpty(res) {
+  const xml = twimlEmpty();
+  if (res && typeof res.status === 'function' && typeof res.send === 'function' && !res.headersSent) {
+    res.status(200).type('application/xml').send(xml);
+  } else if (res && typeof res.type === 'function' && typeof res.send === 'function' && !res.headersSent) {
+    res.type('text/xml').send(xml);
+  }
+  return xml;
 }
 
 function waTo(fromPhone) {
@@ -191,6 +209,7 @@ function getTwilioClient() {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
   if (!accountSid || !authToken) throw new Error('Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN');
+  // eslint-disable-next-line global-require
   const twilio = require('twilio');
   return twilio(accountSid, authToken);
 }
@@ -270,18 +289,18 @@ async function sendWhatsAppListPicker({ to, body, button, items, cacheKey }) {
   ]);
 }
 
-/* ---------------- Active job persistence (ALIGNED with postgres.js + revenue.js safety) ---------------- */
+/* ---------------- Active job persistence (ALIGNED with postgres.js + revenue/expense safety) ---------------- */
 /**
- * Canonical: pg.setActiveJobForIdentity(ownerDigits, identityDigits, jobId(uuid|null), jobName|null)
- * Also supports: pg.setActiveJob(ownerDigits, identityDigits, jobRef) (jobRef = jobName or job_no)
+ * Canonical: pg.setActiveJobForIdentity(ownerId, identityDigits, jobId(uuid|null), jobName|null)
+ * Also supports: pg.setActiveJob(ownerId, identityDigits, jobRef) (jobRef = jobName or job_no)
  *
  * Rules:
  * - NEVER persist tokens as jobName (jobno_/jobix_/job_<n>_<hash>/#6)
  * - NEVER write non-UUID into job_id / active_job_id columns
- * - Prefer identity = DIGITS(fromPhone) so it aligns with pg.getActiveJobForIdentity(owner, fromPhone)
+ * - Prefer identity = DIGITS(fromPhone) so it aligns with pg.getActiveJobForIdentity(ownerId, fromPhone)
  */
 async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, jobRow, jobNameFallback }) {
-  const owner = DIGITS(ownerId);
+  const owner = OWNER(ownerId, fromPhone);
   const identity =
     DIGITS(fromPhone) ||
     DIGITS(userProfile?.phone_e164) ||
@@ -326,7 +345,7 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
   // 1) Canonical identity-based setter
   if (typeof pg.setActiveJobForIdentity === 'function') {
     try {
-      await pg.setActiveJobForIdentity(owner, String(identity), jobUuid || null, jobName || null);
+      await pg.setActiveJobForIdentity(String(owner).trim(), String(identity), jobUuid || null, jobName || null);
       return true;
     } catch (e) {
       console.warn('[JOB] pg.setActiveJobForIdentity failed:', e?.message);
@@ -337,7 +356,7 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
   const jobRef = jobName || (jobNo != null ? String(jobNo) : null);
   if (typeof pg.setActiveJob === 'function' && jobRef) {
     try {
-      await pg.setActiveJob(owner, String(identity), String(jobRef));
+      await pg.setActiveJob(String(owner).trim(), String(identity), String(jobRef));
       return true;
     } catch (e) {
       console.warn('[JOB] pg.setActiveJob failed:', e?.message);
@@ -357,13 +376,13 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
     if (typeof pg[fn] !== 'function') continue;
     try {
       // Try (owner, identity, jobUuid, jobName)
-      await pg[fn](owner, String(identity), jobUuid || null, jobName || null);
+      await pg[fn](String(owner).trim(), String(identity), jobUuid || null, jobName || null);
       return true;
     } catch {
       try {
         if (!jobRef) throw new Error('missing jobRef');
         // Try (owner, identity, jobRef)
-        await pg[fn](owner, String(identity), String(jobRef));
+        await pg[fn](String(owner).trim(), String(identity), String(jobRef));
         return true;
       } catch (e2) {
         console.warn('[JOB] pg.' + fn + ' failed:', e2?.message);
@@ -402,7 +421,7 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
   if (jobUuid && typeof pg.query === 'function') {
     for (const a of sqlAttempts) {
       try {
-        const r = await pg.query(a.sql, [owner, String(identity), jobUuid, jobName || '']);
+        const r = await pg.query(a.sql, [String(owner).trim(), String(identity), jobUuid, jobName || '']);
         if (r?.rowCount) return true;
       } catch {}
     }
@@ -461,7 +480,7 @@ async function listActiveJobsDetailed(ownerId, { limit = 50 } = {}) {
     } catch {}
   }
 
-  // SQL fallback (most reliable when available)
+  // SQL fallback
   if (typeof pg.query === 'function') {
     try {
       const { rows } = await pg.query(
@@ -482,13 +501,13 @@ async function listActiveJobsDetailed(ownerId, { limit = 50 } = {}) {
     } catch {}
   }
 
-  // pg.listOpenJobs fallback (names only, no job_no)
+  // pg.listOpenJobs fallback (names only, no job_no guarantee)
   if (typeof pg.listOpenJobs === 'function') {
     try {
       const out = await pg.listOpenJobs(String(ownerId), { limit });
       return (Array.isArray(out) ? out : []).map((name, idx) => ({
         id: null,
-        job_no: idx + 1, // last-resort pseudo-number; still stable per list ordering but not DB job_no
+        job_no: idx + 1,
         name: sanitizeJobLabel(name)
       }));
     } catch {}
@@ -517,7 +536,6 @@ function normalizeJobOptions(jobRows) {
     out.push({ id: safeUuidId, job_no, name });
   }
 
-  // deterministic
   out.sort((a, b) => Number(a.job_no) - Number(b.job_no));
   return out;
 }
@@ -537,7 +555,9 @@ function buildTextPicker(jobOptions, page, perPage) {
   const hasMore = start + perPage < jobOptions.length;
   const more = hasMore ? `\nReply "more" for more jobs.` : '';
 
-  return `Which job should I set active?\n\n${lines.join('\n')}\n\nReply with a number, "#jobno", job name, or "Overhead".${more}`;
+  return `Which job should I set active?\n\n${lines.join(
+    '\n'
+  )}\n\nReply with a number, "#jobno", job name, or "Overhead".${more}`;
 }
 
 async function clearPickerState(fromPhone) {
@@ -547,7 +567,8 @@ async function clearPickerState(fromPhone) {
     activeJobPickHasMore: null,
     activeJobPickTotal: null,
     activeJobOptions: null,
-    activeJobPickDisplayedJobNos: null
+    activeJobPickDisplayedJobNos: null,
+    activeJobPickPerPage: null
   });
 }
 
@@ -608,6 +629,7 @@ function resolvePickerReply(raw, pending) {
   const name = sanitizeJobLabel(s0);
   const job =
     jobOptions.find((j) => String(j?.name || '').trim().toLowerCase() === name.toLowerCase()) || null;
+
   return job ? { kind: 'job', job } : { kind: 'name', name };
 }
 
@@ -642,7 +664,7 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptio
 
   // Prefer interactive list helper (same flow as revenue/expense)
   if (sendWhatsAppInteractiveList) {
-    const rows = slice.map((j, idx) => {
+    const rows = slice.map((j) => {
       const jobNo = Number(j.job_no);
       const full = sanitizeJobLabel(j.name);
       return {
@@ -667,10 +689,7 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptio
         sections: [{ title: 'Active Jobs', rows }]
       });
 
-      if (res && typeof res.send === 'function' && !res.headersSent) {
-        res.type('text/xml').send(twimlEmpty());
-      }
-      return twimlEmpty();
+      return respondEmpty(res);
     } catch (e) {
       console.warn('[JOB] sendWhatsAppInteractiveList failed; falling back:', e?.message);
       return respond(res, buildTextPicker(clean, p, JOBS_PER_PAGE));
@@ -700,13 +719,10 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptio
       body,
       button,
       items,
-      cacheKey: `active_jobs:${ownerId}:${p}:${stableHash(JSON.stringify(items))}`
+      cacheKey: `active_jobs:${String(ownerId)}:${p}:${stableHash(JSON.stringify(items))}`
     });
 
-    if (res && typeof res.send === 'function' && !res.headersSent) {
-      res.type('text/xml').send(twimlEmpty());
-    }
-    return twimlEmpty();
+    return respondEmpty(res);
   } catch (e) {
     console.warn('[JOB] list-picker send failed; falling back to text:', e?.message);
     return respond(res, buildTextPicker(clean, p, JOBS_PER_PAGE));
@@ -715,8 +731,10 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptio
 
 /* ---------------- job activation helpers ---------------- */
 
-async function activateJobBestEffort(owner, selector) {
+async function activateJobBestEffort(ownerId, selector) {
+  const owner = String(ownerId || '').trim();
   const s = sanitizeJobLabel(selector);
+  if (!owner) throw new Error('missing ownerId');
   if (!s) throw new Error('missing selector');
 
   // jobno_#
@@ -741,7 +759,7 @@ async function activateJobBestEffort(owner, selector) {
                   updated_at = NOW()
             WHERE owner_id = $1 AND job_no = $2
         RETURNING id, job_no, COALESCE(name, job_name) AS name`,
-          [String(owner), Number(jobNo)]
+          [owner, Number(jobNo)]
         );
         if (r?.rows?.[0]) return r.rows[0];
       }
@@ -771,7 +789,7 @@ async function activateJobBestEffort(owner, selector) {
         WHERE owner_id = $1
           AND LOWER(COALESCE(name, job_name)) = LOWER($2)
     RETURNING id, job_no, COALESCE(name, job_name) AS name`,
-      [String(owner), s]
+      [owner, s]
     );
     if (r?.rows?.[0]) return r.rows[0];
   }
@@ -782,191 +800,215 @@ async function activateJobBestEffort(owner, selector) {
 /* ---------------- main handler ---------------- */
 
 async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId) {
-  const owner = ownerDigits(ownerId, fromPhone);
+  const owner = OWNER(ownerId, fromPhone);
   if (!owner) return respond(res, `I couldn't figure out which account this belongs to yet.`);
 
   const msg = String(text || '').trim();
   const lc = msg.toLowerCase();
 
-  const pending = await getPendingTransactionState(fromPhone);
+  try {
+    const pending = await getPendingTransactionState(fromPhone);
 
-  // --- Awaiting picker selection ---
-  if (pending?.awaitingActiveJobPick) {
-    if (isCancelLike(lc)) {
+    // --- Awaiting picker selection ---
+    if (pending?.awaitingActiveJobPick) {
+      if (isCancelLike(lc)) {
+        await clearPickerState(fromPhone);
+        return respond(res, `❌ Cancelled. (No active job changed.)`);
+      }
+
+      if (isPickerOpenCommand(lc)) {
+        const jobs = normalizeJobOptions(await listActiveJobsDetailed(owner, { limit: 50 }));
+        return await sendActiveJobPickerOrFallback({
+          res,
+          fromPhone,
+          ownerId: owner,
+          jobOptions: jobs,
+          page: 0,
+          perPage: 8
+        });
+      }
+
+      const resolved = resolvePickerReply(msg, pending);
+
+      if (!resolved) {
+        return respond(res, `⚠️ I didn’t catch that. Reply with a number, "#jobno", job name, "Overhead", or "more".`);
+      }
+
+      if (resolved.kind === 'more') {
+        const all = normalizeJobOptions(await listActiveJobsDetailed(owner, { limit: 50 }));
+        const nextPage = Number(pending.activeJobPickPage || 0) + 1;
+        const hasMore = !!pending.activeJobPickHasMore;
+        if (!hasMore) return respond(res, `No more jobs to show. Reply with a number, job name, or "Overhead".`);
+        return await sendActiveJobPickerOrFallback({
+          res,
+          fromPhone,
+          ownerId: owner,
+          jobOptions: all,
+          page: nextPage,
+          perPage: 8
+        });
+      }
+
       await clearPickerState(fromPhone);
-      return respond(res, `❌ Cancelled. (No active job changed.)`);
+
+      if (resolved.kind === 'overhead') {
+        // keep backward behavior (no DB change)
+        return respond(res, `✅ Okay — using Overhead (no active job).`);
+      }
+
+      // If we got a job object from picker, use it; otherwise try name.
+      const pickedJob = resolved.kind === 'job' ? resolved.job : null;
+      const pickedName = pickedJob?.name || (resolved.kind === 'name' ? resolved.name : null);
+      const pickedJobNo = pickedJob?.job_no != null ? Number(pickedJob.job_no) : null;
+
+      try {
+        // Activate job
+        const selector = pickedJobNo != null ? `jobno_${pickedJobNo}` : pickedName;
+        const j = await activateJobBestEffort(owner, selector);
+
+        await persistActiveJobBestEffort({
+          ownerId: owner,
+          userProfile,
+          fromPhone,
+          jobRow: j,
+          jobNameFallback: pickedName || j?.name
+        });
+
+        const finalName = sanitizeJobLabel(j?.name || j?.job_name || pickedName || 'Untitled Job');
+        const jobNo = j?.job_no ?? pickedJobNo ?? '?';
+
+        return respond(
+          res,
+          `✅ Active job set to: "${finalName}" (Job #${jobNo}).
+
+Now you can:
+- "clock in"
+- "expense 84.12 nails"
+- "received $2500 deposit"
+- "task - order shingles due tomorrow"`
+        );
+      } catch (e) {
+        console.warn('[JOB] activate/persist failed:', e?.message);
+        return respond(res, `⚠️ I couldn't set that active job. Try: "active job ${pickedName || 'Oak Street'}"`);
+      }
     }
 
+    // --- Open picker ---
     if (isPickerOpenCommand(lc)) {
       const jobs = normalizeJobOptions(await listActiveJobsDetailed(owner, { limit: 50 }));
-      return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobOptions: jobs, page: 0, perPage: 8 });
-    }
-
-    const resolved = resolvePickerReply(msg, pending);
-
-    if (!resolved) {
-      return respond(res, `⚠️ I didn’t catch that. Reply with a number, "#jobno", job name, "Overhead", or "more".`);
-    }
-
-    if (resolved.kind === 'more') {
-      const all = normalizeJobOptions(await listActiveJobsDetailed(owner, { limit: 50 }));
-      const nextPage = Number(pending.activeJobPickPage || 0) + 1;
-      const hasMore = !!pending.activeJobPickHasMore;
-      if (!hasMore) return respond(res, `No more jobs to show. Reply with a number, job name, or "Overhead".`);
       return await sendActiveJobPickerOrFallback({
         res,
         fromPhone,
         ownerId: owner,
-        jobOptions: all,
-        page: nextPage,
+        jobOptions: jobs,
+        page: 0,
         perPage: 8
       });
     }
 
-    await clearPickerState(fromPhone);
+    // --- Direct set active job ---
+    if (/^(active\s+job|set\s+active|switch\s+job)\b/i.test(msg)) {
+      const rest = msg.replace(/^(active\s+job|set\s+active|switch\s+job)\b/i, '').trim();
+      if (!rest) return respond(res, `Which job should I set active? Try: "active job Oak Street"`);
 
-    if (resolved.kind === 'overhead') {
-      // keep backward behavior (no DB change)
-      return respond(res, `✅ Okay — using Overhead (no active job).`);
-    }
+      try {
+        const selector = normalizeJobAnswer(rest);
+        const j = await activateJobBestEffort(owner, selector);
 
-    // If we got a job object from picker, use it; otherwise try name.
-    const pickedJob = resolved.kind === 'job' ? resolved.job : null;
-    const pickedName = pickedJob?.name || (resolved.kind === 'name' ? resolved.name : null);
-    const pickedJobNo = pickedJob?.job_no != null ? Number(pickedJob.job_no) : null;
+        await persistActiveJobBestEffort({
+          ownerId: owner,
+          userProfile,
+          fromPhone,
+          jobRow: j,
+          jobNameFallback: rest
+        });
 
-    try {
-      // Activate job
-      const selector = pickedJobNo != null ? `jobno_${pickedJobNo}` : pickedName;
-      const j = await activateJobBestEffort(owner, selector);
+        const jobName = sanitizeJobLabel(j?.name || j?.job_name || rest);
+        const jobNo = j?.job_no ?? '?';
 
-      await persistActiveJobBestEffort({
-        ownerId: owner,
-        userProfile,
-        fromPhone,
-        jobRow: j,
-        jobNameFallback: pickedName || j?.name
-      });
-
-      const finalName = sanitizeJobLabel(j?.name || j?.job_name || pickedName || 'Untitled Job');
-      const jobNo = j?.job_no ?? pickedJobNo ?? '?';
-
-      return respond(
-        res,
-        `✅ Active job set to: "${finalName}" (Job #${jobNo}).
+        return respond(
+          res,
+          `✅ Active job set to: "${jobName}" (Job #${jobNo}).
 
 Now you can:
 - "clock in"
 - "expense 84.12 nails"
 - "received $2500 deposit"
 - "task - order shingles due tomorrow"`
-      );
-    } catch (e) {
-      console.warn('[JOB] activate/persist failed:', e?.message);
-      return respond(res, `⚠️ I couldn't set that active job. Try: "active job ${pickedName || 'Oak Street'}"`);
+        );
+      } catch (e) {
+        console.warn('[JOB] direct activate failed:', e?.message);
+        return respond(res, `⚠️ I couldn't set that active job. Try "change job" to pick from a list.`);
+      }
     }
-  }
 
-  // --- Open picker ---
-  if (isPickerOpenCommand(lc)) {
-    const jobs = normalizeJobOptions(await listActiveJobsDetailed(owner, { limit: 50 }));
-    return await sendActiveJobPickerOrFallback({ res, fromPhone, ownerId: owner, jobOptions: jobs, page: 0, perPage: 8 });
-  }
+    // --- List jobs ---
+    if (/^(jobs|list jobs|show jobs|show job list|job list)\b/i.test(msg)) {
+      const reply = await listJobs(owner);
+      return respond(res, reply);
+    }
 
-  // --- Direct set active job ---
-  if (/^(active\s+job|set\s+active|switch\s+job)\b/i.test(msg)) {
-    const rest = msg.replace(/^(active\s+job|set\s+active|switch\s+job)\b/i, '').trim();
-    if (!rest) return respond(res, `Which job should I set active? Try: "active job Oak Street"`);
+    // --- Create job (idempotent) ---
+    if (/^(create|new|start)\s+job\b/i.test(msg)) {
+      const name = msg.replace(/^(create|new|start)\s+job\b/i, '').trim();
 
-    try {
-      const selector = normalizeJobAnswer(rest);
-      const j = await activateJobBestEffort(owner, selector);
+      if (!name) {
+        return respond(res, `What should the job be called? Example: "create job Oak Street re-roof"`);
+      }
 
-      await persistActiveJobBestEffort({
+      if (typeof pg.createJobIdempotent !== 'function') {
+        return respond(res, `⚠️ createJobIdempotent() isn't available in postgres.js yet.`);
+      }
+
+      const out = await pg.createJobIdempotent({
         ownerId: owner,
-        userProfile,
-        fromPhone,
-        jobRow: j,
-        jobNameFallback: rest
+        name,
+        sourceMsgId
       });
 
-      const jobName = sanitizeJobLabel(j?.name || j?.job_name || rest);
-      const jobNo = j?.job_no ?? '?';
+      if (!out?.job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
 
-      return respond(
-        res,
-        `✅ Active job set to: "${jobName}" (Job #${jobNo}).
+      const jobName = sanitizeJobLabel(out.job.job_name || out.job.name || name || 'Untitled Job');
+      const jobNo = out.job.job_no ?? '?';
 
-Now you can:
-- "clock in"
-- "expense 84.12 nails"
-- "received $2500 deposit"
-- "task - order shingles due tomorrow"`
-      );
-    } catch (e) {
-      console.warn('[JOB] direct activate failed:', e?.message);
-      return respond(res, `⚠️ I couldn't set that active job. Try "change job" to pick from a list.`);
-    }
-  }
-
-  // --- List jobs ---
-  if (/^(jobs|list jobs|show jobs|show job list|job list)\b/i.test(msg)) {
-    const reply = await listJobs(owner);
-    return respond(res, reply);
-  }
-
-  // --- Create job (idempotent) ---
-  if (/^(create|new|start)\s+job\b/i.test(msg)) {
-    const name = msg.replace(/^(create|new|start)\s+job\b/i, '').trim();
-
-    if (!name) {
-      return respond(res, `What should the job be called? Example: "create job Oak Street re-roof"`);
-    }
-
-    if (typeof pg.createJobIdempotent !== 'function') {
-      return respond(res, `⚠️ createJobIdempotent() isn't available in postgres.js yet.`);
-    }
-
-    const out = await pg.createJobIdempotent({
-      ownerId: owner,
-      name,
-      sourceMsgId
-    });
-
-    if (!out?.job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
-
-    const jobName = sanitizeJobLabel(out.job.job_name || out.job.name || name || 'Untitled Job');
-    const jobNo = out.job.job_no ?? '?';
-
-    if (out.inserted) {
-      return respond(
-        res,
-        `✅ Created job: "${jobName}" (Job #${jobNo}).
+      if (out.inserted) {
+        return respond(
+          res,
+          `✅ Created job: "${jobName}" (Job #${jobNo}).
 
 Next:
 - Switch: "change job"
 - Time: "clock in @ ${jobName}"
 - Expense: "expense 84.12 nails from Home Depot today"
 - Revenue: "received $2500 deposit today"`
-      );
+        );
+      }
+
+      if (out.reason === 'already_exists') {
+        return respond(res, `✅ That job already exists: "${jobName}" (Job #${jobNo}).`);
+      }
+
+      return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
     }
 
-    if (out.reason === 'already_exists') {
-      return respond(res, `✅ That job already exists: "${jobName}" (Job #${jobNo}).`);
-    }
-
-    return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
-  }
-
-  return respond(
-    res,
-    `Job commands you can use:
+    return respond(
+      res,
+      `Job commands you can use:
 
 - "create job Oak Street re-roof"
 - "change job" (shows active jobs picker)
 - "active job Oak Street re-roof" (or "active job #6")
 - "list jobs"`
-  );
+    );
+  } catch (e) {
+    console.error('[job] error:', e?.message, { code: e?.code, detail: e?.detail });
+    return respond(res, 'Job error. Try again.');
+  } finally {
+    // ✅ align with your lock middleware pattern
+    try {
+      res?.req?.releaseLock?.();
+    } catch {}
+  }
 }
 
 module.exports = { handleJob };

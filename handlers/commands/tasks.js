@@ -4,15 +4,23 @@
 // Idempotent on Twilio MessageSid when tasks.source_msg_id exists.
 // COMPLETE DROP-IN (aligned w/ expense.js + revenue.js + timeclock.js patterns)
 // ---------------------------------------------------------------
+//
+// ✅ Alignments added in THIS drop-in (without dropping existing behavior):
+// - ✅ Canonical identity key (paUserId) = WaId || digits(from) (matches expense/revenue/timeclock)
+// - ✅ Uses paUserId for pending state, task created_by, permission checks, "my tasks", etc.
+// - ✅ Stable msg id preference order: router sourceMsgId → Twilio MessageSid → fallback
+// - ✅ Removes unused pending-state variables (kept but wired so no dead code / confusion)
+// - ✅ Fixes missing res in some flows: always respond via TwiML and return true when handled
+// - ✅ Fixes lock release: prefer res.req.releaseLock() (like timeclock), keep middleware fallback
+// - ✅ Keeps all your SQL fallbacks + postgres.js helper usage (fail-open)
+// ---------------------------------------------------------------
 
 const pg = require('../../services/postgres');
 const { formatInTimeZone } = require('date-fns-tz');
 const chrono = require('chrono-node');
 
 const state = require('../../utils/stateManager');
-const getPendingTransactionState =
-  state.getPendingTransactionState ||
-  (async () => null);
+const getPendingTransactionState = state.getPendingTransactionState || state.getPendingState || (async () => null);
 const deletePendingTransactionState =
   state.deletePendingTransactionState ||
   state.deletePendingState ||
@@ -36,6 +44,52 @@ function xmlEsc(s = '') {
 
 function twimlText(msg) {
   return `<Response><Message>${xmlEsc(String(msg || '').trim())}</Message></Response>`;
+}
+
+function respond(res, msg) {
+  res.status(200).type('application/xml').send(twimlText(msg));
+  return true;
+}
+
+/* ---------------- Identity helpers (aligned) ---------------- */
+
+const DIGITS = (x) =>
+  String(x ?? '')
+    .replace(/^whatsapp:/i, '')
+    .replace(/^\+/, '')
+    .replace(/\D/g, '');
+
+function normalizeIdentityDigits(x) {
+  return DIGITS(x);
+}
+
+function getPaUserId(from, userProfile, reqBody) {
+  const waId = reqBody?.WaId || reqBody?.waId || userProfile?.wa_id || userProfile?.waId || null;
+  const a = normalizeIdentityDigits(waId);
+  if (a) return a;
+
+  const b = normalizeIdentityDigits(from);
+  if (b) return b;
+
+  // fallback only (rare)
+  return String(from || '').trim();
+}
+
+function getTwilioMessageSidFromRes(res) {
+  try {
+    const b = res?.req?.body || {};
+    return String(b.MessageSid || b.SmsMessageSid || '').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function computeStableMsgId({ from, sourceMsgId, res }) {
+  const sid = getTwilioMessageSidFromRes(res);
+  const s = String(sourceMsgId || '').trim() || String(sid || '').trim();
+  if (s) return s;
+  // best-effort fallback (non-dedupable)
+  return String(`${from}:${Date.now()}`).trim();
 }
 
 /* ---------------- schema capability cache (serverless-safe) ---------------- */
@@ -92,15 +146,6 @@ function formatDue(dueAt, tz) {
     return dueAt ? formatInTimeZone(dueAt, tz, 'MMM d') : '';
   } catch {
     return '';
-  }
-}
-
-function getTwilioMessageSidFromRes(res) {
-  try {
-    const b = res?.req?.body || {};
-    return String(b.MessageSid || b.SmsMessageSid || '').trim() || null;
-  } catch {
-    return null;
   }
 }
 
@@ -252,10 +297,7 @@ function parseCreateArgs(rawText, tz) {
 
 function formatTaskLine(t, tz) {
   const due = t?.due_at ? ` (due ${formatDue(t.due_at, tz)})` : '';
-  const who =
-    t?.assignee_name ? ` — ${t.assignee_name}` :
-    t?.assigned_to ? ` — ${t.assigned_to}` :
-    '';
+  const who = t?.assignee_name ? ` — ${t.assignee_name}` : t?.assigned_to ? ` — ${t.assigned_to}` : '';
   return `• #${t.task_no} ${t.title}${due}${who}`;
 }
 
@@ -265,22 +307,27 @@ function formatTaskLine(t, tz) {
  * Signature expected by router (matches your other command handlers):
  *   tasksHandler(from, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId)
  *
- * NOTE: sourceMsgId is optional; if not passed, we can try to extract Twilio MessageSid from res.
+ * NOTE: sourceMsgId is optional; if not passed, we extract Twilio MessageSid from res.
  */
 async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isOwner, res, sourceMsgId) {
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
   const raw = String(text || '').trim();
   const lc = raw.toLowerCase();
 
-  const lockKey = `lock:${from}`;
-  const safeMsgId = String(sourceMsgId || getTwilioMessageSidFromRes(res) || `${from}:${Date.now()}`).trim();
+  const reqBody = res?.req?.body || {};
+  const paUserId = getPaUserId(from, userProfile, reqBody);
+
+  const safeMsgId = computeStableMsgId({ from: paUserId, sourceMsgId, res });
+
+  // If you have a middleware lock system, we try to release via req.releaseLock first (preferred).
+  const lockKey = `lock:${paUserId}`;
 
   try {
-    let pending = await getPendingTransactionState(from);
+    let pending = await getPendingTransactionState(paUserId);
 
     // Clear stale edit-mode for tasks (mirrors expense/revenue behavior)
     if (pending?.isEditing && pending?.type === 'tasks') {
-      await deletePendingTransactionState(from);
+      await deletePendingTransactionState(paUserId);
       pending = null;
     }
 
@@ -288,9 +335,9 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
     // HELP
     // -------------------------------------------------
     if (/^(tasks|help tasks|task help)$/i.test(lc)) {
-      res.status(200).type('application/xml').send(
-        twimlText(
-          `Tasks — quick guide:
+      return respond(
+        res,
+        `Tasks — quick guide:
 • task <title> (optional: due <when>, assign <name>, job <job>)
 • my tasks
 • inbox tasks
@@ -298,9 +345,7 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
 • done #N
 • assign #N to <name>
 • delete #N`
-        )
       );
-      return true;
     }
 
     // -------------------------------------------------
@@ -324,7 +369,7 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
 
       const { inserted, task } = await createTaskIdempotent({
         ownerId,
-        createdBy: from,
+        createdBy: paUserId,
         assignedTo,
         title,
         body: null,
@@ -334,38 +379,26 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
         sourceMsgId: safeMsgId
       });
 
-      if (inserted === false) {
-        res.status(200).type('application/xml').send(twimlText('✅ Already got that task (duplicate message).'));
-        return true;
-      }
+      if (inserted === false) return respond(res, '✅ Already got that task (duplicate message).');
 
       const due = task?.due_at ? ` (due ${formatDue(task.due_at, tz)})` : '';
       const who = assignedTo ? ` — assigned` : '';
-      res
-        .status(200)
-        .type('application/xml')
-        .send(twimlText(`✅ Task #${task?.task_no || ''} created: ${task?.title || title}${due}${who}`));
-      return true;
+      return respond(res, `✅ Task #${task?.task_no || ''} created: ${task?.title || title}${due}${who}`);
     }
 
     // -------------------------------------------------
     // MY TASKS
     // -------------------------------------------------
     if (/^my\s+tasks$/i.test(lc)) {
-      const userId = normalizeUserId(from);
-      const rows =
-        (typeof pg.listMyTasks === 'function'
-          ? await pg.listMyTasks({ ownerId, userId, status: 'open', limit: 10 })
-          : []);
+      const userId = normalizeUserId(paUserId);
+      const rows = typeof pg.listMyTasks === 'function'
+        ? await pg.listMyTasks({ ownerId, userId, status: 'open', limit: 10 })
+        : [];
 
-      if (!rows?.length) {
-        res.status(200).type('application/xml').send(twimlText('No open tasks.'));
-        return true;
-      }
+      if (!rows?.length) return respond(res, 'No open tasks.');
 
       const lines = rows.map((t) => formatTaskLine(t, tz));
-      res.status(200).type('application/xml').send(twimlText(`Your open tasks:\n${lines.join('\n')}`));
-      return true;
+      return respond(res, `Your open tasks:\n${lines.join('\n')}`);
     }
 
     // -------------------------------------------------
@@ -391,29 +424,21 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
         }
       } catch {}
 
-      if (!rows?.length) {
-        res.status(200).type('application/xml').send(twimlText('Inbox has no open tasks.'));
-        return true;
-      }
+      if (!rows?.length) return respond(res, 'Inbox has no open tasks.');
 
       const lines = rows.map((t) => `• #${t.task_no} ${t.title}${t.due_at ? ` (due ${formatDue(t.due_at, tz)})` : ''}`);
-      res.status(200).type('application/xml').send(twimlText(`Inbox open tasks:\n${lines.join('\n')}`));
-      return true;
+      return respond(res, `Inbox open tasks:\n${lines.join('\n')}`);
     }
 
     // -------------------------------------------------
     // TEAM TASKS
     // -------------------------------------------------
     if (/^team\s+tasks$/i.test(lc)) {
-      const rows =
-        (typeof pg.listAllOpenTasksByAssignee === 'function'
-          ? await pg.listAllOpenTasksByAssignee({ ownerId })
-          : []);
+      const rows = typeof pg.listAllOpenTasksByAssignee === 'function'
+        ? await pg.listAllOpenTasksByAssignee({ ownerId })
+        : [];
 
-      if (!rows?.length) {
-        res.status(200).type('application/xml').send(twimlText('Team has no open tasks.'));
-        return true;
-      }
+      if (!rows?.length) return respond(res, 'Team has no open tasks.');
 
       const groups = {};
       for (const r of rows) {
@@ -424,11 +449,10 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
       const msg =
         'Team open tasks:\n' +
         Object.entries(groups)
-          .map(([k, v]) => `**${k}**\n${v.join('\n')}`)
+          .map(([k, v]) => `${k}\n${v.join('\n')}`)
           .join('\n\n');
 
-      res.status(200).type('application/xml').send(twimlText(msg));
-      return true;
+      return respond(res, msg);
     }
 
     // -------------------------------------------------
@@ -441,16 +465,20 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
 
         try {
           if (typeof pg.markTaskDone === 'function') {
-            const updated = await pg.markTaskDone({ ownerId, taskNo, actorId: from, isOwner });
+            const updated = await pg.markTaskDone({ ownerId, taskNo, actorId: paUserId, isOwner });
             if (!updated) throw new Error('not found');
-            res.status(200).type('application/xml').send(twimlText(`✅ Task #${updated.task_no} marked done.`));
-            return true;
+            return respond(res, `✅ Task #${updated.task_no} marked done.`);
           }
 
           // fallback raw update with light permissions:
-          const task = (typeof pg.getTaskByNo === 'function') ? await pg.getTaskByNo(ownerId, taskNo) : null;
+          const task = typeof pg.getTaskByNo === 'function' ? await pg.getTaskByNo(ownerId, taskNo) : null;
           if (!task) throw new Error('not found');
-          const can = isOwner || String(task.created_by) === String(from) || String(task.assigned_to) === String(from);
+
+          const can =
+            isOwner ||
+            String(task.created_by) === String(paUserId) ||
+            String(task.assigned_to) === String(paUserId);
+
           if (!can) throw new Error('permission denied');
 
           const r = await pg.query(
@@ -462,12 +490,10 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
           );
 
           if (!r?.rows?.length) throw new Error('not updated');
-          res.status(200).type('application/xml').send(twimlText(`✅ Task #${taskNo} marked done.`));
-          return true;
+          return respond(res, `✅ Task #${taskNo} marked done.`);
         } catch (e) {
           console.warn('[tasks] done failed:', e?.message);
-          res.status(200).type('application/xml').send(twimlText(`⚠️ Couldn’t mark task #${taskNo} done.`));
-          return true;
+          return respond(res, `⚠️ Couldn’t mark task #${taskNo} done.`);
         }
       }
     }
@@ -482,33 +508,37 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
         const name = normalizeTaskText(m[2]);
 
         try {
-          const assignee =
-            (typeof pg.getUserByName === 'function') ? await pg.getUserByName(ownerId, name) : null;
+          const assignee = typeof pg.getUserByName === 'function' ? await pg.getUserByName(ownerId, name) : null;
           if (!assignee) throw new Error('user not found');
 
-          const task =
-            (typeof pg.getTaskByNo === 'function') ? await pg.getTaskByNo(ownerId, taskNo) : null;
+          const task = typeof pg.getTaskByNo === 'function' ? await pg.getTaskByNo(ownerId, taskNo) : null;
           if (!task) throw new Error('task not found');
 
-          const can = isOwner || String(task.created_by) === String(from) || String(task.assigned_to) === String(from);
+          const can =
+            isOwner ||
+            String(task.created_by) === String(paUserId) ||
+            String(task.assigned_to) === String(paUserId);
+
           if (!can) throw new Error('permission denied');
 
           const assigneeId = assignee.user_id || assignee.id || null;
-          await pg.query(`UPDATE public.tasks SET assigned_to=$1, updated_at=NOW() WHERE owner_id=$2 AND task_no=$3`, [
-            assigneeId,
-            String(ownerId),
-            taskNo
-          ]);
 
-          res
-            .status(200)
-            .type('application/xml')
-            .send(twimlText(`✅ Task #${taskNo} assigned to ${assignee.name || assignee.user_id || assignee.id}.`));
-          return true;
+          // prefer helper if present (keeps beta parity if you already implemented richer logic)
+          if (typeof pg.assignTask === 'function') {
+            await pg.assignTask({ ownerId, taskNo, assignedTo: assigneeId, actorId: paUserId });
+          } else {
+            await pg.query(`UPDATE public.tasks SET assigned_to=$1, updated_at=NOW() WHERE owner_id=$2 AND task_no=$3`, [
+              assigneeId,
+              String(ownerId),
+              taskNo
+            ]);
+          }
+
+          const who = assignee.name || assignee.user_id || assignee.id || String(name);
+          return respond(res, `✅ Task #${taskNo} assigned to ${who}.`);
         } catch (e) {
           console.warn('[tasks] assign failed:', e?.message);
-          res.status(200).type('application/xml').send(twimlText(`⚠️ Couldn’t assign task #${taskNo}.`));
-          return true;
+          return respond(res, `⚠️ Couldn’t assign task #${taskNo}.`);
         }
       }
     }
@@ -522,23 +552,25 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
         const taskNo = parseInt(m[1], 10);
 
         try {
-          const task = (typeof pg.getTaskByNo === 'function') ? await pg.getTaskByNo(ownerId, taskNo) : null;
+          const task = typeof pg.getTaskByNo === 'function' ? await pg.getTaskByNo(ownerId, taskNo) : null;
           if (!task) throw new Error('not found');
 
-          const can = isOwner || String(task.created_by) === String(from);
+          const can = isOwner || String(task.created_by) === String(paUserId);
           if (!can) throw new Error('permission denied');
 
-          await pg.query(`UPDATE public.tasks SET status='deleted', updated_at=NOW() WHERE owner_id=$1 AND task_no=$2`, [
-            String(ownerId),
-            taskNo
-          ]);
+          if (typeof pg.deleteTask === 'function') {
+            await pg.deleteTask({ ownerId, taskNo, actorId: paUserId });
+          } else {
+            await pg.query(`UPDATE public.tasks SET status='deleted', updated_at=NOW() WHERE owner_id=$1 AND task_no=$2`, [
+              String(ownerId),
+              taskNo
+            ]);
+          }
 
-          res.status(200).type('application/xml').send(twimlText(`🗑️ Task #${taskNo} deleted.`));
-          return true;
+          return respond(res, `🗑️ Task #${taskNo} deleted.`);
         } catch (e) {
           console.warn('[tasks] delete failed:', e?.message);
-          res.status(200).type('application/xml').send(twimlText(`⚠️ Couldn’t delete task #${taskNo}.`));
-          return true;
+          return respond(res, `⚠️ Couldn’t delete task #${taskNo}.`);
         }
       }
     }
@@ -546,12 +578,16 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
     return false; // fall through
   } catch (e) {
     console.error('[tasks] error:', e?.message);
-    res.status(200).type('application/xml').send(twimlText('⚠️ Task error. Try again.'));
-    return true;
+    return respond(res, '⚠️ Task error. Try again.');
   } finally {
-    // align with other handlers
+    // ✅ Prefer request-scoped release (matches timeclock + your middleware patterns)
+    try { res?.req?.releaseLock?.(); } catch {}
+
+    // optional fallback if your lock middleware exports a release function
     try {
-      await require('../../middleware/lock').releaseLock(lockKey);
+      // eslint-disable-next-line global-require
+      const lock = require('../../middleware/lock');
+      if (typeof lock.releaseLock === 'function') await lock.releaseLock(lockKey);
     } catch {}
   }
 }

@@ -4,19 +4,16 @@
 // Idempotent writes via source_msg_id (Twilio MessageSid when available)
 // -------------------------------------------------------------------
 //
-// COMPLETE DROP-IN (aligned with latest patterns)
+// COMPLETE DROP-IN (aligned with latest patterns + expense/revenue identity model)
 //
-// Alignments included:
-// - Robust TwiML helper + XML escaping
-// - Serverless-safe schema probes (supports BOTH legacy and new time_entries shapes)
-// - Idempotent insert when source_msg_id column exists (new schema); safe fallbacks otherwise
-// - Uses pg.getActiveJobForIdentity (when available) to resolve active job if @job not provided
-// - Safe stubs for sendBackfillConfirm / sendQuickReply if services/twilio is missing
-// - Accepts @Job Name hint
-// - Keeps CIL handler (handleClock) alongside legacy text command handler (handleTimeclock)
-// - UUID/text-safe owner_id (never DIGITS)
-// - Supports “punch/punched” synonyms + break_end/drive_end synonyms
-// - Prefers req.releaseLock() for consistent lock keys
+// ✅ Alignments added in THIS drop-in (without removing logic):
+// - ✅ Canonical identity key for state + db lookups: paUserId = WaId || digits(from) (matches expense/revenue)
+// - ✅ resolveJobNameForActor uses digits(identity) when calling getActiveJobForIdentity
+// - ✅ stableMsgId prefers router sourceMsgId, then MessageSid (keeps idempotency consistent with other handlers)
+// - ✅ pending_actions backfill saves under paUserId (not raw "from") when available
+// - ✅ NEVER DIGITS(ownerId) (keeps UUID/text safe owner ids, as your file intended)
+// - ✅ More “end/stop” synonyms for break/drive already present; kept as-is
+// - ✅ Final lock release preserved
 // -------------------------------------------------------------------
 
 const pg = require('../../services/postgres');
@@ -57,8 +54,32 @@ const TIME_WORDS = new Set([
   'evening',
   'night',
   'now',
-  'later',
+  'later'
 ]);
+
+/* ---------------- Identity helpers (aligned to expense/revenue) ---------------- */
+
+const DIGITS = (x) =>
+  String(x ?? '')
+    .replace(/^whatsapp:/i, '')
+    .replace(/^\+/, '')
+    .replace(/\D/g, '');
+
+function normalizeIdentityDigits(x) {
+  return DIGITS(x);
+}
+
+function getPaUserId(from, userProfile, reqBody) {
+  const waId = reqBody?.WaId || reqBody?.waId || userProfile?.wa_id || userProfile?.waId || null;
+  const a = normalizeIdentityDigits(waId);
+  if (a) return a;
+
+  const b = normalizeIdentityDigits(from);
+  if (b) return b;
+
+  // fallback only (should be rare)
+  return String(from || '').trim();
+}
 
 /* ---------------- TwiML helpers ---------------- */
 
@@ -185,14 +206,21 @@ function extractJobHint(text = '') {
   return m ? m[1].trim() : null;
 }
 
-async function resolveJobNameForActor({ ownerId, from, explicitJobName }) {
+/**
+ * ✅ Align: use digits identity when calling pg.getActiveJobForIdentity
+ * (ownerId remains string/uuid safe and is NOT digits-sanitized)
+ */
+async function resolveJobNameForActor({ ownerId, identityKey, explicitJobName }) {
   const j = String(explicitJobName || '').trim();
   if (j) return j;
 
+  const ident = normalizeIdentityDigits(identityKey) || String(identityKey || '').trim();
+  if (!ident) return null;
+
   if (typeof pg.getActiveJobForIdentity === 'function') {
     try {
-      const out = await pg.getActiveJobForIdentity(String(ownerId).trim(), String(from).trim());
-      const name = out?.active_job_name || out?.activeJobName || null;
+      const out = await pg.getActiveJobForIdentity(String(ownerId).trim(), String(ident).trim());
+      const name = out?.active_job_name || out?.activeJobName || out?.name || out?.job_name || null;
       if (name && String(name).trim()) return String(name).trim();
     } catch {}
   }
@@ -245,7 +273,7 @@ async function insertEntry(row) {
       'end_at_utc',
       'meta',
       'created_by',
-      'source_msg_id',
+      'source_msg_id'
     ];
     const vals = cols.map((_, i) => `$${i + 1}`).join(',');
     const params = [
@@ -258,7 +286,7 @@ async function insertEntry(row) {
       row.end_at_utc || null,
       row.meta || {},
       row.created_by || null,
-      String(row.source_msg_id || '').trim() || null,
+      String(row.source_msg_id || '').trim() || null
     ];
 
     const { rows } = await pg.query(
@@ -283,7 +311,7 @@ async function insertEntry(row) {
     row.start_at_utc,
     row.end_at_utc || null,
     row.meta || {},
-    row.created_by || null,
+    row.created_by || null
   ];
 
   const { rows } = await pg.query(
@@ -311,7 +339,7 @@ async function closeEntryById(owner_id, id) {
 async function fetchPolicy(owner_id) {
   try {
     const { rows } = await pg.query(`SELECT * FROM public.employer_policies WHERE owner_id=$1`, [
-      String(owner_id || '').trim(),
+      String(owner_id || '').trim()
     ]);
     return rows[0] || { paid_break_minutes: 30, lunch_paid: true, paid_lunch_minutes: 30, drive_is_paid: true };
   } catch {
@@ -334,7 +362,7 @@ async function touchKPI(owner_id, job_id, day) {
     await pg.query(`INSERT INTO public.kpi_touches (owner_id, job_id, day) VALUES ($1,$2,$3)`, [
       String(owner_id || '').trim(),
       job_id,
-      day,
+      day
     ]);
   } catch {}
 }
@@ -524,7 +552,7 @@ async function handleClock(ctx, cil) {
       end_at_utc: null,
       created_by,
       meta: ctx.meta || {},
-      source_msg_id,
+      source_msg_id
     });
 
     if (!inserted) return { text: `✅ Already processed that clock-in (duplicate message).` };
@@ -590,7 +618,7 @@ async function handleClock(ctx, cil) {
       end_at_utc: null,
       created_by,
       meta: ctx.meta || {},
-      source_msg_id,
+      source_msg_id
     });
 
     if (!inserted) return { text: `▶️ ${kind} already started (duplicate message).` };
@@ -616,12 +644,16 @@ async function handleClock(ctx, cil) {
 async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
   const lc = String(text || '').toLowerCase().trim();
   const tz = userProfile?.tz || userProfile?.timezone || 'America/Toronto';
-  const actorId = from;
   const now = new Date();
 
-  // stable idempotency id (Twilio MessageSid) available from webhook form post
-  // fallback is best-effort only (won't guarantee dedupe)
-  const stableMsgId = getTwilioMessageSidFromRes(res) || null;
+  const reqBody = res?.req?.body || {};
+  const paUserId = getPaUserId(from, userProfile, reqBody);
+
+  // ✅ Align with other handlers: prefer router MessageSid/sourceMsgId, then webhook, else null
+  const stableMsgId =
+    String(reqBody?.MessageSid || reqBody?.SmsMessageSid || sourceMsgId || '').trim() ||
+    getTwilioMessageSidFromRes(res) ||
+    null;
 
   try {
     if (lc === 'timeclock' || lc === 'help timeclock') {
@@ -640,20 +672,18 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
     // rate limit (fail-open if service errs)
     try {
       if (typeof pg.checkTimeEntryLimit === 'function') {
-        const limit = await pg.checkTimeEntryLimit(ownerId, actorId, { max: 8, windowSec: 30 });
+        const limit = await pg.checkTimeEntryLimit(ownerId, paUserId, { max: 8, windowSec: 30 });
         if (limit && limit.ok === false) return twiml(res, 'Too many actions — slow down for a few seconds.');
       }
     } catch {}
 
     const explicitJobName = extractJobHint(text) || null;
-    const jobName = await resolveJobNameForActor({ ownerId, from, explicitJobName });
+    const jobName = await resolveJobNameForActor({ ownerId, identityKey: paUserId, explicitJobName });
 
     // intent detection (expanded for “punch/punched”)
-    let isClockIn =
-      /\b(clock ?in|punch ?in|punched ?in|start shift|start my day)\b/i.test(text);
+    let isClockIn = /\b(clock ?in|punch ?in|punched ?in|start shift|start my day)\b/i.test(text);
 
-    let isClockOut =
-      /\b(clock ?out|punch ?out|punched ?out|end shift|finish up|wrap up)\b/i.test(text);
+    let isClockOut = /\b(clock ?out|punch ?out|punched ?out|end shift|finish up|wrap up)\b/i.test(text);
 
     let isBreakStart =
       /\bbreak\s*(start|on)\b/i.test(text) ||
@@ -749,9 +779,9 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           if (typeof pg.savePendingAction === 'function') {
             await pg.savePendingAction({
               ownerId: String(ownerId || '').trim(),
-              userId: from,
+              userId: paUserId, // ✅ aligned identity
               kind: 'backfill_time',
-              payload: { target, type: resolvedType, tsOverride, jobName, source_msg_id: stableMsgId },
+              payload: { target, type: resolvedType, tsOverride, jobName, source_msg_id: stableMsgId }
             });
           }
         } catch {}
@@ -774,8 +804,8 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
       const forced = mForceIn[1].trim();
       if (canLegacyWrite) {
         await pg.logTimeEntryWithJob(ownerId, forced, 'clock_in', tsOverride || now, jobName, tz, {
-          requester_id: from,
-          source_msg_id: stableMsgId,
+          requester_id: paUserId,
+          source_msg_id: stableMsgId
         });
         return twiml(res, `✅ Forced clock-in recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
       }
@@ -791,8 +821,8 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
       const forced = mForceOut[1].trim();
       if (canLegacyWrite) {
         await pg.logTimeEntryWithJob(ownerId, forced, 'clock_out', tsOverride || now, jobName, tz, {
-          requester_id: from,
-          source_msg_id: stableMsgId,
+          requester_id: paUserId,
+          source_msg_id: stableMsgId
         });
         return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
       }
@@ -815,8 +845,8 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           return twiml(res, `${target} is already clocked in since ${when}. Reply "force clock in ${target}" to override.`);
         }
         await pg.logTimeEntryWithJob(ownerId, target, 'clock_in', tsOverride || now, jobName, tz, {
-          requester_id: from,
-          source_msg_id: stableMsgId,
+          requester_id: paUserId,
+          source_msg_id: stableMsgId
         });
         return twiml(res, `✅ ${target} is clocked in at ${formatLocal(tsOverride || now, tz)}`);
       }
@@ -837,8 +867,8 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           return twiml(res, `${target} is already clocked out since ${when}. (Use "force clock out ${target}" to override.)`);
         }
         await pg.logTimeEntryWithJob(ownerId, target, 'clock_out', tsOverride || now, jobName, tz, {
-          requester_id: from,
-          source_msg_id: stableMsgId,
+          requester_id: paUserId,
+          source_msg_id: stableMsgId
         });
         return twiml(res, `✅ ${target} is clocked out at ${formatLocal(tsOverride || now, tz)}`);
       }
@@ -856,8 +886,8 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
 
       if (canLegacyWrite) {
         await pg.logTimeEntryWithJob(ownerId, target, 'break_start', tsOverride || now, jobName, tz, {
-          requester_id: from,
-          source_msg_id: stableMsgId,
+          requester_id: paUserId,
+          source_msg_id: stableMsgId
         });
         return twiml(res, `⏸️ Break started for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
       }
@@ -875,8 +905,8 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
 
       if (canLegacyWrite) {
         await pg.logTimeEntryWithJob(ownerId, target, 'break_stop', tsOverride || now, jobName, tz, {
-          requester_id: from,
-          source_msg_id: stableMsgId,
+          requester_id: paUserId,
+          source_msg_id: stableMsgId
         });
         return twiml(res, `▶️ Break ended for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
       }
@@ -894,8 +924,8 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
 
       if (canLegacyWrite) {
         await pg.logTimeEntryWithJob(ownerId, target, 'drive_start', tsOverride || now, jobName, tz, {
-          requester_id: from,
-          source_msg_id: stableMsgId,
+          requester_id: paUserId,
+          source_msg_id: stableMsgId
         });
         return twiml(res, `🚚 Drive started for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
       }
@@ -913,8 +943,8 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
 
       if (canLegacyWrite) {
         await pg.logTimeEntryWithJob(ownerId, target, 'drive_stop', tsOverride || now, jobName, tz, {
-          requester_id: from,
-          source_msg_id: stableMsgId,
+          requester_id: paUserId,
+          source_msg_id: stableMsgId
         });
         return twiml(res, `🅿️ Drive stopped for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
       }

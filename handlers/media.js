@@ -4,10 +4,11 @@
 // ✅ Alignment / beta-hardening changes (no unnecessary logic loss):
 // - Pending media meta schema matches what revenue.js/expense.js consume:
 //     { url, type, transcript, confidence, source_msg_id }
+// - Twilio payload tolerant: mediaUrl/mediaType can be arrays or missing; input can be object/body-like
 // - Stable idempotency key for media: prefers Twilio MediaSid, else MessageSid, else time
 // - Stores mediaSourceMsgId + (expenseSourceMsgId / revenueSourceMsgId) in pending state (same pattern)
 // - Does NOT log expense/revenue; only attaches pendingMediaMeta + returns transcript to router
-// - Conservative finance intent detection; avoids timeclock misclassification
+// - Conservative finance intent detection; avoids timeclock misclassification (timeclock wins)
 // - Adds "job picker token scrubber" so we never persist tokens like jobno_6 into transcripts unintentionally
 // - Uses pg.truncateText / pg.normalizeMediaMeta / pg.MEDIA_TRANSCRIPT_MAX_CHARS when available (aligns postgres.js)
 // - Keeps timesheet/hours inquiry support via generateTimesheet (if exported), else defers to router via transcript
@@ -24,7 +25,7 @@ const { parseMediaText } = require('../services/mediaParser');
 const { extractTextFromImage } = require('../utils/visionService');
 const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
-const pg = require('../services/postgres'); // for helpers / optional normalizeMediaMeta / truncateText
+const pg = require('../services/postgres');
 
 // Some builds export generateTimesheet from postgres; some from pg service layer.
 let generateTimesheet = null;
@@ -64,6 +65,7 @@ function twiml(text) {
   return `<Response><Message>${xmlEsc(String(text || '').trim())}</Message></Response>`;
 }
 
+// NOTE: for identity comparisons only; never use this for owner_id persistence
 function DIGITS(x) {
   return String(x ?? '')
     .replace(/^whatsapp:/i, '')
@@ -83,7 +85,7 @@ function fmtLocal(tsIso, tz) {
       minute: '2-digit',
       year: 'numeric',
       month: '2-digit',
-      day: '2-digit'
+      day: '2-digit',
     });
   } catch {
     return new Date(tsIso).toLocaleString();
@@ -100,10 +102,14 @@ function toAmPm(tsIso, tz) {
   }
 }
 
+/**
+ * Timeclock inference must stay conservative to avoid stealing finance commands.
+ * We only return intents for very strong matches.
+ */
 function inferTimeclockIntentFromText(s = '') {
   const lc = String(s).toLowerCase();
-  if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift)\b/.test(lc)) return 'punch_in';
-  if (/\b(clock|punch)\s+out\b/.test(lc) || /\b(end|finish|stop)\s+(work|shift)\b/.test(lc)) return 'punch_out';
+  if (/\b(clock|punch)\s+in\b/.test(lc) || /\bstart\s+(work|shift|my\s+day)\b/.test(lc)) return 'punch_in';
+  if (/\b(clock|punch)\s+out\b/.test(lc) || /\b(end|finish|wrap)\s+(work|shift|up)\b/.test(lc)) return 'punch_out';
   if (/\b(start|begin)\s+(break|lunch)\b/.test(lc) || /\bon\s+break\b/.test(lc)) return 'break_start';
   if (/\b(end|finish|stop)\s+(break|lunch)\b/.test(lc) || /\boff\s+break\b/.test(lc)) return 'break_end';
   if (/\b(start|begin)\s+drive\b/.test(lc)) return 'drive_start';
@@ -181,19 +187,17 @@ function fixCommonTranscriptionTypos(text) {
 
 /**
  * ✅ Prevent “picker token bleed” into saved transcripts (jobno_ / jobix_ tokens).
- * We still allow “#6” / “J6” *if it’s part of human text*, but tokens like jobno_6 are UI artifacts.
+ * Tokens like jobno_6 are UI artifacts; we scrub them.
  */
 function scrubPickerTokens(text) {
   let s = String(text || '');
-  // Replace isolated tokens; keep surrounding text intact.
-  s = s.replace(/\bjobno_\d{1,10}\b/gi, (m) => m.replace(/_/g, ' ')); // "jobno_6" -> "jobno 6" (harmless)
+  s = s.replace(/\bjobno_\d{1,10}\b/gi, (m) => m.replace(/_/g, ' ')); // jobno_6 -> jobno 6
   s = s.replace(/\bjobix_\d{1,10}\b/gi, (m) => m.replace(/_/g, ' '));
   s = s.replace(/\bjob_\d{1,10}_[0-9a-z]+\b/gi, ''); // legacy row ids are pure UI
   return s.replace(/\s{2,}/g, ' ').trim();
 }
 
 function normalizeHumanText(text) {
-  // Apply typo fixes first, then trade-term normalization, then scrub UI tokens
   return scrubPickerTokens(correctTradeTerms(fixCommonTranscriptionTypos(text)));
 }
 
@@ -206,6 +210,29 @@ function getTwilioMediaSid(mediaUrl) {
   }
 }
 
+function firstOf(x) {
+  if (Array.isArray(x)) return x.find((v) => v != null && String(v).trim()) || null;
+  const s = String(x || '').trim();
+  return s || null;
+}
+
+function coerceInputText(input) {
+  if (input == null) return '';
+  if (typeof input === 'string') return input;
+  // sometimes router passes req.body or a parsed object
+  if (typeof input === 'object') {
+    return String(
+      input.Body ??
+        input.body ??
+        input.text ??
+        input.TranscriptionText ??
+        input.Transcription ??
+        ''
+    );
+  }
+  return String(input);
+}
+
 /* ---------------- pending state + meta ---------------- */
 
 async function attachPendingMediaMeta(from, meta) {
@@ -215,7 +242,7 @@ async function attachPendingMediaMeta(from, meta) {
       type: meta?.type || meta?.media_type || null,
       transcript: truncateText(meta?.transcript || meta?.media_transcript || null, MAX_MEDIA_TRANSCRIPT_CHARS),
       confidence: meta?.confidence ?? meta?.media_confidence ?? null,
-      source_msg_id: meta?.source_msg_id ? String(meta.source_msg_id) : null
+      source_msg_id: meta?.source_msg_id ? String(meta.source_msg_id) : null,
     };
 
     const normalized = typeof pg.normalizeMediaMeta === 'function' ? pg.normalizeMediaMeta(raw) : raw;
@@ -234,7 +261,7 @@ async function attachPendingMediaMeta(from, meta) {
     const pending = await getPendingTransactionState(from);
     await mergePendingTransactionState(from, {
       ...(pending || {}),
-      pendingMediaMeta: normalized
+      pendingMediaMeta: normalized,
     });
   } catch (e) {
     console.warn('[MEDIA] attachPendingMediaMeta failed (ignored):', e?.message);
@@ -271,7 +298,7 @@ async function markPendingFinance({ from, kind, stableMediaMsgId }) {
       pendingMedia: { type: kind },
       expenseSourceMsgId: kind === 'expense' ? stableMediaMsgId : pending?.expenseSourceMsgId || null,
       revenueSourceMsgId: kind === 'revenue' ? stableMediaMsgId : pending?.revenueSourceMsgId || null,
-      mediaSourceMsgId: stableMediaMsgId
+      mediaSourceMsgId: stableMediaMsgId,
     });
   } catch (e) {
     console.warn('[MEDIA] markPendingFinance failed (ignored):', e?.message);
@@ -279,7 +306,7 @@ async function markPendingFinance({ from, kind, stableMediaMsgId }) {
 }
 
 async function passThroughTextOnly(_from, input) {
-  const t = String(input || '').trim();
+  const t = String(coerceInputText(input) || '').trim();
   if (!t) return { transcript: '', twiml: null };
   return { transcript: normalizeHumanText(t), twiml: null };
 }
@@ -310,7 +337,7 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
       payload = String(body || '');
       this.headersSent = true;
       return this;
-    }
+    },
   };
 
   try {
@@ -326,43 +353,49 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
 
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType, sourceMsgId) {
   try {
-    // text-only messages pass through
-    if (!mediaUrl) return await passThroughTextOnly(from, input);
+    const bodyText = String(coerceInputText(input) || '').trim();
 
-    const baseType = normalizeContentType(mediaType);
+    // Twilio payload tolerant: media url/type can be arrays
+    const url = firstOf(mediaUrl);
+    const typeRaw = firstOf(mediaType);
+
+    // text-only messages pass through
+    if (!url) return await passThroughTextOnly(from, bodyText);
+
+    const baseType = normalizeContentType(typeRaw);
     const validImageTypes = ['image/jpeg', 'image/png', 'image/webp'];
     const isSupportedImage = validImageTypes.includes(baseType);
     const isAudioFamily = baseType.startsWith('audio/');
-    const isSupportedAudio = isAudioFamily;
+    const isSupportedAudio = isAudioFamily; // accept all audio/*; downstream can fail-open
 
     if (!isSupportedImage && !isSupportedAudio) {
       return {
         transcript: null,
-        twiml: twiml(`⚠️ Unsupported media type: ${mediaType}. Please send an image (JPEG/PNG/WEBP) or an audio note.`)
+        twiml: twiml(`⚠️ Unsupported media type: ${typeRaw}. Please send an image (JPEG/PNG/WEBP) or an audio note.`),
       };
     }
 
     // Stable idempotency key: prefer MediaSid, else webhook MessageSid, else time.
-    const mediaSid = getTwilioMediaSid(mediaUrl);
+    const mediaSid = getTwilioMediaSid(url);
     const stableMediaMsgId =
       (mediaSid ? `${from}:${mediaSid}` : null) ||
       (String(sourceMsgId || '').trim() ? `${from}:${String(sourceMsgId).trim()}` : null) ||
       `${from}:${Date.now()}`;
 
-    let extractedText = String(input || '').trim();
-    const normType = baseType;
+    let extractedText = bodyText;
 
     const mediaMeta = {
-      url: mediaUrl || null,
-      type: normType || null,
+      url,
+      type: baseType || null,
       transcript: null,
       confidence: null,
-      source_msg_id: stableMediaMsgId
+      source_msg_id: stableMediaMsgId,
     };
 
     // AUDIO
     if (isAudioFamily) {
       if (typeof transcribeAudio !== 'function') {
+        await attachPendingMediaMeta(from, mediaMeta);
         return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
       }
 
@@ -370,21 +403,22 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       let confidence = null;
 
       try {
-        const resp = await axios.get(mediaUrl, {
+        const resp = await axios.get(url, {
           responseType: 'arraybuffer',
           auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
-          maxContentLength: 8 * 1024 * 1024
+          maxContentLength: 10 * 1024 * 1024,
+          timeout: 8000,
         });
 
         const audioBuf = Buffer.from(resp.data);
 
-        const r1 = await transcribeAudio(audioBuf, normType, 'both');
+        const r1 = await transcribeAudio(audioBuf, baseType, 'both');
         const n1 = normalizeTranscriptionResult(r1);
         transcript = n1.transcript;
         confidence = n1.confidence;
 
         // Some Twilio notes arrive as audio/ogg but actually need webm decode in downstream services
-        if (!transcript && normType === 'audio/ogg') {
+        if (!transcript && baseType === 'audio/ogg') {
           try {
             const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
             const n2 = normalizeTranscriptionResult(r2);
@@ -400,6 +434,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       transcript = String(transcript || '').trim();
       if (!transcript) {
+        await attachPendingMediaMeta(from, mediaMeta);
         return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
       }
 
@@ -410,10 +445,10 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       await attachPendingMediaMeta(from, mediaMeta);
 
-      // ✅ Avoid misclassifying time-related voice as finance
+      // ✅ timeclock wins over finance
       const tc = inferTimeclockIntentFromText(transcript);
       if (tc) {
-        extractedText = transcript; // let parser/timeclock flow decide
+        extractedText = transcript;
       } else {
         const fin = financeIntentFromText(transcript);
         if (fin.kind === 'expense' || fin.kind === 'revenue') {
@@ -428,10 +463,11 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     if (isSupportedImage) {
       let ocrText = '';
       try {
-        const out = await extractTextFromImage(mediaUrl);
+        // Safe service: never throws; returns {text:""} on failures
+        const out = await extractTextFromImage(url, { fetchBytes: true });
         ocrText = String(out?.text || out?.transcript || '').trim();
       } catch (e) {
-        console.warn('[MEDIA] extractTextFromImage failed:', e?.message);
+        console.warn('[MEDIA] extractTextFromImage failed (ignored):', e?.message);
       }
 
       extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
@@ -441,10 +477,14 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
       await attachPendingMediaMeta(from, mediaMeta);
 
-      const fin = financeIntentFromText(extractedText);
-      if (fin.kind === 'expense' || fin.kind === 'revenue') {
-        await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
-        return { transcript: extractedText, twiml: null };
+      // timeclock wins over finance (but images are rarely timeclock)
+      const tc = inferTimeclockIntentFromText(extractedText);
+      if (!tc) {
+        const fin = financeIntentFromText(extractedText);
+        if (fin.kind === 'expense' || fin.kind === 'revenue') {
+          await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
+          return { transcript: extractedText, twiml: null };
+        }
       }
     }
 
@@ -453,18 +493,24 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       const pending = await getPendingTransactionState(from);
       await mergePendingTransactionState(from, {
         ...(pending || {}),
-        pendingMedia: { url: mediaUrl, type: null },
-        mediaSourceMsgId: stableMediaMsgId
+        pendingMedia: { url, type: baseType || null },
+        mediaSourceMsgId: stableMediaMsgId,
       });
 
       return {
         transcript: null,
-        twiml: twiml(`Is this an expense receipt, revenue, or timesheet? Reply "expense", "revenue", or "timesheet".`)
+        twiml: twiml(`Is this an expense receipt, revenue, or timesheet? Reply "expense", "revenue", or "timesheet".`),
       };
     }
 
     // Let media parser classify structured intents (time, hours, expense/revenue)
-    const result = await parseMediaText(extractedText);
+    let result = null;
+    try {
+      result = await parseMediaText(extractedText);
+    } catch (e) {
+      console.warn('[MEDIA] parseMediaText failed (ignored):', e?.message);
+      result = null;
+    }
 
     // HOURS inquiry
     if (result?.type === 'hours_inquiry') {
@@ -479,7 +525,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
             person: name,
             period: result.data.period,
             tz,
-            now: new Date()
+            now: new Date(),
           });
           return { transcript: null, twiml: twiml(message) };
         } catch (e) {
@@ -493,12 +539,12 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         ...(pending || {}),
         pendingMedia: { type: 'hours_inquiry' },
         pendingHours: { employeeName: name },
-        mediaSourceMsgId: stableMediaMsgId
+        mediaSourceMsgId: stableMediaMsgId,
       });
 
       return {
         transcript: null,
-        twiml: twiml(`Looks like you’re asking about ${name}’s hours. Do you want today, this week, or this month?`)
+        twiml: twiml(`Looks like you’re asking about ${name}’s hours. Do you want today, this week, or this month?`),
       };
     }
 
@@ -507,6 +553,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       const data = result.data || {};
       let { employeeName, type, timestamp } = data;
 
+      // Voice inference can override weak parser mistakes
       const inferred = inferTimeclockIntentFromText(extractedText);
       if (inferred === 'punch_in' && type === 'punch_out') type = 'punch_in';
       if (inferred === 'punch_out' && type === 'punch_in') type = 'punch_out';

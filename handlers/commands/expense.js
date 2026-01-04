@@ -465,14 +465,13 @@ function extractJobNoFromWhatsAppListTitle(title) {
 
 
 
-async function resendConfirmExpense({ from, ownerId, tz }) {
+async function resendConfirmExpense({ from, ownerId, tz, paUserId }) {
   const paKey =
+    normalizeIdentityDigits(paUserId) ||
     normalizeIdentityDigits(from) ||
-    normalizeIdentityDigits(String(from || '').replace(/^whatsapp:\+/, '')) ||
     String(from || '').trim();
 
   const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
-  if (!confirmPA?.payload) return null;
 
   const draft = confirmPA.payload.draft || {};
 
@@ -2387,7 +2386,7 @@ const lockKey = `lock:${paUserId}`;
           }
         }
 
-        // ----------------------------
+// ----------------------------
 // 1) PICKER-TAP PATH (Twilio interactive replies)
 // ----------------------------
 if (looksLikePickerTap) {
@@ -2505,7 +2504,13 @@ if (looksLikePickerTap) {
 
   // ✅ With your current resendConfirmExpense(), this is correct
   // because you normalize `from = paUserId` at the top of handleExpense
-  return await resendConfirmExpense({ from, ownerId, tz });
+  return await resendConfirmExpense({
+  from,
+  ownerId,
+  tz,
+  paUserId
+});
+
 }
 
 

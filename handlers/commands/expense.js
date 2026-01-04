@@ -963,7 +963,16 @@ return { ok: false, reason: 'unrecognized_row_id' };
 }
 
 
-async function rejectAndResendPicker({ from, ownerId, userProfile, confirmFlowId, jobOptions, reason, twilioMeta }) {
+async function rejectAndResendPicker({
+  from,
+  ownerId,
+  userProfile,
+  confirmFlowId,
+  jobOptions,
+  reason,
+  twilioMeta,
+  confirmDraft = null
+}) {
   console.warn('[JOB_PICK_REJECT]', {
     reason,
     from,
@@ -975,16 +984,16 @@ async function rejectAndResendPicker({ from, ownerId, userProfile, confirmFlowId
     msgSid: twilioMeta?.MessageSid
   });
 
-  // Send a fresh picker first (so the next tap has the newest state)
   await sendJobPickList({
     from,
     ownerId,
     userProfile,
-    confirmFlowId,
-    jobOptions,
+    confirmFlowId: confirmFlowId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+    jobOptions: Array.isArray(jobOptions) ? jobOptions : [],
     page: 0,
     pageSize: 8,
-    context: 'expense_jobpick'
+    context: 'expense_jobpick',
+    confirmDraft
   });
 
   return out(
@@ -992,6 +1001,8 @@ async function rejectAndResendPicker({ from, ownerId, userProfile, confirmFlowId
     false
   );
 }
+
+
 
 
 
@@ -2119,17 +2130,21 @@ if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payloa
   } else {
     // Stale picker protection → resend page 0
     if (!sentAt || (Date.now() - sentAt) > (PA_TTL_SEC * 1000)) {
-      return await sendJobPickList({
-        from,
-        ownerId,
-        userProfile,
-        confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-        jobOptions,
-        page: 0,
-        pageSize: 8,
-        context: 'expense_jobpick',
-        confirmDraft: pickPA.payload.confirmDraft || null
-      });
+      const jobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
+
+return await sendJobPickList({
+  from,
+  ownerId,
+  userProfile,
+  confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+  jobOptions,
+  page: 0,
+  pageSize: 8,
+  context: 'expense_jobpick',
+  confirmDraft: pickPA?.payload?.confirmDraft || null
+});
+
+
     }
 
     // Observability
@@ -2173,17 +2188,21 @@ if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payloa
 
     // change job → resend same page
     if (tok === 'change_job') {
-      return await sendJobPickList({
-        from,
-        ownerId,
-        userProfile,
-        confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-        jobOptions,
-        page,
-        pageSize,
-        context: 'expense_jobpick',
-        confirmDraft: pickPA.payload.confirmDraft || null
-      });
+    const jobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
+
+return await sendJobPickList({
+  from,
+  ownerId,
+  userProfile,
+  confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+  jobOptions,
+  page: 0,
+  pageSize: 8,
+  context: 'expense_jobpick',
+  confirmDraft: pickPA?.payload?.confirmDraft || null
+});
+
+
     }
 
     // more → next page
@@ -2191,17 +2210,21 @@ if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payloa
       if (!hasMore) {
         return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
       }
-      return await sendJobPickList({
-        from,
-        ownerId,
-        userProfile,
-        confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-        jobOptions,
-        page: page + 1,
-        pageSize,
-        context: 'expense_jobpick',
-        confirmDraft: pickPA.payload.confirmDraft || null
-      });
+    const jobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
+
+return await sendJobPickList({
+  from,
+  ownerId,
+  userProfile,
+  confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+  jobOptions,
+  page: 0,
+  pageSize: 8,
+  context: 'expense_jobpick',
+  confirmDraft: pickPA?.payload?.confirmDraft || null
+});
+
+
     }
 
     // ✅ HARD GUARD: if confirm PA is missing but we got a picker reply, re-bootstrap from pickPA.confirmDraft
@@ -2215,16 +2238,21 @@ if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payloa
         confirmPAForGuard = await getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM });
       } else {
         // Can't reconstruct → resend picker
-        return await sendJobPickList({
-          from,
-          ownerId,
-          userProfile,
-          confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-          jobOptions,
-          page,
-          pageSize,
-          context: 'expense_jobpick'
-        });
+       const jobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
+
+return await sendJobPickList({
+  from,
+  ownerId,
+  userProfile,
+  confirmFlowId: confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+  jobOptions,
+  page: 0,
+  pageSize: 8,
+  context: 'expense_jobpick',
+  confirmDraft: pickPA?.payload?.confirmDraft || null
+});
+
+
       }
     }
 
@@ -2403,7 +2431,7 @@ if (confirmPA?.payload?.draft) {
     from,
     ownerId,
     userProfile,
-    confirmFlowId: stableMsgId,
+    confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
     jobOptions: jobs,
     page: 0,
     pageSize: 8,
@@ -2541,15 +2569,21 @@ if (confirmPA?.payload?.draft) {
     });
 
     if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-    return await sendJobPickList({
+    
+
+return await sendJobPickList({
   from,
   ownerId,
-  confirmFlowId: stableMsgId,
+  userProfile,
+  confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
   jobOptions: jobs,
   page: 0,
   pageSize: 8,
   context: 'expense_jobpick'
 });
+
+
+
 
   }
 
@@ -2726,14 +2760,17 @@ return out(twimlText(reply), false);
 
   const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
   return await sendJobPickList({
-    from,
-    ownerId,
-    confirmFlowId: stableMsgId,
-    jobOptions: jobs,
-    page: 0,
-    pageSize: 8,
-    context: 'expense_jobpick'
-  });
+  from,
+  ownerId,
+  userProfile,
+  confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+  jobOptions: jobs,
+  page: 0,
+  pageSize: 8,
+  context: 'expense_jobpick'
+});
+
+
 }
 
 
@@ -2828,19 +2865,22 @@ if (!jobName) {
   from,
   ownerId,
   userProfile,
-  confirmFlowId: stableMsgId,
+  confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
   jobOptions: jobs,
   page: 0,
   pageSize: 8,
   context: 'expense_jobpick',
   confirmDraft: {
-    ...data0,            // or data
+    ...data0,
     jobName: null,
     jobSource: null,
     originalText: input,
     draftText: input
   }
 });
+
+
+
 
 }
 

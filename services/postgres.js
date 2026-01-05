@@ -266,6 +266,7 @@ let TX_HAS_UPDATED_AT = null;
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
 async function detectTransactionsCapabilities() {
+  
   // cached
   if (
     TX_HAS_SOURCE_MSG_ID !== null &&
@@ -283,7 +284,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_USER_NAME !== null &&
     TX_HAS_MEDIA_META !== null &&
     TX_HAS_CREATED_AT !== null &&
-    TX_HAS_UPDATED_AT !== null
+    TX_HAS_UPDATED_AT !== null &&
+    TX_HAS_MEDIA_ASSET_ID !== null 
   ) {
     return {
       TX_HAS_SOURCE_MSG_ID,
@@ -301,7 +303,9 @@ async function detectTransactionsCapabilities() {
       TX_HAS_USER_NAME,
       TX_HAS_MEDIA_META,
       TX_HAS_CREATED_AT,
-      TX_HAS_UPDATED_AT
+      TX_HAS_UPDATED_AT,
+      TX_HAS_MEDIA_ASSET_ID
+
     };
   }
 
@@ -312,6 +316,7 @@ async function detectTransactionsCapabilities() {
         where table_schema='public'
           and table_name='transactions'`
     );
+    
     const names = new Set((rows || []).map((r) => String(r.column_name).toLowerCase()));
 
     TX_HAS_SOURCE_MSG_ID = names.has('source_msg_id');
@@ -323,6 +328,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_JOB_ID = names.has('job_id');
     TX_HAS_JOB_NO = names.has('job_no');
     TX_HAS_DEDUPE_HASH = names.has('dedupe_hash');
+    TX_HAS_MEDIA_ASSET_ID = names.has('media_asset_id');
+
 
     // additional back-compat / optional columns
     TX_HAS_JOB = names.has('job');
@@ -344,6 +351,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_JOB_ID = false;
     TX_HAS_JOB_NO = false;
     TX_HAS_DEDUPE_HASH = false;
+    TX_HAS_MEDIA_ASSET_ID = false;
+
 
     TX_HAS_JOB = false;
     TX_HAS_JOB_NAME = false;
@@ -370,9 +379,12 @@ async function detectTransactionsCapabilities() {
     TX_HAS_USER_NAME,
     TX_HAS_MEDIA_META,
     TX_HAS_CREATED_AT,
-    TX_HAS_UPDATED_AT
+    TX_HAS_UPDATED_AT,
+    TX_HAS_MEDIA_ASSET_ID
+
   };
 }
+
 
 async function detectTransactionsUniqueOwnerSourceMsg() {
   if (TX_HAS_OWNER_SOURCEMSG_UNIQUE !== null) return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
@@ -440,7 +452,7 @@ function normalizeMediaMeta(mediaMeta) {
 /* ✅ Job resolution helpers used by insertTransaction                  */
 /* ------------------------------------------------------------------ */
 async function resolveJobRow(ownerId, jobRefOrName) {
-  const owner = DIGITS(ownerId);
+  const owner = String(ownerId || '').trim();
   const ref = jobRefOrName == null ? '' : String(jobRefOrName).trim();
   if (!owner || !ref) return null;
 
@@ -547,7 +559,7 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
  * - Never accidentally stuff jobs.job_no or jobs.id (int) into a UUID job_id column.
  */
 async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
-  const owner = DIGITS(opts.ownerId || opts.owner_id);
+  const owner = String(opts.ownerId ?? opts.owner_id ?? '').trim();
   const kind = String(opts.kind || '').trim();
   const date = String(opts.date || '').trim();
   const description = String(opts.description || '').trim() || 'Unknown';
@@ -570,6 +582,16 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const category = opts.category == null ? null : String(opts.category).trim() || null;
   const userName = opts.user_name ?? opts.userName ?? null;
   const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
+  const mediaAssetIdRaw = opts.media_asset_id ?? opts.mediaAssetId ?? null;
+const mediaAssetId =
+  mediaAssetIdRaw != null && looksLikeUuid(String(mediaAssetIdRaw).trim())
+    ? String(mediaAssetIdRaw).trim()
+    : null;
+
+if (mediaAssetIdRaw != null && !mediaAssetId) {
+  console.warn('[PG/transactions] refusing non-uuid media_asset_id; ignoring', { mediaAssetIdRaw });
+}
+
 
   if (!owner) throw new Error('insertTransaction missing ownerId');
   if (!kind) throw new Error('insertTransaction missing kind');
@@ -758,6 +780,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
   const vals = [owner, kind, date, description, amountCents, source];
 
+  
+
   if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
     cols.push('amount');
     vals.push(amountMaybe);
@@ -804,6 +828,10 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     cols.push('media_meta');
     vals.push(JSON.stringify(media));
   }
+  if (caps.TX_HAS_MEDIA_ASSET_ID) {
+  cols.push('media_asset_id');
+  vals.push(mediaAssetId); // uuid or null only
+}
 
   // legacy discrete media cols if present (optional, safe)
   if (media) {
@@ -840,7 +868,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
 // Prefer dedupe hash conflict when available
 if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
-  const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
   if (hasOwnerDedupeUnique) {
     conflictSql = ' on conflict (owner_id, dedupe_hash) where dedupe_hash is not null do nothing ';
   }

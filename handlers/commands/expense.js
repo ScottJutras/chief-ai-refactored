@@ -2710,6 +2710,14 @@ if (confirmPA?.payload?.draft) {
     });
 
     const rawDraft = { ...(confirmPA.payload.draft || {}) };
+    // ✅ Link receipt/media asset if present (beta-safe)
+    const mediaAssetId =
+       (rawDraft?.media_asset_id || rawDraft?.mediaAssetId || null) ||
+       (rawDraft?.pendingMediaMeta?.media_asset_id || rawDraft?.pendingMediaMeta?.mediaAssetId || null) ||
+       (confirmPA?.payload?.draft?.pendingMediaMeta?.media_asset_id || null) ||
+       null;
+console.info('[EXPENSE_MEDIA_LINK]', { mediaAssetId: mediaAssetId || null, sourceMsgId: stableMsgId || null });
+
 
     // Never allow numeric job_id to be written into tx.job_id
     const rawJobId =
@@ -2866,7 +2874,8 @@ if (confirmPA?.payload?.draft) {
       job_no: jobNo,
       category: category ? String(category).trim() : null,
       user_name: userProfile?.name || 'Unknown User',
-      source_msg_id: stableMsgId
+      source_msg_id: stableMsgId,
+      media_asset_id: mediaAssetId
     },
     { timeoutMs: 4500 }
   ),
@@ -2910,6 +2919,7 @@ console.info('[EXPENSE_WRITE_RESULT]', {
             suggestedCategory: category,
             job_id: maybeJobId || null,
             job_no: jobNo,
+            media_asset_id: mediaAssetId,
             originalText: rawDraft?.originalText || rawDraft?.draftText || input,
             draftText: rawDraft?.draftText || rawDraft?.originalText || input
           },
@@ -3012,6 +3022,7 @@ console.info('[EXPENSE_WRITE_RESULT]', {
             suggestedCategory: category,
             job_id: null,
             job_no: null,
+            media_asset_id: mediaAssetId,
             originalText: input,
             draftText: input
           },

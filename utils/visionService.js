@@ -1,84 +1,172 @@
 // utils/visionService.js
-// COMPLETE DROP-IN (BETA-ready; aligned to media.js expectations)
-// Safe, serverless-friendly wrapper for Google Vision OCR.
-//
-// ✅ Never hard-fails if optional deps are missing (@google-cloud/vision, axios)
+// ------------------------------------------------------------
+// Document AI OCR wrapper (drop-in replacement for prior Vision OCR)
+// ✅ Never hard-fails if optional deps are missing (@google-cloud/documentai, axios)
 // ✅ Capability-gated + cached client (cold-start friendly)
-// ✅ Handles Twilio-protected Media URLs by fetching bytes with Basic Auth (when creds exist)
+// ✅ Handles Twilio-protected Media URLs by fetching bytes with Basic Auth
 // ✅ Returns { text: "" } on any failure so media flow never crashes
-// ✅ Adds timeouts + size guards to avoid hanging lambdas
+//
+// Env (recommended):
+//   GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64  (service account json base64)
+//   DOCUMENTAI_PROCESSOR_NAME            (projects/.../locations/.../processors/...)
+//
+// Or:
+//   DOCUMENTAI_PROJECT_ID
+//   DOCUMENTAI_LOCATION   (us|eu)
+//   DOCUMENTAI_PROCESSOR_ID
+//
+// Optional:
+//   DOCUMENTAI_API_ENDPOINT  (eu-documentai.googleapis.com / us-documentai.googleapis.com)
+// ------------------------------------------------------------
 
 let cachedClient = undefined; // undefined = not initialized, null = unavailable, object = client
+let cachedCaps = undefined;
 
-function hasVisionCreds() {
-  return !!process.env.GOOGLE_VISION_CREDENTIALS_BASE64;
+function hasDocAiCreds() {
+  return !!(process.env.GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64 || process.env.GOOGLE_VISION_CREDENTIALS_BASE64);
 }
 
-function getVisionClient() {
-  if (cachedClient !== undefined) return cachedClient; // cached
+function getDocAiProcessorName() {
+  const explicit = String(process.env.DOCUMENTAI_PROCESSOR_NAME || '').trim();
+  if (explicit) return explicit;
 
-  if (!hasVisionCreds()) {
-    console.warn('[visionService] GOOGLE_VISION_CREDENTIALS_BASE64 missing. Skipping OCR (dev mode).');
+  const projectId = String(process.env.DOCUMENTAI_PROJECT_ID || '').trim();
+  const location = String(process.env.DOCUMENTAI_LOCATION || '').trim();
+  const processorId = String(process.env.DOCUMENTAI_PROCESSOR_ID || '').trim();
+
+  if (!projectId || !location || !processorId) return null;
+  return `projects/${projectId}/locations/${location}/processors/${processorId}`;
+}
+
+function getDocAiEndpoint() {
+  const explicit = String(process.env.DOCUMENTAI_API_ENDPOINT || '').trim();
+  if (explicit) return explicit;
+
+  const location = String(process.env.DOCUMENTAI_LOCATION || '').trim().toLowerCase();
+  // Google sample notes regional endpoints (eu/us) when needed. :contentReference[oaicite:1]{index=1}
+  if (location === 'eu') return 'eu-documentai.googleapis.com';
+  if (location === 'us') return 'us-documentai.googleapis.com';
+  return null;
+}
+
+function getCredentialsFromBase64() {
+  // Prefer dedicated Document AI creds; fall back to your existing Vision env var if that’s what you have.
+  const b64 =
+    process.env.GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64 ||
+    process.env.GOOGLE_VISION_CREDENTIALS_BASE64 ||
+    '';
+
+  const raw = String(b64).trim();
+  if (!raw) return null;
+
+  try {
+    const jsonStr = Buffer.from(raw, 'base64').toString('utf8');
+    return JSON.parse(jsonStr);
+  } catch (e) {
+    console.warn('[docaiService] Credential JSON decode failed:', e?.message || e);
+    return null;
+  }
+}
+
+function getDocAiClient() {
+  if (cachedClient !== undefined) return cachedClient;
+
+  if (!hasDocAiCreds()) {
+    console.warn('[docaiService] Credentials missing. Skipping OCR (dev mode).');
+    cachedClient = null;
+    return cachedClient;
+  }
+
+  const processorName = getDocAiProcessorName();
+  if (!processorName) {
+    console.warn('[docaiService] Processor name missing. Set DOCUMENTAI_PROCESSOR_NAME (or PROJECT/LOCATION/PROCESSOR_ID).');
     cachedClient = null;
     return cachedClient;
   }
 
   try {
     // Optional dependency — must be guarded.
-    const { ImageAnnotatorClient } = require('@google-cloud/vision');
+    const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
 
-    const credsJson = Buffer.from(process.env.GOOGLE_VISION_CREDENTIALS_BASE64, 'base64').toString('utf8');
-    const credentials = JSON.parse(credsJson);
+    const credentials = getCredentialsFromBase64();
+    if (!credentials) {
+      console.warn('[docaiService] Credentials invalid/unreadable.');
+      cachedClient = null;
+      return cachedClient;
+    }
 
-    cachedClient = new ImageAnnotatorClient({ credentials });
+    const apiEndpoint = getDocAiEndpoint();
+    const opts = apiEndpoint ? { apiEndpoint, credentials } : { credentials };
+
+    cachedClient = new DocumentProcessorServiceClient(opts);
+    cachedCaps = { processorName };
     return cachedClient;
   } catch (err) {
-    // Missing module or bad creds JSON — treat as unavailable, fail-open.
-    console.warn('[visionService] Vision unavailable:', err?.message || err);
+    console.warn('[docaiService] Document AI unavailable:', err?.message || err);
     cachedClient = null;
     return cachedClient;
   }
 }
 
-async function fetchTwilioMediaBytes(imageUrl) {
-  // Fetching Twilio media often requires Basic Auth.
-  // Must fail-open — caller will fall back.
-  const url = String(imageUrl || '').trim();
-  if (!url) return null;
-
-  let axios;
+async function fetchTwilioMediaBytes(url) {
   try {
-    axios = require('axios');
-  } catch (e) {
-    console.warn('[visionService] axios missing. Cannot fetch media bytes.');
-    return null;
-  }
+    const axios = require('axios');
 
-  try {
     const sid = process.env.TWILIO_ACCOUNT_SID;
     const token = process.env.TWILIO_AUTH_TOKEN;
 
-    // If creds missing, try unauthenticated fetch (works if media URL is public/signed)
     const config = {
       responseType: 'arraybuffer',
-      maxContentLength: 12 * 1024 * 1024, // images can be larger than audio
+      maxContentLength: 12 * 1024 * 1024,
       timeout: 8000,
-      headers: { 'User-Agent': 'ChiefOS-VisionService/1.0' },
     };
 
-    if (sid && token) {
-      config.auth = { username: sid, password: token };
-    }
+    if (sid && token) config.auth = { username: sid, password: token };
 
     const resp = await axios.get(url, config);
-    const buf = Buffer.from(resp.data);
-
-    // Small guard: don't try OCR on empty
-    if (!buf || !buf.length) return null;
-    return buf;
+    return Buffer.from(resp.data);
   } catch (err) {
-    console.warn('[visionService] Media fetch failed (ignored):', err?.message || err);
+    console.warn('[docaiService] Media fetch failed (ignored):', err?.message || err);
     return null;
+  }
+}
+
+function normalizeMimeType(mediaType) {
+  const mt = String(mediaType || '').split(';')[0].trim().toLowerCase();
+  if (mt) return mt;
+
+  // best-effort inference (Twilio sometimes omits/warps content-type)
+  return 'application/octet-stream';
+}
+
+async function processBytesWithDocAi({ bytes, mimeType }) {
+  const client = getDocAiClient();
+  if (!client) return { text: '' };
+
+  const processorName = cachedCaps?.processorName || getDocAiProcessorName();
+  if (!processorName) return { text: '' };
+
+  try {
+    // Node quickstart pattern: rawDocument.content = base64; mimeType included. :contentReference[oaicite:2]{index=2}
+    const encoded = Buffer.from(bytes).toString('base64');
+
+    const request = {
+      name: processorName,
+      rawDocument: {
+        content: encoded,
+        mimeType: mimeType || 'application/octet-stream',
+      },
+    };
+
+    const [result] = await client.processDocument(request);
+    const doc = result?.document || null;
+
+    // Most useful generic extraction for receipts: full text.
+    const text = String(doc?.text || '').trim();
+    return { text: text || '' };
+  } catch (err) {
+    console.warn('[docaiService] processDocument failed (ignored):', err?.message || err);
+    return { text: '' };
   }
 }
 
@@ -86,50 +174,40 @@ async function fetchTwilioMediaBytes(imageUrl) {
  * Extract text from an image URL (Twilio media URL).
  *
  * ✅ Never throws.
- * ✅ Returns { text: "" } when Vision is unavailable OR OCR fails.
+ * ✅ Returns { text: "" } when Document AI is unavailable OR OCR fails.
  *
  * @param {string} imageUrl
  * @param {object} [opts]
  * @param {boolean} [opts.fetchBytes=true] - fetch bytes and OCR by content (preferred for Twilio URLs)
+ * @param {string}  [opts.mediaType] - optional mime type hint
  * @returns {Promise<{ text: string }>}
  */
 async function extractTextFromImage(imageUrl, opts = {}) {
   const url = String(imageUrl || '').trim();
   if (!url) return { text: '' };
 
-  const client = getVisionClient();
+  const client = getDocAiClient();
   if (!client) return { text: '' };
 
   const fetchBytes = opts.fetchBytes !== false;
+  const mimeType = normalizeMimeType(opts.mediaType);
 
   try {
-    // Prefer OCR-by-bytes because Twilio media URLs often require auth.
     if (fetchBytes) {
       const buf = await fetchTwilioMediaBytes(url);
       if (!buf || !buf.length) return { text: '' };
-
-      // Vision expects base64 content
-      const [result] = await client.textDetection({
-        image: { content: buf.toString('base64') },
-      });
-
-      const detections = result?.textAnnotations || [];
-      const fullText = detections[0]?.description || '';
-      return { text: fullText || '' };
+      return await processBytesWithDocAi({ bytes: buf, mimeType });
     }
 
-    // Fallback path: OCR-by-URL (only works if URL is publicly accessible)
-    const [result] = await client.textDetection(url);
-    const detections = result?.textAnnotations || [];
-    const fullText = detections[0]?.description || '';
-    return { text: fullText || '' };
+    // For Document AI, OCR-by-URL is not the normal path; keep fail-open behavior.
+    // If you ever want URL ingestion, you’d need to fetch bytes anyway for Twilio.
+    const buf = await fetchTwilioMediaBytes(url);
+    if (!buf || !buf.length) return { text: '' };
+    return await processBytesWithDocAi({ bytes: buf, mimeType });
   } catch (err) {
-    // Fail-open: OCR is enrichment only.
-    console.warn('[visionService] Vision OCR failed (ignored):', err?.message || err);
+    console.warn('[docaiService] extractTextFromImage failed (ignored):', err?.message || err);
     return { text: '' };
   }
 }
 
-module.exports = {
-  extractTextFromImage,
-};
+module.exports = { extractTextFromImage };

@@ -2829,10 +2829,11 @@ if (token === 'yes') {
   });
 
   const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
-  // ✅ Provide resolver a deterministic DB key even if pending state is empty
+ // ✅ Provide resolver a deterministic DB key even if pending state is empty
 if (!rawDraft.media_source_msg_id && confirmPA?.payload?.sourceMsgId) {
   rawDraft.media_source_msg_id = `${String(from || '').trim()}:${String(confirmPA.payload.sourceMsgId).trim()}`;
 }
+
 
 
   // ⛔ OLD mediaAssetId logic was here

@@ -3,7 +3,7 @@
 //
 // ✅ Alignment / beta-hardening changes (no unnecessary logic loss):
 // - Pending media meta schema matches what revenue.js/expense.js consume:
-//     { url, type, transcript, confidence, source_msg_id }
+//     { url, type, transcript, confidence, source_msg_id, media_asset_id }
 // - Stable idempotency key for media: prefers Twilio MediaSid, else MessageSid, else time
 // - Stores mediaSourceMsgId + (expenseSourceMsgId / revenueSourceMsgId) in pending state (same pattern)
 // - Does NOT log expense/revenue; only attaches pendingMediaMeta + returns transcript to router
@@ -26,6 +26,7 @@ const { extractTextFromImage } = require('../utils/visionService'); // now Docum
 const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
 const pg = require('../services/postgres');
+
 function getDbQuery(pg) {
   return (
     (pg && typeof pg.query === 'function' && pg.query.bind(pg)) ||
@@ -34,9 +35,7 @@ function getDbQuery(pg) {
     null
   );
 }
-
 const dbQuery = getDbQuery(pg);
-
 
 // Some builds export generateTimesheet from postgres; some from pg service layer.
 let generateTimesheet = null;
@@ -83,9 +82,19 @@ function DIGITS(x) {
     .replace(/\D/g, '');
 }
 
+// ✅ canonical key for pending state + stable ids (matches expense.js normalization intent)
+function canonicalUserKey(from) {
+  try {
+    return String(DIGITS(from) || '').trim() || String(from || '').trim();
+  } catch {
+    return String(from || '').trim();
+  }
+}
+
 function getUserTz(userProfile) {
   return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 }
+
 async function upsertMediaAsset({
   ownerId,
   from,
@@ -169,7 +178,6 @@ async function upsertMediaAsset({
     return null;
   }
 }
-
 
 function fmtLocal(tsIso, tz) {
   try {
@@ -294,7 +302,7 @@ function getTwilioMediaSid(mediaUrl) {
 
 /* ---------------- pending state + meta ---------------- */
 
-async function attachPendingMediaMeta(from, meta) {
+async function attachPendingMediaMeta(userKey, meta) {
   try {
     const raw = {
       url: meta?.url || meta?.media_url || null,
@@ -317,11 +325,22 @@ async function attachPendingMediaMeta(from, meta) {
       return;
     }
 
-    const pending = await getPendingTransactionState(from);
-    await mergePendingTransactionState(from, {
+    const pending = await getPendingTransactionState(userKey);
+    await mergePendingTransactionState(userKey, {
       ...(pending || {}),
       pendingMediaMeta: normalized
     });
+
+    // ✅ sanity log (prove state contains it)
+    try {
+      const chk = await getPendingTransactionState(userKey);
+      console.info('[PENDING_MEDIA_META_CHECK]', {
+        userKey,
+        hasPending: !!chk,
+        media_asset_id: chk?.pendingMediaMeta?.media_asset_id || null,
+        source_msg_id: chk?.pendingMediaMeta?.source_msg_id || null
+      });
+    } catch {}
   } catch (e) {
     console.warn('[MEDIA] attachPendingMediaMeta failed (ignored):', e?.message);
   }
@@ -347,10 +366,10 @@ function financeIntentFromText(text) {
   return { kind: null };
 }
 
-async function markPendingFinance({ from, kind, stableMediaMsgId }) {
+async function markPendingFinance({ userKey, kind, stableMediaMsgId }) {
   try {
-    const pending = await getPendingTransactionState(from);
-    await mergePendingTransactionState(from, {
+    const pending = await getPendingTransactionState(userKey);
+    await mergePendingTransactionState(userKey, {
       ...(pending || {}),
       type: kind,
       pendingMedia: { type: kind },
@@ -415,6 +434,9 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       sourceMsgId: sourceMsgId || null
     });
 
+    // ✅ canonical key for all state reads/writes and stable ids
+    const userKey = canonicalUserKey(from);
+
     // text-only messages pass through
     if (!mediaUrl) return await passThroughTextOnly(from, input);
 
@@ -441,16 +463,16 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
     const mediaSid = getTwilioMediaSid(mediaUrl);
     const stableMediaMsgId =
-      (mediaSid ? `${from}:${mediaSid}` : null) ||
-      (String(sourceMsgId || '').trim() ? `${from}:${String(sourceMsgId).trim()}` : null) ||
-      `${from}:${Date.now()}`;
+      (mediaSid ? `${userKey}:${mediaSid}` : null) ||
+      (String(sourceMsgId || '').trim() ? `${userKey}:${String(sourceMsgId).trim()}` : null) ||
+      `${userKey}:${Date.now()}`;
 
     console.info('[DB_ENV]', {
       hasDbUrl: !!process.env.DATABASE_URL,
       dbHostHint: (process.env.DATABASE_URL || '').split('@')[1]?.split('/')[0] || null
     });
 
-    // Resolve active job once
+    // Resolve active job once (identity lookup should use digits)
     let activeJobName = null;
     let activeJobNo = null;
     let activeJobId = null;
@@ -543,21 +565,59 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
       }
 
+      // ✅ HARDEN: persist pending media meta for later expense/revenue YES (canonical key)
+      try {
+        const pending = await getPendingTransactionState(userKey);
+
+        await mergePendingTransactionState(userKey, {
+          ...(pending || {}),
+          pendingMediaMeta: {
+            url: mediaUrl || null,
+            type: normType || null,
+            source_msg_id: stableMediaMsgId || null,
+            media_asset_id: mediaAssetId || null,
+            transcript: transcript ? truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS) : null,
+            confidence: Number.isFinite(Number(confidence)) ? Number(confidence) : null
+          },
+          pendingMedia: { url: mediaUrl || null, type: normType || null },
+          mediaSourceMsgId: stableMediaMsgId || null
+        });
+
+        console.info('[PENDING_MEDIA_META_SAVED]', {
+          userKey,
+          media_asset_id: mediaAssetId || null,
+          source_msg_id: stableMediaMsgId || null
+        });
+
+        try {
+          const chk = await getPendingTransactionState(userKey);
+          console.info('[PENDING_MEDIA_META_CHECK]', {
+            userKey,
+            hasPending: !!chk,
+            media_asset_id: chk?.pendingMediaMeta?.media_asset_id || null,
+            source_msg_id: chk?.pendingMediaMeta?.source_msg_id || null
+          });
+        } catch {}
+      } catch (e) {
+        console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
+      }
+
       mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
       mediaMeta.media_asset_id = mediaAssetId;
 
-      await attachPendingMediaMeta(from, mediaMeta);
+      await attachPendingMediaMeta(userKey, mediaMeta);
 
       const tc = inferTimeclockIntentFromText(transcript);
       if (!tc) {
         const fin = financeIntentFromText(transcript);
         if (fin.kind === 'expense' || fin.kind === 'revenue') {
-          await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
-          return { transcript, twiml: null };
+          await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
         }
         return { transcript, twiml: null };
       }
+      // timeclock: fall through to router with transcript (router may call timeclock)
+      return { transcript, twiml: null };
     }
 
     // IMAGE
@@ -568,6 +628,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       try {
         const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
         ocrText = String(out?.text || out?.transcript || '').trim();
+        // ocrFields intentionally left null unless your vision service returns structured fields
+        ocrFields = out?.fields || out?.ocrFields || null;
       } catch (e) {
         console.warn('[MEDIA] OCR failed (ignored):', e?.message);
       }
@@ -592,23 +654,63 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
       }
 
+      // ✅ HARDEN: persist pending media meta for later expense/revenue YES (canonical key)
+      try {
+        const pending = await getPendingTransactionState(userKey);
+
+        await mergePendingTransactionState(userKey, {
+          ...(pending || {}),
+          pendingMediaMeta: {
+            url: mediaUrl || null,
+            type: normType || null,
+            source_msg_id: stableMediaMsgId || null,
+            media_asset_id: mediaAssetId || null,
+            transcript: extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null,
+            confidence: null
+          },
+          pendingMedia: { url: mediaUrl || null, type: normType || null },
+          mediaSourceMsgId: stableMediaMsgId || null
+        });
+
+        console.info('[PENDING_MEDIA_META_SAVED]', {
+          userKey,
+          media_asset_id: mediaAssetId || null,
+          source_msg_id: stableMediaMsgId || null
+        });
+
+        try {
+          const chk = await getPendingTransactionState(userKey);
+          console.info('[PENDING_MEDIA_META_CHECK]', {
+            userKey,
+            hasPending: !!chk,
+            media_asset_id: chk?.pendingMediaMeta?.media_asset_id || null,
+            source_msg_id: chk?.pendingMediaMeta?.source_msg_id || null
+          });
+        } catch {}
+      } catch (e) {
+        console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
+      }
+
       mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
       mediaMeta.confidence = null;
       mediaMeta.media_asset_id = mediaAssetId;
 
-      await attachPendingMediaMeta(from, mediaMeta);
+      await attachPendingMediaMeta(userKey, mediaMeta);
 
       const fin = financeIntentFromText(extractedText);
       if (fin.kind === 'expense' || fin.kind === 'revenue') {
-        await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
+        await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
         return { transcript: extractedText, twiml: null };
       }
+
+      // not clearly expense/revenue — pass transcript to router
+      return { transcript: extractedText, twiml: null };
     }
 
     // If still nothing, ask user what it is (keep your existing UX)
     if (!extractedText) {
-      const pending = await getPendingTransactionState(from);
-      await mergePendingTransactionState(from, {
+      const pending = await getPendingTransactionState(userKey);
+      await mergePendingTransactionState(userKey, {
         ...(pending || {}),
         pendingMedia: { url: mediaUrl, type: null },
         mediaSourceMsgId: stableMediaMsgId
@@ -643,8 +745,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
         }
       }
 
-      const pending = await getPendingTransactionState(from);
-      await mergePendingTransactionState(from, {
+      const pending = await getPendingTransactionState(userKey);
+      await mergePendingTransactionState(userKey, {
         ...(pending || {}),
         pendingMedia: { type: 'hours_inquiry' },
         pendingHours: { employeeName: name },
@@ -691,7 +793,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
 
     // Expense / Revenue
     if (result?.type === 'expense' || result?.type === 'revenue') {
-      await markPendingFinance({ from, kind: result.type, stableMediaMsgId });
+      await markPendingFinance({ userKey, kind: result.type, stableMediaMsgId });
       return { transcript: extractedText, twiml: null };
     }
 

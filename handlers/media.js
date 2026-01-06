@@ -299,6 +299,73 @@ function getTwilioMediaSid(mediaUrl) {
     return null;
   }
 }
+function getTwilioMediaSidFromUrlPath(mediaUrl) {
+  try {
+    const u = new URL(String(mediaUrl || ''));
+    const parts = u.pathname.split('/').filter(Boolean);
+    const ix = parts.findIndex((p) => p.toLowerCase() === 'media');
+    if (ix >= 0 && parts[ix + 1]) return parts[ix + 1];
+    // fallback: last path segment sometimes is MediaSid
+    return parts.length ? parts[parts.length - 1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildTwilioMediaDownloadUrl({ accountSid, messageSid, mediaSid }) {
+  const a = String(accountSid || '').trim();
+  const m = String(messageSid || '').trim();
+  const ms = String(mediaSid || '').trim();
+  if (!a || !m || !ms) return null;
+  return `https://api.twilio.com/2010-04-01/Accounts/${a}/Messages/${m}/Media/${ms}`;
+}
+
+async function fetchTwilioMediaBytes(mediaUrl, sourceMsgId) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+
+  const axiosCfg = {
+    responseType: 'arraybuffer',
+    auth: { username: accountSid, password: authToken },
+    maxRedirects: 5,
+    timeout: 12000,
+    maxContentLength: 12 * 1024 * 1024,
+    maxBodyLength: 12 * 1024 * 1024,
+    validateStatus: (s) => s >= 200 && s < 300
+  };
+
+  // Attempt 1: use provided URL
+  try {
+    const r = await axios.get(mediaUrl, axiosCfg);
+    return Buffer.from(r.data);
+  } catch (e1) {
+    const mediaSid = getTwilioMediaSidFromUrlPath(mediaUrl) || getTwilioMediaSid(mediaUrl);
+    const fallbackUrl = buildTwilioMediaDownloadUrl({
+      accountSid,
+      messageSid: sourceMsgId, // inbound Twilio MessageSid (MM…)
+      mediaSid
+    });
+
+    if (fallbackUrl) {
+      try {
+        const r2 = await axios.get(fallbackUrl, axiosCfg);
+        return Buffer.from(r2.data);
+      } catch (e2) {
+        console.warn('[MEDIA] fetchTwilioMediaBytes fallback failed:', e2?.message, {
+          sourceMsgId,
+          mediaSid,
+          fallbackUrl
+        });
+        throw e2;
+      }
+    }
+
+    console.warn('[MEDIA] fetchTwilioMediaBytes initial failed:', e1?.message, { mediaUrl, sourceMsgId });
+    throw e1;
+  }
+}
+
+
 
 /* ---------------- pending state + meta ---------------- */
 
@@ -514,13 +581,8 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       let confidence = null;
 
       try {
-        const resp = await axios.get(mediaUrl, {
-          responseType: 'arraybuffer',
-          auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
-          maxContentLength: 8 * 1024 * 1024
-        });
+        const audioBuf = await fetchTwilioMediaBytes(mediaUrl, sourceMsgId);
 
-        const audioBuf = Buffer.from(resp.data);
 
         const r1 = await transcribeAudio(audioBuf, normType, 'both');
         const n1 = normalizeTranscriptionResult(r1);
@@ -802,6 +864,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
   } catch (error) {
     console.error(`[MEDIA] handleMedia failed for ${from}:`, error?.message);
     return { transcript: null, twiml: twiml(`⚠️ Failed to process media. Please try again.`) };
+    
   }
 }
 

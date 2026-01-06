@@ -721,26 +721,42 @@ router.post('*', async (req, res, next) => {
     const sourceMsgId = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
 
     const result = await handleMedia(
-      req.from,
-      bodyText,
-      req.userProfile || {},
-      req.ownerId,
-      url,
-      type,
-      sourceMsgId
-    );
+  req.from,
+  bodyText,
+  req.userProfile || {},
+  req.ownerId,
+  url,
+  type,
+  sourceMsgId
+);
 
-    // result object shape: { transcript, twiml }
-    if (result && typeof result === 'object') {
-      if (typeof result.twiml === 'string' && !res.headersSent) {
-        return sendTwiml(res, result.twiml);
-      }
+// ✅ Guarded result checks (prevents edge-case crashes if result is string/null)
+const hasTwiml = !!(result && typeof result === 'object' && result.twiml);
+const hasTranscript = !!(result && typeof result === 'object' && result.transcript);
 
-      if (result.transcript) {
-        req.body.Body = result.transcript;
-        return next();
-      }
-    }
+// ✅ Boundary debug
+console.info('[MEDIA_RETURN]', {
+  from: req.from,
+  ownerId: req.ownerId || null,
+  sourceMsgId: sourceMsgId || null,
+  mediaUrl: url ? String(url).slice(0, 140) : null,
+  mediaType: type || null,
+  hasTwiml,
+  hasTranscript,
+  transcriptLen: hasTranscript ? String(result.transcript).length : 0
+});
+
+
+
+    if (hasTwiml && !res.headersSent) {
+  return sendTwiml(res, result.twiml);
+}
+
+if (hasTranscript) {
+  req.body.Body = result.transcript;
+  return next();
+}
+
 
     if (typeof result === 'string' && !res.headersSent) {
       return sendTwiml(res, result);

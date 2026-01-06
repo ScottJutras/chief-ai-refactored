@@ -2173,9 +2173,21 @@ const paUserId =
   normalizeIdentityDigits(inboundTwilioMeta?.WaId) ||
   normalizeIdentityDigits(from) ||
   String(from || '').trim();
+
 // ✅ If any helper still keys PAs by `from`, normalize `from` now:
 from = paUserId;
 console.info('[PA_KEY]', { from, waId: inboundTwilioMeta?.WaId, paUserId });
+
+// ---- media linkage (function-scope) ----
+// Allows deterministic/AI confirm drafts to carry media_asset_id into YES.
+let flowMediaAssetId = null;
+try {
+  const pending = await getPendingTransactionState(from); // ✅ now uses canonical key
+  flowMediaAssetId =
+    (pending?.pendingMediaMeta?.media_asset_id || pending?.pendingMediaMeta?.mediaAssetId || null) ||
+    null;
+} catch {}
+
 
 // ✅ ONE lock key, canonical
 const lockKey = `lock:${paUserId}`;
@@ -2709,15 +2721,17 @@ if (confirmPA?.payload?.draft) {
       sourceMsgId: confirmPA?.payload?.sourceMsgId || null
     });
 
-    const rawDraft = { ...(confirmPA.payload.draft || {}) };
-    // ✅ Link receipt/media asset if present (beta-safe)
-    const mediaAssetId =
-       (rawDraft?.media_asset_id || rawDraft?.mediaAssetId || null) ||
-       (rawDraft?.pendingMediaMeta?.media_asset_id || rawDraft?.pendingMediaMeta?.mediaAssetId || null) ||
-       (confirmPA?.payload?.draft?.pendingMediaMeta?.media_asset_id || null) ||
-       null;
-console.info('[EXPENSE_MEDIA_LINK]', { mediaAssetId: mediaAssetId || null, sourceMsgId: stableMsgId || null });
+    const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
 
+// ✅ Link receipt/media asset (beta-safe) — prefer draft value, fall back to pendingMediaMeta, then function-scope fallback.
+const mediaAssetId =
+  (rawDraft?.media_asset_id || rawDraft?.mediaAssetId || null) ||
+  (rawDraft?.pendingMediaMeta?.media_asset_id || rawDraft?.pendingMediaMeta?.mediaAssetId || null) ||
+  (confirmPA?.payload?.draft?.pendingMediaMeta?.media_asset_id || null) ||
+  flowMediaAssetId ||
+  null;
+
+console.info('[EXPENSE_MEDIA_LINK]', { mediaAssetId: mediaAssetId || null, sourceMsgId: stableMsgId || null });
 
     // Never allow numeric job_id to be written into tx.job_id
     const rawJobId =
@@ -2884,7 +2898,28 @@ console.info('[EXPENSE_MEDIA_LINK]', { mediaAssetId: mediaAssetId || null, sourc
 );
 
 if (writeResult === '__DB_TIMEOUT__') {
-  await upsertPA({ /* ... */ });
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      ...confirmPA.payload,
+      draft: {
+        ...data,
+        jobName,
+        jobSource,
+        suggestedCategory: category,
+        job_id: maybeJobId || null,
+        job_no: jobNo,
+        media_asset_id: mediaAssetId, // ✅ keep link on retry
+        originalText: rawDraft?.originalText || rawDraft?.draftText || input,
+        draftText: rawDraft?.draftText || rawDraft?.originalText || input
+      },
+      sourceMsgId: stableMsgId,
+      type: 'expense'
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
 
   return out(
     twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
@@ -2892,7 +2927,6 @@ if (writeResult === '__DB_TIMEOUT__') {
   );
 }
 
-// ✅ Now it’s safe / meaningful to log
 console.info('[EXPENSE_WRITE_RESULT]', {
   userId: paUserId,
   inserted: writeResult?.inserted,
@@ -2904,36 +2938,6 @@ console.info('[EXPENSE_WRITE_RESULT]', {
 });
 
 
-
-    if (writeResult === '__DB_TIMEOUT__') {
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...confirmPA.payload,
-          draft: {
-            ...data,
-            jobName,
-            jobSource,
-            suggestedCategory: category,
-            job_id: maybeJobId || null,
-            job_no: jobNo,
-            media_asset_id: mediaAssetId,
-            originalText: rawDraft?.originalText || rawDraft?.draftText || input,
-            draftText: rawDraft?.draftText || rawDraft?.originalText || input
-          },
-          sourceMsgId: stableMsgId,
-          type: 'expense'
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-
-      return out(
-        twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
-        false
-      );
-    }
 
     // ✅ Persist active job after success
     try {
@@ -2982,6 +2986,7 @@ console.info('[EXPENSE_WRITE_RESULT]', {
 
 
     /* ---- 3) New expense parse (deterministic first) ---- */
+    
     const backstop = deterministicExpenseParse(input, userProfile);
     if (backstop && backstop.amount) {
       const data0 = normalizeExpenseData(backstop, userProfile);
@@ -3022,7 +3027,7 @@ console.info('[EXPENSE_WRITE_RESULT]', {
             suggestedCategory: category,
             job_id: null,
             job_no: null,
-            media_asset_id: mediaAssetId,
+            media_asset_id: flowMediaAssetId,
             originalText: input,
             draftText: input
           },
@@ -3031,12 +3036,27 @@ console.info('[EXPENSE_WRITE_RESULT]', {
         },
         ttlSeconds: PA_TTL_SEC
       });
-      const chk = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+      const paChk = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 console.info('[CONFIRM_PA_AFTER_UPSERT]', {
-  hasDraft: !!chk?.payload?.draft,
+  hasDraft: !!paChk?.payload?.draft,
   userId: paUserId,
-  sourceMsgId: chk?.payload?.sourceMsgId || null
+  sourceMsgId: paChk?.payload?.sourceMsgId || null
 });
+
+// one-time sanity check: confirm app DB has media_assets rows for this owner
+try {
+  const dbChk = await pg.query(
+    `select count(*)::int as n from public.media_assets where owner_id=$1`,
+    [String(ownerId || '').trim()]
+  );
+  console.info('[MEDIA_ASSETS_COUNT]', {
+    ownerId: String(ownerId || '').trim(),
+    n: dbChk?.rows?.[0]?.n ?? null
+  });
+} catch (e) {
+  console.warn('[MEDIA_ASSETS_COUNT] failed (ignored):', e?.message);
+}
+
 
 
       if (!jobName) {
@@ -3121,15 +3141,17 @@ console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
         kind: PA_KIND_CONFIRM,
         payload: {
           draft: {
-            ...data,
-            jobName,
-            jobSource,
-            suggestedCategory: category,
-            job_id: null,
-            job_no: null,
-            originalText: input,
-            draftText: input
-          },
+  ...data,
+  jobName,
+  jobSource,
+  suggestedCategory: category,
+  job_id: null,
+  job_no: null,
+  media_asset_id: flowMediaAssetId, // ✅ IMPORTANT
+  originalText: input,
+  draftText: input
+},
+
           sourceMsgId: safeMsgId,
           type: 'expense'
         },

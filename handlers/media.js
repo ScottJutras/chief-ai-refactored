@@ -406,16 +406,14 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   return payload;
 }
 
-/* ---------------- main ---------------- */
-
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType, sourceMsgId) {
   try {
     console.info('[MEDIA_HANDLE_CALLED]', {
-  from,
-  hasMediaUrl: !!mediaUrl,
-  mediaType: mediaType || null,
-  sourceMsgId: sourceMsgId || null
-});
+      from,
+      hasMediaUrl: !!mediaUrl,
+      mediaType: mediaType || null,
+      sourceMsgId: sourceMsgId || null
+    });
 
     // text-only messages pass through
     if (!mediaUrl) return await passThroughTextOnly(from, input);
@@ -423,7 +421,6 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     const baseType = normalizeContentType(mediaType);
     const isAudio = baseType ? baseType.startsWith('audio/') : false;
 
-    // Twilio sometimes omits type; infer from URL extension as a weak hint.
     const urlLc = String(mediaUrl || '').toLowerCase();
     const maybeImage =
       !baseType && (urlLc.includes('.jpg') || urlLc.includes('.jpeg') || urlLc.includes('.png') || urlLc.includes('.webp'));
@@ -436,181 +433,177 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     const isSupportedAudio = isAudio || maybeAudio;
 
     if (!isImage && !isSupportedAudio) {
-      // fail-open: ask user instead of crashing
       return {
         transcript: null,
         twiml: twiml(`Is this an expense receipt, revenue, or timesheet? Reply "expense", "revenue", or "timesheet".`)
       };
     }
 
-    // Stable idempotency key: prefer MediaSid, else webhook MessageSid, else time.
-    // Stable idempotency key: prefer MediaSid, else webhook MessageSid, else time.
-const mediaSid = getTwilioMediaSid(mediaUrl);
-const stableMediaMsgId =
-  (mediaSid ? `${from}:${mediaSid}` : null) ||
-  (String(sourceMsgId || '').trim() ? `${from}:${String(sourceMsgId).trim()}` : null) ||
-  `${from}:${Date.now()}`;
+    const mediaSid = getTwilioMediaSid(mediaUrl);
+    const stableMediaMsgId =
+      (mediaSid ? `${from}:${mediaSid}` : null) ||
+      (String(sourceMsgId || '').trim() ? `${from}:${String(sourceMsgId).trim()}` : null) ||
+      `${from}:${Date.now()}`;
 
-// Resolve active job once (job-first identifier)
-let activeJobName = null;
-let activeJobNo = null;
-let activeJobId = null;
-
-try {
-  if (typeof pg.getActiveJobForIdentity === 'function') {
-    const row = await pg.getActiveJobForIdentity(String(ownerId).trim(), DIGITS(from));
-    if (row) {
-      activeJobName = row.name || row.job_name || null;
-      activeJobNo = row.job_no != null ? Number(row.job_no) : null;
-      activeJobId = row.id && String(row.id).trim() ? String(row.id).trim() : null;
-    }
-  }
-} catch (e) {
-  console.warn('[MEDIA] getActiveJobForIdentity failed (ignored):', e?.message);
-}
-
-let extractedText = String(input || '').trim();
-const normType = baseType || 'application/octet-stream';
-
-let mediaAssetId = null;
-
-const mediaMeta = {
-  url: mediaUrl || null,
-  type: normType || null,
-  transcript: null,
-  confidence: null,
-  source_msg_id: stableMediaMsgId,
-  media_asset_id: null
-};
-
-// AUDIO
-if (isSupportedAudio) {
-  if (typeof transcribeAudio !== 'function') {
-    return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
-  }
-
-  let transcript = '';
-  let confidence = null;
-
-  try {
-    const resp = await axios.get(mediaUrl, {
-      responseType: 'arraybuffer',
-      auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
-      maxContentLength: 8 * 1024 * 1024
+    console.info('[DB_ENV]', {
+      hasDbUrl: !!process.env.DATABASE_URL,
+      dbHostHint: (process.env.DATABASE_URL || '').split('@')[1]?.split('/')[0] || null
     });
 
-    const audioBuf = Buffer.from(resp.data);
+    // Resolve active job once
+    let activeJobName = null;
+    let activeJobNo = null;
+    let activeJobId = null;
 
-    const r1 = await transcribeAudio(audioBuf, normType, 'both');
-    const n1 = normalizeTranscriptionResult(r1);
-    transcript = n1.transcript;
-    confidence = n1.confidence;
+    try {
+      if (typeof pg.getActiveJobForIdentity === 'function') {
+        const row = await pg.getActiveJobForIdentity(String(ownerId).trim(), DIGITS(from));
+        if (row) {
+          activeJobName = row.name || row.job_name || null;
+          activeJobNo = row.job_no != null ? Number(row.job_no) : null;
+          activeJobId = row.id && String(row.id).trim() ? String(row.id).trim() : null;
+        }
+      }
+    } catch (e) {
+      console.warn('[MEDIA] getActiveJobForIdentity failed (ignored):', e?.message);
+    }
 
-    if (!transcript && normType === 'audio/ogg') {
+    let extractedText = String(input || '').trim();
+    const normType = baseType || 'application/octet-stream';
+
+    let mediaAssetId = null;
+
+    const mediaMeta = {
+      url: mediaUrl || null,
+      type: normType || null,
+      transcript: null,
+      confidence: null,
+      source_msg_id: stableMediaMsgId,
+      media_asset_id: null
+    };
+
+    // AUDIO
+    if (isSupportedAudio) {
+      if (typeof transcribeAudio !== 'function') {
+        return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
+      }
+
+      let transcript = '';
+      let confidence = null;
+
       try {
-        const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
-        const n2 = normalizeTranscriptionResult(r2);
-        transcript = n2.transcript;
-        confidence = confidence ?? n2.confidence;
-      } catch (e2) {
-        console.warn('[MEDIA] fallback transcribe failed:', e2?.message);
+        const resp = await axios.get(mediaUrl, {
+          responseType: 'arraybuffer',
+          auth: { username: process.env.TWILIO_ACCOUNT_SID, password: process.env.TWILIO_AUTH_TOKEN },
+          maxContentLength: 8 * 1024 * 1024
+        });
+
+        const audioBuf = Buffer.from(resp.data);
+
+        const r1 = await transcribeAudio(audioBuf, normType, 'both');
+        const n1 = normalizeTranscriptionResult(r1);
+        transcript = n1.transcript;
+        confidence = n1.confidence;
+
+        if (!transcript && normType === 'audio/ogg') {
+          try {
+            const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
+            const n2 = normalizeTranscriptionResult(r2);
+            transcript = n2.transcript;
+            confidence = confidence ?? n2.confidence;
+          } catch (e2) {
+            console.warn('[MEDIA] fallback transcribe failed:', e2?.message);
+          }
+        }
+      } catch (e) {
+        console.error('[MEDIA] transcribe fetch/exec failed:', e?.message);
+      }
+
+      transcript = String(transcript || '').trim();
+      if (!transcript) return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
+
+      transcript = normalizeHumanText(transcript);
+      extractedText = transcript;
+
+      try {
+        mediaAssetId = await upsertMediaAsset({
+          ownerId,
+          from,
+          stableMediaMsgId,
+          mediaUrl,
+          contentType: normType,
+          sizeBytes: null,
+          jobId: activeJobId,
+          jobNo: activeJobNo,
+          jobName: activeJobName,
+          ocrText: transcript,
+          ocrFields: null
+        });
+      } catch (e) {
+        console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
+      }
+
+      mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
+      mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
+      mediaMeta.media_asset_id = mediaAssetId;
+
+      await attachPendingMediaMeta(from, mediaMeta);
+
+      const tc = inferTimeclockIntentFromText(transcript);
+      if (!tc) {
+        const fin = financeIntentFromText(transcript);
+        if (fin.kind === 'expense' || fin.kind === 'revenue') {
+          await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
+          return { transcript, twiml: null };
+        }
+        return { transcript, twiml: null };
       }
     }
-  } catch (e) {
-    console.error('[MEDIA] transcribe fetch/exec failed:', e?.message);
-  }
 
-  transcript = String(transcript || '').trim();
-  if (!transcript) {
-    return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
-  }
-  console.info('[DB_ENV]', {
-  hasDbUrl: !!process.env.DATABASE_URL,
-  dbHostHint: (process.env.DATABASE_URL || '').split('@')[1]?.split('/')[0] || null
-});
+    // IMAGE
+    if (isImage) {
+      let ocrText = '';
+      let ocrFields = null;
 
+      try {
+        const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
+        ocrText = String(out?.text || out?.transcript || '').trim();
+      } catch (e) {
+        console.warn('[MEDIA] OCR failed (ignored):', e?.message);
+      }
 
-  transcript = normalizeHumanText(transcript);
-  extractedText = transcript;
+      extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 
-  // ✅ Create / update media asset AFTER transcription
-  mediaAssetId = await upsertMediaAsset({
-    ownerId,
-    from,
-    stableMediaMsgId,
-    mediaUrl,
-    contentType: normType,
-    sizeBytes: null,
-    jobId: activeJobId,
-    jobNo: activeJobNo,
-    jobName: activeJobName,
-    ocrText: transcript,
-    ocrFields: null
-  });
+      try {
+        mediaAssetId = await upsertMediaAsset({
+          ownerId,
+          from,
+          stableMediaMsgId,
+          mediaUrl,
+          contentType: normType,
+          sizeBytes: null,
+          jobId: activeJobId,
+          jobNo: activeJobNo,
+          jobName: activeJobName,
+          ocrText: extractedText,
+          ocrFields
+        });
+      } catch (e) {
+        console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
+      }
 
-  mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
-  mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
-  mediaMeta.media_asset_id = mediaAssetId;
+      mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
+      mediaMeta.confidence = null;
+      mediaMeta.media_asset_id = mediaAssetId;
 
-  await attachPendingMediaMeta(from, mediaMeta);
+      await attachPendingMediaMeta(from, mediaMeta);
 
-  const tc = inferTimeclockIntentFromText(transcript);
-  if (!tc) {
-    const fin = financeIntentFromText(transcript);
-    if (fin.kind === 'expense' || fin.kind === 'revenue') {
-      await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
-      return { transcript, twiml: null };
+      const fin = financeIntentFromText(extractedText);
+      if (fin.kind === 'expense' || fin.kind === 'revenue') {
+        await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
+        return { transcript: extractedText, twiml: null };
+      }
     }
-    return { transcript, twiml: null };
-  }
-}
-
-// IMAGE
-if (isImage) {
-  let ocrText = '';
-  let ocrFields = null;
-
-  try {
-    const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
-    ocrText = String(out?.text || out?.transcript || '').trim();
-    // if you later return fields: ocrFields = out?.fields || null;
-  } catch (e) {
-    console.warn('[MEDIA] OCR failed (ignored):', e?.message);
-  }
-console.info('[DB_ENV]', {
-  hasDbUrl: !!process.env.DATABASE_URL,
-  dbHostHint: (process.env.DATABASE_URL || '').split('@')[1]?.split('/')[0] || null
-});
-
-  extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
-
-  // ✅ Create / update media asset AFTER OCR
-  mediaAssetId = await upsertMediaAsset({
-    ownerId,
-    from,
-    stableMediaMsgId,
-    mediaUrl,
-    contentType: normType,
-    sizeBytes: null,
-    jobId: activeJobId,
-    jobNo: activeJobNo,
-    jobName: activeJobName,
-    ocrText: extractedText,
-    ocrFields
-  });
-
-  mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
-  mediaMeta.confidence = null;
-  mediaMeta.media_asset_id = mediaAssetId;
-
-  await attachPendingMediaMeta(from, mediaMeta);
-
-  const fin = financeIntentFromText(extractedText);
-  if (fin.kind === 'expense' || fin.kind === 'revenue') {
-    await markPendingFinance({ from, kind: fin.kind, stableMediaMsgId });
-    return { transcript: extractedText, twiml: null };
-  }
-}
 
     // If still nothing, ask user what it is (keep your existing UX)
     if (!extractedText) {

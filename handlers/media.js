@@ -410,6 +410,13 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
 
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType, sourceMsgId) {
   try {
+    console.info('[MEDIA_HANDLE_CALLED]', {
+  from,
+  hasMediaUrl: !!mediaUrl,
+  mediaType: mediaType || null,
+  sourceMsgId: sourceMsgId || null
+});
+
     // text-only messages pass through
     if (!mediaUrl) return await passThroughTextOnly(from, input);
 
@@ -517,6 +524,11 @@ if (isSupportedAudio) {
   if (!transcript) {
     return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
   }
+  console.info('[DB_ENV]', {
+  hasDbUrl: !!process.env.DATABASE_URL,
+  dbHostHint: (process.env.DATABASE_URL || '').split('@')[1]?.split('/')[0] || null
+});
+
 
   transcript = normalizeHumanText(transcript);
   extractedText = transcript;
@@ -565,6 +577,10 @@ if (isImage) {
   } catch (e) {
     console.warn('[MEDIA] OCR failed (ignored):', e?.message);
   }
+console.info('[DB_ENV]', {
+  hasDbUrl: !!process.env.DATABASE_URL,
+  dbHostHint: (process.env.DATABASE_URL || '').split('@')[1]?.split('/')[0] || null
+});
 
   extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 

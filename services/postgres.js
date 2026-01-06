@@ -549,6 +549,12 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
   }
   return TX_HAS_OWNER_DEDUPE_UNIQUE;
 }
+console.info('[TX_MEDIA_BIND_DEBUG]', {
+  mediaAssetId: mediaAssetId || null,
+  hasCol: !!caps?.TX_HAS_MEDIA_ASSET_ID
+});
+
+
 
 /**
  * ✅ insertTransaction()

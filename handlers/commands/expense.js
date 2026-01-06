@@ -2273,6 +2273,7 @@ async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMedi
 
 
 // ✅ Resolve media link early so confirm draft always carries it.
+// This prevents job pick / change job / other merges from “losing” the link.
 let resolvedFlowMediaAssetId = null;
 try {
   const inferredSrc = String(sourceMsgId || '').trim()
@@ -2293,6 +2294,7 @@ console.info('[FLOW_MEDIA_RESOLVED_EARLY]', {
   resolvedFlowMediaAssetId: resolvedFlowMediaAssetId || null,
   sourceMsgId: sourceMsgId || null
 });
+
 
 
 
@@ -2819,247 +2821,288 @@ if (confirmPA?.payload?.draft) {
     return out(twimlText('❌ Expense cancelled.'), false);
   }
 
-  // ✅ Yes (RESTORED)
+  // ✅ Yes (HARDENED)
 if (token === 'yes') {
-  // ✅ Debug first
+  const userKey = String(paUserId || '').trim() || String(from || '').trim();
+
   console.info('[YES_RECEIVED]', {
-    userId: paUserId,
+    userId: userKey,
     hasConfirmDraft: !!confirmPA?.payload?.draft,
-    sourceMsgId: confirmPA?.payload?.sourceMsgId || null
+    paSourceMsgId: confirmPA?.payload?.sourceMsgId || null,
+    inboundYesMsgId: stableMsgId || null
   });
 
   const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
- // ✅ Provide resolver a deterministic DB key even if pending state is empty
-if (!rawDraft.media_source_msg_id && confirmPA?.payload?.sourceMsgId) {
-  rawDraft.media_source_msg_id = `${String(from || '').trim()}:${String(confirmPA.payload.sourceMsgId).trim()}`;
-}
 
+  // ✅ Use the CONFIRM flow id as the canonical "source msg id" for this expense write
+  // (this should be the message that created the confirm draft — often the media/audio MM sid)
+  const txSourceMsgId =
+    String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+    String(stableMsgId || '').trim() ||
+    null;
 
+  // ✅ Provide resolver a deterministic DB key even if pending state is empty
+  // media_assets.source_msg_id format is "<userKey>:<sid>"
+  if (!rawDraft.media_source_msg_id && txSourceMsgId) {
+    rawDraft.media_source_msg_id = `${userKey}:${txSourceMsgId}`;
+  } else if (rawDraft.media_source_msg_id) {
+    // normalize if someone stored only "MM..." without "<userKey>:"
+    const ms = String(rawDraft.media_source_msg_id || '').trim();
+    if (ms && !ms.includes(':')) rawDraft.media_source_msg_id = `${userKey}:${ms}`;
+  }
 
-  // ⛔ OLD mediaAssetId logic was here
+  // Optional: one-line proof at YES time (helps catch state-key mismatches)
+  try {
+    const pendingNow = await getPendingTransactionState(userKey);
+    console.info('[YES_PENDING_SNAPSHOT]', {
+      userKey,
+      pending_has: !!pendingNow,
+      pending_media_asset_id: pendingNow?.pendingMediaMeta?.media_asset_id || null,
+      pending_source_msg_id: pendingNow?.pendingMediaMeta?.source_msg_id || pendingNow?.mediaSourceMsgId || null
+    });
+  } catch {}
 
-
+  // ✅ Resolve media asset id (draft -> flow -> pending -> DB)
   const mediaAssetId = await resolveMediaAssetIdForFlow({
     ownerId,
-    userKey: from,          // ✅ canonical paUserId (you normalized earlier)
+    userKey,
     rawDraft,
     flowMediaAssetId
   });
 
   console.info('[YES_DRAFT_MEDIA_DEBUG]', {
     draft_media_asset_id: rawDraft?.media_asset_id || null,
-    draft_pending_media_asset_id: rawDraft?.pendingMediaMeta?.media_asset_id || null,
+    draft_media_source_msg_id: rawDraft?.media_source_msg_id || null,
     flowMediaAssetId: flowMediaAssetId || null,
-    resolved_media_asset_id: mediaAssetId || null
+    resolved_media_asset_id: mediaAssetId || null,
+    txSourceMsgId: txSourceMsgId || null
   });
 
+  // Never allow numeric job_id to be written into tx.job_id
+  const rawJobId =
+    rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
 
+  if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
+    console.warn('[EXPENSE] refusing numeric job id; forcing null', { job_id: rawJobId });
+    if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
+    rawDraft.job_id = null;
+    rawDraft.jobId = null;
+  }
 
-    // Never allow numeric job_id to be written into tx.job_id
-    const rawJobId =
-      rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
+  const maybeJobId = rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
 
-    if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
-      console.warn('[EXPENSE] refusing numeric job id; forcing null', { job_id: rawJobId });
-      if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
-      rawDraft.job_id = null;
-      rawDraft.jobId = null;
+  let data = normalizeExpenseData(rawDraft, userProfile);
+
+  // Strong Unknown handling
+  if (!data.item || isUnknownItem(data.item)) {
+    const src =
+      rawDraft?.draftText ||
+      rawDraft?.originalText ||
+      rawDraft?.text ||
+      rawDraft?.media_transcript ||
+      rawDraft?.mediaTranscript ||
+      rawDraft?.input ||
+      '';
+
+    let inferred = inferItemFromDashOrInPattern(src);
+    if (!inferred) inferred = inferItemFromOnPattern(src);
+    if (!inferred) inferred = inferExpenseItemFallback(src);
+    if (!inferred) inferred = inferItemFromDashOrInPattern(input);
+    if (!inferred) inferred = inferItemFromOnPattern(input);
+    if (!inferred) inferred = inferExpenseItemFallback(input);
+
+    if (inferred) data.item = inferred;
+  }
+
+  if (!data.item || isUnknownItem(data.item)) {
+    const fallbackDesc = rawDraft?.item || rawDraft?.description || rawDraft?.desc || rawDraft?.memo || '';
+    if (fallbackDesc && !isUnknownItem(fallbackDesc)) {
+      data.item = cleanExpenseItemForDisplay(String(fallbackDesc).trim());
     }
+  }
 
-    const maybeJobId = rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
+  if (!data.item || isUnknownItem(data.item)) data.item = 'Unknown';
 
-    let data = normalizeExpenseData(rawDraft, userProfile);
+  data.store = await normalizeVendorName(ownerId, data.store);
+  const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
 
-    // Strong Unknown handling
-    if (!data.item || isUnknownItem(data.item)) {
-      const src =
-        rawDraft?.draftText ||
-        rawDraft?.originalText ||
-        rawDraft?.text ||
-        rawDraft?.media_transcript ||
-        rawDraft?.mediaTranscript ||
-        rawDraft?.input ||
-        '';
+  // ---- job resolution ----
+  const pickedJobName = data.jobName && String(data.jobName).trim() ? String(data.jobName).trim() : null;
 
-      let inferred = inferItemFromDashOrInPattern(src);
-      if (!inferred) inferred = inferItemFromOnPattern(src);
-      if (!inferred) inferred = inferExpenseItemFallback(src);
-      if (!inferred) inferred = inferItemFromDashOrInPattern(input);
-      if (!inferred) inferred = inferItemFromOnPattern(input);
-      if (!inferred) inferred = inferExpenseItemFallback(input);
+  let jobName = pickedJobName || rawDraft?.jobName || null;
+  let jobSource = rawDraft?.jobSource || (pickedJobName ? 'typed' : null);
 
-      if (inferred) data.item = inferred;
+  let jobNo =
+    rawDraft?.job_no != null && Number.isFinite(Number(rawDraft.job_no))
+      ? Number(rawDraft.job_no)
+      : rawDraft?.job?.job_no != null && Number.isFinite(Number(rawDraft.job.job_no))
+        ? Number(rawDraft.job.job_no)
+        : null;
+
+  if (!jobName) {
+    jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: userKey })) || null;
+    if (jobName) jobSource = 'active';
+  }
+
+  if (jobName && looksLikeOverhead(jobName)) {
+    jobName = 'Overhead';
+    jobSource = 'overhead';
+    jobNo = null;
+  }
+
+  // ✅ If we have jobNo, canonicalize name from DB
+  if (jobNo != null) {
+    const canonical = await resolveJobNameByNo(ownerId, jobNo);
+    if (canonical) {
+      jobName = canonical;
+      if (jobSource !== 'active') jobSource = jobSource || 'picked';
     }
+  }
 
-    if (!data.item || isUnknownItem(data.item)) {
-      const fallbackDesc = rawDraft?.item || rawDraft?.description || rawDraft?.desc || rawDraft?.memo || '';
-      if (fallbackDesc && !isUnknownItem(fallbackDesc)) {
-        data.item = cleanExpenseItemForDisplay(String(fallbackDesc).trim());
-      }
-    }
+  // still no job -> keep confirm PA and show picker (MUST preserve media linkage)
+  if (!jobName) {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
 
-    if (!data.item || isUnknownItem(data.item)) data.item = 'Unknown';
+    await upsertPA({
+      ownerId,
+      userId: userKey,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...confirmPA.payload,
+        draft: {
+          ...data,
+          jobName: null,
+          jobSource: jobSource || null,
+          suggestedCategory: category,
+          job_id: maybeJobId || null,
+          job_no: jobNo,
 
-    data.store = await normalizeVendorName(ownerId, data.store);
-    const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+          // ✅ preserve linkage
+          media_asset_id: mediaAssetId || rawDraft?.media_asset_id || null,
+          media_source_msg_id: rawDraft?.media_source_msg_id || null,
 
-    // ---- job resolution ----
-    const pickedJobName = data.jobName && String(data.jobName).trim() ? String(data.jobName).trim() : null;
-
-    let jobName = pickedJobName || rawDraft?.jobName || null;
-    let jobSource = rawDraft?.jobSource || (pickedJobName ? 'typed' : null);
-
-    let jobNo =
-      rawDraft?.job_no != null && Number.isFinite(Number(rawDraft.job_no))
-        ? Number(rawDraft.job_no)
-        : rawDraft?.job?.job_no != null && Number.isFinite(Number(rawDraft.job.job_no))
-          ? Number(rawDraft.job.job_no)
-          : null;
-
-    if (!jobName) {
-      jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-      if (jobName) jobSource = 'active';
-    }
-
-    if (jobName && looksLikeOverhead(jobName)) {
-      jobName = 'Overhead';
-      jobSource = 'overhead';
-      jobNo = null;
-    }
-
-    // ✅ If we have jobNo, canonicalize name from DB
-    if (jobNo != null) {
-      const canonical = await resolveJobNameByNo(ownerId, jobNo);
-      if (canonical) {
-        jobName = canonical;
-        if (jobSource !== 'active') jobSource = jobSource || 'picked';
-      }
-    }
-
-    // still no job -> keep confirm PA and show picker
-    if (!jobName) {
-      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...confirmPA.payload,
-          draft: {
-            ...data,
-            jobName: null,
-            jobSource: jobSource || null,
-            suggestedCategory: category,
-            job_id: maybeJobId || null,
-            job_no: jobNo,
-            originalText: rawDraft?.originalText || rawDraft?.draftText || rawDraft?.text || input,
-            draftText: rawDraft?.draftText || rawDraft?.originalText || input
-          },
-          sourceMsgId: stableMsgId,
-          type: 'expense'
+          originalText: rawDraft?.originalText || rawDraft?.draftText || rawDraft?.text || input,
+          draftText: rawDraft?.draftText || rawDraft?.originalText || input
         },
-        ttlSeconds: PA_TTL_SEC
-      });
-
-      if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-
-      return await sendJobPickList({
-        from,
-        ownerId,
-        userProfile,
-        confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-        jobOptions: jobs,
-        paUserId,
-        page: 0,
-        pageSize: 8,
-        context: 'expense_jobpick',
-        confirmDraft: { ...(rawDraft || {}), ...data, jobName: null, jobSource: jobSource || null }
-      });
-    }
-
-    data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
-
-    const gate = assertExpenseCILOrClarify({
-      ownerId,
-      from,
-      userProfile,
-      data,
-      jobName,
-      category,
-      sourceMsgId: stableMsgId
+        sourceMsgId: txSourceMsgId || stableMsgId,
+        type: 'expense'
+      },
+      ttlSeconds: PA_TTL_SEC
     });
-    if (!gate.ok) return out(twimlText(String(gate.reply || '').slice(0, 1500)), false);
 
-    const amountCents = toCents(data.amount);
-    if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
 
-    const writeResult = await withTimeout(
-  insertTransaction(
-    {
+    return await sendJobPickList({
+      from: userKey,
       ownerId,
-      kind: 'expense',
-      date: data.date || todayInTimeZone(tz),
-      description: String(data.item || '').trim() || 'Unknown',
-      amount_cents: amountCents,
-      amount: toNumberAmount(data.amount),
-      source: String(data.store || '').trim() || 'Unknown',
-      job: jobNo != null ? String(jobNo) : jobName,
-      job_name: jobName,
-      job_id: maybeJobId || null,
-      job_no: jobNo,
-      category: category ? String(category).trim() : null,
-      user_name: userProfile?.name || 'Unknown User',
-      source_msg_id: stableMsgId,
-      media_asset_id: mediaAssetId
-    },
-    { timeoutMs: 4500 }
-  ),
-  5200,
-  '__DB_TIMEOUT__'
-);
+      userProfile,
+      confirmFlowId: txSourceMsgId || stableMsgId || `${normalizeIdentityDigits(userKey) || userKey}:${Date.now()}`,
+      jobOptions: jobs,
+      paUserId: userKey,
+      page: 0,
+      pageSize: 8,
+      context: 'expense_jobpick',
 
-if (writeResult === '__DB_TIMEOUT__') {
-  await upsertPA({
-    ownerId,
-    userId: paUserId,
-    kind: PA_KIND_CONFIRM,
-    payload: {
-      ...confirmPA.payload,
-      draft: {
+      // ✅ preserve linkage in picker draft too
+      confirmDraft: {
+        ...(rawDraft || {}),
         ...data,
-        jobName,
-        jobSource,
-        suggestedCategory: category,
+        jobName: null,
+        jobSource: jobSource || null,
+        media_asset_id: mediaAssetId || rawDraft?.media_asset_id || null,
+        media_source_msg_id: rawDraft?.media_source_msg_id || null
+      }
+    });
+  }
+
+  data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
+
+  const gate = assertExpenseCILOrClarify({
+    ownerId,
+    from: userKey,
+    userProfile,
+    data,
+    jobName,
+    category,
+    sourceMsgId: txSourceMsgId || stableMsgId
+  });
+  if (!gate.ok) return out(twimlText(String(gate.reply || '').slice(0, 1500)), false);
+
+  const amountCents = toCents(data.amount);
+  if (!amountCents || amountCents <= 0) throw new Error('Invalid amount');
+
+  const writeResult = await withTimeout(
+    insertTransaction(
+      {
+        ownerId,
+        kind: 'expense',
+        date: data.date || todayInTimeZone(tz),
+        description: String(data.item || '').trim() || 'Unknown',
+        amount_cents: amountCents,
+        amount: toNumberAmount(data.amount),
+        source: String(data.store || '').trim() || 'Unknown',
+        job: jobNo != null ? String(jobNo) : jobName,
+        job_name: jobName,
         job_id: maybeJobId || null,
         job_no: jobNo,
-        media_asset_id: mediaAssetId, // ✅ keep link on retry
-        originalText: rawDraft?.originalText || rawDraft?.draftText || input,
-        draftText: rawDraft?.draftText || rawDraft?.originalText || input
+        category: category ? String(category).trim() : null,
+        user_name: userProfile?.name || 'Unknown User',
+
+        // ✅ IMPORTANT: use confirm flow id, not the YES tap MessageSid
+        source_msg_id: txSourceMsgId || stableMsgId,
+
+        media_asset_id: mediaAssetId
       },
-      sourceMsgId: stableMsgId,
-      type: 'expense'
-    },
-    ttlSeconds: PA_TTL_SEC
-  });
-
-  return out(
-    twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
-    false
+      { timeoutMs: 4500 }
+    ),
+    5200,
+    '__DB_TIMEOUT__'
   );
-}
 
-console.info('[EXPENSE_WRITE_RESULT]', {
-  userId: paUserId,
-  inserted: writeResult?.inserted,
-  job_no: jobNo,
-  jobName,
-  amount: data.amount,
-  store: data.store,
-  sourceMsgId: stableMsgId,
-  media_asset_id: mediaAssetId || null
-});
+  if (writeResult === '__DB_TIMEOUT__') {
+    await upsertPA({
+      ownerId,
+      userId: userKey,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...confirmPA.payload,
+        draft: {
+          ...data,
+          jobName,
+          jobSource,
+          suggestedCategory: category,
+          job_id: maybeJobId || null,
+          job_no: jobNo,
 
+          // ✅ keep link on retry
+          media_asset_id: mediaAssetId || null,
+          media_source_msg_id: rawDraft?.media_source_msg_id || null,
+
+          originalText: rawDraft?.originalText || rawDraft?.draftText || input,
+          draftText: rawDraft?.draftText || rawDraft?.originalText || input
+        },
+        sourceMsgId: txSourceMsgId || stableMsgId,
+        type: 'expense'
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    return out(
+      twimlText('⚠️ Saving is taking longer than expected (database slow). Please tap Yes again in a few seconds.'),
+      false
+    );
+  }
+
+  console.info('[EXPENSE_WRITE_RESULT]', {
+    userId: userKey,
+    inserted: writeResult?.inserted,
+    job_no: jobNo,
+    jobName,
+    amount: data.amount,
+    store: data.store,
+    sourceMsgId: txSourceMsgId || stableMsgId,
+    media_asset_id: mediaAssetId || null
+  });
 
 
 
@@ -3152,8 +3195,13 @@ console.info('[EXPENSE_WRITE_RESULT]', {
     job_id: null,
     job_no: null,
 
-    // ✅ carry the resolved link into the draft now (stronger than relying on pending state later)
+    // ✅ carry the resolved link into the draft now
     media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+
+    // ✅ strongest possible DB fallback key (matches media_assets.source_msg_id format)
+    media_source_msg_id: (String(safeMsgId || '').trim()
+      ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+      : null),
 
     originalText: input,
     draftText: input
@@ -3161,6 +3209,7 @@ console.info('[EXPENSE_WRITE_RESULT]', {
   sourceMsgId: safeMsgId,
   type: 'expense'
 },
+
 
         ttlSeconds: PA_TTL_SEC
       });
@@ -3199,14 +3248,20 @@ try {
           page: 0,
           pageSize: 8,
           context: 'expense_jobpick',
-          confirmDraft: {
+         confirmDraft: {
   ...data0,
   jobName: null,
   jobSource: null,
+
   media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+  media_source_msg_id: (String(safeMsgId || '').trim()
+    ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+    : null),
+
   originalText: input,
   draftText: input
 }
+
 
         });
       }
@@ -3287,9 +3342,15 @@ console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
   // ✅ carry the resolved link into the draft now
   media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
 
+  // ✅ strongest possible DB fallback key (matches media_assets.source_msg_id format)
+  media_source_msg_id: (String(safeMsgId || '').trim()
+    ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+    : null),
+
   originalText: input,
   draftText: input
 },
+
 
 
           sourceMsgId: safeMsgId,
@@ -3323,10 +3384,16 @@ console.info('[CONFIRM_PA_AFTER_UPSERT]', {
   ...data,
   jobName: null,
   jobSource: null,
+
   media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+  media_source_msg_id: (String(safeMsgId || '').trim()
+    ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+    : null),
+
   originalText: input,
   draftText: input
 }
+
 
         });
       }

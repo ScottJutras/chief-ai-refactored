@@ -2187,7 +2187,7 @@ try {
     (pending?.pendingMediaMeta?.media_asset_id || pending?.pendingMediaMeta?.mediaAssetId || null) ||
     null;
 } catch {}
-async function resolveMediaAssetIdForFlow({ ownerId, from, rawDraft, flowMediaAssetId }) {
+async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMediaAssetId }) {
   // 1) Draft direct
   let id =
     (rawDraft?.media_asset_id || rawDraft?.mediaAssetId || null) ||
@@ -2202,7 +2202,7 @@ async function resolveMediaAssetIdForFlow({ ownerId, from, rawDraft, flowMediaAs
   // 3) Re-read pending state (in case flowMediaAssetId was null earlier / state changed)
   let pending = null;
   try {
-    pending = await getPendingTransactionState(from);
+    pending = await getPendingTransactionState(userKey);
   } catch {}
 
   id =
@@ -2757,29 +2757,33 @@ if (confirmPA?.payload?.draft) {
   }
 
   // ✅ Yes (RESTORED)
-  if (token === 'yes') {
-    // ✅ Debug first
-    console.info('[YES_RECEIVED]', {
-      userId: paUserId,
-      hasConfirmDraft: !!confirmPA?.payload?.draft,
-      sourceMsgId: confirmPA?.payload?.sourceMsgId || null
-    });
+if (token === 'yes') {
+  // ✅ Debug first
+  console.info('[YES_RECEIVED]', {
+    userId: paUserId,
+    hasConfirmDraft: !!confirmPA?.payload?.draft,
+    sourceMsgId: confirmPA?.payload?.sourceMsgId || null
+  });
 
-   const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
+  const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
 
-const mediaAssetId = await resolveMediaAssetIdForFlow({
-  ownerId,
-  from, // already normalized to paUserId earlier
-  rawDraft,
-  flowMediaAssetId
-});
+  // ⛔ OLD mediaAssetId logic was here
 
-console.info('[YES_DRAFT_MEDIA_DEBUG]', {
-  draft_media_asset_id: rawDraft?.media_asset_id || null,
-  draft_pending_media_asset_id: rawDraft?.pendingMediaMeta?.media_asset_id || null,
-  flowMediaAssetId: flowMediaAssetId || null,
-  resolved_media_asset_id: mediaAssetId || null
-});
+
+  const mediaAssetId = await resolveMediaAssetIdForFlow({
+    ownerId,
+    userKey: from,          // ✅ canonical paUserId (you normalized earlier)
+    rawDraft,
+    flowMediaAssetId
+  });
+
+  console.info('[YES_DRAFT_MEDIA_DEBUG]', {
+    draft_media_asset_id: rawDraft?.media_asset_id || null,
+    draft_pending_media_asset_id: rawDraft?.pendingMediaMeta?.media_asset_id || null,
+    flowMediaAssetId: flowMediaAssetId || null,
+    resolved_media_asset_id: mediaAssetId || null
+  });
+
 
 
     // Never allow numeric job_id to be written into tx.job_id

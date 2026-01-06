@@ -2182,11 +2182,15 @@ console.info('[PA_KEY]', { from, waId: inboundTwilioMeta?.WaId, paUserId });
 // Allows deterministic/AI confirm drafts to carry media_asset_id into YES.
 let flowMediaAssetId = null;
 try {
-  const pending = await getPendingTransactionState(from); // ✅ now uses canonical key
+  // NOTE: by this point you already normalized `from = paUserId`
+  const pending = await getPendingTransactionState(from); // ✅ canonical key
   flowMediaAssetId =
-    (pending?.pendingMediaMeta?.media_asset_id || pending?.pendingMediaMeta?.mediaAssetId || null) ||
-    null;
+    (pending?.pendingMediaMeta?.media_asset_id ||
+      pending?.pendingMediaMeta?.mediaAssetId ||
+      null) || null;
 } catch {}
+
+// Resolve media_asset_id for this flow using (draft -> flow -> pending -> DB by source_msg_id)
 async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMediaAssetId }) {
   // 1) Draft direct
   let id =
@@ -2231,6 +2235,24 @@ async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMedi
 
   return null;
 }
+
+// ✅ Resolve media link early so CONFIRM draft always carries it.
+// This prevents job pick / change job / other merges from “losing” the link.
+let resolvedFlowMediaAssetId = null;
+try {
+  resolvedFlowMediaAssetId = await resolveMediaAssetIdForFlow({
+    ownerId,
+    userKey: paUserId, // ✅ canonical
+    rawDraft: null,    // no draft yet
+    flowMediaAssetId
+  });
+} catch {}
+
+console.info('[FLOW_MEDIA_RESOLVED_EARLY]', {
+  userKey: paUserId,
+  flowMediaAssetId: flowMediaAssetId || null,
+  resolvedFlowMediaAssetId: resolvedFlowMediaAssetId || null
+});
 
 
 // ✅ ONE lock key, canonical
@@ -2987,8 +3009,10 @@ console.info('[EXPENSE_WRITE_RESULT]', {
   jobName,
   amount: data.amount,
   store: data.store,
-  sourceMsgId: stableMsgId
+  sourceMsgId: stableMsgId,
+  media_asset_id: mediaAssetId || null
 });
+
 
 
 
@@ -3073,20 +3097,24 @@ console.info('[EXPENSE_WRITE_RESULT]', {
         userId: paUserId,
         kind: PA_KIND_CONFIRM,
         payload: {
-          draft: {
-            ...data0,
-            jobName,
-            jobSource,
-            suggestedCategory: category,
-            job_id: null,
-            job_no: null,
-            media_asset_id: flowMediaAssetId,
-            originalText: input,
-            draftText: input
-          },
-          sourceMsgId: safeMsgId,
-          type: 'expense'
-        },
+  draft: {
+    ...data0,
+    jobName,
+    jobSource,
+    suggestedCategory: category,
+    job_id: null,
+    job_no: null,
+
+    // ✅ carry the resolved link into the draft now (stronger than relying on pending state later)
+    media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+
+    originalText: input,
+    draftText: input
+  },
+  sourceMsgId: safeMsgId,
+  type: 'expense'
+},
+
         ttlSeconds: PA_TTL_SEC
       });
       const paChk = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
@@ -3124,7 +3152,15 @@ try {
           page: 0,
           pageSize: 8,
           context: 'expense_jobpick',
-          confirmDraft: { ...data0, jobName: null, jobSource: null, originalText: input, draftText: input }
+          confirmDraft: {
+  ...data0,
+  jobName: null,
+  jobSource: null,
+  media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+  originalText: input,
+  draftText: input
+}
+
         });
       }
 
@@ -3200,10 +3236,14 @@ console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
   suggestedCategory: category,
   job_id: null,
   job_no: null,
-  media_asset_id: flowMediaAssetId, // ✅ IMPORTANT
+
+  // ✅ carry the resolved link into the draft now
+  media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+
   originalText: input,
   draftText: input
 },
+
 
           sourceMsgId: safeMsgId,
           type: 'expense'
@@ -3232,7 +3272,15 @@ console.info('[CONFIRM_PA_AFTER_UPSERT]', {
           page: 0,
           pageSize: 8,
           context: 'expense_jobpick',
-          confirmDraft: { ...data, jobName: null, jobSource: null, originalText: input, draftText: input }
+          confirmDraft: {
+  ...data,
+  jobName: null,
+  jobSource: null,
+  media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+  originalText: input,
+  draftText: input
+}
+
         });
       }
 

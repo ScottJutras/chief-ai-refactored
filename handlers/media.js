@@ -682,92 +682,112 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return { transcript, twiml: null };
     }
 
-    // IMAGE
-    if (isImage) {
-      let ocrText = '';
-      let ocrFields = null;
+   // IMAGE
+if (isImage) {
+  let ocrText = '';
+  let ocrFields = null;
 
-      try {
-        const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
-        ocrText = String(out?.text || out?.transcript || '').trim();
-        // ocrFields intentionally left null unless your vision service returns structured fields
-        ocrFields = out?.fields || out?.ocrFields || null;
-      } catch (e) {
-        console.warn('[MEDIA] OCR failed (ignored):', e?.message);
-      }
+  try {
+    const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
+    ocrText = String(out?.text || out?.transcript || '').trim();
+    ocrFields = out?.fields || out?.ocrFields || null;
+  } catch (e) {
+    console.warn('[MEDIA] OCR failed (ignored):', e?.message);
+  }
 
-      extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
+  extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 
-      try {
-        mediaAssetId = await upsertMediaAsset({
-          ownerId,
-          from,
-          stableMediaMsgId,
-          mediaUrl,
-          contentType: normType,
-          sizeBytes: null,
-          jobId: activeJobId,
-          jobNo: activeJobNo,
-          jobName: activeJobName,
-          ocrText: extractedText,
-          ocrFields
-        });
-      } catch (e) {
-        console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
-      }
+  // ✅ Always upsert a media asset row (even if OCR is empty)
+  try {
+    mediaAssetId = await upsertMediaAsset({
+      ownerId,
+      from,
+      stableMediaMsgId,
+      mediaUrl,
+      contentType: normType,
+      sizeBytes: null,
+      jobId: activeJobId,
+      jobNo: activeJobNo,
+      jobName: activeJobName,
+      // if extractedText is empty, store null (keeps row but avoids misleading "hasText")
+      ocrText: extractedText ? extractedText : null,
+      ocrFields
+    });
+  } catch (e) {
+    console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
+  }
 
-      // ✅ HARDEN: persist pending media meta for later expense/revenue YES (canonical key)
-      try {
-        const pending = await getPendingTransactionState(userKey);
+  // ✅ Always persist pending media meta (even if OCR is empty)
+  try {
+    const pending = await getPendingTransactionState(userKey);
 
-        await mergePendingTransactionState(userKey, {
-          ...(pending || {}),
-          pendingMediaMeta: {
-            url: mediaUrl || null,
-            type: normType || null,
-            source_msg_id: stableMediaMsgId || null,
-            media_asset_id: mediaAssetId || null,
-            transcript: extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null,
-            confidence: null
-          },
-          pendingMedia: { url: mediaUrl || null, type: normType || null },
-          mediaSourceMsgId: stableMediaMsgId || null
-        });
+    await mergePendingTransactionState(userKey, {
+      ...(pending || {}),
+      pendingMediaMeta: {
+        url: mediaUrl || null,
+        type: normType || null,
+        source_msg_id: stableMediaMsgId || null,
+        media_asset_id: mediaAssetId || null,
+        transcript: extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null,
+        confidence: null
+      },
+      pendingMedia: { url: mediaUrl || null, type: normType || null },
+      mediaSourceMsgId: stableMediaMsgId || null
+    });
 
-        console.info('[PENDING_MEDIA_META_SAVED]', {
-          userKey,
-          media_asset_id: mediaAssetId || null,
-          source_msg_id: stableMediaMsgId || null
-        });
+    console.info('[PENDING_MEDIA_META_SAVED]', {
+      userKey,
+      media_asset_id: mediaAssetId || null,
+      source_msg_id: stableMediaMsgId || null
+    });
 
-        try {
-          const chk = await getPendingTransactionState(userKey);
-          console.info('[PENDING_MEDIA_META_CHECK]', {
-            userKey,
-            hasPending: !!chk,
-            media_asset_id: chk?.pendingMediaMeta?.media_asset_id || null,
-            source_msg_id: chk?.pendingMediaMeta?.source_msg_id || null
-          });
-        } catch {}
-      } catch (e) {
-        console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
-      }
+    try {
+      const chk = await getPendingTransactionState(userKey);
+      console.info('[PENDING_MEDIA_META_CHECK]', {
+        userKey,
+        hasPending: !!chk,
+        media_asset_id: chk?.pendingMediaMeta?.media_asset_id || null,
+        source_msg_id: chk?.pendingMediaMeta?.source_msg_id || null
+      });
+    } catch {}
+  } catch (e) {
+    console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
+  }
 
-      mediaMeta.transcript = truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS);
-      mediaMeta.confidence = null;
-      mediaMeta.media_asset_id = mediaAssetId;
+  mediaMeta.transcript = extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null;
+  mediaMeta.confidence = null;
+  mediaMeta.media_asset_id = mediaAssetId || null;
 
-      await attachPendingMediaMeta(userKey, mediaMeta);
+  // keep your existing helper if you want it
+  try {
+    await attachPendingMediaMeta(userKey, mediaMeta);
+  } catch {}
+console.info('[IMAGE_EXTRACT_DEBUG]', {
+  userKey,
+  stableMediaMsgId,
+  ocrLen: (ocrText || '').length,
+  extractedLen: (extractedText || '').length,
+  willPrompt: !extractedText
+});
 
-      const fin = financeIntentFromText(extractedText);
-      if (fin.kind === 'expense' || fin.kind === 'revenue') {
-        await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
-        return { transcript: extractedText, twiml: null };
-      }
+  // ✅ CRITICAL: never return empty result for images
+  if (!extractedText) {
+    return {
+      transcript: null,
+      twiml: twiml(`Is this an expense receipt or revenue? Reply "expense" or "revenue".`)
+    };
+  }
 
-      // not clearly expense/revenue — pass transcript to router
-      return { transcript: extractedText, twiml: null };
-    }
+  // classify when we have OCR text
+  const fin = financeIntentFromText(extractedText);
+  if (fin.kind === 'expense' || fin.kind === 'revenue') {
+    await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
+    return { transcript: extractedText, twiml: null };
+  }
+
+  // not clearly expense/revenue — pass transcript to router
+  return { transcript: extractedText, twiml: null };
+}
 
     // If still nothing, ask user what it is (keep your existing UX)
     if (!extractedText) {

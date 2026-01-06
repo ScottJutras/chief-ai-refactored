@@ -2187,6 +2187,50 @@ try {
     (pending?.pendingMediaMeta?.media_asset_id || pending?.pendingMediaMeta?.mediaAssetId || null) ||
     null;
 } catch {}
+async function resolveMediaAssetIdForFlow({ ownerId, from, rawDraft, flowMediaAssetId }) {
+  // 1) Draft direct
+  let id =
+    (rawDraft?.media_asset_id || rawDraft?.mediaAssetId || null) ||
+    (rawDraft?.pendingMediaMeta?.media_asset_id || rawDraft?.pendingMediaMeta?.mediaAssetId || null) ||
+    null;
+
+  if (id) return id;
+
+  // 2) Function-scope fallback (what you already compute)
+  if (flowMediaAssetId) return flowMediaAssetId;
+
+  // 3) Re-read pending state (in case flowMediaAssetId was null earlier / state changed)
+  let pending = null;
+  try {
+    pending = await getPendingTransactionState(from);
+  } catch {}
+
+  id =
+    (pending?.pendingMediaMeta?.media_asset_id || pending?.pendingMediaMeta?.mediaAssetId || null) ||
+    null;
+
+  if (id) return id;
+
+  // 4) If we at least have a stable source_msg_id in pending state, resolve via DB
+  const src = pending?.pendingMediaMeta?.source_msg_id || pending?.mediaSourceMsgId || null;
+  if (src) {
+    try {
+      const r = await pg.query(
+        `select id
+           from public.media_assets
+          where owner_id=$1 and source_msg_id=$2
+          limit 1`,
+        [String(ownerId || '').trim(), String(src).trim()]
+      );
+      const found = r?.rows?.[0]?.id || null;
+      if (found) return found;
+    } catch (e) {
+      console.warn('[MEDIA_ASSET_RESOLVE_DB] failed (ignored):', e?.message);
+    }
+  }
+
+  return null;
+}
 
 
 // ✅ ONE lock key, canonical
@@ -2721,17 +2765,22 @@ if (confirmPA?.payload?.draft) {
       sourceMsgId: confirmPA?.payload?.sourceMsgId || null
     });
 
-    const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
+   const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
 
-// ✅ Link receipt/media asset (beta-safe) — prefer draft value, fall back to pendingMediaMeta, then function-scope fallback.
-const mediaAssetId =
-  (rawDraft?.media_asset_id || rawDraft?.mediaAssetId || null) ||
-  (rawDraft?.pendingMediaMeta?.media_asset_id || rawDraft?.pendingMediaMeta?.mediaAssetId || null) ||
-  (confirmPA?.payload?.draft?.pendingMediaMeta?.media_asset_id || null) ||
-  flowMediaAssetId ||
-  null;
+const mediaAssetId = await resolveMediaAssetIdForFlow({
+  ownerId,
+  from, // already normalized to paUserId earlier
+  rawDraft,
+  flowMediaAssetId
+});
 
-console.info('[EXPENSE_MEDIA_LINK]', { mediaAssetId: mediaAssetId || null, sourceMsgId: stableMsgId || null });
+console.info('[YES_DRAFT_MEDIA_DEBUG]', {
+  draft_media_asset_id: rawDraft?.media_asset_id || null,
+  draft_pending_media_asset_id: rawDraft?.pendingMediaMeta?.media_asset_id || null,
+  flowMediaAssetId: flowMediaAssetId || null,
+  resolved_media_asset_id: mediaAssetId || null
+});
+
 
     // Never allow numeric job_id to be written into tx.job_id
     const rawJobId =

@@ -549,10 +549,6 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
   }
   return TX_HAS_OWNER_DEDUPE_UNIQUE;
 }
-console.info('[TX_MEDIA_BIND_DEBUG]', {
-  mediaAssetId: mediaAssetId || null,
-  hasCol: !!caps?.TX_HAS_MEDIA_ASSET_ID
-});
 
 
 
@@ -562,7 +558,7 @@ console.info('[TX_MEDIA_BIND_DEBUG]', {
  *
  * HARD GUARANTEE:
  * - Only insert transactions.job_id when it is a UUID.
- * - Never accidentally stuff jobs.job_no or jobs.id (int) into a UUID job_id column.
+ * - media_asset_id is UUID or null only.
  */
 async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const owner = String(opts.ownerId ?? opts.owner_id ?? '').trim();
@@ -588,9 +584,9 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const category = opts.category == null ? null : String(opts.category).trim() || null;
   const userName = opts.user_name ?? opts.userName ?? null;
   const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
-  const mediaAssetIdRaw = opts.media_asset_id ?? opts.mediaAssetId ?? opts.mediaAssetID ?? null;
 
-  // ✅ UUID-only guard (prevents poisoning / insert errors)
+  // ✅ media asset id: UUID or null only
+  const mediaAssetIdRaw = opts.media_asset_id ?? opts.mediaAssetId ?? opts.mediaAssetID ?? null;
   const mediaAssetId =
     mediaAssetIdRaw != null && looksLikeUuid(String(mediaAssetIdRaw).trim())
       ? String(mediaAssetIdRaw).trim()
@@ -599,8 +595,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   if (mediaAssetIdRaw != null && !mediaAssetId) {
     console.warn('[PG/transactions] refusing non-uuid media_asset_id; ignoring', { mediaAssetIdRaw });
   }
-
-
 
   if (!owner) throw new Error('insertTransaction missing ownerId');
   if (!kind) throw new Error('insertTransaction missing kind');
@@ -683,7 +677,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
         const row = await resolveJobRow(owner, String(n));
         if (row) {
           const candidate = row.id != null ? String(row.id) : null;
-          if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate; // only if uuid
+          if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
           resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
           const nm = row.job_name ? String(row.job_name).trim() : null;
           if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -696,7 +690,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       const row = await resolveJobRow(owner, jobRef);
       if (row) {
         const candidate = row.id != null ? String(row.id) : null;
-        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate; // only if uuid
+        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         const nm = row.job_name ? String(row.job_name).trim() : null;
         if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -716,7 +710,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       const row = await resolveJobRow(owner, resolvedJobName);
       if (row) {
         const candidate = row.id != null ? String(row.id) : null;
-        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate; // only if uuid
+        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         const nm = row.job_name ? String(row.job_name).trim() : null;
         if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -740,8 +734,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const jobNo = resolvedJobNo != null && Number.isFinite(Number(resolvedJobNo)) ? Number(resolvedJobNo) : null;
   const jobName = resolvedJobName ? String(resolvedJobName).trim() : null;
 
-  // Keep job "string" field for back-compat with older schemas/handlers.
-  // Prefer: jobRef (caller), else name, else jobNo, else uuid.
   const job =
     jobRef != null
       ? jobRef
@@ -756,16 +748,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const shouldDedupeByContent = kind === 'expense' || kind === 'revenue';
   const dedupeHash =
     shouldDedupeByContent && typeof buildTxnDedupeHash === 'function'
-      ? buildTxnDedupeHash({
-          owner,
-          kind,
-          date,
-          amountCents,
-          source,
-          description,
-          jobNo,
-          jobName
-        })
+      ? buildTxnDedupeHash({ owner, kind, date, amountCents, source, description, jobNo, jobName })
       : null;
 
   // idempotency pre-check (source_msg_id)
@@ -782,14 +765,11 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     }
   }
 
-  // Prefer dedupe hash unique if it exists; otherwise fall back to normal insert
   const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
 
-  // Build insert cols/vals based on caps
+  // ✅ Build insert cols/vals based on caps (INSIDE function)
   const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
   const vals = [owner, kind, date, description, amountCents, source];
-
-  
 
   if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
     cols.push('amount');
@@ -810,7 +790,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   }
   if (caps.TX_HAS_JOB_ID) {
     cols.push('job_id');
-    vals.push(resolvedJobId); // UUID or null only
+    vals.push(resolvedJobId);
   }
 
   if (caps.TX_HAS_CATEGORY) {
@@ -837,10 +817,11 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     cols.push('media_meta');
     vals.push(JSON.stringify(media));
   }
+
   if (caps.TX_HAS_MEDIA_ASSET_ID) {
-  cols.push('media_asset_id');
-  vals.push(mediaAssetId); // uuid or null only
-}
+    cols.push('media_asset_id');
+    vals.push(mediaAssetId); // ✅ UUID or null only
+  }
 
   // legacy discrete media cols if present (optional, safe)
   if (media) {
@@ -873,24 +854,20 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
 
-    let conflictSql = '';
+  let conflictSql = '';
 
-// Prefer dedupe hash conflict when available
-if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
-  if (hasOwnerDedupeUnique) {
+  // Prefer dedupe hash conflict when available
+  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash && hasOwnerDedupeUnique) {
     conflictSql = ' on conflict (owner_id, dedupe_hash) where dedupe_hash is not null do nothing ';
   }
-}
 
-// Otherwise source_msg_id idempotency
-if (!conflictSql && caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
-  const hasUq = await detectTransactionsUniqueOwnerSourceMsg().catch(() => false);
-  if (hasUq) {
-    conflictSql = ' on conflict (owner_id, source_msg_id) where source_msg_id is not null do nothing ';
+  // Otherwise source_msg_id idempotency
+  if (!conflictSql && caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+    const hasUq = await detectTransactionsUniqueOwnerSourceMsg().catch(() => false);
+    if (hasUq) {
+      conflictSql = ' on conflict (owner_id, source_msg_id) where source_msg_id is not null do nothing ';
+    }
   }
-}
-
-
 
   const sql = `
     insert into public.transactions (${cols.join(', ')})

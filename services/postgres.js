@@ -588,15 +588,18 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const category = opts.category == null ? null : String(opts.category).trim() || null;
   const userName = opts.user_name ?? opts.userName ?? null;
   const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
-  const mediaAssetIdRaw = opts.media_asset_id ?? opts.mediaAssetId ?? null;
-const mediaAssetId =
-  mediaAssetIdRaw != null && looksLikeUuid(String(mediaAssetIdRaw).trim())
-    ? String(mediaAssetIdRaw).trim()
-    : null;
+  const mediaAssetIdRaw = opts.media_asset_id ?? opts.mediaAssetId ?? opts.mediaAssetID ?? null;
 
-if (mediaAssetIdRaw != null && !mediaAssetId) {
-  console.warn('[PG/transactions] refusing non-uuid media_asset_id; ignoring', { mediaAssetIdRaw });
-}
+  // ✅ UUID-only guard (prevents poisoning / insert errors)
+  const mediaAssetId =
+    mediaAssetIdRaw != null && looksLikeUuid(String(mediaAssetIdRaw).trim())
+      ? String(mediaAssetIdRaw).trim()
+      : null;
+
+  if (mediaAssetIdRaw != null && !mediaAssetId) {
+    console.warn('[PG/transactions] refusing non-uuid media_asset_id; ignoring', { mediaAssetIdRaw });
+  }
+
 
 
   if (!owner) throw new Error('insertTransaction missing ownerId');

@@ -2190,7 +2190,6 @@ try {
       null) || null;
 } catch {}
 
-// Resolve media_asset_id for this flow using (draft -> flow -> pending -> DB by source_msg_id)
 async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMediaAssetId }) {
   // 1) Draft direct
   let id =
@@ -2200,10 +2199,44 @@ async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMedi
 
   if (id) return id;
 
-  // 2) Function-scope fallback (what you already compute)
+  // 2) Function-scope fallback
   if (flowMediaAssetId) return flowMediaAssetId;
 
-  // 3) Re-read pending state (in case flowMediaAssetId was null earlier / state changed)
+  // Helper: normalize a source msg id into the DB format "<userKey>:<sid>"
+  const asDbSource = (sid) => {
+    const s = String(sid || '').trim();
+    if (!s) return null;
+    // already looks like "userKey:SID"
+    if (s.includes(':')) return s;
+    return `${String(userKey || '').trim()}:${s}`;
+  };
+
+  // 3) Try draft hints for source msg id (strong fallback)
+  const draftSrc =
+    rawDraft?.media_source_msg_id ||
+    rawDraft?.source_msg_id ||
+    rawDraft?.pendingMediaMeta?.source_msg_id ||
+    rawDraft?.mediaSourceMsgId ||
+    null;
+
+  const srcFromDraft = asDbSource(draftSrc);
+  if (srcFromDraft) {
+    try {
+      const r = await pg.query(
+        `select id
+           from public.media_assets
+          where owner_id=$1 and source_msg_id=$2
+          limit 1`,
+        [String(ownerId || '').trim(), String(srcFromDraft).trim()]
+      );
+      const found = r?.rows?.[0]?.id || null;
+      if (found) return found;
+    } catch (e) {
+      console.warn('[MEDIA_ASSET_RESOLVE_DB_DRAFTSRC] failed (ignored):', e?.message);
+    }
+  }
+
+  // 4) Re-read pending state (in case it exists)
   let pending = null;
   try {
     pending = await getPendingTransactionState(userKey);
@@ -2215,35 +2248,41 @@ async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMedi
 
   if (id) return id;
 
-  // 4) If we at least have a stable source_msg_id in pending state, resolve via DB
-  const src = pending?.pendingMediaMeta?.source_msg_id || pending?.mediaSourceMsgId || null;
-  if (src) {
+  // 5) DB fallback using pending source msg id
+  const pendingSrc = pending?.pendingMediaMeta?.source_msg_id || pending?.mediaSourceMsgId || null;
+  const srcFromPending = asDbSource(pendingSrc);
+
+  if (srcFromPending) {
     try {
       const r = await pg.query(
         `select id
            from public.media_assets
           where owner_id=$1 and source_msg_id=$2
           limit 1`,
-        [String(ownerId || '').trim(), String(src).trim()]
+        [String(ownerId || '').trim(), String(srcFromPending).trim()]
       );
       const found = r?.rows?.[0]?.id || null;
       if (found) return found;
     } catch (e) {
-      console.warn('[MEDIA_ASSET_RESOLVE_DB] failed (ignored):', e?.message);
+      console.warn('[MEDIA_ASSET_RESOLVE_DB_PENDINGSRC] failed (ignored):', e?.message);
     }
   }
 
   return null;
 }
 
-// ✅ Resolve media link early so CONFIRM draft always carries it.
-// This prevents job pick / change job / other merges from “losing” the link.
+
+// ✅ Resolve media link early so confirm draft always carries it.
 let resolvedFlowMediaAssetId = null;
 try {
+  const inferredSrc = String(sourceMsgId || '').trim()
+    ? `${String(paUserId || '').trim()}:${String(sourceMsgId).trim()}`
+    : null;
+
   resolvedFlowMediaAssetId = await resolveMediaAssetIdForFlow({
     ownerId,
     userKey: paUserId, // ✅ canonical
-    rawDraft: null,    // no draft yet
+    rawDraft: inferredSrc ? { media_source_msg_id: inferredSrc } : null,
     flowMediaAssetId
   });
 } catch {}
@@ -2251,8 +2290,10 @@ try {
 console.info('[FLOW_MEDIA_RESOLVED_EARLY]', {
   userKey: paUserId,
   flowMediaAssetId: flowMediaAssetId || null,
-  resolvedFlowMediaAssetId: resolvedFlowMediaAssetId || null
+  resolvedFlowMediaAssetId: resolvedFlowMediaAssetId || null,
+  sourceMsgId: sourceMsgId || null
 });
+
 
 
 // ✅ ONE lock key, canonical
@@ -2788,6 +2829,11 @@ if (token === 'yes') {
   });
 
   const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
+  // ✅ Provide resolver a deterministic DB key even if pending state is empty
+if (!rawDraft.media_source_msg_id && confirmPA?.payload?.sourceMsgId) {
+  rawDraft.media_source_msg_id = `${String(from || '').trim()}:${String(confirmPA.payload.sourceMsgId).trim()}`;
+}
+
 
   // ⛔ OLD mediaAssetId logic was here
 

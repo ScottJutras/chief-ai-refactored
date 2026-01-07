@@ -12,11 +12,10 @@ function initOnce() {
   try {
     const { Pool } = require('pg');        // lazy require
     _pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      max: 2,
-      idleTimeoutMillis: 10_000,
-      connectionTimeoutMillis: 3_000,
-    });
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
   } catch (e) {
     console.warn('[RAG] pg init failed:', e?.message);
     _pool = null;

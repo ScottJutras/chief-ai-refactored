@@ -787,6 +787,22 @@ if (isImage) {
 
   return { transcript: extractedText, twiml: null };
 }
+// classify when we have OCR text
+const fin = financeIntentFromText(extractedText);
+console.info('[IMAGE_FIN_INTENT]', { userKey, kind: fin?.kind || null });
+
+// If confident, route it
+if (fin?.kind === 'expense' || fin?.kind === 'revenue') {
+  await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
+  return { transcript: extractedText, twiml: null };
+}
+
+// ✅ NEW: if we have OCR but can't classify, ask user instead of sending transcript to agent
+return {
+  transcript: null,
+  twiml: twiml(`I pulled text from the receipt. Is this an *expense* or *revenue*? Reply "expense" or "revenue".`)
+};
+
 
     // If still nothing, ask user what it is (keep your existing UX)
     if (!extractedText) {

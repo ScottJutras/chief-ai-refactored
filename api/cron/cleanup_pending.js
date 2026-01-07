@@ -9,11 +9,10 @@ const { Pool } = require('pg');
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 2,
-  idleTimeoutMillis: 10_000,
-  connectionTimeoutMillis: 8_000,
+  ssl: { rejectUnauthorized: false }
 });
+
+
 
 async function deleteExpired() {
   // Use a CTE so we can return the deleted count in one roundtrip

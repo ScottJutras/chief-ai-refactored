@@ -127,6 +127,12 @@ async function searchRag({ ownerId = 'GLOBAL', query, k = 8 }) {
 async function answer({ from, query, hints = [], ownerId = 'GLOBAL' } = {}) {
   // Fast short-circuit for generic help — don’t call OpenAI/PG here.
   const lc = String(query || '').toLowerCase();
+  // Don't treat receipt/OCR dumps as RAG questions
+if (query && query.length > 200 && /\b(total|hst|gst|pst|subtotal|receipt|invoice)\b/i.test(query)) {
+  return '';
+}
+
+
   if (/\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(lc)) {
     return [
       'PocketCFO — What I can do:',

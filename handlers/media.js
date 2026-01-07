@@ -687,9 +687,8 @@ if (isImage) {
   let ocrText = '';
   let ocrFields = null;
 
+  // 1) OCR (DocAI -> Vision fallback happens inside extractTextFromImage)
   try {
-    // extractTextFromImage() now internally does:
-    // DocAI -> (if empty/unavailable) Vision -> (else) ''
     const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
     ocrText = String(out?.text || out?.transcript || '').trim();
     ocrFields = out?.fields || out?.ocrFields || null;
@@ -697,9 +696,10 @@ if (isImage) {
     console.warn('[MEDIA] OCR failed (ignored):', e?.message);
   }
 
+  // Normalize final extractedText for downstream
   extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 
-  // Always upsert media asset row
+  // 2) Always upsert media asset row (even if OCR empty)
   try {
     mediaAssetId = await upsertMediaAsset({
       ownerId,
@@ -718,7 +718,7 @@ if (isImage) {
     console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
   }
 
-  // Always persist pending media meta
+  // 3) Always persist pending media meta (even if OCR empty)
   try {
     const pending = await getPendingTransactionState(userKey);
 
@@ -755,11 +755,11 @@ if (isImage) {
     console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
   }
 
-  mediaMeta.transcript = extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null;
-  mediaMeta.confidence = null;
-  mediaMeta.media_asset_id = mediaAssetId || null;
-
+  // Also keep your mediaMeta helper if you want it
   try {
+    mediaMeta.transcript = extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null;
+    mediaMeta.confidence = null;
+    mediaMeta.media_asset_id = mediaAssetId || null;
     await attachPendingMediaMeta(userKey, mediaMeta);
   } catch {}
 
@@ -768,10 +768,11 @@ if (isImage) {
     stableMediaMsgId,
     ocrLen: (ocrText || '').length,
     extractedLen: (extractedText || '').length,
-    willPrompt: !extractedText
+    willPrompt: !extractedText,
+    hasMediaAsset: !!mediaAssetId
   });
 
-  // never return empty result
+  // 4) If OCR is empty, ask what it is (NEVER pass empty transcript to agent)
   if (!extractedText) {
     return {
       transcript: null,
@@ -779,29 +780,33 @@ if (isImage) {
     };
   }
 
+  // 5) Receipt-first routing: classify BEFORE agent/RAG ever sees it
   const fin = financeIntentFromText(extractedText);
-  if (fin.kind === 'expense' || fin.kind === 'revenue') {
+
+  // Strong receipt heuristics backup (OCR often messy)
+  const looksLikeReceipt =
+    /\b(subtotal|total|hst|gst|pst|visa|mastercard|debit|tax|change|cash|invoice|receipt)\b/i.test(extractedText) ||
+    /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(extractedText) ||
+    /\$\s*\d+(\.\d{2})?/.test(extractedText);
+
+  // If confident, lock finance intent and return transcript to finance pipeline
+  if (fin?.kind === 'expense' || fin?.kind === 'revenue') {
     await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
     return { transcript: extractedText, twiml: null };
   }
 
+  // If it looks like a receipt but can't classify, prompt user (DO NOT send to agent/RAG)
+  if (looksLikeReceipt) {
+    return {
+      transcript: null,
+      twiml: twiml(`I pulled text from the receipt. Is this an *expense* or *revenue*? Reply "expense" or "revenue".`)
+    };
+  }
+
+  // Otherwise: not obviously a receipt → allow agent/router to interpret transcript
   return { transcript: extractedText, twiml: null };
 }
-// classify when we have OCR text
-const fin = financeIntentFromText(extractedText);
-console.info('[IMAGE_FIN_INTENT]', { userKey, kind: fin?.kind || null });
 
-// If confident, route it
-if (fin?.kind === 'expense' || fin?.kind === 'revenue') {
-  await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
-  return { transcript: extractedText, twiml: null };
-}
-
-// ✅ NEW: if we have OCR but can't classify, ask user instead of sending transcript to agent
-return {
-  transcript: null,
-  twiml: twiml(`I pulled text from the receipt. Is this an *expense* or *revenue*? Reply "expense" or "revenue".`)
-};
 
 
     // If still nothing, ask user what it is (keep your existing UX)

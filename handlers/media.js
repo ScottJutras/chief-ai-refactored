@@ -416,15 +416,21 @@ async function attachPendingMediaMeta(userKey, meta) {
 function financeIntentFromText(text) {
   const lc = String(text || '').toLowerCase();
 
+  // Receipt-ish signals (most image OCR is expense unless it explicitly says paid/received)
+  const receiptSignals =
+    /\b(subtotal|total|hst|gst|pst|tax|visa|mastercard|debit|cash|change|invoice|receipt)\b/.test(lc) ||
+    /\$\s*\d+(\.\d{2})?/.test(lc);
+
   const looksExpense =
-    /\b(expense|receipt|spent|cost|paid|bought|buy|purchase|purchased|ordered|charge|charged)\b/.test(lc) ||
+    receiptSignals ||
+    /\b(expense|spent|cost|paid|bought|buy|purchase|purchased|ordered|charge|charged)\b/.test(lc) ||
     /\b(home\s*depot|rona|lowe'?s|home\s*hardware|beacon|abc\s*supply|convoy|gentek)\b/.test(lc);
 
   const looksRevenue =
     /\b(revenue|payment|paid\s+by|deposit|deposited|sale|received|got\s+paid|invoice\s+paid)\b/.test(lc);
 
   if (looksExpense && looksRevenue) {
-    if (/\b(received|deposit|deposited|got\s+paid|invoice\s+paid)\b/.test(lc)) return { kind: 'revenue' };
+    if (/\b(received|deposit|deposited|got\s+paid|invoice\s+paid|paid\s+by)\b/.test(lc)) return { kind: 'revenue' };
     return { kind: 'expense' };
   }
   if (looksExpense) return { kind: 'expense' };
@@ -432,6 +438,7 @@ function financeIntentFromText(text) {
 
   return { kind: null };
 }
+
 
 async function markPendingFinance({ userKey, kind, stableMediaMsgId }) {
   try {
@@ -772,39 +779,48 @@ if (isImage) {
     hasMediaAsset: !!mediaAssetId
   });
 
-  // 4) If OCR is empty, ask what it is (NEVER pass empty transcript to agent)
-  if (!extractedText) {
-    return {
-      transcript: null,
-      twiml: twiml(`Is this an expense receipt or revenue? Reply "expense" or "revenue".`)
-    };
-  }
+  // 4) If OCR is empty, ask what it is
+if (!extractedText) {
+  return {
+    transcript: null,
+    twiml: twiml(`Is this an expense receipt or revenue? Reply "expense" or "revenue".`)
+  };
+}
 
-  // 5) Receipt-first routing: classify BEFORE agent/RAG ever sees it
-  const fin = financeIntentFromText(extractedText);
+// 5) Receipt-first routing: classify BEFORE agent/RAG ever sees it
+const fin = financeIntentFromText(extractedText);
 
-  // Strong receipt heuristics backup (OCR often messy)
-  const looksLikeReceipt =
-    /\b(subtotal|total|hst|gst|pst|visa|mastercard|debit|tax|change|cash|invoice|receipt)\b/i.test(extractedText) ||
-    /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(extractedText) ||
-    /\$\s*\d+(\.\d{2})?/.test(extractedText);
+const looksLikeReceipt =
+  /\b(subtotal|total|hst|gst|pst|visa|mastercard|debit|tax|change|cash|invoice|receipt)\b/i.test(extractedText) ||
+  /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(extractedText) ||
+  /\$\s*\d+(\.\d{2})?/.test(extractedText);
 
-  // If confident, lock finance intent and return transcript to finance pipeline
-  if (fin?.kind === 'expense' || fin?.kind === 'revenue') {
-    await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
-    return { transcript: extractedText, twiml: null };
-  }
+console.info('[IMAGE_CLASSIFY_DEBUG]', {
+  finKind: fin?.kind || null,
+  looksLikeReceipt,
+  extractedLen: extractedText.length,
+  sample: extractedText.slice(0, 80)
+});
 
-  // If it looks like a receipt but can't classify, prompt user (DO NOT send to agent/RAG)
-  if (looksLikeReceipt) {
-    return {
-      transcript: null,
-      twiml: twiml(`I pulled text from the receipt. Is this an *expense* or *revenue*? Reply "expense" or "revenue".`)
-    };
-  }
-
-  // Otherwise: not obviously a receipt → allow agent/router to interpret transcript
+// If confident, lock finance intent and return transcript to finance pipeline
+if (fin?.kind === 'expense' || fin?.kind === 'revenue') {
+  await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
   return { transcript: extractedText, twiml: null };
+}
+
+// If it looks like a receipt but can't classify, prompt user (DO NOT send to agent/RAG)
+if (looksLikeReceipt) {
+  return {
+    transcript: null,
+    twiml: twiml(
+      `I pulled text from the receipt. Is this an *expense* or *revenue*? Reply "expense" or "revenue".`
+    )
+  };
+}
+
+// Otherwise: not obviously a receipt → allow agent/router to interpret transcript
+return { transcript: extractedText, twiml: null };
+
 }
 
 

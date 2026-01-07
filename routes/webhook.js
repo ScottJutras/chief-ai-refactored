@@ -754,8 +754,15 @@ console.info('[MEDIA_RETURN]', {
 
 if (hasTranscript) {
   req.body.Body = result.transcript;
+  console.info('[WEBHOOK_MEDIA_TO_ROUTER]', {
+  from: req.from,
+  len: String(result.transcript || '').length,
+  sample: String(result.transcript || '').slice(0, 120)
+});
   return next();
 }
+
+
 
 
     if (typeof result === 'string' && !res.headersSent) {

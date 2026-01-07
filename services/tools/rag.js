@@ -125,13 +125,17 @@ async function searchRag({ ownerId = 'GLOBAL', query, k = 8 }) {
 
 // ---------- Agent-facing string answer ----------
 async function answer({ from, query, hints = [], ownerId = 'GLOBAL' } = {}) {
-  // Fast short-circuit for generic help — don’t call OpenAI/PG here.
-  const lc = String(query || '').toLowerCase();
-  // Don't treat receipt/OCR dumps as RAG questions
-if (query && query.length > 200 && /\b(total|hst|gst|pst|subtotal|receipt|invoice)\b/i.test(query)) {
-  return '';
-}
+  const q = String(query || '');
 
+  // ✅ Guard: don't treat receipt/OCR dumps as RAG questions
+  if (
+    q.length > 200 &&
+    /\b(total|subtotal|hst|gst|pst|tax|receipt|invoice|visa|mastercard|debit|cash)\b/i.test(q)
+  ) {
+    return '';
+  }
+
+  const lc = q.toLowerCase();
 
   if (/\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(lc)) {
     return [
@@ -145,10 +149,9 @@ if (query && query.length > 200 && /\b(total|hst|gst|pst|subtotal|receipt|invoic
     ].join('\n');
   }
 
-  const results = await searchRag({ ownerId, query, k: 8 });
-  if (!results.length) return ''; // let agent fallback by returning empty
+  const results = await searchRag({ ownerId, query: q, k: 8 });
+  if (!results.length) return '';
 
-  // Compose a concise answer from top snippets (no model call)
   const bullets = results.slice(0, 3).map((r, i) => {
     const head = r.title || r.path || `Result ${i + 1}`;
     const snip = (r.snippet || '').replace(/\s+/g, ' ').trim().slice(0, 280);
@@ -157,6 +160,7 @@ if (query && query.length > 200 && /\b(total|hst|gst|pst|subtotal|receipt|invoic
 
   return `Here’s what I found:\n${bullets.join('\n')}`;
 }
+
 
 // Optional: keep the tool wrapper if something else uses it
 const ragTool = {

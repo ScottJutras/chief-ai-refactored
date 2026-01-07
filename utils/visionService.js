@@ -7,7 +7,7 @@
 // ✅ Returns { text: "" } on any failure so media flow never crashes
 //
 // Env (recommended):
-//   GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64  (service account json base64)
+//   GOOGLE_CREDENTIALS_BASE64  (service account json base64)
 //   DOCUMENTAI_PROCESSOR_NAME            (projects/.../locations/.../processors/...)
 //
 // Or:
@@ -21,10 +21,36 @@
 
 let cachedClient = undefined; // undefined = not initialized, null = unavailable, object = client
 let cachedCaps = undefined;
+let DocAI = null;
+let Vision = null;
+
+try {
+  DocAI = require('@google-cloud/documentai').v1;
+} catch (e) {
+  console.warn('[docaiService] Document AI unavailable:', e?.message || e);
+  DocAI = null;
+}
+
+try {
+  Vision = require('@google-cloud/vision');
+} catch (e) {
+  console.warn('[visionService] Vision OCR unavailable:', e?.message || e);
+  Vision = null;
+}
 
 function hasDocAiCreds() {
-  return !!(process.env.GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64 || process.env.GOOGLE_VISION_CREDENTIALS_BASE64);
+  return !!(
+    process.env.GOOGLE_CREDENTIALS_BASE64 ||
+    process.env.GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64 ||
+    process.env.GOOGLE_VISION_CREDENTIALS_BASE64
+  );
 }
+const b64 =
+  process.env.GOOGLE_CREDENTIALS_BASE64 ||
+  process.env.GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64 ||
+  process.env.GOOGLE_VISION_CREDENTIALS_BASE64 ||
+  '';
+
 
 function getDocAiProcessorName() {
   const explicit = String(process.env.DOCUMENTAI_PROCESSOR_NAME || '').trim();
@@ -52,7 +78,7 @@ function getDocAiEndpoint() {
 function getCredentialsFromBase64() {
   // Prefer dedicated Document AI creds; fall back to your existing Vision env var if that’s what you have.
   const b64 =
-    process.env.GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64 ||
+    process.env.GOOGLE_CREDENTIALS_BASE64 ||
     process.env.GOOGLE_VISION_CREDENTIALS_BASE64 ||
     '';
 
@@ -86,7 +112,12 @@ function getDocAiClient() {
 
   try {
     // Optional dependency — must be guarded.
-    const { DocumentProcessorServiceClient } = require('@google-cloud/documentai').v1;
+    if (!DocAI?.DocumentProcessorServiceClient) {
+  cachedClient = null;
+  return cachedClient;
+}
+const { DocumentProcessorServiceClient } = DocAI;
+
 
     const credentials = getCredentialsFromBase64();
     if (!credentials) {

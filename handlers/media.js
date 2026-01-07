@@ -682,27 +682,16 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       return { transcript, twiml: null };
     }
 
-   // IMAGE
+// IMAGE
 if (isImage) {
   let ocrText = '';
   let ocrFields = null;
 
   try {
+    // extractTextFromImage() now internally does:
+    // DocAI -> (if empty/unavailable) Vision -> (else) ''
     const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
     ocrText = String(out?.text || out?.transcript || '').trim();
-    // After DocAI attempt:
-if (!ocrText) {
-  try {
-    // If your visionService exposes a cheaper OCR fallback, call it here.
-    // Example names (use whichever you actually have):
-    const out2 = await extractTextFromImage(mediaUrl, { provider: 'vision', fetchBytes: true, mediaType: normType });
-    ocrText = String(out2?.text || out2?.transcript || '').trim();
-    if (ocrText) console.info('[MEDIA] OCR fallback (vision) succeeded', { len: ocrText.length });
-  } catch (e2) {
-    console.warn('[MEDIA] OCR fallback (vision) failed (ignored):', e2?.message);
-  }
-}
-
     ocrFields = out?.fields || out?.ocrFields || null;
   } catch (e) {
     console.warn('[MEDIA] OCR failed (ignored):', e?.message);
@@ -710,7 +699,7 @@ if (!ocrText) {
 
   extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 
-  // ✅ Always upsert a media asset row (even if OCR is empty)
+  // Always upsert media asset row
   try {
     mediaAssetId = await upsertMediaAsset({
       ownerId,
@@ -722,7 +711,6 @@ if (!ocrText) {
       jobId: activeJobId,
       jobNo: activeJobNo,
       jobName: activeJobName,
-      // if extractedText is empty, store null (keeps row but avoids misleading "hasText")
       ocrText: extractedText ? extractedText : null,
       ocrFields
     });
@@ -730,7 +718,7 @@ if (!ocrText) {
     console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
   }
 
-  // ✅ Always persist pending media meta (even if OCR is empty)
+  // Always persist pending media meta
   try {
     const pending = await getPendingTransactionState(userKey);
 
@@ -771,19 +759,19 @@ if (!ocrText) {
   mediaMeta.confidence = null;
   mediaMeta.media_asset_id = mediaAssetId || null;
 
-  // keep your existing helper if you want it
   try {
     await attachPendingMediaMeta(userKey, mediaMeta);
   } catch {}
-console.info('[IMAGE_EXTRACT_DEBUG]', {
-  userKey,
-  stableMediaMsgId,
-  ocrLen: (ocrText || '').length,
-  extractedLen: (extractedText || '').length,
-  willPrompt: !extractedText
-});
 
-  // ✅ CRITICAL: never return empty result for images
+  console.info('[IMAGE_EXTRACT_DEBUG]', {
+    userKey,
+    stableMediaMsgId,
+    ocrLen: (ocrText || '').length,
+    extractedLen: (extractedText || '').length,
+    willPrompt: !extractedText
+  });
+
+  // never return empty result
   if (!extractedText) {
     return {
       transcript: null,
@@ -791,14 +779,12 @@ console.info('[IMAGE_EXTRACT_DEBUG]', {
     };
   }
 
-  // classify when we have OCR text
   const fin = financeIntentFromText(extractedText);
   if (fin.kind === 'expense' || fin.kind === 'revenue') {
     await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
     return { transcript: extractedText, twiml: null };
   }
 
-  // not clearly expense/revenue — pass transcript to router
   return { transcript: extractedText, twiml: null };
 }
 

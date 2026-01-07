@@ -802,10 +802,14 @@ console.info('[IMAGE_CLASSIFY_DEBUG]', {
   sample: extractedText.slice(0, 80)
 });
 
-// If confident, lock finance intent and return transcript to finance pipeline
 if (fin?.kind === 'expense' || fin?.kind === 'revenue') {
   await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
-  return { transcript: extractedText, twiml: null };
+
+  // 🔥 critical: force router to enter expense.js / revenue.js
+  // (raw OCR blobs otherwise fall through to agent/help)
+  const routed = `${fin.kind} ${extractedText}`.trim();
+
+  return { transcript: routed, twiml: null };
 }
 
 // If it looks like a receipt but can't classify, prompt user (DO NOT send to agent/RAG)

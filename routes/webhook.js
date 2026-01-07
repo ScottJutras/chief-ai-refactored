@@ -754,11 +754,10 @@ console.info('[MEDIA_RETURN]', {
 
 if (hasTranscript) {
   req.body.Body = result.transcript;
-  console.info('[WEBHOOK_MEDIA_TO_ROUTER]', {
-  from: req.from,
-  len: String(result.transcript || '').length,
-  sample: String(result.transcript || '').slice(0, 120)
+  console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', {
+  head: String(result.transcript || '').slice(0, 12),
 });
+
   return next();
 }
 

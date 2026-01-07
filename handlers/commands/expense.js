@@ -497,6 +497,70 @@ async function resendConfirmExpense({ from, ownerId, tz, paUserId }) {
 
   return sendConfirmExpenseOrFallback(from, line);
 }
+async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile }) {
+  const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  const draft = confirmPA?.payload?.draft;
+  if (!draft || !draft.needsReparse) return confirmPA;
+
+  const sourceText = String(draft?.originalText || draft?.draftText || '').trim();
+  if (!sourceText) {
+    // nothing to reparse; just clear the flag to avoid loops
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: { ...(confirmPA.payload || {}), draft: { ...(draft || {}), needsReparse: false } },
+      ttlSeconds: PA_TTL_SEC
+    });
+    return await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  }
+
+  // Re-run the *existing* parser on the OCR source text.
+  // IMPORTANT: keep job fields as-is (job choice must win).
+  const parsed = await parseExpenseMessage(sourceText, { tz }).catch(() => ({}));
+
+  const jobFields = {
+    jobName: draft.jobName ?? null,
+    jobSource: draft.jobSource ?? null,
+    job_no: draft.job_no ?? null,
+    job_id: draft.job_id ?? null
+  };
+
+  const merged = {
+    ...(draft || {}),
+    ...(parsed || {}),
+    ...jobFields,
+    // keep media linkage if you store it in the draft
+    media_asset_id: draft.media_asset_id ?? parsed?.media_asset_id ?? null,
+    media_source_msg_id: draft.media_source_msg_id ?? parsed?.media_source_msg_id ?? null,
+    needsReparse: false
+  };
+
+  // Normalize receipt-safe fields now (TOTAL/date/store)
+  const normalized = normalizeExpenseData(merged, userProfile, sourceText);
+
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      ...(confirmPA.payload || {}),
+      draft: normalized
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
+
+  console.info('[EXPENSE_REPARSE_AFTER_JOB_CHANGE]', {
+    paUserId,
+    amount: normalized?.amount || null,
+    date: normalized?.date || null,
+    store: normalized?.store || null
+  });
+
+  return await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+}
+
+
 
 /* ---------------- misc helpers ---------------- */
 
@@ -1061,13 +1125,105 @@ async function rejectAndResendPicker({
 
 
 
+/* ---------------- receipt-safe extractors (TOTAL/date/store) ---------------- */
+
+// Prefer TOTAL lines; ignore hyphenated IDs; avoid “largest number wins” traps.
+function extractReceiptTotal(text) {
+  const raw = String(text || '');
+  if (!raw) return null;
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map(l => l.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  // 1) Strong: TOTAL line with 2 decimals (no $ required)
+  for (const line of lines) {
+    const lc = line.toLowerCase();
+
+    // avoid lines like "invoice 1852-4" etc
+    if (/\b(invoice|inv|order|auth|approval|reference|ref|customer|acct|account)\b/i.test(lc)) continue;
+
+    if (/\btotal\b/i.test(lc)) {
+      // Look for a proper money number like 13.21
+      const m = lc.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
+      if (m) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n) && n > 0 && n < 100000) return n;
+      }
+    }
+  }
+
+  // 2) Backup: Subtotal + Tax style (subtotal 11.69, hst 1.52)
+  let subtotal = null;
+  let tax = null;
+
+  for (const line of lines) {
+    const lc = line.toLowerCase();
+    if (/\bsubtotal\b/i.test(lc)) {
+      const m = lc.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
+      if (m) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n) && n > 0) subtotal = n;
+      }
+    }
+    if (/\b(hst|gst|pst|tax)\b/i.test(lc)) {
+      const m = lc.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
+      if (m) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n) && n >= 0) tax = n;
+      }
+    }
+  }
+
+  if (subtotal != null && tax != null) {
+    const n = subtotal + tax;
+    if (Number.isFinite(n) && n > 0 && n < 100000) return Number(n.toFixed(2));
+  }
+
+  return null;
+}
+
+// Extract MM/DD/YYYY (common receipt format). Returns YYYY-MM-DD.
+function extractReceiptDate(text) {
+  const raw = String(text || '');
+  if (!raw) return null;
+
+  // Prefer MM/DD/YYYY
+  const m = raw.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
+  if (m) {
+    const mm = m[1], dd = m[2], yyyy = m[3];
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  // Backup: YYYY-MM-DD if OCR happens to normalize
+  const m2 = raw.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  if (m2) return `${m2[1]}-${m2[2]}-${m2[3]}`;
+
+  return null;
+}
+
+// Cheap store detection from OCR blob
+function extractReceiptStore(text) {
+  const raw = String(text || '').toLowerCase();
+
+  if (/\bhome\s*hardware\b/.test(raw)) return 'Home Hardware';
+  if (/\bhome\s*depot\b/.test(raw) || /\bhomedepot\b/.test(raw)) return 'Home Depot';
+  if (/\brona\b/.test(raw)) return 'Rona';
+  if (/\blowe'?s\b/.test(raw) || /\blowes\b/.test(raw)) return "Lowe's";
+  if (/\bbeacon\b/.test(raw)) return 'Beacon';
+  if (/\babc\s*supply\b/.test(raw)) return 'ABC Supply';
+  if (/\bconvoy\b/.test(raw)) return 'Convoy';
+
+  return null;
+}
+
 /* ---------------- category heuristics ---------------- */
 
 function isUnknownItem(x) {
   const s = String(x || '').trim().toLowerCase();
   return !s || s === 'unknown' || s.startsWith('unknown ');
 }
-
 
 function vendorDefaultCategory(store) {
   const s = String(store || '').toLowerCase();
@@ -1098,10 +1254,40 @@ function formatMoneyDisplay(n) {
   }
 }
 
-function normalizeExpenseData(data, userProfile) {
+/**
+ * ✅ UPDATED: normalizeExpenseData(data, userProfile, sourceText?)
+ * - Uses receipt TOTAL/date/store when present
+ * - Then applies your standard formatting/defaults
+ */
+function normalizeExpenseData(data, userProfile, sourceText = '') {
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
   const d = { ...(data || {}) };
 
+  // ---------------------------
+  // Receipt-first fixes (only if missing/weak)
+  // ---------------------------
+
+  const currentAmt = d.amount != null ? toNumberAmount(d.amount) : null;
+  const receiptTotal = extractReceiptTotal(sourceText);
+
+  if ((d.amount == null || !Number.isFinite(currentAmt) || currentAmt <= 0) && receiptTotal != null) {
+    d.amount = receiptTotal; // numeric; formatted below
+  }
+
+  if (!String(d.date || '').trim()) {
+    const receiptDate = extractReceiptDate(sourceText);
+    if (receiptDate) d.date = receiptDate;
+  }
+
+  const storeTrim = String(d.store || '').trim();
+  if (!storeTrim || /^unknown\b/i.test(storeTrim)) {
+    const receiptStore = extractReceiptStore(sourceText);
+    if (receiptStore) d.store = receiptStore;
+  }
+
+  // ---------------------------
+  // Your original normalization
+  // ---------------------------
   if (d.amount != null) {
     const n = toNumberAmount(d.amount);
     if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
@@ -1128,6 +1314,7 @@ function normalizeExpenseData(data, userProfile) {
   return d;
 }
 
+
 async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   const vendor = String(data?.store || '').trim() || 'Unknown Store';
   const itemText = String(data?.item || '').trim();
@@ -1152,6 +1339,9 @@ async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
 
   return null;
 }
+
+
+
 /* ---------------- Active job persistence (expense.js) ---------------- */
 /**
  * Best-effort persist active job for this identity.
@@ -2189,6 +2379,46 @@ try {
       pending?.pendingMediaMeta?.mediaAssetId ||
       null) || null;
 } catch {}
+// Optional high-signal debug (after reparse attempt)
+  try {
+    const c = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    console.info('[CONFIRM_DRAFT_AFTER_REPARSE]', {
+      paUserId,
+      needsReparse: !!c?.payload?.draft?.needsReparse,
+      amount: c?.payload?.draft?.amount || null,
+      date: c?.payload?.draft?.date || null,
+      store: c?.payload?.draft?.store || null
+    });
+  } catch {}
+// ✅ tz needed for reparse (safe default)
+const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
+
+// ✅ Only attempt reparse if confirm draft exists and is marked dirty
+try {
+  const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  const needs = !!c0?.payload?.draft?.needsReparse;
+
+  if (needs) {
+    await maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile });
+
+    // Optional high-signal debug (after reparse attempt)
+    try {
+      const c = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+      console.info('[CONFIRM_DRAFT_AFTER_REPARSE]', {
+        paUserId,
+        needsReparse: !!c?.payload?.draft?.needsReparse,
+        amount: c?.payload?.draft?.amount || null,
+        date: c?.payload?.draft?.date || null,
+        store: c?.payload?.draft?.store || null
+      });
+    } catch {}
+  }
+} catch (e) {
+  console.warn('[EXPENSE] maybeReparseConfirmDraftExpense precheck failed (ignored):', e?.message);
+}
+
+
+  
 
 async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMediaAssetId }) {
   // 1) Draft direct
@@ -2449,6 +2679,28 @@ const lockKey = `lock:${paUserId}`;
 
         // "change job" while already picking -> resend page 0
         if (tok === 'change_job') {
+          // ✅ Mark confirm draft dirty so we re-parse receipt fields after job changes
+try {
+  const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  if (confirmPA?.payload?.draft) {
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA.payload || {}),
+        draft: {
+          ...(confirmPA.payload.draft || {}),
+          needsReparse: true
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+  }
+} catch (e) {
+  console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
+}
+
           return await sendJobPickList({
             from,
             ownerId,
@@ -2584,7 +2836,7 @@ if (looksLikePickerTap) {
     await persistActiveJobBestEffort({
       ownerId,
       userProfile,
-      fromPhone: from,
+      fromPhone: userKey,
       jobRow: chosen,
       jobNameFallback: chosen?.name
     });
@@ -2721,7 +2973,7 @@ return await resendConfirmExpense({ from, ownerId, tz });
             await persistActiveJobBestEffort({
               ownerId,
               userProfile,
-              fromPhone: from,
+              fromPhone: userKey,
               jobRow: resolved.job,
               jobNameFallback: resolved.job?.name
             });
@@ -2779,24 +3031,47 @@ if (confirmPA?.payload?.draft) {
 
   const token = normalizeDecisionToken(input);
 
-  // 🔁 Change Job (keep confirm PA)
-  if (token === 'change_job') {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+ // 🔁 Change Job (keep confirm PA)
+if (token === 'change_job') {
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+  if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
 
-    return await sendJobPickList({
-      from,
-      ownerId,
-      userProfile,
-      confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-      jobOptions: jobs,
-      paUserId,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft: confirmPA?.payload?.draft || null
-    });
+  // ✅ Mark confirm draft dirty so we re-parse receipt fields after job changes
+  try {
+    if (confirmPA?.payload?.draft) {
+      await upsertPA({
+        ownerId,
+        userId: paUserId,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPA.payload || {}),
+          draft: {
+            ...(confirmPA.payload.draft || {}),
+            needsReparse: true
+          }
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+    }
+  } catch (e) {
+    console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
   }
+
+  return await sendJobPickList({
+    from,
+    ownerId,
+    userProfile,
+    confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+    jobOptions: jobs,
+    paUserId,
+    page: 0,
+    pageSize: 8,
+    context: 'expense_jobpick',
+    confirmDraft: confirmPA?.payload?.draft || null
+  });
+}
+
+
 
   // ✏️ Edit (DO NOT delete confirm PA — contract)
   if (token === 'edit') {
@@ -2891,7 +3166,23 @@ if (token === 'yes') {
 
   const maybeJobId = rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
 
-  let data = normalizeExpenseData(rawDraft, userProfile);
+  // ✅ Receipt/OCR-first source text for receipt-safe amount/date/store extraction
+  const sourceText = String(
+    confirmPA?.payload?.receiptText ||
+    confirmPA?.payload?.ocrText ||
+    confirmPA?.payload?.extractedText ||
+    rawDraft?.receiptText ||
+    rawDraft?.ocrText ||
+    rawDraft?.extractedText ||
+    rawDraft?.media_transcript ||
+    rawDraft?.mediaTranscript ||
+    rawDraft?.originalText ||
+    rawDraft?.draftText ||
+    rawDraft?.text ||
+    ''
+  ).trim();
+
+  let data = normalizeExpenseData(rawDraft, userProfile, sourceText);
 
   // Strong Unknown handling
   if (!data.item || isUnknownItem(data.item)) {
@@ -3111,7 +3402,7 @@ if (token === 'yes') {
       await persistActiveJobBestEffort({
         ownerId,
         userProfile,
-        fromPhone: from,
+        fromPhone: userKey,
         jobRow: { id: maybeJobId || null, job_no: jobNo, name: jobName },
         jobNameFallback: jobName
       });
@@ -3156,7 +3447,9 @@ if (token === 'yes') {
     
     const backstop = deterministicExpenseParse(input, userProfile);
     if (backstop && backstop.amount) {
-      const data0 = normalizeExpenseData(backstop, userProfile);
+      const sourceText0 = String(backstop?.originalText || backstop?.draftText || '').trim();
+const data0 = normalizeExpenseData(backstop, userProfile, sourceText0);
+
       data0.store = await normalizeVendorName(ownerId, data0.store);
 
       if (isUnknownItem(data0.item)) {
@@ -3280,84 +3573,100 @@ console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
     }
 
     /* ---- 4) AI parsing fallback ---- */
-    const defaultData = { date: todayInTimeZone(tz), item: 'Unknown', amount: '$0.00', store: 'Unknown Store' };
-    const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData, { tz });
+const defaultData = { date: todayInTimeZone(tz), item: 'Unknown', amount: '$0.00', store: 'Unknown Store' };
+const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData, { tz });
 
-    let data = aiRes?.data || null;
-    let aiReply = aiRes?.reply || null;
+let data = aiRes?.data || null;
+let aiReply = aiRes?.reply || null;
 
-    if (data) data = normalizeExpenseData(data, userProfile);
-    if (data?.jobName) data.jobName = sanitizeJobNameCandidate(data.jobName);
+if (data) {
+  // Prefer OCR/receipt blobs if AI included them, otherwise fall back to input text
+  const sourceText = String(
+    data?.receiptText ||
+    data?.ocrText ||
+    data?.extractedText ||
+    data?.media_transcript ||
+    data?.mediaTranscript ||
+    data?.originalText ||
+    data?.draftText ||
+    input ||
+    ''
+  ).trim();
 
-    if (data && isUnknownItem(data.item)) {
-      const inferred = inferExpenseItemFallback(input);
-      if (inferred) data.item = inferred;
-    }
+  data = normalizeExpenseData(data, userProfile, sourceText);
+}
 
-    const missingCore =
-      !data ||
-      !data.amount ||
-      data.amount === '$0.00' ||
-      !data.item ||
-      data.item === 'Unknown' ||
-      !data.store ||
-      data.store === 'Unknown Store';
+if (data?.jobName) data.jobName = sanitizeJobNameCandidate(data.jobName);
 
-    if (aiReply && missingCore) return out(twimlText(aiReply), false);
+if (data && isUnknownItem(data.item)) {
+  const inferred = inferExpenseItemFallback(input);
+  if (inferred) data.item = inferred;
+}
 
-    if (data && data.amount && data.amount !== '$0.00') {
-      data.store = await normalizeVendorName(ownerId, data.store);
+const missingCore =
+  !data ||
+  !data.amount ||
+  data.amount === '$0.00' ||
+  !data.item ||
+  data.item === 'Unknown' ||
+  !data.store ||
+  data.store === 'Unknown Store';
 
-      let category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
-      category = category && String(category).trim() ? String(category).trim() : null;
+if (aiReply && missingCore) return out(twimlText(aiReply), false);
 
-      let jobName = data.jobName || null;
-      let jobSource = jobName ? 'typed' : null;
+if (data && data.amount && data.amount !== '$0.00') {
+  data.store = await normalizeVendorName(ownerId, data.store);
 
-      if (!jobName) {
-        jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-        if (jobName) jobSource = 'active';
-      }
+  let category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+  category = category && String(category).trim() ? String(category).trim() : null;
 
-      if (jobName && looksLikeOverhead(jobName)) {
-        jobName = 'Overhead';
-        jobSource = 'overhead';
-      }
+  let jobName = data.jobName || null;
+  let jobSource = jobName ? 'typed' : null;
 
-      if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
+  if (!jobName) {
+    jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+    if (jobName) jobSource = 'active';
+  }
 
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          draft: {
-  ...data,
-  jobName,
-  jobSource,
-  suggestedCategory: category,
-  job_id: null,
-  job_no: null,
+  if (jobName && looksLikeOverhead(jobName)) {
+    jobName = 'Overhead';
+    jobSource = 'overhead';
+  }
 
-  // ✅ carry the resolved link into the draft now
-  media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+  if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
 
-  // ✅ strongest possible DB fallback key (matches media_assets.source_msg_id format)
-  media_source_msg_id: (String(safeMsgId || '').trim()
-    ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
-    : null),
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      draft: {
+        ...data,
+        jobName,
+        jobSource,
+        suggestedCategory: category,
+        job_id: null,
+        job_no: null,
 
-  originalText: input,
-  draftText: input
-},
+        // ✅ carry resolved link (keep your existing vars here)
+        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+        media_source_msg_id: (String(safeMsgId || '').trim()
+          ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+          : null),
 
+        // ✅ IMPORTANT: store OCR text into the PA so YES + reparse can use it
+        receiptText: data?.receiptText || data?.ocrText || data?.extractedText || data?.media_transcript || null,
+        ocrText: data?.ocrText || data?.extractedText || null,
 
+        originalText: input,
+        draftText: input
+      },
+      sourceMsgId: safeMsgId,
+      type: 'expense'
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
 
-          sourceMsgId: safeMsgId,
-          type: 'expense'
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
       const chk = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 console.info('[CONFIRM_PA_AFTER_UPSERT]', {
   hasDraft: !!chk?.payload?.draft,

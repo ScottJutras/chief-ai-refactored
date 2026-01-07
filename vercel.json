@@ -4,7 +4,7 @@
     "api/webhook.js": {
       "memory": 2048,
       "maxDuration": 15,
-      "excludeFiles": "{docs/**,public/**,dashboard/**,parse/**,deep-dive/**,api/index.js,node_modules/pdfkit/**,node_modules/exceljs/**,node_modules/@google-cloud/**,node_modules/google-auth-library/**}"
+      "excludeFiles": "{docs/**,public/**,dashboard/**,parse/**,deep-dive/**,api/index.js,node_modules/pdfkit/**,node_modules/exceljs/**}"
     },
     "api/index.js": {
       "memory": 1024,

@@ -45,11 +45,7 @@ function hasDocAiCreds() {
     process.env.GOOGLE_VISION_CREDENTIALS_BASE64
   );
 }
-const b64 =
-  process.env.GOOGLE_CREDENTIALS_BASE64 ||
-  process.env.GOOGLE_DOCUMENTAI_CREDENTIALS_BASE64 ||
-  process.env.GOOGLE_VISION_CREDENTIALS_BASE64 ||
-  '';
+
 
 
 function getDocAiProcessorName() {
@@ -105,26 +101,29 @@ function getDocAiClient() {
 
   const processorName = getDocAiProcessorName();
   if (!processorName) {
-    console.warn('[docaiService] Processor name missing. Set DOCUMENTAI_PROCESSOR_NAME (or PROJECT/LOCATION/PROCESSOR_ID).');
+    console.warn(
+      '[docaiService] Processor name missing. Set DOCUMENTAI_PROCESSOR_NAME (or PROJECT/LOCATION/PROCESSOR_ID).'
+    );
+    cachedClient = null;
+    return cachedClient;
+  }
+
+  // ✅ bundler-friendly: use hoisted module, never require here
+  if (!DocAI?.DocumentProcessorServiceClient) {
+    console.warn('[docaiService] @google-cloud/documentai not present in runtime bundle.');
+    cachedClient = null;
+    return cachedClient;
+  }
+
+  const credentials = getCredentialsFromBase64();
+  if (!credentials) {
+    console.warn('[docaiService] Credentials invalid/unreadable.');
     cachedClient = null;
     return cachedClient;
   }
 
   try {
-    // Optional dependency — must be guarded.
-    if (!DocAI?.DocumentProcessorServiceClient) {
-  cachedClient = null;
-  return cachedClient;
-}
-const { DocumentProcessorServiceClient } = DocAI;
-
-
-    const credentials = getCredentialsFromBase64();
-    if (!credentials) {
-      console.warn('[docaiService] Credentials invalid/unreadable.');
-      cachedClient = null;
-      return cachedClient;
-    }
+    const { DocumentProcessorServiceClient } = DocAI;
 
     const apiEndpoint = getDocAiEndpoint();
     const opts = apiEndpoint ? { apiEndpoint, credentials } : { credentials };
@@ -133,11 +132,12 @@ const { DocumentProcessorServiceClient } = DocAI;
     cachedCaps = { processorName };
     return cachedClient;
   } catch (err) {
-    console.warn('[docaiService] Document AI unavailable:', err?.message || err);
+    console.warn('[docaiService] Document AI client init failed:', err?.message || err);
     cachedClient = null;
     return cachedClient;
   }
 }
+
 
 async function fetchTwilioMediaBytes(url) {
   try {
@@ -202,12 +202,12 @@ async function processBytesWithDocAi({ bytes, mimeType }) {
 }
 async function processBytesWithVision({ bytes }) {
   try {
-    const { ImageAnnotatorClient } = require('@google-cloud/vision');
+    if (!Vision?.ImageAnnotatorClient) return { text: '' };
 
     const credentials = getCredentialsFromBase64();
     if (!credentials) return { text: '' };
 
-    const client = new ImageAnnotatorClient({ credentials });
+    const client = new Vision.ImageAnnotatorClient({ credentials });
 
     const [result] = await client.textDetection({ image: { content: bytes } });
     const text = String(result?.fullTextAnnotation?.text || '').trim();
@@ -217,6 +217,7 @@ async function processBytesWithVision({ bytes }) {
     return { text: '' };
   }
 }
+
 
 
 

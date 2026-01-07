@@ -134,6 +134,9 @@ function looksLikeJobPickerReplyToken(raw) {
 }
 
 function pendingTxnNudgeMessage(pending) {
+  // If user is mid-edit, do not nag. The next message should be treated as the edit payload.
+  if (pending?.confirmDraft?.awaiting_edit) return null;
+
   const type = pending?.type || pending?.kind || 'entry';
   return `It looks like you still have a pending ${type}.
 
@@ -144,6 +147,7 @@ Reply:
 
 Or reply "skip" to leave it pending and continue.`;
 }
+
 
 /* -----------------------------------------------------------------------
  * ✅ Inbound text normalization (button-aware + interactive list-aware)
@@ -495,6 +499,51 @@ async function hasExpensePA(ownerId, from) {
   }
 }
 
+
+
+async function maybeAutoYesAfterEdit({
+  userId,
+  kind,            // 'expense' | 'revenue'
+  handlerFn,       // handleExpense | handleRevenue
+  handlerArgs,     // array of args you used for the first call
+  firstResult,
+  getPendingTransactionState,
+  mergePendingTransactionState,
+  messageSid
+}) {
+  try {
+    const pending = await getPendingTransactionState(userId);
+    if (!pending?._autoYesAfterEdit) return firstResult;
+
+    // ✅ Clear flag first (prevents loops even if auto-yes fails)
+    await mergePendingTransactionState(userId, {
+      _autoYesAfterEdit: false,
+      _autoYesSourceMsgId: null
+    });
+
+    const yesSid = `${messageSid || ''}:auto_yes_after_edit`.slice(0, 64);
+
+    // Re-call the same handler with "yes"
+    // signature: (from, text, profile, ownerId, ownerProfile, isOwner, messageSid, req.body)
+    const yesArgs = [...handlerArgs];
+    yesArgs[1] = 'yes';
+    yesArgs[6] = yesSid;
+
+    // ✅ also patch payload body (some logic reads req.body.Body)
+    if (yesArgs[7] && typeof yesArgs[7] === 'object') {
+      yesArgs[7] = { ...yesArgs[7], Body: 'yes' };
+    }
+
+    const yesResult = await handlerFn(...yesArgs);
+    console.info('[AUTO_YES_AFTER_EDIT]', { userId, kind, ok: true });
+    return yesResult;
+  } catch (e) {
+    console.warn('[AUTO_YES_AFTER_EDIT] failed (ignored):', e?.message);
+    return firstResult;
+  }
+}
+
+
 /* ---------------- Raw urlencoded parser (Twilio signature expects original body) ---------------- */
 
 router.use((req, _res, next) => {
@@ -798,6 +847,74 @@ router.post('*', async (req, res, next) => {
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid =
       rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
+    // -----------------------------------------------------------------------
+    // ✅ EDIT LOOP FIX: if user is in "awaiting_edit" mode and sends a full
+    // "expense ..." or "revenue ..." line, treat it as "Yes" (auto-submit),
+    // but update the body so ingestion uses the corrected details.
+    // -----------------------------------------------------------------------
+    if (pending?.confirmDraft?.awaiting_edit) {
+      const isCorrectedExpense = /^expense\b/i.test(text);
+      const isCorrectedRevenue = /^revenue\b/i.test(text);
+
+      if (isCorrectedExpense || isCorrectedRevenue) {
+        // clear edit mode immediately (prevents re-entry / nag)
+        await mergePendingTransactionState(req.from, {
+          ...(pending || {}),
+          confirmDraft: {
+            ...(pending.confirmDraft || {}),
+            awaiting_edit: false
+          }
+        });
+
+        // Pass the corrected message through normal pipeline
+        req.body.Body = text;
+
+        // ✅ Force immediate submit after draft overwrite:
+        // we convert this inbound message to "yes" *after* the corrected text
+        // has been parsed and saved into the draft by the expense/revenue handler.
+        //
+        // The simplest cross-file way: set a one-shot flag in pending state
+        // that your expense/revenue handler can check, OR (if you already do)
+        // use confirmDraft.hasDraft + "yes" to finalize.
+        //
+        // We'll do the smallest: stash a flag that we can consume later in this router
+        // right after ingestion creates/updates confirmDraft.
+        await mergePendingTransactionState(req.from, {
+          ...(pending || {}),
+          _autoYesAfterEdit: true,
+          _autoYesSourceMsgId: messageSid || null
+        });
+
+        // Continue routing with corrected body
+        text = String(getInboundText(req.body || {}) || '').trim();
+        lc = text.toLowerCase();
+        pending = await getPendingTransactionState(req.from);
+      }
+    }
+
+        // -----------------------------------------------------------------------
+    // ✅ If user presses "edit" while a confirm draft exists, enter edit mode
+    // and prompt for corrected details. No nag.
+    // -----------------------------------------------------------------------
+    if (lc === 'edit' && pending?.confirmDraft) {
+      await mergePendingTransactionState(req.from, {
+        ...(pending || {}),
+        confirmDraft: {
+          ...(pending.confirmDraft || {}),
+          awaiting_edit: true
+        }
+      });
+
+      const kind = pending?.type || pending?.kind || pending?.confirmDraft?.type || 'expense';
+      const promptKind = kind === 'revenue' ? 'revenue' : 'expense';
+
+      return ok(
+        res,
+        `Got it — send the corrected ${promptKind} like:\n` +
+          `${promptKind} $13.21 spray foam insulation on 2025-09-27`
+      );
+    }
+
 
     /* -----------------------------------------------------------------------
      * ✅ GLOBAL HARD CANCEL
@@ -867,7 +984,8 @@ router.post('*', async (req, res, next) => {
     const lc2 = text2.toLowerCase();
     const isPickerToken = looksLikeJobPickerReplyToken(text2);
 
-    /* -----------------------------------------------------------------------
+    
+/* -----------------------------------------------------------------------
      * ✅ Pending-actions router (must run early)
      * ----------------------------------------------------------------------- */
     const pa =
@@ -888,7 +1006,7 @@ router.post('*', async (req, res, next) => {
       throw new Error('expense handler export missing (handleExpense)');
     }
 
-    const tw = await expenseHandler(
+        const handlerArgs = [
       req.from,
       text2,
       req.userProfile,
@@ -896,8 +1014,28 @@ router.post('*', async (req, res, next) => {
       req.ownerProfile,
       req.isOwner,
       messageSid,
-      req.body // ✅ pass Twilio payload
-    );
+      req.body
+    ];
+
+    const first = await expenseHandler(...handlerArgs);
+console.info('[AUTO_YES_CHECK]', {
+  from: req.from,
+  kind: 'expense',
+  messageSid,
+  head: String(text2 || '').slice(0, 20)
+});
+
+    const tw = await maybeAutoYesAfterEdit({
+      userId: req.from,
+      kind: 'expense',
+      handlerFn: expenseHandler,
+      handlerArgs,
+      firstResult: first,
+      getPendingTransactionState,
+      mergePendingTransactionState,
+      messageSid
+    });
+
 
     if (!res.headersSent) {
       if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
@@ -911,30 +1049,50 @@ router.post('*', async (req, res, next) => {
 }
 
 
-    if (isRevenuePA) {
-      try {
-        const { handleRevenue } = require('../handlers/commands/revenue');
-        const tw = await handleRevenue(
-  req.from,
-  text2,
-  req.userProfile,
-  req.ownerId,
-  req.ownerProfile,
-  req.isOwner,
-  messageSid,
-  req.body // ✅ pass Twilio payload
-);
+if (isRevenuePA) {
+  try {
+    const revMod = require('../handlers/commands/revenue');
+    const revenueHandler = revMod && typeof revMod.handleRevenue === 'function' ? revMod.handleRevenue : null;
 
-        if (!res.headersSent) {
-          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          return ok(res); // empty
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] revenue PA router failed (ignored):', e?.message);
-      }
+    if (!revenueHandler) {
+      throw new Error('revenue handler export missing (handleRevenue)');
     }
+
+    const handlerArgs = [
+      req.from,
+      text2,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid,
+      req.body
+    ];
+
+    const first = await revenueHandler(...handlerArgs);
+
+    const tw = await maybeAutoYesAfterEdit({
+      userId: req.from,
+      kind: 'revenue',
+      handlerFn: revenueHandler,
+      handlerArgs,
+      firstResult: first,
+      getPendingTransactionState,
+      mergePendingTransactionState,
+      messageSid
+    });
+
+    if (!res.headersSent) {
+      if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+      if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+      return ok(res); // empty
+    }
+    return;
+  } catch (e) {
+    console.warn('[WEBHOOK] revenue PA router failed (ignored):', e?.message);
+  }
+}
+
 
     /* -----------------------------------------------------------------------
      * (A0) ACTIVE JOB PICKER FLOW — only if awaitingActiveJobPick OR explicit intent
@@ -984,41 +1142,15 @@ router.post('*', async (req, res, next) => {
       (!!pending?.pendingExpense && !isNewExpenseCmd);
 
     if (pendingRevenueLike) {
-      try {
-        const { handleRevenue } = require('../handlers/commands/revenue');
-        const tw = await handleRevenue(
-  req.from,
-  text2,
-  req.userProfile,
-  req.ownerId,
-  req.ownerProfile,
-  req.isOwner,
-  messageSid,
-  req.body // ✅ pass Twilio payload
-);
-
-
-        if (!res.headersSent) {
-          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          return ok(res);
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
-      }
-    }
-
-    if (pendingExpenseLike) {
   try {
-    const expenseMod = require('../handlers/commands/expense');
-    const expenseHandler = expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
+    const revMod = require('../handlers/commands/revenue');
+    const revenueHandler = revMod && typeof revMod.handleRevenue === 'function' ? revMod.handleRevenue : null;
 
-    if (!expenseHandler) {
-      throw new Error('expense handler export missing (handleExpense)');
+    if (!revenueHandler) {
+      throw new Error('revenue handler export missing (handleRevenue)');
     }
 
-    const tw = await expenseHandler(
+    const handlerArgs = [
       req.from,
       text2,
       req.userProfile,
@@ -1026,8 +1158,21 @@ router.post('*', async (req, res, next) => {
       req.ownerProfile,
       req.isOwner,
       messageSid,
-      req.body // ✅ pass Twilio payload
-    );
+      req.body
+    ];
+
+    const first = await revenueHandler(...handlerArgs);
+
+    const tw = await maybeAutoYesAfterEdit({
+      userId: req.from,
+      kind: 'revenue',
+      handlerFn: revenueHandler,
+      handlerArgs,
+      firstResult: first,
+      getPendingTransactionState,
+      mergePendingTransactionState,
+      messageSid
+    });
 
     if (!res.headersSent) {
       if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
@@ -1036,7 +1181,7 @@ router.post('*', async (req, res, next) => {
     }
     return;
   } catch (e) {
-    console.warn('[WEBHOOK] expense pending/clarification handler failed:', e?.message);
+    console.warn('[WEBHOOK] revenue pending/clarification handler failed:', e?.message);
   }
 }
 

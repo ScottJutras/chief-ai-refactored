@@ -169,6 +169,25 @@ async function processBytesWithDocAi({ bytes, mimeType }) {
     return { text: '' };
   }
 }
+async function processBytesWithVision({ bytes }) {
+  try {
+    const { ImageAnnotatorClient } = require('@google-cloud/vision');
+
+    const credentials = getCredentialsFromBase64();
+    if (!credentials) return { text: '' };
+
+    const client = new ImageAnnotatorClient({ credentials });
+
+    const [result] = await client.textDetection({ image: { content: bytes } });
+    const text = String(result?.fullTextAnnotation?.text || '').trim();
+    return { text: text || '' };
+  } catch (err) {
+    console.warn('[visionService] Vision OCR unavailable/failed (ignored):', err?.message || err);
+    return { text: '' };
+  }
+}
+
+
 
 /**
  * Extract text from an image URL (Twilio media URL).
@@ -186,28 +205,30 @@ async function extractTextFromImage(imageUrl, opts = {}) {
   const url = String(imageUrl || '').trim();
   if (!url) return { text: '' };
 
-  const client = getDocAiClient();
-  if (!client) return { text: '' };
-
   const fetchBytes = opts.fetchBytes !== false;
   const mimeType = normalizeMimeType(opts.mediaType);
 
   try {
-    if (fetchBytes) {
-      const buf = await fetchTwilioMediaBytes(url);
-      if (!buf || !buf.length) return { text: '' };
-      return await processBytesWithDocAi({ bytes: buf, mimeType });
+    const buf = fetchBytes ? await fetchTwilioMediaBytes(url) : await fetchTwilioMediaBytes(url);
+    if (!buf || !buf.length) return { text: '' };
+
+    // 1) Try DocAI if available
+    const client = getDocAiClient();
+    if (client) {
+      const r1 = await processBytesWithDocAi({ bytes: buf, mimeType });
+      const t1 = String(r1?.text || '').trim();
+      if (t1) return { text: t1 };
     }
 
-    // For Document AI, OCR-by-URL is not the normal path; keep fail-open behavior.
-    // If you ever want URL ingestion, you’d need to fetch bytes anyway for Twilio.
-    const buf = await fetchTwilioMediaBytes(url);
-    if (!buf || !buf.length) return { text: '' };
-    return await processBytesWithDocAi({ bytes: buf, mimeType });
+    // 2) Fallback: Vision OCR
+    const r2 = await processBytesWithVision({ bytes: buf });
+    const t2 = String(r2?.text || '').trim();
+    return { text: t2 || '' };
   } catch (err) {
     console.warn('[docaiService] extractTextFromImage failed (ignored):', err?.message || err);
     return { text: '' };
   }
 }
+
 
 module.exports = { extractTextFromImage };

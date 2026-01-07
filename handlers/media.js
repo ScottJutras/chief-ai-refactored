@@ -690,6 +690,19 @@ if (isImage) {
   try {
     const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
     ocrText = String(out?.text || out?.transcript || '').trim();
+    // After DocAI attempt:
+if (!ocrText) {
+  try {
+    // If your visionService exposes a cheaper OCR fallback, call it here.
+    // Example names (use whichever you actually have):
+    const out2 = await extractTextFromImage(mediaUrl, { provider: 'vision', fetchBytes: true, mediaType: normType });
+    ocrText = String(out2?.text || out2?.transcript || '').trim();
+    if (ocrText) console.info('[MEDIA] OCR fallback (vision) succeeded', { len: ocrText.length });
+  } catch (e2) {
+    console.warn('[MEDIA] OCR fallback (vision) failed (ignored):', e2?.message);
+  }
+}
+
     ocrFields = out?.fields || out?.ocrFields || null;
   } catch (e) {
     console.warn('[MEDIA] OCR failed (ignored):', e?.message);

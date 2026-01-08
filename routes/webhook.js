@@ -134,24 +134,22 @@ function looksLikeJobPickerReplyToken(raw) {
 }
 
 function pendingTxnNudgeMessage(pending) {
-  // If user is mid-edit, do not nag. Next message should be treated as edit payload.
-  const awaitingEdit =
-    !!pending?.edit_mode ||
-    !!pending?.confirmDraft?.awaiting_edit ||
-    !!pending?.confirmDraft?.awaitingEdit;
-
-  if (awaitingEdit) return null;
+  // If user is mid-edit, do not nag. Next message is edit payload.
+  if (pending?.confirmDraft?.awaiting_edit || pending?.edit_mode) return null;
 
   const type = pending?.type || pending?.kind || 'entry';
-  return `It looks like you still have a pending ${type}.
 
-Reply:
-"yes" to submit
-"edit" to change it
-"cancel" (or "stop") to discard
-
-Or reply "skip" to leave it pending and continue.`;
+  return [
+    `You’ve got an unfinished ${type} waiting for confirmation.`,
+    ``,
+    `Reply:`,
+    `• "yes" to submit it`,
+    `• "edit" to change it`,
+    `• "cancel" to discard it`,
+    `• "skip" to keep it pending and continue`
+  ].join('\n');
 }
+
 
 
 /* -----------------------------------------------------------------------
@@ -847,6 +845,62 @@ router.post('*', async (req, res, next) => {
 
     let text = String(getInboundText(req.body || {}) || '').trim();
     let lc = text.toLowerCase();
+     // -----------------------------------------------------------------------
+// "resume" => re-send the pending confirm card if we have a confirm pending-action
+// MUST run early (before nudge / PA router / job picker / fast paths / agent)
+// -----------------------------------------------------------------------
+if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
+  try {
+    const pa =
+      typeof pg.getMostRecentPendingActionForUser === 'function'
+        ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
+        : null;
+
+    const kind = String(pa?.kind || '').trim();
+
+    if (kind === 'confirm_expense' || kind === 'pick_job_for_expense') {
+      const { handleExpense } = require('../handlers/commands/expense');
+      const result = await handleExpense(
+        req.from,
+        'edit', // triggers your edit prompt flow (or swap to a "sendConfirm" if you have one)
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        messageSid,
+        req.body
+      );
+      if (!res.headersSent) {
+        const tw = typeof result === 'string' ? result : (result?.twiml || null);
+        return sendTwiml(res, tw);
+      }
+      return;
+    }
+
+    if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
+      const { handleRevenue } = require('../handlers/commands/revenue');
+      const result = await handleRevenue(
+        req.from,
+        'edit',
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        messageSid,
+        req.body
+      );
+      if (!res.headersSent) {
+        const tw = typeof result === 'string' ? result : (result?.twiml || null);
+        return sendTwiml(res, tw);
+      }
+      return;
+    }
+  } catch (e) {
+    console.warn('[WEBHOOK] resume pending failed (ignored):', e?.message);
+  }
+
+  return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
+}
 
     const crypto = require('crypto');
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
@@ -953,7 +1007,7 @@ if (pendingRevenueFlow) {
   if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
     const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'revenue' });
     if (msg) return ok(res, msg);
-    // if msg is null (mid-edit), do NOT nag; fall through
+    // msg null => mid-edit; do NOT nag; fall through
   }
 }
 
@@ -963,9 +1017,10 @@ if (pendingExpenseFlow) {
   if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
     const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
     if (msg) return ok(res, msg);
-    // if msg is null (mid-edit), do NOT nag; fall through
+    // msg null => mid-edit; do NOT nag; fall through
   }
 }
+
 
 
     /* -----------------------------------------------------------------------

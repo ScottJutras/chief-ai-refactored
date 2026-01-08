@@ -1128,7 +1128,7 @@ async function rejectAndResendPicker({
 
 /* ---------------- receipt-safe extractors (TOTAL/date/store) ---------------- */
 
-// Prefer TOTAL lines; ignore hyphenated IDs; avoid “largest number wins” traps.
+// Prefer TOTAL lines; ignore loyalty/points; ignore hyphenated IDs; avoid “largest number wins”.
 function extractReceiptTotal(text) {
   const raw = String(text || '');
   if (!raw) return null;
@@ -1138,61 +1138,82 @@ function extractReceiptTotal(text) {
     .map(l => l.replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
-  const looksLikeInvoiceToken = (s) => /\b\d{2,}-\d+\b/.test(String(s || ''));
-  const hasMoneySignal = (line) => {
-    const s = String(line || '').toLowerCase();
-    return (
-      s.includes('$') ||
-      s.includes(' total') ||
-      s.startsWith('total') ||
-      s.includes('amount') ||
-      s.includes('balance') ||
-      s.includes('subtotal') ||
-      s.includes('visa') ||
-      s.includes('debit')
-    );
+  const BAD_LINE =
+    /\b(points?|redeem(ed)?|balance|bonus|base\s*points?|loyalty|member|rewards?)\b/i;
+
+  const BAD_CONTEXT =
+    /\b(invoice|inv|order|auth|approval|reference|ref|customer|acct|account|terminal|trace|batch)\b/i;
+
+  const hasHyphenatedId = (s) => /\b\d{3,6}-\d{1,4}\b/.test(s);          // 1852-4
+  const hasLongDigitRun = (s) => /\b\d{8,}\b/.test(s);                   // barcode/account-ish
+  const money2dp = (s) => s.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
+
+  const toNum = (x) => {
+    const n = Number(x);
+    return Number.isFinite(n) ? n : null;
   };
 
-  // 1) Strong: TOTAL line with 2 decimals (no $ required)
+  // 1) Strong: TOTAL lines (must be 2dp, not “points/balance”, not ref-like)
   for (const line of lines) {
     const lc = line.toLowerCase();
 
-    // reject invoice-like hyphen tokens anywhere on the line
-    if (looksLikeInvoiceToken(lc)) continue;
-
-    // avoid lines like "invoice 1852-4" etc
-    if (/\b(invoice|inv|order|auth|approval|reference|ref|customer|acct|account)\b/i.test(lc)) continue;
+    if (BAD_LINE.test(lc)) continue;
+    if (BAD_CONTEXT.test(lc)) continue;
+    if (hasHyphenatedId(lc)) continue;
+    if (hasLongDigitRun(lc)) continue;
 
     if (/\btotal\b/i.test(lc)) {
-      // Look for a proper money number like 13.21
-      const m = lc.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
-      if (m) {
-        const n = Number(m[1]);
-        if (Number.isFinite(n) && n > 0 && n < 100000) return n;
+      const m = money2dp(lc);
+      if (m?.[1]) {
+        const n = toNum(m[1]);
+        if (n != null && n > 0 && n < 100000) return n;
       }
     }
   }
 
-  // 2) Backup: Subtotal + Tax style (subtotal 11.69, hst 1.52)
+  // 2) Backup: GRAND TOTAL / AMOUNT DUE (common variants)
+  for (const line of lines) {
+    const lc = line.toLowerCase();
+
+    if (BAD_LINE.test(lc)) continue;
+    if (BAD_CONTEXT.test(lc)) continue;
+    if (hasHyphenatedId(lc)) continue;
+    if (hasLongDigitRun(lc)) continue;
+
+    if (/\b(grand\s*total|amount\s*due|total\s*due)\b/i.test(lc)) {
+      const m = money2dp(lc);
+      if (m?.[1]) {
+        const n = toNum(m[1]);
+        if (n != null && n > 0 && n < 100000) return n;
+      }
+    }
+  }
+
+  // 3) Backup: Subtotal + Tax (both must be 2dp, and not points/balance)
   let subtotal = null;
   let tax = null;
 
   for (const line of lines) {
     const lc = line.toLowerCase();
-    if (looksLikeInvoiceToken(lc)) continue;
+
+    if (BAD_LINE.test(lc)) continue;
+    if (BAD_CONTEXT.test(lc)) continue;
+    if (hasHyphenatedId(lc)) continue;
+    if (hasLongDigitRun(lc)) continue;
 
     if (/\bsubtotal\b/i.test(lc)) {
-      const m = lc.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
-      if (m) {
-        const n = Number(m[1]);
-        if (Number.isFinite(n) && n > 0) subtotal = n;
+      const m = money2dp(lc);
+      if (m?.[1]) {
+        const n = toNum(m[1]);
+        if (n != null && n > 0) subtotal = n;
       }
     }
+
     if (/\b(hst|gst|pst|tax)\b/i.test(lc)) {
-      const m = lc.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
-      if (m) {
-        const n = Number(m[1]);
-        if (Number.isFinite(n) && n >= 0) tax = n;
+      const m = money2dp(lc);
+      if (m?.[1]) {
+        const n = toNum(m[1]);
+        if (n != null && n >= 0) tax = n;
       }
     }
   }
@@ -1202,33 +1223,9 @@ function extractReceiptTotal(text) {
     if (Number.isFinite(n) && n > 0 && n < 100000) return Number(n.toFixed(2));
   }
 
-  // 3) Fallback: pick the best decimal candidate anywhere, but NEVER use hyphenated IDs (1852-4)
-  //    and NEVER accept whole-dollar ints without a money signal.
-  const candidates = [];
-  for (const line of lines) {
-    const lc = line.toLowerCase();
-    if (looksLikeInvoiceToken(lc)) continue;
-
-    const dec = lc.match(/\b\d{1,6}\.\d{2}\b/g) || [];
-    for (const m of dec) {
-      const v = Number(m);
-      if (!Number.isFinite(v) || v <= 0 || v >= 100000) continue;
-
-      const score =
-        (/\btotal\b/.test(lc) ? 100 : 0) +
-        (hasMoneySignal(lc) ? 10 : 0);
-
-      candidates.push({ v, score });
-    }
-  }
-
-  if (candidates.length) {
-    candidates.sort((a, b) => (b.score - a.score) || (b.v - a.v));
-    return Number(candidates[0].v.toFixed(2));
-  }
-
   return null;
 }
+
 
 
 // Extract MM/DD/YYYY (common receipt format). Returns YYYY-MM-DD.

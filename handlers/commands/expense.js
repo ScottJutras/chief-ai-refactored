@@ -43,6 +43,7 @@ const validateCIL =
   (typeof cilMod === 'function' && cilMod) ||
   null;
 
+
 const getCategorySuggestion =
   (typeof pg.getCategorySuggestion === 'function' && pg.getCategorySuggestion) || (async () => null);
 
@@ -1137,9 +1138,27 @@ function extractReceiptTotal(text) {
     .map(l => l.replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
+  const looksLikeInvoiceToken = (s) => /\b\d{2,}-\d+\b/.test(String(s || ''));
+  const hasMoneySignal = (line) => {
+    const s = String(line || '').toLowerCase();
+    return (
+      s.includes('$') ||
+      s.includes(' total') ||
+      s.startsWith('total') ||
+      s.includes('amount') ||
+      s.includes('balance') ||
+      s.includes('subtotal') ||
+      s.includes('visa') ||
+      s.includes('debit')
+    );
+  };
+
   // 1) Strong: TOTAL line with 2 decimals (no $ required)
   for (const line of lines) {
     const lc = line.toLowerCase();
+
+    // reject invoice-like hyphen tokens anywhere on the line
+    if (looksLikeInvoiceToken(lc)) continue;
 
     // avoid lines like "invoice 1852-4" etc
     if (/\b(invoice|inv|order|auth|approval|reference|ref|customer|acct|account)\b/i.test(lc)) continue;
@@ -1160,6 +1179,8 @@ function extractReceiptTotal(text) {
 
   for (const line of lines) {
     const lc = line.toLowerCase();
+    if (looksLikeInvoiceToken(lc)) continue;
+
     if (/\bsubtotal\b/i.test(lc)) {
       const m = lc.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
       if (m) {
@@ -1181,8 +1202,34 @@ function extractReceiptTotal(text) {
     if (Number.isFinite(n) && n > 0 && n < 100000) return Number(n.toFixed(2));
   }
 
+  // 3) Fallback: pick the best decimal candidate anywhere, but NEVER use hyphenated IDs (1852-4)
+  //    and NEVER accept whole-dollar ints without a money signal.
+  const candidates = [];
+  for (const line of lines) {
+    const lc = line.toLowerCase();
+    if (looksLikeInvoiceToken(lc)) continue;
+
+    const dec = lc.match(/\b\d{1,6}\.\d{2}\b/g) || [];
+    for (const m of dec) {
+      const v = Number(m);
+      if (!Number.isFinite(v) || v <= 0 || v >= 100000) continue;
+
+      const score =
+        (/\btotal\b/.test(lc) ? 100 : 0) +
+        (hasMoneySignal(lc) ? 10 : 0);
+
+      candidates.push({ v, score });
+    }
+  }
+
+  if (candidates.length) {
+    candidates.sort((a, b) => (b.score - a.score) || (b.v - a.v));
+    return Number(candidates[0].v.toFixed(2));
+  }
+
   return null;
 }
+
 
 // Extract MM/DD/YYYY (common receipt format). Returns YYYY-MM-DD.
 function extractReceiptDate(text) {
@@ -2256,7 +2303,15 @@ function deterministicExpenseParse(input, userProfile) {
     const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
     if (iso?.[1]) date = iso[1];
   }
-  if (!date) date = todayInTimeZone(tz);
+  // If this looks like receipt/OCR text and no explicit date token was found, do NOT default to today.
+// Let downstream confirmation / OCR-safe extractors fill date, or keep it null.
+const looksReceipt =
+  /\b(receipt|subtotal|hst|gst|pst|tax|total|debit|visa|mastercard|amex|approved|auth|terminal)\b/i.test(raw);
+
+if (!date) {
+  date = looksReceipt ? null : todayInTimeZone(tz);
+}
+
 
   let jobName = null;
   const forJob = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:[.?!]|$)/i);
@@ -2317,6 +2372,160 @@ function deterministicExpenseParse(input, userProfile) {
   };
 }
 
+/* ---------------- inbound helpers (drop-in) ---------------- */
+
+function normLower(s) {
+  return String(s ?? '').trim().toLowerCase();
+}
+
+// Extremely defensive extraction of "what the user meant" from Twilio payloads.
+// DO NOT assume a single shape exists.
+function getInboundText(input, twilioMeta) {
+  const direct = String(input ?? '').trim();
+
+  const meta = twilioMeta || {};
+  const resolved =
+    meta.ResolvedInboundText ??
+    meta.resolvedInboundText ??
+    meta.Body ??
+    meta.body ??
+    '';
+
+  const btn =
+    meta.ButtonPayload ??
+    meta.buttonPayload ??
+    meta.ButtonText ??
+    meta.buttonText ??
+    '';
+
+  // Prefer explicit resolved text if present, else fall back to input, else button text
+  const out = String(resolved || direct || btn || '').trim();
+  return out;
+}
+
+function isEditIntent(input, twilioMeta) {
+  const meta = twilioMeta || {};
+  const t = normLower(getInboundText(input, twilioMeta));
+  const bp = normLower(meta.ButtonPayload || meta.buttonPayload);
+  return t === 'edit' || bp === 'edit';
+}
+
+function isYesIntent(input, twilioMeta) {
+  const meta = twilioMeta || {};
+  const t = normLower(getInboundText(input, twilioMeta));
+  const bp = normLower(meta.ButtonPayload || meta.buttonPayload);
+  return t === 'yes' || t === 'y' || bp === 'yes';
+}
+
+function isCancelIntent(input, twilioMeta) {
+  const meta = twilioMeta || {};
+  const t = normLower(getInboundText(input, twilioMeta));
+  const bp = normLower(meta.ButtonPayload || meta.buttonPayload);
+  return t === 'cancel' || t === 'stop' || bp === 'cancel';
+}
+
+function isSkipIntent(input, twilioMeta) {
+  const t = normLower(getInboundText(input, twilioMeta));
+  return t === 'skip';
+}
+
+// If user is in edit-mode, these are the "control words" that should NOT be treated as edit payload.
+function isControlWord(input, twilioMeta) {
+  const t = normLower(getInboundText(input, twilioMeta));
+  return (
+    t === 'yes' ||
+    t === 'y' ||
+    t === 'edit' ||
+    t === 'cancel' ||
+    t === 'stop' ||
+    t === 'skip' ||
+    t === 'change job' ||
+    t.startsWith('job ') || // text fallback like "job 1"
+    t.startsWith('job_')    // list tokens like job_1_xxx
+  );
+}
+// --- EDIT MODE helpers (drop-in) ---
+// We store edit intent in stateManager so the next free-text message is treated as the edit payload.
+// This MUST run before handleInputWithAI(...) to avoid parsing "edit" / "" as an expense.
+
+function isSkipWord(s) {
+  const t = normLower(s);
+  return t === 'skip';
+}
+
+// Build a confirm message in plain text (fail-open). This avoids relying on interactive templates.
+function formatExpenseConfirmText(draft) {
+  const amt = draft?.amount || 'Unknown';
+  const item = draft?.item || draft?.description || 'Expense';
+  const store = draft?.store || 'Unknown Store';
+  const date = draft?.date || 'Unknown date';
+  const job = draft?.job_name || draft?.jobName || 'Unassigned';
+  const cat = draft?.category || draft?.suggestedCategory || 'Other Expenses';
+
+  return [
+    `Confirm expense`,
+    `💸 ${amt} — ${item}`,
+    `🏪 ${store}`,
+    `📅 ${date}`,
+    `🧰 ${job}`,
+    `Category: ${cat}`,
+    ``,
+    `Reply:`,
+    `"yes" to submit`,
+    `"edit" to change it`,
+    `"cancel" (or "stop") to discard`
+  ].join('\n');
+}
+
+// Parse edit payload and merge into existing draft WITHOUT losing receipt/media linkage.
+async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
+  const { handleInputWithAI, parseExpenseMessage } = require('../../utils/aiErrorHandler');
+
+  const tz = ctx?.tz || 'America/Toronto';
+
+  // IMPORTANT: Do not strip to "" before parsing — pass the user's actual message.
+  const aiRes = await handleInputWithAI(
+    ctx.fromKey,
+    editText,
+    'expense',
+    parseExpenseMessage,
+    ctx.defaultData || {},
+    { tz }
+  );
+
+  // If not confirmed, return null so caller can show aiRes.reply
+  if (!aiRes || !aiRes.confirmed || !aiRes.data) {
+    return { nextDraft: null, aiReply: aiRes?.reply || null };
+  }
+
+  const data = aiRes.data || {};
+  const nextDraft = {
+    ...(existingDraft || {}),
+
+    // Merge fields only if provided
+    amount: data.amount ?? existingDraft?.amount,
+    date: data.date ?? existingDraft?.date,
+    store: data.store ?? existingDraft?.store,
+    item: data.item ?? existingDraft?.item,
+    description: data.description ?? existingDraft?.description,
+    category: data.category ?? existingDraft?.category,
+
+    // job hint from deterministic parser
+    job_name: data.jobName ?? existingDraft?.job_name,
+    jobName: data.jobName ?? existingDraft?.jobName,
+
+    // DO NOT lose receipt/media linkage
+    media_asset_id: existingDraft?.media_asset_id || existingDraft?.mediaAssetId || null,
+    media_source_msg_id: existingDraft?.media_source_msg_id || existingDraft?.mediaSourceMsgId || null,
+
+    // DO NOT change canonical source id (the MM... confirmFlowId)
+    source_msg_id: existingDraft?.source_msg_id || existingDraft?.sourceMsgId || null
+  };
+
+  return { nextDraft, aiReply: null };
+}
+
+
 /* ---------------- main handler ---------------- */
 
 async function handleExpense(
@@ -2329,15 +2538,6 @@ async function handleExpense(
   sourceMsgId,
   twilioMeta = null
 ) {
-  input = correctTradeTerms(stripExpensePrefixes(input));
-
-  // Stable id for idempotency; prefer inbound MessageSid. Always fall back to something deterministic.
-  const stableMsgId =
-    String(sourceMsgId || '').trim() ||
-    String(userProfile?.last_message_sid || '').trim() ||
-    String(`${from}:${Date.now()}`).trim();
-
-  const safeMsgId = stableMsgId;
   // Normalize Twilio meta (req.body) if caller provided it.
   twilioMeta = twilioMeta && typeof twilioMeta === 'object' ? twilioMeta : {};
 
@@ -2346,27 +2546,181 @@ async function handleExpense(
     twilioMeta?.[String(k).toLowerCase()] ??
     twilioMeta?.[String(k).toUpperCase()] ??
     null;
-const fromRaw = from; // keep for waTo() etc if needed
-  // Build inboundTwilioMeta first
-const inboundTwilioMeta = {
-  MessageSid: getTwilio('MessageSid'),
-  OriginalRepliedMessageSid: getTwilio('OriginalRepliedMessageSid'),
-  Body: getTwilio('Body'),
-  ListId: getTwilio('ListId'),
-  ListTitle: getTwilio('ListTitle'),
-  ButtonPayload: getTwilio('ButtonPayload'),
-  WaId: getTwilio('WaId') || getTwilio('WaID') || getTwilio('waid')
-};
 
-// ✅ Canonical PA key (digits only)
-const paUserId =
-  normalizeIdentityDigits(inboundTwilioMeta?.WaId) ||
-  normalizeIdentityDigits(from) ||
-  String(from || '').trim();
+  // Build inboundTwilioMeta first (defensive)
+  const inboundTwilioMeta = {
+    MessageSid: getTwilio('MessageSid'),
+    OriginalRepliedMessageSid: getTwilio('OriginalRepliedMessageSid'),
+    Body: getTwilio('Body'),
+    ListId: getTwilio('ListId'),
+    ListTitle: getTwilio('ListTitle'),
+    ButtonPayload: getTwilio('ButtonPayload'),
+    ButtonText: getTwilio('ButtonText'),
+    WaId: getTwilio('WaId') || getTwilio('WaID') || getTwilio('waid')
+  };
 
-// ✅ If any helper still keys PAs by `from`, normalize `from` now:
-from = paUserId;
-console.info('[PA_KEY]', { from, waId: inboundTwilioMeta?.WaId, paUserId });
+  // ✅ Canonical PA key (digits only)
+  const paUserId =
+    normalizeIdentityDigits(inboundTwilioMeta?.WaId) ||
+    normalizeIdentityDigits(from) ||
+    String(from || '').trim();
+
+  // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
+  // This must see resolved text / button payload / body.
+  const rawInboundText = getInboundText(input, twilioMeta);
+  const inboundLower = normLower(rawInboundText);
+
+  // Stable id for idempotency; prefer inbound MessageSid. Always fall back to something deterministic.
+  const stableMsgId =
+    String(sourceMsgId || '').trim() ||
+    String(inboundTwilioMeta?.MessageSid || '').trim() ||
+    String(userProfile?.last_message_sid || '').trim() ||
+    String(`${from}:${Date.now()}`).trim();
+
+  const safeMsgId = stableMsgId;
+  const fromRaw = from;
+
+  // ✅ If any helper still keys PAs by `from`, normalize `from` now:
+  from = paUserId;
+  console.info('[PA_KEY]', { from, waId: inboundTwilioMeta?.WaId, paUserId });
+
+  // --------------------------------------------------------------------
+// EARLY: EDIT state machine (must run BEFORE any parsing)
+// --------------------------------------------------------------------
+let pendingTxState = null;
+try {
+  pendingTxState = await getPendingTransactionState(paUserId);
+} catch {
+  pendingTxState = null; // fail-open
+}
+
+const inEditMode =
+  !!(pendingTxState &&
+     pendingTxState.kind === 'expense' &&
+     (pendingTxState.edit_mode || pendingTxState.confirmDraft?.awaiting_edit));
+
+const editIntent = isEditIntent(rawInboundText, twilioMeta);
+
+// (1) User pressed Edit button / typed "edit" -> enter edit mode and prompt for corrected details
+if (editIntent && !inEditMode) {
+  try {
+    const existingDraft = pendingTxState?.confirmDraft || pendingTxState?.draft || {};
+    await mergePendingTransactionState(paUserId, {
+      kind: 'expense',
+      edit_mode: true,
+      edit_started_at: Date.now(),
+      confirmDraft: { ...existingDraft, awaiting_edit: true }
+    });
+  } catch {}
+
+  const msg = [
+    '✏️ Okay — send the corrected expense details in ONE message.',
+    'Example:',
+    'expense $13.21 spray foam insulation from Home Hardware on Sept 27 2025',
+    'Reply "cancel" to discard.'
+  ].join('\n');
+
+  if (typeof twimlText === 'function') return twimlText(msg);
+  return msg;
+}
+
+// (2) If we are in edit mode, treat next free-text as the edit payload (NOT as a new expense)
+if (inEditMode) {
+  // Allow control words to behave normally
+  if (isCancelIntent(rawInboundText, twilioMeta) || isSkipIntent(rawInboundText, twilioMeta) || editIntent) {
+    if (editIntent) {
+      const msg = [
+        '✏️ Send the corrected expense details in ONE message.',
+        'Example: expense $13.21 spray foam insulation from Home Hardware on Sept 27 2025'
+      ].join('\n');
+      if (typeof twimlText === 'function') return twimlText(msg);
+      return msg;
+    }
+
+    // Cancel -> exit edit mode (downstream cancel logic may also run later)
+    if (isCancelIntent(rawInboundText, twilioMeta)) {
+      try {
+        await mergePendingTransactionState(paUserId, {
+          kind: 'expense',
+          edit_mode: false,
+          edit_started_at: null,
+          confirmDraft: { ...(pendingTxState?.confirmDraft || {}), awaiting_edit: false }
+        });
+      } catch {}
+      // fall through to your existing cancel handling if any
+    }
+
+    // Skip -> exit edit mode but keep draft pending
+    if (isSkipIntent(rawInboundText, twilioMeta)) {
+      try {
+        await mergePendingTransactionState(paUserId, {
+          kind: 'expense',
+          edit_mode: false,
+          edit_started_at: null,
+          confirmDraft: { ...(pendingTxState?.confirmDraft || {}), awaiting_edit: false }
+        });
+      } catch {}
+      const msg = 'Okay — leaving that expense pending. What do you want to do next?';
+      if (typeof twimlText === 'function') return twimlText(msg);
+      return msg;
+    }
+  }
+
+  // Consume this message as the edit payload
+  const existingDraft = pendingTxState?.confirmDraft || pendingTxState?.draft || {};
+
+  const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(rawInboundText, existingDraft, {
+    fromKey: paUserId,
+    tz: userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto',
+    defaultData: {} // keep empty; your draft already carries job/media context
+  });
+
+  if (!nextDraft) {
+    const msg = aiReply || 'I couldn’t understand that edit. Please resend with amount + date.';
+    if (typeof twimlText === 'function') return twimlText(msg);
+    return msg;
+  }
+
+  // Persist updated draft and exit edit mode (stateManager)
+  try {
+    await mergePendingTransactionState(paUserId, {
+      kind: 'expense',
+      edit_mode: false,
+      edit_started_at: null,
+      confirmDraft: { ...nextDraft, awaiting_edit: false }
+    });
+  } catch {}
+
+  // ✅ ALSO persist into pending-actions confirm draft so YES submits the edited data
+  try {
+    const confirmPA0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    if (confirmPA0?.payload?.draft) {
+      await upsertPA({
+        ownerId,
+        userId: paUserId,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPA0.payload || {}),
+          draft: { ...(confirmPA0.payload.draft || {}), ...nextDraft, awaiting_edit: false }
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+
+      // optional: refresh local confirmPA if later code uses it
+      // confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    }
+  } catch {}
+
+  // Re-confirm using fail-open plain text (no templates required)
+  const confirmMsg = formatExpenseConfirmText(nextDraft);
+  if (typeof twimlText === 'function') return twimlText(confirmMsg);
+  return confirmMsg;
+}
+
+// ---- from here on, continue with your existing handler logic ----
+// Now it is safe to normalize the input for "new expense" parsing.
+input = correctTradeTerms(stripExpensePrefixes(rawInboundText));
+
 
 // ---- media linkage (function-scope) ----
 // Allows deterministic/AI confirm drafts to carry media_asset_id into YES.
@@ -2417,8 +2771,6 @@ try {
   console.warn('[EXPENSE] maybeReparseConfirmDraftExpense precheck failed (ignored):', e?.message);
 }
 
-
-  
 
 async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMediaAssetId }) {
   // 1) Draft direct
@@ -3029,7 +3381,8 @@ if (confirmPA?.payload?.draft) {
     return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
   }
 
-  const token = normalizeDecisionToken(input);
+  const token = normalizeDecisionToken(rawInboundText);
+
 
  // 🔁 Change Job (keep confirm PA)
 if (token === 'change_job') {

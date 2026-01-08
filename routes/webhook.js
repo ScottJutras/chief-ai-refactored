@@ -134,8 +134,13 @@ function looksLikeJobPickerReplyToken(raw) {
 }
 
 function pendingTxnNudgeMessage(pending) {
-  // If user is mid-edit, do not nag. The next message should be treated as the edit payload.
-  if (pending?.confirmDraft?.awaiting_edit) return null;
+  // If user is mid-edit, do not nag. Next message should be treated as edit payload.
+  const awaitingEdit =
+    !!pending?.edit_mode ||
+    !!pending?.confirmDraft?.awaiting_edit ||
+    !!pending?.confirmDraft?.awaitingEdit;
+
+  if (awaitingEdit) return null;
 
   const type = pending?.type || pending?.kind || 'entry';
   return `It looks like you still have a pending ${type}.
@@ -929,32 +934,39 @@ router.post('*', async (req, res, next) => {
     const hasExpensePendingActions = !!expensePA.hasAny;
 
     /* ------------------------------------------------------------
-     * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
-     * ------------------------------------------------------------ */
-    const pendingRevenueFlow =
-      !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
+ * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
+ * ------------------------------------------------------------ */
+const pendingRevenueFlow =
+  !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
 
-    const pendingExpenseFlowLegacy =
-      !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
+const pendingExpenseFlowLegacy =
+  !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
 
-    const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
+const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
 
-    const allowJobPickerThrough =
-      (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
+const allowJobPickerThrough =
+  (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
 
-    if (pendingRevenueFlow) {
-      if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
-      if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
-        return ok(res, pendingTxnNudgeMessage({ type: 'revenue' }));
-      }
-    }
+if (pendingRevenueFlow) {
+  if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
 
-    if (pendingExpenseFlow) {
-      if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
-      if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
-        return ok(res, pendingTxnNudgeMessage({ type: 'expense' }));
-      }
-    }
+  if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+    const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'revenue' });
+    if (msg) return ok(res, msg);
+    // if msg is null (mid-edit), do NOT nag; fall through
+  }
+}
+
+if (pendingExpenseFlow) {
+  if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
+
+  if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+    const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
+    if (msg) return ok(res, msg);
+    // if msg is null (mid-edit), do NOT nag; fall through
+  }
+}
+
 
     /* -----------------------------------------------------------------------
      * Media follow-up: if prior step set pendingMedia and this is text-only

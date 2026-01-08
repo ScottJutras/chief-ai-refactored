@@ -93,20 +93,40 @@ function moneyToFixed(amountStr) {
 function extractMoneyToken(text) {
   const s = String(text || '');
 
-  let m = s.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
-  if (m?.[1]) return m[1];
+  // If token is part of a hyphenated id like "1852-4" or "22428-..." ignore it.
+  // Prefer values with decimals (real totals) and explicit $.
+  const isBadIdContext = (idx, len) => {
+    const left = s.slice(Math.max(0, idx - 2), idx);
+    const right = s.slice(idx + len, Math.min(s.length, idx + len + 2));
+    return left.includes('-') || right.includes('-') || left.includes('/') || right.includes('/');
+  };
 
-  m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?)\b/);
-  if (m?.[1]) return m[1];
+  // 1) Strong: explicit $ with decimals
+  let m = [...s.matchAll(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*\.[0-9]{2})/g)];
+  for (const mm of m) {
+    const token = mm[1];
+    if (!token) continue;
+    if (isBadIdContext(mm.index ?? 0, mm[0].length)) continue;
+    return token;
+  }
 
-  m = s.match(/\b([0-9]{4,}(?:\.[0-9]{1,2})?)\b/);
-  if (m?.[1]) return m[1];
+  // 2) Next: numbers with decimals (no $), but avoid big invoice-like numbers by requiring <= 6 digits before dot
+  m = [...s.matchAll(/\b([0-9]{1,6}\.[0-9]{2})\b/g)];
+  for (const mm of m) {
+    const token = mm[1];
+    if (!token) continue;
+    if (isBadIdContext(mm.index ?? 0, mm[0].length)) continue;
+    return token;
+  }
 
-  m = s.match(/\b([0-9]{1,3}\.[0-9]{1,2})\b/);
+  // 3) Avoid: plain 4+ digit integers (addresses / invoice numbers). Only allow <= 3 digits integer without decimals.
+  m = s.match(/\b([0-9]{1,3})\b/);
   if (m?.[1]) return m[1];
 
   return null;
 }
+
+
 
 function extractTimePhrase(text) {
   const s = String(text || '').toLowerCase();
@@ -237,7 +257,12 @@ function tryParseExpense(text) {
   const amount = moneyToFixed(token);
   if (!amount) return null;
 
-  const date = parseNaturalDateLoose(s) || todayIso();
+  // For OCR/receipt-ish blobs: do NOT invent a date.
+// Trust over cleverness — let the confirm flow ask or let user edit.
+const looksReceiptish = /\b(total|subtotal|hst|gst|pst|tax|balance|visa|debit)\b/i.test(s) || /\n/.test(String(text || ''));
+const parsedDate = parseNaturalDateLoose(s);
+const date = looksReceiptish ? (parsedDate || null) : (parsedDate || todayIso());
+
 
   let store = s.match(/\b(?:at|from)\s+(.+?)(?:\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i)?.[1] || null;
   store = store ? titleCase(sanitizeName(store)) : 'Unknown Store';
@@ -279,7 +304,18 @@ function tryParseRevenue(text) {
   const amount = moneyToFixed(token);
   if (!amount) return null;
 
-  const date = parseNaturalDateLoose(s) || todayIso();
+    const looksReceipt =
+    /\breceipt\b/.test(lc) ||
+    /\b(subtotal|total|hst|gst|pst|tax|visa|mastercard|debit|credit)\b/.test(lc);
+
+  const parsedDate = parseNaturalDateLoose(s);
+
+  // ✅ For receipt-like messages, do NOT assume "today" if date is missing.
+  // Let upstream ask a clarifying question instead of inventing a date.
+  const date = looksReceipt ? parsedDate : (parsedDate || todayIso());
+
+  if (looksReceipt && !date) return null;
+
 
   let jobName = null;
   const forMatch = s.match(/\bfor\s+(.+?)(?:\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i);

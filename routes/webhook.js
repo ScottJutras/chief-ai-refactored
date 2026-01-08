@@ -986,10 +986,10 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
     // ✅ Option A: check pending_actions FIRST (so job picker tokens go to expense.js, not job.js)
     const expensePA = await hasExpensePA(req.ownerId, req.from);
     const hasExpensePendingActions = !!expensePA.hasAny;
-
-    /* ------------------------------------------------------------
+/* ------------------------------------------------------------
  * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
  * ------------------------------------------------------------ */
+
 const pendingRevenueFlow =
   !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
 
@@ -997,6 +997,9 @@ const pendingExpenseFlowLegacy =
   !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
 
 const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
+
+// ✅ If user said "skip" in expense.js, we allow new commands/messages to proceed without nagging.
+const allowNewWhilePendingExpense = !!pending?.allow_new_while_pending;
 
 const allowJobPickerThrough =
   (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
@@ -1014,13 +1017,15 @@ if (pendingRevenueFlow) {
 if (pendingExpenseFlow) {
   if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
 
-  if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
-    const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
-    if (msg) return ok(res, msg);
-    // msg null => mid-edit; do NOT nag; fall through
+  // ✅ Key change: if allowNewWhilePendingExpense, do NOT nag/block — let message proceed
+  if (!allowNewWhilePendingExpense) {
+    if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+      const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
+      if (msg) return ok(res, msg);
+      // msg null => mid-edit; do NOT nag; fall through
+    }
   }
 }
-
 
 
     /* -----------------------------------------------------------------------

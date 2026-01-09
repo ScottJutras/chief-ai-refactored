@@ -503,22 +503,30 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
   const draft = confirmPA?.payload?.draft;
   if (!draft || !draft.needsReparse) return confirmPA;
 
-  const sourceText = String(draft?.originalText || draft?.draftText || '').trim();
+  // ✅ Receipt/OCR-first source text (critical)
+  const sourceText = String(
+    draft?.receiptText ||
+      draft?.ocrText ||
+      draft?.extractedText ||
+      draft?.originalText ||
+      draft?.draftText ||
+      ''
+  ).trim();
+
   if (!sourceText) {
-    // nothing to reparse; just clear the flag to avoid loops
-    await upsertPA({
-      ownerId,
-      userId: paUserId,
-      kind: PA_KIND_CONFIRM,
-      payload: { ...(confirmPA.payload || {}), draft: { ...(draft || {}), needsReparse: false } },
-      ttlSeconds: PA_TTL_SEC
-    });
-    return await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    // Nothing to reparse — DO NOT clear needsReparse (keeps the system honest)
+    console.warn('[EXPENSE_REPARSE] no sourceText; leaving needsReparse=true', { paUserId });
+    return confirmPA;
   }
 
-  // Re-run the *existing* parser on the OCR source text.
+  // Re-run your existing parser on the receipt/OCR source text.
   // IMPORTANT: keep job fields as-is (job choice must win).
-  const parsed = await parseExpenseMessage(sourceText, { tz }).catch(() => ({}));
+  let parsed = {};
+  try {
+    parsed = (await parseExpenseMessage(sourceText, { tz })) || {};
+  } catch {
+    parsed = {};
+  }
 
   const jobFields = {
     jobName: draft.jobName ?? null,
@@ -527,35 +535,49 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     job_id: draft.job_id ?? null
   };
 
-  const merged = {
-    ...(draft || {}),
-    ...(parsed || {}),
-    ...jobFields,
-    // keep media linkage if you store it in the draft
-    media_asset_id: draft.media_asset_id ?? parsed?.media_asset_id ?? null,
-    media_source_msg_id: draft.media_source_msg_id ?? parsed?.media_source_msg_id ?? null,
-    needsReparse: false
-  };
+  // ✅ Merge but never clobber existing values with nulls
+  const mergedDraft = mergeDraftNonNull(
+    {
+      ...(draft || {}),
+      ...jobFields,
+
+      // keep media linkage
+      media_asset_id: draft?.media_asset_id ?? null,
+      media_source_msg_id: draft?.media_source_msg_id ?? null
+    },
+    {
+      ...(parsed || {}),
+      ...jobFields
+    }
+  );
 
   // Normalize receipt-safe fields now (TOTAL/date/store)
-  const normalized = normalizeExpenseData(merged, userProfile, sourceText);
+  const normalized = normalizeExpenseData(mergedDraft, userProfile, sourceText);
+
+  // ✅ Only clear needsReparse if we got minimum viable fields
+  const gotAmount = !!String(normalized?.amount || '').trim() && String(normalized.amount).trim() !== '$0.00';
+  const gotDate = !!String(normalized?.date || '').trim();
+
+  normalized.needsReparse = !(gotAmount && gotDate);
 
   await upsertPA({
     ownerId,
     userId: paUserId,
     kind: PA_KIND_CONFIRM,
     payload: {
-      ...(confirmPA.payload || {}),
+      ...(confirmPA?.payload || {}),
       draft: normalized
     },
     ttlSeconds: PA_TTL_SEC
   });
 
-  console.info('[EXPENSE_REPARSE_AFTER_JOB_CHANGE]', {
+  console.info('[EXPENSE_REPARSE_RESULT]', {
     paUserId,
+    needsReparse: !!normalized.needsReparse,
     amount: normalized?.amount || null,
     date: normalized?.date || null,
-    store: normalized?.store || null
+    store: normalized?.store || null,
+    currency: normalized?.currency || null
   });
 
   return await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
@@ -3686,87 +3708,68 @@ if (confirmPA?.payload?.draft) {
     }
 
     // ✅ Yes (HARDENED)
-    if (token === 'yes') {
-      const userKey = String(paUserId || '').trim() || String(from || '').trim();
+if (token === 'yes') {
+  const userKey = String(paUserId || '').trim() || String(from || '').trim();
 
-      console.info('[YES_RECEIVED]', {
-        userId: userKey,
-        hasConfirmDraft: !!confirmPA?.payload?.draft,
-        paSourceMsgId: confirmPA?.payload?.sourceMsgId || null,
-        inboundYesMsgId: stableMsgId || null
-      });
+  // ✅ High-signal check: prove whether CONFIRM PA exists at YES time
+  let confirmSnap = null;
+  try {
+    confirmSnap = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    console.info('[YES_HANDLER_CONFIRM_PA]', {
+      paUserId,
+      hasConfirm: !!confirmSnap,
+      hasDraft: !!confirmSnap?.payload?.draft,
+      paSourceMsgId: confirmSnap?.payload?.sourceMsgId || null,
+      amount: confirmSnap?.payload?.draft?.amount || null,
+      date: confirmSnap?.payload?.draft?.date || null,
+      store: confirmSnap?.payload?.draft?.store || null,
+      currency: confirmSnap?.payload?.draft?.currency || null
+    });
+  } catch (e) {
+    console.warn('[YES_HANDLER_CONFIRM_PA] read failed (ignored):', e?.message);
+  }
 
-      const rawDraft = { ...(confirmPA?.payload?.draft || {}) };
+  // ✅ Prefer freshest confirm PA (avoid stale confirmPA var)
+  const confirmPAFresh = confirmSnap || confirmPA;
 
-      // ✅ Use the CONFIRM flow id as the canonical "source msg id" for this expense write
-      const txSourceMsgId =
-        String(confirmPA?.payload?.sourceMsgId || '').trim() ||
-        String(stableMsgId || '').trim() ||
-        null;
+  console.info('[YES_RECEIVED]', {
+    userId: userKey,
+    hasConfirmDraft: !!confirmPAFresh?.payload?.draft,
+    paSourceMsgId: confirmPAFresh?.payload?.sourceMsgId || null,
+    inboundYesMsgId: stableMsgId || null
+  });
 
-      // ✅ Provide resolver a deterministic DB key even if pending state is empty
-      if (!rawDraft.media_source_msg_id && txSourceMsgId) {
-        rawDraft.media_source_msg_id = `${userKey}:${txSourceMsgId}`;
-      } else if (rawDraft.media_source_msg_id) {
-        const ms = String(rawDraft.media_source_msg_id || '').trim();
-        if (ms && !ms.includes(':')) rawDraft.media_source_msg_id = `${userKey}:${ms}`;
-      }
+  const rawDraft = { ...(confirmPAFresh?.payload?.draft || {}) };
 
-      // Optional: one-line proof at YES time (helps catch state-key mismatches)
-      try {
-        const pendingSnap = await getPendingTransactionState(userKey);
-        console.info('[YES_PENDING_SNAPSHOT]', {
-          userKey,
-          pending_has: !!pendingSnap,
-          pending_media_asset_id: pendingSnap?.pendingMediaMeta?.media_asset_id || null,
-          pending_source_msg_id: pendingSnap?.pendingMediaMeta?.source_msg_id || pendingSnap?.mediaSourceMsgId || null
-        });
-      } catch {}
+  // ✅ Canonical source msg id for this expense write
+  const txSourceMsgId =
+    String(confirmPAFresh?.payload?.sourceMsgId || '').trim() ||
+    String(stableMsgId || '').trim() ||
+    null;
 
-      // ✅ Resolve media asset id (draft -> flow -> pending -> DB)
-      const mediaAssetId = await resolveMediaAssetIdForFlow({
-        ownerId,
-        userKey,
-        rawDraft,
-        flowMediaAssetId
-      });
+  // ✅ Provide resolver a deterministic DB key even if pending state is empty
+  if (!rawDraft.media_source_msg_id && txSourceMsgId) {
+    rawDraft.media_source_msg_id = `${userKey}:${txSourceMsgId}`;
+  } else if (rawDraft.media_source_msg_id) {
+    const ms = String(rawDraft.media_source_msg_id || '').trim();
+    if (ms && !ms.includes(':')) rawDraft.media_source_msg_id = `${userKey}:${ms}`;
+  }
 
-      console.info('[YES_DRAFT_MEDIA_DEBUG]', {
-        draft_media_asset_id: rawDraft?.media_asset_id || null,
-        draft_media_source_msg_id: rawDraft?.media_source_msg_id || null,
-        flowMediaAssetId: flowMediaAssetId || null,
-        resolved_media_asset_id: mediaAssetId || null,
-        txSourceMsgId: txSourceMsgId || null
-      });
-
-      // Never allow numeric job_id to be written into tx.job_id
-      const rawJobId =
-        rawDraft?.job_id ?? rawDraft?.jobId ?? rawDraft?.job?.id ?? rawDraft?.job?.job_id ?? null;
-
-      if (rawJobId != null && /^\d+$/.test(String(rawJobId).trim())) {
-        console.warn('[EXPENSE] refusing numeric job id; forcing null', { job_id: rawJobId });
-        if (rawDraft.job && typeof rawDraft.job === 'object') rawDraft.job.id = null;
-        rawDraft.job_id = null;
-        rawDraft.jobId = null;
-      }
-
-      const maybeJobId = rawJobId != null && looksLikeUuid(String(rawJobId)) ? String(rawJobId).trim() : null;
-
-      // ✅ Receipt/OCR-first source text for receipt-safe amount/date/store extraction
-      const sourceText = String(
-        confirmPA?.payload?.receiptText ||
-          confirmPA?.payload?.ocrText ||
-          confirmPA?.payload?.extractedText ||
-          rawDraft?.receiptText ||
-          rawDraft?.ocrText ||
-          rawDraft?.extractedText ||
-          rawDraft?.media_transcript ||
-          rawDraft?.mediaTranscript ||
-          rawDraft?.originalText ||
-          rawDraft?.draftText ||
-          rawDraft?.text ||
-          ''
-      ).trim();
+  // ✅ Receipt/OCR-first source text for receipt-safe amount/date/store extraction
+  const sourceText = String(
+    confirmPAFresh?.payload?.receiptText ||
+      confirmPAFresh?.payload?.ocrText ||
+      confirmPAFresh?.payload?.extractedText ||
+      rawDraft?.receiptText ||
+      rawDraft?.ocrText ||
+      rawDraft?.extractedText ||
+      rawDraft?.media_transcript ||
+      rawDraft?.mediaTranscript ||
+      rawDraft?.originalText ||
+      rawDraft?.draftText ||
+      rawDraft?.text ||
+      ''
+  ).trim();
 
       let data = normalizeExpenseData(rawDraft, userProfile, sourceText);
 
@@ -3841,149 +3844,238 @@ if (confirmPA?.payload?.draft) {
 // (Confirm PA remains untouched and can be resumed later.)
 
 
-    /* ---- 3) New expense parse (deterministic first) ---- */
+ /* ---- 3) New expense parse (deterministic first) ---- */
 
-// ✅ If this looks like receipt/OCR text, do NOT run generic deterministic parsing here.
-// Receipt parsing is handled in mediaParser + confirm reparse pipeline.
-const backstop = looksLikeReceiptText(input) ? null : deterministicExpenseParse(input, userProfile);
-
-if (backstop && backstop.amount) {
-  const sourceText0 = String(backstop?.originalText || backstop?.draftText || input || '').trim();
-  const data0 = normalizeExpenseData(backstop, userProfile, sourceText0);
-
-  data0.store = await normalizeVendorName(ownerId, data0.store);
-
-  if (isUnknownItem(data0.item)) {
-    const inferred = inferExpenseItemFallback(input);
-    if (inferred) data0.item = inferred;
-  }
-
-  let category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
-  category = category && String(category).trim() ? String(category).trim() : null;
-
-  let jobName = data0.jobName || null;
-  let jobSource = jobName ? 'typed' : null;
-
-  if (!jobName) {
-    jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-    if (jobName) jobSource = 'active';
-  }
-
-  if (jobName && looksLikeOverhead(jobName)) {
-    jobName = 'Overhead';
-    jobSource = 'overhead';
-  }
-
-  if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
-
-  // Use the message that triggered this confirm as the PA source (prefer stableMsgId)
-  const safeMsgId = String(stableMsgId || '').trim() || String(safeMsgId || '').trim() || null;
-
-  await upsertPA({
-    ownerId,
-    userId: paUserId,
-    kind: PA_KIND_CONFIRM,
-    payload: {
-      draft: {
-        ...data0,
-        jobName,
-        jobSource,
-        suggestedCategory: category,
-        job_id: null,
-        job_no: null,
-
-        // ✅ carry the resolved link into the draft now
-        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-
-        // ✅ strongest possible DB fallback key (matches media_assets.source_msg_id format)
-        media_source_msg_id: safeMsgId
-          ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
-          : null,
-
-        originalText: input,
-        draftText: input
-      },
-      sourceMsgId: safeMsgId,
-      type: 'expense'
-    },
-    ttlSeconds: PA_TTL_SEC
-  });
-
-  // ✅ A3 One-shot reset: we just created a NEW confirm draft, so stop "allow new while pending"
-  // (skip-mode is only for allowing the next intake to start; once it starts, turn it off)
+// ✅ Receipt/OCR path: seed/patch CONFIRM PA so "Yes" has something real to submit.
+// IMPORTANT: do NOT run deterministicExpenseParse on receipt blobs.
+if (looksLikeReceiptText(input)) {
   try {
-    const pendingNow = await getPendingTransactionState(paUserId);
-    if (pendingNow?.allow_new_while_pending) {
-      await mergePendingTransactionState(paUserId, {
-        allow_new_while_pending: false,
-        allow_new_set_at: null
-      });
-      console.info('[ALLOW_NEW_WHILE_PENDING_RESET]', { paUserId });
+    // If your router prepends "expense " before OCR text, strip it here.
+    const receiptText = stripExpensePrefixes(String(input || '')).trim();
+
+    const back = parseReceiptBackstop(receiptText);
+
+    // Even if backstop fails, still store receiptText into the draft so reparsers have it.
+    const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    const draft0 = c0?.payload?.draft || {};
+
+    const txSourceMsgId =
+      String(c0?.payload?.sourceMsgId || '').trim() ||
+      String(stableMsgId || '').trim() ||
+      null;
+
+    const userKey = String(paUserId || '').trim() || String(from || '').trim();
+
+    const patch = {
+      // Parsed receipt fields (only if we got them)
+      store: back?.store || null,
+      date: back?.dateIso || null,
+      amount: back?.total != null ? String(Number(back.total).toFixed(2)) : null,
+      currency: back?.currency || null,
+
+      // ✅ Always keep the raw receipt blob available for YES + reparsers
+      receiptText,
+      ocrText: receiptText,
+      extractedText: receiptText,
+
+      // Preserve any existing originalText/draftText if already present
+      originalText: draft0.originalText || receiptText,
+      draftText: draft0.draftText || receiptText
+    };
+
+    const mergedDraft = mergeDraftNonNull(draft0, patch);
+
+    // ✅ Ensure media_source_msg_id is always in "userKey:msgId" format
+    if (!mergedDraft.media_source_msg_id && txSourceMsgId) {
+      mergedDraft.media_source_msg_id = `${userKey}:${txSourceMsgId}`;
+    } else if (mergedDraft.media_source_msg_id) {
+      const ms = String(mergedDraft.media_source_msg_id || '').trim();
+      if (ms && !ms.includes(':')) mergedDraft.media_source_msg_id = `${userKey}:${ms}`;
     }
-  } catch {}
 
-  const paChk = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-  console.info('[CONFIRM_PA_AFTER_UPSERT]', {
-    hasDraft: !!paChk?.payload?.draft,
-    userId: paUserId,
-    sourceMsgId: paChk?.payload?.sourceMsgId || null
-  });
+    // ✅ Carry resolved media link (best effort)
+    mergedDraft.media_asset_id =
+      mergedDraft.media_asset_id ||
+      resolvedFlowMediaAssetId ||
+      flowMediaAssetId ||
+      null;
 
-  // one-time sanity check: confirm app DB has media_assets rows for this owner
-  try {
-    const dbChk = await pg.query(
-      `select count(*)::int as n from public.media_assets where owner_id=$1`,
-      [String(ownerId || '').trim()]
-    );
-    console.info('[MEDIA_ASSETS_COUNT]', {
-      ownerId: String(ownerId || '').trim(),
-      n: dbChk?.rows?.[0]?.n ?? null
+    const gotAmount = !!String(mergedDraft.amount || '').trim();
+    const gotDate = !!String(mergedDraft.date || '').trim();
+
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(c0?.payload || {}),
+        type: 'expense',
+        sourceMsgId: txSourceMsgId,
+        draft: {
+          ...mergedDraft,
+          // ✅ Keep dirty until minimum viable fields exist
+          needsReparse: !(gotAmount && gotDate)
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    console.info('[RECEIPT_SEED_CONFIRM_PA]', {
+      paUserId,
+      sourceMsgId: txSourceMsgId,
+      store: mergedDraft.store || null,
+      date: mergedDraft.date || null,
+      amount: mergedDraft.amount || null,
+      currency: mergedDraft.currency || null,
+      needsReparse: !(gotAmount && gotDate),
+      media_asset_id: mergedDraft.media_asset_id || null
     });
   } catch (e) {
-    console.warn('[MEDIA_ASSETS_COUNT] failed (ignored):', e?.message);
+    console.warn('[RECEIPT_SEED_CONFIRM_PA] failed (ignored):', e?.message);
   }
 
-  if (!jobName) {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-    return await sendJobPickList({
-      from,
+  // ✅ Hard stop: do NOT run deterministic parse on receipt blobs.
+  // Let the rest of your pipeline (or reparse) drive confirmation.
+  // If you want to immediately send a confirm card here, you can,
+  // but default is: fall through to AI parsing fallback (section 4) or later logic.
+} else {
+  // ✅ Non-receipt path: deterministic parse first
+  const backstop = deterministicExpenseParse(input, userProfile);
+
+  if (backstop && backstop.amount) {
+    const sourceText0 = String(backstop?.originalText || backstop?.draftText || input || '').trim();
+    const data0 = normalizeExpenseData(backstop, userProfile, sourceText0);
+
+    data0.store = await normalizeVendorName(ownerId, data0.store);
+
+    if (isUnknownItem(data0.item)) {
+      const inferred = inferExpenseItemFallback(input);
+      if (inferred) data0.item = inferred;
+    }
+
+    let category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
+    category = category && String(category).trim() ? String(category).trim() : null;
+
+    let jobName = data0.jobName || null;
+    let jobSource = jobName ? 'typed' : null;
+
+    if (!jobName) {
+      jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+      if (jobName) jobSource = 'active';
+    }
+
+    if (jobName && looksLikeOverhead(jobName)) {
+      jobName = 'Overhead';
+      jobSource = 'overhead';
+    }
+
+    if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
+
+    const safeMsgId = String(stableMsgId || '').trim() || null;
+
+    await upsertPA({
       ownerId,
-      userProfile,
-      confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-      jobOptions: jobs,
-      paUserId,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft: {
-        ...data0,
-        jobName: null,
-        jobSource: null,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        draft: {
+          ...data0,
+          jobName,
+          jobSource,
+          suggestedCategory: category,
+          job_id: null,
+          job_no: null,
 
-        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-        media_source_msg_id: safeMsgId
-          ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
-          : null,
+          media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+          media_source_msg_id: safeMsgId
+            ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+            : null,
 
-        originalText: input,
-        draftText: input
-      }
+          originalText: input,
+          draftText: input
+        },
+        sourceMsgId: safeMsgId,
+        type: 'expense'
+      },
+      ttlSeconds: PA_TTL_SEC
     });
+
+    // ✅ A3 One-shot reset: we just created a NEW confirm draft, so stop "allow new while pending"
+    try {
+      const pendingNow = await getPendingTransactionState(paUserId);
+      if (pendingNow?.allow_new_while_pending) {
+        await mergePendingTransactionState(paUserId, {
+          allow_new_while_pending: false,
+          allow_new_set_at: null
+        });
+        console.info('[ALLOW_NEW_WHILE_PENDING_RESET]', { paUserId });
+      }
+    } catch {}
+
+    const paChk = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    console.info('[CONFIRM_PA_AFTER_UPSERT]', {
+      hasDraft: !!paChk?.payload?.draft,
+      userId: paUserId,
+      sourceMsgId: paChk?.payload?.sourceMsgId || null
+    });
+
+    // one-time sanity check: confirm app DB has media_assets rows for this owner
+    try {
+      const dbChk = await pg.query(
+        `select count(*)::int as n from public.media_assets where owner_id=$1`,
+        [String(ownerId || '').trim()]
+      );
+      console.info('[MEDIA_ASSETS_COUNT]', {
+        ownerId: String(ownerId || '').trim(),
+        n: dbChk?.rows?.[0]?.n ?? null
+      });
+    } catch (e) {
+      console.warn('[MEDIA_ASSETS_COUNT] failed (ignored):', e?.message);
+    }
+
+    if (!jobName) {
+      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+      return await sendJobPickList({
+        from,
+        ownerId,
+        userProfile,
+        confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+        jobOptions: jobs,
+        paUserId,
+        page: 0,
+        pageSize: 8,
+        context: 'expense_jobpick',
+        confirmDraft: {
+          ...data0,
+          jobName: null,
+          jobSource: null,
+
+          media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+          media_source_msg_id: safeMsgId
+            ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+            : null,
+
+          originalText: input,
+          draftText: input
+        }
+      });
+    }
+
+    const summaryLine = buildExpenseSummaryLine({
+      amount: data0.amount,
+      item: data0.item,
+      store: data0.store,
+      date: data0.date,
+      jobName,
+      tz, // ✅ uses existing tz in outer scope
+      sourceText: input
+    });
+
+    console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
+    return await sendConfirmExpenseOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
   }
-
-  const summaryLine = buildExpenseSummaryLine({
-    amount: data0.amount,
-    item: data0.item,
-    store: data0.store,
-    date: data0.date,
-    jobName,
-    tz,
-    sourceText: input
-  });
-
-  console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
-  return await sendConfirmExpenseOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
 }
+
 
 
     /* ---- 4) AI parsing fallback ---- */

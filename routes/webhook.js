@@ -970,7 +970,7 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
       return ok(
         res,
         `Got it — send the corrected ${promptKind} like:\n` +
-          `${promptKind} $13.21 spray foam insulation on 2025-09-27`
+          `${promptKind} $14.21 spray foam insulation on 2025-09-27`
       );
     }
 

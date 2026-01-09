@@ -2232,6 +2232,71 @@ function normalizeDashes(s) {
     .replace(/\s+/g, ' ')
     .trim();
 }
+function parseReceiptBackstop(ocrText) {
+  const t = normalizeDashes(String(ocrText || '')).replace(/\s+/g, ' ').trim();
+  if (!t) return null;
+
+  // Store guess: first line-ish with "Home Hardware" etc
+  let store = null;
+  const storeHints = [
+    /home hardware/i,
+    /home\s+building\s+centre/i,
+    /building\s+centre/i,
+    /rona/i,
+    /home\s+depot/i,
+    /lowe'?s/i
+  ];
+  for (const re of storeHints) {
+    const m = t.match(re);
+    if (m) {
+      // grab a small window around the match
+      const i = Math.max(0, m.index - 20);
+      store = t.slice(i, i + 60).trim();
+      break;
+    }
+  }
+
+  // Date: support MM/DD/YYYY and also your shown "01/07/2026"
+  let dateIso = null;
+  const mdY = t.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
+  if (mdY) {
+    const mm = mdY[1], dd = mdY[2], yyyy = mdY[3];
+    dateIso = `${yyyy}-${mm}-${dd}`;
+  } else {
+    const ymd = t.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+    if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+  }
+
+  // Total: prefer explicit "Total"
+  let total = null;
+  const totalLine =
+    t.match(/\btotal\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
+    t.match(/\bdebit\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
+    null;
+
+  if (totalLine?.[1]) {
+    total = Number(String(totalLine[1]).replace(/,/g, ''));
+    if (!Number.isFinite(total)) total = null;
+  }
+
+  // Currency (optional): CAD, USD, etc
+  let currency = null;
+  const cur = t.match(/\b(CAD|USD|EUR|GBP)\b/i);
+  if (cur?.[1]) currency = cur[1].toUpperCase();
+
+  if (!total && !dateIso && !store) return null;
+
+  return { total, dateIso, store, currency };
+}
+
+function mergeDraftNonNull(dst, patch) {
+  const out = { ...(dst || {}) };
+  for (const [k, v] of Object.entries(patch || {})) {
+    if (v === null || v === undefined || v === '') continue;
+    out[k] = v;
+  }
+  return out;
+}
 
 
 
@@ -2602,7 +2667,7 @@ if (editIntent && !inEditMode) {
   const msg = [
     '✏️ Okay — send the corrected expense details in ONE message.',
     'Example:',
-    'expense $13.21 spray foam insulation from Home Hardware on Sept 27 2025',
+    'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
     'Reply "cancel" to discard.'
   ].join('\n');
 
@@ -2617,7 +2682,7 @@ if (inEditMode) {
     if (editIntent) {
       const msg = [
         '✏️ Send the corrected expense details in ONE message.',
-        'Example: expense $13.21 spray foam insulation from Home Hardware on Sept 27 2025'
+        'Example: expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025'
       ].join('\n');
       if (typeof twimlText === 'function') return twimlText(msg);
       return msg;
@@ -2739,22 +2804,69 @@ try {
   const needs = !!c0?.payload?.draft?.needsReparse;
 
   if (needs) {
-    await maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile });
-
-    // Optional high-signal debug (after reparse attempt)
+    // 1) Run your existing reparse pipeline (may or may not fill fields)
     try {
-      const c = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-      console.info('[CONFIRM_DRAFT_AFTER_REPARSE]', {
-        paUserId,
-        needsReparse: !!c?.payload?.draft?.needsReparse,
-        amount: c?.payload?.draft?.amount || null,
-        date: c?.payload?.draft?.date || null,
-        store: c?.payload?.draft?.store || null
-      });
-    } catch {}
+      await maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile });
+    } catch (e) {
+      console.warn('[EXPENSE] maybeReparseConfirmDraftExpense failed (ignored):', e?.message);
+    }
+
+    // 2) Backstop merge using the *latest* PA draft (never overwrite with null)
+    const c1 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    const draft1 = c1?.payload?.draft || {};
+
+    // ✅ Use whatever variable in this scope contains the receipt/OCR text
+    // Common ones in your codebase: extractedText, transcript, input, receiptText
+    const receiptText = String(extractedText || ocrText || draft1?.draftText || draft1?.originalText || '').trim();
+
+    const back = parseReceiptBackstop(receiptText);
+
+    const patch = back
+      ? {
+          store: back.store || null,
+          date: back.dateIso || null,
+          amount: back.total != null ? String(Number(back.total).toFixed(2)) : null,
+          currency: back.currency || null
+        }
+      : {};
+
+    const mergedDraft = mergeDraftNonNull(draft1, patch);
+
+    // ✅ Only mark needsReparse=false if we got the minimum viable fields
+    const gotAmount = !!String(mergedDraft.amount || '').trim();
+    const gotDate = !!String(mergedDraft.date || '').trim();
+
+    const needsReparseNext = !(gotAmount && gotDate);
+
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(c1?.payload || {}),
+        draft: {
+          ...mergedDraft,
+          needsReparse: needsReparseNext
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
   }
+
+  // Optional high-signal debug (after reparse attempt)
+  try {
+    const c = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    console.info('[CONFIRM_DRAFT_AFTER_REPARSE]', {
+      paUserId,
+      needsReparse: !!c?.payload?.draft?.needsReparse,
+      amount: c?.payload?.draft?.amount || null,
+      date: c?.payload?.draft?.date || null,
+      store: c?.payload?.draft?.store || null,
+      currency: c?.payload?.draft?.currency || null
+    });
+  } catch {}
 } catch (e) {
-  console.warn('[EXPENSE] maybeReparseConfirmDraftExpense precheck failed (ignored):', e?.message);
+  console.warn('[EXPENSE] confirm reparse precheck failed (ignored):', e?.message);
 }
 
 

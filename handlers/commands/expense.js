@@ -2839,7 +2839,23 @@ try {
 
     // ✅ Use whatever variable in this scope contains the receipt/OCR text
     // Common ones in your codebase: extractedText, transcript, input, receiptText
-    const receiptText = String(extractedText || ocrText || draft1?.draftText || draft1?.originalText || '').trim();
+    const receiptText = String(
+  confirmPA?.payload?.draft?.receiptText ||
+  confirmPA?.payload?.draft?.ocrText ||
+  confirmPA?.payload?.draft?.extractedText ||
+  confirmPA?.payload?.receiptText ||
+  confirmPA?.payload?.ocrText ||
+  confirmPA?.payload?.extractedText ||
+  rawDraft?.receiptText ||
+  rawDraft?.ocrText ||
+  rawDraft?.extractedText ||
+  rawDraft?.media_transcript ||
+  rawDraft?.mediaTranscript ||
+  rawDraft?.originalText ||
+  rawDraft?.draftText ||
+  ''
+).trim();
+
 
     const back = parseReceiptBackstop(receiptText);
 
@@ -3541,6 +3557,7 @@ let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }
 let bypassConfirmToAllowNewIntake = false;
 
 if (confirmPA?.payload?.draft) {
+  // Owner-only gate
   if (!isOwner) {
     await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
     return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
@@ -3567,7 +3584,7 @@ if (confirmPA?.payload?.draft) {
     }
   }
 
-  // ✅ Skip: keep the current confirm draft pending, but allow exactly ONE new intake to start next.
+  // ✅ Skip: keep current confirm draft pending, but allow exactly ONE new intake to start next.
   // This flag is consumed (reset) when we successfully create a new confirm draft (deterministic + AI paths).
   if (token === 'skip') {
     try {
@@ -3591,7 +3608,7 @@ if (confirmPA?.payload?.draft) {
     );
   }
 
-    // ✅ Replace / Start fresh: user is trying to log a new expense while a confirm is pending
+  // ✅ Replace / Start fresh: user is trying to log a new expense while a confirm is pending
   // If allow_new_while_pending is set → let it through by BYPASSING this confirm block.
   if (looksLikeNewExpenseText(rawInboundText)) {
     const allowNew = !!pendingNow?.allow_new_while_pending;
@@ -3614,7 +3631,6 @@ if (confirmPA?.payload?.draft) {
       );
     }
 
-    // ✅ allow_new_while_pending === true → BYPASS confirm handling and continue into new-intake parse
     console.info('[EXPENSE] allow_new_while_pending: bypassing confirm block for new intake', {
       paUserId,
       tokenHead: String(rawInboundText || '').slice(0, 40)
@@ -3622,13 +3638,14 @@ if (confirmPA?.payload?.draft) {
 
     bypassConfirmToAllowNewIntake = true;
 
-    // ✅ Micro-guard: prevent any downstream "confirm pending" checks from re-firing in this request.
-    // We keep the CONFIRM PA in storage (so user can resume later), but we ignore it for this intake.
+    // We keep CONFIRM PA in storage (so user can resume later), but ignore it for this intake.
     confirmPA = null;
   }
 
   // If we decided to bypass, do NOT process confirm tokens.
-  if (!bypassConfirmToAllowNewIntake) {
+  if (!bypassConfirmToAllowNewIntake && confirmPA?.payload?.draft) {
+    const userKey = String(paUserId || '').trim() || String(from || '').trim();
+
     // 🔁 Change Job (keep confirm PA)
     if (token === 'change_job') {
       const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
@@ -3636,21 +3653,19 @@ if (confirmPA?.payload?.draft) {
 
       // ✅ Mark confirm draft dirty so we re-parse receipt fields after job changes
       try {
-        if (confirmPA?.payload?.draft) {
-          await upsertPA({
-            ownerId,
-            userId: paUserId,
-            kind: PA_KIND_CONFIRM,
-            payload: {
-              ...(confirmPA.payload || {}),
-              draft: {
-                ...(confirmPA.payload.draft || {}),
-                needsReparse: true
-              }
-            },
-            ttlSeconds: PA_TTL_SEC
-          });
-        }
+        await upsertPA({
+          ownerId,
+          userId: paUserId,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...(confirmPA.payload || {}),
+            draft: {
+              ...(confirmPA.payload.draft || {}),
+              needsReparse: true
+            }
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
       } catch (e) {
         console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
       }
@@ -3669,11 +3684,8 @@ if (confirmPA?.payload?.draft) {
       });
     }
 
-
     // ✏️ Edit (DO NOT delete confirm PA — contract)
     if (token === 'edit') {
-      // If you’ve installed the EARLY edit state machine at the top of handleExpense,
-      // this will usually be handled earlier. This is a safe fallback.
       return out(
         twimlText(
           '✏️ What would you like to change?\n' +
@@ -3686,14 +3698,13 @@ if (confirmPA?.payload?.draft) {
       );
     }
 
-    // ❌ Cancel (delete confirm + pick)
+    // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending
     if (token === 'cancel') {
       await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
       try {
         await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
       } catch {}
 
-      // Also clear allow_new_while_pending if set (clean slate)
       try {
         const p2 = await getPendingTransactionState(paUserId);
         if (p2?.allow_new_while_pending) {
@@ -3707,121 +3718,233 @@ if (confirmPA?.payload?.draft) {
       return out(twimlText('❌ Expense cancelled.'), false);
     }
 
-    // ✅ Yes (HARDENED)
-if (token === 'yes') {
-  const userKey = String(paUserId || '').trim() || String(from || '').trim();
-
-  // ✅ High-signal check: prove whether CONFIRM PA exists at YES time
-  let confirmSnap = null;
-  try {
-    confirmSnap = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-    console.info('[YES_HANDLER_CONFIRM_PA]', {
-      paUserId,
-      hasConfirm: !!confirmSnap,
-      hasDraft: !!confirmSnap?.payload?.draft,
-      paSourceMsgId: confirmSnap?.payload?.sourceMsgId || null,
-      amount: confirmSnap?.payload?.draft?.amount || null,
-      date: confirmSnap?.payload?.draft?.date || null,
-      store: confirmSnap?.payload?.draft?.store || null,
-      currency: confirmSnap?.payload?.draft?.currency || null
-    });
-  } catch (e) {
-    console.warn('[YES_HANDLER_CONFIRM_PA] read failed (ignored):', e?.message);
-  }
-
-  // ✅ Prefer freshest confirm PA (avoid stale confirmPA var)
-  const confirmPAFresh = confirmSnap || confirmPA;
-
-  console.info('[YES_RECEIVED]', {
-    userId: userKey,
-    hasConfirmDraft: !!confirmPAFresh?.payload?.draft,
-    paSourceMsgId: confirmPAFresh?.payload?.sourceMsgId || null,
-    inboundYesMsgId: stableMsgId || null
-  });
-
-  const rawDraft = { ...(confirmPAFresh?.payload?.draft || {}) };
-
-  // ✅ Canonical source msg id for this expense write
-  const txSourceMsgId =
-    String(confirmPAFresh?.payload?.sourceMsgId || '').trim() ||
-    String(stableMsgId || '').trim() ||
-    null;
-
-  // ✅ Provide resolver a deterministic DB key even if pending state is empty
-  if (!rawDraft.media_source_msg_id && txSourceMsgId) {
-    rawDraft.media_source_msg_id = `${userKey}:${txSourceMsgId}`;
-  } else if (rawDraft.media_source_msg_id) {
-    const ms = String(rawDraft.media_source_msg_id || '').trim();
-    if (ms && !ms.includes(':')) rawDraft.media_source_msg_id = `${userKey}:${ms}`;
-  }
-
-  // ✅ Receipt/OCR-first source text for receipt-safe amount/date/store extraction
-  const sourceText = String(
-    confirmPAFresh?.payload?.receiptText ||
-      confirmPAFresh?.payload?.ocrText ||
-      confirmPAFresh?.payload?.extractedText ||
-      rawDraft?.receiptText ||
-      rawDraft?.ocrText ||
-      rawDraft?.extractedText ||
-      rawDraft?.media_transcript ||
-      rawDraft?.mediaTranscript ||
-      rawDraft?.originalText ||
-      rawDraft?.draftText ||
-      rawDraft?.text ||
-      ''
-  ).trim();
-
-      let data = normalizeExpenseData(rawDraft, userProfile, sourceText);
-
-      // Strong Unknown handling
-      if (!data.item || isUnknownItem(data.item)) {
-        const src =
-          rawDraft?.draftText ||
-          rawDraft?.originalText ||
-          rawDraft?.text ||
-          rawDraft?.media_transcript ||
-          rawDraft?.mediaTranscript ||
-          rawDraft?.input ||
-          '';
-
-        let inferred = inferItemFromDashOrInPattern(src);
-        if (!inferred) inferred = inferItemFromOnPattern(src);
-        if (!inferred) inferred = inferExpenseItemFallback(src);
-        if (!inferred) inferred = inferItemFromDashOrInPattern(input);
-        if (!inferred) inferred = inferItemFromOnPattern(input);
-        if (!inferred) inferred = inferExpenseItemFallback(input);
-
-        if (inferred) data.item = inferred;
-      }
-
-      if (!data.item || isUnknownItem(data.item)) {
-        const fallbackDesc = rawDraft?.item || rawDraft?.description || rawDraft?.desc || rawDraft?.memo || '';
-        if (fallbackDesc && !isUnknownItem(fallbackDesc)) {
-          data.item = cleanExpenseItemForDisplay(String(fallbackDesc).trim());
-        }
-      }
-
-      if (!data.item || isUnknownItem(data.item)) data.item = 'Unknown';
-
-      data.store = await normalizeVendorName(ownerId, data.store);
-      const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
-
-      // ✅ One-shot reset safety: if allow_new_while_pending is set, clear it on successful YES submit
+    // --------------------------------------------
+    // ✅ YES (HARDENED + DOES INSERT + MUST RETURN)
+    // --------------------------------------------
+    if (token === 'yes') {
       try {
-        const p3 = await getPendingTransactionState(userKey);
-        if (p3?.allow_new_while_pending) {
-          await mergePendingTransactionState(userKey, {
-            allow_new_while_pending: false,
-            allow_new_set_at: null
-          });
-          console.info('[ALLOW_NEW_WHILE_PENDING_RESET_ON_YES]', { userKey });
+        // Always operate on freshest confirm PA (avoid stale confirmPA var)
+        let confirmPAFresh = null;
+        try {
+          confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+        } catch (e) {
+          console.warn('[YES] getPA failed (ignored):', e?.message);
+          confirmPAFresh = confirmPA || null;
         }
-      } catch {}
+        if (!confirmPAFresh) confirmPAFresh = confirmPA || null;
 
-      // ---- continue with your existing YES flow (job resolution → insert → cleanup → reply) ----
+        // If draft is marked dirty, reparse now (receipt-safe)
+        if (confirmPAFresh?.payload?.draft?.needsReparse) {
+          try {
+            await maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile });
+            confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+          } catch (e) {
+            console.warn('[YES] maybeReparseConfirmDraftExpense failed (ignored):', e?.message);
+          }
+        }
+
+        const rawDraft =
+          confirmPAFresh?.payload?.draft ? { ...confirmPAFresh.payload.draft } : null;
+
+        console.info('[YES_HANDLER_CONFIRM_PA]', {
+          paUserId,
+          hasConfirm: !!confirmPAFresh,
+          hasDraft: !!rawDraft && !!Object.keys(rawDraft).length,
+          paSourceMsgId: confirmPAFresh?.payload?.sourceMsgId || null,
+          amount: rawDraft?.amount || null,
+          date: rawDraft?.date || null,
+          store: rawDraft?.store || null,
+          currency: rawDraft?.currency || null,
+          jobName: rawDraft?.jobName || null
+        });
+
+        if (!rawDraft || !Object.keys(rawDraft).length) {
+          return out(
+            twimlText(`I didn’t find an expense draft to submit. Reply "resume" to see what’s pending.`),
+            false
+          );
+        }
+
+        // Canonical txSourceMsgId (the confirm flow ID)
+        const txSourceMsgId =
+          String(confirmPAFresh?.payload?.sourceMsgId || '').trim() ||
+          String(stableMsgId || '').trim() ||
+          null;
+
+        // Ensure media_source_msg_id always "userKey:msgId"
+        if (!rawDraft.media_source_msg_id && txSourceMsgId) {
+          rawDraft.media_source_msg_id = `${userKey}:${txSourceMsgId}`;
+        } else if (rawDraft.media_source_msg_id) {
+          const ms = String(rawDraft.media_source_msg_id || '').trim();
+          if (ms && !ms.includes(':')) rawDraft.media_source_msg_id = `${userKey}:${ms}`;
+        }
+
+        // Resolve media asset id (draft -> flow -> pending -> DB)
+        const mediaAssetId = await resolveMediaAssetIdForFlow({
+          ownerId,
+          userKey,
+          rawDraft,
+          flowMediaAssetId
+        });
+
+        // Receipt/OCR-first source text for normalization
+        const sourceText = String(
+          rawDraft?.receiptText ||
+            rawDraft?.ocrText ||
+            rawDraft?.media_transcript ||
+            rawDraft?.mediaTranscript ||
+            rawDraft?.originalText ||
+            rawDraft?.draftText ||
+            rawDraft?.text ||
+            ''
+        ).trim();
+
+        let data = normalizeExpenseData(rawDraft, userProfile, sourceText);
+
+        data.media_asset_id = mediaAssetId || data.media_asset_id || null;
+        data.media_source_msg_id = rawDraft.media_source_msg_id || null;
+
+        // ✅ Minimal gating
+        const amountStr = String(data?.amount || '').trim();
+        const dateStr = String(data?.date || '').trim();
+
+        if (!amountStr || amountStr === '$0.00') {
+          return out(
+            twimlText(`I’m missing the total amount. Reply like: "Total 14.84 CAD" (or just "14.84").`),
+            false
+          );
+        }
+        if (!dateStr) {
+          return out(
+            twimlText(`I’m missing the date. Reply like: "The transaction date is 01/05/2026".`),
+            false
+          );
+        }
+
+        // ✅ Job resolution
+        let jobName = data.jobName || rawDraft.jobName || null;
+        let jobSource = jobName ? (data.jobSource || rawDraft.jobSource || 'typed') : null;
+
+        if (!jobName) {
+          jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+          if (jobName) jobSource = 'active';
+        }
+
+        if (jobName && looksLikeOverhead(jobName)) {
+          jobName = 'Overhead';
+          jobSource = 'overhead';
+        }
+
+        if (!jobName) {
+          const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+          await sendJobPickList({
+            from,
+            ownerId,
+            userProfile,
+            confirmFlowId: txSourceMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+            jobOptions: jobs,
+            paUserId,
+            page: 0,
+            pageSize: 8,
+            context: 'expense_jobpick',
+            confirmDraft: {
+              ...data,
+              jobName: null,
+              jobSource: null,
+              media_asset_id: data.media_asset_id || null,
+              media_source_msg_id: data.media_source_msg_id || null,
+              originalText: rawDraft?.originalText || sourceText || '',
+              draftText: rawDraft?.draftText || sourceText || ''
+            }
+          });
+
+          return out(twimlText('Pick the job for this expense:'), false);
+        }
+
+        data.jobName = jobName;
+        data.jobSource = jobSource;
+
+        // ✅ Store normalization + category
+        data.store = await normalizeVendorName(ownerId, data.store);
+        const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
+        const categoryStr = category && String(category).trim() ? String(category).trim() : null;
+
+        // ✅ One-shot reset safety: allow_new_while_pending
+        try {
+          const p3 = await getPendingTransactionState(userKey);
+          if (p3?.allow_new_while_pending) {
+            await mergePendingTransactionState(userKey, {
+              allow_new_while_pending: false,
+              allow_new_set_at: null
+            });
+            console.info('[ALLOW_NEW_WHILE_PENDING_RESET_ON_YES]', { userKey });
+          }
+        } catch {}
+
+        // ✅ ACTUAL DB INSERT
+        await pg.insertTransaction({
+          ownerId,
+          owner_id: ownerId,
+          userId: paUserId,
+          user_id: paUserId,
+          fromPhone: from,
+          from,
+
+          type: 'expense',
+          kind: 'expense',
+
+          ...data,
+
+          jobName,
+          jobSource,
+          suggestedCategory: categoryStr,
+          category: categoryStr,
+
+          media_asset_id: data.media_asset_id || null,
+          media_source_msg_id: data.media_source_msg_id || null,
+
+          sourceMsgId: txSourceMsgId || null,
+          source_msg_id: txSourceMsgId || null
+        });
+
+        console.info('[EXPENSE_INSERT_OK]', {
+          paUserId,
+          txSourceMsgId: txSourceMsgId || null,
+          media_asset_id: data.media_asset_id || null
+        });
+
+        // ✅ Clear confirm PA (best-effort)
+        try {
+          const existing = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+          await upsertPA({
+            ownerId,
+            userId: paUserId,
+            kind: PA_KIND_CONFIRM,
+            payload: { ...(existing?.payload || {}), draft: null, clearedAt: new Date().toISOString() },
+            ttlSeconds: 10
+          });
+        } catch {}
+
+        const okMsg = [
+          `✅ Logged expense ${String(data.amount || '').trim()} — ${data.store || 'Unknown Store'}`,
+          data.date ? `Date: ${data.date}` : null,
+          jobName ? `Job: ${jobName}` : null,
+          categoryStr ? `Category: ${categoryStr}` : null
+        ]
+          .filter(Boolean)
+          .join('\n');
+
+        return out(twimlText(okMsg), false);
+      } catch (e) {
+        console.error('[YES] handler failed:', e?.message);
+        return out(
+          twimlText(`Something went wrong submitting that expense. Reply "resume" and try again.`),
+          false
+        );
+      }
     }
 
-    // Unknown token while confirm pending → nudge
+    // Default while confirm pending
     return out(
       twimlText(
         [
@@ -3838,24 +3961,21 @@ if (token === 'yes') {
       false
     );
   }
-}
+} // ✅ IMPORTANT: closes the line-3559 confirmPA?.payload?.draft block
 
-// If bypassConfirmToAllowNewIntake === true, we fall through here to your normal new-intake parsing.
-// (Confirm PA remains untouched and can be resumed later.)
+// If confirm draft exists but we bypassed (allow_new_while_pending), continue below into new-intake parsing.
+// If no confirm draft exists, we also continue into new-intake parsing.
 
 
- /* ---- 3) New expense parse (deterministic first) ---- */
+/* ---- 3) New expense parse (deterministic first) ---- */
 
 // ✅ Receipt/OCR path: seed/patch CONFIRM PA so "Yes" has something real to submit.
 // IMPORTANT: do NOT run deterministicExpenseParse on receipt blobs.
 if (looksLikeReceiptText(input)) {
   try {
-    // If your router prepends "expense " before OCR text, strip it here.
     const receiptText = stripExpensePrefixes(String(input || '')).trim();
-
     const back = parseReceiptBackstop(receiptText);
 
-    // Even if backstop fails, still store receiptText into the draft so reparsers have it.
     const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
     const draft0 = c0?.payload?.draft || {};
 
@@ -3867,25 +3987,20 @@ if (looksLikeReceiptText(input)) {
     const userKey = String(paUserId || '').trim() || String(from || '').trim();
 
     const patch = {
-      // Parsed receipt fields (only if we got them)
       store: back?.store || null,
       date: back?.dateIso || null,
       amount: back?.total != null ? String(Number(back.total).toFixed(2)) : null,
       currency: back?.currency || null,
 
-      // ✅ Always keep the raw receipt blob available for YES + reparsers
       receiptText,
       ocrText: receiptText,
-      extractedText: receiptText,
 
-      // Preserve any existing originalText/draftText if already present
       originalText: draft0.originalText || receiptText,
       draftText: draft0.draftText || receiptText
     };
 
     const mergedDraft = mergeDraftNonNull(draft0, patch);
 
-    // ✅ Ensure media_source_msg_id is always in "userKey:msgId" format
     if (!mergedDraft.media_source_msg_id && txSourceMsgId) {
       mergedDraft.media_source_msg_id = `${userKey}:${txSourceMsgId}`;
     } else if (mergedDraft.media_source_msg_id) {
@@ -3893,12 +4008,8 @@ if (looksLikeReceiptText(input)) {
       if (ms && !ms.includes(':')) mergedDraft.media_source_msg_id = `${userKey}:${ms}`;
     }
 
-    // ✅ Carry resolved media link (best effort)
     mergedDraft.media_asset_id =
-      mergedDraft.media_asset_id ||
-      resolvedFlowMediaAssetId ||
-      flowMediaAssetId ||
-      null;
+      mergedDraft.media_asset_id || resolvedFlowMediaAssetId || flowMediaAssetId || null;
 
     const gotAmount = !!String(mergedDraft.amount || '').trim();
     const gotDate = !!String(mergedDraft.date || '').trim();
@@ -3913,7 +4024,6 @@ if (looksLikeReceiptText(input)) {
         sourceMsgId: txSourceMsgId,
         draft: {
           ...mergedDraft,
-          // ✅ Keep dirty until minimum viable fields exist
           needsReparse: !(gotAmount && gotDate)
         }
       },
@@ -3935,9 +4045,6 @@ if (looksLikeReceiptText(input)) {
   }
 
   // ✅ Hard stop: do NOT run deterministic parse on receipt blobs.
-  // Let the rest of your pipeline (or reparse) drive confirmation.
-  // If you want to immediately send a confirm card here, you can,
-  // but default is: fall through to AI parsing fallback (section 4) or later logic.
 } else {
   // ✅ Non-receipt path: deterministic parse first
   const backstop = deterministicExpenseParse(input, userProfile);
@@ -3971,7 +4078,7 @@ if (looksLikeReceiptText(input)) {
 
     if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
 
-    const safeMsgId = String(stableMsgId || '').trim() || null;
+    const safeMsgId0 = String(stableMsgId || '').trim() || null;
 
     await upsertPA({
       ownerId,
@@ -3987,23 +4094,23 @@ if (looksLikeReceiptText(input)) {
           job_no: null,
 
           media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-          media_source_msg_id: safeMsgId
-            ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+          media_source_msg_id: safeMsgId0
+            ? `${String(paUserId || '').trim()}:${String(safeMsgId0).trim()}`
             : null,
 
           originalText: input,
           draftText: input
         },
-        sourceMsgId: safeMsgId,
+        sourceMsgId: safeMsgId0,
         type: 'expense'
       },
       ttlSeconds: PA_TTL_SEC
     });
 
-    // ✅ A3 One-shot reset: we just created a NEW confirm draft, so stop "allow new while pending"
+    // ✅ consume allow_new_while_pending
     try {
-      const pendingNow = await getPendingTransactionState(paUserId);
-      if (pendingNow?.allow_new_while_pending) {
+      const pn = await getPendingTransactionState(paUserId);
+      if (pn?.allow_new_while_pending) {
         await mergePendingTransactionState(paUserId, {
           allow_new_while_pending: false,
           allow_new_set_at: null
@@ -4011,27 +4118,6 @@ if (looksLikeReceiptText(input)) {
         console.info('[ALLOW_NEW_WHILE_PENDING_RESET]', { paUserId });
       }
     } catch {}
-
-    const paChk = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-    console.info('[CONFIRM_PA_AFTER_UPSERT]', {
-      hasDraft: !!paChk?.payload?.draft,
-      userId: paUserId,
-      sourceMsgId: paChk?.payload?.sourceMsgId || null
-    });
-
-    // one-time sanity check: confirm app DB has media_assets rows for this owner
-    try {
-      const dbChk = await pg.query(
-        `select count(*)::int as n from public.media_assets where owner_id=$1`,
-        [String(ownerId || '').trim()]
-      );
-      console.info('[MEDIA_ASSETS_COUNT]', {
-        ownerId: String(ownerId || '').trim(),
-        n: dbChk?.rows?.[0]?.n ?? null
-      });
-    } catch (e) {
-      console.warn('[MEDIA_ASSETS_COUNT] failed (ignored):', e?.message);
-    }
 
     if (!jobName) {
       const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
@@ -4049,12 +4135,10 @@ if (looksLikeReceiptText(input)) {
           ...data0,
           jobName: null,
           jobSource: null,
-
           media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-          media_source_msg_id: safeMsgId
-            ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+          media_source_msg_id: safeMsgId0
+            ? `${String(paUserId || '').trim()}:${String(safeMsgId0).trim()}`
             : null,
-
           originalText: input,
           draftText: input
         }
@@ -4067,36 +4151,42 @@ if (looksLikeReceiptText(input)) {
       store: data0.store,
       date: data0.date,
       jobName,
-      tz, // ✅ uses existing tz in outer scope
+      tz,
       sourceText: input
     });
 
     console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
     return await sendConfirmExpenseOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
   }
-}
+} // ✅ closes Section 3 else block
 
 
+/* ---- 4) AI parsing fallback ---- */
 
-    /* ---- 4) AI parsing fallback ---- */
-const defaultData = { date: todayInTimeZone(tz), item: 'Unknown', amount: '$0.00', store: 'Unknown Store' };
+const safeMsgId = String(stableMsgId || '').trim() || null;
+
+const defaultData = {
+  date: todayInTimeZone(tz),
+  item: 'Unknown',
+  amount: '$0.00',
+  store: 'Unknown Store'
+};
+
 const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData, { tz });
 
 let data = aiRes?.data || null;
 let aiReply = aiRes?.reply || null;
 
 if (data) {
-  // Prefer OCR/receipt blobs if AI included them, otherwise fall back to input text
   const sourceText = String(
     data?.receiptText ||
-    data?.ocrText ||
-    data?.extractedText ||
-    data?.media_transcript ||
-    data?.mediaTranscript ||
-    data?.originalText ||
-    data?.draftText ||
-    input ||
-    ''
+      data?.ocrText ||
+      data?.media_transcript ||
+      data?.mediaTranscript ||
+      data?.originalText ||
+      data?.draftText ||
+      input ||
+      ''
   ).trim();
 
   data = normalizeExpenseData(data, userProfile, sourceText);
@@ -4154,15 +4244,13 @@ if (data && data.amount && data.amount !== '$0.00') {
         job_id: null,
         job_no: null,
 
-        // ✅ carry resolved link (keep your existing vars here)
         media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-        media_source_msg_id: (String(safeMsgId || '').trim()
+        media_source_msg_id: safeMsgId
           ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
-          : null),
+          : null,
 
-        // ✅ IMPORTANT: store OCR text into the PA so YES + reparse can use it
-        receiptText: data?.receiptText || data?.ocrText || data?.extractedText || data?.media_transcript || null,
-        ocrText: data?.ocrText || data?.extractedText || null,
+        receiptText: data?.receiptText || data?.ocrText || data?.media_transcript || null,
+        ocrText: data?.ocrText || null,
 
         originalText: input,
         draftText: input
@@ -4173,77 +4261,67 @@ if (data && data.amount && data.amount !== '$0.00') {
     ttlSeconds: PA_TTL_SEC
   });
 
-      const chk = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-console.info('[CONFIRM_PA_AFTER_UPSERT]', {
-  hasDraft: !!chk?.payload?.draft,
-  userId: paUserId,
-  sourceMsgId: chk?.payload?.sourceMsgId || null
-});
+  if (!jobName) {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
 
+    return await sendJobPickList({
+      from,
+      ownerId,
+      userProfile,
+      confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+      jobOptions: jobs,
+      paUserId,
+      page: 0,
+      pageSize: 8,
+      context: 'expense_jobpick',
+      confirmDraft: {
+        ...data,
+        jobName: null,
+        jobSource: null,
+        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+        media_source_msg_id: safeMsgId
+          ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+          : null,
+        originalText: input,
+        draftText: input
+      }
+    });
+  }
 
-      if (!jobName) {
-        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-        if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+  const summaryLine = buildExpenseSummaryLine({
+    amount: data.amount,
+    item: data.item,
+    store: data.store,
+    date: data.date || todayInTimeZone(tz),
+    jobName,
+    tz,
+    sourceText: input
+  });
 
-        return await sendJobPickList({
-          from,
-          ownerId,
-          userProfile,
-          confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-          jobOptions: jobs,
-          paUserId,
-          page: 0,
-          pageSize: 8,
-          context: 'expense_jobpick',
-          confirmDraft: {
-  ...data,
-  jobName: null,
-  jobSource: null,
-
-  media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-  media_source_msg_id: (String(safeMsgId || '').trim()
-    ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
-    : null),
-
-  originalText: input,
-  draftText: input
+  console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
+  return await sendConfirmExpenseOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
 }
 
+return out(
+  twimlText(`🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`),
+  false
+);
 
-        });
-      }
+} catch (error) {
+  console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
+    stack: error?.stack,
+    code: error?.code,
+    detail: error?.detail,
+    constraint: error?.constraint
+  });
 
-      const summaryLine = buildExpenseSummaryLine({
-        amount: data.amount,
-        item: data.item,
-        store: data.store,
-        date: data.date || todayInTimeZone(tz),
-        jobName,
-        tz,
-        sourceText: input
-      });
-console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
-      return await sendConfirmExpenseOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
-    }
-
-    return out(
-      twimlText(`🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`),
-      false
-    );
-  } catch (error) {
-    console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
-  stack: error?.stack,
-  code: error?.code,
-  detail: error?.detail,
-  constraint: error?.constraint
-});
-
-    return out(twimlText('⚠️ Error logging expense. Please try again.'), false);
-  } finally {
-    try {
-      const lock = require('../../middleware/lock');
-      if (lock?.releaseLock) await lock.releaseLock(lockKey);
-    } catch {}
+  return out(twimlText('⚠️ Error logging expense. Please try again.'), false);
+} finally {
+  try {
+    const lock = require('../../middleware/lock');
+    if (lock?.releaseLock) await lock.releaseLock(lockKey);
+  } catch {}
   }
 }
 

@@ -1295,6 +1295,14 @@ function inferExpenseCategoryHeuristic(data) {
   if (/\b(lunch|coffee|meal)\b/i.test(it)) return 'Meals';
   return null;
 }
+function isControlDuringEdit(rawInboundText, twilioMeta) {
+  return (
+    isCancelIntent(rawInboundText, twilioMeta) ||
+    isSkipIntent(rawInboundText, twilioMeta) ||
+    isEditIntent(rawInboundText, twilioMeta) ||
+    normalizeDecisionToken(rawInboundText) === 'resume'
+  );
+}
 
 function formatMoneyDisplay(n) {
   try {
@@ -1335,6 +1343,17 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
     const receiptStore = extractReceiptStore(sourceText);
     if (receiptStore) d.store = receiptStore;
   }
+  // Vendor: Petro-Canada receipts commonly include "TRANSACTION RECORD PETRO-CANADA"
+if (!store) {
+  const m = text.match(/TRANSACTION\s+RECORD\s+([A-Z0-9&' .-]{3,40})/i);
+  if (m?.[1]) {
+    const cand = String(m[1]).trim();
+    // avoid “TOTAL / INTERAC / FUEL SALES”
+    if (!/\b(total|interac|fuel|sales|hst|gst|pst)\b/i.test(cand)) store = cand;
+  }
+}
+if (!store && /\bPETRO[- ]?CANADA\b/i.test(text)) store = 'Petro-Canada';
+
 
   // ---------------------------
   // Your original normalization
@@ -3573,6 +3592,56 @@ if (confirmPA?.payload?.draft) {
 
   const token = normalizeDecisionToken(rawInboundText);
   const lcRaw = String(rawInboundText || '').trim().toLowerCase();
+// ✅ If confirm draft is awaiting an edit payload, consume the next free-text message as the edit.
+if (confirmPA?.payload?.draft?.awaiting_edit) {
+  // Allow control words to behave normally
+  if (isControlDuringEdit(rawInboundText, inboundTwilioMeta)) {
+    // cancel/skip/resume/edit are handled by existing logic below
+  } else {
+    const existingDraft = confirmPA.payload.draft || {};
+    const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
+
+    const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(rawInboundText, existingDraft, {
+      fromKey: paUserId,
+      tz: tz0,
+      defaultData: {}
+    });
+
+    if (!nextDraft) {
+      return out(
+        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
+        false
+      );
+    }
+
+    // Persist updated draft and clear awaiting_edit
+    try {
+      await upsertPA({
+        ownerId,
+        userId: paUserId,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPA.payload || {}),
+          draft: {
+            ...(confirmPA.payload?.draft || {}),
+            ...nextDraft,
+            awaiting_edit: false
+          }
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+    } catch (e) {
+      console.warn('[EXPENSE] apply edit upsertPA failed (ignored):', e?.message);
+    }
+
+    // Re-confirm (prefer interactive if you have it; otherwise plain text)
+    try {
+      return await resendConfirmExpense({ from, ownerId, tz: tz0, paUserId });
+    } catch {
+      return out(twimlText(formatExpenseConfirmText({ ...existingDraft, ...nextDraft })), false);
+    }
+  }
+}
 
   // decision tokens that MUST stay inside confirm flow
   const isDecisionToken =
@@ -3712,19 +3781,39 @@ if (confirmPA?.payload?.draft) {
         return out(twimlText(''), true);
       }
 
-      // ✏️ Edit (DO NOT delete confirm PA — contract)
-      if (token === 'edit') {
-        return out(
-          twimlText(
-            '✏️ What would you like to change?\n' +
-              '• change amount to 420\n' +
-              '• change date to yesterday\n' +
-              '• change item to caulking\n' +
-              '• change job'
-          ),
-          false
-        );
-      }
+      // ✏️ Edit: mark confirm draft as awaiting edit, so the *next free-text* is consumed as edit payload
+if (token === 'edit') {
+  try {
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA.payload || {}),
+        draft: {
+          ...(confirmPA.payload?.draft || {}),
+          awaiting_edit: true
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+  } catch (e) {
+    console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
+  }
+
+  return out(
+    twimlText(
+      [
+        '✏️ Okay — send the corrected expense details in ONE message.',
+        'Example:',
+        'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+        'Reply "cancel" to discard.'
+      ].join('\n')
+    ),
+    false
+  );
+}
+
 
       // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending
       if (token === 'cancel') {

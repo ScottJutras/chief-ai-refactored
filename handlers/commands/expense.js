@@ -2846,21 +2846,22 @@ try {
     // ✅ Use whatever variable in this scope contains the receipt/OCR text
     // Common ones in your codebase: extractedText, transcript, input, receiptText
     const receiptText = String(
-  confirmPA?.payload?.draft?.receiptText ||
-  confirmPA?.payload?.draft?.ocrText ||
-  confirmPA?.payload?.draft?.extractedText ||
-  confirmPA?.payload?.receiptText ||
-  confirmPA?.payload?.ocrText ||
-  confirmPA?.payload?.extractedText ||
-  rawDraft?.receiptText ||
-  rawDraft?.ocrText ||
-  rawDraft?.extractedText ||
-  rawDraft?.media_transcript ||
-  rawDraft?.mediaTranscript ||
-  rawDraft?.originalText ||
-  rawDraft?.draftText ||
-  ''
+  draft1?.receiptText ||
+    draft1?.ocrText ||
+    draft1?.extractedText ||
+    c1?.payload?.receiptText ||
+    c1?.payload?.ocrText ||
+    c1?.payload?.extractedText ||
+    rawDraft?.receiptText ||
+    rawDraft?.ocrText ||
+    rawDraft?.extractedText ||
+    rawDraft?.media_transcript ||
+    rawDraft?.mediaTranscript ||
+    rawDraft?.originalText ||
+    rawDraft?.draftText ||
+    ''
 ).trim();
+
 
 
     const back = parseReceiptBackstop(receiptText);
@@ -3559,9 +3560,8 @@ return await resendConfirmExpense({ from, ownerId, tz });
       }
     }
 
-   // ---- 2) Confirm/edit/cancel (CONSOLIDATED: Resume / Skip / Replace / Cancel / Yes) ----
+  // ---- 2) Confirm/edit/cancel (CONSOLIDATED) ----
 let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-
 let bypassConfirmToAllowNewIntake = false;
 
 if (confirmPA?.payload?.draft) {
@@ -3571,159 +3571,180 @@ if (confirmPA?.payload?.draft) {
     return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
   }
 
-  // ✅ IMPORTANT: compute decision token from RAW inbound (not normalized input)
   const token = normalizeDecisionToken(rawInboundText);
+  const lcRaw = String(rawInboundText || '').trim().toLowerCase();
 
-  // Optional pending state (only used for allow_new_while_pending)
-  let pendingNow = null;
-  try {
-    pendingNow = await getPendingTransactionState(paUserId);
-  } catch {
-    pendingNow = null;
+  // decision tokens that MUST stay inside confirm flow
+  const isDecisionToken =
+    token === 'yes' ||
+    token === 'edit' ||
+    token === 'cancel' ||
+    token === 'resume' ||
+    token === 'skip' ||
+    token === 'change_job';
+
+  // “info commands” that should NOT be blocked by confirm draft
+  const isNonIntakeQuery =
+    /^show\b/.test(lcRaw) ||
+    lcRaw.includes('last expense') ||
+    lcRaw.includes('last revenue') ||
+    /^help\b/.test(lcRaw) ||
+    /^dashboard\b/.test(lcRaw) ||
+    /^jobs?\b/.test(lcRaw) ||
+    /^tasks?\b/.test(lcRaw) ||
+    /^timesheet\b/.test(lcRaw);
+
+  // ✅ bypass confirm nag for "info commands" (but do NOT bypass real decision tokens)
+  if (!isDecisionToken && isNonIntakeQuery && !looksLikeNewExpenseText(rawInboundText)) {
+    bypassConfirmToAllowNewIntake = true;
   }
 
-  // ✅ Resume: re-send confirm for the existing pending expense (no state changes)
-  if (token === 'resume') {
+  // ✅ If bypassing, do nothing here and fall through to normal routing below.
+  // We DO NOT clear confirmPA in storage; we just ignore it for this one inbound.
+  if (!bypassConfirmToAllowNewIntake) {
+    // Optional pending state (only used for allow_new_while_pending)
+    let pendingNow = null;
     try {
-      return await resendConfirmExpense({ from, ownerId, tz, paUserId });
-    } catch (e) {
-      console.warn('[EXPENSE] resume confirm resend failed (fallback to text):', e?.message);
-      return out(twimlText(formatExpenseConfirmText(confirmPA.payload.draft)), false);
-    }
-  }
-
-  // ✅ Skip: keep current confirm draft pending, but allow exactly ONE new intake to start next.
-  // This flag is consumed (reset) when we successfully create a new confirm draft (deterministic + AI paths).
-  if (token === 'skip') {
-    try {
-      await mergePendingTransactionState(paUserId, {
-        kind: 'expense',
-        allow_new_while_pending: true,
-        allow_new_set_at: Date.now()
-      });
-      console.info('[ALLOW_NEW_WHILE_PENDING_SET]', { paUserId });
+      pendingNow = await getPendingTransactionState(paUserId);
     } catch {}
 
-    return out(
-      twimlText(
-        [
-          'Okay — I’ll keep that expense pending.',
-          'Now send the *new* expense (or photo) you want to log.',
-          'Tip: reply “resume” anytime to bring back the pending one.'
-        ].join('\n')
-      ),
-      false
-    );
-  }
+    // ✅ Resume: re-send confirm for the existing pending expense (no state changes)
+    if (token === 'resume') {
+      try {
+        return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+      } catch (e) {
+        console.warn('[EXPENSE] resume confirm resend failed (fallback to text):', e?.message);
+        return out(twimlText(formatExpenseConfirmText(confirmPA.payload.draft)), false);
+      }
+    }
 
-  // ✅ Replace / Start fresh: user is trying to log a new expense while a confirm is pending
-  // If allow_new_while_pending is set → let it through by BYPASSING this confirm block.
-  if (looksLikeNewExpenseText(rawInboundText)) {
-    const allowNew = !!pendingNow?.allow_new_while_pending;
+    // ✅ Skip: keep current confirm draft pending, allow ONE new intake next.
+    if (token === 'skip') {
+      try {
+        await mergePendingTransactionState(paUserId, {
+          kind: 'expense',
+          allow_new_while_pending: true,
+          allow_new_set_at: Date.now()
+        });
+        console.info('[ALLOW_NEW_WHILE_PENDING_SET]', { paUserId });
+      } catch {}
 
-    if (!allowNew) {
       return out(
         twimlText(
           [
-            'You’ve still got an expense waiting for confirmation.',
-            '',
-            'Reply:',
-            '• "yes" to submit it',
-            '• "edit" to change it',
-            '• "resume" to see it again',
-            '• "skip" to keep it pending and log a new one',
-            '• "cancel" to discard it'
+            'Okay — I’ll keep that expense pending.',
+            'Now send the *new* expense (or photo) you want to log.',
+            'Tip: reply “resume” anytime to bring back the pending one.'
           ].join('\n')
         ),
         false
       );
     }
 
-    console.info('[EXPENSE] allow_new_while_pending: bypassing confirm block for new intake', {
-      paUserId,
-      tokenHead: String(rawInboundText || '').slice(0, 40)
-    });
+    // ✅ If user is trying to log a new expense while confirm pending:
+    if (looksLikeNewExpenseText(rawInboundText)) {
+      const allowNew = !!pendingNow?.allow_new_while_pending;
 
-    bypassConfirmToAllowNewIntake = true;
-
-    // We keep CONFIRM PA in storage (so user can resume later), but ignore it for this intake.
-    confirmPA = null;
-  }
-
-  // If we decided to bypass, do NOT process confirm tokens.
-  if (!bypassConfirmToAllowNewIntake && confirmPA?.payload?.draft) {
-    const userKey = String(paUserId || '').trim() || String(from || '').trim();
-
-    // 🔁 Change Job (keep confirm PA)
-    if (token === 'change_job') {
-      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-      if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-
-      // ✅ Mark confirm draft dirty so we re-parse receipt fields after job changes
-      try {
-        await upsertPA({
-          ownerId,
-          userId: paUserId,
-          kind: PA_KIND_CONFIRM,
-          payload: {
-            ...(confirmPA.payload || {}),
-            draft: {
-              ...(confirmPA.payload.draft || {}),
-              needsReparse: true
-            }
-          },
-          ttlSeconds: PA_TTL_SEC
-        });
-      } catch (e) {
-        console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
+      if (!allowNew) {
+        return out(
+          twimlText(
+            [
+              'You’ve still got an expense waiting for confirmation.',
+              '',
+              'Reply:',
+              '• "yes" to submit it',
+              '• "edit" to change it',
+              '• "resume" to see it again',
+              '• "skip" to keep it pending and log a new one',
+              '• "cancel" to discard it'
+            ].join('\n')
+          ),
+          false
+        );
       }
 
-      return await sendJobPickList({
-        from,
-        ownerId,
-        userProfile,
-        confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-        jobOptions: jobs,
-        paUserId,
-        page: 0,
-        pageSize: 8,
-        context: 'expense_jobpick',
-        confirmDraft: confirmPA?.payload?.draft || null
-      });
+      // ✅ allow new intake to proceed; keep confirmPA stored for resume
+      bypassConfirmToAllowNewIntake = true;
     }
 
-    // ✏️ Edit (DO NOT delete confirm PA — contract)
-    if (token === 'edit') {
-      return out(
-        twimlText(
-          '✏️ What would you like to change?\n' +
-            '• change amount to 420\n' +
-            '• change date to yesterday\n' +
-            '• change item to caulking\n' +
-            '• change job'
-        ),
-        false
-      );
-    }
-
-    // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending
-    if (token === 'cancel') {
-      await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-      try {
-        await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
-      } catch {}
-
-      try {
-        const p2 = await getPendingTransactionState(paUserId);
-        if (p2?.allow_new_while_pending) {
-          await mergePendingTransactionState(paUserId, {
-            allow_new_while_pending: false,
-            allow_new_set_at: null
-          });
+    // If we decided to bypass to allow new intake, fall through.
+    if (!bypassConfirmToAllowNewIntake) {
+      // 🔁 Change Job (keep confirm PA)
+      if (token === 'change_job') {
+        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+        if (!jobs.length) {
+          return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
         }
-      } catch {}
 
-      return out(twimlText('❌ Expense cancelled.'), false);
+        // ✅ Mark confirm draft dirty so we re-parse receipt fields after job changes
+        try {
+          await upsertPA({
+            ownerId,
+            userId: paUserId,
+            kind: PA_KIND_CONFIRM,
+            payload: {
+              ...(confirmPA.payload || {}),
+              draft: {
+                ...(confirmPA.payload?.draft || {}),
+                needsReparse: true
+              }
+            },
+            ttlSeconds: PA_TTL_SEC
+          });
+        } catch (e) {
+          console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
+        }
+
+        // IMPORTANT: send picker out-of-band; do NOT also return a TwiML body message
+        await sendJobPickList({
+          from,
+          ownerId,
+          userProfile,
+          confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+          jobOptions: jobs,
+          paUserId,
+          page: 0,
+          pageSize: 8,
+          context: 'expense_jobpick',
+          confirmDraft: confirmPA?.payload?.draft || null
+        });
+
+        return out(twimlText(''), true);
+      }
+
+      // ✏️ Edit (DO NOT delete confirm PA — contract)
+      if (token === 'edit') {
+        return out(
+          twimlText(
+            '✏️ What would you like to change?\n' +
+              '• change amount to 420\n' +
+              '• change date to yesterday\n' +
+              '• change item to caulking\n' +
+              '• change job'
+          ),
+          false
+        );
+      }
+
+      // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending
+      if (token === 'cancel') {
+        await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+        try {
+          await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
+        } catch {}
+
+        try {
+          const p2 = await getPendingTransactionState(paUserId);
+          if (p2?.allow_new_while_pending) {
+            await mergePendingTransactionState(paUserId, {
+              allow_new_while_pending: false,
+              allow_new_set_at: null
+            });
+          }
+        } catch {}
+
+        return out(twimlText('❌ Expense cancelled.'), false);
+      }
     }
 
     // --------------------------------------------
@@ -3844,30 +3865,33 @@ if (confirmPA?.payload?.draft) {
         }
 
         if (!jobName) {
-          const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-          await sendJobPickList({
-            from,
-            ownerId,
-            userProfile,
-            confirmFlowId: txSourceMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-            jobOptions: jobs,
-            paUserId,
-            page: 0,
-            pageSize: 8,
-            context: 'expense_jobpick',
-            confirmDraft: {
-              ...data,
-              jobName: null,
-              jobSource: null,
-              media_asset_id: data.media_asset_id || null,
-              media_source_msg_id: data.media_source_msg_id || null,
-              originalText: rawDraft?.originalText || sourceText || '',
-              draftText: rawDraft?.draftText || sourceText || ''
-            }
-          });
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
 
-          return out(twimlText('Pick the job for this expense:'), false);
-        }
+  await sendJobPickList({
+    from,
+    ownerId,
+    userProfile,
+    confirmFlowId: txSourceMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+    jobOptions: jobs,
+    paUserId,
+    page: 0,
+    pageSize: 8,
+    context: 'expense_jobpick',
+    confirmDraft: {
+      ...data,
+      jobName: null,
+      jobSource: null,
+      media_asset_id: data.media_asset_id || null,
+      media_source_msg_id: data.media_source_msg_id || null,
+      originalText: rawDraft?.originalText || sourceText || '',
+      draftText: rawDraft?.draftText || sourceText || ''
+    }
+  });
+
+  // ✅ DO NOT send an extra TwiML message; the picker is already sent out-of-band
+  return out(twimlText(''), true);
+}
+
 
         data.jobName = jobName;
         data.jobSource = jobSource;
@@ -3909,7 +3933,7 @@ if (!Number.isFinite(amountNum) || amountNum <= 0) {
 const amountCents = Math.round(amountNum * 100);
 
 // 3) Canonicalize fields so pg.insertTransaction() can’t misread them
-data.amount = amountNum.toFixed(2);      // ✅ also update data so your reply uses clean amount
+data.amount = amountNum.toFixed(2); // ✅ clean "14.84"
 data.amount_cents = amountCents;
 
 // ✅ Ensure insertTransaction gets what it expects
@@ -3926,20 +3950,19 @@ await pg.insertTransaction({
   from,
 
   kind: 'expense',
-  date: String(data.date || '').trim(), // insertTransaction requires date
-
-  // ✅ map your semantics to what insertTransaction actually uses
-  source: sourceForDb,
-  description: descForDb,
 
   // keep your normalized fields too
   ...data,
 
-  // ✅ force canonical amount forms (override any "$14.84" lingering)
+  // ✅ DB-critical fields must come AFTER ...data so they win
+  date: String(data.date || '').trim(),
+  source: sourceForDb,
+  description: descForDb,
+
+  // ✅ force canonical amount forms
   amount: amountNum.toFixed(2),
   amount_cents: amountCents,
 
-  // job details
   jobName,
   jobSource,
 
@@ -3949,44 +3972,35 @@ await pg.insertTransaction({
   source_msg_id: txSourceMsgId || null
 });
 
+console.info('[EXPENSE_INSERT_OK]', {
+  paUserId,
+  txSourceMsgId: txSourceMsgId || null,
+  media_asset_id: data.media_asset_id || null
+});
 
-
-        console.info('[EXPENSE_INSERT_OK]', {
-          paUserId,
-          txSourceMsgId: txSourceMsgId || null,
-          media_asset_id: data.media_asset_id || null
-        });
-
-        // ✅ Clear confirm PA (best-effort)
-        try {
-          const existing = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-          await upsertPA({
-            ownerId,
-            userId: paUserId,
-            kind: PA_KIND_CONFIRM,
-            payload: { ...(existing?.payload || {}), draft: null, clearedAt: new Date().toISOString() },
-            ttlSeconds: 10
-          });
-        } catch {}
-
-        const okMsg = [
-          `✅ Logged expense ${String(data.amount || '').trim()} — ${data.store || 'Unknown Store'}`,
-          data.date ? `Date: ${data.date}` : null,
-          jobName ? `Job: ${jobName}` : null,
-          categoryStr ? `Category: ${categoryStr}` : null
-        ]
-          .filter(Boolean)
-          .join('\n');
-
-        // ✅ Send success via the same outbound channel you use elsewhere
+// ✅ Clear confirm PA (best-effort)
 try {
-  await sendConfirmExpenseOrFallback(from, okMsg); // (despite name, it sends a normal message too)
-} catch (e) {
-  console.warn('[EXPENSE] success send failed (ignored):', e?.message);
-}
+  const existing = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: { ...(existing?.payload || {}), draft: null, clearedAt: new Date().toISOString() },
+    ttlSeconds: 10
+  });
+} catch {}
 
-// ✅ Return a minimal TwiML (so webhook completes cleanly)
-return out(twimlText(''), false);
+const okMsg = [
+  `✅ Logged expense ${String(data.amount || '').trim()} — ${data.store || 'Unknown Store'}`,
+  data.date ? `Date: ${data.date}` : null,
+  jobName ? `Job: ${jobName}` : null,
+  categoryStr ? `Category: ${categoryStr}` : null
+]
+  .filter(Boolean)
+  .join('\n');
+
+// ✅ IMPORTANT: TwiML is the correct “plain message” path
+return out(twimlText(okMsg), false);
 
       } catch (e) {
         console.error('[YES] handler failed:', e?.message);
@@ -3996,6 +4010,7 @@ return out(twimlText(''), false);
         );
       }
     }
+
 
     // Default while confirm pending
     return out(

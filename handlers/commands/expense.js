@@ -1254,20 +1254,56 @@ function extractReceiptDate(text) {
   return null;
 }
 
-// Cheap store detection from OCR blob
 function extractReceiptStore(text) {
-  const raw = String(text || '').toLowerCase();
+  const t = normalizeDashes(String(text || '')).replace(/\s+/g, ' ').trim();
+  if (!t) return null;
 
-  if (/\bhome\s*hardware\b/.test(raw)) return 'Home Hardware';
-  if (/\bhome\s*depot\b/.test(raw) || /\bhomedepot\b/.test(raw)) return 'Home Depot';
-  if (/\brona\b/.test(raw)) return 'Rona';
-  if (/\blowe'?s\b/.test(raw) || /\blowes\b/.test(raw)) return "Lowe's";
-  if (/\bbeacon\b/.test(raw)) return 'Beacon';
-  if (/\babc\s*supply\b/.test(raw)) return 'ABC Supply';
-  if (/\bconvoy\b/.test(raw)) return 'Convoy';
+  // 1) Strong explicit vendor phrases
+  // e.g. "TRANSACTION RECORD PETRO-CANADA"
+  {
+    const m = t.match(/\bTRANSACTION\s+RECORD\s+([A-Z0-9&' .-]{3,40})\b/i);
+    if (m?.[1]) {
+      const cand = String(m[1]).trim();
+      if (!/\b(total|interac|fuel|sales|hst|gst|pst|invoice|auth|reference)\b/i.test(cand)) {
+        const cleaned = cand.replace(/\s{2,}/g, ' ').trim();
+        if (cleaned && cleaned.length <= 40) return titleCaseVendor(cleaned);
+      }
+    }
+  }
 
+  // 2) Brand keyword fallbacks (high precision)
+  if (/\bPETRO[- ]?CANADA\b/i.test(t)) return 'Petro-Canada';
+  if (/\bESSO\b/i.test(t)) return 'Esso';
+  if (/\bSHELL\b/i.test(t)) return 'Shell';
+  if (/\bULTRAMAR\b/i.test(t)) return 'Ultramar';
+  if (/\bPIONEER\b/i.test(t)) return 'Pioneer';
+  if (/\bCIRCLE\s*K\b/i.test(t)) return 'Circle K';
+
+  if (/\bHOME\s*DEPOT\b/i.test(t)) return 'Home Depot';
+  if (/\bHOME\s*HARDWARE\b/i.test(t)) return 'Home Hardware';
+  if (/\bRONA\b/i.test(t)) return 'Rona';
+  if (/\bLOWE'?S\b/i.test(t)) return "Lowe's";
+
+  // 3) Nothing found
   return null;
 }
+
+// Optional: tiny helper to keep vendor formatting sane
+function titleCaseVendor(s) {
+  const x = String(s || '').trim();
+  if (!x) return null;
+  // Preserve common brand styling
+  if (/petro[- ]?canada/i.test(x)) return 'Petro-Canada';
+  if (/circle\s*k/i.test(x)) return 'Circle K';
+  // Default title case
+  return x
+    .toLowerCase()
+    .split(' ')
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
 
 /* ---------------- category heuristics ---------------- */
 
@@ -1315,49 +1351,46 @@ function formatMoneyDisplay(n) {
 
 /**
  * ✅ UPDATED: normalizeExpenseData(data, userProfile, sourceText?)
- * - Uses receipt TOTAL/date/store when present
- * - Then applies your standard formatting/defaults
+ * - Receipt-first: backfills missing/weak amount/date/store from receipt text
+ * - Then applies formatting/defaults
  */
 function normalizeExpenseData(data, userProfile, sourceText = '') {
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
   const d = { ...(data || {}) };
 
+  const src = String(sourceText || '').trim();
+
   // ---------------------------
-  // Receipt-first fixes (only if missing/weak)
+  // Receipt-first backfills
   // ---------------------------
 
+  // Amount
   const currentAmt = d.amount != null ? toNumberAmount(d.amount) : null;
-  const receiptTotal = extractReceiptTotal(sourceText);
+  const receiptTotal = src ? extractReceiptTotal(src) : null;
 
   if ((d.amount == null || !Number.isFinite(currentAmt) || currentAmt <= 0) && receiptTotal != null) {
     d.amount = receiptTotal; // numeric; formatted below
   }
 
-  if (!String(d.date || '').trim()) {
-    const receiptDate = extractReceiptDate(sourceText);
+  // Date
+  if (!String(d.date || '').trim() && src) {
+    const receiptDate = extractReceiptDate(src);
     if (receiptDate) d.date = receiptDate;
   }
 
+  // Store (vendor)
   const storeTrim = String(d.store || '').trim();
-  if (!storeTrim || /^unknown\b/i.test(storeTrim)) {
-    const receiptStore = extractReceiptStore(sourceText);
+  const storeWeak = !storeTrim || /^unknown\b/i.test(storeTrim) || storeTrim.length > 60 || /\$\d/.test(storeTrim);
+
+  if (storeWeak && src) {
+    const receiptStore = extractReceiptStore(src);
     if (receiptStore) d.store = receiptStore;
   }
-  // Vendor: Petro-Canada receipts commonly include "TRANSACTION RECORD PETRO-CANADA"
-if (!store) {
-  const m = text.match(/TRANSACTION\s+RECORD\s+([A-Z0-9&' .-]{3,40})/i);
-  if (m?.[1]) {
-    const cand = String(m[1]).trim();
-    // avoid “TOTAL / INTERAC / FUEL SALES”
-    if (!/\b(total|interac|fuel|sales|hst|gst|pst)\b/i.test(cand)) store = cand;
-  }
-}
-if (!store && /\bPETRO[- ]?CANADA\b/i.test(text)) store = 'Petro-Canada';
-
 
   // ---------------------------
   // Your original normalization
   // ---------------------------
+
   if (d.amount != null) {
     const n = toNumberAmount(d.amount);
     if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
@@ -1383,6 +1416,7 @@ if (!store && /\bPETRO[- ]?CANADA\b/i.test(text)) store = 'Petro-Canada';
 
   return d;
 }
+
 
 
 async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
@@ -2283,27 +2317,10 @@ function parseReceiptBackstop(ocrText) {
   const t = normalizeDashes(String(ocrText || '')).replace(/\s+/g, ' ').trim();
   if (!t) return null;
 
-  // Store guess: first line-ish with "Home Hardware" etc
-  let store = null;
-  const storeHints = [
-    /home hardware/i,
-    /home\s+building\s+centre/i,
-    /building\s+centre/i,
-    /rona/i,
-    /home\s+depot/i,
-    /lowe'?s/i
-  ];
-  for (const re of storeHints) {
-    const m = t.match(re);
-    if (m) {
-      // grab a small window around the match
-      const i = Math.max(0, m.index - 20);
-      store = t.slice(i, i + 60).trim();
-      break;
-    }
-  }
+  // ✅ Store: use extractReceiptStore instead of substring window heuristics
+  const store = extractReceiptStore(t);
 
-  // Date: support MM/DD/YYYY and also your shown "01/07/2026"
+  // Date: support MM/DD/YYYY and also ISO
   let dateIso = null;
   const mdY = t.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
   if (mdY) {
@@ -2319,6 +2336,7 @@ function parseReceiptBackstop(ocrText) {
   const totalLine =
     t.match(/\btotal\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
     t.match(/\bdebit\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
+    t.match(/\binterac\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
     null;
 
   if (totalLine?.[1]) {
@@ -2335,6 +2353,7 @@ function parseReceiptBackstop(ocrText) {
 
   return { total, dateIso, store, currency };
 }
+
 
 function mergeDraftNonNull(dst, patch) {
   const out = { ...(dst || {}) };

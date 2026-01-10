@@ -3978,7 +3978,16 @@ await pg.insertTransaction({
           .filter(Boolean)
           .join('\n');
 
-        return out(twimlText(okMsg), false);
+        // ✅ Send success via the same outbound channel you use elsewhere
+try {
+  await sendConfirmExpenseOrFallback(from, okMsg); // (despite name, it sends a normal message too)
+} catch (e) {
+  console.warn('[EXPENSE] success send failed (ignored):', e?.message);
+}
+
+// ✅ Return a minimal TwiML (so webhook completes cleanly)
+return out(twimlText(''), false);
+
       } catch (e) {
         console.error('[YES] handler failed:', e?.message);
         return out(

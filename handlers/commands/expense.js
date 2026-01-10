@@ -3750,6 +3750,7 @@ if (confirmPA?.payload?.draft) {
     // --------------------------------------------
     // ✅ YES (HARDENED + DOES INSERT + MUST RETURN)
     // --------------------------------------------
+    const userKey = paUserId; // canonical digits-based PA key
     if (token === 'yes') {
       try {
         // Always operate on freshest confirm PA (avoid stale confirmPA var)

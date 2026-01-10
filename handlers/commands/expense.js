@@ -4267,6 +4267,13 @@ if (looksLikeReceiptText(input)) {
   try {
     const receiptText = stripExpensePrefixes(String(input || '')).trim();
     const back = parseReceiptBackstop(receiptText);
+// ✅ Default currency for receipts (Canada = CAD)
+// Prefer explicit profile currency, then owner locale hint, then CAD as safe default.
+const defaultCurrency =
+  String(userProfile?.currency || '').trim().toUpperCase() ||
+  String(ownerProfile?.currency || '').trim().toUpperCase() ||
+  (String(ownerProfile?.locale || '').toLowerCase().includes('ca') ? 'CAD' : '') ||
+  'CAD';
 
     const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
     const draft0 = c0?.payload?.draft || {};
@@ -4279,17 +4286,20 @@ if (looksLikeReceiptText(input)) {
     const userKey = String(paUserId || '').trim() || String(from || '').trim();
 
     const patch = {
-      store: back?.store || null,
-      date: back?.dateIso || null,
-      amount: back?.total != null ? String(Number(back.total).toFixed(2)) : null,
-      currency: back?.currency || null,
+  store: back?.store || null,
+  date: back?.dateIso || null,
+  amount: back?.total != null ? String(Number(back.total).toFixed(2)) : null,
 
-      receiptText,
-      ocrText: receiptText,
+  // ✅ NEW: currency default
+  currency: back?.currency || draft0?.currency || defaultCurrency,
 
-      originalText: draft0.originalText || receiptText,
-      draftText: draft0.draftText || receiptText
-    };
+  receiptText,
+  ocrText: receiptText,
+
+  originalText: draft0.originalText || receiptText,
+  draftText: draft0.draftText || receiptText
+};
+
 
     const mergedDraft = mergeDraftNonNull(draft0, patch);
 

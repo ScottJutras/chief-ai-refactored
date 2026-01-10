@@ -2641,18 +2641,48 @@ function formatExpenseConfirmText(draft) {
 }
 
 // Parse edit payload and merge into existing draft WITHOUT losing receipt/media linkage.
+// ✅ Rule: Only overwrite fields the user explicitly intended to change.
 async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   const { handleInputWithAI, parseExpenseMessage } = require('../../utils/aiErrorHandler');
 
   const tz = ctx?.tz || 'America/Toronto';
+  const raw = String(editText || '').trim();
+  const lc = raw.toLowerCase();
+
+  // --------- helpers ---------
+  const isUnknownish = (s) => {
+    const x = String(s || '').trim().toLowerCase();
+    return !x || x === 'unknown' || x.startsWith('unknown ');
+  };
+
+  const hasMoney = (s) => /\$?\s*-?\d{1,3}(?:,\d{3})*(?:\.\d{2})\b/.test(String(s || ''));
+  const hasDateToken = (s) =>
+    /\b(\d{4}-\d{2}-\d{2}|\d{2}\/\d{2}\/\d{4}|\d{4}[\/.]\d{2}[\/.]\d{2})\b/.test(String(s || '')) ||
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(String(s || '')) ||
+    /\b(today|yesterday|tomorrow)\b/i.test(String(s || ''));
+
+  const explicit = {
+    amount:
+      /\b(amount|total|price|cost)\b/i.test(raw) || hasMoney(raw),
+    date:
+      /\b(date|day|on\s)\b/i.test(raw) || hasDateToken(raw),
+    store:
+      /\b(store|vendor|merchant|from|at)\b/i.test(raw),
+    item:
+      /\b(item|for|bought|purchase|description|desc)\b/i.test(raw),
+    category:
+      /\b(category|categorize|type)\b/i.test(raw),
+    job:
+      /\b(job|for job|change job|overhead)\b/i.test(raw)
+  };
 
   // IMPORTANT: Do not strip to "" before parsing — pass the user's actual message.
   const aiRes = await handleInputWithAI(
-    ctx.fromKey,
-    editText,
+    ctx?.fromKey,
+    raw,
     'expense',
     parseExpenseMessage,
-    ctx.defaultData || {},
+    ctx?.defaultData || {},
     { tz }
   );
 
@@ -2662,31 +2692,70 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   }
 
   const data = aiRes.data || {};
-  const nextDraft = {
-    ...(existingDraft || {}),
+  const out = { ...(existingDraft || {}) };
 
-    // Merge fields only if provided
-    amount: data.amount ?? existingDraft?.amount,
-    date: data.date ?? existingDraft?.date,
-    store: data.store ?? existingDraft?.store,
-    item: data.item ?? existingDraft?.item,
-    description: data.description ?? existingDraft?.description,
-    category: data.category ?? existingDraft?.category,
+  // ---------- preserve receipt/media linkage ALWAYS ----------
+  out.media_asset_id =
+    existingDraft?.media_asset_id || existingDraft?.mediaAssetId || data?.media_asset_id || data?.mediaAssetId || null;
 
-    // job hint from deterministic parser
-    job_name: data.jobName ?? existingDraft?.job_name,
-    jobName: data.jobName ?? existingDraft?.jobName,
+  out.media_source_msg_id =
+    existingDraft?.media_source_msg_id || existingDraft?.mediaSourceMsgId || data?.media_source_msg_id || data?.mediaSourceMsgId || null;
 
-    // DO NOT lose receipt/media linkage
-    media_asset_id: existingDraft?.media_asset_id || existingDraft?.mediaAssetId || null,
-    media_source_msg_id: existingDraft?.media_source_msg_id || existingDraft?.mediaSourceMsgId || null,
+  out.source_msg_id =
+    existingDraft?.source_msg_id || existingDraft?.sourceMsgId || data?.source_msg_id || data?.sourceMsgId || null;
 
-    // DO NOT change canonical source id (the MM... confirmFlowId)
-    source_msg_id: existingDraft?.source_msg_id || existingDraft?.sourceMsgId || null
-  };
+  // Preserve receipt text fields so later normalize/backstop can keep working
+  out.receiptText = existingDraft?.receiptText || existingDraft?.ocrText || existingDraft?.extractedText || out.receiptText || null;
+  out.ocrText = existingDraft?.ocrText || out.ocrText || null;
+  out.extractedText = existingDraft?.extractedText || out.extractedText || null;
 
-  return { nextDraft, aiReply: null };
+  // ---------- guarded merges (only if explicitly changed) ----------
+  if (explicit.amount) {
+    // Avoid overwriting with "$0.00" or nonsense
+    if (data.amount != null && !String(data.amount).includes('$0.00')) out.amount = data.amount;
+  }
+
+  if (explicit.date) {
+    if (data.date && String(data.date).trim()) out.date = data.date;
+  }
+
+  if (explicit.store) {
+    if (data.store && !isUnknownish(data.store)) out.store = data.store;
+  }
+
+  if (explicit.item) {
+    if (data.item && !isUnknownish(data.item)) out.item = data.item;
+    if (data.description && !isUnknownish(data.description)) out.description = data.description;
+  }
+
+  if (explicit.category) {
+    if (data.category && !isUnknownish(data.category)) out.category = data.category;
+    if (data.suggestedCategory && !isUnknownish(data.suggestedCategory)) out.suggestedCategory = data.suggestedCategory;
+  }
+
+  if (explicit.job) {
+    // Keep your canonical fields
+    if (data.jobName && !isUnknownish(data.jobName)) out.jobName = data.jobName;
+    if (data.job_name && !isUnknownish(data.job_name)) out.job_name = data.job_name;
+
+    // If parseExpenseMessage returns jobSource/job_no, keep them
+    if (data.jobSource && String(data.jobSource).trim()) out.jobSource = data.jobSource;
+    if (data.job_no != null) out.job_no = data.job_no;
+  }
+
+  // ---------- ensure we never accidentally null out strong values ----------
+  // (AI sometimes sends blanks; we only set when non-empty above, so this is mostly redundant,
+  // but it protects against weird schema outputs.)
+  if (out.store && isUnknownish(out.store) && existingDraft?.store && !isUnknownish(existingDraft.store)) {
+    out.store = existingDraft.store;
+  }
+  if (out.amount === '$0.00' && existingDraft?.amount && existingDraft.amount !== '$0.00') {
+    out.amount = existingDraft.amount;
+  }
+
+  return { nextDraft: out, aiReply: null };
 }
+
 
 
 /* ---------------- main handler ---------------- */

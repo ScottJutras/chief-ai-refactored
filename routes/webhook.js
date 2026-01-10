@@ -842,10 +842,22 @@ router.post('*', async (req, res, next) => {
 
     let pending = await getPendingTransactionState(req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
+const crypto = require('crypto');
 
-    let text = String(getInboundText(req.body || {}) || '').trim();
-    let lc = text.toLowerCase();
-     // -----------------------------------------------------------------------
+let text = String(getInboundText(req.body || {}) || '').trim();
+let lc = text.toLowerCase();
+
+// ✅ Compute messageSid EARLY so resume can use it safely
+const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
+const messageSid =
+  rawSid ||
+  crypto
+    .createHash('sha256')
+    .update(`${req.from || ''}|${text}`)
+    .digest('hex')
+    .slice(0, 32);
+
+// -----------------------------------------------------------------------
 // "resume" => re-send the pending confirm card if we have a confirm pending-action
 // MUST run early (before nudge / PA router / job picker / fast paths / agent)
 // -----------------------------------------------------------------------
@@ -860,9 +872,10 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
 
     if (kind === 'confirm_expense' || kind === 'pick_job_for_expense') {
       const { handleExpense } = require('../handlers/commands/expense');
+
       const result = await handleExpense(
         req.from,
-        'edit', // triggers your edit prompt flow (or swap to a "sendConfirm" if you have one)
+        'resume', // ✅ correct intent: resend confirm
         req.userProfile,
         req.ownerId,
         req.ownerProfile,
@@ -870,6 +883,7 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
         messageSid,
         req.body
       );
+
       if (!res.headersSent) {
         const tw = typeof result === 'string' ? result : (result?.twiml || null);
         return sendTwiml(res, tw);
@@ -879,9 +893,10 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
 
     if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
       const { handleRevenue } = require('../handlers/commands/revenue');
+
       const result = await handleRevenue(
         req.from,
-        'edit',
+        'resume', // ✅ correct intent
         req.userProfile,
         req.ownerId,
         req.ownerProfile,
@@ -889,6 +904,7 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
         messageSid,
         req.body
       );
+
       if (!res.headersSent) {
         const tw = typeof result === 'string' ? result : (result?.twiml || null);
         return sendTwiml(res, tw);
@@ -902,10 +918,7 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
   return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
 }
 
-    const crypto = require('crypto');
-    const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-    const messageSid =
-      rawSid || crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
+
     // -----------------------------------------------------------------------
     // ✅ EDIT LOOP FIX: if user is in "awaiting_edit" mode and sends a full
     // "expense ..." or "revenue ..." line, treat it as "Yes" (auto-submit),

@@ -467,24 +467,28 @@ function extractJobNoFromWhatsAppListTitle(title) {
 
 
 async function resendConfirmExpense({ from, ownerId, tz, paUserId }) {
-  const paKey =
-    normalizeIdentityDigits(paUserId) ||
-    normalizeIdentityDigits(from) ||
-    String(from || '').trim();
+  // ✅ Canonical: NEVER re-key; use the same PA key you write with everywhere else
+  const paKey = String(paUserId || '').trim() || String(from || '').trim();
 
-  const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+  const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
 
-  const draft = confirmPA.payload.draft || {};
+  const draft = confirmPA?.payload?.draft || null;
+  if (!draft || !Object.keys(draft).length) {
+    // Return a clean message instead of throwing
+    return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
+  }
 
   const srcText =
-    confirmPA.payload.humanLine ||
-    confirmPA.payload.summaryLine ||
+    confirmPA?.payload?.humanLine ||
+    confirmPA?.payload?.summaryLine ||
     draft.draftText ||
     draft.originalText ||
+    draft.receiptText ||
+    draft.ocrText ||
     '';
 
   const line =
-    confirmPA.payload.humanLine ||
+    confirmPA?.payload?.humanLine ||
     buildExpenseSummaryLine({
       amount: draft.amount,
       item: draft.item,
@@ -496,8 +500,10 @@ async function resendConfirmExpense({ from, ownerId, tz, paUserId }) {
     }) ||
     'Confirm expense?';
 
-  return sendConfirmExpenseOrFallback(from, line);
+  // ✅ Important: return the TwiML result
+  return await sendConfirmExpenseOrFallback(from, line);
 }
+
 async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile }) {
   const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
   const draft = confirmPA?.payload?.draft;
@@ -3103,20 +3109,22 @@ if (
     confirmFlowId || stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`;
 
   // ✅ Resume works even while we’re in the picker flow
-  if (tok === 'resume') {
-    const confirmPA0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-    const draft0 = confirmPA0?.payload?.draft || null;
+if (tok === 'resume') {
+  const confirmPA0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
+  const draft0 = confirmPA0?.payload?.draft || null;
 
-    if (draft0) {
-      try {
-        return await resendConfirmExpense({ from, ownerId, tz, paUserId });
-      } catch (e) {
-        console.warn('[EXPENSE] resume during pick failed; fallback to text:', e?.message);
-        return out(twimlText(formatExpenseConfirmText(draft0)), false);
-      }
+  if (draft0 && Object.keys(draft0).length) {
+    try {
+      return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+    } catch (e) {
+      console.warn('[EXPENSE] resume during pick failed; fallback to text:', e?.message);
+      return out(twimlText(formatExpenseConfirmText(draft0)), false);
     }
-    return out(twimlText('No pending expense to resume.'), false);
   }
+
+  return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
+}
+
 
   // If user sent a brand new expense while waiting for job pick, clear state and continue parsing.
   if (looksLikeNewExpenseText(input)) {
@@ -3881,31 +3889,67 @@ if (confirmPA?.payload?.draft) {
           }
         } catch {}
 
-        // ✅ ACTUAL DB INSERT
-        await pg.insertTransaction({
-          ownerId,
-          owner_id: ownerId,
-          userId: paUserId,
-          user_id: paUserId,
-          fromPhone: from,
-          from,
+// ---------------------------------------------------
+// ✅ ACTUAL DB INSERT (HARDENED amount → amount_cents)
+// ---------------------------------------------------
 
-          type: 'expense',
-          kind: 'expense',
+// 1) Derive a clean amount number from "$14.84", "14.84", "Total 14.84 CAD", etc.
+const amountRaw = String(data?.amount ?? rawDraft?.amount ?? '').trim();
+const m = amountRaw.match(/-?\d+(?:\.\d+)?/);
+const amountNum = m ? Number(m[0]) : NaN;
 
-          ...data,
+if (!Number.isFinite(amountNum) || amountNum <= 0) {
+  return out(
+    twimlText(`I couldn’t confirm the total amount from "${amountRaw}". Reply like: "14.84".`),
+    false
+  );
+}
 
-          jobName,
-          jobSource,
-          suggestedCategory: categoryStr,
-          category: categoryStr,
+// 2) Convert to integer cents (always)
+const amountCents = Math.round(amountNum * 100);
 
-          media_asset_id: data.media_asset_id || null,
-          media_source_msg_id: data.media_source_msg_id || null,
+// 3) Canonicalize fields so pg.insertTransaction() can’t misread them
+data.amount = amountNum.toFixed(2);      // ✅ also update data so your reply uses clean amount
+data.amount_cents = amountCents;
 
-          sourceMsgId: txSourceMsgId || null,
-          source_msg_id: txSourceMsgId || null
-        });
+// ✅ Ensure insertTransaction gets what it expects
+const sourceForDb = String(data.store || '').trim() || 'Unknown';
+const descForDb = String(data.item || data.description || '').trim() || 'Unknown';
+
+// 4) Insert (pass BOTH amount + amount_cents)
+await pg.insertTransaction({
+  ownerId,
+  owner_id: ownerId,
+  userId: paUserId,
+  user_id: paUserId,
+  fromPhone: from,
+  from,
+
+  kind: 'expense',
+  date: String(data.date || '').trim(), // insertTransaction requires date
+
+  // ✅ map your semantics to what insertTransaction actually uses
+  source: sourceForDb,
+  description: descForDb,
+
+  // keep your normalized fields too
+  ...data,
+
+  // ✅ force canonical amount forms (override any "$14.84" lingering)
+  amount: amountNum.toFixed(2),
+  amount_cents: amountCents,
+
+  // job details
+  jobName,
+  jobSource,
+
+  category: categoryStr,
+
+  media_asset_id: data.media_asset_id || null,
+  source_msg_id: txSourceMsgId || null
+});
+
+
 
         console.info('[EXPENSE_INSERT_OK]', {
           paUserId,

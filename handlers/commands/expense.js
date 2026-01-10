@@ -1149,64 +1149,62 @@ function extractReceiptTotal(text) {
     /\b(points?|redeem(ed)?|balance|bonus|base\s*points?|loyalty|member|rewards?)\b/i;
 
   const BAD_CONTEXT =
-    /\b(invoice|inv|order|auth|approval|reference|ref|customer|acct|account|terminal|trace|batch)\b/i;
+    /\b(invoice|inv|order|auth|approval|reference|ref|customer|acct|account|terminal|trace|batch|pump|litre|liter|l\/|price\/l)\b/i;
 
   const hasHyphenatedId = (s) => /\b\d{3,6}-\d{1,4}\b/.test(s);          // 1852-4
   const hasLongDigitRun = (s) => /\b\d{8,}\b/.test(s);                   // barcode/account-ish
-  const money2dp = (s) => s.match(/(?:^|[^0-9])(\d{1,6}\.\d{2})(?:[^0-9]|$)/);
+
+  // ✅ allow 1,234.56 or 1234.56
+  const money2dp = (s) => s.match(/(?:^|[^0-9])(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d{1,6}\.\d{2})(?:[^0-9]|$)/);
 
   const toNum = (x) => {
-    const n = Number(x);
+    const n = Number(String(x).replace(/,/g, ''));
     return Number.isFinite(n) ? n : null;
   };
 
-  // 1) Strong: TOTAL lines (must be 2dp, not “points/balance”, not ref-like)
+  const goodLine = (lc) => {
+    if (BAD_LINE.test(lc)) return false;
+    if (BAD_CONTEXT.test(lc)) return false;
+    if (hasHyphenatedId(lc)) return false;
+    if (hasLongDigitRun(lc)) return false;
+    return true;
+  };
+
+  // 1) Strong: TOTAL lines
   for (const line of lines) {
     const lc = line.toLowerCase();
-
-    if (BAD_LINE.test(lc)) continue;
-    if (BAD_CONTEXT.test(lc)) continue;
-    if (hasHyphenatedId(lc)) continue;
-    if (hasLongDigitRun(lc)) continue;
+    if (!goodLine(lc)) continue;
 
     if (/\btotal\b/i.test(lc)) {
       const m = money2dp(lc);
       if (m?.[1]) {
         const n = toNum(m[1]);
-        if (n != null && n > 0 && n < 100000) return n;
+        if (n != null && n > 0 && n < 100000) return Number(n.toFixed(2));
       }
     }
   }
 
-  // 2) Backup: GRAND TOTAL / AMOUNT DUE (common variants)
+  // 2) Backup: GRAND TOTAL / AMOUNT DUE
   for (const line of lines) {
     const lc = line.toLowerCase();
-
-    if (BAD_LINE.test(lc)) continue;
-    if (BAD_CONTEXT.test(lc)) continue;
-    if (hasHyphenatedId(lc)) continue;
-    if (hasLongDigitRun(lc)) continue;
+    if (!goodLine(lc)) continue;
 
     if (/\b(grand\s*total|amount\s*due|total\s*due)\b/i.test(lc)) {
       const m = money2dp(lc);
       if (m?.[1]) {
         const n = toNum(m[1]);
-        if (n != null && n > 0 && n < 100000) return n;
+        if (n != null && n > 0 && n < 100000) return Number(n.toFixed(2));
       }
     }
   }
 
-  // 3) Backup: Subtotal + Tax (both must be 2dp, and not points/balance)
+  // 3) Backup: Subtotal + Tax
   let subtotal = null;
   let tax = null;
 
   for (const line of lines) {
     const lc = line.toLowerCase();
-
-    if (BAD_LINE.test(lc)) continue;
-    if (BAD_CONTEXT.test(lc)) continue;
-    if (hasHyphenatedId(lc)) continue;
-    if (hasLongDigitRun(lc)) continue;
+    if (!goodLine(lc)) continue;
 
     if (/\bsubtotal\b/i.test(lc)) {
       const m = money2dp(lc);
@@ -1230,29 +1228,77 @@ function extractReceiptTotal(text) {
     if (Number.isFinite(n) && n > 0 && n < 100000) return Number(n.toFixed(2));
   }
 
+  // ✅ 4) Final fallback: PURCHASE / PAID / DEBIT / AMOUNT (when TOTAL isn't present)
+  // Choose the *largest plausible* money value from these lines, but still filtered.
+  let best = null;
+
+  for (const line of lines) {
+    const lc = line.toLowerCase();
+    if (!goodLine(lc)) continue;
+
+    if (/\b(purchase|paid|debit|credit|amount)\b/i.test(lc)) {
+      const m = money2dp(lc);
+      if (m?.[1]) {
+        const n = toNum(m[1]);
+        if (n != null && n > 0 && n < 100000) {
+          if (best == null || n > best) best = n;
+        }
+      }
+    }
+  }
+
+  if (best != null) return Number(best.toFixed(2));
+
   return null;
 }
 
 
 
-// Extract MM/DD/YYYY (common receipt format). Returns YYYY-MM-DD.
+// Extract common receipt dates. Returns YYYY-MM-DD.
 function extractReceiptDate(text) {
   const raw = String(text || '');
   if (!raw) return null;
 
-  // Prefer MM/DD/YYYY
-  const m = raw.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
-  if (m) {
-    const mm = m[1], dd = m[2], yyyy = m[3];
+  // 1) Prefer explicit YYYY-MM-DD (works with timestamps too)
+  const ymd = raw.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  if (ymd) return `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+
+  // 2) MM/DD/YYYY (US-style)
+  const mdy = raw.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
+  if (mdy) {
+    const mm = mdy[1], dd = mdy[2], yyyy = mdy[3];
     return `${yyyy}-${mm}-${dd}`;
   }
 
-  // Backup: YYYY-MM-DD if OCR happens to normalize
-  const m2 = raw.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-  if (m2) return `${m2[1]}-${m2[2]}-${m2[3]}`;
+  // 3) YYYY/MM/DD or YYYY.MM.DD
+  const ymd2 = raw.match(/\b(\d{4})[\/.](\d{2})[\/.](\d{2})\b/);
+  if (ymd2) return `${ymd2[1]}-${ymd2[2]}-${ymd2[3]}`;
+
+  // 4) Month name formats: "Jan 05 2026" or "05 Jan 2026"
+  const monMap = {
+    jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+    jul: '07', aug: '08', sep: '09', sept: '09', oct: '10', nov: '11', dec: '12'
+  };
+
+  let m = raw.match(/\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})\s*,?\s*(\d{4})\b/i);
+  if (m) {
+    const mm = monMap[String(m[1]).toLowerCase().slice(0, 4).replace('sept','sep')] || monMap[String(m[1]).toLowerCase().slice(0,3)];
+    const dd = String(m[2]).padStart(2, '0');
+    const yyyy = m[3];
+    if (mm) return `${yyyy}-${mm}-${dd}`;
+  }
+
+  m = raw.match(/\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+(\d{4})\b/i);
+  if (m) {
+    const dd = String(m[1]).padStart(2, '0');
+    const mm = monMap[String(m[2]).toLowerCase().slice(0, 4).replace('sept','sep')] || monMap[String(m[2]).toLowerCase().slice(0,3)];
+    const yyyy = m[3];
+    if (mm) return `${yyyy}-${mm}-${dd}`;
+  }
 
   return null;
 }
+
 
 function extractReceiptStore(text) {
   const t = normalizeDashes(String(text || '')).replace(/\s+/g, ' ').trim();

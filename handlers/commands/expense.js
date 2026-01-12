@@ -457,7 +457,7 @@ async function sendConfirmExpenseOrFallback(from, summaryLine) {
 
 
 
-async function resendConfirmExpense({ from, ownerId, tz, paUserId }) {
+async function resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile = null }) {
   // ✅ Canonical: NEVER re-key; use the same PA key you write with everywhere else
   const paKey = String(paUserId || '').trim() || String(from || '').trim();
 
@@ -465,11 +465,11 @@ async function resendConfirmExpense({ from, ownerId, tz, paUserId }) {
 
   const draft = confirmPA?.payload?.draft || null;
   if (!draft || !Object.keys(draft).length) {
-    // Return a clean message instead of throwing
     return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
   }
 
-    const srcText =
+  // Prefer stored summary/humanLine if present
+  const srcText =
     confirmPA?.payload?.humanLine ||
     confirmPA?.payload?.summaryLine ||
     draft.draftText ||
@@ -478,27 +478,24 @@ async function resendConfirmExpense({ from, ownerId, tz, paUserId }) {
     draft.ocrText ||
     '';
 
-  // ✅ Normalize once so confirm UI matches what YES will log
-  const normSourceText = String(srcText || '').trim();
-  const normalizedDraft = normalizeExpenseData(draft, userProfile, normSourceText);
-
   const line =
     confirmPA?.payload?.humanLine ||
+    confirmPA?.payload?.summaryLine ||
     buildExpenseSummaryLine({
-      amount: normalizedDraft.amount,
-      item: normalizedDraft.item,
-      store: normalizedDraft.store,
-      date: normalizedDraft.date,
-      jobName: normalizedDraft.jobName || draft.jobName,
+      amount: draft.amount,
+      item: draft.item,
+      store: draft.store,
+      date: draft.date,
+      jobName: draft.jobName,
       tz,
-      sourceText: normSourceText
+      sourceText: srcText
     }) ||
     'Confirm expense?';
 
-
-  // ✅ Important: return the TwiML result
+  // ✅ Send interactive template/quick replies if possible
   return await sendConfirmExpenseOrFallback(from, line);
 }
+
 
 async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile }) {
   const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
@@ -3289,7 +3286,7 @@ if (tok === 'resume') {
 
   if (draft0 && Object.keys(draft0).length) {
     try {
-      return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+      return await resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile });
     } catch (e) {
       console.warn('[EXPENSE] resume during pick failed; fallback to text:', e?.message);
       return out(twimlText(formatExpenseConfirmText(draft0)), false);
@@ -3369,7 +3366,8 @@ if (tok === 'resume') {
   const confirmPA0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
   if (confirmPA0?.payload?.draft) {
     try {
-      return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+      return await resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile });
+
     } catch {}
     return out(twimlText(formatExpenseConfirmText(confirmPA0.payload.draft)), false);
   }
@@ -3620,7 +3618,7 @@ if (looksLikePickerTap) {
     } catch {}
 
     // ✅ Immediately re-send confirm UI (interactive template if available)
-    return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+    return await resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile });
   }
 
 
@@ -3856,7 +3854,7 @@ if (confirmPA?.payload?.draft) {
           confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
         } catch {}
 
-        return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+        return await resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile });
       }
     }
   } catch (e) {
@@ -3899,7 +3897,7 @@ if (confirmPA?.payload?.draft) {
     // ✅ Resume: re-send confirm for the existing pending expense (no state changes)
     if (token === 'resume') {
       try {
-        return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+        return await resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile });
       } catch (e) {
         console.warn('[EXPENSE] resume confirm resend failed (fallback to text):', e?.message);
         return out(twimlText(formatExpenseConfirmText(confirmPA.payload.draft)), false);
@@ -4487,7 +4485,7 @@ if (looksLikeReceiptText(input)) {
 
     // If seeded confirm but picker failed, re-send confirm instead of nag text.
     try {
-      return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+      return await resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile });
     } catch {
       return out(twimlText(''), true);
     }

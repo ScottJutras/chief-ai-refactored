@@ -2373,8 +2373,8 @@ function parseReceiptBackstop(ocrText) {
     const mm = mdY[1], dd = mdY[2], yyyy = mdY[3];
     dateIso = `${yyyy}-${mm}-${dd}`;
   } else {
-    const ymd = t.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
-    if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+    const ymd = t.match(/\b(\d{4})\s*-\s*(\d{2})\s*-\s*(\d{2})\b/);
+if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
   }
 
   // ✅ Total: prefer explicit "Total"
@@ -3726,7 +3726,7 @@ return await resendConfirmExpense({ from, ownerId, tz });
       }
     }
 
-  // ---- 2) Confirm/edit/cancel (CONSOLIDATED) ----
+ // ---- 2) Confirm/edit/cancel (CONSOLIDATED) ----
 let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
 let bypassConfirmToAllowNewIntake = false;
 
@@ -3736,66 +3736,99 @@ if (confirmPA?.payload?.draft) {
     await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
     return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
   }
-// ✅ Currency-only reply consumption (prevents “unfinished expense” nag)
-// If the user replies "CAD" / "USD" etc while a confirm draft is pending, treat it as a patch.
 
   const token = normalizeDecisionToken(rawInboundText);
   const lcRaw = String(rawInboundText || '').trim().toLowerCase();
-// ✅ Currency-only reply consumption (prevents “unfinished expense” nag)
-try {
-  // Never consume currency if user is issuing a real decision token
-  if (!['yes', 'edit', 'cancel', 'resume', 'skip', 'change_job'].includes(token)) {
-    const draft = confirmPA?.payload?.draft || null;
-    const draftCurrency = String(draft?.currency || '').trim();
-    const awaitingCurrency = !!draft?.awaiting_currency;
 
-    const tokCurrencyRaw = String(rawInboundText || '').trim().toUpperCase();
-    const isCurrencyToken = /^(CAD|USD|EUR|GBP|C\$|US\$)$/.test(tokCurrencyRaw);
+  // ✅ 0) If awaiting edit, consume edit payload FIRST (and RETURN)
+  if (confirmPA?.payload?.draft?.awaiting_edit) {
+    if (!isControlDuringEdit(rawInboundText, inboundTwilioMeta)) {
+      const existingDraft = confirmPA.payload.draft || {};
+      const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
 
-    if (draft && isCurrencyToken && (!draftCurrency || awaitingCurrency)) {
-      const normalizedCurrency =
-        tokCurrencyRaw === 'C$' ? 'CAD' : tokCurrencyRaw === 'US$' ? 'USD' : tokCurrencyRaw;
+      const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
+        rawInboundText,
+        existingDraft,
+        { fromKey: paUserId, tz: tz0, defaultData: {} }
+      );
 
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA.payload || {}),
-          draft: {
-            ...(draft || {}),
-            currency: normalizedCurrency,
-            awaiting_currency: false
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
+      if (!nextDraft) {
+        return out(
+          twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
+          false
+        );
+      }
 
-      // Refresh confirmPA (best-effort)
       try {
-        confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-      } catch {}
-
-      // Re-send confirm immediately
-      try {
-        return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+        await upsertPA({
+          ownerId,
+          userId: paUserId,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...(confirmPA.payload || {}),
+            draft: {
+              ...(existingDraft || {}),
+              ...nextDraft,
+              awaiting_edit: false
+            }
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
       } catch (e) {
-        console.warn('[EXPENSE] resendConfirmExpense after currency patch failed (fallback):', e?.message);
-        const d2 = confirmPA?.payload?.draft || { ...(draft || {}), currency: normalizedCurrency };
-        return out(twimlText(formatExpenseConfirmText(d2)), false);
+        console.warn('[EXPENSE] apply edit upsertPA failed (ignored):', e?.message);
+      }
+
+      // ✅ CRITICAL: stop here and re-send confirm UI (prevents “unfinished expense” nag)
+      return await resendConfirmExpense({ from, ownerId, tz: tz0, paUserId });
+    }
+    // control tokens fall through to normal logic
+  }
+
+  // ✅ 1) Currency-only reply consumption (only when it's a pure currency token)
+  try {
+    if (!['yes', 'edit', 'cancel', 'resume', 'skip', 'change_job'].includes(token)) {
+      const draft = confirmPA?.payload?.draft || null;
+      const draftCurrency = String(draft?.currency || '').trim();
+      const awaitingCurrency = !!draft?.awaiting_currency;
+
+      const tokCurrencyRaw = String(rawInboundText || '').trim().toUpperCase();
+      const isCurrencyToken = /^(CAD|USD|EUR|GBP|C\$|US\$)$/.test(tokCurrencyRaw);
+
+      if (draft && isCurrencyToken && (!draftCurrency || awaitingCurrency)) {
+        const normalizedCurrency =
+          tokCurrencyRaw === 'C$' ? 'CAD' : tokCurrencyRaw === 'US$' ? 'USD' : tokCurrencyRaw;
+
+        await upsertPA({
+          ownerId,
+          userId: paUserId,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...(confirmPA.payload || {}),
+            draft: {
+              ...(draft || {}),
+              currency: normalizedCurrency,
+              awaiting_currency: false
+            }
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
+
+        try {
+          confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+        } catch {}
+
+        return await resendConfirmExpense({ from, ownerId, tz, paUserId });
       }
     }
+  } catch (e) {
+    console.warn('[EXPENSE] currency-only consume failed (ignored):', e?.message);
   }
-} catch (e) {
-  console.warn('[EXPENSE] currency-only consume failed (ignored):', e?.message);
-}
 
 
 // ✅ If confirm draft is awaiting an edit payload, consume the next free-text message as the edit.
 if (confirmPA?.payload?.draft?.awaiting_edit) {
-  // Allow control words to behave normally
   if (isControlDuringEdit(rawInboundText, inboundTwilioMeta)) {
-    // cancel/skip/resume/edit are handled by existing logic below
+    // fallthrough to existing token logic
   } else {
     const existingDraft = confirmPA.payload.draft || {};
     const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
@@ -3807,38 +3840,26 @@ if (confirmPA?.payload?.draft?.awaiting_edit) {
     });
 
     if (!nextDraft) {
-      return out(
-        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
-        false
-      );
+      return out(twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'), false);
     }
 
-    // Persist updated draft and clear awaiting_edit
-    try {
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA.payload || {}),
-          draft: {
-            ...(confirmPA.payload?.draft || {}),
-            ...nextDraft,
-            awaiting_edit: false
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-    } catch (e) {
-      console.warn('[EXPENSE] apply edit upsertPA failed (ignored):', e?.message);
-    }
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA.payload || {}),
+        draft: {
+          ...(existingDraft || {}),
+          ...nextDraft,
+          awaiting_edit: false
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
 
-    // Re-confirm (prefer interactive if you have it; otherwise plain text)
-    try {
-      return await resendConfirmExpense({ from, ownerId, tz: tz0, paUserId });
-    } catch {
-      return out(twimlText(formatExpenseConfirmText({ ...existingDraft, ...nextDraft })), false);
-    }
+    // ✅ CRITICAL: stop here and re-send confirm UI
+    return await resendConfirmExpense({ from, ownerId, tz: tz0, paUserId });
   }
 }
 
@@ -3909,31 +3930,83 @@ if (confirmPA?.payload?.draft?.awaiting_edit) {
       );
     }
 
-    // ✅ If user is trying to log a new expense while confirm pending:
-    if (looksLikeNewExpenseText(rawInboundText)) {
-      const allowNew = !!pendingNow?.allow_new_while_pending;
+   // ✅ If user is trying to log a new expense while confirm pending:
+if (looksLikeNewExpenseText(rawInboundText)) {
+  const allowNew = !!pendingNow?.allow_new_while_pending;
 
-      if (!allowNew) {
-        return out(
-          twimlText(
-            [
-              'You’ve still got an expense waiting for confirmation.',
-              '',
-              'Reply:',
-              '• "yes" to submit it',
-              '• "edit" to change it',
-              '• "resume" to see it again',
-              '• "skip" to keep it pending and log a new one',
-              '• "cancel" to discard it'
-            ].join('\n')
-          ),
-          false
-        );
-      }
+  if (!allowNew) {
+    return out(
+      twimlText(
+        [
+          'You’ve still got an expense waiting for confirmation.',
+          '',
+          'Reply:',
+          '• "yes" to submit it',
+          '• "edit" to change it',
+          '• "resume" to see it again',
+          '• "skip" to keep it pending and log a new one',
+          '• "cancel" to discard it'
+        ].join('\n')
+      ),
+      false
+    );
+  }
 
-      // ✅ allow new intake to proceed; keep confirmPA stored for resume
-      bypassConfirmToAllowNewIntake = true;
+  // ✅ allow ONE new intake to proceed; keep confirmPA stored for resume
+  bypassConfirmToAllowNewIntake = true;
+}
+
+// If we decided to bypass to allow new intake, fall through.
+if (!bypassConfirmToAllowNewIntake) {
+  // 🔁 Change Job (keep confirm PA)
+  if (token === 'change_job') {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    if (!jobs.length) {
+      return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
     }
+
+    // ✅ Mark confirm draft dirty so we re-parse receipt fields after job changes
+    try {
+      await upsertPA({
+        ownerId,
+        userId: paUserId,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPA.payload || {}),
+          draft: {
+            ...(confirmPA.payload?.draft || {}),
+            needsReparse: true
+          }
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+    } catch (e) {
+      console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
+    }
+
+    // ✅ Use the confirm flow id you already have (do NOT mint a new one)
+    const confirmFlowId =
+      String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+      String(stableMsgId || '').trim() ||
+      `${normalizeIdentityDigits(from) || from}:${Date.now()}`;
+
+    // IMPORTANT: send picker out-of-band; do NOT also return a TwiML body message
+    await sendJobPickList({
+      from,
+      ownerId,
+      userProfile,
+      confirmFlowId,
+      jobOptions: jobs,
+      paUserId,
+      page: 0,
+      pageSize: 8,
+      context: 'expense_jobpick',
+      confirmDraft: confirmPA?.payload?.draft || null
+    });
+
+    return out(twimlText(''), true);
+  }
+}
 
     // If we decided to bypass to allow new intake, fall through.
     if (!bypassConfirmToAllowNewIntake) {
@@ -4329,17 +4402,19 @@ return out(twimlText(okMsg), false);
 // ✅ Receipt/OCR path: seed/patch CONFIRM PA so "Yes" has something real to submit.
 // IMPORTANT: do NOT run deterministicExpenseParse on receipt blobs.
 if (looksLikeReceiptText(input)) {
+  let seededOk = false;
+
   try {
     const receiptText = stripExpensePrefixes(String(input || '')).trim();
     const back = parseReceiptBackstop(receiptText);
 
+    const locale0 = String(userProfile?.locale || ownerProfile?.locale || '').toLowerCase();
     const defaultCurrency =
-  String(userProfile?.currency || '').trim().toUpperCase() ||
-  String(ownerProfile?.currency || '').trim().toUpperCase() ||
-  (/us/i.test(String(ownerProfile?.locale || '')) ? 'USD' : '') ||
-  (/ca/i.test(String(ownerProfile?.locale || '')) ? 'CAD' : '') ||
-  'CAD';
-
+      String(userProfile?.currency || '').trim().toUpperCase() ||
+      String(ownerProfile?.currency || '').trim().toUpperCase() ||
+      (locale0.includes('us') ? 'USD' : '') ||
+      (locale0.includes('ca') ? 'CAD' : '') ||
+      'CAD';
 
     const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
     const draft0 = c0?.payload?.draft || {};
@@ -4356,12 +4431,11 @@ if (looksLikeReceiptText(input)) {
       date: back?.dateIso || null,
       amount: back?.total != null ? String(Number(back.total).toFixed(2)) : null,
 
-      // ✅ NEW: currency default (never null)
+      // ✅ Always have a currency (prefer parsed, then existing, then default)
       currency: back?.currency || draft0?.currency || defaultCurrency,
 
       receiptText,
       ocrText: receiptText,
-
       originalText: draft0.originalText || receiptText,
       draftText: draft0.draftText || receiptText
     };
@@ -4407,8 +4481,32 @@ if (looksLikeReceiptText(input)) {
       needsReparse: !(gotAmount && gotDate),
       media_asset_id: mergedDraft.media_asset_id || null
     });
+
+    seededOk = true;
   } catch (e) {
     console.warn('[RECEIPT_SEED_CONFIRM_PA] failed (ignored):', e?.message);
+  }
+
+  // ✅ Receipt intake UX: ALWAYS go to job picker first.
+  // Never emit "issues"/confirm text on receipt intake.
+  try {
+    // IMPORTANT: send picker out-of-band; do NOT return whatever it returns.
+    await sendJobPickerForExpense({ from, ownerId, paUserId, tz });
+    return out(twimlText(''), true);
+  } catch (e) {
+    console.warn('[EXPENSE] sendJobPickerForExpense failed:', e?.message);
+
+    // Fallback: if we couldn't send picker, avoid confirm nags.
+    if (!seededOk) {
+      return out(twimlText('⚠️ I couldn’t read that receipt. Try sending it again.'), false);
+    }
+
+    // If we seeded confirm but couldn't picker, stay silent (or optionally resend confirm).
+    try {
+      return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+    } catch {
+      return out(twimlText(''), true);
+    }
   }
 
   // ✅ Hard stop: do NOT run deterministic parse on receipt blobs.
@@ -4488,11 +4586,18 @@ if (looksLikeReceiptText(input)) {
 
     if (!jobName) {
       const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-      return await sendJobPickList({
+
+      const confirmFlowId =
+        String(safeMsgId0 || '').trim() ||
+        String(stableMsgId || '').trim() ||
+        `${normalizeIdentityDigits(from) || from}:${Date.now()}`;
+
+      // IMPORTANT: send picker out-of-band; do NOT also return a TwiML body message
+      await sendJobPickList({
         from,
         ownerId,
         userProfile,
-        confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
+        confirmFlowId,
         jobOptions: jobs,
         paUserId,
         page: 0,
@@ -4510,6 +4615,8 @@ if (looksLikeReceiptText(input)) {
           draftText: input
         }
       });
+
+      return out(twimlText(''), true);
     }
 
     const summaryLine = buildExpenseSummaryLine({
@@ -4629,32 +4736,42 @@ if (data && data.amount && data.amount !== '$0.00') {
   });
 
   if (!jobName) {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+  if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
 
-    return await sendJobPickList({
-      from,
-      ownerId,
-      userProfile,
-      confirmFlowId: stableMsgId || `${normalizeIdentityDigits(from) || from}:${Date.now()}`,
-      jobOptions: jobs,
-      paUserId,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft: {
-        ...data,
-        jobName: null,
-        jobSource: null,
-        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-        media_source_msg_id: safeMsgId
-          ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
-          : null,
-        originalText: input,
-        draftText: input
-      }
-    });
-  }
+  const confirmFlowId =
+    String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+    String(safeMsgId || '').trim() ||
+    String(stableMsgId || '').trim() ||
+    `${normalizeIdentityDigits(from) || from}:${Date.now()}`;
+
+  await sendJobPickList({
+    from,
+    ownerId,
+    userProfile,
+    confirmFlowId,
+    jobOptions: jobs,
+    paUserId,
+    page: 0,
+    pageSize: 8,
+    context: 'expense_jobpick',
+    confirmDraft: {
+      ...data,
+      jobName: null,
+      jobSource: null,
+      media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+      media_source_msg_id: safeMsgId
+        ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
+        : null,
+      originalText: input,
+      draftText: input
+    }
+  });
+
+  // IMPORTANT: send picker out-of-band; do NOT also return a TwiML body message
+  return out(twimlText(''), true);
+}
+
 
   const summaryLine = buildExpenseSummaryLine({
     amount: data.amount,

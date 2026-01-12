@@ -2366,7 +2366,7 @@ function parseReceiptBackstop(ocrText) {
   // ✅ Store: use extractReceiptStore instead of substring window heuristics
   const store = extractReceiptStore(t);
 
-  // Date: support MM/DD/YYYY and also ISO
+  // ✅ Date: support MM/DD/YYYY and also ISO
   let dateIso = null;
   const mdY = t.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
   if (mdY) {
@@ -2377,7 +2377,7 @@ function parseReceiptBackstop(ocrText) {
     if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
   }
 
-  // Total: prefer explicit "Total"
+  // ✅ Total: prefer explicit "Total"
   let total = null;
   const totalLine =
     t.match(/\btotal\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
@@ -2390,16 +2390,27 @@ function parseReceiptBackstop(ocrText) {
     if (!Number.isFinite(total)) total = null;
   }
 
-  // Currency (optional): CAD, USD, etc
+  // ✅ Currency (optional): CAD, USD, etc
   let currency = null;
-  const cur = t.match(/\b(CAD|USD|EUR|GBP)\b/i);
-  if (cur?.[1]) currency = cur[1].toUpperCase();
 
-  if (!total && !dateIso && !store) return null;
+  // Accept common variants: "CAD", "C$", "$CAD", "USD", "$USD"
+  const cur =
+    t.match(/\b(CAD|USD|EUR|GBP)\b/i) ||
+    t.match(/\b(C\$|US\$)\b/i) ||
+    t.match(/\$\s*(CAD|USD|EUR|GBP)\b/i);
+
+  if (cur?.[1]) {
+    const raw = String(cur[1]).toUpperCase();
+    if (raw === 'C$') currency = 'CAD';
+    else if (raw === 'US$') currency = 'USD';
+    else currency = raw.replace('$', '');
+  }
+
+  // If we found nothing useful, return null
+  if (!total && !dateIso && !store && !currency) return null;
 
   return { total, dateIso, store, currency };
 }
-
 
 function mergeDraftNonNull(dst, patch) {
   const out = { ...(dst || {}) };
@@ -2981,7 +2992,7 @@ const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
 
 // ✅ Only attempt reparse if confirm draft exists and is marked dirty
 try {
-  const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
   const needs = !!c0?.payload?.draft?.needsReparse;
 
   if (needs) {
@@ -2993,47 +3004,49 @@ try {
     }
 
     // 2) Backstop merge using the *latest* PA draft (never overwrite with null)
-    const c1 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    const c1 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
     const draft1 = c1?.payload?.draft || {};
 
-    // ✅ Use whatever variable in this scope contains the receipt/OCR text
-    // Common ones in your codebase: extractedText, transcript, input, receiptText
+    // ✅ Receipt/OCR text to backstop parse from (prefer stored receipt text first)
     const receiptText = String(
-  draft1?.receiptText ||
-    draft1?.ocrText ||
-    draft1?.extractedText ||
-    c1?.payload?.receiptText ||
-    c1?.payload?.ocrText ||
-    c1?.payload?.extractedText ||
-    rawDraft?.receiptText ||
-    rawDraft?.ocrText ||
-    rawDraft?.extractedText ||
-    rawDraft?.media_transcript ||
-    rawDraft?.mediaTranscript ||
-    rawDraft?.originalText ||
-    rawDraft?.draftText ||
-    ''
-).trim();
-
-
+      draft1?.receiptText ||
+        draft1?.ocrText ||
+        draft1?.extractedText ||
+        c1?.payload?.receiptText ||
+        c1?.payload?.ocrText ||
+        c1?.payload?.extractedText ||
+        draft1?.media_transcript ||
+        draft1?.mediaTranscript ||
+        draft1?.originalText ||
+        draft1?.draftText ||
+        ''
+    ).trim();
 
     const back = parseReceiptBackstop(receiptText);
+
+    // ✅ Default currency (prefer explicit user currency, then owner currency, then locale hint, else CAD)
+    const defaultCurrency =
+      String(userProfile?.currency || '').trim().toUpperCase() ||
+      String(ownerProfile?.currency || '').trim().toUpperCase() ||
+      (/us/i.test(String(ownerProfile?.locale || '')) ? 'USD' : '') ||
+      (/ca/i.test(String(ownerProfile?.locale || '')) ? 'CAD' : '') ||
+      'CAD';
 
     const patch = back
       ? {
           store: back.store || null,
           date: back.dateIso || null,
           amount: back.total != null ? String(Number(back.total).toFixed(2)) : null,
-          currency: back.currency || null
+          currency: back.currency || draft1?.currency || defaultCurrency
         }
-      : {};
+      : {
+          currency: draft1?.currency || defaultCurrency
+        };
 
     const mergedDraft = mergeDraftNonNull(draft1, patch);
 
-    // ✅ Only mark needsReparse=false if we got the minimum viable fields
     const gotAmount = !!String(mergedDraft.amount || '').trim();
     const gotDate = !!String(mergedDraft.date || '').trim();
-
     const needsReparseNext = !(gotAmount && gotDate);
 
     await upsertPA({
@@ -3053,7 +3066,7 @@ try {
 
   // Optional high-signal debug (after reparse attempt)
   try {
-    const c = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    const c = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
     console.info('[CONFIRM_DRAFT_AFTER_REPARSE]', {
       paUserId,
       needsReparse: !!c?.payload?.draft?.needsReparse,
@@ -3723,9 +3736,61 @@ if (confirmPA?.payload?.draft) {
     await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
     return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
   }
+// ✅ Currency-only reply consumption (prevents “unfinished expense” nag)
+// If the user replies "CAD" / "USD" etc while a confirm draft is pending, treat it as a patch.
 
   const token = normalizeDecisionToken(rawInboundText);
   const lcRaw = String(rawInboundText || '').trim().toLowerCase();
+// ✅ Currency-only reply consumption (prevents “unfinished expense” nag)
+try {
+  // Never consume currency if user is issuing a real decision token
+  if (!['yes', 'edit', 'cancel', 'resume', 'skip', 'change_job'].includes(token)) {
+    const draft = confirmPA?.payload?.draft || null;
+    const draftCurrency = String(draft?.currency || '').trim();
+    const awaitingCurrency = !!draft?.awaiting_currency;
+
+    const tokCurrencyRaw = String(rawInboundText || '').trim().toUpperCase();
+    const isCurrencyToken = /^(CAD|USD|EUR|GBP|C\$|US\$)$/.test(tokCurrencyRaw);
+
+    if (draft && isCurrencyToken && (!draftCurrency || awaitingCurrency)) {
+      const normalizedCurrency =
+        tokCurrencyRaw === 'C$' ? 'CAD' : tokCurrencyRaw === 'US$' ? 'USD' : tokCurrencyRaw;
+
+      await upsertPA({
+        ownerId,
+        userId: paUserId,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPA.payload || {}),
+          draft: {
+            ...(draft || {}),
+            currency: normalizedCurrency,
+            awaiting_currency: false
+          }
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+
+      // Refresh confirmPA (best-effort)
+      try {
+        confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+      } catch {}
+
+      // Re-send confirm immediately
+      try {
+        return await resendConfirmExpense({ from, ownerId, tz, paUserId });
+      } catch (e) {
+        console.warn('[EXPENSE] resendConfirmExpense after currency patch failed (fallback):', e?.message);
+        const d2 = confirmPA?.payload?.draft || { ...(draft || {}), currency: normalizedCurrency };
+        return out(twimlText(formatExpenseConfirmText(d2)), false);
+      }
+    }
+  }
+} catch (e) {
+  console.warn('[EXPENSE] currency-only consume failed (ignored):', e?.message);
+}
+
+
 // ✅ If confirm draft is awaiting an edit payload, consume the next free-text message as the edit.
 if (confirmPA?.payload?.draft?.awaiting_edit) {
   // Allow control words to behave normally
@@ -4267,13 +4332,14 @@ if (looksLikeReceiptText(input)) {
   try {
     const receiptText = stripExpensePrefixes(String(input || '')).trim();
     const back = parseReceiptBackstop(receiptText);
-// ✅ Default currency for receipts (Canada = CAD)
-// Prefer explicit profile currency, then owner locale hint, then CAD as safe default.
-const defaultCurrency =
+
+    const defaultCurrency =
   String(userProfile?.currency || '').trim().toUpperCase() ||
   String(ownerProfile?.currency || '').trim().toUpperCase() ||
-  (String(ownerProfile?.locale || '').toLowerCase().includes('ca') ? 'CAD' : '') ||
+  (/us/i.test(String(ownerProfile?.locale || '')) ? 'USD' : '') ||
+  (/ca/i.test(String(ownerProfile?.locale || '')) ? 'CAD' : '') ||
   'CAD';
+
 
     const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
     const draft0 = c0?.payload?.draft || {};
@@ -4286,20 +4352,19 @@ const defaultCurrency =
     const userKey = String(paUserId || '').trim() || String(from || '').trim();
 
     const patch = {
-  store: back?.store || null,
-  date: back?.dateIso || null,
-  amount: back?.total != null ? String(Number(back.total).toFixed(2)) : null,
+      store: back?.store || null,
+      date: back?.dateIso || null,
+      amount: back?.total != null ? String(Number(back.total).toFixed(2)) : null,
 
-  // ✅ NEW: currency default
-  currency: back?.currency || draft0?.currency || defaultCurrency,
+      // ✅ NEW: currency default (never null)
+      currency: back?.currency || draft0?.currency || defaultCurrency,
 
-  receiptText,
-  ocrText: receiptText,
+      receiptText,
+      ocrText: receiptText,
 
-  originalText: draft0.originalText || receiptText,
-  draftText: draft0.draftText || receiptText
-};
-
+      originalText: draft0.originalText || receiptText,
+      draftText: draft0.draftText || receiptText
+    };
 
     const mergedDraft = mergeDraftNonNull(draft0, patch);
 

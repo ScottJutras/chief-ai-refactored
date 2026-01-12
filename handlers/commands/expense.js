@@ -4350,6 +4350,10 @@ if (token === 'yes') {
 if (looksLikeReceiptText(input)) {
   let seededOk = false;
 
+  // ✅ hoist so the picker try/catch can use them
+  let txSourceMsgId = null;
+  let mergedDraft = null;
+
   try {
     const receiptText = stripExpensePrefixes(String(input || '')).trim();
     const back = parseReceiptBackstop(receiptText);
@@ -4365,7 +4369,8 @@ if (looksLikeReceiptText(input)) {
     const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
     const draft0 = c0?.payload?.draft || {};
 
-    const txSourceMsgId =
+    // ✅ assign to hoisted var (NOT const)
+    txSourceMsgId =
       String(c0?.payload?.sourceMsgId || '').trim() ||
       String(stableMsgId || '').trim() ||
       null;
@@ -4386,7 +4391,8 @@ if (looksLikeReceiptText(input)) {
       draftText: draft0.draftText || receiptText
     };
 
-    const mergedDraft = mergeDraftNonNull(draft0, patch);
+    // ✅ assign to hoisted var (NOT const) — AFTER patch exists
+    mergedDraft = mergeDraftNonNull(draft0, patch);
 
     if (!mergedDraft.media_source_msg_id && txSourceMsgId) {
       mergedDraft.media_source_msg_id = `${userKey}:${txSourceMsgId}`;
@@ -4433,7 +4439,7 @@ if (looksLikeReceiptText(input)) {
     console.warn('[RECEIPT_SEED_CONFIRM_PA] failed (ignored):', e?.message);
   }
 
-    // ✅ Receipt intake UX: ALWAYS go to job picker first.
+  // ✅ Receipt intake UX: ALWAYS go to job picker first.
   // Never emit "issues"/confirm text on receipt intake.
   try {
     const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
@@ -4446,7 +4452,7 @@ if (looksLikeReceiptText(input)) {
       String(stableMsgId || '').trim() ||
       `${normalizeIdentityDigits(from) || from}:${Date.now()}`;
 
-    // IMPORTANT: send picker out-of-band; do NOT also return a TwiML body message
+    // IMPORTANT: send picker out-of-band; do NOT return whatever it returns.
     await sendJobPickList({
       from,
       ownerId,
@@ -4457,26 +4463,29 @@ if (looksLikeReceiptText(input)) {
       page: 0,
       pageSize: 8,
       context: 'expense_jobpick',
-
-      // keep a minimal snapshot for E5 recovery; mergedDraft is already receipt-safe
-      confirmDraft: {
-        ...mergedDraft,
-        jobName: null,
-        jobSource: null
-      }
+      confirmDraft: mergedDraft
+        ? {
+            ...mergedDraft,
+            jobName: null,
+            jobSource: null,
+            media_asset_id: mergedDraft.media_asset_id || null,
+            media_source_msg_id: mergedDraft.media_source_msg_id || null,
+            originalText: mergedDraft.originalText || mergedDraft.receiptText || '',
+            draftText: mergedDraft.draftText || mergedDraft.receiptText || ''
+          }
+        : null
     });
 
     return out(twimlText(''), true);
   } catch (e) {
     console.warn('[EXPENSE] receipt job picker send failed:', e?.message);
 
-    // If we couldn't seed AND couldn't picker, tell the user.
+    // Fallback: if we couldn't seed OR picker, tell the user.
     if (!seededOk) {
       return out(twimlText('⚠️ I couldn’t read that receipt. Try sending it again.'), false);
     }
 
-    // If we seeded confirm but couldn't send picker, best fallback is to show confirm UI
-    // (this is better than silence, and avoids "unfinished expense" nags later).
+    // If seeded confirm but picker failed, re-send confirm instead of nag text.
     try {
       return await resendConfirmExpense({ from, ownerId, tz, paUserId });
     } catch {

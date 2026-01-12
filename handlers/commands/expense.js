@@ -4433,27 +4433,57 @@ if (looksLikeReceiptText(input)) {
     console.warn('[RECEIPT_SEED_CONFIRM_PA] failed (ignored):', e?.message);
   }
 
-  // ✅ Receipt intake UX: ALWAYS go to job picker first.
+    // ✅ Receipt intake UX: ALWAYS go to job picker first.
   // Never emit "issues"/confirm text on receipt intake.
   try {
-    // IMPORTANT: send picker out-of-band; do NOT return whatever it returns.
-    await sendJobPickerForExpense({ from, ownerId, paUserId, tz });
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    if (!jobs.length) {
+      return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+    }
+
+    const confirmFlowId =
+      String(txSourceMsgId || '').trim() ||
+      String(stableMsgId || '').trim() ||
+      `${normalizeIdentityDigits(from) || from}:${Date.now()}`;
+
+    // IMPORTANT: send picker out-of-band; do NOT also return a TwiML body message
+    await sendJobPickList({
+      from,
+      ownerId,
+      userProfile,
+      confirmFlowId,
+      jobOptions: jobs,
+      paUserId,
+      page: 0,
+      pageSize: 8,
+      context: 'expense_jobpick',
+
+      // keep a minimal snapshot for E5 recovery; mergedDraft is already receipt-safe
+      confirmDraft: {
+        ...mergedDraft,
+        jobName: null,
+        jobSource: null
+      }
+    });
+
     return out(twimlText(''), true);
   } catch (e) {
-    console.warn('[EXPENSE] sendJobPickerForExpense failed:', e?.message);
+    console.warn('[EXPENSE] receipt job picker send failed:', e?.message);
 
-    // Fallback: if we couldn't send picker, avoid confirm nags.
+    // If we couldn't seed AND couldn't picker, tell the user.
     if (!seededOk) {
       return out(twimlText('⚠️ I couldn’t read that receipt. Try sending it again.'), false);
     }
 
-    // If we seeded confirm but couldn't picker, stay silent (or optionally resend confirm).
+    // If we seeded confirm but couldn't send picker, best fallback is to show confirm UI
+    // (this is better than silence, and avoids "unfinished expense" nags later).
     try {
       return await resendConfirmExpense({ from, ownerId, tz, paUserId });
     } catch {
       return out(twimlText(''), true);
     }
   }
+
 
   // ✅ Hard stop: do NOT run deterministic parse on receipt blobs.
 } else {

@@ -3296,7 +3296,7 @@ const lockKey = `lock:${paUserId}`;
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
   /* ---- 1) Awaiting job pick ---- */
-const pickPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
+const pickPA = await getPA({ ownerId, userId: pickKey, kind: PA_KIND_PICK_JOB });;
 
 if (
   pickPA?.payload &&
@@ -3394,7 +3394,7 @@ if (
     try {
       await upsertPA({
         ownerId,
-        userId: paUserId,
+        userId: pickKey,
         kind: PA_KIND_PICK_JOB,
         payload: { ...(pickPA.payload || {}), lastInboundTextRaw: input, lastInboundText: rawInput },
         ttlSeconds: PA_TTL_SEC
@@ -3672,7 +3672,7 @@ if (
 
         // ✅ Clear pick state now that we have a job
         try {
-          await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
+          await deletePA({ ownerId, userId: pickKey, kind: PA_KIND_PICK_JOB });
         } catch {}
 
         // ✅ Immediately re-send confirm UI (interactive template if available)
@@ -3817,7 +3817,16 @@ if (
   } // end else (not new expense)
 } // end pickPA block
 // ---- 2) Confirm/edit/cancel (CONSOLIDATED) ----
+// Canonical key for any PA lookups in this handler scope
 const paKey = String(paUserId || '').trim() || String(from || '').trim();
+
+// ✅ Canonical key for job-pick PA (must match sendJobPickList storage)
+const pickKey =
+  normalizeIdentityDigits(paUserId) ||
+  normalizeIdentityDigits(userProfile?.wa_id) ||
+  normalizeIdentityDigits(from) ||
+  String(from || '').trim();
+
 
 // ✅ reads (always use paKey for CONFIRM in this scope)
 let confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
@@ -4132,7 +4141,7 @@ try {
       if (token === 'cancel') {
         await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
         try {
-          await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
+          await deletePA({ ownerId, userId: pickKey, kind: PA_KIND_PICK_JOB });
         } catch {}
 
         try {
@@ -4370,7 +4379,7 @@ if (token === 'yes') {
       await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
     } catch {}
     try {
-      await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
+      await deletePA({ ownerId, userId: pickKey, kind: PA_KIND_PICK_JOB });
     } catch {}
 
     try {

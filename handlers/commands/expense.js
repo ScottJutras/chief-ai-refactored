@@ -1021,9 +1021,9 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
   function normalizeTitleText(s) {
     return String(s || '')
       .toLowerCase()
-      .replace(/^#\s*\d+\s*/g, '')              // drop "#2 "
-      .replace(/^\d+\s+/g, '')                 // drop "2 "
-      .replace(/job\s*#\s*\d+\s*[-—:]?\s*/g, '')// drop "Job #12 —"
+      .replace(/^#\s*\d+\s*/g, '')               // drop "#2 "
+      .replace(/^\d+\s+/g, '')                  // drop "2 "
+      .replace(/job\s*#\s*\d+\s*[-—:]?\s*/g, '') // drop "Job #12 —"
       .replace(/[^a-z0-9\s]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
@@ -1050,7 +1050,22 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
   }
 
   // ----------------------------
-  // 2) OPTION A PRIMARY: match visible title text against sentRows (most reliable)
+  // 2) NEW: Prefer job token number as actual jobNo if present AND in displayed set
+  //    job_6_<hash> -> jobNo=6
+  // ----------------------------
+  const jobNoFromToken = extractJobTokenNumber(tok) ?? extractJobTokenNumber(inboundListId);
+  if (Number.isFinite(jobNoFromToken) && jobNoFromToken > 0) {
+    if (!displayedJobNos.length || displayedJobNos.includes(jobNoFromToken)) {
+      return {
+        ok: true,
+        jobNo: Number(jobNoFromToken),
+        meta: { mode: 'listid_jobno', flow, pickerNonce, displayedHash, inboundListId: inboundListId.slice(0, 80) }
+      };
+    }
+  }
+
+  // ----------------------------
+  // 3) OPTION A PRIMARY: match visible title text against sentRows (most reliable)
   // ----------------------------
   const inboundNorm = normalizeTitleText(inboundTitle);
   if (inboundNorm && sentRows.length) {
@@ -1095,16 +1110,12 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
   }
 
   // ----------------------------
-  // 3) SECONDARY: index-ish fallback (only if we can map safely)
+  // 4) SECONDARY: index-ish fallback (DANGEROUS; keep only as last resort)
   //    Try:
-  //      - "job_2_<hash>" number
   //      - "#2 ..." number
   //    Map to sentRows[ix-1] ONLY as fallback.
   // ----------------------------
-  const ix =
-    extractJobTokenNumber(tok) ??
-    extractJobTokenNumber(inboundListId) ??
-    extractLeadingHashNumber(inboundTitle);
+  const ix = extractLeadingHashNumber(inboundTitle);
 
   if (Number.isFinite(ix) && ix > 0 && sentRows.length) {
     if (ix > sentRows.length) {
@@ -1122,11 +1133,11 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
       return { ok: false, reason: 'ix_jobno_not_in_displayed', meta: { mode: 'index_fallback', ix, jobNo } };
     }
 
-    return { ok: true, jobNo, meta: { mode: 'index_fallback', ix, jobNo } };
+    return { ok: true, jobNo: Number(jobNo), meta: { mode: 'index_fallback', ix, jobNo } };
   }
 
   // ----------------------------
-  // 4) FINAL typed fallback: user typed a real jobNo (rare)
+  // 5) FINAL typed fallback: user typed a real jobNo (rare)
   // ----------------------------
   const typed = Number(String(tok).replace(/^#/, '').trim());
   if (Number.isFinite(typed) && typed > 0) {
@@ -1138,6 +1149,7 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
 
   return { ok: false, reason: 'unrecognized_pick' };
 }
+
 
 
 
@@ -2127,7 +2139,7 @@ console.info('[JOB_PICK_CLEAN]', {
   const name = sanitizeJobLabel(j.name);
 
   // ✅ CRITICAL: embed REAL jobNo as the first token in the visible label
-  const title = `${jobNo} ${name}`.slice(0, 24);
+  const title = `#${jobNo} ${name}`.slice(0, 24);
 
   return { ix: idx + 1, jobNo, name, title };
 });
@@ -2138,29 +2150,25 @@ console.info('[JOB_PICK_CLEAN]', {
 
   await upsertPA({
     ownerId,
-    userId: paUserId,
+    userId: paKey, // ✅ always store pick state under canonical digits key
     kind: PA_KIND_PICK_JOB,
-    payload: {
-      context,
-      flow,
-      confirmFlowId,
-      pickerNonce,
-      page: p,
-      pageSize: ps,
-      displayedJobNos,
-      displayedHash,
-      sentAt: Date.now(),
-      sentRows,
-
-      // ✅ REQUIRED for handler path
-      jobOptions: clean,
-      hasMore,
-
-      // ✅ E5 recovery source
-      confirmDraft: confirmDraftSnap
-    },
-    ttlSeconds: PA_TTL_SEC
-  });
+  payload: {
+    context,
+    flow,
+    confirmFlowId,
+    pickerNonce,
+    page: p,
+    pageSize: ps,
+    displayedJobNos,
+    displayedHash,
+    sentAt: Date.now(),
+    sentRows,
+    jobOptions: clean,
+    hasMore,
+    confirmDraft: confirmDraftSnap
+  },
+  ttlSeconds: PA_TTL_SEC
+});
 
   // Text fallback
   if (!ENABLE_INTERACTIVE_LIST || !to) {
@@ -2174,7 +2182,7 @@ console.info('[JOB_PICK_CLEAN]', {
 
   return {
     id: makeRowId({ flow, nonce: pickerNonce, jobNo, secret }), // jp:...
-    title: `${jobNo} ${name}`.slice(0, 24),                     // ✅ embed jobNo
+    title: `#${jobNo} ${name}`.slice(0, 24),
     description: `Job #${jobNo} — ${name}`.slice(0, 72)         // optional, but helps visibility
   };
 });
@@ -3840,54 +3848,69 @@ if (confirmPA?.payload?.draft) {
 
 
   // ✅ 1) If awaiting edit, consume edit payload FIRST (and RETURN)
-  try {
-    const draft0 = confirmPA?.payload?.draft || null;
-    if (draft0?.awaiting_edit) {
-      // Allow control tokens to fall through to normal logic
-      if (!isControlDuringEdit(rawInboundText, inboundTwilioMeta)) {
-        const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
+try {
+  const draft0 = confirmPA?.payload?.draft || null;
 
-        const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
-          rawInboundText,
-          draft0,
-          { fromKey: paUserId, tz: tz0, defaultData: {} }
+  if (draft0?.awaiting_edit) {
+    const token = normalizeDecisionToken(rawInboundText);
+
+    // Only these tokens should "fall through" while awaiting_edit.
+    const isEditControlToken =
+      token === 'yes' ||
+      token === 'edit' ||
+      token === 'cancel' ||
+      token === 'resume' ||
+      token === 'skip' ||
+      token === 'change_job';
+
+    // Consume ANY non-control message as the edit payload
+    if (!isEditControlToken) {
+      const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
+
+      const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
+        rawInboundText,
+        draft0,
+        { fromKey: paUserId, tz: tz0, defaultData: {} }
+      );
+
+      if (!nextDraft) {
+        return out(
+          twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
+          false
         );
+      }
 
-        if (!nextDraft) {
-          return out(
-            twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
-            false
-          );
-        }
+      await upsertPA({
+        ownerId,
+        userId: paKey,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPA?.payload || {}),
+          draft: {
+            ...(draft0 || {}),
+            ...nextDraft,
+            awaiting_edit: false
+          }
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
 
-        await upsertPA({
-          ownerId,
-          userId: paKey,
-          kind: PA_KIND_CONFIRM,
-          payload: {
-            ...(confirmPA.payload || {}),
-            draft: {
-              ...(draft0 || {}),
-              ...nextDraft,
-              awaiting_edit: false
-            }
-          },
-          ttlSeconds: PA_TTL_SEC
-        });
-
-        // ✅ Re-send confirm UI immediately (no nag message)
-        try {
-          return await resendConfirmExpense({ from, ownerId, tz: tz0, paUserId });
-        } catch (e) {
-          console.warn('[EXPENSE] resendConfirmExpense after edit payload failed (fallback):', e?.message);
-          const merged = { ...(draft0 || {}), ...nextDraft, awaiting_edit: false };
-          return out(twimlText(formatExpenseConfirmText(merged)), false);
-        }
+      // ✅ Re-send confirm UI immediately (no nag message)
+      try {
+        return await resendConfirmExpense({ from, ownerId, tz: tz0, paUserId, userProfile });
+      } catch (e) {
+        console.warn('[EXPENSE] resendConfirmExpense after edit payload failed (fallback):', e?.message);
+        const merged = { ...(draft0 || {}), ...nextDraft, awaiting_edit: false };
+        return out(twimlText(formatExpenseConfirmText(merged)), false);
       }
     }
-  } catch (e) {
-    console.warn('[EXPENSE] awaiting_edit consume failed (ignored):', e?.message);
+
+    // If it's a control token, fall through to normal logic below
   }
+} catch (e) {
+  console.warn('[EXPENSE] awaiting_edit consume failed (ignored):', e?.message);
+}
+
 
   // ✅ 2) Currency-only reply consumption (only when it's a pure currency token)
   try {

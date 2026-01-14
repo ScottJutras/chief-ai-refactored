@@ -111,11 +111,22 @@ const pgDeletePendingActionByKind =
 const pgDeletePendingActionSmart = (typeof pg.deletePendingAction === 'function' && pg.deletePendingAction) || null;
 
 function DIGITS_ID(v) {
-  return String(v || '')
+  return String(v ?? '')
     .replace(/^whatsapp:/i, '')
     .replace(/^\+/, '')
     .replace(/\D/g, '')
     .trim();
+}
+
+function PA_USER_KEY(userId) {
+  const raw = String(userId || '').trim();
+  const dig = DIGITS_ID(raw);
+  return dig || raw; // ✅ never drop to null if raw exists
+}
+function PA_OWNER_KEY(ownerId) {
+  const raw = String(ownerId || '').trim();
+  const dig = DIGITS_ID(raw);
+  return dig || raw;
 }
 
 
@@ -125,9 +136,10 @@ async function getPA({ ownerId, userId, kind }) {
   const k = String(kind || '').trim();
   if (!owner || !user || !k) return null;
 
-  const ownerKey = DIGITS_ID(owner);
-  const userKey = DIGITS_ID(user);
-  if (!ownerKey || !userKey) return null;
+  const ownerKey = PA_OWNER_KEY(owner);
+const userKey = PA_USER_KEY(user);
+if (!ownerKey || !userKey) return;
+
 
   if (pgGetPendingActionByKind) {
     try {
@@ -173,10 +185,10 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
   const ttl = Number(ttlSeconds || PA_TTL_SEC) || PA_TTL_SEC;
 
   // ✅ normalize IDs once
-  const ownerKey = DIGITS_ID(owner);
-  const userKey = DIGITS_ID(user);
+  const ownerKey = PA_OWNER_KEY(owner);
+const userKey = PA_USER_KEY(user);
+if (!ownerKey || !userKey) return;
 
-  if (!ownerKey || !userKey) return;
 
   if (pgUpsertPendingAction) {
     try {
@@ -228,9 +240,10 @@ async function deletePA({ ownerId, userId, kind }) {
   const k = String(kind || '').trim();
   if (!owner || !user || !k) return;
 
-  const ownerKey = DIGITS_ID(owner);
-  const userKey = DIGITS_ID(user);
-  if (!ownerKey || !userKey) return;
+  const ownerKey = PA_OWNER_KEY(owner);
+const userKey = PA_USER_KEY(user);
+if (!ownerKey || !userKey) return;
+
 
   if (pgDeletePendingActionByKind) {
     try {
@@ -261,22 +274,27 @@ async function deletePA({ ownerId, userId, kind }) {
 }
 exports.deletePA = deletePA;
 
-async function ensureConfirmPAExists({ ownerId, from, draft, sourceMsgId }) {
-  const existing = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+async function ensureConfirmPAExists({ ownerId, userId = null, from = null, draft, sourceMsgId }) {
+  // ✅ CONFIRM PA is keyed by paKey (never paUserId)
+  const paKey = String(userId || '').trim() || String(from || '').trim();
+  if (!paKey) return;
+
+  const existing = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   if (existing?.payload?.draft) return;
 
   await upsertPA({
     ownerId,
-    userId: paUserId,
+    userId: paKey,
     kind: PA_KIND_CONFIRM,
     payload: {
       draft,
-      sourceMsgId,
+      sourceMsgId: sourceMsgId || null,
       type: 'expense'
     },
     ttlSeconds: PA_TTL_SEC
   });
 }
+
 function pickConfirmDraftSnapshot(d) {
   if (!d || typeof d !== 'object') return null;
 
@@ -508,7 +526,11 @@ async function resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile =
 
 
 async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile }) {
-  const confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  // ✅ paUserId param is treated as the CONFIRM PA KEY here
+  const paKey = String(paUserId || '').trim();
+  if (!paKey) return null;
+
+  const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   const draft = confirmPA?.payload?.draft;
   if (!draft || !draft.needsReparse) return confirmPA;
 
@@ -523,12 +545,11 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
   ).trim();
 
   if (!sourceText) {
-    // Nothing to reparse — DO NOT clear needsReparse (keeps the system honest)
-    console.warn('[EXPENSE_REPARSE] no sourceText; leaving needsReparse=true', { paUserId });
+    console.warn('[EXPENSE_REPARSE] no sourceText; leaving needsReparse=true', { paKey });
     return confirmPA;
   }
 
-  // Re-run your existing parser on the receipt/OCR source text.
+  // Re-run your existing parser on receipt/OCR source text.
   // IMPORTANT: keep job fields as-is (job choice must win).
   let parsed = {};
   try {
@@ -549,7 +570,6 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     {
       ...(draft || {}),
       ...jobFields,
-
       // keep media linkage
       media_asset_id: draft?.media_asset_id ?? null,
       media_source_msg_id: draft?.media_source_msg_id ?? null
@@ -560,10 +580,8 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     }
   );
 
-  // Normalize receipt-safe fields now (TOTAL/date/store)
   const normalized = normalizeExpenseData(mergedDraft, userProfile, sourceText);
 
-  // ✅ Only clear needsReparse if we got minimum viable fields
   const gotAmount = !!String(normalized?.amount || '').trim() && String(normalized.amount).trim() !== '$0.00';
   const gotDate = !!String(normalized?.date || '').trim();
 
@@ -571,7 +589,7 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
 
   await upsertPA({
     ownerId,
-    userId: paUserId,
+    userId: paKey,
     kind: PA_KIND_CONFIRM,
     payload: {
       ...(confirmPA?.payload || {}),
@@ -581,7 +599,7 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
   });
 
   console.info('[EXPENSE_REPARSE_RESULT]', {
-    paUserId,
+    paKey,
     needsReparse: !!normalized.needsReparse,
     amount: normalized?.amount || null,
     date: normalized?.date || null,
@@ -589,10 +607,8 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     currency: normalized?.currency || null
   });
 
-  return await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  return await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
 }
-
-
 
 /* ---------------- misc helpers ---------------- */
 
@@ -2122,7 +2138,7 @@ console.info('[JOB_PICK_CLEAN]', {
 
   await upsertPA({
     ownerId,
-    userId: paKey,
+    userId: paUserId,
     kind: PA_KIND_PICK_JOB,
     payload: {
       context,
@@ -2944,25 +2960,25 @@ if (inEditMode) {
     });
   } catch {}
 
-  // ✅ ALSO persist into pending-actions confirm draft so YES submits the edited data
-  try {
-    const confirmPA0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-    if (confirmPA0?.payload?.draft) {
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA0.payload || {}),
-          draft: { ...(confirmPA0.payload.draft || {}), ...nextDraft, awaiting_edit: false }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
+  // ✅ CONFIRM PA key (same doctrine everywhere in handler scope)
+const paKey = String(paUserId || '').trim() || String(from || '').trim();
 
-      // optional: refresh local confirmPA if later code uses it
-      // confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-    }
-  } catch {}
+try {
+  const confirmPA0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+  if (confirmPA0?.payload?.draft) {
+    await upsertPA({
+      ownerId,
+      userId: paKey,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA0.payload || {}),
+        draft: { ...(confirmPA0.payload.draft || {}), ...nextDraft, awaiting_edit: false }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+  }
+} catch {}
+
 
   // Re-confirm using fail-open plain text (no templates required)
   const confirmMsg = formatExpenseConfirmText(nextDraft);
@@ -2980,7 +2996,7 @@ input = correctTradeTerms(stripExpensePrefixes(rawInboundText));
 let flowMediaAssetId = null;
 try {
   // NOTE: by this point you already normalized `from = paUserId`
-  const pending = await getPendingTransactionState(from); // ✅ canonical key
+  const pending = await getPendingTransactionState(normalizeIdentityDigits(from) || paUserId);
   flowMediaAssetId =
     (pending?.pendingMediaMeta?.media_asset_id ||
       pending?.pendingMediaMeta?.mediaAssetId ||
@@ -2988,7 +3004,7 @@ try {
 } catch {}
 // Optional high-signal debug (after reparse attempt)
   try {
-    const c = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    const c = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
     console.info('[CONFIRM_DRAFT_AFTER_REPARSE]', {
       paUserId,
       needsReparse: !!c?.payload?.draft?.needsReparse,
@@ -3000,24 +3016,25 @@ try {
 // ✅ tz needed for reparse (safe default)
 const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
 
-// ✅ Only attempt reparse if confirm draft exists and is marked dirty
+// ✅ CONFIRM PA key (never use paUserId for PA_KIND_CONFIRM ops)
+const paKey = String(paUserId || '').trim() || String(from || '').trim();
+
 try {
-  const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
+  const c0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   const needs = !!c0?.payload?.draft?.needsReparse;
 
   if (needs) {
     // 1) Run your existing reparse pipeline (may or may not fill fields)
     try {
-      await maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile });
+      await maybeReparseConfirmDraftExpense({ ownerId, paUserId: paKey, tz, userProfile });
     } catch (e) {
       console.warn('[EXPENSE] maybeReparseConfirmDraftExpense failed (ignored):', e?.message);
     }
 
     // 2) Backstop merge using the *latest* PA draft (never overwrite with null)
-    const c1 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
+    const c1 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
     const draft1 = c1?.payload?.draft || {};
 
-    // ✅ Receipt/OCR text to backstop parse from (prefer stored receipt text first)
     const receiptText = String(
       draft1?.receiptText ||
         draft1?.ocrText ||
@@ -3034,7 +3051,6 @@ try {
 
     const back = parseReceiptBackstop(receiptText);
 
-    // ✅ Default currency (prefer explicit user currency, then owner currency, then locale hint, else CAD)
     const defaultCurrency =
       String(userProfile?.currency || '').trim().toUpperCase() ||
       String(ownerProfile?.currency || '').trim().toUpperCase() ||
@@ -3049,26 +3065,20 @@ try {
           amount: back.total != null ? String(Number(back.total).toFixed(2)) : null,
           currency: back.currency || draft1?.currency || defaultCurrency
         }
-      : {
-          currency: draft1?.currency || defaultCurrency
-        };
+      : { currency: draft1?.currency || defaultCurrency };
 
     const mergedDraft = mergeDraftNonNull(draft1, patch);
 
     const gotAmount = !!String(mergedDraft.amount || '').trim();
     const gotDate = !!String(mergedDraft.date || '').trim();
-    const needsReparseNext = !(gotAmount && gotDate);
 
     await upsertPA({
       ownerId,
-      userId: paUserId,
+      userId: paKey,
       kind: PA_KIND_CONFIRM,
       payload: {
         ...(c1?.payload || {}),
-        draft: {
-          ...mergedDraft,
-          needsReparse: needsReparseNext
-        }
+        draft: { ...mergedDraft, needsReparse: !(gotAmount && gotDate) }
       },
       ttlSeconds: PA_TTL_SEC
     });
@@ -3076,9 +3086,9 @@ try {
 
   // Optional high-signal debug (after reparse attempt)
   try {
-    const c = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
+    const c = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
     console.info('[CONFIRM_DRAFT_AFTER_REPARSE]', {
-      paUserId,
+      paKey,
       needsReparse: !!c?.payload?.draft?.needsReparse,
       amount: c?.payload?.draft?.amount || null,
       date: c?.payload?.draft?.date || null,
@@ -3089,6 +3099,7 @@ try {
 } catch (e) {
   console.warn('[EXPENSE] confirm reparse precheck failed (ignored):', e?.message);
 }
+
 
 
 async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMediaAssetId }) {
@@ -3105,12 +3116,28 @@ async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMedi
 
   // Helper: normalize a source msg id into the DB format "<userKey>:<sid>"
   const asDbSource = (sid) => {
-    const s = String(sid || '').trim();
-    if (!s) return null;
-    // already looks like "userKey:SID"
-    if (s.includes(':')) return s;
-    return `${String(userKey || '').trim()}:${s}`;
-  };
+  const s = String(sid || '').trim();
+  if (!s) return null;
+
+  const stateKey = normalizeIdentityDigits(userKey) || String(userKey || '').trim();
+  if (!stateKey) return null;
+
+  // If already "digits:SID" (or at least "stateKey:SID"), keep it
+  if (s.includes(':')) {
+    // If it starts with stateKey:, it's definitely correct
+    if (s.startsWith(`${stateKey}:`)) return s;
+
+    // If it starts with some other digits prefix (e.g., "14165551212:SMxxxx"), accept it
+    const prefix = s.split(':')[0];
+    if (/^\d{7,20}$/.test(prefix)) return s;
+
+    // Otherwise it's colon-containing junk; re-key it safely
+    return `${stateKey}:${s.replace(/^[^:]*:/, '')}`; // drop whatever weird prefix existed
+  }
+
+  return `${stateKey}:${s}`;
+};
+
 
   // 3) Try draft hints for source msg id (strong fallback)
   const draftSrc =
@@ -3138,10 +3165,13 @@ async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMedi
   }
 
   // 4) Re-read pending state (in case it exists)
-  let pending = null;
-  try {
-    pending = await getPendingTransactionState(userKey);
-  } catch {}
+let pending = null;
+try {
+  // ✅ stateManager canonical key should be digits-based
+  const stateKey = normalizeIdentityDigits(userKey) || String(userKey || '').trim();
+  pending = await getPendingTransactionState(stateKey);
+} catch {}
+
 
   id =
     (pending?.pendingMediaMeta?.media_asset_id || pending?.pendingMediaMeta?.mediaAssetId || null) ||
@@ -3832,7 +3862,7 @@ if (confirmPA?.payload?.draft) {
 
         await upsertPA({
           ownerId,
-          userId: paUserId,
+          userId: paKey,
           kind: PA_KIND_CONFIRM,
           payload: {
             ...(confirmPA.payload || {}),
@@ -3875,7 +3905,7 @@ if (confirmPA?.payload?.draft) {
 
         await upsertPA({
           ownerId,
-          userId: paUserId,
+          userId: paKey,
           kind: PA_KIND_CONFIRM,
           payload: {
             ...(confirmPA.payload || {}),
@@ -3890,7 +3920,7 @@ if (confirmPA?.payload?.draft) {
 
         // refresh + resend
         try {
-          confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+          confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
         } catch {}
 
         return await resendConfirmExpense({ from, ownerId, tz, paUserId, userProfile });
@@ -4005,7 +4035,7 @@ if (confirmPA?.payload?.draft) {
         try {
           await upsertPA({
             ownerId,
-            userId: paUserId,
+            userId: paKey,
             kind: PA_KIND_CONFIRM,
             payload: {
               ...(confirmPA.payload || {}),
@@ -4047,7 +4077,7 @@ if (confirmPA?.payload?.draft) {
         try {
           await upsertPA({
             ownerId,
-            userId: paUserId,
+            userId: paKey,
             kind: PA_KIND_CONFIRM,
             payload: {
               ...(confirmPA.payload || {}),
@@ -4077,7 +4107,7 @@ if (confirmPA?.payload?.draft) {
 
       // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending
       if (token === 'cancel') {
-        await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+        await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
         try {
           await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
         } catch {}
@@ -4105,7 +4135,7 @@ if (token === 'yes') {
     // Always operate on freshest confirm PA (avoid stale confirmPA var)
     let confirmPAFresh = null;
     try {
-      confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+      confirmPAFresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
     } catch (e) {
       console.warn('[YES] getPA failed (ignored):', e?.message);
       confirmPAFresh = confirmPA || null;
@@ -4115,8 +4145,9 @@ if (token === 'yes') {
     // If draft is marked dirty, reparse now (receipt-safe)
     if (confirmPAFresh?.payload?.draft?.needsReparse) {
       try {
-        await maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile });
-        confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+        await maybeReparseConfirmDraftExpense({ ownerId, paUserId: paKey, tz, userProfile });
+        confirmPAFresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+
       } catch (e) {
         console.warn('[YES] maybeReparseConfirmDraftExpense failed (ignored):', e?.message);
       }
@@ -4160,7 +4191,7 @@ if (token === 'yes') {
     // Resolve media asset id (draft -> flow -> pending -> DB)
     const mediaAssetId = await resolveMediaAssetIdForFlow({
       ownerId,
-      userKey,
+      userKey: paUserId,
       rawDraft,
       flowMediaAssetId
     });
@@ -4313,7 +4344,7 @@ if (token === 'yes') {
 
     // ✅ After successful log: clear confirm + picker + pending-state flags so we never nag incorrectly
     try {
-      await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+      await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
     } catch {}
     try {
       await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
@@ -4403,14 +4434,15 @@ if (looksLikeReceiptText(input)) {
       (locale0.includes('ca') ? 'CAD' : '') ||
       'CAD';
 
-    const c0 = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-    const draft0 = c0?.payload?.draft || {};
+    const paKey = String(paUserId || '').trim() || String(from || '').trim();
 
-    // ✅ assign to hoisted var (NOT const)
-    txSourceMsgId =
-      String(c0?.payload?.sourceMsgId || '').trim() ||
-      String(stableMsgId || '').trim() ||
-      null;
+const c0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+const draft0 = c0?.payload?.draft || {};
+
+txSourceMsgId =
+  String(c0?.payload?.sourceMsgId || '').trim() ||
+  String(stableMsgId || '').trim() ||
+  null;
 
     const userKey = String(paUserId || '').trim() || String(from || '').trim();
 
@@ -4444,21 +4476,18 @@ if (looksLikeReceiptText(input)) {
     const gotAmount = !!String(mergedDraft.amount || '').trim();
     const gotDate = !!String(mergedDraft.date || '').trim();
 
-    await upsertPA({
-      ownerId,
-      userId: paUserId,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        ...(c0?.payload || {}),
-        type: 'expense',
-        sourceMsgId: txSourceMsgId,
-        draft: {
-          ...mergedDraft,
-          needsReparse: !(gotAmount && gotDate)
-        }
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
+   await upsertPA({
+  ownerId,
+  userId: paKey,
+  kind: PA_KIND_CONFIRM,
+  payload: {
+    ...(c0?.payload || {}),
+    type: 'expense',
+    sourceMsgId: txSourceMsgId,
+    draft: { ...mergedDraft, needsReparse: !(gotAmount && gotDate) }
+  },
+  ttlSeconds: PA_TTL_SEC
+});
 
     console.info('[RECEIPT_SEED_CONFIRM_PA]', {
       paUserId,
@@ -4569,7 +4598,7 @@ if (looksLikeReceiptText(input)) {
 
     await upsertPA({
       ownerId,
-      userId: paUserId,
+      userId: paKey,
       kind: PA_KIND_CONFIRM,
       payload: {
         draft: {
@@ -4729,7 +4758,7 @@ if (data && data.amount && data.amount !== '$0.00') {
 
   await upsertPA({
     ownerId,
-    userId: paUserId,
+    userId: paKey,
     kind: PA_KIND_CONFIRM,
     payload: {
       draft: {

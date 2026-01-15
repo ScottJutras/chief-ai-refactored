@@ -3295,6 +3295,21 @@ const lockKey = `lock:${paUserId}`;
   try {
     const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
+// ----------------------------------------------------
+// ✅ Canonical PA keys (define ONCE, before any PA use)
+// ----------------------------------------------------
+const paKey =
+  String(paUserId || '').trim() ||
+  String(from || '').trim();
+
+// ✅ Canonical key for PA_KIND_PICK_JOB
+const pickKey =
+  normalizeIdentityDigits(paUserId) ||
+  normalizeIdentityDigits(userProfile?.wa_id) ||
+  normalizeIdentityDigits(from) ||
+  String(from || '').trim();
+
+
   /* ---- 1) Awaiting job pick ---- */
 const pickPA = await getPA({ ownerId, userId: pickKey, kind: PA_KIND_PICK_JOB });;
 
@@ -3306,9 +3321,6 @@ if (
   // ✅ IMPORTANT: token should be computed from rawInboundText (not normalized input)
   const tok = normalizeDecisionToken(rawInboundText);
   const rawInput = String(input || '').trim();
-
-  // ✅ Canonical confirm PA key (DO NOT mix keys inside this scope)
-  const paKey = String(paUserId || '').trim() || String(from || '').trim();
 
   // ✅ use stored picker state ONLY (single source of truth)
   const jobOptions = pickPA.payload.jobOptions;
@@ -3816,17 +3828,9 @@ if (
     } // end !skipPickHandling
   } // end else (not new expense)
 } // end pickPA block
+
+
 // ---- 2) Confirm/edit/cancel (CONSOLIDATED) ----
-// Canonical key for any PA lookups in this handler scope
-const paKey = String(paUserId || '').trim() || String(from || '').trim();
-
-// ✅ Canonical key for job-pick PA (must match sendJobPickList storage)
-const pickKey =
-  normalizeIdentityDigits(paUserId) ||
-  normalizeIdentityDigits(userProfile?.wa_id) ||
-  normalizeIdentityDigits(from) ||
-  String(from || '').trim();
-
 
 // ✅ reads (always use paKey for CONFIRM in this scope)
 let confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });

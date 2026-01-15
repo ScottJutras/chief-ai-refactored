@@ -3778,16 +3778,16 @@ console.info('[CONFIRM_STATE]', {
   hasPickPA: false // (optional; you can fill this later if needed)
 });
 // ---------------------------------------------------------
-// ✅ SAFETY NET: If confirm draft is awaiting_edit OR edit was started recently,
-// NEVER nag about "unfinished expense".
-// Consume any non-control inbound as the edit payload.
+// ✅ SAFETY NET (PERMANENT):
+// If the confirm draft is in (or *recently entered*) edit mode,
+// consume ANY non-control inbound as the edit payload.
+// This prevents the "unfinished expense" nag and guarantees edits apply.
 // ---------------------------------------------------------
 try {
   const draftE = confirmPA?.payload?.draft || null;
-
   const tokE = normalizeDecisionToken(rawInboundText);
 
-  const isEditControlToken =
+  const isControlToken =
     tokE === 'yes' ||
     tokE === 'edit' ||
     tokE === 'cancel' ||
@@ -3795,32 +3795,35 @@ try {
     tokE === 'skip' ||
     tokE === 'change_job';
 
-  // ✅ if awaiting_edit got stomped, we still consume the next message as edit payload
+  // "recent edit" latch (works even if awaiting_edit flag is lost)
+  const editStartedAt =
+    Number(draftE?.edit_started_at || draftE?.editStartedAt || 0) || 0;
+
+  const EDIT_WINDOW_MS = 10 * 60 * 1000; // 10 min (safe)
   const editRecentlyStarted =
-    !!draftE?.edit_started_at &&
-    (Date.now() - Number(draftE.edit_started_at || 0)) < 10 * 60 * 1000; // 10 minutes
+    !!editStartedAt && Date.now() - editStartedAt >= 0 && Date.now() - editStartedAt <= EDIT_WINDOW_MS;
 
-  const shouldTreatAsEditPayload =
-    !isEditControlToken && !!draftE && (draftE.awaiting_edit || editRecentlyStarted);
+  const shouldConsumeAsEditPayload =
+    !!draftE && !isControlToken && (draftE.awaiting_edit || editRecentlyStarted);
 
-  // Log proves routing correctness (and shows why we will/won't consume)
   console.info('[AWAITING_EDIT_SAFETYNET_CHECK]', {
     paUserId,
     tokE,
     awaiting_edit: !!draftE?.awaiting_edit,
+    editStartedAt: editStartedAt || null,
     editRecentlyStarted,
-    isEditControlToken,
-    willConsumeAsEditPayload: shouldTreatAsEditPayload,
+    isControlToken,
+    willConsumeAsEditPayload: shouldConsumeAsEditPayload,
     head: String(rawInboundText || '').trim().slice(0, 80)
   });
 
-  if (shouldTreatAsEditPayload) {
+  if (shouldConsumeAsEditPayload) {
     console.info('[AWAITING_EDIT_SAFETYNET_CONSUME]', {
       paUserId,
       head: String(rawInboundText || '').trim().slice(0, 80)
     });
 
-    const tz0 = tz; // canonical tz in this scope
+    const tz0 = tz;
 
     const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
       rawInboundText,
@@ -3835,11 +3838,13 @@ try {
       );
     }
 
-    // ✅ Ensure edited "Job ..." becomes authoritative in the draft
+    // ✅ ensure "Job ..." edits get applied even if the LLM misses it
     let jobPatch = null;
     try {
       jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
-    } catch {}
+    } catch (e) {
+      jobPatch = null;
+    }
 
     await upsertPA({
       ownerId,
@@ -3852,27 +3857,32 @@ try {
           ...nextDraft,
           ...(jobPatch || {}),
 
-          // make user's edit authoritative
+          // ✅ make the user's edit authoritative
           draftText: String(rawInboundText || '').trim(),
           originalText: String(rawInboundText || '').trim(),
 
-          // exit edit mode + prevent later receipt reparse from stomping edits
+          // ✅ exit edit mode (and clear latch)
           awaiting_edit: false,
+          edit_started_at: null,
+          editStartedAt: null,
+
+          // ✅ prevent later receipt reparse from overwriting the edit
           needsReparse: false
         }
       },
       ttlSeconds: PA_TTL_SEC
     });
 
-    // refresh in-memory confirmPA (avoid shadow issues)
+    // refresh in-memory (helps avoid shadow bugs)
     confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
 
-    // ✅ Immediately re-send confirm UI and RETURN (no nag)
+    // ✅ MUST send interactive confirm, NEVER nag
     return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
   }
 } catch (e) {
   console.warn('[AWAITING_EDIT_SAFETYNET] failed (ignored):', e?.message);
 }
+
 
 
 let bypassConfirmToAllowNewIntake = false;
@@ -4099,11 +4109,26 @@ if (token === 'edit') {
       payload: {
         ...(confirmPA.payload || {}),
         draft: {
-          ...(confirmPA.payload?.draft || {}),
-          awaiting_edit: true,
-          edit_started_at: Date.now(),             // ✅ add
-          edit_flow_id: confirmPA?.payload?.sourceMsgId || stableMsgId || null // ✅ add
-        }
+  ...(confirmPA.payload?.draft || {}),
+  awaiting_edit: true,
+
+  // ✅ edit latch (primary)
+  edit_started_at: Date.now(),
+
+  // ✅ compat latch (optional but prevents subtle regressions)
+  editStartedAt: Date.now(),
+
+  // ✅ flow correlation (debug / optional hardening)
+  edit_flow_id:
+    String(
+      confirmPA?.payload?.sourceMsgId ||
+      confirmPA?.payload?.draft?.sourceMsgId ||
+      confirmPA?.payload?.draft?.txSourceMsgId ||
+      stableMsgId ||
+      ''
+    ).trim() || null
+}
+
       },
       ttlSeconds: PA_TTL_SEC
     });

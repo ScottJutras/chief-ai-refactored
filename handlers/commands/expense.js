@@ -609,6 +609,38 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
 
   return await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
 }
+function extractReceiptDateYYYYMMDD(text, tz = 'America/Toronto') {
+  const s = String(text || '');
+  if (!s) return null;
+
+  // Match: 01/13/26, 1/13/2026, 01-13-26, etc.
+  const re = /\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})\b/g;
+
+  const candidates = [];
+  let m;
+  while ((m = re.exec(s))) {
+    const mm = Number(m[1]);
+    const dd = Number(m[2]);
+    let yy = Number(m[3]);
+
+    if (!Number.isFinite(mm) || !Number.isFinite(dd) || !Number.isFinite(yy)) continue;
+    if (mm < 1 || mm > 12) continue;
+    if (dd < 1 || dd > 31) continue;
+
+    // 2-digit year -> 20xx (good enough for receipts)
+    if (yy < 100) yy = 2000 + yy;
+
+    // Build ISO date
+    const iso = `${String(yy).padStart(4, '0')}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+    candidates.push(iso);
+  }
+
+  if (!candidates.length) return null;
+
+  // Heuristic: receipts often include date close to time; pick the LAST match in text
+  // (bottom-right OCR often ends up late in the transcript)
+  return candidates[candidates.length - 1];
+}
 
 /* ---------------- misc helpers ---------------- */
 
@@ -1440,7 +1472,9 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
 
   // Date
   if (!String(d.date || '').trim() && src) {
-    const receiptDate = extractReceiptDate(src);
+    const receiptDate =
+  extractReceiptDateYYYYMMDD(src, tz) ||
+  extractReceiptDate(src);
     if (receiptDate) d.date = receiptDate;
   }
 
@@ -2182,7 +2216,7 @@ console.info('[JOB_PICK_CLEAN]', {
 
   return {
     id: makeRowId({ flow, nonce: pickerNonce, jobNo, secret }), // jp:...
-    title: `#${jobNo} ${name}`.slice(0, 24),
+    title: `${jobNo} ${name}`.slice(0, 24),
     description: `Job #${jobNo} — ${name}`.slice(0, 72)         // optional, but helps visibility
   };
 });
@@ -3840,13 +3874,89 @@ let bypassConfirmToAllowNewIntake = false;
 if (confirmPA?.payload?.draft) {
   // Owner-only gate
   if (!isOwner) {
-    // ✅ also use paKey here (same confirm key)
     await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
     return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
   }
 
   const token = normalizeDecisionToken(rawInboundText);
   const lcRaw = String(rawInboundText || '').trim().toLowerCase();
+
+  // ✅ 1) If awaiting edit, consume edit payload FIRST (and RETURN)
+  try {
+    const draft0 = confirmPA?.payload?.draft || null;
+
+    if (draft0?.awaiting_edit) {
+      // Only these tokens should "fall through" while awaiting_edit
+      const isEditControlToken =
+        token === 'yes' ||
+        token === 'edit' ||
+        token === 'cancel' ||
+        token === 'resume' ||
+        token === 'skip' ||
+        token === 'change_job';
+
+      // Any non-control message while awaiting_edit is treated as the edit payload
+      if (!isEditControlToken) {
+        const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
+
+        const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
+          rawInboundText,
+          draft0,
+          { fromKey: paUserId, tz: tz0, defaultData: {} }
+        );
+
+        if (!nextDraft) {
+          return out(
+            twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
+            false
+          );
+        }
+
+        await upsertPA({
+          ownerId,
+          userId: paKey,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...(confirmPA.payload || {}),
+            draft: {
+              ...(draft0 || {}),
+              ...nextDraft,
+
+              // ✅ make the user's edit the authoritative "source"
+              draftText: String(rawInboundText || '').trim(),
+              originalText: String(rawInboundText || '').trim(),
+
+              // ✅ critical: exit edit mode
+              awaiting_edit: false,
+
+              // ✅ prevent later receipt reparse from overwriting the edit
+              needsReparse: false
+            }
+          },
+          ttlSeconds: PA_TTL_SEC
+        });
+
+        // ✅ Re-send confirm UI immediately (no nag message)
+        try {
+          return await resendConfirmExpense({ from, ownerId, tz: tz0, paUserId, userProfile });
+        } catch (e) {
+          console.warn('[EXPENSE] resendConfirmExpense after edit payload failed (fallback):', e?.message);
+          const merged = {
+            ...(draft0 || {}),
+            ...nextDraft,
+            draftText: String(rawInboundText || '').trim(),
+            originalText: String(rawInboundText || '').trim(),
+            awaiting_edit: false
+          };
+          return out(twimlText(formatExpenseConfirmText(merged)), false);
+        }
+      }
+
+      // If it's a control token, fall through to normal logic below.
+    }
+  } catch (e) {
+    console.warn('[EXPENSE] awaiting_edit consume failed (ignored):', e?.message);
+  }
 
   // ✅ 0) Receipt/media inbound bypass: do NOT nag; let receipt intake handle this inbound.
   try {
@@ -3858,72 +3968,6 @@ if (confirmPA?.payload?.draft) {
       bypassConfirmToAllowNewIntake = true;
     }
   } catch {}
-
-
-  // ✅ 1) If awaiting edit, consume edit payload FIRST (and RETURN)
-try {
-  const draft0 = confirmPA?.payload?.draft || null;
-
-  if (draft0?.awaiting_edit) {
-    const token = normalizeDecisionToken(rawInboundText);
-
-    // Only these tokens should "fall through" while awaiting_edit.
-    const isEditControlToken =
-      token === 'yes' ||
-      token === 'edit' ||
-      token === 'cancel' ||
-      token === 'resume' ||
-      token === 'skip' ||
-      token === 'change_job';
-
-    // Consume ANY non-control message as the edit payload
-    if (!isEditControlToken) {
-      const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
-
-      const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
-        rawInboundText,
-        draft0,
-        { fromKey: paUserId, tz: tz0, defaultData: {} }
-      );
-
-      if (!nextDraft) {
-        return out(
-          twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
-          false
-        );
-      }
-
-      await upsertPA({
-        ownerId,
-        userId: paKey,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA?.payload || {}),
-          draft: {
-            ...(draft0 || {}),
-            ...nextDraft,
-            awaiting_edit: false
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-
-      // ✅ Re-send confirm UI immediately (no nag message)
-      try {
-        return await resendConfirmExpense({ from, ownerId, tz: tz0, paUserId, userProfile });
-      } catch (e) {
-        console.warn('[EXPENSE] resendConfirmExpense after edit payload failed (fallback):', e?.message);
-        const merged = { ...(draft0 || {}), ...nextDraft, awaiting_edit: false };
-        return out(twimlText(formatExpenseConfirmText(merged)), false);
-      }
-    }
-
-    // If it's a control token, fall through to normal logic below
-  }
-} catch (e) {
-  console.warn('[EXPENSE] awaiting_edit consume failed (ignored):', e?.message);
-}
-
 
   // ✅ 2) Currency-only reply consumption (only when it's a pure currency token)
   try {
@@ -4245,6 +4289,12 @@ if (token === 'yes') {
     ).trim();
 
     let data = normalizeExpenseData(rawDraft, userProfile, sourceText);
+    // ✅ Receipt date fallback (prevents "today" when OCR had MM/DD/YY)
+if (!data.date) {
+  const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
+  const d = extractReceiptDateYYYYMMDD(sourceText, tz0);
+  if (d) data.date = d;
+}
 
     data.media_asset_id = mediaAssetId || data.media_asset_id || null;
     data.media_source_msg_id = rawDraft.media_source_msg_id || null;

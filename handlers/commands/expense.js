@@ -978,7 +978,8 @@ function hmac12(secret, s) {
 
 /**
  * ✅ FIXED: resolve primarily by visible title against sentRows.
- * DO NOT treat "job_4_xxx" as jobNo — it's NOT stable in Content Templates.
+ * ✅ Legacy-safe: "job_7_xxx" is treated as a ROW INDEX, not a jobNo.
+ * ✅ Typed "#4" is treated as a jobNo (not index) because user typed it.
  */
 async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickState }) {
   const tok = String(input || '').trim();
@@ -998,9 +999,9 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
   function normalizeTitleText(s) {
     return String(s || '')
       .toLowerCase()
-      .replace(/^#\s*\d+\s*/g, '')               // "#4 "
-      .replace(/^\d+\s+/g, '')                  // "4 "
-      .replace(/job\s*#\s*\d+\s*[-—:]?\s*/g, '') // "Job #12 —"
+      .replace(/^#\s*\d+\s*/g, '')                // "#4 "
+      .replace(/^\d+\s+/g, '')                   // "4 "
+      .replace(/job\s*#\s*\d+\s*[-—:]?\s*/g, '')  // "Job #12 —"
       .replace(/[^a-z0-9\s]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
@@ -1010,6 +1011,34 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
     const t = String(s || '').trim();
     const m = t.match(/^#\s*(\d{1,10})\b/);
     return m ? Number(m[1]) : null;
+  }
+
+  // ✅ Legacy token: "job_<ix>_<hash>" → treat <ix> as ROW INDEX (1-based)
+  // This is the only safe interpretation for Content Template list responses.
+  {
+    const m = tok.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+    if (m) {
+      const ix = Number(m[1]);
+      if (Number.isFinite(ix) && ix > 0 && sentRows.length) {
+        if (ix <= sentRows.length) {
+          const row = sentRows[ix - 1];
+          const jobNo = Number(row?.jobNo ?? row?.job_no);
+          if (Number.isFinite(jobNo) && jobNo > 0) {
+            if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) {
+              return { ok: false, reason: 'legacy_ix_jobno_not_in_displayed', meta: { mode: 'legacy_index', ix, jobNo } };
+            }
+            return { ok: true, jobNo, meta: { mode: 'legacy_index', ix, jobNo } };
+          }
+          return { ok: false, reason: 'legacy_row_missing_jobNo', meta: { mode: 'legacy_index', ix } };
+        }
+
+        // Out of range index ⇒ almost certainly an old menu tap
+        return { ok: false, reason: 'stale_menu_pick', meta: { mode: 'legacy_index_oob', ix, sentRowsLen: sentRows.length } };
+      }
+
+      // If no sentRows, we can't safely interpret legacy token
+      return { ok: false, reason: 'legacy_no_sentrows', meta: { mode: 'legacy_index' } };
+    }
   }
 
   // 0) BEST CASE: signed jp:... row id
@@ -1069,20 +1098,17 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
     }
   }
 
-  // 2) SECONDARY: treat "#4 ..." as an INDEX into sentRows (not a jobNo)
-  const ix = extractLeadingHashNumber(inboundTitle);
-  if (Number.isFinite(ix) && ix > 0 && sentRows.length && ix <= sentRows.length) {
-    const row = sentRows[ix - 1];
-    const jobNo = Number(row?.jobNo ?? row?.job_no);
-    if (Number.isFinite(jobNo) && jobNo > 0) {
-      if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) {
-        return { ok: false, reason: 'ix_jobno_not_in_displayed', meta: { mode: 'index_from_title', ix, jobNo } };
-      }
-      return { ok: true, jobNo, meta: { mode: 'index_from_title', ix, jobNo } };
+  // 2) SECONDARY: "#4 ..." in ListTitle is a JOB NUMBER, not an index.
+  // (Because the UI label is "#<jobNo> <name>")
+  const jobNoFromTitle = extractLeadingHashNumber(inboundTitle);
+  if (Number.isFinite(jobNoFromTitle) && jobNoFromTitle > 0) {
+    if (displayedJobNos.length && !displayedJobNos.includes(jobNoFromTitle)) {
+      return { ok: false, reason: 'title_jobno_not_in_displayed', meta: { mode: 'jobno_from_title', jobNo: jobNoFromTitle } };
     }
+    return { ok: true, jobNo: jobNoFromTitle, meta: { mode: 'jobno_from_title', jobNo: jobNoFromTitle } };
   }
 
-  // 3) FINAL typed fallback: user typed a real jobNo
+  // 3) FINAL typed fallback: user typed a real jobNo (e.g. "4" or "#4")
   const typed = Number(String(tok).replace(/^#/, '').trim());
   if (Number.isFinite(typed) && typed > 0) {
     if (displayedJobNos.length && !displayedJobNos.includes(typed)) {
@@ -1093,6 +1119,7 @@ async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickS
 
   return { ok: false, reason: 'unrecognized_pick' };
 }
+
 
 
 
@@ -2871,6 +2898,90 @@ async function handleExpense(
 
   // ✅ tz needed throughout handler (single definition)
   const tz = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
+// ---------------------------------------------------------
+// ✅ EARLY GUARD: If confirm draft is awaiting_edit,
+// consume ANY non-control inbound as the edit payload.
+// This must run BEFORE job picker, new expense detection, etc.
+// ---------------------------------------------------------
+try {
+  const tokenEarly = normalizeDecisionToken(rawInboundText);
+
+  // Only these tokens are allowed to fall through while awaiting_edit
+  const isEditControlTokenEarly =
+    tokenEarly === 'yes' ||
+    tokenEarly === 'edit' ||
+    tokenEarly === 'cancel' ||
+    tokenEarly === 'resume' ||
+    tokenEarly === 'skip' ||
+    tokenEarly === 'change_job';
+
+  // Load confirm PA ONCE for this early guard
+  const confirmPAEarly = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+  const draftEarly = confirmPAEarly?.payload?.draft || null;
+
+  if (draftEarly?.awaiting_edit && !isEditControlTokenEarly) {
+    console.info('[AWAITING_EDIT_EARLY_GUARD]', {
+      paUserId,
+      token: tokenEarly,
+      head: String(rawInboundText || '').trim().slice(0, 80),
+      willConsumeAsEditPayload: true
+    });
+
+    const tz0 = tz; // use the single canonical tz you already computed
+
+    const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
+      rawInboundText,
+      draftEarly,
+      { fromKey: paUserId, tz: tz0, defaultData: {} }
+    );
+
+    if (!nextDraft) {
+      return out(
+        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
+        false
+      );
+    }
+
+    await upsertPA({
+      ownerId,
+      userId: paKey,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPAEarly?.payload || {}),
+        draft: {
+          ...(draftEarly || {}),
+          ...nextDraft,
+
+          // ✅ make the user's edit authoritative
+          draftText: String(rawInboundText || '').trim(),
+          originalText: String(rawInboundText || '').trim(),
+
+          // ✅ critical: exit edit mode
+          awaiting_edit: false,
+
+          // ✅ prevent later receipt reparse from overwriting the edit
+          needsReparse: false
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    // ✅ Immediately re-send confirm UI and RETURN (no nag, no fall-through)
+    try {
+      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
+    } catch (e) {
+      console.warn('[EXPENSE] resendConfirmExpense after early edit guard failed:', e?.message);
+      const merged = { ...(draftEarly || {}), ...nextDraft, awaiting_edit: false };
+      return out(twimlText(formatExpenseConfirmText(merged)), false);
+    }
+  }
+} catch (e) {
+  console.warn('[EARLY_EDIT_PAYLOAD_GUARD] failed (ignored):', e?.message);
+}
+
+// ✅ NOTE: early pendingTxState edit machine is removed entirely.
+// CONFIRM PA is the only source of truth for edit flow.
+
 
   // ✅ If confirm PA exists, do NOT run any separate edit machine.
   // (We are deleting the early pendingTxState edit machine entirely.)
@@ -3708,6 +3819,84 @@ console.info('[CONFIRM_STATE]', {
   head: String(rawInboundText || '').trim().slice(0, 80),
   hasPickPA: false // (optional; you can fill this later if needed)
 });
+// ---------------------------------------------------------
+// ✅ SAFETY NET: If confirm draft is awaiting_edit,
+// NEVER nag about "unfinished expense".
+// Consume any non-control inbound as the edit payload.
+// ---------------------------------------------------------
+try {
+  const draftE = confirmPA?.payload?.draft || null;
+
+  if (draftE?.awaiting_edit) {
+    const tokE = normalizeDecisionToken(rawInboundText);
+
+    const isEditControlToken =
+      tokE === 'yes' ||
+      tokE === 'edit' ||
+      tokE === 'cancel' ||
+      tokE === 'resume' ||
+      tokE === 'skip' ||
+      tokE === 'change_job';
+
+    // Log proves routing correctness
+    console.info('[AWAITING_EDIT_SAFETYNET_CHECK]', {
+      paUserId,
+      tokE,
+      awaiting_edit: true,
+      isEditControlToken,
+      head: String(rawInboundText || '').trim().slice(0, 80)
+    });
+
+    // Any non-control inbound while awaiting_edit is treated as edit payload
+    if (!isEditControlToken) {
+      console.info('[AWAITING_EDIT_SAFETYNET_CONSUME]', {
+        paUserId,
+        head: String(rawInboundText || '').trim().slice(0, 80)
+      });
+
+      const tz0 = tz;
+
+      const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
+        rawInboundText,
+        draftE,
+        { fromKey: paUserId, tz: tz0, defaultData: {} }
+      );
+
+      if (!nextDraft) {
+        return out(
+          twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
+          false
+        );
+      }
+
+      await upsertPA({
+        ownerId,
+        userId: paKey,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPA?.payload || {}),
+          draft: {
+            ...(draftE || {}),
+            ...nextDraft,
+            draftText: String(rawInboundText || '').trim(),
+            originalText: String(rawInboundText || '').trim(),
+            awaiting_edit: false,
+            needsReparse: false
+          }
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+
+      // Refresh confirmPA in-memory (optional but helps avoid shadow bugs)
+      confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
+
+      // ✅ Immediately re-send confirm UI and RETURN (no nag)
+      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
+    }
+  }
+} catch (e) {
+  console.warn('[AWAITING_EDIT_SAFETYNET] failed (ignored):', e?.message);
+}
 
 let bypassConfirmToAllowNewIntake = false;
 
@@ -3720,89 +3909,6 @@ if (confirmPA?.payload?.draft) {
 
   const token = normalizeDecisionToken(rawInboundText);
   const lcRaw = String(rawInboundText || '').trim().toLowerCase();
-
-  // ✅ 1) If awaiting edit, consume edit payload FIRST (and RETURN)
-  try {
-    const draft0 = confirmPA?.payload?.draft || null;
-
-    if (draft0?.awaiting_edit) {
-      // Only these tokens should "fall through" while awaiting_edit
-      const isEditControlToken =
-        token === 'yes' ||
-        token === 'edit' ||
-        token === 'cancel' ||
-        token === 'resume' ||
-        token === 'skip' ||
-        token === 'change_job';
-
-      // Any non-control message while awaiting_edit is treated as the edit payload
-      if (!isEditControlToken) {
-        const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
-console.info('[AWAITING_EDIT_CONSUME]', {
-  paUserId,
-  token,
-  head: String(rawInboundText || '').trim().slice(0, 80),
-  willConsumeAsEditPayload: true
-});
-
-        const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
-          rawInboundText,
-          draft0,
-          { fromKey: paUserId, tz: tz0, defaultData: {} }
-        );
-
-        if (!nextDraft) {
-          return out(
-            twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
-            false
-          );
-        }
-
-        await upsertPA({
-          ownerId,
-          userId: paKey,
-          kind: PA_KIND_CONFIRM,
-          payload: {
-            ...(confirmPA.payload || {}),
-            draft: {
-              ...(draft0 || {}),
-              ...nextDraft,
-
-              // ✅ make the user's edit the authoritative "source"
-              draftText: String(rawInboundText || '').trim(),
-              originalText: String(rawInboundText || '').trim(),
-
-              // ✅ critical: exit edit mode
-              awaiting_edit: false,
-
-              // ✅ prevent later receipt reparse from overwriting the edit
-              needsReparse: false
-            }
-          },
-          ttlSeconds: PA_TTL_SEC
-        });
-
-        // ✅ Re-send confirm UI immediately (no nag message)
-        try {
-          return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
-        } catch (e) {
-          console.warn('[EXPENSE] resendConfirmExpense after edit payload failed (fallback):', e?.message);
-          const merged = {
-            ...(draft0 || {}),
-            ...nextDraft,
-            draftText: String(rawInboundText || '').trim(),
-            originalText: String(rawInboundText || '').trim(),
-            awaiting_edit: false
-          };
-          return out(twimlText(formatExpenseConfirmText(merged)), false);
-        }
-      }
-
-      // If it's a control token, fall through to normal logic below.
-    }
-  } catch (e) {
-    console.warn('[EXPENSE] awaiting_edit consume failed (ignored):', e?.message);
-  }
 
   // ✅ 0) Receipt/media inbound bypass: do NOT nag; let receipt intake handle this inbound.
   try {
@@ -3924,6 +4030,14 @@ console.info('[AWAITING_EDIT_CONSUME]', {
 
     // ✅ If user is trying to log a new expense while confirm pending:
     if (looksLikeNewExpenseText(rawInboundText)) {
+      console.info('[CONFIRM_NAG_WOULD_FIRE]', {
+        paUserId,
+        awaiting_edit: !!confirmPA?.payload?.draft?.awaiting_edit,
+        head: String(rawInboundText || '').trim().slice(0, 80),
+        looksLikeNewExpense: true,
+        token: normalizeDecisionToken(rawInboundText)
+      });
+
       const allowNew = !!pendingNow?.allow_new_while_pending;
 
       if (!allowNew) {

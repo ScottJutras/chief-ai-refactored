@@ -612,6 +612,57 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
 }
 
 /* ---------------- misc helpers ---------------- */
+async function bestEffortResolveJobFromText(ownerId, text) {
+  const raw = String(text || '').toLowerCase();
+
+  // Pull the "job ..." segment if present
+  const m = raw.match(/\bjob\b\s*[:\-]?\s*([a-z0-9 #'\-–—]+)$/i);
+  const needle = String(m?.[1] || '').trim();
+  if (!needle) return null;
+
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 200));
+  if (!jobs.length) return null;
+
+  const n = needle
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const j of jobs) {
+    const name = String(getJobDisplayName(j) || j?.name || '').trim();
+    const normName = name
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!normName) continue;
+
+    // Simple scoring: exact/contains
+    let score = 0;
+    if (normName === n) score = 3;
+    else if (normName.includes(n)) score = 2;
+    else if (n.includes(normName)) score = 1;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = j;
+    }
+  }
+
+  if (!best) return null;
+
+  return {
+    jobName: getJobDisplayName(best),
+    jobSource: 'edited',
+    job_no: Number(best?.job_no ?? best?.jobNo ?? null) || null,
+    job_id: best?.id || best?.job_id || null
+  };
+}
 
 /* =========================================================
    Job picker helpers (DE-DUPED, aligned with sendJobPickList)
@@ -649,22 +700,6 @@ function normalizeListTitle(s) {
     .replace(/[^a-z0-9 #:-]/g, ''); // keep minimal safe chars
 }
 
-// ✅ parse jobNo from the title you actually send: "2 Oak Street Re-roof"
-// (also accepts "#2 ..." and "Job #2 ...")
-function jobNoFromTitle(title) {
-  const t = String(title || '').trim();
-
-  let m = t.match(/^#\s*(\d{1,10})\b/);
-  if (m) return Number(m[1]);
-
-  m = t.match(/^\s*(\d{1,10})\b/);
-  if (m) return Number(m[1]);
-
-  m = t.match(/\bjob\s*#\s*(\d{1,10})\b/i);
-  if (m) return Number(m[1]);
-
-  return null;
-}
 
 // ✅ legacy support for old "job_<ix>_<hash>" replies (keep ONE copy)
 function legacyIndexFromTwilioToken(tok) {
@@ -982,143 +1017,71 @@ function hmac12(secret, s) {
  * ✅ Typed "#4" is treated as a jobNo (not index) because user typed it.
  */
 async function resolveJobPickSelection({ ownerId, from, input, twilioMeta, pickState }) {
-  const tok = String(input || '').trim();
-  const inboundTitle = String(twilioMeta?.ListTitle || '').trim();
+  const inboundTitleRaw = String(twilioMeta?.ListTitle || '').trim();
   const inboundListId = String(twilioMeta?.ListId || '').trim();
-
-  const flow = String(pickState?.flow || '').trim() || null;
-  const pickerNonce = String(pickState?.pickerNonce || '').trim() || null;
-  const displayedHash = String(pickState?.displayedHash || '').trim() || null;
+  const tok = String(input || '').trim();
 
   const displayedJobNos = Array.isArray(pickState?.displayedJobNos)
-    ? pickState.displayedJobNos.map(Number).filter(Number.isFinite)
+    ? pickState.displayedJobNos.map(Number).filter((n) => Number.isFinite(n) && n > 0)
     : [];
 
   const sentRows = Array.isArray(pickState?.sentRows) ? pickState.sentRows : [];
 
-  function normalizeTitleText(s) {
-    return String(s || '')
+  // Normalize: remove Twilio-added "#<index>" prefix (NOT jobNo)
+  function stripTwilioIndexPrefix(s) {
+    return String(s || '').replace(/^#\s*\d+\s*/i, '').trim();
+  }
+
+  function norm(s) {
+    return stripTwilioIndexPrefix(s)
       .toLowerCase()
-      .replace(/^#\s*\d+\s*/g, '')                // "#4 "
-      .replace(/^\d+\s+/g, '')                   // "4 "
-      .replace(/job\s*#\s*\d+\s*[-—:]?\s*/g, '')  // "Job #12 —"
       .replace(/[^a-z0-9\s]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
   }
 
-  function extractLeadingHashNumber(s) {
-    const t = String(s || '').trim();
-    const m = t.match(/^#\s*(\d{1,10})\b/);
-    return m ? Number(m[1]) : null;
-  }
-
-  // ✅ Legacy token: "job_<ix>_<hash>" → treat <ix> as ROW INDEX (1-based)
-  // This is the only safe interpretation for Content Template list responses.
-  {
-    const m = tok.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
-    if (m) {
-      const ix = Number(m[1]);
-      if (Number.isFinite(ix) && ix > 0 && sentRows.length) {
-        if (ix <= sentRows.length) {
-          const row = sentRows[ix - 1];
-          const jobNo = Number(row?.jobNo ?? row?.job_no);
-          if (Number.isFinite(jobNo) && jobNo > 0) {
-            if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) {
-              return { ok: false, reason: 'legacy_ix_jobno_not_in_displayed', meta: { mode: 'legacy_index', ix, jobNo } };
-            }
-            return { ok: true, jobNo, meta: { mode: 'legacy_index', ix, jobNo } };
-          }
-          return { ok: false, reason: 'legacy_row_missing_jobNo', meta: { mode: 'legacy_index', ix } };
-        }
-
-        // Out of range index ⇒ almost certainly an old menu tap
-        return { ok: false, reason: 'stale_menu_pick', meta: { mode: 'legacy_index_oob', ix, sentRowsLen: sentRows.length } };
-      }
-
-      // If no sentRows, we can't safely interpret legacy token
-      return { ok: false, reason: 'legacy_no_sentrows', meta: { mode: 'legacy_index' } };
-    }
-  }
-
-  // 0) BEST CASE: signed jp:... row id
-  const rid = typeof parseRowId === 'function' ? parseRowId(tok) : null;
-  if (rid) {
-    if (flow && String(rid.flow) !== String(flow)) return { ok: false, reason: 'flow_mismatch' };
-    if (pickerNonce && String(rid.nonce) !== String(pickerNonce)) return { ok: false, reason: 'nonce_mismatch' };
-
-    const secret = (typeof getJobPickerSecret === 'function' && getJobPickerSecret()) || 'dev-secret-change-me';
-    const expected = hmac12(secret, `${rid.flow}|${rid.nonce}|${rid.jobNo}`);
-    if (String(rid.sig) !== String(expected)) return { ok: false, reason: 'sig_mismatch' };
-
-    const jobNo = Number(rid.jobNo);
-    if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) {
-      return { ok: false, reason: 'jobno_not_in_displayed' };
-    }
-
-    return { ok: true, jobNo, meta: { mode: 'row_id', flow: rid.flow, pickerNonce: rid.nonce } };
-  }
-
-  // 1) PRIMARY: match visible title text against sentRows (most reliable in Content Templates)
-  const inboundNorm = normalizeTitleText(inboundTitle);
+  // ✅ 1) Primary: match inbound title text to sentRows.name/title
+  const inboundNorm = norm(inboundTitleRaw);
   if (inboundNorm && sentRows.length) {
-    const candidates = sentRows
+    const best = sentRows
       .map((r) => {
         const jobNo = Number(r?.jobNo ?? r?.job_no);
         if (!Number.isFinite(jobNo) || jobNo <= 0) return null;
+
+        // If we have displayedJobNos, jobNo must be within it
         if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return null;
 
-        const nameNorm = normalizeTitleText(r?.name || '');
-        const titleNorm = normalizeTitleText(r?.title || '');
+        const a = norm(r?.name || '');
+        const b = norm(r?.title || '');
 
         let score = 0;
-        if (nameNorm === inboundNorm || titleNorm === inboundNorm) score = 3;
-        else if (
-          (nameNorm && nameNorm.startsWith(inboundNorm)) ||
-          (titleNorm && titleNorm.startsWith(inboundNorm)) ||
-          (inboundNorm && inboundNorm.startsWith(nameNorm))
-        ) score = 2;
-        else if (
-          (nameNorm && nameNorm.includes(inboundNorm)) ||
-          (titleNorm && titleNorm.includes(inboundNorm)) ||
-          (inboundNorm && inboundNorm.includes(nameNorm))
-        ) score = 1;
+        if (a === inboundNorm || b === inboundNorm) score = 3;
+        else if ((a && a.includes(inboundNorm)) || (b && b.includes(inboundNorm))) score = 2;
+        else if ((inboundNorm && inboundNorm.includes(a)) || (inboundNorm && inboundNorm.includes(b))) score = 1;
 
         return score ? { jobNo, score } : null;
       })
       .filter(Boolean)
-      .sort((a, b) => b.score - a.score);
+      .sort((x, y) => y.score - x.score)[0];
 
-    if (candidates.length) {
-      return {
-        ok: true,
-        jobNo: Number(candidates[0].jobNo),
-        meta: { mode: 'title_match', flow, pickerNonce, displayedHash, inboundTitle: inboundTitle.slice(0, 80) }
-      };
+    if (best) {
+      return { ok: true, jobNo: Number(best.jobNo), meta: { mode: 'title_match', inboundTitle: inboundTitleRaw.slice(0, 80) } };
     }
   }
 
-  // 2) SECONDARY: "#4 ..." in ListTitle is a JOB NUMBER, not an index.
-  // (Because the UI label is "#<jobNo> <name>")
-  const jobNoFromTitle = extractLeadingHashNumber(inboundTitle);
-  if (Number.isFinite(jobNoFromTitle) && jobNoFromTitle > 0) {
-    if (displayedJobNos.length && !displayedJobNos.includes(jobNoFromTitle)) {
-      return { ok: false, reason: 'title_jobno_not_in_displayed', meta: { mode: 'jobno_from_title', jobNo: jobNoFromTitle } };
-    }
-    return { ok: true, jobNo: jobNoFromTitle, meta: { mode: 'jobno_from_title', jobNo: jobNoFromTitle } };
-  }
-
-  // 3) FINAL typed fallback: user typed a real jobNo (e.g. "4" or "#4")
+  // ✅ 2) Fallback: if user typed an actual number, allow it ONLY if it's in displayedJobNos
   const typed = Number(String(tok).replace(/^#/, '').trim());
   if (Number.isFinite(typed) && typed > 0) {
     if (displayedJobNos.length && !displayedJobNos.includes(typed)) {
-      return { ok: false, reason: 'typed_not_in_displayed' };
+      return { ok: false, reason: 'typed_not_in_displayed', meta: { mode: 'typed_number', typed } };
     }
-    return { ok: true, jobNo: typed, meta: { mode: 'typed_number', flow, pickerNonce, displayedHash } };
+    return { ok: true, jobNo: typed, meta: { mode: 'typed_number', typed } };
   }
 
-  return { ok: false, reason: 'unrecognized_pick' };
+  // Anything else (including job_3_xxxx) is not reliable in Content Templates
+  return { ok: false, reason: 'unrecognized_pick', meta: { inboundTitle: inboundTitleRaw.slice(0, 80), inboundListId, tok: tok.slice(0, 40) } };
 }
+
 
 
 
@@ -2076,7 +2039,14 @@ function extractJobNoFromWhatsAppListTitle(title) {
 
   return null;
 }
-
+// helpers used above (ensure they exist)
+function randHex8() {
+  return Math.random().toString(16).slice(2, 10).padEnd(8, '0').slice(0, 8);
+}
+function hash8(s) {
+  const x = require('crypto').createHash('sha1').update(String(s || '')).digest('hex');
+  return x.slice(0, 8);
+}
 async function sendJobPickList({
   fromPhone,
   ownerId,
@@ -2089,125 +2059,111 @@ async function sendJobPickList({
   context = 'expense_jobpick',
   confirmDraft = null
 }) {
-  const paKey =
-    normalizeIdentityDigits(paUserId) ||
-    normalizeIdentityDigits(userProfile?.wa_id) ||
-    normalizeIdentityDigits(fromPhone) ||
-    String(fromPhone || '').trim();
-
   const to = waTo(fromPhone);
+  if (!to) return out(twimlText('Missing recipient.'), false);
+
   const p = Math.max(0, Number(page) || 0);
   const ps = Math.min(8, Math.max(1, Number(pageSize) || 8));
 
-  // deterministic, job_no-first clean list
-  const seen = new Set();
-  const clean = [];
-
-  for (const j of jobOptions || []) {
-    const jobNo = j?.job_no != null ? Number(j.job_no) : null;
-    if (jobNo == null || !Number.isFinite(jobNo)) continue;
-
-    const name = sanitizeJobLabel(j?.name || j?.job_name || '');
-    if (!name || isGarbageJobName(name)) continue;
-
-    if (seen.has(jobNo)) continue;
-    seen.add(jobNo);
-
-    const rawId = j?.id != null ? String(j.id) : j?.job_id != null ? String(j.job_id) : null;
-    const safeUuidId = rawId && looksLikeUuid(rawId) ? rawId : null;
-
-    clean.push({ id: safeUuidId, job_no: jobNo, name });
-  }
-
-  clean.sort((a, b) => Number(a.job_no) - Number(b.job_no));
+  const safeJobs = Array.isArray(jobOptions) ? jobOptions : [];
+  const total = safeJobs.length;
 
   const start = p * ps;
-  const slice = clean.slice(start, start + ps);
-  const displayedJobNos = slice.map((j) => Number(j.job_no)).filter(Number.isFinite);
-  const hasMore = start + ps < clean.length;
+  const end = start + ps;
 
-  const displayedHash = sha8(displayedJobNos.join(','));
-  const pickerNonce = makePickerNonce();
-  const flow = sha8(String(confirmFlowId || `${ownerId}:${fromPhone}:${Date.now()}`));
+  const pageJobs = safeJobs.slice(start, end);
+  const hasMore = end < total;
 
-  const sentRows = slice.map((j, idx) => {
-    const jobNo = Number(j.job_no);
-    const name = sanitizeJobLabel(j.name);
-    const title = `#${jobNo} ${name}`.slice(0, 24);
-    return { ix: idx + 1, jobNo, name, title };
-  });
+  // Stable flow for this picker session:
+  // ✅ MUST be stable across pages + replies for this confirm flow
+  const flow = String(confirmFlowId || '').trim() || String(`${paUserId}:${Date.now()}`).trim();
 
-  // store minimal confirmDraft snapshot for recovery
-  const confirmDraftSnap = pickConfirmDraftSnapshot(confirmDraft);
+  // Nonce rotates per send to prevent stale replays
+  const pickerNonce = randHex8();
 
-  await upsertPA({
-    ownerId,
-    userId: paKey,
-    kind: PA_KIND_PICK_JOB,
-    payload: {
-      context,
-      flow,
-      confirmFlowId,
-      pickerNonce,
-      page: p,
-      pageSize: ps,
-      displayedJobNos,
-      displayedHash,
-      sentAt: Date.now(),
-      sentRows,
-      jobOptions: clean,
-      hasMore,
-      confirmDraft: confirmDraftSnap
-    },
-    ttlSeconds: PA_TTL_SEC
+  // displayedJobNos are REAL jobNos (not UI indexes)
+  const displayedJobNos = pageJobs
+    .map((j) => Number(j?.job_no ?? j?.jobNo))
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  const displayedHash = hash8(displayedJobNos.join(','));
+
+  // ✅ ROW TITLES MUST BE NAME-ONLY (Twilio adds its own #index)
+  // ✅ sentRows must carry jobNo so resolver can map title->jobNo reliably
+  const sentRows = pageJobs.map((j) => {
+    const jobNo = Number(j?.job_no ?? j?.jobNo);
+    const name = String(getJobDisplayName(j) || j?.name || '').trim() || `Job ${jobNo || ''}`.trim();
+
+    return {
+      jobNo,
+      name,
+      id: `jobno_${jobNo}`, // stable debug id
+      title: name // name-only title (no "#")
+    };
   });
 
   console.info('[JOB_PICK_CLEAN]', {
-    total: clean.length,
+    total,
     page: p,
     displayedJobNos,
     hasMore
   });
 
-  // Text fallback
-  if (!ENABLE_INTERACTIVE_LIST || !to) {
-    return out(twimlText(buildTextJobPrompt(clean, p, ps)), false);
-  }
-
-  // ✅ IMPORTANT: make row.id deterministic so Twilio can return Body/ListId reliably
-  const rows = slice.map((j) => {
-    const jobNo = Number(j.job_no);
-    const name = sanitizeJobLabel(j.name);
-
-    return {
-      id: `jobno_${jobNo}`,                 // ✅ parseable forever
-      title: `#${jobNo} ${name}`.slice(0, 24),
-      description: `Job #${jobNo} — ${name}`.slice(0, 72)
-    };
-  });
-
-  const bodyText = 'Which job is this expense for?';
-  const sections = [{ title: 'Jobs', rows }];
-
   console.info('[JOB_PICK_SEND]', {
     context,
-    flow,
+    flow: hash8(flow),
     pickerNonce,
     page: p,
     displayedHash,
     displayedJobNos,
-    rows: rows.map((r) => ({ id: r.id, title: r.title }))
+    rows: sentRows.map((r) => ({ id: r.id, title: r.title, jobNo: r.jobNo }))
   });
 
-  // ✅ ONLY send the interactive list. Do not also send templates here.
-  return await sendWhatsAppInteractiveList({
+  // ✅ Persist picker PA state
+  await upsertPA({
+    ownerId,
+    userId: normalizeIdentityDigits(paUserId) || String(paUserId || '').trim(),
+    kind: PA_KIND_PICK_JOB,
+    payload: {
+      flow, // ✅ store REAL flow, not hash
+      confirmFlowId: String(confirmFlowId || '').trim() || null,
+      context,
+      page: p,
+      pageSize: ps,
+      hasMore,
+      sentAt: Date.now(),
+      pickerNonce,
+      displayedHash,
+      displayedJobNos,
+      sentRows, // ✅ critical for title-based resolution
+      jobOptions: safeJobs, // optional; ok if you rely on it elsewhere
+      confirmDraft: confirmDraft || null
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
+
+  // ✅ Build Twilio "sections" payload (as expected by services/twilio.js)
+  const bodyText = hasMore
+    ? 'Tap a job below (reply “more” for next page).'
+    : 'Tap a job below.';
+
+  const sections = [
+    {
+      title: 'Jobs',
+      rows: sentRows.map((r) => ({ id: r.id, title: r.title }))
+    }
+  ];
+
+  // ✅ Send the interactive list via your wrapper signature
+  await sendWhatsAppInteractiveList({
     to,
     bodyText,
     buttonText: 'Pick job',
     sections
   });
-}
 
+  return out(twimlEmpty(), true);
+}
 
 /* ---------------- Active job resolution ---------------- */
 
@@ -2906,7 +2862,6 @@ async function handleExpense(
 try {
   const tokenEarly = normalizeDecisionToken(rawInboundText);
 
-  // Only these tokens are allowed to fall through while awaiting_edit
   const isEditControlTokenEarly =
     tokenEarly === 'yes' ||
     tokenEarly === 'edit' ||
@@ -2915,7 +2870,6 @@ try {
     tokenEarly === 'skip' ||
     tokenEarly === 'change_job';
 
-  // Load confirm PA ONCE for this early guard
   const confirmPAEarly = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   const draftEarly = confirmPAEarly?.payload?.draft || null;
 
@@ -2927,7 +2881,7 @@ try {
       willConsumeAsEditPayload: true
     });
 
-    const tz0 = tz; // use the single canonical tz you already computed
+    const tz0 = tz;
 
     const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
       rawInboundText,
@@ -2942,6 +2896,12 @@ try {
       );
     }
 
+    // ✅ Ensure edited "Job ..." becomes authoritative in the draft
+    let jobPatch = null;
+    try {
+      jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
+    } catch {}
+
     await upsertPA({
       ownerId,
       userId: paKey,
@@ -2951,33 +2911,31 @@ try {
         draft: {
           ...(draftEarly || {}),
           ...nextDraft,
+          ...(jobPatch || {}),
 
-          // ✅ make the user's edit authoritative
           draftText: String(rawInboundText || '').trim(),
           originalText: String(rawInboundText || '').trim(),
 
-          // ✅ critical: exit edit mode
           awaiting_edit: false,
-
-          // ✅ prevent later receipt reparse from overwriting the edit
           needsReparse: false
         }
       },
       ttlSeconds: PA_TTL_SEC
     });
 
-    // ✅ Immediately re-send confirm UI and RETURN (no nag, no fall-through)
+    // ✅ Immediately re-send confirm UI and RETURN
     try {
       return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
     } catch (e) {
       console.warn('[EXPENSE] resendConfirmExpense after early edit guard failed:', e?.message);
-      const merged = { ...(draftEarly || {}), ...nextDraft, awaiting_edit: false };
+      const merged = { ...(draftEarly || {}), ...nextDraft, ...(jobPatch || {}), awaiting_edit: false };
       return out(twimlText(formatExpenseConfirmText(merged)), false);
     }
   }
 } catch (e) {
   console.warn('[EARLY_EDIT_PAYLOAD_GUARD] failed (ignored):', e?.message);
 }
+
 
 // ✅ NOTE: early pendingTxState edit machine is removed entirely.
 // CONFIRM PA is the only source of truth for edit flow.
@@ -3820,83 +3778,102 @@ console.info('[CONFIRM_STATE]', {
   hasPickPA: false // (optional; you can fill this later if needed)
 });
 // ---------------------------------------------------------
-// ✅ SAFETY NET: If confirm draft is awaiting_edit,
+// ✅ SAFETY NET: If confirm draft is awaiting_edit OR edit was started recently,
 // NEVER nag about "unfinished expense".
 // Consume any non-control inbound as the edit payload.
 // ---------------------------------------------------------
 try {
   const draftE = confirmPA?.payload?.draft || null;
 
-  if (draftE?.awaiting_edit) {
-    const tokE = normalizeDecisionToken(rawInboundText);
+  const tokE = normalizeDecisionToken(rawInboundText);
 
-    const isEditControlToken =
-      tokE === 'yes' ||
-      tokE === 'edit' ||
-      tokE === 'cancel' ||
-      tokE === 'resume' ||
-      tokE === 'skip' ||
-      tokE === 'change_job';
+  const isEditControlToken =
+    tokE === 'yes' ||
+    tokE === 'edit' ||
+    tokE === 'cancel' ||
+    tokE === 'resume' ||
+    tokE === 'skip' ||
+    tokE === 'change_job';
 
-    // Log proves routing correctness
-    console.info('[AWAITING_EDIT_SAFETYNET_CHECK]', {
+  // ✅ if awaiting_edit got stomped, we still consume the next message as edit payload
+  const editRecentlyStarted =
+    !!draftE?.edit_started_at &&
+    (Date.now() - Number(draftE.edit_started_at || 0)) < 10 * 60 * 1000; // 10 minutes
+
+  const shouldTreatAsEditPayload =
+    !isEditControlToken && !!draftE && (draftE.awaiting_edit || editRecentlyStarted);
+
+  // Log proves routing correctness (and shows why we will/won't consume)
+  console.info('[AWAITING_EDIT_SAFETYNET_CHECK]', {
+    paUserId,
+    tokE,
+    awaiting_edit: !!draftE?.awaiting_edit,
+    editRecentlyStarted,
+    isEditControlToken,
+    willConsumeAsEditPayload: shouldTreatAsEditPayload,
+    head: String(rawInboundText || '').trim().slice(0, 80)
+  });
+
+  if (shouldTreatAsEditPayload) {
+    console.info('[AWAITING_EDIT_SAFETYNET_CONSUME]', {
       paUserId,
-      tokE,
-      awaiting_edit: true,
-      isEditControlToken,
       head: String(rawInboundText || '').trim().slice(0, 80)
     });
 
-    // Any non-control inbound while awaiting_edit is treated as edit payload
-    if (!isEditControlToken) {
-      console.info('[AWAITING_EDIT_SAFETYNET_CONSUME]', {
-        paUserId,
-        head: String(rawInboundText || '').trim().slice(0, 80)
-      });
+    const tz0 = tz; // canonical tz in this scope
 
-      const tz0 = tz;
+    const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
+      rawInboundText,
+      draftE,
+      { fromKey: paUserId, tz: tz0, defaultData: {} }
+    );
 
-      const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
-        rawInboundText,
-        draftE,
-        { fromKey: paUserId, tz: tz0, defaultData: {} }
+    if (!nextDraft) {
+      return out(
+        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
+        false
       );
-
-      if (!nextDraft) {
-        return out(
-          twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
-          false
-        );
-      }
-
-      await upsertPA({
-        ownerId,
-        userId: paKey,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA?.payload || {}),
-          draft: {
-            ...(draftE || {}),
-            ...nextDraft,
-            draftText: String(rawInboundText || '').trim(),
-            originalText: String(rawInboundText || '').trim(),
-            awaiting_edit: false,
-            needsReparse: false
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-
-      // Refresh confirmPA in-memory (optional but helps avoid shadow bugs)
-      confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
-
-      // ✅ Immediately re-send confirm UI and RETURN (no nag)
-      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
     }
+
+    // ✅ Ensure edited "Job ..." becomes authoritative in the draft
+    let jobPatch = null;
+    try {
+      jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
+    } catch {}
+
+    await upsertPA({
+      ownerId,
+      userId: paKey,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA?.payload || {}),
+        draft: {
+          ...(draftE || {}),
+          ...nextDraft,
+          ...(jobPatch || {}),
+
+          // make user's edit authoritative
+          draftText: String(rawInboundText || '').trim(),
+          originalText: String(rawInboundText || '').trim(),
+
+          // exit edit mode + prevent later receipt reparse from stomping edits
+          awaiting_edit: false,
+          needsReparse: false
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    // refresh in-memory confirmPA (avoid shadow issues)
+    confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
+
+    // ✅ Immediately re-send confirm UI and RETURN (no nag)
+    return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
   }
 } catch (e) {
   console.warn('[AWAITING_EDIT_SAFETYNET] failed (ignored):', e?.message);
 }
+
 
 let bypassConfirmToAllowNewIntake = false;
 
@@ -4113,39 +4090,42 @@ if (confirmPA?.payload?.draft) {
       }
 
       // ✏️ Edit: mark confirm draft as awaiting edit
-      if (token === 'edit') {
-        try {
-          await upsertPA({
-            ownerId,
-            userId: paKey,
-            kind: PA_KIND_CONFIRM,
-            payload: {
-              ...(confirmPA.payload || {}),
-              draft: {
-                ...(confirmPA.payload?.draft || {}),
-                awaiting_edit: true
-              }
-            },
-            ttlSeconds: PA_TTL_SEC
-          });
-
-          console.info('[EXPENSE_EDIT_MODE_SET]', { paUserId });
-        } catch (e) {
-          console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
+if (token === 'edit') {
+  try {
+    await upsertPA({
+      ownerId,
+      userId: paKey,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA.payload || {}),
+        draft: {
+          ...(confirmPA.payload?.draft || {}),
+          awaiting_edit: true,
+          edit_started_at: Date.now(),             // ✅ add
+          edit_flow_id: confirmPA?.payload?.sourceMsgId || stableMsgId || null // ✅ add
         }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
 
-        return out(
-          twimlText(
-            [
-              '✏️ Okay — send the corrected expense details in ONE message.',
-              'Example:',
-              'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
-              'Reply "cancel" to discard.'
-            ].join('\n')
-          ),
-          false
-        );
-      }
+    console.info('[EXPENSE_EDIT_MODE_SET]', { paUserId });
+  } catch (e) {
+    console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
+  }
+
+  return out(
+    twimlText(
+      [
+        '✏️ Okay — send the corrected expense details in ONE message.',
+        'Example:',
+        'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+        'Reply "cancel" to discard.'
+      ].join('\n')
+    ),
+    false
+  );
+}
+
 
       // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending
       if (token === 'cancel') {

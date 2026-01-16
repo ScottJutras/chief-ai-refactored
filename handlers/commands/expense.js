@@ -533,7 +533,16 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
 
   const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   const draft = confirmPA?.payload?.draft;
-  if (!draft || !draft.needsReparse) return confirmPA;
+
+  if (!draft) return confirmPA;
+
+  // ✅ CRITICAL: never reparse while user is in Edit flow
+  if (draft?.awaiting_edit) {
+    console.info('[EXPENSE_REPARSE_SKIP_AWAITING_EDIT]', { paKey });
+    return confirmPA;
+  }
+
+  if (!draft.needsReparse) return confirmPA;
 
   // ✅ Receipt/OCR-first source text (critical)
   const sourceText = String(
@@ -583,6 +592,12 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
 
   const normalized = normalizeExpenseData(mergedDraft, userProfile, sourceText);
 
+  // ✅ Preserve edit latch fields across reparse (never drop edit mode accidentally)
+  normalized.awaiting_edit = !!draft?.awaiting_edit;
+  normalized.edit_started_at = draft?.edit_started_at ?? null;
+  normalized.editStartedAt = draft?.editStartedAt ?? null;
+  normalized.edit_flow_id = draft?.edit_flow_id ?? null;
+
   const gotAmount = !!String(normalized?.amount || '').trim() && String(normalized.amount).trim() !== '$0.00';
   const gotDate = !!String(normalized?.date || '').trim();
 
@@ -610,6 +625,7 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
 
   return await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
 }
+
 
 /* ---------------- misc helpers ---------------- */
 async function bestEffortResolveJobFromText(ownerId, text) {
@@ -2874,39 +2890,32 @@ async function handleExpense(
 
   // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
   // Must see resolved text / button payload / body.
+   // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
+  // Must see resolved text / button payload / body.
   const rawInboundText = getInboundText(input, inboundTwilioMeta);
+
+  // ✅ Strict decision token extractor (ONLY these tokens; everything else => null)
+  // NOTE: keep this ONE helper; remove any other strict-token helpers to avoid drift.
+  function strictDecisionToken(raw) {
+    const t = String(raw || '').trim().toLowerCase();
+    if (!t) return null;
+
+    // normalize a few common variants
+    if (t === 'y' || t === 'yeah' || t === 'yep' || t === 'ok' || t === 'okay') return 'yes';
+
+    // only allow exact command tokens
+    if (t === 'yes') return 'yes';
+    if (t === 'edit') return 'edit';
+    if (t === 'cancel') return 'cancel';
+    if (t === 'resume') return 'resume';
+    if (t === 'skip') return 'skip';
+    if (t === 'change_job' || t === 'change job' || t === 'change-job') return 'change_job';
+
+    return null;
+  }
+
   const inboundLower = normLower(rawInboundText);
-function getStrictControlToken(raw) {
-  const s = String(raw || '').trim().toLowerCase();
-  if (!s) return null;
 
-  // normalize common variants
-  if (s === 'change job') return 'change_job';
-  if (s === 'change-job') return 'change_job';
-
-  // only accept exact matches (NO fuzzy parsing)
-  const allowed = new Set(['yes', 'edit', 'cancel', 'resume', 'skip', 'change_job']);
-  return allowed.has(s) ? s : null;
-}
-
-  // ✅ Stable id for idempotency; prefer inbound MessageSid. Always fall back to deterministic.
-  const stableMsgId =
-    String(sourceMsgId || '').trim() ||
-    String(inboundTwilioMeta?.MessageSid || '').trim() ||
-    String(userProfile?.last_message_sid || '').trim() ||
-    String(`${paUserId}:${Date.now()}`).trim();
-
-  const safeMsgId = stableMsgId;
-
-  // ✅ DO NOT overwrite `from`. Keep `fromPhone` for Twilio replies.
-  const fromKey = paUserId;
-
-    console.info('[PA_KEY]', {
-    fromPhone,
-    waId: inboundTwilioMeta?.WaId,
-    paUserId,
-    stableMsgId
-  });
 
   // -------------------------------------------------------------------
   // ✅ SINGLE-DEFINITION CANONICALS (must be immediately after [PA_KEY])
@@ -2932,18 +2941,18 @@ function getStrictControlToken(raw) {
 // This must run BEFORE job picker, new expense detection, etc.
 // ---------------------------------------------------------
 try {
-  const strictEarly = getStrictControlToken(rawInboundText);
-const isEditControlTokenEarly = !!strictEarly;
-
+  const strictEarly = strictDecisionToken(rawInboundText);
+  const isControlEarly = !!strictEarly;
 
   const confirmPAEarly = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   const draftEarly = confirmPAEarly?.payload?.draft || null;
 
-  if (draftEarly?.awaiting_edit && !isEditControlTokenEarly) {
+  if (draftEarly?.awaiting_edit && !isControlEarly) {
     console.info('[AWAITING_EDIT_EARLY_GUARD]', {
       paUserId,
-      token: tokenEarly,
-      head: String(rawInboundText || '').trim().slice(0, 80),
+      strictEarly,
+      awaiting_edit: true,
+      head: String(rawInboundText || '').trim().slice(0, 120),
       willConsumeAsEditPayload: true
     });
 
@@ -2962,11 +2971,23 @@ const isEditControlTokenEarly = !!strictEarly;
       );
     }
 
-    // ✅ Ensure edited "Job ..." becomes authoritative in the draft
+    // ✅ Job patch (AI/deterministic resolver)
     let jobPatch = null;
     try {
       jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
     } catch {}
+
+    // ✅ Deterministic "Job ..." fallback (covers: "Job Oak St re-roof")
+    const jobFromText = (() => {
+      const s = String(rawInboundText || '').trim();
+      if (!s) return null;
+      const m = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
+      if (!m?.[1]) return null;
+      let name = String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim();
+      if (!name) return null;
+      if (/^overhead$/i.test(name)) return 'Overhead';
+      return name;
+    })();
 
     await upsertPA({
       ownerId,
@@ -2976,13 +2997,20 @@ const isEditControlTokenEarly = !!strictEarly;
         ...(confirmPAEarly?.payload || {}),
         draft: {
           ...(draftEarly || {}),
-          ...nextDraft,
+          ...(nextDraft || {}),
           ...(jobPatch || {}),
+          ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
 
+          // make this edit authoritative
           draftText: String(rawInboundText || '').trim(),
           originalText: String(rawInboundText || '').trim(),
 
+          // exit edit mode + clear latch
           awaiting_edit: false,
+          edit_started_at: null,
+          editStartedAt: null,
+
+          // prevent later receipt reparse from overwriting the edit
           needsReparse: false
         }
       },
@@ -2994,13 +3022,20 @@ const isEditControlTokenEarly = !!strictEarly;
       return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
     } catch (e) {
       console.warn('[EXPENSE] resendConfirmExpense after early edit guard failed:', e?.message);
-      const merged = { ...(draftEarly || {}), ...nextDraft, ...(jobPatch || {}), awaiting_edit: false };
+      const merged = {
+        ...(draftEarly || {}),
+        ...(nextDraft || {}),
+        ...(jobPatch || {}),
+        ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
+        awaiting_edit: false
+      };
       return out(twimlText(formatExpenseConfirmText(merged)), false);
     }
   }
 } catch (e) {
   console.warn('[EARLY_EDIT_PAYLOAD_GUARD] failed (ignored):', e?.message);
 }
+
 
 
 // ✅ NOTE: early pendingTxState edit machine is removed entirely.
@@ -3878,7 +3913,7 @@ console.info('[CONFIRM_STATE]', {
 // ---------------------------------------------------------
 try {
   const draftE = confirmPA?.payload?.draft || null;
-  const strictTok = getStrictControlToken(rawInboundText);
+  const strictTok = strictDecisionToken(rawInboundText);
 const isControlToken = !!strictTok;
 
   // "recent edit" latch (works even if awaiting_edit flag is lost)
@@ -4700,27 +4735,38 @@ if (looksLikeReceiptText(input)) {
     // ✅ Deterministic receipt date from the receipt text itself (01/13/26 works)
     const seededDate = extractReceiptDateYYYYMMDD(receiptText, tz0);
 
+const inEdit = !!draft0?.awaiting_edit;
+
+const editLatch = {
+  awaiting_edit: !!draft0?.awaiting_edit,
+  edit_started_at: draft0?.edit_started_at ?? null,
+  editStartedAt: draft0?.editStartedAt ?? null,
+  edit_flow_id: draft0?.edit_flow_id ?? null
+};
+
+
+
     // ✅ Build patch (prefer existing draft date first, then seededDate, then backstop)
     const patch = {
-      store: back?.store || draft0?.store || null,
+  store: back?.store || draft0?.store || null,
 
-      date: String(draft0?.date || '').trim() || seededDate || back?.dateIso || null,
+  date: String(draft0?.date || '').trim() || seededDate || back?.dateIso || null,
 
-      amount:
-        back?.total != null
-          ? String(Number(back.total).toFixed(2))
-          : (String(draft0?.amount || '').trim() || null),
+  amount:
+    back?.total != null
+      ? String(Number(back.total).toFixed(2))
+      : (String(draft0?.amount || '').trim() || null),
 
-      currency: back?.currency || draft0?.currency || defaultCurrency,
+  currency: back?.currency || draft0?.currency || defaultCurrency,
 
-      // keep receipt fields present so normalize/backstops work later
-      receiptText,
-      ocrText: receiptText,
+  receiptText,
+  ocrText: receiptText,
 
-      // ✅ new receipt should become the authoritative source
-      originalText: receiptText,
-      draftText: receiptText
-    };
+  // ✅ Only overwrite these when NOT awaiting_edit (prevents clobbering user edit text)
+  originalText: inEdit ? (draft0?.originalText || receiptText) : receiptText,
+  draftText: inEdit ? (draft0?.draftText || receiptText) : receiptText
+};
+
 
     mergedDraft = mergeDraftNonNull(draft0, patch);
 
@@ -4748,6 +4794,7 @@ if (looksLikeReceiptText(input)) {
         sourceMsgId: txSourceMsgId,
         draft: {
           ...mergedDraft,
+          ...editLatch,
           needsReparse: !(gotAmount && gotDate)
         }
       },

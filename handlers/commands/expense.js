@@ -3981,8 +3981,113 @@ if (confirmPA?.payload?.draft) {
     return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
   }
 
-  const token = normalizeDecisionToken(rawInboundText);
+  // ✅ Use STRICT token for ALL confirm-flow routing (single source of truth)
+  const strictTok = strictDecisionToken(rawInboundText); // yes/edit/cancel/resume/skip/change_job OR null
   const lcRaw = String(rawInboundText || '').trim().toLowerCase();
+
+  // ---------------------------------------------------------
+  // ✅ HARD ENFORCEMENT (CONFIRM FLOW):
+  // If we're awaiting_edit, we MUST treat the next non-control
+  // inbound message as the edit payload (even if it "looks like"
+  // a new expense). This runs BEFORE any nag/bypass logic.
+  // ---------------------------------------------------------
+  try {
+    const draftE2 = confirmPA?.payload?.draft || null;
+
+    const isControl2 =
+      strictTok === 'yes' ||
+      strictTok === 'edit' ||
+      strictTok === 'cancel' ||
+      strictTok === 'resume' ||
+      strictTok === 'skip' ||
+      strictTok === 'change_job';
+
+    if (draftE2?.awaiting_edit && !isControl2) {
+      console.info('[AWAITING_EDIT_CONFIRM_ENFORCE]', {
+        paUserId,
+        strictTok,
+        head: String(rawInboundText || '').trim().slice(0, 120)
+      });
+
+      const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
+        rawInboundText,
+        draftE2,
+        { fromKey: paUserId, tz, defaultData: {} }
+      );
+
+      if (!nextDraft) {
+        return out(
+          twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
+          false
+        );
+      }
+
+      // ✅ Deterministic "Job ..." capture (so job edits never rely on LLM)
+      const extractJobNameFromEditText = (t) => {
+        const s = String(t || '').trim();
+        if (!s) return null;
+
+        // match last "job ..." segment
+        const m = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
+        if (!m?.[1]) return null;
+
+        let name = String(m[1]).trim();
+        name = name.replace(/[.!,;:]+$/g, '').trim();
+        if (!name) return null;
+        if (/^overhead$/i.test(name)) return 'Overhead';
+        return name;
+      };
+
+      const jobFromText = extractJobNameFromEditText(rawInboundText);
+
+      let jobPatch = null;
+      try {
+        jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
+      } catch {}
+
+      const patchedDraft = {
+        ...(draftE2 || {}),
+        ...(nextDraft || {}),
+        ...(jobPatch || {}),
+        ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
+
+        draftText: String(rawInboundText || '').trim(),
+        originalText: String(rawInboundText || '').trim(),
+
+        awaiting_edit: false,
+        edit_started_at: null,
+        editStartedAt: null,
+
+        needsReparse: false
+      };
+
+      await upsertPA({
+        ownerId,
+        userId: paKey,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPA?.payload || {}),
+          draft: patchedDraft
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+
+      // refresh in-memory (avoid stale confirmPA)
+      try {
+        confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+      } catch {}
+
+      // MUST resend confirm UI and return
+      try {
+        return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+      } catch (e) {
+        console.warn('[AWAITING_EDIT_CONFIRM_ENFORCE] resendConfirmExpense failed; fallback to text:', e?.message);
+        return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
+      }
+    }
+  } catch (e) {
+    console.warn('[AWAITING_EDIT_CONFIRM_ENFORCE] failed (ignored):', e?.message);
+  }
 
   // ✅ 0) Receipt/media inbound bypass: do NOT nag; let receipt intake handle this inbound.
   try {
@@ -3997,7 +4102,7 @@ if (confirmPA?.payload?.draft) {
 
   // ✅ 2) Currency-only reply consumption (only when it's a pure currency token)
   try {
-    if (!['yes', 'edit', 'cancel', 'resume', 'skip', 'change_job'].includes(token)) {
+    if (!strictTok) {
       const draft = confirmPA?.payload?.draft || null;
       const draftCurrency = String(draft?.currency || '').trim();
       const awaitingCurrency = !!draft?.awaiting_currency;
@@ -4024,11 +4129,7 @@ if (confirmPA?.payload?.draft) {
           ttlSeconds: PA_TTL_SEC
         });
 
-        // refresh + resend
-        try {
-          confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
-        } catch {}
-
+        try { confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
         return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
       }
     }
@@ -4037,13 +4138,7 @@ if (confirmPA?.payload?.draft) {
   }
 
   // decision tokens that MUST stay inside confirm flow
-  const isDecisionToken =
-    token === 'yes' ||
-    token === 'edit' ||
-    token === 'cancel' ||
-    token === 'resume' ||
-    token === 'skip' ||
-    token === 'change_job';
+  const isDecisionToken = !!strictTok;
 
   // “info commands” that should NOT be blocked by confirm draft
   const isNonIntakeQuery =
@@ -4060,6 +4155,9 @@ if (confirmPA?.payload?.draft) {
   if (!isDecisionToken && isNonIntakeQuery && !looksLikeNewExpenseText(rawInboundText)) {
     bypassConfirmToAllowNewIntake = true;
   }
+// IMPORTANT: below this point, replace uses of `token` with `strictTok`
+  // e.g. `if (strictTok === 'resume') ...`, `if (strictTok === 'skip') ...`,
+  // `if (strictTok === 'edit') ...`, etc.
 
   // ✅ If bypassing, fall through to normal routing below (do not nag, do not clear)
   if (!bypassConfirmToAllowNewIntake) {
@@ -4070,7 +4168,7 @@ if (confirmPA?.payload?.draft) {
     } catch {}
 
     // ✅ Resume: re-send confirm for the existing pending expense (no state changes)
-    if (token === 'resume') {
+    if (strictTok === 'resume') {
       try {
         return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
       } catch (e) {
@@ -4080,7 +4178,7 @@ if (confirmPA?.payload?.draft) {
     }
 
     // ✅ Skip: keep current confirm draft pending, allow ONE new intake next.
-    if (token === 'skip') {
+    if (strictTok === 'skip') {
       try {
         await mergePendingTransactionState(paUserId, {
           kind: 'expense',
@@ -4139,7 +4237,7 @@ if (confirmPA?.payload?.draft) {
     // If we decided to bypass to allow new intake, fall through.
     if (!bypassConfirmToAllowNewIntake) {
       // 🔁 Change Job (keep confirm PA)
-      if (token === 'change_job') {
+      if (strictTok === 'change_job') {
         const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
         if (!jobs.length) {
           return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
@@ -4188,7 +4286,7 @@ if (confirmPA?.payload?.draft) {
       }
 
       // ✏️ Edit: mark confirm draft as awaiting edit
-if (token === 'edit') {
+if (strictTok === 'edit') {
   try {
     await upsertPA({
       ownerId,
@@ -4241,7 +4339,7 @@ if (token === 'edit') {
 
 
       // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending
-      if (token === 'cancel') {
+      if (strictTok === 'cancel') {
         try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
         try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
 
@@ -4261,7 +4359,7 @@ if (token === 'edit') {
       // --------------------------------------------
       // ✅ YES (HARDENED + DOES INSERT + MUST RETURN)
       // --------------------------------------------
-      if (token === 'yes') {
+      if (strictTok === 'yes') {
         try {
           // Always operate on freshest confirm PA (avoid stale confirmPA var)
           let confirmPAFresh = null;
@@ -4436,6 +4534,19 @@ if (token === 'edit') {
 
           const sourceForDb = String(data.store || '').trim() || 'Unknown';
           const descForDb = String(data.item || data.description || '').trim() || 'Unknown';
+          console.info('[YES_FINAL_DRAFT_BEFORE_INSERT]', {
+  paUserId,
+  rawDraft_jobName: rawDraft?.jobName || null,
+  rawDraft_jobSource: rawDraft?.jobSource || null,
+  data_jobName: data?.jobName || null,
+  data_jobSource: data?.jobSource || null,
+  final_jobName: jobName || null,
+  final_jobSource: jobSource || null,
+  amount: data?.amount || null,
+  date: data?.date || null,
+  store: data?.store || null,
+  head_originalText: String(rawDraft?.originalText || rawDraft?.draftText || '').slice(0, 80)
+});
 
           await pg.insertTransaction({
             ownerId,

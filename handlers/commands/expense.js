@@ -943,7 +943,19 @@ function formatDisplayDate(isoDate, tz = 'America/Toronto') {
 }
 
 function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourceText }) {
-  const amt = String(amount || '').trim();
+  // ✅ Display amount with $ + 2 decimals when possible
+  const rawAmt = String(amount || '').trim();
+  const amtNum = Number(rawAmt.replace(/[^0-9.-]/g, ''));
+  const amt =
+    Number.isFinite(amtNum) && amtNum > 0
+      ? `$${amtNum.toFixed(2)}`
+      : rawAmt
+        ? (rawAmt.startsWith('$')
+            ? rawAmt
+            : /^\d+(?:\.\d+)?$/.test(rawAmt)
+              ? `$${Number(rawAmt).toFixed(2)}`
+              : rawAmt)
+        : '$0.00';
 
   // Start with existing behavior
   let it = cleanExpenseItemForDisplay(item);
@@ -992,6 +1004,7 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
 
   return lines.join('\n');
 }
+
 
 function getJobPickerSecret() {
   const s = process.env.JOB_PICKER_HMAC_SECRET;
@@ -2863,6 +2876,18 @@ async function handleExpense(
   // Must see resolved text / button payload / body.
   const rawInboundText = getInboundText(input, inboundTwilioMeta);
   const inboundLower = normLower(rawInboundText);
+function getStrictControlToken(raw) {
+  const s = String(raw || '').trim().toLowerCase();
+  if (!s) return null;
+
+  // normalize common variants
+  if (s === 'change job') return 'change_job';
+  if (s === 'change-job') return 'change_job';
+
+  // only accept exact matches (NO fuzzy parsing)
+  const allowed = new Set(['yes', 'edit', 'cancel', 'resume', 'skip', 'change_job']);
+  return allowed.has(s) ? s : null;
+}
 
   // ✅ Stable id for idempotency; prefer inbound MessageSid. Always fall back to deterministic.
   const stableMsgId =
@@ -2907,15 +2932,9 @@ async function handleExpense(
 // This must run BEFORE job picker, new expense detection, etc.
 // ---------------------------------------------------------
 try {
-  const tokenEarly = normalizeDecisionToken(rawInboundText);
+  const strictEarly = getStrictControlToken(rawInboundText);
+const isEditControlTokenEarly = !!strictEarly;
 
-  const isEditControlTokenEarly =
-    tokenEarly === 'yes' ||
-    tokenEarly === 'edit' ||
-    tokenEarly === 'cancel' ||
-    tokenEarly === 'resume' ||
-    tokenEarly === 'skip' ||
-    tokenEarly === 'change_job';
 
   const confirmPAEarly = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   const draftEarly = confirmPAEarly?.payload?.draft || null;
@@ -3859,15 +3878,8 @@ console.info('[CONFIRM_STATE]', {
 // ---------------------------------------------------------
 try {
   const draftE = confirmPA?.payload?.draft || null;
-  const tokE = normalizeDecisionToken(rawInboundText);
-
-  const isControlToken =
-    tokE === 'yes' ||
-    tokE === 'edit' ||
-    tokE === 'cancel' ||
-    tokE === 'resume' ||
-    tokE === 'skip' ||
-    tokE === 'change_job';
+  const strictTok = getStrictControlToken(rawInboundText);
+const isControlToken = !!strictTok;
 
   // "recent edit" latch (works even if awaiting_edit flag is lost)
   const editStartedAt =
@@ -3881,15 +3893,16 @@ try {
     !!draftE && !isControlToken && (draftE.awaiting_edit || editRecentlyStarted);
 
   console.info('[AWAITING_EDIT_SAFETYNET_CHECK]', {
-    paUserId,
-    tokE,
-    awaiting_edit: !!draftE?.awaiting_edit,
-    editStartedAt: editStartedAt || null,
-    editRecentlyStarted,
-    isControlToken,
-    willConsumeAsEditPayload: shouldConsumeAsEditPayload,
-    head: String(rawInboundText || '').trim().slice(0, 80)
-  });
+  paUserId,
+  strictTok, // ✅ add
+  awaiting_edit: !!draftE?.awaiting_edit,
+  editStartedAt: editStartedAt || null,
+  editRecentlyStarted,
+  isControlToken,
+  willConsumeAsEditPayload: shouldConsumeAsEditPayload,
+  head: String(rawInboundText || '').trim().slice(0, 80)
+});
+
 
   if (shouldConsumeAsEditPayload) {
     console.info('[AWAITING_EDIT_SAFETYNET_CONSUME]', {
@@ -4479,14 +4492,32 @@ if (token === 'edit') {
             }
           } catch {}
 
-          const okMsg = [
-            `✅ Logged expense ${String(data.amount || '').trim()} — ${data.store || 'Unknown Store'}`,
-            data.date ? `Date: ${data.date}` : null,
-            jobName ? `Job: ${jobName}` : null,
-            categoryStr ? `Category: ${categoryStr}` : null
-          ]
-            .filter(Boolean)
-            .join('\n');
+          // ✅ Format amount for display (always show $ and 2 decimals when numeric)
+const amountNumForMsg = Number(String(data?.amount ?? '').replace(/[^0-9.-]/g, ''));
+const amountDisplay =
+  Number.isFinite(amountNumForMsg) && amountNumForMsg > 0
+    ? `$${amountNumForMsg.toFixed(2)}`
+    : (() => {
+        // fallback: keep whatever string exists, but add $ if it looks like a bare number
+        const s = String(data?.amount ?? '').trim();
+        if (!s) return '$0.00';
+        if (/^\d+(?:\.\d+)?$/.test(s)) return `$${Number(s).toFixed(2)}`;
+        return s.startsWith('$') ? s : `$${s}`;
+      })();
+
+// Prefer normalized currency if present
+const currencyDisplay = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase();
+const currencySuffix = currencyDisplay ? ` ${currencyDisplay}` : '';
+
+const okMsg = [
+  `✅ Logged expense ${amountDisplay}${currencySuffix} — ${data.store || 'Unknown Store'}`,
+  data.date ? `Date: ${data.date}` : null,
+  jobName ? `Job: ${jobName}` : null,
+  categoryStr ? `Category: ${categoryStr}` : null
+]
+  .filter(Boolean)
+  .join('\n');
+
 
           return out(twimlText(okMsg), false);
         } catch (e) {

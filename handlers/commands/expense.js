@@ -2915,6 +2915,15 @@ async function handleExpense(
   }
 
   const inboundLower = normLower(rawInboundText);
+        // ✅ Stable id for idempotency + flow correlation
+  // Prefer Twilio MessageSid (most stable), then provided sourceMsgId, then deterministic fallback.
+  const stableMsgId =
+    String(inboundTwilioMeta?.MessageSid || '').trim() ||
+    String(sourceMsgId || '').trim() ||
+    String(userProfile?.last_message_sid || '').trim() ||
+    String(`${paUserId}:${Date.now()}`).trim();
+
+  const safeMsgId = stableMsgId;
 
 
   // -------------------------------------------------------------------
@@ -4725,9 +4734,12 @@ if (looksLikeReceiptText(input)) {
     const draft0 = c0?.payload?.draft || {};
 
     txSourceMsgId =
-      String(c0?.payload?.sourceMsgId || '').trim() ||
-      String(stableMsgId || '').trim() ||
-      null;
+  String(c0?.payload?.sourceMsgId || '').trim() ||
+  String(inboundTwilioMeta?.MessageSid || '').trim() ||
+  String(sourceMsgId || '').trim() ||
+  String(stableMsgId || '').trim() ||
+  null;
+
 
     const userKey = String(paUserId || '').trim();
     const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';

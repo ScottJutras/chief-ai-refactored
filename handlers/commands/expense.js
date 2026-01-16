@@ -2945,58 +2945,83 @@ async function handleExpense(
   const tz = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
 
 // ---------------------------------------------------------
-// ✅ EARLY GUARD: If confirm draft is awaiting_edit,
-// consume ANY non-control inbound as the edit payload.
-// This must run BEFORE job picker, new expense detection, etc.
+// ✅ EARLY GUARD (HARD):
+// If confirm draft is awaiting_edit, consume ANY non-control
+// inbound as the edit payload — BEFORE job picker / nag / intake.
 // ---------------------------------------------------------
 try {
-  const strictEarly = strictDecisionToken(rawInboundText);
-  const isControlEarly = !!strictEarly;
-
+  const strictTokEarly = strictDecisionToken(rawInboundText); // only yes/edit/cancel/resume/skip/change_job
   const confirmPAEarly = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   const draftEarly = confirmPAEarly?.payload?.draft || null;
 
+  const isControlEarly = !!strictTokEarly;
+
   if (draftEarly?.awaiting_edit && !isControlEarly) {
-    console.info('[AWAITING_EDIT_EARLY_GUARD]', {
+    console.info('[AWAITING_EDIT_EARLY_CONSUME]', {
       paUserId,
-      strictEarly,
-      awaiting_edit: true,
-      head: String(rawInboundText || '').trim().slice(0, 120),
-      willConsumeAsEditPayload: true
+      strictTokEarly,
+      head: String(rawInboundText || '').trim().slice(0, 140)
     });
 
-    const tz0 = tz;
-
+    // 1) Apply edit payload (AI or deterministic)
     const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
       rawInboundText,
       draftEarly,
-      { fromKey: paUserId, tz: tz0, defaultData: {} }
+      { fromKey: paUserId, tz, defaultData: {} }
     );
 
     if (!nextDraft) {
       return out(
-        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date.'),
+        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
         false
       );
     }
 
-    // ✅ Job patch (AI/deterministic resolver)
+    // 2) Deterministic job extraction: "Job Oak St re-roof", "Job: Oak St re-roof"
+    const extractJobNameFromEditText = (t) => {
+      const s = String(t || '').trim();
+      if (!s) return null;
+
+      // Grab everything after "job" to end-of-line/message
+      const m = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
+      if (!m?.[1]) return null;
+
+      let name = String(m[1]).trim();
+      name = name.replace(/[.!,;:]+$/g, '').trim(); // trim trailing punctuation
+      if (!name) return null;
+
+      if (/^overhead$/i.test(name)) return 'Overhead';
+      return name;
+    };
+
+    const jobFromText = extractJobNameFromEditText(rawInboundText);
+
+    // 3) Optional: keep your existing resolver too (but never let it override explicit typed job)
     let jobPatch = null;
     try {
       jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
     } catch {}
 
-    // ✅ Deterministic "Job ..." fallback (covers: "Job Oak St re-roof")
-    const jobFromText = (() => {
-      const s = String(rawInboundText || '').trim();
-      if (!s) return null;
-      const m = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
-      if (!m?.[1]) return null;
-      let name = String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim();
-      if (!name) return null;
-      if (/^overhead$/i.test(name)) return 'Overhead';
-      return name;
-    })();
+    // 4) Patch + clear edit latch
+    const patchedDraft = {
+      ...(draftEarly || {}),
+      ...(nextDraft || {}),
+      ...(jobPatch || {}),
+      ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
+
+      // make edit authoritative
+      draftText: String(rawInboundText || '').trim(),
+      originalText: String(rawInboundText || '').trim(),
+
+      // exit edit mode (clear latch)
+      awaiting_edit: false,
+      edit_started_at: null,
+      editStartedAt: null,
+      edit_flow_id: null,
+
+      // do NOT let receipt reparse overwrite the edit
+      needsReparse: false
+    };
 
     await upsertPA({
       ownerId,
@@ -3004,45 +3029,21 @@ try {
       kind: PA_KIND_CONFIRM,
       payload: {
         ...(confirmPAEarly?.payload || {}),
-        draft: {
-          ...(draftEarly || {}),
-          ...(nextDraft || {}),
-          ...(jobPatch || {}),
-          ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
-
-          // make this edit authoritative
-          draftText: String(rawInboundText || '').trim(),
-          originalText: String(rawInboundText || '').trim(),
-
-          // exit edit mode + clear latch
-          awaiting_edit: false,
-          edit_started_at: null,
-          editStartedAt: null,
-
-          // prevent later receipt reparse from overwriting the edit
-          needsReparse: false
-        }
+        draft: patchedDraft
       },
       ttlSeconds: PA_TTL_SEC
     });
 
-    // ✅ Immediately re-send confirm UI and RETURN
+    // 5) MUST resend confirm UI and RETURN (never nag)
     try {
-      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
+      return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
     } catch (e) {
-      console.warn('[EXPENSE] resendConfirmExpense after early edit guard failed:', e?.message);
-      const merged = {
-        ...(draftEarly || {}),
-        ...(nextDraft || {}),
-        ...(jobPatch || {}),
-        ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
-        awaiting_edit: false
-      };
-      return out(twimlText(formatExpenseConfirmText(merged)), false);
+      console.warn('[AWAITING_EDIT_EARLY_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
+      return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
     }
   }
 } catch (e) {
-  console.warn('[EARLY_EDIT_PAYLOAD_GUARD] failed (ignored):', e?.message);
+  console.warn('[AWAITING_EDIT_EARLY_CONSUME] failed (ignored):', e?.message);
 }
 
 
@@ -4015,7 +4016,6 @@ const isControlToken = !!strictTok;
 }
 
 
-
 let bypassConfirmToAllowNewIntake = false;
 
 if (confirmPA?.payload?.draft) {
@@ -4025,9 +4025,10 @@ if (confirmPA?.payload?.draft) {
     return out(twimlText('⚠️ Only the owner can manage expenses.'), false);
   }
 
-  // ✅ Use STRICT token for ALL confirm-flow routing (single source of truth)
-  const strictTok = strictDecisionToken(rawInboundText); // yes/edit/cancel/resume/skip/change_job OR null
   const lcRaw = String(rawInboundText || '').trim().toLowerCase();
+
+  // STRICT decision token (ONLY yes/edit/cancel/resume/skip/change_job)
+  const strictTok = strictDecisionToken(rawInboundText);
 
   // ---------------------------------------------------------
   // ✅ HARD ENFORCEMENT (CONFIRM FLOW):
@@ -4049,7 +4050,7 @@ if (confirmPA?.payload?.draft) {
     if (draftE2?.awaiting_edit && !isControl2) {
       console.info('[AWAITING_EDIT_CONFIRM_ENFORCE]', {
         paUserId,
-        strictTok,
+        strictTok, // will be null here by design
         head: String(rawInboundText || '').trim().slice(0, 120)
       });
 
@@ -4101,6 +4102,7 @@ if (confirmPA?.payload?.draft) {
         awaiting_edit: false,
         edit_started_at: null,
         editStartedAt: null,
+        edit_flow_id: null,
 
         needsReparse: false
       };
@@ -4181,6 +4183,21 @@ if (confirmPA?.payload?.draft) {
     console.warn('[EXPENSE] currency-only consume failed (ignored):', e?.message);
   }
 
+  // ✅ HARD STOP: Never nag while awaiting_edit (even if something else changes later)
+  if (confirmPA?.payload?.draft?.awaiting_edit) {
+    return out(
+      twimlText(
+        [
+          '✏️ I’m waiting for your edited expense details in ONE message.',
+          'Example:',
+          'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+          'Reply "cancel" to discard.'
+        ].join('\n')
+      ),
+      false
+    );
+  }
+
   // decision tokens that MUST stay inside confirm flow
   const isDecisionToken = !!strictTok;
 
@@ -4199,9 +4216,6 @@ if (confirmPA?.payload?.draft) {
   if (!isDecisionToken && isNonIntakeQuery && !looksLikeNewExpenseText(rawInboundText)) {
     bypassConfirmToAllowNewIntake = true;
   }
-// IMPORTANT: below this point, replace uses of `token` with `strictTok`
-  // e.g. `if (strictTok === 'resume') ...`, `if (strictTok === 'skip') ...`,
-  // `if (strictTok === 'edit') ...`, etc.
 
   // ✅ If bypassing, fall through to normal routing below (do not nag, do not clear)
   if (!bypassConfirmToAllowNewIntake) {
@@ -4251,7 +4265,7 @@ if (confirmPA?.payload?.draft) {
         awaiting_edit: !!confirmPA?.payload?.draft?.awaiting_edit,
         head: String(rawInboundText || '').trim().slice(0, 80),
         looksLikeNewExpense: true,
-        token: normalizeDecisionToken(rawInboundText)
+        strictTok
       });
 
       const allowNew = !!pendingNow?.allow_new_while_pending;
@@ -4311,7 +4325,6 @@ if (confirmPA?.payload?.draft) {
           String(stableMsgId || '').trim() ||
           `${paUserId}:${Date.now()}`;
 
-        // IMPORTANT: send picker out-of-band; do NOT also return a TwiML body message
         await sendJobPickList({
           fromPhone,
           ownerId,
@@ -4330,56 +4343,50 @@ if (confirmPA?.payload?.draft) {
       }
 
       // ✏️ Edit: mark confirm draft as awaiting edit
-if (strictTok === 'edit') {
-  try {
-    await upsertPA({
-      ownerId,
-      userId: paKey,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        ...(confirmPA.payload || {}),
-        draft: {
-  ...(confirmPA.payload?.draft || {}),
-  awaiting_edit: true,
+      if (strictTok === 'edit') {
+        try {
+          await upsertPA({
+            ownerId,
+            userId: paKey,
+            kind: PA_KIND_CONFIRM,
+            payload: {
+              ...(confirmPA.payload || {}),
+              draft: {
+                ...(confirmPA.payload?.draft || {}),
+                awaiting_edit: true,
+                edit_started_at: Date.now(),
+                editStartedAt: Date.now(),
+                edit_flow_id:
+                  String(
+                    confirmPA?.payload?.sourceMsgId ||
+                      confirmPA?.payload?.draft?.sourceMsgId ||
+                      confirmPA?.payload?.draft?.txSourceMsgId ||
+                      stableMsgId ||
+                      ''
+                  ).trim() || null
+              }
+            },
+            ttlSeconds: PA_TTL_SEC
+          });
 
-  // ✅ edit latch (primary)
-  edit_started_at: Date.now(),
+          console.info('[EXPENSE_EDIT_MODE_SET]', { paUserId });
+        } catch (e) {
+          console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
+        }
 
-  // ✅ compat latch (optional but prevents subtle regressions)
-  editStartedAt: Date.now(),
+        return out(
+          twimlText(
+            [
+              '✏️ Okay — send the corrected expense details in ONE message.',
+              'Example:',
+              'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+              'Reply "cancel" to discard.'
+            ].join('\n')
+          ),
+          false
+        );
+      }
 
-  // ✅ flow correlation (debug / optional hardening)
-  edit_flow_id:
-    String(
-      confirmPA?.payload?.sourceMsgId ||
-      confirmPA?.payload?.draft?.sourceMsgId ||
-      confirmPA?.payload?.draft?.txSourceMsgId ||
-      stableMsgId ||
-      ''
-    ).trim() || null
-}
-
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
-
-    console.info('[EXPENSE_EDIT_MODE_SET]', { paUserId });
-  } catch (e) {
-    console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
-  }
-
-  return out(
-    twimlText(
-      [
-        '✏️ Okay — send the corrected expense details in ONE message.',
-        'Example:',
-        'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
-        'Reply "cancel" to discard.'
-      ].join('\n')
-    ),
-    false
-  );
-}
 
 
       // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending

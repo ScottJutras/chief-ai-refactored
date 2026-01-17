@@ -1,13 +1,13 @@
 // handlers/commands/revenue.js
 // COMPLETE DROP-IN (BETA-ready; aligned to expense.js identity + picker-state safety)
 //
-// ✅ Key alignments added in THIS drop-in:
+// ✅ Key alignments in this drop-in:
 // - ✅ Canonical PA identity: uses paUserId (digits/WaId) for ALL getPA/upsertPA/deletePA (never "from").
 // - ✅ Picker state stores: sentRows + jobOptions + confirmDraft snapshot (so picker taps can recover confirm).
 // - ✅ Picker tap resolver uses Twilio ListTitle name-match FIRST (fixes "#6 happy street" mapping bugs),
 //   then falls back to ix mapping, then stable jobno_ tokens.
-// - ✅ resendConfirmRevenue uses paUserId (and can accept it explicitly).
-// - ✅ No logic removed; all existing behavior preserved, only corrected/safer.
+// - ✅ Confirm flow supports: yes / edit / cancel / resume / skip / change_job
+// - ✅ Auto-yes flag is ONLY set after a successful edit payload is applied (never during DB ops).
 //
 // Signature expected by router:
 //   handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId, twilioMeta)
@@ -33,6 +33,15 @@ const validateCIL =
 // ---- Optional category helper (fail-open) ----
 const categorizeEntry =
   (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) || (async () => null);
+
+/* ---------------- Pending state helpers (stateManager) ---------------- */
+
+const getPendingTransactionState =
+  state.getPendingTransactionState || state.getPendingState || (async () => null);
+
+const mergePendingTransactionState =
+  state.mergePendingTransactionState ||
+  (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
 
 /* ---------------- Constants ---------------- */
 
@@ -62,7 +71,7 @@ function normalizeIdentityDigits(x) {
 
 /* ---------------- Pending Actions (KIND-AWARE w/ SQL fallback) ---------------- */
 
-const { query, insertTransaction } = pg;
+const { query } = pg;
 
 const pgGetPendingActionByKind =
   (typeof pg.getPendingActionByKind === 'function' && pg.getPendingActionByKind) || null;
@@ -108,7 +117,7 @@ async function getPA({ ownerId, userId, kind }) {
        ORDER BY created_at DESC
        LIMIT 1
       `,
-      [normalizeIdentityDigits(owner), String(user), String(k), String(PA_TTL_MIN)]
+      [String(owner), String(user), String(k), String(PA_TTL_MIN)]
     );
     return r?.rows?.[0] || null;
   } catch {
@@ -144,13 +153,13 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
       DO UPDATE SET payload = EXCLUDED.payload,
                     created_at = NOW()
       `,
-      [normalizeIdentityDigits(owner), String(user), String(k), JSON.stringify(payload || {})]
+      [String(owner), String(user), String(k), JSON.stringify(payload || {})]
     );
   } catch (e) {
     // If no unique index exists, fall back to delete+insert
     try {
       await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [
-        normalizeIdentityDigits(owner),
+        String(owner),
         String(user),
         String(k)
       ]);
@@ -159,7 +168,7 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
         INSERT INTO public.pending_actions (owner_id, user_id, kind, payload, created_at)
         VALUES ($1, $2, $3, $4::jsonb, NOW())
         `,
-        [normalizeIdentityDigits(owner), String(user), String(k), JSON.stringify(payload || {})]
+        [String(owner), String(user), String(k), JSON.stringify(payload || {})]
       );
     } catch {}
     console.warn('[PA] upsert fallback failed (ignored):', e?.message);
@@ -185,14 +194,14 @@ async function deletePA({ ownerId, userId, kind }) {
 
   try {
     await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [
-      normalizeIdentityDigits(owner),
+      String(owner),
       String(user),
       String(k)
     ]);
   } catch {}
 }
 
-/* ---------------- TwiML helpers (no duplicates) ---------------- */
+/* ---------------- TwiML helpers ---------------- */
 
 function xmlEsc(s = '') {
   return String(s)
@@ -218,6 +227,22 @@ function out(twiml, sentOutOfBand = false) {
 function waTo(from) {
   const d = normalizeIdentityDigits(from);
   return d ? `whatsapp:+${d}` : null;
+}
+
+/* ---------------- STRICT decision tokens (confirm flow) ---------------- */
+// EXACT allow-list only: yes/edit/cancel/resume/skip/change_job
+function strictDecisionToken(raw) {
+  const t = String(raw || '').trim().toLowerCase();
+  if (!t) return null;
+
+  if (t === 'yes') return 'yes';
+  if (t === 'edit') return 'edit';
+  if (t === 'cancel') return 'cancel';
+  if (t === 'resume') return 'resume';
+  if (t === 'skip') return 'skip';
+  if (t === 'change_job' || t === 'change job') return 'change_job';
+
+  return null;
 }
 
 /**
@@ -297,6 +322,7 @@ function stripRevenuePrefixes(input) {
   return s.trim();
 }
 
+// (Used for non-confirm flows / picker helpers; confirm uses strictDecisionToken)
 function normalizeDecisionToken(input) {
   const s = String(input || '').trim().toLowerCase();
 
@@ -473,48 +499,6 @@ async function persistActiveJobFromRevenue({ ownerId, fromPhone, userProfile, jo
   }
 }
 
-/* ---------------- Media: consume pendingMediaMeta from stateManager ---------------- */
-
-const MAX_MEDIA_TRANSCRIPT_CHARS =
-  (typeof pg.MEDIA_TRANSCRIPT_MAX_CHARS === 'number' && pg.MEDIA_TRANSCRIPT_MAX_CHARS) || 8000;
-
-const truncateText =
-  (typeof pg.truncateText === 'function' && pg.truncateText) ||
-  ((str, maxChars) => {
-    if (!str) return null;
-    const s = String(str);
-    if (s.length <= maxChars) return s;
-    return s.slice(0, maxChars);
-  });
-
-async function consumePendingMediaMeta(identityKey) {
-  try {
-    const getPending = state.getPendingTransactionState || state.getPendingState || (async () => null);
-    const mergePending =
-      state.mergePendingTransactionState ||
-      (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
-
-    const pending = await getPending(identityKey);
-    const m = pending?.pendingMediaMeta || null;
-    if (!m) return null;
-
-    const raw = {
-      url: m.url || m.media_url || null,
-      type: m.type || m.media_type || null,
-      transcript: truncateText(m.transcript || m.media_transcript || null, MAX_MEDIA_TRANSCRIPT_CHARS),
-      confidence: m.confidence ?? m.media_confidence ?? null
-    };
-
-    const mediaMeta = typeof pg.normalizeMediaMeta === 'function' ? pg.normalizeMediaMeta(raw) : raw;
-    const source_msg_id = m.source_msg_id ? String(m.source_msg_id) : null;
-
-    await mergePending(identityKey, { pendingMediaMeta: null });
-    return { mediaMeta, source_msg_id };
-  } catch {
-    return null;
-  }
-}
-
 /* ---------------- CIL (fail-open) ---------------- */
 
 function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
@@ -680,6 +664,16 @@ function buildTextJobPrompt(jobOptions, page, pageSize) {
   return `Which job is this revenue for?\n\n${lines.join('\n')}\n\nReply with a number, job name, or "Overhead".${more}\nTip: reply "change job" to see the picker.`;
 }
 
+function looksLikeJobTokenNameLite(name) {
+  const t = String(name || '').trim().toLowerCase();
+  if (!t) return true;
+  if (/^jobix_\d+$/i.test(t)) return true;
+  if (/^jobno_\d+$/i.test(t)) return true;
+  if (/^job_\d+_[0-9a-z]+$/i.test(t)) return true;
+  if (/^#\s*\d+\b/.test(t)) return true;
+  return false;
+}
+
 function normalizeJobAnswer(text) {
   let s = String(text || '').trim();
   if (!s) return s;
@@ -816,9 +810,9 @@ function normalizeListTitle(s = '') {
 }
 
 /**
- * ✅ Fixes the exact bug you hit:
+ * ✅ Fixes:
  * - Twilio legacy: Body="job_<ix>_<hash>", ListTitle="#<ix> <name>"
- * - We must treat "#<ix>" as UI index, not jobNo
+ * - Treat "#<ix>" as UI index, NOT jobNo
  * - Prefer title-name match to sentRows, then fallback to index mapping
  */
 async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
@@ -828,7 +822,7 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
   const displayedJobNos = Array.isArray(pickState?.displayedJobNos) ? pickState.displayedJobNos.map(Number) : [];
   const sentRows = Array.isArray(pickState?.sentRows) ? pickState.sentRows : [];
 
-  // If Twilio returned our stable id (jobno_123), accept it directly
+  // Stable token supported
   const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
   if (mJobNo?.[1]) {
     return { ok: true, jobNo: Number(mJobNo[1]), meta: { mode: 'stable_jobno' } };
@@ -855,14 +849,12 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
           (nameNorm && nameNorm.startsWith(strippedTitleNorm)) ||
           (titleNorm && titleNorm.startsWith(strippedTitleNorm)) ||
           (strippedTitleNorm && strippedTitleNorm.startsWith(nameNorm))
-        )
-          score = 2;
+        ) score = 2;
         else if (
           (nameNorm && nameNorm.includes(strippedTitleNorm)) ||
           (titleNorm && titleNorm.includes(strippedTitleNorm)) ||
           (strippedTitleNorm && strippedTitleNorm.includes(nameNorm))
-        )
-          score = 1;
+        ) score = 1;
 
         return score ? { jobNo, score } : null;
       })
@@ -900,7 +892,6 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
 function pickConfirmDraftSnapshot(confirmDraft) {
   if (!confirmDraft || typeof confirmDraft !== 'object') return null;
   const d = { ...confirmDraft };
-  // keep it small + safe
   return {
     amount: d.amount ?? null,
     source: d.source ?? null,
@@ -930,7 +921,7 @@ async function sendJobPickerOrFallback({
   const p = Math.max(0, Number(page || 0));
   const start = p * JOBS_PER_PAGE;
 
-  // Filter + de-dupe by job_no, drop token-garbage names
+  // Filter + de-dupe by job_no
   const seen = new Set();
   const clean = [];
   for (const j of jobOptions || []) {
@@ -998,7 +989,7 @@ async function sendJobPickerOrFallback({
     const stamped = `J${jobNo} ${full}`;
 
     return {
-      id: `jobno_${jobNo}`, // stable token when supported
+      id: `jobno_${jobNo}`,
       title: stamped.slice(0, 24),
       description: full.slice(0, 72)
     };
@@ -1049,7 +1040,7 @@ function buildRevenueSummaryLine({ amount, source, date, jobName, tz }) {
 }
 
 async function sendConfirmRevenueOrFallback(from, summaryLine) {
-  return out(twimlText(`✅ Confirm revenue\n${summaryLine}\n\nReply: Yes / Edit / Cancel / Change Job`), false);
+  return out(twimlText(`✅ Confirm revenue\n${summaryLine}\n\nReply: Yes / Edit / Change Job / Skip / Cancel`), false);
 }
 
 /* ---------------- New message detection (job-picker bypass) ---------------- */
@@ -1102,7 +1093,15 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         const shownAt = Number(pickPA.payload.shownAt || 0) || 0;
 
         if (!shownAt || (Date.now() - shownAt) > (PA_TTL_SEC * 1000)) {
-          return await sendJobPickerOrFallback({ from, ownerId, paUserId, jobOptions, page: 0, pageSize: 8, confirmDraft: pickPA?.payload?.confirmDraft || null });
+          return await sendJobPickerOrFallback({
+            from,
+            ownerId,
+            paUserId,
+            jobOptions,
+            page: 0,
+            pageSize: 8,
+            confirmDraft: pickPA?.payload?.confirmDraft || null
+          });
         }
 
         let rawInput = String(input || '').trim();
@@ -1127,7 +1126,15 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           });
 
           if (!sel?.ok) {
-            return await sendJobPickerOrFallback({ from, ownerId, paUserId, jobOptions, page, pageSize, confirmDraft: pickPA?.payload?.confirmDraft || null });
+            return await sendJobPickerOrFallback({
+              from,
+              ownerId,
+              paUserId,
+              jobOptions,
+              page,
+              pageSize,
+              confirmDraft: pickPA?.payload?.confirmDraft || null
+            });
           }
 
           rawInput = `jobno_${Number(sel.jobNo)}`;
@@ -1135,14 +1142,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
         // Coerce router-emitted jobix_#
         rawInput = coerceJobixToJobno(rawInput, displayedJobNos);
-
-        console.info('[JOB_PICK_DEBUG]', {
-          input,
-          rawInput,
-          shownAt,
-          page,
-          displayedJobNos: (displayedJobNos || []).slice(0, 8)
-        });
 
         // Optional: remember last inbound picker token
         try {
@@ -1156,14 +1155,30 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         } catch {}
 
         if (tok === 'change_job') {
-          return await sendJobPickerOrFallback({ from, ownerId, paUserId, jobOptions, page, pageSize, confirmDraft: pickPA?.payload?.confirmDraft || null });
+          return await sendJobPickerOrFallback({
+            from,
+            ownerId,
+            paUserId,
+            jobOptions,
+            page,
+            pageSize,
+            confirmDraft: pickPA?.payload?.confirmDraft || null
+          });
         }
 
         if (tok === 'more') {
           if (!hasMore) {
             return out(twimlText('No more jobs to show. Reply with a number, job name, or "Overhead".'), false);
           }
-          return await sendJobPickerOrFallback({ from, ownerId, paUserId, jobOptions, page: page + 1, pageSize, confirmDraft: pickPA?.payload?.confirmDraft || null });
+          return await sendJobPickerOrFallback({
+            from,
+            ownerId,
+            paUserId,
+            jobOptions,
+            page: page + 1,
+            pageSize,
+            confirmDraft: pickPA?.payload?.confirmDraft || null
+          });
         }
 
         const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
@@ -1233,176 +1248,217 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
     }
 
-    // ---- 2) Confirm/edit/cancel ----
-let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
+    // ---- 2) Confirm/edit/cancel (CONSOLIDATED) ----
+    let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
 
-if (confirmPA?.payload?.draft) {
-  // Owner gate
-  if (!isOwner) {
-    try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
-    return out(twimlText('⚠️ Only the owner can manage revenue.'), false);
-  }
+    if (confirmPA?.payload?.draft) {
+      // Owner gate
+      if (!isOwner) {
+        try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
+        return out(twimlText('⚠️ Only the owner can manage revenue.'), false);
+      }
 
-  // STRICT token (do NOT use fuzzy normalizeDecisionToken here)
-  const strictTok = strictDecisionToken(input);
+      const strictTok = strictDecisionToken(input);
 
-  // ---------------------------------------------------------
-  // ✅ UN-SKIPPABLE EDIT CONSUMPTION (CONFIRM FLOW):
-  // If confirm draft is awaiting_edit OR recently entered edit mode,
-  // consume ANY non-control inbound as the edit payload.
-  // ---------------------------------------------------------
-  try {
-    // refresh confirmPA (avoid stale snapshots)
-    try {
-      confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
-    } catch {}
+      // ---------------------------------------------------------
+      // ✅ UN-SKIPPABLE EDIT CONSUMPTION (CONFIRM FLOW)
+      // ---------------------------------------------------------
+      try {
+        // refresh confirmPA (avoid stale snapshots)
+        try {
+          confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
+        } catch {}
 
-    const draftR = confirmPA?.payload?.draft || null;
+        const draftR = confirmPA?.payload?.draft || null;
 
-    const editStartedAt = Number(draftR?.edit_started_at || draftR?.editStartedAt || 0) || 0;
-    const EDIT_WINDOW_MS = 10 * 60 * 1000;
-    const editRecentlyStarted =
-      !!editStartedAt &&
-      Date.now() - editStartedAt >= 0 &&
-      Date.now() - editStartedAt <= EDIT_WINDOW_MS;
+        const editStartedAt = Number(draftR?.edit_started_at || draftR?.editStartedAt || 0) || 0;
+        const EDIT_WINDOW_MS = 10 * 60 * 1000;
+        const ageMs = editStartedAt ? (Date.now() - editStartedAt) : null;
 
-    const isControl =
-      strictTok === 'yes' ||
-      strictTok === 'edit' ||
-      strictTok === 'cancel' ||
-      strictTok === 'resume' ||
-      strictTok === 'skip' ||
-      strictTok === 'change_job';
+        const editRecentlyStarted =
+          !!editStartedAt &&
+          typeof ageMs === 'number' &&
+          ageMs >= 0 &&
+          ageMs <= EDIT_WINDOW_MS;
 
-    const shouldConsumeAsEditPayload =
-      !!draftR && !isControl && (draftR.awaiting_edit || editRecentlyStarted);
+        const isControl =
+          strictTok === 'yes' ||
+          strictTok === 'edit' ||
+          strictTok === 'cancel' ||
+          strictTok === 'resume' ||
+          strictTok === 'skip' ||
+          strictTok === 'change_job';
 
-    if (shouldConsumeAsEditPayload) {
-      // parse the corrected revenue line, then patch draft + exit edit mode
-      // (we reuse your existing AI revenue parse to avoid inventing new parsers)
-      const defaultData = {
-        date: todayInTimeZone(tz),
-        description: 'Revenue received',
-        amount: '$0.00',
-        source: 'Unknown'
-      };
+        const shouldConsumeAsEditPayload =
+          !!draftR && !isControl && (draftR.awaiting_edit || editRecentlyStarted);
 
-      const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
-      let nextDraft = aiRes?.data || null;
+        if (shouldConsumeAsEditPayload) {
+          const defaultData = {
+            date: todayInTimeZone(tz),
+            description: 'Revenue received',
+            amount: '$0.00',
+            source: 'Unknown'
+          };
 
-      if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
+          const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
+          let nextDraft = aiRes?.data || null;
+          if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
 
-      const missingCore = !nextDraft || !nextDraft.amount || nextDraft.amount === '$0.00';
-      if (missingCore) {
+          const missingCore = !nextDraft || !nextDraft.amount || nextDraft.amount === '$0.00';
+          if (missingCore) {
+            return out(
+              twimlText(aiRes?.reply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
+              false
+            );
+          }
+
+          // deterministic "job ..." capture (optional)
+          const m = String(input || '').trim().match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
+          const jobFromText = m?.[1] ? String(m[1]).replace(/[.!,;:]+$/g, '').trim() : null;
+
+          const patchedDraft = {
+            ...(draftR || {}),
+            ...(nextDraft || {}),
+            ...(jobFromText
+              ? { jobName: /^overhead$/i.test(jobFromText) ? 'Overhead' : jobFromText, jobSource: 'typed' }
+              : null),
+
+            draftText: String(input || '').trim(),
+            originalText: String(input || '').trim(),
+
+            awaiting_edit: false,
+            edit_started_at: null,
+            editStartedAt: null,
+            edit_flow_id: null
+          };
+
+          await upsertPA({
+            ownerId,
+            userId: paUserId,
+            kind: PA_KIND_CONFIRM,
+            payload: { ...(confirmPA?.payload || {}), draft: patchedDraft },
+            ttlSeconds: PA_TTL_SEC
+          });
+
+          // ✅ set one-shot auto-yes so webhook router re-calls handler with "yes"
+          try {
+            const editMsgSid = String(sourceMsgId || '').trim() || null;
+            await mergePendingTransactionState(paUserId, {
+              _autoYesAfterEdit: true,
+              _autoYesSourceMsgId: editMsgSid
+            });
+          } catch (e) {
+            console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
+          }
+
+          return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+        }
+
+        // if still awaiting_edit and user sent a control token, never nag
+        if (draftR?.awaiting_edit && isControl) {
+          return out(
+            twimlText(
+              [
+                '✏️ I’m waiting for your edited revenue details in ONE message.',
+                'Example:',
+                'revenue $2500 from ClientName on Jan 13 2026 job Oak Street Re-roof',
+                'Reply "cancel" to discard.'
+              ].join('\n')
+            ),
+            false
+          );
+        }
+      } catch (e) {
+        console.warn('[REVENUE_AWAITING_EDIT] failed (ignored):', e?.message);
+        if (confirmPA?.payload?.draft?.awaiting_edit) {
+          return out(
+            twimlText(
+              [
+                '✏️ I’m waiting for your edited revenue details in ONE message.',
+                'Example:',
+                'revenue $2500 from ClientName on Jan 13 2026 job Oak Street Re-roof',
+                'Reply "cancel" to discard.'
+              ].join('\n')
+            ),
+            false
+          );
+        }
+      }
+
+      // ✅ Resume: re-send confirm for the existing pending revenue (no state changes)
+      if (strictTok === 'resume') {
+        try {
+          return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+        } catch (e) {
+          console.warn('[REVENUE] resume confirm resend failed:', e?.message);
+          const d = confirmPA?.payload?.draft || {};
+          const line = buildRevenueSummaryLine({ amount: d.amount, source: d.source, date: d.date, jobName: d.jobName, tz }) || 'Confirm revenue?';
+          return await sendConfirmRevenueOrFallback(from, line);
+        }
+      }
+
+      // ✅ Skip: keep current confirm draft pending, allow ONE new intake next.
+      if (strictTok === 'skip') {
+        try {
+          await mergePendingTransactionState(paUserId, {
+            kind: 'revenue',
+            allow_new_while_pending: true,
+            allow_new_set_at: Date.now()
+          });
+        } catch {}
+
         return out(
-          twimlText(aiRes?.reply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
+          twimlText(
+            [
+              'Okay — I’ll keep that revenue pending.',
+              'Now send the *new* revenue you want to log.',
+              'Tip: reply “resume” anytime to bring back the pending one.'
+            ].join('\n')
+          ),
           false
         );
       }
 
-      // deterministic "job ..." capture (optional)
-      const m = String(input || '').trim().match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
-      const jobFromText = m?.[1] ? String(m[1]).replace(/[.!,;:]+$/g, '').trim() : null;
+      // ✅ block new revenue intake while confirm pending (but allow if skip flag set)
+      if (!strictTok && looksLikeNewRevenueText(input)) {
+        let pendingNow = null;
+        try { pendingNow = await getPendingTransactionState(paUserId); } catch {}
+        const allowNew = !!pendingNow?.allow_new_while_pending;
 
-      const patchedDraft = {
-        ...(draftR || {}),
-        ...(nextDraft || {}),
-        ...(jobFromText ? { jobName: /^overhead$/i.test(jobFromText) ? 'Overhead' : jobFromText, jobSource: 'typed' } : null),
-
-        draftText: String(input || '').trim(),
-        originalText: String(input || '').trim(),
-
-        awaiting_edit: false,
-        edit_started_at: null,
-        editStartedAt: null,
-        edit_flow_id: null,
-
-        needsReparse: false
-      };
-
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_CONFIRM,
-        payload: { ...(confirmPA?.payload || {}), draft: patchedDraft },
-        ttlSeconds: PA_TTL_SEC
-      });
-
-      // ✅ set one-shot auto-yes so webhook router re-calls handler with "yes"
-      try {
-        const editMsgSid = String(sourceMsgId || '').trim() || null;
-        await mergePendingTransactionState(paUserId, {
-          _autoYesAfterEdit: true,
-          _autoYesSourceMsgId: editMsgSid
-        });
-      } catch (e) {
-        console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
+        if (!allowNew) {
+          return out(
+            twimlText(
+              'One sec 🙂 You still have a revenue draft open.\n' +
+                'Reply: "yes" / "edit" / "change job" / "skip" / "cancel".'
+            ),
+            false
+          );
+        }
+        // consume the allow-one flag and fall through to new intake parsing
+        try {
+          await mergePendingTransactionState(paUserId, { allow_new_while_pending: false, allow_new_set_at: null });
+        } catch {}
       }
 
-      return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
-    }
+      const stableMsgId =
+        String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+        String(sourceMsgId || '').trim() ||
+        String(`${from}:${Date.now()}`).trim();
 
-    // if still awaiting_edit and user sent a control token, never nag
-    if (draftR?.awaiting_edit && isControl) {
-      return out(
-        twimlText(
-          [
-            '✏️ I’m waiting for your edited revenue details in ONE message.',
-            'Example:',
-            'revenue $2500 from ClientName on Jan 13 2026 job Oak Street Re-roof',
-            'Reply "cancel" to discard.'
-          ].join('\n')
-        ),
-        false
-      );
-    }
-  } catch (e) {
-    console.warn('[REVENUE_AWAITING_EDIT] failed (ignored):', e?.message);
-    if (confirmPA?.payload?.draft?.awaiting_edit) {
-      return out(
-        twimlText(
-          [
-            '✏️ I’m waiting for your edited revenue details in ONE message.',
-            'Example:',
-            'revenue $2500 from ClientName on Jan 13 2026 job Oak Street Re-roof',
-            'Reply "cancel" to discard.'
-          ].join('\n')
-        ),
-        false
-      );
-    }
-  }
+      if (strictTok === 'change_job') {
+        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+        if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+        return await sendJobPickerOrFallback({
+          from,
+          ownerId,
+          paUserId,
+          jobOptions: jobs,
+          page: 0,
+          pageSize: 8,
+          confirmDraft: confirmPA?.payload?.draft || null
+        });
+      }
 
-  // ✅ block new revenue intake while confirm pending (but do not block control tokens)
-  if (!strictTok && looksLikeNewRevenueText(input)) {
-    console.info('[REVENUE] confirm pause: new revenue detected while confirm pending');
-    return out(
-      twimlText(
-        'One sec 🙂 It looks like you still have a revenue draft open.\n' +
-          'Tap Yes/Edit/Change Job/Cancel to finish it. If you want to start over, reply "Cancel".'
-      ),
-      false
-    );
-  }
-
-  const stableMsgId =
-    String(confirmPA?.payload?.sourceMsgId || '').trim() ||
-    String(sourceMsgId || '').trim() ||
-    String(`${from}:${Date.now()}`).trim();
-
-  if (strictTok === 'change_job') {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-    return await sendJobPickerOrFallback({
-      from,
-      ownerId,
-      paUserId,
-      jobOptions: jobs,
-      page: 0,
-      pageSize: 8,
-      confirmDraft: confirmPA?.payload?.draft || null
-    });
-  }
 
   if (strictTok === 'edit') {
     // ✅ enter edit mode (do NOT delete confirm PA)
@@ -1438,18 +1494,245 @@ if (confirmPA?.payload?.draft) {
     );
   }
 
+  // ✅ Resume: re-send confirm (no state changes)
+  if (strictTok === 'resume') {
+    try {
+      const r = await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+      if (r) return r;
+    } catch {}
+    // fallback: generic
+    return out(
+      twimlText(
+        'You still have a revenue draft open.\n' +
+          'Tap Yes/Edit/Change Job/Cancel to finish it. If you want to start over, reply "Cancel".'
+      ),
+      false
+    );
+  }
+
   if (strictTok === 'cancel') {
     await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-    try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }); } catch {}
+    try {
+      await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
+    } catch {}
     return out(twimlText('❌ Operation cancelled.'), false);
   }
 
   if (strictTok === 'yes') {
-    // ✅ keep your existing YES handler EXACTLY as-is,
-    // EXCEPT: remove any AUTO_YES_FLAG_SET that you pasted into DB timeout.
-    // (Do NOT set auto-yes during DB timeout.)
-    //
-    // ... your existing strictTok === 'yes' block here ...
+    try {
+      // Always operate on freshest confirm PA (avoid stale snapshots)
+      let confirmPAFresh = null;
+      try {
+        confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+      } catch (e) {
+        console.warn('[REVENUE_YES] getPA failed (ignored):', e?.message);
+        confirmPAFresh = confirmPA || null;
+      }
+      if (!confirmPAFresh) confirmPAFresh = confirmPA || null;
+
+      const rawDraft =
+        confirmPAFresh?.payload?.draft && typeof confirmPAFresh.payload.draft === 'object'
+          ? { ...confirmPAFresh.payload.draft }
+          : null;
+
+      if (!rawDraft || !Object.keys(rawDraft).length) {
+        return out(twimlText(`I didn’t find a revenue draft to submit. Reply "resume" to see what’s pending.`), false);
+      }
+
+      // ✅ CRITICAL: if user is in edit mode, do NOT submit
+      if (rawDraft?.awaiting_edit) {
+        return out(
+          twimlText(
+            [
+              '✏️ I’m still waiting for your edited revenue details in ONE message.',
+              'Example:',
+              'revenue $2500 from ClientName on Jan 13 2026 job Oak Street Re-roof',
+              'Reply "cancel" to discard.'
+            ].join('\n')
+          ),
+          false
+        );
+      }
+
+      // Normalize draft
+      let data = normalizeRevenueData(rawDraft, tz);
+
+      // Minimal gating
+      const cents = toCents(data.amount);
+      if (!Number.isFinite(Number(cents)) || Number(cents) <= 0) {
+        return out(
+          twimlText(`I’m missing the amount. Reply like: "revenue $2500 from ClientName today".`),
+          false
+        );
+      }
+
+      const dateStr = String(data?.date || '').trim();
+      if (!dateStr) {
+        return out(twimlText(`I’m missing the date. Reply like: "on 2026-01-13".`), false);
+      }
+
+      // ✅ Job resolution (job choice must win)
+      let jobName = (data.jobName && String(data.jobName).trim()) || null;
+      let jobSource = jobName ? (data.jobSource || rawDraft.jobSource || 'typed') : null;
+
+      if (jobName && looksLikeOverhead(jobName)) {
+        jobName = 'Overhead';
+        jobSource = 'overhead';
+      }
+
+      if (!jobName) {
+        jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+        if (jobName) jobSource = 'active';
+      }
+
+      if (jobName && looksLikeOverhead(jobName)) {
+        jobName = 'Overhead';
+        jobSource = 'overhead';
+      }
+
+      // If still no job, force picker (keep confirm)
+      if (!jobName) {
+        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+        if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+
+        return await sendJobPickerOrFallback({
+          from,
+          ownerId,
+          paUserId,
+          jobOptions: jobs,
+          page: 0,
+          pageSize: 8,
+          confirmDraft: {
+            ...data,
+            jobName: null,
+            jobSource: null,
+            job_no: null,
+            job_id: null,
+            originalText: rawDraft?.originalText || rawDraft?.draftText || null,
+            draftText: rawDraft?.draftText || rawDraft?.originalText || null
+          }
+        });
+      }
+
+      data.jobName = jobName;
+      data.jobSource = jobSource;
+
+      // Category: prefer suggestedCategory (set earlier), else best-effort categorizeEntry (fail-open)
+      let categoryStr =
+        (data?.suggestedCategory && String(data.suggestedCategory).trim()) ||
+        (rawDraft?.suggestedCategory && String(rawDraft.suggestedCategory).trim()) ||
+        null;
+
+      if (!categoryStr) {
+        try {
+          const c =
+            (await withTimeout(Promise.resolve(categorizeEntry('revenue', data, ownerProfile)), 1200, null)) || null;
+          if (c && String(c).trim()) categoryStr = String(c).trim();
+        } catch {}
+      }
+
+      // ✅ Canonical sourceMsgId for DB (prefer PA sourceMsgId)
+      const txSourceMsgId =
+        String(confirmPAFresh?.payload?.sourceMsgId || '').trim() ||
+        String(sourceMsgId || '').trim() ||
+        null;
+
+      // ✅ CIL validation (fail-open-ish but blocks if validator says no)
+      const cilCheck = assertRevenueCILOrClarify({
+        from,
+        data,
+        jobName,
+        category: categoryStr,
+        sourceMsgId: txSourceMsgId
+      });
+
+      if (!cilCheck?.ok) {
+        return out(twimlText(cilCheck?.reply || '⚠️ Could not log that revenue yet.'), false);
+      }
+
+      // Insert
+      const amountNum = toNumberAmount(data.amount);
+      const amountCents = toCents(data.amount);
+
+      if (!Number.isFinite(amountNum) || !Number.isFinite(amountCents) || amountCents <= 0) {
+        return out(
+          twimlText(`I couldn’t confirm the amount from "${String(data.amount || '').trim()}". Reply like: "2500".`),
+          false
+        );
+      }
+
+      if (typeof pg.insertTransaction !== 'function' && typeof insertTransaction !== 'function') {
+        console.warn('[REVENUE_YES] insertTransaction missing');
+        return out(twimlText('⚠️ Revenue logging is unavailable right now. Try again in a moment.'), false);
+      }
+
+      const insertFn = typeof pg.insertTransaction === 'function' ? pg.insertTransaction : insertTransaction;
+
+      const sourceForDb = String(data.source || '').trim() || 'Unknown';
+      const descForDb = String(data.description || '').trim() || 'Revenue received';
+
+      await insertFn({
+        ownerId,
+        owner_id: ownerId,
+        userId: paUserId,
+        user_id: paUserId,
+        fromPhone: from,
+        from,
+
+        kind: 'revenue',
+
+        // core fields
+        date: String(dateStr),
+        source: sourceForDb,
+        description: descForDb,
+
+        amount: amountNum.toFixed(2),
+        amount_cents: amountCents,
+
+        jobName,
+        jobSource,
+
+        category: categoryStr,
+
+        source_msg_id: txSourceMsgId || null
+      });
+
+      // Clear confirm + picker
+      try {
+        await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+      } catch {}
+      try {
+        await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
+      } catch {}
+
+      // Best-effort: persist active job (skip overhead)
+      try {
+        if (jobName && !looksLikeOverhead(jobName)) {
+          await persistActiveJobFromRevenue({
+            ownerId,
+            fromPhone: from,
+            userProfile,
+            jobNo: data?.job_no ?? null,
+            jobName
+          });
+        }
+      } catch {}
+
+      const amountDisplay = formatMoneyDisplay(amountNum);
+      const okMsg = [
+        `✅ Logged revenue ${amountDisplay} — ${sourceForDb}`,
+        dateStr ? `Date: ${dateStr}` : null,
+        jobName ? `Job: ${jobName}` : null,
+        categoryStr ? `Category: ${categoryStr}` : null
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      return out(twimlText(okMsg), false);
+    } catch (e) {
+      console.error('[REVENUE_YES] handler failed:', e?.message);
+      return out(twimlText(`Something went wrong submitting that revenue. Reply "resume" and try again.`), false);
+    }
   }
 
   // default while confirm pending
@@ -1464,92 +1747,98 @@ if (confirmPA?.payload?.draft) {
 
 
     // ---- 3) New revenue parse (AI first-pass; keep behavior; beta hardening) ----
-    const defaultData = {
-      date: todayInTimeZone(tz),
-      description: 'Revenue received',
-      amount: '$0.00',
-      source: 'Unknown'
-    };
+const defaultData = {
+  date: todayInTimeZone(tz),
+  description: 'Revenue received',
+  amount: '$0.00',
+  source: 'Unknown'
+};
 
-    const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
+const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
 
-    let data = aiRes?.data || null;
-    let aiReply = aiRes?.reply || null;
+let data = aiRes?.data || null;
+let aiReply = aiRes?.reply || null;
 
-    if (data) data = normalizeRevenueData(data, tz);
+if (data) data = normalizeRevenueData(data, tz);
 
-    const missingCore = !data || !data.amount || data.amount === '$0.00';
-    if (aiReply && missingCore) return out(twimlText(aiReply), false);
+const missingCore = !data || !data.amount || data.amount === '$0.00';
+if (aiReply && missingCore) return out(twimlText(aiReply), false);
 
-    if (missingCore) {
-      return out(
-        twimlText(`🤔 Couldn’t parse a revenue from "${input}". Try "received $2500 from ClientName today for <job>".`),
-        false
-      );
-    }
+if (missingCore) {
+  return out(
+    twimlText(`🤔 Couldn’t parse a revenue from "${input}". Try "received $2500 from ClientName today for <job>".`),
+    false
+  );
+}
 
-    let category = (await withTimeout(Promise.resolve(categorizeEntry('revenue', data, ownerProfile)), 1200, null)) || null;
-    if (category && String(category).trim()) category = String(category).trim();
-    else category = null;
+let category = (await withTimeout(Promise.resolve(categorizeEntry('revenue', data, ownerProfile)), 1200, null)) || null;
+if (category && String(category).trim()) category = String(category).trim();
+else category = null;
 
-    let jobName = (data.jobName && String(data.jobName).trim()) || null;
-    let jobSource = jobName ? 'typed' : null;
+let jobName = (data.jobName && String(data.jobName).trim()) || null;
+let jobSource = jobName ? 'typed' : null;
 
-    if (!jobName) {
-      jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
-      if (jobName) jobSource = 'active';
-    }
+if (!jobName) {
+  jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone: from })) || null;
+  if (jobName) jobSource = 'active';
+}
 
-    if (jobName && looksLikeOverhead(jobName)) {
-      jobName = 'Overhead';
-      jobSource = 'overhead';
-    }
+if (jobName && looksLikeOverhead(jobName)) {
+  jobName = 'Overhead';
+  jobSource = 'overhead';
+}
 
-    await upsertPA({
-      ownerId,
-      userId: paUserId,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        draft: {
-          ...data,
-          jobName,
-          jobSource: jobSource || null,
-          suggestedCategory: category,
-          job_id: null,
-          job_no: null,
-          originalText: input,
-          draftText: input
-        },
-        sourceMsgId: safeMsgId,
-        type: 'revenue'
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
+await upsertPA({
+  ownerId,
+  userId: paUserId,
+  kind: PA_KIND_CONFIRM,
+  payload: {
+    draft: {
+      ...data,
 
-    if (!jobName) {
-      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-      if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+      // ✅ alignment: never allow stale parser job fields to linger
+      jobName: jobName || null,
+      jobSource: jobName ? (jobSource || 'typed') : null,
 
-      return await sendJobPickerOrFallback({
-        from,
-        ownerId,
-        paUserId,
-        jobOptions: jobs,
-        page: 0,
-        pageSize: 8,
-        confirmDraft: { ...(data || {}), jobName: null, jobSource: jobSource || null }
-      });
-    }
+      suggestedCategory: category,
+      job_id: null,
+      job_no: null,
+      originalText: input,
+      draftText: input
+    },
+    sourceMsgId: safeMsgId,
+    type: 'revenue'
+  },
+  ttlSeconds: PA_TTL_SEC
+});
 
-    const summaryLine = buildRevenueSummaryLine({
-      amount: data.amount,
-      source: data.source,
-      date: data.date || todayInTimeZone(tz),
-      jobName,
-      tz
-    });
+if (!jobName) {
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+  if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
 
-    return await sendConfirmRevenueOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
+  return await sendJobPickerOrFallback({
+    from,
+    ownerId,
+    paUserId,
+    jobOptions: jobs,
+    page: 0,
+    pageSize: 8,
+
+    // ✅ alignment: job must be selected explicitly
+    confirmDraft: { ...(data || {}), jobName: null, jobSource: null }
+  });
+}
+
+const summaryLine = buildRevenueSummaryLine({
+  amount: data.amount,
+  source: data.source,
+  date: data.date || todayInTimeZone(tz),
+  jobName,
+  tz
+});
+
+return await sendConfirmRevenueOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
+
   } catch (error) {
     console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {
       code: error?.code,

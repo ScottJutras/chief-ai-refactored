@@ -532,9 +532,10 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
   if (!paKey) return null;
 
   const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-  const draft = confirmPA?.payload?.draft;
+  const draft = confirmPA?.payload?.draft || null;
 
-  if (!draft) return confirmPA;
+  // ✅ Nothing to do: no confirm, or confirm exists but no draft yet
+  if (!confirmPA || !draft) return confirmPA;
 
   // ✅ CRITICAL: never reparse while user is in Edit flow
   if (draft?.awaiting_edit) {
@@ -542,9 +543,11 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     return confirmPA;
   }
 
-  if (!draft.needsReparse) return confirmPA;
+  // ✅ Only reparse when explicitly requested
+  if (!draft?.needsReparse) return confirmPA;
 
-  // ✅ Receipt/OCR-first source text (critical)
+  // ✅ Reparse must have a receipt/OCR-ish source. If it's only a typed draft,
+  // we still allow, but we require *some* text to parse.
   const sourceText = String(
     draft?.receiptText ||
       draft?.ocrText ||
@@ -559,6 +562,11 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     return confirmPA;
   }
 
+  // ✅ If there's nothing receipt-like and parse would be low value, you can optionally skip.
+  // Keeping behavior: DO NOT skip — just a safe guard in case you want it later.
+  // const hasReceiptSignals = !!(draft?.receiptText || draft?.ocrText || draft?.extractedText);
+  // if (!hasReceiptSignals && !draft?.originalText && !draft?.draftText) return confirmPA;
+
   // Re-run your existing parser on receipt/OCR source text.
   // IMPORTANT: keep job fields as-is (job choice must win).
   let parsed = {};
@@ -569,10 +577,10 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
   }
 
   const jobFields = {
-    jobName: draft.jobName ?? null,
-    jobSource: draft.jobSource ?? null,
-    job_no: draft.job_no ?? null,
-    job_id: draft.job_id ?? null
+    jobName: draft?.jobName ?? null,
+    jobSource: draft?.jobSource ?? null,
+    job_no: draft?.job_no ?? null,
+    job_id: draft?.job_id ?? null
   };
 
   // ✅ Merge but never clobber existing values with nulls
@@ -590,7 +598,8 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     }
   );
 
-  const normalized = normalizeExpenseData(mergedDraft, userProfile, sourceText);
+  // ✅ normalize AFTER merge (so we keep receipt-derived data but preserve job/media)
+  const normalized = normalizeExpenseData(mergedDraft, userProfile, sourceText) || {};
 
   // ✅ Preserve edit latch fields across reparse (never drop edit mode accidentally)
   normalized.awaiting_edit = !!draft?.awaiting_edit;
@@ -598,10 +607,26 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
   normalized.editStartedAt = draft?.editStartedAt ?? null;
   normalized.edit_flow_id = draft?.edit_flow_id ?? null;
 
+  // ✅ Preserve media linkage again (belt + suspenders)
+  normalized.media_asset_id = draft?.media_asset_id ?? normalized.media_asset_id ?? null;
+  normalized.media_source_msg_id = draft?.media_source_msg_id ?? normalized.media_source_msg_id ?? null;
+
+  // ✅ Preserve job fields again (belt + suspenders)
+  normalized.jobName = jobFields.jobName;
+  normalized.jobSource = jobFields.jobSource;
+  normalized.job_no = jobFields.job_no;
+  normalized.job_id = jobFields.job_id;
+
   const gotAmount = !!String(normalized?.amount || '').trim() && String(normalized.amount).trim() !== '$0.00';
   const gotDate = !!String(normalized?.date || '').trim();
 
   normalized.needsReparse = !(gotAmount && gotDate);
+
+  // ✅ Safety: never write an empty draft object back (prevents accidental blanking)
+  if (!Object.keys(normalized || {}).length) {
+    console.warn('[EXPENSE_REPARSE] normalized draft empty; leaving confirmPA unchanged', { paKey });
+    return confirmPA;
+  }
 
   await upsertPA({
     ownerId,
@@ -625,6 +650,7 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
 
   return await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
 }
+
 
 
 /* ---------------- misc helpers ---------------- */
@@ -4581,120 +4607,129 @@ if (confirmPA?.payload?.draft) {
           const category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
           const categoryStr = category && String(category).trim() ? String(category).trim() : null;
 
-          // ---------------------------------------------------
-          // ✅ ACTUAL DB INSERT (HARDENED amount → amount_cents)
-          // ---------------------------------------------------
-          const amountRaw = String(data?.amount ?? rawDraft?.amount ?? '').trim();
-          const mAmt = amountRaw.match(/-?\d+(?:\.\d+)?/);
-          const amountNum = mAmt ? Number(mAmt[0]) : NaN;
+// ---------------------------------------------------
+// ✅ ACTUAL DB INSERT (HARDENED amount → amount_cents)
+// ---------------------------------------------------
+const amountRaw = String(data?.amount ?? rawDraft?.amount ?? '').trim();
 
-          if (!Number.isFinite(amountNum) || amountNum <= 0) {
-            return out(
-              twimlText(`I couldn’t confirm the total amount from "${amountRaw}". Reply like: "14.84".`),
-              false
-            );
-          }
+// Match formats like "4,000", "4,000.00", "2300", "2300.50"
+const mAmt =
+  amountRaw.match(/-?\d{1,3}(?:,\d{3})+(?:\.\d+)?/) || // prefers comma-thousands if present
+  amountRaw.match(/-?\d+(?:\.\d+)?/);                 // fallback
 
-          const amountCents = Math.round(amountNum * 100);
-          data.amount = amountNum.toFixed(2);
-          data.amount_cents = amountCents;
+const amtToken = mAmt ? String(mAmt[0]) : '';
+const amountNum = amtToken ? Number(amtToken.replace(/,/g, '')) : NaN;
 
-          const sourceForDb = String(data.store || '').trim() || 'Unknown';
-          const descForDb = String(data.item || data.description || '').trim() || 'Unknown';
+if (!Number.isFinite(amountNum) || amountNum <= 0) {
+  return out(
+    twimlText(`I couldn’t confirm the total amount from "${amountRaw}". Reply like: "14.84".`),
+    false
+  );
+}
 
-          console.info('[YES_FINAL_DRAFT_BEFORE_INSERT]', {
-            paUserId,
-            rawDraft_jobName: rawDraft?.jobName || null,
-            rawDraft_jobSource: rawDraft?.jobSource || null,
-            data_jobName: data?.jobName || null,
-            data_jobSource: data?.jobSource || null,
-            final_jobName: jobName || null,
-            final_jobSource: jobSource || null,
-            amount: data?.amount || null,
-            date: data?.date || null,
-            store: data?.store || null,
-            head_originalText: String(rawDraft?.originalText || rawDraft?.draftText || '').slice(0, 80)
-          });
+const amountCents = Math.round(amountNum * 100);
+data.amount = amountNum.toFixed(2);     // keep canonical numeric string
+data.amount_cents = amountCents;
 
-          await pg.insertTransaction({
-            ownerId,
-            owner_id: ownerId,
-            userId: paUserId,
-            user_id: paUserId,
-            fromPhone,
-            from: fromPhone,
+// Optional debug (guarded)
+if (String(process.env.DEBUG_AMOUNT_PARSE || '').toLowerCase() === 'true') {
+  console.info('[AMOUNT_PARSE]', {
+    amountRaw,
+    amtToken: amtToken || null,
+    amountNum,
+    amountCents
+  });
+}
 
-            kind: 'expense',
+const sourceForDb = String(data.store || '').trim() || 'Unknown';
+const descForDb = String(data.item || data.description || '').trim() || 'Unknown';
 
-            ...data,
+console.info('[YES_FINAL_DRAFT_BEFORE_INSERT]', {
+  paUserId,
+  rawDraft_jobName: rawDraft?.jobName || null,
+  rawDraft_jobSource: rawDraft?.jobSource || null,
+  data_jobName: data?.jobName || null,
+  data_jobSource: data?.jobSource || null,
+  final_jobName: jobName || null,
+  final_jobSource: jobSource || null,
+  amount: data?.amount || null,
+  date: data?.date || null,
+  store: data?.store || null,
+  head_originalText: String(rawDraft?.originalText || rawDraft?.draftText || '').slice(0, 80)
+});
 
-            date: String(data.date || '').trim(),
-            source: sourceForDb,
-            description: descForDb,
+await pg.insertTransaction({
+  ownerId,
+  owner_id: ownerId,
+  userId: paUserId,
+  user_id: paUserId,
+  fromPhone,
+  from: fromPhone,
 
-            amount: amountNum.toFixed(2),
-            amount_cents: amountCents,
+  kind: 'expense',
 
-            jobName,
-            jobSource,
+  ...data,
 
-            category: categoryStr,
+  date: String(data.date || '').trim(),
+  source: sourceForDb,
+  description: descForDb,
 
-            media_asset_id: data.media_asset_id || null,
-            source_msg_id: txSourceMsgId || null
-          });
+  // ✅ authoritative values
+  amount: amountNum.toFixed(2),
+  amount_cents: amountCents,
 
-          console.info('[EXPENSE_INSERT_OK]', {
-            paUserId,
-            txSourceMsgId: txSourceMsgId || null,
-            media_asset_id: data.media_asset_id || null
-          });
+  jobName,
+  jobSource,
 
-          // ✅ After successful log: clear confirm + picker + pending-state flags so we never nag incorrectly
-          try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
-          try { await deletePA({ ownerId, userId: pickKey, kind: PA_KIND_PICK_JOB }); } catch {}
+  category: categoryStr,
 
-          try {
-            const p2 = await getPendingTransactionState(paUserId);
-            if (p2?.allow_new_while_pending) {
-              await mergePendingTransactionState(paUserId, {
-                allow_new_while_pending: false,
-                allow_new_set_at: null
-              });
-            }
-          } catch {}
+  media_asset_id: data.media_asset_id || null,
+  source_msg_id: txSourceMsgId || null
+});
 
-          try {
-            if (typeof state?.deletePendingMediaMeta === 'function') {
-              await state.deletePendingMediaMeta(paUserId);
-            }
-          } catch {}
+console.info('[EXPENSE_INSERT_OK]', {
+  paUserId,
+  txSourceMsgId: txSourceMsgId || null,
+  media_asset_id: data.media_asset_id || null
+});
 
-          // ✅ Format amount for display
-          const amountNumForMsg = Number(String(data?.amount ?? '').replace(/[^0-9.-]/g, ''));
-          const amountDisplay =
-            Number.isFinite(amountNumForMsg) && amountNumForMsg > 0
-              ? `$${amountNumForMsg.toFixed(2)}`
-              : (() => {
-                  const s = String(data?.amount ?? '').trim();
-                  if (!s) return '$0.00';
-                  if (/^\d+(?:\.\d+)?$/.test(s)) return `$${Number(s).toFixed(2)}`;
-                  return s.startsWith('$') ? s : `$${s}`;
-                })();
+// ✅ After successful log: clear confirm + picker + pending-state flags so we never nag incorrectly
+try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
+try { await deletePA({ ownerId, userId: pickKey, kind: PA_KIND_PICK_JOB }); } catch {}
 
-          const currencyDisplay = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase();
-          const currencySuffix = currencyDisplay ? ` ${currencyDisplay}` : '';
+try {
+  const p2 = await getPendingTransactionState(paUserId);
+  if (p2?.allow_new_while_pending) {
+    await mergePendingTransactionState(paUserId, {
+      allow_new_while_pending: false,
+      allow_new_set_at: null
+    });
+  }
+} catch {}
 
-          const okMsg = [
-            `✅ Logged expense ${amountDisplay}${currencySuffix} — ${data.store || 'Unknown Store'}`,
-            data.date ? `Date: ${data.date}` : null,
-            jobName ? `Job: ${jobName}` : null,
-            categoryStr ? `Category: ${categoryStr}` : null
-          ]
-            .filter(Boolean)
-            .join('\n');
+try {
+  if (typeof state?.deletePendingMediaMeta === 'function') {
+    await state.deletePendingMediaMeta(paUserId);
+  }
+} catch {}
 
-          return out(twimlText(okMsg), false);
+// ✅ Format amount for display (use amountNum — no re-parse drift)
+const amountDisplay = `$${amountNum.toFixed(2)}`;
+
+const currencyDisplay = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase();
+const currencySuffix = currencyDisplay ? ` ${currencyDisplay}` : '';
+
+const okMsg = [
+  `✅ Logged expense ${amountDisplay}${currencySuffix} — ${data.store || 'Unknown Store'}`,
+  data.date ? `Date: ${data.date}` : null,
+  jobName ? `Job: ${jobName}` : null,
+  categoryStr ? `Category: ${categoryStr}` : null
+]
+  .filter(Boolean)
+  .join('\n');
+
+return out(twimlText(okMsg), false);
+
         } catch (e) {
           console.error('[YES] handler failed:', e?.message);
           return out(

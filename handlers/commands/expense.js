@@ -3430,14 +3430,15 @@ if (
     // ✅ DO NOTHING — fall through to confirm block below
   } else {
     // ✅ EVERYTHING picker-related must be inside this ELSE
-    const rawInput = String(input || '').trim();
+   const rawInput = String(input || '').trim();
 
-    // ✅ Helper: detect picker-ish answers
-    const looksLikePickerTap =
-      /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
-      /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-      !!inboundTwilioMeta?.ListTitle ||
-      !!inboundTwilioMeta?.ListId;
+// ✅ define BEFORE any use (prevents TDZ crash)
+const looksLikePickerTap =
+  /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
+  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+  /^jobno_\d{1,10}$/i.test(rawInput) ||
+  !!inboundTwilioMeta?.ListTitle ||
+  !!inboundTwilioMeta?.ListId;
 
     // ✅ use stored picker state ONLY (single source of truth)
     const jobOptions = pickPA.payload.jobOptions;
@@ -3624,32 +3625,22 @@ if (
         }
       }
 
-     // ----------------------------
-// 1) PICKER-TAP PATH (Twilio interactive replies)
+  // ----------------------------
+// 1) PICKER-TAP PATH
 // ----------------------------
-
 if (looksLikePickerTap) {
   const pickJobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
-
-  const sel = await resolveJobPickSelectionExpense({
-    input: rawInput,
-    twilioMeta: inboundTwilioMeta || {},
-    pickState: {
-      displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
-      sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : []
-    }
-  });
+  const sel = await resolveJobPickSelection(rawInput, inboundTwilioMeta || {}, pickPA);
 
   console.info('[JOB_PICK_RESOLVED_EXPENSE]', {
-    tok: String(rawInput || '').slice(0, 40),
+    tok: rawInput,
     inboundTitle: String(inboundTwilioMeta?.ListTitle || '').slice(0, 80),
     ok: !!sel?.ok,
     reason: sel?.ok ? null : sel?.reason,
     jobNo: sel?.jobNo || null,
-    mode: sel?.meta?.mode || null
+    via: sel?.via || null
   });
 
-  // If user sent a control token (yes/edit/etc) while meta exists, do not hijack it
   const token2 = normalizeDecisionToken(rawInput);
   const isControlToken2 =
     token2 === 'yes' ||
@@ -3679,8 +3670,6 @@ if (looksLikePickerTap) {
     }
 
     const chosenJobNo = Number(sel.jobNo);
-
-    // ✅ accept any resolved jobNo if it exists in the stored options snapshot
     const chosen = (pickJobOptions || []).find((j) => Number(j?.job_no ?? j?.jobNo) === chosenJobNo) || null;
 
     if (!chosen) {
@@ -3693,7 +3682,7 @@ if (looksLikePickerTap) {
         confirmFlowId: effectiveConfirmFlowId,
         jobOptions: pickJobOptions.length ? pickJobOptions : jobOptions,
         confirmDraft,
-        reason: sel?.reason || 'job_not_in_pick_state',
+        reason: 'job_not_in_pick_state',
         twilioMeta: inboundTwilioMeta,
         pickUserId: canonicalUserKey
       });
@@ -3784,101 +3773,6 @@ if (looksLikePickerTap) {
 
 
 
-function normalizeListTitle(s = '') {
-  return String(s || '')
-    .toLowerCase()
-    .replace(/\u00A0/g, ' ')
-    .replace(/[^\p{L}\p{N} ]+/gu, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
-}
-
-
-
-/**
- * ✅ Expense picker selection resolver
- * Prefers:
- *  1) stable jobno_<N>
- *  2) ListTitle name match against sentRows
- *  3) fallback to legacy ix mapping
- *
- * Returns: { ok: true, jobNo, meta } or { ok: false, reason }
- */
-async function resolveJobPickSelectionExpense({ input, twilioMeta, pickState }) {
-  const tok = String(input || '').trim();
-  const inboundTitleRaw = String(twilioMeta?.ListTitle || '').trim();
-
-  const displayedJobNos = Array.isArray(pickState?.displayedJobNos) ? pickState.displayedJobNos.map(Number) : [];
-  const sentRows = Array.isArray(pickState?.sentRows) ? pickState.sentRows : [];
-
-  // 1) Stable id path: jobno_<N>
-  const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
-  if (mJobNo?.[1]) {
-    return { ok: true, jobNo: Number(mJobNo[1]), meta: { mode: 'stable_jobno' } };
-  }
-
-  // Legacy: "job_<ix>_<hash>" where ix is UI index, NOT jobNo
-  const mIx = tok.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
-  const ix = mIx?.[1] ? Number(mIx[1]) : null;
-
-  // 2) Prefer matching by title text (strip "#<ix>" prefix from ListTitle)
-  const strippedTitleNorm = normalizeListTitle(inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim());
-  if (strippedTitleNorm && sentRows.length) {
-    const candidates = sentRows
-      .map((r) => {
-        const nameNorm = normalizeListTitle(r?.name || '');
-        const titleNorm = normalizeListTitle(r?.title || '');
-        const jobNo = Number(r?.jobNo);
-        if (!Number.isFinite(jobNo)) return null;
-
-        // If we have a displayed whitelist, enforce it
-        if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return null;
-
-        let score = 0;
-        if (nameNorm === strippedTitleNorm || titleNorm === strippedTitleNorm) score = 3;
-        else if (
-          (nameNorm && nameNorm.startsWith(strippedTitleNorm)) ||
-          (titleNorm && titleNorm.startsWith(strippedTitleNorm)) ||
-          (strippedTitleNorm && strippedTitleNorm.startsWith(nameNorm))
-        ) score = 2;
-        else if (
-          (nameNorm && nameNorm.includes(strippedTitleNorm)) ||
-          (titleNorm && titleNorm.includes(strippedTitleNorm)) ||
-          (strippedTitleNorm && strippedTitleNorm.includes(nameNorm))
-        ) score = 1;
-
-        return score ? { jobNo, score } : null;
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.score - a.score);
-
-    if (candidates.length) {
-      const top = candidates[0];
-      const second = candidates[1];
-      if (!second || second.score < top.score) {
-        return { ok: true, jobNo: Number(top.jobNo), meta: { mode: 'legacy_title_name_match' } };
-      }
-    }
-  }
-
-  // 3) Fallback to index mapping
-  if (ix != null && Number.isFinite(ix) && ix >= 1) {
-    if (sentRows.length && ix <= sentRows.length) {
-      const expected = sentRows[ix - 1];
-      const jobNo = Number(expected?.jobNo);
-      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_index_sentRows', ix } };
-    }
-
-    if (displayedJobNos.length && ix <= displayedJobNos.length) {
-      const jobNo = Number(displayedJobNos[ix - 1]);
-      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_index_displayed', ix } };
-    }
-
-    return { ok: false, reason: 'legacy_ix_out_of_range' };
-  }
-
-  return { ok: false, reason: 'unrecognized_row_id' };
-}
       // ----------------------------
       // 2) TYPED INPUT PATH
       // ----------------------------

@@ -342,6 +342,43 @@ function normalizeDecisionToken(input) {
   return s;
 }
 
+function isIsoDate(s) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim());
+}
+
+function parseRelativeDateReply(input, tz) {
+  const t = String(input || '').trim().toLowerCase();
+  if (!t) return null;
+
+  if (t === 'today' || t === 'td' || t === 'now' || t === 'just now') {
+    return todayInTimeZone(tz);
+  }
+
+  if (t === 'yesterday') {
+    // tz-safe enough for our use: compute "yesterday" from todayInTimeZone
+    const today = todayInTimeZone(tz);
+    const d = new Date(`${today}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 1);
+    return d.toISOString().slice(0, 10);
+  }
+
+  // accept ISO directly
+  if (isIsoDate(t)) return t;
+
+  return null;
+}
+
+function inferDateFromJust(originalText, tz) {
+  const s = String(originalText || '').toLowerCase();
+  const hasJust = /\bjust\b/.test(s);
+  const looksLikeReceiptMoment =
+    /\b(received|got|paid|deposit|e-?transfer|etransfer|interac|cheque|check)\b/.test(s);
+
+  if (hasJust && looksLikeReceiptMoment) return todayInTimeZone(tz);
+  return null;
+}
+
+
 function looksLikeOverhead(s) {
   const t = String(s || '').trim().toLowerCase();
   return t === 'overhead' || t === 'oh';
@@ -1259,6 +1296,72 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
       }
 
       const strictTok = strictDecisionToken(input);
+      // ---------------------------------------------------------
+// ✅ UN-SKIPPABLE DATE CONSUMPTION (CONFIRM FLOW):
+// If draft is awaiting_date, consume ANY non-control inbound
+// as the date payload and update confirm draft.
+// ---------------------------------------------------------
+try {
+  // refresh confirmPA (avoid stale snapshots)
+  try {
+    confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
+  } catch {}
+
+  const d0 = confirmPA?.payload?.draft || null;
+
+  const isControl =
+    strictTok === 'yes' ||
+    strictTok === 'edit' ||
+    strictTok === 'cancel' ||
+    strictTok === 'change_job';
+
+  if (d0?.awaiting_date && !isControl) {
+    const parsedDate = parseRelativeDateReply(input, tz);
+
+    if (!parsedDate) {
+      return out(
+        twimlText(
+          `Please tell me the date you received it.\n` +
+            `Reply "today", "yesterday", or a date like "2026-01-13".`
+        ),
+        false
+      );
+    }
+
+    const patched = {
+      ...(d0 || {}),
+      date: parsedDate,
+      awaiting_date: false,
+      needsReparse: false,
+      draftText: String(input || '').trim() || (d0?.draftText ?? null),
+      originalText: d0?.originalText ?? null
+    };
+
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: { ...(confirmPA?.payload || {}), draft: patched },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+  }
+
+  // if awaiting_date and user pressed a control token, remind (no nag loop)
+  if (d0?.awaiting_date && isControl) {
+    return out(
+      twimlText(
+        `📅 I still need the date you received it.\n` +
+          `Reply "today", "yesterday", or "2026-01-13".`
+      ),
+      false
+    );
+  }
+} catch (e) {
+  console.warn('[REVENUE_AWAITING_DATE] failed (ignored):', e?.message);
+}
+
 
       // ---------------------------------------------------------
       // ✅ UN-SKIPPABLE EDIT CONSUMPTION (CONFIRM FLOW)
@@ -1746,9 +1849,12 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 }
 
 
-    // ---- 3) New revenue parse (AI first-pass; keep behavior; beta hardening) ----
+  // ---- 3) New revenue parse (AI first-pass; keep behavior; beta hardening) ----
+
+// IMPORTANT: do NOT force date here, or it will prevent awaiting_date from ever triggering.
+// We want to know if the user explicitly provided a date.
 const defaultData = {
-  date: todayInTimeZone(tz),
+  date: null, // ✅ allow missing date so we can latch awaiting_date
   description: 'Revenue received',
   amount: '$0.00',
   source: 'Unknown'
@@ -1759,7 +1865,37 @@ const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessag
 let data = aiRes?.data || null;
 let aiReply = aiRes?.reply || null;
 
+// Track whether we had a real date BEFORE normalization defaults
+const rawDateBeforeNormalize = data?.date != null ? String(data.date).trim() : '';
+
+// Normalize everything else, but we will decide date explicitly below
 if (data) data = normalizeRevenueData(data, tz);
+
+// --------------------
+// ✅ Decide the date
+// --------------------
+
+// 1) If parser gave a usable ISO date, keep it
+let finalDate = isIsoDate(rawDateBeforeNormalize) ? rawDateBeforeNormalize : null;
+
+// 2) If user typed a relative date reply in the SAME message (e.g., "... today"), use it
+if (!finalDate) {
+  const rel = parseRelativeDateReply(input, tz);
+  if (rel) finalDate = rel;
+}
+
+// 3) If user said "just" and still no date, treat as today
+if (!finalDate) {
+  const inferred = inferDateFromJust(input, tz);
+  if (inferred) finalDate = inferred;
+}
+
+// Apply chosen date (or keep null so we can latch awaiting_date)
+data.date = finalDate;
+
+// --------------------
+// ✅ Core parse checks
+// --------------------
 
 const missingCore = !data || !data.amount || data.amount === '$0.00';
 if (aiReply && missingCore) return out(twimlText(aiReply), false);
@@ -1788,6 +1924,45 @@ if (jobName && looksLikeOverhead(jobName)) {
   jobSource = 'overhead';
 }
 
+// ------------------------------------------------------
+// ✅ If date is still missing/unusable, latch awaiting_date
+// ------------------------------------------------------
+if (!data?.date || !isIsoDate(data.date)) {
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      draft: {
+        ...(data || {}),
+        awaiting_date: true,
+        // preserve job inference so the user only has to answer the date
+        jobName: jobName || null,
+        jobSource: jobName ? (jobSource || 'typed') : null,
+        suggestedCategory: category,
+        job_id: null,
+        job_no: null,
+        originalText: input,
+        draftText: input
+      },
+      sourceMsgId: safeMsgId,
+      type: 'revenue'
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
+
+  return out(
+    twimlText(
+      `Please specify the date you received the check.\n` +
+        `Reply "today", "yesterday", or a date like "2026-01-13".`
+    ),
+    false
+  );
+}
+
+// --------------------------------------
+// ✅ Normal confirm PA upsert (date valid)
+// --------------------------------------
 await upsertPA({
   ownerId,
   userId: paUserId,
@@ -1796,7 +1971,7 @@ await upsertPA({
     draft: {
       ...data,
 
-      // ✅ alignment: never allow stale parser job fields to linger
+      // ✅ alignment: job must reflect inference/pick logic (not stale parser fields)
       jobName: jobName || null,
       jobSource: jobName ? (jobSource || 'typed') : null,
 
@@ -1823,7 +1998,6 @@ if (!jobName) {
     jobOptions: jobs,
     page: 0,
     pageSize: 8,
-
     // ✅ alignment: job must be selected explicitly
     confirmDraft: { ...(data || {}), jobName: null, jobSource: null }
   });
@@ -1838,6 +2012,7 @@ const summaryLine = buildRevenueSummaryLine({
 });
 
 return await sendConfirmRevenueOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
+
 
   } catch (error) {
     console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {

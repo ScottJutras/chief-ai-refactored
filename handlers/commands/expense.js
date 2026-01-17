@@ -732,16 +732,6 @@ function parseRowId(rowId) {
   };
 }
 
-// ✅ self-contained title normalization (safe even if sanitizeJobLabel changes)
-function normalizeListTitle(s) {
-  return String(s || '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .replace(/[—–-]/g, '-') // normalize dashes
-    .replace(/[^a-z0-9 #:-]/g, ''); // keep minimal safe chars
-}
-
 
 // ✅ legacy support for old "job_<ix>_<hash>" replies (keep ONE copy)
 function legacyIndexFromTwilioToken(tok) {
@@ -3634,10 +3624,10 @@ if (
         }
       }
 
-      // ----------------------------
-      // 1) PICKER-TAP PATH (Twilio interactive replies)
-      // ----------------------------
-      
+     // ----------------------------
+// 1) PICKER-TAP PATH (Twilio interactive replies)
+// ----------------------------
+
 if (looksLikePickerTap) {
   const pickJobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
 
@@ -3651,7 +3641,7 @@ if (looksLikePickerTap) {
   });
 
   console.info('[JOB_PICK_RESOLVED_EXPENSE]', {
-    tok: rawInput,
+    tok: String(rawInput || '').slice(0, 40),
     inboundTitle: String(inboundTwilioMeta?.ListTitle || '').slice(0, 80),
     ok: !!sel?.ok,
     reason: sel?.ok ? null : sel?.reason,
@@ -3690,9 +3680,8 @@ if (looksLikePickerTap) {
 
     const chosenJobNo = Number(sel.jobNo);
 
-    const chosen =
-      (pickJobOptions || []).find((j) => Number(j?.job_no ?? j?.jobNo) === chosenJobNo) ||
-      null;
+    // ✅ accept any resolved jobNo if it exists in the stored options snapshot
+    const chosen = (pickJobOptions || []).find((j) => Number(j?.job_no ?? j?.jobNo) === chosenJobNo) || null;
 
     if (!chosen) {
       return await rejectAndResendPicker({
@@ -3704,7 +3693,7 @@ if (looksLikePickerTap) {
         confirmFlowId: effectiveConfirmFlowId,
         jobOptions: pickJobOptions.length ? pickJobOptions : jobOptions,
         confirmDraft,
-        reason: 'job_not_in_pick_state',
+        reason: sel?.reason || 'job_not_in_pick_state',
         twilioMeta: inboundTwilioMeta,
         pickUserId: canonicalUserKey
       });
@@ -3746,7 +3735,6 @@ if (looksLikePickerTap) {
         reason: 'missing_confirm_after_pick',
         twilioMeta: inboundTwilioMeta,
         pickUserId: canonicalUserKey
-
       });
     }
 
@@ -3793,11 +3781,10 @@ if (looksLikePickerTap) {
     return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
   }
 } // end looksLikePickerTap
-const looksLikePickerTap =
-  !!twilioMeta?.ListId ||
-  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-  /^jobno_\d{1,10}$/i.test(rawInput);
-  function normalizeListTitle(s = '') {
+
+
+
+function normalizeListTitle(s = '') {
   return String(s || '')
     .toLowerCase()
     .replace(/\u00A0/g, ' ')
@@ -3805,6 +3792,8 @@ const looksLikePickerTap =
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
+
+
 
 /**
  * ✅ Expense picker selection resolver
@@ -3890,33 +3879,6 @@ async function resolveJobPickSelectionExpense({ input, twilioMeta, pickState }) 
 
   return { ok: false, reason: 'unrecognized_row_id' };
 }
-
-
-if (looksLikePickerTap) {
-  const sel = await resolveJobPickSelectionExpense({
-    input: rawInput,
-    twilioMeta: twilioMeta || {},
-    pickState: {
-      displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
-      sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : []
-    }
-  });
-
-  console.info('[JOB_PICK_RESOLVED_EXPENSE]', {
-    tok: rawInput,
-    inboundTitle: twilioMeta?.ListTitle,
-    result: sel
-  });
-
-  if (!sel?.ok) {
-    // re-send picker or fallback
-    return await sendJobPickerOrFallback({ /* your existing args */ });
-  }
-
-  rawInput = `jobno_${Number(sel.jobNo)}`;
-}
-
-
       // ----------------------------
       // 2) TYPED INPUT PATH
       // ----------------------------

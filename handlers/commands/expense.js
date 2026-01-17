@@ -477,27 +477,31 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine) {
 
 
 async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile = null }) {
-  // ✅ Canonical: NEVER re-key; use the same PA key you write with everywhere else
   const paKey = String(paUserId || '').trim();
 
-  // ✅ If we have userProfile + a reparse helper, try to heal draft before resending
-  try {
-    if (userProfile && typeof maybeReparseConfirmDraftExpense === 'function') {
-      await maybeReparseConfirmDraftExpense({ ownerId, paUserId: paKey, tz, userProfile });
-    }
-  } catch (e) {
-    console.warn('[RESEND_CONFIRM] maybeReparseConfirmDraftExpense failed (ignored):', e?.message);
-  }
+  // ✅ Load first
+  const confirmPA0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+  const draft0 = confirmPA0?.payload?.draft || null;
 
-  // ✅ Always reload after optional reparse
-  const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-
-  const draft = confirmPA?.payload?.draft || null;
-  if (!draft || !Object.keys(draft).length) {
+  if (!draft0 || !Object.keys(draft0).length) {
     return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
   }
 
-  // Prefer stored summary/humanLine if present
+  // ✅ Only reparse if explicitly requested AND not in edit flow
+  if (draft0?.needsReparse && !draft0?.awaiting_edit) {
+    try {
+      if (userProfile && typeof maybeReparseConfirmDraftExpense === 'function') {
+        await maybeReparseConfirmDraftExpense({ ownerId, paUserId: paKey, tz, userProfile });
+      }
+    } catch (e) {
+      console.warn('[RESEND_CONFIRM] maybeReparseConfirmDraftExpense failed (ignored):', e?.message);
+    }
+  }
+
+  // ✅ Reload after optional reparse
+  const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+  const draft = confirmPA?.payload?.draft || draft0;
+
   const srcText =
     confirmPA?.payload?.humanLine ||
     confirmPA?.payload?.summaryLine ||
@@ -521,9 +525,10 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
     }) ||
     'Confirm expense?';
 
-  // ✅ Send interactive template/quick replies if possible
   return await sendConfirmExpenseOrFallback(fromPhone, line);
 }
+
+
 
 
 async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile }) {
@@ -985,7 +990,7 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
 
   const amt =
     Number.isFinite(amtNum) && amtNum > 0
-      ? formatMoneyDisplay(amtNum) // ✅ uses Intl.NumberFormat => commas
+      ? formatMoneyDisplay(amtNum) // ✅ Intl.NumberFormat => commas
       : rawAmt
         ? (rawAmt.startsWith('$')
             ? rawAmt
@@ -997,33 +1002,42 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
   // Start with existing behavior
   let it = cleanExpenseItemForDisplay(item);
 
-  // ✅ If item is Unknown, try to infer from the original line
+  // ✅ Option B: Only infer item from receipt-ish text (prevents job/date pollution)
   if (isUnknownItem(it) && sourceText) {
-    const src = normalizeDashes(String(sourceText || '').trim());
+    const src0 = String(sourceText || '').trim();
 
-    // 1) "$883 - Railing ..."
-    let m =
-      src.match(
-        /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
-      ) || null;
-    if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
+    const looksReceiptish =
+      /^\s*\$/.test(src0) || // starts with money
+      /\b(total|subtotal|hst|gst|pst|tax|amount due)\b/i.test(src0) ||
+      src0.split('\n').length >= 3; // multi-line = likely OCR/receipt
 
-    // 2) "purchased $883 in railing at Rona"
-    if (isUnknownItem(it)) {
-      m =
+    if (looksReceiptish) {
+      const src = normalizeDashes(src0);
+
+      // 1) "$883 - Railing ..."
+      let m =
         src.match(
-          /\b(?:spent|spend|paid|pay|purchased|purchase|bought|buy|ordered|order|got)\b.*?\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+\bin\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+          /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
         ) || null;
       if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
-    }
 
-    // 3) "$883 railing at Rona"
-    if (isUnknownItem(it)) {
-      m =
-        src.match(
-          /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-        ) || null;
-      if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
+      // 2) "purchased $883 in railing at Rona"
+      if (isUnknownItem(it)) {
+        m =
+          src.match(
+            /\b(?:spent|spend|paid|pay|purchased|purchase|bought|buy|ordered|order|got)\b.*?\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+\bin\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+          ) || null;
+        if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
+      }
+
+      // 3) "$883 railing at Rona"
+      if (isUnknownItem(it)) {
+        m =
+          src.match(
+            /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+          ) || null;
+        if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
+      }
     }
   }
 
@@ -1041,6 +1055,7 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
 
   return lines.join('\n');
 }
+
 
 
 function getJobPickerSecret() {
@@ -4313,24 +4328,26 @@ if (confirmPA?.payload?.draft) {
           return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
         }
 
-        // ✅ Mark confirm draft dirty so we re-parse receipt fields after job changes
-        try {
-          await upsertPA({
-            ownerId,
-            userId: paKey,
-            kind: PA_KIND_CONFIRM,
-            payload: {
-              ...(confirmPA.payload || {}),
-              draft: {
-                ...(confirmPA.payload?.draft || {}),
-                needsReparse: true
-              }
-            },
-            ttlSeconds: PA_TTL_SEC
-          });
-        } catch (e) {
-          console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
-        }
+        // ✅ Change job must NOT trigger reparse (prevents date/item from being overwritten)
+try {
+  await upsertPA({
+    ownerId,
+    userId: paKey,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      ...(confirmPA.payload || {}),
+      draft: {
+        ...(confirmPA.payload?.draft || {}),
+        // explicitly keep needsReparse as-is (or false if missing)
+        needsReparse: !!(confirmPA.payload?.draft?.needsReparse)
+      }
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
+} catch (e) {
+  console.warn('[EXPENSE] change_job confirmPA touch failed (ignored):', e?.message);
+}
+
 
         await sendJobPickList({
           fromPhone,

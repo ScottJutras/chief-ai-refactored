@@ -985,17 +985,22 @@ function formatDisplayDate(isoDate, tz = 'America/Toronto') {
 }
 
 function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourceText }) {
-  // ✅ Display amount with $ + 2 decimals when possible
+  // ✅ Display amount with commas + $ + 2 decimals when possible
   const rawAmt = String(amount || '').trim();
-  const amtNum = Number(rawAmt.replace(/[^0-9.-]/g, ''));
+
+  const amtNum = (() => {
+    const n = Number(rawAmt.replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
+    return Number.isFinite(n) ? n : NaN;
+  })();
+
   const amt =
     Number.isFinite(amtNum) && amtNum > 0
-      ? `$${amtNum.toFixed(2)}`
+      ? formatMoneyDisplay(amtNum) // ✅ uses Intl.NumberFormat => commas
       : rawAmt
         ? (rawAmt.startsWith('$')
             ? rawAmt
             : /^\d+(?:\.\d+)?$/.test(rawAmt)
-              ? `$${Number(rawAmt).toFixed(2)}`
+              ? formatMoneyDisplay(Number(rawAmt))
               : rawAmt)
         : '$0.00';
 
@@ -1186,6 +1191,16 @@ function extractReceiptTotal(text) {
     const n = Number(String(x).replace(/,/g, ''));
     return Number.isFinite(n) ? n : null;
   };
+
+function formatMoneyMaybe(amountStrOrNum) {
+  const n =
+    typeof amountStrOrNum === 'number'
+      ? amountStrOrNum
+      : Number(String(amountStrOrNum || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
+
+  if (!Number.isFinite(n)) return null;
+  return formatMoneyDisplay(n); // uses Intl.NumberFormat → commas
+}
 
   const goodLine = (lc) => {
     if (BAD_LINE.test(lc)) return false;
@@ -2705,7 +2720,13 @@ function isSkipWord(s) {
 
 // Build a confirm message in plain text (fail-open). This avoids relying on interactive templates.
 function formatExpenseConfirmText(draft) {
-  const amt = draft?.amount || 'Unknown';
+  const amtRaw = String(draft?.amount || '').trim();
+  const amtNum = Number(amtRaw.replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
+  const amt =
+    Number.isFinite(amtNum) && amtNum > 0
+      ? formatMoneyDisplay(amtNum) // "$18,000.00"
+      : (amtRaw ? (amtRaw.startsWith('$') ? amtRaw : `$${amtRaw}`) : 'Unknown');
+
   const item = draft?.item || draft?.description || 'Expense';
   const store = draft?.store || 'Unknown Store';
   const date = draft?.date || 'Unknown date';
@@ -2726,6 +2747,7 @@ function formatExpenseConfirmText(draft) {
     `"cancel" (or "stop") to discard`
   ].join('\n');
 }
+
 
 // Parse edit payload and merge into existing draft WITHOUT losing receipt/media linkage.
 // ✅ Rule: Only overwrite fields the user explicitly intended to change.
@@ -3619,45 +3641,25 @@ if (
 if (looksLikePickerTap) {
   const pickJobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
 
-  // ✅ Parse jobNo from whatever Twilio actually returns
-  const extractJobNo = (tok, meta) => {
-    const t = String(tok || '').trim();
-
-    // 1) New canonical ids (what sendJobPickList now sends)
-    let m = t.match(/^jobno_(\d{1,10})$/i);
-    if (m?.[1]) return Number(m[1]);
-
-    // 2) Legacy inbound tokens you’ve seen in logs (job_7_xxxx)
-    m = t.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
-    if (m?.[1]) return Number(m[1]);
-
-    // 3) Sometimes Twilio sticks the id in ListId
-    const lid = String(meta?.ListId || '').trim();
-    m = lid.match(/^jobno_(\d{1,10})$/i);
-    if (m?.[1]) return Number(m[1]);
-
-    // 4) Title always contains "#<jobNo>"
-    const title = String(meta?.ListTitle || '').trim();
-    m = title.match(/^#\s*(\d{1,10})\b/);
-    if (m?.[1]) return Number(m[1]);
-
-    return null;
-  };
-
-   // ✅ Use the real resolver (ListTitle-first), so we can propagate true reason codes
-  const sel = await resolveJobPickSelection(rawInput, inboundTwilioMeta, pickPA);
-
-  console.info('[JOB_PICK_SELECTION]', {
-    ok: !!sel?.ok,
-    reason: sel?.ok ? null : (sel?.reason || 'unrecognized_pick'),
-    jobNo: sel?.jobNo || null,
-    via: sel?.via || null,
-    inboundBody: String(inboundTwilioMeta?.Body || '').slice(0, 40),
-    inboundListTitle: String(inboundTwilioMeta?.ListTitle || '').slice(0, 60),
-    inboundListId: String(inboundTwilioMeta?.ListId || '').slice(0, 60)
+  const sel = await resolveJobPickSelectionExpense({
+    input: rawInput,
+    twilioMeta: inboundTwilioMeta || {},
+    pickState: {
+      displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
+      sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : []
+    }
   });
 
-  // If user somehow sent a confirm-control token while Twilio meta exists, do not hijack it
+  console.info('[JOB_PICK_RESOLVED_EXPENSE]', {
+    tok: rawInput,
+    inboundTitle: String(inboundTwilioMeta?.ListTitle || '').slice(0, 80),
+    ok: !!sel?.ok,
+    reason: sel?.ok ? null : sel?.reason,
+    jobNo: sel?.jobNo || null,
+    mode: sel?.meta?.mode || null
+  });
+
+  // If user sent a control token (yes/edit/etc) while meta exists, do not hijack it
   const token2 = normalizeDecisionToken(rawInput);
   const isControlToken2 =
     token2 === 'yes' ||
@@ -3670,34 +3672,7 @@ if (looksLikePickerTap) {
   if (isControlToken2) {
     skipPickHandling = true;
   } else {
-    // If we cannot resolve a jobNo, reject and resend with the correct reason
     if (!sel?.ok || !sel?.jobNo || !Number.isFinite(Number(sel.jobNo))) {
-      return await rejectAndResendPicker({
-  fromPhone,
-  paUserId,
-  stableMsgId,
-  ownerId,
-  userProfile,
-  confirmFlowId: effectiveConfirmFlowId,
-  jobOptions: pickJobOptions.length ? pickJobOptions : jobOptions,
-  confirmDraft,
-  reason: sel?.reason || 'unrecognized_pick',
-  twilioMeta: inboundTwilioMeta,
-  pickUserId: canonicalUserKey
-
-});
-
-    }
-
-    const chosenJobNo = Number(sel.jobNo);
-
-    // ✅ IMPORTANT: accept any resolved jobNo if it exists in the stored options snapshot
-    const chosen =
-      (pickJobOptions || []).find((j) => Number(j?.job_no ?? j?.jobNo) === chosenJobNo) ||
-      null;
-
-    if (!chosen) {
-      // ✅ propagate the real reason; do NOT hardcode job_not_in_pick_state
       return await rejectAndResendPicker({
         fromPhone,
         paUserId,
@@ -3707,10 +3682,31 @@ if (looksLikePickerTap) {
         confirmFlowId: effectiveConfirmFlowId,
         jobOptions: pickJobOptions.length ? pickJobOptions : jobOptions,
         confirmDraft,
-        reason: sel?.reason || 'unresolvable_selection',
+        reason: sel?.reason || 'unrecognized_pick',
         twilioMeta: inboundTwilioMeta,
         pickUserId: canonicalUserKey
+      });
+    }
 
+    const chosenJobNo = Number(sel.jobNo);
+
+    const chosen =
+      (pickJobOptions || []).find((j) => Number(j?.job_no ?? j?.jobNo) === chosenJobNo) ||
+      null;
+
+    if (!chosen) {
+      return await rejectAndResendPicker({
+        fromPhone,
+        paUserId,
+        stableMsgId,
+        ownerId,
+        userProfile,
+        confirmFlowId: effectiveConfirmFlowId,
+        jobOptions: pickJobOptions.length ? pickJobOptions : jobOptions,
+        confirmDraft,
+        reason: 'job_not_in_pick_state',
+        twilioMeta: inboundTwilioMeta,
+        pickUserId: canonicalUserKey
       });
     }
 
@@ -3797,12 +3793,135 @@ if (looksLikePickerTap) {
     return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
   }
 } // end looksLikePickerTap
+const looksLikePickerTap =
+  !!twilioMeta?.ListId ||
+  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+  /^jobno_\d{1,10}$/i.test(rawInput);
+  function normalizeListTitle(s = '') {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/\u00A0/g, ' ')
+    .replace(/[^\p{L}\p{N} ]+/gu, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * ✅ Expense picker selection resolver
+ * Prefers:
+ *  1) stable jobno_<N>
+ *  2) ListTitle name match against sentRows
+ *  3) fallback to legacy ix mapping
+ *
+ * Returns: { ok: true, jobNo, meta } or { ok: false, reason }
+ */
+async function resolveJobPickSelectionExpense({ input, twilioMeta, pickState }) {
+  const tok = String(input || '').trim();
+  const inboundTitleRaw = String(twilioMeta?.ListTitle || '').trim();
+
+  const displayedJobNos = Array.isArray(pickState?.displayedJobNos) ? pickState.displayedJobNos.map(Number) : [];
+  const sentRows = Array.isArray(pickState?.sentRows) ? pickState.sentRows : [];
+
+  // 1) Stable id path: jobno_<N>
+  const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
+  if (mJobNo?.[1]) {
+    return { ok: true, jobNo: Number(mJobNo[1]), meta: { mode: 'stable_jobno' } };
+  }
+
+  // Legacy: "job_<ix>_<hash>" where ix is UI index, NOT jobNo
+  const mIx = tok.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+  const ix = mIx?.[1] ? Number(mIx[1]) : null;
+
+  // 2) Prefer matching by title text (strip "#<ix>" prefix from ListTitle)
+  const strippedTitleNorm = normalizeListTitle(inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim());
+  if (strippedTitleNorm && sentRows.length) {
+    const candidates = sentRows
+      .map((r) => {
+        const nameNorm = normalizeListTitle(r?.name || '');
+        const titleNorm = normalizeListTitle(r?.title || '');
+        const jobNo = Number(r?.jobNo);
+        if (!Number.isFinite(jobNo)) return null;
+
+        // If we have a displayed whitelist, enforce it
+        if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return null;
+
+        let score = 0;
+        if (nameNorm === strippedTitleNorm || titleNorm === strippedTitleNorm) score = 3;
+        else if (
+          (nameNorm && nameNorm.startsWith(strippedTitleNorm)) ||
+          (titleNorm && titleNorm.startsWith(strippedTitleNorm)) ||
+          (strippedTitleNorm && strippedTitleNorm.startsWith(nameNorm))
+        ) score = 2;
+        else if (
+          (nameNorm && nameNorm.includes(strippedTitleNorm)) ||
+          (titleNorm && titleNorm.includes(strippedTitleNorm)) ||
+          (strippedTitleNorm && strippedTitleNorm.includes(nameNorm))
+        ) score = 1;
+
+        return score ? { jobNo, score } : null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score);
+
+    if (candidates.length) {
+      const top = candidates[0];
+      const second = candidates[1];
+      if (!second || second.score < top.score) {
+        return { ok: true, jobNo: Number(top.jobNo), meta: { mode: 'legacy_title_name_match' } };
+      }
+    }
+  }
+
+  // 3) Fallback to index mapping
+  if (ix != null && Number.isFinite(ix) && ix >= 1) {
+    if (sentRows.length && ix <= sentRows.length) {
+      const expected = sentRows[ix - 1];
+      const jobNo = Number(expected?.jobNo);
+      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_index_sentRows', ix } };
+    }
+
+    if (displayedJobNos.length && ix <= displayedJobNos.length) {
+      const jobNo = Number(displayedJobNos[ix - 1]);
+      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_index_displayed', ix } };
+    }
+
+    return { ok: false, reason: 'legacy_ix_out_of_range' };
+  }
+
+  return { ok: false, reason: 'unrecognized_row_id' };
+}
+
+
+if (looksLikePickerTap) {
+  const sel = await resolveJobPickSelectionExpense({
+    input: rawInput,
+    twilioMeta: twilioMeta || {},
+    pickState: {
+      displayedJobNos: Array.isArray(pickPA?.payload?.displayedJobNos) ? pickPA.payload.displayedJobNos : [],
+      sentRows: Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : []
+    }
+  });
+
+  console.info('[JOB_PICK_RESOLVED_EXPENSE]', {
+    tok: rawInput,
+    inboundTitle: twilioMeta?.ListTitle,
+    result: sel
+  });
+
+  if (!sel?.ok) {
+    // re-send picker or fallback
+    return await sendJobPickerOrFallback({ /* your existing args */ });
+  }
+
+  rawInput = `jobno_${Number(sel.jobNo)}`;
+}
 
 
       // ----------------------------
       // 2) TYPED INPUT PATH
       // ----------------------------
       if (!skipPickHandling) {
+        
         const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
 
         console.info('[JOB_PICK_RESOLVED]', {
@@ -4628,8 +4747,19 @@ if (!Number.isFinite(amountNum) || amountNum <= 0) {
 }
 
 const amountCents = Math.round(amountNum * 100);
-data.amount = amountNum.toFixed(2);     // keep canonical numeric string
+
+// ✅ canonical for storage + downstream logic
+data.amount = amountNum.toFixed(2);              // "18000.00"
 data.amount_cents = amountCents;
+
+// ✅ optional debug while validating
+console.info('[AMOUNT_PARSE]', {
+  amountRaw,
+  amtToken: amtToken || null,
+  amountNum,
+  amountCents
+});
+
 
 // Optional debug (guarded)
 if (String(process.env.DEBUG_AMOUNT_PARSE || '').toLowerCase() === 'true') {
@@ -4657,6 +4787,10 @@ console.info('[YES_FINAL_DRAFT_BEFORE_INSERT]', {
   store: data?.store || null,
   head_originalText: String(rawDraft?.originalText || rawDraft?.draftText || '').slice(0, 80)
 });
+
+// ✅ authoritative values (DB: numeric string + cents; UI: format separately)
+data.amount = amountNum.toFixed(2);      // "18000.00" (canonical)
+data.amount_cents = amountCents;         // 1800000
 
 await pg.insertTransaction({
   ownerId,
@@ -4687,6 +4821,7 @@ await pg.insertTransaction({
   source_msg_id: txSourceMsgId || null
 });
 
+
 console.info('[EXPENSE_INSERT_OK]', {
   paUserId,
   txSourceMsgId: txSourceMsgId || null,
@@ -4713,8 +4848,9 @@ try {
   }
 } catch {}
 
-// ✅ Format amount for display (use amountNum — no re-parse drift)
-const amountDisplay = `$${amountNum.toFixed(2)}`;
+// ✅ Format amount for display (with commas)
+const amountDisplay = formatMoneyDisplay(amountNum);
+
 
 const currencyDisplay = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase();
 const currencySuffix = currencyDisplay ? ` ${currencyDisplay}` : '';

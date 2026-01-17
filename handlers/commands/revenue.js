@@ -299,9 +299,11 @@ function formatMoneyDisplay(n) {
     const fmt = new Intl.NumberFormat('en-CA', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     return `$${fmt.format(n)}`;
   } catch {
-    return `$${Number(n).toFixed(2)}`;
+    const num = Number(n);
+    return Number.isFinite(num) ? `$${num.toFixed(2)}` : '$0.00';
   }
 }
+
 
 function formatDisplayDate(isoDate, tz = 'America/Toronto') {
   const s = String(isoDate || '').trim();
@@ -1789,7 +1791,7 @@ try {
         source: sourceForDb,
         description: descForDb,
 
-        amount: amountNum.toFixed(2),
+        amount: formatMoneyDisplay(amountNum),
         amount_cents: amountCents,
 
         jobName,

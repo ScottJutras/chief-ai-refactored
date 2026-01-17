@@ -381,6 +381,95 @@ function looksRevenueNl(str) {
   if (/\b(paid)\b/.test(s) && /\b(from|client|customer)\b/.test(s)) return true;
   return false;
 }
+function lc(s) {
+  return String(s || '').toLowerCase();
+}
+
+function hasAny(haystack, patterns) {
+  const t = lc(haystack);
+  return patterns.some((p) => p.test(t));
+}
+
+function strongExpenseCue(text) {
+  // "paid for" is ambiguous (could be expense OR "paid for invoice").
+  // Keep it, but don't treat it as "strong" like spent/bought/receipt.
+  const strong = [
+    /\bspent\b/i,
+    /\bbought\b/i,
+    /\bpurchase\b/i,
+    /\breceipt\b/i,
+    /\btotal\b/i,
+    /\btax\b/i
+  ];
+  return hasAny(text, strong);
+}
+
+function revenueCue(text) {
+  const cues = [
+    /\breceived\b/i,
+    /\bpaid\b/i,               // revenue: "paid $X"
+    /\bpayment\b/i,
+    /\bdeposit\b/i,
+    /\be[-\s]?transfer\b/i,
+    /\betransfer\b/i,
+    /\binterac\b/i,
+    /\binvoice\s+paid\b/i,
+    /\bcheque\b/i,
+    /\bcheck\b/i,
+    /\bwire\b/i,
+    /\btransfer\b/i
+  ];
+  return hasAny(text, cues);
+}
+
+function expenseCue(text) {
+  const cues = [
+    /\bbought\b/i,
+    /\bspent\b/i,
+    /\bpurchase\b/i,
+    /\breceipt\b/i,
+    /\btotal\b/i,
+    /\btax\b/i,
+    /\bhome\s+depot\b/i,
+    /\blumber\b/i,
+    /\btools?\b/i,
+    /\bgas\b/i,
+    /\bfuel\b/i,
+    /\bpaid\s+for\b/i
+  ];
+  return hasAny(text, cues);
+}
+
+function receivedChequeDepositCue(text) {
+  // tie-breaker: "received" + (cheque/check/deposit)
+  const t = lc(text);
+  const hasReceived = /\breceived\b/i.test(t) || /\bjust\s+got\b/i.test(t) || /\bgot\b/i.test(t);
+  const hasInstrument = /\bcheque\b/i.test(t) || /\bcheck\b/i.test(t) || /\bdeposit\b/i.test(t);
+  return !!(hasReceived && hasInstrument);
+}
+
+/**
+ * ✅ Minimal deterministic classifier for "expense vs revenue"
+ * Returns: 'revenue' | 'expense' | null
+ */
+function classifyMoneyIntent(text) {
+  const hasRev = revenueCue(text);
+  const hasExp = expenseCue(text);
+  const strongExp = strongExpenseCue(text);
+
+  // Revenue precedence:
+  // If we see revenue cues and NOT strong expense cues → revenue
+  if (hasRev && !strongExp) return 'revenue';
+
+  // If both match, prefer revenue when "received + cheque/check/deposit"
+  if (hasRev && hasExp && receivedChequeDepositCue(text)) return 'revenue';
+
+  // Otherwise, expense if expense cues are present
+  if (hasExp) return 'expense';
+
+  // Unknown
+  return null;
+}
 
 /* ---------------- Pending Actions (Option A) ---------------- */
 
@@ -1316,10 +1405,20 @@ router.post('*', async (req, res, next) => {
     /* -----------------------------------------------------------------------
  * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
  * ----------------------------------------------------------------------- */
-const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
-const revenueNl = !revenuePrefix && looksRevenueNl(text2);
-const looksRevenue = revenuePrefix || revenueNl;
 
+// Prefix commands (hard)
+const revenuePrefix = /^(?:revenue|rev|received)\b/.test(lc2);
+const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
+
+// NL heuristics (soft)
+const revenueNl = !revenuePrefix && looksRevenueNl(text2);
+const expenseNl = !expensePrefix && looksExpenseNl(text2);
+
+// ✅ Precedence rule: revenue wins on cheque/check/received/deposit unless strong expense verbs
+const looksRevenue = revenuePrefix || (revenueNl && !expensePrefix);
+const looksExpense = expensePrefix || (!looksRevenue && expenseNl); // only if not revenue
+
+// -------------------- REVENUE FAST PATH --------------------
 if (looksRevenue) {
   if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
 
@@ -1348,7 +1447,7 @@ if (looksRevenue) {
         req.ownerProfile,
         req.isOwner,
         messageSid,
-        req.body // ✅ pass Twilio payload
+        req.body
       ),
       timeoutPromise
     ]).finally(() => timeoutId && clearTimeout(timeoutId));
@@ -1359,7 +1458,7 @@ if (looksRevenue) {
           ? result
           : (result && typeof result.twiml === 'string' ? result.twiml : null);
 
-      return sendTwiml(res, twiml); // null -> <Response></Response>
+      return sendTwiml(res, twiml);
     }
     return;
   } catch (e) {
@@ -1369,10 +1468,7 @@ if (looksRevenue) {
   }
 }
 
-const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
-const expenseNl = !expensePrefix && looksExpenseNl(text2);
-const looksExpense = expensePrefix || expenseNl;
-
+// -------------------- EXPENSE FAST PATH --------------------
 if (looksExpense) {
   if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
 
@@ -1401,7 +1497,7 @@ if (looksExpense) {
         req.ownerProfile,
         req.isOwner,
         messageSid,
-        req.body // ✅ pass Twilio payload
+        req.body
       ),
       timeoutPromise
     ]).finally(() => timeoutId && clearTimeout(timeoutId));
@@ -1412,7 +1508,7 @@ if (looksExpense) {
           ? result
           : (result && typeof result.twiml === 'string' ? result.twiml : null);
 
-      return sendTwiml(res, twiml); // null -> <Response></Response>
+      return sendTwiml(res, twiml);
     }
     return;
   } catch (e) {
@@ -1421,7 +1517,6 @@ if (looksExpense) {
     return;
   }
 }
-
 
     /* -----------------------------------------------------------------------
      * (C) Other command routing (tasks / jobs / timeclock / forecast / KPIs / agent)

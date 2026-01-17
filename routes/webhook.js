@@ -514,17 +514,59 @@ async function maybeAutoYesAfterEdit({
   mergePendingTransactionState,
   messageSid
 }) {
+  // Local strict token detector (do NOT rely on fuzzy parsing)
+  const strictControlTokenForPA = (raw) => {
+    const t = String(raw || '').trim().toLowerCase();
+    if (!t) return null;
+
+    // normalize common variants
+    if (t === 'y' || t === 'yeah' || t === 'yep' || t === 'ok' || t === 'okay') return 'yes';
+
+    // exact allow-list only
+    if (t === 'yes') return 'yes';
+    if (t === 'edit') return 'edit';
+    if (t === 'cancel') return 'cancel';
+    if (t === 'resume') return 'resume';
+    if (t === 'skip') return 'skip';
+    if (t === 'change_job' || t === 'change job') return 'change_job';
+
+    return null;
+  };
+
   try {
+    // Defensive: if inbound is a strict control token, never auto-yes.
+    // (Webhooks should already skip calling us in this case, but we guard anyway.)
+    const inboundText = handlerArgs && handlerArgs.length >= 2 ? handlerArgs[1] : '';
+    const strictTok = strictControlTokenForPA(inboundText);
+    if (strictTok) {
+      return firstResult;
+    }
+
     const pending = await getPendingTransactionState(userId);
     if (!pending?._autoYesAfterEdit) return firstResult;
 
-    // ✅ Clear flag first (prevents loops even if auto-yes fails)
+    // ✅ Correlate: only auto-yes for the specific inbound message that set the flag.
+    // If sourceMsgId is set and doesn't match, do NOT clear the flag — just ignore.
+    const src = String(pending?._autoYesSourceMsgId || '').trim();
+    const mid = String(messageSid || '').trim();
+
+    if (src && mid && src !== mid) {
+      console.info('[AUTO_YES_AFTER_EDIT] skip (msg mismatch)', {
+        userId,
+        kind,
+        pendingSourceMsgId: src,
+        messageSid: mid
+      });
+      return firstResult;
+    }
+
+    // ✅ Now that we are actually going to fire, clear the flag first (prevents loops)
     await mergePendingTransactionState(userId, {
       _autoYesAfterEdit: false,
       _autoYesSourceMsgId: null
     });
 
-    const yesSid = `${messageSid || ''}:auto_yes_after_edit`.slice(0, 64);
+    const yesSid = `${mid || ''}:auto_yes_after_edit`.slice(0, 64);
 
     // Re-call the same handler with "yes"
     // signature: (from, text, profile, ownerId, ownerProfile, isOwner, messageSid, req.body)
@@ -534,17 +576,18 @@ async function maybeAutoYesAfterEdit({
 
     // ✅ also patch payload body (some logic reads req.body.Body)
     if (yesArgs[7] && typeof yesArgs[7] === 'object') {
-      yesArgs[7] = { ...yesArgs[7], Body: 'yes' };
+      yesArgs[7] = { ...yesArgs[7], Body: 'yes', ButtonPayload: 'yes', ButtonText: 'Yes' };
     }
 
     const yesResult = await handlerFn(...yesArgs);
-    console.info('[AUTO_YES_AFTER_EDIT]', { userId, kind, ok: true });
+    console.info('[AUTO_YES_AFTER_EDIT]', { userId, kind, ok: true, via: 'pending_flag' });
     return yesResult;
   } catch (e) {
     console.warn('[AUTO_YES_AFTER_EDIT] failed (ignored):', e?.message);
     return firstResult;
   }
 }
+
 
 
 /* ---------------- Raw urlencoded parser (Twilio signature expects original body) ---------------- */
@@ -919,74 +962,6 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
 }
 
 
-    // -----------------------------------------------------------------------
-    // ✅ EDIT LOOP FIX: if user is in "awaiting_edit" mode and sends a full
-    // "expense ..." or "revenue ..." line, treat it as "Yes" (auto-submit),
-    // but update the body so ingestion uses the corrected details.
-    // -----------------------------------------------------------------------
-    if (pending?.confirmDraft?.awaiting_edit) {
-      const isCorrectedExpense = /^expense\b/i.test(text);
-      const isCorrectedRevenue = /^revenue\b/i.test(text);
-
-      if (isCorrectedExpense || isCorrectedRevenue) {
-        // clear edit mode immediately (prevents re-entry / nag)
-        await mergePendingTransactionState(req.from, {
-          ...(pending || {}),
-          confirmDraft: {
-            ...(pending.confirmDraft || {}),
-            awaiting_edit: false
-          }
-        });
-
-        // Pass the corrected message through normal pipeline
-        req.body.Body = text;
-
-        // ✅ Force immediate submit after draft overwrite:
-        // we convert this inbound message to "yes" *after* the corrected text
-        // has been parsed and saved into the draft by the expense/revenue handler.
-        //
-        // The simplest cross-file way: set a one-shot flag in pending state
-        // that your expense/revenue handler can check, OR (if you already do)
-        // use confirmDraft.hasDraft + "yes" to finalize.
-        //
-        // We'll do the smallest: stash a flag that we can consume later in this router
-        // right after ingestion creates/updates confirmDraft.
-        await mergePendingTransactionState(req.from, {
-          ...(pending || {}),
-          _autoYesAfterEdit: true,
-          _autoYesSourceMsgId: messageSid || null
-        });
-
-        // Continue routing with corrected body
-        text = String(getInboundText(req.body || {}) || '').trim();
-        lc = text.toLowerCase();
-        pending = await getPendingTransactionState(req.from);
-      }
-    }
-
-        // -----------------------------------------------------------------------
-    // ✅ If user presses "edit" while a confirm draft exists, enter edit mode
-    // and prompt for corrected details. No nag.
-    // -----------------------------------------------------------------------
-    if (lc === 'edit' && pending?.confirmDraft) {
-      await mergePendingTransactionState(req.from, {
-        ...(pending || {}),
-        confirmDraft: {
-          ...(pending.confirmDraft || {}),
-          awaiting_edit: true
-        }
-      });
-
-      const kind = pending?.type || pending?.kind || pending?.confirmDraft?.type || 'expense';
-      const promptKind = kind === 'revenue' ? 'revenue' : 'expense';
-
-      return ok(
-        res,
-        `Got it — send the corrected ${promptKind} like:\n` +
-          `${promptKind} $14.21 spray foam insulation on 2025-09-27`
-      );
-    }
-
 
     /* -----------------------------------------------------------------------
      * ✅ GLOBAL HARD CANCEL
@@ -1071,27 +1046,48 @@ if (pendingExpenseFlow) {
 
     
 /* -----------------------------------------------------------------------
-     * ✅ Pending-actions router (must run early)
-     * ----------------------------------------------------------------------- */
-    const pa =
-      typeof pg.getMostRecentPendingActionForUser === 'function'
-        ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
-        : null;
+ * ✅ Pending-actions router (must run early)
+ * ----------------------------------------------------------------------- */
+const pa =
+  typeof pg.getMostRecentPendingActionForUser === 'function'
+    ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
+    : null;
 
-    const paKind = pa?.kind ? String(pa.kind).trim() : '';
-    const isExpensePA = paKind === 'confirm_expense' || paKind === 'pick_job_for_expense';
-    const isRevenuePA = paKind === 'confirm_revenue' || paKind === 'pick_job_for_revenue';
+const paKind = pa?.kind ? String(pa.kind).trim() : '';
+const isExpensePA = paKind === 'confirm_expense' || paKind === 'pick_job_for_expense';
+const isRevenuePA = paKind === 'confirm_revenue' || paKind === 'pick_job_for_revenue';
 
-    if (isExpensePA) {
+// ✅ Strict decision/control token check (mirror your strictDecisionToken intent)
+// NOTE: keep this local + simple; do NOT add fuzzy parsing.
+const strictControlTokenForPA = (raw) => {
+  const t = String(raw || '').trim().toLowerCase();
+  if (!t) return null;
+
+  // normalize common variants
+  if (t === 'y' || t === 'yeah' || t === 'yep' || t === 'ok' || t === 'okay') return 'yes';
+
+  // exact allow-list only
+  if (t === 'yes') return 'yes';
+  if (t === 'edit') return 'edit';
+  if (t === 'cancel') return 'cancel';
+  if (t === 'resume') return 'resume';
+  if (t === 'skip') return 'skip';
+  if (t === 'change_job' || t === 'change job') return 'change_job';
+
+  return null;
+};
+
+if (isExpensePA) {
   try {
     const expenseMod = require('../handlers/commands/expense');
-    const expenseHandler = expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
+    const expenseHandler =
+      expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
 
     if (!expenseHandler) {
       throw new Error('expense handler export missing (handleExpense)');
     }
 
-        const handlerArgs = [
+    const handlerArgs = [
       req.from,
       text2,
       req.userProfile,
@@ -1102,13 +1098,29 @@ if (pendingExpenseFlow) {
       req.body
     ];
 
+    // Always run the handler first (it owns state transitions)
     const first = await expenseHandler(...handlerArgs);
-console.info('[AUTO_YES_CHECK]', {
-  from: req.from,
-  kind: 'expense',
-  messageSid,
-  head: String(text2 || '').slice(0, 20)
-});
+
+    const strictTok = strictControlTokenForPA(text2);
+
+    console.info('[AUTO_YES_CHECK]', {
+      from: req.from,
+      kind: 'expense',
+      messageSid,
+      strictTok: strictTok || null,
+      head: String(text2 || '').slice(0, 20)
+    });
+
+    // ✅ CRITICAL: Never attempt auto-yes on strict control tokens
+    // Auto-yes is only for the free-text edit payload message.
+    if (strictTok) {
+      if (!res.headersSent) {
+        if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+        if (typeof first === 'string' && first) return sendTwiml(res, first);
+        return ok(res);
+      }
+      return;
+    }
 
     const tw = await maybeAutoYesAfterEdit({
       userId: req.from,
@@ -1121,10 +1133,11 @@ console.info('[AUTO_YES_CHECK]', {
       messageSid
     });
 
-
     if (!res.headersSent) {
       if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
       if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+      if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+      if (typeof first === 'string' && first) return sendTwiml(res, first);
       return ok(res); // empty
     }
     return;
@@ -1133,11 +1146,11 @@ console.info('[AUTO_YES_CHECK]', {
   }
 }
 
-
 if (isRevenuePA) {
   try {
     const revMod = require('../handlers/commands/revenue');
-    const revenueHandler = revMod && typeof revMod.handleRevenue === 'function' ? revMod.handleRevenue : null;
+    const revenueHandler =
+      revMod && typeof revMod.handleRevenue === 'function' ? revMod.handleRevenue : null;
 
     if (!revenueHandler) {
       throw new Error('revenue handler export missing (handleRevenue)');
@@ -1156,6 +1169,26 @@ if (isRevenuePA) {
 
     const first = await revenueHandler(...handlerArgs);
 
+    const strictTok = strictControlTokenForPA(text2);
+
+    console.info('[AUTO_YES_CHECK]', {
+      from: req.from,
+      kind: 'revenue',
+      messageSid,
+      strictTok: strictTok || null,
+      head: String(text2 || '').slice(0, 20)
+    });
+
+    // ✅ CRITICAL: Never attempt auto-yes on strict control tokens
+    if (strictTok) {
+      if (!res.headersSent) {
+        if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+        if (typeof first === 'string' && first) return sendTwiml(res, first);
+        return ok(res);
+      }
+      return;
+    }
+
     const tw = await maybeAutoYesAfterEdit({
       userId: req.from,
       kind: 'revenue',
@@ -1170,13 +1203,16 @@ if (isRevenuePA) {
     if (!res.headersSent) {
       if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
       if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-      return ok(res); // empty
+      if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+      if (typeof first === 'string' && first) return sendTwiml(res, first);
+      return ok(res);
     }
     return;
   } catch (e) {
     console.warn('[WEBHOOK] revenue PA router failed (ignored):', e?.message);
   }
 }
+
 
 
     /* -----------------------------------------------------------------------

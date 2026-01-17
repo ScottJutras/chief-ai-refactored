@@ -3909,6 +3909,7 @@ let confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).c
 // STRICT decision token (ONLY yes/edit/cancel/resume/skip/change_job)
 const strictTok = strictDecisionToken(rawInboundText);
 
+// for logs
 console.info('[CONFIRM_STATE]', {
   paUserId,
   paKey,
@@ -3917,7 +3918,7 @@ console.info('[CONFIRM_STATE]', {
   needsReparse: !!confirmPA?.payload?.draft?.needsReparse,
   strictTok,
   head: String(rawInboundText || '').trim().slice(0, 80),
-  hasPickPA: false // (optional; you can fill this later if needed)
+  hasPickPA: false
 });
 
 let bypassConfirmToAllowNewIntake = false;
@@ -3939,8 +3940,7 @@ try {
   const draftE = confirmPA?.payload?.draft || null;
 
   // "recent edit" latch (works even if awaiting_edit flag is lost)
-  const editStartedAt =
-    Number(draftE?.edit_started_at || draftE?.editStartedAt || 0) || 0;
+  const editStartedAt = Number(draftE?.edit_started_at || draftE?.editStartedAt || 0) || 0;
 
   const EDIT_WINDOW_MS = 10 * 60 * 1000; // 10 min
   const editRecentlyStarted =
@@ -3996,7 +3996,6 @@ try {
       const s = String(t || '').trim();
       if (!s) return null;
 
-      // match last "job ..." segment
       const m = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
       if (!m?.[1]) return null;
 
@@ -4051,6 +4050,22 @@ try {
     // refresh in-memory (avoid stale confirmPA shadow bugs)
     confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
 
+    // ✅ After applying edit payload & saving patched draft:
+    // set one-shot auto-yes so webhook router re-calls handler with "yes"
+    try {
+      const editMsgSid =
+        String(sourceMsgId || '').trim() ||
+        String(inboundTwilioMeta?.MessageSid || '').trim() ||
+        null;
+
+      await mergePendingTransactionState(paUserId, {
+        _autoYesAfterEdit: true,
+        _autoYesSourceMsgId: editMsgSid
+      });
+    } catch (e) {
+      console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
+    }
+
     // ✅ MUST send interactive confirm, NEVER nag
     try {
       return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
@@ -4076,7 +4091,6 @@ try {
   }
 } catch (e) {
   console.warn('[AWAITING_EDIT_SAFETYNET] failed (ignored):', e?.message);
-  // Worst-case: re-prompt, never nag
   if (confirmPA?.payload?.draft?.awaiting_edit) {
     return out(
       twimlText(
@@ -4092,6 +4106,9 @@ try {
   }
 }
 
+// ---------------------------------------------------------
+// ✅ Confirm flow (nag/bypass/decision tokens)
+// ---------------------------------------------------------
 if (confirmPA?.payload?.draft) {
   // Owner-only gate
   if (!isOwner) {
@@ -4257,6 +4274,14 @@ if (confirmPA?.payload?.draft) {
 
     // If we decided to bypass to allow new intake, fall through.
     if (!bypassConfirmToAllowNewIntake) {
+      // Common safe flow id builder (avoids stableMsgId scope surprises)
+      const confirmFlowIdSafe =
+        String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+        String(confirmPA?.payload?.draft?.txSourceMsgId || confirmPA?.payload?.draft?.sourceMsgId || '').trim() ||
+        String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+        String(sourceMsgId || '').trim() ||
+        `${paUserId}:${Date.now()}`;
+
       // 🔁 Change Job (keep confirm PA)
       if (strictTok === 'change_job') {
         const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
@@ -4283,16 +4308,11 @@ if (confirmPA?.payload?.draft) {
           console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
         }
 
-        const confirmFlowId =
-          String(confirmPA?.payload?.sourceMsgId || '').trim() ||
-          String(stableMsgId || '').trim() ||
-          `${paUserId}:${Date.now()}`;
-
         await sendJobPickList({
           fromPhone,
           ownerId,
           userProfile,
-          confirmFlowId,
+          confirmFlowId: confirmFlowIdSafe,
           jobOptions: jobs,
           paUserId,
           pickUserId: canonicalUserKey,
@@ -4319,14 +4339,7 @@ if (confirmPA?.payload?.draft) {
                 awaiting_edit: true,
                 edit_started_at: Date.now(),
                 editStartedAt: Date.now(),
-                edit_flow_id:
-                  String(
-                    confirmPA?.payload?.sourceMsgId ||
-                      confirmPA?.payload?.draft?.sourceMsgId ||
-                      confirmPA?.payload?.draft?.txSourceMsgId ||
-                      stableMsgId ||
-                      ''
-                  ).trim() || null
+                edit_flow_id: confirmFlowIdSafe
               }
             },
             ttlSeconds: PA_TTL_SEC
@@ -4372,6 +4385,22 @@ if (confirmPA?.payload?.draft) {
       // ✅ YES (HARDENED + DOES INSERT + MUST RETURN)
       // --------------------------------------------
       if (strictTok === 'yes') {
+        // ✅ If user hits "yes" while we're awaiting_edit, do NOT submit.
+        // Prevents accidentally submitting the pre-edit draft.
+        if (confirmPA?.payload?.draft?.awaiting_edit) {
+          return out(
+            twimlText(
+              [
+                '✏️ I’m still waiting for your edited expense details in ONE message.',
+                'Example:',
+                'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+                'Reply "cancel" to discard.'
+              ].join('\n')
+            ),
+            false
+          );
+        }
+
         try {
           // Always operate on freshest confirm PA (avoid stale confirmPA var)
           let confirmPAFresh = null;
@@ -4414,10 +4443,11 @@ if (confirmPA?.payload?.draft) {
             );
           }
 
-          // Canonical txSourceMsgId (the confirm flow ID)
+          // ✅ Canonical txSourceMsgId — NO stableMsgId dependency
           const txSourceMsgId =
             String(confirmPAFresh?.payload?.sourceMsgId || '').trim() ||
-            String(stableMsgId || '').trim() ||
+            String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+            String(sourceMsgId || '').trim() ||
             null;
 
           // Ensure media_source_msg_id always "userKey:msgId"
@@ -4451,7 +4481,7 @@ if (confirmPA?.payload?.draft) {
 
           let data = normalizeExpenseData(rawDraft, userProfile, sourceText);
 
-          // ✅ Receipt date fallback (prevents "today" when OCR had MM/DD/YY)
+          // ✅ Receipt date fallback
           if (!data.date) {
             const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
             const d = extractReceiptDateYYYYMMDD(sourceText, tz0);
@@ -4472,7 +4502,10 @@ if (confirmPA?.payload?.draft) {
             );
           }
           if (!dateStr) {
-            return out(twimlText(`I’m missing the date. Reply like: "The transaction date is 01/05/2026".`), false);
+            return out(
+              twimlText(`I’m missing the date. Reply like: "The transaction date is 01/05/2026".`),
+              false
+            );
           }
 
           // ✅ Job resolution
@@ -4540,7 +4573,6 @@ if (confirmPA?.payload?.draft) {
           }
 
           const amountCents = Math.round(amountNum * 100);
-
           data.amount = amountNum.toFixed(2);
           data.amount_cents = amountCents;
 
@@ -4615,7 +4647,7 @@ if (confirmPA?.payload?.draft) {
             }
           } catch {}
 
-          // ✅ Format amount for display (always show $ and 2 decimals when numeric)
+          // ✅ Format amount for display
           const amountNumForMsg = Number(String(data?.amount ?? '').replace(/[^0-9.-]/g, ''));
           const amountDisplay =
             Number.isFinite(amountNumForMsg) && amountNumForMsg > 0
@@ -4665,9 +4697,11 @@ if (confirmPA?.payload?.draft) {
         ),
         false
       );
-    }
-  }
-}
+    } // ✅ closes: if (!bypassConfirmToAllowNewIntake) { ... inner decision handling }
+  } // ✅ closes: if (!bypassConfirmToAllowNewIntake) { ... outer confirm-flow body }
+} // ✅ closes: if (confirmPA?.payload?.draft) { ... }
+
+
 
 /* ---- 3) New expense parse (deterministic first) ---- */
 

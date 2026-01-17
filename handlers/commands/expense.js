@@ -3906,8 +3906,23 @@ if (looksLikePickerTap) {
 // ✅ reads (always use paKey for CONFIRM in this scope)
 let confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
 
-// STRICT decision token (ONLY yes/edit/cancel/resume/skip/change_job)
-const strictTok = strictDecisionToken(rawInboundText);
+// ✅ STRICT decision token = EXACT allow-list only (no ok/yeah/yep normalization)
+// ONLY yes/edit/cancel/resume/skip/change_job
+const strictDecisionTokenExact = (raw) => {
+  const t = String(raw || '').trim().toLowerCase();
+  if (!t) return null;
+
+  if (t === 'yes') return 'yes';
+  if (t === 'edit') return 'edit';
+  if (t === 'cancel') return 'cancel';
+  if (t === 'resume') return 'resume';
+  if (t === 'skip') return 'skip';
+  if (t === 'change_job' || t === 'change job') return 'change_job';
+
+  return null;
+};
+
+const strictTok = strictDecisionTokenExact(rawInboundText);
 
 // for logs
 console.info('[CONFIRM_STATE]', {
@@ -3930,10 +3945,11 @@ let bypassConfirmToAllowNewIntake = false;
 // Runs BEFORE any nag/bypass logic.
 // ---------------------------------------------------------
 try {
-  // ✅ Only refresh if we are actually in confirm-flow (draft exists)
+  // ✅ Refresh ONLY once, and only if we think confirm exists
   if (confirmPA?.payload?.draft) {
     try {
-      confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
+      const fresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+      if (fresh) confirmPA = fresh;
     } catch {}
   }
 
@@ -3943,10 +3959,13 @@ try {
   const editStartedAt = Number(draftE?.edit_started_at || draftE?.editStartedAt || 0) || 0;
 
   const EDIT_WINDOW_MS = 10 * 60 * 1000; // 10 min
+  const ageMs = editStartedAt ? Date.now() - editStartedAt : null;
+
   const editRecentlyStarted =
     !!editStartedAt &&
-    Date.now() - editStartedAt >= 0 &&
-    Date.now() - editStartedAt <= EDIT_WINDOW_MS;
+    typeof ageMs === 'number' &&
+    ageMs >= 0 &&
+    ageMs <= EDIT_WINDOW_MS;
 
   const isControl =
     strictTok === 'yes' ||
@@ -3965,6 +3984,7 @@ try {
     awaiting_edit: !!draftE?.awaiting_edit,
     editStartedAt: editStartedAt || null,
     editRecentlyStarted,
+    editAgeMs: ageMs,
     isControlToken: isControl,
     willConsumeAsEditPayload: shouldConsumeAsEditPayload,
     head: String(rawInboundText || '').trim().slice(0, 80)
@@ -4047,8 +4067,11 @@ try {
       ttlSeconds: PA_TTL_SEC
     });
 
-    // refresh in-memory (avoid stale confirmPA shadow bugs)
-    confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
+    // ✅ refresh in-memory (avoid stale confirmPA shadow bugs)
+    try {
+      const fresh2 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+      if (fresh2) confirmPA = fresh2;
+    } catch {}
 
     // ✅ After applying edit payload & saving patched draft:
     // set one-shot auto-yes so webhook router re-calls handler with "yes"
@@ -4386,7 +4409,6 @@ if (confirmPA?.payload?.draft) {
       // --------------------------------------------
       if (strictTok === 'yes') {
         // ✅ If user hits "yes" while we're awaiting_edit, do NOT submit.
-        // Prevents accidentally submitting the pre-edit draft.
         if (confirmPA?.payload?.draft?.awaiting_edit) {
           return out(
             twimlText(
@@ -4401,6 +4423,7 @@ if (confirmPA?.payload?.draft) {
           );
         }
 
+        // ✅ FULL YES HANDLER (this was orphaned before; keep it INSIDE this block)
         try {
           // Always operate on freshest confirm PA (avoid stale confirmPA var)
           let confirmPAFresh = null;
@@ -4679,9 +4702,9 @@ if (confirmPA?.payload?.draft) {
             false
           );
         }
-      }
+      } // ✅ closes if (strictTok === 'yes')
 
-      // Default while confirm pending
+      // Default while confirm pending (only reached if no decision token matched)
       return out(
         twimlText(
           [

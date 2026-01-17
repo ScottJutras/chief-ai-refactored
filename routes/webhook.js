@@ -885,83 +885,81 @@ router.post('*', async (req, res, next) => {
 
     let pending = await getPendingTransactionState(req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
-const crypto = require('crypto');
+    const crypto = require('crypto');
 
-let text = String(getInboundText(req.body || {}) || '').trim();
-let lc = text.toLowerCase();
+    let text = String(getInboundText(req.body || {}) || '').trim();
+    let lc = text.toLowerCase();
 
-// ✅ Compute messageSid EARLY so resume can use it safely
-const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-const messageSid =
-  rawSid ||
-  crypto
-    .createHash('sha256')
-    .update(`${req.from || ''}|${text}`)
-    .digest('hex')
-    .slice(0, 32);
+    // ✅ Compute messageSid EARLY so resume can use it safely
+    const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
+    const messageSid =
+      rawSid ||
+      crypto
+        .createHash('sha256')
+        .update(`${req.from || ''}|${text}`)
+        .digest('hex')
+        .slice(0, 32);
 
-// -----------------------------------------------------------------------
-// "resume" => re-send the pending confirm card if we have a confirm pending-action
-// MUST run early (before nudge / PA router / job picker / fast paths / agent)
-// -----------------------------------------------------------------------
-if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
-  try {
-    const pa =
-      typeof pg.getMostRecentPendingActionForUser === 'function'
-        ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
-        : null;
+    // -----------------------------------------------------------------------
+    // "resume" => re-send the pending confirm card if we have a confirm pending-action
+    // MUST run early (before nudge / PA router / job picker / fast paths / agent)
+    // -----------------------------------------------------------------------
+    if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
+      try {
+        const pa =
+          typeof pg.getMostRecentPendingActionForUser === 'function'
+            ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
+            : null;
 
-    const kind = String(pa?.kind || '').trim();
+        const kind = String(pa?.kind || '').trim();
 
-    if (kind === 'confirm_expense' || kind === 'pick_job_for_expense') {
-      const { handleExpense } = require('../handlers/commands/expense');
+        if (kind === 'confirm_expense' || kind === 'pick_job_for_expense') {
+          const { handleExpense } = require('../handlers/commands/expense');
 
-      const result = await handleExpense(
-        req.from,
-        'resume', // ✅ correct intent: resend confirm
-        req.userProfile,
-        req.ownerId,
-        req.ownerProfile,
-        req.isOwner,
-        messageSid,
-        req.body
-      );
+          const result = await handleExpense(
+            req.from,
+            'resume',
+            req.userProfile,
+            req.ownerId,
+            req.ownerProfile,
+            req.isOwner,
+            messageSid,
+            req.body
+          );
 
-      if (!res.headersSent) {
-        const tw = typeof result === 'string' ? result : (result?.twiml || null);
-        return sendTwiml(res, tw);
+          if (!res.headersSent) {
+            const tw = typeof result === 'string' ? result : (result?.twiml || null);
+            return sendTwiml(res, tw);
+          }
+          return;
+        }
+
+        if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
+          const { handleRevenue } = require('../handlers/commands/revenue');
+
+          const result = await handleRevenue(
+            req.from,
+            'resume',
+            req.userProfile,
+            req.ownerId,
+            req.ownerProfile,
+            req.isOwner,
+            messageSid,
+            req.body
+          );
+
+          if (!res.headersSent) {
+            const tw = typeof result === 'string' ? result : (result?.twiml || null);
+            return sendTwiml(res, tw);
+          }
+          return;
+        }
+      } catch (e) {
+        console.warn('[WEBHOOK] resume pending failed (ignored):', e?.message);
       }
-      return;
+
+      return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
     }
-
-    if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
-      const { handleRevenue } = require('../handlers/commands/revenue');
-
-      const result = await handleRevenue(
-        req.from,
-        'resume', // ✅ correct intent
-        req.userProfile,
-        req.ownerId,
-        req.ownerProfile,
-        req.isOwner,
-        messageSid,
-        req.body
-      );
-
-      if (!res.headersSent) {
-        const tw = typeof result === 'string' ? result : (result?.twiml || null);
-        return sendTwiml(res, tw);
-      }
-      return;
-    }
-  } catch (e) {
-    console.warn('[WEBHOOK] resume pending failed (ignored):', e?.message);
-  }
-
-  return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
-}
-
-
 
     /* -----------------------------------------------------------------------
      * ✅ GLOBAL HARD CANCEL
@@ -971,50 +969,71 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
       return ok(res, '❌ Cancelled. You’re cleared.');
     }
 
-    // ✅ Option A: check pending_actions FIRST (so job picker tokens go to expense.js, not job.js)
+    // -----------------------------------------------------------------------
+    // ✅ Pending Action: fetch ONCE early and reuse everywhere
+    // This prevents legacy nudge from swallowing edit payloads when hasExpensePA() misses.
+    // -----------------------------------------------------------------------
+    const mostRecentPA =
+      typeof pg.getMostRecentPendingActionForUser === 'function'
+        ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
+        : null;
+
+    const mostRecentPAKind = mostRecentPA?.kind ? String(mostRecentPA.kind).trim() : '';
+    const mostRecentIsExpensePA = mostRecentPAKind === 'confirm_expense' || mostRecentPAKind === 'pick_job_for_expense';
+    const mostRecentIsRevenuePA = mostRecentPAKind === 'confirm_revenue' || mostRecentPAKind === 'pick_job_for_revenue';
+
+    // ✅ Keep your Option A helper (but don’t trust it as sole source of truth)
     const expensePA = await hasExpensePA(req.ownerId, req.from);
-    const hasExpensePendingActions = !!expensePA.hasAny;
-/* ------------------------------------------------------------
- * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
- * ------------------------------------------------------------ */
+    const hasExpensePendingActions = !!expensePA?.hasAny || mostRecentIsExpensePA;
 
-const pendingRevenueFlow =
-  !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
+    /* ------------------------------------------------------------
+     * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
+     * ------------------------------------------------------------ */
 
-const pendingExpenseFlowLegacy =
-  !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
+    const pendingRevenueFlow =
+      !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
 
-const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
+    const pendingExpenseFlowLegacy =
+      !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
 
-// ✅ If user said "skip" in expense.js, we allow new commands/messages to proceed without nagging.
-const allowNewWhilePendingExpense = !!pending?.allow_new_while_pending;
+    const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
 
-const allowJobPickerThrough =
-  (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
+    // ✅ If user said "skip" in expense.js, we allow new commands/messages to proceed without nagging.
+    const allowNewWhilePendingExpense = !!pending?.allow_new_while_pending;
 
-if (pendingRevenueFlow) {
-  if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
+    const allowJobPickerThrough =
+      (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
 
-  if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
-    const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'revenue' });
-    if (msg) return ok(res, msg);
-    // msg null => mid-edit; do NOT nag; fall through
-  }
-}
+    if (pendingRevenueFlow) {
+      if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
 
-if (pendingExpenseFlow) {
-  if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
-
-  // ✅ Key change: if allowNewWhilePendingExpense, do NOT nag/block — let message proceed
-  if (!allowNewWhilePendingExpense) {
-    if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
-      const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
-      if (msg) return ok(res, msg);
-      // msg null => mid-edit; do NOT nag; fall through
+      if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+        const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'revenue' });
+        if (msg) return ok(res, msg);
+        // msg null => mid-edit; do NOT nag; fall through
+      }
     }
-  }
-}
 
+    // ✅ EXPENSE NUDGE GATE — hardened: NEVER block when an expense PA exists
+    if (pendingExpenseFlow) {
+      if (!hasExpensePendingActions) {
+        if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
+
+        if (!allowNewWhilePendingExpense) {
+          if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+            const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
+            if (msg) return ok(res, msg);
+          }
+        }
+      }
+
+      console.info('[WEBHOOK] after_nudge_gate', {
+        hasExpensePendingActions,
+        pendingExpenseFlow,
+        lc: String(lc || '').slice(0, 30),
+        mostRecentPAKind: mostRecentPAKind || null
+      });
+    }
 
     /* -----------------------------------------------------------------------
      * Media follow-up: if prior step set pendingMedia and this is text-only
@@ -1044,177 +1063,164 @@ if (pendingExpenseFlow) {
     const lc2 = text2.toLowerCase();
     const isPickerToken = looksLikeJobPickerReplyToken(text2);
 
+    /* -----------------------------------------------------------------------
+     * ✅ Pending-actions router (must run early)
+     * Uses mostRecentPA fetched earlier (single source here)
+     * ----------------------------------------------------------------------- */
+
+    const pa = mostRecentPA;
+    const paKind = pa?.kind ? String(pa.kind).trim() : '';
+
+    const isExpensePA = paKind === 'confirm_expense' || paKind === 'pick_job_for_expense';
+    const isRevenuePA = paKind === 'confirm_revenue' || paKind === 'pick_job_for_revenue';
+
+    // ✅ STRICT TOKENS = EXACT MATCH ONLY (no ok/yeah/yep normalization)
+    const strictControlTokenForPA = (raw) => {
+      const t = String(raw || '').trim().toLowerCase();
+      if (!t) return null;
+
+      if (t === 'yes') return 'yes';
+      if (t === 'edit') return 'edit';
+      if (t === 'cancel') return 'cancel';
+      if (t === 'resume') return 'resume';
+      if (t === 'skip') return 'skip';
+      if (t === 'change_job' || t === 'change job') return 'change_job';
+
+      return null;
+    };
+
+    if (isExpensePA) {
+      try {
+        const expenseMod = require('../handlers/commands/expense');
+        const expenseHandler =
+          expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
+
+        if (!expenseHandler) throw new Error('expense handler export missing (handleExpense)');
+
+        const handlerArgs = [
+          req.from,
+          text2,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid,
+          req.body
+        ];
+
+        // Always run the handler first (it owns state transitions)
+        const first = await expenseHandler(...handlerArgs);
+
+        const strictTok = strictControlTokenForPA(text2);
+
+        console.info('[AUTO_YES_CHECK]', {
+          from: req.from,
+          kind: 'expense',
+          messageSid,
+          strictTok: strictTok || null,
+          head: String(text2 || '').slice(0, 20)
+        });
+
+        // ✅ Never auto-yes on strict control tokens
+        if (strictTok) {
+          if (!res.headersSent) {
+            if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+            if (typeof first === 'string' && first) return sendTwiml(res, first);
+            return ok(res);
+          }
+          return;
+        }
+
+        const tw = await maybeAutoYesAfterEdit({
+          userId: req.from,
+          kind: 'expense',
+          handlerFn: expenseHandler,
+          handlerArgs,
+          firstResult: first,
+          getPendingTransactionState,
+          mergePendingTransactionState,
+          messageSid
+        });
+
+        if (!res.headersSent) {
+          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+          if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+          if (typeof first === 'string' && first) return sendTwiml(res, first);
+          return ok(res);
+        }
+        return;
+      } catch (e) {
+        console.warn('[WEBHOOK] expense PA router failed (ignored):', e?.message);
+      }
+    }
+
+    if (isRevenuePA) {
+      try {
+        const revMod = require('../handlers/commands/revenue');
+        const revenueHandler =
+          revMod && typeof revMod.handleRevenue === 'function' ? revMod.handleRevenue : null;
+
+        if (!revenueHandler) throw new Error('revenue handler export missing (handleRevenue)');
+
+        const handlerArgs = [
+          req.from,
+          text2,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid,
+          req.body
+        ];
+
+        const first = await revenueHandler(...handlerArgs);
+
+        const strictTok = strictControlTokenForPA(text2);
+
+        console.info('[AUTO_YES_CHECK]', {
+          from: req.from,
+          kind: 'revenue',
+          messageSid,
+          strictTok: strictTok || null,
+          head: String(text2 || '').slice(0, 20)
+        });
+
+        // ✅ Never auto-yes on strict control tokens
+        if (strictTok) {
+          if (!res.headersSent) {
+            if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+            if (typeof first === 'string' && first) return sendTwiml(res, first);
+            return ok(res);
+          }
+          return;
+        }
+
+        const tw = await maybeAutoYesAfterEdit({
+          userId: req.from,
+          kind: 'revenue',
+          handlerFn: revenueHandler,
+          handlerArgs,
+          firstResult: first,
+          getPendingTransactionState,
+          mergePendingTransactionState,
+          messageSid
+        });
+
+        if (!res.headersSent) {
+          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
+          if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+          if (typeof first === 'string' && first) return sendTwiml(res, first);
+          return ok(res);
+        }
+        return;
+      } catch (e) {
+        console.warn('[WEBHOOK] revenue PA router failed (ignored):', e?.message);
+      }
+    }
+
     
-/* -----------------------------------------------------------------------
- * ✅ Pending-actions router (must run early)
- * ----------------------------------------------------------------------- */
-const pa =
-  typeof pg.getMostRecentPendingActionForUser === 'function'
-    ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
-    : null;
-
-const paKind = pa?.kind ? String(pa.kind).trim() : '';
-const isExpensePA = paKind === 'confirm_expense' || paKind === 'pick_job_for_expense';
-const isRevenuePA = paKind === 'confirm_revenue' || paKind === 'pick_job_for_revenue';
-
-// ✅ Strict decision/control token check (mirror your strictDecisionToken intent)
-// NOTE: keep this local + simple; do NOT add fuzzy parsing.
-const strictControlTokenForPA = (raw) => {
-  const t = String(raw || '').trim().toLowerCase();
-  if (!t) return null;
-
-  // normalize common variants
-  if (t === 'y' || t === 'yeah' || t === 'yep' || t === 'ok' || t === 'okay') return 'yes';
-
-  // exact allow-list only
-  if (t === 'yes') return 'yes';
-  if (t === 'edit') return 'edit';
-  if (t === 'cancel') return 'cancel';
-  if (t === 'resume') return 'resume';
-  if (t === 'skip') return 'skip';
-  if (t === 'change_job' || t === 'change job') return 'change_job';
-
-  return null;
-};
-
-if (isExpensePA) {
-  try {
-    const expenseMod = require('../handlers/commands/expense');
-    const expenseHandler =
-      expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
-
-    if (!expenseHandler) {
-      throw new Error('expense handler export missing (handleExpense)');
-    }
-
-    const handlerArgs = [
-      req.from,
-      text2,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid,
-      req.body
-    ];
-
-    // Always run the handler first (it owns state transitions)
-    const first = await expenseHandler(...handlerArgs);
-
-    const strictTok = strictControlTokenForPA(text2);
-
-    console.info('[AUTO_YES_CHECK]', {
-      from: req.from,
-      kind: 'expense',
-      messageSid,
-      strictTok: strictTok || null,
-      head: String(text2 || '').slice(0, 20)
-    });
-
-    // ✅ CRITICAL: Never attempt auto-yes on strict control tokens
-    // Auto-yes is only for the free-text edit payload message.
-    if (strictTok) {
-      if (!res.headersSent) {
-        if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
-        if (typeof first === 'string' && first) return sendTwiml(res, first);
-        return ok(res);
-      }
-      return;
-    }
-
-    const tw = await maybeAutoYesAfterEdit({
-      userId: req.from,
-      kind: 'expense',
-      handlerFn: expenseHandler,
-      handlerArgs,
-      firstResult: first,
-      getPendingTransactionState,
-      mergePendingTransactionState,
-      messageSid
-    });
-
-    if (!res.headersSent) {
-      if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-      if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-      if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
-      if (typeof first === 'string' && first) return sendTwiml(res, first);
-      return ok(res); // empty
-    }
-    return;
-  } catch (e) {
-    console.warn('[WEBHOOK] expense PA router failed (ignored):', e?.message);
-  }
-}
-
-if (isRevenuePA) {
-  try {
-    const revMod = require('../handlers/commands/revenue');
-    const revenueHandler =
-      revMod && typeof revMod.handleRevenue === 'function' ? revMod.handleRevenue : null;
-
-    if (!revenueHandler) {
-      throw new Error('revenue handler export missing (handleRevenue)');
-    }
-
-    const handlerArgs = [
-      req.from,
-      text2,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid,
-      req.body
-    ];
-
-    const first = await revenueHandler(...handlerArgs);
-
-    const strictTok = strictControlTokenForPA(text2);
-
-    console.info('[AUTO_YES_CHECK]', {
-      from: req.from,
-      kind: 'revenue',
-      messageSid,
-      strictTok: strictTok || null,
-      head: String(text2 || '').slice(0, 20)
-    });
-
-    // ✅ CRITICAL: Never attempt auto-yes on strict control tokens
-    if (strictTok) {
-      if (!res.headersSent) {
-        if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
-        if (typeof first === 'string' && first) return sendTwiml(res, first);
-        return ok(res);
-      }
-      return;
-    }
-
-    const tw = await maybeAutoYesAfterEdit({
-      userId: req.from,
-      kind: 'revenue',
-      handlerFn: revenueHandler,
-      handlerArgs,
-      firstResult: first,
-      getPendingTransactionState,
-      mergePendingTransactionState,
-      messageSid
-    });
-
-    if (!res.headersSent) {
-      if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-      if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-      if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
-      if (typeof first === 'string' && first) return sendTwiml(res, first);
-      return ok(res);
-    }
-    return;
-  } catch (e) {
-    console.warn('[WEBHOOK] revenue PA router failed (ignored):', e?.message);
-  }
-}
-
-
-
     /* -----------------------------------------------------------------------
      * (A0) ACTIVE JOB PICKER FLOW — only if awaitingActiveJobPick OR explicit intent
      * AND NOT blocked by expense pending_actions.

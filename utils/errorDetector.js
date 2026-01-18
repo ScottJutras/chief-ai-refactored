@@ -1,23 +1,7 @@
 // utils/errorDetector.js
 const storeList = require('./storeList');
+const { todayInTimeZone } = require('./dateUtils');
 
-/**
- * Timezone-aware "today" (YYYY-MM-DD).
- * If tz invalid or Intl fails, falls back to server date.
- */
-function todayInTimeZone(tz) {
-  try {
-    const dtf = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    });
-    return dtf.format(new Date());
-  } catch {
-    return new Date().toISOString().split('T')[0];
-  }
-}
 
 function toMoneyNumber(val) {
   if (val == null) return null;

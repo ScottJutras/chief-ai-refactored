@@ -3,6 +3,7 @@
 // IMPORTANT: Does NOT intercept expense/revenue confirm flows handled by command handlers.
 
 const pg = require('../services/postgres');
+const { normalizeJobNameCandidate } = require('./jobNameUtils'); // path may vary
 
 function xmlMsg(s = '') {
   const esc = String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

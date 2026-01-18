@@ -20,6 +20,8 @@ const handleInputWithAI = ai.handleInputWithAI;
 const parseRevenueMessage = ai.parseRevenueMessage;
 
 const { sendWhatsAppInteractiveList } = require('../../services/twilio');
+const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
+
 
 // ---- CIL validator (fail-open) ----
 const cilMod = require('../../cil');
@@ -405,9 +407,9 @@ function normalizeRevenueData(data, tz) {
   d.source = src || 'Unknown';
 
   if (d.jobName != null) {
-    const j = String(d.jobName).trim();
-    d.jobName = j || null;
-  }
+  d.jobName = normalizeJobNameCandidate(d.jobName);
+}
+
 
   if (d.suggestedCategory != null) {
     const c = String(d.suggestedCategory).trim();
@@ -1255,8 +1257,9 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           draft.job_no = null;
           draft.job_id = null;
         } else if (resolved.kind === 'job' && resolved.job?.job_no != null) {
-          const jobName = resolved.job?.name ? String(resolved.job.name).trim() : null;
+          const jobName = normalizeJobNameCandidate(resolved.job?.name);
           draft.jobName = jobName || draft.jobName || null;
+
           draft.jobSource = 'picked';
           draft.job_no = Number(resolved.job.job_no);
           const jobId = resolved.job?.id && looksLikeUuid(resolved.job.id) ? String(resolved.job.id) : null;
@@ -1677,7 +1680,7 @@ try {
       }
 
       // ✅ Job resolution (job choice must win)
-      let jobName = (data.jobName && String(data.jobName).trim()) || null;
+      let jobName = normalizeJobNameCandidate(data.jobName) || null;
       let jobSource = jobName ? (data.jobSource || rawDraft.jobSource || 'typed') : null;
 
       if (jobName && looksLikeOverhead(jobName)) {
@@ -1913,7 +1916,7 @@ let category = (await withTimeout(Promise.resolve(categorizeEntry('revenue', dat
 if (category && String(category).trim()) category = String(category).trim();
 else category = null;
 
-let jobName = (data.jobName && String(data.jobName).trim()) || null;
+let jobName = normalizeJobNameCandidate(data.jobName) || null;
 let jobSource = jobName ? 'typed' : null;
 
 if (!jobName) {

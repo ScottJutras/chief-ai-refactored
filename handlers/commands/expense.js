@@ -19,6 +19,8 @@ const pg = require('../../services/postgres');
 const twilioSvc = require('../../services/twilio');
 // --- Node crypto (do NOT rely on variable name "crypto" being unshadowed)
 const nodeCrypto = require('crypto');
+const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
+
 
 const {
   sendWhatsAppInteractiveList,
@@ -919,21 +921,6 @@ function inferItemFromOnPattern(text) {
   return item && !isUnknownItem(item) ? item : null;
 }
 
-function sanitizeJobNameCandidate(candidate) {
-  const s = String(candidate || '').trim();
-  if (!s) return null;
-  const lc = s.toLowerCase();
-
-  if (lc.includes('$') || /\b\d{4}-\d{2}-\d{2}\b/.test(lc)) return null;
-  if (/\b(from|at|on|today|yesterday|tomorrow|worth|purchased|bought|paid|spent|received)\b/.test(lc)) return null;
-
-  const connectors = (lc.match(/\b(from|at|on|for)\b/g) || []).length;
-  if (connectors >= 2) return null;
-
-  if (s.length > 80) return null;
-  return s;
-}
-
 function normalizeDecisionToken(input) {
   const s = String(input || '').trim().toLowerCase();
 
@@ -1649,7 +1636,7 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
 
   d.store = String(d.store || '').trim() || 'Unknown Store';
 
-  if (d.jobName != null) d.jobName = sanitizeJobNameCandidate(d.jobName);
+  if (d.jobName != null) d.jobName = normalizeJobNameCandidate(d.jobName);
 
   if (d.suggestedCategory != null) {
     const c = String(d.suggestedCategory).trim();
@@ -2713,9 +2700,9 @@ if (!date) {
   let jobName = null;
   const forJob = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:[.?!]|$)/i);
   if (forJob?.[1]) {
-    const cand = String(forJob[1]).trim();
-    if (cand && !isIsoDateToken(cand)) jobName = sanitizeJobNameCandidate(cand);
-  }
+  const cand = String(forJob[1]).trim();
+  if (cand && !isIsoDateToken(cand)) jobName = normalizeJobNameCandidate(cand);
+}
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
   let store = null;
@@ -5295,7 +5282,7 @@ if (data) {
   data = normalizeExpenseData(data, userProfile, sourceText);
 }
 
-if (data?.jobName) data.jobName = sanitizeJobNameCandidate(data.jobName);
+if (data?.jobName) data.jobName = normalizeJobNameCandidate(data.jobName);
 
 if (data && isUnknownItem(data.item)) {
   const inferred = inferExpenseItemFallback(input);

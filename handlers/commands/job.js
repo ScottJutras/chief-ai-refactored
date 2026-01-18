@@ -19,6 +19,7 @@
 
 const pg = require('../../services/postgres');
 const state = require('../../utils/stateManager');
+const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
 
 // Twilio helpers (preferred)
 let sendWhatsAppInteractiveList = null;
@@ -733,7 +734,10 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptio
 
 async function activateJobBestEffort(ownerId, selector) {
   const owner = String(ownerId || '').trim();
-  const s = sanitizeJobLabel(selector);
+
+  const s0 = sanitizeJobLabel(selector);
+  const s = normalizeJobNameCandidate(s0) || s0;
+
   if (!owner) throw new Error('missing ownerId');
   if (!s) throw new Error('missing selector');
 
@@ -751,6 +755,7 @@ async function activateJobBestEffort(ownerId, selector) {
           } catch {}
         }
       }
+
       // SQL fallback
       if (typeof pg.query === 'function') {
         const r = await pg.query(
@@ -796,6 +801,7 @@ async function activateJobBestEffort(ownerId, selector) {
 
   throw new Error('activate failed');
 }
+
 
 /* ---------------- main handler ---------------- */
 

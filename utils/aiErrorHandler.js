@@ -2,6 +2,8 @@
 const { callOpenAI } = require('../services/openAI');
 const stateManager = require('./stateManager');
 const { detectErrors: detectErrorsImpl } = require('./errorDetector');
+const { todayInTimeZone, parseNaturalDate, stripDateTail } = require('./dateUtils');
+const { normalizeJobNameCandidate } = require('./jobNameUtils');
 
 /**
  * ChiefOS Ingestion AI helper
@@ -48,58 +50,6 @@ Output MUST be JSON only. No markdown. No extra text.
 `;
 }
 
-/**
- * Timezone-aware "today" (YYYY-MM-DD) using Intl.
- * If tz is invalid or Intl fails, fall back to server time.
- */
-function todayInTimeZone(tz) {
-  try {
-    const dtf = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    });
-    // en-CA yields YYYY-MM-DD
-    return dtf.format(new Date());
-  } catch {
-    return new Date().toISOString().split('T')[0];
-  }
-}
-
-/**
- * Parse common natural date tokens into YYYY-MM-DD.
- * Supports: today/yesterday/tomorrow, ISO, and "Dec 12, 2025" formats.
- * tz is optional but recommended so "today" matches the user's locale.
- */
-function parseNaturalDate(s, tz) {
-  const t = String(s || '').trim().toLowerCase();
-
-  const today = todayInTimeZone(tz || 'UTC');
-  if (!t || t === 'today') return today;
-
-  if (t === 'yesterday') {
-    // use noon Z anchored on "today" to avoid DST edge weirdness
-    const d = new Date(`${today}T12:00:00Z`);
-    d.setUTCDate(d.getUTCDate() - 1);
-    return d.toISOString().split('T')[0];
-  }
-
-  if (t === 'tomorrow') {
-    const d = new Date(`${today}T12:00:00Z`);
-    d.setUTCDate(d.getUTCDate() + 1);
-    return d.toISOString().split('T')[0];
-  }
-
-  // strict ISO
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
-
-  // “December 12, 2025”, “Dec 12 2025”, etc.
-  const parsed = Date.parse(s);
-  if (!Number.isNaN(parsed)) return new Date(parsed).toISOString().split('T')[0];
-
-  return null;
-}
 
 /**
  * For parse failures: return a helpful example + one clarifying question.
@@ -191,20 +141,40 @@ function buildPendingKey(type) {
  * - If parseFn succeeds => run detectErrors; if errors => optionally AI suggests corrections + sets pending state
  * - Otherwise return confirmed:true with parsed data
  *
- * ctx is optional (ex: { tz }) and will be passed to parseFn if parseFn accepts 2 args.
+ * ctx is optional (ex: { tz }) and will be passed to parseFn.
  */
 async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, ctx = {}, opts = {}) {
   const options = opts && typeof opts === 'object' ? opts : {};
   const disableCorrections = options.disableCorrections === true; // ✅ for edit-mode flows
   const disablePendingState = options.disablePendingState === true; // ✅ for edit-mode flows
 
-  console.log(`[DEBUG] Ingestion parse (${type}): "${input}"`);
+  // normalize ctx to plain object
+  ctx = ctx && typeof ctx === 'object' ? ctx : {};
 
-  // 1) Attempt deterministic parse first
+  // ✅ accept both { tz } and { timezone } callers
+  if (!ctx.tz && ctx.timezone) ctx.tz = ctx.timezone;
+
+  let rawInput = String(input ?? '');
+
+  // Optional: transcript normalization hook (voice → deterministic-friendly)
+  // Safe: only applies if module exists and exposes a normalizer.
+  try {
+    const tn = require('./transcriptNormalize'); // utils/transcriptNormalize.js
+    if (tn && typeof tn.normalizeTranscriptMoney === 'function') {
+      rawInput = tn.normalizeTranscriptMoney(rawInput);
+    }
+  } catch {
+    // ignore; module optional
+  }
+
+  console.log(`[DEBUG] Ingestion parse (${type}): "${rawInput}"`);
+
+  // 1) Attempt deterministic parse first (SAFE RULE: always pass ctx)
   let data = null;
   try {
     if (typeof parseFn === 'function') {
-      data = parseFn.length >= 2 ? parseFn(input, ctx) : parseFn(input);
+      // IMPORTANT: Always pass ctx. Do NOT use parseFn.length gating (regresses tz-aware parsing).
+      data = parseFn(rawInput, ctx);
     }
   } catch (e) {
     console.warn(`[WARN] parseFn threw for ${type}:`, e?.message);
@@ -213,7 +183,7 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
 
   // 2) If deterministic parse failed, ask for clarification (but still ingestion-only)
   if (!data) {
-    return await proposeClarification(input, type);
+    return await proposeClarification(rawInput, type);
   }
 
   // 2b) Apply default fields if missing (non-destructive)
@@ -226,26 +196,19 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
   // 3) Detect structural errors (missing fields etc.)
   let errors = null;
   try {
-    // ✅ key patch: pass ctx through
     errors = await detectErrorsImpl(data, type, ctx);
 
-if (Array.isArray(errors)) {
-  const hard = errors.filter((e) => String(e?.severity || 'hard') === 'hard');
-  const soft = errors.filter((e) => String(e?.severity || '') === 'soft');
+    if (Array.isArray(errors)) {
+      const hard = errors.filter((e) => String(e?.severity || 'hard') === 'hard');
+      const soft = errors.filter((e) => String(e?.severity || '') === 'soft');
 
-  // ✅ Log soft warnings (non-blocking visibility)
-  if (!hard.length && soft.length) {
-    console.info('[INGESTION_SOFT_WARNINGS]', { type, soft });
-  }
+      // ✅ Log soft warnings (non-blocking visibility)
+      if (!hard.length && soft.length) {
+        console.info('[INGESTION_SOFT_WARNINGS]', { type, soft });
+      }
 
-  if (!hard.length) {
-    errors = null;
-  } else {
-    errors = hard;
-  }
-}
-
-
+      errors = hard.length ? hard : null;
+    }
 
     // ✅ contractor-first: revenue payer/client is optional
     if (type === 'revenue' && errors) {
@@ -260,53 +223,53 @@ if (Array.isArray(errors)) {
   }
 
   // 4) If errors exist...
-if (errors) {
-  // ✅ Edit-mode / confirm-mode: do NOT generate "issues" diffs or write pending state.
-  if (disableCorrections || disablePendingState) {
-    return {
-      data: null,
-      reply: `I couldn't apply that edit yet. Please resend with amount + store + date (if changing date).`,
-      confirmed: false
-    };
-  }
+  if (errors) {
+    // ✅ Edit-mode / confirm-mode: do NOT generate "issues" diffs or write pending state.
+    if (disableCorrections || disablePendingState) {
+      return {
+        data: null,
+        reply: `I couldn't apply that edit yet. Please resend with amount + store + date (if changing date).`,
+        confirmed: false
+      };
+    }
 
-  const corrections = await correctErrorsWithAI(
-    `Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)} Ctx=${JSON.stringify(ctx || {})}`,
-    type
-  );
-
-  if (corrections) {
-    const pendingKey = buildPendingKey(type);
-
-    await stateManager.setPendingTransactionState(from, {
-      [pendingKey]: data,
-      pendingCorrection: true,
-      suggestedCorrections: corrections,
+    const corrections = await correctErrorsWithAI(
+      `Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)} Ctx=${JSON.stringify(ctx || {})}`,
       type
-    });
+    );
 
-    const text = Object.entries(corrections)
-      .map(([k, v]) => `${k}: ${data?.[k] ?? 'missing'} → ${v}`)
-      .join('\n');
+    if (corrections) {
+      const pendingKey = buildPendingKey(type);
+
+      await stateManager.setPendingTransactionState(from, {
+        [pendingKey]: data,
+        pendingCorrection: true,
+        suggestedCorrections: corrections,
+        type
+      });
+
+      const text = Object.entries(corrections)
+        .map(([k, v]) => `${k}: ${data?.[k] ?? 'missing'} → ${v}`)
+        .join('\n');
+
+      return {
+        data: null,
+        reply: `🤔 I found a few issues:\n${text}\nReply "yes" to accept, "edit" to resend, or "cancel" to abort.`,
+        confirmed: false
+      };
+    }
 
     return {
       data: null,
-      reply: `🤔 I found a few issues:\n${text}\nReply "yes" to accept, "edit" to resend, or "cancel" to abort.`,
+      reply: `⚠️ I couldn't log that ${type} yet. Please resend with the missing details.`,
       confirmed: false
     };
   }
-
-  return {
-    data: null,
-    reply: `⚠️ I couldn't log that ${type} yet. Please resend with the missing details.`,
-    confirmed: false
-  };
-}
-
 
   // 5) Looks good. Caller must STILL CIL-validate before any DB writes.
   return { data, reply: null, confirmed: true };
 }
+
 
 /**
  * Categorization helper. Keep as-is but this is still “ingestion-side enrichment”.
@@ -342,6 +305,7 @@ function looksLikeAddress(str) {
  * - prefers explicit $ amounts
  * - supports commas ($8,436.10)
  * - avoids grabbing address numbers
+ * - supports common transcript pattern: "for 10" / "for 10.50" (no $ sign)
  */
 function extractDollarAmount(text) {
   const s = String(text || '');
@@ -363,37 +327,17 @@ function extractDollarAmount(text) {
   const nearMoney = s.match(/\b([0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\b\s*(?:dollars|bucks)\b/i);
   if (nearMoney?.[1]) return toMoneyNumber(nearMoney[1]);
 
+  // fallback: "for 10" / "for 10.50" (common transcript style)
+  // Guard: avoid obvious address patterns like "for 1556 Medway Park Dr"
+  const forMoney = s.match(
+    /\bfor\s+([0-9]{1,3}(?:,\d{3})*(?:\.\d{1,2})?)\b(?!\s*(?:st|street|ave|avenue|rd|road|dr|drive|blvd|boulevard|ln|lane|ct|court|cir|circle|way|trail|trl|pkwy|park)\b)/i
+  );
+  if (forMoney?.[1]) return toMoneyNumber(forMoney[1]);
+
   return null;
 }
 
-/**
- * stripDateTail(raw, tz?)
- * Pull a trailing date-ish token off the end, if present.
- */
-function stripDateTail(raw = '', tz) {
-  const s = String(raw).trim();
 
-  // ISO at end, optionally preceded by "on"
-  const mIso = s.match(/\s+(?:on\s+)?(?<date>\d{4}-\d{2}-\d{2})\s*$/i);
-  if (mIso?.groups?.date) {
-    return { rest: s.slice(0, mIso.index).trim(), date: mIso.groups.date };
-  }
-
-  // today/yesterday/tomorrow at end, optionally preceded by "on"
-  const mWord = s.match(/\s+(?:on\s+)?(?<date>today|yesterday|tomorrow)\s*$/i);
-  if (mWord?.groups?.date) {
-    return { rest: s.slice(0, mWord.index).trim(), date: parseNaturalDate(mWord.groups.date, tz) };
-  }
-
-  // Try natural language date at the end (best-effort)
-  const mTail = s.match(/\s+(?:on\s+)?(?<date>[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\s*$/);
-  if (mTail?.groups?.date) {
-    const d = parseNaturalDate(mTail.groups.date, tz);
-    if (d) return { rest: s.slice(0, mTail.index).trim(), date: d };
-  }
-
-  return { rest: s, date: null };
-}
 
 /**
  * parseExpenseMessage(input, ctx?)
@@ -401,7 +345,10 @@ function stripDateTail(raw = '', tz) {
  * - "expense 84.12 nails from Home Depot"
  * - "I bought $489.78 worth of Lumber from Home Depot today for 1556 Medway Park Dr"
  */
-function parseExpenseMessage(input, ctx = {}) {
+function parseExpenseMessage(input, ctx) {
+  // ✅ Make ctx always a plain object (so tz access is stable)
+  ctx = ctx && typeof ctx === 'object' ? ctx : {};
+
   const text = String(input || '').trim();
   if (!text) return null;
 
@@ -419,6 +366,7 @@ function parseExpenseMessage(input, ctx = {}) {
       /^(?:expense|exp)\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:from|at)\s+(.+))?$/i
     );
     if (!strict) return null;
+
     return stripUndefined({
       date: d,
       item: strict[2]?.trim() || 'Unknown',
@@ -445,12 +393,12 @@ function parseExpenseMessage(input, ctx = {}) {
   if (jobMatch?.[1]) {
     const candidate = jobMatch[1].trim();
     if (looksLikeAddress(candidate) || /\bjob\b/i.test(candidate)) {
-      jobName = candidate.replace(/^job\s*[:\-]?\s*/i, '').trim();
+      jobName = normalizeJobNameCandidate(candidate); // ✅ shared canonical normalizer
       base = base.slice(0, jobMatch.index).trim();
     }
   }
 
-  // item/memo:
+  // item/memo
   let item = null;
 
   const worth = base.match(/\bworth\s+of\s+(.+?)\b/i);
@@ -485,6 +433,7 @@ function parseExpenseMessage(input, ctx = {}) {
   });
 }
 
+
 function parseBillMessage(input) {
   const match = input.match(
     /^bill\s+(.+?)\s+\$?(\d+(?:\.\d{1,2})?)(?:\s+(yearly|monthly|weekly|bi-weekly|one-time))?(?:\s+due\s+(.+))?$/i
@@ -504,7 +453,7 @@ function parseBillMessage(input) {
 
 /**
  * parseRevenueMessage(input, ctx?)
- * NOTE: revenue parsing currently does not use tz for date tail unless you add it (optional).
+ * Supports tz-aware date tail via stripDateTail(body, tz).
  */
 function parseRevenueMessage(input, ctx = {}) {
   const text = String(input || '').trim();
@@ -519,72 +468,90 @@ function parseRevenueMessage(input, ctx = {}) {
   const { rest, date } = stripDateTail(body, tz);
   const d = date || todayInTimeZone(tz || 'UTC');
 
-  const asAmount = (amt) => `$${parseFloat(amt).toFixed(2)}`;
-  const normalizeJobPrefix = (s) =>
-    String(s || '')
-      .trim()
-      .replace(/^(job|job\s*name)\s*[:\-]?\s*/i, '')
-      .trim();
+  const asAmount = (amt) => {
+    const n = Number(String(amt).replace(/[^0-9.]/g, ''));
+    if (!Number.isFinite(n)) return null;
+    return `$${n.toFixed(2)}`;
+  };
 
+  // Pattern A: "$500 for X" OR "$500 from X"
   let m = rest.match(/^\$?(?<amt>\d+(?:\.\d{1,2})?)\s+(?:(?<kw>from|for)\s+)?(?<src>.+)$/i);
   if (m?.groups?.amt && m?.groups?.src) {
-    let src = m.groups.src.trim();
+    const src = m.groups.src.trim();
     const kw = (m.groups.kw || '').toLowerCase();
+    const amount = asAmount(m.groups.amt);
+    if (!amount) return null;
 
+    // ✅ If "for ..." treat as jobName (supports "... job")
     if (kw === 'for') {
-      const jobName = normalizeJobPrefix(src);
+      const jobName = normalizeJobNameCandidate(src);
       return stripUndefined({
         date: d,
         description: `Payment for ${jobName}`,
-        amount: asAmount(m.groups.amt),
+        amount,
         source: 'Unknown',
         jobName
       });
     }
 
+    // Existing behavior: if src begins with "job ..." also treat as job
     const srcLc = src.toLowerCase();
-    if (srcLc.startsWith('job ') || srcLc.startsWith('jobname ') || srcLc.startsWith('job:')) {
-      const jobName = normalizeJobPrefix(src.replace(/^jobname\b/i, 'job'));
+    if (
+      srcLc.startsWith('job ') ||
+      srcLc.startsWith('jobname ') ||
+      srcLc.startsWith('job:') ||
+      srcLc.startsWith('job name')
+    ) {
+      const jobName = normalizeJobNameCandidate(src.replace(/^jobname\b/i, 'job'));
       return stripUndefined({
         date: d,
         description: `Payment for ${jobName}`,
-        amount: asAmount(m.groups.amt),
+        amount,
         source: 'Unknown',
         jobName
       });
     }
 
+    // Otherwise treat as payer/source
     return stripUndefined({
       date: d,
       description: `Payment from ${src}`,
-      amount: asAmount(m.groups.amt),
+      amount,
       source: src
     });
   }
 
+  // Pattern B: "from X $500" OR "for X $500"
   m = rest.match(/^(?:(?<kw>from|for)\s+)?(?<src>.+?)\s+\$?(?<amt>\d+(?:\.\d{1,2})?)$/i);
   if (m?.groups?.amt && m?.groups?.src) {
-    let src = m.groups.src.trim();
+    const src = m.groups.src.trim();
     const kw = (m.groups.kw || '').toLowerCase();
+    const amount = asAmount(m.groups.amt);
+    if (!amount) return null;
 
     if (kw === 'for') {
-      const jobName = normalizeJobPrefix(src);
+      const jobName = normalizeJobNameCandidate(src);
       return stripUndefined({
         date: d,
         description: `Payment for ${jobName}`,
-        amount: asAmount(m.groups.amt),
+        amount,
         source: 'Unknown',
         jobName
       });
     }
 
     const srcLc = src.toLowerCase();
-    if (srcLc.startsWith('job ') || srcLc.startsWith('jobname ') || srcLc.startsWith('job:')) {
-      const jobName = normalizeJobPrefix(src.replace(/^jobname\b/i, 'job'));
+    if (
+      srcLc.startsWith('job ') ||
+      srcLc.startsWith('jobname ') ||
+      srcLc.startsWith('job:') ||
+      srcLc.startsWith('job name')
+    ) {
+      const jobName = normalizeJobNameCandidate(src.replace(/^jobname\b/i, 'job'));
       return stripUndefined({
         date: d,
         description: `Payment for ${jobName}`,
-        amount: asAmount(m.groups.amt),
+        amount,
         source: 'Unknown',
         jobName
       });
@@ -593,7 +560,7 @@ function parseRevenueMessage(input, ctx = {}) {
     return stripUndefined({
       date: d,
       description: `Payment from ${src}`,
-      amount: asAmount(m.groups.amt),
+      amount,
       source: src
     });
   }
@@ -601,22 +568,40 @@ function parseRevenueMessage(input, ctx = {}) {
   return null;
 }
 
+
 function parseQuoteMessage(input) {
-  const match = input.match(/^quote\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:to|for)\s+(.+))?$/i);
+  const match = String(input || '').match(
+    /^quote\s+\$?(\d+(?:\.\d{1,2})?)\s+(.+?)(?:\s+(?:to|for)\s+(.+))?$/i
+  );
   if (!match) return null;
+
+  const amount = Number(match[1]);
+  const description = match[2].trim();
+  const clientOrJobRaw = match[3]?.trim() || '';
+
+  // Keep semantics:
+  // - client = 3rd group or 'Unknown'
+  // - jobName = if user provided tail, treat as job hint; otherwise fall back to description
+  const jobName = clientOrJobRaw ? normalizeJobNameCandidate(clientOrJobRaw) : description;
+
   return stripUndefined({
-    amount: parseFloat(match[1]),
-    description: match[2].trim(),
-    client: match[3]?.trim() || 'Unknown',
-    jobName: match[2].trim()
+    amount,
+    description,
+    client: clientOrJobRaw || 'Unknown',
+    jobName
   });
 }
 
 function parseJobMessage(input) {
-  const match = input.match(/^(start job|create job|new job|add job)\s+(.+)/i);
+  const match = String(input || '').match(/^(start job|create job|new job|add job)\s+(.+)/i);
   if (!match) return null;
-  return stripUndefined({ jobName: match[2].trim() });
+
+  const jobName = normalizeJobNameCandidate(match[2]);
+
+  return stripUndefined({ jobName });
 }
+
+
 
 module.exports = {
   // core
@@ -627,7 +612,7 @@ module.exports = {
   // keep compat
   detectErrors: detectErrorsImpl,
 
-  // date utils
+  // date utils (re-exported)
   todayInTimeZone,
   parseNaturalDate,
   stripDateTail,

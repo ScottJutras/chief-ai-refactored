@@ -1,6 +1,7 @@
 // utils/quoteUtils.js
 
 const { getPricingItems } = require('../services/postgres');
+const { normalizeJobNameCandidate } = require('./jobNameUtils'); // path may vary
 
 /**
  * Parses a “quote for <jobName>: …” message into its components.
@@ -9,7 +10,7 @@ function parseQuoteMessage(message) {
   const match = message.match(/quote for\s+([^:]+)(?::\s*(.+))?/i);
   if (!match) return null;
 
-  const jobName = match[1].trim();
+  const jobName = normalizeJobNameCandidate(match[1]) || match[1].trim();
   const itemsText = match[2]?.trim() || '';
   if (!itemsText) return { jobName, items: [], overallMarkup: 1.40 };
 

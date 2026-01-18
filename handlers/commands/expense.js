@@ -5253,15 +5253,26 @@ const defaultData = {
   store: 'Unknown Store'
 };
 
+// ✅ Ensure ctx is always defined (used by edit-mode + handleInputWithAI)
+const ctx = {
+  fromKey: canonicalUserKey || fromPhone || userProfile?.user_id || userProfile?.from || null,
+  tz: userProfile?.tz || userProfile?.timezone || 'America/Toronto',
+  defaultData: {
+    // keep minimal — only safe defaults
+    currency: userProfile?.currency || ownerProfile?.currency || 'CAD'
+  }
+};
+
 const aiRes = await handleInputWithAI(
-  ctx?.fromKey,
+  ctx.fromKey,
   raw,
   'expense',
   parseExpenseMessage,
-  ctx?.defaultData || {},
-  { tz },
+  ctx.defaultData,
+  { tz: ctx.tz },
   { disableCorrections: true, disablePendingState: true } // ✅ edit-mode safety
 );
+
 
 
 let data = aiRes?.data || null;

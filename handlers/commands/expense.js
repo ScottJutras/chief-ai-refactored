@@ -2879,6 +2879,23 @@ function formatExpenseConfirmText(draft) {
     `"cancel" (or "stop") to discard`
   ].join('\n');
 }
+function hasExplicitDateToken(text = '') {
+  const s = String(text || '');
+
+  // ISO
+  if (/\b\d{4}-\d{2}-\d{2}\b/.test(s)) return true;
+
+  // 01/13/2026, 1-13-26, 01.13.2026 (includes YY)
+  if (/\b(0?[1-9]|1[0-2])[\/\-\.](0?[1-9]|[12]\d|3[01])[\/\-\.](\d{2}|\d{4})\b/.test(s)) return true;
+
+  // Month name formats: Jan 17 2026 / Jan 17, 2026 / January 17 2026
+  if (/\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:,\s*|\s+)\d{2,4}\b/i.test(s)) return true;
+
+  // Relative date words
+  if (/\b(today|yesterday|tomorrow)\b/i.test(s)) return true;
+
+  return false;
+}
 
 
 // Parse edit payload and merge into existing draft WITHOUT losing receipt/media linkage.
@@ -2898,23 +2915,23 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
 
   const hasMoney = (s) => /\$?\s*-?\d{1,3}(?:,\d{3})*(?:\.\d{2})\b/.test(String(s || ''));
   const hasDateToken = (s) =>
-    /\b(\d{4}-\d{2}-\d{2}|\d{2}\/\d{2}\/\d{4}|\d{4}[\/.]\d{2}[\/.]\d{2})\b/.test(String(s || '')) ||
+    /\b(\d{4}-\d{2}-\d{2}|\d{2}\/\d{2}\/\d{4}|\d{4}[\/.]\d{2}[\/.]\d{2}|\d{2}\/\d{2}\/\d{2}|\d{2}-\d{2}-\d{2})\b/.test(String(s || '')) ||
     /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(String(s || '')) ||
     /\b(today|yesterday|tomorrow)\b/i.test(String(s || ''));
 
+  // ✅ Single source of truth: did the user explicitly provide a date?
+  const explicitDate = hasExplicitDateToken(raw);
+
   const explicit = {
-    amount:
-      /\b(amount|total|price|cost)\b/i.test(raw) || hasMoney(raw),
-    date:
-      /\b(date|day|on\s)\b/i.test(raw) || hasDateToken(raw),
-    store:
-      /\b(store|vendor|merchant|from|at)\b/i.test(raw),
-    item:
-      /\b(item|for|bought|purchase|description|desc)\b/i.test(raw),
-    category:
-      /\b(category|categorize|type)\b/i.test(raw),
-    job:
-      /\b(job|for job|change job|overhead)\b/i.test(raw)
+    amount: /\b(amount|total|price|cost)\b/i.test(raw) || hasMoney(raw),
+
+    // ✅ FORCE: only treat date as explicit if we truly saw a date token
+    date: explicitDate,
+
+    store: /\b(store|vendor|merchant|from|at)\b/i.test(raw),
+    item: /\b(item|for|bought|purchase|description|desc)\b/i.test(raw),
+    category: /\b(category|categorize|type)\b/i.test(raw),
+    job: /\b(job|for job|change job|overhead)\b/i.test(raw)
   };
 
   // IMPORTANT: Do not strip to "" before parsing — pass the user's actual message.
@@ -2952,39 +2969,37 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
 
   // ---------- guarded merges (only if explicitly changed) ----------
   if (explicit.amount) {
-    // Avoid overwriting with "$0.00" or nonsense
     if (data.amount != null && !String(data.amount).includes('$0.00')) out.amount = data.amount;
   }
 
+  // ✅ Date merge rule (permanent):
+  // Only allow date to change if user explicitly provided a date token.
+  // Otherwise preserve existingDraft.date exactly.
   if (explicit.date) {
-  const tz0 = ctx?.tz || 'America/Toronto';
+    const tz0 = tz;
 
-  // ✅ Deterministic parse from the user's edit text (handles 01/13/26)
-  const typedDate = extractReceiptDateYYYYMMDD(raw, tz0);
+    // Prefer deterministic extraction from the user's typed edit text
+    const typedDate = typeof extractReceiptDateYYYYMMDD === 'function' ? extractReceiptDateYYYYMMDD(raw, tz0) : null;
+    if (typedDate) {
+      out.date = typedDate;
+    } else if (data.date && String(data.date).trim()) {
+      const aiDate = String(data.date).trim();
 
-  if (typedDate) {
-    out.date = typedDate;
-  } else if (data.date && String(data.date).trim()) {
-    const today = todayInTimeZone(tz0);
-    const aiDate = String(data.date).trim();
+      // If AI still defaulted to "today" while user supplied something date-like, reject to avoid bad overwrite.
+      const today = typeof todayInTimeZone === 'function' ? todayInTimeZone(tz0) : null;
+      if (today && aiDate === today) {
+        return {
+          nextDraft: null,
+          aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Jan 13 2026" or "01/13/2026".'
+        };
+      }
 
-    // ✅ Strong guard: if user included any plausible date token but AI defaulted to today, reject it
-    const userLooksLikeTheyProvidedADate =
-      /\b(0?[1-9]|1[0-2])[\/\-\.](0?[1-9]|[12]\d|3[01])[\/\-\.](\d{2}|\d{4})\b/.test(raw) || // ✅ includes YY
-      /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(raw) ||
-      /\b(today|yesterday|tomorrow)\b/i.test(raw);
-
-    if (aiDate === today && userLooksLikeTheyProvidedADate) {
-      return {
-        nextDraft: null,
-        aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Jan 13 2026" or "01/13/2026".'
-      };
+      out.date = aiDate;
     }
-
-    out.date = aiDate;
+  } else {
+    // ✅ Explicitly lock date if user did not supply it
+    if (existingDraft?.date) out.date = existingDraft.date;
   }
-}
-
 
   if (explicit.store) {
     if (data.store && !isUnknownish(data.store)) out.store = data.store;
@@ -3001,18 +3016,13 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   }
 
   if (explicit.job) {
-    // Keep your canonical fields
     if (data.jobName && !isUnknownish(data.jobName)) out.jobName = data.jobName;
     if (data.job_name && !isUnknownish(data.job_name)) out.job_name = data.job_name;
-
-    // If parseExpenseMessage returns jobSource/job_no, keep them
     if (data.jobSource && String(data.jobSource).trim()) out.jobSource = data.jobSource;
     if (data.job_no != null) out.job_no = data.job_no;
   }
 
   // ---------- ensure we never accidentally null out strong values ----------
-  // (AI sometimes sends blanks; we only set when non-empty above, so this is mostly redundant,
-  // but it protects against weird schema outputs.)
   if (out.store && isUnknownish(out.store) && existingDraft?.store && !isUnknownish(existingDraft.store)) {
     out.store = existingDraft.store;
   }
@@ -4591,6 +4601,63 @@ try {
           }
 
           const rawDraft = confirmPAFresh?.payload?.draft ? { ...confirmPAFresh.payload.draft } : null;
+          // ---------------------------------------------------
+// ---------------------------------------------------
+// ✅ LOOP BREAKER: if we are here on YES, we must not be stuck in any edit/issue sub-flow.
+// Clear all edit-related latches so we can finalize safely.
+// ---------------------------------------------------
+try {
+  if (rawDraft) {
+    const hadEditLatch =
+      !!rawDraft.awaiting_edit ||
+      !!rawDraft.edit_started_at ||
+      !!rawDraft.editStartedAt ||
+      !!rawDraft.edit_flow_id ||
+      !!rawDraft.editIssues ||
+      !!rawDraft.pendingIssues ||
+      !!rawDraft.issues ||
+      rawDraft.validationMode === 'issues';
+
+    if (hadEditLatch) {
+      rawDraft.awaiting_edit = false;
+      rawDraft.edit_started_at = null;
+      rawDraft.editStartedAt = null;
+      rawDraft.edit_flow_id = null;
+
+      rawDraft.editIssues = null;
+      rawDraft.pendingIssues = null;
+      rawDraft.issues = null;
+      rawDraft.validationMode = null;
+
+      await upsertPA({
+        ownerId,
+        userId: paKey,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          ...(confirmPAFresh?.payload || {}),
+          draft: { ...(confirmPAFresh?.payload?.draft || {}), ...rawDraft }
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+
+      console.info('[YES_LOOP_BREAKER_CLEARED]', { paUserId });
+
+      // ✅ Refresh local copies so downstream logic uses the cleared state
+      try {
+        confirmPAFresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+      } catch {}
+    }
+  }
+} catch (e) {
+  console.warn('[YES_LOOP_BREAKER_CLEARED] failed (ignored):', e?.message);
+}
+
+// Recompute rawDraft after possible refresh (safe)
+const rawDraft2 = confirmPAFresh?.payload?.draft ? { ...confirmPAFresh.payload.draft } : rawDraft;
+
+
+
+
 
           console.info('[YES_HANDLER_CONFIRM_PA]', {
             paUserId,
@@ -5199,7 +5266,16 @@ const defaultData = {
   store: 'Unknown Store'
 };
 
-const aiRes = await handleInputWithAI(from, input, 'expense', parseExpenseMessage, defaultData, { tz });
+const aiRes = await handleInputWithAI(
+  ctx?.fromKey,
+  raw,
+  'expense',
+  parseExpenseMessage,
+  ctx?.defaultData || {},
+  { tz },
+  { disableCorrections: true, disablePendingState: true } // ✅ edit-mode safety
+);
+
 
 let data = aiRes?.data || null;
 let aiReply = aiRes?.reply || null;

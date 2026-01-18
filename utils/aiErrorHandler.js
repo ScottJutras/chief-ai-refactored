@@ -193,7 +193,11 @@ function buildPendingKey(type) {
  *
  * ctx is optional (ex: { tz }) and will be passed to parseFn if parseFn accepts 2 args.
  */
-async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, ctx = {}) {
+async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, ctx = {}, opts = {}) {
+  const options = opts && typeof opts === 'object' ? opts : {};
+  const disableCorrections = options.disableCorrections === true; // ✅ for edit-mode flows
+  const disablePendingState = options.disablePendingState === true; // ✅ for edit-mode flows
+
   console.log(`[DEBUG] Ingestion parse (${type}): "${input}"`);
 
   // 1) Attempt deterministic parse first
@@ -225,6 +229,24 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
     // ✅ key patch: pass ctx through
     errors = await detectErrorsImpl(data, type, ctx);
 
+if (Array.isArray(errors)) {
+  const hard = errors.filter((e) => String(e?.severity || 'hard') === 'hard');
+  const soft = errors.filter((e) => String(e?.severity || '') === 'soft');
+
+  // ✅ Log soft warnings (non-blocking visibility)
+  if (!hard.length && soft.length) {
+    console.info('[INGESTION_SOFT_WARNINGS]', { type, soft });
+  }
+
+  if (!hard.length) {
+    errors = null;
+  } else {
+    errors = hard;
+  }
+}
+
+
+
     // ✅ contractor-first: revenue payer/client is optional
     if (type === 'revenue' && errors) {
       const s = JSON.stringify(errors);
@@ -237,40 +259,50 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
     errors = null;
   }
 
-  // 4) If errors exist, ask AI for correction suggestions (optional) and save pending state
-  if (errors) {
-    const corrections = await correctErrorsWithAI(
-      `Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)} Ctx=${JSON.stringify(ctx || {})}`,
-      type
-    );
-
-    if (corrections) {
-      const pendingKey = buildPendingKey(type);
-
-      await stateManager.setPendingTransactionState(from, {
-        [pendingKey]: data,
-        pendingCorrection: true,
-        suggestedCorrections: corrections,
-        type
-      });
-
-      const text = Object.entries(corrections)
-        .map(([k, v]) => `${k}: ${data?.[k] ?? 'missing'} → ${v}`)
-        .join('\n');
-
-      return {
-        data: null,
-        reply: `🤔 I found a few issues:\n${text}\nReply "yes" to accept, "edit" to resend, or "cancel" to abort.`,
-        confirmed: false
-      };
-    }
-
+  // 4) If errors exist...
+if (errors) {
+  // ✅ Edit-mode / confirm-mode: do NOT generate "issues" diffs or write pending state.
+  if (disableCorrections || disablePendingState) {
     return {
       data: null,
-      reply: `⚠️ I couldn't log that ${type} yet. Please resend with the missing details.`,
+      reply: `I couldn't apply that edit yet. Please resend with amount + store + date (if changing date).`,
       confirmed: false
     };
   }
+
+  const corrections = await correctErrorsWithAI(
+    `Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)} Ctx=${JSON.stringify(ctx || {})}`,
+    type
+  );
+
+  if (corrections) {
+    const pendingKey = buildPendingKey(type);
+
+    await stateManager.setPendingTransactionState(from, {
+      [pendingKey]: data,
+      pendingCorrection: true,
+      suggestedCorrections: corrections,
+      type
+    });
+
+    const text = Object.entries(corrections)
+      .map(([k, v]) => `${k}: ${data?.[k] ?? 'missing'} → ${v}`)
+      .join('\n');
+
+    return {
+      data: null,
+      reply: `🤔 I found a few issues:\n${text}\nReply "yes" to accept, "edit" to resend, or "cancel" to abort.`,
+      confirmed: false
+    };
+  }
+
+  return {
+    data: null,
+    reply: `⚠️ I couldn't log that ${type} yet. Please resend with the missing details.`,
+    confirmed: false
+  };
+}
+
 
   // 5) Looks good. Caller must STILL CIL-validate before any DB writes.
   return { data, reply: null, confirmed: true };

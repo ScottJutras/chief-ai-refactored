@@ -1074,6 +1074,16 @@ router.post('*', async (req, res, next) => {
     // ✅ Keep your Option A helper (but don’t trust it as sole source of truth)
     const expensePA = await hasExpensePA(req.ownerId, req.from);
     const hasExpensePendingActions = !!expensePA?.hasAny || mostRecentIsExpensePA;
+// ✅ If PA flow exists, legacy pendingCorrection is stale noise — clear it once.
+try {
+  if (mostRecentIsExpensePA && pending?.pendingCorrection && pending?.type === 'expense') {
+    await stateManager.mergePendingTransactionState(req.from, {
+      pendingCorrection: false,
+      suggestedCorrections: null
+    });
+    console.info('[WEBHOOK] cleared stale pendingCorrection (expense) due to PA');
+  }
+} catch {}
 
     /* ------------------------------------------------------------
      * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
@@ -1341,21 +1351,22 @@ router.post('*', async (req, res, next) => {
     const isNewExpenseCmd = /^(?:expense|exp)\b/.test(lc2);
 
     const pendingRevenueLike =
-      !!pending?.awaitingRevenueClarification ||
-      !!pending?.awaitingRevenueJob ||
-      (pending?.pendingCorrection && pending?.type === 'revenue') ||
-      (!!pending?.pendingRevenue && !isNewRevenueCmd);
+  !!pending?.awaitingRevenueClarification ||
+  !!pending?.awaitingRevenueJob ||
+  ((pending?.pendingCorrection && pending?.type === 'revenue') && !mostRecentIsRevenuePA) ||
+  (!!pending?.pendingRevenue && !isNewRevenueCmd);
 
-    const expensePendingActionsLike =
-      hasExpensePendingActions && (isPickerToken || isAllowedWhilePending(lc2) || /^(expense|exp)\b/.test(lc2));
+const expensePendingActionsLike =
+  hasExpensePendingActions && (isPickerToken || isAllowedWhilePending(lc2) || /^(expense|exp)\b/.test(lc2));
 
-    const pendingExpenseLike =
-      expensePendingActionsLike ||
-      !!pending?.awaitingExpenseClarification ||
-      !!pending?.awaitingExpenseJob ||
-      pending?.pendingDelete?.type === 'expense' ||
-      (pending?.pendingCorrection && pending?.type === 'expense') ||
-      (!!pending?.pendingExpense && !isNewExpenseCmd);
+const pendingExpenseLike =
+  expensePendingActionsLike ||
+  !!pending?.awaitingExpenseClarification ||
+  !!pending?.awaitingExpenseJob ||
+  pending?.pendingDelete?.type === 'expense' ||
+  ((pending?.pendingCorrection && pending?.type === 'expense') && !mostRecentIsExpensePA) ||
+  (!!pending?.pendingExpense && !isNewExpenseCmd);
+
 
     if (pendingRevenueLike) {
   try {

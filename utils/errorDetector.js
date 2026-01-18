@@ -51,12 +51,7 @@ function detectErrors(data, type = 'expense', ctx = {}) {
   const d = data || {};
 
   // tz from ctx OR embedded in data/user profile style objects
-  const tz =
-    ctx?.tz ||
-    ctx?.timezone ||
-    d?.timezone ||
-    d?.tz ||
-    'UTC';
+  const tz = ctx?.tz || ctx?.timezone || d?.timezone || d?.tz || 'UTC';
 
   // --- Amount + Date validation for expense/revenue ---
   if (type === 'expense' || type === 'revenue') {
@@ -66,12 +61,15 @@ function detectErrors(data, type = 'expense', ctx = {}) {
     if (amountNum <= 0) {
       errors.push({
         field: 'amount',
+        severity: 'hard',
         message: 'Amount is zero or negative',
         suggested: '$50.00'
       });
     } else if (amountNum > 10000) {
+      // ✅ This should NOT block: legitimate for contractors.
       errors.push({
         field: 'amount',
+        severity: 'soft',
         message: 'Amount seems unusually high',
         suggested: `$${(amountNum / 10).toFixed(2)}`
       });
@@ -83,6 +81,7 @@ function detectErrors(data, type = 'expense', ctx = {}) {
     if (!isIsoDate(d.date)) {
       errors.push({
         field: 'date',
+        severity: 'hard',
         message: 'Invalid date format',
         suggested: todayIso
       });
@@ -92,8 +91,10 @@ function detectErrors(data, type = 'expense', ctx = {}) {
         const dataDate = new Date(`${d.date}T12:00:00Z`);
         const todayDate = new Date(`${todayIso}T12:00:00Z`);
         if (dataDate.getTime() > todayDate.getTime()) {
+          // ✅ Default safe policy: block future dates (hard)
           errors.push({
             field: 'date',
+            severity: 'hard',
             message: 'Date is in the future',
             suggested: todayIso
           });
@@ -101,6 +102,7 @@ function detectErrors(data, type = 'expense', ctx = {}) {
       } catch {
         errors.push({
           field: 'date',
+          severity: 'hard',
           message: 'Invalid date',
           suggested: todayIso
         });
@@ -118,10 +120,13 @@ function detectErrors(data, type = 'expense', ctx = {}) {
       // If we don't have a store list, do not block ingestion
       const list = Array.isArray(storeList) ? storeList : [];
 
-      const isKnownStore = list.some((st) => normalizeStoreToken(st).includes(storeLower) || storeLower.includes(normalizeStoreToken(st)));
+      const isKnownStore = list.some(
+        (st) =>
+          normalizeStoreToken(st).includes(storeLower) ||
+          storeLower.includes(normalizeStoreToken(st))
+      );
 
       if (!isKnownStore && store !== 'Unknown Store') {
-        // Suggest closest-ish: if user typed "hom dep" prefer Home Depot; otherwise first list item fallback
         let suggestedStore = null;
 
         const hd = list.find((st) => /home\s*depot/i.test(st));
@@ -131,15 +136,16 @@ function detectErrors(data, type = 'expense', ctx = {}) {
           suggestedStore = list[0] || 'Home Depot';
         }
 
+        // ✅ Store recognition should never block logging.
         errors.push({
           field: 'store',
+          severity: 'soft',
           message: 'Store not recognized',
           suggested: suggestedStore
         });
       }
     }
   }
-
   // --- Revenue: client/payer/source should be OPTIONAL (contractor-first) ---
   // Your aiErrorHandler already ignores client/payer missing for revenue.
   // So we DO NOT flag missing client here.

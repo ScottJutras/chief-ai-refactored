@@ -1076,24 +1076,73 @@ function hmac12(secret, s) {
 }
 
 
-function stripListNumberPrefix(title) {
-  // Twilio often gives: "#3 Some Job Name"
+// -------------------------------------------------------
+// Twilio ListTitle cleanup + normalization (HARDENED)
+// -------------------------------------------------------
+
+function stripListNumberPrefix(title = '') {
+  // Handles:
+  // "#1 Job Name"
+  // "# 1 Job Name"
+  // "1) Job Name"
+  // "1. Job Name"
+  // "(1) Job Name"
+  // "1 - Job Name"
   return String(title || '')
     .trim()
-    .replace(/^#\s*\d+\s+/, '')     // "#3 "
-    .replace(/^\d+\s+/, '');        // "3 "
+    .replace(/^#\s*\d+\s+/i, '')                 // "#1 "
+    .replace(/^\(?\d+\)?\s*[\)\.:\-]\s+/i, '')   // "1) " / "1. " / "(1) " / "1 - "
+    .replace(/^\d+\s+/, '')                      // "1 " (bare)
+    .trim();
 }
 
-function normalizePickTitle(s) {
+function normalizePickTitle(s = '') {
+  // IMPORTANT: remove "#" so "#1 foo" can't poison matching even if stripper fails.
   return String(s || '')
-    .trim()
     .toLowerCase()
+    .replace(/\u00a0/g, ' ')
+    .replace(/[—–]/g, '-')                // normalize fancy dashes
+    .replace(/#/g, ' ')                   // critical safety
+    .replace(/[^a-z0-9\s:-]/g, ' ')       // keep safe chars only
     .replace(/\s+/g, ' ')
-    .replace(/[—–-]/g, '-')         // normalize dashes
-    .replace(/[^a-z0-9\s#:-]/g, ''); // keep safe chars
+    .trim();
 }
 
-// ✅ legacy support for Twilio "job_<ix>_<hash>"
+function deSpace(s = '') {
+  return String(s || '').replace(/\s+/g, '');
+}
+
+// -------------------------------------------------------
+// Title-signal detection across Twilio variants (HARDENED)
+// -------------------------------------------------------
+function getInboundTitleSignal(meta = {}) {
+  const candidates = [
+    meta?.ListTitle,
+    meta?.ListRowTitle,
+    meta?.listTitle,
+    meta?.list_row_title
+  ].filter((v) => String(v || '').trim());
+
+  // Some Twilio configs include interactive response JSON
+  try {
+    const raw = meta?.InteractiveResponseJson;
+    const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const t =
+      obj?.list_reply?.title ||
+      obj?.list_reply?.row_title ||
+      obj?.interactive?.list_reply?.title ||
+      obj?.interactive?.list_reply?.row_title ||
+      null;
+    if (String(t || '').trim()) candidates.push(t);
+  } catch (_) {}
+
+  const hit = candidates.find((v) => String(v || '').trim());
+  return hit ? String(hit).trim() : null;
+}
+
+// -------------------------------------------------------
+// ✅ legacy support for Twilio "job_<ix>_<hash>" (INDEX ONLY)
+// -------------------------------------------------------
 function legacyIndexFromTwilioToken(tok) {
   const m = String(tok || '').trim().match(/^job_(\d{1,10})_[0-9a-z]+$/i);
   if (!m) return null;
@@ -1101,62 +1150,139 @@ function legacyIndexFromTwilioToken(tok) {
   return Number.isFinite(ix) ? ix : null;
 }
 
+// -------------------------------------------------------
+// Tripwire: forbid legacy_* resolutions when title exists
+// -------------------------------------------------------
+function enforceNoLegacyWhenTitle(result, hasTitleSignal) {
+  if (!result?.ok) return result;
+  if (!hasTitleSignal) return result;
+
+  const via = String(result?.via || '');
+  if (via.startsWith('legacy_')) {
+    console.error('[JOB_PICK_INVARIANT_BROKEN] legacy path used despite title signal', {
+      via,
+      inboundTitle: result?.inboundListTitle,
+      inboundBody: result?.inboundBody
+    });
+    return {
+      ok: false,
+      reason: 'invariant_broken_legacy_with_title',
+      jobNo: null,
+      via: 'reject_invariant_broken',
+      inboundBody: result?.inboundBody,
+      inboundListTitle: result?.inboundListTitle
+    };
+  }
+  return result;
+}
+
+// -------------------------------------------------------
+// Canonical interactive-list resolver (SAFE + PERMANENT)
+// -------------------------------------------------------
 async function resolveJobPickSelection(rawInboundText, inboundTwilioMeta, pickPA) {
   const tok = String(rawInboundText || '').trim();
 
   const sentRows = Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : [];
+  const displayedJobNos = Array.isArray(pickPA?.payload?.displayedJobNos)
+    ? pickPA.payload.displayedJobNos.map(Number).filter((n) => Number.isFinite(n))
+    : [];
+
   const hasPickState = !!sentRows.length;
 
-  // Pull inbound list title if Twilio provided it
-  const inboundListTitle =
-    inboundTwilioMeta?.ListTitle ||
-    inboundTwilioMeta?.listTitle ||
-    inboundTwilioMeta?.list_title ||
-    null;
+  // Title signal: treat ANY signal as authoritative "Twilio provided a title"
+  const inboundListTitle = getInboundTitleSignal(inboundTwilioMeta);
+  const hasTitleSignal = !!inboundListTitle;
 
-  // 1) ✅ PRIMARY: resolve by ListTitle text match (most reliable)
-  if (hasPickState && inboundListTitle) {
-    const needle = normalizePickTitle(stripListNumberPrefix(inboundListTitle));
-
-    // match against what WE sent (title/name)
-    const hit = sentRows.find((r) => {
-      const cand = normalizePickTitle(String(r?.title || r?.name || ''));
-      return cand && needle && cand === needle;
-    });
-
-    if (hit?.jobNo) {
-      return {
-        ok: true,
-        reason: null,
-        jobNo: Number(hit.jobNo),
-        via: 'list_title_match',
-        inboundBody: tok,
-        inboundListTitle
-      };
-    }
+  // 0) Stable id path: jobno_<N> (best-case)
+  const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
+  if (mJobNo?.[1]) {
+    return {
+      ok: true,
+      reason: null,
+      jobNo: Number(mJobNo[1]),
+      via: 'stable_jobno',
+      inboundBody: tok,
+      inboundListTitle
+    };
   }
 
-  // 2) Fallback: legacy token index -> sentRows index
-  // ⚠️ Only works if Twilio’s index happens to align; title-match is preferred.
-  if (hasPickState) {
-    const ix = legacyIndexFromTwilioToken(tok);
-    if (ix && ix >= 1 && ix <= sentRows.length) {
-      const r = sentRows[ix - 1];
-      if (r?.jobNo) {
-        return {
+  // 1) If Twilio provided a title: MUST title-match or reject.
+  //    No legacy mapping allowed in this branch, ever.
+  if (hasPickState && hasTitleSignal) {
+    const needleRaw = stripListNumberPrefix(inboundListTitle);
+    const needle = normalizePickTitle(needleRaw);
+    const needleDS = deSpace(needle);
+
+    const hit = sentRows.find((r) => {
+      const candRaw = String(r?.title || r?.name || '');
+      const cand = normalizePickTitle(candRaw);
+      if (!cand || !needle) return false;
+
+      // exact match OR de-spaced equality (MedwayPark vs Medway Park)
+      return cand === needle || deSpace(cand) === needleDS;
+    });
+
+    const res = hit?.jobNo
+      ? {
           ok: true,
           reason: null,
-          jobNo: Number(r.jobNo),
-          via: 'legacy_index_into_sentRows',
+          jobNo: Number(hit.jobNo),
+          via: 'list_title_match',
+          inboundBody: tok,
+          inboundListTitle
+        }
+      : {
+          ok: false,
+          reason: 'list_title_present_but_no_match',
+          jobNo: null,
+          via: 'reject_listtitle_no_match',
           inboundBody: tok,
           inboundListTitle
         };
+
+    // Tripwire guard (belt & suspenders)
+    return enforceNoLegacyWhenTitle(res, hasTitleSignal);
+  }
+
+  // 2) No title signal: allow legacy token index mapping using snapshots.
+  // Prefer displayedJobNos (what user saw), then sentRows.
+  if (hasPickState && !hasTitleSignal) {
+    const ix = legacyIndexFromTwilioToken(tok);
+    if (ix && ix >= 1) {
+      if (displayedJobNos.length && ix <= displayedJobNos.length) {
+        const jobNo = Number(displayedJobNos[ix - 1]);
+        if (Number.isFinite(jobNo)) {
+          const res = {
+            ok: true,
+            reason: null,
+            jobNo,
+            via: 'legacy_token_into_displayedJobNos',
+            inboundBody: tok,
+            inboundListTitle
+          };
+          return enforceNoLegacyWhenTitle(res, hasTitleSignal);
+        }
+      }
+
+      if (ix <= sentRows.length) {
+        const r = sentRows[ix - 1];
+        const jobNo = Number(r?.jobNo);
+        if (Number.isFinite(jobNo)) {
+          const res = {
+            ok: true,
+            reason: null,
+            jobNo,
+            via: 'legacy_index_into_sentRows',
+            inboundBody: tok,
+            inboundListTitle
+          };
+          return enforceNoLegacyWhenTitle(res, hasTitleSignal);
+        }
       }
     }
   }
 
-  // 3) Reject
-  return {
+  const res = {
     ok: false,
     reason: !hasPickState ? 'job_not_in_pick_state' : 'unresolvable_selection',
     jobNo: null,
@@ -1164,8 +1290,9 @@ async function resolveJobPickSelection(rawInboundText, inboundTwilioMeta, pickPA
     inboundBody: tok,
     inboundListTitle
   };
-}
 
+  return enforceNoLegacyWhenTitle(res, hasTitleSignal);
+}
 
 
 /* ---------------- receipt-safe extractors (TOTAL/date/store) ---------------- */

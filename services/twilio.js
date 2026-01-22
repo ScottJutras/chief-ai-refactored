@@ -337,5 +337,6 @@ module.exports = {
   sendBackfillConfirm,
   sendWhatsAppInteractiveList,
   toWhatsApp,
-  toTemplateVar
+  toTemplateVar,
+  sendWhatsAppTemplate
 };

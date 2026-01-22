@@ -32,6 +32,7 @@ const mergePendingTransactionState =
 
 const pg = require('../services/postgres');
 const { query } = pg;
+const { normalizeTranscriptMoney, stripLeadingFiller } = require('../utils/transcriptNormalize');
 
 /* ---------------- Small helpers ---------------- */
 
@@ -937,13 +938,27 @@ console.info('[MEDIA_RETURN]', {
 }
 
 if (hasTranscript) {
-  req.body.Body = result.transcript;
+  let t = String(result.transcript || '').trim();
+
+  // ✅ Fix voice fillers ("uh, expense ...") BEFORE routing
+  try {
+    if (typeof stripLeadingFiller === 'function') t = stripLeadingFiller(t);
+  } catch {}
+
+  // ✅ Apply your deterministic money normalization BEFORE routing
+  try {
+    if (typeof normalizeTranscriptMoney === 'function') t = normalizeTranscriptMoney(t);
+  } catch {}
+
+  req.body.Body = t;
+
   console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', {
-  head: String(result.transcript || '').slice(0, 12),
-});
+    head: String(t || '').slice(0, 12),
+  });
 
   return next();
 }
+
 
 
 
@@ -1145,7 +1160,15 @@ try {
 
         if (result && typeof result === 'object') {
           if (result.twiml) return sendTwiml(res, result.twiml);
-          if (result.transcript && !result.twiml) req.body.Body = result.transcript;
+          if (result.transcript && !result.twiml) {
+  let t = String(result.transcript || '').trim();
+  try { if (typeof stripLeadingFiller === 'function') t = stripLeadingFiller(t); } catch {}
+  try { if (typeof normalizeTranscriptMoney === 'function') t = normalizeTranscriptMoney(t); } catch {}
+  req.body.Body = t;
+  console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 12) });
+
+}
+
         } else if (typeof result === 'string' && result) {
           return sendTwiml(res, result);
         }

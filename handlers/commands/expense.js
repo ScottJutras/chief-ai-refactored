@@ -3070,6 +3070,9 @@ async function handleExpense(
    // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
   // Must see resolved text / button payload / body.
   const rawInboundText = getInboundText(input, inboundTwilioMeta);
+  // ✅ Define "raw" once (local to this handler) — used by edit-mode + AI intake
+  const raw = String(rawInboundText || '').trim();
+
 
   // ✅ Strict decision token extractor (ONLY these tokens; everything else => null)
   // NOTE: keep this ONE helper; remove any other strict-token helpers to avoid drift.

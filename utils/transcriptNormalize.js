@@ -51,4 +51,19 @@ function normalizeTranscriptMoney(text) {
   return s;
 }
 
-module.exports = { normalizeTranscriptMoney };
+function stripLeadingFiller(text) {
+  let s = String(text || '').trim();
+
+  // Remove common fillers at start (can repeat)
+  s = s.replace(/^(?:uh+|um+|erm+|ah+|like|okay|ok|so|well)[,\s]+/i, '');
+  s = s.replace(/^(?:uh+|um+|erm+|ah+|like|okay|ok|so|well)[,\s]+/i, '');
+
+  return s.trim();
+}
+
+
+module.exports = {
+  normalizeTranscriptMoney,
+  stripLeadingFiller
+};
+

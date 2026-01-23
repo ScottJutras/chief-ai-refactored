@@ -75,12 +75,20 @@ const normalizePhone = (raw = '') =>
 
 /* ---------------- WhatsApp Link Code helpers ---------------- */
 
-// Accept: "LINK 123456" (case-insensitive)
 function parseLinkCommand(raw = '') {
   const s = String(raw || '').trim();
-  const m = s.match(/^link\s+([a-z0-9]{4,12})$/i);
-  return m ? String(m[1]).trim() : null;
+
+  // LINK 123456
+  let m = s.match(/^link\s+([a-z0-9]{4,12})$/i);
+  if (m) return String(m[1]).trim();
+
+  // Just the code: 123456
+  m = s.match(/^([0-9]{4,12})$/);
+  if (m) return String(m[1]).trim();
+
+  return null;
 }
+
 
 // Uses your existing pg.query connection
 async function redeemLinkCodeToTenant({ code, fromPhone }) {

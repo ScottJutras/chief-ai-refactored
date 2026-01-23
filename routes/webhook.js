@@ -73,6 +73,71 @@ const ok = (res, text = null) => {
 const normalizePhone = (raw = '') =>
   String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
 
+/* ---------------- WhatsApp Link Code helpers ---------------- */
+
+// Accept: "LINK 123456" (case-insensitive)
+function parseLinkCommand(raw = '') {
+  const s = String(raw || '').trim();
+  const m = s.match(/^link\s+([a-z0-9]{4,12})$/i);
+  return m ? String(m[1]).trim() : null;
+}
+
+// Uses your existing pg.query connection
+async function redeemLinkCodeToTenant({ code, fromPhone }) {
+  const cleanCode = String(code || '').trim();
+  const phone = String(fromPhone || '').trim();
+
+  if (!cleanCode || !phone) return { ok: false, error: 'Missing code or phone.' };
+
+  // 1) Find valid, unused code
+  // NOTE: adjust table/column names here if your SQL used different names
+   const row = await query(
+    `
+    SELECT tenant_id, portal_user_id
+      FROM public.chiefos_link_codes
+     WHERE code = $1
+       AND used_at IS NULL
+       AND (expires_at IS NULL OR expires_at > now())
+     LIMIT 1
+    `,
+    [cleanCode]
+  );
+
+  const tenantId = row?.rows?.[0]?.tenant_id;
+  if (!tenantId) return { ok: false, error: 'Invalid or expired link code.' };
+
+  // 2) Upsert identity mapping (WhatsApp phone -> tenant)
+  // We use the table you said exists: chiefos_ingestion_identities
+  // NOTE: if your schema uses different columns, adjust here.
+  await query(
+    `
+    INSERT INTO public.chiefos_identity_map (tenant_id, kind, identifier, created_at)
+    VALUES ($1, 'whatsapp', $2, now())
+    ON CONFLICT (kind, identifier)
+    DO UPDATE SET
+      tenant_id = EXCLUDED.tenant_id,
+      updated_at = now()
+    `,
+    [tenantId, phone]
+  );
+
+
+  // 3) Mark code used (prevents reuse)
+  // NOTE: if you don’t have used_by / used_by_phone, you can remove those lines.
+  await query(
+    `
+    UPDATE public.chiefos_link_codes
+       SET used_at = now()
+     WHERE code = $1
+    `,
+    [cleanCode]
+  );
+
+  return { ok: true, tenantId };
+}
+
+
+
 function pickFirstMedia(body = {}) {
   const n = parseInt(body.NumMedia || '0', 10) || 0;
   if (n <= 0) return { n: 0, url: null, type: null };
@@ -1003,6 +1068,38 @@ router.post('*', async (req, res, next) => {
         .update(`${req.from || ''}|${text}`)
         .digest('hex')
         .slice(0, 32);
+
+            // -----------------------------------------------------------------------
+    // ✅ WHATSAPP LINK CODE (must run EARLY, before resume/nudges/PA/fast-paths)
+    // User texts: "LINK 123456"
+    // -----------------------------------------------------------------------
+    const linkCode = parseLinkCommand(text);
+    if (linkCode) {
+      try {
+        const phone = String(req.from || '').trim();
+        if (!phone) return ok(res, 'Missing sender phone. Try again.');
+
+        const out = await redeemLinkCodeToTenant({ code: linkCode, fromPhone: phone });
+
+        if (!out?.ok) {
+          return ok(
+            res,
+            `❌ Link failed: ${out?.error || 'Unknown error'}\n\nGo back to the portal and generate a fresh code, then text: LINK <code>`
+          );
+        }
+
+        // Optional: clear any stale pending state after linking
+        await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
+
+        return ok(
+          res,
+          `✅ WhatsApp linked.\n\nYou can now log:\n• expense $45 Home Depot\n• revenue $1200 from client\n• clock in\n\n(Go back to the portal and refresh.)`
+        );
+      } catch (e) {
+        console.warn('[WEBHOOK] link code redeem failed:', e?.message);
+        return ok(res, `❌ Link failed: ${e?.message || 'Unknown error'}`);
+      }
+    }
 
     // -----------------------------------------------------------------------
     // "resume" => re-send the pending confirm card if we have a confirm pending-action

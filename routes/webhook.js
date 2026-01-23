@@ -109,14 +109,12 @@ async function redeemLinkCodeToTenant({ code, fromPhone }) {
   // 2) Upsert identity mapping (WhatsApp phone -> tenant)
   // We use the table you said exists: chiefos_ingestion_identities
   // NOTE: if your schema uses different columns, adjust here.
-  await query(
+    await query(
     `
     INSERT INTO public.chiefos_identity_map (tenant_id, kind, identifier, created_at)
     VALUES ($1, 'whatsapp', $2, now())
     ON CONFLICT (kind, identifier)
-    DO UPDATE SET
-      tenant_id = EXCLUDED.tenant_id,
-      updated_at = now()
+    DO UPDATE SET tenant_id = EXCLUDED.tenant_id
     `,
     [tenantId, phone]
   );
@@ -1068,38 +1066,41 @@ router.post('*', async (req, res, next) => {
         .update(`${req.from || ''}|${text}`)
         .digest('hex')
         .slice(0, 32);
+// -----------------------------------------------------------------------
+// ✅ LINK CODE REDEEM (must run EARLY so it doesn't fall into agent)
+// Accepts: "LINK 123456"
+// -----------------------------------------------------------------------
+{
+  const linkCode = parseLinkCommand(text);
+  if (linkCode) {
+    try {
+      const phone = String(req.from || "").trim();
+      if (!phone) return ok(res, "Missing sender phone. Try again.");
 
-            // -----------------------------------------------------------------------
-    // ✅ WHATSAPP LINK CODE (must run EARLY, before resume/nudges/PA/fast-paths)
-    // User texts: "LINK 123456"
-    // -----------------------------------------------------------------------
-    const linkCode = parseLinkCommand(text);
-    if (linkCode) {
-      try {
-        const phone = String(req.from || '').trim();
-        if (!phone) return ok(res, 'Missing sender phone. Try again.');
+      const out = await redeemLinkCodeToTenant({ code: linkCode, fromPhone: phone });
 
-        const out = await redeemLinkCodeToTenant({ code: linkCode, fromPhone: phone });
-
-        if (!out?.ok) {
-          return ok(
-            res,
-            `❌ Link failed: ${out?.error || 'Unknown error'}\n\nGo back to the portal and generate a fresh code, then text: LINK <code>`
-          );
-        }
-
-        // Optional: clear any stale pending state after linking
-        await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
-
+      if (!out?.ok) {
         return ok(
           res,
-          `✅ WhatsApp linked.\n\nYou can now log:\n• expense $45 Home Depot\n• revenue $1200 from client\n• clock in\n\n(Go back to the portal and refresh.)`
+          `❌ Link failed: ${out?.error || "Unknown error"}\n\nGo back to the portal and generate a fresh code, then text: LINK <code>`
         );
-      } catch (e) {
-        console.warn('[WEBHOOK] link code redeem failed:', e?.message);
-        return ok(res, `❌ Link failed: ${e?.message || 'Unknown error'}`);
       }
+
+      // Optional: clear any stale pending state after linking
+      await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
+
+      return ok(
+        res,
+        `✅ WhatsApp linked.\n\nNow try:\n• expense $18 Home Depot\n• revenue $500 deposit\n\n(Go back to the portal and tap “I sent it”.)`
+      );
+    } catch (e) {
+      console.warn("[LINK] redeem failed:", e?.message);
+      return ok(res, "⚠️ Link failed. Please request a new code in the portal and try again.");
     }
+  }
+}
+
+
 
     // -----------------------------------------------------------------------
     // "resume" => re-send the pending confirm card if we have a confirm pending-action

@@ -75,19 +75,30 @@ const normalizePhone = (raw = '') =>
 
 /* ---------------- WhatsApp Link Code helpers ---------------- */
 
+// ✅ Canonical phone normalization for identity map (store +E164 only)
+function normalizeE164(fromRaw) {
+  // Twilio often gives: "whatsapp:+14165551234"
+  const s = String(fromRaw || "").trim();
+  const m = s.match(/\+?[0-9]{8,15}/);
+  if (!m) return null;
+  const digits = m[0].startsWith("+") ? m[0] : `+${m[0]}`;
+  return digits;
+}
+
 function parseLinkCommand(raw = '') {
   const s = String(raw || '').trim();
 
-  // LINK 123456
+  // LINK 123456  (legacy)
   let m = s.match(/^link\s+([a-z0-9]{4,12})$/i);
   if (m) return String(m[1]).trim();
 
   // Just the code: 123456
-  m = s.match(/^([0-9]{4,12})$/);
+  m = s.match(/^([0-9]{6})$/);
   if (m) return String(m[1]).trim();
 
   return null;
 }
+
 
 
 // Uses your existing pg.query connection
@@ -97,51 +108,46 @@ async function redeemLinkCodeToTenant({ code, fromPhone }) {
 
   if (!cleanCode || !phone) return { ok: false, error: 'Missing code or phone.' };
 
-  // 1) Find valid, unused code
-  // NOTE: adjust table/column names here if your SQL used different names
-   const row = await query(
+  // 1) Atomically "claim" the code (mark used) and get tenant_id.
+  // This prevents races + ensures one-time use.
+  const claimed = await query(
     `
-    SELECT tenant_id, portal_user_id
-      FROM public.chiefos_link_codes
-     WHERE code = $1
-       AND used_at IS NULL
-       AND (expires_at IS NULL OR expires_at > now())
-     LIMIT 1
+    WITH claimed AS (
+      UPDATE public.chiefos_link_codes
+         SET used_at = now()
+       WHERE code = $1
+         AND used_at IS NULL
+         AND (expires_at IS NULL OR expires_at > now())
+       RETURNING tenant_id
+    )
+    SELECT tenant_id FROM claimed
     `,
     [cleanCode]
   );
 
-  const tenantId = row?.rows?.[0]?.tenant_id;
-  if (!tenantId) return { ok: false, error: 'Invalid or expired link code.' };
+  const tenantId = claimed?.rows?.[0]?.tenant_id;
+  if (!tenantId) {
+    return {
+      ok: false,
+      error: 'That code was already used or expired. Generate a new one in the portal.'
+    };
+  }
 
   // 2) Upsert identity mapping (WhatsApp phone -> tenant)
-  // We use the table you said exists: chiefos_ingestion_identities
-  // NOTE: if your schema uses different columns, adjust here.
-    await query(
+  await query(
     `
     INSERT INTO public.chiefos_identity_map (tenant_id, kind, identifier, created_at)
     VALUES ($1, 'whatsapp', $2, now())
     ON CONFLICT (kind, identifier)
-    DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+    DO UPDATE SET
+      tenant_id = EXCLUDED.tenant_id,
+      updated_at = now()
     `,
     [tenantId, phone]
   );
 
-
-  // 3) Mark code used (prevents reuse)
-  // NOTE: if you don’t have used_by / used_by_phone, you can remove those lines.
-  await query(
-    `
-    UPDATE public.chiefos_link_codes
-       SET used_at = now()
-     WHERE code = $1
-    `,
-    [cleanCode]
-  );
-
   return { ok: true, tenantId };
 }
-
 
 
 function pickFirstMedia(body = {}) {
@@ -242,7 +248,7 @@ function pendingTxnNudgeMessage(pending) {
  *   "#3 J8 1559..." -> jobno_8
  * ----------------------------------------------------------------------- */
 
-function resolveTwilioInboundText(body = {}) {
+function getInboundText(body = {}) {
   const b = body || {};
   const rawBody = String(b.Body || '').trim();
 
@@ -337,68 +343,7 @@ function normalizeListPickToken(raw = '', { listTitle = '' } = {}) {
   return s;
 }
 
-function getInboundText(b = {}) {
-  const get = (...keys) => {
-    for (const k of keys) {
-      if (b[k] != null && String(b[k]).trim() !== '') return b[k];
-    }
-    return undefined;
-  };
 
-  // 1) Buttons (quick replies / persistentAction)
-  const btnPayload = get('ButtonPayload', 'buttonPayload');
-  const btnText = get('ButtonText', 'buttonText');
-  if (btnPayload) return String(btnPayload).trim();
-  if (btnText) return String(btnText).trim();
-
-  // 2) Interactive list selection IDs (prefer IDs over titles)
-  const listId =
-    get('ListRowId', 'ListRowID', 'listRowId', 'listRowID') ||
-    get('ListId', 'listId', 'ListItemId', 'listItemId', 'ListReplyId', 'listReplyId');
-
-  if (listId) {
-    const id = String(listId).trim();
-
-    // ✅ If we already have a stable ID, return it AS-IS.
-    // This preserves: jobno_1556, job_1_hash, overhead, more, etc.
-    return id;
-  }
-
-  // 3) Some Twilio deliveries put the ID into Body
-  const body = String(get('Body', 'body') || '').trim();
-  if (body) {
-    // If Body looks like an ID token, preserve it.
-    if (/^(jobno_\d{1,10}|jobix_\d{1,10}|job_\d{1,10}_[0-9a-z]+|overhead|more)$/i.test(body)) {
-      return body;
-    }
-    // Otherwise: treat as normal inbound text
-    return body;
-  }
-
-  // 4) As a last resort, try extracting job_no from the title
-  // NEW format often uses "J1556 ..." (your sendJobPickerOrFallback uses that)
-  const listTitle =
-    get('ListRowTitle', 'listRowTitle') ||
-    get('ListTitle', 'listTitle', 'ListItemTitle', 'listItemTitle', 'ListReplyTitle', 'listReplyTitle');
-
-  if (listTitle) {
-    const t = String(listTitle).trim();
-
-    // Prefer J1234 form -> jobno_1234
-    const mJ = t.match(/\bJ(\d{1,10})\b/i);
-    if (mJ?.[1]) return `jobno_${Number(mJ[1])}`;
-
-    // If the title is "Overhead" / "More jobs…"
-    if (/^overhead$/i.test(t)) return 'overhead';
-    if (/^more\b/i.test(t)) return 'more';
-
-    // Avoid converting "#1 Foo" to jobix_1 (that’s the bug).
-    // Just return the title text if nothing else is usable.
-    return t;
-  }
-
-  return '';
-}
 
 
 /* ---------------- NL heuristics for expense/revenue ---------------- */
@@ -797,7 +742,10 @@ router.all('*', (req, res, next) => {
 /* ---------------- Identity + canonical URL ---------------- */
 
 router.use((req, _res, next) => {
-  req.from = req.body?.From ? normalizePhone(req.body.From) : null;
+  // ✅ Canonical WhatsApp identity (store +E164 only)
+  req.from = req.body?.From ? normalizeE164(req.body.From) : null;
+
+  // Keep ownerId semantics unchanged if the rest of your system expects this
   req.ownerId = req.from || null;
 
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
@@ -807,6 +755,7 @@ router.use((req, _res, next) => {
   req.twilioUrl = `${proto}://${host}${path}`;
   next();
 });
+
 
 /* ---------------- Phase tracker (debug) ---------------- */
 
@@ -1062,7 +1011,17 @@ router.post('*', async (req, res, next) => {
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
     const crypto = require('crypto');
 
-    let text = String(getInboundText(req.body || {}) || '').trim();
+    // ✅ Compute canonical inbound text ONCE (button/list/IRJ-aware)
+    const resolvedInbound = String(getInboundText(req.body || {}) || '').trim();
+
+    // ✅ If there's no text and no media, do nothing (avoid burning cycles)
+    if (!resolvedInbound && numMedia === 0) return ok(res);
+
+    // ✅ Make canonical resolved text available to downstream handlers (expense.js reads this)
+    req.body.ResolvedInboundText = resolvedInbound;
+
+    // Use resolvedInbound as the main text everywhere in this router
+    let text = resolvedInbound;
     let lc = text.toLowerCase();
 
     // ✅ Compute messageSid EARLY so resume can use it safely
@@ -1074,39 +1033,47 @@ router.post('*', async (req, res, next) => {
         .update(`${req.from || ''}|${text}`)
         .digest('hex')
         .slice(0, 32);
-// -----------------------------------------------------------------------
-// ✅ LINK CODE REDEEM (must run EARLY so it doesn't fall into agent)
-// Accepts: "LINK 123456"
-// -----------------------------------------------------------------------
-{
-  const linkCode = parseLinkCommand(text);
-  if (linkCode) {
-    try {
-      const phone = String(req.from || "").trim();
-      if (!phone) return ok(res, "Missing sender phone. Try again.");
 
-      const out = await redeemLinkCodeToTenant({ code: linkCode, fromPhone: phone });
+    // -----------------------------------------------------------------------
+    // ✅ LINK CODE REDEEM (must run EARLY so it doesn't fall into agent)
+    // Accepts: "LINK 123456" (legacy) OR "123456"
+    // IMPORTANT: uses resolvedInbound (button/list-aware) AND canonical phone (+E164)
+    // -----------------------------------------------------------------------
+    {
+      const linkCode = parseLinkCommand(text);
 
-      if (!out?.ok) {
-        return ok(
-          res,
-          `❌ Link failed: ${out?.error || "Unknown error"}\n\nGo back to the portal and generate a fresh code, then text: LINK <code>`
-        );
+      if (linkCode) {
+        try {
+          const phone = String(req.from || '').trim(); // ✅ already +E164 from middleware above
+          if (!phone) {
+            console.warn('[LINK] missing/invalid From:', req.body?.From);
+            return ok(res, 'Missing sender phone. Try again.');
+          }
+
+          const out = await redeemLinkCodeToTenant({ code: linkCode, fromPhone: phone });
+
+          if (!out?.ok) {
+            return ok(
+              res,
+              `❌ Link failed: ${out?.error || 'Unknown error'}\n\nGo back to the portal, generate a fresh code, then text the 6 digits.`
+            );
+          }
+
+          // Optional: clear any stale pending state after linking
+          try {
+            await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from });
+          } catch {}
+
+          return ok(
+            res,
+            `✅ WhatsApp linked.\n\nNow you can try:\n• expense $18 Home Depot\n• revenue $500 deposit`
+          );
+        } catch (e) {
+          console.warn('[LINK] redeem failed:', e?.message);
+          return ok(res, '⚠️ Link failed. Please request a new code in the portal and try again.');
+        }
       }
-
-      // Optional: clear any stale pending state after linking
-      await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
-
-      return ok(
-        res,
-        `✅ WhatsApp linked.\n\nNow try:\n• expense $18 Home Depot\n• revenue $500 deposit\n\n(Go back to the portal and tap “I sent it”.)`
-      );
-    } catch (e) {
-      console.warn("[LINK] redeem failed:", e?.message);
-      return ok(res, "⚠️ Link failed. Please request a new code in the portal and try again.");
     }
-  }
-}
 
 
 

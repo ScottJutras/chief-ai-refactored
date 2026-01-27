@@ -88,6 +88,70 @@ async function queryWithRetry(text, params, attempt = 1) {
     throw e;
   }
 }
+function getDbQueryFn() {
+  // Prefer local helper if it exists
+  if (typeof query === 'function') return query;
+
+  // Common patterns
+  if (typeof module.exports?.query === 'function') return module.exports.query;
+  if (typeof exports?.query === 'function') return exports.query;
+
+  // Pool fallbacks
+  if (module.exports?.pool?.query) return module.exports.pool.query.bind(module.exports.pool);
+  if (typeof pool?.query === 'function') return pool.query.bind(pool);
+
+  throw new Error('DB query function not available (query/pool missing)');
+}
+// ✅ Cancel a draft by source message id (best-effort)
+async function cancelCilDraftBySourceMsg({ owner_id, source_msg_id, status = 'cancelled' } = {}) {
+  const ownerKey = String(owner_id || '').trim();
+  const src = String(source_msg_id || '').trim();
+  if (!ownerKey || !src) return { ok: false, reason: 'missing_owner_or_source' };
+
+  const q = getDbQueryFn();
+
+  const { rows } = await q(
+    `
+    update public.cil_drafts
+       set status = $3,
+           updated_at = now()
+     where owner_id::text = $1
+       and source_msg_id = $2
+       and status = 'draft'
+     returning id, status, source_msg_id
+    `,
+    [ownerKey, src, String(status || 'cancelled')]
+  );
+
+  return { ok: true, cancelled: rows?.length || 0, row: rows?.[0] || null };
+}
+
+// ✅ Expire old drafts (so PA TTL expiration doesn't leave zombies)
+async function expireOldCilDrafts(owner_id, { maxAgeMinutes = 360 } = {}) {
+  const ownerKey = String(owner_id || '').trim();
+  if (!ownerKey) return { ok: false, reason: 'missing_owner' };
+
+  const mins = Number(maxAgeMinutes);
+  const maxMins = Number.isFinite(mins) && mins > 0 ? Math.floor(mins) : 360;
+
+  const q = getDbQueryFn();
+
+  const { rows } = await q(
+    `
+    update public.cil_drafts
+       set status = 'expired',
+           updated_at = now()
+     where owner_id::text = $1
+       and status = 'draft'
+       and created_at < (now() - (($2::text || ' minutes')::interval))
+     returning id
+    `,
+    [ownerKey, String(maxMins)]
+  );
+
+  return { ok: true, expired: rows?.length || 0 };
+}
+
 
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await pool.connect();
@@ -645,21 +709,132 @@ async function confirmCilDraftBySourceMsg({
     returning id
   `;
 
-  const r = await queryWithTimeout(sql, [String(owner_id), String(source_msg_id), Number(confirmed_transaction_id)], timeoutMs);
+  const r = await queryWithTimeout(
+    sql,
+    [String(owner_id), String(source_msg_id), Number(confirmed_transaction_id)],
+    timeoutMs
+  );
+
   return { updated: (r?.rows?.length || 0) > 0, id: r?.rows?.[0]?.id ?? null };
 }
 
-async function countPendingCilDrafts(owner_id, { timeoutMs = 2500 } = {}) {
-  if (!owner_id) throw new Error('countPendingCilDrafts missing owner_id');
+// ✅ Cancel a draft by source message id (best-effort)
+async function cancelCilDraftBySourceMsg(
+  { owner_id, source_msg_id, status = 'cancelled' } = {},
+  { timeoutMs = 4000 } = {}
+) {
+  const ownerKey = String(owner_id || '').trim();
+  const src = String(source_msg_id || '').trim();
+  if (!ownerKey || !src) return { ok: false, reason: 'missing_owner_or_source' };
+
+  const sql = `
+    update public.cil_drafts
+       set status = $3,
+           updated_at = now()
+     where owner_id::text = $1
+       and source_msg_id = $2
+       and status = 'draft'
+     returning id, status, source_msg_id
+  `;
+
+  const r = await queryWithTimeout(sql, [ownerKey, src, String(status || 'cancelled')], timeoutMs);
+
+  return { ok: true, cancelled: r?.rows?.length || 0, row: r?.rows?.[0] || null };
+}
+
+// ✅ Expire old drafts (so PA TTL expiration doesn't leave zombies)
+async function expireOldCilDrafts(
+  owner_id,
+  { maxAgeMinutes = 360 } = {},
+  { timeoutMs = 4000 } = {}
+) {
+  const ownerKey = String(owner_id || '').trim();
+  if (!ownerKey) return { ok: false, reason: 'missing_owner' };
+
+  const mins = Number(maxAgeMinutes);
+  const maxMins = Number.isFinite(mins) && mins > 0 ? Math.floor(mins) : 360;
+
+  const sql = `
+    update public.cil_drafts
+       set status = 'expired',
+           updated_at = now()
+     where owner_id::text = $1
+       and status = 'draft'
+       and created_at < (now() - (($2::text || ' minutes')::interval))
+     returning id
+  `;
+
+  const r = await queryWithTimeout(sql, [ownerKey, String(maxMins)], timeoutMs);
+  return { ok: true, expired: r?.rows?.length || 0 };
+}
+
+async function countPendingCilDrafts(ownerId) {
+  const ownerKey = String(ownerId || '').trim();
+  if (!ownerKey) return 0;
+
+  // ✅ best-effort cleanup (prevents PA TTL from leaving “draft” zombies)
+  try {
+    const ttlMins = Number(process.env.CIL_DRAFT_TTL_MINUTES) || 360;
+    await expireOldCilDrafts(ownerKey, { maxAgeMinutes: ttlMins });
+  } catch {}
+
   const sql = `
     select count(*)::int as n
     from public.cil_drafts
     where owner_id::text = $1
       and status = 'draft'
   `;
-  const r = await queryWithTimeout(sql, [String(owner_id)], timeoutMs);
+
+  const r = await queryWithTimeout(sql, [ownerKey], 2500);
   return Number(r?.rows?.[0]?.n) || 0;
 }
+
+// ✅ Cancel most-recent draft for this actor/owner (fallback when source_msg_id missing/mismatch)
+async function cancelLatestCilDraftForActor({
+  owner_id,
+  actor_phone,
+  kind = null,
+  status = 'cancelled'
+} = {}) {
+  const ownerKey = String(owner_id || '').trim();
+  const actorRaw = String(actor_phone || '').trim();
+  const actorDigits = actorRaw.replace(/\D/g, '');
+  if (!ownerKey || !actorDigits) return { ok: false, reason: 'missing_owner_or_actor' };
+
+  const q = getDbQueryFn();
+
+  const params = [ownerKey, actorDigits, String(status || 'cancelled')];
+  let kindSql = '';
+  if (kind) {
+    kindSql = ' and kind = $4 ';
+    params.push(String(kind));
+  }
+
+  const { rows } = await q(
+    `
+    update public.cil_drafts d
+       set status = $3,
+           updated_at = now()
+     where d.id = (
+       select id
+         from public.cil_drafts
+        where owner_id::text = $1
+          and regexp_replace(coalesce(actor_phone,''), '\\D', '', 'g') = $2
+          and status = 'draft'
+          ${kindSql}
+        order by created_at desc
+        limit 1
+     )
+     returning id, status, source_msg_id, actor_phone, kind, created_at
+    `,
+    params
+  );
+
+  return { ok: true, cancelled: rows?.length || 0, row: rows?.[0] || null };
+}
+
+
+
 
 /**
  * ✅ insertTransaction()
@@ -3330,8 +3505,10 @@ module.exports = {
   getMostRecentPendingActionForUser,
   createCilDraft,
   confirmCilDraftBySourceMsg,
+  cancelCilDraftBySourceMsg,
+  expireOldCilDrafts,
   countPendingCilDrafts,
-
+  cancelLatestCilDraftForActor,
 
   // kept helpers (if other files import them)
   getJobByName,

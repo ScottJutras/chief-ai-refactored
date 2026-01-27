@@ -9,7 +9,8 @@ const cors = require('cors');
 const webhookRouter      = require('./routes/webhook');
 const parseRouter        = require('./routes/parse');
 const deepDiveRouter     = require('./routes/deepDive');
-const dashboardRouter    = require('./routes/dashboard'); // NEW: KPI dashboard API
+const dashboardRouter    = require('./routes/dashboard'); // KPI dashboard API
+const debugRouter        = require('./routes/debug');     // ✅ debug endpoints (dev-only recommended)
 
 const app = express();
 
@@ -51,15 +52,19 @@ app.use('/webhook', webhookRouter); // temporary alias
 app.use('/parse',     parseRouter);
 app.use('/deep-dive', deepDiveRouter);
 
+// ✅ Debug tools (returns Answer Contract JSON) — strongly recommend dev-only
+if (!process.env.VERCEL) {
+  app.use('/api', debugRouter);
+}
+
 // JSON dashboard API used by the React frontend (Vite app)
 // routes/dashboard.js defines GET /dashboard, so mounting at /api → /api/dashboard
-app.use('/api', dashboardRouter);
+app.use('/api/dashboard', dashboardRouter);
 
 /* ---------------- Local dev only ---------------- */
 if (!process.env.VERCEL && process.env.NODE_ENV !== 'test') {
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
 }
-
 
 module.exports = app;

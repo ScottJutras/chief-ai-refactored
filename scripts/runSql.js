@@ -1,5 +1,6 @@
 // scripts/runSql.js
-require('dotenv').config({ path: './config/.env' });   // <<< add
+require('../config/env');
+
 const fs = require('fs');
 const { query } = require('../services/postgres');
 

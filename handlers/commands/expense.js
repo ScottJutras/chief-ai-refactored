@@ -3086,7 +3086,6 @@ async function handleExpense(
 ) {
   // Normalize Twilio meta (req.body) if caller provided it.
   twilioMeta = twilioMeta && typeof twilioMeta === 'object' ? twilioMeta : {};
-
   const getTwilio = (k) =>
     twilioMeta?.[k] ??
     twilioMeta?.[String(k).toLowerCase()] ??
@@ -3117,17 +3116,15 @@ async function handleExpense(
 
   // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
   // Must see resolved text / button payload / body.
-   // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
-  // Must see resolved text / button payload / body.
   const rawInboundText = getInboundText(input, inboundTwilioMeta);
+
   // ✅ Define "raw" once (local to this handler) — used by edit-mode + AI intake
   const raw = String(rawInboundText || '').trim();
 
-
   // ✅ Strict decision token extractor (ONLY these tokens; everything else => null)
   // NOTE: keep this ONE helper; remove any other strict-token helpers to avoid drift.
-  function strictDecisionToken(raw) {
-    const t = String(raw || '').trim().toLowerCase();
+  function strictDecisionToken(s) {
+    const t = String(s || '').trim().toLowerCase();
     if (!t) return null;
 
     // normalize a few common variants
@@ -3144,8 +3141,22 @@ async function handleExpense(
     return null;
   }
 
+  // ✅ Debug: prove what token we see for this inbound message
+  const strictTok = strictDecisionToken(raw);
+  console.info('[EXPENSE_IN]', {
+    ownerId,
+    fromPhone,
+    paUserId,
+    raw: raw.slice(0, 140),
+    strictTok,
+    messageSid: inboundTwilioMeta?.MessageSid || null,
+    originalReplied: inboundTwilioMeta?.OriginalRepliedMessageSid || null,
+    waId: inboundTwilioMeta?.WaId || null
+  });
+
   const inboundLower = normLower(rawInboundText);
-        // ✅ Stable id for idempotency + flow correlation
+
+  // ✅ Stable id for idempotency + flow correlation
   // Prefer Twilio MessageSid (most stable), then provided sourceMsgId, then deterministic fallback.
   const stableMsgId =
     String(inboundTwilioMeta?.MessageSid || '').trim() ||
@@ -3155,9 +3166,6 @@ async function handleExpense(
 
   const safeMsgId = stableMsgId;
 
-
-  // -------------------------------------------------------------------
-  // ✅ SINGLE-DEFINITION CANONICALS (must be immediately after [PA_KEY])
   // -------------------------------------------------------------------
 
   // ✅ Canonical CONFIRM PA key used everywhere in this handler
@@ -4581,23 +4589,119 @@ try {
         );
       }
 
-      // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending
-      if (strictTok === 'cancel') {
-        try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
-        try { await deletePA({ ownerId, userId: pickKey, kind: PA_KIND_PICK_JOB }); } catch {}
+   /// ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending + cancel CIL draft
+if (strictTok === 'cancel') {
+  // ---------------------------------------------
+  // 0) Extract the best possible source_msg_id
+  // ---------------------------------------------
+  const paSourceMsgId = String(confirmPA?.payload?.sourceMsgId || '').trim() || null;
 
-        try {
-          const p2 = await getPendingTransactionState(paUserId);
-          if (p2?.allow_new_while_pending) {
-            await mergePendingTransactionState(paUserId, {
-              allow_new_while_pending: false,
-              allow_new_set_at: null
-            });
-          }
-        } catch {}
+  const txSourceMsgId =
+    String(
+      confirmPA?.payload?.draft?.txSourceMsgId ||
+      confirmPA?.payload?.draft?.sourceMsgId ||
+      ''
+    ).trim() || null;
 
-        return out(twimlText('❌ Cancelled. You’re cleared.'), false);
-      }
+  const mediaSourceRaw =
+    String(confirmPA?.payload?.draft?.media_source_msg_id || '').trim() || null;
+
+  // media_source_msg_id is often like: "<paUserId>:SMxxxxxxxx"
+  let mediaMsgSid = null;
+  if (mediaSourceRaw) {
+    const m = mediaSourceRaw.match(/\bSM[a-f0-9]{10,64}\b/i);
+    if (m) mediaMsgSid = m[0];
+  }
+
+  const srcId = paSourceMsgId || txSourceMsgId || mediaMsgSid || null;
+
+  // ✅ Normalize actor phone to digits-only (must match cil_drafts.actor_phone)
+  const actorDigits =
+    normalizeIdentityDigits(fromPhone) ||
+    normalizeIdentityDigits(paUserId) ||
+    String(fromPhone || '').replace(/\D/g, '');
+
+  // ✅ Guaranteed proof cancel branch was entered
+  console.info('[EXPENSE_CANCEL_HIT]', {
+    ownerId,
+    fromPhone,
+    actorDigits,
+    paKey,
+    pickUserId,
+    strictTok,
+    srcId,
+    paSourceMsgId,
+    txSourceMsgId,
+    media_source_msg_id: mediaSourceRaw,
+    mediaMsgSid
+  });
+
+  // ---------------------------------------------
+  // 1) Delete PAs (confirm + pick)
+  // ---------------------------------------------
+  try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
+  try { await deletePA({ ownerId, userId: pickUserId, kind: PA_KIND_PICK_JOB }); } catch {}
+
+  // ---------------------------------------------
+  // 2) Cancel matching CIL draft (best-effort + fallback)
+  // ---------------------------------------------
+  let cancelledBySrc = 0;
+
+  // 2a) cancel by source_msg_id if possible
+  try {
+    if (srcId) {
+      const r = await pg.cancelCilDraftBySourceMsg({
+        owner_id: ownerId,
+        source_msg_id: srcId,
+        status: 'cancelled'
+      });
+      cancelledBySrc = Number(r?.cancelled || 0) || 0;
+      console.info('[CIL_DRAFT_CANCEL]', { srcId, cancelled: cancelledBySrc });
+    } else {
+      console.warn('[CIL_DRAFT_CANCEL] no srcId found; cannot cancel by source_msg_id');
+    }
+  } catch (e) {
+    console.warn('[CIL_DRAFT] cancel by source_msg_id failed (ignored):', e?.message);
+  }
+
+  // 2b) fallback: cancel latest draft for this actor phone (digits-only!)
+  try {
+    if (!cancelledBySrc) {
+      const r2 = await pg.cancelLatestCilDraftForActor({
+        owner_id: ownerId,
+        actor_phone: actorDigits, // ✅ THIS is the fix
+        kind: 'expense',
+        status: 'cancelled'
+      });
+
+      console.info('[CIL_DRAFT_CANCEL_FALLBACK]', {
+        actorDigits,
+        cancelled: r2?.cancelled ?? null,
+        id: r2?.row?.id ?? null,
+        source_msg_id: r2?.row?.source_msg_id ?? null,
+        status: r2?.row?.status ?? null
+      });
+    }
+  } catch (e) {
+    console.warn('[CIL_DRAFT] cancel fallback failed (ignored):', e?.message);
+  }
+
+  // ---------------------------------------------
+  // 3) Clear allow_new_while_pending
+  // ---------------------------------------------
+  try {
+    const p2 = await getPendingTransactionState(paUserId);
+    if (p2?.allow_new_while_pending) {
+      await mergePendingTransactionState(paUserId, {
+        allow_new_while_pending: false,
+        allow_new_set_at: null
+      });
+    }
+  } catch {}
+
+  return out(twimlText('❌ Cancelled. You’re cleared.'), false);
+}
+
 
       // --------------------------------------------
       // ✅ YES (HARDENED + DOES INSERT + MUST RETURN)

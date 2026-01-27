@@ -6,6 +6,7 @@
 
 const { LLMProvider } = require('../llm');
 const { CHIEF_SYSTEM_PROMPT } = require('../../prompts/chief.system');
+const txTools = require('../agentTools/transactions');
 
 // ----- Subscription gate (free/basic can't use Agent) -----
 function canUseAgent(userProfile) {
@@ -59,6 +60,80 @@ function getTools() {
     toolsSpec.push(jobTool);
   } catch (e) {
     console.warn('[AGENT] jobs tool not available:', e?.message);
+  }
+
+  // -------------------------------------------------------
+  // ✅ Transactions (read-only): Tool A/B/C
+  // These are "truth tools" for the brain. No writes.
+  // -------------------------------------------------------
+  const txToolSpecs = [
+    {
+      type: 'function',
+      function: {
+        name: 'search_transactions',
+        description: 'Search confirmed transactions for this owner with filters. Read-only.',
+        parameters: {
+          type: 'object',
+          required: ['owner_id'],
+          properties: {
+            owner_id: { type: 'string' },
+            kind: { type: 'string', enum: ['expense', 'revenue', 'bill', 'quote', 'invoice', 'receipt'] },
+            date_from: { type: 'string', description: 'YYYY-MM-DD' },
+            date_to: { type: 'string', description: 'YYYY-MM-DD' },
+            source_contains: { type: 'string' },
+            description_contains: { type: 'string' },
+            category: { type: 'string' },
+            job_id: { type: 'string', description: 'UUID' },
+            job_name_contains: { type: 'string' },
+            min_amount_cents: { type: 'integer' },
+            max_amount_cents: { type: 'integer' },
+            limit: { type: 'integer', default: 25, maximum: 100 },
+            offset: { type: 'integer', default: 0, maximum: 10000 }
+          }
+        }
+      },
+      __handler: async (args) => txTools.search_transactions(args)
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'get_transaction',
+        description: 'Fetch a single confirmed transaction by id for this owner. Read-only.',
+        parameters: {
+          type: 'object',
+          required: ['owner_id', 'id'],
+          properties: {
+            owner_id: { type: 'string' },
+            id: { type: 'integer' }
+          }
+        }
+      },
+      __handler: async (args) => txTools.get_transaction(args)
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'get_spend_summary',
+        description: 'Summarize confirmed expenses for a date range, optionally scoped to a job. Read-only.',
+        parameters: {
+          type: 'object',
+          required: ['owner_id', 'date_from', 'date_to'],
+          properties: {
+            owner_id: { type: 'string' },
+            date_from: { type: 'string', description: 'YYYY-MM-DD' },
+            date_to: { type: 'string', description: 'YYYY-MM-DD' },
+            job_id: { type: 'string', description: 'UUID' },
+            job_name_contains: { type: 'string' }
+          }
+        }
+      },
+      __handler: async (args) => txTools.get_spend_summary(args)
+    }
+  ];
+
+  for (const t of txToolSpecs) {
+    reg[t.function.name] = t.__handler;
+    toolsSpec.push(t);
   }
 
   TOOL_REGISTRY = { reg, toolsSpec };
@@ -124,7 +199,6 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
     const content = (m.content || '').trim();
     if (!toolCalls || toolCalls.length === 0) {
       if (content) return content;
-      // If no content and no tool calls, bail to menu
       return genericMenu();
     }
 
@@ -142,11 +216,15 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
       // Parse args, inject context
       let args;
       try { args = JSON.parse(rawArgs || '{}'); } catch { args = {}; }
-      // Ensure context fields are present for our wrappers
+
+      // Standardize ownerId vs owner_id expectations:
+      // Our tx tools use owner_id; your other tools use ownerId.
+      if (ownerId && args.owner_id == null) args.owner_id = String(ownerId);
       if (ownerId && args.ownerId == null) args.ownerId = String(ownerId);
+
       if (from && args.fromPhone == null) args.fromPhone = String(from);
+
       if (args.text == null && messages) {
-        // Fallback: last user message text
         const lastUser = [...messages].reverse().find(x => x.role === 'user');
         if (lastUser?.content) args.text = String(lastUser.content);
       }
@@ -168,28 +246,18 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
     }
 
     // After executing tools, ask LLM to produce final user-facing message
-    // Add a short system nudge to confirm/execute pattern & clarity.
     messages = [
       { role: 'system', content: 'You are Chief. If all required details were present, confirm success with a concise checkmark line and any IDs. If details were missing, ask exactly one clarifying question.' },
       ...messages
     ];
   }
 
-  // Safety fallback
   return genericMenu();
 }
 
 // ----- Public ask API --------------------------------------
-/**
- * ask({ from, ownerId, text, topicHints, userProfile })
- * - RAG first (cheap + fast)
- * - If not sufficient → LLM + tools (confirm → execute)
- * - Always returns a helpful string
- */
 async function ask({ from, ownerId, text, topicHints = [], userProfile } = {}) {
-  // Gate by plan
   if (!canUseAgent(userProfile)) {
-    // Light nudge for upgrade but still be helpful:
     const ragMod = getRag();
     if (ragMod?.answer) {
       try {
@@ -202,7 +270,6 @@ async function ask({ from, ownerId, text, topicHints = [], userProfile } = {}) {
 
   const lc = String(text || '').toLowerCase();
 
-  // Immediate generic menu
   if (/\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(lc)) {
     return genericMenu();
   }
@@ -210,7 +277,6 @@ async function ask({ from, ownerId, text, topicHints = [], userProfile } = {}) {
   const topic = pickTopic(text, topicHints);
   console.log('[AGENT] topic:', topic || 'generic', 'text:', text);
 
-  // 1) Try RAG answer fast (no model call if your rag.answer composes locally)
   const ragMod = getRag();
   if (ragMod?.answer) {
     try {
@@ -222,31 +288,28 @@ async function ask({ from, ownerId, text, topicHints = [], userProfile } = {}) {
     }
   }
 
-  // 2) LLM with tool-calls: confirm → execute (bounded loop)
   const llm = new LLMProvider({
     provider: process.env.LLM_PROVIDER || 'openai',
     model: process.env.LLM_MODEL || 'gpt-4o-mini'
   });
 
-  const topicPrompt = topic ? `Focus on ${topic}.` : '';
   const seed = [
-  {
-    role: 'system',
-    content: `${CHIEF_SYSTEM_PROMPT}
+    {
+      role: 'system',
+      content: `${CHIEF_SYSTEM_PROMPT}
 
 Execution rules:
 - If details are sufficient: use tools, then reply with "✅ <short confirmation>" (+ IDs if relevant).
 - If details are missing: ask exactly ONE clarifying question (do not execute yet).
 - Never dead-end; always offer the next best action.`
-  },
-  { role: 'user', content: text }
-];
+    },
+    { role: 'user', content: text }
+  ];
 
   try {
     return await runToolsLoop({ llm, seedMessages: seed, ownerId, from });
   } catch (e) {
     console.warn('[AGENT] tools loop failed:', e?.message);
-    // 3) Last resort: generic help
     return genericMenu();
   }
 }

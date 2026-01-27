@@ -551,6 +551,115 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
 }
 
 
+// ------------------------------------------------------------------
+// ✅ CIL Drafts (v1): store drafts before confirm; link to transactions
+// ------------------------------------------------------------------
+
+async function createCilDraft({
+  owner_id,
+  kind,
+  payload,
+  actor_user_id = null,
+  actor_phone = null,
+  occurred_on = null,
+  amount_cents = null,
+  source = null,
+  description = null,
+  job_id = null,
+  job_name = null,
+  category = null,
+  source_msg_id = null,
+  dedupe_hash = null,
+  media_asset_id = null
+} = {}, { timeoutMs = 4000 } = {}) {
+  if (!owner_id) throw new Error('createCilDraft missing owner_id');
+  if (!kind) throw new Error('createCilDraft missing kind');
+  if (!payload) throw new Error('createCilDraft missing payload');
+
+  const sql = `
+    insert into public.cil_drafts (
+      owner_id, kind, status, payload,
+      actor_user_id, actor_phone,
+      occurred_on, amount_cents, source, description,
+      job_id, job_name, category,
+      source_msg_id, dedupe_hash,
+      media_asset_id,
+      created_at, updated_at
+    )
+    values (
+      $1, $2, 'draft', $3::jsonb,
+      $4, $5,
+      $6::date, $7::bigint, $8, $9,
+      $10::uuid, $11, $12,
+      $13, $14,
+      $15::uuid,
+      now(), now()
+    )
+    on conflict (owner_id, source_msg_id)
+    where source_msg_id is not null
+    do update set
+      payload = excluded.payload,
+      updated_at = now()
+    returning id
+  `;
+
+  const params = [
+    String(owner_id),
+    String(kind),
+    JSON.stringify(payload),
+    actor_user_id ? String(actor_user_id) : null,
+    actor_phone ? String(actor_phone) : null,
+    occurred_on ? String(occurred_on) : null,
+    amount_cents != null ? Number(amount_cents) : null,
+    source != null ? String(source) : null,
+    description != null ? String(description) : null,
+    job_id ? String(job_id) : null,
+    job_name != null ? String(job_name) : null,
+    category != null ? String(category) : null,
+    source_msg_id ? String(source_msg_id) : null,
+    dedupe_hash ? String(dedupe_hash) : null,
+    media_asset_id ? String(media_asset_id) : null
+  ];
+
+  const r = await queryWithTimeout(sql, params, timeoutMs);
+  return { id: r?.rows?.[0]?.id ?? null };
+}
+
+async function confirmCilDraftBySourceMsg({
+  owner_id,
+  source_msg_id,
+  confirmed_transaction_id
+} = {}, { timeoutMs = 4000 } = {}) {
+  if (!owner_id) throw new Error('confirmCilDraftBySourceMsg missing owner_id');
+  if (!source_msg_id) throw new Error('confirmCilDraftBySourceMsg missing source_msg_id');
+  if (!confirmed_transaction_id) throw new Error('confirmCilDraftBySourceMsg missing confirmed_transaction_id');
+
+  const sql = `
+    update public.cil_drafts
+    set
+      status = 'confirmed',
+      confirmed_transaction_id = $3,
+      updated_at = now()
+    where owner_id::text = $1
+      and source_msg_id = $2
+    returning id
+  `;
+
+  const r = await queryWithTimeout(sql, [String(owner_id), String(source_msg_id), Number(confirmed_transaction_id)], timeoutMs);
+  return { updated: (r?.rows?.length || 0) > 0, id: r?.rows?.[0]?.id ?? null };
+}
+
+async function countPendingCilDrafts(owner_id, { timeoutMs = 2500 } = {}) {
+  if (!owner_id) throw new Error('countPendingCilDrafts missing owner_id');
+  const sql = `
+    select count(*)::int as n
+    from public.cil_drafts
+    where owner_id::text = $1
+      and status = 'draft'
+  `;
+  const r = await queryWithTimeout(sql, [String(owner_id)], timeoutMs);
+  return Number(r?.rows?.[0]?.n) || 0;
+}
 
 /**
  * ✅ insertTransaction()
@@ -3219,6 +3328,10 @@ module.exports = {
   getPendingActionByKind,
   deletePendingActionByKind,
   getMostRecentPendingActionForUser,
+  createCilDraft,
+  confirmCilDraftBySourceMsg,
+  countPendingCilDrafts,
+
 
   // kept helpers (if other files import them)
   getJobByName,

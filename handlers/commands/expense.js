@@ -449,6 +449,69 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine) {
 }
 
 
+// ------------------------------------------------------------------
+// ✅ CIL Draft upsert for Expense Confirm UI
+// Centralized: whenever we show a confirm UI, ensure a cil_drafts row exists.
+// ------------------------------------------------------------------
+async function upsertCilDraftForExpenseConfirm({
+  ownerId,
+  paUserId,
+  fromPhone,
+  draft,
+  sourceMsgId
+}) {
+  try {
+    if (!ownerId || !paUserId || !draft) return;
+
+    const sid = String(sourceMsgId || '').trim() || null;
+
+    // Best-effort: safe payload snapshot (don’t dump huge OCR blobs)
+    const payload = {
+      type: 'ExpenseDraft',
+      draft: pickConfirmDraftSnapshot(draft),
+      // keep a tiny amount of useful text
+      text_head: String(draft?.draftText || draft?.originalText || draft?.ocrText || '')
+        .replace(/\u0000/g, '')
+        .trim()
+        .slice(0, 300)
+    };
+
+    // Derive lightweight index fields
+    const occurred_on = String(draft?.date || '').trim() || null;
+    const amount_cents =
+      draft?.amount_cents != null
+        ? Number(draft.amount_cents)
+        : null;
+
+    const source = String(draft?.store || draft?.source || '').trim() || null;
+    const description = String(draft?.item || draft?.description || '').trim() || null;
+    const category = String(draft?.category || draft?.suggestedCategory || '').trim() || null;
+
+    const job_id = draft?.job_id || draft?.jobId || null;
+    const job_name = String(draft?.jobName || draft?.job_name || '').trim() || null;
+
+    const media_asset_id = draft?.media_asset_id || draft?.mediaAssetId || null;
+
+    await pg.createCilDraft({
+      owner_id: ownerId,
+      kind: 'expense',
+      actor_user_id: paUserId,
+      actor_phone: fromPhone || null,
+      source_msg_id: sid,
+      payload,
+      occurred_on,
+      amount_cents,
+      source,
+      description,
+      job_id,
+      job_name,
+      category,
+      media_asset_id
+    });
+  } catch (e) {
+    console.warn('[CIL_DRAFT] upsertCilDraftForExpenseConfirm failed (ignored):', e?.message);
+  }
+}
 
 async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile = null }) {
   const paKey = String(paUserId || '').trim();
@@ -498,6 +561,21 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
       sourceText: srcText
     }) ||
     'Confirm expense?';
+     // ✅ Ensure CIL draft exists whenever we show confirm UI
+  try {
+    const srcId =
+      String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+      String(confirmPA0?.payload?.sourceMsgId || '').trim() ||
+      null;
+
+    await upsertCilDraftForExpenseConfirm({
+      ownerId,
+      paUserId: paKey,
+      fromPhone,
+      draft,
+      sourceMsgId: srcId
+    });
+  } catch {}
 
   return await sendConfirmExpenseOrFallback(fromPhone, line);
 }
@@ -4821,7 +4899,7 @@ console.info('[YES_FINAL_DRAFT_BEFORE_INSERT]', {
 data.amount = amountNum.toFixed(2);      // "18000.00" (canonical)
 data.amount_cents = amountCents;         // 1800000
 
-await pg.insertTransaction({
+const ins = await pg.insertTransaction({
   ownerId,
   owner_id: ownerId,
   userId: paUserId,
@@ -4850,12 +4928,27 @@ await pg.insertTransaction({
   source_msg_id: txSourceMsgId || null
 });
 
-
 console.info('[EXPENSE_INSERT_OK]', {
   paUserId,
   txSourceMsgId: txSourceMsgId || null,
-  media_asset_id: data.media_asset_id || null
+  media_asset_id: data.media_asset_id || null,
+  inserted: ins?.inserted ?? null,
+  id: ins?.id ?? null
 });
+
+// ✅ Link draft → confirmed transaction (best-effort)
+try {
+  if (txSourceMsgId && ins?.id) {
+    await pg.confirmCilDraftBySourceMsg({
+      owner_id: ownerId,
+      source_msg_id: txSourceMsgId,
+      confirmed_transaction_id: ins.id
+    });
+  }
+} catch (e) {
+  console.warn('[CIL_DRAFT] confirm link failed (ignored):', e?.message);
+}
+
 
 // ✅ After successful log: clear confirm + picker + pending-state flags so we never nag incorrectly
 try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
@@ -5215,6 +5308,23 @@ const editLatch = {
     });
 
     console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
+    // ✅ CIL draft upsert (initial confirm send)
+try {
+  const confirmPA1 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+  const draft1 = confirmPA1?.payload?.draft || null;
+  const srcId = String(confirmPA1?.payload?.sourceMsgId || '').trim() || null;
+
+  if (draft1) {
+    await upsertCilDraftForExpenseConfirm({
+      ownerId,
+      paUserId: paKey,
+      fromPhone,
+      draft: draft1,
+      sourceMsgId: srcId
+    });
+  }
+} catch {}
+
     return await sendConfirmExpenseOrFallback(fromPhone, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
   }
 } // ✅ closes: if (looksLikeReceiptText(input)) { ... } else { ... }
@@ -5384,6 +5494,23 @@ if (data && data.amount && data.amount !== '$0.00') {
   });
 
   console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
+  // ✅ CIL draft upsert (initial confirm send)
+try {
+  const confirmPA1 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+  const draft1 = confirmPA1?.payload?.draft || null;
+  const srcId = String(confirmPA1?.payload?.sourceMsgId || '').trim() || null;
+
+  if (draft1) {
+    await upsertCilDraftForExpenseConfirm({
+      ownerId,
+      paUserId: paKey,
+      fromPhone,
+      draft: draft1,
+      sourceMsgId: srcId
+    });
+  }
+} catch {}
+
   return await sendConfirmExpenseOrFallback(fromPhone, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
 }
 

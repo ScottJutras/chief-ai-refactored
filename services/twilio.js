@@ -225,6 +225,11 @@ async function sendTemplateMessage(to, contentSid, vars = {}, fallbackBody = '')
     throw e; // let callers decide fallback (your interactive list does)
   }
 }
+async function sendWhatsAppTemplate({ to, templateSid, summaryLine } = {}) {
+  const safe = String(summaryLine || '').replace(/\s+/g, ' ').trim().slice(0, 600) || '—';
+  return sendTemplateMessage(to, templateSid, { 1: toTemplateVar(safe) }, safe);
+}
+
 
 async function sendTemplateQuickReply(to, contentSid, vars = {}, fallbackBody = '') {
   return sendTemplateMessage(to, contentSid, vars, fallbackBody);

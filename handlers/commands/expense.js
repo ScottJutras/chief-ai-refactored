@@ -28,7 +28,8 @@ const {
   sendQuickReply,
   sendTemplateMessage,
   sendTemplateQuickReply,
-  toWhatsApp
+  toWhatsApp,
+  sendWhatsAppTemplate
 } = twilioSvc;
 
 const { query, insertTransaction } = pg;
@@ -401,35 +402,6 @@ function toTemplateVar(str) {
   );
 }
 
-async function sendWhatsAppTemplate({ to, templateSid, summaryLine }) {
-  const client = getTwilioClient();
-  const { waFrom, messagingServiceSid } = getSendFromConfig();
-
-  if (!to) throw new Error('Missing "to"');
-
-  const toClean = String(to).startsWith('whatsapp:') ? String(to) : `whatsapp:${String(to).replace(/^whatsapp:/, '')}`;
-  const safeBody = String(summaryLine || '').trim().slice(0, 1500) || '—';
-
-  // ✅ If templateSid missing, send plain text (prevents 21619)
-  if (!templateSid || !String(templateSid).trim()) {
-    const payload = { to: toClean, body: safeBody };
-    if (waFrom) payload.from = waFrom;
-    else payload.messagingServiceSid = messagingServiceSid;
-    return client.messages.create(payload);
-  }
-
-  const payload = {
-    to: toClean,
-    contentSid: String(templateSid).trim(),
-    body: safeBody,
-    contentVariables: JSON.stringify({ '1': toTemplateVar(summaryLine) })
-  };
-
-  if (waFrom) payload.from = waFrom;
-  else payload.messagingServiceSid = messagingServiceSid;
-
-  return client.messages.create(payload);
-}
 
 function buildActiveJobHint(jobName, jobSource) {
   if (jobSource !== 'active' || !jobName) return '';

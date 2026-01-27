@@ -833,6 +833,34 @@ async function cancelLatestCilDraftForActor({
   return { ok: true, cancelled: rows?.length || 0, row: rows?.[0] || null };
 }
 
+async function cancelAllCilDraftsForActor({ owner_id, actor_phone, kind = null, status = 'cancelled' } = {}) {
+  const ownerId = String(owner_id || '').trim();
+  const actorPhone = String(actor_phone || '').trim();
+  const st = String(status || 'cancelled').trim();
+  const k = kind ? String(kind).trim() : null;
+
+  if (!ownerId) throw new Error('cancelAllCilDraftsForActor: owner_id is required');
+  if (!actorPhone) throw new Error('cancelAllCilDraftsForActor: actor_phone is required');
+
+  const q = module.exports.query || module.exports.pool?.query;
+  if (!q) throw new Error('DB query not available');
+
+  const { rows } = await q(
+    `
+    update public.cil_drafts
+      set status = $3,
+          updated_at = now()
+    where owner_id::text = $1
+      and actor_phone = $2
+      and status = 'draft'
+      and ($4::text is null or kind = $4)
+    returning id, source_msg_id, kind, status, created_at, updated_at
+    `,
+    [ownerId, actorPhone, st, k]
+  );
+
+  return { ok: true, cancelled: rows.length, rows };
+}
 
 
 
@@ -3509,6 +3537,7 @@ module.exports = {
   expireOldCilDrafts,
   countPendingCilDrafts,
   cancelLatestCilDraftForActor,
+  cancelAllCilDraftsForActor,
 
   // kept helpers (if other files import them)
   getJobByName,

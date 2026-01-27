@@ -1158,32 +1158,27 @@ if (/^(cancel|stop|no)\b/.test(lc)) {
   // 1) Clear all pending actions/state (existing behavior)
   await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
 
-  // 2) Cancel latest draft in DB (NEW)
+    // 2) Cancel ALL draft rows for this actor (NEW: definitive)
   try {
-    // digits-only actor id (matches your DB rows)
-    const actorDigits =
-      (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(req.from)) ||
-      String(req.from || '').replace(/\D/g, '');
+    const actorDigits = String(req.from || '').replace(/\D/g, '');
 
-    // If you want to cancel “any kind” you can run multiple kinds,
-    // but for your current test we target expense.
-    const r2 = await pg.cancelLatestCilDraftForActor({
+    const r = await pg.cancelAllCilDraftsForActor({
       owner_id: req.ownerId,
       actor_phone: actorDigits,
-      kind: 'expense',
+      kind: 'expense',       // keep tight for now
       status: 'cancelled'
     });
 
-    console.info('[GLOBAL_CANCEL_CIL]', {
+    console.info('[GLOBAL_CANCEL_CIL_ALL]', {
       ownerId: req.ownerId,
       actorDigits,
-      cancelled: r2?.cancelled ?? null,
-      id: r2?.row?.id ?? null,
-      source_msg_id: r2?.row?.source_msg_id ?? null
+      cancelled: r?.cancelled ?? null,
+      cancelled_ids: (r?.rows || []).slice(0, 10).map((x) => x.id) // cap log
     });
   } catch (e) {
-    console.warn('[GLOBAL_CANCEL_CIL] failed (ignored):', e?.message);
+    console.warn('[GLOBAL_CANCEL_CIL_ALL] failed (ignored):', e?.message);
   }
+
 
   return ok(res, '❌ Cancelled. You’re cleared.');
 }

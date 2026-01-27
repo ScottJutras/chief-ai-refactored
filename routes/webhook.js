@@ -1012,10 +1012,21 @@ router.post('*', async (req, res, next) => {
     const crypto = require('crypto');
 
     // ✅ Compute canonical inbound text ONCE (button/list/IRJ-aware)
-    const resolvedInbound = String(getInboundText(req.body || {}) || '').trim();
+const resolvedInbound = String(getInboundText(req.body || {}) || '').trim();
 
-    // ✅ If there's no text and no media, do nothing (avoid burning cycles)
-    if (!resolvedInbound && numMedia === 0) return ok(res);
+// ✅ PROVE router received the message + what text it resolved
+console.info('[WEBHOOK_IN]', {
+  ownerId: req.ownerId || null,
+  from: req.from || null,
+  messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
+  waId: req.body?.WaId || req.body?.WaID || req.body?.waid || null,
+  numMedia: Number(req.body?.NumMedia || 0) || 0,
+  resolvedInbound: resolvedInbound.slice(0, 140)
+});
+
+// ✅ If there's no text and no media, do nothing (avoid burning cycles)
+if (!resolvedInbound && numMedia === 0) return ok(res);
+
 
     // ✅ Make canonical resolved text available to downstream handlers (expense.js reads this)
     req.body.ResolvedInboundText = resolvedInbound;
@@ -1139,12 +1150,43 @@ router.post('*', async (req, res, next) => {
     }
 
     /* -----------------------------------------------------------------------
-     * ✅ GLOBAL HARD CANCEL
-     * ----------------------------------------------------------------------- */
-    if (/^(cancel|stop|no)\b/.test(lc)) {
-      await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
-      return ok(res, '❌ Cancelled. You’re cleared.');
-    }
+ * ✅ GLOBAL HARD CANCEL (router-level)
+ * - Runs BEFORE handlers
+ * - Must also cancel any pending CIL drafts
+ * ----------------------------------------------------------------------- */
+if (/^(cancel|stop|no)\b/.test(lc)) {
+  // 1) Clear all pending actions/state (existing behavior)
+  await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
+
+  // 2) Cancel latest draft in DB (NEW)
+  try {
+    // digits-only actor id (matches your DB rows)
+    const actorDigits =
+      (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(req.from)) ||
+      String(req.from || '').replace(/\D/g, '');
+
+    // If you want to cancel “any kind” you can run multiple kinds,
+    // but for your current test we target expense.
+    const r2 = await pg.cancelLatestCilDraftForActor({
+      owner_id: req.ownerId,
+      actor_phone: actorDigits,
+      kind: 'expense',
+      status: 'cancelled'
+    });
+
+    console.info('[GLOBAL_CANCEL_CIL]', {
+      ownerId: req.ownerId,
+      actorDigits,
+      cancelled: r2?.cancelled ?? null,
+      id: r2?.row?.id ?? null,
+      source_msg_id: r2?.row?.source_msg_id ?? null
+    });
+  } catch (e) {
+    console.warn('[GLOBAL_CANCEL_CIL] failed (ignored):', e?.message);
+  }
+
+  return ok(res, '❌ Cancelled. You’re cleared.');
+}
 
     // -----------------------------------------------------------------------
     // ✅ Pending Action: fetch ONCE early and reuse everywhere

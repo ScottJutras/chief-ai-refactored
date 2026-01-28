@@ -570,6 +570,8 @@ function compactHasAny(compact, patterns) {
 // ----------------- Precompiled regexes (micro-optimization) -----------------
 const RE_CLOCK_IN  = /\b(clock|punch)\s*in\b/i;
 const RE_CLOCK_OUT = /\b(clock|punch)\s*out\b/i;
+const RE_CLOCKIN_WORD  = /\b(clockin|punchin|shiftin)\b/i;
+const RE_CLOCKOUT_WORD = /\b(clockout|punchout|shiftout)\b/i;
 
 const RE_HAS_BREAK = /\bbreak\b/i;
 const RE_HAS_DRIVE = /\bdrive\b/i;
@@ -905,11 +907,14 @@ const DRIVE_STOP_COMPACT = [
 
 let isClockIn =
   compactHasAny(compact, CLOCK_IN_PATTERNS) ||
-  RE_CLOCK_IN.test(rawNorm);
+  RE_CLOCK_IN.test(rawNorm) ||
+  RE_CLOCKIN_WORD.test(rawNorm);
 
 let isClockOut =
   compactHasAny(compact, CLOCK_OUT_PATTERNS) ||
-  RE_CLOCK_OUT.test(rawNorm);
+  RE_CLOCK_OUT.test(rawNorm) ||
+  RE_CLOCKOUT_WORD.test(rawNorm);
+
 
 // BREAK start/stop (lots of synonyms)
 let isBreakStart =
@@ -990,27 +995,29 @@ const isUndo = /^undo(\s+last)?$/i.test(rawNorm);
       : isDriveStop ? 'drive_stop'
       : null;
 
-    // If ambiguous segment intent, quick reply
-    if (!resolvedType) {
-      const hasBreak = RE_HAS_BREAK.test(rawNorm);
-      const hasDrive = RE_HAS_DRIVE.test(rawNorm);
+    // If Undo, handle it explicitly (do NOT fall through)
+if (isUndo) {
+  // fall through to the undo branch later in the function
+} else if (!resolvedType) {
+  const hasBreak = RE_HAS_BREAK.test(rawNorm);
+  const hasDrive = RE_HAS_DRIVE.test(rawNorm);
 
-      if (hasBreak || hasDrive) {
-        const seg = hasBreak ? 'Break' : 'Drive';
-        try {
-          await sendQuickReply(
-            from,
-            `Do you want me to ${seg.toLowerCase()} **start** or **stop** for ${target}${
-              tsOverride ? ' at ' + formatLocal(tsOverride, tz) : ''
-            }?\nReply: "${seg} Start" | "${seg} Stop" | "Cancel"`,
-            [`${seg} Start`, `${seg} Stop`, 'Cancel']
-          );
-        } catch {}
-        return twiml(res, 'Choose an option above.');
-      }
+  if (hasBreak || hasDrive) {
+    const seg = hasBreak ? 'Break' : 'Drive';
+    try {
+      await sendQuickReply(
+        from,
+        `Do you want me to ${seg.toLowerCase()} **start** or **stop** for ${target}${
+          tsOverride ? ' at ' + formatLocal(tsOverride, tz) : ''
+        }?\nReply: "${seg} Start" | "${seg} Stop" | "Cancel"`,
+        [`${seg} Start`, `${seg} Stop`, 'Cancel']
+      );
+    } catch {}
+    return twiml(res, 'Choose an option above.');
+  }
 
-      return false; // router can fall through to other handlers
-    }
+  return false; // router can fall through to other handlers (agent, etc.)
+}
 
     // Backfill confirm if >2 min away from now
     if (tsOverride) {

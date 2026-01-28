@@ -22,7 +22,8 @@ const {
   sendWhatsAppInteractiveList,
   sendWhatsAppTemplate,
   toTemplateVar
-} = require('../../utils/twilio');
+} = require('../../services/twilio');
+
 
 const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
 

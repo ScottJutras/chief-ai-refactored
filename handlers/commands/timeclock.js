@@ -624,7 +624,8 @@ async function handleClock(ctx, cil) {
       job_name: null,              // not available here
       job_source: 'active',        // best guess; or null
 
-      occurred_at: at,
+      occurred_at: occurredAtIso,
+      recorded_at: new Date().toISOString(),
       source_msg_id,
       source_kind: 'whatsapp_text',
       event_payload: { action: 'in', kind: 'shift', at },
@@ -682,7 +683,8 @@ async function handleClock(ctx, cil) {
       entity_type: 'time_entry',
       entity_id: String(shift.id), // we DO have the shift id here
       job_id: shift.job_id || null,
-      occurred_at: at,
+      occurred_at: occurredAtIso,
+      recorded_at: new Date().toISOString(),
       source_msg_id,
       source_kind: 'whatsapp_text',
       event_payload: { action: 'out', kind: 'shift', at, shift_id: shift.id, calc },
@@ -723,7 +725,8 @@ if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.a
       entity_type: 'time_entry',
       entity_id: childId != null ? String(childId) : null,
       job_id: shift.job_id || null,
-      occurred_at: at,
+      occurred_at: occurredAtIso,
+      recorded_at: new Date().toISOString(),
       source_msg_id,
       source_kind: 'whatsapp_text',
       event_payload: { action: 'stop', kind, at, shift_id: shift.id, child_id: childId },

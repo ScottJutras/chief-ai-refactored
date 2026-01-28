@@ -529,34 +529,30 @@ try {
       }
 
       // ------------------------------
-      // ✅ Brain v0 fact emission (task.done)
-      // ------------------------------
-      try {
-        await pg.insertFactEvent({
-          owner_id: ownerId,
-          actor_key: paUserId,
+// ✅ Brain v0 fact emission (task.done)
+// ------------------------------
+try {
+  await pg.insertFactEvent({
+    owner_id: ownerId,
+    actor_key: paUserId,
 
-          event_type: 'task.done',
-          entity_type: 'task',
-          entity_id: updated?.id != null ? String(updated.id) : null,
-          entity_no: updated?.task_no != null ? Number(updated.task_no) : taskNo,
+    event_type: 'task.done',
+    entity_type: 'task',
+    entity_id: updated?.id != null ? String(updated.id) : null,   // if helper returns it
+    entity_no: Number(taskNo),
 
-          job_no: updated?.job_no ?? null,
-          job_name: null,
-          job_source: null,
+    occurred_at: new Date().toISOString(),
+    source_msg_id: safeMsgId || null,
+    source_kind: 'whatsapp_text',
+    event_payload: { task_no: taskNo },
 
-          occurred_at: new Date().toISOString(),
-          source_msg_id: safeMsgId,
-          source_kind: 'whatsapp_text',
-          event_payload: { taskNo, title: updated?.title || null },
+    dedupe_key: `task.done:${String(safeMsgId || 'no_msg')}:${String(taskNo)}`
+  });
+} catch (e) {
+  console.warn('[FACT_EVENT] task.done insert failed (ignored):', e?.message);
+}
 
-          dedupe_key: `task.done:${String(safeMsgId || 'no_msg')}:${String(taskNo)}`
-        });
-      } catch (e) {
-        console.warn('[FACT_EVENT] task.done insert failed (ignored):', e?.message);
-      }
-
-      return respond(res, `✅ Task #${taskNo} marked done.`);
+return respond(res, `✅ Task #${taskNo} marked done.`);
     } catch (e) {
       console.warn('[tasks] done failed:', e?.message);
       return respond(res, `⚠️ Couldn’t mark task #${taskNo} done.`);

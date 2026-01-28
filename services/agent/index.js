@@ -6,7 +6,7 @@
 
 const { LLMProvider } = require('../llm');
 const { CHIEF_SYSTEM_PROMPT } = require('../../prompts/chief.system');
-const txTools = require('../agentTools/transactions');
+const txTools = require('../agentTools/transaction');
 
 // ----- Subscription gate (free/basic can't use Agent) -----
 function canUseAgent(userProfile) {

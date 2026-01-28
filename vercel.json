@@ -2,10 +2,11 @@
   "version": 2,
   "functions": {
     "api/webhook.js": {
-      "memory": 2048,
-      "maxDuration": 15,
-      "excludeFiles": "{docs/**,public/**,dashboard/**,parse/**,deep-dive/**,api/index.js,node_modules/pdfkit/**,node_modules/exceljs/**}"
-    },
+  "memory": 2048,
+  "maxDuration": 15,
+  "excludeFiles": "{public/**,dashboard/**,parse/**,deep-dive/**,api/index.js,node_modules/pdfkit/**,node_modules/exceljs/**}"
+}
+,
     "api/index.js": {
       "memory": 1024,
       "maxDuration": 10

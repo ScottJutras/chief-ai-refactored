@@ -873,13 +873,27 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
     const explicitJobName = extractJobHint(text) || null;
     const jobName = await resolveJobNameForActor({ ownerId, identityKey: paUserId, explicitJobName });
 
-    // -------------------------------------------------
-// ✅ Robust timeclock intent detection (forgiving UX)
-// Recognizes: "breakstart", "start break", "on break", "beginbreak", etc.
+ // -------------------------------------------------
+// ✅ Timeclock early-claim gate (prevents fallthrough to agent)
+// Handles: clockin/clockout, clock in/out, punchin/out, break/drive, undo last
 // -------------------------------------------------
 const norm = normalizeTcText(text);
 const rawNorm = norm.raw;
 const compact = norm.compact;
+
+// If it's clearly not timeclock, let other handlers try.
+const looksLikeTimeclock =
+  RE_CLOCK_IN.test(rawNorm) ||
+  RE_CLOCK_OUT.test(rawNorm) ||
+  RE_CLOCKIN_WORD.test(rawNorm) ||
+  RE_CLOCKOUT_WORD.test(rawNorm) ||
+  RE_HAS_BREAK.test(rawNorm) ||
+  RE_HAS_DRIVE.test(rawNorm) ||
+  /^undo(\s+last)?$/i.test(rawNorm) ||
+  /^undo(last)?$/i.test(compact); // also catches "undolast"
+
+if (!looksLikeTimeclock) return false;
+
 
 const START_WORDS = ['start', 'starting', 'begin', 'on', 'going'];
 const STOP_WORDS  = ['stop', 'end', 'off', 'finish', 'done'];
@@ -945,7 +959,10 @@ let isDriveStop =
 // (already covered via START_WORDS)
 
 // ✅ Undo stays the same
-const isUndo = /^undo(\s+last)?$/i.test(rawNorm);
+const isUndo =
+  /^undo(\s+last)?$/i.test(rawNorm) ||
+  /^undo(last)?$/i.test(compact);
+
 
 
     const explicitTarget = extractTargetName(lc);

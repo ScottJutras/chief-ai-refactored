@@ -475,7 +475,7 @@ async function emitTimeclockFact({
       amount_cents: null,
       currency: null,
 
-      occurred_at: occurredAtIso || null,
+      occurred_at: occurredAtIso,
       source_msg_id,
       source_kind: 'whatsapp_text',
 
@@ -623,7 +623,8 @@ async function handleClock(ctx, cil) {
       event_type: 'timeclock.logged',
       entity_type: 'time_entry',
       entity_id: null,
-      job_id: job_id,
+      job_id: job_id || null,
+
       occurred_at: occurredAtIso,
       source_msg_id,
       source_kind: 'whatsapp_text',
@@ -635,7 +636,6 @@ async function handleClock(ctx, cil) {
     console.warn('[FACT_EVENT] timeclock.logged clock_in failed (ignored):', e?.message);
   }
 }
-
 
     return { text: `✅ Clocked in at ${toHumanTime(at, ctx.tz || 'UTC')}.` };
   }
@@ -675,23 +675,25 @@ async function handleClock(ctx, cil) {
   await touchKPI(owner_id, shift.job_id, day);
 
   // ✅ Fact emission: shift clock-out (update-based, not insert-based)
-  try {
-    await pg.insertFactEvent({
-      owner_id,
-      actor_key: user_id,
-      event_type: 'timeclock.logged',
-      entity_type: 'time_entry',
-      entity_id: String(shift.id), // we DO have the shift id here
-      job_id: shift.job_id || null,
-      occurred_at: occurredAtIso,
-      source_msg_id,
-      source_kind: 'whatsapp_text',
-      event_payload: { action: 'out', kind: 'shift', at, shift_id: shift.id, calc },
-      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${kind}_stop`
-    });
-  } catch (e) {
-    console.warn('[FACT_EVENT] timeclock.logged shift_out failed (ignored):', e?.message);
-  }
+try {
+  await pg.insertFactEvent({
+    owner_id,
+    actor_key: user_id,
+    event_type: 'timeclock.logged',
+    entity_type: 'time_entry',
+    entity_id: String(shift.id),
+    job_id: shift.job_id || null,
+
+    occurred_at: occurredAtIso,
+    source_msg_id,
+    source_kind: 'whatsapp_text',
+    event_payload: { action: 'out', kind: 'shift', at, shift_id: shift.id, calc },
+
+    dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:clock_out`
+  });
+} catch (e) {
+  console.warn('[FACT_EVENT] timeclock.logged clock_out failed (ignored):', e?.message);
+}
 
   const msg =
     calc.unpaidLunch > 0 || calc.unpaidBreak > 0
@@ -716,23 +718,25 @@ if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.a
   const childId = r?.rows?.[0]?.id ?? null;
 
   // ✅ Fact emission: segment stop
-  try {
-    await pg.insertFactEvent({
-      owner_id,
-      actor_key: user_id,
-      event_type: 'timeclock.logged',
-      entity_type: 'time_entry',
-      entity_id: childId != null ? String(childId) : null,
-      job_id: shift.job_id || null,
-      occurred_at: occurredAtIso,
-      source_msg_id,
-      source_kind: 'whatsapp_text',
-      event_payload: { action: 'stop', kind, at, shift_id: shift.id, child_id: childId },
-      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${kind}_stop`
-    });
-  } catch (e) {
-    console.warn('[FACT_EVENT] timeclock.logged child_stop failed (ignored):', e?.message);
-  }
+try {
+  await pg.insertFactEvent({
+    owner_id,
+    actor_key: user_id,
+    event_type: 'timeclock.logged',
+    entity_type: 'time_entry',
+    entity_id: childId != null ? String(childId) : null,
+    job_id: shift.job_id || null,
+
+    occurred_at: occurredAtIso,
+    source_msg_id,
+    source_kind: 'whatsapp_text',
+    event_payload: { action: 'stop', kind, at, shift_id: shift.id, child_id: childId },
+
+    dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${kind}_stop`
+  });
+} catch (e) {
+  console.warn('[FACT_EVENT] timeclock.logged child_stop failed (ignored):', e?.message);
+}
 
   return { text: `⏹️ ${kind} stopped.` };
 }

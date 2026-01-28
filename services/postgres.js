@@ -1431,7 +1431,10 @@ async function insertFactEvent(e) {
     amount_cents: e.amount_cents != null ? Number(e.amount_cents) : null,
     currency: e.currency != null ? String(e.currency) : null,
 
-    occurred_at: e.occurred_at ? new Date(e.occurred_at) : null,
+    occurred_at: e.occurred_at
+  ? new Date(e.occurred_at)
+  : new Date(),
+
 
     source_msg_id: e.source_msg_id != null ? String(e.source_msg_id) : null,
     source_kind: e.source_kind != null ? String(e.source_kind) : null,

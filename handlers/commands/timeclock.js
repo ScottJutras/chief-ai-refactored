@@ -567,6 +567,21 @@ function hasBoth(normRaw, a, b) {
 function compactHasAny(compact, patterns) {
   return patterns.some(p => compact.includes(p));
 }
+// ----------------- Compact pattern dictionaries (module-scope) -----------------
+
+const START_WORDS = ['start', 'starting', 'begin', 'on', 'going'];
+const STOP_WORDS  = ['stop', 'end', 'off', 'finish', 'done'];
+
+const CLOCK_IN_PATTERNS  = ['clockin', 'punchin', 'startshift', 'startmyday', 'shiftin'];
+const CLOCK_OUT_PATTERNS = ['clockout', 'punchout', 'endshift', 'finishup', 'wrapup', 'shiftout'];
+
+const BREAK_START_COMPACT = ['breakstart', 'startbreak', 'beginbreak', 'breakbegin', 'onbreak', 'breakon'];
+const BREAK_STOP_COMPACT  = ['breakstop', 'stopbreak', 'endbreak', 'breakend', 'offbreak', 'breakoff'];
+
+const DRIVE_START_COMPACT = ['drivestart', 'startdrive', 'begindrive', 'drivebegin', 'ondrive', 'driveon'];
+const DRIVE_STOP_COMPACT  = ['drivestop', 'stopdrive', 'enddrive', 'driveend', 'offdrive', 'driveoff'];
+
+
 // ----------------- Precompiled regexes (micro-optimization) -----------------
 const RE_CLOCK_IN  = /\b(clock|punch)\s*in\b/i;
 const RE_CLOCK_OUT = /\b(clock|punch)\s*out\b/i;

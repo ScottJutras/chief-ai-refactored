@@ -1166,17 +1166,23 @@ function looksLikeNewRevenueText(s = '') {
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId, twilioMeta = null) {
   input = stripRevenuePrefixes(input);
 
-  // ✅ Canonical PA key for ALL state in this handler
+  twilioMeta = twilioMeta && typeof twilioMeta === 'object' ? twilioMeta : {};
+
+  // ✅ Canonical PA key (digits) — prefer WaId, then userProfile, then from
   const paUserId =
-    normalizeIdentityDigits(twilioMeta?.WaId) ||
-    normalizeIdentityDigits(userProfile?.wa_id) ||
-    normalizeIdentityDigits(from) ||
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(twilioMeta?.WaId || twilioMeta?.WaID || twilioMeta?.waid)) ||
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(userProfile?.wa_id)) ||
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(from)) ||
+    String(from || '').replace(/\D/g, '').trim() ||
     String(from || '').trim();
 
-  const safeMsgId = String(sourceMsgId || `${from}:${Date.now()}`).trim();
+  const msgSid = String(twilioMeta?.MessageSid || twilioMeta?.SmsMessageSid || '').trim();
+  const safeMsgId = msgSid || String(sourceMsgId || '').trim() || String(`${paUserId}:${Date.now()}`).trim();
+
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
 
   try {
+    
     // ---- 1) Awaiting job pick ----
     const pickPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
 
@@ -1841,31 +1847,87 @@ try {
 
     const insertFn = typeof pg.insertTransaction === 'function' ? pg.insertTransaction : insertTransaction;
 
-    // ✅ IMPORTANT: ensure we pass numeric-friendly amount values
-    await insertFn({
-      ownerId,
-      owner_id: ownerId,
-      userId: paUserId,
-      user_id: paUserId,
-      fromPhone: from,
-      from,
+// ✅ IMPORTANT: ensure we pass numeric-friendly amount values
+const ins = await insertFn({
+  ownerId,
+  owner_id: ownerId,
+  userId: paUserId,
+  user_id: paUserId,
+  fromPhone: from,
+  from,
 
-      kind: 'revenue',
+  kind: 'revenue',
 
-      date: String(dateStr),
+  date: String(dateStr),
+  source: sourceForDb,
+  description: descForDb,
+
+  amount: amountNum,
+  amount_cents: amountCents,
+
+  jobName,
+  jobSource,
+
+  category: categoryStr,
+  source_msg_id: txSourceMsgId || null
+});
+
+// Try to infer inserted id across both styles:
+// - some paths return { inserted, id }
+// - some return inserted row
+// - some return just id
+const txId =
+  (ins && typeof ins === 'object' && ins.id != null) ? ins.id
+  : (ins && typeof ins === 'object' && ins.transaction_id != null) ? ins.transaction_id
+  : (typeof ins === 'string' || typeof ins === 'number') ? ins
+  : null;
+
+// ------------------------------
+// ✅ Brain v0 fact emission (revenue.confirmed)
+// ------------------------------
+try {
+  const currency = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase() || null;
+  const occurredAt = dateStr ? `${dateStr}T12:00:00Z` : null;
+
+  const dedupeKey =
+    txSourceMsgId ? `revenue.confirmed:${String(txSourceMsgId)}`
+    : txId != null ? `revenue.confirmed:tx:${String(txId)}`
+    : `revenue.confirmed:fallback:${paUserId}:${Date.now()}`;
+
+  await pg.insertFactEvent({
+    owner_id: ownerId,
+    actor_key: paUserId,
+
+    event_type: 'revenue.confirmed',
+    entity_type: 'revenue',
+    entity_id: txId != null ? String(txId) : null,
+
+    job_no: data?.job_no ?? null,
+    job_id: data?.job_id ?? null,
+    job_name: jobName || null,
+    job_source: jobSource || null,
+
+    amount_cents: Number.isFinite(amountCents) ? amountCents : null,
+    currency,
+
+    occurred_at: occurredAt,
+    source_msg_id: txSourceMsgId || null,
+    source_kind: 'whatsapp_text',
+
+    event_payload: {
       source: sourceForDb,
       description: descForDb,
+      date: dateStr || null,
+      jobName: jobName || null,
+      jobSource: jobSource || null
+    },
 
-      // "amount" should be numeric-safe for DB schemas that use numeric
-      amount: amountNum,
-      amount_cents: amountCents,
+    dedupe_key: dedupeKey
+  });
+} catch (e) {
+  console.warn('[FACT_EVENT] revenue.confirmed insert failed (ignored):', e?.message);
+}
 
-      jobName,
-      jobSource,
-
-      category: categoryStr,
-      source_msg_id: txSourceMsgId || null
-    });
 
     // Clear confirm + picker
     try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}

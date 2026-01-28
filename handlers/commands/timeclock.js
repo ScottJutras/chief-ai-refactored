@@ -199,6 +199,7 @@ function getTwilioMessageSidFromRes(res) {
   }
 }
 
+
 /* ---------------- Job resolution (active-job aware) ---------------- */
 
 function extractJobHint(text = '') {
@@ -437,6 +438,61 @@ function formatLocal(ts, tz) {
     return new Date(ts).toISOString().replace('T', ' ').slice(0, 19);
   }
 }
+async function emitTimeclockFact({
+  ownerId,
+  actorKey,
+  sourceMsgId,
+  resolvedType,
+  targetKey,     // ✅ digits or employee key (who the event is about)
+  jobName,
+  occurredAtIso  // ✅ ISO string
+}) {
+  try {
+    const owner_id = String(ownerId || '').trim();
+    const actor_key = String(actorKey || '').trim();
+    const source_msg_id = sourceMsgId ? String(sourceMsgId).trim() : null;
+
+    if (!owner_id || !actor_key) return;
+
+    const type = String(resolvedType || '').trim() || 'unknown';
+    const dedupe_key = `timeclock.logged:${String(source_msg_id || 'no_msg')}:${type}`;
+
+    await pg.insertFactEvent({
+      owner_id,
+      actor_key,
+
+      event_type: 'timeclock.logged',
+      entity_type: 'time_entry',
+
+      entity_id: null,
+      entity_no: null,
+
+      job_id: null,
+      job_no: null,
+      job_name: jobName ? String(jobName).trim() : null,
+      job_source: jobName ? 'active' : null,
+
+      amount_cents: null,
+      currency: null,
+
+      occurred_at: occurredAtIso || null,
+      source_msg_id,
+      source_kind: 'whatsapp_text',
+
+      event_payload: {
+        type,
+        target: targetKey ? String(targetKey).trim() : null,
+        jobName: jobName ? String(jobName).trim() : null,
+        at: occurredAtIso || null
+      },
+
+      dedupe_key
+    });
+  } catch (e) {
+    console.warn('[FACT_EVENT] timeclock.logged insert failed (ignored):', e?.message);
+  }
+}
+
 
 /* ---------------- Legacy helpers (guarded by schema probe) ---------------- */
 
@@ -555,107 +611,153 @@ async function handleClock(ctx, cil) {
       source_msg_id
     });
 
-    if (!inserted) return { text: `✅ Already processed that clock-in (duplicate message).` };
+    if (inserted) {
+  try {
+    await pg.insertFactEvent({
+      owner_id,
+      actor_key: user_id,
+      event_type: 'timeclock.logged',
+      entity_type: 'time_entry',
+      entity_id: null,
+      job_id: job_id,
+      job_no: null,                // not available here
+      job_name: null,              // not available here
+      job_source: 'active',        // best guess; or null
+
+      occurred_at: at,
+      source_msg_id,
+      source_kind: 'whatsapp_text',
+      event_payload: { action: 'in', kind: 'shift', at },
+
+      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:shift_in`
+    });
+  } catch (e) {
+    console.warn('[FACT_EVENT] timeclock.logged shift_in failed (ignored):', e?.message);
+  }
+}
+
     return { text: `✅ Clocked in at ${toHumanTime(at, ctx.tz || 'UTC')}.` };
   }
 
   if (parsed.action === 'out') {
-    const shift = await getOpenShift(owner_id, user_id);
-    if (!shift) return { text: `You’re not clocked in.` };
-
-    await pg.query(
-      `UPDATE public.time_entries SET end_at_utc=$3
-        WHERE owner_id=$1 AND parent_id=$2 AND end_at_utc IS NULL`,
-      [owner_id, shift.id, at]
-    );
-
-    await closeEntryById(owner_id, shift.id);
-
-    const policy = await fetchPolicy(owner_id);
-    const entries = await entriesForShift(owner_id, shift.id);
-
-    let calc = { paidMinutes: 0, unpaidLunch: 0, unpaidBreak: 0 };
-    try {
-      // eslint-disable-next-line global-require
-      const { computeShiftCalc } = require('../../services/timecalc');
-      calc = computeShiftCalc(entries, policy);
-    } catch {}
-
-    try {
-      await pg.query(
-        `UPDATE public.time_entries
-            SET meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{calc}', $3::jsonb)
-          WHERE id=$1 AND owner_id=$2`,
-        [shift.id, owner_id, JSON.stringify(calc)]
-      );
-    } catch {}
-
-    const day = new Date(shift.start_at_utc).toISOString().slice(0, 10);
-    await touchKPI(owner_id, shift.job_id, day);
-
-    const msg =
-      calc.unpaidLunch > 0 || calc.unpaidBreak > 0
-        ? `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m (policy deducted lunch ${calc.unpaidLunch}m, breaks ${calc.unpaidBreak}m).`
-        : `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m.`;
-
-    return { text: `✅ Clocked out. ${msg}` };
-  }
-
   const shift = await getOpenShift(owner_id, user_id);
-  if (!shift) return { text: `You need an open shift. Try: clock in.` };
+  if (!shift) return { text: `You’re not clocked in.` };
 
-  if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed.action === 'drive_start') {
-    const kind = parsed.action.split('_')[0]; // break/lunch/drive
-    await ensureNoOverlapChild(owner_id, shift.id, kind);
+  await pg.query(
+    `UPDATE public.time_entries SET end_at_utc=$3
+      WHERE owner_id=$1 AND parent_id=$2 AND end_at_utc IS NULL`,
+    [owner_id, shift.id, at]
+  );
 
-    const inserted = await insertEntry({
-      owner_id,
-      user_id,
-      job_id: shift.job_id,
-      parent_id: shift.id,
-      kind,
-      start_at_utc: at,
-      end_at_utc: null,
-      created_by,
-      meta: ctx.meta || {},
-      source_msg_id
-    });
+  await closeEntryById(owner_id, shift.id);
 
-    if (!inserted) return { text: `▶️ ${kind} already started (duplicate message).` };
-    return { text: `▶️ ${kind} started.` };
-  }
+  const policy = await fetchPolicy(owner_id);
+  const entries = await entriesForShift(owner_id, shift.id);
 
-  if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.action === 'drive_stop') {
-    const kind = parsed.action.split('_')[0];
+  let calc = { paidMinutes: 0, unpaidLunch: 0, unpaidBreak: 0 };
+  try {
+    // eslint-disable-next-line global-require
+    const { computeShiftCalc } = require('../../services/timecalc');
+    calc = computeShiftCalc(entries, policy);
+  } catch {}
+
+  try {
     await pg.query(
       `UPDATE public.time_entries
-          SET end_at_utc=$3
-        WHERE owner_id=$1 AND parent_id=$2 AND kind=$4 AND end_at_utc IS NULL`,
-      [owner_id, shift.id, at, kind]
+          SET meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{calc}', $3::jsonb)
+        WHERE id=$1 AND owner_id=$2`,
+      [shift.id, owner_id, JSON.stringify(calc)]
     );
-    return { text: `⏹️ ${kind} stopped.` };
+  } catch {}
+
+  const day = new Date(shift.start_at_utc).toISOString().slice(0, 10);
+  await touchKPI(owner_id, shift.job_id, day);
+
+  // ✅ Fact emission: shift clock-out (update-based, not insert-based)
+  try {
+    await pg.insertFactEvent({
+      owner_id,
+      actor_key: user_id,
+      event_type: 'timeclock.logged',
+      entity_type: 'time_entry',
+      entity_id: String(shift.id), // we DO have the shift id here
+      job_id: shift.job_id || null,
+      occurred_at: at,
+      source_msg_id,
+      source_kind: 'whatsapp_text',
+      event_payload: { action: 'out', kind: 'shift', at, shift_id: shift.id, calc },
+      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:shift_out`
+    });
+  } catch (e) {
+    console.warn('[FACT_EVENT] timeclock.logged shift_out failed (ignored):', e?.message);
   }
+
+  const msg =
+    calc.unpaidLunch > 0 || calc.unpaidBreak > 0
+      ? `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m (policy deducted lunch ${calc.unpaidLunch}m, breaks ${calc.unpaidBreak}m).`
+      : `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m.`;
+
+  return { text: `✅ Clocked out. ${msg}` };
+}
+
+if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.action === 'drive_stop') {
+  const kind = parsed.action.split('_')[0];
+
+  // capture which child was actually closed (best-effort)
+  const r = await pg.query(
+    `UPDATE public.time_entries
+        SET end_at_utc=$3
+      WHERE owner_id=$1 AND parent_id=$2 AND kind=$4 AND end_at_utc IS NULL
+      RETURNING id`,
+    [owner_id, shift.id, at, kind]
+  );
+
+  const childId = r?.rows?.[0]?.id ?? null;
+
+  // ✅ Fact emission: segment stop
+  try {
+    await pg.insertFactEvent({
+      owner_id,
+      actor_key: user_id,
+      event_type: 'timeclock.logged',
+      entity_type: 'time_entry',
+      entity_id: childId != null ? String(childId) : null,
+      job_id: shift.job_id || null,
+      occurred_at: at,
+      source_msg_id,
+      source_kind: 'whatsapp_text',
+      event_payload: { action: 'stop', kind, at, shift_id: shift.id, child_id: childId },
+      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${kind}_stop`
+    });
+  } catch (e) {
+    console.warn('[FACT_EVENT] timeclock.logged child_stop failed (ignored):', e?.message);
+  }
+
+  return { text: `⏹️ ${kind} stopped.` };
+}
 
   return { text: 'Timeclock: action not recognized.' };
 }
 
 /* ---------------- Legacy text command wrapper ---------------- */
 
-async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res) {
+async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId = null) {
   const lc = String(text || '').toLowerCase().trim();
   const tz = userProfile?.tz || userProfile?.timezone || 'America/Toronto';
   const now = new Date();
 
   const reqBody = res?.req?.body || {};
-  const paUserId = getPaUserId(from, userProfile, reqBody);
+  const paUserId = getPaUserId(from, userProfile, reqBody); // should return digits
 
-  // ✅ Align with other handlers: prefer router MessageSid/sourceMsgId, then webhook, else null
+  // ✅ Stable message id: prefer Twilio SID, else router sourceMsgId, else res extractor, else null
   const stableMsgId =
-    String(reqBody?.MessageSid || reqBody?.SmsMessageSid || sourceMsgId || '').trim() ||
-    getTwilioMessageSidFromRes(res) ||
+    String(reqBody?.MessageSid || reqBody?.SmsMessageSid || '').trim() ||
+    String(sourceMsgId || '').trim() ||
+    String(getTwilioMessageSidFromRes(res) || '').trim() ||
     null;
 
   try {
+  
     if (lc === 'timeclock' || lc === 'help timeclock') {
       return twiml(
         res,
@@ -795,44 +897,73 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
     }
 
     // force paths
-    const mForceIn = lc.match(/^force\s+clock\s+in\s+(.+)$/i);
-    const mForceOut = lc.match(/^force\s+clock\s+out\s+(.+)$/i);
+const mForceIn = lc.match(/^force\s+clock\s+in\s+(.+)$/i);
+const mForceOut = lc.match(/^force\s+clock\s+out\s+(.+)$/i);
 
-    const canLegacyWrite = typeof pg.logTimeEntryWithJob === 'function';
+const canLegacyWrite = typeof pg.logTimeEntryWithJob === 'function';
 
-    if (mForceIn) {
-      const forced = mForceIn[1].trim();
-      if (canLegacyWrite) {
-        await pg.logTimeEntryWithJob(ownerId, forced, 'clock_in', tsOverride || now, jobName, tz, {
-          requester_id: paUserId,
-          source_msg_id: stableMsgId
-        });
-        return twiml(res, `✅ Forced clock-in recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
-      }
+if (mForceIn) {
+  const forced = mForceIn[1].trim();
+  const forceType = 'clock_in';
 
-      const out = await handleClock(
-        { owner_id: ownerId, user_id: forced, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
-        { action: 'in', at: tsOverride || now.toISOString() }
-      );
-      return twiml(res, out?.text || '✅ Forced clock-in recorded.');
-    }
+  if (canLegacyWrite) {
+    await pg.logTimeEntryWithJob(ownerId, forced, forceType, tsOverride || now, jobName, tz, {
+      requester_id: paUserId,
+      source_msg_id: stableMsgId
+    });
 
-    if (mForceOut) {
-      const forced = mForceOut[1].trim();
-      if (canLegacyWrite) {
-        await pg.logTimeEntryWithJob(ownerId, forced, 'clock_out', tsOverride || now, jobName, tz, {
-          requester_id: paUserId,
-          source_msg_id: stableMsgId
-        });
-        return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
-      }
+    await emitTimeclockFact({
+      ownerId,
+      actorKey: paUserId,
+      sourceMsgId: stableMsgId,
+      resolvedType: forceType,   // ✅ explicit
+      target: forced,            // ✅ forced, not target
+      jobName,
+      tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+    });
 
-      const out = await handleClock(
-        { owner_id: ownerId, user_id: forced, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
-        { action: 'out', at: tsOverride || now.toISOString() }
-      );
-      return twiml(res, out?.text || '✅ Forced clock-out recorded.');
-    }
+    return twiml(res, `✅ Forced clock-in recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
+  }
+
+  // New schema path: handleClock already emits facts in your updated handleClock.
+  const out = await handleClock(
+    { owner_id: ownerId, user_id: forced, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { action: 'in', at: tsOverride || now.toISOString() }
+  );
+  return twiml(res, out?.text || '✅ Forced clock-in recorded.');
+}
+
+if (mForceOut) {
+  const forced = mForceOut[1].trim();
+  const forceType = 'clock_out';
+
+  if (canLegacyWrite) {
+    await pg.logTimeEntryWithJob(ownerId, forced, forceType, tsOverride || now, jobName, tz, {
+      requester_id: paUserId,
+      source_msg_id: stableMsgId
+    });
+
+    await emitTimeclockFact({
+      ownerId,
+      actorKey: paUserId,
+      sourceMsgId: stableMsgId,
+      resolvedType: forceType,   // ✅ explicit
+      target: forced,
+      jobName,
+      tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+    });
+
+    return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
+  }
+
+  // New schema path: handleClock already emits facts in your updated handleClock.
+  const out = await handleClock(
+    { owner_id: ownerId, user_id: forced, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { action: 'out', at: tsOverride || now.toISOString() }
+  );
+  return twiml(res, out?.text || '✅ Forced clock-out recorded.');
+}
+
 
     const state = await getCurrentState(ownerId, target);
 
@@ -848,6 +979,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           requester_id: paUserId,
           source_msg_id: stableMsgId
         });
+        await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
         return twiml(res, `✅ ${target} is clocked in at ${formatLocal(tsOverride || now, tz)}`);
       }
 
@@ -855,6 +996,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
         { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
         { action: 'in', at: tsOverride || now.toISOString() }
       );
+      await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
       return twiml(res, out?.text || `✅ ${target} clocked in.`);
     }
 
@@ -870,6 +1021,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           requester_id: paUserId,
           source_msg_id: stableMsgId
         });
+        await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,       // requester is actor in wrapper
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
         return twiml(res, `✅ ${target} is clocked out at ${formatLocal(tsOverride || now, tz)}`);
       }
 
@@ -877,6 +1038,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
         { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
         { action: 'out', at: tsOverride || now.toISOString() }
       );
+      await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
       return twiml(res, out?.text || `✅ ${target} clocked out.`);
     }
 
@@ -889,6 +1060,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           requester_id: paUserId,
           source_msg_id: stableMsgId
         });
+        await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,       // requester is actor in wrapper
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
         return twiml(res, `⏸️ Break started for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
       }
 
@@ -896,6 +1077,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
         { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
         { action: 'break_start', at: tsOverride || now.toISOString() }
       );
+      await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
       return twiml(res, out?.text || `⏸️ Break started for ${target}.`);
     }
 
@@ -908,6 +1099,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           requester_id: paUserId,
           source_msg_id: stableMsgId
         });
+        await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,       // requester is actor in wrapper
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
         return twiml(res, `▶️ Break ended for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
       }
 
@@ -915,6 +1116,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
         { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
         { action: 'break_stop', at: tsOverride || now.toISOString() }
       );
+      await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
       return twiml(res, out?.text || `▶️ Break ended for ${target}.`);
     }
 
@@ -927,6 +1138,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           requester_id: paUserId,
           source_msg_id: stableMsgId
         });
+        await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,       // requester is actor in wrapper
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
         return twiml(res, `🚚 Drive started for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
       }
 
@@ -934,6 +1155,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
         { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
         { action: 'drive_start', at: tsOverride || now.toISOString() }
       );
+      await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
       return twiml(res, out?.text || `🚚 Drive started for ${target}.`);
     }
 
@@ -946,6 +1177,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
           requester_id: paUserId,
           source_msg_id: stableMsgId
         });
+        await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,       // requester is actor in wrapper
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
         return twiml(res, `🅿️ Drive stopped for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
       }
 
@@ -953,6 +1194,16 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
         { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
         { action: 'drive_stop', at: tsOverride || now.toISOString() }
       );
+      await emitTimeclockFact({
+  ownerId,
+  actorKey: paUserId,
+  sourceMsgId: stableMsgId,
+  resolvedType,
+  target,
+  jobName,
+  tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+});
+
       return twiml(res, out?.text || `🅿️ Drive stopped for ${target}.`);
     }
 

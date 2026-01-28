@@ -3094,7 +3094,7 @@ async function handleExpense(
 
   // Build inboundTwilioMeta first (defensive)
   const inboundTwilioMeta = {
-    MessageSid: getTwilio('MessageSid'),
+    MessageSid: getTwilio('MessageSid') || getTwilio('SmsMessageSid'),
     OriginalRepliedMessageSid: getTwilio('OriginalRepliedMessageSid'),
     Body: getTwilio('Body'),
     ListId: getTwilio('ListId'),
@@ -3105,24 +3105,20 @@ async function handleExpense(
     WaId: getTwilio('WaId') || getTwilio('WaID') || getTwilio('waid')
   };
 
-  // ✅ Preserve raw sender for replies + logs
+  // ✅ Preserve raw sender for replies + logs (router may pass +E164 now)
   const fromPhone = String(from || '').trim();
 
-  // ✅ Canonical PA user id (digits only) — used for PA keys/state
+  // ✅ Canonical PA/state user id (digits only) — ALWAYS prefer WaId then from
   const paUserId =
-    normalizeIdentityDigits(inboundTwilioMeta?.WaId) ||
-    normalizeIdentityDigits(fromPhone) ||
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(inboundTwilioMeta?.WaId)) ||
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(fromPhone)) ||
+    String(fromPhone || '').replace(/\D/g, '').trim() ||
     String(fromPhone || '').trim();
 
   // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
-  // Must see resolved text / button payload / body.
   const rawInboundText = getInboundText(input, inboundTwilioMeta);
-
-  // ✅ Define "raw" once (local to this handler) — used by edit-mode + AI intake
   const raw = String(rawInboundText || '').trim();
 
-  // ✅ Strict decision token extractor (ONLY these tokens; everything else => null)
-  // NOTE: keep this ONE helper; remove any other strict-token helpers to avoid drift.
   function strictDecisionToken(s) {
     const t = String(s || '').trim().toLowerCase();
     if (!t) return null;
@@ -3130,7 +3126,6 @@ async function handleExpense(
     // normalize a few common variants
     if (t === 'y' || t === 'yeah' || t === 'yep' || t === 'ok' || t === 'okay') return 'yes';
 
-    // only allow exact command tokens
     if (t === 'yes') return 'yes';
     if (t === 'edit') return 'edit';
     if (t === 'cancel') return 'cancel';
@@ -3141,7 +3136,6 @@ async function handleExpense(
     return null;
   }
 
-  // ✅ Debug: prove what token we see for this inbound message
   const strictTok = strictDecisionToken(raw);
   console.info('[EXPENSE_IN]', {
     ownerId,
@@ -3157,7 +3151,7 @@ async function handleExpense(
   const inboundLower = normLower(rawInboundText);
 
   // ✅ Stable id for idempotency + flow correlation
-  // Prefer Twilio MessageSid (most stable), then provided sourceMsgId, then deterministic fallback.
+  // Prefer Twilio MessageSid, then router sourceMsgId, then deterministic fallback.
   const stableMsgId =
     String(inboundTwilioMeta?.MessageSid || '').trim() ||
     String(sourceMsgId || '').trim() ||
@@ -3165,6 +3159,7 @@ async function handleExpense(
     String(`${paUserId}:${Date.now()}`).trim();
 
   const safeMsgId = stableMsgId;
+
 
   // -------------------------------------------------------------------
 
@@ -4960,17 +4955,8 @@ if (!Number.isFinite(amountNum) || amountNum <= 0) {
 const amountCents = Math.round(amountNum * 100);
 
 // ✅ canonical for storage + downstream logic
-data.amount = amountNum.toFixed(2);              // "18000.00"
-data.amount_cents = amountCents;
-
-// ✅ optional debug while validating
-console.info('[AMOUNT_PARSE]', {
-  amountRaw,
-  amtToken: amtToken || null,
-  amountNum,
-  amountCents
-});
-
+data.amount = amountNum.toFixed(2);      // "18000.00"
+data.amount_cents = amountCents;         // 1800000
 
 // Optional debug (guarded)
 if (String(process.env.DEBUG_AMOUNT_PARSE || '').toLowerCase() === 'true') {
@@ -4998,10 +4984,6 @@ console.info('[YES_FINAL_DRAFT_BEFORE_INSERT]', {
   store: data?.store || null,
   head_originalText: String(rawDraft?.originalText || rawDraft?.draftText || '').slice(0, 80)
 });
-
-// ✅ authoritative values (DB: numeric string + cents; UI: format separately)
-data.amount = amountNum.toFixed(2);      // "18000.00" (canonical)
-data.amount_cents = amountCents;         // 1800000
 
 const ins = await pg.insertTransaction({
   ownerId,
@@ -5039,6 +5021,74 @@ console.info('[EXPENSE_INSERT_OK]', {
   inserted: ins?.inserted ?? null,
   id: ins?.id ?? null
 });
+const didInsert =
+  ins?.inserted === true ||                      // explicit contract
+  (ins?.inserted == null && ins?.id != null);    // fallback: older insertTransaction that returns only id
+
+if (!didInsert) {
+  console.info('[FACT_EVENT] skipped expense.confirmed (duplicate insertTransaction)', {
+    paUserId,
+    txSourceMsgId: txSourceMsgId || null,
+    inserted: ins?.inserted ?? null,
+    id: ins?.id ?? null
+  });
+} else {
+
+}
+
+// ------------------------------
+// ✅ Brain v0 fact emission (expense.confirmed)
+// ------------------------------
+try {
+  const currency = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase() || null;
+
+  // occurred_at: if date is YYYY-MM-DD, anchor midday UTC; if already ISO, keep it
+  const rawDate = String(data?.date || '').trim() || null;
+  const occurredAt =
+    rawDate && /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? `${rawDate}T12:00:00Z`
+    : rawDate && /^\d{4}-\d{2}-\d{2}T/.test(rawDate) ? rawDate
+    : null;
+
+  const dedupeKey =
+    txSourceMsgId ? `expense.confirmed:${String(txSourceMsgId)}`
+    : ins?.id != null ? `expense.confirmed:tx:${String(ins.id)}`
+    : `expense.confirmed:fallback:${paUserId}:${Date.now()}`;
+
+  await pg.insertFactEvent({
+    owner_id: ownerId,
+    actor_key: paUserId,
+
+    event_type: 'expense.confirmed',
+    entity_type: 'expense',
+    entity_id: ins?.id != null ? String(ins.id) : null,
+
+    job_no: data?.job_no ?? null,
+    job_id: data?.job_id ?? null,
+    job_name: jobName || data?.jobName || null,
+    job_source: jobSource || data?.jobSource || null,
+
+    amount_cents: Number.isFinite(amountCents) ? amountCents : null,
+    currency,
+
+    occurred_at: occurredAt,
+    source_msg_id: txSourceMsgId || null,
+    source_kind: 'whatsapp_text',
+
+    event_payload: {
+      store: String(data?.store || '').trim() || null,
+      description: String(data?.item || data?.description || '').trim() || null,
+      date: rawDate,
+      jobName: jobName || null,
+      jobSource: jobSource || null
+    },
+
+    dedupe_key: dedupeKey
+  });
+} catch (e) {
+  console.warn('[FACT_EVENT] expense.confirmed insert failed (ignored):', e?.message);
+}
+
+
 
 // ✅ Link draft → confirmed transaction (best-effort)
 try {

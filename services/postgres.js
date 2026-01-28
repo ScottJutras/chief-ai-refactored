@@ -1189,18 +1189,66 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   `;
 
   try {
-    const r = await queryWithTimeout(sql, vals, timeoutMs);
-    const id = r?.rows?.[0]?.id ?? null;
-    if (!id) return { inserted: false, id: null };
-    return { inserted: true, id };
-  } catch (e) {
-    const code = String(e?.code || '');
-    if (code === '23505') {
-      console.warn('[PG/transactions] insert conflict treated as duplicate:', e?.message);
-      return { inserted: false, id: null };
-    }
-    throw e;
+  const r = await queryWithTimeout(sql, vals, timeoutMs);
+  const id = r?.rows?.[0]?.id ?? null;
+  if (id) return { inserted: true, id };
+
+  // conflictSql DO NOTHING can yield no RETURNING row; try to recover id
+  if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+    try {
+      const ex = await queryWithTimeout(
+        `select id from public.transactions where owner_id=$1 and source_msg_id=$2 limit 1`,
+        [owner, sourceMsgId],
+        Math.min(2500, timeoutMs)
+      );
+      if (ex?.rows?.length) return { inserted: false, id: ex.rows[0].id };
+    } catch {}
   }
+
+  // If dedupe_hash exists, try that too
+  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
+    try {
+      const ex2 = await queryWithTimeout(
+        `select id from public.transactions where owner_id=$1 and dedupe_hash=$2 limit 1`,
+        [owner, dedupeHash],
+        Math.min(2500, timeoutMs)
+      );
+      if (ex2?.rows?.length) return { inserted: false, id: ex2.rows[0].id };
+    } catch {}
+  }
+
+  return { inserted: false, id: null };
+} catch (e) {
+  const code = String(e?.code || '');
+  if (code === '23505') {
+    console.warn('[PG/transactions] insert conflict treated as duplicate:', e?.message);
+
+    // best-effort: recover id on unique violation too
+    if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+      try {
+        const ex = await queryWithTimeout(
+          `select id from public.transactions where owner_id=$1 and source_msg_id=$2 limit 1`,
+          [owner, sourceMsgId],
+          Math.min(2500, timeoutMs)
+        );
+        if (ex?.rows?.length) return { inserted: false, id: ex.rows[0].id };
+      } catch {}
+    }
+    if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
+      try {
+        const ex2 = await queryWithTimeout(
+          `select id from public.transactions where owner_id=$1 and dedupe_hash=$2 limit 1`,
+          [owner, dedupeHash],
+          Math.min(2500, timeoutMs)
+        );
+        if (ex2?.rows?.length) return { inserted: false, id: ex2.rows[0].id };
+      } catch {}
+    }
+
+    return { inserted: false, id: null };
+  }
+  throw e;
+}
 }
 
 /* -------------------- Time helpers -------------------- */
@@ -1355,6 +1403,176 @@ async function resolveJobContext(ownerId, { explicitJobName, require = false, fa
   if (require) throw new Error('No active job');
   return null;
 }
+
+async function insertFactEvent(e) {
+  const owner_id = String(e?.owner_id || '').trim();
+  const actor_key = String(e?.actor_key || '').trim();
+  const event_type = String(e?.event_type || '').trim();
+  const entity_type = String(e?.entity_type || '').trim();
+  const dedupe_key = String(e?.dedupe_key || '').trim();
+
+  if (!owner_id || !actor_key || !event_type || !entity_type || !dedupe_key) {
+    return { ok: false, error: 'missing required fields' };
+  }
+
+  const row = {
+    owner_id,
+    actor_key,
+    event_type,
+    entity_type,
+    entity_id: e.entity_id != null ? String(e.entity_id) : null,
+    entity_no: e.entity_no != null ? Number(e.entity_no) : null,
+
+    job_id: e.job_id != null ? String(e.job_id) : null,
+    job_no: e.job_no != null ? Number(e.job_no) : null,
+    job_name: e.job_name != null ? String(e.job_name) : null,
+    job_source: e.job_source != null ? String(e.job_source) : null,
+
+    amount_cents: e.amount_cents != null ? Number(e.amount_cents) : null,
+    currency: e.currency != null ? String(e.currency) : null,
+
+    occurred_at: e.occurred_at ? new Date(e.occurred_at) : null,
+
+    source_msg_id: e.source_msg_id != null ? String(e.source_msg_id) : null,
+    source_kind: e.source_kind != null ? String(e.source_kind) : null,
+    source_payload: e.source_payload || null,
+    event_payload: e.event_payload || null,
+
+    dedupe_key
+  };
+
+  const q = `
+    insert into public.fact_events (
+      owner_id, actor_key, event_type, entity_type,
+      entity_id, entity_no,
+      job_id, job_no, job_name, job_source,
+      amount_cents, currency,
+      occurred_at,
+      source_msg_id, source_kind,
+      source_payload, event_payload,
+      dedupe_key
+    ) values (
+      $1,$2,$3,$4,
+      $5,$6,
+      $7,$8,$9,$10,
+      $11,$12,
+      $13,
+      $14,$15,
+      $16::jsonb,$17::jsonb,
+      $18
+    )
+    on conflict (owner_id, dedupe_key) do nothing
+    returning id
+  `;
+
+  try {
+    const r = await query(q, [
+      row.owner_id, row.actor_key, row.event_type, row.entity_type,
+      row.entity_id, row.entity_no,
+      row.job_id, row.job_no, row.job_name, row.job_source,
+      row.amount_cents, row.currency,
+      row.occurred_at,
+      row.source_msg_id, row.source_kind,
+      row.source_payload ? JSON.stringify(row.source_payload) : null,
+      row.event_payload ? JSON.stringify(row.event_payload) : null,
+      row.dedupe_key
+    ]);
+
+    const inserted = !!(r?.rows?.[0]?.id);
+    return { ok: true, inserted, id: inserted ? r.rows[0].id : null };
+  } catch (e2) {
+    return { ok: false, error: e2?.message || 'db error' };
+  }
+}
+async function getCashflowDaily({ ownerId, days = 30 }) {
+  const owner_id = String(ownerId || '').trim();
+  const limDays = Math.max(1, Math.min(365, Number(days) || 30));
+
+  if (!owner_id) return { ok: false, error: 'missing ownerId' };
+
+  const q = `
+    select day, revenue_cents, expense_cents, net_cents
+    from public.v_cashflow_daily
+    where owner_id = $1
+      and day >= (now() - ($2::text || ' days')::interval)
+    order by day asc
+  `;
+
+  try {
+    const r = await query(q, [owner_id, String(limDays)]);
+    return { ok: true, rows: r.rows || [] };
+  } catch (e) {
+    return { ok: false, error: e?.message || 'db error' };
+  }
+}
+
+async function getJobProfitSimple({ ownerId, jobNo = null, limit = 20 }) {
+  const owner_id = String(ownerId || '').trim();
+  const lim = Math.max(1, Math.min(200, Number(limit) || 20));
+
+  if (!owner_id) return { ok: false, error: 'missing ownerId' };
+
+  const q = jobNo
+    ? `
+      select job_no, job_name, revenue_cents, expense_cents, profit_cents
+      from public.v_job_profit_simple
+      where owner_id = $1 and job_no = $2
+      limit 1
+    `
+    : `
+      select job_no, job_name, revenue_cents, expense_cents, profit_cents
+      from public.v_job_profit_simple
+      where owner_id = $1
+      order by profit_cents desc nulls last
+      limit $2
+    `;
+
+  try {
+    const args = jobNo ? [owner_id, Number(jobNo)] : [owner_id, lim];
+    const r = await query(q, args);
+    return { ok: true, rows: r.rows || [] };
+  } catch (e) {
+    return { ok: false, error: e?.message || 'db error' };
+  }
+}
+async function getLatestFacts({ ownerId, limit = 20, types = [] }) {
+  const owner_id = String(ownerId || '').trim();
+  const lim = Math.max(1, Math.min(200, Number(limit) || 20));
+  if (!owner_id) return { ok: false, error: 'missing ownerId' };
+
+  const typeList = Array.isArray(types) ? types.filter(Boolean).map(String) : [];
+  const hasTypes = typeList.length > 0;
+
+  const q = hasTypes
+    ? `
+      select recorded_at, occurred_at, event_type, entity_type, entity_id, entity_no,
+             job_no, job_name, amount_cents, currency, event_payload
+      from public.fact_events
+      where owner_id = $1
+        and event_type = any($2::text[])
+      order by recorded_at desc
+      limit $3
+    `
+    : `
+      select recorded_at, occurred_at, event_type, entity_type, entity_id, entity_no,
+             job_no, job_name, amount_cents, currency, event_payload
+      from public.fact_events
+      where owner_id = $1
+      order by recorded_at desc
+      limit $2
+    `;
+
+  try {
+    const args = hasTypes ? [owner_id, typeList, lim] : [owner_id, lim];
+    const r = await query(q, args);
+    return { ok: true, rows: r.rows || [] };
+  } catch (e) {
+    return { ok: false, error: e?.message || 'db error' };
+  }
+}
+
+
+
 
 /**
  * ✅ createJobIdempotent (CANONICAL)
@@ -3538,6 +3756,12 @@ module.exports = {
   countPendingCilDrafts,
   cancelLatestCilDraftForActor,
   cancelAllCilDraftsForActor,
+
+  // Brain Exports
+  insertFactEvent,
+  getCashflowDaily,
+  getJobProfitSimple,
+  getLatestFacts,
 
   // kept helpers (if other files import them)
   getJobByName,

@@ -315,9 +315,15 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
   const lc = raw.toLowerCase();
 
   const reqBody = res?.req?.body || {};
-  const paUserId = getPaUserId(from, userProfile, reqBody);
+  const paUserId =
+  (typeof getPaUserId === 'function' && getPaUserId(from, userProfile, reqBody)) ||
+  (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(reqBody?.WaId)) ||
+  (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(from)) ||
+  String(from || '').replace(/\D/g, '').trim() ||
+  String(from || '').trim();
 
-  const safeMsgId = computeStableMsgId({ from: paUserId, sourceMsgId, res });
+const safeMsgId = computeStableMsgId({ from: paUserId, sourceMsgId, res });
+
 
   // If you have a middleware lock system, we try to release via req.releaseLock first (preferred).
   const lockKey = `lock:${paUserId}`;
@@ -380,6 +386,35 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
       });
 
       if (inserted === false) return respond(res, '✅ Already got that task (duplicate message).');
+      // ------------------------------
+// ✅ Brain v0 fact emission (task.created)
+// ------------------------------
+try {
+  if (task?.task_no) {
+    await pg.insertFactEvent({
+      owner_id: ownerId,
+      actor_key: paUserId,
+
+      event_type: 'task.created',
+      entity_type: 'task',
+      entity_id: task?.id != null ? String(task.id) : null,
+      entity_no: Number(task.task_no),
+
+      job_no: task?.job_no ?? null,
+      job_name: jobName || null,
+      job_source: jobName ? 'typed' : null,
+
+      occurred_at: new Date().toISOString(),
+      source_msg_id: safeMsgId,
+      source_kind: 'whatsapp_text',
+      event_payload: { title: task?.title || title },
+
+      dedupe_key: `task.created:${String(safeMsgId || 'no_msg')}:${String(task.task_no)}`
+    });
+  }
+} catch (e) {
+  console.warn('[FACT_EVENT] task.created insert failed (ignored):', e?.message);
+}
 
       const due = task?.due_at ? ` (due ${formatDue(task.due_at, tz)})` : '';
       const who = assignedTo ? ` — assigned` : '';
@@ -456,47 +491,78 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
     }
 
     // -------------------------------------------------
-    // DONE #N
-    // -------------------------------------------------
-    {
-      const m = lc.match(/^done\s*#?\s*(\d+)$/i);
-      if (m) {
-        const taskNo = parseInt(m[1], 10);
+// DONE #N
+// -------------------------------------------------
+{
+  const m = lc.match(/^done\s*#?\s*(\d+)$/i);
+  if (m) {
+    const taskNo = parseInt(m[1], 10);
 
-        try {
-          if (typeof pg.markTaskDone === 'function') {
-            const updated = await pg.markTaskDone({ ownerId, taskNo, actorId: paUserId, isOwner });
-            if (!updated) throw new Error('not found');
-            return respond(res, `✅ Task #${updated.task_no} marked done.`);
-          }
+    try {
+      let updated = null;
 
-          // fallback raw update with light permissions:
-          const task = typeof pg.getTaskByNo === 'function' ? await pg.getTaskByNo(ownerId, taskNo) : null;
-          if (!task) throw new Error('not found');
+      if (typeof pg.markTaskDone === 'function') {
+        updated = await pg.markTaskDone({ ownerId, taskNo, actorId: paUserId, isOwner });
+        if (!updated) throw new Error('not found');
+      } else {
+        // fallback raw update with light permissions:
+        const task = typeof pg.getTaskByNo === 'function' ? await pg.getTaskByNo(ownerId, taskNo) : null;
+        if (!task) throw new Error('not found');
 
-          const can =
-            isOwner ||
-            String(task.created_by) === String(paUserId) ||
-            String(task.assigned_to) === String(paUserId);
+        const can =
+          isOwner ||
+          String(task.created_by) === String(paUserId) ||
+          String(task.assigned_to) === String(paUserId);
 
-          if (!can) throw new Error('permission denied');
+        if (!can) throw new Error('permission denied');
 
-          const r = await pg.query(
-            `update public.tasks
-                set status='done', done_at=now(), updated_at=now()
-              where owner_id=$1 and task_no=$2
-              returning task_no`,
-            [String(ownerId), taskNo]
-          );
+        const r = await pg.query(
+          `update public.tasks
+              set status='done', done_at=now(), updated_at=now()
+            where owner_id=$1 and task_no=$2
+            returning id, task_no, job_no, title`,
+          [String(ownerId), taskNo]
+        );
 
-          if (!r?.rows?.length) throw new Error('not updated');
-          return respond(res, `✅ Task #${taskNo} marked done.`);
-        } catch (e) {
-          console.warn('[tasks] done failed:', e?.message);
-          return respond(res, `⚠️ Couldn’t mark task #${taskNo} done.`);
-        }
+        if (!r?.rows?.length) throw new Error('not updated');
+        updated = r.rows[0];
       }
+
+      // ------------------------------
+      // ✅ Brain v0 fact emission (task.done)
+      // ------------------------------
+      try {
+        await pg.insertFactEvent({
+          owner_id: ownerId,
+          actor_key: paUserId,
+
+          event_type: 'task.done',
+          entity_type: 'task',
+          entity_id: updated?.id != null ? String(updated.id) : null,
+          entity_no: updated?.task_no != null ? Number(updated.task_no) : taskNo,
+
+          job_no: updated?.job_no ?? null,
+          job_name: null,
+          job_source: null,
+
+          occurred_at: new Date().toISOString(),
+          source_msg_id: safeMsgId,
+          source_kind: 'whatsapp_text',
+          event_payload: { taskNo, title: updated?.title || null },
+
+          dedupe_key: `task.done:${String(safeMsgId || 'no_msg')}:${String(taskNo)}`
+        });
+      } catch (e) {
+        console.warn('[FACT_EVENT] task.done insert failed (ignored):', e?.message);
+      }
+
+      return respond(res, `✅ Task #${taskNo} marked done.`);
+    } catch (e) {
+      console.warn('[tasks] done failed:', e?.message);
+      return respond(res, `⚠️ Couldn’t mark task #${taskNo} done.`);
     }
+  }
+}
 
     // -------------------------------------------------
     // ASSIGN #N TO NAME

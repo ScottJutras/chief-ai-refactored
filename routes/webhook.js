@@ -508,69 +508,124 @@ const PA_TTL_MIN = Number(process.env.PENDING_TTL_MIN || 10);
 
 async function getPA({ ownerId, userId, kind }) {
   const owner = String(ownerId || '').trim();
-  const user = String(userId || '').trim();
+  const rawUser = String(userId || '').trim();
   const k = String(kind || '').trim();
-  if (!owner || !user || !k) return null;
+  if (!owner || !rawUser || !k) return null;
 
+  const digits =
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(rawUser)) ||
+    rawUser.replace(/\D/g, '');
+
+  const candidateUserIds = Array.from(new Set([rawUser, digits].filter(Boolean)));
+
+  // Prefer newest by created_at when multiple exist
+  const pickNewest = (rows = []) => {
+    const arr = (rows || []).filter(Boolean);
+    if (arr.length <= 1) return arr[0] || null;
+    arr.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    return arr[0] || null;
+  };
+
+  // ---------- Option A fast path ----------
   if (pgGetPendingActionByKind) {
     try {
-      const r = await pgGetPendingActionByKind({ ownerId: owner, userId: user, kind: k });
-      if (!r) return null;
-      if (r.payload != null) return r;
-      if (typeof r === 'object') return { payload: r };
-      return null;
+      const hits = await Promise.all(
+        candidateUserIds.map(async (uid) => {
+          try {
+            const r = await pgGetPendingActionByKind({ ownerId: owner, userId: uid, kind: k });
+            if (!r) return null;
+            if (r.payload != null) return r;
+            if (typeof r === 'object') return { payload: r };
+            return null;
+          } catch {
+            return null;
+          }
+        })
+      );
+
+      const best = pickNewest(hits);
+      if (best) return best;
     } catch {
-      // fall through
+      // fall through to SQL
     }
   }
 
+  // ---------- SQL fallback ----------
   try {
-    const r = await query(
-      `
-      SELECT id, kind, payload, created_at
-        FROM public.pending_actions
-       WHERE owner_id = $1
-         AND user_id = $2
-         AND kind = $3
-         AND created_at > now() - (($4::text || ' minutes')::interval)
-       ORDER BY created_at DESC
-       LIMIT 1
-      `,
-      [owner, user, k, String(PA_TTL_MIN)]
+    const rs = await Promise.all(
+      candidateUserIds.map((uid) =>
+        query(
+          `
+          SELECT id, kind, payload, created_at
+            FROM public.pending_actions
+           WHERE owner_id = $1
+             AND user_id = $2
+             AND kind = $3
+             AND created_at > now() - (($4::text || ' minutes')::interval)
+           ORDER BY created_at DESC
+           LIMIT 1
+          `,
+          [owner, uid, k, String(PA_TTL_MIN)]
+        ).catch(() => null)
+      )
     );
-    return r?.rows?.[0] || null;
+
+    const rows = rs.map((r) => r?.rows?.[0] || null).filter(Boolean);
+    return pickNewest(rows);
   } catch {
     return null;
   }
 }
 
+
 async function deletePA({ ownerId, userId, kind }) {
   const owner = String(ownerId || '').trim();
-  const user = String(userId || '').trim();
+  const rawUser = String(userId || '').trim();
   const k = String(kind || '').trim();
-  if (!owner || !user || !k) return;
+  if (!owner || !rawUser || !k) return;
 
+  const digits =
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(rawUser)) ||
+    rawUser.replace(/\D/g, '');
+
+  const candidateUserIds = Array.from(new Set([rawUser, digits].filter(Boolean)));
+
+  // Option A delete (if provided)
   if (pgDeletePendingActionByKind) {
-    try {
-      await pgDeletePendingActionByKind({ ownerId: owner, userId: user, kind: k });
-      return;
-    } catch {
-      // fall through
-    }
+    await Promise.all(
+      candidateUserIds.map((uid) =>
+        pgDeletePendingActionByKind({ ownerId: owner, userId: uid, kind: k }).catch(() => null)
+      )
+    );
+    return;
   }
 
-  try {
-    await query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [
-      owner,
-      user,
-      k
-    ]);
-  } catch {
-    // ignore
-  }
+  // SQL fallback
+  await Promise.all(
+    candidateUserIds.map((uid) =>
+      query(`DELETE FROM public.pending_actions WHERE owner_id=$1 AND user_id=$2 AND kind=$3`, [owner, uid, k]).catch(
+        () => null
+      )
+    )
+  );
 }
 
+
 async function clearAllPendingForUser({ ownerId, from }) {
+  const rawFrom = String(from || '').trim();
+
+  // ✅ Canonical keys used across handlers / PA storage (digits-only)
+  const actorDigits =
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(rawFrom)) ||
+    rawFrom.replace(/\D/g, '');
+
+  // ✅ Clear BOTH possible PA keys defensively:
+  // - digits-only (the correct canonical key)
+  // - rawFrom (legacy callers / older stored keys)
+  const candidateUserIds = Array.from(
+    new Set([actorDigits, rawFrom].filter(Boolean).map((x) => String(x).trim()))
+  );
+
   const kinds = [
     PA_KIND_CONFIRM_EXPENSE,
     PA_KIND_PICK_JOB_EXPENSE,
@@ -579,34 +634,71 @@ async function clearAllPendingForUser({ ownerId, from }) {
     'timeclock.confirm'
   ];
 
-  await Promise.all(kinds.map((k) => deletePA({ ownerId, userId: from, kind: k }).catch(() => null)));
+  // ✅ Delete all PAs for both keys (idempotent)
+  await Promise.all(
+    candidateUserIds.flatMap((uid) =>
+      kinds.map((k) => deletePA({ ownerId, userId: uid, kind: k }).catch(() => null))
+    )
+  );
 
   // legacy state cleanup (safe)
   try {
     if (typeof stateManager.clearFinanceFlow === 'function') {
-      await stateManager.clearFinanceFlow(from).catch(() => null);
+      await stateManager.clearFinanceFlow(rawFrom).catch(() => null);
+      // also clear by digits, because stateManager normalizes anyway but this is explicit
+      if (actorDigits && actorDigits !== rawFrom) {
+        await stateManager.clearFinanceFlow(actorDigits).catch(() => null);
+      }
     }
   } catch {}
 
   try {
     if (typeof stateManager.deletePendingTransactionState === 'function') {
-      await stateManager.deletePendingTransactionState(from).catch(() => null);
+      await stateManager.deletePendingTransactionState(rawFrom).catch(() => null);
+      if (actorDigits && actorDigits !== rawFrom) {
+        await stateManager.deletePendingTransactionState(actorDigits).catch(() => null);
+      }
     }
   } catch {}
 }
 
+
 async function hasExpensePA(ownerId, from) {
+  const rawFrom = String(from || '').trim();
+
+  const digits =
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(rawFrom)) ||
+    rawFrom.replace(/\D/g, '');
+
+  const candidateUserIds = Array.from(new Set([rawFrom, digits].filter(Boolean)));
+
   try {
-    const [pick, conf] = await Promise.all([
-      getPA({ ownerId, userId: from, kind: PA_KIND_PICK_JOB_EXPENSE }),
-      getPA({ ownerId, userId: from, kind: PA_KIND_CONFIRM_EXPENSE })
-    ]);
+    // Fetch both kinds across both candidate keys, pick the most recent hit if multiple exist.
+    const results = await Promise.all(
+      candidateUserIds.flatMap((uid) => [
+        getPA({ ownerId, userId: uid, kind: PA_KIND_PICK_JOB_EXPENSE }),
+        getPA({ ownerId, userId: uid, kind: PA_KIND_CONFIRM_EXPENSE })
+      ])
+    );
+
+    // results order is [pick(raw), conf(raw), pick(digits), conf(digits)] (if both keys exist)
+    const pickCandidates = [results[0], results[2]].filter(Boolean);
+    const confCandidates = [results[1], results[3]].filter(Boolean);
+
+    const pick =
+      pickCandidates.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))[0] || null;
+
+    const conf =
+      confCandidates.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))[0] || null;
+
     const hasAny = !!(pick?.payload || conf?.payload);
+
     return { pick, conf, hasAny };
   } catch {
     return { pick: null, conf: null, hasAny: false };
   }
 }
+
 
 
 
@@ -742,19 +834,36 @@ router.all('*', (req, res, next) => {
 /* ---------------- Identity + canonical URL ---------------- */
 
 router.use((req, _res, next) => {
-  // ✅ Canonical WhatsApp identity (store +E164 only)
-  req.from = req.body?.From ? normalizeE164(req.body.From) : null;
+  // Raw Twilio From (may be "whatsapp:+1...", "+1...", "1...", etc)
+  const rawFrom = String(req.body?.From || '').trim();
 
-  // Keep ownerId semantics unchanged if the rest of your system expects this
-  req.ownerId = req.from || null;
+  // ✅ Canonical E.164 (no "whatsapp:" prefix) for routing/sending
+  // normalizeE164 should return like "+1905...." OR null
+  const e164 = rawFrom ? normalizeE164(rawFrom) : null;
+
+  // ✅ Canonical digits-only key for *all storage/state/PA/CIL*
+  const digits =
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(rawFrom)) ||
+    String(rawFrom).replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '').trim() ||
+    null;
+
+  // Keep both available
+  req.from = e164;            // e.g. "+19053279955"
+  req.actorKey = digits;      // e.g. "19053279955"
+
+  // Owner id semantics (unchanged, but be explicit)
+  // If your system expects digits as ownerId, use actorKey.
+  // If your system expects e164, use req.from.
+  req.ownerId = req.actorKey || req.from || null;
 
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
   const path = req.originalUrl || req.url || '/api/webhook';
-
   req.twilioUrl = `${proto}://${host}${path}`;
+
   next();
 });
+
 
 
 /* ---------------- Phase tracker (debug) ---------------- */
@@ -1007,7 +1116,7 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-    let pending = await getPendingTransactionState(req.from);
+    let pending = await getPendingTransactionState(req.actorKey || req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
     const crypto = require('crypto');
 
@@ -1072,7 +1181,7 @@ if (!resolvedInbound && numMedia === 0) return ok(res);
 
           // Optional: clear any stale pending state after linking
           try {
-            await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from });
+            await clearAllPendingForUser({ ownerId: req.ownerId, from: (req.actorKey || req.from) });
           } catch {}
 
           return ok(
@@ -1088,121 +1197,190 @@ if (!resolvedInbound && numMedia === 0) return ok(res);
 
 
 
-    // -----------------------------------------------------------------------
-    // "resume" => re-send the pending confirm card if we have a confirm pending-action
-    // MUST run early (before nudge / PA router / job picker / fast paths / agent)
-    // -----------------------------------------------------------------------
-    if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
-      try {
-        const pa =
-          typeof pg.getMostRecentPendingActionForUser === 'function'
-            ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
-            : null;
 
-        const kind = String(pa?.kind || '').trim();
+// -----------------------------------------------------------------------
+// "resume" => re-send the pending confirm card if we have a confirm pending-action
+// MUST run early (before nudge / PA router / job picker / fast paths / agent)
+// -----------------------------------------------------------------------
+if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
+  try {
+    // ✅ Dual-key newest-wins PA lookup (rawFrom vs digits)
+    const rawFrom = String(req.from || '').trim();
+    const fromDigits = String(req.actorKey || '').trim() || rawFrom.replace(/\D/g, '');
 
-        if (kind === 'confirm_expense' || kind === 'pick_job_for_expense') {
-          const { handleExpense } = require('../handlers/commands/expense');
+    const pickNewest = (a, b) => {
+      if (!a) return b || null;
+      if (!b) return a || null;
+      const ta = new Date(a.created_at || 0).getTime();
+      const tb = new Date(b.created_at || 0).getTime();
+      return tb >= ta ? b : a;
+    };
 
-          const result = await handleExpense(
-            req.from,
-            'resume',
-            req.userProfile,
-            req.ownerId,
-            req.ownerProfile,
-            req.isOwner,
-            messageSid,
-            req.body
-          );
+    let resolvedResumePA = null;
 
-          if (!res.headersSent) {
-            const tw = typeof result === 'string' ? result : (result?.twiml || null);
-            return sendTwiml(res, tw);
-          }
-          return;
-        }
+    if (typeof pg.getMostRecentPendingActionForUser === 'function') {
+      const [paRaw, paDigits] = await Promise.all([
+        pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: rawFrom }).catch(() => null),
+        fromDigits && fromDigits !== rawFrom
+          ? pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: fromDigits }).catch(() => null)
+          : Promise.resolve(null)
+      ]);
 
-        if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
-          const { handleRevenue } = require('../handlers/commands/revenue');
-
-          const result = await handleRevenue(
-            req.from,
-            'resume',
-            req.userProfile,
-            req.ownerId,
-            req.ownerProfile,
-            req.isOwner,
-            messageSid,
-            req.body
-          );
-
-          if (!res.headersSent) {
-            const tw = typeof result === 'string' ? result : (result?.twiml || null);
-            return sendTwiml(res, tw);
-          }
-          return;
-        }
-      } catch (e) {
-        console.warn('[WEBHOOK] resume pending failed (ignored):', e?.message);
-      }
-
-      return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
+      resolvedResumePA = pickNewest(paRaw, paDigits);
     }
 
-    /* -----------------------------------------------------------------------
+    const kind = String(resolvedResumePA?.kind || '').trim();
+
+    // ✅ Tiny debug log (keep for ~1 week then remove)
+    console.info('[RESUME_PA]', {
+      ownerId: req.ownerId || null,
+      rawFrom: rawFrom || null,
+      fromDigits: fromDigits || null,
+      kind: kind || null,
+      paId: resolvedResumePA?.id ?? null,
+      created_at: resolvedResumePA?.created_at ?? null
+    });
+
+    if (kind === 'confirm_expense' || kind === 'pick_job_for_expense') {
+      const { handleExpense } = require('../handlers/commands/expense');
+
+      const result = await handleExpense(
+        req.from, // ✅ reply identity (E.164)
+        'resume',
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        messageSid,
+        req.body
+      );
+
+      if (!res.headersSent) {
+        const tw = typeof result === 'string' ? result : (result?.twiml || null);
+        return sendTwiml(res, tw);
+      }
+      return;
+    }
+
+    if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
+      const { handleRevenue } = require('../handlers/commands/revenue');
+
+      const result = await handleRevenue(
+        req.from, // ✅ reply identity (E.164)
+        'resume',
+        req.userProfile,
+        req.ownerId,
+        req.ownerProfile,
+        req.isOwner,
+        messageSid,
+        req.body
+      );
+
+      if (!res.headersSent) {
+        const tw = typeof result === 'string' ? result : (result?.twiml || null);
+        return sendTwiml(res, tw);
+      }
+      return;
+    }
+  } catch (e) {
+    console.warn('[WEBHOOK] resume pending failed (ignored):', e?.message);
+  }
+
+  return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
+}
+
+
+  /* -----------------------------------------------------------------------
  * ✅ GLOBAL HARD CANCEL (router-level)
  * - Runs BEFORE handlers
- * - Must also cancel any pending CIL drafts
+ * - Clears pending actions/state
+ * - Cancels pending CIL drafts (expense + revenue)
  * ----------------------------------------------------------------------- */
 if (/^(cancel|stop|no)\b/.test(lc)) {
   // 1) Clear all pending actions/state (existing behavior)
-  await clearAllPendingForUser({ ownerId: req.ownerId, from: req.from }).catch(() => null);
+  await clearAllPendingForUser({ ownerId: req.ownerId, from: (req.actorKey || req.from) }).catch(() => null);
 
-    // 2) Cancel ALL draft rows for this actor (NEW: definitive)
-  try {
-    const actorDigits = String(req.from || '').replace(/\D/g, '');
+  // 2) Cancel ALL draft rows for this actor (definitive)
+try {
+  const actorDigits = String(req.actorKey || '').trim() || String(req.from || '').replace(/\D/g, '');
 
+  const kinds = ['expense', 'revenue'];
+  const out = [];
+
+  for (const kind of kinds) {
     const r = await pg.cancelAllCilDraftsForActor({
       owner_id: req.ownerId,
       actor_phone: actorDigits,
-      kind: 'expense',       // keep tight for now
+      kind,
       status: 'cancelled'
     });
 
-    console.info('[GLOBAL_CANCEL_CIL_ALL]', {
-      ownerId: req.ownerId,
-      actorDigits,
+    out.push({
+      kind,
       cancelled: r?.cancelled ?? null,
-      cancelled_ids: (r?.rows || []).slice(0, 10).map((x) => x.id) // cap log
+      cancelled_ids: (r?.rows || []).slice(0, 10).map((x) => x.id)
     });
-  } catch (e) {
-    console.warn('[GLOBAL_CANCEL_CIL_ALL] failed (ignored):', e?.message);
   }
 
-
+  console.info('[GLOBAL_CANCEL_CIL_ALL]', {
+    ownerId: req.ownerId,
+    actorDigits,
+    results: out
+  });
+} catch (e) {
+  console.warn('[GLOBAL_CANCEL_CIL_ALL] failed (ignored):', e?.message);
+}
   return ok(res, '❌ Cancelled. You’re cleared.');
 }
 
-    // -----------------------------------------------------------------------
-    // ✅ Pending Action: fetch ONCE early and reuse everywhere
-    // This prevents legacy nudge from swallowing edit payloads when hasExpensePA() misses.
-    // -----------------------------------------------------------------------
-    const mostRecentPA =
-      typeof pg.getMostRecentPendingActionForUser === 'function'
-        ? await pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: req.from })
-        : null;
+// -----------------------------------------------------------------------
+// ✅ Pending Action: fetch ONCE early and reuse everywhere
+// This prevents legacy nudge from swallowing edit payloads when hasExpensePA() misses.
+// -----------------------------------------------------------------------
+const rawFrom = String(req.from || '').trim();
+const fromDigits = rawFrom.replace(/\D/g, '');
 
-    const mostRecentPAKind = mostRecentPA?.kind ? String(mostRecentPA.kind).trim() : '';
-    const mostRecentIsExpensePA = mostRecentPAKind === 'confirm_expense' || mostRecentPAKind === 'pick_job_for_expense';
-    const mostRecentIsRevenuePA = mostRecentPAKind === 'confirm_revenue' || mostRecentPAKind === 'pick_job_for_revenue';
+// Helper: pick newest PA row (created_at desc)
+const pickNewestPA = (a, b) => {
+  if (!a) return b || null;
+  if (!b) return a || null;
+  const ta = new Date(a.created_at || 0).getTime();
+  const tb = new Date(b.created_at || 0).getTime();
+  return tb >= ta ? b : a;
+};
 
-    // ✅ Keep your Option A helper (but don’t trust it as sole source of truth)
-    const expensePA = await hasExpensePA(req.ownerId, req.from);
-    const hasExpensePendingActions = !!expensePA?.hasAny || mostRecentIsExpensePA;
+let resolvedMostRecentPA = null;
+
+if (typeof pg.getMostRecentPendingActionForUser === 'function') {
+  try {
+    const [paRaw, paDigits] = await Promise.all([
+      pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: rawFrom }).catch(() => null),
+      fromDigits && fromDigits !== rawFrom
+        ? pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: fromDigits }).catch(() => null)
+        : Promise.resolve(null)
+    ]);
+
+    resolvedMostRecentPA = pickNewestPA(paRaw, paDigits);
+  } catch (e) {
+    console.warn('[WEBHOOK] getMostRecentPendingActionForUser dual-key failed (ignored):', e?.message);
+    resolvedMostRecentPA = null;
+  }
+}
+
+const mostRecentPAKind = resolvedMostRecentPA?.kind ? String(resolvedMostRecentPA.kind).trim() : '';
+const mostRecentIsExpensePA =
+  mostRecentPAKind === 'confirm_expense' || mostRecentPAKind === 'pick_job_for_expense';
+const mostRecentIsRevenuePA =
+  mostRecentPAKind === 'confirm_revenue' || mostRecentPAKind === 'pick_job_for_revenue';
+
+// ✅ Keep your Option A helper (but don’t trust it as sole source of truth)
+const expensePA = await hasExpensePA(req.ownerId, rawFrom);
+const hasExpensePendingActions = !!expensePA?.hasAny || mostRecentIsExpensePA;
+
 // ✅ If PA flow exists, legacy pendingCorrection is stale noise — clear it once.
 try {
   if (mostRecentIsExpensePA && pending?.pendingCorrection && pending?.type === 'expense') {
-    await stateManager.mergePendingTransactionState(req.from, {
+    await stateManager.mergePendingTransactionState(rawFrom, {
       pendingCorrection: false,
       suggestedCorrections: null
     });
@@ -1285,7 +1463,7 @@ try {
 
         text = String(getInboundText(req.body || {}) || '').trim();
         lc = text.toLowerCase();
-        pending = await getPendingTransactionState(req.from);
+        pending = await getPendingTransactionState(req.actorKey || req.from);
       } catch (e) {
         console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
       }
@@ -1297,10 +1475,10 @@ try {
 
     /* -----------------------------------------------------------------------
      * ✅ Pending-actions router (must run early)
-     * Uses mostRecentPA fetched earlier (single source here)
+     * Uses resolvedMostRecentPA fetched earlier (single source here)
      * ----------------------------------------------------------------------- */
 
-    const pa = mostRecentPA;
+    const pa = resolvedMostRecentPA;
     const paKind = pa?.kind ? String(pa.kind).trim() : '';
 
     const isExpensePA = paKind === 'confirm_expense' || paKind === 'pick_job_for_expense';
@@ -1825,7 +2003,7 @@ if (looksExpense) {
     }
 
     if (looksTime && typeof handleTimeclock === 'function') {
-      const out = await handleTimeclock(req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
+      const out = await handleTimeclock(req.actorKey || req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);
       if (res.headersSent) return;
 
       let msg = '';

@@ -11,6 +11,7 @@ const parseRouter        = require('./routes/parse');
 const deepDiveRouter     = require('./routes/deepDive');
 const dashboardRouter    = require('./routes/dashboard'); // KPI dashboard API
 const debugRouter        = require('./routes/debug');     // ✅ debug endpoints (dev-only recommended)
+const askChiefRouter     = require('./routes/askChief');
 
 const app = express();
 
@@ -51,6 +52,7 @@ app.use('/webhook', webhookRouter); // temporary alias
 // Other routers can attach their own parsers internally as needed.
 app.use('/parse',     parseRouter);
 app.use('/deep-dive', deepDiveRouter);
+app.use(askChiefRouter); // routes/askChief.js defines POST /api/ask-chief
 
 // ✅ Debug tools (returns Answer Contract JSON) — strongly recommend dev-only
 if (!process.env.VERCEL) {

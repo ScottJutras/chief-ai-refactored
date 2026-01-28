@@ -500,13 +500,14 @@ try {
 
     try {
       let updated = null;
+      let task = null; // ✅ make available for fallback fact id
 
       if (typeof pg.markTaskDone === 'function') {
         updated = await pg.markTaskDone({ ownerId, taskNo, actorId: paUserId, isOwner });
         if (!updated) throw new Error('not found');
       } else {
         // fallback raw update with light permissions:
-        const task = typeof pg.getTaskByNo === 'function' ? await pg.getTaskByNo(ownerId, taskNo) : null;
+        task = typeof pg.getTaskByNo === 'function' ? await pg.getTaskByNo(ownerId, taskNo) : null;
         if (!task) throw new Error('not found');
 
         const can =
@@ -528,31 +529,36 @@ try {
         updated = r.rows[0];
       }
 
+      const taskIdForFact =
+        updated?.id != null ? String(updated.id)
+        : task?.id != null ? String(task.id)
+        : null;
+
       // ------------------------------
-// ✅ Brain v0 fact emission (task.done)
-// ------------------------------
-try {
-  await pg.insertFactEvent({
-    owner_id: ownerId,
-    actor_key: paUserId,
+      // ✅ Brain v0 fact emission (task.done)
+      // ------------------------------
+      try {
+        await pg.insertFactEvent({
+          owner_id: ownerId,
+          actor_key: paUserId,
 
-    event_type: 'task.done',
-    entity_type: 'task',
-    entity_id: updated?.id != null ? String(updated.id) : null,   // if helper returns it
-    entity_no: Number(taskNo),
+          event_type: 'task.done',
+          entity_type: 'task',
+          entity_id: taskIdForFact,
+          entity_no: Number(taskNo),
 
-    occurred_at: new Date().toISOString(),
-    source_msg_id: safeMsgId || null,
-    source_kind: 'whatsapp_text',
-    event_payload: { task_no: taskNo },
+          occurred_at: new Date().toISOString(),
+          source_msg_id: safeMsgId || null,
+          source_kind: 'whatsapp_text',
+          event_payload: { task_no: taskNo },
 
-    dedupe_key: `task.done:${String(safeMsgId || 'no_msg')}:${String(taskNo)}`
-  });
-} catch (e) {
-  console.warn('[FACT_EVENT] task.done insert failed (ignored):', e?.message);
-}
+          dedupe_key: `task.done:${String(safeMsgId || 'no_msg')}:${String(taskNo)}`
+        });
+      } catch (e) {
+        console.warn('[FACT_EVENT] task.done insert failed (ignored):', e?.message);
+      }
 
-return respond(res, `✅ Task #${taskNo} marked done.`);
+      return respond(res, `✅ Task #${taskNo} marked done.`);
     } catch (e) {
       console.warn('[tasks] done failed:', e?.message);
       return respond(res, `⚠️ Couldn’t mark task #${taskNo} done.`);

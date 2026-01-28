@@ -587,6 +587,10 @@ async function handleClock(ctx, cil) {
   const parsed = ClockCIL.parse(cil); // throws on invalid
   const nowIso = new Date().toISOString();
   const at = parsed.at || nowIso;
+  const occurredAtIso =
+  at && !Number.isNaN(Date.parse(String(at)))
+    ? new Date(String(at)).toISOString()
+    : new Date().toISOString();
 
   const owner_id = String(ctx.owner_id || '').trim();
   const user_id = String(ctx.user_id || '').trim();
@@ -611,7 +615,7 @@ async function handleClock(ctx, cil) {
       source_msg_id
     });
 
-    if (inserted) {
+  if (inserted) {
   try {
     await pg.insertFactEvent({
       owner_id,
@@ -620,22 +624,18 @@ async function handleClock(ctx, cil) {
       entity_type: 'time_entry',
       entity_id: null,
       job_id: job_id,
-      job_no: null,                // not available here
-      job_name: null,              // not available here
-      job_source: 'active',        // best guess; or null
-
       occurred_at: occurredAtIso,
-      recorded_at: new Date().toISOString(),
       source_msg_id,
       source_kind: 'whatsapp_text',
       event_payload: { action: 'in', kind: 'shift', at },
 
-      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:shift_in`
+      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:clock_in`
     });
   } catch (e) {
-    console.warn('[FACT_EVENT] timeclock.logged shift_in failed (ignored):', e?.message);
+    console.warn('[FACT_EVENT] timeclock.logged clock_in failed (ignored):', e?.message);
   }
 }
+
 
     return { text: `✅ Clocked in at ${toHumanTime(at, ctx.tz || 'UTC')}.` };
   }
@@ -684,11 +684,10 @@ async function handleClock(ctx, cil) {
       entity_id: String(shift.id), // we DO have the shift id here
       job_id: shift.job_id || null,
       occurred_at: occurredAtIso,
-      recorded_at: new Date().toISOString(),
       source_msg_id,
       source_kind: 'whatsapp_text',
       event_payload: { action: 'out', kind: 'shift', at, shift_id: shift.id, calc },
-      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:shift_out`
+      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${kind}_stop`
     });
   } catch (e) {
     console.warn('[FACT_EVENT] timeclock.logged shift_out failed (ignored):', e?.message);
@@ -726,7 +725,6 @@ if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.a
       entity_id: childId != null ? String(childId) : null,
       job_id: shift.job_id || null,
       occurred_at: occurredAtIso,
-      recorded_at: new Date().toISOString(),
       source_msg_id,
       source_kind: 'whatsapp_text',
       event_payload: { action: 'stop', kind, at, shift_id: shift.id, child_id: childId },

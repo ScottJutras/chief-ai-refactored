@@ -671,69 +671,101 @@ async function handleClock(ctx, cil) {
   }
 
   const parsed = ClockCIL.parse(cil); // throws on invalid
+
   const nowIso = new Date().toISOString();
-  const at = parsed.at || nowIso;
+  const atRaw = parsed.at || nowIso;
+
   const occurredAtIso =
-  at && !Number.isNaN(Date.parse(String(at)))
-    ? new Date(String(at)).toISOString()
-    : new Date().toISOString();
+    atRaw && !Number.isNaN(Date.parse(String(atRaw)))
+      ? new Date(String(atRaw)).toISOString()
+      : new Date().toISOString();
 
   const owner_id = String(ctx.owner_id || '').trim();
   const user_id = String(ctx.user_id || '').trim();
   const job_id = ctx.job_id || null;
   const created_by = ctx.created_by || null;
   const source_msg_id = ctx.source_msg_id ? String(ctx.source_msg_id).trim() : null;
+  const tz = ctx.tz || 'UTC';
 
-  if (parsed.action === 'in') {
-    const open = await getOpenShift(owner_id, user_id);
-    if (open) return { text: `You’re already clocked in since ${formatLocal(open.start_at_utc, ctx.tz || 'UTC')}.` };
+  if (!owner_id || !user_id) return { text: 'Timeclock: missing owner_id or user_id.' };
 
-    const inserted = await insertEntry({
-      owner_id,
-      user_id,
-      job_id,
-      parent_id: null,
-      kind: 'shift',
-      start_at_utc: at,
-      end_at_utc: null,
-      created_by,
-      meta: ctx.meta || {},
-      source_msg_id
-    });
+  // ---------------- helpers ----------------
+
+  async function emit(type, payload, dedupeSuffix, entity_id = null, jobId = null) {
+    try {
+      await pg.insertFactEvent({
+        owner_id,
+        actor_key: user_id,
+
+        event_type: 'timeclock.logged',
+        entity_type: 'time_entry',
+        entity_id: entity_id != null ? String(entity_id) : null,
+        entity_no: null,
+
+        job_id: jobId || null,
+
+        occurred_at: occurredAtIso,
+        source_msg_id,
+        source_kind: 'whatsapp_text',
+
+        event_payload: payload,
+
+        dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${dedupeSuffix}`
+      });
+    } catch (e) {
+      // never block UX
+      console.warn('[FACT_EVENT] timeclock.logged insert failed (ignored):', e?.message);
+    }
+  }
+
+  async function requireOpenShift() {
+    const shift = await getOpenShift(owner_id, user_id);
+    if (!shift) return { shift: null, text: `You’re not clocked in.` };
+    return { shift, text: null };
+  }
+
+  // ---------------- actions ----------------
+
+if (parsed.action === 'in') {
+  const open = await getOpenShift(owner_id, user_id);
+  if (open) return { text: `You’re already clocked in since ${formatLocal(open.start_at_utc, tz)}.` };
+
+  const inserted = await insertEntry({
+    owner_id,
+    user_id,
+    job_id,
+    parent_id: null,
+    kind: 'shift',
+    start_at_utc: atRaw,
+    end_at_utc: null,
+    created_by,
+    meta: ctx.meta || {},
+    source_msg_id
+  });
 
   if (inserted) {
-  try {
-    await pg.insertFactEvent({
-      owner_id,
-      actor_key: user_id,
-      event_type: 'timeclock.logged',
-      entity_type: 'time_entry',
-      entity_id: null,
-      job_id: job_id || null,
-
-      occurred_at: occurredAtIso,
-      source_msg_id,
-      source_kind: 'whatsapp_text',
-      event_payload: { action: 'in', kind: 'shift', at },
-
-      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:clock_in`
-    });
-  } catch (e) {
-    console.warn('[FACT_EVENT] timeclock.logged clock_in failed (ignored):', e?.message);
+    await emit(
+      'timeclock.logged',
+      { action: 'in', kind: 'shift', at: occurredAtIso, shift_id: inserted.id ?? null },
+      'clock_in',
+      null,
+      job_id || null
+    );
   }
+
+  return { text: `✅ Clocked in at ${toHumanTime(occurredAtIso, tz)}.` };
 }
 
-    return { text: `✅ Clocked in at ${toHumanTime(at, ctx.tz || 'UTC')}.` };
-  }
+if (parsed.action === 'out') {
+  const { shift, text } = await requireOpenShift();
+  if (!shift) return { text };
 
-  if (parsed.action === 'out') {
-  const shift = await getOpenShift(owner_id, user_id);
-  if (!shift) return { text: `You’re not clocked in.` };
-
+  // close any open children
   await pg.query(
-    `UPDATE public.time_entries SET end_at_utc=$3
+    `UPDATE public.time_entries
+        SET end_at_utc=$3
       WHERE owner_id=$1 AND parent_id=$2 AND end_at_utc IS NULL`,
-    [owner_id, shift.id, at]
+    [owner_id, shift.id, atRaw]
   );
 
   await closeEntryById(owner_id, shift.id);
@@ -760,26 +792,13 @@ async function handleClock(ctx, cil) {
   const day = new Date(shift.start_at_utc).toISOString().slice(0, 10);
   await touchKPI(owner_id, shift.job_id, day);
 
-  // ✅ Fact emission: shift clock-out (update-based, not insert-based)
-try {
-  await pg.insertFactEvent({
-    owner_id,
-    actor_key: user_id,
-    event_type: 'timeclock.logged',
-    entity_type: 'time_entry',
-    entity_id: String(shift.id),
-    job_id: shift.job_id || null,
-
-    occurred_at: occurredAtIso,
-    source_msg_id,
-    source_kind: 'whatsapp_text',
-    event_payload: { action: 'out', kind: 'shift', at, shift_id: shift.id, calc },
-
-    dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:clock_out`
-  });
-} catch (e) {
-  console.warn('[FACT_EVENT] timeclock.logged clock_out failed (ignored):', e?.message);
-}
+  await emit(
+    'timeclock.logged',
+    { action: 'out', kind: 'shift', at: occurredAtIso, shift_id: shift.id, calc },
+    'clock_out',
+    shift.id,
+    shift.job_id || null
+  );
 
   const msg =
     calc.unpaidLunch > 0 || calc.unpaidBreak > 0
@@ -789,46 +808,87 @@ try {
   return { text: `✅ Clocked out. ${msg}` };
 }
 
-if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.action === 'drive_stop') {
-  const kind = parsed.action.split('_')[0];
+// Segment START (break/lunch/drive)
+if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed.action === 'drive_start') {
+  const { shift, text } = await requireOpenShift();
+  if (!shift) return { text };
 
-  // capture which child was actually closed (best-effort)
+  const kind = parsed.action.split('_')[0]; // break | lunch | drive
+
+  // close any existing open child of same kind (fail-soft)
+  try {
+    await ensureNoOverlapChild(owner_id, shift.id, kind);
+  } catch {}
+
+  const inserted = await insertEntry({
+    owner_id,
+    user_id,
+    job_id: shift.job_id || null,
+    parent_id: shift.id,
+    kind,
+    start_at_utc: atRaw,
+    end_at_utc: null,
+    created_by,
+    meta: ctx.meta || {},
+    source_msg_id
+  });
+
+  if (inserted) {
+    await emit(
+      'timeclock.logged',
+      { action: 'start', kind, at: occurredAtIso, shift_id: shift.id, child_id: inserted.id ?? null },
+      `${kind}_start`,
+      inserted.id ?? null,
+      shift.job_id || null
+    );
+  }
+
+  if (kind === 'lunch') return { text: `🍽️ Lunch started.` };
+  if (kind === 'break') return { text: `⏸️ Break started.` };
+  return { text: `🚚 Drive started.` };
+}
+
+// Segment STOP (break/lunch/drive)
+if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.action === 'drive_stop') {
+  const { shift, text } = await requireOpenShift();
+  if (!shift) return { text };
+
+  const kind = parsed.action.split('_')[0]; // break | lunch | drive
+
+  // close open child of this kind (capture child id)
   const r = await pg.query(
     `UPDATE public.time_entries
-        SET end_at_utc=$3
+        SET end_at_utc=$3, updated_at=now()
       WHERE owner_id=$1 AND parent_id=$2 AND kind=$4 AND end_at_utc IS NULL
       RETURNING id`,
-    [owner_id, shift.id, at, kind]
+    [owner_id, shift.id, atRaw, kind]
   );
 
   const childId = r?.rows?.[0]?.id ?? null;
 
-  // ✅ Fact emission: segment stop
-try {
-  await pg.insertFactEvent({
-    owner_id,
-    actor_key: user_id,
-    event_type: 'timeclock.logged',
-    entity_type: 'time_entry',
-    entity_id: childId != null ? String(childId) : null,
-    job_id: shift.job_id || null,
+  if (!childId) {
+    if (kind === 'lunch') return { text: `No active lunch to stop.` };
+    if (kind === 'break') return { text: `No active break to stop.` };
+    return { text: `No active drive to stop.` };
+  }
 
-    occurred_at: occurredAtIso,
-    source_msg_id,
-    source_kind: 'whatsapp_text',
-    event_payload: { action: 'stop', kind, at, shift_id: shift.id, child_id: childId },
+  await emit(
+    'timeclock.logged',
+    { action: 'stop', kind, at: occurredAtIso, shift_id: shift.id, child_id: childId },
+    `${kind}_stop`,
+    childId,
+    shift.job_id || null
+  );
 
-    dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${kind}_stop`
-  });
-} catch (e) {
-  console.warn('[FACT_EVENT] timeclock.logged child_stop failed (ignored):', e?.message);
+  if (kind === 'lunch') return { text: `🍽️ Lunch stopped.` };
+  if (kind === 'break') return { text: `▶️ Break ended.` };
+  return { text: `🅿️ Drive stopped.` };
 }
 
-  return { text: `⏹️ ${kind} stopped.` };
+return { text: 'Timeclock: action not recognized.' };
+
 }
 
-  return { text: 'Timeclock: action not recognized.' };
-}
 
 /* ---------------- Legacy text command wrapper ---------------- */
 
@@ -874,99 +934,62 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
     const jobName = await resolveJobNameForActor({ ownerId, identityKey: paUserId, explicitJobName });
 
 // -------------------------------------------------
-// ✅ Timeclock early-claim gate (prevents fallthrough to agent)
-// Handles: clockin/clockout (no-space), clock in/out, punch in/out,
-// break/drive variants, and undo last / undolast.
+// ✅ Timeclock intent detection (single source of truth)
+// Handles: clockin/clockout, clock in/out, punchin/out, break/drive, undo last, undolast
 // -------------------------------------------------
 const norm = normalizeTcText(text);
 const rawNorm = norm.raw;
 const compact = norm.compact;
 
-// Bulletproof Undo detection (handles: "undo", "undo last", "undolast")
+// 1) Undo (most important: must never fall through)
 const isUndo =
   /^undo(\s+last)?$/i.test(rawNorm) ||
   /^undo(last)?$/i.test(compact);
 
-// Bulletproof no-space clock forms (handles: "clockin", "clockout")
-const isClockInNoSpace = RE_CLOCKIN_WORD.test(rawNorm) || RE_CLOCKIN_WORD.test(compact);
-const isClockOutNoSpace = RE_CLOCKOUT_WORD.test(rawNorm) || RE_CLOCKOUT_WORD.test(compact);
+// 2) Clock in/out (spaced + no-space)
+const isClockInSpaced = RE_CLOCK_IN.test(rawNorm);     // "clock in", "punch in"
+const isClockOutSpaced = RE_CLOCK_OUT.test(rawNorm);   // "clock out", "punch out"
 
-// Standard spaced forms (handles: "clock in", "punch out", etc.)
-const isClockInSpaced = RE_CLOCK_IN.test(rawNorm);
-const isClockOutSpaced = RE_CLOCK_OUT.test(rawNorm);
+const isClockInNoSpace =
+  RE_CLOCKIN_WORD.test(rawNorm) ||                     // "clockin", "punchin"
+  compactHasAny(compact, CLOCK_IN_PATTERNS);           // "startshift", etc
 
-// Segment presence
-const hasBreak = RE_HAS_BREAK.test(rawNorm);
-const hasDrive = RE_HAS_DRIVE.test(rawNorm);
+const isClockOutNoSpace =
+  RE_CLOCKOUT_WORD.test(rawNorm) ||                    // "clockout", "punchout"
+  compactHasAny(compact, CLOCK_OUT_PATTERNS);          // "endshift", etc
 
-// ✅ If it's clearly not timeclock, let other handlers try.
-const looksLikeTimeclock =
-  isUndo ||
-  isClockInNoSpace || isClockOutNoSpace ||
-  isClockInSpaced || isClockOutSpaced ||
-  hasBreak || hasDrive;
+let isClockIn = isClockInSpaced || isClockInNoSpace;
+let isClockOut = isClockOutSpaced || isClockOutNoSpace;
 
-if (!looksLikeTimeclock) return false;
-// ✅ Undo already computed in early-claim gate as `isUndo`
-// (do not redeclare; just reuse)
-
-
-const START_WORDS = ['start', 'starting', 'begin', 'on', 'going'];
-const STOP_WORDS  = ['stop', 'end', 'off', 'finish', 'done'];
-
-const CLOCK_IN_PATTERNS = [
-  'clockin', 'punchin', 'startshift', 'startmyday', 'shiftin'
-];
-const CLOCK_OUT_PATTERNS = [
-  'clockout', 'punchout', 'endshift', 'finishup', 'wrapup', 'shiftout'
-];
-
-// segment compact patterns (no spaces)
-const BREAK_START_COMPACT = [
-  'breakstart', 'startbreak', 'beginbreak', 'breakbegin', 'onbreak', 'breakon'
-];
-const BREAK_STOP_COMPACT = [
-  'breakstop', 'stopbreak', 'endbreak', 'breakend', 'offbreak', 'breakoff'
-];
-const DRIVE_START_COMPACT = [
-  'drivestart', 'startdrive', 'begindrive', 'drivebegin', 'ondrive', 'driveon'
-];
-const DRIVE_STOP_COMPACT = [
-  'drivestop', 'stopdrive', 'enddrive', 'driveend', 'offdrive', 'driveoff'
-];
-
-let isClockIn = isClockInNoSpace || isClockInSpaced;
-let isClockOut = isClockOutNoSpace || isClockOutSpaced;
-
-
-
-// BREAK start/stop (lots of synonyms)
+// 3) Break/drive
 let isBreakStart =
   compactHasAny(compact, BREAK_START_COMPACT) ||
-  (/\bbreak\b/i.test(rawNorm) && hasAnyWord(rawNorm, START_WORDS)) ||
+  (RE_HAS_BREAK.test(rawNorm) && hasAnyWord(rawNorm, START_WORDS)) ||
   hasBoth(rawNorm, 'on', 'break');
 
 let isBreakStop =
   compactHasAny(compact, BREAK_STOP_COMPACT) ||
-  (/\bbreak\b/i.test(rawNorm) && hasAnyWord(rawNorm, STOP_WORDS)) ||
+  (RE_HAS_BREAK.test(rawNorm) && hasAnyWord(rawNorm, STOP_WORDS)) ||
   hasBoth(rawNorm, 'off', 'break');
 
-// DRIVE start/stop
 let isDriveStart =
   compactHasAny(compact, DRIVE_START_COMPACT) ||
-  (/\bdrive\b/i.test(rawNorm) && hasAnyWord(rawNorm, START_WORDS)) ||
+  (RE_HAS_DRIVE.test(rawNorm) && hasAnyWord(rawNorm, START_WORDS)) ||
   hasBoth(rawNorm, 'on', 'drive');
 
 let isDriveStop =
   compactHasAny(compact, DRIVE_STOP_COMPACT) ||
-  (/\bdrive\b/i.test(rawNorm) && hasAnyWord(rawNorm, STOP_WORDS)) ||
+  (RE_HAS_DRIVE.test(rawNorm) && hasAnyWord(rawNorm, STOP_WORDS)) ||
   hasBoth(rawNorm, 'off', 'drive');
 
-// If user says just "on break" we treat as start; if "off break" treat as stop
-// (already covered above)
+// 4) Early-claim gate (prevents fallthrough to agent)
+// If it doesn't look like timeclock at all, let other handlers try.
+const looksLikeTimeclock =
+  isUndo ||
+  isClockIn || isClockOut ||
+  RE_HAS_BREAK.test(rawNorm) || RE_HAS_DRIVE.test(rawNorm);
 
-// If they said "start break" or "begin break", normalize that to start
-// (already covered via START_WORDS)
+if (!looksLikeTimeclock) return false;
 
 
 
@@ -1018,10 +1041,123 @@ let isDriveStop =
       : isDriveStop ? 'drive_stop'
       : null;
 
-    // If Undo, handle it explicitly (do NOT fall through)
+    // If Undo, execute it NOW (do NOT fall through and do NOT call state machine helpers)
 if (isUndo) {
-  // fall through to the undo branch later in the function
-} else if (!resolvedType) {
+  console.log('[timeclock] UNDO branch hit', { ownerId, target });
+
+  const shape = await detectTimeEntriesShape();
+
+  if (shape === 'legacy') {
+    const del = await pg.query(
+      `DELETE FROM public.time_entries
+         WHERE id = (
+           SELECT id FROM public.time_entries
+            WHERE owner_id=$1 AND lower(employee_name)=lower($2)
+            ORDER BY timestamp DESC
+            LIMIT 1
+         )
+         RETURNING id, type, timestamp`,
+      [String(ownerId || '').trim(), target]
+    );
+
+    if (!del.rowCount) return twiml(res, `Nothing to undo for ${target}.`);
+
+    const deletedType = String(del.rows[0].type || '').trim() || 'unknown';
+    const deletedAt = del.rows[0].timestamp ? new Date(del.rows[0].timestamp).toISOString() : null;
+
+    try {
+      const sid = String(stableMsgId || 'no_msg');
+      await pg.insertFactEvent({
+        owner_id: String(ownerId || '').trim(),
+        actor_key: String(paUserId || '').trim(),
+
+        event_type: 'timeclock.undone',
+        entity_type: 'time_entry',
+        entity_id: del.rows[0].id != null ? String(del.rows[0].id) : null,
+        entity_no: null,
+
+        occurred_at: new Date().toISOString(),
+        source_msg_id: stableMsgId || null,
+        source_kind: 'whatsapp_text',
+
+        event_payload: {
+          shape: 'legacy',
+          undone_target: String(target || '').trim() || null,
+          deleted_type: deletedType,
+          deleted_at: deletedAt
+        },
+
+        dedupe_key: `timeclock.undone:${sid}:legacy:${String(del.rows[0].id || deletedAt || 'x')}`
+      });
+    } catch (e) {
+      console.warn('[FACT_EVENT] timeclock.undone insert failed (ignored):', e?.message);
+    }
+
+    const typeHuman = deletedType.replace(/_/g, ' ');
+    const atHuman = del.rows[0].timestamp ? formatLocal(del.rows[0].timestamp, tz) : 'recently';
+    return twiml(res, `Undid ${typeHuman} at ${atHuman} for ${target}.`);
+  }
+
+  if (shape === 'new') {
+    // IMPORTANT: in new schema, "target" must be a user_id (digits). If it's a name, use paUserId.
+    const targetUserId = /^\d+$/.test(String(target || '').trim()) ? String(target || '').trim() : String(paUserId || '').trim();
+
+    const del = await pg.query(
+      `DELETE FROM public.time_entries
+         WHERE id = (
+           SELECT id FROM public.time_entries
+            WHERE owner_id=$1 AND user_id=$2
+            ORDER BY coalesce(start_at_utc, created_at) DESC
+            LIMIT 1
+         )
+         RETURNING id, kind, start_at_utc, created_at`,
+      [String(ownerId || '').trim(), targetUserId]
+    );
+
+    if (!del.rowCount) return twiml(res, `Nothing to undo.`);
+
+    const deletedKind = String(del.rows[0].kind || '').trim() || 'entry';
+    const deletedAtIso = del.rows[0].start_at_utc
+      ? new Date(del.rows[0].start_at_utc).toISOString()
+      : (del.rows[0].created_at ? new Date(del.rows[0].created_at).toISOString() : null);
+
+    try {
+      const sid = String(stableMsgId || 'no_msg');
+      await pg.insertFactEvent({
+        owner_id: String(ownerId || '').trim(),
+        actor_key: String(paUserId || '').trim(),
+
+        event_type: 'timeclock.undone',
+        entity_type: 'time_entry',
+        entity_id: del.rows[0].id != null ? String(del.rows[0].id) : null,
+        entity_no: null,
+
+        occurred_at: new Date().toISOString(),
+        source_msg_id: stableMsgId || null,
+        source_kind: 'whatsapp_text',
+
+        event_payload: {
+          shape: 'new',
+          undone_target: targetUserId,
+          deleted_kind: deletedKind,
+          deleted_at: deletedAtIso
+        },
+
+        dedupe_key: `timeclock.undone:${sid}:new:${String(del.rows[0].id || deletedAtIso || 'x')}`
+      });
+    } catch (e) {
+      console.warn('[FACT_EVENT] timeclock.undone insert failed (ignored):', e?.message);
+    }
+
+    const atHuman = del.rows[0].start_at_utc ? formatLocal(del.rows[0].start_at_utc, tz) : 'recently';
+    return twiml(res, `Undid ${deletedKind} at ${atHuman}.`);
+  }
+
+  return twiml(res, `Undo isn't available until time_entries schema is recognized.`);
+}
+
+// If ambiguous segment intent, quick reply
+if (!resolvedType) {
   const hasBreak = RE_HAS_BREAK.test(rawNorm);
   const hasDrive = RE_HAS_DRIVE.test(rawNorm);
 
@@ -1039,8 +1175,9 @@ if (isUndo) {
     return twiml(res, 'Choose an option above.');
   }
 
-  return false; // router can fall through to other handlers (agent, etc.)
+  return false; // router can fall through to other handlers
 }
+
 
     // Backfill confirm if >2 min away from now
     if (tsOverride) {
@@ -1065,7 +1202,9 @@ if (isUndo) {
       }
     }
 
-    // force paths
+  // -------------------------------------------------
+// force paths
+// -------------------------------------------------
 const mForceIn = rawNorm.match(/^force\s+clock\s+in\s+(.+)$/i);
 const mForceOut = rawNorm.match(/^force\s+clock\s+out\s+(.+)$/i);
 
@@ -1075,6 +1214,7 @@ if (mForceIn) {
   const forced = mForceIn[1].trim();
   const forceType = 'clock_in';
 
+  // Legacy schema: forced can be employee name (as before)
   if (canLegacyWrite) {
     await pg.logTimeEntryWithJob(ownerId, forced, forceType, tsOverride || now, jobName, tz, {
       requester_id: paUserId,
@@ -1085,8 +1225,8 @@ if (mForceIn) {
       ownerId,
       actorKey: paUserId,
       sourceMsgId: stableMsgId,
-      resolvedType: forceType,   // ✅ explicit
-      target: forced,            // ✅ forced, not target
+      resolvedType: forceType,
+      target: forced,
       jobName,
       tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
     });
@@ -1094,9 +1234,22 @@ if (mForceIn) {
     return twiml(res, `✅ Forced clock-in recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
   }
 
-  // New schema path: handleClock already emits facts in your updated handleClock.
+  // New schema: forced MUST be a user_id (digits)
+  const shapeForForce = await detectTimeEntriesShape();
+  const forcedKey =
+    shapeForForce === 'new'
+      ? (/^\d+$/.test(String(forced || '').trim()) ? String(forced || '').trim() : null)
+      : String(forced || '').trim();
+
+  if (shapeForForce === 'new' && !forcedKey) {
+    return twiml(
+      res,
+      `Force clock-in in v0 requires an employee phone/user_id (digits). Example: "force clock in 19053279955".`
+    );
+  }
+
   const out = await handleClock(
-    { owner_id: ownerId, user_id: forced, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { owner_id: ownerId, user_id: forcedKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
     { action: 'in', at: tsOverride || now.toISOString() }
   );
   return twiml(res, out?.text || '✅ Forced clock-in recorded.');
@@ -1106,6 +1259,7 @@ if (mForceOut) {
   const forced = mForceOut[1].trim();
   const forceType = 'clock_out';
 
+  // Legacy schema: forced can be employee name (as before)
   if (canLegacyWrite) {
     await pg.logTimeEntryWithJob(ownerId, forced, forceType, tsOverride || now, jobName, tz, {
       requester_id: paUserId,
@@ -1116,7 +1270,7 @@ if (mForceOut) {
       ownerId,
       actorKey: paUserId,
       sourceMsgId: stableMsgId,
-      resolvedType: forceType,   // ✅ explicit
+      resolvedType: forceType,
       target: forced,
       jobName,
       tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
@@ -1125,16 +1279,40 @@ if (mForceOut) {
     return twiml(res, `✅ Forced clock-out recorded for ${forced} at ${formatLocal(tsOverride || now, tz)}.`);
   }
 
-  // New schema path: handleClock already emits facts in your updated handleClock.
+  // New schema: forced MUST be a user_id (digits)
+  const shapeForForce = await detectTimeEntriesShape();
+  const forcedKey =
+    shapeForForce === 'new'
+      ? (/^\d+$/.test(String(forced || '').trim()) ? String(forced || '').trim() : null)
+      : String(forced || '').trim();
+
+  if (shapeForForce === 'new' && !forcedKey) {
+    return twiml(
+      res,
+      `Force clock-out in v0 requires an employee phone/user_id (digits). Example: "force clock out 19053279955".`
+    );
+  }
+
   const out = await handleClock(
-    { owner_id: ownerId, user_id: forced, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { owner_id: ownerId, user_id: forcedKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
     { action: 'out', at: tsOverride || now.toISOString() }
   );
   return twiml(res, out?.text || '✅ Forced clock-out recorded.');
 }
 
 
-const state = await getCurrentState(ownerId, target);
+
+
+const shapeForTarget = await detectTimeEntriesShape();
+
+// targetKey is what DB ops should use (new schema expects digits user_id)
+const targetKey =
+  shapeForTarget === 'new'
+    ? (/^\d+$/.test(String(target || '').trim()) ? String(target || '').trim() : String(paUserId || '').trim())
+    : target;
+
+const state = await getCurrentState(ownerId, targetKey);
+
 
 // ✅ IMPORTANT:
 // - Legacy path emits facts via emitTimeclockFact (wrapper)
@@ -1170,7 +1348,7 @@ if (resolvedType === 'clock_in') {
 
   // New schema path: handleClock emits fact itself ✅
   const out = await handleClock(
-    { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { owner_id: ownerId, user_id: targetKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
     { action: 'in', at: tsOverride || now.toISOString() }
   );
 
@@ -1206,7 +1384,7 @@ if (resolvedType === 'clock_out') {
 
   // New schema path: handleClock emits fact itself ✅
   const out = await handleClock(
-    { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { owner_id: ownerId, user_id: targetKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
     { action: 'out', at: tsOverride || now.toISOString() }
   );
 
@@ -1238,7 +1416,7 @@ if (resolvedType === 'break_start') {
 
   // New schema path: handleClock emits fact itself ✅
   const out = await handleClock(
-    { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { owner_id: ownerId, user_id: targetKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
     { action: 'break_start', at: tsOverride || now.toISOString() }
   );
 
@@ -1270,7 +1448,7 @@ if (resolvedType === 'break_stop') {
 
   // New schema path: handleClock emits fact itself ✅
   const out = await handleClock(
-    { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { owner_id: ownerId, user_id: targetKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
     { action: 'break_stop', at: tsOverride || now.toISOString() }
   );
 
@@ -1302,7 +1480,7 @@ if (resolvedType === 'drive_start') {
 
   // New schema path: handleClock emits fact itself ✅
   const out = await handleClock(
-    { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { owner_id: ownerId, user_id: targetKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
     { action: 'drive_start', at: tsOverride || now.toISOString() }
   );
 
@@ -1334,122 +1512,11 @@ if (resolvedType === 'drive_stop') {
 
   // New schema path: handleClock emits fact itself ✅
   const out = await handleClock(
-    { owner_id: ownerId, user_id: target, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { owner_id: ownerId, user_id: targetKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
     { action: 'drive_stop', at: tsOverride || now.toISOString() }
   );
 
   return twiml(res, out?.text || `🅿️ Drive stopped for ${target}.`);
-}
-
-    if (isUndo) {
-  const shape = await detectTimeEntriesShape();
-
-  if (shape === 'legacy') {
-    const del = await pg.query(
-      `DELETE FROM public.time_entries
-         WHERE id = (
-           SELECT id FROM public.time_entries
-            WHERE owner_id=$1 AND lower(employee_name)=lower($2)
-            ORDER BY timestamp DESC
-            LIMIT 1
-         )
-         RETURNING id, type, timestamp`,
-      [String(ownerId || '').trim(), target]
-    );
-
-    if (!del.rowCount) return twiml(res, `Nothing to undo for ${target}.`);
-
-    const deletedType = String(del.rows[0].type || '').trim() || 'unknown';
-    const deletedAt = del.rows[0].timestamp ? new Date(del.rows[0].timestamp).toISOString() : null;
-
-    // ✅ Brain v0: emit undo fact (best-effort, never blocks UX)
-    try {
-      const sid = String(stableMsgId || 'no_msg');
-      await pg.insertFactEvent({
-        owner_id: String(ownerId || '').trim(),
-        actor_key: String(paUserId || '').trim(),
-
-        event_type: 'timeclock.undone',
-        entity_type: 'time_entry',
-        entity_id: del.rows[0].id != null ? String(del.rows[0].id) : null,
-        entity_no: null,
-
-        occurred_at: new Date().toISOString(),
-        source_msg_id: stableMsgId || null,
-        source_kind: 'whatsapp_text',
-
-        event_payload: {
-          shape: 'legacy',
-          undone_target: String(target || '').trim() || null,
-          deleted_type: deletedType,
-          deleted_at: deletedAt
-        },
-
-        dedupe_key: `timeclock.undone:${sid}:legacy:${String(del.rows[0].id || deletedAt || 'x')}`
-      });
-    } catch (e) {
-      console.warn('[FACT_EVENT] timeclock.undone insert failed (ignored):', e?.message);
-    }
-
-    const typeHuman = deletedType.replace(/_/g, ' ');
-    const atHuman = del.rows[0].timestamp ? formatLocal(del.rows[0].timestamp, tz) : 'recently';
-    return twiml(res, `Undid ${typeHuman} at ${atHuman} for ${target}.`);
-  }
-
-  if (shape === 'new') {
-    const del = await pg.query(
-      `DELETE FROM public.time_entries
-         WHERE id = (
-           SELECT id FROM public.time_entries
-            WHERE owner_id=$1 AND user_id=$2
-            ORDER BY coalesce(start_at_utc, created_at) DESC
-            LIMIT 1
-         )
-         RETURNING id, kind, start_at_utc, created_at`,
-      [String(ownerId || '').trim(), String(target || '').trim()]
-    );
-
-    if (!del.rowCount) return twiml(res, `Nothing to undo for ${target}.`);
-
-    const deletedKind = String(del.rows[0].kind || '').trim() || 'entry';
-    const deletedAtIso = del.rows[0].start_at_utc
-      ? new Date(del.rows[0].start_at_utc).toISOString()
-      : (del.rows[0].created_at ? new Date(del.rows[0].created_at).toISOString() : null);
-
-    // ✅ Brain v0: emit undo fact (best-effort, never blocks UX)
-    try {
-      const sid = String(stableMsgId || 'no_msg');
-      await pg.insertFactEvent({
-        owner_id: String(ownerId || '').trim(),
-        actor_key: String(paUserId || '').trim(),
-
-        event_type: 'timeclock.undone',
-        entity_type: 'time_entry',
-        entity_id: del.rows[0].id != null ? String(del.rows[0].id) : null,
-        entity_no: null,
-
-        occurred_at: new Date().toISOString(),
-        source_msg_id: stableMsgId || null,
-        source_kind: 'whatsapp_text',
-
-        event_payload: {
-          shape: 'new',
-          undone_target: String(target || '').trim() || null,
-          deleted_kind: deletedKind,
-          deleted_at: deletedAtIso
-        },
-
-        dedupe_key: `timeclock.undone:${sid}:new:${String(del.rows[0].id || deletedAtIso || 'x')}`
-      });
-    } catch (e) {
-      console.warn('[FACT_EVENT] timeclock.undone insert failed (ignored):', e?.message);
-    }
-
-    const atHuman = del.rows[0].start_at_utc ? formatLocal(del.rows[0].start_at_utc, tz) : 'recently';
-    return twiml(res, `Undid ${deletedKind} at ${atHuman} for ${target}.`);
-  }
-
-  return twiml(res, `Undo isn't available until time_entries schema is recognized.`);
 }
 
     return false;

@@ -1415,31 +1415,34 @@ async function insertFactEvent(e) {
     return { ok: false, error: 'missing required fields' };
   }
 
+  // ✅ occurred_at hardening: never null, never Invalid Date
+  const occurredAt =
+    e?.occurred_at && !Number.isNaN(Date.parse(String(e.occurred_at)))
+      ? new Date(e.occurred_at)
+      : new Date();
+
   const row = {
     owner_id,
     actor_key,
     event_type,
     entity_type,
-    entity_id: e.entity_id != null ? String(e.entity_id) : null,
-    entity_no: e.entity_no != null ? Number(e.entity_no) : null,
+    entity_id: e?.entity_id != null ? String(e.entity_id) : null,
+    entity_no: e?.entity_no != null ? Number(e.entity_no) : null,
 
-    job_id: e.job_id != null ? String(e.job_id) : null,
-    job_no: e.job_no != null ? Number(e.job_no) : null,
-    job_name: e.job_name != null ? String(e.job_name) : null,
-    job_source: e.job_source != null ? String(e.job_source) : null,
+    job_id: e?.job_id != null ? String(e.job_id) : null,
+    job_no: e?.job_no != null ? Number(e.job_no) : null,
+    job_name: e?.job_name != null ? String(e.job_name) : null,
+    job_source: e?.job_source != null ? String(e.job_source) : null,
 
-    amount_cents: e.amount_cents != null ? Number(e.amount_cents) : null,
-    currency: e.currency != null ? String(e.currency) : null,
+    amount_cents: e?.amount_cents != null ? Number(e.amount_cents) : null,
+    currency: e?.currency != null ? String(e.currency) : null,
 
-    occurred_at: e.occurred_at
-  ? new Date(e.occurred_at)
-  : new Date(),
+    occurred_at: occurredAt,
 
-
-    source_msg_id: e.source_msg_id != null ? String(e.source_msg_id) : null,
-    source_kind: e.source_kind != null ? String(e.source_kind) : null,
-    source_payload: e.source_payload || null,
-    event_payload: e.event_payload || null,
+    source_msg_id: e?.source_msg_id != null ? String(e.source_msg_id) : null,
+    source_kind: e?.source_kind != null ? String(e.source_kind) : null,
+    source_payload: e?.source_payload || null,
+    event_payload: e?.event_payload || null,
 
     dedupe_key
   };
@@ -1487,6 +1490,7 @@ async function insertFactEvent(e) {
     return { ok: false, error: e2?.message || 'db error' };
   }
 }
+
 async function getCashflowDaily({ ownerId, days = 30 }) {
   const owner_id = String(ownerId || '').trim();
   const limDays = Math.max(1, Math.min(365, Number(days) || 30));

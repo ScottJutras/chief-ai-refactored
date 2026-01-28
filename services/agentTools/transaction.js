@@ -7,7 +7,7 @@
  * Tool C: get_spend_summary
  */
 
-const pg = require('../../postgres'); // adjust path if yours differs
+const pg = require('../postgres');
 
 function isoDateOrNull(s) {
   const t = String(s || '').trim();

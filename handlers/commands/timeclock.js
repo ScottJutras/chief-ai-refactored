@@ -873,26 +873,42 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
     const explicitJobName = extractJobHint(text) || null;
     const jobName = await resolveJobNameForActor({ ownerId, identityKey: paUserId, explicitJobName });
 
- // -------------------------------------------------
+// -------------------------------------------------
 // ✅ Timeclock early-claim gate (prevents fallthrough to agent)
-// Handles: clockin/clockout, clock in/out, punchin/out, break/drive, undo last
+// Handles: clockin/clockout (no-space), clock in/out, punch in/out,
+// break/drive variants, and undo last / undolast.
 // -------------------------------------------------
 const norm = normalizeTcText(text);
 const rawNorm = norm.raw;
 const compact = norm.compact;
 
-// If it's clearly not timeclock, let other handlers try.
-const looksLikeTimeclock =
-  RE_CLOCK_IN.test(rawNorm) ||
-  RE_CLOCK_OUT.test(rawNorm) ||
-  RE_CLOCKIN_WORD.test(rawNorm) ||
-  RE_CLOCKOUT_WORD.test(rawNorm) ||
-  RE_HAS_BREAK.test(rawNorm) ||
-  RE_HAS_DRIVE.test(rawNorm) ||
+// Bulletproof Undo detection (handles: "undo", "undo last", "undolast")
+const isUndo =
   /^undo(\s+last)?$/i.test(rawNorm) ||
-  /^undo(last)?$/i.test(compact); // also catches "undolast"
+  /^undo(last)?$/i.test(compact);
+
+// Bulletproof no-space clock forms (handles: "clockin", "clockout")
+const isClockInNoSpace = RE_CLOCKIN_WORD.test(rawNorm) || RE_CLOCKIN_WORD.test(compact);
+const isClockOutNoSpace = RE_CLOCKOUT_WORD.test(rawNorm) || RE_CLOCKOUT_WORD.test(compact);
+
+// Standard spaced forms (handles: "clock in", "punch out", etc.)
+const isClockInSpaced = RE_CLOCK_IN.test(rawNorm);
+const isClockOutSpaced = RE_CLOCK_OUT.test(rawNorm);
+
+// Segment presence
+const hasBreak = RE_HAS_BREAK.test(rawNorm);
+const hasDrive = RE_HAS_DRIVE.test(rawNorm);
+
+// ✅ If it's clearly not timeclock, let other handlers try.
+const looksLikeTimeclock =
+  isUndo ||
+  isClockInNoSpace || isClockOutNoSpace ||
+  isClockInSpaced || isClockOutSpaced ||
+  hasBreak || hasDrive;
 
 if (!looksLikeTimeclock) return false;
+// ✅ Undo already computed in early-claim gate as `isUndo`
+// (do not redeclare; just reuse)
 
 
 const START_WORDS = ['start', 'starting', 'begin', 'on', 'going'];
@@ -919,15 +935,9 @@ const DRIVE_STOP_COMPACT = [
   'drivestop', 'stopdrive', 'enddrive', 'driveend', 'offdrive', 'driveoff'
 ];
 
-let isClockIn =
-  compactHasAny(compact, CLOCK_IN_PATTERNS) ||
-  RE_CLOCK_IN.test(rawNorm) ||
-  RE_CLOCKIN_WORD.test(rawNorm);
+let isClockIn = isClockInNoSpace || isClockInSpaced;
+let isClockOut = isClockOutNoSpace || isClockOutSpaced;
 
-let isClockOut =
-  compactHasAny(compact, CLOCK_OUT_PATTERNS) ||
-  RE_CLOCK_OUT.test(rawNorm) ||
-  RE_CLOCKOUT_WORD.test(rawNorm);
 
 
 // BREAK start/stop (lots of synonyms)
@@ -958,10 +968,6 @@ let isDriveStop =
 // If they said "start break" or "begin break", normalize that to start
 // (already covered via START_WORDS)
 
-// ✅ Undo stays the same
-const isUndo =
-  /^undo(\s+last)?$/i.test(rawNorm) ||
-  /^undo(last)?$/i.test(compact);
 
 
 

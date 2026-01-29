@@ -1177,7 +1177,7 @@ if (!resolvedInbound && numMedia === 0) return ok(res);
 // ✅ HARD TIME COMMANDS: bypass nudge + PA + pending-flow routers
 // ------------------------------------------------------------
 let isHardTimeCommand = looksHardTimeCommand(lc);
-console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
+console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand, mostRecentPAKind });
 
     // ✅ Compute messageSid EARLY so resume can use it safely
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
@@ -1917,9 +1917,11 @@ if (looksExpense) {
       /\bmove\s+last\s+log\s+to\b/.test(lc2);
 
  let looksTime =
-  /\b(time\s*clock|timeclock|punch|break|drive|timesheet|hours|lunch|undo)\b/.test(lc2) ||
+  /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours|lunch|undo)\b/.test(lc2) ||
   /\b(clockin|clockout|punchin|punchout|shiftin|shiftout|undolast|breakstart|breakend|startbreak|lunchstart|lunchend)\b/.test(lc2) ||
+  /^clock\s*(in|out)\b/.test(lc2) ||
   /^undo(\s+last)?$/.test(lc2);
+
 
 
 

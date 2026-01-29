@@ -601,28 +601,42 @@ function toNumericAmount(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+function sendConfirmRevenueTwiML(from, summaryLine) {
+  return out(
+    twimlText(`✅ Confirm revenue\n${summaryLine}\n\nReply: Yes / Edit / Change Job / Skip / Cancel`),
+    false
+  );
+}
+
 async function sendConfirmRevenueTemplateOrFallback(from, summaryLine) {
   const sid = String(process.env.TWILIO_REVENUE_CONFIRM_TEMPLATE_SID || '').trim();
 
-  // If template SID missing, fall back to TwiML confirm
-  if (!sid) return sendConfirmRevenueOrFallback(from, summaryLine);
+  // If template SID missing, fall back to TwiML confirm (NO recursion)
+  if (!sid) return sendConfirmRevenueTwiML(from, summaryLine);
 
   try {
-    // Prefer centralized Twilio sender (consistent + hardened)
     const { sendWhatsAppTemplate } = require('../../services/twilio'); // path may vary
 
-    // "from" may already be whatsapp:+..., but your twilio.js helper normalizes
     await sendWhatsAppTemplate({
       to: from,
       templateSid: sid,
       summaryLine
     });
 
-    // Since we sent an outbound WhatsApp message, return empty TwiML to stop double replies
+    // outbound WhatsApp sent, return empty TwiML to stop double replies
     return out(twimlEmpty(), true);
   } catch (e) {
     console.warn('[REVENUE_CONFIRM_TEMPLATE] failed, falling back:', e?.message);
-    return sendConfirmRevenueOrFallback(from, summaryLine);
+    return sendConfirmRevenueTwiML(from, summaryLine);
+  }
+}
+
+async function sendConfirmRevenueOrFallback(from, summaryLine) {
+  try {
+    return await sendConfirmRevenueTemplateOrFallback(from, summaryLine);
+  } catch (e) {
+    console.warn('[REVENUE_CONFIRM] template wrapper failed, falling back:', e?.message);
+    return sendConfirmRevenueTwiML(from, summaryLine);
   }
 }
 
@@ -942,37 +956,72 @@ function normalizeListTitle(s = '') {
 
 /**
  * ✅ Fixes:
- * - Twilio legacy: Body="job_<ix>_<hash>", ListTitle="#<ix> <name>"
- * - Treat "#<ix>" as UI index, NOT jobNo
- * - Prefer title-name match to sentRows, then fallback to index mapping
+ * - Twilio legacy list: ListId="job_<ix>_<hash>", ListTitle="#<ix> <name>", Body may equal ListId
+ * - Router-normalized token: input="jobix_<ix>"
+ * - Treat "<ix>" as UI index, NOT jobNo
+ * - Prefer title-name match to sentRows, then fallback to ix mapping
+ * - Works even if some helper fns are missing
  */
 async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
-  const tok = String(input || '').trim();
-  const inboundTitleRaw = String(twilioMeta?.ListTitle || '').trim();
+  const tokRaw = String(input || '').trim();
 
-  const displayedJobNos = Array.isArray(pickState?.displayedJobNos) ? pickState.displayedJobNos.map(Number) : [];
+  const listIdRaw = String(twilioMeta?.ListId || twilioMeta?.ListRowId || '').trim();
+  const bodyRaw = String(twilioMeta?.Body || '').trim();
+  const inboundTitleRaw = String(twilioMeta?.ListTitle || twilioMeta?.ListRowTitle || '').trim();
+
+  // Prefer the most "true" token:
+  // 1) ListId (stable from Twilio interactive), then
+  // 2) Body (often equals ListId for legacy), then
+  // 3) input (router-normalized like jobix_#)
+  const tok = listIdRaw || bodyRaw || tokRaw;
+
+  const displayedJobNos = Array.isArray(pickState?.displayedJobNos)
+    ? pickState.displayedJobNos.map((n) => Number(n)).filter((n) => Number.isFinite(n))
+    : [];
+
   const sentRows = Array.isArray(pickState?.sentRows) ? pickState.sentRows : [];
 
-  // Stable token supported
+  const safeNormalize = (s) => {
+    const v = String(s || '').trim();
+    if (!v) return '';
+    if (typeof normalizeListTitle === 'function') return normalizeListTitle(v);
+    // fallback normalization: lower + strip punctuation/spaces
+    return v.toLowerCase().replace(/[#\s]+/g, ' ').replace(/[^\w\s]/g, '').trim();
+  };
+
+  const extractJobNoFromRow = (r) => {
+    const cand = r?.jobNo ?? r?.job_no ?? r?.jobNumber ?? r?.job_number ?? r?.job ?? null;
+    const n = Number(cand);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  // ----------------------------
+  // 0) Stable token: jobno_<jobNo>
+  // ----------------------------
   const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
   if (mJobNo?.[1]) {
     return { ok: true, jobNo: Number(mJobNo[1]), meta: { mode: 'stable_jobno' } };
   }
 
-  // Legacy: "job_<ix>_<hash>"
-  const mIx = tok.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
-  const ix = mIx?.[1] ? Number(mIx[1]) : null;
+  // ----------------------------
+  // 1) Title/name match (strongest UX tie-breaker)
+  // If we have a ListTitle, match it to the rows the user actually saw.
+  // Works even when token is jobix_#
+  // ----------------------------
+  const strippedTitle = inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim();
+  const strippedTitleNorm = safeNormalize(strippedTitle);
 
-  // 1) Prefer matching by title text (strip "#<ix>" prefix)
-  const strippedTitleNorm = normalizeListTitle(inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim());
   if (strippedTitleNorm && sentRows.length) {
     const candidates = sentRows
       .map((r) => {
-        const nameNorm = normalizeListTitle(r?.name || '');
-        const titleNorm = normalizeListTitle(r?.title || '');
-        const jobNo = Number(r?.jobNo);
-        if (!Number.isFinite(jobNo)) return null;
+        const jobNo = extractJobNoFromRow(r);
+        if (jobNo == null) return null;
+
+        // If we tracked displayedJobNos, ensure the candidate is actually on-screen
         if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return null;
+
+        const nameNorm = safeNormalize(r?.name || r?.title || r?.label || '');
+        const titleNorm = safeNormalize(r?.title || r?.name || r?.label || '');
 
         let score = 0;
         if (nameNorm === strippedTitleNorm || titleNorm === strippedTitleNorm) score = 3;
@@ -995,23 +1044,51 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
     if (candidates.length) {
       const top = candidates[0];
       const second = candidates[1];
+      // only accept if not tied
       if (!second || second.score < top.score) {
-        return { ok: true, jobNo: Number(top.jobNo), meta: { mode: 'legacy_title_name_match' } };
+        return { ok: true, jobNo: Number(top.jobNo), meta: { mode: 'title_name_match' } };
       }
     }
   }
 
-  // 2) Fall back to ix mapping into sentRows/displayedJobNos
-  if (ix != null && Number.isFinite(ix) && ix >= 1) {
+  // ----------------------------
+  // 2) Router token: jobix_<ix> (UI index)
+  // ----------------------------
+  const mJobIx = tok.match(/^jobix_(\d{1,10})$/i);
+  const ixFromJobix = mJobIx?.[1] ? Number(mJobIx[1]) : null;
+  if (ixFromJobix != null && Number.isFinite(ixFromJobix) && ixFromJobix >= 1) {
+    const ix = ixFromJobix;
+
     if (sentRows.length && ix <= sentRows.length) {
       const expected = sentRows[ix - 1];
-      const jobNo = Number(expected?.jobNo);
-      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_index_sentRows', ix } };
+      const jobNo = extractJobNoFromRow(expected);
+      if (jobNo != null) return { ok: true, jobNo, meta: { mode: 'jobix_sentRows', ix } };
     }
 
     if (displayedJobNos.length && ix <= displayedJobNos.length) {
       const jobNo = Number(displayedJobNos[ix - 1]);
-      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_index_displayed', ix } };
+      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'jobix_displayed', ix } };
+    }
+
+    return { ok: false, reason: 'jobix_out_of_range' };
+  }
+
+  // ----------------------------
+  // 3) Twilio legacy token: job_<ix>_<hash> (UI index)
+  // ----------------------------
+  const mLegacy = tok.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+  const ix = mLegacy?.[1] ? Number(mLegacy[1]) : null;
+
+  if (ix != null && Number.isFinite(ix) && ix >= 1) {
+    if (sentRows.length && ix <= sentRows.length) {
+      const expected = sentRows[ix - 1];
+      const jobNo = extractJobNoFromRow(expected);
+      if (jobNo != null) return { ok: true, jobNo, meta: { mode: 'legacy_ix_sentRows', ix } };
+    }
+
+    if (displayedJobNos.length && ix <= displayedJobNos.length) {
+      const jobNo = Number(displayedJobNos[ix - 1]);
+      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_ix_displayed', ix } };
     }
 
     return { ok: false, reason: 'legacy_ix_out_of_range' };
@@ -1019,6 +1096,7 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
 
   return { ok: false, reason: 'unrecognized_row_id' };
 }
+
 
 function pickConfirmDraftSnapshot(confirmDraft) {
   if (!confirmDraft || typeof confirmDraft !== 'object') return null;
@@ -1190,19 +1268,6 @@ function buildRevenueSummaryLine({ amount, source, date, jobName, tz }) {
 }
 
 
-async function sendConfirmRevenueOrFallback(from, summaryLine) {
-  // ✅ Prefer interactive/template confirm if configured
-  try {
-    return await sendConfirmRevenueTemplateOrFallback(from, summaryLine);
-  } catch (e) {
-    console.warn('[REVENUE_CONFIRM] template wrapper failed, falling back:', e?.message);
-    return out(
-      twimlText(`✅ Confirm revenue\n${summaryLine}\n\nReply: Yes / Edit / Change Job / Skip / Cancel`),
-      false
-    );
-  }
-}
-
 
 /* ---------------- New message detection (job-picker bypass) ---------------- */
 
@@ -1282,58 +1347,46 @@ const looksLikePickerTap =
   /^jobix_\d{1,10}$/i.test(rawInput0);
 
 if (looksLikePickerTap) {
-  const primaryTok = String(twilioMeta?.ListId || rawInput0 || '').trim(); // ✅ real row id if present
-
-  let sel = await resolveJobPickSelection({
-    input: primaryTok,
+  const sel = await resolveJobPickSelection({
+    input: rawInput0,                 // IMPORTANT: original inbound token
     twilioMeta: twilioMeta || {},
     pickState: { displayedJobNos, sentRows }
   });
 
-  // ✅ If resolver fails, try deterministic title match against sentRows
-  if (!sel?.ok && twilioMeta?.ListTitle && Array.isArray(sentRows) && sentRows.length) {
-    const norm = (s) =>
-      String(s || '')
-        .replace(/^#\d+\s*/i, '')   // strip leading "#5 "
-        .replace(/\s+/g, ' ')
-        .trim()
-        .toLowerCase();
-
-    const want = norm(twilioMeta.ListTitle);
-
-    const hit = sentRows.find((r) => norm(r?.title || r?.ListTitle || r?.label) === want);
-    const jobNoFromRow =
-      hit?.jobNo ?? hit?.job_no ?? hit?.jobno ?? (hit?.job?.job_no);
-
-    if (jobNoFromRow != null) {
-      sel = { ok: true, jobNo: Number(jobNoFromRow), meta: { mode: 'title_sentRows' } };
-    }
-  }
-
   console.info('[JOB_PICK_RESOLVED]', {
-    tok: primaryTok || rawInput0,
+    tok: rawInput0,
     inboundTitle: twilioMeta?.ListTitle,
     result: sel
   });
 
-  if (sel?.ok && sel.jobNo != null) {
-    rawInput = `jobno_${Number(sel.jobNo)}`;
+  // ✅ If Twilio gave ListId/ListTitle, we trust that and NEVER "coerce fallback" on failure.
+  const twilioProvidedPickerMeta =
+    !!String(twilioMeta?.ListId || twilioMeta?.ListRowId || '').trim() ||
+    !!String(twilioMeta?.ListTitle || twilioMeta?.ListRowTitle || '').trim();
+
+  if (!sel?.ok) {
+    if (twilioProvidedPickerMeta) {
+      // deterministic: if we can't resolve a Twilio picker tap, re-send the picker
+      return await sendJobPickerOrFallback({
+        from,
+        ownerId,
+        paUserId,
+        jobOptions,
+        page,
+        pageSize,
+        confirmDraft: pickPA?.payload?.confirmDraft || null
+      });
+    }
+
+    // only in non-Twilio situations do we allow coercion
+    rawInput = coerceJobixToJobno(rawInput0, displayedJobNos);
   } else {
-    // ✅ IMPORTANT: do NOT guess via coerce here; it causes mismatches
-    return await sendJobPickerOrFallback({
-      from,
-      ownerId,
-      paUserId,
-      jobOptions,
-      page,
-      pageSize,
-      confirmDraft: pickPA?.payload?.confirmDraft || null
-    });
+    rawInput = `jobno_${Number(sel.jobNo)}`;
   }
 } else {
-  // Non-picker input: still allow jobix_# coercion
   rawInput = coerceJobixToJobno(rawInput0, displayedJobNos);
 }
+
 
         // Optional: remember last inbound picker token
         try {
@@ -1700,7 +1753,7 @@ try {
             console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
           }
 
-          console.info('[REVENUE_DRAFT_READY]', {
+        console.info('[REVENUE_DRAFT_READY]', {
   amount: patchedDraft?.amount,
   source: patchedDraft?.source,
   date: patchedDraft?.date,
@@ -1708,42 +1761,17 @@ try {
   awaiting_edit: patchedDraft?.awaiting_edit,
   source_msg_id: confirmPA?.payload?.sourceMsgId || sourceMsgId || null
 });
-
-console.info('[REVENUE_DRAFT_READY]', {
-  amount: patchedDraft?.amount,
-  source: patchedDraft?.source,
-  date: patchedDraft?.date,
-  jobName: patchedDraft?.jobName,
-  awaiting_edit: patchedDraft?.awaiting_edit,
-  source_msg_id: confirmPA?.payload?.sourceMsgId || sourceMsgId || null
-});
-
-// ✅ deterministically confirm from the draft we just built (no stale re-read)
-const summaryLine = buildRevenueSummaryLine({
-  amount: patchedDraft.amount,
-  source: patchedDraft.source,
-  date: patchedDraft.date,
-  jobName: patchedDraft.jobName,
-  tz
-});
-
-// persist humanLine for resume/debug (optional but helpful)
-try {
-  await upsertPA({
-    ownerId,
-    userId: paUserId,
-    kind: PA_KIND_CONFIRM,
-    payload: { ...(confirmPA?.payload || {}), draft: patchedDraft, humanLine: summaryLine },
-    ttlSeconds: PA_TTL_SEC
-  });
-} catch {}
 
 // ✅ deterministically build the SAME emoji summary used everywhere else
-const displayDate = formatDisplayDate(patchedDraft?.date, tz) || String(patchedDraft?.date || '').trim() || '—';
+const displayDate =
+  (typeof formatDisplayDate === 'function' ? formatDisplayDate(patchedDraft?.date, tz) : null) ||
+  String(patchedDraft?.date || '').trim() ||
+  '—';
+
 const displayAmt = String(patchedDraft?.amount || '').trim() || '—';
 const displayJob = String(patchedDraft?.jobName || '').trim() || '—';
 
-let summaryLine = `💰 ${displayAmt}\n📅 ${displayDate}\n🧰 ${displayJob}`;
+const summaryLine = `💰 ${displayAmt}\n📅 ${displayDate}\n🧰 ${displayJob}`;
 
 // persist humanLine for resume/debug (optional)
 try {
@@ -1757,10 +1785,7 @@ try {
 } catch {}
 
 return await sendConfirmRevenueOrFallback(from, summaryLine);
-
-
-
-        }
+      }
 
         // if still awaiting_edit and user sent a control token, never nag
         if (draftR?.awaiting_edit && isControl) {

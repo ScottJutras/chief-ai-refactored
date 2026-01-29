@@ -226,7 +226,14 @@ async function sendTemplateMessage(to, contentSid, vars = {}, fallbackBody = '')
   }
 }
 async function sendWhatsAppTemplate({ to, templateSid, summaryLine } = {}) {
-  const safe = String(summaryLine || '').replace(/\s+/g, ' ').trim().slice(0, 600) || '—';
+  // Preserve newlines (WhatsApp card formatting) — do NOT collapse whitespace
+  const safe = String(summaryLine || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')   // trim trailing spaces before newline
+    .replace(/\n[ \t]+/g, '\n')   // trim leading spaces after newline
+    .trim()
+    .slice(0, 600) || '—';
+
   return sendTemplateMessage(to, templateSid, { 1: toTemplateVar(safe) }, safe);
 }
 

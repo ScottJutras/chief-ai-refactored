@@ -1310,6 +1310,11 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
 
     if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
       const { handleRevenue } = require('../handlers/commands/revenue');
+       console.info('[META_PASS_THROUGH]', {
+  ListId: req.body?.ListId,
+  ListTitle: req.body?.ListTitle,
+  Body: req.body?.Body
+});
 
       const result = await handleRevenue(
         req.from, // ✅ reply identity (E.164)
@@ -1806,32 +1811,16 @@ if (looksRevenue) {
   try {
     const { handleRevenue } = require('../handlers/commands/revenue');
 
-    const timeoutMs = 8000;
-    const timeoutTwiml = twimlText(
-      '⚠️ I’m having trouble saving that right now (database busy). Please tap Yes again in a few seconds.'
+    const result = await handleRevenue(
+      req.from,
+      text2,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid,
+      req.body
     );
-
-    let timeoutId = null;
-    const timeoutPromise = new Promise((resolve) => {
-      timeoutId = setTimeout(() => {
-        console.warn('[WEBHOOK] revenue handler timeout', { from: req.from, messageSid, timeoutMs });
-        resolve(timeoutTwiml);
-      }, timeoutMs);
-    });
-
-    const result = await Promise.race([
-      handleRevenue(
-        req.from,
-        text2,
-        req.userProfile,
-        req.ownerId,
-        req.ownerProfile,
-        req.isOwner,
-        messageSid,
-        req.body
-      ),
-      timeoutPromise
-    ]).finally(() => timeoutId && clearTimeout(timeoutId));
 
     if (!res.headersSent) {
       const twiml =
@@ -1848,6 +1837,7 @@ if (looksRevenue) {
     return;
   }
 }
+
 
 // -------------------- EXPENSE FAST PATH --------------------
 if (looksExpense) {

@@ -1272,12 +1272,16 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         }
 
         let rawInput = String(input || '').trim();
+        // ✅ Coerce router-emitted jobix_# BEFORE picker resolution
+rawInput = coerceJobixToJobno(rawInput, displayedJobNos);
+
 
         // ✅ Picker tap path: resolve using ListTitle name-match first (fixes mis-map)
         const looksLikePickerTap =
-          !!twilioMeta?.ListId ||
-          /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-          /^jobno_\d{1,10}$/i.test(rawInput);
+  !!twilioMeta?.ListId ||
+  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+  /^jobno_\d{1,10}$/i.test(rawInput) ||
+  /^jobix_\d{1,10}$/i.test(rawInput);
 
         if (looksLikePickerTap) {
           const sel = await resolveJobPickSelection({
@@ -1306,9 +1310,6 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
 
           rawInput = `jobno_${Number(sel.jobNo)}`;
         }
-
-        // Coerce router-emitted jobix_#
-        rawInput = coerceJobixToJobno(rawInput, displayedJobNos);
 
         // Optional: remember last inbound picker token
         try {
@@ -1458,55 +1459,61 @@ try {
 
   const d0 = confirmPA?.payload?.draft || null;
 
-  const isControl =
-    strictTok === 'yes' ||
-    strictTok === 'edit' ||
-    strictTok === 'cancel' ||
-    strictTok === 'change_job';
+const isControl =
+  strictTok === 'yes' ||
+  strictTok === 'edit' ||
+  strictTok === 'cancel' ||
+  strictTok === 'change_job' ||
+  strictTok === 'resume' ||
+  strictTok === 'skip';
 
-  if (d0?.awaiting_date && !isControl) {
-    const parsedDate = parseRelativeDateReply(input, tz);
+// ✅ Patch 2: if we're in edit mode, do NOT consume date replies here
+if (d0?.awaiting_edit) {
+  // edit flow owns the next payload
+} else if (d0?.awaiting_date && !isControl) {
+  const parsedDate = parseRelativeDateReply(input, tz);
 
-    if (!parsedDate) {
-      return out(
-        twimlText(
-          `Please tell me the date you received it.\n` +
-            `Reply "today", "yesterday", or a date like "2026-01-13".`
-        ),
-        false
-      );
-    }
-
-    const patched = {
-      ...(d0 || {}),
-      date: parsedDate,
-      awaiting_date: false,
-      needsReparse: false,
-      draftText: String(input || '').trim() || (d0?.draftText ?? null),
-      originalText: d0?.originalText ?? null
-    };
-
-    await upsertPA({
-      ownerId,
-      userId: paUserId,
-      kind: PA_KIND_CONFIRM,
-      payload: { ...(confirmPA?.payload || {}), draft: patched },
-      ttlSeconds: PA_TTL_SEC
-    });
-
-    return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
-  }
-
-  // if awaiting_date and user pressed a control token, remind (no nag loop)
-  if (d0?.awaiting_date && isControl) {
+  if (!parsedDate) {
     return out(
       twimlText(
-        `📅 I still need the date you received it.\n` +
-          `Reply "today", "yesterday", or "2026-01-13".`
+        `Please tell me the date you received it.\n` +
+          `Reply "today", "yesterday", or a date like "2026-01-13".`
       ),
       false
     );
   }
+
+  const patched = {
+    ...(d0 || {}),
+    date: parsedDate,
+    awaiting_date: false,
+    needsReparse: false,
+    draftText: String(input || '').trim() || (d0?.draftText ?? null),
+    originalText: d0?.originalText ?? null
+  };
+
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: { ...(confirmPA?.payload || {}), draft: patched },
+    ttlSeconds: PA_TTL_SEC
+  });
+
+  return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+}
+
+// if awaiting_date and user pressed a control token, remind (no nag loop)
+if (d0?.awaiting_date && isControl && !d0?.awaiting_edit) {
+  return out(
+    twimlText(
+      `📅 I still need the date you received it.\n` +
+        `Reply "today", "yesterday", or "2026-01-13".`
+    ),
+    false
+  );
+}
+
 } catch (e) {
   console.warn('[REVENUE_AWAITING_DATE] failed (ignored):', e?.message);
 }
@@ -1747,38 +1754,46 @@ return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
 
 
   if (strictTok === 'edit') {
-    // ✅ enter edit mode (do NOT delete confirm PA)
-    try {
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA.payload || {}),
-          draft: {
-            ...(confirmPA.payload?.draft || {}),
-            awaiting_edit: true,
-            edit_started_at: Date.now(),
-            editStartedAt: Date.now(),
-            edit_flow_id: String(confirmPA?.payload?.sourceMsgId || stableMsgId || '').trim() || null
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-    } catch {}
+  // ✅ enter edit mode (do NOT delete confirm PA)
+  try {
+    await upsertPA({
+      ownerId,
+      userId: paUserId,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA?.payload || {}),
+        draft: {
+          ...(confirmPA?.payload?.draft || {}),
 
-    return out(
-      twimlText(
-        [
-          '✏️ Okay — send the corrected revenue details in ONE message.',
-          'Example:',
-          'revenue $2500 from ClientName on Jan 13 2026 job Oak Street Re-roof',
-          'Reply "cancel" to discard.'
-        ].join('\n')
-      ),
-      false
-    );
-  }
+          awaiting_edit: true,
+
+          // ✅ critical: do not let awaiting_date hijack edit payload
+          awaiting_date: false,
+          needsReparse: false,
+
+          edit_started_at: Date.now(),
+          editStartedAt: Date.now(),
+          edit_flow_id:
+            String(confirmPA?.payload?.sourceMsgId || stableMsgId || '').trim() || null
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+  } catch {}
+
+  return out(
+    twimlText(
+      [
+        '✏️ Okay — send the corrected revenue details in ONE message.',
+        'Example:',
+        'revenue $2500 from ClientName on Jan 13 2026 job Oak Street Re-roof',
+        'Reply "cancel" to discard.'
+      ].join('\n')
+    ),
+    false
+  );
+}
+
 
   // ✅ Resume: re-send confirm (no state changes)
   if (strictTok === 'resume') {

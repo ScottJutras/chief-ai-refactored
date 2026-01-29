@@ -587,6 +587,9 @@ const RE_CLOCK_IN  = /\b(clock|punch)\s*in\b/i;
 const RE_CLOCK_OUT = /\b(clock|punch)\s*out\b/i;
 const RE_CLOCKIN_WORD  = /\b(clockin|punchin|shiftin)\b/i;
 const RE_CLOCKOUT_WORD = /\b(clockout|punchout|shiftout)\b/i;
+const RE_HAS_LUNCH = /\b(lunch)\b/i;
+const RE_LUNCH_START = /^(?:lunch\s*(?:start|started|begin|began)|(?:start|begin|began)\s*lunch)$/i;
+const RE_LUNCH_STOP  = /^(?:lunch\s*(?:stop|end|ended|finish|finished)|(?:stop|end|finish)\s*lunch)$/i;
 
 const RE_HAS_BREAK = /\bbreak\b/i;
 const RE_HAS_DRIVE = /\bdrive\b/i;
@@ -602,10 +605,25 @@ async function getCurrentState(ownerId, employeeName) {
 
   if (shape === 'new') {
     const owner_id = String(ownerId || '').trim();
-    const user_id = String(employeeName || '').trim(); // best-effort mapping
+
+    // In new schema, user_id must be digits (or +E164 -> digits).
+    const raw = String(employeeName || '').trim();
+    const digits = raw.replace(/\D/g, '').trim();
+    const user_id = /^\d+$/.test(digits) ? digits : null;
+
+    if (!user_id) {
+      console.warn('[timeclock] getCurrentState(new) called with non-user_id', {
+        owner_id,
+        raw: raw.slice(0, 60)
+      });
+      return { hasOpenShift: false, openBreak: false, openLunch: false, openDrive: false, lastShiftStart: null };
+    }
+
     const openShift = await getOpenShift(owner_id, user_id);
 
-    if (!openShift) return { hasOpenShift: false, openBreak: false, openDrive: false, lastShiftStart: null };
+    if (!openShift) {
+      return { hasOpenShift: false, openBreak: false, openLunch: false, openDrive: false, lastShiftStart: null };
+    }
 
     const { rows } = await pg.query(
       `SELECT kind, start_at_utc, end_at_utc
@@ -616,14 +634,19 @@ async function getCurrentState(ownerId, employeeName) {
     );
 
     let openBreak = false;
+    let openLunch = false;
     let openDrive = false;
+
     for (const r of rows || []) {
-      if (r.kind === 'break' && !r.end_at_utc) openBreak = true;
-      if (r.kind === 'drive' && !r.end_at_utc) openDrive = true;
+      const k = String(r.kind || '').toLowerCase();
+      if (k === 'break' && !r.end_at_utc) openBreak = true;
+      if (k === 'drive' && !r.end_at_utc) openDrive = true;
+      if (k === 'lunch' && !r.end_at_utc) openLunch = true;
     }
 
-    return { hasOpenShift: true, openBreak, openDrive, lastShiftStart: openShift.start_at_utc };
+    return { hasOpenShift: true, openBreak, openLunch, openDrive, lastShiftStart: openShift.start_at_utc };
   }
+
 
   if (shape === 'legacy') {
     const { rows } = await pg.query(
@@ -638,33 +661,51 @@ async function getCurrentState(ownerId, employeeName) {
 
     let hasOpenShift = false;
     let openBreak = false;
+    let openLunch = false;
     let openDrive = false;
     let lastShiftStart = null;
 
     for (const r of rows || []) {
-      switch (r.type) {
+      const t = String(r.type || '').toLowerCase();
+
+      switch (t) {
         case 'clock_in':
         case 'punch_in':
           hasOpenShift = true;
           lastShiftStart = r.timestamp;
           break;
+
         case 'clock_out':
         case 'punch_out':
           hasOpenShift = false;
           openBreak = false;
+          openLunch = false;
           openDrive = false;
           lastShiftStart = null;
           break;
+
         case 'break_start':
           if (hasOpenShift) openBreak = true;
           break;
+
         case 'break_stop':
         case 'break_end':
           openBreak = false;
           break;
+
+        case 'lunch_start':
+          if (hasOpenShift) openLunch = true;
+          break;
+
+        case 'lunch_stop': // canonical
+        case 'lunch_end':  // legacy alias (keep reading it)
+          openLunch = false;
+          break;
+
         case 'drive_start':
           if (hasOpenShift) openDrive = true;
           break;
+
         case 'drive_stop':
         case 'drive_end':
           openDrive = false;
@@ -672,11 +713,12 @@ async function getCurrentState(ownerId, employeeName) {
       }
     }
 
-    return { hasOpenShift, openBreak, openDrive, lastShiftStart };
+    return { hasOpenShift, openBreak, openLunch, openDrive, lastShiftStart };
   }
 
-  return { hasOpenShift: false, openBreak: false, openDrive: false, lastShiftStart: null };
+  return { hasOpenShift: false, openBreak: false, openLunch: false, openDrive: false, lastShiftStart: null };
 }
+
 
 /* ---------------- CIL handler (new schema path) ---------------- */
 
@@ -1002,9 +1044,12 @@ let isDriveStop =
 const looksLikeTimeclock =
   isUndo ||
   isClockIn || isClockOut ||
-  RE_HAS_BREAK.test(rawNorm) || RE_HAS_DRIVE.test(rawNorm);
+  RE_HAS_BREAK.test(rawNorm) ||
+  RE_HAS_DRIVE.test(rawNorm) ||
+  RE_HAS_LUNCH.test(rawNorm);
 
 if (!looksLikeTimeclock) return false;
+
 
 
 
@@ -1046,15 +1091,19 @@ if (!looksLikeTimeclock) return false;
     const whenTxt = extractAtWhen(text);
     const tsOverride = whenTxt ? parseLocalWhenToIso(whenTxt, tz, now) : null;
 
-    // canonical legacy types (keeps compatibility with pg.logTimeEntryWithJob)
-    const resolvedType =
-      isClockIn ? 'clock_in'
-      : isClockOut ? 'clock_out'
-      : isBreakStart ? 'break_start'
-      : isBreakStop ? 'break_stop'
-      : isDriveStart ? 'drive_start'
-      : isDriveStop ? 'drive_stop'
-      : null;
+
+// canonical legacy types (keeps compatibility with pg.logTimeEntryWithJob)
+const resolvedType =
+  (RE_CLOCK_IN.test(rawNorm) || RE_CLOCKIN_WORD.test(rawNorm) || compactHasAny(compact, CLOCK_IN_PATTERNS)) ? 'clock_in'
+  : (RE_CLOCK_OUT.test(rawNorm) || RE_CLOCKOUT_WORD.test(rawNorm) || compactHasAny(compact, CLOCK_OUT_PATTERNS)) ? 'clock_out'
+  : (RE_HAS_BREAK.test(rawNorm) && (compactHasAny(compact, BREAK_START_COMPACT) || /\bbreak\s*start(ed)?\b/i.test(rawNorm))) ? 'break_start'
+  : (RE_HAS_BREAK.test(rawNorm) && (compactHasAny(compact, BREAK_STOP_COMPACT)  || /\bbreak\s*(stop|end)(ed)?\b/i.test(rawNorm))) ? 'break_stop'
+  : (RE_HAS_LUNCH.test(rawNorm) && (RE_LUNCH_START.test(rawNorm) || compact === 'lunchstart' || compact === 'startlunch')) ? 'lunch_start'
+  : (RE_HAS_LUNCH.test(rawNorm) && (RE_LUNCH_STOP.test(rawNorm)  || compact === 'lunchend'  || compact === 'endlunch' || compact === 'lunchstop' || compact === 'stoplunch')) ? 'lunch_stop'
+  : (RE_HAS_DRIVE.test(rawNorm) && (compactHasAny(compact, DRIVE_START_COMPACT) || /\bdrive\s*start(ed)?\b/i.test(rawNorm))) ? 'drive_start'
+  : (RE_HAS_DRIVE.test(rawNorm) && (compactHasAny(compact, DRIVE_STOP_COMPACT)  || /\bdrive\s*(stop|end)(ed)?\b/i.test(rawNorm))) ? 'drive_stop'
+  : null;
+
 
     // If Undo, execute it NOW (do NOT fall through and do NOT call state machine helpers)
 if (isUndo) {
@@ -1175,9 +1224,10 @@ if (isUndo) {
 if (!resolvedType) {
   const hasBreak = RE_HAS_BREAK.test(rawNorm);
   const hasDrive = RE_HAS_DRIVE.test(rawNorm);
+  const hasLunch = RE_HAS_LUNCH.test(rawNorm);
 
-  if (hasBreak || hasDrive) {
-    const seg = hasBreak ? 'Break' : 'Drive';
+  if (hasBreak || hasDrive || hasLunch) {
+    const seg = hasBreak ? 'Break' : (hasLunch ? 'Lunch' : 'Drive');
     try {
       await sendQuickReply(
         from,
@@ -1192,6 +1242,7 @@ if (!resolvedType) {
 
   return false; // router can fall through to other handlers
 }
+
 
 
     // Backfill confirm if >2 min away from now
@@ -1326,7 +1377,19 @@ const targetKey =
     ? (/^\d+$/.test(String(target || '').trim()) ? String(target || '').trim() : String(paUserId || '').trim())
     : target;
 
+// shapeForTarget already computed above — don't call detect again
+console.info('[timeclock] getCurrentState args', {
+  shape: shapeForTarget,
+  target,        // what the user/narrative resolved to (could be name)
+  targetKey      // what we will actually pass into getCurrentState (digits in new schema)
+});
+if (shapeForTarget === 'new' && !/^\d+$/.test(String(targetKey || '').trim())) {
+  console.warn('[timeclock] BAD targetKey for new schema', { target, targetKey });
+}
+
 const state = await getCurrentState(ownerId, targetKey);
+
+
 
 
 // ✅ IMPORTANT:
@@ -1469,6 +1532,71 @@ if (resolvedType === 'break_stop') {
 
   return twiml(res, out?.text || `▶️ Break ended for ${target}.`);
 }
+if (resolvedType === 'lunch_start') {
+  if (!state.hasOpenShift) return twiml(res, `Can't start lunch — no open shift for ${target}.`);
+  if (!tsOverride && state.openLunch) return twiml(res, `${target} is already on lunch.`);
+
+  if (canLegacyWrite) {
+    await pg.logTimeEntryWithJob(ownerId, target, 'lunch_start', tsOverride || now, jobName, tz, {
+      requester_id: paUserId,
+      source_msg_id: stableMsgId
+    });
+
+    await emitTimeclockFact({
+      ownerId,
+      actorKey: paUserId,
+      sourceMsgId: stableMsgId,
+      resolvedType,
+      target,
+      jobName,
+      tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+    });
+
+    return twiml(res, `🍽️ Lunch started for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
+  }
+
+  // New schema path: handleClock emits fact itself ✅
+  const out = await handleClock(
+    { owner_id: ownerId, user_id: targetKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { action: 'lunch_start', at: tsOverride || now.toISOString() }
+  );
+
+  return twiml(res, out?.text || `🍽️ Lunch started for ${target}.`);
+}
+
+if (resolvedType === 'lunch_stop') {
+  if (!state.hasOpenShift) return twiml(res, `Can't end lunch — no open shift for ${target}.`);
+  if (!tsOverride && !state.openLunch) return twiml(res, `No active lunch for ${target}.`);
+
+  if (canLegacyWrite) {
+    await pg.logTimeEntryWithJob(ownerId, target, 'lunch_end', tsOverride || now, jobName, tz, {
+      requester_id: paUserId,
+      source_msg_id: stableMsgId
+    });
+
+    await emitTimeclockFact({
+      ownerId,
+      actorKey: paUserId,
+      sourceMsgId: stableMsgId,
+      resolvedType,
+      target,
+      jobName,
+      tsIso: (tsOverride || now).toISOString ? (tsOverride || now).toISOString() : String(tsOverride || now)
+    });
+
+    return twiml(res, `🍽️ Lunch ended for ${target} at ${formatLocal(tsOverride || now, tz)}.`);
+  }
+
+  // New schema path: handleClock emits fact itself ✅
+  const out = await handleClock(
+    { owner_id: ownerId, user_id: targetKey, tz, source_msg_id: stableMsgId, meta: { job_name: jobName || null } },
+    { action: 'lunch_stop', at: tsOverride || now.toISOString() }
+  );
+
+  return twiml(res, out?.text || `🍽️ Lunch ended for ${target}.`);
+}
+
+
 
 if (resolvedType === 'drive_start') {
   if (!state.hasOpenShift) return twiml(res, `Can't start drive — no open shift for ${target}.`);

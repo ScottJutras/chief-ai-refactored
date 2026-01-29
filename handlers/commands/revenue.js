@@ -1422,8 +1422,10 @@ await upsertPA({
 });
 console.info('[REVENUE_RECONFIRM_AFTER_PICK]', {
   head: String(summaryLine || '').slice(0, 60),
-  job: draft.jobName || null
+  job: draft.jobName || null,
+  job_no: draft.job_no ?? null
 });
+
 
 // ✅ IMPORTANT: route through the unified sender (template if configured, fallback otherwise)
 return await sendConfirmRevenueOrFallback(from, summaryLine);

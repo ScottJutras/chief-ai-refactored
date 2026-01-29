@@ -1403,6 +1403,7 @@ if (typeof pg.getMostRecentPendingActionForUser === 'function') {
 }
 
 const mostRecentPAKind = resolvedMostRecentPA?.kind ? String(resolvedMostRecentPA.kind).trim() : '';
+
 console.info('[ROUTER_PA_CTX]', {
   mostRecentPAKind: mostRecentPAKind || null,
   isHardTimeCommand
@@ -2027,49 +2028,54 @@ if (looksExpense) {
       }
     }
 
-    if (flags.timeclock_v2) {
-      const cil = (() => {
-  // normalize common variants
-  const s = lc2;
+  if (flags.timeclock_v2) {
+  const cil = (() => {
+    const s = lc2;
 
-  // NOTE: Undo is handled by legacy handler (handleTimeclock), not CIL
-  if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(s)) return null;
+    // NOTE: Undo is handled by legacy handler (handleTimeclock), not CIL
+    if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(s)) return null;
 
-  // Clock in/out (space + no-space)
-  if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(s)) return { type: 'Clock', action: 'in' };
-  if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(s)) return { type: 'Clock', action: 'out' };
+    // Clock in/out (space + no-space)
+    if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(s)) return { type: 'Clock', action: 'in' };
+    if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(s)) return { type: 'Clock', action: 'out' };
 
-  // Break start/stop/end (accept "end")
-  if (/^break\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'break_start' };
-  if (/^break\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'break_stop' };
+    // Break start/stop/end (accept "end")
+    if (/^break\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'break_start' };
+    if (/^break\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'break_stop' };
 
-  // Lunch start/stop/end (accept "started", "end")
-  if (/^lunch\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'lunch_start' };
-  if (/^lunch\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'lunch_stop' };
+    // Lunch start/stop/end (accept "started", "end")
+    if (/^lunch\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'lunch_start' };
+    if (/^lunch\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'lunch_stop' };
 
-  // Drive start/stop/end
-  if (/^drive\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'drive_start' };
-  if (/^drive\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'drive_stop' };
+    // Drive start/stop/end
+    if (/^drive\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'drive_start' };
+    if (/^drive\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'drive_stop' };
 
-  return null;
-})();
+    return null;
+  })();
 
+  // ✅ PROVE matcher outcome
+  console.info('[TIME_V2_CIL]', { flagsTimeV2: !!flags.timeclock_v2, lc2, matched: !!cil, cil });
 
-      if (cil) {
-        const ctx = {
-          owner_id: req.ownerId,
-          user_id: req.userProfile?.id || req.userProfile?.user_id || null,
-          job_id: req.userProfile?.active_job_id || null,
-          job_name: req.userProfile?.active_job_name || 'Active Job',
-          created_by: req.userProfile?.id || req.userProfile?.user_id || null
-        };
+  if (cil) {
+    const ctx = {
+      owner_id: req.ownerId,
+      user_id: req.userProfile?.id || req.userProfile?.user_id || null,
+      job_id: req.userProfile?.active_job_id || null,
+      job_name: req.userProfile?.active_job_name || 'Active Job',
+      created_by: req.userProfile?.id || req.userProfile?.user_id || null
+    };
 
-        const reply = await handleClock(ctx, cil);
-        let msg = reply?.text || 'Time logged.';
-        msg += await glossaryNudgeFrom(text2);
-        return ok(res, msg);
-      }
-    }
+    // ✅ PROVE we actually call handleClock
+    console.info('[TIME_V2_CALL_HANDLECLOCK]', { owner_id: ctx.owner_id, user_id: ctx.user_id, action: cil.action });
+
+    const reply = await handleClock(ctx, cil);
+    let msg = reply?.text || 'Time logged.';
+    msg += await glossaryNudgeFrom(text2);
+    return ok(res, msg);
+  }
+}
+
 
     if (looksTime && typeof handleTimeclock === 'function') {
       const out = await handleTimeclock(req.actorKey || req.from, text2, req.userProfile, req.ownerId, req.ownerProfile, req.isOwner, res, messageSid);

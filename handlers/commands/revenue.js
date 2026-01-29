@@ -1282,14 +1282,36 @@ const looksLikePickerTap =
   /^jobix_\d{1,10}$/i.test(rawInput0);
 
 if (looksLikePickerTap) {
-  const sel = await resolveJobPickSelection({
-    input: rawInput0,
+  const primaryTok = String(twilioMeta?.ListId || rawInput0 || '').trim(); // ✅ real row id if present
+
+  let sel = await resolveJobPickSelection({
+    input: primaryTok,
     twilioMeta: twilioMeta || {},
     pickState: { displayedJobNos, sentRows }
   });
 
+  // ✅ If resolver fails, try deterministic title match against sentRows
+  if (!sel?.ok && twilioMeta?.ListTitle && Array.isArray(sentRows) && sentRows.length) {
+    const norm = (s) =>
+      String(s || '')
+        .replace(/^#\d+\s*/i, '')   // strip leading "#5 "
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+
+    const want = norm(twilioMeta.ListTitle);
+
+    const hit = sentRows.find((r) => norm(r?.title || r?.ListTitle || r?.label) === want);
+    const jobNoFromRow =
+      hit?.jobNo ?? hit?.job_no ?? hit?.jobno ?? (hit?.job?.job_no);
+
+    if (jobNoFromRow != null) {
+      sel = { ok: true, jobNo: Number(jobNoFromRow), meta: { mode: 'title_sentRows' } };
+    }
+  }
+
   console.info('[JOB_PICK_RESOLVED]', {
-    tok: rawInput0,
+    tok: primaryTok || rawInput0,
     inboundTitle: twilioMeta?.ListTitle,
     result: sel
   });
@@ -1297,8 +1319,16 @@ if (looksLikePickerTap) {
   if (sel?.ok && sel.jobNo != null) {
     rawInput = `jobno_${Number(sel.jobNo)}`;
   } else {
-    // Fallback: coerce router-emitted jobix_# -> jobno_# if needed
-    rawInput = coerceJobixToJobno(rawInput0, displayedJobNos);
+    // ✅ IMPORTANT: do NOT guess via coerce here; it causes mismatches
+    return await sendJobPickerOrFallback({
+      from,
+      ownerId,
+      paUserId,
+      jobOptions,
+      page,
+      pageSize,
+      confirmDraft: pickPA?.payload?.confirmDraft || null
+    });
   }
 } else {
   // Non-picker input: still allow jobix_# coercion
@@ -1679,7 +1709,56 @@ try {
   source_msg_id: confirmPA?.payload?.sourceMsgId || sourceMsgId || null
 });
 
-return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+console.info('[REVENUE_DRAFT_READY]', {
+  amount: patchedDraft?.amount,
+  source: patchedDraft?.source,
+  date: patchedDraft?.date,
+  jobName: patchedDraft?.jobName,
+  awaiting_edit: patchedDraft?.awaiting_edit,
+  source_msg_id: confirmPA?.payload?.sourceMsgId || sourceMsgId || null
+});
+
+// ✅ deterministically confirm from the draft we just built (no stale re-read)
+const summaryLine = buildRevenueSummaryLine({
+  amount: patchedDraft.amount,
+  source: patchedDraft.source,
+  date: patchedDraft.date,
+  jobName: patchedDraft.jobName,
+  tz
+});
+
+// persist humanLine for resume/debug (optional but helpful)
+try {
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: { ...(confirmPA?.payload || {}), draft: patchedDraft, humanLine: summaryLine },
+    ttlSeconds: PA_TTL_SEC
+  });
+} catch {}
+
+// ✅ deterministically build the SAME emoji summary used everywhere else
+const displayDate = formatDisplayDate(patchedDraft?.date, tz) || String(patchedDraft?.date || '').trim() || '—';
+const displayAmt = String(patchedDraft?.amount || '').trim() || '—';
+const displayJob = String(patchedDraft?.jobName || '').trim() || '—';
+
+let summaryLine = `💰 ${displayAmt}\n📅 ${displayDate}\n🧰 ${displayJob}`;
+
+// persist humanLine for resume/debug (optional)
+try {
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: { ...(confirmPA?.payload || {}), draft: patchedDraft, humanLine: summaryLine },
+    ttlSeconds: PA_TTL_SEC
+  });
+} catch {}
+
+return await sendConfirmRevenueOrFallback(from, summaryLine);
+
+
 
         }
 

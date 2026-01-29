@@ -2030,54 +2030,37 @@ if (looksExpense) {
 
     const s = String(lc2 || '').trim();
 console.info('[TIME_V2_GATE]', { timeclock_v2: !!flags.timeclock_v2, isHardTimeCommand, lc2 });
-  if (flags.timeclock_v2 || isHardTimeCommand) {
+
+if (flags.timeclock_v2) {
   const cil = (() => {
-  const s0 = String(lc2 || '').toLowerCase().trim();
-  const s = s0.replace(/\s+/g, ' ');       // normalized spaces
-  const c = s0.replace(/\s+/g, '');        // compact (no spaces)
+    const s0 = String(lc2 || '').toLowerCase().trim();
+    const s = s0.replace(/\s+/g, ' ');
+    const c = s0.replace(/\s+/g, '');
 
-  // Undo stays legacy
-  if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(c)) return null;
+    // NOTE: Undo stays legacy handler (handleTimeclock)
+    if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(c)) return null;
 
-  // Clock in/out
-  if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(c)) return { type: 'Clock', action: 'in' };
-  if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(c)) return { type: 'Clock', action: 'out' };
+    if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(c)) return { type: 'Clock', action: 'in' };
+    if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(c)) return { type: 'Clock', action: 'out' };
 
-  // Break (spaced + compact + swapped order)
-  if (/^break\s+start(ed)?\b/.test(s) || /^breakstart(ed)?$/.test(c) || /^startbreak(ed)?$/.test(c))
-    return { type: 'Clock', action: 'break_start' };
-  if (/^break\s+(stop|end)(ed)?\b/.test(s) || /^break(stop|end)(ed)?$/.test(c) || /^(stop|end)break(ed)?$/.test(c))
-    return { type: 'Clock', action: 'break_stop' };
+    if (/^break\s+start(ed)?\b/.test(s) || /^(breakstart|startbreak)$/.test(c)) return { type: 'Clock', action: 'break_start' };
+    if (/^break\s+(stop|end)(ed)?\b/.test(s) || /^(breakend|endbreak|breakstop|stopbreak)$/.test(c)) return { type: 'Clock', action: 'break_stop' };
 
-  // Lunch (spaced + compact + swapped order)
-  if (/^lunch\s+start(ed)?\b/.test(s) || /^lunchstart(ed)?$/.test(c) || /^startlunch(ed)?$/.test(c))
-    return { type: 'Clock', action: 'lunch_start' };
-  if (/^lunch\s+(stop|end)(ed)?\b/.test(s) || /^lunch(stop|end)(ed)?$/.test(c) || /^(stop|end)lunch(ed)?$/.test(c))
-    return { type: 'Clock', action: 'lunch_stop' };
+    if (/^lunch\s+start(ed)?\b/.test(s) || /^(lunchstart|startlunch)$/.test(c)) return { type: 'Clock', action: 'lunch_start' };
+    if (/^lunch\s+(stop|end)(ed)?\b/.test(s) || /^(lunchend|endlunch|lunchstop|stoplunch)$/.test(c)) return { type: 'Clock', action: 'lunch_stop' };
 
-  // Drive (spaced + compact + swapped order)
-  if (/^drive\s+start(ed)?\b/.test(s) || /^drivestart(ed)?$/.test(c) || /^startdrive(ed)?$/.test(c))
-    return { type: 'Clock', action: 'drive_start' };
-  if (/^drive\s+(stop|end)(ed)?\b/.test(s) || /^drive(stop|end)(ed)?$/.test(c) || /^(stop|end)drive(ed)?$/.test(c))
-    return { type: 'Clock', action: 'drive_stop' };
+    if (/^drive\s+start(ed)?\b/.test(s) || /^(drivestart|startdrive)$/.test(c)) return { type: 'Clock', action: 'drive_start' };
+    if (/^drive\s+(stop|end)(ed)?\b/.test(s) || /^(driveend|enddrive|drivestop|stopdrive)$/.test(c)) return { type: 'Clock', action: 'drive_stop' };
 
-  return null;
-})();
+    return null;
+  })();
 
-const s0 = String(lc2 || '').toLowerCase().trim();
-const s = s0.replace(/\s+/g, ' ');
-const c = s0.replace(/\s+/g, '');
-
-  // ✅ PROVE matcher outcome
   console.info('[TIME_V2_CIL]', {
-  flagsTimeV2: !!flags.timeclock_v2,
-  lc2,
-  s,
-  c,
-  matched: !!cil,
-  cil
-});
-
+    flagsTimeV2: !!flags.timeclock_v2,
+    lc2,
+    matched: !!cil,
+    cil
+  });
 
   if (cil) {
     const ctx = {
@@ -2088,7 +2071,6 @@ const c = s0.replace(/\s+/g, '');
       created_by: req.userProfile?.id || req.userProfile?.user_id || null
     };
 
-    // ✅ PROVE we actually call handleClock
     console.info('[TIME_V2_CALL_HANDLECLOCK]', { owner_id: ctx.owner_id, user_id: ctx.user_id, action: cil.action });
 
     const reply = await handleClock(ctx, cil);

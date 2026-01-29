@@ -908,14 +908,20 @@ router.use((req, res, next) => {
   next();
 });
 
-/* ---------------- 8s Safety Timer ---------------- */
+/* ---------------- Safety Timer ---------------- */
 
 router.use((req, res, next) => {
   if (res.locals._safety) return next();
 
+  const fromRaw = String(req.body?.From || req.from || '');
+  const isWhatsApp = fromRaw.startsWith('whatsapp:') || !!req.body?.WaId;
+
+  // WhatsApp + AI can exceed 8s; still must respond before Twilio timeout.
+  const SAFETY_MS = isWhatsApp ? 14000 : 8000;
+
   res.locals._safety = setTimeout(() => {
     if (!res.headersSent) {
-      console.warn('[WEBHOOK] 8s safety reply', {
+      console.warn('[WEBHOOK] safety reply', {
         phase: res.locals.phase,
         msInPhase: Date.now() - (res.locals.phaseAt || Date.now()),
         from: req.from,
@@ -923,7 +929,7 @@ router.use((req, res, next) => {
       });
       ok(res); // empty TwiML (no bubble)
     }
-  }, 8000);
+  }, SAFETY_MS);
 
   const clear = () => clearTimeout(res.locals._safety);
   res.on('finish', clear);
@@ -931,6 +937,7 @@ router.use((req, res, next) => {
 
   next();
 });
+
 
 /* ---------------- Inbound debug (TEMP) ---------------- */
 

@@ -410,7 +410,9 @@ function normalizeRevenueData(data, tz) {
     if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
   }
 
-  d.date = String(d.date || '').trim() || todayInTimeZone(tz);
+  // ✅ Do NOT default date here.
+// New-parse flow decides date explicitly (and may latch awaiting_date).
+d.date = String(d.date || '').trim() || null;
 
   const desc = String(d.description || '').trim();
   d.description = desc || 'Revenue received';
@@ -1170,13 +1172,16 @@ function buildRevenueTemplateLine({ amount, source, date, jobName, tz }) {
 }
 
 function buildRevenueSummaryLine({ amount, source, date, jobName, tz }) {
-  const amt = String(amount || '').trim();
+  // amount might be "$16890.00", "16890", 16890, etc.
+  const n = typeof amount === 'number' ? amount : toNumberAmount(amount);
+  const amtPretty = formatMoneyDisplay(Number.isFinite(n) ? n : 0);
+
   const src = String(source || '').trim();
   const dt = formatDisplayDate(date, tz);
   const jb = jobName ? String(jobName).trim() : '';
 
   const lines = [];
-  lines.push(`💰 ${amt}`);
+  lines.push(`💰 ${amtPretty}`);
   if (src && src !== 'Unknown') lines.push(`👤 ${src}`);
   if (dt) lines.push(`📅 ${dt}`);
   if (jb) lines.push(`🧰 ${jb}`);
@@ -1184,9 +1189,20 @@ function buildRevenueSummaryLine({ amount, source, date, jobName, tz }) {
   return lines.join('\n');
 }
 
+
 async function sendConfirmRevenueOrFallback(from, summaryLine) {
-  return out(twimlText(`✅ Confirm revenue\n${summaryLine}\n\nReply: Yes / Edit / Change Job / Skip / Cancel`), false);
+  // ✅ Prefer interactive/template confirm if configured
+  try {
+    return await sendConfirmRevenueTemplateOrFallback(from, summaryLine);
+  } catch (e) {
+    console.warn('[REVENUE_CONFIRM] template wrapper failed, falling back:', e?.message);
+    return out(
+      twimlText(`✅ Confirm revenue\n${summaryLine}\n\nReply: Yes / Edit / Change Job / Skip / Cancel`),
+      false
+    );
+  }
 }
+
 
 /* ---------------- New message detection (job-picker bypass) ---------------- */
 
@@ -2022,7 +2038,7 @@ try {
     } catch {}
 
     const okMsg = [
-      `✅ Logged revenue $${amountNum.toFixed(2)} — ${sourceForDb}`,
+      `✅ Logged revenue ${formatMoneyDisplay(amountNum)} — ${sourceForDb}`,
       dateStr ? `Date: ${dateStr}` : null,
       jobName ? `Job: ${jobName}` : null,
       categoryStr ? `Category: ${categoryStr}` : null
@@ -2174,7 +2190,17 @@ else category = null;
     raw.match(/\bfor\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
     raw.match(/\bfrom\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i);
 
-  const jobFromText = mJob?.[1] ? String(mJob[1]).replace(/[.!,;:]+$/g, '').trim() : null;
+  let jobFromText = mJob?.[1] ? String(mJob[1]).replace(/[.!,;:]+$/g, '').trim() : null;
+
+// ✅ remove trailing date-ish tokens accidentally included in job tail
+// examples: "1559 Medway Park Dr today" -> "1559 Medway Park Dr"
+if (jobFromText) {
+  jobFromText = jobFromText
+    .replace(/\b(on\s+)?(today|yesterday|tomorrow)\b\s*$/i, '')
+    .replace(/\b(on\s+)?\d{4}-\d{2}-\d{2}\b\s*$/i, '')
+    .trim();
+}
+
 
   if (jobFromText) {
     data.jobName = jobFromText;
@@ -2295,7 +2321,20 @@ const summaryLine = buildRevenueSummaryLine({
   tz
 });
 
-return await sendConfirmRevenueOrFallback(from, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
+const confirmText = `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`;
+
+// ✅ debug why we chose template vs fallback (keep ~1 week)
+try {
+  const hasContentSid = !!String(process.env.TWILIO_REVENUE_CONFIRM_TEMPLATE_SID || '').trim();
+  console.info('[REVENUE_CONFIRM_DISPATCH]', {
+    hasContentSid,
+    to: String(from || '').slice(0, 25),
+    head: String(confirmText || '').slice(0, 60)
+  });
+} catch {}
+
+return await sendConfirmRevenueOrFallback(from, confirmText);
+
 
 
   } catch (error) {

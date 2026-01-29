@@ -652,6 +652,19 @@ function isDateishSource(s) {
 
   return false;
 }
+function parseMoneyAmountFromText(text) {
+  const s = String(text || '');
+
+  // Match: $16,890  |  $16890  |  $16,890.50
+  const m = s.match(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/);
+  if (!m) return null;
+
+  const raw = String(m[1] || '').replace(/,/g, '').trim();
+  const n = Number(raw);
+
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
 
 
 /* ---------------- Job list + picker (JOB_NO-FIRST; deterministic) ---------------- */
@@ -2086,11 +2099,25 @@ if (data?.source) {
 // 1) If parser gave a usable ISO date, keep it
 let finalDate = isIsoDate(rawDateBeforeNormalize) ? rawDateBeforeNormalize : null;
 
-// 2) If user typed a relative date reply in the SAME message (e.g., "... today"), use it
+
+// 2) If user typed a relative date anywhere in the message, use it
 if (!finalDate) {
-  const rel = parseRelativeDateReply(input, tz);
-  if (rel) finalDate = rel;
+  const t = String(input || '').toLowerCase();
+  if (/\btoday\b/.test(t)) finalDate = todayInTimeZone(tz);
+  else if (/\byesterday\b/.test(t)) {
+    // if you have a helper for yesterday, use it; otherwise compute from todayInTimeZone
+    try {
+      const td = todayInTimeZone(tz);
+      const d = new Date(`${td}T12:00:00Z`);
+      d.setUTCDate(d.getUTCDate() - 1);
+      finalDate = d.toISOString().slice(0, 10);
+    } catch {}
+  } else {
+    const rel = parseRelativeDateReply(input, tz);
+    if (rel) finalDate = rel;
+  }
 }
+
 
 // 3) If user said "just" and still no date, treat as today
 if (!finalDate) {
@@ -2104,9 +2131,24 @@ data.date = finalDate;
 // --------------------
 // ✅ Core parse checks
 // --------------------
+// ---------------------------------------------------------
+// ✅ Deterministic amount fallback
+// If AI misses the amount but user typed "$...", recover it.
+// This prevents falling into AI clarifier prompts.
+// ---------------------------------------------------------
+if (!data?.amount || data.amount === '$0.00') {
+  const n = parseMoneyAmountFromText(input);
+  if (n != null) {
+    data.amount = `$${n.toFixed(2)}`;
+  }
+}
 
+// --------------------
+// ✅ Core parse checks
+// --------------------
 const missingCore = !data || !data.amount || data.amount === '$0.00';
 if (aiReply && missingCore) return out(twimlText(aiReply), false);
+
 
 if (missingCore) {
   return out(

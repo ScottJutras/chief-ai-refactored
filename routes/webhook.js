@@ -183,6 +183,36 @@ function looksHardCommand(lc) {
     /^revenue\b/.test(lc)
   );
 }
+function looksHardTimeCommand(str) {
+  const s = String(str || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const compact = s.replace(/\s+/g, '');
+
+  // undo
+  if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(compact)) return true;
+
+  // timesheet
+  if (/^timesheet\b/.test(s)) return true;
+
+  // clock in/out (space + no-space)
+  if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(compact)) return true;
+  if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(compact)) return true;
+
+  // break / lunch / drive (space + no-space + swapped order)
+  // Examples: "break start", "breakstart", "startbreak", "break end", "breakend", "endbreak"
+  const isSeg =
+    /^break\s+(start|stop|end)(ed)?\b/.test(s) ||
+    /^lunch\s+(start|stop|end)(ed)?\b/.test(s) ||
+    /^drive\s+(start|stop|end)(ed)?\b/.test(s);
+
+  if (isSeg) return true;
+
+  if (
+    /^(break|lunch|drive)(start|stop|end)(ed)?$/.test(compact) ||   // breakstart, lunchend
+    /^(start|stop|end)(break|lunch|drive)(ed)?$/.test(compact)      // startbreak, endlunch
+  ) return true;
+
+  return false;
+}
 
 // Allowed while a pending expense/revenue exists (so we don't nudge-block them)
 function isAllowedWhilePending(lc) {
@@ -1146,22 +1176,8 @@ if (!resolvedInbound && numMedia === 0) return ok(res);
 // ------------------------------------------------------------
 // ✅ HARD TIME COMMANDS: bypass nudge + PA + pending-flow routers
 // ------------------------------------------------------------
-const lcN = String(lc || '').replace(/\s+/g, ' ').trim();
-
-const isHardTimeCommand =
-  /^undo(\s+last)?$/.test(lcN) ||
-  /^undolast$/.test(lcN) ||
-  /^clock\s*in\b/.test(lcN) ||
-  /^clockin\b/.test(lcN) ||
-  /^clock\s*out\b/.test(lcN) ||
-  /^clockout\b/.test(lcN) ||
-  /^break\s+(start|stop|end)(ed)?\b/.test(lcN) ||
-  /^lunch\s+(start|stop|end)(ed)?\b/.test(lcN) ||
-  /^lunch\s+(started|ended)\b/.test(lcN) ||
-  /^drive\s+(start|stop|end)(ed)?\b/.test(lcN) ||
-  /^timesheet\b/.test(lcN);
-
-console.info('[ROUTER_HARD_TIME]', { lcN: lcN.slice(0, 50), isHardTimeCommand });
+let isHardTimeCommand = looksHardTimeCommand(lc);
+console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
 
     // ✅ Compute messageSid EARLY so resume can use it safely
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
@@ -1482,6 +1498,9 @@ try {
 
         text = String(getInboundText(req.body || {}) || '').trim();
         lc = text.toLowerCase();
+        isHardTimeCommand = looksHardTimeCommand(lc);
+        console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc.slice(0, 50), isHardTimeCommand });
+
         pending = await getPendingTransactionState(req.actorKey || req.from);
       } catch (e) {
         console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
@@ -1897,10 +1916,11 @@ if (looksExpense) {
       /\b(list|create|start|activate|pause|resume|finish)\s+job\b/.test(lc2) ||
       /\bmove\s+last\s+log\s+to\b/.test(lc2);
 
-    let looksTime =
+ let looksTime =
   /\b(time\s*clock|timeclock|punch|break|drive|timesheet|hours|lunch|undo)\b/.test(lc2) ||
-  /\b(clockin|clockout|punchin|punchout|shiftin|shiftout|undolast)\b/.test(lc2) ||
+  /\b(clockin|clockout|punchin|punchout|shiftin|shiftout|undolast|breakstart|breakend|startbreak|lunchstart|lunchend)\b/.test(lc2) ||
   /^undo(\s+last)?$/.test(lc2);
+
 
 
     if (askingHow && /\btasks?\b/.test(lc2)) looksTask = true;

@@ -625,6 +625,33 @@ async function sendConfirmRevenueTemplateOrFallback(from, summaryLine) {
 }
 
 
+// ---------------------------------------------
+// Revenue parsing hardening: prevent field bleed
+// ---------------------------------------------
+function stripJobClause(s) {
+  return String(s || '')
+    // strip "for job ..." tail
+    .replace(/\bfor\s+job\b[\s\S]*$/i, '')
+    // strip "job: ..." tail (in case parser produces it)
+    .replace(/\bjob\b\s*[:\-]?\s*[\s\S]*$/i, '')
+    .trim();
+}
+
+function isDateishSource(s) {
+  const t = String(s || '').trim().toLowerCase();
+  if (!t) return false;
+
+  // common relative tokens
+  if (t === 'today' || t === 'yesterday' || t === 'tomorrow') return true;
+
+  // ISO date
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return true;
+
+  // "Jan 29" / "January 29, 2026" (loose)
+  if (/^[a-z]{3,9}\s+\d{1,2}(,\s*\d{4})?$/i.test(t)) return true;
+
+  return false;
+}
 
 
 /* ---------------- Job list + picker (JOB_NO-FIRST; deterministic) ---------------- */
@@ -1508,24 +1535,43 @@ try {
           }
 
           // deterministic "job ..." capture (optional)
-          const m = String(input || '').trim().match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
-          const jobFromText = m?.[1] ? String(m[1]).replace(/[.!,;:]+$/g, '').trim() : null;
+const m = String(input || '').trim().match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
+const jobFromText = m?.[1] ? String(m[1]).replace(/[.!,;:]+$/g, '').trim() : null;
 
-          const patchedDraft = {
-            ...(draftR || {}),
-            ...(nextDraft || {}),
-            ...(jobFromText
-              ? { jobName: /^overhead$/i.test(jobFromText) ? 'Overhead' : jobFromText, jobSource: 'typed' }
-              : null),
+// ✅ cleanup: prevent "today for job ..." from leaking into source
+if (nextDraft?.source) {
+  nextDraft.source = stripJobClause(nextDraft.source);
+  if (isDateishSource(nextDraft.source)) nextDraft.source = '';
+}
 
-            draftText: String(input || '').trim(),
-            originalText: String(input || '').trim(),
 
-            awaiting_edit: false,
-            edit_started_at: null,
-            editStartedAt: null,
-            edit_flow_id: null
-          };
+         const patchedDraft = {
+  ...(draftR || {}),
+  ...(nextDraft || {}),
+
+  // ✅ harden source again after merge (prevents bleed from older draftR)
+  ...(nextDraft?.source
+    ? {
+        source: (() => {
+          const s = stripJobClause(nextDraft.source);
+          return isDateishSource(s) ? '' : s;
+        })()
+      }
+    : null),
+
+  ...(jobFromText
+    ? { jobName: /^overhead$/i.test(jobFromText) ? 'Overhead' : jobFromText, jobSource: 'typed' }
+    : null),
+
+  draftText: String(input || '').trim(),
+  originalText: String(input || '').trim(),
+
+  awaiting_edit: false,
+  edit_started_at: null,
+  editStartedAt: null,
+  edit_flow_id: null
+};
+
 
           await upsertPA({
             ownerId,
@@ -1538,15 +1584,30 @@ try {
           // ✅ set one-shot auto-yes so webhook router re-calls handler with "yes"
           try {
             const editMsgSid = String(sourceMsgId || '').trim() || null;
-            await mergePendingTransactionState(paUserId, {
-              _autoYesAfterEdit: true,
-              _autoYesSourceMsgId: editMsgSid
-            });
+            // Do NOT auto-confirm after edit.
+// Just resend the updated confirm card and wait for explicit Yes.
+try {
+  await mergePendingTransactionState(paUserId, {
+    _autoYesAfterEdit: false,
+    _autoYesSourceMsgId: null
+  });
+} catch {}
+
           } catch (e) {
             console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
           }
 
-          return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+          console.info('[REVENUE_DRAFT_READY]', {
+  amount: patchedDraft?.amount,
+  source: patchedDraft?.source,
+  date: patchedDraft?.date,
+  jobName: patchedDraft?.jobName,
+  awaiting_edit: patchedDraft?.awaiting_edit,
+  source_msg_id: confirmPA?.payload?.sourceMsgId || sourceMsgId || null
+});
+
+return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+
         }
 
         // if still awaiting_edit and user sent a control token, never nag

@@ -1374,21 +1374,26 @@ const shapeForTarget = await detectTimeEntriesShape();
 // targetKey is what DB ops should use (new schema expects digits user_id)
 const targetKey =
   shapeForTarget === 'new'
-    ? (/^\d+$/.test(String(target || '').trim()) ? String(target || '').trim() : String(paUserId || '').trim())
+    ? (/^\d+$/.test(String(target || '').trim())
+        ? String(target || '').trim()
+        : String(paUserId || '').trim())
     : target;
 
-// shapeForTarget already computed above — don't call detect again
+// normalize ONCE for safety
+const tk = String(targetKey || '').trim();
+
 console.info('[timeclock] getCurrentState args', {
   shape: shapeForTarget,
-  target,        // what the user/narrative resolved to (could be name)
-  targetKey      // what we will actually pass into getCurrentState (digits in new schema)
+  target,        // what user/narrative resolved to
+  targetKey: tk, // what DB will receive
+  paUserId
 });
-if (shapeForTarget === 'new' && !/^\d+$/.test(String(targetKey || '').trim())) {
-  console.warn('[timeclock] BAD targetKey for new schema', { target, targetKey });
+
+if (shapeForTarget === 'new' && !/^\d+$/.test(tk)) {
+  console.warn('[timeclock] BAD targetKey for new schema', { target, targetKey: tk });
 }
 
-const state = await getCurrentState(ownerId, targetKey);
-
+const state = await getCurrentState(ownerId, tk);
 
 
 

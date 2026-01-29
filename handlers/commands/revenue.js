@@ -959,7 +959,8 @@ function normalizeListTitle(s = '') {
  * - Twilio legacy list: ListId="job_<ix>_<hash>", ListTitle="#<ix> <name>", Body may equal ListId
  * - Router-normalized token: input="jobix_<ix>"
  * - Treat "<ix>" as UI index, NOT jobNo
- * - Prefer title-name match to sentRows, then fallback to ix mapping
+ * - ✅ CRITICAL INVARIANT: if Twilio provided a title, DO NOT use any index mapping.
+ *   Title must match a row the user saw, or we reject and force re-pick.
  * - Works even if some helper fns are missing
  */
 async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
@@ -970,9 +971,7 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
   const inboundTitleRaw = String(twilioMeta?.ListTitle || twilioMeta?.ListRowTitle || '').trim();
 
   // Prefer the most "true" token:
-  // 1) ListId (stable from Twilio interactive), then
-  // 2) Body (often equals ListId for legacy), then
-  // 3) input (router-normalized like jobix_#)
+  // 1) ListId, then 2) Body, then 3) router-normalized input
   const tok = listIdRaw || bodyRaw || tokRaw;
 
   const displayedJobNos = Array.isArray(pickState?.displayedJobNos)
@@ -985,9 +984,14 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
     const v = String(s || '').trim();
     if (!v) return '';
     if (typeof normalizeListTitle === 'function') return normalizeListTitle(v);
-    // fallback normalization: lower + strip punctuation/spaces
-    return v.toLowerCase().replace(/[#\s]+/g, ' ').replace(/[^\w\s]/g, '').trim();
+    return v
+      .toLowerCase()
+      .replace(/[#\s]+/g, ' ')
+      .replace(/[^\w\s]/g, '')
+      .trim();
   };
+
+  const deSpace = (s) => String(s || '').replace(/\s+/g, '').trim().toLowerCase();
 
   const extractJobNoFromRow = (r) => {
     const cand = r?.jobNo ?? r?.job_no ?? r?.jobNumber ?? r?.job_number ?? r?.job ?? null;
@@ -1004,60 +1008,52 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
   }
 
   // ----------------------------
-  // 1) Title/name match (strongest UX tie-breaker)
-  // If we have a ListTitle, match it to the rows the user actually saw.
-  // Works even when token is jobix_#
+  // 1) Title/name match (authoritative if title exists)
   // ----------------------------
-  const strippedTitle = inboundTitleRaw.replace(/^#\s*\d+\s+/, '').trim();
-  const strippedTitleNorm = safeNormalize(strippedTitle);
+  const hasTitleSignal = !!String(inboundTitleRaw || '').trim();
 
-  if (strippedTitleNorm && sentRows.length) {
-    const candidates = sentRows
-      .map((r) => {
-        const jobNo = extractJobNoFromRow(r);
-        if (jobNo == null) return null;
+  if (hasTitleSignal && sentRows.length) {
+    const strippedTitle = String(inboundTitleRaw || '').replace(/^#\s*\d+\s+/, '').trim();
+    const needle = safeNormalize(strippedTitle);
+    const needleDS = deSpace(needle);
 
-        // If we tracked displayedJobNos, ensure the candidate is actually on-screen
-        if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return null;
+    const hit = sentRows.find((r) => {
+      const jobNo = extractJobNoFromRow(r);
+      if (jobNo == null) return false;
+      if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return false;
 
-        const nameNorm = safeNormalize(r?.name || r?.title || r?.label || '');
-        const titleNorm = safeNormalize(r?.title || r?.name || r?.label || '');
+      const candRaw = String(r?.title || r?.name || r?.label || '');
+      const cand = safeNormalize(candRaw);
+      if (!cand || !needle) return false;
 
-        let score = 0;
-        if (nameNorm === strippedTitleNorm || titleNorm === strippedTitleNorm) score = 3;
-        else if (
-          (nameNorm && nameNorm.startsWith(strippedTitleNorm)) ||
-          (titleNorm && titleNorm.startsWith(strippedTitleNorm)) ||
-          (strippedTitleNorm && strippedTitleNorm.startsWith(nameNorm))
-        ) score = 2;
-        else if (
-          (nameNorm && nameNorm.includes(strippedTitleNorm)) ||
-          (titleNorm && titleNorm.includes(strippedTitleNorm)) ||
-          (strippedTitleNorm && strippedTitleNorm.includes(nameNorm))
-        ) score = 1;
+      return cand === needle || deSpace(cand) === needleDS;
+    });
 
-        return score ? { jobNo, score } : null;
-      })
-      .filter(Boolean)
-      .sort((a, b) => b.score - a.score);
-
-    if (candidates.length) {
-      const top = candidates[0];
-      const second = candidates[1];
-      // only accept if not tied
-      if (!second || second.score < top.score) {
-        return { ok: true, jobNo: Number(top.jobNo), meta: { mode: 'title_name_match' } };
-      }
+    if (hit) {
+      return { ok: true, jobNo: Number(extractJobNoFromRow(hit)), meta: { mode: 'title_name_match' } };
     }
+
+    // ✅ IMPORTANT: title existed but we couldn't match -> reject (NO index fallback)
+    return { ok: false, reason: 'title_present_but_no_match' };
+  }
+
+  // ✅ If title exists but we don't have pick rows, also reject (forces fresh picker)
+  if (hasTitleSignal && !sentRows.length) {
+    return { ok: false, reason: 'title_present_but_no_pick_state' };
   }
 
   // ----------------------------
-  // 2) Router token: jobix_<ix> (UI index)
+  // 2) Router token: jobix_<ix> (UI index) — ONLY allowed when NO title signal
   // ----------------------------
   const mJobIx = tok.match(/^jobix_(\d{1,10})$/i);
   const ixFromJobix = mJobIx?.[1] ? Number(mJobIx[1]) : null;
   if (ixFromJobix != null && Number.isFinite(ixFromJobix) && ixFromJobix >= 1) {
     const ix = ixFromJobix;
+
+    if (displayedJobNos.length && ix <= displayedJobNos.length) {
+      const jobNo = Number(displayedJobNos[ix - 1]);
+      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'jobix_displayed', ix } };
+    }
 
     if (sentRows.length && ix <= sentRows.length) {
       const expected = sentRows[ix - 1];
@@ -1065,30 +1061,25 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
       if (jobNo != null) return { ok: true, jobNo, meta: { mode: 'jobix_sentRows', ix } };
     }
 
-    if (displayedJobNos.length && ix <= displayedJobNos.length) {
-      const jobNo = Number(displayedJobNos[ix - 1]);
-      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'jobix_displayed', ix } };
-    }
-
     return { ok: false, reason: 'jobix_out_of_range' };
   }
 
   // ----------------------------
-  // 3) Twilio legacy token: job_<ix>_<hash> (UI index)
+  // 3) Twilio legacy token: job_<ix>_<hash> (UI index) — ONLY allowed when NO title signal
   // ----------------------------
   const mLegacy = tok.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
   const ix = mLegacy?.[1] ? Number(mLegacy[1]) : null;
 
   if (ix != null && Number.isFinite(ix) && ix >= 1) {
+    if (displayedJobNos.length && ix <= displayedJobNos.length) {
+      const jobNo = Number(displayedJobNos[ix - 1]);
+      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_ix_displayed', ix } };
+    }
+
     if (sentRows.length && ix <= sentRows.length) {
       const expected = sentRows[ix - 1];
       const jobNo = extractJobNoFromRow(expected);
       if (jobNo != null) return { ok: true, jobNo, meta: { mode: 'legacy_ix_sentRows', ix } };
-    }
-
-    if (displayedJobNos.length && ix <= displayedJobNos.length) {
-      const jobNo = Number(displayedJobNos[ix - 1]);
-      if (Number.isFinite(jobNo)) return { ok: true, jobNo, meta: { mode: 'legacy_ix_displayed', ix } };
     }
 
     return { ok: false, reason: 'legacy_ix_out_of_range' };

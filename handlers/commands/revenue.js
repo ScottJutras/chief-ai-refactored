@@ -1403,7 +1403,8 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
         });
         await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB });
 
-        const summaryLine = buildRevenueSummaryLine({
+       // ✅ Always re-confirm using the SAME human summary builder
+const summaryLine = buildRevenueSummaryLine({
   amount: draft.amount,
   source: draft.source,
   date: draft.date,
@@ -1411,15 +1412,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
   tz
 });
 
-const templateLine = buildRevenueTemplateLine({
-  amount: draft.amount,
-  source: draft.source,
-  date: draft.date,
-  jobName: draft.jobName,
-  tz
-});
-
-confirm.payload.humanLine = summaryLine; // optional if you store it
+// (Optional) persist a humanLine for resume/debug
 await upsertPA({
   ownerId,
   userId: paUserId,
@@ -1427,8 +1420,14 @@ await upsertPA({
   payload: { ...confirm.payload, humanLine: summaryLine, draft },
   ttlSeconds: PA_TTL_SEC
 });
+console.info('[REVENUE_RECONFIRM_AFTER_PICK]', {
+  head: String(summaryLine || '').slice(0, 60),
+  job: draft.jobName || null
+});
 
-return await sendConfirmRevenueTemplateOrFallback(from, templateLine);
+// ✅ IMPORTANT: route through the unified sender (template if configured, fallback otherwise)
+return await sendConfirmRevenueOrFallback(from, summaryLine);
+
 
       }
     }

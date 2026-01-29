@@ -1177,7 +1177,7 @@ if (!resolvedInbound && numMedia === 0) return ok(res);
 // ✅ HARD TIME COMMANDS: bypass nudge + PA + pending-flow routers
 // ------------------------------------------------------------
 let isHardTimeCommand = looksHardTimeCommand(lc);
-console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand, mostRecentPAKind });
+console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
 
     // ✅ Compute messageSid EARLY so resume can use it safely
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
@@ -1403,6 +1403,11 @@ if (typeof pg.getMostRecentPendingActionForUser === 'function') {
 }
 
 const mostRecentPAKind = resolvedMostRecentPA?.kind ? String(resolvedMostRecentPA.kind).trim() : '';
+console.info('[ROUTER_PA_CTX]', {
+  mostRecentPAKind: mostRecentPAKind || null,
+  isHardTimeCommand
+});
+
 const mostRecentIsExpensePA =
   mostRecentPAKind === 'confirm_expense' || mostRecentPAKind === 'pick_job_for_expense';
 const mostRecentIsRevenuePA =

@@ -2028,9 +2028,12 @@ if (looksExpense) {
       }
     }
 
-  if (flags.timeclock_v2) {
+    const s = String(lc2 || '').trim();
+console.info('[TIME_V2_GATE]', { timeclock_v2: !!flags.timeclock_v2, isHardTimeCommand, lc2 });
+  if (flags.timeclock_v2 || isHardTimeCommand) {
   const cil = (() => {
     const s = lc2;
+
 
     // NOTE: Undo is handled by legacy handler (handleTimeclock), not CIL
     if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(s)) return null;

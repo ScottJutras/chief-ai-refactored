@@ -960,7 +960,7 @@ function normalizeListTitle(s = '') {
  * - Router-normalized token: input="jobix_<ix>"
  * - Treat "<ix>" as UI index, NOT jobNo
  * - ✅ CRITICAL INVARIANT: if Twilio provided a title, DO NOT use any index mapping.
- *   Title must match a row the user saw, or we reject and force re-pick.
+ *   Title must match a row the user saw OR a unique jobOptions match, otherwise reject.
  * - Works even if some helper fns are missing
  */
 async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
@@ -979,6 +979,7 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
     : [];
 
   const sentRows = Array.isArray(pickState?.sentRows) ? pickState.sentRows : [];
+  const jobOptions = Array.isArray(pickState?.jobOptions) ? pickState.jobOptions : [];
 
   const safeNormalize = (s) => {
     const v = String(s || '').trim();
@@ -999,6 +1000,11 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
     return Number.isFinite(n) ? n : null;
   };
 
+  const extractJobName = (r) => {
+    const cand = r?.name ?? r?.title ?? r?.label ?? r?.jobName ?? r?.job_name ?? '';
+    return String(cand || '').trim();
+  };
+
   // ----------------------------
   // 0) Stable token: jobno_<jobNo>
   // ----------------------------
@@ -1012,34 +1018,58 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
   // ----------------------------
   const hasTitleSignal = !!String(inboundTitleRaw || '').trim();
 
-  if (hasTitleSignal && sentRows.length) {
+  if (hasTitleSignal) {
     const strippedTitle = String(inboundTitleRaw || '').replace(/^#\s*\d+\s+/, '').trim();
     const needle = safeNormalize(strippedTitle);
     const needleDS = deSpace(needle);
 
-    const hit = sentRows.find((r) => {
-      const jobNo = extractJobNoFromRow(r);
-      if (jobNo == null) return false;
-      if (displayedJobNos.length && !displayedJobNos.includes(jobNo)) return false;
+    // 1a) Try sentRows (what we believe we rendered)
+    if (sentRows.length) {
+      const hit = sentRows.find((r) => {
+        const jobNo = extractJobNoFromRow(r);
+        if (jobNo == null) return false;
 
-      const candRaw = String(r?.title || r?.name || r?.label || '');
-      const cand = safeNormalize(candRaw);
-      if (!cand || !needle) return false;
+        // NOTE: do NOT hard-require displayedJobNos; some builds store UI indices here
+        const candRaw = extractJobName(r);
+        const cand = safeNormalize(candRaw);
+        if (!cand || !needle) return false;
 
-      return cand === needle || deSpace(cand) === needleDS;
-    });
+        return cand === needle || deSpace(cand) === needleDS;
+      });
 
-    if (hit) {
-      return { ok: true, jobNo: Number(extractJobNoFromRow(hit)), meta: { mode: 'title_name_match' } };
+      if (hit) {
+        const jn = extractJobNoFromRow(hit);
+        if (jn != null) return { ok: true, jobNo: Number(jn), meta: { mode: 'title_match_sentRows' } };
+      }
+    }
+
+    // 1b) Fallback: match against jobOptions (authoritative listOpenJobsDetailed result)
+    if (jobOptions.length) {
+      const matches = jobOptions
+        .map((j) => {
+          const jobNo = extractJobNoFromRow(j);
+          if (jobNo == null) return null;
+
+          const name = safeNormalize(extractJobName(j));
+          if (!name || !needle) return null;
+
+          const ok = name === needle || deSpace(name) === needleDS || name.includes(needle) || needle.includes(name);
+          return ok ? { jobNo, name } : null;
+        })
+        .filter(Boolean);
+
+      // only accept unique match
+      const uniq = new Map();
+      for (const m of matches) uniq.set(String(m.jobNo), m);
+      const arr = Array.from(uniq.values());
+
+      if (arr.length === 1) {
+        return { ok: true, jobNo: Number(arr[0].jobNo), meta: { mode: 'title_match_jobOptions' } };
+      }
     }
 
     // ✅ IMPORTANT: title existed but we couldn't match -> reject (NO index fallback)
     return { ok: false, reason: 'title_present_but_no_match' };
-  }
-
-  // ✅ If title exists but we don't have pick rows, also reject (forces fresh picker)
-  if (hasTitleSignal && !sentRows.length) {
-    return { ok: false, reason: 'title_present_but_no_pick_state' };
   }
 
   // ----------------------------
@@ -1087,6 +1117,8 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
 
   return { ok: false, reason: 'unrecognized_row_id' };
 }
+
+
 
 
 function pickConfirmDraftSnapshot(confirmDraft) {
@@ -1339,10 +1371,11 @@ const looksLikePickerTap =
 
 if (looksLikePickerTap) {
   const sel = await resolveJobPickSelection({
-    input: rawInput0,                 // IMPORTANT: original inbound token
-    twilioMeta: twilioMeta || {},
-    pickState: { displayedJobNos, sentRows }
-  });
+  input: rawInput0,                 // IMPORTANT: original inbound token
+  twilioMeta: twilioMeta || {},
+  pickState: { displayedJobNos, sentRows, jobOptions } // ✅ add jobOptions
+});
+
 
   console.info('[JOB_PICK_RESOLVED]', {
     tok: rawInput0,

@@ -1271,45 +1271,39 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
           });
         }
 
-        let rawInput = String(input || '').trim();
-        // ✅ Coerce router-emitted jobix_# BEFORE picker resolution
-rawInput = coerceJobixToJobno(rawInput, displayedJobNos);
+      let rawInput = String(input || '').trim();
+const rawInput0 = rawInput; // preserve original (may be jobix_#, job_#, etc.)
 
-
-        // ✅ Picker tap path: resolve using ListTitle name-match first (fixes mis-map)
-        const looksLikePickerTap =
+// ✅ Picker tap path: resolve using ListTitle/name-match FIRST (fixes mis-map)
+const looksLikePickerTap =
   !!twilioMeta?.ListId ||
-  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-  /^jobno_\d{1,10}$/i.test(rawInput) ||
-  /^jobix_\d{1,10}$/i.test(rawInput);
+  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput0) ||
+  /^jobno_\d{1,10}$/i.test(rawInput0) ||
+  /^jobix_\d{1,10}$/i.test(rawInput0);
 
-        if (looksLikePickerTap) {
-          const sel = await resolveJobPickSelection({
-            input: rawInput,
-            twilioMeta: twilioMeta || {},
-            pickState: { displayedJobNos, sentRows }
-          });
+if (looksLikePickerTap) {
+  const sel = await resolveJobPickSelection({
+    input: rawInput0,
+    twilioMeta: twilioMeta || {},
+    pickState: { displayedJobNos, sentRows }
+  });
 
-          console.info('[JOB_PICK_RESOLVED]', {
-            tok: rawInput,
-            inboundTitle: twilioMeta?.ListTitle,
-            result: sel
-          });
+  console.info('[JOB_PICK_RESOLVED]', {
+    tok: rawInput0,
+    inboundTitle: twilioMeta?.ListTitle,
+    result: sel
+  });
 
-          if (!sel?.ok) {
-            return await sendJobPickerOrFallback({
-              from,
-              ownerId,
-              paUserId,
-              jobOptions,
-              page,
-              pageSize,
-              confirmDraft: pickPA?.payload?.confirmDraft || null
-            });
-          }
-
-          rawInput = `jobno_${Number(sel.jobNo)}`;
-        }
+  if (sel?.ok && sel.jobNo != null) {
+    rawInput = `jobno_${Number(sel.jobNo)}`;
+  } else {
+    // Fallback: coerce router-emitted jobix_# -> jobno_# if needed
+    rawInput = coerceJobixToJobno(rawInput0, displayedJobNos);
+  }
+} else {
+  // Non-picker input: still allow jobix_# coercion
+  rawInput = coerceJobixToJobno(rawInput0, displayedJobNos);
+}
 
         // Optional: remember last inbound picker token
         try {
@@ -1562,6 +1556,48 @@ if (d0?.awaiting_date && isControl && !d0?.awaiting_edit) {
           const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
           let nextDraft = aiRes?.data || null;
           if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
+          // ✅ deterministic fallbacks during edit (same as new intake)
+if (!nextDraft || typeof nextDraft !== 'object') nextDraft = {};
+
+if (!nextDraft.amount || nextDraft.amount === '$0.00') {
+  const n = parseMoneyAmountFromText(input);
+  if (n != null) nextDraft.amount = formatMoneyDisplay(n);
+}
+
+// capture today/yesterday if user said it in the edit message
+if (!isIsoDate(nextDraft.date)) {
+  const t = String(input || '').toLowerCase();
+  if (/\btoday\b/.test(t)) nextDraft.date = todayInTimeZone(tz);
+  else if (/\byesterday\b/.test(t)) {
+    try {
+      const td = todayInTimeZone(tz);
+      const d = new Date(`${td}T12:00:00Z`);
+      d.setUTCDate(d.getUTCDate() - 1);
+      nextDraft.date = d.toISOString().slice(0, 10);
+    } catch {}
+  }
+}
+
+// deterministic "from job ..." / "for job ..." capture in edit payload
+{
+  const raw = String(input || '').trim();
+  const mJob =
+    raw.match(/\bfor\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
+    raw.match(/\bfrom\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i);
+
+  let jobFromText = mJob?.[1] ? String(mJob[1]).replace(/[.!,;:]+$/g, '').trim() : null;
+  if (jobFromText) {
+    jobFromText = jobFromText
+      .replace(/\b(on\s+)?(today|yesterday|tomorrow)\b\s*$/i, '')
+      .replace(/\b(on\s+)?\d{4}-\d{2}-\d{2}\b\s*$/i, '')
+      .trim();
+
+    if (jobFromText) {
+      nextDraft.jobName = jobFromText;
+      nextDraft.jobSource = 'typed';
+    }
+  }
+}
 
           const missingCore = !nextDraft || !nextDraft.amount || nextDraft.amount === '$0.00';
           if (missingCore) {

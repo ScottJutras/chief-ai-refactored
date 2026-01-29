@@ -400,7 +400,10 @@ function looksExpenseNl(str) {
     /\b(on|for)\b/.test(s);
 
   if (!verb) return false;
-  if (/\b(received|got paid|payment|deposit)\b/.test(s)) return false;
+  // ✅ If it's a "money came in" phrase, do NOT treat as expense NL.
+// Include common misspelling "payed".
+if (/\b(received|payment|deposit|got\s+pa(?:i|y)ed|just\s+got\s+pa(?:i|y)ed)\b/.test(s)) return false;
+
 
   if (
     /^(create|new)\s+job\b/.test(s) ||
@@ -424,7 +427,8 @@ function looksExpenseNl(str) {
 function looksRevenueNl(str) {
   const s = String(str || '').trim().toLowerCase();
   if (!hasMoneyAmount(s)) return false;
-  if (/\b(received|revenue|rev|got paid|payment|deposit)\b/.test(s)) return true;
+  // ✅ include common misspelling "payed"
+if (/\b(received|revenue|rev|payment|deposit|got\s+pa(?:i|y)ed|just\s+got\s+pa(?:i|y)ed)\b/.test(s)) return true;
   if (/\b(paid)\b/.test(s) && /\b(from|client|customer)\b/.test(s)) return true;
   return false;
 }

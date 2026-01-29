@@ -2050,6 +2050,16 @@ const defaultData = {
 const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
 
 let data = aiRes?.data || null;
+// ---------------------------------------------------------
+// ✅ NL revenue safety: handleInputWithAI can return null data
+// for phrases like "Just got paid $X today from Job ..."
+// Never mutate `data` unless it's an object.
+// ---------------------------------------------------------
+if (!data || typeof data !== 'object') {
+  data = { ...(defaultData || {}) };
+}
+
+
 let aiReply = aiRes?.reply || null;
 
 // Track whether we had a real date BEFORE normalization defaults
@@ -2057,6 +2067,17 @@ const rawDateBeforeNormalize = data?.date != null ? String(data.date).trim() : '
 
 // Normalize everything else, but we will decide date explicitly below
 if (data) data = normalizeRevenueData(data, tz);
+// ---------------------------------------------------------
+// ✅ Harden parsed fields (new revenue intake)
+// - Prevent job clause from bleeding into source
+// - Prevent date-ish tokens like "today" from becoming payer/source
+// ---------------------------------------------------------
+if (data?.source) {
+  data.source = stripJobClause(data.source);
+  if (isDateishSource(data.source)) data.source = '';
+}
+
+
 
 // --------------------
 // ✅ Decide the date
@@ -2097,6 +2118,40 @@ if (missingCore) {
 let category = (await withTimeout(Promise.resolve(categorizeEntry('revenue', data, ownerProfile)), 1200, null)) || null;
 if (category && String(category).trim()) category = String(category).trim();
 else category = null;
+
+// ---------------------------------------------------------
+// ✅ Deterministic job capture for NL revenue
+// Accepts: "... for job <name>" OR "... from job <name>"
+// This prevents "from Job X" being misread as payer/source.
+// ---------------------------------------------------------
+{
+  const raw = String(input || '').trim();
+
+  // Prefer "for job ..." and "from job ..." tails
+  const mJob =
+    raw.match(/\bfor\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
+    raw.match(/\bfrom\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i);
+
+  const jobFromText = mJob?.[1] ? String(mJob[1]).replace(/[.!,;:]+$/g, '').trim() : null;
+
+  if (jobFromText) {
+    data.jobName = jobFromText;
+    data.jobSource = 'typed';
+
+    // If source accidentally contains "job ...", strip it
+    if (data.source) {
+      data.source = stripJobClause(data.source);
+      if (isDateishSource(data.source)) data.source = '';
+    }
+  }
+
+  // If user literally wrote "from Job X", we should NOT keep that as payer/source
+  // because it’s job context, not customer name.
+  if (/\bfrom\s+job\b/i.test(raw)) {
+    data.source = data.source && !isDateishSource(data.source) ? stripJobClause(data.source) : '';
+  }
+}
+
 
 let jobName = normalizeJobNameCandidate(data.jobName) || null;
 let jobSource = jobName ? 'typed' : null;

@@ -1143,6 +1143,25 @@ if (!resolvedInbound && numMedia === 0) return ok(res);
     // Use resolvedInbound as the main text everywhere in this router
     let text = resolvedInbound;
     let lc = text.toLowerCase();
+// ------------------------------------------------------------
+// ✅ HARD TIME COMMANDS: bypass nudge + PA + pending-flow routers
+// ------------------------------------------------------------
+const lcN = String(lc || '').replace(/\s+/g, ' ').trim();
+
+const isHardTimeCommand =
+  /^undo(\s+last)?$/.test(lcN) ||
+  /^undolast$/.test(lcN) ||
+  /^clock\s*in\b/.test(lcN) ||
+  /^clockin\b/.test(lcN) ||
+  /^clock\s*out\b/.test(lcN) ||
+  /^clockout\b/.test(lcN) ||
+  /^break\s+(start|stop|end)(ed)?\b/.test(lcN) ||
+  /^lunch\s+(start|stop|end)(ed)?\b/.test(lcN) ||
+  /^lunch\s+(started|ended)\b/.test(lcN) ||
+  /^drive\s+(start|stop|end)(ed)?\b/.test(lcN) ||
+  /^timesheet\b/.test(lcN);
+
+console.info('[ROUTER_HARD_TIME]', { lcN: lcN.slice(0, 50), isHardTimeCommand });
 
     // ✅ Compute messageSid EARLY so resume can use it safely
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
@@ -1406,7 +1425,7 @@ try {
     const allowJobPickerThrough =
       (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
 
-    if (pendingRevenueFlow) {
+    if (pendingRevenueFlow && !isHardTimeCommand) {
       if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
 
       if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
@@ -1417,7 +1436,7 @@ try {
     }
 
     // ✅ EXPENSE NUDGE GATE — hardened: NEVER block when an expense PA exists
-    if (pendingExpenseFlow) {
+    if (pendingExpenseFlow && !isHardTimeCommand) {
       if (!hasExpensePendingActions) {
         if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
 
@@ -1471,6 +1490,9 @@ try {
 
     const text2 = String(getInboundText(req.body || {}) || '').trim();
     const lc2 = text2.toLowerCase();
+
+
+
     const isPickerToken = looksLikeJobPickerReplyToken(text2);
 
     /* -----------------------------------------------------------------------
@@ -1499,7 +1521,7 @@ try {
       return null;
     };
 
-    if (isExpensePA) {
+    if (isExpensePA && !isHardTimeCommand) {
       try {
         const expenseMod = require('../handlers/commands/expense');
         const expenseHandler =
@@ -1565,7 +1587,7 @@ try {
       }
     }
 
-    if (isRevenuePA) {
+    if (isRevenuePA && !isHardTimeCommand) {
       try {
         const revMod = require('../handlers/commands/revenue');
         const revenueHandler =
@@ -1679,7 +1701,8 @@ const pendingExpenseLike =
   (!!pending?.pendingExpense && !isNewExpenseCmd);
 
 
-    if (pendingRevenueLike) {
+    if (pendingRevenueLike && !isHardTimeCommand) {
+
   try {
     const revMod = require('../handlers/commands/revenue');
     const revenueHandler = revMod && typeof revMod.handleRevenue === 'function' ? revMod.handleRevenue : null;
@@ -1874,7 +1897,11 @@ if (looksExpense) {
       /\b(list|create|start|activate|pause|resume|finish)\s+job\b/.test(lc2) ||
       /\bmove\s+last\s+log\s+to\b/.test(lc2);
 
-    let looksTime = /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours)\b/.test(lc2);
+    let looksTime =
+  /\b(time\s*clock|timeclock|punch|break|drive|timesheet|hours|lunch|undo)\b/.test(lc2) ||
+  /\b(clockin|clockout|punchin|punchout|shiftin|shiftout|undolast)\b/.test(lc2) ||
+  /^undo(\s+last)?$/.test(lc2);
+
 
     if (askingHow && /\btasks?\b/.test(lc2)) looksTask = true;
     if (askingHow && /\b(time\s*clock|timeclock)\b/.test(lc2)) looksTime = true;
@@ -1975,16 +2002,31 @@ if (looksExpense) {
 
     if (flags.timeclock_v2) {
       const cil = (() => {
-        if (/^clock in\b/.test(lc2)) return { type: 'Clock', action: 'in' };
-        if (/^clock out\b/.test(lc2)) return { type: 'Clock', action: 'out' };
-        if (/^break start\b/.test(lc2)) return { type: 'Clock', action: 'break_start' };
-        if (/^break stop\b/.test(lc2)) return { type: 'Clock', action: 'break_end' };
-        if (/^lunch start\b/.test(lc2)) return { type: 'Clock', action: 'lunch_start' };
-        if (/^lunch stop\b/.test(lc2)) return { type: 'Clock', action: 'lunch_end' };
-        if (/^drive start\b/.test(lc2)) return { type: 'Clock', action: 'drive_start' };
-        if (/^drive stop\b/.test(lc2)) return { type: 'Clock', action: 'drive_end' };
-        return null;
-      })();
+  // normalize common variants
+  const s = lc2;
+
+  // NOTE: Undo is handled by legacy handler (handleTimeclock), not CIL
+  if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(s)) return null;
+
+  // Clock in/out (space + no-space)
+  if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(s)) return { type: 'Clock', action: 'in' };
+  if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(s)) return { type: 'Clock', action: 'out' };
+
+  // Break start/stop/end (accept "end")
+  if (/^break\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'break_start' };
+  if (/^break\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'break_stop' };
+
+  // Lunch start/stop/end (accept "started", "end")
+  if (/^lunch\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'lunch_start' };
+  if (/^lunch\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'lunch_stop' };
+
+  // Drive start/stop/end
+  if (/^drive\s+start(ed)?\b/.test(s)) return { type: 'Clock', action: 'drive_start' };
+  if (/^drive\s+(stop|end)(ed)?\b/.test(s)) return { type: 'Clock', action: 'drive_stop' };
+
+  return null;
+})();
+
 
       if (cil) {
         const ctx = {

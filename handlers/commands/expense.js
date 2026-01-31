@@ -3110,6 +3110,81 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   return { nextDraft: out, aiReply: null };
 }
 
+// -------------------------------------------------------
+// ✅ Inbound extraction (expense-local) — aligned w/ webhook.js
+// Purpose:
+// - Do NOT rely on router ResolvedInboundText for interactive list picks
+// - Prefer stable row id (jp:...) / ListRowId / ListId / Body as-is
+// - Buttons still normalize
+// -------------------------------------------------------
+function getInboundTextExpense(input, inboundTwilioMeta = {}) {
+  const meta = inboundTwilioMeta && typeof inboundTwilioMeta === 'object' ? inboundTwilioMeta : {};
+  const direct = String(input ?? '').trim();
+
+  // 1) Buttons / quick replies
+  const payload = String(meta.ButtonPayload || '').trim();
+  if (payload) return payload.toLowerCase();
+
+  const btnText = String(meta.ButtonText || '').trim();
+  if (btnText && btnText.length <= 40) return btnText.toLowerCase();
+
+  // 2) InteractiveResponseJson (if present)
+  const irj = meta.InteractiveResponseJson || null;
+  if (irj) {
+    try {
+      const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
+
+      const id =
+        json?.list_reply?.id ||
+        json?.listReply?.id ||
+        json?.interactive?.list_reply?.id ||
+        json?.interactive?.listReply?.id ||
+        '';
+
+      const title =
+        json?.list_reply?.title ||
+        json?.listReply?.title ||
+        json?.interactive?.list_reply?.title ||
+        json?.interactive?.listReply?.title ||
+        '';
+
+      const pickedId = String(id || '').trim();
+      const pickedTitle = String(title || '').trim();
+
+      // Optional stamped J<num> -> jobno_<num>
+      const mStamp = pickedTitle.match(/\bJ(\d{1,10})\b/i);
+      if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
+
+      if (pickedId) return pickedId; // ✅ stable row id (jp:...) or jobno_...
+      if (pickedTitle) return pickedTitle;
+    } catch {}
+  }
+
+  // 3) List picker fields
+  const listRowId = String(meta.ListRowId || '').trim();
+  const listId = String(meta.ListId || '').trim();
+  const body = String(meta.Body || '').trim();
+  const listTitle = String(meta.ListTitle || '').trim();
+
+  // Optional stamped J<num> -> jobno_<num>
+  const mStamp = listTitle.match(/\bJ(\d{1,10})\b/i);
+  if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
+
+  // ✅ Prefer stable IDs; otherwise return Body as-is (NO rewrites)
+  if (listRowId) return listRowId;
+  if (listId) return listId;
+  if (body) return body;
+
+  // Fallbacks
+  if (direct) return direct;
+  if (listTitle) return listTitle;
+
+  // Last resort: router’s resolved text if present
+  const resolved = String(meta.ResolvedInboundText || '').trim();
+  if (resolved) return resolved;
+
+  return '';
+}
 
 
 /* ---------------- main handler ---------------- */
@@ -3189,10 +3264,22 @@ async function handleExpense(
   // ✅ tz needed throughout handler (single definition)
   const tz = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
 
-  // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
+   // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
   // NOTE: getInboundTextExpense MUST exist at FILE SCOPE (do NOT define it inside handleExpense)
   const rawInboundText = getInboundTextExpense(input, inboundTwilioMeta);
+
+  // ✅ Debug: verify we’re extracting the right signal for list picks / IRJ
+  console.info('[EXPENSE_INBOUND_EXTRACTOR]', {
+    rawInboundText: String(rawInboundText || '').slice(0, 80),
+    body: String(inboundTwilioMeta?.Body || '').slice(0, 80),
+    listId: inboundTwilioMeta?.ListId || null,
+    listTitle: inboundTwilioMeta?.ListTitle || null,
+    listRowId: inboundTwilioMeta?.ListRowId || null,
+    hasIRJ: !!inboundTwilioMeta?.InteractiveResponseJson
+  });
+
   const raw = String(rawInboundText || '').trim();
+
 
   function strictDecisionToken(s) {
     const t = String(s || '').trim().toLowerCase();

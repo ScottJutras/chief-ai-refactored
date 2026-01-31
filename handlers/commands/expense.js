@@ -1226,11 +1226,10 @@ async function resolveJobPickSelection(rawInboundText, inboundTwilioMeta, pickPA
 
   const hasPickState = !!sentRows.length;
 
-  // Title signal: treat ANY signal as authoritative "Twilio provided a title"
   const inboundListTitle = getInboundTitleSignal(inboundTwilioMeta);
-  const hasTitleSignal = !!inboundListTitle;
+  const hasTitleSignal = !!String(inboundListTitle || '').trim();
 
-  // 0) Stable id path: jobno_<N> (best-case)
+  // 0) Stable id path: jobno_<N>
   const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
   if (mJobNo?.[1]) {
     return {
@@ -1243,39 +1242,20 @@ async function resolveJobPickSelection(rawInboundText, inboundTwilioMeta, pickPA
     };
   }
 
-  // 1) If Twilio provided a title: MUST title-match or reject.
-  //    No legacy mapping allowed in this branch, ever.
+  // 1) If title signal exists, ONLY title-match (never parse "#N" as jobNo)
   if (hasPickState && hasTitleSignal) {
     const needleRaw = stripListNumberPrefix(inboundListTitle);
     const needle = normalizePickTitle(needleRaw);
     const needleDS = deSpace(needle);
-const m = String(inboundListTitle).match(/^#\s*(\d{1,10})\b/);
-if (m?.[1]) {
-  const jobNo = Number(m[1]);
-  if (Number.isFinite(jobNo) && displayedJobNos.includes(jobNo)) {
-    return {
-      ok: true,
-      reason: null,
-      jobNo,
-      via: 'list_title_jobno_prefix',
-      inboundBody: tok,
-      inboundListTitle
-    };
-  }
-}
 
     const hit = sentRows.find((r) => {
-    const candRaw0 = String(r?.title || r?.name || '');
-    const candRaw = stripListNumberPrefix(candRaw0);    // ✅ add this
-    const cand = normalizePickTitle(candRaw);
-
+      const candRaw = stripListNumberPrefix(String(r?.title || r?.name || ''));
+      const cand = normalizePickTitle(candRaw);
       if (!cand || !needle) return false;
-
-      // exact match OR de-spaced equality (MedwayPark vs Medway Park)
       return cand === needle || deSpace(cand) === needleDS;
     });
 
-    const res = hit?.jobNo
+    return hit?.jobNo
       ? {
           ok: true,
           reason: null,
@@ -1292,36 +1272,27 @@ if (m?.[1]) {
           inboundBody: tok,
           inboundListTitle
         };
-
-    // Tripwire guard (belt & suspenders)
-    return enforceNoLegacyWhenTitle(res, hasTitleSignal);
   }
 
-  // 2) No title signal: allow legacy token index mapping using snapshots.
-  // Prefer displayedJobNos (what user saw), then sentRows.
+  // 2) No title signal: allow legacy index token mapping against snapshots
   if (hasPickState && !hasTitleSignal) {
     const ix = legacyIndexFromTwilioToken(tok);
     if (ix && ix >= 1) {
       if (displayedJobNos.length && ix <= displayedJobNos.length) {
-        const jobNo = Number(displayedJobNos[ix - 1]);
-        if (Number.isFinite(jobNo)) {
-          const res = {
-            ok: true,
-            reason: null,
-            jobNo,
-            via: 'legacy_token_into_displayedJobNos',
-            inboundBody: tok,
-            inboundListTitle
-          };
-          return enforceNoLegacyWhenTitle(res, hasTitleSignal);
-        }
+        return {
+          ok: true,
+          reason: null,
+          jobNo: Number(displayedJobNos[ix - 1]),
+          via: 'legacy_token_into_displayedJobNos',
+          inboundBody: tok,
+          inboundListTitle
+        };
       }
-
       if (ix <= sentRows.length) {
         const r = sentRows[ix - 1];
         const jobNo = Number(r?.jobNo);
         if (Number.isFinite(jobNo)) {
-          const res = {
+          return {
             ok: true,
             reason: null,
             jobNo,
@@ -1329,13 +1300,12 @@ if (m?.[1]) {
             inboundBody: tok,
             inboundListTitle
           };
-          return enforceNoLegacyWhenTitle(res, hasTitleSignal);
         }
       }
     }
   }
 
-  const res = {
+  return {
     ok: false,
     reason: !hasPickState ? 'job_not_in_pick_state' : 'unresolvable_selection',
     jobNo: null,
@@ -1343,9 +1313,8 @@ if (m?.[1]) {
     inboundBody: tok,
     inboundListTitle
   };
-
-  return enforceNoLegacyWhenTitle(res, hasTitleSignal);
 }
+
 
 
 /* ---------------- receipt-safe extractors (TOTAL/date/store) ---------------- */
@@ -3117,74 +3086,56 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
 // - Prefer stable row id (jp:...) / ListRowId / ListId / Body as-is
 // - Buttons still normalize
 // -------------------------------------------------------
-function getInboundTextExpense(input, inboundTwilioMeta = {}) {
-  const meta = inboundTwilioMeta && typeof inboundTwilioMeta === 'object' ? inboundTwilioMeta : {};
-  const direct = String(input ?? '').trim();
+function getInboundTextExpense(input, meta = {}) {
+  const rawInput = String(input || '').trim();
 
-  // 1) Buttons / quick replies
-  const payload = String(meta.ButtonPayload || '').trim();
+  // Buttons
+  const payload = String(meta?.ButtonPayload || '').trim();
   if (payload) return payload.toLowerCase();
 
-  const btnText = String(meta.ButtonText || '').trim();
+  const btnText = String(meta?.ButtonText || '').trim();
   if (btnText && btnText.length <= 40) return btnText.toLowerCase();
 
-  // 2) InteractiveResponseJson (if present)
-  const irj = meta.InteractiveResponseJson || null;
+  // InteractiveResponseJson (best signal)
+  const irj = meta?.InteractiveResponseJson || null;
   if (irj) {
     try {
-      const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
-
+      const obj = typeof irj === 'string' ? JSON.parse(irj) : irj;
       const id =
-        json?.list_reply?.id ||
-        json?.listReply?.id ||
-        json?.interactive?.list_reply?.id ||
-        json?.interactive?.listReply?.id ||
+        obj?.list_reply?.id ||
+        obj?.interactive?.list_reply?.id ||
+        obj?.listReply?.id ||
         '';
-
       const title =
-        json?.list_reply?.title ||
-        json?.listReply?.title ||
-        json?.interactive?.list_reply?.title ||
-        json?.interactive?.listReply?.title ||
+        obj?.list_reply?.title ||
+        obj?.interactive?.list_reply?.title ||
+        obj?.listReply?.title ||
         '';
 
       const pickedId = String(id || '').trim();
+      if (pickedId) return pickedId; // ✅ never rewrite
+
       const pickedTitle = String(title || '').trim();
-
-      // Optional stamped J<num> -> jobno_<num>
-      const mStamp = pickedTitle.match(/\bJ(\d{1,10})\b/i);
-      if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
-
-      if (pickedId) return pickedId; // ✅ stable row id (jp:...) or jobno_...
       if (pickedTitle) return pickedTitle;
     } catch {}
   }
 
-  // 3) List picker fields
-  const listRowId = String(meta.ListRowId || '').trim();
-  const listId = String(meta.ListId || '').trim();
-  const body = String(meta.Body || '').trim();
-  const listTitle = String(meta.ListTitle || '').trim();
-
-  // Optional stamped J<num> -> jobno_<num>
-  const mStamp = listTitle.match(/\bJ(\d{1,10})\b/i);
-  if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
-
-  // ✅ Prefer stable IDs; otherwise return Body as-is (NO rewrites)
+  // Twilio list fields: prefer ids first
+  const listRowId = String(meta?.ListRowId || meta?.ListRowID || '').trim();
   if (listRowId) return listRowId;
+
+  const listId = String(meta?.ListId || meta?.ListItemId || meta?.ListReplyId || '').trim();
   if (listId) return listId;
-  if (body) return body;
 
-  // Fallbacks
-  if (direct) return direct;
-  if (listTitle) return listTitle;
+  // Do NOT rewrite job_3_xxx -> jobix_3 (leave raw token)
+  if (rawInput) return rawInput;
 
-  // Last resort: router’s resolved text if present
-  const resolved = String(meta.ResolvedInboundText || '').trim();
-  if (resolved) return resolved;
+  const title = String(meta?.ListTitle || meta?.ListRowTitle || '').trim();
+  if (title) return title;
 
   return '';
 }
+
 // ---------------------------------------------------------
 // ✅ Media asset resolver (FILE SCOPE)
 // Used by YES path to ensure confirm drafts link to media_assets.

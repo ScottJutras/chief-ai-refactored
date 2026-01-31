@@ -225,21 +225,21 @@ function isJobPickerIntent(lc) {
 }
 
 function looksLikeJobPickerReplyToken(raw) {
-  const s = String(raw || '').trim();
-  if (!s) return false;
+  const t = String(raw || '').trim().toLowerCase();
+  if (!t) return false;
 
-  if (/^(more|overhead|oh)$/i.test(s)) return true;
-  if (/^\d+$/i.test(s)) return true;
+  if (t === 'more' || t === 'overhead' || t === 'oh') return true;
+  if (/^\d{1,10}$/.test(t)) return true;
 
-  // ✅ canonical tokens
-  if (/^jobno_\d+$/i.test(s)) return true;
-  if (/^jobix_\d+$/i.test(s)) return true;
-
-  // ✅ Twilio Content Template inbound format
-  if (/^job_\d+_[0-9a-z]+$/i.test(s)) return true;
-
-  return false;
+  return (
+    /^jobno_\d{1,10}$/.test(t) ||
+    /^jobix_\d{1,10}$/.test(t) ||
+    /^job_\d{1,10}_[0-9a-z]+$/.test(t) ||
+    /^jp:[0-9a-f]{8}:[0-9a-f]{8}:jn:\d{1,10}:h:[0-9a-f]{10,16}$/.test(t)
+  );
 }
+
+
 
 function pendingTxnNudgeMessage(pending) {
   // If user is mid-edit, do not nag. Next message is edit payload.
@@ -263,55 +263,86 @@ function pendingTxnNudgeMessage(pending) {
 /* -----------------------------------------------------------------------
  * ✅ Inbound text normalization (button-aware + interactive list-aware)
  *
- * Your Twilio Content Template list clicks arrive as:
- *   Body:      job_3_552e375c
- *   ListId:    job_3_552e375c
- *   ListTitle: "#3 1559 MedwayPark Dr"
+ * Twilio list clicks can arrive in multiple shapes:
+ *   - InteractiveResponseJson: list_reply.id (row id) + list_reply.title
+ *   - ListRowId / ListId (sometimes equals Body)
+ *   - ListTitle / ListRowTitle
  *
- * IMPORTANT:
- *   job_3_* and "#3 ..." are ROW INDEX tokens, NOT job_no.
+ * IMPORTANT RULE (to prevent picker loops):
+ *   ✅ If Twilio provides an interactive list selection, we must prefer the
+ *      STABLE row id (e.g. "jp:...") OR the original token (e.g. "job_3_xxx")
+ *      and NEVER rewrite it into a different semantic token.
  *
- * We normalize:
- *   job_3_*  -> jobix_3
+ * Why:
+ *   - "job_3_*" is a ROW INDEX token in some templates (NOT job_no)
+ *   - rewriting into "jobix_3" causes mismatches and loops when title/state
+ *     expects the original token or stable row id.
  *
- * If ListTitle contains a stamped token like "J8", we can recover job_no:
- *   "#3 J8 1559..." -> jobno_8
+ * Therefore:
+ *   - Return row id if present (jp:..., ListRowId, list_reply.id)
+ *   - Else return the raw list token (job_3_xxx) as-is
+ *   - Buttons remain normalized ("yes"/"edit"/etc)
  * ----------------------------------------------------------------------- */
+
 
 function getInboundText(body = {}) {
   const b = body || {};
   const rawBody = String(b.Body || '').trim();
 
-  // 1) Buttons / quick replies
+  // -------------------------------------------------------
+  // 1) Buttons / quick replies (safe to normalize)
+  // -------------------------------------------------------
   const payload = String(b.ButtonPayload || b.buttonPayload || '').trim();
   if (payload) return payload.toLowerCase();
 
   const btnText = String(b.ButtonText || b.buttonText || '').trim();
   if (btnText && btnText.length <= 40) return btnText.toLowerCase();
 
-  // 2) InteractiveResponseJson (some flows)
+  // -------------------------------------------------------
+  // 2) InteractiveResponseJson (best signal if present)
+  //    Prefer list_reply.id (row id) over title.
+  // -------------------------------------------------------
   const irj = b.InteractiveResponseJson || b.interactiveResponseJson || null;
   if (irj) {
     try {
       const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
+
       const id =
         json?.list_reply?.id ||
         json?.listReply?.id ||
         json?.interactive?.list_reply?.id ||
+        json?.interactive?.listReply?.id ||
         '';
+
       const title =
         json?.list_reply?.title ||
         json?.listReply?.title ||
         json?.interactive?.list_reply?.title ||
+        json?.interactive?.listReply?.title ||
         '';
-      const picked = String(id || title || '').trim();
-      if (picked) return normalizeListPickToken(picked, { listTitle: String(title || '').trim() });
+
+      const pickedId = String(id || '').trim();
+      const pickedTitle = String(title || '').trim();
+
+      // If title contains stamped job number like "J8", allow jobno recovery
+      const stamped = extractStampedJobNo(pickedTitle);
+      if (stamped) return `jobno_${stamped}`;
+
+      // ✅ Return ID as-is (do NOT rewrite)
+      if (pickedId) return pickedId;
+
+      // Fallback to title if no id
+      if (pickedTitle) return pickedTitle;
     } catch {}
   }
 
+  // -------------------------------------------------------
   // 3) Twilio list picker fields
+  //    Prefer RowId/Id over Body over Title.
+  // -------------------------------------------------------
   const listRowId = String(b.ListRowId || b.ListRowID || b.listRowId || b.listRowID || '').trim();
   const listRowTitle = String(b.ListRowTitle || b.listRowTitle || '').trim();
+
   const listId = String(
     b.ListId ||
       b.listId ||
@@ -321,6 +352,7 @@ function getInboundText(body = {}) {
       b.listReplyId ||
       ''
   ).trim();
+
   const listTitle = String(
     b.ListTitle ||
       b.listTitle ||
@@ -331,47 +363,35 @@ function getInboundText(body = {}) {
       ''
   ).trim();
 
-  // Prefer IDs over titles if present
-  const candidateId = listRowId || listId || rawBody;
   const candidateTitle = listRowTitle || listTitle;
 
-  // If we have a title, allow stamped J<num> recovery
-  if (candidateTitle) {
-    const mStamp = String(candidateTitle).match(/\bJ(\d{1,10})\b/i);
-    if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
-  }
+  // If title contains stamped job number like "J8", allow jobno recovery
+  const stamped = extractStampedJobNo(candidateTitle);
+  if (stamped) return `jobno_${stamped}`;
 
-  // Normalize the ID/body token
-  const normalized = normalizeListPickToken(candidateId, { listTitle: candidateTitle });
+  // ✅ Prefer the ID fields if present (stable)
+  if (listRowId) return listRowId;
+  if (listId) return listId;
 
-  // If normalization did nothing but we have a title, fall back to title
-  if (!normalized && candidateTitle) return candidateTitle;
-  if (normalized) return normalized;
+  // If Twilio put the token in Body (common), return it AS-IS
+  // ✅ CRITICAL: do NOT rewrite job_3_xxx -> jobix_3
+  if (rawBody) return rawBody;
 
-  return rawBody;
+  // As a last resort, fall back to title
+  if (candidateTitle) return candidateTitle;
+
+  return '';
 }
 
-/**
- * Normalize list click tokens into what your pickers understand.
- *
- * - "job_3_deadbeef" => "jobix_3"  (ROW INDEX token from Content Template)
- * - "jobno_8"        => "jobno_8"  (already canonical)
- * - "#3 Something"   => "#3 Something" (expense.js will treat as index safely)
- */
-function normalizeListPickToken(raw = '', { listTitle = '' } = {}) {
-  const s = String(raw || '').trim();
-  if (!s) return s;
-
-  // ✅ If title contains stamped job number like "J8", trust job_no directly
-  const mStamp = String(listTitle || s).match(/\bJ(\d{1,10})\b/i);
-  if (mStamp?.[1]) return `jobno_${mStamp[1]}`;
-
-  // ✅ Content-template list click format: job_<index>_<nonce>  (index, not job_no!)
-  const mLegacy = s.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
-  if (mLegacy?.[1]) return `jobix_${mLegacy[1]}`;
-
-  return s;
+function extractStampedJobNo(title = '') {
+  const s = String(title || '').trim();
+  if (!s) return null;
+  const m = s.match(/\bJ(\d{1,10})\b/i);
+  if (!m?.[1]) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
 }
+
 
 
 
@@ -1495,46 +1515,69 @@ try {
     }
 
     /* -----------------------------------------------------------------------
-     * Media follow-up: if prior step set pendingMedia and this is text-only
-     * ----------------------------------------------------------------------- */
-    const hasPendingMedia = !!pending?.pendingMedia || !!pending?.pendingMediaMeta;
-    if (hasPendingMedia && numMedia === 0) {
-      try {
-        const { handleMedia } = require('../handlers/media');
-        const result = await handleMedia(req.from, text, req.userProfile || {}, req.ownerId, null, null, messageSid);
+ * Media follow-up: if prior step set pendingMedia and this is text-only
+ * ----------------------------------------------------------------------- */
+const hasPendingMedia = !!pending?.pendingMedia || !!pending?.pendingMediaMeta;
 
-        if (result && typeof result === 'object') {
-          if (result.twiml) return sendTwiml(res, result.twiml);
-          if (result.transcript && !result.twiml) {
-  let t = String(result.transcript || '').trim();
-  try { if (typeof stripLeadingFiller === 'function') t = stripLeadingFiller(t); } catch {}
-  try { if (typeof normalizeTranscriptMoney === 'function') t = normalizeTranscriptMoney(t); } catch {}
-  req.body.Body = t;
-  console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 12) });
+if (hasPendingMedia && numMedia === 0) {
+  try {
+    const { handleMedia } = require('../handlers/media');
 
-}
+    // Use the current canonical text we already computed earlier in the request
+    const priorText = String(req.body?.ResolvedInboundText || text || '').trim();
 
-        } else if (typeof result === 'string' && result) {
-          return sendTwiml(res, result);
-        }
+    const result = await handleMedia(
+      req.from,
+      priorText,
+      req.userProfile || {},
+      req.ownerId,
+      null,
+      null,
+      messageSid
+    );
 
-        text = String(getInboundText(req.body || {}) || '').trim();
+    if (result && typeof result === 'object') {
+      if (result.twiml) return sendTwiml(res, result.twiml);
+
+      if (result.transcript && !result.twiml) {
+        let t = String(result.transcript || '').trim();
+        try { if (typeof stripLeadingFiller === 'function') t = stripLeadingFiller(t); } catch {}
+        try { if (typeof normalizeTranscriptMoney === 'function') t = normalizeTranscriptMoney(t); } catch {}
+
+        // Put transcript into the inbound body
+        req.body.Body = t;
+
+        // ✅ Recompute canonical text ONCE and store it (so everything downstream uses the same thing)
+        const newResolved = String(getInboundText(req.body || {}) || '').trim();
+        req.body.ResolvedInboundText = newResolved;
+
+        // ✅ Update local vars to match
+        text = newResolved;
         lc = text.toLowerCase();
-        isHardTimeCommand = looksHardTimeCommand(lc);
-        console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc.slice(0, 50), isHardTimeCommand });
 
-        pending = await getPendingTransactionState(req.actorKey || req.from);
-      } catch (e) {
-        console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
+        console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 12) });
       }
+    } else if (typeof result === 'string' && result) {
+      return sendTwiml(res, result);
     }
 
-    const text2 = String(getInboundText(req.body || {}) || '').trim();
-    const lc2 = text2.toLowerCase();
+    // If handleMedia didn't produce a transcript, keep whatever canonical text we already had
+    text = String(req.body.ResolvedInboundText || text || '').trim();
+    lc = text.toLowerCase();
 
+    isHardTimeCommand = looksHardTimeCommand(lc);
+    console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc.slice(0, 50), isHardTimeCommand });
 
+    pending = await getPendingTransactionState(req.actorKey || req.from);
+  } catch (e) {
+    console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
+  }
+}
 
-    const isPickerToken = looksLikeJobPickerReplyToken(text2);
+// ✅ From here on, reuse the canonical `text`
+const text2 = text;
+const lc2 = text2.toLowerCase();
+const isPickerToken = looksLikeJobPickerReplyToken(text2);
 
     /* -----------------------------------------------------------------------
      * ✅ Pending-actions router (must run early)

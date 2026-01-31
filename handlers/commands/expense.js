@@ -3185,6 +3185,118 @@ function getInboundTextExpense(input, inboundTwilioMeta = {}) {
 
   return '';
 }
+// ---------------------------------------------------------
+// ✅ Media asset resolver (FILE SCOPE)
+// Used by YES path to ensure confirm drafts link to media_assets.
+// Priority:
+// 1) draft.media_asset_id
+// 2) flowMediaAssetId (function-scope capture)
+// 3) DB lookup by draft/pending source_msg_id
+// 4) pending state pendingMediaMeta.media_asset_id
+// ---------------------------------------------------------
+async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMediaAssetId }) {
+  // 1) Draft direct
+  let id =
+    (rawDraft?.media_asset_id || rawDraft?.mediaAssetId || null) ||
+    (rawDraft?.pendingMediaMeta?.media_asset_id || rawDraft?.pendingMediaMeta?.mediaAssetId || null) ||
+    null;
+
+  if (id) return id;
+
+  // 2) Function-scope fallback
+  if (flowMediaAssetId) return flowMediaAssetId;
+
+  // Helper: normalize a source msg id into the DB format "<digitsUserKey>:<sid>"
+  const asDbSource = (sid) => {
+    const s = String(sid || '').trim();
+    if (!s) return null;
+
+    const stateKey =
+      (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(userKey)) ||
+      String(userKey || '').replace(/\D/g, '') ||
+      String(userKey || '').trim();
+
+    if (!stateKey) return null;
+
+    // If already has a prefix like "digits:SID", keep it (or re-key safely)
+    if (s.includes(':')) {
+      if (s.startsWith(`${stateKey}:`)) return s;
+
+      const prefix = s.split(':')[0];
+      if (/^\d{7,20}$/.test(prefix)) return s;
+
+      // colon-containing junk; force our key prefix
+      return `${stateKey}:${s.replace(/^[^:]*:/, '')}`;
+    }
+
+    return `${stateKey}:${s}`;
+  };
+
+  // 3) Try draft hints for source msg id (strong fallback)
+  const draftSrc =
+    rawDraft?.media_source_msg_id ||
+    rawDraft?.source_msg_id ||
+    rawDraft?.pendingMediaMeta?.source_msg_id ||
+    rawDraft?.mediaSourceMsgId ||
+    null;
+
+  const srcFromDraft = asDbSource(draftSrc);
+  if (srcFromDraft) {
+    try {
+      const r = await pg.query(
+        `select id
+           from public.media_assets
+          where owner_id=$1 and source_msg_id=$2
+          limit 1`,
+        [String(ownerId || '').trim(), String(srcFromDraft).trim()]
+      );
+      const found = r?.rows?.[0]?.id || null;
+      if (found) return found;
+    } catch (e) {
+      console.warn('[MEDIA_ASSET_RESOLVE_DB_DRAFTSRC] failed (ignored):', e?.message);
+    }
+  }
+
+  // 4) Re-read pending state (in case it exists)
+  let pending = null;
+  try {
+    const stateKey =
+      (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(userKey)) ||
+      String(userKey || '').replace(/\D/g, '') ||
+      String(userKey || '').trim();
+
+    pending = await getPendingTransactionState(stateKey);
+  } catch {}
+
+  id =
+    (pending?.pendingMediaMeta?.media_asset_id ||
+      pending?.pendingMediaMeta?.mediaAssetId ||
+      null) || null;
+
+  if (id) return id;
+
+  // 5) DB fallback using pending source msg id
+  const pendingSrc = pending?.pendingMediaMeta?.source_msg_id || pending?.mediaSourceMsgId || null;
+  const srcFromPending = asDbSource(pendingSrc);
+
+  if (srcFromPending) {
+    try {
+      const r = await pg.query(
+        `select id
+           from public.media_assets
+          where owner_id=$1 and source_msg_id=$2
+          limit 1`,
+        [String(ownerId || '').trim(), String(srcFromPending).trim()]
+      );
+      const found = r?.rows?.[0]?.id || null;
+      if (found) return found;
+    } catch (e) {
+      console.warn('[MEDIA_ASSET_RESOLVE_DB_PENDINGSRC] failed (ignored):', e?.message);
+    }
+  }
+
+  return null;
+}
 
 
 /* ---------------- main handler ---------------- */

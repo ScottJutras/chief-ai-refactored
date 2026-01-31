@@ -2287,6 +2287,15 @@ function hash8(s) {
   const x = require('crypto').createHash('sha1').update(String(s || '')).digest('hex');
   return x.slice(0, 8);
 }
+// ============================================================================
+// ✅ DROP-IN: sendJobPickList (with stale-click hardening via lastPickerMsgSid)
+// ----------------------------------------------------------------------------
+// What’s new:
+// 1) Captures the outbound picker message SID (from Twilio send result)
+// 2) Stores it in the PICK PA payload as `lastPickerMsgSid`
+// 3) Leaves everything else unchanged (title-match resolver still works)
+// ============================================================================
+
 async function sendJobPickList({
   fromPhone,
   ownerId,
@@ -2325,7 +2334,6 @@ async function sendJobPickList({
     String(fromPhone || '').replace(/\D/g, '') ||
     String(fromPhone || '').trim();
 
-
   const p = Math.max(0, Number(page) || 0);
   const ps = Math.min(8, Math.max(1, Number(pageSize) || 8));
 
@@ -2361,7 +2369,7 @@ async function sendJobPickList({
     return {
       jobNo,
       name,
-      id: `jobno_${jobNo}`, // stable debug id
+      id: `jobno_${jobNo}`, // stable debug id (Twilio may not return this, but keep it)
       title: name // name-only title (no "#")
     };
   });
@@ -2383,7 +2391,35 @@ async function sendJobPickList({
     rows: sentRows.map((r) => ({ id: r.id, title: r.title, jobNo: r.jobNo }))
   });
 
-  // ✅ Persist picker PA state
+  // ✅ Build Twilio "sections" payload (as expected by services/twilio.js)
+  const bodyText = hasMore ? 'Tap a job below (reply “more” for next page).' : 'Tap a job below.';
+
+  const sections = [
+    {
+      title: 'Jobs',
+      rows: sentRows.map((r) => ({ id: r.id, title: r.title }))
+    }
+  ];
+
+  // ✅ Send the interactive list via your wrapper signature
+  // IMPORTANT: capture result to store picker message SID for stale-click protection
+  let sendResult = null;
+  try {
+    sendResult = await sendWhatsAppInteractiveList({
+      to,
+      bodyText,
+      buttonText: 'Pick job',
+      sections
+    });
+  } catch (e) {
+    console.warn('[JOB_PICK_SEND] sendWhatsAppInteractiveList failed:', e?.message);
+    // fail-open (Twilio wrapper may already have fallback). Continue to persist PA anyway.
+  }
+
+  // ✅ Persist picker PA state (includes lastPickerMsgSid)
+  // Twilio usually returns `{ sid }` for message create; your logs show "result { sid: 'MM...' }"
+  const lastPickerMsgSid = String(sendResult?.sid || sendResult?.messageSid || '').trim() || null;
+
   await upsertPA({
     ownerId,
     userId: pickKey, // ✅ MUST MATCH read key
@@ -2400,31 +2436,17 @@ async function sendJobPickList({
       displayedJobNos,
       sentRows,
       jobOptions: safeJobs,
-      confirmDraft: confirmDraft || null
+      confirmDraft: confirmDraft || null,
+
+      // ✅ NEW: used to reject stale clicks from old list messages
+      lastPickerMsgSid
     },
     ttlSeconds: PA_TTL_SEC
   });
 
-  // ✅ Build Twilio "sections" payload (as expected by services/twilio.js)
-  const bodyText = hasMore ? 'Tap a job below (reply “more” for next page).' : 'Tap a job below.';
-
-  const sections = [
-    {
-      title: 'Jobs',
-      rows: sentRows.map((r) => ({ id: r.id, title: r.title }))
-    }
-  ];
-
-  // ✅ Send the interactive list via your wrapper signature
-  await sendWhatsAppInteractiveList({
-    to,
-    bodyText,
-    buttonText: 'Pick job',
-    sections
-  });
-
   return out(twimlEmpty(), true);
 }
+
 
 
 /* ---------------- Active job resolution ---------------- */
@@ -3697,131 +3719,176 @@ async function handleExpense(
       if (lock?.acquireLock) await lock.acquireLock(lockKey, 8000).catch(() => null);
     } catch {}
 
-    /* ---- 1) Awaiting job pick ---- */
-    const pickPA = await getPA({
-      ownerId,
-      userId: canonicalUserKey, // ✅ single canonical key
-      kind: PA_KIND_PICK_JOB
-    }).catch(() => null);
+    // ============================================================================
+// ✅ DROP-IN: JOB_PICK_DEBUG block (with stale-click guard)
+// ----------------------------------------------------------------------------
+// What’s new:
+// - Uses pickPA.payload.lastPickerMsgSid (stored by sendJobPickList)
+// - Compares against inboundTwilioMeta.OriginalRepliedMessageSid
+// - If mismatch -> treat as stale tap and resend page 0 (no wrong-job mapping)
+// - Also logs `expectedPickerMsgSid` + `repliedToMsgSid` for debugging
+// ============================================================================
 
-    if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payload.jobOptions.length) {
-      const tok = normalizeDecisionToken(rawInboundText);
+/* ---- 1) Awaiting job pick ---- */
+const pickPA = await getPA({
+  ownerId,
+  userId: canonicalUserKey, // ✅ single canonical key
+  kind: PA_KIND_PICK_JOB
+}).catch(() => null);
 
-      const isConfirmControlToken =
-        tok === 'yes' ||
-        tok === 'edit' ||
-        tok === 'cancel' ||
-        tok === 'resume' ||
-        tok === 'skip' ||
-        tok === 'change_job';
+if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payload.jobOptions.length) {
+  const tok = normalizeDecisionToken(rawInboundText);
 
-      if (isConfirmControlToken) {
-        console.info('[PICK_FLOW_BYPASS_FOR_CONFIRM_TOKEN]', { tok });
-        // fall through
-      } else {
-        const rawInput = String(rawInboundText || '').trim();
+  const isConfirmControlToken =
+    tok === 'yes' ||
+    tok === 'edit' ||
+    tok === 'cancel' ||
+    tok === 'resume' ||
+    tok === 'skip' ||
+    tok === 'change_job';
 
-        // ✅ include ListRowId + IRJ in "picker tap" detection
-        const looksLikePickerTap =
-          /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
-          /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-          /^jobno_\d{1,10}$/i.test(rawInput) ||
-          !!inboundTwilioMeta?.ListTitle ||
-          !!inboundTwilioMeta?.ListId ||
-          !!inboundTwilioMeta?.ListRowId ||
-          !!inboundTwilioMeta?.InteractiveResponseJson;
+  if (isConfirmControlToken) {
+    console.info('[PICK_FLOW_BYPASS_FOR_CONFIRM_TOKEN]', { tok });
+    // fall through
+  } else {
+    const rawInput = String(rawInboundText || '').trim();
 
-        const jobOptions = pickPA.payload.jobOptions;
-        const page = Number(pickPA.payload.page || 0) || 0;
-        const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
-        const hasMore = !!pickPA.payload.hasMore;
+    // ✅ include ListRowId + IRJ in "picker tap" detection
+    const looksLikePickerTap =
+      /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
+      /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
+      /^jobno_\d{1,10}$/i.test(rawInput) ||
+      !!inboundTwilioMeta?.ListTitle ||
+      !!inboundTwilioMeta?.ListId ||
+      !!inboundTwilioMeta?.ListRowId ||
+      !!inboundTwilioMeta?.InteractiveResponseJson;
 
-        const flow = String(pickPA.payload.flow || '').trim() || null;
-        const confirmFlowId = String(pickPA.payload.confirmFlowId || '').trim() || null;
-        const sentAt = Number(pickPA.payload.sentAt || 0) || 0;
-        const pickerNonce = pickPA.payload.pickerNonce || null;
-        const displayedHash = pickPA.payload.displayedHash || null;
-        const confirmDraft = pickPA?.payload?.confirmDraft || null;
+    const jobOptions = pickPA.payload.jobOptions;
+    const page = Number(pickPA.payload.page || 0) || 0;
+    const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
+    const hasMore = !!pickPA.payload.hasMore;
 
-        const displayedJobNos = Array.isArray(pickPA?.payload?.displayedJobNos)
-          ? pickPA.payload.displayedJobNos
-          : [];
+    const flow = String(pickPA.payload.flow || '').trim() || null;
+    const confirmFlowId = String(pickPA.payload.confirmFlowId || '').trim() || null;
+    const sentAt = Number(pickPA.payload.sentAt || 0) || 0;
+    const pickerNonce = pickPA.payload.pickerNonce || null;
+    const displayedHash = pickPA.payload.displayedHash || null;
+    const confirmDraft = pickPA?.payload?.confirmDraft || null;
 
-        const effectiveConfirmFlowId =
-          confirmFlowId || stableMsgId || `${paUserId}:${Date.now()}`;
+    const displayedJobNos = Array.isArray(pickPA?.payload?.displayedJobNos)
+      ? pickPA.payload.displayedJobNos
+      : [];
 
-        // ✅ Resume works even while we’re in the picker flow
-        if (tok === 'resume') {
-          const confirmPA0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-          const draft0 = confirmPA0?.payload?.draft || null;
+    const effectiveConfirmFlowId = confirmFlowId || stableMsgId || `${paUserId}:${Date.now()}`;
 
-          if (draft0 && Object.keys(draft0).length) {
-            try {
-              return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
-            } catch (e) {
-              console.warn('[EXPENSE] resume during pick failed; fallback to text:', e?.message);
-              return out(twimlText(formatExpenseConfirmText(draft0)), false);
-            }
-          }
+    // ✅ Resume works even while we’re in the picker flow
+    if (tok === 'resume') {
+      const confirmPA0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+      const draft0 = confirmPA0?.payload?.draft || null;
 
-          return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
+      if (draft0 && Object.keys(draft0).length) {
+        try {
+          return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+        } catch (e) {
+          console.warn('[EXPENSE] resume during pick failed; fallback to text:', e?.message);
+          return out(twimlText(formatExpenseConfirmText(draft0)), false);
         }
+      }
 
-        // If user sent a brand new expense while waiting for job pick, clear state and continue parsing.
-        if (looksLikeNewExpenseText(input)) {
-          console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
-          try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
-          try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
-          // fall through
-        } else {
-          // Stale picker protection → resend page 0
-          if (!sentAt || Date.now() - sentAt > PA_TTL_SEC * 1000) {
-            return await sendJobPickList({
-              fromPhone,
-              ownerId,
-              userProfile,
-              confirmFlowId: effectiveConfirmFlowId,
-              jobOptions,
-              paUserId,
-              pickUserId: canonicalUserKey,
-              page: 0,
-              pageSize: 8,
-              context: 'expense_jobpick',
-              confirmDraft
-            });
-          }
+      return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
+    }
 
-          console.info('[JOB_PICK_DEBUG]', {
-            input,
-            rawInput,
-            tok,
-            flow,
-            confirmFlowId: effectiveConfirmFlowId,
-            sentAt,
-            page,
-            pageSize,
-            pickerNonce,
-            displayedHash,
-            displayedJobNos: displayedJobNos.slice(0, 16),
-            inbound: {
-              MessageSid: inboundTwilioMeta?.MessageSid || null,
-              OriginalRepliedMessageSid: inboundTwilioMeta?.OriginalRepliedMessageSid || null,
-              ListRowId: inboundTwilioMeta?.ListRowId || null,
-              ListId: inboundTwilioMeta?.ListId || null,
-              ListTitle: inboundTwilioMeta?.ListTitle || null
-            }
-          });
+    // If user sent a brand new expense while waiting for job pick, clear state and continue parsing.
+    if (looksLikeNewExpenseText(input)) {
+      console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
+      try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
+      try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
+      // fall through
+    } else {
+      // Stale picker protection (TTL) → resend page 0
+      if (!sentAt || Date.now() - sentAt > PA_TTL_SEC * 1000) {
+        return await sendJobPickList({
+          fromPhone,
+          ownerId,
+          userProfile,
+          confirmFlowId: effectiveConfirmFlowId,
+          jobOptions,
+          paUserId,
+          pickUserId: canonicalUserKey,
+          page: 0,
+          pageSize: 8,
+          context: 'expense_jobpick',
+          confirmDraft
+        });
+      }
 
-          // Optional: remember last inbound picker token (store RAWs)
-          try {
-            await upsertPA({
-              ownerId,
-              userId: canonicalUserKey,
-              kind: PA_KIND_PICK_JOB,
-              payload: { ...(pickPA.payload || {}), lastInboundTextRaw: rawInboundText, lastInboundText: rawInput },
-              ttlSeconds: PA_TTL_SEC
-            });
-          } catch {}
+      // ✅ NEW: Stale picker protection (message reply mismatch)
+      // Only enforce when this looks like a picker tap (don’t block typed messages)
+      const expectedPickerMsgSid = String(pickPA?.payload?.lastPickerMsgSid || '').trim() || null;
+      const repliedToMsgSid = String(inboundTwilioMeta?.OriginalRepliedMessageSid || '').trim() || null;
+
+      if (looksLikePickerTap && expectedPickerMsgSid && repliedToMsgSid && expectedPickerMsgSid !== repliedToMsgSid) {
+        console.warn('[JOB_PICK_STALE_CLICK]', {
+          expectedPickerMsgSid,
+          repliedToMsgSid,
+          rawInput,
+          listTitle: inboundTwilioMeta?.ListTitle || null,
+          listId: inboundTwilioMeta?.ListId || null
+        });
+
+        // Resend latest picker page 0 (keeps state aligned with newest list)
+        return await sendJobPickList({
+          fromPhone,
+          ownerId,
+          userProfile,
+          confirmFlowId: effectiveConfirmFlowId,
+          jobOptions,
+          paUserId,
+          pickUserId: canonicalUserKey,
+          page: 0,
+          pageSize: 8,
+          context: 'expense_jobpick',
+          confirmDraft
+        });
+      }
+
+      console.info('[JOB_PICK_DEBUG]', {
+        input,
+        rawInput,
+        tok,
+        flow,
+        confirmFlowId: effectiveConfirmFlowId,
+        sentAt,
+        page,
+        pageSize,
+        pickerNonce,
+        displayedHash,
+        displayedJobNos: displayedJobNos.slice(0, 16),
+
+        // ✅ NEW: message-based stale protection visibility
+        expectedPickerMsgSid,
+        repliedToMsgSid,
+
+        inbound: {
+          MessageSid: inboundTwilioMeta?.MessageSid || null,
+          OriginalRepliedMessageSid: inboundTwilioMeta?.OriginalRepliedMessageSid || null,
+          ListRowId: inboundTwilioMeta?.ListRowId || null,
+          ListId: inboundTwilioMeta?.ListId || null,
+          ListTitle: inboundTwilioMeta?.ListTitle || null
+        }
+      });
+
+      // Optional: remember last inbound picker token (store RAWs)
+      try {
+        await upsertPA({
+          ownerId,
+          userId: canonicalUserKey,
+          kind: PA_KIND_PICK_JOB,
+          payload: { ...(pickPA.payload || {}), lastInboundTextRaw: rawInboundText, lastInboundText: rawInput },
+          ttlSeconds: PA_TTL_SEC
+        });
+      } catch {}
+    
 
           // ✅ If user says "change job" while already picking -> resend page 0
           if (tok === 'change_job') {

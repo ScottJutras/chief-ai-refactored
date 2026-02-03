@@ -878,6 +878,31 @@ router.use((req, _res, next) => {
   });
 });
 
+// ---------------- Transport health & echo ----------------
+// Put this ABOVE the first router.post('*') so it doesn’t get intercepted.
+
+router.get('/health', (_req, res) => {
+  // plain 200 for uptime checks
+  return res.status(200).send('OK');
+});
+
+// Twilio posts to you; this returns TwiML quickly and proves routing + body parsing
+router.post('/echo', (req, res) => {
+  try {
+    const b = req.body || {};
+    const msgSid = b.MessageSid || b.SmsMessageSid || null;
+    const from = b.From || null;
+    const body = (b.Body || '').toString().slice(0, 200);
+
+    // If you already have sendTwiml + ok() helpers, use them.
+    // Otherwise simplest safe TwiML:
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>echo: ${body || '—'} (sid ${msgSid || 'none'})</Message></Response>`;
+    res.set('Content-Type', 'text/xml');
+    return res.status(200).send(twiml);
+  } catch {
+    return res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+  }
+});
 /* ---------------- Non-POST guard ---------------- */
 
 router.all('*', (req, res, next) => {
@@ -957,6 +982,7 @@ router.use((req, res, next) => {
 
   next();
 });
+
 
 
 /* ---------------- Inbound debug (TEMP) ---------------- */
@@ -2077,52 +2103,47 @@ console.info('[TIME_V2_GATE]', { timeclock_v2: !!flags.timeclock_v2, isHardTimeC
 
 if (flags.timeclock_v2) {
   const cil = (() => {
-    const s0 = String(lc2 || '').toLowerCase().trim();
+    const s0 = String(text2 || '').toLowerCase().trim();
     const s = s0.replace(/\s+/g, ' ');
     const c = s0.replace(/\s+/g, '');
 
-    // NOTE: Undo stays legacy handler (handleTimeclock)
+    // Undo stays legacy handler (handleTimeclock)
     if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(c)) return null;
 
-    if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(c)) return { type: 'Clock', action: 'in' };
-    if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(c)) return { type: 'Clock', action: 'out' };
+    if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(c)) return { action: 'in' };
+    if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(c)) return { action: 'out' };
 
-    if (/^break\s+start(ed)?\b/.test(s) || /^(breakstart|startbreak)$/.test(c)) return { type: 'Clock', action: 'break_start' };
-    if (/^break\s+(stop|end)(ed)?\b/.test(s) || /^(breakend|endbreak|breakstop|stopbreak)$/.test(c)) return { type: 'Clock', action: 'break_stop' };
+    if (/^break\s+start(ed)?\b/.test(s) || /^(breakstart|startbreak)$/.test(c)) return { action: 'break_start' };
+    if (/^break\s+(stop|end)(ed)?\b/.test(s) || /^(breakend|endbreak|breakstop|stopbreak)$/.test(c)) return { action: 'break_stop' };
 
-    if (/^lunch\s+start(ed)?\b/.test(s) || /^(lunchstart|startlunch)$/.test(c)) return { type: 'Clock', action: 'lunch_start' };
-    if (/^lunch\s+(stop|end)(ed)?\b/.test(s) || /^(lunchend|endlunch|lunchstop|stoplunch)$/.test(c)) return { type: 'Clock', action: 'lunch_stop' };
+    if (/^lunch\s+start(ed)?\b/.test(s) || /^(lunchstart|startlunch)$/.test(c)) return { action: 'lunch_start' };
+    if (/^lunch\s+(stop|end)(ed)?\b/.test(s) || /^(lunchend|endlunch|lunchstop|stoplunch)$/.test(c)) return { action: 'lunch_stop' };
 
-    if (/^drive\s+start(ed)?\b/.test(s) || /^(drivestart|startdrive)$/.test(c)) return { type: 'Clock', action: 'drive_start' };
-    if (/^drive\s+(stop|end)(ed)?\b/.test(s) || /^(driveend|enddrive|drivestop|stopdrive)$/.test(c)) return { type: 'Clock', action: 'drive_stop' };
+    if (/^drive\s+start(ed)?\b/.test(s) || /^(drivestart|startdrive)$/.test(c)) return { action: 'drive_start' };
+    if (/^drive\s+(stop|end)(ed)?\b/.test(s) || /^(driveend|enddrive|drivestop|stopdrive)$/.test(c)) return { action: 'drive_stop' };
 
     return null;
   })();
 
-  console.info('[TIME_V2_CIL]', {
-    flagsTimeV2: !!flags.timeclock_v2,
-    lc2,
-    matched: !!cil,
-    cil
-  });
+  console.info('[TIME_V2_CIL]', { flagsTimeV2: true, text2, matched: !!cil, cil });
 
   if (cil) {
     const ctx = {
       owner_id: req.ownerId,
-      user_id: req.userProfile?.id || req.userProfile?.user_id || null,
+      user_id: req.actorKey || req.ownerId || null,       // ✅ digits
       job_id: req.userProfile?.active_job_id || null,
-      job_name: req.userProfile?.active_job_name || 'Active Job',
-      created_by: req.userProfile?.id || req.userProfile?.user_id || null
+      created_by: req.actorKey || req.ownerId || null,    // ✅ digits
+      source_msg_id: messageSid || null,
+      meta: { job_name: req.userProfile?.active_job_name || null }
     };
 
-    console.info('[TIME_V2_CALL_HANDLECLOCK]', { owner_id: ctx.owner_id, user_id: ctx.user_id, action: cil.action });
-
-    const reply = await handleClock(ctx, cil);
+    const reply = await handleClock(ctx, { action: cil.action, at: new Date().toISOString() });
     let msg = reply?.text || 'Time logged.';
     msg += await glossaryNudgeFrom(text2);
     return ok(res, msg);
   }
 }
+
 
 
     if (looksTime && typeof handleTimeclock === 'function') {

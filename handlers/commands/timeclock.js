@@ -19,6 +19,7 @@
 const pg = require('../../services/postgres');
 const chrono = require('chrono-node');
 const { formatInTimeZone, zonedTimeToUtc } = require('date-fns-tz');
+const { getUserByName, getUserBasic } = require('../../services/users');
 
 // ---- safe Twilio helpers (do NOT crash if file moved/renamed) ----
 let sendBackfillConfirm = async () => null;
@@ -985,11 +986,27 @@ if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed
 
   const kind = parsed.action.split('_')[0]; // break | lunch | drive
 
-  // close any existing open child of same kind (fail-soft)
-  try {
-   await ensureNoOverlapChild(owner_id, shift.id, kind, atRaw);
-  } catch {}
+  // ✅ If already open, don't create a new one
+  const { rows: openKids } = await pg.query(
+    `SELECT id, start_at_utc
+       FROM public.time_entries_v2
+      WHERE owner_id=$1
+        AND parent_id=$2
+        AND kind=$3
+        AND end_at_utc IS NULL
+        AND deleted_at IS NULL
+      ORDER BY start_at_utc DESC
+      LIMIT 1`,
+    [owner_id, shift.id, kind]
+  );
 
+  const openKid = openKids?.[0] || null;
+  if (openKid) {
+    const label = kind === 'lunch' ? '🍽️ Lunch' : kind === 'break' ? '⏸️ Break' : '🚚 Drive';
+    return { text: `${label} already started at ${formatLocal(openKid.start_at_utc, tz)}.` };
+  }
+
+  // ✅ create a new child entry
   const inserted = await insertEntry({
     owner_id,
     user_id,
@@ -1004,19 +1021,19 @@ if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed
   });
 
   if (inserted) {
-  await emit(
-    { action: 'start', kind, at: occurredAtIso, shift_id: shift.id, child_id: inserted.id ?? null },
-    `${kind}_start`,
-    inserted.id ?? null,
-    shift.job_id || null
-  );
-}
-
+    await emit(
+      { action: 'start', kind, at: occurredAtIso, shift_id: shift.id, child_id: inserted.id ?? null },
+      `${kind}_start`,
+      inserted.id ?? null,
+      shift.job_id || null
+    );
+  }
 
   if (kind === 'lunch') return { text: `🍽️ Lunch started.` };
   if (kind === 'break') return { text: `⏸️ Break started.` };
   return { text: `🚚 Drive started.` };
 }
+
 
 // Segment STOP (break/lunch/drive)
 if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.action === 'drive_stop') {
@@ -1095,6 +1112,9 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
       );
     }
 
+    // ✅ Timesheet is handled by the v2 gate + handleTimesheetCommand (NOT here)
+    if (/^timesheet\b/i.test(String(text || '').trim())) return false;
+
     // Rate limit (fail-open)
     try {
       if (typeof pg.checkTimeEntryLimit === 'function') {
@@ -1103,22 +1123,21 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
       }
     } catch {}
 
-    // ---------------- intent detection (your existing detection stays) ----------------
+    // ---------------- intent detection ----------------
     const norm = normalizeTcText(text);
     const rawNorm = norm.raw;
     const compact = norm.compact;
 
-    const isUndo =
-      /^undo(\s+last)?$/i.test(rawNorm) ||
-      /^undo(last)?$/i.test(compact);
+    const isUndo = /^undo(\s+last)?$/i.test(rawNorm) || /^undo(last)?$/i.test(compact);
 
     const looksLikeTimeclock =
       isUndo ||
-      /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours|lunch|undo)\b/.test(rawNorm) ||
+      /\b(time\s*clock|timeclock|clock|punch|break|drive|hours|lunch|undo)\b/.test(rawNorm) ||
       /\b(clockin|clockout|punchin|punchout|shiftin|shiftout|undolast|breakstart|breakend|startbreak|lunchstart|lunchend)\b/.test(compact);
 
     if (!looksLikeTimeclock) return false;
-        // ✅ HARD STOP: v2 requires new schema
+
+    // ✅ HARD STOP: v2 requires new schema
     const shape = await detectTimeEntriesShape();
     if (shape !== 'new') {
       return twiml(
@@ -1135,8 +1154,7 @@ Detected: ${shape}`
     const explicitJobName = extractJobHint(text) || null;
     const jobName = await resolveJobNameForActor({ ownerId, identityKey: paUserId, explicitJobName });
 
-    // Target: for now timeclock always applies to the actor (digits)
-    // (multi-employee commands can be reintroduced later via a proper user directory)
+    // Target (actor only for now)
     const targetUserId = String(paUserId || '').trim();
     if (!targetUserId) return twiml(res, 'Timeclock: missing identity.');
 
@@ -1156,7 +1174,7 @@ Detected: ${shape}`
       : (RE_HAS_DRIVE.test(rawNorm) && (compactHasAny(compact, DRIVE_STOP_COMPACT)  || /\bdrive\s*(stop|end)(ed)?\b/i.test(rawNorm))) ? 'drive_stop'
       : null;
 
-    // If ambiguous segment intent, quick reply (unchanged)
+    // If ambiguous segment intent, quick reply
     if (!resolvedType && !isUndo) {
       const hasBreak = RE_HAS_BREAK.test(rawNorm);
       const hasDrive = RE_HAS_DRIVE.test(rawNorm);
@@ -1179,7 +1197,7 @@ Detected: ${shape}`
       return false;
     }
 
-    // Backfill confirm (>2 min away) stays (but payload stores CIL, not legacy type)
+    // Backfill confirm (>2 min away)
     if (tsOverrideIso) {
       const diffMin = Math.abs((new Date(tsOverrideIso) - now) / 60000);
       if (diffMin > 2) {
@@ -1190,7 +1208,6 @@ Detected: ${shape}`
               userId: targetUserId,
               kind: 'backfill_time',
               payload: {
-                // store resolvedType; later confirmation will also route through handleClock
                 resolvedType,
                 tsOverrideIso,
                 jobName,
@@ -1206,7 +1223,7 @@ Detected: ${shape}`
       }
     }
 
-    // ----------------- FORCE commands (still allowed, but no legacy writes) -----------------
+    // FORCE commands
     const mForceIn = rawNorm.match(/^force\s+clock\s+in\b/i);
     const mForceOut = rawNorm.match(/^force\s+clock\s+out\b/i);
 
@@ -1226,12 +1243,8 @@ Detected: ${shape}`
       return twiml(res, out?.text || '✅ Forced time action recorded.');
     }
 
-    // ----------------- UNDO (route through new schema) -----------------
+    // UNDO (new schema)
     if (isUndo) {
-      // If you have a v2 undo inside handleClock, use it.
-      // Otherwise: safest MVP is "undo not supported yet in v2" OR implement a new-schema delete.
-      // Here: implement a simple new-schema delete by source_msg_id cannot work;
-      // so we delete most recent entry for that user.
       try {
         const del = await pg.query(
           `DELETE FROM public.time_entries_v2
@@ -1248,10 +1261,7 @@ Detected: ${shape}`
 
         if (!del.rowCount) return twiml(res, `Nothing to undo.`);
 
-        const atHuman = del.rows[0].start_at_utc
-          ? formatLocal(del.rows[0].start_at_utc, tz)
-          : 'recently';
-
+        const atHuman = del.rows[0].start_at_utc ? formatLocal(del.rows[0].start_at_utc, tz) : 'recently';
         return twiml(res, `Undid last time entry (${del.rows[0].kind || 'entry'}) from ${atHuman}.`);
       } catch {
         return twiml(res, `Undo isn't available yet.`);
@@ -1280,4 +1290,262 @@ Detected: ${shape}`
   }
 }
 
-module.exports = { handleTimeclock, handleClock };
+/* ---------------- Timesheet (TOP-LEVEL ONLY — DO NOT PUT INSIDE handleTimeclock) ----------------
+   NOTE: This assumes formatInTimeZone + zonedTimeToUtc are already in scope in this file.
+   If not, add near your other requires:
+   const { formatInTimeZone, zonedTimeToUtc } = require('date-fns-tz');
+*/
+
+const DEFAULT_TZ = 'America/Toronto';
+
+function minsToHM(mins) {
+  const m = Math.max(0, Number(mins) || 0);
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${h}h ${mm}m`;
+}
+
+function fmtDateTime(ts, tz) {
+  try {
+    const d = new Date(ts);
+    return formatInTimeZone(d, tz, "EEE MMM dd, h:mmaaa").replace('AM', 'am').replace('PM', 'pm');
+  } catch {
+    return String(ts);
+  }
+}
+
+function startOfDayUtcIso(refDate, tz) {
+  const y = Number(formatInTimeZone(refDate, tz, 'yyyy'));
+  const m = Number(formatInTimeZone(refDate, tz, 'MM'));
+  const d = Number(formatInTimeZone(refDate, tz, 'dd'));
+  const local = `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')} 00:00:00`;
+  return zonedTimeToUtc(local, tz).toISOString();
+}
+
+function addDaysUtcIso(utcIso, days) {
+  const dt = new Date(utcIso);
+  dt.setUTCDate(dt.getUTCDate() + Number(days || 0));
+  return dt.toISOString();
+}
+
+function startOfWeekUtcIso(refDate, tz) {
+  const localDow = Number(formatInTimeZone(refDate, tz, 'i')); // 1=Mon..7=Sun
+  const daysSinceMon = localDow - 1;
+  const sod = startOfDayUtcIso(refDate, tz);
+  return addDaysUtcIso(sod, -daysSinceMon);
+}
+
+function computeRangeUtc(mode, tz, now = new Date()) {
+  const zone = tz || DEFAULT_TZ;
+
+  if (mode === 'today') {
+    const startUtcIso = startOfDayUtcIso(now, zone);
+    const endUtcIso = addDaysUtcIso(startUtcIso, 1);
+    return { startUtcIso, endUtcIso, label: `Today (${zone})` };
+  }
+
+  if (mode === 'last_week') {
+    const thisWeekStart = startOfWeekUtcIso(now, zone);
+    const startUtcIso = addDaysUtcIso(thisWeekStart, -7);
+    const endUtcIso = thisWeekStart;
+    return { startUtcIso, endUtcIso, label: `Last week (${zone})` };
+  }
+
+  const startUtcIso = startOfWeekUtcIso(now, zone);
+  const endUtcIso = addDaysUtcIso(startUtcIso, 7);
+  return { startUtcIso, endUtcIso, label: `This week (${zone})` };
+}
+
+// ---------------- Name resolution (wired to services/users.js) ----------------
+
+const _nameCache = new Map();     // key: `${owner_id}:${q}` -> [user_id]
+const _displayCache = new Map();  // key: `${owner_id}:${user_id}` -> "Name"
+
+function _cacheKey(owner_id, s) {
+  return `${String(owner_id || '').trim()}:${String(s || '').trim().toLowerCase()}`;
+}
+
+async function resolveUserIdsByName(owner_id, nameQuery, actorKey = null) {
+  const ownerId = String(owner_id || '').trim();
+  const qRaw = String(nameQuery || '').trim();
+  const q = qRaw.toLowerCase();
+
+  if (!ownerId || !qRaw) return null;
+
+  // aliases
+  if (q === 'crew') return ['crew'];
+  if ((q === 'me' || q === 'my' || q === 'myself') && actorKey) return [String(actorKey).trim()];
+
+  const ck = _cacheKey(ownerId, qRaw);
+  if (_nameCache.has(ck)) return _nameCache.get(ck);
+
+  // 1) If they typed digits, treat as user_id
+  if (/^\d+$/.test(qRaw)) {
+    const out = [qRaw];
+    _nameCache.set(ck, out);
+    return out;
+  }
+
+  // 2) Exact match using your helper (case-insensitive exact)
+  try {
+    const exact = await getUserByName(ownerId, qRaw);
+    if (exact?.user_id) {
+      const out = [String(exact.user_id)];
+      _nameCache.set(ck, out);
+      return out;
+    }
+  } catch {}
+
+  // 3) Fuzzy fallback: find "Scott" inside "Scott Jutras"
+  // Only searches team members under this owner.
+  try {
+    const like = `%${qRaw.replace(/%/g, '').replace(/_/g, '').trim()}%`;
+    const { rows } = await pg.query(
+      `SELECT user_id, name
+         FROM public.users
+        WHERE owner_id = $1
+          AND is_team_member = true
+          AND (lower(name) ILIKE lower($2))
+        ORDER BY name ASC
+        LIMIT 5`,
+      [ownerId, like]
+    );
+
+    if (rows?.length === 1) {
+      const out = [String(rows[0].user_id)];
+      _nameCache.set(ck, out);
+      return out;
+    }
+
+    // If multiple hits, fail-soft with null (caller prints "I don't recognize")
+    // You can later upgrade this to show a picker.
+  } catch {}
+
+  _nameCache.set(ck, null);
+  return null;
+}
+
+async function displayNameForUserId(owner_id, user_id) {
+  const ownerId = String(owner_id || '').trim();
+  const uid = String(user_id || '').trim();
+  if (!uid) return 'Unknown';
+
+  if (uid.toLowerCase() === 'crew') return 'Crew';
+
+  const ck = _cacheKey(ownerId, uid);
+  if (_displayCache.has(ck)) return _displayCache.get(ck);
+
+  // If it's digits, fetch name from users table
+  if (/^\d+$/.test(uid)) {
+    try {
+      const u = await getUserBasic(uid);
+      const nm = String(u?.name || '').trim();
+      if (nm) {
+        _displayCache.set(ck, nm);
+        return nm;
+      }
+    } catch {}
+  }
+
+  // fallback: show id
+  _displayCache.set(ck, uid);
+  return uid;
+}
+
+
+async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
+  const owner_id = String(ownerId || '').trim();
+  if (!owner_id) return false;
+
+  const tz = req?.userProfile?.tz || req?.userProfile?.timezone || DEFAULT_TZ;
+
+  const s = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!/^timesheet\b/.test(s)) return false;
+
+  const range = (() => {
+    if (/^timesheet\s+today\b/.test(s)) return { mode: 'today' };
+    if (/^timesheet\s+last\s+week\b/.test(s)) return { mode: 'last_week' };
+    if (/^timesheet\s+week\b/.test(s)) return { mode: 'week' };
+    const m = s.match(/^timesheet\s+(.+?)\s*$/);
+    if (m && m[1]) return { mode: 'week', who: m[1].trim() };
+    return { mode: 'week' };
+  })();
+
+  const { startUtcIso, endUtcIso, label } = computeRangeUtc(range.mode, tz, new Date());
+
+  let filterUserIds = null;
+  if (range.who) {
+    const who = String(range.who || '').toLowerCase().trim();
+    if (/^\d+$/.test(who)) filterUserIds = [who];
+    else if (who === 'crew') filterUserIds = ['crew'];
+    else {
+      const hit = await resolveUserIdsByName(owner_id, who, actorKey);
+      filterUserIds = hit?.length ? hit : null;
+      if (!filterUserIds) {
+        return twiml(
+          res,
+          `I don’t recognize "${range.who}".\n\nTry:\n- timesheet today\n- timesheet week\n- timesheet last week\n- timesheet Crew`
+        );
+      }
+    }
+  }
+
+  const params = [owner_id, startUtcIso, endUtcIso];
+  let sql = `
+    SELECT user_id,
+           start_at_utc,
+           end_at_utc,
+           coalesce((meta->'calc'->>'paidMinutes')::int, 0) AS paid_minutes,
+           coalesce((meta->'calc'->>'driveTotal')::int, 0) AS drive_minutes
+      FROM public.time_entries_v2
+     WHERE owner_id = $1
+       AND kind = 'shift'
+       AND deleted_at IS NULL
+       AND end_at_utc IS NOT NULL
+       AND start_at_utc >= $2::timestamptz
+       AND start_at_utc <  $3::timestamptz
+  `;
+
+  if (filterUserIds?.length) {
+    params.push(filterUserIds);
+    sql += ` AND user_id = ANY($4::text[]) `;
+  }
+
+  sql += ` ORDER BY user_id, start_at_utc ASC`;
+
+  const { rows } = await pg.query(sql, params);
+
+  if (!rows?.length) return twiml(res, `No shifts found for ${label}.`);
+
+  const byUser = new Map();
+  for (const r of rows) {
+    const uid = String(r.user_id || 'unknown');
+    if (!byUser.has(uid)) byUser.set(uid, { paid: 0, drive: 0 });
+    const agg = byUser.get(uid);
+    agg.paid += Number(r.paid_minutes || 0);
+    agg.drive += Number(r.drive_minutes || 0);
+  }
+
+  const lines = [];
+  lines.push(`🧾 Timesheet — ${label}`);
+  lines.push(`Range: ${fmtDateTime(startUtcIso, tz)} → ${fmtDateTime(endUtcIso, tz)}`);
+  lines.push('');
+
+  for (const [uid, agg] of byUser.entries()) {
+    const name = await displayNameForUserId(owner_id, uid);
+    lines.push(`• ${name}: ${minsToHM(agg.paid)} paid` + (agg.drive ? ` (drive ${minsToHM(agg.drive)})` : ''));
+  }
+
+  lines.push('');
+  lines.push(`Try: "timesheet today" | "timesheet week" | "timesheet Crew"`);
+
+  return twiml(res, lines.join('\n'));
+}
+
+// ✅ Export without clobbering
+module.exports = {
+  handleTimeclock,
+  handleClock,
+  handleTimesheetCommand
+};
+

@@ -56,9 +56,15 @@ pool.on('connect', async (client) => {
     await client.query(`SET TIME ZONE 'UTC'`);
     await client.query(`SET intervalstyle = 'iso_8601'`);
   } catch (e) {
-    console.warn('[PG] connect session prep failed:', e?.message);
+    const msg = String(e?.message || '');
+    const transient = /terminated|ECONNRESET|EPIPE|server closed the connection|Connection terminated/i.test(msg);
+    if (!transient) {
+      console.warn('[PG] connect session prep failed:', msg);
+    }
+    // transient: ignore; next query retry will recover
   }
 });
+
 
 pool.on('error', (err) => {
   console.error('[PG] idle client error:', err?.message);

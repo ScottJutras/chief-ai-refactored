@@ -395,7 +395,10 @@ function extractStampedJobNo(title = '') {
 
 
 
-
+function looksTimesheetCommand(str) {
+  const s = String(str || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  return /^timesheet\b/.test(s);
+}
 
 /* ---------------- NL heuristics for expense/revenue ---------------- */
 
@@ -2097,34 +2100,49 @@ if (looksExpense) {
     const s = String(lc2 || '').trim();
 console.info('[TIME_V2_GATE]', { timeclock_v2: !!flags.timeclock_v2, isHardTimeCommand, lc2 });
 
-if (flags.timeclock_v2) {
-  const cil = (() => {
-    const s0 = String(text2 || '').toLowerCase().trim();
-    const s = s0.replace(/\s+/g, ' ');
-    const c = s0.replace(/\s+/g, '');
+if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
+  const s0 = String(text2 || '').trim();
 
-    // Undo stays legacy handler (handleTimeclock)
+  // ✅ Timesheet routes even without Clock CIL
+  if (looksTimesheetCommand(s0)) {
+    try {
+      const out = await handleTimesheetCommand({
+        ownerId: req.ownerId,
+        actorKey: req.actorKey,           // digits
+        from: req.from,                   // e164
+        text: s0,
+        req,
+        res
+      });
+      if (out !== false) return; // handler already responded (twiml or json)
+    } catch (e) {
+      console.error('[TIMESHEET] error:', e?.message);
+      return ok(res, 'Timesheet error. Try again.');
+    }
+  }
+
+  // existing Clock CIL builder (your completed block)
+  const cil = (() => {
+    const s = String(text2 || '').toLowerCase().trim().replace(/\s+/g, ' ');
+    const c = s.replace(/\s+/g, '');
+
     if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(c)) return null;
 
-    // Clock in/out
     if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(c)) return { type: 'Clock', action: 'in' };
     if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(c)) return { type: 'Clock', action: 'out' };
 
-    // Break
     if (/^break\s+start(ed)?\b/.test(s) || /^(breakstart|startbreak)$/.test(c)) return { type: 'Clock', action: 'break_start' };
     if (/^break\s+(stop|end)(ed)?\b/.test(s) || /^(breakend|endbreak|breakstop|stopbreak)$/.test(c)) return { type: 'Clock', action: 'break_stop' };
 
-    // Lunch
     if (/^lunch\s+start(ed)?\b/.test(s) || /^(lunchstart|startlunch)$/.test(c)) return { type: 'Clock', action: 'lunch_start' };
     if (/^lunch\s+(stop|end)(ed)?\b/.test(s) || /^(lunchend|endlunch|lunchstop|stoplunch)$/.test(c)) return { type: 'Clock', action: 'lunch_stop' };
 
-    // Drive
     if (/^drive\s+start(ed)?\b/.test(s) || /^(drivestart|startdrive)$/.test(c)) return { type: 'Clock', action: 'drive_start' };
     if (/^drive\s+(stop|end)(ed)?\b/.test(s) || /^(driveend|enddrive|drivestop|stopdrive)$/.test(c)) return { type: 'Clock', action: 'drive_stop' };
 
     return null;
   })();
-
+  
   console.info('[TIME_V2_CIL]', { flagsTimeV2: true, text2, matched: !!cil, cil });
 
   if (cil) {

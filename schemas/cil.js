@@ -8,11 +8,17 @@ const nowOrIso = z.union([z.literal('now'), iso]).default('now');
 
 const ClockCIL = z.object({
   type: z.literal('Clock'),
-  action: z.enum(['in', 'out', 'break_start', 'break_stop', 'drive_start', 'drive_stop']),
+  action: z.enum([
+    'in', 'out',
+    'break_start', 'break_stop',
+    'lunch_start', 'lunch_stop',
+    'drive_start', 'drive_stop'
+  ]),
   at: nowOrIso,
   job: z.string().nullable().optional(),
-  name: z.string().nullable().optional(),
+  target_user: z.string().nullable().optional(),
 });
+
 
 const CreateTaskCIL = z.object({
   type: z.literal('CreateTask'),

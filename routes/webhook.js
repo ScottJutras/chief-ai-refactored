@@ -197,8 +197,7 @@ function looksHardTimeCommand(str) {
   if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(compact)) return true;
   if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(compact)) return true;
 
-  // break / lunch / drive (space + no-space + swapped order)
-  // Examples: "break start", "breakstart", "startbreak", "break end", "breakend", "endbreak"
+  // segments (space form)
   const isSeg =
     /^break\s+(start|stop|end)(ed)?\b/.test(s) ||
     /^lunch\s+(start|stop|end)(ed)?\b/.test(s) ||
@@ -206,13 +205,15 @@ function looksHardTimeCommand(str) {
 
   if (isSeg) return true;
 
+  // segments (compact form)
   if (
-    /^(break|lunch|drive)(start|stop|end)(ed)?$/.test(compact) ||   // breakstart, lunchend
-    /^(start|stop|end)(break|lunch|drive)(ed)?$/.test(compact)      // startbreak, endlunch
+    /^(break|lunch|drive)(start|stop|end)(ed)?$/.test(compact) ||
+    /^(start|stop|end)(break|lunch|drive)(ed)?$/.test(compact)
   ) return true;
 
   return false;
 }
+
 
 // Allowed while a pending expense/revenue exists (so we don't nudge-block them)
 function isAllowedWhilePending(lc) {
@@ -914,26 +915,21 @@ router.all('*', (req, res, next) => {
 
 router.use((req, _res, next) => {
   // Raw Twilio From (may be "whatsapp:+1...", "+1...", "1...", etc)
-  const rawFrom = String(req.body?.From || '').trim();
+ const rawFrom = String(req.body?.From || '').trim();
 
-  // ✅ Canonical E.164 (no "whatsapp:" prefix) for routing/sending
-  // normalizeE164 should return like "+1905...." OR null
-  const e164 = rawFrom ? normalizeE164(rawFrom) : null;
+const e164 = rawFrom ? normalizeE164(rawFrom) : null;
 
-  // ✅ Canonical digits-only key for *all storage/state/PA/CIL*
-  const digits =
-    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(rawFrom)) ||
-    String(rawFrom).replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '').trim() ||
-    null;
+const digitsRaw =
+  (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(rawFrom)) ||
+  String(rawFrom).replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '').trim() ||
+  '';
 
-  // Keep both available
-  req.from = e164;            // e.g. "+19053279955"
-  req.actorKey = digits;      // e.g. "19053279955"
+const digits = /^\d+$/.test(digitsRaw) ? digitsRaw : null;
 
-  // Owner id semantics (unchanged, but be explicit)
-  // If your system expects digits as ownerId, use actorKey.
-  // If your system expects e164, use req.from.
-  req.ownerId = req.actorKey || req.from || null;
+req.from = e164;
+req.actorKey = digits;
+req.ownerId = req.actorKey || req.from || null;
+
 
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();
   const host = (req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
@@ -2110,17 +2106,21 @@ if (flags.timeclock_v2) {
     // Undo stays legacy handler (handleTimeclock)
     if (/^undo(\s+last)?$/.test(s) || /^undolast$/.test(c)) return null;
 
-    if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(c)) return { action: 'in' };
-    if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(c)) return { action: 'out' };
+    // Clock in/out
+    if (/^clock\s*in\b/.test(s) || /^clockin\b/.test(c)) return { type: 'Clock', action: 'in' };
+    if (/^clock\s*out\b/.test(s) || /^clockout\b/.test(c)) return { type: 'Clock', action: 'out' };
 
-    if (/^break\s+start(ed)?\b/.test(s) || /^(breakstart|startbreak)$/.test(c)) return { action: 'break_start' };
-    if (/^break\s+(stop|end)(ed)?\b/.test(s) || /^(breakend|endbreak|breakstop|stopbreak)$/.test(c)) return { action: 'break_stop' };
+    // Break
+    if (/^break\s+start(ed)?\b/.test(s) || /^(breakstart|startbreak)$/.test(c)) return { type: 'Clock', action: 'break_start' };
+    if (/^break\s+(stop|end)(ed)?\b/.test(s) || /^(breakend|endbreak|breakstop|stopbreak)$/.test(c)) return { type: 'Clock', action: 'break_stop' };
 
-    if (/^lunch\s+start(ed)?\b/.test(s) || /^(lunchstart|startlunch)$/.test(c)) return { action: 'lunch_start' };
-    if (/^lunch\s+(stop|end)(ed)?\b/.test(s) || /^(lunchend|endlunch|lunchstop|stoplunch)$/.test(c)) return { action: 'lunch_stop' };
+    // Lunch
+    if (/^lunch\s+start(ed)?\b/.test(s) || /^(lunchstart|startlunch)$/.test(c)) return { type: 'Clock', action: 'lunch_start' };
+    if (/^lunch\s+(stop|end)(ed)?\b/.test(s) || /^(lunchend|endlunch|lunchstop|stoplunch)$/.test(c)) return { type: 'Clock', action: 'lunch_stop' };
 
-    if (/^drive\s+start(ed)?\b/.test(s) || /^(drivestart|startdrive)$/.test(c)) return { action: 'drive_start' };
-    if (/^drive\s+(stop|end)(ed)?\b/.test(s) || /^(driveend|enddrive|drivestop|stopdrive)$/.test(c)) return { action: 'drive_stop' };
+    // Drive
+    if (/^drive\s+start(ed)?\b/.test(s) || /^(drivestart|startdrive)$/.test(c)) return { type: 'Clock', action: 'drive_start' };
+    if (/^drive\s+(stop|end)(ed)?\b/.test(s) || /^(driveend|enddrive|drivestop|stopdrive)$/.test(c)) return { type: 'Clock', action: 'drive_stop' };
 
     return null;
   })();
@@ -2128,16 +2128,30 @@ if (flags.timeclock_v2) {
   console.info('[TIME_V2_CIL]', { flagsTimeV2: true, text2, matched: !!cil, cil });
 
   if (cil) {
+    const nowIso = new Date().toISOString();
+
+    // IMPORTANT: in webhook.js req.ownerId is digits (tenant owner key), not UUID
+    // For timeclock v2 ctx, user_id / created_by must be digits (WaId).
     const ctx = {
       owner_id: req.ownerId,
-      user_id: req.actorKey || req.ownerId || null,       // ✅ digits
+      user_id: req.actorKey || null,          // ✅ digits (WaId) — do NOT fall back to owner_id
       job_id: req.userProfile?.active_job_id || null,
-      created_by: req.actorKey || req.ownerId || null,    // ✅ digits
+      created_by: req.actorKey || null,       // ✅ digits
       source_msg_id: messageSid || null,
       meta: { job_name: req.userProfile?.active_job_name || null }
     };
 
-    const reply = await handleClock(ctx, { action: cil.action, at: new Date().toISOString() });
+    // If we still don't have an actorKey, fail-soft but do not write bad ids
+    if (!ctx.user_id) {
+      let msg = 'Timeclock: missing user identity (WaId).';
+      msg += await glossaryNudgeFrom(text2);
+      return ok(res, msg);
+    }
+
+    // ensure at is present and valid for schema ("now" or ISO)
+    const cilToSend = { ...cil, at: nowIso };
+
+    const reply = await handleClock(ctx, cilToSend);
     let msg = reply?.text || 'Time logged.';
     msg += await glossaryNudgeFrom(text2);
     return ok(res, msg);

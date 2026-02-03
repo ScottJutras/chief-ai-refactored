@@ -147,12 +147,13 @@ async function hasColumn(table, col) {
 async function hasTimeEntriesSourceMsgIdColumn() {
   if (_hasTimeEntriesSourceMsgIdCol !== null) return _hasTimeEntriesSourceMsgIdCol;
   try {
-    _hasTimeEntriesSourceMsgIdCol = await hasColumn('time_entries', 'source_msg_id');
+    _hasTimeEntriesSourceMsgIdCol = await hasColumn('time_entries_v2', 'source_msg_id');
   } catch {
     _hasTimeEntriesSourceMsgIdCol = false;
   }
   return _hasTimeEntriesSourceMsgIdCol;
 }
+
 
 async function detectTimeEntriesShape() {
   if (_timeEntriesShape) return _timeEntriesShape;
@@ -608,7 +609,10 @@ function compactHasAny(compact, patterns) {
   return patterns.some(p => compact.includes(p));
 }
 function buildClockCilFromResolvedType(resolvedType, atIso) {
-  // Maps legacy resolved types -> CIL action strings used by handleClock
+  const at = atIso && !Number.isNaN(Date.parse(String(atIso)))
+    ? new Date(String(atIso)).toISOString()
+    : new Date().toISOString();
+
   const map = {
     clock_in: 'in',
     clock_out: 'out',
@@ -619,15 +623,13 @@ function buildClockCilFromResolvedType(resolvedType, atIso) {
     drive_start: 'drive_start',
     drive_stop: 'drive_stop'
   };
-  const action = map[String(resolvedType || '').trim()];
+
+  const action = map[String(resolvedType || '').trim()] || null;
   if (!action) return null;
 
-  return {
-    // must satisfy ClockCIL.parse(cil)
-    action,
-    at: atIso || new Date().toISOString()
-  };
+  return { type: 'Clock', action, at };
 }
+
 
 async function execClockViaCil({
   ownerId,
@@ -754,15 +756,15 @@ async function getCurrentState(ownerId, employeeName) {
 
 
   if (shape === 'legacy') {
-    const { rows } = await pg.query(
-      `SELECT type, timestamp
-         FROM public.time_entries_v2
-        WHERE owner_id = $1
-          AND lower(employee_name) = lower($2)
-        ORDER BY timestamp ASC
-        LIMIT 200`,
-      [String(ownerId || '').trim(), employeeName]
-    );
+  const { rows } = await pg.query(
+    `SELECT type, timestamp
+       FROM public.time_entries
+      WHERE owner_id = $1
+        AND lower(employee_name) = lower($2)
+      ORDER BY timestamp ASC
+      LIMIT 200`,
+    [String(ownerId || '').trim(), employeeName]
+  );
 
     let hasOpenShift = false;
     let openBreak = false;

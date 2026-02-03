@@ -1546,6 +1546,7 @@ async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
 module.exports = {
   handleTimeclock,
   handleClock,
-  handleTimesheetCommand
+  handleTimesheetCommand,
 };
+
 

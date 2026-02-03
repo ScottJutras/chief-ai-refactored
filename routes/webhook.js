@@ -18,7 +18,9 @@ const router = express.Router();
 const app = express();
 
 const { flags } = require('../config/flags');
-const { handleClock } = require('../handlers/commands/timeclock'); // v2 handler (optional)
+const { handleClock, handleTimesheetCommand } = require('../handlers/commands/timeclock'); // v2 handler (optional)
+console.log('[DEBUG] handleTimesheetCommand?', typeof handleTimesheetCommand);
+
 const { handleForecast } = require('../handlers/commands/forecast');
 const { getOwnerUuidForPhone } = require('../services/owners'); // optional map phone -> uuid (store separately)
 
@@ -2142,7 +2144,7 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
 
     return null;
   })();
-  
+
   console.info('[TIME_V2_CIL]', { flagsTimeV2: true, text2, matched: !!cil, cil });
 
   if (cil) {

@@ -2435,18 +2435,29 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
   const targetUserId = String(targets[0] || actorId).replace(/\D/g, '') || actorId;
   const ctx = { ...baseCtx, user_id: targetUserId };
 
-  const reply = await handleClock(ctx, cilToSend);
+  const baseText =
+  (typeof reply === 'string' && reply.trim())
+    ? reply.trim()
+    : (reply && typeof reply === 'object' && typeof reply.text === 'string' ? reply.text.trim() : '');
 
-  let msg = reply?.text || 'Time logged.';
-  msg += await glossaryNudgeFrom(text2);
+let msg = baseText || 'Time logged.';
+msg += await glossaryNudgeFrom(text2);
 
-  // Use TwiML wrapper so actor+target names are injected
- return twimlWithTargetName(res, msg, {
+const targetFromReply =
+  (reply && typeof reply === 'object' && reply.targetUserId)
+    ? String(reply.targetUserId).replace(/\D/g, '')
+    : '';
+
+const targetUserIdSafe =
+  targetFromReply || String(targetUserId || '').replace(/\D/g, '') || actorId;
+
+return twimlWithTargetName(res, msg, {
   ownerId: ownerDigits,
   actorId,
-  targetUserId,
+  targetUserId: targetUserIdSafe,
   fallbackName: req.userProfile?.name || req.body?.ProfileName || ''
 });
+
 }
 
 }

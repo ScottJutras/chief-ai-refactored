@@ -999,11 +999,27 @@ async function getCurrentState(ownerId, employeeName) {
 /* ---------------- CIL handler (new schema path) ---------------- */
 
 async function handleClock(ctx, cil) {
+  // --- identity / return helper (must exist before any early returns) ---
+  const owner_id = String(ctx?.owner_id || '').trim();
+  const user_id = String(ctx?.user_id || '').trim();
+  const targetUserId = user_id || null;
+
+  // allow future extra fields without refactoring again
+  const ret = (text, extra = {}) => ({ text: String(text || '').trim(), targetUserId, ...extra });
+
+  if (!owner_id || !user_id) return ret('Timeclock: missing owner_id or user_id.');
+
   if (!ClockCIL) {
-    return ret( 'Timeclock: CIL schema missing. Please update schemas/cil.clock.' );
+    return ret('Timeclock: CIL schema missing. Please update schemas/cil.clock.');
   }
 
-  const parsed = ClockCIL.parse(cil); // throws on invalid
+  // --- parse / timestamps ---
+  let parsed;
+  try {
+    parsed = ClockCIL.parse(cil); // throws on invalid
+  } catch (e) {
+    return ret('Timeclock: invalid command.');
+  }
 
   const nowIso = new Date().toISOString();
   const atRaw = parsed.at || nowIso;
@@ -1013,240 +1029,222 @@ async function handleClock(ctx, cil) {
       ? new Date(String(atRaw)).toISOString()
       : new Date().toISOString();
 
-  const owner_id = String(ctx.owner_id || '').trim();
-const user_id = String(ctx.user_id || '').trim();
-const targetUserId = user_id || null;
-const ret = (text, extra = {}) => ({ text, targetUserId, ...extra });
-const job_id = ctx.job_id || null;
+  const job_id = ctx.job_id || null;
 
-const created_by_raw = ctx.created_by || null;
-const created_by = /^\d+$/.test(String(created_by_raw || '').trim())
-  ? String(created_by_raw).trim()
-  : (user_id || null);
+  const created_by_raw = ctx.created_by || null;
+  const created_by = /^\d+$/.test(String(created_by_raw || '').trim())
+    ? String(created_by_raw).trim()
+    : (user_id || null);
 
-const source_msg_id = ctx.source_msg_id ? String(ctx.source_msg_id).trim() : null;
-const tz = ctx.tz || 'UTC';
-
-
-  if (!owner_id || !user_id) return ret('Timeclock: missing owner_id or user_id.');
-
+  const source_msg_id = ctx.source_msg_id ? String(ctx.source_msg_id).trim() : null;
+  const tz = ctx.tz || 'UTC';
 
   // ---------------- helpers ----------------
 
   async function emit(payload, dedupeSuffix, entity_id = null, jobId = null) {
-  try {
-    await pg.insertFactEvent({
-      owner_id,
-      actor_key: user_id,
+    try {
+      await pg.insertFactEvent({
+        owner_id,
+        actor_key: user_id,
 
-      event_type: 'timeclock.logged',
-      entity_type: 'time_entry',
-      entity_id: entity_id != null ? String(entity_id) : null,
-      entity_no: null,
+        event_type: 'timeclock.logged',
+        entity_type: 'time_entry',
+        entity_id: entity_id != null ? String(entity_id) : null,
+        entity_no: null,
 
-      job_id: jobId || null,
+        job_id: jobId || null,
 
-      occurred_at: occurredAtIso,
-      source_msg_id,
-      source_kind: 'whatsapp_text',
+        occurred_at: occurredAtIso,
+        source_msg_id,
+        source_kind: 'whatsapp_text',
 
-      event_payload: payload,
+        event_payload: payload,
 
-      dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${dedupeSuffix}`
-    });
-  } catch (e) {
-    console.warn('[FACT_EVENT] timeclock.logged insert failed (ignored):', e?.message);
+        dedupe_key: `timeclock.logged:${String(source_msg_id || 'no_msg')}:${dedupeSuffix}`
+      });
+    } catch (e) {
+      console.warn('[FACT_EVENT] timeclock.logged insert failed (ignored):', e?.message);
+    }
   }
-}
-
 
   async function requireOpenShift() {
     const shift = await getOpenShift(owner_id, user_id);
-    if (!shift) return { shift: null, text: `You’re not clocked in.` };
-    return { shift, text: null };
+    if (!shift) return { shift: null, errText: `You’re not clocked in.` };
+    return { shift, errText: null };
   }
 
   // ---------------- actions ----------------
 
-if (parsed.action === 'in') {
-  const open = await getOpenShift(owner_id, user_id);
-  if (open) return ret( `You’re already clocked in since ${formatLocal(open.start_at_utc, tz)}.` );
+  if (parsed.action === 'in') {
+    const open = await getOpenShift(owner_id, user_id);
+    if (open) return ret(`You’re already clocked in since ${formatLocal(open.start_at_utc, tz)}.`);
 
-  const inserted = await insertEntry({
-    owner_id,
-    user_id,
-    job_id,
-    parent_id: null,
-    kind: 'shift',
-    start_at_utc: atRaw,
-    end_at_utc: null,
-    created_by,
-    meta: ctx.meta || {},
-    source_msg_id
-  });
+    const inserted = await insertEntry({
+      owner_id,
+      user_id,
+      job_id,
+      parent_id: null,
+      kind: 'shift',
+      start_at_utc: atRaw,
+      end_at_utc: null,
+      created_by,
+      meta: ctx.meta || {},
+      source_msg_id
+    });
 
-  if (inserted) {
-  await emit(
-    { action: 'in', kind: 'shift', at: occurredAtIso, shift_id: inserted.id ?? null },
-    'clock_in',
-    inserted.id ?? null,
-    job_id || null
-  );
-}
+    if (inserted) {
+      await emit(
+        { action: 'in', kind: 'shift', at: occurredAtIso, shift_id: inserted.id ?? null },
+        'clock_in',
+        inserted.id ?? null,
+        job_id || null
+      );
+    }
 
+    return ret(`✅ Clocked in at ${toHumanTime(occurredAtIso, tz)}.`);
+  }
 
-  return ret( `✅ Clocked in at ${toHumanTime(occurredAtIso, tz)}.` );
-}
+  if (parsed.action === 'out') {
+    const { shift, errText } = await requireOpenShift();
+    if (!shift) return ret(errText);
 
-if (parsed.action === 'out') {
-  const { shift, text } = await requireOpenShift();
-  if (!shift) return { text };
-
-  // close any open children
-  await pg.query(
-    `UPDATE public.time_entries_v2
-        SET end_at_utc=$3
-      WHERE owner_id=$1 AND parent_id=$2 AND end_at_utc IS NULL`,
-    [owner_id, shift.id, atRaw]
-  );
-
-  await closeEntryById(owner_id, shift.id, atRaw);
-
-  const policy = await fetchPolicy(owner_id);
-  const entries = await entriesForShift(owner_id, shift.id);
-
-  let calc = { paidMinutes: 0, unpaidLunch: 0, unpaidBreak: 0 };
-  try {
-    // eslint-disable-next-line global-require
-    const { computeShiftCalc } = require('../../services/timecalc');
-    calc = computeShiftCalc(entries, policy);
-  } catch {}
-
-  try {
+    // close any open children
     await pg.query(
       `UPDATE public.time_entries_v2
-          SET meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{calc}', $3::jsonb)
-        WHERE id=$1 AND owner_id=$2`,
-      [shift.id, owner_id, JSON.stringify(calc)]
+          SET end_at_utc=$3
+        WHERE owner_id=$1 AND parent_id=$2 AND end_at_utc IS NULL`,
+      [owner_id, shift.id, atRaw]
     );
-  } catch {}
 
-  const day = new Date(shift.start_at_utc).toISOString().slice(0, 10);
-  await touchKPI(owner_id, shift.job_id, day);
+    await closeEntryById(owner_id, shift.id, atRaw);
 
- await emit(
-  { action: 'out', kind: 'shift', at: occurredAtIso, shift_id: shift.id, calc },
-  'clock_out',
-  shift.id,
-  shift.job_id || null
-);
+    const policy = await fetchPolicy(owner_id);
+    const entries = await entriesForShift(owner_id, shift.id);
 
+    let calc = { paidMinutes: 0, unpaidLunch: 0, unpaidBreak: 0 };
+    try {
+      // eslint-disable-next-line global-require
+      const { computeShiftCalc } = require('../../services/timecalc');
+      calc = computeShiftCalc(entries, policy);
+    } catch {}
 
-  const msg =
-    calc.unpaidLunch > 0 || calc.unpaidBreak > 0
-      ? `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m (policy deducted lunch ${calc.unpaidLunch}m, breaks ${calc.unpaidBreak}m).`
-      : `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m.`;
+    try {
+      await pg.query(
+        `UPDATE public.time_entries_v2
+            SET meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{calc}', $3::jsonb)
+          WHERE id=$1 AND owner_id=$2`,
+        [shift.id, owner_id, JSON.stringify(calc)]
+      );
+    } catch {}
 
-  return ret( `✅ Clocked out. ${msg}` );
-}
+    const day = new Date(shift.start_at_utc).toISOString().slice(0, 10);
+    await touchKPI(owner_id, shift.job_id, day);
 
-// Segment START (break/lunch/drive)
-if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed.action === 'drive_start') {
-  const { shift, text } = await requireOpenShift();
-  if (!shift) return { text };
-
-  const kind = parsed.action.split('_')[0]; // break | lunch | drive
-
-  // ✅ If already open, don't create a new one
-  const { rows: openKids } = await pg.query(
-    `SELECT id, start_at_utc
-       FROM public.time_entries_v2
-      WHERE owner_id=$1
-        AND parent_id=$2
-        AND kind=$3
-        AND end_at_utc IS NULL
-        AND deleted_at IS NULL
-      ORDER BY start_at_utc DESC
-      LIMIT 1`,
-    [owner_id, shift.id, kind]
-  );
-
-  const openKid = openKids?.[0] || null;
-  if (openKid) {
-    const label = kind === 'lunch' ? '🍽️ Lunch' : kind === 'break' ? '⏸️ Break' : '🚚 Drive';
-    return ret( `${label} already started at ${formatLocal(openKid.start_at_utc, tz)}.` );
-  }
-
-  // ✅ create a new child entry
-  const inserted = await insertEntry({
-    owner_id,
-    user_id,
-    job_id: shift.job_id || null,
-    parent_id: shift.id,
-    kind,
-    start_at_utc: atRaw,
-    end_at_utc: null,
-    created_by,
-    meta: ctx.meta || {},
-    source_msg_id
-  });
-
-  if (inserted) {
     await emit(
-      { action: 'start', kind, at: occurredAtIso, shift_id: shift.id, child_id: inserted.id ?? null },
-      `${kind}_start`,
-      inserted.id ?? null,
+      { action: 'out', kind: 'shift', at: occurredAtIso, shift_id: shift.id, calc },
+      'clock_out',
+      shift.id,
       shift.job_id || null
     );
+
+    const msg =
+      calc.unpaidLunch > 0 || calc.unpaidBreak > 0
+        ? `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m (policy deducted lunch ${calc.unpaidLunch}m, breaks ${calc.unpaidBreak}m).`
+        : `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m.`;
+
+    return ret(`✅ Clocked out. ${msg}`);
   }
 
-  if (kind === 'lunch') return ret( `🍽️ Lunch started.` );
-  if (kind === 'break') return ret( `⏸️ Break started.` );
-  return ret( `🚚 Drive started.` );
-}
+  // Segment START (break/lunch/drive)
+  if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed.action === 'drive_start') {
+    const { shift, errText } = await requireOpenShift();
+    if (!shift) return ret(errText);
 
+    const kind = parsed.action.split('_')[0]; // break | lunch | drive
 
-// Segment STOP (break/lunch/drive)
-if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.action === 'drive_stop') {
-  const { shift, text } = await requireOpenShift();
-  if (!shift) return { text };
+    // ✅ If already open, don't create a new one
+    const { rows: openKids } = await pg.query(
+      `SELECT id, start_at_utc
+         FROM public.time_entries_v2
+        WHERE owner_id=$1
+          AND parent_id=$2
+          AND kind=$3
+          AND end_at_utc IS NULL
+          AND deleted_at IS NULL
+        ORDER BY start_at_utc DESC
+        LIMIT 1`,
+      [owner_id, shift.id, kind]
+    );
 
-  const kind = parsed.action.split('_')[0]; // break | lunch | drive
+    const openKid = openKids?.[0] || null;
+    if (openKid) {
+      const label = kind === 'lunch' ? '🍽️ Lunch' : kind === 'break' ? '⏸️ Break' : '🚚 Drive';
+      return ret(`${label} already started at ${formatLocal(openKid.start_at_utc, tz)}.`);
+    }
 
-  // close open child of this kind (capture child id)
-  const r = await pg.query(
-    `UPDATE public.time_entries_v2
-        SET end_at_utc=$3, updated_at=now()
-      WHERE owner_id=$1 AND parent_id=$2 AND kind=$4 AND end_at_utc IS NULL
-      RETURNING id`,
-    [owner_id, shift.id, atRaw, kind]
-  );
+    const inserted = await insertEntry({
+      owner_id,
+      user_id,
+      job_id: shift.job_id || null,
+      parent_id: shift.id,
+      kind,
+      start_at_utc: atRaw,
+      end_at_utc: null,
+      created_by,
+      meta: ctx.meta || {},
+      source_msg_id
+    });
 
-  const childId = r?.rows?.[0]?.id ?? null;
+    if (inserted) {
+      await emit(
+        { action: 'start', kind, at: occurredAtIso, shift_id: shift.id, child_id: inserted.id ?? null },
+        `${kind}_start`,
+        inserted.id ?? null,
+        shift.job_id || null
+      );
+    }
 
-  if (!childId) {
-    if (kind === 'lunch') return ret( `No active lunch to stop.` );
-    if (kind === 'break') return ret( `No active break to stop.` );
-    return ret( `No active drive to stop.` );
+    if (kind === 'lunch') return ret(`🍽️ Lunch started.`);
+    if (kind === 'break') return ret(`⏸️ Break started.`);
+    return ret(`🚚 Drive started.`);
   }
 
-  
-   await emit(
-  { action: 'stop', kind, at: occurredAtIso, shift_id: shift.id, child_id: childId },
-  `${kind}_stop`,
-  childId,
-  shift.job_id || null
-);
+  // Segment STOP (break/lunch/drive)
+  if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.action === 'drive_stop') {
+    const { shift, errText } = await requireOpenShift();
+    if (!shift) return ret(errText);
 
+    const kind = parsed.action.split('_')[0]; // break | lunch | drive
 
+    const r = await pg.query(
+      `UPDATE public.time_entries_v2
+          SET end_at_utc=$3, updated_at=now()
+        WHERE owner_id=$1 AND parent_id=$2 AND kind=$4 AND end_at_utc IS NULL
+        RETURNING id`,
+      [owner_id, shift.id, atRaw, kind]
+    );
 
-  if (kind === 'lunch') return ret( `🍽️ Lunch stopped.` );
-  if (kind === 'break') return ret( `▶️ Break ended.` );
-  return ret( `🅿️ Drive stopped.` );
-}
+    const childId = r?.rows?.[0]?.id ?? null;
 
-return ret( 'Timeclock: action not recognized.' );
+    if (!childId) {
+      if (kind === 'lunch') return ret(`No active lunch to stop.`);
+      if (kind === 'break') return ret(`No active break to stop.`);
+      return ret(`No active drive to stop.`);
+    }
 
+    await emit(
+      { action: 'stop', kind, at: occurredAtIso, shift_id: shift.id, child_id: childId },
+      `${kind}_stop`,
+      childId,
+      shift.job_id || null
+    );
+
+    if (kind === 'lunch') return ret(`🍽️ Lunch stopped.`);
+    if (kind === 'break') return ret(`▶️ Break ended.`);
+    return ret(`🅿️ Drive stopped.`);
+  }
+
+  return ret('Timeclock: action not recognized.');
 }
 
 

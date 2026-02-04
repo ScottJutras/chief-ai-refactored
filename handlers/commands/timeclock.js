@@ -956,7 +956,7 @@ async function getCurrentState(ownerId, employeeName) {
 
 async function handleClock(ctx, cil) {
   if (!ClockCIL) {
-    return { text: 'Timeclock: CIL schema missing. Please update schemas/cil.clock.' };
+    return ret( 'Timeclock: CIL schema missing. Please update schemas/cil.clock.' );
   }
 
   const parsed = ClockCIL.parse(cil); // throws on invalid
@@ -971,6 +971,8 @@ async function handleClock(ctx, cil) {
 
   const owner_id = String(ctx.owner_id || '').trim();
 const user_id = String(ctx.user_id || '').trim();
+const targetUserId = user_id || null;
+const ret = (text, extra = {}) => ({ text, targetUserId, ...extra });
 const job_id = ctx.job_id || null;
 
 const created_by_raw = ctx.created_by || null;
@@ -982,7 +984,8 @@ const source_msg_id = ctx.source_msg_id ? String(ctx.source_msg_id).trim() : nul
 const tz = ctx.tz || 'UTC';
 
 
-  if (!owner_id || !user_id) return { text: 'Timeclock: missing owner_id or user_id.' };
+  if (!owner_id || !user_id) return ret( 'Timeclock: missing owner_id or user_id.', targetUserId );
+
 
   // ---------------- helpers ----------------
 
@@ -1023,7 +1026,7 @@ const tz = ctx.tz || 'UTC';
 
 if (parsed.action === 'in') {
   const open = await getOpenShift(owner_id, user_id);
-  if (open) return { text: `You’re already clocked in since ${formatLocal(open.start_at_utc, tz)}.` };
+  if (open) return ret( `You’re already clocked in since ${formatLocal(open.start_at_utc, tz)}.` );
 
   const inserted = await insertEntry({
     owner_id,
@@ -1048,7 +1051,7 @@ if (parsed.action === 'in') {
 }
 
 
-  return { text: `✅ Clocked in at ${toHumanTime(occurredAtIso, tz)}.` };
+  return ret( `✅ Clocked in at ${toHumanTime(occurredAtIso, tz)}.` );
 }
 
 if (parsed.action === 'out') {
@@ -1100,7 +1103,7 @@ if (parsed.action === 'out') {
       ? `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m (policy deducted lunch ${calc.unpaidLunch}m, breaks ${calc.unpaidBreak}m).`
       : `⏱️ Paid ${Math.floor(calc.paidMinutes / 60)}h ${calc.paidMinutes % 60}m.`;
 
-  return { text: `✅ Clocked out. ${msg}` };
+  return ret( `✅ Clocked out. ${msg}` );
 }
 
 // Segment START (break/lunch/drive)
@@ -1127,7 +1130,7 @@ if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed
   const openKid = openKids?.[0] || null;
   if (openKid) {
     const label = kind === 'lunch' ? '🍽️ Lunch' : kind === 'break' ? '⏸️ Break' : '🚚 Drive';
-    return { text: `${label} already started at ${formatLocal(openKid.start_at_utc, tz)}.` };
+    return ret( `${label} already started at ${formatLocal(openKid.start_at_utc, tz)}.` );
   }
 
   // ✅ create a new child entry
@@ -1153,9 +1156,9 @@ if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed
     );
   }
 
-  if (kind === 'lunch') return { text: `🍽️ Lunch started.` };
-  if (kind === 'break') return { text: `⏸️ Break started.` };
-  return { text: `🚚 Drive started.` };
+  if (kind === 'lunch') return ret( `🍽️ Lunch started.` );
+  if (kind === 'break') return ret( `⏸️ Break started.` );
+  return ret( `🚚 Drive started.` );
 }
 
 
@@ -1178,9 +1181,9 @@ if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.a
   const childId = r?.rows?.[0]?.id ?? null;
 
   if (!childId) {
-    if (kind === 'lunch') return { text: `No active lunch to stop.` };
-    if (kind === 'break') return { text: `No active break to stop.` };
-    return { text: `No active drive to stop.` };
+    if (kind === 'lunch') return ret( `No active lunch to stop.` );
+    if (kind === 'break') return ret( `No active break to stop.` );
+    return ret( `No active drive to stop.` );
   }
 
   
@@ -1193,12 +1196,12 @@ if (parsed.action === 'break_stop' || parsed.action === 'lunch_stop' || parsed.a
 
 
 
-  if (kind === 'lunch') return { text: `🍽️ Lunch stopped.` };
-  if (kind === 'break') return { text: `▶️ Break ended.` };
-  return { text: `🅿️ Drive stopped.` };
+  if (kind === 'lunch') return ret( `🍽️ Lunch stopped.` );
+  if (kind === 'break') return ret( `▶️ Break ended.` );
+  return ret( `🅿️ Drive stopped.` );
 }
 
-return { text: 'Timeclock: action not recognized.' };
+return ret( 'Timeclock: action not recognized.' );
 
 }
 

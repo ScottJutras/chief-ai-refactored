@@ -23,6 +23,7 @@ console.log('[DEBUG] handleTimesheetCommand?', typeof handleTimesheetCommand);
 
 const { handleForecast } = require('../handlers/commands/forecast');
 const { getOwnerUuidForPhone } = require('../services/owners'); // optional map phone -> uuid (store separately)
+const { twimlWithTargetName } = require('../handlers/commands/timeclock');
 
 const stateManager = require('../utils/stateManager');
 const { getPendingTransactionState } = stateManager;
@@ -2172,9 +2173,23 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
     const cilToSend = { ...cil, at: nowIso };
 
     const reply = await handleClock(ctx, cilToSend);
-    let msg = reply?.text || 'Time logged.';
-    msg += await glossaryNudgeFrom(text2);
-    return ok(res, msg);
+
+// build final message first
+let msg = reply?.text || 'Time logged.';
+msg += await glossaryNudgeFrom(text2);
+
+// ✅ actor + target (v2 is “self” today, but this keeps it future-safe)
+const actorId = String(req.actorKey || req.from || '').replace(/\D/g, '');
+const targetUserId =
+  String(reply?.targetUserId || ctx?.user_id || actorId || '').replace(/\D/g, '') || actorId;
+
+// ✅ IMPORTANT: send via TwiML wrapper so names get injected
+return twimlWithTargetName(res, msg, {
+  ownerId: req.ownerId,
+  actorId,
+  targetUserId
+});
+
   }
 }
 

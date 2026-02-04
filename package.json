@@ -22,6 +22,7 @@
     "@google-cloud/vision": "^5.3.4",
     "@marsidev/react-turnstile": "^1.4.1",
     "@sendgrid/mail": "^8.1.4",
+    "@supabase/supabase-js": "^2.94.0",
     "@upstash/ratelimit": "^2.0.8",
     "@upstash/redis": "^1.36.1",
     "axios": "^1.7.7",

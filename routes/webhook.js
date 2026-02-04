@@ -174,7 +174,7 @@ async function resolveTargetUserIdsFromText({ ownerId, text }) {
     return { mode: 'crew', targets, namesById };
   }
 
-    // Explicit names list
+  // Explicit names list
   const phrase = extractTargetPhrase(text);
   const rawNames = splitNameList(phrase);
   if (!rawNames.length) return { mode: 'self', targets: [], namesById: {} };
@@ -218,6 +218,7 @@ async function resolveTargetUserIdsFromText({ ownerId, text }) {
 
   return { mode: 'names', targets, namesById };
 }
+
 
 function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
   const a = String(action || '').toLowerCase();
@@ -2373,16 +2374,19 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
 
   const cilToSend = { ...cil, at: nowIso };
 
+  // ✅ De-dupe targets defensively (important because name matching can create duplicates)
+  targets = Array.from(
+    new Set((targets || []).map((x) => String(x || '').replace(/\D/g, '')).filter(Boolean))
+  );
+
   // MULTI-TARGET (Crew or explicit names)
   if (targets.length > 1 || resolved.mode === 'crew') {
     let okCount = 0;
     let lastText = '';
     const previewNames = [];
+    const previewSeen = new Set(); // ✅ prevent duplicate preview names
 
-    for (const tId of targets) {
-      const targetId = String(tId || '').replace(/\D/g, '');
-      if (!targetId) continue;
-
+    for (const targetId of targets) {
       const ctx = { ...baseCtx, user_id: targetId };
 
       try {
@@ -2390,11 +2394,19 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
         if (reply?.text) lastText = reply.text;
         okCount += 1;
 
-        // Name preview (best-effort)
-        const nm = resolved.namesById?.[targetId];
-        if (nm && previewNames.length < 4) previewNames.push(nm);
+        // Name preview (best-effort, only for successful targets)
+        const nmRaw = resolved.namesById?.[targetId];
+        const nm = String(nmRaw || '').trim();
+
+        if (nm && previewNames.length < 4) {
+          const key = nm.toLowerCase();
+          if (!previewSeen.has(key)) {
+            previewSeen.add(key);
+            previewNames.push(nm);
+          }
+        }
       } catch (e) {
-        console.warn('[TIME_V2_CREW] target failed:', e?.message, { targetId });
+        console.warn('[TIME_V2_MULTI] target failed:', e?.message, { targetId });
       }
     }
 
@@ -2413,7 +2425,7 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
 
     msg += await glossaryNudgeFrom(text2);
 
-    // For Crew aggregation: return one clean line (no per-target name injection)
+    // One clean aggregated line (no per-target injection)
     return ok(res, msg);
   }
 
@@ -2433,7 +2445,6 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
     targetUserId
   });
 }
-
 
 }
 

@@ -13,7 +13,8 @@
     "test": "jest",
     "worker:kpi": "node services/kpiWorker.js",
     "sql": "node scripts/runSql.js",
-    "ingest:rag": "node scripts/ingestRAG.js data/rag/contractor_terms.csv"
+    "ingest:rag": "node scripts/ingestRAG.js data/rag/contractor_terms.csv",
+    "postinstall": "node -e \"require.resolve('pdfkit'); require.resolve('@supabase/supabase-js'); console.log('deps ok')\""
   },
   "dependencies": {
     "@ffmpeg/ffmpeg": "^0.12.10",

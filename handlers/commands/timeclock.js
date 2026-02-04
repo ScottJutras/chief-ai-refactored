@@ -296,6 +296,130 @@ async function closeEntryById(owner_id, id, atIso = null) {
   return rows[0] || null;
 }
 
+async function twimlWithTargetName(res, text, { ownerId, actorId, targetId } = {}) {
+  let msg = String(text || '').trim() || 'Time logged.';
+
+  try {
+    msg = await rewriteWithActorTargetNames({
+      ownerId,
+      actorId,
+      targetId,
+      text: msg
+    });
+  } catch {
+    // fallback: old behavior (append "for X")
+    try {
+      if (ownerId && targetId) {
+        const suffix = await nameSuffix(ownerId, targetId);
+        if (suffix && !/\sfor\s/i.test(msg)) {
+          msg = msg.replace(/\.$/, '') + suffix + '.';
+        }
+      }
+    } catch {}
+  }
+
+  return twiml(res, msg);
+}
+
+
+function normalizeSentencePunct(s) {
+  const t = String(s || '').trim();
+  if (!t) return '';
+  return /[.!?]$/.test(t) ? t : (t + '.');
+}
+
+// Build "You..." phrasing using the existing out.text
+async function rewriteWithActorTargetNames({ ownerId, actorId, targetId, text }) {
+  let msg = normalizeSentencePunct(text || 'Time logged.');
+
+  const a = String(actorId || '').trim();
+  const t = String(targetId || '').trim();
+  if (!ownerId || !a || !t) return msg;
+
+  // Resolve names (Crew works too)
+  let targetName = t;
+  try {
+    targetName = await displayNameForUserId(ownerId, t);
+  } catch {}
+
+  // If the message already mentions "for ..." don't double-append
+  if (/\sfor\s/i.test(msg)) return msg;
+
+  // Self case: "You're <action> <Name>."
+  if (a === t) {
+    // Convert common passive confirmations into "You're ..."
+    // Examples:
+    // "✅ Clocked in." -> "✅ You're clocked in Scott."
+    // "⏸️ Break started." -> "⏸️ You're on break Scott." (keeps your emoji)
+    const m = msg.match(/^(\S+\s+)?(✅\s*)?(.*)$/); // keep emoji/leading bits
+    const lead = (m?.[1] || '') + (m?.[2] || '');
+    const core = (m?.[3] || msg).trim();
+
+    // If core already starts with "You" or "You're", just append name
+    if (/^(you|you're|you are)\b/i.test(core)) {
+      return normalizeSentencePunct(`${lead}${core.replace(/\.$/, '')} ${targetName}`);
+    }
+
+    // Basic transform: lower-case first letter for "You're ..."
+    // ✅ Special-case common segments so it reads naturally
+const coreClean = core.replace(/\.$/, '').trim();
+const coreNorm = coreClean.toLowerCase().replace(/\s+/g, ' ');
+
+// Break
+if (/^break (started|start)$/.test(coreNorm)) {
+  return normalizeSentencePunct(`${lead}You're on break ${targetName}`);
+}
+if (/^break (stopped|stop|ended|end)$/.test(coreNorm)) {
+  return normalizeSentencePunct(`${lead}You're back from break ${targetName}`);
+}
+
+// Lunch
+if (/^lunch (started|start)$/.test(coreNorm)) {
+  return normalizeSentencePunct(`${lead}You're at lunch ${targetName}`);
+}
+if (/^lunch (stopped|stop|ended|end)$/.test(coreNorm)) {
+  return normalizeSentencePunct(`${lead}You're back from lunch ${targetName}`);
+}
+
+// Drive
+if (/^drive (started|start)$/.test(coreNorm)) {
+  return normalizeSentencePunct(`${lead}You're driving ${targetName}`);
+}
+if (/^drive (stopped|stop|ended|end)$/.test(coreNorm)) {
+  return normalizeSentencePunct(`${lead}You're done driving ${targetName}`);
+}
+
+// Default transform: "You're <action> <Name>."
+const coreLc = coreClean.charAt(0).toLowerCase() + coreClean.slice(1);
+return normalizeSentencePunct(`${lead}You're ${coreLc} ${targetName}`);
+
+  }
+
+  // Target != actor: "You <action> <TargetName>."
+  // If message already begins with emoji/✅, keep it.
+  const m = msg.match(/^(\S+\s+)?(✅\s*)?(.*)$/);
+  const lead = (m?.[1] || '') + (m?.[2] || '');
+  const core = (m?.[3] || msg).trim();
+
+  if (/^you\b/i.test(core)) {
+    return normalizeSentencePunct(`${lead}${core.replace(/\.$/, '')} ${targetName}`);
+  }
+
+  // Convert passive into active-ish: "Clocked in." -> "You clocked in <Name>."
+  const coreActive = core.charAt(0).toLowerCase() + core.slice(1);
+  return normalizeSentencePunct(`${lead}You ${coreActive.replace(/\.$/, '')} ${targetName}`);
+}
+
+
+async function nameSuffix(ownerId, userId) {
+  try {
+    const name = await displayNameForUserId(ownerId, userId);
+    if (!name) return '';
+    return ` for ${name}`;
+  } catch {
+    return '';
+  }
+}
 
 async function insertEntry(row) {
   const ownerId = String(row.owner_id || '').trim();
@@ -1240,7 +1364,12 @@ Detected: ${shape}`
         tsOverride: tsOverrideIso || null,
         nowIso: now.toISOString()
       });
-      return twiml(res, out?.text || '✅ Forced time action recorded.');
+      return twimlWithTargetName(
+  res,
+  out?.text || '✅ Forced time action recorded.',
+  { ownerId, actorId: paUserId, targetId: targetUserId }
+);
+
     }
 
     // UNDO (new schema)
@@ -1262,7 +1391,15 @@ Detected: ${shape}`
         if (!del.rowCount) return twiml(res, `Nothing to undo.`);
 
         const atHuman = del.rows[0].start_at_utc ? formatLocal(del.rows[0].start_at_utc, tz) : 'recently';
-        return twiml(res, `Undid last time entry (${del.rows[0].kind || 'entry'}) from ${atHuman}.`);
+        let msg = `Undid last time entry (${del.rows[0].kind || 'entry'}) from ${atHuman}.`;
+
+try {
+  const suffix = await nameSuffix(ownerId, targetUserId);
+  if (suffix) msg = msg.replace('Undid', `Undid${suffix}`);
+} catch {}
+
+return twiml(res, msg);
+
       } catch {
         return twiml(res, `Undo isn't available yet.`);
       }
@@ -1281,7 +1418,12 @@ Detected: ${shape}`
       nowIso: now.toISOString()
     });
 
-    return twiml(res, out?.text || 'Time logged.');
+   return twimlWithTargetName(
+  res,
+  out?.text || 'Time logged.',
+  { ownerId, actorId: paUserId, targetId: targetUserId }
+);
+
   } catch (e) {
     console.error('[timeclock] error:', e?.message, { code: e?.code, detail: e?.detail });
     return twiml(res, 'Timeclock error. Try again.');
@@ -1463,13 +1605,21 @@ async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
   if (!/^timesheet\b/.test(s)) return false;
 
   const range = (() => {
-    if (/^timesheet\s+today\b/.test(s)) return { mode: 'today' };
-    if (/^timesheet\s+last\s+week\b/.test(s)) return { mode: 'last_week' };
-    if (/^timesheet\s+week\b/.test(s)) return { mode: 'week' };
-    const m = s.match(/^timesheet\s+(.+?)\s*$/);
-    if (m && m[1]) return { mode: 'week', who: m[1].trim() };
-    return { mode: 'week' };
-  })();
+  if (/^timesheet\s+today\b/.test(s)) return { mode: 'today' };
+  if (/^timesheet\s+last\s+week\b/.test(s)) return { mode: 'last_week' };
+  if (/^timesheet\s+week\b/.test(s)) return { mode: 'week' };
+  if (/^timesheet\s+crew\b/.test(s)) return { mode: 'week', who: 'crew' };
+
+  // ✅ "timesheet me" = actor's timesheet (this week)
+  if (/^timesheet\s+(me|my|mine)\b/.test(s)) return { mode: 'week', who: actorKey };
+
+  // timesheet <name>
+  const m = s.match(/^timesheet\s+(.+?)\s*$/);
+  if (m && m[1]) return { mode: 'week', who: m[1].trim() };
+
+  return { mode: 'week' };
+})();
+
 
   const { startUtcIso, endUtcIso, label } = computeRangeUtc(range.mode, tz, new Date());
 

@@ -296,30 +296,74 @@ async function closeEntryById(owner_id, id, atIso = null) {
   return rows[0] || null;
 }
 
-async function twimlWithTargetName(res, text, { ownerId, actorId, targetId } = {}) {
+async function twimlWithTargetName(res, text, opts = {}) {
+  const ownerId = opts.ownerId;
+  const actorId = String(opts.actorId || '').replace(/\D/g, '') || null;
+
+  // Support both keys: targetUserId (new) and targetId (older callsites)
+  const targetUserIdRaw = opts.targetUserId || opts.targetId || null;
+  const targetUserId = String(targetUserIdRaw || '').replace(/\D/g, '') || null;
+
+  // ✅ NEW: allow caller to provide fallback display name (usually userProfile.name)
+  const fallbackName =
+    String(opts.fallbackName || '').trim() ||
+    String(opts.fallbackTargetName || '').trim() ||
+    '';
+
   let msg = String(text || '').trim() || 'Time logged.';
 
+  // If we can’t identify a target, just return as-is
+  if (!ownerId || !targetUserId) return twiml(res, msg);
+
   try {
-    msg = await rewriteWithActorTargetNames({
-      ownerId,
-      actorId,
-      targetId,
-      text: msg
-    });
-  } catch {
-    // fallback: old behavior (append "for X")
+    // Prefer real display name via your existing helper(s)
+    let display = '';
     try {
-      if (ownerId && targetId) {
-        const suffix = await nameSuffix(ownerId, targetId);
-        if (suffix && !/\sfor\s/i.test(msg)) {
-          msg = msg.replace(/\.$/, '') + suffix + '.';
-        }
+      if (typeof displayNameForUserId === 'function') {
+        display = await displayNameForUserId(ownerId, targetUserId);
       }
     } catch {}
-  }
 
-  return twiml(res, msg);
+    // ✅ Fallback if lookup failed / blank
+    if (!display) display = fallbackName;
+
+    // If still nothing, just return the original message
+    if (!display) return twiml(res, msg);
+
+    // Rewrite message into your preferred “You…”/actor-target phrasing if available
+    try {
+      if (typeof rewriteWithActorTargetNames === 'function') {
+        const actorName =
+          actorId && actorId === targetUserId
+            ? display
+            : (await (typeof displayNameForUserId === 'function'
+                ? displayNameForUserId(ownerId, actorId)
+                : Promise.resolve(''))) || '';
+
+        msg = await rewriteWithActorTargetNames(msg, {
+          actorId,
+          actorName: actorName || null,
+          targetId: targetUserId,
+          targetName: display
+        });
+        return twiml(res, msg);
+      }
+    } catch {}
+
+    // Otherwise, append a suffix if not already present
+    // Avoid duplicating if message already includes the name.
+    if (!msg.toLowerCase().includes(String(display).toLowerCase())) {
+      msg = msg.replace(/\.$/, '');
+      msg = `${msg} — ${display}.`;
+    }
+
+    return twiml(res, msg);
+  } catch {
+    return twiml(res, msg);
+  }
 }
+
+
 
 
 function normalizeSentencePunct(s) {
@@ -1370,8 +1414,14 @@ Detected: ${shape}`
       return twimlWithTargetName(
   res,
   out?.text || '✅ Forced time action recorded.',
-  { ownerId, actorId: paUserId, targetId: targetUserId }
+  {
+    ownerId,
+    actorId: paUserId,
+    targetId: targetUserId,
+    fallbackName: userProfile?.name || userProfile?.ProfileName || ''
+  }
 );
+
 
     }
 
@@ -1424,8 +1474,14 @@ return twiml(res, msg);
    return twimlWithTargetName(
   res,
   out?.text || 'Time logged.',
-  { ownerId, actorId: paUserId, targetId: targetUserId }
+  {
+    ownerId,
+    actorId: paUserId,
+    targetId: targetUserId,
+    fallbackName: userProfile?.name || userProfile?.ProfileName || ''
+  }
 );
+
 
   } catch (e) {
     console.error('[timeclock] error:', e?.message, { code: e?.code, detail: e?.detail });

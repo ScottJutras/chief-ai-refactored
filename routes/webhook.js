@@ -2441,11 +2441,12 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
   msg += await glossaryNudgeFrom(text2);
 
   // Use TwiML wrapper so actor+target names are injected
-  return twimlWithTargetName(res, msg, {
-    ownerId: ownerDigits,
-    actorId,
-    targetUserId
-  });
+ return twimlWithTargetName(res, msg, {
+  ownerId: ownerDigits,
+  actorId,
+  targetUserId,
+  fallbackName: req.userProfile?.name || req.body?.ProfileName || ''
+});
 }
 
 }

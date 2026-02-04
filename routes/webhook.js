@@ -2432,30 +2432,30 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
   }
 
   // SINGLE TARGET (self)
-  const targetUserId = String(targets[0] || actorId).replace(/\D/g, '') || actorId;
-  const ctx = { ...baseCtx, user_id: targetUserId };
+const targetUserId = String(targets[0] || actorId).replace(/\D/g, '') || actorId;
+const ctx = { ...baseCtx, user_id: targetUserId };
 
-  const baseText =
-  (typeof reply === 'string' && reply.trim())
-    ? reply.trim()
-    : (reply && typeof reply === 'object' && typeof reply.text === 'string' ? reply.text.trim() : '');
+// ✅ ALWAYS define a local variable, then normalize into { text, targetUserId }
+const raw = await handleClock(ctx, cilToSend);
 
-let msg = baseText || 'Time logged.';
+// Normalize: handleClock might return string OR object
+const reply =
+  typeof raw === 'string'
+    ? { text: raw, targetUserId }
+    : (raw && typeof raw === 'object')
+      ? { text: raw.text || 'Time logged.', targetUserId: raw.targetUserId || targetUserId }
+      : { text: 'Time logged.', targetUserId };
+
+// build final message
+let msg = String(reply.text || 'Time logged.').trim();
 msg += await glossaryNudgeFrom(text2);
 
-const targetFromReply =
-  (reply && typeof reply === 'object' && reply.targetUserId)
-    ? String(reply.targetUserId).replace(/\D/g, '')
-    : '';
-
-const targetUserIdSafe =
-  targetFromReply || String(targetUserId || '').replace(/\D/g, '') || actorId;
-
+// Use TwiML wrapper so actor+target names are injected
 return twimlWithTargetName(res, msg, {
   ownerId: ownerDigits,
   actorId,
-  targetUserId: targetUserIdSafe,
-  fallbackName: req.userProfile?.name || req.body?.ProfileName || ''
+  targetUserId: reply.targetUserId || targetUserId,
+  fallbackName: req.userProfile?.name || req.userProfile?.ProfileName || ''
 });
 
 }

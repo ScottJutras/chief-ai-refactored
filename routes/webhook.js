@@ -24,6 +24,8 @@ console.log('[DEBUG] handleTimesheetCommand?', typeof handleTimesheetCommand);
 const { handleForecast } = require('../handlers/commands/forecast');
 const { getOwnerUuidForPhone } = require('../services/owners'); // optional map phone -> uuid (store separately)
 const { twimlWithTargetName } = require('../handlers/commands/timeclock');
+const { handleQuoteCommand, isQuoteCommand } = require('../handlers/commands/quote');
+const { getUserByName } = require('../services/users');
 
 const stateManager = require('../utils/stateManager');
 const { getPendingTransactionState } = stateManager;
@@ -75,6 +77,178 @@ const ok = (res, text = null) => {
 
 const normalizePhone = (raw = '') =>
   String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
+
+// --- v2 multi-target helpers (crew + name list) ---
+// Uses your existing imports:
+//   const pg = require('../services/postgres');
+//   const { getUserByName } = require('../services/users');
+
+function splitNameList(raw) {
+  let s = String(raw || '')
+    .replace(/\band\b/gi, ',')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!s) return [];
+
+  // If they used commas, split on commas
+  if (s.includes(',')) {
+    return s
+      .split(',')
+      .map(x => x.trim())
+      .filter(Boolean);
+  }
+
+  // Otherwise, they likely used spaces: "Scott Justin Tyler"
+  // Keep it conservative: split into tokens, then recombine common 2-word names.
+  const parts = s.split(' ').filter(Boolean);
+
+  // If only one token, it's a single name
+  if (parts.length <= 1) return parts;
+
+  // Conservative heuristic:
+  // - treat each token as a name
+  // - BUT if the user has 2-word names in your directory, getUserByName() will still catch them
+  //   when we also try pairing adjacent tokens (handled below).
+  return parts;
+}
+
+
+function hasCrewToken(text) {
+  return /\bcrew\b/i.test(String(text || ''));
+}
+
+function extractTargetPhrase(text) {
+  const s = String(text || '').trim();
+
+  // Strip job hint if present ("@ Roof Repair")
+  const withoutJob = s.split(/\s+@\s+/)[0].trim();
+
+  // Preferred: "... for <targets>"
+  let m = withoutJob.match(/\bfor\s+(.+)$/i);
+  if (m && m[1]) return m[1].trim();
+
+  // Fallback: "<action> <targets>"
+  // We only capture targets if they come AFTER a known action phrase
+  m = withoutJob.match(
+    /\b(clock\s*in|clock\s*out|break\s*(?:start|stop|end)|lunch\s*(?:start|stop|end)|drive\s*(?:start|stop|end))\s+(.+)$/i
+  );
+  if (m && m[2]) return m[2].trim();
+
+  return '';
+}
+
+
+async function getCrewUsers(ownerId) {
+  // Returns [{id, name}] for team members
+  try {
+    const { rows } = await pg.query(
+      `SELECT user_id, name
+         FROM public.users
+        WHERE owner_id=$1
+          AND is_team_member=true`,
+      [String(ownerId || '').trim()]
+    );
+
+    return (rows || [])
+      .map(r => ({
+        id: String(r.user_id || '').replace(/\D/g, ''),
+        name: String(r.name || '').trim()
+      }))
+      .filter(x => x.id);
+  } catch (e) {
+    console.warn('[CREW] failed to load crew users:', e?.message);
+    return [];
+  }
+}
+
+async function resolveTargetUserIdsFromText({ ownerId, text }) {
+  const owner_id = String(ownerId || '').trim();
+  if (!owner_id) return { mode: 'self', targets: [], namesById: {} };
+
+  // Crew
+  if (hasCrewToken(text)) {
+    const crew = await getCrewUsers(owner_id);
+    const targets = crew.map(x => x.id);
+    const namesById = Object.fromEntries(crew.map(x => [x.id, x.name || x.id]));
+    return { mode: 'crew', targets, namesById };
+  }
+
+    // Explicit names list
+  const phrase = extractTargetPhrase(text);
+  const rawNames = splitNameList(phrase);
+  if (!rawNames.length) return { mode: 'self', targets: [], namesById: {} };
+
+  // Build candidate names:
+  // - if comma list: each entry already a candidate
+  // - if space tokens: try single tokens + adjacent pairs (to support "Mary Jane")
+  const candidates = [];
+  for (let i = 0; i < rawNames.length; i++) {
+    const a = String(rawNames[i] || '').trim();
+    if (a) candidates.push(a);
+
+    const b = String(rawNames[i + 1] || '').trim();
+    if (a && b) candidates.push(`${a} ${b}`);
+  }
+
+  // Dedupe while preserving order
+  const seen = new Set();
+  const uniqCandidates = candidates.filter(n => {
+    const k = n.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+
+  const hits = [];
+  const namesById = {};
+
+  for (const nm of uniqCandidates) {
+    const u = await getUserByName(owner_id, nm).catch(() => null);
+    const id = u?.user_id ? String(u.user_id).replace(/\D/g, '') : '';
+    if (!id) continue;
+
+    // If we already resolved this id, keep the first/best name we saw
+    if (!namesById[id]) namesById[id] = String(u?.name || nm || id).trim();
+    hits.push(id);
+  }
+
+  const targets = Array.from(new Set(hits));
+  if (!targets.length) return { mode: 'names', targets: [], namesById: {} };
+
+  return { mode: 'names', targets, namesById };
+}
+
+function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
+  const a = String(action || '').toLowerCase();
+
+  const map = {
+    in: '✅ Clocked in',
+    out: '✅ Clocked out',
+    break_start: '⏸️ Break started',
+    break_stop: '▶️ Break ended',
+    lunch_start: '🍽️ Lunch started',
+    lunch_stop: '🍽️ Lunch stopped',
+    drive_start: '🚚 Drive started',
+    drive_stop: '🅿️ Drive stopped'
+  };
+
+  const head =
+    map[a] ||
+    String(baseText || 'Time logged.')
+      .replace(/\s+for\s+.+$/i, '')
+      .trim();
+
+  // Name preview for small counts
+  const preview =
+    Array.isArray(previewNames) && previewNames.length && count <= 4
+      ? ` (${count} people: ${previewNames.slice(0, 4).join(', ')})`
+      : ` (${count} people)`;
+
+  return `${head} for Crew${preview}.`;
+}
+
+
 
 /* ---------------- WhatsApp Link Code helpers ---------------- */
 
@@ -1606,6 +1780,27 @@ if (hasPendingMedia && numMedia === 0) {
 const text2 = text;
 const lc2 = text2.toLowerCase();
 const isPickerToken = looksLikeJobPickerReplyToken(text2);
+/* -----------------------------------------------------------------------
+ * ✅ Quotes (MVP): route early (before PA router / other flows)
+ * ----------------------------------------------------------------------- */
+try {
+  // Quote commands should not be interpreted as PA confirmations.
+  // They are deterministic and generate a PDF + link.
+  if (typeof isQuoteCommand === 'function' && isQuoteCommand(text2)) {
+    const msg = await handleQuoteCommand({
+      ownerId: req.ownerId,
+      from: req.from,
+      text: text2,
+      userProfile: req.userProfile
+    });
+
+    if (typeof msg === 'string' && msg.trim()) return ok(res, msg.trim());
+    return ok(res, 'Quote created.');
+  }
+} catch (e) {
+  console.error('[QUOTE] error:', e?.message);
+  return ok(res, 'Quote error. Try again.');
+}
 
     /* -----------------------------------------------------------------------
      * ✅ Pending-actions router (must run early)
@@ -2149,48 +2344,97 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
   console.info('[TIME_V2_CIL]', { flagsTimeV2: true, text2, matched: !!cil, cil });
 
   if (cil) {
-    const nowIso = new Date().toISOString();
+  const nowIso = new Date().toISOString();
 
-    // IMPORTANT: in webhook.js req.ownerId is digits (tenant owner key), not UUID
-    // For timeclock v2 ctx, user_id / created_by must be digits (WaId).
-    const ctx = {
-      owner_id: req.ownerId,
-      user_id: req.actorKey || null,          // ✅ digits (WaId) — do NOT fall back to owner_id
-      job_id: req.userProfile?.active_job_id || null,
-      created_by: req.actorKey || null,       // ✅ digits
-      source_msg_id: messageSid || null,
-      meta: { job_name: req.userProfile?.active_job_name || null }
-    };
+  const actorId = String(req.actorKey || req.from || '').replace(/\D/g, '');
+  const ownerDigits = String(req.ownerId || '').replace(/\D/g, '');
 
-    // If we still don't have an actorKey, fail-soft but do not write bad ids
-    if (!ctx.user_id) {
-      let msg = 'Timeclock: missing user identity (WaId).';
+  // Resolve targets (self vs crew vs explicit names)
+  const resolved = await resolveTargetUserIdsFromText({ ownerId: ownerDigits, text: text2 });
+
+  // Default: target = actor (self)
+  let targets = resolved.targets || [];
+  if (!targets.length) targets = actorId ? [actorId] : [];
+
+  // If we still don't have identity, fail-soft
+  if (!actorId) {
+    let msg = 'Timeclock: missing user identity (WaId).';
+    msg += await glossaryNudgeFrom(text2);
+    return ok(res, msg);
+  }
+
+  const baseCtx = {
+    owner_id: ownerDigits,
+    job_id: req.userProfile?.active_job_id || null,
+    created_by: actorId,
+    source_msg_id: messageSid || null,
+    meta: { job_name: req.userProfile?.active_job_name || null }
+  };
+
+  const cilToSend = { ...cil, at: nowIso };
+
+  // MULTI-TARGET (Crew or explicit names)
+  if (targets.length > 1 || resolved.mode === 'crew') {
+    let okCount = 0;
+    let lastText = '';
+    const previewNames = [];
+
+    for (const tId of targets) {
+      const targetId = String(tId || '').replace(/\D/g, '');
+      if (!targetId) continue;
+
+      const ctx = { ...baseCtx, user_id: targetId };
+
+      try {
+        const reply = await handleClock(ctx, cilToSend);
+        if (reply?.text) lastText = reply.text;
+        okCount += 1;
+
+        // Name preview (best-effort)
+        const nm = resolved.namesById?.[targetId];
+        if (nm && previewNames.length < 4) previewNames.push(nm);
+      } catch (e) {
+        console.warn('[TIME_V2_CREW] target failed:', e?.message, { targetId });
+      }
+    }
+
+    if (!okCount) {
+      let msg = 'Timeclock: no valid targets found.';
       msg += await glossaryNudgeFrom(text2);
       return ok(res, msg);
     }
 
-    // ensure at is present and valid for schema ("now" or ISO)
-    const cilToSend = { ...cil, at: nowIso };
+    let msg = aggregateCrewMessage({
+      action: cil.action,
+      count: okCount,
+      previewNames,
+      baseText: lastText || 'Time logged.'
+    });
 
-    const reply = await handleClock(ctx, cilToSend);
+    msg += await glossaryNudgeFrom(text2);
 
-// build final message first
-let msg = reply?.text || 'Time logged.';
-msg += await glossaryNudgeFrom(text2);
-
-// ✅ actor + target (v2 is “self” today, but this keeps it future-safe)
-const actorId = String(req.actorKey || req.from || '').replace(/\D/g, '');
-const targetUserId =
-  String(reply?.targetUserId || ctx?.user_id || actorId || '').replace(/\D/g, '') || actorId;
-
-// ✅ IMPORTANT: send via TwiML wrapper so names get injected
-return twimlWithTargetName(res, msg, {
-  ownerId: req.ownerId,
-  actorId,
-  targetUserId
-});
-
+    // For Crew aggregation: return one clean line (no per-target name injection)
+    return ok(res, msg);
   }
+
+  // SINGLE TARGET (self)
+  const targetUserId = String(targets[0] || actorId).replace(/\D/g, '') || actorId;
+  const ctx = { ...baseCtx, user_id: targetUserId };
+
+  const reply = await handleClock(ctx, cilToSend);
+
+  let msg = reply?.text || 'Time logged.';
+  msg += await glossaryNudgeFrom(text2);
+
+  // Use TwiML wrapper so actor+target names are injected
+  return twimlWithTargetName(res, msg, {
+    ownerId: ownerDigits,
+    actorId,
+    targetUserId
+  });
+}
+
+
 }
 
 

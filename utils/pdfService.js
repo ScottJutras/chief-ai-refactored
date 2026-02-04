@@ -1,64 +1,96 @@
 // utils/pdfService.js
 const PDFDocument = require('pdfkit');
-const fs = require('fs');
 const axios = require('axios');
 
-async function generateQuotePDF(quoteData, outputPath) {
-    const { jobName, items, subtotal, tax, total, customerName, contractorName, companyName, companyAddress, companyPhone, logoUrl } = quoteData;
-    
-    const doc = new PDFDocument({ size: 'A4', margin: 50 });
-    const stream = fs.createWriteStream(outputPath);
-    doc.pipe(stream);
+/**
+ * generateQuotePDFBuffer(quoteData) -> Buffer
+ * No filesystem writes. Safe for serverless.
+ */
+async function generateQuotePDFBuffer(quoteData) {
+  const {
+    jobName,
+    items = [],
+    subtotal = 0,
+    tax = 0,
+    total = 0,
+    customerName,
+    contractorName,
+    companyName,
+    companyAddress,
+    companyPhone,
+    logoUrl
+  } = quoteData || {};
 
-    // Header with Logo and Company Info
-    if (logoUrl) {
-        const logoResponse = await axios.get(logoUrl, { responseType: 'arraybuffer' });
-        doc.image(Buffer.from(logoResponse.data), 50, 50, { width: 100 });
+  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+
+  const chunks = [];
+  doc.on('data', (c) => chunks.push(c));
+
+  const done = new Promise((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+
+  // Header
+  if (logoUrl) {
+    try {
+      const logoResponse = await axios.get(logoUrl, { responseType: 'arraybuffer', timeout: 8000 });
+      doc.image(Buffer.from(logoResponse.data), 50, 50, { width: 100 });
+    } catch {
+      // fail-open: ignore logo failures
     }
-    doc.fontSize(12)
-       .text(companyName || contractorName, 160, 50, { align: 'left' })
-       .text(companyAddress || '', 160, 70)
-       .text(companyPhone || '', 160, 90)
-       .moveDown(2);
+  }
 
-    // Quote Title
-    doc.fontSize(20).text(`Quote for ${jobName}`, { align: 'center' })
-       .moveDown();
+  doc
+    .fontSize(12)
+    .text(companyName || contractorName || 'Quote', 160, 50, { align: 'left' })
+    .text(companyAddress || '', 160, 70)
+    .text(companyPhone || '', 160, 90)
+    .moveDown(2);
 
-    // Customer Info
-    doc.fontSize(12).text(`Customer: ${customerName}`, { align: 'left' })
-       .moveDown();
+  doc.fontSize(20).text(`Quote for ${jobName || 'Job'}`, { align: 'center' }).moveDown();
+  if (customerName) doc.fontSize(12).text(`Customer: ${customerName}`, { align: 'left' }).moveDown();
 
-    // Items Table
-    doc.fontSize(10);
-    const tableTop = doc.y;
-    doc.text('Item', 50, tableTop)
-       .text('Quantity', 200, tableTop)
-       .text('Unit Price', 300, tableTop)
-       .text('Total', 400, tableTop);
-    doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
+  // Table header
+  doc.fontSize(10);
+  const tableTop = doc.y;
+  doc.text('Item', 50, tableTop)
+    .text('Quantity', 250, tableTop)
+    .text('Unit Price', 340, tableTop)
+    .text('Total', 450, tableTop);
+  doc.moveTo(50, tableTop + 15).lineTo(550, tableTop + 15).stroke();
 
-    let y = tableTop + 25;
-    items.forEach(({ item, quantity, price }) => {
-        const lineTotal = price * quantity;
-        doc.text(item, 50, y)
-           .text(quantity, 200, y)
-           .text(`$${price.toFixed(2)}`, 300, y)
-           .text(`$${lineTotal.toFixed(2)}`, 400, y);
-        y += 20;
-    });
+  let y = tableTop + 25;
 
-    // Summary (no markup mention)
-    doc.moveTo(50, y).lineTo(550, y).stroke();
-    y += 10;
-    doc.text(`Subtotal: $${subtotal.toFixed(2)}`, 400, y, { align: 'right' });
+  for (const row of items) {
+    const item = String(row?.item || '').trim();
+    const quantity = Number(row?.quantity || 0);
+    const price = Number(row?.price || 0);
+    const lineTotal = price * quantity;
+
+    doc.text(item || '—', 50, y)
+      .text(String(quantity || 0), 250, y)
+      .text(`$${price.toFixed(2)}`, 340, y)
+      .text(`$${lineTotal.toFixed(2)}`, 450, y);
+
     y += 20;
-    doc.text(`Tax: $${tax.toFixed(2)}`, 400, y, { align: 'right' });
-    y += 20;
-    doc.text(`Total: $${total.toFixed(2)}`, 400, y, { align: 'right' });
+    if (y > 720) { // simple page break
+      doc.addPage();
+      y = 80;
+    }
+  }
 
-    doc.end();
-    return new Promise((resolve) => stream.on('finish', resolve));
+  // Summary
+  doc.moveTo(50, y).lineTo(550, y).stroke();
+  y += 10;
+  doc.text(`Subtotal: $${Number(subtotal || 0).toFixed(2)}`, 350, y, { align: 'right' });
+  y += 20;
+  doc.text(`Tax: $${Number(tax || 0).toFixed(2)}`, 350, y, { align: 'right' });
+  y += 20;
+  doc.text(`Total: $${Number(total || 0).toFixed(2)}`, 350, y, { align: 'right' });
+
+  doc.end();
+  return done;
 }
 
-module.exports = { generateQuotePDF };
+module.exports = { generateQuotePDFBuffer };

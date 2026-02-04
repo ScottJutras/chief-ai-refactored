@@ -984,7 +984,7 @@ const source_msg_id = ctx.source_msg_id ? String(ctx.source_msg_id).trim() : nul
 const tz = ctx.tz || 'UTC';
 
 
-  if (!owner_id || !user_id) return ret( 'Timeclock: missing owner_id or user_id.', targetUserId );
+  if (!owner_id || !user_id) return ret('Timeclock: missing owner_id or user_id.');
 
 
   // ---------------- helpers ----------------

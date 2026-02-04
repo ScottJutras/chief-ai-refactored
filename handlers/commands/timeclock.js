@@ -1700,6 +1700,7 @@ module.exports = {
   handleTimeclock,
   handleClock,
   handleTimesheetCommand,
+  twimlWithTargetName,
 };
 
 

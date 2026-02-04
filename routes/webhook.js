@@ -24,6 +24,8 @@ console.log('[DEBUG] handleTimesheetCommand?', typeof handleTimesheetCommand);
 const { handleForecast } = require('../handlers/commands/forecast');
 const { getOwnerUuidForPhone } = require('../services/owners'); // optional map phone -> uuid (store separately)
 const { twimlWithTargetName } = require('../handlers/commands/timeclock');
+console.log('[DEBUG] twimlWithTargetName?', typeof twimlWithTargetName);
+
 const { handleQuoteCommand, isQuoteCommand } = require('../handlers/commands/quote');
 const { getUserByName } = require('../services/users');
 

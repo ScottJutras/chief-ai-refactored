@@ -304,7 +304,7 @@ async function twimlWithTargetName(res, text, opts = {}) {
   const targetUserIdRaw = opts.targetUserId || opts.targetId || null;
   const targetUserId = String(targetUserIdRaw || '').replace(/\D/g, '') || null;
 
-  // ✅ NEW: allow caller to provide fallback display name (usually userProfile.name)
+  // ✅ allow caller to provide fallback display name (usually userProfile.name)
   const fallbackName =
     String(opts.fallbackName || '').trim() ||
     String(opts.fallbackTargetName || '').trim() ||
@@ -316,7 +316,7 @@ async function twimlWithTargetName(res, text, opts = {}) {
   if (!ownerId || !targetUserId) return twiml(res, msg);
 
   try {
-    // Prefer real display name via your existing helper(s)
+    // Prefer real display name via helper
     let display = '';
     try {
       if (typeof displayNameForUserId === 'function') {
@@ -324,34 +324,30 @@ async function twimlWithTargetName(res, text, opts = {}) {
       }
     } catch {}
 
-    // ✅ Fallback if lookup failed / blank
+    // Fallback if lookup failed / blank
     if (!display) display = fallbackName;
 
-    // If still nothing, just return the original message
+    // If still nothing, just return original message
     if (!display) return twiml(res, msg);
 
-    // Rewrite message into your preferred “You…”/actor-target phrasing if available
+    // ✅ Correct call signature: rewriteWithActorTargetNames expects ONE object
     try {
       if (typeof rewriteWithActorTargetNames === 'function') {
-        const actorName =
-          actorId && actorId === targetUserId
-            ? display
-            : (await (typeof displayNameForUserId === 'function'
-                ? displayNameForUserId(ownerId, actorId)
-                : Promise.resolve(''))) || '';
-
-        msg = await rewriteWithActorTargetNames(msg, {
+        const rewritten = await rewriteWithActorTargetNames({
+          ownerId,
           actorId,
-          actorName: actorName || null,
           targetId: targetUserId,
-          targetName: display
+          text: msg
         });
-        return twiml(res, msg);
+
+        // If rewrite returns something usable, trust it
+        if (rewritten && String(rewritten).trim()) {
+          return twiml(res, String(rewritten).trim());
+        }
       }
     } catch {}
 
-    // Otherwise, append a suffix if not already present
-    // Avoid duplicating if message already includes the name.
+    // Otherwise, append suffix if not already present
     if (!msg.toLowerCase().includes(String(display).toLowerCase())) {
       msg = msg.replace(/\.$/, '');
       msg = `${msg} — ${display}.`;

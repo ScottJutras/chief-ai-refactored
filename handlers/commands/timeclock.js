@@ -1068,27 +1068,27 @@ async function handleBreakDurationRepairReply(ctx, text) {
 
   // Only adjust if the break currently ends at clock-out (or is later). This avoids weird rewrites.
   const r = await pg.query(
-    `UPDATE public.time_entries_v2
-        SET end_at_utc=$3,
-            updated_at=now(),
-            meta = jsonb_set(
-              coalesce(meta,'{}'::jsonb),
-              '{repair}',
-              jsonb_build_object(
-                'kind','break_duration',
-                'minutes',$4,
-                'clock_out_at_utc',$5,
-                'adjusted_end_at_utc',$3,
-                'source_msg_id',$6
-              ),
-              true
-            )
-      WHERE owner_id=$1
-        AND id=$2
-        AND deleted_at IS NULL
-      RETURNING id`,
-    [owner_id, prompt.break_entry_id, newEndIso, minutes, prompt.clock_out_at_utc, source_msg_id]
-  );
+  `UPDATE public.time_entries_v2
+      SET end_at_utc = $3::timestamptz,
+          updated_at = now(),
+          meta = jsonb_set(
+            coalesce(meta,'{}'::jsonb),
+            '{repair}',
+            jsonb_build_object(
+              'kind','break_duration',
+              'minutes',$4::int,
+              'clock_out_at_utc',$5::timestamptz,
+              'adjusted_end_at_utc',$3::timestamptz,
+              'source_msg_id',$6
+            ),
+            true
+          )
+    WHERE owner_id = $1
+      AND id = $2::bigint
+      AND deleted_at IS NULL
+    RETURNING id`,
+  [owner_id, prompt.break_entry_id, newEndIso, minutes, prompt.clock_out_at_utc, source_msg_id]
+);
 
   await pg.query(`DELETE FROM public.timeclock_repair_prompts WHERE id=$1`, [prompt.id]);
 

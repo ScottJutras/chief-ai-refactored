@@ -2312,17 +2312,26 @@ if (flags.timeclock_v2) {
 
       if (ownerDigits && actorId) {
         const repairOut = await handleBreakDurationRepairReply(
-          {
-            owner_id: ownerDigits,
-            user_id: actorId,
-            source_msg_id: messageSid || null,
-            tz: req.tz || req.userProfile?.tz || 'UTC'
-          },
-          text2
-        );
+  {
+    owner_id: ownerDigits,
+    user_id: actorId,
+    source_msg_id: messageSid || null,
+    tz: req.tz || req.userProfile?.tz || 'UTC'
+  },
+  text2
+);
 
-        // ✅ Only respond if we got a real message back
-        if (repairOut && String(repairOut.text || '').trim()) {
+// ✅ LOG RIGHT HERE
+console.info('[TIME_V2_REPAIR_CHECK]', {
+  ownerDigits,
+  actorId,
+  text2,
+  hasRepairOut: !!repairOut,
+  hasText: !!String(repairOut?.text || '').trim()
+});
+
+// ✅ Only respond if we got a real message back
+if (repairOut && String(repairOut.text || '').trim()) {
           let msg = String(repairOut.text || '').trim();
           msg += await glossaryNudgeFrom(text2);
 

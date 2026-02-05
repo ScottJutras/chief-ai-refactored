@@ -1428,6 +1428,16 @@ if (openBreakId) {
         ($1,$2,'break_duration',$3,$4,$5, now() + interval '12 hours', $6)`,
       [owner_id, user_id, shift.id, openBreakId, occurredAtIso, source_msg_id]
     );
+
+    // ✅ LOG RIGHT HERE (insert succeeded)
+    console.info('[TIME_V2_REPAIR_PROMPT_INSERTED]', {
+      owner_id,
+      user_id,
+      shiftId: shift.id,
+      breakId: openBreakId,
+      occurredAtIso,
+      source_msg_id
+    });
   } catch (e) {
     console.warn('[REPAIR_PROMPT] insert failed (ignored):', e?.message);
   }
@@ -1437,9 +1447,9 @@ if (openBreakId) {
     `How long was your break? (e.g., “20 min”) or reply “skip”.`;
 }
 
-return ret(finalText);
 
-  return ret('Timeclock: action not recognized.');
+return ret('Timeclock: action not recognized.');
+
 }
 
 

@@ -117,10 +117,41 @@ const HANDLER_OWNED_KINDS = new Set([
 
 async function pendingActionMiddleware(req, res, next) {
   try {
-    const textRaw = (req.body?.Body || '').trim();
-    const lc = textRaw.toLowerCase();
+   const textRaw = (req.body?.Body || '').trim();
+const lc = textRaw.toLowerCase();
 
-    if (lc === 'skip') return next();
+// ✅ If a timeclock break-duration repair prompt is active, do NOT intercept "skip"/duration replies here.
+// Let the timeclock v2 gate handle it.
+try {
+  const fromDigits = digits(req.from || req.userProfile?.from || req.userProfile?.user_id || '');
+  const ownerDigits = digits(req.ownerId || req.userProfile?.ownerId || req.userProfile?.owner_id || '');
+
+  if (fromDigits && ownerDigits && textRaw) {
+    const { rows } = await pg.query(
+      `SELECT 1
+         FROM public.timeclock_repair_prompts
+        WHERE owner_id=$1
+          AND user_id=$2
+          AND kind='break_duration'
+          AND (expires_at IS NULL OR expires_at > now())
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [ownerDigits, fromDigits]
+    );
+
+    if (rows?.length) {
+      // Bypass only if it looks like a duration reply or skip
+      const looksDurationOrSkip =
+        /^\s*(skip|no|n|\d{1,4}\s*(m|min|mins|minute|minutes)?|\d{1,2}\s*:\s*\d{1,2})\s*$/i.test(textRaw);
+
+      if (looksDurationOrSkip) return next();
+    }
+  }
+} catch {
+  // fail-soft
+}
+
+if (lc === 'skip') return next();
 
     const from = digits(req.from || req.userProfile?.from || req.userProfile?.user_id || '');
     const ownerId = digits(req.ownerId || req.userProfile?.ownerId || req.userProfile?.owner_id || '');

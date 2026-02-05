@@ -2298,9 +2298,49 @@ if (looksExpense) {
       }
     }
 
-    const s = String(lc2 || '').trim();
+  const s = String(lc2 || '').trim();
 console.info('[TIME_V2_GATE]', { timeclock_v2: !!flags.timeclock_v2, isHardTimeCommand, lc2 });
 
+// ✅ ALWAYS allow timeclock repair replies (duration/skip) to be handled,
+// even if the text is NOT a hard time command (e.g., "20 min").
+if (flags.timeclock_v2) {
+  try {
+    const { handleBreakDurationRepairReply } = require('../handlers/commands/timeclock');
+    if (typeof handleBreakDurationRepairReply === 'function') {
+      const ownerDigits = String(req.ownerId || '').replace(/\D/g, '');
+      const actorId = String(req.actorKey || req.from || '').replace(/\D/g, '');
+
+      if (ownerDigits && actorId) {
+        const repairOut = await handleBreakDurationRepairReply(
+          {
+            owner_id: ownerDigits,
+            user_id: actorId,
+            source_msg_id: messageSid || null,
+            tz: req.tz || req.userProfile?.tz || 'UTC'
+          },
+          text2
+        );
+
+        // ✅ Only respond if we got a real message back
+        if (repairOut && String(repairOut.text || '').trim()) {
+          let msg = String(repairOut.text || '').trim();
+          msg += await glossaryNudgeFrom(text2);
+
+          return twimlWithTargetName(res, msg, {
+            ownerId: ownerDigits,
+            actorId,
+            targetUserId: String(repairOut.targetUserId || actorId).replace(/\D/g, '') || actorId,
+            fallbackName: req.userProfile?.name || req.userProfile?.ProfileName || ''
+          });
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[TIME_V2_REPAIR] ignored:', e?.message);
+  }
+}
+
+// From here down: only handle "hard time commands" via CIL
 if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
   const s0 = String(text2 || '').trim();
 
@@ -2309,8 +2349,8 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
     try {
       const out = await handleTimesheetCommand({
         ownerId: req.ownerId,
-        actorKey: req.actorKey,           // digits
-        from: req.from,                   // e164
+        actorKey: req.actorKey, // digits
+        from: req.from, // e164
         text: s0,
         req,
         res
@@ -2322,7 +2362,7 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
     }
   }
 
-  // existing Clock CIL builder (your completed block)
+  // existing Clock CIL builder
   const cil = (() => {
     const s = String(text2 || '').toLowerCase().trim().replace(/\s+/g, ' ');
     const c = s.replace(/\s+/g, '');
@@ -2347,120 +2387,105 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
   console.info('[TIME_V2_CIL]', { flagsTimeV2: true, text2, matched: !!cil, cil });
 
   if (cil) {
-  const nowIso = new Date().toISOString();
+    const nowIso = new Date().toISOString();
 
-  const actorId = String(req.actorKey || req.from || '').replace(/\D/g, '');
-  const ownerDigits = String(req.ownerId || '').replace(/\D/g, '');
+    const actorId = String(req.actorKey || req.from || '').replace(/\D/g, '');
+    const ownerDigits = String(req.ownerId || '').replace(/\D/g, '');
 
-  // Resolve targets (self vs crew vs explicit names)
-  const resolved = await resolveTargetUserIdsFromText({ ownerId: ownerDigits, text: text2 });
+    const resolved = await resolveTargetUserIdsFromText({ ownerId: ownerDigits, text: text2 });
 
-  // Default: target = actor (self)
-  let targets = resolved.targets || [];
-  if (!targets.length) targets = actorId ? [actorId] : [];
+    let targets = resolved.targets || [];
+    if (!targets.length) targets = actorId ? [actorId] : [];
 
-  // If we still don't have identity, fail-soft
-  if (!actorId) {
-    let msg = 'Timeclock: missing user identity (WaId).';
-    msg += await glossaryNudgeFrom(text2);
-    return ok(res, msg);
-  }
-
-  const baseCtx = {
-    owner_id: ownerDigits,
-    job_id: req.userProfile?.active_job_id || null,
-    created_by: actorId,
-    source_msg_id: messageSid || null,
-    meta: { job_name: req.userProfile?.active_job_name || null }
-  };
-
-  const cilToSend = { ...cil, at: nowIso };
-
-  // ✅ De-dupe targets defensively (important because name matching can create duplicates)
-  targets = Array.from(
-    new Set((targets || []).map((x) => String(x || '').replace(/\D/g, '')).filter(Boolean))
-  );
-
-  // MULTI-TARGET (Crew or explicit names)
-  if (targets.length > 1 || resolved.mode === 'crew') {
-    let okCount = 0;
-    let lastText = '';
-    const previewNames = [];
-    const previewSeen = new Set(); // ✅ prevent duplicate preview names
-
-    for (const targetId of targets) {
-      const ctx = { ...baseCtx, user_id: targetId };
-
-      try {
-        const reply = await handleClock(ctx, cilToSend);
-        if (reply?.text) lastText = reply.text;
-        okCount += 1;
-
-        // Name preview (best-effort, only for successful targets)
-        const nmRaw = resolved.namesById?.[targetId];
-        const nm = String(nmRaw || '').trim();
-
-        if (nm && previewNames.length < 4) {
-          const key = nm.toLowerCase();
-          if (!previewSeen.has(key)) {
-            previewSeen.add(key);
-            previewNames.push(nm);
-          }
-        }
-      } catch (e) {
-        console.warn('[TIME_V2_MULTI] target failed:', e?.message, { targetId });
-      }
-    }
-
-    if (!okCount) {
-      let msg = 'Timeclock: no valid targets found.';
+    if (!actorId) {
+      let msg = 'Timeclock: missing user identity (WaId).';
       msg += await glossaryNudgeFrom(text2);
       return ok(res, msg);
     }
 
-    let msg = aggregateCrewMessage({
-      action: cil.action,
-      count: okCount,
-      previewNames,
-      baseText: lastText || 'Time logged.'
-    });
+    const baseCtx = {
+      owner_id: ownerDigits,
+      job_id: req.userProfile?.active_job_id || null,
+      created_by: actorId,
+      source_msg_id: messageSid || null,
+      meta: { job_name: req.userProfile?.active_job_name || null }
+    };
 
+    const cilToSend = { ...cil, at: nowIso };
+
+    targets = Array.from(new Set((targets || []).map((x) => String(x || '').replace(/\D/g, '')).filter(Boolean)));
+
+    if (targets.length > 1 || resolved.mode === 'crew') {
+      let okCount = 0;
+      let lastText = '';
+      const previewNames = [];
+      const previewSeen = new Set();
+
+      for (const targetId of targets) {
+        const ctx = { ...baseCtx, user_id: targetId };
+
+        try {
+          const reply = await handleClock(ctx, cilToSend);
+          if (reply?.text) lastText = reply.text;
+          okCount += 1;
+
+          const nmRaw = resolved.namesById?.[targetId];
+          const nm = String(nmRaw || '').trim();
+
+          if (nm && previewNames.length < 4) {
+            const key = nm.toLowerCase();
+            if (!previewSeen.has(key)) {
+              previewSeen.add(key);
+              previewNames.push(nm);
+            }
+          }
+        } catch (e) {
+          console.warn('[TIME_V2_MULTI] target failed:', e?.message, { targetId });
+        }
+      }
+
+      if (!okCount) {
+        let msg = 'Timeclock: no valid targets found.';
+        msg += await glossaryNudgeFrom(text2);
+        return ok(res, msg);
+      }
+
+      let msg = aggregateCrewMessage({
+        action: cil.action,
+        count: okCount,
+        previewNames,
+        baseText: lastText || 'Time logged.'
+      });
+
+      msg += await glossaryNudgeFrom(text2);
+      return ok(res, msg);
+    }
+
+    const targetUserId = String(targets[0] || actorId).replace(/\D/g, '') || actorId;
+    const ctx = { ...baseCtx, user_id: targetUserId };
+
+    const raw = await handleClock(ctx, cilToSend);
+
+    const reply =
+      typeof raw === 'string'
+        ? { text: raw, targetUserId }
+        : raw && typeof raw === 'object'
+          ? { text: raw.text || 'Time logged.', targetUserId: raw.targetUserId || targetUserId }
+          : { text: 'Time logged.', targetUserId };
+
+    let msg = String(reply.text || 'Time logged.').trim();
     msg += await glossaryNudgeFrom(text2);
 
-    // One clean aggregated line (no per-target injection)
-    return ok(res, msg);
+    return twimlWithTargetName(res, msg, {
+      ownerId: ownerDigits,
+      actorId,
+      targetUserId: reply.targetUserId || targetUserId,
+      fallbackName: req.userProfile?.name || req.userProfile?.ProfileName || ''
+    });
   }
-
-  // SINGLE TARGET (self)
-const targetUserId = String(targets[0] || actorId).replace(/\D/g, '') || actorId;
-const ctx = { ...baseCtx, user_id: targetUserId };
-
-// ✅ ALWAYS define a local variable, then normalize into { text, targetUserId }
-const raw = await handleClock(ctx, cilToSend);
-
-// Normalize: handleClock might return string OR object
-const reply =
-  typeof raw === 'string'
-    ? { text: raw, targetUserId }
-    : (raw && typeof raw === 'object')
-      ? { text: raw.text || 'Time logged.', targetUserId: raw.targetUserId || targetUserId }
-      : { text: 'Time logged.', targetUserId };
-
-// build final message
-let msg = String(reply.text || 'Time logged.').trim();
-msg += await glossaryNudgeFrom(text2);
-
-// Use TwiML wrapper so actor+target names are injected
-return twimlWithTargetName(res, msg, {
-  ownerId: ownerDigits,
-  actorId,
-  targetUserId: reply.targetUserId || targetUserId,
-  fallbackName: req.userProfile?.name || req.userProfile?.ProfileName || ''
-});
-
 }
 
-}
+
 
 
 

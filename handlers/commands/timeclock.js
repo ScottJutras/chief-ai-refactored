@@ -1020,14 +1020,14 @@ function parseDurationMinutes(s) {
 async function handleBreakDurationRepairReply(ctx, text) {
   const owner_id = String(ctx?.owner_id || '').trim();
   const user_id = String(ctx?.user_id || '').trim();
-  const source_msg_id = ctx.source_msg_id ? String(ctx.source_msg_id).trim() : null;
-  const tz = ctx.tz || 'UTC';
+  const source_msg_id = ctx?.source_msg_id ? String(ctx.source_msg_id).trim() : null;
+  const tz = ctx?.tz || 'UTC';
 
   const ret = (msg) => ({ text: String(msg || '').trim(), targetUserId: user_id || null });
 
   if (!owner_id || !user_id) return ret('Timeclock: missing owner_id or user_id.');
 
-  // Find active prompt
+  // Find active prompt (most recent, unexpired)
   const { rows } = await pg.query(
     `SELECT *
        FROM public.timeclock_repair_prompts
@@ -1039,8 +1039,16 @@ async function handleBreakDurationRepairReply(ctx, text) {
       LIMIT 1`,
     [owner_id, user_id]
   );
+
   const prompt = rows?.[0] || null;
   if (!prompt) return null; // no-op, let normal routing proceed
+
+  // ✅ Only intercept if the message looks like a duration reply or skip
+  // This prevents "clock in" / "clock out" from being treated as "invalid duration"
+  const looksDurationOrSkip =
+    /^\s*(skip|no|n|\d{1,4}\s*(m|min|mins|minute|minutes)?|\d{1,2}\s*:\s*\d{1,2})\s*$/i.test(String(text || ''));
+
+  if (!looksDurationOrSkip) return null;
 
   const parsed = parseDurationMinutes(text);
   if (!parsed) {
@@ -1057,7 +1065,7 @@ async function handleBreakDurationRepairReply(ctx, text) {
     return ret('Sorry — reply like “20 min” or “skip”.');
   }
 
-  // sanity cap (you can tune this)
+  // sanity cap (tune anytime)
   if (minutes > 360) {
     return ret('That break length looks too long. Reply like “20 min” or “skip”.');
   }
@@ -1066,40 +1074,38 @@ async function handleBreakDurationRepairReply(ctx, text) {
   const newEnd = new Date(clockOutAt.getTime() - minutes * 60 * 1000);
   const newEndIso = newEnd.toISOString();
 
-  // Only adjust if the break currently ends at clock-out (or is later). This avoids weird rewrites.
   const r = await pg.query(
-  `UPDATE public.time_entries_v2
-      SET end_at_utc = $3::timestamptz,
-          updated_at = now(),
-          meta = jsonb_set(
-            coalesce(meta,'{}'::jsonb),
-            '{repair}',
-            jsonb_build_object(
-              'kind','break_duration',
-              'minutes',$4::int,
-              'clock_out_at_utc',$5::timestamptz,
-              'adjusted_end_at_utc',$3::timestamptz,
-              'source_msg_id',$6
-            ),
-            true
-          )
-    WHERE owner_id = $1
-      AND id = $2::bigint
-      AND deleted_at IS NULL
-    RETURNING id`,
-  [owner_id, prompt.break_entry_id, newEndIso, minutes, prompt.clock_out_at_utc, source_msg_id]
-);
+    `UPDATE public.time_entries_v2
+        SET end_at_utc = $3::timestamptz,
+            updated_at = now(),
+            meta = jsonb_set(
+              coalesce(meta,'{}'::jsonb),
+              '{repair}',
+              jsonb_build_object(
+                'kind','break_duration',
+                'minutes',$4::int,
+                'clock_out_at_utc',$5::timestamptz,
+                'adjusted_end_at_utc',$3::timestamptz,
+                'source_msg_id',$6::text
+              ),
+              true
+            )
+      WHERE owner_id = $1
+        AND id = $2::bigint
+        AND deleted_at IS NULL
+      RETURNING id`,
+    [owner_id, prompt.break_entry_id, newEndIso, minutes, prompt.clock_out_at_utc, source_msg_id]
+  );
 
+  // Clear prompt regardless (fail-soft)
   await pg.query(`DELETE FROM public.timeclock_repair_prompts WHERE id=$1`, [prompt.id]);
 
   if (!r?.rows?.length) {
-    // fail-soft
     return ret('Okay — I couldn’t adjust that break (it may have already been edited).');
   }
 
   return ret(`✅ Got it — set your break to ${minutes} min (ended at ${toHumanTime(newEndIso, tz)}).`);
 }
-
 
 /* ---------------- CIL handler (new schema path) ---------------- */
 

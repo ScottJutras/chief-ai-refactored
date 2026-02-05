@@ -315,6 +315,11 @@ async function twimlWithTargetName(res, text, opts = {}) {
   // If we can’t identify a target, just return as-is
   if (!ownerId || !targetUserId) return twiml(res, msg);
 
+  // ✅ Detect placeholder usage (if present, we should NOT append a suffix name)
+  const hadNamePlaceholder = /\{name\}/i.test(msg);
+  const hadTargetPlaceholder = /\{target\}/i.test(msg);
+  const hadAnyPlaceholder = hadNamePlaceholder || hadTargetPlaceholder;
+
   try {
     // Prefer real display name via helper
     let display = '';
@@ -330,7 +335,21 @@ async function twimlWithTargetName(res, text, opts = {}) {
     // If still nothing, just return original message
     if (!display) return twiml(res, msg);
 
-    // ✅ Correct call signature: rewriteWithActorTargetNames expects ONE object
+    // ✅ Replace placeholder(s) with FIRST name (Scott) not full name (Scott Jutras)
+    if (hadAnyPlaceholder) {
+      const first =
+        String(display || '')
+          .trim()
+          .split(/\s+/)[0] || 'there';
+
+      msg = msg.replace(/\{name\}/gi, first).replace(/\{target\}/gi, first);
+
+      // If we used placeholders, return without further rewriting or suffix-append.
+      // (Prevents "Scott Jutras" being appended at end.)
+      return twiml(res, msg);
+    }
+
+    // ✅ Otherwise, try the actor/target rewriter (for the normal “You…” phrasing)
     try {
       if (typeof rewriteWithActorTargetNames === 'function') {
         const rewritten = await rewriteWithActorTargetNames({
@@ -340,7 +359,6 @@ async function twimlWithTargetName(res, text, opts = {}) {
           text: msg
         });
 
-        // If rewrite returns something usable, trust it
         if (rewritten && String(rewritten).trim()) {
           return twiml(res, String(rewritten).trim());
         }
@@ -358,6 +376,7 @@ async function twimlWithTargetName(res, text, opts = {}) {
     return twiml(res, msg);
   }
 }
+
 
 
 
@@ -1183,6 +1202,8 @@ async function handleClock(ctx, cil) {
 
   const source_msg_id = ctx.source_msg_id ? String(ctx.source_msg_id).trim() : null;
   const tz = ctx.tz || 'UTC';
+  console.info('[TIME_V2_TZ]', { owner_id, user_id, tz });
+
 
   // ---------------- helpers ----------------
 

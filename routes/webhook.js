@@ -2418,12 +2418,14 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
     }
 
     const baseCtx = {
-      owner_id: ownerDigits,
-      job_id: req.userProfile?.active_job_id || null,
-      created_by: actorId,
-      source_msg_id: messageSid || null,
-      meta: { job_name: req.userProfile?.active_job_name || null }
-    };
+  owner_id: ownerDigits,
+  job_id: req.userProfile?.active_job_id || null,
+  created_by: actorId,
+  source_msg_id: messageSid || null,
+  tz: req.tz || req.userProfile?.tz || 'America/Toronto',
+  meta: { job_name: req.userProfile?.active_job_name || null }
+};
+
 
     const cilToSend = { ...cil, at: nowIso };
 

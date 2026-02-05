@@ -1011,10 +1011,72 @@ async function getCurrentState(ownerId, employeeName) {
   return { hasOpenShift: false, openBreak: false, openLunch: false, openDrive: false, lastShiftStart: null };
 }
 function parseDurationMinutes(s) {
-  const raw = String(s || '').trim().toLowerCase();
+  const raw0 = String(s || '').trim();
+  const raw = raw0.toLowerCase().replace(/\s+/g, ' ').trim();
   if (!raw) return null;
 
+  // skip
   if (/^(skip|no|n)$/i.test(raw)) return { kind: 'skip' };
+
+  // ----- helpers -----
+  const WORD_NUM = {
+    zero: 0,
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+    thirteen: 13,
+    fourteen: 14,
+    fifteen: 15,
+    sixteen: 16,
+    seventeen: 17,
+    eighteen: 18,
+    nineteen: 19,
+    twenty: 20,
+    thirty: 30,
+    forty: 40,
+    fifty: 50,
+    sixty: 60,
+    seventy: 70,
+    eighty: 80,
+    ninety: 90
+  };
+
+  function wordToInt(w) {
+    const k = String(w || '').toLowerCase().trim();
+    if (!k) return null;
+    if (k === 'a' || k === 'an') return 1;
+    if (k in WORD_NUM) return WORD_NUM[k];
+
+    // allow "twenty one", "twenty-one"
+    const parts = k.replace(/-/g, ' ').split(' ').filter(Boolean);
+    if (parts.length === 2 && parts[0] in WORD_NUM && parts[1] in WORD_NUM) {
+      const a = WORD_NUM[parts[0]];
+      const b = WORD_NUM[parts[1]];
+      // only allow 20/30/.. + 1..9
+      if (a >= 20 && a % 10 === 0 && b > 0 && b < 10) return a + b;
+    }
+    return null;
+  }
+
+  function clampMinutes(n) {
+    if (!Number.isFinite(n)) return null;
+    const m = Math.round(n);
+    if (m <= 0) return null;
+    // keep your sanity cap
+    if (m > 360) return null;
+    return m;
+  }
+
+  // ----- existing formats -----
 
   // 0:20 / 00:20
   const hhmm = raw.match(/^(\d{1,2})\s*:\s*(\d{1,2})$/);
@@ -1022,19 +1084,96 @@ function parseDurationMinutes(s) {
     const h = Number(hhmm[1]);
     const m = Number(hhmm[2]);
     if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
-    return { kind: 'minutes', minutes: h * 60 + m };
+    const out = clampMinutes(h * 60 + m);
+    if (!out) return null;
+    return { kind: 'minutes', minutes: out };
   }
 
-  // 20m / 20 min / 20mins
+  // 20m / 20 min / 20mins / 20 minute(s)
   const m1 = raw.match(/^(\d{1,4})\s*(m|min|mins|minute|minutes)$/);
-  if (m1) return { kind: 'minutes', minutes: Number(m1[1]) };
+  if (m1) {
+    const out = clampMinutes(Number(m1[1]));
+    if (!out) return null;
+    return { kind: 'minutes', minutes: out };
+  }
 
   // plain number => minutes
   const plain = raw.match(/^(\d{1,4})$/);
-  if (plain) return { kind: 'minutes', minutes: Number(plain[1]) };
+  if (plain) {
+    const out = clampMinutes(Number(plain[1]));
+    if (!out) return null;
+    return { kind: 'minutes', minutes: out };
+  }
+
+  // ----- NEW: compact hour/min tokens -----
+  // "1h", "1h15m", "1h 15m"
+  const hmCompact = raw.match(/^(\d{1,2})\s*h(?:\s*(\d{1,2})\s*m)?$/);
+  if (hmCompact) {
+    const h = Number(hmCompact[1]);
+    const m = hmCompact[2] != null ? Number(hmCompact[2]) : 0;
+    if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+    const out = clampMinutes(h * 60 + m);
+    if (!out) return null;
+    return { kind: 'minutes', minutes: out };
+  }
+
+  // ----- NEW: strict "X hour(s) [Y minute(s)]" -----
+  // e.g., "1 hour", "2 hours", "1 hour 15", "1 hour 15 minutes"
+  const hourMin = raw.match(
+    /^(\d{1,2})\s*(h|hr|hrs|hour|hours)(?:\s+(\d{1,2})\s*(m|min|mins|minute|minutes)?)?$/
+  );
+  if (hourMin) {
+    const h = Number(hourMin[1]);
+    const m = hourMin[3] != null ? Number(hourMin[3]) : 0;
+    if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+    const out = clampMinutes(h * 60 + m);
+    if (!out) return null;
+    return { kind: 'minutes', minutes: out };
+  }
+
+  // ----- NEW: word-number minutes -----
+  // "ten minutes", "one min", "a minute"
+  const wordMin = raw.match(/^([a-z-]+)\s*(m|min|mins|minute|minutes)$/);
+  if (wordMin) {
+    const n = wordToInt(wordMin[1]);
+    if (n == null) return null;
+    const out = clampMinutes(n);
+    if (!out) return null;
+    return { kind: 'minutes', minutes: out };
+  }
+
+  // ----- NEW: word-number hours (optionally + minutes) -----
+  // "an hour", "two hours", "two hours fifteen minutes"
+  const wordHour = raw.match(
+    /^([a-z-]+)\s*(h|hr|hrs|hour|hours)(?:\s+([a-z-]+|\d{1,2})\s*(m|min|mins|minute|minutes)?)?$/
+  );
+  if (wordHour) {
+    const h = wordToInt(wordHour[1]);
+    if (h == null) return null;
+
+    let m = 0;
+    if (wordHour[3] != null) {
+      if (/^\d{1,2}$/.test(String(wordHour[3]))) m = Number(wordHour[3]);
+      else {
+        const mw = wordToInt(wordHour[3]);
+        if (mw == null) return null;
+        m = mw;
+      }
+    }
+
+    const out = clampMinutes(h * 60 + m);
+    if (!out) return null;
+    return { kind: 'minutes', minutes: out };
+  }
+
+  // ----- NEW: "half hour" variants -----
+  if (/^(half\s*(an?\s*)?(h|hr|hour))$/.test(raw) || /^(a\s*half\s*(an?\s*)?(h|hr|hour))$/.test(raw)) {
+    return { kind: 'minutes', minutes: 30 };
+  }
 
   return null;
 }
+
 
 async function handleSegmentDurationRepairReply(ctx, text) {
   const owner_id = String(ctx?.owner_id || '').trim();
@@ -1047,8 +1186,10 @@ async function handleSegmentDurationRepairReply(ctx, text) {
   if (!owner_id || !user_id) return ret('Timeclock: missing owner_id or user_id.');
 
   // quick gate: don't hijack random texts
-  const looksDurationOrSkip =
-    /^\s*(skip|no|n|\d{1,4}\s*(m|min|mins|minute|minutes)?|\d{1,2}\s*:\s*\d{1,2})\s*$/i.test(String(text || ''));
+const looksDurationOrSkip =
+  /^\s*(skip|no|n|(\d{1,4}\s*(m|min|mins|minute|minutes)?)|(\d{1,2}\s*:\s*\d{1,2})|([a-z-]+\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours))|(half\s*(an?\s*)?(h|hr|hour))|(a\s*half\s*(an?\s*)?(h|hr|hour)))\s*$/i
+    .test(String(text || ''));
+
   if (!looksDurationOrSkip) return null;
 
   // Find active prompt (most recent, unexpired)
@@ -1151,11 +1292,14 @@ async function handleSegmentDurationRepairReply(ctx, text) {
   if (!r?.rows?.length) return ret('Okay — I couldn’t adjust that (it may have already been edited).');
 
   const segLabel =
-    segKind === 'lunch' ? 'lunch' :
-    segKind === 'drive' ? 'drive' : 'break';
+  segKind === 'lunch' ? 'lunch' :
+  segKind === 'drive' ? 'drive' : 'break';
 
-  // {target} placeholder so twimlWithTargetName can rewrite it
-  return ret(`✅ You got it, {target}. I set your ${segLabel} to ${minutesApplied} min (ended at ${toHumanTime(appliedEnd.toISOString(), tz)}).`);
+// Optional: personalize with first name if available
+const firstName = String(ctx?.fallbackName || '').trim().split(/\s+/)[0] || '';
+const who = firstName ? `, ${firstName}` : '';
+
+return ret(`✅ You got it${who}. I set your ${segLabel} to ${minutesApplied} min (ended at ${toHumanTime(appliedEnd.toISOString(), tz)}).`);
 }
 
 

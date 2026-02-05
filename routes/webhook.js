@@ -2316,15 +2316,17 @@ if (flags.timeclock_v2) {
       const actorId = String(req.actorKey || req.from || '').replace(/\D/g, '');
 
       if (ownerDigits && actorId) {
-        const repairOut = await handleSegmentDurationRepairReply(
+      const repairOut = await handleSegmentDurationRepairReply(
   {
     owner_id: ownerDigits,
     user_id: actorId,
     source_msg_id: messageSid || null,
-    tz: req.tz || req.userProfile?.tz || req.userProfile?.timezone || 'America/Toronto'
+    tz: req.tz || req.userProfile?.tz || 'America/Toronto',
+    fallbackName: req.userProfile?.name || req.userProfile?.ProfileName || ''
   },
   text2
 );
+
 
 // ✅ LOG RIGHT HERE
 console.info('[TIME_V2_REPAIR_CHECK]', {

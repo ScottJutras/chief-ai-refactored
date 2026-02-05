@@ -1418,6 +1418,7 @@ console.info('[TIME_V2_OUT_OPEN_BREAK]', { openBreakId: openBreakId || null, shi
   }
 let finalText = `✅ Clocked out. ${msg}`;
 
+let promptInserted = false;
 // If a break was open at clock-out, create a repair prompt
 if (openBreakId) {
   try {
@@ -1428,7 +1429,7 @@ if (openBreakId) {
         ($1,$2,'break_duration',$3,$4,$5, now() + interval '12 hours', $6)`,
       [owner_id, user_id, shift.id, openBreakId, occurredAtIso, source_msg_id]
     );
-
+    promptInserted = true;
     // ✅ LOG RIGHT HERE (insert succeeded)
     console.info('[TIME_V2_REPAIR_PROMPT_INSERTED]', {
       owner_id,
@@ -1441,12 +1442,12 @@ if (openBreakId) {
   } catch (e) {
     console.warn('[REPAIR_PROMPT] insert failed (ignored):', e?.message);
   }
-
+    if (promptInserted) {
   finalText =
     `✅ Clocked out. Your break was still running — I ended it at clock-out.\n` +
     `How long was your break? (e.g., “20 min”) or reply “skip”.`;
+  }
 }
-
 
 return ret('Timeclock: action not recognized.');
 

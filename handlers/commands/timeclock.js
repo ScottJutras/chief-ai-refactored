@@ -1407,14 +1407,14 @@ async function clearRepairPrompt(id) {
 
 
 
-  // Segment START (break/lunch/drive)
+ // Segment START (break/lunch/drive)
 if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed.action === 'drive_start') {
   const { shift, errText } = await requireOpenShift();
   if (!shift) return ret(errText);
 
   const kind = parsed.action.split('_')[0]; // break | lunch | drive
 
-  // ✅ If another segment is open, close it at THIS segment start time and create a repair prompt for it
+  // If another segment is open, close it at THIS segment start time and create a repair prompt for it
   const { rows: openAnyRows } = await pg.query(
     `SELECT id, kind, start_at_utc
        FROM public.time_entries_v2
@@ -1430,7 +1430,11 @@ if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed
 
   const openAny = openAnyRows?.[0] || null;
 
+  let repairTail = '';
+
   if (openAny && String(openAny.kind) !== String(kind)) {
+    const prevKind = String(openAny.kind);
+
     // auto-end previous segment at this moment
     await pg.query(
       `UPDATE public.time_entries_v2
@@ -1451,18 +1455,36 @@ if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed
           user_id,
           shift.id,
           openAny.id,
-          String(openAny.kind),
+          prevKind,
           occurredAtIso,
           `switch_to_${kind}`,
           source_msg_id
         ]
       );
+
+      // success log (helps debugging segment switches)
+      console.info('[TIME_V2_REPAIR_PROMPT_INSERTED]', {
+        owner_id,
+        user_id,
+        shiftId: shift.id,
+        entryId: openAny.id,
+        segment: prevKind,
+        endedAtUtc: occurredAtIso,
+        reason: `switch_to_${kind}`,
+        source_msg_id
+      });
+
+      const label = prevKind === 'lunch' ? 'lunch' : prevKind === 'drive' ? 'drive' : 'break';
+      repairTail =
+        `Your ${label} was still running — I ended it at ${kind} start.\n` +
+        `How long was your ${label}? (e.g., “20 min”) or reply “skip”.`;
     } catch (e) {
       console.warn('[REPAIR_PROMPT] insert failed (ignored):', e?.message);
+      // fail-soft: still proceed starting the new segment
     }
   }
 
-  // ✅ If same kind already open, don't create a new one
+  // If same kind already open, don't create a new one
   const { rows: openKids } = await pg.query(
     `SELECT id, start_at_utc
        FROM public.time_entries_v2
@@ -1482,7 +1504,7 @@ if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed
     return ret(`${label} already started at ${formatLocal(openKid.start_at_utc, tz)}.`);
   }
 
-  // ✅ Create the new segment entry
+  // Create the new segment entry
   const inserted = await insertEntry({
     owner_id,
     user_id,
@@ -1505,10 +1527,12 @@ if (parsed.action === 'break_start' || parsed.action === 'lunch_start' || parsed
     );
   }
 
-  if (kind === 'lunch') return ret(`🍽️ Lunch started.`);
-  if (kind === 'break') return ret(`⏸️ Break started.`);
-  return ret(`🚚 Drive started.`);
+  const startedLine = kind === 'lunch' ? `🍽️ Lunch started.` : kind === 'break' ? `⏸️ Break started.` : `🚚 Drive started.`;
+
+  // If we had to auto-close another segment, append the repair question as extra lines
+  return ret(repairTail ? `${startedLine}\n${repairTail}` : startedLine);
 }
+
 
 
   // Segment STOP (break/lunch/drive)

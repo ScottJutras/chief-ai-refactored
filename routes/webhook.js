@@ -223,13 +223,7 @@ async function resolveTargetUserIdsFromText({ ownerId, text }) {
 
 
 function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
-  const a0 = String(action || '').toLowerCase();
-
-  // normalize possible variants
-  const a =
-    a0 === 'clock_in' ? 'in' :
-    a0 === 'clock_out' ? 'out' :
-    a0;
+  const a = String(action || '').toLowerCase();
 
   const map = {
     in: '✅ Clocked in',
@@ -242,20 +236,24 @@ function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
     drive_stop: '🅿️ Drive stopped'
   };
 
+  const bt = String(baseText || '').trim();
+
+  // If handler returned multi-line text, keep the "tail" as a follow-up under the crew line.
+  const parts = bt.split('\n').map((x) => x.trim()).filter(Boolean);
+  const tail = parts.length > 1 ? parts.slice(1).join('\n') : '';
+
   const head =
     map[a] ||
-    String(baseText || 'Time logged.')
+    (parts[0] || 'Time logged.')
       .replace(/\s+for\s+.+$/i, '')
       .trim();
 
-  const nLabel = count === 1 ? '1 person' : `${count} people`;
-
   const preview =
     Array.isArray(previewNames) && previewNames.length && count <= 4
-      ? ` (${nLabel}: ${previewNames.slice(0, 4).join(', ')})`
-      : ` (${nLabel})`;
+      ? ` (${count} people: ${previewNames.slice(0, 4).join(', ')})`
+      : ` (${count} people)`;
 
-  return `${head} for Crew${preview}.`;
+  return `${head} for Crew${preview}.${tail ? `\n${tail}` : ''}`;
 }
 
 

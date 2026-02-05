@@ -2312,13 +2312,13 @@ console.info('[TIME_V2_GATE]', { timeclock_v2: !!flags.timeclock_v2, isHardTimeC
 // even if the text is NOT a hard time command (e.g., "20 min").
 if (flags.timeclock_v2) {
   try {
-    const { handleBreakDurationRepairReply } = require('../handlers/commands/timeclock');
-    if (typeof handleBreakDurationRepairReply === 'function') {
+    const { handleSegmentDurationRepairReply } = require('../handlers/commands/timeclock');
+    if (typeof handleSegmentDurationRepairReply === 'function') {
       const ownerDigits = String(req.ownerId || '').replace(/\D/g, '');
       const actorId = String(req.actorKey || req.from || '').replace(/\D/g, '');
 
       if (ownerDigits && actorId) {
-        const repairOut = await handleBreakDurationRepairReply(
+        const repairOut = await handleSegmentDurationRepairReply(
   {
     owner_id: ownerDigits,
     user_id: actorId,

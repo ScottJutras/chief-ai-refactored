@@ -223,7 +223,13 @@ async function resolveTargetUserIdsFromText({ ownerId, text }) {
 
 
 function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
-  const a = String(action || '').toLowerCase();
+  const a0 = String(action || '').toLowerCase();
+
+  // normalize possible variants
+  const a =
+    a0 === 'clock_in' ? 'in' :
+    a0 === 'clock_out' ? 'out' :
+    a0;
 
   const map = {
     in: '✅ Clocked in',
@@ -242,11 +248,12 @@ function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
       .replace(/\s+for\s+.+$/i, '')
       .trim();
 
-  // Name preview for small counts
+  const nLabel = count === 1 ? '1 person' : `${count} people`;
+
   const preview =
     Array.isArray(previewNames) && previewNames.length && count <= 4
-      ? ` (${count} people: ${previewNames.slice(0, 4).join(', ')})`
-      : ` (${count} people)`;
+      ? ` (${nLabel}: ${previewNames.slice(0, 4).join(', ')})`
+      : ` (${nLabel})`;
 
   return `${head} for Crew${preview}.`;
 }

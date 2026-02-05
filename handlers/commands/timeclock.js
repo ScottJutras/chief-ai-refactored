@@ -1105,9 +1105,8 @@ async function handleBreakDurationRepairReply(ctx, text) {
   }
 
   return ret(
-  `✅ You got it, {target}. I set your break to ${minutes} min (ended at ${toHumanTime(newEndIso, tz)}).`
-);
-
+  `✅ You got it. I set your break to ${minutes} min (ended at ${toHumanTime(newEndIso, tz)}).`);
+}
 
 /* ---------------- CIL handler (new schema path) ---------------- */
 

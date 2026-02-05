@@ -1271,98 +1271,140 @@ async function clearRepairPrompt(id) {
     return ret(`✅ Clocked in at ${toHumanTime(occurredAtIso, tz)}.`);
   }
 
-  if (parsed.action === 'out') {
+ if (parsed.action === 'out') {
   const { shift, errText } = await requireOpenShift();
   if (!shift) return ret(errText);
 
   // detect any open segment (break/lunch/drive) BEFORE we auto-close children
-const { rows: openSegRows } = await pg.query(
-  `SELECT id, kind
-     FROM public.time_entries_v2
-    WHERE owner_id=$1
-      AND parent_id=$2
-      AND kind IN ('break','lunch','drive')
-      AND end_at_utc IS NULL
-      AND deleted_at IS NULL
-    ORDER BY start_at_utc DESC
-    LIMIT 1`,
-  [owner_id, shift.id]
-);
+  const { rows: openSegRows } = await pg.query(
+    `SELECT id, kind
+       FROM public.time_entries_v2
+      WHERE owner_id=$1
+        AND parent_id=$2
+        AND kind IN ('break','lunch','drive')
+        AND end_at_utc IS NULL
+        AND deleted_at IS NULL
+      ORDER BY start_at_utc DESC
+      LIMIT 1`,
+    [owner_id, shift.id]
+  );
 
-const openSeg = openSegRows?.[0] || null;
-const openSegId = openSeg?.id || null;
-const openSegKind = String(openSeg?.kind || '').trim() || null;
+  const openSeg = openSegRows?.[0] || null;
+  const openSegId = openSeg?.id || null;
+  const openSegKind = String(openSeg?.kind || '').trim() || null;
 
-console.info('[TIME_V2_OUT_OPEN_SEGMENT]', {
-  shiftId: shift.id,
-  openSegId: openSegId || null,
-  openSegKind: openSegKind || null
-});
+  console.info('[TIME_V2_OUT_OPEN_SEGMENT]', {
+    shiftId: shift.id,
+    openSegId: openSegId || null,
+    openSegKind: openSegKind || null
+  });
 
-// close any open children (including break/lunch/drive) at clock-out time
-await pg.query(
-  `UPDATE public.time_entries_v2
-      SET end_at_utc=$3,
-          updated_at=now()
-    WHERE owner_id=$1
-      AND parent_id=$2
-      AND end_at_utc IS NULL
-      AND deleted_at IS NULL`,
-  [owner_id, shift.id, atRaw]
-);
+  // close any open children (including break/lunch/drive) at clock-out time
+  await pg.query(
+    `UPDATE public.time_entries_v2
+        SET end_at_utc=$3,
+            updated_at=now()
+      WHERE owner_id=$1
+        AND parent_id=$2
+        AND end_at_utc IS NULL
+        AND deleted_at IS NULL`,
+    [owner_id, shift.id, atRaw]
+  );
 
-// close the shift
-await closeEntryById(owner_id, shift.id, atRaw);
+  // close the shift
+  await closeEntryById(owner_id, shift.id, atRaw);
 
-// ... (calc, meta calc, emit, summaryLine) ...
+  // --- calc + store calc in meta ---
+  const policy = await fetchPolicy(owner_id);
+  const entries = await entriesForShift(owner_id, shift.id);
 
-let finalText = `✅ Clocked out. ${summaryLine}`;
+  let calc = { paidMinutes: 0, unpaidLunch: 0, unpaidBreak: 0 };
+  try {
+    // eslint-disable-next-line global-require
+    const { computeShiftCalc } = require('../../services/timecalc');
+    calc = computeShiftCalc(entries, policy) || calc;
+  } catch {}
 
-// If a segment was open at clock-out, create repair prompt + use kind-specific copy
-if (openSegId && openSegKind) {
   try {
     await pg.query(
-      `INSERT INTO public.timeclock_repair_prompts
-        (owner_id, user_id, kind, shift_id, entry_id, segment_kind, ended_at_utc, ended_reason, expires_at, source_msg_id)
-       VALUES
-        ($1,$2,'segment_duration',$3,$4,$5,$6,'clock_out', now() + interval '12 hours', $7)`,
-      [
+      `UPDATE public.time_entries_v2
+          SET meta = jsonb_set(coalesce(meta,'{}'::jsonb), '{calc}', $3::jsonb),
+              updated_at=now()
+        WHERE id=$1 AND owner_id=$2`,
+      [shift.id, owner_id, JSON.stringify(calc)]
+    );
+  } catch {}
+
+  // KPI touch + fact event
+  try {
+    const day = new Date(shift.start_at_utc).toISOString().slice(0, 10);
+    await touchKPI(owner_id, shift.job_id, day);
+  } catch {}
+
+  try {
+    await emit(
+      { action: 'out', kind: 'shift', at: occurredAtIso, shift_id: shift.id, calc },
+      'clock_out',
+      shift.id,
+      shift.job_id || null
+    );
+  } catch {}
+
+  // summary line (MUST exist in this scope)
+  const paidMinutes = Number(calc?.paidMinutes || 0);
+  const unpaidLunch = Number(calc?.unpaidLunch || 0);
+  const unpaidBreak = Number(calc?.unpaidBreak || 0);
+
+  const summaryLine =
+    unpaidLunch > 0 || unpaidBreak > 0
+      ? `⏱️ Paid ${Math.floor(paidMinutes / 60)}h ${paidMinutes % 60}m (policy deducted lunch ${unpaidLunch}m, breaks ${unpaidBreak}m).`
+      : `⏱️ Paid ${Math.floor(paidMinutes / 60)}h ${paidMinutes % 60}m.`;
+
+  let finalText = `✅ Clocked out. ${summaryLine}`;
+
+  // If a segment was open at clock-out, create repair prompt + use kind-specific copy
+  if (openSegId && openSegKind) {
+    try {
+      await pg.query(
+        `INSERT INTO public.timeclock_repair_prompts
+          (owner_id, user_id, kind, shift_id, entry_id, segment_kind, ended_at_utc, ended_reason, expires_at, source_msg_id)
+         VALUES
+          ($1,$2,'segment_duration',$3,$4,$5,$6,'clock_out', now() + interval '12 hours', $7)`,
+        [
+          owner_id,
+          user_id,
+          shift.id,
+          openSegId,
+          openSegKind,
+          occurredAtIso,
+          source_msg_id
+        ]
+      );
+
+      // ✅ SUCCESS LOG GOES IMMEDIATELY AFTER INSERT SUCCEEDS (RIGHT HERE)
+      console.info('[TIME_V2_REPAIR_PROMPT_INSERTED]', {
         owner_id,
         user_id,
-        shift.id,
-        openSegId,
-        openSegKind,
+        shiftId: shift.id,
+        entryId: openSegId,
+        segment: openSegKind,
         occurredAtIso,
         source_msg_id
-      ]
-    );
+      });
 
-    // ✅ success log goes RIGHT HERE
-    console.info('[TIME_V2_REPAIR_PROMPT_INSERTED]', {
-      owner_id,
-      user_id,
-      shiftId: shift.id,
-      entryId: openSegId,
-      segment: openSegKind,
-      occurredAtIso,
-      source_msg_id
-    });
+      const label = openSegKind === 'lunch' ? 'lunch' : openSegKind === 'drive' ? 'drive' : 'break';
 
-    const label =
-      openSegKind === 'lunch' ? 'lunch' :
-      openSegKind === 'drive' ? 'drive' : 'break';
-
-    finalText =
-      `✅ Clocked out. Your ${label} was still running — I ended it at clock-out.\n` +
-      `How long was your ${label}? (e.g., “20 min”) or reply “skip”.`;
-  } catch (e) {
-    console.warn('[REPAIR_PROMPT] insert failed (ignored):', e?.message);
+      finalText =
+        `✅ Clocked out. Your ${label} was still running — I ended it at clock-out.\n` +
+        `How long was your ${label}? (e.g., “20 min”) or reply “skip”.`;
+    } catch (e) {
+      console.warn('[REPAIR_PROMPT] insert failed (ignored):', e?.message);
+    }
   }
+
+  return ret(finalText);
 }
 
-return ret(finalText);
-
-}
 
 
   // Segment START (break/lunch/drive)

@@ -2321,7 +2321,7 @@ if (flags.timeclock_v2) {
     owner_id: ownerDigits,
     user_id: actorId,
     source_msg_id: messageSid || null,
-    tz: req.tz || req.userProfile?.tz || 'UTC'
+    tz: req.tz || req.userProfile?.tz || req.userProfile?.timezone || 'America/Toronto'
   },
   text2
 );

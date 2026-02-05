@@ -2,6 +2,8 @@
 const pg = require('../services/postgres');
 const { getUserProfile, createUserProfile, getOwnerProfile } = pg;
 
+const DEFAULT_TZ = 'America/Toronto';
+
 /**
  * Digits-only identity (no whatsapp:, no +).
  */
@@ -14,10 +16,21 @@ function normalizeId(raw) {
   );
 }
 
+function pickTz(obj) {
+  // accept a few legacy keys
+  const tz =
+    (obj && (obj.tz || obj.timezone || obj.time_zone)) ||
+    null;
+  return tz ? String(tz).trim() : null;
+}
+
 function shapeProfile(p, from) {
   const user_id = p?.user_id || p?.id || from;
   const owner_id = p?.owner_id || p?.ownerId || user_id;
   const plan = (p?.plan || p?.subscription_tier || 'free').toLowerCase();
+
+  // ✅ normalize tz onto a single key on the shaped profile
+  const tz = pickTz(p) || null;
 
   return {
     user_id,
@@ -30,11 +43,14 @@ function shapeProfile(p, from) {
     plan,
     onboarding_in_progress: Boolean(p?.onboarding_in_progress || p?.onboardingPending || false),
 
+    // ✅ timezone
+    tz,
+
     // active job (hydrated best-effort below)
     active_job_id: p?.active_job_id ?? p?.activeJobId ?? null,
     active_job_name: p?.active_job_name ?? p?.activeJobName ?? null,
 
-    ...p
+    ...p // keep last so callers still get any extra fields you’ve added elsewhere
   };
 }
 
@@ -77,7 +93,6 @@ async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
     }
   }
 
-  // No legacy SQL fallbacks here. postgres.js already handles memberships/users/user_profiles safely.
   return null;
 }
 
@@ -136,6 +151,10 @@ async function userProfileMiddleware(req, _res, next) {
       req.userProfile = null;
       req.ownerProfile = null;
       req.isOwner = false;
+
+      // ✅ always set a tz on req (even in weird paths)
+      req.tz = DEFAULT_TZ;
+
       return next();
     }
 
@@ -180,6 +199,14 @@ async function userProfileMiddleware(req, _res, next) {
       console.warn('[userProfile] active job hydrate failed (ignored):', e?.message);
     }
 
+    // ✅ Canonical tz for the whole request:
+    // user override -> owner profile -> default
+    req.tz = pickTz(profile) || pickTz(ownerProfile) || DEFAULT_TZ;
+
+    // ✅ normalize onto userProfile + ownerProfile so legacy callsites are stable
+    if (profile && !profile.tz) profile.tz = req.tz;
+    if (ownerProfile && !ownerProfile.tz) ownerProfile.tz = req.tz;
+
     req.userProfile = profile;
     req.ownerProfile = ownerProfile;
     req.isOwner = String(profile.user_id) === String(req.ownerId);
@@ -187,6 +214,10 @@ async function userProfileMiddleware(req, _res, next) {
     return next();
   } catch (e) {
     console.warn('[userProfile] failed:', e?.message);
+
+    // ✅ fail-soft tz
+    req.tz = req.tz || DEFAULT_TZ;
+
     return next();
   }
 }

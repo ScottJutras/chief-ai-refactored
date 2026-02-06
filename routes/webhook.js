@@ -1149,18 +1149,35 @@ router.use((req, res, next) => {
   const SAFETY_MS = isWhatsApp ? 14000 : 8000;
 
   res.locals._safety = setTimeout(() => {
-    if (!res.headersSent) {
-      console.warn('[WEBHOOK] safety reply', {
-        phase: res.locals.phase,
-        msInPhase: Date.now() - (res.locals.phaseAt || Date.now()),
-        from: req.from,
-        messageSid: req.body?.MessageSid || req.body?.SmsMessageSid
-      });
-      ok(res); // empty TwiML (no bubble)
-    }
+    if (res.headersSent) return;
+
+    const phase = res.locals.phase || 'router';
+    const phaseAt = Number(res.locals.phaseAt || 0) || Date.now();
+    const msInPhase = Date.now() - phaseAt;
+
+    const messageSid =
+      String(req.body?.MessageSid || req.body?.SmsMessageSid || req.body?.MediaMessageSid || '').trim() || null;
+
+    console.warn('[WEBHOOK] safety reply', {
+      phase,
+      msInPhase,
+      from: req.from || null,
+      messageSid
+    });
+
+    // ✅ Always send a visible bubble (never empty TwiML)
+    return ok(
+      res,
+      '⚠️ That voice note took too long to process. Please try again, or type it (e.g., "clock in").'
+    );
   }, SAFETY_MS);
 
-  const clear = () => clearTimeout(res.locals._safety);
+  const clear = () => {
+    try {
+      clearTimeout(res.locals._safety);
+    } catch {}
+  };
+
   res.on('finish', clear);
   res.on('close', clear);
 

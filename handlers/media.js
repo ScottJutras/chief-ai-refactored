@@ -70,6 +70,12 @@ function xmlEsc(s = '') {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;');
 }
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout:${label}:${ms}ms`)), ms))
+  ]);
+}
 
 function twiml(text) {
   return `<Response><Message>${xmlEsc(String(text || '').trim())}</Message></Response>`;
@@ -324,6 +330,18 @@ async function fetchTwilioMediaBytes(mediaUrl, sourceMsgId) {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
 
+  console.info('[MEDIA_FETCH_TRY]', {
+    mediaUrl: String(mediaUrl || '').slice(0, 140),
+    sourceMsgId: sourceMsgId || null
+  });
+
+  if (!accountSid || !authToken) {
+    console.warn('[MEDIA_FETCH] missing Twilio creds', {
+      hasAccountSid: !!accountSid,
+      hasAuthToken: !!authToken
+    });
+  }
+
   const axiosCfg = {
     responseType: 'arraybuffer',
     auth: { username: accountSid, password: authToken },
@@ -339,7 +357,13 @@ async function fetchTwilioMediaBytes(mediaUrl, sourceMsgId) {
     const r = await axios.get(mediaUrl, axiosCfg);
     return Buffer.from(r.data);
   } catch (e1) {
+    console.warn('[MEDIA_FETCH_FAIL_1]', {
+      msg: e1?.message || 'unknown',
+      status: e1?.response?.status || null
+    });
+
     const mediaSid = getTwilioMediaSidFromUrlPath(mediaUrl) || getTwilioMediaSid(mediaUrl);
+
     const fallbackUrl = buildTwilioMediaDownloadUrl({
       accountSid,
       messageSid: sourceMsgId, // inbound Twilio MessageSid (MM…)
@@ -347,20 +371,34 @@ async function fetchTwilioMediaBytes(mediaUrl, sourceMsgId) {
     });
 
     if (fallbackUrl) {
+      console.info('[MEDIA_FETCH_FALLBACK_URL]', { fallbackUrl: String(fallbackUrl).slice(0, 180) });
+
       try {
         const r2 = await axios.get(fallbackUrl, axiosCfg);
         return Buffer.from(r2.data);
       } catch (e2) {
+        console.warn('[MEDIA_FETCH_FAIL_2]', {
+          msg: e2?.message || 'unknown',
+          status: e2?.response?.status || null
+        });
+
         console.warn('[MEDIA] fetchTwilioMediaBytes fallback failed:', e2?.message, {
           sourceMsgId,
           mediaSid,
           fallbackUrl
         });
+
         throw e2;
       }
     }
 
-    console.warn('[MEDIA] fetchTwilioMediaBytes initial failed:', e1?.message, { mediaUrl, sourceMsgId });
+    console.warn('[MEDIA] fetchTwilioMediaBytes initial failed:', e1?.message, {
+      mediaUrl: String(mediaUrl || '').slice(0, 180),
+      sourceMsgId,
+      mediaSid: mediaSid || null,
+      fallbackUrl: fallbackUrl || null
+    });
+
     throw e1;
   }
 }
@@ -588,13 +626,31 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       let confidence = null;
 
       try {
-        const audioBuf = await fetchTwilioMediaBytes(mediaUrl, sourceMsgId);
+       // --- Fetch media bytes with a hard timeout ---
+console.info('[MEDIA_AUDIO_FETCH_START]', { sourceMsgId: sourceMsgId || null, normType });
 
+let audioBuf;
+try {
+  audioBuf = await withTimeout(fetchTwilioMediaBytes(mediaUrl, sourceMsgId), 7000, 'twilio_media_fetch');
+  console.info('[MEDIA_AUDIO_FETCH_OK]', { bytes: audioBuf ? audioBuf.length : 0 });
+} catch (e) {
+  console.warn('[MEDIA_AUDIO_FETCH_FAIL]', e?.message);
+  return { transcript: null, twiml: twiml('⚠️ Voice took too long to download. Try again, or type: "clock in".') };
+}
 
-        const r1 = await transcribeAudio(audioBuf, normType, 'both');
-        const n1 = normalizeTranscriptionResult(r1);
-        transcript = n1.transcript;
-        confidence = n1.confidence;
+// --- Transcribe with a hard timeout ---
+console.info('[MEDIA_STT_START]', { engine: 'both', normType });
+
+try {
+  const r1 = await withTimeout(transcribeAudio(audioBuf, normType, 'both'), 7000, 'stt');
+  const n1 = normalizeTranscriptionResult(r1);
+  transcript = n1.transcript;
+  confidence = n1.confidence;
+  console.info('[MEDIA_STT_OK]', { len: String(transcript || '').length, confidence: confidence ?? null });
+} catch (e) {
+  console.warn('[MEDIA_STT_FAIL]', e?.message);
+  return { transcript: null, twiml: twiml('⚠️ Voice took too long to transcribe. Try again, or type: "clock in".') };
+}
 
         if (!transcript && normType === 'audio/ogg') {
           try {

@@ -642,7 +642,7 @@ try {
 console.info('[MEDIA_STT_START]', { engine: 'both', normType });
 
 try {
-  const r1 = await withTimeout(transcribeAudio(audioBuf, normType, 'both'), 7000, 'stt');
+  const r1 = await withTimeout(transcribeAudio(audioBuf, normType, 'both'), 11000, 'stt');
   const n1 = normalizeTranscriptionResult(r1);
   transcript = n1.transcript;
   confidence = n1.confidence;

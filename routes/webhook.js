@@ -60,22 +60,33 @@ function twimlEmpty() {
   return '<Response></Response>';
 }
 
-const sendTwiml = (res, twiml) => {
-  if (res.headersSent) return;
-  const out = String(twiml || '').trim();
-  // Always return valid XML
-  const payload = out ? out : twimlEmpty();
-  return res.status(200).type('text/xml; charset=utf-8').send(payload);
-};
+// ✅ bulletproof TwiML sender (never sends "nothing")
+function sendTwiml(res, xml) {
+  if (!res || res.headersSent) return;
+
+  // Accept raw TwiML string OR object { twiml: '...' }
+  let out = xml;
+  if (out && typeof out === 'object' && typeof out.twiml === 'string') {
+    out = out.twiml;
+  }
+
+  out = String(out || '').trim();
+  if (!out) out = twimlEmpty();
+
+  return res.status(200).type('text/xml; charset=utf-8').send(out);
+}
 
 // Safe default:
-// ok(res) -> empty TwiML
+// ok(res) -> empty TwiML (no bubble)
 // ok(res, "text") -> visible bubble
-const ok = (res, text = null) => {
+function ok(res, text = null) {
   if (res.headersSent) return;
-  if (!text) return sendTwiml(res, twimlEmpty());
-  return sendTwiml(res, twimlText(text));
-};
+
+  const t = text == null ? '' : String(text).trim();
+  if (!t) return sendTwiml(res, twimlEmpty());
+  return sendTwiml(res, twimlText(t));
+}
+
 
 const normalizePhone = (raw = '') =>
   String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '') || null;
@@ -1145,37 +1156,30 @@ router.use((req, res, next) => {
   const fromRaw = String(req.body?.From || req.from || '');
   const isWhatsApp = fromRaw.startsWith('whatsapp:') || !!req.body?.WaId;
 
-  // WhatsApp + AI can exceed 8s; still must respond before Twilio timeout.
   const SAFETY_MS = isWhatsApp ? 14000 : 8000;
+
+  // track phase timing
+  const startedAt = Date.now();
+  const messageSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
 
   res.locals._safety = setTimeout(() => {
     if (res.headersSent) return;
 
-    const phase = res.locals.phase || 'router';
-    const phaseAt = Number(res.locals.phaseAt || 0) || Date.now();
-    const msInPhase = Date.now() - phaseAt;
-
-    const messageSid =
-      String(req.body?.MessageSid || req.body?.SmsMessageSid || req.body?.MediaMessageSid || '').trim() || null;
+    const msInPhase = Date.now() - startedAt;
 
     console.warn('[WEBHOOK] safety reply', {
-      phase,
+      phase: res.locals.phase || 'router',
       msInPhase,
-      from: req.from || null,
+      from: req.from,
       messageSid
     });
 
-    // ✅ Always send a visible bubble (never empty TwiML)
-    return ok(
-      res,
-      '⚠️ That voice note took too long to process. Please try again, or type it (e.g., "clock in").'
-    );
+    // NEVER return empty — always give user a bubble
+    return ok(res, '⚠️ That voice note took too long to process. Please try again, or type it (e.g., "clock in").');
   }, SAFETY_MS);
 
   const clear = () => {
-    try {
-      clearTimeout(res.locals._safety);
-    } catch {}
+    try { clearTimeout(res.locals._safety); } catch {}
   };
 
   res.on('finish', clear);
@@ -1350,9 +1354,20 @@ console.info('[MEDIA_RETURN]', {
 
 
 
-    if (hasTwiml && !res.headersSent) {
-  return sendTwiml(res, result.twiml);
+ if (hasTwiml && !res.headersSent) {
+  const xml = String(result.twiml || '').trim();
+
+  console.info('[MEDIA_SEND_TWIML]', {
+    from: req.from,
+    ownerId: req.ownerId || null,
+    sourceMsgId: sourceMsgId || null,
+    twimlLen: xml.length
+  });
+
+  res.status(200).type('text/xml').send(xml);
+  return;
 }
+
 
 if (hasTranscript) {
   let t = String(result.transcript || '').trim();

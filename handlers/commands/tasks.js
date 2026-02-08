@@ -326,6 +326,8 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
   String(from || '').replace(/\D/g, '').trim() ||
   String(from || '').trim();
 
+  console.info('[TASKS_CTX]', { ownerId, paUserId, isOwner });
+
 const safeMsgId = computeStableMsgId({ from: paUserId, sourceMsgId, res });
    const rawPlan = String(_ownerProfile?.plan || _ownerProfile?.tier || _ownerProfile?.pricing_plan || "free")
   .toLowerCase()

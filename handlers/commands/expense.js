@@ -3291,21 +3291,16 @@ async function handleExpense(
   // Normalize Twilio meta (req.body) if caller provided it.
   twilioMeta = twilioMeta && typeof twilioMeta === 'object' ? twilioMeta : {};
   const getTwilio = (k) =>
-    twilioMeta?.[k] ??
-    twilioMeta?.[String(k).toLowerCase()] ??
-    twilioMeta?.[String(k).toUpperCase()] ??
-    null;
+    twilioMeta?.[k] ?? twilioMeta?.[String(k).toLowerCase()] ?? twilioMeta?.[String(k).toUpperCase()] ?? null;
 
   // ✅ IMPORTANT: carry IRJ + ListRowId variants through to resolver
   const inboundTwilioMeta = {
     MessageSid: getTwilio('MessageSid') || getTwilio('SmsMessageSid'),
     SmsMessageSid: getTwilio('SmsMessageSid') || null,
     OriginalRepliedMessageSid: getTwilio('OriginalRepliedMessageSid'),
-
     // core text fields
     Body: getTwilio('Body'),
     ResolvedInboundText: getTwilio('ResolvedInboundText') || getTwilio('resolvedInboundText'),
-
     // list fields (all variants)
     ListRowId:
       getTwilio('ListRowId') ||
@@ -3327,14 +3322,11 @@ async function handleExpense(
       getTwilio('listItemTitle') ||
       getTwilio('ListReplyTitle') ||
       getTwilio('listReplyTitle'),
-
     // IRJ (interactive response json)
     InteractiveResponseJson: getTwilio('InteractiveResponseJson') || getTwilio('interactiveResponseJson'),
-
     // buttons
     ButtonPayload: getTwilio('ButtonPayload') || getTwilio('buttonPayload'),
     ButtonText: getTwilio('ButtonText') || getTwilio('buttonText'),
-
     // meta
     NumMedia: getTwilio('NumMedia') ?? getTwilio('numMedia') ?? null,
     WaId: getTwilio('WaId') || getTwilio('WaID') || getTwilio('waid')
@@ -3350,10 +3342,19 @@ async function handleExpense(
     String(fromPhone || '').replace(/\D/g, '').trim() ||
     String(fromPhone || '').trim();
 
+  // ✅ Stable id for idempotency + flow correlation (define EARLY so gating can use it)
+  const stableMsgId =
+    String(inboundTwilioMeta?.MessageSid || '').trim() ||
+    String(sourceMsgId || '').trim() ||
+    String(userProfile?.last_message_sid || '').trim() ||
+    String(`${paUserId}:${Date.now()}`).trim();
+
+  const safeMsgId = stableMsgId; // keep the alias so future clamps are centralized
+
   // ✅ tz needed throughout handler (single definition)
   const tz = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
 
-   // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
+  // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
   // NOTE: getInboundTextExpense MUST exist at FILE SCOPE (do NOT define it inside handleExpense)
   const rawInboundText = getInboundTextExpense(input, inboundTwilioMeta);
 
@@ -3368,7 +3369,6 @@ async function handleExpense(
   });
 
   const raw = String(rawInboundText || '').trim();
-
 
   function strictDecisionToken(s) {
     const t = String(s || '').trim().toLowerCase();
@@ -3399,42 +3399,35 @@ async function handleExpense(
     waId: inboundTwilioMeta?.WaId || null
   });
 
-  // ✅ Stable id for idempotency + flow correlation
-  const stableMsgId =
-    String(inboundTwilioMeta?.MessageSid || '').trim() ||
-    String(sourceMsgId || '').trim() ||
-    String(userProfile?.last_message_sid || '').trim() ||
-    String(`${paUserId}:${Date.now()}`).trim();
-
   source_msg_id: safeMsgId || null;
-     
+
   // ✅ Canonical CONFIRM PA key used everywhere in this handler
   const paKey = String(paUserId || '').trim();
-const rawPlan = String(ownerProfile?.plan || ownerProfile?.tier || ownerProfile?.pricing_plan || "free")
-  .toLowerCase()
-  .trim();
-const plan = getPlanOrDefault ? getPlanOrDefault(rawPlan) : (rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro" ? rawPlan : "free");
+  const rawPlan = String(ownerProfile?.plan || ownerProfile?.tier || ownerProfile?.pricing_plan || "free")
+    .toLowerCase()
+    .trim();
+  const plan = getPlanOrDefault ? getPlanOrDefault(rawPlan) : rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro" ? rawPlan : "free";
 
-if (!isOwner) {
-  const gate = canEmployeeSelfLog(plan);
-  if (!gate.allowed) {
-    try {
-      await logCapabilityDenial(pg, {
-        owner_id: String(ownerId || "").trim(),
-        user_id: String(paUserId || "").trim(),
-        actor_role: "employee",
-        plan,
-        capability: "expense",
-        reason_code: gate.reason_code,
-        upgrade_plan: gate.upgrade_plan || null,
-        source_msg_id: stableMsgId || null,
-        context: { handler: "expense.handleExpense" },
-      });
-    } catch {}
+  if (!isOwner) {
+    const gate = canEmployeeSelfLog(plan);
+    if (!gate.allowed) {
+      try {
+        await logCapabilityDenial(pg, {
+          owner_id: String(ownerId || "").trim(),
+          user_id: String(paUserId || "").trim(),
+          actor_role: "employee",
+          plan,
+          capability: "expense",
+          reason_code: gate.reason_code,
+          upgrade_plan: gate.upgrade_plan || null,
+          source_msg_id: safeMsgId || null, // ✅ ensure safeMsgId is used here
+          context: { handler: "expense.handleExpense" }
+        });
+      } catch {}
 
-    return out(twimlText(`${PRO_CREW_UPGRADE_LINE}\n${UPGRADE_FOLLOWUP_ASK}`), false);
+      return out(twimlText(`${PRO_CREW_UPGRADE_LINE}\n${UPGRADE_FOLLOWUP_ASK}`), false);
+    }
   }
-}
 
   // ✅ Canonical PICK key used everywhere in this handler
   const canonicalUserKey =
@@ -3444,6 +3437,8 @@ if (!isOwner) {
     String(fromPhone || '').trim();
 
   const pickUserId = canonicalUserKey; // alias for readability in picker calls
+
+
 
   // ---------------------------------------------------------
   // ✅ EARLY GUARD (HARD):

@@ -1649,6 +1649,7 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
     /^\$?\s*\d{1,6}(?:\.\d{2})?\s*$/.test(rawItem) ||
     /\$\s*\d{1,6}(?:\.\d{2})?/.test(rawItem);
 
+
   const tooLong = rawItem.length > 120;
 
   if (!rawItem || looksLikeReceiptMeta || looksLikeMoneyLine || tooLong) {
@@ -2994,17 +2995,26 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   // ✅ Single source of truth: did the user explicitly provide a date?
   const explicitDate = hasExplicitDateToken(raw);
 
-  const explicit = {
+    const explicit = {
     amount: /\b(amount|total|price|cost)\b/i.test(raw) || hasMoney(raw),
-
-    // ✅ FORCE: only treat date as explicit if we truly saw a date token
     date: explicitDate,
-
     store: /\b(store|vendor|merchant|from|at)\b/i.test(raw),
     item: /\b(item|for|bought|purchase|description|desc)\b/i.test(raw),
     category: /\b(category|categorize|type)\b/i.test(raw),
     job: /\b(job|for job|change job|overhead)\b/i.test(raw)
   };
+
+  // ✅ Treat short “just a vendor” edits as vendor edits.
+  // Examples: "Home Depot", "Value Village"
+  const looksLikeJustVendor =
+    !explicit.amount &&
+    !explicit.date &&
+    !explicit.job &&
+    !explicit.category &&
+    raw.split(/\s+/).length <= 4;
+
+  explicit.store = explicit.store || looksLikeJustVendor;
+
 
   // IMPORTANT: Do not strip to "" before parsing — pass the user's actual message.
   let aiRes = null;
@@ -3017,15 +3027,17 @@ try {
     ctx?.defaultData || {},
     { tz }
   );
-  } catch (e) {
+ } catch (e) {
   console.warn('[EXPENSE_AI] failed; using deterministic fallback:', e?.message);
-  aiRes = { confirmed: false, data: null, reply: null };
+
+  return {
+    nextDraft: null,
+    aiReply:
+      'I can’t auto-parse edits right now. Please resend in this format:\n' +
+      'expense $AMOUNT at VENDOR on YYYY-MM-DD (optional: job JOBNAME)'
+  };
 }
 
-  // If not confirmed, return null so caller can show aiRes.reply
-  if (!aiRes || !aiRes.confirmed || !aiRes.data) {
-    return { nextDraft: null, aiReply: aiRes?.reply || null };
-  }
 
   const data = aiRes.data || {};
   const out = { ...(existingDraft || {}) };
@@ -5891,40 +5903,134 @@ if (looksLikeReceiptText(input)) {
     return await sendConfirmExpenseOrFallback(fromPhone, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
   }
 } // ✅ closes: if (looksLikeReceiptText(input)) { ... } else { ... }
-/* ---- 4) AI parsing fallback ---- */
+/* ---- 4) Parsing (AI optional; deterministic fallback always available) ---- */
 
-const defaultData = {
-  date: todayInTimeZone(tz),
-  item: 'Unknown',
-  amount: '$0.00',
-  store: 'Unknown Store'
-};
-
-// ✅ Ensure ctx is always defined (used by edit-mode + handleInputWithAI)
 const ctx = {
   fromKey: canonicalUserKey || fromPhone || userProfile?.user_id || userProfile?.from || null,
-  tz: userProfile?.tz || userProfile?.timezone || 'America/Toronto',
+  tz: userProfile?.tz || userProfile?.timezone || tz || 'America/Toronto',
   defaultData: {
-    // keep minimal — only safe defaults
     currency: userProfile?.currency || ownerProfile?.currency || 'CAD'
   }
 };
 
-const aiRes = await handleInputWithAI(
-  ctx.fromKey,
-  raw,
-  'expense',
-  parseExpenseMessage,
-  ctx.defaultData,
-  { tz: ctx.tz },
-  { disableCorrections: true, disablePendingState: true } // ✅ edit-mode safety
-);
+// -----------------------------
+// Deterministic expense parser (no OpenAI)
+// Handles: "expense $5 at value village today", "expense 12.34 home depot", "exp $18 nails from home depot yesterday"
+// -----------------------------
+function parseExpenseDeterministic(rawText, tz0) {
+  const s = String(rawText || '').replace(/\s+/g, ' ').trim();
+  const lc = s.toLowerCase();
 
+  // Require an amount somewhere
+  const moneyMatch = s.match(/\$?\s*(-?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)/);
+  if (!moneyMatch) return null;
 
+  const num = Number(String(moneyMatch[1]).replace(/,/g, ''));
+  if (!Number.isFinite(num) || num <= 0) return null;
+
+  const amount = `$${num.toFixed(2)}`;
+
+  // Date: today/yesterday/tomorrow or explicit YYYY-MM-DD or MM/DD/YYYY
+  let date = null;
+  try {
+    if (/\btoday\b/i.test(lc)) date = todayInTimeZone(tz0);
+    else if (/\byesterday\b/i.test(lc)) date = shiftDateYYYYMMDD(todayInTimeZone(tz0), -1);
+    else if (/\btomorrow\b/i.test(lc)) date = shiftDateYYYYMMDD(todayInTimeZone(tz0), 1);
+    else if (typeof extractReceiptDateYYYYMMDD === 'function') {
+      date = extractReceiptDateYYYYMMDD(s, tz0) || null;
+    }
+  } catch {
+    date = null;
+  }
+
+  // Vendor/store: look for " at X " or " from X " else take trailing tokens after amount
+  let store = null;
+  const atFrom = s.match(/\b(?:at|from)\s+(.+?)(?:\s+\b(?:on|for|job)\b\s+|$)/i);
+  if (atFrom?.[1]) {
+    store = String(atFrom[1]).trim();
+  } else {
+    // remove leading "expense/exp" and amount then use what's left as store candidate
+    const stripped = s
+      .replace(/^(expense|exp)\b[:\-]?\s*/i, '')
+      .replace(moneyMatch[0], ' ')
+      .replace(/\b(today|yesterday|tomorrow)\b/ig, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    // If user wrote: "$12.34 Home Depot"
+    if (stripped) store = stripped;
+  }
+
+  // Item: optional; if you have your infer fallback, let that do it later.
+  let item = null;
+
+  // Job: best-effort parse "job X" or "for job X"
+  let jobName = null;
+  const jobM = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
+  if (jobM?.[1]) jobName = String(jobM[1]).trim();
+
+  return {
+    amount,
+    date: date || null,
+    store: store || null,
+    item,
+    jobName: jobName || null
+  };
+}
+
+// Helper: shift YYYY-MM-DD by days without moment libs
+function shiftDateYYYYMMDD(ymd, deltaDays) {
+  const m = String(ymd || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return ymd;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  d.setUTCDate(d.getUTCDate() + Number(deltaDays || 0));
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+// -----------------------------
+// 1) Try AI parse (soft)
+// -----------------------------
+let aiRes = null;
+try {
+  aiRes = await handleInputWithAI(
+    ctx.fromKey,
+    raw,
+    'expense',
+    parseExpenseMessage,
+    ctx.defaultData,
+    { tz: ctx.tz },
+    { disableCorrections: true, disablePendingState: true }
+  );
+} catch (e) {
+  console.warn('[EXPENSE_AI] failed; using deterministic fallback:', e?.message);
+  aiRes = null;
+}
 
 let data = aiRes?.data || null;
 let aiReply = aiRes?.reply || null;
 
+// -----------------------------
+// 2) If AI failed or missing core, use deterministic parse
+// -----------------------------
+const det = (!data ? parseExpenseDeterministic(raw, ctx.tz) : null);
+
+if (!data && det) {
+  data = {
+    amount: det.amount,
+    date: det.date || todayInTimeZone(ctx.tz),
+    store: det.store || 'Unknown Store',
+    item: det.item || inferExpenseItemFallback(raw) || 'Unknown',
+    jobName: det.jobName || null,
+    originalText: input,
+    draftText: input
+  };
+  aiReply = null; // we have data now
+}
+
+// Normalize (works for both AI + deterministic)
 if (data) {
   const sourceText = String(
     data?.receiptText ||
@@ -5951,137 +6057,19 @@ const missingCore =
   !data ||
   !data.amount ||
   data.amount === '$0.00' ||
-  !data.item ||
-  data.item === 'Unknown' ||
   !data.store ||
   data.store === 'Unknown Store';
 
+// If AI gave a helpful reply AND we truly have nothing usable, show it
 if (aiReply && missingCore) return out(twimlText(aiReply), false);
 
-if (data && data.amount && data.amount !== '$0.00') {
-  data.store = await normalizeVendorName(ownerId, data.store);
-
-  let category = await resolveExpenseCategory({ ownerId, data, ownerProfile });
-  category = category && String(category).trim() ? String(category).trim() : null;
-
-  let jobName = data.jobName || null;
-  let jobSource = jobName ? 'typed' : null;
-
-  if (!jobName) {
-    jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone })) || null;
-    if (jobName) jobSource = 'active';
-  }
-
-  if (jobName && looksLikeOverhead(jobName)) {
-    jobName = 'Overhead';
-    jobSource = 'overhead';
-  }
-
-  if (jobName) data.item = stripEmbeddedDateAndJobFromItem(data.item, { date: data.date, jobName });
-
-  await upsertPA({
-    ownerId,
-    userId: paKey,
-    kind: PA_KIND_CONFIRM,
-    payload: {
-      draft: {
-        ...data,
-        jobName,
-        jobSource,
-        suggestedCategory: category,
-        job_id: null,
-        job_no: null,
-
-        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-        media_source_msg_id: safeMsgId
-          ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
-          : null,
-
-        receiptText: data?.receiptText || data?.ocrText || data?.media_transcript || null,
-        ocrText: data?.ocrText || null,
-
-        originalText: input,
-        draftText: input
-      },
-      sourceMsgId: safeMsgId,
-      type: 'expense'
-    },
-    ttlSeconds: PA_TTL_SEC
-  });
-
-  if (!jobName) {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-    if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-
-    const confirmFlowId =
-      String(safeMsgId || '').trim() ||
-      String(stableMsgId || '').trim() ||
-      `${paUserId}:${Date.now()}`;
-
-    await sendJobPickList({
-      fromPhone,
-      ownerId,
-      userProfile,
-      confirmFlowId,
-      jobOptions: jobs,
-      paUserId,
-      pickUserId: canonicalUserKey,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft: {
-        ...data,
-        jobName: null,
-        jobSource: null,
-        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-        media_source_msg_id: safeMsgId
-          ? `${String(paUserId || '').trim()}:${String(safeMsgId).trim()}`
-          : null,
-        originalText: input,
-        draftText: input
-      }
-    });
-
-    return out(twimlText(''), true);
-  }
-
-  const summaryLine = buildExpenseSummaryLine({
-    amount: data.amount,
-    item: data.item,
-    store: data.store,
-    date: data.date || todayInTimeZone(tz),
-    jobName,
-    tz,
-    sourceText: input
-  });
-
-  console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
-  // ✅ CIL draft upsert (initial confirm send)
-try {
-  const confirmPA1 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-  const draft1 = confirmPA1?.payload?.draft || null;
-  const srcId = String(confirmPA1?.payload?.sourceMsgId || '').trim() || null;
-
-  if (draft1) {
-    await upsertCilDraftForExpenseConfirm({
-      ownerId,
-      paUserId: paKey,
-      fromPhone,
-      draft: draft1,
-      sourceMsgId: srcId
-    });
-  }
-} catch {}
-
-  return await sendConfirmExpenseOrFallback(fromPhone, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
+// If still missing core after deterministic attempt, show a clear fallback
+if (missingCore) {
+  return out(
+    twimlText(`🤔 Couldn’t parse an expense from "${input}". Try:\nexpense $84.12 at Home Depot today`),
+    false
+  );
 }
-
-return out(
-  twimlText(`🤔 Couldn’t parse an expense from "${input}". Try "expense 84.12 nails from Home Depot".`),
-  false
-);
-
-
   } catch (error) {
     console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
       stack: error?.stack,

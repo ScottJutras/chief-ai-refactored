@@ -527,7 +527,12 @@ function getInboundText(body = {}) {
       const stamped = extractStampedJobNo(pickedTitle);
       if (stamped) return `jobno_${stamped}`;
 
-      // ✅ Return ID as-is (do NOT rewrite)
+      // ✅ Canonicalize job picker Content Template IDs:
+      // "job_5_44fc8181" => "jobix_5"
+      const jobIx = extractJobPickerIndexFromToken(pickedId || pickedTitle);
+      if (jobIx != null) return `jobix_${jobIx}`;
+
+      // Otherwise return ID as-is
       if (pickedId) return pickedId;
 
       // Fallback to title if no id
@@ -568,13 +573,27 @@ function getInboundText(body = {}) {
   const stamped = extractStampedJobNo(candidateTitle);
   if (stamped) return `jobno_${stamped}`;
 
+  // ✅ NEW: canonicalize job picker content template IDs early
+  // Prefer listRowId/listId (stable), but normalize if they match job_<ix>_<nonce>
+  const idCandidate = listRowId || listId;
+  const ixFromId = extractJobPickerIndexFromToken(idCandidate);
+  if (ixFromId != null) return `jobix_${ixFromId}`;
+
+  // If title begins with "#<index> ..." normalize to jobix as well
+  const ixFromTitle = extractJobPickerIndexFromToken(candidateTitle);
+  if (ixFromTitle != null) return `jobix_${ixFromTitle}`;
+
   // ✅ Prefer the ID fields if present (stable)
   if (listRowId) return listRowId;
   if (listId) return listId;
 
-  // If Twilio put the token in Body (common), return it AS-IS
-  // ✅ CRITICAL: do NOT rewrite job_3_xxx -> jobix_3
-  if (rawBody) return rawBody;
+  // If Twilio put the token in Body (common), return it,
+  // but still canonicalize job picker tokens.
+  if (rawBody) {
+    const ixFromBody = extractJobPickerIndexFromToken(rawBody);
+    if (ixFromBody != null) return `jobix_${ixFromBody}`;
+    return rawBody;
+  }
 
   // As a last resort, fall back to title
   if (candidateTitle) return candidateTitle;
@@ -591,6 +610,32 @@ function extractStampedJobNo(title = '') {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * Extracts a job picker *index* from either:
+ * - Content-template token: "job_5_44fc8181" => 5
+ * - Title prefix: "#5 Happy Road" => 5
+ * Returns number or null.
+ */
+function extractJobPickerIndexFromToken(s) {
+  const str = String(s || '').trim();
+  if (!str) return null;
+
+  // job_<index>_<nonce>
+  let m = str.match(/^job_(\d+)_/i);
+  if (m?.[1]) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  // "#<index> <title>"
+  m = str.match(/^#\s*(\d+)\b/);
+  if (m?.[1]) {
+    const n = Number(m[1]);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  return null;
+}
 
 
 function looksTimesheetCommand(str) {

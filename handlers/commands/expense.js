@@ -3007,7 +3007,9 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   };
 
   // IMPORTANT: Do not strip to "" before parsing — pass the user's actual message.
-  const aiRes = await handleInputWithAI(
+  let aiRes = null;
+try {
+  aiRes = await handleInputWithAI(
     ctx?.fromKey,
     raw,
     'expense',
@@ -3015,6 +3017,10 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
     ctx?.defaultData || {},
     { tz }
   );
+  } catch (e) {
+  console.warn('[EXPENSE_AI] failed; using deterministic fallback:', e?.message);
+  aiRes = { confirmed: false, data: null, reply: null };
+}
 
   // If not confirmed, return null so caller can show aiRes.reply
   if (!aiRes || !aiRes.confirmed || !aiRes.data) {

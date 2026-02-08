@@ -26,6 +26,7 @@ const {
 
 
 const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
+const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
 
 
 // ---- CIL validator (fail-open) ----

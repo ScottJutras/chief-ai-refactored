@@ -86,6 +86,10 @@ const parseNaturalDateTz =
   });
 
 const categorizeEntry = (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) || (async () => null);
+const { canEmployeeSelfLog, getPlanOrDefault } = require("../../src/config/checkCapability");
+const { logCapabilityDenial } = require("../../src/lib/capabilityDenials");
+const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require("../../src/config/upgradeCopy");
+
 
 /* ---------------- Pending Actions (KIND-AWARE; postgres.js-aligned) ---------------- */
 
@@ -3402,10 +3406,35 @@ async function handleExpense(
     String(userProfile?.last_message_sid || '').trim() ||
     String(`${paUserId}:${Date.now()}`).trim();
 
-  const safeMsgId = stableMsgId;
-
+  source_msg_id: safeMsgId || null;
+     
   // ✅ Canonical CONFIRM PA key used everywhere in this handler
   const paKey = String(paUserId || '').trim();
+const rawPlan = String(ownerProfile?.plan || ownerProfile?.tier || ownerProfile?.pricing_plan || "free")
+  .toLowerCase()
+  .trim();
+const plan = getPlanOrDefault ? getPlanOrDefault(rawPlan) : (rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro" ? rawPlan : "free");
+
+if (!isOwner) {
+  const gate = canEmployeeSelfLog(plan);
+  if (!gate.allowed) {
+    try {
+      await logCapabilityDenial(pg, {
+        owner_id: String(ownerId || "").trim(),
+        user_id: String(paUserId || "").trim(),
+        actor_role: "employee",
+        plan,
+        capability: "expense",
+        reason_code: gate.reason_code,
+        upgrade_plan: gate.upgrade_plan || null,
+        source_msg_id: stableMsgId || null,
+        context: { handler: "expense.handleExpense" },
+      });
+    } catch {}
+
+    return out(twimlText(`${PRO_CREW_UPGRADE_LINE}\n${UPGRADE_FOLLOWUP_ASK}`), false);
+  }
+}
 
   // ✅ Canonical PICK key used everywhere in this handler
   const canonicalUserKey =

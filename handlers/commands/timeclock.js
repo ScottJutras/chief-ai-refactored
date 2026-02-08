@@ -20,6 +20,11 @@ const pg = require('../../services/postgres');
 const chrono = require('chrono-node');
 const { formatInTimeZone, zonedTimeToUtc } = require('date-fns-tz');
 const { getUserByName, getUserBasic } = require('../../services/users');
+const { canLogTime } = require("../../src/config/checkCapability");
+const { logCapabilityDenial } = require("../../src/lib/capabilityDenials");
+const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
+
+
 
 // ---- safe Twilio helpers (do NOT crash if file moved/renamed) ----
 let sendBackfillConfirm = async () => null;
@@ -827,8 +832,14 @@ async function execClockViaCil({
   createdBy = null,
   resolvedType,
   tsOverride,
-  nowIso
+  nowIso,
+
+  // ✅ add these
+  plan = "free",
+  role = "owner",
+  crew_count = 0,
 }) {
+
   const atIso = tsOverride || nowIso || new Date().toISOString();
   const cil = buildClockCilFromResolvedType(resolvedType, atIso);
   if (!cil) return null;
@@ -844,14 +855,23 @@ async function execClockViaCil({
     : String(paUserId || '').trim();
 
   const ctx = {
-    owner_id: String(ownerId || '').trim(),
-    user_id,
-    tz: tz || 'America/Toronto',
-    source_msg_id: stableMsgId || null,
-    created_by,
-    job_id: jobId || null,
-    meta: { job_name: jobName || null }
-  };
+  owner_id: String(ownerId || "").trim(),
+  user_id,
+  tz: tz || "America/Toronto",
+  source_msg_id: stableMsgId || null,
+  created_by,
+  job_id: jobId || null,
+  meta: { job_name: jobName || null },
+
+  // ✅ PLAN + ROLE (Phase 1 safe defaults)
+  // IMPORTANT: execClockViaCil does not know tenant/user plan/role unless passed in.
+  // So we set safe defaults here and upgrade later in Phase 2 via cilRouter.
+  plan: String(plan || "free").toLowerCase().trim(),
+role: String(role || "owner").toLowerCase().trim(),
+crew_count: Number.isFinite(Number(crew_count)) ? Number(crew_count) : 0,
+};
+
+
 
   const out = await handleClock(ctx, cil); // ✅ writes + emits facts inside
   return out;
@@ -1315,7 +1335,52 @@ async function handleClock(ctx, cil) {
   // allow future extra fields without refactoring again
   const ret = (text, extra = {}) => ({ text: String(text || '').trim(), targetUserId, ...extra });
 
-  if (!owner_id || !user_id) return ret('Timeclock: missing owner_id or user_id.');
+ if (!owner_id || !user_id) return ret("Timeclock: missing owner_id or user_id.");
+
+const rawPlan = String(ctx?.plan || "free").toLowerCase().trim();
+const plan = (rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro") ? rawPlan : "free";
+
+
+const rawRole = String(ctx?.role || "owner").toLowerCase().trim();
+const role =
+  rawRole === "board_member" ? "board" :
+  rawRole === "crew_member" ? "crew" :
+  rawRole === "employee" ? "crew" :          // ✅ map employee → crew
+  rawRole === "crew" ? "crew" :
+  rawRole === "board" ? "board" :
+  rawRole === "owner" ? "owner" :
+  "owner"; // fail-safe
+
+const gate = canLogTime(plan, role);
+if (!gate.allowed) {
+  // ✅ GTM gold: record denial for analytics (fail-open)
+  try {
+    await logCapabilityDenial(pg, {
+      owner_id,
+      user_id: user_id || null,
+      actor_role: role || null,
+      plan: plan || null,
+      capability: "timeclock",
+      reason_code: gate.reason_code,
+      upgrade_plan: gate.upgrade_plan || null,
+      job_id: ctx?.job_id || null,
+      source_msg_id: ctx?.source_msg_id || null,
+      context: {
+        handler: "timeclock.handleClock",
+        role_raw: ctx?.role || null,
+        plan_raw: ctx?.plan || null,
+      },
+    });
+  } catch {}
+
+  return ret(gate.message, {
+    reason_code: gate.reason_code,
+    upgrade_plan: gate.upgrade_plan,
+  });
+}
+
+
+
 
   if (!ClockCIL) {
     return ret('Timeclock: CIL schema missing. Please update schemas/cil.clock.');
@@ -1753,6 +1818,25 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
     String(sourceMsgId || '').trim() ||
     String(getTwilioMessageSidFromRes(res) || '').trim() ||
     null;
+  // ✅ Phase 1: best-effort plan/role (no DB calls here)
+// Prefer ownerProfile.plan if you have it; else fall back to free.
+const rawPlan =
+  String(ownerProfile?.plan || ownerProfile?.tier || ownerProfile?.pricing_plan || "free")
+    .toLowerCase()
+    .trim();
+
+const plan = (rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro") ? rawPlan : "free";
+
+
+
+// ✅ Role: if this inbound user is the owner → owner, otherwise treat as crew.
+// (If you later distinguish “employee self logging” vs “owner logging for crew”, you can refine this.)
+// Phase 1: anyone who is not the owner is treated as "employee self-log attempt"
+const role = isOwner ? "owner" : "employee";
+
+
+// optional for now
+const crew_count = 0;
 
   const lc = String(text || '').toLowerCase().trim();
 
@@ -1889,17 +1973,23 @@ Detected: ${shape}`
 
     if (mForceIn || mForceOut) {
       const forcedType = mForceIn ? 'clock_in' : 'clock_out';
-      const out = await execClockViaCil({
-        ownerId,
-        paUserId: targetUserId,
-        target: targetUserId,
-        tz,
-        stableMsgId,
-        jobName,
-        resolvedType: forcedType,
-        tsOverride: tsOverrideIso || null,
-        nowIso: now.toISOString()
-      });
+    const out = await execClockViaCil({
+  ownerId,
+  paUserId: targetUserId,
+  target: targetUserId,
+  tz,
+  stableMsgId,
+  jobName,
+  resolvedType: forcedType,
+  tsOverride: tsOverrideIso || null,
+  nowIso: now.toISOString(),
+
+  // ✅ pass plan/role through
+  plan,
+  role,
+  crew_count,
+});
+
       return twimlWithTargetName(
   res,
   out?.text || '✅ Forced time action recorded.',
@@ -1949,16 +2039,22 @@ return twiml(res, msg);
 
     // ----------------- MAIN: ALWAYS CIL -> handleClock (NO legacy DB writes) -----------------
     const out = await execClockViaCil({
-      ownerId,
-      paUserId: targetUserId,
-      target: targetUserId,
-      tz,
-      stableMsgId,
-      jobName,
-      resolvedType,
-      tsOverride: tsOverrideIso || null,
-      nowIso: now.toISOString()
-    });
+  ownerId,
+  paUserId: targetUserId,
+  target: targetUserId,
+  tz,
+  stableMsgId,
+  jobName,
+  resolvedType,
+  tsOverride: tsOverrideIso || null,
+  nowIso: now.toISOString(),
+
+  // ✅ pass plan/role through
+  plan,
+  role,
+  crew_count,
+});
+
 
    return twimlWithTargetName(
   res,

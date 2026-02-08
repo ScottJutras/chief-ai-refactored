@@ -40,6 +40,8 @@ const mergePendingTransactionState =
 const pg = require('../services/postgres');
 const { query } = pg;
 const { normalizeTranscriptMoney, stripLeadingFiller } = require('../utils/transcriptNormalize');
+const twilioSvc = require('../services/twilio');
+const sendWhatsApp = twilioSvc.sendWhatsApp;
 
 /* ---------------- Small helpers ---------------- */
 
@@ -1446,6 +1448,8 @@ if (!resolvedInbound && numMedia === 0) return ok(res);
     // Use resolvedInbound as the main text everywhere in this router
     let text = resolvedInbound;
     let lc = text.toLowerCase();
+
+    
 // ------------------------------------------------------------
 // ✅ HARD TIME COMMANDS: bypass nudge + PA + pending-flow routers
 // ------------------------------------------------------------
@@ -1462,6 +1466,8 @@ console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
         .digest('hex')
         .slice(0, 32);
 
+
+      
     // -----------------------------------------------------------------------
     // ✅ LINK CODE REDEEM (must run EARLY so it doesn't fall into agent)
     // Accepts: "LINK 123456" (legacy) OR "123456"
@@ -1602,7 +1608,24 @@ if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
   return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
 }
 
+  // ------------------------------------------------------------
+// ✅ Owner nudge (Phase 1) — only on owner messages, skip time commands
+// ------------------------------------------------------------
+try {
+  if (req.isOwner && !isHardTimeCommand && req.ownerId && req.from) {
+    const { maybeNudgeOwnerForProSelfLogging } = require('../src/lib/nudges');
 
+    await maybeNudgeOwnerForProSelfLogging(pg, {
+      owner_id: req.ownerId,
+      toPhone: req.from,
+      sendText: async (to, msg) => {
+        await sendWhatsApp(to, msg); // must exist in this router scope
+      }
+    });
+  }
+} catch (e) {
+  console.warn('[NUDGE] skipped:', e?.message);
+}
   /* -----------------------------------------------------------------------
  * ✅ GLOBAL HARD CANCEL (router-level)
  * - Runs BEFORE handlers

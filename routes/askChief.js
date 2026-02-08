@@ -1,8 +1,8 @@
 const express = require('express');
 const brainV0 = require('../services/brain_v0');
 const brainBeta = require('../services/brain_beta');
-
 const router = express.Router();
+const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../src/config/upgradeCopy');
 
 // Replace this with your real auth/session mapping.
 function getOwnerIdFromRequest(req) {

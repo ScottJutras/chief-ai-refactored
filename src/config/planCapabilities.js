@@ -1,0 +1,159 @@
+// src/config/planCapabilities.js
+// Backend canonical plan capabilities (CommonJS).
+
+/**
+ * Plan keys:
+ * - free
+ * - starter
+ * - pro
+ *
+ * Monthly capacity:
+ * - number = included monthly capacity
+ * - null   = effectively unbounded / included
+ *
+ * NOTE: Your clarified semantics:
+ * - Free: owner can log for self AND can log "crew" by naming them (owner-mediated). No separate crew accounts.
+ * - Starter: owner can add up to 10 employees and log "clock-in John..." (still owner-mediated).
+ * - Pro: employees can log for themselves via WhatsApp (role-based permissions).
+ */
+
+const plan_capabilities = {
+  free: {
+    label: "Field Capture",
+
+    jobs: { enabled: true, max_jobs_total: 3 },
+
+    people: {
+      owner_seats: 1,
+
+      // ✅ employees exist as records even in Free (owner can name them),
+      // but they cannot self-log from their own phone until Pro.
+      max_employee_records: 3,
+
+      // ✅ self-logging via WhatsApp (employees sending commands) is Pro.
+      employee_self_logging: false,
+
+      // board is Pro only
+      max_board: 0,
+    },
+
+    capture: {
+      text_logging: {
+        expenses: { enabled: true },
+        revenue: { enabled: true },
+        time: { enabled: true },
+        tasks: { enabled: true },
+      },
+
+      // premium capture surfaces
+      ocr_receipts: { enabled: false, monthly_capacity: 0, behavior: "pause" },
+      voice: { enabled: false, monthly_minutes: 0, behavior: "pause" },
+    },
+
+    reasoning: {
+      ask_chief: { enabled: false, owner_only: true, monthly_questions: 0, behavior: "pause" },
+    },
+
+    exports: { enabled: false, watermark: true },
+
+    approvals: { enabled: false },
+
+    audit: { trail: true, depth: "basic" },
+
+    retention: { history_days: 90, while_subscribed: false },
+
+    onboarding: { priority_onboarding: false },
+  },
+
+  starter: {
+    label: "Owner Mode",
+
+    jobs: { enabled: true, max_jobs_total: 25 },
+
+    people: {
+      owner_seats: 1,
+
+      // ✅ Starter: owner can add up to 10 employees (records) and log for them
+      max_employee_records: 10,
+
+      // ✅ still NOT self-logging from their own phones
+      employee_self_logging: false,
+
+      max_board: 0,
+    },
+
+    capture: {
+      text_logging: {
+        expenses: { enabled: true },
+        revenue: { enabled: true },
+        time: { enabled: true },
+        tasks: { enabled: true },
+      },
+
+      ocr_receipts: { enabled: true, monthly_capacity: 150, behavior: "pause" },
+      voice: { enabled: true, monthly_minutes: 150, behavior: "pause" },
+    },
+
+    reasoning: {
+      ask_chief: { enabled: true, owner_only: true, monthly_questions: 250, behavior: "pause" },
+    },
+
+    exports: { enabled: true, watermark: false },
+
+    approvals: { enabled: false },
+
+    audit: { trail: true, depth: "standard" },
+
+    retention: { history_days: 365 * 3, while_subscribed: true },
+
+    onboarding: { priority_onboarding: false },
+  },
+
+  pro: {
+    label: "Crew + Control",
+
+    jobs: { enabled: true, max_jobs_total: null },
+
+    people: {
+      owner_seats: 1,
+
+      // ✅ Pro: up to 25 employees records
+      max_employee_records: 25,
+
+      // ✅ Pro: employees can self-log from their own phones (WhatsApp)
+      employee_self_logging: true,
+
+      // ✅ Pro: board members
+      max_board: 10,
+    },
+
+    capture: {
+      text_logging: {
+        expenses: { enabled: true },
+        revenue: { enabled: true },
+        time: { enabled: true },
+        tasks: { enabled: true },
+      },
+
+      ocr_receipts: { enabled: true, monthly_capacity: 500, behavior: "pause" },
+      voice: { enabled: true, monthly_minutes: 500, behavior: "pause" },
+    },
+
+    reasoning: {
+      ask_chief: { enabled: true, owner_only: true, monthly_questions: 1000, behavior: "pause" },
+    },
+
+    exports: { enabled: true, watermark: false },
+
+    approvals: { enabled: true },
+
+    audit: { trail: true, depth: "full" },
+
+    retention: { history_days: 365 * 7, while_subscribed: true },
+
+    onboarding: { priority_onboarding: true },
+  },
+};
+
+module.exports = { plan_capabilities }; // source of truth for gating
+

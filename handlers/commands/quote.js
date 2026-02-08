@@ -8,6 +8,7 @@ const pg = require('../../services/postgres');
 const { parseQuoteMessage, buildQuoteDetails } = require('../../utils/quoteUtils');
 const { generateQuotePDFBuffer } = require('../../utils/pdfService');
 const { uploadQuotePdfBuffer, createQuoteSignedUrl } = require('../../utils/storageQuotes');
+const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
 
 function isQuoteCommand(text) {
   const s = String(text || '').trim().toLowerCase();

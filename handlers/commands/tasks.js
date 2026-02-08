@@ -30,6 +30,10 @@ const deletePendingTransactionState =
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
+const { canEmployeeSelfLog, getPlanOrDefault } = require("../../src/config/checkCapability");
+const { logCapabilityDenial } = require("../../src/lib/capabilityDenials");
+const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require("../../src/config/upgradeCopy");
+
 
 /* ---------------- TwiML helpers ---------------- */
 
@@ -323,6 +327,34 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
   String(from || '').trim();
 
 const safeMsgId = computeStableMsgId({ from: paUserId, sourceMsgId, res });
+   const rawPlan = String(_ownerProfile?.plan || _ownerProfile?.tier || _ownerProfile?.pricing_plan || "free")
+  .toLowerCase()
+  .trim();
+const plan = getPlanOrDefault ? getPlanOrDefault(rawPlan) : (rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro" ? rawPlan : "free");
+
+const role = isOwner ? "owner" : "employee";
+
+// Gate: employees can’t self-use tasks unless Pro (same semantics as time self-log)
+if (!isOwner) {
+  const gate = canEmployeeSelfLog(plan);
+  if (!gate.allowed) {
+    try {
+      await logCapabilityDenial(pg, {
+        owner_id: String(ownerId || "").trim(),
+        user_id: String(paUserId || "").trim(),
+        actor_role: role,
+        plan,
+        capability: "tasks",
+        reason_code: gate.reason_code,
+        upgrade_plan: gate.upgrade_plan || null,
+        source_msg_id: safeMsgId || null,
+        context: { handler: "tasks.tasksHandler" },
+      });
+    } catch {}
+
+    return respond(res, `${PRO_CREW_UPGRADE_LINE}\n${UPGRADE_FOLLOWUP_ASK}`);
+  }
+}
 
 
   // If you have a middleware lock system, we try to release via req.releaseLock first (preferred).

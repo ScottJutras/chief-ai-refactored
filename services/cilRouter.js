@@ -155,17 +155,20 @@ async function applyCIL(rawCil, ctx) {
   if (!fn) throw new Error(`No handler for CIL type: ${cil.type}`);
 
   const ctxOut = {
-    ...baseCtx,
-    owner_id,
-    actor_phone,
-    source_msg_id,
+  ...baseCtx,
+  owner_id,
+  actor_phone,
+  source_msg_id,
 
-    // Preferred: domain handlers can persist full attachment meta
-    mediaMetaNormalized,
+  // ✅ plan/role defaults (wire from DB next)
+  plan: baseCtx.plan || "free",
+  role: baseCtx.role || "owner",
+  crew_count: typeof baseCtx.crew_count === "number" ? baseCtx.crew_count : 0,
 
-    // Back-compat conveniences
-    media_url: effectiveMediaUrl,
-  };
+  mediaMetaNormalized,
+  media_url: effectiveMediaUrl,
+};
+
 
   const result = await fn(cil, ctxOut);
 

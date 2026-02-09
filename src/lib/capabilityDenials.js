@@ -1,4 +1,5 @@
 // src/lib/capabilityDenials.js
+
 async function logCapabilityDenial(db, row) {
   try {
     if (!db || typeof db.query !== "function") return; // fail-open
@@ -39,9 +40,39 @@ async function logCapabilityDenial(db, row) {
       ]
     );
   } catch (e) {
-    // fail-open always
     console.warn("[capability_denial_log_failed]", e?.message || e);
   }
 }
 
-module.exports = { logCapabilityDenial };
+/**
+ * ✅ One-time guard helper (fail-open).
+ * Returns true if a matching denial row exists.
+ */
+async function hasDenial(db, { owner_id, capability, reason_code } = {}) {
+  try {
+    if (!db || typeof db.query !== "function") return false; // fail-open
+    if (!owner_id) return false;
+
+    const cap = capability != null ? String(capability) : null;
+    const code = reason_code != null ? String(reason_code) : null;
+
+    const { rows } = await db.query(
+      `
+      select 1
+        from capability_denials
+       where owner_id = $1
+         and ($2::text is null or capability = $2::text)
+         and ($3::text is null or reason_code = $3::text)
+       limit 1
+      `,
+      [String(owner_id), cap, code]
+    );
+
+    return !!rows?.length;
+  } catch (e) {
+    // fail-open
+    return false;
+  }
+}
+
+module.exports = { logCapabilityDenial, hasDenial };

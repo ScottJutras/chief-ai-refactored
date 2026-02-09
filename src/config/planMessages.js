@@ -36,6 +36,10 @@ const plan_messages = {
     message: PRO_CREW_UPGRADE_LINE,
     upgrade_plan: "pro",
   },
+  CREW_SELF_LOGGING_REQUIRES_PRO: {
+  message: "Pro unlocks crew self-logging — employees can clock in/out from their own phones.",
+  upgrade_plan: "pro"
+  },
 
   // If you want “crew requires pro” to map to the same copy:
   CREW_REQUIRES_PRO: {

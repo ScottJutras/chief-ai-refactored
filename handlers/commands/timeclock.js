@@ -23,6 +23,7 @@ const { getUserByName, getUserBasic } = require('../../services/users');
 const { canLogTime } = require("../../src/config/checkCapability");
 const { logCapabilityDenial } = require("../../src/lib/capabilityDenials");
 const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
+const { maybeGetCrewMomentText } = require('../../src/lib/upsellMoments');
 
 
 
@@ -1373,7 +1374,30 @@ if (!gate.allowed) {
     });
   } catch {}
 
-  return ret(gate.message, {
+    // ✅ Moment 2: only once, Free/Starter, crew-adjacent implication
+  // We treat "role !== owner" attempting to log time as a valid "crew exists" signal.
+  let moment2 = null;
+  try {
+    moment2 = await maybeGetCrewMomentText({
+      pg,
+      ownerId: owner_id,
+      userId: user_id,
+      role,
+      plan,
+      context: {
+        source_msg_id: ctx?.source_msg_id || null,
+        handler: "timeclock.handleClock",
+        trigger: "time_log_attempt_denied",
+        role_raw: ctx?.role || null,
+        plan_raw: ctx?.plan || null,
+      },
+      includeFollowUp: false, // set true if you want “Want me to send the upgrade link?”
+    });
+  } catch {}
+
+  const msg = moment2 ? `${gate.message}\n\n${moment2}` : gate.message;
+
+  return ret(msg, {
     reason_code: gate.reason_code,
     upgrade_plan: gate.upgrade_plan,
   });

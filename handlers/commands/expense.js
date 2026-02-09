@@ -3506,11 +3506,20 @@ async function handleExpense(
   source_msg_id: safeMsgId || null;
 
   // ✅ Canonical CONFIRM PA key used everywhere in this handler
-  const paKey = String(paUserId || '').trim();
-  const rawPlan = String(ownerProfile?.plan || ownerProfile?.tier || ownerProfile?.pricing_plan || "free")
-    .toLowerCase()
-    .trim();
-  const plan = getPlanOrDefault ? getPlanOrDefault(rawPlan) : rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro" ? rawPlan : "free";
+const paKey = String(paUserId || '').trim();
+
+// ✅ Canonical plan normalization (default Free on ambiguity)
+const rawPlan = String(
+  ownerProfile?.plan ||
+    ownerProfile?.tier ||
+    ownerProfile?.pricing_plan ||
+    ownerProfile?.subscription_tier ||
+    ownerProfile?.paid_tier ||
+    'free'
+).toLowerCase().trim();
+
+const plan = (typeof getPlanOrDefault === 'function') ? getPlanOrDefault(rawPlan) : 'free';
+
 
   if (!isOwner) {
     const gate = canEmployeeSelfLog(plan);
@@ -4788,19 +4797,19 @@ const patchedDraft = {
 // ---------------------------------------------------------
 if (confirmPA?.payload?.draft) {
   // ✅ Confirm gate (Owner OR employee-allowed-by-plan)
-  // - Owners always allowed.
-  // - Employees allowed only if canEmployeeSelfLog(plan).allowed
-  if (!isOwner) {
-    const rawPlan = String(ownerProfile?.plan || ownerProfile?.tier || ownerProfile?.pricing_plan || 'free')
-      .toLowerCase()
-      .trim();
+if (!isOwner) {
+  // ✅ Canonical plan normalization (default Free on ambiguity)
+  const rawPlan = String(
+    ownerProfile?.plan ||
+      ownerProfile?.tier ||
+      ownerProfile?.pricing_plan ||
+      ownerProfile?.subscription_tier ||
+      ownerProfile?.paid_tier ||
+      'free'
+  ).toLowerCase().trim();
 
-    const plan =
-      typeof getPlanOrDefault === 'function'
-        ? getPlanOrDefault(rawPlan)
-        : rawPlan === 'free' || rawPlan === 'starter' || rawPlan === 'pro'
-          ? rawPlan
-          : 'free';
+  const plan = (typeof getPlanOrDefault === 'function') ? getPlanOrDefault(rawPlan) : 'free';
+
 
     const gate = canEmployeeSelfLog(plan);
 

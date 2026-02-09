@@ -131,6 +131,11 @@ function canUseApprovals(plan, role) {
 
   return allow();
 }
+function canCrewSelfLog(plan) {
+  const p = getPlanOrDefault(plan);
+  if (p === 'pro' || p === 'enterprise') return allow();
+  return deny("CREW_SELF_LOGGING_REQUIRES_PRO");
+}
 
 /**
  * Time logging:

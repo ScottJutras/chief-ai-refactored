@@ -20,6 +20,8 @@
 const pg = require('../../services/postgres');
 const state = require('../../utils/stateManager');
 const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
+const { shouldShowJobCreatedOrientation } = require('../../src/lib/upsellDecisions');
+const { getPlanOrDefault } = require('../../src/config/checkCapability');
 
 // Twilio helpers (preferred)
 let sendWhatsAppInteractiveList = null;
@@ -955,47 +957,78 @@ Now you can:
     }
 
     // --- Create job (idempotent) ---
-    if (/^(create|new|start)\s+job\b/i.test(msg)) {
-      const name = msg.replace(/^(create|new|start)\s+job\b/i, '').trim();
+if (/^(create|new|start)\s+job\b/i.test(msg)) {
+  const name = msg.replace(/^(create|new|start)\s+job\b/i, '').trim();
 
-      if (!name) {
-        return respond(res, `What should the job be called? Example: "create job Oak Street re-roof"`);
-      }
+  if (!name) {
+    return respond(res, `What should the job be called? Example: "create job Oak Street re-roof"`);
+  }
 
-      if (typeof pg.createJobIdempotent !== 'function') {
-        return respond(res, `⚠️ createJobIdempotent() isn't available in postgres.js yet.`);
-      }
+  if (typeof pg.createJobIdempotent !== 'function') {
+    return respond(res, `⚠️ createJobIdempotent() isn't available in postgres.js yet.`);
+  }
 
-      const out = await pg.createJobIdempotent({
-        ownerId: owner,
-        name,
-        sourceMsgId
-      });
+  const out = await pg.createJobIdempotent({
+    ownerId: owner,
+    name,
+    sourceMsgId
+  });
 
-      if (!out?.job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
+  if (!out?.job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
 
-      const jobName = sanitizeJobLabel(out.job.job_name || out.job.name || name || 'Untitled Job');
-      const jobNo = out.job.job_no ?? '?';
+  const jobName = sanitizeJobLabel(out.job.job_name || out.job.name || name || 'Untitled Job');
+  const jobNo = out.job.job_no ?? '?';
 
-      if (out.inserted) {
-        return respond(
-          res,
-          `✅ Created job: "${jobName}" (Job #${jobNo}).
+  // Normalize plan (default free on ambiguity)
+  const rawPlan = String(
+    ownerProfile?.plan ||
+    ownerProfile?.tier ||
+    ownerProfile?.pricing_plan ||
+    ownerProfile?.subscription_tier ||
+    ownerProfile?.paid_tier ||
+    'free'
+  );
+  const plan = (typeof getPlanOrDefault === 'function')
+    ? getPlanOrDefault(rawPlan)
+    : String(rawPlan || 'free').toLowerCase().trim();
 
-Next:
-- Switch: "change job"
-- Time: "clock in @ ${jobName}"
-- Expense: "expense 84.12 nails from Home Depot today"
-- Revenue: "received $2500 deposit today"`
-        );
-      }
+  if (out.inserted) {
+    // ✅ DB-based “first job” detection (cheap; limit 2)
+    let isFirstJobCreated = false;
+    try {
+      const { rows } = await pg.query(
+        `select job_no
+           from public.jobs
+          where owner_id=$1
+          order by job_no asc
+          limit 2`,
+        [String(owner).replace(/\D/g, '')] // jobs.owner_id is DIGITS(ownerId)
+      );
+      isFirstJobCreated = (rows?.length === 1);
+    } catch {}
 
-      if (out.reason === 'already_exists') {
-        return respond(res, `✅ That job already exists: "${jobName}" (Job #${jobNo}).`);
-      }
-
-      return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
+    // ✅ Moment 1 (orientation) — ONLY first job + ONLY free — exact copy
+    if (shouldShowJobCreatedOrientation({ plan, isFirstJobCreated })) {
+      return respond(
+        res,
+        `✅ Created job: “${jobName}” (Job #${jobNo}).\n\nEverything logged against this job stays traceable.\n\nFree lets you capture the basics.\nPro unlocks crew self-logging — employees can clock in/out from their own phones.`
+      );
     }
+
+    // Normal success message (non-first-job OR non-free)
+    return respond(
+      res,
+      `✅ Created job: "${jobName}" (Job #${jobNo}).`
+    );
+  }
+
+  if (out.reason === 'already_exists') {
+    return respond(res, `✅ That job already exists: "${jobName}" (Job #${jobNo}).`);
+  }
+
+  return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
+}
+
 
     return respond(
       res,

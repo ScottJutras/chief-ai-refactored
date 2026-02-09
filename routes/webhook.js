@@ -1336,15 +1336,30 @@ router.use((req, res, next) => {
       res.locals.phaseAt = Date.now();
 
       prof.userProfileMiddleware(req, res, () => {
-        res.locals.phase = 'lock';
-        res.locals.phaseAt = Date.now();
+  // ✅ WHOAMI debug (remove after you confirm gating)
+  try {
+    console.info('[WHOAMI_CTX]', {
+      from: req.from || null,
+      actorKey: req.actorKey || null,
+      waId: req.body?.WaId || req.body?.WaID || null,
+      profileName: req.body?.ProfileName || null,
+      ownerId: req.ownerId || null,
+      isOwner: !!req.isOwner,
+      role: req.userProfile?.role || req.userProfile?.user_role || null,
+      userId: req.userProfile?.user_id || req.userProfile?.id || null
+    });
+  } catch {}
 
-        lock.lockMiddleware(req, res, () => {
-          res.locals.phase = 'router';
-          res.locals.phaseAt = Date.now();
-          next();
-        });
-      });
+  res.locals.phase = 'lock';
+  res.locals.phaseAt = Date.now();
+
+  lock.lockMiddleware(req, res, () => {
+    res.locals.phase = 'router';
+    res.locals.phaseAt = Date.now();
+    next();
+  });
+});
+
     });
   } catch (e) {
     console.warn('[WEBHOOK] light middlewares skipped:', e?.message);

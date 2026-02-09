@@ -2838,33 +2838,71 @@ function getInboundText(bodyOrInput, twilioMetaMaybe) {
   const direct = (typeof bodyOrInput === 'string') ? bodyOrInput : '';
   const body = String(meta.Body || meta.body || direct || '').trim();
 
-  // --- List replies: DO NOT REWRITE TOKENS ---
-  // Prefer raw token the resolver can understand (jobno_*, job_#_hash, etc.)
-  const listish =
-    !!(meta.ListId || meta.ListTitle || meta.ListRowId || meta.ListRowTitle || meta.InteractiveResponseJson);
-
-  if (listish) {
-    // Most reliable in your logs:
-    // Body: 'job_1_694ca083'
-    if (body) return body;
-
-    // fallbacks for other payload shapes
-    if (meta.ListRowId) return String(meta.ListRowId).trim();
-    if (meta.ListId) return String(meta.ListId).trim();
-
-    // last resort: return title (not ideal, but better than jobix rewrite)
-    if (meta.ListTitle) return String(meta.ListTitle).trim();
-  }
+  // ✅ 0) Router-resolved token (highest priority)
+  // webhook.js may canonicalize list clicks to jobix_<n> or jobno_<n>
+  const resolved =
+    String(meta.ResolvedInboundText || meta.resolvedInboundText || '').trim();
+  if (resolved) return resolved; // do NOT rewrite
 
   // --- Buttons ---
   const btnPayload = String(meta.ButtonPayload || meta.buttonPayload || '').trim();
   const btnText = String(meta.ButtonText || meta.buttonText || '').trim();
-  if (btnPayload) return btnPayload;
-  if (btnText) return btnText;
+  if (btnPayload) return btnPayload.toLowerCase();
+  if (btnText && btnText.length <= 40) return btnText.toLowerCase();
 
-  // --- Normal text ---
-  return body;
+  // --- InteractiveResponseJson (best signal if present) ---
+  const irj = meta.InteractiveResponseJson || meta.interactiveResponseJson || null;
+  if (irj) {
+    try {
+      const json = (typeof irj === 'string') ? JSON.parse(irj) : irj;
+
+      const id =
+        json?.list_reply?.id ||
+        json?.listReply?.id ||
+        json?.interactive?.list_reply?.id ||
+        json?.interactive?.listReply?.id ||
+        '';
+
+      const title =
+        json?.list_reply?.title ||
+        json?.listReply?.title ||
+        json?.interactive?.list_reply?.title ||
+        json?.interactive?.listReply?.title ||
+        '';
+
+      const pickedId = String(id || '').trim();
+      if (pickedId) return pickedId; // ✅ never rewrite
+
+      const pickedTitle = String(title || '').trim();
+      if (pickedTitle) return pickedTitle;
+    } catch {}
+  }
+
+  // --- List replies (Twilio list picker fields): prefer ids first ---
+  const listRowId = String(meta.ListRowId || meta.ListRowID || meta.listRowId || meta.listRowID || '').trim();
+  if (listRowId) return listRowId;
+
+  const listId = String(
+    meta.ListId ||
+    meta.listId ||
+    meta.ListItemId ||
+    meta.listItemId ||
+    meta.ListReplyId ||
+    meta.listReplyId ||
+    ''
+  ).trim();
+  if (listId) return listId;
+
+  // If Twilio put the token in Body (common), return it AS-IS
+  if (body) return body;
+
+  // last resort: titles
+  const listTitle = String(meta.ListTitle || meta.listTitle || meta.ListReplyTitle || meta.listReplyTitle || '').trim();
+  if (listTitle) return listTitle;
+
+  return '';
 }
+
 
 
 function isEditIntent(input, twilioMeta) {
@@ -3125,23 +3163,31 @@ try {
 
 // -------------------------------------------------------
 // ✅ Inbound extraction (expense-local) — aligned w/ webhook.js
-// Purpose:
-// - Do NOT rely on router ResolvedInboundText for interactive list picks
-// - Prefer stable row id (jp:...) / ListRowId / ListId / Body as-is
+// Rules:
+// - Prefer router-resolved token first (ResolvedInboundText), because webhook.js
+//   may canonicalize list clicks to jobix_<n>
 // - Buttons still normalize
+// - IRJ id is stable if present
+// - Then ListRowId/ListId
+// - Then raw input/body as-is
 // -------------------------------------------------------
 function getInboundTextExpense(input, meta = {}) {
   const rawInput = String(input || '').trim();
 
-  // Buttons
-  const payload = String(meta?.ButtonPayload || '').trim();
+  // ✅ 0) Router-resolved inbound (highest priority)
+  const resolved =
+    String(meta?.ResolvedInboundText || meta?.resolvedInboundText || '').trim();
+  if (resolved) return resolved; // e.g. "jobix_2" (do NOT rewrite)
+
+  // ✅ 1) Buttons
+  const payload = String(meta?.ButtonPayload || meta?.buttonPayload || '').trim();
   if (payload) return payload.toLowerCase();
 
-  const btnText = String(meta?.ButtonText || '').trim();
+  const btnText = String(meta?.ButtonText || meta?.buttonText || '').trim();
   if (btnText && btnText.length <= 40) return btnText.toLowerCase();
 
-  // InteractiveResponseJson (best signal)
-  const irj = meta?.InteractiveResponseJson || null;
+  // ✅ 2) InteractiveResponseJson (best raw signal if present)
+  const irj = meta?.InteractiveResponseJson || meta?.interactiveResponseJson || null;
   if (irj) {
     try {
       const obj = typeof irj === 'string' ? JSON.parse(irj) : irj;
@@ -3149,11 +3195,14 @@ function getInboundTextExpense(input, meta = {}) {
         obj?.list_reply?.id ||
         obj?.interactive?.list_reply?.id ||
         obj?.listReply?.id ||
+        obj?.interactive?.listReply?.id ||
         '';
+
       const title =
         obj?.list_reply?.title ||
         obj?.interactive?.list_reply?.title ||
         obj?.listReply?.title ||
+        obj?.interactive?.listReply?.title ||
         '';
 
       const pickedId = String(id || '').trim();
@@ -3164,18 +3213,22 @@ function getInboundTextExpense(input, meta = {}) {
     } catch {}
   }
 
-  // Twilio list fields: prefer ids first
-  const listRowId = String(meta?.ListRowId || meta?.ListRowID || '').trim();
+  // ✅ 3) Twilio list fields: prefer ids
+  const listRowId = String(meta?.ListRowId || meta?.ListRowID || meta?.listRowId || meta?.listRowID || '').trim();
   if (listRowId) return listRowId;
 
-  const listId = String(meta?.ListId || meta?.ListItemId || meta?.ListReplyId || '').trim();
+  const listId = String(meta?.ListId || meta?.listId || meta?.ListItemId || meta?.listItemId || meta?.ListReplyId || meta?.listReplyId || '').trim();
   if (listId) return listId;
 
-  // Do NOT rewrite job_3_xxx -> jobix_3 (leave raw token)
+  // ✅ 4) Raw input
   if (rawInput) return rawInput;
 
-  const title = String(meta?.ListTitle || meta?.ListRowTitle || '').trim();
+  // ✅ 5) Last resort titles
+  const title = String(meta?.ListTitle || meta?.listTitle || meta?.ListRowTitle || meta?.listRowTitle || '').trim();
   if (title) return title;
+
+  const body = String(meta?.Body || meta?.body || '').trim();
+  if (body) return body;
 
   return '';
 }

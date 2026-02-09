@@ -81,7 +81,7 @@ async function resolveOwnerPlan(ownerDigits) {
     );
 
     const row = r?.rows?.[0] || null;
-    const plan = String(row?.paid_tier || row?.subscription_tier || 'free').toLowerCase().trim();
+    const plan = String(row?.subscription_tier || row?.paid_tier || 'free').toLowerCase().trim();
     return plan || 'free';
   } catch (e) {
     console.warn('[userProfile] resolveOwnerPlan failed (default free):', e?.message);

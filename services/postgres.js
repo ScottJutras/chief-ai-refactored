@@ -1588,7 +1588,7 @@ async function getLatestFacts({ ownerId, limit = 20, types = [] }) {
 
 
 /**
- * ✅ createJobIdempotent (CANONICAL)
+ * ✅ createJobIdempotent (CANONICAL) — FIXED $3 type conflict + optional membership gating
  */
 async function createJobIdempotent({
   ownerId,
@@ -1598,7 +1598,8 @@ async function createJobIdempotent({
   status = 'open',
   active = true
 } = {}) {
-  const owner = DIGITS(ownerId);
+  // ✅ Owner IDs may be numeric OR UUID/text now — do NOT DIGITS() here.
+  const owner = String(ownerId || '').trim();
   const cleanName = String(jobName || name || '').trim() || 'Untitled Job';
   const msgId = String(sourceMsgId || '').trim() || null;
 
@@ -1607,6 +1608,90 @@ async function createJobIdempotent({
   return await withClient(async (client) => {
     await withOwnerAllocLock(owner, client);
 
+    /* ---------------------------------------------------------
+     * OPTIONAL: membership gating (safe / best-effort)
+     * - If memberships table/cols exist, enforce a basic rule.
+     * - If anything is missing or errors, fail-open (no blocking).
+     * --------------------------------------------------------- */
+    try {
+      const hasMemberships = await hasTable('memberships').catch(() => false);
+      if (hasMemberships) {
+        // Best-effort: look for a plan on the owner row.
+        // Adjust column names if yours differ (plan, tier, status, etc.)
+        const cols = await client.query(
+          `
+          select column_name
+            from information_schema.columns
+           where table_schema='public'
+             and table_name='memberships'
+             and column_name in ('plan','tier','status','is_active','max_jobs')
+          `
+        );
+
+        const colset = new Set((cols.rows || []).map((r) => r.column_name));
+        const planCol = colset.has('plan') ? 'plan' : colset.has('tier') ? 'tier' : null;
+        const statusCol = colset.has('status') ? 'status' : null;
+        const isActiveCol = colset.has('is_active') ? 'is_active' : null;
+        const maxJobsCol = colset.has('max_jobs') ? 'max_jobs' : null;
+
+        if (planCol || statusCol || isActiveCol || maxJobsCol) {
+          const r = await client.query(
+            `
+            select
+              ${planCol ? `${planCol} as plan,` : `null as plan,`}
+              ${statusCol ? `${statusCol} as status,` : `null as status,`}
+              ${isActiveCol ? `${isActiveCol} as is_active,` : `null as is_active,`}
+              ${maxJobsCol ? `${maxJobsCol} as max_jobs` : `null as max_jobs`}
+            from public.memberships
+            where owner_id = $1
+            order by updated_at desc nulls last, created_at desc nulls last
+            limit 1
+            `,
+            [owner]
+          );
+
+          const m = r.rows?.[0] || null;
+
+          // Very conservative gating:
+          // - if is_active exists and is false => block job creation
+          // - if status exists and looks inactive/canceled => block
+          const isInactive =
+            (isActiveCol && m && m.is_active === false) ||
+            (statusCol && m && typeof m.status === 'string' && /cancel|inactive|past_due|unpaid/i.test(m.status));
+
+          if (isInactive) {
+            return {
+              inserted: false,
+              job: null,
+              reason: 'membership_inactive',
+              error: 'Membership inactive — cannot create new jobs.'
+            };
+          }
+
+          // Optional cap:
+          // - if max_jobs exists and is a number => enforce it
+          const maxJobs =
+            maxJobsCol && m?.max_jobs != null && Number.isFinite(Number(m.max_jobs)) ? Number(m.max_jobs) : null;
+
+          if (maxJobs != null) {
+            const c = await client.query(`select count(*)::int as n from public.jobs where owner_id=$1`, [owner]);
+            const n = c.rows?.[0]?.n ?? 0;
+            if (Number.isFinite(n) && n >= maxJobs) {
+              return {
+                inserted: false,
+                job: null,
+                reason: 'job_limit_reached',
+                error: `Job limit reached for your plan (${maxJobs}).`
+              };
+            }
+          }
+        }
+      }
+    } catch {
+      // ✅ fail-open: never block core workflow due to gating lookup
+    }
+
+    // Idempotency by sourceMsgId (if present)
     if (msgId) {
       const existing = await client.query(
         `SELECT id, owner_id, job_no,
@@ -1620,6 +1705,7 @@ async function createJobIdempotent({
       if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
     }
 
+    // Idempotency by name
     const existingByName = await client.query(
       `SELECT id, owner_id, job_no,
               COALESCE(job_name, name) AS job_name,
@@ -1634,15 +1720,26 @@ async function createJobIdempotent({
     const nextNo = await allocateNextJobNo(owner, client);
 
     try {
+      // ✅ IMPORTANT FIX:
+      // Use $3 for job_name and $4 for name (same value twice).
+      // This avoids Postgres 42P08 when column types differ (varchar vs text).
       const ins = await client.query(
         `INSERT INTO public.jobs
            (owner_id, job_no, job_name, name, status, active, start_date, created_at, updated_at, source_msg_id)
          VALUES
-           ($1, $2, $3, $3, $4, $5, NOW(), NOW(), NOW(), $6)
+           ($1, $2, $3, $4, $5, $6, NOW(), NOW(), NOW(), $7)
          RETURNING id, owner_id, job_no,
                    COALESCE(job_name, name) AS job_name,
                    name, active, status, source_msg_id`,
-        [owner, nextNo, cleanName, String(status || 'open'), !!active, msgId]
+        [
+          owner,
+          nextNo,
+          cleanName, // $3 -> job_name
+          cleanName, // $4 -> name (separate param fixes type inference)
+          String(status || 'open'),
+          !!active,
+          msgId
+        ]
       );
       return { inserted: true, job: ins.rows[0], reason: 'created' };
     } catch (e) {

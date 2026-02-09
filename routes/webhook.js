@@ -1174,7 +1174,7 @@ const digits = /^\d+$/.test(digitsRaw) ? digitsRaw : null;
 
 req.from = e164;
 req.actorKey = digits;
-req.ownerId = req.actorKey || req.from || null;
+
 
 
   const proto = (req.headers['x-forwarded-proto'] || 'https').split(',')[0].trim();

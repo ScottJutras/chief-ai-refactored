@@ -1,223 +1,174 @@
-// middleware/userProfile.js
+// middleware/userProfile.js (DROP-IN)
+// Canonical identity resolution via tenant actor mapping (secure).
+// Falls back to legacy public.users only if resolver has no row.
+//
+// Sets:
+// - req.from (digits)
+// - req.tenantId (uuid)
+// - req.ownerId (digits string, legacy compatibility)
+// - req.isOwner (role === 'owner')
+// - req.userProfile (shaped minimal profile)
+// - req.ownerProfile (shaped minimal owner profile)
+// - req.tz (tenant tz)
+
 const pg = require('../services/postgres');
-const { getUserProfile, createUserProfile, getOwnerProfile } = pg;
 
 const DEFAULT_TZ = 'America/Toronto';
 
-/**
- * Digits-only identity (no whatsapp:, no +).
- */
-function normalizeId(raw) {
+function normalizeDigits(raw) {
   return (
     String(raw || '')
       .replace(/^whatsapp:/i, '')
+      .replace(/^\+/, '')
       .replace(/\D/g, '')
       .trim() || null
   );
 }
 
 function pickTz(obj) {
-  // accept a few legacy keys
-  const tz =
-    (obj && (obj.tz || obj.timezone || obj.time_zone)) ||
-    null;
+  const tz = (obj && (obj.tz || obj.timezone || obj.time_zone)) || null;
   return tz ? String(tz).trim() : null;
 }
 
-function shapeProfile(p, from) {
-  const user_id = p?.user_id || p?.id || from;
-  const owner_id = p?.owner_id || p?.ownerId || user_id;
-  const plan = (p?.plan || p?.subscription_tier || 'free').toLowerCase();
-
-  // ✅ normalize tz onto a single key on the shaped profile
-  const tz = pickTz(p) || null;
+function shapeMinimalProfile({ from, ownerId, role, tz, plan }) {
+  const safeRole = role || null;
+  const safePlan = (plan || 'free').toLowerCase();
 
   return {
-    user_id,
-    owner_id,
-    ownerId: owner_id,
-    from,
-    phone: p?.phone || user_id,
-    name: p?.name || p?.display_name || null,
-    subscription_tier: plan,
-    plan,
-    onboarding_in_progress: Boolean(p?.onboarding_in_progress || p?.onboardingPending || false),
-
-    // ✅ timezone
-    tz,
-
-    // active job (hydrated best-effort below)
-    active_job_id: p?.active_job_id ?? p?.activeJobId ?? null,
-    active_job_name: p?.active_job_name ?? p?.activeJobName ?? null,
-
-    ...p // keep last so callers still get any extra fields you’ve added elsewhere
+    user_id: from,
+    owner_id: ownerId,
+    ownerId,
+    role: safeRole,
+    plan: safePlan,
+    subscription_tier: safePlan,
+    tz: tz || DEFAULT_TZ
   };
 }
 
-function looksLikeUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    String(str || '')
-  );
+// ---- Resolver query (actor identity system) ----
+async function resolveActorIdentity({ kind, identifier }) {
+  try {
+    const r = await pg.query(
+      `
+      select
+        tenant_id,
+        role,
+        owner_phone_digits,
+        tz
+      from public.v_actor_identity_resolver
+      where kind = $1 and identifier = $2
+      limit 1
+      `,
+      [String(kind), String(identifier)]
+    );
+    return r?.rows?.[0] || null;
+  } catch (e) {
+    console.warn('[userProfile] actor identity resolver failed:', e?.message);
+    return null;
+  }
 }
 
-/**
- * Best-effort: get active job fields for this identity.
- * Prefers pg.getActiveJobForIdentity() if present.
- *
- * Returns: { active_job_id, active_job_name } | null
- */
-async function fetchActiveJobForIdentity({ ownerId, from, userProfile }) {
-  const ownerParam = normalizeId(ownerId);
-  const userId = normalizeId(userProfile?.user_id || userProfile?.id || from);
-
-  if (!ownerParam || !userId) return null;
-
-  if (typeof pg.getActiveJobForIdentity === 'function') {
-    try {
-      const out = await pg.getActiveJobForIdentity(ownerParam, userId);
-      if (
-        out &&
-        (out.active_job_id != null ||
-          out.active_job_name != null ||
-          out.activeJobId != null ||
-          out.activeJobName != null)
-      ) {
-        return {
-          active_job_id: out.active_job_id ?? out.activeJobId ?? null,
-          active_job_name: out.active_job_name ?? out.activeJobName ?? null
-        };
-      }
-    } catch (e) {
-      // fail-open
-      console.warn('[userProfile] pg.getActiveJobForIdentity failed (ignored):', e?.message);
+// ---- Legacy fallback (public.users) ----
+async function resolveLegacyUser(fromDigits) {
+  try {
+    if (typeof pg.getUserProfile === 'function') {
+      const u = await pg.getUserProfile(fromDigits);
+      return u || null;
     }
+  } catch (e) {
+    console.warn('[userProfile] legacy getUserProfile failed:', e?.message);
   }
 
-  return null;
-}
-
-/**
- * If we have an id but no name, resolve name from jobs.
- * Supports UUID id or numeric job_no.
- */
-async function resolveJobNameFromJobsTable({ ownerId, active_job_id }) {
-  if (active_job_id == null) return null;
-  const ownerParam = normalizeId(ownerId);
-  const s = String(active_job_id).trim();
-  if (!ownerParam || !s) return null;
-
-  // UUID job id
-  if (looksLikeUuid(s)) {
-    try {
-      const r = await pg.query(
-        `SELECT COALESCE(name, job_name) AS job_name
-           FROM public.jobs
-          WHERE owner_id = $1 AND id = $2::uuid
-          LIMIT 1`,
-        [ownerParam, s]
-      );
-      const name = r?.rows?.[0]?.job_name;
-      return name ? String(name).trim() : null;
-    } catch {}
+  // Direct SQL fallback if helper missing
+  try {
+    const r = await pg.query(
+      `select user_id, owner_id, role, paid_tier, timezone
+       from public.users
+       where user_id = $1
+       limit 1`,
+      [fromDigits]
+    );
+    return r?.rows?.[0] || null;
+  } catch {
+    return null;
   }
-
-  // numeric job_no
-  if (/^\d+$/.test(s)) {
-    try {
-      const r = await pg.query(
-        `SELECT COALESCE(name, job_name) AS job_name
-           FROM public.jobs
-          WHERE owner_id = $1 AND job_no = $2::int
-          LIMIT 1`,
-        [ownerParam, Number(s)]
-      );
-      const name = r?.rows?.[0]?.job_name;
-      return name ? String(name).trim() : null;
-    } catch {}
-  }
-
-  return null;
 }
 
 async function userProfileMiddleware(req, _res, next) {
   try {
-    const from = normalizeId(req.body?.From || req.from);
+    const from = normalizeDigits(req.body?.From || req.from);
     req.from = from;
 
-    const ownerFromReq = normalizeId(req.ownerId);
-    req.ownerId = ownerFromReq || from || 'GLOBAL';
+    // default safe values
+    req.tz = DEFAULT_TZ;
+    req.isOwner = false;
+    req.tenantId = null;
 
     if (!from) {
       req.userProfile = null;
       req.ownerProfile = null;
-      req.isOwner = false;
+      req.ownerId = req.ownerId || 'GLOBAL';
+      return next();
+    }
 
-      // ✅ always set a tz on req (even in weird paths)
-      req.tz = DEFAULT_TZ;
+    // 1) Try canonical resolver first (whatsapp identity -> tenant + role)
+    const resolved = await resolveActorIdentity({ kind: 'whatsapp', identifier: from });
+
+    if (resolved?.tenant_id) {
+      req.tenantId = resolved.tenant_id;
+      req.ownerId = normalizeDigits(resolved.owner_phone_digits) || from; // legacy compat
+      req.isOwner = String(resolved.role || '').toLowerCase() === 'owner';
+      req.tz = pickTz(resolved) || DEFAULT_TZ;
+
+      req.userProfile = shapeMinimalProfile({
+        from,
+        ownerId: req.ownerId,
+        role: resolved.role,
+        tz: req.tz,
+        plan: null
+      });
+
+      req.ownerProfile = shapeMinimalProfile({
+        from: req.ownerId,
+        ownerId: req.ownerId,
+        role: 'owner',
+        tz: req.tz,
+        plan: null
+      });
 
       return next();
     }
 
-    // Load or create the user
-    let profile = await getUserProfile(from);
-    if (!profile) {
-      profile = await createUserProfile({ user_id: from, ownerId: from, onboarding_in_progress: true });
-      console.log('[userProfile] created new user', from);
-    }
-    profile = shapeProfile(profile, from);
+    // 2) Fallback: legacy public.users path (temporary)
+    const legacy = await resolveLegacyUser(from);
 
-    // Owner profile (handlers receive this)
-    let ownerProfile = null;
-    try {
-      ownerProfile = await getOwnerProfile(req.ownerId);
-    } catch (e) {
-      console.warn('[userProfile] getOwnerProfile failed:', e?.message);
-    }
-    if (ownerProfile) ownerProfile = shapeProfile(ownerProfile, req.ownerId);
+    if (legacy) {
+      const ownerId = normalizeDigits(legacy.owner_id) || from;
+      const role = legacy.role || (String(legacy.user_id) === String(ownerId) ? 'owner' : 'employee');
+      const tz = legacy.timezone || DEFAULT_TZ;
+      const plan = legacy.paid_tier || legacy.subscription_tier || 'free';
 
-    // Hydrate active job (best-effort, fail-open)
-    try {
-      const hasActiveAlready =
-        (profile.active_job_name && String(profile.active_job_name).trim()) || profile.active_job_id != null;
+      req.ownerId = ownerId;
+      req.isOwner = String(role).toLowerCase() === 'owner';
+      req.tz = tz;
 
-      if (!hasActiveAlready) {
-        const fetched = await fetchActiveJobForIdentity({ ownerId: req.ownerId, from, userProfile: profile });
-        if (fetched) {
-          profile.active_job_id = fetched.active_job_id ?? null;
-          profile.active_job_name = fetched.active_job_name ?? null;
-        }
-      }
+      req.userProfile = shapeMinimalProfile({ from, ownerId, role, tz, plan });
+      req.ownerProfile = shapeMinimalProfile({ from: ownerId, ownerId, role: 'owner', tz, plan });
 
-      if ((!profile.active_job_name || !String(profile.active_job_name).trim()) && profile.active_job_id != null) {
-        const resolvedName = await resolveJobNameFromJobsTable({
-          ownerId: req.ownerId,
-          active_job_id: profile.active_job_id
-        });
-        if (resolvedName) profile.active_job_name = resolvedName;
-      }
-    } catch (e) {
-      console.warn('[userProfile] active job hydrate failed (ignored):', e?.message);
+      return next();
     }
 
-    // ✅ Canonical tz for the whole request:
-    // user override -> owner profile -> default
-    req.tz = pickTz(profile) || pickTz(ownerProfile) || DEFAULT_TZ;
-
-    // ✅ normalize onto userProfile + ownerProfile so legacy callsites are stable
-    if (profile && !profile.tz) profile.tz = req.tz;
-    if (ownerProfile && !ownerProfile.tz) ownerProfile.tz = req.tz;
-
-    req.userProfile = profile;
-    req.ownerProfile = ownerProfile;
-    req.isOwner = String(profile.user_id) === String(req.ownerId);
+    // 3) Fail-soft: create legacy user if needed (optional)
+    // You can disable this once actor identity is enforced.
+    req.ownerId = from;
+    req.isOwner = true;
+    req.userProfile = shapeMinimalProfile({ from, ownerId: from, role: 'owner', tz: DEFAULT_TZ, plan: 'free' });
+    req.ownerProfile = req.userProfile;
 
     return next();
   } catch (e) {
     console.warn('[userProfile] failed:', e?.message);
-
-    // ✅ fail-soft tz
     req.tz = req.tz || DEFAULT_TZ;
-
     return next();
   }
 }

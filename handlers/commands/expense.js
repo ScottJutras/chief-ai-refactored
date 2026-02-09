@@ -2906,24 +2906,18 @@ function getInboundText(bodyOrInput, twilioMetaMaybe) {
 
 
 function isEditIntent(input, twilioMeta) {
-  const meta = twilioMeta || {};
   const t = normLower(getInboundText(input, twilioMeta));
-  const bp = normLower(meta.ButtonPayload || meta.buttonPayload);
-  return t === 'edit' || bp === 'edit';
+  return t === 'edit';
 }
 
 function isYesIntent(input, twilioMeta) {
-  const meta = twilioMeta || {};
   const t = normLower(getInboundText(input, twilioMeta));
-  const bp = normLower(meta.ButtonPayload || meta.buttonPayload);
-  return t === 'yes' || t === 'y' || bp === 'yes';
+  return t === 'yes' || t === 'y';
 }
 
 function isCancelIntent(input, twilioMeta) {
-  const meta = twilioMeta || {};
   const t = normLower(getInboundText(input, twilioMeta));
-  const bp = normLower(meta.ButtonPayload || meta.buttonPayload);
-  return t === 'cancel' || t === 'stop' || bp === 'cancel';
+  return t === 'cancel' || t === 'stop' || t === 'no';
 }
 
 function isSkipIntent(input, twilioMeta) {
@@ -2940,12 +2934,15 @@ function isControlWord(input, twilioMeta) {
     t === 'edit' ||
     t === 'cancel' ||
     t === 'stop' ||
+    t === 'no' ||
     t === 'skip' ||
+    t === 'resume' ||
+    t === 'change_job' ||
     t === 'change job' ||
     t === 'switch job' ||
-    t.startsWith('job ') ||     // keep: covers "job 1" typed manually
+    t.startsWith('job ') ||     // covers "job 1" typed manually
     t.startsWith('jobno_') ||
-    t.startsWith('jobix_') ||   // keep for legacy compatibility
+    t.startsWith('jobix_') ||   // legacy compatibility
     t.startsWith('job_') ||     // Twilio content-template tokens
     t.startsWith('jp:')         // your stable row id format
   );
@@ -3009,11 +3006,10 @@ function hasExplicitDateToken(text = '') {
 }
 
 
-// Parse edit payload and merge into existing draft WITHOUT losing receipt/media linkage.
+/// Parse edit payload and merge into existing draft WITHOUT losing receipt/media linkage.
 // ✅ Rule: Only overwrite fields the user explicitly intended to change.
+// ✅ AI-FREE: deterministic parsing only.
 async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
-  const { handleInputWithAI, parseExpenseMessage } = require('../../utils/aiErrorHandler');
-
   const tz = ctx?.tz || 'America/Toronto';
   const raw = String(editText || '').trim();
   const lc = raw.toLowerCase();
@@ -3025,15 +3021,11 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   };
 
   const hasMoney = (s) => /\$?\s*-?\d{1,3}(?:,\d{3})*(?:\.\d{2})\b/.test(String(s || ''));
-  const hasDateToken = (s) =>
-    /\b(\d{4}-\d{2}-\d{2}|\d{2}\/\d{2}\/\d{4}|\d{4}[\/.]\d{2}[\/.]\d{2}|\d{2}\/\d{2}\/\d{2}|\d{2}-\d{2}-\d{2})\b/.test(String(s || '')) ||
-    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(String(s || '')) ||
-    /\b(today|yesterday|tomorrow)\b/i.test(String(s || ''));
+  const explicitDate = (typeof hasExplicitDateToken === 'function')
+    ? !!hasExplicitDateToken(raw)
+    : /\b(\d{4}-\d{2}-\d{2}|today|yesterday|tomorrow|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(raw);
 
-  // ✅ Single source of truth: did the user explicitly provide a date?
-  const explicitDate = hasExplicitDateToken(raw);
-
-    const explicit = {
+  const explicit = {
     amount: /\b(amount|total|price|cost)\b/i.test(raw) || hasMoney(raw),
     date: explicitDate,
     store: /\b(store|vendor|merchant|from|at)\b/i.test(raw),
@@ -3053,104 +3045,99 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
 
   explicit.store = explicit.store || looksLikeJustVendor;
 
-
-  // IMPORTANT: Do not strip to "" before parsing — pass the user's actual message.
-  let aiRes = null;
-try {
-  aiRes = await handleInputWithAI(
-    ctx?.fromKey,
-    raw,
-    'expense',
-    parseExpenseMessage,
-    ctx?.defaultData || {},
-    { tz }
-  );
- } catch (e) {
-  console.warn('[EXPENSE_AI] failed; using deterministic fallback:', e?.message);
-
-  return {
-    nextDraft: null,
-    aiReply:
-      'I can’t auto-parse edits right now. Please resend in this format:\n' +
-      'expense $AMOUNT at VENDOR on YYYY-MM-DD (optional: job JOBNAME)'
-  };
-}
-
-
-  const data = aiRes.data || {};
+  // --------- deterministic extractors ---------
   const out = { ...(existingDraft || {}) };
 
-  // ---------- preserve receipt/media linkage ALWAYS ----------
-  out.media_asset_id =
-    existingDraft?.media_asset_id || existingDraft?.mediaAssetId || data?.media_asset_id || data?.mediaAssetId || null;
+  // Preserve receipt/media linkage ALWAYS
+  out.media_asset_id = existingDraft?.media_asset_id || existingDraft?.mediaAssetId || out.media_asset_id || null;
+  out.media_source_msg_id = existingDraft?.media_source_msg_id || existingDraft?.mediaSourceMsgId || out.media_source_msg_id || null;
+  out.source_msg_id = existingDraft?.source_msg_id || existingDraft?.sourceMsgId || out.source_msg_id || null;
 
-  out.media_source_msg_id =
-    existingDraft?.media_source_msg_id || existingDraft?.mediaSourceMsgId || data?.media_source_msg_id || data?.mediaSourceMsgId || null;
-
-  out.source_msg_id =
-    existingDraft?.source_msg_id || existingDraft?.sourceMsgId || data?.source_msg_id || data?.sourceMsgId || null;
-
-  // Preserve receipt text fields so later normalize/backstop can keep working
   out.receiptText = existingDraft?.receiptText || existingDraft?.ocrText || existingDraft?.extractedText || out.receiptText || null;
   out.ocrText = existingDraft?.ocrText || out.ocrText || null;
   out.extractedText = existingDraft?.extractedText || out.extractedText || null;
 
-  // ---------- guarded merges (only if explicitly changed) ----------
+  // Amount
   if (explicit.amount) {
-    if (data.amount != null && !String(data.amount).includes('$0.00')) out.amount = data.amount;
+    // Prefer your existing helper if available
+    const amt =
+      (typeof extractMoneyAmount === 'function' ? extractMoneyAmount(raw) : null) ||
+      (() => {
+        const m = raw.match(/\$?\s*(-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/);
+        if (!m?.[1]) return null;
+        const n = Number(String(m[1]).replace(/,/g, ''));
+        if (!Number.isFinite(n)) return null;
+        return `$${n.toFixed(2)}`;
+      })();
+
+    if (amt && amt !== '$0.00') out.amount = amt;
   }
 
-  // ✅ Date merge rule (permanent):
-  // Only allow date to change if user explicitly provided a date token.
-  // Otherwise preserve existingDraft.date exactly.
+  // Date
   if (explicit.date) {
-    const tz0 = tz;
+    const typedDate =
+      (typeof extractReceiptDateYYYYMMDD === 'function' ? extractReceiptDateYYYYMMDD(raw, tz) : null) ||
+      (typeof todayInTimeZone === 'function' ? todayInTimeZone(tz) : null);
 
-    // Prefer deterministic extraction from the user's typed edit text
-    const typedDate = typeof extractReceiptDateYYYYMMDD === 'function' ? extractReceiptDateYYYYMMDD(raw, tz0) : null;
-    if (typedDate) {
-      out.date = typedDate;
-    } else if (data.date && String(data.date).trim()) {
-      const aiDate = String(data.date).trim();
-
-      // If AI still defaulted to "today" while user supplied something date-like, reject to avoid bad overwrite.
-      const today = typeof todayInTimeZone === 'function' ? todayInTimeZone(tz0) : null;
-      if (today && aiDate === today) {
-        return {
-          nextDraft: null,
-          aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Jan 13 2026" or "01/13/2026".'
-        };
-      }
-
-      out.date = aiDate;
+    if (!typedDate) {
+      return {
+        nextDraft: null,
+        aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Jan 13 2026" or "2026-01-13".'
+      };
     }
+
+    out.date = typedDate;
   } else {
-    // ✅ Explicitly lock date if user did not supply it
+    // lock date if not explicit
     if (existingDraft?.date) out.date = existingDraft.date;
   }
 
-  if (explicit.store) {
-    if (data.store && !isUnknownish(data.store)) out.store = data.store;
-  }
-
-  if (explicit.item) {
-    if (data.item && !isUnknownish(data.item)) out.item = data.item;
-    if (data.description && !isUnknownish(data.description)) out.description = data.description;
-  }
-
-  if (explicit.category) {
-    if (data.category && !isUnknownish(data.category)) out.category = data.category;
-    if (data.suggestedCategory && !isUnknownish(data.suggestedCategory)) out.suggestedCategory = data.suggestedCategory;
-  }
-
+  // Job (very conservative: only if they used "job ...")
   if (explicit.job) {
-    if (data.jobName && !isUnknownish(data.jobName)) out.jobName = data.jobName;
-    if (data.job_name && !isUnknownish(data.job_name)) out.job_name = data.job_name;
-    if (data.jobSource && String(data.jobSource).trim()) out.jobSource = data.jobSource;
-    if (data.job_no != null) out.job_no = data.job_no;
+    // If they typed "overhead"
+    if (/\boverhead\b/i.test(raw)) {
+      out.jobName = 'Overhead';
+      out.jobSource = 'typed';
+    } else {
+      const m = raw.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
+      if (m?.[1]) {
+        const name = String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim();
+        if (name) {
+          out.jobName = name;
+          out.jobSource = 'typed';
+        }
+      }
+    }
   }
 
-  // ---------- ensure we never accidentally null out strong values ----------
+  // Store
+  if (explicit.store) {
+    // If it's a short phrase vendor edit, treat the entire raw as vendor
+    if (looksLikeJustVendor) {
+      out.store = raw;
+    } else {
+      // Try "at X" / "from X"
+      const m = raw.match(/\b(?:at|from|vendor|merchant|store)\b\s*[:\-]?\s*([^\n\r]+)$/i);
+      const v = m?.[1] ? String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim() : null;
+      if (v) out.store = v;
+    }
+  }
+
+  // Item / description (only if explicit)
+  if (explicit.item) {
+    const m = raw.match(/\b(?:item|desc|description|for)\b\s*[:\-]?\s*([^\n\r]+)$/i);
+    const v = m?.[1] ? String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim() : null;
+    if (v) out.item = v;
+  }
+
+  // Category (only if explicit)
+  if (explicit.category) {
+    const m = raw.match(/\b(?:category|type)\b\s*[:\-]?\s*([^\n\r]+)$/i);
+    const v = m?.[1] ? String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim() : null;
+    if (v) out.category = v;
+  }
+
+  // Ensure we never accidentally null out strong values
   if (out.store && isUnknownish(out.store) && existingDraft?.store && !isUnknownish(existingDraft.store)) {
     out.store = existingDraft.store;
   }
@@ -3160,6 +3147,7 @@ try {
 
   return { nextDraft: out, aiReply: null };
 }
+
 
 // -------------------------------------------------------
 // ✅ Inbound extraction (expense-local) — aligned w/ webhook.js

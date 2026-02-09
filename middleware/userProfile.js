@@ -67,6 +67,27 @@ async function resolveActorIdentity({ kind, identifier }) {
     return null;
   }
 }
+async function resolveOwnerPlan(ownerDigits) {
+  const owner = normalizeDigits(ownerDigits);
+  if (!owner) return 'free';
+
+  try {
+    const r = await pg.query(
+      `select paid_tier, subscription_tier
+       from public.users
+       where user_id = $1
+       limit 1`,
+      [owner]
+    );
+
+    const row = r?.rows?.[0] || null;
+    const plan = String(row?.paid_tier || row?.subscription_tier || 'free').toLowerCase().trim();
+    return plan || 'free';
+  } catch (e) {
+    console.warn('[userProfile] resolveOwnerPlan failed (default free):', e?.message);
+    return 'free';
+  }
+}
 
 // ---- Legacy fallback (public.users) ----
 async function resolveLegacyUser(fromDigits) {
@@ -115,29 +136,33 @@ async function userProfileMiddleware(req, _res, next) {
     const resolved = await resolveActorIdentity({ kind: 'whatsapp', identifier: from });
 
     if (resolved?.tenant_id) {
-      req.tenantId = resolved.tenant_id;
-      req.ownerId = normalizeDigits(resolved.owner_phone_digits) || from; // legacy compat
-      req.isOwner = String(resolved.role || '').toLowerCase() === 'owner';
-      req.tz = pickTz(resolved) || DEFAULT_TZ;
+  req.tenantId = resolved.tenant_id;
+  req.ownerId = normalizeDigits(resolved.owner_phone_digits) || from; // legacy compat
+  req.isOwner = String(resolved.role || '').toLowerCase() === 'owner';
+  req.tz = pickTz(resolved) || DEFAULT_TZ;
 
-      req.userProfile = shapeMinimalProfile({
-        from,
-        ownerId: req.ownerId,
-        role: resolved.role,
-        tz: req.tz,
-        plan: null
-      });
+  // ✅ resolve the tenant's paid plan from the OWNER record (public.users)
+  const plan = await resolveOwnerPlan(req.ownerId);
 
-      req.ownerProfile = shapeMinimalProfile({
-        from: req.ownerId,
-        ownerId: req.ownerId,
-        role: 'owner',
-        tz: req.tz,
-        plan: null
-      });
+  req.userProfile = shapeMinimalProfile({
+    from,
+    ownerId: req.ownerId,
+    role: resolved.role,
+    tz: req.tz,
+    plan
+  });
 
-      return next();
-    }
+  req.ownerProfile = shapeMinimalProfile({
+    from: req.ownerId,
+    ownerId: req.ownerId,
+    role: 'owner',
+    tz: req.tz,
+    plan
+  });
+
+  return next();
+}
+
 
     // 2) Fallback: legacy public.users path (temporary)
     const legacy = await resolveLegacyUser(from);
@@ -158,14 +183,15 @@ async function userProfileMiddleware(req, _res, next) {
       return next();
     }
 
-    // 3) Fail-soft: create legacy user if needed (optional)
-    // You can disable this once actor identity is enforced.
-    req.ownerId = from;
-    req.isOwner = true;
-    req.userProfile = shapeMinimalProfile({ from, ownerId: from, role: 'owner', tz: DEFAULT_TZ, plan: 'free' });
-    req.ownerProfile = req.userProfile;
+    // 3) Fail-closed: unknown identity
+req.ownerId = null;
+req.isOwner = false;
+req.userProfile = null;
+req.ownerProfile = null;
+req.tenantId = null;
+req.tz = DEFAULT_TZ;
+return next();
 
-    return next();
   } catch (e) {
     console.warn('[userProfile] failed:', e?.message);
     req.tz = req.tz || DEFAULT_TZ;

@@ -1472,6 +1472,15 @@ if (hasTranscript) {
 
 router.post('*', async (req, res, next) => {
   try {
+    // ✅ Fail-closed: unknown identity (not linked to any tenant)
+    if (!req.ownerId) {
+      return ok(
+        res,
+        `You’re not linked to a ChiefOS business yet.\n\nGo to the portal, generate a link code, then text the 6 digits here.`
+      );
+    }
+
+  try {
     if (req.from) {
       try {
         const mapped = await getOwnerUuidForPhone(req.from);

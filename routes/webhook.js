@@ -1480,7 +1480,6 @@ router.post('*', async (req, res, next) => {
       );
     }
 
-  try {
     if (req.from) {
       try {
         const mapped = await getOwnerUuidForPhone(req.from);
@@ -1489,6 +1488,8 @@ router.post('*', async (req, res, next) => {
         console.warn('[WEBHOOK] owner uuid map failed:', e?.message);
       }
     }
+
+
 
     let pending = await getPendingTransactionState(req.actorKey || req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;

@@ -4536,11 +4536,18 @@ try {
     : false;
 
   const shouldConsumeAsEditPayload =
-    !!draftE &&
-    !isControl &&
-    !isNonIntakeQuery &&
-    !looksLikeNewIntake &&
-    (draftE.awaiting_edit || editRecentlyStarted);
+  !!draftE &&
+  !isControl &&
+  !isNonIntakeQuery &&
+  (
+    // ✅ If we are explicitly awaiting an edit, consume ANY non-control text,
+    // even if it looks like a new intake (users will naturally type "expense ...")
+    !!draftE.awaiting_edit ||
+
+    // ✅ If awaiting_edit flag got lost, only then use the stricter heuristic window
+    (editRecentlyStarted && !looksLikeNewIntake)
+  );
+
 
   console.info('[AWAITING_EDIT_SAFETYNET_CHECK]', {
     paUserId,
@@ -5426,6 +5433,8 @@ if (strictTok === 'yes') {
     if (!amountCents || amountCents <= 0) {
       return out(twimlText(`That amount doesn’t look valid. Reply like: "Total 14.84" (or "14.84 CAD").`), false);
     }
+// ✅ Ensure DB-safe numeric amount (never "$10.00")
+const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0).toFixed(2);
 
     const insertPayload = {
       owner_id: String(ownerId || '').trim(),
@@ -5433,7 +5442,7 @@ if (strictTok === 'yes') {
       actor_phone: String(paUserId || '').trim(),
       source_msg_id: txSourceMsgId || null,
 
-      amount: data.amount,
+      amount: amountNumericStr, // ✅ "10.00" (DB-safe),
       amount_cents: amountCents,
       currency: data.currency || null,
       date: data.date,
@@ -5466,7 +5475,7 @@ if (strictTok === 'yes') {
       owner_id: p.owner_id,
       user_id: p.user_id,
       kind: 'expense',
-      amount: p.amount,
+      amount: amountNumericStr, // ✅ never "$10.00"
       amount_cents: p.amount_cents,
       currency: p.currency,
       date: p.date,

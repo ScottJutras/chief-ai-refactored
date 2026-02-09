@@ -143,6 +143,8 @@ async function userProfileMiddleware(req, _res, next) {
 
   // ✅ resolve the tenant's paid plan from the OWNER record (public.users)
   const plan = await resolveOwnerPlan(req.ownerId);
+console.info('[PLAN_RESOLVED]', { ownerId: req.ownerId, plan });
+
 
   req.userProfile = shapeMinimalProfile({
     from,

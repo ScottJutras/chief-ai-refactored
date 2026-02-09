@@ -1220,103 +1220,141 @@ function enforceNoLegacyWhenTitle(result, hasTitleSignal) {
 // -------------------------------------------------------
 // Canonical interactive-list resolver (SAFE + PERMANENT)
 // -------------------------------------------------------
-async function resolveJobPickSelection(rawInboundText, inboundTwilioMeta, pickPA) {
-  const tok = String(rawInboundText || '').trim();
+function resolveJobPickSelection(rawInput, inboundTwilioMeta = {}, pickPA = null) {
+  const s = String(rawInput || '').trim();
+  const tok = s.toLowerCase();
 
-  const sentRows = Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : [];
   const displayedJobNos = Array.isArray(pickPA?.payload?.displayedJobNos)
-    ? pickPA.payload.displayedJobNos.map(Number).filter((n) => Number.isFinite(n))
+    ? pickPA.payload.displayedJobNos.map((n) => Number(n)).filter((n) => Number.isFinite(n))
     : [];
 
-  const hasPickState = !!sentRows.length;
+  const sentRows = Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : [];
+  const jobOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
 
-  const inboundListTitle = getInboundTitleSignal(inboundTwilioMeta);
-  const hasTitleSignal = !!String(inboundListTitle || '').trim();
+  const clean = (x) =>
+    String(x || '')
+      .toLowerCase()
+      .replace(/[#]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
 
-  // 0) Stable id path: jobno_<N>
-  const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
-  if (mJobNo?.[1]) {
-    return {
-      ok: true,
-      reason: null,
-      jobNo: Number(mJobNo[1]),
-      via: 'stable_jobno',
-      inboundBody: tok,
-      inboundListTitle
-    };
+  // -----------------------------
+  // 0) Strongest: stable signed row id (jp:...)
+  // Try multiple likely carriers: rawInput, ListRowId, ListId, Body, IRJ list_reply.id
+  // -----------------------------
+  const candidates = [];
+  candidates.push(s);
+
+  const listRowId = String(inboundTwilioMeta?.ListRowId || inboundTwilioMeta?.ListRowID || '').trim();
+  const listId = String(
+    inboundTwilioMeta?.ListId ||
+      inboundTwilioMeta?.listId ||
+      inboundTwilioMeta?.ListItemId ||
+      inboundTwilioMeta?.listItemId ||
+      ''
+  ).trim();
+  const body = String(inboundTwilioMeta?.Body || '').trim();
+
+  if (listRowId) candidates.push(listRowId);
+  if (listId) candidates.push(listId);
+  if (body) candidates.push(body);
+
+  const irj = inboundTwilioMeta?.InteractiveResponseJson || inboundTwilioMeta?.interactiveResponseJson || null;
+  if (irj) {
+    try {
+      const json = typeof irj === 'string' ? JSON.parse(irj) : irj;
+      const irjId =
+        json?.list_reply?.id ||
+        json?.listReply?.id ||
+        json?.interactive?.list_reply?.id ||
+        json?.interactive?.listReply?.id ||
+        '';
+      if (irjId) candidates.push(String(irjId).trim());
+    } catch {}
   }
 
-  // 1) If title signal exists, ONLY title-match (never parse "#N" as jobNo)
-  if (hasPickState && hasTitleSignal) {
-    const needleRaw = stripListNumberPrefix(inboundListTitle);
-    const needle = normalizePickTitle(needleRaw);
-    const needleDS = deSpace(needle);
-
-    const hit = sentRows.find((r) => {
-      const candRaw = stripListNumberPrefix(String(r?.title || r?.name || ''));
-      const cand = normalizePickTitle(candRaw);
-      if (!cand || !needle) return false;
-      return cand === needle || deSpace(cand) === needleDS;
-    });
-
-    return hit?.jobNo
-      ? {
-          ok: true,
-          reason: null,
-          jobNo: Number(hit.jobNo),
-          via: 'list_title_match',
-          inboundBody: tok,
-          inboundListTitle
-        }
-      : {
-          ok: false,
-          reason: 'list_title_present_but_no_match',
-          jobNo: null,
-          via: 'reject_listtitle_no_match',
-          inboundBody: tok,
-          inboundListTitle
-        };
-  }
-
-  // 2) No title signal: allow legacy index token mapping against snapshots
-  if (hasPickState && !hasTitleSignal) {
-    const ix = legacyIndexFromTwilioToken(tok);
-    if (ix && ix >= 1) {
-      if (displayedJobNos.length && ix <= displayedJobNos.length) {
-        return {
-          ok: true,
-          reason: null,
-          jobNo: Number(displayedJobNos[ix - 1]),
-          via: 'legacy_token_into_displayedJobNos',
-          inboundBody: tok,
-          inboundListTitle
-        };
-      }
-      if (ix <= sentRows.length) {
-        const r = sentRows[ix - 1];
-        const jobNo = Number(r?.jobNo);
-        if (Number.isFinite(jobNo)) {
-          return {
-            ok: true,
-            reason: null,
-            jobNo,
-            via: 'legacy_index_into_sentRows',
-            inboundBody: tok,
-            inboundListTitle
-          };
-        }
+  if (typeof parseRowId === 'function') {
+    for (const c of candidates) {
+      const parsed = parseRowId(c);
+      if (parsed?.jobNo && Number.isFinite(Number(parsed.jobNo))) {
+        return { ok: true, jobNo: Number(parsed.jobNo), via: 'stable_row_id' };
       }
     }
   }
 
-  return {
-    ok: false,
-    reason: !hasPickState ? 'job_not_in_pick_state' : 'unresolvable_selection',
-    jobNo: null,
-    via: null,
-    inboundBody: tok,
-    inboundListTitle
-  };
+  // -----------------------------
+  // 1) Strongest (legacy template): ListId / Body job_<row>_<nonce>
+  // Twilio sends ListId + Body like "job_1_694ca083"
+  // -----------------------------
+  const mList =
+    String(listId || '').match(/^job_(\d{1,10})_[0-9a-z]+$/i) ||
+    String(body || '').match(/^job_(\d{1,10})_[0-9a-z]+$/i) ||
+    s.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
+
+  if (mList?.[1]) {
+    const row = Number(mList[1]);
+    const idx = row - 1;
+
+    // Prefer displayedJobNos snapshot (fast + explicit)
+    const jobNoA = displayedJobNos[idx];
+    if (Number.isFinite(jobNoA)) return { ok: true, jobNo: jobNoA, via: 'list_id_row_index' };
+
+    // ✅ Hardening: fallback to sentRows snapshot if displayedJobNos missing/corrupt
+    const jobNoB = Number(sentRows[idx]?.jobNo);
+    if (Number.isFinite(jobNoB)) return { ok: true, jobNo: jobNoB, via: 'list_id_sentRows_index' };
+
+    return { ok: false, reason: 'row_out_of_range', via: 'list_id_row_index' };
+  }
+
+  // -----------------------------
+  // 2) Token jobix_<row>
+  // -----------------------------
+  const mTok = tok.match(/^jobix_(\d{1,10})$/i);
+  if (mTok?.[1]) {
+    const row = Number(mTok[1]);
+    const idx = row - 1;
+
+    const jobNoA = displayedJobNos[idx];
+    if (Number.isFinite(jobNoA)) return { ok: true, jobNo: jobNoA, via: 'jobix_row_index' };
+
+    // ✅ same fallback
+    const jobNoB = Number(sentRows[idx]?.jobNo);
+    if (Number.isFinite(jobNoB)) return { ok: true, jobNo: jobNoB, via: 'jobix_sentRows_index' };
+
+    return { ok: false, reason: 'row_out_of_range', via: 'jobix_row_index' };
+  }
+
+  // -----------------------------
+  // 3) jobno_<jobNo> (explicit)
+  // -----------------------------
+  const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
+  if (mJobNo?.[1]) {
+    const jobNo = Number(mJobNo[1]);
+    if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: 'jobno_token' };
+  }
+
+  // -----------------------------
+  // 4) Last resort: title match (dangerous with similar names)
+  // Prefer exact normalized match against options names.
+  // -----------------------------
+  const title = String(inboundTwilioMeta?.ListTitle || inboundTwilioMeta?.listTitle || '').trim();
+  if (title) {
+    // title looks like "#1 1556 Medway Park Dr"
+    const titleName = clean(title.replace(/^#\d+\s*/i, ''));
+
+    if (titleName) {
+      const exact = jobOptions.find((j) => clean(j?.name || j?.job_name) === titleName);
+      if (exact) {
+        const jobNo = Number(exact?.job_no ?? exact?.jobNo);
+        if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: 'list_title_exact_name' };
+      }
+    }
+
+    // still nothing -> don't guess
+    return { ok: false, reason: 'ambiguous_title', via: 'list_title_match' };
+  }
+
+  return { ok: false, reason: 'unrecognized_pick', via: 'none' };
 }
 
 
@@ -2293,12 +2331,24 @@ function hash8(s) {
   return x.slice(0, 8);
 }
 // ============================================================================
-// ✅ DROP-IN: sendJobPickList (with stale-click hardening via lastPickerMsgSid)
+// ✅ DROP-IN: sendJobPickList (FULLY ACTIVATES stable jp: row IDs via makeRowId)
 // ----------------------------------------------------------------------------
-// What’s new:
-// 1) Captures the outbound picker message SID (from Twilio send result)
-// 2) Stores it in the PICK PA payload as `lastPickerMsgSid`
-// 3) Leaves everything else unchanged (title-match resolver still works)
+// What’s new vs your current sendJobPickList:
+// 1) Uses makeRowId({ flow, nonce, jobNo, secret }) for each row.id  ✅
+// 2) Stores `flow8` (8-hex) in PA payload so parseRowId() expects jp:<flow8>:<nonce>:... ✅
+// 3) Leaves displayedJobNos + sentRows intact (resolver still has fallbacks)
+// 4) Keeps lastPickerMsgSid stale-click hardening unchanged
+//
+// REQUIREMENTS (already in your file per your snippet):
+// - makeRowId({ flow, nonce, jobNo, secret }) exists
+// - randHex8() exists
+// - PA_TTL_SEC, PA_KIND_PICK_JOB exist
+// - upsertPA(), sendWhatsAppInteractiveList(), twimlEmpty(), out(), waTo()
+// - normalizeIdentityDigits(), getJobDisplayName(), hash8() exist
+//
+// ENV needed (pick ONE; either works):
+// - JOB_PICKER_ROWID_SECRET   (recommended)
+// - TWILIO_ROWID_SECRET       (fallback)
 // ============================================================================
 
 async function sendJobPickList({
@@ -2353,10 +2403,22 @@ async function sendJobPickList({
 
   // Stable flow for this picker session:
   // ✅ MUST be stable across pages + replies for this confirm flow
-  const flow = String(confirmFlowId || '').trim() || String(`${paUserId}:${Date.now()}`).trim();
+  const flowRaw = String(confirmFlowId || '').trim() || String(`${paUserId}:${Date.now()}`).trim();
+
+  // ✅ IMPORTANT: jp: row ids expect 8-hex flow (parseRowId regex is 8-hex)
+  // Use hash8(flowRaw) to generate a stable, 8-hex flow token
+  const flow8 = hash8(flowRaw);
 
   // Nonce rotates per send to prevent stale replays
-  const pickerNonce = randHex8();
+  const pickerNonce = randHex8(); // 8-hex
+
+  // Secret for signing stable row ids
+  const rowSecret =
+    String(process.env.JOB_PICKER_ROWID_SECRET || process.env.TWILIO_ROWID_SECRET || '').trim();
+
+  if (!rowSecret) {
+    console.warn('[JOB_PICK] missing JOB_PICKER_ROWID_SECRET/TWILIO_ROWID_SECRET; jp: row ids will still be generated but signature will be weak/invalid if makeRowId depends on secret.');
+  }
 
   // displayedJobNos are REAL jobNos (not UI indexes)
   const displayedJobNos = pageJobs
@@ -2367,14 +2429,20 @@ async function sendJobPickList({
 
   // ✅ ROW TITLES MUST BE NAME-ONLY (Twilio adds its own #index)
   // ✅ sentRows must carry jobNo so resolver can map title->jobNo reliably
+  // ✅ NEW: row.id is a signed stable jp: row id
   const sentRows = pageJobs.map((j) => {
     const jobNo = Number(j?.job_no ?? j?.jobNo);
     const name = String(getJobDisplayName(j) || j?.name || '').trim() || `Job ${jobNo || ''}`.trim();
 
+    const stableId =
+      typeof makeRowId === 'function' && Number.isFinite(jobNo) && jobNo > 0
+        ? makeRowId({ flow: flow8, nonce: pickerNonce, jobNo, secret: rowSecret })
+        : `jobno_${jobNo}`; // fallback (should be rare)
+
     return {
       jobNo,
       name,
-      id: `jobno_${jobNo}`, // stable debug id (Twilio may not return this, but keep it)
+      id: stableId, // ✅ FULLY ACTIVATED: jp:<flow8>:<nonce>:jn:<jobNo>:h:<sig>
       title: name // name-only title (no "#")
     };
   });
@@ -2388,12 +2456,16 @@ async function sendJobPickList({
 
   console.info('[JOB_PICK_SEND]', {
     context,
-    flow: hash8(flow),
+    flow: flow8,
     pickerNonce,
     page: p,
     displayedHash,
     displayedJobNos,
-    rows: sentRows.map((r) => ({ id: r.id, title: r.title, jobNo: r.jobNo }))
+    rows: sentRows.map((r) => ({
+      id: String(r.id || '').slice(0, 42) + (String(r.id || '').length > 42 ? '…' : ''),
+      title: r.title,
+      jobNo: r.jobNo
+    }))
   });
 
   // ✅ Build Twilio "sections" payload (as expected by services/twilio.js)
@@ -2430,12 +2502,15 @@ async function sendJobPickList({
     userId: pickKey, // ✅ MUST MATCH read key
     kind: PA_KIND_PICK_JOB,
     payload: {
-      flow: hash8(flow),
+      // Keep both: raw confirmFlowId (for other flows) + flow8 for jp: ids/debug
+      flow: flow8,
       confirmFlowId: String(confirmFlowId || '').trim() || null,
+
       page: p,
       pageSize: ps,
       hasMore,
       sentAt: Date.now(),
+
       pickerNonce,
       displayedHash,
       displayedJobNos,
@@ -2451,6 +2526,7 @@ async function sendJobPickList({
 
   return out(twimlEmpty(), true);
 }
+
 
 
 
@@ -3527,9 +3603,8 @@ try {
 
   if (draftEarly?.awaiting_edit && !isControlEarly) {
     // ✅ If user sends an info command or a brand-new intake while awaiting_edit, do NOT consume as edit payload.
-    if (isNonIntakeQueryEarly || looksLikeNewIntakeEarly) {
-      return out(
-        twimlText(
+    if (isNonIntakeQueryEarly) {
+  return out(twimlText(
           [
             '✏️ I’m waiting for your edited expense details in ONE message.',
             'Example:',
@@ -3547,18 +3622,36 @@ try {
       head: String(rawInboundText || '').trim().slice(0, 140)
     });
 
-    const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
-      rawInboundText,
-      draftEarly,
-      { fromKey: paUserId, tz, defaultData: {} }
-    );
+   let nextDraft = null;
+let aiReply = null;
 
-    if (!nextDraft) {
-      return out(
-        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
-        false
-      );
-    }
+try {
+  const tz0 = tz;
+  const r = await applyEditPayloadToConfirmDraft(
+    rawInboundText,
+    draftEarly,
+    { fromKey: paUserId, tz: tz0, defaultData: {} }
+  );
+  nextDraft = r?.nextDraft || null;
+  aiReply = r?.aiReply || null;
+} catch (e) {
+  const msg = String(e?.message || '');
+  if (msg.includes('429')) {
+    return out(
+      twimlText('⚠️ I’m temporarily rate-limited. Please resend your edited expense with: amount + store + date + (optional) job.'),
+      false
+    );
+  }
+  throw e;
+}
+
+if (!nextDraft) {
+  return out(
+    twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
+    false
+  );
+}
+
 
     const extractJobNameFromEditText = (t) => {
       const s = String(t || '').trim();
@@ -5475,7 +5568,7 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
       owner_id: p.owner_id,
       user_id: p.user_id,
       kind: 'expense',
-      amount: amountNumericStr, // ✅ never "$10.00"
+      amount: p.amount, // ✅ use payload, not closure
       amount_cents: p.amount_cents,
       currency: p.currency,
       date: p.date,

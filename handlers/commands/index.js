@@ -257,7 +257,7 @@ module.exports = async function handleCommands(from, text, userProfile, ownerId,
       return true;
     }
 
-    if (handleRevenue && /^revenue\b/i.test(lc) || (handleRevenue && /^(received|got paid|payment)\b/i.test(lc))) {
+    if (handleRevenue && (/^revenue\b/i.test(lc) || /^(received|got paid|payment)\b/i.test(lc))) {
       // NOTE: your revenue handler expects to return TwiML string (in your drop-in)
       const out = await handleRevenue(from, raw, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId);
       res.status(200).type('application/xml').send(out);

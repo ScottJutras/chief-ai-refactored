@@ -968,6 +968,79 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
     return respond(res, `⚠️ createJobIdempotent() isn't available in postgres.js yet.`);
   }
 
+  // -------------------------------
+  // ✅ Gate #2 — max jobs per plan
+  // -------------------------------
+  let plan = 'free';
+  try {
+    const rawPlan = String(
+      ownerProfile?.plan_key ||
+      ownerProfile?.plan ||
+      ownerProfile?.tier ||
+      ownerProfile?.pricing_plan ||
+      ownerProfile?.subscription_tier ||
+      ownerProfile?.paid_tier ||
+      'free'
+    );
+    plan = (typeof getPlanOrDefault === 'function')
+      ? getPlanOrDefault(rawPlan)
+      : String(rawPlan || 'free').toLowerCase().trim();
+  } catch {}
+
+  // Resolve caps (fail-open if missing)
+  let caps = null;
+  try {
+    // Prefer your canonical resolver if you created it
+    const capMod = require('../../src/config/capabilities');
+    const fn =
+      capMod?.getCapabilitiesForPlan ||
+      capMod?.resolveCapabilities ||
+      capMod?.getPlanCapabilities ||
+      null;
+
+    if (typeof fn === 'function') caps = fn(plan);
+    else {
+      // fallback direct import
+      const { plan_capabilities } = require('../../src/config/planCapabilities');
+      caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
+    }
+  } catch {
+    try {
+      const { plan_capabilities } = require('../../src/config/planCapabilities');
+      caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
+    } catch {}
+  }
+
+  const maxJobs = caps?.jobs?.max_jobs_total ?? null;
+
+  // Only gate if maxJobs is a finite number (null means unbounded)
+  if (Number.isFinite(Number(maxJobs))) {
+    try {
+      const { rows } = await pg.query(
+        `select count(*)::int as c
+           from public.jobs
+          where owner_id=$1`,
+        [String(owner).replace(/\D/g, '')]
+      );
+
+      const currentCount = Number(rows?.[0]?.c || 0);
+      if (currentCount >= Number(maxJobs)) {
+        const upgradeLine =
+          plan === 'free'
+            ? `Free supports up to ${maxJobs} jobs. Upgrade to Starter (25 jobs) or Pro (unlimited).`
+            : `Your plan supports up to ${maxJobs} jobs. Upgrade to Pro for unlimited jobs.`;
+
+        return respond(
+          res,
+          `⚠️ Job limit reached (${currentCount}/${maxJobs}).\n\n${upgradeLine}`
+        );
+      }
+    } catch (e) {
+      console.warn('[JOB] job count gate failed (fail-open):', e?.message);
+    }
+  }
+
+  // Create job
   const out = await pg.createJobIdempotent({
     ownerId: owner,
     name,
@@ -979,19 +1052,6 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
   const jobName = sanitizeJobLabel(out.job.job_name || out.job.name || name || 'Untitled Job');
   const jobNo = out.job.job_no ?? '?';
 
-  // Normalize plan (default free on ambiguity)
-  const rawPlan = String(
-    ownerProfile?.plan ||
-    ownerProfile?.tier ||
-    ownerProfile?.pricing_plan ||
-    ownerProfile?.subscription_tier ||
-    ownerProfile?.paid_tier ||
-    'free'
-  );
-  const plan = (typeof getPlanOrDefault === 'function')
-    ? getPlanOrDefault(rawPlan)
-    : String(rawPlan || 'free').toLowerCase().trim();
-
   if (out.inserted) {
     // ✅ DB-based “first job” detection (cheap; limit 2)
     let isFirstJobCreated = false;
@@ -1002,7 +1062,7 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
           where owner_id=$1
           order by job_no asc
           limit 2`,
-        [String(owner).replace(/\D/g, '')] // jobs.owner_id is DIGITS(ownerId)
+        [String(owner).replace(/\D/g, '')]
       );
       isFirstJobCreated = (rows?.length === 1);
     } catch {}
@@ -1016,10 +1076,7 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
     }
 
     // Normal success message (non-first-job OR non-free)
-    return respond(
-      res,
-      `✅ Created job: "${jobName}" (Job #${jobNo}).`
-    );
+    return respond(res, `✅ Created job: "${jobName}" (Job #${jobNo}).`);
   }
 
   if (out.reason === 'already_exists') {

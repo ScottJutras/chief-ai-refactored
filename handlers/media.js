@@ -26,6 +26,53 @@ const { extractTextFromImage } = require('../utils/visionService'); // now Docum
 const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
 const pg = require('../services/postgres');
+async function resolveCapsForOwner(ownerId) {
+  let ownerProfile = null;
+  try {
+    ownerProfile = await pg.getOwnerProfile(String(ownerId));
+  } catch (e) {
+    console.warn('[MEDIA] getOwnerProfile failed (fail-open):', e?.message);
+  }
+
+  const rawPlan = String(ownerProfile?.plan_key || ownerProfile?.paid_tier || ownerProfile?.subscription_tier || 'free');
+  const plan = rawPlan.toLowerCase().trim() || 'free';
+
+  try {
+    const capMod = require('../src/config/capabilities');
+    const fn =
+      capMod?.getCapabilitiesForPlan ||
+      capMod?.resolveCapabilities ||
+      capMod?.getPlanCapabilities ||
+      null;
+
+    if (typeof fn === 'function') return fn(plan);
+  } catch {}
+
+  try {
+    const { plan_capabilities } = require('../src/config/planCapabilities');
+    return plan_capabilities?.[plan] || plan_capabilities?.free || null;
+  } catch {}
+
+  return null;
+}
+
+async function gateMonthly({ ownerId, tz, field, capMonthly, incrementBy }) {
+  // returns { allowed: boolean, used:number, cap:number|null }
+  try {
+    const ym = pg.ymInTZ(tz);
+    const usage = await pg.getUsageMonthly(String(ownerId), ym);
+    const used = Number(usage?.[field] || 0);
+
+    const q = pg.checkMonthlyQuota(capMonthly, used);
+    if (!q.allowed) return { allowed: false, used, cap: capMonthly ?? null };
+
+    await pg.incrementUsageMonthly(String(ownerId), ym, field, incrementBy);
+    return { allowed: true, used, cap: capMonthly ?? null };
+  } catch (e) {
+    console.warn('[MEDIA] quota gate failed (fail-open):', e?.message);
+    return { allowed: true, used: 0, cap: capMonthly ?? null };
+  }
+}
 
 function getDbQuery(pg) {
   return (
@@ -617,13 +664,56 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     };
 
     // AUDIO
-    if (isSupportedAudio) {
-      if (typeof transcribeAudio !== 'function') {
-        return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
+if (isSupportedAudio) {
+  if (typeof transcribeAudio !== 'function') {
+    return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
+  }
+
+  // -------------------------------
+  // ✅ Gate #4b — Voice minutes quota + plan
+  // (MUST run BEFORE fetch/transcribe)
+  // -------------------------------
+  try {
+    const tz = getUserTz(userProfile);
+    const caps = await resolveCapsForOwner(ownerId);
+
+    // ✅ Fail-open if caps can’t be resolved (don’t accidentally block everyone)
+    if (caps) {
+      const voiceEnabled = !!caps?.capture?.voice?.enabled;
+      const voiceCap = caps?.capture?.voice?.monthly_minutes ?? 0;
+
+      if (!voiceEnabled) {
+        return {
+          transcript: null,
+          twiml: twiml(`Voice is not enabled on your plan.\n\nUpgrade to Starter or Pro to use voice notes.`)
+        };
       }
 
-      let transcript = '';
-      let confidence = null;
+      // If you don't have duration, start with 1 minute per voice note
+      const minutesUsed = 1;
+
+      const g = await gateMonthly({
+        ownerId,
+        tz,
+        field: 'voice_minutes',
+        capMonthly: voiceCap,
+        incrementBy: minutesUsed
+      });
+
+      if (!g.allowed) {
+        return {
+          transcript: null,
+          twiml: twiml(`You’ve hit your monthly Voice limit (${g.used}/${voiceCap} minutes).\n\nUpgrade to Pro for more capacity.`)
+        };
+      }
+    }
+  } catch (e) {
+    console.warn('[MEDIA] voice gate failed (fail-open):', e?.message);
+  }
+
+  // ✅ ONLY NOW do the fetch + transcribe work
+  let transcript = '';
+  let confidence = null;
 
       try {
        // --- Fetch media bytes with a hard timeout ---
@@ -651,6 +741,7 @@ try {
   console.warn('[MEDIA_STT_FAIL]', e?.message);
   return { transcript: null, twiml: twiml('⚠️ Voice took too long to transcribe. Try again, or type: "clock in".') };
 }
+    
 
         if (!transcript && normType === 'audio/ogg') {
           try {
@@ -749,6 +840,45 @@ try {
 if (isImage) {
   let ocrText = '';
   let ocrFields = null;
+
+  // -------------------------------
+  // ✅ Gate #4a — OCR quota + plan (FAIL-OPEN)
+  // -------------------------------
+  try {
+    const tz = getUserTz(userProfile);
+    const caps = await resolveCapsForOwner(ownerId);
+
+    // ✅ If caps can't be resolved, do NOT block (fail-open)
+    if (caps) {
+      const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
+      const ocrCap = caps?.capture?.ocr_receipts?.monthly_capacity ?? 0;
+
+      if (!ocrEnabled) {
+        return {
+          transcript: null,
+          twiml: twiml(`OCR receipts are not enabled on your plan.\n\nUpgrade to Starter or Pro to scan receipts.`)
+        };
+      }
+
+      // Increment 1 receipt if within quota
+      const g = await gateMonthly({
+        ownerId,
+        tz,
+        field: 'ocr_receipts_count',
+        capMonthly: ocrCap,
+        incrementBy: 1
+      });
+
+      if (!g.allowed) {
+        return {
+          transcript: null,
+          twiml: twiml(`You’ve hit your monthly OCR limit (${g.used}/${ocrCap}).\n\nUpgrade to Pro for more capacity.`)
+        };
+      }
+    }
+  } catch (e) {
+    console.warn('[MEDIA] OCR gate failed (fail-open):', e?.message);
+  }
 
   // 1) OCR (DocAI -> Vision fallback happens inside extractTextFromImage)
   try {

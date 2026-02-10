@@ -341,17 +341,18 @@ async function twimlWithTargetName(res, text, opts = {}) {
     // If still nothing, just return original message
     if (!display) return twiml(res, msg);
 
+    const disp = String(display).trim();
+    const dispFirst = disp.split(/\s+/)[0] || '';
+    const dispFirstLc = dispFirst.toLowerCase();
+    const msgLc = msg.toLowerCase();
+    const dispLc = disp.toLowerCase();
+
     // ✅ Replace placeholder(s) with FIRST name (Scott) not full name (Scott Jutras)
     if (hadAnyPlaceholder) {
-      const first =
-        String(display || '')
-          .trim()
-          .split(/\s+/)[0] || 'there';
-
+      const first = dispFirstLc ? dispFirst : 'there';
       msg = msg.replace(/\{name\}/gi, first).replace(/\{target\}/gi, first);
 
       // If we used placeholders, return without further rewriting or suffix-append.
-      // (Prevents "Scott Jutras" being appended at end.)
       return twiml(res, msg);
     }
 
@@ -371,10 +372,22 @@ async function twimlWithTargetName(res, text, opts = {}) {
       }
     } catch {}
 
-    // Otherwise, append suffix if not already present
-    if (!msg.toLowerCase().includes(String(display).toLowerCase())) {
+    // ✅ Don’t suffix when message already clearly mentions the target (first name)
+    // (Avoids: "✅ Logged clock in for Scott — Scott Jutras.")
+    if (dispFirstLc && msgLc.includes(dispFirstLc)) {
+      return twiml(res, msg);
+    }
+
+    // ✅ Avoid double-suffix when message already ends with the exact name
+    const alreadyEndsWithName =
+      msgLc.endsWith(`— ${dispLc}.`) ||
+      msgLc.endsWith(`- ${dispLc}.`) ||
+      msgLc.endsWith(`${dispLc}.`) ||
+      msgLc.endsWith(`${dispLc}`);
+
+    if (!alreadyEndsWithName) {
       msg = msg.replace(/\.$/, '');
-      msg = `${msg} — ${display}.`;
+      msg = `${msg} — ${disp}.`;
     }
 
     return twiml(res, msg);
@@ -382,10 +395,6 @@ async function twimlWithTargetName(res, text, opts = {}) {
     return twiml(res, msg);
   }
 }
-
-
-
-
 
 
 function normalizeSentencePunct(s) {
@@ -1863,6 +1872,27 @@ const role = isOwner ? "owner" : "employee";
 const crew_count = 0;
 
   const lc = String(text || '').toLowerCase().trim();
+// ✅ Optional early Gate #1 (cheap reject; handleClock still enforces)
+try {
+  if (!isOwner) {
+    const isPro = plan === 'pro' || plan === 'enterprise';
+
+    const looksLikeTimeLog =
+      /\b(clock|punch)\s+(in|out)\b/.test(lc) ||
+      /\b(break|lunch)\s+(start|stop|end)\b/.test(lc) ||
+      /\bdrive\s+(start|stop|end)\b/.test(lc) ||
+      /\b(start|end)\s+(shift|work)\b/.test(lc);
+
+    if (looksLikeTimeLog && !isPro) {
+      return twiml(
+        res,
+        `⛔ Crew self-logging is Pro only.\n\nThe owner can still log your time from their phone.\n\nUpgrade to Pro to let employees clock in/out from their own phones.`
+      );
+    }
+  }
+} catch (e) {
+  console.warn('[TIMELOCK_GATE] failed (fail-open):', e?.message);
+}
 
   try {
     // Help

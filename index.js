@@ -12,6 +12,9 @@ const deepDiveRouter     = require('./routes/deepDive');
 const dashboardRouter    = require('./routes/dashboard'); // KPI dashboard API
 const debugRouter        = require('./routes/debug');     // ✅ debug endpoints (dev-only recommended)
 const askChiefRouter     = require('./routes/askChief');
+const billingRouter      = require('./routes/billing');
+
+const { stripeWebhookHandler } = require('./handlers/stripeWebhook');
 
 const app = express();
 
@@ -44,10 +47,22 @@ app.get('/api/healthz', (req, res) => {
     .json({ ok: true, ts: Date.now() });
 });
 
+/* ---------------- Stripe webhook (MUST be raw body) ---------------- */
+/**
+ * Stripe requires raw body for signature verification.
+ * Do NOT put express.json() globally.
+ */
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
+// optional alias if you prefer /api routes
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
+
 /* ---------------- Mount order (NO global body parsers) ---------------- */
 // Webhook first; it does its own tolerant urlencoded/body handling.
 app.use('/api/webhook', webhookRouter);
 app.use('/webhook', webhookRouter); // temporary alias
+
+// Billing (router adds its own JSON parser internally)
+app.use('/api/billing', billingRouter);
 
 // Other routers can attach their own parsers internally as needed.
 app.use('/parse',     parseRouter);
@@ -60,7 +75,6 @@ if (!process.env.VERCEL) {
 }
 
 // JSON dashboard API used by the React frontend (Vite app)
-// routes/dashboard.js defines GET /dashboard, so mounting at /api → /api/dashboard
 app.use('/api/dashboard', dashboardRouter);
 
 /* ---------------- Local dev only ---------------- */

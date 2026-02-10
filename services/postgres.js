@@ -209,6 +209,119 @@ function looksLikeUuid(str) {
     String(str || '')
   );
 }
+/* -------------------- Usage / Quotas (monthly) -------------------- */
+
+function ymInTZ(tz = 'America/Toronto', d = new Date()) {
+  // returns "YYYY-MM"
+  const day = formatInTimeZone(d, tz, 'yyyy-MM-dd'); // you already import formatInTimeZone
+  return String(day).slice(0, 7);
+}
+
+async function getUsageMonthly(ownerId, ym, { createIfMissing = true } = {}) {
+  const owner = String(ownerId || '').trim();
+  const keyYm = String(ym || '').trim();
+  if (!owner || !keyYm) return null;
+
+  const { rows } = await query(
+    `
+    select owner_id, ym, ocr_receipts_count, voice_minutes, ask_chief_questions
+      from public.usage_monthly
+     where owner_id = $1 and ym = $2
+     limit 1
+    `,
+    [owner, keyYm]
+  );
+
+  if (rows?.[0]) return rows[0];
+
+  if (!createIfMissing) return {
+    owner_id: owner,
+    ym: keyYm,
+    ocr_receipts_count: 0,
+    voice_minutes: 0,
+    ask_chief_questions: 0
+  };
+
+  const ins = await query(
+    `
+    insert into public.usage_monthly (owner_id, ym, ocr_receipts_count, voice_minutes, ask_chief_questions)
+    values ($1, $2, 0, 0, 0)
+    on conflict (owner_id, ym) do nothing
+    returning owner_id, ym, ocr_receipts_count, voice_minutes, ask_chief_questions
+    `,
+    [owner, keyYm]
+  );
+
+  if (ins?.rows?.[0]) return ins.rows[0];
+
+  // If conflict happened, re-read
+  const reread = await query(
+    `
+    select owner_id, ym, ocr_receipts_count, voice_minutes, ask_chief_questions
+      from public.usage_monthly
+     where owner_id = $1 and ym = $2
+     limit 1
+    `,
+    [owner, keyYm]
+  );
+  return reread?.rows?.[0] || null;
+}
+
+async function incrementUsageMonthly(ownerId, ym, field, delta = 1) {
+  const owner = String(ownerId || '').trim();
+  const keyYm = String(ym || '').trim();
+  const f = String(field || '').trim();
+
+  const allowed = new Set(['ocr_receipts_count', 'voice_minutes', 'ask_chief_questions']);
+  if (!owner || !keyYm || !allowed.has(f)) {
+    return { ok: false, reason: 'invalid_args' };
+  }
+
+  const d = Number(delta);
+  const inc = Number.isFinite(d) ? d : 1;
+
+  const sqlByField = {
+    ocr_receipts_count: `
+      insert into public.usage_monthly (owner_id, ym, ocr_receipts_count)
+      values ($1, $2, $3)
+      on conflict (owner_id, ym)
+      do update set ocr_receipts_count = public.usage_monthly.ocr_receipts_count + excluded.ocr_receipts_count
+      returning owner_id, ym, ocr_receipts_count, voice_minutes, ask_chief_questions
+    `,
+    voice_minutes: `
+      insert into public.usage_monthly (owner_id, ym, voice_minutes)
+      values ($1, $2, $3)
+      on conflict (owner_id, ym)
+      do update set voice_minutes = public.usage_monthly.voice_minutes + excluded.voice_minutes
+      returning owner_id, ym, ocr_receipts_count, voice_minutes, ask_chief_questions
+    `,
+    ask_chief_questions: `
+      insert into public.usage_monthly (owner_id, ym, ask_chief_questions)
+      values ($1, $2, $3)
+      on conflict (owner_id, ym)
+      do update set ask_chief_questions = public.usage_monthly.ask_chief_questions + excluded.ask_chief_questions
+      returning owner_id, ym, ocr_receipts_count, voice_minutes, ask_chief_questions
+    `,
+  };
+
+  const { rows } = await query(sqlByField[f], [owner, keyYm, inc]);
+  return { ok: true, row: rows?.[0] || null };
+}
+
+/**
+ * Convenience checker:
+ * - capMonthly: number | null
+ * - used: number
+ * returns { allowed: boolean, remaining: number|null }
+ */
+function checkMonthlyQuota(capMonthly, used) {
+  if (capMonthly == null) return { allowed: true, remaining: null }; // unbounded
+  const cap = Number(capMonthly);
+  const u = Number(used || 0);
+  if (!Number.isFinite(cap) || cap <= 0) return { allowed: false, remaining: 0 };
+  const remaining = Math.max(0, cap - u);
+  return { allowed: remaining > 0, remaining };
+}
 
 /* ---------- schema helpers (cached) ---------- */
 const _TABLE_CACHE = new Map();
@@ -3880,6 +3993,10 @@ module.exports = {
   // optional: debugging / inspection
   detectUserActiveJobJobIdType,
   userActiveJobJoinMode,
+  ymInTZ,
+  getUsageMonthly,
+  incrementUsageMonthly,
+  checkMonthlyQuota,
 
   // internal helpers occasionally useful
   resolveJobRow,

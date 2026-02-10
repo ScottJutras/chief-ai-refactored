@@ -1221,7 +1221,7 @@ function enforceNoLegacyWhenTitle(result, hasTitleSignal) {
 // Canonical interactive-list resolver (SAFE + PERMANENT)
 // -------------------------------------------------------
 function resolveJobPickSelection(rawInput, inboundTwilioMeta = {}, pickPA = null) {
-  const s = String(rawInput || '').trim();
+  const s = String(rawInput || "").trim();
   const tok = s.toLowerCase();
 
   const displayedJobNos = Array.isArray(pickPA?.payload?.displayedJobNos)
@@ -1232,18 +1232,18 @@ function resolveJobPickSelection(rawInput, inboundTwilioMeta = {}, pickPA = null
   const sentRows = Array.isArray(pickPA?.payload?.sentRows) ? pickPA.payload.sentRows : [];
 
   const clean = (x) =>
-    String(x || '')
+    String(x || "")
       .toLowerCase()
-      .replace(/[#]/g, '')
-      .replace(/\s+/g, ' ')
+      .replace(/[#]/g, "")
+      .replace(/\s+/g, " ")
       .trim();
 
   // -----------------------------
   // 0) Strongest: stable signed row id (jp:...)
   // -----------------------------
-  const parsed = typeof parseRowId === 'function' ? parseRowId(s) : null;
+  const parsed = typeof parseRowId === "function" ? parseRowId(s) : null;
   if (parsed?.jobNo && Number.isFinite(Number(parsed.jobNo))) {
-    return { ok: true, jobNo: Number(parsed.jobNo), via: 'stable_row_id' };
+    return { ok: true, jobNo: Number(parsed.jobNo), via: "stable_row_id" };
   }
 
   // -----------------------------
@@ -1252,41 +1252,75 @@ function resolveJobPickSelection(rawInput, inboundTwilioMeta = {}, pickPA = null
   const mJobNo = tok.match(/^jobno_(\d{1,10})$/i);
   if (mJobNo?.[1]) {
     const jobNo = Number(mJobNo[1]);
-    if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: 'jobno_token' };
+    if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: "jobno_token" };
   }
 
   // -----------------------------
-  // 2) If we have a title signal, ALWAYS resolve by title first.
-  // This prevents the "Job #1 -> wrong jobNo" bug from Content Template index tokens.
+  // 2) Title-based resolution (exact OR unique prefix, truncation-safe)
+  // If title exists but we can't uniquely match it, we DO NOT GUESS.
+  // We still allow explicit index tokens below (jobix_/job_<row>_) because those are explicit picks.
   // -----------------------------
-  const listTitle = String(inboundTwilioMeta?.ListTitle || inboundTwilioMeta?.ListRowTitle || '').trim();
+  const listTitle = String(inboundTwilioMeta?.ListTitle || inboundTwilioMeta?.ListRowTitle || "").trim();
   if (listTitle) {
-    // "#1 1556 Medway Park Dr" -> "1556 Medway Park Dr"
-    const titleName = clean(listTitle.replace(/^#\d+\s*/i, ''));
+    const titleName = clean(listTitle.replace(/^#\d+\s*/i, ""));
 
     if (titleName) {
-      // Prefer sentRows (exactly what we sent)
-      const hitRow = sentRows.find((r) => clean(r?.title || r?.name) === titleName);
-      if (hitRow) {
-        const jobNo = Number(hitRow?.jobNo);
-        if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: 'list_title_sentRows_exact' };
+      const rowKey = (r) => clean(r?.title || r?.name || "");
+
+      // Exact match against sentRows (what we actually sent)
+      const exactRows = sentRows.filter((r) => rowKey(r) === titleName);
+      if (exactRows.length === 1) {
+        const jobNo = Number(exactRows[0]?.jobNo);
+        if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: "list_title_sentRows_exact" };
       }
 
-      // Fall back to jobOptions (global options list)
-      const hitOpt = jobOptions.find((j) => clean(j?.name || j?.job_name || getJobDisplayName?.(j)) === titleName);
-      if (hitOpt) {
-        const jobNo = Number(hitOpt?.job_no ?? hitOpt?.jobNo);
-        if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: 'list_title_jobOptions_exact' };
+      // Unique prefix match (handles WhatsApp truncation)
+      const prefixRows = sentRows.filter((r) => {
+        const k = rowKey(r);
+        if (!k || !titleName) return false;
+        if (titleName.length < 8) return false; // prevents tiny prefixes matching everything
+        return k.startsWith(titleName) || titleName.startsWith(k);
+      });
+
+      if (prefixRows.length === 1) {
+        const jobNo = Number(prefixRows[0]?.jobNo);
+        if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: "list_title_sentRows_prefix" };
       }
+
+      // Fall back to jobOptions with the same rules
+      const optKey = (j) =>
+        clean(
+          j?.name ||
+            j?.job_name ||
+            (typeof getJobDisplayName === "function" ? getJobDisplayName(j) : "")
+        );
+
+      const exactOpts = jobOptions.filter((j) => optKey(j) === titleName);
+      if (exactOpts.length === 1) {
+        const jobNo = Number(exactOpts[0]?.job_no ?? exactOpts[0]?.jobNo);
+        if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: "list_title_jobOptions_exact" };
+      }
+
+      const prefixOpts = jobOptions.filter((j) => {
+        const k = optKey(j);
+        if (!k || !titleName) return false;
+        if (titleName.length < 8) return false;
+        return k.startsWith(titleName) || titleName.startsWith(k);
+      });
+
+      if (prefixOpts.length === 1) {
+        const jobNo = Number(prefixOpts[0]?.job_no ?? prefixOpts[0]?.jobNo);
+        if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: "list_title_jobOptions_prefix" };
+      }
+
+      // Still ambiguous or no match:
+      // Do NOT return failure here — allow explicit index tokens below.
     }
-
-    // Title exists but we can't match it => DO NOT GUESS by index
-    return { ok: false, reason: 'title_present_but_no_match', via: 'reject_title_no_match' };
   }
 
   // -----------------------------
-  // 3) Next: jobix_<row>
-  // (only used when there is NO title signal)
+  // 3) jobix_<row> (explicit index token)
+  // Safe because it maps through displayedJobNos that we stored when sending the picker.
   // -----------------------------
   const mTok = tok.match(/^jobix_(\d{1,10})$/i);
   if (mTok?.[1]) {
@@ -1294,18 +1328,15 @@ function resolveJobPickSelection(rawInput, inboundTwilioMeta = {}, pickPA = null
     const idx = row - 1;
     const jobNo = displayedJobNos[idx];
 
-    if (Number.isFinite(jobNo)) {
-      return { ok: true, jobNo, via: 'jobix_row_index' };
-    }
-    return { ok: false, reason: 'row_out_of_range', via: 'jobix_row_index' };
+    if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: "jobix_row_index" };
+    return { ok: false, reason: "row_out_of_range", via: "jobix_row_index" };
   }
 
   // -----------------------------
-  // 4) Legacy: ListId / Body job_<row>_<nonce>
-  // (only used when there is NO title signal)
+  // 4) Legacy: ListId / Body job_<row>_<nonce> (explicit index token)
   // -----------------------------
-  const listId = String(inboundTwilioMeta?.ListId || '').trim();
-  const body = String(inboundTwilioMeta?.Body || '').trim();
+  const listId = String(inboundTwilioMeta?.ListId || "").trim();
+  const body = String(inboundTwilioMeta?.Body || "").trim();
 
   const mList =
     listId.match(/^job_(\d{1,10})_[0-9a-z]+$/i) ||
@@ -1316,14 +1347,13 @@ function resolveJobPickSelection(rawInput, inboundTwilioMeta = {}, pickPA = null
     const idx = row - 1;
     const jobNo = displayedJobNos[idx];
 
-    if (Number.isFinite(jobNo)) {
-      return { ok: true, jobNo, via: 'list_id_row_index' };
-    }
-    return { ok: false, reason: 'row_out_of_range', via: 'list_id_row_index' };
+    if (Number.isFinite(jobNo)) return { ok: true, jobNo, via: "list_id_row_index" };
+    return { ok: false, reason: "row_out_of_range", via: "list_id_row_index" };
   }
 
-  return { ok: false, reason: 'unrecognized_pick', via: 'none' };
+  return { ok: false, reason: "unrecognized_pick", via: "none" };
 }
+
 
 
 

@@ -1701,7 +1701,11 @@ async function getLatestFacts({ ownerId, limit = 20, types = [] }) {
 
 
 /**
- * ✅ createJobIdempotent (CANONICAL) — FIXED $3 type conflict + optional membership gating
+ * ✅ createJobIdempotent (CANONICAL)
+ * - Owner IDs may be numeric OR UUID/text — do NOT DIGITS() here.
+ * - Idempotency checks happen BEFORE cap (duplicates never blocked).
+ * - Plan-based job cap enforced inside owner allocation lock (serial).
+ * - Membership gating removed (recommended) — keep your codebase single-source for plan truth.
  */
 async function createJobIdempotent({
   ownerId,
@@ -1711,7 +1715,6 @@ async function createJobIdempotent({
   status = 'open',
   active = true
 } = {}) {
-  // ✅ Owner IDs may be numeric OR UUID/text now — do NOT DIGITS() here.
   const owner = String(ownerId || '').trim();
   const cleanName = String(jobName || name || '').trim() || 'Untitled Job';
   const msgId = String(sourceMsgId || '').trim() || null;
@@ -1721,90 +1724,9 @@ async function createJobIdempotent({
   return await withClient(async (client) => {
     await withOwnerAllocLock(owner, client);
 
-    /* ---------------------------------------------------------
-     * OPTIONAL: membership gating (safe / best-effort)
-     * - If memberships table/cols exist, enforce a basic rule.
-     * - If anything is missing or errors, fail-open (no blocking).
-     * --------------------------------------------------------- */
-    try {
-      const hasMemberships = await hasTable('memberships').catch(() => false);
-      if (hasMemberships) {
-        // Best-effort: look for a plan on the owner row.
-        // Adjust column names if yours differ (plan, tier, status, etc.)
-        const cols = await client.query(
-          `
-          select column_name
-            from information_schema.columns
-           where table_schema='public'
-             and table_name='memberships'
-             and column_name in ('plan','tier','status','is_active','max_jobs')
-          `
-        );
-
-        const colset = new Set((cols.rows || []).map((r) => r.column_name));
-        const planCol = colset.has('plan') ? 'plan' : colset.has('tier') ? 'tier' : null;
-        const statusCol = colset.has('status') ? 'status' : null;
-        const isActiveCol = colset.has('is_active') ? 'is_active' : null;
-        const maxJobsCol = colset.has('max_jobs') ? 'max_jobs' : null;
-
-        if (planCol || statusCol || isActiveCol || maxJobsCol) {
-          const r = await client.query(
-            `
-            select
-              ${planCol ? `${planCol} as plan,` : `null as plan,`}
-              ${statusCol ? `${statusCol} as status,` : `null as status,`}
-              ${isActiveCol ? `${isActiveCol} as is_active,` : `null as is_active,`}
-              ${maxJobsCol ? `${maxJobsCol} as max_jobs` : `null as max_jobs`}
-            from public.memberships
-            where owner_id = $1
-            order by updated_at desc nulls last, created_at desc nulls last
-            limit 1
-            `,
-            [owner]
-          );
-
-          const m = r.rows?.[0] || null;
-
-          // Very conservative gating:
-          // - if is_active exists and is false => block job creation
-          // - if status exists and looks inactive/canceled => block
-          const isInactive =
-            (isActiveCol && m && m.is_active === false) ||
-            (statusCol && m && typeof m.status === 'string' && /cancel|inactive|past_due|unpaid/i.test(m.status));
-
-          if (isInactive) {
-            return {
-              inserted: false,
-              job: null,
-              reason: 'membership_inactive',
-              error: 'Membership inactive — cannot create new jobs.'
-            };
-          }
-
-          // Optional cap:
-          // - if max_jobs exists and is a number => enforce it
-          const maxJobs =
-            maxJobsCol && m?.max_jobs != null && Number.isFinite(Number(m.max_jobs)) ? Number(m.max_jobs) : null;
-
-          if (maxJobs != null) {
-            const c = await client.query(`select count(*)::int as n from public.jobs where owner_id=$1`, [owner]);
-            const n = c.rows?.[0]?.n ?? 0;
-            if (Number.isFinite(n) && n >= maxJobs) {
-              return {
-                inserted: false,
-                job: null,
-                reason: 'job_limit_reached',
-                error: `Job limit reached for your plan (${maxJobs}).`
-              };
-            }
-          }
-        }
-      }
-    } catch {
-      // ✅ fail-open: never block core workflow due to gating lookup
-    }
-
-    // Idempotency by sourceMsgId (if present)
+    // ---------------------------------------------------------
+    // 1) Idempotency by sourceMsgId (if present) — FIRST
+    // ---------------------------------------------------------
     if (msgId) {
       const existing = await client.query(
         `SELECT id, owner_id, job_no,
@@ -1818,7 +1740,9 @@ async function createJobIdempotent({
       if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
     }
 
-    // Idempotency by name
+    // ---------------------------------------------------------
+    // 2) Idempotency by name — SECOND
+    // ---------------------------------------------------------
     const existingByName = await client.query(
       `SELECT id, owner_id, job_no,
               COALESCE(job_name, name) AS job_name,
@@ -1830,12 +1754,58 @@ async function createJobIdempotent({
     );
     if (existingByName.rowCount) return { inserted: false, job: existingByName.rows[0], reason: 'already_exists' };
 
+    // ---------------------------------------------------------
+    // 3) DB-level job cap (planCapabilities-aligned) — THIRD
+    // Free: 3, Starter: 25, Pro: unlimited
+    // Fail-open on unexpected DB issues.
+    // ---------------------------------------------------------
+    try {
+      const planRow = await client.query(
+        `select subscription_tier, paid_tier, plan_key
+           from public.users
+          where user_id = $1
+          limit 1`,
+        [owner]
+      );
+
+      const plan = String(
+        planRow?.rows?.[0]?.subscription_tier ||
+        planRow?.rows?.[0]?.paid_tier ||
+        planRow?.rows?.[0]?.plan_key ||
+        'free'
+      ).toLowerCase().trim();
+
+      const maxJobs =
+        plan === 'pro' ? null :     // unlimited
+        plan === 'starter' ? 25 :
+        3;                          // free default
+
+      if (maxJobs != null) {
+        const c = await client.query(
+          `select count(*)::int as n from public.jobs where owner_id=$1`,
+          [owner]
+        );
+        const n = c.rows?.[0]?.n ?? 0;
+
+        if (Number.isFinite(n) && n >= maxJobs) {
+          return {
+            inserted: false,
+            job: null,
+            reason: 'job_limit_reached',
+            error: `Job limit reached for your plan (${maxJobs}).`
+          };
+        }
+      }
+    } catch {
+      // ✅ fail-open
+    }
+
+    // ---------------------------------------------------------
+    // 4) Create
+    // ---------------------------------------------------------
     const nextNo = await allocateNextJobNo(owner, client);
 
     try {
-      // ✅ IMPORTANT FIX:
-      // Use $3 for job_name and $4 for name (same value twice).
-      // This avoids Postgres 42P08 when column types differ (varchar vs text).
       const ins = await client.query(
         `INSERT INTO public.jobs
            (owner_id, job_no, job_name, name, status, active, start_date, created_at, updated_at, source_msg_id)
@@ -1856,6 +1826,7 @@ async function createJobIdempotent({
       );
       return { inserted: true, job: ins.rows[0], reason: 'created' };
     } catch (e) {
+      // handle unique collisions gracefully
       if (e && e.code === '23505' && msgId) {
         const existing = await client.query(
           `SELECT id, owner_id, job_no,
@@ -1868,6 +1839,7 @@ async function createJobIdempotent({
         );
         if (existing.rowCount) return { inserted: false, job: existing.rows[0], reason: 'duplicate_message' };
       }
+
       if (e && e.code === '23505') {
         const byName = await client.query(
           `SELECT id, owner_id, job_no,
@@ -1880,10 +1852,12 @@ async function createJobIdempotent({
         );
         if (byName.rowCount) return { inserted: false, job: byName.rows[0], reason: 'already_exists' };
       }
+
       throw e;
     }
   });
 }
+
 
 // Upsert a job by name, deactivate others, and activate this one
 async function activateJobByName(ownerId, rawName) {
@@ -3888,6 +3862,136 @@ async function saveActiveJob(ownerId, userId, jobId, jobName) {
 async function setActiveJobForPhone(ownerId, fromPhone, jobId, jobName) {
   return setActiveJobForIdentity(ownerId, fromPhone, jobId, jobName);
 }
+// ---------------- Stripe / Billing helpers ----------------
+
+async function hasStripeEvent(eventId) {
+  const id = String(eventId || '').trim();
+  if (!id) return false;
+  const r = await query(`select 1 from public.stripe_events where id=$1 limit 1`, [id]);
+  return (r?.rowCount || 0) > 0;
+}
+async function getOwnerByDashboardToken(token) {
+  const t = String(token || '').trim();
+  if (!t) return null;
+
+  const r = await query(
+    `select user_id
+       from public.users
+      where dashboard_token = $1
+      limit 1`,
+    [t]
+  );
+
+  return r?.rows?.[0]?.user_id || null;
+}
+
+async function insertStripeEvent(eventId) {
+  const id = String(eventId || '').trim();
+  if (!id) return false;
+  try {
+    await query(`insert into public.stripe_events (id) values ($1)`, [id]);
+    return true;
+  } catch (e) {
+    // idempotency: if concurrent, treat conflict as success
+    if (String(e?.code) === '23505') return false;
+    throw e;
+  }
+}
+
+async function getOwner(ownerId) {
+  const owner = String(ownerId || '').trim();
+  if (!owner) return null;
+
+  const r = await query(
+    `select user_id, name, email,
+            plan_key, subscription_tier, paid_tier, sub_status,
+            stripe_customer_id, stripe_subscription_id, stripe_price_id,
+            current_period_start, current_period_end, cancel_at_period_end
+       from public.users
+      where user_id = $1
+      limit 1`,
+    [owner]
+  );
+
+  return r?.rows?.[0] || null;
+}
+
+async function findOwnerIdByStripeCustomer(customerId) {
+  const cid = String(customerId || '').trim();
+  if (!cid) return null;
+
+  const r = await query(
+    `select user_id
+       from public.users
+      where stripe_customer_id = $1
+      limit 1`,
+    [cid]
+  );
+
+  return r?.rows?.[0]?.user_id || null;
+}
+
+/**
+ * updateOwnerBilling(ownerId, patch)
+ * - keeps plan truth consistent: plan_key, subscription_tier, paid_tier
+ * - patch keys supported:
+ *   plan_key, sub_status, stripe_customer_id, stripe_subscription_id, stripe_price_id,
+ *   current_period_start, current_period_end, cancel_at_period_end
+ */
+async function updateOwnerBilling(ownerId, patch = {}) {
+  const owner = String(ownerId || '').trim();
+  if (!owner) throw new Error('Missing ownerId');
+
+  const p = patch || {};
+
+  // normalize plan if provided
+  const planKeyRaw = p.plan_key != null ? String(p.plan_key).toLowerCase().trim() : null;
+  const planKey =
+    planKeyRaw === 'free' || planKeyRaw === 'starter' || planKeyRaw === 'pro'
+      ? planKeyRaw
+      : (planKeyRaw ? 'free' : null);
+
+  const fields = [];
+  const vals = [];
+  const push = (col, val) => {
+    vals.push(val);
+    fields.push(`${col}=$${vals.length}`);
+  };
+
+  // Plan truth: keep three columns aligned when plan_key provided
+  if (planKey != null) {
+    push('plan_key', planKey);
+    push('subscription_tier', planKey);
+    push('paid_tier', planKey);
+  }
+
+  if (p.sub_status != null) push('sub_status', String(p.sub_status));
+  if (p.stripe_customer_id != null) push('stripe_customer_id', p.stripe_customer_id ? String(p.stripe_customer_id) : null);
+  if (p.stripe_subscription_id != null) push('stripe_subscription_id', p.stripe_subscription_id ? String(p.stripe_subscription_id) : null);
+  if (p.stripe_price_id != null) push('stripe_price_id', p.stripe_price_id ? String(p.stripe_price_id) : null);
+
+  if (p.current_period_start !== undefined) push('current_period_start', p.current_period_start);
+  if (p.current_period_end !== undefined) push('current_period_end', p.current_period_end);
+  if (p.cancel_at_period_end !== undefined) push('cancel_at_period_end', !!p.cancel_at_period_end);
+
+  // always update updated_at if column exists (yours does)
+  push('updated_at', new Date());
+
+  if (!fields.length) return await getOwner(owner);
+
+  const sql = `
+    update public.users
+       set ${fields.join(', ')}
+     where user_id = $${vals.length + 1}
+     returning user_id, plan_key, subscription_tier, paid_tier, sub_status,
+               stripe_customer_id, stripe_subscription_id, stripe_price_id,
+               current_period_start, current_period_end, cancel_at_period_end
+  `;
+  vals.push(owner);
+
+  const r = await query(sql, vals);
+  return r?.rows?.[0] || null;
+}
 
 /* -------------------- module exports -------------------- */
 module.exports = {
@@ -3997,6 +4101,11 @@ module.exports = {
   getUsageMonthly,
   incrementUsageMonthly,
   checkMonthlyQuota,
+  hasStripeEvent,
+  insertStripeEvent,
+  getOwner,
+  findOwnerIdByStripeCustomer,
+  updateOwnerBilling,
 
   // internal helpers occasionally useful
   resolveJobRow,

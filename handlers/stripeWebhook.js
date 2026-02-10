@@ -1,5 +1,6 @@
 // handlers/stripeWebhook.js
 const Stripe = require('stripe');
+const db = require('../services/postgres');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
@@ -16,6 +17,7 @@ async function stripeWebhookHandler(req, res) {
 
   let event;
   try {
+    // req.body MUST be the raw Buffer (express.raw on the route)
     event = stripe.webhooks.constructEvent(req.body, sig, whsec);
   } catch (err) {
     console.warn('[STRIPE] webhook signature failed:', err?.message);
@@ -23,24 +25,22 @@ async function stripeWebhookHandler(req, res) {
   }
 
   try {
-    // ✅ idempotency (must implement db.hasStripeEvent/db.insertStripeEvent)
+    // ✅ idempotency
     const seen = await db.hasStripeEvent(event.id);
     if (seen) return res.json({ received: true, deduped: true });
     await db.insertStripeEvent(event.id);
 
-    // ---- Handle events ----
     switch (event.type) {
       case 'checkout.session.completed': {
-        // Usually contains customer + subscription when mode=subscription
         const sess = event.data.object;
         const ownerId = sess?.metadata?.ownerId || null;
         const planKey = sess?.metadata?.planKey || null;
 
-        // We still rely on subscription.updated for canonical period_end, etc.
         if (ownerId && sess.customer) {
           await db.updateOwnerBilling(ownerId, {
             stripe_customer_id: String(sess.customer),
             stripe_subscription_id: sess.subscription ? String(sess.subscription) : null,
+            // don't force plan here if you want subscription.updated to be canonical
             plan_key: planKey || null,
           });
         }
@@ -64,8 +64,9 @@ async function stripeWebhookHandler(req, res) {
 
         const ownerId = await db.findOwnerIdByStripeCustomer(customerId);
         if (ownerId) {
+          const isEntitled = (status === 'active' || status === 'trialing');
           await db.updateOwnerBilling(ownerId, {
-            plan_key: status === 'active' || status === 'trialing' ? planKey : 'free',
+            plan_key: isEntitled ? planKey : 'free',
             sub_status: status,
             stripe_customer_id: customerId,
             stripe_subscription_id: subscriptionId,
@@ -80,22 +81,16 @@ async function stripeWebhookHandler(req, res) {
         break;
       }
 
-      case 'invoice.payment_failed':
-      case 'invoice.payment_succeeded':
-        // optional: you can log, or map to owner and update sub_status if you want
-        break;
-
       default:
-        // ignore
         break;
     }
 
     return res.json({ received: true });
   } catch (e) {
     console.error('[STRIPE] webhook handler error:', e?.message);
-    // Stripe expects 2xx usually; but if you want retry, return 500.
     return res.status(500).json({ error: 'webhook_failed' });
   }
 }
 
 module.exports = { stripeWebhookHandler };
+

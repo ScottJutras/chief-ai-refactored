@@ -55,7 +55,8 @@ app.get('/api/healthz', (req, res) => {
 app.post('/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
 // optional alias if you prefer /api routes
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
-
+// ✅ Stripe dashboard endpoint uses this:
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), stripeWebhookHandler);
 /* ---------------- Mount order (NO global body parsers) ---------------- */
 // Webhook first; it does its own tolerant urlencoded/body handling.
 app.use('/api/webhook', webhookRouter);

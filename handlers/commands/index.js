@@ -27,12 +27,15 @@ const { applyCIL } = require('../../services/cilRouter');
 const confirmationTemplates = require('../../config').confirmationTemplates;
 
 // Lazy-load per-file handlers
-let tasksHandler, handleTimeclock, handleJob, handleExpense, handleRevenue;
+let tasksHandler, handleTimeclock, handleJob, handleExpense, handleRevenue, teamHandler;
 try { ({ tasksHandler } = require('./tasks')); } catch {}
 try { ({ handleTimeclock } = require('./timeclock')); } catch {}
 try { ({ handleJob } = require('./job')); } catch {}
 try { ({ handleExpense } = require('./expense')); } catch {}
 try { ({ handleRevenue } = require('./revenue')); } catch {}
+try { ({ teamHandler } = require('./team')); } catch {} // ✅ add
+
+
 
 function xmlEsc(s = '') {
   return String(s)
@@ -235,7 +238,7 @@ module.exports = async function handleCommands(from, text, userProfile, ownerId,
 
     // 3) Subscription gating (unchanged)
     const tier = String(userProfile?.subscription_tier || 'basic').toLowerCase();
-    const needsPro = /agent|deepdive|quote|metrics|receipt|team|pricing/i.test(lc);
+    const needsPro = /agent|deepdive|quote|metrics|receipt|pricing/i.test(lc);
     if (needsPro && !['pro', 'enterprise'].includes(tier)) {
       const sent = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, {
         '1': `This feature requires Pro or Enterprise.`,
@@ -268,6 +271,27 @@ module.exports = async function handleCommands(from, text, userProfile, ownerId,
     // If the user is replying "yes/edit/cancel" and we have expense/revenue handlers enabled,
     // DO NOT intercept here — let those handlers pick it up based on pending state.
     // We'll just fall through to them below.
+    
+    // 5) Dedicated handlers first (stateful flows)
+// ✅ TEAM (employees/crew) — Gate #3 lives inside team.js
+if (teamHandler) {
+  const teamHit =
+    /^(team|crew|employees?)\b/i.test(raw) ||
+    /^(add|new|create)\s+(employee|crew)\b/i.test(raw) ||
+    /^invite\b/i.test(raw) ||
+    /^remove\s+(employee|crew)\b/i.test(raw) ||
+    /^list\s+(team|crew|employees?)\b/i.test(raw);
+
+  if (teamHit) {
+    const handled = await teamHandler(from, raw, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId);
+    if (handled) {
+      await safeCleanup({ from, ownerId });
+      return true;
+    }
+  }
+}
+
+
 
     if (tasksHandler) {
       const handled = await tasksHandler(from, raw, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId);
@@ -293,7 +317,7 @@ module.exports = async function handleCommands(from, text, userProfile, ownerId,
       }
     }
 
-    // 5) Bootstrap CIL (ONLY for areas without dedicated handlers)
+    // 6) Bootstrap CIL (ONLY for areas without dedicated handlers)
     // If you ever add a handler for a command, keep it ahead of this.
     const cil = simpleTextToCIL(raw);
     if (cil) {
@@ -304,7 +328,7 @@ module.exports = async function handleCommands(from, text, userProfile, ownerId,
       return true;
     }
 
-    // 6) Agent fallback
+    // 7) Agent fallback
     const { ask } = require('../../services/agent');
     const answer = await ask({
       from,

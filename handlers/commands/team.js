@@ -102,7 +102,20 @@ async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwn
     // Plan + caps
     const rawPlan = String(ownerProfile?.plan_key || ownerProfile?.paid_tier || ownerProfile?.subscription_tier || 'free');
     const caps = await resolveCaps(rawPlan);
-    const maxEmployees = caps?.people?.max_employee_records ?? 0;
+    const maxEmployees = caps?.people?.max_employee_records;
+
+if (maxEmployees != null && Number.isFinite(Number(maxEmployees))) {
+  const { rows } = await pg.query(
+    `select count(*)::int as c from public.employees where owner_id=$1`,
+    [owner]
+  );
+  const c = Number(rows?.[0]?.c || 0);
+
+  if (c >= Number(maxEmployees)) {
+    // block + upsell copy...
+  }
+}
+
 
     // LIST
     if (/^(team|employees|crew)\b/i.test(msg)) {
@@ -133,60 +146,102 @@ async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwn
     }
 
     // ADD
-    if (/^add\s+(employee|emp|crew)\b/i.test(msg)) {
-      const parsed = parseAdd(msg);
-      if (!parsed?.name) {
-        return res.send(RESP(`Try:\nadd employee John\nadd employee John +15195551234`));
-      }
+if (/^add\s+(employee|emp|crew)\b/i.test(msg)) {
+  const parsed = parseAdd(msg);
+  if (!parsed?.name) {
+    return res.send(RESP(`Try:\nadd employee John\nadd employee John +15195551234`));
+  }
 
-      // Gate #3 — max_employee_records
-      if (Number.isFinite(Number(maxEmployees))) {
-        const { rows } = await pg.query(
-          `select count(*)::int as c from public.employees where owner_id=$1`,
-          [owner]
-        );
-        const c = Number(rows?.[0]?.c || 0);
-        if (c >= Number(maxEmployees)) {
-          const tierLine =
-            String(rawPlan || 'free').toLowerCase().includes('free')
-              ? `Free supports up to ${maxEmployees} employee records. Upgrade to Starter (10) or Pro (25).`
-              : `Your plan supports up to ${maxEmployees} employee records. Upgrade to Pro for more.`;
+  // Gate #3 — max_employee_records (only if it's a real number)
+  if (maxEmployees != null && Number.isFinite(Number(maxEmployees))) {
+    const { rows } = await pg.query(
+      `select count(*)::int as c from public.employees where owner_id=$1`,
+      [owner]
+    );
+    const c = Number(rows?.[0]?.c || 0);
 
-          return res.send(RESP(`⚠️ Employee limit reached (${c}/${maxEmployees}).\n\n${tierLine}`));
-        }
-      }
+    if (c >= Number(maxEmployees)) {
+      const planLc = String(rawPlan || 'free').toLowerCase();
+      const tierLine =
+        planLc.includes('free')
+          ? `Free supports up to ${maxEmployees} employee records. Upgrade to Starter (10) or Pro (25).`
+          : `Your plan supports up to ${maxEmployees} employee records. Upgrade to Pro for more.`;
 
-      // Insert (schema-tolerant: phone/role columns optional)
-      const hasPhone = await employeesTableHasColumn('phone');
-      const hasSource = await employeesTableHasColumn('source_msg_id');
-
-      const cols = ['owner_id', 'name', 'created_at'];
-      const vals = ['$1', '$2', 'now()'];
-      const params = [owner, parsed.name];
-
-      if (hasPhone) {
-        cols.push('phone');
-        vals.push(`$${params.length + 1}`);
-        params.push(parsed.phone);
-      }
-
-      if (hasSource) {
-        cols.push('source_msg_id');
-        vals.push(`$${params.length + 1}`);
-        params.push(String(sourceMsgId || '').trim() || null);
-      }
-
-      const sql = `
-        insert into public.employees (${cols.join(', ')})
-        values (${vals.join(', ')})
-        returning id, name
-      `;
-
-      const r = await pg.query(sql, params);
-      const nm = String(r?.rows?.[0]?.name || parsed.name).trim();
-
-      return res.send(RESP(`✅ Added employee: ${nm}`));
+      return res.send(RESP(`⚠️ Employee limit reached (${c}/${maxEmployees}).\n\n${tierLine}`));
     }
+  }
+
+  // Insert (schema-tolerant: phone/source_msg_id exist; role/active may be required)
+  const hasPhone = await employeesTableHasColumn('phone');
+  const hasSource = await employeesTableHasColumn('source_msg_id'); // will be false until you add column
+  const hasRole = await employeesTableHasColumn('role');
+  const hasActive = await employeesTableHasColumn('active');
+
+  const cols = ['owner_id', 'name', 'created_at'];
+  const vals = ['$1', '$2', 'now()'];
+  const params = [owner, parsed.name];
+
+  // ✅ role is NOT NULL in your schema — set it when column exists
+  if (hasRole) {
+    cols.push('role');
+    vals.push(`$${params.length + 1}`);
+    params.push('employee'); // canonical default
+  }
+
+  // optional active flag (your table has it)
+  if (hasActive) {
+    cols.push('active');
+    vals.push(`$${params.length + 1}`);
+    params.push(true);
+  }
+
+  if (hasPhone) {
+    cols.push('phone');
+    vals.push(`$${params.length + 1}`);
+    params.push(parsed.phone);
+  }
+
+  // Only add source_msg_id if col exists AND we have a non-empty value
+  const sourceVal = String(sourceMsgId || '').trim() || null;
+  const willWriteSource = !!(hasSource && sourceVal);
+  if (willWriteSource) {
+    cols.push('source_msg_id');
+    vals.push(`$${params.length + 1}`);
+    params.push(sourceVal);
+  }
+
+  const sql = `
+    insert into public.employees (${cols.join(', ')})
+    values (${vals.join(', ')})
+    returning id, name
+  `;
+
+  let r;
+  try {
+    r = await pg.query(sql, params);
+  } catch (e) {
+    // ✅ If DB trigger blocks (Gate #3), return friendly upsell instead of “Team error”
+    if (String(e?.code) === 'P0001' && /employee_limit_reached/i.test(String(e?.message || ''))) {
+      const planLc = String(rawPlan || 'free').toLowerCase();
+      const tierLine =
+        planLc.includes('free')
+          ? `Free supports up to ${maxEmployees ?? 3} employee records. Upgrade to Starter (10) or Pro (25).`
+          : `Your plan supports up to ${maxEmployees ?? 10} employee records. Upgrade to Pro for more.`;
+
+      return res.send(RESP(`⚠️ Employee limit reached.\n\n${tierLine}`));
+    }
+
+    // ✅ Twilio retry idempotency (only if we actually wrote source_msg_id)
+    if (String(e?.code) === '23505' && willWriteSource) {
+      return res.send(RESP(`✅ Added employee: ${parsed.name}`));
+    }
+
+    throw e;
+  }
+
+  const nm = String(r?.rows?.[0]?.name || parsed.name).trim();
+  return res.send(RESP(`✅ Added employee: ${nm}`));
+}
 
     // REMOVE
     if (/^remove\s+(employee|emp|crew)\b/i.test(msg)) {

@@ -669,99 +669,105 @@ if (isSupportedAudio) {
     return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
   }
 
-  // -------------------------------
-  // ✅ Gate #4b — Voice minutes quota + plan
-  // (MUST run BEFORE fetch/transcribe)
-  // -------------------------------
+  // ---------------------------------------------
+  // ✅ Gate #4b — Voice minutes quota (charge only on SUCCESS)
+  // ---------------------------------------------
+  let voiceGate = null;
+  let voiceCap = 0;
+  let caps = null;
+
   try {
     const tz = getUserTz(userProfile);
-    const caps = await resolveCapsForOwner(ownerId);
+    caps = await resolveCapsForOwner(ownerId);
 
-    // ✅ Fail-open if caps can’t be resolved (don’t accidentally block everyone)
-    if (caps) {
-      const voiceEnabled = !!caps?.capture?.voice?.enabled;
-      const voiceCap = caps?.capture?.voice?.monthly_minutes ?? 0;
+    const voiceEnabled = !!caps?.capture?.voice?.enabled;
+    voiceCap = caps?.capture?.voice?.monthly_minutes ?? 0;
 
-      if (!voiceEnabled) {
-        return {
-          transcript: null,
-          twiml: twiml(`Voice is not enabled on your plan.\n\nUpgrade to Starter or Pro to use voice notes.`)
-        };
-      }
+    if (caps && !voiceEnabled) {
+      return { transcript: null, twiml: twiml(`Voice is not enabled on your plan.\n\nUpgrade to Starter or Pro to use voice notes.`) };
+    }
 
-      // If you don't have duration, start with 1 minute per voice note
-      const minutesUsed = 1;
+    // ✅ pre-check only (NO increment yet)
+    voiceGate = await gateMonthly({
+      ownerId,
+      tz,
+      field: 'voice_minutes',
+      capMonthly: voiceCap,
+      incrementBy: 0
+    });
 
-      const g = await gateMonthly({
-        ownerId,
-        tz,
-        field: 'voice_minutes',
-        capMonthly: voiceCap,
-        incrementBy: minutesUsed
-      });
-
-      if (!g.allowed) {
-        return {
-          transcript: null,
-          twiml: twiml(`You’ve hit your monthly Voice limit (${g.used}/${voiceCap} minutes).\n\nUpgrade to Pro for more capacity.`)
-        };
-      }
+    if (caps && voiceGate && !voiceGate.allowed) {
+      return { transcript: null, twiml: twiml(`You’ve hit your monthly Voice limit (${voiceGate.used}/${voiceCap} minutes).\n\nUpgrade to Pro for more capacity.`) };
     }
   } catch (e) {
-    console.warn('[MEDIA] voice gate failed (fail-open):', e?.message);
+    console.warn('[MEDIA] voice precheck failed (fail-open):', e?.message);
   }
 
   // ✅ ONLY NOW do the fetch + transcribe work
   let transcript = '';
   let confidence = null;
 
-      try {
-       // --- Fetch media bytes with a hard timeout ---
-console.info('[MEDIA_AUDIO_FETCH_START]', { sourceMsgId: sourceMsgId || null, normType });
+  // --- Fetch media bytes with a hard timeout ---
+  console.info('[MEDIA_AUDIO_FETCH_START]', { sourceMsgId: sourceMsgId || null, normType });
 
-let audioBuf;
-try {
-  audioBuf = await withTimeout(fetchTwilioMediaBytes(mediaUrl, sourceMsgId), 7000, 'twilio_media_fetch');
-  console.info('[MEDIA_AUDIO_FETCH_OK]', { bytes: audioBuf ? audioBuf.length : 0 });
-} catch (e) {
-  console.warn('[MEDIA_AUDIO_FETCH_FAIL]', e?.message);
-  return { transcript: null, twiml: twiml('⚠️ Voice took too long to download. Try again, or type: "clock in".') };
-}
+  let audioBuf;
+  try {
+    audioBuf = await withTimeout(fetchTwilioMediaBytes(mediaUrl, sourceMsgId), 7000, 'twilio_media_fetch');
+    console.info('[MEDIA_AUDIO_FETCH_OK]', { bytes: audioBuf ? audioBuf.length : 0 });
+  } catch (e) {
+    console.warn('[MEDIA_AUDIO_FETCH_FAIL]', e?.message);
+    return { transcript: null, twiml: twiml('⚠️ Voice took too long to download. Try again, or type: "clock in".') };
+  }
 
-// --- Transcribe with a hard timeout ---
-console.info('[MEDIA_STT_START]', { engine: 'both', normType });
+  // --- Transcribe with a hard timeout ---
+  console.info('[MEDIA_STT_START]', { engine: 'both', normType });
 
-try {
-  const r1 = await withTimeout(transcribeAudio(audioBuf, normType, 'both'), 11000, 'stt');
-  const n1 = normalizeTranscriptionResult(r1);
-  transcript = n1.transcript;
-  confidence = n1.confidence;
-  console.info('[MEDIA_STT_OK]', { len: String(transcript || '').length, confidence: confidence ?? null });
-} catch (e) {
-  console.warn('[MEDIA_STT_FAIL]', e?.message);
-  return { transcript: null, twiml: twiml('⚠️ Voice took too long to transcribe. Try again, or type: "clock in".') };
-}
-    
+  try {
+    const r1 = await withTimeout(transcribeAudio(audioBuf, normType, 'both'), 11000, 'stt');
+    const n1 = normalizeTranscriptionResult(r1);
+    transcript = n1.transcript;
+    confidence = n1.confidence;
+    console.info('[MEDIA_STT_OK]', { len: String(transcript || '').length, confidence: confidence ?? null });
+  } catch (e) {
+    console.warn('[MEDIA_STT_FAIL]', e?.message);
+    return { transcript: null, twiml: twiml('⚠️ Voice took too long to transcribe. Try again, or type: "clock in".') };
+  }
 
-        if (!transcript && normType === 'audio/ogg') {
-          try {
-            const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
-            const n2 = normalizeTranscriptionResult(r2);
-            transcript = n2.transcript;
-            confidence = confidence ?? n2.confidence;
-          } catch (e2) {
-            console.warn('[MEDIA] fallback transcribe failed:', e2?.message);
-          }
-        }
-      } catch (e) {
-        console.error('[MEDIA] transcribe fetch/exec failed:', e?.message);
-      }
+  // Fallback container type tweak
+  if (!transcript && normType === 'audio/ogg') {
+    try {
+      const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
+      const n2 = normalizeTranscriptionResult(r2);
+      transcript = n2.transcript;
+      confidence = confidence ?? n2.confidence;
+    } catch (e2) {
+      console.warn('[MEDIA] fallback transcribe failed:', e2?.message);
+    }
+  }
 
-      transcript = String(transcript || '').trim();
-      if (!transcript) return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
+  transcript = String(transcript || '').trim();
+  if (!transcript) {
+    return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
+  }
 
-      transcript = normalizeHumanText(transcript);
-      extractedText = transcript;
+  // ✅ charge only on success (default 1 minute per note until you add duration)
+  try {
+    if (caps && voiceGate?.allowed) {
+      const tz = getUserTz(userProfile);
+      await gateMonthly({
+        ownerId,
+        tz,
+        field: 'voice_minutes',
+        capMonthly: voiceCap,      // keep real cap
+        incrementBy: 1
+      });
+    }
+  } catch (e) {
+    console.warn('[MEDIA] voice increment failed (ignored):', e?.message);
+  }
+
+  transcript = normalizeHumanText(transcript);
+  extractedText = transcript;
 
       try {
         mediaAssetId = await upsertMediaAsset({
@@ -842,48 +848,64 @@ if (isImage) {
   let ocrFields = null;
 
   // -------------------------------
-  // ✅ Gate #4a — OCR quota + plan (FAIL-OPEN)
-  // -------------------------------
-  try {
-    const tz = getUserTz(userProfile);
-    const caps = await resolveCapsForOwner(ownerId);
+// ✅ Gate #4a — OCR quota + plan (charge on success)
+// -------------------------------
+let ocrGate = null;
+let ocrCap = 0;
+try {
+  const tz = getUserTz(userProfile);
+  const caps = await resolveCapsForOwner(ownerId);
 
-    // ✅ If caps can't be resolved, do NOT block (fail-open)
-    if (caps) {
-      const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
-      const ocrCap = caps?.capture?.ocr_receipts?.monthly_capacity ?? 0;
+  const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
+  ocrCap = caps?.capture?.ocr_receipts?.monthly_capacity ?? 0;
 
-      if (!ocrEnabled) {
-        return {
-          transcript: null,
-          twiml: twiml(`OCR receipts are not enabled on your plan.\n\nUpgrade to Starter or Pro to scan receipts.`)
-        };
-      }
-
-      // Increment 1 receipt if within quota
-      const g = await gateMonthly({
-        ownerId,
-        tz,
-        field: 'ocr_receipts_count',
-        capMonthly: ocrCap,
-        incrementBy: 1
-      });
-
-      if (!g.allowed) {
-        return {
-          transcript: null,
-          twiml: twiml(`You’ve hit your monthly OCR limit (${g.used}/${ocrCap}).\n\nUpgrade to Pro for more capacity.`)
-        };
-      }
-    }
-  } catch (e) {
-    console.warn('[MEDIA] OCR gate failed (fail-open):', e?.message);
+  if (caps && !ocrEnabled) {
+    return {
+      transcript: null,
+      twiml: twiml(`OCR receipts are not enabled on your plan.\n\nUpgrade to Starter or Pro to scan receipts.`)
+    };
   }
+
+  ocrGate = await gateMonthly({
+    ownerId,
+    tz,
+    field: 'ocr_receipts_count',
+    capMonthly: ocrCap,
+    incrementBy: 0
+  });
+
+  if (caps && ocrGate && !ocrGate.allowed) {
+    return {
+      transcript: null,
+      twiml: twiml(`You’ve hit your monthly OCR limit (${ocrGate.used}/${ocrCap}).\n\nUpgrade to Pro for more capacity.`)
+    };
+  }
+} catch (e) {
+  console.warn('[MEDIA] OCR precheck failed (fail-open):', e?.message);
+}
+
 
   // 1) OCR (DocAI -> Vision fallback happens inside extractTextFromImage)
   try {
     const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
     ocrText = String(out?.text || out?.transcript || '').trim();
+    // ✅ charge only if OCR produced text
+try {
+ const gotText = !!String(ocrText || '').trim();
+if (caps && gotText && ocrGate?.allowed) {
+  const tz = getUserTz(userProfile);
+  await gateMonthly({
+    ownerId,
+    tz,
+    field: 'ocr_receipts_count',
+    capMonthly: ocrCap,
+    incrementBy: 1
+  });
+}
+} catch (e) {
+  console.warn('[MEDIA] OCR increment failed (ignored):', e?.message);
+}
+
     ocrFields = out?.fields || out?.ocrFields || null;
   } catch (e) {
     console.warn('[MEDIA] OCR failed (ignored):', e?.message);

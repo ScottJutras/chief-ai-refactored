@@ -1,25 +1,47 @@
 // middleware/requireDashboardOwner.js
-const db = require('../services/postgres');
+const pg = require("../services/postgres");
 
-function bearerToken(req) {
-  const h = String(req.headers?.authorization || '').trim();
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1].trim() : null;
+function parseBearer(req) {
+  const raw = req.get("authorization") || req.get("Authorization") || "";
+  const s = String(raw).trim();
+  if (!s) return null;
+  const m = s.match(/^bearer\s+(.+)$/i);
+  return (m ? m[1] : s).trim() || null;
 }
 
 async function requireDashboardOwner(req, res, next) {
   try {
-    const token = bearerToken(req);
-    if (!token) return res.status(401).json({ error: 'Missing Authorization Bearer token' });
+    const token = parseBearer(req);
 
-    const ownerId = await db.getOwnerByDashboardToken(token);
-    if (!ownerId) return res.status(401).json({ error: 'Invalid token' });
+    console.log("[DASH_AUTH]", {
+      hasAuthHeader: !!(req.get("authorization") || req.get("Authorization")),
+      tokenLen: token ? token.length : 0,
+      path: req.originalUrl,
+    });
 
-    req.ownerId = String(ownerId);
+    if (!token) return res.status(401).json({ error: "Missing dashboard token" });
+
+    const result = await pg.getOwnerByDashboardToken(token);
+
+    // ✅ Support both return shapes:
+    // - legacy: "19053279955"
+    // - newer: { user_id: "19053279955", ... }
+    const ownerId =
+      typeof result === "string" || typeof result === "number"
+        ? String(result)
+        : result?.user_id
+          ? String(result.user_id)
+          : null;
+
+    if (!ownerId) {
+      return res.status(401).json({ error: "Missing owner context" });
+    }
+
+    req.ownerId = ownerId;
     return next();
   } catch (e) {
-    console.warn('[AUTH] requireDashboardOwner failed:', e?.message);
-    return res.status(500).json({ error: 'auth_failed' });
+    console.error("[DASH_AUTH_ERR]", e);
+    return res.status(500).json({ error: "Auth error" });
   }
 }
 

@@ -3870,20 +3870,21 @@ async function hasStripeEvent(eventId) {
   const r = await query(`select 1 from public.stripe_events where id=$1 limit 1`, [id]);
   return (r?.rowCount || 0) > 0;
 }
-async function getOwnerByDashboardToken(token) {
-  const t = String(token || '').trim();
+async function getOwnerByDashboardToken(dashboardToken) {
+  const t = String(dashboardToken || "").trim();
   if (!t) return null;
 
-  const r = await query(
+  const { rows } = await pool.query(
     `select user_id
-       from public.users
-      where dashboard_token = $1
-      limit 1`,
+     from public.users
+     where dashboard_token = $1
+     limit 1`,
     [t]
   );
 
-  return r?.rows?.[0]?.user_id || null;
+  return rows[0]?.user_id ? String(rows[0].user_id) : null;
 }
+
 
 async function insertStripeEvent(eventId) {
   const id = String(eventId || '').trim();
@@ -4106,6 +4107,7 @@ module.exports = {
   getOwner,
   findOwnerIdByStripeCustomer,
   updateOwnerBilling,
+  getOwnerByDashboardToken,
 
   // internal helpers occasionally useful
   resolveJobRow,

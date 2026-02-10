@@ -273,10 +273,11 @@ async function sendBackfillConfirm(to, humanLine, opts = {}) {
 
 /**
  * Interactive list sender (via Content Templates).
- * If no Content SID is configured, falls back to a plain text message.
+ * Uses a List Picker template with 8 fixed rows:
+ * 1 = body, 2 = button
+ * rows: (name,id,desc) repeated starting at var 3
  *
- * If DOUBLE_SEND_LIST_FALLBACK=1, also sends a plain-text backup after the template
- * (helps when template delivery is flaky / user is on web client).
+ * If no Content SID is configured, falls back to a plain text message.
  */
 async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections, contentSid } = {}) {
   const safeBody = safeBodyOrDash(bodyText);
@@ -315,34 +316,47 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
     return sendWhatsApp(to, safeBody);
   }
 
-  const sectionsJson = JSON.stringify(sections);
+  // Flatten rows across sections and take first 8
+  const flatRows = [];
+  for (const s of (sections || [])) {
+    for (const r of (s?.rows || [])) flatRows.push(r);
+  }
 
-  // ✅ Hard cap to avoid template var rejection; fall back instead of slicing into invalid JSON
-  if (sectionsJson.length > 900) {
-    console.warn('[TWILIO] sections JSON too large for template var; falling back to plain text', {
-      len: sectionsJson.length
-    });
+  const rows8 = flatRows.slice(0, 8);
 
-    // Plain text fallback list
-    const flat = [];
-    for (const s of sections) {
-      for (const r of (s?.rows || [])) flat.push(r);
-    }
-    const lines = flat.slice(0, 12).map((r, i) => `${i + 1}) ${r.title}`);
-    return sendWhatsApp(to, `${safeBody}\n\nReply with a job number:\n${lines.join('\n')}`);
+  // Pad to exactly 8 rows (template requires 8 items)
+  while (rows8.length < 8) {
+    rows8.push({ title: '—', id: `pad_${rows8.length + 1}`, description: '—' });
   }
 
   const vars = {
     1: toTemplateVar(safeBody),
-    2: toTemplateVar(buttonText || 'Pick job'),
-    3: toTemplateVar(sectionsJson)
+    2: toTemplateVar(buttonText || 'Pick job')
   };
+
+  for (let i = 0; i < 8; i++) {
+    const r = rows8[i];
+    const base = 3 + i * 3;
+
+    vars[base] = toTemplateVar(String(r?.title || '—'));
+    vars[base + 1] = toTemplateVar(String(r?.id || `jobix_${i + 1}`));
+    vars[base + 2] = toTemplateVar(String(r?.description || '—'));
+  }
+
+  // Helpful debug: confirm we are setting the vars we expect
+  console.info('[TWILIO] list vars preview', {
+    v1: vars[1],
+    v2: vars[2],
+    firstRow: { name: vars[3], id: vars[4], desc: vars[5] }
+  });
 
   try {
     const result = await sendTemplateMessage(to, sid, vars, safeBody);
 
     if (DOUBLE_SEND_LIST_FALLBACK) {
-      try { await sendWhatsApp(to, safeBody); } catch (e2) {
+      try {
+        await sendWhatsApp(to, safeBody);
+      } catch (e2) {
         console.warn('[TWILIO] double-send fallback failed (ignored):', e2?.message);
       }
     }
@@ -350,9 +364,13 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
     return result;
   } catch (e) {
     console.warn('[TWILIO] interactive list template failed; falling back to plain text:', e?.message);
-    return sendWhatsApp(to, safeBody);
+
+    // Plain text fallback list (still useful)
+    const lines = flatRows.slice(0, 12).map((r, i) => `${i + 1}) ${r.title}`);
+    return sendWhatsApp(to, `${safeBody}\n\nReply with a job number:\n${lines.join('\n')}`);
   }
 }
+
 
 
 

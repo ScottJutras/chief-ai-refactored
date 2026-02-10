@@ -2286,7 +2286,14 @@ function looksLikeNewExpenseText(s = '') {
     /\b(spent|bought|purchase|purchased|paid|receipt|cost|home\s*depot|rona|lowe'?s|home\s*hardware|beacon)\b/.test(lc) &&
     /\$?\s*\d+(\.\d{1,2})?\b/.test(lc)
   );
-}/* ---------------- Job picker helpers ---------------- */
+}
+/* ---------------- Job picker helpers ---------------- */
+
+function capListTitle(s, max = 24) {
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  return t.length > max ? t.slice(0, max - 1) + '…' : t;
+}
+
 function getJobDisplayName(job) {
   const nm = String(job?.name || job?.job_name || job?.jobName || job?.job_name_display || '').trim();
   return nm || null;
@@ -2442,7 +2449,7 @@ async function sendJobPickList({
       jobNo,
       name,
       id: stableId, // ✅ FULLY ACTIVATED: jp:<flow8>:<nonce>:jn:<jobNo>:h:<sig>
-      title: name // name-only title (no "#")
+     title: capListTitle(name, 24) // ✅ truncation-safe for WhatsApp UI
     };
   });
 

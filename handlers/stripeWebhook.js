@@ -55,87 +55,88 @@ async function stripeWebhookHandler(req, res) {
       }
 
       case "customer.subscription.created":
-      case "customer.subscription.updated":
-      case "customer.subscription.deleted": {
-        const sub = event.data.object;
+case "customer.subscription.updated":
+case "customer.subscription.deleted": {
+  const sub = event.data.object;
 
-        const customerId = String(sub.customer || "");
-        const subscriptionId = String(sub.id || "");
-        const status = String(sub.status || "");
-        const cancelAtPeriodEnd = !!sub.cancel_at_period_end;
+  const customerId = String(sub.customer || "");
+  const subscriptionId = String(sub.id || "");
+  const status = String(sub.status || "");
+  const cancelAtPeriodEnd = !!sub.cancel_at_period_end;
 
-        const priceId = sub?.items?.data?.[0]?.price?.id
-          ? String(sub.items.data[0].price.id)
-          : null;
+  const priceId = sub?.items?.data?.[0]?.price?.id
+    ? String(sub.items.data[0].price.id)
+    : null;
 
-        const mappedPlanKey = priceIdToPlanKey(priceId);
+  const mappedPlanKey = priceIdToPlanKey(priceId);
 
-        const ownerId = await db.findOwnerIdByStripeCustomer(customerId);
-        if (!ownerId) {
-          console.warn("[STRIPE] subscription event but no owner found for customer", customerId, {
-            eventType: event.type,
-            subscriptionId,
-          });
-          break;
-        }
-
-        const isEntitled = status === "active" || status === "trialing";
-
-       // ✅ Option B (strong): always retrieve period dates for entitled subs
-let periodStart = null;
-let periodEnd = null;
-
-try {
-  if (subscriptionId && (status === "active" || status === "trialing")) {
-    const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
-    periodStart = fullSub.current_period_start
-      ? new Date(fullSub.current_period_start * 1000)
-      : null;
-    periodEnd = fullSub.current_period_end
-      ? new Date(fullSub.current_period_end * 1000)
-      : null;
-  } else {
-    // fall back to what the event provided, if anything
-    periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
-    periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+  const ownerId = await db.findOwnerIdByStripeCustomer(customerId);
+  if (!ownerId) {
+    console.warn("[STRIPE] subscription event but no owner found for customer", customerId, {
+      eventType: event.type,
+      subscriptionId,
+    });
+    break;
   }
-} catch (e) {
-  console.warn("[STRIPE] failed to retrieve subscription for period dates", {
-    subscriptionId,
-    status,
-    msg: e?.message,
+
+  const isEntitled = status === "active" || status === "trialing";
+
+  // ✅ Always retrieve authoritative period dates for entitled subscriptions
+  let periodStart = null;
+  let periodEnd = null;
+
+  try {
+    if (subscriptionId && isEntitled) {
+      const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
+
+      periodStart = fullSub.current_period_start
+        ? new Date(fullSub.current_period_start * 1000)
+        : null;
+
+      periodEnd = fullSub.current_period_end
+        ? new Date(fullSub.current_period_end * 1000)
+        : null;
+    } else {
+      // fallback to event payload
+      periodStart = sub.current_period_start
+        ? new Date(sub.current_period_start * 1000)
+        : null;
+
+      periodEnd = sub.current_period_end
+        ? new Date(sub.current_period_end * 1000)
+        : null;
+    }
+  } catch (e) {
+    console.warn("[STRIPE] failed to retrieve subscription for period dates", {
+      subscriptionId,
+      status,
+      msg: e?.message,
+    });
+
+    // fallback to payload if Stripe call fails
+    periodStart = sub.current_period_start
+      ? new Date(sub.current_period_start * 1000)
+      : null;
+
+    periodEnd = sub.current_period_end
+      ? new Date(sub.current_period_end * 1000)
+      : null;
+  }
+
+  await db.updateOwnerBilling(ownerId, {
+    plan_key: isEntitled ? mappedPlanKey : "free",
+    sub_status: status,
+    stripe_customer_id: customerId,
+    stripe_subscription_id: subscriptionId,
+    stripe_price_id: priceId,
+    cancel_at_period_end: cancelAtPeriodEnd,
+    current_period_start: periodStart,
+    current_period_end: periodEnd,
   });
-  // fallback to payload
-  periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
-  periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+
+  break;
 }
 
-
-        // If entitled but unmapped priceId, warn loudly (prevents silent “free” entitlement)
-        if (isEntitled && mappedPlanKey === "free" && priceId) {
-          console.warn("[STRIPE] entitled subscription has unmapped priceId; defaulting plan_key to free", {
-            ownerId: String(ownerId),
-            customerId,
-            subscriptionId,
-            status,
-            priceId,
-            STRIPE_PRICE_STARTER: process.env.STRIPE_PRICE_STARTER,
-            STRIPE_PRICE_PRO: process.env.STRIPE_PRICE_PRO,
-          });
-        }
-
-        await db.updateOwnerBilling(ownerId, {
-          plan_key: isEntitled ? mappedPlanKey : "free",
-          sub_status: status,
-          stripe_customer_id: customerId,
-          stripe_subscription_id: subscriptionId,
-          stripe_price_id: priceId,
-          cancel_at_period_end: cancelAtPeriodEnd,
-          current_period_start: periodStart,
-          current_period_end: periodEnd,
-        });
-
-        break;
       }
 
       case "invoice.paid":

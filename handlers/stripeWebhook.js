@@ -16,6 +16,9 @@ function priceIdToPlanKey(priceId) {
 }
 
 async function stripeWebhookHandler(req, res) {
+  // proves the handler is being hit (no guessing)
+  console.log("[STRIPE_HIT]", Date.now());
+
   const sig = req.headers["stripe-signature"];
   const whsec = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -28,11 +31,22 @@ async function stripeWebhookHandler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
+  // ✅ event logging MUST happen after constructEvent
+  console.log("[STRIPE_EVT]", {
+    type: event?.type || null,
+    id: event?.id || null,
+    obj: event?.data?.object?.object || null,
+    subId: event?.data?.object?.id || null,
+    customer: event?.data?.object?.customer || null,
+  });
+
   try {
-    // ✅ idempotency (schema: public.stripe_events(event_id, received_at))
+    // ✅ idempotency (schema: public.stripe_events(event_id, received_at, event_type?))
     const seen = await db.hasStripeEvent(event.id);
     if (seen) return res.json({ received: true, deduped: true });
-    await db.insertStripeEvent(event.id);
+
+    // IMPORTANT: record event_type so we can debug what’s arriving
+    await db.insertStripeEvent(event.id, event.type);
 
     switch (event.type) {
       case "checkout.session.completed": {
@@ -81,66 +95,65 @@ async function stripeWebhookHandler(req, res) {
 
         const isEntitled = status === "active" || status === "trialing";
 
-       // ✅ Always retrieve authoritative period dates for entitled subscriptions
-let periodStart = null;
-let periodEnd = null;
+        // ✅ Period dates (robust): try subscription → fallback invoice line period
+        let periodStart = null;
+        let periodEnd = null;
 
-try {
-  if (subscriptionId && isEntitled) {
-    const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
+        try {
+          if (subscriptionId && isEntitled) {
+            const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
 
-    const cps = fullSub?.current_period_start ?? null;
-    const cpe = fullSub?.current_period_end ?? null;
+            const cps = fullSub?.current_period_start ?? null;
+            const cpe = fullSub?.current_period_end ?? null;
 
-    if (cps && cpe) {
-      periodStart = new Date(cps * 1000);
-      periodEnd = new Date(cpe * 1000);
-    } else {
-      // 🔁 Fallback: derive from latest invoice line period
-      const invs = await stripe.invoices.list({ subscription: subscriptionId, limit: 1 });
-      const inv = invs?.data?.[0] || null;
+            if (cps && cpe) {
+              periodStart = new Date(cps * 1000);
+              periodEnd = new Date(cpe * 1000);
+            } else {
+              // 🔁 Fallback: derive from latest invoice line period
+              const invs = await stripe.invoices.list({ subscription: subscriptionId, limit: 1 });
+              const inv = invs?.data?.[0] || null;
 
-      const linePeriod = inv?.lines?.data?.[0]?.period || null;
-      const ps = linePeriod?.start ?? null;
-      const pe = linePeriod?.end ?? null;
+              const linePeriod = inv?.lines?.data?.[0]?.period || null;
+              const ps = linePeriod?.start ?? null;
+              const pe = linePeriod?.end ?? null;
 
-      periodStart = ps ? new Date(ps * 1000) : null;
-      periodEnd = pe ? new Date(pe * 1000) : null;
+              periodStart = ps ? new Date(ps * 1000) : null;
+              periodEnd = pe ? new Date(pe * 1000) : null;
 
-      // TEMP DEBUG (remove once confirmed)
-      console.log("[STRIPE_PERIOD_FALLBACK_INVOICE]", {
-        subscriptionId,
-        cps,
-        cpe,
-        invoiceId: inv?.id || null,
-        invPeriodStart: ps,
-        invPeriodEnd: pe,
-      });
-    }
-  } else {
-    // fallback to event payload
-    periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
-    periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
-  }
-} catch (e) {
-  console.warn("[STRIPE] failed to derive period dates", {
-    subscriptionId,
-    status,
-    msg: e?.message,
-  });
+              console.log("[STRIPE_PERIOD_FALLBACK_INVOICE]", {
+                subscriptionId,
+                cps,
+                cpe,
+                invoiceId: inv?.id || null,
+                invPeriodStart: ps,
+                invPeriodEnd: pe,
+              });
+            }
+          } else {
+            // fallback to event payload
+            periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
+            periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+          }
+        } catch (e) {
+          console.warn("[STRIPE] failed to derive period dates", {
+            subscriptionId,
+            status,
+            msg: e?.message,
+          });
 
-  // final fallback to payload if anything fails
-  periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
-  periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
-}
+          // final fallback to payload if anything fails
+          periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
+          periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+        }
 
-console.log("[STRIPE_PERIOD_DEBUG]", {
-  subscriptionId,
-  status,
-  isEntitled,
-  periodStart: periodStart ? periodStart.toISOString() : null,
-  periodEnd: periodEnd ? periodEnd.toISOString() : null,
-});
+        console.log("[STRIPE_PERIOD_DEBUG]", {
+          subscriptionId,
+          status,
+          isEntitled,
+          periodStart: periodStart ? periodStart.toISOString() : null,
+          periodEnd: periodEnd ? periodEnd.toISOString() : null,
+        });
 
         await db.updateOwnerBilling(ownerId, {
           plan_key: isEntitled ? mappedPlanKey : "free",

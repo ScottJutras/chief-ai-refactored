@@ -3880,19 +3880,15 @@ async function hasStripeEvent(eventId) {
   return rows.length > 0;
 }
 
-async function insertStripeEvent(eventId) {
-  const id = String(eventId || "").trim();
-  if (!id) throw new Error("insertStripeEvent: missing eventId");
-
+async function insertStripeEvent(eventId, eventType = null) {
   await pool.query(
-    `insert into public.stripe_events (event_id, received_at)
-     values ($1, now())
+    `insert into public.stripe_events (event_id, received_at, event_type)
+     values ($1, now(), $2)
      on conflict (event_id) do nothing`,
-    [id]
+    [String(eventId), eventType ? String(eventType) : null]
   );
-
-  return true;
 }
+
 
 async function getOwnerByDashboardToken(dashboardToken) {
   const t = String(dashboardToken || "").trim();

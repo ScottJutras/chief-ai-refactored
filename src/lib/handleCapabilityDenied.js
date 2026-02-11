@@ -1,5 +1,6 @@
 // src/lib/handleCapabilityDenied.js
-// Central one-time upsell trigger memory (MVP-safe, no auto-detection)
+// One-time upsell trigger memory (ACCOUNT-level)
+// Stores flags on the OWNER row: where user_id = owner_id
 
 const pg = require('../../services/postgres');
 
@@ -13,37 +14,34 @@ function normalizeFlagName(kind) {
 }
 
 async function shouldShowUpgradePromptOnce({ ownerId, kind }) {
-  const owner = String(ownerId || '').trim();
+  const owner = String(ownerId || '').trim(); // THIS is tenant key (1905...)
   const flagName = normalizeFlagName(kind);
 
-  if (!owner || !flagName) {
-    return { shouldShow: false, flagName };
-  }
+  if (!owner || !flagName) return { shouldShow: false, flagName };
 
   try {
-    // Read current flag
+    // Read flag from OWNER row (user_id = owner_id)
     const sel = await pg.query(
       `
       select ${flagName} as shown
-      from public.users
-      where user_id = $1
-      limit 1
+        from public.users
+       where owner_id = $1
+         and user_id = owner_id
+       limit 1
       `,
       [owner]
     );
 
     const shown = !!sel?.rows?.[0]?.shown;
+    if (shown) return { shouldShow: false, flagName };
 
-    if (shown) {
-      return { shouldShow: false, flagName };
-    }
-
-    // Set flag
+    // Set it once
     await pg.query(
       `
       update public.users
          set ${flagName} = true
-       where user_id = $1
+       where owner_id = $1
+         and user_id = owner_id
       `,
       [owner]
     );
@@ -55,6 +53,4 @@ async function shouldShowUpgradePromptOnce({ ownerId, kind }) {
   }
 }
 
-module.exports = {
-  shouldShowUpgradePromptOnce
-};
+module.exports = { shouldShowUpgradePromptOnce };

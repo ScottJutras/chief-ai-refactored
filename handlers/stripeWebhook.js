@@ -81,28 +81,35 @@ async function stripeWebhookHandler(req, res) {
 
         const isEntitled = status === "active" || status === "trialing";
 
-        // ✅ Option B: Backfill period dates from Stripe if the event payload is sparse
-        let periodStart = sub.current_period_start
-          ? new Date(sub.current_period_start * 1000)
-          : null;
-        let periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+       // ✅ Option B (strong): always retrieve period dates for entitled subs
+let periodStart = null;
+let periodEnd = null;
 
-        try {
-          if ((!periodStart || !periodEnd) && subscriptionId) {
-            const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
-            if (!periodStart && fullSub.current_period_start) {
-              periodStart = new Date(fullSub.current_period_start * 1000);
-            }
-            if (!periodEnd && fullSub.current_period_end) {
-              periodEnd = new Date(fullSub.current_period_end * 1000);
-            }
-          }
-        } catch (e) {
-          console.warn("[STRIPE] failed to retrieve subscription for period dates", {
-            subscriptionId,
-            msg: e?.message,
-          });
-        }
+try {
+  if (subscriptionId && (status === "active" || status === "trialing")) {
+    const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
+    periodStart = fullSub.current_period_start
+      ? new Date(fullSub.current_period_start * 1000)
+      : null;
+    periodEnd = fullSub.current_period_end
+      ? new Date(fullSub.current_period_end * 1000)
+      : null;
+  } else {
+    // fall back to what the event provided, if anything
+    periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
+    periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+  }
+} catch (e) {
+  console.warn("[STRIPE] failed to retrieve subscription for period dates", {
+    subscriptionId,
+    status,
+    msg: e?.message,
+  });
+  // fallback to payload
+  periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
+  periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+}
+
 
         // If entitled but unmapped priceId, warn loudly (prevents silent “free” entitlement)
         if (isEntitled && mappedPlanKey === "free" && priceId) {

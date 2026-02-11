@@ -55,88 +55,86 @@ async function stripeWebhookHandler(req, res) {
       }
 
       case "customer.subscription.created":
-case "customer.subscription.updated":
-case "customer.subscription.deleted": {
-  const sub = event.data.object;
+      case "customer.subscription.updated":
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
 
-  const customerId = String(sub.customer || "");
-  const subscriptionId = String(sub.id || "");
-  const status = String(sub.status || "");
-  const cancelAtPeriodEnd = !!sub.cancel_at_period_end;
+        const customerId = String(sub.customer || "");
+        const subscriptionId = String(sub.id || "");
+        const status = String(sub.status || "");
+        const cancelAtPeriodEnd = !!sub.cancel_at_period_end;
 
-  const priceId = sub?.items?.data?.[0]?.price?.id
-    ? String(sub.items.data[0].price.id)
-    : null;
+        const priceId = sub?.items?.data?.[0]?.price?.id
+          ? String(sub.items.data[0].price.id)
+          : null;
 
-  const mappedPlanKey = priceIdToPlanKey(priceId);
+        const mappedPlanKey = priceIdToPlanKey(priceId);
 
-  const ownerId = await db.findOwnerIdByStripeCustomer(customerId);
-  if (!ownerId) {
-    console.warn("[STRIPE] subscription event but no owner found for customer", customerId, {
-      eventType: event.type,
-      subscriptionId,
-    });
-    break;
-  }
+        const ownerId = await db.findOwnerIdByStripeCustomer(customerId);
+        if (!ownerId) {
+          console.warn("[STRIPE] subscription event but no owner found for customer", customerId, {
+            eventType: event.type,
+            subscriptionId,
+          });
+          break;
+        }
 
-  const isEntitled = status === "active" || status === "trialing";
+        const isEntitled = status === "active" || status === "trialing";
 
-  // ✅ Always retrieve authoritative period dates for entitled subscriptions
-  let periodStart = null;
-  let periodEnd = null;
+        // ✅ Always retrieve authoritative period dates for entitled subscriptions
+        let periodStart = null;
+        let periodEnd = null;
 
-  try {
-    if (subscriptionId && isEntitled) {
-      const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
+        try {
+          if (subscriptionId && isEntitled) {
+            const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
 
-      periodStart = fullSub.current_period_start
-        ? new Date(fullSub.current_period_start * 1000)
-        : null;
+            periodStart = fullSub.current_period_start
+              ? new Date(fullSub.current_period_start * 1000)
+              : null;
 
-      periodEnd = fullSub.current_period_end
-        ? new Date(fullSub.current_period_end * 1000)
-        : null;
-    } else {
-      // fallback to event payload
-      periodStart = sub.current_period_start
-        ? new Date(sub.current_period_start * 1000)
-        : null;
+            periodEnd = fullSub.current_period_end
+              ? new Date(fullSub.current_period_end * 1000)
+              : null;
+          } else {
+            // fallback to event payload
+            periodStart = sub.current_period_start
+              ? new Date(sub.current_period_start * 1000)
+              : null;
 
-      periodEnd = sub.current_period_end
-        ? new Date(sub.current_period_end * 1000)
-        : null;
-    }
-  } catch (e) {
-    console.warn("[STRIPE] failed to retrieve subscription for period dates", {
-      subscriptionId,
-      status,
-      msg: e?.message,
-    });
+            periodEnd = sub.current_period_end
+              ? new Date(sub.current_period_end * 1000)
+              : null;
+          }
+        } catch (e) {
+          console.warn("[STRIPE] failed to retrieve subscription for period dates", {
+            subscriptionId,
+            status,
+            msg: e?.message,
+          });
 
-    // fallback to payload if Stripe call fails
-    periodStart = sub.current_period_start
-      ? new Date(sub.current_period_start * 1000)
-      : null;
+          // fallback to payload if Stripe call fails
+          periodStart = sub.current_period_start
+            ? new Date(sub.current_period_start * 1000)
+            : null;
 
-    periodEnd = sub.current_period_end
-      ? new Date(sub.current_period_end * 1000)
-      : null;
-  }
+          periodEnd = sub.current_period_end
+            ? new Date(sub.current_period_end * 1000)
+            : null;
+        }
 
-  await db.updateOwnerBilling(ownerId, {
-    plan_key: isEntitled ? mappedPlanKey : "free",
-    sub_status: status,
-    stripe_customer_id: customerId,
-    stripe_subscription_id: subscriptionId,
-    stripe_price_id: priceId,
-    cancel_at_period_end: cancelAtPeriodEnd,
-    current_period_start: periodStart,
-    current_period_end: periodEnd,
-  });
+        await db.updateOwnerBilling(ownerId, {
+          plan_key: isEntitled ? mappedPlanKey : "free",
+          sub_status: status,
+          stripe_customer_id: customerId,
+          stripe_subscription_id: subscriptionId,
+          stripe_price_id: priceId,
+          cancel_at_period_end: cancelAtPeriodEnd,
+          current_period_start: periodStart,
+          current_period_end: periodEnd,
+        });
 
-  break;
-}
-
+        break;
       }
 
       case "invoice.paid":

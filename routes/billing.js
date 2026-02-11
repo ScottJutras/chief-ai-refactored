@@ -1,18 +1,18 @@
 // routes/billing.js
-const express = require('express');
-const Stripe = require('stripe');
+const express = require("express");
+const Stripe = require("stripe");
 const router = express.Router();
 
-const db = require('../services/postgres');
+const db = require("../services/postgres");
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-const { requireDashboardOwner } = require('../middleware/requireDashboardOwner');
+const { requireDashboardOwner } = require("../middleware/requireDashboardOwner");
 
 // ✅ Billing routes are normal HTTP calls (not Twilio), so use dashboard token auth
 router.use(requireDashboardOwner);
 
 // ✅ Because index.js intentionally has NO global body parsers
-router.use(express.json({ limit: '200kb' }));
+router.use(express.json({ limit: "200kb" }));
 
 const PRICE_BY_PLAN = {
   starter: process.env.STRIPE_PRICE_STARTER,
@@ -22,21 +22,22 @@ const PRICE_BY_PLAN = {
 function requireOwner(req, res) {
   const ownerId = req.ownerId;
   if (!ownerId) {
-    res.status(401).json({ error: 'Missing owner context' });
+    res.status(401).json({ error: "Missing owner context" });
     return null;
   }
   return ownerId;
 }
 
-router.post('/checkout', async (req, res) => {
+router.post("/checkout", async (req, res) => {
   try {
     const ownerId = requireOwner(req, res);
     if (!ownerId) return;
 
     const { planKey } = req.body || {};
-    if (!PRICE_BY_PLAN[planKey]) return res.status(400).json({ error: 'Invalid plan' });
+    if (!PRICE_BY_PLAN[planKey]) return res.status(400).json({ error: "Invalid plan" });
 
     const owner = await db.getOwner(ownerId);
+    if (!owner) return res.status(404).json({ error: "Owner not found" });
 
     let customerId = owner?.stripe_customer_id || null;
 
@@ -59,7 +60,7 @@ router.post('/checkout', async (req, res) => {
     }
 
     const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
+      mode: "subscription",
       customer: customerId,
       line_items: [{ price: PRICE_BY_PLAN[planKey], quantity: 1 }],
       success_url: `${process.env.APP_BASE_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
@@ -69,27 +70,54 @@ router.post('/checkout', async (req, res) => {
 
     return res.json({ url: session.url });
   } catch (e) {
-    console.error('[BILLING_CHECKOUT_ERR]', e);
-    return res.status(500).json({ error: 'checkout_failed' });
+    console.error("[BILLING_CHECKOUT_ERR]", e);
+    return res.status(500).json({ error: "checkout_failed" });
   }
 });
 
+router.get("/status", async (req, res) => {
+  try {
+    const ownerId = requireOwner(req, res);
+    if (!ownerId) return;
 
-router.post('/portal', async (req, res) => {
-  const ownerId = requireOwner(req, res);
-  if (!ownerId) return;
+    const owner = await db.getOwner(ownerId);
+    if (!owner) return res.status(404).json({ error: "Owner not found" });
 
-  const owner = await db.getOwner(ownerId);
-  const customerId = owner?.stripe_customer_id;
+    return res.json({
+      plan_key: owner.plan_key,
+      sub_status: owner.sub_status,
+      cancel_at_period_end: owner.cancel_at_period_end,
+      current_period_start: owner.current_period_start,
+      current_period_end: owner.current_period_end,
+      stripe_customer_id: !!owner.stripe_customer_id,
+    });
+  } catch (e) {
+    console.error("[BILLING_STATUS_ERR]", e);
+    return res.status(500).json({ error: "status_failed" });
+  }
+});
 
-  if (!customerId) return res.status(400).json({ error: 'No Stripe customer on file' });
+router.post("/portal", async (req, res) => {
+  try {
+    const ownerId = requireOwner(req, res);
+    if (!ownerId) return;
 
-  const session = await stripe.billingPortal.sessions.create({
-    customer: customerId,
-    return_url: `${process.env.APP_BASE_URL}/billing`,
-  });
+    const owner = await db.getOwner(ownerId);
+    if (!owner) return res.status(404).json({ error: "Owner not found" });
 
-  return res.json({ url: session.url });
+    const customerId = owner?.stripe_customer_id;
+    if (!customerId) return res.status(400).json({ error: "No Stripe customer on file" });
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${process.env.APP_BASE_URL}/billing`,
+    });
+
+    return res.json({ url: session.url });
+  } catch (e) {
+    console.error("[BILLING_PORTAL_ERR]", e);
+    return res.status(500).json({ error: "portal_failed" });
+  }
 });
 
 module.exports = router;

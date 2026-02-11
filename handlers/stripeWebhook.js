@@ -17,7 +17,7 @@ function priceIdToPlanKey(priceId) {
 
 async function stripeWebhookHandler(req, res) {
   // proves the handler is being hit (no guessing)
-  console.log("[STRIPE_HIT]", Date.now());
+  
 
   const sig = req.headers["stripe-signature"];
   const whsec = process.env.STRIPE_WEBHOOK_SECRET;
@@ -94,6 +94,16 @@ async function stripeWebhookHandler(req, res) {
         }
 
         const isEntitled = status === "active" || status === "trialing";
+        // Optional hardening: warn if an entitled sub has an unknown price id
+if (isEntitled && mappedPlanKey === "free" && priceId) {
+  console.warn("[STRIPE] Unknown price ID for entitled subscription", {
+    priceId,
+    subscriptionId,
+    customerId,
+    status,
+    eventType: event.type,
+  });
+}
 
         // ✅ Period dates (robust): try subscription → fallback invoice line period
         let periodStart = null;
@@ -121,14 +131,6 @@ async function stripeWebhookHandler(req, res) {
               periodStart = ps ? new Date(ps * 1000) : null;
               periodEnd = pe ? new Date(pe * 1000) : null;
 
-              console.log("[STRIPE_PERIOD_FALLBACK_INVOICE]", {
-                subscriptionId,
-                cps,
-                cpe,
-                invoiceId: inv?.id || null,
-                invPeriodStart: ps,
-                invPeriodEnd: pe,
-              });
             }
           } else {
             // fallback to event payload
@@ -146,14 +148,6 @@ async function stripeWebhookHandler(req, res) {
           periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
           periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
         }
-
-        console.log("[STRIPE_PERIOD_DEBUG]", {
-          subscriptionId,
-          status,
-          isEntitled,
-          periodStart: periodStart ? periodStart.toISOString() : null,
-          periodEnd: periodEnd ? periodEnd.toISOString() : null,
-        });
 
         await db.updateOwnerBilling(ownerId, {
           plan_key: isEntitled ? mappedPlanKey : "free",

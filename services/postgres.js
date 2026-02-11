@@ -3942,67 +3942,72 @@ async function findOwnerIdByStripeCustomer(customerId) {
   return r?.rows?.[0]?.user_id || null;
 }
 
-/**
- * updateOwnerBilling(ownerId, patch)
- * - keeps plan truth consistent: plan_key, subscription_tier, paid_tier
- * - patch keys supported:
- *   plan_key, sub_status, stripe_customer_id, stripe_subscription_id, stripe_price_id,
- *   current_period_start, current_period_end, cancel_at_period_end
- */
 async function updateOwnerBilling(ownerId, patch = {}) {
-  const owner = String(ownerId || '').trim();
-  if (!owner) throw new Error('Missing ownerId');
+  const id = String(ownerId || "").trim();
+  if (!id) throw new Error("updateOwnerBilling: missing ownerId");
 
   const p = patch || {};
 
-  // normalize plan if provided
-  const planKeyRaw = p.plan_key != null ? String(p.plan_key).toLowerCase().trim() : null;
-  const planKey =
-    planKeyRaw === 'free' || planKeyRaw === 'starter' || planKeyRaw === 'pro'
-      ? planKeyRaw
-      : (planKeyRaw ? 'free' : null);
+  // ✅ Whitelist of columns we allow billing to mutate
+  const allowed = new Set([
+    "plan_key",
+    "subscription_tier",
+    "paid_tier",
 
-  const fields = [];
-  const vals = [];
-  const push = (col, val) => {
-    vals.push(val);
-    fields.push(`${col}=$${vals.length}`);
-  };
+    "stripe_customer_id",
+    "stripe_subscription_id",
+    "stripe_price_id",
 
-  // Plan truth: keep three columns aligned when plan_key provided
-  if (planKey != null) {
-    push('plan_key', planKey);
-    push('subscription_tier', planKey);
-    push('paid_tier', planKey);
+    "sub_status",
+    "cancel_at_period_end",
+    "current_period_start",
+    "current_period_end",
+  ]);
+
+  const entries = Object.entries(p).filter(([k]) => allowed.has(k));
+  if (entries.length === 0) return null;
+
+  // ✅ Plan truth alignment: whenever plan_key is set, mirror it
+  // (but do not overwrite mirrors if plan_key isn't present)
+  let finalEntries = entries;
+  const hasPlanKey = entries.some(([k]) => k === "plan_key");
+  if (hasPlanKey) {
+    const planKey = entries.find(([k]) => k === "plan_key")[1];
+    finalEntries = finalEntries
+      .filter(([k]) => k !== "subscription_tier" && k !== "paid_tier")
+      .concat([
+        ["subscription_tier", planKey],
+        ["paid_tier", planKey],
+      ]);
   }
 
-  if (p.sub_status != null) push('sub_status', String(p.sub_status));
-  if (p.stripe_customer_id != null) push('stripe_customer_id', p.stripe_customer_id ? String(p.stripe_customer_id) : null);
-  if (p.stripe_subscription_id != null) push('stripe_subscription_id', p.stripe_subscription_id ? String(p.stripe_subscription_id) : null);
-  if (p.stripe_price_id != null) push('stripe_price_id', p.stripe_price_id ? String(p.stripe_price_id) : null);
+  const sets = [];
+  const values = [];
+  let i = 1;
 
-  if (p.current_period_start !== undefined) push('current_period_start', p.current_period_start);
-  if (p.current_period_end !== undefined) push('current_period_end', p.current_period_end);
-  if (p.cancel_at_period_end !== undefined) push('cancel_at_period_end', !!p.cancel_at_period_end);
+  for (const [k, v] of finalEntries) {
+    sets.push(`${k} = $${i++}`);
+    values.push(v === undefined ? null : v);
+  }
 
-  // always update updated_at if column exists (yours does)
-  push('updated_at', new Date());
-
-  if (!fields.length) return await getOwner(owner);
+  values.push(id);
 
   const sql = `
     update public.users
-       set ${fields.join(', ')}
-     where user_id = $${vals.length + 1}
-     returning user_id, plan_key, subscription_tier, paid_tier, sub_status,
-               stripe_customer_id, stripe_subscription_id, stripe_price_id,
-               current_period_start, current_period_end, cancel_at_period_end
+    set ${sets.join(", ")},
+        updated_at = now()
+    where user_id = $${i}
+    returning user_id, plan_key, subscription_tier, paid_tier,
+              stripe_customer_id, stripe_subscription_id, stripe_price_id,
+              sub_status, cancel_at_period_end,
+              current_period_start, current_period_end,
+              updated_at
   `;
-  vals.push(owner);
 
-  const r = await query(sql, vals);
-  return r?.rows?.[0] || null;
+  const { rows } = await pool.query(sql, values);
+  return rows[0] || null;
 }
+
 
 /* -------------------- module exports -------------------- */
 module.exports = {

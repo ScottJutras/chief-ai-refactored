@@ -122,6 +122,13 @@ async function stripeWebhookHandler(req, res) {
             ? new Date(sub.current_period_end * 1000)
             : null;
         }
+console.log("[STRIPE_PERIOD_DEBUG]", {
+  subscriptionId,
+  status,
+  isEntitled,
+  periodStart: periodStart ? periodStart.toISOString() : null,
+  periodEnd: periodEnd ? periodEnd.toISOString() : null,
+});
 
         await db.updateOwnerBilling(ownerId, {
           plan_key: isEntitled ? mappedPlanKey : "free",

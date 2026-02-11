@@ -3,6 +3,55 @@
 
 require("./config/env");
 
+// 🔒 Stripe mode separation guard (fail fast on mixed env)
+(function assertStripeModeConsistency() {
+  const sk = String(process.env.STRIPE_SECRET_KEY || "");
+  const whsec = String(process.env.STRIPE_WEBHOOK_SECRET || "");
+  const priceStarter = String(process.env.STRIPE_PRICE_STARTER || "");
+  const pricePro = String(process.env.STRIPE_PRICE_PRO || "");
+  const appBase = String(process.env.APP_BASE_URL || "");
+
+  const isLiveKey = sk.startsWith("sk_live_");
+  const isTestKey = sk.startsWith("sk_test_");
+  const stripeEnabled = isLiveKey || isTestKey;
+
+  if (!stripeEnabled) return; // Stripe not configured in this env
+
+  // Require prices when Stripe is enabled (prevents partial/misconfigured deploys)
+  if (!priceStarter || !pricePro) {
+    throw new Error(
+      "Stripe enabled but STRIPE_PRICE_STARTER/STRIPE_PRICE_PRO missing in this environment"
+    );
+  }
+
+  // Require webhook secret when Stripe is enabled (webhook route exists)
+  if (!whsec.startsWith("whsec_")) {
+    throw new Error("Stripe enabled but STRIPE_WEBHOOK_SECRET missing/invalid in this environment");
+  }
+
+  // Optional sanity: prevent obviously wrong APP_BASE_URL
+  // (success/cancel redirects use this; keeps checkout from pointing at the wrong host)
+  if (!/^https?:\/\//i.test(appBase)) {
+    throw new Error("APP_BASE_URL must be an absolute URL (e.g., https://app.usechiefos.com)");
+  }
+
+  // Best-effort mismatch detection.
+  // Stripe secrets don't expose mode directly for whsec, so we enforce a manual mode flag if present.
+  // If you set STRIPE_MODE=test|live, we will strictly enforce it.
+  const declaredMode = String(process.env.STRIPE_MODE || "").toLowerCase().trim(); // "test" | "live" | ""
+  if (declaredMode) {
+    if (declaredMode !== "test" && declaredMode !== "live") {
+      throw new Error('STRIPE_MODE must be either "test" or "live" if set');
+    }
+    if (declaredMode === "live" && !isLiveKey) {
+      throw new Error("Stripe mode mismatch: STRIPE_MODE=live but STRIPE_SECRET_KEY is not sk_live_");
+    }
+    if (declaredMode === "test" && !isTestKey) {
+      throw new Error("Stripe mode mismatch: STRIPE_MODE=test but STRIPE_SECRET_KEY is not sk_test_");
+    }
+  }
+})();
+
 const express = require("express");
 const cors = require("cors");
 
@@ -62,25 +111,13 @@ app.get("/billing/cancel", (req, res) => {
  * Stripe requires raw body for signature verification.
  * Do NOT put express.json() globally.
  */
-app.post(
-  "/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  stripeWebhookHandler
-);
+app.post("/stripe/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
 
 // ✅ canonical API route
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  stripeWebhookHandler
-);
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
 
 // ⚠️ optional legacy alias (only keep if Stripe dashboard is still pointed here)
-app.post(
-  "/api/stripe-webhook",
-  express.raw({ type: "application/json" }),
-  stripeWebhookHandler
-);
+app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
 
 /* ---------------- Mount order (NO global body parsers) ---------------- */
 // Webhook first; it does its own tolerant urlencoded/body handling.

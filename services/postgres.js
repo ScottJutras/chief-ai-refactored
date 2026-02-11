@@ -3960,11 +3960,14 @@ async function updateOwnerBilling(ownerId, patch = {}) {
     "current_period_end",
   ]);
 
-  const entries = Object.entries(p).filter(([k]) => allowed.has(k));
+  // ✅ IMPORTANT: drop undefined values entirely (do NOT convert to null)
+  const entries = Object.entries(p)
+    .filter(([k]) => allowed.has(k))
+    .filter(([, v]) => v !== undefined);
+
   if (entries.length === 0) return null;
 
   // ✅ Plan truth alignment: whenever plan_key is set, mirror it
-  // (but do not overwrite mirrors if plan_key isn't present)
   let finalEntries = entries;
   const hasPlanKey = entries.some(([k]) => k === "plan_key");
   if (hasPlanKey) {
@@ -3983,7 +3986,8 @@ async function updateOwnerBilling(ownerId, patch = {}) {
 
   for (const [k, v] of finalEntries) {
     sets.push(`${k} = $${i++}`);
-    values.push(v === undefined ? null : v);
+    // ✅ allow explicit null if caller really wants to clear it
+    values.push(v);
   }
 
   values.push(id);
@@ -4003,6 +4007,7 @@ async function updateOwnerBilling(ownerId, patch = {}) {
   const { rows } = await pool.query(sql, values);
   return rows[0] || null;
 }
+
 
 
 /* -------------------- module exports -------------------- */

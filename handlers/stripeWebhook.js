@@ -16,9 +16,6 @@ function priceIdToPlanKey(priceId) {
 }
 
 async function stripeWebhookHandler(req, res) {
-  // proves the handler is being hit (no guessing)
-  
-
   const sig = req.headers["stripe-signature"];
   const whsec = process.env.STRIPE_WEBHOOK_SECRET;
 
@@ -41,24 +38,24 @@ async function stripeWebhookHandler(req, res) {
   });
 
   try {
-    // ✅ idempotency (schema: public.stripe_events(event_id, received_at, event_type?))
+    // ✅ idempotency (schema: public.stripe_events(event_id, received_at, event_type))
     const seen = await db.hasStripeEvent(event.id);
     if (seen) return res.json({ received: true, deduped: true });
 
-    // IMPORTANT: record event_type so we can debug what’s arriving
+    // Record event_type so we can debug what’s arriving
     await db.insertStripeEvent(event.id, event.type);
 
     switch (event.type) {
       case "checkout.session.completed": {
         const sess = event.data.object;
+
         const ownerId = sess?.metadata?.ownerId ? String(sess.metadata.ownerId) : null;
         const planKeyFromMeta = sess?.metadata?.planKey ? String(sess.metadata.planKey) : null;
 
         if (ownerId && sess?.customer) {
-          const patch = {
-            stripe_customer_id: String(sess.customer),
-            stripe_subscription_id: sess.subscription ? String(sess.subscription) : null,
-          };
+          // ✅ Never null-out subscription id here; only set if present
+          const patch = { stripe_customer_id: String(sess.customer) };
+          if (sess.subscription) patch.stripe_subscription_id = String(sess.subscription);
 
           // Only set plan_key if provided (never null it out)
           if (planKeyFromMeta) patch.plan_key = planKeyFromMeta;
@@ -94,16 +91,17 @@ async function stripeWebhookHandler(req, res) {
         }
 
         const isEntitled = status === "active" || status === "trialing";
+
         // Optional hardening: warn if an entitled sub has an unknown price id
-if (isEntitled && mappedPlanKey === "free" && priceId) {
-  console.warn("[STRIPE] Unknown price ID for entitled subscription", {
-    priceId,
-    subscriptionId,
-    customerId,
-    status,
-    eventType: event.type,
-  });
-}
+        if (isEntitled && mappedPlanKey === "free" && priceId) {
+          console.warn("[STRIPE] Unknown price ID for entitled subscription", {
+            priceId,
+            subscriptionId,
+            customerId,
+            status,
+            eventType: event.type,
+          });
+        }
 
         // ✅ Period dates (robust): try subscription → fallback invoice line period
         let periodStart = null;
@@ -121,7 +119,10 @@ if (isEntitled && mappedPlanKey === "free" && priceId) {
               periodEnd = new Date(cpe * 1000);
             } else {
               // 🔁 Fallback: derive from latest invoice line period
-              const invs = await stripe.invoices.list({ subscription: subscriptionId, limit: 1 });
+              const invs = await stripe.invoices.list({
+                subscription: subscriptionId,
+                limit: 1,
+              });
               const inv = invs?.data?.[0] || null;
 
               const linePeriod = inv?.lines?.data?.[0]?.period || null;
@@ -130,7 +131,6 @@ if (isEntitled && mappedPlanKey === "free" && priceId) {
 
               periodStart = ps ? new Date(ps * 1000) : null;
               periodEnd = pe ? new Date(pe * 1000) : null;
-
             }
           } else {
             // fallback to event payload

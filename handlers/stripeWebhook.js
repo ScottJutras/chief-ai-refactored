@@ -6,7 +6,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 /**
  * Map a Stripe price.id → canonical plan_key.
- * IMPORTANT: This relies on the env vars matching the current Stripe mode (test vs live).
+ * IMPORTANT: Env vars must match the current Stripe mode (test vs live).
  */
 function priceIdToPlanKey(priceId) {
   if (!priceId) return "free";
@@ -29,30 +29,24 @@ async function stripeWebhookHandler(req, res) {
   }
 
   try {
-    // ✅ idempotency (backed by public.stripe_events(event_id, received_at))
+    // ✅ idempotency (schema: public.stripe_events(event_id, received_at))
     const seen = await db.hasStripeEvent(event.id);
     if (seen) return res.json({ received: true, deduped: true });
     await db.insertStripeEvent(event.id);
 
     switch (event.type) {
-      /**
-       * Checkout completion: helpful to ensure customer is linked + subscription id captured.
-       * NOTE: Stripe sometimes includes sess.subscription; sometimes you rely on subscription.created/updated.
-       */
       case "checkout.session.completed": {
         const sess = event.data.object;
         const ownerId = sess?.metadata?.ownerId ? String(sess.metadata.ownerId) : null;
         const planKeyFromMeta = sess?.metadata?.planKey ? String(sess.metadata.planKey) : null;
 
         if (ownerId && sess?.customer) {
-          // Build patch safely (do NOT set plan_key to null)
           const patch = {
             stripe_customer_id: String(sess.customer),
             stripe_subscription_id: sess.subscription ? String(sess.subscription) : null,
           };
 
-          // Optional: set plan_key if you intentionally want checkout meta to set it.
-          // Safer: only set if present (never null it out).
+          // Only set plan_key if provided (never null it out)
           if (planKeyFromMeta) patch.plan_key = planKeyFromMeta;
 
           await db.updateOwnerBilling(ownerId, patch);
@@ -60,9 +54,6 @@ async function stripeWebhookHandler(req, res) {
         break;
       }
 
-      /**
-       * Subscription lifecycle: this is the canonical place to set entitlement + plan_key.
-       */
       case "customer.subscription.created":
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
@@ -79,9 +70,7 @@ async function stripeWebhookHandler(req, res) {
 
         const mappedPlanKey = priceIdToPlanKey(priceId);
 
-        // ownerId is resolved from our DB using the customer id
         const ownerId = await db.findOwnerIdByStripeCustomer(customerId);
-
         if (!ownerId) {
           console.warn("[STRIPE] subscription event but no owner found for customer", customerId, {
             eventType: event.type,
@@ -92,7 +81,30 @@ async function stripeWebhookHandler(req, res) {
 
         const isEntitled = status === "active" || status === "trialing";
 
-        // If entitled but price id is unknown, warn loudly (prevents silent downgrade to free)
+        // ✅ Option B: Backfill period dates from Stripe if the event payload is sparse
+        let periodStart = sub.current_period_start
+          ? new Date(sub.current_period_start * 1000)
+          : null;
+        let periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+
+        try {
+          if ((!periodStart || !periodEnd) && subscriptionId) {
+            const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
+            if (!periodStart && fullSub.current_period_start) {
+              periodStart = new Date(fullSub.current_period_start * 1000);
+            }
+            if (!periodEnd && fullSub.current_period_end) {
+              periodEnd = new Date(fullSub.current_period_end * 1000);
+            }
+          }
+        } catch (e) {
+          console.warn("[STRIPE] failed to retrieve subscription for period dates", {
+            subscriptionId,
+            msg: e?.message,
+          });
+        }
+
+        // If entitled but unmapped priceId, warn loudly (prevents silent “free” entitlement)
         if (isEntitled && mappedPlanKey === "free" && priceId) {
           console.warn("[STRIPE] entitled subscription has unmapped priceId; defaulting plan_key to free", {
             ownerId: String(ownerId),
@@ -112,24 +124,16 @@ async function stripeWebhookHandler(req, res) {
           stripe_subscription_id: subscriptionId,
           stripe_price_id: priceId,
           cancel_at_period_end: cancelAtPeriodEnd,
-          current_period_start: sub.current_period_start
-            ? new Date(sub.current_period_start * 1000)
-            : null,
-          current_period_end: sub.current_period_end
-            ? new Date(sub.current_period_end * 1000)
-            : null,
+          current_period_start: periodStart,
+          current_period_end: periodEnd,
         });
 
         break;
       }
 
-      /**
-       * Invoice events are optional; useful for “paid vs failed” state,
-       * but subscription.updated generally covers entitlement.
-       */
       case "invoice.paid":
       case "invoice.payment_failed": {
-        // No-op for now (keep for future hooks / logging if desired)
+        // Optional: add logging or billing state transitions later
         break;
       }
 

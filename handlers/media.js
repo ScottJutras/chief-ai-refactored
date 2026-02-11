@@ -27,6 +27,8 @@ const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
 const pg = require('../services/postgres');
 const { checkMonthlyQuota } = require('../utils/quota'); // adjust path if needed
+const { shouldShowUpgradePromptOnce } = require('../src/lib/handleCapabilityDenied');
+
 async function resolveCapsForOwner(ownerId) {
   let ownerProfile = null;
   try {
@@ -834,11 +836,19 @@ if (isImage) {
     const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
 
     if (caps && !ocrEnabled) {
-      return {
-        transcript: null,
-        twiml: twiml(`OCR receipts are not enabled on your plan.\n\nUpgrade to Starter or Pro to scan receipts.`)
-      };
-    }
+  try {
+    const r = await shouldShowUpgradePromptOnce({ ownerId: String(ownerId || '').trim(), kind: 'ocr' });
+    console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: String(ownerId || '').trim(), ...r });
+  } catch (e) {
+    console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
+  }
+
+  return {
+    transcript: null,
+    twiml: twiml(`OCR receipts are not enabled on your plan.\n\nUpgrade to Starter or Pro to scan receipts.`)
+  };
+}
+
 
     // Pre-check quota for nicer UX (no spend). Actual consume happens inside extractTextFromImage().
     const q = await checkMonthlyQuota({
@@ -849,11 +859,19 @@ if (isImage) {
     });
 
     if (!q.ok) {
-      return {
-        transcript: null,
-        twiml: twiml(`You’ve hit your monthly OCR limit.\n\nUpgrade to Pro for more capacity.`)
-      };
-    }
+  try {
+    const r = await shouldShowUpgradePromptOnce({ ownerId: String(ownerId || '').trim(), kind: 'ocr' });
+    console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: String(ownerId || '').trim(), ...r });
+  } catch (e) {
+    console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
+  }
+
+  return {
+    transcript: null,
+    twiml: twiml(`You’ve hit your monthly OCR limit.\n\nUpgrade to Pro for more capacity.`)
+  };
+}
+
   } catch (e) {
     console.warn('[MEDIA] OCR precheck failed (fail-open):', e?.message);
   }

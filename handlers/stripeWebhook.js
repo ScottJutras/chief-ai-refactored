@@ -81,47 +81,59 @@ async function stripeWebhookHandler(req, res) {
 
         const isEntitled = status === "active" || status === "trialing";
 
-        // ✅ Always retrieve authoritative period dates for entitled subscriptions
-        let periodStart = null;
-        let periodEnd = null;
+       // ✅ Always retrieve authoritative period dates for entitled subscriptions
+let periodStart = null;
+let periodEnd = null;
 
-        try {
-          if (subscriptionId && isEntitled) {
-            const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
+try {
+  if (subscriptionId && isEntitled) {
+    const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
 
-            periodStart = fullSub.current_period_start
-              ? new Date(fullSub.current_period_start * 1000)
-              : null;
+    const cps = fullSub?.current_period_start ?? null;
+    const cpe = fullSub?.current_period_end ?? null;
 
-            periodEnd = fullSub.current_period_end
-              ? new Date(fullSub.current_period_end * 1000)
-              : null;
-          } else {
-            // fallback to event payload
-            periodStart = sub.current_period_start
-              ? new Date(sub.current_period_start * 1000)
-              : null;
+    if (cps && cpe) {
+      periodStart = new Date(cps * 1000);
+      periodEnd = new Date(cpe * 1000);
+    } else {
+      // 🔁 Fallback: derive from latest invoice line period
+      const invs = await stripe.invoices.list({ subscription: subscriptionId, limit: 1 });
+      const inv = invs?.data?.[0] || null;
 
-            periodEnd = sub.current_period_end
-              ? new Date(sub.current_period_end * 1000)
-              : null;
-          }
-        } catch (e) {
-          console.warn("[STRIPE] failed to retrieve subscription for period dates", {
-            subscriptionId,
-            status,
-            msg: e?.message,
-          });
+      const linePeriod = inv?.lines?.data?.[0]?.period || null;
+      const ps = linePeriod?.start ?? null;
+      const pe = linePeriod?.end ?? null;
 
-          // fallback to payload if Stripe call fails
-          periodStart = sub.current_period_start
-            ? new Date(sub.current_period_start * 1000)
-            : null;
+      periodStart = ps ? new Date(ps * 1000) : null;
+      periodEnd = pe ? new Date(pe * 1000) : null;
 
-          periodEnd = sub.current_period_end
-            ? new Date(sub.current_period_end * 1000)
-            : null;
-        }
+      // TEMP DEBUG (remove once confirmed)
+      console.log("[STRIPE_PERIOD_FALLBACK_INVOICE]", {
+        subscriptionId,
+        cps,
+        cpe,
+        invoiceId: inv?.id || null,
+        invPeriodStart: ps,
+        invPeriodEnd: pe,
+      });
+    }
+  } else {
+    // fallback to event payload
+    periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
+    periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+  }
+} catch (e) {
+  console.warn("[STRIPE] failed to derive period dates", {
+    subscriptionId,
+    status,
+    msg: e?.message,
+  });
+
+  // final fallback to payload if anything fails
+  periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
+  periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
+}
+
 console.log("[STRIPE_PERIOD_DEBUG]", {
   subscriptionId,
   status,

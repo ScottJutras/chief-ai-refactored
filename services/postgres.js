@@ -3894,6 +3894,20 @@ async function insertStripeEvent(eventId) {
   return true;
 }
 
+async function getOwnerByDashboardToken(dashboardToken) {
+  const t = String(dashboardToken || "").trim();
+  if (!t) return null;
+
+  const { rows } = await pool.query(
+    `select user_id
+     from public.users
+     where dashboard_token = $1
+     limit 1`,
+    [t]
+  );
+
+  return rows[0]?.user_id ? String(rows[0].user_id) : null;
+}
 
 async function getOwner(ownerId) {
   const owner = String(ownerId || '').trim();

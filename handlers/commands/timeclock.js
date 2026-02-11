@@ -24,6 +24,8 @@ const { canLogTime } = require("../../src/config/checkCapability");
 const { logCapabilityDenial } = require("../../src/lib/capabilityDenials");
 const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
 const { maybeGetCrewMomentText } = require('../../src/lib/upsellMoments');
+const { checkMonthlyQuota, consumeMonthlyQuota } = require('../../utils/quota');
+const { shouldShowUpgradePromptOnce } = require('../../src/lib/handleCapabilityDenied');
 
 
 
@@ -2303,22 +2305,32 @@ async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
   const s = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
   if (!/^timesheet\b/.test(s)) return false;
 
+  // ----- detect export intent -----
+  // Supported:
+  // - "timesheet week xlsx" / "timesheet xlsx"
+  // - "timesheet week pdf"  / "timesheet pdf"
+  // Default: summary text (no export)
+  const wantsXlsx = /\b(xlsx|excel)\b/.test(s);
+  const wantsPdf = /\b(pdf)\b/.test(s);
+  const wantsExport = wantsXlsx || wantsPdf;
+
+  const exportKind = wantsPdf ? 'export_pdf' : 'export_xlsx';
+
   const range = (() => {
-  if (/^timesheet\s+today\b/.test(s)) return { mode: 'today' };
-  if (/^timesheet\s+last\s+week\b/.test(s)) return { mode: 'last_week' };
-  if (/^timesheet\s+week\b/.test(s)) return { mode: 'week' };
-  if (/^timesheet\s+crew\b/.test(s)) return { mode: 'week', who: 'crew' };
+    if (/^timesheet\s+today\b/.test(s)) return { mode: 'today' };
+    if (/^timesheet\s+last\s+week\b/.test(s)) return { mode: 'last_week' };
+    if (/^timesheet\s+week\b/.test(s)) return { mode: 'week' };
+    if (/^timesheet\s+crew\b/.test(s)) return { mode: 'week', who: 'crew' };
 
-  // ✅ "timesheet me" = actor's timesheet (this week)
-  if (/^timesheet\s+(me|my|mine)\b/.test(s)) return { mode: 'week', who: actorKey };
+    // ✅ "timesheet me" = actor's timesheet (this week)
+    if (/^timesheet\s+(me|my|mine)\b/.test(s)) return { mode: 'week', who: actorKey };
 
-  // timesheet <name>
-  const m = s.match(/^timesheet\s+(.+?)\s*$/);
-  if (m && m[1]) return { mode: 'week', who: m[1].trim() };
+    // timesheet <name>
+    const m = s.match(/^timesheet\s+(.+?)\s*$/);
+    if (m && m[1]) return { mode: 'week', who: m[1].trim() };
 
-  return { mode: 'week' };
-})();
-
+    return { mode: 'week' };
+  })();
 
   const { startUtcIso, endUtcIso, label } = computeRangeUtc(range.mode, tz, new Date());
 
@@ -2339,6 +2351,121 @@ async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
     }
   }
 
+  // ----- planKey (for quotas) -----
+  // Prefer req.userProfile; fall back to owner profile if available
+  let planKey =
+    String(
+      req?.userProfile?.plan_key ||
+        req?.userProfile?.subscription_tier ||
+        req?.userProfile?.paid_tier ||
+        'free'
+    )
+      .toLowerCase()
+      .trim() || 'free';
+
+  try {
+    if ((planKey === 'free' || !planKey) && typeof pg.getOwnerProfile === 'function') {
+      const op = await pg.getOwnerProfile(owner_id);
+      const p2 = String(op?.plan_key || op?.subscription_tier || op?.paid_tier || '').toLowerCase().trim();
+      if (p2) planKey = p2;
+    }
+  } catch {}
+
+  // ----- EXPORT PATH -----
+  if (wantsExport) {
+    const canXlsx = typeof pg.exportTimesheetXlsx === 'function';
+    const canPdf = typeof pg.exportTimesheetPdf === 'function';
+
+    if (wantsXlsx && !canXlsx) {
+      return twiml(res, `⚠️ Timesheet XLSX export isn’t available in this build yet.`);
+    }
+    if (wantsPdf && !canPdf) {
+      return twiml(res, `⚠️ Timesheet PDF export isn’t available in this build yet.`);
+    }
+
+    // ✅ Quota precheck with reason (NOT_INCLUDED vs OVER_QUOTA)
+    let q;
+    try {
+      q = await checkMonthlyQuota({
+        ownerId: owner_id,
+        planKey,
+        kind: exportKind,
+        units: 1
+      });
+    } catch (e) {
+      return twiml(res, `⚠️ Export is temporarily unavailable. Please try again.`);
+    }
+
+    if (!q?.ok) {
+      // One-time upsell flag (account-level)
+      let show = false;
+      try {
+        const r = await shouldShowUpgradePromptOnce({ ownerId: owner_id, kind: exportKind });
+        show = !!r?.shouldShow;
+      } catch {}
+
+      // Distinct copy
+      if (q?.reason === 'NOT_INCLUDED') {
+        const base =
+          `Exports aren’t included on your plan.\n\n` +
+          `Starter unlocks timesheet exports (Excel/PDF).\n` +
+          `You can still view the summary here with: "timesheet week".`;
+
+        return twiml(res, show ? `${base}\n\nUpgrade when it makes sense.` : base);
+      }
+
+      // OVER_QUOTA (paid plan)
+      const base =
+        `You’ve used your monthly export allowance.\n\n` +
+        `You can:\n` +
+        `• Wait until your limit resets next month\n` +
+        `• Upgrade for higher capacity\n` +
+        `• View the summary instead: "timesheet week"`;
+
+      return twiml(res, show ? `${base}\n\nNothing is lost — exports just pause until reset or upgrade.` : base);
+    }
+
+    // ✅ Consume BEFORE generating export (server cost surface)
+    try {
+      await consumeMonthlyQuota({ ownerId: owner_id, kind: exportKind, units: 1 });
+    } catch (e) {
+      return twiml(res, `⚠️ Export is temporarily unavailable. Please try again.`);
+    }
+
+    // Generate export (returns { url, id, filename } in your postgres.js)
+    try {
+      const opts = {
+        ownerId: owner_id,
+        startUtcIso,
+        endUtcIso,
+        tz,
+        filterUserIds // pass through; postgres.js can ignore if it doesn't support
+      };
+
+      const out = wantsPdf ? await pg.exportTimesheetPdf(opts) : await pg.exportTimesheetXlsx(opts);
+      const url = String(out?.url || '').trim();
+
+      if (!url) return twiml(res, `⚠️ Export failed to generate a link. Please try again.`);
+
+      const typeLabel = wantsPdf ? 'PDF' : 'Excel (XLSX)';
+      const whoLabel =
+        filterUserIds?.length && filterUserIds[0] === 'crew'
+          ? 'Crew'
+          : (filterUserIds?.length ? 'Selected worker(s)' : 'All');
+
+      return twiml(
+        res,
+        `✅ Timesheet ${typeLabel} ready — ${label}\n` +
+          `Scope: ${whoLabel}\n\n` +
+          `${url}\n\n` +
+          `Tip: "timesheet week" shows the summary in chat.`
+      );
+    } catch (e) {
+      return twiml(res, `⚠️ Export failed. Please try again, or use: "timesheet week".`);
+    }
+  }
+
+  // ----- SUMMARY PATH (existing behavior) -----
   const params = [owner_id, startUtcIso, endUtcIso];
   let sql = `
     SELECT user_id,
@@ -2364,7 +2491,12 @@ async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
 
   const { rows } = await pg.query(sql, params);
 
-  if (!rows?.length) return twiml(res, `No shifts found for ${label}.`);
+  if (!rows?.length) {
+    return twiml(
+      res,
+      `No shifts found for ${label}.\n\nTry:\n- timesheet week\n- timesheet week xlsx\n- timesheet week pdf`
+    );
+  }
 
   const byUser = new Map();
   for (const r of rows) {
@@ -2386,10 +2518,12 @@ async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
   }
 
   lines.push('');
-  lines.push(`Try: "timesheet today" | "timesheet week" | "timesheet Crew"`);
+  lines.push(`Exports: "timesheet week xlsx" | "timesheet week pdf"`);
+  lines.push(`Summary: "timesheet today" | "timesheet week" | "timesheet Crew"`);
 
   return twiml(res, lines.join('\n'));
 }
+
 
 // ✅ Export without clobbering
 module.exports = {

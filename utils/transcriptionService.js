@@ -165,7 +165,8 @@ async function gateSttOrReturnNull(opts = {}) {
 
   const u = Number.isFinite(units) && units > 0 ? units : 1;
   const q = await checkMonthlyQuota({ ownerId, planKey, kind: 'stt', units: u });
-  if (!q.ok) return { ok: false };
+if (!q.ok) return { ok: false, reason: q.reason, limit: q.limit, used: q.used, planKey: q.planKey };
+
 
   // Consume BEFORE paid call
   await consumeMonthlyQuota({ ownerId, kind: 'stt', units: u });

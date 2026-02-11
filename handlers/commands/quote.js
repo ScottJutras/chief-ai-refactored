@@ -74,16 +74,50 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
 
   const planKey = resolvePlanKey(userProfile);
 
-  // ✅ Gate + consume BEFORE PDF generation (server cost surface)
+    // ✅ Gate + consume BEFORE PDF generation (server cost surface)
   try {
     const q = await checkMonthlyQuota({ ownerId: owner_id, planKey, kind: 'export_pdf', units: 1 });
+
     if (!q.ok) {
-      return `You’ve hit your monthly PDF limit.\n\nUpgrade to Pro for more exports.`;
+      // ✅ One-time upsell flag (export)
+      try {
+        const r = await shouldShowUpgradePromptOnce({ ownerId: owner_id, kind: 'export_pdf' });
+        console.info('[UPSELL_FLAG]', { kind: 'export_pdf', ownerId: owner_id, ...r });
+      } catch (e) {
+        console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
+      }
+
+      const reason = String(q.reason || '').toUpperCase();
+
+      // OVER_QUOTA (paid user) vs NOT_INCLUDED (free)
+      if (reason === 'OVER_QUOTA') {
+        const proNudge =
+          String(planKey || '').toLowerCase() === 'starter'
+            ? `\n\nYou’re on Starter. Pro includes higher monthly export capacity — upgrade only if your volume justifies it.`
+            : '';
+
+        return (
+          `You’ve used your monthly PDF export allowance.\n\n` +
+          `You can:\n` +
+          `• Wait until your limit resets next month\n` +
+          `• Upgrade for higher capacity\n\n` +
+          `Nothing is lost — your quote is still saved.` +
+          proNudge
+        );
+      }
+
+      return (
+        `PDF export isn’t included on your plan.\n\n` +
+        `Starter unlocks PDF/Excel exports so you can hand a clean file to your accountant or customer.\n\n` +
+        `Upgrade when it makes sense.`
+      );
     }
+
     await consumeMonthlyQuota({ ownerId: owner_id, kind: 'export_pdf', units: 1 });
   } catch (e) {
     return `PDF export is temporarily unavailable. Please try again.`;
   }
+
 
   // Generate PDF buffer
   const pdfBuffer = await generateQuotePDFBuffer(quoteData);

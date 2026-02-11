@@ -629,6 +629,7 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
     }
 
     const planKey = resolvePlanKey(userProfile, ownerProfile);
+    const ownerIdKey = String(ownerId || '').trim(); // keep UUID or digits intact
 
     const mediaSid = getTwilioMediaSid(mediaUrl);
     const stableMediaMsgId =
@@ -673,30 +674,104 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       media_asset_id: null
     };
 
-   // AUDIO
+ // AUDIO
 if (isSupportedAudio) {
   if (typeof transcribeAudio !== 'function') {
     return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
   }
 
-  // Optional: plan enable check (capabilities), but DO NOT use gateMonthly anymore
+  // ✅ Normalize once (align with IMAGE)
+  const ownerKey = String(ownerIdKey || ownerId || '').trim(); // prefer ownerIdKey if you created it
+  const planLc = String(planKey || 'free').toLowerCase().trim() || 'free';
+
+  // 0) Capability gate (plan feature enable)
   try {
-    const caps = await resolveCapsForOwner(ownerId);
+    const caps = await resolveCapsForOwner(ownerKey);
     const voiceEnabled = !!caps?.capture?.voice?.enabled;
+
     if (caps && !voiceEnabled) {
-      return { transcript: null, twiml: twiml(`Voice is not enabled on your plan.\n\nUpgrade to Starter or Pro to use voice notes.`) };
+      // upsell flag (once)
+      try {
+        const r = await shouldShowUpgradePromptOnce({ ownerId: ownerKey, kind: 'stt' });
+        console.info('[UPSELL_FLAG]', { kind: 'stt', ownerId: ownerKey, ...r });
+      } catch (e) {
+        console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
+      }
+
+      return {
+        transcript: null,
+        twiml: twiml(
+          `Voice notes aren’t included on your plan.\n\n` +
+          `Starter unlocks voice capture — send a voice note and I’ll transcribe it automatically.\n\n` +
+          `You can keep logging manually, or upgrade when it makes sense.`
+        )
+      };
     }
   } catch (e) {
     console.warn('[MEDIA] voice plan check failed (fail-open):', e?.message);
   }
 
+  // 1) ✅ STT quota precheck (prevents downloading audio if blocked)
+  try {
+    const q = await checkMonthlyQuota({
+      ownerId: ownerKey,
+      planKey: planLc,
+      kind: 'stt',
+      units: 1
+    });
+
+    if (!q.ok) {
+      // upsell flag (once)
+      try {
+        const r = await shouldShowUpgradePromptOnce({ ownerId: ownerKey, kind: 'stt' });
+        console.info('[UPSELL_FLAG]', { kind: 'stt', ownerId: ownerKey, ...r });
+      } catch (e) {
+        console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
+      }
+
+      const reason = String(q.reason || '').toUpperCase();
+
+      if (reason === 'OVER_QUOTA') {
+        const proNudge =
+          planLc === 'starter'
+            ? `\n\nYou’re on Starter. Pro includes higher monthly voice capacity — upgrade only if your volume justifies it.`
+            : '';
+
+        return {
+          transcript: null,
+          twiml: twiml(
+            `You’ve used your monthly voice transcription allowance.\n\n` +
+            `You can:\n` +
+            `• Wait until your limit resets next month\n` +
+            `• Upgrade for higher capacity\n` +
+            `• Type it right now\n\n` +
+            `Nothing is lost — just type the amount/vendor or “clock in”.` +
+            proNudge
+          )
+        };
+      }
+
+      // NOT_INCLUDED (or unknown) → treat like not included
+      return {
+        transcript: null,
+        twiml: twiml(
+          `Voice notes aren’t included on your plan.\n\n` +
+          `Starter unlocks voice capture — send a voice note and I’ll transcribe it automatically.\n\n` +
+          `You can keep logging manually, or upgrade when it makes sense.`
+        )
+      };
+    }
+  } catch (e) {
+    console.warn('[MEDIA] STT precheck failed (fail-open):', e?.message);
+  }
+
+  // 2) Past this point, voice is allowed → do fetch + transcribe
   const quotaOpts = {
-    ownerId: String(ownerId || '').trim(), // keep UUID intact
-    planKey: String(planKey || 'free').toLowerCase().trim() || 'free',
+    ownerId: ownerKey,
+    planKey: planLc,
     units: 1
   };
 
-  // ✅ ONLY NOW do the fetch + transcribe work
   let transcript = '';
   let confidence = null;
 
@@ -753,73 +828,7 @@ if (isSupportedAudio) {
 
   transcript = normalizeHumanText(transcript);
   extractedText = transcript;
-
-  try {
-    mediaAssetId = await upsertMediaAsset({
-      ownerId,
-      from,
-      stableMediaMsgId,
-      mediaUrl,
-      contentType: normType,
-      sizeBytes: null,
-      jobId: activeJobId,
-      jobNo: activeJobNo,
-      jobName: activeJobName,
-      ocrText: transcript,
-      ocrFields: null
-    });
-  } catch (e) {
-    console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
-  }
-
-  // ✅ HARDEN: persist pending media meta for later expense/revenue YES (canonical key)
-  try {
-    const pending = await getPendingTransactionState(userKey);
-
-    await mergePendingTransactionState(userKey, {
-      ...(pending || {}),
-      pendingMediaMeta: {
-        url: mediaUrl || null,
-        type: normType || null,
-        source_msg_id: stableMediaMsgId || null,
-        media_asset_id: mediaAssetId || null,
-        transcript: transcript ? truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS) : null,
-        confidence: Number.isFinite(Number(confidence)) ? Number(confidence) : null
-      },
-      pendingMedia: { url: mediaUrl || null, type: normType || null },
-      mediaSourceMsgId: stableMediaMsgId || null
-    });
-
-    console.info('[PENDING_MEDIA_META_SAVED]', {
-      userKey,
-      media_asset_id: mediaAssetId || null,
-      source_msg_id: stableMediaMsgId || null
-    });
-  } catch (e) {
-    console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
-  }
-
-  mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
-  mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
-  mediaMeta.media_asset_id = mediaAssetId;
-
-  try {
-    await attachPendingMediaMeta(userKey, mediaMeta);
-  } catch {}
-
-  const tc = inferTimeclockIntentFromText(transcript);
-  if (!tc) {
-    const fin = financeIntentFromText(transcript);
-    if (fin.kind === 'expense' || fin.kind === 'revenue') {
-      await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
-    }
-    return { transcript, twiml: null };
-  }
-
-  // timeclock: fall through to router with transcript (router may call timeclock)
-  return { transcript, twiml: null };
 }
-
 
 
 
@@ -832,46 +841,78 @@ if (isImage) {
   // ✅ Gate — OCR plan enable + monthly quota (NEW SYSTEM ONLY)
   // -------------------------------
   try {
-    const caps = await resolveCapsForOwner(ownerId);
+    const caps = await resolveCapsForOwner(ownerIdKey);
     const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
 
+    // 1) NOT_INCLUDED (plan doesn't include OCR)
     if (caps && !ocrEnabled) {
-  try {
-    const r = await shouldShowUpgradePromptOnce({ ownerId: String(ownerId || '').trim(), kind: 'ocr' });
-    console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: String(ownerId || '').trim(), ...r });
-  } catch (e) {
-    console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
-  }
+      try {
+        const r = await shouldShowUpgradePromptOnce({ ownerId: ownerIdKey, kind: 'ocr' });
+        console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: ownerIdKey, ...r });
+      } catch (e) {
+        console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
+      }
 
-  return {
-    transcript: null,
-    twiml: twiml(`OCR receipts are not enabled on your plan.\n\nUpgrade to Starter or Pro to scan receipts.`)
-  };
-}
+      return {
+        transcript: null,
+        twiml: twiml(
+          `I can store this receipt, but automatic receipt reading isn’t included on the Free plan.\n\n` +
+          `Starter unlocks OCR — send a photo and I’ll extract the vendor, amount, and date automatically.\n\n` +
+          `You can keep logging manually, or upgrade when it makes sense.`
+        )
+      };
+    }
 
-
-    // Pre-check quota for nicer UX (no spend). Actual consume happens inside extractTextFromImage().
+    // 2) Pre-check quota for nicer UX (no spend).
+    // Actual consume happens inside extractTextFromImage().
     const q = await checkMonthlyQuota({
-      ownerId: String(ownerId),
+      ownerId: ownerIdKey,
       planKey,
       kind: 'ocr',
       units: 1
     });
 
     if (!q.ok) {
-  try {
-    const r = await shouldShowUpgradePromptOnce({ ownerId: String(ownerId || '').trim(), kind: 'ocr' });
-    console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: String(ownerId || '').trim(), ...r });
-  } catch (e) {
-    console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
-  }
+      try {
+        const r = await shouldShowUpgradePromptOnce({ ownerId: ownerIdKey, kind: 'ocr' });
+        console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: ownerIdKey, ...r });
+      } catch (e) {
+        console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
+      }
 
-  return {
-    transcript: null,
-    twiml: twiml(`You’ve hit your monthly OCR limit.\n\nUpgrade to Pro for more capacity.`)
-  };
-}
+      const reason = String(q.reason || '').toUpperCase();
+      const planLc = String(planKey || 'free').toLowerCase().trim() || 'free';
 
+      // OVER_QUOTA: paid plan ran out of monthly OCR
+      if (reason === 'OVER_QUOTA') {
+        const proNudge = planLc === 'starter'
+          ? `\n\nYou’re on Starter. Pro includes higher monthly OCR capacity — upgrade only if your volume justifies it.`
+          : '';
+
+        return {
+          transcript: null,
+          twiml: twiml(
+            `You’ve used your monthly OCR allowance.\n\n` +
+            `You can:\n` +
+            `• Wait until your limit resets next month\n` +
+            `• Upgrade for higher capacity\n` +
+            `• Log this receipt manually right now\n\n` +
+            `Nothing is lost — just tell me the amount and vendor if you’d like to continue.` +
+            proNudge
+          )
+        };
+      }
+
+      // NOT_INCLUDED (or unknown): treat as not-included safely
+      return {
+        transcript: null,
+        twiml: twiml(
+          `I can store this receipt, but automatic receipt reading isn’t included on the Free plan.\n\n` +
+          `Starter unlocks OCR — send a photo and I’ll extract the vendor, amount, and date automatically.\n\n` +
+          `You can keep logging manually, or upgrade when it makes sense.`
+        )
+      };
+    }
   } catch (e) {
     console.warn('[MEDIA] OCR precheck failed (fail-open):', e?.message);
   }
@@ -880,7 +921,7 @@ if (isImage) {
   try {
     const out = await extractTextFromImage(mediaUrl, {
       mediaType,
-      ownerId: String(ownerId),
+      ownerId: ownerIdKey,
       planKey
     });
 
@@ -895,7 +936,7 @@ if (isImage) {
   // 2) Always upsert media asset row (even if OCR empty)
   try {
     mediaAssetId = await upsertMediaAsset({
-      ownerId,
+      ownerId: ownerIdKey,
       from,
       stableMediaMsgId,
       mediaUrl,
@@ -967,6 +1008,7 @@ if (isImage) {
 
   return { transcript: extractedText, twiml: null };
 }
+
 
 
 

@@ -4008,6 +4008,51 @@ async function updateOwnerBilling(ownerId, patch = {}) {
   return rows[0] || null;
 }
 
+// ---- Usage / Quota (MVP) ---------------------------------------------
+
+function monthKeyFromDate(d = new Date()) {
+  const dt = (d instanceof Date) ? d : new Date(d);
+  const y = dt.getUTCFullYear();
+  const m = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  return `${y}-${m}`; // e.g. "2026-02"
+}
+
+async function getMonthlyUsage({ ownerId, kind, monthKey }) {
+  if (!ownerId) throw new Error('getMonthlyUsage: missing ownerId');
+  if (!kind) throw new Error('getMonthlyUsage: missing kind');
+  const mk = monthKey || monthKeyFromDate();
+
+  const sql = `
+    select units
+    from public.usage_monthly_v2
+    where owner_id = $1 and month_key = $2 and kind = $3
+    limit 1
+  `;
+  const { rows } = await pool.query(sql, [ownerId, mk, kind]);
+  return rows[0]?.units ? Number(rows[0].units) : 0;
+}
+
+// amount is the number of units to add (1 receipt, N seconds, 1 export)
+async function incrementMonthlyUsage({ ownerId, kind, monthKey, amount = 1 }) {
+  if (!ownerId) throw new Error('incrementMonthlyUsage: missing ownerId');
+  if (!kind) throw new Error('incrementMonthlyUsage: missing kind');
+  const mk = monthKey || monthKeyFromDate();
+  const add = Number(amount || 0);
+  if (!Number.isFinite(add) || add <= 0) return 0;
+
+  const sql = `
+    insert into public.usage_monthly_v2 (owner_id, month_key, kind, units)
+    values ($1, $2, $3, $4)
+    on conflict (owner_id, month_key, kind)
+do update set
+  units = public.usage_monthly_v2.units + excluded.units,
+      updated_at = now()
+    returning units
+  `;
+  const { rows } = await pool.query(sql, [ownerId, mk, kind, add]);
+  return rows[0]?.units ? Number(rows[0].units) : 0;
+}
+
 
 
 /* -------------------- module exports -------------------- */
@@ -4124,6 +4169,9 @@ module.exports = {
   findOwnerIdByStripeCustomer,
   updateOwnerBilling,
   getOwnerByDashboardToken,
+  getMonthlyUsage,
+  incrementMonthlyUsage,
+
 
   // internal helpers occasionally useful
   resolveJobRow,

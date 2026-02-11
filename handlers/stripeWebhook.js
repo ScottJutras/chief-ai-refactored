@@ -28,15 +28,6 @@ async function stripeWebhookHandler(req, res) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  // ✅ event logging MUST happen after constructEvent
-  console.log("[STRIPE_EVT]", {
-    type: event?.type || null,
-    id: event?.id || null,
-    obj: event?.data?.object?.object || null,
-    subId: event?.data?.object?.id || null,
-    customer: event?.data?.object?.customer || null,
-  });
-
   try {
     // ✅ idempotency (schema: public.stripe_events(event_id, received_at, event_type))
     const seen = await db.hasStripeEvent(event.id);

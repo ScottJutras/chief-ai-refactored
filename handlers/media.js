@@ -26,6 +26,7 @@ const { extractTextFromImage } = require('../utils/visionService'); // now Docum
 const transcriptionMod = require('../utils/transcriptionService');
 const { handleTimeclock } = require('./commands/timeclock');
 const pg = require('../services/postgres');
+const { checkMonthlyQuota } = require('../utils/quota'); // adjust path if needed
 async function resolveCapsForOwner(ownerId) {
   let ownerProfile = null;
   try {
@@ -56,23 +57,6 @@ async function resolveCapsForOwner(ownerId) {
   return null;
 }
 
-async function gateMonthly({ ownerId, tz, field, capMonthly, incrementBy }) {
-  // returns { allowed: boolean, used:number, cap:number|null }
-  try {
-    const ym = pg.ymInTZ(tz);
-    const usage = await pg.getUsageMonthly(String(ownerId), ym);
-    const used = Number(usage?.[field] || 0);
-
-    const q = pg.checkMonthlyQuota(capMonthly, used);
-    if (!q.allowed) return { allowed: false, used, cap: capMonthly ?? null };
-
-    await pg.incrementUsageMonthly(String(ownerId), ym, field, incrementBy);
-    return { allowed: true, used, cap: capMonthly ?? null };
-  } catch (e) {
-    console.warn('[MEDIA] quota gate failed (fail-open):', e?.message);
-    return { allowed: true, used: 0, cap: capMonthly ?? null };
-  }
-}
 
 function getDbQuery(pg) {
   return (
@@ -147,7 +131,19 @@ function canonicalUserKey(from) {
 function getUserTz(userProfile) {
   return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 }
-
+function resolvePlanKey(userProfile, ownerProfile) {
+  return String(
+    ownerProfile?.plan_key ||
+      ownerProfile?.paid_tier ||
+      ownerProfile?.subscription_tier ||
+      userProfile?.plan_key ||
+      userProfile?.paid_tier ||
+      userProfile?.subscription_tier ||
+      'free'
+  )
+    .toLowerCase()
+    .trim() || 'free';
+}
 async function upsertMediaAsset({
   ownerId,
   from,
@@ -620,6 +616,18 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       };
     }
 
+    // ✅ Fetch ownerProfile ONCE + resolve planKey ONCE (used by BOTH image + audio)
+    let ownerProfile = null;
+    try {
+      if (typeof pg.getOwnerProfile === 'function') {
+        ownerProfile = await pg.getOwnerProfile(String(ownerId).trim());
+      }
+    } catch (e) {
+      console.warn('[MEDIA] getOwnerProfile failed (fail-open):', e?.message);
+    }
+
+    const planKey = resolvePlanKey(userProfile, ownerProfile);
+
     const mediaSid = getTwilioMediaSid(mediaUrl);
     const stableMediaMsgId =
       (mediaSid ? `${userKey}:${mediaSid}` : null) ||
@@ -663,45 +671,28 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       media_asset_id: null
     };
 
-    // AUDIO
+   // AUDIO
 if (isSupportedAudio) {
   if (typeof transcribeAudio !== 'function') {
     return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
   }
 
-  // ---------------------------------------------
-  // ✅ Gate #4b — Voice minutes quota (charge only on SUCCESS)
-  // ---------------------------------------------
-  let voiceGate = null;
-  let voiceCap = 0;
-  let caps = null;
-
+  // Optional: plan enable check (capabilities), but DO NOT use gateMonthly anymore
   try {
-    const tz = getUserTz(userProfile);
-    caps = await resolveCapsForOwner(ownerId);
-
+    const caps = await resolveCapsForOwner(ownerId);
     const voiceEnabled = !!caps?.capture?.voice?.enabled;
-    voiceCap = caps?.capture?.voice?.monthly_minutes ?? 0;
-
     if (caps && !voiceEnabled) {
       return { transcript: null, twiml: twiml(`Voice is not enabled on your plan.\n\nUpgrade to Starter or Pro to use voice notes.`) };
     }
-
-    // ✅ pre-check only (NO increment yet)
-    voiceGate = await gateMonthly({
-      ownerId,
-      tz,
-      field: 'voice_minutes',
-      capMonthly: voiceCap,
-      incrementBy: 0
-    });
-
-    if (caps && voiceGate && !voiceGate.allowed) {
-      return { transcript: null, twiml: twiml(`You’ve hit your monthly Voice limit (${voiceGate.used}/${voiceCap} minutes).\n\nUpgrade to Pro for more capacity.`) };
-    }
   } catch (e) {
-    console.warn('[MEDIA] voice precheck failed (fail-open):', e?.message);
+    console.warn('[MEDIA] voice plan check failed (fail-open):', e?.message);
   }
+
+  const quotaOpts = {
+    ownerId: String(ownerId || '').trim(), // keep UUID intact
+    planKey: String(planKey || 'free').toLowerCase().trim() || 'free',
+    units: 1
+  };
 
   // ✅ ONLY NOW do the fetch + transcribe work
   let transcript = '';
@@ -723,7 +714,11 @@ if (isSupportedAudio) {
   console.info('[MEDIA_STT_START]', { engine: 'both', normType });
 
   try {
-    const r1 = await withTimeout(transcribeAudio(audioBuf, normType, 'both'), 11000, 'stt');
+    const r1 = await withTimeout(
+      transcribeAudio(audioBuf, normType, 'both', quotaOpts),
+      11000,
+      'stt'
+    );
     const n1 = normalizeTranscriptionResult(r1);
     transcript = n1.transcript;
     confidence = n1.confidence;
@@ -733,10 +728,14 @@ if (isSupportedAudio) {
     return { transcript: null, twiml: twiml('⚠️ Voice took too long to transcribe. Try again, or type: "clock in".') };
   }
 
-  // Fallback container type tweak
+  // Fallback container type tweak (ALSO timeout protected)
   if (!transcript && normType === 'audio/ogg') {
     try {
-      const r2 = await transcribeAudio(audioBuf, 'audio/webm', 'both');
+      const r2 = await withTimeout(
+        transcribeAudio(audioBuf, 'audio/webm', 'both', quotaOpts),
+        11000,
+        'stt_fallback'
+      );
       const n2 = normalizeTranscriptionResult(r2);
       transcript = n2.transcript;
       confidence = confidence ?? n2.confidence;
@@ -750,97 +749,77 @@ if (isSupportedAudio) {
     return { transcript: null, twiml: twiml(`⚠️ I couldn’t understand the audio. Try again or type it.`) };
   }
 
-  // ✅ charge only on success (default 1 minute per note until you add duration)
-  try {
-    if (caps && voiceGate?.allowed) {
-      const tz = getUserTz(userProfile);
-      await gateMonthly({
-        ownerId,
-        tz,
-        field: 'voice_minutes',
-        capMonthly: voiceCap,      // keep real cap
-        incrementBy: 1
-      });
-    }
-  } catch (e) {
-    console.warn('[MEDIA] voice increment failed (ignored):', e?.message);
-  }
-
   transcript = normalizeHumanText(transcript);
   extractedText = transcript;
 
-      try {
-        mediaAssetId = await upsertMediaAsset({
-          ownerId,
-          from,
-          stableMediaMsgId,
-          mediaUrl,
-          contentType: normType,
-          sizeBytes: null,
-          jobId: activeJobId,
-          jobNo: activeJobNo,
-          jobName: activeJobName,
-          ocrText: transcript,
-          ocrFields: null
-        });
-      } catch (e) {
-        console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
-      }
+  try {
+    mediaAssetId = await upsertMediaAsset({
+      ownerId,
+      from,
+      stableMediaMsgId,
+      mediaUrl,
+      contentType: normType,
+      sizeBytes: null,
+      jobId: activeJobId,
+      jobNo: activeJobNo,
+      jobName: activeJobName,
+      ocrText: transcript,
+      ocrFields: null
+    });
+  } catch (e) {
+    console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
+  }
 
-      // ✅ HARDEN: persist pending media meta for later expense/revenue YES (canonical key)
-      try {
-        const pending = await getPendingTransactionState(userKey);
+  // ✅ HARDEN: persist pending media meta for later expense/revenue YES (canonical key)
+  try {
+    const pending = await getPendingTransactionState(userKey);
 
-        await mergePendingTransactionState(userKey, {
-          ...(pending || {}),
-          pendingMediaMeta: {
-            url: mediaUrl || null,
-            type: normType || null,
-            source_msg_id: stableMediaMsgId || null,
-            media_asset_id: mediaAssetId || null,
-            transcript: transcript ? truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS) : null,
-            confidence: Number.isFinite(Number(confidence)) ? Number(confidence) : null
-          },
-          pendingMedia: { url: mediaUrl || null, type: normType || null },
-          mediaSourceMsgId: stableMediaMsgId || null
-        });
+    await mergePendingTransactionState(userKey, {
+      ...(pending || {}),
+      pendingMediaMeta: {
+        url: mediaUrl || null,
+        type: normType || null,
+        source_msg_id: stableMediaMsgId || null,
+        media_asset_id: mediaAssetId || null,
+        transcript: transcript ? truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS) : null,
+        confidence: Number.isFinite(Number(confidence)) ? Number(confidence) : null
+      },
+      pendingMedia: { url: mediaUrl || null, type: normType || null },
+      mediaSourceMsgId: stableMediaMsgId || null
+    });
 
-        console.info('[PENDING_MEDIA_META_SAVED]', {
-          userKey,
-          media_asset_id: mediaAssetId || null,
-          source_msg_id: stableMediaMsgId || null
-        });
+    console.info('[PENDING_MEDIA_META_SAVED]', {
+      userKey,
+      media_asset_id: mediaAssetId || null,
+      source_msg_id: stableMediaMsgId || null
+    });
+  } catch (e) {
+    console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
+  }
 
-        try {
-          const chk = await getPendingTransactionState(userKey);
-          console.info('[PENDING_MEDIA_META_CHECK]', {
-            userKey,
-            hasPending: !!chk,
-            media_asset_id: chk?.pendingMediaMeta?.media_asset_id || null,
-            source_msg_id: chk?.pendingMediaMeta?.source_msg_id || null
-          });
-        } catch {}
-      } catch (e) {
-        console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
-      }
+  mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
+  mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
+  mediaMeta.media_asset_id = mediaAssetId;
 
-      mediaMeta.transcript = truncateText(transcript, MAX_MEDIA_TRANSCRIPT_CHARS);
-      mediaMeta.confidence = Number.isFinite(Number(confidence)) ? Number(confidence) : null;
-      mediaMeta.media_asset_id = mediaAssetId;
+  try {
+    await attachPendingMediaMeta(userKey, mediaMeta);
+  } catch {}
 
-      await attachPendingMediaMeta(userKey, mediaMeta);
-
-      const tc = inferTimeclockIntentFromText(transcript);
-      if (!tc) {
-        const fin = financeIntentFromText(transcript);
-        if (fin.kind === 'expense' || fin.kind === 'revenue') {
-          await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
-        }
-        return { transcript, twiml: null };
-      }
-      // timeclock: fall through to router with transcript (router may call timeclock)
-      return { transcript, twiml: null };
+  const tc = inferTimeclockIntentFromText(transcript);
+  if (!tc) {
+    const fin = financeIntentFromText(transcript);
+    if (fin.kind === 'expense' || fin.kind === 'revenue') {
+      await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
     }
+    return { transcript, twiml: null };
+  }
+
+  // timeclock: fall through to router with transcript (router may call timeclock)
+  return { transcript, twiml: null };
+}
+
+
+
 
 // IMAGE
 if (isImage) {
@@ -848,70 +827,51 @@ if (isImage) {
   let ocrFields = null;
 
   // -------------------------------
-// ✅ Gate #4a — OCR quota + plan (charge on success)
-// -------------------------------
-let ocrGate = null;
-let ocrCap = 0;
-try {
-  const tz = getUserTz(userProfile);
-  const caps = await resolveCapsForOwner(ownerId);
+  // ✅ Gate — OCR plan enable + monthly quota (NEW SYSTEM ONLY)
+  // -------------------------------
+  try {
+    const caps = await resolveCapsForOwner(ownerId);
+    const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
 
-  const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
-  ocrCap = caps?.capture?.ocr_receipts?.monthly_capacity ?? 0;
+    if (caps && !ocrEnabled) {
+      return {
+        transcript: null,
+        twiml: twiml(`OCR receipts are not enabled on your plan.\n\nUpgrade to Starter or Pro to scan receipts.`)
+      };
+    }
 
-  if (caps && !ocrEnabled) {
-    return {
-      transcript: null,
-      twiml: twiml(`OCR receipts are not enabled on your plan.\n\nUpgrade to Starter or Pro to scan receipts.`)
-    };
+    // Pre-check quota for nicer UX (no spend). Actual consume happens inside extractTextFromImage().
+    const q = await checkMonthlyQuota({
+      ownerId: String(ownerId),
+      planKey,
+      kind: 'ocr',
+      units: 1
+    });
+
+    if (!q.ok) {
+      return {
+        transcript: null,
+        twiml: twiml(`You’ve hit your monthly OCR limit.\n\nUpgrade to Pro for more capacity.`)
+      };
+    }
+  } catch (e) {
+    console.warn('[MEDIA] OCR precheck failed (fail-open):', e?.message);
   }
-
-  ocrGate = await gateMonthly({
-    ownerId,
-    tz,
-    field: 'ocr_receipts_count',
-    capMonthly: ocrCap,
-    incrementBy: 0
-  });
-
-  if (caps && ocrGate && !ocrGate.allowed) {
-    return {
-      transcript: null,
-      twiml: twiml(`You’ve hit your monthly OCR limit (${ocrGate.used}/${ocrCap}).\n\nUpgrade to Pro for more capacity.`)
-    };
-  }
-} catch (e) {
-  console.warn('[MEDIA] OCR precheck failed (fail-open):', e?.message);
-}
-
 
   // 1) OCR (DocAI -> Vision fallback happens inside extractTextFromImage)
   try {
-    const out = await extractTextFromImage(mediaUrl, { fetchBytes: true, mediaType: normType });
-    ocrText = String(out?.text || out?.transcript || '').trim();
-    // ✅ charge only if OCR produced text
-try {
- const gotText = !!String(ocrText || '').trim();
-if (caps && gotText && ocrGate?.allowed) {
-  const tz = getUserTz(userProfile);
-  await gateMonthly({
-    ownerId,
-    tz,
-    field: 'ocr_receipts_count',
-    capMonthly: ocrCap,
-    incrementBy: 1
-  });
-}
-} catch (e) {
-  console.warn('[MEDIA] OCR increment failed (ignored):', e?.message);
-}
+    const out = await extractTextFromImage(mediaUrl, {
+      mediaType,
+      ownerId: String(ownerId),
+      planKey
+    });
 
+    ocrText = String(out?.text || out?.transcript || '').trim();
     ocrFields = out?.fields || out?.ocrFields || null;
   } catch (e) {
     console.warn('[MEDIA] OCR failed (ignored):', e?.message);
   }
 
-  // Normalize final extractedText for downstream
   extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 
   // 2) Always upsert media asset row (even if OCR empty)
@@ -950,27 +910,10 @@ if (caps && gotText && ocrGate?.allowed) {
       pendingMedia: { url: mediaUrl || null, type: normType || null },
       mediaSourceMsgId: stableMediaMsgId || null
     });
-
-    console.info('[PENDING_MEDIA_META_SAVED]', {
-      userKey,
-      media_asset_id: mediaAssetId || null,
-      source_msg_id: stableMediaMsgId || null
-    });
-
-    try {
-      const chk = await getPendingTransactionState(userKey);
-      console.info('[PENDING_MEDIA_META_CHECK]', {
-        userKey,
-        hasPending: !!chk,
-        media_asset_id: chk?.pendingMediaMeta?.media_asset_id || null,
-        source_msg_id: chk?.pendingMediaMeta?.source_msg_id || null
-      });
-    } catch {}
   } catch (e) {
     console.warn('[PENDING_MEDIA_META_SAVED] failed (ignored):', e?.message);
   }
 
-  // Also keep your mediaMeta helper if you want it
   try {
     mediaMeta.transcript = extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null;
     mediaMeta.confidence = null;
@@ -978,62 +921,36 @@ if (caps && gotText && ocrGate?.allowed) {
     await attachPendingMediaMeta(userKey, mediaMeta);
   } catch {}
 
-  console.info('[IMAGE_EXTRACT_DEBUG]', {
-    userKey,
-    stableMediaMsgId,
-    ocrLen: (ocrText || '').length,
-    extractedLen: (extractedText || '').length,
-    willPrompt: !extractedText,
-    hasMediaAsset: !!mediaAssetId
-  });
+  if (!extractedText) {
+    return {
+      transcript: null,
+      twiml: twiml(`Is this an expense receipt or revenue? Reply "expense" or "revenue".`)
+    };
+  }
 
-  // 4) If OCR is empty, ask what it is
-if (!extractedText) {
-  return {
-    transcript: null,
-    twiml: twiml(`Is this an expense receipt or revenue? Reply "expense" or "revenue".`)
-  };
+  const fin = financeIntentFromText(extractedText);
+
+  const looksLikeReceipt =
+    /\b(subtotal|total|hst|gst|pst|visa|mastercard|debit|tax|change|cash|invoice|receipt)\b/i.test(extractedText) ||
+    /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(extractedText) ||
+    /\$\s*\d+(\.\d{2})?/.test(extractedText);
+
+  if (fin?.kind === 'expense' || fin?.kind === 'revenue') {
+    await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
+    return { transcript: `${fin.kind} ${extractedText}`.trim(), twiml: null };
+  }
+
+  if (looksLikeReceipt) {
+    return {
+      transcript: null,
+      twiml: twiml(`I pulled text from the receipt. Is this an *expense* or *revenue*? Reply "expense" or "revenue".`)
+    };
+  }
+
+  return { transcript: extractedText, twiml: null };
 }
 
-// 5) Receipt-first routing: classify BEFORE agent/RAG ever sees it
-const fin = financeIntentFromText(extractedText);
 
-const looksLikeReceipt =
-  /\b(subtotal|total|hst|gst|pst|visa|mastercard|debit|tax|change|cash|invoice|receipt)\b/i.test(extractedText) ||
-  /\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/.test(extractedText) ||
-  /\$\s*\d+(\.\d{2})?/.test(extractedText);
-
-console.info('[IMAGE_CLASSIFY_DEBUG]', {
-  finKind: fin?.kind || null,
-  looksLikeReceipt,
-  extractedLen: extractedText.length,
-  sample: extractedText.slice(0, 80)
-});
-
-if (fin?.kind === 'expense' || fin?.kind === 'revenue') {
-  await markPendingFinance({ userKey, kind: fin.kind, stableMediaMsgId });
-
-  // 🔥 critical: force router to enter expense.js / revenue.js
-  // (raw OCR blobs otherwise fall through to agent/help)
-  const routed = `${fin.kind} ${extractedText}`.trim();
-
-  return { transcript: routed, twiml: null };
-}
-
-// If it looks like a receipt but can't classify, prompt user (DO NOT send to agent/RAG)
-if (looksLikeReceipt) {
-  return {
-    transcript: null,
-    twiml: twiml(
-      `I pulled text from the receipt. Is this an *expense* or *revenue*? Reply "expense" or "revenue".`
-    )
-  };
-}
-
-// Otherwise: not obviously a receipt → allow agent/router to interpret transcript
-return { transcript: extractedText, twiml: null };
-
-}
 
 
 

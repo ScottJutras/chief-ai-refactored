@@ -8,7 +8,8 @@ const pg = require('../../services/postgres');
 const { parseQuoteMessage, buildQuoteDetails } = require('../../utils/quoteUtils');
 const { generateQuotePDFBuffer } = require('../../utils/pdfService');
 const { uploadQuotePdfBuffer, createQuoteSignedUrl } = require('../../utils/storageQuotes');
-const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
+
+const { checkMonthlyQuota, consumeMonthlyQuota } = require('../../utils/quota');
 
 function isQuoteCommand(text) {
   const s = String(text || '').trim().toLowerCase();
@@ -17,16 +18,22 @@ function isQuoteCommand(text) {
 
 function newQuoteId() {
   // short, URL-safe-ish id for paths/logs
-  // ex: q_2f9c1f8a1b2c
   return `q_${crypto.randomBytes(6).toString('hex')}`;
 }
 
+function resolvePlanKey(userProfile) {
+  return (
+    String(userProfile?.plan_key || userProfile?.paid_tier || userProfile?.subscription_tier || 'free')
+      .toLowerCase()
+      .trim() || 'free'
+  );
+}
+
 async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
-  const owner_id = String(ownerId || '').replace(/\D/g, '');
+  const owner_id = String(ownerId || '').trim(); // ✅ keep UUID intact
   const actor_id = String(from || '').replace(/\D/g, '');
 
   if (!owner_id) return false;
-
   if (!isQuoteCommand(text)) return false;
 
   const parsed = parseQuoteMessage(text);
@@ -45,21 +52,19 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
   }
 
   // MVP: tax/subtotal handling
-  // If you already have locale tax logic elsewhere, swap this.
   const subtotal = Number(details.total || 0);
   const tax = 0;
   const total = subtotal + tax;
 
   const quoteId = newQuoteId();
 
-  // Build PDF data model
   const quoteData = {
     jobName: parsed.jobName,
     items: details.items,
     subtotal,
     tax,
     total,
-    customerName: null, // MVP: you can ask later or infer from message
+    customerName: null,
     contractorName: userProfile?.name || 'Contractor',
     companyName: userProfile?.business_name || userProfile?.company_name || null,
     companyAddress: userProfile?.company_address || null,
@@ -67,10 +72,23 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
     logoUrl: userProfile?.logo_url || null
   };
 
+  const planKey = resolvePlanKey(userProfile);
+
+  // ✅ Gate + consume BEFORE PDF generation (server cost surface)
+  try {
+    const q = await checkMonthlyQuota({ ownerId: owner_id, planKey, kind: 'export_pdf', units: 1 });
+    if (!q.ok) {
+      return `You’ve hit your monthly PDF limit.\n\nUpgrade to Pro for more exports.`;
+    }
+    await consumeMonthlyQuota({ ownerId: owner_id, kind: 'export_pdf', units: 1 });
+  } catch (e) {
+    return `PDF export is temporarily unavailable. Please try again.`;
+  }
+
   // Generate PDF buffer
   const pdfBuffer = await generateQuotePDFBuffer(quoteData);
 
-  // Upload (immutable path: quote_v1.pdf)
+  // Upload
   const { bucket, path } = await uploadQuotePdfBuffer({
     ownerId: owner_id,
     quoteId,
@@ -82,11 +100,10 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
   const signedUrl = await createQuoteSignedUrl({
     bucket,
     path,
-    expiresInSec: 60 * 60 * 24 * 7 // 7 days
+    expiresInSec: 60 * 60 * 24 * 7
   });
 
-  // Optional: persist record if you have a quotes table/function
-  // Fail-open for MVP.
+  // Optional: persist record (fail-open)
   try {
     if (typeof pg.createQuoteRecord === 'function') {
       await pg.createQuoteRecord({

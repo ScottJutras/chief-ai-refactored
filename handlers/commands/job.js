@@ -975,14 +975,15 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
   try {
     const rawPlan = String(
       ownerProfile?.plan_key ||
-      ownerProfile?.plan ||
-      ownerProfile?.tier ||
-      ownerProfile?.pricing_plan ||
-      ownerProfile?.subscription_tier ||
-      ownerProfile?.paid_tier ||
-      'free'
+        ownerProfile?.plan ||
+        ownerProfile?.tier ||
+        ownerProfile?.pricing_plan ||
+        ownerProfile?.subscription_tier ||
+        ownerProfile?.paid_tier ||
+        'free'
     );
-    plan = (typeof getPlanOrDefault === 'function')
+
+    plan = typeof getPlanOrDefault === 'function'
       ? getPlanOrDefault(rawPlan)
       : String(rawPlan || 'free').toLowerCase().trim();
   } catch {}
@@ -990,7 +991,6 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
   // Resolve caps (fail-open if missing)
   let caps = null;
   try {
-    // Prefer your canonical resolver if you created it
     const capMod = require('../../src/config/capabilities');
     const fn =
       capMod?.getCapabilitiesForPlan ||
@@ -999,12 +999,9 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
       null;
 
     if (typeof fn === 'function') caps = fn(plan);
-    else {
-      // fallback direct import
-      const { plan_capabilities } = require('../../src/config/planCapabilities');
-      caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
-    }
-  } catch {
+  } catch {}
+
+  if (!caps) {
     try {
       const { plan_capabilities } = require('../../src/config/planCapabilities');
       caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
@@ -1020,13 +1017,13 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
         `select count(*)::int as c
            from public.jobs
           where owner_id=$1`,
-        [String(owner).replace(/\D/g, '')]
+        [String(owner).trim()] // ✅ keep UUID/text intact
       );
 
       const currentCount = Number(rows?.[0]?.c || 0);
       if (currentCount >= Number(maxJobs)) {
         const upgradeLine =
-          plan === 'free'
+          String(plan) === 'free'
             ? `Free supports up to ${maxJobs} jobs. Upgrade to Starter (25 jobs) or Pro (unlimited).`
             : `Your plan supports up to ${maxJobs} jobs. Upgrade to Pro for unlimited jobs.`;
 
@@ -1042,7 +1039,7 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
 
   // Create job
   const out = await pg.createJobIdempotent({
-    ownerId: owner,
+    ownerId: String(owner).trim(), // ✅ keep UUID/text intact
     name,
     sourceMsgId
   });
@@ -1062,7 +1059,7 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
           where owner_id=$1
           order by job_no asc
           limit 2`,
-        [String(owner).replace(/\D/g, '')]
+        [String(owner).trim()] // ✅ keep UUID/text intact
       );
       isFirstJobCreated = (rows?.length === 1);
     } catch {}
@@ -1075,7 +1072,6 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
       );
     }
 
-    // Normal success message (non-first-job OR non-free)
     return respond(res, `✅ Created job: "${jobName}" (Job #${jobNo}).`);
   }
 
@@ -1085,6 +1081,7 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
 
   return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
 }
+
 
 
     return respond(

@@ -1,24 +1,17 @@
 // utils/documentAiExpense.js
-// Pretrained Document AI Expense Parser
-// Input: Buffer of image bytes (jpeg/png/webp/pdf)
-// Output: { text, fields, raw }
-
 const { DocumentProcessorServiceClient } = require('@google-cloud/documentai');
+const { checkMonthlyQuota, consumeMonthlyQuota } = require('./quota');
 
 let _client = null;
 
 function getClient() {
   if (_client) return _client;
-
-  // Recommended: set GOOGLE_APPLICATION_CREDENTIALS to a file path.
-  // If you prefer base64, decode to /tmp at runtime (shown below).
   _client = new DocumentProcessorServiceClient();
   return _client;
 }
 
 function normalizeMime(mimeType) {
   const m = String(mimeType || '').split(';')[0].trim().toLowerCase();
-  // Twilio sometimes gives odd things; keep it conservative.
   if (m === 'image/jpg') return 'image/jpeg';
   return m;
 }
@@ -35,7 +28,7 @@ function entityMoney(entity) {
   if (typeof props === 'string') return props;
   const units = props.units != null ? String(props.units) : '0';
   const nanos = props.nanos != null ? String(props.nanos) : '0';
-  return `${units}.${String(nanos).padStart(9, '0').slice(0, 2)}`; // cents-ish display
+  return `${units}.${String(nanos).padStart(9, '0').slice(0, 2)}`;
 }
 
 async function processExpenseReceipt({
@@ -44,13 +37,25 @@ async function processExpenseReceipt({
   location = 'us',
   bytes,
   mimeType,
+
+  // ✅ NEW (for gating)
+  ownerId,
+  planKey = 'free',
 }) {
   if (!projectId) throw new Error('Missing projectId');
   if (!processorId) throw new Error('Missing processorId');
   if (!bytes || !Buffer.isBuffer(bytes)) throw new Error('Missing bytes Buffer');
 
-  const client = getClient();
+  const owner = String(ownerId || '').trim();
+  const plan = String(planKey || 'free').toLowerCase().trim() || 'free';
 
+  // ✅ Gate + consume BEFORE paid call
+  if (!owner) throw new Error('Missing ownerId (quota gate safety)');
+  const q = await checkMonthlyQuota({ ownerId: owner, planKey: plan, kind: 'ocr', units: 1 });
+  if (!q.ok) return { text: '', fields: null, raw: null };
+  await consumeMonthlyQuota({ ownerId: owner, kind: 'ocr', units: 1 });
+
+  const client = getClient();
   const name = client.processorPath(projectId, location, processorId);
 
   const request = {
@@ -65,17 +70,17 @@ async function processExpenseReceipt({
 
   const doc = result?.document || {};
   const text = doc?.text || '';
-
-  // Expense Parser puts key fields in entities.
   const entities = doc?.entities || [];
 
   const supplier = pickEntity(entities, 'supplier_name')?.mentionText || null;
   const receiptDate = pickEntity(entities, 'receipt_date')?.mentionText || null;
-  const total = entityMoney(pickEntity(entities, 'total_amount')) || pickEntity(entities, 'total_amount')?.mentionText || null;
+  const total =
+    entityMoney(pickEntity(entities, 'total_amount')) ||
+    pickEntity(entities, 'total_amount')?.mentionText ||
+    null;
   const currency = pickEntity(entities, 'currency')?.mentionText || null;
 
   const fields = { supplier, receiptDate, total, currency };
-
   return { text, fields, raw: result };
 }
 

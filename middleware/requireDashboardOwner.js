@@ -13,11 +13,7 @@ async function requireDashboardOwner(req, res, next) {
   try {
     const token = parseBearer(req);
 
-    console.log("[DASH_AUTH]", {
-      hasAuthHeader: !!(req.get("authorization") || req.get("Authorization")),
-      tokenLen: token ? token.length : 0,
-      path: req.originalUrl,
-    });
+    
 
     if (!token) return res.status(401).json({ error: "Missing dashboard token" });
 

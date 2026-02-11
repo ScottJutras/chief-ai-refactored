@@ -29,34 +29,51 @@ function requireOwner(req, res) {
 }
 
 router.post('/checkout', async (req, res) => {
-  const ownerId = requireOwner(req, res);
-  if (!ownerId) return;
+  try {
+    const ownerId = requireOwner(req, res);
+    if (!ownerId) return;
 
-  const { planKey } = req.body;
-  if (!PRICE_BY_PLAN[planKey]) return res.status(400).json({ error: 'Invalid plan' });
+    const { planKey } = req.body || {};
+    if (!PRICE_BY_PLAN[planKey]) return res.status(400).json({ error: 'Invalid plan' });
 
-  const owner = await db.getOwner(ownerId);
+    const owner = await db.getOwner(ownerId);
 
-  let customerId = owner?.stripe_customer_id || null;
-  if (!customerId) {
-    const customer = await stripe.customers.create({
-      metadata: { ownerId: String(ownerId) },
+    let customerId = owner?.stripe_customer_id || null;
+
+    // If switching between test/live, a stored customer may not exist in this mode.
+    // Safest: attempt to retrieve; if not found, create a new one and overwrite DB.
+    if (customerId) {
+      try {
+        await stripe.customers.retrieve(customerId);
+      } catch (e) {
+        customerId = null;
+      }
+    }
+
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        metadata: { ownerId: String(ownerId) },
+      });
+      customerId = customer.id;
+      await db.updateOwnerBilling(ownerId, { stripe_customer_id: customerId });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: [{ price: PRICE_BY_PLAN[planKey], quantity: 1 }],
+      success_url: `${process.env.APP_BASE_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.APP_BASE_URL}/billing/cancel`,
+      metadata: { ownerId: String(ownerId), planKey: String(planKey) },
     });
-    customerId = customer.id;
-    await db.updateOwnerBilling(ownerId, { stripe_customer_id: customerId });
+
+    return res.json({ url: session.url });
+  } catch (e) {
+    console.error('[BILLING_CHECKOUT_ERR]', e);
+    return res.status(500).json({ error: 'checkout_failed' });
   }
-
-  const session = await stripe.checkout.sessions.create({
-    mode: 'subscription',
-    customer: customerId,
-    line_items: [{ price: PRICE_BY_PLAN[planKey], quantity: 1 }],
-    success_url: `${process.env.APP_BASE_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${process.env.APP_BASE_URL}/billing/cancel`,
-    metadata: { ownerId: String(ownerId), planKey: String(planKey) },
-  });
-
-  return res.json({ url: session.url });
 });
+
 
 router.post('/portal', async (req, res) => {
   const ownerId = requireOwner(req, res);

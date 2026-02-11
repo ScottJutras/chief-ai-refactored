@@ -3864,40 +3864,36 @@ async function setActiveJobForPhone(ownerId, fromPhone, jobId, jobName) {
 }
 // ---------------- Stripe / Billing helpers ----------------
 
+// Stripe webhook idempotency (schema: stripe_events(event_id text, received_at timestamptz))
 async function hasStripeEvent(eventId) {
-  const id = String(eventId || '').trim();
+  const id = String(eventId || "").trim();
   if (!id) return false;
-  const r = await query(`select 1 from public.stripe_events where id=$1 limit 1`, [id]);
-  return (r?.rowCount || 0) > 0;
-}
-async function getOwnerByDashboardToken(dashboardToken) {
-  const t = String(dashboardToken || "").trim();
-  if (!t) return null;
 
   const { rows } = await pool.query(
-    `select user_id
-     from public.users
-     where dashboard_token = $1
+    `select 1
+     from public.stripe_events
+     where event_id = $1
      limit 1`,
-    [t]
+    [id]
   );
 
-  return rows[0]?.user_id ? String(rows[0].user_id) : null;
+  return rows.length > 0;
 }
-
 
 async function insertStripeEvent(eventId) {
-  const id = String(eventId || '').trim();
-  if (!id) return false;
-  try {
-    await query(`insert into public.stripe_events (id) values ($1)`, [id]);
-    return true;
-  } catch (e) {
-    // idempotency: if concurrent, treat conflict as success
-    if (String(e?.code) === '23505') return false;
-    throw e;
-  }
+  const id = String(eventId || "").trim();
+  if (!id) throw new Error("insertStripeEvent: missing eventId");
+
+  await pool.query(
+    `insert into public.stripe_events (event_id, received_at)
+     values ($1, now())
+     on conflict (event_id) do nothing`,
+    [id]
+  );
+
+  return true;
 }
+
 
 async function getOwner(ownerId) {
   const owner = String(ownerId || '').trim();

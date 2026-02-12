@@ -232,15 +232,17 @@ async function sendTemplateMessage(to, sid, vars = {}, fallbackBody = ' ') {
     contentVariables = '{}';
   }
 
-  const payload = applyFromOrService(
-    {
-      to: toWhatsApp(to),
-      contentSid: sid,
-      contentVariables,
-      body: safeFallback
-    },
-    'whatsapp'
-  );
+  const statusCallback = process.env.TWILIO_STATUS_CALLBACK_URL || null;
+
+const payload = {
+  to,
+  ...(messagingServiceSid ? { messagingServiceSid } : { from: waFrom }),
+  contentSid,
+  contentVariables,
+  body: fallbackBody,
+  ...(statusCallback ? { statusCallback } : {})
+};
+
 
   console.info('[TWILIO] sendTemplateMessage messages.create payload', {
     to: payload.to,

@@ -1449,6 +1449,21 @@ if (hasTranscript) {
   }
 });
 
+
+router.post('/twilio/status', express.urlencoded({ extended: false }), (req, res) => {
+  try {
+    console.info('[TWILIO_STATUS]', {
+      MessageSid: req.body?.MessageSid || null,
+      MessageStatus: req.body?.MessageStatus || null,
+      To: req.body?.To || null,
+      From: req.body?.From || null,
+      ErrorCode: req.body?.ErrorCode || null,
+      ErrorMessage: req.body?.ErrorMessage || null
+    });
+  } catch {}
+  return res.status(200).send('ok');
+});
+
 /* ---------------- Main text router ---------------- */
 
 router.post('*', async (req, res, next) => {

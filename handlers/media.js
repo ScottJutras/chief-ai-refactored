@@ -1020,26 +1020,26 @@ try {
     console.warn('[MEDIA] upsertMediaAsset (ocr update) failed (ignored):', e?.message);
   }
 
-  // Update pending meta with OCR transcript (best-effort)
-  try {
-    const pending = await getPendingTransactionState(userKey);
+  // ✅ Remember last media so a manual expense typed next can attach it (no OCR needed)
+try {
+  const pending = await getPendingTransactionState(userKey);
+  await mergePendingTransactionState(userKey, {
+    ...(pending || {}),
+    pendingMediaMeta: {
+      url: mediaUrl || null,
+      type: normType || null,
+      source_msg_id: stableMediaMsgId || null,
+      media_asset_id: mediaAssetId || null,
+      transcript: null,
+      confidence: null
+    },
+    pendingMedia: { url: mediaUrl || null, type: normType || null },
+    mediaSourceMsgId: stableMediaMsgId || null
+  });
+} catch (e) {
+  console.warn('[PENDING_MEDIA_META_SAVED] (image/free_gate) failed (ignored):', e?.message);
+}
 
-    await mergePendingTransactionState(userKey, {
-      ...(pending || {}),
-      pendingMediaMeta: {
-        url: mediaUrl || null,
-        type: normType || null,
-        source_msg_id: stableMediaMsgId || null,
-        media_asset_id: mediaAssetId || null,
-        transcript: extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null,
-        confidence: null
-      },
-      pendingMedia: { url: mediaUrl || null, type: normType || null },
-      mediaSourceMsgId: stableMediaMsgId || null
-    });
-  } catch (e) {
-    console.warn('[PENDING_MEDIA_META_SAVED] (ocr update) failed (ignored):', e?.message);
-  }
 
   try {
     mediaMeta.transcript = extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null;

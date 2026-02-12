@@ -208,6 +208,27 @@ async function sendQuickReply(to, body, replies = []) {
   });
   return msg;
 }
+// ✅ Local send-from resolver (self-contained; avoids getSendFromConfig dependency)
+function resolveSendFromConfig() {
+  // Prefer any existing module-scope variables if your file already defines them
+  // (These checks are safe even if the vars don't exist.)
+  let waFromLocal = null;
+  let mssLocal = null;
+
+  try { waFromLocal = typeof waFrom !== 'undefined' ? waFrom : null; } catch {}
+  try { mssLocal = typeof messagingServiceSid !== 'undefined' ? messagingServiceSid : null; } catch {}
+
+  const waFromEnv =
+    String(process.env.TWILIO_WA_FROM || process.env.TWILIO_WHATSAPP_FROM || '').trim() || null;
+
+  const messagingServiceSidEnv =
+    String(process.env.TWILIO_MESSAGING_SERVICE_SID || '').trim() || null;
+
+  return {
+    waFrom: String(waFromLocal || waFromEnv || '').trim() || null,
+    messagingServiceSid: String(mssLocal || messagingServiceSidEnv || '').trim() || null
+  };
+}
 
 /**
  * ✅ WhatsApp Content API still wants a body field present; keep it non-empty
@@ -232,8 +253,7 @@ async function sendTemplateMessage(to, sid, vars = {}, fallbackBody = ' ') {
     contentVariables = '{}';
   }
 
-  // ✅ Pull send-from config the same way the rest of your Twilio layer does
-  const { waFrom, messagingServiceSid } = getSendFromConfig(); // must exist in this module
+  const { waFrom, messagingServiceSid } = resolveSendFromConfig();
 
   const statusCallback = String(process.env.TWILIO_STATUS_CALLBACK_URL || '').trim() || null;
 
@@ -270,6 +290,7 @@ async function sendTemplateMessage(to, sid, vars = {}, fallbackBody = ' ') {
     throw e;
   }
 }
+
 
 
 /**

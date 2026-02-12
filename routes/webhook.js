@@ -1429,12 +1429,14 @@ if (hasTranscript) {
     head: String(t || '').slice(0, 12),
   });
 
+  // ✅ ADD THIS DEBUG LINE (right here)
+  console.info('[MEDIA_ROUTING_BODY]', {
+    bodyHead: String(req.body?.Body || '').slice(0, 60),
+    len: String(req.body?.Body || '').length
+  });
+
   return next();
 }
-
-
-
-
 
     if (typeof result === 'string' && !res.headersSent) {
       return sendTwiml(res, result);

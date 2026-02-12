@@ -875,6 +875,12 @@ try {
 // Return the gating message as TwiML so the user sees a response.
 try {
   const caps = await resolveCapsForOwner(ownerIdKey);
+  console.info('[OCR_CAPS]', {
+  ownerId: ownerIdKey,
+  plan_key: ownerProfile?.plan_key || null,
+  ocrEnabled: !!caps?.capture?.ocr_receipts?.enabled
+});
+
   const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
 
   if (caps && !ocrEnabled) {

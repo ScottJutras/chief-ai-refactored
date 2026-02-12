@@ -851,55 +851,53 @@ if (isImage) {
     /\b(ocr|scan|read|extract|parse)\b/.test(rawHint) &&
     rawHint.length <= 80;
 
-  // --------------------------------------------
-  // ✅ Always store the image first (even on Free)
-  // This ensures receipts are not "lost" and expense handler can attach media.
-  // --------------------------------------------
-  try {
-    mediaAssetId = await upsertMediaAsset({
-      ownerId: ownerIdKey,
-      from,
-      stableMediaMsgId,
-      mediaUrl,
-      contentType: normType,
-      sizeBytes: null,
-      jobId: activeJobId,
-      jobNo: activeJobNo,
-      jobName: activeJobName,
-      ocrText: null,
-      ocrFields: null
-    });
-  } catch (e) {
-    console.warn('[MEDIA] upsertMediaAsset (image) failed (ignored):', e?.message);
+  // 2) Always upsert media asset row (even if OCR empty)
+try {
+  mediaAssetId = await upsertMediaAsset({
+    ownerId: ownerIdKey,
+    from,
+    stableMediaMsgId,
+    mediaUrl,
+    contentType: normType,
+    sizeBytes: null,
+    jobId: activeJobId,
+    jobNo: activeJobNo,
+    jobName: activeJobName,
+    ocrText: null,          // keep null until OCR runs
+    ocrFields: null
+  });
+} catch (e) {
+  console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
+}
+
+// ✅ FREE TIER / OCR-NOT-ENABLED BEHAVIOR:
+// Store the image, DO NOT route into expense confirm/job picker.
+// Return the gating message as TwiML so the user sees a response.
+try {
+  const caps = await resolveCapsForOwner(ownerIdKey);
+  const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
+
+  if (caps && !ocrEnabled) {
+    // (optional) one-time prompt flag
+    try {
+      const r = await shouldShowUpgradePromptOnce({ ownerId: ownerIdKey, kind: 'ocr' });
+      console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: ownerIdKey, ...r });
+    } catch {}
+
+    return {
+      transcript: null,
+      twiml: twiml(
+        `I stored the receipt photo ✅\n\n` +
+        `Automatic receipt reading (OCR) isn’t included on the Free plan.\n\n` +
+        `Starter unlocks OCR — I’ll extract vendor, amount, and date automatically.\n\n` +
+        `If you want, you can still log it manually right now like:\n` +
+        `expense $24.18 from Home Depot today`
+      )
+    };
   }
-
-  // Persist pending media meta so downstream flows can find/link it.
-  try {
-    const pending = await getPendingTransactionState(userKey);
-
-    await mergePendingTransactionState(userKey, {
-      ...(pending || {}),
-      pendingMediaMeta: {
-        url: mediaUrl || null,
-        type: normType || null,
-        source_msg_id: stableMediaMsgId || null,
-        media_asset_id: mediaAssetId || null,
-        transcript: null,
-        confidence: null
-      },
-      pendingMedia: { url: mediaUrl || null, type: normType || null },
-      mediaSourceMsgId: stableMediaMsgId || null
-    });
-  } catch (e) {
-    console.warn('[PENDING_MEDIA_META_SAVED] (image) failed (ignored):', e?.message);
-  }
-
-  try {
-    mediaMeta.transcript = null;
-    mediaMeta.confidence = null;
-    mediaMeta.media_asset_id = mediaAssetId || null;
-    await attachPendingMediaMeta(userKey, mediaMeta);
-  } catch {}
+} catch (e) {
+  console.warn('[MEDIA] OCR enabled check failed (fail-open):', e?.message);
+}
 
   // --------------------------------------------
   // ✅ Gate OCR (plan + quota)

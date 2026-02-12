@@ -46,20 +46,15 @@ const twilioSvc = require('../services/twilio');
 const sendWhatsApp = twilioSvc.sendWhatsApp;
 
 /* ---------------- Small helpers ---------------- */
-
-function xmlEsc(s = '') {
+// ✅ XML escape helper for TwiML (single source of truth in this file)
+function escapeXml(s = '') {
   return String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
-
-function twimlText(text) {
-  const t = String(text ?? '').trim();
-  if (!t) return twimlEmpty(); // ✅ never emit empty <Message>
-  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXml(t)}</Message></Response>`;
-}
-
 
 function twimlEmpty() {
   // ✅ IMPORTANT:
@@ -67,6 +62,11 @@ function twimlEmpty() {
   return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 }
 
+function twimlText(text) {
+  const t = String(text ?? '').trim();
+  if (!t) return twimlEmpty(); // ✅ never emit empty <Message>
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXml(t)}</Message></Response>`;
+}
 
 /// ✅ bulletproof TwiML sender (never sends an "empty Message" which causes Twilio 14103)
 function sendTwiml(res, xml) {
@@ -100,17 +100,17 @@ function sendTwiml(res, xml) {
   return res.status(200).type('text/xml; charset=utf-8').send(out);
 }
 
-
 // Safe default:
 // ok(res) -> empty TwiML (no bubble)
 // ok(res, "text") -> visible bubble
 function ok(res, text = null) {
-  if (res.headersSent) return;
+  if (!res || res.headersSent) return;
 
   const t = text == null ? '' : String(text).trim();
   if (!t) return sendTwiml(res, twimlEmpty());
   return sendTwiml(res, twimlText(t));
 }
+
 
 
 const normalizePhone = (raw = '') =>

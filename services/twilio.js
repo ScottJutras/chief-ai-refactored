@@ -232,17 +232,19 @@ async function sendTemplateMessage(to, sid, vars = {}, fallbackBody = ' ') {
     contentVariables = '{}';
   }
 
-  const statusCallback = process.env.TWILIO_STATUS_CALLBACK_URL || null;
+  // ✅ Pull send-from config the same way the rest of your Twilio layer does
+  const { waFrom, messagingServiceSid } = getSendFromConfig(); // must exist in this module
 
-const payload = {
-  to,
-  ...(messagingServiceSid ? { messagingServiceSid } : { from: waFrom }),
-  contentSid,
-  contentVariables,
-  body: fallbackBody,
-  ...(statusCallback ? { statusCallback } : {})
-};
+  const statusCallback = String(process.env.TWILIO_STATUS_CALLBACK_URL || '').trim() || null;
 
+  const payload = {
+    to,
+    ...(messagingServiceSid ? { messagingServiceSid } : { from: waFrom }),
+    contentSid: String(sid || '').trim(),
+    contentVariables,
+    body: safeFallback,
+    ...(statusCallback ? { statusCallback } : {})
+  };
 
   console.info('[TWILIO] sendTemplateMessage messages.create payload', {
     to: payload.to,
@@ -251,7 +253,8 @@ const payload = {
     hasContentSid: !!payload.contentSid,
     hasContentVariables: !!payload.contentVariables,
     contentVariablesLen: String(payload.contentVariables || '').length,
-    hasBody: !!payload.body
+    hasBody: !!payload.body,
+    hasStatusCallback: !!payload.statusCallback
   });
 
   try {
@@ -267,6 +270,7 @@ const payload = {
     throw e;
   }
 }
+
 
 /**
  * Legacy/compat alias: some callsites want “template quick reply”.

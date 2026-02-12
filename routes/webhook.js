@@ -1065,6 +1065,20 @@ async function maybeAutoYesAfterEdit({
   }
 }
 
+// ✅ Twilio delivery status callback (must be BEFORE router.post('*') catch-alls)
+router.post('/twilio/status', express.urlencoded({ extended: false }), (req, res) => {
+  try {
+    console.info('[TWILIO_STATUS]', {
+      MessageSid: req.body?.MessageSid || null,
+      MessageStatus: req.body?.MessageStatus || null,
+      To: req.body?.To || null,
+      From: req.body?.From || null,
+      ErrorCode: req.body?.ErrorCode || null,
+      ErrorMessage: req.body?.ErrorMessage || null
+    });
+  } catch {}
+  return res.status(200).send('ok');
+});
 
 
 /* ---------------- Raw urlencoded parser (Twilio signature expects original body) ---------------- */
@@ -1102,6 +1116,9 @@ router.use((req, _res, next) => {
     next();
   });
 });
+
+
+
 
 // ---------------- Transport health & echo ----------------
 // Put this ABOVE the first router.post('*') so it doesn’t get intercepted.
@@ -1449,20 +1466,6 @@ if (hasTranscript) {
   }
 });
 
-
-router.post('/twilio/status', express.urlencoded({ extended: false }), (req, res) => {
-  try {
-    console.info('[TWILIO_STATUS]', {
-      MessageSid: req.body?.MessageSid || null,
-      MessageStatus: req.body?.MessageStatus || null,
-      To: req.body?.To || null,
-      From: req.body?.From || null,
-      ErrorCode: req.body?.ErrorCode || null,
-      ErrorMessage: req.body?.ErrorMessage || null
-    });
-  } catch {}
-  return res.status(200).send('ok');
-});
 
 /* ---------------- Main text router ---------------- */
 

@@ -39,13 +39,22 @@ async function safeCleanup(req) {
   const key = `lock:${req.ownerId || req.from || 'GLOBAL'}`;
   try { await releaseLock(key); } catch {}
 }
-
-/** TwiML helper */
+/** TwiML helper (safe) */
 function twiml(res, body) {
+  const t = String(body ?? '').trim();
+
+  // ✅ Never emit empty <Message> (Twilio 14103)
+  if (!t) {
+    return res
+      .status(200)
+      .type('application/xml; charset=utf-8')
+      .send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+  }
+
   return res
     .status(200)
-    .type('application/xml')
-    .send(`<Response><Message>${body}</Message></Response>`);
+    .type('application/xml; charset=utf-8')
+    .send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${t}</Message></Response>`);
 }
 
 // -----------------------------------------------------------------

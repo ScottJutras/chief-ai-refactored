@@ -220,13 +220,16 @@ function xmlEsc(s = '') {
     .replace(/'/g, '&apos;');
 }
 
-function twimlText(msg) {
-  return `<Response><Message>${xmlEsc(msg)}</Message></Response>`;
+function twimlEmpty() {
+  return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 }
 
-function twimlEmpty() {
-  return `<Response></Response>`;
+function twimlText(msg) {
+  const t = String(msg ?? '').trim();
+  if (!t) return twimlEmpty(); // ✅ never emit empty <Message>
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${xmlEsc(t)}</Message></Response>`;
 }
+
 
 function out(twiml, sentOutOfBand = false) {
   return { twiml, sentOutOfBand: !!sentOutOfBand };

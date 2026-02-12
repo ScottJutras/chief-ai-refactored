@@ -16,6 +16,7 @@ const querystring = require('querystring');
 
 const router = express.Router();
 const app = express();
+const { handleJobPickSelection } = require('../handlers/system/jobPickRouter');
 
 const { flags } = require('../config/flags');
 const { handleClock, handleTimesheetCommand } = require('../handlers/commands/timeclock'); // v2 handler (optional)
@@ -31,6 +32,7 @@ const { getUserByName } = require('../services/users');
 
 const stateManager = require('../utils/stateManager');
 const { getPendingTransactionState } = stateManager;
+const { resolveInboundTextFromTwilio } = require('../services/whatsapp/inboundInteractive');
 
 // Prefer mergePendingTransactionState; fall back to setPendingTransactionState (older builds)
 const mergePendingTransactionState =
@@ -52,31 +54,52 @@ function xmlEsc(s = '') {
     .replace(/>/g, '&gt;');
 }
 
-function twimlText(s = '') {
-  const safe = String(s || '');
-  return `<Response><Message>${xmlEsc(safe)}</Message></Response>`;
+function twimlText(text) {
+  const t = String(text ?? '').trim();
+  if (!t) return twimlEmpty(); // ✅ never emit empty <Message>
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXml(t)}</Message></Response>`;
 }
 
-// ✅ single source of truth
+
 function twimlEmpty() {
-  return '<Response></Response>';
+  // ✅ IMPORTANT:
+  // Must NOT include <Message></Message> or Twilio will attempt to send an empty reply (14103).
+  return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 }
 
-// ✅ bulletproof TwiML sender (never sends "nothing")
+
+/// ✅ bulletproof TwiML sender (never sends an "empty Message" which causes Twilio 14103)
 function sendTwiml(res, xml) {
   if (!res || res.headersSent) return;
 
   // Accept raw TwiML string OR object { twiml: '...' }
   let out = xml;
-  if (out && typeof out === 'object' && typeof out.twiml === 'string') {
-    out = out.twiml;
-  }
+  if (out && typeof out === 'object' && typeof out.twiml === 'string') out = out.twiml;
 
   out = String(out || '').trim();
+
+  // ✅ If missing, return truly empty TwiML (no bubble)
   if (!out) out = twimlEmpty();
+
+  // ✅ CRITICAL: if someone returned "<Response><Message></Message></Response>",
+  // Twilio interprets it as "send an outbound reply with blank body" → 14103.
+  // Normalize it to empty <Response></Response>.
+  const normalized = out.replace(/\s+/g, '');
+  if (
+    normalized === '<Response><Message></Message></Response>' ||
+    normalized === '<?xmlversion="1.0"encoding="UTF-8"?><Response><Message></Message></Response>'
+  ) {
+    out = twimlEmpty();
+  }
+
+  // ✅ Also guard against "<Message/>" variants
+  if (/<Message\s*\/>/.test(out) || /<Message>\s*<\/Message>/.test(out)) {
+    out = twimlEmpty();
+  }
 
   return res.status(200).type('text/xml; charset=utf-8').send(out);
 }
+
 
 // Safe default:
 // ok(res) -> empty TwiML (no bubble)
@@ -460,47 +483,27 @@ function pendingTxnNudgeMessage(pending) {
 
 
 /* -----------------------------------------------------------------------
- * ✅ Inbound text normalization (button-aware + interactive list-aware)
+ * ✅ Inbound text normalization (SAFE)
  *
- * Twilio list clicks can arrive in multiple shapes:
- *   - InteractiveResponseJson: list_reply.id (row id) + list_reply.title
- *   - ListRowId / ListId (sometimes equals Body)
- *   - ListTitle / ListRowTitle
+ * Rule:
+ * - Prefer stable IDs provided by Twilio (RowId/ListId/ButtonPayload)
+ * - Do NOT rewrite list IDs into job indexes (jobix_*) — this causes loops.
+ * - Do NOT infer job numbers from list titles (unless it is explicitly stamped like "J8")
  *
- * IMPORTANT RULE (to prevent picker loops):
- *   ✅ If Twilio provides an interactive list selection, we must prefer the
- *      STABLE row id (e.g. "jp:...") OR the original token (e.g. "job_3_xxx")
- *      and NEVER rewrite it into a different semantic token.
- *
- * Why:
- *   - "job_3_*" is a ROW INDEX token in some templates (NOT job_no)
- *   - rewriting into "jobix_3" causes mismatches and loops when title/state
- *     expects the original token or stable row id.
- *
- * Therefore:
- *   - Return row id if present (jp:..., ListRowId, list_reply.id)
- *   - Else return the raw list token (job_3_xxx) as-is
- *   - Buttons remain normalized ("yes"/"edit"/etc)
+ * This is compatible with your new picker row ids: "jp:<flow8>:<nonce>:jn:<jobNo>:h:<sig>"
  * ----------------------------------------------------------------------- */
-
 
 function getInboundText(body = {}) {
   const b = body || {};
-  const rawBody = String(b.Body || '').trim();
 
-  // -------------------------------------------------------
-  // 1) Buttons / quick replies (safe to normalize)
-  // -------------------------------------------------------
+  // 1) Buttons / quick replies
   const payload = String(b.ButtonPayload || b.buttonPayload || '').trim();
   if (payload) return payload.toLowerCase();
 
   const btnText = String(b.ButtonText || b.buttonText || '').trim();
   if (btnText && btnText.length <= 40) return btnText.toLowerCase();
 
-  // -------------------------------------------------------
   // 2) InteractiveResponseJson (best signal if present)
-  //    Prefer list_reply.id (row id) over title.
-  // -------------------------------------------------------
   const irj = b.InteractiveResponseJson || b.interactiveResponseJson || null;
   if (irj) {
     try {
@@ -523,30 +526,20 @@ function getInboundText(body = {}) {
       const pickedId = String(id || '').trim();
       const pickedTitle = String(title || '').trim();
 
-      // If title contains stamped job number like "J8", allow jobno recovery
+      // If title contains stamped job number like "J8", allow explicit recovery
       const stamped = extractStampedJobNo(pickedTitle);
       if (stamped) return `jobno_${stamped}`;
 
-      // ✅ Canonicalize job picker Content Template IDs:
-      // "job_5_44fc8181" => "jobix_5"
-      const jobIx = extractJobPickerIndexFromToken(pickedId || pickedTitle);
-      if (jobIx != null) return `jobix_${jobIx}`;
-
-      // Otherwise return ID as-is
+      // ✅ Prefer ID as-is (this is where "jp:..." will come through)
       if (pickedId) return pickedId;
 
-      // Fallback to title if no id
+      // Fallback to title only if no id
       if (pickedTitle) return pickedTitle;
     } catch {}
   }
 
-  // -------------------------------------------------------
-  // 3) Twilio list picker fields
-  //    Prefer RowId/Id over Body over Title.
-  // -------------------------------------------------------
+  // 3) Twilio list picker fields (prefer IDs)
   const listRowId = String(b.ListRowId || b.ListRowID || b.listRowId || b.listRowID || '').trim();
-  const listRowTitle = String(b.ListRowTitle || b.listRowTitle || '').trim();
-
   const listId = String(
     b.ListId ||
       b.listId ||
@@ -557,6 +550,11 @@ function getInboundText(body = {}) {
       ''
   ).trim();
 
+  if (listRowId) return listRowId; // ✅ "jp:..." stable
+  if (listId) return listId;       // ✅ "jp:..." stable
+
+  // Titles only as a last resort
+  const listRowTitle = String(b.ListRowTitle || b.listRowTitle || '').trim();
   const listTitle = String(
     b.ListTitle ||
       b.listTitle ||
@@ -569,33 +567,12 @@ function getInboundText(body = {}) {
 
   const candidateTitle = listRowTitle || listTitle;
 
-  // If title contains stamped job number like "J8", allow jobno recovery
   const stamped = extractStampedJobNo(candidateTitle);
   if (stamped) return `jobno_${stamped}`;
 
-  // ✅ NEW: canonicalize job picker content template IDs early
-  // Prefer listRowId/listId (stable), but normalize if they match job_<ix>_<nonce>
-  const idCandidate = listRowId || listId;
-  const ixFromId = extractJobPickerIndexFromToken(idCandidate);
-  if (ixFromId != null) return `jobix_${ixFromId}`;
+  const rawBody = String(b.Body || '').trim();
+  if (rawBody) return rawBody;
 
-  // If title begins with "#<index> ..." normalize to jobix as well
-  const ixFromTitle = extractJobPickerIndexFromToken(candidateTitle);
-  if (ixFromTitle != null) return `jobix_${ixFromTitle}`;
-
-  // ✅ Prefer the ID fields if present (stable)
-  if (listRowId) return listRowId;
-  if (listId) return listId;
-
-  // If Twilio put the token in Body (common), return it,
-  // but still canonicalize job picker tokens.
-  if (rawBody) {
-    const ixFromBody = extractJobPickerIndexFromToken(rawBody);
-    if (ixFromBody != null) return `jobix_${ixFromBody}`;
-    return rawBody;
-  }
-
-  // As a last resort, fall back to title
   if (candidateTitle) return candidateTitle;
 
   return '';
@@ -609,6 +586,7 @@ function extractStampedJobNo(title = '') {
   const n = Number(m[1]);
   return Number.isFinite(n) ? n : null;
 }
+
 
 /**
  * Extracts a job picker *index* from either:
@@ -1139,7 +1117,8 @@ router.post('/echo', (req, res) => {
     const b = req.body || {};
     const msgSid = b.MessageSid || b.SmsMessageSid || null;
     const from = b.From || null;
-    const body = (b.Body || '').toString().slice(0, 200);
+    const body = String(resolveInboundTextFromTwilio(b) || '').slice(0, 200);
+
 
     // If you already have sendTwiml + ok() helpers, use them.
     // Otherwise simplest safe TwiML:
@@ -1489,35 +1468,32 @@ router.post('*', async (req, res, next) => {
       }
     }
 
-
-
-    let pending = await getPendingTransactionState(req.actorKey || req.from);
+        let pending = await getPendingTransactionState(req.actorKey || req.from);
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
     const crypto = require('crypto');
 
-    // ✅ Compute canonical inbound text ONCE (button/list/IRJ-aware)
-const resolvedInbound = String(getInboundText(req.body || {}) || '').trim();
-
-// ✅ PROVE router received the message + what text it resolved
-console.info('[WEBHOOK_IN]', {
-  ownerId: req.ownerId || null,
-  from: req.from || null,
-  messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
-  waId: req.body?.WaId || req.body?.WaID || req.body?.waid || null,
-  numMedia: Number(req.body?.NumMedia || 0) || 0,
-  resolvedInbound: resolvedInbound.slice(0, 140)
-});
-
-// ✅ If there's no text and no media, do nothing (avoid burning cycles)
-if (!resolvedInbound && numMedia === 0) return ok(res);
-
-
-    // ✅ Make canonical resolved text available to downstream handlers (expense.js reads this)
-    req.body.ResolvedInboundText = resolvedInbound;
-
-    // Use resolvedInbound as the main text everywhere in this router
-    let text = resolvedInbound;
+    // ✅ Canonical inbound text (single source of truth for this request)
+    // Prefer Twilio interactive IDs exactly as sent (jp:...).
+    let text = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
+    req.body.ResolvedInboundText = text;
     let lc = text.toLowerCase();
+
+    // ✅ PROVE router received the message + what text it resolved
+    console.info('[WEBHOOK_IN]', {
+      ownerId: req.ownerId || null,
+      from: req.from || null,
+      messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
+      waId: req.body?.WaId || req.body?.WaID || req.body?.waid || null,
+      numMedia: Number(req.body?.NumMedia || 0) || 0,
+      resolvedInbound: String(text || '').slice(0, 140),
+      ListId: req.body?.ListId || null,
+      ListRowId: req.body?.ListRowId || null,
+      ButtonPayload: req.body?.ButtonPayload || null
+    });
+
+    // ✅ If there's no text and no media, do nothing (avoid burning cycles)
+    if (!text && numMedia === 0) return ok(res);
+
 
     
 // ------------------------------------------------------------
@@ -1883,12 +1859,11 @@ if (hasPendingMedia && numMedia === 0) {
         req.body.Body = t;
 
         // ✅ Recompute canonical text ONCE and store it (so everything downstream uses the same thing)
-        const newResolved = String(getInboundText(req.body || {}) || '').trim();
-        req.body.ResolvedInboundText = newResolved;
+        const newResolved = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
+req.body.ResolvedInboundText = newResolved;
+text = newResolved;
+lc = text.toLowerCase();
 
-        // ✅ Update local vars to match
-        text = newResolved;
-        lc = text.toLowerCase();
 
         console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 12) });
       }

@@ -7,9 +7,21 @@ const { normalizeJobNameCandidate } = require('../utils/jobNameUtils');
 
 
 function xmlMsg(s = '') {
-  const esc = String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  return `<Response><Message>${esc}</Message></Response>`;
+  const t = String(s ?? '').trim();
+
+  // ✅ Never emit empty <Message> (Twilio 14103)
+  if (!t) return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+
+  const esc = t
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${esc}</Message></Response>`;
 }
+
 
 const digits = (s = '') => String(s || '').replace(/\D/g, '');
 

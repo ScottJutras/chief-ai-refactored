@@ -7,3 +7,5 @@ scripts/
 legacy/
 *.log
 node_modules
+archive/
+archive/**

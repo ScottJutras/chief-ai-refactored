@@ -14,14 +14,21 @@
 const pg = require('../../services/postgres');
 
 function RESP(t) {
-  const s = String(t || '').trim();
-  return `<Response><Message>${s
+  const s = String(t ?? '').trim();
+
+  // ✅ Never emit empty <Message> (Twilio 14103)
+  if (!s) return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+
+  const esc = s
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;')}</Message></Response>`;
+    .replace(/'/g, '&apos;');
+
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${esc}</Message></Response>`;
 }
+
 
 function DIGITS(x) {
   return String(x ?? '').replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '');

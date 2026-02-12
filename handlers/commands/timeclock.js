@@ -88,7 +88,7 @@ function xmlEsc(s = '') {
 function twiml(res, body) {
   res
     .status(200)
-    .type('application/xml')
+    .type('application/xml; charset=utf-8')
     .send(`<Response><Message>${xmlEsc(String(body || '').trim() || 'Timeclock error. Try again.')}</Message></Response>`);
   return true;
 }
@@ -466,10 +466,13 @@ if (/^drive (stopped|stop|ended|end)$/.test(coreNorm)) {
   return normalizeSentencePunct(`${lead}You're done driving ${targetName}`);
 }
 
-// Default transform: "You're <action> <Name>."
 const coreLc = coreClean.charAt(0).toLowerCase() + coreClean.slice(1);
-return normalizeSentencePunct(`${lead}You're ${coreLc} ${targetName}`);
 
+// If lead already includes "You're", don't add it again.
+const leadHasYoure = /\byou['’]re\b/i.test(String(lead || ''));
+const prefix = leadHasYoure ? String(lead || '') : `${String(lead || '')}You're `;
+
+return normalizeSentencePunct(`${prefix}${coreLc} ${targetName}`);
   }
 
   // Target != actor: "You <action> <TargetName>."
@@ -572,15 +575,76 @@ async function insertEntry(row) {
 }
 
 async function fetchPolicy(owner_id) {
+  const ownerKey = String(owner_id || '').trim();
+  if (!ownerKey) return {};
+
   try {
-    const { rows } = await pg.query(`SELECT * FROM public.employer_policies WHERE owner_id=$1`, [
-      String(owner_id || '').trim()
-    ]);
-    return rows[0] || { paid_break_minutes: 30, lunch_paid: true, paid_lunch_minutes: 30, drive_is_paid: true };
-  } catch {
-    return { paid_break_minutes: 30, lunch_paid: true, paid_lunch_minutes: 30, drive_is_paid: true };
+    // Try: JSON policy column (preferred)
+    // If your table DOES have "policy" jsonb, this will work immediately.
+    const { rows } = await pg.query(
+      `select
+         coalesce(policy, '{}'::jsonb) as policy,
+         *
+       from public.employer_policies
+      where owner_id = $1
+      limit 1`,
+      [ownerKey]
+    );
+
+    const row = rows?.[0] || null;
+    const policy = row?.policy && typeof row.policy === 'object' ? row.policy : {};
+
+    // If policy json is present and has any expected keys, return it as-is.
+    const hasNewKeys =
+      policy &&
+      (typeof policy.breaks_paid === 'boolean' ||
+        typeof policy.lunch_paid === 'boolean' ||
+        policy.auto_lunch_deduct_minutes != null ||
+        typeof policy.drive_paid === 'boolean');
+
+    if (hasNewKeys) return policy;
+
+    // Otherwise: map legacy/column-based schema → new policy keys.
+    // Your current defaults suggest you might have columns like:
+    // paid_break_minutes, lunch_paid, paid_lunch_minutes, drive_is_paid
+    const breaksPaid =
+      typeof row?.breaks_paid === 'boolean'
+        ? row.breaks_paid
+        : // If you store "paid_break_minutes", treat >0 as paid breaks enabled
+          (Number(row?.paid_break_minutes ?? 0) > 0 ? true : true); // default true
+
+    const lunchPaid =
+      typeof row?.lunch_paid === 'boolean'
+        ? row.lunch_paid
+        : true; // your previous fallback had lunch_paid:true; you can change this default if desired
+
+    const autoLunchDeduct =
+      Number.isFinite(Number(row?.auto_lunch_deduct_minutes))
+        ? Number(row.auto_lunch_deduct_minutes)
+        : // If lunch is unpaid and you had a "paid_lunch_minutes" concept, this is NOT the same.
+          // If you want auto-deduct behavior, add a real column or store it in policy json.
+          0;
+
+    const drivePaid =
+      typeof row?.drive_paid === 'boolean'
+        ? row.drive_paid
+        : typeof row?.drive_is_paid === 'boolean'
+          ? row.drive_is_paid
+          : true;
+
+    return {
+      breaks_paid: breaksPaid,
+      lunch_paid: lunchPaid,
+      auto_lunch_deduct_minutes: autoLunchDeduct,
+      drive_paid: drivePaid
+    };
+  } catch (e) {
+    console.warn('[POLICY] fetchPolicy failed (fail-open):', e?.message);
+    return {};
   }
 }
+
+
 
 async function entriesForShift(owner_id, shift_id) {
   const { rows } = await pg.query(
@@ -845,48 +909,50 @@ async function execClockViaCil({
   resolvedType,
   tsOverride,
   nowIso,
-
-  // ✅ add these
-  plan = "free",
-  role = "owner",
+  plan = 'free',
+  role = 'owner',
   crew_count = 0,
+  actorName = null
 }) {
-
   const atIso = tsOverride || nowIso || new Date().toISOString();
   const cil = buildClockCilFromResolvedType(resolvedType, atIso);
   if (!cil) return null;
 
-  // For MVP enforcement: ALWAYS use digits user_id.
-  const user_id = /^\d+$/.test(String(target || '').trim())
-    ? String(target || '').trim()
-    : String(paUserId || '').trim();
+  const digitsOr = (v, fallback) => (/^\d+$/.test(String(v || '').trim()) ? String(v).trim() : fallback);
 
-  // ✅ created_by should also be digits (fall back to paUserId)
-  const created_by = /^\d+$/.test(String(createdBy || '').trim())
-    ? String(createdBy).trim()
-    : String(paUserId || '').trim();
+  const owner_id = String(ownerId || '').trim();
+  const paDigits = String(paUserId || '').trim();
+  const user_id = digitsOr(target, paDigits);
+
+  const created_by = digitsOr(createdBy, paDigits);
+
+  const actorNameClean = String(actorName || '').trim() || null;
 
   const ctx = {
-  owner_id: String(ownerId || "").trim(),
-  user_id,
-  tz: tz || "America/Toronto",
-  source_msg_id: stableMsgId || null,
-  created_by,
-  job_id: jobId || null,
-  meta: { job_name: jobName || null },
+    owner_id,
+    user_id,
+    tz: tz || 'America/Toronto',
+    source_msg_id: stableMsgId || null,
+    created_by,
+    job_id: jobId || null,
 
-  // ✅ PLAN + ROLE (Phase 1 safe defaults)
-  // IMPORTANT: execClockViaCil does not know tenant/user plan/role unless passed in.
-  // So we set safe defaults here and upgrade later in Phase 2 via cilRouter.
-  plan: String(plan || "free").toLowerCase().trim(),
-role: String(role || "owner").toLowerCase().trim(),
-crew_count: Number.isFinite(Number(crew_count)) ? Number(crew_count) : 0,
-};
+    // optional but useful elsewhere
+    profileName: actorNameClean,
 
+    meta: {
+      job_name: jobName || null,
 
+      // what your "already clocked in" formatter reads
+      actorName: actorNameClean,
+      targetName: actorNameClean // self-case (actor == target)
+    },
 
-  const out = await handleClock(ctx, cil); // ✅ writes + emits facts inside
-  return out;
+    plan: String(plan || 'free').toLowerCase().trim(),
+    role: String(role || 'owner').toLowerCase().trim(),
+    crew_count: Number.isFinite(Number(crew_count)) ? Number(crew_count) : 0
+  };
+
+  return handleClock(ctx, cil); // ✅ writes + emits facts inside
 }
 
 
@@ -1509,7 +1575,31 @@ async function clearRepairPrompt(id) {
 
   if (parsed.action === 'in') {
     const open = await getOpenShift(owner_id, user_id);
-    if (open) return ret(`You’re already clocked in since ${formatLocal(open.start_at_utc, tz)}.`);
+    if (open) {
+  const who =
+    String(ctx?.meta?.targetName || ctx?.meta?.actorName || ctx?.meta?.name || '').trim() ||
+    String(ctx?.profileName || '').trim() ||
+    'there';
+
+  const dt = new Date(open.start_at_utc);
+  const timeLine = (() => {
+    try { return formatInTimeZone(dt, tz, 'h:mmaaa').replace('AM', 'am').replace('PM', 'pm'); }
+    catch { return formatLocal(open.start_at_utc, tz); }
+  })();
+
+  const dateLine = (() => {
+    try { return formatInTimeZone(dt, tz, 'EEEE, MMMM do, yyyy'); }
+    catch { return ''; }
+  })();
+
+  return ret(
+    `One moment, ${who}.\n` +
+    `It looks like you’ve been clocked in since:\n` +
+    `${timeLine}\n` +
+    `${dateLine ? dateLine : ''}`.trim()
+  );
+}
+
 
     const inserted = await insertEntry({
       owner_id,
@@ -1615,17 +1705,53 @@ async function clearRepairPrompt(id) {
     );
   } catch {}
 
-  // summary line (MUST exist in this scope)
-  const paidMinutes = Number(calc?.paidMinutes || 0);
-  const unpaidLunch = Number(calc?.unpaidLunch || 0);
-  const unpaidBreak = Number(calc?.unpaidBreak || 0);
+  // ---------------- Timesheet Truth summary ----------------
+const shiftMinutes = Number(calc?.shiftMinutes ?? 0);
+const breakTotal = Number(calc?.breakTotal ?? 0);
+const lunchTotal = Number(calc?.lunchTotal ?? 0);
+const driveTotal = Number(calc?.driveTotal ?? 0);
 
-  const summaryLine =
-    unpaidLunch > 0 || unpaidBreak > 0
-      ? `⏱️ Paid ${Math.floor(paidMinutes / 60)}h ${paidMinutes % 60}m (policy deducted lunch ${unpaidLunch}m, breaks ${unpaidBreak}m).`
-      : `⏱️ Paid ${Math.floor(paidMinutes / 60)}h ${paidMinutes % 60}m.`;
+const unpaidLunch = Number(calc?.unpaidLunch ?? 0);
+const unpaidBreak = Number(calc?.unpaidBreak ?? 0);
 
-  let finalText = `✅ Clocked out. ${summaryLine}`;
+// Work time = what actually happened (truth, not policy)
+const workMinutes = Math.max(0, shiftMinutes - breakTotal - lunchTotal);
+
+// Paid time = policy result (can differ from truth)
+const paidMinutes = Number(calc?.paidMinutes ?? workMinutes);
+
+// formatter
+const hm = (mins) => {
+  const m = Math.max(0, Number(mins) || 0);
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return `${h}h ${mm}m`;
+};
+
+// policy note line (only when policy changes paid)
+let policyNote = '';
+if (paidMinutes !== workMinutes) {
+  const bits = [];
+  if (unpaidLunch > 0) bits.push(`lunch ${unpaidLunch}m`);
+  if (unpaidBreak > 0) bits.push(`breaks ${unpaidBreak}m`);
+  policyNote = bits.length ? `Policy deducted: ${bits.join(', ')}.` : 'Policy adjusted paid time.';
+}
+
+// WhatsApp-friendly multi-line summary
+const truthLines = [
+  `⏱️ Shift: ${hm(shiftMinutes)}`,
+  `☕ Breaks: ${hm(breakTotal)}`,
+  `🥪 Lunch: ${hm(lunchTotal)}`,
+  `🚗 Drive: ${hm(driveTotal)} (tracked, not deducted)`,
+  ``,
+  `🧱 Work time (Shift − Break − Lunch): ${hm(workMinutes)}`,
+  `💵 Paid time: ${hm(paidMinutes)}`
+];
+
+if (policyNote) truthLines.push(``, `ℹ️ ${policyNote}`);
+
+let finalText = `✅ Clocked out.\n${truthLines.join('\n')}`;
+
 
   // If a segment was open at clock-out, create repair prompt + use kind-specific copy
   if (openSegId && openSegKind) {
@@ -1660,8 +1786,10 @@ async function clearRepairPrompt(id) {
       const label = openSegKind === 'lunch' ? 'lunch' : openSegKind === 'drive' ? 'drive' : 'break';
 
       finalText =
-        `✅ Clocked out. Your ${label} was still running — I ended it at clock-out.\n` +
-        `How long was your ${label}? (e.g., “20 min”) or reply “skip”.`;
+  `✅ Clocked out.\n` +
+  `${truthLines.join('\n')}\n\n` +
+  `Your ${label} was still running — I ended it at clock-out.\n` +
+  `How long was your ${label}? (e.g., “20 min”) or reply “skip”.`;
     } catch (e) {
       console.warn('[REPAIR_PROMPT] insert failed (ignored):', e?.message);
     }
@@ -1844,6 +1972,9 @@ return ret('Timeclock: action not recognized.');
 async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId = null) {
   const tz = userProfile?.tz || userProfile?.timezone || 'America/Toronto';
   const now = new Date();
+  const actorName =
+  String(userProfile?.name || userProfile?.ProfileName || '').trim() ||
+  'there';
 
   const reqBody = res?.req?.body || {};
   const paUserId = getPaUserId(from, userProfile, reqBody); // ✅ digits
@@ -2036,15 +2167,15 @@ Detected: ${shape}`
   tz,
   stableMsgId,
   jobName,
-  resolvedType: forcedType,
+  resolvedType,
   tsOverride: tsOverrideIso || null,
   nowIso: now.toISOString(),
-
-  // ✅ pass plan/role through
   plan,
   role,
   crew_count,
+  actorName,
 });
+
 
       return twimlWithTargetName(
   res,
@@ -2094,7 +2225,7 @@ return twiml(res, msg);
     }
 
     // ----------------- MAIN: ALWAYS CIL -> handleClock (NO legacy DB writes) -----------------
-    const out = await execClockViaCil({
+  const out = await execClockViaCil({
   ownerId,
   paUserId: targetUserId,
   target: targetUserId,
@@ -2104,12 +2235,12 @@ return twiml(res, msg);
   resolvedType,
   tsOverride: tsOverrideIso || null,
   nowIso: now.toISOString(),
-
-  // ✅ pass plan/role through
   plan,
   role,
   crew_count,
+  actorName,
 });
+
 
 
    return twimlWithTargetName(
@@ -2302,177 +2433,225 @@ async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
 
   const tz = req?.userProfile?.tz || req?.userProfile?.timezone || DEFAULT_TZ;
 
-  const s = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const raw = String(text || '').trim();
+  const s = raw.toLowerCase().replace(/\s+/g, ' ').trim();
   if (!/^timesheet\b/.test(s)) return false;
 
-  // ----- detect export intent -----
-  // Supported:
-  // - "timesheet week xlsx" / "timesheet xlsx"
-  // - "timesheet week pdf"  / "timesheet pdf"
-  // Default: summary text (no export)
+  // -----------------------------
+  // 1) export intent (pdf/xlsx)
+  // -----------------------------
   const wantsXlsx = /\b(xlsx|excel)\b/.test(s);
-  const wantsPdf = /\b(pdf)\b/.test(s);
+  const wantsPdf = /\bpdf\b/.test(s);
   const wantsExport = wantsXlsx || wantsPdf;
-
   const exportKind = wantsPdf ? 'export_pdf' : 'export_xlsx';
 
-  const range = (() => {
-    if (/^timesheet\s+today\b/.test(s)) return { mode: 'today' };
-    if (/^timesheet\s+last\s+week\b/.test(s)) return { mode: 'last_week' };
-    if (/^timesheet\s+week\b/.test(s)) return { mode: 'week' };
-    if (/^timesheet\s+crew\b/.test(s)) return { mode: 'week', who: 'crew' };
+  // -----------------------------
+  // 2) range intent
+  // -----------------------------
+  const rangeMode =
+    /\btoday\b/.test(s) ? 'today' :
+    /\blast week\b/.test(s) ? 'last_week' :
+    'week';
 
-    // ✅ "timesheet me" = actor's timesheet (this week)
-    if (/^timesheet\s+(me|my|mine)\b/.test(s)) return { mode: 'week', who: actorKey };
+// -----------------------------
+// 3) "who" intent (crew / me / name / digits)
+// -----------------------------
+const whoToken = (tok) => `__WHO__${tok}__`;
 
-    // timesheet <name>
-    const m = s.match(/^timesheet\s+(.+?)\s*$/);
-    if (m && m[1]) return { mode: 'week', who: m[1].trim() };
+const cleanedWho = s
+  .replace(/^timesheet\b/, '')
+  .replace(/\b(last week|today|week)\b/g, '') // "last week" must be first
+  .replace(/\b(crew|me|my|mine)\b/g, (m) => whoToken(m.toLowerCase()))
+  .replace(/\b(pdf|xlsx|excel)\b/g, '')
+  .replace(/\s+/g, ' ')
+  .trim();
 
-    return { mode: 'week' };
-  })();
+let who = null;
 
-  const { startUtcIso, endUtcIso, label } = computeRangeUtc(range.mode, tz, new Date());
+const hasCrew = cleanedWho.includes(whoToken('crew')) || /\btimesheet\s+crew\b/.test(s);
+const hasMe =
+  cleanedWho.includes(whoToken('me')) ||
+  cleanedWho.includes(whoToken('my')) ||
+  cleanedWho.includes(whoToken('mine')) ||
+  /\btimesheet\s+(me|my|mine)\b/.test(s);
 
+if (hasCrew) {
+  who = 'crew';
+} else if (hasMe) {
+  who = String(actorKey || '').trim() || null;
+} else if (cleanedWho) {
+  who =
+    cleanedWho
+      .replace(/__WHO__\w+__/g, '')
+      .replace(/\s+/g, ' ')
+      .trim() || null;
+}
+
+const { startUtcIso, endUtcIso, label } = computeRangeUtc(rangeMode, tz, new Date());
+
+
+
+  // -----------------------------
+  // 4) resolve filterUserIds
+  // -----------------------------
   let filterUserIds = null;
-  if (range.who) {
-    const who = String(range.who || '').toLowerCase().trim();
-    if (/^\d+$/.test(who)) filterUserIds = [who];
-    else if (who === 'crew') filterUserIds = ['crew'];
-    else {
-      const hit = await resolveUserIdsByName(owner_id, who, actorKey);
-      filterUserIds = hit?.length ? hit : null;
-      if (!filterUserIds) {
+  let titleWhoLabel = null;
+
+  if (who) {
+    const w = String(who).trim();
+
+    if (/^crew$/i.test(w)) {
+      filterUserIds = null; // crew = all users under owner
+      titleWhoLabel = 'Crew';
+    } else if (/^\d+$/.test(w)) {
+      filterUserIds = [w];
+      titleWhoLabel = await displayNameForUserId(owner_id, w);
+    } else {
+      // name -> user ids
+      const hit = await resolveUserIdsByName(owner_id, w, actorKey);
+      if (!hit?.length) {
         return twiml(
           res,
-          `I don’t recognize "${range.who}".\n\nTry:\n- timesheet today\n- timesheet week\n- timesheet last week\n- timesheet Crew`
+          `I don’t recognize "${who}".\n\nTry:\n- timesheet week\n- timesheet me\n- timesheet crew\n- timesheet Jaclyn\n- timesheet week xlsx`
         );
       }
+      // If multiple matches, we can either fail or pick the first.
+      // For now: if >1, fail soft with guidance (prevents wrong payroll).
+      if (hit.length > 1) {
+        return twiml(
+          res,
+          `I found multiple matches for "${who}". Try a more specific name, or use:\n- timesheet crew\n- timesheet <phone digits>`
+        );
+      }
+      filterUserIds = [String(hit[0]).trim()];
+      titleWhoLabel = await displayNameForUserId(owner_id, filterUserIds[0]);
     }
+  } else {
+    // default = actor
+    filterUserIds = actorKey ? [String(actorKey).trim()] : null;
+    titleWhoLabel = filterUserIds?.[0] ? await displayNameForUserId(owner_id, filterUserIds[0]) : null;
   }
 
-  // ----- planKey (for quotas) -----
-  // Prefer req.userProfile; fall back to owner profile if available
-  let planKey =
-    String(
-      req?.userProfile?.plan_key ||
-        req?.userProfile?.subscription_tier ||
-        req?.userProfile?.paid_tier ||
-        'free'
-    )
-      .toLowerCase()
-      .trim() || 'free';
-
+  // -----------------------------
+  // 5) resolve planKey for export gates
+  // -----------------------------
+  let ownerProfile = null;
   try {
-    if ((planKey === 'free' || !planKey) && typeof pg.getOwnerProfile === 'function') {
-      const op = await pg.getOwnerProfile(owner_id);
-      const p2 = String(op?.plan_key || op?.subscription_tier || op?.paid_tier || '').toLowerCase().trim();
-      if (p2) planKey = p2;
+    if (typeof pg.getOwnerProfile === 'function') {
+      ownerProfile = await pg.getOwnerProfile(owner_id);
     }
   } catch {}
 
-  // ----- EXPORT PATH -----
+  const planKey =
+    String(
+      req?.userProfile?.plan_key ||
+      ownerProfile?.plan_key ||
+      ownerProfile?.plan ||
+      ownerProfile?.subscription_tier ||
+      ownerProfile?.paid_tier ||
+      'free'
+    ).toLowerCase().trim() || 'free';
+
+  const ownerIdKey = String(owner_id || '').trim();
+
+  // -----------------------------
+  // 6) EXPORT path (v2-first)
+  // -----------------------------
   if (wantsExport) {
-    const canXlsx = typeof pg.exportTimesheetXlsx === 'function';
-    const canPdf = typeof pg.exportTimesheetPdf === 'function';
-
-    if (wantsXlsx && !canXlsx) {
-      return twiml(res, `⚠️ Timesheet XLSX export isn’t available in this build yet.`);
-    }
-    if (wantsPdf && !canPdf) {
-      return twiml(res, `⚠️ Timesheet PDF export isn’t available in this build yet.`);
-    }
-
-    // ✅ Quota precheck with reason (NOT_INCLUDED vs OVER_QUOTA)
-    let q;
+    // Quota gate with reason (NOT_INCLUDED vs OVER_QUOTA)
     try {
-      q = await checkMonthlyQuota({
-        ownerId: owner_id,
-        planKey,
-        kind: exportKind,
-        units: 1
-      });
-    } catch (e) {
-      return twiml(res, `⚠️ Export is temporarily unavailable. Please try again.`);
-    }
+      const q = await checkMonthlyQuota({ ownerId: ownerIdKey, planKey, kind: exportKind, units: 1 });
+      if (!q.ok) {
+        // flip upsell flag once (export)
+        try {
+          const r = await shouldShowUpgradePromptOnce({ ownerId: ownerIdKey, kind: exportKind });
+          console.info('[UPSELL_FLAG]', { kind: exportKind, ownerId: ownerIdKey, ...r });
+        } catch {}
 
-    if (!q?.ok) {
-      // One-time upsell flag (account-level)
-      let show = false;
-      try {
-        const r = await shouldShowUpgradePromptOnce({ ownerId: owner_id, kind: exportKind });
-        show = !!r?.shouldShow;
-      } catch {}
-
-      // Distinct copy
-      if (q?.reason === 'NOT_INCLUDED') {
-        const base =
-          `Exports aren’t included on your plan.\n\n` +
-          `Starter unlocks timesheet exports (Excel/PDF).\n` +
-          `You can still view the summary here with: "timesheet week".`;
-
-        return twiml(res, show ? `${base}\n\nUpgrade when it makes sense.` : base);
+        const whoLine = titleWhoLabel ? ` (${titleWhoLabel})` : '';
+        if (q.reason === 'NOT_INCLUDED') {
+          return twiml(
+            res,
+            `📤 Exports aren’t included on your plan.\n\nUpgrade to Starter or Pro to export ${wantsPdf ? 'PDF' : 'XLSX'} timesheets${whoLine}.`
+          );
+        }
+        // OVER_QUOTA
+        if (planKey === 'pro') {
+          return twiml(
+            res,
+            `📤 You’ve used your monthly ${wantsPdf ? 'PDF' : 'XLSX'} export allowance.\n\nYour limit resets next month. For now, you can still view the timesheet summary in chat.`
+          );
+        }
+        return twiml(
+          res,
+          `📤 You’ve used your monthly ${wantsPdf ? 'PDF' : 'XLSX'} export allowance.\n\nYou can:\n• Wait until next month\n• Upgrade for higher capacity\n• Use the chat summary now (no export needed)`
+        );
       }
-
-      // OVER_QUOTA (paid plan)
-      const base =
-        `You’ve used your monthly export allowance.\n\n` +
-        `You can:\n` +
-        `• Wait until your limit resets next month\n` +
-        `• Upgrade for higher capacity\n` +
-        `• View the summary instead: "timesheet week"`;
-
-      return twiml(res, show ? `${base}\n\nNothing is lost — exports just pause until reset or upgrade.` : base);
-    }
-
-    // ✅ Consume BEFORE generating export (server cost surface)
-    try {
-      await consumeMonthlyQuota({ ownerId: owner_id, kind: exportKind, units: 1 });
     } catch (e) {
-      return twiml(res, `⚠️ Export is temporarily unavailable. Please try again.`);
+      console.warn('[TIMESHEET_EXPORT] quota gate failed (fail-open):', e?.message);
     }
 
-    // Generate export (returns { url, id, filename } in your postgres.js)
+    // consume BEFORE export (matches your quota pattern)
     try {
+      await consumeMonthlyQuota({ ownerId: ownerIdKey, kind: exportKind, units: 1 });
+    } catch (e) {
+      console.warn('[TIMESHEET_EXPORT] consume failed (ignored):', e?.message);
+    }
+
+    // Export using v2 exports if present, else fallback
+    try {
+      const startIso = startUtcIso;
+      const endIso = endUtcIso;
+
       const opts = {
-        ownerId: owner_id,
-        startUtcIso,
-        endUtcIso,
+        ownerId: ownerIdKey,
+        startIso,
+        endIso,
         tz,
-        filterUserIds // pass through; postgres.js can ignore if it doesn't support
+        filterUserIds: filterUserIds && filterUserIds.length ? filterUserIds : null
       };
 
-      const out = wantsPdf ? await pg.exportTimesheetPdf(opts) : await pg.exportTimesheetXlsx(opts);
-      const url = String(out?.url || '').trim();
+      let out = null;
+      if (wantsPdf && typeof pg.exportTimesheetPdfV2 === 'function') out = await pg.exportTimesheetPdfV2(opts);
+      if (wantsXlsx && typeof pg.exportTimesheetXlsxV2 === 'function') out = await pg.exportTimesheetXlsxV2(opts);
 
-      if (!url) return twiml(res, `⚠️ Export failed to generate a link. Please try again.`);
+      // fallback to legacy exports if v2 ones not present
+      if (!out && wantsPdf && typeof pg.exportTimesheetPdf === 'function') {
+        // legacy expects employeeName; if you *must* use it, only allow when single user and name exists
+        if (filterUserIds?.length === 1) {
+          const nm = await displayNameForUserId(owner_id, filterUserIds[0]);
+          out = await pg.exportTimesheetPdf({ ownerId: ownerIdKey, startIso, endIso, employeeName: nm || null, tz });
+        } else {
+          out = await pg.exportTimesheetPdf({ ownerId: ownerIdKey, startIso, endIso, employeeName: null, tz });
+        }
+      }
+      if (!out && wantsXlsx && typeof pg.exportTimesheetXlsx === 'function') {
+        if (filterUserIds?.length === 1) {
+          const nm = await displayNameForUserId(owner_id, filterUserIds[0]);
+          out = await pg.exportTimesheetXlsx({ ownerId: ownerIdKey, startIso, endIso, employeeName: nm || null, tz });
+        } else {
+          out = await pg.exportTimesheetXlsx({ ownerId: ownerIdKey, startIso, endIso, employeeName: null, tz });
+        }
+      }
 
-      const typeLabel = wantsPdf ? 'PDF' : 'Excel (XLSX)';
-      const whoLabel =
-        filterUserIds?.length && filterUserIds[0] === 'crew'
-          ? 'Crew'
-          : (filterUserIds?.length ? 'Selected worker(s)' : 'All');
+      if (!out?.url) return twiml(res, `⚠️ Export is temporarily unavailable. Please try again.`);
 
-      return twiml(
-        res,
-        `✅ Timesheet ${typeLabel} ready — ${label}\n` +
-          `Scope: ${whoLabel}\n\n` +
-          `${url}\n\n` +
-          `Tip: "timesheet week" shows the summary in chat.`
-      );
+      const whoLine = titleWhoLabel ? ` — ${titleWhoLabel}` : '';
+      return twiml(res, `✅ ${wantsPdf ? 'PDF' : 'XLSX'} ready${whoLine}:\n${out.url}`);
     } catch (e) {
-      return twiml(res, `⚠️ Export failed. Please try again, or use: "timesheet week".`);
+      console.warn('[TIMESHEET_EXPORT] export failed:', e?.message);
+      return twiml(res, `⚠️ Export is temporarily unavailable. Please try again.`);
     }
   }
 
-  // ----- SUMMARY PATH (existing behavior) -----
+  // -----------------------------
+  // 7) SUMMARY path (Timesheet Truth, v2)
+  // -----------------------------
+
+  // 7a) pull shifts for range + filter
   const params = [owner_id, startUtcIso, endUtcIso];
   let sql = `
-    SELECT user_id,
-           start_at_utc,
-           end_at_utc,
-           coalesce((meta->'calc'->>'paidMinutes')::int, 0) AS paid_minutes,
-           coalesce((meta->'calc'->>'driveTotal')::int, 0) AS drive_minutes
+    SELECT id, user_id, start_at_utc, end_at_utc, meta
       FROM public.time_entries_v2
      WHERE owner_id = $1
        AND kind = 'shift'
@@ -2489,39 +2668,269 @@ async function handleTimesheetCommand({ ownerId, actorKey, text, req, res }) {
 
   sql += ` ORDER BY user_id, start_at_utc ASC`;
 
-  const { rows } = await pg.query(sql, params);
-
-  if (!rows?.length) {
+  const { rows: shiftRows } = await pg.query(sql, params);
+  if (!shiftRows?.length) {
+    const whoLine = titleWhoLabel ? ` for ${titleWhoLabel}` : '';
     return twiml(
       res,
-      `No shifts found for ${label}.\n\nTry:\n- timesheet week\n- timesheet week xlsx\n- timesheet week pdf`
+      `No shifts found${whoLine} for ${label}.\n\nTry:\n- timesheet week\n- timesheet me\n- timesheet crew\n- timesheet week xlsx\n- timesheet week pdf`
     );
   }
 
-  const byUser = new Map();
-  for (const r of rows) {
-    const uid = String(r.user_id || 'unknown');
-    if (!byUser.has(uid)) byUser.set(uid, { paid: 0, drive: 0 });
-    const agg = byUser.get(uid);
-    agg.paid += Number(r.paid_minutes || 0);
-    agg.drive += Number(r.drive_minutes || 0);
+  // 7b) load children for those shifts (one query)
+  const shiftIds = shiftRows.map((r) => r.id).filter(Boolean);
+  let childRows = [];
+  try {
+    const { rows } = await pg.query(
+      `
+      SELECT parent_id, kind, start_at_utc, end_at_utc
+        FROM public.time_entries_v2
+       WHERE owner_id = $1
+         AND deleted_at IS NULL
+         AND parent_id = ANY($2::uuid[])
+         AND kind IN ('break','lunch','drive')
+      `,
+      [owner_id, shiftIds]
+    );
+    childRows = rows || [];
+  } catch (e) {
+    console.warn('[TIMESHEET] child fetch failed (ignored):', e?.message);
   }
 
+  // 7c) per-shift “truth” calc
+  const byShiftId = new Map(); // shift_id -> {break,lunch,drive}
+  for (const c of (childRows || [])) {
+    const pid = c.parent_id;
+    if (!pid) continue;
+    if (!byShiftId.has(pid)) byShiftId.set(pid, { breakM: 0, lunchM: 0, driveM: 0 });
+
+    const agg = byShiftId.get(pid);
+    const mins = Math.max(
+      0,
+      Math.round((new Date(c.end_at_utc).getTime() - new Date(c.start_at_utc).getTime()) / 60000)
+    );
+
+    if (c.kind === 'break') agg.breakM += mins;
+    if (c.kind === 'lunch') agg.lunchM += mins;
+    if (c.kind === 'drive') agg.driveM += mins;
+  }
+
+  // 7d) aggregate per user
+  const byUser = new Map(); // user_id -> totals
+  for (const sh of shiftRows) {
+    const uid = String(sh.user_id || 'unknown').trim();
+    if (!byUser.has(uid)) {
+      byUser.set(uid, { shiftM: 0, breakM: 0, lunchM: 0, driveM: 0, workM: 0, paidM: 0 });
+    }
+    const u = byUser.get(uid);
+
+    const shiftM = Math.max(
+      0,
+      Math.round((new Date(sh.end_at_utc).getTime() - new Date(sh.start_at_utc).getTime()) / 60000)
+    );
+
+    const seg = byShiftId.get(sh.id) || { breakM: 0, lunchM: 0, driveM: 0 };
+    const workM = Math.max(0, shiftM - seg.breakM - seg.lunchM);
+
+    // For now: paid = work (policy-agnostic summary)
+    const paidM = workM;
+
+    u.shiftM += shiftM;
+    u.breakM += seg.breakM;
+    u.lunchM += seg.lunchM;
+    u.driveM += seg.driveM;
+    u.workM += workM;
+    u.paidM += paidM;
+  }
+
+  // 7e) render
   const lines = [];
-  lines.push(`🧾 Timesheet — ${label}`);
+  const whoTitle = (filterUserIds?.length === 1 && titleWhoLabel) ? ` — ${titleWhoLabel}` :
+                   (!filterUserIds?.length && titleWhoLabel) ? ` — ${titleWhoLabel}` :
+                   '';
+
+  lines.push(`🧾 Timesheet${whoTitle} — ${label}`);
   lines.push(`Range: ${fmtDateTime(startUtcIso, tz)} → ${fmtDateTime(endUtcIso, tz)}`);
   lines.push('');
 
-  for (const [uid, agg] of byUser.entries()) {
-    const name = await displayNameForUserId(owner_id, uid);
-    lines.push(`• ${name}: ${minsToHM(agg.paid)} paid` + (agg.drive ? ` (drive ${minsToHM(agg.drive)})` : ''));
+  // Individual summary (single person)
+  if (filterUserIds?.length === 1) {
+    const uid = filterUserIds[0];
+    const a = byUser.get(uid);
+    if (!a) return twiml(res, `No shifts found for ${label}.`);
+
+    lines.push(`⏱️ Shift: ${minsToHM(a.shiftM)}`);
+    lines.push(`☕ Breaks: ${minsToHM(a.breakM)}`);
+    lines.push(`🥪 Lunch: ${minsToHM(a.lunchM)}`);
+    lines.push(`🚗 Drive: ${minsToHM(a.driveM)} (tracked, not deducted)`);
+    lines.push('');
+    lines.push(`🧱 Work time (Shift − Break − Lunch): ${minsToHM(a.workM)}`);
+    lines.push(`💵 Paid time: ${minsToHM(a.paidM)}`);
+
+  } else {
+    // Crew summary (per-person lines)
+    let grand = { shiftM: 0, breakM: 0, lunchM: 0, driveM: 0, workM: 0, paidM: 0 };
+
+    for (const [uid, a] of byUser.entries()) {
+      const name = await displayNameForUserId(owner_id, uid);
+      lines.push(
+        `• ${name}: Paid ${minsToHM(a.paidM)} | Work ${minsToHM(a.workM)} | Break ${minsToHM(a.breakM)} | Lunch ${minsToHM(a.lunchM)} | Drive ${minsToHM(a.driveM)}`
+      );
+
+      grand.shiftM += a.shiftM;
+      grand.breakM += a.breakM;
+      grand.lunchM += a.lunchM;
+      grand.driveM += a.driveM;
+      grand.workM += a.workM;
+      grand.paidM += a.paidM;
+    }
+
+    lines.push('');
+    lines.push(`📌 Crew total`);
+    lines.push(`💵 Paid: ${minsToHM(grand.paidM)} | 🧱 Work: ${minsToHM(grand.workM)} | ☕ Break: ${minsToHM(grand.breakM)} | 🥪 Lunch: ${minsToHM(grand.lunchM)} | 🚗 Drive: ${minsToHM(grand.driveM)}`);
   }
 
   lines.push('');
-  lines.push(`Exports: "timesheet week xlsx" | "timesheet week pdf"`);
-  lines.push(`Summary: "timesheet today" | "timesheet week" | "timesheet Crew"`);
+  lines.push(`Try:\n- timesheet week\n- timesheet me\n- timesheet crew\n- timesheet week xlsx\n- timesheet week pdf`);
 
   return twiml(res, lines.join('\n'));
+}
+
+// ---------- V2 EXCEL EXPORT (lazy load) ----------
+let ExcelJS_V2 = null;
+async function exportTimesheetXlsxV2(opts) {
+  if (!ExcelJS_V2) ExcelJS_V2 = require('exceljs');
+
+  const { ownerId, startIso, endIso, userId = null, tz = 'America/Toronto' } = opts;
+  const owner = DIGITS(ownerId);
+  const uid = userId ? String(userId).trim() : null;
+
+  const params = uid ? [owner, startIso, endIso, uid] : [owner, startIso, endIso];
+
+  const { rows } = await queryWithTimeout(
+    `
+    SELECT te.user_id,
+           te.start_at_utc,
+           te.end_at_utc,
+           COALESCE((te.meta->'calc'->>'paidMinutes')::int, 0) AS paid_minutes,
+           COALESCE((te.meta->'calc'->>'driveTotal')::int, 0) AS drive_minutes,
+           COALESCE(j.name, j.job_name, te.job_name, '') AS job_name
+      FROM public.time_entries_v2 te
+      LEFT JOIN public.jobs j
+        ON j.owner_id = te.owner_id
+       AND (j.id::text = COALESCE(NULLIF(te.job_id::text,''), NULL))
+     WHERE te.owner_id = $1
+       AND te.kind = 'shift'
+       AND te.deleted_at IS NULL
+       AND te.end_at_utc IS NOT NULL
+       AND te.start_at_utc >= $2::timestamptz
+       AND te.start_at_utc <  $3::timestamptz
+       ${uid ? 'AND te.user_id = $4' : ''}
+     ORDER BY te.user_id, te.start_at_utc ASC
+    `,
+    params,
+    15000
+  );
+
+  const wb = new ExcelJS_V2.Workbook();
+  const ws = wb.addWorksheet('Timesheet');
+
+  ws.columns = [
+    { header: 'UserId', key: 'user_id' },
+    { header: 'Start (UTC)', key: 'start_at_utc' },
+    { header: 'End (UTC)', key: 'end_at_utc' },
+    { header: 'Paid Minutes', key: 'paid_minutes' },
+    { header: 'Drive Minutes', key: 'drive_minutes' },
+    { header: 'Job', key: 'job_name' }
+  ];
+
+  (rows || []).forEach((r) => ws.addRow(r));
+
+  const buf = await wb.xlsx.writeBuffer();
+  const id = crypto.randomBytes(12).toString('hex');
+
+  const suffix = uid ? `_user_${uid}` : '';
+  const filename = `timesheet_v2_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${suffix}.xlsx`;
+
+  await query(
+    `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
+     VALUES ($1,$2,$3,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',$4,NOW())`,
+    [id, owner, filename, Buffer.from(buf)]
+  );
+
+  const base = process.env.PUBLIC_BASE_URL || '';
+  return { url: `${base}/exports/${id}`, id, filename };
+}
+
+// ---------- V2 PDF EXPORT (lazy load) ----------
+let PDFDocument_V2 = null;
+async function exportTimesheetPdfV2(opts) {
+  if (!PDFDocument_V2) PDFDocument_V2 = require('pdfkit');
+
+  const { ownerId, startIso, endIso, userId = null, tz = 'America/Toronto' } = opts;
+  const owner = DIGITS(ownerId);
+  const uid = userId ? String(userId).trim() : null;
+
+  const params = uid ? [owner, startIso, endIso, uid] : [owner, startIso, endIso];
+
+  const { rows } = await queryWithTimeout(
+    `
+    SELECT te.user_id,
+           te.start_at_utc,
+           te.end_at_utc,
+           COALESCE((te.meta->'calc'->>'paidMinutes')::int, 0) AS paid_minutes,
+           COALESCE((te.meta->'calc'->>'driveTotal')::int, 0) AS drive_minutes,
+           COALESCE(j.name, j.job_name, te.job_name, '') AS job_name,
+           COALESCE(te.tz, $4) AS tz
+      FROM public.time_entries_v2 te
+      LEFT JOIN public.jobs j
+        ON j.owner_id = te.owner_id
+       AND (j.id::text = COALESCE(NULLIF(te.job_id::text,''), NULL))
+     WHERE te.owner_id = $1
+       AND te.kind = 'shift'
+       AND te.deleted_at IS NULL
+       AND te.end_at_utc IS NOT NULL
+       AND te.start_at_utc >= $2::timestamptz
+       AND te.start_at_utc <  $3::timestamptz
+       ${uid ? 'AND te.user_id = $4' : ''}
+     ORDER BY te.user_id, te.start_at_utc ASC
+    `,
+    uid ? params : [owner, startIso, endIso, tz],
+    15000
+  );
+
+  const doc = new PDFDocument_V2({ margin: 40 });
+  const chunks = [];
+  doc.on('data', (d) => chunks.push(d));
+  const done = new Promise((r) => doc.on('end', r));
+
+  doc.fontSize(16).text(`Timesheet (v2) ${startIso.slice(0, 10)} – ${endIso.slice(0, 10)}`, { align: 'center' }).moveDown();
+
+  (rows || []).forEach((r) => {
+    doc
+      .fontSize(10)
+      .text(
+        `User ${r.user_id} | paid ${r.paid_minutes}m | drive ${r.drive_minutes}m | ${r.job_name || ''} | ${r.start_at_utc} → ${r.end_at_utc}`
+      );
+  });
+
+  doc.end();
+  await done;
+
+  const buf = Buffer.concat(chunks);
+  const id = crypto.randomBytes(12).toString('hex');
+
+  const suffix = uid ? `_user_${uid}` : '';
+  const filename = `timesheet_v2_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${suffix}.pdf`;
+
+  await query(
+    `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
+     VALUES ($1,$2,$3,'application/pdf',$4,NOW())`,
+    [id, owner, filename, buf]
+  );
+
+  const base = process.env.PUBLIC_BASE_URL || '';
+  return { url: `${base}/exports/${id}`, id, filename };
 }
 
 
@@ -2532,6 +2941,7 @@ module.exports = {
   handleTimesheetCommand,
   twimlWithTargetName,
   handleSegmentDurationRepairReply,
+  
 };
 
 

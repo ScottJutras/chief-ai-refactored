@@ -23,6 +23,24 @@ const CFO = {
   nudge: (s) => `${s} (one more detail?)`,
   follow: (s) => s
 };
+function twimlEmpty() {
+  return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+}
+
+function twimlTextSafe(s = '') {
+  const t = String(s ?? '').trim();
+  if (!t) return twimlEmpty();
+
+  // Minimal escaping (safe for TwiML)
+  const esc = t
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${esc}</Message></Response>`;
+}
 
 function normalize(s = '') {
   return String(s).toLowerCase().replace(/[^\w\s\.\-:$@]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -248,18 +266,20 @@ async function converseAndRoute(userText, { userProfile, ownerId, convoState, me
   }
 
   if (!key || score < MID) {
-    return {
-      handled: true,
-      twiml:
-        `<Response><Message>` +
-        CFO.ask('I can help with tasks, time, expenses.') + `\n` +
-        `• “task - buy tape”\n` +
-        `• “tasks”\n` +
-        `• “task @everyone - team standup at 8”\n` +
-        CFO.follow('What do you want to do?') +
-        `</Message></Response>`
-    };
-  }
+  return {
+    handled: true,
+    twiml: twimlTextSafe(
+      [
+        CFO.ask('I can help with tasks, time, expenses.'),
+        '• “task - buy tape”',
+        '• “tasks”',
+        '• “task @everyone - team standup at 8”',
+        CFO.follow('What do you want to do?')
+      ].join('\n')
+    )
+  };
+}
+
 
   const def = CATALOG[key] || {};
   const slots = extractSlots(key, userText, convoState, memory);
@@ -272,7 +292,7 @@ async function converseAndRoute(userText, { userProfile, ownerId, convoState, me
     convoState.aliases[aliasKey] = value;
     convoState.pendingAlias = null;
     const response = CFO.confirm(`Saved “${aliasKey}” as ${value}. Now, what’s the expense details?`);
-    return { handled: true, twiml: `<Response><Message>${response}</Message></Response>` };
+    return { handled: true, twiml: twimlTextSafe(response) };
   }
 
   // Missing required slots
@@ -282,7 +302,7 @@ async function converseAndRoute(userText, { userProfile, ownerId, convoState, me
     const ask = def.asks?.[first] || `I need ${first}.`;
     const hint = def.personality_hints?.[0] ? def.personality_hints[0] + ' ' : '';
     const response = CFO.ask(`${hint}${ask}`);
-    return { handled: true, twiml: `<Response><Message>${response}</Message></Response>`, intent: key };
+    return { handled: true, twiml: twimlTextSafe(response), intent: key };
   }
 
   // Inline memory intents
@@ -290,27 +310,37 @@ async function converseAndRoute(userText, { userProfile, ownerId, convoState, me
     const mem = await getMemory(ownerId, userProfile.user_id, []);
     const summary = Object.entries(mem || {}).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join('\n') || 'Nothing yet!';
     const response = CFO.confirm(`Here’s what I know:\n${summary}`);
-    return { handled: true, twiml: `<Response><Message>${response}</Message></Response>` };
+    return { handled: true, twiml: twimlTextSafe(response) };
   }
   if (key === 'memory.forget') {
     await forget(ownerId, userProfile.user_id, slots.key);
     const response = CFO.confirm(`Forgot ${slots.key}. Anything else?`);
-    return { handled: true, twiml: `<Response><Message>${response}</Message></Response>` };
+    return { handled: true, twiml: twimlTextSafe(response) };
   }
 
-  // Normalize for handlers
-  const norm = normalizeForHandlers(key, slots);
-  if (norm) {
-    const confirmLine = fillTemplate(def.confirm || 'Okay.', slots);
-    const follow = def.follow_up_prompts?.[0] || 'What’s next?';
-    const response = CFO.confirm(`${confirmLine} ${follow}`);
-    return { handled: false, ...norm, twiml: `<Response><Message>${response}</Message></Response>`, intent: key, args: slots };
-  }
+// Normalize for handlers
+const norm = normalizeForHandlers(key, slots);
+if (norm) {
+  const confirmLine = fillTemplate(def.confirm || 'Okay.', slots);
+  const follow = def.follow_up_prompts?.[0] || 'What’s next?';
+  const response = CFO.confirm(`${confirmLine} ${follow}`.trim());
 
-  return {
-    handled: true,
-    twiml: `<Response><Message>${CFO.ask('Got it. Want to create a task, list your tasks, or send one to everyone?')}</Message></Response>`
-  };
+  // ✅ IMPORTANT:
+  // This should be handled:false so webhook continues to the actual handler route.
+  return { handled: false, ...norm, twiml: twimlTextSafe(response), intent: key, args: slots };
+}
+
+
+return {
+  handled: true,
+  twiml: twimlTextSafe(
+    [
+      CFO.ask('Got it. Want to create a task, list your tasks, or send one to everyone?'),
+      CFO.follow('What do you want to do?')
+    ].join('\n')
+  )
+};
+
 }
 
 module.exports = { converseAndRoute };

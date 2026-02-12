@@ -46,16 +46,21 @@ function xmlEsc(s = '') {
     .replace(/'/g, '&apos;');
 }
 
-function twiml(res, body) {
-  return res
-    .status(200)
-    .type('application/xml')
-    .send(`<Response><Message>${xmlEsc(String(body || '').trim())}</Message></Response>`);
+function twimlEmpty(res) {
+  const xml = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+  return res.status(200).type('application/xml; charset=utf-8').send(xml);
 }
 
-function twimlEmpty(res) {
-  return res.status(200).type('application/xml').send('<Response></Response>');
+function twiml(res, body) {
+  const t = String(body ?? '').trim();
+
+  // ✅ Never emit empty <Message> (Twilio 14103)
+  if (!t) return twimlEmpty(res);
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${xmlEsc(t)}</Message></Response>`;
+  return res.status(200).type('application/xml; charset=utf-8').send(xml);
 }
+
 
 function getSourceMsgId(from, res) {
   // Prefer res.locals (if you set it in webhook middleware), else fall back to body fields

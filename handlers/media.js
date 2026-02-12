@@ -109,10 +109,15 @@ function withTimeout(promise, ms, label) {
     new Promise((_, rej) => setTimeout(() => rej(new Error(`timeout:${label}:${ms}ms`)), ms))
   ]);
 }
-
 function twiml(text) {
-  return `<Response><Message>${xmlEsc(String(text || '').trim())}</Message></Response>`;
+  const t = String(text ?? '').trim();
+
+  // ✅ Never emit empty <Message> (Twilio 14103)
+  if (!t) return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${xmlEsc(t)}</Message></Response>`;
 }
+
 
 function DIGITS(x) {
   return String(x ?? '')

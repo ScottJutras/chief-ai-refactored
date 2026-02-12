@@ -732,6 +732,65 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
   }
   return TX_HAS_OWNER_DEDUPE_UNIQUE;
 }
+// --- Job Picker Pending State (owner-scoped, pickUserId-scoped) ---
+
+async function getPendingJobPick({ ownerId, pickUserId }) {
+  if (!ownerId) throw new Error('getPendingJobPick missing ownerId');
+  if (!pickUserId) throw new Error('getPendingJobPick missing pickUserId');
+
+  // Assumes you have a table for pending flows.
+  // If your actual table name differs, keep the query shape identical.
+  const q = `
+    SELECT confirm_flow_id, context, resume_key
+    FROM public.confirm_flow_pending
+    WHERE owner_id = $1
+      AND pick_user_id = $2
+      AND kind = 'JOB_PICK'
+      AND used_at IS NULL
+      AND expires_at > NOW()
+    ORDER BY created_at DESC
+    LIMIT 1
+  `;
+  const { rows } = await pool.query(q, [ownerId, pickUserId]);
+  return rows[0] || null;
+}
+
+async function applyJobToPendingDraft({ ownerId, confirmFlowId, jobId }) {
+  if (!ownerId) throw new Error('applyJobToPendingDraft missing ownerId');
+  if (!confirmFlowId) throw new Error('applyJobToPendingDraft missing confirmFlowId');
+  if (!jobId) throw new Error('applyJobToPendingDraft missing jobId');
+
+  // This MUST update a CIL draft / staged payload, not directly mutate final domain rows.
+  // If your drafts are stored in confirm_flow table, update that payload JSON.
+  const q = `
+    UPDATE public.confirm_flows
+    SET draft = jsonb_set(
+      COALESCE(draft, '{}'::jsonb),
+      '{job_id}',
+      to_jsonb($3::text),
+      true
+    ),
+    updated_at = NOW()
+    WHERE owner_id = $1
+      AND id = $2
+  `;
+  await pool.query(q, [ownerId, confirmFlowId, jobId]);
+}
+
+async function clearPendingJobPick({ ownerId, confirmFlowId }) {
+  if (!ownerId) throw new Error('clearPendingJobPick missing ownerId');
+  if (!confirmFlowId) throw new Error('clearPendingJobPick missing confirmFlowId');
+
+  const q = `
+    UPDATE public.confirm_flow_pending
+    SET used_at = NOW()
+    WHERE owner_id = $1
+      AND confirm_flow_id = $2
+      AND kind = 'JOB_PICK'
+      AND used_at IS NULL
+  `;
+  await pool.query(q, [ownerId, confirmFlowId]);
+}
 
 
 // ------------------------------------------------------------------
@@ -2754,118 +2813,157 @@ async function createTaskWithJob(opts) {
   return await createTask(opts);
 }
 
-// ---------- EXCEL EXPORT (lazy load) ----------
-let ExcelJS = null;
-async function exportTimesheetXlsx(opts) {
-  if (!ExcelJS) ExcelJS = require('exceljs');
+// ---------- V2 EXCEL EXPORT (lazy load) ----------
+let ExcelJS_V2 = null;
+async function exportTimesheetXlsxV2(opts) {
+  if (!ExcelJS_V2) ExcelJS_V2 = require('exceljs');
 
-  const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
+  const { ownerId, startIso, endIso, tz = 'America/Toronto', filterUserIds = null } = opts;
   const owner = DIGITS(ownerId);
-  const params = employeeName ? [owner, startIso, endIso, tz, employeeName] : [owner, startIso, endIso, tz];
+
+  const params = [owner, startIso, endIso];
+  let whereUser = '';
+  if (Array.isArray(filterUserIds) && filterUserIds.length) {
+    params.push(filterUserIds);
+    whereUser = ` AND te.user_id = ANY($4::text[]) `;
+  }
 
   const { rows } = await queryWithTimeout(
-    `SELECT te.employee_name,
-            te.type,
-            te.timestamp,
-            COALESCE(j.name, j.job_name, '') AS job_name,
-            COALESCE(te.tz, $4)              AS tz
-       FROM public.time_entries te
-       LEFT JOIN public.jobs j
-         ON j.owner_id = $1 AND j.job_no = te.job_no
-      WHERE te.owner_id = $1
-        AND te.timestamp >= $2::timestamptz
-        AND te.timestamp <= $3::timestamptz
-        ${employeeName ? 'AND te.employee_name = $5' : ''}
-      ORDER BY te.employee_name, te.timestamp`,
+    `
+    SELECT te.user_id,
+           te.start_at_utc,
+           te.end_at_utc,
+           COALESCE((te.meta->'calc'->>'paidMinutes')::int, 0) AS paid_minutes,
+           COALESCE((te.meta->'calc'->>'driveTotal')::int, 0) AS drive_minutes,
+           COALESCE(j.name, j.job_name, '') AS job_name
+      FROM public.time_entries_v2 te
+      LEFT JOIN public.jobs j
+        ON j.owner_id = te.owner_id
+       AND te.job_id IS NOT NULL
+       AND j.id = te.job_id
+     WHERE te.owner_id = $1
+       AND te.kind = 'shift'
+       AND te.deleted_at IS NULL
+       AND te.end_at_utc IS NOT NULL
+       AND te.start_at_utc >= $2::timestamptz
+       AND te.start_at_utc <  $3::timestamptz
+       ${whereUser}
+     ORDER BY te.user_id, te.start_at_utc ASC
+    `,
     params,
     15000
   );
 
-  const wb = new ExcelJS.Workbook();
+  const wb = new ExcelJS_V2.Workbook();
   const ws = wb.addWorksheet('Timesheet');
+
   ws.columns = [
-    { header: 'Employee', key: 'employee_name' },
-    { header: 'Type', key: 'type' },
-    { header: 'Timestamp', key: 'timestamp' },
+    { header: 'UserId', key: 'user_id' },
+    { header: 'Start (UTC)', key: 'start_at_utc' },
+    { header: 'End (UTC)', key: 'end_at_utc' },
+    { header: 'Paid Minutes', key: 'paid_minutes' },
+    { header: 'Drive Minutes', key: 'drive_minutes' },
     { header: 'Job', key: 'job_name' }
   ];
+
   (rows || []).forEach((r) => ws.addRow(r));
 
   const buf = await wb.xlsx.writeBuffer();
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${
-    employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''
-  }.xlsx`;
+
+  const suffix =
+    Array.isArray(filterUserIds) && filterUserIds.length === 1 ? `_user_${String(filterUserIds[0])}` : '';
+  const filename = `timesheet_v2_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${suffix}.xlsx`;
 
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
      VALUES ($1,$2,$3,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',$4,NOW())`,
     [id, owner, filename, Buffer.from(buf)]
   );
+
   const base = process.env.PUBLIC_BASE_URL || '';
   return { url: `${base}/exports/${id}`, id, filename };
 }
 
-// ---------- PDF EXPORT (lazy load) ----------
-let PDFDocument = null;
-async function exportTimesheetPdf(opts) {
-  if (!PDFDocument) PDFDocument = require('pdfkit');
+// ---------- V2 PDF EXPORT (lazy load) ----------
+let PDFDocument_V2 = null;
+async function exportTimesheetPdfV2(opts) {
+  if (!PDFDocument_V2) PDFDocument_V2 = require('pdfkit');
 
-  const { ownerId, startIso, endIso, employeeName, tz = 'America/Toronto' } = opts;
+  const { ownerId, startIso, endIso, tz = 'America/Toronto', filterUserIds = null } = opts;
   const owner = DIGITS(ownerId);
-  const params = employeeName ? [owner, startIso, endIso, tz, employeeName] : [owner, startIso, endIso, tz];
+
+  const params = [owner, startIso, endIso];
+  let whereUser = '';
+  if (Array.isArray(filterUserIds) && filterUserIds.length) {
+    params.push(filterUserIds);
+    whereUser = ` AND te.user_id = ANY($4::text[]) `;
+  }
 
   const { rows } = await queryWithTimeout(
-    `SELECT te.employee_name,
-            te.type,
-            te.timestamp,
-            COALESCE(j.name, j.job_name, '') AS job_name,
-            COALESCE(te.tz, $4)              AS tz
-       FROM public.time_entries te
-       LEFT JOIN public.jobs j
-         ON j.owner_id = $1 AND j.job_no = te.job_no
-      WHERE te.owner_id = $1
-        AND te.timestamp >= $2::timestamptz
-        AND te.timestamp <= $3::timestamptz
-        ${employeeName ? 'AND te.employee_name = $5' : ''}
-      ORDER BY te.employee_name, te.timestamp`,
+    `
+    SELECT te.user_id,
+           te.start_at_utc,
+           te.end_at_utc,
+           COALESCE((te.meta->'calc'->>'paidMinutes')::int, 0) AS paid_minutes,
+           COALESCE((te.meta->'calc'->>'driveTotal')::int, 0) AS drive_minutes,
+           COALESCE(j.name, j.job_name, '') AS job_name
+      FROM public.time_entries_v2 te
+      LEFT JOIN public.jobs j
+        ON j.owner_id = te.owner_id
+       AND te.job_id IS NOT NULL
+       AND j.id = te.job_id
+     WHERE te.owner_id = $1
+       AND te.kind = 'shift'
+       AND te.deleted_at IS NULL
+       AND te.end_at_utc IS NOT NULL
+       AND te.start_at_utc >= $2::timestamptz
+       AND te.start_at_utc <  $3::timestamptz
+       ${whereUser}
+     ORDER BY te.user_id, te.start_at_utc ASC
+    `,
     params,
     15000
   );
 
-  const doc = new PDFDocument({ margin: 40 });
+  const doc = new PDFDocument_V2({ margin: 40 });
   const chunks = [];
   doc.on('data', (d) => chunks.push(d));
   const done = new Promise((r) => doc.on('end', r));
 
-  doc.fontSize(16).text(`Timesheet ${startIso.slice(0, 10)} – ${endIso.slice(0, 10)}`, { align: 'center' }).moveDown();
+  doc
+    .fontSize(16)
+    .text(`Timesheet (v2) ${startIso.slice(0, 10)} – ${endIso.slice(0, 10)}`, { align: 'center' })
+    .moveDown();
 
   (rows || []).forEach((r) => {
-    const ts = new Date(r.timestamp);
     doc
       .fontSize(10)
       .text(
-        `${r.employee_name} | ${r.type} | ${formatInTimeZone(ts, r.tz, 'yyyy-MM-dd HH:mm')} | ${r.job_name || ''}`
+        `User ${r.user_id} | paid ${r.paid_minutes}m | drive ${r.drive_minutes}m | ${r.job_name || ''} | ${r.start_at_utc} → ${r.end_at_utc}`
       );
   });
 
   doc.end();
   await done;
-  const buf = Buffer.concat(chunks);
 
+  const buf = Buffer.concat(chunks);
   const id = crypto.randomBytes(12).toString('hex');
-  const filename = `timesheet_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${
-    employeeName ? '_' + employeeName.replace(/\s+/g, '_') : ''
-  }.pdf`;
+
+  const suffix =
+    Array.isArray(filterUserIds) && filterUserIds.length === 1 ? `_user_${String(filterUserIds[0])}` : '';
+  const filename = `timesheet_v2_${startIso.slice(0, 10)}_${endIso.slice(0, 10)}${suffix}.pdf`;
 
   await query(
     `INSERT INTO public.file_exports (id, owner_id, filename, content_type, bytes, created_at)
      VALUES ($1,$2,$3,'application/pdf',$4,NOW())`,
     [id, owner, filename, buf]
   );
+
   const base = process.env.PUBLIC_BASE_URL || '';
   return { url: `${base}/exports/${id}`, id, filename };
 }
+
 
 async function getFileExport(id) {
   const { rows } = await query(
@@ -4053,6 +4151,23 @@ do update set
   return rows[0]?.units ? Number(rows[0].units) : 0;
 }
 
+// -----------------------------------------------------------------------------
+// ✅ Export safety bridge (prevents boot-time ReferenceError on Vercel)
+// If legacy names were removed/renamed during v2 migration, Node will crash
+// when module.exports references undefined identifiers.
+// This ensures the identifiers always exist, and points legacy names to v2.
+// -----------------------------------------------------------------------------
+
+// Prefer v2 exports if present
+const exportTimesheetXlsx =
+  (typeof exportTimesheetXlsxV2 === 'function' && exportTimesheetXlsxV2) ||
+  (typeof exportTimesheetXlsxLegacy === 'function' && exportTimesheetXlsxLegacy) ||
+  null;
+
+const exportTimesheetPdf =
+  (typeof exportTimesheetPdfV2 === 'function' && exportTimesheetPdfV2) ||
+  (typeof exportTimesheetPdfLegacy === 'function' && exportTimesheetPdfLegacy) ||
+  null;
 
 
 /* -------------------- module exports -------------------- */
@@ -4171,9 +4286,11 @@ module.exports = {
   getOwnerByDashboardToken,
   getMonthlyUsage,
   incrementMonthlyUsage,
-
-
-  // internal helpers occasionally useful
+  exportTimesheetXlsxV2,
+  exportTimesheetPdfV2,
   resolveJobRow,
-  getColumnDataType
+  getColumnDataType,
+  getPendingJobPick,
+  applyJobToPendingDraft,
+  clearPendingJobPick,
 };

@@ -46,14 +46,23 @@ function xmlEsc(s = '') {
     .replace(/'/g, '&apos;');
 }
 
+function twimlEmpty() {
+  return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+}
+
 function twimlText(msg) {
-  return `<Response><Message>${xmlEsc(String(msg || '').trim())}</Message></Response>`;
+  const t = String(msg ?? '').trim();
+  if (!t) return twimlEmpty(); // ✅ never emit empty <Message>
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${xmlEsc(t)}</Message></Response>`;
 }
 
 function respond(res, msg) {
-  res.status(200).type('application/xml').send(twimlText(msg));
-  return true;
+  if (!res || res.headersSent) return false;
+
+  const xml = twimlText(msg); // will be empty-safe
+  return res.status(200).type('text/xml; charset=utf-8').send(xml);
 }
+
 
 /* ---------------- Identity helpers (aligned) ---------------- */
 

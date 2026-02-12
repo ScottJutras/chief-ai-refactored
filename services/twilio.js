@@ -47,14 +47,18 @@ const {
   TWILIO_WA_JOB_PICKER_CONTENT_SID,
 
   // Your older env var name (keep supporting it)
-  TWILIO_ACTIVE_JOBS_LIST_TEMPLATE_SID
+  TWILIO_ACTIVE_JOBS_LIST_TEMPLATE_SID,
+
+  // optional toggle
+  DOUBLE_SEND_LIST_FALLBACK: _DOUBLE_SEND_LIST_FALLBACK
 } = process.env;
 
 console.info(
   '[TWILIO] job picker content sid present?',
   !!(TWILIO_WA_JOB_PICKER_CONTENT_SID || TWILIO_ACTIVE_JOBS_LIST_TEMPLATE_SID)
 );
-const DOUBLE_SEND_LIST_FALLBACK = String(process.env.DOUBLE_SEND_LIST_FALLBACK || '') === '1';
+
+const DOUBLE_SEND_LIST_FALLBACK = String(_DOUBLE_SEND_LIST_FALLBACK || '') === '1';
 const isProd = NODE_ENV === 'production';
 const resolvedWhatsAppFrom = normalizeWhatsAppFrom(TWILIO_WHATSAPP_FROM || TWILIO_WHATSAPP_NUMBER);
 
@@ -95,30 +99,36 @@ if (useMock) {
 
 /**
  * Apply either Messaging Service SID OR From address.
- * `channel` controls the fallback "from" value format.
+ * `channel` controls which "from" value is valid.
  */
 function applyFromOrService(payload, channel = 'whatsapp') {
-  const wantWhatsAppFrom = channel === 'whatsapp' && resolvedWhatsAppFrom;
-
   // ✅ Prefer explicit WhatsApp from for WA + templates
-  if (wantWhatsAppFrom) {
+  if (channel === 'whatsapp' && resolvedWhatsAppFrom) {
     payload.from = useMock ? 'whatsapp:+10000000000' : resolvedWhatsAppFrom;
     return payload;
   }
 
+  // ✅ If we have a Messaging Service SID, use it (real client only)
   if (TWILIO_MESSAGING_SERVICE_SID && !useMock) {
     payload.messagingServiceSid = TWILIO_MESSAGING_SERVICE_SID;
-  } else {
-    payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
+    return payload;
   }
 
+  // ✅ Otherwise set a valid From per channel
+  if (channel === 'sms') {
+    payload.from = useMock ? '+10000000000' : (TWILIO_SMS_FROM || '+10000000000');
+    return payload;
+  }
+
+  // whatsapp fallback
+  payload.from = useMock ? 'whatsapp:+10000000000' : (resolvedWhatsAppFrom || 'whatsapp:+10000000000');
   return payload;
 }
-
 
 /**
  * ✅ HARDENED: Never send Twilio a message with no Body and no Media.
  * If body is empty and no mediaUrls, we set body = '—' to prevent 21619.
+ * ✅ Returns Twilio Message object (sid/status).
  */
 async function sendWhatsApp(to, body, mediaUrls) {
   const hasMedia = Array.isArray(mediaUrls) && mediaUrls.length > 0;
@@ -133,7 +143,15 @@ async function sendWhatsApp(to, body, mediaUrls) {
   );
 
   if (hasMedia) payload.mediaUrl = mediaUrls;
-  return twilioClient.messages.create(payload);
+
+  const msg = await twilioClient.messages.create(payload);
+  console.info('[TWILIO] sendWhatsApp messages.create result', {
+    to: payload.to,
+    sid: msg?.sid,
+    status: msg?.status,
+    hasMedia
+  });
+  return msg;
 }
 
 async function sendSMS(to, body) {
@@ -145,16 +163,29 @@ async function sendSMS(to, body) {
     'sms'
   );
 
-  return twilioClient.messages.create(payload);
+  const msg = await twilioClient.messages.create(payload);
+  console.info('[TWILIO] sendSMS messages.create result', {
+    to: payload.to,
+    sid: msg?.sid,
+    status: msg?.status
+  });
+  return msg;
 }
 
-// Back-compat convenience
-async function sendMessage(to, body) {
-  return sendWhatsApp(to, body);
+/**
+ * Generic send helper (keeps legacy callers safe).
+ * Uses WhatsApp if `to` looks like whatsapp:... otherwise SMS.
+ */
+async function sendMessage(to, body, mediaUrls) {
+  const s = String(to || '').trim().toLowerCase();
+  if (s.startsWith('whatsapp:')) return sendWhatsApp(to, body, mediaUrls);
+  // If you want stricter routing, change this heuristic.
+  return sendSMS(to, body);
 }
 
 /**
  * Best-effort “quick replies” using persistentAction.
+ * ✅ Returns Twilio Message object (sid/status).
  */
 async function sendQuickReply(to, body, replies = []) {
   const actions = (replies || []).slice(0, 3).map((r) => `reply?text=${encodeURIComponent(String(r))}`);
@@ -168,40 +199,48 @@ async function sendQuickReply(to, body, replies = []) {
     'whatsapp'
   );
 
-  return twilioClient.messages.create(payload);
+  const msg = await twilioClient.messages.create(payload);
+  console.info('[TWILIO] sendQuickReply messages.create result', {
+    to: payload.to,
+    sid: msg?.sid,
+    status: msg?.status,
+    replies: (replies || []).slice(0, 3)
+  });
+  return msg;
 }
 
 /**
- * Template sender (Twilio Content API).
- * ✅ HARDENED: never sends an empty-body, and falls back to sendWhatsApp if sid missing.
- * ✅ LOGGED: prints payload summary + result sid/status + errors
+ * ✅ WhatsApp Content API still wants a body field present; keep it non-empty
+ * ✅ Twilio requires `contentVariables` as a JSON STRING
+ * ✅ Returns Twilio Message object (sid/status)
  */
-async function sendTemplateMessage(to, contentSid, vars = {}, fallbackBody = '') {
-  const sid = String(contentSid || '').trim();
-
-  // No SID -> plain message (prevents 21619)
-  if (!sid) {
-    const body =
-      String(fallbackBody || '').trim() ||
-      Object.values(vars || {})
-        .map((v) => String(v || ''))
-        .join(' ')
-        .trim() ||
-      '—';
-
-    console.warn('[TWILIO] sendTemplateMessage: missing contentSid; falling back to body');
-    return sendWhatsApp(to, body);
-  }
-
+async function sendTemplateMessage(to, sid, vars = {}, fallbackBody = ' ') {
   const safeFallback = String(fallbackBody || '').trim() || ' ';
 
-  const payload = applyFromOrService({
-  to: toWhatsApp(to),
-  contentSid: sid,
-  contentVariables: JSON.stringify(vars || {}),
-  body: safeFallback
-}, 'whatsapp');
+  const cleanVars = {};
+  try {
+    for (const [k, v] of Object.entries(vars || {})) {
+      if (v == null) continue;
+      cleanVars[String(k)] = String(v);
+    }
+  } catch {}
 
+  let contentVariables = '{}';
+  try {
+    contentVariables = JSON.stringify(cleanVars);
+  } catch {
+    contentVariables = '{}';
+  }
+
+  const payload = applyFromOrService(
+    {
+      to: toWhatsApp(to),
+      contentSid: sid,
+      contentVariables,
+      body: safeFallback
+    },
+    'whatsapp'
+  );
 
   console.info('[TWILIO] sendTemplateMessage messages.create payload', {
     to: payload.to,
@@ -209,6 +248,7 @@ async function sendTemplateMessage(to, contentSid, vars = {}, fallbackBody = '')
     hasMessagingServiceSid: !!payload.messagingServiceSid,
     hasContentSid: !!payload.contentSid,
     hasContentVariables: !!payload.contentVariables,
+    contentVariablesLen: String(payload.contentVariables || '').length,
     hasBody: !!payload.body
   });
 
@@ -222,24 +262,25 @@ async function sendTemplateMessage(to, contentSid, vars = {}, fallbackBody = '')
       code: e?.code,
       status: e?.status
     });
-    throw e; // let callers decide fallback (your interactive list does)
+    throw e;
   }
 }
-async function sendWhatsAppTemplate({ to, templateSid, summaryLine } = {}) {
-  // Preserve newlines (WhatsApp card formatting) — do NOT collapse whitespace
-  const safe = String(summaryLine || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/[ \t]+\n/g, '\n')   // trim trailing spaces before newline
-    .replace(/\n[ \t]+/g, '\n')   // trim leading spaces after newline
-    .trim()
-    .slice(0, 600) || '—';
 
-  return sendTemplateMessage(to, templateSid, { 1: toTemplateVar(safe) }, safe);
+/**
+ * Legacy/compat alias: some callsites want “template quick reply”.
+ * For Content Templates, the buttons live in the template itself.
+ * So this is just sendTemplateMessage().
+ */
+async function sendTemplateQuickReply(to, templateSid, vars = {}, fallbackBody = ' ') {
+  return sendTemplateMessage(to, templateSid, vars, fallbackBody);
 }
 
-
-async function sendTemplateQuickReply(to, contentSid, vars = {}, fallbackBody = '') {
-  return sendTemplateMessage(to, contentSid, vars, fallbackBody);
+/**
+ * Wrapper: returns Twilio message object (sid/status).
+ */
+async function sendWhatsAppTemplate({ to, templateSid, summaryLine } = {}) {
+  const safe = String(summaryLine || '').replace(/\s+/g, ' ').trim().slice(0, 600) || '—';
+  return sendTemplateMessage(to, templateSid, { 1: toTemplateVar(safe) }, safe);
 }
 
 async function sendBackfillConfirm(to, humanLine, opts = {}) {
@@ -275,7 +316,7 @@ async function sendBackfillConfirm(to, humanLine, opts = {}) {
  * Interactive list sender (via Content Templates).
  * Uses a List Picker template with 8 fixed rows:
  * 1 = body, 2 = button
- * rows: (name,id,desc) repeated starting at var 3
+ * rows: (name,id) repeated starting at var 3
  *
  * If no Content SID is configured, falls back to a plain text message.
  */
@@ -302,7 +343,6 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
     doubleSend: DOUBLE_SEND_LIST_FALLBACK
   });
 
-  // ✅ Never send a “list template” with empty rows — WhatsApp clients behave weirdly.
   if (!hasRows) {
     console.warn('[TWILIO] interactive list requested but sections had no rows; sending plain text fallback');
     return sendWhatsApp(
@@ -326,28 +366,32 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
 
   // Pad to exactly 8 rows (template requires 8 items)
   while (rows8.length < 8) {
-    rows8.push({ title: '—', id: `pad_${rows8.length + 1}`, description: '—' });
+    rows8.push({ title: '—', id: `pad_${rows8.length + 1}` });
   }
 
+  // Template vars:
+  // 1=body, 2=button
+  // row1: 3=name, 4=id
+  // row2: 5=name, 6=id
+  // ...
+  // row8: 17=name, 18=id
   const vars = {
-    1: toTemplateVar(safeBody),
-    2: toTemplateVar(buttonText || 'Pick job')
+    1: String(safeBody || '—'),
+    2: String(buttonText || 'Pick job')
   };
 
   for (let i = 0; i < 8; i++) {
     const r = rows8[i];
-    const base = 3 + i * 3;
-
-    vars[base] = toTemplateVar(String(r?.title || '—'));
-    vars[base + 1] = toTemplateVar(String(r?.id || `jobix_${i + 1}`));
-    vars[base + 2] = toTemplateVar(String(r?.description || '—'));
+    const base = 3 + i * 2;
+    vars[String(base)] = String(r?.title || '—');
+    vars[String(base + 1)] = String(r?.id || `pad_${i + 1}`);
   }
 
-  // Helpful debug: confirm we are setting the vars we expect
   console.info('[TWILIO] list vars preview', {
     v1: vars[1],
     v2: vars[2],
-    firstRow: { name: vars[3], id: vars[4], desc: vars[5] }
+    row1: { name: vars[3], id: vars[4] },
+    row2: { name: vars[5], id: vars[6] }
   });
 
   try {
@@ -361,18 +405,14 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
       }
     }
 
-    return result;
+    return result; // ✅ includes sid/status
   } catch (e) {
     console.warn('[TWILIO] interactive list template failed; falling back to plain text:', e?.message);
 
-    // Plain text fallback list (still useful)
     const lines = flatRows.slice(0, 12).map((r, i) => `${i + 1}) ${r.title}`);
     return sendWhatsApp(to, `${safeBody}\n\nReply with a job number:\n${lines.join('\n')}`);
   }
 }
-
-
-
 
 function verifyTwilioSignature(options = {}) {
   if (!useMock && TWILIO_AUTH_TOKEN) {
@@ -388,10 +428,10 @@ module.exports = {
   sendWhatsApp,
   sendSMS,
   verifyTwilioSignature,
-  sendMessage,
+  sendMessage, // ✅ now defined
   sendQuickReply,
   sendTemplateMessage,
-  sendTemplateQuickReply,
+  sendTemplateQuickReply, // ✅ now defined (alias)
   sendBackfillConfirm,
   sendWhatsAppInteractiveList,
   toWhatsApp,

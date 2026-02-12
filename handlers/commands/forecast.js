@@ -14,11 +14,9 @@ async function handleForecast(
   // For now, just say it's not implemented.
   if (res && !res.headersSent) {
     res
-      .status(200)
-      .type("application/xml")
-      .send(
-        `<Response><Message>Forecasting isn’t wired up yet, but I’m logging your request so we can add this.</Message></Response>`
-      )
+  .status(200)
+  .type('application/xml; charset=utf-8')
+  .send('<?xml version="1.0" encoding="UTF-8"?><Response><Message>Forecasting isn’t wired up yet, but I’m logging your request so we can add this.</Message></Response>');
   }
   return true // or false if you want webhook to fall back to agent
 }

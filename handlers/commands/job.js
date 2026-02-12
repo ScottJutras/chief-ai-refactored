@@ -69,32 +69,43 @@ function escapeXml(str = '') {
 }
 
 function twimlText(message) {
-  return `<Response><Message>${escapeXml(String(message || '').trim())}</Message></Response>`;
+  const t = String(message ?? '').trim();
+  if (!t) {
+    // ✅ Never emit empty <Message> (Twilio 14103)
+    return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escapeXml(t)}</Message></Response>`;
 }
 
+
 function twimlEmpty() {
-  return `<Response></Response>`;
+  // ✅ Never emit <Message></Message>
+  return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
 }
 
 function respond(res, message) {
-  const xml = twimlText(message);
-  if (res && typeof res.status === 'function' && typeof res.send === 'function' && !res.headersSent) {
-    res.status(200).type('application/xml').send(xml);
-  } else if (res && typeof res.type === 'function' && typeof res.send === 'function' && !res.headersSent) {
-    res.type('text/xml').send(xml);
+  const t = String(message ?? '').trim();
+
+  // ✅ Blank -> truly empty TwiML (no bubble)
+  const xml = t ? twimlText(t) : twimlEmpty();
+
+  if (res && !res.headersSent) {
+    return res.status(200).type('text/xml; charset=utf-8').send(xml);
   }
+
   return xml;
 }
 
 function respondEmpty(res) {
   const xml = twimlEmpty();
-  if (res && typeof res.status === 'function' && typeof res.send === 'function' && !res.headersSent) {
-    res.status(200).type('application/xml').send(xml);
-  } else if (res && typeof res.type === 'function' && typeof res.send === 'function' && !res.headersSent) {
-    res.type('text/xml').send(xml);
+
+  if (res && !res.headersSent) {
+    return res.status(200).type('text/xml; charset=utf-8').send(xml);
   }
+
   return xml;
 }
+
 
 function waTo(fromPhone) {
   const s = String(fromPhone || '').trim();

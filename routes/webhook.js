@@ -381,7 +381,6 @@ function pickFirstMedia(body = {}) {
   return { n, url, type: typ ? String(typ).toLowerCase() : null };
 }
 
-const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
 
 function canUseAgent(ownerProfile) {
   const planKey = getEffectivePlanKey(ownerProfile);
@@ -2715,7 +2714,6 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
     }
    // --- one-time plan sanity log (remove after verification) ---
 try {
-  const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
   console.info("[PLAN_EFFECTIVE]", {
     from: req.from,
     ownerId: req.ownerId,

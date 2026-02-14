@@ -10,7 +10,11 @@
  * Monthly capacity:
  * - number = included monthly capacity
  * - null   = effectively unbounded / included
- *
+ * Monthly Pricing:
+ * - free
+ * - starter = $59 USD
+ * - pro = $149 USD
+ * 
  * NOTE: Your clarified semantics:
  * - Free: owner can log for self AND can log "crew" by naming them (owner-mediated). No separate crew accounts.
  * - Starter: owner can add up to 10 employees and log "clock-in John..." (still owner-mediated).
@@ -54,7 +58,7 @@ const plan_capabilities = {
       ask_chief: { enabled: false, owner_only: true, monthly_questions: 0, behavior: "pause" },
     },
 
-    exports: { enabled: false, watermark: true },
+    exports: { enabled: true, watermark: true },
 
     approvals: { enabled: false },
 
@@ -90,8 +94,8 @@ const plan_capabilities = {
         tasks: { enabled: true },
       },
 
-      ocr_receipts: { enabled: true, monthly_capacity: 150, behavior: "pause" },
-      voice: { enabled: true, monthly_minutes: 150, behavior: "pause" },
+      ocr_receipts: { enabled: true, monthly_capacity: 30, behavior: "pause" },
+      voice: { enabled: true, monthly_minutes: 50, behavior: "pause" },
     },
 
     reasoning: {

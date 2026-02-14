@@ -12,11 +12,6 @@ const plan_messages = {
     upgrade_plan: "starter",
   },
 
-  EXPORTS_REQUIRES_STARTER: {
-    title: "Exports are part of Owner Mode",
-    message: "Exports are available on Starter and Pro. Upgrade to export clean job history anytime.",
-    upgrade_plan: "starter",
-  },
 
   OCR_REQUIRES_STARTER: {
     title: "Receipt scanning is part of Owner Mode",

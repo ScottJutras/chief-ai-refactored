@@ -3,7 +3,7 @@
 const { Pool } = require('pg');
 const crypto = require('crypto');
 const { formatInTimeZone } = require('date-fns-tz');
-
+const { getEffectivePlanKey } = require('../src/config/getEffectivePlanKey');
 /* ---------- Environment (robust) ---------- */
 const env = process.env;
 
@@ -43,10 +43,11 @@ if (!DB_URL && (!poolConfig.host || !poolConfig.database)) {
 /* ---------- Pool (sane limits + timeouts) ---------- */
 const pool = new Pool({
   ...poolConfig,
-  max: 20,
+  max: parseInt(process.env.PG_POOL_MAX || '5', 10),
   min: 0,
   idleTimeoutMillis: 60_000,
-  connectionTimeoutMillis: 20_000,
+  connectionTimeoutMillis: parseInt(process.env.PG_CONN_TIMEOUT_MS || '5000', 10),
+  query_timeout: parseInt(process.env.PG_QUERY_TIMEOUT_MS || '9000', 10),
   keepAlive: true,
   application_name: 'chief-ai'
 });
@@ -55,15 +56,16 @@ pool.on('connect', async (client) => {
   try {
     await client.query(`SET TIME ZONE 'UTC'`);
     await client.query(`SET intervalstyle = 'iso_8601'`);
+
+    // ✅ server-side kill switch
+    await client.query(`SET statement_timeout TO ${parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || '8000', 10)}`);
   } catch (e) {
     const msg = String(e?.message || '');
     const transient = /terminated|ECONNRESET|EPIPE|server closed the connection|Connection terminated/i.test(msg);
-    if (!transient) {
-      console.warn('[PG] connect session prep failed:', msg);
-    }
-    // transient: ignore; next query retry will recover
+    if (!transient) console.warn('[PG] connect session prep failed:', msg);
   }
 });
+
 
 
 pool.on('error', (err) => {
@@ -1814,50 +1816,50 @@ async function createJobIdempotent({
     if (existingByName.rowCount) return { inserted: false, job: existingByName.rows[0], reason: 'already_exists' };
 
     // ---------------------------------------------------------
-    // 3) DB-level job cap (planCapabilities-aligned) — THIRD
-    // Free: 3, Starter: 25, Pro: unlimited
-    // Fail-open on unexpected DB issues.
-    // ---------------------------------------------------------
-    try {
-      const planRow = await client.query(
-        `select subscription_tier, paid_tier, plan_key
-           from public.users
-          where user_id = $1
-          limit 1`,
-        [owner]
-      );
+// 3) DB-level job cap (planCapabilities-aligned) — THIRD
+// Free: 3, Starter: 25, Pro: unlimited
+// Fail-open on unexpected DB issues.
+// ---------------------------------------------------------
+try {
+  const planRow = await client.query(
+    `select plan_key, sub_status
+       from public.users
+      where user_id = $1
+      limit 1`,
+    [owner]
+  );
 
-      const plan = String(
-        planRow?.rows?.[0]?.subscription_tier ||
-        planRow?.rows?.[0]?.paid_tier ||
-        planRow?.rows?.[0]?.plan_key ||
-        'free'
-      ).toLowerCase().trim();
+  const effective = getEffectivePlanKey(planRow?.rows?.[0] || null);
 
-      const maxJobs =
-        plan === 'pro' ? null :     // unlimited
-        plan === 'starter' ? 25 :
-        3;                          // free default
+  const maxJobs =
+    effective === 'pro' ? null :     // unlimited
+    effective === 'starter' ? 25 :
+    3;
 
-      if (maxJobs != null) {
-        const c = await client.query(
-          `select count(*)::int as n from public.jobs where owner_id=$1`,
-          [owner]
-        );
-        const n = c.rows?.[0]?.n ?? 0;
+  if (maxJobs != null) {
+    const c = await client.query(
+      `select count(*)::int as n
+         from public.jobs
+        where owner_id=$1`,
+      [owner]
+    );
 
-        if (Number.isFinite(n) && n >= maxJobs) {
-          return {
-            inserted: false,
-            job: null,
-            reason: 'job_limit_reached',
-            error: `Job limit reached for your plan (${maxJobs}).`
-          };
-        }
-      }
-    } catch {
-      // ✅ fail-open
+    const n = c.rows?.[0]?.n ?? 0;
+
+    if (Number.isFinite(n) && n >= maxJobs) {
+      return {
+        inserted: false,
+        job: null,
+        reason: 'job_limit_reached',
+        error: `Job limit reached for your plan (${maxJobs}).`
+      };
     }
+  }
+} catch (e) {
+  // ✅ fail-open
+  // (optional) console.warn('[DB_JOB_CAP] fail-open:', e?.message);
+}
+
 
     // ---------------------------------------------------------
     // 4) Create
@@ -2741,14 +2743,15 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
   const token = crypto.randomBytes(16).toString('hex');
 
   const { rows } = await query(
-    `INSERT INTO public.users (user_id, owner_id, onboarding_in_progress, subscription_tier, dashboard_token, created_at)
-     VALUES ($1,$2,$3,'basic',$4,NOW())
+    `INSERT INTO public.users (user_id, owner_id, onboarding_in_progress, dashboard_token, created_at)
+     VALUES ($1,$2,$3,$4,NOW())
      ON CONFLICT (user_id) DO UPDATE SET onboarding_in_progress=EXCLUDED.onboarding_in_progress
      RETURNING *`,
     [uid, oid, onboarding_in_progress, token]
   );
   return rows[0];
 }
+
 
 async function saveUserProfile(p) {
   const keys = Object.keys(p);
@@ -3979,13 +3982,16 @@ async function hasStripeEvent(eventId) {
 }
 
 async function insertStripeEvent(eventId, eventType = null) {
-  await pool.query(
+  const { rows } = await pool.query(
     `insert into public.stripe_events (event_id, received_at, event_type)
      values ($1, now(), $2)
-     on conflict (event_id) do nothing`,
+     on conflict (event_id) do nothing
+     returning event_id`,
     [String(eventId), eventType ? String(eventType) : null]
   );
+  return !!rows?.[0]?.event_id; // true = inserted, false = deduped
 }
+
 
 
 async function getOwnerByDashboardToken(dashboardToken) {
@@ -3993,15 +3999,19 @@ async function getOwnerByDashboardToken(dashboardToken) {
   if (!t) return null;
 
   const { rows } = await pool.query(
-    `select user_id
-     from public.users
-     where dashboard_token = $1
-     limit 1`,
+    `
+    select user_id
+    from public.users
+    where dashboard_token = $1
+      and user_id = owner_id
+    limit 1
+    `,
     [t]
   );
 
   return rows[0]?.user_id ? String(rows[0].user_id) : null;
 }
+
 
 async function getOwner(ownerId) {
   const owner = String(ownerId || '').trim();

@@ -15,6 +15,30 @@ function priceIdToPlanKey(priceId) {
   return "free";
 }
 
+/**
+ * Robust price selection:
+ * - Prefer the first recurring price on the subscription (future-proof for addons)
+ * - Fallback to the first item if needed
+ */
+function subscriptionToPriceId(sub) {
+  const items = Array.isArray(sub?.items?.data) ? sub.items.data : [];
+  if (!items.length) return null;
+
+  const recurringItem = items.find((it) => it?.price?.recurring);
+  const price = recurringItem?.price || items[0]?.price || null;
+
+  const id = price?.id ? String(price.id) : null;
+  return id && id.trim() ? id.trim() : null;
+}
+
+/**
+ * Convert Stripe unix seconds → JS Date (or null)
+ */
+function unixToDate(sec) {
+  if (typeof sec !== "number" || !Number.isFinite(sec) || sec <= 0) return null;
+  return new Date(sec * 1000);
+}
+
 async function stripeWebhookHandler(req, res) {
   const sig = req.headers["stripe-signature"];
   const whsec = process.env.STRIPE_WEBHOOK_SECRET;
@@ -29,30 +53,54 @@ async function stripeWebhookHandler(req, res) {
   }
 
   try {
-    // ✅ idempotency (schema: public.stripe_events(event_id, received_at, event_type))
-    const seen = await db.hasStripeEvent(event.id);
-    if (seen) return res.json({ received: true, deduped: true });
+    /**
+     * ✅ Race-proof idempotency:
+     * Your insertStripeEvent should be:
+     *   INSERT ... ON CONFLICT DO NOTHING
+     * and return whether it inserted.
+     *
+     * If you haven't updated insertStripeEvent to return a boolean,
+     * this will still work if it returns { inserted: true/false } or boolean.
+     */
+    let inserted = true;
+    try {
+      const r = await db.insertStripeEvent(event.id, event.type);
+      // Accept boolean OR object shapes, fail-open if unknown
+      inserted =
+        typeof r === "boolean"
+          ? r
+          : r && typeof r === "object" && "inserted" in r
+            ? !!r.inserted
+            : true;
+    } catch (e) {
+      // If insert fails for some reason, do NOT crash; fail-open and continue processing.
+      console.warn("[STRIPE] insertStripeEvent failed (continuing):", e?.message);
+      inserted = true;
+    }
 
-    // Record event_type so we can debug what’s arriving
-    await db.insertStripeEvent(event.id, event.type);
+    if (!inserted) {
+      return res.json({ received: true, deduped: true });
+    }
 
     switch (event.type) {
       case "checkout.session.completed": {
         const sess = event.data.object;
 
-        const ownerId = sess?.metadata?.ownerId ? String(sess.metadata.ownerId) : null;
-        const planKeyFromMeta = sess?.metadata?.planKey ? String(sess.metadata.planKey) : null;
+        const ownerId = (
+  (sess?.client_reference_id ? String(sess.client_reference_id) : "") ||
+  (sess?.metadata?.owner_id ? String(sess.metadata.owner_id) : "") ||
+  (sess?.metadata?.ownerId ? String(sess.metadata.ownerId) : "")
+).trim() || null;
+
 
         if (ownerId && sess?.customer) {
-          // ✅ Never null-out subscription id here; only set if present
           const patch = { stripe_customer_id: String(sess.customer) };
           if (sess.subscription) patch.stripe_subscription_id = String(sess.subscription);
 
-          // Only set plan_key if provided (never null it out)
-          if (planKeyFromMeta) patch.plan_key = planKeyFromMeta;
-
+          // ✅ DO NOT set plan_key here (entitlements only come from subscription events)
           await db.updateOwnerBilling(ownerId, patch);
         }
+
         break;
       }
 
@@ -61,17 +109,16 @@ async function stripeWebhookHandler(req, res) {
       case "customer.subscription.deleted": {
         const sub = event.data.object;
 
-        const customerId = String(sub.customer || "");
-        const subscriptionId = String(sub.id || "");
-        const status = String(sub.status || "");
+        const customerId = String(sub.customer || "").trim();
+        const subscriptionId = String(sub.id || "").trim();
+        const status = String(sub.status || "").trim();
         const cancelAtPeriodEnd = !!sub.cancel_at_period_end;
 
-        const priceId = sub?.items?.data?.[0]?.price?.id
-          ? String(sub.items.data[0].price.id)
-          : null;
-
+        // ✅ recurring-first
+        const priceId = subscriptionToPriceId(sub);
         const mappedPlanKey = priceIdToPlanKey(priceId);
 
+        // ✅ Deterministic owner mapping: customerId → owner row
         const ownerId = await db.findOwnerIdByStripeCustomer(customerId);
         if (!ownerId) {
           console.warn("[STRIPE] subscription event but no owner found for customer", customerId, {
@@ -83,7 +130,7 @@ async function stripeWebhookHandler(req, res) {
 
         const isEntitled = status === "active" || status === "trialing";
 
-        // Optional hardening: warn if an entitled sub has an unknown price id
+        // Warn if entitled but we can't map the price → plan
         if (isEntitled && mappedPlanKey === "free" && priceId) {
           console.warn("[STRIPE] Unknown price ID for entitled subscription", {
             priceId,
@@ -94,58 +141,16 @@ async function stripeWebhookHandler(req, res) {
           });
         }
 
-        // ✅ Period dates (robust): try subscription → fallback invoice line period
-        let periodStart = null;
-        let periodEnd = null;
-
-        try {
-          if (subscriptionId && isEntitled) {
-            const fullSub = await stripe.subscriptions.retrieve(subscriptionId);
-
-            const cps = fullSub?.current_period_start ?? null;
-            const cpe = fullSub?.current_period_end ?? null;
-
-            if (cps && cpe) {
-              periodStart = new Date(cps * 1000);
-              periodEnd = new Date(cpe * 1000);
-            } else {
-              // 🔁 Fallback: derive from latest invoice line period
-              const invs = await stripe.invoices.list({
-                subscription: subscriptionId,
-                limit: 1,
-              });
-              const inv = invs?.data?.[0] || null;
-
-              const linePeriod = inv?.lines?.data?.[0]?.period || null;
-              const ps = linePeriod?.start ?? null;
-              const pe = linePeriod?.end ?? null;
-
-              periodStart = ps ? new Date(ps * 1000) : null;
-              periodEnd = pe ? new Date(pe * 1000) : null;
-            }
-          } else {
-            // fallback to event payload
-            periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
-            periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
-          }
-        } catch (e) {
-          console.warn("[STRIPE] failed to derive period dates", {
-            subscriptionId,
-            status,
-            msg: e?.message,
-          });
-
-          // final fallback to payload if anything fails
-          periodStart = sub.current_period_start ? new Date(sub.current_period_start * 1000) : null;
-          periodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null;
-        }
+        // ✅ No extra Stripe API calls. Use event payload directly.
+        const periodStart = unixToDate(sub.current_period_start);
+        const periodEnd = unixToDate(sub.current_period_end);
 
         await db.updateOwnerBilling(ownerId, {
           plan_key: isEntitled ? mappedPlanKey : "free",
           sub_status: status,
-          stripe_customer_id: customerId,
-          stripe_subscription_id: subscriptionId,
-          stripe_price_id: priceId,
+          stripe_customer_id: customerId || null,
+          stripe_subscription_id: subscriptionId || null,
+          stripe_price_id: priceId || null,
           cancel_at_period_end: cancelAtPeriodEnd,
           current_period_start: periodStart,
           current_period_end: periodEnd,

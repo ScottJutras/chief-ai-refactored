@@ -28,17 +28,11 @@ const { handleTimeclock } = require('./commands/timeclock');
 const pg = require('../services/postgres');
 const { checkMonthlyQuota } = require('../utils/quota'); // adjust path if needed
 const { shouldShowUpgradePromptOnce } = require('../src/lib/handleCapabilityDenied');
+const { getEffectivePlanFromOwner } = require('../src/config/effectivePlan');
 
-async function resolveCapsForOwner(ownerId) {
-  let ownerProfile = null;
-  try {
-    ownerProfile = await pg.getOwnerProfile(String(ownerId));
-  } catch (e) {
-    console.warn('[MEDIA] getOwnerProfile failed (fail-open):', e?.message);
-  }
-
-  const rawPlan = String(ownerProfile?.plan_key || ownerProfile?.paid_tier || ownerProfile?.subscription_tier || 'free');
-  const plan = rawPlan.toLowerCase().trim() || 'free';
+// ✅ Preferred: resolve caps from an already-loaded ownerProfile (NO extra DB call)
+async function resolveCapsForOwnerProfile(ownerProfile) {
+  const plan = getEffectivePlanFromOwner(ownerProfile); // free/starter/pro
 
   try {
     const capMod = require('../src/config/capabilities');
@@ -58,6 +52,20 @@ async function resolveCapsForOwner(ownerId) {
 
   return null;
 }
+
+// ✅ Optional helper if some callsites only have ownerId (kept for compatibility)
+async function resolveCapsForOwner(ownerId) {
+  let ownerProfile = null;
+  try {
+    if (typeof pg.getOwnerProfile === 'function') {
+      ownerProfile = await pg.getOwnerProfile(String(ownerId || '').trim());
+    }
+  } catch (e) {
+    console.warn('[MEDIA] getOwnerProfile failed (fail-open):', e?.message);
+  }
+  return resolveCapsForOwnerProfile(ownerProfile);
+}
+
 
 
 function getDbQuery(pg) {
@@ -138,19 +146,7 @@ function canonicalUserKey(from) {
 function getUserTz(userProfile) {
   return userProfile?.timezone || userProfile?.tz || userProfile?.time_zone || 'America/Toronto';
 }
-function resolvePlanKey(userProfile, ownerProfile) {
-  return String(
-    ownerProfile?.plan_key ||
-      ownerProfile?.paid_tier ||
-      ownerProfile?.subscription_tier ||
-      userProfile?.plan_key ||
-      userProfile?.paid_tier ||
-      userProfile?.subscription_tier ||
-      'free'
-  )
-    .toLowerCase()
-    .trim() || 'free';
-}
+
 async function upsertMediaAsset({
   ownerId,
   from,
@@ -623,61 +619,73 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       };
     }
 
-    // ✅ Fetch ownerProfile ONCE + resolve planKey ONCE (used by BOTH image + audio)
-    let ownerProfile = null;
-    try {
-      if (typeof pg.getOwnerProfile === 'function') {
-        ownerProfile = await pg.getOwnerProfile(String(ownerId).trim());
-      }
-    } catch (e) {
-      console.warn('[MEDIA] getOwnerProfile failed (fail-open):', e?.message);
+ // ✅ Fetch ownerProfile ONCE + resolve planKey + caps ONCE (used by BOTH image + audio)
+let ownerProfile = null;
+try {
+  if (typeof pg.getOwnerProfile === 'function') {
+    ownerProfile = await pg.getOwnerProfile(String(ownerId).trim());
+  }
+} catch (e) {
+  console.warn('[MEDIA] getOwnerProfile failed (fail-open):', e?.message);
+}
+
+const planKey = getEffectivePlanFromOwner(ownerProfile); // free/starter/pro
+const planLc = String(planKey || 'free').toLowerCase().trim() || 'free';
+const ownerIdKey = String(ownerId || '').trim(); // keep UUID or digits intact
+
+// ✅ Resolve caps ONCE (no extra DB fetch)
+let caps = null;
+try {
+  caps = await resolveCapsForOwnerProfile(ownerProfile);
+} catch (e) {
+  console.warn('[MEDIA] resolveCaps failed (fail-open):', e?.message);
+  caps = null;
+}
+
+// ✅ Stable idempotency key for this media event
+const mediaSid = getTwilioMediaSid(mediaUrl);
+const stableMediaMsgId =
+  (mediaSid ? `${userKey}:${mediaSid}` : null) ||
+  (String(sourceMsgId || '').trim() ? `${userKey}:${String(sourceMsgId).trim()}` : null) ||
+  `${userKey}:${Date.now()}`;
+
+console.info('[DB_ENV]', {
+  hasDbUrl: !!process.env.DATABASE_URL,
+  dbHostHint: (process.env.DATABASE_URL || '').split('@')[1]?.split('/')[0] || null
+});
+
+// ✅ Resolve active job once (identity lookup should use digits)
+let activeJobName = null;
+let activeJobNo = null;
+let activeJobId = null;
+
+try {
+  if (typeof pg.getActiveJobForIdentity === 'function') {
+    const row = await pg.getActiveJobForIdentity(String(ownerId).trim(), DIGITS(from));
+    if (row) {
+      activeJobName = row.name || row.job_name || null;
+      activeJobNo = row.job_no != null ? Number(row.job_no) : null;
+      activeJobId = row.id && String(row.id).trim() ? String(row.id).trim() : null;
     }
+  }
+} catch (e) {
+  console.warn('[MEDIA] getActiveJobForIdentity failed (ignored):', e?.message);
+}
 
-    const planKey = resolvePlanKey(userProfile, ownerProfile);
-    const ownerIdKey = String(ownerId || '').trim(); // keep UUID or digits intact
+let extractedText = String(input || '').trim();
+const normType = baseType || 'application/octet-stream';
 
-    const mediaSid = getTwilioMediaSid(mediaUrl);
-    const stableMediaMsgId =
-      (mediaSid ? `${userKey}:${mediaSid}` : null) ||
-      (String(sourceMsgId || '').trim() ? `${userKey}:${String(sourceMsgId).trim()}` : null) ||
-      `${userKey}:${Date.now()}`;
+let mediaAssetId = null;
 
-    console.info('[DB_ENV]', {
-      hasDbUrl: !!process.env.DATABASE_URL,
-      dbHostHint: (process.env.DATABASE_URL || '').split('@')[1]?.split('/')[0] || null
-    });
+const mediaMeta = {
+  url: mediaUrl || null,
+  type: normType || null,
+  transcript: null,
+  confidence: null,
+  source_msg_id: stableMediaMsgId,
+  media_asset_id: null
+};
 
-    // Resolve active job once (identity lookup should use digits)
-    let activeJobName = null;
-    let activeJobNo = null;
-    let activeJobId = null;
-
-    try {
-      if (typeof pg.getActiveJobForIdentity === 'function') {
-        const row = await pg.getActiveJobForIdentity(String(ownerId).trim(), DIGITS(from));
-        if (row) {
-          activeJobName = row.name || row.job_name || null;
-          activeJobNo = row.job_no != null ? Number(row.job_no) : null;
-          activeJobId = row.id && String(row.id).trim() ? String(row.id).trim() : null;
-        }
-      }
-    } catch (e) {
-      console.warn('[MEDIA] getActiveJobForIdentity failed (ignored):', e?.message);
-    }
-
-    let extractedText = String(input || '').trim();
-    const normType = baseType || 'application/octet-stream';
-
-    let mediaAssetId = null;
-
-    const mediaMeta = {
-      url: mediaUrl || null,
-      type: normType || null,
-      transcript: null,
-      confidence: null,
-      source_msg_id: stableMediaMsgId,
-      media_asset_id: null
-    };
 
  // AUDIO
 if (isSupportedAudio) {
@@ -685,17 +693,13 @@ if (isSupportedAudio) {
     return { transcript: null, twiml: twiml(`⚠️ Voice transcription isn’t available. Please type the details.`) };
   }
 
-  // ✅ Normalize once (align with IMAGE)
-  const ownerKey = String(ownerIdKey || ownerId || '').trim(); // prefer ownerIdKey if you created it
-  const planLc = String(planKey || 'free').toLowerCase().trim() || 'free';
+  const ownerKey = String(ownerIdKey || ownerId || '').trim(); // normalize once
 
   // 0) Capability gate (plan feature enable)
   try {
-    const caps = await resolveCapsForOwner(ownerKey);
     const voiceEnabled = !!caps?.capture?.voice?.enabled;
 
     if (caps && !voiceEnabled) {
-      // upsell flag (once)
       try {
         const r = await shouldShowUpgradePromptOnce({ ownerId: ownerKey, kind: 'stt' });
         console.info('[UPSELL_FLAG]', { kind: 'stt', ownerId: ownerKey, ...r });
@@ -716,11 +720,11 @@ if (isSupportedAudio) {
     console.warn('[MEDIA] voice plan check failed (fail-open):', e?.message);
   }
 
-  // 1) ✅ STT quota precheck (prevents downloading audio if blocked)
+  // 1) STT quota precheck
   try {
     const q = await checkMonthlyQuota({
       ownerId: ownerKey,
-      planKey: planLc,
+      planKey: planLc, // ✅ reuse shared normalized plan
       kind: 'stt',
       units: 1
     });
@@ -874,13 +878,6 @@ try {
 // Store the image, DO NOT route into expense confirm/job picker.
 // Return the gating message as TwiML so the user sees a response.
 try {
-  const caps = await resolveCapsForOwner(ownerIdKey);
-  console.info('[OCR_CAPS]', {
-  ownerId: ownerIdKey,
-  plan_key: ownerProfile?.plan_key || null,
-  ocrEnabled: !!caps?.capture?.ocr_receipts?.enabled
-});
-
   const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
 
   if (caps && !ocrEnabled) {
@@ -943,11 +940,12 @@ let ocrDeniedReason = null;
 
 try {
   const q = await checkMonthlyQuota({
-    ownerId: ownerIdKey,
-    planKey,
-    kind: 'ocr',
-    units: 1
-  });
+  ownerId: ownerIdKey,
+  planKey: planLc, // ✅ normalized effective plan
+  kind: 'ocr',
+  units: 1
+});
+
 
   if (!q.ok) {
     ocrAllowed = false;
@@ -971,7 +969,7 @@ if (!ocrAllowed) {
       console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
     }
 
-    const planLc = String(planKey || 'free').toLowerCase().trim() || 'free';
+    // IMPORTANT: use outer planLc (normalized effective plan)
 
     if (ocrDeniedReason === 'OVER_QUOTA') {
       const proNudge =
@@ -1008,15 +1006,17 @@ if (!ocrAllowed) {
   return { transcript: 'expense receipt', twiml: null };
 }
 
-  // --------------------------------------------
-  // OCR allowed → attempt OCR
-  // --------------------------------------------
+// --------------------------------------------
+// OCR allowed → attempt OCR
+// --------------------------------------------
+
   try {
     const out = await extractTextFromImage(mediaUrl, {
-      mediaType,
-      ownerId: ownerIdKey,
-      planKey
-    });
+  mediaType,
+  ownerId: ownerIdKey,
+  planKey: planLc
+});
+
 
     ocrText = String(out?.text || out?.transcript || '').trim();
     ocrFields = out?.fields || out?.ocrFields || null;

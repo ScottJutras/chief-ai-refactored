@@ -1,4 +1,14 @@
-// routes/billing.js
+// routes/billing.js (DROP-IN)
+// Billing API for portal (dashboard token auth)
+// - GET  /api/billing/status
+// - POST /api/billing/checkout
+// - POST /api/billing/portal
+//
+// Truth rules:
+// - Webhook writes plan_key + sub_status on owner row.
+// - Effective plan is computed from (plan_key + sub_status) server-side.
+// - UI never "assumes" payment succeeded; it polls /status after checkout.
+
 const express = require("express");
 const Stripe = require("stripe");
 const router = express.Router();
@@ -7,6 +17,8 @@ const db = require("../services/postgres");
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const { requireDashboardOwner } = require("../middleware/requireDashboardOwner");
+const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
+const { plan_capabilities } = require("../src/config/planCapabilities");
 
 // ✅ Billing routes are normal HTTP calls (not Twilio), so use dashboard token auth
 router.use(requireDashboardOwner);
@@ -19,25 +31,55 @@ const PRICE_BY_PLAN = {
   pro: process.env.STRIPE_PRICE_PRO,
 };
 
+function ok(res, payload) {
+  return res.json({ ok: true, ...payload });
+}
+function bad(res, code, error) {
+  return res.status(code).json({ ok: false, error });
+}
+
 function requireOwner(req, res) {
   const ownerId = req.ownerId;
   if (!ownerId) {
-    res.status(401).json({ error: "Missing owner context" });
+    bad(res, 401, "Missing owner context");
     return null;
   }
   return ownerId;
 }
 
+function requireAppBaseUrl() {
+  const base = String(process.env.APP_BASE_URL || "").trim();
+  return base && /^https?:\/\//i.test(base) ? base.replace(/\/+$/, "") : null;
+}
+
+function capsForPlanKey(planKey) {
+  const k = String(planKey || "free").toLowerCase().trim();
+  return plan_capabilities?.[k] || plan_capabilities?.free || null;
+}
+
+// -----------------------------
+// POST /api/billing/checkout
+// -----------------------------
 router.post("/checkout", async (req, res) => {
   try {
     const ownerId = requireOwner(req, res);
     if (!ownerId) return;
 
-    const { planKey } = req.body || {};
-    if (!PRICE_BY_PLAN[planKey]) return res.status(400).json({ error: "Invalid plan" });
+    const appBase = requireAppBaseUrl();
+    if (!appBase) return bad(res, 500, "APP_BASE_URL missing/invalid");
+
+    // Accept either planKey or plan_key (prevents frontend/backend drift)
+    const body = req.body || {};
+    const planKeyRaw = body.planKey || body.plan_key || body.plan || null;
+    const planKey = String(planKeyRaw || "").toLowerCase().trim();
+
+    const priceId = PRICE_BY_PLAN[planKey];
+    if (!planKey || !priceId) {
+      return bad(res, 400, "Invalid plan");
+    }
 
     const owner = await db.getOwner(ownerId);
-    if (!owner) return res.status(404).json({ error: "Owner not found" });
+    if (!owner) return bad(res, 404, "Owner not found");
 
     let customerId = owner?.stripe_customer_id || null;
 
@@ -46,15 +88,16 @@ router.post("/checkout", async (req, res) => {
     if (customerId) {
       try {
         await stripe.customers.retrieve(customerId);
-      } catch (e) {
+      } catch {
         customerId = null;
       }
     }
 
     if (!customerId) {
       const customer = await stripe.customers.create({
-        metadata: { ownerId: String(ownerId) },
+        metadata: { owner_id: String(ownerId), ownerId: String(ownerId) },
       });
+
       customerId = customer.id;
       await db.updateOwnerBilling(ownerId, { stripe_customer_id: customerId });
     }
@@ -62,61 +105,100 @@ router.post("/checkout", async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: customerId,
-      line_items: [{ price: PRICE_BY_PLAN[planKey], quantity: 1 }],
-      success_url: `${process.env.APP_BASE_URL}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.APP_BASE_URL}/billing/cancel`,
-      metadata: { ownerId: String(ownerId), planKey: String(planKey) },
+      line_items: [{ price: priceId, quantity: 1 }],
+
+      // Redirects are just UX; webhook is truth.
+      // We add activating=1 so the billing page can poll.
+      success_url: `${appBase}/app/settings/billing?activating=1&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${appBase}/app/settings/billing?canceled=1`,
+
+      client_reference_id: String(ownerId),
+
+      // Metadata is informative only; webhook must map price_id → plan_key
+      metadata: {
+        owner_id: String(ownerId),
+        ownerId: String(ownerId),
+        plan_key_requested: String(planKey),
+        planKey: String(planKey),
+      },
     });
 
-    return res.json({ url: session.url });
+    return ok(res, { url: session.url });
   } catch (e) {
-    console.error("[BILLING_CHECKOUT_ERR]", e);
-    return res.status(500).json({ error: "checkout_failed" });
+    console.error("[BILLING_CHECKOUT_ERR]", e?.message || e);
+    return bad(res, 500, "checkout_failed");
   }
 });
 
+// -----------------------------
+// GET /api/billing/status
+// -----------------------------
 router.get("/status", async (req, res) => {
   try {
     const ownerId = requireOwner(req, res);
     if (!ownerId) return;
 
     const owner = await db.getOwner(ownerId);
-    if (!owner) return res.status(404).json({ error: "Owner not found" });
+    if (!owner) return bad(res, 404, "Owner not found");
 
-    return res.json({
-      plan_key: owner.plan_key,
-      sub_status: owner.sub_status,
-      cancel_at_period_end: owner.cancel_at_period_end,
-      current_period_start: owner.current_period_start,
-      current_period_end: owner.current_period_end,
-      stripe_customer_id: !!owner.stripe_customer_id,
+    // "linked" is already enforced by requireDashboardOwner,
+    // but we return it so UI can render cleanly.
+    const linked = true;
+
+    const effective_plan = getEffectivePlanKey(owner); // free|starter|pro|enterprise (if you add later)
+    const caps = capsForPlanKey(effective_plan);
+
+    return ok(res, {
+      owner_id: String(ownerId),
+      linked,
+
+      plan_key: String(owner.plan_key || "free").toLowerCase(),
+      sub_status: owner.sub_status || null,
+      effective_plan,
+
+      cancel_at_period_end: !!owner.cancel_at_period_end,
+      current_period_start: owner.current_period_start || null,
+      current_period_end: owner.current_period_end || null,
+
+      // IDs (return actual values; UI can choose to display or not)
+      stripe_customer_id: owner.stripe_customer_id || null,
+      stripe_subscription_id: owner.stripe_subscription_id || null,
+      stripe_price_id: owner.stripe_price_id || null,
+
+      caps,
     });
   } catch (e) {
-    console.error("[BILLING_STATUS_ERR]", e);
-    return res.status(500).json({ error: "status_failed" });
+    console.error("[BILLING_STATUS_ERR]", e?.message || e);
+    return bad(res, 500, "status_failed");
   }
 });
 
+// -----------------------------
+// POST /api/billing/portal
+// -----------------------------
 router.post("/portal", async (req, res) => {
   try {
     const ownerId = requireOwner(req, res);
     if (!ownerId) return;
 
+    const appBase = requireAppBaseUrl();
+    if (!appBase) return bad(res, 500, "APP_BASE_URL missing/invalid");
+
     const owner = await db.getOwner(ownerId);
-    if (!owner) return res.status(404).json({ error: "Owner not found" });
+    if (!owner) return bad(res, 404, "Owner not found");
 
     const customerId = owner?.stripe_customer_id;
-    if (!customerId) return res.status(400).json({ error: "No Stripe customer on file" });
+    if (!customerId) return bad(res, 400, "No Stripe customer on file");
 
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
-      return_url: `${process.env.APP_BASE_URL}/billing`,
+      return_url: `${appBase}/app/settings/billing`,
     });
 
-    return res.json({ url: session.url });
+    return ok(res, { url: session.url });
   } catch (e) {
-    console.error("[BILLING_PORTAL_ERR]", e);
-    return res.status(500).json({ error: "portal_failed" });
+    console.error("[BILLING_PORTAL_ERR]", e?.message || e);
+    return bad(res, 500, "portal_failed");
   }
 });
 

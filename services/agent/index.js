@@ -8,11 +8,14 @@ const { LLMProvider } = require('../llm');
 const { CHIEF_SYSTEM_PROMPT } = require('../../prompts/chief.system');
 const txTools = require('../agentTools/transaction');
 
-// ----- Subscription gate (free/basic can't use Agent) -----
-function canUseAgent(userProfile) {
-  const tier = (userProfile?.subscription_tier || 'basic').toLowerCase();
-  return tier !== 'basic';
+// ✅ correct path from /services/agent → /src/config
+const { getEffectivePlanKey } = require('../../src/config/getEffectivePlanKey');
+
+// ----- Subscription gate (free/starter can't use Agent) -----
+function canUseAgent(ownerProfile) {
+  return getEffectivePlanKey(ownerProfile) === 'pro';
 }
+
 
 // ----- Lazy RAG loader (prevents cold-start stalls) -----
 let rag = null, ragTried = false;
@@ -256,8 +259,8 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
 }
 
 // ----- Public ask API --------------------------------------
-async function ask({ from, ownerId, text, topicHints = [], userProfile } = {}) {
-  if (!canUseAgent(userProfile)) {
+async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) {
+  if (!canUseAgent(ownerProfile)) {
     const ragMod = getRag();
     if (ragMod?.answer) {
       try {

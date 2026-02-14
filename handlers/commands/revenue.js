@@ -27,6 +27,8 @@ const {
 
 const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
 const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
+const { getEffectivePlanFromOwner } = require("../../src/config/effectivePlan");
+
 
 
 // ---- CIL validator (fail-open) ----
@@ -1316,7 +1318,7 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
   input = stripRevenuePrefixes(input);
 
   twilioMeta = twilioMeta && typeof twilioMeta === 'object' ? twilioMeta : {};
-
+const plan = getEffectivePlanFromOwner(ownerProfile);
   // ✅ Canonical PA key (digits) — prefer WaId, then userProfile, then from
   const paUserId =
     (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(twilioMeta?.WaId || twilioMeta?.WaID || twilioMeta?.waid)) ||

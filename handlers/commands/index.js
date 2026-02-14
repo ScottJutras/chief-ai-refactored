@@ -25,6 +25,8 @@ const deletePendingTransactionState =
 const { sendTemplateMessage } = require('../../services/twilio');
 const { applyCIL } = require('../../services/cilRouter');
 const confirmationTemplates = require('../../config').confirmationTemplates;
+const { getEffectivePlanKey } = require("../../src/config/getEffectivePlanKey");
+
 
 // Lazy-load per-file handlers
 let tasksHandler, handleTimeclock, handleJob, handleExpense, handleRevenue, teamHandler;
@@ -241,19 +243,23 @@ module.exports = async function handleCommands(from, text, userProfile, ownerId,
       }
     }
 
-    // 3) Subscription gating (unchanged)
-    const tier = String(userProfile?.subscription_tier || 'basic').toLowerCase();
-    const needsPro = /agent|deepdive|quote|metrics|receipt|pricing/i.test(lc);
-    if (needsPro && !['pro', 'enterprise'].includes(tier)) {
-      const sent = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, {
-        '1': `This feature requires Pro or Enterprise.`,
-      });
+    // 3) Subscription gating (canonical: plan_key + sub_status)
+const planKey = getEffectivePlanKey(ownerProfile);
 
-      await safeCleanup({ from, ownerId });
+// Decide what you want to gate here. (Keep your regex.)
+const needsPro = /agent|quote|metrics|receipt|pricing/i.test(lc);
 
-      // If REST template send worked, don't also send TwiML
-      return sent ? twimlEmpty(res) : twiml(res, `Upgrade to Pro to use this feature.`);
-    }
+if (needsPro && planKey !== "pro") {
+  const sent = await sendTemplateMessage(from, confirmationTemplates.upgradeNow, {
+    "1": "This feature requires Pro.",
+  });
+
+  await safeCleanup({ from, ownerId });
+
+  // If REST template send worked, don't also send TwiML
+  return sent ? twimlEmpty(res) : twiml(res, "Upgrade to Pro to use this feature.");
+}
+
 
     // 4) Dedicated handlers first (so they can manage stateful flows cleanly)
     // Expense + Revenue should run before task/timeclock/job so they can consume confirmations, job pickers, etc.

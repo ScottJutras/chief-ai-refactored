@@ -3,7 +3,8 @@
 //
 // Alignments:
 // - Defensive query() import
-// - Fixes minor formatting + keeps plan + featureFlags + tasks + recentReceipts
+// - Uses effective plan via getEffectivePlanFromOwner(ownerProfile)
+// - Keeps plan + featureFlags + tasks + recentReceipts
 // - Does NOT assume columns exist; failures return [] (fail-open)
 
 const express = require('express');
@@ -11,6 +12,7 @@ const router = express.Router();
 
 const { getCompanyKpis } = require('../services/kpis');
 const { getJobKpiSummary } = require('../services/jobsKpis');
+const { getEffectivePlanFromOwner } = require('../src/config/effectivePlan');
 
 const pg = require('../services/postgres');
 const query = pg.query || pg.pool?.query || pg.db?.query;
@@ -26,41 +28,24 @@ async function resolveOwnerId(req) {
       err.statusCode = 500;
       throw err;
     }
+
     const { rows } = await query(
       `SELECT owner_id FROM users WHERE dashboard_token = $1 LIMIT 1`,
       [String(token).trim()]
     );
+
     if (!rows.length) {
       const err = new Error('Invalid dashboard token');
       err.statusCode = 404;
       throw err;
     }
-    return rows[0].owner_id;
+
+    return String(rows[0].owner_id || '').trim();
   }
 
   const err = new Error('ownerId or token is required');
   err.statusCode = 400;
   throw err;
-}
-
-async function getOwnerPlan(ownerId) {
-  if (!query) return { tier: 'free', isPro: false };
-
-  const { rows } = await query(
-    `SELECT subscription_tier, paid_tier
-       FROM users
-      WHERE owner_id = $1
-      ORDER BY created_at ASC
-      LIMIT 1`,
-    [ownerId]
-  );
-
-  const row = rows[0] || {};
-  const rawTier = (row.paid_tier || row.subscription_tier || 'free').toString();
-  const tier = rawTier.toLowerCase();
-
-  const isPro = tier === 'pro' || tier === 'trial' || tier === 'paid' || tier === 'plus';
-  return { tier, isPro };
 }
 
 function getPeriodLabel(period) {
@@ -169,7 +154,19 @@ router.get('/', async (req, res) => {
   try {
     const ownerId = await resolveOwnerId(req);
     const period = (req.query.period || 'this_month').toString().toLowerCase();
-    const plan = await getOwnerPlan(ownerId);
+
+    // ✅ Effective plan
+    let ownerProfile = null;
+    try {
+      if (typeof pg.getOwnerProfile === 'function') {
+        ownerProfile = await pg.getOwnerProfile(String(ownerId).trim());
+      }
+    } catch (e) {
+      console.warn('[API.DASHBOARD] getOwnerProfile failed (fail-open):', e?.message);
+    }
+
+    const tier = String(getEffectivePlanFromOwner(ownerProfile) || 'free').toLowerCase().trim() || 'free';
+    const plan = { tier, isPro: tier === 'pro' };
 
     const [kpis, jobs, tasks, recentReceipts] = await Promise.all([
       getCompanyKpis({ ownerId }),

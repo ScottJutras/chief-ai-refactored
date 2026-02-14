@@ -340,7 +340,6 @@ module.exports = async function handleOnboarding(
         email,
         stripe_customer_id,
         stripe_subscription_id,
-        subscription_tier: stripe_subscription_id ? 'pro' : (profile?.subscription_tier || 'basic'),
         trial_start,
         trial_end,
         onboarding_in_progress: true,

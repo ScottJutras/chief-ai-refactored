@@ -10,6 +10,8 @@ const { generateQuotePDFBuffer } = require('../../utils/pdfService');
 const { uploadQuotePdfBuffer, createQuoteSignedUrl } = require('../../utils/storageQuotes');
 
 const { checkMonthlyQuota, consumeMonthlyQuota } = require('../../utils/quota');
+const { shouldShowUpgradePromptOnce } = require('../../src/lib/handleCapabilityDenied');
+const { getEffectivePlanFromOwner } = require('../../src/config/effectivePlan');
 
 function isQuoteCommand(text) {
   const s = String(text || '').trim().toLowerCase();
@@ -19,14 +21,6 @@ function isQuoteCommand(text) {
 function newQuoteId() {
   // short, URL-safe-ish id for paths/logs
   return `q_${crypto.randomBytes(6).toString('hex')}`;
-}
-
-function resolvePlanKey(userProfile) {
-  return (
-    String(userProfile?.plan_key || userProfile?.paid_tier || userProfile?.subscription_tier || 'free')
-      .toLowerCase()
-      .trim() || 'free'
-  );
 }
 
 async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
@@ -72,9 +66,11 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
     logoUrl: userProfile?.logo_url || null
   };
 
-  const planKey = resolvePlanKey(userProfile);
+  // ✅ Canonical effective plan (normalized)
+  const planKey =
+    String(getEffectivePlanFromOwner(userProfile) || 'free').toLowerCase().trim() || 'free';
 
-    // ✅ Gate + consume BEFORE PDF generation (server cost surface)
+  // ✅ Gate + consume BEFORE PDF generation (server cost surface)
   try {
     const q = await checkMonthlyQuota({ ownerId: owner_id, planKey, kind: 'export_pdf', units: 1 });
 
@@ -89,10 +85,9 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
 
       const reason = String(q.reason || '').toUpperCase();
 
-      // OVER_QUOTA (paid user) vs NOT_INCLUDED (free)
       if (reason === 'OVER_QUOTA') {
         const proNudge =
-          String(planKey || '').toLowerCase() === 'starter'
+          planKey === 'starter'
             ? `\n\nYou’re on Starter. Pro includes higher monthly export capacity — upgrade only if your volume justifies it.`
             : '';
 
@@ -117,7 +112,6 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
   } catch (e) {
     return `PDF export is temporarily unavailable. Please try again.`;
   }
-
 
   // Generate PDF buffer
   const pdfBuffer = await generateQuotePDFBuffer(quoteData);

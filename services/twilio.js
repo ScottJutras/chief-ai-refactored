@@ -225,41 +225,90 @@ function resolveSendFromConfig() {
     String(process.env.TWILIO_MESSAGING_SERVICE_SID || '').trim() || null;
 
   return {
-    waFrom: String(waFromLocal || waFromEnv || '').trim() || null,
-    messagingServiceSid: String(mssLocal || messagingServiceSidEnv || '').trim() || null
-  };
+  waFrom: String(waFromLocal || waFromEnv || '').trim() || null,
+
+  // ✅ IMPORTANT: Do NOT use Messaging Service for WhatsApp templates unless you 100% confirmed
+  // the service has a WhatsApp sender attached. Prevents 21703.
+  messagingServiceSid: null
+};
+
 }
 
 /**
- * ✅ WhatsApp Content API still wants a body field present; keep it non-empty
- * ✅ Twilio requires `contentVariables` as a JSON STRING
- * ✅ Returns Twilio Message object (sid/status)
+ * ✅ WhatsApp Content API requires `contentVariables` as a JSON STRING
+ * ✅ Keep body non-empty
+ * ✅ HARDENED: normalize to/from, normalize numeric keys, and (optionally) enforce count
  */
 async function sendTemplateMessage(to, sid, vars = {}, fallbackBody = ' ') {
   const safeFallback = String(fallbackBody || '').trim() || ' ';
 
-  const cleanVars = {};
+  // ✅ Normalize TO for WhatsApp templates (always safe)
+  const toNorm = toWhatsApp(to);
+
+  // ✅ Normalize variable keys to pure integer strings "1".."N"
+  // and values to strings. Drops anything not a positive integer key.
+  const normalized = {};
   try {
     for (const [k, v] of Object.entries(vars || {})) {
       if (v == null) continue;
-      cleanVars[String(k)] = String(v);
+      const n = parseInt(String(k).trim(), 10);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      normalized[String(n)] = String(v);
     }
   } catch {}
 
+  // ✅ OPTIONAL strict enforcement:
+  // If you set TWILIO_TEMPLATE_PARAM_COUNT, we will send EXACTLY 1..N keys (no more, no less).
+  // For job picker, set this to 18.
+  const envCount = parseInt(String(process.env.TWILIO_TEMPLATE_PARAM_COUNT || '').trim(), 10) || null;
+
+  let finalVars = normalized;
+
+  if (envCount && Number.isFinite(envCount) && envCount > 0) {
+    const strict = {};
+    for (let i = 1; i <= envCount; i++) {
+      const key = String(i);
+      strict[key] = finalVars[key] != null ? String(finalVars[key]) : '—';
+    }
+    finalVars = strict;
+  }
+
+  // ✅ Key audit + missing keys (this is the most useful log for 63028)
+  const keys = Object.keys(finalVars).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+  const maxKey = keys.reduce((m, k) => Math.max(m, parseInt(k, 10) || 0), 0);
+
+  const missing = [];
+  for (let i = 1; i <= maxKey; i++) {
+    if (!finalVars[String(i)]) missing.push(String(i));
+  }
+
+  console.info('[TWILIO] contentVariables key audit', {
+    keyCount: keys.length,
+    maxKey,
+    missingCount: missing.length,
+    missingFirst: missing.slice(0, 10),
+    firstKeys: keys.slice(0, 10),
+    lastKeys: keys.slice(-10),
+    envCount: envCount || null
+  });
+
   let contentVariables = '{}';
   try {
-    contentVariables = JSON.stringify(cleanVars);
+    contentVariables = JSON.stringify(finalVars);
   } catch {
     contentVariables = '{}';
   }
 
   const { waFrom, messagingServiceSid } = resolveSendFromConfig();
 
+  // ✅ Normalize FROM if using WhatsApp sender
+  const fromNorm = waFrom ? normalizeWhatsAppFrom(waFrom) : null;
+
   const statusCallback = String(process.env.TWILIO_STATUS_CALLBACK_URL || '').trim() || null;
 
   const payload = {
-    to,
-    ...(messagingServiceSid ? { messagingServiceSid } : { from: waFrom }),
+    to: toNorm,
+    ...(messagingServiceSid ? { messagingServiceSid } : { from: fromNorm }),
     contentSid: String(sid || '').trim(),
     contentVariables,
     body: safeFallback,
@@ -268,10 +317,9 @@ async function sendTemplateMessage(to, sid, vars = {}, fallbackBody = ' ') {
 
   console.info('[TWILIO] sendTemplateMessage messages.create payload', {
     to: payload.to,
-    hasFrom: !!payload.from,
+    from: payload.from ? String(payload.from).slice(0, 20) : null,
     hasMessagingServiceSid: !!payload.messagingServiceSid,
     hasContentSid: !!payload.contentSid,
-    hasContentVariables: !!payload.contentVariables,
     contentVariablesLen: String(payload.contentVariables || '').length,
     hasBody: !!payload.body,
     hasStatusCallback: !!payload.statusCallback
@@ -290,6 +338,8 @@ async function sendTemplateMessage(to, sid, vars = {}, fallbackBody = ' ') {
     throw e;
   }
 }
+
+
 
 
 
@@ -349,6 +399,7 @@ async function sendBackfillConfirm(to, humanLine, opts = {}) {
  */
 async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections, contentSid } = {}) {
   const safeBody = safeBodyOrDash(bodyText);
+  const toWa = toWhatsApp(to);
 
   const sid =
     (contentSid && String(contentSid).trim()) ||
@@ -361,7 +412,7 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
     sections.some((s) => Array.isArray(s?.rows) && s.rows.length > 0);
 
   console.info('[TWILIO] sendWhatsAppInteractiveList', {
-    to: String(to || '').slice(0, 12),
+    to: String(toWa || '').slice(0, 18),
     hasSid: !!sid,
     sid: sid ? `${sid.slice(0, 6)}…` : null,
     hasBody: !!safeBody,
@@ -373,73 +424,102 @@ async function sendWhatsAppInteractiveList({ to, bodyText, buttonText, sections,
   if (!hasRows) {
     console.warn('[TWILIO] interactive list requested but sections had no rows; sending plain text fallback');
     return sendWhatsApp(
-      to,
+      toWa,
       safeBody + '\n\n(No jobs found for this account — try creating a job or check tenant mapping.)'
     );
   }
 
   if (!sid) {
     console.warn('[TWILIO] Interactive list requested but no Content SID configured. Sending plain text.');
-    return sendWhatsApp(to, safeBody);
+    return sendWhatsApp(toWa, safeBody);
   }
 
-  // Flatten rows across sections and take first 8
+  // Flatten rows across sections
   const flatRows = [];
   for (const s of (sections || [])) {
     for (const r of (s?.rows || [])) flatRows.push(r);
   }
 
-  const rows8 = flatRows.slice(0, 8);
+  // ✅ Row count configurable (1..8)
+  const rowCount =
+    Math.max(1, Math.min(8, parseInt(String(process.env.TWILIO_WA_JOB_PICKER_ROW_COUNT || '8'), 10) || 8));
 
-  // Pad to exactly 8 rows (template requires 8 items)
-  while (rows8.length < 8) {
-    rows8.push({ title: '—', id: `pad_${rows8.length + 1}` });
+  const rows = flatRows.slice(0, rowCount);
+
+  while (rows.length < rowCount) {
+    rows.push({ title: '—', id: `pad_${rows.length + 1}` });
   }
 
-  // Template vars:
-  // 1=body, 2=button
-  // row1: 3=name, 4=id
-  // row2: 5=name, 6=id
-  // ...
-  // row8: 17=name, 18=id
-  const vars = {
+  let vars = {
     1: String(safeBody || '—'),
     2: String(buttonText || 'Pick job')
   };
 
-  for (let i = 0; i < 8; i++) {
-    const r = rows8[i];
+  for (let i = 0; i < rowCount; i++) {
+    const r = rows[i];
     const base = 3 + i * 2;
     vars[String(base)] = String(r?.title || '—');
     vars[String(base + 1)] = String(r?.id || `pad_${i + 1}`);
   }
 
   console.info('[TWILIO] list vars preview', {
+    rowCount,
     v1: vars[1],
     v2: vars[2],
     row1: { name: vars[3], id: vars[4] },
-    row2: { name: vars[5], id: vars[6] }
+    row2: rowCount >= 2 ? { name: vars[5], id: vars[6] } : null
+  });
+
+  // ✅ Determine final param count
+  const envExpected =
+    parseInt(String(process.env.TWILIO_WA_JOB_PICKER_PARAM_COUNT || '').trim(), 10) || null;
+
+  // Optional “pad higher” override (use ONLY if Content API shows more than 18 expected)
+  const envPadTo =
+    parseInt(String(process.env.TWILIO_WA_JOB_PICKER_PAD_TO || '').trim(), 10) || null;
+
+  const keysNow = Object.keys(vars).map((k) => parseInt(k, 10)).filter((n) => Number.isFinite(n));
+  const maxKeyNow = keysNow.length ? Math.max(...keysNow) : 0;
+
+  const expectedParamCount =
+    (envExpected && envExpected > 0 ? envExpected : null) ||
+    (envPadTo && envPadTo > 0 ? envPadTo : null) ||
+    maxKeyNow;
+
+  // ✅ Pad/trim to expectedParamCount
+  const finalVars = {};
+  for (let i = 1; i <= expectedParamCount; i++) {
+    const k = String(i);
+    finalVars[k] = (vars[k] != null ? String(vars[k]) : '—');
+  }
+
+  console.info('[TWILIO] list vars finalized', {
+    expectedParamCount,
+    maxKeyNow,
+    keysSent: Object.keys(finalVars).length
   });
 
   try {
-    const result = await sendTemplateMessage(to, sid, vars, safeBody);
+    const result = await sendTemplateMessage(toWa, sid, finalVars, safeBody);
 
     if (DOUBLE_SEND_LIST_FALLBACK) {
       try {
-        await sendWhatsApp(to, safeBody);
+        await sendWhatsApp(toWa, safeBody);
       } catch (e2) {
         console.warn('[TWILIO] double-send fallback failed (ignored):', e2?.message);
       }
     }
 
-    return result; // ✅ includes sid/status
+    return result;
   } catch (e) {
     console.warn('[TWILIO] interactive list template failed; falling back to plain text:', e?.message);
-
     const lines = flatRows.slice(0, 12).map((r, i) => `${i + 1}) ${r.title}`);
-    return sendWhatsApp(to, `${safeBody}\n\nReply with a job number:\n${lines.join('\n')}`);
+    return sendWhatsApp(toWa, `${safeBody}\n\nReply with a job number:\n${lines.join('\n')}`);
   }
 }
+
+
+
 
 function verifyTwilioSignature(options = {}) {
   if (!useMock && TWILIO_AUTH_TOKEN) {

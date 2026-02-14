@@ -12,6 +12,7 @@
 // Self-logging from employee phones is gated elsewhere (Gate #1, Pro only).
 
 const pg = require('../../services/postgres');
+const { getEffectivePlanFromOwner } = require('../../src/config/effectivePlan');
 
 function RESP(t) {
   const s = String(t ?? '').trim();
@@ -28,7 +29,6 @@ function RESP(t) {
 
   return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${esc}</Message></Response>`;
 }
-
 
 function DIGITS(x) {
   return String(x ?? '').replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '');
@@ -106,23 +106,10 @@ async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwn
     const msg = String(input || '').trim();
     const lc = msg.toLowerCase();
 
-    // Plan + caps
-    const rawPlan = String(ownerProfile?.plan_key || ownerProfile?.paid_tier || ownerProfile?.subscription_tier || 'free');
-    const caps = await resolveCaps(rawPlan);
+    // ✅ Canonical, status-aware plan (ONE place)
+    const planKey = getEffectivePlanFromOwner(ownerProfile); // free/starter/pro
+    const caps = await resolveCaps(planKey);
     const maxEmployees = caps?.people?.max_employee_records;
-
-if (maxEmployees != null && Number.isFinite(Number(maxEmployees))) {
-  const { rows } = await pg.query(
-    `select count(*)::int as c from public.employees where owner_id=$1`,
-    [owner]
-  );
-  const c = Number(rows?.[0]?.c || 0);
-
-  if (c >= Number(maxEmployees)) {
-    // block + upsell copy...
-  }
-}
-
 
     // LIST
     if (/^(team|employees|crew)\b/i.test(msg)) {
@@ -153,109 +140,106 @@ if (maxEmployees != null && Number.isFinite(Number(maxEmployees))) {
     }
 
     // ADD
-if (/^add\s+(employee|emp|crew)\b/i.test(msg)) {
-  const parsed = parseAdd(msg);
-  if (!parsed?.name) {
-    return res.send(RESP(`Try:\nadd employee John\nadd employee John +15195551234`));
-  }
+    if (/^add\s+(employee|emp|crew)\b/i.test(msg)) {
+      const parsed = parseAdd(msg);
+      if (!parsed?.name) {
+        return res.send(RESP(`Try:\nadd employee John\nadd employee John +15195551234`));
+      }
 
-  // Gate #3 — max_employee_records (only if it's a real number)
-  if (maxEmployees != null && Number.isFinite(Number(maxEmployees))) {
-    const { rows } = await pg.query(
-      `select count(*)::int as c from public.employees where owner_id=$1`,
-      [owner]
-    );
-    const c = Number(rows?.[0]?.c || 0);
+      // Gate — max_employee_records (only if it's a real number)
+      if (maxEmployees != null && Number.isFinite(Number(maxEmployees))) {
+        const { rows } = await pg.query(
+          `select count(*)::int as c from public.employees where owner_id=$1`,
+          [owner]
+        );
+        const c = Number(rows?.[0]?.c || 0);
 
-    if (c >= Number(maxEmployees)) {
-      const planLc = String(rawPlan || 'free').toLowerCase();
-      const tierLine =
-        planLc.includes('free')
-          ? `Free supports up to ${maxEmployees} employee records. Upgrade to Starter (10) or Pro (25).`
-          : `Your plan supports up to ${maxEmployees} employee records. Upgrade to Pro for more.`;
+        if (c >= Number(maxEmployees)) {
+          const planLc = String(planKey || 'free').toLowerCase();
+          const tierLine =
+            planLc === 'free'
+              ? `Free supports up to ${maxEmployees} employee records. Upgrade to Starter or Pro for more.`
+              : `Your plan supports up to ${maxEmployees} employee records. Upgrade to Pro for more.`;
 
-      return res.send(RESP(`⚠️ Employee limit reached (${c}/${maxEmployees}).\n\n${tierLine}`));
+          return res.send(RESP(`⚠️ Employee limit reached (${c}/${maxEmployees}).\n\n${tierLine}`));
+        }
+      }
+
+      // Insert (schema-tolerant)
+      const hasPhone = await employeesTableHasColumn('phone');
+      const hasSource = await employeesTableHasColumn('source_msg_id'); // optional
+      const hasRole = await employeesTableHasColumn('role');
+      const hasActive = await employeesTableHasColumn('active');
+
+      const cols = ['owner_id', 'name', 'created_at'];
+      const vals = ['$1', '$2', 'now()'];
+      const params = [owner, parsed.name];
+
+      // role default if required
+      if (hasRole) {
+        cols.push('role');
+        vals.push(`$${params.length + 1}`);
+        params.push('employee');
+      }
+
+      if (hasActive) {
+        cols.push('active');
+        vals.push(`$${params.length + 1}`);
+        params.push(true);
+      }
+
+      if (hasPhone) {
+        cols.push('phone');
+        vals.push(`$${params.length + 1}`);
+        params.push(parsed.phone);
+      }
+
+      const sourceVal = String(sourceMsgId || '').trim() || null;
+      const willWriteSource = !!(hasSource && sourceVal);
+      if (willWriteSource) {
+        cols.push('source_msg_id');
+        vals.push(`$${params.length + 1}`);
+        params.push(sourceVal);
+      }
+
+      const sql = `
+        insert into public.employees (${cols.join(', ')})
+        values (${vals.join(', ')})
+        returning id, name
+      `;
+
+      let r;
+      try {
+        r = await pg.query(sql, params);
+      } catch (e) {
+        // If DB trigger blocks, show friendly message
+        if (String(e?.code) === 'P0001' && /employee_limit_reached/i.test(String(e?.message || ''))) {
+          const planLc = String(planKey || 'free').toLowerCase();
+          const tierLine =
+            planLc === 'free'
+              ? `Free supports up to ${maxEmployees ?? 3} employee records. Upgrade to Starter or Pro for more.`
+              : `Your plan supports up to ${maxEmployees ?? 10} employee records. Upgrade to Pro for more.`;
+
+          return res.send(RESP(`⚠️ Employee limit reached.\n\n${tierLine}`));
+        }
+
+        // Twilio retry idempotency (only if we wrote source_msg_id)
+        if (String(e?.code) === '23505' && willWriteSource) {
+          return res.send(RESP(`✅ Added employee: ${parsed.name}`));
+        }
+
+        throw e;
+      }
+
+      const nm = String(r?.rows?.[0]?.name || parsed.name).trim();
+      return res.send(RESP(`✅ Added employee: ${nm}`));
     }
-  }
-
-  // Insert (schema-tolerant: phone/source_msg_id exist; role/active may be required)
-  const hasPhone = await employeesTableHasColumn('phone');
-  const hasSource = await employeesTableHasColumn('source_msg_id'); // will be false until you add column
-  const hasRole = await employeesTableHasColumn('role');
-  const hasActive = await employeesTableHasColumn('active');
-
-  const cols = ['owner_id', 'name', 'created_at'];
-  const vals = ['$1', '$2', 'now()'];
-  const params = [owner, parsed.name];
-
-  // ✅ role is NOT NULL in your schema — set it when column exists
-  if (hasRole) {
-    cols.push('role');
-    vals.push(`$${params.length + 1}`);
-    params.push('employee'); // canonical default
-  }
-
-  // optional active flag (your table has it)
-  if (hasActive) {
-    cols.push('active');
-    vals.push(`$${params.length + 1}`);
-    params.push(true);
-  }
-
-  if (hasPhone) {
-    cols.push('phone');
-    vals.push(`$${params.length + 1}`);
-    params.push(parsed.phone);
-  }
-
-  // Only add source_msg_id if col exists AND we have a non-empty value
-  const sourceVal = String(sourceMsgId || '').trim() || null;
-  const willWriteSource = !!(hasSource && sourceVal);
-  if (willWriteSource) {
-    cols.push('source_msg_id');
-    vals.push(`$${params.length + 1}`);
-    params.push(sourceVal);
-  }
-
-  const sql = `
-    insert into public.employees (${cols.join(', ')})
-    values (${vals.join(', ')})
-    returning id, name
-  `;
-
-  let r;
-  try {
-    r = await pg.query(sql, params);
-  } catch (e) {
-    // ✅ If DB trigger blocks (Gate #3), return friendly upsell instead of “Team error”
-    if (String(e?.code) === 'P0001' && /employee_limit_reached/i.test(String(e?.message || ''))) {
-      const planLc = String(rawPlan || 'free').toLowerCase();
-      const tierLine =
-        planLc.includes('free')
-          ? `Free supports up to ${maxEmployees ?? 3} employee records. Upgrade to Starter (10) or Pro (25).`
-          : `Your plan supports up to ${maxEmployees ?? 10} employee records. Upgrade to Pro for more.`;
-
-      return res.send(RESP(`⚠️ Employee limit reached.\n\n${tierLine}`));
-    }
-
-    // ✅ Twilio retry idempotency (only if we actually wrote source_msg_id)
-    if (String(e?.code) === '23505' && willWriteSource) {
-      return res.send(RESP(`✅ Added employee: ${parsed.name}`));
-    }
-
-    throw e;
-  }
-
-  const nm = String(r?.rows?.[0]?.name || parsed.name).trim();
-  return res.send(RESP(`✅ Added employee: ${nm}`));
-}
 
     // REMOVE
     if (/^remove\s+(employee|emp|crew)\b/i.test(msg)) {
       const parsed = parseRemove(msg);
       if (!parsed) return res.send(RESP(`Try:\nremove employee John\nremove employee +15195551234`));
 
-      // Prefer phone if present + column exists
       const hasPhone = await employeesTableHasColumn('phone');
 
       let out;
@@ -283,19 +267,17 @@ if (/^add\s+(employee|emp|crew)\b/i.test(msg)) {
     return res.send(
       RESP(
         `Employee commands:\n` +
-        `- team\n` +
-        `- add employee John\n` +
-        `- add employee John +15195551234\n` +
-        `- remove employee John`
+          `- team\n` +
+          `- add employee John\n` +
+          `- add employee John +15195551234\n` +
+          `- remove employee John`
       )
     );
   } catch (e) {
     console.error('[team] error:', e?.message);
     return res.send(RESP(`Team error. Try again.`));
   } finally {
-    try {
-      res?.req?.releaseLock?.();
-    } catch {}
+    try { res?.req?.releaseLock?.(); } catch {}
   }
 }
 

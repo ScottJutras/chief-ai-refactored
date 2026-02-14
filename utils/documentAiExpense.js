@@ -47,7 +47,7 @@ async function processExpenseReceipt({
   if (!bytes || !Buffer.isBuffer(bytes)) throw new Error('Missing bytes Buffer');
 
   const owner = String(ownerId || '').trim();
-  const plan = String(planKey || 'free').toLowerCase().trim() || 'free';
+  const plan = String(planKey || 'free').toLowerCase().trim() || 'free'; // effective plan expected
 
   // ✅ Gate + consume BEFORE paid call
   if (!owner) throw new Error('Missing ownerId (quota gate safety)');

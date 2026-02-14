@@ -22,6 +22,7 @@ const state = require('../../utils/stateManager');
 const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
 const { shouldShowJobCreatedOrientation } = require('../../src/lib/upsellDecisions');
 const { getPlanOrDefault } = require('../../src/config/checkCapability');
+const { getEffectivePlanKey } = require("../../src/config/getEffectivePlanKey");
 
 // Twilio helpers (preferred)
 let sendWhatsAppInteractiveList = null;
@@ -980,73 +981,49 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
   }
 
   // -------------------------------
-  // ✅ Gate #2 — max jobs per plan
-  // -------------------------------
-  let plan = 'free';
+// ✅ Gate #2 — max jobs per plan
+// Canonical: plan_key + sub_status (effective plan)
+// -------------------------------
+let plan = "free";
+try {
+  plan = getEffectivePlanKey(ownerProfile); // "free" | "starter" | "pro"
+} catch {}
+
+let caps = null;
+try {
+  const { plan_capabilities } = require("../../src/config/planCapabilities");
+  caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
+} catch {}
+
+const maxJobs = caps?.jobs?.max_jobs_total ?? null;
+
+// Only gate if maxJobs is a finite number (null means unbounded)
+if (Number.isFinite(Number(maxJobs))) {
   try {
-    const rawPlan = String(
-      ownerProfile?.plan_key ||
-        ownerProfile?.plan ||
-        ownerProfile?.tier ||
-        ownerProfile?.pricing_plan ||
-        ownerProfile?.subscription_tier ||
-        ownerProfile?.paid_tier ||
-        'free'
+    const { rows } = await pg.query(
+      `select count(*)::int as c
+         from public.jobs
+        where owner_id=$1`,
+      [String(owner).trim()]
     );
 
-    plan = typeof getPlanOrDefault === 'function'
-      ? getPlanOrDefault(rawPlan)
-      : String(rawPlan || 'free').toLowerCase().trim();
-  } catch {}
+    const currentCount = Number(rows?.[0]?.c || 0);
+    if (currentCount >= Number(maxJobs)) {
+      const upgradeLine =
+        plan === "free"
+          ? `Free supports up to ${maxJobs} jobs. Upgrade to Starter (25 jobs) or Pro (unlimited).`
+          : `Your plan supports up to ${maxJobs} jobs. Upgrade to Pro for unlimited jobs.`;
 
-  // Resolve caps (fail-open if missing)
-  let caps = null;
-  try {
-    const capMod = require('../../src/config/capabilities');
-    const fn =
-      capMod?.getCapabilitiesForPlan ||
-      capMod?.resolveCapabilities ||
-      capMod?.getPlanCapabilities ||
-      null;
-
-    if (typeof fn === 'function') caps = fn(plan);
-  } catch {}
-
-  if (!caps) {
-    try {
-      const { plan_capabilities } = require('../../src/config/planCapabilities');
-      caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
-    } catch {}
-  }
-
-  const maxJobs = caps?.jobs?.max_jobs_total ?? null;
-
-  // Only gate if maxJobs is a finite number (null means unbounded)
-  if (Number.isFinite(Number(maxJobs))) {
-    try {
-      const { rows } = await pg.query(
-        `select count(*)::int as c
-           from public.jobs
-          where owner_id=$1`,
-        [String(owner).trim()] // ✅ keep UUID/text intact
+      return respond(
+        res,
+        `⚠️ Job limit reached (${currentCount}/${maxJobs}).\n\n${upgradeLine}`
       );
-
-      const currentCount = Number(rows?.[0]?.c || 0);
-      if (currentCount >= Number(maxJobs)) {
-        const upgradeLine =
-          String(plan) === 'free'
-            ? `Free supports up to ${maxJobs} jobs. Upgrade to Starter (25 jobs) or Pro (unlimited).`
-            : `Your plan supports up to ${maxJobs} jobs. Upgrade to Pro for unlimited jobs.`;
-
-        return respond(
-          res,
-          `⚠️ Job limit reached (${currentCount}/${maxJobs}).\n\n${upgradeLine}`
-        );
-      }
-    } catch (e) {
-      console.warn('[JOB] job count gate failed (fail-open):', e?.message);
     }
+  } catch (e) {
+    console.warn("[JOB] job count gate failed (fail-open):", e?.message);
   }
+}
+
 
   // Create job
   const out = await pg.createJobIdempotent({

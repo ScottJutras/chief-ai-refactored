@@ -57,9 +57,7 @@ const cors = require("cors");
 
 const webhookRouter = require("./routes/webhook");
 const parseRouter = require("./routes/parse");
-const deepDiveRouter = require("./routes/deepDive");
 const dashboardRouter = require("./routes/dashboard"); // KPI dashboard API
-const debugRouter = require("./routes/debug"); // ✅ debug endpoints (dev-only recommended)
 const askChiefRouter = require("./routes/askChief");
 const billingRouter = require("./routes/billing");
 
@@ -111,13 +109,12 @@ app.get("/billing/cancel", (req, res) => {
  * Stripe requires raw body for signature verification.
  * Do NOT put express.json() globally.
  */
-app.post("/stripe/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
+app.post(
+  "/api/stripe/webhook",
+  express.raw({ type: "application/json" }),
+  stripeWebhookHandler
+);
 
-// ✅ canonical API route
-app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
-
-// ⚠️ optional legacy alias (only keep if Stripe dashboard is still pointed here)
-app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), stripeWebhookHandler);
 
 /* ---------------- Mount order (NO global body parsers) ---------------- */
 // Webhook first; it does its own tolerant urlencoded/body handling.
@@ -128,14 +125,9 @@ app.use("/webhook", webhookRouter); // temporary alias
 app.use("/api/billing", billingRouter);
 
 // Other routers can attach their own parsers internally as needed.
-app.use("/parse", parseRouter);
-app.use("/deep-dive", deepDiveRouter);
+app.use("/api/parse", parseRouter);
 app.use(askChiefRouter); // routes/askChief.js defines POST /api/ask-chief
 
-// ✅ Debug tools (returns Answer Contract JSON) — strongly recommend dev-only
-if (!process.env.VERCEL) {
-  app.use("/api", debugRouter);
-}
 
 // JSON dashboard API used by the React frontend (Vite app)
 app.use("/api/dashboard", dashboardRouter);

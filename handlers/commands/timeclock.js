@@ -26,6 +26,7 @@ const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/confi
 const { maybeGetCrewMomentText } = require('../../src/lib/upsellMoments');
 const { checkMonthlyQuota, consumeMonthlyQuota } = require('../../utils/quota');
 const { shouldShowUpgradePromptOnce } = require('../../src/lib/handleCapabilityDenied');
+const { getEffectivePlanFromOwner } = require("../../src/config/effectivePlan");
 
 
 
@@ -909,7 +910,10 @@ async function execClockViaCil({
   resolvedType,
   tsOverride,
   nowIso,
+
+  // MUST be effective plan already (status-aware)
   plan = 'free',
+
   role = 'owner',
   crew_count = 0,
   actorName = null
@@ -923,7 +927,6 @@ async function execClockViaCil({
   const owner_id = String(ownerId || '').trim();
   const paDigits = String(paUserId || '').trim();
   const user_id = digitsOr(target, paDigits);
-
   const created_by = digitsOr(createdBy, paDigits);
 
   const actorNameClean = String(actorName || '').trim() || null;
@@ -936,24 +939,24 @@ async function execClockViaCil({
     created_by,
     job_id: jobId || null,
 
-    // optional but useful elsewhere
     profileName: actorNameClean,
 
     meta: {
       job_name: jobName || null,
-
-      // what your "already clocked in" formatter reads
       actorName: actorNameClean,
-      targetName: actorNameClean // self-case (actor == target)
+      targetName: actorNameClean
     },
 
+    // ✅ TRUST INPUT: plan already effective
     plan: String(plan || 'free').toLowerCase().trim(),
     role: String(role || 'owner').toLowerCase().trim(),
     crew_count: Number.isFinite(Number(crew_count)) ? Number(crew_count) : 0
   };
 
-  return handleClock(ctx, cil); // ✅ writes + emits facts inside
+  return handleClock(ctx, cil);
 }
+
+
 
 
 
@@ -1415,8 +1418,8 @@ async function handleClock(ctx, cil) {
 
  if (!owner_id || !user_id) return ret("Timeclock: missing owner_id or user_id.");
 
-const rawPlan = String(ctx?.plan || "free").toLowerCase().trim();
-const plan = (rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro") ? rawPlan : "free";
+const plan = String(ctx?.plan || "free").toLowerCase().trim();
+
 
 
 const rawRole = String(ctx?.role || "owner").toLowerCase().trim();
@@ -1984,14 +1987,10 @@ async function handleTimeclock(from, text, userProfile, ownerId, ownerProfile, i
     String(sourceMsgId || '').trim() ||
     String(getTwilioMessageSidFromRes(res) || '').trim() ||
     null;
-  // ✅ Phase 1: best-effort plan/role (no DB calls here)
-// Prefer ownerProfile.plan if you have it; else fall back to free.
-const rawPlan =
-  String(ownerProfile?.plan || ownerProfile?.tier || ownerProfile?.pricing_plan || "free")
-    .toLowerCase()
-    .trim();
 
-const plan = (rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro") ? rawPlan : "free";
+// ✅ Canonical, status-aware plan
+const plan = getEffectivePlanFromOwner(ownerProfile);
+
 
 
 
@@ -2055,141 +2054,138 @@ Tip: add @ Job Name for context (e.g., “clock in @ Roof Repair”).`
     } catch {}
 
     // ---------------- intent detection ----------------
-    const norm = normalizeTcText(text);
-    const rawNorm = norm.raw;
-    const compact = norm.compact;
+const norm = normalizeTcText(text);
+const rawNorm = norm.raw;
+const compact = norm.compact;
 
-    const isUndo = /^undo(\s+last)?$/i.test(rawNorm) || /^undo(last)?$/i.test(compact);
+const isUndo = /^undo(\s+last)?$/i.test(rawNorm) || /^undo(last)?$/i.test(compact);
 
-    const looksLikeTimeclock =
-      isUndo ||
-      /\b(time\s*clock|timeclock|clock|punch|break|drive|hours|lunch|undo)\b/.test(rawNorm) ||
-      /\b(clockin|clockout|punchin|punchout|shiftin|shiftout|undolast|breakstart|breakend|startbreak|lunchstart|lunchend)\b/.test(compact);
+const looksLikeTimeclock =
+  isUndo ||
+  /\b(time\s*clock|timeclock|clock|punch|break|drive|hours|lunch|undo)\b/.test(rawNorm) ||
+  /\b(clockin|clockout|punchin|punchout|shiftin|shiftout|undolast|breakstart|breakend|startbreak|lunchstart|lunchend)\b/.test(compact);
 
-    if (!looksLikeTimeclock) return false;
+if (!looksLikeTimeclock) return false;
 
-    // ✅ HARD STOP: v2 requires new schema
-    const shape = await detectTimeEntriesShape();
-    if (shape !== 'new') {
-      return twiml(
-        res,
-        `⛔ Timeclock v2 is not ready on this database yet.
+// ✅ HARD STOP: v2 requires new schema
+const shape = await detectTimeEntriesShape();
+if (shape !== 'new') {
+  return twiml(
+    res,
+    `⛔ Timeclock v2 is not ready on this database yet.
 Your time_entries table is still LEGACY (employee_name/type/timestamp).
 Run the v2 migration (kind/start_at_utc/end_at_utc + idempotency) or turn off flags.timeclock_v2.
 
 Detected: ${shape}`
+  );
+}
+
+// Job hint
+const explicitJobName = extractJobHint(text) || null;
+const jobName = await resolveJobNameForActor({ ownerId, identityKey: paUserId, explicitJobName });
+
+// Target (actor only for now)
+const targetUserId = String(paUserId || '').trim();
+if (!targetUserId) return twiml(res, 'Timeclock: missing identity.');
+
+// When override
+const whenTxt = extractAtWhen(text);
+const tsOverrideIso = whenTxt ? parseLocalWhenToIso(whenTxt, tz, now) : null;
+
+// Resolve type using your existing mapping
+const resolvedType =
+  (RE_CLOCK_IN.test(rawNorm) || RE_CLOCKIN_WORD.test(rawNorm) || compactHasAny(compact, CLOCK_IN_PATTERNS)) ? 'clock_in'
+  : (RE_CLOCK_OUT.test(rawNorm) || RE_CLOCKOUT_WORD.test(rawNorm) || compactHasAny(compact, CLOCK_OUT_PATTERNS)) ? 'clock_out'
+  : (RE_HAS_BREAK.test(rawNorm) && (compactHasAny(compact, BREAK_START_COMPACT) || /\bbreak\s*start(ed)?\b/i.test(rawNorm))) ? 'break_start'
+  : (RE_HAS_BREAK.test(rawNorm) && (compactHasAny(compact, BREAK_STOP_COMPACT)  || /\bbreak\s*(stop|end)(ed)?\b/i.test(rawNorm))) ? 'break_stop'
+  : (RE_HAS_LUNCH.test(rawNorm) && (RE_LUNCH_START.test(rawNorm) || compact === 'lunchstart' || compact === 'startlunch')) ? 'lunch_start'
+  : (RE_HAS_LUNCH.test(rawNorm) && (RE_LUNCH_STOP.test(rawNorm)  || compact === 'lunchend'  || compact === 'endlunch' || compact === 'lunchstop' || compact === 'stoplunch')) ? 'lunch_stop'
+  : (RE_HAS_DRIVE.test(rawNorm) && (compactHasAny(compact, DRIVE_START_COMPACT) || /\bdrive\s*start(ed)?\b/i.test(rawNorm))) ? 'drive_start'
+  : (RE_HAS_DRIVE.test(rawNorm) && (compactHasAny(compact, DRIVE_STOP_COMPACT)  || /\bdrive\s*(stop|end)(ed)?\b/i.test(rawNorm))) ? 'drive_stop'
+  : null;
+
+// If ambiguous segment intent, quick reply
+if (!resolvedType && !isUndo) {
+  const hasBreak = RE_HAS_BREAK.test(rawNorm);
+  const hasDrive = RE_HAS_DRIVE.test(rawNorm);
+  const hasLunch = RE_HAS_LUNCH.test(rawNorm);
+
+  if (hasBreak || hasDrive || hasLunch) {
+    const seg = hasBreak ? 'Break' : (hasLunch ? 'Lunch' : 'Drive');
+    try {
+      await sendQuickReply(
+        from,
+        `Do you want me to ${seg.toLowerCase()} **start** or **stop**?${
+          tsOverrideIso ? ' at ' + formatLocal(tsOverrideIso, tz) : ''
+        }\nReply: "${seg} Start" | "${seg} Stop" | "Cancel"`,
+        [`${seg} Start`, `${seg} Stop`, 'Cancel']
       );
-    }
-
-    // Job hint
-    const explicitJobName = extractJobHint(text) || null;
-    const jobName = await resolveJobNameForActor({ ownerId, identityKey: paUserId, explicitJobName });
-
-    // Target (actor only for now)
-    const targetUserId = String(paUserId || '').trim();
-    if (!targetUserId) return twiml(res, 'Timeclock: missing identity.');
-
-    // When override
-    const whenTxt = extractAtWhen(text);
-    const tsOverrideIso = whenTxt ? parseLocalWhenToIso(whenTxt, tz, now) : null;
-
-    // Resolve type using your existing mapping
-    const resolvedType =
-      (RE_CLOCK_IN.test(rawNorm) || RE_CLOCKIN_WORD.test(rawNorm) || compactHasAny(compact, CLOCK_IN_PATTERNS)) ? 'clock_in'
-      : (RE_CLOCK_OUT.test(rawNorm) || RE_CLOCKOUT_WORD.test(rawNorm) || compactHasAny(compact, CLOCK_OUT_PATTERNS)) ? 'clock_out'
-      : (RE_HAS_BREAK.test(rawNorm) && (compactHasAny(compact, BREAK_START_COMPACT) || /\bbreak\s*start(ed)?\b/i.test(rawNorm))) ? 'break_start'
-      : (RE_HAS_BREAK.test(rawNorm) && (compactHasAny(compact, BREAK_STOP_COMPACT)  || /\bbreak\s*(stop|end)(ed)?\b/i.test(rawNorm))) ? 'break_stop'
-      : (RE_HAS_LUNCH.test(rawNorm) && (RE_LUNCH_START.test(rawNorm) || compact === 'lunchstart' || compact === 'startlunch')) ? 'lunch_start'
-      : (RE_HAS_LUNCH.test(rawNorm) && (RE_LUNCH_STOP.test(rawNorm)  || compact === 'lunchend'  || compact === 'endlunch' || compact === 'lunchstop' || compact === 'stoplunch')) ? 'lunch_stop'
-      : (RE_HAS_DRIVE.test(rawNorm) && (compactHasAny(compact, DRIVE_START_COMPACT) || /\bdrive\s*start(ed)?\b/i.test(rawNorm))) ? 'drive_start'
-      : (RE_HAS_DRIVE.test(rawNorm) && (compactHasAny(compact, DRIVE_STOP_COMPACT)  || /\bdrive\s*(stop|end)(ed)?\b/i.test(rawNorm))) ? 'drive_stop'
-      : null;
-
-    // If ambiguous segment intent, quick reply
-    if (!resolvedType && !isUndo) {
-      const hasBreak = RE_HAS_BREAK.test(rawNorm);
-      const hasDrive = RE_HAS_DRIVE.test(rawNorm);
-      const hasLunch = RE_HAS_LUNCH.test(rawNorm);
-
-      if (hasBreak || hasDrive || hasLunch) {
-        const seg = hasBreak ? 'Break' : (hasLunch ? 'Lunch' : 'Drive');
-        try {
-          await sendQuickReply(
-            from,
-            `Do you want me to ${seg.toLowerCase()} **start** or **stop**?${
-              tsOverrideIso ? ' at ' + formatLocal(tsOverrideIso, tz) : ''
-            }\nReply: "${seg} Start" | "${seg} Stop" | "Cancel"`,
-            [`${seg} Start`, `${seg} Stop`, 'Cancel']
-          );
-        } catch {}
-        return twiml(res, 'Choose an option above.');
-      }
-
-      return false;
-    }
-
-    // Backfill confirm (>2 min away)
-    if (tsOverrideIso) {
-      const diffMin = Math.abs((new Date(tsOverrideIso) - now) / 60000);
-      if (diffMin > 2) {
-        try {
-          if (typeof pg.savePendingAction === 'function') {
-            await pg.savePendingAction({
-              ownerId: String(ownerId || '').trim(),
-              userId: targetUserId,
-              kind: 'backfill_time',
-              payload: {
-                resolvedType,
-                tsOverrideIso,
-                jobName,
-                source_msg_id: stableMsgId
-              }
-            });
-          }
-        } catch {}
-
-        const line = humanLine(resolvedType, userProfile?.name || 'You', tsOverrideIso, tz);
-        try { await sendBackfillConfirm(from, line, { preferTemplate: true }); } catch {}
-        return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
-      }
-    }
-
-    // FORCE commands
-    const mForceIn = rawNorm.match(/^force\s+clock\s+in\b/i);
-    const mForceOut = rawNorm.match(/^force\s+clock\s+out\b/i);
-
-    if (mForceIn || mForceOut) {
-      const forcedType = mForceIn ? 'clock_in' : 'clock_out';
-    const out = await execClockViaCil({
-  ownerId,
-  paUserId: targetUserId,
-  target: targetUserId,
-  tz,
-  stableMsgId,
-  jobName,
-  resolvedType,
-  tsOverride: tsOverrideIso || null,
-  nowIso: now.toISOString(),
-  plan,
-  role,
-  crew_count,
-  actorName,
-});
-
-
-      return twimlWithTargetName(
-  res,
-  out?.text || '✅ Forced time action recorded.',
-  {
-    ownerId,
-    actorId: paUserId,
-    targetId: targetUserId,
-    fallbackName: userProfile?.name || userProfile?.ProfileName || ''
+    } catch {}
+    return twiml(res, 'Choose an option above.');
   }
-);
 
+  return false;
+}
 
+// Backfill confirm (>2 min away)
+if (tsOverrideIso) {
+  const diffMin = Math.abs((new Date(tsOverrideIso) - now) / 60000);
+  if (diffMin > 2) {
+    try {
+      if (typeof pg.savePendingAction === 'function') {
+        await pg.savePendingAction({
+          ownerId: String(ownerId || '').trim(),
+          userId: targetUserId,
+          kind: 'backfill_time',
+          payload: {
+            resolvedType,
+            tsOverrideIso,
+            jobName,
+            source_msg_id: stableMsgId
+          }
+        });
+      }
+    } catch {}
+
+    const line = humanLine(resolvedType, userProfile?.name || 'You', tsOverrideIso, tz);
+    try { await sendBackfillConfirm(from, line, { preferTemplate: true }); } catch {}
+    return twiml(res, 'I sent a confirmation — reply **Confirm** or **Cancel**.');
+  }
+}
+
+// FORCE commands
+const mForceIn = rawNorm.match(/^force\s+clock\s+in\b/i);
+const mForceOut = rawNorm.match(/^force\s+clock\s+out\b/i);
+
+if (mForceIn || mForceOut) {
+  const forcedType = mForceIn ? 'clock_in' : 'clock_out';
+  const out = await execClockViaCil({
+    ownerId,
+    paUserId: targetUserId,
+    target: targetUserId,
+    tz,
+    stableMsgId,
+    jobName,
+    resolvedType: forcedType, // ✅ use forcedType
+    tsOverride: tsOverrideIso || null,
+    nowIso: now.toISOString(),
+    plan,
+    role,
+    crew_count,
+    actorName,
+  });
+
+  return twimlWithTargetName(
+    res,
+    out?.text || '✅ Forced time action recorded.',
+    {
+      ownerId,
+      actorId: paUserId,
+      targetId: targetUserId,
+      fallbackName: userProfile?.name || userProfile?.ProfileName || ''
     }
+  );
+}
 
     // UNDO (new schema)
     if (isUndo) {
@@ -2224,8 +2220,8 @@ return twiml(res, msg);
       }
     }
 
-    // ----------------- MAIN: ALWAYS CIL -> handleClock (NO legacy DB writes) -----------------
-  const out = await execClockViaCil({
+    // MAIN: ALWAYS CIL -> handleClock
+const out = await execClockViaCil({
   ownerId,
   paUserId: targetUserId,
   target: targetUserId,
@@ -2241,9 +2237,7 @@ return twiml(res, msg);
   actorName,
 });
 
-
-
-   return twimlWithTargetName(
+return twimlWithTargetName(
   res,
   out?.text || 'Time logged.',
   {
@@ -2253,7 +2247,6 @@ return twiml(res, msg);
     fallbackName: userProfile?.name || userProfile?.ProfileName || ''
   }
 );
-
 
   } catch (e) {
     console.error('[timeclock] error:', e?.message, { code: e?.code, detail: e?.detail });
@@ -2542,15 +2535,11 @@ const { startUtcIso, endUtcIso, label } = computeRangeUtc(rangeMode, tz, new Dat
     }
   } catch {}
 
-  const planKey =
-    String(
-      req?.userProfile?.plan_key ||
-      ownerProfile?.plan_key ||
-      ownerProfile?.plan ||
-      ownerProfile?.subscription_tier ||
-      ownerProfile?.paid_tier ||
-      'free'
-    ).toLowerCase().trim() || 'free';
+  const { getEffectivePlanFromOwner } = require("../../src/config/effectivePlan");
+
+// planKey here should also be effective (status-aware)
+const planKey = getEffectivePlanFromOwner(ownerProfile || req?.userProfile);
+
 
   const ownerIdKey = String(owner_id || '').trim();
 

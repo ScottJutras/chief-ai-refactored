@@ -20,7 +20,7 @@ const twilioSvc = require('../../services/twilio');
 // --- Node crypto (do NOT rely on variable name "crypto" being unshadowed)
 const nodeCrypto = require('crypto');
 const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
-
+const { getEffectivePlanFromOwner } = require("../../src/config/effectivePlan");
 
 const {
   sendWhatsAppInteractiveList,
@@ -3560,18 +3560,9 @@ async function handleExpense(
 
   // ✅ Canonical CONFIRM PA key used everywhere in this handler
 const paKey = String(paUserId || '').trim();
+// ✅ Canonical, status-aware plan (paid users only if active/trialing)
+const plan = getEffectivePlanFromOwner(ownerProfile);
 
-// ✅ Canonical plan normalization (default Free on ambiguity)
-const rawPlan = String(
-  ownerProfile?.plan ||
-    ownerProfile?.tier ||
-    ownerProfile?.pricing_plan ||
-    ownerProfile?.subscription_tier ||
-    ownerProfile?.paid_tier ||
-    'free'
-).toLowerCase().trim();
-
-const plan = (typeof getPlanOrDefault === 'function') ? getPlanOrDefault(rawPlan) : 'free';
 
 
   if (!isOwner) {
@@ -4852,20 +4843,10 @@ const patchedDraft = {
 if (confirmPA?.payload?.draft) {
   // ✅ Confirm gate (Owner OR employee-allowed-by-plan)
 if (!isOwner) {
-  // ✅ Canonical plan normalization (default Free on ambiguity)
-  const rawPlan = String(
-    ownerProfile?.plan ||
-      ownerProfile?.tier ||
-      ownerProfile?.pricing_plan ||
-      ownerProfile?.subscription_tier ||
-      ownerProfile?.paid_tier ||
-      'free'
-  ).toLowerCase().trim();
 
-  const plan = (typeof getPlanOrDefault === 'function') ? getPlanOrDefault(rawPlan) : 'free';
+const plan = getEffectivePlanFromOwner(ownerProfile);
+const gate = canEmployeeSelfLog(plan);
 
-
-    const gate = canEmployeeSelfLog(plan);
 
     if (!gate?.allowed) {
       // (Optional) log denial for analytics/audit
@@ -6152,7 +6133,8 @@ if (looksLikeReceiptText(input)) {
 
     return await sendConfirmExpenseOrFallback(fromPhone, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
   }
-} // ✅ closes: if (looksLikeReceiptText(input)) { ... } else { ... }
+} 
+// ✅ closes: if (looksLikeReceiptText(input)) { ... } else { ... }
 /* ---- 4) Parsing (AI optional; deterministic fallback always available) ---- */
 
 const ctx = {

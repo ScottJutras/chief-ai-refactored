@@ -44,6 +44,8 @@ const { query } = pg;
 const { normalizeTranscriptMoney, stripLeadingFiller } = require('../utils/transcriptNormalize');
 const twilioSvc = require('../services/twilio');
 const sendWhatsApp = twilioSvc.sendWhatsApp;
+const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
+
 
 /* ---------------- Small helpers ---------------- */
 // ✅ XML escape helper for TwiML (single source of truth in this file)
@@ -379,10 +381,13 @@ function pickFirstMedia(body = {}) {
   return { n, url, type: typ ? String(typ).toLowerCase() : null };
 }
 
-function canUseAgent(profile) {
-  const tier = (profile?.subscription_tier || profile?.plan || '').toLowerCase();
-  return !!tier && tier !== 'basic' && tier !== 'free';
+const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
+
+function canUseAgent(ownerProfile) {
+  const planKey = getEffectivePlanKey(ownerProfile);
+  return planKey === "pro";
 }
+
 
 function looksHardCommand(lc) {
   return (
@@ -1065,6 +1070,74 @@ async function maybeAutoYesAfterEdit({
   }
 }
 
+function withTimeout(ms, label = 'timeout') {
+  let timer = null;
+  let done = false;
+
+  const p = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      reject(new Error(label));
+    }, ms);
+  });
+
+  return {
+    promise: p,
+    cancel: () => {
+      if (timer) clearTimeout(timer);
+      done = true;
+    }
+  };
+}
+
+/**
+ * Wrap a callback-style middleware (req,res,next) with a hard timeout.
+ * If it times out, we fail-open to next() and log.
+ */
+function middlewareWithDeadline(mw, { ms = 2500, name = 'mw' } = {}) {
+  return (req, res, next) => {
+    const t0 = Date.now();
+    const { promise, cancel } = withTimeout(ms, `${name}_timeout`);
+
+    let finished = false;
+    const safeNext = (err) => {
+      if (finished) return;
+      finished = true;
+      cancel();
+      return next(err);
+    };
+
+    // If the middleware never calls next(), this will fire.
+    promise
+      .then(() => {}) // never resolves
+      .catch((e) => {
+        if (finished) return;
+        finished = true;
+
+        console.warn(`[WEBHOOK] ${name} fail-open`, {
+          phase: res?.locals?.phase || null,
+          msInPhase: Date.now() - (res?.locals?.phaseAt || t0),
+          ownerId: req.ownerId || null,
+          from: req.from || req.fromPhone || null,
+          messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
+          err: e?.message
+        });
+
+        // ✅ Fail-open
+        return next();
+      });
+
+    try {
+      mw(req, res, safeNext);
+    } catch (err) {
+      console.warn(`[WEBHOOK] ${name} threw (fail-open)`, { err: err?.message });
+      return safeNext(); // fail-open
+    }
+  };
+}
+
+
 // ✅ Twilio delivery status callback (must be BEFORE router.post('*') catch-alls)
 router.post('/twilio/status', express.urlencoded({ extended: false }), (req, res) => {
   try {
@@ -1331,7 +1404,7 @@ router.use((req, res, next) => {
       res.locals.phase = 'userProfile';
       res.locals.phaseAt = Date.now();
 
-      prof.userProfileMiddleware(req, res, () => {
+      middlewareWithDeadline(prof.userProfileMiddleware, { ms: 2500, name: 'userProfile' })(req, res, () => {
   // ✅ WHOAMI debug (remove after you confirm gating)
   try {
     console.info('[WHOAMI_CTX]', {
@@ -2640,10 +2713,21 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
       msg += await glossaryNudgeFrom(text2);
       return ok(res, msg);
     }
+   // --- one-time plan sanity log (remove after verification) ---
+try {
+  const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
+  console.info("[PLAN_EFFECTIVE]", {
+    from: req.from,
+    ownerId: req.ownerId,
+    plan_key: req.ownerProfile?.plan_key || null,
+    sub_status: req.ownerProfile?.sub_status || null,
+    effective_plan: getEffectivePlanKey(req.ownerProfile),
+  });
+} catch {}
 
     const looksKpi = /^kpis?\s+for\b/.test(lc2);
     const KPI_ENABLED = (process.env.FEATURE_FINANCE_KPIS || '1') === '1';
-    const hasSub = canUseAgent(req.userProfile);
+    const hasSub = canUseAgent(req.ownerProfile);
 
     if (looksKpi && KPI_ENABLED && hasSub) {
       try {
@@ -2661,12 +2745,12 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
       }
     }
 
-    if (canUseAgent(req.userProfile)) {
+    if (canUseAgent(req.ownerProfile)) {
       try {
         const { ask } = require('../services/agent');
         if (typeof ask === 'function') {
           const answer = await Promise.race([
-            ask({ from: req.from, text: text2, topicHints }),
+            ask({ from: req.from, ownerId: req.ownerId, ownerProfile: req.ownerProfile, userProfile: req.userProfile, text: text2, topicHints }),
             new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000))
           ]).catch(() => '');
 

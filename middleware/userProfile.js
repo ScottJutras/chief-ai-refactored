@@ -12,7 +12,7 @@
 // - req.tz (tenant tz)
 
 const pg = require('../services/postgres');
-
+const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
 const DEFAULT_TZ = 'America/Toronto';
 
 function normalizeDigits(raw) {
@@ -69,23 +69,22 @@ async function resolveActorIdentity({ kind, identifier }) {
 }
 async function resolveOwnerPlan(ownerDigits) {
   const owner = normalizeDigits(ownerDigits);
-  if (!owner) return 'free';
+  if (!owner) return "free";
 
   try {
     const r = await pg.query(
-      `select paid_tier, subscription_tier
-       from public.users
-       where user_id = $1
-       limit 1`,
+      `select plan_key, sub_status
+         from public.users
+        where user_id = $1
+        limit 1`,
       [owner]
     );
 
     const row = r?.rows?.[0] || null;
-    const plan = String(row?.subscription_tier || row?.paid_tier || 'free').toLowerCase().trim();
-    return plan || 'free';
+    return getEffectivePlanKey(row);
   } catch (e) {
-    console.warn('[userProfile] resolveOwnerPlan failed (default free):', e?.message);
-    return 'free';
+    console.warn("[userProfile] resolveOwnerPlan failed (default free):", e?.message);
+    return "free";
   }
 }
 
@@ -103,12 +102,12 @@ async function resolveLegacyUser(fromDigits) {
   // Direct SQL fallback if helper missing
   try {
     const r = await pg.query(
-      `select user_id, owner_id, role, paid_tier, timezone
-       from public.users
-       where user_id = $1
-       limit 1`,
-      [fromDigits]
-    );
+  `select user_id, owner_id, role, plan_key, sub_status, timezone
+     from public.users
+    where user_id = $1
+    limit 1`,
+  [fromDigits]
+);
     return r?.rows?.[0] || null;
   } catch {
     return null;
@@ -173,7 +172,8 @@ console.info('[PLAN_RESOLVED]', { ownerId: req.ownerId, plan });
       const ownerId = normalizeDigits(legacy.owner_id) || from;
       const role = legacy.role || (String(legacy.user_id) === String(ownerId) ? 'owner' : 'employee');
       const tz = legacy.timezone || DEFAULT_TZ;
-      const plan = legacy.paid_tier || legacy.subscription_tier || 'free';
+      const plan = getEffectivePlanKey(legacy);
+
 
       req.ownerId = ownerId;
       req.isOwner = String(role).toLowerCase() === 'owner';

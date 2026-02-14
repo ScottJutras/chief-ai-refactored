@@ -33,7 +33,7 @@ const mergePendingTransactionState =
 const { canEmployeeSelfLog, getPlanOrDefault } = require("../../src/config/checkCapability");
 const { logCapabilityDenial } = require("../../src/lib/capabilityDenials");
 const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require("../../src/config/upgradeCopy");
-
+ const { getEffectivePlanFromOwner } = require("../../src/config/effectivePlan");
 
 /* ---------------- TwiML helpers ---------------- */
 
@@ -338,10 +338,11 @@ async function tasksHandler(from, text, userProfile, ownerId, _ownerProfile, isO
   console.info('[TASKS_CTX]', { ownerId, paUserId, isOwner });
 
 const safeMsgId = computeStableMsgId({ from: paUserId, sourceMsgId, res });
-   const rawPlan = String(_ownerProfile?.plan || _ownerProfile?.tier || _ownerProfile?.pricing_plan || "free")
-  .toLowerCase()
-  .trim();
-const plan = getPlanOrDefault ? getPlanOrDefault(rawPlan) : (rawPlan === "free" || rawPlan === "starter" || rawPlan === "pro" ? rawPlan : "free");
+
+
+// ✅ Canonical, status-aware plan
+const plan = getEffectivePlanFromOwner(_ownerProfile);
+
 
 const role = isOwner ? "owner" : "employee";
 

@@ -2,8 +2,8 @@ const express = require('express');
 const brainV0 = require('../services/brain_v0');
 const brainBeta = require('../services/brain_beta');
 const router = express.Router();
-
 const pg = require('../services/postgres');
+const { getEffectivePlanFromOwner } = require('../src/config/effectivePlan');
 
 // Replace this with your real auth/session mapping.
 function getOwnerIdFromRequest(req) {
@@ -15,8 +15,7 @@ function getActorKeyFromRequest(req) {
 }
 
 async function resolveCapsForOwnerProfile(ownerProfile) {
-  const rawPlan = String(ownerProfile?.plan_key || ownerProfile?.paid_tier || ownerProfile?.subscription_tier || 'free');
-  const plan = rawPlan.toLowerCase().trim() || 'free';
+  const plan = String(getEffectivePlanFromOwner(ownerProfile) || 'free').toLowerCase().trim() || 'free';
 
   try {
     const capMod = require('../src/config/capabilities');
@@ -46,7 +45,6 @@ router.post('/api/ask-chief', express.json(), async (req, res) => {
   if (!ownerId) return res.status(401).json({ ok: false, error: 'unauthorized' });
   if (!text) return res.status(400).json({ ok: false, error: 'missing text' });
 
-  // Load ownerProfile (you already have this helper)
   let ownerProfile = null;
   try {
     ownerProfile = await pg.getOwnerProfile(String(ownerId));
@@ -81,22 +79,18 @@ router.post('/api/ask-chief', express.json(), async (req, res) => {
       });
     }
 
-    // Reserve 1 question now (source-of-truth-ish)
     await pg.incrementUsageMonthly(String(ownerId), ym, 'ask_chief_questions', 1);
   } catch (e) {
     console.warn('[ASK_CHIEF] quota check failed (fail-open):', e?.message);
   }
 
-  // 1) Brain v0 fast path
   const v0 = await brainV0.answer({ ownerId, actorKey, text, tz });
   if (v0?.ok) return res.json(v0);
 
-  // 2) Beta Brain
   const agent = req.app?.locals?.agent || null;
   const beta = await brainBeta.answerBeta({ ownerId, actorKey, text, tz, agent });
   if (beta?.ok) return res.json(beta);
 
-  // 3) Fallback
   return res.json({
     ok: true,
     answer: `I can’t answer that from facts yet. Try: “cashflow last 7 days”, “profit on job 1556”, or “what happened today”.`,

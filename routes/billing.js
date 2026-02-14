@@ -103,27 +103,25 @@ router.post("/checkout", async (req, res) => {
     }
 
     const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer: customerId,
-      line_items: [{ price: priceId, quantity: 1 }],
+  mode: "subscription",
+  customer: customerId,
+  line_items: [{ price: priceId, quantity: 1 }],
 
-      // Redirects are just UX; webhook is truth.
-      // We add activating=1 so the billing page can poll.
-      success_url: `${appBase}/app/settings/billing?activating=1&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${appBase}/app/settings/billing?canceled=1`,
+  // ✅ Correct return path to authenticated portal billing page
+  success_url: `${appBase}/app/settings/billing?session_id={CHECKOUT_SESSION_ID}&plan=${planKey}`,
+  cancel_url: `${appBase}/app/settings/billing?canceled=1`,
 
-      client_reference_id: String(ownerId),
+  client_reference_id: String(ownerId),
 
-      // Metadata is informative only; webhook must map price_id → plan_key
-      metadata: {
-        owner_id: String(ownerId),
-        ownerId: String(ownerId),
-        plan_key_requested: String(planKey),
-        planKey: String(planKey),
-      },
-    });
+  metadata: {
+    owner_id: String(ownerId),
+    plan_key_requested: String(planKey),
+  },
+});
 
-    return ok(res, { url: session.url });
+
+    return res.json({ url: session.url });
+
   } catch (e) {
     console.error("[BILLING_CHECKOUT_ERR]", e?.message || e);
     return bad(res, 500, "checkout_failed");
@@ -148,25 +146,25 @@ router.get("/status", async (req, res) => {
     const effective_plan = getEffectivePlanKey(owner); // free|starter|pro|enterprise (if you add later)
     const caps = capsForPlanKey(effective_plan);
 
-    return ok(res, {
-      owner_id: String(ownerId),
-      linked,
+    return res.json({
+  linked,
+  owner_id: String(ownerId),
 
-      plan_key: String(owner.plan_key || "free").toLowerCase(),
-      sub_status: owner.sub_status || null,
-      effective_plan,
+  plan_key: String(owner.plan_key || "free").toLowerCase(),
+  sub_status: owner.sub_status || null,
+  effective_plan,
 
-      cancel_at_period_end: !!owner.cancel_at_period_end,
-      current_period_start: owner.current_period_start || null,
-      current_period_end: owner.current_period_end || null,
+  cancel_at_period_end: !!owner.cancel_at_period_end,
+  current_period_start: owner.current_period_start || null,
+  current_period_end: owner.current_period_end || null,
 
-      // IDs (return actual values; UI can choose to display or not)
-      stripe_customer_id: owner.stripe_customer_id || null,
-      stripe_subscription_id: owner.stripe_subscription_id || null,
-      stripe_price_id: owner.stripe_price_id || null,
+  stripe_customer_id: owner.stripe_customer_id || null,
+  stripe_subscription_id: owner.stripe_subscription_id || null,
+  stripe_price_id: owner.stripe_price_id || null,
 
-      caps,
-    });
+  caps,
+});
+
   } catch (e) {
     console.error("[BILLING_STATUS_ERR]", e?.message || e);
     return bad(res, 500, "status_failed");
@@ -195,7 +193,7 @@ router.post("/portal", async (req, res) => {
       return_url: `${appBase}/app/settings/billing`,
     });
 
-    return ok(res, { url: session.url });
+   return res.json({ url: session.url });
   } catch (e) {
     console.error("[BILLING_PORTAL_ERR]", e?.message || e);
     return bad(res, 500, "portal_failed");

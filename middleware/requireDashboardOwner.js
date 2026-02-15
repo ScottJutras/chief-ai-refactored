@@ -9,16 +9,45 @@ function parseBearer(req) {
   return (m ? m[1] : s).trim() || null;
 }
 
+function parseCookieHeader(req) {
+  const h = req.headers?.cookie;
+  if (!h) return {};
+  const out = {};
+  String(h)
+    .split(";")
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .forEach((part) => {
+      const i = part.indexOf("=");
+      if (i > -1) {
+        const k = part.slice(0, i).trim();
+        const v = part.slice(i + 1).trim();
+        out[k] = decodeURIComponent(v);
+      }
+    });
+  return out;
+}
+
 function DIGITS(x) {
   return String(x ?? "").replace(/\D/g, "");
 }
 
 async function requireDashboardOwner(req, res, next) {
   try {
-    // Billing/auth responses should never be cached by proxies/browsers
-    res.set("Cache-Control", "no-store");
+    // ✅ Prefer HttpOnly cookie (Option B)
+    const cookies = parseCookieHeader(req);
 
-    const token = parseBearer(req);
+    // Support a couple names to avoid drift
+    const cookieToken =
+      cookies["chiefos_dashboard_token"] ||
+      cookies["dashboard_token"] ||
+      cookies["dashboardToken"] ||
+      null;
+
+    // Fallback to Authorization header if you want (optional, safe)
+    const bearerToken = parseBearer(req);
+
+    const token = (cookieToken || bearerToken || "").trim();
     if (!token) return res.status(401).json({ error: "Missing dashboard token" });
 
     const result = await pg.getOwnerByDashboardToken(token);
@@ -31,22 +60,12 @@ async function requireDashboardOwner(req, res, next) {
           : null;
 
     const ownerId = DIGITS(ownerIdRaw);
-    if (!ownerId) return res.status(401).json({ error: "Invalid dashboard token" });
 
-    req.ownerId = ownerId;
-
-    // Optional but useful: attach owner profile so routes can avoid extra DB fetch
-    try {
-      if (typeof pg.getOwner === "function") {
-        req.ownerProfile = await pg.getOwner(ownerId);
-      } else {
-        req.ownerProfile = null;
-      }
-    } catch (e) {
-      console.warn("[DASH_AUTH] failed to load owner profile:", e?.message);
-      req.ownerProfile = null; // fail-open (auth ok, profile missing)
+    if (!ownerId) {
+      return res.status(401).json({ error: "Missing owner context" });
     }
 
+    req.ownerId = ownerId;
     return next();
   } catch (e) {
     console.error("[DASH_AUTH_ERR]", e?.message || e);

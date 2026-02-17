@@ -276,9 +276,13 @@ function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
 
   const bt = String(baseText || '').trim();
 
-  // If handler returned multi-line text, keep the "tail" as a follow-up under the crew line.
-  const parts = bt.split('\n').map((x) => x.trim()).filter(Boolean);
-  const tail = parts.length > 1 ? parts.slice(1).join('\n') : '';
+  // If handleMedia didn't produce a transcript, keep whatever canonical text we already had
+text2 = String(req.body.ResolvedInboundText || text2 || '').trim();
+lc2 = text2.toLowerCase();
+
+isHardTimeCommand = looksHardTimeCommand(lc2);
+console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
+
 
   const head =
     map[a] ||
@@ -2014,6 +2018,9 @@ try {
         mostRecentPAKind: mostRecentPAKind || null
       });
     }
+// ✅ Define canonical reuse vars BEFORE media follow-up (prevents lc2 TDZ crash)
+let text2 = String(text || '').trim();
+let lc2 = text2.toLowerCase();
 
     /* -----------------------------------------------------------------------
  * Media follow-up: if prior step set pendingMedia and this is text-only
@@ -2053,8 +2060,9 @@ req.body.Body = t;
 const newResolved = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
 req.body.ResolvedInboundText = newResolved;
 
-// ✅ DO NOT mutate original `text`
-// Instead, update working variables later
+// ✅ Update working canonical vars (text2/lc2) so downstream routing uses transcript
+text2 = newResolved;
+lc2 = text2.toLowerCase();
 
 
         console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 12) });
@@ -2063,12 +2071,12 @@ req.body.ResolvedInboundText = newResolved;
       return sendTwiml(res, result);
     }
 
-    // If handleMedia didn't produce a transcript, keep whatever canonical text we already had
-    text = String(req.body.ResolvedInboundText || text || '').trim();
-    lc = text.toLowerCase();
+    // ✅ Keep working canonical vars stable
+text2 = String(req.body.ResolvedInboundText || text2 || '').trim();
+lc2 = text2.toLowerCase();
 
     isHardTimeCommand = looksHardTimeCommand(lc2);
-    console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc.slice(0, 50), isHardTimeCommand });
+    console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
 
   try {
   pending = await safeDb(
@@ -2088,8 +2096,6 @@ req.body.ResolvedInboundText = newResolved;
 }
 
 // ✅ From here on, reuse canonical working text
-let text2 = String(req.body.ResolvedInboundText || text || "").trim();
-let lc2 = text2.toLowerCase();
 const isPickerToken = looksLikeJobPickerReplyToken(text2);
 
 // --- LINK keyword: prevent RAG confusion (exact match only) ---
@@ -2105,6 +2111,38 @@ if (lc2_clean === "link") {
       "Code expires in 10 minutes.",
     ].join("\n")
   );
+}
+
+/* -----------------------------------------------------------------------
+ * ✅ INSIGHTS v0 FASTPATH (Phase 2)
+ * Must run BEFORE job handler routing, so "profit on job 1556" isn't swallowed.
+ * ----------------------------------------------------------------------- */
+try {
+  const { answerInsightV0 } = require('../services/insights_v0');
+
+  const t = String(text2 || '').trim();
+  const s = t.toLowerCase();
+
+  const looksProfit =
+    (s.includes('profit') || s.includes('margin') || s.includes('how much am i making') || s.includes('how much are we making')) &&
+    (s.includes('job') || /(^|\s)#\d+\b/.test(s) || s.includes('active job'));
+
+  const looksSpend =
+    s.includes('spend') || s.includes('spent') || s.includes('revenue') || s.includes('cash flow');
+
+  // Only intercept obvious insight questions (MVP-safe)
+  if (looksProfit || looksSpend) {
+    const out = await answerInsightV0({
+      ownerId: req.ownerId,
+      actorKey: req.actorKey || req.from,
+      text: t,
+      tz: req.tz || 'America/Toronto'
+    });
+
+    if (out?.answer) return ok(res, out.answer);
+  }
+} catch (e) {
+  console.warn('[INSIGHTS_V0_FASTPATH] skipped:', e?.message);
 }
 
 

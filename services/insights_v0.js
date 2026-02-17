@@ -24,113 +24,138 @@ function pct(x) {
 function normalizeJobRefToken(s) {
   return String(s || '')
     .trim()
+    .replace(/\u00A0/g, ' ')      // NBSP -> space
     .replace(/\s+/g, ' ')
     .replace(/^job\s+/i, '')
     .replace(/^#\s*/i, '')
     .trim();
 }
 
+// We ONLY treat a number as job_no when the user uses an explicit job-no cue:
+//   "job 12", "job #12", "#12"
+function hasJobNoCue(rawText = '') {
+  const t = String(rawText || '').replace(/\u00A0/g, ' ').trim();
+  return (
+    /\bjob\s*#?\s*\d+\b/i.test(t) ||
+    /(^|\s)#\s*\d+\b/i.test(t)
+  );
+}
+
+// If the token is numeric-only (e.g. "1556"), it is almost certainly an address/job-name anchor in your system.
+// (Your job_no values are small sequential ints.)
+function isNumericOnlyToken(token) {
+  return /^\d{1,10}$/.test(String(token || '').trim());
+}
+
 // Pull job ref out of phrases like:
-// - "profit on job 1556"
-// - "profit on job 1556 medway park dr"
+// - "profit on job 12"
+// - "profit on #12"
 // - "profit on 1556"
 // - "profit 1556 medway"
-// - "how much am i making on oak st"
+// - "how much am i making on oak street"
 function extractJobRefFromText(rawText) {
-  const t = String(rawText || '').replace(/\s+/g, ' ').trim();
+  const t = String(rawText || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
   const s = t.toLowerCase();
 
-  // Prefer explicit "job ..."
-  let m =
-    t.match(/\b(?:profit|margin|making)\b[\s\S]*?\bjob\b\s*([#]?\s*\d+)?\s*([\s\S]+)?$/i) ||
-    t.match(/\b(?:profit|margin|making)\b[\s\S]*?\bjob\b\s*([\s\S]+)$/i);
-
-  if (m) {
-    const maybeNo = normalizeJobRefToken(m[1] || '');
-    const maybeName = normalizeJobRefToken(m[2] || '');
-    const jobNo = /^\d+$/.test(maybeNo) ? Number(maybeNo) : null;
-    const name = maybeName || null;
-
-    return {
-      jobNo,
-      name,
-      raw: normalizeJobRefToken((m[1] || '') + ' ' + (m[2] || ''))
-    };
-  }
-
-  // No "job" word: allow "making on <term>", "profit on <term>"
   const isProfitIntent =
     /\bprofit\b|\bmargin\b|\bhow much am i making\b|\bhow much are we making\b|\bwhat am i making\b|\bmaking\b/i.test(s);
 
-  if (isProfitIntent) {
-    // capture "... on <something>"
-    const m2 = t.match(/\bon\b\s+([\s\S]+)$/i);
-    if (m2) {
-      const token = normalizeJobRefToken(m2[1] || '');
-      if (token && !/^job\b/i.test(token)) {
-        const jobNo = /^\d+$/.test(token) ? Number(token) : null;
-        // NOTE: keep name as token for downstream resolution; we'll treat digits-only
-        // as a name-anchor (address) rather than job_no.
-        return { jobNo, name: token, raw: token };
-      }
-    }
+  if (!isProfitIntent) return { kind: null, jobNo: null, name: null, raw: null };
 
-    // capture "profit <something>" / "margin <something>"
-    const m3 = t.match(/^\s*(?:profit|margin)\s+([\s\S]+)$/i);
-    if (m3) {
-      const token = normalizeJobRefToken(m3[1] || '');
-      if (token) {
-        const jobNo = /^\d+$/.test(token) ? Number(token) : null;
-        return { jobNo, name: token, raw: token };
+  // 1) Explicit internal job number cue:
+  // - "#12" or "job #12" => ALWAYS job_no
+  {
+    const m =
+      t.match(/(^|\s)#\s*(\d{1,10})\b/i) ||
+      t.match(/\bjob\s*#\s*(\d{1,10})\b/i);
+
+    if (m) {
+      const num = m[2] || m[1];
+      const jobNo = Number(num);
+      if (Number.isFinite(jobNo)) {
+        return { kind: 'job_no', jobNo, name: null, raw: `job #${jobNo}` };
       }
     }
   }
 
-  return { jobNo: null, name: null, raw: null };
+  // 2) "job 12" (no #) — treat as job_no ONLY for "small" numbers.
+  // If it's 4+ digits (1556), it's almost certainly an address-style anchor in your system.
+  {
+    const m = t.match(/\bjob\s+(\d{1,10})\b/i);
+    if (m) {
+      const numStr = String(m[1] || '').trim();
+      const n = Number(numStr);
+
+      if (Number.isFinite(n)) {
+        if (numStr.length >= 4) {
+          // "job 1556" => address/name anchor, NOT job_no
+          return { kind: 'name', jobNo: null, name: numStr, raw: numStr };
+        }
+        // "job 12" => internal job_no
+        return { kind: 'job_no', jobNo: n, name: null, raw: `job ${n}` };
+      }
+    }
+  }
+
+  // 3) "on <term>" (name/address anchor)
+  {
+    const m = t.match(/\bon\b\s+([\s\S]+)$/i);
+    if (m) {
+      const token = normalizeJobRefToken(m[1] || '');
+      if (token) {
+        return { kind: 'name', jobNo: null, name: token, raw: token };
+      }
+    }
+  }
+
+  // 4) "profit <term>" / "margin <term>"
+  {
+    const m = t.match(/^\s*(?:profit|margin)\s+([\s\S]+)$/i);
+    if (m) {
+      const token = normalizeJobRefToken(m[1] || '');
+      if (token) {
+        return { kind: 'name', jobNo: null, name: token, raw: token };
+      }
+    }
+  }
+
+  return { kind: null, jobNo: null, name: null, raw: null };
 }
+
 
 /**
- * Decide if a numeric token should be treated as:
- * - a "job_no" (internal numbering like 1,2,3...) OR
- * - an address-style anchor like 1556 (house #)
- *
- * Your observed bug (1556 -> 1559) strongly suggests:
- * - job_no is NOT 1556
- * - 1556 lives in the job NAME, not job_no
- *
- * So: treat 4+ digits as an address/name-anchor by default.
+ * Resolve job by:
+ * 1) job_no ONLY if ref.kind === 'job_no'
+ * 2) exact name match (normalized) if name provided
+ * 3) name fragment fallback:
+ *    - if term begins with digits (e.g. "1556", "1556 medway") => REQUIRE starts_with those digits
+ *    - otherwise => contains match, ranked by starts-with, then active, then recency
  */
-function isLikelyAddressNumber(n) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return false;
-  // Heuristic: 4+ digit numbers are almost always address numbers in your UX.
-  return x >= 1000;
-}
-
-function escapeRegex(s) {
-  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Resolve job by:
-// 1) exact job_no ONLY when jobNo looks like internal numbering (not address numbers like 1556)
-// 2) exact name (case-insensitive)
-// 3) fragment search:
-//    - digits-only term (e.g., "1556") => MUST match job name starting with that number (word boundary)
-//    - otherwise => ILIKE %term%, with ranking
 async function resolveJobForInsight(pgClient, ownerId, ref) {
   const owner = String(ownerId || '').trim();
   if (!owner) return { ok: false, reason: 'missing_owner' };
 
+  const kind = ref?.kind || null;
   const jobNo =
-    ref?.jobNo != null && Number.isFinite(Number(ref.jobNo)) ? Number(ref.jobNo) : null;
+    kind === 'job_no' && ref?.jobNo != null && Number.isFinite(Number(ref.jobNo))
+      ? Number(ref.jobNo)
+      : null;
 
   const name = ref?.name ? String(ref.name).trim() : null;
 
-  const hasNumeric = jobNo != null;
-  const numericLooksAddress = hasNumeric && isLikelyAddressNumber(jobNo);
+  // Normalization helpers (SQL-side):
+  // - coalesce(name, job_name)
+  // - replace NBSP with space
+  // - collapse whitespace
+  // - lowercase
+  const SQL_NORM = `lower(regexp_replace(replace(coalesce(name, job_name), chr(160), ' '), '\\s+', ' ', 'g'))`;
 
-  // 1) Try job_no direct ONLY if it's likely internal numbering
-  if (jobNo != null && !numericLooksAddress) {
+  // 1) job_no direct (ONLY when explicitly requested)
+  if (jobNo != null) {
     try {
       const r = await pgClient.query(
         `
@@ -145,90 +170,91 @@ async function resolveJobForInsight(pgClient, ownerId, ref) {
     } catch {}
   }
 
-  // 2) Try exact name match if we have a name
-  // (Skip exact-name match when name is digits-only; that’s handled by numeric-anchor search below.)
-  if (name && !/^\d+$/.test(name)) {
-    try {
-      const r = await pgClient.query(
-        `
-        select id, job_no, coalesce(name, job_name) as job_name
-        from public.jobs
-        where owner_id::text = $1
-          and lower(coalesce(name, job_name)) = lower($2)
-        order by updated_at desc nulls last, created_at desc
-        limit 1
-        `,
-        [owner, name]
-      );
-      if (r?.rows?.[0]) return { ok: true, job: r.rows[0], mode: 'exact_name' };
-    } catch {}
-  }
+  // If no name, we can't do name resolution.
+  if (!name) return { ok: false, reason: 'not_found' };
 
-  // 3) Fragment fallback (numeric-safe)
-  const term = (name || (jobNo != null ? String(jobNo) : '')).trim();
-  if (term) {
-    const termIsDigits = /^\d{1,10}$/.test(term);
+  const term = normalizeJobRefToken(name);
+  if (!term) return { ok: false, reason: 'not_found' };
 
-    // ✅ Special: digits-only term (like "1556") => match name that STARTS with "1556" (word boundary)
-    if (termIsDigits) {
-      try {
-        const re = `^${escapeRegex(term)}\\b`; // e.g. ^1556\b
+  const termNorm = normalizeJobRefToken(term).toLowerCase();
+  const digitsPrefix = (termNorm.match(/^(\d{2,10})\b/) || [])[1] || null; // 2+ digits only
 
-        const r = await pgClient.query(
-          `
-          select id, job_no, coalesce(name, job_name) as job_name, active, status
-          from public.jobs
-          where owner_id::text = $1
-            and lower(coalesce(name, job_name)) ~ lower($2)
-          order by
-            active desc nulls last,
-            updated_at desc nulls last,
-            created_at desc
-          limit 5
-          `,
-          [owner, re]
-        );
+  // 2) exact name match (normalized)
+  try {
+    const r = await pgClient.query(
+      `
+      select id, job_no, coalesce(name, job_name) as job_name
+      from public.jobs
+      where owner_id::text = $1
+        and ${SQL_NORM} = lower($2)
+      order by updated_at desc nulls last, created_at desc
+      limit 1
+      `,
+      [owner, termNorm]
+    );
+    if (r?.rows?.[0]) return { ok: true, job: r.rows[0], mode: 'exact_name' };
+  } catch {}
 
-        const rows = r?.rows || [];
-        if (rows.length === 1) return { ok: true, job: rows[0], mode: 'name_startswith_digits' };
-        if (rows.length > 1) return { ok: false, reason: 'ambiguous', matches: rows, term };
-        // If none start with the number, treat as not_found (do not guess)
-      } catch {}
-      return { ok: false, reason: 'not_found' };
-    }
-
-    // ✅ Default: non-numeric term => contains search + ranking
+  // 3a) If the term starts with digits (like your addresses), REQUIRE starts-with those digits.
+  // This prevents 1556 -> 1559 accidental picks forever.
+  if (digitsPrefix) {
     try {
       const r = await pgClient.query(
         `
         select id, job_no, coalesce(name, job_name) as job_name, active, status
         from public.jobs
         where owner_id::text = $1
-          and lower(coalesce(name, job_name)) like lower($2)
+          and ${SQL_NORM} like lower($2)
         order by
-          case
-            when lower(coalesce(name, job_name)) like lower($3) then 0 -- starts with term
-            else 1
-          end,
           active desc nulls last,
           updated_at desc nulls last,
           created_at desc
         limit 5
         `,
-        [owner, `%${term}%`, `${term}%`]
+        [owner, `${digitsPrefix}%`]
       );
 
       const rows = r?.rows || [];
-      if (rows.length === 1) return { ok: true, job: rows[0], mode: 'name_contains' };
-      if (rows.length > 1) return { ok: false, reason: 'ambiguous', matches: rows, term };
+      if (rows.length === 1) return { ok: true, job: rows[0], mode: 'digits_starts_with' };
+      if (rows.length > 1) return { ok: false, reason: 'ambiguous', matches: rows, term: digitsPrefix };
     } catch {}
+
+    // If digits-prefix match found nothing, do NOT fall back to fuzzy contains.
+    // That's how 1556 can accidentally become 1559.
+    return { ok: false, reason: 'not_found', term: digitsPrefix };
   }
 
-  return { ok: false, reason: 'not_found' };
+  // 3b) Otherwise do contains match with ranking.
+  try {
+    const r = await pgClient.query(
+      `
+      select id, job_no, coalesce(name, job_name) as job_name, active, status
+      from public.jobs
+      where owner_id::text = $1
+        and ${SQL_NORM} like lower($2)
+      order by
+        case
+          when ${SQL_NORM} like lower($3) then 0
+          else 1
+        end,
+        active desc nulls last,
+        updated_at desc nulls last,
+        created_at desc
+      limit 5
+      `,
+      [owner, `%${termNorm}%`, `${termNorm}%`]
+    );
+
+    const rows = r?.rows || [];
+    if (rows.length === 1) return { ok: true, job: rows[0], mode: 'name_contains' };
+    if (rows.length > 1) return { ok: false, reason: 'ambiguous', matches: rows, term: termNorm };
+  } catch {}
+
+  return { ok: false, reason: 'not_found', term: termNorm };
 }
 
 async function resolveJobForProfit({ ownerId, actorKey, text }) {
-  const raw = String(text || '').replace(/\s+/g, ' ').trim();
+  const raw = String(text || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
   const s = raw.toLowerCase();
 
   const explicitActive = /\bactive\s+job\b/.test(s);
@@ -236,44 +262,22 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
 
   const explicitRefProvided = !!(
     ref &&
-    (ref.jobNo != null || (ref.name && String(ref.name).trim()) || (ref.raw && String(ref.raw).trim()))
+    (ref.kind === 'job_no' ||
+      (ref.name && String(ref.name).trim()) ||
+      (ref.raw && String(ref.raw).trim()))
   );
 
-  // Resolve via DB (job_no / exact name / contains)
+  // Resolve via DB (job_no only if explicitly requested; else name/address)
   const resolved = await resolveJobForInsight(pg, ownerId, ref);
 
   if (resolved?.ok && resolved?.job) {
-    const out = {
+    return {
       jobNo: Number(resolved.job.job_no),
       jobName: resolved.job.job_name || null,
       source: resolved.mode || 'resolved'
     };
-
-    // ✅ HARD MISMATCH BLOCK:
-    // If the user referenced a digits-only anchor (e.g., "1556") and we resolved a job whose
-    // NAME does not start with that anchor, do NOT answer (prevents 1556 -> 1559 forever).
-    const requestedDigits =
-      ref && (typeof ref.name === 'string' && /^\d{4,10}$/.test(ref.name.trim()))
-        ? ref.name.trim()
-        : (ref && ref.jobNo != null && isLikelyAddressNumber(ref.jobNo) ? String(ref.jobNo) : null);
-
-    if (requestedDigits) {
-      const jn = String(out.jobName || '').trim();
-      const startsOk = new RegExp(`^${escapeRegex(requestedDigits)}\\b`, 'i').test(jn);
-      if (!startsOk) {
-        return {
-          jobNo: null,
-          jobName: null,
-          source: 'not_found_explicit',
-          term: requestedDigits
-        };
-      }
-    }
-
-    return out;
   }
 
-  // Ambiguous matches
   if (resolved?.reason === 'ambiguous') {
     return {
       jobNo: null,
@@ -285,19 +289,18 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
   }
 
   // ✅ CRITICAL:
-  // If the user explicitly referenced a job, DO NOT silently fall back to active job.
+  // If user explicitly referenced a job (1556 / oak street / job #12) and we can't resolve it,
+  // DO NOT fall back to active job.
   if (explicitRefProvided && !explicitActive) {
     return {
       jobNo: null,
       jobName: null,
       source: 'not_found_explicit',
-      term: String(ref?.raw || ref?.name || ref?.jobNo || '').trim()
+      term: String(resolved?.term || ref?.raw || ref?.name || ref?.jobNo || '').trim()
     };
   }
 
-  // Only fall back to active job when:
-  // - user explicitly asked for active job, OR
-  // - user did not provide any job ref at all
+  // Only fall back to active job if they explicitly asked for it, or gave no ref at all.
   try {
     if (typeof pg.getActiveJob === 'function') {
       const aj = await pg.getActiveJob(ownerId, actorKey);
@@ -309,6 +312,7 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
 
   return { jobNo: null, jobName: null, source: resolved?.reason || 'none' };
 }
+
 
 async function getProfitRowByJobNo(ownerId, jobNo) {
   if (!Number.isFinite(jobNo)) return null; // hard stop
@@ -411,7 +415,7 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
 }
 
 function looksLikeProfitQuestion(text) {
-  const s = lc(String(text || '').replace(/\s+/g, ' ').trim());
+  const s = lc(String(text || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim());
 
   const hasProfitIntent =
     /\bprofit\b|\bmargin\b|\bhow much am i making\b|\bhow much are we making\b|\bwhat am i making\b|\bmaking\b/.test(s);

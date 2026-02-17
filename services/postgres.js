@@ -4374,5 +4374,4 @@ module.exports = {
   applyJobToPendingDraft,
   clearPendingJobPick,
   getTotalsForRange,
-  orchestrateChief,
 };

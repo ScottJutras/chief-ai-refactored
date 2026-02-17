@@ -1,11 +1,56 @@
 // utils/stateManager.js
 const { query } = require('../services/postgres');
 
+/* ---------------- Small utilities ---------------- */
+
 function normalizePhoneNumber(userId = '') {
   const val = String(userId || '');
   const noWa = val.startsWith('whatsapp:') ? val.slice('whatsapp:'.length) : val;
   return noWa.replace(/^\+/, '').replace(/\D/g, '').trim();
 }
+
+
+function withDeadline(promise, ms, label = 'deadline') {
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms))
+  ]);
+}
+
+// ---- In-memory cache (5–10 min “memory”) ----
+const STATE_CACHE_TTL_MS = parseInt(process.env.STATE_CACHE_TTL_MS || '120000', 10);
+const NULL_SENTINEL = Symbol('STATE_CACHE_NULL');
+const _stateCache = new Map(); // userId -> { value, expiresAt }
+
+function cacheGet(userId) {
+  const k = normalizePhoneNumber(userId);
+  const hit = _stateCache.get(k);
+  if (!hit) return { hit: false, value: null };
+
+  if (Date.now() > hit.expiresAt) {
+    _stateCache.delete(k);
+    return { hit: false, value: null };
+  }
+
+  return {
+    hit: true,
+    value: hit.value === NULL_SENTINEL ? null : hit.value
+  };
+}
+
+function cacheSet(userId, value) {
+  const k = normalizePhoneNumber(userId);
+  const stored = (value === null || value === undefined) ? NULL_SENTINEL : value;
+  _stateCache.set(k, { value: stored, expiresAt: Date.now() + STATE_CACHE_TTL_MS });
+}
+
+
+function cacheDel(userId) {
+  const k = normalizePhoneNumber(userId);
+  _stateCache.delete(k);
+}
+
+/* ---------------- JSON helpers ---------------- */
 
 // Ensure we always work with plain objects for jsonb state
 function safeObject(x) {
@@ -64,12 +109,45 @@ function mergeState(prev, patch) {
   return out;
 }
 
-async function getPendingTransactionState(userId) {
+/* ---------------- Core state functions ---------------- */
+
+async function getPendingTransactionState(userId, opts = null) {
   const normalizedId = normalizePhoneNumber(userId);
-  const res = await query(`SELECT state FROM public.states WHERE user_id = $1`, [normalizedId]);
-  const raw = res.rows[0]?.state || null;
-  return safeObject(raw) || raw || null;
+
+  const bypassCache = !!opts?.bypassCache;
+  const deadlineMs = parseInt(process.env.STATE_READ_DEADLINE_MS || '2500', 10);
+
+  if (!bypassCache) {
+    const c = cacheGet(normalizedId);
+    if (c.hit) return c.value; // ✅ returns cached null too
+  }
+
+  let res;
+try {
+  res = await withDeadline(
+    query(`SELECT state FROM public.states WHERE user_id = $1`, [normalizedId]),
+    deadlineMs,
+    'getPendingTransactionState_timeout'
+  );
+} catch (e) {
+  // ✅ safest fallback: treat as no pending state
+  console.warn('[state] getPendingTransactionState failed (returning null)', {
+    userId: normalizedId,
+    err: e?.message
+  });
+  cacheSet(normalizedId, null); // ✅ cache null briefly to avoid hammering DB
+  return null;
 }
+
+
+  const raw = res.rows[0]?.state || null;
+  const val = safeObject(raw) || raw || null;
+
+  cacheSet(normalizedId, val); // ✅ caches null too
+  return val;
+}
+
+
 
 async function setPendingTransactionState(userId, state, options = null) {
   const normalizedId = normalizePhoneNumber(userId);
@@ -86,6 +164,9 @@ async function setPendingTransactionState(userId, state, options = null) {
       `,
       [normalizedId, state]
     );
+
+    // ✅ invalidate cache immediately
+    cacheDel(normalizedId);
     return;
   }
 
@@ -102,7 +183,11 @@ async function setPendingTransactionState(userId, state, options = null) {
     `,
     [normalizedId, merged]
   );
+
+  // ✅ invalidate cache immediately
+  cacheDel(normalizedId);
 }
+
 
 async function mergePendingTransactionState(userId, patch) {
   return setPendingTransactionState(userId, patch, { merge: true });
@@ -111,7 +196,11 @@ async function mergePendingTransactionState(userId, patch) {
 async function deletePendingTransactionState(userId) {
   const normalizedId = normalizePhoneNumber(userId);
   await query(`DELETE FROM public.states WHERE user_id = $1`, [normalizedId]);
+
+  // ✅ invalidate cache immediately
+  cacheDel(normalizedId);
 }
+
 
 async function clearUserState(userId) {
   await deletePendingTransactionState(userId);

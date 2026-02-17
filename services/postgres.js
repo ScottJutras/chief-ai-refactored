@@ -3349,6 +3349,76 @@ async function getOwnerMonthlyFinance(ownerId, monthStart) {
     margin_pct
   };
 }
+// -----------------------------------------------------------------------------
+// ✅ MVP Insight Helper: totals for a date range (business-wide)
+// Returns DOLLARS (not cents) to match insights_v0 expectations.
+// -----------------------------------------------------------------------------
+function isoToDateOnly(isoLike) {
+  if (!isoLike) return null;
+  const d = new Date(isoLike);
+  if (Number.isNaN(d.getTime())) return null;
+
+  // Use local date; good enough for MVP given insights_v0 creates day windows.
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
+async function getTotalsForRange(ownerId, fromIso, toIso, _jobId = null) {
+  const ownerKey = String(ownerId || '').trim();
+  if (!ownerKey) throw new Error('getTotalsForRange: missing ownerId');
+
+  const fromDate = isoToDateOnly(fromIso);
+  const toDate = isoToDateOnly(toIso);
+
+  if (!fromDate || !toDate) {
+    return {
+      spend: 0,
+      revenue: 0,
+      profit: 0,
+      spend_cents: 0,
+      revenue_cents: 0,
+      profit_cents: 0,
+      from: fromDate || null,
+      to: toDate || null
+    };
+  }
+
+  // We use inclusive end date because transactions.date is stored as DATE.
+  const { rows } = await query(
+    `
+    select
+      coalesce(sum(case when kind = 'expense' then amount_cents end), 0) as expense_cents,
+      coalesce(sum(case when kind = 'revenue' then amount_cents end), 0) as revenue_cents
+    from public.transactions
+    where owner_id::text = $1
+      and date >= $2::date
+      and date <= $3::date
+    `,
+    [ownerKey, fromDate, toDate]
+  );
+
+  const expenseCents = Number(rows?.[0]?.expense_cents) || 0;
+  const revenueCents = Number(rows?.[0]?.revenue_cents) || 0;
+  const profitCents = revenueCents - expenseCents;
+
+  // ✅ insights_v0 expects dollars (it prints with toFixed(2))
+  const spend = expenseCents / 100;
+  const revenue = revenueCents / 100;
+  const profit = profitCents / 100;
+
+  return {
+    spend,
+    revenue,
+    profit,
+    spend_cents: expenseCents,
+    revenue_cents: revenueCents,
+    profit_cents: profitCents,
+    from: fromDate,
+    to: toDate
+  };
+}
 
 async function getOwnerCategoryBreakdown(ownerId, fromDate, toDate, kindFilter = null) {
   const ownerKey = String(ownerId);
@@ -4303,4 +4373,5 @@ module.exports = {
   getPendingJobPick,
   applyJobToPendingDraft,
   clearPendingJobPick,
+  getTotalsForRange,
 };

@@ -483,6 +483,64 @@ function pendingTxnNudgeMessage(pending) {
     `• "skip" to keep it pending and continue`
   ].join('\n');
 }
+// routes/webhook.js (DROP-IN) — DB degraded wrappers for webhook-level DB calls
+
+function isTransientDbError(e) {
+  const msg = String(e?.message || '');
+  const code = String(e?.code || '');
+  const status = String(e?.status || '');
+
+  if (/timeout|timed out|ETIMEDOUT|ECONNRESET|EPIPE|ENOTFOUND|socket hang up|Connection terminated|server closed the connection/i.test(msg)) return true;
+  if (/(57P01|57P02|57P03|53300|53400|08006|08003|08001|08004)/.test(code)) return true;
+  if (/^5\d\d$/.test(status)) return true;
+  if (/internal server error|unexpected response|fetch failed/i.test(msg)) return true;
+
+  return false;
+}
+
+function withDeadline(promise, ms, label = 'deadline') {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms))
+  ]);
+}
+
+/**
+ * Wrap a DB call:
+ * - if transient error OR deadline hit -> mark req.dbDegraded=true and return fallback
+ * - otherwise rethrow (so you don't hide real bugs)
+ */
+async function safeDb(req, name, fn, { fallback = null, ms = 2500 } = {}) {
+  const safeName = String(name || 'db').replace(/\s+/g, '_');
+
+  try {
+    const p = typeof fn === 'function' ? fn() : fn;
+    return await withDeadline(Promise.resolve(p), ms, `${safeName}_timeout`);
+  } catch (e) {
+    const msg = String(e?.message || '');
+    const transient = isTransientDbError(e) || msg.includes(`${safeName}_timeout`);
+
+    if (transient) {
+      req.dbDegraded = true;
+
+      console.warn(`[WEBHOOK] ${safeName} degraded (fallback)`, {
+        phase: req?._phase || req?.phase || null, // see note below
+        ownerId: req.ownerId || null,
+        from: req.from || req.fromPhone || req.body?.From || null,
+        messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
+        message: msg,
+        code: e?.code,
+        status: e?.status
+      });
+
+      return fallback;
+    }
+
+    // Non-transient: real bug, bubble up
+    throw e;
+  }
+}
+
 
 
 
@@ -1023,7 +1081,20 @@ async function maybeAutoYesAfterEdit({
       return firstResult;
     }
 
-    const pending = await getPendingTransactionState(userId);
+    let pending = null;
+try {
+  // best effort: if DB degraded, skip auto-yes rather than breaking flow
+  pending = await safeDb(
+    { dbDegraded: false }, // local shim; we don't have req here
+    'getPendingTransactionState_autoYes',
+    () => getPendingTransactionState(userId),
+    { fallback: null, ms: 2500 }
+  );
+} catch (e) {
+  console.warn('[WEBHOOK] autoYes pending state failed (non-transient):', e?.message);
+  pending = null;
+}
+
     if (!pending?._autoYesAfterEdit) return firstResult;
 
     // ✅ Correlate: only auto-yes for the specific inbound message that set the flag.
@@ -1398,10 +1469,12 @@ router.use((req, res, next) => {
 
     res.locals.phase = 'token';
     res.locals.phaseAt = Date.now();
+    req._phase = 'token';
 
     token.tokenMiddleware(req, res, () => {
       res.locals.phase = 'userProfile';
       res.locals.phaseAt = Date.now();
+      req._phase = 'userProfile';
 
       middlewareWithDeadline(prof.userProfileMiddleware, { ms: 2500, name: 'userProfile' })(req, res, () => {
   // ✅ WHOAMI debug (remove after you confirm gating)
@@ -1419,16 +1492,19 @@ router.use((req, res, next) => {
   } catch {}
 
   res.locals.phase = 'lock';
-  res.locals.phaseAt = Date.now();
-
-  lock.lockMiddleware(req, res, () => {
-    res.locals.phase = 'router';
     res.locals.phaseAt = Date.now();
-    next();
+    req._phase = 'lock';
+
+    lock.lockMiddleware(req, res, () => {
+      res.locals.phase = 'router';
+      res.locals.phaseAt = Date.now();
+      req._phase = 'router';
+
+      next();
+    });
   });
 });
 
-    });
   } catch (e) {
     console.warn('[WEBHOOK] light middlewares skipped:', e?.message);
     next();
@@ -1539,88 +1615,66 @@ if (hasTranscript) {
 });
 
 
-/* ---------------- Main text router ---------------- */
-
 router.post('*', async (req, res, next) => {
   try {
-    // ✅ Fail-closed: unknown identity (not linked to any tenant)
-    if (!req.ownerId) {
+    if (req.dbDegraded) {
       return ok(
         res,
-        `You’re not linked to a ChiefOS business yet.\n\nGo to the portal, generate a link code, then text the 6 digits here.`
+        `ChiefOS is having trouble reaching the database right now...\n\nPlease try again in 1–2 minutes.\n\nIf this keeps happening, reply SUPPORT.`
       );
     }
 
-    if (req.from) {
-      try {
-        const mapped = await getOwnerUuidForPhone(req.from);
-        if (mapped) req.ownerUuid = mapped;
-      } catch (e) {
-        console.warn('[WEBHOOK] owner uuid map failed:', e?.message);
-      }
-    }
-
-        let pending = await getPendingTransactionState(req.actorKey || req.from);
-    const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
     const crypto = require('crypto');
+    const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // ✅ Canonical inbound text (single source of truth for this request)
-    // Prefer Twilio interactive IDs exactly as sent (jp:...).
+    // ✅ Canonical inbound text (single source of truth)
     let text = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
     req.body.ResolvedInboundText = text;
     let lc = text.toLowerCase();
 
-    // ✅ PROVE router received the message + what text it resolved
-    console.info('[WEBHOOK_IN]', {
-      ownerId: req.ownerId || null,
-      from: req.from || null,
-      messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
-      waId: req.body?.WaId || req.body?.WaID || req.body?.waid || null,
-      numMedia: Number(req.body?.NumMedia || 0) || 0,
-      resolvedInbound: String(text || '').slice(0, 140),
-      ListId: req.body?.ListId || null,
-      ListRowId: req.body?.ListRowId || null,
-      ButtonPayload: req.body?.ButtonPayload || null
-    });
-
-    // ✅ If there's no text and no media, do nothing (avoid burning cycles)
+    // ✅ If there's no text and no media, do nothing
     if (!text && numMedia === 0) return ok(res);
 
+    // ✅ "link" keyword (WhatsApp 24h-window opener for portal OTP)
+    const lcClean = lc.trim().replace(/[.!?]+$/g, '');
+    if (lcClean === 'link') {
+      return ok(
+        res,
+        [
+          '✅ Got it — WhatsApp confirmed.',
+          '',
+          'Now go back to the portal:',
+          '1) Check the box',
+          '2) Enter your phone number',
+          '3) Request your 6-digit code',
+          '',
+          'Paste the code here, then click Verify in ChiefOS.',
+          '',
+          'Code expires in 10 minutes.'
+        ].join('\n')
+      );
+    }
 
-    
-// ------------------------------------------------------------
-// ✅ HARD TIME COMMANDS: bypass nudge + PA + pending-flow routers
-// ------------------------------------------------------------
-let isHardTimeCommand = looksHardTimeCommand(lc);
-console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
-
-    // ✅ Compute messageSid EARLY so resume can use it safely
+    // ✅ Compute messageSid ONCE (used by everything below)
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid =
       rawSid ||
-      crypto
-        .createHash('sha256')
-        .update(`${req.from || ''}|${text}`)
-        .digest('hex')
-        .slice(0, 32);
+      crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
 
+    // ✅ Hard time command classification (uses lc we already computed)
+    const isHardTimeCommand = looksHardTimeCommand(lc);
+    console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
 
-      
     // -----------------------------------------------------------------------
-    // ✅ LINK CODE REDEEM (must run EARLY so it doesn't fall into agent)
-    // Accepts: "LINK 123456" (legacy) OR "123456"
-    // IMPORTANT: uses resolvedInbound (button/list-aware) AND canonical phone (+E164)
+    // ✅ LINK CODE REDEEM (must run EARLY, and MUST work even when unlinked)
+    // Accepts: "LINK 123456" OR "123456"
     // -----------------------------------------------------------------------
     {
       const linkCode = parseLinkCommand(text);
-
       if (linkCode) {
         try {
-          const phone = String(req.from || '').trim(); // ✅ already +E164 from middleware above
-          if (!phone) {
-            console.warn('[LINK] missing/invalid From:', req.body?.From);
-            return ok(res, 'Missing sender phone. Try again.');
-          }
+          const phone = String(req.from || '').trim(); // +E164
+          if (!phone) return ok(res, 'Missing sender phone. Try again.');
 
           const out = await redeemLinkCodeToTenant({ code: linkCode, fromPhone: phone });
 
@@ -1631,9 +1685,10 @@ console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
             );
           }
 
-          // Optional: clear any stale pending state after linking
+          // After redeem, your middleware may not have req.ownerId yet on THIS request.
+          // Clear pending using the actor key only (safe).
           try {
-            await clearAllPendingForUser({ ownerId: req.ownerId, from: (req.actorKey || req.from) });
+            await clearAllPendingForUser({ ownerId: null, from: (req.actorKey || req.from) });
           } catch {}
 
           return ok(
@@ -1647,8 +1702,27 @@ console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
       }
     }
 
+    // ✅ Now that redeem had a chance, enforce tenant link
+    if (!req.ownerId) {
+      return ok(
+        res,
+        `You’re not linked to a ChiefOS business yet.\n\nGo to the portal, generate a link code, then text the 6 digits here.`
+      );
+    }
 
+    console.info('[WEBHOOK_IN]', {
+      ownerId: req.ownerId || null,
+      from: req.from || null,
+      messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
+      waId: req.body?.WaId || req.body?.WaID || req.body?.waid || null,
+      numMedia,
+      resolvedInbound: String(text || '').slice(0, 140),
+      ListId: req.body?.ListId || null,
+      ListRowId: req.body?.ListRowId || null,
+      ButtonPayload: req.body?.ButtonPayload || null
+    });
 
+    
 
 // -----------------------------------------------------------------------
 // "resume" => re-send the pending confirm card if we have a confirm pending-action
@@ -1970,16 +2044,44 @@ lc = text.toLowerCase();
     isHardTimeCommand = looksHardTimeCommand(lc);
     console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc.slice(0, 50), isHardTimeCommand });
 
-    pending = await getPendingTransactionState(req.actorKey || req.from);
+  try {
+  pending = await safeDb(
+    req,
+    'getPendingTransactionState',
+    () => getPendingTransactionState(req.actorKey || req.from),
+    { fallback: pending || null, ms: 2500 }
+  );
+} catch (e) {
+  console.warn('[WEBHOOK] pending media follow-up failed (non-transient, ignored):', e?.message);
+  // keep existing pending
+}
+
   } catch (e) {
     console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
   }
 }
 
 // ✅ From here on, reuse the canonical `text`
-const text2 = text;
+const text2 = String(text || "");
 const lc2 = text2.toLowerCase();
 const isPickerToken = looksLikeJobPickerReplyToken(text2);
+
+// --- LINK keyword: prevent RAG confusion (exact match only) ---
+const lc2_clean = lc2.trim().replace(/[.!?]+$/g, ""); // allow "link." "link!" "link?"
+if (lc2_clean === "link") {
+  return ok(
+    res,
+    [
+      "✅ WhatsApp confirmed.",
+      "",
+      "Go back to the portal, request your 6-digit code, enter it here, then click Verify in ChiefOS.",
+      "",
+      "Code expires in 10 minutes.",
+    ].join("\n")
+  );
+}
+
+
 /* -----------------------------------------------------------------------
  * ✅ Quotes (MVP): route early (before PA router / other flows)
  * ----------------------------------------------------------------------- */
@@ -2743,34 +2845,54 @@ try {
       }
     }
 
-    if (canUseAgent(req.ownerProfile)) {
-      try {
-        const { ask } = require('../services/agent');
-        if (typeof ask === 'function') {
-          const answer = await Promise.race([
-            ask({ from: req.from, ownerId: req.ownerId, ownerProfile: req.ownerProfile, userProfile: req.userProfile, text: text2, topicHints }),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 2000))
-          ]).catch(() => '');
+ try {
+  const { answerChief } = require('../services/answerChief');
 
-          if (answer?.trim()) {
-            let msg = answer.trim();
-            msg += await glossaryNudgeFrom(text2);
-            return ok(res, msg);
-          }
-        }
-      } catch (e) {
-        console.warn('[AGENT] failed:', e?.message);
-      }
+  const out = await answerChief({
+    ownerId: req.ownerId,
+    actorKey: req.actorKey || req.from,
+    text: text2,
+    tz: req.tz || req.userProfile?.tz || 'America/Toronto',
+    channel: 'whatsapp',
+    req,
+    agent: req.app?.locals?.agent || null,
+    context: {
+      from: req.from,
+      ownerProfile: req.ownerProfile,
+      userProfile: req.userProfile,
+      isOwner: req.isOwner,
+      messageSid,
+      reqBody: req.body,
+      topicHints
     }
+  });
 
-    let msg =
-      'PocketCFO — What I can do:\n' +
-      '• Jobs: create job Roof Repair, change job, active job Roof Repair\n' +
-      '• Tasks: task - buy nails, my tasks, done #4\n' +
-      '• Time: clock in, clock out, timesheet week';
+  if (out?.route === 'action' && typeof out.run === 'function') {
+    const ran = await out.run();
+    const ans = String(ran?.answer || '').trim() || 'Done.';
+    let msg = ans + (await glossaryNudgeFrom(text2));
+    return ok(res, msg);
+  }
 
+  if (String(out?.answer || '').trim()) {
+    let msg = String(out.answer).trim();
     msg += await glossaryNudgeFrom(text2);
     return ok(res, msg);
+  }
+} catch (e) {
+  console.warn('[CHIEF] answerChief failed:', e?.message);
+}
+
+// final fallback
+let msg =
+  'ChiefOS — Try:\n' +
+  '• expense $18 Home Depot\n' +
+  '• revenue $500 deposit\n' +
+  '• task - buy nails\n' +
+  '• clock in';
+
+msg += await glossaryNudgeFrom(text2);
+return ok(res, msg);
   } catch (err) {
     return next(err);
   }

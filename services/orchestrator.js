@@ -1,155 +1,264 @@
-// services/orchestrator.js
-// Classify every message → action | insight | RAG | web. No dead ends.
-const OpenAI = require('openai');
+// services/chiefOrchestrator.js
+const { ragAnswer } = require('./rag_search'); // your existing RAG search wrapper (safe)
 const pg = require('./postgres');
-const { createPendingAction, resolvePendingAction, shortConfirmForCIL } = require('./ai_confirm');
-const { answerInsights } = require('./qa_insights');
-const { ragAnswer } = require('./rag_search');
-const { webAnswer } = require('./web_fallback');
-const { AnyCIL } = require('../schemas/cil');
-const { handleTimeclock } = require('../handlers/commands/timeclock'); // legacy fallback
-const { ensureAnswerContract } = require('../schemas/answer');
+// Feature flags (default OFF unless explicitly enabled)
+const FEATURE_QUOTES = (process.env.FEATURE_QUOTES || '0') === '1';
+const FEATURE_KPIS = (process.env.FEATURE_FINANCE_KPIS || '0') === '1';
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Existing handlers (writes go through these only)
+const { handleExpense } = require('../handlers/commands/expense');
+const { handleRevenue } = require('../handlers/commands/revenue');
+const { handleTasks } = require('../handlers/commands/tasks');
+const { handleJob } = require('../handlers/commands/job'); // if you have a single entry; else adapt
+const { handleQuoteCommand } = require('../handlers/commands/quote');
+const { handleClock } = require('../handlers/commands/timeclock'); // your newer v2 clock handler
+const { answerInsightV0 } = require('./insights_v0');
 
-const SYS_ROUTER = `
-You are Chief's router. Classify the user's message into exactly one route:
-- "action" for commands that mutate data (clock in/out, create task, move time, export, etc.)
-- "insight" for performance questions answerable from our database (KPIs, jobs, P&L, hours, forecasts).
-- "rag" for how-to and product usage questions that are answered by our internal docs/SOPs.
-- "web" if it's outside product scope and not answered by our docs (industry methods, materials, regulations).
-Return strict JSON: {"route":"action|insight|rag|web","followup": "short question if info missing or null"}`;
 
-async function classifyRoute({ text, profile }) {
-  const res = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL_CLASSIFY || 'gpt-4o-mini',
-    temperature: 0.1,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: SYS_ROUTER },
-      { role: 'user', content: `User: ${text}\nPlan:${profile?.plan||'free'}` }
-    ]
-  });
-  try { return JSON.parse(res.choices[0].message.content); }
-  catch { return { route: 'rag', followup: null }; }
+function lc(s) { return String(s || '').toLowerCase(); }
+function DIGITS(x) { return String(x ?? '').replace(/\D/g, ''); }
+
+function looksLikeHowToOrDefinition(text) {
+  const s = lc(text);
+  return (
+    /\bhow do i\b|\bhow to\b|\bwhat is\b|\bdefine\b|\bmeaning\b|\bhelp\b|\bguide\b|\bhow can i\b/.test(s) ||
+    /\bretainage\b|\bholdback\b|\bprogress billing\b|\bchange order\b/.test(s)
+  );
 }
 
-/**
- * orchestrate({ from, text, userProfile, ownerId, returnContract=false })
- * - Default returns STRING (WhatsApp safe)
- * - If returnContract=true, returns Answer Contract object
- */
-async function orchestrate({ from, text, userProfile, ownerId, returnContract = false } = {}) {
-  const tz = userProfile?.tz || 'America/Toronto';
-  const lc = String(text || '').trim().toLowerCase();
+function looksLikeTimeclock(text) {
+  const s = lc(text);
+  return /\bclock\s+(in|out)\b|\bbreak\b|\bdrive\b|\btimesheet\b|\bhours\b/.test(s);
+}
 
-  async function injectPendingDraftNote(contractObj) {
-    try {
-      if (!returnContract) return contractObj;
-      if (!ownerId) return contractObj;
+function looksLikeExpense(text) {
+  const s = lc(text);
+  return /^\s*(expense|spent|paid)\b/.test(s) || /\b(expense|receipt)\b/.test(s);
+}
 
-      const n = await pg.countPendingCilDrafts(ownerId).catch(() => 0);
-      if (!n) return contractObj;
+function looksLikeRevenue(text) {
+  const s = lc(text);
+  return /^\s*(revenue|earned|deposit|invoice|paid by customer)\b/.test(s);
+}
 
-      const c = ensureAnswerContract(contractObj);
-      const note = `${n} draft${n === 1 ? '' : 's'} pending confirmation (not included in totals until confirmed).`;
+function looksLikeTask(text) {
+  const s = lc(text);
+  return /^\s*(task|todo)\b/.test(s) || /\bmy tasks\b|\binbox\b|\bdone\s*#?\d+/.test(s);
+}
 
-      // attach into "missing" because it’s literally missing from truth set
-      const missing = Array.isArray(c.missing) ? c.missing.slice() : [];
-      if (!missing.includes(note)) missing.push(note);
+function looksLikeJob(text) {
+  const s = lc(text);
+  return /\b(create|new|start|activate|pause|resume|finish|close)\s+job\b/.test(s) ||
+         /\b(active job|change job|list jobs)\b/.test(s);
+}
 
-      return ensureAnswerContract({ ...c, missing });
-    } catch {
-      return contractObj;
-    }
+function looksLikeQuote(text) {
+  const s = lc(text);
+  return /^\s*(quote)\b/.test(s) || /\bcreate quote\b/.test(s);
+}
+
+function looksLikeInsightQuestion(text) {
+  const s = lc(text);
+  return (
+    /\bprofit\b|\bmargin\b|\bcash ?flow\b|\bspend\b|\brevenue\b|\bnet\b|\bhow much\b|\bwhat did i\b|\blast (7|14|30) days\b/.test(s) ||
+    /^kpis?\b/.test(s)
+  );
+}
+
+async function answerInsight({ ownerId, actorKey, text, tz }) {
+  return await answerInsightV0({ ownerId, actorKey, text, tz });
+}
+
+function normalizeHandlerOutput(out, fallbackText) {
+  if (typeof out === 'string' && out.trim()) return out.trim();
+  if (out?.text && String(out.text).trim()) return String(out.text).trim();
+  if (out?.twiml && String(out.twiml).trim()) return String(out.twiml).trim(); // if you ever bubble it
+  return fallbackText;
+}
+
+
+async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, agent, context }) {
+  const rawText = String(text || '').trim();
+  const s = lc(rawText);
+
+  // 0) Deterministic “how-to/definition” → RAG
+  if (looksLikeHowToOrDefinition(rawText)) {
+    const ans = await ragAnswer({ text: rawText, ownerId });
+    return { ok: true, route: 'rag', answer: ans || `I don’t have that in docs yet.`, evidence: { sql: [], facts_used: 0 } };
   }
 
-  function asText(out) {
-    if (out && typeof out === 'object' && !Array.isArray(out)) {
-      if (typeof out.answer === 'string') return out.answer;
-      return JSON.stringify(out);
-    }
-    return String(out || '');
-  }
+  // 1) Deterministic writes (action)
+  if (looksLikeTimeclock(rawText)) {
+    return {
+      ok: true,
+      route: 'action',
+      action: 'timeclock',
+      run: async () => {
+        // Use your v2 handleClock signature via ctx+cil if you already have it,
+        // or call your existing handleTimeclock wrapper. This is the safe “call the handler” point.
+        const nowIso = new Date().toISOString();
+        const messageSid = context?.messageSid || null;
+        const actorId = DIGITS(actorKey);
 
-  async function asContractOrText(out) {
-    if (!returnContract) return asText(out);
-    const base =
-      (out && typeof out === 'object' && !Array.isArray(out))
-        ? ensureAnswerContract(out)
-        : ensureAnswerContract({ answer: String(out || '') });
+        // Minimal ctx; adapt to your timeclock v2 CIL contract
+        const ctx = {
+          owner_id: DIGITS(ownerId),
+          user_id: actorId,
+          created_by: actorId,
+          source_msg_id: messageSid,
+          tz: tz || 'America/Toronto',
+          job_id: context?.userProfile?.active_job_id || null,
+          meta: { job_name: context?.userProfile?.active_job_name || null }
+        };
 
-    return await injectPendingDraftNote(base);
-  }
+        const cil = { action: 'timeclock', text: rawText, at: nowIso }; // adapt to your expected CIL
+        const out = await handleClock(ctx, cil);
 
-  // 1) Pending yes/no? Resolve first (idempotent)
-  const yesMatch = lc.match(/^yes\s+([a-f0-9]{24})$/i);
-  const noMatch = lc.match(/^no\s+([a-f0-9]{24})$/i);
-  if (yesMatch || noMatch) {
-    const id = (yesMatch || noMatch)[1];
-    const row = await resolvePendingAction(id, !!yesMatch);
-    if (!row) return await asContractOrText('That request expired. Try again.');
-    if (noMatch) return await asContractOrText('Okay, cancelled.');
-
-    const cil = AnyCIL.safeParse(row.cil_json);
-    if (!cil.success) return await asContractOrText('Invalid action—try again.');
-
-    if (cil.data.type === 'Clock') {
-      const cmd = `clock ${cil.data.action.replace('_', ' ')} ${cil.data.name ? cil.data.name : ''} ${cil.data.job ? '@ ' + cil.data.job : ''}`;
-      const out = await handleTimeclock(from, cmd, userProfile, ownerId, null, true, null);
-      return await asContractOrText(out);
-    }
-
-    return await asContractOrText('Action done.');
-  }
-
-  // 2) Choose a route
-  const { route, followup } = await classifyRoute({ text, profile: userProfile });
-
-  // 3) If missing info, ask a tight clarifier (no dead ends)
-  if (followup && !/^\s*$/.test(followup)) return await asContractOrText(followup);
-
-  // 4) Execute per route
-  switch (route) {
-    case 'action': {
-      const cil = AnyCIL.safeParse(parseToCIL(text)); // placeholder parseToCIL
-      if (cil.success) {
-        const summary = shortConfirmForCIL(cil.data);
-        const pendingId = await createPendingAction({ ownerId, from, cil: cil.data, summary });
-        return await asContractOrText(`${summary}\nReply: yes ${pendingId} or no ${pendingId}`);
+        const answer = normalizeHandlerOutput(out, 'Time logged.');
+return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
       }
-      return await asContractOrText('I think you want to do something—try “clock in” or “task - buy nails”.');
-    }
-
-    case 'insight': {
-      const out = await answerInsights({ text, ownerId, tz });
-      return await asContractOrText(out);
-    }
-
-    case 'rag': {
-      const ans = await ragAnswer({ text, ownerId });
-      if (ans?.ok) return await asContractOrText(ans.text);
-      const web = await webAnswer({ text });
-      return await asContractOrText(web.text);
-    }
-
-    case 'web': {
-      const web = await webAnswer({ text });
-      return await asContractOrText(web.text);
-    }
-
-    default:
-      return await asContractOrText('I can help with time, tasks, expenses, quotes, and KPIs. Try “clock in” or “How am I doing this month?”');
+    };
   }
+
+  if (FEATURE_QUOTES && looksLikeQuote(rawText)) {
+  return {
+    ok: true,
+    route: 'action',
+    action: 'quote',
+    run: async () => {
+      const msg = await handleQuoteCommand({
+        ownerId,
+        from: context?.from || null,
+        text: rawText,
+        userProfile: context?.userProfile || null
+      });
+
+      const answer = normalizeHandlerOutput(msg, 'Quote updated.');
+      return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
+    }
+  };
 }
 
-module.exports = { orchestrate };
+  if (looksLikeExpense(rawText)) {
+    return {
+      ok: true,
+      route: 'action',
+      action: 'expense',
+      run: async () => {
+        const from = context?.from || null;           // WhatsApp reply identity (+E164)
+        const messageSid = context?.messageSid || null;
+        const reqBody = context?.reqBody || null;
+        const out = await handleExpense(
+          from,
+          rawText,
+          context?.userProfile || null,
+          ownerId,
+          context?.ownerProfile || null,
+          !!context?.isOwner,
+          messageSid,
+          reqBody
+        );
+        const answer = normalizeHandlerOutput(out, 'Expense logged.');
+return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
 
-// Placeholder NL → CIL parser (expand with OpenAI if needed)
-function parseToCIL(text) {
-  const lc = text.toLowerCase();
-  if (/(clock in|clock out|break|drive)/i.test(lc)) {
-    return { type: 'Clock', action: 'in' }; // stub
+      }
+    };
   }
-  return null;
+
+  if (looksLikeRevenue(rawText)) {
+    return {
+      ok: true,
+      route: 'action',
+      action: 'revenue',
+      run: async () => {
+        const from = context?.from || null;
+        const messageSid = context?.messageSid || null;
+        const reqBody = context?.reqBody || null;
+        const out = await handleRevenue(
+          from,
+          rawText,
+          context?.userProfile || null,
+          ownerId,
+          context?.ownerProfile || null,
+          !!context?.isOwner,
+          messageSid,
+          reqBody
+        );
+        const answer = normalizeHandlerOutput(out, 'Revenue logged.'); // or Task updated / Job updated
+return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
+
+      }
+    };
+  }
+
+  if (looksLikeTask(rawText)) {
+    return {
+      ok: true,
+      route: 'action',
+      action: 'tasks',
+      run: async () => {
+        const from = context?.from || null;
+        const messageSid = context?.messageSid || null;
+        const reqBody = context?.reqBody || null;
+        const out = await handleTasks(
+          from,
+          rawText,
+          context?.userProfile || null,
+          ownerId,
+          context?.ownerProfile || null,
+          !!context?.isOwner,
+          messageSid,
+          reqBody
+        );
+        const answer = normalizeHandlerOutput(out, 'Task Updated.'); 
+return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
+
+      }
+    };
+  }
+
+  if (looksLikeJob(rawText)) {
+    return {
+      ok: true,
+      route: 'action',
+      action: 'jobs',
+      run: async () => {
+        // If you have a single job handler entry point; otherwise adapt to your command module
+        const from = context?.from || null;
+        const messageSid = context?.messageSid || null;
+        const reqBody = context?.reqBody || null;
+        const out = await handleJob(
+          from,
+          rawText,
+          context?.userProfile || null,
+          ownerId,
+          context?.ownerProfile || null,
+          !!context?.isOwner,
+          messageSid,
+          reqBody
+        );
+        const answer = normalizeHandlerOutput(out, 'Job Updated.'); // or Task updated / Job updated
+return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
+
+      }
+    };
+  }
+
+  // 2) Deterministic insight questions
+  if (looksLikeInsightQuestion(rawText)) {
+    return await answerInsight({ ownerId, actorKey, text: rawText, tz });
+  }
+
+  // 3) Final fallback: RAG first, then (later) narrated LLM if you want
+  const rag = await ragAnswer({ text: rawText, ownerId });
+  if (rag) return { ok: true, route: 'rag', answer: rag, evidence: { sql: [], facts_used: 0 } };
+
+  return {
+    ok: true,
+    route: 'clarify',
+    answer: `Do you want me to (1) log something (expense/revenue/time/task), or (2) answer a question (profit/cashflow/KPIs)?\n\nReply “log” or “question”.`,
+    evidence: { sql: [], facts_used: 0 }
+  };
 }
+
+module.exports = { orchestrateChief };

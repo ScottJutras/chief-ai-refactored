@@ -1930,6 +1930,30 @@ const mostRecentIsRevenuePA =
 // ✅ Keep your Option A helper (but don’t trust it as sole source of truth)
 const expensePA = await hasExpensePA(req.ownerId, rawFrom);
 const hasExpensePendingActions = !!expensePA?.hasAny || mostRecentIsExpensePA;
+// -------------------------------------------------------------------
+// ✅ Pending (legacy stateManager) — define BEFORE any pending?. usage
+// -------------------------------------------------------------------
+let pending = null;
+
+// Prefer legacy state (this is what mergePendingTransactionState writes to)
+try {
+  if (stateManager?.getPendingTransactionState) {
+    pending = await stateManager.getPendingTransactionState(rawFrom);
+  } else if (stateManager?.getPendingState) {
+    pending = await stateManager.getPendingState(rawFrom);
+  }
+} catch (e) {
+  pending = null;
+}
+
+// Fallback: if some routes attach pending to req (rare but harmless)
+pending =
+  pending ||
+  req.pendingAction ||
+  req.pending ||
+  req.mostRecentPendingAction ||
+  req.pa ||
+  null;
 
 // ✅ If PA flow exists, legacy pendingCorrection is stale noise — clear it once.
 try {

@@ -4,7 +4,8 @@
 
 const pg = require('./postgres');
 const { getEffectivePlanFromOwner } = require('../src/config/effectivePlan');
-const { orchestrateChief } = require('./chiefOrchestrator');
+const { orchestrateChief } = require('./orchestrator');
+
 
 function DIGITS(x) { return String(x ?? '').replace(/\D/g, ''); }
 

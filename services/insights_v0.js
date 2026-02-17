@@ -159,6 +159,12 @@ function pct(x) {
 function parseJobRef(rawText) {
   const t = String(rawText || '').trim();
   const s = lc(t);
+// "profit on 1556", "making on oak st"
+let on = t.match(/\bon\s+(.+)$/i);
+if (on?.[1]) {
+  const term = String(on[1]).trim();
+  if (term) return { jobNo: null, jobName: term };
+}
 
   // job 18, job #18, #18
   let m = s.match(/\bjob\s*#?\s*(\d+)\b/);
@@ -220,14 +226,15 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
 
 
 async function getProfitRowByJobNo(ownerId, jobNo) {
-  // Preferred: view-backed helper
+  if (!Number.isFinite(jobNo)) return null; // ✅ hard stop
+
   if (typeof pg.getJobProfitSimple === 'function') {
     const r = await pg.getJobProfitSimple({ ownerId, jobNo, limit: 1 });
-    const row = r?.rows?.[0] || null;
-    if (row) return row;
+    return r?.rows?.[0] || null;
   }
   return null;
 }
+
 
 function profitReply({ row, label }) {
   const revenue = Number(row.revenue_cents) || 0;
@@ -273,7 +280,7 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
   }
 
   // If we have a job_no, we can answer deterministically
-  if (resolved.jobNo != null) {
+  if (Number.isFinite(resolved.jobNo)) {
     const row = await getProfitRowByJobNo(ownerId, resolved.jobNo);
     if (row) {
       return {
@@ -338,25 +345,17 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
 }
 
 function looksLikeProfitQuestion(text) {
-  const s = lc(text);
+  const s = lc(String(text || '').replace(/\s+/g, ' ').trim()); // ✅ normalize whitespace/newlines
 
-  const profitIntent =
-    /\bprofit\b|\bmargin\b|\bhow much am i making\b|\bhow much are we making\b/.test(s);
+  const hasProfitIntent =
+    /\bprofit\b|\bmargin\b|\bhow much am i making\b|\bhow much are we making\b|\bwhat am i making\b/.test(s);
 
-  // allow:
-  // - "profit on job 18"
-  // - "profit on #18"
-  // - "profit on 1556"
-  // - "profit on 1556 medway"
-  const hasJobSignal =
-    /\bjob\b/.test(s) ||
-    /(^|\s)#\d+\b/.test(s) ||
-    /\bactive job\b/.test(s) ||
-    /\bprofit\b[\s\S]*\bon\b\s*\d+\b/.test(s) ||      // "profit on 1556"
-    /^\s*(profit|margin)\s+\d+\b/.test(s);            // "profit 1556"
+  const hasJobAnchor =
+    /\bjob\b|(^|\s)#\d+\b|\bactive job\b|\bon\s+[a-z0-9]/.test(s); // ✅ allow "on oak street"
 
-  return profitIntent && hasJobSignal;
+  return hasProfitIntent && hasJobAnchor;
 }
+
 
 
 async function answerInsightV0({ ownerId, actorKey, text, tz }) {

@@ -114,49 +114,57 @@ async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, age
   const rawText = String(text || '').trim();
   const s = lc(rawText);
 
-   // 00) Pending-action / mid-flow resolver (prevents "yes" being misrouted)
-if (context?.userProfile?.pending_action) {
-  return {
-    ok: true,
-    route: 'action',
-    action: 'pending_action',
-    run: async () => {
-      let out = null;
+  // 00) Pending-action / mid-flow resolver (prevents "yes" being misrouted)
+  // If we’re mid-confirmation, do NOT let the orchestrator route this message elsewhere.
+  if (context?.userProfile?.pending_action) {
+    return {
+      ok: true,
+      route: 'action',
+      action: 'pending_action',
+      run: async () => {
+        let out = null;
 
-      // Adapt this require to your real pending-action module.
-      // If you already handle pending actions in webhook only, keep this as a safety net.
-      try {
-        const { handlePendingAction } = require('../handlers/pending_action');
-        if (typeof handlePendingAction === 'function') {
-          out = await handlePendingAction(context, rawText);
+        // Best-effort pending action handler (safe if missing)
+        try {
+          const { handlePendingAction } = require('../handlers/pending_action');
+          if (typeof handlePendingAction === 'function') {
+            out = await handlePendingAction(context, rawText);
+          }
+        } catch (e) {
+          // swallow; do not guess
         }
-      } catch (e) {
-        // Safe fallback: do not guess.
+
+        const msg = normalizeHandlerOutput(
+          out,
+          'Please finish the pending confirmation first (or reply “cancel”).'
+        );
+
+        return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
       }
+    };
+  }
 
-      const msg = normalizeHandlerOutput(out, 'Please finish the pending confirmation first (or reply “cancel”).');
-      return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
-    }
-  };
-}
-
-// 01) Job picker token safety net (your tokens are jp:...)
-// If this reaches Chief, do NOT treat it as natural language.
-if (/^jp:/i.test(rawText)) {
-  return {
-    ok: true,
-    route: 'clarify',
-    answer: `✅ Job selected. Now tell me what you want to do (expense / revenue / time / task).`,
-    evidence: { sql: [], facts_used: 0 }
-  };
-}
-
-
+  // 01) Job picker token safety net (your tokens are jp:...)
+  // If this reaches Chief, do NOT treat it as natural language.
+  // Webhook SHOULD consume jp: earlier; this is a last-resort loop breaker.
+  if (/^jp:/i.test(rawText)) {
+    return {
+      ok: true,
+      route: 'clarify',
+      answer: '✅ Job selected. Now tell me what you want to do (expense / revenue / time / task).',
+      evidence: { sql: [], facts_used: 0 }
+    };
+  }
 
   // 0) Deterministic “how-to/definition” → RAG
   if (looksLikeHowToOrDefinition(rawText)) {
     const ans = await ragAnswer({ text: rawText, ownerId });
-    return { ok: true, route: 'rag', answer: ans || `I don’t have that in docs yet.`, evidence: { sql: [], facts_used: 0 } };
+    return {
+      ok: true,
+      route: 'rag',
+      answer: ans || `I don’t have that in docs yet.`,
+      evidence: { sql: [], facts_used: 0 }
+    };
   }
 
   // 1) Deterministic writes (action)
@@ -166,13 +174,10 @@ if (/^jp:/i.test(rawText)) {
       route: 'action',
       action: 'timeclock',
       run: async () => {
-        // Use your v2 handleClock signature via ctx+cil if you already have it,
-        // or call your existing handleTimeclock wrapper. This is the safe “call the handler” point.
         const nowIso = new Date().toISOString();
         const messageSid = context?.messageSid || null;
         const actorId = DIGITS(actorKey);
 
-        // Minimal ctx; adapt to your timeclock v2 CIL contract
         const ctx = {
           owner_id: DIGITS(ownerId),
           user_id: actorId,
@@ -183,34 +188,33 @@ if (/^jp:/i.test(rawText)) {
           meta: { job_name: context?.userProfile?.active_job_name || null }
         };
 
-        const cil = { action: 'timeclock', text: rawText, at: nowIso }; // adapt to your expected CIL
+        const cil = { action: 'timeclock', text: rawText, at: nowIso };
         const out = await handleClock(ctx, cil);
 
         const msg = normalizeHandlerOutput(out, 'Time logged.');
-return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
+        return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
       }
     };
   }
 
   if (QUOTES_ENABLED && looksLikeQuote(rawText)) {
-  return {
-    ok: true,
-    route: 'action',
-    action: 'quote',
-    run: async () => {
-      const out = await handleQuoteCommand({
-        ownerId,
-        from: context?.from || null,
-        text: rawText,
-        userProfile: context?.userProfile || null
-      });
+    return {
+      ok: true,
+      route: 'action',
+      action: 'quote',
+      run: async () => {
+        const out = await handleQuoteCommand({
+          ownerId,
+          from: context?.from || null,
+          text: rawText,
+          userProfile: context?.userProfile || null
+        });
 
-      const msg = normalizeHandlerOutput(out, 'Quote Updated.');
-      return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
-    }
-  };
-}
-
+        const msg = normalizeHandlerOutput(out, 'Quote Updated.');
+        return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
+      }
+    };
+  }
 
   if (looksLikeExpense(rawText)) {
     return {
@@ -218,9 +222,10 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
       route: 'action',
       action: 'expense',
       run: async () => {
-        const from = context?.from || null;           // WhatsApp reply identity (+E164)
+        const from = context?.from || null;
         const messageSid = context?.messageSid || null;
         const reqBody = context?.reqBody || null;
+
         const out = await handleExpense(
           from,
           rawText,
@@ -231,8 +236,9 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
           messageSid,
           reqBody
         );
+
         const msg = normalizeHandlerOutput(out, 'Expense logged.');
-return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
+        return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
       }
     };
   }
@@ -246,6 +252,7 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
         const from = context?.from || null;
         const messageSid = context?.messageSid || null;
         const reqBody = context?.reqBody || null;
+
         const out = await handleRevenue(
           from,
           rawText,
@@ -256,8 +263,9 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
           messageSid,
           reqBody
         );
+
         const msg = normalizeHandlerOutput(out, 'Revenue logged.');
-return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
+        return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
       }
     };
   }
@@ -271,6 +279,7 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
         const from = context?.from || null;
         const messageSid = context?.messageSid || null;
         const reqBody = context?.reqBody || null;
+
         const out = await handleTasks(
           from,
           rawText,
@@ -281,8 +290,9 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
           messageSid,
           reqBody
         );
-      const msg = normalizeHandlerOutput(out, 'Task Updated.');
-return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
+
+        const msg = normalizeHandlerOutput(out, 'Task Updated.');
+        return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
       }
     };
   }
@@ -293,10 +303,10 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
       route: 'action',
       action: 'jobs',
       run: async () => {
-        // If you have a single job handler entry point; otherwise adapt to your command module
         const from = context?.from || null;
         const messageSid = context?.messageSid || null;
         const reqBody = context?.reqBody || null;
+
         const out = await handleJob(
           from,
           rawText,
@@ -307,8 +317,9 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
           messageSid,
           reqBody
         );
+
         const msg = normalizeHandlerOutput(out, 'Job Updated.');
-return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
+        return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
       }
     };
   }
@@ -318,16 +329,18 @@ return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 }
     return await answerInsight({ ownerId, actorKey, text: rawText, tz });
   }
 
-  // 3) Final fallback: RAG first, then (later) narrated LLM if you want
+  // 3) Final fallback: RAG first
   const rag = await ragAnswer({ text: rawText, ownerId });
   if (rag) return { ok: true, route: 'rag', answer: rag, evidence: { sql: [], facts_used: 0 } };
 
   return {
     ok: true,
     route: 'clarify',
-    answer: `Do you want me to (1) log something (expense/revenue/time/task), or (2) answer a question (profit/cashflow/KPIs)?\n\nReply “log” or “question”.`,
+    answer:
+      'Do you want me to (1) log something (expense/revenue/time/task), or (2) answer a question (profit/cashflow/KPIs)?\n\nReply “log” or “question”.',
     evidence: { sql: [], facts_used: 0 }
   };
 }
+
 
 module.exports = { orchestrateChief };

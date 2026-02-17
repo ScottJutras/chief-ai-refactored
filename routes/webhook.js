@@ -1629,9 +1629,19 @@ let lc2 = text2.toLowerCase();
 
 // ✅ Post-media refresh (safe even when no media)
 // IMPORTANT: media handler writes req.body.Body (transcript), not ResolvedInboundText
-text2 = String(req.body?.Body || req.body?.ResolvedInboundText || text2 || '').trim();
+// If interactive produced a stable token (jp:...), never overwrite it with Body.
+// Body may be a transcript from media handling.
+const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
+const body0 = String(req.body?.Body || '').trim();
+
+text2 = resolved0 && /^jp:/i.test(resolved0)
+  ? resolved0
+  : (body0 || resolved0 || text2 || '').trim();
+
 lc2 = text2.toLowerCase();
 console.info('[ROUTER_TEXT_REFRESH]', { lcN: lc2.slice(0, 50) });
+if (/^jp:/i.test(text2)) console.info('[ROUTER_JP_TOKEN_PRESERVED]', { text2: text2.slice(0, 80) });
+
 
 // ✅ Hard time command classification (uses lc2)
 let isHardTimeCommand = looksHardTimeCommand(lc2);

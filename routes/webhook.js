@@ -1515,7 +1515,13 @@ try {
   console.warn('[WEBHOOK] pendingActionMiddleware unavailable:', e?.message);
 }
 
-/* ---------------- Media ingestion (audio/image → handleMedia) ---------------- */
+/* ---------------- Media ingestion (audio/image → handleMedia) ----------------
+ * Goals:
+ * - Media handler may inject transcript into req.body.Body
+ * - Router must use ONE canonical text variable (text2/lc2)
+ * - NEVER let Body override stable interactive tokens (jp:/jobpick::/more/overhead/etc.)
+ * - Remove legacy `text` and `lc` usage in this section (prevents "text is not defined")
+ * -------------------------------------------------------------------------- */
 
 router.post('*', async (req, res, next) => {
   const { n, url, type } = pickFirstMedia(req.body || {});
@@ -1524,81 +1530,75 @@ router.post('*', async (req, res, next) => {
   try {
     const { handleMedia } = require('../handlers/media');
 
-    const bodyText = getInboundText(req.body || {});
+    // Use canonical inbound text resolver (interactive-aware)
+    const bodyText = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
     const sourceMsgId = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
 
     const result = await handleMedia(
-  req.from,
-  bodyText,
-  req.userProfile || {},
-  req.ownerId,
-  url,
-  type,
-  sourceMsgId
-);
+      req.from,
+      bodyText,
+      req.userProfile || {},
+      req.ownerId,
+      url,
+      type,
+      sourceMsgId
+    );
 
-// ✅ Guarded result checks (prevents edge-case crashes if result is string/null)
-const hasTwiml = !!(result && typeof result === 'object' && result.twiml);
-const hasTranscript = !!(result && typeof result === 'object' && result.transcript);
+    // ✅ Guarded result checks (prevents edge-case crashes if result is string/null)
+    const hasTwiml = !!(result && typeof result === 'object' && result.twiml);
+    const hasTranscript = !!(result && typeof result === 'object' && result.transcript);
 
-// ✅ Boundary debug
-console.info('[MEDIA_RETURN]', {
-  from: req.from,
-  ownerId: req.ownerId || null,
-  sourceMsgId: sourceMsgId || null,
-  mediaUrl: url ? String(url).slice(0, 140) : null,
-  mediaType: type || null,
-  hasTwiml,
-  hasTranscript,
-  transcriptLen: hasTranscript ? String(result.transcript).length : 0
-});
+    console.info('[MEDIA_RETURN]', {
+      from: req.from,
+      ownerId: req.ownerId || null,
+      sourceMsgId: sourceMsgId || null,
+      mediaUrl: url ? String(url).slice(0, 140) : null,
+      mediaType: type || null,
+      hasTwiml,
+      hasTranscript,
+      transcriptLen: hasTranscript ? String(result.transcript).length : 0
+    });
 
+    // ✅ If media handler decided to respond immediately, do it.
+    if (hasTwiml && !res.headersSent) {
+      const xml = String(result.twiml || '').trim();
 
+      console.info('[MEDIA_SEND_TWIML]', {
+        from: req.from,
+        ownerId: req.ownerId || null,
+        sourceMsgId: sourceMsgId || null,
+        twimlLen: xml.length
+      });
 
- if (hasTwiml && !res.headersSent) {
-  const xml = String(result.twiml || '').trim();
+      res.status(200).type('text/xml').send(xml);
+      return;
+    }
 
-  console.info('[MEDIA_SEND_TWIML]', {
-    from: req.from,
-    ownerId: req.ownerId || null,
-    sourceMsgId: sourceMsgId || null,
-    twimlLen: xml.length
-  });
+    // ✅ If media handler produced a transcript, inject it into Body for routing.
+    // NOTE: We do NOT touch ResolvedInboundText here; router will reconcile safely later.
+    if (hasTranscript) {
+      let t = String(result.transcript || '').trim();
 
-  res.status(200).type('text/xml').send(xml);
-  return;
-}
+      // Fix voice fillers ("uh, expense ...") BEFORE routing
+      try { if (typeof stripLeadingFiller === 'function') t = stripLeadingFiller(t); } catch {}
 
+      // Deterministic money normalization BEFORE routing
+      try { if (typeof normalizeTranscriptMoney === 'function') t = normalizeTranscriptMoney(t); } catch {}
 
-if (hasTranscript) {
-  let t = String(result.transcript || '').trim();
+      req.body = req.body || {};
+      req.body.Body = t;
 
-  // ✅ Fix voice fillers ("uh, expense ...") BEFORE routing
-  try {
-    if (typeof stripLeadingFiller === 'function') t = stripLeadingFiller(t);
-  } catch {}
+      console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 40) });
+      console.info('[MEDIA_ROUTING_BODY]', {
+        bodyHead: String(req.body?.Body || '').slice(0, 60),
+        len: String(req.body?.Body || '').length
+      });
 
-  // ✅ Apply your deterministic money normalization BEFORE routing
-  try {
-    if (typeof normalizeTranscriptMoney === 'function') t = normalizeTranscriptMoney(t);
-  } catch {}
+      return next();
+    }
 
-  req.body.Body = t;
-
-  console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', {
-    head: String(t || '').slice(0, 12),
-  });
-
-  // ✅ ADD THIS DEBUG LINE (right here)
-  console.info('[MEDIA_ROUTING_BODY]', {
-    bodyHead: String(req.body?.Body || '').slice(0, 60),
-    len: String(req.body?.Body || '').length
-  });
-
-  return next();
-}
-
-    if (typeof result === 'string' && !res.headersSent) {
+    // Legacy pattern: handler might return raw TwiML string
+    if (typeof result === 'string' && result && !res.headersSent) {
       return sendTwiml(res, result);
     }
 
@@ -1609,6 +1609,7 @@ if (hasTranscript) {
   }
 });
 
+/* ---------------- Main router ---------------- */
 
 router.post('*', async (req, res, next) => {
   try {
@@ -1622,37 +1623,47 @@ router.post('*', async (req, res, next) => {
     const crypto = require('crypto');
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
- // ✅ Canonical inbound text (single source of truth)
-let text2 = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
-req.body.ResolvedInboundText = text2;
-let lc2 = text2.toLowerCase();
+    // ✅ Canonical inbound text (single source of truth) — interactive-aware
+    let text2 = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
+    req.body.ResolvedInboundText = text2;
+    let lc2 = text2.toLowerCase();
 
-// ✅ Post-media refresh (safe even when no media)
-// IMPORTANT: media handler writes req.body.Body (transcript), not ResolvedInboundText
-// If interactive produced a stable token (jp:...), never overwrite it with Body.
-// Body may be a transcript from media handling.
-const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
-const body0 = String(req.body?.Body || '').trim();
+    /* -----------------------------------------------------------------------
+     * ✅ Canonical post-media refresh (SINGLE source of truth)
+     * - IMPORTANT: media handler writes req.body.Body (transcript), not ResolvedInboundText
+     * - If interactive produced a stable token (jp:/jobpick::/more/oh/etc.), never overwrite it with Body.
+     * ----------------------------------------------------------------------- */
+    {
+      const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
+      const body0 = String(req.body?.Body || '').trim();
 
-text2 = resolved0 && /^jp:/i.test(resolved0)
-  ? resolved0
-  : (body0 || resolved0 || text2 || '').trim();
+      // Treat picker tokens as stable (do not overwrite with transcript Body)
+      const isStablePickerToken =
+        /^jp:/i.test(resolved0) ||
+        /^jobix_\d+/i.test(resolved0) ||
+        /^jobno_\d+/i.test(resolved0) ||
+        /^jobpick::/i.test(resolved0) ||
+        /^(more|overhead|oh)$/i.test(resolved0);
 
-lc2 = text2.toLowerCase();
-console.info('[ROUTER_TEXT_REFRESH]', { lcN: lc2.slice(0, 50) });
-if (/^jp:/i.test(text2)) console.info('[ROUTER_JP_TOKEN_PRESERVED]', { text2: text2.slice(0, 80) });
+      text2 = isStablePickerToken ? resolved0 : (body0 || resolved0 || text2 || '').trim();
+      lc2 = text2.toLowerCase();
 
+      console.info('[ROUTER_TEXT_REFRESH]', { lcN: lc2.slice(0, 50) });
+      if (isStablePickerToken) {
+        console.info('[ROUTER_PICKER_TOKEN_PRESERVED]', { token: resolved0.slice(0, 80) });
+      }
+    }
 
-// ✅ Hard time command classification (uses lc2)
-let isHardTimeCommand = looksHardTimeCommand(lc2);
-console.info('[ROUTER_HARD_TIME]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
+    // ✅ Hard time command classification (uses lc2)
+    let isHardTimeCommand = looksHardTimeCommand(lc2);
+    console.info('[ROUTER_HARD_TIME]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
 
-// ✅ If there's no text and no media, do nothing
-if (!text2 && numMedia === 0) return ok(res);
+    // ✅ If there's no text and no media, do nothing
+    if (!text2 && numMedia === 0) return ok(res);
 
-    // ✅ "link" keyword (WhatsApp 24h-window opener for portal OTP)
+    // ✅ "link" keyword (WhatsApp 24h-window opener for portal OTP) — exact match only
     const lc2Clean = lc2.trim().replace(/[.!?]+$/g, '');
-if (lc2Clean === 'link') {
+    if (lc2Clean === 'link') {
       return ok(
         res,
         [
@@ -1676,14 +1687,12 @@ if (lc2Clean === 'link') {
       rawSid ||
       crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
 
-    
-
     // -----------------------------------------------------------------------
     // ✅ LINK CODE REDEEM (must run EARLY, and MUST work even when unlinked)
     // Accepts: "LINK 123456" OR "123456"
     // -----------------------------------------------------------------------
     {
-      const linkCode = parseLinkCommand(text);
+      const linkCode = parseLinkCommand(text2);
       if (linkCode) {
         try {
           const phone = String(req.from || '').trim(); // +E164
@@ -1729,109 +1738,107 @@ if (lc2Clean === 'link') {
       messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
       waId: req.body?.WaId || req.body?.WaID || req.body?.waid || null,
       numMedia,
-      resolvedInbound: String(text || '').slice(0, 140),
+      resolvedInbound: String(text2 || '').slice(0, 140),
       ListId: req.body?.ListId || null,
       ListRowId: req.body?.ListRowId || null,
       ButtonPayload: req.body?.ButtonPayload || null
     });
 
-    
+    // -----------------------------------------------------------------------
+    // "resume" => re-send the pending confirm card if we have a confirm pending-action
+    // MUST run early (before nudge / PA router / job picker / fast paths / agent)
+    // -----------------------------------------------------------------------
+    if (lc2 === 'resume' || lc2 === 'show' || lc2 === 'show pending') {
+      try {
+        // ✅ Dual-key newest-wins PA lookup (rawFrom vs digits)
+        const rawFrom = String(req.from || '').trim();
+        const fromDigits = String(req.actorKey || '').trim() || rawFrom.replace(/\D/g, '');
 
-// -----------------------------------------------------------------------
-// "resume" => re-send the pending confirm card if we have a confirm pending-action
-// MUST run early (before nudge / PA router / job picker / fast paths / agent)
-// -----------------------------------------------------------------------
-if (lc === 'resume' || lc === 'show' || lc === 'show pending') {
-  try {
-    // ✅ Dual-key newest-wins PA lookup (rawFrom vs digits)
-    const rawFrom = String(req.from || '').trim();
-    const fromDigits = String(req.actorKey || '').trim() || rawFrom.replace(/\D/g, '');
+        const pickNewest = (a, b) => {
+          if (!a) return b || null;
+          if (!b) return a || null;
+          const ta = new Date(a.created_at || 0).getTime();
+          const tb = new Date(b.created_at || 0).getTime();
+          return tb >= ta ? b : a;
+        };
 
-    const pickNewest = (a, b) => {
-      if (!a) return b || null;
-      if (!b) return a || null;
-      const ta = new Date(a.created_at || 0).getTime();
-      const tb = new Date(b.created_at || 0).getTime();
-      return tb >= ta ? b : a;
-    };
+        let resolvedResumePA = null;
 
-    let resolvedResumePA = null;
+        if (typeof pg.getMostRecentPendingActionForUser === 'function') {
+          const [paRaw, paDigits] = await Promise.all([
+            pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: rawFrom }).catch(() => null),
+            fromDigits && fromDigits !== rawFrom
+              ? pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: fromDigits }).catch(() => null)
+              : Promise.resolve(null)
+          ]);
 
-    if (typeof pg.getMostRecentPendingActionForUser === 'function') {
-      const [paRaw, paDigits] = await Promise.all([
-        pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: rawFrom }).catch(() => null),
-        fromDigits && fromDigits !== rawFrom
-          ? pg.getMostRecentPendingActionForUser({ ownerId: req.ownerId, userId: fromDigits }).catch(() => null)
-          : Promise.resolve(null)
-      ]);
+          resolvedResumePA = pickNewest(paRaw, paDigits);
+        }
 
-      resolvedResumePA = pickNewest(paRaw, paDigits);
-    }
+        const kind = String(resolvedResumePA?.kind || '').trim();
 
-    const kind = String(resolvedResumePA?.kind || '').trim();
+        console.info('[RESUME_PA]', {
+          ownerId: req.ownerId || null,
+          rawFrom: rawFrom || null,
+          fromDigits: fromDigits || null,
+          kind: kind || null,
+          paId: resolvedResumePA?.id ?? null,
+          created_at: resolvedResumePA?.created_at ?? null
+        });
 
-    // ✅ Tiny debug log (keep for ~1 week then remove)
-    console.info('[RESUME_PA]', {
-      ownerId: req.ownerId || null,
-      rawFrom: rawFrom || null,
-      fromDigits: fromDigits || null,
-      kind: kind || null,
-      paId: resolvedResumePA?.id ?? null,
-      created_at: resolvedResumePA?.created_at ?? null
-    });
+        if (kind === 'confirm_expense' || kind === 'pick_job_for_expense') {
+          const { handleExpense } = require('../handlers/commands/expense');
 
-    if (kind === 'confirm_expense' || kind === 'pick_job_for_expense') {
-      const { handleExpense } = require('../handlers/commands/expense');
+          const result = await handleExpense(
+            req.from,
+            'resume',
+            req.userProfile,
+            req.ownerId,
+            req.ownerProfile,
+            req.isOwner,
+            messageSid,
+            req.body
+          );
 
-      const result = await handleExpense(
-        req.from, // ✅ reply identity (E.164)
-        'resume',
-        req.userProfile,
-        req.ownerId,
-        req.ownerProfile,
-        req.isOwner,
-        messageSid,
-        req.body
-      );
+          if (!res.headersSent) {
+            const tw = typeof result === 'string' ? result : (result?.twiml || null);
+            return sendTwiml(res, tw);
+          }
+          return;
+        }
 
-      if (!res.headersSent) {
-        const tw = typeof result === 'string' ? result : (result?.twiml || null);
-        return sendTwiml(res, tw);
+        if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
+          const { handleRevenue } = require('../handlers/commands/revenue');
+
+          console.info('[META_PASS_THROUGH]', {
+            ListId: req.body?.ListId,
+            ListTitle: req.body?.ListTitle,
+            Body: req.body?.Body
+          });
+
+          const result = await handleRevenue(
+            req.from,
+            'resume',
+            req.userProfile,
+            req.ownerId,
+            req.ownerProfile,
+            req.isOwner,
+            messageSid,
+            req.body
+          );
+
+          if (!res.headersSent) {
+            const tw = typeof result === 'string' ? result : (result?.twiml || null);
+            return sendTwiml(res, tw);
+          }
+          return;
+        }
+      } catch (e) {
+        console.warn('[WEBHOOK] resume pending failed (ignored):', e?.message);
       }
-      return;
+
+      return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
     }
-
-    if (kind === 'confirm_revenue' || kind === 'pick_job_for_revenue') {
-      const { handleRevenue } = require('../handlers/commands/revenue');
-       console.info('[META_PASS_THROUGH]', {
-  ListId: req.body?.ListId,
-  ListTitle: req.body?.ListTitle,
-  Body: req.body?.Body
-});
-
-      const result = await handleRevenue(
-        req.from, // ✅ reply identity (E.164)
-        'resume',
-        req.userProfile,
-        req.ownerId,
-        req.ownerProfile,
-        req.isOwner,
-        messageSid,
-        req.body
-      );
-
-      if (!res.headersSent) {
-        const tw = typeof result === 'string' ? result : (result?.twiml || null);
-        return sendTwiml(res, tw);
-      }
-      return;
-    }
-  } catch (e) {
-    console.warn('[WEBHOOK] resume pending failed (ignored):', e?.message);
-  }
-
-  return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
-}
 
   // ------------------------------------------------------------
 // ✅ Owner nudge (Phase 1) — only on owner messages, skip time commands
@@ -2042,7 +2049,7 @@ if (hasPendingMedia && numMedia === 0) {
   try {
     const { handleMedia } = require('../handlers/media');
 
-    // Use the current canonical text (Body-first)
+    // Use the best current text (prefer Body, then ResolvedInboundText, then text2)
     const priorText = String(req.body?.Body || req.body?.ResolvedInboundText || text2 || '').trim();
 
     const result = await handleMedia(
@@ -2068,21 +2075,13 @@ if (hasPendingMedia && numMedia === 0) {
         req.body = req.body || {};
         req.body.Body = t;
 
-        console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 12) });
+        console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 40) });
       }
     } else if (typeof result === 'string' && result) {
       return sendTwiml(res, result);
     }
 
-    // ✅ Refresh canonical vars ONCE (Body-first)
-    text2 = String(req.body?.Body || req.body?.ResolvedInboundText || text2 || '').trim();
-    lc2 = text2.toLowerCase();
-
-    // ✅ Recompute hard-time classification ONCE (after transcript injection)
-    isHardTimeCommand = looksHardTimeCommand(lc2);
-    console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
-
-    // ✅ Refresh pending state best-effort (media follow-up may have changed flow state)
+    // Refresh pending state best-effort (media follow-up may have changed flow state)
     try {
       pending = await safeDb(
         req,
@@ -2091,15 +2090,63 @@ if (hasPendingMedia && numMedia === 0) {
         { fallback: pending || null, ms: 2500 }
       );
     } catch (e) {
-      console.warn('[WEBHOOK] pending media follow-up failed (non-transient, ignored):', e?.message);
+      console.warn('[WEBHOOK] pending refresh after media failed (ignored):', e?.message);
     }
   } catch (e) {
     console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
   }
 }
 
-// ✅ From here on, reuse canonical working text
-const isPickerToken = looksLikeJobPickerReplyToken(text2);
+/* -----------------------------------------------------------------------
+ * ✅ Canonical post-media refresh (SINGLE source of truth)
+ * - IMPORTANT: never let Body overwrite stable interactive tokens
+ * ----------------------------------------------------------------------- */
+{
+  const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
+  const body0 = String(req.body?.Body || '').trim();
+
+  // Treat picker tokens as stable (do not overwrite with transcript Body)
+  const isStablePickerToken =
+    /^jp:/i.test(resolved0) ||
+    /^jobix_\d+/i.test(resolved0) ||
+    /^jobno_\d+/i.test(resolved0) ||
+    /^jobpick::/i.test(resolved0) ||
+    /^(more|overhead|oh)$/i.test(resolved0);
+
+  text2 = isStablePickerToken
+    ? resolved0
+    : (body0 || resolved0 || text2 || '').trim();
+
+  lc2 = text2.toLowerCase();
+
+  console.info('[ROUTER_TEXT_REFRESH]', { lcN: lc2.slice(0, 50) });
+  if (isStablePickerToken) {
+    console.info('[ROUTER_PICKER_TOKEN_PRESERVED]', { token: resolved0.slice(0, 80) });
+  }
+
+  // Recompute hard-time classification ONCE (after final text settles)
+  isHardTimeCommand = looksHardTimeCommand(lc2);
+  console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
+}
+
+
+const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
+const body0 = String(req.body?.Body || '').trim();
+
+// treat any picker token as "stable"
+const isStablePickerToken =
+  /^jp:/i.test(resolved0) ||
+  /^jobix_\d+/i.test(resolved0) ||
+  /^jobno_\d+/i.test(resolved0) ||
+  /^jobpick::/i.test(resolved0) ||
+  /^(more|overhead|oh)$/i.test(resolved0);
+
+text2 = isStablePickerToken
+  ? resolved0
+  : (body0 || resolved0 || text2 || '').trim();
+
+lc2 = text2.toLowerCase();
+
 
 // --- LINK keyword: prevent confusion (exact match only) ---
 const lc2_clean = lc2.trim().replace(/[.!?]+$/g, '');

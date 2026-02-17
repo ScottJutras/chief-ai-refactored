@@ -2114,8 +2114,10 @@ if (lc2_clean === "link") {
 }
 
 /* -----------------------------------------------------------------------
- * ✅ INSIGHTS v0 FASTPATH (Phase 2)
- * Must run BEFORE job handler routing, so "profit on job 1556" isn't swallowed.
+ * ✅ INSIGHTS v0 FASTPATH (MVP)
+ * - Runs BEFORE job handler routing
+ * - Intercepts ONLY deterministic “insight” questions
+ * - Must NOT swallow core command flows (expense/revenue/task/time/job CRUD)
  * ----------------------------------------------------------------------- */
 try {
   const { answerInsightV0 } = require('../services/insights_v0');
@@ -2123,23 +2125,133 @@ try {
   const t = String(text2 || '').trim();
   const s = t.toLowerCase();
 
-  const looksProfit =
-    (s.includes('profit') || s.includes('margin') || s.includes('how much am i making') || s.includes('how much are we making')) &&
-    (s.includes('job') || /(^|\s)#\d+\b/.test(s) || s.includes('active job'));
+  // ------------------------------------------------------------
+  // 0) Hard exclusions — never intercept these (they have dedicated handlers)
+  // ------------------------------------------------------------
+  const looksLikeCoreCommand =
+    // money logging
+    /^\s*(expense|exp)\b/.test(s) ||
+    /^\s*(revenue|rev)\b/.test(s) ||
+    /^\s*(bill)\b/.test(s) ||
+    // timeclock
+    /^\s*(clock\s+in|clock\s+out|break|drive|resume)\b/.test(s) ||
+    // job CRUD / context
+    /^\s*(create\s+job|new\s+job|change\s+job|active\s+job|set\s+active\s+job)\b/.test(s) ||
+    // task CRUD
+    /^\s*(task\s*[-:]|new\s+task|create\s+task|done\s+task|complete\s+task)\b/.test(s) ||
+    // support / admin
+    /^\s*(support|help)\b/.test(s);
 
-  const looksSpend =
-    s.includes('spend') || s.includes('spent') || s.includes('revenue') || s.includes('cash flow');
+  if (!t || looksLikeCoreCommand) {
+    // let the normal router handle it
+  } else {
+    // ------------------------------------------------------------
+    // 1) Profit / margin (job-specific)
+    // ------------------------------------------------------------
+    const looksProfit =
+      (/\bprofit\b/.test(s) ||
+        /\bmargin\b/.test(s) ||
+        /\bhow much am i making\b/.test(s) ||
+        /\bhow much are we making\b/.test(s) ||
+        /\bwhat am i making\b/.test(s) ||
+        /\bmaking\b/.test(s)) &&
+      (
+        /\bjob\b/.test(s) ||
+        /(^|\s)#\d+\b/.test(s) ||
+        /\bactive job\b/.test(s) ||
+        /\bon\s+[a-z0-9]/.test(s) ||
+        /\bprofit\s+\d+\b/.test(s)
+      );
 
-  // Only intercept obvious insight questions (MVP-safe)
-  if (looksProfit || looksSpend) {
-    const out = await answerInsightV0({
-      ownerId: req.ownerId,
-      actorKey: req.actorKey || req.from,
-      text: t,
-      tz: req.tz || 'America/Toronto'
-    });
+    // ------------------------------------------------------------
+    // 2) Spend / revenue / cashflow totals (time presets)
+    // ------------------------------------------------------------
+    const hasTimePreset =
+      /\btoday\b/.test(s) ||
+      /\byesterday\b/.test(s) ||
+      /\bthis\s+week\b/.test(s) ||
+      /\blast\s+week\b/.test(s) ||
+      /\bthis\s+month\b/.test(s) ||
+      /\blast\s+month\b/.test(s) ||
+      /\bthis\s+year\b/.test(s) ||
+      /\blast\s+year\b/.test(s);
 
-    if (out?.answer) return ok(res, out.answer);
+    const looksSpendTotal =
+      (/\bspend\b/.test(s) || /\bspent\b/.test(s) || /\bexpenses?\b/.test(s)) && hasTimePreset;
+
+    const looksRevenueTotal =
+      (/\brevenue\b/.test(s) || /\bsales\b/.test(s) || /\bincome\b/.test(s)) && hasTimePreset;
+
+    const looksCashflowTotal =
+      (/\bcash\s*flow\b/.test(s) || /\bcashflow\b/.test(s)) && hasTimePreset;
+
+    // ------------------------------------------------------------
+    // 3) Vendor spend (MVP-safe)
+    // - "how much did i spend at home depot"
+    // - "spend at home depot this month"
+    // ------------------------------------------------------------
+    const looksVendorSpend =
+      (
+        /\bhome depot\b/.test(s) ||
+        /\bat\s+[a-z0-9][a-z0-9\s&'.-]{2,}\b/.test(s) ||     // "at <vendor>"
+        /\bfrom\s+[a-z0-9][a-z0-9\s&'.-]{2,}\b/.test(s)     // "from <vendor>"
+      ) &&
+      (
+        /\bspend\b/.test(s) ||
+        /\bspent\b/.test(s) ||
+        /\bhow much\b/.test(s) ||
+        /\btotal\b/.test(s)
+      );
+
+    // ------------------------------------------------------------
+    // 4) Jobs overview (list-ish questions)
+    // ------------------------------------------------------------
+    const looksJobsQuery =
+      /\bjobs\b/.test(s) &&
+      (/\blist\b/.test(s) || /\bshow\b/.test(s) || /\brecent\b/.test(s) || /\bopen\b/.test(s) || /\bactive\b/.test(s));
+
+    // ------------------------------------------------------------
+    // 5) Tasks overview (list-ish questions)
+    // ------------------------------------------------------------
+    const looksTasksQuery =
+      /\btasks?\b/.test(s) &&
+      (/\blist\b/.test(s) || /\bshow\b/.test(s) || /\bopen\b/.test(s) || /\bdue\b/.test(s) || /\btoday\b/.test(s) || /\bthis\s+week\b/.test(s));
+
+    // ------------------------------------------------------------
+    // 6) Top vendors / categories (optional MVP)
+    // ------------------------------------------------------------
+    const looksTopVendors =
+      (/\btop\b/.test(s) || /\bbiggest\b/.test(s)) &&
+      (/\bvendors?\b/.test(s) || /\bwhere am i spending\b/.test(s) || /\bwho am i paying\b/.test(s));
+
+    const looksTopCategories =
+      (/\btop\b/.test(s) || /\bbiggest\b/.test(s)) &&
+      (/\bcategories?\b/.test(s) || /\bwhere am i spending\b/.test(s));
+
+    // ------------------------------------------------------------
+    // 7) Decide: intercept only “obvious insights”
+    // ------------------------------------------------------------
+    const shouldIntercept =
+      looksProfit ||
+      looksSpendTotal ||
+      looksRevenueTotal ||
+      looksCashflowTotal ||
+      looksVendorSpend ||
+      looksJobsQuery ||
+      looksTasksQuery ||
+      looksTopVendors ||
+      looksTopCategories;
+
+    if (shouldIntercept) {
+      const out = await answerInsightV0({
+        ownerId: req.ownerId,
+        actorKey: req.actorKey || req.from,
+        text: t,
+        tz: req.tz || 'America/Toronto'
+      });
+
+      if (out?.answer) return ok(res, out.answer);
+    }
   }
 } catch (e) {
   console.warn('[INSIGHTS_V0_FASTPATH] skipped:', e?.message);

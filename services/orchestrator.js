@@ -2,8 +2,9 @@
 const { ragAnswer } = require('./rag_search'); // your existing RAG search wrapper (safe)
 const pg = require('./postgres');
 // Feature flags (default OFF unless explicitly enabled)
-const FEATURE_QUOTES = (process.env.FEATURE_QUOTES || '0') === '1';
 const FEATURE_KPIS = (process.env.FEATURE_FINANCE_KPIS || '0') === '1';
+// Quotes are MVP-excluded. Default OFF.
+const QUOTES_ENABLED = (process.env.FEATURE_QUOTES || '0') === '1';
 
 // Existing handlers (writes go through these only)
 const { handleExpense } = require('../handlers/commands/expense');
@@ -20,11 +21,30 @@ function DIGITS(x) { return String(x ?? '').replace(/\D/g, ''); }
 
 function looksLikeHowToOrDefinition(text) {
   const s = lc(text);
-  return (
-    /\bhow do i\b|\bhow to\b|\bwhat is\b|\bdefine\b|\bmeaning\b|\bhelp\b|\bguide\b|\bhow can i\b/.test(s) ||
-    /\bretainage\b|\bholdback\b|\bprogress billing\b|\bchange order\b/.test(s)
-  );
+
+  // If it contains finance metrics, treat as insight (NOT a definition request)
+  if (/\b(profit|revenue|spend|spent|expenses?|cash ?flow|margin|kpi|invoice|paid)\b/.test(s)) {
+    return false;
+  }
+
+  // How-to / help intent
+  if (/\bhow do i\b|\bhow to\b|\bdefine\b|\bmeaning\b|\bhelp\b|\bguide\b|\bhow can i\b/.test(s)) {
+    return true;
+  }
+
+  // Contractor vocabulary terms (OK for RAG)
+  if (/\bretainage\b|\bholdback\b|\bprogress billing\b|\bchange order\b/.test(s)) {
+    return true;
+  }
+
+  // Only allow "what is" if it's a contractor term (prevents “what is my profit”)
+  if (/\bwhat is\b/.test(s) && /\b(retainage|holdback|change order|progress billing)\b/.test(s)) {
+    return true;
+  }
+
+  return false;
 }
+
 
 function looksLikeTimeclock(text) {
   const s = lc(text);
@@ -64,22 +84,74 @@ function looksLikeInsightQuestion(text) {
     /^kpis?\b/.test(s)
   );
 }
+function normalizeHandlerOutput(out, fallback = 'Done.') {
+  if (out == null) return fallback;
+
+  // Common legacy patterns
+  if (typeof out === 'string') {
+    const s = out.trim();
+    return s || fallback;
+  }
+
+  // Many handlers return { text }, { message }, { twiml }, { ok, text }, etc.
+  const cand =
+    (typeof out.text === 'string' && out.text) ||
+    (typeof out.message === 'string' && out.message) ||
+    (typeof out.twiml === 'string' && out.twiml) ||
+    (typeof out.answer === 'string' && out.answer) ||
+    null;
+
+  if (cand && String(cand).trim()) return String(cand).trim();
+  return fallback;
+}
 
 async function answerInsight({ ownerId, actorKey, text, tz }) {
   return await answerInsightV0({ ownerId, actorKey, text, tz });
-}
-
-function normalizeHandlerOutput(out, fallbackText) {
-  if (typeof out === 'string' && out.trim()) return out.trim();
-  if (out?.text && String(out.text).trim()) return String(out.text).trim();
-  if (out?.twiml && String(out.twiml).trim()) return String(out.twiml).trim(); // if you ever bubble it
-  return fallbackText;
 }
 
 
 async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, agent, context }) {
   const rawText = String(text || '').trim();
   const s = lc(rawText);
+
+   // 00) Pending-action / mid-flow resolver (prevents "yes" being misrouted)
+if (context?.userProfile?.pending_action) {
+  return {
+    ok: true,
+    route: 'action',
+    action: 'pending_action',
+    run: async () => {
+      let out = null;
+
+      // Adapt this require to your real pending-action module.
+      // If you already handle pending actions in webhook only, keep this as a safety net.
+      try {
+        const { handlePendingAction } = require('../handlers/pending_action');
+        if (typeof handlePendingAction === 'function') {
+          out = await handlePendingAction(context, rawText);
+        }
+      } catch (e) {
+        // Safe fallback: do not guess.
+      }
+
+      const msg = normalizeHandlerOutput(out, 'Please finish the pending confirmation first (or reply “cancel”).');
+      return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
+    }
+  };
+}
+
+// 01) Job picker token safety net (your tokens are jp:...)
+// If this reaches Chief, do NOT treat it as natural language.
+if (/^jp:/i.test(rawText)) {
+  return {
+    ok: true,
+    route: 'clarify',
+    answer: `✅ Job selected. Now tell me what you want to do (expense / revenue / time / task).`,
+    evidence: { sql: [], facts_used: 0 }
+  };
+}
+
+
 
   // 0) Deterministic “how-to/definition” → RAG
   if (looksLikeHowToOrDefinition(rawText)) {
@@ -114,30 +186,31 @@ async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, age
         const cil = { action: 'timeclock', text: rawText, at: nowIso }; // adapt to your expected CIL
         const out = await handleClock(ctx, cil);
 
-        const answer = normalizeHandlerOutput(out, 'Time logged.');
-return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
+        const msg = normalizeHandlerOutput(out, 'Time logged.');
+return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
       }
     };
   }
 
-  if (FEATURE_QUOTES && looksLikeQuote(rawText)) {
+  if (QUOTES_ENABLED && looksLikeQuote(rawText)) {
   return {
     ok: true,
     route: 'action',
     action: 'quote',
     run: async () => {
-      const msg = await handleQuoteCommand({
+      const out = await handleQuoteCommand({
         ownerId,
         from: context?.from || null,
         text: rawText,
         userProfile: context?.userProfile || null
       });
 
-      const answer = normalizeHandlerOutput(msg, 'Quote updated.');
-      return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
+      const msg = normalizeHandlerOutput(out, 'Quote Updated.');
+      return { ok: true, route: 'action', answer: msg, evidence: { sql: [], facts_used: 0 } };
     }
   };
 }
+
 
   if (looksLikeExpense(rawText)) {
     return {
@@ -158,9 +231,8 @@ return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 }
           messageSid,
           reqBody
         );
-        const answer = normalizeHandlerOutput(out, 'Expense logged.');
-return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
-
+        const msg = normalizeHandlerOutput(out, 'Expense logged.');
+return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
       }
     };
   }
@@ -184,9 +256,8 @@ return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 }
           messageSid,
           reqBody
         );
-        const answer = normalizeHandlerOutput(out, 'Revenue logged.'); // or Task updated / Job updated
-return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
-
+        const msg = normalizeHandlerOutput(out, 'Revenue logged.');
+return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
       }
     };
   }
@@ -210,9 +281,8 @@ return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 }
           messageSid,
           reqBody
         );
-        const answer = normalizeHandlerOutput(out, 'Task Updated.'); 
-return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
-
+      const msg = normalizeHandlerOutput(out, 'Task Updated.');
+return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
       }
     };
   }
@@ -237,9 +307,8 @@ return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 }
           messageSid,
           reqBody
         );
-        const answer = normalizeHandlerOutput(out, 'Job Updated.'); // or Task updated / Job updated
-return { ok: true, route: 'action', answer, evidence: { sql: [], facts_used: 0 } };
-
+        const msg = normalizeHandlerOutput(out, 'Job Updated.');
+return { ok:true, route:'action', answer: msg, evidence:{ sql:[], facts_used:0 } };
       }
     };
   }

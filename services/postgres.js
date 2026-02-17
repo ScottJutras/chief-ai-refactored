@@ -211,6 +211,123 @@ function looksLikeUuid(str) {
     String(str || '')
   );
 }
+
+// ---------------- Tenant mapping helpers ----------------
+
+/**
+ * Map owner digits (e.g. "19053279955") -> tenant UUID (e.g. "5c7c3a45-...").
+ * Tries both resolver view names because code + DB dumps show both.
+ *
+ * Returns: tenant_id UUID string OR null
+ */
+async function getTenantIdForOwnerDigits(ownerDigits) {
+  const owner = DIGITS(ownerDigits);
+  if (!owner) return null;
+
+  // Prefer the view referenced by middleware/userProfile.js
+  try {
+    const r = await query(
+      `
+      select tenant_id
+      from public.v_actor_identity_resolver
+      where kind = 'whatsapp'
+        and identifier = $1
+      limit 1
+      `,
+      [owner]
+    );
+    const tid = r?.rows?.[0]?.tenant_id || null;
+    if (tid) return String(tid);
+  } catch (e) {
+    const msg = String(e?.message || '');
+    if (!/does not exist|permission denied/i.test(msg)) {
+      console.warn('[PG] getTenantIdForOwnerDigits(v_actor_identity_resolver) failed:', msg);
+    }
+  }
+
+  // Fallback: alternate name that shows up in some DB exports
+  try {
+    const r = await query(
+      `
+      select tenant_id
+      from public.v_identity_resolver
+      where kind = 'whatsapp'
+        and identifier = $1
+      limit 1
+      `,
+      [owner]
+    );
+    const tid = r?.rows?.[0]?.tenant_id || null;
+    if (tid) return String(tid);
+  } catch (e) {
+    const msg = String(e?.message || '');
+    if (!/does not exist|permission denied/i.test(msg)) {
+      console.warn('[PG] getTenantIdForOwnerDigits(v_identity_resolver) failed:', msg);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Sum expenses (in cents) for a date range.
+ * Uses tenant_id UUID (chiefos_expenses is tenant-scoped).
+ */
+async function sumExpensesCentsByRange({ tenantId, ownerId, fromIso, toIso }) {
+  let tid = tenantId ? String(tenantId) : null;
+
+  if (!tid && ownerId) {
+    tid = await getTenantIdForOwnerDigits(ownerId);
+  }
+
+  // TEMP DEBUG (remove after verification)
+  if (!tid) console.warn('[INSIGHTS] tenantId not resolved for owner:', ownerId);
+
+  if (!tid) return 0;
+
+  const r = await query(
+    `
+    select coalesce(sum(amount), 0) as total_amount
+    from public.chiefos_expenses
+    where tenant_id = $1
+      and deleted_at is null
+      and expense_date >= $2::date
+      and expense_date <= $3::date
+    `,
+    [tid, fromIso, toIso]
+  );
+
+  const amt = Number(r?.rows?.[0]?.total_amount || 0);
+  return Math.round(amt * 100);
+}
+
+/**
+ * Sum revenues (in cents) for a date range.
+ * Uses owner_id digits (transactions is owner-scoped).
+ */
+async function sumRevenueCentsByRange({ ownerId, fromIso, toIso }) {
+  const owner = DIGITS(ownerId);
+  if (!owner) return 0;
+
+  const r = await query(
+  `
+  select coalesce(sum(
+    coalesce(amount_cents, (round(amount * 100))::bigint)
+  ), 0)::bigint as total_cents
+  from public.transactions
+  where owner_id::text = $1
+    and kind = 'revenue'
+    and date >= $2::date
+    and date <= $3::date
+  `,
+  [owner, fromIso, toIso]
+);
+
+
+  return Number(r?.rows?.[0]?.total_cents || 0);
+}
+
+
 /* -------------------- Usage / Quotas (monthly) -------------------- */
 
 function ymInTZ(tz = 'America/Toronto', d = new Date()) {
@@ -4374,4 +4491,8 @@ module.exports = {
   applyJobToPendingDraft,
   clearPendingJobPick,
   getTotalsForRange,
+  getTenantIdForOwnerDigits,
+  sumExpensesCentsByRange,
+  sumRevenueCentsByRange,
+
 };

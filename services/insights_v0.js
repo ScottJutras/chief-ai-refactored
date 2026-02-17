@@ -171,7 +171,18 @@ async function resolveJobForInsight(pgClient, ownerId, ref) {
 }
 
 async function resolveJobForProfit({ ownerId, actorKey, text }) {
-  const ref = extractJobRefFromText(text);
+  const raw = String(text || '').replace(/\s+/g, ' ').trim();
+  const s = raw.toLowerCase();
+
+  const explicitActive = /\bactive\s+job\b/.test(s);
+  const ref = extractJobRefFromText(raw);
+
+  const explicitRefProvided = !!(
+    ref &&
+    (ref.jobNo != null || (ref.name && String(ref.name).trim()) || (ref.raw && String(ref.raw).trim()))
+  );
+
+  // Resolve via DB (job_no / exact name / contains)
   const resolved = await resolveJobForInsight(pg, ownerId, ref);
 
   if (resolved?.ok && resolved?.job) {
@@ -182,17 +193,32 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
     };
   }
 
+  // Ambiguous matches
   if (resolved?.reason === 'ambiguous') {
     return {
       jobNo: null,
       jobName: null,
       source: 'ambiguous',
       matches: resolved.matches || [],
-      term: resolved.term || ref?.raw || ''
+      term: resolved.term || ref?.raw || ref?.name || ''
     };
   }
 
-  // Active job fallback
+  // ✅ CRITICAL:
+  // If the user explicitly referenced a job (like "1556" or "oak street"),
+  // DO NOT silently fall back to active job.
+  if (explicitRefProvided && !explicitActive) {
+    return {
+      jobNo: null,
+      jobName: null,
+      source: 'not_found_explicit',
+      term: String(ref?.raw || ref?.name || ref?.jobNo || '').trim()
+    };
+  }
+
+  // Only fall back to active job when:
+  // - user explicitly asked for active job, OR
+  // - user did not provide any job ref at all
   try {
     if (typeof pg.getActiveJob === 'function') {
       const aj = await pg.getActiveJob(ownerId, actorKey);
@@ -204,6 +230,7 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
 
   return { jobNo: null, jobName: null, source: resolved?.reason || 'none' };
 }
+
 
 async function getProfitRowByJobNo(ownerId, jobNo) {
   if (!Number.isFinite(jobNo)) return null; // hard stop
@@ -239,8 +266,26 @@ function profitReply({ row, label }) {
   ].join('\n');
 }
 
-async function answerProfitIntent({ ownerId, actorKey, text }) {
+
+   async function answerProfitIntent({ ownerId, actorKey, text }) {
   const resolved = await resolveJobForProfit({ ownerId, actorKey, text });
+
+  // ✅ If they asked for a specific job and we couldn't find it, never answer active job.
+  if (resolved?.source === 'not_found_explicit') {
+    const term = String(resolved.term || '').trim();
+    return {
+      ok: true,
+      route: 'clarify',
+      answer:
+        `I couldn’t find a job matching "${term}".\n\n` +
+        `Try:\n` +
+        `• “list jobs”\n` +
+        `• “profit on 1556”\n` +
+        `• “profit on Oak Street Re-roof”\n` +
+        `• “profit on active job”`,
+      evidence: { sql: [], facts_used: 0 }
+    };
+  }
 
   // Ambiguous fragment
   if (resolved?.source === 'ambiguous' && Array.isArray(resolved.matches) && resolved.matches.length) {
@@ -279,24 +324,15 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
     };
   }
 
-  // If they provided a term but it didn't resolve
-  // (ex: "oak st" but no matching job found)
-  if (resolved?.source === 'not_found' || resolved?.source === 'none') {
-    return {
-      ok: true,
-      route: 'clarify',
-      answer: `I couldn’t match that to a job. Try “list jobs”, or say something like “profit on Oak Street Re-roof”.`,
-      evidence: { sql: [], facts_used: 0 }
-    };
-  }
-
+  // Final fallback (no explicit job ref and no active job)
   return {
     ok: true,
     route: 'clarify',
-    answer: `Which job are you asking about? Reply like “profit on job 18” or “profit on active job”.`,
+    answer: `Which job are you asking about? Reply like “profit on 1556”, “profit on Oak Street”, or “profit on active job”.`,
     evidence: { sql: [], facts_used: 0 }
   };
 }
+
 
 function looksLikeProfitQuestion(text) {
   const s = lc(String(text || '').replace(/\s+/g, ' ').trim());
@@ -311,18 +347,89 @@ function looksLikeProfitQuestion(text) {
   return hasProfitIntent && hasJobAnchor;
 }
 
+function ymdInTZ(tz = 'America/Toronto') {
+  // Prefer pg helper if you have it (you do: todayInTZ)
+  try {
+    if (typeof pg.todayInTZ === 'function') return pg.todayInTZ(tz);
+  } catch {}
+  // Fallback: UTC date (not ideal, but safe)
+  return new Date().toISOString().slice(0, 10);
+}
+
+// Tiny helper: shift YYYY-MM-DD by deltaDays (negative allowed)
+function dateShift(ymd, deltaDays) {
+  const s = String(ymd || '').trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1; // 0-indexed
+  const d = Number(m[3]);
+
+  // Work in UTC to avoid DST weirdness for pure date shifts
+  const dt = new Date(Date.UTC(y, mo, d));
+  dt.setUTCDate(dt.getUTCDate() + Number(deltaDays || 0));
+  return dt.toISOString().slice(0, 10);
+}
+
 async function answerInsightV0({ ownerId, actorKey, text, tz }) {
   const raw = String(text || '').trim();
   const s = lc(raw);
 
-  // 1) Job profit / margin
+  // 1) Job profit / margin (KEEP EXACTLY as your current logic)
   if (looksLikeProfitQuestion(raw)) {
     return await answerProfitIntent({ ownerId, actorKey, text: raw });
   }
 
-  // 2) Spend / revenue totals (Phase 1)
+  // 2) Business totals: spend / revenue / profit (today, last 7 days, last 30 days)
+  const wantsSpend = /\bspend\b|\bspent\b|\bexpenses?\b/.test(s);
+  const wantsRevenue = /\brevenue\b|\bsales\b|\bearned\b/.test(s);
+  const wantsProfit = /\bprofit\b|\bmargin\b|\bnet\b/.test(s);
+
+  const wantsToday = /\btoday\b/.test(s);
+  const wants7 = /\blast\s*7\s*days\b|\bpast\s*7\s*days\b/.test(s);
+  const wants30 = /\blast\s*30\s*days\b|\bpast\s*30\s*days\b/.test(s);
+
+  // Only trigger if they asked for a metric AND a supported window
+  if ((wantsSpend || wantsRevenue || wantsProfit) && (wantsToday || wants7 || wants30)) {
+    const tzUse = String(tz || '').trim() || 'America/Toronto';
+
+    // Date boundaries are DATE-based and inclusive on both ends.
+    // today: [today, today]
+    // last 7 days: [today-6, today]
+    // last 30 days: [today-29, today]
+    const toIso = ymdInTZ(tzUse);
+
+    let fromIso = toIso;
+    if (wants30) fromIso = dateShift(toIso, -29);
+    else if (wants7) fromIso = dateShift(toIso, -6);
+
+    // Safety fallback if dateShift failed for any reason
+    if (!fromIso) fromIso = toIso;
+
+    // Expenses require tenantId mapping; revenues are ownerId in transactions
+    const spendCents = await pg.sumExpensesCentsByRange({ ownerId, fromIso, toIso });
+    const revenueCents = await pg.sumRevenueCentsByRange({ ownerId, fromIso, toIso });
+    const profitCents = Number(revenueCents || 0) - Number(spendCents || 0);
+
+    const label = wantsToday ? 'today' : wants30 ? 'last 30 days' : 'last 7 days';
+
+    const lines = [`For ${label}:`];
+    if (wantsRevenue) lines.push(`• Revenue: ${money(revenueCents)}`);
+    if (wantsSpend) lines.push(`• Spend: ${money(spendCents)}`);
+    if (wantsProfit) lines.push(`• Profit (revenue − spend): ${money(profitCents)}`);
+
+    return {
+      ok: true,
+      route: 'insight',
+      answer: lines.join('\n'),
+      evidence: { sql: ['sumExpensesCentsByRange', 'sumRevenueCentsByRange'], facts_used: 2 }
+      
+    };
+  }
+
+  // 3) Legacy fallback (keep if you want; it should rarely be hit now)
   if (typeof pg.getTotalsForRange === 'function') {
-    // Spend today
     if (/\bspend\b/.test(s) && /\btoday\b/.test(s)) {
       const r = await pg.getTotalsForRange({
         ownerId,
@@ -343,9 +450,10 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
   return {
     ok: true,
     route: 'clarify',
-    answer: `Try: “spend today” or “profit on Oak Street Re-roof”.`,
+    answer: `Try: “spend today”, “revenue last 7 days”, or “profit on Oak Street Re-roof”.`,
     evidence: { sql: [], facts_used: 0 }
   };
 }
+
 
 module.exports = { answerInsightV0 };

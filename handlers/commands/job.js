@@ -457,8 +457,8 @@ async function listJobs(ownerId) {
         created_at
        FROM public.jobs
       WHERE owner_id = $1
-      ORDER BY created_at DESC
-      LIMIT 10`,
+      ORDER BY job_no DESC NULLS LAST, created_at DESC
+      LIMIT 15`,
     [String(ownerId)]
   );
 
@@ -479,6 +479,7 @@ Try:
 
   return `Here are your recent jobs:\n\n${lines.join('\n')}`;
 }
+
 
 // Best-effort detailed active jobs list (aligned with revenue.js expectations)
 async function listActiveJobsDetailed(ownerId, { limit = 50 } = {}) {

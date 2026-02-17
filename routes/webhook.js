@@ -275,15 +275,6 @@ function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
   };
 
   const bt = String(baseText || '').trim();
-
-  // If handleMedia didn't produce a transcript, keep whatever canonical text we already had
-text2 = String(req.body.ResolvedInboundText || text2 || '').trim();
-lc2 = text2.toLowerCase();
-
-isHardTimeCommand = looksHardTimeCommand(lc2);
-console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
-
-
   const head =
     map[a] ||
     (parts[0] || 'Time logged.')
@@ -1631,17 +1622,27 @@ router.post('*', async (req, res, next) => {
     const crypto = require('crypto');
     const numMedia = parseInt(req.body?.NumMedia || '0', 10) || 0;
 
-    // ✅ Canonical inbound text (single source of truth)
-    let text = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
-    req.body.ResolvedInboundText = text;
-    let lc = text.toLowerCase();
+ // ✅ Canonical inbound text (single source of truth)
+let text2 = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
+req.body.ResolvedInboundText = text2;
+let lc2 = text2.toLowerCase();
 
-    // ✅ If there's no text and no media, do nothing
-    if (!text && numMedia === 0) return ok(res);
+// ✅ Post-media refresh (safe even when no media)
+// IMPORTANT: media handler writes req.body.Body (transcript), not ResolvedInboundText
+text2 = String(req.body?.Body || req.body?.ResolvedInboundText || text2 || '').trim();
+lc2 = text2.toLowerCase();
+console.info('[ROUTER_TEXT_REFRESH]', { lcN: lc2.slice(0, 50) });
+
+// ✅ Hard time command classification (uses lc2)
+let isHardTimeCommand = looksHardTimeCommand(lc2);
+console.info('[ROUTER_HARD_TIME]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
+
+// ✅ If there's no text and no media, do nothing
+if (!text2 && numMedia === 0) return ok(res);
 
     // ✅ "link" keyword (WhatsApp 24h-window opener for portal OTP)
-    const lcClean = lc.trim().replace(/[.!?]+$/g, '');
-    if (lcClean === 'link') {
+    const lc2Clean = lc2.trim().replace(/[.!?]+$/g, '');
+if (lc2Clean === 'link') {
       return ok(
         res,
         [
@@ -1663,11 +1664,9 @@ router.post('*', async (req, res, next) => {
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid =
       rawSid ||
-      crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
+      crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
 
-    // ✅ Hard time command classification (uses lc we already computed)
-    let isHardTimeCommand = looksHardTimeCommand(lc);
-    console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
+    
 
     // -----------------------------------------------------------------------
     // ✅ LINK CODE REDEEM (must run EARLY, and MUST work even when unlinked)
@@ -1970,59 +1969,61 @@ try {
   }
 } catch {}
 
-    /* ------------------------------------------------------------
-     * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
-     * ------------------------------------------------------------ */
+ /* ------------------------------------------------------------
+ * PENDING TXN NUDGE (legacy revenue/expense flows via stateManager)
+ * ------------------------------------------------------------ */
 
-    const pendingRevenueFlow =
-      !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
+const pendingRevenueFlow =
+  !!pending?.pendingRevenue || !!pending?.awaitingRevenueJob || !!pending?.awaitingRevenueClarification;
 
-    const pendingExpenseFlowLegacy =
-      !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
+const pendingExpenseFlowLegacy =
+  !!pending?.pendingExpense || !!pending?.awaitingExpenseJob || !!pending?.awaitingExpenseClarification;
 
-    const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
+const pendingExpenseFlow = pendingExpenseFlowLegacy || hasExpensePendingActions;
 
-    // ✅ If user said "skip" in expense.js, we allow new commands/messages to proceed without nagging.
-    const allowNewWhilePendingExpense = !!pending?.allow_new_while_pending;
+// ✅ If user said "skip" in expense.js, we allow new commands/messages to proceed without nagging.
+const allowNewWhilePendingExpense = !!pending?.allow_new_while_pending;
 
-    const allowJobPickerThrough =
-      (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
+// ✅ Only allow job picker commands through when expense PA is NOT active
+const allowJobPickerThrough =
+  (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
 
-    if (pendingRevenueFlow && !isHardTimeCommand) {
-      if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
+if (pendingRevenueFlow && !isHardTimeCommand) {
+  if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
 
+  if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+    const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'revenue' });
+    if (msg) return ok(res, msg);
+    // msg null => mid-edit; do NOT nag; fall through
+  }
+}
+
+// ✅ EXPENSE NUDGE GATE — hardened: NEVER block when an expense PA exists
+if (pendingExpenseFlow && !isHardTimeCommand) {
+  if (!hasExpensePendingActions) {
+    if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
+
+    if (!allowNewWhilePendingExpense) {
       if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
-        const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'revenue' });
+        const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
         if (msg) return ok(res, msg);
-        // msg null => mid-edit; do NOT nag; fall through
       }
     }
+  }
 
-    // ✅ EXPENSE NUDGE GATE — hardened: NEVER block when an expense PA exists
-    if (pendingExpenseFlow && !isHardTimeCommand) {
-      if (!hasExpensePendingActions) {
-        if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
+  console.info('[WEBHOOK] after_nudge_gate', {
+    hasExpensePendingActions,
+    pendingExpenseFlow,
+    lc: String(lc || '').slice(0, 30),
+    mostRecentPAKind: mostRecentPAKind || null
+  });
+}
 
-        if (!allowNewWhilePendingExpense) {
-          if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
-            const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
-            if (msg) return ok(res, msg);
-          }
-        }
-      }
+// ✅ Refresh canonical working vars (Body-first) — do NOT redeclare text2/lc2
+text2 = String(req.body?.Body || req.body?.ResolvedInboundText || text2 || '').trim();
+lc2 = text2.toLowerCase();
 
-      console.info('[WEBHOOK] after_nudge_gate', {
-        hasExpensePendingActions,
-        pendingExpenseFlow,
-        lc: String(lc || '').slice(0, 30),
-        mostRecentPAKind: mostRecentPAKind || null
-      });
-    }
-// ✅ Define canonical reuse vars BEFORE media follow-up (prevents lc2 TDZ crash)
-let text2 = String(text || '').trim();
-let lc2 = text2.toLowerCase();
-
-    /* -----------------------------------------------------------------------
+/* -----------------------------------------------------------------------
  * Media follow-up: if prior step set pendingMedia and this is text-only
  * ----------------------------------------------------------------------- */
 const hasPendingMedia = !!pending?.pendingMedia || !!pending?.pendingMediaMeta;
@@ -2031,8 +2032,8 @@ if (hasPendingMedia && numMedia === 0) {
   try {
     const { handleMedia } = require('../handlers/media');
 
-    // Use the current canonical text we already computed earlier in the request
-    const priorText = String(req.body?.ResolvedInboundText || text || '').trim();
+    // Use the current canonical text (Body-first)
+    const priorText = String(req.body?.Body || req.body?.ResolvedInboundText || text2 || '').trim();
 
     const result = await handleMedia(
       req.from,
@@ -2045,25 +2046,17 @@ if (hasPendingMedia && numMedia === 0) {
     );
 
     if (result && typeof result === 'object') {
+      // If media handler decided to respond immediately, do it.
       if (result.twiml) return sendTwiml(res, result.twiml);
 
+      // If media handler produced a transcript, inject it into Body for routing
       if (result.transcript && !result.twiml) {
         let t = String(result.transcript || '').trim();
         try { if (typeof stripLeadingFiller === 'function') t = stripLeadingFiller(t); } catch {}
         try { if (typeof normalizeTranscriptMoney === 'function') t = normalizeTranscriptMoney(t); } catch {}
 
-        // Put transcript into the inbound body
-req.body = req.body || {};
-req.body.Body = t;
-
-// Recompute canonical text
-const newResolved = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
-req.body.ResolvedInboundText = newResolved;
-
-// ✅ Update working canonical vars (text2/lc2) so downstream routing uses transcript
-text2 = newResolved;
-lc2 = text2.toLowerCase();
-
+        req.body = req.body || {};
+        req.body.Body = t;
 
         console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 12) });
       }
@@ -2071,25 +2064,25 @@ lc2 = text2.toLowerCase();
       return sendTwiml(res, result);
     }
 
-    // ✅ Keep working canonical vars stable
-text2 = String(req.body.ResolvedInboundText || text2 || '').trim();
-lc2 = text2.toLowerCase();
+    // ✅ Refresh canonical vars ONCE (Body-first)
+    text2 = String(req.body?.Body || req.body?.ResolvedInboundText || text2 || '').trim();
+    lc2 = text2.toLowerCase();
 
+    // ✅ Recompute hard-time classification ONCE (after transcript injection)
     isHardTimeCommand = looksHardTimeCommand(lc2);
     console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
 
-  try {
-  pending = await safeDb(
-    req,
-    'getPendingTransactionState',
-    () => getPendingTransactionState(req.actorKey || req.from),
-    { fallback: pending || null, ms: 2500 }
-  );
-} catch (e) {
-  console.warn('[WEBHOOK] pending media follow-up failed (non-transient, ignored):', e?.message);
-  // keep existing pending
-}
-
+    // ✅ Refresh pending state best-effort (media follow-up may have changed flow state)
+    try {
+      pending = await safeDb(
+        req,
+        'getPendingTransactionState',
+        () => getPendingTransactionState(req.actorKey || req.from),
+        { fallback: pending || null, ms: 2500 }
+      );
+    } catch (e) {
+      console.warn('[WEBHOOK] pending media follow-up failed (non-transient, ignored):', e?.message);
+    }
   } catch (e) {
     console.warn('[WEBHOOK] pending media follow-up failed (ignored):', e?.message);
   }
@@ -2098,18 +2091,18 @@ lc2 = text2.toLowerCase();
 // ✅ From here on, reuse canonical working text
 const isPickerToken = looksLikeJobPickerReplyToken(text2);
 
-// --- LINK keyword: prevent RAG confusion (exact match only) ---
-const lc2_clean = lc2.trim().replace(/[.!?]+$/g, ""); // allow "link." "link!" "link?"
-if (lc2_clean === "link") {
+// --- LINK keyword: prevent confusion (exact match only) ---
+const lc2_clean = lc2.trim().replace(/[.!?]+$/g, '');
+if (lc2_clean === 'link') {
   return ok(
     res,
     [
-      "✅ WhatsApp confirmed.",
-      "",
-      "Go back to the portal, request your 6-digit code, enter it here, then click Verify in ChiefOS.",
-      "",
-      "Code expires in 10 minutes.",
-    ].join("\n")
+      '✅ WhatsApp confirmed.',
+      '',
+      'Go back to the portal, request your 6-digit code, enter it here, then click Verify in ChiefOS.',
+      '',
+      'Code expires in 10 minutes.'
+    ].join('\n')
   );
 }
 
@@ -2125,29 +2118,25 @@ try {
   const t = String(text2 || '').trim();
   const s = t.toLowerCase();
 
-  // ------------------------------------------------------------
   // 0) Hard exclusions — never intercept these (they have dedicated handlers)
-  // ------------------------------------------------------------
   const looksLikeCoreCommand =
     // money logging
     /^\s*(expense|exp)\b/.test(s) ||
     /^\s*(revenue|rev)\b/.test(s) ||
     /^\s*(bill)\b/.test(s) ||
     // timeclock
-    /^\s*(clock\s+in|clock\s+out|break|drive|resume)\b/.test(s) ||
+    /^\s*(clock\s+in|clock\s+out|break|drive|resume|timesheet|undo)\b/.test(s) ||
     // job CRUD / context
-    /^\s*(create\s+job|new\s+job|change\s+job|active\s+job|set\s+active\s+job)\b/.test(s) ||
+    /^\s*(create\s+job|new\s+job|start\s+job|change\s+job|switch\s+job|pick\s+job|active\s+job|set\s+active)\b/.test(s) ||
     // task CRUD
-    /^\s*(task\s*[-:]|new\s+task|create\s+task|done\s+task|complete\s+task)\b/.test(s) ||
+    /^\s*(task\b|my\s+tasks\b|team\s+tasks\b|done\s*#?\d+)\b/.test(s) ||
     // support / admin
     /^\s*(support|help)\b/.test(s);
 
   if (!t || looksLikeCoreCommand) {
     // let the normal router handle it
   } else {
-    // ------------------------------------------------------------
     // 1) Profit / margin (job-specific)
-    // ------------------------------------------------------------
     const looksProfit =
       (/\bprofit\b/.test(s) ||
         /\bmargin\b/.test(s) ||
@@ -2155,17 +2144,13 @@ try {
         /\bhow much are we making\b/.test(s) ||
         /\bwhat am i making\b/.test(s) ||
         /\bmaking\b/.test(s)) &&
-      (
-        /\bjob\b/.test(s) ||
+      (/\bjob\b/.test(s) ||
         /(^|\s)#\d+\b/.test(s) ||
         /\bactive job\b/.test(s) ||
-        /\bon\s+[a-z0-9]/.test(s) ||
-        /\bprofit\s+\d+\b/.test(s)
-      );
+        /\bprofit\s+\d+\b/.test(s) ||
+        /\bon\s+[a-z0-9]/.test(s));
 
-    // ------------------------------------------------------------
-    // 2) Spend / revenue / cashflow totals (time presets)
-    // ------------------------------------------------------------
+    // 2) Time presets (MVP-safe totals)
     const hasTimePreset =
       /\btoday\b/.test(s) ||
       /\byesterday\b/.test(s) ||
@@ -2185,41 +2170,26 @@ try {
     const looksCashflowTotal =
       (/\bcash\s*flow\b/.test(s) || /\bcashflow\b/.test(s)) && hasTimePreset;
 
-    // ------------------------------------------------------------
     // 3) Vendor spend (MVP-safe)
-    // - "how much did i spend at home depot"
-    // - "spend at home depot this month"
-    // ------------------------------------------------------------
     const looksVendorSpend =
       (
         /\bhome depot\b/.test(s) ||
-        /\bat\s+[a-z0-9][a-z0-9\s&'.-]{2,}\b/.test(s) ||     // "at <vendor>"
-        /\bfrom\s+[a-z0-9][a-z0-9\s&'.-]{2,}\b/.test(s)     // "from <vendor>"
+        /\bat\s+[a-z0-9][a-z0-9\s&'.-]{2,}\b/.test(s) ||
+        /\bfrom\s+[a-z0-9][a-z0-9\s&'.-]{2,}\b/.test(s)
       ) &&
-      (
-        /\bspend\b/.test(s) ||
-        /\bspent\b/.test(s) ||
-        /\bhow much\b/.test(s) ||
-        /\btotal\b/.test(s)
-      );
+      (/\bspend\b/.test(s) || /\bspent\b/.test(s) || /\bhow much\b/.test(s) || /\btotal\b/.test(s));
 
-    // ------------------------------------------------------------
-    // 4) Jobs overview (list-ish questions)
-    // ------------------------------------------------------------
+    // 4) Jobs overview (query-ish, not CRUD)
     const looksJobsQuery =
       /\bjobs\b/.test(s) &&
       (/\blist\b/.test(s) || /\bshow\b/.test(s) || /\brecent\b/.test(s) || /\bopen\b/.test(s) || /\bactive\b/.test(s));
 
-    // ------------------------------------------------------------
-    // 5) Tasks overview (list-ish questions)
-    // ------------------------------------------------------------
+    // 5) Tasks overview (query-ish, not CRUD)
     const looksTasksQuery =
       /\btasks?\b/.test(s) &&
       (/\blist\b/.test(s) || /\bshow\b/.test(s) || /\bopen\b/.test(s) || /\bdue\b/.test(s) || /\btoday\b/.test(s) || /\bthis\s+week\b/.test(s));
 
-    // ------------------------------------------------------------
-    // 6) Top vendors / categories (optional MVP)
-    // ------------------------------------------------------------
+    // 6) Top vendors / categories (optional MVP-safe)
     const looksTopVendors =
       (/\btop\b/.test(s) || /\bbiggest\b/.test(s)) &&
       (/\bvendors?\b/.test(s) || /\bwhere am i spending\b/.test(s) || /\bwho am i paying\b/.test(s));
@@ -2228,9 +2198,6 @@ try {
       (/\btop\b/.test(s) || /\bbiggest\b/.test(s)) &&
       (/\bcategories?\b/.test(s) || /\bwhere am i spending\b/.test(s));
 
-    // ------------------------------------------------------------
-    // 7) Decide: intercept only “obvious insights”
-    // ------------------------------------------------------------
     const shouldIntercept =
       looksProfit ||
       looksSpendTotal ||
@@ -2256,7 +2223,6 @@ try {
 } catch (e) {
   console.warn('[INSIGHTS_V0_FASTPATH] skipped:', e?.message);
 }
-
 
 /* -----------------------------------------------------------------------
  * ✅ Quotes (MVP): route early (before PA router / other flows)
@@ -3002,7 +2968,7 @@ try {
 } catch {}
 
     const looksKpi = /^kpis?\s+for\b/.test(lc2);
-    const KPI_ENABLED = (process.env.FEATURE_FINANCE_KPIS || '1') === '1';
+    const KPI_ENABLED = (process.env.FEATURE_FINANCE_KPIS || '0') === '1';
     const hasSub = canUseAgent(req.ownerProfile);
 
     if (looksKpi && KPI_ENABLED && hasSub) {

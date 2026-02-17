@@ -1662,7 +1662,7 @@ router.post('*', async (req, res, next) => {
       crypto.createHash('sha256').update(`${req.from || ''}|${text}`).digest('hex').slice(0, 32);
 
     // ✅ Hard time command classification (uses lc we already computed)
-    const isHardTimeCommand = looksHardTimeCommand(lc);
+    let isHardTimeCommand = looksHardTimeCommand(lc);
     console.info('[ROUTER_HARD_TIME]', { lcN: lc.slice(0, 50), isHardTimeCommand });
 
     // -----------------------------------------------------------------------
@@ -2046,13 +2046,15 @@ if (hasPendingMedia && numMedia === 0) {
         try { if (typeof normalizeTranscriptMoney === 'function') t = normalizeTranscriptMoney(t); } catch {}
 
         // Put transcript into the inbound body
-        req.body.Body = t;
+req.body = req.body || {};
+req.body.Body = t;
 
-        // ✅ Recompute canonical text ONCE and store it (so everything downstream uses the same thing)
-        const newResolved = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
+// Recompute canonical text
+const newResolved = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
 req.body.ResolvedInboundText = newResolved;
-text = newResolved;
-lc = text.toLowerCase();
+
+// ✅ DO NOT mutate original `text`
+// Instead, update working variables later
 
 
         console.info('[WEBHOOK_MEDIA_TO_ROUTER_HEAD]', { head: String(t || '').slice(0, 12) });
@@ -2065,7 +2067,7 @@ lc = text.toLowerCase();
     text = String(req.body.ResolvedInboundText || text || '').trim();
     lc = text.toLowerCase();
 
-    isHardTimeCommand = looksHardTimeCommand(lc);
+    isHardTimeCommand = looksHardTimeCommand(lc2);
     console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc.slice(0, 50), isHardTimeCommand });
 
   try {
@@ -2085,9 +2087,9 @@ lc = text.toLowerCase();
   }
 }
 
-// ✅ From here on, reuse the canonical `text`
-const text2 = String(text || "");
-const lc2 = text2.toLowerCase();
+// ✅ From here on, reuse canonical working text
+let text2 = String(req.body.ResolvedInboundText || text || "").trim();
+let lc2 = text2.toLowerCase();
 const isPickerToken = looksLikeJobPickerReplyToken(text2);
 
 // --- LINK keyword: prevent RAG confusion (exact match only) ---

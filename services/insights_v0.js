@@ -41,7 +41,6 @@ function extractJobRefFromText(rawText) {
   const s = t.toLowerCase();
 
   // Prefer explicit "job ..."
-  // ex: "profit on job 18 main st", "margin job #12"
   let m =
     t.match(/\b(?:profit|margin|making)\b[\s\S]*?\bjob\b\s*([#]?\s*\d+)?\s*([\s\S]+)?$/i) ||
     t.match(/\b(?:profit|margin|making)\b[\s\S]*?\bjob\b\s*([\s\S]+)$/i);
@@ -68,9 +67,10 @@ function extractJobRefFromText(rawText) {
     const m2 = t.match(/\bon\b\s+([\s\S]+)$/i);
     if (m2) {
       const token = normalizeJobRefToken(m2[1] || '');
-      // If they said "on job 12", let job parsing handle it elsewhere; here treat as name only
       if (token && !/^job\b/i.test(token)) {
         const jobNo = /^\d+$/.test(token) ? Number(token) : null;
+        // NOTE: keep name as token for downstream resolution; we'll treat digits-only
+        // as a name-anchor (address) rather than job_no.
         return { jobNo, name: token, raw: token };
       }
     }
@@ -89,10 +89,34 @@ function extractJobRefFromText(rawText) {
   return { jobNo: null, name: null, raw: null };
 }
 
+/**
+ * Decide if a numeric token should be treated as:
+ * - a "job_no" (internal numbering like 1,2,3...) OR
+ * - an address-style anchor like 1556 (house #)
+ *
+ * Your observed bug (1556 -> 1559) strongly suggests:
+ * - job_no is NOT 1556
+ * - 1556 lives in the job NAME, not job_no
+ *
+ * So: treat 4+ digits as an address/name-anchor by default.
+ */
+function isLikelyAddressNumber(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return false;
+  // Heuristic: 4+ digit numbers are almost always address numbers in your UX.
+  return x >= 1000;
+}
+
+function escapeRegex(s) {
+  return String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Resolve job by:
-// 1) exact job_no if provided
+// 1) exact job_no ONLY when jobNo looks like internal numbering (not address numbers like 1556)
 // 2) exact name (case-insensitive)
-// 3) name fragment search (ILIKE %term%) INCLUDING numeric fragments like "1556"
+// 3) fragment search:
+//    - digits-only term (e.g., "1556") => MUST match job name starting with that number (word boundary)
+//    - otherwise => ILIKE %term%, with ranking
 async function resolveJobForInsight(pgClient, ownerId, ref) {
   const owner = String(ownerId || '').trim();
   if (!owner) return { ok: false, reason: 'missing_owner' };
@@ -102,8 +126,11 @@ async function resolveJobForInsight(pgClient, ownerId, ref) {
 
   const name = ref?.name ? String(ref.name).trim() : null;
 
-  // 1) Try job_no direct (NOTE: in your system job_no is the #1/#2 numbering)
-  if (jobNo != null) {
+  const hasNumeric = jobNo != null;
+  const numericLooksAddress = hasNumeric && isLikelyAddressNumber(jobNo);
+
+  // 1) Try job_no direct ONLY if it's likely internal numbering
+  if (jobNo != null && !numericLooksAddress) {
     try {
       const r = await pgClient.query(
         `
@@ -119,7 +146,8 @@ async function resolveJobForInsight(pgClient, ownerId, ref) {
   }
 
   // 2) Try exact name match if we have a name
-  if (name) {
+  // (Skip exact-name match when name is digits-only; that’s handled by numeric-anchor search below.)
+  if (name && !/^\d+$/.test(name)) {
     try {
       const r = await pgClient.query(
         `
@@ -136,11 +164,40 @@ async function resolveJobForInsight(pgClient, ownerId, ref) {
     } catch {}
   }
 
-  // 3) Name fragment fallback (key behavior)
-  // If they said only a number (e.g. "1556"), search for jobs containing "1556" in the name,
-  // and rank matches that START with the term above "contains".
+  // 3) Fragment fallback (numeric-safe)
   const term = (name || (jobNo != null ? String(jobNo) : '')).trim();
   if (term) {
+    const termIsDigits = /^\d{1,10}$/.test(term);
+
+    // ✅ Special: digits-only term (like "1556") => match name that STARTS with "1556" (word boundary)
+    if (termIsDigits) {
+      try {
+        const re = `^${escapeRegex(term)}\\b`; // e.g. ^1556\b
+
+        const r = await pgClient.query(
+          `
+          select id, job_no, coalesce(name, job_name) as job_name, active, status
+          from public.jobs
+          where owner_id::text = $1
+            and lower(coalesce(name, job_name)) ~ lower($2)
+          order by
+            active desc nulls last,
+            updated_at desc nulls last,
+            created_at desc
+          limit 5
+          `,
+          [owner, re]
+        );
+
+        const rows = r?.rows || [];
+        if (rows.length === 1) return { ok: true, job: rows[0], mode: 'name_startswith_digits' };
+        if (rows.length > 1) return { ok: false, reason: 'ambiguous', matches: rows, term };
+        // If none start with the number, treat as not_found (do not guess)
+      } catch {}
+      return { ok: false, reason: 'not_found' };
+    }
+
+    // ✅ Default: non-numeric term => contains search + ranking
     try {
       const r = await pgClient.query(
         `
@@ -186,11 +243,34 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
   const resolved = await resolveJobForInsight(pg, ownerId, ref);
 
   if (resolved?.ok && resolved?.job) {
-    return {
+    const out = {
       jobNo: Number(resolved.job.job_no),
       jobName: resolved.job.job_name || null,
       source: resolved.mode || 'resolved'
     };
+
+    // ✅ HARD MISMATCH BLOCK:
+    // If the user referenced a digits-only anchor (e.g., "1556") and we resolved a job whose
+    // NAME does not start with that anchor, do NOT answer (prevents 1556 -> 1559 forever).
+    const requestedDigits =
+      ref && (typeof ref.name === 'string' && /^\d{4,10}$/.test(ref.name.trim()))
+        ? ref.name.trim()
+        : (ref && ref.jobNo != null && isLikelyAddressNumber(ref.jobNo) ? String(ref.jobNo) : null);
+
+    if (requestedDigits) {
+      const jn = String(out.jobName || '').trim();
+      const startsOk = new RegExp(`^${escapeRegex(requestedDigits)}\\b`, 'i').test(jn);
+      if (!startsOk) {
+        return {
+          jobNo: null,
+          jobName: null,
+          source: 'not_found_explicit',
+          term: requestedDigits
+        };
+      }
+    }
+
+    return out;
   }
 
   // Ambiguous matches
@@ -205,8 +285,7 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
   }
 
   // ✅ CRITICAL:
-  // If the user explicitly referenced a job (like "1556" or "oak street"),
-  // DO NOT silently fall back to active job.
+  // If the user explicitly referenced a job, DO NOT silently fall back to active job.
   if (explicitRefProvided && !explicitActive) {
     return {
       jobNo: null,
@@ -230,7 +309,6 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
 
   return { jobNo: null, jobName: null, source: resolved?.reason || 'none' };
 }
-
 
 async function getProfitRowByJobNo(ownerId, jobNo) {
   if (!Number.isFinite(jobNo)) return null; // hard stop
@@ -266,8 +344,7 @@ function profitReply({ row, label }) {
   ].join('\n');
 }
 
-
-   async function answerProfitIntent({ ownerId, actorKey, text }) {
+async function answerProfitIntent({ ownerId, actorKey, text }) {
   const resolved = await resolveJobForProfit({ ownerId, actorKey, text });
 
   // ✅ If they asked for a specific job and we couldn't find it, never answer active job.
@@ -333,14 +410,12 @@ function profitReply({ row, label }) {
   };
 }
 
-
 function looksLikeProfitQuestion(text) {
   const s = lc(String(text || '').replace(/\s+/g, ' ').trim());
 
   const hasProfitIntent =
     /\bprofit\b|\bmargin\b|\bhow much am i making\b|\bhow much are we making\b|\bwhat am i making\b|\bmaking\b/.test(s);
 
-  // allow: "on oak st", "profit 1556", "profit on 1556"
   const hasJobAnchor =
     /\bjob\b|(^|\s)#\d+\b|\bactive job\b|\bon\s+[a-z0-9]/.test(s) || /\bprofit\s+\d+/.test(s);
 
@@ -348,25 +423,21 @@ function looksLikeProfitQuestion(text) {
 }
 
 function ymdInTZ(tz = 'America/Toronto') {
-  // Prefer pg helper if you have it (you do: todayInTZ)
   try {
     if (typeof pg.todayInTZ === 'function') return pg.todayInTZ(tz);
   } catch {}
-  // Fallback: UTC date (not ideal, but safe)
   return new Date().toISOString().slice(0, 10);
 }
 
-// Tiny helper: shift YYYY-MM-DD by deltaDays (negative allowed)
 function dateShift(ymd, deltaDays) {
   const s = String(ymd || '').trim();
   const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return null;
 
   const y = Number(m[1]);
-  const mo = Number(m[2]) - 1; // 0-indexed
+  const mo = Number(m[2]) - 1;
   const d = Number(m[3]);
 
-  // Work in UTC to avoid DST weirdness for pure date shifts
   const dt = new Date(Date.UTC(y, mo, d));
   dt.setUTCDate(dt.getUTCDate() + Number(deltaDays || 0));
   return dt.toISOString().slice(0, 10);
@@ -376,12 +447,12 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
   const raw = String(text || '').trim();
   const s = lc(raw);
 
-  // 1) Job profit / margin (KEEP EXACTLY as your current logic)
+  // 1) Job profit / margin
   if (looksLikeProfitQuestion(raw)) {
     return await answerProfitIntent({ ownerId, actorKey, text: raw });
   }
 
-  // 2) Business totals: spend / revenue / profit (today, last 7 days, last 30 days)
+  // 2) Business totals
   const wantsSpend = /\bspend\b|\bspent\b|\bexpenses?\b/.test(s);
   const wantsRevenue = /\brevenue\b|\bsales\b|\bearned\b/.test(s);
   const wantsProfit = /\bprofit\b|\bmargin\b|\bnet\b/.test(s);
@@ -390,24 +461,15 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
   const wants7 = /\blast\s*7\s*days\b|\bpast\s*7\s*days\b/.test(s);
   const wants30 = /\blast\s*30\s*days\b|\bpast\s*30\s*days\b/.test(s);
 
-  // Only trigger if they asked for a metric AND a supported window
   if ((wantsSpend || wantsRevenue || wantsProfit) && (wantsToday || wants7 || wants30)) {
     const tzUse = String(tz || '').trim() || 'America/Toronto';
-
-    // Date boundaries are DATE-based and inclusive on both ends.
-    // today: [today, today]
-    // last 7 days: [today-6, today]
-    // last 30 days: [today-29, today]
     const toIso = ymdInTZ(tzUse);
 
     let fromIso = toIso;
     if (wants30) fromIso = dateShift(toIso, -29);
     else if (wants7) fromIso = dateShift(toIso, -6);
-
-    // Safety fallback if dateShift failed for any reason
     if (!fromIso) fromIso = toIso;
 
-    // Expenses require tenantId mapping; revenues are ownerId in transactions
     const spendCents = await pg.sumExpensesCentsByRange({ ownerId, fromIso, toIso });
     const revenueCents = await pg.sumRevenueCentsByRange({ ownerId, fromIso, toIso });
     const profitCents = Number(revenueCents || 0) - Number(spendCents || 0);
@@ -424,11 +486,10 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
       route: 'insight',
       answer: lines.join('\n'),
       evidence: { sql: ['sumExpensesCentsByRange', 'sumRevenueCentsByRange'], facts_used: 2 }
-      
     };
   }
 
-  // 3) Legacy fallback (keep if you want; it should rarely be hit now)
+  // 3) Legacy fallback (optional)
   if (typeof pg.getTotalsForRange === 'function') {
     if (/\bspend\b/.test(s) && /\btoday\b/.test(s)) {
       const r = await pg.getTotalsForRange({
@@ -454,6 +515,5 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
     evidence: { sql: [], facts_used: 0 }
   };
 }
-
 
 module.exports = { answerInsightV0 };

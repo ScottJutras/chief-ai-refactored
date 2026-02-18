@@ -1178,9 +1178,25 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const amountCents = Number(opts.amount_cents ?? opts.amountCents ?? 0) || 0;
   const amountMaybe = opts.amount;
 
-  let source = String(opts.source || '').trim() || 'Unknown';
-  source = normalizeVendorSource(source); // ✅ right here
+    let source = String(opts.source || '').trim() || 'Unknown';
 
+  const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
+
+  // ✅ Normalize + diagnose bad sources in ONE place (before dedupe + insert)
+  const sourceRaw = source;
+  source = normalizeVendorSource(source);
+
+  const lcRaw = String(sourceRaw || '').trim().toLowerCase();
+  if (lcRaw.startsWith('job ') || lcRaw === 'on' || lcRaw === 'off') {
+    console.warn('[TXN_SOURCE_GARBAGE]', {
+      kind,
+      owner_id: owner,
+      source_raw: sourceRaw,
+      source_norm: source,
+      description: String(description || '').slice(0, 80),
+      source_msg_id: sourceMsgId
+    });
+  }
 
   const jobRef = opts.job == null ? null : String(opts.job).trim() || null;
 
@@ -1194,23 +1210,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
   const category = opts.category == null ? null : String(opts.category).trim() || null;
   const userName = opts.user_name ?? opts.userName ?? null;
-  const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
-
-// ✅ Normalize + diagnose bad sources in ONE place
-const sourceRaw = source;
-source = normalizeVendorSource(source);
-
-if (String(sourceRaw || '').toLowerCase().startsWith('job ') || String(sourceRaw || '').toLowerCase() === 'on') {
-  console.warn('[TXN_SOURCE_GARBAGE]', {
-    kind,
-    owner_id: owner,              // ✅ your variable is "owner" here
-    source_raw: sourceRaw,
-    source_norm: source,
-    description: String(description || '').slice(0, 80),
-    source_msg_id: sourceMsgId
-  });
-}
-
   // ✅ media asset id: UUID or null only
   const mediaAssetIdRaw = opts.media_asset_id ?? opts.mediaAssetId ?? opts.mediaAssetID ?? null;
   const mediaAssetId =
@@ -3668,11 +3667,20 @@ function normalizeCategoryString(category) {
 }
 
 function normalizeVendorSource(source) {
-  const s = String(source || '').trim();
+  let s = String(source || '').trim().replace(/\s+/g, ' ');
   const lc = s.toLowerCase();
   if (!s) return 'Unknown';
   if (lc === 'on' || lc === 'off') return 'Unknown';
   if (lc.startsWith('job ')) return 'Unknown';
+
+  // optional alias map
+  const ALIASES = {
+    'rona': 'RONA',
+    'the home depot': 'Home Depot',
+    'home depot': 'Home Depot',
+  };
+  s = ALIASES[lc] || s;
+
   if (s.length > 80) return s.slice(0, 80);
   return s;
 }
@@ -3682,11 +3690,12 @@ async function normalizeVendorName(_ownerId, vendor) {
   return normalizeVendorSource(vendor);
 }
 
+
 async function upsertCategoryRule({ ownerId, kind = 'expense', vendor, keyword = null, category, weight = 10 } = {}) {
   const owner = String(ownerId || '').replace(/\D/g, '');
   const k = String(kind || 'expense').trim() || 'expense';
 
-  const vendorNorm = vendor ? normalizeVendorString(vendor) : null;
+  const vendorNorm = vendor ? normalizeVendorSource(vendor) : null;
   const kw = keyword ? String(keyword).trim().toLowerCase() : null;
 
   const cat = normalizeCategoryString(category);
@@ -3743,7 +3752,7 @@ async function getCategorySuggestion(ownerId, kind = 'expense', vendor, itemText
   if (!(await detectCategoryRulesTable())) return null;
 
   const k = String(kind || 'expense').trim() || 'expense';
-  const vendorNorm = vendor ? normalizeVendorString(vendor) : null;
+  const vendorNorm = vendor ? normalizeVendorSource(vendor) : null;
   const text = String(itemText || '').toLowerCase();
 
   try {

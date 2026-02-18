@@ -1178,7 +1178,9 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const amountCents = Number(opts.amount_cents ?? opts.amountCents ?? 0) || 0;
   const amountMaybe = opts.amount;
 
-  const source = String(opts.source || '').trim() || 'Unknown';
+  let source = String(opts.source || '').trim() || 'Unknown';
+  source = normalizeVendorSource(source); // ✅ right here
+
 
   const jobRef = opts.job == null ? null : String(opts.job).trim() || null;
 
@@ -1193,6 +1195,21 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const category = opts.category == null ? null : String(opts.category).trim() || null;
   const userName = opts.user_name ?? opts.userName ?? null;
   const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
+
+// ✅ Normalize + diagnose bad sources in ONE place
+const sourceRaw = source;
+source = normalizeVendorSource(source);
+
+if (String(sourceRaw || '').toLowerCase().startsWith('job ') || String(sourceRaw || '').toLowerCase() === 'on') {
+  console.warn('[TXN_SOURCE_GARBAGE]', {
+    kind,
+    owner_id: owner,              // ✅ your variable is "owner" here
+    source_raw: sourceRaw,
+    source_norm: source,
+    description: String(description || '').slice(0, 80),
+    source_msg_id: sourceMsgId
+  });
+}
 
   // ✅ media asset id: UUID or null only
   const mediaAssetIdRaw = opts.media_asset_id ?? opts.mediaAssetId ?? opts.mediaAssetID ?? null;
@@ -3650,34 +3667,19 @@ function normalizeCategoryString(category) {
   return s.replace(/\s+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-function normalizeVendorString(v) {
-  let s = String(v || '').trim();
-  s = s.replace(/\s+/g, ' ');
-  if (!s) return 'Unknown Store';
-
-  s = s.replace(/\s+#\d+$/i, '');
-  s = s.replace(/\s+(inc|ltd|limited)\.?$/i, '');
-  s = s.trim();
-
-  const key = s.toLowerCase();
-  const ALIASES = {
-    'home depot': 'Home Depot',
-    'the home depot': 'Home Depot',
-    homedepot: 'Home Depot',
-    'convoy supply': 'Convoy Supply',
-    convoy: 'Convoy Supply',
-    rona: 'RONA',
-    lowes: "Lowe's",
-    'lowe’s': "Lowe's",
-    gentek: 'Gentek',
-    gentech: 'Gentek'
-  };
-
-  return ALIASES[key] || s;
+function normalizeVendorSource(source) {
+  const s = String(source || '').trim();
+  const lc = s.toLowerCase();
+  if (!s) return 'Unknown';
+  if (lc === 'on' || lc === 'off') return 'Unknown';
+  if (lc.startsWith('job ')) return 'Unknown';
+  if (s.length > 80) return s.slice(0, 80);
+  return s;
 }
 
+
 async function normalizeVendorName(_ownerId, vendor) {
-  return normalizeVendorString(vendor);
+  return normalizeVendorSource(vendor);
 }
 
 async function upsertCategoryRule({ ownerId, kind = 'expense', vendor, keyword = null, category, weight = 10 } = {}) {

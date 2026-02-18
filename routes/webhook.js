@@ -2171,6 +2171,7 @@ if (lc2_clean === 'link') {
  * ----------------------------------------------------------------------- */
 try {
   const { answerInsightV0 } = require('../services/insights_v0');
+  const { sendJobPickList } = require('../handlers/commands/expense');
 
   const t = String(text2 || '').trim();
   const s = t.toLowerCase();
@@ -2267,15 +2268,56 @@ try {
       looksTopCategories;
 
     if (shouldIntercept) {
-      const out = await answerInsightV0({
-        ownerId: req.ownerId,
-        actorKey: req.actorKey || req.from,
-        text: t,
-        tz: req.tz || 'America/Toronto'
-      });
+  const out = await answerInsightV0({
+    ownerId: req.ownerId,
+    actorKey: req.actorKey || req.from,
+    text: t,
+    tz: req.tz || 'America/Toronto'
+  });
 
-      if (out?.answer) return ok(res, out.answer);
-    }
+  // ✅ NEW: route-aware handling
+  if (out?.route === 'picker' && out?.picker?.kind === 'job_picker') {
+    const fromPhone = String(req.from || '').trim();
+    const ownerId = String(req.ownerId || '').trim();
+
+    const userProfile = req.userProfile || req.profile || req.actorProfile || null;
+
+    const paUserId =
+      (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(req.waId || req.from)) ||
+      String(req.waId || req.from || '').replace(/\D/g, '');
+
+    const pickUserId = paUserId;
+
+    const stableMsgId =
+      String(req.messageSid || req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() ||
+      `${paUserId}:${Date.now()}`;
+
+    const jobOptions = Array.isArray(out.picker.jobOptions) ? out.picker.jobOptions : [];
+
+    await sendJobPickList({
+      fromPhone,
+      ownerId,
+      userProfile,
+      confirmFlowId: stableMsgId,
+      jobOptions,
+      paUserId,
+      pickUserId,
+      page: 0,
+      pageSize: 8,
+      context: out.picker.context || 'profit_jobpick',
+      confirmDraft: null,
+      resolveAttempts: 0
+    });
+
+    // ✅ IMPORTANT: don’t also send a text reply
+    // Prefer empty TwiML so Twilio doesn't show a blank message
+    return sendTwiml(res, twimlEmpty());
+    // If you don't have sendTwiml/twimlEmpty here, use whatever your other branches use
+  }
+
+  // Normal text response path
+  if (out?.answer) return ok(res, out.answer);
+}
   }
 } catch (e) {
   console.warn('[INSIGHTS_V0_FASTPATH] skipped:', e?.message);

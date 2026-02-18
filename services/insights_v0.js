@@ -362,38 +362,78 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
     jobName: resolved?.jobName ?? null
   });
 
-  // If they asked for a specific job and we couldn't find it, never answer active job.
+  // Helper: build job options for picker (keeps this function deterministic)
+  async function buildJobPickerPayload({ term, context }) {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 200));
+    const jobOptions = jobs
+  .map((j) => ({
+    id: j?.id || j?.job_id || null,
+    job_id: j?.id || j?.job_id || null,
+    job_no: Number(j?.job_no ?? j?.jobNo ?? null) || null,
+    name: getJobDisplayName(j) || j?.name || j?.job_name || null
+  }))
+  .filter((x) => x.job_no || x.name);
+    return {
+      kind: 'job_picker',
+      context: context || 'profit_jobpick',
+      term: String(term || '').trim() || null,
+      jobOptions
+    };
+  }
+
+  // ------------------------------------------------------------
+  // ✅ UX BONUS: if explicit job not found -> send job picker
+  // ------------------------------------------------------------
   if (resolved?.source === 'not_found_explicit') {
     const term = String(resolved.term || '').trim();
+
+    // Return a "picker route" so the WhatsApp layer can send the list
     return {
       ok: true,
-      route: 'clarify',
+      route: 'picker',
+      picker: await buildJobPickerPayload({ term, context: 'profit_not_found' }),
       answer:
         `I couldn’t find a job matching "${term}".\n\n` +
-        `Try:\n` +
-        `• “list jobs”\n` +
-        `• “profit on 1556”\n` +
-        `• “profit on Oak Street Re-roof”\n` +
-        `• “profit on active job”`,
-      evidence: { sql: [], facts_used: 0 }
+        `Tap the job from the list so I can calculate profit/margin.`,
+      evidence: { sql: ['listOpenJobsDetailed'], facts_used: 0 }
     };
   }
 
-  // Ambiguous fragment
+  // ------------------------------------------------------------
+  // ✅ UX BONUS: ambiguous -> send job picker (not a text list)
+  // ------------------------------------------------------------
   if (resolved?.source === 'ambiguous' && Array.isArray(resolved.matches) && resolved.matches.length) {
-    const lines = resolved.matches.slice(0, 5).map((j) => `- #${j.job_no} ${j.job_name}`);
+    const term = String(resolved.term || '').trim();
+
+    // If resolveJobForProfit gave matches, prefer those first (tight list)
+    const matches = resolved.matches
+      .map((j) => ({
+        id: j?.id || j?.job_id || null,
+        job_id: j?.id || j?.job_id || null,
+        job_no: Number(j?.job_no ?? j?.jobNo ?? null) || null,
+        name: String(j?.job_name || j?.name || '').trim() || null
+      }))
+      .filter((x) => x.job_no || x.name);
+
     return {
       ok: true,
-      route: 'clarify',
+      route: 'picker',
+      picker: {
+        kind: 'job_picker',
+        context: 'profit_ambiguous',
+        term: term || null,
+        // provide tight options first; WhatsApp layer can fall back to full job list if needed
+        jobOptions: matches
+      },
       answer:
-        `I found a few jobs matching "${resolved.term}". Which one?\n\n` +
-        lines.join('\n') +
-        `\n\nReply like: “profit on job #<number>”.`,
+        `I found a few jobs matching "${term}". Tap the right one so I can calculate profit/margin.`,
       evidence: { sql: [], facts_used: 0 }
     };
   }
 
+  // ------------------------------------------------------------
   // Deterministic answer if we have a job_no
+  // ------------------------------------------------------------
   if (Number.isFinite(Number(resolved?.jobNo))) {
     const requestedJobNo = Number(resolved.jobNo);
     const row = await getProfitRowByJobNo(ownerId, requestedJobNo);
@@ -421,11 +461,11 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
         };
       }
 
-      // ✅ SAFETY GUARD #2: if user typed an address-style prefix (e.g. "1556"),
-      // ensure returned job_name starts with that prefix. This catches corrupted profit rows
-      // where job_no matches but job_name is wrong.
+      // ✅ SAFETY GUARD #2: address-style prefix must match job_name head (if user typed digits)
       const raw = String(text || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
-      const m = raw.match(/\bprofit\b[\s\S]*?\bon\s+(\d{2,10})\b/i) || raw.match(/^\s*profit\s+(\d{2,10})\b/i);
+      const m =
+        raw.match(/\bprofit\b[\s\S]*?\bon\s+(\d{2,10})\b/i) ||
+        raw.match(/^\s*profit\s+(\d{2,10})\b/i);
       const requestedDigits = m ? String(m[1] || '').trim() : null;
 
       if (requestedDigits) {
@@ -469,14 +509,19 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
     };
   }
 
-  // Final fallback (no explicit job ref and no active job)
+  // ------------------------------------------------------------
+  // Final fallback: no explicit job ref and no active job
+  // ✅ UX BONUS: send picker here too
+  // ------------------------------------------------------------
   return {
     ok: true,
-    route: 'clarify',
-    answer: `Which job are you asking about? Reply like “profit on 1556”, “profit on Oak Street”, or “profit on active job”.`,
-    evidence: { sql: [], facts_used: 0 }
+    route: 'picker',
+    picker: await buildJobPickerPayload({ term: null, context: 'profit_no_job' }),
+    answer: `Which job are you asking about? Tap a job from the list.`,
+    evidence: { sql: ['listOpenJobsDetailed'], facts_used: 0 }
   };
 }
+
 
 function looksLikeProfitQuestion(text) {
   const s = lc(String(text || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim());

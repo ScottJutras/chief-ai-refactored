@@ -3079,6 +3079,16 @@ function deterministicExpenseParse(input, userProfile) {
     jobName: jobName || null
   };
 }
+const backstop = deterministicExpenseParse(input, userProfile);
+
+console.info('[EXPENSE_PARSE_RESULT_BACKSTOP]', {
+  hasBackstop: !!backstop,
+  amount: backstop?.amount ?? null,
+  store: backstop?.store ?? backstop?.vendor ?? null,
+  date: backstop?.date ?? null,
+  job: backstop?.jobName ?? backstop?.job ?? null,
+  head: String(input || '').slice(0, 120)
+});
 
 
 
@@ -6194,6 +6204,16 @@ if (looksLikeReceiptText(input)) {
     const sourceText0 = String(backstop?.originalText || backstop?.draftText || input || '').trim();
     const data0 = normalizeExpenseData(backstop, userProfile, sourceText0);
 
+console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
+  amount: data0?.amount ?? null,
+  amount_cents: data0?.amount_cents ?? null,
+  store: data0?.store ?? null,
+  date: data0?.date ?? null,
+  item: data0?.item ?? null,
+  jobName: data0?.jobName ?? null
+});
+
+    
     data0.store = await normalizeVendorName(ownerId, data0.store);
 
     if (isUnknownItem(data0.item)) {
@@ -6517,7 +6537,9 @@ const missingCore =
   data.store === 'Unknown Store';
 
 // If AI gave a helpful reply AND we truly have nothing usable, show it
-if (aiReply && missingCore) return out(twimlText(aiReply), false);
+if (aiReply && missingCore) {
+  return out(twimlText(aiReply), false);
+}
 
 // If still missing core after deterministic attempt, show a clear fallback
 if (missingCore) {
@@ -6526,22 +6548,42 @@ if (missingCore) {
     false
   );
 }
-  } catch (error) {
-    console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
-      stack: error?.stack,
-      code: error?.code,
-      detail: error?.detail,
-      constraint: error?.constraint
-    });
 
-    return out(twimlText('⚠️ Error logging expense. Please try again.'), false);
-  } finally {
-    try {
-      const lock = require('../../middleware/lock');
-      if (lock?.releaseLock) await lock.releaseLock(lockKey);
-    } catch {}
-  }
+// 🔒 HARD FALLBACK: if we got here, we fell through without replying
+// (This should be *very rare*—it means a future refactor forgot to return.)
+console.warn('[EXPENSE_FALLTHROUGH_NO_REPLY]', {
+  ownerId,
+  paUserId,
+  sourceMsgId: inboundTwilioMeta?.MessageSid || null,
+  head: String(rawInboundText || input || '').slice(0, 120)
+});
+
+return out(
+  twimlText(
+    [
+      "I couldn’t parse that expense yet.",
+      "Try: expense $48 from RONA for plywood",
+      'Or reply: "help expense"'
+    ].join('\n')
+  ),
+  false
+);
+
+} catch (error) {
+  console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
+    stack: error?.stack,
+    code: error?.code,
+    detail: error?.detail,
+    constraint: error?.constraint
+  });
+
+  return out(twimlText('⚠️ Error logging expense. Please try again.'), false);
+} finally {
+  try {
+    const lock = require('../../middleware/lock');
+    if (lock?.releaseLock) await lock.releaseLock(lockKey);
+  } catch {}
 } // end handleExpense
-
+}
 module.exports = { handleExpense };
 

@@ -2885,7 +2885,7 @@ function extractMoneyToken(input) {
   // 1) Strong signal: $ amount (allow comma OR space grouping)
   // Examples: $2000, $2,000, $2 000, $2000.50, -$2000
   const moneyMatches = [];
-  const reDollar = /(?:^|[^\w])-\s*\$?\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?=$|[^\w])/g;
+  const reDollar = /(?:^|[^\w])(?:-\s*)?\$?\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?=$|[^\w])/g;
   let m;
   while ((m = reDollar.exec(s)) !== null) {
     const tok = m[1];

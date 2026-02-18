@@ -4181,25 +4181,28 @@ const pickPA = await getPA({
 
 if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payload.jobOptions.length) {
   const tok = normalizeDecisionToken(rawInboundText);
-// ✅ INSERT HERE:
-if (/^\s*more\s*$/i.test(inboundText)) {
-  const nextPage = Number(pa.payload?.page || 0) + 1;
+// ✅ "more" paging for job picker (MUST use rawInboundText + pickPA)
+if (/^\s*more\s*$/i.test(String(rawInboundText || '').trim())) {
+  const nextPage = Number(pickPA?.payload?.page || 0) + 1;
 
-  return await sendJobPickList({
+  await sendJobPickList({
     fromPhone,
     ownerId,
     userProfile,
-    confirmFlowId: pa.payload?.confirmFlowId,
-    jobOptions: pa.payload?.jobOptions || [],
+    confirmFlowId: pickPA?.payload?.confirmFlowId,
+    jobOptions: pickPA?.payload?.jobOptions || [],
     paUserId,
-    pickUserId,
+    pickUserId, // ✅ your canonical pick key (should already be defined earlier)
     page: nextPage,
-    pageSize: pa.payload?.pageSize || 10,
-    context: pa.payload?.context || 'jobpick',
-    confirmDraft: pa.payload?.confirmDraft || null,
-    resolveAttempts: pa.payload?.resolveAttempts || 0
+    pageSize: pickPA?.payload?.pageSize || 10,
+    context: pickPA?.payload?.context || 'jobpick',
+    confirmDraft: pickPA?.payload?.confirmDraft || null,
+    resolveAttempts: pickPA?.payload?.resolveAttempts || 0
   });
+
+  return out(twimlEmpty(), true);
 }
+
 
   const isConfirmControlToken =
     tok === 'yes' ||

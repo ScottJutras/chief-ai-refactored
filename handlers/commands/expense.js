@@ -792,15 +792,11 @@ function scoreJobMatch(needleNorm, jobNorm) {
 /* ---------------- misc helpers ---------------- */
 async function bestEffortResolveJobFromText(ownerId, text) {
   const raw = String(text || '').trim();
+  if (!raw) return null;
 
-  // Pull the "job ..." segment if present
-  // Supports:
-  // - "job: 1556 Medway Park Dr"
-  // - "job 1556 Medway Park Dr"
-  // - "Job1556 Medway Park Dr"
   const m =
     raw.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
-    raw.match(/\bjob\s*(\d{1,6}\b[^\n\r]*)$/i); // catches Job1556 ...
+    raw.match(/\bjob\s*(\d{1,6}\b[^\n\r]*)$/i);
 
   const needle = String(m?.[1] || '').trim();
   if (!needle) return null;
@@ -808,30 +804,92 @@ async function bestEffortResolveJobFromText(ownerId, text) {
   const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 200));
   if (!jobs.length) return null;
 
+  // ------------------------------------------------------------
+  // 1) STRONG PATH: "job 9" / "job #9" / "job no 9" => exact job_no
+  // ------------------------------------------------------------
+  const mJobNo =
+    needle.match(/^\s*(?:#|no\.?\s*)?(\d{1,4})\s*$/i) ||
+    needle.match(/^\s*(\d{1,4})\s*$/);
+
+  if (mJobNo?.[1]) {
+    const jobNo = Number(mJobNo[1]);
+    if (Number.isFinite(jobNo) && jobNo > 0) {
+      const exact = jobs.find((j) => Number(j?.job_no ?? j?.jobNo) === jobNo) || null;
+      if (exact) {
+        const chosenJobId = asUuidOrNull(exact?.job_id) || asUuidOrNull(exact?.id) || null;
+        return {
+          jobName: getJobDisplayName(exact),
+          jobSource: 'edited',
+          job_no: Number(exact?.job_no ?? exact?.jobNo ?? null) || null,
+          job_id: chosenJobId
+        };
+      }
+      return null; // do not fuzzy-guess a numeric-only intent
+    }
+  }
+
+  // ------------------------------------------------------------
+  // 2) FUZZY PATH: match by name/address, but with guardrails
+  // ------------------------------------------------------------
+  const prefixDigits = (needle.match(/^\s*(\d{3,6})\b/) || [])[1] || null;
+
   const needleNorm = normalizeNeedle(needle);
 
   let best = null;
   let bestScore = 0;
+  let bestPrefixMatch = false;
 
   for (const j of jobs) {
     const name = String(getJobDisplayName(j) || j?.name || '').trim();
+    if (!name) continue;
+
     const jNorm = normalizeNeedle(name);
-    const sc = scoreJobMatch(needleNorm, jNorm);
+
+    let sc = scoreJobMatch(needleNorm, jNorm);
+
+    let prefixMatch = false;
+    if (prefixDigits) {
+      const jPrefix = (name.match(/^\s*(\d{3,6})\b/) || [])[1] || null;
+      prefixMatch = !!(jPrefix && jPrefix === prefixDigits);
+      if (prefixMatch) sc += 15; // small boost, still bounded by thresholds below
+    }
+
     if (sc > bestScore) {
       bestScore = sc;
       best = j;
+      bestPrefixMatch = prefixMatch;
     }
   }
 
-  if (!best || bestScore < 40) return null;
+  if (!best) return null;
+
+  // --- Thresholds tuned to YOUR scoring function ---
+  //
+  // Without digits:
+  // - Accept >= 60 (needle includes job or strong partial), but reject token-overlap-only (42..)
+  //
+  // With digit prefix:
+  // - Prefer strong substring containment (>= 80) OR
+  // - allow >= 60 only if digit prefix matches exactly (prevents 1556 -> 1559 swaps)
+  //
+  const accept =
+    !prefixDigits
+      ? bestScore >= 60
+      : (bestScore >= 80) || (bestPrefixMatch && bestScore >= 60);
+
+  if (!accept) return null;
+
+  const chosenJobId = asUuidOrNull(best?.job_id) || asUuidOrNull(best?.id) || null;
 
   return {
     jobName: getJobDisplayName(best),
     jobSource: 'edited',
     job_no: Number(best?.job_no ?? best?.jobNo ?? null) || null,
-    job_id: best?.id || best?.job_id || null
+    job_id: chosenJobId
   };
 }
+
+
 
 
 /* =========================================================
@@ -932,6 +990,15 @@ function looksLikeOverhead(s) {
   const t = String(s || '').trim().toLowerCase();
   return t === 'overhead' || t === 'oh';
 }
+
+function asUuidOrNull(v) {
+  const s = String(v || '').trim();
+  if (!s) return null;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s)
+    ? s
+    : null;
+}
+
 
 function normalizeJobAnswer(text) {
   let s = String(text || '').trim();
@@ -1065,11 +1132,12 @@ function inferItemFromOnPattern(text) {
 
 function normalizeDecisionToken(input) {
   const s = String(input || '').trim().toLowerCase();
+  if (!s) return null;
 
   // exact / common taps
   if (s === 'yes' || s === 'y' || s === 'confirm' || s === '✅ yes' || s === '✅yes') return 'yes';
   if (s === 'edit') return 'edit';
-  if (s === 'cancel' || s === 'stop' || s === 'no') return 'cancel';
+  if (s === 'cancel' || s === 'stop') return 'cancel';
   if (s === 'skip') return 'skip';
 
   // change job
@@ -1082,15 +1150,17 @@ function normalizeDecisionToken(input) {
 
   // "more" (job list paging)
   if (s === 'more' || s === 'more jobs' || s === 'more jobs…') return 'more';
+  if (/\bmore\b/.test(s) && s.length <= 24) return 'more'; // handles "more please"
 
-  // soft contains (conservative)
-  if (/\byes\b/.test(s) && s.length <= 20) return 'yes';
-  if (/\bedit\b/.test(s) && s.length <= 20) return 'edit';
-  if (/\bcancel\b/.test(s) && s.length <= 20) return 'cancel';
-  if (/\bskip\b/.test(s) && s.length <= 20) return 'skip';
+  // soft contains (safe only)
+  // ⚠️ avoid soft "yes"/"cancel" to prevent accidental confirmation/cancel on natural sentences
+  if (/\bedit\b/.test(s) && s.length <= 24) return 'edit';
+  if (/\bskip\b/.test(s) && s.length <= 24) return 'skip';
 
-  return s;
+  // Not a control token
+  return null;
 }
+
 
 function formatDisplayDate(isoDate, tz = 'America/Toronto') {
   const s = String(isoDate || '').trim();
@@ -1185,6 +1255,24 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
   return lines.join('\n');
 }
 
+function isStalePickerTap(pickPA, inbound) {
+  // We only enforce staleness when Twilio tells us what message the user replied to.
+  // If Twilio doesn’t send it (some client cases), we do NOT block — but we log.
+  const expected = pickPA?.payload?.lastPickerMsgSid || pickPA?.payload?.expectedPickerMsgSid || null;
+  const repliedTo = inbound?.OriginalRepliedMessageSid || inbound?.originalReplied || null;
+
+  if (!expected) return { stale: false, reason: null };
+
+  if (!repliedTo) {
+    return { stale: false, reason: 'no_replied_to_sid' };
+  }
+
+  if (String(expected) !== String(repliedTo)) {
+    return { stale: true, reason: 'replied_to_mismatch', expected, repliedTo };
+  }
+
+  return { stale: false, reason: null };
+}
 
 
 function getJobPickerSecret() {
@@ -2221,6 +2309,11 @@ function coerceJobixToJobno(raw, displayedJobNos) {
  * - Accepts jobno_<job_no>, job_<n>_<hash>, jobix_<ix>, "#1556", "J1556", "1556", "1" (page-local), name.
  * - Uses displayedJobNos when available to interpret index replies safely.
  * - ✅ Treats job_<n>_<hash> as INDEX ONLY (Twilio list), never job_no.
+ *
+ * MVP guardrails:
+ * - Pure numeric replies ("1") are treated as ROW INDEX first (when displayedJobNos exists),
+ *   then page-index fallback ONLY if displayedJobNos is missing AND the slice exists.
+ * - Index tokens (job_<ix>_<hash>, jobix_<ix>) FAIL-CLOSED if displayedJobNos is missing.
  */
 function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 10, displayedJobNos = null } = {}) {
   const raw = normalizeJobAnswer(input);
@@ -2234,15 +2327,26 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 10,
   const p = Math.max(0, Number(page || 0));
   const ps = Math.min(10, Math.max(1, Number(pageSize) || 10));
   const opts = Array.isArray(jobOptions) ? jobOptions : [];
-  const arr = Array.isArray(displayedJobNos) ? displayedJobNos : [];
+  const arr = Array.isArray(displayedJobNos) ? displayedJobNos : null;
 
   const findByJobNo = (jobNo) => {
     const n = Number(jobNo);
     if (!Number.isFinite(n)) return null;
-    return opts.find((j) => Number(j?.job_no) === n) || null;
+    return opts.find((j) => Number(j?.job_no ?? j?.jobNo) === n) || null;
   };
 
-  // --- A) jobno_123 (canonical) ---
+  // Helper: page slice lookup (least preferred; only used when arr missing and we truly must)
+  const findByRowIndexInPage = (ix1Based) => {
+    const ix = Number(ix1Based);
+    if (!Number.isFinite(ix) || ix <= 0) return null;
+    const start = p * ps;
+    const idx = start + (ix - 1);
+    const opt = opts[idx] || null;
+    if (opt && Number.isFinite(Number(opt?.job_no ?? opt?.jobNo))) return opt;
+    return null;
+  };
+
+  // --- A) jobno_123 (canonical job_no) ---
   let m = t0.match(/^jobno_(\d{1,10})$/i);
   if (m?.[1]) {
     const opt = findByJobNo(m[1]);
@@ -2250,25 +2354,17 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 10,
   }
 
   // --- B) Twilio list token: job_<ix>_<hash> (INDEX ONLY) ---
-  // Twilio sends Body/ListId like "job_2_abcd1234" where 2 == row index (1-based).
   m = t0.match(/^job_(\d{1,10})_[0-9a-z]+$/i);
   if (m?.[1]) {
     const ix = Number(m[1]);
     if (!Number.isFinite(ix) || ix <= 0) return null;
 
-    // Prefer displayed mapping
-    if (arr.length >= ix) {
-      const mappedJobNo = arr[ix - 1];
-      const opt = findByJobNo(mappedJobNo);
-      return opt ? { kind: 'job', job: opt } : null;
-    }
+    // ✅ FAIL-CLOSED if we don't have displayed mapping (prevents wrong-job assignment)
+    if (!arr || !arr.length || arr.length < ix) return null;
 
-    // Fallback: page-local index into opts (least preferred)
-    const start = p * ps;
-    const idx = start + (ix - 1);
-    const opt = opts[idx] || null;
-    if (opt && Number.isFinite(Number(opt?.job_no))) return { kind: 'job', job: opt };
-    return null;
+    const mappedJobNo = arr[ix - 1];
+    const opt = findByJobNo(mappedJobNo);
+    return opt ? { kind: 'job', job: opt } : null;
   }
 
   // --- C) jobix_5 (index token) ---
@@ -2277,20 +2373,34 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 10,
     const ix = Number(m[1]);
     if (!Number.isFinite(ix) || ix <= 0) return null;
 
-    if (arr.length >= ix) {
-      const mappedJobNo = arr[ix - 1];
-      const opt = findByJobNo(mappedJobNo);
-      if (opt) return { kind: 'job', job: opt };
-    }
+    // ✅ FAIL-CLOSED if displayed mapping missing
+    if (!arr || !arr.length || arr.length < ix) return null;
 
-    const start = p * ps;
-    const idx = start + (ix - 1);
-    const opt = opts[idx] || null;
-    if (opt && Number.isFinite(Number(opt?.job_no))) return { kind: 'job', job: opt };
-    return null;
+    const mappedJobNo = arr[ix - 1];
+    const opt = findByJobNo(mappedJobNo);
+    return opt ? { kind: 'job', job: opt } : null;
   }
 
-  // --- D) "#1556 ..." or "1556 ..." or "J1556 ..." ---
+  // --- D) Pure numeric reply "1" ---
+  // ✅ ROW INDEX FIRST when displayedJobNos exists, because that's what users mean in picker context.
+  if (/^\d+$/.test(t0)) {
+    const n = Number(t0);
+    if (!Number.isFinite(n) || n <= 0) return null;
+
+    if (arr && arr.length >= n) {
+      const mappedJobNo = arr[n - 1];
+      const opt = findByJobNo(mappedJobNo);
+      if (opt) return { kind: 'job', job: opt };
+      return null;
+    }
+
+    // If no displayed mapping, treat as page row index (least preferred)
+    const opt = findByRowIndexInPage(n);
+    return opt ? { kind: 'job', job: opt } : null;
+  }
+
+  // --- E) "#1556 ..." or "J1556 ..." or "1556 ..." => job_no intent ---
+  // This runs AFTER the pure-numeric row-index logic.
   m = t0.match(/^(?:#\s*)?(\d{1,10})\b/);
   if (m?.[1]) {
     const opt = findByJobNo(m[1]);
@@ -2303,24 +2413,6 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 10,
     if (opt) return { kind: 'job', job: opt };
   }
 
-  // --- E) Pure numeric reply "1" (displayed row / index) ---
-  if (/^\d+$/.test(t0)) {
-    const n = Number(t0);
-    if (!Number.isFinite(n) || n <= 0) return null;
-
-    if (arr.length >= n) {
-      const mappedJobNo = arr[n - 1];
-      const opt = findByJobNo(mappedJobNo);
-      if (opt) return { kind: 'job', job: opt };
-    }
-
-    const start = p * ps;
-    const idx = start + (n - 1);
-    const opt = opts[idx] || null;
-    if (opt && Number.isFinite(Number(opt?.job_no))) return { kind: 'job', job: opt };
-    return null;
-  }
-
   // --- F) Name match ---
   const lc = t0.toLowerCase();
   const opt =
@@ -2328,10 +2420,11 @@ function resolveJobOptionFromReply(input, jobOptions, { page = 0, pageSize = 10,
     opts.find((j) => String(j?.name || j?.job_name || '').trim().toLowerCase().startsWith(lc.slice(0, 24))) ||
     null;
 
-  if (opt && Number.isFinite(Number(opt?.job_no))) return { kind: 'job', job: opt };
+  if (opt && Number.isFinite(Number(opt?.job_no ?? opt?.jobNo))) return { kind: 'job', job: opt };
 
   return null;
 }
+
 
 
 
@@ -3730,6 +3823,10 @@ async function handleExpense(
     hasIRJ: !!inboundTwilioMeta?.InteractiveResponseJson
   });
 
+  // ✅ Canonical inbound signal for expense flow.
+  // Some older branches still referenced `inboundText` — alias it to prevent crashes.
+  const inboundText = rawInboundText;
+
   const raw = String(rawInboundText || '').trim();
 
   function strictDecisionToken(s) {
@@ -4181,28 +4278,6 @@ const pickPA = await getPA({
 
 if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payload.jobOptions.length) {
   const tok = normalizeDecisionToken(rawInboundText);
-// ✅ "more" paging for job picker (MUST use rawInboundText + pickPA)
-if (/^\s*more\s*$/i.test(String(rawInboundText || '').trim())) {
-  const nextPage = Number(pickPA?.payload?.page || 0) + 1;
-
-  await sendJobPickList({
-    fromPhone,
-    ownerId,
-    userProfile,
-    confirmFlowId: pickPA?.payload?.confirmFlowId,
-    jobOptions: pickPA?.payload?.jobOptions || [],
-    paUserId,
-    pickUserId, // ✅ your canonical pick key (should already be defined earlier)
-    page: nextPage,
-    pageSize: pickPA?.payload?.pageSize || 10,
-    context: pickPA?.payload?.context || 'jobpick',
-    confirmDraft: pickPA?.payload?.confirmDraft || null,
-    resolveAttempts: pickPA?.payload?.resolveAttempts || 0
-  });
-
-  return out(twimlEmpty(), true);
-}
-
 
   const isConfirmControlToken =
     tok === 'yes' ||
@@ -4287,35 +4362,87 @@ if (/^\s*more\s*$/i.test(String(rawInboundText || '').trim())) {
         });
       }
 
-      // ✅ NEW: Stale picker protection (message reply mismatch)
-      // Only enforce when this looks like a picker tap (don’t block typed messages)
-      const expectedPickerMsgSid = String(pickPA?.payload?.lastPickerMsgSid || '').trim() || null;
-      const repliedToMsgSid = String(inboundTwilioMeta?.OriginalRepliedMessageSid || '').trim() || null;
+      // ✅ "more" paging MUST happen BEFORE picker tap parsing / stale-click checks
+      if (tok === 'more' || /^\s*more\s*$/i.test(String(rawInboundText || '').trim())) {
+        if (!hasMore) {
+          return out(twimlText('No more jobs to show. Tap a job, or reply with a job name.'), false);
+        }
 
-      if (looksLikePickerTap && expectedPickerMsgSid && repliedToMsgSid && expectedPickerMsgSid !== repliedToMsgSid) {
-        console.warn('[JOB_PICK_STALE_CLICK]', {
-          expectedPickerMsgSid,
-          repliedToMsgSid,
-          rawInput,
-          listTitle: inboundTwilioMeta?.ListTitle || null,
-          listId: inboundTwilioMeta?.ListId || null
-        });
+        const nextPage = Number(page) + 1;
 
-        // Resend latest picker page 0 (keeps state aligned with newest list)
         return await sendJobPickList({
           fromPhone,
           ownerId,
           userProfile,
-          confirmFlowId: effectiveConfirmFlowId,
+          confirmFlowId: confirmFlowId || effectiveConfirmFlowId,
           jobOptions,
           paUserId,
           pickUserId: canonicalUserKey,
-          page: 0,
-          pageSize: 8,
-          context: 'expense_jobpick',
-          confirmDraft
+          page: nextPage,
+          pageSize,
+          context: pickPA?.payload?.context || 'expense_jobpick',
+          confirmDraft,
+          resolveAttempts: pickPA?.payload?.resolveAttempts || 0
         });
       }
+
+      // ✅ NEW: Stale picker protection (message reply mismatch)
+// Only enforce when this looks like a picker tap (don’t block typed messages)
+const expectedPickerMsgSid = String(pickPA?.payload?.lastPickerMsgSid || '').trim() || null;
+const repliedToMsgSid = String(inboundTwilioMeta?.OriginalRepliedMessageSid || '').trim() || null;
+
+if (looksLikePickerTap && expectedPickerMsgSid) {
+  // ✅ If Twilio did NOT include the replied-to SID, fail-closed (prevents stale taps from history)
+  if (!repliedToMsgSid) {
+    console.warn('[JOB_PICK_STALE_CLICK_NO_REPLY_SID]', {
+      expectedPickerMsgSid,
+      rawInput,
+      listTitle: inboundTwilioMeta?.ListTitle || null,
+      listId: inboundTwilioMeta?.ListId || null
+    });
+
+    return await sendJobPickList({
+      fromPhone,
+      ownerId,
+      userProfile,
+      confirmFlowId: effectiveConfirmFlowId,
+      jobOptions,
+      paUserId,
+      pickUserId: canonicalUserKey,
+      page: 0,
+      pageSize: 8,
+      context: 'expense_jobpick',
+      confirmDraft
+    });
+  }
+
+  // ✅ Mismatch -> stale
+  if (expectedPickerMsgSid !== repliedToMsgSid) {
+    console.warn('[JOB_PICK_STALE_CLICK]', {
+      expectedPickerMsgSid,
+      repliedToMsgSid,
+      rawInput,
+      listTitle: inboundTwilioMeta?.ListTitle || null,
+      listId: inboundTwilioMeta?.ListId || null
+    });
+
+    // Resend latest picker page 0 (keeps state aligned with newest list)
+    return await sendJobPickList({
+      fromPhone,
+      ownerId,
+      userProfile,
+      confirmFlowId: effectiveConfirmFlowId,
+      jobOptions,
+      paUserId,
+      pickUserId: canonicalUserKey,
+      page: 0,
+      pageSize: 8,
+      context: 'expense_jobpick',
+      confirmDraft
+    });
+  }
+}
+
 
       console.info('[JOB_PICK_DEBUG]', {
         input,
@@ -4330,7 +4457,7 @@ if (/^\s*more\s*$/i.test(String(rawInboundText || '').trim())) {
         displayedHash,
         displayedJobNos: displayedJobNos.slice(0, 16),
 
-        // ✅ NEW: message-based stale protection visibility
+        // visibility for stale protection
         expectedPickerMsgSid,
         repliedToMsgSid,
 
@@ -4353,69 +4480,41 @@ if (/^\s*more\s*$/i.test(String(rawInboundText || '').trim())) {
           ttlSeconds: PA_TTL_SEC
         });
       } catch {}
-    
 
-          // ✅ If user says "change job" while already picking -> resend page 0
-          if (tok === 'change_job') {
-            try {
-              const confirmPAx = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-              if (confirmPAx?.payload?.draft) {
-                await upsertPA({
-                  ownerId,
-                  userId: paKey,
-                  kind: PA_KIND_CONFIRM,
-                  payload: {
-                    ...(confirmPAx.payload || {}),
-                    draft: { ...(confirmPAx.payload.draft || {}), needsReparse: true }
-                  },
-                  ttlSeconds: PA_TTL_SEC
-                });
-              }
-            } catch (e) {
-              console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
-            }
-
-            return await sendJobPickList({
-              fromPhone,
+      // ✅ If user says "change job" while already picking -> resend page 0
+      if (tok === 'change_job') {
+        try {
+          const confirmPAx = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+          if (confirmPAx?.payload?.draft) {
+            await upsertPA({
               ownerId,
-              userProfile,
-              confirmFlowId: effectiveConfirmFlowId,
-              jobOptions,
-              paUserId,
-              pickUserId: canonicalUserKey,
-              page: 0,
-              pageSize: 8,
-              context: 'expense_jobpick',
-              confirmDraft
+              userId: paKey,
+              kind: PA_KIND_CONFIRM,
+              payload: {
+                ...(confirmPAx.payload || {}),
+                draft: { ...(confirmPAx.payload.draft || {}), needsReparse: true }
+              },
+              ttlSeconds: PA_TTL_SEC
             });
           }
+        } catch (e) {
+          console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
+        }
 
-          // ✅ "more" paging (must happen BEFORE picker tap parsing / stale-click checks)
-if (tok === 'more' || /^\s*more\s*$/i.test(String(rawInboundText || '').trim())) {
-  const hasMore = !!pickPA.payload.hasMore;
-
-  if (!hasMore) {
-    return out(twimlText('No more jobs to show. Tap a job, or reply with a job name.'), false);
-  }
-
-  const nextPage = Number(pickPA.payload.page || 0) + 1;
-
-  return await sendJobPickList({
-    fromPhone,
-    ownerId,
-    userProfile,
-    confirmFlowId: pickPA.payload?.confirmFlowId,
-    jobOptions: pickPA.payload?.jobOptions || [],
-    paUserId,
-    pickUserId: canonicalUserKey,
-    page: nextPage,
-    pageSize: pickPA.payload?.pageSize || 10,
-    context: pickPA.payload?.context || 'expense_jobpick',
-    confirmDraft: pickPA.payload?.confirmDraft || null,
-    resolveAttempts: pickPA.payload?.resolveAttempts || 0
-  });
-}
-
+        return await sendJobPickList({
+          fromPhone,
+          ownerId,
+          userProfile,
+          confirmFlowId: effectiveConfirmFlowId,
+          jobOptions,
+          paUserId,
+          pickUserId: canonicalUserKey,
+          page: 0,
+          pageSize: 8,
+          context: 'expense_jobpick',
+          confirmDraft
+        });
+      }
 
           // ✅ HARD GUARD: if confirm PA is missing but we got a picker reply, re-bootstrap from pickPA.confirmDraft
           let confirmPAForGuard = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
@@ -4578,23 +4677,32 @@ if (looksLikePickerTap) {
       });
     } catch {}
 
-    // Patch confirm draft with chosen job
-    await upsertPA({
-      ownerId,
-      userId: paKey,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        ...(confirmPA.payload || {}),
-        draft: {
-          ...(confirmPA.payload?.draft || {}),
-          jobName: getJobDisplayName(chosen),
-          jobSource: 'picked',
-          job_no: Number(chosen.job_no ?? chosen.jobNo),
-          job_id: chosen?.id || chosen?.job_id || null
-        }
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
+    // Patch confirm draft with chosen job (UUID-safe job_id)
+const chosenJobId =
+  asUuidOrNull(chosen?.job_id) ||
+  asUuidOrNull(chosen?.id) ||
+  null;
+
+await upsertPA({
+  ownerId,
+  userId: paKey,
+  kind: PA_KIND_CONFIRM,
+  payload: {
+    ...(confirmPA.payload || {}),
+    draft: {
+      ...(confirmPA.payload?.draft || {}),
+      jobName: getJobDisplayName(chosen),
+      jobSource: 'picked',
+      job_no: Number.isFinite(Number(chosen?.job_no ?? chosen?.jobNo))
+        ? Number(chosen?.job_no ?? chosen?.jobNo)
+        : null,
+      job_id: chosenJobId
+    }
+  },
+  ttlSeconds: PA_TTL_SEC
+});
+
+
 
     // Clear pick state now that we have a job
     try {
@@ -4618,14 +4726,21 @@ if (looksLikePickerTap) {
 // - canonicalUserKey, paKey, tz
 // - helpers: resolveJobOptionFromReply, getJobDisplayName, persistActiveJobBestEffort
 // - helpers: getPA, upsertPA, deletePA, resendConfirmExpense, rejectAndResendPicker
+// - helper: asUuidOrNull (file-scope)
 
 if (!skipPickHandling) {
-  const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
+  // Prefer pick-state options if present (prevents stale/shifted list interpretation)
+  const pickStateOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
+  const optionsForResolution = pickStateOptions.length ? pickStateOptions : jobOptions;
+
+  const resolved = resolveJobOptionFromReply(rawInput, optionsForResolution, { page, pageSize, displayedJobNos });
 
   console.info('[JOB_PICK_RESOLVED_TYPED]', {
     input: rawInput,
     title: inboundTwilioMeta?.ListTitle,
-    resolved
+    resolvedKind: resolved?.kind || null,
+    resolvedJobNo: resolved?.job?.job_no ?? resolved?.job?.jobNo ?? null,
+    usedPickState: pickStateOptions.length > 0
   });
 
   if (!resolved) {
@@ -4670,7 +4785,7 @@ if (!skipPickHandling) {
         ownerId,
         userProfile,
         confirmFlowId: effectiveConfirmFlowId,
-        jobOptions,
+        jobOptions: optionsForResolution,
         confirmDraft,
         reason: 'missing_confirm_after_typed_overhead',
         twilioMeta: inboundTwilioMeta,
@@ -4705,7 +4820,39 @@ if (!skipPickHandling) {
   // ----------------------------
   // Specific job selection
   // ----------------------------
-  if (resolved.kind === 'job' && resolved.job?.job_no) {
+  if (resolved.kind === 'job' && resolved.job) {
+    const resolvedJobNo =
+      Number(resolved?.job?.job_no ?? resolved?.job?.jobNo ?? NaN);
+
+    if (!Number.isFinite(resolvedJobNo)) {
+      // typed reply did not resolve deterministically
+      return out(
+        twimlText('Please reply with a job from the list, a number, job name, "Overhead", or "more".'),
+        false
+      );
+    }
+
+    // ✅ Safety: ensure chosen job exists in pick-state options (if present)
+    const chosen =
+      (optionsForResolution || []).find((j) => Number(j?.job_no ?? j?.jobNo) === resolvedJobNo) || null;
+
+    if (!chosen) {
+      return await rejectAndResendPicker({
+        fromPhone,
+        paUserId,
+        stableMsgId,
+        ownerId,
+        userProfile,
+        confirmFlowId: effectiveConfirmFlowId,
+        jobOptions: optionsForResolution,
+        confirmDraft,
+        reason: 'typed_job_not_in_pick_state',
+        twilioMeta: inboundTwilioMeta,
+        pickUserId: canonicalUserKey,
+        pickPA
+      });
+    }
+
     const userKey =
       String(paUserId || '').trim() ||
       String(userProfile?.wa_id || '').trim() ||
@@ -4717,8 +4864,8 @@ if (!skipPickHandling) {
         ownerId,
         userProfile,
         fromPhone: userKey,
-        jobRow: resolved.job,
-        jobNameFallback: resolved.job?.name
+        jobRow: chosen,
+        jobNameFallback: chosen?.name
       });
     } catch {}
 
@@ -4752,7 +4899,7 @@ if (!skipPickHandling) {
         ownerId,
         userProfile,
         confirmFlowId: effectiveConfirmFlowId,
-        jobOptions,
+        jobOptions: optionsForResolution,
         confirmDraft,
         reason: 'missing_confirm_after_typed_job',
         twilioMeta: inboundTwilioMeta,
@@ -4760,6 +4907,12 @@ if (!skipPickHandling) {
         pickPA
       });
     }
+
+    // ✅ UUID-only enforcement for job_id (matches picker-tap safety)
+    const chosenJobId =
+      asUuidOrNull(chosen?.job_id) ||
+      asUuidOrNull(chosen?.id) ||
+      null;
 
     await upsertPA({
       ownerId,
@@ -4769,10 +4922,13 @@ if (!skipPickHandling) {
         ...(confirmPA.payload || {}),
         draft: {
           ...(confirmPA.payload?.draft || {}),
-          jobName: getJobDisplayName(resolved.job),
+          jobName: getJobDisplayName(chosen),
           jobSource: 'picked',
-          job_no: Number(resolved.job.job_no),
-          job_id: resolved.job?.id || resolved.job?.job_id || null
+          job_no: Number.isFinite(Number(chosen?.job_no ?? chosen?.jobNo))
+          ? Number(chosen?.job_no ?? chosen?.jobNo)
+          : null,
+
+          job_id: chosenJobId
         }
       },
       ttlSeconds: PA_TTL_SEC
@@ -4784,7 +4940,7 @@ if (!skipPickHandling) {
     return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
   }
 
-  // Safe fallback
+  // Safe fallback (should rarely hit)
   return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
 }
 
@@ -6120,10 +6276,19 @@ if (looksLikeReceiptText(input)) {
     }
 
     mergedDraft.media_asset_id =
-      mergedDraft.media_asset_id || resolvedFlowMediaAssetId || flowMediaAssetId || null;
+  mergedDraft.media_asset_id || resolvedFlowMediaAssetId || flowMediaAssetId || null;
 
-    const gotAmount = !!String(mergedDraft.amount || '').trim() && String(mergedDraft.amount).trim() !== '$0.00';
-    const gotDate = !!String(mergedDraft.date || '').trim();
+// ✅ Vendor sanitation (receipt seed): prevent “Rona for plywood” pollution.
+// Only strip trailing “ for …” if we ALSO have an item/description already.
+if (mergedDraft?.store && typeof mergedDraft.store === 'string') {
+  const s = mergedDraft.store.trim();
+  if (mergedDraft?.item && /\sfor\s/i.test(s)) {
+    mergedDraft.store = s.replace(/\s+for\s+.*/i, '').trim();
+  }
+}
+
+const gotAmount = !!String(mergedDraft.amount || '').trim() && String(mergedDraft.amount).trim() !== '$0.00';
+const gotDate = !!String(mergedDraft.date || '').trim();
 
     await upsertPA({
       ownerId,
@@ -6254,9 +6419,19 @@ console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
 });
 
     
-    data0.store = await normalizeVendorName(ownerId, data0.store);
+        data0.store = await normalizeVendorName(ownerId, data0.store);
+
+    // ✅ Vendor sanitation: prevent “Rona for plywood” pollution.
+    // Only strip trailing “ for …” if we ALSO have an item/description already.
+    if (data0?.store && typeof data0.store === 'string') {
+      const s = data0.store.trim();
+      if (data0?.item && /\sfor\s/i.test(s)) {
+        data0.store = s.replace(/\s+for\s+.*/i, '').trim();
+      }
+    }
 
     if (isUnknownItem(data0.item)) {
+
       const inferred = inferExpenseItemFallback(input);
       if (inferred) data0.item = inferred;
     }

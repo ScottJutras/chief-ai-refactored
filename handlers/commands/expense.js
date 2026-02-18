@@ -135,6 +135,15 @@ function PA_OWNER_KEY(ownerId) {
   const dig = DIGITS_ID(raw);
   return dig || raw;
 }
+function normalizeDateTextForParse(s) {
+  let t = String(s || '');
+  t = t.replace(/\b(\d{1,2})(st|nd|rd|th)\b/gi, '$1');      // 1st -> 1
+  t = t.replace(/\b(\d{4})\s+(\d)\b/g, '$1$2');            // 2020 5 -> 20205
+  t = t.replace(/\b(19|20)(\d0\d)\b/g, (m, c, rest) => {   // 20205 -> 2025 (only for x0y pattern)
+    return `${c}${rest[0]}${rest[2]}`;
+  });
+  return t;
+}
 
 
 async function getPA({ ownerId, userId, kind }) {
@@ -3824,10 +3833,27 @@ async function handleExpense(
   });
 
   // ✅ Canonical inbound signal for expense flow.
-  // Some older branches still referenced `inboundText` — alias it to prevent crashes.
-  const inboundText = rawInboundText;
+// Some older branches still referenced `inboundText` — alias it to prevent crashes.
+let raw = String(rawInboundText || '').trim();
 
-  const raw = String(rawInboundText || '').trim();
+// ✅ Normalize date text BEFORE parsing (ordinals + "2020 5" year spacing)
+// This prevents "January 1st, 2020 5" from failing date parse and falling back to today.
+try {
+  if (raw) raw = normalizeDateTextForParse(raw);
+} catch {
+  // fail-open: never block intake
+}
+
+const inboundText = raw; // keep legacy alias, but normalized
+try {
+  if (typeof inboundTwilioMeta?.Body === 'string') {
+    inboundTwilioMeta.Body = normalizeDateTextForParse(inboundTwilioMeta.Body);
+  }
+  if (typeof inboundTwilioMeta?.ResolvedInboundText === 'string') {
+    inboundTwilioMeta.ResolvedInboundText = normalizeDateTextForParse(inboundTwilioMeta.ResolvedInboundText);
+  }
+} catch {}
+
 
   function strictDecisionToken(s) {
     const t = String(s || '').trim().toLowerCase();

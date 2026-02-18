@@ -27,8 +27,38 @@ function todayIso() {
 }
 
 function parseNaturalDateLoose(text) {
-  const raw = String(text || '').trim();
+  const raw0 = String(text || '').trim();
+  if (!raw0) return null;
+
+  // Normalize common STT weirdness:
+  // - "January 1st, 2025" -> "January 1, 2025"
+  // - "January 1st, 2020 5" -> "January 1, 20205" (then fixed again below)
+  // - "2020 5" -> "20205" (we’ll also try to interpret "2020 5" as "2025" with a safer rule)
+  let raw = raw0;
+
+  // 1) Strip ordinal suffixes: 1st/2nd/3rd/4th...
+  raw = raw.replace(/\b(\d{1,2})(st|nd|rd|th)\b/gi, '$1');
+
+  // 2) Collapse "2020 5" -> "20205"
+  raw = raw.replace(/\b(\d{4})\s+(\d)\b/g, '$1$2');
+
+  // 3) If we ended up with a 5-digit year like 20205, it’s almost certainly "2025"
+  //    This happens when STT does "2020 5".
+  raw = raw.replace(/\b(19|20)(\d{3})\b/g, (m, century, rest) => {
+    // rest is 3 digits, like "205" from "20205"
+    // Map "20205" -> "2025" by dropping the 3rd digit: "205" -> "25"
+    // Only do this when it *looks* like the STT pattern (ends with 0 + digit)
+    if (/^\d0\d$/.test(rest)) {
+      return `${century}${rest[0]}${rest[2]}`; // "205" -> "25" => "2025"
+    }
+    return m;
+  });
+
   const s = raw.toLowerCase();
+
+  function todayIso() {
+    return new Date().toISOString().split('T')[0];
+  }
 
   if (/\btoday\b/.test(s)) return todayIso();
   if (/\byesterday\b/.test(s)) {
@@ -42,9 +72,12 @@ function parseNaturalDateLoose(text) {
     return d.toISOString().split('T')[0];
   }
 
+  // ISO date
   const mIso = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
   if (mIso) return mIso[1];
 
+  // Month Day, Year (allow optional comma)
+  // Matches: "January 1 2025", "January 1, 2025"
   const mNat = raw.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})\b/);
   if (mNat?.[1]) {
     const parsed = Date.parse(mNat[1]);
@@ -53,6 +86,7 @@ function parseNaturalDateLoose(text) {
 
   return null;
 }
+
 
 function looksLikeAddress(s) {
   const t = String(s || '').trim();

@@ -2942,13 +2942,7 @@ function isIsoDateToken(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim());
 }
 
-const isRefundish = /\b(refund|credit|return|chargeback|reversal)\b/i.test(raw);
-const amount = moneyToFixed(token);
-if (isRefundish && amount && !/^-/.test(amount)) {
-  // convert "$200.00" -> "-$200.00" by reformatting from number instead if you have it
-}
 
-// ✅ DROP-IN: deterministicExpenseParse (robust, refund-safe, no top-level raw/token usage)
 function deterministicExpenseParse(input, userProfile) {
   const raw0 = String(input || '').trim();
   if (!raw0) return null;
@@ -2956,7 +2950,6 @@ function deterministicExpenseParse(input, userProfile) {
   // Normalize fancy dashes so "$883 — Railing" behaves like "$883 - Railing"
   const raw = normalizeDashes(raw0);
 
-  // --- amount ---
   const token = extractMoneyToken(raw);
   if (!token) return null;
 
@@ -2966,8 +2959,8 @@ function deterministicExpenseParse(input, userProfile) {
   let amount = moneyToFixed(token);
   if (!amount) return null;
 
-  // Optional: if text is refund-ish and amount is positive, force negative
-  // NOTE: only applies if moneyToFixed returned a positive formatted string
+  // Optional: force negative when refundish + amount is positive
+  // (only if your formatMoneyDisplay supports negatives well)
   if (isRefundish && amount && !/^-/.test(String(amount))) {
     const num = Number(String(amount).replace(/[^0-9.-]/g, ''));
     if (Number.isFinite(num) && num !== 0) {
@@ -2975,7 +2968,6 @@ function deterministicExpenseParse(input, userProfile) {
     }
   }
 
-  // --- date ---
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
   let date = null;
@@ -2988,7 +2980,7 @@ function deterministicExpenseParse(input, userProfile) {
     if (iso?.[1]) date = iso[1];
   }
 
-  // If receipt-ish and no explicit date token, do NOT default to today
+  // If this looks like receipt/OCR text and no explicit date token was found, do NOT default to today.
   const looksReceipt =
     /\b(receipt|subtotal|hst|gst|pst|tax|total|debit|visa|mastercard|amex|approved|auth|terminal)\b/i.test(raw);
 
@@ -2996,7 +2988,6 @@ function deterministicExpenseParse(input, userProfile) {
     date = looksReceipt ? null : todayInTimeZone(tz);
   }
 
-  // --- job ---
   let jobName = null;
   const forJob = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:[.?!]|$)/i);
   if (forJob?.[1]) {
@@ -3005,14 +2996,12 @@ function deterministicExpenseParse(input, userProfile) {
   }
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
-  // --- store/vendor ---
   let store = null;
   const fromMatch = raw.match(
     /\b(?:from|at)\s+(.+?)(?:\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
   );
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
-  // --- item ---
   let item = null;
 
   // 1) "worth of <item> from/at <store>"
@@ -3029,15 +3018,15 @@ function deterministicExpenseParse(input, userProfile) {
     if (inItem?.[1]) item = String(inItem[1]).trim();
   }
 
-  // 3) "$883 - Railing at Rona"
+  // 3) "$883 - Railing at Rona" (after normalizeDashes)
   if (!item) {
     const dashItem = raw.match(
-      /\$\s*[0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
+      /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
     );
     if (dashItem?.[1]) item = String(dashItem[1]).trim();
   }
 
-  // 4) "for <item> at/from <store>" (but don’t allow "for job ...")
+  // 4) Keep "for <item> ..." rule (but don’t allow "for job ...")
   if (!item) {
     const itemMatch = raw.match(
       /\bfor\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
@@ -3057,6 +3046,7 @@ function deterministicExpenseParse(input, userProfile) {
     jobName: jobName || null
   };
 }
+
 
 
 /* ---------------- inbound helpers (drop-in) ---------------- */

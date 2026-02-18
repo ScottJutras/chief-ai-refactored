@@ -5666,33 +5666,33 @@ if (strictTok === 'yes') {
     });
 
     // Receipt/OCR-first source text for normalization
-    const sourceText = String(
-      draftForSubmit?.receiptText ||
-        draftForSubmit?.ocrText ||
-        draftForSubmit?.media_transcript ||
-        draftForSubmit?.mediaTranscript ||
-        draftForSubmit?.originalText ||
-        draftForSubmit?.draftText ||
-        draftForSubmit?.text ||
-        ''
-    ).trim();
+const sourceText = String(
+  draftForSubmit?.receiptText ||
+    draftForSubmit?.ocrText ||
+    draftForSubmit?.media_transcript ||
+    draftForSubmit?.mediaTranscript ||
+    draftForSubmit?.originalText ||
+    draftForSubmit?.draftText ||
+    draftForSubmit?.text ||
+    ''
+).trim();
 
-    // Normalize
-    let data = normalizeExpenseData(draftForSubmit, userProfile, sourceText);
-    ensureAmountCents(data);
-    // ✅ Receipt date fallback
-    if (!data.date) {
-      const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
-      const d = extractReceiptDateYYYYMMDD(sourceText, tz0);
-      if (d) data.date = d;
-    }
+// Normalize
+let data = normalizeExpenseData(draftForSubmit, userProfile, sourceText);
+ensureAmountCents(data);
 
-    data.media_asset_id = mediaAssetId || data.media_asset_id || null;
-    data.media_source_msg_id = draftForSubmit.media_source_msg_id || null;
+// ✅ Receipt date fallback (must happen BEFORE date gating)
+if (!data?.date) {
+  const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
+  const d = extractReceiptDateYYYYMMDD(sourceText, tz0);
+  if (d) data.date = d;
+}
 
-    // ✅ Minimal gating
-    const amountStr = String(data?.amount || '').trim();
-    // ✅ Minimal gating (DB requires amount_cents + date)
+// Attach media (resolved earlier)
+data.media_asset_id = mediaAssetId || data.media_asset_id || null;
+data.media_source_msg_id = draftForSubmit.media_source_msg_id || null;
+
+// ✅ Minimal gating (DB requires amount_cents + date)
 const dateStr = String(data?.date || '').trim();
 
 if (!data?.amount_cents) {
@@ -5707,48 +5707,48 @@ if (!dateStr) {
   return out(twimlText(`I’m missing the date. Reply like: "The transaction date is 01/05/2026".`), false);
 }
 
+// ✅ Job resolution
+let jobName = data.jobName || draftForSubmit.jobName || null;
+let jobSource = jobName ? (data.jobSource || draftForSubmit.jobSource || 'typed') : null;
 
-    // ✅ Job resolution
-    let jobName = data.jobName || draftForSubmit.jobName || null;
-    let jobSource = jobName ? data.jobSource || draftForSubmit.jobSource || 'typed' : null;
+if (!jobName) {
+  jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone })) || null;
+  if (jobName) jobSource = 'active';
+}
 
-    if (!jobName) {
-      jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone })) || null;
-      if (jobName) jobSource = 'active';
+if (jobName && looksLikeOverhead(jobName)) {
+  jobName = 'Overhead';
+  jobSource = 'overhead';
+}
+
+if (!jobName) {
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+
+  await sendJobPickList({
+    fromPhone,
+    ownerId,
+    userProfile,
+    confirmFlowId: txSourceMsgId || `${paUserId}:${Date.now()}`,
+    jobOptions: jobs,
+    paUserId,
+    pickUserId: canonicalUserKey, // ✅ MUST be canonical pick key
+    page: 0,
+    pageSize: 8,
+    context: 'expense_jobpick',
+    confirmDraft: {
+      ...data,
+      jobName: null,
+      jobSource: null,
+      media_asset_id: data.media_asset_id || null,
+      media_source_msg_id: data.media_source_msg_id || null,
+      originalText: draftForSubmit?.originalText || sourceText || '',
+      draftText: draftForSubmit?.draftText || sourceText || ''
     }
+  });
 
-    if (jobName && looksLikeOverhead(jobName)) {
-      jobName = 'Overhead';
-      jobSource = 'overhead';
-    }
+  return out(twimlEmpty(), true);
+}
 
-    if (!jobName) {
-      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-
-      await sendJobPickList({
-        fromPhone,
-        ownerId,
-        userProfile,
-        confirmFlowId: txSourceMsgId || `${paUserId}:${Date.now()}`,
-        jobOptions: jobs,
-        paUserId,
-        pickUserId: canonicalUserKey, // ✅ MUST be canonical pick key
-        page: 0,
-        pageSize: 8,
-        context: 'expense_jobpick',
-        confirmDraft: {
-          ...data,
-          jobName: null,
-          jobSource: null,
-          media_asset_id: data.media_asset_id || null,
-          media_source_msg_id: data.media_source_msg_id || null,
-          originalText: draftForSubmit?.originalText || sourceText || '',
-          draftText: draftForSubmit?.draftText || sourceText || ''
-        }
-      });
-
-      return out(twimlEmpty(), true);
-    }
 
     data.jobName = jobName;
     data.jobSource = jobSource;

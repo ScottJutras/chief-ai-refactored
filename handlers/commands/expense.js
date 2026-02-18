@@ -2983,8 +2983,20 @@ function deterministicExpenseParse(input, userProfile) {
   // Normalize fancy dashes so "$883 — Railing" behaves like "$883 - Railing"
   const raw = normalizeDashes(raw0);
 
-  const token = extractMoneyToken(raw);
-  if (!token) return null;
+  let token = extractMoneyToken(raw);
+
+// ✅ HARD FALLBACK: match "$48", "$48.12", "$1,234.56" even if extractMoneyToken is picky
+if (!token) {
+  const m = raw.match(/\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?/);
+  if (m?.[0]) token = m[0];
+}
+
+if (!token) return null;
+console.info('[DET_EXPENSE_MONEY_TOKEN]', {
+  head: String(raw || '').slice(0, 120),
+  token: token || null
+});
+
 
   // Refund/credit hint must live INSIDE the function (raw exists here)
   const isRefundish = /\b(refund|credit|return|chargeback|reversal)\b/i.test(raw);

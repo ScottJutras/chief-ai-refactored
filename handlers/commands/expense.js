@@ -890,6 +890,25 @@ function stripExpensePrefixes(input) {
 
   return s.trim();
 }
+function ensureAmountCents(d) {
+  if (!d) return d;
+
+  // If normalizeExpenseData already set it, great.
+  const ac = Number(d.amount_cents);
+  if (Number.isFinite(ac) && ac > 0) return d;
+
+  // Otherwise compute from amount (string like "$48.00", "48", "48.00")
+  const a = String(d.amount || '').trim();
+  if (a) {
+    const cents = toCents(a); // you already export toCents from pg/postgres.js
+    if (Number.isFinite(cents) && cents > 0) {
+      d.amount_cents = cents;
+      return d;
+    }
+  }
+
+  return d;
+}
 
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.,]/g, '').replace(/,/g, ''));
@@ -3034,7 +3053,7 @@ console.info('[DET_EXPENSE_MONEY_TOKEN]', {
   }
 
   let jobName = null;
-  const forJob = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:[.?!]|$)/i);
+  const forJob = raw.match(/\bfor\s+job\s+(.+?)(?:[.?!]|$)/i);
   if (forJob?.[1]) {
     const cand = String(forJob[1]).trim();
     if (cand && !isIsoDateToken(cand)) jobName = normalizeJobNameCandidate(cand);
@@ -5660,7 +5679,7 @@ if (strictTok === 'yes') {
 
     // Normalize
     let data = normalizeExpenseData(draftForSubmit, userProfile, sourceText);
-
+    ensureAmountCents(data);
     // ✅ Receipt date fallback
     if (!data.date) {
       const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
@@ -5673,17 +5692,21 @@ if (strictTok === 'yes') {
 
     // ✅ Minimal gating
     const amountStr = String(data?.amount || '').trim();
-    const dateStr = String(data?.date || '').trim();
+    // ✅ Minimal gating (DB requires amount_cents + date)
+const dateStr = String(data?.date || '').trim();
 
-    if (!amountStr || amountStr === '$0.00') {
-      return out(
-        twimlText(`I’m missing the total amount. Reply like: "Total 14.84 CAD" (or just "14.84").`),
-        false
-      );
-    }
-    if (!dateStr) {
-      return out(twimlText(`I’m missing the date. Reply like: "The transaction date is 01/05/2026".`), false);
-    }
+if (!data?.amount_cents) {
+  console.warn('[EXPENSE_PARSE_MISSING_AMOUNT_CENTS]', {
+    head: String(raw || '').slice(0, 120),
+    amount: data?.amount ?? null
+  });
+  return out(twimlText('I didn’t catch the amount. Try: expense $48 from RONA for plywood'), false);
+}
+
+if (!dateStr) {
+  return out(twimlText(`I’m missing the date. Reply like: "The transaction date is 01/05/2026".`), false);
+}
+
 
     // ✅ Job resolution
     let jobName = data.jobName || draftForSubmit.jobName || null;
@@ -6215,6 +6238,8 @@ console.info('[EXPENSE_PARSE_RESULT_BACKSTOP]', {
   if (backstop && backstop.amount) {
     const sourceText0 = String(backstop?.originalText || backstop?.draftText || input || '').trim();
     const data0 = normalizeExpenseData(backstop, userProfile, sourceText0);
+    ensureAmountCents(data0);
+
 
 console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
   amount: data0?.amount ?? null,

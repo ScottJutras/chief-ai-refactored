@@ -144,6 +144,29 @@ function normalizeDateTextForParse(s) {
   });
   return t;
 }
+function extractExplicitDateFromText(rawText, tz) {
+  const s0 = String(rawText || '').trim();
+  if (!s0) return null;
+
+  // normalize ordinals + "2020 5" year spacing etc
+  const s = (typeof normalizeDateTextForParse === 'function')
+    ? normalizeDateTextForParse(s0)
+    : s0;
+
+  // 1) ISO
+  let m = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (m?.[1]) return parseNaturalDateTz(m[1], tz);
+
+  // 2) Month name date: "January 1, 2025" (optionally preceded by "on")
+  m = s.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2}(?:,\s*)?\s+\d{4})\b/);
+  if (m?.[1]) return parseNaturalDateTz(m[1], tz);
+
+  // 3) Slash date: 1/1/2025
+  m = s.match(/\b(\d{1,2}\/\d{1,2}\/\d{2,4})\b/);
+  if (m?.[1]) return parseNaturalDateTz(m[1], tz);
+
+  return null;
+}
 
 
 async function getPA({ ownerId, userId, kind }) {
@@ -381,6 +404,23 @@ function waTo(fromPhone) {
   return d ? `whatsapp:+${d}` : null;
 }
 exports.waTo = waTo;
+
+// Helper: normalize "<digits>:SMxxxx" safely (prevents double-prefix / junk prefixes)
+function normalizeMediaSourceMsgId(userKeyDigits, val) {
+  const u = String(userKeyDigits || '').trim();
+  const s0 = String(val || '').trim();
+  if (!u) return s0 || null;
+  if (!s0) return null;
+
+  // Already "digits:SM..." -> keep
+  if (/^\d{7,20}:SM[a-f0-9]{10,64}$/i.test(s0)) return s0;
+
+  // Plain "SM..." -> prefix with digits
+  if (/^SM[a-f0-9]{10,64}$/i.test(s0)) return `${u}:${s0}`;
+
+  // Unknown shape -> keep as-is (don’t invent)
+  return s0;
+}
 
 
 function getTwilioClient() {
@@ -5813,24 +5853,7 @@ if (strictTok === 'yes') {
     // ✅ Ensure media_source_msg_id always "userKey:SM..." (canonical userKey = digits paUserId)
     const userKey = String(paUserId || '').trim();
 
-    const normalizeMediaSourceMsgId = (userKeyDigits, val) => {
-      const u = String(userKeyDigits || '').trim();
-      const s0 = String(val || '').trim();
-      if (!u) return s0 || null;
-      if (!s0) return null;
-
-      if (/^\d{7,20}:SM[a-f0-9]{10,64}$/i.test(s0)) return s0;
-
-      const mSid = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
-      if (mSid?.[0]) return `${u}:${mSid[0]}`;
-
-      if (s0.includes(':')) {
-        const m2 = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
-        if (m2?.[0]) return `${u}:${m2[0]}`;
-      }
-
-      return `${u}:${s0}`;
-    };
+    
 
     // Work off draft2 (NOT rawDraft) from here down
     const draftForSubmit = { ...rawDraft2 };
@@ -6347,87 +6370,89 @@ const gotDate = !!String(mergedDraft.date || '').trim();
     console.warn('[RECEIPT_SEED_CONFIRM_PA] failed (ignored):', e?.message);
   }
 
-  // --------------------------------------------
+    // --------------------------------------------
   // 2) Receipt intake UX: ALWAYS go to job picker first
   // --------------------------------------------
-  try {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-    if (!jobs.length) {
-      return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+  if (looksLikeReceiptText(input)) {
+    try {
+      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+      if (!jobs.length) {
+        return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+      }
+
+      // ✅ confirmFlowId — NO stableMsgId dependency
+      const confirmFlowId =
+        String(txSourceMsgId || '').trim() ||
+        String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+        String(sourceMsgId || '').trim() ||
+        `${paUserId}:${Date.now()}`;
+
+      await sendJobPickList({
+        fromPhone,
+        ownerId,
+        userProfile,
+        confirmFlowId,
+        jobOptions: jobs,
+        paUserId,
+        pickUserId: canonicalUserKey,
+        page: 0,
+        pageSize: 8,
+        context: 'expense_jobpick',
+        confirmDraft: mergedDraft
+          ? {
+              ...mergedDraft,
+              jobName: null,
+              jobSource: null,
+              media_asset_id: mergedDraft.media_asset_id || null,
+              media_source_msg_id: mergedDraft.media_source_msg_id || null,
+              originalText: mergedDraft.originalText || mergedDraft.receiptText || '',
+              draftText: mergedDraft.draftText || mergedDraft.receiptText || ''
+            }
+          : null
+      });
+
+      // ✅ picker sent out-of-band
+      return out(twimlEmpty(), true);
+    } catch (e) {
+      console.warn('[EXPENSE] receipt job picker send failed:', e?.message);
+      // fallback: at least avoid nagging
+      return out(twimlText('I had trouble showing the job list. Try again or reply "jobs".'), false);
+    }
+  } else {
+    // ✅ Non-receipt path: deterministic parse first
+    let backstop = deterministicExpenseParse(rawInboundText, userProfile);
+
+    // ✅ If parser failed to extract a date but the user clearly said one (e.g. "January 1st, 2025"),
+    // capture it here and inject it so we don't fall back to "today".
+    const explicitDate = extractExplicitDateFromText(rawInboundText, tz);
+
+    if (backstop && !backstop.date && explicitDate) {
+      backstop = { ...backstop, date: explicitDate };
     }
 
-    // ✅ confirmFlowId — NO stableMsgId dependency
-    const confirmFlowId =
-      String(txSourceMsgId || '').trim() ||
-      String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
-      String(sourceMsgId || '').trim() ||
-      `${paUserId}:${Date.now()}`;
-
-    await sendJobPickList({
-      fromPhone,
-      ownerId,
-      userProfile,
-      confirmFlowId,
-      jobOptions: jobs,
-      paUserId,
-      pickUserId: canonicalUserKey,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft: mergedDraft
-        ? {
-            ...mergedDraft,
-            jobName: null,
-            jobSource: null,
-            media_asset_id: mergedDraft.media_asset_id || null,
-            media_source_msg_id: mergedDraft.media_source_msg_id || null,
-            originalText: mergedDraft.originalText || mergedDraft.receiptText || '',
-            draftText: mergedDraft.draftText || mergedDraft.receiptText || ''
-          }
-        : null
+    console.info('[DET_EXPENSE_DATE_TOKEN]', {
+      head: String(rawInboundText || '').slice(0, 120),
+      explicitDate: explicitDate || null,
+      backstopDateBeforeFallback: backstop?.date ?? null
     });
 
-    // ✅ picker sent out-of-band
-    return out(twimlEmpty(), true);
-  } catch (e) {
-    console.warn('[EXPENSE] receipt job picker send failed:', e?.message);
-    // fallback: at least avoid nagging
-    return out(twimlText('I had trouble showing the job list. Try again or reply "jobs".'), false);
+    console.info('[EXPENSE_PARSE_RESULT_BACKSTOP]', {
+      hasBackstop: !!backstop,
+      amount: backstop?.amount ?? null,
+      store: backstop?.store ?? backstop?.vendor ?? null,
+      date: backstop?.date ?? null,
+      job: backstop?.jobName ?? backstop?.job ?? null,
+      head: String(rawInboundText || '').slice(0, 120)
+    });
+
+    // IMPORTANT:
+    // Do NOT `return` here — let the rest of your existing non-receipt flow continue
+    // using `backstop` (you’ll already have `backstop` in scope for the next steps).
   }
-// ✅ IMPORTANT: this brace closes ONLY: if (looksLikeReceiptText(input)) { ... }
-} else {
-  // ✅ Non-receipt path: deterministic parse first
-  const backstop = deterministicExpenseParse(rawInboundText, userProfile);
-
-console.info('[EXPENSE_PARSE_RESULT_BACKSTOP]', {
-  hasBackstop: !!backstop,
-  amount: backstop?.amount ?? null,
-  store: backstop?.store ?? backstop?.vendor ?? null,
-  date: backstop?.date ?? null,
-  job: backstop?.jobName ?? backstop?.job ?? null,
-  head: String(rawInboundText || '').slice(0, 120)
-});
 
 
-  // Helper: normalize "<digits>:SMxxxx" safely (prevents double-prefix / junk prefixes)
-  const normalizeMediaSourceMsgId = (userKeyDigits, val) => {
-    const u = String(userKeyDigits || '').trim();
-    const s0 = String(val || '').trim();
-    if (!u) return s0 || null;
-    if (!s0) return null;
 
-    if (/^\d{7,20}:SM[a-f0-9]{10,64}$/i.test(s0)) return s0;
-
-    const mSid = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
-    if (mSid?.[0]) return `${u}:${mSid[0]}`;
-
-    if (s0.includes(':')) {
-      const m2 = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
-      if (m2?.[0]) return `${u}:${m2[0]}`;
-    }
-
-    return `${u}:${s0}`;
-  };
+  
 
   if (backstop && backstop.amount) {
     const sourceText0 = String(backstop?.originalText || backstop?.draftText || input || '').trim();
@@ -6486,7 +6511,15 @@ console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
       String(sourceMsgId || '').trim() ||
       `${paUserId}:${Date.now()}`;
 
-    const ms0 = safeMsgId0 ? normalizeMediaSourceMsgId(String(paUserId || '').trim(), safeMsgId0) : null;
+    const u = String(paUserId || '').trim();
+    const sid = String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim();
+    const ms0 = sid ? normalizeMediaSourceMsgId(u, sid) : null;
+    console.info('[MEDIA_SOURCE_MSG_ID_NORMALIZED]', {
+  u,
+  sid: sid || null,
+  ms0
+});
+
 
     await upsertPA({
       ownerId,

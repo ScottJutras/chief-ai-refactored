@@ -153,6 +153,41 @@ function alnumLen(s) {
   const t = normalizeTranscript(s).replace(/[^\w]/g, '');
   return t.length;
 }
+function looksLikeDateOnlyTranscript(t) {
+  const s = String(t || '').trim();
+  if (!s) return false;
+
+  // Examples: "January 1st, 2025." "Jan 1 2025" "2025-01-01"
+  const dateOnly =
+    /^(?:on\s+)?(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\s+\d{1,2}(?:st|nd|rd|th)?(?:,)?\s+\d{4}\.?$/i.test(s) ||
+    /^\d{4}-\d{2}-\d{2}\.?$/.test(s) ||
+    /^\d{1,2}\/\d{1,2}\/\d{2,4}\.?$/.test(s);
+
+  if (!dateOnly) return false;
+
+  // If it includes finance verbs or money, it's NOT "date only"
+  if (/\b(spent|paid|bought|purchase|purchased|ordered|charge|charged|worth|dollars|\$)\b/i.test(s)) return false;
+
+  return true;
+}
+
+function looksLowSignalFinanceTranscript(t) {
+  const s = String(t || '').trim().toLowerCase();
+  if (!s) return true;
+
+  // If it has any money token or clear finance verbs, it’s likely usable
+  if (/\$\s*\d/.test(s)) return false;
+  if (/\b(dollars?|cents?)\b/.test(s)) return false;
+  if (/\b(spent|paid|bought|purchase|purchased|ordered|charge|charged|worth of|deposit|received)\b/.test(s)) return false;
+
+  // Date-only is a known failure mode
+  if (looksLikeDateOnlyTranscript(s)) return true;
+
+  // Very short or generic
+  if (alnumLen(s) < 12) return true;
+
+  return false;
+}
 
 /* --------- Quota gate (NEW) --------- */
 async function gateSttOrReturnNull(opts = {}) {
@@ -263,7 +298,13 @@ async function transcribeAudio(audioBuffer, mimeType, engine = 'google', opts = 
   function finish(t, c, eng) {
     const text = normalizeTranscript(t);
     if (!text) return null;
-    if (wantObj) return { transcript: text, confidence: (Number.isFinite(Number(c)) ? Number(c) : null), engine: eng || 'unknown' };
+    if (wantObj) {
+      return {
+        transcript: text,
+        confidence: (Number.isFinite(Number(c)) ? Number(c) : null),
+        engine: eng || 'unknown'
+      };
+    }
     return text;
   }
 
@@ -300,21 +341,48 @@ async function transcribeAudio(audioBuffer, mimeType, engine = 'google', opts = 
     return null;
   }
 
+  // ------------------------------------------------------------
+  // Google-first path (OGG/OPUS often lands here) with low-signal guard
+  // ------------------------------------------------------------
   const g = await transcribeWithGoogle(audioBuffer, mimeType);
   if (g && g.transcript) {
     const gText = normalizeTranscript(g.transcript);
+
     const isShort = alnumLen(gText) < 7;
     const isNowOnly = /^\s*now[\s.!?\-–—]*$/i.test(gText || '');
+    const isLowSignal = typeof looksLowSignalFinanceTranscript === 'function'
+      ? looksLowSignalFinanceTranscript(gText)
+      : false;
 
-    if (!isShort && !isNowOnly) return finish(gText, g.confidence, 'google');
+    // Log once when Google looks incomplete (helps confirm in Vercel logs)
+    if (isLowSignal) {
+      logOnce('info', 'stt_low_signal_google', '[STT] Google low-signal transcript; trying Whisper:', gText);
+    }
 
+    // ✅ Accept Google only when it’s not low-signal
+    if (!isShort && !isNowOnly && !isLowSignal) {
+      return finish(gText, g.confidence, 'google');
+    }
+
+    // Otherwise attempt Whisper and prefer the richer result
     const w = await transcribeWithWhisper(audioBuffer, mimeType);
     const wText = normalizeTranscript(w);
 
     if (wText && alnumLen(wText) > alnumLen(gText)) return finish(wText, null, 'whisper');
+
+    // If Google was date-only (or similarly useless) but Whisper produced *anything*, prefer Whisper
+    if (
+      wText &&
+      typeof looksLikeDateOnlyTranscript === 'function' &&
+      looksLikeDateOnlyTranscript(gText)
+    ) {
+      return finish(wText, null, 'whisper');
+    }
+
     return finish(gText, g.confidence, 'google');
   }
 
+  // If Google produced nothing, try Whisper
   const w = await transcribeWithWhisper(audioBuffer, mimeType);
   if (w) return finish(w, null, 'whisper');
 
@@ -332,3 +400,4 @@ module.exports = {
   _normalizeContentType: normalizeContentType,
   _normalizeTranscript: normalizeTranscript
 };
+

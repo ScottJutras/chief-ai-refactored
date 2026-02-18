@@ -1115,6 +1115,27 @@ try {
       };
     }
     extractedText = normalizeTranscriptMoney(stripLeadingFiller(extractedText));
+    // ✅ Guard: STT sometimes returns ONLY a date (useless by itself). Ask a targeted follow-up.
+const dateOnly =
+  /^\s*(?:\d{4}-\d{2}-\d{2}|[A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?[,]?\s+\d{4})[.!?]*\s*$/i.test(extractedText);
+
+if (dateOnly) {
+  const pending = await getPendingTransactionState(userKey);
+  await mergePendingTransactionState(userKey, {
+    ...(pending || {}),
+    pendingMedia: { type: 'voice', url: mediaUrl || null },
+    mediaSourceMsgId: stableMediaMsgId,
+    pendingHeard: { kind: 'date_only', text: extractedText }
+  });
+
+  return {
+    transcript: null,
+    twiml: twiml(
+      `I only caught a date: "${extractedText}".\n\nWhat do you want to log for that date?\nExamples:\n• expense $18 Home Depot\n• revenue $500 deposit\n• clock in`
+    )
+  };
+}
+
     // Let media parser classify structured intents (time, hours, expense/revenue)
     const result = await parseMediaText(extractedText);
 

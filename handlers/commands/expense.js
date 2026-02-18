@@ -426,9 +426,9 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) 
   const to = waTo(fromPhone);
   const templateSid = getExpenseConfirmTemplateSid();
 
+  // Defensive: keep templates happy + avoid OCR garbage explosions
   const safeSummary = String(summaryLine || '')
     .replace(/\u0000/g, '')
-    .replace(/\u00A0/g, ' ')      // ✅ NBSP normalize
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 600);
@@ -437,31 +437,32 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) 
     `✅ Confirm expense\n${safeSummary}\n\n` +
     `Reply: Yes / Edit / Cancel / Change Job`;
 
+  // ✅ Render-time truth log (NO undefined vars)
   try {
     console.info('[EXPENSE_CONFIRM_RENDER_CTX]', {
       ownerId: ctx?.ownerId ?? null,
       paUserId: ctx?.paUserId ?? null,
       fromPhone: String(fromPhone || '').trim() || null,
-
-      hasTemplate: Boolean(to && templateSid),
-      templateSid: templateSid || null,
-
+      // Draft job fields
       draft_job_id: ctx?.draft?.job_id ?? ctx?.draft?.jobId ?? null,
       draft_job_no: ctx?.draft?.job_no ?? null,
-      draft_job_name: (ctx?.draft?.jobName || ctx?.draft?.job_name || ctx?.draft?.jobNameLabel || null),
-
+      draft_job_name:
+        (ctx?.draft?.jobName || ctx?.draft?.job_name || ctx?.draft?.job_name_label || null),
+      // Active job fields (if passed)
       active_job_no: ctx?.activeJob?.job_no ?? null,
       active_job_name: ctx?.activeJob?.name ?? null,
-
+      // Template debug (if you pass contentVariables preview)
       varsPreview: ctx?.varsPreview ?? null,
       safeSummaryHead: safeSummary.slice(0, 140),
       safeSummaryLen: safeSummary.length
     });
   } catch {}
 
+  // ✅ 1) Best path: Content Template with buttons
   if (to && templateSid) {
     try {
       const msg = await sendWhatsAppTemplate({ to, templateSid, summaryLine: safeSummary });
+
       console.info('[EXPENSE_CONFIRM_SENT]', { to, sid: msg?.sid, status: msg?.status });
       return out(twimlEmpty(), true);
     } catch (e) {
@@ -469,6 +470,7 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) 
     }
   }
 
+  // ✅ 2) Fallback path: 3 quick replies + explicit "change job" instruction
   if (to) {
     try {
       await sendQuickReply(to, `✅ Confirm expense\n${safeSummary}`, ['Yes', 'Edit', 'Cancel']);
@@ -479,9 +481,9 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) 
     }
   }
 
+  // ✅ 3) Final fallback: TwiML
   return out(twimlText(bodyText), false);
 }
-
 
 
 // ------------------------------------------------------------------
@@ -764,7 +766,8 @@ async function bestEffortResolveJobFromText(ownerId, text) {
   const raw = String(text || '').toLowerCase();
 
   // Pull the "job ..." segment if present
-  const m = raw.match(/\bjob\b\s*[:\-]?\s*([a-z0-9 #'\-–—]+)$/i);
+  const m = raw.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i) 
+       || raw.match(/\bjob\s*(\d{1,6}\b[^\n\r]*)$/i); // catches Job1556 ...
   const needle = String(m?.[1] || '').trim();
   if (!needle) return null;
 
@@ -2837,31 +2840,112 @@ function mergeDraftNonNull(dst, patch) {
 /* --------- deterministic parser --------- */
 
 function extractMoneyToken(input) {
-  const s = String(input || '');
-  let m = s.match(/\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/);
-  if (m?.[1]) return m[1];
-  m = s.match(/\b([0-9]{1,3}(?:,[0-9]{3})+(?:\.[0-9]{1,2})?)\b/);
-  if (m?.[1]) return m[1];
-  m = s.match(/\b([0-9]{4,}(?:\.[0-9]{1,2})?)\b/);
-  if (m?.[1]) return m[1];
-  m = s.match(/\b([0-9]{1,3}\.[0-9]{1,2})\b/);
-  if (m?.[1]) return m[1];
-  return null;
+  const s0 = String(input || '');
+  if (!s0.trim()) return null;
+
+  // Normalize common unicode spacing/dashes that break tokenization
+  const s = s0
+    .replace(/\u00A0/g, ' ')       // nbsp
+    .replace(/[–—]/g, '-')         // en/em dash → hyphen
+    .replace(/\s+/g, ' ');
+
+  // 1) Strong signal: $ amount (allow comma OR space grouping)
+  // Examples: $2000, $2,000, $2 000, $2000.50, -$2000
+  const moneyMatches = [];
+  const reDollar = /(?:^|[^\w])-\s*\$?\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?=$|[^\w])/g;
+  let m;
+  while ((m = reDollar.exec(s)) !== null) {
+    const tok = m[1];
+    if (tok) moneyMatches.push(tok);
+  }
+
+  // Prefer first $-style match
+  if (moneyMatches.length) return moneyMatches[0];
+
+  // 2) Currency words (CAD/USD) near a number
+  // "2000 cad", "cad 2000", "usd 2,000.00"
+  const reCcy = /\b(?:cad|usd)\b\s*\$?\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)|\$?\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)\s*\b(?:cad|usd)\b/i;
+  const ccy = s.match(reCcy);
+  if (ccy?.[1] || ccy?.[2]) return (ccy[1] || ccy[2]).trim();
+
+  // 3) Fallback: find numeric candidates, but avoid ISO dates and likely job numbers.
+  // Collect candidates, choose the largest plausible amount.
+  const candidates = [];
+  const reNum = /\b(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{4,}(?:\.\d{1,2})?|\d{1,3}\.\d{1,2})\b/g;
+  while ((m = reNum.exec(s)) !== null) {
+    const tok = m[1];
+    if (!tok) continue;
+
+    // skip ISO dates like 2026-02-14 (reNum won't match full, but be safe)
+    if (/\b\d{4}-\d{2}-\d{2}\b/.test(s)) {
+      // keep, but don’t auto-skip everything; just skip tokens that are date pieces if any
+      // (practically: no action needed here)
+    }
+
+    // skip likely job numbers if preceded by "job" nearby
+    const idx = m.index;
+    const left = s.slice(Math.max(0, idx - 12), idx).toLowerCase();
+    if (/\bjob\s*$/.test(left) || /\bjob#\s*$/.test(left) || /\bjob\s*\d*\s*$/.test(left)) continue;
+
+    // skip very small numbers that are likely quantities, not amounts
+    const n = Number(tok.replace(/,/g, '').replace(/\s/g, ''));
+    if (!Number.isFinite(n) || n <= 0) continue;
+
+    candidates.push({ tok, n });
+  }
+
+  if (!candidates.length) return null;
+
+  // Choose the largest candidate (prevents picking 200 when 2000 exists)
+  candidates.sort((a, b) => b.n - a.n);
+  return candidates[0].tok;
 }
 
+
 function moneyToFixed(token) {
-  const raw = String(token || '').trim();
-  if (!raw) return null;
-  const cleaned = raw.replace(/[^0-9.,]/g, '');
+  const raw0 = String(token || '').trim();
+  if (!raw0) return null;
+
+  // Detect negative via leading '-' OR parentheses
+  // Examples: -200, $-200, (-200), (200)
+  const isNeg =
+    /^\s*-/.test(raw0) ||
+    /\(\s*[^)]+\s*\)/.test(raw0);
+
+  // Keep only digits, dots, commas, spaces (for "2 000"), and strip parens/minus later
+  let cleaned = raw0
+    .replace(/[()]/g, '')       // remove parens (we already captured negativity)
+    .replace(/-/g, '')          // remove minus (we already captured negativity)
+    .replace(/[^0-9.,\s]/g, '') // remove currency symbols/words
+    .trim();
+
   if (!cleaned) return null;
-  const normalized = cleaned.replace(/,/g, '');
-  const n = Number(normalized);
-  if (!Number.isFinite(n) || n <= 0) return null;
+
+  // Normalize thousands separators:
+  // - remove spaces used as thousands separators
+  // - remove commas
+  const normalized = cleaned.replace(/\s+/g, '').replace(/,/g, '');
+
+  const n0 = Number(normalized);
+  if (!Number.isFinite(n0)) return null;
+
+  // Reject zero (keeps your old behavior)
+  if (n0 === 0) return null;
+
+  const n = isNeg ? -Math.abs(n0) : Math.abs(n0);
+
+  // Your formatter should handle negatives fine (e.g. "-$200.00")
   return formatMoneyDisplay(n);
 }
 
 function isIsoDateToken(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim());
+}
+
+const isRefundish = /\b(refund|credit|return|chargeback|reversal)\b/i.test(raw);
+const amount = moneyToFixed(token);
+if (isRefundish && amount && !/^-/.test(amount)) {
+  // convert "$200.00" -> "-$200.00" by reformatting from number instead if you have it
 }
 
 function deterministicExpenseParse(input, userProfile) {
@@ -3159,7 +3243,7 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
     return !x || x === 'unknown' || x.startsWith('unknown ');
   };
 
-  const hasMoney = (s) => /\$?\s*-?\d{1,3}(?:,\d{3})*(?:\.\d{2})\b/.test(String(s || ''));
+  const hasMoney = (s) => /\$?\s*-?\d+(?:,\d{3})*(?:\.\d{1,2})?\b/.test(String(s || ''));
   const explicitDate = (typeof hasExplicitDateToken === 'function')
     ? !!hasExplicitDateToken(raw)
     : /\b(\d{4}-\d{2}-\d{2}|today|yesterday|tomorrow|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(raw);
@@ -3197,39 +3281,45 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   out.extractedText = existingDraft?.extractedText || out.extractedText || null;
 
   // Amount
-  if (explicit.amount) {
-    // Prefer your existing helper if available
-    const amt =
-      (typeof extractMoneyAmount === 'function' ? extractMoneyAmount(raw) : null) ||
-      (() => {
-        const m = raw.match(/\$?\s*(-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?)/);
-        if (!m?.[1]) return null;
-        const n = Number(String(m[1]).replace(/,/g, ''));
-        if (!Number.isFinite(n)) return null;
-        return `$${n.toFixed(2)}`;
-      })();
+if (explicit.amount) {
+  const amt =
+    (typeof extractMoneyAmount === 'function' ? extractMoneyAmount(raw) : null) ||
+    (() => {
+      // supports: $2000, $2,000, 2000, 2000.5, -2000
+      const m = raw.match(/\$?\s*(-?\s*\d+(?:,\d{3})*(?:\.\d{1,2})?)/);
+      if (!m?.[1]) return null;
 
-    if (amt && amt !== '$0.00') out.amount = amt;
-  }
+      const numStr = String(m[1]).replace(/\s+/g, '').replace(/,/g, '');
+      const n = Number(numStr);
+      if (!Number.isFinite(n)) return null;
+
+      return `$${n.toFixed(2)}`;
+    })();
+
+  if (amt && amt !== '$0.00') out.amount = amt;
+}
+
 
   // Date
-  if (explicit.date) {
-    const typedDate =
-      (typeof extractReceiptDateYYYYMMDD === 'function' ? extractReceiptDateYYYYMMDD(raw, tz) : null) ||
-      (typeof todayInTimeZone === 'function' ? todayInTimeZone(tz) : null);
+if (explicit.date) {
+  const typedDate =
+    (typeof extractReceiptDateYYYYMMDD === 'function'
+      ? extractReceiptDateYYYYMMDD(raw, tz)
+      : null);
 
-    if (!typedDate) {
-      return {
-        nextDraft: null,
-        aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Jan 13 2026" or "2026-01-13".'
-      };
-    }
-
-    out.date = typedDate;
-  } else {
-    // lock date if not explicit
-    if (existingDraft?.date) out.date = existingDraft.date;
+  if (!typedDate) {
+    return {
+      nextDraft: null,
+      aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Feb 14 2026" or "2026-02-14".'
+    };
   }
+
+  out.date = typedDate;
+} else {
+  // lock date if not explicit
+  if (existingDraft?.date) out.date = existingDraft.date;
+}
+
 
   // Job (very conservative: only if they used "job ...")
   if (explicit.job) {
@@ -3238,7 +3328,9 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
       out.jobName = 'Overhead';
       out.jobSource = 'typed';
     } else {
-      const m = raw.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
+      const m =
+  raw.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
+  raw.match(/\bjob\s*(\d{1,6}\b[^\n\r]*)$/i); // handles Job1556...
       if (m?.[1]) {
         const name = String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim();
         if (name) {
@@ -3597,7 +3689,6 @@ async function handleExpense(
     waId: inboundTwilioMeta?.WaId || null
   });
 
-  source_msg_id: safeMsgId || null;
 
   // ✅ Canonical CONFIRM PA key used everywhere in this handler
 const paKey = String(paUserId || '').trim();

@@ -315,12 +315,14 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
 
 
 async function getProfitRowByJobNo(ownerId, jobNo) {
-  if (!Number.isFinite(jobNo)) return null; // hard stop
+  const jn = Number(jobNo);
+  if (!Number.isFinite(jn)) return null; // hard stop
 
   if (typeof pg.getJobProfitSimple === 'function') {
-    const r = await pg.getJobProfitSimple({ ownerId, jobNo, limit: 1 });
+    const r = await pg.getJobProfitSimple({ ownerId, jobNo: jn, limit: 1 });
     return r?.rows?.[0] || null;
   }
+
   return null;
 }
 
@@ -351,7 +353,16 @@ function profitReply({ row, label }) {
 async function answerProfitIntent({ ownerId, actorKey, text }) {
   const resolved = await resolveJobForProfit({ ownerId, actorKey, text });
 
-  // ✅ If they asked for a specific job and we couldn't find it, never answer active job.
+  // Helpful debug: what did we resolve to?
+  console.info('[INSIGHTS_PROFIT_RESOLVED]', {
+    ownerId,
+    text: String(text || '').slice(0, 80),
+    source: resolved?.source || null,
+    jobNo: resolved?.jobNo ?? null,
+    jobName: resolved?.jobName ?? null
+  });
+
+  // If they asked for a specific job and we couldn't find it, never answer active job.
   if (resolved?.source === 'not_found_explicit') {
     const term = String(resolved.term || '').trim();
     return {
@@ -383,24 +394,77 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
   }
 
   // Deterministic answer if we have a job_no
-  if (Number.isFinite(resolved.jobNo)) {
-    const row = await getProfitRowByJobNo(ownerId, resolved.jobNo);
+  if (Number.isFinite(Number(resolved?.jobNo))) {
+    const requestedJobNo = Number(resolved.jobNo);
+    const row = await getProfitRowByJobNo(ownerId, requestedJobNo);
+
     if (row) {
+      // ✅ SAFETY GUARD #1: job_no must match
+      const rowJobNo = row.job_no != null ? Number(row.job_no) : null;
+      if (rowJobNo == null || rowJobNo !== requestedJobNo) {
+        console.warn('[INSIGHTS_PROFIT_MISMATCH_JOBNO]', {
+          ownerId,
+          requestedJobNo,
+          requestedJobName: resolved.jobName || null,
+          returnedRowJobNo: rowJobNo,
+          returnedRowJobName: row.job_name || null
+        });
+
+        return {
+          ok: true,
+          route: 'clarify',
+          answer:
+            `I hit a mismatch while calculating profit (requested Job #${requestedJobNo}, but profit data returned for ` +
+            `${rowJobNo != null ? `Job #${rowJobNo}` : 'a different job'}).\n\n` +
+            `Try:\n• “profit on job #${requestedJobNo}”\n• “list jobs”`,
+          evidence: { sql: ['v_job_profit_simple_fixed/getJobProfitSimple'], facts_used: 0 }
+        };
+      }
+
+      // ✅ SAFETY GUARD #2: if user typed an address-style prefix (e.g. "1556"),
+      // ensure returned job_name starts with that prefix. This catches corrupted profit rows
+      // where job_no matches but job_name is wrong.
+      const raw = String(text || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+      const m = raw.match(/\bprofit\b[\s\S]*?\bon\s+(\d{2,10})\b/i) || raw.match(/^\s*profit\s+(\d{2,10})\b/i);
+      const requestedDigits = m ? String(m[1] || '').trim() : null;
+
+      if (requestedDigits) {
+        const nameHead = String(row.job_name || '').replace(/\u00A0/g, ' ').trim();
+        const startsOk = new RegExp(`^${requestedDigits}\\b`, 'i').test(nameHead);
+        if (!startsOk) {
+          console.warn('[INSIGHTS_PROFIT_MISMATCH_NAMEPREFIX]', {
+            ownerId,
+            requestedJobNo,
+            requestedDigits,
+            returnedRowJobName: row.job_name || null
+          });
+
+          return {
+            ok: true,
+            route: 'clarify',
+            answer:
+              `Your profit data looks inconsistent for Job #${requestedJobNo} (it returned “${String(row.job_name || '').trim()}”).\n\n` +
+              `Try:\n• “profit on job #${requestedJobNo}”\n• “list jobs”`,
+            evidence: { sql: ['v_job_profit_simple_fixed/getJobProfitSimple'], facts_used: 0 }
+          };
+        }
+      }
+
       return {
         ok: true,
         route: 'insight',
         answer: profitReply({
           row,
-          label: row.job_name || resolved.jobName || `Job #${resolved.jobNo}`
+          label: row.job_name || resolved.jobName || `Job #${requestedJobNo}`
         }),
-        evidence: { sql: ['v_job_profit_simple/getJobProfitSimple'], facts_used: 4 }
+        evidence: { sql: ['v_job_profit_simple_fixed/getJobProfitSimple'], facts_used: 4 }
       };
     }
 
     return {
       ok: true,
       route: 'clarify',
-      answer: `I couldn’t find Job #${resolved.jobNo}. Try “list jobs” or tell me the job name.`,
+      answer: `I couldn’t find Job #${requestedJobNo}. Try “list jobs” or tell me the job name.`,
       evidence: { sql: [], facts_used: 0 }
     };
   }
@@ -425,6 +489,7 @@ function looksLikeProfitQuestion(text) {
 
   return hasProfitIntent && hasJobAnchor;
 }
+
 
 function ymdInTZ(tz = 'America/Toronto') {
   try {

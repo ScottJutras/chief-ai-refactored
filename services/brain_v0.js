@@ -150,7 +150,7 @@ async function answer({ ownerId, actorKey, text, tz = 'America/Toronto', jobNo =
       return {
         ok: true,
         answer: s.answer,
-        evidence: { sql: ['v_job_profit_simple'], facts_used: s.evidence.facts_used }
+        evidence: { sql: ['v_job_profit_simple_fixed'], facts_used: s.evidence.facts_used }
       };
     }
 

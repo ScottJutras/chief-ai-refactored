@@ -1816,29 +1816,44 @@ async function getJobProfitSimple({ ownerId, jobNo = null, limit = 20 }) {
 
   if (!owner_id) return { ok: false, error: 'missing ownerId' };
 
-  const q = jobNo
+  const q = jobNo != null
     ? `
-      select job_no, job_name, revenue_cents, expense_cents, profit_cents
-      from public.v_job_profit_simple
-      where owner_id = $1 and job_no = $2
+      select
+        job_no,
+        job_name,
+        revenue_cents,
+        expense_cents,
+        profit_cents
+      from public.v_job_profit_simple_fixed
+      where owner_id::text = $1
+        and job_no = $2
       limit 1
     `
     : `
-      select job_no, job_name, revenue_cents, expense_cents, profit_cents
-      from public.v_job_profit_simple
-      where owner_id = $1
+      select
+        job_no,
+        job_name,
+        revenue_cents,
+        expense_cents,
+        profit_cents
+      from public.v_job_profit_simple_fixed
+      where owner_id::text = $1
       order by profit_cents desc nulls last
       limit $2
     `;
 
   try {
-    const args = jobNo ? [owner_id, Number(jobNo)] : [owner_id, lim];
+    const args = jobNo != null ? [owner_id, Number(jobNo)] : [owner_id, lim];
     const r = await query(q, args);
     return { ok: true, rows: r.rows || [] };
   } catch (e) {
     return { ok: false, error: e?.message || 'db error' };
   }
 }
+
+
+
+
 async function getLatestFacts({ ownerId, limit = 20, types = [] }) {
   const owner_id = String(ownerId || '').trim();
   const lim = Math.max(1, Math.min(200, Number(limit) || 20));

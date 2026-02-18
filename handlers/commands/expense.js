@@ -414,13 +414,21 @@ function buildActiveJobHint(jobName, jobSource) {
   return `\n\n🧠 Using active job: ${jobName}\nTip: reply "change job" to pick another`;
 }
 
-async function sendConfirmExpenseOrFallback(fromPhone, summaryLine) {
+/**
+ * sendConfirmExpenseOrFallback
+ * - Sends confirm UI via approved content template when available
+ * - Falls back to quick replies
+ * - Final fallback to TwiML
+ *
+ * IMPORTANT: accepts optional ctx so we can log exactly what job/date/vendor will render.
+ */
+async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) {
   const to = waTo(fromPhone);
   const templateSid = getExpenseConfirmTemplateSid();
 
-  // Defensive: keep templates happy + avoid OCR garbage explosions
   const safeSummary = String(summaryLine || '')
     .replace(/\u0000/g, '')
+    .replace(/\u00A0/g, ' ')      // ✅ NBSP normalize
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 600);
@@ -429,19 +437,38 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine) {
     `✅ Confirm expense\n${safeSummary}\n\n` +
     `Reply: Yes / Edit / Cancel / Change Job`;
 
-  // ✅ 1) Best path: Content Template with 4 buttons
+  try {
+    console.info('[EXPENSE_CONFIRM_RENDER_CTX]', {
+      ownerId: ctx?.ownerId ?? null,
+      paUserId: ctx?.paUserId ?? null,
+      fromPhone: String(fromPhone || '').trim() || null,
+
+      hasTemplate: Boolean(to && templateSid),
+      templateSid: templateSid || null,
+
+      draft_job_id: ctx?.draft?.job_id ?? ctx?.draft?.jobId ?? null,
+      draft_job_no: ctx?.draft?.job_no ?? null,
+      draft_job_name: (ctx?.draft?.jobName || ctx?.draft?.job_name || ctx?.draft?.jobNameLabel || null),
+
+      active_job_no: ctx?.activeJob?.job_no ?? null,
+      active_job_name: ctx?.activeJob?.name ?? null,
+
+      varsPreview: ctx?.varsPreview ?? null,
+      safeSummaryHead: safeSummary.slice(0, 140),
+      safeSummaryLen: safeSummary.length
+    });
+  } catch {}
+
   if (to && templateSid) {
     try {
       const msg = await sendWhatsAppTemplate({ to, templateSid, summaryLine: safeSummary });
-console.info('[EXPENSE_CONFIRM_SENT]', { to, sid: msg?.sid, status: msg?.status });
-return out(twimlEmpty(), true);
-
+      console.info('[EXPENSE_CONFIRM_SENT]', { to, sid: msg?.sid, status: msg?.status });
+      return out(twimlEmpty(), true);
     } catch (e) {
       console.warn('[EXPENSE] confirm template send failed; falling back:', e?.message);
     }
   }
 
-  // ✅ 2) Fallback path: 3 quick replies + explicit "change job" instruction
   if (to) {
     try {
       await sendQuickReply(to, `✅ Confirm expense\n${safeSummary}`, ['Yes', 'Edit', 'Cancel']);
@@ -452,9 +479,9 @@ return out(twimlEmpty(), true);
     }
   }
 
-  // ✅ 3) Final fallback: TwiML
   return out(twimlText(bodyText), false);
 }
+
 
 
 // ------------------------------------------------------------------
@@ -585,7 +612,21 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
     });
   } catch {}
 
-  return await sendConfirmExpenseOrFallback(fromPhone, line);
+  // Optional: get active job for debug only (safe)
+let activeJob = null;
+try {
+  if (typeof pg.getActiveJob === 'function') {
+    activeJob = await pg.getActiveJob(ownerId, paKey).catch(() => null);
+  }
+} catch {}
+
+return await sendConfirmExpenseOrFallback(fromPhone, line, {
+  ownerId,
+  paUserId: paKey,
+  draft,
+  activeJob
+});
+
 }
 
 
@@ -6130,8 +6171,35 @@ if (looksLikeReceiptText(input)) {
         });
       }
     } catch {}
+let activeJob = null;
+try {
+  if (typeof pg.getActiveJob === 'function') {
+    activeJob = await pg.getActiveJob(ownerId, paKey).catch(() => null);
+  }
+} catch {}
 
-    return await sendConfirmExpenseOrFallback(fromPhone, `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`);
+return await sendConfirmExpenseOrFallback(
+  fromPhone,
+  `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`,
+  {
+    ownerId,
+    paUserId: paKey,
+    draft: {
+      ...data0,
+      jobName,
+      jobSource,
+      suggestedCategory: category,
+      job_id: null,
+      job_no: null,
+      media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+      media_source_msg_id: ms0,
+      originalText: input,
+      draftText: input
+    },
+    activeJob,       // ✅ USE THE VARIABLE YOU FETCHED
+    varsPreview: null
+  }
+);
   }
 } 
 // ✅ closes: if (looksLikeReceiptText(input)) { ... } else { ... }

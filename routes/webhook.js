@@ -1839,6 +1839,69 @@ router.post('*', async (req, res, next) => {
 
       return ok(res, `I couldn’t find anything pending. What do you want to do next?`);
     }
+/* -----------------------------------------------------------------------
+ * ✅ GLOBAL HARD CANCEL (router-level)
+ * - Runs BEFORE nudge / PA fetch / time gates / RAG
+ * - Clears pending actions/state
+ * - Cancels pending CIL drafts (expense + revenue)
+ * ----------------------------------------------------------------------- */
+{
+  const lcCancel = String(lc2 || '').trim(); // ✅ canonical lc2
+  const isGlobalCancel = /^(cancel|stop)\b/.test(lcCancel);
+
+  if (isGlobalCancel) {
+    console.info('[GLOBAL_CANCEL_HIT]', {
+      ownerId: req.ownerId || null,
+      from: req.from || null,
+      actorKey: req.actorKey || null,
+      messageSid: req.body?.MessageSid || req.body?.SmsMessageSid || null,
+      lc: lcCancel
+    });
+
+    // 1) Clear all pending actions/state (best-effort)
+    try {
+      await clearAllPendingForUser({
+        ownerId: req.ownerId,
+        from: (req.actorKey || req.from)
+      });
+    } catch {}
+
+    // 2) Cancel ALL draft rows for this actor (best-effort)
+    try {
+      const actorDigits =
+        String(req.actorKey || '').trim() ||
+        String(req.from || '').replace(/\D/g, '').trim();
+
+      const kinds = ['expense', 'revenue'];
+      const results = [];
+
+      for (const kind of kinds) {
+        const r = await pg.cancelAllCilDraftsForActor({
+          owner_id: req.ownerId,
+          actor_phone: actorDigits,
+          kind,
+          status: 'cancelled'
+        });
+
+        results.push({
+          kind,
+          cancelled: r?.cancelled ?? null,
+          cancelled_ids: (r?.rows || []).slice(0, 10).map((x) => x.id)
+        });
+      }
+
+      console.info('[GLOBAL_CANCEL_CIL_ALL]', {
+        ownerId: req.ownerId,
+        actorDigits,
+        results
+      });
+    } catch (e) {
+      console.warn('[GLOBAL_CANCEL_CIL_ALL] failed (ignored):', e?.message);
+    }
+
+    return ok(res, '❌ Cancelled. You’re cleared.');
+  }
+}
 
   // ------------------------------------------------------------
 // ✅ Owner nudge (Phase 1) — only on owner messages, skip time commands
@@ -1857,48 +1920,6 @@ try {
   }
 } catch (e) {
   console.warn('[NUDGE] skipped:', e?.message);
-}
-  /* -----------------------------------------------------------------------
- * ✅ GLOBAL HARD CANCEL (router-level)
- * - Runs BEFORE handlers
- * - Clears pending actions/state
- * - Cancels pending CIL drafts (expense + revenue)
- * ----------------------------------------------------------------------- */
-if (/^(cancel|stop|no)\b/.test(lc)) {
-  // 1) Clear all pending actions/state (existing behavior)
-  await clearAllPendingForUser({ ownerId: req.ownerId, from: (req.actorKey || req.from) }).catch(() => null);
-
-  // 2) Cancel ALL draft rows for this actor (definitive)
-try {
-  const actorDigits = String(req.actorKey || '').trim() || String(req.from || '').replace(/\D/g, '');
-
-  const kinds = ['expense', 'revenue'];
-  const out = [];
-
-  for (const kind of kinds) {
-    const r = await pg.cancelAllCilDraftsForActor({
-      owner_id: req.ownerId,
-      actor_phone: actorDigits,
-      kind,
-      status: 'cancelled'
-    });
-
-    out.push({
-      kind,
-      cancelled: r?.cancelled ?? null,
-      cancelled_ids: (r?.rows || []).slice(0, 10).map((x) => x.id)
-    });
-  }
-
-  console.info('[GLOBAL_CANCEL_CIL_ALL]', {
-    ownerId: req.ownerId,
-    actorDigits,
-    results: out
-  });
-} catch (e) {
-  console.warn('[GLOBAL_CANCEL_CIL_ALL] failed (ignored):', e?.message);
-}
-  return ok(res, '❌ Cancelled. You’re cleared.');
 }
 
 // -----------------------------------------------------------------------

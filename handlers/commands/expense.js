@@ -2948,19 +2948,34 @@ if (isRefundish && amount && !/^-/.test(amount)) {
   // convert "$200.00" -> "-$200.00" by reformatting from number instead if you have it
 }
 
+// ✅ DROP-IN: deterministicExpenseParse (robust, refund-safe, no top-level raw/token usage)
 function deterministicExpenseParse(input, userProfile) {
   const raw0 = String(input || '').trim();
   if (!raw0) return null;
 
-  // ✅ Normalize fancy dashes so "$883 — Railing" behaves like "$883 - Railing"
+  // Normalize fancy dashes so "$883 — Railing" behaves like "$883 - Railing"
   const raw = normalizeDashes(raw0);
 
+  // --- amount ---
   const token = extractMoneyToken(raw);
   if (!token) return null;
 
-  const amount = moneyToFixed(token);
+  // Refund/credit hint must live INSIDE the function (raw exists here)
+  const isRefundish = /\b(refund|credit|return|chargeback|reversal)\b/i.test(raw);
+
+  let amount = moneyToFixed(token);
   if (!amount) return null;
 
+  // Optional: if text is refund-ish and amount is positive, force negative
+  // NOTE: only applies if moneyToFixed returned a positive formatted string
+  if (isRefundish && amount && !/^-/.test(String(amount))) {
+    const num = Number(String(amount).replace(/[^0-9.-]/g, ''));
+    if (Number.isFinite(num) && num !== 0) {
+      amount = formatMoneyDisplay(-Math.abs(num));
+    }
+  }
+
+  // --- date ---
   const tz = userProfile?.timezone || userProfile?.tz || 'UTC';
 
   let date = null;
@@ -2972,30 +2987,32 @@ function deterministicExpenseParse(input, userProfile) {
     const iso = raw.match(/\b(\d{4}-\d{2}-\d{2})\b/);
     if (iso?.[1]) date = iso[1];
   }
-  // If this looks like receipt/OCR text and no explicit date token was found, do NOT default to today.
-// Let downstream confirmation / OCR-safe extractors fill date, or keep it null.
-const looksReceipt =
-  /\b(receipt|subtotal|hst|gst|pst|tax|total|debit|visa|mastercard|amex|approved|auth|terminal)\b/i.test(raw);
 
-if (!date) {
-  date = looksReceipt ? null : todayInTimeZone(tz);
-}
+  // If receipt-ish and no explicit date token, do NOT default to today
+  const looksReceipt =
+    /\b(receipt|subtotal|hst|gst|pst|tax|total|debit|visa|mastercard|amex|approved|auth|terminal)\b/i.test(raw);
 
+  if (!date) {
+    date = looksReceipt ? null : todayInTimeZone(tz);
+  }
 
+  // --- job ---
   let jobName = null;
   const forJob = raw.match(/\bfor\s+(?:job\s+)?(.+?)(?:[.?!]|$)/i);
   if (forJob?.[1]) {
-  const cand = String(forJob[1]).trim();
-  if (cand && !isIsoDateToken(cand)) jobName = normalizeJobNameCandidate(cand);
-}
+    const cand = String(forJob[1]).trim();
+    if (cand && !isIsoDateToken(cand)) jobName = normalizeJobNameCandidate(cand);
+  }
   if (jobName && looksLikeOverhead(jobName)) jobName = 'Overhead';
 
+  // --- store/vendor ---
   let store = null;
   const fromMatch = raw.match(
     /\b(?:from|at)\s+(.+?)(?:\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
   );
   if (fromMatch?.[1]) store = String(fromMatch[1]).trim();
 
+  // --- item ---
   let item = null;
 
   // 1) "worth of <item> from/at <store>"
@@ -3004,7 +3021,7 @@ if (!date) {
   );
   if (worthOf?.[1]) item = String(worthOf[1]).trim();
 
-  // 2) ✅ NEW: "purchased $883 in railing at Rona"
+  // 2) "purchased $883 in railing at Rona"
   if (!item) {
     const inItem = raw.match(
       /\b(?:spent|spend|paid|pay|purchased|purchase|bought|buy|ordered|order|got)\b.*?\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+\bin\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
@@ -3012,15 +3029,15 @@ if (!date) {
     if (inItem?.[1]) item = String(inItem[1]).trim();
   }
 
-  // 3) ✅ UPGRADED: "$883 - Railing at Rona" (after normalizeDashes)
+  // 3) "$883 - Railing at Rona"
   if (!item) {
     const dashItem = raw.match(
-      /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
+      /\$\s*[0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
     );
     if (dashItem?.[1]) item = String(dashItem[1]).trim();
   }
 
-  // 4) Keep your "for <item> at/from <store>" rule (but don’t allow "for job ...")
+  // 4) "for <item> at/from <store>" (but don’t allow "for job ...")
   if (!item) {
     const itemMatch = raw.match(
       /\bfor\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
@@ -3040,6 +3057,7 @@ if (!date) {
     jobName: jobName || null
   };
 }
+
 
 /* ---------------- inbound helpers (drop-in) ---------------- */
 

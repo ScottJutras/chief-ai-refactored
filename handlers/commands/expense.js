@@ -3079,16 +3079,6 @@ function deterministicExpenseParse(input, userProfile) {
     jobName: jobName || null
   };
 }
-const backstop = deterministicExpenseParse(input, userProfile);
-
-console.info('[EXPENSE_PARSE_RESULT_BACKSTOP]', {
-  hasBackstop: !!backstop,
-  amount: backstop?.amount ?? null,
-  store: backstop?.store ?? backstop?.vendor ?? null,
-  date: backstop?.date ?? null,
-  job: backstop?.jobName ?? backstop?.job ?? null,
-  head: String(input || '').slice(0, 120)
-});
 
 
 
@@ -6178,7 +6168,17 @@ if (looksLikeReceiptText(input)) {
 // ✅ IMPORTANT: this brace closes ONLY: if (looksLikeReceiptText(input)) { ... }
 } else {
   // ✅ Non-receipt path: deterministic parse first
-  const backstop = deterministicExpenseParse(input, userProfile);
+  const backstop = deterministicExpenseParse(rawInboundText, userProfile);
+
+console.info('[EXPENSE_PARSE_RESULT_BACKSTOP]', {
+  hasBackstop: !!backstop,
+  amount: backstop?.amount ?? null,
+  store: backstop?.store ?? backstop?.vendor ?? null,
+  date: backstop?.date ?? null,
+  job: backstop?.jobName ?? backstop?.job ?? null,
+  head: String(rawInboundText || '').slice(0, 120)
+});
+
 
   // Helper: normalize "<digits>:SMxxxx" safely (prevents double-prefix / junk prefixes)
   const normalizeMediaSourceMsgId = (userKeyDigits, val) => {

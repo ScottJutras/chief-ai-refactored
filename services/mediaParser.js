@@ -249,7 +249,11 @@ function tryParseExpense(text) {
   const lc = s.toLowerCase();
 
   const verb = /\b(spent|paid|bought|purchased|purchase|ordered|charge|charged|picked\s*up)\b/.test(lc);
-  if (!verb && !/\bexpense\b/.test(lc) && !/\breceipt\b/.test(lc)) return null;
+    const worth = /\bworth(?:\s+of)?\b/.test(lc);
+
+  // treat "$X worth of Y" as expense-ish even without "bought/spent"
+  if (!verb && !worth && !/\bexpense\b/.test(lc) && !/\breceipt\b/.test(lc)) return null;
+
 
   const token = extractMoneyToken(s);
   if (!token) return null;

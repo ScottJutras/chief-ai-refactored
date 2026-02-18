@@ -687,6 +687,34 @@ async function detectTransactionsCapabilities() {
   };
 }
 
+// ============================================================================
+// ✅ DROP-IN: safeQueryUndefinedColumnRetry
+// ----------------------------------------------------------------------------
+// If a query fails due to undefined column (42703) we retry with a caller-provided
+// fallback SQL (typically the same query but without the missing column).
+// This prevents crashes from schema drift like: column "source" does not exist.
+// ============================================================================
+async function safeQueryUndefinedColumnRetry(pgClient, primarySql, params, fallbackSql, tag = 'SAFE_SQL') {
+  try {
+    return await pgClient.query(primarySql, params);
+  } catch (e) {
+    const code = e?.code || null; // Postgres error code
+    const msg = String(e?.message || '');
+
+    const isUndefinedColumn = code === '42703' || /column .* does not exist/i.test(msg);
+    if (!isUndefinedColumn) throw e;
+
+    console.warn(`[${tag}] undefined column -> retrying without optional column`, {
+      code,
+      msg: msg.slice(0, 180)
+    });
+
+    return await pgClient.query(fallbackSql, params);
+  }
+}
+
+
+
 
 async function detectTransactionsUniqueOwnerSourceMsg() {
   if (TX_HAS_OWNER_SOURCEMSG_UNIQUE !== null) return TX_HAS_OWNER_SOURCEMSG_UNIQUE;
@@ -4520,5 +4548,5 @@ module.exports = {
   getTenantIdForOwnerDigits,
   sumExpensesCentsByRange,
   sumRevenueCentsByRange,
-
+  safeQueryUndefinedColumnRetry,
 };

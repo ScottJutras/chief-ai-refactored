@@ -29,7 +29,7 @@ const pg = require('../services/postgres');
 const { checkMonthlyQuota } = require('../utils/quota'); // adjust path if needed
 const { shouldShowUpgradePromptOnce } = require('../src/lib/handleCapabilityDenied');
 const { getEffectivePlanFromOwner } = require('../src/config/effectivePlan');
-
+const { normalizeTranscriptMoney, stripLeadingFiller } = require('../utils/transcriptNormalize');
 // ✅ Preferred: resolve caps from an already-loaded ownerProfile (NO extra DB call)
 async function resolveCapsForOwnerProfile(ownerProfile) {
   const plan = getEffectivePlanFromOwner(ownerProfile); // free/starter/pro
@@ -1114,7 +1114,7 @@ try {
         twiml: twiml(`Is this an expense receipt, revenue, or timesheet? Reply "expense", "revenue", or "timesheet".`)
       };
     }
-
+    extractedText = normalizeTranscriptMoney(stripLeadingFiller(extractedText));
     // Let media parser classify structured intents (time, hours, expense/revenue)
     const result = await parseMediaText(extractedText);
 
@@ -1185,10 +1185,14 @@ try {
     }
 
     // Expense / Revenue
-    if (result?.type === 'expense' || result?.type === 'revenue') {
-      await markPendingFinance({ userKey, kind: result.type, stableMediaMsgId });
-      return { transcript: extractedText, twiml: null };
-    }
+if (result?.type === 'expense' || result?.type === 'revenue') {
+  await markPendingFinance({ userKey, kind: result.type, stableMediaMsgId });
+
+  // ✅ IMPORTANT: force deterministic routing by prefixing the command keyword
+  const forced = `${result.type} ${String(extractedText || '').trim()}`.trim();
+  return { transcript: forced, twiml: null };
+}
+
 
     // Otherwise pass transcript to router
     return { transcript: extractedText, twiml: null };

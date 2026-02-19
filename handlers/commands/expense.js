@@ -6820,6 +6820,138 @@ console.info('[EXPENSE_DEBUG_AFTER_PARSE]', {
     : null,
   aiReplyHead: aiReply ? String(aiReply).slice(0, 80) : null
 });
+// === DATE INFERENCE: month/day provided but year missing ==================
+// If transcript includes an explicit month+day but no year, infer year as:
+// - currentYear if that date <= today (tenant TZ)
+// - else currentYear - 1
+// This prevents AI/date fallback from incorrectly stamping "today".
+
+function getTodayPartsInTz(tz) {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz || "UTC",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    const parts = fmt.formatToParts(new Date());
+    const y = Number(parts.find(p => p.type === "year")?.value);
+    const m = Number(parts.find(p => p.type === "month")?.value);
+    const d = Number(parts.find(p => p.type === "day")?.value);
+    if (!y || !m || !d) return null;
+    return { y, m, d };
+  } catch (e) {
+    return null;
+  }
+}
+
+function pad2(n) { return String(n).padStart(2, "0"); }
+
+function extractMonthDayNoYear(text) {
+  if (!text) return null;
+  const s = String(text);
+
+  // If a 4-digit year is explicitly present anywhere, do nothing.
+  // (We only infer year when user omitted it.)
+  if (/\b(19|20)\d{2}\b/.test(s)) return null;
+
+  const monthMap = {
+    jan: 1, january: 1,
+    feb: 2, february: 2,
+    mar: 3, march: 3,
+    apr: 4, april: 4,
+    may: 5,
+    jun: 6, june: 6,
+    jul: 7, july: 7,
+    aug: 8, august: 8,
+    sep: 9, sept: 9, september: 9,
+    oct: 10, october: 10,
+    nov: 11, november: 11,
+    dec: 12, december: 12,
+  };
+
+  // Month name + day (e.g., "August 31st", "Aug 31")
+  const monthDay = s.match(
+    /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t|tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b[^0-9]{0,10}\b([0-3]?\d)(st|nd|rd|th)?\b/i
+  );
+  if (monthDay) {
+    const monStr = monthDay[1].toLowerCase();
+    const day = Number(monthDay[2]);
+    const month = monthMap[monStr] ?? monthMap[monStr.slice(0, 3)];
+    if (month && day >= 1 && day <= 31) return { month, day, source: "month_name" };
+  }
+
+  // Numeric month/day (e.g., "8/31", "08-31")
+  const md = s.match(/\b([0-1]?\d)\s*[\/\-]\s*([0-3]?\d)\b/);
+  if (md) {
+    const month = Number(md[1]);
+    const day = Number(md[2]);
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return { month, day, source: "numeric_md" };
+  }
+
+  return null;
+}
+
+function inferYearForMonthDay(month, day, tz) {
+  const t = getTodayPartsInTz(tz) || getTodayPartsInTz("UTC");
+  if (!t) return null;
+
+  // If month/day is after today's month/day, that date in current year is future → use last year.
+  const isFutureInCurrentYear =
+    (month > t.m) || (month === t.m && day > t.d);
+
+  const year = isFutureInCurrentYear ? (t.y - 1) : t.y;
+  return `${year}-${pad2(month)}-${pad2(day)}`;
+}
+
+// Apply override only when:
+// - user text contains explicit month/day w/o year
+// - and parsed date is missing OR equals today (common fallback symptom)
+try {
+  // Use the canonical intake text you are currently processing.
+  // Prefer `input` because your logs + fallback copy use it.
+  const textForDateScan = input || raw || "";
+
+  const md = extractMonthDayNoYear(textForDateScan);
+  if (md) {
+    const today = getTodayPartsInTz(ctx?.tz) || getTodayPartsInTz("UTC");
+    const todayStr = today ? `${today.y}-${pad2(today.m)}-${pad2(today.d)}` : null;
+
+    // Your canonical date field is `data.date` in this snippet.
+    const parsedDateStr = (data && (data.date || data.expense_date || data.expenseDate)) || null;
+    const isMissing = !parsedDateStr;
+    const isFallbackToday = !!(todayStr && parsedDateStr === todayStr);
+
+    if (isMissing || isFallbackToday) {
+      const inferred = inferYearForMonthDay(md.month, md.day, ctx?.tz);
+      if (inferred) {
+        console.info("[EXPENSE_DATE_INFERRED_MISSING_YEAR]", {
+          ownerId,
+          paUserId,
+          from: parsedDateStr,
+          to: inferred,
+          source: md.source,
+          rawHead: String(textForDateScan).slice(0, 120),
+        });
+
+        if (data) {
+          data.date = inferred;
+          if (data.expense_date) data.expense_date = inferred;
+          if (data.expenseDate) data.expenseDate = inferred;
+        }
+      }
+    }
+  }
+} catch (e) {
+  console.warn("[EXPENSE_DATE_INFERRED_MISSING_YEAR_ERR]", {
+    ownerId,
+    paUserId,
+    msg: e?.message
+  });
+}
+// === END DATE INFERENCE ===================================================
+
+console.info("[EXPENSE_FINAL_DATE_PRE_NORMALIZE]", { date: data?.date ?? null });
 
 
 // Normalize (works for both AI + deterministic)

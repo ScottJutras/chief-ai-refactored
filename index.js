@@ -65,16 +65,30 @@ const { stripeWebhookHandler } = require("./handlers/stripeWebhook");
 
 const app = express();
 
-// Allow the Vite dashboard (localhost:5174) to call this API in dev.
+// Allow local/dev frontends to call this API when NOT on Vercel.
+// (Portal normally proxies server-to-server, but this helps debugging.)
 if (!process.env.VERCEL) {
+  const allow = new Set([
+    "http://localhost:5174",
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://app.usechiefos.com",
+    "https://usechiefos.com",
+  ]);
+
   app.use(
     cors({
-      origin: "http://localhost:5174",
+      origin: (origin, cb) => {
+        if (!origin) return cb(null, true); // curl/postman
+        if (allow.has(origin)) return cb(null, true);
+        return cb(new Error(`CORS blocked: ${origin}`));
+      },
       methods: ["GET", "POST", "OPTIONS"],
       allowedHeaders: ["Content-Type", "Authorization"],
     })
   );
 }
+
 
 /* ---------------- Hardening / perf (no global parsers) ---------------- */
 app.disable("x-powered-by");

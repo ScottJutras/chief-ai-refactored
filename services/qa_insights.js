@@ -12,6 +12,21 @@ if (window === 'MTD') { start.setDate(1); start.setHours(0,0,0,0); end.setHours(
 return { startIso: start.toISOString(), endIso: end.toISOString() };
 }
 
+function normalizeRangeFromText(text, fallback = "mtd") {
+  const t = String(text || "").toLowerCase();
+
+  // Explicit
+  if (/\b(today|todays|today's)\b/.test(t)) return "today";
+  if (/\b(wtd|week to date|this week)\b/.test(t)) return "wtd";
+  if (/\b(mtd|month to date|this month)\b/.test(t)) return "mtd";
+  if (/\b(ytd|year to date|this year)\b/.test(t)) return "ytd";
+  if (/\b(all time|all)\b/.test(t)) return "all";
+
+  // Common “rolling week” phrasing → treat as wtd for v0
+  if (/\b(last 7 days|past 7 days|previous 7 days)\b/.test(t)) return "wtd";
+
+  return fallback;
+}
 
 async function getCompanySnapshot({ ownerId, window = 'MTD', tz }) {
 const { startIso, endIso } = startEndOfWindow(window, tz);

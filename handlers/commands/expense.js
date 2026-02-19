@@ -6871,18 +6871,201 @@ if (missingCore) {
   );
 }
 
-// ✅ If we got here, we have enough to continue the normal expense flow.
-// DO NOT return here — let the existing confirm / PA / job picker logic run next.
+// ✅ If we got here, we have enough to proceed.
+// IMPORTANT: we must now RUN the confirm flow and RETURN,
+// otherwise we will fall through to the hard fallback.
 
+try {
+  let data0 = { ...data };
 
+  // Normalize vendor (optional)
+  if (data0.store) {
+    try {
+      data0.store = await normalizeVendorName(ownerId, data0.store);
+    } catch {}
+  }
 
-// It can now safely assume `data.amount` + `data.store` exist.
+  // Vendor sanitation: prevent “Rona for plywood” pollution.
+  // Only strip trailing “ for …” if we ALSO have an item/description already.
+  if (data0?.store && typeof data0.store === 'string') {
+    const s = data0.store.trim();
+    if (data0?.item && /\sfor\s/i.test(s)) {
+      data0.store = s.replace(/\s+for\s+.*/i, '').trim();
+    }
+  }
 
+  // Item fallback (if still unknown)
+  if (isUnknownItem(data0.item)) {
+    const inferred = inferExpenseItemFallback(input);
+    if (inferred) data0.item = inferred;
+  }
 
-// IMPORTANT: your existing code should normally return from inside that flow.
+  // Category (best-effort)
+  let category = null;
+  try {
+    category = await resolveExpenseCategory({ ownerId, data: data0, ownerProfile });
+    category = category && String(category).trim() ? String(category).trim() : null;
+  } catch {}
 
-// 🔒 HARD FALLBACK: if we got here, we fell through without replying.
-// This should be very rare — it means a future refactor forgot to return.
+  // Job resolution (typed → active → overhead)
+  let jobName = data0.jobName || null;
+  let jobSource = jobName ? 'typed' : null;
+
+  if (!jobName) {
+    try {
+      jobName = (await resolveActiveJobName({ ownerId, userProfile, fromPhone })) || null;
+      if (jobName) jobSource = 'active';
+    } catch {}
+  }
+
+  if (jobName && looksLikeOverhead(jobName)) {
+    jobName = 'Overhead';
+    jobSource = 'overhead';
+  }
+
+  // Clean “item” of embedded job/date junk once job is known
+  if (jobName) {
+    data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
+  }
+
+  // ✅ Canonical per-message id for confirm PA (NO stableMsgId dependency)
+  const safeMsgId0 =
+    String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+    String(sourceMsgId || '').trim() ||
+    `${paUserId}:${Date.now()}`;
+
+  // ✅ media_source_msg_id always "digits:SM..."
+  const u = String(paUserId || '').trim();
+  const sid = String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim();
+  const ms0 = sid ? normalizeMediaSourceMsgId(u, sid) : null;
+
+  // ✅ Upsert CONFIRM PA (so “Yes/Edit” works)
+  await upsertPA({
+    ownerId,
+    userId: paKey,
+    kind: PA_KIND_CONFIRM,
+    payload: {
+      draft: {
+        ...data0,
+        jobName,
+        jobSource,
+        suggestedCategory: category,
+        job_id: null,
+        job_no: null,
+
+        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+        media_source_msg_id: ms0,
+
+        originalText: input,
+        draftText: input
+      },
+      sourceMsgId: safeMsgId0,
+      type: 'expense'
+    },
+    ttlSeconds: PA_TTL_SEC
+  });
+
+  // ✅ Create/refresh CIL draft row (initial confirm send)
+  try {
+    const confirmPA1 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+    const draft1 = confirmPA1?.payload?.draft || null;
+    const srcId = String(confirmPA1?.payload?.sourceMsgId || '').trim() || null;
+
+    if (draft1) {
+      await upsertCilDraftForExpenseConfirm({
+        ownerId,
+        paUserId: paKey,
+        fromPhone,
+        draft: draft1,
+        sourceMsgId: srcId
+      });
+    }
+  } catch {}
+
+  // ✅ If no job, go to picker
+  if (!jobName) {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+
+    const confirmFlowId =
+      String(safeMsgId0 || '').trim() ||
+      String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+      String(sourceMsgId || '').trim() ||
+      `${paUserId}:${Date.now()}`;
+
+    await sendJobPickList({
+      fromPhone,
+      ownerId,
+      userProfile,
+      confirmFlowId,
+      jobOptions: jobs,
+      paUserId,
+      page: 0,
+      pickUserId: canonicalUserKey,
+      pageSize: 8,
+      context: 'expense_jobpick',
+      confirmDraft: {
+        ...data0,
+        jobName: null,
+        jobSource: null,
+        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+        media_source_msg_id: ms0,
+        originalText: input,
+        draftText: input
+      }
+    });
+
+    return out(twimlEmpty(), true);
+  }
+
+  // ✅ Otherwise send confirm card
+  const summaryLine = buildExpenseSummaryLine({
+    amount: data0.amount,
+    item: data0.item,
+    store: data0.store,
+    date: data0.date,
+    jobName,
+    tz,
+    sourceText: input
+  });
+
+  let activeJob = null;
+  try {
+    if (typeof pg.getActiveJob === 'function') {
+      activeJob = await pg.getActiveJob(ownerId, paKey).catch(() => null);
+    }
+  } catch {}
+
+  return await sendConfirmExpenseOrFallback(
+    fromPhone,
+    `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`,
+    {
+      ownerId,
+      paUserId: paKey,
+      draft: {
+        ...data0,
+        jobName,
+        jobSource,
+        suggestedCategory: category,
+        job_id: null,
+        job_no: null,
+        media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+        media_source_msg_id: ms0,
+        originalText: input,
+        draftText: input
+      },
+      activeJob,
+      varsPreview: null
+    }
+  );
+} catch (e) {
+  console.warn('[EXPENSE_CONFIRM_FLOW_FAILED]', e?.message);
+  return out(
+    twimlText(`🤔 I parsed that expense, but I couldn’t start the confirm flow. Try again or reply "resume".`),
+    false
+  );
+}
+
+// 🔒 HARD FALLBACK (should never happen now)
 console.warn('[EXPENSE_FALLTHROUGH_NO_REPLY]', {
   ownerId,
   paUserId,
@@ -6900,6 +7083,7 @@ return out(
   ),
   false
 );
+
 
 } catch (error) {
   console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {

@@ -3043,10 +3043,10 @@ function extractMoneyToken(input) {
     .replace(/[–—]/g, '-')         // en/em dash → hyphen
     .replace(/\s+/g, ' ');
 
-  // 1) Strong signal: $ amount (allow comma OR space grouping)
+   // 1) Strong signal: MUST include '$' (prevents matching dates like "July 17")
   // Examples: $2000, $2,000, $2 000, $2000.50, -$2000
   const moneyMatches = [];
-  const reDollar = /(?:^|[^\w])(?:-\s*)?\$?\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?=$|[^\w])/g;
+  const reDollar = /(?:^|[^\w])(?:-\s*)?\$\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?=$|[^\w])/g;
   let m;
   while ((m = reDollar.exec(s)) !== null) {
     const tok = m[1];
@@ -6671,14 +6671,31 @@ function parseExpenseDeterministic(rawText, tz0) {
   const s = String(rawText || '').replace(/\s+/g, ' ').trim();
   const lc = s.toLowerCase();
 
-  // Require an amount somewhere (ignore negatives)
-  const moneyMatch = s.match(/\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)/);
+    // Require an amount somewhere.
+  // Prefer explicit "$" amounts first to avoid grabbing dates like "July 17".
+  let moneyMatch = s.match(/-\s*\$\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/);
+  if (!moneyMatch) {
+    moneyMatch = s.match(/\$\s*(\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/);
+  }
+
+  // Fallback only if no $-amount exists: allow a bare number (legacy behavior)
+  // NOTE: this can still match non-money numbers; keep it last.
+  if (!moneyMatch) {
+   // Prefer decimal amounts (12.34) or comma-grouped (1,234.56) before plain ints (17)
+moneyMatch = s.match(/\b(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d{1,3}\.\d{1,2})\b/);
+if (!moneyMatch) {
+  moneyMatch = s.match(/\b(\d{1,3}(?:,\d{3})*)\b/);
+}
+
+  }
+
   if (!moneyMatch) return null;
 
-  const num = Number(String(moneyMatch[1]).replace(/,/g, ''));
+  const num = Number(String(moneyMatch[1]).replace(/,/g, '').replace(/\s/g, ''));
   if (!Number.isFinite(num) || num <= 0) return null;
 
   const amount = `$${num.toFixed(2)}`;
+
 
   // Date: today/yesterday/tomorrow OR explicit date via extractReceiptDateYYYYMMDD
   let date = null;
@@ -6740,8 +6757,11 @@ function shiftDateYYYYMMDD(ymd, deltaDays) {
 }
 
 // -----------------------------
-// 1) Try AI parse (soft)
+// Canonical parse stage (AI soft → deterministic fallback → normalize)
+// MUST run before any confirm/draft logic reads `data`.
 // -----------------------------
+
+// 1) Try AI parse (soft)
 let aiRes = null;
 try {
   aiRes = await handleInputWithAI(
@@ -6761,25 +6781,23 @@ try {
 let data = aiRes?.data || null;
 let aiReply = aiRes?.reply || null;
 
-// -----------------------------
-// 2) If AI failed or missing core, use deterministic parse
-// -----------------------------
+// 2) If AI failed, use deterministic parse
 const det = (!data ? parseExpenseDeterministic(raw, ctx.tz) : null);
 
 if (!data && det) {
   data = {
     amount: det.amount,
-    date: det.date || null, // leave null; normalizeExpenseData decides fallback rules
+    date: det.date || null, // keep null if absent; normalizeExpenseData decides fallback
     store: det.store || 'Unknown Store',
     item: det.item || inferExpenseItemFallback(raw) || 'Unknown',
     jobName: det.jobName || null,
     originalText: input,
     draftText: input
   };
-  aiReply = null; // we have data now
+  aiReply = null;
 }
 
-// Normalize (works for both AI + deterministic)
+// 3) Normalize (works for both AI + deterministic)
 if (data) {
   const sourceText = String(
     data?.receiptText ||
@@ -6821,6 +6839,9 @@ if (missingCore) {
     false
   );
 }
+
+
+// It can now safely assume `data.amount` + `data.store` exist.
 
 // ✅ SUCCESS FLOW CONTINUES HERE
 // (your existing confirm / upsert PA / send confirm card / picker / etc.)

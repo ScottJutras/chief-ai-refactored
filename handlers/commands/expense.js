@@ -6797,6 +6797,31 @@ if (!data && det) {
   aiReply = null;
 }
 
+// ✅ DEBUG (place #1): right after AI+deterministic assignment, BEFORE normalize
+console.info('[EXPENSE_DEBUG_AFTER_PARSE]', {
+  hasAI: !!aiRes,
+  hasData: !!data,
+  data: data
+    ? {
+        amount: data.amount ?? null,
+        store: data.store ?? null,
+        date: data.date ?? null,
+        item: data.item ?? null,
+        jobName: data.jobName ?? null
+      }
+    : null,
+  det: det
+    ? {
+        amount: det.amount ?? null,
+        store: det.store ?? null,
+        date: det.date ?? null,
+        jobName: det.jobName ?? null
+      }
+    : null,
+  aiReplyHead: aiReply ? String(aiReply).slice(0, 80) : null
+});
+
+
 // Normalize (works for both AI + deterministic)
 if (data) {
   const sourceText = String(

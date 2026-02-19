@@ -6671,8 +6671,8 @@ function parseExpenseDeterministic(rawText, tz0) {
   const s = String(rawText || '').replace(/\s+/g, ' ').trim();
   const lc = s.toLowerCase();
 
-  // Require an amount somewhere
-  const moneyMatch = s.match(/\$?\s*(-?\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)/);
+  // Require an amount somewhere (ignore negatives)
+  const moneyMatch = s.match(/\$?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)/);
   if (!moneyMatch) return null;
 
   const num = Number(String(moneyMatch[1]).replace(/,/g, ''));
@@ -6680,7 +6680,7 @@ function parseExpenseDeterministic(rawText, tz0) {
 
   const amount = `$${num.toFixed(2)}`;
 
-  // Date: today/yesterday/tomorrow or explicit YYYY-MM-DD or MM/DD/YYYY
+  // Date: today/yesterday/tomorrow OR explicit date via extractReceiptDateYYYYMMDD
   let date = null;
   try {
     if (/\btoday\b/i.test(lc)) date = todayInTimeZone(tz0);
@@ -6693,13 +6693,13 @@ function parseExpenseDeterministic(rawText, tz0) {
     date = null;
   }
 
-  // Vendor/store: look for " at X " or " from X " else take trailing tokens after amount
+  // Vendor/store: look for "at X" or "from X" else take trailing tokens after amount
   let store = null;
   const atFrom = s.match(/\b(?:at|from)\s+(.+?)(?:\s+\b(?:on|for|job)\b\s+|$)/i);
   if (atFrom?.[1]) {
     store = String(atFrom[1]).trim();
   } else {
-    // remove leading "expense/exp" and amount then use what's left as store candidate
+    // remove leading "expense/exp" and the amount then use what's left as store candidate
     const stripped = s
       .replace(/^(expense|exp)\b[:\-]?\s*/i, '')
       .replace(moneyMatch[0], ' ')
@@ -6707,12 +6707,11 @@ function parseExpenseDeterministic(rawText, tz0) {
       .replace(/\s+/g, ' ')
       .trim();
 
-    // If user wrote: "$12.34 Home Depot"
     if (stripped) store = stripped;
   }
 
-  // Item: optional; if you have your infer fallback, let that do it later.
-  let item = null;
+  // Item: optional; let downstream inference handle it
+  const item = null;
 
   // Job: best-effort parse "job X" or "for job X"
   let jobName = null;
@@ -6770,7 +6769,7 @@ const det = (!data ? parseExpenseDeterministic(raw, ctx.tz) : null);
 if (!data && det) {
   data = {
     amount: det.amount,
-    date: det.date || todayInTimeZone(ctx.tz),
+    date: det.date || null, // leave null; normalizeExpenseData decides fallback rules
     store: det.store || 'Unknown Store',
     item: det.item || inferExpenseItemFallback(raw) || 'Unknown',
     jobName: det.jobName || null,
@@ -6823,26 +6822,28 @@ if (missingCore) {
   );
 }
 
-// 🔒 HARD FALLBACK: if we got here, we fell through without replying
-// (This should be *very rare*—it means a future refactor forgot to return.)
-console.warn('[EXPENSE_FALLTHROUGH_NO_REPLY]', {
+// ✅ SUCCESS FLOW CONTINUES HERE
+// (your existing confirm / upsert PA / send confirm card / picker / etc.)
+// IMPORTANT: your existing code should normally return from inside that flow.
+
+// 🔒 HARD FALLBACK (LAST thing in try, only if a refactor forgot to return)
+console.warn('[EXPENSE_FALLTHROUGH_REPLIED]', {
   ownerId,
   paUserId,
-  sourceMsgId: inboundTwilioMeta?.MessageSid || null,
+  sourceMsgId: inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || null,
   head: String(rawInboundText || input || '').slice(0, 120)
 });
 
 return out(
   twimlText(
     [
-      "I couldn’t parse that expense yet.",
+      "I couldn’t confirm that expense yet.",
       "Try: expense $48 from RONA for plywood",
       'Or reply: "help expense"'
     ].join('\n')
   ),
   false
 );
-
 } catch (error) {
   console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
     stack: error?.stack,
@@ -6857,7 +6858,10 @@ return out(
     const lock = require('../../middleware/lock');
     if (lock?.releaseLock) await lock.releaseLock(lockKey);
   } catch {}
-} // end handleExpense
-}
+} // end try/catch/finally
+
+} // ✅ end handleExpense
+
 module.exports = { handleExpense };
+
 

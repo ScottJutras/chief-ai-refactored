@@ -6819,6 +6819,12 @@ if (data && isUnknownItem(data.item)) {
   const inferred = inferExpenseItemFallback(input);
   if (inferred) data.item = inferred;
 }
+console.info('[EXPENSE_DEBUG_BEFORE_MISSINGCORE]', {
+  hasData: !!data,
+  amount: data?.amount ?? null,
+  store: data?.store ?? null,
+  date: data?.date ?? null
+});
 
 const missingCore =
   !data ||

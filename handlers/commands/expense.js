@@ -6797,7 +6797,7 @@ if (!data && det) {
   aiReply = null;
 }
 
-// 3) Normalize (works for both AI + deterministic)
+// Normalize (works for both AI + deterministic)
 if (data) {
   const sourceText = String(
     data?.receiptText ||
@@ -6840,18 +6840,22 @@ if (missingCore) {
   );
 }
 
+// ✅ If we got here, we have enough to continue the normal expense flow.
+// DO NOT return here — let the existing confirm / PA / job picker logic run next.
+
+
 
 // It can now safely assume `data.amount` + `data.store` exist.
 
-// ✅ SUCCESS FLOW CONTINUES HERE
-// (your existing confirm / upsert PA / send confirm card / picker / etc.)
+
 // IMPORTANT: your existing code should normally return from inside that flow.
 
-// 🔒 HARD FALLBACK (LAST thing in try, only if a refactor forgot to return)
-console.warn('[EXPENSE_FALLTHROUGH_REPLIED]', {
+// 🔒 HARD FALLBACK: if we got here, we fell through without replying.
+// This should be very rare — it means a future refactor forgot to return.
+console.warn('[EXPENSE_FALLTHROUGH_NO_REPLY]', {
   ownerId,
   paUserId,
-  sourceMsgId: inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || null,
+  sourceMsgId: inboundTwilioMeta?.MessageSid || null,
   head: String(rawInboundText || input || '').slice(0, 120)
 });
 
@@ -6865,6 +6869,7 @@ return out(
   ),
   false
 );
+
 } catch (error) {
   console.error(`[ERROR] handleExpense failed for ${from}:`, error?.message, {
     stack: error?.stack,

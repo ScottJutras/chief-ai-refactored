@@ -2187,14 +2187,35 @@ if (hasPendingMedia && numMedia === 0) {
  * - Runs AFTER final post-media refresh (lc2 is settled)
  * - Runs AFTER tenant link enforcement (req.ownerId exists by here)
  * - Runs BEFORE Insights/orchestrator so "list jobs" never becomes insights
+ *
+ * IMPORTANT FIX:
+ * If we're awaiting a job delete confirmation, route "yes/cancel" back into handleJob()
+ * even though "yes" is not a "hard job command".
  * ----------------------------------------------------------------------- */
 try {
   const lcJob = String(lc2 || '').trim().toLowerCase();
   const hardJob = isHardJobCommand(lcJob);
 
-  console.info('[ROUTER_HARD_JOB]', { lcN: lcJob.slice(0, 50), isHardJobCommand: hardJob });
+  // ✅ If a job-delete confirm is pending, job handler must receive "yes"/"cancel".
+  const hasPendingJobDeleteConfirm = !!pending?.awaitingJobDeleteConfirm;
 
-  if (hardJob) {
+  // ✅ Avoid hijacking PA flows (expense/revenue) unless it's an explicit job command
+  const paKindHere = String(mostRecentPAKind || '').trim();
+  const isExpensePAHere = paKindHere === 'confirm_expense' || paKindHere === 'pick_job_for_expense';
+  const isRevenuePAHere = paKindHere === 'confirm_revenue' || paKindHere === 'pick_job_for_revenue';
+  const hasMoneyPAHere = isExpensePAHere || isRevenuePAHere;
+
+  const shouldRouteToJob = hardJob || (hasPendingJobDeleteConfirm && !hasMoneyPAHere);
+
+  console.info('[ROUTER_HARD_JOB]', {
+    lcN: lcJob.slice(0, 50),
+    isHardJobCommand: hardJob,
+    hasPendingJobDeleteConfirm,
+    hasMoneyPAHere,
+    shouldRouteToJob
+  });
+
+  if (shouldRouteToJob) {
     const { handleJob } = require('../handlers/commands/job');
 
     const sourceMsgId =

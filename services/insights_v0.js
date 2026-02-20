@@ -91,9 +91,20 @@ function rangeToFromTo(range, tz) {
 
   // For WTD/MTD/YTD we’ll prefer a calendar-aligned window if you have it.
   // If not, we approximate with fixed shifts (still deterministic).
-  if (range === "wtd") {
-    // Approx: last 7 days (good enough for tomorrow)
-    const fromIso = dateShift(toIso, -6) || toIso;
+    if (range === "wtd") {
+    // True WTD (Mon..today) in local tz without extra libs
+    const now = new Date();
+    const local = new Date(now.toLocaleString("en-CA", { timeZone: tz }));
+    const day = local.getDay(); // 0=Sun,1=Mon...
+    const diffToMonday = (day + 6) % 7; // Mon->0, Tue->1, ... Sun->6
+    const start = new Date(local);
+    start.setDate(local.getDate() - diffToMonday);
+
+    const y = start.getFullYear();
+    const m = String(start.getMonth() + 1).padStart(2, "0");
+    const d = String(start.getDate()).padStart(2, "0");
+    const fromIso = `${y}-${m}-${d}`;
+
     return { fromIso, toIso };
   }
 
@@ -503,73 +514,106 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
   const s = lc(raw);
   const tzUse = String(tz || "").trim() || "America/Toronto";
 
-  // (2) ✅ effectiveRange computed here (correct place)
+  // (0) Range (compute ONCE)
   const effectiveRange = normalizeRangeFromText(raw, "mtd");
   const { fromIso, toIso } = rangeToFromTo(effectiveRange, tzUse);
 
-  console.info("[INSIGHTS_RANGE_RESOLVED]", { ownerId, text: raw.slice(0, 80), effectiveRange, fromIso, toIso });
+  console.info("[INSIGHTS_RANGE_RESOLVED]", {
+    ownerId,
+    text: raw.slice(0, 80),
+    effectiveRange,
+    fromIso,
+    toIso,
+  });
+
+  // Helper: pretty label
+  const label =
+    effectiveRange === "today" ? "today" :
+    effectiveRange === "wtd" ? "this week" :
+    effectiveRange === "mtd" ? "this month" :
+    effectiveRange === "ytd" ? "this year" :
+    effectiveRange === "last7" ? "last 7 days" :
+    effectiveRange === "last30" ? "last 30 days" :
+    effectiveRange === "all" ? "all time" :
+    "this period";
 
   // 1) Profit / margin (job)
   if (looksLikeProfitQuestion(raw)) {
     return await answerProfitIntent({ ownerId, actorKey, text: raw });
   }
 
-  // 2) Spend / Revenue / Net / Profit totals (company)
-  const wantsSpend = /\b(spend|spent|expenses?|costs?)\b/.test(s);
-  const wantsRevenue = /\b(revenue|sales|earned|income)\b/.test(s);
-  const wantsNet = /\b(net|cash flow|cashflow)\b/.test(s) && (wantsSpend || wantsRevenue);
-  const wantsProfitTotal = /\bprofit\b|\bmargin\b/.test(s) && !/\bjob\b|#\d+|\bon\s+/.test(s); // avoid stealing job profit path
+  // 2) Business totals (spend / revenue / profit)
+  const wantsSpend = /\bspend\b|\bspent\b|\bexpenses?\b|\bcosts?\b/.test(s);
+  const wantsRevenue = /\brevenue\b|\bsales\b|\bearned\b|\bcollect(ed|ions)?\b|\bdeposits?\b/.test(s);
+  const wantsProfit = /\bprofit\b|\bmargin\b|\bnet\b/.test(s);
 
-  // If they asked for totals and mentioned a time window (or implicit via effectiveRange)
-  if (wantsSpend || wantsRevenue || wantsProfitTotal || wantsNet) {
-    const totals = await totalsForRange({ ownerId, fromIso, toIso });
+  // 2b) “Top expenses” intent (categories/vendors)
+  const wantsTopExpenses =
+    /\btop\s*\d*\s*(expenses?|costs?)\b|\bbiggest\s*(expenses?|costs?)\b|\btop\s*categories\b|\btop\s*vendors\b/.test(s);
 
-    // If we can’t compute totals, fall back safely.
-    if (!totals.ok) {
-      return {
-        ok: true,
-        route: "clarify",
-        answer:
-          `I can answer profit-by-job right now (e.g., “profit on job 1556”).\n` +
-          `Spend/revenue totals need one more DB helper wired.\n\nTry:\n• “profit on job 1556”\n• “list jobs”`,
-        evidence: { sql: [], facts_used: 0 },
-      };
-    }
+  // If they asked for totals OR top expenses — answer off the same range
+  if (wantsSpend || wantsRevenue || wantsProfit || wantsTopExpenses) {
+    // IMPORTANT: today you’re mixing sources:
+    // - revenue is from transactions
+    // - expenses are currently from chiefos_expenses (tenant scoped)
+    // That’s OK for tomorrow, but long-term you want both from transactions.
 
-    const label =
-      effectiveRange === "today"
-        ? "today"
-        : effectiveRange === "wtd"
-        ? "this week"
-        : effectiveRange === "mtd"
-        ? "this month"
-        : effectiveRange === "ytd"
-        ? "this year"
-        : effectiveRange === "all"
-        ? "all time"
-        : effectiveRange === "last7"
-        ? "last 7 days"
-        : effectiveRange === "last30"
-        ? "last 30 days"
-        : "this period";
+    const spendCents = await pg.sumExpensesCentsByRange({ ownerId, fromIso, toIso });
+    const revenueCents = await pg.sumRevenueCentsByRange({ ownerId, fromIso, toIso });
+    const profitCents = Number(revenueCents || 0) - Number(spendCents || 0);
 
     const lines = [`For ${label}:`];
-    if (wantsRevenue) lines.push(`• Revenue: ${money(totals.revenue)}`);
-    if (wantsSpend) lines.push(`• Spend: ${money(totals.spend)}`);
 
-    // Profit total (revenue - spend) for the period
-    if (wantsProfitTotal) lines.push(`• Profit (revenue − spend): ${money(totals.net)}`);
+    if (wantsRevenue) lines.push(`• Revenue: ${money(revenueCents)}`);
+    if (wantsSpend) lines.push(`• Spend: ${money(spendCents)}`);
+    if (wantsProfit) lines.push(`• Profit (revenue − spend): ${money(profitCents)}`);
 
-    // If they explicitly asked for “net”
-    if (wantsNet) lines.push(`• Net (revenue − spend): ${money(totals.net)}`);
+    // Top expense breakdown (best-effort, deterministic, uses transactions)
+    if (wantsTopExpenses) {
+      // Top categories
+      const topCats = await pg.topExpenseCategoriesByRange?.({
+        ownerId,
+        fromIso,
+        toIso,
+        limit: 5,
+      });
 
-    // Optional: “top 5 expenses” intent
-    if (/\btop\s*(\d+)?\s*expenses?\b|\bbiggest\s*expenses?\b|\btop\s*categories\b/.test(s)) {
-      const top = await topExpenseBreakdown({ ownerId, fromIso, toIso, limit: 5 });
-      if (top.ok) {
-        lines.push(``);
-        lines.push(`Top expense categories:`);
-        top.rows.forEach((r) => lines.push(`• ${r.category}: ${money(r.cents)}`));
+      // Top vendors
+      const topVendors = await pg.topExpenseVendorsByRange?.({
+        ownerId,
+        fromIso,
+        toIso,
+        limit: 5,
+      });
+
+      const catRows = Array.isArray(topCats?.rows) ? topCats.rows : [];
+      const venRows = Array.isArray(topVendors?.rows) ? topVendors.rows : [];
+
+      if (catRows.length || venRows.length) lines.push("");
+
+      if (catRows.length) {
+        lines.push("Top expense categories:");
+        catRows.forEach((r) => {
+          const name = String(r.category || "Uncategorized").trim() || "Uncategorized";
+          const cents = Number(r.cents || 0);
+          lines.push(`• ${name}: ${money(cents)}`);
+        });
+      }
+
+      if (venRows.length) {
+        if (catRows.length) lines.push("");
+        lines.push("Top vendors:");
+        venRows.forEach((r) => {
+          const name = String(r.vendor || "Unknown").trim() || "Unknown";
+          const cents = Number(r.cents || 0);
+          lines.push(`• ${name}: ${money(cents)}`);
+        });
+      }
+
+      // If functions aren’t wired, be explicit (no hallucination)
+      if (!pg.topExpenseCategoriesByRange || !pg.topExpenseVendorsByRange) {
+        lines.push("");
+        lines.push("Note: “top expenses” breakdown isn’t fully wired yet (needs 2 SQL helpers on transactions).");
       }
     }
 
@@ -577,50 +621,31 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
       ok: true,
       route: "insight",
       answer: lines.join("\n"),
-      evidence: { sql: ["sumExpensesCentsByRange", "sumRevenueCentsByRange"], facts_used: 2 },
+      evidence: {
+        sql: [
+          "sumExpensesCentsByRange",
+          "sumRevenueCentsByRange",
+          ...(wantsTopExpenses ? ["topExpenseCategoriesByRange", "topExpenseVendorsByRange"] : []),
+        ],
+        facts_used: 2,
+      },
     };
   }
 
-  // 3) Cash in/out (best-effort)
+  // 3) Cash-in/out (best-effort stub)
   const wantsCash = /\bcash\b|\bbank\b|\bcashflow\b|\bcash flow\b/.test(s);
-  const wantsIn = /\b(in|received|came in|collections)\b/.test(s);
-  const wantsOut = /\b(out|spent|went out|payments)\b/.test(s);
-
-  if (wantsCash && (wantsIn || wantsOut || /\bnet\b/.test(s))) {
-    const cf = await cashflowForRange({ ownerId, fromIso, toIso });
-
-    if (!cf.ok) {
-      return {
-        ok: true,
-        route: "clarify",
-        answer:
-          `Cash-in/out isn’t wired yet for your schema (we can add it via v_cashflow_daily).\n\n` +
-          `Try:\n• “spend this week”\n• “revenue this week”\n• “profit on job 1556”`,
-        evidence: { sql: [], facts_used: 0 },
-      };
-    }
-
-    const label =
-      effectiveRange === "today"
-        ? "today"
-        : effectiveRange === "wtd"
-        ? "this week"
-        : effectiveRange === "mtd"
-        ? "this month"
-        : effectiveRange === "ytd"
-        ? "this year"
-        : "this period";
-
-    const lines = [`Cash flow for ${label}:`];
-    if (wantsIn) lines.push(`• Cash in: ${money(cf.inCents)}`);
-    if (wantsOut) lines.push(`• Cash out: ${money(cf.outCents)}`);
-    if (!wantsIn && !wantsOut) lines.push(`• Net cash flow: ${money(cf.netCents)}`);
-    if (/\bnet\b/.test(s)) lines.push(`• Net cash flow: ${money(cf.netCents)}`);
-
-    return { ok: true, route: "insight", answer: lines.join("\n"), evidence: { sql: ["v_cashflow_daily"], facts_used: 2 } };
+  if (wantsCash) {
+    return {
+      ok: true,
+      route: "clarify",
+      answer:
+        `Cash-in/out isn’t wired yet for your schema (we can add it via v_cashflow_daily).\n\n` +
+        `Try:\n• “spend ${label}”\n• “revenue ${label}”\n• “top expenses ${label}”\n• “profit on job 1556”`,
+      evidence: { sql: [], facts_used: 0 },
+    };
   }
 
-  // Fallback: good suggestions
+  // Fallback
   return {
     ok: true,
     route: "clarify",
@@ -628,8 +653,8 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
       `Try:\n` +
       `• “spend this week” / “spend this month”\n` +
       `• “revenue this week” / “revenue this month”\n` +
-      `• “profit on job 1556”\n` +
-      `• “top expenses this month”`,
+      `• “top expenses this month”\n` +
+      `• “profit on job 1556”`,
     evidence: { sql: [], facts_used: 0 },
   };
 }

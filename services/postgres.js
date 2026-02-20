@@ -269,6 +269,74 @@ async function getTenantIdForOwnerDigits(ownerDigits) {
   return null;
 }
 
+async function topExpenseCategoriesByRange({ ownerId, fromIso, toIso, limit = 5 }) {
+  const owner = DIGITS(ownerId);
+  if (!owner) return { rows: [] };
+
+  const lim = Math.max(1, Math.min(25, Number(limit || 5)));
+
+  const r = await query(
+    `
+    select
+      coalesce(nullif(trim(category), ''), 'Uncategorized') as category,
+      coalesce(sum(coalesce(amount_cents, (round(amount * 100))::bigint)), 0)::bigint as cents
+    from public.transactions
+    where owner_id::text = $1
+      and lower(kind) = 'expense'
+      and date >= $2::date
+      and date <= $3::date
+    group by 1
+    order by cents desc
+    limit ${lim}
+    `,
+    [owner, fromIso, toIso]
+  );
+
+  return r;
+}
+
+async function topExpenseVendorsByRange({ ownerId, fromIso, toIso, limit = 5 }) {
+  const owner = DIGITS(ownerId);
+  if (!owner) return { rows: [] };
+
+  const lim = Math.max(1, Math.min(25, Number(limit || 5)));
+
+  // vendor does not exist in transactions, so we use:
+  // - description (best effort)
+  // - fallback to category if description empty
+const r = await query(
+  `
+  with v as (
+    select
+      -- raw vendor guess (best effort)
+      coalesce(
+        nullif(trim(split_part(description, ' - ', 1)), ''),
+        nullif(trim(split_part(description, '@', 1)), ''),
+        nullif(trim(description), ''),
+        'Unknown'
+      ) as vendor_raw,
+      coalesce(amount_cents, (round(amount * 100))::bigint) as cents
+    from public.transactions
+    where owner_id::text = $1
+      and lower(kind) = 'expense'
+      and date >= $2::date
+      and date <= $3::date
+  )
+  select
+    -- normalized key for grouping (fixes Lumber vs lumber)
+    initcap(lower(trim(vendor_raw))) as vendor,
+    coalesce(sum(cents), 0)::bigint as cents
+  from v
+  group by lower(trim(vendor_raw))
+  order by cents desc
+  limit ${lim}
+  `,
+  [owner, fromIso, toIso]
+);
+
+  return r;
+}
+
 /**
  * Sum expenses (in cents) for a date range.
  * Uses tenant_id UUID (chiefos_expenses is tenant-scoped).
@@ -4549,4 +4617,6 @@ module.exports = {
   sumExpensesCentsByRange,
   sumRevenueCentsByRange,
   safeQueryUndefinedColumnRetry,
+  topExpenseVendorsByRange,
+  topExpenseCategoriesByRange,
 };

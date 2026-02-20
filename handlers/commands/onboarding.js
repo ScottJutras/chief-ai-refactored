@@ -1,503 +1,411 @@
-// handlers/onboarding.js
-// ---------------------------------------------------------------
-// Multi‑step onboarding – name → location → business location →
-// email + 7‑day Pro trial + OTP + dashboard link → industry →
-// timezone → goal → terms → complete.
-// ---------------------------------------------------------------
+// handlers/commands/onboarding.js
+// Minimal, fast onboarding with “magic moment” + first job creation.
+// Uses public.settings (owner_id, key, value) as state store.
+
 const pg = require('../../services/postgres');
-const { releaseLock } = require('../../middleware/lock');
-const {
-  getPendingTransactionState,
-  setPendingTransactionState,
-  deletePendingTransactionState,
-} = require('../../utils/stateManager');
-const { sendTemplateMessage, sendQuickReply, sendMessage } = require('../../services/twilio');
-const { getValidationLists, detectLocation } = require('../../utils/validateLocation');
-const { resolveTimezone, isValidIanaTz, suggestTimezone } = require('../../utils/timezones');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const PRO_PRICE_ID = process.env.PRO_PRICE_ID;
 
-// -----------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------
-const normalizePhone = (raw = '') =>
-  String(raw || '').replace(/^whatsapp:/i, '').replace(/\D/g, '');
+// Optional: Twilio sender if you have it available in your codebase.
+// If you already have a "sendWhatsAppText" / "sendWhatsAppMedia" helper, wire it in here.
+let twilioClient = null;
+try {
+  twilioClient = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+} catch {}
 
-const cap = (s = '') =>
-  s
-    .trim()
-    .replace(/\s+/g, ' ')
-    .split(' ')
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join(' ');
-
-const INVALID_MAX = 3;
-const REQUIRED_FIELDS = ['user_id'];
-
-/** Safe lock release + audit */
-async function safeCleanup(req) {
-  const key = `lock:${req.ownerId || req.from || 'GLOBAL'}`;
-  try { await releaseLock(key); } catch {}
+function dbQuery(sql, params = []) {
+  // supports pg.query OR pg.pool.query (both patterns are common in your repo)
+  if (pg?.query) return pg.query(sql, params);
+  if (pg?.pool?.query) return pg.pool.query(sql, params);
+  throw new Error('postgres service has no query() or pool.query()');
 }
-/** TwiML helper (safe) */
-function twiml(res, body) {
-  const t = String(body ?? '').trim();
 
-  // ✅ Never emit empty <Message> (Twilio 14103)
-  if (!t) {
-    return res
-      .status(200)
-      .type('application/xml; charset=utf-8')
-      .send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+async function getSetting(ownerId, key) {
+  const { rows } = await dbQuery(
+    `select value from public.settings where owner_id = $1 and key = $2 limit 1`,
+    [String(ownerId), String(key)]
+  );
+  return rows?.[0]?.value ?? null;
+}
+
+async function setSetting(ownerId, key, value) {
+  await dbQuery(
+    `
+    insert into public.settings (owner_id, key, value)
+    values ($1, $2, $3)
+    on conflict (owner_id, key)
+    do update set value = excluded.value, updated_at = now()
+    `,
+    [String(ownerId), String(key), String(value ?? '')]
+  );
+}
+
+function normCountry(raw) {
+  const s = String(raw || '').trim().toUpperCase();
+  if (!s) return null;
+
+  if (['CA', 'CAN', 'CANADA'].includes(s)) return 'CA';
+  if (['US', 'USA', 'UNITED STATES', 'UNITED STATES OF AMERICA'].includes(s)) return 'US';
+
+  return null;
+}
+
+function normProvince(country, raw) {
+  const s0 = String(raw || '').trim();
+  if (!s0) return null;
+
+  const s = s0.toUpperCase();
+
+  if (country === 'CA') {
+    // allow full names or 2-letter codes
+    const map = {
+      ON: 'ON', ONTARIO: 'ON',
+      QC: 'QC', QUEBEC: 'QC',
+      BC: 'BC', 'BRITISH COLUMBIA': 'BC',
+      AB: 'AB', ALBERTA: 'AB',
+      MB: 'MB', MANITOBA: 'MB',
+      SK: 'SK', SASKATCHEWAN: 'SK',
+      NS: 'NS', 'NOVA SCOTIA': 'NS',
+      NB: 'NB', 'NEW BRUNSWICK': 'NB',
+      NL: 'NL', 'NEWFOUNDLAND AND LABRADOR': 'NL',
+      PE: 'PE', 'PRINCE EDWARD ISLAND': 'PE',
+      NT: 'NT', 'NORTHWEST TERRITORIES': 'NT',
+      NU: 'NU', NUNAVUT: 'NU',
+      YT: 'YT', YUKON: 'YT'
+    };
+    return map[s] || (s.length >= 2 ? s.slice(0, 2) : null);
   }
 
-  return res
-    .status(200)
-    .type('application/xml; charset=utf-8')
-    .send(`<?xml version="1.0" encoding="UTF-8"?><Response><Message>${t}</Message></Response>`);
+  if (country === 'US') {
+    // for MVP, just store 2-letter state code if possible
+    return s.length >= 2 ? s.slice(0, 2) : null;
+  }
+
+  return null;
 }
 
-// -----------------------------------------------------------------
-// Main handler – returns true when it responded
-// -----------------------------------------------------------------
-module.exports = async function handleOnboarding(
-  from,
-  input,
-  userProfile,
-  ownerId,
-  res
-) {
-  const raw = String(input || '').trim();
-  const lc = raw.toLowerCase();
-  const fromNorm = normalizePhone(from);
+function computeCurrency(country) {
+  if (country === 'CA') return 'CAD';
+  if (country === 'US') return 'USD';
+  return null;
+}
+
+function computeTaxCode(country, prov) {
+  const p = String(prov || '').toUpperCase();
+  if (country === 'US') return 'US_SALES_TAX';
+  if (country !== 'CA') return 'NO_SALES_TAX';
+
+  switch (p) {
+    case 'ON': return 'HST_ON';
+    case 'NS': return 'HST_NS';
+    case 'NB': return 'HST_NB';
+    case 'NL': return 'HST_NL';
+    case 'PE': return 'HST_PE';
+    case 'BC': return 'GST_PST_BC';
+    case 'SK': return 'GST_PST_SK';
+    case 'MB': return 'GST_PST_MB';
+    case 'QC': return 'GST_PST_QC';
+    case 'AB':
+    case 'NT':
+    case 'NU':
+    case 'YT':
+      return 'GST_ONLY';
+    default:
+      return 'NO_SALES_TAX';
+  }
+}
+
+async function upsertTenantLocale({ ownerId, country, province, tz }) {
+  const currency = computeCurrency(country);
+  const tax_code = computeTaxCode(country, province);
+
+  await dbQuery(
+    `
+    update public.chiefos_tenants
+    set
+      country  = coalesce($2, country),
+      province = coalesce($3, province),
+      tz       = coalesce($4, tz),
+      currency = coalesce($5, currency),
+      tax_code = coalesce($6, tax_code)
+    where owner_id = $1
+    `,
+    [String(ownerId), country, province, tz, currency, tax_code]
+  );
+}
+
+async function listOpenJobsCount(ownerId) {
+  // use your canonical jobs table (public.jobs)
+  // if your schema differs, this still won’t break onboarding; it only influences “needs first job”
+  const { rows } = await dbQuery(
+    `select count(*)::int as n from public.jobs where owner_id = $1`,
+    [String(ownerId)]
+  );
+  return rows?.[0]?.n ?? 0;
+}
+
+async function bestEffortCreateJob({ ownerId, jobName, actorId }) {
+  const name = String(jobName || '').trim();
+  if (!name) return { ok: false, error: 'missing_name' };
+
+  // Prefer your existing pg job helpers if present (most future-proof)
+  try {
+    if (typeof pg.createJobIdempotent === 'function') {
+      const out = await pg.createJobIdempotent(ownerId, name, actorId);
+      return { ok: true, out };
+    }
+  } catch {}
 
   try {
-    // -------------------------------------------------
-    // 1. Fresh profile + bootstrap if missing
-    // -------------------------------------------------
-    let profile = await pg.getUserProfile(fromNorm);
-    if (!profile) {
-      profile = await pg.createUserProfile({
-        user_id: fromNorm,
-        ownerId: fromNorm,
-        onboarding_in_progress: true,
-      });
+    if (typeof pg.createJob === 'function') {
+      const out = await pg.createJob(ownerId, name, actorId);
+      return { ok: true, out };
     }
+  } catch {}
 
-    // -------------------------------------------------
-    // 2. Reset flow if requested
-    // -------------------------------------------------
-    if (/^reset onboarding|start onboarding$/i.test(lc)) {
-      await deletePendingTransactionState(fromNorm);
-      profile = { ...profile, onboarding_in_progress: true, onboarding_completed: false };
-      await pg.saveUserProfile(profile);
-      const state = {
-        step: 1,
-        responses: {},
-        detectedLocation: detectLocation(fromNorm),
-        invalidAttempts: {},
-      };
-      await setPendingTransactionState(fromNorm, state);
-      await sendMessage(fromNorm, 'Welcome to Chief AI! Please reply with your full name.');
-      await safeCleanup({ ownerId: fromNorm });
-      return true;
-    }
-
-    // -------------------------------------------------
-    // 3. Load / create state
-    // -------------------------------------------------
-    let state = await getPendingTransactionState(fromNorm);
-    if (!state) {
-      state = {
-        step: 1,
-        responses: {},
-        detectedLocation: detectLocation(fromNorm),
-        invalidAttempts: {},
-      };
-      await setPendingTransactionState(fromNorm, state);
-      await sendMessage(fromNorm, 'Welcome to Chief AI! Please reply with your full name.');
-      await safeCleanup({ ownerId: fromNorm });
-      return true;
-    }
-
-    // -------------------------------------------------
-    // 4. STEP MACHINE
-    // -------------------------------------------------
-    // ---- Step 1: name ----
-    if (state.step === 1) {
-      const name = raw.trim();
-      if (!name || name.length < 2) {
-        await sendMessage(fromNorm, 'Please provide your full name to continue.');
-        return true;
-      }
-      state.responses.name = cap(name);
-      state.step = 2;
-      await setPendingTransactionState(fromNorm, state);
-
-      const { knownProvinces, knownCountries } = getValidationLists();
-      const loc = state.detectedLocation || {};
-      const provinceOk = loc.province && knownProvinces.some((p) => p.toLowerCase() === loc.province.toLowerCase());
-      const countryOk = loc.country && knownCountries.some((c) => c.toLowerCase() === loc.country.toLowerCase());
-
-      if (provinceOk && countryOk) {
-        try {
-          await sendTemplateMessage(
-            fromNorm,
-            'HX0280df498999848aaff04cc079e16c31', // location confirm
-            { '1': loc.province, '2': loc.country }
-          );
-          return true;
-        } catch {
-          await sendQuickReply(
-            fromNorm,
-            `Hi ${state.responses.name}! Is this your location?\n${loc.province}, ${loc.country}`,
-            ['yes', 'edit', 'cancel']
-          );
-          return true;
-        }
-      }
-
-      await sendQuickReply(
-        fromNorm,
-        `Hi ${state.responses.name}! Please provide your State/Province, Country (e.g., "Ontario, Canada").`,
-        ['edit', 'cancel']
-      );
-      return true;
-    }
-
-    // ---- Step 2: personal location confirm ----
-    if (state.step === 2) {
-      if (/^y(es)?$/i.test(lc)) {
-        state.responses.location = state.detectedLocation;
-        state.step = 3;
-        await setPendingTransactionState(fromNorm, state);
-        await sendTemplateMessage(fromNorm, 'HXa885f78d7654642672bfccfae98d57cb', {}); // business same?
-        return true;
-      }
-      if (/^edit$/i.test(lc)) {
-        state.step = 2.5;
-        await setPendingTransactionState(fromNorm, state);
-        await sendMessage(fromNorm, `Please provide your State/Province, Country (e.g., "Ontario, Canada").`);
-        return true;
-      }
-      if (/^cancel$/i.test(lc)) {
-        await deletePendingTransactionState(fromNorm);
-        await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-        await sendMessage(fromNorm, `Onboarding cancelled. Reply "start onboarding" to begin again.`);
-        return true;
-      }
-      await sendMessage(fromNorm, `Please reply with 'yes', 'edit', or 'cancel'.`);
-      return true;
-    }
-
-    // ---- Step 2.5: manual personal location ----
-    if (state.step === 2.5) {
-      const { knownProvinces, knownCountries } = getValidationLists();
-      const parts = raw.split(',').map((s) => s.trim());
-      const province = parts[0] || '';
-      const country = parts[1] || '';
-      const countryAliases = { us: 'United States', usa: 'United States', canada: 'Canada' };
-      const canonical = countryAliases[country.toLowerCase()] || country;
-
-      const validProvince = knownProvinces.some((p) => p.toLowerCase() === province.toLowerCase());
-      const validCountry = knownCountries.some((c) => c.toLowerCase() === canonical.toLowerCase());
-
-      if (!validProvince || !validCountry) {
-        state.invalidAttempts.location = (state.invalidAttempts.location || 0) + 1;
-        if (state.invalidAttempts.location >= INVALID_MAX) {
-          await deletePendingTransactionState(fromNorm);
-          await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-          await sendMessage(fromNorm, `Too many invalid attempts. Onboarding cancelled.`);
-          return true;
-        }
-        await setPendingTransactionState(fromNorm, state);
-        await sendMessage(fromNorm, `Invalid location. Use "State/Province, Country" (e.g., "Ontario, Canada").`);
-        return true;
-      }
-
-      state.responses.location = { province, country: canonical };
-      state.step = 3;
-      await setPendingTransactionState(fromNorm, state);
-      await sendTemplateMessage(fromNorm, 'HXa885f78d7654642672bfccfae98d57cb', {});
-      return true;
-    }
-
-    // ---- Step 3: business location confirm ----
-    if (state.step === 3) {
-      if (/^y(es)?$/i.test(lc)) {
-        state.responses.business_location = state.responses.location;
-        state.step = 4;
-        await setPendingTransactionState(fromNorm, state);
-        await sendMessage(fromNorm, `Please share your email address for your financial dashboard.`);
-        return true;
-      }
-      if (/^no?$/i.test(lc)) {
-        state.step = 3.5;
-        await setPendingTransactionState(fromNorm, state);
-        await sendMessage(fromNorm, `Please provide your business's registered State/Province, Country.`);
-        return true;
-      }
-      if (/^cancel$/i.test(lc)) {
-        await deletePendingTransactionState(fromNorm);
-        await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-        await sendMessage(fromNorm, `Onboarding cancelled.`);
-        return true;
-      }
-      await sendMessage(fromNorm, `Please reply with 'yes', 'no', or 'cancel'.`);
-      return true;
-    }
-
-    // ---- Step 3.5: manual business location ----
-    if (state.step === 3.5) {
-      const parts = raw.split(',').map((s) => s.trim());
-      const province = parts[0] || '';
-      const country = parts[1] || '';
-      const { knownProvinces, knownCountries } = getValidationLists();
-      const canonical = { us: 'United States', usa: 'United States', canada: 'Canada' }[country.toLowerCase()] || country;
-
-      const validProvince = knownProvinces.some((p) => p.toLowerCase() === province.toLowerCase());
-      const validCountry = knownCountries.some((c) => c.toLowerCase() === canonical.toLowerCase());
-
-      if (!validProvince || !validCountry) {
-        state.invalidAttempts.business_location = (state.invalidAttempts.business_location || 0) + 1;
-        if (state.invalidAttempts.business_location >= INVALID_MAX) {
-          await deletePendingTransactionState(fromNorm);
-          await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-          await sendMessage(fromNorm, `Too many invalid attempts. Onboarding cancelled.`);
-          return true;
-        }
-        await setPendingTransactionState(fromNorm, state);
-        await sendMessage(fromNorm, `Invalid business location. Use "State/Province, Country".`);
-        return true;
-      }
-
-      state.responses.business_location = { province, country: canonical };
-      state.step = 4;
-      await setPendingTransactionState(fromNorm, state);
-      await sendMessage(fromNorm, `Please share your email address for your financial dashboard.`);
-      return true;
-    }
-
-    // ---- Step 4: email + Stripe trial + OTP + dashboard ----
-    if (state.step === 4) {
-      const email = raw.trim().toLowerCase();
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-        state.invalidAttempts.email = (state.invalidAttempts.email || 0) + 1;
-        if (state.invalidAttempts.email >= INVALID_MAX) {
-          await deletePendingTransactionState(fromNorm);
-          await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-          await sendMessage(fromNorm, `Too many invalid attempts. Onboarding cancelled.`);
-          return true;
-        }
-        await setPendingTransactionState(fromNorm, state);
-        await sendMessage(fromNorm, `Please provide a valid email address.`);
-        return true;
-      }
-
-      // ---- Stripe 7‑day Pro trial (best‑effort) ----
-      let stripe_customer_id = profile?.stripe_customer_id;
-      let stripe_subscription_id = profile?.stripe_subscription_id;
-      let trial_start = null;
-      let trial_end = null;
-      if (process.env.STRIPE_SECRET_KEY && PRO_PRICE_ID) {
-        try {
-          if (!stripe_customer_id) {
-            const cust = await stripe.customers.create({
-              email,
-              phone: `+${fromNorm}`,
-              metadata: { user_id: fromNorm },
-            });
-            stripe_customer_id = cust.id;
-          }
-          if (!stripe_subscription_id) {
-            const sub = await stripe.subscriptions.create({
-              customer: stripe_customer_id,
-              items: [{ price: PRO_PRICE_ID }],
-              trial_period_days: 7,
-              payment_behavior: 'default_incomplete',
-              metadata: { user_id: fromNorm },
-            });
-            stripe_subscription_id = sub.id;
-            trial_start = sub.trial_start ? new Date(sub.trial_start * 1000).toISOString() : null;
-            trial_end = sub.trial_end ? new Date(sub.trial_end * 1000).toISOString() : null;
-          }
-        } catch (e) {
-          console.warn('[onboarding] Stripe trial failed (continuing):', e.message);
-        }
-      }
-
-      // ---- Persist captured data ----
-      const loc = state.responses.location || state.detectedLocation || { province: '', country: '' };
-      const bloc = state.responses.business_location || loc;
-      const updated = {
-        ...profile,
-        user_id: fromNorm,
-        name: state.responses.name,
-        country: loc.country,
-        province: loc.province,
-        business_country: bloc.country,
-        business_province: bloc.province,
-        email,
-        stripe_customer_id,
-        stripe_subscription_id,
-        trial_start,
-        trial_end,
-        onboarding_in_progress: true,
-        onboarding_completed: false,
-      };
-      await pg.saveUserProfile(updated);
-
-      // ---- OTP + dashboard link ----
-      const otp = await pg.generateOTP(fromNorm);
-      const fresh = await pg.getUserProfile(fromNorm);
-      const token = otp || fresh?.dashboard_token || null;
-      const dashboardUrl = `https://chief-ai-refactored.vercel.app/dashboard/${fromNorm}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
-      await sendMessage(fromNorm, `Your financial dashboard: ${dashboardUrl}`);
-
-      const congrats = `Congratulations ${cap(state.responses.name)}!\nYou’re on a 7-day Pro trial. Explore all features!\nStart with:\n• "expense $100 tools"\n• "create job Roof Repair"`;
-      await sendMessage(fromNorm, congrats);
-
-      state.step = 5;
-      await setPendingTransactionState(fromNorm, state);
-      await sendQuickReply(
-        fromNorm,
-        `What industry is your business in?`,
-        ['Construction', 'Freelancer', 'Other']
-      );
-      return true;
-    }
-
-    // ---- Step 5: industry ----
-    if (state.step === 5) {
-      const industry = raw.trim();
-      if (!industry || industry.length < 3) {
-        state.invalidAttempts.industry = (state.invalidAttempts.industry || 0) + 1;
-        if (state.invalidAttempts.industry >= INVALID_MAX) {
-          await deletePendingTransactionState(fromNorm);
-          await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-          await sendMessage(fromNorm, `Too many invalid attempts. Onboarding cancelled.`);
-          return true;
-        }
-        await setPendingTransactionState(fromNorm, state);
-        await sendQuickReply(fromNorm, `Please provide your industry.`, ['Construction', 'Freelancer', 'Other']);
-        return true;
-      }
-      profile = { ...profile, user_id: fromNorm, industry: cap(industry) };
-      state.step = 6;
-      await pg.saveUserProfile(profile);
-      await setPendingTransactionState(fromNorm, state);
-
-      const loc = state.responses.location || state.detectedLocation || { province: '', country: '' };
-      const suggested = state.detectedLocation?.timezone || suggestTimezone(loc.country, loc.province) || 'UTC';
-      await sendQuickReply(
-        fromNorm,
-        `Set industry to ${cap(industry)}. What’s your timezone? Suggested: ${suggested}`,
-        [suggested, 'Other']
-      );
-      return true;
-    }
-
-    // ---- Step 6: timezone ----
-    if (state.step === 6) {
-      const candidate = raw.trim();
-      if (/^other$/i.test(candidate)) {
-        await sendMessage(fromNorm, `Reply with a city (e.g., "Toronto") or IANA timezone (e.g., "America/Toronto").`);
-        return true;
-      }
-      let tz = resolveTimezone(candidate);
-      if (!tz) {
-        const loc = state.responses.location || state.detectedLocation || { province: '', country: '' };
-        tz = suggestTimezone(loc.country, loc.province) || null;
-      }
-      if (!tz || !isValidIanaTz(tz)) {
-        state.invalidAttempts.timezone = (state.invalidAttempts.timezone || 0) + 1;
-        if (state.invalidAttempts.timezone >= INVALID_MAX) {
-          await deletePendingTransactionState(fromNorm);
-          await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-          await sendMessage(fromNorm, `Too many invalid attempts. Onboarding cancelled.`);
-          return true;
-        }
-        await setPendingTransactionState(fromNorm, state);
-        await sendQuickReply(fromNorm, `Invalid timezone. Try a city or IANA name.`, ['America/Toronto', 'America/Vancouver', 'Other']);
-        return true;
-      }
-      profile = { ...profile, user_id: fromNorm, timezone: tz };
-      state.step = 7;
-      await pg.saveUserProfile(profile);
-      await setPendingTransactionState(fromNorm, state);
-      await sendQuickReply(
-        fromNorm,
-        `Timezone set to ${tz}. What’s your financial goal?`,
-        ['Save for a purchase', 'Pay off debt', 'Grow profits']
-      );
-      return true;
-    }
-
-    // ---- Step 7: goal ----
-    if (state.step === 7) {
-      const goal = raw.trim();
-      if (!goal) {
-        state.invalidAttempts.goal = (state.invalidAttempts.goal || 0) + 1;
-        if (state.invalidAttempts.goal >= INVALID_MAX) {
-          await deletePendingTransactionState(fromNorm);
-          await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-          await sendMessage(fromNorm, `Too many invalid attempts. Onboarding cancelled.`);
-          return true;
-        }
-        await setPendingTransactionState(fromNorm, state);
-        await sendQuickReply(fromNorm, `Please share your financial goal.`, ['Save for a purchase', 'Pay off debt', 'Grow profits']);
-        return true;
-      }
-      profile = { ...profile, user_id: fromNorm, goal };
-      state.step = 8;
-      await pg.saveUserProfile(profile);
-      await setPendingTransactionState(fromNorm, state);
-      await sendQuickReply(
-        fromNorm,
-        `Goal set: "${goal}". Agree to Terms: https://chief-ai-refactored.vercel.app/terms-and-conditions`,
-        ['agree', 'cancel']
-      );
-      return true;
-    }
-
-    // ---- Step 8: terms ----
-    if (state.step === 8) {
-      if (/^agree$/i.test(lc)) {
-        const final = {
-          ...profile,
-          user_id: fromNorm,
-          onboarding_in_progress: false,
-          onboarding_completed: true,
-        };
-        await pg.saveUserProfile(final);
-        await deletePendingTransactionState(fromNorm);
-        await sendMessage(
-          fromNorm,
-          `Onboarding complete! Try "expense $100 tools" or "create job Roof Repair".`
-        );
-        await safeCleanup({ ownerId: fromNorm });
-        return true;
-      }
-      if (/^cancel$/i.test(lc)) {
-        await deletePendingTransactionState(fromNorm);
-        await pg.saveUserProfile({ ...profile, onboarding_in_progress: false });
-        await sendMessage(fromNorm, `Onboarding cancelled.`);
-        await safeCleanup({ ownerId: fromNorm });
-        return true;
-      }
-      await sendQuickReply(fromNorm, `Please reply 'agree' or 'cancel'.`, ['agree', 'cancel']);
-      return true;
-    }
-
-    // -------------------------------------------------
-    // 5. Fallback
-    // -------------------------------------------------
-    await sendMessage(fromNorm, `Unknown step. Reply "start onboarding" to restart.`);
-    return true;
-  } catch (err) {
-    console.error('[onboarding] error:', err?.message);
-    await sendMessage(fromNorm, `Something went wrong. Try again.`);
-    await safeCleanup({ ownerId: fromNorm });
-    return true;
+  // Last-resort SQL insert (may need adapting if your jobs schema differs)
+  try {
+    const { rows } = await dbQuery(
+      `
+      insert into public.jobs (owner_id, name, status, created_at)
+      values ($1, $2, 'open', now())
+      returning *
+      `,
+      [String(ownerId), name]
+    );
+    return { ok: true, out: rows?.[0] || null };
+  } catch (e) {
+    return { ok: false, error: e?.message || 'insert_failed' };
   }
+}
+
+async function sendWhatsAppText({ fromPhone, body }) {
+  // Your webhook likely replies with TwiML immediately; onboarding should also reply via TwiML.
+  // This helper is only here for future “out of band” sends.
+  if (!twilioClient) return { ok: false, error: 'no_twilio_client' };
+  if (!process.env.TWILIO_WHATSAPP_NUMBER) return { ok: false, error: 'missing_TWILIO_WHATSAPP_NUMBER' };
+
+  const to = String(fromPhone || '').trim();
+  const from = String(process.env.TWILIO_WHATSAPP_NUMBER || '').trim(); // should be "whatsapp:+1..."
+  const msg = await twilioClient.messages.create({
+    from,
+    to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+    body: String(body || '')
+  });
+  return { ok: true, sid: msg?.sid || null };
+}
+
+async function sendWhatsAppVideo({ fromPhone, videoUrl, caption }) {
+  // Works inside 24h window (user has messaged you recently). No template required for this immediate onboarding moment.
+  if (!twilioClient) return { ok: false, error: 'no_twilio_client' };
+  if (!process.env.TWILIO_WHATSAPP_NUMBER) return { ok: false, error: 'missing_TWILIO_WHATSAPP_NUMBER' };
+
+  const to = String(fromPhone || '').trim();
+  const from = String(process.env.TWILIO_WHATSAPP_NUMBER || '').trim();
+
+  const msg = await twilioClient.messages.create({
+    from,
+    to: to.startsWith('whatsapp:') ? to : `whatsapp:${to}`,
+    body: caption ? String(caption) : undefined,
+    mediaUrl: [String(videoUrl)]
+  });
+
+  return { ok: true, sid: msg?.sid || null };
+}
+
+/**
+ * Main entry: decides if onboarding should intercept this inbound message.
+ *
+ * Returns:
+ *   { handled: true, replyText: '...' }  -> webhook should respond with this and STOP
+ *   { handled: false }                  -> webhook continues normal routing
+ */
+async function handleOnboardingInbound({
+  ownerId,
+  fromPhone,
+  text2,
+  tz,
+  userProfile
+}) {
+  const raw = String(text2 || '').trim();
+  const lc = raw.toLowerCase();
+
+  // Owner can opt out quickly
+  if (lc === 'skip' || lc === 'skip onboarding') {
+    await setSetting(ownerId, 'onboarding.stage', 'done');
+    return { handled: true, replyText: '✅ Skipped onboarding. Send an expense, revenue, timeclock, or “create job <name>”.' };
+  }
+
+  const stage = (await getSetting(ownerId, 'onboarding.stage')) || 'new';
+
+  // Don’t intercept forever
+  if (stage === 'done') return { handled: false };
+
+  // If they start using the product immediately, don’t block them — but still ensure first-job strategy.
+  const looksLikeImmediateUsage =
+    /\b(expense|spent|revenue|invoice|receipt|clock in|clock out|timesheet|task)\b/i.test(raw);
+
+  // If brand-new and they’re already sending real data, we let main router handle it
+  // BUT we’ll still “prime” onboarding and let expense flow job-pick handle create-job.
+  if (stage === 'new' && looksLikeImmediateUsage) {
+    await setSetting(ownerId, 'onboarding.stage', 'welcomed');
+    return { handled: false };
+  }
+
+  // Stage: new -> welcome
+  if (stage === 'new') {
+    await setSetting(ownerId, 'onboarding.stage', 'welcomed');
+
+    // Use tenant locale already set, but allow quick correction
+    const welcome = [
+      `👋 Welcome to ChiefOS — I’ll get you set up in 30 seconds.`,
+      ``,
+      `I’ve set your location to:`,
+      `• Country: CA`,
+      `• Province/State: ON`,
+      `• Timezone: ${tz || 'America/Toronto'}`,
+      ``,
+      `If that’s correct, reply: yes`,
+      `If not, reply like: CA BC  (or)  US FL`,
+      ``,
+      `Tip: reply “skip” to skip onboarding.`
+    ].join('\n');
+
+    return { handled: true, replyText: welcome };
+  }
+
+  // Stage: welcomed -> capture locale confirmation or override
+  if (stage === 'welcomed') {
+    if (lc === 'yes' || lc === 'y') {
+      await setSetting(ownerId, 'onboarding.stage', 'need_first_job');
+
+      const nJobs = await listOpenJobsCount(ownerId);
+      if (nJobs > 0) {
+        await setSetting(ownerId, 'onboarding.stage', 'video');
+        return { handled: true, replyText: `✅ Perfect. You already have jobs.\n\nWant a 60-second walkthrough video? Reply: video` };
+      }
+
+      return {
+        handled: true,
+        replyText: [
+          `✅ Great.`,
+          ``,
+          `Last step: what’s your first job name?`,
+          `Example: “Oak Street Re-roof”`,
+          ``,
+          `Reply with the job name (just the name).`
+        ].join('\n')
+      };
+    }
+
+    // Parse “CA BC” or “US FL”
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const c = normCountry(parts[0]);
+    const p = normProvince(c, parts[1]);
+
+    if (!c) {
+      return { handled: true, replyText: `Reply “yes” to confirm, or reply like: CA ON  (or)  US FL` };
+    }
+
+    await upsertTenantLocale({ ownerId, country: c, province: p || null, tz: tz || null });
+    await setSetting(ownerId, 'onboarding.stage', 'need_first_job');
+
+    return {
+      handled: true,
+      replyText: [
+        `✅ Updated.`,
+        ``,
+        `Now: what’s your first job name?`,
+        `Example: “Oak Street Re-roof”`,
+        ``,
+        `Reply with the job name (just the name).`
+      ].join('\n')
+    };
+  }
+
+  // Stage: need_first_job -> create the first job
+  if (stage === 'need_first_job') {
+    const jobName = raw;
+    if (!jobName || jobName.length < 2) {
+      return { handled: true, replyText: `Reply with a job name like: Oak Street Re-roof` };
+    }
+
+    const created = await bestEffortCreateJob({
+      ownerId,
+      jobName,
+      actorId: String(userProfile?.user_id || userProfile?.wa_id || fromPhone || ownerId)
+    });
+
+    if (!created?.ok) {
+      return {
+        handled: true,
+        replyText: `⚠️ I couldn’t create that job. Try: “create job ${jobName}” or reply with a slightly different name.`
+      };
+    }
+
+    await setSetting(ownerId, 'onboarding.stage', 'video');
+
+    return {
+      handled: true,
+      replyText: [
+        `✅ Created your first job: “${jobName}”`,
+        ``,
+        `Want the 60-second walkthrough video?`,
+        `Reply: video`,
+        ``,
+        `Or start right now:`,
+        `• expense $18 Home Depot`,
+        `• revenue $500 deposit`,
+        `• send a receipt photo`
+      ].join('\n')
+    };
+  }
+
+  // Stage: video -> deliver video (inside 24h window, no template needed)
+  if (stage === 'video') {
+    if (lc !== 'video') {
+      // Don’t block product usage
+      await setSetting(ownerId, 'onboarding.stage', 'done');
+      return { handled: false };
+    }
+
+    // You must host a public https video file (mp4). Put it in env so it’s easy to swap.
+    const videoUrl = process.env.ONBOARDING_VIDEO_URL || '';
+    if (!videoUrl) {
+      await setSetting(ownerId, 'onboarding.stage', 'done');
+      return {
+        handled: true,
+        replyText: `✅ Here’s the walkthrough: (add ONBOARDING_VIDEO_URL env var)\n\nIn the meantime, try: expense $18 Home Depot`
+      };
+    }
+
+    // Best effort “out of band” send; but webhook still needs to reply something via TwiML.
+    try {
+      await sendWhatsAppVideo({
+        fromPhone,
+        videoUrl,
+        caption: '🎥 60-second walkthrough'
+      });
+    } catch {}
+
+    await setSetting(ownerId, 'onboarding.stage', 'done');
+    await setSetting(ownerId, 'onboarding.video_sent_at', String(Date.now()));
+
+    return {
+      handled: true,
+      replyText: [
+        `✅ Sent the walkthrough video.`,
+        ``,
+        `Now try one:`,
+        `• expense $18 Home Depot`,
+        `• revenue $500 deposit`,
+        `• clock in`,
+        `• send a receipt photo`
+      ].join('\n')
+    };
+  }
+
+  return { handled: false };
+}
+
+module.exports = {
+  handleOnboardingInbound
 };

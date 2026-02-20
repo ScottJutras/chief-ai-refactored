@@ -45,7 +45,7 @@ const { normalizeTranscriptMoney, stripLeadingFiller } = require('../utils/trans
 const twilioSvc = require('../services/twilio');
 const sendWhatsApp = twilioSvc.sendWhatsApp;
 const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
-
+const { handleOnboardingInbound } = require('../handlers/commands/onboarding');
 
 /* ---------------- Small helpers ---------------- */
 // ✅ XML escape helper for TwiML (single source of truth in this file)
@@ -1773,7 +1773,30 @@ router.post('*', async (req, res, next) => {
       ListRowId: req.body?.ListRowId || null,
       ButtonPayload: req.body?.ButtonPayload || null
     });
+/* -----------------------------------------------------------------------
+ * ✅ ONBOARDING INTERCEPT (fast magic moment)
+ * - Runs only when onboarding.stage != done
+ * - Never blocks real usage once they start (falls through)
+ * ----------------------------------------------------------------------- */
+try {
+  const tzSafe =
+    String(req?.tz || req?.userProfile?.timezone || req?.ownerProfile?.timezone || '').trim() ||
+    'America/Toronto';
 
+  const ob = await handleOnboardingInbound({
+    ownerId: req.ownerId,
+    fromPhone: req.from,        // e164 or whatsapp:+e164 depending on your req.from
+    text2,
+    tz: tzSafe,
+    userProfile: req.userProfile || null
+  });
+
+  if (ob?.handled && ob?.replyText) {
+    return ok(res, ob.replyText);
+  }
+} catch (e) {
+  console.warn('[ONBOARDING] failed (ignored):', e?.message);
+}
     // -----------------------------------------------------------------------
     // "resume" => re-send the pending confirm card if we have a confirm pending-action
     // MUST run early (before nudge / PA router / job picker / fast paths / agent)

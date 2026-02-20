@@ -85,30 +85,46 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
 
     // ---------------- Lookup + authorize (owner scoped) ----------------
     const q = `
-      select
-        t.id as transaction_id,
-        t.owner_id,
-        t.media_asset_id,
-        m.storage_provider,
-        m.storage_path,
-        m.content_type
-      from public.transactions t
-      join public.media_assets m on m.id = t.media_asset_id
-      where t.id = $1::int
-        and t.owner_id::text = $2
-      limit 1
-    `;
+  select
+    t.id as transaction_id,
+    t.owner_id,
+    t.media_asset_id,
+    m.storage_provider,
+    m.storage_path,
+    m.content_type
+  from public.transactions t
+  left join public.media_assets m on m.id = t.media_asset_id
+  where t.id = $1::int
+    and t.owner_id::text = $2
+  limit 1
+`;
 
-    const out = await pg.query(q, [txId, ownerDigits]);
-    const row = out?.rows?.[0] || null;
+const out = await pg.query(q, [txId, ownerDigits]);
+const row = out?.rows?.[0] || null;
 
-    if (!row) {
-      return res.status(404).json({
-        ok: false,
-        code: "ERROR",
-        message: "Receipt not found for this transaction (or access denied).",
-      });
-    }
+if (!row) {
+  return res.status(404).json({
+    ok: false,
+    code: "ERROR",
+    message: "Transaction not found (or access denied)."
+  });
+}
+
+if (!row.media_asset_id) {
+  return res.status(404).json({
+    ok: false,
+    code: "NO_RECEIPT",
+    message: "This transaction has no receipt attachment (media_asset_id is null)."
+  });
+}
+
+if (!row.storage_path || !row.storage_provider) {
+  return res.status(404).json({
+    ok: false,
+    code: "BROKEN_RECEIPT_LINK",
+    message: "Receipt attachment record is missing storage_path/storage_provider."
+  });
+}
 
     const provider = String(row.storage_provider || "").toLowerCase();
     const storagePath = String(row.storage_path || "");

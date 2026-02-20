@@ -1,27 +1,27 @@
-// routes/receipts.js
+// routes/receipts.js (CommonJS)
 const express = require("express");
-
-// If you're on Node 18+ you likely have global fetch.
-// If not, install node-fetch and uncomment next line:
-// const fetch = require("node-fetch");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 
 const router = express.Router();
 
-/**
- * REQUIRED ENV (core only):
- * - NEXT_PUBLIC_SUPABASE_URL
- * - SUPABASE_SERVICE_ROLE_KEY
- * - TWILIO_ACCOUNT_SID
- * - TWILIO_AUTH_TOKEN
- *
- * REQUIRED DB access:
- * - a pg helper exposing `query(text, params)`
- *   (adjust the require path below to match your backend)
- */
-const pg = require("../services/postgres"); // <-- ADJUST if your path differs
+const pg = require("../services/postgres");
 
-// Supabase admin client (service role) — used ONLY in core backend
-const { createClient } = require("@supabase/supabase-js");
+// Same middleware you already have in your core (matches askChief.js pattern)
+const { requireDashboardOwner } = require("../middleware/requireDashboardOwner");
+const { requirePortalUser } = require("../middleware/requirePortalUser");
+
+/**
+ * Dashboard token detection (copy from routes/askChief.js)
+ */
+function hasDashboardToken(req) {
+  const cookie = String(req.headers?.cookie || "");
+  return (
+    cookie.includes("chiefos_dashboard_token=") ||
+    cookie.includes("dashboard_token=") ||
+    cookie.includes("dashboardToken=")
+  );
+}
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -29,120 +29,60 @@ function mustEnv(name) {
   return v;
 }
 
-function getBearerToken(req) {
-  const h = req.headers.authorization || req.headers.Authorization;
-  if (!h) return null;
-  const m = String(h).match(/^Bearer\s+(.+)$/i);
-  return (m && m[1]) || null;
-}
-
 function isTruthy(v) {
   return v === "1" || v === "true" || v === "yes";
 }
 
-function safeFilenameFromContentType(ct) {
+function safeFilenameFromContentType(ct, txId) {
   const x = String(ct || "").toLowerCase();
-  if (x.includes("pdf")) return "receipt.pdf";
-  if (x.includes("png")) return "receipt.png";
-  if (x.includes("jpeg") || x.includes("jpg")) return "receipt.jpg";
-  if (x.includes("webp")) return "receipt.webp";
-  return "receipt";
-}
-
-function supabaseAdmin() {
-  const url = mustEnv("NEXT_PUBLIC_SUPABASE_URL");
-  const key = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
-  return createClient(url, key, { auth: { persistSession: false } });
-}
-
-/**
- * Resolve ownerDigits from portal auth:
- * Supabase bearer -> auth.user.id (UUID)
- * -> chiefos_portal_users.user_id (UUID) => tenant_id
- * -> chiefos_tenants.id => owner_id (digits)
- */
-async function resolveOwnerDigitsFromPortalBearer(token) {
-  const sb = supabaseAdmin();
-
-  const userRes = await sb.auth.getUser(token);
-  const user = userRes?.data?.user;
-  if (!user) return { ok: false, status: 401, code: "AUTH_REQUIRED", message: "Invalid session." };
-
-  const pu = await sb
-    .from("chiefos_portal_users")
-    .select("user_id, tenant_id, role")
-    .eq("user_id", user.id)
-    .maybeSingle();
-
-  const portalUser = pu.data || null;
-  if (!portalUser?.tenant_id) {
-    return {
-      ok: false,
-      status: 403,
-      code: "NOT_LINKED",
-      message: "Account not linked to a business.",
-    };
-  }
-
-  const ten = await sb
-    .from("chiefos_tenants")
-    .select("id, owner_id, tz")
-    .eq("id", portalUser.tenant_id)
-    .maybeSingle();
-
-  const tenant = ten.data || null;
-  const ownerDigits = String(tenant?.owner_id || "").replace(/\D/g, "").trim();
-  if (!ownerDigits) {
-    return {
-      ok: false,
-      status: 403,
-      code: "NOT_LINKED",
-      message: "Business owner phone not linked.",
-    };
-  }
-
-  return {
-    ok: true,
-    status: 200,
-    ownerDigits,
-    portalRole: String(portalUser.role || "").toLowerCase(),
-    supabaseUserId: user.id,
-  };
+  if (x.includes("pdf")) return `receipt-${txId}.pdf`;
+  if (x.includes("png")) return `receipt-${txId}.png`;
+  if (x.includes("jpeg") || x.includes("jpg")) return `receipt-${txId}.jpg`;
+  if (x.includes("webp")) return `receipt-${txId}.webp`;
+  if (x.includes("audio/ogg")) return `attachment-${txId}.ogg`;
+  return `attachment-${txId}`;
 }
 
 /**
  * GET /api/receipts/:transactionId
- * - Validates portal bearer token
- * - Authorizes by owner_id (digits) using public.transactions.owner_id
- * - Joins media_assets and streams Twilio temp media
+ * Supports:
+ * - Dashboard auth (cookie) via requireDashboardOwner -> req.ownerId digits
+ * - Portal auth (bearer) via requirePortalUser -> req.ownerId digits
  *
- * Query:
- * - ?download=1 -> attachment
+ * Authorizes by public.transactions.owner_id (digits).
  */
 router.get("/api/receipts/:transactionId", async (req, res) => {
   try {
-    const token = getBearerToken(req);
-    if (!token) {
-      return res
-        .status(401)
-        .json({ ok: false, code: "AUTH_REQUIRED", message: "Missing session." });
+    // ---------------- Auth (same split as askChief) ----------------
+    if (hasDashboardToken(req)) {
+      await new Promise((resolve, reject) =>
+        requireDashboardOwner(req, res, (err) => (err ? reject(err) : resolve()))
+      );
+      if (res.headersSent) return;
+    } else {
+      await new Promise((resolve, reject) =>
+        requirePortalUser(req, res, (err) => (err ? reject(err) : resolve()))
+      );
+      if (res.headersSent) return;
     }
 
-    const ctx = await resolveOwnerDigitsFromPortalBearer(token);
-    if (!ctx.ok) {
-      return res.status(ctx.status || 403).json({
+    const ownerDigits = String(req.ownerId || "").trim();
+    if (!ownerDigits) {
+      return res.status(401).json({
         ok: false,
-        code: ctx.code || "PERMISSION_DENIED",
-        message: ctx.message || "Denied.",
+        code: "AUTH_REQUIRED",
+        message: "Missing session. Please log in again.",
       });
     }
 
-    const transactionId = String(req.params.transactionId || "").trim();
-    if (!transactionId) {
-      return res.status(400).json({ ok: false, code: "ERROR", message: "Missing transactionId." });
+    // ---------------- Validate tx id ----------------
+    const rawId = String(req.params.transactionId || "").trim();
+    const txId = Number(rawId);
+    if (!Number.isInteger(txId) || txId <= 0) {
+      return res.status(400).json({ ok: false, code: "ERROR", message: "Invalid transaction id." });
     }
 
-    // ✅ Single source of truth lookup (owner-scoped)
+    // ---------------- Lookup + authorize (owner scoped) ----------------
     const q = `
       select
         t.id as transaction_id,
@@ -153,12 +93,12 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
         m.content_type
       from public.transactions t
       join public.media_assets m on m.id = t.media_asset_id
-      where t.id = $1
+      where t.id = $1::int
         and t.owner_id::text = $2
-      limit 1;
+      limit 1
     `;
 
-    const out = await pg.query(q, [transactionId, ctx.ownerDigits]);
+    const out = await pg.query(q, [txId, ownerDigits]);
     const row = out?.rows?.[0] || null;
 
     if (!row) {
@@ -175,7 +115,12 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
 
     const download = isTruthy(req.query.download);
     const disposition = download ? "attachment" : "inline";
-    const filename = safeFilenameFromContentType(contentType);
+    const filename = safeFilenameFromContentType(contentType, txId);
+
+    res.status(200);
+    res.setHeader("Cache-Control", "private, no-store, max-age=0");
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
 
     if (provider !== "twilio_temp") {
       return res.status(400).json({
@@ -186,7 +131,7 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
     }
 
     if (!storagePath.startsWith("http")) {
-      return res.status(500).json({ ok: false, code: "ERROR", message: "Invalid Twilio media URL." });
+      return res.status(500).json({ ok: false, code: "ERROR", message: "Invalid storage URL." });
     }
 
     const sid = mustEnv("TWILIO_ACCOUNT_SID");
@@ -208,16 +153,16 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
       });
     }
 
-    // Stream bytes to browser
-    res.status(200);
-    res.setHeader("Content-Type", tw.headers.get("content-type") || contentType);
-    res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
-    res.setHeader("Cache-Control", "private, no-store");
+    if (!tw.body) {
+      return res.status(502).json({ ok: false, code: "ERROR", message: "Missing receipt body." });
+    }
 
-    // node-fetch + global fetch both expose a readable body
-    tw.body.pipe(res);
+    // Node 18 safe streaming
+    const bodyStream = Readable.fromWeb(tw.body);
+    await pipeline(bodyStream, res);
   } catch (e) {
-    res.status(500).json({ ok: false, code: "ERROR", message: e?.message || "Receipt failed." });
+    console.warn("[RECEIPTS] failed:", e?.message);
+    return res.status(500).json({ ok: false, code: "ERROR", message: e?.message || "Receipt failed." });
   }
 });
 

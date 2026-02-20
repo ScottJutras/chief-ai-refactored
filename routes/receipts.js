@@ -4,7 +4,6 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 
 const router = express.Router();
-
 const pg = require("../services/postgres");
 
 // Same middleware you already have in your core (matches askChief.js pattern)
@@ -79,7 +78,9 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
     const rawId = String(req.params.transactionId || "").trim();
     const txId = Number(rawId);
     if (!Number.isInteger(txId) || txId <= 0) {
-      return res.status(400).json({ ok: false, code: "ERROR", message: "Invalid transaction id." });
+      return res
+        .status(400)
+        .json({ ok: false, code: "ERROR", message: "Invalid transaction id." });
     }
 
     // ---------------- Lookup + authorize (owner scoped) ----------------
@@ -117,6 +118,7 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
     const disposition = download ? "attachment" : "inline";
     const filename = safeFilenameFromContentType(contentType, txId);
 
+    // NOTE: set headers before streaming
     res.status(200);
     res.setHeader("Cache-Control", "private, no-store, max-age=0");
     res.setHeader("Content-Type", contentType);
@@ -131,7 +133,9 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
     }
 
     if (!storagePath.startsWith("http")) {
-      return res.status(500).json({ ok: false, code: "ERROR", message: "Invalid storage URL." });
+      return res
+        .status(500)
+        .json({ ok: false, code: "ERROR", message: "Invalid storage URL." });
     }
 
     const sid = mustEnv("TWILIO_ACCOUNT_SID");
@@ -139,7 +143,8 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
 
     const tw = await fetch(storagePath, {
       headers: {
-        Authorization: "Basic " + Buffer.from(`${sid}:${auth}`).toString("base64"),
+        Authorization:
+          "Basic " + Buffer.from(`${sid}:${auth}`).toString("base64"),
       },
     });
 
@@ -154,7 +159,9 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
     }
 
     if (!tw.body) {
-      return res.status(502).json({ ok: false, code: "ERROR", message: "Missing receipt body." });
+      return res
+        .status(502)
+        .json({ ok: false, code: "ERROR", message: "Missing receipt body." });
     }
 
     // Node 18 safe streaming
@@ -162,7 +169,9 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
     await pipeline(bodyStream, res);
   } catch (e) {
     console.warn("[RECEIPTS] failed:", e?.message);
-    return res.status(500).json({ ok: false, code: "ERROR", message: e?.message || "Receipt failed." });
+    return res
+      .status(500)
+      .json({ ok: false, code: "ERROR", message: e?.message || "Receipt failed." });
   }
 });
 

@@ -61,6 +61,9 @@ const dashboardRouter = require("./routes/dashboard"); // KPI dashboard API
 const askChiefRouter = require("./routes/askChief");
 const billingRouter = require("./routes/billing");
 
+// ✅ NEW: receipts streaming route
+const receiptsRouter = require("./routes/receipts");
+
 const { stripeWebhookHandler } = require("./handlers/stripeWebhook");
 
 const app = express();
@@ -88,7 +91,6 @@ if (!process.env.VERCEL) {
     })
   );
 }
-
 
 /* ---------------- Hardening / perf (no global parsers) ---------------- */
 app.disable("x-powered-by");
@@ -129,7 +131,6 @@ app.post(
   stripeWebhookHandler
 );
 
-
 /* ---------------- Mount order (NO global body parsers) ---------------- */
 // Webhook first; it does its own tolerant urlencoded/body handling.
 app.use("/api/webhook", webhookRouter);
@@ -138,10 +139,13 @@ app.use("/webhook", webhookRouter); // temporary alias
 // Billing (router adds its own JSON parser internally)
 app.use("/api/billing", billingRouter);
 
+// ✅ Receipts route (router defines /api/receipts/:transactionId internally)
+// IMPORTANT: mount at "/" (NOT "/api") so it doesn't become /api/api/receipts
+app.use(receiptsRouter);
+
 // Other routers can attach their own parsers internally as needed.
 app.use("/api/parse", parseRouter);
 app.use(askChiefRouter); // routes/askChief.js defines POST /api/ask-chief
-
 
 // JSON dashboard API used by the React frontend (Vite app)
 app.use("/api/dashboard", dashboardRouter);

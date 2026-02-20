@@ -981,7 +981,7 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
     return respond(res, `⚠️ createJobIdempotent() isn't available in postgres.js yet.`);
   }
 
- // -------------------------------
+// -------------------------------
 // ✅ Gate #2 — max jobs per plan
 // Canonical: effective plan key -> planCapabilities
 // IMPORTANT: max_jobs_total = null means UNLIMITED (do not gate)
@@ -992,12 +992,16 @@ try {
 } catch {}
 
 let caps = null;
+let capsPlanKeys = [];
 try {
-  const { plan_capabilities } = require("../../src/config/planCapabilities"); // ✅ correct path from handlers/commands/job.js
+  const mod = require("../../src/config/planCapabilities"); // ✅ correct path from handlers/commands/job.js
+  const plan_capabilities = mod?.plan_capabilities || {};
+  capsPlanKeys = Object.keys(plan_capabilities || {}).slice(0, 20);
   caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
 } catch (e) {
   console.warn("[PLAN_CAPS_LOAD_FAILED]", e?.message);
   caps = null;
+  capsPlanKeys = [];
 }
 
 let maxJobs = caps?.jobs?.max_jobs_total ?? null;
@@ -1016,6 +1020,18 @@ const hasJobLimit =
   Number.isFinite(Number(maxJobs)) &&
   Number(maxJobs) > 0;
 
+// ✅ Determine where the effective plan *came from* (truthful)
+const effectivePlanSource = (() => {
+  // If effective plan is NOT free, it must have come from an entitled status check
+  if (plan !== "free") return "users.plan_key+sub_status(entitled)";
+  // If we had plan_key/sub_status fields but still ended up free, record why
+  if (ownerProfile?.plan_key != null || ownerProfile?.sub_status != null) return "users.plan_key+sub_status(not_entitled_or_missing)";
+  // Legacy fallback
+  if (ownerProfile?.plan) return "ownerProfile.plan(legacy)";
+  if (ownerProfile?.subscription_tier) return "ownerProfile.subscription_tier(legacy)";
+  return "default_free";
+})();
+
 // ✅ DEBUG (won’t lie about null -> 0)
 try {
   console.info("[PLAN_GATE_DEBUG][create_job]", {
@@ -1023,26 +1039,20 @@ try {
     fromPhone: String(fromPhone || ""),
     plan_raw: plan,
     maxJobs_raw: maxJobs,
-    maxJobs_type: typeof maxJobs,
+    maxJobs_type: maxJobs === null ? "null" : typeof maxJobs,
     hasJobLimit,
     caps_found_for_plan: !!caps,
     caps_keys_hint: caps ? Object.keys(caps).slice(0, 12) : [],
-    capsPlanKeys: (() => {
-      try {
-        const obj = require("../../src/config/planCapabilities")?.plan_capabilities || {};
-        return Object.keys(obj || {}).slice(0, 20);
-      } catch {
-        return [];
-      }
-    })(),
+    effectivePlanSource,
+    capsPlanKeys,
     ownerProfile_plan_fields: {
       plan_key: ownerProfile?.plan_key ?? null,
       sub_status: ownerProfile?.sub_status ?? null,
       plan: ownerProfile?.plan ?? null,
       subscription_tier: ownerProfile?.subscription_tier ?? null,
       stripe_status: ownerProfile?.stripe_status ?? null,
-      plan_status: ownerProfile?.plan_status ?? null,
-    },
+      plan_status: ownerProfile?.plan_status ?? null
+    }
   });
 } catch {}
 
@@ -1067,7 +1077,7 @@ if (hasJobLimit) {
         ownerId: String(owner || ""),
         plan,
         maxJobs,
-        currentCount,
+        currentCount
       });
 
       return respond(

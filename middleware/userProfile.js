@@ -235,31 +235,45 @@ async function userProfileMiddleware(req, _res, next) {
     }
 
     // ✅ Fast path: cache hit (only positive mappings cached)
-    const cached = cacheGet(from);
-    if (cached?.tenantId && cached?.ownerId) {
-      req.tenantId = cached.tenantId;
-      req.ownerId = cached.ownerId;
-      req.isOwner = !!cached.isOwner;
-      req.tz = cached.tz || DEFAULT_TZ;
+const cached = cacheGet(from);
+if (cached?.tenantId && cached?.ownerId) {
+  req.tenantId = cached.tenantId;
+  req.ownerId = cached.ownerId;
+  req.isOwner = !!cached.isOwner;
+  req.tz = cached.tz || DEFAULT_TZ;
 
-      req.userProfile = shapeMinimalProfile({
-        from,
-        ownerId: req.ownerId,
-        role: cached.role || (req.isOwner ? 'owner' : null),
-        tz: req.tz,
-        plan: cached.plan || 'free'
-      });
+  const plan = String(cached.plan || "free").trim().toLowerCase();
 
-      req.ownerProfile = shapeMinimalProfile({
-        from: req.ownerId,
-        ownerId: req.ownerId,
-        role: 'owner',
-        tz: req.tz,
-        plan: cached.plan || 'free'
-      });
+  // ✅ Debug: confirms what plan we are using on warm/cache path
+  try {
+    console.info("[PLAN_RESOLVE][userProfile][cache]", {
+      from,
+      ownerId: req.ownerId,
+      tenantId: req.tenantId,
+      role: cached.role || null,
+      resolvedPlan: plan,
+      note: "plan comes from identityCache; stored onto req.userProfile.plan / req.ownerProfile.plan"
+    });
+  } catch {}
 
-      return next();
-    }
+  req.userProfile = shapeMinimalProfile({
+    from,
+    ownerId: req.ownerId,
+    role: cached.role || (req.isOwner ? 'owner' : null),
+    tz: req.tz,
+    plan
+  });
+
+  req.ownerProfile = shapeMinimalProfile({
+    from: req.ownerId,
+    ownerId: req.ownerId,
+    role: 'owner',
+    tz: req.tz,
+    plan
+  });
+
+  return next();
+}
 
     // 1) Try canonical resolver first (whatsapp identity -> tenant + role)
     let resolved = null;
@@ -283,7 +297,16 @@ async function userProfileMiddleware(req, _res, next) {
         console.warn("[userProfile] resolveOwnerPlan failed (default free):", e?.message);
         plan = 'free';
       }
-
+try {
+  console.info("[PLAN_RESOLVE][userProfile][resolver]", {
+    from,
+    ownerId: req.ownerId,
+    tenantId: req.tenantId,
+    role: resolved?.role || null,
+    resolvedPlan: plan,
+    note: "plan came from resolveOwnerPlan(); stored onto req.userProfile.plan / req.ownerProfile.plan"
+  });
+} catch {}
       req.userProfile = shapeMinimalProfile({
         from,
         ownerId: req.ownerId,

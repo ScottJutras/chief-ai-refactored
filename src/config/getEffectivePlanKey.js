@@ -21,17 +21,19 @@ function isEntitledStatus(status) {
 
 /**
  * Canonical "effective plan" used for gating.
- *
- * Priority:
- * 1) If we have an entitled status (sub_status / plan_status / stripe_status), use plan_key if present.
- * 2) If status fields are missing/null (common during migration), fall back to legacy plan fields:
- *    subscription_tier / tier / stripe_plan-like fields.
- *
- * Never trust random strings; only accept free/starter/pro after normalization.
+ * Accepts either:
+ * - raw DB row (plan_key/sub_status/subscription_tier...)
+ * - shaped middleware profile (plan)
  */
 function getEffectivePlanKey(ownerRow) {
   if (!ownerRow) return "free";
 
+  // ✅ IMPORTANT: shaped profile support (your middleware)
+  // shapeMinimalProfile stores `plan` as the already-resolved effective plan.
+  const shapedPlan = normalizePlanKey(ownerRow.plan);
+  if (shapedPlan) return shapedPlan;
+
+  // raw DB fields
   const planKey = normalizePlanKey(ownerRow.plan_key);
 
   const subStatus = normalizeStatus(ownerRow.sub_status);
@@ -43,15 +45,16 @@ function getEffectivePlanKey(ownerRow) {
     isEntitledStatus(planStatus) ||
     isEntitledStatus(stripeStatus);
 
-  // 1) Best case: entitled + explicit plan_key
+  // best: entitled + explicit plan_key
   if (entitled && planKey) return planKey;
 
-  // 2) Migration case: we may have plan_key but no status yet — treat it as authoritative if set
+  // migration case: plan_key present but status missing
   if (planKey) return planKey;
 
-  // 3) Legacy fallback fields (your logs show these exist / used)
+  // legacy fallbacks
   const legacy =
     normalizePlanKey(ownerRow.subscription_tier) ||
+    normalizePlanKey(ownerRow.paid_tier) ||
     normalizePlanKey(ownerRow.tier) ||
     normalizePlanKey(ownerRow.stripe_plan) ||
     "";

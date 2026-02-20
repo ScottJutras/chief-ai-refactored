@@ -141,48 +141,24 @@ async function resolveActorIdentity({ kind, identifier }, markDegraded) {
 
 async function resolveOwnerPlan(ownerDigits, markDegraded) {
   const owner = normalizeDigits(ownerDigits);
-  if (!owner) return "free";
+  if (!owner) return { plan: "free", plan_key: null, sub_status: null };
 
-  // IMPORTANT:
-  // Your DB may still be using legacy `plan` (pro/starter/free) without plan_key/sub_status populated.
-  // So we must select ALL plausible fields and let getEffectivePlanKey() decide.
   const r = await safeQuery(
-  `
-  select
-    user_id,
-    plan_key,
-    sub_status,
-    plan_status,
-    stripe_status,
-    subscription_tier,
-    tier,
-    stripe_plan,
-    stripe_price_id
-  from public.users
-  where user_id = $1
-  limit 1
-  `,
-  [owner],
-  markDegraded
-);
+    `select plan_key, sub_status
+       from public.users
+      where user_id = $1
+      limit 1`,
+    [owner],
+    markDegraded
+  );
 
   const row = r?.rows?.[0] || null;
 
-  // 🔎 optional debug (helps confirm what WhatsApp is actually reading)
-  try {
-    console.info("[OWNER_PLAN_ROW]", {
-      owner,
-      plan: row?.plan ?? null,
-      plan_key: row?.plan_key ?? null,
-      sub_status: row?.sub_status ?? null,
-      plan_status: row?.plan_status ?? null,
-      stripe_status: row?.stripe_status ?? null,
-      subscription_tier: row?.subscription_tier ?? null,
-      tier: row?.tier ?? null
-    });
-  } catch {}
-
-  return getEffectivePlanKey(row);
+  return {
+    plan: getEffectivePlanKey(row),
+    plan_key: row?.plan_key ?? null,
+    sub_status: row?.sub_status ?? null
+  };
 }
 
 // ---- Legacy fallback (public.users) ----
@@ -235,45 +211,53 @@ async function userProfileMiddleware(req, _res, next) {
     }
 
     // ✅ Fast path: cache hit (only positive mappings cached)
-const cached = cacheGet(from);
-if (cached?.tenantId && cached?.ownerId) {
-  req.tenantId = cached.tenantId;
-  req.ownerId = cached.ownerId;
-  req.isOwner = !!cached.isOwner;
-  req.tz = cached.tz || DEFAULT_TZ;
+    const cached = cacheGet(from);
+    if (cached?.tenantId && cached?.ownerId) {
+      req.tenantId = cached.tenantId;
+      req.ownerId = cached.ownerId;
+      req.isOwner = !!cached.isOwner;
+      req.tz = cached.tz || DEFAULT_TZ;
 
-  const plan = String(cached.plan || "free").trim().toLowerCase();
+      const plan = String(cached.plan || 'free').trim().toLowerCase();
+      const plan_key = cached?.plan_key ?? null;
+      const sub_status = cached?.sub_status ?? null;
 
-  // ✅ Debug: confirms what plan we are using on warm/cache path
-  try {
-    console.info("[PLAN_RESOLVE][userProfile][cache]", {
-      from,
-      ownerId: req.ownerId,
-      tenantId: req.tenantId,
-      role: cached.role || null,
-      resolvedPlan: plan,
-      note: "plan comes from identityCache; stored onto req.userProfile.plan / req.ownerProfile.plan"
-    });
-  } catch {}
+      // ✅ Debug: confirms what plan we are using on warm/cache path
+      try {
+        console.info('[PLAN_RESOLVE][userProfile][cache]', {
+          from,
+          ownerId: req.ownerId,
+          tenantId: req.tenantId,
+          role: cached.role || null,
+          resolvedPlan: plan,
+          plan_key,
+          sub_status,
+          note: 'plan comes from identityCache; stored onto req.userProfile.plan / req.ownerProfile.plan'
+        });
+      } catch {}
 
-  req.userProfile = shapeMinimalProfile({
-    from,
-    ownerId: req.ownerId,
-    role: cached.role || (req.isOwner ? 'owner' : null),
-    tz: req.tz,
-    plan
-  });
+      req.userProfile = shapeMinimalProfile({
+        from,
+        ownerId: req.ownerId,
+        role: cached.role || (req.isOwner ? 'owner' : null),
+        tz: req.tz,
+        plan
+      });
 
-  req.ownerProfile = shapeMinimalProfile({
-    from: req.ownerId,
-    ownerId: req.ownerId,
-    role: 'owner',
-    tz: req.tz,
-    plan
-  });
+      req.ownerProfile = shapeMinimalProfile({
+        from: req.ownerId,
+        ownerId: req.ownerId,
+        role: 'owner',
+        tz: req.tz,
+        plan
+      });
 
-  return next();
-}
+      // ✅ Attach raw plan truth for downstream gating/debugging
+      req.ownerProfile.plan_key = plan_key;
+      req.ownerProfile.sub_status = sub_status;
+
+      return next();
+    }
 
     // 1) Try canonical resolver first (whatsapp identity -> tenant + role)
     let resolved = null;
@@ -291,22 +275,34 @@ if (cached?.tenantId && cached?.ownerId) {
       req.tz = pickTz(resolved) || DEFAULT_TZ;
 
       let plan = 'free';
+      let plan_key = null;
+      let sub_status = null;
+
       try {
-        plan = await resolveOwnerPlan(req.ownerId, markDegraded);
+        const out = await resolveOwnerPlan(req.ownerId, markDegraded);
+        plan = String(out?.plan || 'free').trim().toLowerCase();
+        plan_key = out?.plan_key ?? null;
+        sub_status = out?.sub_status ?? null;
       } catch (e) {
-        console.warn("[userProfile] resolveOwnerPlan failed (default free):", e?.message);
+        console.warn('[userProfile] resolveOwnerPlan failed (default free):', e?.message);
         plan = 'free';
+        plan_key = null;
+        sub_status = null;
       }
-try {
-  console.info("[PLAN_RESOLVE][userProfile][resolver]", {
-    from,
-    ownerId: req.ownerId,
-    tenantId: req.tenantId,
-    role: resolved?.role || null,
-    resolvedPlan: plan,
-    note: "plan came from resolveOwnerPlan(); stored onto req.userProfile.plan / req.ownerProfile.plan"
-  });
-} catch {}
+
+      try {
+        console.info('[PLAN_RESOLVE][userProfile][resolver]', {
+          from,
+          ownerId: req.ownerId,
+          tenantId: req.tenantId,
+          role: resolved?.role || null,
+          resolvedPlan: plan,
+          plan_key,
+          sub_status,
+          note: 'plan came from resolveOwnerPlan(); stored onto req.userProfile.plan / req.ownerProfile.plan'
+        });
+      } catch {}
+
       req.userProfile = shapeMinimalProfile({
         from,
         ownerId: req.ownerId,
@@ -323,6 +319,10 @@ try {
         plan
       });
 
+      // ✅ Attach raw plan truth for downstream gating/debugging
+      req.ownerProfile.plan_key = plan_key;
+      req.ownerProfile.sub_status = sub_status;
+
       // ✅ Cache positive mapping for outage resilience
       cacheSet(from, {
         tenantId: req.tenantId,
@@ -330,7 +330,9 @@ try {
         isOwner: req.isOwner,
         tz: req.tz,
         role: resolved.role || null,
-        plan
+        plan,
+        plan_key,
+        sub_status
       });
 
       return next();
@@ -349,7 +351,7 @@ try {
       const ownerId = normalizeDigits(legacy.owner_id) || from;
       const role = legacy.role || (String(legacy.user_id) === String(ownerId) ? 'owner' : 'employee');
       const tz = legacy.timezone || DEFAULT_TZ;
-      const plan = getEffectivePlanKey(legacy);
+      const plan = String(getEffectivePlanKey(legacy) || 'free').trim().toLowerCase();
 
       req.ownerId = ownerId;
       req.isOwner = String(role).toLowerCase() === 'owner';
@@ -358,14 +360,20 @@ try {
       req.userProfile = shapeMinimalProfile({ from, ownerId, role, tz, plan });
       req.ownerProfile = shapeMinimalProfile({ from: ownerId, ownerId, role: 'owner', tz, plan });
 
+      // ✅ Attach raw plan truth if present on legacy row
+      req.ownerProfile.plan_key = legacy?.plan_key ?? null;
+      req.ownerProfile.sub_status = legacy?.sub_status ?? null;
+
       // ✅ Cache positive mapping for outage resilience
       cacheSet(from, {
-        tenantId: null,            // legacy may not have tenantId
+        tenantId: null, // legacy may not have tenantId
         ownerId,
         isOwner: req.isOwner,
         tz: req.tz,
         role,
-        plan
+        plan,
+        plan_key: legacy?.plan_key ?? null,
+        sub_status: legacy?.sub_status ?? null
       });
 
       return next();

@@ -987,7 +987,7 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
 // -------------------------------
 let plan = "free";
 try {
-  plan = getEffectivePlanKey(ownerProfile); // "free" | "starter" | "pro"
+  plan = String(getEffectivePlanKey(ownerProfile) || "free").trim().toLowerCase(); // ✅ normalize for map lookup
 } catch {}
 
 let caps = null;
@@ -997,7 +997,51 @@ try {
 } catch {}
 
 const maxJobs = caps?.jobs?.max_jobs_total ?? null;
+// ✅ DEBUG: prove what plan/caps/maxJobs we are gating with (log once per create-job attempt)
+try {
+  const planNorm = String(plan || "free").trim().toLowerCase();
+  const capsPlanKeys = (() => {
+    try {
+      const obj = require("../../src/config/planCapabilities")?.plan_capabilities || {};
+      return Object.keys(obj || {}).slice(0, 20);
+    } catch {
+      return [];
+    }
+  })();
 
+  console.info("[PLAN_GATE_DEBUG][create_job]", {
+    ownerId: String(owner || ""),
+    fromPhone: String(fromPhone || ""),
+    plan_raw: plan,
+    plan_norm: planNorm,
+    maxJobs_raw: maxJobs,
+    maxJobs_num: Number.isFinite(Number(maxJobs)) ? Number(maxJobs) : null,
+    caps_found_for_plan: !!caps,
+    caps_keys_hint: caps ? Object.keys(caps).slice(0, 12) : [],
+    capsPlanKeys, // shows what plan keys exist in the capabilities map
+    // ownerProfile hints (safe + helpful)
+    ownerProfile_plan_fields: {
+  // canonical fields used by getEffectivePlanKey()
+  plan_key: ownerProfile?.plan_key ?? null,
+  sub_status: ownerProfile?.sub_status ?? null,
+
+  // common alternates seen in older versions / portal paths
+  plan: ownerProfile?.plan ?? null,
+  subscription_tier: ownerProfile?.subscription_tier ?? null,
+  tier: ownerProfile?.tier ?? null,
+
+  // stripe-ish
+  stripe_plan: ownerProfile?.stripe_plan ?? null,
+  stripe_price_id: ownerProfile?.stripe_price_id ?? null,
+  stripe_status: ownerProfile?.stripe_status ?? null,
+  plan_status: ownerProfile?.plan_status ?? null,
+
+  // tenant-style fields (if ownerProfile is actually tenant row)
+  tenant_plan_key: ownerProfile?.tenant_plan_key ?? null,
+  tenant_sub_status: ownerProfile?.tenant_sub_status ?? null,
+}
+  });
+} catch {}
 // Only gate if maxJobs is a finite number (null means unbounded)
 if (Number.isFinite(Number(maxJobs))) {
   try {
@@ -1014,7 +1058,12 @@ if (Number.isFinite(Number(maxJobs))) {
         plan === "free"
           ? `Free supports up to ${maxJobs} jobs. Upgrade to Starter (25 jobs) or Pro (unlimited).`
           : `Your plan supports up to ${maxJobs} jobs. Upgrade to Pro for unlimited jobs.`;
-
+console.warn("[PLAN_GATE_DENY][create_job]", {
+  ownerId: String(owner || ""),
+  plan,
+  maxJobs,
+  currentCount
+});
       return respond(
         res,
         `⚠️ Job limit reached (${currentCount}/${maxJobs}).\n\n${upgradeLine}`

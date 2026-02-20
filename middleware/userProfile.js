@@ -69,7 +69,7 @@ function pickTz(obj) {
   return tz ? String(tz).trim() : null;
 }
 
-function shapeMinimalProfile({ from, ownerId, role, tz, plan }) {
+function shapeMinimalProfile({ from, ownerId, role, tz, plan, plan_key, sub_status }) {
   const safeRole = role || null;
   const safePlan = (plan || 'free').toLowerCase();
 
@@ -79,6 +79,8 @@ function shapeMinimalProfile({ from, ownerId, role, tz, plan }) {
     ownerId,
     role: safeRole,
     plan: safePlan,
+    plan_key: plan_key ?? null,
+    sub_status: sub_status ?? null,
     tz: tz || DEFAULT_TZ
   };
 }
@@ -141,16 +143,45 @@ async function resolveOwnerPlan(ownerDigits, markDegraded) {
   const owner = normalizeDigits(ownerDigits);
   if (!owner) return "free";
 
+  // IMPORTANT:
+  // Your DB may still be using legacy `plan` (pro/starter/free) without plan_key/sub_status populated.
+  // So we must select ALL plausible fields and let getEffectivePlanKey() decide.
   const r = await safeQuery(
-    `select plan_key, sub_status
-       from public.users
-      where user_id = $1
-      limit 1`,
-    [owner],
-    markDegraded
-  );
+  `
+  select
+    user_id,
+    plan_key,
+    sub_status,
+    plan_status,
+    stripe_status,
+    subscription_tier,
+    tier,
+    stripe_plan,
+    stripe_price_id
+  from public.users
+  where user_id = $1
+  limit 1
+  `,
+  [owner],
+  markDegraded
+);
 
   const row = r?.rows?.[0] || null;
+
+  // 🔎 optional debug (helps confirm what WhatsApp is actually reading)
+  try {
+    console.info("[OWNER_PLAN_ROW]", {
+      owner,
+      plan: row?.plan ?? null,
+      plan_key: row?.plan_key ?? null,
+      sub_status: row?.sub_status ?? null,
+      plan_status: row?.plan_status ?? null,
+      stripe_status: row?.stripe_status ?? null,
+      subscription_tier: row?.subscription_tier ?? null,
+      tier: row?.tier ?? null
+    });
+  } catch {}
+
   return getEffectivePlanKey(row);
 }
 

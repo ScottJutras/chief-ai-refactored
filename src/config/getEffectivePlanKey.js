@@ -1,72 +1,64 @@
-// src/config/getEffectivePlanKey.js
-
 function normalizePlanKey(x) {
   const p = String(x || "").toLowerCase().trim();
-
-  // canonical
   if (p === "free" || p === "starter" || p === "pro") return p;
 
-  // common variants / legacy
-  if (p === "basic") return "starter";
+  // common variants
   if (p === "professional") return "pro";
-  if (p === "unlimited") return "pro";
+  if (p === "starter_monthly" || p === "starter_yearly") return "starter";
+  if (p === "pro_monthly" || p === "pro_yearly") return "pro";
 
-  return "free";
+  return "";
 }
 
 function normalizeStatus(x) {
   return String(x || "").toLowerCase().trim();
 }
 
-/**
- * Treat these as "entitled" (allowed to use paid features).
- * Stripe + many internal systems use these.
- */
 function isEntitledStatus(status) {
   const s = normalizeStatus(status);
-  return (
-    s === "active" ||
-    s === "trialing" ||
-    s === "paid" ||          // common internal alias
-    s === "succeeded" ||     // sometimes stored from payment intents (not ideal but seen)
-    s === "complete"         // sometimes used by onboarding/billing pipelines
-  );
+  return s === "active" || s === "trialing";
 }
 
 /**
  * Canonical "effective plan" used for gating.
  *
- * Goal: prevent plan drift by reading the best available canonical fields.
- * Fail-closed if we cannot prove entitlement.
- *
  * Priority:
- * 1) plan_key + sub_status (canonical)
- * 2) tenant_plan_key + tenant_sub_status (if ownerProfile is actually tenant row)
- * 3) plan_status/stripe_status only if paired with a usable plan key
+ * 1) If we have an entitled status (sub_status / plan_status / stripe_status), use plan_key if present.
+ * 2) If status fields are missing/null (common during migration), fall back to legacy plan fields:
+ *    subscription_tier / tier / stripe_plan-like fields.
  *
- * We do NOT use subscription_tier alone as a paid signal.
+ * Never trust random strings; only accept free/starter/pro after normalization.
  */
 function getEffectivePlanKey(ownerRow) {
   if (!ownerRow) return "free";
 
-  // --- 1) canonical fields ---
-  const planKey =
-    ownerRow.plan_key ??
-    ownerRow.tenant_plan_key ??
-    ownerRow.plan ??                // allow if you stored it here historically
-    null;
+  const planKey = normalizePlanKey(ownerRow.plan_key);
 
-  const status =
-    ownerRow.sub_status ??
-    ownerRow.tenant_sub_status ??
-    ownerRow.plan_status ??
-    ownerRow.stripe_status ??
-    null;
+  const subStatus = normalizeStatus(ownerRow.sub_status);
+  const planStatus = normalizeStatus(ownerRow.plan_status);
+  const stripeStatus = normalizeStatus(ownerRow.stripe_status);
 
-  // Fail-closed: must be entitled
-  if (!isEntitledStatus(status)) return "free";
+  const entitled =
+    isEntitledStatus(subStatus) ||
+    isEntitledStatus(planStatus) ||
+    isEntitledStatus(stripeStatus);
 
-  return normalizePlanKey(planKey);
+  // 1) Best case: entitled + explicit plan_key
+  if (entitled && planKey) return planKey;
+
+  // 2) Migration case: we may have plan_key but no status yet — treat it as authoritative if set
+  if (planKey) return planKey;
+
+  // 3) Legacy fallback fields (your logs show these exist / used)
+  const legacy =
+    normalizePlanKey(ownerRow.subscription_tier) ||
+    normalizePlanKey(ownerRow.tier) ||
+    normalizePlanKey(ownerRow.stripe_plan) ||
+    "";
+
+  if (legacy) return legacy;
+
+  return "free";
 }
 
 module.exports = { getEffectivePlanKey, normalizePlanKey, isEntitledStatus };

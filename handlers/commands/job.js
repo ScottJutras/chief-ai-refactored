@@ -983,7 +983,7 @@ if (/^(create|new|start)\s+job\b/i.test(msg)) {
 
  // -------------------------------
 // ✅ Gate #2 — max jobs per plan
-// Canonical: plan_key + sub_status (effective plan)
+// Canonical: effective plan key -> planCapabilities
 // IMPORTANT: max_jobs_total = null means UNLIMITED (do not gate)
 // -------------------------------
 let plan = "free";
@@ -993,7 +993,7 @@ try {
 
 let caps = null;
 try {
-  const { plan_capabilities } = require("../../src/config/planCapabilities");
+  const { plan_capabilities } = require("../../src/config/planCapabilities"); // ✅ correct path from handlers/commands/job.js
   caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
 } catch (e) {
   console.warn("[PLAN_CAPS_LOAD_FAILED]", e?.message);
@@ -1002,14 +1002,21 @@ try {
 
 let maxJobs = caps?.jobs?.max_jobs_total ?? null;
 
-// Normalize string-ish values that sometimes sneak in
+// Normalize string-ish values just in case
 if (typeof maxJobs === "string") {
   const s = maxJobs.trim().toLowerCase();
   if (s === "null" || s === "undefined" || s === "") maxJobs = null;
   else if (/^\d+(\.\d+)?$/.test(s)) maxJobs = Number(s);
 }
 
-// ✅ DEBUG: prove what plan/caps/maxJobs we are gating with (log once per create-job attempt)
+// ✅ Unlimited if null/undefined
+const hasJobLimit =
+  maxJobs !== null &&
+  maxJobs !== undefined &&
+  Number.isFinite(Number(maxJobs)) &&
+  Number(maxJobs) > 0;
+
+// ✅ DEBUG (won’t lie about null -> 0)
 try {
   console.info("[PLAN_GATE_DEBUG][create_job]", {
     ownerId: String(owner || ""),
@@ -1017,7 +1024,9 @@ try {
     plan_raw: plan,
     maxJobs_raw: maxJobs,
     maxJobs_type: typeof maxJobs,
+    hasJobLimit,
     caps_found_for_plan: !!caps,
+    caps_keys_hint: caps ? Object.keys(caps).slice(0, 12) : [],
     capsPlanKeys: (() => {
       try {
         const obj = require("../../src/config/planCapabilities")?.plan_capabilities || {};
@@ -1036,9 +1045,6 @@ try {
     },
   });
 } catch {}
-
-// ✅ Unlimited if null/undefined
-const hasJobLimit = maxJobs !== null && maxJobs !== undefined && Number.isFinite(Number(maxJobs)) && Number(maxJobs) > 0;
 
 if (hasJobLimit) {
   try {

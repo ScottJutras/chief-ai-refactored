@@ -34,18 +34,23 @@ async function resolveJobRef(
   if (!owner) throw new Error('Missing owner_id');
 
   // If nothing provided, optionally create
-  if (!job_ref) {
-    if (!allowCreate) return null;
-    const name = String(defaultName || 'Untitled Job').trim() || 'Untitled Job';
-    const created = await pg.createJobIdempotent({
-      ownerId: owner,
-      jobName: name,
-      sourceMsgId,
-      status: 'draft',
-      active: true,
-    });
-    return created?.job || null;
-  }
+if (!job_ref) {
+  if (!allowCreate) return null;
+
+  const name = String(defaultName || 'Untitled Job').trim() || 'Untitled Job';
+
+  const created = await pg.createJobIdempotent({
+    ownerId: owner,
+    // ✅ pass both keys for compatibility with all versions
+    jobName: name,
+    name,
+    sourceMsgId,
+    status: 'draft',
+    active: true,
+  });
+
+  return created?.job || null;
+}
 
   // 1) Resolve by integer jobs.id
   if (job_ref.id && looksLikeInt(job_ref.id)) {

@@ -2059,12 +2059,13 @@ async function createJobIdempotent({
     );
     if (existingByName.rowCount) return { inserted: false, job: existingByName.rows[0], reason: 'already_exists' };
 
-    // ---------------------------------------------------------
-// 3) DB-level job cap (planCapabilities-aligned) — THIRD
-// Free: 3, Starter: 25, Pro: unlimited
+// ---------------------------------------------------------
+// 3) DB-level job cap (planCapabilities source of truth) — THIRD
 // Fail-open on unexpected DB issues.
 // ---------------------------------------------------------
 try {
+  const { plan_capabilities } = require('../src/config/planCapabilities'); // ✅ correct relative path
+
   const planRow = await client.query(
     `select plan_key, sub_status
        from public.users
@@ -2075,12 +2076,10 @@ try {
 
   const effective = getEffectivePlanKey(planRow?.rows?.[0] || null);
 
-  const maxJobs =
-    effective === 'pro' ? null :     // unlimited
-    effective === 'starter' ? 25 :
-    3;
+  const caps = plan_capabilities?.[effective] || plan_capabilities?.free || null;
+  const maxJobs = caps?.jobs?.max_jobs_total ?? null; // null => unlimited
 
-  if (maxJobs != null) {
+  if (maxJobs != null && Number.isFinite(Number(maxJobs))) {
     const c = await client.query(
       `select count(*)::int as n
          from public.jobs
@@ -2090,7 +2089,7 @@ try {
 
     const n = c.rows?.[0]?.n ?? 0;
 
-    if (Number.isFinite(n) && n >= maxJobs) {
+    if (Number.isFinite(n) && n >= Number(maxJobs)) {
       return {
         inserted: false,
         job: null,
@@ -2101,9 +2100,8 @@ try {
   }
 } catch (e) {
   // ✅ fail-open
-  // (optional) console.warn('[DB_JOB_CAP] fail-open:', e?.message);
+  // console.warn('[DB_JOB_CAP] fail-open:', e?.message);
 }
-
 
     // ---------------------------------------------------------
     // 4) Create

@@ -447,37 +447,80 @@ async function persistActiveJobBestEffort({ ownerId, userProfile, fromPhone, job
 
 /* ---------------- DB helpers ---------------- */
 
-async function listJobs(ownerId) {
+async function listJobs(ownerId, opts = {}) {
+  const owner = String(ownerId);
+
+  // Default: hide archived unless explicitly requested
+  const includeArchived = !!opts.includeArchived;
+
   const { rows } = await pg.query(
-    `SELECT
-        id,
-        job_no,
-        COALESCE(name, job_name) AS job_name,
-        status,
-        created_at
-       FROM public.jobs
-      WHERE owner_id = $1
-      ORDER BY job_no DESC NULLS LAST, created_at DESC
-      LIMIT 15`,
-    [String(ownerId)]
+    includeArchived
+      ? `SELECT
+            id,
+            job_no,
+            COALESCE(name, job_name) AS job_name,
+            status,
+            created_at,
+            updated_at
+         FROM public.jobs
+        WHERE owner_id = $1
+        ORDER BY job_no DESC NULLS LAST, created_at DESC
+        LIMIT 15`
+      : `SELECT
+            id,
+            job_no,
+            COALESCE(name, job_name) AS job_name,
+            status,
+            created_at,
+            updated_at
+         FROM public.jobs
+        WHERE owner_id = $1
+          AND (status IS NULL OR status IN ('open','active','draft'))
+        ORDER BY job_no DESC NULLS LAST, created_at DESC
+        LIMIT 15`,
+    [owner]
   );
 
   if (!rows.length) {
-    return `You don't have any jobs yet.
+    return includeArchived
+      ? `You don't have any jobs yet.
 
 Try:
 - "create job Oak Street re-roof"
-- "create job 12 Elm - siding"`;
+- "create job 12 Elm - siding"`
+      : `You don't have any active jobs yet.
+
+Try:
+- "create job Oak Street re-roof"
+- "create job 12 Elm - siding"
+
+If you want to see archived jobs too, say:
+- "list jobs all"`;
   }
 
   const lines = rows.map((j, idx) => {
-    const status = j.status || 'unknown';
+    const rawStatus = (j.status || '').toLowerCase();
+    const isArchived = rawStatus === 'archived';
+
+    // For non-archived list, rawStatus is usually open/active/draft/null
+    const statusLabel = isArchived ? 'archived' : (j.status || 'unknown');
+
     const date = j.created_at ? new Date(j.created_at).toLocaleDateString('en-CA') : 'n/a';
     const no = j.job_no != null ? `#${j.job_no} ` : '';
-    return `${idx + 1}. ${no}${j.job_name} (${status}, created ${date})`;
+
+    // Light clarity when includeArchived is true
+    const archivedTag = includeArchived && isArchived ? ' 🗑️' : '';
+
+    return `${idx + 1}. ${no}${j.job_name}${archivedTag} (${statusLabel}, created ${date})`;
   });
 
-  return `Here are your recent jobs:\n\n${lines.join('\n')}`;
+  const header = includeArchived ? 'Here are your recent jobs (including archived):' : 'Here are your recent active jobs:';
+
+  const footer = includeArchived
+    ? ''
+    : `\n\nTo include archived jobs, say: "list jobs all"`;
+
+  return `${header}\n\n${lines.join('\n')}${footer}`;
 }
 
 
@@ -830,7 +873,135 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
   try {
     const pending = await getPendingTransactionState(fromPhone);
 
-    // --- Awaiting picker selection ---
+    /* ------------------------------------------------------------
+     * Helper: Archive job best-effort (SAFE = soft delete)
+     * ------------------------------------------------------------ */
+    async function archiveJobBestEffort({ ownerId, jobNo, jobName }) {
+      const owner = String(ownerId || '').trim();
+      const no = jobNo != null && Number.isFinite(Number(jobNo)) ? Number(jobNo) : null;
+      const nm = jobName ? String(jobName).trim() : null;
+
+      if (!owner) throw new Error('missing ownerId');
+      if (no == null && !nm) throw new Error('missing job selector');
+
+      // Prefer pg helpers if they exist
+      const fnCandidates = [
+        'archiveJobByNo',
+        'archiveJob',
+        'deleteJobByNo', // some codebases use delete* but implement soft delete
+        'removeJobByNo',
+        'closeJobByNo'
+      ];
+
+      for (const fn of fnCandidates) {
+        if (typeof pg[fn] !== 'function') continue;
+        try {
+          if (no != null) {
+            const out = await pg[fn](owner, no);
+            if (out) return true;
+          }
+          if (nm) {
+            const out = await pg[fn](owner, nm);
+            if (out) return true;
+          }
+        } catch (e) {
+          console.warn('[JOB] pg.' + fn + ' failed:', e?.message);
+        }
+      }
+
+      // SQL fallback (safe)
+      if (typeof pg.query !== 'function') return false;
+
+      if (no != null) {
+        const r = await pg.query(
+          `update public.jobs
+              set status = 'archived',
+                  active = false,
+                  updated_at = now()
+            where owner_id=$1
+              and job_no=$2
+            returning job_no`,
+          [owner, Number(no)]
+        );
+        return !!r?.rowCount;
+      }
+
+      const r = await pg.query(
+        `update public.jobs
+            set status = 'archived',
+                active = false,
+                updated_at = now()
+          where owner_id=$1
+            and lower(coalesce(name, job_name)) = lower($2)
+          returning job_no`,
+        [owner, String(nm)]
+      );
+      return !!r?.rowCount;
+    }
+
+    /* ------------------------------------------------------------
+     * Pending: Awaiting delete-job confirmation
+     * ------------------------------------------------------------ */
+    if (pending?.awaitingJobDeleteConfirm) {
+      const lcMsg = String(msg || '').trim().toLowerCase();
+
+      if (isCancelLike(lcMsg)) {
+        await mergePendingTransactionState(fromPhone, {
+          awaitingJobDeleteConfirm: false,
+          deleteJobTarget: null
+        });
+        return respond(res, `❌ Cancelled. (No job was deleted.)`);
+      }
+
+      const isYes = /^(yes|y|confirm|delete|archive|ok|okay|do it)\b/i.test(String(msg || '').trim());
+
+      if (!isYes) {
+        const t = pending?.deleteJobTarget || {};
+        const nm = sanitizeJobLabel(t?.name || '');
+        const no = t?.job_no != null ? `#${t.job_no}` : '';
+        return respond(
+          res,
+          `⚠️ To confirm, reply: "yes"\n\nTo cancel, reply: "cancel"\n\nPending delete: ${no} ${nm}`.trim()
+        );
+      }
+
+      const target = pending?.deleteJobTarget || null;
+
+      // Clear pending FIRST
+      await mergePendingTransactionState(fromPhone, {
+        awaitingJobDeleteConfirm: false,
+        deleteJobTarget: null
+      });
+
+      if (!target?.job_no && !target?.name) {
+        return respond(res, `⚠️ I lost which job you meant. Try: "delete job #13"`);
+      }
+
+      try {
+        const ok = await archiveJobBestEffort({
+          ownerId: owner,
+          jobNo: target?.job_no ?? null,
+          jobName: target?.name ?? null
+        });
+
+        if (!ok) {
+          const nm = sanitizeJobLabel(target?.name || '');
+          const no = target?.job_no != null ? `#${target.job_no}` : '';
+          return respond(res, `⚠️ I couldn’t archive that job (${no} ${nm}). Try again.`);
+        }
+
+        const nm = sanitizeJobLabel(target?.name || 'Untitled Job');
+        const no = target?.job_no != null ? `#${target.job_no}` : '';
+        return respond(res, `🗑️ Archived job ${no} "${nm}".`);
+      } catch (e) {
+        console.warn('[JOB] archive failed:', e?.message);
+        return respond(res, `⚠️ I couldn’t archive that job right now. Try again.`);
+      }
+    }
+
+    /* ------------------------------------------------------------
+     * Pending: Awaiting picker selection
+     * ------------------------------------------------------------ */
     if (pending?.awaitingActiveJobPick) {
       if (isCancelLike(lc)) {
         await clearPickerState(fromPhone);
@@ -877,13 +1048,11 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
         return respond(res, `✅ Okay — using Overhead (no active job).`);
       }
 
-      // If we got a job object from picker, use it; otherwise try name.
       const pickedJob = resolved.kind === 'job' ? resolved.job : null;
       const pickedName = pickedJob?.name || (resolved.kind === 'name' ? resolved.name : null);
       const pickedJobNo = pickedJob?.job_no != null ? Number(pickedJob.job_no) : null;
 
       try {
-        // Activate job
         const selector = pickedJobNo != null ? `jobno_${pickedJobNo}` : pickedName;
         const j = await activateJobBestEffort(owner, selector);
 
@@ -914,7 +1083,9 @@ Now you can:
       }
     }
 
-    // --- Open picker ---
+    /* ------------------------------------------------------------
+     * Command: Open picker
+     * ------------------------------------------------------------ */
     if (isPickerOpenCommand(lc)) {
       const jobs = normalizeJobOptions(await listActiveJobsDetailed(owner, { limit: 50 }));
       return await sendActiveJobPickerOrFallback({
@@ -927,7 +1098,9 @@ Now you can:
       });
     }
 
-    // --- Direct set active job ---
+    /* ------------------------------------------------------------
+     * Command: Direct set active job
+     * ------------------------------------------------------------ */
     if (/^(active\s+job|set\s+active|switch\s+job)\b/i.test(msg)) {
       const rest = msg.replace(/^(active\s+job|set\s+active|switch\s+job)\b/i, '').trim();
       if (!rest) return respond(res, `Which job should I set active? Try: "active job Oak Street"`);
@@ -963,179 +1136,252 @@ Now you can:
       }
     }
 
-    // --- List jobs ---
+    /* ------------------------------------------------------------
+     * Command: List jobs
+     * ------------------------------------------------------------ */
     if (/^(jobs|list jobs|show jobs|show job list|job list)\b/i.test(msg)) {
-      const reply = await listJobs(owner);
-      return respond(res, reply);
-    }
-
-    // --- Create job (idempotent) ---
-if (/^(create|new|start)\s+job\b/i.test(msg)) {
-  const name = msg.replace(/^(create|new|start)\s+job\b/i, '').trim();
-
-  if (!name) {
-    return respond(res, `What should the job be called? Example: "create job Oak Street re-roof"`);
-  }
-
-  if (typeof pg.createJobIdempotent !== 'function') {
-    return respond(res, `⚠️ createJobIdempotent() isn't available in postgres.js yet.`);
-  }
-
-// -------------------------------
-// ✅ Gate #2 — max jobs per plan
-// Canonical: effective plan key -> planCapabilities
-// IMPORTANT: max_jobs_total = null means UNLIMITED (do not gate)
-// -------------------------------
-let plan = "free";
-try {
-  plan = String(getEffectivePlanKey(ownerProfile) || "free").trim().toLowerCase();
-} catch {}
-
-let caps = null;
-let capsPlanKeys = [];
-try {
-  const mod = require("../../src/config/planCapabilities"); // ✅ correct path from handlers/commands/job.js
-  const plan_capabilities = mod?.plan_capabilities || {};
-  capsPlanKeys = Object.keys(plan_capabilities || {}).slice(0, 20);
-  caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
-} catch (e) {
-  console.warn("[PLAN_CAPS_LOAD_FAILED]", e?.message);
-  caps = null;
-  capsPlanKeys = [];
+  const includeArchived = /\ball\b/i.test(msg); // "list jobs all" / "jobs all"
+  const reply = await listJobs(owner, { includeArchived });
+  return respond(res, reply);
 }
 
-let maxJobs = caps?.jobs?.max_jobs_total ?? null;
+    /* ------------------------------------------------------------
+     * Command: Delete job (SAFE = archive)
+     * ------------------------------------------------------------ */
+    if (/^(delete|remove|archive)\s+job\b/i.test(msg)) {
+      const rest = String(msg || '').replace(/^(delete|remove|archive)\s+job\b/i, '').trim();
 
-// Normalize string-ish values just in case
-if (typeof maxJobs === "string") {
-  const s = maxJobs.trim().toLowerCase();
-  if (s === "null" || s === "undefined" || s === "") maxJobs = null;
-  else if (/^\d+(\.\d+)?$/.test(s)) maxJobs = Number(s);
-}
+      if (!rest) {
+        return respond(res, `Which job should I archive? Try: "delete job #13" or "delete job Oak Street"`);
+      }
 
-// ✅ Unlimited if null/undefined
-const hasJobLimit =
-  maxJobs !== null &&
-  maxJobs !== undefined &&
-  Number.isFinite(Number(maxJobs)) &&
-  Number(maxJobs) > 0;
+      const token = normalizeJobAnswer(rest);
 
-// ✅ Determine where the effective plan *came from* (truthful)
-const effectivePlanSource = (() => {
-  // If effective plan is NOT free, it must have come from an entitled status check
-  if (plan !== "free") return "users.plan_key+sub_status(entitled)";
-  // If we had plan_key/sub_status fields but still ended up free, record why
-  if (ownerProfile?.plan_key != null || ownerProfile?.sub_status != null) return "users.plan_key+sub_status(not_entitled_or_missing)";
-  // Legacy fallback
-  if (ownerProfile?.plan) return "ownerProfile.plan(legacy)";
-  if (ownerProfile?.subscription_tier) return "ownerProfile.subscription_tier(legacy)";
-  return "default_free";
-})();
+      let jobNo = null;
+      const mNo = String(token).match(/^jobno_(\d{1,10})$/i);
+      if (mNo?.[1]) jobNo = Number(mNo[1]);
 
-// ✅ DEBUG (won’t lie about null -> 0)
-try {
-  console.info("[PLAN_GATE_DEBUG][create_job]", {
-    ownerId: String(owner || ""),
-    fromPhone: String(fromPhone || ""),
-    plan_raw: plan,
-    maxJobs_raw: maxJobs,
-    maxJobs_type: maxJobs === null ? "null" : typeof maxJobs,
-    hasJobLimit,
-    caps_found_for_plan: !!caps,
-    caps_keys_hint: caps ? Object.keys(caps).slice(0, 12) : [],
-    effectivePlanSource,
-    capsPlanKeys,
-    ownerProfile_plan_fields: {
-      plan_key: ownerProfile?.plan_key ?? null,
-      sub_status: ownerProfile?.sub_status ?? null,
-      plan: ownerProfile?.plan ?? null,
-      subscription_tier: ownerProfile?.subscription_tier ?? null,
-      stripe_status: ownerProfile?.stripe_status ?? null,
-      plan_status: ownerProfile?.plan_status ?? null
-    }
-  });
-} catch {}
+      if (jobNo == null) {
+        const mNum = String(rest).trim().match(/^#?\s*(\d{1,10})\b/);
+        if (mNum?.[1]) jobNo = Number(mNum[1]);
+      }
 
-if (hasJobLimit) {
-  try {
-    const { rows } = await pg.query(
-      `select count(*)::int as c
-         from public.jobs
-        where owner_id=$1`,
-      [String(owner).trim()]
-    );
+      const nameCandidate =
+        jobNo == null ? sanitizeJobLabel(rest.replace(/^#?\s*\d+\b/, '').trim() || rest) : null;
 
-    const currentCount = Number(rows?.[0]?.c || 0);
+      let jobRow = null;
+      try {
+        if (typeof pg.query === 'function') {
+          if (jobNo != null && Number.isFinite(jobNo)) {
+            const r = await pg.query(
+              `select job_no, coalesce(name, job_name) as name, active, status
+                 from public.jobs
+                where owner_id=$1 and job_no=$2
+                limit 1`,
+              [String(owner).trim(), Number(jobNo)]
+            );
+            jobRow = r?.rows?.[0] || null;
+          } else if (nameCandidate) {
+            const r1 = await pg.query(
+              `select job_no, coalesce(name, job_name) as name, active, status
+                 from public.jobs
+                where owner_id=$1
+                  and lower(coalesce(name, job_name)) = lower($2)
+                order by updated_at desc nulls last, created_at desc
+                limit 1`,
+              [String(owner).trim(), String(nameCandidate)]
+            );
+            jobRow = r1?.rows?.[0] || null;
 
-    if (currentCount >= Number(maxJobs)) {
-      const upgradeLine =
-        plan === "free"
-          ? `Free supports up to ${maxJobs} jobs. Upgrade to Starter (25 jobs) or Pro (unlimited).`
-          : `Your plan supports up to ${maxJobs} jobs. Upgrade to Pro for unlimited jobs.`;
+            if (!jobRow) {
+              const r2 = await pg.query(
+                `select job_no, coalesce(name, job_name) as name, active, status
+                   from public.jobs
+                  where owner_id=$1
+                    and (name ilike $2 or job_name ilike $2)
+                  order by updated_at desc nulls last, created_at desc
+                  limit 1`,
+                [String(owner).trim(), `%${String(nameCandidate)}%`]
+              );
+              jobRow = r2?.rows?.[0] || null;
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[JOB] delete lookup failed:', e?.message);
+        jobRow = null;
+      }
 
-      console.warn("[PLAN_GATE_DENY][create_job]", {
-        ownerId: String(owner || ""),
-        plan,
-        maxJobs,
-        currentCount
+      if (!jobRow?.job_no) {
+        return respond(res, `⚠️ I couldn’t find that job.\n\nTry: "list jobs" then "delete job #<number>"`);
+      }
+
+      const nm = sanitizeJobLabel(jobRow?.name || 'Untitled Job');
+      const no = Number(jobRow.job_no);
+
+      await mergePendingTransactionState(fromPhone, {
+        awaitingJobDeleteConfirm: true,
+        deleteJobTarget: { job_no: no, name: nm }
       });
 
-      return respond(
-        res,
-        `⚠️ Job limit reached (${currentCount}/${maxJobs}).\n\n${upgradeLine}`
-      );
-    }
-  } catch (e) {
-    console.warn("[JOB] job count gate failed (fail-open):", e?.message);
-  }
-}
-  // Create job
-  const out = await pg.createJobIdempotent({
-    ownerId: String(owner).trim(), // ✅ keep UUID/text intact
-    name,
-    sourceMsgId
-  });
-
-  if (!out?.job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
-
-  const jobName = sanitizeJobLabel(out.job.job_name || out.job.name || name || 'Untitled Job');
-  const jobNo = out.job.job_no ?? '?';
-
-  if (out.inserted) {
-    // ✅ DB-based “first job” detection (cheap; limit 2)
-    let isFirstJobCreated = false;
-    try {
-      const { rows } = await pg.query(
-        `select job_no
-           from public.jobs
-          where owner_id=$1
-          order by job_no asc
-          limit 2`,
-        [String(owner).trim()] // ✅ keep UUID/text intact
-      );
-      isFirstJobCreated = (rows?.length === 1);
-    } catch {}
-
-    // ✅ Moment 1 (orientation) — ONLY first job + ONLY free — exact copy
-    if (shouldShowJobCreatedOrientation({ plan, isFirstJobCreated })) {
-      return respond(
-        res,
-        `✅ Created job: “${jobName}” (Job #${jobNo}).\n\nEverything logged against this job stays traceable.\n\nFree lets you capture the basics.\nPro unlocks crew self-logging — employees can clock in/out from their own phones.`
-      );
+      return respond(res, `🗑️ Archive job #${no} "${nm}"?\n\nReply "yes" to confirm, or "cancel" to abort.`);
     }
 
-    return respond(res, `✅ Created job: "${jobName}" (Job #${jobNo}).`);
-  }
+    /* ------------------------------------------------------------
+     * Command: Create job (idempotent)
+     * ------------------------------------------------------------ */
+    if (/^(create|new|start)\s+job\b/i.test(msg)) {
+      const name = msg.replace(/^(create|new|start)\s+job\b/i, '').trim();
 
-  if (out.reason === 'already_exists') {
-    return respond(res, `✅ That job already exists: "${jobName}" (Job #${jobNo}).`);
-  }
+      if (!name) {
+        return respond(res, `What should the job be called? Example: "create job Oak Street re-roof"`);
+      }
 
-  return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
-}
+      if (typeof pg.createJobIdempotent !== 'function') {
+        return respond(res, `⚠️ createJobIdempotent() isn't available in postgres.js yet.`);
+      }
 
+      // -------------------------------
+      // ✅ Gate #2 — max jobs per plan
+      // Canonical: effective plan key -> planCapabilities
+      // IMPORTANT: max_jobs_total = null means UNLIMITED (do not gate)
+      // -------------------------------
+      let plan = 'free';
+      try {
+        plan = String(getEffectivePlanKey(ownerProfile) || 'free').trim().toLowerCase();
+      } catch {}
 
+      let caps = null;
+      let capsPlanKeys = [];
+      try {
+        const mod = require('../../src/config/planCapabilities');
+        const plan_capabilities = mod?.plan_capabilities || {};
+        capsPlanKeys = Object.keys(plan_capabilities || {}).slice(0, 20);
+        caps = plan_capabilities?.[plan] || plan_capabilities?.free || null;
+      } catch (e) {
+        console.warn('[PLAN_CAPS_LOAD_FAILED]', e?.message);
+        caps = null;
+        capsPlanKeys = [];
+      }
 
+      let maxJobs = caps?.jobs?.max_jobs_total ?? null;
+
+      if (typeof maxJobs === 'string') {
+        const s = maxJobs.trim().toLowerCase();
+        if (s === 'null' || s === 'undefined' || s === '') maxJobs = null;
+        else if (/^\d+(\.\d+)?$/.test(s)) maxJobs = Number(s);
+      }
+
+      const hasJobLimit =
+        maxJobs !== null && maxJobs !== undefined && Number.isFinite(Number(maxJobs)) && Number(maxJobs) > 0;
+
+      const effectivePlanSource = (() => {
+        if (plan !== 'free') return 'users.plan_key+sub_status(entitled)';
+        if (ownerProfile?.plan_key != null || ownerProfile?.sub_status != null) return 'users.plan_key+sub_status(not_entitled_or_missing)';
+        if (ownerProfile?.plan) return 'ownerProfile.plan(legacy)';
+        if (ownerProfile?.subscription_tier) return 'ownerProfile.subscription_tier(legacy)';
+        return 'default_free';
+      })();
+
+      try {
+        console.info('[PLAN_GATE_DEBUG][create_job]', {
+          ownerId: String(owner || ''),
+          fromPhone: String(fromPhone || ''),
+          plan_raw: plan,
+          maxJobs_raw: maxJobs,
+          maxJobs_type: maxJobs === null ? 'null' : typeof maxJobs,
+          hasJobLimit,
+          caps_found_for_plan: !!caps,
+          caps_keys_hint: caps ? Object.keys(caps).slice(0, 12) : [],
+          effectivePlanSource,
+          capsPlanKeys,
+          ownerProfile_plan_fields: {
+            plan_key: ownerProfile?.plan_key ?? null,
+            sub_status: ownerProfile?.sub_status ?? null,
+            plan: ownerProfile?.plan ?? null,
+            subscription_tier: ownerProfile?.subscription_tier ?? null,
+            stripe_status: ownerProfile?.stripe_status ?? null,
+            plan_status: ownerProfile?.plan_status ?? null
+          }
+        });
+      } catch {}
+
+      if (hasJobLimit) {
+        try {
+          const { rows } = await pg.query(
+            `select count(*)::int as c
+               from public.jobs
+              where owner_id=$1`,
+            [String(owner).trim()]
+          );
+
+          const currentCount = Number(rows?.[0]?.c || 0);
+
+          if (currentCount >= Number(maxJobs)) {
+            const upgradeLine =
+              plan === 'free'
+                ? `Free supports up to ${maxJobs} jobs. Upgrade to Starter (25 jobs) or Pro (unlimited).`
+                : `Your plan supports up to ${maxJobs} jobs. Upgrade to Pro for unlimited jobs.`;
+
+            console.warn('[PLAN_GATE_DENY][create_job]', {
+              ownerId: String(owner || ''),
+              plan,
+              maxJobs,
+              currentCount
+            });
+
+            return respond(res, `⚠️ Job limit reached (${currentCount}/${maxJobs}).\n\n${upgradeLine}`);
+          }
+        } catch (e) {
+          console.warn('[JOB] job count gate failed (fail-open):', e?.message);
+        }
+      }
+
+      const out = await pg.createJobIdempotent({
+        ownerId: String(owner).trim(),
+        name,
+        sourceMsgId
+      });
+
+      if (!out?.job) return respond(res, `⚠️ I couldn't create that job right now. Try again.`);
+
+      const jobName = sanitizeJobLabel(out.job.job_name || out.job.name || name || 'Untitled Job');
+      const jobNo = out.job.job_no ?? '?';
+
+      if (out.inserted) {
+        let isFirstJobCreated = false;
+        try {
+          const { rows } = await pg.query(
+            `select job_no
+               from public.jobs
+              where owner_id=$1
+              order by job_no asc
+              limit 2`,
+            [String(owner).trim()]
+          );
+          isFirstJobCreated = rows?.length === 1;
+        } catch {}
+
+        if (shouldShowJobCreatedOrientation({ plan, isFirstJobCreated })) {
+          return respond(
+            res,
+            `✅ Created job: “${jobName}” (Job #${jobNo}).\n\nEverything logged against this job stays traceable.\n\nFree lets you capture the basics.\nPro unlocks crew self-logging — employees can clock in/out from their own phones.`
+          );
+        }
+
+        return respond(res, `✅ Created job: "${jobName}" (Job #${jobNo}).`);
+      }
+
+      if (out.reason === 'already_exists') {
+        return respond(res, `✅ That job already exists: "${jobName}" (Job #${jobNo}).`);
+      }
+
+      return respond(res, `✅ Already handled that message: "${jobName}" (Job #${jobNo}).`);
+    }
+
+    /* ------------------------------------------------------------
+     * Fallback help
+     * ------------------------------------------------------------ */
     return respond(
       res,
       `Job commands you can use:
@@ -1143,13 +1389,13 @@ if (hasJobLimit) {
 - "create job Oak Street re-roof"
 - "change job" (shows active jobs picker)
 - "active job Oak Street re-roof" (or "active job #6")
-- "list jobs"`
+- "list jobs"
+- "delete job #6" (archives it)`
     );
   } catch (e) {
     console.error('[job] error:', e?.message, { code: e?.code, detail: e?.detail });
     return respond(res, 'Job error. Try again.');
   } finally {
-    // ✅ align with your lock middleware pattern
     try {
       res?.req?.releaseLock?.();
     } catch {}

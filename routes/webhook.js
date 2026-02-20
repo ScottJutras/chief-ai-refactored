@@ -1628,16 +1628,17 @@ router.post('*', async (req, res, next) => {
     req.body.ResolvedInboundText = text2;
     let lc2 = text2.toLowerCase();
 
-    /* -----------------------------------------------------------------------
-     * ✅ Canonical post-media refresh (SINGLE source of truth)
-     * - IMPORTANT: media handler writes req.body.Body (transcript), not ResolvedInboundText
-     * - If interactive produced a stable token (jp:/jobpick::/more/oh/etc.), never overwrite it with Body.
+       /* -----------------------------------------------------------------------
+     * ✅ Canonical post-media refresh (EARLY)
+     * - Runs immediately after resolveInboundTextFromTwilio()
+     * - Preserves stable interactive picker tokens (so Body cannot overwrite them)
+     * - IMPORTANT: media handler later may write req.body.Body (transcript)
      * ----------------------------------------------------------------------- */
     {
       const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
       const body0 = String(req.body?.Body || '').trim();
 
-      // Treat picker tokens as stable (do not overwrite with transcript Body)
+      // Treat picker tokens as stable (do not overwrite with Body)
       const isStablePickerToken =
         /^jp:/i.test(resolved0) ||
         /^jobix_\d+/i.test(resolved0) ||
@@ -1645,14 +1646,19 @@ router.post('*', async (req, res, next) => {
         /^jobpick::/i.test(resolved0) ||
         /^(more|overhead|oh)$/i.test(resolved0);
 
-      text2 = isStablePickerToken ? resolved0 : (body0 || resolved0 || text2 || '').trim();
+      text2 = isStablePickerToken
+        ? resolved0
+        : (body0 || resolved0 || text2 || '').trim();
+
       lc2 = text2.toLowerCase();
 
-      console.info('[ROUTER_TEXT_REFRESH]', { lcN: lc2.slice(0, 50) });
+      console.info('[ROUTER_TEXT_REFRESH_EARLY]', { lcN: lc2.slice(0, 50) });
       if (isStablePickerToken) {
-        console.info('[ROUTER_PICKER_TOKEN_PRESERVED]', { token: resolved0.slice(0, 80) });
+        console.info('[ROUTER_PICKER_TOKEN_PRESERVED_EARLY]', { token: resolved0.slice(0, 80) });
       }
     }
+
+   
 
     // ✅ Hard time command classification (uses lc2)
     let isHardTimeCommand = looksHardTimeCommand(lc2);
@@ -2118,9 +2124,11 @@ if (hasPendingMedia && numMedia === 0) {
   }
 }
 
+
 /* -----------------------------------------------------------------------
  * ✅ Canonical post-media refresh (SINGLE source of truth)
  * - IMPORTANT: never let Body overwrite stable interactive tokens
+ * - Recompute hard-time classification ONCE (after final text settles)
  * ----------------------------------------------------------------------- */
 {
   const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
@@ -2150,40 +2158,44 @@ if (hasPendingMedia && numMedia === 0) {
   console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
 }
 
+/* -----------------------------------------------------------------------
+ * ✅ HARD JOB COMMANDS (router-level)
+ * - Runs AFTER final post-media refresh (lc2 is settled)
+ * - Runs AFTER tenant link enforcement (req.ownerId exists by here)
+ * - Runs BEFORE Insights/orchestrator so "list jobs" never becomes insights
+ * ----------------------------------------------------------------------- */
+try {
+  const lcJob = String(lc2 || '').trim().toLowerCase();
+  const hardJob = isHardJobCommand(lcJob);
 
-const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
-const body0 = String(req.body?.Body || '').trim();
+  console.info('[ROUTER_HARD_JOB]', { lcN: lcJob.slice(0, 50), isHardJobCommand: hardJob });
 
-// treat any picker token as "stable"
-const isStablePickerToken =
-  /^jp:/i.test(resolved0) ||
-  /^jobix_\d+/i.test(resolved0) ||
-  /^jobno_\d+/i.test(resolved0) ||
-  /^jobpick::/i.test(resolved0) ||
-  /^(more|overhead|oh)$/i.test(resolved0);
+  if (hardJob) {
+    const { handleJob } = require('../handlers/commands/job');
 
-text2 = isStablePickerToken
-  ? resolved0
-  : (body0 || resolved0 || text2 || '').trim();
+    const sourceMsgId =
+      String(req.body?.MessageSid || req.body?.SmsMessageSid || messageSid || '').trim() || null;
 
-lc2 = text2.toLowerCase();
+    const result = await handleJob(
+      req.from,          // fromPhone (digits)
+      text2,             // ✅ canonical inbound text (post-media settled)
+      req.userProfile,   // userProfile
+      req.ownerId,       // ownerId
+      req.ownerProfile,  // ownerProfile
+      req.isOwner,       // isOwner
+      res,               // res (Twilio)
+      sourceMsgId        // sourceMsgId
+    );
 
-
-// --- LINK keyword: prevent confusion (exact match only) ---
-const lc2_clean = lc2.trim().replace(/[.!?]+$/g, '');
-if (lc2_clean === 'link') {
-  return ok(
-    res,
-    [
-      '✅ WhatsApp confirmed.',
-      '',
-      'Go back to the portal, request your 6-digit code, enter it here, then click Verify in ChiefOS.',
-      '',
-      'Code expires in 10 minutes.'
-    ].join('\n')
-  );
+    if (!res.headersSent && result) {
+      if (typeof result === 'string') return sendTwiml(res, result);
+      if (result?.twiml) return sendTwiml(res, result.twiml);
+    }
+    return;
+  }
+} catch (e) {
+  console.warn('[ROUTER_HARD_JOB] failed (continue):', e?.message);
 }
-
 /* -----------------------------------------------------------------------
  * ✅ INSIGHTS v0 FASTPATH (MVP)
  * - Runs BEFORE job handler routing

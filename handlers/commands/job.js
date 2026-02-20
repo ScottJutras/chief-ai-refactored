@@ -1139,7 +1139,7 @@ Now you can:
     /* ------------------------------------------------------------
      * Command: List jobs
      * ------------------------------------------------------------ */
-    if (/^(jobs|list jobs|show jobs|show job list|job list)\b/i.test(msg)) {
+    if (/^(jobs|job|list jobs|list job|show jobs|show job|show job list|job list)\b/i.test(msg)) {
   const includeArchived = /\ball\b/i.test(msg); // "list jobs all" / "jobs all"
   const reply = await listJobs(owner, { includeArchived });
   return respond(res, reply);

@@ -1664,6 +1664,30 @@ router.post('*', async (req, res, next) => {
     let isHardTimeCommand = looksHardTimeCommand(lc2);
     console.info('[ROUTER_HARD_TIME]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
 
+         // ✅ HARD JOB COMMANDS helper (must be defined before router-level hard job routing uses it)
+    // Includes both "list jobs" and common singular typo "list job"
+    function isHardJobCommand(lc) {
+      const s = String(lc || '').trim().toLowerCase();
+
+      return (
+        // list
+        /^(jobs|job|list\s+jobs|list\s+job|show\s+jobs|show\s+job|job\s+list|show\s+job\s+list)\b/.test(s) ||
+
+        // create
+        /^(create|new|start)\s+job\b/.test(s) ||
+
+        // active job set
+        /^(active\s+job|set\s+active|switch\s+job)\b/.test(s) ||
+
+        // picker open
+        /^(change\s+job|pick\s+job|show\s+active\s+jobs|active\s+jobs)\b/.test(s) ||
+
+        // delete/archive
+        /^(delete|remove|archive)\s+job\b/.test(s)
+      );
+    }
+
+
     // ✅ If there's no text and no media, do nothing
     if (!text2 && numMedia === 0) return ok(res);
 

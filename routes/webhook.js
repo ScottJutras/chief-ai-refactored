@@ -1711,6 +1711,396 @@ router.post('*', async (req, res, next) => {
       );
     }
 
+    // ✅ Owner-only: onboarding status (debug helper)
+// Keyword: chiefonboarding status
+if (/^chiefonboarding\s+status\b/i.test(lc2Clean)) {
+  if (!req.isOwner) {
+    return ok(
+      res,
+      [
+        "❌ Only the business owner can run this.",
+        "",
+        "If you need access, ask the owner to link your phone in the portal."
+      ].join("\n")
+    );
+  }
+
+  try {
+    const ownerId = String(req.ownerId || "").trim();
+    if (!ownerId) return ok(res, "Missing owner context. Try again.");
+
+    const { rows } = await pg.query(
+      `
+      select key, value, updated_at
+      from public.settings
+      where owner_id = $1
+        and key like 'onboarding.%'
+      order by key
+      `,
+      [ownerId]
+    );
+
+    if (!rows || rows.length === 0) {
+      return ok(
+        res,
+        [
+          `📊 Onboarding Status`,
+          ``,
+          `Owner: ${ownerId}`,
+          `Stage: (none set — defaults to "new")`
+        ].join("\n")
+      );
+    }
+
+    const stageRow = rows.find(r => r.key === "onboarding.stage");
+    const stage = stageRow?.value || "unknown";
+    const updated = stageRow?.updated_at
+      ? new Date(stageRow.updated_at).toISOString()
+      : "unknown";
+
+    return ok(
+      res,
+      [
+        `📊 Onboarding Status`,
+        ``,
+        `Owner: ${ownerId}`,
+        `Stage: ${stage}`,
+        `Last Updated: ${updated}`,
+        ``,
+        `All onboarding keys:`,
+        ...rows.map(r =>
+          `• ${r.key} = ${r.value} (${new Date(r.updated_at).toISOString()})`
+        )
+      ].join("\n")
+    );
+  } catch (e) {
+    console.warn("[ONBOARDING_STATUS] failed:", e?.message);
+    return ok(res, `⚠️ Could not fetch onboarding status. ${e?.message || ""}`.trim());
+  }
+}
+
+// ✅ Owner-only: tenant debug
+// Keyword: chiefdebug tenant
+if (/^chiefdebug\s+tenant\b/i.test(lc2Clean)) {
+  if (!req.isOwner) {
+    return ok(
+      res,
+      [
+        "❌ Only the business owner can run this.",
+        "",
+        "Ask the owner to link your phone in the portal."
+      ].join("\n")
+    );
+  }
+
+  try {
+    const ownerId = String(req.ownerId || "").trim();
+    if (!ownerId) return ok(res, "Missing owner context. Try again.");
+
+    const { rows } = await pg.query(
+      `
+      select
+        id,
+        owner_id,
+        business_name,
+        country,
+        province,
+        tz,
+        currency,
+        tax_code,
+        plan_key,
+        plan_status,
+        stripe_customer_id,
+        stripe_subscription_id,
+        current_period_end,
+        created_at,
+        updated_at
+      from public.chiefos_tenants
+      where owner_id::text = $1
+      limit 1
+      `,
+      [ownerId]
+    );
+
+    const t = rows?.[0] || null;
+    if (!t) {
+      return ok(
+        res,
+        [
+          "🏢 Tenant Debug",
+          "",
+          `Owner: ${ownerId}`,
+          "Result: ❌ No tenant row found in public.chiefos_tenants",
+          "",
+          "This usually means owner→tenant mapping is missing or wrong."
+        ].join("\n")
+      );
+    }
+
+    const fmt = (v) => (v === null || v === undefined || v === "" ? "(null)" : String(v));
+
+    return ok(
+      res,
+      [
+        "🏢 Tenant Debug",
+        "",
+        `tenant_id: ${fmt(t.id)}`,
+        `owner_id: ${fmt(t.owner_id)}`,
+        `business_name: ${fmt(t.business_name)}`,
+        "",
+        `locale: ${fmt(t.country)} ${fmt(t.province)}  tz=${fmt(t.tz)}  currency=${fmt(t.currency)}  tax=${fmt(t.tax_code)}`,
+        "",
+        `plan_key: ${fmt(t.plan_key)}`,
+        `plan_status: ${fmt(t.plan_status)}`,
+        `stripe_customer_id: ${fmt(t.stripe_customer_id)}`,
+        `stripe_subscription_id: ${fmt(t.stripe_subscription_id)}`,
+        `current_period_end: ${fmt(t.current_period_end)}`,
+        "",
+        `updated_at: ${fmt(t.updated_at)}`,
+        `created_at: ${fmt(t.created_at)}`
+      ].join("\n")
+    );
+  } catch (e) {
+    console.warn("[CHIEFDEBUG_TENANT] failed:", e?.message);
+    return ok(res, `⚠️ chiefdebug tenant failed. ${e?.message || ""}`.trim());
+  }
+}
+// ✅ Owner-only: effective plan debug
+// Keyword: chiefdebug plan
+if (/^chiefdebug\s+plan\b/i.test(lc2Clean)) {
+  if (!req.isOwner) {
+    return ok(
+      res,
+      [
+        "❌ Only the business owner can run this.",
+        "",
+        "Ask the owner to link your phone in the portal."
+      ].join("\n")
+    );
+  }
+
+  try {
+    const ownerId = String(req.ownerId || "").trim();
+    if (!ownerId) return ok(res, "Missing owner context. Try again.");
+
+    // 1) Try your canonical plan resolver if present (preferred)
+    let eff = null;
+    try {
+      const planSvc =
+        require("../services/effectivePlan") ||
+        require("../services/effective_plan") ||
+        null;
+
+      if (planSvc?.getEffectivePlanForOwner) {
+        eff = await planSvc.getEffectivePlanForOwner(ownerId);
+      }
+    } catch {}
+
+    // 2) Fallback: read tenant plan fields directly (still valuable)
+    let tenant = null;
+    try {
+      const { rows } = await pg.query(
+        `
+        select id, plan_key, plan_status, stripe_subscription_id, current_period_end, updated_at
+        from public.chiefos_tenants
+        where owner_id::text = $1
+        limit 1
+        `,
+        [ownerId]
+      );
+      tenant = rows?.[0] || null;
+    } catch {}
+
+    const fmt = (v) => (v === null || v === undefined || v === "" ? "(null)" : String(v));
+
+    const planKeyRaw = eff?.plan_key ?? tenant?.plan_key ?? "free";
+    const planKeyNorm = String(planKeyRaw || "free").trim().toLowerCase();
+    const planStatus = eff?.plan_status ?? tenant?.plan_status ?? "(unknown)";
+    const source = eff?.source ?? (tenant ? "chiefos_tenants.plan_key" : "fallback_free");
+    const tenantId = eff?.tenant_id ?? tenant?.id ?? null;
+
+    return ok(
+      res,
+      [
+        "🧾 Plan Debug",
+        "",
+        `owner_id: ${ownerId}`,
+        `tenant_id: ${fmt(tenantId)}`,
+        "",
+        `plan_key_raw: ${fmt(planKeyRaw)}`,
+        `plan_key_norm: ${planKeyNorm}`,
+        `plan_status: ${fmt(planStatus)}`,
+        `source: ${fmt(source)}`,
+        "",
+        `stripe_subscription_id: ${fmt(tenant?.stripe_subscription_id)}`,
+        `current_period_end: ${fmt(tenant?.current_period_end)}`,
+        `tenant_updated_at: ${fmt(tenant?.updated_at)}`
+      ].join("\n")
+    );
+  } catch (e) {
+    console.warn("[CHIEFDEBUG_PLAN] failed:", e?.message);
+    return ok(res, `⚠️ chiefdebug plan failed. ${e?.message || ""}`.trim());
+  }
+}
+// ✅ Owner-only: capability/caps debug (jobs)
+// Keyword: chiefdebug caps
+if (/^chiefdebug\s+caps\b/i.test(lc2Clean)) {
+  if (!req.isOwner) {
+    return ok(
+      res,
+      [
+        "❌ Only the business owner can run this.",
+        "",
+        "Ask the owner to link your phone in the portal."
+      ].join("\n")
+    );
+  }
+
+  try {
+    const ownerId = String(req.ownerId || "").trim();
+    if (!ownerId) return ok(res, "Missing owner context. Try again.");
+
+    // Resolve plan (best effort)
+    let planKeyRaw = null;
+    let planSource = null;
+
+    try {
+      const planSvc =
+        require("../services/effectivePlan") ||
+        require("../services/effective_plan") ||
+        null;
+
+      if (planSvc?.getEffectivePlanForOwner) {
+        const eff = await planSvc.getEffectivePlanForOwner(ownerId);
+        planKeyRaw = eff?.plan_key || null;
+        planSource = eff?.source || "effectivePlan";
+      }
+    } catch {}
+
+    if (!planKeyRaw) {
+      // fallback to tenant row
+      const { rows } = await pg.query(
+        `select plan_key from public.chiefos_tenants where owner_id::text = $1 limit 1`,
+        [ownerId]
+      );
+      planKeyRaw = rows?.[0]?.plan_key || "free";
+      planSource = "chiefos_tenants.plan_key";
+    }
+
+    const planKeyNorm = String(planKeyRaw || "free").trim().toLowerCase();
+
+    // Load capability map
+    let capsMap = null;
+    try {
+      capsMap = require("../services/plan_capabilities");
+    } catch (e) {
+      // some repos keep it elsewhere
+      try {
+        capsMap = require("../services/planCapabilities");
+      } catch {}
+    }
+
+    if (!capsMap) {
+      return ok(
+        res,
+        [
+          "🧠 Caps Debug",
+          "",
+          "❌ Could not load plan capabilities map.",
+          "Expected one of:",
+          "• services/plan_capabilities",
+          "• services/planCapabilities"
+        ].join("\n")
+      );
+    }
+
+    const caps = capsMap[planKeyNorm] || capsMap.free;
+    const maxJobs = caps?.max_jobs;
+    const isUnlimited = maxJobs == null || maxJobs === Infinity;
+
+    // Count jobs
+    const { rows: jr } = await pg.query(
+      `select count(*)::int as n from public.jobs where owner_id = $1`,
+      [ownerId]
+    );
+    const jobCount = jr?.[0]?.n ?? 0;
+
+    const wouldDeny = !isUnlimited && jobCount >= Number(maxJobs);
+
+    const fmt = (v) => (v === null || v === undefined || v === "" ? "(null)" : String(v));
+
+    return ok(
+      res,
+      [
+        "🧠 Caps Debug (Jobs)",
+        "",
+        `owner_id: ${ownerId}`,
+        "",
+        `plan_key_raw: ${fmt(planKeyRaw)}`,
+        `plan_key_norm: ${planKeyNorm}`,
+        `plan_source: ${fmt(planSource)}`,
+        "",
+        `job_count: ${jobCount}`,
+        `max_jobs: ${fmt(maxJobs)}`,
+        `unlimited: ${isUnlimited ? "true" : "false"}`,
+        `would_deny_now: ${wouldDeny ? "true" : "false"}`
+      ].join("\n")
+    );
+  } catch (e) {
+    console.warn("[CHIEFDEBUG_CAPS] failed:", e?.message);
+    return ok(res, `⚠️ chiefdebug caps failed. ${e?.message || ""}`.trim());
+  }
+}
+
+     // ✅ Owner-only: reset onboarding state for repeat testing
+// Keyword: chiefonboarding
+if (/^chiefonboarding\b/i.test(lc2Clean)) {
+  if (!req.isOwner) {
+    return ok(
+      res,
+      [
+        "❌ Only the business owner can run this.",
+        "",
+        "If you need access, ask the owner to link your phone in the portal."
+      ].join("\n")
+    );
+  }
+
+  try {
+    const ownerId = String(req.ownerId || "").trim();
+    if (!ownerId) return ok(res, "Missing owner context. Try again.");
+
+    // Requires pg in scope:
+    // const pg = require('../services/postgres');
+    await pg.query(
+      `delete from public.settings where owner_id = $1 and key like 'onboarding.%'`,
+      [ownerId]
+    );
+
+    const portal = String(
+      process.env.PORTAL_BASE_URL ||
+        process.env.APP_BASE_URL ||
+        "https://www.usechiefos.com/app"
+    )
+      .trim()
+      .replace(/\/$/, "");
+
+    return ok(
+      res,
+      [
+        `✅ Onboarding reset for owner ${ownerId}.`,
+        "",
+        `Now text: Hi`,
+        `and you’ll see onboarding again.`,
+        "",
+        `Portal: ${portal}`
+      ].join("\n")
+    );
+  } catch (e) {
+    console.warn("[ONBOARDING_RESET] failed:", e?.message);
+    return ok(res, `⚠️ Could not reset onboarding. ${e?.message || ""}`.trim());
+  }
+}
     // ✅ Compute messageSid ONCE (used by everything below)
     const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
     const messageSid =
@@ -1755,12 +2145,24 @@ router.post('*', async (req, res, next) => {
     }
 
     // ✅ Now that redeem had a chance, enforce tenant link
-    if (!req.ownerId) {
-      return ok(
-        res,
-        `You’re not linked to a ChiefOS business yet.\n\nGo to the portal, generate a link code, then text the 6 digits here.`
-      );
-    }
+if (!req.ownerId) {
+  const portal =
+    String(process.env.PORTAL_BASE_URL || process.env.APP_BASE_URL || "https://www.usechiefos.com/app")
+      .trim()
+      .replace(/\/$/, "");
+
+  return ok(
+    res,
+    [
+      `You’re not linked to a ChiefOS business yet.`,
+      ``,
+      `Open the portal to link your phone:`,
+      portal,
+      ``,
+      `Then generate a link code and text the 6 digits here.`,
+    ].join("\n")
+  );
+}
 
     console.info('[WEBHOOK_IN]', {
       ownerId: req.ownerId || null,

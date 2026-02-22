@@ -339,62 +339,88 @@ const r = await query(
 
 /**
  * Sum expenses (in cents) for a date range.
- * Uses tenant_id UUID (chiefos_expenses is tenant-scoped).
+ * chiefos_expenses.amount is numeric dollars (e.g. 4000.0000000000000000)
  */
 async function sumExpensesCentsByRange({ tenantId, ownerId, fromIso, toIso }) {
-  let tid = tenantId ? String(tenantId) : null;
+  let tid = tenantId ? String(tenantId).trim() : null;
 
   if (!tid && ownerId) {
     tid = await getTenantIdForOwnerDigits(ownerId);
   }
 
-  // TEMP DEBUG (remove after verification)
-  if (!tid) console.warn('[INSIGHTS] tenantId not resolved for owner:', ownerId);
+  if (!tid) {
+    console.warn("[INSIGHTS] tenantId not resolved for owner:", ownerId || null);
+    return 0;
+  }
 
-  if (!tid) return 0;
+  const from = String(fromIso || "").trim();
+  const to = String(toIso || "").trim();
+
+  const isIso = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (!isIso(from) || !isIso(to)) {
+    console.warn("[INSIGHTS] invalid date range (expenses)", { fromIso, toIso, tid });
+    return 0;
+  }
+
+  const a = from <= to ? from : to;
+  const b = from <= to ? to : from;
 
   const r = await query(
     `
-    select coalesce(sum(amount), 0) as total_amount
+    select coalesce(sum(
+      (round(coalesce(amount, 0)::numeric * 100))::bigint
+    ), 0)::bigint as total_cents
     from public.chiefos_expenses
     where tenant_id = $1
       and deleted_at is null
       and expense_date >= $2::date
       and expense_date <= $3::date
     `,
-    [tid, fromIso, toIso]
+    [tid, a, b]
   );
 
-  const amt = Number(r?.rows?.[0]?.total_amount || 0);
-  return Math.round(amt * 100);
+  return Number(r?.rows?.[0]?.total_cents || 0);
 }
 
 /**
  * Sum revenues (in cents) for a date range.
- * Uses owner_id digits (transactions is owner-scoped).
+ * transactions.amount_cents preferred; fallback to amount (numeric dollars).
  */
 async function sumRevenueCentsByRange({ ownerId, fromIso, toIso }) {
   const owner = DIGITS(ownerId);
   if (!owner) return 0;
 
-  const r = await query(
-  `
-  select coalesce(sum(
-    coalesce(amount_cents, (round(amount * 100))::bigint)
-  ), 0)::bigint as total_cents
-  from public.transactions
-  where owner_id::text = $1
-    and kind = 'revenue'
-    and date >= $2::date
-    and date <= $3::date
-  `,
-  [owner, fromIso, toIso]
-);
+  const from = String(fromIso || "").trim();
+  const to = String(toIso || "").trim();
 
+  const isIso = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (!isIso(from) || !isIso(to)) {
+    console.warn("[INSIGHTS] invalid date range (revenue)", { fromIso, toIso, owner });
+    return 0;
+  }
+
+  const a = from <= to ? from : to;
+  const b = from <= to ? to : from;
+
+  const r = await query(
+    `
+    select coalesce(sum(
+      coalesce(
+        amount_cents,
+        (round(coalesce(amount, 0)::numeric * 100))::bigint
+      )
+    ), 0)::bigint as total_cents
+    from public.transactions
+    where owner_id::text = $1
+      and kind = 'revenue'
+      and date >= $2::date
+      and date <= $3::date
+    `,
+    [owner, a, b]
+  );
 
   return Number(r?.rows?.[0]?.total_cents || 0);
 }
-
 
 /* -------------------- Usage / Quotas (monthly) -------------------- */
 

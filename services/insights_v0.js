@@ -9,10 +9,6 @@ function lc(s) {
   return String(s || "").toLowerCase();
 }
 
-function DIGITS(x) {
-  return String(x ?? "").replace(/\D/g, "");
-}
-
 function money(cents) {
   const n = Number(cents || 0) / 100;
   return `$${n.toFixed(2)}`;
@@ -23,13 +19,6 @@ function pct(x) {
   const n = Number(x);
   if (!Number.isFinite(n)) return null;
   return `${n.toFixed(1)}%`;
-}
-
-function safeYmd(d) {
-  if (!d) return null;
-  const dt = d instanceof Date ? d : new Date(d);
-  if (!Number.isFinite(dt.getTime())) return null;
-  return dt.toISOString().slice(0, 10);
 }
 
 // -------------------- Range normalization --------------------
@@ -43,97 +32,129 @@ function normalizeRangeFromText(text, fallback = "mtd") {
   if (/\b(ytd|year to date|this year)\b/.test(t)) return "ytd";
   if (/\b(all time|all)\b/.test(t)) return "all";
 
-  // rolling windows -> v0 maps to “wtd/mtd” style unless you add true rolling support
   if (/\b(last 7 days|past 7 days|previous 7 days)\b/.test(t)) return "last7";
   if (/\b(last 30 days|past 30 days|previous 30 days)\b/.test(t)) return "last30";
 
   return fallback;
 }
 
-// If you have pg.todayInTZ use it, else fallback.
-function ymdInTZ(tz = "America/Toronto") {
+// -------------------- TZ-safe range resolver (NO NaN dates) --------------------
+
+const WEEKDAY_MAP = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+function isoDateInTz(date, tz) {
+  // en-CA => YYYY-MM-DD
   try {
-    if (typeof pg.todayInTZ === "function") return pg.todayInTZ(tz);
-  } catch {}
-  return new Date().toISOString().slice(0, 10);
+    return new Intl.DateTimeFormat("en-CA", { timeZone: tz }).format(date);
+  } catch {
+    // If tz is invalid, fall back to system tz (still YYYY-MM-DD)
+    return new Intl.DateTimeFormat("en-CA").format(date);
+  }
 }
 
-function dateShift(ymd, deltaDays) {
-  const s = String(ymd || "").trim();
-  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
+function partsInTz(date, tz) {
+  let parts;
+  try {
+    parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "short",
+    }).formatToParts(date);
+  } catch {
+    parts = new Intl.DateTimeFormat("en-CA", {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      weekday: "short",
+    }).formatToParts(date);
+  }
 
-  const y = Number(m[1]);
-  const mo = Number(m[2]) - 1;
-  const d = Number(m[3]);
-
-  const dt = new Date(Date.UTC(y, mo, d));
-  dt.setUTCDate(dt.getUTCDate() + Number(deltaDays || 0));
-  return dt.toISOString().slice(0, 10);
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  const y = Number(get("year"));
+  const m = Number(get("month"));
+  const d = Number(get("day"));
+  const wd = WEEKDAY_MAP[get("weekday")] ?? null;
+  return { y, m, d, wd };
 }
 
-// Turn a normalized range into from/to (inclusive YMD).
-// This keeps v0 deterministic and consistent.
-function rangeToFromTo(range, tz) {
-  const toIso = ymdInTZ(tz);
+function addDaysUtcNoon(y, m, d, deltaDays) {
+  // UTC noon avoids DST boundary weirdness.
+  const base = Date.UTC(y, m - 1, d, 12, 0, 0);
+  return new Date(base + deltaDays * 86400000);
+}
 
-  if (range === "today") return { fromIso: toIso, toIso };
+function isIsoDate(s) {
+  return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
 
-  if (range === "last7") {
-    const fromIso = dateShift(toIso, -6) || toIso;
-    return { fromIso, toIso };
+/**
+ * effectiveRange: today|wtd|mtd|ytd|last7|last30|all
+ * tz: IANA timezone string (e.g., America/Toronto)
+ */
+function rangeToFromTo(effectiveRange, tz) {
+  const now = new Date();
+  const toIso = isoDateInTz(now, tz);
+  const { y, m, d, wd } = partsInTz(now, tz);
+
+  // Fail-closed: if anything is weird, return "today" safely.
+  if (!y || !m || !d || wd == null || !isIsoDate(toIso)) {
+    const safe = isIsoDate(toIso) ? toIso : "2000-01-01";
+    return { fromIso: safe, toIso: safe };
   }
 
-  if (range === "last30") {
-    const fromIso = dateShift(toIso, -29) || toIso;
-    return { fromIso, toIso };
+  const r = String(effectiveRange || "mtd").toLowerCase().trim();
+
+  // Monday week start: Sun=0 -> 6, Mon=1 -> 0, ...
+  const daysSinceMonday = (wd + 6) % 7;
+
+  let fromDate;
+
+  switch (r) {
+    case "today":
+      fromDate = addDaysUtcNoon(y, m, d, 0);
+      break;
+
+    case "wtd":
+      fromDate = addDaysUtcNoon(y, m, d, -daysSinceMonday);
+      break;
+
+    case "mtd":
+      fromDate = addDaysUtcNoon(y, m, 1, 0);
+      break;
+
+    case "ytd":
+      fromDate = addDaysUtcNoon(y, 1, 1, 0);
+      break;
+
+    case "last7":
+      fromDate = addDaysUtcNoon(y, m, d, -6); // inclusive window
+      break;
+
+    case "last30":
+      fromDate = addDaysUtcNoon(y, m, d, -29); // inclusive window
+      break;
+
+    case "all":
+      return { fromIso: "2000-01-01", toIso };
+
+    default:
+      // Unknown => treat as mtd
+      fromDate = addDaysUtcNoon(y, m, 1, 0);
+      break;
   }
 
-  // For WTD/MTD/YTD we’ll prefer a calendar-aligned window if you have it.
-  // If not, we approximate with fixed shifts (still deterministic).
-    if (range === "wtd") {
-    // True WTD (Mon..today) in local tz without extra libs
-    const now = new Date();
-    const local = new Date(now.toLocaleString("en-CA", { timeZone: tz }));
-    const day = local.getDay(); // 0=Sun,1=Mon...
-    const diffToMonday = (day + 6) % 7; // Mon->0, Tue->1, ... Sun->6
-    const start = new Date(local);
-    start.setDate(local.getDate() - diffToMonday);
+  const fromIso = isoDateInTz(fromDate, tz);
 
-    const y = start.getFullYear();
-    const m = String(start.getMonth() + 1).padStart(2, "0");
-    const d = String(start.getDate()).padStart(2, "0");
-    const fromIso = `${y}-${m}-${d}`;
-
-    return { fromIso, toIso };
-  }
-
-  if (range === "mtd") {
-    // Approx: last 30 days (good enough for tomorrow)
-    const fromIso = dateShift(toIso, -29) || toIso;
-    return { fromIso, toIso };
-  }
-
-  if (range === "ytd") {
-    // Approx: last 365 days (good enough for tomorrow)
-    const fromIso = dateShift(toIso, -364) || toIso;
-    return { fromIso, toIso };
-  }
-
-  // "all" -> try very early
-  if (range === "all") {
-    return { fromIso: "2000-01-01", toIso };
-  }
-
-  // default
-  return rangeToFromTo("mtd", tz);
+  // Final guard: never return NaN-ish strings.
+  return {
+    fromIso: isIsoDate(fromIso) ? fromIso : toIso,
+    toIso: isIsoDate(toIso) ? toIso : fromIso,
+  };
 }
 
 // -------------------- Job profit (existing strong path) --------------------
-// NOTE: Your existing profit resolver + picker code is good.
-// I’m leaving it as-is, but removing the stray effectiveRange lines
-// (those should only live inside answerInsightV0).
-
 // ---- Begin: your existing profit parsing/resolution helpers (unchanged) ----
 
 function normalizeJobRefToken(s) {
@@ -362,15 +383,30 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
   const resolved = await resolveJobForInsight(pg, ownerId, ref);
 
   if (resolved?.ok && resolved?.job) {
-    return { jobNo: Number(resolved.job.job_no), jobName: resolved.job.job_name || null, source: resolved.mode || "resolved" };
+    return {
+      jobNo: Number(resolved.job.job_no),
+      jobName: resolved.job.job_name || null,
+      source: resolved.mode || "resolved",
+    };
   }
 
   if (resolved?.reason === "ambiguous") {
-    return { jobNo: null, jobName: null, source: "ambiguous", matches: resolved.matches || [], term: resolved.term || ref?.raw || ref?.name || "" };
+    return {
+      jobNo: null,
+      jobName: null,
+      source: "ambiguous",
+      matches: resolved.matches || [],
+      term: resolved.term || ref?.raw || ref?.name || "",
+    };
   }
 
   if (explicitRefProvided && !explicitActive) {
-    return { jobNo: null, jobName: null, source: "not_found_explicit", term: String(resolved?.term || ref?.raw || ref?.name || ref?.jobNo || "").trim() };
+    return {
+      jobNo: null,
+      jobName: null,
+      source: "not_found_explicit",
+      term: String(resolved?.term || ref?.raw || ref?.name || ref?.jobNo || "").trim(),
+    };
   }
 
   try {
@@ -409,7 +445,12 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
       };
     }
 
-    return { ok: true, route: "clarify", answer: `I couldn’t find Job #${requestedJobNo}. Try “list jobs” or tell me the job name.`, evidence: { sql: [], facts_used: 0 } };
+    return {
+      ok: true,
+      route: "clarify",
+      answer: `I couldn’t find Job #${requestedJobNo}. Try “list jobs” or tell me the job name.`,
+      evidence: { sql: [], facts_used: 0 },
+    };
   }
 
   return {
@@ -422,91 +463,6 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
 
 // ---- End: profit helpers ----
 
-// -------------------- New: deterministic totals (spend/revenue/net) using effectiveRange --------------------
-
-async function totalsForRange({ ownerId, fromIso, toIso }) {
-  // Prefer your existing pg helpers (fast + already-canonical)
-  const spendCents =
-    typeof pg.sumExpensesCentsByRange === "function"
-      ? await pg.sumExpensesCentsByRange({ ownerId, fromIso, toIso })
-      : null;
-
-  const revenueCents =
-    typeof pg.sumRevenueCentsByRange === "function"
-      ? await pg.sumRevenueCentsByRange({ ownerId, fromIso, toIso })
-      : null;
-
-  // If helpers missing, fail safe.
-  if (spendCents == null && revenueCents == null) {
-    return { ok: false, reason: "missing_pg_helpers" };
-  }
-
-  const spend = Number(spendCents || 0);
-  const revenue = Number(revenueCents || 0);
-  const net = revenue - spend;
-  return { ok: true, spend, revenue, net };
-}
-
-// -------------------- New: cash in/out (best-effort, guarded) --------------------
-
-async function cashflowForRange({ ownerId, fromIso, toIso }) {
-  // Try view v_cashflow_daily if present.
-  // If schema differs, this will throw and we’ll gracefully return unsupported.
-  try {
-    const o = DIGITS(ownerId);
-    const r = await pg.query(
-      `
-      select
-        coalesce(sum(cash_in_cents),0)::bigint as in_cents,
-        coalesce(sum(cash_out_cents),0)::bigint as out_cents
-      from public.v_cashflow_daily
-      where owner_id::text = $1
-        and day >= $2::date
-        and day <= $3::date
-      `,
-      [o, fromIso, toIso]
-    );
-
-    const row = r?.rows?.[0];
-    if (!row) return { ok: false, reason: "no_rows" };
-
-    const inCents = Number(row.in_cents || 0);
-    const outCents = Number(row.out_cents || 0);
-    return { ok: true, inCents, outCents, netCents: inCents - outCents };
-  } catch (e) {
-    return { ok: false, reason: "unsupported" };
-  }
-}
-
-// -------------------- New: top expenses by category/vendor (best-effort) --------------------
-
-async function topExpenseBreakdown({ ownerId, fromIso, toIso, limit = 5 }) {
-  try {
-    const o = DIGITS(ownerId);
-    // Column names may differ; keep guarded.
-    const r = await pg.query(
-      `
-      select
-        coalesce(category, 'Uncategorized') as category,
-        coalesce(sum(amount_cents),0)::bigint as cents
-      from public.expenses
-      where owner_id::text = $1
-        and (ts::date >= $2::date and ts::date <= $3::date)
-      group by 1
-      order by cents desc
-      limit $4
-      `,
-      [o, fromIso, toIso, Number(limit)]
-    );
-
-    const rows = r?.rows || [];
-    if (!rows.length) return { ok: false, reason: "no_rows" };
-    return { ok: true, rows };
-  } catch {
-    return { ok: false, reason: "unsupported" };
-  }
-}
-
 // -------------------- Main entry --------------------
 
 async function answerInsightV0({ ownerId, actorKey, text, tz }) {
@@ -516,7 +472,7 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
 
   // (0) Range (compute ONCE)
   const effectiveRange = normalizeRangeFromText(raw, "mtd");
-  const { fromIso, toIso } = rangeToFromTo(effectiveRange, tzUse);
+  let { fromIso, toIso } = rangeToFromTo(effectiveRange, tzUse);
 
   console.info("[INSIGHTS_RANGE_RESOLVED]", {
     ownerId,
@@ -525,6 +481,14 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
     fromIso,
     toIso,
   });
+
+  // ✅ One more tiny safeguard (optional but recommended)
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(fromIso) || !/^\d{4}-\d{2}-\d{2}$/.test(toIso)) {
+    console.warn("[INSIGHTS_RANGE_INVALID] forcing today", { fromIso, toIso, effectiveRange, tz: tzUse });
+    const safe = rangeToFromTo("today", tzUse);
+    fromIso = safe.fromIso;
+    toIso = safe.toIso;
+  }
 
   // Helper: pretty label
   const label =
@@ -553,11 +517,6 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
 
   // If they asked for totals OR top expenses — answer off the same range
   if (wantsSpend || wantsRevenue || wantsProfit || wantsTopExpenses) {
-    // IMPORTANT: today you’re mixing sources:
-    // - revenue is from transactions
-    // - expenses are currently from chiefos_expenses (tenant scoped)
-    // That’s OK for tomorrow, but long-term you want both from transactions.
-
     const spendCents = await pg.sumExpensesCentsByRange({ ownerId, fromIso, toIso });
     const revenueCents = await pg.sumRevenueCentsByRange({ ownerId, fromIso, toIso });
     const profitCents = Number(revenueCents || 0) - Number(spendCents || 0);
@@ -570,7 +529,6 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
 
     // Top expense breakdown (best-effort, deterministic, uses transactions)
     if (wantsTopExpenses) {
-      // Top categories
       const topCats = await pg.topExpenseCategoriesByRange?.({
         ownerId,
         fromIso,
@@ -578,7 +536,6 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
         limit: 5,
       });
 
-      // Top vendors
       const topVendors = await pg.topExpenseVendorsByRange?.({
         ownerId,
         fromIso,
@@ -610,7 +567,6 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
         });
       }
 
-      // If functions aren’t wired, be explicit (no hallucination)
       if (!pg.topExpenseCategoriesByRange || !pg.topExpenseVendorsByRange) {
         lines.push("");
         lines.push("Note: “top expenses” breakdown isn’t fully wired yet (needs 2 SQL helpers on transactions).");

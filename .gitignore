@@ -36,3 +36,8 @@ continue.log
 dashboard/node_modules/
 dashboard/dist/
 dashboard/build/
+
+# Twilio content exports (never commit)
+
+twilio_content_*.json
+

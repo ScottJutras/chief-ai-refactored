@@ -54,7 +54,7 @@ require("./config/env");
 
 const express = require("express");
 const cors = require("cors");
-
+const stripeRouter = require("./routes/stripe");
 const webhookRouter = require("./routes/webhook");
 const parseRouter = require("./routes/parse");
 const dashboardRouter = require("./routes/dashboard"); // KPI dashboard API
@@ -63,8 +63,6 @@ const billingRouter = require("./routes/billing");
 
 // ✅ NEW: receipts streaming route
 const receiptsRouter = require("./routes/receipts");
-
-const { stripeWebhookHandler } = require("./handlers/stripeWebhook");
 
 const app = express();
 
@@ -120,16 +118,14 @@ app.get("/billing/cancel", (req, res) => {
   res.status(200).send("Billing canceled. You can close this tab.");
 });
 
-/* ---------------- Stripe webhook (MUST be raw body) ---------------- */
+/* ---------------- Stripe (webhook MUST be raw body) ---------------- */
 /**
  * Stripe requires raw body for signature verification.
  * Do NOT put express.json() globally.
+ * routes/stripe should define:
+ *   POST /webhook  with express.raw({ type: "application/json" })
  */
-app.post(
-  "/api/stripe/webhook",
-  express.raw({ type: "application/json" }),
-  stripeWebhookHandler
-);
+app.use("/api/stripe", stripeRouter);
 
 /* ---------------- Mount order (NO global body parsers) ---------------- */
 // Webhook first; it does its own tolerant urlencoded/body handling.

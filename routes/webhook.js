@@ -46,7 +46,7 @@ const twilioSvc = require('../services/twilio');
 const sendWhatsApp = twilioSvc.sendWhatsApp;
 const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
 const { handleOnboardingInbound } = require('../handlers/commands/onboarding');
-
+const { buildCommandsMessage } = require("../services/commands_message");
 /* ---------------- Small helpers ---------------- */
 // ✅ XML escape helper for TwiML (single source of truth in this file)
 function escapeXml(s = '') {
@@ -1710,6 +1710,12 @@ router.post('*', async (req, res, next) => {
         ].join('\n')
       );
     }
+    
+  // ✅ commands/help keyword intercept (pure informational; no CIL; no DB; no side effects)
+// Must occur before any DB work (debug helpers), onboarding intercept, pending-action routing, or orchestrator.
+if (lc2Clean === "commands" || lc2Clean === "help") {
+  return ok(res, buildCommandsMessage());
+}
 
     // ✅ Owner-only: onboarding status (debug helper)
 // Keyword: chiefonboarding status

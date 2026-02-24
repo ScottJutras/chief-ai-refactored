@@ -237,7 +237,7 @@ async function handleOnboardingInbound({ ownerId, fromPhone, text2, tz, userProf
     await setSetting(ownerId, "onboarding.stage", "done");
     return {
       handled: true,
-      replyText: `✅ Skipped onboarding.\n\nPortal: ${portalUrl()}\n\nSend an expense, revenue, timeclock, or “create job <name>”.`,
+      replyText: `✅ Skipped onboarding.\n\nPortal: ${portalUrl()}\n\nSend an expense, revenue, timeclock, or “create job <name>”.\n\nTip: Send 'commands' anytime to see everything Chief can do.`,
     };
   }
 
@@ -387,7 +387,7 @@ async function handleOnboardingInbound({ ownerId, fromPhone, text2, tz, userProf
       await setSetting(ownerId, "onboarding.stage", "done");
       return {
         handled: true,
-        replyText: `✅ Walkthrough video is not configured yet.\n\nPortal: ${portalUrl()}\n\nIn the meantime, try: expense $18 Home Depot`,
+        replyText: `✅ Walkthrough video is not configured yet.\n\nPortal: ${portalUrl()}\n\nIn the meantime, try: expense $18 Home Depot\n\nTip: Send 'commands' anytime to see everything Chief can do.`,
       };
     }
 
@@ -414,13 +414,11 @@ async function handleOnboardingInbound({ ownerId, fromPhone, text2, tz, userProf
         `• revenue $500 deposit`,
         `• clock in`,
         `• send a receipt photo`,
+        ``,
+        `Tip: Send 'commands' anytime to see everything Chief can do.`,
       ].join("\n"),
     };
   }
 
   return { handled: false };
 }
-
-module.exports = {
-  handleOnboardingInbound,
-};

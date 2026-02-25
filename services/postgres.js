@@ -134,23 +134,6 @@ async function cancelCilDraftBySourceMsg({ owner_id, source_msg_id, status = 'ca
   return { ok: true, cancelled: rows?.length || 0, row: rows?.[0] || null };
 }
 
-async function resolveTenantIdByOwner(owner_id) {
-  const r = await queryWithTimeout(
-    `select id
-       from public.chiefos_tenants
-      where owner_id = $1
-      limit 1`,
-    [String(owner_id).trim()],
-    3000
-  );
-
-  if (!r?.rows?.length) {
-    throw new Error(`No tenant found for owner_id ${owner_id}`);
-  }
-
-  return r.rows[0].id;
-}
-
 
 // ✅ Expire old drafts (so PA TTL expiration doesn't leave zombies)
 async function expireOldCilDrafts(owner_id, { maxAgeMinutes = 360 } = {}) {
@@ -311,6 +294,24 @@ async function topExpenseCategoriesByRange({ ownerId, fromIso, toIso, limit = 5 
   );
 
   return r;
+}
+
+async function resolveTenantIdForOwner(ownerId) {
+  const owner = String(ownerId || '').trim();
+  if (!owner) return null;
+
+  // Most ChiefOS installs: 1 tenant per owner phone
+  const r = await queryWithTimeout(
+    `select id
+       from public.chiefos_tenants
+      where regexp_replace(coalesce(owner_id,''), '\\D', '', 'g') = regexp_replace($1, '\\D', '', 'g')
+      order by created_at asc
+      limit 1`,
+    [owner],
+    2500
+  );
+
+  return r?.rows?.[0]?.id ?? null;
 }
 
 async function topExpenseVendorsByRange({ ownerId, fromIso, toIso, limit = 5 }) {
@@ -680,7 +681,6 @@ let TX_HAS_UPDATED_AT = null;
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
 async function detectTransactionsCapabilities() {
-  
   // cached
   if (
     TX_HAS_SOURCE_MSG_ID !== null &&
@@ -699,7 +699,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_META !== null &&
     TX_HAS_CREATED_AT !== null &&
     TX_HAS_UPDATED_AT !== null &&
-    TX_HAS_MEDIA_ASSET_ID !== null 
+    TX_HAS_MEDIA_ASSET_ID !== null &&
+    TX_HAS_TENANT_ID !== null
   ) {
     return {
       TX_HAS_SOURCE_MSG_ID,
@@ -718,8 +719,8 @@ async function detectTransactionsCapabilities() {
       TX_HAS_MEDIA_META,
       TX_HAS_CREATED_AT,
       TX_HAS_UPDATED_AT,
-      TX_HAS_MEDIA_ASSET_ID
-
+      TX_HAS_MEDIA_ASSET_ID,
+      TX_HAS_TENANT_ID
     };
   }
 
@@ -730,8 +731,10 @@ async function detectTransactionsCapabilities() {
         where table_schema='public'
           and table_name='transactions'`
     );
-    
+
     const names = new Set((rows || []).map((r) => String(r.column_name).toLowerCase()));
+
+    TX_HAS_TENANT_ID = names.has('tenant_id');
 
     TX_HAS_SOURCE_MSG_ID = names.has('source_msg_id');
     TX_HAS_AMOUNT = names.has('amount');
@@ -744,7 +747,6 @@ async function detectTransactionsCapabilities() {
     TX_HAS_DEDUPE_HASH = names.has('dedupe_hash');
     TX_HAS_MEDIA_ASSET_ID = names.has('media_asset_id');
 
-
     // additional back-compat / optional columns
     TX_HAS_JOB = names.has('job');
     TX_HAS_JOB_NAME = names.has('job_name');
@@ -756,6 +758,8 @@ async function detectTransactionsCapabilities() {
   } catch (e) {
     console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
 
+    TX_HAS_TENANT_ID = false;
+
     TX_HAS_SOURCE_MSG_ID = false;
     TX_HAS_AMOUNT = false;
     TX_HAS_MEDIA_URL = false;
@@ -766,7 +770,6 @@ async function detectTransactionsCapabilities() {
     TX_HAS_JOB_NO = false;
     TX_HAS_DEDUPE_HASH = false;
     TX_HAS_MEDIA_ASSET_ID = false;
-
 
     TX_HAS_JOB = false;
     TX_HAS_JOB_NAME = false;
@@ -794,8 +797,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_META,
     TX_HAS_CREATED_AT,
     TX_HAS_UPDATED_AT,
-    TX_HAS_MEDIA_ASSET_ID
-
+    TX_HAS_MEDIA_ASSET_ID,
+    TX_HAS_TENANT_ID
   };
 }
 
@@ -1314,7 +1317,7 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const kind = String(opts.kind || '').trim();
   const date = String(opts.date || '').trim();
   const description = String(opts.description || '').trim() || 'Unknown';
-
+  
   const amountCents = Number(opts.amount_cents ?? opts.amountCents ?? 0) || 0;
   const amountMaybe = opts.amount;
 
@@ -1367,18 +1370,28 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   if (!amountCents || amountCents <= 0) throw new Error('insertTransaction invalid amount_cents');
 
   // 🔐 Resolve tenant_id (required post-RLS hardening)
-const tenantIdInput = opts.tenant_id ?? opts.tenantId ?? null;
-
-const tenantId = tenantIdInput
-  ? String(tenantIdInput).trim()
-  : await resolveTenantIdByOwner(owner);
-
-if (!tenantId) {
-  throw new Error('insertTransaction missing tenant_id');
-}
-
   const caps = await detectTransactionsCapabilities();
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
+
+  // 🔐 tenant_id (required by portal RLS insert policy when column exists)
+  const tenantIdRaw = opts.tenant_id ?? opts.tenantId ?? null;
+  let tenantId =
+    tenantIdRaw != null && looksLikeUuid(String(tenantIdRaw).trim())
+      ? String(tenantIdRaw).trim()
+      : null;
+
+  // If caller didn't pass tenant_id, resolve from owner -> chiefos_tenants
+  if (!tenantId && caps.TX_HAS_TENANT_ID) {
+    try {
+      tenantId = await resolveTenantIdForOwner(owner);
+    } catch (e) {
+      console.warn('[PG/transactions] resolveTenantIdForOwner failed:', e?.message);
+    }
+    if (!tenantId) {
+      // Fail closed (better than RLS policy failure / silent insert deny)
+      throw new Error('insertTransaction missing tenant_id (required)');
+    }
+  }
 
   let resolvedJobId = null; // UUID only
   let resolvedJobNo = null;
@@ -1541,12 +1554,27 @@ if (!tenantId) {
     }
   }
 
+   
+
   const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
 
-  // ✅ Build insert cols/vals based on caps (INSIDE function)
-  const cols = ['tenant_id', 'owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
-const vals = [tenantId, owner, kind, date, description, amountCents, source];
+   // ✅ Build insert cols/vals based on caps (INSIDE function)
+  const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
+  const vals = [owner, kind, date, description, amountCents, source];
 
+  // ✅ Add tenant_id ONLY if the column exists (and only once)
+  if (caps.TX_HAS_TENANT_ID) {
+    cols.unshift('tenant_id');     // put tenant_id first (optional, but clean)
+    vals.unshift(tenantId);
+  }
+
+    // ✅ Add tenant_id when the column exists
+  if (caps.TX_HAS_TENANT_ID) {
+    if (!tenantId) throw new Error('insertTransaction missing tenant_id (required)');
+    cols.push('tenant_id');
+    vals.push(tenantId);
+  }
+  
   if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
     cols.push('amount');
     vals.push(amountMaybe);
@@ -3450,7 +3478,6 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
 
   if (jobId) {
     params.push(String(jobId));
-    // Prefer job_id if present, else fall back to job string field matching
     const caps = await detectTransactionsCapabilities().catch(() => ({ TX_HAS_JOB_ID: false, TX_HAS_JOB: false }));
     if (caps?.TX_HAS_JOB_ID) where += ' AND job_id::text = $2';
     else if (caps?.TX_HAS_JOB) where += ' AND job::text = $2';
@@ -3486,126 +3513,6 @@ async function getJobFinanceSnapshot(ownerId, jobId = null) {
     profit_cents: profit,
     margin_pct: marginPct
   };
-}
-
-let _JOBS_ID_TYPE = null;
-let _TX_JOB_ID_TYPE = null;
-
-async function detectJobsIdType() {
-  if (_JOBS_ID_TYPE !== null) return _JOBS_ID_TYPE;
-  _JOBS_ID_TYPE = (await getColumnDataType('jobs', 'id').catch(() => null)) || 'unknown';
-  return _JOBS_ID_TYPE;
-}
-async function detectTransactionsJobIdType() {
-  if (_TX_JOB_ID_TYPE !== null) return _TX_JOB_ID_TYPE;
-  _TX_JOB_ID_TYPE = (await getColumnDataType('transactions', 'job_id').catch(() => null)) || 'unknown';
-  return _TX_JOB_ID_TYPE;
-}
-
-async function getOwnerJobsFinance(ownerId) {
-  const ownerKey = String(ownerId);
-  const caps = await detectTransactionsCapabilities().catch(() => ({ TX_HAS_JOB_ID: false, TX_HAS_JOB_NO: false }));
-
-  // If we can't join safely, return zeroed list (but still list jobs)
-  const { rows: jobs } = await query(
-    `
-    select
-      j.id,
-      j.name,
-      j.status,
-      j.created_at,
-      j.completed_at,
-      j.job_no
-    from jobs j
-    where j.owner_id::text = $1
-    order by j.created_at desc
-    `,
-    [ownerKey]
-  );
-
-  if (!jobs?.length) return [];
-
-  // Decide best join strategy
-  let joinMode = 'none';
-
-  if (caps.TX_HAS_JOB_ID) {
-    const jobsIdType = await detectJobsIdType().catch(() => 'unknown');
-    const txJobIdType = await detectTransactionsJobIdType().catch(() => 'unknown');
-
-    const jobsUuid = String(jobsIdType || '').includes('uuid');
-    const txUuid = String(txJobIdType || '').includes('uuid');
-
-    // safe: uuid-to-uuid
-    if (jobsUuid && txUuid) joinMode = 'job_id_uuid';
-  }
-
-  if (joinMode === 'none' && caps.TX_HAS_JOB_NO) {
-    joinMode = 'job_no';
-  }
-
-  if (joinMode === 'none') {
-    return jobs.map((j) => ({
-      job_id: j.id,
-      name: j.name,
-      status: j.status,
-      created_at: j.created_at,
-      completed_at: j.completed_at,
-      revenue_cents: 0,
-      expense_cents: 0,
-      profit_cents: 0,
-      margin_pct: null
-    }));
-  }
-
-  // Aggregate in one query, then map to jobs
-  let aggSql = '';
-  if (joinMode === 'job_id_uuid') {
-    aggSql = `
-      select
-        t.job_id::text as key,
-        coalesce(sum(case when t.kind='revenue' then t.amount_cents end),0) as revenue_cents,
-        coalesce(sum(case when t.kind='expense' then t.amount_cents end),0) as expense_cents
-      from transactions t
-      where t.owner_id::text = $1
-        and t.job_id is not null
-      group by t.job_id::text
-    `;
-  } else {
-    aggSql = `
-      select
-        t.job_no::text as key,
-        coalesce(sum(case when t.kind='revenue' then t.amount_cents end),0) as revenue_cents,
-        coalesce(sum(case when t.kind='expense' then t.amount_cents end),0) as expense_cents
-      from transactions t
-      where t.owner_id::text = $1
-        and t.job_no is not null
-      group by t.job_no::text
-    `;
-  }
-
-  const { rows: agg } = await query(aggSql, [ownerKey]);
-  const map = new Map((agg || []).map((r) => [String(r.key), r]));
-
-  return jobs.map((j) => {
-    const key = joinMode === 'job_id_uuid' ? String(j.id) : String(j.job_no ?? '');
-    const row = map.get(key);
-    const revenue = Number(row?.revenue_cents) || 0;
-    const expense = Number(row?.expense_cents) || 0;
-    const profit = revenue - expense;
-    const margin_pct = revenue > 0 ? Math.round((profit / revenue) * 1000) / 10 : null;
-
-    return {
-      job_id: j.id,
-      name: j.name,
-      status: j.status,
-      created_at: j.created_at,
-      completed_at: j.completed_at,
-      revenue_cents: revenue,
-      expense_cents: expense,
-      profit_cents: profit,
-      margin_pct
-    };
-  });
 }
 
 async function getOwnerMonthlyFinance(ownerId, monthStart) {

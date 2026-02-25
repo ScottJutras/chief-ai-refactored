@@ -134,6 +134,24 @@ async function cancelCilDraftBySourceMsg({ owner_id, source_msg_id, status = 'ca
   return { ok: true, cancelled: rows?.length || 0, row: rows?.[0] || null };
 }
 
+async function resolveTenantIdByOwner(owner_id) {
+  const r = await queryWithTimeout(
+    `select id
+       from public.chiefos_tenants
+      where owner_id = $1
+      limit 1`,
+    [String(owner_id).trim()],
+    3000
+  );
+
+  if (!r?.rows?.length) {
+    throw new Error(`No tenant found for owner_id ${owner_id}`);
+  }
+
+  return r.rows[0].id;
+}
+
+
 // ✅ Expire old drafts (so PA TTL expiration doesn't leave zombies)
 async function expireOldCilDrafts(owner_id, { maxAgeMinutes = 360 } = {}) {
   const ownerKey = String(owner_id || '').trim();
@@ -1348,6 +1366,17 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   if (!date) throw new Error('insertTransaction missing date');
   if (!amountCents || amountCents <= 0) throw new Error('insertTransaction invalid amount_cents');
 
+  // 🔐 Resolve tenant_id (required post-RLS hardening)
+const tenantIdInput = opts.tenant_id ?? opts.tenantId ?? null;
+
+const tenantId = tenantIdInput
+  ? String(tenantIdInput).trim()
+  : await resolveTenantIdByOwner(owner);
+
+if (!tenantId) {
+  throw new Error('insertTransaction missing tenant_id');
+}
+
   const caps = await detectTransactionsCapabilities();
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
 
@@ -1515,8 +1544,8 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
 
   // ✅ Build insert cols/vals based on caps (INSIDE function)
-  const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
-  const vals = [owner, kind, date, description, amountCents, source];
+  const cols = ['tenant_id', 'owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
+const vals = [tenantId, owner, kind, date, description, amountCents, source];
 
   if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
     cols.push('amount');

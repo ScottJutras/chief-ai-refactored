@@ -4519,7 +4519,6 @@ module.exports = {
 
   getJobFinanceSnapshot,
   getOwnerPricingItems,
-  getOwnerJobsFinance,
   getOwnerMonthlyFinance,
   getOwnerCategoryBreakdown,
   getOwnerVendorBreakdown,

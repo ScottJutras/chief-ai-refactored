@@ -1559,104 +1559,99 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
 
    // ✅ Build insert cols/vals based on caps (INSIDE function)
-  const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
-  const vals = [owner, kind, date, description, amountCents, source];
+// Start with the required baseline columns that always exist
+const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
+const vals = [owner, kind, date, description, amountCents, source];
 
-  // ✅ Add tenant_id ONLY if the column exists (and only once)
-  if (caps.TX_HAS_TENANT_ID) {
-    cols.unshift('tenant_id');     // put tenant_id first (optional, but clean)
-    vals.unshift(tenantId);
-  }
+// ✅ tenant_id: include ONLY if the column exists (and we resolved it above)
+if (caps.TX_HAS_TENANT_ID) {
+  if (!tenantId) throw new Error('insertTransaction missing tenant_id (required)');
+  cols.unshift('tenant_id');     // put it first (optional, but neat)
+  vals.unshift(tenantId);
+}
 
-    // ✅ Add tenant_id when the column exists
-  if (caps.TX_HAS_TENANT_ID) {
-    if (!tenantId) throw new Error('insertTransaction missing tenant_id (required)');
-    cols.push('tenant_id');
-    vals.push(tenantId);
-  }
-  
-  if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
-    cols.push('amount');
-    vals.push(amountMaybe);
-  }
+if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
+  cols.push('amount');
+  vals.push(amountMaybe);
+}
 
-  if (caps.TX_HAS_JOB) {
-    cols.push('job');
-    vals.push(job);
-  }
-  if (caps.TX_HAS_JOB_NAME) {
-    cols.push('job_name');
-    vals.push(jobName);
-  }
-  if (caps.TX_HAS_JOB_NO) {
-    cols.push('job_no');
-    vals.push(jobNo);
-  }
-  if (caps.TX_HAS_JOB_ID) {
-    cols.push('job_id');
-    vals.push(resolvedJobId);
-  }
+if (caps.TX_HAS_JOB) {
+  cols.push('job');
+  vals.push(job);
+}
+if (caps.TX_HAS_JOB_NAME) {
+  cols.push('job_name');
+  vals.push(jobName);
+}
+if (caps.TX_HAS_JOB_NO) {
+  cols.push('job_no');
+  vals.push(jobNo);
+}
+if (caps.TX_HAS_JOB_ID) {
+  cols.push('job_id');
+  vals.push(resolvedJobId);
+}
 
-  if (caps.TX_HAS_CATEGORY) {
-    cols.push('category');
-    vals.push(category);
-  }
+if (caps.TX_HAS_CATEGORY) {
+  cols.push('category');
+  vals.push(category);
+}
 
-  if (caps.TX_HAS_USER_NAME) {
-    cols.push('user_name');
-    vals.push(userName);
-  }
+if (caps.TX_HAS_USER_NAME) {
+  cols.push('user_name');
+  vals.push(userName);
+}
 
-  if (caps.TX_HAS_SOURCE_MSG_ID) {
-    cols.push('source_msg_id');
-    vals.push(sourceMsgId);
-  }
+if (caps.TX_HAS_SOURCE_MSG_ID) {
+  cols.push('source_msg_id');
+  vals.push(sourceMsgId);
+}
 
-  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
-    cols.push('dedupe_hash');
-    vals.push(dedupeHash);
-  }
+if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
+  cols.push('dedupe_hash');
+  vals.push(dedupeHash);
+}
 
-  if (caps.TX_HAS_MEDIA_META && media) {
-    cols.push('media_meta');
-    vals.push(JSON.stringify(media));
-  }
+if (caps.TX_HAS_MEDIA_META && media) {
+  cols.push('media_meta');
+  vals.push(JSON.stringify(media));
+}
 
-  if (caps.TX_HAS_MEDIA_ASSET_ID) {
-    cols.push('media_asset_id');
-    vals.push(mediaAssetId); // ✅ UUID or null only
-  }
+if (caps.TX_HAS_MEDIA_ASSET_ID) {
+  cols.push('media_asset_id');
+  vals.push(mediaAssetId); // ✅ UUID or null only
+}
 
-  // legacy discrete media cols if present (optional, safe)
-  if (media) {
-    if (caps.TX_HAS_MEDIA_URL) {
-      cols.push('media_url');
-      vals.push(media.media_url);
-    }
-    if (caps.TX_HAS_MEDIA_TYPE) {
-      cols.push('media_type');
-      vals.push(media.media_type);
-    }
-    if (caps.TX_HAS_MEDIA_TXT) {
-      cols.push('media_transcript');
-      vals.push(media.media_transcript);
-    }
-    if (caps.TX_HAS_MEDIA_CONF) {
-      cols.push('media_confidence');
-      vals.push(media.media_confidence);
-    }
+// legacy discrete media cols if present (optional, safe)
+if (media) {
+  if (caps.TX_HAS_MEDIA_URL) {
+    cols.push('media_url');
+    vals.push(media.media_url);
   }
+  if (caps.TX_HAS_MEDIA_TYPE) {
+    cols.push('media_type');
+    vals.push(media.media_type);
+  }
+  if (caps.TX_HAS_MEDIA_TXT) {
+    cols.push('media_transcript');
+    vals.push(media.media_transcript);
+  }
+  if (caps.TX_HAS_MEDIA_CONF) {
+    cols.push('media_confidence');
+    vals.push(media.media_confidence);
+  }
+}
 
-  if (caps.TX_HAS_CREATED_AT) {
-    cols.push('created_at');
-    vals.push(new Date());
-  }
-  if (caps.TX_HAS_UPDATED_AT) {
-    cols.push('updated_at');
-    vals.push(new Date());
-  }
+if (caps.TX_HAS_CREATED_AT) {
+  cols.push('created_at');
+  vals.push(new Date());
+}
+if (caps.TX_HAS_UPDATED_AT) {
+  cols.push('updated_at');
+  vals.push(new Date());
+}
 
-  const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
 
   let conflictSql = '';
 

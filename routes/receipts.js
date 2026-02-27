@@ -22,6 +22,23 @@ function hasDashboardToken(req) {
   );
 }
 
+const { createClient } = require("@supabase/supabase-js");
+
+function getSupabaseAdmin() {
+  const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "").replace(/\/$/, "");
+if (!url) throw new Error("Missing env var: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
+  const serviceKey = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+  return createClient(url, serviceKey, { auth: { persistSession: false } });
+}
+
+function parseSupabasePath(storagePath) {
+  // expected: "<bucket>/<objectPath>"
+  const s = String(storagePath || "").replace(/^\/+/, "");
+  const idx = s.indexOf("/");
+  if (idx <= 0) return null;
+  return { bucket: s.slice(0, idx), objectPath: s.slice(idx + 1) };
+}
+
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);

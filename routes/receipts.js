@@ -2,6 +2,7 @@
 const express = require("express");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
+const { createClient } = require("@supabase/supabase-js");
 
 const router = express.Router();
 const pg = require("../services/postgres");
@@ -22,33 +23,6 @@ function hasDashboardToken(req) {
   );
 }
 
-const { createClient } = require("@supabase/supabase-js");
-
-function getSupabaseAdmin() {
-  const raw =
-    process.env.SUPABASE_URL ||
-    process.env.NEXT_PUBLIC_SUPABASE_URL ||
-    "";
-
-  if (!raw) {
-    throw new Error("Missing env var: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
-  }
-
-  const url = raw.replace(/\/$/, "");
-  const serviceKey = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
-
-  return createClient(url, serviceKey, {
-    auth: { persistSession: false },
-  });
-}
-function parseSupabasePath(storagePath) {
-  // expected: "<bucket>/<objectPath>"
-  const s = String(storagePath || "").replace(/^\/+/, "");
-  const idx = s.indexOf("/");
-  if (idx <= 0) return null;
-  return { bucket: s.slice(0, idx), objectPath: s.slice(idx + 1) };
-}
-
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -66,7 +40,30 @@ function safeFilenameFromContentType(ct, txId) {
   if (x.includes("jpeg") || x.includes("jpg")) return `receipt-${txId}.jpg`;
   if (x.includes("webp")) return `receipt-${txId}.webp`;
   if (x.includes("audio/ogg")) return `attachment-${txId}.ogg`;
+  if (x.includes("audio/mpeg")) return `attachment-${txId}.mp3`;
+  if (x.includes("audio/mp4")) return `attachment-${txId}.m4a`;
   return `attachment-${txId}`;
+}
+
+/**
+ * Supabase admin client (service role) - core only
+ */
+function getSupabaseAdmin() {
+  const raw = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "";
+  if (!raw) throw new Error("Missing env var: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
+
+  const url = raw.replace(/\/$/, "");
+  const serviceKey = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  return createClient(url, serviceKey, { auth: { persistSession: false } });
+}
+
+function parseSupabasePath(storagePath) {
+  // expected: "<bucket>/<objectPath>"
+  const s = String(storagePath || "").replace(/^\/+/, "");
+  const idx = s.indexOf("/");
+  if (idx <= 0) return null;
+  return { bucket: s.slice(0, idx), objectPath: s.slice(idx + 1) };
 }
 
 /**
@@ -105,54 +102,55 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
     const rawId = String(req.params.transactionId || "").trim();
     const txId = Number(rawId);
     if (!Number.isInteger(txId) || txId <= 0) {
-      return res
-        .status(400)
-        .json({ ok: false, code: "ERROR", message: "Invalid transaction id." });
+      return res.status(400).json({
+        ok: false,
+        code: "ERROR",
+        message: "Invalid transaction id.",
+      });
     }
 
     // ---------------- Lookup + authorize (owner scoped) ----------------
-   // ---------------- Lookup + authorize (owner scoped) ----------------
-const q = `
-  select
-    t.id as transaction_id,
-    t.owner_id,
-    t.media_asset_id,
-    m.storage_provider,
-    m.storage_path,
-    m.content_type
-  from public.transactions t
-  left join public.media_assets m on m.id = t.media_asset_id
-  where t.id = $1::int
-    and t.owner_id::text = $2
-  limit 1
-`;
+    const q = `
+      select
+        t.id as transaction_id,
+        t.owner_id,
+        t.media_asset_id,
+        m.storage_provider,
+        m.storage_path,
+        m.content_type
+      from public.transactions t
+      left join public.media_assets m on m.id = t.media_asset_id
+      where t.id = $1::int
+        and t.owner_id::text = $2
+      limit 1
+    `;
 
-const out = await pg.query(q, [txId, ownerDigits]);
-const row = out?.rows?.[0] || null;
+    const out = await pg.query(q, [txId, ownerDigits]);
+    const row = out?.rows?.[0] || null;
 
-if (!row) {
-  return res.status(404).json({
-    ok: false,
-    code: "ERROR",
-    message: "Transaction not found (or access denied).",
-  });
-}
+    if (!row) {
+      return res.status(404).json({
+        ok: false,
+        code: "ERROR",
+        message: "Transaction not found (or access denied).",
+      });
+    }
 
-if (!row.media_asset_id) {
-  return res.status(404).json({
-    ok: false,
-    code: "NO_RECEIPT",
-    message: "This transaction has no receipt attachment (media_asset_id is null).",
-  });
-}
+    if (!row.media_asset_id) {
+      return res.status(404).json({
+        ok: false,
+        code: "NO_RECEIPT",
+        message: "This transaction has no receipt attachment (media_asset_id is null).",
+      });
+    }
 
-if (!row.storage_path || !row.storage_provider) {
-  return res.status(500).json({
-    ok: false,
-    code: "BROKEN_RECEIPT_LINK",
-    message: "Receipt attachment record is missing storage_path/storage_provider.",
-  });
-}
+    if (!row.storage_path || !row.storage_provider) {
+      return res.status(500).json({
+        ok: false,
+        code: "BROKEN_RECEIPT_LINK",
+        message: "Receipt attachment record is missing storage_path/storage_provider.",
+      });
+    }
 
     const provider = String(row.storage_provider || "").toLowerCase();
     const storagePath = String(row.storage_path || "");
@@ -162,146 +160,111 @@ if (!row.storage_path || !row.storage_provider) {
     const disposition = download ? "attachment" : "inline";
     const filename = safeFilenameFromContentType(contentType, txId);
 
-    // NOTE: set headers before streaming
-    res.status(200);
-    res.setHeader("Cache-Control", "private, no-store, max-age=0");
-    res.setHeader("Content-Type", contentType);
-    res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
+    function setReceiptHeaders() {
+      // set headers ONLY once we're sure we're returning a body
+      res.status(200);
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      res.setHeader("Content-Type", contentType);
+      res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
+    }
 
-    if (provider !== "twilio_temp") {
-      // ---------------- Provider dispatch ----------------
-if (provider === "supabase") {
-  const admin = getSupabaseAdmin();
-  const parsed = parseSupabasePath(storagePath);
+    // ---------------- Provider dispatch (single source of truth) ----------------
+    if (provider === "supabase") {
+      const admin = getSupabaseAdmin();
+      const parsed = parseSupabasePath(storagePath);
 
-  if (!parsed) {
+      if (!parsed) {
+        return res.status(500).json({
+          ok: false,
+          code: "ERROR",
+          message: "Invalid Supabase storage_path format (expected <bucket>/<path>).",
+        });
+      }
+
+      const { data, error } = await admin.storage
+        .from(parsed.bucket)
+        .createSignedUrl(parsed.objectPath, 60);
+
+      if (error || !data?.signedUrl) {
+        return res.status(502).json({
+          ok: false,
+          code: "ERROR",
+          message: "Failed to sign receipt URL.",
+          details: error?.message || null,
+        });
+      }
+
+      const upstream = await fetch(data.signedUrl);
+      if (!upstream.ok || !upstream.body) {
+        const t = await upstream.text().catch(() => "");
+        return res.status(502).json({
+          ok: false,
+          code: "ERROR",
+          message: "Failed to fetch receipt from storage.",
+          details: t.slice(0, 200),
+        });
+      }
+
+      setReceiptHeaders();
+      const bodyStream = Readable.fromWeb(upstream.body);
+      await pipeline(bodyStream, res);
+      return;
+    }
+
+    if (provider === "twilio_temp") {
+      if (!storagePath.startsWith("http")) {
+        return res.status(500).json({
+          ok: false,
+          code: "ERROR",
+          message: "Invalid storage URL.",
+        });
+      }
+
+      const sid = mustEnv("TWILIO_ACCOUNT_SID");
+      const auth = mustEnv("TWILIO_AUTH_TOKEN");
+
+      const tw = await fetch(storagePath, {
+        headers: {
+          Authorization: "Basic " + Buffer.from(`${sid}:${auth}`).toString("base64"),
+        },
+      });
+
+      if (!tw.ok) {
+        const t = await tw.text().catch(() => "");
+        return res.status(502).json({
+          ok: false,
+          code: "ERROR",
+          message: "Failed to fetch receipt from Twilio.",
+          details: t.slice(0, 200),
+        });
+      }
+
+      if (!tw.body) {
+        return res.status(502).json({
+          ok: false,
+          code: "ERROR",
+          message: "Missing receipt body.",
+        });
+      }
+
+      setReceiptHeaders();
+      const bodyStream = Readable.fromWeb(tw.body);
+      await pipeline(bodyStream, res);
+      return;
+    }
+
+    return res.status(400).json({
+      ok: false,
+      code: "ERROR",
+      message: `Unsupported storage_provider: ${provider}`,
+    });
+  } catch (e) {
+    console.warn("[RECEIPTS] failed:", e?.message);
     return res.status(500).json({
       ok: false,
       code: "ERROR",
-      message: "Invalid Supabase storage_path format (expected <bucket>/<path>).",
+      message: e?.message || "Receipt failed.",
     });
-  }
-
-  // short-lived signed url (60s) then stream through
-  const { data, error } = await admin.storage
-    .from(parsed.bucket)
-    .createSignedUrl(parsed.objectPath, 60);
-
-  if (error || !data?.signedUrl) {
-    return res.status(502).json({
-      ok: false,
-      code: "ERROR",
-      message: "Failed to sign receipt URL.",
-      details: error?.message || null,
-    });
-  }
-
-  const upstream = await fetch(data.signedUrl);
-  if (!upstream.ok || !upstream.body) {
-    const t = await upstream.text().catch(() => "");
-    return res.status(502).json({
-      ok: false,
-      code: "ERROR",
-      message: "Failed to fetch receipt from storage.",
-      details: t.slice(0, 200),
-    });
-  }
-
-  // ✅ set headers only on success
-  res.status(200);
-  res.setHeader("Cache-Control", "private, no-store, max-age=0");
-  res.setHeader("Content-Type", contentType);
-  res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
-
-  const bodyStream = Readable.fromWeb(upstream.body);
-  await pipeline(bodyStream, res);
-  return;
-}
-
-if (provider === "twilio_temp") {
-  if (!storagePath.startsWith("http")) {
-    return res.status(500).json({ ok: false, code: "ERROR", message: "Invalid storage URL." });
-  }
-
-  const sid = mustEnv("TWILIO_ACCOUNT_SID");
-  const auth = mustEnv("TWILIO_AUTH_TOKEN");
-
-  const tw = await fetch(storagePath, {
-    headers: { Authorization: "Basic " + Buffer.from(`${sid}:${auth}`).toString("base64") },
-  });
-
-  if (!tw.ok) {
-    const t = await tw.text().catch(() => "");
-    return res.status(502).json({
-      ok: false,
-      code: "ERROR",
-      message: "Failed to fetch receipt from Twilio.",
-      details: t.slice(0, 200),
-    });
-  }
-
-  if (!tw.body) {
-    return res.status(502).json({ ok: false, code: "ERROR", message: "Missing receipt body." });
-  }
-
-  // ✅ set headers only on success
-  res.status(200);
-  res.setHeader("Cache-Control", "private, no-store, max-age=0");
-  res.setHeader("Content-Type", contentType);
-  res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
-
-  const bodyStream = Readable.fromWeb(tw.body);
-  await pipeline(bodyStream, res);
-  return;
-}
-
-return res.status(400).json({
-  ok: false,
-  code: "ERROR",
-  message: `Unsupported storage_provider: ${provider}`,
-});
-    }
-
-    if (!storagePath.startsWith("http")) {
-      return res
-        .status(500)
-        .json({ ok: false, code: "ERROR", message: "Invalid storage URL." });
-    }
-
-    const sid = mustEnv("TWILIO_ACCOUNT_SID");
-    const auth = mustEnv("TWILIO_AUTH_TOKEN");
-
-    const tw = await fetch(storagePath, {
-      headers: {
-        Authorization:
-          "Basic " + Buffer.from(`${sid}:${auth}`).toString("base64"),
-      },
-    });
-
-    if (!tw.ok) {
-      const t = await tw.text().catch(() => "");
-      return res.status(502).json({
-        ok: false,
-        code: "ERROR",
-        message: "Failed to fetch receipt from Twilio.",
-        details: t.slice(0, 200),
-      });
-    }
-
-    if (!tw.body) {
-      return res
-        .status(502)
-        .json({ ok: false, code: "ERROR", message: "Missing receipt body." });
-    }
-
-    // Node 18 safe streaming
-    const bodyStream = Readable.fromWeb(tw.body);
-    await pipeline(bodyStream, res);
-  } catch (e) {
-    console.warn("[RECEIPTS] failed:", e?.message);
-    return res
-      .status(500)
-      .json({ ok: false, code: "ERROR", message: e?.message || "Receipt failed." });
   }
 });
 

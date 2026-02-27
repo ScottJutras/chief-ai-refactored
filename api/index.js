@@ -1,5 +1,5 @@
 // api/index.js
-// Vercel Serverless Function Handler
-// Exports your Express app directly
+// Vercel Serverless entrypoint: export the Express app from the repo root.
 
-module.exports = require('../index');
+const app = require("../index"); // <- your root index.js that mounts routers
+module.exports = app;

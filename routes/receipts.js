@@ -169,11 +169,97 @@ if (!row.storage_path || !row.storage_provider) {
     res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
 
     if (provider !== "twilio_temp") {
-      return res.status(400).json({
-        ok: false,
-        code: "ERROR",
-        message: `Unsupported storage_provider: ${provider}`,
-      });
+      // ---------------- Provider dispatch ----------------
+if (provider === "supabase") {
+  const admin = getSupabaseAdmin();
+  const parsed = parseSupabasePath(storagePath);
+
+  if (!parsed) {
+    return res.status(500).json({
+      ok: false,
+      code: "ERROR",
+      message: "Invalid Supabase storage_path format (expected <bucket>/<path>).",
+    });
+  }
+
+  // short-lived signed url (60s) then stream through
+  const { data, error } = await admin.storage
+    .from(parsed.bucket)
+    .createSignedUrl(parsed.objectPath, 60);
+
+  if (error || !data?.signedUrl) {
+    return res.status(502).json({
+      ok: false,
+      code: "ERROR",
+      message: "Failed to sign receipt URL.",
+      details: error?.message || null,
+    });
+  }
+
+  const upstream = await fetch(data.signedUrl);
+  if (!upstream.ok || !upstream.body) {
+    const t = await upstream.text().catch(() => "");
+    return res.status(502).json({
+      ok: false,
+      code: "ERROR",
+      message: "Failed to fetch receipt from storage.",
+      details: t.slice(0, 200),
+    });
+  }
+
+  // ✅ set headers only on success
+  res.status(200);
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
+
+  const bodyStream = Readable.fromWeb(upstream.body);
+  await pipeline(bodyStream, res);
+  return;
+}
+
+if (provider === "twilio_temp") {
+  if (!storagePath.startsWith("http")) {
+    return res.status(500).json({ ok: false, code: "ERROR", message: "Invalid storage URL." });
+  }
+
+  const sid = mustEnv("TWILIO_ACCOUNT_SID");
+  const auth = mustEnv("TWILIO_AUTH_TOKEN");
+
+  const tw = await fetch(storagePath, {
+    headers: { Authorization: "Basic " + Buffer.from(`${sid}:${auth}`).toString("base64") },
+  });
+
+  if (!tw.ok) {
+    const t = await tw.text().catch(() => "");
+    return res.status(502).json({
+      ok: false,
+      code: "ERROR",
+      message: "Failed to fetch receipt from Twilio.",
+      details: t.slice(0, 200),
+    });
+  }
+
+  if (!tw.body) {
+    return res.status(502).json({ ok: false, code: "ERROR", message: "Missing receipt body." });
+  }
+
+  // ✅ set headers only on success
+  res.status(200);
+  res.setHeader("Cache-Control", "private, no-store, max-age=0");
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Content-Disposition", `${disposition}; filename="${filename}"`);
+
+  const bodyStream = Readable.fromWeb(tw.body);
+  await pipeline(bodyStream, res);
+  return;
+}
+
+return res.status(400).json({
+  ok: false,
+  code: "ERROR",
+  message: `Unsupported storage_provider: ${provider}`,
+});
     }
 
     if (!storagePath.startsWith("http")) {

@@ -173,7 +173,11 @@ router.get("/status", async (req, res) => {
 
     const ownerId = requireOwner(req, res);
     if (!ownerId) return;
-
+    console.log("[BILLING_STATUS_CTX]", {
+  ownerId,
+  authKeys: Object.keys(req.auth || {}),
+  hasSupabaseUser: !!req.supabaseUserId,
+});
     const owner = await db.getOwner(ownerId);
     if (!owner) return bad(res, 404, "Owner not found");
 

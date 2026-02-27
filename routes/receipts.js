@@ -25,12 +25,22 @@ function hasDashboardToken(req) {
 const { createClient } = require("@supabase/supabase-js");
 
 function getSupabaseAdmin() {
-  const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "").replace(/\/$/, "");
-if (!url) throw new Error("Missing env var: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
-  const serviceKey = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
-  return createClient(url, serviceKey, { auth: { persistSession: false } });
-}
+  const raw =
+    process.env.SUPABASE_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    "";
 
+  if (!raw) {
+    throw new Error("Missing env var: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
+  }
+
+  const url = raw.replace(/\/$/, "");
+  const serviceKey = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  return createClient(url, serviceKey, {
+    auth: { persistSession: false },
+  });
+}
 function parseSupabasePath(storagePath) {
   // expected: "<bucket>/<objectPath>"
   const s = String(storagePath || "").replace(/^\/+/, "");

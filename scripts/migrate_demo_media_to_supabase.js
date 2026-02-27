@@ -45,14 +45,30 @@ async function fetchTwilioBytes(url) {
 }
 
 function makeSupabaseAdmin() {
-  const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "").replace(/\/$/, "");
-  if (!url) throw new Error("Missing env var: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
+  const raw =
+    process.env.SUPABASE_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    "";
+
+  if (!raw) {
+    throw new Error("Missing env var: SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL)");
+  }
+
+  const url = raw.replace(/\/$/, "");
   const serviceKey = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
-  return createClient(url, serviceKey, { auth: { persistSession: false } });
+
+  return createClient(url, serviceKey, {
+    auth: { persistSession: false },
+  });
 }
 
 async function main() {
-  const DATABASE_URL = mustEnv("NEXT_PUBLIC_SUPABASE_URL");
+  const DATABASE_URL =
+  process.env.DATABASE_URL ||
+  process.env.SUPABASE_DATABASE_URL || // optional alias if you ever use it
+  "";
+
+if (!DATABASE_URL) throw new Error("Missing env var: DATABASE_URL");
   const dryRun = process.argv.includes("--dry-run");
 
   const db = new pg.Pool({ connectionString: DATABASE_URL });
@@ -69,12 +85,11 @@ async function main() {
     select id, tenant_id, owner_id, storage_provider, storage_path, content_type, created_at
     from public.media_assets
     where tenant_id = $1::uuid
-      and owner_id = $2
       and storage_provider = 'twilio_temp'
       and storage_path like 'http%'
     order by created_at asc
     `,
-    [DEMO_TENANT_ID, OWNER_ID]
+    [DEMO_TENANT_ID]
   );
 
   console.log(`Found ${rows.length} demo media rows to migrate.`);

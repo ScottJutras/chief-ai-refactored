@@ -52,17 +52,21 @@ const pool = new Pool({
   application_name: 'chief-ai'
 });
 
-pool.on('connect', async (client) => {
+pool.on("connect", async (client) => {
   try {
-    await client.query(`SET TIME ZONE 'UTC'`);
-    await client.query(`SET intervalstyle = 'iso_8601'`);
+    // ✅ Single round-trip session prep (much safer on serverless/poolers)
+    const timeoutMs = parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || "8000", 10);
 
-    // ✅ server-side kill switch
-    await client.query(`SET statement_timeout TO ${parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || '8000', 10)}`);
+    await client.query(
+      `
+      SET TIME ZONE 'UTC';
+      SET intervalstyle = 'iso_8601';
+      SET statement_timeout = '${timeoutMs}ms';
+      `
+    );
   } catch (e) {
-    const msg = String(e?.message || '');
-    const transient = /terminated|ECONNRESET|EPIPE|server closed the connection|Connection terminated/i.test(msg);
-    if (!transient) console.warn('[PG] connect session prep failed:', msg);
+    // ✅ Never let connect-prep failures break requests
+    console.warn("[PG] connect session prep failed:", String(e?.message || e));
   }
 });
 

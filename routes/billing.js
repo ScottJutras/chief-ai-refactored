@@ -165,19 +165,32 @@ router.post("/checkout", async (req, res) => {
 // -----------------------------
 router.get("/status", async (req, res) => {
   try {
-    console.log("[BILLING_AUTH]", {
-      ownerId: req.ownerId || req?.auth?.owner_id || null,
-      supabaseUserId: req.supabaseUserId || req?.auth?.supabase_user_id || null,
-      hasOwnerId: !!(req.ownerId || req?.auth?.owner_id),
-    });
+    const debug = String(process.env.BILLING_DEBUG || "").trim() === "1";
 
-    const ownerId = requireOwner(req, res);
-    if (!ownerId) return;
-    console.log("[BILLING_STATUS_CTX]", {
-  ownerId,
-  authKeys: Object.keys(req.auth || {}),
-  hasSupabaseUser: !!req.supabaseUserId,
-});
+    // Prefer req.auth if present; fallback to req.ownerId for older paths
+    const ownerId =
+      (req?.auth?.owner_id ? String(req.auth.owner_id) : null) ||
+      (req?.ownerId ? String(req.ownerId) : null);
+
+    const supabaseUserId =
+      (req?.auth?.supabase_user_id ? String(req.auth.supabase_user_id) : null) ||
+      (req?.supabaseUserId ? String(req.supabaseUserId) : null);
+
+    if (debug) {
+      console.log("[BILLING_AUTH]", {
+        ownerId,
+        supabaseUserId,
+        hasOwnerId: !!ownerId,
+      });
+      console.log("[BILLING_STATUS_CTX]", {
+        ownerId,
+        authKeys: Object.keys(req.auth || {}),
+        hasSupabaseUser: !!supabaseUserId,
+      });
+    }
+
+    if (!ownerId) return bad(res, 401, "Missing owner context");
+
     const owner = await db.getOwner(ownerId);
     if (!owner) return bad(res, 404, "Owner not found");
 

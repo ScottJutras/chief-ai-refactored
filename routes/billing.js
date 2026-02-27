@@ -16,12 +16,12 @@ const router = express.Router();
 const db = require("../services/postgres");
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-const { requireDashboardOwner } = require("../middleware/requireDashboardOwner");
+const requireOwnerContext = require("../middleware/requireOwnerContext");
 const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
 const { plan_capabilities } = require("../src/config/planCapabilities");
 
 // ✅ Billing routes are normal HTTP calls (not Twilio), so use dashboard token auth
-router.use(requireDashboardOwner);
+router.use(requireOwnerContext);
 
 // ✅ Because index.js intentionally has NO global body parsers
 router.use(express.json({ limit: "200kb" }));
@@ -39,7 +39,7 @@ function bad(res, code, error) {
 }
 
 function requireOwner(req, res) {
-  const ownerId = req.ownerId;
+  const ownerId = req?.auth?.owner_id || null;
   if (!ownerId) {
     bad(res, 401, "Missing owner context");
     return null;
@@ -133,6 +133,12 @@ router.post("/checkout", async (req, res) => {
 // -----------------------------
 router.get("/status", async (req, res) => {
   try {
+    console.log("[BILLING_AUTH]", {
+      hasOwnerId: !!req.ownerId,
+      ownerId: req.ownerId,
+      supabaseUserId: req.supabaseUserId,
+    });
+
     const ownerId = requireOwner(req, res);
     if (!ownerId) return;
 

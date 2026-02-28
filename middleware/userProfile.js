@@ -219,8 +219,6 @@ async function userProfileMiddleware(req, _res, next) {
       req.ownerId = cached.ownerId;
       req.isOwner = !!cached.isOwner;
       req.tz = cached.tz || DEFAULT_TZ;
-
-  // ✅ ADD THIS
       req.actorId = cached.actorId || null;
 
       const plan = String(cached.plan || 'free').trim().toLowerCase();
@@ -278,7 +276,11 @@ async function userProfileMiddleware(req, _res, next) {
       req.ownerId = normalizeDigits(resolved.owner_phone_digits) || from; // legacy compat
       req.isOwner = String(resolved.role || '').toLowerCase() === 'owner';
       req.tz = pickTz(resolved) || DEFAULT_TZ;
-      req.actorId = resolved.actor_id || null;
+      req.actorId =
+        resolved.actor_id ||
+        resolved.actorId ||
+        resolved.actor ||
+        null;
 
 
       let plan = 'free';

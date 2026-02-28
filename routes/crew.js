@@ -133,4 +133,139 @@ if (type && !ALLOWED_TYPE.has(type)) {
   }
 });
 
+/**
+ * POST /api/crew/logs/:id/approve
+ * Approves a submitted log (reviewer only).
+ */
+router.post("/logs/:id/approve", requirePortalUser, async (req, res) => {
+  try {
+    const { tenantId, actorId } = await getCrewCtx(req);
+    const logId = String(req.params.id || "").trim();
+
+    if (!tenantId || !actorId) {
+      return res.status(403).json({ ok: false, code: "CREW_CTX_MISSING", message: "Missing tenant/actor context." });
+    }
+    if (!logId) {
+      return res.status(400).json({ ok: false, code: "LOG_ID_MISSING", message: "Missing log id." });
+    }
+
+    // 1) Approve only if:
+    // - same tenant
+    // - actor is the reviewer
+    // - status is submitted/needs_clarification
+    const r = await pg.query(
+      `
+      update public.chiefos_activity_logs
+         set status = 'approved',
+             reviewed_by_actor_id = $3,
+             reviewed_at = now(),
+             updated_at = now()
+       where id = $1
+         and tenant_id = $2
+         and reviewer_actor_id = $3
+         and status in ('submitted','needs_clarification')
+       returning id, owner_id, status, created_by_actor_id, reviewer_actor_id
+      `,
+      [logId, tenantId, actorId]
+    );
+
+    const row = r?.rows?.[0] || null;
+    if (!row?.id) {
+      return res.status(403).json({
+        ok: false,
+        code: "NOT_ALLOWED",
+        message: "Not found, not your log, or not in an approvable state.",
+      });
+    }
+
+    // 2) Append audit event
+    await pg.query(
+      `
+      insert into public.chiefos_activity_log_events (
+        tenant_id, owner_id, log_id, event_type, actor_id, payload
+      )
+      values ($1,$2,$3,'approved',$4,$5)
+      `,
+      [
+        tenantId,
+        String(row.owner_id),
+        row.id,
+        actorId,
+        { status: "approved" },
+      ]
+    );
+
+    return res.json({ ok: true, id: row.id, status: row.status });
+  } catch (e) {
+    console.warn("[CREW_APPROVE] failed:", e?.message);
+    return res.status(500).json({ ok: false, code: "CREW_APPROVE_FAILED", message: e?.message || "failed" });
+  }
+});
+
+/**
+ * POST /api/crew/logs/:id/reject
+ * Rejects a submitted log (reviewer only). Optional reason in body: { reason: "..." }
+ */
+router.post("/logs/:id/reject", requirePortalUser, async (req, res) => {
+  try {
+    const { tenantId, actorId } = await getCrewCtx(req);
+    const logId = String(req.params.id || "").trim();
+    const reason = String(req.body?.reason || "").trim();
+
+    if (!tenantId || !actorId) {
+      return res.status(403).json({ ok: false, code: "CREW_CTX_MISSING", message: "Missing tenant/actor context." });
+    }
+    if (!logId) {
+      return res.status(400).json({ ok: false, code: "LOG_ID_MISSING", message: "Missing log id." });
+    }
+
+    const r = await pg.query(
+      `
+      update public.chiefos_activity_logs
+         set status = 'rejected',
+             reviewed_by_actor_id = $3,
+             reviewed_at = now(),
+             updated_at = now()
+       where id = $1
+         and tenant_id = $2
+         and reviewer_actor_id = $3
+         and status in ('submitted','needs_clarification')
+       returning id, owner_id, status
+      `,
+      [logId, tenantId, actorId]
+    );
+
+    const row = r?.rows?.[0] || null;
+    if (!row?.id) {
+      return res.status(403).json({
+        ok: false,
+        code: "NOT_ALLOWED",
+        message: "Not found, not your log, or not in a rejectable state.",
+      });
+    }
+
+    await pg.query(
+      `
+      insert into public.chiefos_activity_log_events (
+        tenant_id, owner_id, log_id, event_type, actor_id, payload
+      )
+      values ($1,$2,$3,'rejected',$4,$5)
+      `,
+      [
+        tenantId,
+        String(row.owner_id),
+        row.id,
+        actorId,
+        { status: "rejected", reason: reason || null },
+      ]
+    );
+
+    return res.json({ ok: true, id: row.id, status: row.status });
+  } catch (e) {
+    console.warn("[CREW_REJECT] failed:", e?.message);
+    return res.status(500).json({ ok: false, code: "CREW_REJECT_FAILED", message: e?.message || "failed" });
+  }
+});
+
+
 module.exports = router;

@@ -1481,6 +1481,8 @@ router.use((req, res, next) => {
       profileName: req.body?.ProfileName || null,
       ownerId: req.ownerId || null,
       isOwner: !!req.isOwner,
+      actorId: req.actorId || null,
+      tenantId: req.tenantId || null,
       role: req.userProfile?.role || req.userProfile?.user_role || null,
       userId: req.userProfile?.user_id || req.userProfile?.id || null
     });

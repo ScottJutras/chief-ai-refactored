@@ -1779,6 +1779,44 @@ async function allocateNextJobNo(owner, client) {
   );
   return Number(rows?.[0]?.next_no || 1);
 }
+// ---------- Per-tenant safe activity log_no allocator ----------
+async function withTenantAllocLock(tenantId, client) {
+  // tenantId is uuid; use advisory lock scoped to this tenant
+  // hashtext(text) gives stable int32; advisory lock expects bigint but PG coerces fine.
+  await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [String(tenantId)]);
+}
+
+async function allocateNextActivityLogNo(tenantId, client) {
+  // Ensure counter row exists, then atomically increment & return previous value
+  const tid = String(tenantId || "").trim();
+  if (!tid) throw new Error("Missing tenantId for allocateNextActivityLogNo");
+
+  // Create row if missing
+  await client.query(
+    `
+    insert into public.chiefos_tenant_counters (tenant_id, next_activity_log_no, updated_at)
+    values ($1, 1, now())
+    on conflict (tenant_id) do nothing
+    `,
+    [tid]
+  );
+
+  // Increment and return the allocated number = previous next_activity_log_no
+  const r = await client.query(
+    `
+    update public.chiefos_tenant_counters
+       set next_activity_log_no = next_activity_log_no + 1,
+           updated_at = now()
+     where tenant_id = $1
+     returning (next_activity_log_no - 1) as allocated_no
+    `,
+    [tid]
+  );
+
+  const n = r?.rows?.[0]?.allocated_no;
+  if (!Number.isFinite(Number(n))) throw new Error("Failed to allocate activity log number");
+  return Number(n);
+}
 
 // Find or create a job by name (case-insensitive on name or job_name).
 async function ensureJobByName(ownerId, name) {
@@ -4591,4 +4629,6 @@ module.exports = {
   safeQueryUndefinedColumnRetry,
   topExpenseVendorsByRange,
   topExpenseCategoriesByRange,
+  withTenantAllocLock,
+  allocateNextActivityLogNo,
 };

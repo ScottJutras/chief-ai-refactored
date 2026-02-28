@@ -79,73 +79,119 @@ async function createCrewActivityLog({
     console.warn("[CREW_CONTROL] reviewer fallback to self", { tenantId, createdByActorId });
   }
 
-  const inserted = await pg.query(
-    `
-    insert into public.chiefos_activity_logs (
-      tenant_id,
-      owner_id,
-      created_by_actor_id,
-      reviewer_actor_id,
-      type,
-      source,
-      content_text,
-      structured,
-      status,
-      source_msg_id
-    )
-    values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-    on conflict (tenant_id, source_msg_id)
-    where source_msg_id is not null
-    do update set updated_at = now()
-    returning id
-    `,
-    [
-      tenantId,
-      String(ownerId),
-      createdByActorId,
-      reviewerFinal,
-      String(type),
-      String(source),
-      String(contentText).trim(),
-      structured || {},
-      String(status),
-      sourceMsgId ? String(sourceMsgId) : null,
-    ]
-  );
+  const tid = String(tenantId).trim();
+  const oid = String(ownerId).trim();
 
-  const logId = inserted?.rows?.[0]?.id || null;
-  if (!logId) throw new Error("Failed to create crew activity log");
+  // ✅ One transaction so: allocate log_no + insert log + insert event is consistent
+  return await pg.withClient(async (client) => {
+    // Lock per-tenant so numbering is sequential and collision-free
+    if (typeof pg.withTenantAllocLock === "function") {
+      await pg.withTenantAllocLock(tid, client);
+    }
 
-  // event (append-only)
-  await pg.query(
-    `
-    insert into public.chiefos_activity_log_events (
-      tenant_id,
-      owner_id,
-      log_id,
-      event_type,
-      actor_id,
-      payload
-    )
-    values ($1,$2,$3,$4,$5,$6)
-    `,
-    [
-      tenantId,
-      String(ownerId),
-      logId,
-      "created",
-      createdByActorId,
-      {
+    // If idempotent key exists, return existing row (and its log_no) instead of updating
+    if (sourceMsgId) {
+      const existing = await client.query(
+        `
+        select id, log_no
+          from public.chiefos_activity_logs
+         where tenant_id = $1
+           and source_msg_id = $2
+         limit 1
+        `,
+        [tid, String(sourceMsgId)]
+      );
+      if (existing?.rowCount) {
+        return { ok: true, logId: existing.rows[0].id, logNo: existing.rows[0].log_no, reviewerActorId: reviewerFinal };
+      }
+    }
+
+    // Allocate a new per-tenant log number (preferred)
+    let logNo = null;
+    if (typeof pg.allocateNextActivityLogNo === "function") {
+      logNo = await pg.allocateNextActivityLogNo(tid, client);
+    } else {
+      // fallback: derive from existing rows (not ideal, but keeps it alive)
+      const r = await client.query(
+        `select coalesce(max(log_no), 0)::int + 1 as next_no
+           from public.chiefos_activity_logs
+          where tenant_id=$1`,
+        [tid]
+      );
+      logNo = Number(r?.rows?.[0]?.next_no || 1);
+    }
+
+    // Insert log
+    const ins = await client.query(
+      `
+      insert into public.chiefos_activity_logs (
+        tenant_id,
+        owner_id,
+        log_no,
+        created_by_actor_id,
+        reviewer_actor_id,
         type,
         source,
+        content_text,
+        structured,
         status,
-        reviewer_actor_id: reviewerFinal,
-        source_msg_id: sourceMsgId || null,
-      },
-    ]
-  );
+        source_msg_id
+      )
+      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      returning id, log_no
+      `,
+      [
+        tid,
+        oid,
+        logNo,
+        createdByActorId,
+        reviewerFinal,
+        String(type),
+        String(source),
+        String(contentText).trim(),
+        structured || {},
+        String(status),
+        sourceMsgId ? String(sourceMsgId) : null,
+      ]
+    );
 
-  return { ok: true, logId, reviewerActorId: reviewerFinal };
+    const logId = ins?.rows?.[0]?.id || null;
+    const logNoOut = ins?.rows?.[0]?.log_no ?? logNo;
+
+    if (!logId) throw new Error("Failed to create crew activity log");
+
+    // event (append-only)
+    await client.query(
+      `
+      insert into public.chiefos_activity_log_events (
+        tenant_id,
+        owner_id,
+        log_id,
+        event_type,
+        actor_id,
+        payload
+      )
+      values ($1,$2,$3,$4,$5,$6)
+      `,
+      [
+        tid,
+        oid,
+        logId,
+        "created",
+        createdByActorId,
+        {
+          type,
+          source,
+          status,
+          reviewer_actor_id: reviewerFinal,
+          source_msg_id: sourceMsgId || null,
+          log_no: logNoOut || null,
+        },
+      ]
+    );
+
+    return { ok: true, logId, logNo: logNoOut, reviewerActorId: reviewerFinal };
+  });
 }
 
 module.exports = {

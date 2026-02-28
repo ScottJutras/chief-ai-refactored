@@ -1638,68 +1638,73 @@ router.post('*', async (req, res, next) => {
   
 
 
-       /* -----------------------------------------------------------------------
-     * ✅ Canonical post-media refresh (EARLY)
-     * - Runs immediately after resolveInboundTextFromTwilio()
-     * - Preserves stable interactive picker tokens (so Body cannot overwrite them)
-     * - IMPORTANT: media handler later may write req.body.Body (transcript)
-     * ----------------------------------------------------------------------- */
-    {
-      const resolved0 = String(req.body?.ResolvedInboundText || '').trim();
-      const body0 = String(req.body?.Body || '').trim();
+   /* -----------------------------------------------------------------------
+ * ✅ Canonical post-media refresh (EARLY)
+ * - Runs immediately after resolveInboundTextFromTwilio()
+ * - Preserves stable interactive picker tokens (so Body cannot overwrite them)
+ * - IMPORTANT: media handler later may write req.body.Body (transcript)
+ * ----------------------------------------------------------------------- */
+{
+  const resolved0 = String(req.body?.ResolvedInboundText || "").trim();
+  const body0 = String(req.body?.Body || "").trim();
 
-      // Treat picker tokens as stable (do not overwrite with Body)
-      const isStablePickerToken =
-        /^jp:/i.test(resolved0) ||
-        /^jobix_\d+/i.test(resolved0) ||
-        /^jobno_\d+/i.test(resolved0) ||
-        /^jobpick::/i.test(resolved0) ||
-        /^(more|overhead|oh)$/i.test(resolved0);
+  // Treat picker tokens as stable (do not overwrite with Body)
+  const isStablePickerToken =
+    /^jp:/i.test(resolved0) ||
+    /^jobix_\d+/i.test(resolved0) ||
+    /^jobno_\d+/i.test(resolved0) ||
+    /^jobpick::/i.test(resolved0) ||
+    /^(more|overhead|oh)$/i.test(resolved0);
 
-      text2 = isStablePickerToken
-        ? resolved0
-        : (body0 || resolved0 || text2 || '').trim();
+  text2 = isStablePickerToken ? resolved0 : (body0 || resolved0 || text2 || "").trim();
+  lc2 = text2.toLowerCase();
 
-      lc2 = text2.toLowerCase();
+  console.info("[ROUTER_TEXT_REFRESH_EARLY]", { lcN: lc2.slice(0, 50) });
+  if (isStablePickerToken) {
+    console.info("[ROUTER_PICKER_TOKEN_PRESERVED_EARLY]", { token: resolved0.slice(0, 80) });
+  }
+}
 
-      console.info('[ROUTER_TEXT_REFRESH_EARLY]', { lcN: lc2.slice(0, 50) });
-      if (isStablePickerToken) {
-        console.info('[ROUTER_PICKER_TOKEN_PRESERVED_EARLY]', { token: resolved0.slice(0, 80) });
-      }
-    }
-    // ✅ Compute messageSid ONCE (used by everything below)
-const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
+// ✅ Compute Twilio MessageSid ONCE (preferred stable id)
+const twilioSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || "").trim() || null;
+
+// ✅ Optional fallback stable id (used elsewhere in your router if needed)
+// NOTE: we do NOT use this for Crew idempotency because it can collide on repeated identical messages.
+const rawSid = twilioSid || "";
 const messageSid =
   rawSid ||
-  crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
+  crypto
+    .createHash("sha256")
+    .update(`${req.from || ""}|${text2}`)
+    .digest("hex")
+    .slice(0, 32);
 
- // (D) CREW+CONTROL FAST PATH (task/time → activity logs)
+// (D) CREW+CONTROL FAST PATH (task/time → activity logs)
 // - requires actor identity + tenant mapping
 // - does NOT replace existing systems; just captures a crew-auditable log stream
 try {
   const crewEnabled = String(process.env.FEATURE_CREW_CONTROL || "0") === "1";
-  if (!crewEnabled) {
-    // crew disabled → fall through
-  } else {
+  if (crewEnabled) {
     const hasTenant = !!req.tenantId;
     const hasActor = !!req.actorId;
 
     // Fail closed unless actor identity system is active
     if (hasTenant && hasActor) {
-      const rawText = String(text2 || "");
+      const rawText = String(text2 || "").trim();
+
       const isTaskCmd =
-        /^task\b/i.test(lc2) ||
+        /^task\b/i.test(String(lc2 || "")) ||
         /^\s*task\s*-\s*/i.test(rawText) ||
         /^\s*task-\s*/i.test(rawText);
 
       const isTimeCmd =
-        /^time\b/i.test(lc2) ||
-        /^clock\s*(in|out)\b/i.test(lc2);
+        /^time\b/i.test(String(lc2 || "")) ||
+        /^clock\s*(in|out)\b/i.test(rawText);
 
       if (isTaskCmd || isTimeCmd) {
-        // ✅ enforce idempotency key for WhatsApp capture
-        // messageSid MUST be defined earlier in the webhook handler
-        if (!messageSid) return ok(res, "⚠️ Missing message id. Try again.");
+        // ✅ Only use idempotency when we have a real Twilio SID.
+        // If twilioSid is missing, we still capture, but with sourceMsgId=null (no dedupe).
+        const sourceMsgId = twilioSid ? String(twilioSid) : null;
 
         // Lazy-load so crew module issues never crash the whole webhook
         const mod = require("../services/crewControl");
@@ -1711,38 +1716,61 @@ try {
           // fall through to legacy routing
         } else {
           const type = isTaskCmd ? "task" : "time";
-          const content = rawText.trim();
 
-          // Don't capture empty payloads
-          if (!content) {
-            // fall through
+          // ✅ clean stored/displayed content (strip command prefix for tasks)
+          let contentText = rawText;
+          if (isTaskCmd) {
+            contentText = contentText
+              .replace(/^\s*task\s*-\s*/i, "")
+              .replace(/^\s*task-\s*/i, "")
+              .replace(/^\s*task\s+/i, "")
+              .trim();
+          }
+
+          if (!contentText) {
+            // fall through to legacy routing
           } else {
-            const structured = { raw: content, detected: { isTaskCmd, isTimeCmd } };
+            const structured = {
+              raw: rawText,
+              normalized: contentText,
+              detected: { isTaskCmd, isTimeCmd },
+              meta: {
+                twilio_message_sid: twilioSid,
+                used_idempotency: !!sourceMsgId,
+              },
+            };
 
             console.info("[CREW_CONTROL] capturing", {
               tenantId: req.tenantId,
               ownerId: req.ownerId,
               actorId: req.actorId,
-              messageSid,
-              text: content.slice(0, 80),
+              twilioSid,
+              usedIdempotency: !!sourceMsgId,
+              type,
+              text: contentText.slice(0, 80),
             });
 
-            await createCrewActivityLog({
+            const out = await createCrewActivityLog({
               tenantId: req.tenantId,
               ownerId: req.ownerId,
               createdByActorId: req.actorId,
               type,
               source: "whatsapp",
-              contentText: content,
+              contentText,
               structured,
               status: "submitted",
-              sourceMsgId: String(messageSid),
+              sourceMsgId, // ✅ null if no real Twilio SID (avoid hash collisions)
             });
 
-            return ok(
-              res,
-              type === "task" ? "✅ Task logged for review." : "✅ Time log captured for review."
-            );
+            // Legacy-style reply:
+            // "✅ Task #77 created: Task buy hammer"
+            const n = out?.logNo ? `#${out.logNo}` : (out?.logId ? `#${out.logId}` : "");
+            const replyText =
+              type === "task"
+                ? `✅ Task ${n} created: Task ${contentText}`
+                : `✅ Time log ${n} created: ${contentText}`;
+
+            return ok(res, replyText.replace(/\s+/g, " ").trim());
           }
         }
       }

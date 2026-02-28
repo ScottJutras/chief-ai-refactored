@@ -52,6 +52,9 @@ const accountRouter = require("./routes/account");
 const receiptsRouter = require("./routes/receipts");
 const portalRouter = require("./routes/portal");
 
+// ✅ Portal auth + tenant/actor context for protected API routes
+const { requirePortalUser } = require("./middleware/requirePortalUser");
+
 const app = express();
 
 if (!process.env.VERCEL) {
@@ -116,8 +119,8 @@ app.use(receiptsRouter);
 
 // ✅ Portal routes (this provides /api/whoami etc.)
 app.use("/api", portalRouter);
-// Crew+Control (Pro-gated)
-app.use("/api/crew", require("./routes/crewControl"));
+// ✅ Crew+Control (Pro-gated) — portal-auth required
+app.use("/api/crew", requirePortalUser, require("./routes/crewControl"));
 
 // AskChief defines POST /api/ask-chief internally
 app.use(askChiefRouter);

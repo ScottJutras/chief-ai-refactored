@@ -1766,11 +1766,10 @@ try {
             // "✅ Task #77 created: Task buy hammer"
             const n = out?.logNo ? `#${out.logNo}` : (out?.logId ? `#${out.logId}` : "");
             const replyText =
-              type === "task"
-                ? `✅ Task ${n} created: Task ${contentText}`
-                : `✅ Time log ${n} created: ${contentText}`;
-
-            return ok(res, replyText.replace(/\s+/g, " ").trim());
+  type === "task"
+    ? `✅ Task ${n} created: ${contentText}`
+    : `✅ Time log ${n} created: ${contentText}`;
+return ok(res, replyText.replace(/\s+/g, " ").trim());
           }
         }
       }

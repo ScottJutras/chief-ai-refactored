@@ -72,7 +72,7 @@ async function bumpTenantCounterToMax(tenantId) {
  * Idempotent per (tenant_id, source_msg_id) if source_msg_id is provided.
  *
  * Returns:
- *  { ok: true, logId, logNo, reviewerActorId }
+ *  { ok: true, logId, logNo, reviewerActorId, deduped }
  */
 async function createCrewActivityLog({
   tenantId,
@@ -85,20 +85,20 @@ async function createCrewActivityLog({
   status = "submitted",
   sourceMsgId = null,
 } = {}) {
-  // ---- Required validation (restore the stuff you accidentally removed) ----
+  // ---- Required validation ----
   const tid = String(tenantId || "").trim();
   const oid = String(ownerId || "").trim();
   const by = String(createdByActorId || "").trim();
   const t = String(type || "").trim();
   const s = String(source || "").trim();
-  const text = String(contentText || "").trim();
+  const rawText = String(contentText || "").trim();
 
   if (!tid) throw new Error("Missing tenantId");
   if (!oid) throw new Error("Missing ownerId");
   if (!by) throw new Error("Missing createdByActorId");
   if (!t) throw new Error("Missing type");
   if (!s) throw new Error("Missing source");
-  if (!text) throw new Error("Missing contentText");
+  if (!rawText) throw new Error("Missing contentText");
 
   // reviewer (board assignment -> owner/admin -> null)
   let reviewerActorId = null;
@@ -120,14 +120,25 @@ async function createCrewActivityLog({
 
   const msgId = sourceMsgId ? String(sourceMsgId).trim() : null;
 
+  // ✅ CLEAN stored content (no "Task " prefix)
+  let cleanText = rawText;
+  if (t === "task") {
+    cleanText = cleanText
+      .replace(/^\s*task\s*-\s*/i, "")
+      .replace(/^\s*task-\s*/i, "")
+      .replace(/^\s*task\s+/i, "")
+      .trim();
+  }
+  if (!cleanText) throw new Error("Missing contentText");
+
   const tryOnce = async () => {
     return await pg.withClient(async (client) => {
-      // Ensure per-tenant allocation lock (single-flight job_no behavior)
+      // Ensure per-tenant allocation lock (single-flight allocator)
       if (typeof pg.withTenantAllocLock === "function") {
         await pg.withTenantAllocLock(tid, client);
       }
 
-      // ✅ Idempotency: if same Twilio MessageSid comes again, return existing row
+      // ✅ Idempotency pre-check (fast)
       if (msgId) {
         const existing = await client.query(
           `
@@ -154,44 +165,86 @@ async function createCrewActivityLog({
       // ✅ Allocate log_no (must exist in postgres.js)
       const logNo = await pg.allocateNextActivityLogNo(tid, client);
 
-      const ins = await client.query(
-        `
-        insert into public.chiefos_activity_logs (
-          tenant_id,
-          owner_id,
-          log_no,
-          created_by_actor_id,
-          reviewer_actor_id,
-          type,
-          source,
-          content_text,
-          structured,
-          status,
-          source_msg_id
-        )
-        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-        returning id, log_no
-        `,
-        [
-          tid,
-          oid,
-          logNo,
-          by,
-          reviewerFinal,
-          t,
-          s,
-          text, // ✅ CLEAN: should be "clean truck", not "Task clean truck"
-          structured || {},
-          String(status || "submitted"),
-          msgId,
-        ]
-      );
+      let ins;
+
+      if (msgId) {
+        // ✅ Idempotent path (predicate matches your partial unique index exactly)
+        ins = await client.query(
+          `
+          insert into public.chiefos_activity_logs (
+            tenant_id,
+            owner_id,
+            log_no,
+            created_by_actor_id,
+            reviewer_actor_id,
+            type,
+            source,
+            content_text,
+            structured,
+            status,
+            source_msg_id
+          )
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          on conflict (tenant_id, source_msg_id)
+          where (source_msg_id is not null)
+          do update set updated_at = now()
+          returning id, log_no
+          `,
+          [
+            tid,
+            oid,
+            logNo,
+            by,
+            reviewerFinal,
+            t,
+            s,
+            cleanText,
+            structured || {},
+            String(status || "submitted"),
+            msgId,
+          ]
+        );
+      } else {
+        // ✅ Non-idempotent path (no source_msg_id)
+        ins = await client.query(
+          `
+          insert into public.chiefos_activity_logs (
+            tenant_id,
+            owner_id,
+            log_no,
+            created_by_actor_id,
+            reviewer_actor_id,
+            type,
+            source,
+            content_text,
+            structured,
+            status,
+            source_msg_id
+          )
+          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          returning id, log_no
+          `,
+          [
+            tid,
+            oid,
+            logNo,
+            by,
+            reviewerFinal,
+            t,
+            s,
+            cleanText,
+            structured || {},
+            String(status || "submitted"),
+            null,
+          ]
+        );
+      }
 
       const logId = ins?.rows?.[0]?.id || null;
       const logNoOut = ins?.rows?.[0]?.log_no ?? logNo;
       if (!logId) throw new Error("Failed to create crew activity log");
 
-      // event (append-only)
+      // ✅ event (append-only)
       await client.query(
         `
         insert into public.chiefos_activity_log_events (
@@ -231,7 +284,8 @@ async function createCrewActivityLog({
   } catch (e) {
     const code = String(e?.code || "");
     const msg = String(e?.message || "");
-    const isLogNoCollision = code === "23505" && /ux_activity_logs_tenant_log_no/i.test(msg);
+    const isLogNoCollision =
+      code === "23505" && /ux_activity_logs_tenant_log_no/i.test(msg);
 
     if (!isLogNoCollision) throw e;
 

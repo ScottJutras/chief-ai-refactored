@@ -126,23 +126,27 @@ async function resolveActorIdentity({ kind, identifier }, markDegraded) {
   const k = String(kind || "").trim().toLowerCase();
   const raw = String(identifier || "").trim();
 
-  // For whatsapp: normalize to digits, but also try common stored variants
+  if (!k || !raw) return null;
+
+  // Normalize identifiers safely
   const digits = raw.replace(/\D/g, "");
+
   const candidates =
     k === "whatsapp"
       ? Array.from(
-          new Set([
-            digits,
-            raw,
-            raw.startsWith("whatsapp:") ? raw : `whatsapp:${raw}`,
-            raw.startsWith("whatsapp:+") ? raw : `whatsapp:+${digits}`,
-            raw.startsWith("+") ? raw : `+${digits}`,
-          ].filter(Boolean))
+          new Set(
+            [
+              digits,                   // 19053279955
+              "+" + digits,              // +19053279955
+              "whatsapp:+" + digits,     // whatsapp:+19053279955
+              "whatsapp:" + digits,      // whatsapp:19053279955
+              raw                        // whatever came in
+            ].filter(Boolean)
+          )
         )
       : [raw.toLowerCase()];
 
   try {
-    // IMPORTANT: select actor_id explicitly
     const { rows } = await pg.query(
       `
       select
@@ -156,7 +160,7 @@ async function resolveActorIdentity({ kind, identifier }, markDegraded) {
       from public.v_actor_identity_resolver
       where kind = $1
         and identifier = any($2::text[])
-      order by updated_at desc nulls last
+      order by (actor_id is not null) desc
       limit 1
       `,
       [k, candidates]
@@ -164,7 +168,20 @@ async function resolveActorIdentity({ kind, identifier }, markDegraded) {
 
     return rows?.[0] || null;
   } catch (e) {
-    if (markDegraded) markDegraded();
+    // Only mark degraded for real transient DB issues
+    const msg = String(e?.message || "");
+    const code = String(e?.code || "");
+
+    const looksTransient =
+      code === "57P01" || // admin_shutdown
+      code === "57P02" || // crash_shutdown
+      code === "53300" || // too_many_connections
+      /timeout|ECONNRESET|ENETUNREACH|EAI_AGAIN|connection/i.test(msg);
+
+    if (looksTransient && typeof markDegraded === "function") {
+      markDegraded();
+    }
+
     throw e;
   }
 }

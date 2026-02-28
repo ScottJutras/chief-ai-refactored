@@ -318,14 +318,16 @@ router.post("/logs/:id/needs-clarification", requireCrewControlPro(), async (req
         `
         update public.chiefos_activity_logs
            set status = 'needs_clarification',
+               reviewed_by_actor_id = $1,
+               reviewed_at = now(),
                updated_at = now(),
                structured = coalesce(structured, '{}'::jsonb) || jsonb_build_object('clarification_note', $4)
-         where tenant_id = $1
-           and id = $2
+         where tenant_id = $2
+           and id = $3
            and status in ('submitted','needs_clarification')
          returning id, log_no, status
         `,
-        [tenantId, logId, actorId, note || null]
+        [actorId, tenantId, logId, note || null]
       );
 
       if (!u?.rowCount) {

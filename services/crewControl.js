@@ -40,158 +40,209 @@ async function resolveReviewerActorId({ tenantId, creatorActorId }) {
 }
 
 /**
+ * Repair counter drift by bumping next_activity_log_no = max(log_no)+1
+ * Safe to run any time.
+ */
+async function bumpTenantCounterToMax(tenantId) {
+  const tid = String(tenantId || "").trim();
+  if (!tid) return;
+
+  try {
+    await pg.query(
+      `
+      update public.chiefos_tenant_counters c
+      set next_activity_log_no = x.next_no,
+          updated_at = now()
+      from (
+        select (coalesce(max(log_no), 0) + 1)::int as next_no
+        from public.chiefos_activity_logs
+        where tenant_id = $1
+      ) x
+      where c.tenant_id = $1::uuid
+      `,
+      [tid]
+    );
+  } catch (e) {
+    console.warn("[CREW_CONTROL] bumpTenantCounterToMax failed (ignored):", e?.message || e);
+  }
+}
+
+/**
  * Create a Crew activity log + an append-only event.
  * Idempotent per (tenant_id, source_msg_id) if source_msg_id is provided.
+ *
+ * Returns:
+ *  { ok: true, logId, logNo, reviewerActorId }
  */
 async function createCrewActivityLog({
   tenantId,
   ownerId,
   createdByActorId,
-  type,            // 'time' | 'task'
-  source,          // 'whatsapp' | 'portal' | ...
+  type, // 'time' | 'task'
+  source, // 'whatsapp' | 'portal' | ...
   contentText,
   structured = {},
   status = "submitted",
   sourceMsgId = null,
-}) {
-  if (!tenantId) throw new Error("Missing tenantId");
-  if (!ownerId) throw new Error("Missing ownerId");
-  if (!createdByActorId) throw new Error("Missing createdByActorId");
-  if (!type) throw new Error("Missing type");
-  if (!source) throw new Error("Missing source");
-  if (!String(contentText || "").trim()) throw new Error("Missing contentText");
+} = {}) {
+  // ---- Required validation (restore the stuff you accidentally removed) ----
+  const tid = String(tenantId || "").trim();
+  const oid = String(ownerId || "").trim();
+  const by = String(createdByActorId || "").trim();
+  const t = String(type || "").trim();
+  const s = String(source || "").trim();
+  const text = String(contentText || "").trim();
+
+  if (!tid) throw new Error("Missing tenantId");
+  if (!oid) throw new Error("Missing ownerId");
+  if (!by) throw new Error("Missing createdByActorId");
+  if (!t) throw new Error("Missing type");
+  if (!s) throw new Error("Missing source");
+  if (!text) throw new Error("Missing contentText");
 
   // reviewer (board assignment -> owner/admin -> null)
   let reviewerActorId = null;
   try {
     reviewerActorId = await resolveReviewerActorId({
-      tenantId,
-      creatorActorId: createdByActorId,
+      tenantId: tid,
+      creatorActorId: by,
     });
   } catch (e) {
-    console.warn("[CREW_CONTROL] resolveReviewerActorId failed:", e?.message);
+    console.warn("[CREW_CONTROL] resolveReviewerActorId failed:", e?.message || e);
     reviewerActorId = null;
   }
 
   // ✅ fallback to self-review (prevents capture from breaking in half-configured tenants)
-  const reviewerFinal = reviewerActorId || createdByActorId;
+  const reviewerFinal = reviewerActorId || by;
   if (!reviewerActorId) {
-    console.warn("[CREW_CONTROL] reviewer fallback to self", { tenantId, createdByActorId });
+    console.warn("[CREW_CONTROL] reviewer fallback to self", { tenantId: tid, createdByActorId: by });
   }
 
-  const tid = String(tenantId).trim();
-  const oid = String(ownerId).trim();
+  const msgId = sourceMsgId ? String(sourceMsgId).trim() : null;
 
-  // ✅ One transaction so: allocate log_no + insert log + insert event is consistent
-  return await pg.withClient(async (client) => {
-    // Lock per-tenant so numbering is sequential and collision-free
-    if (typeof pg.withTenantAllocLock === "function") {
-      await pg.withTenantAllocLock(tid, client);
-    }
-
-    // If idempotent key exists, return existing row (and its log_no) instead of updating
-    if (sourceMsgId) {
-      const existing = await client.query(
-        `
-        select id, log_no
-          from public.chiefos_activity_logs
-         where tenant_id = $1
-           and source_msg_id = $2
-         limit 1
-        `,
-        [tid, String(sourceMsgId)]
-      );
-      if (existing?.rowCount) {
-        return { ok: true, logId: existing.rows[0].id, logNo: existing.rows[0].log_no, reviewerActorId: reviewerFinal };
+  const tryOnce = async () => {
+    return await pg.withClient(async (client) => {
+      // Ensure per-tenant allocation lock (single-flight job_no behavior)
+      if (typeof pg.withTenantAllocLock === "function") {
+        await pg.withTenantAllocLock(tid, client);
       }
-    }
 
-    // Allocate a new per-tenant log number (preferred)
-    let logNo = null;
-    if (typeof pg.allocateNextActivityLogNo === "function") {
-      logNo = await pg.allocateNextActivityLogNo(tid, client);
-    } else {
-      // fallback: derive from existing rows (not ideal, but keeps it alive)
-      const r = await client.query(
-        `select coalesce(max(log_no), 0)::int + 1 as next_no
-           from public.chiefos_activity_logs
-          where tenant_id=$1`,
-        [tid]
-      );
-      logNo = Number(r?.rows?.[0]?.next_no || 1);
-    }
+      // ✅ Idempotency: if same Twilio MessageSid comes again, return existing row
+      if (msgId) {
+        const existing = await client.query(
+          `
+          select id, log_no
+            from public.chiefos_activity_logs
+           where tenant_id = $1
+             and source_msg_id = $2
+           limit 1
+          `,
+          [tid, msgId]
+        );
 
-    // Insert log
-    const ins = await client.query(
-      `
-      insert into public.chiefos_activity_logs (
-        tenant_id,
-        owner_id,
-        log_no,
-        created_by_actor_id,
-        reviewer_actor_id,
-        type,
-        source,
-        content_text,
-        structured,
-        status,
-        source_msg_id
-      )
-      values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-      returning id, log_no
-      `,
-      [
-        tid,
-        oid,
-        logNo,
-        createdByActorId,
-        reviewerFinal,
-        String(type),
-        String(source),
-        String(contentText).trim(),
-        structured || {},
-        String(status),
-        sourceMsgId ? String(sourceMsgId) : null,
-      ]
-    );
+        if (existing?.rowCount) {
+          return {
+            ok: true,
+            logId: existing.rows[0].id,
+            logNo: existing.rows[0].log_no,
+            reviewerActorId: reviewerFinal,
+            deduped: true,
+          };
+        }
+      }
 
-    const logId = ins?.rows?.[0]?.id || null;
-    const logNoOut = ins?.rows?.[0]?.log_no ?? logNo;
+      // ✅ Allocate log_no (must exist in postgres.js)
+      const logNo = await pg.allocateNextActivityLogNo(tid, client);
 
-    if (!logId) throw new Error("Failed to create crew activity log");
-
-    // event (append-only)
-    await client.query(
-      `
-      insert into public.chiefos_activity_log_events (
-        tenant_id,
-        owner_id,
-        log_id,
-        event_type,
-        actor_id,
-        payload
-      )
-      values ($1,$2,$3,$4,$5,$6)
-      `,
-      [
-        tid,
-        oid,
-        logId,
-        "created",
-        createdByActorId,
-        {
+      const ins = await client.query(
+        `
+        insert into public.chiefos_activity_logs (
+          tenant_id,
+          owner_id,
+          log_no,
+          created_by_actor_id,
+          reviewer_actor_id,
           type,
           source,
+          content_text,
+          structured,
           status,
-          reviewer_actor_id: reviewerFinal,
-          source_msg_id: sourceMsgId || null,
-          log_no: logNoOut || null,
-        },
-      ]
-    );
+          source_msg_id
+        )
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        returning id, log_no
+        `,
+        [
+          tid,
+          oid,
+          logNo,
+          by,
+          reviewerFinal,
+          t,
+          s,
+          text, // ✅ CLEAN: should be "clean truck", not "Task clean truck"
+          structured || {},
+          String(status || "submitted"),
+          msgId,
+        ]
+      );
 
-    return { ok: true, logId, logNo: logNoOut, reviewerActorId: reviewerFinal };
-  });
+      const logId = ins?.rows?.[0]?.id || null;
+      const logNoOut = ins?.rows?.[0]?.log_no ?? logNo;
+      if (!logId) throw new Error("Failed to create crew activity log");
+
+      // event (append-only)
+      await client.query(
+        `
+        insert into public.chiefos_activity_log_events (
+          tenant_id,
+          owner_id,
+          log_id,
+          event_type,
+          actor_id,
+          payload
+        )
+        values ($1,$2,$3,$4,$5,$6)
+        `,
+        [
+          tid,
+          oid,
+          logId,
+          "created",
+          by,
+          {
+            type: t,
+            source: s,
+            status: String(status || "submitted"),
+            reviewer_actor_id: reviewerFinal,
+            source_msg_id: msgId,
+            log_no: logNoOut,
+          },
+        ]
+      );
+
+      return { ok: true, logId, logNo: logNoOut, reviewerActorId: reviewerFinal, deduped: false };
+    });
+  };
+
+  // ✅ retry once if log_no collided (counter drift)
+  try {
+    return await tryOnce();
+  } catch (e) {
+    const code = String(e?.code || "");
+    const msg = String(e?.message || "");
+    const isLogNoCollision = code === "23505" && /ux_activity_logs_tenant_log_no/i.test(msg);
+
+    if (!isLogNoCollision) throw e;
+
+    console.warn("[CREW_CONTROL] log_no collision → repairing counter and retrying", {
+      tenantId: tid,
+      sourceMsgId: msgId,
+    });
+
+    await bumpTenantCounterToMax(tid);
+    return await tryOnce();
+  }
 }
 
 module.exports = {

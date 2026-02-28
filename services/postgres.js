@@ -1787,28 +1787,24 @@ async function withTenantAllocLock(tenantId, client) {
 }
 
 async function allocateNextActivityLogNo(tenantId, client) {
-  // Ensure counter row exists, then atomically increment & return previous value
   const tid = String(tenantId || "").trim();
   if (!tid) throw new Error("Missing tenantId for allocateNextActivityLogNo");
 
-  // Create row if missing
-  await client.query(
-    `
-    insert into public.chiefos_tenant_counters (tenant_id, next_activity_log_no, updated_at)
-    values ($1, 1, now())
-    on conflict (tenant_id) do nothing
-    `,
-    [tid]
-  );
-
-  // Increment and return the allocated number = previous next_activity_log_no
+  // Atomic upsert: allocate current value, then advance counter.
+  // If row doesn't exist, start at 1 and advance to 2.
   const r = await client.query(
     `
-    update public.chiefos_tenant_counters
-       set next_activity_log_no = next_activity_log_no + 1,
-           updated_at = now()
-     where tenant_id = $1
-     returning (next_activity_log_no - 1) as allocated_no
+    insert into public.chiefos_tenant_counters (tenant_id, next_activity_log_no, updated_at)
+    values ($1, 2, now())
+    on conflict (tenant_id)
+    do update
+      set next_activity_log_no = public.chiefos_tenant_counters.next_activity_log_no + 1,
+          updated_at = now()
+    returning
+      case
+        when xmax = 0 then 1                         -- inserted path allocates 1
+        else (public.chiefos_tenant_counters.next_activity_log_no - 1) -- update path allocates previous
+      end as allocated_no
     `,
     [tid]
   );

@@ -217,6 +217,15 @@ function looksLikeUuid(str) {
   );
 }
 
+function ownerKey(ownerId) {
+  return String(ownerId || "").trim();
+}
+
+function ownerDigitsOrNull(ownerId) {
+  const d = String(ownerId || "").replace(/\D/g, "");
+  return d || null;
+}
+
 // ---------------- Tenant mapping helpers ----------------
 
 /**
@@ -1773,11 +1782,14 @@ async function allocateNextJobNo(owner, client) {
 
 // Find or create a job by name (case-insensitive on name or job_name).
 async function ensureJobByName(ownerId, name) {
-  const owner = DIGITS(ownerId);
-  const jobNameRaw = String(name || '').trim();
+  // ✅ Jobs table appears legacy-keyed by digits (varchar(20) + FK to users.user_id)
+  const owner = ownerDigitsOrNull(ownerId);
+  const jobNameRaw = String(name || "").trim();
+
+  // Fail closed if we can't produce the legacy owner key
   if (!owner || !jobNameRaw) return null;
 
-  const jobName = jobNameRaw.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+  const jobName = jobNameRaw.replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
   const lc = jobName.toLowerCase();
 
   // ✅ HARD GUARDRAIL: refuse poison names (tokens / commands / error/debug strings)
@@ -1786,37 +1798,37 @@ async function ensureJobByName(ownerId, name) {
     /^jobno_\d+$/i.test(lc) ||
     /^job_\d+_[0-9a-z]+$/i.test(lc) ||
     /^#\s*\d+\b/.test(lc) ||
-    lc === 'cancel' ||
-    lc === 'show active jobs' ||
-    lc === 'active jobs' ||
-    lc === 'change job' ||
-    lc === 'switch job' ||
-    lc === 'pick job' ||
-    lc === 'more' ||
-    lc === 'overhead';
+    lc === "cancel" ||
+    lc === "show active jobs" ||
+    lc === "active jobs" ||
+    lc === "change job" ||
+    lc === "switch job" ||
+    lc === "pick job" ||
+    lc === "more" ||
+    lc === "overhead";
 
   const looksLikeErrorText =
-    lc.includes('should succeed') ||
-    lc.includes('owner_id') ||
-    lc.includes('missing owner') ||
-    lc.includes('missing ownerid') ||
-    lc.includes('assert') ||
-    lc.includes('operator does not exist') ||
-    lc.includes('require stack') ||
-    lc.includes('stack') ||
-    lc.includes('exception') ||
-    lc.includes('error') ||
-    lc.includes('failed') ||
-    lc.includes('counter should stamp');
+    lc.includes("should succeed") ||
+    lc.includes("owner_id") ||
+    lc.includes("missing owner") ||
+    lc.includes("missing ownerid") ||
+    lc.includes("assert") ||
+    lc.includes("operator does not exist") ||
+    lc.includes("require stack") ||
+    lc.includes("stack") ||
+    lc.includes("exception") ||
+    lc.includes("error") ||
+    lc.includes("failed") ||
+    lc.includes("counter should stamp");
 
   // Extra: looks like an expense sentence, not a job name
   const looksLikeSentence =
-    lc.includes('$') ||
+    lc.includes("$") ||
     /\b\d{4}-\d{2}-\d{2}\b/.test(lc) ||
     /\b(expense|revenue|paid|spent|bought|purchased|received|worth|from|at|today|yesterday|tomorrow)\b/.test(lc);
 
   if (looksLikeTokenGarbage || looksLikeErrorText || looksLikeSentence) {
-    console.warn('[PG/ensureJobByName] refusing poison job name', { jobName });
+    console.warn("[PG/ensureJobByName] refusing poison job name", { jobName });
     return null;
   }
 
@@ -1856,7 +1868,7 @@ async function ensureJobByName(ownerId, name) {
       );
       return ins.rows[0];
     } catch (e) {
-      if (e && e.code === '23505') {
+      if (e && e.code === "23505") {
         const final = await client.query(
           `SELECT id, job_no, COALESCE(name, job_name) AS name, active AS is_active
              FROM public.jobs
@@ -2246,13 +2258,14 @@ try {
 
 // Upsert a job by name, deactivate others, and activate this one
 async function activateJobByName(ownerId, rawName) {
-  const owner = DIGITS(ownerId);
-  const name = String(rawName || '').trim();
-  if (!name) throw new Error('Missing job name');
+  const owner = ownerDigitsOrNull(ownerId);
+if (!owner) throw new Error("Missing ownerId (digits) for jobs subsystem");
+  const name = String(rawName || "").trim();
+  if (!name) throw new Error("Missing job name");
 
-  const j = await ensureJobByName(owner, name);
+  const j = await ensureJobByName(owner, name); // ensureJobByName must also accept owner as text
   const jobNo = j?.job_no;
-  if (!jobNo) throw new Error('Failed to create/resolve job');
+  if (!jobNo) throw new Error("Failed to create/resolve job");
 
   await withClient(async (client) => {
     await client.query(
@@ -2277,6 +2290,7 @@ async function activateJobByName(ownerId, rawName) {
       LIMIT 1`,
     [owner, jobNo]
   );
+
   return rows[0] || { id: j?.id || null, job_no: jobNo, name, active: true };
 }
 
@@ -2296,8 +2310,8 @@ async function detectUserActiveJobTable() {
 }
 
 async function getActiveJob(ownerId, userId = null) {
-  const owner = DIGITS(ownerId);
-  if (!owner) return null;
+  const owner = ownerDigitsOrNull(ownerId);
+if (!owner) throw new Error("Missing ownerId (digits) for jobs subsystem");
 
   // per-user active job if available
   if (userId && (await detectUserActiveJobTable())) {
@@ -2319,7 +2333,7 @@ async function getActiveJob(ownerId, userId = null) {
       const { rows } = await query(sql, [owner, String(userId)]);
       if (rows?.[0]) return rows[0];
     } catch (e) {
-      console.warn('[PG/getActiveJob] user_active_job lookup failed (ignored):', e?.message);
+      console.warn("[PG/getActiveJob] user_active_job lookup failed (ignored):", e?.message);
     }
   }
 
@@ -2347,10 +2361,10 @@ async function getActiveJob(ownerId, userId = null) {
  * - user_active_job.job_id stores job_no (INT or TEXT)
  */
 async function setActiveJob(ownerId, userId, jobRef) {
-  const owner = DIGITS(ownerId);
-  if (!owner) throw new Error('Missing ownerId');
+  const owner = ownerDigitsOrNull(ownerId);
+if (!owner) throw new Error("Missing ownerId (digits) for jobs subsystem");
 
-  const ref = String(jobRef || '').trim();
+  const ref = String(jobRef || "").trim();
 
   // 1) Per-user active job (preferred) if table exists
   if (userId && (await detectUserActiveJobTable())) {
@@ -2374,7 +2388,7 @@ async function setActiveJob(ownerId, userId, jobRef) {
         return true;
       }
     } catch (e) {
-      console.warn('[PG/setActiveJob] user_active_job upsert failed (ignored):', e?.message);
+      console.warn("[PG/setActiveJob] user_active_job upsert failed (ignored):", e?.message);
       // fall through to owner-wide activation
     }
   }
@@ -2384,7 +2398,7 @@ async function setActiveJob(ownerId, userId, jobRef) {
   if (/^\d+$/.test(ref)) jobNo = Number(ref);
   else if (ref) jobNo = (await ensureJobByName(owner, ref))?.job_no ?? null;
 
-  if (!jobNo) throw new Error('Could not resolve job');
+  if (!jobNo) throw new Error("Could not resolve job");
 
   await withClient(async (client) => {
     await client.query(

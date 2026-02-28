@@ -171,23 +171,34 @@ async function listOpenJobsCount(ownerId) {
   return rows?.[0]?.n ?? 0;
 }
 
-async function bestEffortCreateJob({ ownerId, jobName, actorId }) {
+async function bestEffortCreateJob({ ownerId, jobName, actorId, actorUuid = null, sourceMsgId = null }) {
   const name = String(jobName || "").trim();
   if (!name) return { ok: false, error: "missing_name" };
 
+  // actorId here is your legacy identity digits (fine for now)
+  // actorUuid is not used by jobs yet — carried for future alignment
+
   try {
     if (typeof pg.createJobIdempotent === "function") {
-      const out = await pg.createJobIdempotent(ownerId, name, actorId);
+      const out = await pg.createJobIdempotent({
+        ownerId,
+        jobName: name,
+        sourceMsgId: sourceMsgId || null,
+      });
       return { ok: true, out };
     }
-  } catch {}
+  } catch (e) {
+    // fall through
+  }
 
   try {
     if (typeof pg.createJob === "function") {
       const out = await pg.createJob(ownerId, name, actorId);
       return { ok: true, out };
     }
-  } catch {}
+  } catch (e) {
+    // fall through
+  }
 
   try {
     const { rows } = await dbQuery(
@@ -228,7 +239,7 @@ async function sendWhatsAppVideo({ fromPhone, videoUrl, caption }) {
  *   { handled: true, replyText: '...' }  -> webhook should respond with this and STOP
  *   { handled: false }                  -> webhook continues normal routing
  */
-async function handleOnboardingInbound({ ownerId, fromPhone, text2, tz, userProfile }) {
+async function handleOnboardingInbound({ ownerId, fromPhone, text2, tz, userProfile, actorKey = null, actorId = null }) {
   const raw = String(text2 || "").trim();
   const lc = raw.toLowerCase();
 
@@ -342,11 +353,21 @@ async function handleOnboardingInbound({ ownerId, fromPhone, text2, tz, userProf
       return { handled: true, replyText: `Reply with a job name like: Oak Street Re-roof` };
     }
 
-    const created = await bestEffortCreateJob({
-      ownerId,
-      jobName,
-      actorId: String(userProfile?.user_id || userProfile?.wa_id || fromPhone || ownerId),
-    });
+    const identityDigits =
+  String(actorKey || "").replace(/\D/g, "") ||
+  String(fromPhone || "").replace(/\D/g, "") ||
+  String(ownerId || "").replace(/\D/g, "");
+
+const created = await bestEffortCreateJob({
+  ownerId,
+  jobName,
+
+  // ✅ for current pg.createJobIdempotent/createJob helpers (they expect identity digits in your codebase)
+  actorId: identityDigits,
+
+  // ✅ optional: preserve canonical actor uuid for future use (not used by current helpers)
+  actorUuid: actorId ? String(actorId) : null,
+});
 
     if (!created?.ok) {
       return {
@@ -422,3 +443,6 @@ async function handleOnboardingInbound({ ownerId, fromPhone, text2, tz, userProf
 
   return { handled: false };
 }
+module.exports = {
+  handleOnboardingInbound,
+};

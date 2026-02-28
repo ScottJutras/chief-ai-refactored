@@ -45,7 +45,6 @@ const { normalizeTranscriptMoney, stripLeadingFiller } = require('../utils/trans
 const twilioSvc = require('../services/twilio');
 const sendWhatsApp = twilioSvc.sendWhatsApp;
 const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
-const { handleOnboardingInbound } = require('../handlers/commands/onboarding');
 const { buildCommandsMessage } = require("../services/commands_message");
 /* ---------------- Small helpers ---------------- */
 // ✅ XML escape helper for TwiML (single source of truth in this file)
@@ -1458,52 +1457,58 @@ router.post('*', (req, res, next) => {
 
 router.use((req, res, next) => {
   try {
-    const token = require('../middleware/token');
-    const prof = require('../middleware/userProfile');
-    const lock = require('../middleware/lock');
+    const token = require("../middleware/token");
+    const prof = require("../middleware/userProfile");
+    const lock = require("../middleware/lock");
 
-    res.locals.phase = 'token';
+    res.locals.phase = "token";
     res.locals.phaseAt = Date.now();
-    req._phase = 'token';
+    req._phase = "token";
 
     token.tokenMiddleware(req, res, () => {
-      res.locals.phase = 'userProfile';
+      res.locals.phase = "userProfile";
       res.locals.phaseAt = Date.now();
-      req._phase = 'userProfile';
+      req._phase = "userProfile";
 
-      middlewareWithDeadline(prof.userProfileMiddleware, { ms: 2500, name: 'userProfile' })(req, res, () => {
-  // ✅ WHOAMI debug (remove after you confirm gating)
-  try {
-    console.info('[WHOAMI_CTX]', {
-      from: req.from || null,
-      actorKey: req.actorKey || null,
-      waId: req.body?.WaId || req.body?.WaID || null,
-      profileName: req.body?.ProfileName || null,
-      ownerId: req.ownerId || null,
-      isOwner: !!req.isOwner,
-      actorId: req.actorId || null,
-      tenantId: req.tenantId || null,
-      role: req.userProfile?.role || req.userProfile?.user_role || null,
-      userId: req.userProfile?.user_id || req.userProfile?.id || null
+      middlewareWithDeadline(prof.userProfileMiddleware, { ms: 2500, name: "userProfile" })(
+        req,
+        res,
+        () => {
+          // ✅ WHOAMI debug (remove after you confirm gating)
+          try {
+            console.info("[WHOAMI_CTX]", {
+              from: req.from || null,
+              actorKey: req.actorKey || null, // may be digits depending on your stack
+              waId: req.body?.WaId || req.body?.WaID || null,
+              profileName: req.body?.ProfileName || null,
+              ownerId: req.ownerId || null,
+              isOwner: !!req.isOwner,
+
+              // ✅ the two fields we care about for Crew+Control gating
+              actorId: req.actorId || null,
+              tenantId: req.tenantId || null,
+
+              role: req.userProfile?.role || req.userProfile?.user_role || null,
+              userId: req.userProfile?.user_id || req.userProfile?.id || null,
+            });
+          } catch {}
+
+          res.locals.phase = "lock";
+          res.locals.phaseAt = Date.now();
+          req._phase = "lock";
+
+          lock.lockMiddleware(req, res, () => {
+            res.locals.phase = "router";
+            res.locals.phaseAt = Date.now();
+            req._phase = "router";
+
+            next();
+          });
+        }
+      );
     });
-  } catch {}
-
-  res.locals.phase = 'lock';
-    res.locals.phaseAt = Date.now();
-    req._phase = 'lock';
-
-    lock.lockMiddleware(req, res, () => {
-      res.locals.phase = 'router';
-      res.locals.phaseAt = Date.now();
-      req._phase = 'router';
-
-      next();
-    });
-  });
-});
-
   } catch (e) {
-    console.warn('[WEBHOOK] light middlewares skipped:', e?.message);
+    console.warn("[WEBHOOK] light middlewares skipped:", e?.message);
     next();
   }
 });
@@ -1680,7 +1685,7 @@ try {
 
     // Fail closed unless actor identity system is active
     if (hasTenant && hasActor) {
-      const isTaskCmd = /^task\b/i.test(lc2) || /^\s*task\s*-\s*/i.test(text2);
+      const isTaskCmd = /^task\b/i.test(lc2) || /^\s*task\s*-\s*/i.test(text2) || /^\s*task-\s*/i.test(text2);
       const isTimeCmd = /^time\b/i.test(lc2) || /^clock\s*(in|out)\b/i.test(lc2);
 
       if (isTaskCmd || isTimeCmd) {
@@ -2233,27 +2238,56 @@ if (!req.ownerId) {
     });
 /* -----------------------------------------------------------------------
  * ✅ ONBOARDING INTERCEPT (fast magic moment)
- * - Runs only when onboarding.stage != done
- * - Never blocks real usage once they start (falls through)
+ * - Owner-only
+ * - Runs only when onboarding.stage != done (inside handler)
+ * - Never blocks real usage once they start (handler returns handled:false)
  * ----------------------------------------------------------------------- */
 try {
-  const tzSafe =
-    String(req?.tz || req?.userProfile?.timezone || req?.ownerProfile?.timezone || '').trim() ||
-    'America/Toronto';
+  // ✅ Owner-only: never onboard employees/board members
+  if (!!req.isOwner && req.ownerId) {
+    // Load lazily so a missing file can't crash the whole router
+    const obMod = require("../handlers/commands/onboarding");
+    const handleOnboardingInbound =
+      obMod?.handleOnboardingInbound ||
+      obMod?.default ||
+      null;
 
-  const ob = await handleOnboardingInbound({
-    ownerId: req.ownerId,
-    fromPhone: req.from,        // e164 or whatsapp:+e164 depending on your req.from
-    text2,
-    tz: tzSafe,
-    userProfile: req.userProfile || null
-  });
+    if (typeof handleOnboardingInbound === "function") {
+      const tzSafe =
+        String(
+          req?.tz ||
+            req?.userProfile?.tz ||
+            req?.userProfile?.timezone ||
+            req?.ownerProfile?.tz ||
+            req?.ownerProfile?.timezone ||
+            ""
+        ).trim() || "America/Toronto";
 
-  if (ob?.handled && ob?.replyText) {
-    return ok(res, ob.replyText);
+      const ob = await handleOnboardingInbound({
+  ownerId: String(req.ownerId),
+  fromPhone: req.from,
+  text2,
+  tz: tzSafe,
+
+  // ✅ legacy identity key (digits) used by existing jobs/tasks system
+  actorKey: String(req.actorKey || req.from || "").replace(/\D/g, "") || null,
+
+  // ✅ canonical actor uuid (used by Crew+Control + future alignment)
+  actorId: req.actorId || null,
+
+  userProfile: req.userProfile || null,
+});
+
+      if (ob?.handled && String(ob?.replyText || "").trim()) {
+        return ok(res, String(ob.replyText).trim());
+      }
+    } else {
+      // If it isn't a function, log once (helps catch export/import mismatches)
+      console.warn("[ONBOARDING] handler missing or not a function");
+    }
   }
 } catch (e) {
-  console.warn('[ONBOARDING] failed (ignored):', e?.message);
+  console.warn("[ONBOARDING] failed (ignored):", e?.message);
 }
     // -----------------------------------------------------------------------
     // "resume" => re-send the pending confirm card if we have a confirm pending-action

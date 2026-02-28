@@ -19,6 +19,7 @@ const pg = require('../services/postgres');
 const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
 const DEFAULT_TZ = 'America/Toronto';
 
+
 /* ------------------------ tiny in-memory cache ------------------------ */
 /**
  * 5–10 min memory helps during provider hiccups.
@@ -201,7 +202,8 @@ async function userProfileMiddleware(req, _res, next) {
     req.ownerId = req.ownerId || null;
     req.userProfile = null;
     req.ownerProfile = null;
-
+    req.actorId = null;
+    
     // new flag
     req.dbDegraded = false;
 
@@ -217,6 +219,9 @@ async function userProfileMiddleware(req, _res, next) {
       req.ownerId = cached.ownerId;
       req.isOwner = !!cached.isOwner;
       req.tz = cached.tz || DEFAULT_TZ;
+
+  // ✅ ADD THIS
+      req.actorId = cached.actorId || null;
 
       const plan = String(cached.plan || 'free').trim().toLowerCase();
       const plan_key = cached?.plan_key ?? null;
@@ -273,6 +278,8 @@ async function userProfileMiddleware(req, _res, next) {
       req.ownerId = normalizeDigits(resolved.owner_phone_digits) || from; // legacy compat
       req.isOwner = String(resolved.role || '').toLowerCase() === 'owner';
       req.tz = pickTz(resolved) || DEFAULT_TZ;
+      req.actorId = resolved.actor_id || null;
+
 
       let plan = 'free';
       let plan_key = null;
@@ -322,11 +329,12 @@ async function userProfileMiddleware(req, _res, next) {
       // ✅ Attach raw plan truth for downstream gating/debugging
       req.ownerProfile.plan_key = plan_key;
       req.ownerProfile.sub_status = sub_status;
-
+          
       // ✅ Cache positive mapping for outage resilience
       cacheSet(from, {
         tenantId: req.tenantId,
         ownerId: req.ownerId,
+        actorId: req.actorId,          // ✅ correct
         isOwner: req.isOwner,
         tz: req.tz,
         role: resolved.role || null,
@@ -366,8 +374,9 @@ async function userProfileMiddleware(req, _res, next) {
 
       // ✅ Cache positive mapping for outage resilience
       cacheSet(from, {
-        tenantId: null, // legacy may not have tenantId
+        tenantId: null,
         ownerId,
+        actorId: null,                 // optional, explicit
         isOwner: req.isOwner,
         tz: req.tz,
         role,

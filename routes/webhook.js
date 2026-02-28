@@ -1341,7 +1341,7 @@ router.use((req, res, next) => {
 
   // track phase timing
   const startedAt = Date.now();
-  const messageSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
+  const safetyMessageSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
 
   res.locals._safety = setTimeout(() => {
     if (res.headersSent) return;
@@ -1628,6 +1628,9 @@ router.post('*', async (req, res, next) => {
     req.body.ResolvedInboundText = text2;
     let lc2 = text2.toLowerCase();
 
+  
+
+
        /* -----------------------------------------------------------------------
      * ✅ Canonical post-media refresh (EARLY)
      * - Runs immediately after resolveInboundTextFromTwilio()
@@ -1657,8 +1660,57 @@ router.post('*', async (req, res, next) => {
         console.info('[ROUTER_PICKER_TOKEN_PRESERVED_EARLY]', { token: resolved0.slice(0, 80) });
       }
     }
+    // ✅ Compute messageSid ONCE (used by everything below)
+const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
+const messageSid =
+  rawSid ||
+  crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
 
-   
+ // (D) CREW+CONTROL FAST PATH (task/time → activity logs)
+// - requires actor identity + tenant mapping
+// - does NOT replace existing systems; just captures a crew-auditable log stream
+try {
+  const crewEnabled = String(process.env.FEATURE_CREW_CONTROL || "0") === "1";
+
+  if (crewEnabled) {
+    const hasTenant = !!req.tenantId;
+    const hasActor = !!req.actorId;
+
+    // Fail closed unless actor identity system is active
+    if (hasTenant && hasActor) {
+      const isTaskCmd = /^task\b/i.test(lc2) || /^\s*task\s*-\s*/i.test(text2);
+      const isTimeCmd = /^time\b/i.test(lc2) || /^clock\s*(in|out)\b/i.test(lc2);
+
+      if (isTaskCmd || isTimeCmd) {
+  // ✅ enforce idempotency key for WhatsApp capture
+  if (!messageSid) return ok(res, "⚠️ Missing message id. Try again.");
+
+  const { createCrewActivityLog } = require("../services/crewControl");
+
+        const type = isTaskCmd ? "task" : "time";
+        const content = String(text2 || "").trim();
+
+        const structured = { raw: content, detected: { isTaskCmd, isTimeCmd } };
+
+        await createCrewActivityLog({
+          tenantId: req.tenantId,
+          ownerId: req.ownerId,
+          createdByActorId: req.actorId,
+          type,
+          source: "whatsapp",
+          contentText: content,
+          structured,
+          status: "submitted",
+          sourceMsgId: messageSid || null,
+        });
+
+        return ok(res, type === "task" ? "✅ Task logged for review." : "✅ Time log captured for review.");
+      }
+    }
+  }
+} catch (e) {
+  console.warn("[CREW_CONTROL] capture failed (ignored):", e?.message);
+}
 
     // ✅ Hard time command classification (uses lc2)
     let isHardTimeCommand = looksHardTimeCommand(lc2);
@@ -2107,11 +2159,7 @@ if (/^chiefonboarding\b/i.test(lc2Clean)) {
     return ok(res, `⚠️ Could not reset onboarding. ${e?.message || ""}`.trim());
   }
 }
-    // ✅ Compute messageSid ONCE (used by everything below)
-    const rawSid = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim();
-    const messageSid =
-      rawSid ||
-      crypto.createHash('sha256').update(`${req.from || ''}|${text2}`).digest('hex').slice(0, 32);
+
 
     // -----------------------------------------------------------------------
     // ✅ LINK CODE REDEEM (must run EARLY, and MUST work even when unlinked)

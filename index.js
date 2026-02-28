@@ -51,7 +51,7 @@ const billingRouter = require("./routes/billing");
 const accountRouter = require("./routes/account");
 const receiptsRouter = require("./routes/receipts");
 const portalRouter = require("./routes/portal");
-
+const crewRouter = require("./routes/crew");
 const app = express();
 
 if (!process.env.VERCEL) {
@@ -116,6 +116,8 @@ app.use(receiptsRouter);
 
 // ✅ Portal routes (this provides /api/whoami etc.)
 app.use("/api", portalRouter);
+
+app.use("/api/crew", crewRouter);
 
 // AskChief defines POST /api/ask-chief internally
 app.use(askChiefRouter);

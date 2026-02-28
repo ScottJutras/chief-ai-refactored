@@ -1,6 +1,6 @@
 // middleware/requirePortalUser.js
 const { createClient } = require("@supabase/supabase-js");
-
+const pg = require("../services/postgres");
 function mustEnv(name) {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env var: ${name}`);
@@ -81,7 +81,47 @@ async function requirePortalUser(req, res, next) {
 
     // Optional convenience: many of your systems key owner by digits
     req.ownerId = DIGITS(tenant.owner_id || "") || null;
+    // 4) Resolve portal actorId by email identity (preferred)
+try {
+  const email = String(user.email || "").trim().toLowerCase();
+  if (email) {
+    const r = await pg.query(
+      `
+      select actor_id
+      from public.v_actor_identity_resolver
+      where kind = 'email'
+        and identifier = $1
+        and tenant_id = $2
+      limit 1
+      `,
+      [email, tenant.id]
+    );
 
+    req.actorId = r?.rows?.[0]?.actor_id || null;
+  }
+} catch (e) {
+  console.warn("[PORTAL_ACTOR_RESOLVE] failed:", e?.message);
+}
+
+// 5) If still missing and owner/admin, fallback to tenant owner/admin actor
+if (!req.actorId && req.tenantId && (req.portalRole === "owner" || req.portalRole === "admin")) {
+  try {
+    const r2 = await pg.query(
+      `
+      select actor_id
+      from public.chiefos_tenant_actors
+      where tenant_id = $1
+        and role in ('owner','admin')
+      order by case role when 'owner' then 0 else 1 end
+      limit 1
+      `,
+      [req.tenantId]
+    );
+    req.actorId = r2?.rows?.[0]?.actor_id || null;
+  } catch (e) {
+    console.warn("[PORTAL_ACTOR_FALLBACK] failed:", e?.message);
+  }
+}
     // Save token for downstream calls if needed
     req.supabaseAccessToken = token;
 

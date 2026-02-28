@@ -8,11 +8,15 @@ const TTL_MS = 8_000;
 function _now() { return Date.now(); }
 
 function _key(req) {
+  const tenant = req?.tenantId || req?.tenant_id || null;
+  if (tenant) return `lock:tenant:${String(tenant)}`;
+
   const owner =
     (req && (req.owner_id || req.ownerId)) ||
     (req && req.from) ||
     'GLOBAL';
-  return `lock:${String(owner).trim() || 'GLOBAL'}`;
+
+  return `lock:owner:${String(owner).trim() || 'GLOBAL'}`;
 }
 
 function releaseLock(keyOrReq) {

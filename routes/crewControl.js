@@ -251,14 +251,15 @@ router.post("/logs/:id/reject", requireCrewControlPro(), async (req, res) => {
     const out = await pg.withClient(async (client) => {
       await assertCanReview({ tenantId, actorId, logId }, client);
 
-      const u = await client.query(
+            const u = await client.query(
         `
         update public.chiefos_activity_logs
            set status = 'rejected',
                reviewed_by_actor_id = $1,
                reviewed_at = now(),
                updated_at = now(),
-               structured = coalesce(structured, '{}'::jsonb) || jsonb_build_object('rejection_reason', $4)
+               structured = coalesce(structured, '{}'::jsonb)
+                 || jsonb_build_object('rejection_reason', $4::text)
          where tenant_id = $2
            and id = $3
            and status in ('submitted','needs_clarification')
@@ -314,14 +315,15 @@ router.post("/logs/:id/needs-clarification", requireCrewControlPro(), async (req
     const out = await pg.withClient(async (client) => {
       await assertCanReview({ tenantId, actorId, logId }, client);
 
-      const u = await client.query(
+            const u = await client.query(
         `
         update public.chiefos_activity_logs
            set status = 'needs_clarification',
                reviewed_by_actor_id = $1,
                reviewed_at = now(),
                updated_at = now(),
-               structured = coalesce(structured, '{}'::jsonb) || jsonb_build_object('clarification_note', $4)
+               structured = coalesce(structured, '{}'::jsonb)
+                 || jsonb_build_object('clarification_note', $4::text)
          where tenant_id = $2
            and id = $3
            and status in ('submitted','needs_clarification')

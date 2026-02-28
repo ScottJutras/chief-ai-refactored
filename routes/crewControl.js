@@ -95,7 +95,8 @@ async function assertCanReview({ tenantId, actorId, logId }, client) {
 
 /**
  * GET /api/crew/inbox
- * Returns pending logs for reviewer (board) or full pending for owner/admin.
+ * Returns pending logs for reviewer (board) or all pending for owner/admin.
+ * ✅ JOIN fixed: chiefos_tenant_actors uses actor_id (not id).
  */
 router.get("/inbox", requireCrewControlPro(), async (req, res) => {
   try {
@@ -103,7 +104,6 @@ router.get("/inbox", requireCrewControlPro(), async (req, res) => {
 
     const out = await pg.withClient(async (client) => {
       const role = await getActorRole({ tenantId, actorId }, client);
-
       const isOwnerAdmin = canOverrideInbox(role);
 
       const q = isOwnerAdmin
@@ -119,11 +119,12 @@ router.get("/inbox", requireCrewControlPro(), async (req, res) => {
             l.created_at,
             l.created_by_actor_id,
             l.reviewer_actor_id,
+            l.source_msg_id,
             a_creator.role as creator_role
           from public.chiefos_activity_logs l
           left join public.chiefos_tenant_actors a_creator
             on a_creator.tenant_id = l.tenant_id
-           and a_creator.id = l.created_by_actor_id
+           and a_creator.actor_id = l.created_by_actor_id  -- ✅ FIXED
           where l.tenant_id = $1
             and l.status in ('submitted','needs_clarification')
           order by l.created_at desc
@@ -141,11 +142,12 @@ router.get("/inbox", requireCrewControlPro(), async (req, res) => {
             l.created_at,
             l.created_by_actor_id,
             l.reviewer_actor_id,
+            l.source_msg_id,
             a_creator.role as creator_role
           from public.chiefos_activity_logs l
           left join public.chiefos_tenant_actors a_creator
             on a_creator.tenant_id = l.tenant_id
-           and a_creator.id = l.created_by_actor_id
+           and a_creator.actor_id = l.created_by_actor_id  -- ✅ FIXED
           where l.tenant_id = $1
             and l.reviewer_actor_id = $2
             and l.status in ('submitted','needs_clarification')
@@ -161,7 +163,14 @@ router.get("/inbox", requireCrewControlPro(), async (req, res) => {
 
     return res.json({ ok: true, role: out.role, items: out.rows });
   } catch (e) {
-    console.error("[CREW_CONTROL] inbox error", e?.message || e);
+    console.error("[CREW_CONTROL] inbox error", {
+      code: e?.code,
+      message: e?.message,
+      detail: e?.detail,
+      hint: e?.hint,
+      where: e?.where,
+    });
+
     const code = e?.code || "INBOX_FAILED";
     const status = code === "TENANT_CTX_MISSING" ? 403 : 500;
     return jsonErr(res, status, code, "Unable to load crew inbox.");

@@ -195,7 +195,9 @@ async function userProfileMiddleware(req, _res, next) {
     const from = normalizeDigits(req.body?.From || req.from);
     req.from = from;
 
+    // -----------------------------
     // default safe values
+    // -----------------------------
     req.tz = DEFAULT_TZ;
     req.isOwner = false;
     req.tenantId = null;
@@ -203,33 +205,39 @@ async function userProfileMiddleware(req, _res, next) {
     req.userProfile = null;
     req.ownerProfile = null;
     req.actorId = null;
-    
+
     // new flag
     req.dbDegraded = false;
 
     if (!from) {
-      req.ownerId = req.ownerId || 'GLOBAL';
+      // allow internal/system calls to pass through without From
+      req.ownerId = req.ownerId || "GLOBAL";
       return next();
     }
 
-    // ✅ Fast path: cache hit (only positive mappings cached)
-const cached = cacheGet(from);
-if (cached?.tenantId && cached?.ownerId) {
-  req.tenantId = cached.tenantId;
-  req.ownerId = cached.ownerId;
-  req.isOwner = !!cached.isOwner;
-  req.tz = cached.tz || DEFAULT_TZ;
+    // -----------------------------
+    // 0) Cache fast path
+    // ONLY accept cache-hit if it includes actorId
+    // -----------------------------
+    const cached = cacheGet(from);
 
-  // ✅ Add this (uuid)
-  req.actorId = cached.actorId || null;
+    const hasCore = !!(cached?.tenantId && cached?.ownerId);
+    const hasActor = !!cached?.actorId;
 
-  const plan = String(cached.plan || "free").trim().toLowerCase();
-  const plan_key = cached?.plan_key ?? null;
-  const sub_status = cached?.sub_status ?? null;
+    if (hasCore && hasActor) {
+      req.tenantId = cached.tenantId;
+      req.ownerId = cached.ownerId;
+      req.isOwner = !!cached.isOwner;
+      req.tz = cached.tz || DEFAULT_TZ;
+      req.actorId = cached.actorId || null;
+
+      const plan = String(cached.plan || "free").trim().toLowerCase();
+      const plan_key = cached?.plan_key ?? null;
+      const sub_status = cached?.sub_status ?? null;
 
       // ✅ Debug: confirms what plan we are using on warm/cache path
       try {
-        console.info('[PLAN_RESOLVE][userProfile][cache]', {
+        console.info("[PLAN_RESOLVE][userProfile][cache]", {
           from,
           ownerId: req.ownerId,
           tenantId: req.tenantId,
@@ -237,24 +245,24 @@ if (cached?.tenantId && cached?.ownerId) {
           resolvedPlan: plan,
           plan_key,
           sub_status,
-          note: 'plan comes from identityCache; stored onto req.userProfile.plan / req.ownerProfile.plan'
+          note: "plan comes from identityCache; stored onto req.userProfile.plan / req.ownerProfile.plan",
         });
       } catch {}
 
       req.userProfile = shapeMinimalProfile({
         from,
         ownerId: req.ownerId,
-        role: cached.role || (req.isOwner ? 'owner' : null),
+        role: cached.role || (req.isOwner ? "owner" : null),
         tz: req.tz,
-        plan
+        plan,
       });
 
       req.ownerProfile = shapeMinimalProfile({
         from: req.ownerId,
         ownerId: req.ownerId,
-        role: 'owner',
+        role: "owner",
         tz: req.tz,
-        plan
+        plan,
       });
 
       // ✅ Attach raw plan truth for downstream gating/debugging
@@ -264,134 +272,163 @@ if (cached?.tenantId && cached?.ownerId) {
       return next();
     }
 
-    // 1) Try canonical resolver first (whatsapp identity -> tenant + role)
-let resolved = null;
-try {
-  resolved = await resolveActorIdentity({ kind: "whatsapp", identifier: from }, markDegraded);
-} catch (e) {
-  console.warn("[userProfile] actor identity resolver failed:", e?.message);
-  // If transient, we marked dbDegraded; continue to legacy/cached paths.
-}
-
-if (resolved?.tenant_id) {
-  req.tenantId = resolved.tenant_id;
-  req.ownerId = normalizeDigits(resolved.owner_phone_digits) || from; // legacy compat
-  req.isOwner = String(resolved.role || "").toLowerCase() === "owner";
-  req.tz = pickTz(resolved) || DEFAULT_TZ;
-
-  // ✅ Defensive actorId extraction (uuid)
-  req.actorId =
-    resolved.actor_id ||
-    resolved.actorId ||
-    resolved.actor ||
-    resolved.actor_uuid ||
-    null;
-
-  let plan = "free";
-  let plan_key = null;
-  let sub_status = null;
-
-  try {
-    const out = await resolveOwnerPlan(req.ownerId, markDegraded);
-    plan = String(out?.plan || "free").trim().toLowerCase();
-    plan_key = out?.plan_key ?? null;
-    sub_status = out?.sub_status ?? null;
-  } catch (e) {
-    console.warn("[userProfile] resolveOwnerPlan failed (default free):", e?.message);
-    plan = "free";
-    plan_key = null;
-    sub_status = null;
-  }
-
-  req.userProfile = shapeMinimalProfile({
-    from,
-    ownerId: req.ownerId,
-    role: resolved.role,
-    tz: req.tz,
-    plan
-  });
-
-  req.ownerProfile = shapeMinimalProfile({
-    from: req.ownerId,
-    ownerId: req.ownerId,
-    role: "owner",
-    tz: req.tz,
-    plan
-  });
-
-  req.ownerProfile.plan_key = plan_key;
-  req.ownerProfile.sub_status = sub_status;
-
-  // ✅ Cache positive mapping for outage resilience
-  cacheSet(from, {
-    tenantId: req.tenantId,
-    ownerId: req.ownerId,
-    actorId: req.actorId, // ✅ store uuid
-    isOwner: req.isOwner,
-    tz: req.tz,
-    role: resolved.role || null,
-    plan,
-    plan_key,
-    sub_status
-  });
-
-  return next();
-}
-
-    // 2) Fallback: legacy public.users path (temporary)
-    let legacy = null;
-    try {
-      legacy = await resolveLegacyUser(from, markDegraded);
-    } catch (e) {
-      console.warn('[userProfile] legacy lookup failed:', e?.message);
-      legacy = null;
+    // ✅ Cache entry exists but is missing actorId (old cache schema)
+    // Treat as miss so resolver runs and re-caches correctly.
+    if (hasCore && !hasActor) {
+      try {
+        console.info("[userProfile] cache hit missing actorId → bypassing cache", {
+          from,
+          tenantId: cached?.tenantId || null,
+          ownerId: cached?.ownerId || null,
+        });
+      } catch {}
     }
 
-    if (legacy) {
-      const ownerId = normalizeDigits(legacy.owner_id) || from;
-      const role = legacy.role || (String(legacy.user_id) === String(ownerId) ? 'owner' : 'employee');
-      const tz = legacy.timezone || DEFAULT_TZ;
-      const plan = String(getEffectivePlanKey(legacy) || 'free').trim().toLowerCase();
+    // -----------------------------
+    // 1) Canonical resolver (whatsapp identity -> tenant + role + actorId)
+    // -----------------------------
+    let resolved = null;
+    try {
+      resolved = await resolveActorIdentity({ kind: "whatsapp", identifier: from }, markDegraded);
+    } catch (e) {
+      console.warn("[userProfile] actor identity resolver failed:", e?.message);
+      // If transient, we marked dbDegraded; continue to legacy paths.
+      resolved = null;
+    }
 
-      req.ownerId = ownerId;
-      req.isOwner = String(role).toLowerCase() === 'owner';
-      req.tz = tz;
+    if (resolved?.tenant_id) {
+      req.tenantId = resolved.tenant_id;
+      req.ownerId = normalizeDigits(resolved.owner_phone_digits) || from; // legacy compat
+      req.isOwner = String(resolved.role || "").toLowerCase() === "owner";
+      req.tz = pickTz(resolved) || DEFAULT_TZ;
 
-      req.userProfile = shapeMinimalProfile({ from, ownerId, role, tz, plan });
-      req.ownerProfile = shapeMinimalProfile({ from: ownerId, ownerId, role: 'owner', tz, plan });
+      req.actorId =
+        resolved.actor_id ||
+        resolved.actorId ||
+        resolved.actor ||
+        null;
 
-      // ✅ Attach raw plan truth if present on legacy row
-      req.ownerProfile.plan_key = legacy?.plan_key ?? null;
-      req.ownerProfile.sub_status = legacy?.sub_status ?? null;
+      // ✅ debug (remove once stable)
+      try {
+        console.info("[userProfile] resolver ctx", {
+          from,
+          tenantId: req.tenantId,
+          ownerId: req.ownerId,
+          actorId: req.actorId,
+          role: resolved?.role || null,
+        });
+      } catch {}
 
-      // ✅ Cache positive mapping for outage resilience
+      // Plan resolve (best-effort, fail-soft)
+      let plan = "free";
+      let plan_key = null;
+      let sub_status = null;
+
+      try {
+        const out = await resolveOwnerPlan(req.ownerId, markDegraded);
+        plan = String(out?.plan || "free").trim().toLowerCase();
+        plan_key = out?.plan_key ?? null;
+        sub_status = out?.sub_status ?? null;
+      } catch (e) {
+        console.warn("[userProfile] resolveOwnerPlan failed (default free):", e?.message);
+        plan = "free";
+        plan_key = null;
+        sub_status = null;
+      }
+
+      req.userProfile = shapeMinimalProfile({
+        from,
+        ownerId: req.ownerId,
+        role: resolved.role,
+        tz: req.tz,
+        plan,
+      });
+
+      req.ownerProfile = shapeMinimalProfile({
+        from: req.ownerId,
+        ownerId: req.ownerId,
+        role: "owner",
+        tz: req.tz,
+        plan,
+      });
+
+      req.ownerProfile.plan_key = plan_key;
+      req.ownerProfile.sub_status = sub_status;
+
+      // ✅ Cache positive mapping (now includes actorId)
       cacheSet(from, {
-        tenantId: null,
-        ownerId,
-        actorId: null,                 // optional, explicit
+        tenantId: req.tenantId,
+        ownerId: req.ownerId,
+        actorId: req.actorId || null,
         isOwner: req.isOwner,
         tz: req.tz,
-        role,
+        role: resolved.role || null,
         plan,
-        plan_key: legacy?.plan_key ?? null,
-        sub_status: legacy?.sub_status ?? null
+        plan_key,
+        sub_status,
       });
 
       return next();
     }
 
-    // 3) Unknown identity
-    // If DB was degraded, keep ownerId null but flag dbDegraded so webhook can show outage message
+    // -----------------------------
+    // 2) Legacy fallback (public.users / old systems)
+    // -----------------------------
+    let legacy = null;
+    try {
+      legacy = await resolveLegacyUser(from, markDegraded);
+    } catch (e) {
+      console.warn("[userProfile] legacy lookup failed:", e?.message);
+      legacy = null;
+    }
+
+    if (legacy) {
+      const ownerId = normalizeDigits(legacy.owner_id) || from;
+      const role = legacy.role || (String(legacy.user_id) === String(ownerId) ? "owner" : "employee");
+      const tz = legacy.timezone || DEFAULT_TZ;
+      const plan = String(getEffectivePlanKey(legacy) || "free").trim().toLowerCase();
+
+      req.ownerId = ownerId;
+      req.isOwner = String(role).toLowerCase() === "owner";
+      req.tz = tz;
+
+      req.userProfile = shapeMinimalProfile({ from, ownerId, role, tz, plan });
+      req.ownerProfile = shapeMinimalProfile({ from: ownerId, ownerId, role: "owner", tz, plan });
+
+      // ✅ Attach raw plan truth if present on legacy row
+      req.ownerProfile.plan_key = legacy?.plan_key ?? null;
+      req.ownerProfile.sub_status = legacy?.sub_status ?? null;
+
+      // ✅ Cache positive mapping (legacy has no actorId)
+      cacheSet(from, {
+        tenantId: null,
+        ownerId,
+        actorId: null,
+        isOwner: req.isOwner,
+        tz: req.tz,
+        role,
+        plan,
+        plan_key: legacy?.plan_key ?? null,
+        sub_status: legacy?.sub_status ?? null,
+      });
+
+      return next();
+    }
+
+    // -----------------------------
+    // 3) Unknown identity (not linked)
+    // -----------------------------
     req.ownerId = null;
     req.isOwner = false;
     req.userProfile = null;
     req.ownerProfile = null;
     req.tenantId = null;
+    req.actorId = null;
     req.tz = DEFAULT_TZ;
 
     return next();
   } catch (e) {
-    console.warn('[userProfile] failed:', e?.message);
+    console.warn("[userProfile] failed:", e?.message);
     if (isTransientDbError(e)) req.dbDegraded = true;
     req.tz = req.tz || DEFAULT_TZ;
     return next();

@@ -27,7 +27,7 @@ async function getActorRole({ tenantId, actorId }, client) {
     select role
       from public.chiefos_tenant_actors
      where tenant_id = $1
-       and id = $2
+       and actor_id = $2   -- ✅ FIXED (was id)
      limit 1
     `,
     [tenantId, actorId]

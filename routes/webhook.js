@@ -1678,45 +1678,79 @@ const messageSid =
 // - does NOT replace existing systems; just captures a crew-auditable log stream
 try {
   const crewEnabled = String(process.env.FEATURE_CREW_CONTROL || "0") === "1";
-
-  if (crewEnabled) {
+  if (!crewEnabled) {
+    // crew disabled → fall through
+  } else {
     const hasTenant = !!req.tenantId;
     const hasActor = !!req.actorId;
 
     // Fail closed unless actor identity system is active
     if (hasTenant && hasActor) {
-      const isTaskCmd = /^task\b/i.test(lc2) || /^\s*task\s*-\s*/i.test(text2) || /^\s*task-\s*/i.test(text2);
-      const isTimeCmd = /^time\b/i.test(lc2) || /^clock\s*(in|out)\b/i.test(lc2);
+      const rawText = String(text2 || "");
+      const isTaskCmd =
+        /^task\b/i.test(lc2) ||
+        /^\s*task\s*-\s*/i.test(rawText) ||
+        /^\s*task-\s*/i.test(rawText);
+
+      const isTimeCmd =
+        /^time\b/i.test(lc2) ||
+        /^clock\s*(in|out)\b/i.test(lc2);
 
       if (isTaskCmd || isTimeCmd) {
-  // ✅ enforce idempotency key for WhatsApp capture
-  if (!messageSid) return ok(res, "⚠️ Missing message id. Try again.");
+        // ✅ enforce idempotency key for WhatsApp capture
+        // messageSid MUST be defined earlier in the webhook handler
+        if (!messageSid) return ok(res, "⚠️ Missing message id. Try again.");
 
-  const { createCrewActivityLog } = require("../services/crewControl");
+        // Lazy-load so crew module issues never crash the whole webhook
+        const mod = require("../services/crewControl");
+        const createCrewActivityLog =
+          typeof mod?.createCrewActivityLog === "function" ? mod.createCrewActivityLog : null;
 
-        const type = isTaskCmd ? "task" : "time";
-        const content = String(text2 || "").trim();
+        if (!createCrewActivityLog) {
+          console.warn("[CREW_CONTROL] createCrewActivityLog missing (skipping crew capture)");
+          // fall through to legacy routing
+        } else {
+          const type = isTaskCmd ? "task" : "time";
+          const content = rawText.trim();
 
-        const structured = { raw: content, detected: { isTaskCmd, isTimeCmd } };
+          // Don't capture empty payloads
+          if (!content) {
+            // fall through
+          } else {
+            const structured = { raw: content, detected: { isTaskCmd, isTimeCmd } };
 
-        await createCrewActivityLog({
-          tenantId: req.tenantId,
-          ownerId: req.ownerId,
-          createdByActorId: req.actorId,
-          type,
-          source: "whatsapp",
-          contentText: content,
-          structured,
-          status: "submitted",
-          sourceMsgId: messageSid || null,
-        });
+            console.info("[CREW_CONTROL] capturing", {
+              tenantId: req.tenantId,
+              ownerId: req.ownerId,
+              actorId: req.actorId,
+              messageSid,
+              text: content.slice(0, 80),
+            });
 
-        return ok(res, type === "task" ? "✅ Task logged for review." : "✅ Time log captured for review.");
+            await createCrewActivityLog({
+              tenantId: req.tenantId,
+              ownerId: req.ownerId,
+              createdByActorId: req.actorId,
+              type,
+              source: "whatsapp",
+              contentText: content,
+              structured,
+              status: "submitted",
+              sourceMsgId: String(messageSid),
+            });
+
+            return ok(
+              res,
+              type === "task" ? "✅ Task logged for review." : "✅ Time log captured for review."
+            );
+          }
+        }
       }
     }
   }
 } catch (e) {
-  console.warn("[CREW_CONTROL] capture failed (ignored):", e?.message);
+  console.warn("[CREW_CONTROL] capture failed (ignored):", e?.message || e);
+  // IMPORTANT: ignore and continue normal routing
 }
 
     // ✅ Hard time command classification (uses lc2)

@@ -123,21 +123,50 @@ async function safeQuery(sql, params, markDegraded) {
 
 // ---- Resolver query (actor identity system) ----
 async function resolveActorIdentity({ kind, identifier }, markDegraded) {
-  const r = await safeQuery(
-    `
+  const k = String(kind || "").trim().toLowerCase();
+  const raw = String(identifier || "").trim();
+
+  // For whatsapp: normalize to digits, but also try common stored variants
+  const digits = raw.replace(/\D/g, "");
+  const candidates =
+    k === "whatsapp"
+      ? Array.from(
+          new Set([
+            digits,
+            raw,
+            raw.startsWith("whatsapp:") ? raw : `whatsapp:${raw}`,
+            raw.startsWith("whatsapp:+") ? raw : `whatsapp:+${digits}`,
+            raw.startsWith("+") ? raw : `+${digits}`,
+          ].filter(Boolean))
+        )
+      : [raw.toLowerCase()];
+
+  try {
+    // IMPORTANT: select actor_id explicitly
+    const { rows } = await pg.query(
+      `
       select
+        kind,
+        identifier,
         tenant_id,
         role,
         owner_phone_digits,
-        tz
+        tz,
+        actor_id
       from public.v_actor_identity_resolver
-      where kind = $1 and identifier = $2
+      where kind = $1
+        and identifier = any($2::text[])
+      order by updated_at desc nulls last
       limit 1
-    `,
-    [String(kind), String(identifier)],
-    markDegraded
-  );
-  return r?.rows?.[0] || null;
+      `,
+      [k, candidates]
+    );
+
+    return rows?.[0] || null;
+  } catch (e) {
+    if (markDegraded) markDegraded();
+    throw e;
+  }
 }
 
 async function resolveOwnerPlan(ownerDigits, markDegraded) {

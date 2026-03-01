@@ -2266,6 +2266,64 @@ if (/^chiefonboarding\b/i.test(lc2Clean)) {
       }
     }
 
+// -----------------------------------------------------------------------
+// ✅ MULTI-TENANT SELECTION GATE (FAIL CLOSED)
+// - If user has access to multiple tenants and has no active tenant selected,
+//   we show a numbered menu and STOP.
+// - User sets active tenant with: "use 1" (or "use 2", etc.)
+// -----------------------------------------------------------------------
+if (!req.tenantId && req.multiTenant && Array.isArray(req.multiTenantChoices) && req.multiTenantChoices.length) {
+  const raw = String(text2 || "").trim();
+  const lc = raw.toLowerCase();
+
+  // "use" command: use <n>
+  const m = lc.match(/^use\s+(\d+)\s*$/i);
+  if (m) {
+    const idx = parseInt(m[1], 10);
+    const choice = req.multiTenantChoices[idx - 1];
+
+    if (!choice?.tenant_id) {
+      return ok(res, `❌ Invalid choice. Reply "use 1" (or another number) from the list.`);
+    }
+
+    const phone = String(req.actorKey || req.from || "").replace(/\D/g, "");
+    try {
+      await query(
+  `
+  insert into public.chiefos_phone_active_tenant (phone_digits, tenant_id, updated_at)
+  values ($1, $2, now())
+  on conflict (phone_digits) do update
+    set tenant_id = excluded.tenant_id,
+        updated_at = now()
+  `,
+  [phone, choice.tenant_id]
+);
+    } catch (e) {
+      console.warn("[MULTI_TENANT] failed to set active tenant:", e?.message);
+      return ok(res, `⚠️ Could not set active business. Please try again.`);
+    }
+
+    const label = choice.tenant_name ? ` (${choice.tenant_name})` : "";
+    return ok(res, `✅ Active business set${label}. Now send your log again.`);
+  }
+
+  // Show menu (tenant names if available)
+  const lines = [
+    "You have access to more than one business.",
+    "Reply with: use 1 (or use 2, etc.)",
+    "",
+    ...req.multiTenantChoices.map((c, i) => {
+      const name = c.tenant_name ? ` — ${c.tenant_name}` : "";
+      return ` ${i + 1}) ${c.tenant_id}${name}`;
+    }),
+    "",
+    "Tip: once set, we’ll keep using that business until you switch.",
+  ];
+
+  return ok(res, lines.join("\n"));
+}
+
+
     // ✅ Now that redeem had a chance, enforce tenant link
 if (!req.ownerId) {
   const portal =

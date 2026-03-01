@@ -141,9 +141,22 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
 
       await assertLimits({ tenantId }, client, { addingRole: "employee" });
 
-      // create new actor_id
+            // create new actor_id
       const newActorId = crypto.randomUUID();
 
+      // ✅ IMPORTANT: satisfy actor FK first (your schema requires a parent actor row)
+      // Your older bootstrap data suggests a base actor table exists (e.g., public.chiefos_actors).
+      // This insert is safe even if the table already has the row (ON CONFLICT DO NOTHING).
+      await client.query(
+        `
+        insert into public.chiefos_actors (id, display_name, created_at, updated_at)
+        values ($1, $2, now(), now())
+        on conflict (id) do nothing
+        `,
+        [newActorId, displayName]
+      );
+
+      // now tenant-scoped actor row
       await client.query(
         `
         insert into public.chiefos_tenant_actors (tenant_id, actor_id, role)
@@ -152,6 +165,7 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
         [tenantId, newActorId]
       );
 
+      // profile (tenant-local metadata)
       await client.query(
         `
         insert into public.chiefos_tenant_actor_profiles (tenant_id, actor_id, display_name, phone_digits, email)
@@ -165,7 +179,13 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
         [tenantId, newActorId, displayName, phoneDigits || null, email || null]
       );
 
-      return { actor_id: newActorId, role: "employee", display_name: displayName, phone_digits: phoneDigits || null, email: email || null };
+      return {
+        actor_id: newActorId,
+        role: "employee",
+        display_name: displayName,
+        phone_digits: phoneDigits || null,
+        email: email || null,
+      };
     });
 
     return res.json({ ok: true, item: out });

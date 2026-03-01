@@ -106,6 +106,23 @@ function isTransientDbError(e) {
 
   return false;
 }
+async function getActiveTenantForPhone(phoneDigits, markDegraded) {
+  const p = normalizeDigits(phoneDigits);
+  if (!p) return null;
+
+  const r = await safeQuery(
+    `
+    select tenant_id, actor_id
+    from public.chiefos_phone_active_tenant
+    where phone_digits = $1
+    limit 1
+    `,
+    [p],
+    markDegraded
+  );
+
+  return r?.rows?.[0] || null;
+}
 
 // A safe query wrapper that can signal dbDegraded without changing pg.js
 async function safeQuery(sql, params, markDegraded) {
@@ -122,13 +139,12 @@ async function safeQuery(sql, params, markDegraded) {
 /* ------------------------ resolver queries ------------------------ */
 
 // ---- Resolver query (actor identity system) ----
-async function resolveActorIdentity({ kind, identifier }, markDegraded) {
+// Returns ALL candidates (multi-tenant safe). Caller decides.
+async function resolveActorIdentities({ kind, identifier }, markDegraded) {
   const k = String(kind || "").trim().toLowerCase();
   const raw = String(identifier || "").trim();
+  if (!k || !raw) return [];
 
-  if (!k || !raw) return null;
-
-  // Normalize identifiers safely
   const digits = raw.replace(/\D/g, "");
 
   const candidates =
@@ -136,11 +152,11 @@ async function resolveActorIdentity({ kind, identifier }, markDegraded) {
       ? Array.from(
           new Set(
             [
-              digits,                   // 19053279955
-              "+" + digits,              // +19053279955
-              "whatsapp:+" + digits,     // whatsapp:+19053279955
-              "whatsapp:" + digits,      // whatsapp:19053279955
-              raw                        // whatever came in
+              digits,
+              "+" + digits,
+              "whatsapp:+" + digits,
+              "whatsapp:" + digits,
+              raw
             ].filter(Boolean)
           )
         )
@@ -160,28 +176,24 @@ async function resolveActorIdentity({ kind, identifier }, markDegraded) {
       from public.v_actor_identity_resolver
       where kind = $1
         and identifier = any($2::text[])
-      order by (actor_id is not null) desc
-      limit 1
+      order by
+        tenant_id asc,
+        (actor_id is not null) desc
       `,
       [k, candidates]
     );
 
-    return rows?.[0] || null;
+    return rows || [];
   } catch (e) {
-    // Only mark degraded for real transient DB issues
     const msg = String(e?.message || "");
     const code = String(e?.code || "");
-
     const looksTransient =
-      code === "57P01" || // admin_shutdown
-      code === "57P02" || // crash_shutdown
-      code === "53300" || // too_many_connections
+      code === "57P01" ||
+      code === "57P02" ||
+      code === "53300" ||
       /timeout|ECONNRESET|ENETUNREACH|EAI_AGAIN|connection/i.test(msg);
 
-    if (looksTransient && typeof markDegraded === "function") {
-      markDegraded();
-    }
-
+    if (looksTransient && typeof markDegraded === "function") markDegraded();
     throw e;
   }
 }
@@ -206,6 +218,28 @@ async function resolveOwnerPlan(ownerDigits, markDegraded) {
     plan_key: row?.plan_key ?? null,
     sub_status: row?.sub_status ?? null
   };
+}
+
+async function loadTenantNames(tenantIds, markDegraded) {
+  const ids = (tenantIds || []).map(String).filter(Boolean);
+  if (!ids.length) return new Map();
+
+  const r = await safeQuery(
+    `
+    select id::text as tenant_id,
+           coalesce(nullif(business_name,''), nullif(name,''), 'Business') as tenant_name
+      from public.chiefos_tenants
+     where id = any($1::uuid[])
+    `,
+    [ids],
+    markDegraded
+  );
+
+  const m = new Map();
+  for (const row of (r?.rows || [])) {
+    m.set(String(row.tenant_id), String(row.tenant_name || "Business"));
+  }
+  return m;
 }
 
 // ---- Legacy fallback (public.users) ----
@@ -331,91 +365,133 @@ async function userProfileMiddleware(req, _res, next) {
     }
 
     // -----------------------------
-    // 1) Canonical resolver (whatsapp identity -> tenant + role + actorId)
-    // -----------------------------
-    let resolved = null;
+// 1) Canonical resolver (whatsapp identity -> tenant + role + actorId)
+// MULTI-TENANT SAFE: may return multiple candidates
+// -----------------------------
+let resolvedRows = [];
+try {
+  resolvedRows = await resolveActorIdentities({ kind: "whatsapp", identifier: from }, markDegraded);
+} catch (e) {
+  console.warn("[userProfile] actor identity resolver failed:", e?.message);
+  resolvedRows = [];
+}
+
+const candidates = (resolvedRows || []).filter(r => !!r?.tenant_id);
+const uniqTenantIds = Array.from(new Set(candidates.map(r => String(r.tenant_id))));
+
+if (uniqTenantIds.length > 1) {
+  // Multi-tenant phone: require an active tenant selection or fail closed.
+  let active = null;
+  try {
+    active = await getActiveTenantForPhone(from, markDegraded);
+  } catch (e) {
+    console.warn("[userProfile] getActiveTenantForPhone failed:", e?.message);
+    active = null;
+  }
+
+  if (!active?.tenant_id) {
+    // FAIL CLOSED: do not set tenant/actor.
+    req.multiTenant = true;
+    const names = await loadTenantNames(uniqTenantIds, markDegraded);
+
+req.multiTenantChoices = uniqTenantIds.map((tid) => {
+  const row = candidates.find((x) => String(x.tenant_id) === String(tid));
+  return {
+    tenant_id: tid,
+    tenant_name: names.get(String(tid)) || null,
+    owner_phone_digits: row?.owner_phone_digits || null,
+    role: row?.role || null,
+    tz: row?.tz || null,
+    actor_id: row?.actor_id || null,
+  };
+});
+
     try {
-      resolved = await resolveActorIdentity({ kind: "whatsapp", identifier: from }, markDegraded);
-    } catch (e) {
-      console.warn("[userProfile] actor identity resolver failed:", e?.message);
-      // If transient, we marked dbDegraded; continue to legacy paths.
-      resolved = null;
-    }
-
-    if (resolved?.tenant_id) {
-      req.tenantId = resolved.tenant_id;
-      req.ownerId = normalizeDigits(resolved.owner_phone_digits) || from; // legacy compat
-      req.isOwner = String(resolved.role || "").toLowerCase() === "owner";
-      req.tz = pickTz(resolved) || DEFAULT_TZ;
-
-      req.actorId =
-        resolved.actor_id ||
-        resolved.actorId ||
-        resolved.actor ||
-        null;
-
-      // ✅ debug (remove once stable)
-      try {
-        console.info("[userProfile] resolver ctx", {
-          from,
-          tenantId: req.tenantId,
-          ownerId: req.ownerId,
-          actorId: req.actorId,
-          role: resolved?.role || null,
-        });
-      } catch {}
-
-      // Plan resolve (best-effort, fail-soft)
-      let plan = "free";
-      let plan_key = null;
-      let sub_status = null;
-
-      try {
-        const out = await resolveOwnerPlan(req.ownerId, markDegraded);
-        plan = String(out?.plan || "free").trim().toLowerCase();
-        plan_key = out?.plan_key ?? null;
-        sub_status = out?.sub_status ?? null;
-      } catch (e) {
-        console.warn("[userProfile] resolveOwnerPlan failed (default free):", e?.message);
-        plan = "free";
-        plan_key = null;
-        sub_status = null;
-      }
-
-      req.userProfile = shapeMinimalProfile({
+      console.info("[userProfile] multi-tenant detected, no active tenant → selection required", {
         from,
-        ownerId: req.ownerId,
-        role: resolved.role,
-        tz: req.tz,
-        plan,
+        tenantCount: uniqTenantIds.length,
       });
+    } catch {}
 
-      req.ownerProfile = shapeMinimalProfile({
-        from: req.ownerId,
-        ownerId: req.ownerId,
-        role: "owner",
-        tz: req.tz,
-        plan,
-      });
+    // leave req.tenantId / req.actorId null
+    return next();
+  }
 
-      req.ownerProfile.plan_key = plan_key;
-      req.ownerProfile.sub_status = sub_status;
+  // active tenant exists → pick matching candidate
+  const chosen = candidates.find((x) => String(x.tenant_id) === String(active.tenant_id)) || null;
+  if (!chosen) {
+    // active tenant points to something no longer valid → fail closed
+    req.multiTenant = true;
+    req.multiTenantChoices = uniqTenantIds.map((tid) => ({ tenant_id: tid }));
+    return next();
+  }
 
-      // ✅ Cache positive mapping (now includes actorId)
-      cacheSet(from, {
-        tenantId: req.tenantId,
-        ownerId: req.ownerId,
-        actorId: req.actorId || null,
-        isOwner: req.isOwner,
-        tz: req.tz,
-        role: resolved.role || null,
-        plan,
-        plan_key,
-        sub_status,
-      });
+  // proceed as normal with chosen
+  req.tenantId = chosen.tenant_id;
+  req.ownerId = normalizeDigits(chosen.owner_phone_digits) || from;
+  req.isOwner = String(chosen.role || "").toLowerCase() === "owner";
+  req.tz = pickTz(chosen) || DEFAULT_TZ;
+  req.actorId = chosen.actor_id || null;
 
-      return next();
-    }
+} else if (uniqTenantIds.length === 1) {
+  // single tenant mapping
+  const chosen = candidates[0];
+  req.tenantId = chosen.tenant_id;
+  req.ownerId = normalizeDigits(chosen.owner_phone_digits) || from;
+  req.isOwner = String(chosen.role || "").toLowerCase() === "owner";
+  req.tz = pickTz(chosen) || DEFAULT_TZ;
+  req.actorId = chosen.actor_id || null;
+}
+
+if (req.tenantId) {
+  // Plan resolve (best-effort, fail-soft)
+  let plan = "free";
+  let plan_key = null;
+  let sub_status = null;
+
+  try {
+    const out = await resolveOwnerPlan(req.ownerId, markDegraded);
+    plan = String(out?.plan || "free").trim().toLowerCase();
+    plan_key = out?.plan_key ?? null;
+    sub_status = out?.sub_status ?? null;
+  } catch (e) {
+    console.warn("[userProfile] resolveOwnerPlan failed (default free):", e?.message);
+    plan = "free";
+  }
+
+  req.userProfile = shapeMinimalProfile({
+    from,
+    ownerId: req.ownerId,
+    role: req.isOwner ? "owner" : (candidates?.[0]?.role || null),
+    tz: req.tz,
+    plan,
+  });
+
+  req.ownerProfile = shapeMinimalProfile({
+    from: req.ownerId,
+    ownerId: req.ownerId,
+    role: "owner",
+    tz: req.tz,
+    plan,
+  });
+
+  req.ownerProfile.plan_key = plan_key;
+  req.ownerProfile.sub_status = sub_status;
+
+  cacheSet(from, {
+    tenantId: req.tenantId,
+    ownerId: req.ownerId,
+    actorId: req.actorId || null,
+    isOwner: req.isOwner,
+    tz: req.tz,
+    role: req.userProfile.role || null,
+    plan,
+    plan_key,
+    sub_status,
+  });
+
+  return next();
+}
 
     // -----------------------------
     // 2) Legacy fallback (public.users / old systems)

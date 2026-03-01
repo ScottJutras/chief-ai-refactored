@@ -16,14 +16,27 @@ function mustCtx(req) {
   const actorId = String(req.actorId || "").trim();
   const ownerId = String(req.ownerId || "").trim();
   const role = String(req.portalRole || "").trim();
+
   if (!tenantId || !actorId) {
-    return { ok: false, status: 403, code: "TENANT_CTX_MISSING", message: "Access not resolved. Please re-authenticate." };
+    const err = new Error("Access not resolved. Please re-authenticate.");
+    err.code = "TENANT_CTX_MISSING";
+    throw err;
   }
+
   return { tenantId, actorId, ownerId, role };
 }
 
 function DIGITS(x) {
   return String(x ?? "").replace(/\D/g, "");
+}
+
+// Mirror UI behavior (Canada/US convenience)
+function normalizePhoneDigits(input) {
+  const d = DIGITS(input || "");
+  if (!d) return "";
+  if (d.length === 10) return "1" + d;
+  if (d.length === 11 && d.startsWith("1")) return d;
+  return d; // validation happens in route
 }
 
 async function getActorRole({ tenantId, actorId }, client) {
@@ -76,6 +89,79 @@ async function assertLimits({ tenantId }, client, { addingRole = null } = {}) {
 }
 
 /**
+ * Find an existing actor_id by identity so we don't create duplicates.
+ * Supports whatsapp variants + email.
+ */
+async function findExistingActorId({ phoneDigits, email }, client) {
+  if (phoneDigits) {
+    const candidates = [
+      phoneDigits,
+      "+" + phoneDigits,
+      "whatsapp:" + phoneDigits,
+      "whatsapp:+" + phoneDigits,
+    ];
+
+    const r = await client.query(
+      `
+      select actor_id
+      from public.chiefos_actor_identities
+      where kind = 'whatsapp'
+        and identifier = any($1::text[])
+      limit 1
+      `,
+      [candidates]
+    );
+
+    const hit = r?.rows?.[0]?.actor_id || null;
+    if (hit) return hit;
+  }
+
+  if (email) {
+    const r2 = await client.query(
+      `
+      select actor_id
+      from public.chiefos_actor_identities
+      where kind = 'email'
+        and identifier = $1
+      limit 1
+      `,
+      [String(email).trim().toLowerCase()]
+    );
+    const hit2 = r2?.rows?.[0]?.actor_id || null;
+    if (hit2) return hit2;
+  }
+
+  return null;
+}
+
+/**
+ * Ensure owner profile rows exist so UI shows a name instead of "Unnamed Owner".
+ * Uses chiefos_actors.display_name when available.
+ */
+async function ensureOwnerProfiles({ tenantId }, client) {
+  await client.query(
+    `
+    insert into public.chiefos_tenant_actor_profiles (tenant_id, actor_id, display_name, phone_digits, email)
+    select
+      a.tenant_id,
+      a.actor_id,
+      coalesce(nullif(oa.display_name,''), 'Owner') as display_name,
+      null::text as phone_digits,
+      null::text as email
+    from public.chiefos_tenant_actors a
+    left join public.chiefos_actors oa
+      on oa.id = a.actor_id
+    where a.tenant_id = $1
+      and a.role = 'owner'
+    on conflict (tenant_id, actor_id) do update
+      set display_name = coalesce(nullif(public.chiefos_tenant_actor_profiles.display_name,''), excluded.display_name),
+          updated_at = now()
+    `,
+    [tenantId]
+  );
+}
+
+/**
  * GET /api/crew/admin/members
  * Owner/admin view of all actors + profiles.
  */
@@ -86,6 +172,9 @@ router.get("/admin/members", requirePortalUser, requireCrewControlPro(), async (
     const out = await pg.withClient(async (client) => {
       const role = await getActorRole({ tenantId, actorId }, client);
       mustOwnerOrAdmin(role);
+
+      // ✅ small UX improvement: ensure owner profile rows exist
+      await ensureOwnerProfiles({ tenantId }, client);
 
       const r = await client.query(
         `
@@ -114,7 +203,10 @@ router.get("/admin/members", requirePortalUser, requireCrewControlPro(), async (
     return res.json({ ok: true, items: out });
   } catch (e) {
     const code = e?.code || "MEMBERS_FAILED";
-    const status = code === "PERMISSION_DENIED" ? 403 : 500;
+    const status =
+      code === "TENANT_CTX_MISSING" ? 403 :
+      code === "PERMISSION_DENIED" ? 403 :
+      500;
     console.error("[CREW_ADMIN] members error", e?.message || e);
     return jsonErr(res, status, code, "Unable to load members.");
   }
@@ -123,17 +215,28 @@ router.get("/admin/members", requirePortalUser, requireCrewControlPro(), async (
 /**
  * POST /api/crew/admin/members
  * Body: { display_name, phone, email }
- * Creates an employee actor + profile.
+ * Creates (or reuses) an employee actor + membership + profile + identities.
  */
 router.post("/admin/members", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
+
     const displayName = String(req.body?.display_name || "").trim();
-    const phoneDigits = DIGITS(req.body?.phone || "");
+    const phoneDigits = normalizePhoneDigits(req.body?.phone || "");
     const email = String(req.body?.email || "").trim().toLowerCase();
 
     if (!displayName) return jsonErr(res, 400, "MISSING_NAME", "Display name is required.");
     if (!phoneDigits && !email) return jsonErr(res, 400, "MISSING_CONTACT", "Phone or email is required.");
+
+    // Until you add a country selector, we fail closed for non-NANP
+    if (phoneDigits && !(phoneDigits.length === 11 && phoneDigits.startsWith("1"))) {
+      return jsonErr(
+        res,
+        400,
+        "INVALID_PHONE",
+        "Phone must be 10 digits (Canada/US) or include country code (e.g., 1XXXXXXXXXX)."
+      );
+    }
 
     const out = await pg.withClient(async (client) => {
       const role = await getActorRole({ tenantId, actorId }, client);
@@ -141,31 +244,33 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
 
       await assertLimits({ tenantId }, client, { addingRole: "employee" });
 
-            // create new actor_id
-      const newActorId = crypto.randomUUID();
+      // ✅ Reuse existing actor if identity exists
+      const existingActorId = await findExistingActorId({ phoneDigits, email }, client);
+      const newActorId = existingActorId || crypto.randomUUID();
 
-      // ✅ IMPORTANT: satisfy actor FK first (your schema requires a parent actor row)
-      // Your older bootstrap data suggests a base actor table exists (e.g., public.chiefos_actors).
-      // This insert is safe even if the table already has the row (ON CONFLICT DO NOTHING).
+      // ✅ satisfy actor FK
       await client.query(
         `
         insert into public.chiefos_actors (id, display_name, created_at, updated_at)
         values ($1, $2, now(), now())
-        on conflict (id) do nothing
+        on conflict (id) do update
+          set display_name = coalesce(nullif(public.chiefos_actors.display_name,''), excluded.display_name),
+              updated_at = now()
         `,
         [newActorId, displayName]
       );
 
-      // now tenant-scoped actor row
+      // ✅ tenant membership (idempotent; do NOT crash if already exists)
       await client.query(
         `
         insert into public.chiefos_tenant_actors (tenant_id, actor_id, role)
         values ($1, $2, 'employee')
+        on conflict (tenant_id, actor_id) do nothing
         `,
         [tenantId, newActorId]
       );
 
-      // profile (tenant-local metadata)
+      // ✅ profile (tenant-local metadata)
       await client.query(
         `
         insert into public.chiefos_tenant_actor_profiles (tenant_id, actor_id, display_name, phone_digits, email)
@@ -179,12 +284,56 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
         [tenantId, newActorId, displayName, phoneDigits || null, email || null]
       );
 
+      // ✅ identities for routing (idempotent) — MUST be inside this transaction
+      if (phoneDigits) {
+        await client.query(
+          `
+          insert into public.chiefos_actor_identities (kind, identifier, actor_id, created_at, updated_at)
+          values
+            ('whatsapp', $1, $2, now(), now()),
+            ('whatsapp', '+' || $1, $2, now(), now()),
+            ('whatsapp', 'whatsapp:' || $1, $2, now(), now()),
+            ('whatsapp', 'whatsapp:+' || $1, $2, now(), now())
+          on conflict do nothing
+          `,
+          [phoneDigits, newActorId]
+        );
+      }
+
+      if (email) {
+        await client.query(
+          `
+          insert into public.chiefos_actor_identities (kind, identifier, actor_id, created_at, updated_at)
+          values ('email', $1, $2, now(), now())
+          on conflict do nothing
+          `,
+          [email, newActorId]
+        );
+      }
+
+      // small UX: ensure owner profiles exist too
+      await ensureOwnerProfiles({ tenantId }, client);
+
+      // Return the membership role as stored
+      const rr = await client.query(
+        `
+        select role
+        from public.chiefos_tenant_actors
+        where tenant_id = $1 and actor_id = $2
+        limit 1
+        `,
+        [tenantId, newActorId]
+      );
+
+      const finalRole = rr?.rows?.[0]?.role || "employee";
+
       return {
         actor_id: newActorId,
-        role: "employee",
+        role: finalRole,
         display_name: displayName,
         phone_digits: phoneDigits || null,
         email: email || null,
+        reused_actor: !!existingActorId,
       };
     });
 
@@ -192,6 +341,7 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
   } catch (e) {
     const code = e?.code || "CREATE_MEMBER_FAILED";
     const status =
+      code === "TENANT_CTX_MISSING" ? 403 :
       code === "PERMISSION_DENIED" ? 403 :
       code === "EMPLOYEE_LIMIT" ? 409 :
       500;
@@ -203,7 +353,6 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
 /**
  * PATCH /api/crew/admin/members/:actorId/role
  * Body: { role: 'employee'|'board'|'admin' }
- * Owner/admin can promote/demote, with board cap enforced.
  */
 router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
   try {
@@ -218,7 +367,7 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
       const role = await getActorRole({ tenantId, actorId }, client);
       mustOwnerOrAdmin(role);
 
-      // don't allow changing self out of owner/admin via this endpoint (safety)
+      // safety: don't allow changing self out of owner/admin here
       if (targetActorId === actorId && newRole !== role) {
         const err = new Error("Cannot change your own role here");
         err.code = "SELF_ROLE_CHANGE_BLOCKED";
@@ -246,7 +395,7 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
         throw err;
       }
 
-      // If demoting from board, deactivate their assignments as board target
+      // If demoting from board, deactivate assignments where they are board target
       if (newRole !== "board") {
         await client.query(
           `
@@ -259,6 +408,9 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
         );
       }
 
+      // keep owner profiles present for UI
+      await ensureOwnerProfiles({ tenantId }, client);
+
       return u.rows[0];
     });
 
@@ -266,6 +418,7 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
   } catch (e) {
     const code = e?.code || "UPDATE_ROLE_FAILED";
     const status =
+      code === "TENANT_CTX_MISSING" ? 403 :
       code === "PERMISSION_DENIED" ? 403 :
       code === "BOARD_LIMIT" ? 409 :
       code === "NOT_FOUND" ? 404 :
@@ -279,7 +432,6 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
 /**
  * POST /api/crew/admin/assign
  * Body: { employee_actor_id, board_actor_id }
- * Upserts assignment -> used by resolveReviewerActorId().
  */
 router.post("/admin/assign", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
   try {
@@ -287,13 +439,14 @@ router.post("/admin/assign", requirePortalUser, requireCrewControlPro(), express
     const employeeActorId = String(req.body?.employee_actor_id || "").trim();
     const boardActorId = String(req.body?.board_actor_id || "").trim();
 
-    if (!employeeActorId || !boardActorId) return jsonErr(res, 400, "MISSING_FIELDS", "employee_actor_id and board_actor_id required.");
+    if (!employeeActorId || !boardActorId) {
+      return jsonErr(res, 400, "MISSING_FIELDS", "employee_actor_id and board_actor_id required.");
+    }
 
     const out = await pg.withClient(async (client) => {
       const role = await getActorRole({ tenantId, actorId }, client);
       mustOwnerOrAdmin(role);
 
-      // sanity: both actors exist in tenant, and roles are correct-ish
       const chk = await client.query(
         `
         select actor_id, role
@@ -304,13 +457,15 @@ router.post("/admin/assign", requirePortalUser, requireCrewControlPro(), express
         [tenantId, employeeActorId, boardActorId]
       );
 
-      const map = new Map(chk.rows.map(r => [r.actor_id, r.role]));
+      const map = new Map(chk.rows.map((r) => [r.actor_id, r.role]));
       if (!map.has(employeeActorId) || !map.has(boardActorId)) {
         const err = new Error("Actor not found in tenant");
         err.code = "NOT_FOUND";
         throw err;
       }
-      if (map.get(boardActorId) !== "board" && map.get(boardActorId) !== "owner" && map.get(boardActorId) !== "admin") {
+
+      const br = map.get(boardActorId);
+      if (br !== "board" && br !== "owner" && br !== "admin") {
         const err = new Error("Target reviewer must be board/owner/admin");
         err.code = "INVALID_REVIEWER";
         throw err;
@@ -334,6 +489,7 @@ router.post("/admin/assign", requirePortalUser, requireCrewControlPro(), express
   } catch (e) {
     const code = e?.code || "ASSIGN_FAILED";
     const status =
+      code === "TENANT_CTX_MISSING" ? 403 :
       code === "PERMISSION_DENIED" ? 403 :
       code === "NOT_FOUND" ? 404 :
       code === "INVALID_REVIEWER" ? 409 :

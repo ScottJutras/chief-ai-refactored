@@ -51,6 +51,8 @@ const billingRouter = require("./routes/billing");
 const accountRouter = require("./routes/account");
 const receiptsRouter = require("./routes/receipts");
 const portalRouter = require("./routes/portal");
+const crewAdminRouter = require("./routes/crewAdmin");
+
 
 // ✅ Portal auth + tenant/actor context for protected API routes
 const { requirePortalUser } = require("./middleware/requirePortalUser");
@@ -121,9 +123,10 @@ app.use(receiptsRouter);
 app.use("/api", portalRouter);
 // ✅ Crew+Control (Pro-gated) — portal-auth required
 app.use("/api/crew", requirePortalUser, require("./routes/crewControl"));
-
+app.use("/api/crew", crewAdminRouter);
 // AskChief defines POST /api/ask-chief internally
 app.use(askChiefRouter);
+
 
 // Parse
 app.use("/api/parse", parseRouter);

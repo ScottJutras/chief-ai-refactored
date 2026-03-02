@@ -3546,7 +3546,7 @@ const looksRevenue = revenuePrefix || (revenueNl && !expensePrefix);
 const looksExpense = expensePrefix || (!looksRevenue && expenseNl); // only if not revenue
 
 // -------------------- REVENUE FAST PATH --------------------
-if (looksRevenue) {
+if (looksRevenue && !isHowToQuestion && !isQuestionAsk) {
   if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
 
   try {
@@ -3581,7 +3581,7 @@ if (looksRevenue) {
 
 
 // -------------------- EXPENSE FAST PATH --------------------
-if (looksExpense) {
+if (looksRevenue && !isHowToQuestion && !isQuestionAsk) {
   if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
 
   try {

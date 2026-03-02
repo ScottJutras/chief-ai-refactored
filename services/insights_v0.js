@@ -100,6 +100,8 @@ function hasExplicitRangeHint(text) {
   return /\b(today|todays|today's|wtd|week to date|this week|mtd|month to date|this month|ytd|year to date|this year|all time|all|last 7 days|past 7 days|previous 7 days|last 30 days|past 30 days|previous 30 days|last month|previous month)\b/.test(t);
 }
 
+
+
 /**
  * effectiveRange: today|wtd|mtd|ytd|last7|last30|all
  * tz: IANA timezone string (e.g., America/Toronto)
@@ -401,7 +403,8 @@ function looksLikeProfitQuestion(text) {
     /\bjob\s*#\s*\d{1,10}\b/.test(s) ||
     /\bjob\s+\d{1,10}\b/.test(s) ||
     /\bactive\s+job\b/.test(s) ||
-    /\bon\s+[a-z0-9]/.test(s);
+    /\bon\s+[a-z0-9]/.test(s) || 
+    /^\s*(profitability|profit|margin)\s+\d{2,10}\b/.test(s);
 
   return hasProfitIntent && hasJobAnchor;
 }
@@ -532,7 +535,7 @@ async function resolveJobForProfit({ ownerId, actorKey, text, actorMemory }) {
   return { jobId: null, jobNo: null, jobName: null, source: resolved?.reason || "none" };
 }
 
-async function answerProfitIntent({ ownerId, actorKey, text, actorMemory }) {
+async function answerProfitIntent({ ownerId, actorKey, text, actorMemory, fromIso, toIso, label, effectiveRange, explicitRange }) {
   const resolved = await resolveJobForProfit({ ownerId, actorKey, text, actorMemory });
 
   console.info("[INSIGHTS_PROFIT_RESOLVED]", {
@@ -542,57 +545,126 @@ async function answerProfitIntent({ ownerId, actorKey, text, actorMemory }) {
     jobId: resolved?.jobId ?? null,
     jobNo: resolved?.jobNo ?? null,
     jobName: resolved?.jobName ?? null,
+    effectiveRange: effectiveRange || null,
+    fromIso: fromIso || null,
+    toIso: toIso || null,
   });
 
-  if (Number.isFinite(Number(resolved?.jobNo))) {
-    const requestedJobNo = Number(resolved.jobNo);
-    const row = await getProfitRowByJobNo(ownerId, requestedJobNo);
-
-    if (row) {
-      const memory_patch = {
-        conversation: {
-          active_job_id: Number.isFinite(Number(resolved?.jobId)) ? Number(resolved.jobId) : null,
-          active_job_no: requestedJobNo,
-          active_job_name: row?.job_name || resolved.jobName || null,
-        },
-      };
+  if (!Number.isFinite(Number(resolved?.jobNo))) {
+    if (resolved?.source === "ambiguous" && Array.isArray(resolved?.matches) && resolved.matches.length) {
+      const options = resolved.matches
+        .slice(0, 5)
+        .map((j) => `• Job #${j.job_no} — ${j.job_name || "Unnamed"}`)
+        .join("\n");
 
       return {
         ok: true,
-        route: "insight",
-        answer: profitReply({ row, label: row.job_name || resolved.jobName || `Job #${requestedJobNo}` }),
-        evidence: { sql: ["v_job_profit_simple_fixed/getJobProfitSimple"], facts_used: 4 },
-        memory_patch,
+        route: "clarify",
+        answer: `Which job did you mean?\n\n${options}\n\nReply with the job number (e.g., “profit on job 1556”).`,
+        evidence: { sql: [], facts_used: 0 },
       };
     }
 
-    // If profit table can't find it, do not overwrite memory.
     return {
       ok: true,
       route: "clarify",
-      answer: `I couldn’t find Job #${requestedJobNo}. Try “list jobs” or tell me the job name.`,
+      answer: `Tell me the job (e.g., “profit on job 1556” or “profit on Oak Street Re-roof”).`,
       evidence: { sql: [], facts_used: 0 },
     };
   }
 
-  if (resolved?.source === "ambiguous" && Array.isArray(resolved?.matches) && resolved.matches.length) {
-    const options = resolved.matches
-      .slice(0, 5)
-      .map((j) => `• Job #${j.job_no} — ${j.job_name || "Unnamed"}`)
-      .join("\n");
+  const requestedJobNo = Number(resolved.jobNo);
+
+  // Decide whether we should attempt ranged job profit
+  const hasRange = /^\d{4}-\d{2}-\d{2}$/.test(String(fromIso || "")) && /^\d{4}-\d{2}-\d{2}$/.test(String(toIso || ""));
+  const wantsRanged = !!(hasRange && (explicitRange || (effectiveRange && effectiveRange !== "all")));
+
+  // 1) RANGED PROFIT PATH (transactions-first)
+  if (wantsRanged && typeof pg.getJobProfitByRange === "function") {
+    try {
+      const r = await pg.getJobProfitByRange({
+        ownerId,
+        jobId: Number.isFinite(Number(resolved?.jobId)) ? Number(resolved.jobId) : null,
+        jobNo: requestedJobNo,
+        fromIso,
+        toIso,
+      });
+
+      if (r?.ok && r?.row) {
+        const row = {
+          job_no: requestedJobNo,
+          job_name: resolved.jobName || `Job #${requestedJobNo}`,
+          revenue_cents: Number(r.row.revenue_cents || 0),
+          expense_cents: Number(r.row.expense_cents || 0),
+          profit_cents: Number(r.row.profit_cents || 0),
+        };
+
+        const memory_patch = {
+          conversation: {
+            active_job_id: Number.isFinite(Number(resolved?.jobId)) ? Number(resolved.jobId) : null,
+            active_job_no: requestedJobNo,
+            active_job_name: resolved.jobName || null,
+            last_intent: "profit",
+            last_topic: "job_profit",
+          },
+        };
+
+        return {
+          ok: true,
+          route: "insight",
+          answer: [
+            `📌 ${row.job_name}`,
+            ``,
+            `For ${label || "this period"}:`,
+            `Revenue: ${money(row.revenue_cents)}`,
+            `Spend: ${money(row.expense_cents)}`,
+            `Profit: ${money(row.profit_cents)}`,
+          ].join("\n"),
+          evidence: { sql: ["transactions/getJobProfitByRange"], facts_used: 3 },
+          memory_patch,
+        };
+      }
+
+      // Fail closed to all-time if schema can’t support job linkage
+      if (r?.reason === "no_job_link_columns" || r?.reason === "missing_job_key_for_available_mode") {
+        // fall through to all-time (but be transparent if they asked for a range)
+      }
+    } catch {}
+  }
+
+  // 2) ALL-TIME fallback (existing stable path)
+  const row = await getProfitRowByJobNo(ownerId, requestedJobNo);
+
+  if (row) {
+    const memory_patch = {
+      conversation: {
+        active_job_id: Number.isFinite(Number(resolved?.jobId)) ? Number(resolved.jobId) : null,
+        active_job_no: requestedJobNo,
+        active_job_name: row?.job_name || resolved.jobName || null,
+        last_intent: "profit",
+        last_topic: "job_profit",
+      },
+    };
+
+    const askedForRangeButWeCant = wantsRanged; // they asked “last month” etc.
 
     return {
       ok: true,
-      route: "clarify",
-      answer: `Which job did you mean?\n\n${options}\n\nReply with the job number (e.g., “profit on job 1556”).`,
-      evidence: { sql: [], facts_used: 0 },
+      route: "insight",
+      answer:
+        profitReply({ row, label: row.job_name || resolved.jobName || `Job #${requestedJobNo}` }) +
+        (askedForRangeButWeCant
+          ? `\n\nNote: job profit by date range isn’t fully wired yet, so this is all-time for that job.`
+          : ``),
+      evidence: { sql: ["v_job_profit_simple_fixed/getJobProfitSimple"], facts_used: 4 },
+      memory_patch,
     };
   }
 
   return {
     ok: true,
     route: "clarify",
-    answer: `Tell me the job (e.g., “profit on job 1556” or “profit on Oak Street Re-roof”).`,
+    answer: `I couldn’t find Job #${requestedJobNo}. Try “list jobs” or tell me the job name.`,
     evidence: { sql: [], facts_used: 0 },
   };
 }
@@ -654,42 +726,144 @@ async function answerInsightV0({ ownerId, actorKey, text, tz, context = {} }) {
     effectiveRange === "all" ? "all time" :
     "this period";
 
-  // 1) Profit / margin (job)
+    // 1) Profit / margin (job)
   if (looksLikeProfitQuestion(raw)) {
-    const out = await answerProfitIntent({ ownerId, actorKey, text: raw, actorMemory: mem });
-    // Always keep range context sticky even on profit replies
+  const out = await answerProfitIntent({
+    ownerId,
+    actorKey,
+    text: raw,
+    actorMemory: mem,
+    fromIso,
+    toIso,
+    label,
+    effectiveRange,
+    explicitRange: hasExplicitRangeHint(raw),
+  });
+
+    // Persist: last_intent="profit" when we detect profit intent
     if (out && typeof out === "object") {
       out.memory_patch = {
         conversation: {
           ...(memoryPatchBase.conversation || {}),
           ...(out.memory_patch?.conversation || {}),
+          last_intent: "profit",
+          last_topic: "job_profit",
         },
       };
     }
     return out;
   }
 
-  // 2) Business totals (spend / revenue / profit)
-  const wantsSpend = /\bspend\b|\bspent\b|\bexpenses?\b|\bcosts?\b/.test(s);
-  const wantsRevenue = /\brevenue\b|\bsales\b|\bearned\b|\bcollect(ed|ions)?\b|\bdeposits?\b/.test(s);
-  const wantsProfit = /\bprofit\b|\bmargin\b|\bnet\b/.test(s);
+  // 1b) Range-only follow-up: reuse last intent deterministically
+  // Example: after "profit on job 1556", user says "what about last month?"
+  if (isRangeOnlyFollowup(raw)) {
+    const lastIntent = String(convo.last_intent || "").trim();
 
-  // 2b) “Top expenses” intent (categories/vendors)
-  const wantsTopExpenses =
-    /\btop\s*\d*\s*(expenses?|costs?)\b|\bbiggest\s*(expenses?|costs?)\b|\btop\s*categories\b|\btop\s*vendors\b/.test(s);
+    if (lastIntent === "profit") {
+      // If we have an active job in memory, re-run profit using the new range context (range is already set above)
+      // NOTE: job profit currently ignores range because it uses v_job_profit_simple_fixed (all-time).
+      // We still keep range sticky for other intents and for future job-profit-by-range wiring.
+      const out = await answerProfitIntent({ ownerId, actorKey, text: raw, actorMemory: mem });
+      if (out && typeof out === "object") {
+        out.memory_patch = {
+          conversation: {
+            ...(memoryPatchBase.conversation || {}),
+            ...(out.memory_patch?.conversation || {}),
+            last_intent: "profit",
+            last_topic: "job_profit",
+          },
+        };
+      }
+      return out;
+    }
 
-  if (wantsSpend || wantsRevenue || wantsProfit || wantsTopExpenses) {
+    if (lastIntent === "totals") {
+      // Re-run totals using the new range, based on what they asked last time (stored below)
+      const lastTotalsMode = String(convo.last_totals_mode || "spend").trim(); // spend|revenue|profit|top_expenses
+      const wantsSpend = lastTotalsMode === "spend";
+      const wantsRevenue = lastTotalsMode === "revenue";
+      const wantsProfit = lastTotalsMode === "profit";
+      const wantsTopExpenses = lastTotalsMode === "top_expenses";
+
+      const spendCents = await pg.sumExpensesCentsByRange({ ownerId, fromIso, toIso });
+      const revenueCents = await pg.sumRevenueCentsByRange({ ownerId, fromIso, toIso });
+      const profitCents = Number(revenueCents || 0) - Number(spendCents || 0);
+
+      const lines = [`For ${label}:`];
+      if (wantsRevenue) lines.push(`• Revenue: ${money(revenueCents)}`);
+      if (wantsSpend) lines.push(`• Spend: ${money(spendCents)}`);
+      if (wantsProfit) lines.push(`• Profit (revenue − spend): ${money(profitCents)}`);
+
+      if (wantsTopExpenses) {
+        const topCats = await pg.topExpenseCategoriesByRange?.({ ownerId, fromIso, toIso, limit: 5 });
+        const topVendors = await pg.topExpenseVendorsByRange?.({ ownerId, fromIso, toIso, limit: 5 });
+
+        const catRows = Array.isArray(topCats?.rows) ? topCats.rows : [];
+        const venRows = Array.isArray(topVendors?.rows) ? topVendors.rows : [];
+
+        if (catRows.length || venRows.length) lines.push("");
+
+        if (catRows.length) {
+          lines.push("Top expense categories:");
+          catRows.forEach((r) => {
+            const name = String(r.category || "Uncategorized").trim() || "Uncategorized";
+            const cents = Number(r.cents || 0);
+            lines.push(`• ${name}: ${money(cents)}`);
+          });
+        }
+
+        if (venRows.length) {
+          if (catRows.length) lines.push("");
+          lines.push("Top vendors:");
+          venRows.forEach((r) => {
+            const name = String(r.vendor || "Unknown").trim() || "Unknown";
+            const cents = Number(r.cents || 0);
+            lines.push(`• ${name}: ${money(cents)}`);
+          });
+        }
+      }
+
+      return {
+        ok: true,
+        route: "insight",
+        answer: lines.join("\n"),
+        evidence: { sql: ["sumExpensesCentsByRange", "sumRevenueCentsByRange"], facts_used: 2 },
+        memory_patch: {
+          conversation: {
+            ...(memoryPatchBase.conversation || {}),
+            last_intent: "totals",
+            last_topic: "totals",
+            last_totals_mode: lastTotalsMode,
+          },
+        },
+      };
+    }
+
+    // If we don't know the last intent, keep it tight (no guessing)
+    return {
+      ok: true,
+      route: "clarify",
+      answer: `What should I run for ${label} — spend, revenue, profit, or top expenses?`,
+      evidence: { sql: [], facts_used: 0 },
+      memory_patch: memoryPatchBase,
+    };
+  }
+
+  // 2) Business totals (spend / revenue / profit / top expenses)
+  const intent = detectIntent(raw);
+
+  if (intent.anyTotals) {
     const spendCents = await pg.sumExpensesCentsByRange({ ownerId, fromIso, toIso });
     const revenueCents = await pg.sumRevenueCentsByRange({ ownerId, fromIso, toIso });
     const profitCents = Number(revenueCents || 0) - Number(spendCents || 0);
 
     const lines = [`For ${label}:`];
 
-    if (wantsRevenue) lines.push(`• Revenue: ${money(revenueCents)}`);
-    if (wantsSpend) lines.push(`• Spend: ${money(spendCents)}`);
-    if (wantsProfit) lines.push(`• Profit (revenue − spend): ${money(profitCents)}`);
+    if (intent.wantsRevenue) lines.push(`• Revenue: ${money(revenueCents)}`);
+    if (intent.wantsSpend) lines.push(`• Spend: ${money(spendCents)}`);
+    if (intent.wantsProfit) lines.push(`• Profit (revenue − spend): ${money(profitCents)}`);
 
-    if (wantsTopExpenses) {
+    if (intent.wantsTopExpenses) {
       const topCats = await pg.topExpenseCategoriesByRange?.({ ownerId, fromIso, toIso, limit: 5 });
       const topVendors = await pg.topExpenseVendorsByRange?.({ ownerId, fromIso, toIso, limit: 5 });
 
@@ -723,6 +897,14 @@ async function answerInsightV0({ ownerId, actorKey, text, tz, context = {} }) {
       }
     }
 
+    // Determine last_totals_mode for range-only followups
+    const lastTotalsMode =
+      intent.wantsTopExpenses ? "top_expenses" :
+      intent.wantsProfit ? "profit" :
+      intent.wantsRevenue ? "revenue" :
+      intent.wantsSpend ? "spend" :
+      "spend";
+
     return {
       ok: true,
       route: "insight",
@@ -731,17 +913,23 @@ async function answerInsightV0({ ownerId, actorKey, text, tz, context = {} }) {
         sql: [
           "sumExpensesCentsByRange",
           "sumRevenueCentsByRange",
-          ...(wantsTopExpenses ? ["topExpenseCategoriesByRange", "topExpenseVendorsByRange"] : []),
+          ...(intent.wantsTopExpenses ? ["topExpenseCategoriesByRange", "topExpenseVendorsByRange"] : []),
         ],
         facts_used: 2,
       },
-      memory_patch: memoryPatchBase,
+      memory_patch: {
+        conversation: {
+          ...(memoryPatchBase.conversation || {}),
+          last_intent: "totals",
+          last_topic: "totals",
+          last_totals_mode: lastTotalsMode,
+        },
+      },
     };
   }
 
   // 3) Cash-in/out (best-effort stub)
-  const wantsCash = /\bcash\b|\bbank\b|\bcashflow\b|\bcash flow\b/.test(s);
-  if (wantsCash) {
+  if (intent.wantsCash) {
     return {
       ok: true,
       route: "clarify",
@@ -749,7 +937,13 @@ async function answerInsightV0({ ownerId, actorKey, text, tz, context = {} }) {
         `Cash-in/out isn’t wired yet for your schema (we can add it via v_cashflow_daily).\n\n` +
         `Try:\n• “spend ${label}”\n• “revenue ${label}”\n• “top expenses ${label}”\n• “profit on job 1556”`,
       evidence: { sql: [], facts_used: 0 },
-      memory_patch: memoryPatchBase,
+      memory_patch: {
+        conversation: {
+          ...(memoryPatchBase.conversation || {}),
+          last_intent: "cashflow",
+          last_topic: "cashflow",
+        },
+      },
     };
   }
 

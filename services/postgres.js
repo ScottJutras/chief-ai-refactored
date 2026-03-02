@@ -369,6 +369,143 @@ const r = await query(
   return r;
 }
 
+// -------------------- Schema introspection (cached) --------------------
+
+const __colCache = new Map(); // key: "schema.table" => Set(cols)
+
+async function getColumnsCached(schema, table) {
+  const key = `${schema}.${table}`;
+  if (__colCache.has(key)) return __colCache.get(key);
+
+  const r = await query(
+    `
+    select column_name
+    from information_schema.columns
+    where table_schema = $1 and table_name = $2
+    `,
+    [schema, table]
+  );
+
+  const set = new Set((r?.rows || []).map((x) => String(x.column_name || "").toLowerCase()));
+  __colCache.set(key, set);
+  return set;
+}
+
+async function hasColumn(schema, table, col) {
+  try {
+    const cols = await getColumnsCached(schema, table);
+    return cols.has(String(col || "").toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+// -------------------- Job profit by range (transactions-first) --------------------
+
+/**
+ * Compute job profit by range from public.transactions.
+ *
+ * Requirements:
+ * - transactions.kind in ('revenue','expense')
+ * - date column exists (you already use `date`)
+ * - job link exists in one of:
+ *   - transactions.job_id (preferred)
+ *   - transactions.job_no
+ *
+ * Returns:
+ * { ok:true, row:{ revenue_cents, expense_cents, profit_cents, mode } }
+ * or { ok:false, error, reason }
+ */
+async function getJobProfitByRange({ ownerId, jobId = null, jobNo = null, fromIso, toIso }) {
+  const owner = DIGITS(ownerId);
+  if (!owner) return { ok: false, reason: "missing_owner" };
+
+  const isIso = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || "").trim());
+  const from = String(fromIso || "").trim();
+  const to = String(toIso || "").trim();
+  if (!isIso(from) || !isIso(to)) return { ok: false, reason: "invalid_range" };
+
+  const a = from <= to ? from : to;
+  const b = from <= to ? to : from;
+
+  // Decide which job-link column is available
+  const hasJobId = await hasColumn("public", "transactions", "job_id");
+  const hasJobNo = await hasColumn("public", "transactions", "job_no");
+
+  // Fail-closed: if we have neither, we cannot do ranged job profit safely
+  if (!hasJobId && !hasJobNo) {
+    return { ok: false, reason: "no_job_link_columns" };
+  }
+
+  // Prefer job_id if available and provided
+  if (hasJobId && jobId != null && Number.isFinite(Number(jobId))) {
+    const jid = Number(jobId);
+
+    const r = await query(
+      `
+      with sums as (
+        select
+          coalesce(sum(case when kind='revenue' then coalesce(amount_cents, (round(coalesce(amount,0)::numeric*100))::bigint) else 0 end),0)::bigint as revenue_cents,
+          coalesce(sum(case when kind='expense' then coalesce(amount_cents, (round(coalesce(amount,0)::numeric*100))::bigint) else 0 end),0)::bigint as expense_cents
+        from public.transactions
+        where owner_id::text = $1
+          and kind in ('revenue','expense')
+          and date >= $2::date
+          and date <= $3::date
+          and job_id = $4
+      )
+      select
+        revenue_cents,
+        expense_cents,
+        (revenue_cents - expense_cents)::bigint as profit_cents
+      from sums
+      `,
+      [owner, a, b, jid]
+    );
+
+    const row = r?.rows?.[0] || null;
+    if (!row) return { ok: false, reason: "no_rows" };
+
+    return { ok: true, row: { ...row, mode: "job_id" } };
+  }
+
+  // Fallback: job_no if available and provided
+  if (hasJobNo && jobNo != null && Number.isFinite(Number(jobNo))) {
+    const jn = Number(jobNo);
+
+    const r = await query(
+      `
+      with sums as (
+        select
+          coalesce(sum(case when kind='revenue' then coalesce(amount_cents, (round(coalesce(amount,0)::numeric*100))::bigint) else 0 end),0)::bigint as revenue_cents,
+          coalesce(sum(case when kind='expense' then coalesce(amount_cents, (round(coalesce(amount,0)::numeric*100))::bigint) else 0 end),0)::bigint as expense_cents
+        from public.transactions
+        where owner_id::text = $1
+          and kind in ('revenue','expense')
+          and date >= $2::date
+          and date <= $3::date
+          and job_no = $4
+      )
+      select
+        revenue_cents,
+        expense_cents,
+        (revenue_cents - expense_cents)::bigint as profit_cents
+      from sums
+      `,
+      [owner, a, b, jn]
+    );
+
+    const row = r?.rows?.[0] || null;
+    if (!row) return { ok: false, reason: "no_rows" };
+
+    return { ok: true, row: { ...row, mode: "job_no" } };
+  }
+
+  // If we couldn't use any mode because required input missing:
+  return { ok: false, reason: "missing_job_key_for_available_mode", hasJobId, hasJobNo };
+}
+
+
 /**
  * Sum expenses (in cents) for a date range.
  * chiefos_expenses.amount is numeric dollars (e.g. 4000.0000000000000000)
@@ -813,6 +950,38 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_ASSET_ID,
     TX_HAS_TENANT_ID
   };
+}
+
+// -------------------- Column type introspection (cached) --------------------
+
+const __colTypeCache = new Map(); // key: "schema.table.column" => { data_type, udt_name }
+
+async function getColumnTypeCached(schema, table, column) {
+  const key = `${schema}.${table}.${column}`.toLowerCase();
+  if (__colTypeCache.has(key)) return __colTypeCache.get(key);
+
+  const r = await query(
+    `
+    select data_type, udt_name
+    from information_schema.columns
+    where table_schema = $1 and table_name = $2 and column_name = $3
+    limit 1
+    `,
+    [schema, table, column]
+  );
+
+  const row = r?.rows?.[0] || null;
+  const out = row
+    ? { data_type: String(row.data_type || '').toLowerCase(), udt_name: String(row.udt_name || '').toLowerCase() }
+    : null;
+
+  __colTypeCache.set(key, out);
+  return out;
+}
+
+function isIntLike(x) {
+  const s = String(x ?? '').trim();
+  return /^\d+$/.test(s);
 }
 
 // ============================================================================
@@ -1435,6 +1604,21 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 
   // 🔐 Resolve tenant_id (required post-RLS hardening)
   const caps = await detectTransactionsCapabilities();
+  // Determine transactions.job_id type (uuid vs int) once
+if (caps.TX_HAS_JOB_ID) {
+  try {
+    const t = await getColumnTypeCached('public', 'transactions', 'job_id');
+    // Postgres reports uuid as data_type='uuid'
+    // Ints usually data_type='integer' or 'bigint' (udt_name: int4/int8)
+    if (t?.data_type === 'uuid') jobIdType = 'uuid';
+    else if (t?.data_type === 'integer' || t?.data_type === 'bigint' || t?.udt_name === 'int4' || t?.udt_name === 'int8')
+      jobIdType = 'int';
+    else jobIdType = null;
+  } catch (e) {
+    console.warn('[PG/transactions] job_id type detect failed:', e?.message);
+    jobIdType = null;
+  }
+}
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
 
   // 🔐 tenant_id (required by portal RLS insert policy when column exists)
@@ -1457,7 +1641,11 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     }
   }
 
-  let resolvedJobId = null; // UUID only
+  // Schema-aware job_id:
+// - if transactions.job_id is uuid -> store UUID string
+// - else (typically int) -> store integer
+let resolvedJobId = null;
+let jobIdType = null; // 'uuid' | 'int' | null
   let resolvedJobNo = null;
   let resolvedJobName =
     jobNameInput || (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
@@ -1509,18 +1697,18 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   }
 
   try {
-    // 1) explicit UUID job_id
-    if (explicitJobId != null && looksLikeUuid(String(explicitJobId))) {
-      resolvedJobId = String(explicitJobId);
-      const row = await resolveJobRow(owner, resolvedJobId);
-      if (row) {
-        resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
-        const nm = row.job_name ? String(row.job_name).trim() : null;
-        if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
-      }
-    } else if (explicitJobId != null && /^\d+$/.test(String(explicitJobId).trim())) {
-      console.warn('[PG/transactions] refusing numeric explicit job_id; ignoring', { explicitJobId });
-    }
+   // 1) explicit UUID job_id
+if (explicitJobId != null && looksLikeUuid(String(explicitJobId))) {
+  resolvedJobId = String(explicitJobId);
+  const row = await resolveJobRow(owner, resolvedJobId);
+  if (row) {
+    resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
+    const nm = row.job_name ? String(row.job_name).trim() : null;
+    if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
+  }
+} else if (explicitJobId != null && /^\d+$/.test(String(explicitJobId).trim())) {
+  console.warn('[PG/transactions] refusing numeric explicit job_id; ignoring', { explicitJobId });
+}
 
     // 2) explicit job_no
     if (!resolvedJobId && explicitJobNo != null && String(explicitJobNo).trim() !== '') {
@@ -1529,8 +1717,13 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
         resolvedJobNo = n;
         const row = await resolveJobRow(owner, String(n));
         if (row) {
-          const candidate = row.id != null ? String(row.id) : null;
-          if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+          const candidate = row?.id != null ? String(row.id).trim() : null;
+
+if (jobIdType === 'uuid') {
+  if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+} else if (jobIdType === 'int') {
+  if (candidate && isIntLike(candidate)) resolvedJobId = Number(candidate);
+}
           resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
           const nm = row.job_name ? String(row.job_name).trim() : null;
           if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -1542,8 +1735,13 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     if (!resolvedJobId && jobRef) {
       const row = await resolveJobRow(owner, jobRef);
       if (row) {
-        const candidate = row.id != null ? String(row.id) : null;
-        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+        const candidate = row?.id != null ? String(row.id).trim() : null;
+
+if (jobIdType === 'uuid') {
+  if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+} else if (jobIdType === 'int') {
+  if (candidate && isIntLike(candidate)) resolvedJobId = Number(candidate);
+}
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         const nm = row.job_name ? String(row.job_name).trim() : null;
         if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -1562,8 +1760,13 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     if (!resolvedJobId && resolvedJobName) {
       const row = await resolveJobRow(owner, resolvedJobName);
       if (row) {
-        const candidate = row.id != null ? String(row.id) : null;
-        if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+        const candidate = row?.id != null ? String(row.id).trim() : null;
+
+if (jobIdType === 'uuid') {
+  if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
+} else if (jobIdType === 'int') {
+  if (candidate && isIntLike(candidate)) resolvedJobId = Number(candidate);
+}
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         const nm = row.job_name ? String(row.job_name).trim() : null;
         if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -1573,11 +1776,25 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     console.warn('[PG/transactions] job resolution failed (ignored):', e?.message);
   }
 
-  // hard guard: UUID or null
-  if (resolvedJobId && !looksLikeUuid(String(resolvedJobId))) {
-    console.warn('[PG/transactions] dropping non-uuid resolvedJobId', { resolvedJobId });
+  // hard guard: enforce schema type (uuid vs int). Unknown => null.
+if (resolvedJobId != null) {
+  if (jobIdType === 'uuid') {
+    if (!looksLikeUuid(String(resolvedJobId))) {
+      console.warn('[PG/transactions] dropping non-uuid resolvedJobId (uuid column)', { resolvedJobId });
+      resolvedJobId = null;
+    }
+  } else if (jobIdType === 'int') {
+    if (!Number.isFinite(Number(resolvedJobId))) {
+      console.warn('[PG/transactions] dropping non-int resolvedJobId (int column)', { resolvedJobId });
+      resolvedJobId = null;
+    } else {
+      resolvedJobId = Number(resolvedJobId);
+    }
+  } else {
+    console.warn('[PG/transactions] dropping resolvedJobId (unknown column type)', { resolvedJobId });
     resolvedJobId = null;
   }
+}
 
   if (resolvedJobName && isPoisonJobName(resolvedJobName)) {
     console.warn('[PG/transactions] dropping poison resolvedJobName (post-resolve)', { resolvedJobName });
@@ -1742,6 +1959,7 @@ const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
   try {
   const r = await queryWithTimeout(sql, vals, timeoutMs);
   const id = r?.rows?.[0]?.id ?? null;
+  console.info('[TX_WRITE_JOB]', { owner_id: owner, kind, job_id: resolvedJobId ?? null, job_no: jobNo ?? null });
   if (id) return { inserted: true, id };
 
   // conflictSql DO NOTHING can yield no RETURNING row; try to recover id
@@ -4680,4 +4898,7 @@ module.exports = {
   allocateNextActivityLogNo,
   getActorMemory,
   patchActorMemory,
+  sumExpensesCentsByRange,
+  sumRevenueCentsByRange,
+  getJobProfitByRange,
 };

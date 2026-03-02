@@ -119,12 +119,22 @@ async function answerChief({
     context: { ...context, ownerProfile }
   });
 
-  // 2) If action route: DO NOT Ask-Chief gate. This preserves Free-tier capture.
-  if (decision?.route === 'action') return decision;
+    // 2) If action route: DO NOT Ask-Chief gate. This preserves Free-tier capture.
+  if (decision?.route === "action") return decision;
 
   // 3) If reasoning route: enforce plan + quota (fail-closed) + consume quota before answering.
   const gate = await enforceAskChiefGates_AND_Consume({ ownerId: ownerIdNorm, ownerProfile, tz });
   if (gate?.gated) return gate;
+
+  // 4) Execute reasoning AFTER gates
+  if (typeof decision?.run === "function") {
+    try {
+      return await decision.run();
+    } catch (e) {
+      console.warn("[CHIEF] reasoning run failed:", e?.message);
+      return { ok: true, answer: "Something went wrong. Try again.", evidence: { sql: [], facts_used: 0 } };
+    }
+  }
 
   return decision;
 }

@@ -3192,18 +3192,23 @@ try {
   } else {
     // 1) Profit / margin (job-specific)
     const looksProfit =
-      (/\bprofit\b/.test(s) ||
-        /\bmargin\b/.test(s) ||
-        /\bhow much am i making\b/.test(s) ||
-        /\bhow much are we making\b/.test(s) ||
-        /\bwhat am i making\b/.test(s) ||
-        /\bmaking\b/.test(s)) &&
-      (/\bjob\b/.test(s) ||
-        /(^|\s)#\d+\b/.test(s) ||
-        /\bactive job\b/.test(s) ||
-        /\bprofit\s+\d+\b/.test(s) ||
-        /\bon\s+[a-z0-9]/.test(s));
-
+  (
+    /\bprofit\b/.test(s) ||
+    /\bprofitability\b/.test(s) ||
+    /\bmargin\b/.test(s) ||
+    /\bhow\s+profitable\b/.test(s) ||
+    /\bwhat'?s\s+the\s+margin\b/.test(s) ||
+    /\bhow much am i making\b/.test(s) ||
+    /\bhow much are we making\b/.test(s) ||
+    /\bwhat am i making\b/.test(s)
+  ) &&
+  (
+    /\bjob\b/.test(s) ||
+    /(^|\s)#\d+\b/.test(s) ||          // "#12"
+    /\bjob\s*#?\s*\d+\b/.test(s) ||     // "job 1556" or "job #1556"
+    /\bactive job\b/.test(s) ||
+    /\bon\s+[a-z0-9]/.test(s)
+  );
     // 2) Time presets (MVP-safe totals)
     const hasTimePreset =
       /\btoday\b/.test(s) ||
@@ -3720,13 +3725,13 @@ if (looksRevenue && !isHowToQuestion && !isQuestionAsk) {
     let looksTask = /^task\b/.test(lc2) || /\btasks?\b/.test(lc2);
 
     let looksJob =
-      /\b(?:job|jobs)\b/.test(lc2) ||
-      isJobPickerIntent(lc2) ||
-      /\bactive job\??\b/.test(lc2) ||
-      /\bwhat'?s\s+my\s+active\s+job\??\b/.test(lc2) ||
-      /\bset\s+active\b/.test(lc2) ||
-      /\b(list|create|start|activate|pause|resume|finish)\s+job\b/.test(lc2) ||
-      /\bmove\s+last\s+log\s+to\b/.test(lc2);
+  isJobPickerIntent(lc2) ||
+  /\bactive job\??\b/.test(lc2) ||
+  /\bwhat'?s\s+my\s+active\s+job\??\b/.test(lc2) ||
+  /\bset\s+active\b/.test(lc2) ||
+  /\b(list|create|new|start|change|switch|pick|activate|pause|resume|finish|close|delete|remove|archive)\s+job\b/.test(lc2) ||
+  /\bjobs?\s+(list|show|open|active|recent)\b/.test(lc2) ||
+  /\bmove\s+last\s+log\s+to\b/.test(lc2);
 
  let looksTime =
   /\b(time\s*clock|timeclock|clock|punch|break|drive|timesheet|hours|lunch|undo)\b/.test(lc2) ||

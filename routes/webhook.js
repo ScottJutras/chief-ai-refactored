@@ -1962,6 +1962,70 @@ if (lc2Clean === "commands" || lc2Clean === "help") {
   return ok(res, buildCommandsMessage());
 }
 
+// -----------------------------------------------------------------------
+// ✅ HOW-TO / HELP INTERCEPT (must run EARLY)
+// - Prevents "How do I log an expense?" from triggering intake handlers
+// - Routes to Chief/agent guidance (or SOP) instead
+// -----------------------------------------------------------------------
+{
+  const raw = String(text2 || "").trim();
+  const s = raw.toLowerCase();
+
+  const howStem =
+    /\b(how (do|to) i|how to|help me|help with|what do i say|what should i say|how can i)\b/i.test(raw);
+
+  const mentionsLog =
+    /\b(log|add|record|enter|track|submit)\b/i.test(raw);
+
+  const mentionsDomain =
+    /\b(expense|exp|revenue|rev|income|sale|task|time|clock|timesheet|job|jobs)\b/i.test(raw);
+
+  const looksHowTo = (howStem || /\?\s*$/.test(raw)) && (mentionsLog || howStem) && mentionsDomain;
+
+  if (looksHowTo) {
+    try {
+      // Prefer agent for natural help
+      const { answerChief } = require("../services/answerChief");
+
+      const out = await answerChief({
+        ownerId: req.ownerId,
+        actorKey: req.actorKey || req.from,
+        text: raw,
+        tz: req.tz || req.userProfile?.tz || "America/Toronto",
+        channel: "whatsapp",
+        req,
+        agent: req.app?.locals?.agent || null,
+        context: {
+          from: req.from,
+          ownerProfile: req.ownerProfile,
+          userProfile: req.userProfile,
+          isOwner: req.isOwner,
+          messageSid,
+          reqBody: req.body,
+          topicHints: ["help"]
+        }
+      });
+
+      const msg = String(out?.answer || "").trim();
+      if (msg) return ok(res, msg);
+    } catch (e) {
+      console.warn("[HOWTO] answerChief failed (fallback):", e?.message);
+    }
+
+    // Fallback if agent is down
+    return ok(
+      res,
+      [
+        "To log an expense, just text something like:",
+        "",
+        "• expense $52 Home Depot lumber today",
+        "",
+        "That’s it."
+      ].join("\n")
+    );
+  }
+}
+
     // ✅ Owner-only: onboarding status (debug helper)
 // Keyword: chiefonboarding status
 if (/^chiefonboarding\s+status\b/i.test(lc2Clean)) {

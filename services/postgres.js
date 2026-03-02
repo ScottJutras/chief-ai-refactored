@@ -1541,8 +1541,11 @@ async function cancelAllCilDraftsForActor({ owner_id, actor_phone, kind = null, 
  * ✅ insertTransaction()
  * Schema-aware insert into public.transactions with optional fields.
  *
- * HARD GUARANTEE:
- * - Only insert transactions.job_id when it is a UUID.
+ * HARD GUARANTEES:
+ * - transactions.job_id is written ONLY when it matches the column type:
+ *   - UUID string if job_id column is uuid
+ *   - integer if job_id column is int/bigint
+ *   - otherwise null
  * - media_asset_id is UUID or null only.
  */
 async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
@@ -1550,12 +1553,11 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   const kind = String(opts.kind || '').trim();
   const date = String(opts.date || '').trim();
   const description = String(opts.description || '').trim() || 'Unknown';
-  
+
   const amountCents = Number(opts.amount_cents ?? opts.amountCents ?? 0) || 0;
   const amountMaybe = opts.amount;
 
-    let source = String(opts.source || '').trim() || 'Unknown';
-
+  let source = String(opts.source || '').trim() || 'Unknown';
   const sourceMsgId = String(opts.source_msg_id ?? opts.sourceMsgId ?? '').trim() || null;
 
   // ✅ Normalize + diagnose bad sources in ONE place (before dedupe + insert)
@@ -1581,11 +1583,12 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       ? String(opts.job_name ?? opts.jobName ?? opts.job_title).trim()
       : null;
 
-  const explicitJobId = opts.job_id ?? opts.jobId ?? null; // should be UUID if present
+  const explicitJobId = opts.job_id ?? opts.jobId ?? null; // uuid OR int (schema-dependent)
   const explicitJobNo = opts.job_no ?? opts.jobNo ?? null; // number-like
 
   const category = opts.category == null ? null : String(opts.category).trim() || null;
   const userName = opts.user_name ?? opts.userName ?? null;
+
   // ✅ media asset id: UUID or null only
   const mediaAssetIdRaw = opts.media_asset_id ?? opts.mediaAssetId ?? opts.mediaAssetID ?? null;
   const mediaAssetId =
@@ -1602,23 +1605,32 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   if (!date) throw new Error('insertTransaction missing date');
   if (!amountCents || amountCents <= 0) throw new Error('insertTransaction invalid amount_cents');
 
+  // Schema-aware job_id:
+  // - if transactions.job_id is uuid -> store UUID string
+  // - if int/bigint -> store integer
+  let resolvedJobId = null;
+  let jobIdType = null; // 'uuid' | 'int' | null
+
   // 🔐 Resolve tenant_id (required post-RLS hardening)
   const caps = await detectTransactionsCapabilities();
+
   // Determine transactions.job_id type (uuid vs int) once
-if (caps.TX_HAS_JOB_ID) {
-  try {
-    const t = await getColumnTypeCached('public', 'transactions', 'job_id');
-    // Postgres reports uuid as data_type='uuid'
-    // Ints usually data_type='integer' or 'bigint' (udt_name: int4/int8)
-    if (t?.data_type === 'uuid') jobIdType = 'uuid';
-    else if (t?.data_type === 'integer' || t?.data_type === 'bigint' || t?.udt_name === 'int4' || t?.udt_name === 'int8')
-      jobIdType = 'int';
-    else jobIdType = null;
-  } catch (e) {
-    console.warn('[PG/transactions] job_id type detect failed:', e?.message);
-    jobIdType = null;
+  if (caps.TX_HAS_JOB_ID) {
+    try {
+      const t = await getColumnTypeCached('public', 'transactions', 'job_id');
+
+      const dt = String(t?.data_type || '').toLowerCase();
+      const udt = String(t?.udt_name || '').toLowerCase();
+
+      if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
+      else if (dt === 'integer' || dt === 'bigint' || udt === 'int4' || udt === 'int8') jobIdType = 'int';
+      else jobIdType = null;
+    } catch (e) {
+      console.warn('[PG/transactions] job_id type detect failed:', e?.message);
+      jobIdType = null;
+    }
   }
-}
+
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
 
   // 🔐 tenant_id (required by portal RLS insert policy when column exists)
@@ -1641,14 +1653,10 @@ if (caps.TX_HAS_JOB_ID) {
     }
   }
 
-  // Schema-aware job_id:
-// - if transactions.job_id is uuid -> store UUID string
-// - else (typically int) -> store integer
-let resolvedJobId = null;
-let jobIdType = null; // 'uuid' | 'int' | null
   let resolvedJobNo = null;
   let resolvedJobName =
     jobNameInput || (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
+
 
   function isPoisonJobName(name) {
     const s = String(name || '').trim();

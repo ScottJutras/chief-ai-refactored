@@ -2,7 +2,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const pg = require("../services/postgres");
-const { requireCrewControlPro } = require("../middleware/requireCrewControlPro");
+const { requireCrewControlStarter } = require("../middleware/requireCrewControlStarter");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
 
 const router = express.Router();
@@ -165,7 +165,7 @@ async function ensureOwnerProfiles({ tenantId }, client) {
  * GET /api/crew/admin/members
  * Owner/admin view of all actors + profiles.
  */
-router.get("/admin/members", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+router.get("/admin/members", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -218,7 +218,7 @@ router.get("/admin/members", requirePortalUser, requireCrewControlPro(), async (
  *
  * Returns: { ok: true, items: [{ employee_actor_id, board_actor_id, active }] }
  */
-router.get("/admin/assignments", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+router.get("/admin/assignments", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -259,7 +259,7 @@ router.get("/admin/assignments", requirePortalUser, requireCrewControlPro(), asy
  * Body: { display_name, phone, email }
  * Creates (or reuses) an employee actor + membership + profile + identities.
  */
-router.post("/admin/members", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
+router.post("/admin/members", requirePortalUser, requireCrewControlStarter(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -389,7 +389,7 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
  * PATCH /api/crew/admin/members/:actorId/role
  * Body: { role: 'employee'|'board'|'admin' }
  */
-router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
+router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewControlStarter(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
     const targetActorId = String(req.params.actorId || "").trim();
@@ -468,7 +468,7 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
  * - cannot delete owner
  * - cannot delete yourself
  */
-router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
     const targetActorId = String(req.params.actorId || "").trim();
@@ -558,7 +558,7 @@ router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlPr
  * GET /api/crew/admin/members/export.csv
  * Owner/admin exports members as CSV.
  */
-router.get("/admin/members/export.csv", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+router.get("/admin/members/export.csv", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -627,7 +627,7 @@ router.get("/admin/members/export.csv", requirePortalUser, requireCrewControlPro
  * POST /api/crew/admin/assign
  * Body: { employee_actor_id, board_actor_id }
  */
-router.post("/admin/assign", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
+router.post("/admin/assign", requirePortalUser, requireCrewControlStarter(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
     const employeeActorId = String(req.body?.employee_actor_id || "").trim();

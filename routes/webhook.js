@@ -1802,12 +1802,11 @@ try {
                 planKey = "free";
               }
 
-              const isPro = planKey === "pro";
-              if (!isPro) {
-                return { ok: false, reason: "NOT_INCLUDED", actorRole, planKey };
-              }
-
-              return { ok: true, reason: "PRO_OK", actorRole, planKey };
+              const isStarterOrPro = planKey === "starter" || planKey === "pro";
+if (!isStarterOrPro) {
+  return { ok: false, reason: "NOT_INCLUDED", actorRole, planKey };
+}
+return { ok: true, reason: "STARTER_OK", actorRole, planKey };
             });
 
             if (!gate.ok) {
@@ -1817,7 +1816,7 @@ try {
                 return ok(
                   res,
                   [
-                    "🔒 Crew logging requires Pro (Crew+Control).",
+                    "🔒 Crew logging requires Starter or Pro (Crew+Control).",
                     "Ask the owner to upgrade in the portal, then try again.",
                   ].join("\n")
                 );

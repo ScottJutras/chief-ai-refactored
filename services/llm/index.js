@@ -2,28 +2,42 @@
 // Minimal LLM provider used by services/agent.
 // OpenAI-only for now, soft-fails if key missing.
 
-const OpenAI = require('openai');
+const OpenAI = require("openai");
 
 class LLMProvider {
-  constructor() {
-    this.provider = (process.env.AI_PROVIDER || 'openai').toLowerCase();
-    this.model = process.env.LLM_MODEL || 'gpt-4o-mini';
-    this.openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+  constructor(opts = {}) {
+    // Normalize env var naming (support both)
+    const envProvider =
+      process.env.LLM_PROVIDER ||
+      process.env.AI_PROVIDER ||
+      "openai";
+
+    this.provider = String(opts.provider || envProvider).toLowerCase().trim();
+    this.model = String(opts.model || process.env.LLM_MODEL || "gpt-4o-mini").trim();
+
+    this.openai =
+      this.provider === "openai" && process.env.OPENAI_API_KEY
+        ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+        : null;
   }
 
-  async chat({ messages, temperature = 0.2, max_tokens = 800 }) {
-    if (this.provider === 'openai' && this.openai) {
+  async chat({ messages, tools, temperature = 0.2, max_tokens = 800 }) {
+    if (this.provider === "openai" && this.openai) {
       const resp = await this.openai.chat.completions.create({
         model: this.model,
         messages,
+        // Only send tools if present
+        ...(Array.isArray(tools) && tools.length ? { tools } : {}),
         temperature,
-        max_tokens
+        max_tokens,
       });
-      return resp.choices?.[0]?.message || { role: 'assistant', content: '' };
+
+      return resp.choices?.[0]?.message || { role: "assistant", content: "" };
     }
+
     // Soft fallback (no key): echo minimal help
-    const last = messages?.slice(-1)?.[0]?.content || '';
-    return { role: 'assistant', content: `(llm offline) You said: ${last}` };
+    const last = messages?.slice(-1)?.[0]?.content || "";
+    return { role: "assistant", content: `(llm offline) You said: ${last}` };
   }
 }
 

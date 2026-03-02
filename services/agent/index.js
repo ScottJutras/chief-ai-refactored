@@ -13,7 +13,9 @@ const { getEffectivePlanKey } = require('../../src/config/getEffectivePlanKey');
 
 // ----- Subscription gate (free/starter can't use Agent) -----
 function canUseAgent(ownerProfile) {
-  return getEffectivePlanKey(ownerProfile) === 'pro';
+  // Ask Chief unlocks on Starter, so Agent should too.
+  const k = getEffectivePlanKey(ownerProfile);
+  return k === "starter" || k === "pro";
 }
 
 
@@ -292,9 +294,9 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
   }
 
   const llm = new LLMProvider({
-    provider: process.env.LLM_PROVIDER || 'openai',
-    model: process.env.LLM_MODEL || 'gpt-4o-mini'
-  });
+  provider: process.env.LLM_PROVIDER || process.env.AI_PROVIDER || "openai",
+  model: process.env.LLM_MODEL || "gpt-4o-mini",
+});
 
   const seed = [
     {
@@ -323,8 +325,8 @@ async function runAgent(opts = {}) {
   const text = opts.text || opts.query || '';
   const topicHints = opts.topicHints || opts.hints || [];
   const ownerId = opts.ownerId;
-  const userProfile = opts.userProfile;
-  return ask({ from, ownerId, text, topicHints, userProfile });
+    const ownerProfile = opts.ownerProfile || opts.userProfile || null;
+  return ask({ from, ownerId, text, topicHints, ownerProfile });
 }
 
 module.exports = { ask, runAgent, canUseAgent };

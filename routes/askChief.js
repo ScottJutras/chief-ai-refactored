@@ -5,6 +5,7 @@ const router = express.Router();
 const { requireDashboardOwner } = require("../middleware/requireDashboardOwner");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
 const { answerChief } = require("../services/answerChief");
+const { runAgent } = require("../services/agent");
 
 /**
  * ✅ IMPORTANT:
@@ -173,7 +174,9 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
               upgrade_url: "https://app.usechiefos.com/app/settings/billing",
             });
           }
-
+          // ✅ keep for agent plan gating
+              req.ownerProfile = userRow;
+              
           console.info("[ASK_CHIEF_PLAN_GATE]", {
             tenantId: req.tenantId,
             ownerDigits,
@@ -194,18 +197,28 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
     // ---------------- Execute Brain ----------------
     const actorKey = String(req.portalUserId || "").trim() || ownerId || "portal";
 
-    const out = await answerChief({
-      ownerId: ownerId || null,
-      actorKey,
-      text,
-      tz,
-      channel: tenantId ? "portal" : "dashboard",
-      req,
-      agent: req.app?.locals?.agent || null,
-      context: { tenantId, ownerDigits: ownerId || null, portalRole: req.portalRole || null, range },
-    });
+// ✅ Conversational path: Agent (tool-aware)
+// (This will still fall back to RAG/menu if LLM key missing.)
+const agentReply = await runAgent({
+  fromPhone: null,
+  ownerId: ownerId || null,
+  text,
+  topicHints: ["portal", "askchief"],
+  ownerProfile: req.ownerProfile || null,
+});
 
-    return res.json(out?.ok ? out : { ok: true, answer: out?.answer || "Done." });
+// Keep response contract stable for portal UI
+return res.json({
+  ok: true,
+  answer: String(agentReply || "").trim() || "Done.",
+  meta: {
+    channel: tenantId ? "portal" : "dashboard",
+    tenantId,
+    range,
+    tz,
+    actorKey,
+  },
+});
   } catch (e) {
     console.error("[ASK_CHIEF] failed:", e?.message);
     return res.status(500).json({ ok: false, error: "server_error" });

@@ -124,6 +124,7 @@ app.use("/api", portalRouter);
 // ✅ Crew+Control (Pro-gated) — portal-auth required
 app.use("/api/crew", requirePortalUser, require("./routes/crewControl"));
 app.use("/api/crew", crewAdminRouter);
+app.use("/api/crew", require("./routes/crewReview"));
 // AskChief defines POST /api/ask-chief internally
 app.use(askChiefRouter);
 

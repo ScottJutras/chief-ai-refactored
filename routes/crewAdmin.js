@@ -430,6 +430,164 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
 });
 
 /**
+ * DELETE /api/crew/admin/members/:actorId
+ * Owner/admin can remove a member from the tenant.
+ * Safety:
+ * - cannot delete owner
+ * - cannot delete yourself
+ */
+router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+  try {
+    const { tenantId, actorId } = mustCtx(req);
+    const targetActorId = String(req.params.actorId || "").trim();
+    if (!targetActorId) return jsonErr(res, 400, "MISSING_TARGET", "Missing actorId.");
+
+    const out = await pg.withClient(async (client) => {
+      const role = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(role);
+
+      if (targetActorId === actorId) {
+        return jsonErr(res, 409, "SELF_DELETE_BLOCKED", "You can’t remove yourself.");
+      }
+
+      const t = await client.query(
+        `
+        select actor_id, role
+        from public.chiefos_tenant_actors
+        where tenant_id = $1 and actor_id = $2
+        limit 1
+        `,
+        [tenantId, targetActorId]
+      );
+
+      if (!t?.rowCount) {
+        return jsonErr(res, 404, "NOT_FOUND", "Member not found.");
+      }
+
+      const targetRole = String(t.rows[0].role || "");
+      if (targetRole === "owner") {
+        return jsonErr(res, 409, "OWNER_DELETE_BLOCKED", "Owner cannot be removed.");
+      }
+
+      // Deactivate assignments where this actor is employee or board target
+      await client.query(
+        `
+        update public.chiefos_board_assignments
+           set active = false
+         where tenant_id = $1
+           and (employee_actor_id = $2 or board_actor_id = $2)
+        `,
+        [tenantId, targetActorId]
+      );
+
+      // Remove tenant-scoped profile (optional; keeps things clean)
+      await client.query(
+        `
+        delete from public.chiefos_tenant_actor_profiles
+         where tenant_id = $1
+           and actor_id = $2
+        `,
+        [tenantId, targetActorId]
+      );
+
+      // Remove tenant actor membership
+      const d = await client.query(
+        `
+        delete from public.chiefos_tenant_actors
+         where tenant_id = $1
+           and actor_id = $2
+         returning actor_id
+        `,
+        [tenantId, targetActorId]
+      );
+
+      return { actor_id: d.rows?.[0]?.actor_id || targetActorId };
+    });
+
+    // if we returned jsonErr from inside withClient, it already responded.
+    if (res.headersSent) return;
+
+    return res.json({ ok: true, item: out });
+  } catch (e) {
+    const code = e?.code || "DELETE_MEMBER_FAILED";
+    const status =
+      code === "PERMISSION_DENIED" ? 403 :
+      500;
+    console.error("[CREW_ADMIN] delete member error", e?.message || e);
+    return jsonErr(res, status, code, "Unable to remove member.");
+  }
+});
+
+/**
+ * GET /api/crew/admin/members/export.csv
+ * Owner/admin exports members as CSV.
+ */
+router.get("/admin/members/export.csv", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+  try {
+    const { tenantId, actorId } = mustCtx(req);
+
+    const rows = await pg.withClient(async (client) => {
+      const role = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(role);
+
+      const r = await client.query(
+        `
+        select
+          a.actor_id,
+          a.role,
+          a.created_at,
+          coalesce(p.display_name, '') as display_name,
+          coalesce(p.phone_digits, '') as phone_digits,
+          coalesce(p.email, '') as email
+        from public.chiefos_tenant_actors a
+        left join public.chiefos_tenant_actor_profiles p
+          on p.tenant_id = a.tenant_id and p.actor_id = a.actor_id
+        where a.tenant_id = $1
+        order by a.created_at asc
+        `,
+        [tenantId]
+      );
+
+      return r.rows || [];
+    });
+
+    const esc = (v) => {
+      const s = String(v ?? "");
+      if (/[,"\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    };
+
+    const header = ["actor_id", "role", "display_name", "phone_digits", "email", "created_at"];
+    const lines = [
+      header.join(","),
+      ...rows.map((r) =>
+        [
+          esc(r.actor_id),
+          esc(r.role),
+          esc(r.display_name),
+          esc(r.phone_digits),
+          esc(r.email),
+          esc(r.created_at),
+        ].join(",")
+      ),
+    ];
+
+    const csv = lines.join("\n");
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="crew_members_${tenantId}.csv"`);
+    return res.status(200).send(csv);
+  } catch (e) {
+    const code = e?.code || "EXPORT_FAILED";
+    const status =
+      code === "PERMISSION_DENIED" ? 403 :
+      500;
+    console.error("[CREW_ADMIN] export error", e?.message || e);
+    return jsonErr(res, status, code, "Unable to export members.");
+  }
+});
+
+/**
  * POST /api/crew/admin/assign
  * Body: { employee_actor_id, board_actor_id }
  */

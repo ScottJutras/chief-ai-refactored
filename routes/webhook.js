@@ -1035,7 +1035,30 @@ async function hasExpensePA(ownerId, from) {
 }
 
 
+function normBare(s = "") {
+  return String(s || "").trim().toLowerCase().replace(/[.!?]+$/g, "");
+}
 
+function isBareExpense(text = "") {
+  const s = normBare(text);
+  return s === "expense" || s === "an expense" || s === "a expense";
+}
+function isBareRevenue(text = "") {
+  const s = normBare(text);
+  return s === "revenue" || s === "a revenue" || s === "an revenue";
+}
+function isBareTask(text = "") {
+  const s = normBare(text);
+  return s === "task" || s === "a task" || s === "an task" || s === "todo";
+}
+function isBareTime(text = "") {
+  const s = normBare(text);
+  return s === "time" || s === "clock" || s === "timesheet";
+}
+function isBareJob(text = "") {
+  const s = normBare(text);
+  return s === "job" || s === "a job" || s === "an job" || s === "jobs";
+}
 
 async function maybeAutoYesAfterEdit({
   userId,
@@ -2728,6 +2751,101 @@ console.info('[ROUTER_PA_CTX]', {
   mostRecentPAKind: mostRecentPAKind || null,
   isHardTimeCommand
 });
+
+// -----------------------------------------------------------------------
+// ✅ Pending-choice intercept (ChatGPT-like log flow)
+// If user previously chose "log", then bare intents like "expense" should
+// stay in the conversational flow (Agent/Chief) instead of triggering intake.
+// Must run BEFORE any intake routing / pending txn nudges.
+// -----------------------------------------------------------------------
+try {
+  // If we are already inside a confirm/pick flow, do NOT hijack it.
+  // (Let confirm cards / job pick flows win.)
+  const k = String(mostRecentPAKind || "").trim();
+  const hasActiveConfirmFlow =
+    k === "confirm_expense" ||
+    k === "pick_job_for_expense" ||
+    k === "confirm_revenue" ||
+    k === "pick_job_for_revenue";
+
+  if (!hasActiveConfirmFlow && req.ownerId) {
+    const actorKeyDigits =
+      String(req.actorKey || "").trim() ||
+      String(req.from || "").replace(/\D/g, "").trim();
+
+    // Load actor memory (best-effort)
+    let actorMemory = {};
+    try {
+      if (typeof pg.getActorMemory === "function") {
+        actorMemory = (await pg.getActorMemory(String(req.ownerId), actorKeyDigits)) || {};
+      }
+    } catch (e) {
+      console.warn("[MEMORY] getActorMemory failed (ignored):", e?.message);
+      actorMemory = {};
+    }
+
+    const pendingChoice = String(actorMemory?.pending_choice || "").trim().toLowerCase();
+
+    // Bare intent checks (helpers must exist above)
+    const isBareIntent =
+      isBareExpense(text2) ||
+      isBareRevenue(text2) ||
+      isBareTask(text2) ||
+      isBareTime(text2) ||
+      isBareJob(text2);
+
+    if (pendingChoice === "log" && isBareIntent) {
+      // Route through Chief/Agent path (NOT intake handlers)
+      // so Chief can ask the single best next question.
+      try {
+        const { answerChief } = require("../services/answerChief"); // adjust if your path differs
+
+        const tzSafe =
+          String(
+            req?.tz ||
+              req?.userProfile?.tz ||
+              req?.ownerProfile?.tz ||
+              req?.userProfile?.timezone ||
+              req?.ownerProfile?.timezone ||
+              ""
+          ).trim() || "America/Toronto";
+
+        const out = await answerChief({
+  ownerId: req.ownerId,
+  actorKey: req.actorKey || req.from,
+  text: text2,
+  tz: req.tz || req.userProfile?.tz || "America/Toronto",
+  channel: "whatsapp",
+  req,
+  agent: req.app?.locals?.agent || null,
+  context: {
+    from: req.from,
+    ownerProfile: req.ownerProfile,
+    userProfile: req.userProfile,
+    isOwner: req.isOwner,
+    messageSid,
+    reqBody: req.body,
+    // give it the memory you just loaded (so it can drive the next question)
+    actorMemory,
+    topicHints: ["logging"],
+  },
+});
+
+        const reply =
+          (typeof out === "string" && out.trim()) ? out.trim() :
+          (out?.answer && String(out.answer).trim()) ? String(out.answer).trim() :
+          "Okay — what are you logging?";
+
+        return ok(res, reply);
+      } catch (e) {
+        console.warn("[PENDING_CHOICE] intercept failed (fallthrough):", e?.message);
+        // fall through to normal routing
+      }
+    }
+  }
+} catch (e) {
+  console.warn("[PENDING_CHOICE] outer failed (ignored):", e?.message);
+}
 
 const mostRecentIsExpensePA =
   mostRecentPAKind === 'confirm_expense' || mostRecentPAKind === 'pick_job_for_expense';

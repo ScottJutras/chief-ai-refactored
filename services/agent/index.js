@@ -176,14 +176,21 @@ function pickTopic(text = '', hints = []) {
 // ----- Generic menu (never dead-ends) ----------------------
 function genericMenu() {
   return [
-    'PocketCFO — What I can do:',
-    '• **Jobs**: create job, set active job, list jobs, close job',
-    '• **Tasks**: task – buy nails, my tasks, done #4, due #3 Friday',
-    '• **Timeclock**: clock in/out, start break, timesheet',
-    '• **Money**: expense $50, revenue $500, bill $200',
-    '• **Reports**: metrics, quotes, tax',
-    '• Ask me anything — I’ll search your SOPs!',
-  ].join('\n');
+    "Here’s what I can do right now:",
+    "",
+    "If you want to **log something**, send one of these:",
+    "• task - buy nails",
+    "• expense $52 Home Depot",
+    "• revenue $500 deposit",
+    "• clock in / clock out",
+    "",
+    "If you want an **answer**, ask:",
+    "• what’s my cashflow this month?",
+    "• profit on job 1556",
+    "• what did I log today?",
+    "",
+    "Tell me: **log** or **question** — and I’ll drive."
+  ].join("\n");
 }
 
 // ----- Tool runner (exec OpenAI tool_calls using our handlers) -----

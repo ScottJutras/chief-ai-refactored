@@ -107,17 +107,26 @@ async function answerChief({
     console.warn('[CHIEF] getOwnerProfile failed:', e?.message);
   }
 
+  let actorMemory = {};
+try {
+  if (typeof pg.getActorMemory === 'function') {
+    actorMemory = await pg.getActorMemory(ownerIdNorm, actorKeyNorm);
+  }
+} catch (e) {
+  console.warn('[CHIEF] getActorMemory failed:', e?.message);
+}
+
   // 1) Route FIRST (deterministic-first). Orchestrator must not write directly.
   const decision = await orchestrateChief({
-    ownerId: ownerIdNorm,
-    actorKey: actorKeyNorm,
-    text: cleanedText,
-    tz,
-    channel,
-    req,
-    agent,
-    context: { ...context, ownerProfile }
-  });
+  ownerId: ownerIdNorm,
+  actorKey: actorKeyNorm,
+  text: cleanedText,
+  tz,
+  channel,
+  req,
+  agent,
+  context: { ...context, ownerProfile, actorMemory }
+});
 
     // 2) If action route: DO NOT Ask-Chief gate. This preserves Free-tier capture.
   if (decision?.route === "action") return decision;

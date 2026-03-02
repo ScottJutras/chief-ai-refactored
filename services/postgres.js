@@ -1007,6 +1007,46 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
   }
   return TX_HAS_OWNER_DEDUPE_UNIQUE;
 }
+
+async function getActorMemory(ownerId, actorKey) {
+  const owner_id = String(ownerId || '').trim();
+  const actor_key = String(actorKey || '').trim();
+  if (!owner_id || !actor_key) return {};
+
+  const r = await query(
+    `
+    select memory
+      from public.chief_actor_memory
+     where owner_id = $1 and actor_key = $2
+     limit 1
+    `,
+    [owner_id, actor_key]
+  );
+
+  return r?.rows?.[0]?.memory || {};
+}
+
+async function patchActorMemory(ownerId, actorKey, patch = {}) {
+  const owner_id = String(ownerId || '').trim();
+  const actor_key = String(actorKey || '').trim();
+  if (!owner_id || !actor_key) return;
+
+  const patchJson = patch && typeof patch === 'object' ? patch : {};
+
+  await query(
+    `
+    insert into public.chief_actor_memory (owner_id, actor_key, memory, updated_at)
+    values ($1, $2, $3::jsonb, now())
+    on conflict (owner_id, actor_key)
+    do update set
+      memory = public.chief_actor_memory.memory || excluded.memory,
+      updated_at = now()
+    `,
+    [owner_id, actor_key, JSON.stringify(patchJson)]
+  );
+}
+
+
 // --- Job Picker Pending State (owner-scoped, pickUserId-scoped) ---
 
 async function getPendingJobPick({ ownerId, pickUserId }) {
@@ -4627,4 +4667,6 @@ module.exports = {
   topExpenseCategoriesByRange,
   withTenantAllocLock,
   allocateNextActivityLogNo,
+  getActorMemory,
+  patchActorMemory,
 };

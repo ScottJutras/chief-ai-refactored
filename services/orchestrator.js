@@ -117,7 +117,55 @@ async function answerInsight({ ownerId, actorKey, text, tz }) {
  */
 async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, agent, context }) {
   const rawText = String(text || "").trim();
+    // ---------------------------------------------------------
+  // ✅ Actor memory: handle “log / question” follow-ups
+  // ---------------------------------------------------------
+  const mem = context?.actorMemory || {};
+  const pending = String(mem?.pending_choice || '').trim();
+  const lcRaw = lc(rawText);
 
+  if (pending === 'log_or_question') {
+    if (lcRaw === 'log') {
+      // Set next step memory
+      try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: 'log_or_question', last_topic: 'menu' }); } catch {}
+return {
+  ok: true,
+  route: 'clarify',
+  answer:
+    'Do you want me to (1) log something (expense/revenue/time/task), or (2) answer a question (profit/cashflow/KPIs)?\n\nReply “log” or “question”.',
+  evidence: { sql: [], facts_used: 0 }
+};
+    }
+    if (lcRaw === 'question') {
+      try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: '', last_topic: 'question' }); } catch {}
+      return {
+        ok: true,
+        route: 'clarify',
+        answer: `Alright — what do you want to know? (profit, cashflow, spending, recent activity, etc.)`,
+        evidence: { sql: [], facts_used: 0 }
+      };
+    }
+
+    // If they reply something else, keep the prompt tight
+    return {
+      ok: true,
+      route: 'clarify',
+      answer: `Reply “log” or “question”.`,
+      evidence: { sql: [], facts_used: 0 }
+    };
+  }
+
+  if (pending === 'log_which') {
+    // If they answer with a category word, we can route naturally by leaving it to the existing classifiers.
+    // But if they say something vague, keep it tight.
+    if (/^(expense|revenue|time|task)s?\b/i.test(rawText)) {
+      try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: '' }); } catch {}
+      // let normal routing handle it
+    } else if (lcRaw === 'back' || lcRaw === 'cancel') {
+      try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: '' }); } catch {}
+      return { ok: true, route: 'clarify', answer: `No problem. Tell me what you want to do.`, evidence: { sql: [], facts_used: 0 } };
+    }
+  }
   // 00) Pending-action / mid-flow resolver
   // IMPORTANT: Do not let confirmation replies ("yes") get rerouted.
   if (context?.userProfile?.pending_action) {

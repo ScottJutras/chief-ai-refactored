@@ -78,10 +78,10 @@ function summarizeCashflow(rows, currencyFallback = 'CAD') {
 
   const currency = currencyFallback; // facts may not have currency per-day; keep deterministic
   const ans =
-    `From ${new Date(firstDay).toISOString().slice(0,10)} to ${new Date(lastDay).toISOString().slice(0,10)}:\n` +
-    `• Revenue: ${centsToMoney(totalRev, currency)}\n` +
-    `• Expenses: ${centsToMoney(totalExp, currency)}\n` +
-    `• Net: ${centsToMoney(net, currency)}`;
+  `Cashflow summary (${new Date(firstDay).toISOString().slice(0,10)} → ${new Date(lastDay).toISOString().slice(0,10)}):\n` +
+  `• In:  ${centsToMoney(totalRev, currency)}\n` +
+  `• Out: ${centsToMoney(totalExp, currency)}\n` +
+  `• Net: ${centsToMoney(net, currency)}`;
 
   return {
     answer: ans,
@@ -101,10 +101,10 @@ function summarizeJobProfit(row) {
   }
   const currency = row.currency || 'CAD';
   const ans =
-    `Job ${row.job_no} (${row.job_name || 'Unnamed'}):\n` +
-    `• Revenue: ${centsToMoney(row.revenue_cents || 0, currency)}\n` +
-    `• Expenses: ${centsToMoney(row.expense_cents || 0, currency)}\n` +
-    `• Profit: ${centsToMoney(row.profit_cents || 0, currency)}`;
+  `Job ${row.job_no}${row.job_name ? ` — ${row.job_name}` : ''}:\n` +
+  `• Revenue:  ${centsToMoney(row.revenue_cents || 0, currency)}\n` +
+  `• Expenses: ${centsToMoney(row.expense_cents || 0, currency)}\n` +
+  `• Profit:   ${centsToMoney(row.profit_cents || 0, currency)}`;
 
   return { answer: ans, evidence: { facts_used: 1 } };
 }
@@ -119,7 +119,7 @@ function summarizeLatestFacts(rows) {
     const amt = r.amount_cents != null ? ` ${centsToMoney(r.amount_cents, r.currency || 'CAD')}` : '';
     return `• ${r.event_type}${job}${amt}`;
   });
-  return { answer: `Latest activity:\n${lines.join('\n')}`, evidence: { facts_used: rows.length } };
+  return { answer: `Here’s the latest confirmed activity:\n${lines.join('\n')}`, evidence: { facts_used: rows.length } };
 }
 
 // --- main ---

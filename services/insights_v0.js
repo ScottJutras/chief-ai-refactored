@@ -21,6 +21,12 @@ function pct(x) {
   return `${n.toFixed(1)}%`;
 }
 
+// -------------------- Profit intent (shared) --------------------
+
+// "profitability" must match. Also covers natural phrasing: "did it make money?"
+const PROFIT_INTENT_RE =
+  /\bprofitability\b|\bprofit\b|\bprofits\b|\bmargin\b|\bgross\s*margin\b|\bnet\s*margin\b|\bdid\s+it\s+make\s+money\b|\bmake\s+money\b|\bhow\s+much\s+(am\s+i|are\s+we)\s+making\b|\bwhat\s+(am\s+i|are\s+we)\s+making\b|\bmaking\b/i;
+
 // -------------------- Range normalization --------------------
 
 function normalizeRangeFromText(text, fallback = "mtd") {
@@ -174,10 +180,7 @@ function extractJobRefFromText(rawText) {
     .trim();
 
   const s = t.toLowerCase();
-  const isProfitIntent =
-    /\bprofit\b|\bmargin\b|\bhow much am i making\b|\bhow much are we making\b|\bwhat am i making\b|\bmaking\b/i.test(
-      s
-    );
+    const isProfitIntent = PROFIT_INTENT_RE.test(s);
 
   if (!isProfitIntent) return { kind: null, jobNo: null, name: null, raw: null };
 
@@ -360,11 +363,17 @@ function profitReply({ row, label }) {
 
 function looksLikeProfitQuestion(text) {
   const s = lc(String(text || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim());
-  const hasProfitIntent =
-    /\bprofit\b|\bmargin\b|\bhow much am i making\b|\bhow much are we making\b|\bwhat am i making\b|\bmaking\b/.test(
-      s
-    );
-  const hasJobAnchor = /\bjob\b|(^|\s)#\d+\b|\bactive job\b|\bon\s+[a-z0-9]/.test(s) || /\bprofit\s+\d+/.test(s);
+    const hasProfitIntent = PROFIT_INTENT_RE.test(s);
+
+  // Job anchors: "job 1556", "job #1556", "#1556", "active job", "on Medway Park"
+  const hasJobAnchor =
+    /\bjob\b/.test(s) ||
+    /(^|\s)#\s*\d{1,10}\b/.test(s) ||
+    /\bjob\s*#\s*\d{1,10}\b/.test(s) ||
+    /\bjob\s+\d{1,10}\b/.test(s) ||
+    /\bactive\s+job\b/.test(s) ||
+    /\bon\s+[a-z0-9]/.test(s);
+
   return hasProfitIntent && hasJobAnchor;
 }
 

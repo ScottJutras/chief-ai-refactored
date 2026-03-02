@@ -1962,6 +1962,9 @@ if (lc2Clean === "commands" || lc2Clean === "help") {
   return ok(res, buildCommandsMessage());
 }
 
+if (/^\s*(what('?s)?\s+my\s+)?owner\s*id\b|where do i get my owner id\??/i.test(text2)) {
+  return ok(res, `You don’t need that. I already know your owner ID from your WhatsApp number. Just ask your question (e.g., “profit this month” or “profit on job 1556”).`);
+}
 // -----------------------------------------------------------------------
 // ✅ HOW-TO / HELP INTERCEPT (must run EARLY)
 // - Prevents "How do I log an expense?" from triggering intake handlers

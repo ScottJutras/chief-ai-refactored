@@ -173,7 +173,6 @@ router.get("/admin/members", requirePortalUser, requireCrewControlPro(), async (
       const role = await getActorRole({ tenantId, actorId }, client);
       mustOwnerOrAdmin(role);
 
-      // ✅ small UX improvement: ensure owner profile rows exist
       await ensureOwnerProfiles({ tenantId }, client);
 
       const r = await client.query(
@@ -213,6 +212,49 @@ router.get("/admin/members", requirePortalUser, requireCrewControlPro(), async (
 });
 
 /**
+ * ✅ NEW
+ * GET /api/crew/admin/assignments
+ * Owner/admin fetches current reviewer routing (employee -> board/admin/owner).
+ *
+ * Returns: { ok: true, items: [{ employee_actor_id, board_actor_id, active }] }
+ */
+router.get("/admin/assignments", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+  try {
+    const { tenantId, actorId } = mustCtx(req);
+
+    const out = await pg.withClient(async (client) => {
+      const role = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(role);
+
+      const r = await client.query(
+        `
+        select
+          employee_actor_id,
+          board_actor_id,
+          active
+        from public.chiefos_board_assignments
+        where tenant_id = $1
+          and active = true
+        `,
+        [tenantId]
+      );
+
+      return r.rows || [];
+    });
+
+    return res.json({ ok: true, items: out });
+  } catch (e) {
+    const code = e?.code || "ASSIGNMENTS_FAILED";
+    const status =
+      code === "TENANT_CTX_MISSING" ? 403 :
+      code === "PERMISSION_DENIED" ? 403 :
+      500;
+    console.error("[CREW_ADMIN] assignments error", e?.message || e);
+    return jsonErr(res, status, code, "Unable to load assignments.");
+  }
+});
+
+/**
  * POST /api/crew/admin/members
  * Body: { display_name, phone, email }
  * Creates (or reuses) an employee actor + membership + profile + identities.
@@ -244,11 +286,9 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
 
       await assertLimits({ tenantId }, client, { addingRole: "employee" });
 
-      // ✅ Reuse existing actor if identity exists
       const existingActorId = await findExistingActorId({ phoneDigits, email }, client);
       const newActorId = existingActorId || crypto.randomUUID();
 
-      // ✅ satisfy actor FK
       await client.query(
         `
         insert into public.chiefos_actors (id, display_name, created_at, updated_at)
@@ -260,7 +300,6 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
         [newActorId, displayName]
       );
 
-      // ✅ tenant membership (idempotent; do NOT crash if already exists)
       await client.query(
         `
         insert into public.chiefos_tenant_actors (tenant_id, actor_id, role)
@@ -270,7 +309,6 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
         [tenantId, newActorId]
       );
 
-      // ✅ profile (tenant-local metadata)
       await client.query(
         `
         insert into public.chiefos_tenant_actor_profiles (tenant_id, actor_id, display_name, phone_digits, email)
@@ -284,7 +322,6 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
         [tenantId, newActorId, displayName, phoneDigits || null, email || null]
       );
 
-      // ✅ identities for routing (idempotent) — MUST be inside this transaction
       if (phoneDigits) {
         await client.query(
           `
@@ -311,10 +348,8 @@ router.post("/admin/members", requirePortalUser, requireCrewControlPro(), expres
         );
       }
 
-      // small UX: ensure owner profiles exist too
       await ensureOwnerProfiles({ tenantId }, client);
 
-      // Return the membership role as stored
       const rr = await client.query(
         `
         select role
@@ -367,7 +402,6 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
       const role = await getActorRole({ tenantId, actorId }, client);
       mustOwnerOrAdmin(role);
 
-      // safety: don't allow changing self out of owner/admin here
       if (targetActorId === actorId && newRole !== role) {
         const err = new Error("Cannot change your own role here");
         err.code = "SELF_ROLE_CHANGE_BLOCKED";
@@ -395,7 +429,6 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
         throw err;
       }
 
-      // If demoting from board, deactivate assignments where they are board target
       if (newRole !== "board") {
         await client.query(
           `
@@ -408,7 +441,6 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
         );
       }
 
-      // keep owner profiles present for UI
       await ensureOwnerProfiles({ tenantId }, client);
 
       return u.rows[0];
@@ -447,7 +479,9 @@ router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlPr
       mustOwnerOrAdmin(role);
 
       if (targetActorId === actorId) {
-        return jsonErr(res, 409, "SELF_DELETE_BLOCKED", "You can’t remove yourself.");
+        const err = new Error("You can’t remove yourself.");
+        err.code = "SELF_DELETE_BLOCKED";
+        throw err;
       }
 
       const t = await client.query(
@@ -461,15 +495,18 @@ router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlPr
       );
 
       if (!t?.rowCount) {
-        return jsonErr(res, 404, "NOT_FOUND", "Member not found.");
+        const err = new Error("Member not found.");
+        err.code = "NOT_FOUND";
+        throw err;
       }
 
       const targetRole = String(t.rows[0].role || "");
       if (targetRole === "owner") {
-        return jsonErr(res, 409, "OWNER_DELETE_BLOCKED", "Owner cannot be removed.");
+        const err = new Error("Owner cannot be removed.");
+        err.code = "OWNER_DELETE_BLOCKED";
+        throw err;
       }
 
-      // Deactivate assignments where this actor is employee or board target
       await client.query(
         `
         update public.chiefos_board_assignments
@@ -480,7 +517,6 @@ router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlPr
         [tenantId, targetActorId]
       );
 
-      // Remove tenant-scoped profile (optional; keeps things clean)
       await client.query(
         `
         delete from public.chiefos_tenant_actor_profiles
@@ -490,7 +526,6 @@ router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlPr
         [tenantId, targetActorId]
       );
 
-      // Remove tenant actor membership
       const d = await client.query(
         `
         delete from public.chiefos_tenant_actors
@@ -504,14 +539,15 @@ router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlPr
       return { actor_id: d.rows?.[0]?.actor_id || targetActorId };
     });
 
-    // if we returned jsonErr from inside withClient, it already responded.
-    if (res.headersSent) return;
-
     return res.json({ ok: true, item: out });
   } catch (e) {
     const code = e?.code || "DELETE_MEMBER_FAILED";
     const status =
+      code === "TENANT_CTX_MISSING" ? 403 :
       code === "PERMISSION_DENIED" ? 403 :
+      code === "SELF_DELETE_BLOCKED" ? 409 :
+      code === "OWNER_DELETE_BLOCKED" ? 409 :
+      code === "NOT_FOUND" ? 404 :
       500;
     console.error("[CREW_ADMIN] delete member error", e?.message || e);
     return jsonErr(res, status, code, "Unable to remove member.");
@@ -600,6 +636,9 @@ router.post("/admin/assign", requirePortalUser, requireCrewControlPro(), express
     if (!employeeActorId || !boardActorId) {
       return jsonErr(res, 400, "MISSING_FIELDS", "employee_actor_id and board_actor_id required.");
     }
+    if (employeeActorId === boardActorId) {
+      return jsonErr(res, 400, "INVALID_ASSIGNMENT", "Employee and reviewer cannot be the same actor.");
+    }
 
     const out = await pg.withClient(async (client) => {
       const role = await getActorRole({ tenantId, actorId }, client);
@@ -619,6 +658,13 @@ router.post("/admin/assign", requirePortalUser, requireCrewControlPro(), express
       if (!map.has(employeeActorId) || !map.has(boardActorId)) {
         const err = new Error("Actor not found in tenant");
         err.code = "NOT_FOUND";
+        throw err;
+      }
+
+      const employeeRole = map.get(employeeActorId);
+      if (employeeRole !== "employee") {
+        const err = new Error("Only employees can be assigned to a reviewer");
+        err.code = "INVALID_EMPLOYEE";
         throw err;
       }
 
@@ -651,6 +697,7 @@ router.post("/admin/assign", requirePortalUser, requireCrewControlPro(), express
       code === "PERMISSION_DENIED" ? 403 :
       code === "NOT_FOUND" ? 404 :
       code === "INVALID_REVIEWER" ? 409 :
+      code === "INVALID_EMPLOYEE" ? 409 :
       500;
     console.error("[CREW_ADMIN] assign error", e?.message || e);
     return jsonErr(res, status, code, "Unable to assign employee to board.");

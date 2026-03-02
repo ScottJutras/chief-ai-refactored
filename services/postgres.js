@@ -1009,8 +1009,8 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
 }
 
 async function getActorMemory(ownerId, actorKey) {
-  const owner_id = String(ownerId || '').trim();
-  const actor_key = String(actorKey || '').trim();
+  const owner_id = String(ownerId || '').replace(/\D/g,'');
+  const actor_key = String(actorKey || '').replace(/\D/g,'');
   if (!owner_id || !actor_key) return {};
 
   const r = await query(
@@ -1027,8 +1027,8 @@ async function getActorMemory(ownerId, actorKey) {
 }
 
 async function patchActorMemory(ownerId, actorKey, patch = {}) {
-  const owner_id = String(ownerId || '').trim();
-  const actor_key = String(actorKey || '').trim();
+  const owner_id = String(ownerId || '').replace(/\D/g,'');
+const actor_key = String(actorKey || '').replace(/\D/g,'');
   if (!owner_id || !actor_key) return;
 
   const patchJson = patch && typeof patch === 'object' ? patch : {};

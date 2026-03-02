@@ -3,7 +3,7 @@
 // Chief Agent: topic-aware RAG + LLM + tool-calls (confirm → execute)
 // NORTHSTAR: no dead ends, fast paths, provider-agnostic, audit-friendly
 // ------------------------------------------------------------
-
+const pg = require('../postgres');
 const { LLMProvider } = require('../llm');
 const { CHIEF_SYSTEM_PROMPT } = require('../../prompts/chief.system');
 const txTools = require('../agentTools/transaction');
@@ -193,6 +193,41 @@ function genericMenu() {
   ].join("\n");
 }
 
+function isLogChoice(text = '') {
+  const s = String(text || '').trim().toLowerCase();
+  return s === 'log' || s === 'logging';
+}
+
+function isQuestionChoice(text = '') {
+  const s = String(text || '').trim().toLowerCase();
+  return s === 'question' || s === 'questions' || s === 'answer' || s === 'answers';
+}
+
+function logMenu() {
+  return [
+    `Cool — what are we logging?`,
+    ``,
+    `Reply with one: **expense**, **revenue**, **time**, or **task**.`,
+    ``,
+    `Examples:`,
+    `• expense $52 Home Depot`,
+    `• revenue $500 deposit`,
+    `• clock in`,
+    `• task - buy nails`
+  ].join('\n');
+}
+
+function questionMenu() {
+  return [
+    `Alright — ask it straight.`,
+    ``,
+    `Examples:`,
+    `• what’s my cashflow this month?`,
+    `• profit on job 1556`,
+    `• what did I log today?`
+  ].join('\n');
+}
+
 // ----- Tool runner (exec OpenAI tool_calls using our handlers) -----
 async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
   const { reg, toolsSpec } = getTools();
@@ -267,33 +302,475 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
   return genericMenu();
 }
 
+function normBare(s = '') {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?]+$/g, ''); // "expense." -> "expense"
+}
+
+function isBareExpense(text = '') {
+  const s = normBare(text);
+  return s === 'expense' || s === 'an expense' || s === 'a expense';
+}
+
+function isBareRevenue(text = '') {
+  const s = normBare(text);
+  return s === 'revenue' || s === 'a revenue' || s === 'an revenue';
+}
+
+function isBareTask(text = '') {
+  const s = normBare(text);
+  return s === 'task' || s === 'a task' || s === 'an task' || s === 'todo' || s === 'a todo' || s === 'to-do';
+}
+
+function isBareTime(text = '') {
+  const s = normBare(text);
+  return (
+    s === 'time' ||
+    s === 'clock' ||
+    s === 'clock in' ||
+    s === 'clock out' ||
+    s === 'timesheet' ||
+    s === 'hours'
+  );
+}
+
+function isBareJob(text = '') {
+  const s = normBare(text);
+  return s === 'job' || s === 'a job' || s === 'an job' || s === 'jobs';
+}
+
+function DIGITS_ONLY(x) { return String(x ?? '').replace(/\D/g, ''); }
+
+function normBare(s = '') {
+  return String(s || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?]+$/g, '');
+}
+
+function safeJson(obj) {
+  return obj && typeof obj === 'object' ? obj : {};
+}
+
+async function loadActorMemorySafe(ownerId, actorKey) {
+  try {
+    if (!pg?.getActorMemory) return {};
+    return safeJson(await pg.getActorMemory(ownerId, actorKey));
+  } catch {
+    return {};
+  }
+}
+
+async function patchActorMemorySafe(ownerId, actorKey, patch) {
+  try {
+    if (!pg?.patchActorMemory) return;
+    await pg.patchActorMemory(ownerId, actorKey, safeJson(patch));
+  } catch {
+    // never block user reply
+  }
+}
+
+// Bare intent detectors
+function isBareExpense(text = '') {
+  const s = normBare(text);
+  return s === 'expense' || s === 'an expense' || s === 'a expense';
+}
+function isBareRevenue(text = '') {
+  const s = normBare(text);
+  return s === 'revenue' || s === 'a revenue' || s === 'an revenue';
+}
+function isBareTask(text = '') {
+  const s = normBare(text);
+  return s === 'task' || s === 'a task' || s === 'an task' || s === 'todo' || s === 'to-do';
+}
+function isBareTime(text = '') {
+  const s = normBare(text);
+  return s === 'time' || s === 'clock' || s === 'timesheet' || s === 'hours';
+}
+function isBareJob(text = '') {
+  const s = normBare(text);
+  return s === 'job' || s === 'jobs' || s === 'a job' || s === 'an job';
+}
+
+// “Choice” detectors (you already added isLogChoice/isQuestionChoice — keep yours)
+function isLogChoice(text = '') {
+  const s = normBare(text);
+  return s === 'log' || s === 'logging' || s === 'log something';
+}
+function isQuestionChoice(text = '') {
+  const s = normBare(text);
+  return s === 'question' || s === 'ask' || s === 'answer' || s === 'insight';
+}
+
+// Lightweight “did they provide the missing core?” detectors
+function hasMoney(text = '') {
+  return /\$?\s*\d+(\.\d{1,2})?\b/.test(String(text || ''));
+}
+function looksLikeClockCmd(text = '') {
+  const s = normBare(text);
+  return s === 'clock in' || s === 'clock out' || s === 'start break' || s === 'end break';
+}
+
+function getTodayIso(tz = 'America/Toronto') {
+  try {
+    if (pg?.todayInTZ) return pg.todayInTZ(tz); // your postgres helper
+  } catch {}
+  // fallback (UTC-based, acceptable as last resort)
+  return new Date().toISOString().slice(0, 10);
+}
+
+function extractMoneyText(text = '') {
+  const s = String(text || '').trim();
+  // captures: 52, 52.50, $52, $52.50
+  const m = s.match(/(\$?\s*\d+(?:\.\d{1,2})?)/);
+  if (!m) return null;
+  const raw = m[1].replace(/\s+/g, '');
+  // normalize: always include $ prefix (helps your ingestion)
+  return raw.startsWith('$') ? raw : `$${raw}`;
+}
+
+function extractIsoDate(text = '', tz = 'America/Toronto') {
+  const s = normBare(text);
+  // YYYY-MM-DD
+  const m = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  if (m) return m[1];
+
+  if (s === 'today') return getTodayIso(tz);
+  if (s === 'yesterday') {
+    const t = getTodayIso(tz);
+    const d = new Date(`${t}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 1);
+    return d.toISOString().slice(0, 10);
+  }
+
+  return null;
+}
+
+function looksLikeJustANumber(text = '') {
+  const s = normBare(text);
+  return /^\d+(\.\d{1,2})?$/.test(s) || /^\$\d+(\.\d{1,2})?$/.test(s);
+}
+
+function cleanVendorOrDesc(text = '') {
+  // keep it simple: vendor/desc is whatever they typed, minus trailing punctuation
+  return String(text || '').trim().replace(/[.!?]+$/g, '').trim();
+}
+
+function buildExpenseCommand({ amountText, vendor, dateIso } = {}) {
+  const parts = ['expense'];
+  if (amountText) parts.push(amountText);
+  if (vendor) parts.push(vendor);
+  // only append date if user explicitly provided it (keeps it “chatty”)
+  if (dateIso) parts.push(dateIso);
+  return parts.join(' ');
+}
+
+function buildRevenueCommand({ amountText, desc, dateIso } = {}) {
+  const parts = ['revenue'];
+  if (amountText) parts.push(amountText);
+  if (desc) parts.push(desc);
+  if (dateIso) parts.push(dateIso);
+  return parts.join(' ');
+}
+
+function buildTaskCommand({ taskText } = {}) {
+  // match your examples
+  return `task - ${String(taskText || '').trim()}`;
+}
+
+
 // ----- Public ask API --------------------------------------
 async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) {
+  const raw = String(text || '').trim();
+  const lc = normBare(raw);
+
+  const ownerDigits = DIGITS_ONLY(ownerId);
+  const actorKey = DIGITS_ONLY(from) || ownerDigits; // WhatsApp "from" is your actor identity
+
+  // Load memory (best-effort)
+  const memory = await loadActorMemorySafe(ownerDigits, actorKey);
+  const pending_choice = String(memory?.pending_choice || '').toLowerCase().trim(); // 'log' | 'question'
+  const pending_intent = String(memory?.pending_intent || '').toLowerCase().trim(); // 'expense'|'revenue'|'task'|'time'|'job'
+
+  // If Agent not available for this plan, still give a non-dead-end reply
   if (!canUseAgent(ownerProfile)) {
+    // If they’re mid-flow, still help
+    if (pending_choice === 'log') {
+      return `Got it. What are you logging — expense, revenue, task, or time?`;
+    }
+    if (pending_choice === 'question') {
+      return `Ask away — what do you want to know? (cashflow, profit on a job, what you logged today, etc.)`;
+    }
+
     const ragMod = getRag();
     if (ragMod?.answer) {
       try {
-        const out = await ragMod.answer({ from, query: text, hints: topicHints, ownerId });
+        const out = await ragMod.answer({ from, query: raw, hints: topicHints, ownerId: ownerDigits });
         if (out && out.trim()) return out;
       } catch {}
     }
     return genericMenu();
   }
 
-  const lc = String(text || '').toLowerCase();
-
+  // 0) Help/menu
   if (/\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(lc)) {
+    // reset stale flow state to avoid weird followups
+    await patchActorMemorySafe(ownerDigits, actorKey, { pending_choice: null, pending_intent: null });
     return genericMenu();
   }
 
-  const topic = pickTopic(text, topicHints);
-  console.log('[AGENT] topic:', topic || 'generic', 'text:', text);
+  // 1) Deterministic choice handling + memory
+  if (isLogChoice(raw)) {
+    await patchActorMemorySafe(ownerDigits, actorKey, { pending_choice: 'log', pending_intent: null });
+    // One best next question (ChatGPT-like)
+    return `Got it. What are you logging — **expense**, **revenue**, **task**, **time**, or **job**?`;
+  }
+
+  if (isQuestionChoice(raw)) {
+    await patchActorMemorySafe(ownerDigits, actorKey, { pending_choice: 'question', pending_intent: null });
+    // One best next question (ChatGPT-like)
+    return `Okay — what do you want to know?`;
+  }
+
+  // 2) If we already know they’re logging, treat bare intents as a continuation (NOT a new convo)
+  if (pending_choice === 'log') {
+  if (isBareExpense(raw)) {
+    await patchActorMemorySafe(ownerDigits, actorKey, {
+      pending_intent: 'expense',
+      intake_draft: { kind: 'expense', amountText: null, vendor: null, dateIso: null }
+    });
+    return `How much was it?`;
+  }
+
+  if (isBareRevenue(raw)) {
+    await patchActorMemorySafe(ownerDigits, actorKey, {
+      pending_intent: 'revenue',
+      intake_draft: { kind: 'revenue', amountText: null, desc: null, dateIso: null }
+    });
+    return `How much came in?`;
+  }
+
+  if (isBareTask(raw)) {
+    await patchActorMemorySafe(ownerDigits, actorKey, {
+      pending_intent: 'task',
+      intake_draft: { kind: 'task', taskText: null }
+    });
+    return `What’s the task?`;
+  }
+
+  if (isBareTime(raw)) {
+    await patchActorMemorySafe(ownerDigits, actorKey, {
+      pending_intent: 'time',
+      intake_draft: { kind: 'time' }
+    });
+    return `Clock **in** or **out**?`;
+  }
+
+  if (isBareJob(raw)) {
+    await patchActorMemorySafe(ownerDigits, actorKey, {
+      pending_intent: 'job',
+      intake_draft: { kind: 'job' }
+    });
+    return `Create a job, list jobs, or set active?`;
+  }
+}
+
+   // 3) Draft-driven log flows (ChatGPT-like: one question at a time)
+  const tz = ownerProfile?.tz || 'America/Toronto';
+  const intake = safeJson(memory?.intake_draft || {});
+  const intakeKind = String(intake?.kind || '').toLowerCase().trim();
+
+  // ---------------- EXPENSE ----------------
+  if (pending_choice === 'log' && pending_intent === 'expense') {
+    // Ensure draft exists
+    if (intakeKind !== 'expense') {
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        intake_draft: { kind: 'expense', amountText: null, vendor: null, dateIso: null }
+      });
+      return `How much was it?`;
+    }
+
+    // If they provided a date at any time, capture it
+    const maybeDate = extractIsoDate(raw, tz);
+    if (maybeDate && !intake.dateIso) {
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        intake_draft: { dateIso: maybeDate }
+      });
+    }
+
+    // 1) Need amount
+    if (!intake.amountText) {
+      const amt = extractMoneyText(raw);
+      if (!amt) return `How much was it?`;
+
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        intake_draft: { amountText: amt }
+      });
+
+      return `✅ Got it — expense ${amt}. Where was it from?`;
+    }
+
+    // 2) Need vendor
+    if (!intake.vendor) {
+      // If user just repeats amount again, re-ask vendor
+      if (looksLikeJustANumber(raw)) {
+        return `Where was it from?`;
+      }
+
+      const vendor = cleanVendorOrDesc(raw);
+      if (!vendor) return `Where was it from?`;
+
+      // If the vendor text *also* contains a date, extract it
+      const dateIso = extractIsoDate(vendor, tz) || intake.dateIso || null;
+
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        intake_draft: { vendor, dateIso }
+      });
+
+      const cmd = buildExpenseCommand({ amountText: intake.amountText, vendor, dateIso });
+      // Clear flow state so they don’t get stuck
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        pending_choice: null,
+        pending_intent: null,
+        intake_draft: null
+      });
+
+      return `✅ Logged: ${cmd}`;
+    }
+
+    // If somehow complete already, finalize
+    const cmd = buildExpenseCommand({
+      amountText: intake.amountText,
+      vendor: intake.vendor,
+      dateIso: intake.dateIso || null
+    });
+    await patchActorMemorySafe(ownerDigits, actorKey, {
+      pending_choice: null,
+      pending_intent: null,
+      intake_draft: null
+    });
+    return `✅ Logged: ${cmd}`;
+  }
+
+  // ---------------- REVENUE ----------------
+  if (pending_choice === 'log' && pending_intent === 'revenue') {
+    if (intakeKind !== 'revenue') {
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        intake_draft: { kind: 'revenue', amountText: null, desc: null, dateIso: null }
+      });
+      return `How much came in?`;
+    }
+
+    const maybeDate = extractIsoDate(raw, tz);
+    if (maybeDate && !intake.dateIso) {
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        intake_draft: { dateIso: maybeDate }
+      });
+    }
+
+    // 1) Need amount
+    if (!intake.amountText) {
+      const amt = extractMoneyText(raw);
+      if (!amt) return `How much came in?`;
+
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        intake_draft: { amountText: amt }
+      });
+
+      return `✅ Got it — revenue ${amt}. What was it for? (optional)`;
+    }
+
+    // 2) Optional description — if they type anything non-empty, we’ll capture and finalize.
+    const desc = cleanVendorOrDesc(raw);
+    const dateIso = extractIsoDate(desc, tz) || intake.dateIso || null;
+
+    // If they reply “skip”, finalize with no desc
+    const skip = normBare(desc) === 'skip' || normBare(desc) === 'no' || normBare(desc) === 'none';
+    const finalDesc = skip ? null : (desc || null);
+
+    const cmd = buildRevenueCommand({ amountText: intake.amountText, desc: finalDesc, dateIso });
+
+    await patchActorMemorySafe(ownerDigits, actorKey, {
+      pending_choice: null,
+      pending_intent: null,
+      intake_draft: null
+    });
+
+    return `✅ Logged: ${cmd}`;
+  }
+
+  // ---------------- TASK ----------------
+  if (pending_choice === 'log' && pending_intent === 'task') {
+    if (intakeKind !== 'task') {
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        intake_draft: { kind: 'task', taskText: null }
+      });
+      return `What’s the task?`;
+    }
+
+    if (!intake.taskText) {
+      const taskText = cleanVendorOrDesc(raw);
+      if (!taskText) return `What’s the task?`;
+
+      const cmd = buildTaskCommand({ taskText });
+
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        pending_choice: null,
+        pending_intent: null,
+        intake_draft: null
+      });
+
+      return `✅ Logged: ${cmd}`;
+    }
+
+    // finalize if already present
+    const cmd = buildTaskCommand({ taskText: intake.taskText });
+    await patchActorMemorySafe(ownerDigits, actorKey, {
+      pending_choice: null,
+      pending_intent: null,
+      intake_draft: null
+    });
+    return `✅ Logged: ${cmd}`;
+  }
+
+  // ---------------- TIME ----------------
+  if (pending_choice === 'log' && pending_intent === 'time') {
+    // Keep time ultra-deterministic: push them to the exact phrases your router already knows.
+    if (looksLikeClockCmd(raw)) {
+      await patchActorMemorySafe(ownerDigits, actorKey, {
+        pending_choice: null,
+        pending_intent: null,
+        intake_draft: null
+      });
+      // Let orchestrator/router consume "clock in/out" normally
+    } else {
+      return `Say **clock in** or **clock out**.`;
+    }
+  }
+
+  // ---------------- JOB ----------------
+  if (pending_choice === 'log' && pending_intent === 'job') {
+    // No draft needed for now; just route them into deterministic phrases you already support.
+    return `Say one of these: **create job <name>**, **list jobs**, or **set active job <name>**.`;
+  }
+  // 4) If user types bare intent without saying “log” first, still be helpful (ChatGPT-like)
+  if (isBareExpense(raw)) return `Got it — how much was it?`;
+  if (isBareRevenue(raw)) return `Got it — how much came in?`;
+  if (isBareTask(raw)) return `Got it — what’s the task?`;
+  if (isBareTime(raw)) return `Got it — clock **in** or **out**?`;
+  if (isBareJob(raw)) return `Got it — create, list, or set active?`;
+
+  // 5) Normal Agent flow (RAG → tools → LLM)
+  const topic = pickTopic(raw, topicHints);
+  console.log('[AGENT] topic:', topic || 'generic', 'text:', raw);
 
   const ragMod = getRag();
   if (ragMod?.answer) {
     try {
       const hints = topic ? Array.from(new Set([topic, ...topicHints])) : topicHints;
-      const out = await ragMod.answer({ from, query: text, hints, ownerId });
+      const out = await ragMod.answer({ from, query: raw, hints, ownerId: ownerDigits });
       if (out && out.trim()) return out;
     } catch (e) {
       console.warn('[AGENT] RAG call failed:', e?.message);
@@ -301,9 +778,9 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
   }
 
   const llm = new LLMProvider({
-  provider: process.env.LLM_PROVIDER || process.env.AI_PROVIDER || "openai",
-  model: process.env.LLM_MODEL || "gpt-4o-mini",
-});
+    provider: process.env.LLM_PROVIDER || process.env.AI_PROVIDER || 'openai',
+    model: process.env.LLM_MODEL || 'gpt-4o-mini',
+  });
 
   const seed = [
     {
@@ -315,11 +792,11 @@ Execution rules:
 - If details are missing: ask exactly ONE clarifying question (do not execute yet).
 - Never dead-end; always offer the next best action.`
     },
-    { role: 'user', content: text }
+    { role: 'user', content: raw }
   ];
 
   try {
-    return await runToolsLoop({ llm, seedMessages: seed, ownerId, from });
+    return await runToolsLoop({ llm, seedMessages: seed, ownerId: ownerDigits, from });
   } catch (e) {
     console.warn('[AGENT] tools loop failed:', e?.message);
     return genericMenu();

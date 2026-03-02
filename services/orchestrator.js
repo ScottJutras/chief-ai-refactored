@@ -348,9 +348,21 @@ async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, age
     kind: "agent",
     run: async () => {
       // Agent is allowed on Starter+ now (you changed that), so if it exists, use it.
-      try {
-        if (agent && typeof agent.runAgent === "function") {
-          const out = await agent.runAgent({
+            try {
+        // ✅ If caller didn't pass agent (common on webhook path), lazy-load it
+        const agentMod =
+          agent && typeof agent.runAgent === "function"
+            ? agent
+            : (() => {
+                try {
+                  return require("./agent"); // resolves to services/agent/index.js
+                } catch {
+                  return null;
+                }
+              })();
+
+        if (agentMod && typeof agentMod.runAgent === "function") {
+          const out = await agentMod.runAgent({
             fromPhone: context?.from || "",
             ownerId,
             text: rawText,

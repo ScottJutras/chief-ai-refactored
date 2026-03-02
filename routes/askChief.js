@@ -6,7 +6,7 @@ const { requireDashboardOwner } = require("../middleware/requireDashboardOwner")
 const { requirePortalUser } = require("../middleware/requirePortalUser");
 const { answerChief } = require("../services/answerChief");
 const { runAgent } = require("../services/agent");
-
+const { enforceAskChiefGates_AND_Consume } = require("../services/answerChief");
 /**
  * ✅ IMPORTANT:
  * Portal requests use Authorization: Bearer <supabase_jwt>
@@ -176,7 +176,21 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
           }
           // ✅ keep for agent plan gating
               req.ownerProfile = userRow;
-              
+              // ✅ Ask Chief monthly quota gate + consume (fail-closed)
+const quota = await enforceAskChiefGates_AND_Consume({
+  ownerId: ownerDigits,
+  ownerProfile: userRow,
+  tz,
+});
+if (quota?.gated) {
+  // keep same response contract
+  return res.status(200).json({
+    ok: true,
+    answer: quota.answer || "Ask Chief is currently unavailable.",
+    gated: true,
+    meta: { code: quota?.evidence?.warnings?.[0] || "GATED" },
+  });
+}
           console.info("[ASK_CHIEF_PLAN_GATE]", {
             tenantId: req.tenantId,
             ownerDigits,

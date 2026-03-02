@@ -129,4 +129,4 @@ async function answerChief({
   return decision;
 }
 
-module.exports = { answerChief };
+module.exports = { answerChief, enforceAskChiefGates_AND_Consume };

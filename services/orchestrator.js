@@ -29,7 +29,7 @@ function looksLikeHowToOrDefinition(text) {
   const s = lc(text);
 
   // If it contains finance metrics, treat as insight (NOT a definition request)
-  if (/\b(profit|revenue|spend|spent|expenses?|cash ?flow|margin|kpi|invoice|paid)\b/.test(s)) {
+    if (/\b(profitability|profit|revenue|spend|spent|expenses?|cash ?flow|margin|kpi|invoice|paid)\b/.test(s)) {
     return false;
   }
 
@@ -81,7 +81,7 @@ function looksLikeQuote(text) {
 function looksLikeInsightQuestion(text) {
   const s = lc(text);
   return (
-    /\bprofit\b|\bmargin\b|\bcash ?flow\b|\bspend\b|\brevenue\b|\bnet\b|\bhow much\b|\bwhat did i\b|\blast (7|14|30) days\b/.test(s) ||
+    /\bprofitability\b|\bprofit\b|\bmargin\b|\bmake\s+money\b|\bdid\s+it\s+make\s+money\b|\bcash ?flow\b|\bspend\b|\brevenue\b|\bnet\b|\bhow much\b|\bwhat did i\b|\blast (7|14|30) days\b/.test(s) ||
     /^kpis?\b/.test(s)
   );
 }
@@ -105,8 +105,8 @@ function normalizeHandlerOutput(out, fallback = "Done.") {
   return fallback;
 }
 
-async function answerInsight({ ownerId, actorKey, text, tz }) {
-  return await answerInsightV0({ ownerId, actorKey, text, tz });
+async function answerInsight({ ownerId, actorKey, text, tz, context }) {
+  return await answerInsightV0({ ownerId, actorKey, text, tz, context });
 }
 
 /**
@@ -124,29 +124,32 @@ async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, age
   const pending = String(mem?.pending_choice || '').trim();
   const lcRaw = lc(rawText);
 
-  if (pending === 'log_or_question') {
+    if (pending === 'log_or_question') {
     if (lcRaw === 'log') {
-      // Set next step memory
-      try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: 'log_or_question', last_topic: 'menu' }); } catch {}
-return {
-  ok: true,
-  route: 'clarify',
-  answer:
-    'Do you want me to (1) log something (expense/revenue/time/task), or (2) answer a question (profit/cashflow/KPIs)?\n\nReply “log” or “question”.',
-  evidence: { sql: [], facts_used: 0 }
-};
-    }
-    if (lcRaw === 'question') {
-      try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: '', last_topic: 'question' }); } catch {}
+      // Move to next step: pick which log type
+      try {
+        await pg.patchActorMemory(ownerId, actorKey, { pending_choice: 'log_which', last_topic: 'log_menu' });
+      } catch {}
       return {
         ok: true,
         route: 'clarify',
-        answer: `Alright — what do you want to know? (profit, cashflow, spending, recent activity, etc.)`,
+        answer:
+          'Got it — what do you want to log?\n\nReply: “expense”, “revenue”, “time”, or “task”.\n\n(Or “back” to exit.)',
         evidence: { sql: [], facts_used: 0 }
       };
     }
 
-    // If they reply something else, keep the prompt tight
+    if (lcRaw === 'question') {
+      // Exit menu and let normal reasoning classification handle the next message
+      try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: '', last_topic: 'question' }); } catch {}
+      return {
+        ok: true,
+        route: 'clarify',
+        answer: `Alright — what do you want to know? (profitability, spending, revenue, jobs, time, etc.)`,
+        evidence: { sql: [], facts_used: 0 }
+      };
+    }
+
     return {
       ok: true,
       route: 'clarify',
@@ -155,15 +158,25 @@ return {
     };
   }
 
-  if (pending === 'log_which') {
-    // If they answer with a category word, we can route naturally by leaving it to the existing classifiers.
-    // But if they say something vague, keep it tight.
+    if (pending === 'log_which') {
     if (/^(expense|revenue|time|task)s?\b/i.test(rawText)) {
       try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: '' }); } catch {}
-      // let normal routing handle it
+      // Let normal routing classify and execute below
     } else if (lcRaw === 'back' || lcRaw === 'cancel') {
       try { await pg.patchActorMemory(ownerId, actorKey, { pending_choice: '' }); } catch {}
-      return { ok: true, route: 'clarify', answer: `No problem. Tell me what you want to do.`, evidence: { sql: [], facts_used: 0 } };
+      return {
+        ok: true,
+        route: 'clarify',
+        answer: `No problem. Tell me what you want to do.`,
+        evidence: { sql: [], facts_used: 0 }
+      };
+    } else {
+      return {
+        ok: true,
+        route: 'clarify',
+        answer: `Reply: “expense”, “revenue”, “time”, or “task”. (Or “back”.)`,
+        evidence: { sql: [], facts_used: 0 }
+      };
     }
   }
   // 00) Pending-action / mid-flow resolver
@@ -378,13 +391,17 @@ return {
     };
   }
 
-  if (looksLikeInsightQuestion(rawText)) {
+   if (looksLikeInsightQuestion(rawText)) {
     return {
       ok: true,
       route: "reasoning",
       kind: "insight",
       run: async () => {
-        return await answerInsight({ ownerId, actorKey, text: rawText, tz });
+        const out = await answerInsight({ ownerId, actorKey, text: rawText, tz, context });
+        try {
+          if (out?.memory_patch) await pg.patchActorMemory(ownerId, actorKey, out.memory_patch);
+        } catch {}
+        return out;
       },
     };
   }
@@ -395,6 +412,18 @@ return {
     route: "reasoning",
     kind: "agent",
     run: async () => {
+            // ✅ Tool-first: try deterministic insights before agent
+      try {
+        const ins = await answerInsight({ ownerId, actorKey, text: rawText, tz, context });
+        const msg = normalizeHandlerOutput(ins, "");
+        // If insights can answer OR produce a useful clarify, prefer it
+        if (ins?.route === "insight" && msg) {
+          return { ok: true, route: "insight", answer: msg, evidence: ins?.evidence || { sql: [], facts_used: 0 } };
+        }
+        if (ins?.route === "clarify" && msg) {
+          return { ok: true, route: "clarify", answer: msg, evidence: ins?.evidence || { sql: [], facts_used: 0 } };
+        }
+      } catch {}
       // Agent is allowed on Starter+ now (you changed that), so if it exists, use it.
             try {
         // ✅ If caller didn't pass agent (common on webhook path), lazy-load it

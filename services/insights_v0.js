@@ -40,7 +40,7 @@ function normalizeRangeFromText(text, fallback = "mtd") {
 
   if (/\b(last 7 days|past 7 days|previous 7 days)\b/.test(t)) return "last7";
   if (/\b(last 30 days|past 30 days|previous 30 days)\b/.test(t)) return "last30";
-
+  if (/\b(last month|previous month)\b/.test(t)) return "prev_month";
   return fallback;
 }
 
@@ -93,6 +93,11 @@ function addDaysUtcNoon(y, m, d, deltaDays) {
 
 function isIsoDate(s) {
   return typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function hasExplicitRangeHint(text) {
+  const t = lc(text);
+  return /\b(today|todays|today's|wtd|week to date|this week|mtd|month to date|this month|ytd|year to date|this year|all time|all|last 7 days|past 7 days|previous 7 days|last 30 days|past 30 days|previous 30 days|last month|previous month)\b/.test(t);
 }
 
 /**
@@ -149,7 +154,30 @@ function rangeToFromTo(effectiveRange, tz) {
       // Unknown => treat as mtd
       fromDate = addDaysUtcNoon(y, m, 1, 0);
       break;
-  }
+  
+        case "prev_month": {
+      // previous month in the user's TZ
+      // Use tz parts (y,m) and build prev month boundaries safely at UTC noon.
+      const prevY = m === 1 ? (y - 1) : y;
+      const prevM = m === 1 ? 12 : (m - 1);
+
+      // from: first day prev month
+      const fromD = addDaysUtcNoon(prevY, prevM, 1, 0);
+
+      // to: last day prev month = day 0 of current month
+      // Use UTC noon trick again:
+      const toD = new Date(Date.UTC(y, m - 1, 0, 12, 0, 0));
+
+      const fromIsoPm = isoDateInTz(fromD, tz);
+      const toIsoPm = isoDateInTz(toD, tz);
+
+      return {
+        fromIso: isIsoDate(fromIsoPm) ? fromIsoPm : toIso,
+        toIso: isIsoDate(toIsoPm) ? toIsoPm : toIso,
+      };
+    }
+
+    }
 
   const fromIso = isoDateInTz(fromDate, tz);
 
@@ -214,12 +242,13 @@ function extractJobRefFromText(rawText) {
   }
 
   {
-    const m = t.match(/^\s*(?:profit|margin)\s+([\s\S]+)$/i);
-    if (m) {
-      const token = normalizeJobRefToken(m[1] || "");
-      if (token) return { kind: "name", jobNo: null, name: token, raw: token };
-    }
+  // Accept "profitability ..." too
+  const m = t.match(/^\s*(?:profitability|profit|margin)\s+([\s\S]+)$/i);
+  if (m) {
+    const token = normalizeJobRefToken(m[1] || "");
+    if (token) return { kind: "name", jobNo: null, name: token, raw: token };
   }
+}
 
   return { kind: null, jobNo: null, name: null, raw: null };
 }
@@ -377,7 +406,28 @@ function looksLikeProfitQuestion(text) {
   return hasProfitIntent && hasJobAnchor;
 }
 
-async function resolveJobForProfit({ ownerId, actorKey, text }) {
+async function getJobByIdForOwner(pgClient, ownerId, jobId) {
+  const owner = String(ownerId || "").trim();
+  const jid = Number(jobId);
+  if (!owner || !Number.isFinite(jid)) return null;
+
+  try {
+    const r = await pgClient.query(
+      `
+      select id, job_no, coalesce(name, job_name) as job_name, active, status
+      from public.jobs
+      where owner_id::text = $1 and id = $2
+      limit 1
+      `,
+      [owner, jid]
+    );
+    return r?.rows?.[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveJobForProfit({ ownerId, actorKey, text, actorMemory }) {
   const raw = String(text || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
   const s = raw.toLowerCase();
 
@@ -389,10 +439,54 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
     (ref.kind === "job_no" || (ref.name && String(ref.name).trim()) || (ref.raw && String(ref.raw).trim()))
   );
 
+  // 1) If they explicitly asked for "active job", prefer the DB active job
+  if (explicitActive) {
+    try {
+      if (typeof pg.getActiveJob === "function") {
+        const aj = await pg.getActiveJob(ownerId, actorKey);
+        if (aj && typeof aj === "object" && aj.job_no != null) {
+          return {
+            jobId: aj.id != null ? Number(aj.id) : null,
+            jobNo: Number(aj.job_no),
+            jobName: aj.name || aj.job_name || null,
+            source: "active_job",
+          };
+        }
+      }
+    } catch {}
+    // If no active job, continue to explicit ref resolution below
+  }
+
+  // 2) Conversation memory fallback (canonical first): active_job_id
+  const convo =
+    actorMemory?.conversation && typeof actorMemory.conversation === "object" ? actorMemory.conversation : {};
+
+  const memJobId = Number(convo.active_job_id);
+  if (!explicitRefProvided && Number.isFinite(memJobId)) {
+    const job = await getJobByIdForOwner(pg, ownerId, memJobId);
+    if (job) {
+      return {
+        jobId: Number(job.id),
+        jobNo: Number(job.job_no),
+        jobName: job.job_name || null,
+        source: "memory_active_job_id",
+      };
+    }
+    // If memory points to a missing job, fall through (do NOT block)
+  }
+
+  // 3) Secondary memory fallback: active_job_no (less canonical)
+  const memJobNo = Number(convo.active_job_no);
+  if (!explicitRefProvided && Number.isFinite(memJobNo)) {
+    return { jobId: null, jobNo: memJobNo, jobName: convo.active_job_name || null, source: "memory_active_job_no" };
+  }
+
+  // 4) Resolve from explicit provided ref (job number or name)
   const resolved = await resolveJobForInsight(pg, ownerId, ref);
 
   if (resolved?.ok && resolved?.job) {
     return {
+      jobId: resolved.job.id != null ? Number(resolved.job.id) : null,
       jobNo: Number(resolved.job.job_no),
       jobName: resolved.job.job_name || null,
       source: resolved.mode || "resolved",
@@ -401,6 +495,7 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
 
   if (resolved?.reason === "ambiguous") {
     return {
+      jobId: null,
       jobNo: null,
       jobName: null,
       source: "ambiguous",
@@ -411,6 +506,7 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
 
   if (explicitRefProvided && !explicitActive) {
     return {
+      jobId: null,
       jobNo: null,
       jobName: null,
       source: "not_found_explicit",
@@ -418,25 +514,32 @@ async function resolveJobForProfit({ ownerId, actorKey, text }) {
     };
   }
 
+  // 5) Fall back to active job when no explicit ref was provided
   try {
     if (typeof pg.getActiveJob === "function") {
       const aj = await pg.getActiveJob(ownerId, actorKey);
       if (aj && typeof aj === "object" && aj.job_no != null) {
-        return { jobNo: Number(aj.job_no), jobName: aj.name || null, source: "active_job" };
+        return {
+          jobId: aj.id != null ? Number(aj.id) : null,
+          jobNo: Number(aj.job_no),
+          jobName: aj.name || aj.job_name || null,
+          source: "active_job",
+        };
       }
     }
   } catch {}
 
-  return { jobNo: null, jobName: null, source: resolved?.reason || "none" };
+  return { jobId: null, jobNo: null, jobName: null, source: resolved?.reason || "none" };
 }
 
-async function answerProfitIntent({ ownerId, actorKey, text }) {
-  const resolved = await resolveJobForProfit({ ownerId, actorKey, text });
+async function answerProfitIntent({ ownerId, actorKey, text, actorMemory }) {
+  const resolved = await resolveJobForProfit({ ownerId, actorKey, text, actorMemory });
 
   console.info("[INSIGHTS_PROFIT_RESOLVED]", {
     ownerId,
     text: String(text || "").slice(0, 80),
     source: resolved?.source || null,
+    jobId: resolved?.jobId ?? null,
     jobNo: resolved?.jobNo ?? null,
     jobName: resolved?.jobName ?? null,
   });
@@ -446,18 +549,42 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
     const row = await getProfitRowByJobNo(ownerId, requestedJobNo);
 
     if (row) {
+      const memory_patch = {
+        conversation: {
+          active_job_id: Number.isFinite(Number(resolved?.jobId)) ? Number(resolved.jobId) : null,
+          active_job_no: requestedJobNo,
+          active_job_name: row?.job_name || resolved.jobName || null,
+        },
+      };
+
       return {
         ok: true,
         route: "insight",
         answer: profitReply({ row, label: row.job_name || resolved.jobName || `Job #${requestedJobNo}` }),
         evidence: { sql: ["v_job_profit_simple_fixed/getJobProfitSimple"], facts_used: 4 },
+        memory_patch,
       };
     }
 
+    // If profit table can't find it, do not overwrite memory.
     return {
       ok: true,
       route: "clarify",
       answer: `I couldn’t find Job #${requestedJobNo}. Try “list jobs” or tell me the job name.`,
+      evidence: { sql: [], facts_used: 0 },
+    };
+  }
+
+  if (resolved?.source === "ambiguous" && Array.isArray(resolved?.matches) && resolved.matches.length) {
+    const options = resolved.matches
+      .slice(0, 5)
+      .map((j) => `• Job #${j.job_no} — ${j.job_name || "Unnamed"}`)
+      .join("\n");
+
+    return {
+      ok: true,
+      route: "clarify",
+      answer: `Which job did you mean?\n\n${options}\n\nReply with the job number (e.g., “profit on job 1556”).`,
       evidence: { sql: [], facts_used: 0 },
     };
   }
@@ -469,18 +596,34 @@ async function answerProfitIntent({ ownerId, actorKey, text }) {
     evidence: { sql: [], facts_used: 0 },
   };
 }
-
 // ---- End: profit helpers ----
 
 // -------------------- Main entry --------------------
 
-async function answerInsightV0({ ownerId, actorKey, text, tz }) {
+async function answerInsightV0({ ownerId, actorKey, text, tz, context = {} }) {
   const raw = String(text || "").trim();
   const s = lc(raw);
   const tzUse = String(tz || "").trim() || "America/Toronto";
 
+  const mem = context?.actorMemory || {};
+  const convo = mem?.conversation && typeof mem.conversation === "object" ? mem.conversation : {};
+
+  // Range preference:
+  // - if user explicitly specified a range -> use it
+  // - else fall back to convo.active_range
+  const explicitRange = hasExplicitRangeHint(raw);
+  const fallbackRange = String(convo.active_range || "mtd").trim() || "mtd";
+
   // (0) Range (compute ONCE)
-  const effectiveRange = normalizeRangeFromText(raw, "mtd");
+  const effectiveRange = normalizeRangeFromText(raw, explicitRange ? "mtd" : fallbackRange);
+
+  const memoryPatchBase = {
+    conversation: {
+      active_range: effectiveRange,
+      updated_at: isoDateInTz(new Date(), tzUse),
+    },
+  };
+
   let { fromIso, toIso } = rangeToFromTo(effectiveRange, tzUse);
 
   console.info("[INSIGHTS_RANGE_RESOLVED]", {
@@ -491,7 +634,7 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
     toIso,
   });
 
-  // ✅ One more tiny safeguard (optional but recommended)
+  // ✅ One more tiny safeguard
   if (!/^\d{4}-\d{2}-\d{2}$/.test(fromIso) || !/^\d{4}-\d{2}-\d{2}$/.test(toIso)) {
     console.warn("[INSIGHTS_RANGE_INVALID] forcing today", { fromIso, toIso, effectiveRange, tz: tzUse });
     const safe = rangeToFromTo("today", tzUse);
@@ -504,6 +647,7 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
     effectiveRange === "today" ? "today" :
     effectiveRange === "wtd" ? "this week" :
     effectiveRange === "mtd" ? "this month" :
+    effectiveRange === "prev_month" ? "last month" :
     effectiveRange === "ytd" ? "this year" :
     effectiveRange === "last7" ? "last 7 days" :
     effectiveRange === "last30" ? "last 30 days" :
@@ -512,7 +656,17 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
 
   // 1) Profit / margin (job)
   if (looksLikeProfitQuestion(raw)) {
-    return await answerProfitIntent({ ownerId, actorKey, text: raw });
+    const out = await answerProfitIntent({ ownerId, actorKey, text: raw, actorMemory: mem });
+    // Always keep range context sticky even on profit replies
+    if (out && typeof out === "object") {
+      out.memory_patch = {
+        conversation: {
+          ...(memoryPatchBase.conversation || {}),
+          ...(out.memory_patch?.conversation || {}),
+        },
+      };
+    }
+    return out;
   }
 
   // 2) Business totals (spend / revenue / profit)
@@ -524,7 +678,6 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
   const wantsTopExpenses =
     /\btop\s*\d*\s*(expenses?|costs?)\b|\bbiggest\s*(expenses?|costs?)\b|\btop\s*categories\b|\btop\s*vendors\b/.test(s);
 
-  // If they asked for totals OR top expenses — answer off the same range
   if (wantsSpend || wantsRevenue || wantsProfit || wantsTopExpenses) {
     const spendCents = await pg.sumExpensesCentsByRange({ ownerId, fromIso, toIso });
     const revenueCents = await pg.sumRevenueCentsByRange({ ownerId, fromIso, toIso });
@@ -536,21 +689,9 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
     if (wantsSpend) lines.push(`• Spend: ${money(spendCents)}`);
     if (wantsProfit) lines.push(`• Profit (revenue − spend): ${money(profitCents)}`);
 
-    // Top expense breakdown (best-effort, deterministic, uses transactions)
     if (wantsTopExpenses) {
-      const topCats = await pg.topExpenseCategoriesByRange?.({
-        ownerId,
-        fromIso,
-        toIso,
-        limit: 5,
-      });
-
-      const topVendors = await pg.topExpenseVendorsByRange?.({
-        ownerId,
-        fromIso,
-        toIso,
-        limit: 5,
-      });
+      const topCats = await pg.topExpenseCategoriesByRange?.({ ownerId, fromIso, toIso, limit: 5 });
+      const topVendors = await pg.topExpenseVendorsByRange?.({ ownerId, fromIso, toIso, limit: 5 });
 
       const catRows = Array.isArray(topCats?.rows) ? topCats.rows : [];
       const venRows = Array.isArray(topVendors?.rows) ? topVendors.rows : [];
@@ -594,6 +735,7 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
         ],
         facts_used: 2,
       },
+      memory_patch: memoryPatchBase,
     };
   }
 
@@ -607,6 +749,7 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
         `Cash-in/out isn’t wired yet for your schema (we can add it via v_cashflow_daily).\n\n` +
         `Try:\n• “spend ${label}”\n• “revenue ${label}”\n• “top expenses ${label}”\n• “profit on job 1556”`,
       evidence: { sql: [], facts_used: 0 },
+      memory_patch: memoryPatchBase,
     };
   }
 
@@ -621,6 +764,7 @@ async function answerInsightV0({ ownerId, actorKey, text, tz }) {
       `• “top expenses this month”\n` +
       `• “profit on job 1556”`,
     evidence: { sql: [], facts_used: 0 },
+    memory_patch: memoryPatchBase,
   };
 }
 

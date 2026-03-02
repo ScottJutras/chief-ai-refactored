@@ -1028,21 +1028,32 @@ async function getActorMemory(ownerId, actorKey) {
 
 async function patchActorMemory(ownerId, actorKey, patch = {}) {
   const owner_id = String(ownerId || '').replace(/\D/g,'');
-const actor_key = String(actorKey || '').replace(/\D/g,'');
+  const actor_key = String(actorKey || '').replace(/\D/g,'');
   if (!owner_id || !actor_key) return;
 
-  const patchJson = patch && typeof patch === 'object' ? patch : {};
+  const patchObj = patch && typeof patch === 'object' ? patch : {};
+  const patchJson = JSON.stringify(patchObj);
 
+  // We deep-merge known nested object "conversation" to avoid accidental overwrite.
   await query(
     `
     insert into public.chief_actor_memory (owner_id, actor_key, memory, updated_at)
     values ($1, $2, $3::jsonb, now())
     on conflict (owner_id, actor_key)
     do update set
-      memory = public.chief_actor_memory.memory || excluded.memory,
+      memory =
+        (
+          public.chief_actor_memory.memory
+          || (excluded.memory - 'conversation')
+          || jsonb_build_object(
+               'conversation',
+               coalesce(public.chief_actor_memory.memory->'conversation', '{}'::jsonb)
+               || coalesce(excluded.memory->'conversation', '{}'::jsonb)
+             )
+        ),
       updated_at = now()
     `,
-    [owner_id, actor_key, JSON.stringify(patchJson)]
+    [owner_id, actor_key, patchJson]
   );
 }
 

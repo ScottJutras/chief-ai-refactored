@@ -1681,7 +1681,8 @@ const messageSid =
 
 // (D) CREW+CONTROL FAST PATH (task/time → activity logs)
 // - requires actor identity + tenant mapping
-// - does NOT replace existing systems; just captures a crew-auditable log stream
+// - captures crew-auditable log stream
+// - IMPORTANT: enforce Pro for employee/board self-logging (fail-closed)
 try {
   const crewEnabled = String(process.env.FEATURE_CREW_CONTROL || "0") === "1";
   if (crewEnabled) {
@@ -1715,8 +1716,6 @@ try {
           console.warn("[CREW_CONTROL] createCrewActivityLog missing (skipping crew capture)");
           // fall through to legacy routing
         } else {
-          const type = isTaskCmd ? "task" : "time";
-
           // ✅ clean stored/displayed content (strip command prefix for tasks)
           let contentText = rawText;
           if (isTaskCmd) {
@@ -1730,46 +1729,150 @@ try {
           if (!contentText) {
             // fall through to legacy routing
           } else {
-            const structured = {
-              raw: rawText,
-              normalized: contentText,
-              detected: { isTaskCmd, isTimeCmd },
-              meta: {
-                twilio_message_sid: twilioSid,
-                used_idempotency: !!sourceMsgId,
-              },
-            };
+            const type = isTaskCmd ? "task" : "time";
 
-            console.info("[CREW_CONTROL] capturing", {
-              tenantId: req.tenantId,
-              ownerId: req.ownerId,
-              actorId: req.actorId,
-              twilioSid,
-              usedIdempotency: !!sourceMsgId,
-              type,
-              text: contentText.slice(0, 80),
+            // ------------------------------------------------------------------
+            // ✅ PRO GATE (fail-closed) for employee/board self-logging via WhatsApp
+            // Owner/admin can always capture (core capture). Employee/board requires Pro.
+            // Plan authority: users.plan_key by owner_id (or equivalent).
+            // If plan lookup fails -> treat as Free.
+            // ------------------------------------------------------------------
+            const gate = await pg.withClient(async (client) => {
+              // role of this actor inside tenant
+              const rr = await client.query(
+                `
+                select role
+                  from public.chiefos_tenant_actors
+                 where tenant_id = $1
+                   and actor_id = $2
+                 limit 1
+                `,
+                [req.tenantId, req.actorId]
+              );
+              const actorRole = String(rr?.rows?.[0]?.role || "").trim();
+
+              // Owners/admins allowed regardless of plan (core capture)
+              const isOwnerOrAdmin = actorRole === "owner" || actorRole === "admin";
+              const isEmployeeOrBoard = actorRole === "employee" || actorRole === "board";
+
+              // If role is missing/unknown, fail closed for crew capture (do not create crew log)
+              if (!actorRole) {
+                return { ok: false, reason: "ROLE_UNKNOWN", actorRole: null, planKey: "free" };
+              }
+
+              // Only employee/board are Pro-gated on WhatsApp self-log
+              if (!isEmployeeOrBoard) {
+                return { ok: true, reason: "ROLE_ALLOWED", actorRole, planKey: "n/a" };
+              }
+
+              // Resolve plan_key (fail-closed)
+              let planKey = "free";
+
+              // Detect which table exists for plan authority
+              const reg = await client.query(
+                `
+                select
+                  to_regclass('public.users') as t_users,
+                  to_regclass('public.chiefos_users') as t_chiefos_users
+                `
+              );
+
+              const tUsers = reg?.rows?.[0]?.t_users || null;
+              const tChiefosUsers = reg?.rows?.[0]?.t_chiefos_users || null;
+
+              try {
+                if (tUsers) {
+                  const p = await client.query(
+                    `select plan_key from public.users where owner_id = $1 limit 1`,
+                    [req.ownerId]
+                  );
+                  planKey = String(p?.rows?.[0]?.plan_key || "free").trim().toLowerCase();
+                } else if (tChiefosUsers) {
+                  const p = await client.query(
+                    `select plan_key from public.chiefos_users where owner_id = $1 limit 1`,
+                    [req.ownerId]
+                  );
+                  planKey = String(p?.rows?.[0]?.plan_key || "free").trim().toLowerCase();
+                } else {
+                  // Unknown schema -> fail closed
+                  planKey = "free";
+                }
+              } catch (e) {
+                // Any plan lookup error -> fail closed
+                planKey = "free";
+              }
+
+              const isPro = planKey === "pro";
+              if (!isPro) {
+                return { ok: false, reason: "NOT_INCLUDED", actorRole, planKey };
+              }
+
+              return { ok: true, reason: "PRO_OK", actorRole, planKey };
             });
 
-            const out = await createCrewActivityLog({
-              tenantId: req.tenantId,
-              ownerId: req.ownerId,
-              createdByActorId: req.actorId,
-              type,
-              source: "whatsapp",
-              contentText,
-              structured,
-              status: "submitted",
-              sourceMsgId, // ✅ null if no real Twilio SID (avoid hash collisions)
-            });
+            if (!gate.ok) {
+              // IMPORTANT: do not create Crew activity log if not allowed.
+              // Calm upsell message for employee/board self-log; avoid spamming.
+              if (gate.reason === "NOT_INCLUDED") {
+                return ok(
+                  res,
+                  [
+                    "🔒 Crew logging requires Pro (Crew+Control).",
+                    "Ask the owner to upgrade in the portal, then try again.",
+                  ].join("\n")
+                );
+              }
 
-            // Legacy-style reply:
-            // "✅ Task #77 created: Task buy hammer"
-            const n = out?.logNo ? `#${out.logNo}` : (out?.logId ? `#${out.logId}` : "");
-            const replyText =
-  type === "task"
-    ? `✅ Task ${n} created: ${contentText}`
-    : `✅ Time log ${n} created: ${contentText}`;
-return ok(res, replyText.replace(/\s+/g, " ").trim());
+              // ROLE_UNKNOWN or other -> silently fall through to legacy routing
+            } else {
+              const structured = {
+                raw: rawText,
+                normalized: contentText,
+                detected: { isTaskCmd, isTimeCmd },
+                gate: {
+                  actor_role: gate.actorRole,
+                  plan_key: gate.planKey,
+                  reason: gate.reason,
+                },
+                meta: {
+                  twilio_message_sid: twilioSid,
+                  used_idempotency: !!sourceMsgId,
+                },
+              };
+
+              console.info("[CREW_CONTROL] capturing", {
+                tenantId: req.tenantId,
+                ownerId: req.ownerId,
+                actorId: req.actorId,
+                twilioSid,
+                usedIdempotency: !!sourceMsgId,
+                type,
+                text: contentText.slice(0, 80),
+                actorRole: gate.actorRole,
+                planKey: gate.planKey,
+              });
+
+              const out = await createCrewActivityLog({
+                tenantId: req.tenantId,
+                ownerId: req.ownerId,
+                createdByActorId: req.actorId,
+                type,
+                source: "whatsapp",
+                contentText,
+                structured,
+                status: "submitted",
+                sourceMsgId, // ✅ null if no real Twilio SID (avoid hash collisions)
+              });
+
+              // Legacy-style reply:
+              const n = out?.logNo ? `#${out.logNo}` : out?.logId ? `#${out.logId}` : "";
+              const replyText =
+                type === "task"
+                  ? `✅ Task ${n} created: ${contentText}`
+                  : `✅ Time log ${n} created: ${contentText}`;
+
+              return ok(res, replyText.replace(/\s+/g, " ").trim());
+            }
           }
         }
       }

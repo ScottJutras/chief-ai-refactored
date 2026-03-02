@@ -42,13 +42,13 @@ function canOverrideReviewer(role) {
   return role === "owner" || role === "admin";
 }
 
-// Centralize event types to match DB constraint.
-// IMPORTANT: Your DB rejected 'edited'. Use 'edit' instead.
+// Must match DB CHECK constraint allowed values
 const EVENT = {
+  CREATED: "created",
   APPROVED: "approved",
   REJECTED: "rejected",
   NEEDS_CLARIFICATION: "needs_clarification",
-  EDIT: "edit", // <-- changed from 'edited' to 'edit'
+  EDITED: "edited",
 };
 
 /**
@@ -62,6 +62,7 @@ router.get(
     try {
       const { tenantId, actorId } = mustCtx(req);
 
+      // GET should not run inside a transaction
       const items = await pg.withClient(
         async (client) => {
           const myRole = await getActorRole({ tenantId, actorId }, client);
@@ -113,6 +114,11 @@ router.get(
 
 /**
  * PATCH /api/crew/review/:logId
+ *
+ * Accepts UI payload keys:
+ * - action: 'approve'|'reject'|'edit'|'needs_clarification'
+ * - edit text: edited_text OR content_text
+ * - notes: notes OR note OR reason
  */
 router.patch(
   "/review/:logId",
@@ -125,11 +131,9 @@ router.patch(
       const logId = String(req.params.logId || "").trim();
 
       const action = String(req.body?.action || "").trim().toLowerCase();
-
       const editedText = String(
         req.body?.edited_text ?? req.body?.content_text ?? ""
       ).trim();
-
       const notes = String(
         req.body?.notes ?? req.body?.note ?? req.body?.reason ?? ""
       ).trim();
@@ -149,11 +153,9 @@ router.patch(
       if (action === "edit" && !editedText) {
         return jsonErr(res, 400, "MISSING_EDIT", "content_text is required for edit.");
       }
-
       if (action === "reject" && !notes) {
         return jsonErr(res, 400, "MISSING_REASON", "Reason is required for reject.");
       }
-
       if (action === "needs_clarification" && !notes) {
         return jsonErr(res, 400, "MISSING_NOTE", "note is required for needs clarification.");
       }
@@ -162,6 +164,7 @@ router.patch(
         const myRole = await getActorRole({ tenantId, actorId }, client);
         const override = canOverrideReviewer(myRole);
 
+        // Load log inside tenant boundary
         const r = await client.query(
           `
           select
@@ -171,12 +174,7 @@ router.patch(
             log_no,
             status,
             content_text,
-            created_by_actor_id,
-            reviewer_actor_id,
-            type,
-            source,
-            structured,
-            source_msg_id
+            reviewer_actor_id
           from public.chiefos_activity_logs
           where tenant_id = $1
             and id = $2::uuid
@@ -192,19 +190,20 @@ router.patch(
           throw err;
         }
 
+        // Permission: must be reviewer OR override
         if (!override && String(log.reviewer_actor_id || "") !== String(actorId)) {
           const err = new Error("Permission denied");
           err.code = "PERMISSION_DENIED";
           throw err;
         }
 
-        // Status transitions must be from submitted only
-        if (action === "approve" || action === "reject" || action === "needs_clarification") {
-          if (String(log.status || "") !== "submitted") {
-            const err = new Error("Already processed");
-            err.code = "STATUS_CONFLICT";
-            throw err;
-          }
+        // Guard status transitions to prevent races
+        const isTransition =
+          action === "approve" || action === "reject" || action === "needs_clarification";
+        if (isTransition && String(log.status || "") !== "submitted") {
+          const err = new Error("Already processed");
+          err.code = "STATUS_CONFLICT";
+          throw err;
         }
 
         const effectiveOwnerId = ownerId || log.owner_id;
@@ -360,7 +359,7 @@ router.patch(
             tenantId,
             effectiveOwnerId,
             logId,
-            EVENT.EDIT, // <-- now 'edit' (passes your constraint)
+            EVENT.EDITED,
             actorId,
             {
               prior_text: prior,

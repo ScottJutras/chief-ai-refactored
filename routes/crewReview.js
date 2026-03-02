@@ -42,11 +42,17 @@ function canOverrideReviewer(role) {
   return role === "owner" || role === "admin";
 }
 
+// Centralize event types to match DB constraint.
+// IMPORTANT: Your DB rejected 'edited'. Use 'edit' instead.
+const EVENT = {
+  APPROVED: "approved",
+  REJECTED: "rejected",
+  NEEDS_CLARIFICATION: "needs_clarification",
+  EDIT: "edit", // <-- changed from 'edited' to 'edit'
+};
+
 /**
  * GET /api/crew/review/inbox
- * Reviewer queue:
- * - reviewer_actor_id = me
- * - status = submitted
  */
 router.get(
   "/review/inbox",
@@ -56,7 +62,6 @@ router.get(
     try {
       const { tenantId, actorId } = mustCtx(req);
 
-      // GET should NOT run in a transaction (keeps pool healthy + avoids accidental locks)
       const items = await pg.withClient(
         async (client) => {
           const myRole = await getActorRole({ tenantId, actorId }, client);
@@ -108,17 +113,6 @@ router.get(
 
 /**
  * PATCH /api/crew/review/:logId
- *
- * Accepts UI-friendly payload keys:
- * - action: 'approve'|'reject'|'edit'|'needs_clarification'
- * - edit text: edited_text OR content_text
- * - notes: notes OR note OR reason
- *
- * Rules:
- * - reviewer can act on their assigned logs
- * - owner/admin can act on any log in tenant (override)
- * - ALL mutations are atomic (update + event insert in one tx)
- * - status transitions are guarded (must be submitted)
  */
 router.patch(
   "/review/:logId",
@@ -132,7 +126,6 @@ router.patch(
 
       const action = String(req.body?.action || "").trim().toLowerCase();
 
-      // Accept both old + new client keys
       const editedText = String(
         req.body?.edited_text ?? req.body?.content_text ?? ""
       ).trim();
@@ -169,7 +162,6 @@ router.patch(
         const myRole = await getActorRole({ tenantId, actorId }, client);
         const override = canOverrideReviewer(myRole);
 
-        // Load target log (tenant-scoped)
         const r = await client.query(
           `
           select
@@ -200,14 +192,13 @@ router.patch(
           throw err;
         }
 
-        // Permission: must be reviewer OR override (owner/admin)
         if (!override && String(log.reviewer_actor_id || "") !== String(actorId)) {
           const err = new Error("Permission denied");
           err.code = "PERMISSION_DENIED";
           throw err;
         }
 
-        // For status transitions, only allow from submitted
+        // Status transitions must be from submitted only
         if (action === "approve" || action === "reject" || action === "needs_clarification") {
           if (String(log.status || "") !== "submitted") {
             const err = new Error("Already processed");
@@ -245,12 +236,13 @@ router.patch(
             insert into public.chiefos_activity_log_events
               (tenant_id, owner_id, log_id, event_type, actor_id, payload)
             values
-              ($1,$2,$3,'approved',$4,$5)
+              ($1,$2,$3,$4,$5,$6)
             `,
             [
               tenantId,
               effectiveOwnerId,
               logId,
+              EVENT.APPROVED,
               actorId,
               { notes: notes || null, prior_status: log.status },
             ]
@@ -286,12 +278,13 @@ router.patch(
             insert into public.chiefos_activity_log_events
               (tenant_id, owner_id, log_id, event_type, actor_id, payload)
             values
-              ($1,$2,$3,'rejected',$4,$5)
+              ($1,$2,$3,$4,$5,$6)
             `,
             [
               tenantId,
               effectiveOwnerId,
               logId,
+              EVENT.REJECTED,
               actorId,
               { reason: notes, prior_status: log.status },
             ]
@@ -327,12 +320,13 @@ router.patch(
             insert into public.chiefos_activity_log_events
               (tenant_id, owner_id, log_id, event_type, actor_id, payload)
             values
-              ($1,$2,$3,'needs_clarification',$4,$5)
+              ($1,$2,$3,$4,$5,$6)
             `,
             [
               tenantId,
               effectiveOwnerId,
               logId,
+              EVENT.NEEDS_CLARIFICATION,
               actorId,
               { note: notes, prior_status: log.status },
             ]
@@ -341,7 +335,7 @@ router.patch(
           return { id: logId, status: "needs_clarification" };
         }
 
-        // action === "edit" (text-only; append audit event)
+        // action === "edit"
         const prior = String(log.content_text || "");
 
         await client.query(
@@ -360,12 +354,13 @@ router.patch(
           insert into public.chiefos_activity_log_events
             (tenant_id, owner_id, log_id, event_type, actor_id, payload)
           values
-            ($1,$2,$3,'edited',$4,$5)
+            ($1,$2,$3,$4,$5,$6)
           `,
           [
             tenantId,
             effectiveOwnerId,
             logId,
+            EVENT.EDIT, // <-- now 'edit' (passes your constraint)
             actorId,
             {
               prior_text: prior,

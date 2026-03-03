@@ -144,6 +144,66 @@ function normalizeDateTextForParse(s) {
   });
   return t;
 }
+
+// =========================================================
+// Emoji / summary normalization for expense edit payloads
+// - Converts "✅ $14.21 Home Hardware Sept 27 job Oak" →
+//   "expense $14.21 from Home Hardware on Sept 27 job Oak"
+// - Strips common UI emojis and bullet glyphs
+// - Normalizes commas in money and common separators
+// =========================================================
+function normalizeEditedExpense(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return s;
+
+  // Normalize unicode dashes / bullets to spaces
+  s = s
+    .replace(/[\u2012\u2013\u2014\u2015]/g, '-') // en/em dashes → '-'
+    .replace(/[•·∙●◦]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Strip common "confirm UI" words that users paste back
+  // (but keep the important tokens like amount/store/date/job)
+  s = s.replace(/\bconfirm\s+expense\b/i, '').trim();
+
+  // Remove leading "✅ Confirm ..." patterns
+  s = s.replace(/^✅\s*/u, '').trim();
+
+  // Remove common emojis that appear in summaries
+  // (leave text + numbers intact)
+  s = s.replace(
+    /[✅🧾💳💰🪙💵🏦🛒🧰🔧🧱📅🗓️🕒⏱️📍🏷️🧾]/gu,
+    ' '
+  );
+
+  // Normalize currency symbols (keep $ but normalize spacing)
+  s = s.replace(/\s*\$\s*/g, ' $');
+
+  // Normalize money commas: "$4,500" -> "$4500"
+  s = s.replace(/\$(\d{1,3})(,\d{3})+(?=\b)/g, (m) => m.replace(/,/g, ''));
+
+  // If user didn’t include the word "expense" anywhere, add a prefix.
+  // This makes downstream parsing more consistent.
+  const hasExpenseKeyword = /\bexpense\b/i.test(s);
+  if (!hasExpenseKeyword) {
+    s = `expense ${s}`.trim();
+  }
+
+  // Light canonical phrases (helps the parser)
+  // Convert "at Home Depot" / "from Home Depot" consistently
+  // (Don’t overdo it; keep it tolerant.)
+  s = s.replace(/\s+@+\s+/g, ' at ');
+  s = s.replace(/\s+from\s+/gi, ' from ');
+  s = s.replace(/\s+on\s+/gi, ' on ');
+  s = s.replace(/\s+job\s*[:\-]?\s*/gi, ' job ');
+
+  // Final whitespace cleanup
+  s = s.replace(/\s+/g, ' ').trim();
+
+  return s;
+}
+
 function extractExplicitDateFromText(rawText, tz) {
   const s0 = String(rawText || '').trim();
   if (!s0) return null;
@@ -5139,9 +5199,10 @@ try {
     });
 
     const tz0 = tz;
-
+    const rawEditText = String(rawInboundText || '').trim();
+    const normalizedEditText = normalizeEditedExpense(rawEditText);
     const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
-      rawInboundText,
+      normalizedEditText,
       draftE,
       { fromKey: paUserId, tz: tz0, defaultData: {} }
     );

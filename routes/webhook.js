@@ -3162,6 +3162,21 @@ try {
 } catch (e) {
   console.warn('[ROUTER_HARD_JOB] failed (continue):', e?.message);
 }
+
+function isHowToQuestion(text) {
+  const s = String(text || '').trim().toLowerCase();
+  if (!s) return false;
+
+  // simple + safe: catch "how do I / how to / where do I / what do I do"
+  return (
+    /^how\s+do\s+i\b/.test(s) ||
+    /^how\s+to\b/.test(s) ||
+    /^where\s+do\s+i\b/.test(s) ||
+    /^what\s+do\s+i\s+do\b/.test(s) ||
+    /\bhelp\s+me\b/.test(s)
+  );
+}
+
 /* -----------------------------------------------------------------------
  * ✅ INSIGHTS v0 FASTPATH (MVP)
  * - Runs BEFORE job handler routing

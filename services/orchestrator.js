@@ -91,6 +91,13 @@ function looksLikeInsightQuestion(text) {
 function normalizeHandlerOutput(out, fallback = "Done.") {
   if (out == null) return fallback;
 
+  // ✅ If the handler already produced TwiML / already sent an interactive message,
+  // treat it as handled and DO NOT emit fallback text.
+  if (typeof out === "object") {
+    if (typeof out.twiml === "string" && out.twiml.trim()) return "";
+    if (out.sent === true || out.handled === true) return "";
+  }
+
   if (typeof out === "string") {
     const s = out.trim();
     return s || fallback;
@@ -337,7 +344,8 @@ if (/^jp:/i.test(rawText)) {
         );
 
         const msg = normalizeHandlerOutput(out, "Expense logged.");
-        return { ok: true, route: "action", answer: msg, evidence: { sql: [], facts_used: 0 } };
+if (!msg) return { ok: true, route: "action", answer: "", evidence: { sql: [], facts_used: 0 } };
+return { ok: true, route: "action", answer: msg, evidence: { sql: [], facts_used: 0 } };
       },
     };
   }

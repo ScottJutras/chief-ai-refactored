@@ -337,10 +337,16 @@ async function ensureConfirmPAExists({ ownerId, userId = null, from = null, draf
 function pickConfirmDraftSnapshot(d) {
   if (!d || typeof d !== 'object') return null;
 
+  // ✅ snapshot-level sanitize so no upstream draft can leak "on/for ..."
+  const cleanItem =
+    typeof d.item === 'string'
+      ? d.item.replace(/^\s*(on|for)\s+/i, '').replace(/\s+/g, ' ').trim()
+      : d.item ?? null;
+
   return {
     // core confirm fields
     amount: d.amount ?? null,
-    item: d.item ?? null,
+    item: cleanItem || null,
     store: d.store ?? null,
     date: d.date ?? null,
 
@@ -422,6 +428,11 @@ function normalizeMediaSourceMsgId(userKeyDigits, val) {
   return s0;
 }
 
+function stripLeadingOnFor(s) {
+  if (typeof s !== 'string') return s;
+  return s.replace(/^\s*(on|for)\s+/i, '').replace(/\s+/g, ' ').trim();
+}
+
 
 function getTwilioClient() {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -476,11 +487,18 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) 
   const templateSid = getExpenseConfirmTemplateSid();
 
   // Defensive: keep templates happy + avoid OCR garbage explosions
-  const safeSummary = String(summaryLine || '')
-    .replace(/\u0000/g, '')
-    .replace(/\s+/g, ' ')
+  let safeSummary = String(summaryLine || "")
+    .replace(/\u0000/g, "")
+    .replace(/\s+/g, " ")
     .trim()
     .slice(0, 600);
+
+  // ✅ Render-time guard: never show "— on ..." or "— for ..."
+  // Handles patterns like: "💸 $52.00 — on Lumber 🏪 Lowes ..."
+  safeSummary = safeSummary.replace(/(—\s*)(on|for)\s+/gi, "$1");
+
+  // ✅ Also guard if the formatter ever omits the em dash (rare but safe)
+  safeSummary = safeSummary.replace(/^\s*(on|for)\s+/i, "");
 
   const bodyText =
     `✅ Confirm expense\n${safeSummary}\n\n` +
@@ -488,22 +506,26 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) 
 
   // ✅ Render-time truth log (NO undefined vars)
   try {
-    console.info('[EXPENSE_CONFIRM_RENDER_CTX]', {
+    console.info("[EXPENSE_CONFIRM_RENDER_CTX]", {
       ownerId: ctx?.ownerId ?? null,
       paUserId: ctx?.paUserId ?? null,
-      fromPhone: String(fromPhone || '').trim() || null,
+      fromPhone: String(fromPhone || "").trim() || null,
+
       // Draft job fields
       draft_job_id: ctx?.draft?.job_id ?? ctx?.draft?.jobId ?? null,
       draft_job_no: ctx?.draft?.job_no ?? null,
       draft_job_name:
-        (ctx?.draft?.jobName || ctx?.draft?.job_name || ctx?.draft?.job_name_label || null),
+        ctx?.draft?.jobName || ctx?.draft?.job_name || ctx?.draft?.job_name_label || null,
+
       // Active job fields (if passed)
       active_job_no: ctx?.activeJob?.job_no ?? null,
       active_job_name: ctx?.activeJob?.name ?? null,
+
       // Template debug (if you pass contentVariables preview)
       varsPreview: ctx?.varsPreview ?? null,
+
       safeSummaryHead: safeSummary.slice(0, 140),
-      safeSummaryLen: safeSummary.length
+      safeSummaryLen: safeSummary.length,
     });
   } catch {}
 
@@ -511,22 +533,21 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) 
   if (to && templateSid) {
     try {
       const msg = await sendWhatsAppTemplate({ to, templateSid, summaryLine: safeSummary });
-
-      console.info('[EXPENSE_CONFIRM_SENT]', { to, sid: msg?.sid, status: msg?.status });
+      console.info("[EXPENSE_CONFIRM_SENT]", { to, sid: msg?.sid, status: msg?.status });
       return out(twimlEmpty(), true);
     } catch (e) {
-      console.warn('[EXPENSE] confirm template send failed; falling back:', e?.message);
+      console.warn("[EXPENSE] confirm template send failed; falling back:", e?.message);
     }
   }
 
-  // ✅ 2) Fallback path: 3 quick replies + explicit "change job" instruction
+  // ✅ 2) Fallback path: quick replies + explicit "change job" instruction
   if (to) {
     try {
-      await sendQuickReply(to, `✅ Confirm expense\n${safeSummary}`, ['Yes', 'Edit', 'Cancel']);
+      await sendQuickReply(to, `✅ Confirm expense\n${safeSummary}`, ["Yes", "Edit", "Cancel"]);
       await sendWhatsApp(to, `🔁 To change the job, reply: "change job"`);
       return out(twimlEmpty(), true);
     } catch (e2) {
-      console.warn('[EXPENSE] quick replies failed; falling back to TwiML:', e2?.message);
+      console.warn("[EXPENSE] quick replies failed; falling back to TwiML:", e2?.message);
     }
   }
 
@@ -570,7 +591,8 @@ async function upsertCilDraftForExpenseConfirm({
         : null;
 
     const source = String(draft?.store || draft?.source || '').trim() || null;
-    const description = String(draft?.item || draft?.description || '').trim() || null;
+    const descriptionRaw = String(draft?.item || draft?.description || '').trim() || null;
+    const description = descriptionRaw ? stripLeadingOnFor(descriptionRaw) : null;
     const category = String(draft?.category || draft?.suggestedCategory || '').trim() || null;
 
     const job_id = draft?.job_id || draft?.jobId || null;
@@ -634,19 +656,22 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
     draft.ocrText ||
     '';
 
-  const line =
-    confirmPA?.payload?.humanLine ||
-    confirmPA?.payload?.summaryLine ||
+   // Prefer rebuilding from draft to avoid reusing an old polluted humanLine/summaryLine
+  const builtLine =
     buildExpenseSummaryLine({
       amount: draft.amount,
-      item: draft.item,
+      item: stripLeadingOnFor(draft.item),   // ✅ guard here too
       store: draft.store,
       date: draft.date,
       jobName: draft.jobName,
       tz,
       sourceText: srcText
-    }) ||
-    'Confirm expense?';
+    }) || null;
+
+  let line = builtLine || confirmPA?.payload?.humanLine || confirmPA?.payload?.summaryLine || 'Confirm expense?';
+
+  // ✅ Final belt: in case humanLine/summaryLine is used
+  line = String(line || '').replace(/(—\s*)(on|for)\s+/ig, '$1');
      // ✅ Ensure CIL draft exists whenever we show confirm UI
   try {
     const srcId =
@@ -1072,9 +1097,15 @@ function normalizeJobAnswer(text) {
 
 function cleanExpenseItemForDisplay(item) {
   let s = String(item || '').trim();
-  s = s.replace(/^for\s+/i, '');
+
+  // ✅ strip leading prepositions (common bleed from AI + receipts)
+  s = s.replace(/^\s*(on|for)\s+/i, '');
+
+  // normalize whitespace
   s = s.replace(/\s+/g, ' ').trim();
-  return s || 'Unknown';
+
+  // IMPORTANT: do NOT force "Unknown" here — let caller decide
+  return s;
 }
 
 function escapeRegExp(x) {
@@ -1109,14 +1140,20 @@ function inferItemFromDashOrInPattern(text) {
   const src = normalizeDashes(String(text || '')).trim();
   if (!src) return null;
 
+  const finalize = (candidate) => {
+    let it = cleanExpenseItemForDisplay(candidate);
+    if (typeof it === 'string') it = it.replace(/^\s*(on|for)\s+/i, '').trim();
+    return it && !isUnknownItem(it) ? it : null;
+  };
+
   // A) "$883 - Railing at Rona ..."
   let m =
     src.match(
       /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at|@|for)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
     ) || null;
   if (m?.[1]) {
-    const it = cleanExpenseItemForDisplay(m[1]);
-    if (it && !isUnknownItem(it)) return it;
+    const it = finalize(m[1]);
+    if (it) return it;
   }
 
   // B) "... $883 in railing at/from Rona ..."
@@ -1125,13 +1162,16 @@ function inferItemFromDashOrInPattern(text) {
       /\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+\bin\s+(.+?)(?:\s+\b(from|at|@|for)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
     ) || null;
   if (m?.[1]) {
-    const it = cleanExpenseItemForDisplay(m[1]);
-    if (it && !isUnknownItem(it)) return it;
+    const it = finalize(m[1]);
+    if (it) return it;
   }
 
   // C) Last resort: reuse your "on <item>" extractor
   const on = inferItemFromOnPattern(src);
-  if (on && !isUnknownItem(on)) return on;
+  if (on) {
+    const it = finalize(on);
+    if (it) return it;
+  }
 
   return null;
 }
@@ -1238,7 +1278,7 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
 
   const amt =
     Number.isFinite(amtNum) && amtNum > 0
-      ? formatMoneyDisplay(amtNum) // ✅ Intl.NumberFormat => commas
+      ? formatMoneyDisplay(amtNum)
       : rawAmt
         ? (rawAmt.startsWith('$')
             ? rawAmt
@@ -1250,14 +1290,17 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
   // Start with existing behavior
   let it = cleanExpenseItemForDisplay(item);
 
+  // ✅ Never allow leading "on/for" to become the visible item
+  if (typeof it === 'string') it = it.replace(/^\s*(on|for)\s+/i, '').trim();
+
   // ✅ Option B: Only infer item from receipt-ish text (prevents job/date pollution)
   if (isUnknownItem(it) && sourceText) {
     const src0 = String(sourceText || '').trim();
 
     const looksReceiptish =
-      /^\s*\$/.test(src0) || // starts with money
+      /^\s*\$/.test(src0) ||
       /\b(total|subtotal|hst|gst|pst|tax|amount due)\b/i.test(src0) ||
-      src0.split('\n').length >= 3; // multi-line = likely OCR/receipt
+      src0.split('\n').length >= 3;
 
     if (looksReceiptish) {
       const src = normalizeDashes(src0);
@@ -1288,6 +1331,9 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
       }
     }
   }
+
+  // ✅ Re-apply strip after inference (inference can still yield "on/for ...")
+  if (typeof it === 'string') it = it.replace(/^\s*(on|for)\s+/i, '').trim();
 
   if (isUnknownItem(it)) it = 'Unknown';
 
@@ -1822,7 +1868,14 @@ function titleCaseVendor(s) {
 
 function isUnknownItem(x) {
   const s = String(x || '').trim().toLowerCase();
-  return !s || s === 'unknown' || s.startsWith('unknown ');
+
+  if (!s) return true;
+  if (s === 'unknown' || s.startsWith('unknown ')) return true;
+
+  // optional: common “empty” tokens from OCR/LLM
+  if (s === 'n/a' || s === 'na' || s === 'none' || s === '-' || s === '—' || s === '?') return true;
+
+  return false;
 }
 
 function vendorDefaultCategory(store) {
@@ -1909,29 +1962,30 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
   }
 
   // ---------------------------
-  // ✅ Item sanitization (STOP Subtotal/Tax/Total)
-  // ---------------------------
-  // ✅ strip leading "on " from item (common preposition bleed)
+// ✅ Item sanitization (STOP Subtotal/Tax/Total)
+// ---------------------------
+
+// ✅ strip leading "on " / "for " from item (common preposition bleed)
 if (typeof d.item === 'string') {
-  d.item = d.item.replace(/^\s*on\s+/i, '').trim();
+  d.item = d.item.replace(/^\s*(on|for)\s+/i, '').trim();
 }
 
-// now compute rawItem AFTER stripping
+// ✅ now compute rawItem AFTER stripping
 const rawItem = String(d.item || '').trim();
-  // common receipt non-items / totals
-  const looksLikeReceiptMeta =
-    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|visa|mastercard|debit|change|tender)\b/i.test(rawItem);
 
-  const looksLikeMoneyLine =
-    /^\$?\s*\d{1,6}(?:\.\d{2})?\s*$/.test(rawItem) ||
-    /\$\s*\d{1,6}(?:\.\d{2})?/.test(rawItem);
+const looksLikeReceiptMeta =
+  /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|visa|mastercard|debit|change|tender)\b/i
+    .test(rawItem);
 
+const looksLikeMoneyLine =
+  /^\$?\s*\d{1,6}(?:\.\d{2})?\s*$/.test(rawItem) ||
+  /\$\s*\d{1,6}(?:\.\d{2})?/.test(rawItem);
 
-  const tooLong = rawItem.length > 120;
+const tooLong = rawItem.length > 120;
 
-  if (!rawItem || looksLikeReceiptMeta || looksLikeMoneyLine || tooLong) {
-    d.item = null;
-  }
+if (!rawItem || looksLikeReceiptMeta || looksLikeMoneyLine || tooLong) {
+  d.item = null;
+}
 
   // If still no item, keep it null (let category handle it).
   // Optional: if you have an extractor for a "best item line", you can backfill here:
@@ -5284,18 +5338,19 @@ try {
   });
 
   if (shouldConsumeAsEditPayload) {
-    console.info('[AWAITING_EDIT_SAFETYNET_CONSUME]', {
-      paUserId,
-      head: String(rawInboundText || '').trim().slice(0, 80)
-    });
+  console.info('[AWAITING_EDIT_SAFETYNET_CONSUME]', {
+    paUserId,
+    head: String(rawInboundText || '').trim().slice(0, 80)
+  });
 
-    const tz0 = tz;
+  // ✅ single tz0 for the entire edit-consume block
+  const tz0 = tz || "America/Toronto";
 
-    const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
-      rawInboundText,
-      draftE,
-      { fromKey: paUserId, tz: tz0, defaultData: {} }
-    );
+  const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
+    rawInboundText,
+    draftE,
+    { fromKey: paUserId, tz: tz0, defaultData: {} }
+  );
 
     if (!nextDraft) {
       return out(
@@ -5389,18 +5444,19 @@ const patchedDraft = {
         _autoYesAfterEdit: true,
         _autoYesSourceMsgId: editMsgSid
       });
-    } catch (e) {
+        } catch (e) {
       console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
     }
 
+    
     // ✅ MUST send interactive confirm, NEVER nag
-    try {
-      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
-    } catch (e) {
-      console.warn('[AWAITING_EDIT_SAFETYNET_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
-      return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
-    }
+  try {
+    return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
+  } catch (e) {
+    console.warn('[AWAITING_EDIT_SAFETYNET_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
+    return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
   }
+}
 
   // ✅ If we're still awaiting_edit and user sent a control token, never nag.
   if (draftE?.awaiting_edit && isControl) {
@@ -6981,7 +7037,13 @@ if (!data && det) {
   };
   aiReply = null;
 }
-
+// after AI + deterministic assignment
+if (data?.item && typeof data.item === 'string') {
+  data.item = data.item
+    .replace(/^\s*(on|for)\s+/i, '')   // strip "on lumber", "for lumber"
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 // ✅ DEBUG (place #1): right after AI+deterministic assignment, BEFORE normalize
 console.info('[EXPENSE_DEBUG_AFTER_PARSE]', {
@@ -7007,12 +7069,7 @@ console.info('[EXPENSE_DEBUG_AFTER_PARSE]', {
   aiReplyHead: aiReply ? String(aiReply).slice(0, 80) : null
 });
 
-if (data?.item && typeof data.item === 'string') {
-  data.item = data.item
-    .replace(/^\s*(on|for)\s+/i, '')   // strip "on lumber", "for lumber"
-    .replace(/\s+/g, ' ')
-    .trim();
-}
+
 // === DATE HELPERS (MVP) ===================================================
 
 function getTodayPartsInTz(tz) {
@@ -7412,16 +7469,8 @@ console.warn('[EXPENSE_FALLTHROUGH_NO_REPLY]', {
   head: String(rawInboundText || input || '').slice(0, 120)
 });
 
-return out(
-  twimlText(
-    [
-      "I couldn’t confirm that expense yet.",
-      "Try: expense $48 from RONA for plywood",
-      'Or reply: "help expense"'
-    ].join('\n')
-  ),
-  false
-);
+// No return here — allow outer catch to handle unexpected fallthrough.
+throw new Error('EXPENSE_FALLTHROUGH_NO_REPLY');
 
 
 } catch (error) {

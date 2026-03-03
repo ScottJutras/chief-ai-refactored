@@ -4951,9 +4951,17 @@ try {
 
   // ✅ single tz0 for the entire edit-consume block
   const tz0 = tz || "America/Toronto";
+  // ✅ Normalize emoji summary edits into canonical parseable text
+  const rawEditText = String(rawInboundText || '').trim();
+  const normalizedEditText = normalizeEditedExpense(rawEditText);
 
+  console.info('[EDIT_NORMALIZE]', {
+    headRaw: rawEditText.slice(0, 80),
+    headNorm: normalizedEditText.slice(0, 80),
+    changed: normalizedEditText !== rawEditText
+  });
   const { nextDraft, aiReply } = await applyEditPayloadToConfirmDraft(
-    rawInboundText,
+    normalizedEditText,     // ✅ was rawInboundText
     draftE,
     { fromKey: paUserId, tz: tz0, defaultData: {} }
   );
@@ -5004,7 +5012,7 @@ const patchedDraft = {
   ...(nextDraft || {}),
   ...(jobPatch || {}),
   ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
-
+ 
   // ✅ user's edit is authoritative for current draft text
   draftText: String(rawInboundText || '').trim(),
 
@@ -5020,7 +5028,13 @@ const patchedDraft = {
   // ✅ prevent later receipt reparse from overwriting the edit
   needsReparse: false
 };
-
+console.info('[EDIT_PATCHED_DRAFT]', {
+  item: patchedDraft?.item,
+  store: patchedDraft?.store,
+  amount: patchedDraft?.amount,
+  date: patchedDraft?.date,
+  jobName: patchedDraft?.jobName || patchedDraft?.job_name || null
+});
     await upsertPA({
       ownerId,
       userId: paKey,

@@ -3375,71 +3375,88 @@ try {
       return null;
     };
 
-    if (isExpensePA && !isHardTimeCommand) {
-      try {
-        const expenseMod = require('../handlers/commands/expense');
-        const expenseHandler =
-          expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
+  if (isExpensePA && !isHardTimeCommand) {
+  try {
+    const expenseMod = require('../handlers/commands/expense');
+    const expenseHandler =
+      expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
 
-        if (!expenseHandler) throw new Error('expense handler export missing (handleExpense)');
+    if (!expenseHandler) throw new Error('expense handler export missing (handleExpense)');
 
-        const handlerArgs = [
-          req.from,
-          text2,
-          req.userProfile,
-          req.ownerId,
-          req.ownerProfile,
-          req.isOwner,
-          messageSid,
-          req.body
-        ];
+    const handlerArgs = [
+      req.from,
+      text2,
+      req.userProfile,
+      req.ownerId,
+      req.ownerProfile,
+      req.isOwner,
+      messageSid,
+      req.body
+    ];
 
-        // Always run the handler first (it owns state transitions)
-        const first = await expenseHandler(...handlerArgs);
+    // Always run the handler first (it owns state transitions)
+    const first = await expenseHandler(...handlerArgs);
 
-        const strictTok = strictControlTokenForPA(text2);
+    const strictTok = strictControlTokenForPA(text2);
 
-        console.info('[AUTO_YES_CHECK]', {
-          from: req.from,
-          kind: 'expense',
-          messageSid,
-          strictTok: strictTok || null,
-          head: String(text2 || '').slice(0, 20)
-        });
+    // ✅ helpers (local to this block is fine)
+    const looksLikeXml = (s) => typeof s === 'string' && s.trim().startsWith('<');
+    const isDoneAck = (s) => typeof s === 'string' && /^done\.?$/i.test(s.trim());
 
-        // ✅ Never auto-yes on strict control tokens
-        if (strictTok) {
-          if (!res.headersSent) {
-            if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
-            if (typeof first === 'string' && first) return sendTwiml(res, first);
-            return ok(res);
-          }
-          return;
-        }
+    console.info('[AUTO_YES_CHECK]', {
+      from: req.from,
+      kind: 'expense',
+      messageSid,
+      strictTok: strictTok || null,
+      head: String(text2 || '').slice(0, 20)
+    });
 
-        const tw = await maybeAutoYesAfterEdit({
-          userId: req.from,
-          kind: 'expense',
-          handlerFn: expenseHandler,
-          handlerArgs,
-          firstResult: first,
-          getPendingTransactionState,
-          mergePendingTransactionState,
-          messageSid
-        });
+    // ✅ Never auto-yes on strict control tokens
+    if (strictTok) {
+      if (!res.headersSent) {
+        // Prefer TwiML objects
+        if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
 
-        if (!res.headersSent) {
-          if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
-          if (typeof tw === 'string' && tw) return sendTwiml(res, tw);
-          if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
-          if (typeof first === 'string' && first) return sendTwiml(res, first);
-          return ok(res);
-        }
-        return;
-      } catch (e) {
-        console.warn('[WEBHOOK] expense PA router failed (ignored):', e?.message);
+        // ONLY send string if it's XML TwiML
+        if (typeof first === 'string' && looksLikeXml(first)) return sendTwiml(res, first);
+
+        // Suppress non-XML strings like "Done."
+        return ok(res, null);
       }
+      return;
     }
+
+    const tw = await maybeAutoYesAfterEdit({
+      userId: req.from,
+      kind: 'expense',
+      handlerFn: expenseHandler,
+      handlerArgs,
+      firstResult: first,
+      getPendingTransactionState,
+      mergePendingTransactionState,
+      messageSid
+    });
+
+    if (!res.headersSent) {
+      // Prefer TwiML objects
+      if (tw && typeof tw === 'object' && tw.twiml) return sendTwiml(res, tw.twiml);
+      if (first && typeof first === 'object' && first.twiml) return sendTwiml(res, first.twiml);
+
+      // ONLY send strings if they are XML TwiML
+      if (typeof tw === 'string' && looksLikeXml(tw)) return sendTwiml(res, tw);
+      if (typeof first === 'string' && looksLikeXml(first)) return sendTwiml(res, first);
+
+      // Belt & suspenders: suppress Done ack if it leaks through
+      if (isDoneAck(tw) || isDoneAck(first)) return ok(res, null);
+
+      // Default: no bubble
+      return ok(res, null);
+    }
+    return;
+  } catch (e) {
+    console.warn('[WEBHOOK] expense PA router failed (ignored):', e?.message);
+  }
+}
 
     if (isRevenuePA && !isHardTimeCommand) {
       try {

@@ -391,20 +391,53 @@ async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, age
     };
   }
 
-   if (looksLikeInsightQuestion(rawText)) {
-    return {
-      ok: true,
-      route: "reasoning",
-      kind: "insight",
-      run: async () => {
-        const out = await answerInsight({ ownerId, actorKey, text: rawText, tz, context });
-        try {
-          if (out?.memory_patch) await pg.patchActorMemory(ownerId, actorKey, out.memory_patch);
-        } catch {}
-        return out;
-      },
-    };
-  }
+  function looksLikeMoneyOnlyIntake(text) {
+  const raw = String(text || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+  const s = raw.toLowerCase();
+
+  // Starts with "$52" / "52.00" / "52$" etc
+  const hasMoney =
+    /^\$?\s*\d{1,6}(\.\d{2})?\b/.test(raw) ||
+    /\b\d{1,6}(\.\d{2})?\s*\$\b/.test(s) ||
+    /\b(cad|usd)\b/.test(s);
+
+  // Common intake words (optional but strengthens)
+  const hasMerchantish =
+    /\b(at|from|on)\b/.test(s) || /\b(home\s*depot|lowe'?s|rona|costco|walmart)\b/.test(s);
+
+  // If they are explicitly asking an insight, don't intercept
+  const hasInsightWords =
+    /\b(spend|spent|revenue|sales|profit|margin|net|top expenses|biggest)\b/.test(s);
+
+  return hasMoney && !hasInsightWords && hasMerchantish;
+}
+
+// ✅ Prefer intake over insight for "money-only" messages
+if (looksLikeMoneyOnlyIntake(rawText)) {
+  // Route to expense intake the same way your normal "expense ..." messages do.
+  // If you already have a function for that route, call it here.
+  return {
+    ok: true,
+    route: "reasoning",
+    kind: "expense",
+    run: async () => handleExpenseFlow({ ownerId, actorKey, text: rawText, tz, context }),
+  };
+}
+
+if (looksLikeInsightQuestion(rawText)) {
+  return {
+    ok: true,
+    route: "reasoning",
+    kind: "insight",
+    run: async () => {
+      const out = await answerInsight({ ownerId, actorKey, text: rawText, tz, context });
+      try {
+        if (out?.memory_patch) await pg.patchActorMemory(ownerId, actorKey, out.memory_patch);
+      } catch {}
+      return out;
+    },
+  };
+}
 
   // 3) Conversational fallback: Agent first (when available), then RAG, then clarify menu
   return {

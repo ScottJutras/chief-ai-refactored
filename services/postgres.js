@@ -1605,20 +1605,14 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   if (!date) throw new Error('insertTransaction missing date');
   if (!amountCents || amountCents <= 0) throw new Error('insertTransaction invalid amount_cents');
 
-  // Schema-aware job_id:
-  // - if transactions.job_id is uuid -> store UUID string
-  // - if int/bigint -> store integer
-  let resolvedJobId = null;
-  let jobIdType = null; // 'uuid' | 'int' | null
-
-  // 🔐 Resolve tenant_id (required post-RLS hardening)
+  // 🔐 Resolve capabilities
   const caps = await detectTransactionsCapabilities();
 
   // Determine transactions.job_id type (uuid vs int) once
+  let jobIdType = null; // 'uuid' | 'int' | null
   if (caps.TX_HAS_JOB_ID) {
     try {
       const t = await getColumnTypeCached('public', 'transactions', 'job_id');
-
       const dt = String(t?.data_type || '').toLowerCase();
       const udt = String(t?.udt_name || '').toLowerCase();
 
@@ -1631,6 +1625,23 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     }
   }
 
+  // helper: enforce job_id column type
+  function coerceJobIdForColumn(idValue) {
+    if (idValue == null) return null;
+
+    if (jobIdType === 'uuid') {
+      const s = String(idValue).trim();
+      return looksLikeUuid(s) ? s : null;
+    }
+
+    if (jobIdType === 'int') {
+      const n = Number(idValue);
+      return Number.isFinite(n) ? Math.trunc(n) : null;
+    }
+
+    return null;
+  }
+
   const media = normalizeMediaMeta(opts.mediaMeta || opts.media_meta || null);
 
   // 🔐 tenant_id (required by portal RLS insert policy when column exists)
@@ -1640,23 +1651,20 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
       ? String(tenantIdRaw).trim()
       : null;
 
-  // If caller didn't pass tenant_id, resolve from owner -> chiefos_tenants
   if (!tenantId && caps.TX_HAS_TENANT_ID) {
     try {
       tenantId = await resolveTenantIdForOwner(owner);
     } catch (e) {
       console.warn('[PG/transactions] resolveTenantIdForOwner failed:', e?.message);
     }
-    if (!tenantId) {
-      // Fail closed (better than RLS policy failure / silent insert deny)
-      throw new Error('insertTransaction missing tenant_id (required)');
-    }
+    if (!tenantId) throw new Error('insertTransaction missing tenant_id (required)');
   }
 
+  // job resolution outputs
+  let resolvedJobId = null; // uuid string OR int depending on schema
   let resolvedJobNo = null;
   let resolvedJobName =
     jobNameInput || (jobRef && !looksLikeUuid(jobRef) && !/^\d+$/.test(jobRef) ? jobRef : null);
-
 
   function isPoisonJobName(name) {
     const s = String(name || '').trim();
@@ -1705,33 +1713,42 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   }
 
   try {
-   // 1) explicit UUID job_id
-if (explicitJobId != null && looksLikeUuid(String(explicitJobId))) {
-  resolvedJobId = String(explicitJobId);
-  const row = await resolveJobRow(owner, resolvedJobId);
-  if (row) {
-    resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
-    const nm = row.job_name ? String(row.job_name).trim() : null;
-    if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
-  }
-} else if (explicitJobId != null && /^\d+$/.test(String(explicitJobId).trim())) {
-  console.warn('[PG/transactions] refusing numeric explicit job_id; ignoring', { explicitJobId });
-}
+    // 1) explicit job_id (schema-dependent)
+    if (explicitJobId != null && String(explicitJobId).trim() !== '') {
+      const coerced = coerceJobIdForColumn(explicitJobId);
+      if (coerced != null) {
+        resolvedJobId = coerced;
+
+        // best-effort enrich
+        const row = await resolveJobRow(owner, String(explicitJobId)).catch(() => null);
+        if (row) {
+          // if the row.id is better than what we coerced (rare), accept it
+          const rowCoerced = coerceJobIdForColumn(row?.id);
+          if (rowCoerced != null) resolvedJobId = rowCoerced;
+
+          resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
+          const nm = row.job_name ? String(row.job_name).trim() : null;
+          if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
+        }
+      } else {
+        console.warn('[PG/transactions] explicit job_id does not match column type; ignoring', {
+          explicitJobId,
+          jobIdType
+        });
+      }
+    }
 
     // 2) explicit job_no
-    if (!resolvedJobId && explicitJobNo != null && String(explicitJobNo).trim() !== '') {
+    if (resolvedJobId == null && explicitJobNo != null && String(explicitJobNo).trim() !== '') {
       const n = Number(explicitJobNo);
       if (Number.isFinite(n)) {
         resolvedJobNo = n;
-        const row = await resolveJobRow(owner, String(n));
-        if (row) {
-          const candidate = row?.id != null ? String(row.id).trim() : null;
 
-if (jobIdType === 'uuid') {
-  if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
-} else if (jobIdType === 'int') {
-  if (candidate && isIntLike(candidate)) resolvedJobId = Number(candidate);
-}
+        const row = await resolveJobRow(owner, String(n)).catch(() => null);
+        if (row) {
+          const rowCoerced = coerceJobIdForColumn(row?.id);
+          if (rowCoerced != null) resolvedJobId = rowCoerced;
+
           resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
           const nm = row.job_name ? String(row.job_name).trim() : null;
           if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -1740,20 +1757,17 @@ if (jobIdType === 'uuid') {
     }
 
     // 3) jobRef (uuid/job_no/name)
-    if (!resolvedJobId && jobRef) {
-      const row = await resolveJobRow(owner, jobRef);
+    if (resolvedJobId == null && jobRef) {
+      const row = await resolveJobRow(owner, jobRef).catch(() => null);
       if (row) {
-        const candidate = row?.id != null ? String(row.id).trim() : null;
+        const rowCoerced = coerceJobIdForColumn(row?.id);
+        if (rowCoerced != null) resolvedJobId = rowCoerced;
 
-if (jobIdType === 'uuid') {
-  if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
-} else if (jobIdType === 'int') {
-  if (candidate && isIntLike(candidate)) resolvedJobId = Number(candidate);
-}
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         const nm = row.job_name ? String(row.job_name).trim() : null;
         if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
       } else {
+        // fallback: numeric ref -> treat as job_no
         if (/^\d+$/.test(String(jobRef).trim())) {
           const nn = Number(jobRef);
           if (Number.isFinite(nn)) resolvedJobNo = resolvedJobNo ?? nn;
@@ -1765,16 +1779,12 @@ if (jobIdType === 'uuid') {
     }
 
     // 4) resolve name-only
-    if (!resolvedJobId && resolvedJobName) {
-      const row = await resolveJobRow(owner, resolvedJobName);
+    if (resolvedJobId == null && resolvedJobName) {
+      const row = await resolveJobRow(owner, resolvedJobName).catch(() => null);
       if (row) {
-        const candidate = row?.id != null ? String(row.id).trim() : null;
+        const rowCoerced = coerceJobIdForColumn(row?.id);
+        if (rowCoerced != null) resolvedJobId = rowCoerced;
 
-if (jobIdType === 'uuid') {
-  if (candidate && looksLikeUuid(candidate)) resolvedJobId = candidate;
-} else if (jobIdType === 'int') {
-  if (candidate && isIntLike(candidate)) resolvedJobId = Number(candidate);
-}
         resolvedJobNo = row.job_no ?? resolvedJobNo ?? null;
         const nm = row.job_name ? String(row.job_name).trim() : null;
         if (nm && !isPoisonJobName(nm)) resolvedJobName = nm;
@@ -1784,25 +1794,8 @@ if (jobIdType === 'uuid') {
     console.warn('[PG/transactions] job resolution failed (ignored):', e?.message);
   }
 
-  // hard guard: enforce schema type (uuid vs int). Unknown => null.
-if (resolvedJobId != null) {
-  if (jobIdType === 'uuid') {
-    if (!looksLikeUuid(String(resolvedJobId))) {
-      console.warn('[PG/transactions] dropping non-uuid resolvedJobId (uuid column)', { resolvedJobId });
-      resolvedJobId = null;
-    }
-  } else if (jobIdType === 'int') {
-    if (!Number.isFinite(Number(resolvedJobId))) {
-      console.warn('[PG/transactions] dropping non-int resolvedJobId (int column)', { resolvedJobId });
-      resolvedJobId = null;
-    } else {
-      resolvedJobId = Number(resolvedJobId);
-    }
-  } else {
-    console.warn('[PG/transactions] dropping resolvedJobId (unknown column type)', { resolvedJobId });
-    resolvedJobId = null;
-  }
-}
+  // ✅ final hard-guard: enforce schema type (uuid vs int). Unknown => null.
+  resolvedJobId = coerceJobIdForColumn(resolvedJobId);
 
   if (resolvedJobName && isPoisonJobName(resolvedJobName)) {
     console.warn('[PG/transactions] dropping poison resolvedJobName (post-resolve)', { resolvedJobName });
@@ -1819,7 +1812,7 @@ if (resolvedJobId != null) {
         ? jobName
         : jobNo != null
           ? String(jobNo)
-          : resolvedJobId
+          : resolvedJobId != null
             ? String(resolvedJobId)
             : null;
 
@@ -1843,113 +1836,107 @@ if (resolvedJobId != null) {
     }
   }
 
-   
-
   const hasOwnerDedupeUnique = await detectTransactionsUniqueOwnerDedupeHash().catch(() => false);
 
-   // ✅ Build insert cols/vals based on caps (INSIDE function)
-// Start with the required baseline columns that always exist
-const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
-const vals = [owner, kind, date, description, amountCents, source];
+  // Build insert cols/vals based on caps
+  const cols = ['owner_id', 'kind', 'date', 'description', 'amount_cents', 'source'];
+  const vals = [owner, kind, date, description, amountCents, source];
 
-// ✅ tenant_id: include ONLY if the column exists (and we resolved it above)
-if (caps.TX_HAS_TENANT_ID) {
-  if (!tenantId) throw new Error('insertTransaction missing tenant_id (required)');
-  cols.unshift('tenant_id');     // put it first (optional, but neat)
-  vals.unshift(tenantId);
-}
-
-if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
-  cols.push('amount');
-  vals.push(amountMaybe);
-}
-
-if (caps.TX_HAS_JOB) {
-  cols.push('job');
-  vals.push(job);
-}
-if (caps.TX_HAS_JOB_NAME) {
-  cols.push('job_name');
-  vals.push(jobName);
-}
-if (caps.TX_HAS_JOB_NO) {
-  cols.push('job_no');
-  vals.push(jobNo);
-}
-if (caps.TX_HAS_JOB_ID) {
-  cols.push('job_id');
-  vals.push(resolvedJobId);
-}
-
-if (caps.TX_HAS_CATEGORY) {
-  cols.push('category');
-  vals.push(category);
-}
-
-if (caps.TX_HAS_USER_NAME) {
-  cols.push('user_name');
-  vals.push(userName);
-}
-
-if (caps.TX_HAS_SOURCE_MSG_ID) {
-  cols.push('source_msg_id');
-  vals.push(sourceMsgId);
-}
-
-if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
-  cols.push('dedupe_hash');
-  vals.push(dedupeHash);
-}
-
-if (caps.TX_HAS_MEDIA_META && media) {
-  cols.push('media_meta');
-  vals.push(JSON.stringify(media));
-}
-
-if (caps.TX_HAS_MEDIA_ASSET_ID) {
-  cols.push('media_asset_id');
-  vals.push(mediaAssetId); // ✅ UUID or null only
-}
-
-// legacy discrete media cols if present (optional, safe)
-if (media) {
-  if (caps.TX_HAS_MEDIA_URL) {
-    cols.push('media_url');
-    vals.push(media.media_url);
+  if (caps.TX_HAS_TENANT_ID) {
+    if (!tenantId) throw new Error('insertTransaction missing tenant_id (required)');
+    cols.unshift('tenant_id');
+    vals.unshift(tenantId);
   }
-  if (caps.TX_HAS_MEDIA_TYPE) {
-    cols.push('media_type');
-    vals.push(media.media_type);
-  }
-  if (caps.TX_HAS_MEDIA_TXT) {
-    cols.push('media_transcript');
-    vals.push(media.media_transcript);
-  }
-  if (caps.TX_HAS_MEDIA_CONF) {
-    cols.push('media_confidence');
-    vals.push(media.media_confidence);
-  }
-}
 
-if (caps.TX_HAS_CREATED_AT) {
-  cols.push('created_at');
-  vals.push(new Date());
-}
-if (caps.TX_HAS_UPDATED_AT) {
-  cols.push('updated_at');
-  vals.push(new Date());
-}
+  if (caps.TX_HAS_AMOUNT && amountMaybe != null) {
+    cols.push('amount');
+    vals.push(amountMaybe);
+  }
 
-const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+  if (caps.TX_HAS_JOB) {
+    cols.push('job');
+    vals.push(job);
+  }
+  if (caps.TX_HAS_JOB_NAME) {
+    cols.push('job_name');
+    vals.push(jobName);
+  }
+  if (caps.TX_HAS_JOB_NO) {
+    cols.push('job_no');
+    vals.push(jobNo);
+  }
+  if (caps.TX_HAS_JOB_ID) {
+    cols.push('job_id');
+    vals.push(resolvedJobId);
+  }
+
+  if (caps.TX_HAS_CATEGORY) {
+    cols.push('category');
+    vals.push(category);
+  }
+
+  if (caps.TX_HAS_USER_NAME) {
+    cols.push('user_name');
+    vals.push(userName);
+  }
+
+  if (caps.TX_HAS_SOURCE_MSG_ID) {
+    cols.push('source_msg_id');
+    vals.push(sourceMsgId);
+  }
+
+  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
+    cols.push('dedupe_hash');
+    vals.push(dedupeHash);
+  }
+
+  if (caps.TX_HAS_MEDIA_META && media) {
+    cols.push('media_meta');
+    vals.push(JSON.stringify(media));
+  }
+
+  if (caps.TX_HAS_MEDIA_ASSET_ID) {
+    cols.push('media_asset_id');
+    vals.push(mediaAssetId); // UUID or null only
+  }
+
+  // legacy discrete media cols if present (optional, safe)
+  if (media) {
+    if (caps.TX_HAS_MEDIA_URL) {
+      cols.push('media_url');
+      vals.push(media.media_url);
+    }
+    if (caps.TX_HAS_MEDIA_TYPE) {
+      cols.push('media_type');
+      vals.push(media.media_type);
+    }
+    if (caps.TX_HAS_MEDIA_TXT) {
+      cols.push('media_transcript');
+      vals.push(media.media_transcript);
+    }
+    if (caps.TX_HAS_MEDIA_CONF) {
+      cols.push('media_confidence');
+      vals.push(media.media_confidence);
+    }
+  }
+
+  if (caps.TX_HAS_CREATED_AT) {
+    cols.push('created_at');
+    vals.push(new Date());
+  }
+  if (caps.TX_HAS_UPDATED_AT) {
+    cols.push('updated_at');
+    vals.push(new Date());
+  }
+
+  const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
 
   let conflictSql = '';
 
-  // Prefer dedupe hash conflict when available
   if (caps.TX_HAS_DEDUPE_HASH && dedupeHash && hasOwnerDedupeUnique) {
     conflictSql = ' on conflict (owner_id, dedupe_hash) where dedupe_hash is not null do nothing ';
   }
 
-  // Otherwise source_msg_id idempotency
   if (!conflictSql && caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
     const hasUq = await detectTransactionsUniqueOwnerSourceMsg().catch(() => false);
     if (hasUq) {
@@ -1965,42 +1952,19 @@ const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
   `;
 
   try {
-  const r = await queryWithTimeout(sql, vals, timeoutMs);
-  const id = r?.rows?.[0]?.id ?? null;
-  console.info('[TX_WRITE_JOB]', { owner_id: owner, kind, job_id: resolvedJobId ?? null, job_no: jobNo ?? null });
-  if (id) return { inserted: true, id };
+    const r = await queryWithTimeout(sql, vals, timeoutMs);
+    const id = r?.rows?.[0]?.id ?? null;
 
-  // conflictSql DO NOTHING can yield no RETURNING row; try to recover id
-  if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
-    try {
-      const ex = await queryWithTimeout(
-        `select id from public.transactions where owner_id=$1 and source_msg_id=$2 limit 1`,
-        [owner, sourceMsgId],
-        Math.min(2500, timeoutMs)
-      );
-      if (ex?.rows?.length) return { inserted: false, id: ex.rows[0].id };
-    } catch {}
-  }
+    console.info('[TX_WRITE_JOB]', {
+      owner_id: owner,
+      kind,
+      job_id: resolvedJobId ?? null,
+      job_no: jobNo ?? null
+    });
 
-  // If dedupe_hash exists, try that too
-  if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
-    try {
-      const ex2 = await queryWithTimeout(
-        `select id from public.transactions where owner_id=$1 and dedupe_hash=$2 limit 1`,
-        [owner, dedupeHash],
-        Math.min(2500, timeoutMs)
-      );
-      if (ex2?.rows?.length) return { inserted: false, id: ex2.rows[0].id };
-    } catch {}
-  }
+    if (id) return { inserted: true, id };
 
-  return { inserted: false, id: null };
-} catch (e) {
-  const code = String(e?.code || '');
-  if (code === '23505') {
-    console.warn('[PG/transactions] insert conflict treated as duplicate:', e?.message);
-
-    // best-effort: recover id on unique violation too
+    // conflictSql DO NOTHING can yield no RETURNING row; try to recover id
     if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
       try {
         const ex = await queryWithTimeout(
@@ -2011,6 +1975,7 @@ const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
         if (ex?.rows?.length) return { inserted: false, id: ex.rows[0].id };
       } catch {}
     }
+
     if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
       try {
         const ex2 = await queryWithTimeout(
@@ -2023,9 +1988,37 @@ const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
     }
 
     return { inserted: false, id: null };
+  } catch (e) {
+    const code = String(e?.code || '');
+    if (code === '23505') {
+      console.warn('[PG/transactions] insert conflict treated as duplicate:', e?.message);
+
+      // best-effort recover id
+      if (caps.TX_HAS_SOURCE_MSG_ID && sourceMsgId) {
+        try {
+          const ex = await queryWithTimeout(
+            `select id from public.transactions where owner_id=$1 and source_msg_id=$2 limit 1`,
+            [owner, sourceMsgId],
+            Math.min(2500, timeoutMs)
+          );
+          if (ex?.rows?.length) return { inserted: false, id: ex.rows[0].id };
+        } catch {}
+      }
+      if (caps.TX_HAS_DEDUPE_HASH && dedupeHash) {
+        try {
+          const ex2 = await queryWithTimeout(
+            `select id from public.transactions where owner_id=$1 and dedupe_hash=$2 limit 1`,
+            [owner, dedupeHash],
+            Math.min(2500, timeoutMs)
+          );
+          if (ex2?.rows?.length) return { inserted: false, id: ex2.rows[0].id };
+        } catch {}
+      }
+
+      return { inserted: false, id: null };
+    }
+    throw e;
   }
-  throw e;
-}
 }
 
 /* -------------------- Time helpers -------------------- */

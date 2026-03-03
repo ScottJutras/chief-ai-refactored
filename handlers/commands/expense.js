@@ -7001,6 +7001,11 @@ console.info('[EXPENSE_DEBUG_AFTER_PARSE]', {
     : null,
   aiReplyHead: aiReply ? String(aiReply).slice(0, 80) : null
 });
+
+if (data?.item && typeof data.item === 'string') {
+  const cleaned = data.item.replace(/^\s*on\s+/i, '').trim();
+  data.item = cleaned || null;
+}
 // === DATE HELPERS (MVP) ===================================================
 
 function getTodayPartsInTz(tz) {

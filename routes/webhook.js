@@ -3654,7 +3654,10 @@ const howTo = typeof isHowToQuestion === 'function' ? isHowToQuestion(text2) : f
 
 // If isQuestionAsk is a function, call it.
 // If it’s already a boolean computed earlier, keep that instead.
-const askQ = typeof isQuestionAsk === 'function' ? isQuestionAsk(text2) : !!isQuestionAsk;
+const askQ =
+  (typeof isQuestionAsk === 'function' && isQuestionAsk(text2)) ||
+  (typeof isQuestionAsk === 'boolean' && isQuestionAsk) ||
+  false;
 
 
 // -------------------- REVENUE FAST PATH --------------------

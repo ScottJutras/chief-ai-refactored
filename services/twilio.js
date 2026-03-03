@@ -356,7 +356,13 @@ async function sendTemplateQuickReply(to, templateSid, vars = {}, fallbackBody =
  * Wrapper: returns Twilio message object (sid/status).
  */
 async function sendWhatsAppTemplate({ to, templateSid, summaryLine } = {}) {
-  const safe = String(summaryLine || '').replace(/\s+/g, ' ').trim().slice(0, 600) || '—';
+  // Preserve \n (WhatsApp supports line breaks in template variables)
+  const safe =
+    String(summaryLine || '')
+      .replace(/\r\n/g, '\n')
+      .trim()
+      .slice(0, 600) || '—';
+
   return sendTemplateMessage(to, templateSid, { 1: toTemplateVar(safe) }, safe);
 }
 

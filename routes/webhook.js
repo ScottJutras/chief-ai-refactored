@@ -1962,7 +1962,7 @@ if (lc2Clean === "commands" || lc2Clean === "help") {
   return ok(res, buildCommandsMessage());
 }
 
-if (/^\s*(what('?s)?\s+my\s+)?owner\s*id\b|where do i get my owner id\??/i.test(text2)) {
+if (/^(?:what('?s)?\s+my\s+)?owner\s*id\b|^where do i get my owner id\??$/.test(lc2Clean)) {
   return ok(res, `You don’t need that. I already know your owner ID from your WhatsApp number. Just ask your question (e.g., “profit this month” or “profit on job 1556”).`);
 }
 // -----------------------------------------------------------------------
@@ -3126,15 +3126,22 @@ try {
   const isRevenuePAHere = paKindHere === 'confirm_revenue' || paKindHere === 'pick_job_for_revenue';
   const hasMoneyPAHere = isExpensePAHere || isRevenuePAHere;
 
-  const shouldRouteToJob = hardJob || (hasPendingJobDeleteConfirm && !hasMoneyPAHere);
+  const changeJobInMoneyFlow =
+  hasMoneyPAHere && /^\s*(change\s+job|switch\s+job|pick\s+job)\s*$/i.test(lcJob);
+
+// ✅ If money flow is active, "change job" belongs to revenue/expense handler, not job.js
+const shouldRouteToJob =
+  (!changeJobInMoneyFlow && hardJob) ||
+  (hasPendingJobDeleteConfirm && !hasMoneyPAHere);
 
   console.info('[ROUTER_HARD_JOB]', {
-    lcN: lcJob.slice(0, 50),
-    isHardJobCommand: hardJob,
-    hasPendingJobDeleteConfirm,
-    hasMoneyPAHere,
-    shouldRouteToJob
-  });
+  lcN: lcJob.slice(0, 50),
+  isHardJobCommand: hardJob,
+  changeJobInMoneyFlow,
+  hasPendingJobDeleteConfirm,
+  hasMoneyPAHere,
+  shouldRouteToJob
+});
 
   if (shouldRouteToJob) {
     const { handleJob } = require('../handlers/commands/job');

@@ -268,7 +268,7 @@ async function resendConfirmRevenue({ from, ownerId, tz, paUserId } = {}) {
 
   const draft = confirmPA.payload.draft || {};
 
-  const line =
+  const summaryLine =
     confirmPA.payload.humanLine ||
     buildRevenueSummaryLine({
       amount: draft.amount,
@@ -279,14 +279,8 @@ async function resendConfirmRevenue({ from, ownerId, tz, paUserId } = {}) {
     }) ||
     'Confirm revenue?';
 
-  return sendConfirmRevenueTemplateOrFallback(from, buildRevenueTemplateLine({
-  amount: draft.amount,
-  source: draft.source,
-  date: draft.date,
-  jobName: draft.jobName,
-  tz
-}));
-
+  // ✅ ONE PATH: template or fallback both receive the SAME text
+  return sendConfirmRevenueTemplateOrFallback(from, summaryLine);
 }
 
 /* ---------------- Date / money helpers ---------------- */
@@ -615,8 +609,9 @@ function sendConfirmRevenueTwiML(from, summaryLine) {
 }
 
 async function sendConfirmRevenueTemplateOrFallback(from, summaryLine) {
+  summaryLine = String(summaryLine || '').trim() || 'Confirm revenue?';
   const sid = String(process.env.TWILIO_REVENUE_CONFIRM_TEMPLATE_SID || '').trim();
-
+  
   // If template SID missing, fall back to TwiML confirm (NO recursion)
   if (!sid) return sendConfirmRevenueTwiML(from, summaryLine);
 
@@ -858,6 +853,41 @@ function coerceJobixToJobno(rawInput, displayedJobNos) {
     if (Number.isFinite(jobNo)) return `jobno_${jobNo}`;
   }
   return s;
+}
+
+function coerceToYYYYMMDD(raw, tz = 'America/Toronto') {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+
+  // already ISO
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // "2025 02 11" or "2025/02/11"
+  let m = s.match(/^(\d{4})[\/\s](\d{1,2})[\/\s](\d{1,2})$/);
+  if (m) {
+    const y = m[1];
+    const mo = String(m[2]).padStart(2, '0');
+    const d = String(m[3]).padStart(2, '0');
+    return `${y}-${mo}-${d}`;
+  }
+
+  // "Nov 2, 2025" / "November 2 2025"
+  m = s.match(/^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(\d{4})$/i);
+  if (m) {
+    const mon = m[1].slice(0, 3).toLowerCase();
+    const day = String(m[2]).padStart(2, '0');
+    const yr = m[3];
+    const map = { jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12' };
+    return `${yr}-${map[mon]}-${day}`;
+  }
+
+  // relative tokens you already support elsewhere
+  if (/^today$/i.test(s) || /^yesterday$/i.test(s) || /^tomorrow$/i.test(s)) {
+    // If you already have extractReceiptDateYYYYMMDD(raw,tz), prefer it here
+    return null;
+  }
+
+  return null;
 }
 
 function resolveJobOptionFromReply(rawInput, jobOptions, opts = {}) {
@@ -1126,7 +1156,74 @@ async function resolveJobPickSelection({ input, twilioMeta, pickState }) {
 
 
 
+function buildJobPickerRows({
+  jobOptions = [],
+  page = 0,
+  pageSize = 8,
+  includeOverhead = true,
+  includeMore = true
+} = {}) {
+  const jobs = Array.isArray(jobOptions) ? jobOptions : [];
+  const p = Math.max(0, Number(page) || 0);
+  const size = Math.max(1, Math.min(8, Number(pageSize) || 8)); // keep <= 8 jobs per page
+  const start = p * size;
+  const end = start + size;
 
+  const slice = jobs.slice(start, end);
+
+  const total = jobs.length;
+  const hasMore = end < total;
+
+  // Stable row IDs (never index-based)
+  // - job rows: jobno_<job_no>
+  // - overhead: overhead
+  // - more: more
+  const rows = [];
+
+  // Job rows first
+  for (const j of slice) {
+    const jobNo = j?.job_no ?? j?.jobNo ?? null;
+    const titleRaw = j?.name ?? j?.job_name ?? j?.jobName ?? '';
+    const title = String(titleRaw || '').trim() || (jobNo != null ? `Job #${jobNo}` : 'Untitled Job');
+
+    // If job_no is missing, fall back to a stable-ish id using name
+    // (but ideally job_no exists for all rows)
+    const id =
+      jobNo != null && Number.isFinite(Number(jobNo))
+        ? `jobno_${Number(jobNo)}`
+        : `jobname_${title.toLowerCase().replace(/\s+/g, '_').slice(0, 32)}`;
+
+    rows.push({ title, id, jobNo: jobNo != null ? Number(jobNo) : null });
+  }
+
+  // Optional: Overhead row
+  if (includeOverhead) {
+    rows.push({ title: 'Overhead', id: 'overhead', jobNo: null });
+  }
+
+  // Optional: More… row (only if there are more jobs beyond this page)
+  if (includeMore && hasMore) {
+    rows.push({ title: 'More…', id: 'more', jobNo: null });
+  }
+
+  // What we actually displayed (helps coerce jobix -> jobno and verify taps)
+  const displayedJobNos = rows
+    .map((r) => (r.jobNo != null && Number.isFinite(Number(r.jobNo)) ? Number(r.jobNo) : null))
+    .filter((n) => n != null);
+
+  // This is what you should persist so selection resolution can validate taps
+  const sentRows = rows.map((r) => ({ title: r.title, id: r.id }));
+
+  return {
+    rows,              // array of {title, id, jobNo?}
+    sentRows,          // persisted for robust resolution
+    displayedJobNos,   // persisted for jobix->jobno coercion
+    hasMore,
+    page: p,
+    pageSize: size,
+    total
+  };
+}
 function pickConfirmDraftSnapshot(confirmDraft) {
   if (!confirmDraft || typeof confirmDraft !== 'object') return null;
   const d = { ...confirmDraft };
@@ -1151,14 +1248,14 @@ async function sendJobPickerOrFallback({
   paUserId,
   jobOptions,
   page = 0,
-  pageSize = 10,
+  pageSize = 8,
   confirmDraft = null,
   context = 'revenue_jobpick'
 }) {
   const to = waTo(from);
 
-  // ✅ allow up to 10 (Twilio list picker limit)
-  const JOBS_PER_PAGE = Math.min(10, Math.max(1, Number(pageSize || 10)));
+  // ✅ Keep <= 10 total rows: 8 jobs + Overhead + (optional) More…
+const JOBS_PER_PAGE = Math.min(8, Math.max(1, Number(pageSize || 8)));
   const p = Math.max(0, Number(page || 0));
   const start = p * JOBS_PER_PAGE;
 
@@ -1305,12 +1402,12 @@ function buildRevenueTemplateLine({ amount, source, date, jobName, tz }) {
 }
 
 function buildRevenueSummaryLine({ amount, source, date, jobName, tz }) {
-  // amount might be "$16890.00", "16890", 16890, etc.
   const n = typeof amount === 'number' ? amount : toNumberAmount(amount);
   const amtPretty = formatMoneyDisplay(Number.isFinite(n) ? n : 0);
 
   const src = String(source || '').trim();
-  const dt = formatDisplayDate(date, tz);
+  const dtRaw = String(date || '').trim();
+  const dt = dtRaw ? formatDisplayDate(dtRaw, tz) : '';
   const jb = jobName ? String(jobName).trim() : '';
 
   const lines = [];
@@ -1321,7 +1418,6 @@ function buildRevenueSummaryLine({ amount, source, date, jobName, tz }) {
 
   return lines.join('\n');
 }
-
 
 
 /* ---------------- New message detection (job-picker bypass) ---------------- */
@@ -1374,32 +1470,50 @@ if (
     try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }); } catch {}
     try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
   } else {
-    const tok = normalizeDecisionToken(input);
+const raw0 = String(input || '').trim();
+const rawLc = raw0.toLowerCase();
+const tok = normalizeDecisionToken(raw0);
+const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
+const page = Number(pickPA.payload.page || 0) || 0;
+const pageSize = Number(pickPA.payload.pageSize || 8) || 8; // ✅ 8
+const hasMore = !!pickPA.payload.hasMore;
+const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : [];
+const sentRows = Array.isArray(pickPA.payload.sentRows) ? pickPA.payload.sentRows : [];
+const sentAt = Number(pickPA.payload.sentAt || 0) || Number(pickPA.payload.shownAt || 0) || 0; // compat
+const context = String(pickPA.payload.context || 'revenue_jobpick');
+const listRowId = String(twilioMeta?.ListRowId || twilioMeta?.ListId || '').trim().toLowerCase();
+const isMore = tok === 'more' || rawLc === 'more' || listRowId === 'more';
 
-    const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
-    const page = Number(pickPA.payload.page || 0) || 0;
-    const pageSize = Number(pickPA.payload.pageSize || 10) || 10;
-    const hasMore = !!pickPA.payload.hasMore;
-    const displayedJobNos = Array.isArray(pickPA.payload.displayedJobNos) ? pickPA.payload.displayedJobNos : [];
-    const sentRows = Array.isArray(pickPA.payload.sentRows) ? pickPA.payload.sentRows : [];
-    const sentAt = Number(pickPA.payload.sentAt || 0) || Number(pickPA.payload.shownAt || 0) || 0; // compat
-    const context = String(pickPA.payload.context || 'revenue_jobpick');
+// TTL / stale → resend page 0
+if (!sentAt || (Date.now() - sentAt) > (PA_TTL_SEC * 1000)) {
+  return await sendJobPickerOrFallback({
+    from,
+    ownerId,
+    paUserId,
+    jobOptions,
+    page: 0,
+    pageSize,
+    confirmDraft: pickPA?.payload?.confirmDraft || null,
+    context
+  });
+}
 
-    const raw0 = String(input || '').trim();
-
-    // TTL / stale → resend page 0
-    if (!sentAt || (Date.now() - sentAt) > (PA_TTL_SEC * 1000)) {
-      return await sendJobPickerOrFallback({
-        from,
-        ownerId,
-        paUserId,
-        jobOptions,
-        page: 0,
-        pageSize,
-        confirmDraft: pickPA?.payload?.confirmDraft || null,
-        context
-      });
-    }
+// ✅ "more" handler (must run BEFORE coercion / resolution)
+if (isMore) {
+  if (!hasMore) {
+    return out(twimlText('No more jobs to show. Tap a job, or reply with a job name.'), false);
+  }
+  return await sendJobPickerOrFallback({
+    from,
+    ownerId,
+    paUserId,
+    jobOptions,
+    page: page + 1,
+    pageSize,
+    confirmDraft: pickPA?.payload?.confirmDraft || null,
+    context
+  });
+}
 
     // ---------------------------------------------------------
     // ✅ CREATE-FIRST-JOB (typed) when allowCreateJob is true
@@ -1550,35 +1664,7 @@ if (
       }
     }
 
-    // ✅ "more" handler (must run BEFORE coercion / resolution)
-    if (tok === 'more' || /^\s*more\s*$/i.test(raw0)) {
-      if (!hasMore) {
-        return out(twimlText('No more jobs to show. Tap a job, or reply with a job name.'), false);
-      }
-      return await sendJobPickerOrFallback({
-        from,
-        ownerId,
-        paUserId,
-        jobOptions,
-        page: page + 1,
-        pageSize,
-        confirmDraft: pickPA?.payload?.confirmDraft || null,
-        context
-      });
-    }
-
-    if (tok === 'change_job') {
-      return await sendJobPickerOrFallback({
-        from,
-        ownerId,
-        paUserId,
-        jobOptions,
-        page,
-        pageSize,
-        confirmDraft: pickPA?.payload?.confirmDraft || null,
-        context
-      });
-    }
+   
 
     // -----------------------------
     // picker-tap resolution

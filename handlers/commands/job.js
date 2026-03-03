@@ -692,7 +692,74 @@ function resolvePickerReply(raw, pending) {
 
   return job ? { kind: 'job', job } : { kind: 'name', name };
 }
+function buildJobPickerRows({
+  jobOptions = [],
+  page = 0,
+  pageSize = 8,
+  includeOverhead = true,
+  includeMore = true
+} = {}) {
+  const jobs = Array.isArray(jobOptions) ? jobOptions : [];
+  const p = Math.max(0, Number(page) || 0);
+  const size = Math.max(1, Math.min(8, Number(pageSize) || 8)); // keep <= 8 jobs per page
+  const start = p * size;
+  const end = start + size;
 
+  const slice = jobs.slice(start, end);
+
+  const total = jobs.length;
+  const hasMore = end < total;
+
+  // Stable row IDs (never index-based)
+  // - job rows: jobno_<job_no>
+  // - overhead: overhead
+  // - more: more
+  const rows = [];
+
+  // Job rows first
+  for (const j of slice) {
+    const jobNo = j?.job_no ?? j?.jobNo ?? null;
+    const titleRaw = j?.name ?? j?.job_name ?? j?.jobName ?? '';
+    const title = String(titleRaw || '').trim() || (jobNo != null ? `Job #${jobNo}` : 'Untitled Job');
+
+    // If job_no is missing, fall back to a stable-ish id using name
+    // (but ideally job_no exists for all rows)
+    const id =
+      jobNo != null && Number.isFinite(Number(jobNo))
+        ? `jobno_${Number(jobNo)}`
+        : `jobname_${title.toLowerCase().replace(/\s+/g, '_').slice(0, 32)}`;
+
+    rows.push({ title, id, jobNo: jobNo != null ? Number(jobNo) : null });
+  }
+
+  // Optional: Overhead row
+  if (includeOverhead) {
+    rows.push({ title: 'Overhead', id: 'overhead', jobNo: null });
+  }
+
+  // Optional: More… row (only if there are more jobs beyond this page)
+  if (includeMore && hasMore) {
+    rows.push({ title: 'More…', id: 'more', jobNo: null });
+  }
+
+  // What we actually displayed (helps coerce jobix -> jobno and verify taps)
+  const displayedJobNos = rows
+    .map((r) => (r.jobNo != null && Number.isFinite(Number(r.jobNo)) ? Number(r.jobNo) : null))
+    .filter((n) => n != null);
+
+  // This is what you should persist so selection resolution can validate taps
+  const sentRows = rows.map((r) => ({ title: r.title, id: r.id }));
+
+  return {
+    rows,              // array of {title, id, jobNo?}
+    sentRows,          // persisted for robust resolution
+    displayedJobNos,   // persisted for jobix->jobno coercion
+    hasMore,
+    page: p,
+    pageSize: size,
+    total
+  };
+}
 async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptions, page = 0, perPage = 8 }) {
   const to = waTo(fromPhone);
   const JOBS_PER_PAGE = Math.min(8, Math.max(1, Number(perPage || 8)));
@@ -735,19 +802,23 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptio
     });
 
     rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
-    if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: 'Show next page' });
+  if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: 'Show next page' });
 
-    const bodyText =
-      `Pick your active job (${start + 1}-${Math.min(start + JOBS_PER_PAGE, clean.length)} of ${clean.length}).` +
-      `\n\nTip: You can also reply with a number (like "1").`;
+  // ✅ Hard cap: Twilio list rows max (protects against accidental oversize)
+  rows.splice(10);
 
-    try {
-      await sendWhatsAppInteractiveList({
-        to,
-        bodyText,
-        buttonText: 'Pick job',
-        sections: [{ title: 'Active Jobs', rows }]
-      });
+  const bodyText =
+    `Pick a job (${start + 1}-${Math.min(start + JOBS_PER_PAGE, clean.length)} of ${clean.length}).` +
+    `\n\nTip: You can also reply with a number (like "1").`;
+
+  let sendResult = null;
+  try {
+    sendResult = await sendWhatsAppInteractiveList({
+      to,
+      bodyText,
+      buttonText: 'Pick a job',
+      sections: [{ title: 'Active Jobs', rows }]
+    });
 
       return respondEmpty(res);
     } catch (e) {

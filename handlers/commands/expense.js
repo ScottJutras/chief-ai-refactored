@@ -1383,6 +1383,74 @@ function isStalePickerTap(pickPA, inbound) {
   return { stale: false, reason: null };
 }
 
+function buildJobPickerRows({
+  jobOptions = [],
+  page = 0,
+  pageSize = 8,
+  includeOverhead = true,
+  includeMore = true
+} = {}) {
+  const jobs = Array.isArray(jobOptions) ? jobOptions : [];
+  const p = Math.max(0, Number(page) || 0);
+  const size = Math.max(1, Math.min(8, Number(pageSize) || 8)); // keep <= 8 jobs per page
+  const start = p * size;
+  const end = start + size;
+
+  const slice = jobs.slice(start, end);
+
+  const total = jobs.length;
+  const hasMore = end < total;
+
+  // Stable row IDs (never index-based)
+  // - job rows: jobno_<job_no>
+  // - overhead: overhead
+  // - more: more
+  const rows = [];
+
+  // Job rows first
+  for (const j of slice) {
+    const jobNo = j?.job_no ?? j?.jobNo ?? null;
+    const titleRaw = j?.name ?? j?.job_name ?? j?.jobName ?? '';
+    const title = String(titleRaw || '').trim() || (jobNo != null ? `Job #${jobNo}` : 'Untitled Job');
+
+    // If job_no is missing, fall back to a stable-ish id using name
+    // (but ideally job_no exists for all rows)
+    const id =
+      jobNo != null && Number.isFinite(Number(jobNo))
+        ? `jobno_${Number(jobNo)}`
+        : `jobname_${title.toLowerCase().replace(/\s+/g, '_').slice(0, 32)}`;
+
+    rows.push({ title, id, jobNo: jobNo != null ? Number(jobNo) : null });
+  }
+
+  // Optional: Overhead row
+  if (includeOverhead) {
+    rows.push({ title: 'Overhead', id: 'overhead', jobNo: null });
+  }
+
+  // Optional: More… row (only if there are more jobs beyond this page)
+  if (includeMore && hasMore) {
+    rows.push({ title: 'More…', id: 'more', jobNo: null });
+  }
+
+  // What we actually displayed (helps coerce jobix -> jobno and verify taps)
+  const displayedJobNos = rows
+    .map((r) => (r.jobNo != null && Number.isFinite(Number(r.jobNo)) ? Number(r.jobNo) : null))
+    .filter((n) => n != null);
+
+  // This is what you should persist so selection resolution can validate taps
+  const sentRows = rows.map((r) => ({ title: r.title, id: r.id }));
+
+  return {
+    rows,              // array of {title, id, jobNo?}
+    sentRows,          // persisted for robust resolution
+    displayedJobNos,   // persisted for jobix->jobno coercion
+    hasMore,
+    page: p,
+    pageSize: size,
+    total
+  };
+}
 
 function getJobPickerSecret() {
   const s = process.env.JOB_PICKER_HMAC_SECRET;

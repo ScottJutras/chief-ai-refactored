@@ -5303,55 +5303,94 @@ if (confirmPA?.payload?.draft) {
     }
 
     // ✅ New expense while confirm pending → nag unless allow_new_while_pending
-    if (!strictTok && looksLikeNewExpenseText(rawInboundText)) {
-      console.info('[CONFIRM_NAG_WOULD_FIRE]', {
-        paUserId,
-        head: String(rawInboundText || '').trim().slice(0, 80),
-        looksLikeNewExpense: true
-      });
+if (!strictTok && looksLikeNewExpenseText(rawInboundText)) {
 
-      let pendingNow = null;
-      try { pendingNow = await getPendingTransactionState(paUserId); } catch {}
+  // ✅ If confirm draft is awaiting_edit, never nag.
+  // Let the UN-SKIPPABLE EDIT CONSUMPTION block handle this inbound as the edit payload.
+  if (confirmPA?.payload?.draft?.awaiting_edit) {
+    console.info('[CONFIRM_NAG_SUPPRESSED_AWAITING_EDIT]', { paUserId });
+    // DO NOT set bypassConfirmToAllowNewIntake=true here.
+    // Just stop this nag path entirely:
+    // (fall through to rest of handler; do not return a response here)
+  } else {
+    console.info('[CONFIRM_NAG_WOULD_FIRE]', {
+      paUserId,
+      head: String(rawInboundText || '').trim().slice(0, 80),
+      looksLikeNewExpense: true
+    });
 
-      const allowNew = !!pendingNow?.allow_new_while_pending;
+    let pendingNow = null;
+    try { pendingNow = await getPendingTransactionState(paUserId); } catch {}
 
-      if (!allowNew) {
-        return out(
-          twimlText(
-            [
-              'You’ve still got an expense waiting for confirmation.',
-              '',
-              'Reply:',
-              '• "yes" to submit it',
-              '• "edit" to change it',
-              '• "resume" to see it again',
-              '• "skip" to keep it pending and log a new one',
-              '• "cancel" to discard it'
-            ].join('\n')
-          ),
-          false
-        );
-      }
+    const allowNew = !!pendingNow?.allow_new_while_pending;
 
-      // consume allow-one flag
-      try {
-        await mergePendingTransactionState(paUserId, { allow_new_while_pending: false, allow_new_set_at: null });
-      } catch {}
-
-      bypassConfirmToAllowNewIntake = true;
+    if (!allowNew) {
+      return out(
+        twimlText(
+          [
+            'You’ve still got an expense waiting for confirmation.',
+            '',
+            'Reply:',
+            '• "yes" to submit it',
+            '• "edit" to change it',
+            '• "resume" to see it again',
+            '• "skip" to keep it pending and log a new one',
+            '• "cancel" to discard it'
+          ].join('\n')
+        ),
+        false
+      );
     }
 
+    // consume allow-one flag
+    try {
+      await mergePendingTransactionState(paUserId, { allow_new_while_pending: false, allow_new_set_at: null });
+    } catch {}
+
+    bypassConfirmToAllowNewIntake = true;
+  }
+}
     if (!bypassConfirmToAllowNewIntake) {
-      const confirmFlowIdSafe =
       
-        String(confirmPA?.payload?.sourceMsgId || '').trim() ||
-        String(confirmPA?.payload?.draft?.txSourceMsgId || confirmPA?.payload?.draft?.sourceMsgId || '').trim() ||
-        String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
-        String(sourceMsgId || '').trim() ||
-        `${paUserId}:${Date.now()}`;
-// ✏️ Edit: mark confirm draft as awaiting edit (MUST be before change_job/cancel/yes)
+      
+  // ---------------------------------------------------------
+// ✅ CONFIRM FLOW TOKEN HANDLERS (ORDER MATTERS)
+// Place inside: if (!bypassConfirmToAllowNewIntake) { ... }
+// Right after confirmFlowIdSafe is computed
+// ---------------------------------------------------------
+
+const confirmFlowIdSafe =
+  String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+  String(confirmPA?.payload?.draft?.txSourceMsgId || confirmPA?.payload?.draft?.sourceMsgId || '').trim() ||
+  String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+  String(sourceMsgId || '').trim() ||
+  `${paUserId}:${Date.now()}`;
+
+// ✅ IMPORTANT: always refresh confirmPA right before token handling
+try {
+  const fresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+  if (fresh) confirmPA = fresh;
+} catch {}
+
+// ✅ pull freshest draft reference
+const draftTok = confirmPA?.payload?.draft || null;
+
+// ---------------------------------------------------------
+// ✏️ EDIT (must happen BEFORE change_job/cancel/yes)
+// ---------------------------------------------------------
 if (strictTok === 'edit') {
   const now = Date.now();
+
+  // ✅ ensure we do NOT drift into "new intake" bypass behavior
+  bypassConfirmToAllowNewIntake = false;
+
+  // ✅ optional: clear "allow new while pending" so next message is treated as the edit payload, not “new intake”
+  try {
+    await mergePendingTransactionState(paUserId, {
+      allow_new_while_pending: false,
+      allow_new_set_at: null
+    });
+  } catch {}
 
   try {
     await upsertPA({
@@ -5361,7 +5400,7 @@ if (strictTok === 'edit') {
       payload: {
         ...(confirmPA?.payload || {}),
         draft: {
-          ...(confirmPA?.payload?.draft || {}),
+          ...(draftTok || {}),
           awaiting_edit: true,
           edit_started_at: now,
           editStartedAt: now,
@@ -5371,10 +5410,10 @@ if (strictTok === 'edit') {
       ttlSeconds: PA_TTL_SEC
     });
 
-    // ✅ refresh confirmPA in-memory so downstream checks see awaiting_edit=true
+    // ✅ refresh in-memory so downstream sees awaiting_edit=true
     try {
-      const fresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
-      if (fresh) confirmPA = fresh;
+      const fresh2 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+      if (fresh2) confirmPA = fresh2;
     } catch {}
 
     console.info('[EDIT_MODE_SET]', { paUserId, now, flow: confirmFlowIdSafe });
@@ -5394,116 +5433,16 @@ if (strictTok === 'edit') {
     false
   );
 }
-      
-  // 🔁 Change Job (keep confirm PA)
-  if (strictTok === 'change_job') {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
 
-    if (!jobs.length) {
-      // ✅ Create-first-job path (no one gets stuck)
-      await upsertPA({
-        ownerId,
-        userId: canonicalUserKey,
-        kind: PA_KIND_PICK_JOB,
-        payload: {
-          allowCreateJob: true,
-          flow: 'expense',
-          context: 'expense_jobpick_create_first',
-          confirmFlowId: confirmFlowIdSafe,
-          sentAt: Date.now(),
-          jobOptions: [],
-          confirmDraft: confirmPA?.payload?.draft || null
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-
-      return out(
-        twimlText(
-          [
-            'You don’t have any jobs yet.',
-            '',
-            'Reply with your first job name (just the name), or reply "Overhead".',
-            'Example: Oak Street Re-roof'
-          ].join('\n')
-        ),
-        false
-      );
-    }
-
-    // ✅ Touch confirm PA but preserve needsReparse as-is
-    try {
-      await upsertPA({
-        ownerId,
-        userId: paKey,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA?.payload || {}),
-          draft: {
-            ...(confirmPA?.payload?.draft || {}),
-            needsReparse: !!confirmPA?.payload?.draft?.needsReparse
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-    } catch (e) {
-      console.warn('[EXPENSE] change_job confirmPA touch failed (ignored):', e?.message);
-    }
-
-    await sendJobPickList({
-      fromPhone,
-      ownerId,
-      userProfile,
-      confirmFlowId: confirmFlowIdSafe,
-      jobOptions: jobs,
-      paUserId,
-      pickUserId: canonicalUserKey,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft: confirmPA?.payload?.draft || null
-    });
-
-    return out(twimlEmpty(), true);
-  }
-
-  // ✏️ Edit: mark confirm draft as awaiting edit
-  if (strictTok === 'edit') {
-    try {
-      await upsertPA({
-        ownerId,
-        userId: paKey,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA?.payload || {}),
-          draft: {
-            ...(confirmPA?.payload?.draft || {}),
-            awaiting_edit: true,
-            edit_started_at: Date.now(),
-            editStartedAt: Date.now(),
-            edit_flow_id: confirmFlowIdSafe
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-    } catch (e) {
-      console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
-    }
-
-    return out(
-      twimlText(
-        [
-          '✏️ Okay — send the corrected expense details in ONE message.',
-          'Example:',
-          'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
-          'Reply "cancel" to discard.'
-        ].join('\n')
-      ),
-      false
-    );
-  }
-
-  // ✅ If still awaiting_edit and user pressed control token other than cancel, re-prompt (do NOT block cancel)
-  if (confirmPA?.payload?.draft?.awaiting_edit && strictTok && strictTok !== 'cancel') {
+// ---------------------------------------------------------
+// ✅ HARD GATE: if awaiting_edit is true, DO NOT allow other flows to nag/consume.
+// Only cancel is allowed to escape.
+// ---------------------------------------------------------
+if (draftTok?.awaiting_edit) {
+  if (strictTok === 'cancel') {
+    // let your existing cancel handler run below
+  } else if (strictTok) {
+    // any other control token while awaiting edit: re-prompt (no submit / no job change)
     return out(
       twimlText(
         [
@@ -5516,6 +5455,62 @@ if (strictTok === 'edit') {
       false
     );
   }
+  // if strictTok is null here, the edit-consume block above (UN-SKIPPABLE EDIT CONSUMPTION)
+  // should consume the next inbound text. So we just continue.
+}
+
+// ---------------------------------------------------------
+// 🔁 CHANGE JOB
+// ---------------------------------------------------------
+if (strictTok === 'change_job') {
+  const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+
+  if (!jobs.length) {
+    await upsertPA({
+      ownerId,
+      userId: canonicalUserKey,
+      kind: PA_KIND_PICK_JOB,
+      payload: {
+        allowCreateJob: true,
+        flow: 'expense',
+        context: 'expense_jobpick_create_first',
+        confirmFlowId: confirmFlowIdSafe,
+        sentAt: Date.now(),
+        jobOptions: [],
+        confirmDraft: confirmPA?.payload?.draft || null
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    return out(
+      twimlText(
+        [
+          'You don’t have any jobs yet.',
+          '',
+          'Reply with your first job name (just the name), or reply "Overhead".',
+          'Example: Oak Street Re-roof'
+        ].join('\n')
+      ),
+      false
+    );
+  }
+
+  await sendJobPickList({
+    fromPhone,
+    ownerId,
+    userProfile,
+    confirmFlowId: confirmFlowIdSafe,
+    jobOptions: jobs,
+    paUserId,
+    pickUserId: canonicalUserKey,
+    page: 0,
+    pageSize: 8,
+    context: 'expense_jobpick',
+    confirmDraft: confirmPA?.payload?.draft || null
+  });
+
+  return out(twimlEmpty(), true);
+}
 
 
       // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending + cancel CIL draft

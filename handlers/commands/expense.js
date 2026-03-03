@@ -2594,6 +2594,17 @@ function capListTitle(s, max = 24) {
   return t.length > max ? t.slice(0, max - 1) + '…' : t;
 }
 
+function getJobDisplayNameNoCode(job) {
+  const raw = String(getJobDisplayName?.(job) || job?.name || '').trim();
+  if (!raw) return '';
+
+  // Remove leading "J<number>" patterns:
+  // "J1 1556 Medway Park Dr" -> "1556 Medway Park Dr"
+  // "J12 - Oak St" -> "Oak St"
+  // "J12: Oak St" -> "Oak St"
+  return raw.replace(/^\s*J\d+\s*[-:–—]?\s*/i, '').trim();
+}
+
 function getJobDisplayName(job) {
   const nm = String(job?.name || job?.job_name || job?.jobName || job?.job_name_display || '').trim();
   return nm || null;
@@ -2739,7 +2750,9 @@ async function sendJobPickList({
   // ✅ NEW: row.id is a signed stable jp: row id
   const sentRows = pageJobs.map((j) => {
     const jobNo = Number(j?.job_no ?? j?.jobNo);
-    const name = String(getJobDisplayName(j) || j?.name || '').trim() || `Job ${jobNo || ''}`.trim();
+    const name =
+  String(getJobDisplayNameNoCode(j) || j?.name || '').trim() ||
+  `Job ${jobNo || ''}`.trim();
 
    let stableId = `jobno_${jobNo}`; // fallback
 if (typeof makeRowId === 'function' && Number.isFinite(jobNo) && jobNo > 0) {

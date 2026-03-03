@@ -4893,13 +4893,11 @@ let bypassConfirmToAllowNewIntake = false;
 // ---------------------------------------------------------
 
 try {
-  // ✅ Refresh ONLY once, and only if we think confirm exists
-  if (confirmPA?.payload?.draft) {
-    try {
-      const fresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
-      if (fresh) confirmPA = fresh;
-    } catch {}
-  }
+  // ✅ ALWAYS refresh confirmPA before edit-consume decisions (prevents stale awaiting_edit)
+try {
+  const fresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+  if (fresh) confirmPA = fresh;
+} catch {}
 
   const draftE = confirmPA?.payload?.draft || null;
 
@@ -5345,12 +5343,57 @@ if (confirmPA?.payload?.draft) {
 
     if (!bypassConfirmToAllowNewIntake) {
       const confirmFlowIdSafe =
+      
         String(confirmPA?.payload?.sourceMsgId || '').trim() ||
         String(confirmPA?.payload?.draft?.txSourceMsgId || confirmPA?.payload?.draft?.sourceMsgId || '').trim() ||
         String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
         String(sourceMsgId || '').trim() ||
         `${paUserId}:${Date.now()}`;
+// ✏️ Edit: mark confirm draft as awaiting edit (MUST be before change_job/cancel/yes)
+if (strictTok === 'edit') {
+  const now = Date.now();
 
+  try {
+    await upsertPA({
+      ownerId,
+      userId: paKey,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        ...(confirmPA?.payload || {}),
+        draft: {
+          ...(confirmPA?.payload?.draft || {}),
+          awaiting_edit: true,
+          edit_started_at: now,
+          editStartedAt: now,
+          edit_flow_id: confirmFlowIdSafe
+        }
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    // ✅ refresh confirmPA in-memory so downstream checks see awaiting_edit=true
+    try {
+      const fresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+      if (fresh) confirmPA = fresh;
+    } catch {}
+
+    console.info('[EDIT_MODE_SET]', { paUserId, now, flow: confirmFlowIdSafe });
+  } catch (e) {
+    console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
+  }
+
+  return out(
+    twimlText(
+      [
+        '✏️ Okay — send the corrected expense details in ONE message.',
+        'Example:',
+        'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+        'Reply "cancel" to discard.'
+      ].join('\n')
+    ),
+    false
+  );
+}
       
   // 🔁 Change Job (keep confirm PA)
   if (strictTok === 'change_job') {

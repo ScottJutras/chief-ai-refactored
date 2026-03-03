@@ -3633,7 +3633,7 @@ const pendingExpenseLike =
 }
 
 
-    /* -----------------------------------------------------------------------
+/* -----------------------------------------------------------------------
  * (B) FAST PATHS — REVENUE/EXPENSE (prefix OR NL)
  * ----------------------------------------------------------------------- */
 
@@ -3645,12 +3645,20 @@ const expensePrefix = /^(?:expense|exp)\b/.test(lc2);
 const revenueNl = !revenuePrefix && looksRevenueNl(text2);
 const expenseNl = !expensePrefix && looksExpenseNl(text2);
 
-// ✅ Precedence rule: revenue wins on cheque/check/received/deposit unless strong expense verbs
+// ✅ Precedence rule: revenue wins unless strong expense verbs
 const looksRevenue = revenuePrefix || (revenueNl && !expensePrefix);
-const looksExpense = expensePrefix || (!looksRevenue && expenseNl); // only if not revenue
+const looksExpense = expensePrefix || (!looksRevenue && expenseNl);
+
+// ✅ IMPORTANT: evaluate these as booleans (CALL the functions)
+const howTo = typeof isHowToQuestion === 'function' ? isHowToQuestion(text2) : false;
+
+// If isQuestionAsk is a function, call it.
+// If it’s already a boolean computed earlier, keep that instead.
+const askQ = typeof isQuestionAsk === 'function' ? isQuestionAsk(text2) : !!isQuestionAsk;
+
 
 // -------------------- REVENUE FAST PATH --------------------
-if (looksRevenue && !isHowToQuestion && !isQuestionAsk) {
+if (looksRevenue && !howTo && !askQ) {
   if (revenueNl) console.info('[WEBHOOK] NL revenue detected', { from: req.from, text: text2.slice(0, 120) });
 
   try {
@@ -3685,7 +3693,7 @@ if (looksRevenue && !isHowToQuestion && !isQuestionAsk) {
 
 
 // -------------------- EXPENSE FAST PATH --------------------
-if (looksRevenue && !isHowToQuestion && !isQuestionAsk) {
+if (looksExpense && !howTo && !askQ) {
   if (expenseNl) console.info('[WEBHOOK] NL expense detected', { from: req.from, text: text2.slice(0, 120) });
 
   try {
@@ -3733,7 +3741,6 @@ if (looksRevenue && !isHowToQuestion && !isQuestionAsk) {
     return;
   }
 }
-
     /* -----------------------------------------------------------------------
      * (C) Other command routing (tasks / jobs / timeclock / forecast / KPIs / agent)
      * ----------------------------------------------------------------------- */

@@ -99,7 +99,6 @@ function normalizeHandlerOutput(out, fallback = "Done.") {
   const cand =
     (typeof out.text === "string" && out.text) ||
     (typeof out.message === "string" && out.message) ||
-    (typeof out.twiml === "string" && out.twiml) ||
     (typeof out.answer === "string" && out.answer) ||
     null;
 

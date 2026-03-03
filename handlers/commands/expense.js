@@ -1911,8 +1911,13 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
   // ---------------------------
   // ✅ Item sanitization (STOP Subtotal/Tax/Total)
   // ---------------------------
-  const rawItem = String(d.item || '').trim();
+  // ✅ strip leading "on " from item (common preposition bleed)
+if (typeof d.item === 'string') {
+  d.item = d.item.replace(/^\s*on\s+/i, '').trim();
+}
 
+// now compute rawItem AFTER stripping
+const rawItem = String(d.item || '').trim();
   // common receipt non-items / totals
   const looksLikeReceiptMeta =
     /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|visa|mastercard|debit|change|tender)\b/i.test(rawItem);
@@ -4100,7 +4105,7 @@ if (!nextDraft) {
     });
 
     try {
-      return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
     } catch (e) {
       console.warn('[AWAITING_EDIT_EARLY_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
       return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
@@ -4402,7 +4407,7 @@ if (
 
       if (draft0 && Object.keys(draft0).length) {
         try {
-          return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+          return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
         } catch (e) {
           console.warn('[EXPENSE] resume during pick failed; fallback to text:', e?.message);
           return out(twimlText(formatExpenseConfirmText(draft0)), false);
@@ -5026,7 +5031,7 @@ if (!skipPickHandling) {
     // Clear pick state now that we have a job
     try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
 
-    return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+    return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
   }
 
   // ----------------------------
@@ -5149,11 +5154,11 @@ if (!skipPickHandling) {
     // Clear pick state now that we have a job
     try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
 
-    return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+    return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId: paKey, userProfile });
   }
 
   // Safe fallback (should rarely hit)
-  return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+  return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId: paKey, userProfile });
 }
 
 } // end not new expense
@@ -5390,7 +5395,7 @@ const patchedDraft = {
 
     // ✅ MUST send interactive confirm, NEVER nag
     try {
-      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
+      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
     } catch (e) {
       console.warn('[AWAITING_EDIT_SAFETYNET_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
       return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
@@ -5513,7 +5518,7 @@ const gate = canEmployeeSelfLog(plan);
         try {
           confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
         } catch {}
-        return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+        return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
       }
     }
   } catch (e) {
@@ -5551,7 +5556,7 @@ const gate = canEmployeeSelfLog(plan);
     // ✅ Resume: re-send confirm for the existing pending expense (no state changes)
     if (strictTok === 'resume') {
       try {
-        return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+        return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
       } catch (e) {
         console.warn('[EXPENSE] resume confirm resend failed (fallback to text):', e?.message);
         return out(twimlText(formatExpenseConfirmText(confirmPA.payload.draft)), false);

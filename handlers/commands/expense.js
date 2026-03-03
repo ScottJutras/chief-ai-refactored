@@ -4342,15 +4342,7 @@ const pickPA = await getPA({
   kind: PA_KIND_PICK_JOB
 }).catch(() => null);
 
-const allowCreateJob = !!pickPA?.payload?.allowCreateJob;
-
-if (
-  pickPA?.payload &&
-  (
-    allowCreateJob ||
-    (Array.isArray(pickPA.payload.jobOptions) && pickPA.payload.jobOptions.length)
-  )
-) {
+if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payload.jobOptions.length) {
   const tok = normalizeDecisionToken(rawInboundText);
 
   const isConfirmControlToken =
@@ -4751,45 +4743,40 @@ if (looksLikePickerTap) {
       });
     } catch {}
 
-  // Patch confirm draft with chosen job (UUID-safe job_id)
+    // Patch confirm draft with chosen job (UUID-safe job_id)
 const chosenJobId =
   asUuidOrNull(chosen?.job_id) ||
   asUuidOrNull(chosen?.id) ||
   null;
 
-const chosenJobNoRaw = chosen?.job_no ?? chosen?.jobNo ?? null;
-const chosenJobNo2 = Number(chosenJobNoRaw);
-
 await upsertPA({
   ownerId,
-  userId: paKey,                 // ✅ confirm PA key
+  userId: paKey,
   kind: PA_KIND_CONFIRM,
   payload: {
-    ...(confirmPA?.payload || {}),
+    ...(confirmPA.payload || {}),
     draft: {
-      ...(confirmPA?.payload?.draft || {}),
-      jobName: (getJobDisplayName?.(chosen) || chosen?.name || '').trim() || null,
+      ...(confirmPA.payload?.draft || {}),
+      jobName: getJobDisplayName(chosen),
       jobSource: 'picked',
-      job_no: Number.isFinite(chosenJobNo) ? chosenJobNo : null,
+      job_no: Number.isFinite(Number(chosen?.job_no ?? chosen?.jobNo))
+        ? Number(chosen?.job_no ?? chosen?.jobNo)
+        : null,
       job_id: chosenJobId
     }
   },
   ttlSeconds: PA_TTL_SEC
 });
 
-// Clear pick state now that we have a job
-try {
-  await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB });
-} catch {}
 
-// Immediately re-send confirm UI
-return await resendConfirmExpense({
-  fromPhone,
-  ownerId,
-  tz,
-  paUserId: paKey,               // ✅ resendConfirmExpense expects confirm key
-  userProfile
-});
+
+    // Clear pick state now that we have a job
+    try {
+      await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB });
+    } catch {}
+
+    // Immediately re-send confirm UI
+    return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
   }
 } // end looksLikePickerTap
 
@@ -4808,138 +4795,6 @@ return await resendConfirmExpense({
 // - helper: asUuidOrNull (file-scope)
 
 if (!skipPickHandling) {
-  // ------------------------------------------------------------------
-  // ✅ CREATE-FIRST-JOB (typed) when allowCreateJob is set on pickPA
-  // - This prevents new users from getting stuck in receipt/expense/revenue
-  // ------------------------------------------------------------------
-  if (allowCreateJob) {
-    const raw = String(rawInput || '').trim();
-    const tok0 = normalizeDecisionToken(raw);
-
-    // Control tokens should fall through to existing logic
-    const isControl0 =
-      tok0 === 'yes' ||
-      tok0 === 'edit' ||
-      tok0 === 'cancel' ||
-      tok0 === 'resume' ||
-      tok0 === 'skip' ||
-      tok0 === 'change_job' ||
-      tok0 === 'more';
-
-    if (!isControl0) {
-      // ✅ Overhead is allowed even with 0 jobs
-      if (/^(overhead|oh)$/i.test(raw)) {
-        let confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-
-        // bootstrap confirm if missing
-        if (!confirmPA?.payload?.draft && confirmDraft) {
-          await ensureConfirmPAExists({
-            ownerId,
-            from,
-            draft: confirmDraft,
-            sourceMsgId: effectiveConfirmFlowId || pickPA?.payload?.confirmFlowId || null,
-            userId: paKey
-          }).catch(() => null);
-
-          confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-        }
-
-        if (!confirmPA?.payload?.draft) {
-          return out(twimlText('I couldn’t find the pending expense. Please resend the receipt/expense.'), false);
-        }
-
-        await upsertPA({
-          ownerId,
-          userId: paKey,
-          kind: PA_KIND_CONFIRM,
-          payload: {
-            ...(confirmPA.payload || {}),
-            draft: {
-              ...(confirmPA.payload?.draft || {}),
-              jobName: 'Overhead',
-              jobSource: 'overhead',
-              job_no: null,
-              job_id: null
-            }
-          },
-          ttlSeconds: PA_TTL_SEC
-        });
-
-        try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
-        return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId: paKey, userProfile });
-      }
-
-      // ✅ Otherwise: create a job from their typed name
-      const jobName = raw;
-
-      let createdJob = null;
-      try {
-        if (typeof pg?.createJobIdempotent === 'function') {
-          // support both signatures
-          try {
-            createdJob = await pg.createJobIdempotent(ownerId, jobName, paKey);
-          } catch {
-            createdJob = await pg.createJobIdempotent({ ownerId, name: jobName, createdBy: paKey });
-          }
-        } else if (typeof pg?.createJob === 'function') {
-          try {
-            createdJob = await pg.createJob(ownerId, jobName, paKey);
-          } catch {
-            createdJob = await pg.createJob({ ownerId, name: jobName, createdBy: paKey });
-          }
-        }
-      } catch (e) {
-        console.warn('[CREATE_FIRST_JOB] createJob failed:', e?.message);
-      }
-
-      if (!createdJob) {
-        return out(twimlText(`I couldn’t create that job. Try a shorter name, like: "Oak Street Re-roof"`), false);
-      }
-
-      const newJobId = asUuidOrNull(createdJob?.job_id) || asUuidOrNull(createdJob?.id) || null;
-      const newJobNo = Number(createdJob?.job_no ?? createdJob?.jobNo ?? NaN);
-
-      // Ensure confirm exists
-      let confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-
-      if (!confirmPA?.payload?.draft && confirmDraft) {
-        await ensureConfirmPAExists({
-          ownerId,
-          from,
-          draft: confirmDraft,
-          sourceMsgId: effectiveConfirmFlowId || pickPA?.payload?.confirmFlowId || null,
-          userId: paKey
-        }).catch(() => null);
-
-        confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-      }
-
-      if (!confirmPA?.payload?.draft) {
-        return out(twimlText('I couldn’t find the pending expense. Please resend the receipt/expense.'), false);
-      }
-
-      await upsertPA({
-        ownerId,
-        userId: paKey,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA.payload || {}),
-          draft: {
-            ...(confirmPA.payload?.draft || {}),
-            jobName,
-            jobSource: 'created',
-            job_no: Number.isFinite(newJobNo) ? newJobNo : null,
-            job_id: newJobId
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-
-      try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
-      return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId: paKey, userProfile });
-    }
-  }
-
   // Prefer pick-state options if present (prevents stale/shifted list interpretation)
   const pickStateOptions = Array.isArray(pickPA?.payload?.jobOptions) ? pickPA.payload.jobOptions : [];
   const optionsForResolution = pickStateOptions.length ? pickStateOptions : jobOptions;
@@ -4961,7 +4816,6 @@ if (!skipPickHandling) {
       false
     );
   }
-
 
   // ----------------------------
   // Overhead selection
@@ -5558,202 +5412,168 @@ const gate = canEmployeeSelfLog(plan);
       }
     }
 
-   // ✅ Skip: keep current confirm draft pending, allow ONE new intake next.
-if (strictTok === 'skip') {
-  try {
-    await mergePendingTransactionState(paUserId, {
-      kind: 'expense',
-      allow_new_while_pending: true,
-      allow_new_set_at: Date.now()
-    });
-    console.info('[ALLOW_NEW_WHILE_PENDING_SET]', { paUserId });
-  } catch {}
-
-  return out(
-    twimlText(
-      [
-        'Okay — I’ll keep that expense pending.',
-        'Now send the *new* expense (or photo) you want to log.',
-        'Tip: reply “resume” anytime to bring back the pending one.'
-      ].join('\n')
-    ),
-    false
-  );
-}
-
-// ✅ If user is trying to log a new expense while confirm pending:
-if (!strictTok && looksLikeNewExpenseText(rawInboundText)) {
-  console.info('[CONFIRM_NAG_WOULD_FIRE]', {
-    paUserId,
-    awaiting_edit: !!confirmPA?.payload?.draft?.awaiting_edit,
-    head: String(rawInboundText || '').trim().slice(0, 80),
-    looksLikeNewExpense: true
-  });
-
-  let pendingNow = null;
-  try { pendingNow = await getPendingTransactionState(paUserId); } catch {}
-
-  const allowNew = !!pendingNow?.allow_new_while_pending;
-
-  if (!allowNew) {
-    return out(
-      twimlText(
-        [
-          'You’ve still got an expense waiting for confirmation.',
-          '',
-          'Reply:',
-          '• "yes" to submit it',
-          '• "edit" to change it',
-          '• "resume" to see it again',
-          '• "skip" to keep it pending and log a new one',
-          '• "cancel" to discard it'
-        ].join('\n')
-      ),
-      false
-    );
-  }
-
-  // ✅ consume allow-one flag (so it’s truly one-shot)
-  try {
-    await mergePendingTransactionState(paUserId, { allow_new_while_pending: false, allow_new_set_at: null });
-  } catch {}
-
-  // ✅ allow ONE new intake to proceed; keep confirmPA stored for resume
-  bypassConfirmToAllowNewIntake = true;
-}
-
-// If we decided to bypass to allow new intake, fall through.
-if (!bypassConfirmToAllowNewIntake) {
-  // Common safe flow id builder
-  const confirmFlowIdSafe =
-    String(confirmPA?.payload?.sourceMsgId || '').trim() ||
-    String(confirmPA?.payload?.draft?.txSourceMsgId || confirmPA?.payload?.draft?.sourceMsgId || '').trim() ||
-    String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
-    String(sourceMsgId || '').trim() ||
-    `${paUserId}:${Date.now()}`;
-
-  // 🔁 Change Job (keep confirm PA)
-  if (strictTok === 'change_job') {
-    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-
-    if (!jobs.length) {
-      // ✅ Create-first-job path (no one gets stuck)
-      await upsertPA({
-        ownerId,
-        userId: canonicalUserKey,
-        kind: PA_KIND_PICK_JOB,
-        payload: {
-          allowCreateJob: true,
-          flow: 'expense',
-          context: 'expense_jobpick_create_first',
-          confirmFlowId: confirmFlowIdSafe,
-          sentAt: Date.now(),
-          jobOptions: [],
-          confirmDraft: confirmPA?.payload?.draft || null
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
+    // ✅ Skip: keep current confirm draft pending, allow ONE new intake next.
+    if (strictTok === 'skip') {
+      try {
+        await mergePendingTransactionState(paUserId, {
+          kind: 'expense',
+          allow_new_while_pending: true,
+          allow_new_set_at: Date.now()
+        });
+        console.info('[ALLOW_NEW_WHILE_PENDING_SET]', { paUserId });
+      } catch {}
 
       return out(
         twimlText(
           [
-            'You don’t have any jobs yet.',
-            '',
-            'Reply with your first job name (just the name), or reply "Overhead".',
-            'Example: Oak Street Re-roof'
+            'Okay — I’ll keep that expense pending.',
+            'Now send the *new* expense (or photo) you want to log.',
+            'Tip: reply “resume” anytime to bring back the pending one.'
           ].join('\n')
         ),
         false
       );
     }
 
-    // ✅ Touch confirm PA but preserve needsReparse as-is
-    try {
-      await upsertPA({
-        ownerId,
-        userId: paKey,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA?.payload || {}),
-          draft: {
-            ...(confirmPA?.payload?.draft || {}),
-            needsReparse: !!confirmPA?.payload?.draft?.needsReparse
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
-      });
-    } catch (e) {
-      console.warn('[EXPENSE] change_job confirmPA touch failed (ignored):', e?.message);
+    // ✅ Never nag while awaiting_edit — re-prompt instead
+    if (confirmPA?.payload?.draft?.awaiting_edit) {
+      return out(
+        twimlText(
+          [
+            '✏️ I’m waiting for your edited expense details in ONE message.',
+            'Example:',
+            'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+            'Reply "cancel" to discard.'
+          ].join('\n')
+        ),
+        false
+      );
     }
 
-    await sendJobPickList({
-      fromPhone,
-      ownerId,
-      userProfile,
-      confirmFlowId: confirmFlowIdSafe,
-      jobOptions: jobs,
-      paUserId,
-      pickUserId: canonicalUserKey,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft: confirmPA?.payload?.draft || null
-    });
-
-    return out(twimlEmpty(), true);
-  }
-
-  // ✏️ Edit: mark confirm draft as awaiting edit
-  if (strictTok === 'edit') {
-    try {
-      await upsertPA({
-        ownerId,
-        userId: paKey,
-        kind: PA_KIND_CONFIRM,
-        payload: {
-          ...(confirmPA?.payload || {}),
-          draft: {
-            ...(confirmPA?.payload?.draft || {}),
-            awaiting_edit: true,
-            edit_started_at: Date.now(),
-            editStartedAt: Date.now(),
-            edit_flow_id: confirmFlowIdSafe
-          }
-        },
-        ttlSeconds: PA_TTL_SEC
+    // ✅ If user is trying to log a new expense while confirm pending:
+    if (looksLikeNewExpenseText(rawInboundText)) {
+      console.info('[CONFIRM_NAG_WOULD_FIRE]', {
+        paUserId,
+        awaiting_edit: !!confirmPA?.payload?.draft?.awaiting_edit,
+        head: String(rawInboundText || '').trim().slice(0, 80),
+        looksLikeNewExpense: true,
+        strictTok
       });
-    } catch (e) {
-      console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
+
+      const allowNew = !!pendingNow?.allow_new_while_pending;
+
+      if (!allowNew) {
+        return out(
+          twimlText(
+            [
+              'You’ve still got an expense waiting for confirmation.',
+              '',
+              'Reply:',
+              '• "yes" to submit it',
+              '• "edit" to change it',
+              '• "resume" to see it again',
+              '• "skip" to keep it pending and log a new one',
+              '• "cancel" to discard it'
+            ].join('\n')
+          ),
+          false
+        );
+      }
+
+      // ✅ allow ONE new intake to proceed; keep confirmPA stored for resume
+      bypassConfirmToAllowNewIntake = true;
     }
 
-    return out(
-      twimlText(
-        [
-          '✏️ Okay — send the corrected expense details in ONE message.',
-          'Example:',
-          'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
-          'Reply "cancel" to discard.'
-        ].join('\n')
-      ),
-      false
-    );
-  }
+    // If we decided to bypass to allow new intake, fall through.
+    if (!bypassConfirmToAllowNewIntake) {
+      // Common safe flow id builder (avoids stableMsgId scope surprises)
+      const confirmFlowIdSafe =
+        String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+        String(confirmPA?.payload?.draft?.txSourceMsgId || confirmPA?.payload?.draft?.sourceMsgId || '').trim() ||
+        String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+        String(sourceMsgId || '').trim() ||
+        `${paUserId}:${Date.now()}`;
 
-  // ✅ If still awaiting_edit and user pressed control token other than cancel, re-prompt (do NOT block cancel)
-  if (confirmPA?.payload?.draft?.awaiting_edit && strictTok && strictTok !== 'cancel') {
-    return out(
-      twimlText(
-        [
-          '✏️ I’m waiting for your edited expense details in ONE message.',
-          'Example:',
-          'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
-          'Reply "cancel" to discard.'
-        ].join('\n')
-      ),
-      false
-    );
-  }
+      // 🔁 Change Job (keep confirm PA)
+      if (strictTok === 'change_job') {
+        const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+        if (!jobs.length) {
+          return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+        }
 
+        // ✅ Touch confirm PA but preserve needsReparse as-is
+        try {
+          await upsertPA({
+            ownerId,
+            userId: paKey,
+            kind: PA_KIND_CONFIRM,
+            payload: {
+              ...(confirmPA.payload || {}),
+              draft: {
+                ...(confirmPA.payload?.draft || {}),
+                needsReparse: !!confirmPA?.payload?.draft?.needsReparse
+              }
+            },
+            ttlSeconds: PA_TTL_SEC
+          });
+        } catch (e) {
+          console.warn('[EXPENSE] change_job confirmPA touch failed (ignored):', e?.message);
+        }
+
+        await sendJobPickList({
+          fromPhone,
+          ownerId,
+          userProfile,
+          confirmFlowId: confirmFlowIdSafe,
+          jobOptions: jobs,
+          paUserId,
+          pickUserId: canonicalUserKey, // ✅ canonical key
+          page: 0,
+          pageSize: 8,
+          context: 'expense_jobpick',
+          confirmDraft: confirmPA?.payload?.draft || null
+        });
+
+        return out(twimlEmpty(), true);
+      }
+
+      // ✏️ Edit: mark confirm draft as awaiting edit
+      if (strictTok === 'edit') {
+        try {
+          await upsertPA({
+            ownerId,
+            userId: paKey,
+            kind: PA_KIND_CONFIRM,
+            payload: {
+              ...(confirmPA.payload || {}),
+              draft: {
+                ...(confirmPA.payload?.draft || {}),
+                awaiting_edit: true,
+                edit_started_at: Date.now(),
+                editStartedAt: Date.now(),
+                edit_flow_id: confirmFlowIdSafe
+              }
+            },
+            ttlSeconds: PA_TTL_SEC
+          });
+
+          console.info('[EXPENSE_EDIT_MODE_SET]', { paUserId });
+        } catch (e) {
+          console.warn('[EXPENSE] set awaiting_edit failed (ignored):', e?.message);
+        }
+
+        return out(
+          twimlText(
+            [
+              '✏️ Okay — send the corrected expense details in ONE message.',
+              'Example:',
+              'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+              'Reply "cancel" to discard.'
+            ].join('\n')
+          ),
+          false
+        );
+      }
 
       // ❌ Cancel (delete confirm + pick) + clear allow_new_while_pending + cancel CIL draft
       if (strictTok === 'cancel') {

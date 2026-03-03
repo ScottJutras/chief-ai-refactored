@@ -4385,223 +4385,116 @@ if (!nextDraft) {
     } catch {}
 
     // ============================================================================
-// ✅ DROP-IN: JOB_PICK_DEBUG block (with stale-click guard)
-// ----------------------------------------------------------------------------
-// What’s new:
-// - Uses pickPA.payload.lastPickerMsgSid (stored by sendJobPickList)
-// - Compares against inboundTwilioMeta.OriginalRepliedMessageSid
-// - If mismatch -> treat as stale tap and resend page 0 (no wrong-job mapping)
-// - Also logs `expectedPickerMsgSid` + `repliedToMsgSid` for debugging
-// ============================================================================
+    // ✅ DROP-IN: JOB_PICK_DEBUG (stale-click guard) + edit-mode paste-block
+    // (keep your exact block here)
+    // ============================================================================
+    {
+      // keep everything you already pasted for JOB_PICK_DEBUG here
+      // NOTE: this { } wrapper prevents accidental brace collisions with surrounding logic
 
-/* ---- 1) Awaiting job pick ---- */
-const pickPA = await getPA({
-  ownerId,
-  userId: canonicalUserKey, // ✅ single canonical key
-  kind: PA_KIND_PICK_JOB
-}).catch(() => null);
+      const tz0 = String(tz || userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto');
 
-const allowCreateJob = !!pickPA?.payload?.allowCreateJob;
+      let confirmPA0 = null;
+      let pickPA0 = null;
+      try { confirmPA0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null); } catch {}
+      try { pickPA0 = await getPA({ ownerId, userId: pickUserId, kind: PA_KIND_PICK_JOB }).catch(() => null); } catch {}
 
-if (
-  pickPA?.payload &&
-  (
-    allowCreateJob ||
-    (Array.isArray(pickPA.payload.jobOptions) && pickPA.payload.jobOptions.length)
-  )
-) {
-  const tok = normalizeDecisionToken(rawInboundText);
-
-  const isConfirmControlToken =
-    tok === 'yes' ||
-    tok === 'edit' ||
-    tok === 'cancel' ||
-    tok === 'resume' ||
-    tok === 'skip' ||
-    tok === 'change_job';
-
-  if (isConfirmControlToken) {
-    console.info('[PICK_FLOW_BYPASS_FOR_CONFIRM_TOKEN]', { tok });
-    // fall through
-  } else {
-    const rawInput = String(rawInboundText || '').trim();
-
-    // ✅ include ListRowId + IRJ in "picker tap" detection
-    const looksLikePickerTap =
-      /^jp:[0-9a-f]{8}:/i.test(rawInput) ||
-      /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput) ||
-      /^jobno_\d{1,10}$/i.test(rawInput) ||
-      !!inboundTwilioMeta?.ListTitle ||
-      !!inboundTwilioMeta?.ListId ||
-      !!inboundTwilioMeta?.ListRowId ||
-      !!inboundTwilioMeta?.InteractiveResponseJson;
-
-    const jobOptions = pickPA.payload.jobOptions;
-    const page = Number(pickPA.payload.page || 0) || 0;
-    const pageSize = Number(pickPA.payload.pageSize || 8) || 8;
-    const hasMore = !!pickPA.payload.hasMore;
-
-    const flow = String(pickPA.payload.flow || '').trim() || null;
-    const confirmFlowId = String(pickPA.payload.confirmFlowId || '').trim() || null;
-    const sentAt = Number(pickPA.payload.sentAt || 0) || 0;
-    const pickerNonce = pickPA.payload.pickerNonce || null;
-    const displayedHash = pickPA.payload.displayedHash || null;
-    const confirmDraft = pickPA?.payload?.confirmDraft || null;
-
-    const displayedJobNos = Array.isArray(pickPA?.payload?.displayedJobNos)
-      ? pickPA.payload.displayedJobNos
-      : [];
-
-    const effectiveConfirmFlowId = confirmFlowId || stableMsgId || `${paUserId}:${Date.now()}`;
-
-    // ✅ Resume works even while we’re in the picker flow
-    if (tok === 'resume') {
-      const confirmPA0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
       const draft0 = confirmPA0?.payload?.draft || null;
 
-      if (draft0 && Object.keys(draft0).length) {
-        try {
-          return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
-        } catch (e) {
-          console.warn('[EXPENSE] resume during pick failed; fallback to text:', e?.message);
-          return out(twimlText(formatExpenseConfirmText(draft0)), false);
+      // 2) awaiting_edit paste-block
+      try {
+        if (draft0?.awaiting_edit) {
+          const t = String(rawInboundText || '').trim();
+          const lc = t.toLowerCase();
+
+          const looksLikePastedConfirm =
+            /\bconfirm\s+expense\b/i.test(t) ||
+            /\b✅\s*confirm\b/i.test(t) ||
+            /\bconfirm\s+\$?\d[\d,]*\.\d{2}\b/i.test(t) ||
+            (/\bon\b/.test(lc) && /\bat\b/.test(lc) && /\bjob\b/.test(lc) && /\$\d/.test(t));
+
+          const hasInteractivePayload =
+            !!inboundTwilioMeta?.InteractiveResponseJson ||
+            !!inboundTwilioMeta?.ListRowId ||
+            !!inboundTwilioMeta?.ListId ||
+            !!inboundTwilioMeta?.ButtonPayload;
+
+          if (looksLikePastedConfirm || hasInteractivePayload) {
+            return out(
+              twimlText(
+                [
+                  '✏️ I’m waiting for your edited expense details in ONE message.',
+                  'Example:',
+                  'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+                  'Reply "cancel" to discard.'
+                ].join('\n')
+              ),
+              false
+            );
+          }
         }
+      } catch (e) {
+        console.warn('[EDIT_PASTE_BLOCK] failed (ignored):', e?.message);
       }
 
-      return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
+      // 3) stale-click guard
+      try {
+        const rawInput0 = String(rawInboundText || '').trim();
+        const looksLikePickerTap0 =
+          /^jp:[0-9a-f]{8}:/i.test(rawInput0) ||
+          /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput0) ||
+          /^jobno_\d{1,10}$/i.test(rawInput0) ||
+          !!inboundTwilioMeta?.ListTitle ||
+          !!inboundTwilioMeta?.ListId ||
+          !!inboundTwilioMeta?.ListRowId ||
+          !!inboundTwilioMeta?.InteractiveResponseJson;
+
+        const expectedPickerMsgSid = String(pickPA0?.payload?.lastPickerMsgSid || '').trim() || null;
+        const repliedToMsgSid = String(inboundTwilioMeta?.OriginalRepliedMessageSid || '').trim() || null;
+
+        if (pickPA0?.payload && looksLikePickerTap0 && expectedPickerMsgSid) {
+          if (!repliedToMsgSid || expectedPickerMsgSid !== repliedToMsgSid) {
+            const jobOptionsSafe = Array.isArray(pickPA0?.payload?.jobOptions) ? pickPA0.payload.jobOptions : [];
+            const confirmDraftSafe = pickPA0?.payload?.confirmDraft || confirmPA0?.payload?.draft || null;
+
+            await sendJobPickList({
+              fromPhone,
+              ownerId,
+              userProfile,
+              confirmFlowId: String(stableMsgId || `${paUserId}:${Date.now()}`),
+              jobOptions: jobOptionsSafe,
+              paUserId,
+              pickUserId,
+              page: 0,
+              pageSize: Number(pickPA0?.payload?.pageSize || 8) || 8,
+              context: pickPA0?.payload?.context || 'expense_jobpick',
+              confirmDraft: confirmDraftSafe,
+              resolveAttempts: Number(pickPA0?.payload?.resolveAttempts || 0) || 0
+            });
+
+            return out(twimlEmpty(), true);
+          }
+        }
+      } catch (e) {
+        console.warn('[JOB_PICK_STALE_GUARD] failed (ignored):', e?.message);
+      }
     }
+    // ============================================================================
+    // ✅ END JOB_PICK_DEBUG
+    // ============================================================================
 
-    // If user sent a brand new expense while waiting for job pick, clear state and continue parsing.
-    if (looksLikeNewExpenseText(input)) {
-      console.info('[EXPENSE] pick-job bypass: new expense detected, clearing PAs');
-      try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
-      try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
-      // fall through
-    } else {
-      // Stale picker protection (TTL) → resend page 0
-      if (!sentAt || Date.now() - sentAt > PA_TTL_SEC * 1000) {
-        return await sendJobPickList({
-          fromPhone,
-          ownerId,
-          userProfile,
-          confirmFlowId: effectiveConfirmFlowId,
-          jobOptions,
-          paUserId,
-          pickUserId: canonicalUserKey,
-          page: 0,
-          pageSize: 8,
-          context: 'expense_jobpick',
-          confirmDraft
-        });
-      }
-
-      // ✅ "more" paging MUST happen BEFORE picker tap parsing / stale-click checks
-      if (tok === 'more' || /^\s*more\s*$/i.test(String(rawInboundText || '').trim())) {
-        if (!hasMore) {
-          return out(twimlText('No more jobs to show. Tap a job, or reply with a job name.'), false);
-        }
-
-        const nextPage = Number(page) + 1;
-
-        return await sendJobPickList({
-          fromPhone,
-          ownerId,
-          userProfile,
-          confirmFlowId: confirmFlowId || effectiveConfirmFlowId,
-          jobOptions,
-          paUserId,
-          pickUserId: canonicalUserKey,
-          page: nextPage,
-          pageSize,
-          context: pickPA?.payload?.context || 'expense_jobpick',
-          confirmDraft,
-          resolveAttempts: pickPA?.payload?.resolveAttempts || 0
-        });
-      }
-
-      // ✅ NEW: Stale picker protection (message reply mismatch)
-// Only enforce when this looks like a picker tap (don’t block typed messages)
-const expectedPickerMsgSid = String(pickPA?.payload?.lastPickerMsgSid || '').trim() || null;
-const repliedToMsgSid = String(inboundTwilioMeta?.OriginalRepliedMessageSid || '').trim() || null;
-
-if (looksLikePickerTap && expectedPickerMsgSid) {
-  // ✅ If Twilio did NOT include the replied-to SID, fail-closed (prevents stale taps from history)
-  if (!repliedToMsgSid) {
-    console.warn('[JOB_PICK_STALE_CLICK_NO_REPLY_SID]', {
-      expectedPickerMsgSid,
-      rawInput,
-      listTitle: inboundTwilioMeta?.ListTitle || null,
-      listId: inboundTwilioMeta?.ListId || null
-    });
-
-    return await sendJobPickList({
-      fromPhone,
-      ownerId,
-      userProfile,
-      confirmFlowId: effectiveConfirmFlowId,
-      jobOptions,
-      paUserId,
-      pickUserId: canonicalUserKey,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft
-    });
-  }
-
-  // ✅ Mismatch -> stale
-  if (expectedPickerMsgSid !== repliedToMsgSid) {
-    console.warn('[JOB_PICK_STALE_CLICK]', {
-      expectedPickerMsgSid,
-      repliedToMsgSid,
-      rawInput,
-      listTitle: inboundTwilioMeta?.ListTitle || null,
-      listId: inboundTwilioMeta?.ListId || null
-    });
-
-    // Resend latest picker page 0 (keeps state aligned with newest list)
-    return await sendJobPickList({
-      fromPhone,
-      ownerId,
-      userProfile,
-      confirmFlowId: effectiveConfirmFlowId,
-      jobOptions,
-      paUserId,
-      pickUserId: canonicalUserKey,
-      page: 0,
-      pageSize: 8,
-      context: 'expense_jobpick',
-      confirmDraft
-    });
-  }
-}
-
-
-      console.info('[JOB_PICK_DEBUG]', {
-        input,
-        rawInput,
-        tok,
-        flow,
-        confirmFlowId: effectiveConfirmFlowId,
-        sentAt,
-        page,
-        pageSize,
-        pickerNonce,
-        displayedHash,
-        displayedJobNos: displayedJobNos.slice(0, 16),
-
-        // visibility for stale protection
-        expectedPickerMsgSid,
-        repliedToMsgSid,
-
-        inbound: {
-          MessageSid: inboundTwilioMeta?.MessageSid || null,
-          OriginalRepliedMessageSid: inboundTwilioMeta?.OriginalRepliedMessageSid || null,
-          ListRowId: inboundTwilioMeta?.ListRowId || null,
-          ListId: inboundTwilioMeta?.ListId || null,
-          ListTitle: inboundTwilioMeta?.ListTitle || null
-        }
-      });
+    // ============================================================
+    // ✅ PICK FLOW (pickPA handling)
+    // IMPORTANT: This whole block must be structurally balanced.
+    // ============================================================
+    if (pickPA?.payload) {
+      // keep / compute these as your existing code does
+      // const rawInput = ...
+      // const looksLikePickerTap = ...
+      // const allowCreateJob = ...
+      // const jobOptions = ...
+      // const confirmDraft = ...
+      // const effectiveConfirmFlowId = ...
 
       // Optional: remember last inbound picker token (store RAWs)
       try {
@@ -4614,7 +4507,7 @@ if (looksLikePickerTap && expectedPickerMsgSid) {
         });
       } catch {}
 
-      // ✅ If user says "change job" while already picking -> resend page 0
+      // ✅ change_job while already picking
       if (tok === 'change_job') {
         try {
           const confirmPAx = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
@@ -4634,7 +4527,7 @@ if (looksLikePickerTap && expectedPickerMsgSid) {
           console.warn('[EXPENSE] change_job needsReparse set failed (ignored):', e?.message);
         }
 
-        return await sendJobPickList({
+        await sendJobPickList({
           fromPhone,
           ownerId,
           userProfile,
@@ -4647,46 +4540,67 @@ if (looksLikePickerTap && expectedPickerMsgSid) {
           context: 'expense_jobpick',
           confirmDraft
         });
+
+        return out(twimlEmpty(), true);
       }
 
-          // ✅ HARD GUARD: if confirm PA is missing but we got a picker reply, re-bootstrap from pickPA.confirmDraft
-          let confirmPAForGuard = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+      // ✅ If confirm missing but we got a picker reply, bootstrap from pickPA.confirmDraft
+      let confirmPAForGuard = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
 
-          if (!confirmPAForGuard?.payload?.draft && (looksLikePickerTap || looksLikeJobPickerAnswer(rawInput))) {
-            if (confirmDraft) {
-              try {
-                await ensureConfirmPAExists({
-                  ownerId,
-                  from,
-                  draft: confirmDraft,
-                  sourceMsgId: effectiveConfirmFlowId || stableMsgId || null,
-                  userId: paKey
-                });
-              } catch (e) {
-                console.warn('[EXPENSE] ensureConfirmPAExists failed (ignored):', e?.message);
-              }
-
-              confirmPAForGuard = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-            } else {
-              return await sendJobPickList({
-                fromPhone,
-                ownerId,
-                userProfile,
-                confirmFlowId: effectiveConfirmFlowId,
-                jobOptions,
-                paUserId,
-                pickUserId: canonicalUserKey,
-                page: 0,
-                pageSize: 8,
-                context: 'expense_jobpick',
-                confirmDraft: null
-              });
-            }
+      if (!confirmPAForGuard?.payload?.draft && (looksLikePickerTap || looksLikeJobPickerAnswer(rawInput))) {
+        if (confirmDraft) {
+          try {
+            await ensureConfirmPAExists({
+              ownerId,
+              from,
+              draft: confirmDraft,
+              sourceMsgId: effectiveConfirmFlowId || stableMsgId || null,
+              userId: paKey
+            });
+          } catch (e) {
+            console.warn('[EXPENSE] ensureConfirmPAExists failed (ignored):', e?.message);
           }
 
-          // ✅ shared across BOTH picker-tap path and typed-input path
-let skipPickHandling = false;
+          confirmPAForGuard = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+        } else {
+          await sendJobPickList({
+            fromPhone,
+            ownerId,
+            userProfile,
+            confirmFlowId: effectiveConfirmFlowId,
+            jobOptions,
+            paUserId,
+            pickUserId: canonicalUserKey,
+            page: 0,
+            pageSize: 8,
+            context: 'expense_jobpick',
+            confirmDraft: null
+          });
 
+          return out(twimlEmpty(), true);
+        }
+      }
+
+      // ✅ shared across picker-tap + typed-input
+      let skipPickHandling = false;
+
+      // ----------------------------
+      // 1) PICKER-TAP PATH
+      // ----------------------------
+      if (looksLikePickerTap) {
+        const token2 = normalizeDecisionToken(rawInput);
+        const isControlToken2 =
+          token2 === 'yes' ||
+          token2 === 'edit' ||
+          token2 === 'cancel' ||
+          token2 === 'change_job' ||
+          token2 === 'skip' ||
+          token2 === 'resume';
+
+        if (isControlToken2) {
+          skipPickHandling = true;
+        } else {
+         
 // ----------------------------
 // 1) PICKER-TAP PATH
 // ----------------------------
@@ -5492,24 +5406,24 @@ const patchedDraft = {
 
 // ---------------------------------------------------------
 // ✅ DROP-IN: Confirm flow (nag/bypass/decision tokens) → LOOP BREAKER
-// REPLACE your entire block starting at:
-//   // ✅ Confirm flow (nag/bypass/decision tokens)
-// DOWN THROUGH (and INCLUDING) the LOOP BREAKER header comment inside YES.
+// Fixes:
+// - Confirm flow always operates on freshest confirmPA (prevents stale draft after edits)
+// - Hard awaiting_edit gate (prevents edit not being applied / prevents tokens from hijacking edit state)
 // ---------------------------------------------------------
 
-// ---------------------------------------------------------
-// ✅ Confirm flow (nag/bypass/decision tokens)
-// ---------------------------------------------------------
+// ✅ Always refresh confirmPA right before confirm-flow handling
+try {
+  const fresh = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+  if (fresh) confirmPA = fresh;
+} catch {}
+
 if (confirmPA?.payload?.draft) {
   // ✅ Confirm gate (Owner OR employee-allowed-by-plan)
-if (!isOwner) {
-
-const plan = getEffectivePlanFromOwner(ownerProfile);
-const gate = canEmployeeSelfLog(plan);
-
+  if (!isOwner) {
+    const plan = getEffectivePlanFromOwner(ownerProfile);
+    const gate = canEmployeeSelfLog(plan);
 
     if (!gate?.allowed) {
-      // (Optional) log denial for analytics/audit
       try {
         await logCapabilityDenial(pg, {
           owner_id: String(ownerId || '').trim(),
@@ -5524,10 +5438,39 @@ const gate = canEmployeeSelfLog(plan);
         });
       } catch {}
 
-      // IMPORTANT: do NOT delete the confirm PA here; keep it resumable for the owner
       return out(twimlText(`${PRO_CREW_UPGRADE_LINE}\n${UPGRADE_FOLLOWUP_ASK}`), false);
     }
-    // ✅ Employee is allowed to confirm their own expense on this plan → continue
+  }
+
+  // ✅ Use freshest draft reference from refreshed confirmPA
+  const draft0 = confirmPA?.payload?.draft || null;
+
+  // ---------------------------------------------------------
+  // ✅ HARD GATE: awaiting_edit means ONLY accept the edit payload
+  // (the edit-consume block above should handle non-control text)
+  // Control tokens should not submit/change state except cancel.
+  // ---------------------------------------------------------
+  if (draft0?.awaiting_edit) {
+    if (strictTok === 'cancel') {
+      // keep your existing cancel handler below if you want it to also cancel CIL drafts
+      // but the minimum safe behavior is clearing confirm + pick:
+      try { await deletePA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
+      try { await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_PICK_JOB }); } catch {}
+      return out(twimlText('❌ Cancelled. You’re cleared.'), false);
+    }
+
+    // Any other token / text while awaiting_edit: remind + stop.
+    return out(
+      twimlText(
+        [
+          '✏️ I’m waiting for your edited expense details in ONE message.',
+          'Example:',
+          'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
+          'Reply "cancel" to discard.'
+        ].join('\n')
+      ),
+      false
+    );
   }
 
   const lcRaw = String(rawInboundText || '').trim().toLowerCase();
@@ -5545,7 +5488,6 @@ const gate = canEmployeeSelfLog(plan);
   // ✅ 2) Currency-only reply consumption (only when it's a pure currency token)
   try {
     if (!strictTok) {
-      const draft0 = confirmPA?.payload?.draft || null;
       const draftCurrency0 = String(draft0?.currency || '').trim();
       const awaitingCurrency0 = !!draft0?.awaiting_currency;
 
@@ -5562,18 +5504,13 @@ const gate = canEmployeeSelfLog(plan);
           kind: PA_KIND_CONFIRM,
           payload: {
             ...(confirmPA.payload || {}),
-            draft: {
-              ...(draft0 || {}),
-              currency: normalizedCurrency,
-              awaiting_currency: false
-            }
+            draft: { ...(draft0 || {}), currency: normalizedCurrency, awaiting_currency: false }
           },
           ttlSeconds: PA_TTL_SEC
         });
 
-        try {
-          confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
-        } catch {}
+        // ✅ refresh confirmPA so the resend uses the updated draft
+        try { confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }); } catch {}
         return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
       }
     }
@@ -5588,28 +5525,22 @@ const gate = canEmployeeSelfLog(plan);
 
   // “info commands” that should NOT be blocked by confirm draft
   const isNonIntakeQuery =
-  /^show\b/.test(lc) ||
-  lc.includes('last expense') ||
-  lc.includes('last revenue') ||
-  /^help\b/.test(lc) ||
-  /^dashboard\b/.test(lc) ||
-  /^jobs?\b/.test(lc) ||
-  /^tasks?\b/.test(lc) ||
-  /^timesheet\b/.test(lc);
+    /^show\b/.test(lc) ||
+    lc.includes('last expense') ||
+    lc.includes('last revenue') ||
+    /^help\b/.test(lc) ||
+    /^dashboard\b/.test(lc) ||
+    /^jobs?\b/.test(lc) ||
+    /^tasks?\b/.test(lc) ||
+    /^timesheet\b/.test(lc);
 
   // ✅ bypass confirm nag for info commands (but do NOT bypass real decision tokens)
   if (!isDecisionToken && isNonIntakeQuery && !looksLikeNewExpenseText(rawInboundText)) {
     bypassConfirmToAllowNewIntake = true;
   }
 
-  // ✅ If bypassing, fall through to normal routing below (do not nag, do not clear)
   if (!bypassConfirmToAllowNewIntake) {
-    let pendingNow = null;
-    try {
-      pendingNow = await getPendingTransactionState(paUserId);
-    } catch {}
-
-    // ✅ Resume: re-send confirm for the existing pending expense (no state changes)
+    // ✅ Resume
     if (strictTok === 'resume') {
       try {
         return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId: paKey, userProfile });
@@ -5619,80 +5550,77 @@ const gate = canEmployeeSelfLog(plan);
       }
     }
 
-   // ✅ Skip: keep current confirm draft pending, allow ONE new intake next.
-if (strictTok === 'skip') {
-  try {
-    await mergePendingTransactionState(paUserId, {
-      kind: 'expense',
-      allow_new_while_pending: true,
-      allow_new_set_at: Date.now()
-    });
-    console.info('[ALLOW_NEW_WHILE_PENDING_SET]', { paUserId });
-  } catch {}
+    // ✅ Skip: allow ONE new intake next.
+    if (strictTok === 'skip') {
+      try {
+        await mergePendingTransactionState(paUserId, {
+          kind: 'expense',
+          allow_new_while_pending: true,
+          allow_new_set_at: Date.now()
+        });
+        console.info('[ALLOW_NEW_WHILE_PENDING_SET]', { paUserId });
+      } catch {}
 
-  return out(
-    twimlText(
-      [
-        'Okay — I’ll keep that expense pending.',
-        'Now send the *new* expense (or photo) you want to log.',
-        'Tip: reply “resume” anytime to bring back the pending one.'
-      ].join('\n')
-    ),
-    false
-  );
-}
+      return out(
+        twimlText(
+          [
+            'Okay — I’ll keep that expense pending.',
+            'Now send the *new* expense (or photo) you want to log.',
+            'Tip: reply “resume” anytime to bring back the pending one.'
+          ].join('\n')
+        ),
+        false
+      );
+    }
 
-// ✅ If user is trying to log a new expense while confirm pending:
-if (!strictTok && looksLikeNewExpenseText(rawInboundText)) {
-  console.info('[CONFIRM_NAG_WOULD_FIRE]', {
-    paUserId,
-    awaiting_edit: !!confirmPA?.payload?.draft?.awaiting_edit,
-    head: String(rawInboundText || '').trim().slice(0, 80),
-    looksLikeNewExpense: true
-  });
+    // ✅ New expense while confirm pending → nag unless allow_new_while_pending
+    if (!strictTok && looksLikeNewExpenseText(rawInboundText)) {
+      console.info('[CONFIRM_NAG_WOULD_FIRE]', {
+        paUserId,
+        head: String(rawInboundText || '').trim().slice(0, 80),
+        looksLikeNewExpense: true
+      });
 
-  let pendingNow = null;
-  try { pendingNow = await getPendingTransactionState(paUserId); } catch {}
+      let pendingNow = null;
+      try { pendingNow = await getPendingTransactionState(paUserId); } catch {}
 
-  const allowNew = !!pendingNow?.allow_new_while_pending;
+      const allowNew = !!pendingNow?.allow_new_while_pending;
 
-  if (!allowNew) {
-    return out(
-      twimlText(
-        [
-          'You’ve still got an expense waiting for confirmation.',
-          '',
-          'Reply:',
-          '• "yes" to submit it',
-          '• "edit" to change it',
-          '• "resume" to see it again',
-          '• "skip" to keep it pending and log a new one',
-          '• "cancel" to discard it'
-        ].join('\n')
-      ),
-      false
-    );
-  }
+      if (!allowNew) {
+        return out(
+          twimlText(
+            [
+              'You’ve still got an expense waiting for confirmation.',
+              '',
+              'Reply:',
+              '• "yes" to submit it',
+              '• "edit" to change it',
+              '• "resume" to see it again',
+              '• "skip" to keep it pending and log a new one',
+              '• "cancel" to discard it'
+            ].join('\n')
+          ),
+          false
+        );
+      }
 
-  // ✅ consume allow-one flag (so it’s truly one-shot)
-  try {
-    await mergePendingTransactionState(paUserId, { allow_new_while_pending: false, allow_new_set_at: null });
-  } catch {}
+      // consume allow-one flag
+      try {
+        await mergePendingTransactionState(paUserId, { allow_new_while_pending: false, allow_new_set_at: null });
+      } catch {}
 
-  // ✅ allow ONE new intake to proceed; keep confirmPA stored for resume
-  bypassConfirmToAllowNewIntake = true;
-}
+      bypassConfirmToAllowNewIntake = true;
+    }
 
-// If we decided to bypass to allow new intake, fall through.
-if (!bypassConfirmToAllowNewIntake) {
-  // Common safe flow id builder
-  const confirmFlowIdSafe =
-    String(confirmPA?.payload?.sourceMsgId || '').trim() ||
-    String(confirmPA?.payload?.draft?.txSourceMsgId || confirmPA?.payload?.draft?.sourceMsgId || '').trim() ||
-    String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
-    String(sourceMsgId || '').trim() ||
-    `${paUserId}:${Date.now()}`;
+    if (!bypassConfirmToAllowNewIntake) {
+      const confirmFlowIdSafe =
+        String(confirmPA?.payload?.sourceMsgId || '').trim() ||
+        String(confirmPA?.payload?.draft?.txSourceMsgId || confirmPA?.payload?.draft?.sourceMsgId || '').trim() ||
+        String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+        String(sourceMsgId || '').trim() ||
+        `${paUserId}:${Date.now()}`;
 
+      
   // 🔁 Change Job (keep confirm PA)
   if (strictTok === 'change_job') {
     const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));

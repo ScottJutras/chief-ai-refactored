@@ -949,7 +949,7 @@ async function bestEffortResolveJobFromText(ownerId, text) {
   let bestPrefixMatch = false;
 
   for (const j of jobs) {
-    const name = String(getJobDisplayName(j) || j?.name || '').trim();
+    const name = String(getJobDisplayNameNoCode(j) || '').trim();
     if (!name) continue;
 
     const jNorm = normalizeNeedle(name);
@@ -2378,7 +2378,8 @@ function normalizeJobOptions(jobRows) {
   const seen = new Set();
 
   for (const j of jobRows || []) {
-    const name = sanitizeJobLabel(j?.name || j?.job_name || j?.jobName);
+    const rawName = j?.name || j?.job_name || j?.jobName;
+    const name = sanitizeJobLabel(stripLeadingJobCode(rawName));
     if (!name) continue;
     if (isGarbageJobName(name)) continue;
 
@@ -2551,7 +2552,8 @@ function buildTextJobPrompt(jobOptions, page, pageSize) {
   const slice = (jobOptions || []).slice(start, start + ps);
 
   const lines = slice.map((j, i) => {
-    const name = sanitizeJobLabel(String(j?.name || 'Untitled Job').trim());
+    const rawName = j?.name || j?.job_name || j?.jobName;
+    const name = sanitizeJobLabel(stripLeadingJobCode(rawName));
     const jobNo = j?.job_no != null ? Number(j.job_no) : null;
 
     // ✅ Make the number semantics unambiguous:
@@ -2608,6 +2610,22 @@ function getJobDisplayNameNoCode(job) {
 function getJobDisplayName(job) {
   const nm = String(job?.name || job?.job_name || job?.jobName || job?.job_name_display || '').trim();
   return nm || null;
+}
+
+function stripLeadingJobCode(s) {
+  const t = String(s || '').trim();
+  if (!t) return '';
+
+  // "J1 1556 Medway Park Dr" -> "1556 Medway Park Dr"
+  // "J12 - Oak St" -> "Oak St"
+  // "J12: Oak St" -> "Oak St"
+  return t.replace(/^\s*J\d+\s*[-:–—]?\s*/i, '').trim();
+}
+
+function getJobDisplayNameClean(job) {
+  const nm = String(job?.name || job?.job_name || job?.jobName || job?.job_name_display || '').trim();
+  const cleaned = stripLeadingJobCode(nm);
+  return cleaned || null;
 }
 
 // tiny nonce for “this picker instance”
@@ -4830,7 +4848,7 @@ await upsertPA({
     ...(confirmPA.payload || {}),
     draft: {
       ...(confirmPA.payload?.draft || {}),
-      jobName: getJobDisplayName(chosen),
+      jobName: getJobDisplayNameClean(chosen),
       jobSource: 'picked',
       job_no: Number.isFinite(Number(chosen?.job_no ?? chosen?.jobNo))
         ? Number(chosen?.job_no ?? chosen?.jobNo)
@@ -5061,7 +5079,7 @@ if (!skipPickHandling) {
         ...(confirmPA.payload || {}),
         draft: {
           ...(confirmPA.payload?.draft || {}),
-          jobName: getJobDisplayName(chosen),
+          jobName: getJobDisplayNameClean(chosen),
           jobSource: 'picked',
           job_no: Number.isFinite(Number(chosen?.job_no ?? chosen?.jobNo))
           ? Number(chosen?.job_no ?? chosen?.jobNo)

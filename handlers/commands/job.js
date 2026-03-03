@@ -580,7 +580,8 @@ function normalizeJobOptions(jobRows) {
   const seen = new Set();
 
   for (const r of jobRows || []) {
-    const name = sanitizeJobLabel(r?.name || r?.job_name || r || '');
+    const rawName = j?.name || j?.job_name || j?.jobName;
+    const name = sanitizeJobLabel(stripLeadingJobCode(rawName));
     if (!name || isGarbageJobName(name)) continue;
 
     const job_no = r?.job_no != null && Number.isFinite(Number(r.job_no)) ? Number(r.job_no) : null;
@@ -728,7 +729,7 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptio
       const full = sanitizeJobLabel(j.name);
       return {
         id: `jobno_${jobNo}`,
-        title: `J${jobNo} ${full}`.slice(0, 24),
+        title: `${full}`.slice(0, 24),
         description: full.slice(0, 72)
       };
     });
@@ -761,7 +762,7 @@ async function sendActiveJobPickerOrFallback({ res, fromPhone, ownerId, jobOptio
     const jobNo = Number(slice[i].job_no);
     const full = slice[i].name;
     items.push({
-      item: `J${jobNo} ${String(full).slice(0, 18)}`.slice(0, 24),
+      item: `${String(full).slice(0, 24)}`,
       id: `jobno_${jobNo}`, // ✅ stable, aligned to revenue/expense
       description: String(full).slice(0, 72)
     });

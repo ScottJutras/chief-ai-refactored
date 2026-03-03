@@ -3894,10 +3894,7 @@ async function handleExpense(
     NumMedia: getTwilio('NumMedia') ?? getTwilio('numMedia') ?? null,
     WaId: getTwilio('WaId') || getTwilio('WaID') || getTwilio('waid')
   };
-  const tz0 =
-  (typeof tz !== 'undefined' && tz ? tz : null) ||
-  String(userProfile?.tz || userProfile?.timezone || '').trim() ||
-  'America/Toronto';
+  
 
   // ✅ Preserve raw sender for replies + logs (router may pass +E164 now)
   const fromPhone = String(from || '').trim();
@@ -3920,7 +3917,10 @@ async function handleExpense(
 
   // ✅ tz needed throughout handler (single definition)
   const tz = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
-
+  const tz0 =
+  (typeof tz !== 'undefined' && tz ? tz : null) ||
+  String(userProfile?.tz || userProfile?.timezone || '').trim() ||
+  'America/Toronto';
   // ✅ IMPORTANT: capture raw inbound text BEFORE modifying input.
   // NOTE: getInboundTextExpense MUST exist at FILE SCOPE (do NOT define it inside handleExpense)
   const rawInboundText = getInboundTextExpense(input, inboundTwilioMeta);

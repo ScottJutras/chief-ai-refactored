@@ -3375,64 +3375,37 @@ try {
       return null;
     };
 
-   if (isExpensePA && !isHardTimeCommand) {
-  try {
-    const expenseMod = require('../handlers/commands/expense');
-    const expenseHandler =
-      expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
+    if (isExpensePA && !isHardTimeCommand) {
+      try {
+        const expenseMod = require('../handlers/commands/expense');
+        const expenseHandler =
+          expenseMod && typeof expenseMod.handleExpense === 'function' ? expenseMod.handleExpense : null;
 
-    if (!expenseHandler) throw new Error('expense handler export missing (handleExpense)');
+        if (!expenseHandler) throw new Error('expense handler export missing (handleExpense)');
 
-    const handlerArgs = [
-      req.from,
-      text2,
-      req.userProfile,
-      req.ownerId,
-      req.ownerProfile,
-      req.isOwner,
-      messageSid,
-      req.body
-    ];
+        const handlerArgs = [
+          req.from,
+          text2,
+          req.userProfile,
+          req.ownerId,
+          req.ownerProfile,
+          req.isOwner,
+          messageSid,
+          req.body
+        ];
 
-    // Always run the handler first (it owns state transitions)
-    const first = await expenseHandler(...handlerArgs);
+        // Always run the handler first (it owns state transitions)
+        const first = await expenseHandler(...handlerArgs);
 
-    const strictTok = strictControlTokenForPA(text2);
+        const strictTok = strictControlTokenForPA(text2);
 
-    console.info('[AUTO_YES_CHECK]', {
-      from: req.from,
-      kind: 'expense',
-      messageSid,
-      strictTok: strictTok || null,
-      head: String(text2 || '').slice(0, 20)
-    });
-
-    // -------------------------------------------------------------
-    // ✅ CRITICAL: If handler returned TwiML, respond with it and STOP.
-    // This prevents "Done." or any other fallback bubble.
-    // -------------------------------------------------------------
-    if (!res.headersSent) {
-      const twiml =
-        typeof first === 'string'
-          ? first
-          : (first && typeof first.twiml === 'string' ? first.twiml : null);
-
-      // If we got TwiML (including empty TwiML), return it immediately.
-      // IMPORTANT: twimlEmpty() should still be sent as TwiML to avoid a bubble.
-      if (twiml != null) {
-        return sendTwiml(res, twiml);
-      }
-    }
-
-    // -------------------------------------------------------------
-    // ✅ Fallback: handler returned a plain answer object (no TwiML).
-    // -------------------------------------------------------------
-    if (!res.headersSent) {
-      if (first && typeof first.answer === 'string' && first.answer.trim()) {
-        return ok(res, first.answer);
-      }
-      return ok(res, null); // empty TwiML
-    }
+        console.info('[AUTO_YES_CHECK]', {
+          from: req.from,
+          kind: 'expense',
+          messageSid,
+          strictTok: strictTok || null,
+          head: String(text2 || '').slice(0, 20)
+        });
 
         // ✅ Never auto-yes on strict control tokens
         if (strictTok) {

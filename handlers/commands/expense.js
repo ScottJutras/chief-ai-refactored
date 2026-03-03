@@ -7003,8 +7003,10 @@ console.info('[EXPENSE_DEBUG_AFTER_PARSE]', {
 });
 
 if (data?.item && typeof data.item === 'string') {
-  const cleaned = data.item.replace(/^\s*on\s+/i, '').trim();
-  data.item = cleaned || null;
+  data.item = data.item
+    .replace(/^\s*(on|for)\s+/i, '')   // strip "on lumber", "for lumber"
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 // === DATE HELPERS (MVP) ===================================================
 

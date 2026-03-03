@@ -18,6 +18,8 @@ const { handleQuoteCommand } = require("../handlers/commands/quote");
 const { handleClock } = require("../handlers/commands/timeclock");
 const { answerInsightV0 } = require("./insights_v0");
 
+
+
 function lc(s) {
   return String(s || "").toLowerCase();
 }
@@ -108,6 +110,8 @@ function normalizeHandlerOutput(out, fallback = "Done.") {
 async function answerInsight({ ownerId, actorKey, text, tz, context }) {
   return await answerInsightV0({ ownerId, actorKey, text, tz, context });
 }
+
+
 
 /**
  * orchestrateChief returns a DECISION object.
@@ -205,15 +209,63 @@ async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, age
     };
   }
 
-  // 01) Job picker token safety net
-  if (/^jp:/i.test(rawText)) {
-    return {
-      ok: true,
-      route: "clarify",
-      answer: "✅ Job selected. Now tell me what you want to do (expense / revenue / time / task).",
-      evidence: { sql: [], facts_used: 0 },
-    };
-  }
+ // 01) Job picker token safety net (ONLY if no active flow needs it)
+// IMPORTANT: expense/revenue handlers must receive jp: tokens to resolve job picks.
+if (/^jp:/i.test(rawText)) {
+  return {
+    ok: true,
+    route: "action",
+    action: "job_pick_token",
+    run: async () => {
+      const from = context?.from || null;
+      const messageSid = context?.messageSid || null;
+      const reqBody = context?.reqBody || null;
+
+      // If you have any signal of “we’re in an expense flow”, let expense consume it.
+      // Your logs show mostRecentPAKind exists in ctx; use it if present.
+      const paKind =
+        String(context?.mostRecentPAKind || context?.actorMemory?.mostRecentPAKind || context?.actorMemory?.most_recent_pa_kind || "").trim();
+
+      if (/expense/i.test(paKind)) {
+        const out = await handleExpense(
+          from,
+          rawText,
+          context?.userProfile || null,
+          ownerId,
+          context?.ownerProfile || null,
+          !!context?.isOwner,
+          messageSid,
+          reqBody
+        );
+        const msg = normalizeHandlerOutput(out, "✅ Job selected.");
+        return { ok: true, route: "action", answer: msg, evidence: { sql: [], facts_used: 0 } };
+      }
+
+      if (/revenue/i.test(paKind)) {
+        const out = await handleRevenue(
+          from,
+          rawText,
+          context?.userProfile || null,
+          ownerId,
+          context?.ownerProfile || null,
+          !!context?.isOwner,
+          messageSid,
+          reqBody
+        );
+        const msg = normalizeHandlerOutput(out, "✅ Job selected.");
+        return { ok: true, route: "action", answer: msg, evidence: { sql: [], facts_used: 0 } };
+      }
+
+      // Unknown flow: keep the “safety net” behavior
+      return {
+        ok: true,
+        route: "clarify",
+        answer: "✅ Job selected. Now tell me what you want to do (expense / revenue / time / task).",
+        evidence: { sql: [], facts_used: 0 },
+      };
+    },
+  };
+}
 
   // 1) Deterministic writes (action)
   if (looksLikeTimeclock(rawText)) {
@@ -391,39 +443,67 @@ async function orchestrateChief({ ownerId, actorKey, text, tz, channel, req, age
     };
   }
 
-  function looksLikeMoneyOnlyIntake(text) {
-  const raw = String(text || "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+ function looksLikeMoneyOnlyIntake(text) {
+  const raw = String(text || "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
   const s = raw.toLowerCase();
 
-  // Starts with "$52" / "52.00" / "52$" etc
+  // starts with $52 / 52.00 / 52$ etc
   const hasMoney =
     /^\$?\s*\d{1,6}(\.\d{2})?\b/.test(raw) ||
     /\b\d{1,6}(\.\d{2})?\s*\$\b/.test(s) ||
     /\b(cad|usd)\b/.test(s);
 
-  // Common intake words (optional but strengthens)
+  // “merchant-ish”: prepositions OR known vendors
   const hasMerchantish =
-    /\b(at|from|on)\b/.test(s) || /\b(home\s*depot|lowe'?s|rona|costco|walmart)\b/.test(s);
+    /\b(at|from|on)\b/.test(s) ||
+    /\b(home\s*depot|lowe'?s|rona|costco|walmart)\b/.test(s);
+
+  // “date-ish” (allow common typos for today)
+  const hasDateish =
+    /\b(today|todai|tody|tofay|tomm?orrow|yesterday)\b/.test(s);
 
   // If they are explicitly asking an insight, don't intercept
   const hasInsightWords =
     /\b(spend|spent|revenue|sales|profit|margin|net|top expenses|biggest)\b/.test(s);
 
-  return hasMoney && !hasInsightWords && hasMerchantish;
+  // extra “intake shape”: more than just the amount
+  const afterMoney = raw.replace(/^\$?\s*\d{1,6}(\.\d{2})?\s*\$?\s*/i, "").trim();
+  const hasPayload = afterMoney.split(/\s+/).filter(Boolean).length >= 2;
+
+  return hasMoney && !hasInsightWords && (hasMerchantish || hasDateish || hasPayload);
 }
 
 // ✅ Prefer intake over insight for "money-only" messages
 if (looksLikeMoneyOnlyIntake(rawText)) {
-  // Route to expense intake the same way your normal "expense ..." messages do.
-  // If you already have a function for that route, call it here.
   return {
     ok: true,
-    route: "reasoning",
-    kind: "expense",
-    run: async () => handleExpenseFlow({ ownerId, actorKey, text: rawText, tz, context }),
+    route: "action",
+    action: "expense_money_only",
+    run: async () => {
+      const from = context?.from || null;
+      const messageSid = context?.messageSid || null;
+      const reqBody = context?.reqBody || null;
+
+      const out = await handleExpense(
+        from,
+        rawText,
+        context?.userProfile || null,
+        ownerId,
+        context?.ownerProfile || null,
+        !!context?.isOwner,
+        messageSid,
+        reqBody
+      );
+
+      const msg = normalizeHandlerOutput(out, "Expense logged.");
+      return { ok: true, route: "action", answer: msg, evidence: { sql: [], facts_used: 0 } };
+    },
   };
 }
-
 if (looksLikeInsightQuestion(rawText)) {
   return {
     ok: true,

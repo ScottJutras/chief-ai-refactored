@@ -1249,7 +1249,32 @@ function normalizeDecisionToken(input) {
   // Not a control token
   return null;
 }
+function normalizeEditedExpense(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return s;
 
+  // Try to parse the emoji summary format:
+  // 💸 $52.00 — Nails 🏪 Home Depot 📅 Mar 3, 2026 🧰 1556 Medway Park Dr
+  const amount = (s.match(/💸\s*\$?\s*(\d+(?:\.\d{1,2})?)/)?.[1] || '').trim();
+  const item = (s.match(/—\s*([^🏪📅🧰\n\r]+)/)?.[1] || '').trim();
+  const store = (s.match(/🏪\s*([^📅🧰\n\r]+)/)?.[1] || '').trim();
+  const date = (s.match(/📅\s*([^🧰\n\r]+)/)?.[1] || '').trim();
+  const job = (s.match(/🧰\s*([^\n\r]+)/)?.[1] || '').trim();
+
+  // If it doesn't look like the emoji format, return original
+  const looksEmoji = s.includes('💸') || s.includes('🏪') || s.includes('📅') || s.includes('🧰');
+  if (!looksEmoji) return s;
+
+  // Build a canonical sentence your parser already understands
+  const parts = ['expense'];
+  if (amount) parts.push(`$${amount}`);
+  if (item) parts.push(item);
+  if (store) parts.push(`from ${store}`);
+  if (date) parts.push(`on ${date}`);
+  if (job) parts.push(`job ${job}`);
+
+  return parts.join(' ').replace(/\s+/g, ' ').trim() || s;
+}
 
 function formatDisplayDate(isoDate, tz = 'America/Toronto') {
   const s = String(isoDate || '').trim();

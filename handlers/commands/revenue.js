@@ -1904,63 +1904,72 @@ if (isMore) {
 
    
 
-    // -----------------------------
-    // picker-tap resolution
-    // -----------------------------
-    let rawInput = raw0;
-    const rawInput0 = rawInput;
+// -----------------------------
+// picker-tap resolution
+// -----------------------------
+const rawInput0 = String(raw0 || input || '').trim(); // immutable original token/text
+let pickerText = rawInput0;                            // mutable normalized token we will resolve
 
-    const looksLikePickerTap =
-      !!twilioMeta?.ListId ||
-      /^jp:[0-9a-f]{8}:/i.test(rawInput0) ||
-      /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput0) ||
-      /^jobno_\d{1,10}$/i.test(rawInput0) ||
-      /^jobix_\d{1,10}$/i.test(rawInput0);
+const looksLikePickerTap =
+  !!twilioMeta?.ListId ||
+  /^jp:[0-9a-f]{8}:/i.test(rawInput0) ||
+  /^job_\d{1,10}_[0-9a-z]+$/i.test(rawInput0) ||
+  /^jobno_\d{1,10}$/i.test(rawInput0) ||
+  /^jobix_\d{1,10}$/i.test(rawInput0);
 
-    if (looksLikePickerTap) {
-      const sel = await resolveJobPickSelection({
-        input: rawInput0,
-        twilioMeta: twilioMeta || {},
-        pickState: { displayedJobNos, sentRows, jobOptions }
+if (looksLikePickerTap) {
+  const sel = await resolveJobPickSelection({
+    input: rawInput0,
+    twilioMeta: twilioMeta || {},
+    pickState: { displayedJobNos, sentRows, jobOptions }
+  });
+
+  const twilioProvidedPickerMeta =
+    !!String(twilioMeta?.ListId || twilioMeta?.ListRowId || '').trim() ||
+    !!String(twilioMeta?.ListTitle || twilioMeta?.ListRowTitle || '').trim();
+
+  if (!sel?.ok) {
+    // If Twilio gave us picker metadata but we couldn't resolve it,
+    // re-send the picker (don't try to coerce random tokens)
+    if (twilioProvidedPickerMeta) {
+      return await sendJobPickerOrFallback({
+        from,
+        ownerId,
+        paUserId,
+        jobOptions,
+        page,
+        pageSize,
+        confirmDraft: pickPA?.payload?.confirmDraft || null,
+        context
       });
-
-      const twilioProvidedPickerMeta =
-        !!String(twilioMeta?.ListId || twilioMeta?.ListRowId || '').trim() ||
-        !!String(twilioMeta?.ListTitle || twilioMeta?.ListRowTitle || '').trim();
-
-      if (!sel?.ok) {
-        if (twilioProvidedPickerMeta) {
-          return await sendJobPickerOrFallback({
-            from,
-            ownerId,
-            paUserId,
-            jobOptions,
-            page,
-            pageSize,
-            confirmDraft: pickPA?.payload?.confirmDraft || null,
-            context
-          });
-        }
-        rawInput = coerceJobixToJobno(rawInput0, displayedJobNos);
-      } else {
-        rawInput = `jobno_${Number(sel.jobNo)}`;
-      }
-    } else {
-      rawInput = coerceJobixToJobno(rawInput0, displayedJobNos);
     }
 
-    // Remember inbound token (optional)
-    try {
-      await upsertPA({
-        ownerId,
-        userId: paUserId,
-        kind: PA_KIND_PICK_JOB,
-        payload: { ...(pickPA.payload || {}), lastInboundTextRaw: input, lastInboundText: rawInput },
-        ttlSeconds: PA_TTL_PICK_SEC
-      });
-    } catch {}
+    // No Twilio meta → allow coercion (jobix_# -> jobno_#) as fallback
+    pickerText = coerceJobixToJobno(rawInput0, displayedJobNos);
+  } else {
+    pickerText = `jobno_${Number(sel.jobNo)}`;
+  }
+} else {
+  // Not a picker token, but allow "1"/"2" / jobix coercion if present
+  pickerText = coerceJobixToJobno(rawInput0, displayedJobNos);
+}
 
-    const resolved = resolveJobOptionFromReply(rawInput, jobOptions, { page, pageSize, displayedJobNos });
+// Remember inbound token (optional)
+try {
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_PICK_JOB,
+    payload: {
+      ...(pickPA?.payload || {}),
+      lastInboundTextRaw: rawInput0,
+      lastInboundText: pickerText
+    },
+    ttlSeconds: PA_TTL_PICK_SEC
+  });
+} catch {}
+
+const resolved = resolveJobOptionFromReply(pickerText, jobOptions, { page, pageSize, displayedJobNos });
 
     if (!resolved) {
       return out(twimlText('Please tap a job, or reply with a job name, or "more".'), false);

@@ -588,8 +588,126 @@ function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
 
 function assertRevenueCILOrClarify({ from, data, jobName, category, sourceMsgId }) {
   try {
-    const cil = buildRevenueCIL({ from, data, jobName, category, sourceMsgId });
+    const d = data && typeof data === 'object' ? { ...data } : {};
+
+    // -----------------------------
+    // ✅ Minimum required fields (for CIL)
+    // -----------------------------
+    const amtOk = !!d.amount && String(d.amount).trim() && String(d.amount).trim() !== '$0.00';
+    const dateOk = !!d.date && typeof isIsoDate === 'function' && isIsoDate(d.date);
+
+    // Job can come from arg or data
+    let j =
+      (typeof normalizeJobNameCandidate === 'function' ? normalizeJobNameCandidate(jobName) : jobName) ||
+      (typeof normalizeJobNameCandidate === 'function' ? normalizeJobNameCandidate(d.jobName) : d.jobName) ||
+      null;
+
+    // If "Overhead" is allowed, normalize it
+    if (j && typeof looksLikeOverhead === 'function' && looksLikeOverhead(j)) {
+      j = 'Overhead';
+    }
+
+    if (!amtOk) {
+      return {
+        ok: false,
+        reply: `I’m missing the amount. Try: "revenue $4500 on Dec 2 2025 job 1556 Medway Park Dr".`
+      };
+    }
+
+    if (!dateOk) {
+      return {
+        ok: false,
+        reply: `I’m missing the date. Reply "today", "yesterday", or "2025-12-02".`
+      };
+    }
+
+    if (!j) {
+      return {
+        ok: false,
+        reply: `Which job is this for? Reply like: "job 1556 Medway Park Dr" or "Overhead".`
+      };
+    }
+
+    // Ensure the jobName that CIL sees is the resolved one
+    d.jobName = j;
+
+    // -----------------------------
+    // ✅ Source/payer OPTIONAL in UX
+    // but CIL may require it → satisfy schema safely
+    // -----------------------------
+    if (!d.source || !String(d.source).trim()) d.source = 'Unknown';
+
+    // Same for description
+    if (!d.description || !String(d.description).trim()) d.description = 'Revenue received';
+
+    // Category can be optional, but keep if provided
+    if (category && !d.suggestedCategory) d.suggestedCategory = category;
+
+    const cil = buildRevenueCIL({ from, data: d, jobName: j, category, sourceMsgId });
+
     if (typeof validateCIL !== 'function') return { ok: true, cil, skipped: true };
+    
+   function assertRevenueCILOrClarify({ from, data, jobName, category, sourceMsgId }) {
+  try {
+    const d = data && typeof data === 'object' ? { ...data } : {};
+
+    // -----------------------------
+    // ✅ Minimum required fields (for CIL)
+    // -----------------------------
+    const amtOk = !!d.amount && String(d.amount).trim() && String(d.amount).trim() !== '$0.00';
+    const dateOk = !!d.date && typeof isIsoDate === 'function' && isIsoDate(d.date);
+
+    // Job can come from arg or data
+    let j =
+      (typeof normalizeJobNameCandidate === 'function' ? normalizeJobNameCandidate(jobName) : jobName) ||
+      (typeof normalizeJobNameCandidate === 'function' ? normalizeJobNameCandidate(d.jobName) : d.jobName) ||
+      null;
+
+    // If "Overhead" is allowed, normalize it
+    if (j && typeof looksLikeOverhead === 'function' && looksLikeOverhead(j)) {
+      j = 'Overhead';
+    }
+
+    if (!amtOk) {
+      return {
+        ok: false,
+        reply: `I’m missing the amount. Try: "revenue $4500 on Dec 2 2025 job 1556 Medway Park Dr".`
+      };
+    }
+
+    if (!dateOk) {
+      return {
+        ok: false,
+        reply: `I’m missing the date. Reply "today", "yesterday", or "2025-12-02".`
+      };
+    }
+
+    if (!j) {
+      return {
+        ok: false,
+        reply: `Which job is this for? Reply like: "job 1556 Medway Park Dr" or "Overhead".`
+      };
+    }
+
+    // Ensure the jobName that CIL sees is the resolved one
+    d.jobName = j;
+
+    // -----------------------------
+    // ✅ Source/payer OPTIONAL in UX
+    // but CIL may require it → satisfy schema safely
+    // -----------------------------
+    if (!d.source || !String(d.source).trim()) d.source = 'Unknown';
+
+    // Same for description
+    if (!d.description || !String(d.description).trim()) d.description = 'Revenue received';
+
+    // Category can be optional, but keep if provided
+    if (category && !d.suggestedCategory) d.suggestedCategory = category;
+
+    const cil = buildRevenueCIL({ from, data: d, jobName: j, category, sourceMsgId });
+
+    if (typeof validateCIL !== 'function') return { ok: true, cil, skipped: true };
+
     validateCIL(cil);
     return { ok: true, cil };
   } catch (e) {
@@ -598,7 +716,29 @@ function assertRevenueCILOrClarify({ from, data, jobName, category, sourceMsgId 
       name: e?.name,
       details: e?.errors || e?.issues || e?.cause || null
     });
-    return { ok: false, reply: `⚠️ Couldn't log that revenue yet. Try: "received $2500 for <job> today".` };
+
+    // ✅ Better fallback than "missing details"
+    return {
+      ok: false,
+      reply: `⚠️ I couldn't log that revenue yet. Try: "revenue $4500 on 2025-12-02 job 1556 Medway Park Dr".`
+    };
+  }
+}
+
+    validateCIL(cil);
+    return { ok: true, cil };
+  } catch (e) {
+    console.warn('[REVENUE] CIL validate failed', {
+      message: e?.message,
+      name: e?.name,
+      details: e?.errors || e?.issues || e?.cause || null
+    });
+
+    // ✅ Better fallback than "missing details"
+    return {
+      ok: false,
+      reply: `⚠️ I couldn't log that revenue yet. Try: "revenue $4500 on 2025-12-02 job 1556 Medway Park Dr".`
+    };
   }
 }
 

@@ -566,20 +566,29 @@ async function persistActiveJobFromRevenue({ ownerId, fromPhone, userProfile, jo
 /* ---------------- CIL (fail-open) ---------------- */
 
 function buildRevenueCIL({ from, data, jobName, category, sourceMsgId }) {
-  const cents = toCents(data.amount);
+  const d = data && typeof data === 'object' ? data : {};
 
+  const cents = toCents(d.amount);
+  
+  // Keep your “Revenue Logged” behavior, but make sure it's always populated
   const description =
-    String(data.description || '').trim() && data.description !== 'Unknown'
-      ? String(data.description).trim()
+    String(d.description || '').trim() && String(d.description).trim() !== 'Unknown'
+      ? String(d.description).trim()
       : 'Revenue Logged';
+
+  // ✅ KEY FIX: Source is OPTIONAL in UX but REQUIRED by schema → always provide one
+  const source =
+    String(d.source || '').trim() && String(d.source).trim() !== 'Unknown'
+      ? String(d.source).trim()
+      : 'Unknown';
 
   return {
     type: 'LogRevenue',
     job: jobName ? String(jobName) : undefined,
     description,
     amount_cents: cents,
-    source: data.source && data.source !== 'Unknown' ? String(data.source) : undefined,
-    date: data.date ? String(data.date) : undefined,
+    source, // ✅ never undefined now
+    date: d.date ? String(d.date) : undefined,
     category: category ? String(category) : undefined,
     source_msg_id: sourceMsgId ? String(sourceMsgId) : undefined,
     actor_phone: from ? String(from) : undefined

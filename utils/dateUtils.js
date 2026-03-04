@@ -94,7 +94,6 @@ const mWord = s.match(/\s+(?:on\s+)?(?<date>today|yesterday|tomorrow)\b[\s\.\!\?
 }
 
 module.exports = {
-  todayInTimeZone,
   parseNaturalDate,
   stripDateTail
 };

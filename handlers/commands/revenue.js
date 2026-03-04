@@ -2765,28 +2765,33 @@ else category = null;
 
 // ---------------------------------------------------------
 // ✅ Deterministic job capture for NL revenue
-// Accepts: "... for job <name>" OR "... from job <name>"
-// This prevents "from Job X" being misread as payer/source.
+// Accepts:
+//   - "... for job <name>"
+//   - "... from job <name>"
+//   - "... job <name>"          ✅ NEW
+// Also strips date-ish tokens accidentally included at end.
 // ---------------------------------------------------------
 {
   const raw = String(input || '').trim();
 
-  // Prefer "for job ..." and "from job ..." tails
+  // Prefer tails like "for job ..." / "from job ..." / "job ..."
+  // We anchor to end-of-message to avoid grabbing mid-sentence junk.
   const mJob =
     raw.match(/\bfor\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
-    raw.match(/\bfrom\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i);
+    raw.match(/\bfrom\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
+    raw.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i); // ✅ NEW
 
   let jobFromText = mJob?.[1] ? String(mJob[1]).replace(/[.!,;:]+$/g, '').trim() : null;
 
-// ✅ remove trailing date-ish tokens accidentally included in job tail
-// examples: "1559 Medway Park Dr today" -> "1559 Medway Park Dr"
-if (jobFromText) {
-  jobFromText = jobFromText
-    .replace(/\b(on\s+)?(today|yesterday|tomorrow)\b\s*$/i, '')
-    .replace(/\b(on\s+)?\d{4}-\d{2}-\d{2}\b\s*$/i, '')
-    .trim();
-}
-
+  // ✅ remove trailing date-ish tokens accidentally included in job tail
+  // examples: "1559 Medway Park Dr today" -> "1559 Medway Park Dr"
+  if (jobFromText) {
+    jobFromText = jobFromText
+      .replace(/\b(on\s+)?(today|yesterday|tomorrow)\b\s*$/i, '')
+      .replace(/\b(on\s+)?\d{4}-\d{2}-\d{2}\b\s*$/i, '')
+      .replace(/\b(on\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b.*$/i, (m) => m) // keep month forms; don't strip whole thing
+      .trim();
+  }
 
   if (jobFromText) {
     data.jobName = jobFromText;
@@ -2799,12 +2804,20 @@ if (jobFromText) {
     }
   }
 
-  // If user literally wrote "from Job X", we should NOT keep that as payer/source
-  // because it’s job context, not customer name.
-  if (/\bfrom\s+job\b/i.test(raw)) {
-    data.source = data.source && !isDateishSource(data.source) ? stripJobClause(data.source) : '';
+  // If user literally wrote "from job X", we should NOT keep that as payer/source
+  if (/\bfrom\s+job\b/i.test(raw) || /\bjob\b/i.test(raw)) {
+    if (data.source) {
+      data.source = stripJobClause(data.source);
+      if (isDateishSource(data.source)) data.source = '';
+    }
   }
 }
+
+console.info('[REVENUE_NEW_JOB_CAPTURE]', {
+  jobNameFromData: data?.jobName || null,
+  jobSourceFromData: data?.jobSource || null,
+  source: data?.source || null
+});
 
 
 let jobName = normalizeJobNameCandidate(data.jobName) || null;

@@ -1831,11 +1831,11 @@ if (isMore) {
       }
 
       const strictTok = strictDecisionToken(input);
-      // ---------------------------------------------------------
+// ---------------------------------------------------------
 // ✅ CONFIRM-SUMMARY ECHO GUARD (CONFIRM FLOW)
 // If user sends back the formatted confirm summary (often after Edit),
 // do NOT treat it as a new "revenue ..." intake.
-// Instead: re-send the confirm card (resume behavior).
+// Instead: re-send confirm (resume behavior) or give the right prompt.
 // ---------------------------------------------------------
 function looksLikeRevenueConfirmEcho(raw) {
   const s = String(raw || '').trim();
@@ -1843,114 +1843,32 @@ function looksLikeRevenueConfirmEcho(raw) {
 
   const lc = s.toLowerCase();
 
-  // Common patterns you generate:
-  // "Revenue\n💰 $X\n📅 ...\n🧰 ..."
-  const startsWithRevenue = /^revenue\b/i.test(s);
-  const hasMoneyLine = /💰\s*\$?\s*\d/.test(s);
-  const hasDateLine = /📅/.test(s) || /\b(20\d{2}-\d{2}-\d{2})\b/.test(s);
+  // Must look like the confirm “shape”
+  const hasMoneyLine = /💰\s*\$?\s*[\d,]+(?:\.\d{2})?/.test(s);
+  const hasDateLine =
+    /📅/.test(s) ||
+    /\b(20\d{2}-\d{2}-\d{2})\b/.test(lc) ||
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/.test(lc);
+
   const hasJobLine = /🧰/.test(s);
 
-  // If it contains the confirm "shape", treat it as echo.
+  // Common patterns you generate
+  const startsWithRevenue = /^revenue\b/i.test(s);
+
+  // "Revenue\n💰...\n📅...\n🧰..."
   if (startsWithRevenue && hasMoneyLine && (hasDateLine || hasJobLine)) return true;
 
-  // Also catch cases where they paste just the emoji block (no "Revenue" header)
-  if (hasMoneyLine && hasDateLine && hasJobLine && s.length <= 220) return true;
+  // Emoji block pasted alone
+  if (hasMoneyLine && hasDateLine && hasJobLine && s.length <= 260) return true;
+
+  // Safety: avoid matching normal intake like "revenue 4500 nov 2"
+  if (startsWithRevenue && !/[\n\r]/.test(s) && s.length <= 60) return false;
 
   return false;
 }
-
-try {
-  // Only when confirm exists and it's not a strict control token
-  if (!strictTok && confirmPA?.payload?.draft) {
-    const echo = looksLikeRevenueConfirmEcho(input);
-
-    if (echo) {
-      console.info('[REVENUE_CONFIRM_ECHO_GUARD]', {
-        head: String(input || '').slice(0, 60)
-      });
-
-      // Re-send confirm as a "resume" (no state changes)
-      return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
-    }
-  }
-} catch (e) {
-  console.warn('[REVENUE_CONFIRM_ECHO_GUARD] failed (ignored):', e?.message);
-}
-      // ---------------------------------------------------------
-// ✅ UN-SKIPPABLE DATE CONSUMPTION (CONFIRM FLOW):
-// If draft is awaiting_date, consume ANY non-control inbound
-// as the date payload and update confirm draft.
-// ---------------------------------------------------------
-try {
-  // refresh confirmPA (avoid stale snapshots)
-  try {
-    confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => confirmPA);
-  } catch {}
-
-  const d0 = confirmPA?.payload?.draft || null;
-
-const isControl =
-  strictTok === 'yes' ||
-  strictTok === 'edit' ||
-  strictTok === 'cancel' ||
-  strictTok === 'change_job' ||
-  strictTok === 'resume' ||
-  strictTok === 'skip';
-
-// ✅ Patch 2: if we're in edit mode, do NOT consume date replies here
-if (d0?.awaiting_edit) {
-  // edit flow owns the next payload
-} else if (d0?.awaiting_date && !isControl) {
-  const parsedDate = parseRelativeDateReply(input, tz);
-
-  if (!parsedDate) {
-    return out(
-      twimlText(
-        `Please tell me the date you received it.\n` +
-          `Reply "today", "yesterday", or a date like "2026-01-13".`
-      ),
-      false
-    );
-  }
-
-  const patched = {
-    ...(d0 || {}),
-    date: parsedDate,
-    awaiting_date: false,
-    needsReparse: false,
-    draftText: String(input || '').trim() || (d0?.draftText ?? null),
-    originalText: d0?.originalText ?? null
-  };
-
-  await upsertPA({
-    ownerId,
-    userId: paUserId,
-    kind: PA_KIND_CONFIRM,
-    payload: { ...(confirmPA?.payload || {}), draft: patched },
-    ttlSeconds: PA_TTL_SEC
-  });
-
-  return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
-}
-
-// if awaiting_date and user pressed a control token, remind (no nag loop)
-if (d0?.awaiting_date && isControl && !d0?.awaiting_edit) {
-  return out(
-    twimlText(
-      `📅 I still need the date you received it.\n` +
-        `Reply "today", "yesterday", or "2026-01-13".`
-    ),
-    false
-  );
-}
-
-} catch (e) {
-  console.warn('[REVENUE_AWAITING_DATE] failed (ignored):', e?.message);
-}
-
-
-      // ---------------------------------------------------------
+       // ---------------------------------------------------------
       // ✅ UN-SKIPPABLE EDIT CONSUMPTION (CONFIRM FLOW)
+      // (Echo guard is defined ONCE above — do not redefine it here)
       // ---------------------------------------------------------
       try {
         // refresh confirmPA (avoid stale snapshots)
@@ -1978,6 +1896,33 @@ if (d0?.awaiting_date && isControl && !d0?.awaiting_edit) {
           strictTok === 'skip' ||
           strictTok === 'change_job';
 
+        // ✅ Echo guard (uses the ONE definition you kept above)
+        if (!strictTok && draftR && looksLikeRevenueConfirmEcho(input)) {
+          if (draftR.awaiting_edit) {
+            return out(
+              twimlText(
+                [
+                  '✏️ Send the corrected revenue details in ONE message.',
+                  'Example:',
+                  'revenue $2500 on Jan 13 2026 job Oak Street Re-roof',
+                  'Reply "cancel" to discard.'
+                ].join('\n')
+              ),
+              false
+            );
+          }
+
+          if (draftR.awaiting_date) {
+            return out(
+              twimlText(`📅 I still need the date. Reply "today", "yesterday", or "2026-01-13".`),
+              false
+            );
+          }
+
+          // Otherwise treat echo as resume
+          return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+        }
+
         const shouldConsumeAsEditPayload =
           !!draftR && !isControl && (draftR.awaiting_edit || editRecentlyStarted);
 
@@ -1992,48 +1937,32 @@ if (d0?.awaiting_date && isControl && !d0?.awaiting_edit) {
           const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
           let nextDraft = aiRes?.data || null;
           if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
-          // ✅ deterministic fallbacks during edit (same as new intake)
-if (!nextDraft || typeof nextDraft !== 'object') nextDraft = {};
 
-if (!nextDraft.amount || nextDraft.amount === '$0.00') {
-  const n = parseMoneyAmountFromText(input);
-  if (n != null) nextDraft.amount = formatMoneyDisplay(n);
-}
+          if (!nextDraft || typeof nextDraft !== 'object') nextDraft = {};
 
-// capture today/yesterday if user said it in the edit message
-if (!isIsoDate(nextDraft.date)) {
-  const t = String(input || '').toLowerCase();
-  if (/\btoday\b/.test(t)) nextDraft.date = todayInTimeZone(tz);
-  else if (/\byesterday\b/.test(t)) {
-    try {
-      const td = todayInTimeZone(tz);
-      const d = new Date(`${td}T12:00:00Z`);
-      d.setUTCDate(d.getUTCDate() - 1);
-      nextDraft.date = d.toISOString().slice(0, 10);
-    } catch {}
-  }
-}
+          if (!nextDraft.amount || nextDraft.amount === '$0.00') {
+            const n = parseMoneyAmountFromText(input);
+            if (n != null) nextDraft.amount = formatMoneyDisplay(n);
+          }
 
-// deterministic "from job ..." / "for job ..." capture in edit payload
-{
-  const raw = String(input || '').trim();
-  const mJob =
-    raw.match(/\bfor\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
-    raw.match(/\bfrom\s+job\b\s*[:\-]?\s*([^\n\r]+)$/i);
+          if (!isIsoDate(nextDraft.date)) {
+            const t = String(input || '').toLowerCase();
+            if (/\btoday\b/.test(t)) nextDraft.date = todayInTimeZone(tz);
+            else if (/\byesterday\b/.test(t)) {
+              try {
+                const td = todayInTimeZone(tz);
+                const d = new Date(`${td}T12:00:00Z`);
+                d.setUTCDate(d.getUTCDate() - 1);
+                nextDraft.date = d.toISOString().slice(0, 10);
+              } catch {}
+            }
+          }
 
-  let jobFromText = mJob?.[1] ? String(mJob[1]).replace(/[.!,;:]+$/g, '').trim() : null;
-  if (jobFromText) {
-    jobFromText = jobFromText
-      .replace(/\b(on\s+)?(today|yesterday|tomorrow)\b\s*$/i, '')
-      .replace(/\b(on\s+)?\d{4}-\d{2}-\d{2}\b\s*$/i, '')
-      .trim();
-
-    if (jobFromText) {
-      nextDraft.jobName = jobFromText;
-      nextDraft.jobSource = 'typed';
-    }
-  }
-}
+          // cleanup: prevent job/date bleed into source
+          if (nextDraft?.source) {
+            nextDraft.source = stripJobClause(nextDraft.source);
+            if (isDateishSource(nextDraft.source)) nextDraft.source = '';
+          }
 
           const missingCore = !nextDraft || !nextDraft.amount || nextDraft.amount === '$0.00';
           if (missingCore) {
@@ -2043,44 +1972,16 @@ if (!isIsoDate(nextDraft.date)) {
             );
           }
 
-          // deterministic "job ..." capture (optional)
-const m = String(input || '').trim().match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
-const jobFromText = m?.[1] ? String(m[1]).replace(/[.!,;:]+$/g, '').trim() : null;
-
-// ✅ cleanup: prevent "today for job ..." from leaking into source
-if (nextDraft?.source) {
-  nextDraft.source = stripJobClause(nextDraft.source);
-  if (isDateishSource(nextDraft.source)) nextDraft.source = '';
-}
-
-
-         const patchedDraft = {
-  ...(draftR || {}),
-  ...(nextDraft || {}),
-
-  // ✅ harden source again after merge (prevents bleed from older draftR)
-  ...(nextDraft?.source
-    ? {
-        source: (() => {
-          const s = stripJobClause(nextDraft.source);
-          return isDateishSource(s) ? '' : s;
-        })()
-      }
-    : null),
-
-  ...(jobFromText
-    ? { jobName: /^overhead$/i.test(jobFromText) ? 'Overhead' : jobFromText, jobSource: 'typed' }
-    : null),
-
-  draftText: String(input || '').trim(),
-  originalText: String(input || '').trim(),
-
-  awaiting_edit: false,
-  edit_started_at: null,
-  editStartedAt: null,
-  edit_flow_id: null
-};
-
+          const patchedDraft = {
+            ...(draftR || {}),
+            ...(nextDraft || {}),
+            draftText: String(input || '').trim(),
+            originalText: String(input || '').trim(),
+            awaiting_edit: false,
+            edit_started_at: null,
+            editStartedAt: null,
+            edit_flow_id: null
+          };
 
           await upsertPA({
             ownerId,
@@ -2090,55 +1991,24 @@ if (nextDraft?.source) {
             ttlSeconds: PA_TTL_SEC
           });
 
-          // ✅ set one-shot auto-yes so webhook router re-calls handler with "yes"
+          // Do NOT auto-confirm after edit
           try {
-            const editMsgSid = String(sourceMsgId || '').trim() || null;
-            // Do NOT auto-confirm after edit.
-// Just resend the updated confirm card and wait for explicit Yes.
-try {
-  await mergePendingTransactionState(paUserId, {
-    _autoYesAfterEdit: false,
-    _autoYesSourceMsgId: null
-  });
-} catch {}
+            if (typeof mergePendingTransactionState === 'function') {
+              await mergePendingTransactionState(paUserId, { _autoYesAfterEdit: false, _autoYesSourceMsgId: null });
+            }
+          } catch {}
 
-          } catch (e) {
-            console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
-          }
+          const displayDate =
+            (typeof formatDisplayDate === 'function' ? formatDisplayDate(patchedDraft?.date, tz) : null) ||
+            String(patchedDraft?.date || '').trim() ||
+            '—';
 
-        console.info('[REVENUE_DRAFT_READY]', {
-  amount: patchedDraft?.amount,
-  source: patchedDraft?.source,
-  date: patchedDraft?.date,
-  jobName: patchedDraft?.jobName,
-  awaiting_edit: patchedDraft?.awaiting_edit,
-  source_msg_id: confirmPA?.payload?.sourceMsgId || sourceMsgId || null
-});
+          const displayAmt = String(patchedDraft?.amount || '').trim() || '—';
+          const displayJob = String(patchedDraft?.jobName || '').trim() || '—';
 
-// ✅ deterministically build the SAME emoji summary used everywhere else
-const displayDate =
-  (typeof formatDisplayDate === 'function' ? formatDisplayDate(patchedDraft?.date, tz) : null) ||
-  String(patchedDraft?.date || '').trim() ||
-  '—';
-
-const displayAmt = String(patchedDraft?.amount || '').trim() || '—';
-const displayJob = String(patchedDraft?.jobName || '').trim() || '—';
-
-const summaryLine = `💰 ${displayAmt}\n📅 ${displayDate}\n🧰 ${displayJob}`;
-
-// persist humanLine for resume/debug (optional)
-try {
-  await upsertPA({
-    ownerId,
-    userId: paUserId,
-    kind: PA_KIND_CONFIRM,
-    payload: { ...(confirmPA?.payload || {}), draft: patchedDraft, humanLine: summaryLine },
-    ttlSeconds: PA_TTL_SEC
-  });
-} catch {}
-
-return await sendConfirmRevenueOrFallback(from, summaryLine);
-      }
+          const summaryLine = `💰 ${displayAmt}\n📅 ${displayDate}\n🧰 ${displayJob}`;
+          return await sendConfirmRevenueOrFallback(from, summaryLine);
+        }
 
         // if still awaiting_edit and user sent a control token, never nag
         if (draftR?.awaiting_edit && isControl) {
@@ -2348,20 +2218,41 @@ return await sendConfirmRevenueOrFallback(from, summaryLine);
   }
 
  if (strictTok === 'yes') {
+  console.info('[REVENUE_YES_ENTER]', {
+    ownerId,
+    paUserId,
+    from,
+    hasConfirmPA: !!confirmPA?.payload,
+    hasDraft: !!confirmPA?.payload?.draft,
+    awaiting_edit: !!confirmPA?.payload?.draft?.awaiting_edit,
+    awaiting_date: !!confirmPA?.payload?.draft?.awaiting_date
+  });
   try {
     // Always operate on freshest confirm PA
     let confirmPAFresh = null;
-    try {
-      confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-    } catch (e) {
-      console.warn('[REVENUE_YES] getPA failed (ignored):', e?.message);
-      confirmPAFresh = confirmPA || null;
-    }
+  try {
+    confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+  } catch (e) {
+    console.warn('[REVENUE_YES] getPA failed:', e?.message);
+    confirmPAFresh = confirmPA || null;
+  }
 
-    const rawDraft =
-      confirmPAFresh?.payload?.draft && typeof confirmPAFresh.payload.draft === 'object'
-        ? { ...confirmPAFresh.payload.draft }
-        : null;
+  const rawDraft =
+    confirmPAFresh?.payload?.draft && typeof confirmPAFresh.payload.draft === 'object'
+      ? { ...confirmPAFresh.payload.draft }
+      : null;
+
+  console.info('[REVENUE_YES_DRAFT]', {
+    hasDraft: !!rawDraft,
+    keys: rawDraft ? Object.keys(rawDraft).slice(0, 25) : [],
+    amount: rawDraft?.amount,
+    date: rawDraft?.date,
+    jobName: rawDraft?.jobName,
+    job_no: rawDraft?.job_no,
+    job_id: rawDraft?.job_id,
+    awaiting_edit: !!rawDraft?.awaiting_edit,
+    awaiting_date: !!rawDraft?.awaiting_date
+  });
 
     if (!rawDraft || !Object.keys(rawDraft).length) {
       return out(twimlText(`I didn’t find a revenue draft to submit. Reply "resume" to see what’s pending.`), false);
@@ -2369,18 +2260,27 @@ return await sendConfirmRevenueOrFallback(from, summaryLine);
 
     // ✅ if user is in edit mode, do NOT submit
     if (rawDraft?.awaiting_edit) {
-      return out(
-        twimlText(
-          [
-            '✏️ I’m still waiting for your edited revenue details in ONE message.',
-            'Example:',
-            'revenue $2500 from ClientName on Jan 13 2026 job Oak Street Re-roof',
-            'Reply "cancel" to discard.'
-          ].join('\n')
-        ),
-        false
-      );
-    }
+    return out(
+      twimlText(
+        [
+          '✏️ I’m still waiting for your edited revenue details in ONE message.',
+          'Example:',
+          'revenue $2500 on Jan 13 2026 job Oak Street Re-roof',
+          'Reply "cancel" to discard.'
+        ].join('\n')
+      ),
+      false
+    );
+  }
+
+  if (rawDraft?.awaiting_date) {
+    return out(
+      twimlText(
+        `📅 I still need the date.\nReply "today", "yesterday", or "2026-01-13".`
+      ),
+      false
+    );
+  }
 
     // Normalize draft
     let data = normalizeRevenueData(rawDraft, tz);
@@ -2518,70 +2418,103 @@ const txId =
   : null;
 
 // ------------------------------
-// ✅ Brain v0 fact emission (revenue.confirmed)
+// ✅ INSERT succeeded — emit fact, clear confirm state, reply once
 // ------------------------------
+console.info('[REVENUE_YES_INSERT_OK]', { txId });
+
+// ✅ Brain v0 fact emission (revenue.confirmed) — best effort
+// (Must run BEFORE returning)
 try {
-  const currency = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase() || null;
-  const occurredAt = dateStr ? `${dateStr}T12:00:00Z` : null;
+  if (pg?.insertFactEvent && typeof pg.insertFactEvent === 'function') {
+    const currency = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase() || null;
+    const occurredAt = dateStr ? `${dateStr}T12:00:00Z` : null;
 
-  const dedupeKey =
-    txSourceMsgId ? `revenue.confirmed:${String(txSourceMsgId)}`
-    : txId != null ? `revenue.confirmed:tx:${String(txId)}`
-    : `revenue.confirmed:fallback:${paUserId}:${Date.now()}`;
+    const dedupeKey =
+      txSourceMsgId ? `revenue.confirmed:${String(txSourceMsgId)}`
+      : txId != null ? `revenue.confirmed:tx:${String(txId)}`
+      : `revenue.confirmed:fallback:${paUserId}:${Date.now()}`;
 
-  await pg.insertFactEvent({
-    owner_id: ownerId,
-    actor_key: paUserId,
+    await pg.insertFactEvent({
+      owner_id: ownerId,
+      actor_key: paUserId,
 
-    event_type: 'revenue.confirmed',
-    entity_type: 'revenue',
-    entity_id: txId != null ? String(txId) : null,
+      event_type: 'revenue.confirmed',
+      entity_type: 'revenue',
+      entity_id: txId != null ? String(txId) : null,
 
-    job_no: data?.job_no ?? null,
-    job_id: data?.job_id ?? null,
-    job_name: jobName || null,
-    job_source: jobSource || null,
+      job_no: data?.job_no ?? data?.jobNo ?? null,
+      job_id: data?.job_id ?? data?.jobId ?? null,
+      job_name: jobName || null,
+      job_source: jobSource || null,
 
-    amount_cents: Number.isFinite(amountCents) ? amountCents : null,
-    currency,
+      amount_cents: Number.isFinite(amountCents) ? amountCents : null,
+      currency,
 
-    occurred_at: occurredAt,
-    source_msg_id: txSourceMsgId || null,
-    source_kind: 'whatsapp_text',
+      occurred_at: occurredAt,
+      source_msg_id: txSourceMsgId || null,
+      source_kind: 'whatsapp_text',
 
-    event_payload: {
-      source: sourceForDb,
-      description: descForDb,
-      date: dateStr || null,
-      jobName: jobName || null,
-      jobSource: jobSource || null
-    },
+      event_payload: {
+        source: sourceForDb,
+        description: descForDb,
+        date: dateStr || null,
+        jobName: jobName || null,
+        jobSource: jobSource || null
+      },
 
-    dedupe_key: dedupeKey
-  });
+      dedupe_key: dedupeKey
+    });
+  }
 } catch (e) {
   console.warn('[FACT_EVENT] revenue.confirmed insert failed (ignored):', e?.message);
 }
 
+// ✅ CRITICAL: clear confirm + pick PA so we never loop
+try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
+try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }); } catch {}
 
-    // Clear confirm + picker
-    try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
-    try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }); } catch {}
+// ✅ Clear legacy pending flags (best-effort)
+try {
+  const mergeFn =
+    (typeof mergePendingTransactionState === 'function' && mergePendingTransactionState) ||
+    (stateManager?.mergePendingTransactionState && stateManager.mergePendingTransactionState) ||
+    null;
 
-    // Best-effort: persist active job (skip overhead)
-    try {
-      if (jobName && !looksLikeOverhead(jobName)) {
-        await persistActiveJobFromRevenue({
-          ownerId,
-          fromPhone: from,
-          userProfile,
-          jobNo: data?.job_no ?? null,
-          jobName
-        });
-      }
-    } catch {}
+  if (mergeFn) {
+    await mergeFn(paUserId, {
+      pendingRevenue: false,
+      awaitingRevenueJob: false,
+      awaitingRevenueClarification: false,
+      allow_new_while_pending: false,
+      allow_new_set_at: null,
 
-    const okMsg = [
+      pendingRevenueFlow: false,
+      awaitingRevenuePick: false,
+
+      _autoYesAfterEdit: false,
+      _autoYesSourceMsgId: null
+    });
+  }
+} catch (e) {
+  console.warn('[REVENUE_YES] clear pending state failed (ignored):', e?.message);
+}
+
+// Best-effort: persist active job (skip overhead)
+try {
+  if (jobName && !looksLikeOverhead(jobName)) {
+    await persistActiveJobFromRevenue({
+      ownerId,
+      fromPhone: from,
+      userProfile,
+      jobNo: data?.job_no ?? data?.jobNo ?? null,
+      jobName
+    });
+  }
+} catch (e) {
+  console.warn('[REVENUE_YES] persistActiveJobFromRevenue failed (ignored):', e?.message);
+}
+
+ const okMsg = [
       `✅ Logged revenue ${formatMoneyDisplay(amountNum)} — ${sourceForDb}`,
       dateStr ? `Date: ${dateStr}` : null,
       jobName ? `Job: ${jobName}` : null,
@@ -2593,21 +2526,23 @@ try {
     return out(twimlText(okMsg), false);
   } catch (e) {
     console.error('[REVENUE_YES] handler failed:', e?.message);
-    return out(twimlText(`Something went wrong submitting that revenue. Reply "resume" and try again.`), false);
+    return out(
+      twimlText(`Something went wrong submitting that revenue. Reply "resume" and try again.`),
+      false
+    );
   }
-}
-
-
-  // default while confirm pending
-  return out(
-    twimlText(
-      'You still have a revenue draft open.\n' +
-        'Tap Yes/Edit/Change Job/Cancel to finish it. If you want to start over, reply "Cancel".'
-    ),
-    false
-  );
-}
-
+} // ✅ end strictTok === 'yes'
+ // ✅ If we’re still here, a confirm draft exists and user didn’t finish it.
+      // Never fall through into new intake parsing.
+      return out(
+        twimlText(
+          'You still have a revenue draft open.\n' +
+            'Reply: "yes" / "edit" / "change job" / "skip" / "cancel".\n' +
+            'Tip: reply "resume" to see it again.'
+        ),
+        false
+      );
+    } // ✅ end if (confirmPA?.payload?.draft)
 
   // ---- 3) New revenue parse (AI first-pass; keep behavior; beta hardening) ----
 

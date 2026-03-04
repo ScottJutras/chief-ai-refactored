@@ -214,15 +214,17 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
   const disableCorrections = options.disableCorrections === true; // ✅ for edit-mode flows
   const disablePendingState = options.disablePendingState === true; // ✅ for edit-mode flows
 
-  // normalize ctx to plain object
+  // ✅ normalize ctx to plain object
   ctx = ctx && typeof ctx === 'object' ? ctx : {};
 
- // ✅ accept both { tz }, { timezone }, { tz0 }
-if (!ctx.tz && ctx.timezone) ctx.tz = ctx.timezone;
-if (!ctx.tz && ctx.tz0) ctx.tz = ctx.tz0;
+  // ✅ accept both { tz } and { timezone } callers
+  if (!ctx.tz && ctx.timezone) ctx.tz = ctx.timezone;
+  if (!ctx.tz && ctx.tz0) ctx.tz = ctx.tz0;
+
+  // ✅ rawInput MUST exist in this scope (fixes your ReferenceError)
+  let rawInput = String(input ?? '');
 
   // Optional: transcript normalization hook (voice → deterministic-friendly)
-  // Safe: only applies if module exists and exposes a normalizer.
   try {
     const tn = require('./transcriptNormalize'); // utils/transcriptNormalize.js
     if (tn && typeof tn.normalizeTranscriptMoney === 'function') {
@@ -246,47 +248,47 @@ if (!ctx.tz && ctx.tz0) ctx.tz = ctx.tz0;
     data = null;
   }
 
- // 2) If deterministic parse failed, ask for clarification (but keep revenue payer/source OPTIONAL)
-if (!data) {
-  const proposed = await proposeClarification(rawInput, type);
+  // 2) If deterministic parse failed, ask for clarification
+  //    (but keep revenue payer/source OPTIONAL)
+  if (!data) {
+    const proposed = await proposeClarification(rawInput, type);
 
-  if (type === 'revenue') {
-    const replyText = String(proposed?.reply || '').toLowerCase();
+    if (type === 'revenue') {
+      const replyText = String(proposed?.reply || '').toLowerCase();
 
-    const asksForSource =
-      replyText.includes('specify the source') ||
-      replyText.includes('source of the revenue') ||
-      (replyText.includes('what is the source') && replyText.includes('revenue')) ||
-      replyText.includes('payer') ||
-      replyText.includes('client');
+      const asksForSource =
+        replyText.includes('specify the source') ||
+        replyText.includes('source of the revenue') ||
+        (replyText.includes('what is the source') && replyText.includes('revenue')) ||
+        replyText.includes('payer') ||
+        replyText.includes('client');
 
-    if (asksForSource) {
-      return {
-        data: null,
-        reply: `✅ Got it. Which job should I attach this to?\nReply with a job number/name, or "Overhead".`,
-        confirmed: false
-      };
+      if (asksForSource) {
+        return {
+          data: null,
+          reply: `✅ Got it. Which job should I attach this to?\nReply with a job number/name, or "Overhead".`,
+          confirmed: false
+        };
+      }
     }
+
+    return proposed;
   }
 
-  return proposed;
-}
+  // ---------------------------------------------------------
+  // ✅ Edit/confirm mode short-circuit:
+  // If caller disabled corrections/pending state, we SKIP detectErrors
+  // and return confirmed:true so revenue.js can enforce its own rules.
+  // ---------------------------------------------------------
+  const skipDetect = disableCorrections || disablePendingState;
+  if (skipDetect) {
+    return { data, reply: null, confirmed: true };
+  }
 
-// ---------------------------------------------------------
-// ✅ Edit / confirm mode shortcut
-// - Do NOT run detectErrors
-// - Caller (revenue.js) handles validation + confirm logic
-// ---------------------------------------------------------
-const skipDetect = disableCorrections || disablePendingState;
-
-if (skipDetect) {
-  return { data, reply: null, confirmed: true };
-}
-
-// 3) Detect structural errors (missing fields etc.)
-let errors = null;
-try {
-  errors = await detectErrorsImpl(data, type, ctx);;
+  // 3) Detect structural errors (missing fields etc.)
+  let errors = null;
+  try {
+    errors = await detectErrorsImpl(data, type, ctx);
 
     if (Array.isArray(errors)) {
       const hard = errors.filter((e) => String(e?.severity || 'hard') === 'hard');
@@ -300,7 +302,7 @@ try {
       errors = hard.length ? hard : null;
     }
 
-    // ✅ contractor-first: revenue payer/client is optional
+    // ✅ contractor-first: revenue payer/client/source is optional
     if (type === 'revenue' && errors) {
       const s = JSON.stringify(errors);
       if (/client|payer|source/i.test(s) && /missing/i.test(s)) {
@@ -314,16 +316,6 @@ try {
 
   // 4) If errors exist...
   if (errors) {
-    // ✅ Edit-mode / confirm-mode: do NOT generate "issues" diffs or write pending state.
-    if (disableCorrections || disablePendingState) {
-  const hint =
-    type === 'revenue'
-      ? `I couldn’t apply that edit yet. Please resend in ONE message with amount + date + job.\nExample: revenue $4590 on Dec 12 2025 job 1556 Medway Park Dr`
-      : `I couldn't apply that edit yet. Please resend with the missing details.`;
-
-  return { data: null, reply: hint, confirmed: false };
-}
-
     const corrections = await correctErrorsWithAI(
       `Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)} Ctx=${JSON.stringify(ctx || {})}`,
       type

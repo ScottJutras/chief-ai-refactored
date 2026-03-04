@@ -1,6 +1,23 @@
 // utils/dateUtils.js
 
-
+/**
+ * Timezone-aware "today" (YYYY-MM-DD) using Intl.
+ * If tz is invalid or Intl fails, fall back to server time.
+ */
+function todayInTimeZone(tz) {
+  try {
+    const dtf = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    });
+    // en-CA yields YYYY-MM-DD
+    return dtf.format(new Date());
+  } catch {
+    return new Date().toISOString().split('T')[0];
+  }
+}
 
 /**
  * Parse common natural date tokens into YYYY-MM-DD.
@@ -28,7 +45,7 @@ function parseNaturalDate(s, tz) {
   // strict ISO
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
 
-   // “December 12, 2025”, “Dec 12 2025”, etc. — avoid Date.parse() timezone drift
+  // “December 12, 2025”, “Dec 12 2025”, etc. — avoid Date.parse() timezone drift
   {
     const mm = String(s || '').trim().match(/^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})$/);
     if (mm) {
@@ -77,8 +94,7 @@ function stripDateTail(raw = '', tz) {
   }
 
   // today/yesterday/tomorrow at end, optionally preceded by "on"
-  // allow trailing punctuation: "today.", "yesterday!", "tomorrow,"
-const mWord = s.match(/\s+(?:on\s+)?(?<date>today|yesterday|tomorrow)\b[\s\.\!\?,]*$/i);
+  const mWord = s.match(/\s+(?:on\s+)?(?<date>today|yesterday|tomorrow)\b[\s\.\!\?,]*$/i);
   if (mWord?.groups?.date) {
     return { rest: s.slice(0, mWord.index).trim(), date: parseNaturalDate(mWord.groups.date, tz) };
   }
@@ -94,6 +110,7 @@ const mWord = s.match(/\s+(?:on\s+)?(?<date>today|yesterday|tomorrow)\b[\s\.\!\?
 }
 
 module.exports = {
+  todayInTimeZone,
   parseNaturalDate,
   stripDateTail
 };

@@ -303,6 +303,25 @@ const todayInTimeZone =
     return new Date().toISOString().split('T')[0];
   });
 
+/**
+ * Timezone-aware "today" (YYYY-MM-DD) using Intl.
+ * If tz is invalid or Intl fails, fall back to server time.
+ */
+function todayInTimeZone(tz) {
+  try {
+    const dtf = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    });
+    // en-CA yields YYYY-MM-DD
+    return dtf.format(new Date());
+  } catch {
+    return new Date().toISOString().split('T')[0];
+  }
+}
+
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
   if (!Number.isFinite(n)) return null;
@@ -340,6 +359,7 @@ function formatDisplayDate(isoDate, tz = 'America/Toronto') {
 function stripRevenuePrefixes(input) {
   let s = String(input || '').trim();
   s = s.replace(/^(edit\s+)?revenue\s*:\s*/i, '');
+  s = s.replace(/^(edit\s+)?rev\s*:\s*/i, '');        // ✅ add
   s = s.replace(/^(edit\s+)?received\s*:\s*/i, '');
   s = s.replace(/^edit\s*:\s*/i, '');
   return s.trim();
@@ -369,27 +389,6 @@ function isIsoDate(s) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(s || '').trim());
 }
 
-function parseRelativeDateReply(input, tz) {
-  const t = String(input || '').trim().toLowerCase();
-  if (!t) return null;
-
-  if (t === 'today' || t === 'td' || t === 'now' || t === 'just now') {
-    return todayInTimeZone(tz);
-  }
-
-  if (t === 'yesterday') {
-    // tz-safe enough for our use: compute "yesterday" from todayInTimeZone
-    const today = todayInTimeZone(tz);
-    const d = new Date(`${today}T12:00:00Z`);
-    d.setUTCDate(d.getUTCDate() - 1);
-    return d.toISOString().slice(0, 10);
-  }
-
-  // accept ISO directly
-  if (isIsoDate(t)) return t;
-
-  return null;
-}
 
 function inferDateFromJust(originalText, tz) {
   const s = String(originalText || '').toLowerCase();
@@ -755,29 +754,118 @@ async function sendConfirmRevenueOrFallback(from, summaryLine, ctx = null) {
 }
 
 function extractIsoDateFromText(raw, tz) {
-  const s = String(raw || '').trim();
+  const s0 = String(raw || '').trim();
+  if (!s0) return null;
 
-  // 1) ISO already
-  const mIso = s.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
-  if (mIso) return mIso[1];
+  const s = s0.toLowerCase();
 
-  // 2) Month name formats: "November 1, 2025" / "Nov 1 2025"
-  const m = s.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(20\d{2})\b/i);
-  if (m) {
-    const mon = m[1].toLowerCase().slice(0, 3);
-    const day = String(m[2]).padStart(2, '0');
-    const year = m[3];
+  // -------------------------
+  // 0) Relative keywords
+  // -------------------------
+  if (/\btoday\b/.test(s)) return todayInTimeZone(tz);
 
-    const map = { jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12' };
-    const mm = map[mon];
-    if (mm) return `${year}-${mm}-${day}`;
+  if (/\byesterday\b/.test(s)) {
+    try {
+      const td = todayInTimeZone(tz);
+      const d = new Date(`${td}T12:00:00Z`);
+      d.setUTCDate(d.getUTCDate() - 1);
+      return d.toISOString().slice(0, 10);
+    } catch {}
   }
 
-  // 3) If they only say today/yesterday/etc, reuse your existing helper
-  const rel = typeof parseRelativeDateReply === 'function' ? parseRelativeDateReply(s, tz) : null;
-  return rel || null;
-}
+  if (/\btomorrow\b/.test(s)) {
+    try {
+      const td = todayInTimeZone(tz);
+      const d = new Date(`${td}T12:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + 1);
+      return d.toISOString().slice(0, 10);
+    } catch {}
+  }
 
+  // -------------------------
+  // 1) ISO already (YYYY-MM-DD)
+  // -------------------------
+  const mIso = s0.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+  if (mIso) return mIso[1];
+
+  // Remove trailing job clause to reduce accidental numeric date picks
+  const sNoJob = s0.replace(/\b(?:for\s+)?job\b\s*[:\-]?\s*[\s\S]*$/i, '').trim();
+
+  // For numeric parsing, strip currency symbols (prevents "$12/12/25" weirdness)
+  const sNum = sNoJob.replace(/\$/g, ' ');
+
+  // -------------------------
+  // 2) Month name formats:
+  // "November 1, 2025" / "Nov 1 2025"
+  // -------------------------
+  const mMon = sNoJob.match(
+    /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(20\d{2})\b/i
+  );
+  if (mMon) {
+    const mon = mMon[1].toLowerCase().slice(0, 3);
+    const dayNum = Number(mMon[2]);
+    const yearNum = Number(mMon[3]);
+
+    const map = {
+      jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+      jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12'
+    };
+    const mm = map[mon];
+    if (mm && dayNum >= 1 && dayNum <= 31 && yearNum >= 1900 && yearNum <= 2100) {
+      const dd = String(dayNum).padStart(2, '0');
+      return `${yearNum}-${mm}-${dd}`;
+    }
+  }
+
+  // -------------------------
+  // 3) Numeric formats:
+  // - YYYY/MM/DD
+  // - MM/DD/YYYY
+  // - MM/DD/YY (assume 20YY for 00-79)
+  // -------------------------
+
+  // a) YYYY/MM/DD
+  {
+    const m = sNum.match(/\b(20\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})\b/);
+    if (m) {
+      const yyyy = Number(m[1]);
+      const mm = Number(m[2]);
+      const dd = Number(m[3]);
+      if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+        return `${yyyy}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+      }
+    }
+  }
+
+  // b) MM/DD/YYYY
+  {
+    const m = sNum.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](20\d{2})\b/);
+    if (m) {
+      const mm = Number(m[1]);
+      const dd = Number(m[2]);
+      const yyyy = Number(m[3]);
+      if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+        return `${yyyy}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+      }
+    }
+  }
+
+  // c) MM/DD/YY
+  {
+    const m = sNum.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})\b/);
+    if (m) {
+      const mm = Number(m[1]);
+      const dd = Number(m[2]);
+      const yy = Number(m[3]);
+      if (mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
+        const yyyy = yy <= 79 ? 2000 + yy : 1900 + yy;
+        return `${yyyy}-${String(mm).padStart(2, '0')}-${String(dd).padStart(2, '0')}`;
+      }
+    }
+  }
+
+  return null;
+}
 // ---------------------------------------------
 // Revenue parsing hardening: prevent field bleed
 // ---------------------------------------------
@@ -2019,8 +2107,8 @@ function looksLikeRevenueConfirmEcho(raw) {
 
   const lc = s.toLowerCase();
 
-  // Must look like the confirm “shape”
-  const hasMoneyLine = /💰\s*\$?\s*[\d,]+(?:\.\d{2})?/.test(s);
+  // Must be the confirm “money line” shape (emoji + amount)
+const hasMoneyLine = /(^|\n)\s*💰\s*\$?\s*[\d,]+(?:\.\d{2})?\s*(\n|$)/.test(s);
   const hasDateLine =
     /📅/.test(s) ||
     /\b(20\d{2}-\d{2}-\d{2})\b/.test(lc) ||
@@ -2041,6 +2129,19 @@ function looksLikeRevenueConfirmEcho(raw) {
   if (startsWithRevenue && !/[\n\r]/.test(s) && s.length <= 60) return false;
 
   return false;
+}
+
+
+// ✅ Edit-mode wrapper: accept edits that omit "revenue" keyword
+function parseRevenueEditMessage(input, ctx) {
+  const s = String(input || '').trim();
+  if (!s) return null;
+
+  // If the user didn't start with revenue|rev|received, assume revenue in edit-mode
+  if (!/^(revenue|rev|received)\b/i.test(s)) {
+    return parseRevenueMessage(`revenue ${s}`, ctx);
+  }
+  return parseRevenueMessage(s, ctx);
 }
        // ---------------------------------------------------------
       // ✅ UN-SKIPPABLE EDIT CONSUMPTION (CONFIRM FLOW)
@@ -2102,8 +2203,7 @@ function looksLikeRevenueConfirmEcho(raw) {
         const shouldConsumeAsEditPayload =
           !!draftR && !isControl && (draftR.awaiting_edit || editRecentlyStarted);
 
-        if (shouldConsumeAsEditPayload) {
-
+       if (shouldConsumeAsEditPayload) {
   console.info('[REVENUE_EDIT_CONSUME_ENTER]', {
     awaiting_edit: !!draftR?.awaiting_edit,
     previousDraftDate: draftR?.date,
@@ -2111,118 +2211,170 @@ function looksLikeRevenueConfirmEcho(raw) {
   });
 
   const editInputRaw = String(input || '').trim();
-  const editInput = stripRevenuePrefixes(editInputRaw); // ✅ makes "Revenue 4580..." acceptable
-  const aiRes = await handleInputWithAI(from, editInput, 'revenue', parseRevenueMessage, REVENUE_DEFAULT_DATA, { tz });
-  let nextDraft = aiRes?.data || null;
+const editInput = stripRevenuePrefixes(editInputRaw);
+
+// ✅ If user typed a bare amount-first edit like "4590 Dec 12 2025 job ..."
+// keep a $ hint to make deterministic parsing more reliable
+const n0 = parseMoneyAmountFromText(editInputRaw);
+const editInputForParse =
+  n0 != null && !/\$/.test(editInput) ? `$${n0} ${editInput}` : editInput;
+
+
+  // ✅ Edit-mode tolerant parser: allows missing "revenue" prefix
+ const aiRes = await handleInputWithAI(
+  from,
+  editInput,
+  'revenue',
+  parseRevenueEditMessage,
+  REVENUE_DEFAULT_DATA,
+  { timezone: tz },             // ✅ IMPORTANT (not { tz })
+  {
+    disableCorrections: true,
+    disablePendingState: true
+  }
+);
+
+  // If AI returned a clarifying question (or object without data), surface it cleanly
+  if (!aiRes || typeof aiRes !== 'object') {
+    return out(
+      twimlText(
+        [
+          '✏️ I couldn’t read that edit.',
+          'Send the edited revenue in ONE message like:',
+          'revenue $4590 on Dec 12 2025 job 1556 Medway Park Dr',
+          'Reply "cancel" to discard.'
+        ].join('\n')
+      ),
+      false
+    );
+  }
+
+  if (!aiRes.data) {
+    const r = String(aiRes.reply || '').trim();
+    if (r) return out(twimlText(r), false);
+
+    // fallback if reply missing
+    return out(
+      twimlText(
+        [
+          '✏️ I’m missing something in that edit.',
+          'Send the edited revenue in ONE message like:',
+          'revenue $4590 on Dec 12 2025 job 1556 Medway Park Dr',
+          'Reply "cancel" to discard.'
+        ].join('\n')
+      ),
+      false
+    );
+  }
+
+  let nextDraft = aiRes.data || null;
   if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
+  if (!nextDraft || typeof nextDraft !== 'object') nextDraft = {};
 
-          if (!nextDraft || typeof nextDraft !== 'object') nextDraft = {};
+  // ✅ Amount backstop: parse from raw edit if AI missed it
+  if (!nextDraft.amount || nextDraft.amount === '$0.00') {
+    const n = parseMoneyAmountFromText(editInputRaw); // raw, not stripped
+    if (n != null) nextDraft.amount = formatMoneyDisplay(n);
+  }
 
-          if (!nextDraft.amount || nextDraft.amount === '$0.00') {
-  const n = parseMoneyAmountFromText(editInputRaw); // raw, not stripped
-  if (n != null) nextDraft.amount = formatMoneyDisplay(n);
+  // ✅ Date backstop: today/yesterday
+  if (!isIsoDate(nextDraft.date)) {
+    const t = String(input || '').toLowerCase();
+    if (/\btoday\b/.test(t)) nextDraft.date = todayInTimeZone(tz);
+    else if (/\byesterday\b/.test(t)) {
+      try {
+        const td = todayInTimeZone(tz);
+        const d = new Date(`${td}T12:00:00Z`);
+        d.setUTCDate(d.getUTCDate() - 1);
+        nextDraft.date = d.toISOString().slice(0, 10);
+      } catch {}
+    }
+  }
+
+  // ✅ Deterministic explicit date override during edit
+  const explicitIso = extractIsoDateFromText(input, tz);
+  if (explicitIso) nextDraft.date = explicitIso;
+
+  console.info('[REVENUE_EDIT_DATE_DEBUG]', {
+    oldDate: draftR?.date,
+    aiDate: aiRes?.data?.date,
+    normalizedDate: nextDraft?.date,
+    explicitIso
+  });
+
+  // cleanup: prevent job/date bleed into source
+  if (nextDraft?.source) {
+    nextDraft.source = stripJobClause(nextDraft.source);
+    if (isDateishSource(nextDraft.source)) nextDraft.source = '';
+  }
+
+  const missingAmountNow = !nextDraft?.amount || nextDraft.amount === '$0.00';
+  const missingDateNow = !isIsoDate(nextDraft?.date);
+
+  if (missingAmountNow || missingDateNow) {
+    const parts = [];
+    if (missingAmountNow) parts.push('amount');
+    if (missingDateNow) parts.push('date');
+
+    return out(
+      twimlText(
+        [
+          `I’m missing the ${parts.join(' and ')}.`,
+          `Send the edited revenue in ONE message like:`,
+          `revenue $4590 on Dec 12 2025 job 1556 Medway Park Dr`,
+          `Tip: the "$" helps.`,
+          `Reply "cancel" to discard.`
+        ].join('\n')
+      ),
+      false
+    );
+  }
+
+  const patchedDraft = {
+    ...(draftR || {}),
+    ...(nextDraft || {}),
+    draftText: String(input || '').trim(),
+    originalText: String(input || '').trim(),
+    awaiting_edit: false,
+    edit_started_at: null,
+    editStartedAt: null,
+    edit_flow_id: null
+  };
+
+  await upsertPA({
+    ownerId,
+    userId: paUserId,
+    kind: PA_KIND_CONFIRM,
+    payload: { ...(confirmPA?.payload || {}), draft: patchedDraft },
+    ttlSeconds: PA_TTL_CONFIRM_SEC
+  });
+
+  // Do NOT auto-confirm after edit
+  try {
+    if (typeof mergePendingTransactionState === 'function') {
+      await mergePendingTransactionState(paUserId, { _autoYesAfterEdit: false, _autoYesSourceMsgId: null });
+    }
+  } catch {}
+
+  const displayDate =
+    (typeof formatDisplayDate === 'function' ? formatDisplayDate(patchedDraft?.date, tz) : null) ||
+    String(patchedDraft?.date || '').trim() ||
+    '—';
+
+  const displayAmt = String(patchedDraft?.amount || '').trim() || '—';
+  const displayJob = String(patchedDraft?.jobName || '').trim() || '—';
+
+  const summaryLine = `💰 ${displayAmt}\n📅 ${displayDate}\n🧰 ${displayJob}`;
+
+  return await sendConfirmRevenueOrFallback(from, summaryLine, {
+    ownerId,
+    paUserId,
+    draft: patchedDraft,
+    confirmPayload: confirmPA?.payload || null,
+    type: 'revenue',
+    sourceMsgId: String(confirmPA?.payload?.sourceMsgId || safeMsgId || sourceMsgId || '').trim() || null
+  });
 }
-
-          if (!isIsoDate(nextDraft.date)) {
-            const t = String(input || '').toLowerCase();
-            if (/\btoday\b/.test(t)) nextDraft.date = todayInTimeZone(tz);
-            else if (/\byesterday\b/.test(t)) {
-              try {
-                const td = todayInTimeZone(tz);
-                const d = new Date(`${td}T12:00:00Z`);
-                d.setUTCDate(d.getUTCDate() - 1);
-                nextDraft.date = d.toISOString().slice(0, 10);
-              } catch {}
-            }
-          }
-// ✅ Deterministic explicit date override during edit
-// If user typed a real date, it must win over stale draft date.
-const explicitIso = extractIsoDateFromText(input, tz);
-if (explicitIso) nextDraft.date = explicitIso;
-console.info('[REVENUE_EDIT_DATE_DEBUG]', {
-  oldDate: draftR?.date,
-  aiDate: aiRes?.data?.date,
-  normalizedDate: nextDraft?.date,
-  explicitIso
-});
-          // cleanup: prevent job/date bleed into source
-          if (nextDraft?.source) {
-            nextDraft.source = stripJobClause(nextDraft.source);
-            if (isDateishSource(nextDraft.source)) nextDraft.source = '';
-          }
-
-          const missingAmountNow = !nextDraft?.amount || nextDraft.amount === '$0.00';
-const missingDateNow = !isIsoDate(nextDraft?.date);
-
-if (missingAmountNow || missingDateNow) {
-  const parts = [];
-  if (missingAmountNow) parts.push('amount');
-  if (missingDateNow) parts.push('date');
-
-  return out(
-    twimlText(
-      [
-        `I’m missing the ${parts.join(' and ')}.`,
-        `Send the edited revenue in ONE message like:`,
-        `revenue $4590 on Dec 12 2025 job 1556 Medway Park Dr`,
-        `Tip: the "$" helps.`,
-        `Reply "cancel" to discard.`
-      ].join('\n')
-    ),
-    false
-  );
-}
-console.info('[REVENUE_EDIT_DATE_DEBUG]', {
-  was: draftR?.date,
-  ai: aiRes?.data?.date,
-  normalized: nextDraft?.date,
-  explicitIso
-});
-          const patchedDraft = {
-            ...(draftR || {}),
-            ...(nextDraft || {}),
-            draftText: String(input || '').trim(),
-            originalText: String(input || '').trim(),
-            awaiting_edit: false,
-            edit_started_at: null,
-            editStartedAt: null,
-            edit_flow_id: null
-          };
-
-          await upsertPA({
-            ownerId,
-            userId: paUserId,
-            kind: PA_KIND_CONFIRM,
-            payload: { ...(confirmPA?.payload || {}), draft: patchedDraft },
-            ttlSeconds: PA_TTL_CONFIRM_SEC
-          });
-
-          // Do NOT auto-confirm after edit
-          try {
-            if (typeof mergePendingTransactionState === 'function') {
-              await mergePendingTransactionState(paUserId, { _autoYesAfterEdit: false, _autoYesSourceMsgId: null });
-            }
-          } catch {}
-
-          const displayDate =
-            (typeof formatDisplayDate === 'function' ? formatDisplayDate(patchedDraft?.date, tz) : null) ||
-            String(patchedDraft?.date || '').trim() ||
-            '—';
-
-          const displayAmt = String(patchedDraft?.amount || '').trim() || '—';
-          const displayJob = String(patchedDraft?.jobName || '').trim() || '—';
-
-          const summaryLine = `💰 ${displayAmt}\n📅 ${displayDate}\n🧰 ${displayJob}`;
-
-return await sendConfirmRevenueOrFallback(from, summaryLine, {
-  ownerId,
-  paUserId,
-  draft: patchedDraft,                 // ✅ correct: patched draft
-  confirmPayload: confirmPA?.payload || null, // ✅ confirmPA is in scope
-  type: 'revenue',
-  sourceMsgId: String(confirmPA?.payload?.sourceMsgId || safeMsgId || sourceMsgId || '').trim() || null
-});
-        }
 
         // if still awaiting_edit and user sent a control token, never nag
         if (draftR?.awaiting_edit && isControl) {
@@ -2744,7 +2896,14 @@ if (strictTok === 'yes') {
 
 // IMPORTANT: do NOT force date here, or it will prevent awaiting_date from ever triggering.
 // We want to know if the user explicitly provided a date.
-const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, REVENUE_DEFAULT_DATA, { tz });
+const aiRes = await handleInputWithAI(
+  from,
+  input,
+  'revenue',
+  parseRevenueMessage,
+  REVENUE_DEFAULT_DATA,
+  { timezone: tz }              // ✅ IMPORTANT
+);
 
 let data = aiRes?.data || null;
 // ---------------------------------------------------------
@@ -2796,38 +2955,18 @@ if (data?.source) {
 // ✅ Decide the date
 // --------------------
 
-// 1) If parser gave a usable ISO date, keep it
+// 1) If parser gave a usable ISO date (usually via tail), keep it
 let finalDate = isIsoDate(rawDateBeforeNormalize) ? rawDateBeforeNormalize : null;
 
-
-// 2) If user typed a relative date anywhere in the message, use it
+// 2) If user typed ANY explicit date anywhere in the message, use it
+// (includes: ISO, "Dec 12 2025", 12/12/2025, today/yesterday/tomorrow)
 if (!finalDate) {
-  const t = String(input || '').toLowerCase();
-  if (/\btoday\b/.test(t)) finalDate = todayInTimeZone(tz);
-  else if (/\byesterday\b/.test(t)) {
-    // if you have a helper for yesterday, use it; otherwise compute from todayInTimeZone
-    try {
-      const td = todayInTimeZone(tz);
-      const d = new Date(`${td}T12:00:00Z`);
-      d.setUTCDate(d.getUTCDate() - 1);
-      finalDate = d.toISOString().slice(0, 10);
-    } catch {}
-  } else {
-    const rel = parseRelativeDateReply(input, tz);
-    if (rel) finalDate = rel;
-  }
-}
-
-
-// 3) If user said "just" and still no date, treat as today
-if (!finalDate) {
-  const inferred = inferDateFromJust(input, tz);
-  if (inferred) finalDate = inferred;
+  const explicitIso = extractIsoDateFromText(input, tz);
+  if (explicitIso) finalDate = explicitIso;
 }
 
 // Apply chosen date (or keep null so we can latch awaiting_date)
 data.date = finalDate;
-
 // --------------------
 // ✅ Core parse checks
 // --------------------

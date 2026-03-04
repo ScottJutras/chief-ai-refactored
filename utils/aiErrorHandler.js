@@ -217,9 +217,9 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
   // normalize ctx to plain object
   ctx = ctx && typeof ctx === 'object' ? ctx : {};
 
-  // ✅ accept both { tz } and { timezone } callers
-  if (!ctx.tz && ctx.timezone) ctx.tz = ctx.timezone;
-
+ // ✅ accept tz from common caller shapes
+const tz = ctx?.tz || ctx?.timezone || ctx?.tz0 || null;
+if (!ctx.tz && tz) ctx.tz = tz;
   let rawInput = String(input ?? '');
 
   // Optional: transcript normalization hook (voice → deterministic-friendly)
@@ -247,22 +247,26 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
     data = null;
   }
 
-  // 2) If deterministic parse failed, ask for clarification (but keep revenue payer/source OPTIONAL)
+ // 2) If deterministic parse failed, ask for clarification (but keep revenue payer/source OPTIONAL)
 if (!data) {
   const proposed = await proposeClarification(rawInput, type);
 
-  // ✅ Hard override: never ask for "source" in revenue flow
-  // because job selection is the real "source" in contractor workflows.
   if (type === 'revenue') {
-    const r = String(proposed || '').toLowerCase();
+    const replyText = String(proposed?.reply || '').toLowerCase();
+
     const asksForSource =
-      r.includes('specify the source') ||
-      r.includes('source of the revenue') ||
-      (r.includes('what is the source') && r.includes('revenue')) ||
-      (r.includes('for example') && r.includes('from') && r.includes('on'));
+      replyText.includes('specify the source') ||
+      replyText.includes('source of the revenue') ||
+      (replyText.includes('what is the source') && replyText.includes('revenue')) ||
+      (replyText.includes('payer')) ||
+      (replyText.includes('client'));
 
     if (asksForSource) {
-      return `✅ Got it. Which job should I attach this to?\n\nReply with a job number/name, or "Overhead".`;
+      return {
+        data: null,
+        reply: `✅ Got it. Which job should I attach this to?\nReply with a job number/name, or "Overhead".`,
+        confirmed: false
+      };
     }
   }
 
@@ -302,12 +306,13 @@ if (!data) {
   if (errors) {
     // ✅ Edit-mode / confirm-mode: do NOT generate "issues" diffs or write pending state.
     if (disableCorrections || disablePendingState) {
-      return {
-        data: null,
-        reply: `I couldn't apply that edit yet. Please resend with amount + store + date (if changing date).`,
-        confirmed: false
-      };
-    }
+  const hint =
+    type === 'revenue'
+      ? `I couldn’t apply that edit yet. Please resend in ONE message with amount + date + job.\nExample: revenue $4590 on Dec 12 2025 job 1556 Medway Park Dr`
+      : `I couldn't apply that edit yet. Please resend with the missing details.`;
+
+  return { data: null, reply: hint, confirmed: false };
+}
 
     const corrections = await correctErrorsWithAI(
       `Type=${type} Errors=${JSON.stringify(errors)} Data=${JSON.stringify(data)} Ctx=${JSON.stringify(ctx || {})}`,

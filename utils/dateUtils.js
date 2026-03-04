@@ -45,9 +45,37 @@ function parseNaturalDate(s, tz) {
   // strict ISO
   if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return t;
 
-  // “December 12, 2025”, “Dec 12 2025”, etc.
-  const parsed = Date.parse(s);
-  if (!Number.isNaN(parsed)) return new Date(parsed).toISOString().split('T')[0];
+   // “December 12, 2025”, “Dec 12 2025”, etc. — avoid Date.parse() timezone drift
+  {
+    const mm = String(s || '').trim().match(/^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{4})$/);
+    if (mm) {
+      const monRaw = mm[1].toLowerCase();
+      const day = Number(mm[2]);
+      const year = Number(mm[3]);
+
+      const months = {
+        jan: 1, january: 1,
+        feb: 2, february: 2,
+        mar: 3, march: 3,
+        apr: 4, april: 4,
+        may: 5,
+        jun: 6, june: 6,
+        jul: 7, july: 7,
+        aug: 8, august: 8,
+        sep: 9, sept: 9, september: 9,
+        oct: 10, october: 10,
+        nov: 11, november: 11,
+        dec: 12, december: 12
+      };
+
+      const month = months[monRaw];
+      if (month && day >= 1 && day <= 31 && year >= 1900 && year <= 2100) {
+        const mm2 = String(month).padStart(2, '0');
+        const dd2 = String(day).padStart(2, '0');
+        return `${year}-${mm2}-${dd2}`;
+      }
+    }
+  }
 
   return null;
 }

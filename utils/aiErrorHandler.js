@@ -37,22 +37,49 @@ function coerceJson(maybeJson) {
 
 /**
  * Enforce the “Ingestion-only” system instruction.
+ * ✅ Revenue: "source/payer/client" is OPTIONAL. Prefer job attachment.
  */
 function ingestionSystemPrompt(type) {
+  const isRevenue = String(type || '').toLowerCase() === 'revenue';
+
   return `
 You are the Ingestion Layer for ChiefOS. You record facts only.
-You do NOT provide business-wide analytics, advice, KPIs, or answers to global questions.
+You do NOT provide analytics, advice, KPIs, or answers to global questions.
+
 Your ONLY job is to either:
 (1) extract structured fields for a single ${type} record, OR
-(2) ask a single clarifying question needed to extract those fields.
+(2) ask ONE clarifying question needed to extract those fields.
 
 Output MUST be JSON only. No markdown. No extra text.
+
+CRITICAL RULES:
+- Never ask more than ONE question.
+- Never ask for fields that are optional.
+
+${isRevenue ? `
+REVENUE-SPECIFIC RULES:
+- "source"/"payer"/"client" is OPTIONAL and must NOT block ingestion.
+- If you must ask a question, prefer this order:
+  1) Which job should this be attached to? (job name/number or "Overhead")
+  2) What date did you receive it? (today/yesterday/YYYY-MM-DD)
+  3) What amount was received?
+- Do NOT ask "Please specify the source of the revenue".
+` : ``}
+
+JSON OUTPUT SHAPE:
+{
+  "data": object | null,
+  "reply": string | null,
+  "confirmed": boolean
+}
 `;
 }
 
 
 /**
  * For parse failures: return a helpful example + one clarifying question.
+ * ✅ Revenue special-case: never ask for "source/payer/client".
+ *    In contractor workflows, "job" is the critical attachment; payer is optional.
  */
 async function proposeClarification(input, type) {
   const prompt = `
@@ -72,13 +99,52 @@ The reply must:
 - give ONE concrete example command the user can copy
 - ask ONE clarifying question
 - be short (1-3 sentences)
+
+${String(type || '').toLowerCase() === 'revenue' ? `
+REVENUE CLARIFIER CONSTRAINT:
+- Do NOT ask for payer/source/client.
+- Ask ONLY one of:
+  - "Which job should I attach this to? (job number/name or Overhead)"
+  - "What date did you receive it? (today/yesterday/YYYY-MM-DD)"
+  - "What amount was received?"
+` : ``}
 `;
+
   const raw = await callOpenAI(prompt, input, process.env.INGESTION_MODEL || 'gpt-4o', 200, 0.2);
   const parsed = coerceJson(raw);
+
+  // ✅ Revenue: sanitize AI clarifiers that ask for "source/payer/client"
+  if (type === 'revenue') {
+    const r0 = String(parsed?.reply || '').trim();
+    const r = r0.toLowerCase();
+
+    const asksForSource =
+      r.includes('specify the source') ||
+      r.includes('source of the revenue') ||
+      r.includes('what is the source') ||
+      r.includes('payer') ||
+      r.includes('client');
+
+    if (asksForSource) {
+      return {
+        data: null,
+        reply: `✅ Got it. Which job should I attach this to?\nReply with a job number/name, or "Overhead".`,
+        confirmed: false
+      };
+    }
+  }
 
   if (parsed && typeof parsed.reply === 'string') return parsed;
 
   // Safe fallback
+  if (type === 'revenue') {
+    return {
+      data: null,
+      reply: `✅ Got it. Which job should I attach this to?\nReply with a job number/name, or "Overhead".`,
+      confirmed: false
+    };
+  }
+
   return {
     data: null,
     reply: `I couldn't log that ${type} yet. Example: "expense 84.12 nails from Home Depot". What was the amount?`,
@@ -181,17 +247,27 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
     data = null;
   }
 
-  // 2) If deterministic parse failed, ask for clarification (but still ingestion-only)
-  if (!data) {
-    return await proposeClarification(rawInput, type);
+  // 2) If deterministic parse failed, ask for clarification (but keep revenue payer/source OPTIONAL)
+if (!data) {
+  const proposed = await proposeClarification(rawInput, type);
+
+  // ✅ Hard override: never ask for "source" in revenue flow
+  // because job selection is the real "source" in contractor workflows.
+  if (type === 'revenue') {
+    const r = String(proposed || '').toLowerCase();
+    const asksForSource =
+      r.includes('specify the source') ||
+      r.includes('source of the revenue') ||
+      (r.includes('what is the source') && r.includes('revenue')) ||
+      (r.includes('for example') && r.includes('from') && r.includes('on'));
+
+    if (asksForSource) {
+      return `✅ Got it. Which job should I attach this to?\n\nReply with a job number/name, or "Overhead".`;
+    }
   }
 
-  // 2b) Apply default fields if missing (non-destructive)
-  if (defaultData && typeof defaultData === 'object') {
-    data = { ...defaultData, ...stripUndefined(data) };
-  } else {
-    data = stripUndefined(data);
-  }
+  return proposed;
+}
 
   // 3) Detect structural errors (missing fields etc.)
   let errors = null;
@@ -454,25 +530,49 @@ function parseBillMessage(input) {
 /**
  * parseRevenueMessage(input, ctx?)
  * Supports tz-aware date tail via stripDateTail(body, tz).
+ *
+ * ✅ IMPORTANT: Do NOT default date to "today" here.
+ * Revenue.js decides date explicitly (and can latch awaiting_date).
  */
 function parseRevenueMessage(input, ctx = {}) {
   const text = String(input || '').trim();
-
   const lower = text.toLowerCase();
   if (!/^(revenue|rev|received)\b/i.test(lower)) return null;
 
   const tz = ctx?.tz || ctx?.timezone || null;
 
   const body = text.replace(/^(revenue|rev|received)\b\s*/i, '').trim();
-
   const { rest, date } = stripDateTail(body, tz);
-  const d = date || todayInTimeZone(tz || 'UTC');
+
+  // ✅ keep null unless user explicitly provided a date tail
+  const d = date || null;
 
   const asAmount = (amt) => {
     const n = Number(String(amt).replace(/[^0-9.]/g, ''));
-    if (!Number.isFinite(n)) return null;
+    if (!Number.isFinite(n) || n <= 0) return null;
     return `$${n.toFixed(2)}`;
   };
+
+  // ------------------------------------------------------------
+  // ✅ Pattern 0: Amount-only (common): "4500" or "$4500"
+  // (date tail may already be stripped into `d`)
+  // Example: "revenue 4500 November 2, 2025" -> rest="4500", d="2025-11-02"
+  // ------------------------------------------------------------
+  {
+    const m0 = rest.match(/^\$?(?<amt>\d+(?:\.\d{1,2})?)$/);
+    if (m0?.groups?.amt) {
+      const amount = asAmount(m0.groups.amt);
+      if (!amount) return null;
+
+      return stripUndefined({
+        date: d, // may be null; revenue.js decides whether to latch awaiting_date
+        description: 'Revenue received',
+        amount,
+        source: 'Unknown'
+        // jobName intentionally omitted so revenue.js can resolve active job or open picker
+      });
+    }
+  }
 
   // Pattern A: "$500 for X" OR "$500 from X"
   let m = rest.match(/^\$?(?<amt>\d+(?:\.\d{1,2})?)\s+(?:(?<kw>from|for)\s+)?(?<src>.+)$/i);
@@ -482,7 +582,7 @@ function parseRevenueMessage(input, ctx = {}) {
     const amount = asAmount(m.groups.amt);
     if (!amount) return null;
 
-    // ✅ If "for ..." treat as jobName (supports "... job")
+    // ✅ If "for ..." treat as jobName
     if (kw === 'for') {
       const jobName = normalizeJobNameCandidate(src);
       return stripUndefined({

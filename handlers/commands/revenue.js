@@ -417,8 +417,10 @@ d.date = String(d.date || '').trim() || null;
   const desc = String(d.description || '').trim();
   d.description = desc || 'Revenue received';
 
-  const src = String(d.source || '').trim();
-  d.source = src || 'Unknown';
+  // ✅ Payer/source is OPTIONAL in MVP (job is the primary dimension).
+// Keep it null/empty if not provided; only default to "Unknown" at DB insert time.
+const src = String(d.source || '').trim();
+d.source = src || null;
 
   if (d.jobName != null) {
   d.jobName = normalizeJobNameCandidate(d.jobName);
@@ -1337,7 +1339,8 @@ const JOBS_PER_PAGE = Math.min(8, Math.max(1, Number(pageSize || 8)));
 
   rows.push({ id: 'overhead', title: 'Overhead', description: 'Not tied to a job' });
   if (hasMore) rows.push({ id: 'more', title: 'More jobs…', description: 'Show next page' });
-
+  // ✅ Hard cap: Twilio list rows max (protects against accidental oversize)
+rows.splice(10);
   const bodyText =
     `Pick a job (${start + 1}-${Math.min(start + JOBS_PER_PAGE, clean.length)} of ${clean.length}).` +
     `\n\nTip: You can also reply with a number (like "1").`;
@@ -2569,9 +2572,10 @@ const defaultData = {
   date: null, // ✅ allow missing date so we can latch awaiting_date
   description: 'Revenue received',
   amount: '$0.00',
-  source: 'Unknown'
+  source: null,   // ✅ payer/source is OPTIONAL (do not seed AI with "Unknown")
+  jobName: null,  // ✅ make intent explicit to the model
+  jobSource: null
 };
-
 const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
 
 let data = aiRes?.data || null;
@@ -2586,7 +2590,23 @@ if (!data || typeof data !== 'object') {
 
 
 let aiReply = aiRes?.reply || null;
+// ---------------------------------------------------------
+// ✅ Ignore AI clarifiers about payer/source (optional in MVP)
+// We only want AI clarifiers when amount is missing.
+// Job is resolved deterministically (active job / picker).
+// ---------------------------------------------------------
+try {
+  const r = String(aiReply || '').toLowerCase();
+  const hasSourceClarifier =
+    r.includes('specify the source') ||
+    (r.includes('source of the revenue') && r.includes('for example'));
 
+  // If AI is asking about source, drop the reply and continue the deterministic flow
+  if (hasSourceClarifier) {
+    console.info('[REVENUE] ignoring AI source-clarifier (source optional)');
+    aiReply = null;
+  }
+} catch {}
 // Track whether we had a real date BEFORE normalization defaults
 const rawDateBeforeNormalize = data?.date != null ? String(data.date).trim() : '';
 
@@ -2658,13 +2678,13 @@ if (!data?.amount || data.amount === '$0.00') {
 // --------------------
 // ✅ Core parse checks
 // --------------------
-const missingCore = !data || !data.amount || data.amount === '$0.00';
-if (aiReply && missingCore) return out(twimlText(aiReply), false);
+const missingAmount = !data || !data.amount || data.amount === '$0.00';
+if (aiReply && missingAmount) return out(twimlText(aiReply), false);
 
 
-if (missingCore) {
+if (missingAmount) {
   return out(
-    twimlText(`🤔 Couldn’t parse a revenue from "${input}". Try "received $2500 from ClientName today for <job>".`),
+    twimlText(`🤔 Couldn’t parse a revenue from "${input}". Try "received $2500 today for <job>".`),
     false
   );
 }

@@ -806,17 +806,30 @@ function isDateishSource(s) {
   return false;
 }
 function parseMoneyAmountFromText(text) {
-  const s = String(text || '');
+  const s = String(text || '').trim();
+  if (!s) return null;
 
-  // Match: $16,890  |  $16890  |  $16,890.50
-  const m = s.match(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/);
-  if (!m) return null;
+  // 1) Prefer explicit currency: $16,890  |  $16890  |  $16,890.50
+  let m = s.match(/\$\s*(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)/);
+  if (m?.[1]) {
+    const raw = String(m[1]).replace(/,/g, '').trim();
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
 
-  const raw = String(m[1] || '').replace(/,/g, '').trim();
-  const n = Number(raw);
+  // 2) No "$": capture a "money-like" number near the start, but avoid years (2025)
+  // Works for: "Revenue 4590 Dec 12 2025 ..." and "4590 Dec 12 2025 ..."
+  // Rejects: 20xx years, tiny day numbers, etc.
+  const head = s.toLowerCase().replace(/^(edit\s+)?(revenue|received|paid|deposit|payment)\b[:\s-]*/i, '');
 
-  if (!Number.isFinite(n) || n <= 0) return null;
-  return n;
+  // First big-ish number token that isn't a year
+  m = head.match(/\b(?!20\d{2}\b)(\d{3,9})(?:\.\d{1,2})?\b/);
+  if (m?.[1]) {
+    const n = Number(String(m[1]).replace(/,/g, ''));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
+  return null;
 }
 
 
@@ -2138,13 +2151,27 @@ console.info('[REVENUE_EDIT_DATE_DEBUG]', {
             if (isDateishSource(nextDraft.source)) nextDraft.source = '';
           }
 
-          const missingCore = !nextDraft || !nextDraft.amount || nextDraft.amount === '$0.00';
-          if (missingCore) {
-            return out(
-              twimlText(aiRes?.reply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
-              false
-            );
-          }
+          const missingAmountNow = !nextDraft?.amount || nextDraft.amount === '$0.00';
+const missingDateNow = !isIsoDate(nextDraft?.date);
+
+if (missingAmountNow || missingDateNow) {
+  const parts = [];
+  if (missingAmountNow) parts.push('amount');
+  if (missingDateNow) parts.push('date');
+
+  return out(
+    twimlText(
+      [
+        `I’m missing the ${parts.join(' and ')}.`,
+        `Send the edited revenue in ONE message like:`,
+        `revenue $4590 on Dec 12 2025 job 1556 Medway Park Dr`,
+        `Tip: the "$" helps.`,
+        `Reply "cancel" to discard.`
+      ].join('\n')
+    ),
+    false
+  );
+}
 console.info('[REVENUE_EDIT_DATE_DEBUG]', {
   was: draftR?.date,
   ai: aiRes?.data?.date,

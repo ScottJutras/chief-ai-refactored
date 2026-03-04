@@ -1661,10 +1661,19 @@ const REVENUE_DEFAULT_DATA = Object.freeze({
 /* ---------------- main handler ---------------- */
 
 async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId, twilioMeta = null) {
-  input = stripRevenuePrefixes(input);
+  // ✅ always define a safe inbound first (even if stripRevenuePrefixes changes later)
+  const inbound0 = String(input ?? '').trim();
+
+  // normalize input for the handler
+  input = stripRevenuePrefixes(inbound0);
+
+  // ✅ canonical handler-scope rawInput AFTER normalization
+  const rawInput = String(input ?? '').trim();
 
   twilioMeta = twilioMeta && typeof twilioMeta === 'object' ? twilioMeta : {};
-const plan = getEffectivePlanFromOwner(ownerProfile);
+  const plan = getEffectivePlanFromOwner(ownerProfile);
+
+
   // ✅ Canonical PA key (digits) — prefer WaId, then userProfile, then from
   const paUserId =
     (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(twilioMeta?.WaId || twilioMeta?.WaID || twilioMeta?.waid)) ||
@@ -1677,9 +1686,9 @@ const plan = getEffectivePlanFromOwner(ownerProfile);
   const safeMsgId = msgSid || String(sourceMsgId || '').trim() || String(`${paUserId}:${Date.now()}`).trim();
 
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
-  
+
   try {
-    
+        
  // ---- 1) Awaiting job pick ----
 const pickPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }).catch(() => null);
 const allowCreateJob = !!pickPA?.payload?.allowCreateJob;
@@ -1694,7 +1703,7 @@ if (
     try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }); } catch {}
     try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
   } else {
-const raw0 = String(input || '').trim();
+const raw0 = rawInput; // ✅ reuse canonical inbound
 const rawLc = raw0.toLowerCase();
 const tok = normalizeDecisionToken(raw0);
 const jobOptions = Array.isArray(pickPA.payload.jobOptions) ? pickPA.payload.jobOptions : [];
@@ -3170,13 +3179,15 @@ return await sendConfirmRevenueOrFallback(from, confirmText, {
 
 
   } catch (error) {
-    console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {
-      code: error?.code,
-      detail: error?.detail,
-      constraint: error?.constraint
-    });
-    return out(twimlText('⚠️ Error logging revenue. Please try again.'), false);
-  }
+  console.error(`[ERROR] handleRevenue failed for ${from}:`, error?.message, {
+    name: error?.name,
+    stack: error?.stack, // ✅ shows exact line
+    code: error?.code,
+    detail: error?.detail,
+    constraint: error?.constraint
+  });
+  return out(twimlText('⚠️ Error logging revenue. Please try again.'), false);
+}
 }
 
 module.exports = { handleRevenue };

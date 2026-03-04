@@ -303,24 +303,6 @@ const todayInTimeZone =
     return new Date().toISOString().split('T')[0];
   });
 
-/**
- * Timezone-aware "today" (YYYY-MM-DD) using Intl.
- * If tz is invalid or Intl fails, fall back to server time.
- */
-function todayInTimeZone(tz) {
-  try {
-    const dtf = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit'
-    });
-    // en-CA yields YYYY-MM-DD
-    return dtf.format(new Date());
-  } catch {
-    return new Date().toISOString().split('T')[0];
-  }
-}
 
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));

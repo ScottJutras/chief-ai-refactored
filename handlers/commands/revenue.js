@@ -1478,6 +1478,14 @@ const plan = getEffectivePlanFromOwner(ownerProfile);
   const safeMsgId = msgSid || String(sourceMsgId || '').trim() || String(`${paUserId}:${Date.now()}`).trim();
 
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
+  const REVENUE_DEFAULT_DATA = {
+  date: null,
+  description: 'Revenue received',
+  amount: '$0.00',
+  source: null,
+  jobName: null,
+  jobSource: null
+};
 
   try {
     
@@ -1956,7 +1964,7 @@ function looksLikeRevenueConfirmEcho(raw) {
     input: String(input || '').slice(0, 120)
   });
 
-  const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
+  const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, REVENUE_DEFAULT_DATA, { tz });
   let nextDraft = aiRes?.data || null;
   if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
 

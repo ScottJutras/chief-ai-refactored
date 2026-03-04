@@ -1832,6 +1832,51 @@ if (isMore) {
 
       const strictTok = strictDecisionToken(input);
       // ---------------------------------------------------------
+// ✅ CONFIRM-SUMMARY ECHO GUARD (CONFIRM FLOW)
+// If user sends back the formatted confirm summary (often after Edit),
+// do NOT treat it as a new "revenue ..." intake.
+// Instead: re-send the confirm card (resume behavior).
+// ---------------------------------------------------------
+function looksLikeRevenueConfirmEcho(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return false;
+
+  const lc = s.toLowerCase();
+
+  // Common patterns you generate:
+  // "Revenue\n💰 $X\n📅 ...\n🧰 ..."
+  const startsWithRevenue = /^revenue\b/i.test(s);
+  const hasMoneyLine = /💰\s*\$?\s*\d/.test(s);
+  const hasDateLine = /📅/.test(s) || /\b(20\d{2}-\d{2}-\d{2})\b/.test(s);
+  const hasJobLine = /🧰/.test(s);
+
+  // If it contains the confirm "shape", treat it as echo.
+  if (startsWithRevenue && hasMoneyLine && (hasDateLine || hasJobLine)) return true;
+
+  // Also catch cases where they paste just the emoji block (no "Revenue" header)
+  if (hasMoneyLine && hasDateLine && hasJobLine && s.length <= 220) return true;
+
+  return false;
+}
+
+try {
+  // Only when confirm exists and it's not a strict control token
+  if (!strictTok && confirmPA?.payload?.draft) {
+    const echo = looksLikeRevenueConfirmEcho(input);
+
+    if (echo) {
+      console.info('[REVENUE_CONFIRM_ECHO_GUARD]', {
+        head: String(input || '').slice(0, 60)
+      });
+
+      // Re-send confirm as a "resume" (no state changes)
+      return await resendConfirmRevenue({ from, ownerId, tz, paUserId });
+    }
+  }
+} catch (e) {
+  console.warn('[REVENUE_CONFIRM_ECHO_GUARD] failed (ignored):', e?.message);
+}
+      // ---------------------------------------------------------
 // ✅ UN-SKIPPABLE DATE CONSUMPTION (CONFIRM FLOW):
 // If draft is awaiting_date, consume ANY non-control inbound
 // as the date payload and update confirm draft.

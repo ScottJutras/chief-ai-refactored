@@ -642,7 +642,29 @@ async function sendConfirmRevenueOrFallback(from, summaryLine) {
     return sendConfirmRevenueTwiML(from, summaryLine);
   }
 }
+function extractIsoDateFromText(raw, tz) {
+  const s = String(raw || '').trim();
 
+  // 1) ISO already
+  const mIso = s.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+  if (mIso) return mIso[1];
+
+  // 2) Month name formats: "November 1, 2025" / "Nov 1 2025"
+  const m = s.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})(?:st|nd|rd|th)?[,]?\s+(20\d{2})\b/i);
+  if (m) {
+    const mon = m[1].toLowerCase().slice(0, 3);
+    const day = String(m[2]).padStart(2, '0');
+    const year = m[3];
+
+    const map = { jan:'01', feb:'02', mar:'03', apr:'04', may:'05', jun:'06', jul:'07', aug:'08', sep:'09', oct:'10', nov:'11', dec:'12' };
+    const mm = map[mon];
+    if (mm) return `${year}-${mm}-${day}`;
+  }
+
+  // 3) If they only say today/yesterday/etc, reuse your existing helper
+  const rel = typeof parseRelativeDateReply === 'function' ? parseRelativeDateReply(s, tz) : null;
+  return rel || null;
+}
 
 // ---------------------------------------------
 // Revenue parsing hardening: prevent field bleed
@@ -1927,16 +1949,16 @@ function looksLikeRevenueConfirmEcho(raw) {
           !!draftR && !isControl && (draftR.awaiting_edit || editRecentlyStarted);
 
         if (shouldConsumeAsEditPayload) {
-          const defaultData = {
-            date: todayInTimeZone(tz),
-            description: 'Revenue received',
-            amount: '$0.00',
-            source: 'Unknown'
-          };
 
-          const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
-          let nextDraft = aiRes?.data || null;
-          if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
+  console.info('[REVENUE_EDIT_CONSUME_ENTER]', {
+    awaiting_edit: !!draftR?.awaiting_edit,
+    previousDraftDate: draftR?.date,
+    input: String(input || '').slice(0, 120)
+  });
+
+  const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
+  let nextDraft = aiRes?.data || null;
+  if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
 
           if (!nextDraft || typeof nextDraft !== 'object') nextDraft = {};
 
@@ -1957,7 +1979,16 @@ function looksLikeRevenueConfirmEcho(raw) {
               } catch {}
             }
           }
-
+// ✅ Deterministic explicit date override during edit
+// If user typed a real date, it must win over stale draft date.
+const explicitIso = extractIsoDateFromText(input, tz);
+if (explicitIso) nextDraft.date = explicitIso;
+console.info('[REVENUE_EDIT_DATE_DEBUG]', {
+  oldDate: draftR?.date,
+  aiDate: aiRes?.data?.date,
+  normalizedDate: nextDraft?.date,
+  explicitIso
+});
           // cleanup: prevent job/date bleed into source
           if (nextDraft?.source) {
             nextDraft.source = stripJobClause(nextDraft.source);
@@ -1971,7 +2002,12 @@ function looksLikeRevenueConfirmEcho(raw) {
               false
             );
           }
-
+console.info('[REVENUE_EDIT_DATE_DEBUG]', {
+  was: draftR?.date,
+  ai: aiRes?.data?.date,
+  normalized: nextDraft?.date,
+  explicitIso
+});
           const patchedDraft = {
             ...(draftR || {}),
             ...(nextDraft || {}),
@@ -2294,7 +2330,11 @@ function looksLikeRevenueConfirmEcho(raw) {
     // Keep your existing cents helpers
     const amountCents = Math.round(amountNum * 100);
 
-    const dateStr = String(data?.date || '').trim();
+    // Prefer normalized date, but fallback to rawDraft if normalization ever drops it
+const dateStr =
+  String(data?.date || '').trim() ||
+  String(rawDraft?.date || '').trim() ||
+  '';
     if (!dateStr) {
       return out(twimlText(`I’m missing the date. Reply like: "on 2026-01-13".`), false);
     }

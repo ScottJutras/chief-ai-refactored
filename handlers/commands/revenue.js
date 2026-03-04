@@ -1458,6 +1458,14 @@ function looksLikeNewRevenueText(s = '') {
     /\$?\s*\d+(\.\d{1,2})?\b/.test(lc)
   );
 }
+const REVENUE_DEFAULT_DATA = Object.freeze({
+  date: null,
+  description: 'Revenue received',
+  amount: '$0.00',
+  source: null,
+  jobName: null,
+  jobSource: null
+});
 
 /* ---------------- main handler ---------------- */
 
@@ -1478,15 +1486,7 @@ const plan = getEffectivePlanFromOwner(ownerProfile);
   const safeMsgId = msgSid || String(sourceMsgId || '').trim() || String(`${paUserId}:${Date.now()}`).trim();
 
   const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
-  const REVENUE_DEFAULT_DATA = {
-  date: null,
-  description: 'Revenue received',
-  amount: '$0.00',
-  source: null,
-  jobName: null,
-  jobSource: null
-};
-
+  
   try {
     
  // ---- 1) Awaiting job pick ----
@@ -2596,15 +2596,7 @@ try {
 
 // IMPORTANT: do NOT force date here, or it will prevent awaiting_date from ever triggering.
 // We want to know if the user explicitly provided a date.
-const defaultData = {
-  date: null, // ✅ allow missing date so we can latch awaiting_date
-  description: 'Revenue received',
-  amount: '$0.00',
-  source: null,   // ✅ payer/source is OPTIONAL (do not seed AI with "Unknown")
-  jobName: null,  // ✅ make intent explicit to the model
-  jobSource: null
-};
-const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, defaultData, { tz });
+const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, REVENUE_DEFAULT_DATA, { tz });
 
 let data = aiRes?.data || null;
 // ---------------------------------------------------------
@@ -2613,7 +2605,7 @@ let data = aiRes?.data || null;
 // Never mutate `data` unless it's an object.
 // ---------------------------------------------------------
 if (!data || typeof data !== 'object') {
-  data = { ...(defaultData || {}) };
+  data = { ...(REVENUE_DEFAULT_DATA) };
 }
 
 

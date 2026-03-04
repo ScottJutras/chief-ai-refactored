@@ -217,10 +217,9 @@ async function handleInputWithAI(from, input, type, parseFn, defaultData = {}, c
   // normalize ctx to plain object
   ctx = ctx && typeof ctx === 'object' ? ctx : {};
 
- // ✅ accept tz from common caller shapes
-const tz = ctx?.tz || ctx?.timezone || ctx?.tz0 || null;
-if (!ctx.tz && tz) ctx.tz = tz;
-  let rawInput = String(input ?? '');
+ // ✅ accept both { tz }, { timezone }, { tz0 }
+if (!ctx.tz && ctx.timezone) ctx.tz = ctx.timezone;
+if (!ctx.tz && ctx.tz0) ctx.tz = ctx.tz0;
 
   // Optional: transcript normalization hook (voice → deterministic-friendly)
   // Safe: only applies if module exists and exposes a normalizer.
@@ -258,8 +257,8 @@ if (!data) {
       replyText.includes('specify the source') ||
       replyText.includes('source of the revenue') ||
       (replyText.includes('what is the source') && replyText.includes('revenue')) ||
-      (replyText.includes('payer')) ||
-      (replyText.includes('client'));
+      replyText.includes('payer') ||
+      replyText.includes('client');
 
     if (asksForSource) {
       return {
@@ -273,10 +272,21 @@ if (!data) {
   return proposed;
 }
 
-  // 3) Detect structural errors (missing fields etc.)
-  let errors = null;
-  try {
-    errors = await detectErrorsImpl(data, type, ctx);
+// ---------------------------------------------------------
+// ✅ Edit / confirm mode shortcut
+// - Do NOT run detectErrors
+// - Caller (revenue.js) handles validation + confirm logic
+// ---------------------------------------------------------
+const skipDetect = disableCorrections || disablePendingState;
+
+if (skipDetect) {
+  return { data, reply: null, confirmed: true };
+}
+
+// 3) Detect structural errors (missing fields etc.)
+let errors = null;
+try {
+  errors = await detectErrorsImpl(data, type, ctx);;
 
     if (Array.isArray(errors)) {
       const hard = errors.filter((e) => String(e?.severity || 'hard') === 'hard');

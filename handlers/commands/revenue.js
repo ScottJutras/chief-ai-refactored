@@ -1,35 +1,44 @@
 // handlers/commands/revenue.js
 // COMPLETE DROP-IN (BETA-ready; aligned to expense.js identity + picker-state safety)
-//
-// ✅ Key alignments in this drop-in:
-// - ✅ Canonical PA identity: uses paUserId (digits/WaId) for ALL getPA/upsertPA/deletePA (never "from").
-// - ✅ Picker state stores: sentRows + jobOptions + confirmDraft snapshot (so picker taps can recover confirm).
-// - ✅ Picker tap resolver uses Twilio ListTitle name-match FIRST (fixes "#6 happy street" mapping bugs),
-//   then falls back to ix mapping, then stable jobno_ tokens.
-// - ✅ Confirm flow supports: yes / edit / cancel / resume / skip / change_job
-// - ✅ Auto-yes flag is ONLY set after a successful edit payload is applied (never during DB ops).
-//
-// Signature expected by router:
-//   handleRevenue(from, input, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId, twilioMeta)
 
 const pg = require('../../services/postgres');
 const state = require('../../utils/stateManager');
 
+// ✅ Always use aiErrorHandler as the single source of truth for parsing + tz helpers
 const ai = require('../../utils/aiErrorHandler');
+
+// ✅ Use these exact references so we don't accidentally call a shadowed/local parser
 const handleInputWithAI = ai.handleInputWithAI;
 const parseRevenueMessage = ai.parseRevenueMessage;
+
+// ✅ IMPORTANT: do NOT redeclare todayInTimeZone anywhere else in this file.
+// Use the shared helper (or pg.todayInTZ if it exists).
+const todayInTimeZone =
+  (typeof pg.todayInTZ === 'function' && pg.todayInTZ) ||
+  ai.todayInTimeZone ||
+  ((tz = 'America/Toronto') => {
+    try {
+      const dtf = new Intl.DateTimeFormat('en-CA', {
+        timeZone: tz,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      });
+      const s = dtf.format(new Date());
+      if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    } catch {}
+    return new Date().toISOString().split('T')[0];
+  });
+
 const {
   sendWhatsAppInteractiveList,
   sendWhatsAppTemplate,
   toTemplateVar
 } = require('../../services/twilio');
 
-
 const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
 const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
-const { getEffectivePlanFromOwner } = require("../../src/config/effectivePlan");
-
-
+const { getEffectivePlanFromOwner } = require('../../src/config/effectivePlan');
 
 // ---- CIL validator (fail-open) ----
 const cilMod = require('../../cil');
@@ -291,19 +300,6 @@ async function resendConfirmRevenue({ from, ownerId, tz, paUserId } = {}) {
 }
 
 /* ---------------- Date / money helpers ---------------- */
-
-const todayInTimeZone =
-  (typeof pg.todayInTZ === 'function' && pg.todayInTZ) ||
-  ((tz = 'America/Toronto') => {
-    try {
-      const dtf = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-      const s = dtf.format(new Date());
-      if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-    } catch {}
-    return new Date().toISOString().split('T')[0];
-  });
-
-
 function toCents(amountStr) {
   const n = Number(String(amountStr || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
   if (!Number.isFinite(n)) return null;
@@ -2114,12 +2110,10 @@ const hasMoneyLine = /(^|\n)\s*💰\s*\$?\s*[\d,]+(?:\.\d{2})?\s*(\n|$)/.test(s)
 }
 
 
-// ✅ Edit-mode wrapper: accept edits that omit "revenue" keyword
 function parseRevenueEditMessage(input, ctx) {
   const s = String(input || '').trim();
   if (!s) return null;
 
-  // If the user didn't start with revenue|rev|received, assume revenue in edit-mode
   if (!/^(revenue|rev|received)\b/i.test(s)) {
     return parseRevenueMessage(`revenue ${s}`, ctx);
   }

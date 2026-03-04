@@ -1975,7 +1975,8 @@ if (/^(?:what('?s)?\s+my\s+)?owner\s*id\b|^where do i get my owner id\??$/.test(
 // - Routes to Chief/agent guidance (or SOP) instead
 // -----------------------------------------------------------------------
 {
-
+  // ✅ define raw ONCE (fixes "raw is not defined")
+  const raw = String(text2 || '').trim();
   const s = raw.toLowerCase();
 
   const howStem =
@@ -1987,14 +1988,17 @@ if (/^(?:what('?s)?\s+my\s+)?owner\s*id\b|^where do i get my owner id\??$/.test(
   const mentionsDomain =
     /\b(expense|exp|revenue|rev|income|sale|task|time|clock|timesheet|job|jobs)\b/i.test(raw);
 
-  const looksHowTo = (howStem || /\?\s*$/.test(raw)) && (mentionsLog || howStem) && mentionsDomain;
+  // "how do I log..." OR "?" + domain mention
+  const looksHowTo =
+    (howStem || /\?\s*$/.test(raw)) &&
+    (mentionsDomain && (mentionsLog || howStem));
 
   if (looksHowTo) {
     try {
       // Prefer agent for natural help
       const { answerChief } = require("../services/answerChief");
 
-      const out = await answerChief({
+      const outA = await answerChief({
         ownerId: req.ownerId,
         actorKey: req.actorKey || req.from,
         text: raw,
@@ -2013,7 +2017,7 @@ if (/^(?:what('?s)?\s+my\s+)?owner\s*id\b|^where do i get my owner id\??$/.test(
         }
       });
 
-      const msg = String(out?.answer || "").trim();
+      const msg = String(outA?.answer || "").trim();
       if (msg) return ok(res, msg);
     } catch (e) {
       console.warn("[HOWTO] answerChief failed (fallback):", e?.message);
@@ -2023,9 +2027,10 @@ if (/^(?:what('?s)?\s+my\s+)?owner\s*id\b|^where do i get my owner id\??$/.test(
     return ok(
       res,
       [
-        "To log an expense, just text something like:",
+        "To log something, just text it like this:",
         "",
         "• expense $52 Home Depot lumber today",
+        "• revenue $4500 deposit for job 1556 on 2025-11-02",
         "",
         "That’s it."
       ].join("\n")
@@ -2784,72 +2789,43 @@ try {
 
 // -----------------------------------------------------------------------
 // ✅ Canonical PA user key (match handlers/commands/* strategy)
-// - Prefer WaId (digits) then from (digits)
-// - Never leave stray expressions; uid must be a single canonical string
+// - Prefer WaId digits (Twilio WhatsApp id) then from digits
+// - Fall back to raw from if digits missing (never null)
 // -----------------------------------------------------------------------
-const uid =
-  (typeof normalizeIdentityDigits === 'function' &&
-    normalizeIdentityDigits(req.body?.WaId || req.body?.WaID || req.body?.waid)) ||
-  (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(req.from)) ||
-  String(req.body?.WaId || req.body?.WaID || req.body?.waid || req.from || '')
-    .replace(/\D/g, '')
-    .trim() ||
-  String(req.from || '').trim();
+function canonicalPAUserKey(req) {
+  const wa =
+    String(req?.body?.WaId || req?.body?.WaID || req?.body?.waid || '').trim();
+
+  const fromRaw = String(req?.from || '').trim();
+
+  // Prefer existing helper if present
+  const waDigits =
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(wa)) ||
+    wa.replace(/\D/g, '');
+
+  const fromDigits =
+    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(fromRaw)) ||
+    fromRaw.replace(/\D/g, '');
+
+  // Choose canonical key
+  const uid =
+    (waDigits && waDigits.trim()) ||
+    (fromDigits && fromDigits.trim()) ||
+    fromRaw;
+
+  return String(uid || '').trim();
+}
+
+const uid = canonicalPAUserKey(req);
 
 console.info('[ROUTER_PA_UID]', {
   uid,
-  from: req.from,
-  waId: req.body?.WaId || req.body?.WaID || req.body?.waid,
-  ownerId: req.ownerId
+  from: String(req.from || '').trim(),
+  waId: String(req.body?.WaId || req.body?.WaID || req.body?.waid || '').trim(),
+  ownerId: String(req.ownerId || '').trim()
 });
 
-// -----------------------------------------------------------------------
-// ✅ Money PA presence (DO NOT rely on mostRecentPAKind)
-// - This is the authoritative guard to prevent job.js hijacks
-// -----------------------------------------------------------------------
-let moneyPAHere = false;
-let moneyPAKind = null;
 
-try {
-  const ownerId = req.ownerId;
-
-  const [
-    paPickExpense,
-    paPickRevenue,
-    paConfirmExpense,
-    paConfirmRevenue
-  ] = await Promise.all([
-    getPA({ ownerId, userId: uid, kind: 'pick_job_for_expense' }).catch(() => null),
-    getPA({ ownerId, userId: uid, kind: 'pick_job_for_revenue' }).catch(() => null),
-    getPA({ ownerId, userId: uid, kind: 'confirm_expense' }).catch(() => null),
-    getPA({ ownerId, userId: uid, kind: 'confirm_revenue' }).catch(() => null)
-  ]);
-
-  const has =
-    !!(paPickExpense?.payload) ||
-    !!(paPickRevenue?.payload) ||
-    !!(paConfirmExpense?.payload) ||
-    !!(paConfirmRevenue?.payload);
-
-  moneyPAHere = has;
-
-  // optional: track which one (useful logs)
-  moneyPAKind =
-    (paPickRevenue?.payload && 'pick_job_for_revenue') ||
-    (paConfirmRevenue?.payload && 'confirm_revenue') ||
-    (paPickExpense?.payload && 'pick_job_for_expense') ||
-    (paConfirmExpense?.payload && 'confirm_expense') ||
-    null;
-
-  console.info('[ROUTER_MONEY_PA]', {
-    moneyPAHere,
-    moneyPAKind
-  });
-} catch (e) {
-  console.warn('[ROUTER_MONEY_PA] check failed (ignored):', e?.message);
-  moneyPAHere = false;
-  moneyPAKind = null;
-}
 
 // -----------------------------------------------------------------------
 // ✅ Pending Action: fetch ONCE early and reuse everywhere
@@ -3176,86 +3152,83 @@ if (hasPendingMedia && numMedia === 0) {
   console.info('[ROUTER_HARD_TIME_POST_MEDIA]', { lcN: lc2.slice(0, 50), isHardTimeCommand });
 }
 
-/* -----------------------------------------------------------------------
- * ✅ HARD JOB COMMANDS (router-level)
- * - Avoid hijacking money PA flows (expense/revenue pick/confirm)
- * - Still allow explicit job commands when NOT in a money flow
- * - Still allow job delete confirms to route to job.js
- * ----------------------------------------------------------------------- */
+// -----------------------------------------------------------------------
+// ✅ Money PA presence (authoritative)
+// - Compute ONCE, reuse everywhere.
+// - Prevents job.js hijacks during revenue/expense pick/confirm.
+// -----------------------------------------------------------------------
+let moneyPAHere = false;
+let moneyPAKind = null;
+
+try {
+  const ownerId = req.ownerId;
+
+  const [
+    paPickExpense,
+    paPickRevenue,
+    paConfirmExpense,
+    paConfirmRevenue
+  ] = await Promise.all([
+    getPA({ ownerId, userId: uid, kind: 'pick_job_for_expense' }).catch(() => null),
+    getPA({ ownerId, userId: uid, kind: 'pick_job_for_revenue' }).catch(() => null),
+    getPA({ ownerId, userId: uid, kind: 'confirm_expense' }).catch(() => null),
+    getPA({ ownerId, userId: uid, kind: 'confirm_revenue' }).catch(() => null)
+  ]);
+
+  moneyPAHere = !!(
+    paPickExpense?.payload ||
+    paPickRevenue?.payload ||
+    paConfirmExpense?.payload ||
+    paConfirmRevenue?.payload
+  );
+
+  moneyPAKind =
+    (paPickRevenue?.payload && 'pick_job_for_revenue') ||
+    (paConfirmRevenue?.payload && 'confirm_revenue') ||
+    (paPickExpense?.payload && 'pick_job_for_expense') ||
+    (paConfirmExpense?.payload && 'confirm_expense') ||
+    null;
+
+  console.info('[ROUTER_MONEY_PA]', { moneyPAHere, moneyPAKind });
+} catch (e) {
+  console.warn('[ROUTER_MONEY_PA] check failed (ignored):', e?.message);
+  moneyPAHere = false;
+  moneyPAKind = null;
+}
+
+// -----------------------------------------------------------------------
+// ✅ HARD JOB COMMANDS (router-level)
+// - Avoid hijacking money flows
+// - Still allow job delete confirm routing
+// -----------------------------------------------------------------------
 try {
   const lcJob = String(lc2 || '').trim().toLowerCase();
   const hardJob = isHardJobCommand(lcJob);
 
-  // ✅ If a job-delete confirm is pending, job handler must receive "yes"/"cancel".
+  // If a job-delete confirm is pending, job handler must receive "yes/cancel"
   const hasPendingJobDeleteConfirm = !!pending?.awaitingJobDeleteConfirm;
 
-  // -----------------------------------------------------------------------
-  // ✅ Canonical PA user key (match handlers/commands/*)
-  // -----------------------------------------------------------------------
-  const uid =
-    (typeof normalizeIdentityDigits === 'function' &&
-      normalizeIdentityDigits(req.body?.WaId || req.body?.WaID || req.body?.waid)) ||
-    (typeof normalizeIdentityDigits === 'function' && normalizeIdentityDigits(req.from)) ||
-    String(req.body?.WaId || req.body?.WaID || req.body?.waid || req.from || '')
-      .replace(/\D/g, '')
-      .trim() ||
-    String(req.from || '').trim();
+  // If money flow is active, "change job" belongs to revenue/expense handler
+  const isChangeJobPhrase = /^\s*(change\s+job|switch\s+job|pick\s+job)\s*$/i.test(lcJob);
 
-  console.info('[ROUTER_PA_UID]', {
-    uid,
-    from: req.from,
-    waId: req.body?.WaId || req.body?.WaID || req.body?.waid,
-    ownerId: req.ownerId
-  });
-
-  // -----------------------------------------------------------------------
-  // ✅ Money PA presence (authoritative)
-  // -----------------------------------------------------------------------
-  let moneyPAHere = false;
-  try {
-    const ownerId = req.ownerId;
-
-    const [paPickExpense, paPickRevenue, paConfirmExpense, paConfirmRevenue] = await Promise.all([
-      getPA({ ownerId, userId: uid, kind: 'pick_job_for_expense' }).catch(() => null),
-      getPA({ ownerId, userId: uid, kind: 'pick_job_for_revenue' }).catch(() => null),
-      getPA({ ownerId, userId: uid, kind: 'confirm_expense' }).catch(() => null),
-      getPA({ ownerId, userId: uid, kind: 'confirm_revenue' }).catch(() => null)
-    ]);
-
-    moneyPAHere = !!(
-      paPickExpense?.payload ||
-      paPickRevenue?.payload ||
-      paConfirmExpense?.payload ||
-      paConfirmRevenue?.payload
-    );
-  } catch (e) {
-    console.warn('[ROUTER_HARD_JOB] money PA lookup failed (ignore):', e?.message);
-    moneyPAHere = false;
-  }
-
-  // ✅ If money flow is active, "change job" belongs to revenue/expense handler, not job.js
-  const changeJobInMoneyFlow =
-    moneyPAHere && /^\s*(change\s+job|switch\s+job|pick\s+job)\s*$/i.test(lcJob);
-
-  // ✅ Special guard: "job 1556" (or "job #1556") should NOT go to job.js if money PA exists
+  // Treat "job 1556" as a selector (never route to job.js while money PA exists)
   const looksLikeJobSelector = /^\s*job\s+#?\d+\b/i.test(lcJob);
   const blockJobSelectorDuringMoneyFlow = moneyPAHere && looksLikeJobSelector;
 
-  // -----------------------------------------------------------------------
-  // ✅ Routing decision
-  // - job delete confirm wins (so "yes/cancel" goes to job.js)
-  // - otherwise only route to job.js if it's a hard job command AND we’re not in money flow
-  // -----------------------------------------------------------------------
+  // Routing decision:
+  // - delete confirm wins (even if moneyPAHere is true)
+  // - otherwise only route to job.js if it’s a hard job command AND no money flow
   const shouldRouteToJob =
     hasPendingJobDeleteConfirm ||
-    (hardJob && !moneyPAHere && !changeJobInMoneyFlow);
+    (hardJob && !moneyPAHere && !isChangeJobPhrase);
 
   console.info('[ROUTER_HARD_JOB]', {
     lcN: lcJob.slice(0, 50),
     hardJob,
     moneyPAHere,
+    moneyPAKind,
     hasPendingJobDeleteConfirm,
-    changeJobInMoneyFlow,
+    isChangeJobPhrase,
     looksLikeJobSelector,
     blockJobSelectorDuringMoneyFlow,
     shouldRouteToJob: shouldRouteToJob && !blockJobSelectorDuringMoneyFlow

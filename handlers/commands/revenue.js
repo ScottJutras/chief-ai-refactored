@@ -61,6 +61,13 @@ const PA_KIND_PICK_JOB = 'pick_job_for_revenue';
 const PA_TTL_MIN = Number(process.env.PENDING_TTL_MIN || 10);
 const PA_TTL_SEC = PA_TTL_MIN * 60;
 
+// New (override per-kind)
+const PA_TTL_CONFIRM_MIN = Number(process.env.PENDING_CONFIRM_TTL_MIN || 30);
+const PA_TTL_CONFIRM_SEC = PA_TTL_CONFIRM_MIN * 60;
+
+const PA_TTL_PICK_MIN = Number(process.env.PENDING_PICK_TTL_MIN || 15);
+const PA_TTL_PICK_SEC = PA_TTL_PICK_MIN * 60;
+
 const ENABLE_INTERACTIVE_LIST = (() => {
   const raw = process.env.TWILIO_ENABLE_INTERACTIVE_LIST ?? process.env.TWILIO_ENABLE_LIST_PICKER ?? 'true';
   return String(raw).trim().toLowerCase() !== 'false';
@@ -141,7 +148,7 @@ async function upsertPA({ ownerId, userId, kind, payload, ttlSeconds = PA_TTL_SE
   const k = String(kind || '').trim();
   if (!owner || !user || !k) return;
 
-  const ttl = Number(ttlSeconds || PA_TTL_SEC) || PA_TTL_SEC;
+  const ttl = Number(ttlSeconds || PA_TTL_PICK_SEC) || PA_TTL_PICK_SEC;
 
   if (pgUpsertPendingActionByKind) {
     try {
@@ -634,7 +641,40 @@ async function sendConfirmRevenueTemplateOrFallback(from, summaryLine) {
   }
 }
 
-async function sendConfirmRevenueOrFallback(from, summaryLine) {
+async function sendConfirmRevenueOrFallback(from, summaryLine, ctx = null) {
+  // ✅ Refresh confirm TTL (best effort) whenever we re-send confirm
+  try {
+    if (ctx?.ownerId && ctx?.paUserId) {
+      const payload =
+        (ctx?.confirmPayload && typeof ctx.confirmPayload === 'object') ? { ...ctx.confirmPayload } : {};
+
+      const draft =
+        (ctx?.draft && typeof ctx.draft === 'object') ? { ...ctx.draft }
+        : (payload?.draft && typeof payload.draft === 'object') ? { ...payload.draft }
+        : null;
+
+      if (draft) {
+        await upsertPA({
+          ownerId: ctx.ownerId,
+          userId: ctx.paUserId,
+          kind: PA_KIND_CONFIRM,
+          payload: {
+            ...(payload || {}),
+            draft,
+            humanLine: summaryLine,
+            sentAt: Date.now(),
+            // preserve these if present
+            sourceMsgId: payload?.sourceMsgId || ctx?.sourceMsgId || null,
+            type: payload?.type || ctx?.type || 'revenue'
+          },
+          ttlSeconds: PA_TTL_CONFIRM_SEC
+        });
+      }
+    }
+  } catch (e) {
+    console.warn('[REVENUE_CONFIRM] ttl refresh failed (ignored):', e?.message);
+  }
+
   try {
     return await sendConfirmRevenueTemplateOrFallback(from, summaryLine);
   } catch (e) {
@@ -642,6 +682,7 @@ async function sendConfirmRevenueOrFallback(from, summaryLine) {
     return sendConfirmRevenueTwiML(from, summaryLine);
   }
 }
+
 function extractIsoDateFromText(raw, tz) {
   const s = String(raw || '').trim();
 
@@ -1340,7 +1381,7 @@ const JOBS_PER_PAGE = Math.min(8, Math.max(1, Number(pageSize || 8)));
       confirmDraft: confirmDraftSnap,
       lastPickerMsgSid: null    // ✅ will be set if interactive succeeds
     },
-    ttlSeconds: PA_TTL_SEC
+    ttlSeconds: PA_TTL_PICK_SEC
   });
 
   if (!ENABLE_INTERACTIVE_LIST || !to) {
@@ -1393,7 +1434,7 @@ rows.splice(10);
           userId: userKey,
           kind: PA_KIND_PICK_JOB,
           payload: { ...(pa0.payload || {}), lastPickerMsgSid },
-          ttlSeconds: PA_TTL_SEC
+          ttlSeconds: PA_TTL_PICK_SEC
         });
       }
     } catch {}
@@ -1518,7 +1559,7 @@ const listRowId = String(twilioMeta?.ListRowId || twilioMeta?.ListId || '').trim
 const isMore = tok === 'more' || rawLc === 'more' || listRowId === 'more';
 
 // TTL / stale → resend page 0
-if (!sentAt || (Date.now() - sentAt) > (PA_TTL_SEC * 1000)) {
+if (!sentAt || (Date.now() - sentAt) > (PA_TTL_PICK_SEC * 1000)) {
   return await sendJobPickerOrFallback({
     from,
     ownerId,
@@ -1577,7 +1618,7 @@ if (isMore) {
               userId: paUserId,
               kind: PA_KIND_CONFIRM,
               payload: { draft: pickPA.payload.confirmDraft, sourceMsgId: safeMsgId, type: 'revenue' },
-              ttlSeconds: PA_TTL_SEC
+              ttlSeconds: PA_TTL_CONFIRM_SEC
             }).catch(() => null);
 
             confirm = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
@@ -1599,7 +1640,7 @@ if (isMore) {
             userId: paUserId,
             kind: PA_KIND_CONFIRM,
             payload: { ...(confirm.payload || {}), draft },
-            ttlSeconds: PA_TTL_SEC
+            ttlSeconds: PA_TTL_CONFIRM_SEC
           });
 
           await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }).catch(() => null);
@@ -1612,7 +1653,14 @@ if (isMore) {
             tz
           });
 
-          return await sendConfirmRevenueOrFallback(from, summaryLine);
+          return await sendConfirmRevenueOrFallback(from, summaryLine, {
+  ownerId,
+  paUserId,
+  draft,
+  confirmPayload: confirm?.payload || null,
+  type: 'revenue',
+  sourceMsgId: String(confirm?.payload?.sourceMsgId || safeMsgId || sourceMsgId || '').trim() || null
+});
         }
 
         // Otherwise create first job from typed name
@@ -1658,7 +1706,7 @@ if (isMore) {
             userId: paUserId,
             kind: PA_KIND_CONFIRM,
             payload: { draft: pickPA.payload.confirmDraft, sourceMsgId: safeMsgId, type: 'revenue' },
-            ttlSeconds: PA_TTL_SEC
+            ttlSeconds: PA_TTL_CONFIRM_SEC
           }).catch(() => null);
 
           confirm = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
@@ -1680,7 +1728,7 @@ if (isMore) {
           userId: paUserId,
           kind: PA_KIND_CONFIRM,
           payload: { ...(confirm.payload || {}), draft },
-          ttlSeconds: PA_TTL_SEC
+          ttlSeconds: PA_TTL_CONFIRM_SEC
         });
 
         await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }).catch(() => null);
@@ -1693,7 +1741,14 @@ if (isMore) {
           tz
         });
 
-        return await sendConfirmRevenueOrFallback(from, summaryLine);
+        return await sendConfirmRevenueOrFallback(from, summaryLine, {
+  ownerId,
+  paUserId,
+  draft,
+  confirmPayload: confirm?.payload || null,
+  type: 'revenue',
+  sourceMsgId: String(confirm?.payload?.sourceMsgId || safeMsgId || sourceMsgId || '').trim() || null
+});
       }
     }
 
@@ -1751,7 +1806,7 @@ if (isMore) {
         userId: paUserId,
         kind: PA_KIND_PICK_JOB,
         payload: { ...(pickPA.payload || {}), lastInboundTextRaw: input, lastInboundText: rawInput },
-        ttlSeconds: PA_TTL_SEC
+        ttlSeconds: PA_TTL_PICK_SEC
       });
     } catch {}
 
@@ -1772,7 +1827,7 @@ if (isMore) {
           userId: paUserId,
           kind: PA_KIND_CONFIRM,
           payload: { draft: fallbackDraft, sourceMsgId: safeMsgId, type: 'revenue' },
-          ttlSeconds: PA_TTL_SEC
+          ttlSeconds: PA_TTL_CONFIRM_SEC
         }).catch(() => null);
 
         confirm = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
@@ -1813,7 +1868,7 @@ if (isMore) {
       userId: paUserId,
       kind: PA_KIND_CONFIRM,
       payload: { ...(confirm.payload || {}), draft },
-      ttlSeconds: PA_TTL_SEC
+      ttlSeconds: PA_TTL_CONFIRM_SEC
     });
 
     await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }).catch(() => null);
@@ -1834,7 +1889,7 @@ if (isMore) {
         userId: paUserId,
         kind: PA_KIND_CONFIRM,
         payload: { ...(confirm.payload || {}), humanLine: summaryLine, draft },
-        ttlSeconds: PA_TTL_SEC
+        ttlSeconds: PA_TTL_CONFIRM_SEC
       });
     } catch {}
 
@@ -1844,7 +1899,14 @@ if (isMore) {
       job_no: draft.job_no ?? null
     });
 
-    return await sendConfirmRevenueOrFallback(from, summaryLine);
+    return await sendConfirmRevenueOrFallback(from, summaryLine, {
+  ownerId,
+  paUserId,
+  draft,
+  confirmPayload: confirm?.payload || null,
+  type: 'revenue',
+  sourceMsgId: String(confirm?.payload?.sourceMsgId || safeMsgId || sourceMsgId || '').trim() || null
+});
   }
 }
 
@@ -1964,16 +2026,18 @@ function looksLikeRevenueConfirmEcho(raw) {
     input: String(input || '').slice(0, 120)
   });
 
-  const aiRes = await handleInputWithAI(from, input, 'revenue', parseRevenueMessage, REVENUE_DEFAULT_DATA, { tz });
+  const editInputRaw = String(input || '').trim();
+  const editInput = stripRevenuePrefixes(editInputRaw); // ✅ makes "Revenue 4580..." acceptable
+  const aiRes = await handleInputWithAI(from, editInput, 'revenue', parseRevenueMessage, REVENUE_DEFAULT_DATA, { tz });
   let nextDraft = aiRes?.data || null;
   if (nextDraft) nextDraft = normalizeRevenueData(nextDraft, tz);
 
           if (!nextDraft || typeof nextDraft !== 'object') nextDraft = {};
 
           if (!nextDraft.amount || nextDraft.amount === '$0.00') {
-            const n = parseMoneyAmountFromText(input);
-            if (n != null) nextDraft.amount = formatMoneyDisplay(n);
-          }
+  const n = parseMoneyAmountFromText(editInputRaw); // raw, not stripped
+  if (n != null) nextDraft.amount = formatMoneyDisplay(n);
+}
 
           if (!isIsoDate(nextDraft.date)) {
             const t = String(input || '').toLowerCase();
@@ -2032,7 +2096,7 @@ console.info('[REVENUE_EDIT_DATE_DEBUG]', {
             userId: paUserId,
             kind: PA_KIND_CONFIRM,
             payload: { ...(confirmPA?.payload || {}), draft: patchedDraft },
-            ttlSeconds: PA_TTL_SEC
+            ttlSeconds: PA_TTL_CONFIRM_SEC
           });
 
           // Do NOT auto-confirm after edit
@@ -2051,7 +2115,15 @@ console.info('[REVENUE_EDIT_DATE_DEBUG]', {
           const displayJob = String(patchedDraft?.jobName || '').trim() || '—';
 
           const summaryLine = `💰 ${displayAmt}\n📅 ${displayDate}\n🧰 ${displayJob}`;
-          return await sendConfirmRevenueOrFallback(from, summaryLine);
+
+return await sendConfirmRevenueOrFallback(from, summaryLine, {
+  ownerId,
+  paUserId,
+  draft: patchedDraft,                 // ✅ correct: patched draft
+  confirmPayload: confirmPA?.payload || null, // ✅ confirmPA is in scope
+  type: 'revenue',
+  sourceMsgId: String(confirmPA?.payload?.sourceMsgId || safeMsgId || sourceMsgId || '').trim() || null
+});
         }
 
         // if still awaiting_edit and user sent a control token, never nag
@@ -2092,8 +2164,23 @@ console.info('[REVENUE_EDIT_DATE_DEBUG]', {
         } catch (e) {
           console.warn('[REVENUE] resume confirm resend failed:', e?.message);
           const d = confirmPA?.payload?.draft || {};
-          const line = buildRevenueSummaryLine({ amount: d.amount, source: d.source, date: d.date, jobName: d.jobName, tz }) || 'Confirm revenue?';
-          return await sendConfirmRevenueOrFallback(from, line);
+const line =
+  buildRevenueSummaryLine({
+    amount: d.amount,
+    source: d.source,
+    date: d.date,
+    jobName: d.jobName,
+    tz
+  }) || 'Confirm revenue?';
+
+return await sendConfirmRevenueOrFallback(from, line, {
+  ownerId,
+  paUserId,
+  draft: d,                             // ✅ correct draft
+  confirmPayload: confirmPA?.payload || null,
+  type: 'revenue',
+  sourceMsgId: String(confirmPA?.payload?.sourceMsgId || sourceMsgId || '').trim() || null
+});
         }
       }
 
@@ -2166,7 +2253,7 @@ console.info('[REVENUE_EDIT_DATE_DEBUG]', {
         jobOptions: [],
         confirmDraft: confirmPA?.payload?.draft || null
       },
-      ttlSeconds: PA_TTL_SEC
+      ttlSeconds: PA_TTL_PICK_SEC
     });
 
     return out(
@@ -2219,7 +2306,7 @@ console.info('[REVENUE_EDIT_DATE_DEBUG]', {
             String(confirmPA?.payload?.sourceMsgId || stableMsgId || '').trim() || null
         }
       },
-      ttlSeconds: PA_TTL_SEC
+      ttlSeconds: PA_TTL_CONFIRM_SEC
     });
   } catch {}
 
@@ -2261,70 +2348,78 @@ console.info('[REVENUE_EDIT_DATE_DEBUG]', {
     return out(twimlText('❌ Operation cancelled.'), false);
   }
 
- if (strictTok === 'yes') {
+ 
+if (strictTok === 'yes') {
   console.info('[REVENUE_YES_ENTER]', {
     ownerId,
     paUserId,
     from,
-    hasConfirmPA: !!confirmPA?.payload,
-    hasDraft: !!confirmPA?.payload?.draft,
-    awaiting_edit: !!confirmPA?.payload?.draft?.awaiting_edit,
-    awaiting_date: !!confirmPA?.payload?.draft?.awaiting_date
+    msgSid: String(twilioMeta?.MessageSid || twilioMeta?.SmsMessageSid || '').trim() || null
   });
+
   try {
     // Always operate on freshest confirm PA
     let confirmPAFresh = null;
-  try {
-    confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
-  } catch (e) {
-    console.warn('[REVENUE_YES] getPA failed:', e?.message);
-    confirmPAFresh = confirmPA || null;
-  }
-
-  const rawDraft =
-    confirmPAFresh?.payload?.draft && typeof confirmPAFresh.payload.draft === 'object'
-      ? { ...confirmPAFresh.payload.draft }
-      : null;
-
-  console.info('[REVENUE_YES_DRAFT]', {
-    hasDraft: !!rawDraft,
-    keys: rawDraft ? Object.keys(rawDraft).slice(0, 25) : [],
-    amount: rawDraft?.amount,
-    date: rawDraft?.date,
-    jobName: rawDraft?.jobName,
-    job_no: rawDraft?.job_no,
-    job_id: rawDraft?.job_id,
-    awaiting_edit: !!rawDraft?.awaiting_edit,
-    awaiting_date: !!rawDraft?.awaiting_date
-  });
-
-    if (!rawDraft || !Object.keys(rawDraft).length) {
-      return out(twimlText(`I didn’t find a revenue draft to submit. Reply "resume" to see what’s pending.`), false);
+    try {
+      confirmPAFresh = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM });
+    } catch (e) {
+      console.warn('[REVENUE_YES] getPA failed:', e?.message);
+      confirmPAFresh = confirmPA || null;
     }
 
-    // ✅ if user is in edit mode, do NOT submit
-    if (rawDraft?.awaiting_edit) {
-    return out(
-      twimlText(
-        [
-          '✏️ I’m still waiting for your edited revenue details in ONE message.',
-          'Example:',
-          'revenue $2500 on Jan 13 2026 job Oak Street Re-roof',
-          'Reply "cancel" to discard.'
-        ].join('\n')
-      ),
-      false
-    );
-  }
+    const rawDraft =
+      confirmPAFresh?.payload?.draft && typeof confirmPAFresh.payload.draft === 'object'
+        ? { ...confirmPAFresh.payload.draft }
+        : null;
 
-  if (rawDraft?.awaiting_date) {
-    return out(
-      twimlText(
-        `📅 I still need the date.\nReply "today", "yesterday", or "2026-01-13".`
-      ),
-      false
-    );
-  }
+    // ✅ If confirm is gone (expired / cleared), DO NOT fall through to agent
+    if (!rawDraft || !Object.keys(rawDraft).length) {
+      return out(
+        twimlText(
+          [
+            '⏱️ That confirmation expired.',
+            'Please resend the revenue in one message.',
+            'Example: revenue $4580 on Dec 21 2025 job 1556 Medway Park Dr'
+          ].join('\n')
+        ),
+        false
+      );
+    }
+
+    console.info('[REVENUE_YES_DRAFT]', {
+      hasDraft: !!rawDraft,
+      keys: Object.keys(rawDraft).slice(0, 25),
+      amount: rawDraft?.amount,
+      date: rawDraft?.date,
+      jobName: rawDraft?.jobName,
+      job_no: rawDraft?.job_no,
+      job_id: rawDraft?.job_id,
+      awaiting_edit: !!rawDraft?.awaiting_edit,
+      awaiting_date: !!rawDraft?.awaiting_date
+    });
+
+    // ✅ If user is still in edit mode, do NOT submit
+    if (rawDraft?.awaiting_edit) {
+      return out(
+        twimlText(
+          [
+            '✏️ I’m still waiting for your edited revenue details in ONE message.',
+            'Example:',
+            'revenue $2500 on Jan 13 2026 job Oak Street Re-roof',
+            'Reply "cancel" to discard.'
+          ].join('\n')
+        ),
+        false
+      );
+    }
+
+    // ✅ If waiting for date, do NOT submit
+    if (rawDraft?.awaiting_date) {
+      return out(
+        twimlText(`📅 I still need the date.\nReply "today", "yesterday", or "2026-01-13".`),
+        false
+      );
+    }
 
     // Normalize draft
     let data = normalizeRevenueData(rawDraft, tz);
@@ -2334,15 +2429,14 @@ console.info('[REVENUE_EDIT_DATE_DEBUG]', {
     if (!amountNum || amountNum <= 0) {
       return out(twimlText('I couldn’t read the amount. Reply "edit" and resend the amount.'), false);
     }
-
-    // Keep your existing cents helpers
     const amountCents = Math.round(amountNum * 100);
 
     // Prefer normalized date, but fallback to rawDraft if normalization ever drops it
-const dateStr =
-  String(data?.date || '').trim() ||
-  String(rawDraft?.date || '').trim() ||
-  '';
+    const dateStr =
+      String(data?.date || '').trim() ||
+      String(rawDraft?.date || '').trim() ||
+      '';
+
     if (!dateStr) {
       return out(twimlText(`I’m missing the date. Reply like: "on 2026-01-13".`), false);
     }
@@ -2370,6 +2464,17 @@ const dateStr =
     if (!jobName) {
       const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
       if (!jobs.length) return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
+
+      // refresh confirm TTL while we’re here (best-effort)
+      try {
+        await upsertPA({
+          ownerId,
+          userId: paUserId,
+          kind: PA_KIND_CONFIRM,
+          payload: { ...(confirmPAFresh?.payload || {}), draft: rawDraft, sentAt: Date.now() },
+          ttlSeconds: PA_TTL_CONFIRM_SEC
+        });
+      } catch {}
 
       return await sendJobPickerOrFallback({
         from,
@@ -2430,139 +2535,84 @@ const dateStr =
 
     const insertFn = typeof pg.insertTransaction === 'function' ? pg.insertTransaction : insertTransaction;
 
-// ✅ IMPORTANT: ensure we pass numeric-friendly amount values
-const ins = await insertFn({
-  ownerId,
-  owner_id: ownerId,
-  userId: paUserId,
-  user_id: paUserId,
-  fromPhone: from,
-  from,
-
-  kind: 'revenue',
-
-  date: String(dateStr),
-  source: sourceForDb,
-  description: descForDb,
-
-  amount: amountNum,
-  amount_cents: amountCents,
-
-  jobName,
-  jobSource,
-
-  category: categoryStr,
-  source_msg_id: txSourceMsgId || null
-});
-
-// Try to infer inserted id across both styles:
-// - some paths return { inserted, id }
-// - some return inserted row
-// - some return just id
-const txId =
-  (ins && typeof ins === 'object' && ins.id != null) ? ins.id
-  : (ins && typeof ins === 'object' && ins.transaction_id != null) ? ins.transaction_id
-  : (typeof ins === 'string' || typeof ins === 'number') ? ins
-  : null;
-
-// ------------------------------
-// ✅ INSERT succeeded — emit fact, clear confirm state, reply once
-// ------------------------------
-console.info('[REVENUE_YES_INSERT_OK]', { txId });
-
-// ✅ Brain v0 fact emission (revenue.confirmed) — best effort
-// (Must run BEFORE returning)
-try {
-  if (pg?.insertFactEvent && typeof pg.insertFactEvent === 'function') {
-    const currency = String(data?.currency || rawDraft?.currency || '').trim().toUpperCase() || null;
-    const occurredAt = dateStr ? `${dateStr}T12:00:00Z` : null;
-
-    const dedupeKey =
-      txSourceMsgId ? `revenue.confirmed:${String(txSourceMsgId)}`
-      : txId != null ? `revenue.confirmed:tx:${String(txId)}`
-      : `revenue.confirmed:fallback:${paUserId}:${Date.now()}`;
-
-    await pg.insertFactEvent({
-      owner_id: ownerId,
-      actor_key: paUserId,
-
-      event_type: 'revenue.confirmed',
-      entity_type: 'revenue',
-      entity_id: txId != null ? String(txId) : null,
-
-      job_no: data?.job_no ?? data?.jobNo ?? null,
-      job_id: data?.job_id ?? data?.jobId ?? null,
-      job_name: jobName || null,
-      job_source: jobSource || null,
-
-      amount_cents: Number.isFinite(amountCents) ? amountCents : null,
-      currency,
-
-      occurred_at: occurredAt,
-      source_msg_id: txSourceMsgId || null,
-      source_kind: 'whatsapp_text',
-
-      event_payload: {
-        source: sourceForDb,
-        description: descForDb,
-        date: dateStr || null,
-        jobName: jobName || null,
-        jobSource: jobSource || null
-      },
-
-      dedupe_key: dedupeKey
-    });
-  }
-} catch (e) {
-  console.warn('[FACT_EVENT] revenue.confirmed insert failed (ignored):', e?.message);
-}
-
-// ✅ CRITICAL: clear confirm + pick PA so we never loop
-try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
-try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }); } catch {}
-
-// ✅ Clear legacy pending flags (best-effort)
-try {
-  const mergeFn =
-    (typeof mergePendingTransactionState === 'function' && mergePendingTransactionState) ||
-    (stateManager?.mergePendingTransactionState && stateManager.mergePendingTransactionState) ||
-    null;
-
-  if (mergeFn) {
-    await mergeFn(paUserId, {
-      pendingRevenue: false,
-      awaitingRevenueJob: false,
-      awaitingRevenueClarification: false,
-      allow_new_while_pending: false,
-      allow_new_set_at: null,
-
-      pendingRevenueFlow: false,
-      awaitingRevenuePick: false,
-
-      _autoYesAfterEdit: false,
-      _autoYesSourceMsgId: null
-    });
-  }
-} catch (e) {
-  console.warn('[REVENUE_YES] clear pending state failed (ignored):', e?.message);
-}
-
-// Best-effort: persist active job (skip overhead)
-try {
-  if (jobName && !looksLikeOverhead(jobName)) {
-    await persistActiveJobFromRevenue({
+    const ins = await insertFn({
       ownerId,
+      owner_id: ownerId,
+      userId: paUserId,
+      user_id: paUserId,
       fromPhone: from,
-      userProfile,
-      jobNo: data?.job_no ?? data?.jobNo ?? null,
-      jobName
-    });
-  }
-} catch (e) {
-  console.warn('[REVENUE_YES] persistActiveJobFromRevenue failed (ignored):', e?.message);
-}
+      from,
 
- const okMsg = [
+      kind: 'revenue',
+
+      date: String(dateStr),
+      source: sourceForDb,
+      description: descForDb,
+
+      amount: amountNum,
+      amount_cents: amountCents,
+
+      jobName,
+      jobSource,
+
+      category: categoryStr,
+      source_msg_id: txSourceMsgId || null
+    });
+
+    const txId =
+      (ins && typeof ins === 'object' && ins.id != null) ? ins.id
+      : (ins && typeof ins === 'object' && ins.transaction_id != null) ? ins.transaction_id
+      : (typeof ins === 'string' || typeof ins === 'number') ? ins
+      : null;
+
+    console.info('[REVENUE_YES_INSERT_OK]', { txId });
+
+    // ✅ Clear confirm + pick PA so we never loop
+    try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
+    try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_PICK_JOB }); } catch {}
+
+    // ✅ Clear legacy pending flags (best-effort)
+    try {
+      const mergeFn =
+        (typeof mergePendingTransactionState === 'function' && mergePendingTransactionState) ||
+        (stateManager?.mergePendingTransactionState && stateManager.mergePendingTransactionState) ||
+        null;
+
+      if (mergeFn) {
+        await mergeFn(paUserId, {
+          pendingRevenue: false,
+          awaitingRevenueJob: false,
+          awaitingRevenueClarification: false,
+          allow_new_while_pending: false,
+          allow_new_set_at: null,
+
+          pendingRevenueFlow: false,
+          awaitingRevenuePick: false,
+
+          _autoYesAfterEdit: false,
+          _autoYesSourceMsgId: null
+        });
+      }
+    } catch (e) {
+      console.warn('[REVENUE_YES] clear pending state failed (ignored):', e?.message);
+    }
+
+    // Best-effort: persist active job (skip overhead)
+    try {
+      if (jobName && !looksLikeOverhead(jobName)) {
+        await persistActiveJobFromRevenue({
+          ownerId,
+          fromPhone: from,
+          userProfile,
+          jobNo: data?.job_no ?? data?.jobNo ?? null,
+          jobName
+        });
+      }
+    } catch (e) {
+      console.warn('[REVENUE_YES] persistActiveJobFromRevenue failed (ignored):', e?.message);
+    }
+
+    const okMsg = [
       `✅ Logged revenue ${formatMoneyDisplay(amountNum)} — ${sourceForDb}`,
       dateStr ? `Date: ${dateStr}` : null,
       jobName ? `Job: ${jobName}` : null,
@@ -2794,7 +2844,7 @@ if (!data?.date || !isIsoDate(data.date)) {
       sourceMsgId: safeMsgId,
       type: 'revenue'
     },
-    ttlSeconds: PA_TTL_SEC
+    ttlSeconds: PA_TTL_CONFIRM_SEC
   });
 
   return out(
@@ -2830,7 +2880,7 @@ await upsertPA({
     sourceMsgId: safeMsgId,
     type: 'revenue'
   },
-  ttlSeconds: PA_TTL_SEC
+  ttlSeconds: PA_TTL_CONFIRM_SEC
 });
 
 if (!jobName) {
@@ -2869,7 +2919,18 @@ try {
   });
 } catch {}
 
-return await sendConfirmRevenueOrFallback(from, confirmText);
+return await sendConfirmRevenueOrFallback(from, confirmText, {
+  ownerId,
+  paUserId,
+  draft: data,                          // ✅ correct: the parsed data becomes the draft
+  confirmPayload: {
+    draft: data,
+    sourceMsgId: safeMsgId,
+    type: 'revenue'
+  },
+  type: 'revenue',
+  sourceMsgId: String(safeMsgId || sourceMsgId || '').trim() || null
+});
 
 
 

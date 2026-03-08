@@ -2,9 +2,13 @@
 const { callOpenAI } = require('../services/openAI');
 const stateManager = require('./stateManager');
 const { detectErrors: detectErrorsImpl } = require('./errorDetector');
-const { todayInTimeZone, parseNaturalDate, stripDateTail } = require('./dateUtils');
 const { normalizeJobNameCandidate } = require('./jobNameUtils');
+const { todayInTimeZone: _todayInTimeZone, parseNaturalDate, stripDateTail } = require('./dateUtils');
 
+const todayInTimeZone =
+  typeof _todayInTimeZone === 'function'
+    ? _todayInTimeZone
+    : () => new Date().toISOString().slice(0, 10);
 /**
  * ChiefOS Ingestion AI helper
  * - WhatsApp is a “sense”: extract fields OR ask a clarification question.

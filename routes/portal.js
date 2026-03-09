@@ -12,7 +12,7 @@ function jsonErr(res, status, code, message) {
    WHOAMI (frontend contract)
    GET /api/whoami
 ========================= */
-router.get("/whoami", requirePortalUser, async (req, res) => {
+router.get("/whoami", requirePortalUser({ allowUnlinked: true }), async (req, res) => {
   try {
     // Try to enrich with portal user profile fields if available.
     // (This is safe even if table/cols differ — we catch errors.)
@@ -21,14 +21,15 @@ router.get("/whoami", requirePortalUser, async (req, res) => {
 
     try {
       const r = await pg.query(
-        `
-        select email, has_whatsapp
-        from public.chiefos_portal_users
-        where id = $1::uuid
-        limit 1
-        `,
-        [req.portalUserId]
-      );
+  `
+  select email, has_whatsapp
+  from public.chiefos_portal_users
+  where user_id = $1::uuid
+  order by created_at desc
+  limit 1
+  `,
+  [req.portalUserId]
+);
       const row = r.rows?.[0] || null;
       email = row?.email ?? null;
       hasWhatsApp = !!row?.has_whatsapp;

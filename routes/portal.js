@@ -8,99 +8,163 @@ function jsonErr(res, status, code, message) {
   return res.status(status).json({ ok: false, code, message: message || code });
 }
 
+function normalizePlanKey(raw) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (!v) return "free";
+  if (v.includes("pro")) return "pro";
+  if (v.includes("starter")) return "starter";
+  return "free";
+}
+
+function normalizePlanStatus(raw) {
+  const v = String(raw || "").trim().toLowerCase();
+  if (!v) return null;
+  if (["active", "trialing", "approved"].includes(v)) return "approved";
+  if (["canceled", "cancelled", "past_due", "unpaid", "denied", "inactive"].includes(v)) return "denied";
+  return "requested";
+}
+
+async function resolvePortalEntitlement({ tenantId, ownerId }) {
+  // ------------------------------------------------------------
+  // Canonical plan resolution path:
+  // portal auth -> tenant -> owner_id -> public.users.plan_key
+  //
+  // This is the constitutional path for ChiefOS:
+  // - portal boundary = tenant_id
+  // - monetization / quota boundary = owner_id
+  // ------------------------------------------------------------
+  const out = {
+    planKey: "free",
+    betaPlan: null,
+    betaStatus: null,
+    betaEntitlementPlan: null,
+    source: "free_fallback",
+  };
+
+  if (!ownerId) return out;
+
+  // 1) Primary authority: public.users by owner_id
+  try {
+    const userRes = await pg.query(
+      `
+      select owner_id, plan_key, subscription_tier, paid_tier, sub_status
+      from public.users
+      where owner_id = $1
+      limit 1
+      `,
+      [String(ownerId)]
+    );
+
+    const row = userRes.rows?.[0] || null;
+    if (row) {
+      const canonicalPlan =
+        normalizePlanKey(row.plan_key) ||
+        normalizePlanKey(row.subscription_tier) ||
+        normalizePlanKey(row.paid_tier) ||
+        "free";
+
+      const canonicalStatus = normalizePlanStatus(row.sub_status) || (canonicalPlan === "free" ? null : "approved");
+
+      out.planKey = canonicalPlan;
+      out.betaEntitlementPlan = canonicalPlan === "free" ? null : canonicalPlan;
+      out.betaStatus = canonicalStatus;
+      out.betaPlan = canonicalStatus === "approved" ? canonicalPlan : null;
+      out.source = "users_owner_id";
+
+      return out;
+    }
+  } catch {
+    // fall through safely
+  }
+
+  // 2) Fallback only if needed: billing_subscriptions by tenant_id
+  // Keep this as secondary compatibility only, NOT primary authority.
+  try {
+    if (tenantId) {
+      const subRes = await pg.query(
+        `
+        select plan_key, status
+        from public.billing_subscriptions
+        where tenant_id = $1::uuid
+        order by created_at desc
+        limit 1
+        `,
+        [tenantId]
+      );
+
+      const row = subRes.rows?.[0] || null;
+      if (row) {
+        const fallbackPlan = normalizePlanKey(row.plan_key);
+        const fallbackStatus = normalizePlanStatus(row.status);
+
+        out.planKey = fallbackPlan;
+        out.betaEntitlementPlan = fallbackPlan === "free" ? null : fallbackPlan;
+        out.betaStatus = fallbackStatus;
+        out.betaPlan = fallbackStatus === "approved" ? fallbackPlan : null;
+        out.source = "billing_subscriptions_tenant";
+
+        return out;
+      }
+    }
+  } catch {
+    // fail closed
+  }
+
+  return out;
+}
+
 /* =========================
    WHOAMI (frontend contract)
    GET /api/whoami
 ========================= */
 router.get("/whoami", requirePortalUser({ allowUnlinked: true }), async (req, res) => {
   try {
-    // Try to enrich with portal user profile fields if available.
-    // (This is safe even if table/cols differ — we catch errors.)
     let email = null;
     let hasWhatsApp = false;
 
     try {
       const r = await pg.query(
-  `
-  select email, has_whatsapp
-  from public.chiefos_portal_users
-  where user_id = $1::uuid
-  order by created_at desc
-  limit 1
-  `,
-  [req.portalUserId]
-);
+        `
+        select email, has_whatsapp
+        from public.chiefos_portal_users
+        where user_id = $1::uuid
+        order by created_at desc
+        limit 1
+        `,
+        [req.portalUserId]
+      );
+
       const row = r.rows?.[0] || null;
       email = row?.email ?? null;
       hasWhatsApp = !!row?.has_whatsapp;
     } catch {
-      // If your portal user table doesn't have these columns, just fall back.
       email = null;
       hasWhatsApp = false;
     }
 
-    // Billing/entitlement fields the frontend expects.
-    // If you don't have approvals wired yet, keep these null.
-    // If you *do* have a subscription row, we can map plan_key -> betaEntitlementPlan.
-    let betaEntitlementPlan = null;
-    let betaStatus = null; // "requested" | "approved" | "denied" | null
-    let betaPlan = null;   // only when approved
-
-    try {
-      if (req.tenantId) {
-        const sub = await pg.query(
-          `
-          select plan_key, status
-          from public.billing_subscriptions
-          where tenant_id = $1::uuid
-          order by created_at desc
-          limit 1
-          `,
-          [req.tenantId]
-        );
-        const row = sub.rows?.[0] || null;
-
-        // Map plan_key to your BetaPlan union.
-        // Adjust these strings to match your real Stripe plan keys.
-        const planKey = String(row?.plan_key || "").toLowerCase();
-        const status = row?.status ? String(row.status).toLowerCase() : "";
-
-        if (planKey.includes("pro")) betaEntitlementPlan = "pro";
-        else if (planKey.includes("starter")) betaEntitlementPlan = "starter";
-        else if (planKey) betaEntitlementPlan = "free";
-
-        // Optional mapping if you use statuses like active/trialing/canceled, etc.
-        // You can tighten this later.
-        if (status === "active" || status === "trialing") {
-          betaStatus = "approved";
-          betaPlan = betaEntitlementPlan;
-        } else if (status === "canceled" || status === "past_due" || status === "unpaid") {
-          betaStatus = "denied";
-          betaPlan = null;
-        } else if (status) {
-          betaStatus = "requested";
-          betaPlan = null;
-        }
-      }
-    } catch {
-      // leave entitlement fields null
-    }
+    const entitlement = await resolvePortalEntitlement({
+      tenantId: req.tenantId || null,
+      ownerId: req.ownerId || null,
+    });
 
     return res.json({
       ok: true,
       userId: req.portalUserId,
       tenantId: req.tenantId || null,
+      ownerId: req.ownerId || null,
       hasWhatsApp,
       email,
 
-      // these fields are required by your WhoamiOk type
-      betaPlan,
-      betaStatus,
-      betaEntitlementPlan,
+      // canonical paid-plan field
+      planKey: entitlement.planKey,
 
-      // keep extra fields for debugging (harmless)
+      // existing frontend beta-compatible fields
+      betaPlan: entitlement.betaPlan,
+      betaStatus: entitlement.betaStatus,
+      betaEntitlementPlan: entitlement.betaEntitlementPlan,
+
       role: req.portalRole || null,
-      ownerId: req.ownerId || null,
+      entitlementSource: entitlement.source,
     });
   } catch (e) {
     return jsonErr(res, 500, "WHOAMI_FAILED", "whoami_failed");
@@ -113,26 +177,31 @@ router.get("/whoami", requirePortalUser({ allowUnlinked: true }), async (req, re
 ========================= */
 router.get("/health/entitlement", requirePortalUser, async (req, res) => {
   try {
-    if (!req.tenantId) {
-      return res.json({ ok: true, tenantId: null, plan: "free", status: null });
+    if (!req.tenantId || !req.ownerId) {
+      return res.json({
+        ok: true,
+        tenantId: req.tenantId || null,
+        ownerId: req.ownerId || null,
+        plan: "free",
+        planKey: "free",
+        status: null,
+        source: "free_fallback",
+      });
     }
 
-    const r = await pg.query(
-      `select plan_key, status
-       from public.billing_subscriptions
-       where tenant_id = $1::uuid
-       order by created_at desc
-       limit 1`,
-      [req.tenantId]
-    );
-
-    const row = r.rows?.[0] || null;
+    const entitlement = await resolvePortalEntitlement({
+      tenantId: req.tenantId,
+      ownerId: req.ownerId,
+    });
 
     return res.json({
       ok: true,
       tenantId: req.tenantId,
-      plan: row?.plan_key || "free",
-      status: row?.status || null,
+      ownerId: req.ownerId,
+      plan: entitlement.planKey,
+      planKey: entitlement.planKey,
+      status: entitlement.betaStatus,
+      source: entitlement.source,
     });
   } catch (e) {
     return jsonErr(res, 500, "ENTITLEMENT_FAILED", "entitlement_failed");

@@ -193,165 +193,20 @@ function genericMenu() {
   ].join("\n");
 }
 
-function isLogChoice(text = '') {
-  const s = String(text || '').trim().toLowerCase();
-  return s === 'log' || s === 'logging';
+// ----- Canonical conversational helpers --------------------
+function DIGITS_ONLY(x) {
+  return String(x ?? "").replace(/\D/g, "");
 }
 
-function isQuestionChoice(text = '') {
-  const s = String(text || '').trim().toLowerCase();
-  return s === 'question' || s === 'questions' || s === 'answer' || s === 'answers';
-}
-
-function logMenu() {
-  return [
-    `Cool — what are we logging?`,
-    ``,
-    `Reply with one: **expense**, **revenue**, **time**, or **task**.`,
-    ``,
-    `Examples:`,
-    `• expense $52 Home Depot`,
-    `• revenue $500 deposit`,
-    `• clock in`,
-    `• task - buy nails`
-  ].join('\n');
-}
-
-function questionMenu() {
-  return [
-    `Alright — ask it straight.`,
-    ``,
-    `Examples:`,
-    `• what’s my cashflow this month?`,
-    `• profit on job 1556`,
-    `• what did I log today?`
-  ].join('\n');
-}
-
-// ----- Tool runner (exec OpenAI tool_calls using our handlers) -----
-async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
-  const { reg, toolsSpec } = getTools();
-
-  // First call with tools
-  let messages = seedMessages.slice();
-  let step = 0;
-  const MAX_STEPS = 2; // keep latency bounded
-
-  while (step < MAX_STEPS) {
-    step += 1;
-    const m = await llm.chat({ messages, tools: toolsSpec, temperature: 0.2 });
-
-    // If no tool calls → return assistant text
-    const toolCalls = Array.isArray(m.tool_calls) ? m.tool_calls : m?.tool_calls;
-    const content = (m.content || '').trim();
-    if (!toolCalls || toolCalls.length === 0) {
-      if (content) return content;
-      return genericMenu();
-    }
-
-    // Execute each tool in order
-    for (const call of toolCalls) {
-      const name = call.function?.name;
-      const rawArgs = call.function?.arguments || '{}';
-
-      if (!name || !reg[name]) {
-        console.warn('[AGENT] unknown tool:', name);
-        messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: 'unknown_tool' }) });
-        continue;
-      }
-
-      // Parse args, inject context
-      let args;
-      try { args = JSON.parse(rawArgs || '{}'); } catch { args = {}; }
-
-      // Standardize ownerId vs owner_id expectations:
-      // Our tx tools use owner_id; your other tools use ownerId.
-      if (ownerId && args.owner_id == null) args.owner_id = String(ownerId);
-      if (ownerId && args.ownerId == null) args.ownerId = String(ownerId);
-
-      if (from && args.fromPhone == null) args.fromPhone = String(from);
-
-      if (args.text == null && messages) {
-        const lastUser = [...messages].reverse().find(x => x.role === 'user');
-        if (lastUser?.content) args.text = String(lastUser.content);
-      }
-
-      let result;
-      try {
-        result = await reg[name](args);
-      } catch (e) {
-        console.error('[AGENT] tool error:', name, e?.message);
-        result = { error: e?.message || 'tool_error' };
-      }
-
-      // Push tool result back to LLM
-      messages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        content: JSON.stringify(result ?? {}),
-      });
-    }
-
-    // After executing tools, ask LLM to produce final user-facing message
-    messages = [
-      { role: 'system', content: 'You are Chief. If all required details were present, confirm success with a concise checkmark line and any IDs. If details were missing, ask exactly one clarifying question.' },
-      ...messages
-    ];
-  }
-
-  return genericMenu();
-}
-
-function normBare(s = '') {
-  return String(s || '')
+function normBare(s = "") {
+  return String(s || "")
     .trim()
     .toLowerCase()
-    .replace(/[.!?]+$/g, ''); // "expense." -> "expense"
-}
-
-function isBareExpense(text = '') {
-  const s = normBare(text);
-  return s === 'expense' || s === 'an expense' || s === 'a expense';
-}
-
-function isBareRevenue(text = '') {
-  const s = normBare(text);
-  return s === 'revenue' || s === 'a revenue' || s === 'an revenue';
-}
-
-function isBareTask(text = '') {
-  const s = normBare(text);
-  return s === 'task' || s === 'a task' || s === 'an task' || s === 'todo' || s === 'a todo' || s === 'to-do';
-}
-
-function isBareTime(text = '') {
-  const s = normBare(text);
-  return (
-    s === 'time' ||
-    s === 'clock' ||
-    s === 'clock in' ||
-    s === 'clock out' ||
-    s === 'timesheet' ||
-    s === 'hours'
-  );
-}
-
-function isBareJob(text = '') {
-  const s = normBare(text);
-  return s === 'job' || s === 'a job' || s === 'an job' || s === 'jobs';
-}
-
-function DIGITS_ONLY(x) { return String(x ?? '').replace(/\D/g, ''); }
-
-function normBare(s = '') {
-  return String(s || '')
-    .trim()
-    .toLowerCase()
-    .replace(/[.!?]+$/g, '');
+    .replace(/[.!?]+$/g, "");
 }
 
 function safeJson(obj) {
-  return obj && typeof obj === 'object' ? obj : {};
+  return obj && typeof obj === "object" ? obj : {};
 }
 
 async function loadActorMemorySafe(ownerId, actorKey) {
@@ -372,73 +227,89 @@ async function patchActorMemorySafe(ownerId, actorKey, patch) {
   }
 }
 
-// Bare intent detectors
-function isBareExpense(text = '') {
+// Choice detectors
+function isLogChoice(text = "") {
   const s = normBare(text);
-  return s === 'expense' || s === 'an expense' || s === 'a expense';
-}
-function isBareRevenue(text = '') {
-  const s = normBare(text);
-  return s === 'revenue' || s === 'a revenue' || s === 'an revenue';
-}
-function isBareTask(text = '') {
-  const s = normBare(text);
-  return s === 'task' || s === 'a task' || s === 'an task' || s === 'todo' || s === 'to-do';
-}
-function isBareTime(text = '') {
-  const s = normBare(text);
-  return s === 'time' || s === 'clock' || s === 'timesheet' || s === 'hours';
-}
-function isBareJob(text = '') {
-  const s = normBare(text);
-  return s === 'job' || s === 'jobs' || s === 'a job' || s === 'an job';
+  return s === "log" || s === "logging" || s === "log something";
 }
 
-// “Choice” detectors (you already added isLogChoice/isQuestionChoice — keep yours)
-function isLogChoice(text = '') {
+function isQuestionChoice(text = "") {
   const s = normBare(text);
-  return s === 'log' || s === 'logging' || s === 'log something';
+  return s === "question" || s === "questions" || s === "ask" || s === "answer" || s === "answers" || s === "insight";
 }
-function isQuestionChoice(text = '') {
+
+// Bare intent detectors
+function isBareExpense(text = "") {
   const s = normBare(text);
-  return s === 'question' || s === 'ask' || s === 'answer' || s === 'insight';
+  return s === "expense" || s === "an expense" || s === "a expense";
+}
+
+function isBareRevenue(text = "") {
+  const s = normBare(text);
+  return s === "revenue" || s === "a revenue" || s === "an revenue";
+}
+
+function isBareTask(text = "") {
+  const s = normBare(text);
+  return s === "task" || s === "a task" || s === "an task" || s === "todo" || s === "a todo" || s === "to-do";
+}
+
+function isBareTime(text = "") {
+  const s = normBare(text);
+  return (
+    s === "time" ||
+    s === "clock" ||
+    s === "clock in" ||
+    s === "clock out" ||
+    s === "timesheet" ||
+    s === "hours"
+  );
+}
+
+function isBareJob(text = "") {
+  const s = normBare(text);
+  return s === "job" || s === "jobs" || s === "a job" || s === "an job";
 }
 
 // Lightweight “did they provide the missing core?” detectors
-function hasMoney(text = '') {
-  return /\$?\s*\d+(\.\d{1,2})?\b/.test(String(text || ''));
-}
-function looksLikeClockCmd(text = '') {
-  const s = normBare(text);
-  return s === 'clock in' || s === 'clock out' || s === 'start break' || s === 'end break';
+function hasMoney(text = "") {
+  return /\$?\s*\d+(\.\d{1,2})?\b/.test(String(text || ""));
 }
 
-function getTodayIso(tz = 'America/Toronto') {
+function looksLikeClockCmd(text = "") {
+  const s = normBare(text);
+  return s === "clock in" || s === "clock out" || s === "start break" || s === "end break";
+}
+
+function looksLikeJustANumber(text = "") {
+  const s = normBare(text);
+  return /^\d+(\.\d{1,2})?$/.test(s) || /^\$\d+(\.\d{1,2})?$/.test(s);
+}
+
+function getTodayIso(tz = "America/Toronto") {
   try {
-    if (pg?.todayInTZ) return pg.todayInTZ(tz); // your postgres helper
+    if (pg?.todayInTZ) return pg.todayInTZ(tz);
   } catch {}
-  // fallback (UTC-based, acceptable as last resort)
   return new Date().toISOString().slice(0, 10);
 }
 
-function extractMoneyText(text = '') {
-  const s = String(text || '').trim();
-  // captures: 52, 52.50, $52, $52.50
+function extractMoneyText(text = "") {
+  const s = String(text || "").trim();
   const m = s.match(/(\$?\s*\d+(?:\.\d{1,2})?)/);
   if (!m) return null;
-  const raw = m[1].replace(/\s+/g, '');
-  // normalize: always include $ prefix (helps your ingestion)
-  return raw.startsWith('$') ? raw : `$${raw}`;
+  const raw = m[1].replace(/\s+/g, "");
+  return raw.startsWith("$") ? raw : `$${raw}`;
 }
 
-function extractIsoDate(text = '', tz = 'America/Toronto') {
+function extractIsoDate(text = "", tz = "America/Toronto") {
   const s = normBare(text);
-  // YYYY-MM-DD
+
   const m = s.match(/\b(\d{4}-\d{2}-\d{2})\b/);
   if (m) return m[1];
 
-  if (s === 'today') return getTodayIso(tz);
-  if (s === 'yesterday') {
+  if (s === "today") return getTodayIso(tz);
+
+  if (s === "yesterday") {
     const t = getTodayIso(tz);
     const d = new Date(`${t}T12:00:00Z`);
     d.setUTCDate(d.getUTCDate() - 1);
@@ -448,38 +319,54 @@ function extractIsoDate(text = '', tz = 'America/Toronto') {
   return null;
 }
 
-function looksLikeJustANumber(text = '') {
-  const s = normBare(text);
-  return /^\d+(\.\d{1,2})?$/.test(s) || /^\$\d+(\.\d{1,2})?$/.test(s);
-}
-
-function cleanVendorOrDesc(text = '') {
-  // keep it simple: vendor/desc is whatever they typed, minus trailing punctuation
-  return String(text || '').trim().replace(/[.!?]+$/g, '').trim();
+function cleanVendorOrDesc(text = "") {
+  return String(text || "").trim().replace(/[.!?]+$/g, "").trim();
 }
 
 function buildExpenseCommand({ amountText, vendor, dateIso } = {}) {
-  const parts = ['expense'];
+  const parts = ["expense"];
   if (amountText) parts.push(amountText);
   if (vendor) parts.push(vendor);
-  // only append date if user explicitly provided it (keeps it “chatty”)
   if (dateIso) parts.push(dateIso);
-  return parts.join(' ');
+  return parts.join(" ");
 }
 
 function buildRevenueCommand({ amountText, desc, dateIso } = {}) {
-  const parts = ['revenue'];
+  const parts = ["revenue"];
   if (amountText) parts.push(amountText);
   if (desc) parts.push(desc);
   if (dateIso) parts.push(dateIso);
-  return parts.join(' ');
+  return parts.join(" ");
 }
 
 function buildTaskCommand({ taskText } = {}) {
-  // match your examples
-  return `task - ${String(taskText || '').trim()}`;
+  return `task - ${String(taskText || "").trim()}`;
 }
 
+function logMenu() {
+  return [
+    "Cool — what are we logging?",
+    "",
+    "Reply with one: **expense**, **revenue**, **time**, or **task**.",
+    "",
+    "Examples:",
+    "• expense $52 Home Depot",
+    "• revenue $500 deposit",
+    "• clock in",
+    "• task - buy nails"
+  ].join("\n");
+}
+
+function questionMenu() {
+  return [
+    "Alright — ask it straight.",
+    "",
+    "Examples:",
+    "• what’s my cashflow this month?",
+    "• profit on job 1556",
+    "• what did I log today?"
+  ].join("\n");
+}
 
 // ----- Public ask API --------------------------------------
 async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) {

@@ -52,7 +52,7 @@ const accountRouter = require("./routes/account");
 const receiptsRouter = require("./routes/receipts");
 const portalRouter = require("./routes/portal");
 const crewAdminRouter = require("./routes/crewAdmin");
-
+const jobsPortalRouter = require("./routes/jobsPortal");
 
 // ✅ Portal auth + tenant/actor context for protected API routes
 const { requirePortalUser } = require("./middleware/requirePortalUser");
@@ -121,6 +121,7 @@ app.use(receiptsRouter);
 
 // ✅ Portal routes (this provides /api/whoami etc.)
 app.use("/api", portalRouter);
+app.use(jobsPortalRouter);
 // ✅ Crew+Control (Pro-gated) — portal-auth required
 app.use("/api/crew", requirePortalUser, require("./routes/crewControl"));
 app.use("/api/crew", crewAdminRouter);

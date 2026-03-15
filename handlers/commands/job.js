@@ -580,8 +580,8 @@ function normalizeJobOptions(jobRows) {
   const seen = new Set();
 
   for (const r of jobRows || []) {
-    const rawName = j?.name || j?.job_name || j?.jobName;
-    const name = sanitizeJobLabel(stripLeadingJobCode(rawName));
+    const rawName = r?.name || r?.job_name || r?.jobName;
+    const name = sanitizeJobLabel(rawName);
     if (!name || isGarbageJobName(name)) continue;
 
     const job_no = r?.job_no != null && Number.isFinite(Number(r.job_no)) ? Number(r.job_no) : null;

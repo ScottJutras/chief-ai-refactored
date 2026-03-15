@@ -7,6 +7,7 @@
 // - Handles handleInputWithAI signature drift (some builds expect fromPhone; others expect ownerId)
 // - Uses req.ownerId when available; otherwise falls back safely
 // - Keeps errorMiddleware last
+// - Resilient to middleware export-shape drift so route registration does not crash boot
 
 const express = require('express');
 
@@ -20,9 +21,10 @@ const {
   parseQuoteMessage,
 } = ai;
 
-const { tokenMiddleware } = require('../middleware/token');
 const { userProfileMiddleware } = require('../middleware/userProfile');
 const { errorMiddleware } = require('../middleware/error');
+
+const tokenModule = require('../middleware/token');
 
 const router = express.Router();
 
@@ -51,6 +53,33 @@ function pickDefaultData(type) {
   }[type];
 }
 
+function noopMiddleware(_req, _res, next) {
+  return next();
+}
+
+function resolveTokenMiddleware(mod) {
+  if (typeof mod === 'function') return mod;
+  if (typeof mod?.tokenMiddleware === 'function') return mod.tokenMiddleware;
+  if (typeof mod?.default === 'function') return mod.default;
+  return null;
+}
+
+const resolvedTokenMiddleware = resolveTokenMiddleware(tokenModule);
+
+if (typeof userProfileMiddleware !== 'function') {
+  throw new Error('[PARSE_ROUTE_BOOT] userProfileMiddleware is not a function');
+}
+
+if (typeof errorMiddleware !== 'function') {
+  throw new Error('[PARSE_ROUTE_BOOT] errorMiddleware is not a function');
+}
+
+if (!resolvedTokenMiddleware) {
+  console.warn('[PARSE_ROUTE_BOOT] tokenMiddleware is undefined; using noop fallback for /parse');
+}
+
+const tokenMiddlewareSafe = resolvedTokenMiddleware || noopMiddleware;
+
 /**
  * handleInputWithAI signature differs across builds:
  * - Some: handleInputWithAI(fromPhone, input, type, parseFn, defaultData, ...)
@@ -59,17 +88,14 @@ function pickDefaultData(type) {
  * We try both in a safe order.
  */
 async function handleInputWithAICompat({ ownerId, from, input, type, parseFn, defaultData }) {
-  // Try "from" first (matches your command handlers)
   try {
     const r = await handleInputWithAI(from || ownerId, input, type, parseFn, defaultData);
     return r;
   } catch (e1) {
-    // Try "ownerId" explicitly
     try {
       const r = await handleInputWithAI(ownerId, input, type, parseFn, defaultData);
       return r;
     } catch (e2) {
-      // throw the more informative error if possible
       throw e2?.message ? e2 : e1;
     }
   }
@@ -78,14 +104,16 @@ async function handleInputWithAICompat({ ownerId, from, input, type, parseFn, de
 router.post(
   '/',
   userProfileMiddleware,
-  tokenMiddleware,
+  tokenMiddlewareSafe,
   async (req, res, next) => {
     try {
       const { input, type = 'expense' } = req.body || {};
       const ownerId = String(req.ownerId || req.owner_id || '').trim();
       const from = String(req.from || req.userProfile?.user_id || ownerId || '').trim();
 
-      if (!input || !String(input).trim()) return res.status(400).json({ error: 'Missing input' });
+      if (!input || !String(input).trim()) {
+        return res.status(400).json({ error: 'Missing input' });
+      }
 
       const t = String(type || '').toLowerCase();
       if (!['expense', 'revenue', 'bill', 'job', 'quote'].includes(t)) {
@@ -107,14 +135,18 @@ router.post(
         input: trimmed,
         type: t,
         parseFn,
-        defaultData
+        defaultData,
       });
 
-      console.log('[parse] success', { ownerId: ownerId || null, type: t, input: trimmed.slice(0, 80) });
+      console.log('[parse] success', {
+        ownerId: ownerId || null,
+        type: t,
+        input: trimmed.slice(0, 80),
+      });
 
-      res.json({ data, reply, confirmed });
+      return res.json({ data, reply, confirmed });
     } catch (err) {
-      next(err);
+      return next(err);
     }
   }
 );

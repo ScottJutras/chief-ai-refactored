@@ -148,6 +148,7 @@ function getUserTz(userProfile) {
 }
 
 async function upsertMediaAsset({
+  tenantId,
   ownerId,
   from,
   stableMediaMsgId,
@@ -165,30 +166,64 @@ async function upsertMediaAsset({
     return null;
   }
 
+  const tenant = String(tenantId || '').trim() || null;
+  const owner = String(ownerId || '').trim();
+  const userId = DIGITS(from) || null;
+
+  if (!owner) {
+    console.warn('[MEDIA] upsertMediaAsset: missing ownerId');
+    return null;
+  }
+
+  if (!tenant) {
+    console.warn('[MEDIA] upsertMediaAsset: missing tenantId', {
+      ownerId: owner,
+      stableMediaMsgId: stableMediaMsgId || null
+    });
+    return null;
+  }
+
   const storageProvider = 'twilio_temp';
   const storagePath = String(mediaUrl || '').trim() || `twilio:${stableMediaMsgId}`;
+  const normalizedContentType = String(contentType || '').trim().toLowerCase() || null;
+
+  // Keep kind aligned with current supported evidence type.
+  // If your DB constraint later uses a different enum/value, this log will help expose it.
+  const kind = normalizedContentType && normalizedContentType.startsWith('audio/')
+    ? 'voice_note'
+    : 'receipt_image';
 
   const sql = `
     insert into public.media_assets (
-      owner_id, user_id, source_msg_id,
-      kind, storage_provider, storage_path,
-      content_type, size_bytes,
-      job_id, job_no, job_name,
-      ocr_text, ocr_fields
+      tenant_id,
+      owner_id,
+      user_id,
+      source_msg_id,
+      kind,
+      storage_provider,
+      storage_path,
+      content_type,
+      size_bytes,
+      job_id,
+      job_no,
+      job_name,
+      ocr_text,
+      ocr_fields
     )
-    values ($1,$2,$3,'receipt_image',$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    values ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
     on conflict (owner_id, source_msg_id)
       where source_msg_id is not null
     do update set
-      content_type = coalesce(excluded.content_type, public.media_assets.content_type),
-      size_bytes   = coalesce(excluded.size_bytes,   public.media_assets.size_bytes),
-      job_id       = coalesce(excluded.job_id,       public.media_assets.job_id),
-      job_no       = coalesce(excluded.job_no,       public.media_assets.job_no),
-      job_name     = coalesce(excluded.job_name,     public.media_assets.job_name),
+      tenant_id     = coalesce(excluded.tenant_id,     public.media_assets.tenant_id),
+      content_type  = coalesce(excluded.content_type,  public.media_assets.content_type),
+      size_bytes    = coalesce(excluded.size_bytes,    public.media_assets.size_bytes),
+      job_id        = coalesce(excluded.job_id,        public.media_assets.job_id),
+      job_no        = coalesce(excluded.job_no,        public.media_assets.job_no),
+      job_name      = coalesce(excluded.job_name,      public.media_assets.job_name),
 
-      -- IMPORTANT: allow OCR text to update if we now have better text
-      ocr_text   = case
-        when excluded.ocr_text is not null and length(excluded.ocr_text) > length(coalesce(public.media_assets.ocr_text, ''))
+      ocr_text = case
+        when excluded.ocr_text is not null
+         and length(excluded.ocr_text) > length(coalesce(public.media_assets.ocr_text, ''))
         then excluded.ocr_text
         else public.media_assets.ocr_text
       end,
@@ -198,17 +233,16 @@ async function upsertMediaAsset({
     returning id
   `;
 
-  const owner = String(ownerId || '').trim();
-  const userId = DIGITS(from);
-
   try {
     const r = await dbQuery(sql, [
+      tenant,
       owner,
-      userId || null,
+      userId,
       stableMediaMsgId || null,
+      kind,
       storageProvider,
       storagePath,
-      contentType || null,
+      normalizedContentType,
       Number.isFinite(Number(sizeBytes)) ? Number(sizeBytes) : null,
       jobId && String(jobId).trim() ? String(jobId).trim() : null,
       Number.isFinite(Number(jobNo)) ? Number(jobNo) : null,
@@ -218,15 +252,28 @@ async function upsertMediaAsset({
     ]);
 
     const id = r?.rows?.[0]?.id || null;
+
     console.info('[MEDIA_ASSET_UPSERT]', {
+      tenant_id: tenant,
       owner_id: owner,
-      source_msg_id: stableMediaMsgId,
+      user_id: userId,
+      source_msg_id: stableMediaMsgId || null,
+      kind,
       id: id || null,
       hasText: !!(ocrText && String(ocrText).trim())
     });
+
     return id;
   } catch (e) {
-    console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
+    console.error('[MEDIA_ASSET_UPSERT_ERR]', {
+      tenantId: tenant,
+      ownerId: owner,
+      userId,
+      sourceMsgId: stableMediaMsgId || null,
+      contentType: normalizedContentType,
+      kind,
+      error: e?.message || String(e)
+    });
     return null;
   }
 }
@@ -591,7 +638,14 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       mediaType: mediaType || null,
       sourceMsgId: sourceMsgId || null
     });
-
+     
+    const tenantId =
+  String(
+    userProfile?.tenant_id ||
+    userProfile?.tenantId ||
+    userProfile?.tenant?.id ||
+    ''
+  ).trim() || null;
     // ✅ canonical key for all state reads/writes and stable ids
     const userKey = canonicalUserKey(from);
 
@@ -856,8 +910,9 @@ if (isImage) {
     rawHint.length <= 80;
 
   // 2) Always upsert media asset row (even if OCR empty)
-try {
-  mediaAssetId = await upsertMediaAsset({
+  try {
+    const mediaAssetId = await upsertMediaAsset({
+    tenantId,
     ownerId: ownerIdKey,
     from,
     stableMediaMsgId,
@@ -867,12 +922,23 @@ try {
     jobId: activeJobId,
     jobNo: activeJobNo,
     jobName: activeJobName,
-    ocrText: null,          // keep null until OCR runs
+    ocrText: null,
     ocrFields: null
   });
-} catch (e) {
-  console.warn('[MEDIA] upsertMediaAsset failed (ignored):', e?.message);
-}
+
+    if (!mediaAssetId && updatedMediaAssetId) {
+      mediaAssetId = updatedMediaAssetId;
+    }
+
+    console.info('[MEDIA_ASSET_UPSERT_OCR_RESULT]', {
+      ownerId: ownerIdKey,
+      stableMediaMsgId,
+      mediaAssetId: mediaAssetId || null,
+      updatedMediaAssetId: updatedMediaAssetId || null
+    });
+  } catch (e) {
+    console.warn('[MEDIA] upsertMediaAsset (ocr update) failed (ignored):', e?.message);
+  }
 
 // ✅ FREE TIER / OCR-NOT-ENABLED BEHAVIOR:
 // Store the image, DO NOT route into expense confirm/job picker.
@@ -1027,8 +1093,9 @@ if (!ocrAllowed) {
   extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 
   // Update asset with OCR results (best-effort)
-  try {
-    await upsertMediaAsset({
+    try {
+    const updatedMediaAssetId = await upsertMediaAsset({
+      tenantId,
       ownerId: ownerIdKey,
       from,
       stableMediaMsgId,
@@ -1040,6 +1107,18 @@ if (!ocrAllowed) {
       jobName: activeJobName,
       ocrText: extractedText ? extractedText : null,
       ocrFields
+    });
+
+    if (!mediaAssetId && updatedMediaAssetId) {
+      mediaAssetId = updatedMediaAssetId;
+    }
+
+    console.info('[MEDIA_ASSET_UPSERT_OCR_RESULT]', {
+      tenantId: tenantId || null,
+      ownerId: ownerIdKey,
+      stableMediaMsgId,
+      mediaAssetId: mediaAssetId || null,
+      updatedMediaAssetId: updatedMediaAssetId || null
     });
   } catch (e) {
     console.warn('[MEDIA] upsertMediaAsset (ocr update) failed (ignored):', e?.message);

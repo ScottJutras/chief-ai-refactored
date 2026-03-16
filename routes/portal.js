@@ -123,9 +123,9 @@ router.get("/whoami", requirePortalUser({ allowUnlinked: true }), async (req, re
     let hasWhatsApp = false;
 
     try {
-      const r = await pg.query(
+      const portalRes = await pg.query(
         `
-        select email, has_whatsapp
+        select email
         from public.chiefos_portal_users
         where user_id = $1::uuid
         order by created_at desc
@@ -134,11 +134,31 @@ router.get("/whoami", requirePortalUser({ allowUnlinked: true }), async (req, re
         [req.portalUserId]
       );
 
-      const row = r.rows?.[0] || null;
-      email = row?.email ?? null;
-      hasWhatsApp = !!row?.has_whatsapp;
+      email = portalRes?.rows?.[0]?.email ?? null;
     } catch {
       email = null;
+    }
+
+    try {
+      if (req.tenantId && req.portalUserId) {
+        const idnRes = await pg.query(
+          `
+          select 1
+          from public.chiefos_user_identities
+          where tenant_id = $1::uuid
+            and user_id = $2::uuid
+            and kind = 'whatsapp'
+          limit 1
+          `,
+          [req.tenantId, req.portalUserId]
+        );
+
+        hasWhatsApp = !!idnRes?.rows?.[0];
+      } else {
+        hasWhatsApp = false;
+      }
+    } catch (e) {
+      console.warn("[WHOAMI_WHATSAPP_CHECK] failed:", e?.message);
       hasWhatsApp = false;
     }
 
@@ -154,15 +174,10 @@ router.get("/whoami", requirePortalUser({ allowUnlinked: true }), async (req, re
       ownerId: req.ownerId || null,
       hasWhatsApp,
       email,
-
-      // canonical paid-plan field
       planKey: entitlement.planKey,
-
-      // existing frontend beta-compatible fields
       betaPlan: entitlement.betaPlan,
       betaStatus: entitlement.betaStatus,
       betaEntitlementPlan: entitlement.betaEntitlementPlan,
-
       role: req.portalRole || null,
       entitlementSource: entitlement.source,
     });

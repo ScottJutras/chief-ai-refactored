@@ -167,11 +167,14 @@ async function upsertMediaAsset({
   }
 
   const tenant = String(tenantId || '').trim() || null;
-  const owner = String(ownerId || '').trim();
+  const owner = String(ownerId || '').trim() || null;
   const userId = DIGITS(from) || null;
 
   if (!owner) {
-    console.warn('[MEDIA] upsertMediaAsset: missing ownerId');
+    console.warn('[MEDIA] upsertMediaAsset: missing ownerId', {
+      tenantId: tenant,
+      stableMediaMsgId: stableMediaMsgId || null
+    });
     return null;
   }
 
@@ -186,12 +189,6 @@ async function upsertMediaAsset({
   const storageProvider = 'twilio_temp';
   const storagePath = String(mediaUrl || '').trim() || `twilio:${stableMediaMsgId}`;
   const normalizedContentType = String(contentType || '').trim().toLowerCase() || null;
-
-  // Keep kind aligned with current supported evidence type.
-  // If your DB constraint later uses a different enum/value, this log will help expose it.
-  const kind = normalizedContentType && normalizedContentType.startsWith('audio/')
-    ? 'voice_note'
-    : 'receipt_image';
 
   const sql = `
     insert into public.media_assets (
@@ -210,26 +207,28 @@ async function upsertMediaAsset({
       ocr_text,
       ocr_fields
     )
-    values ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
+    values (
+      $1, $2, $3, $4,
+      'receipt_image',
+      $5, $6, $7, $8, $9, $10, $11, $12, $13
+    )
     on conflict (owner_id, source_msg_id)
       where source_msg_id is not null
     do update set
-      tenant_id     = coalesce(excluded.tenant_id,     public.media_assets.tenant_id),
-      content_type  = coalesce(excluded.content_type,  public.media_assets.content_type),
-      size_bytes    = coalesce(excluded.size_bytes,    public.media_assets.size_bytes),
-      job_id        = coalesce(excluded.job_id,        public.media_assets.job_id),
-      job_no        = coalesce(excluded.job_no,        public.media_assets.job_no),
-      job_name      = coalesce(excluded.job_name,      public.media_assets.job_name),
-
-      ocr_text = case
+      tenant_id    = coalesce(public.media_assets.tenant_id, excluded.tenant_id),
+      content_type = coalesce(excluded.content_type, public.media_assets.content_type),
+      size_bytes   = coalesce(excluded.size_bytes, public.media_assets.size_bytes),
+      job_id       = coalesce(excluded.job_id, public.media_assets.job_id),
+      job_no       = coalesce(excluded.job_no, public.media_assets.job_no),
+      job_name     = coalesce(excluded.job_name, public.media_assets.job_name),
+      ocr_text     = case
         when excluded.ocr_text is not null
          and length(excluded.ocr_text) > length(coalesce(public.media_assets.ocr_text, ''))
         then excluded.ocr_text
         else public.media_assets.ocr_text
       end,
-
-      ocr_fields = coalesce(excluded.ocr_fields, public.media_assets.ocr_fields),
-      updated_at = now()
+      ocr_fields   = coalesce(excluded.ocr_fields, public.media_assets.ocr_fields),
+      updated_at   = now()
     returning id
   `;
 
@@ -239,7 +238,6 @@ async function upsertMediaAsset({
       owner,
       userId,
       stableMediaMsgId || null,
-      kind,
       storageProvider,
       storagePath,
       normalizedContentType,
@@ -258,7 +256,8 @@ async function upsertMediaAsset({
       owner_id: owner,
       user_id: userId,
       source_msg_id: stableMediaMsgId || null,
-      kind,
+      kind: 'receipt_image',
+      content_type: normalizedContentType,
       id: id || null,
       hasText: !!(ocrText && String(ocrText).trim())
     });
@@ -271,11 +270,97 @@ async function upsertMediaAsset({
       userId,
       sourceMsgId: stableMediaMsgId || null,
       contentType: normalizedContentType,
-      kind,
+      kind: 'receipt_image',
       error: e?.message || String(e)
     });
     return null;
   }
+}
+
+async function resolveTenantIdForMedia({ ownerId, from, userProfile }) {
+  const direct =
+    String(
+      userProfile?.tenant_id ||
+      userProfile?.tenantId ||
+      userProfile?.tenant?.id ||
+      ''
+    ).trim() || null;
+
+  if (direct) return direct;
+
+  if (!dbQuery) {
+    console.warn('[MEDIA] resolveTenantIdForMedia: no dbQuery available');
+    return null;
+  }
+
+  const owner = String(ownerId || '').trim();
+  const digits = DIGITS(from);
+
+  // 1) Best source for WhatsApp/media contexts: direct identity mapping
+  try {
+    if (digits) {
+      const q1 = await dbQuery(
+        `
+          select tenant_id
+          from public.chiefos_user_identities
+          where kind = 'whatsapp'
+            and identifier = $1
+          order by created_at desc
+          limit 1
+        `,
+        [digits]
+      );
+
+      const t1 = String(q1?.rows?.[0]?.tenant_id || '').trim() || null;
+      if (t1) {
+        console.info('[MEDIA_TENANT_RESOLVED]', {
+          source: 'chiefos_user_identities',
+          from: digits,
+          tenantId: t1,
+          ownerId: owner || null
+        });
+        return t1;
+      }
+    }
+  } catch (e) {
+    console.warn('[MEDIA] resolveTenantIdForMedia chiefos_user_identities failed:', e?.message);
+  }
+
+  // 2) Fallback: tenant root by owner_id
+  try {
+    if (owner) {
+      const q2 = await dbQuery(
+        `
+          select id as tenant_id
+          from public.chiefos_tenants
+          where owner_id = $1
+          order by created_at asc
+          limit 1
+        `,
+        [owner]
+      );
+
+      const t2 = String(q2?.rows?.[0]?.tenant_id || '').trim() || null;
+      if (t2) {
+        console.info('[MEDIA_TENANT_RESOLVED]', {
+          source: 'chiefos_tenants.owner_id',
+          from: digits || null,
+          tenantId: t2,
+          ownerId: owner
+        });
+        return t2;
+      }
+    }
+  } catch (e) {
+    console.warn('[MEDIA] resolveTenantIdForMedia chiefos_tenants fallback failed:', e?.message);
+  }
+
+  console.warn('[MEDIA] resolveTenantIdForMedia: tenant unresolved', {
+    ownerId: owner || null,
+    from: digits || null
+  });
+
+  return null;
 }
 
 function fmtLocal(tsIso, tz) {
@@ -639,13 +724,11 @@ async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaTyp
       sourceMsgId: sourceMsgId || null
     });
      
-    const tenantId =
-  String(
-    userProfile?.tenant_id ||
-    userProfile?.tenantId ||
-    userProfile?.tenant?.id ||
-    ''
-  ).trim() || null;
+    const tenantId = await resolveTenantIdForMedia({
+  ownerId,
+  from,
+  userProfile
+});
     // ✅ canonical key for all state reads/writes and stable ids
     const userKey = canonicalUserKey(from);
 

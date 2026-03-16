@@ -901,7 +901,7 @@ if (isImage) {
   let ocrFields = null;
 
   // --------------------------------------------
-  // ✅ Explicit OCR request detector
+  // Explicit OCR request detector
   // Only upsell when user explicitly asked to read/scan/extract/ocr.
   // --------------------------------------------
   const rawHint = String(input || '').trim().toLowerCase();
@@ -909,180 +909,176 @@ if (isImage) {
     /\b(ocr|scan|read|extract|parse)\b/.test(rawHint) &&
     rawHint.length <= 80;
 
-  // 2) Always upsert media asset row (even if OCR empty)
+  // 1) Always create/update a media asset row first, even before OCR.
+  // IMPORTANT:
+  // - assign to outer-scoped mediaAssetId
+  // - do NOT redeclare with const/let here
   try {
-    const mediaAssetId = await upsertMediaAsset({
-    tenantId,
-    ownerId: ownerIdKey,
-    from,
-    stableMediaMsgId,
-    mediaUrl,
-    contentType: normType,
-    sizeBytes: null,
-    jobId: activeJobId,
-    jobNo: activeJobNo,
-    jobName: activeJobName,
-    ocrText: null,
-    ocrFields: null
-  });
+    console.info('[MEDIA_ASSET_UPSERT_ATTEMPT]', {
+      tenantId: tenantId || null,
+      ownerId: ownerIdKey || null,
+      from: from || null,
+      stableMediaMsgId: stableMediaMsgId || null,
+      normType: normType || null,
+      activeJobId: activeJobId || null,
+      activeJobNo: activeJobNo ?? null,
+      activeJobName: activeJobName || null
+    });
 
-    if (!mediaAssetId && updatedMediaAssetId) {
-      mediaAssetId = updatedMediaAssetId;
-    }
-
-    console.info('[MEDIA_ASSET_UPSERT_OCR_RESULT]', {
+    mediaAssetId = await upsertMediaAsset({
+      tenantId,
       ownerId: ownerIdKey,
+      from,
       stableMediaMsgId,
-      mediaAssetId: mediaAssetId || null,
-      updatedMediaAssetId: updatedMediaAssetId || null
+      mediaUrl,
+      contentType: normType,
+      sizeBytes: null,
+      jobId: activeJobId,
+      jobNo: activeJobNo,
+      jobName: activeJobName,
+      ocrText: null,
+      ocrFields: null
+    });
+
+    console.info('[MEDIA_ASSET_UPSERT_INITIAL_RESULT]', {
+      tenantId: tenantId || null,
+      ownerId: ownerIdKey || null,
+      stableMediaMsgId: stableMediaMsgId || null,
+      mediaAssetId: mediaAssetId || null
     });
   } catch (e) {
-    console.warn('[MEDIA] upsertMediaAsset (ocr update) failed (ignored):', e?.message);
+    console.warn('[MEDIA] upsertMediaAsset (initial image row) failed (ignored):', e?.message);
   }
 
-// ✅ FREE TIER / OCR-NOT-ENABLED BEHAVIOR:
-// Store the image, DO NOT route into expense confirm/job picker.
-// Return the gating message as TwiML so the user sees a response.
-try {
-  const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
+  // FREE TIER / OCR-NOT-ENABLED BEHAVIOR:
+  // Store the image, DO NOT route into expense confirm/job picker.
+  // Return the gating message as TwiML so the user sees a response.
+  try {
+    const ocrEnabled = !!caps?.capture?.ocr_receipts?.enabled;
 
-  if (caps && !ocrEnabled) {
-    // (optional) one-time prompt flag
-    try {
-      const r = await shouldShowUpgradePromptOnce({ ownerId: ownerIdKey, kind: 'ocr' });
-      console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: ownerIdKey, ...r });
-    } catch {}
+    if (caps && !ocrEnabled) {
+      try {
+        const r = await shouldShowUpgradePromptOnce({ ownerId: ownerIdKey, kind: 'ocr' });
+        console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: ownerIdKey, ...r });
+      } catch {}
 
-    // ✅ Remember last media for a few minutes so user can immediately type manual expense
-    try {
-      const pending = await getPendingTransactionState(userKey);
-      await mergePendingTransactionState(userKey, {
-        ...(pending || {}),
-        pendingMediaMeta: {
-          url: mediaUrl || null,
-          type: normType || null,
-          source_msg_id: stableMediaMsgId || null,
-          media_asset_id: mediaAssetId || null,
-          transcript: null,
-          confidence: null
-        },
-        pendingMedia: { url: mediaUrl || null, type: normType || null },
-        mediaSourceMsgId: stableMediaMsgId || null
-      });
+      try {
+        const pending = await getPendingTransactionState(userKey);
+        await mergePendingTransactionState(userKey, {
+          ...(pending || {}),
+          pendingMediaMeta: {
+            url: mediaUrl || null,
+            type: normType || null,
+            source_msg_id: stableMediaMsgId || null,
+            media_asset_id: mediaAssetId || null,
+            transcript: null,
+            confidence: null
+          },
+          pendingMedia: { url: mediaUrl || null, type: normType || null },
+          mediaSourceMsgId: stableMediaMsgId || null
+        });
 
-      console.info('[PENDING_MEDIA_META_SAVED]', {
-        ownerId: ownerIdKey,
-        userKey,
-        stableMediaMsgId,
-        mediaAssetId: mediaAssetId || null
-      });
-    } catch (e) {
-      console.warn('[PENDING_MEDIA_META_SAVED] (free_gate) failed (ignored):', e?.message);
-    }
-
-    return {
-      transcript: null,
-      twiml: twiml(
-        `I stored the receipt photo ✅\n\n` +
-          `Automatic receipt reading (OCR) isn’t included on the Free plan.\n\n` +
-          `Starter unlocks OCR — I’ll extract vendor, amount, and date automatically.\n\n` +
-          `If you want, you can still log it manually right now.\n` +
-          `Example: Expense ($Amount) (Material Name) (Store Name) (Date or "Today") (Job Name)`
-      )
-    };
-  }
-} catch (e) {
-  console.warn('[MEDIA] OCR enabled check failed (fail-open):', e?.message);
-}
-
-// --------------------------------------------
-// ✅ Gate OCR (quota only)
-// Note: plan inclusion is already handled above (free-gate early return).
-// BUT: do NOT return TwiML unless user explicitly requested OCR.
-// If not explicitly requested -> fall through to router with a transcript token.
-// --------------------------------------------
-let ocrAllowed = true;
-let ocrDeniedReason = null;
-
-try {
-  const q = await checkMonthlyQuota({
-  ownerId: ownerIdKey,
-  planKey: planLc, // ✅ normalized effective plan
-  kind: 'ocr',
-  units: 1
-});
-
-
-  if (!q.ok) {
-    ocrAllowed = false;
-    ocrDeniedReason = String(q.reason || 'OVER_QUOTA').toUpperCase();
-  }
-} catch (e) {
-  // fail-open for quota checks (still safe because OCR call is in try/catch below)
-  console.warn('[MEDIA] OCR quota precheck failed (fail-open):', e?.message);
-}
-
-// If OCR is NOT allowed:
-// - If user explicitly asked to OCR -> show quota/upsell TwiML
-// - Otherwise -> DO NOT return TwiML; let router continue
-if (!ocrAllowed) {
-  if (userExplicitlyRequestedOcr) {
-    // upsell flag (once)
-    try {
-      const r = await shouldShowUpgradePromptOnce({ ownerId: ownerIdKey, kind: 'ocr' });
-      console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: ownerIdKey, ...r });
-    } catch (e) {
-      console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
-    }
-
-    // IMPORTANT: use outer planLc (normalized effective plan)
-
-    if (ocrDeniedReason === 'OVER_QUOTA') {
-      const proNudge =
-        planLc === 'starter'
-          ? `\n\nYou’re on Starter. Pro includes higher monthly OCR capacity — upgrade only if your volume justifies it.`
-          : '';
+        console.info('[PENDING_MEDIA_META_SAVED]', {
+          tenantId: tenantId || null,
+          ownerId: ownerIdKey,
+          userKey,
+          stableMediaMsgId,
+          mediaAssetId: mediaAssetId || null
+        });
+      } catch (e) {
+        console.warn('[PENDING_MEDIA_META_SAVED] (free_gate) failed (ignored):', e?.message);
+      }
 
       return {
         transcript: null,
         twiml: twiml(
-          `You’ve used your monthly OCR allowance.\n\n` +
+          `I stored the receipt photo ✅\n\n` +
+          `Automatic receipt reading (OCR) isn’t included on the Free plan.\n\n` +
+          `Starter unlocks OCR — I’ll extract vendor, amount, and date automatically.\n\n` +
+          `If you want, you can still log it manually right now.\n` +
+          `Example: Expense ($Amount) (Material Name) (Store Name) (Date or "Today") (Job Name)`
+        )
+      };
+    }
+  } catch (e) {
+    console.warn('[MEDIA] OCR enabled check failed (fail-open):', e?.message);
+  }
+
+  // --------------------------------------------
+  // Gate OCR by quota only
+  // --------------------------------------------
+  let ocrAllowed = true;
+  let ocrDeniedReason = null;
+
+  try {
+    const q = await checkMonthlyQuota({
+      ownerId: ownerIdKey,
+      planKey: planLc,
+      kind: 'ocr',
+      units: 1
+    });
+
+    if (!q.ok) {
+      ocrAllowed = false;
+      ocrDeniedReason = String(q.reason || 'OVER_QUOTA').toUpperCase();
+    }
+  } catch (e) {
+    console.warn('[MEDIA] OCR quota precheck failed (fail-open):', e?.message);
+  }
+
+  // If OCR is not allowed:
+  // - if user explicitly requested OCR, show quota/upsell message
+  // - otherwise let router continue
+  if (!ocrAllowed) {
+    if (userExplicitlyRequestedOcr) {
+      try {
+        const r = await shouldShowUpgradePromptOnce({ ownerId: ownerIdKey, kind: 'ocr' });
+        console.info('[UPSELL_FLAG]', { kind: 'ocr', ownerId: ownerIdKey, ...r });
+      } catch (e) {
+        console.warn('[UPSELL_FLAG] failed (ignored):', e?.message);
+      }
+
+      if (ocrDeniedReason === 'OVER_QUOTA') {
+        const proNudge =
+          planLc === 'starter'
+            ? `\n\nYou’re on Starter. Pro includes higher monthly OCR capacity — upgrade only if your volume justifies it.`
+            : '';
+
+        return {
+          transcript: null,
+          twiml: twiml(
+            `You’ve used your monthly OCR allowance.\n\n` +
             `You can:\n` +
             `• Wait until your limit resets next month\n` +
             `• Upgrade for higher capacity\n` +
             `• Log this receipt manually right now\n\n` +
             `Nothing is lost — just tell me the amount and vendor if you’d like to continue.` +
             proNudge
+          )
+        };
+      }
+
+      return {
+        transcript: null,
+        twiml: twiml(
+          `OCR isn’t available right now.\n\n` +
+          `You can log this receipt manually, or try again later.`
         )
       };
     }
 
-    // Defensive fallback (if quota system returns something else)
-    return {
-      transcript: null,
-      twiml: twiml(
-        `OCR isn’t available right now.\n\n` +
-          `You can log this receipt manually, or try again later.`
-      )
-    };
+    return { transcript: 'expense receipt', twiml: null };
   }
 
-  // ✅ KEY: no TwiML, let main router handle it.
-  // Provide a lightweight transcript token so Body isn't empty and routing continues.
-  return { transcript: 'expense receipt', twiml: null };
-}
-
-// --------------------------------------------
-// OCR allowed → attempt OCR
-// --------------------------------------------
-
+  // --------------------------------------------
+  // OCR allowed -> attempt OCR
+  // --------------------------------------------
   try {
     const out = await extractTextFromImage(mediaUrl, {
-  mediaType,
-  ownerId: ownerIdKey,
-  planKey: planLc
-});
-
+      mediaType,
+      ownerId: ownerIdKey,
+      planKey: planLc
+    });
 
     ocrText = String(out?.text || out?.transcript || '').trim();
     ocrFields = out?.fields || out?.ocrFields || null;
@@ -1092,8 +1088,8 @@ if (!ocrAllowed) {
 
   extractedText = normalizeHumanText((ocrText || extractedText || '').trim());
 
-  // Update asset with OCR results (best-effort)
-    try {
+  // 2) Update media asset with OCR results
+  try {
     const updatedMediaAssetId = await upsertMediaAsset({
       tenantId,
       ownerId: ownerIdKey,
@@ -1115,8 +1111,8 @@ if (!ocrAllowed) {
 
     console.info('[MEDIA_ASSET_UPSERT_OCR_RESULT]', {
       tenantId: tenantId || null,
-      ownerId: ownerIdKey,
-      stableMediaMsgId,
+      ownerId: ownerIdKey || null,
+      stableMediaMsgId: stableMediaMsgId || null,
       mediaAssetId: mediaAssetId || null,
       updatedMediaAssetId: updatedMediaAssetId || null
     });
@@ -1124,34 +1120,34 @@ if (!ocrAllowed) {
     console.warn('[MEDIA] upsertMediaAsset (ocr update) failed (ignored):', e?.message);
   }
 
-  // ✅ Remember last media so a manual expense typed next can attach it (no OCR needed)
-try {
-  const pending = await getPendingTransactionState(userKey);
-  await mergePendingTransactionState(userKey, {
-    ...(pending || {}),
-    pendingMediaMeta: {
-      url: mediaUrl || null,
-      type: normType || null,
-      source_msg_id: stableMediaMsgId || null,
-      media_asset_id: mediaAssetId || null,
-      transcript: null,
-      confidence: null
-    },
-    pendingMedia: { url: mediaUrl || null, type: normType || null },
-    mediaSourceMsgId: stableMediaMsgId || null
-  });
-} catch (e) {
-  console.warn('[PENDING_MEDIA_META_SAVED] (image/free_gate) failed (ignored):', e?.message);
-}
+  // Remember last media so a manual expense typed next can attach it
+  try {
+    const pending = await getPendingTransactionState(userKey);
+    await mergePendingTransactionState(userKey, {
+      ...(pending || {}),
+      pendingMediaMeta: {
+        url: mediaUrl || null,
+        type: normType || null,
+        source_msg_id: stableMediaMsgId || null,
+        media_asset_id: mediaAssetId || null,
+        transcript: null,
+        confidence: null
+      },
+      pendingMedia: { url: mediaUrl || null, type: normType || null },
+      mediaSourceMsgId: stableMediaMsgId || null
+    });
+  } catch (e) {
+    console.warn('[PENDING_MEDIA_META_SAVED] (image) failed (ignored):', e?.message);
+  }
 
-try {
+  try {
     mediaMeta.transcript = extractedText ? truncateText(extractedText, MAX_MEDIA_TRANSCRIPT_CHARS) : null;
     mediaMeta.confidence = null;
     mediaMeta.media_asset_id = mediaAssetId || null;
     await attachPendingMediaMeta(userKey, mediaMeta);
   } catch {}
 
-  // If OCR got nothing, let router continue with a token (no TwiML)
+  // If OCR got nothing, let router continue with a token
   if (!extractedText) {
     return { transcript: 'expense receipt', twiml: null };
   }
@@ -1169,14 +1165,11 @@ try {
   }
 
   if (looksLikeReceipt) {
-    // Let router decide; provide token + OCR text
     return { transcript: `expense ${extractedText}`.trim(), twiml: null };
   }
 
   return { transcript: extractedText, twiml: null };
 }
-
-
 
 
     // If still nothing, ask user what it is (keep your existing UX)

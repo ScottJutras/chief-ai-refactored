@@ -1,5 +1,54 @@
 // index.js
 require("./config/env");
+const { URL } = require("url");
+
+function redact(str, keep = 10) {
+  const s = String(str || "");
+  if (!s) return null;
+  if (s.length <= keep) return s;
+  return `${s.slice(0, keep)}…`;
+}
+
+function summarizeSupabaseHost(rawUrl) {
+  try {
+    if (!rawUrl) return null;
+    return new URL(String(rawUrl)).host || null;
+  } catch {
+    return "invalid_url";
+  }
+}
+
+function summarizeStripeMode(secretKey) {
+  const sk = String(secretKey || "");
+  if (sk.startsWith("sk_live_")) return "live";
+  if (sk.startsWith("sk_test_")) return "test";
+  return "missing";
+}
+
+(function logRuntimeEnvironmentSummary() {
+  const appBase = String(process.env.APP_BASE_URL || "").trim();
+  const supabaseUrl =
+    String(process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || "").trim();
+
+  const anonKey =
+    String(process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || "").trim();
+
+  const serviceRole = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+  const stripeSecret = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  const twilioSid = String(process.env.TWILIO_ACCOUNT_SID || "").trim();
+
+  console.log("[RUNTIME_ENV_SUMMARY]", {
+    nodeEnv: process.env.NODE_ENV || null,
+    vercelEnv: process.env.VERCEL_ENV || null,
+    appBaseUrl: appBase || null,
+    supabaseHost: summarizeSupabaseHost(supabaseUrl),
+    hasSupabaseUrl: !!supabaseUrl,
+    anonKeyPrefix: redact(anonKey),
+    serviceRolePrefix: redact(serviceRole),
+    stripeMode: summarizeStripeMode(stripeSecret),
+    twilioSidPrefix: redact(twilioSid),
+  });
+})();
 
 // (Stripe guard unchanged...)
 (function assertStripeModeConsistency() {

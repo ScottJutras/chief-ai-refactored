@@ -200,13 +200,24 @@ async function resolveActorIdentities({ kind, identifier }, markDegraded) {
 
 async function resolveOwnerPlan(ownerDigits, markDegraded) {
   const owner = normalizeDigits(ownerDigits);
-  if (!owner) return { plan: "free", plan_key: null, sub_status: null };
+
+  if (!owner) {
+    return {
+      plan: "free",
+      plan_key: null,
+      sub_status: null,
+      reason: "missing_owner_id",
+    };
+  }
 
   const r = await safeQuery(
-    `select plan_key, sub_status
-       from public.users
-      where user_id = $1
-      limit 1`,
+    `
+    select owner_id, user_id, plan_key, sub_status, created_at
+    from public.users
+    where owner_id = $1
+    order by created_at desc nulls last
+    limit 1
+    `,
     [owner],
     markDegraded
   );
@@ -216,7 +227,8 @@ async function resolveOwnerPlan(ownerDigits, markDegraded) {
   return {
     plan: getEffectivePlanKey(row),
     plan_key: row?.plan_key ?? null,
-    sub_status: row?.sub_status ?? null
+    sub_status: row?.sub_status ?? null,
+    reason: row ? "users.owner_id" : "free_fallback",
   };
 }
 
@@ -449,11 +461,25 @@ if (req.tenantId) {
   let plan_key = null;
   let sub_status = null;
 
-  try {
+      try {
     const out = await resolveOwnerPlan(req.ownerId, markDegraded);
     plan = String(out?.plan || "free").trim().toLowerCase();
     plan_key = out?.plan_key ?? null;
     sub_status = out?.sub_status ?? null;
+
+    try {
+      console.info("[PLAN_RESOLUTION][whatsapp]", {
+        from,
+        resolvedOwnerId: req.ownerId || null,
+        resolvedTenantId: req.tenantId || null,
+        actorId: req.actorId || null,
+        plan,
+        plan_key,
+        sub_status,
+        source: out?.reason || "unknown",
+        dbDegraded: !!req.dbDegraded,
+      });
+    } catch {}
   } catch (e) {
     console.warn("[userProfile] resolveOwnerPlan failed (default free):", e?.message);
     plan = "free";

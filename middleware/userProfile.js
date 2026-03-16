@@ -198,6 +198,57 @@ async function resolveActorIdentities({ kind, identifier }, markDegraded) {
   }
 }
 
+async function resolveWhatsAppIdentityDirect(phoneDigits, markDegraded) {
+  const p = normalizeDigits(phoneDigits);
+  if (!p) return [];
+
+  const candidates = Array.from(
+    new Set(
+      [
+        p,
+        "+" + p,
+        "whatsapp:+" + p,
+        "whatsapp:" + p,
+      ].filter(Boolean)
+    )
+  );
+
+  const r = await safeQuery(
+    `
+    select
+      ui.tenant_id,
+      ui.user_id::text as portal_user_id,
+      ui.identifier,
+      t.owner_id as owner_phone_digits,
+      cp.role,
+      t.tz
+    from public.chiefos_user_identities ui
+    join public.chiefos_tenants t
+      on t.id = ui.tenant_id
+    left join public.chiefos_portal_users cp
+      on cp.tenant_id = ui.tenant_id
+     and cp.user_id = ui.user_id
+    where ui.kind = 'whatsapp'
+      and ui.identifier = any($1::text[])
+    order by ui.created_at desc
+    `,
+    [candidates],
+    markDegraded
+  );
+
+  return (r?.rows || []).map((row) => ({
+    kind: "whatsapp",
+    identifier: row.identifier,
+    tenant_id: row.tenant_id,
+    role: row.role || null,
+    owner_phone_digits: normalizeDigits(row.owner_phone_digits) || null,
+    tz: row.tz || null,
+    actor_id: null, // no actor_id from this fallback path
+    portal_user_id: row.portal_user_id || null,
+    source: "chiefos_user_identities_direct",
+  }));
+}
+
 async function resolveOwnerPlan(ownerDigits, markDegraded) {
   const owner = normalizeDigits(ownerDigits);
 
@@ -388,7 +439,25 @@ try {
   resolvedRows = [];
 }
 
-const candidates = (resolvedRows || []).filter(r => !!r?.tenant_id);
+let candidates = (resolvedRows || []).filter((r) => !!r?.tenant_id);
+
+// Fallback: direct canonical lookup from chiefos_user_identities
+if (!candidates.length) {
+  try {
+    const directRows = await resolveWhatsAppIdentityDirect(from, markDegraded);
+    candidates = (directRows || []).filter((r) => !!r?.tenant_id);
+
+    try {
+      console.info("[userProfile] direct whatsapp identity fallback", {
+        from,
+        candidateCount: candidates.length,
+        source: "chiefos_user_identities_direct",
+      });
+    } catch {}
+  } catch (e) {
+    console.warn("[userProfile] direct whatsapp identity fallback failed:", e?.message);
+  }
+}
 const uniqTenantIds = Array.from(new Set(candidates.map(r => String(r.tenant_id))));
 
 if (uniqTenantIds.length > 1) {
@@ -453,6 +522,16 @@ req.multiTenantChoices = uniqTenantIds.map((tid) => {
   req.isOwner = String(chosen.role || "").toLowerCase() === "owner";
   req.tz = pickTz(chosen) || DEFAULT_TZ;
   req.actorId = chosen.actor_id || null;
+
+  try {
+    console.info("[userProfile] whatsapp identity resolved", {
+      from,
+      tenantId: req.tenantId,
+      ownerId: req.ownerId,
+      role: chosen.role || null,
+      source: chosen.source || "resolver_view",
+    });
+  } catch {}
 }
 
 if (req.tenantId) {

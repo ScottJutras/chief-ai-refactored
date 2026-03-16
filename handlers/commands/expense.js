@@ -740,7 +740,81 @@ return await sendConfirmExpenseOrFallback(fromPhone, line, {
 
 }
 
+function parseExpenseEditOverwrite(text) {
+  const src = String(text || '').trim();
+  if (!src) {
+    return {
+      amount: null,
+      store: null,
+      date: null,
+      jobName: null
+    };
+  }
 
+  let s = src
+    .replace(/[💸🏪📅🧰]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  let amount = null;
+  let store = null;
+  let date = null;
+  let jobName = null;
+
+  // amount
+  const amtMatch = s.match(/\$?\s*(\d+(?:\.\d{1,2})?)\b/);
+  if (amtMatch?.[1]) {
+    amount = `$${Number(amtMatch[1]).toFixed(2)}`;
+    s = s.replace(amtMatch[0], ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  // job
+  const jobMatch =
+    s.match(/\bfor\s+job\s+(.+)$/i) ||
+    s.match(/\bjob\b\s*[:\-]?\s*(.+)$/i);
+
+  if (jobMatch?.[1]) {
+    jobName = String(jobMatch[1] || '')
+      .trim()
+      .replace(/[.!,;:]+$/g, '')
+      .trim();
+
+    s = s.replace(jobMatch[0], ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  // date
+  const dateMatch =
+    s.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b/i) ||
+    s.match(/\b(?:on\s+)?(\d{4}-\d{2}-\d{2})\b/i) ||
+    s.match(/\b(?:on\s+)?(\d{1,2}\/\d{1,2}\/\d{2,4})\b/i);
+
+  if (dateMatch?.[1]) {
+    const iso =
+      typeof extractReceiptDateYYYYMMDD === 'function'
+        ? extractReceiptDateYYYYMMDD(dateMatch[1])
+        : null;
+
+    date = iso || String(dateMatch[1]).trim();
+    s = s.replace(dateMatch[0], ' ').replace(/\s+/g, ' ').trim();
+  }
+
+  // clean leading connectors
+  s = s
+    .replace(/^\b(expense|from|at|store)\b[:\s-]*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (s) {
+    store = s.replace(/[.!,;:]+$/g, '').trim() || null;
+  }
+
+  return {
+    amount,
+    store,
+    date,
+    jobName
+  };
+}
 
 
 async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile }) {
@@ -3183,6 +3257,40 @@ if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
   return { total, dateIso, store, currency };
 }
 
+function chooseBestReceiptAmountCandidate(candidates) {
+  const rows = Array.isArray(candidates) ? candidates : [];
+  if (!rows.length) return null;
+
+  const penaltyWords = [
+    'hst', 'gst', 'pst', 'tax', 'discount', 'save', 'savings',
+    'litre', 'liter', 'litre:', 'price/l', 'price per litre', 'cents/l'
+  ];
+
+  const strongWords = [
+    'total', 'amount due', 'balance due', 'debit', 'visa',
+    'mastercard', 'paid', 'purchase', 'sale'
+  ];
+
+  const scored = rows
+    .map((r) => {
+      const line = String(r?.line || '').toLowerCase();
+      const value = Number(r?.value || 0);
+
+      if (!Number.isFinite(value) || value <= 0) return null;
+
+      let score = value;
+
+      if (strongWords.some((w) => line.includes(w))) score += 1000;
+      if (penaltyWords.some((w) => line.includes(w))) score -= 1000;
+
+      return { value, line, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.value != null ? scored[0].value : null;
+}
+
 function mergeDraftNonNull(dst, patch) {
   const out = { ...(dst || {}) };
   for (const [k, v] of Object.entries(patch || {})) {
@@ -4150,13 +4258,10 @@ try {
     /^tasks?\b/.test(lcEarly) ||
     /^timesheet\b/.test(lcEarly);
 
-  const looksLikeNewIntakeEarly =
-    typeof looksLikeNewExpenseText === 'function' ? looksLikeNewExpenseText(rawInboundText) : false;
-
   if (draftEarly?.awaiting_edit && !isControlEarly) {
-    // ✅ If user sends an info command or a brand-new intake while awaiting_edit, do NOT consume as edit payload.
     if (isNonIntakeQueryEarly) {
-  return out(twimlText(
+      return out(
+        twimlText(
           [
             '✏️ I’m waiting for your edited expense details in ONE message.',
             'Example:',
@@ -4174,40 +4279,42 @@ try {
       head: String(rawInboundText || '').trim().slice(0, 140)
     });
 
-   let nextDraft = null;
-let aiReply = null;
+    let nextDraft = null;
+    let aiReply = null;
 
-try {
-  const tz0 = tz;
-  const r = await applyEditPayloadToConfirmDraft(
-    rawInboundText,
-    draftEarly,
-    { fromKey: paUserId, tz: tz0, defaultData: {} }
-  );
-  nextDraft = r?.nextDraft || null;
-  aiReply = r?.aiReply || null;
-} catch (e) {
-  const msg = String(e?.message || '');
-  if (msg.includes('429')) {
-    return out(
-      twimlText('⚠️ I’m temporarily rate-limited. Please resend your edited expense with: amount + store + date + (optional) job.'),
-      false
-    );
-  }
-  throw e;
-}
+    try {
+      const tz0 = tz;
+      const r = await applyEditPayloadToConfirmDraft(
+        rawInboundText,
+        draftEarly,
+        { fromKey: paUserId, tz: tz0, defaultData: {} }
+      );
+      nextDraft = r?.nextDraft || null;
+      aiReply = r?.aiReply || null;
+    } catch (e) {
+      const msg = String(e?.message || '');
+      if (msg.includes('429')) {
+        return out(
+          twimlText(
+            '⚠️ I’m temporarily rate-limited. Please resend your edited expense with: amount + store + date + (optional) job.'
+          ),
+          false
+        );
+      }
+      throw e;
+    }
 
-if (!nextDraft) {
-  return out(
-    twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
-    false
-  );
-}
-
+    if (!nextDraft) {
+      return out(
+        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
+        false
+      );
+    }
 
     const extractJobNameFromEditText = (t) => {
       const s = String(t || '').trim();
       if (!s) return null;
+
       const m = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
       if (!m?.[1]) return null;
 
@@ -4222,18 +4329,50 @@ if (!nextDraft) {
     const jobFromText = extractJobNameFromEditText(rawInboundText);
 
     let jobPatch = null;
-    try { jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText); } catch {}
+    try {
+      jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
+    } catch {}
+
+    // ✅ AUTHORITATIVE OVERWRITE FROM USER'S EDIT MESSAGE
+    const overwrite = parseExpenseEditOverwrite(rawInboundText);
 
     const patchedDraft = {
       ...(draftEarly || {}),
       ...(nextDraft || {}),
       ...(jobPatch || {}),
-      ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
+
+      amount:
+        overwrite.amount ||
+        nextDraft?.amount ||
+        draftEarly?.amount ||
+        null,
+
+      store:
+        overwrite.store ||
+        nextDraft?.store ||
+        draftEarly?.store ||
+        null,
+
+      date:
+        overwrite.date ||
+        nextDraft?.date ||
+        draftEarly?.date ||
+        null,
+
+      jobName:
+        overwrite.jobName ||
+        jobFromText ||
+        jobPatch?.jobName ||
+        nextDraft?.jobName ||
+        draftEarly?.jobName ||
+        null,
+
+      ...(overwrite.jobName || jobFromText ? { jobSource: 'typed' } : null),
 
       // ✅ user's edit is authoritative for current draft text
       draftText: String(rawInboundText || '').trim(),
 
-      // ✅ preserve original intake/audit text (do NOT overwrite with edit)
+      // ✅ preserve original intake / OCR evidence
       originalText: (
         String(
           draftEarly?.originalText ||
@@ -4247,9 +4386,16 @@ if (!nextDraft) {
       edit_started_at: null,
       editStartedAt: null,
       edit_flow_id: null,
-
       needsReparse: false
     };
+
+    console.info('[EXPENSE_EDIT_OVERWRITE_RESULT]', {
+      paUserId,
+      amount: patchedDraft.amount || null,
+      store: patchedDraft.store || null,
+      date: patchedDraft.date || null,
+      jobName: patchedDraft.jobName || null
+    });
 
     await upsertPA({
       ownerId,

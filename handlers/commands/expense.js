@@ -1894,6 +1894,10 @@ function extractReceiptDateYYYYMMDD(text, tz = 'America/Toronto') {
   return null;
 }
 
+function extractReceiptDate(text, tz = 'America/Toronto') {
+  return extractReceiptDateYYYYMMDD(text, tz);
+}
+
 
 function extractReceiptStore(text) {
   const t = normalizeDashes(String(text || '')).replace(/\s+/g, ' ').trim();

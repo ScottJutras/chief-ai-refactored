@@ -465,23 +465,6 @@ function waTo(fromPhone) {
 }
 exports.waTo = waTo;
 
-// Helper: normalize "<digits>:SMxxxx" safely (prevents double-prefix / junk prefixes)
-function normalizeMediaSourceMsgId(userKeyDigits, val) {
-  const u = String(userKeyDigits || '').trim();
-  const s0 = String(val || '').trim();
-  if (!u) return s0 || null;
-  if (!s0) return null;
-
-  // Already "digits:SM..." -> keep
-  if (/^\d{7,20}:SM[a-f0-9]{10,64}$/i.test(s0)) return s0;
-
-  // Plain "SM..." -> prefix with digits
-  if (/^SM[a-f0-9]{10,64}$/i.test(s0)) return `${u}:${s0}`;
-
-  // Unknown shape -> keep as-is (don’t invent)
-  return s0;
-}
-
 
 function getTwilioClient() {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
@@ -709,19 +692,26 @@ function buildExpenseSummaryLine({
 
   // ---------------------------------------------------------
   // item
-  // trust order:
-  // 1) explicit cleaned item from draft
+  // TRUST ORDER:
+  // 1) explicit cleaned item already on draft
   // 2) safe receipt primary item extractor
   // 3) Unknown
+  // NEVER broad-regex fallback over noisy OCR footer text
   // ---------------------------------------------------------
   let it = cleanExpenseItemForDisplay(item);
 
-  if (isUnknownItem(it) && sourceText && typeof extractReceiptPrimaryItem === 'function') {
+  const looksBadItem =
+    !it ||
+    /^unknown\b/i.test(String(it || '')) ||
+    /\b(returns?-and-refunds|store details|career with|www\.|http|rona\.ca)\b/i.test(String(it || '')) ||
+    String(it || '').length > 100;
+
+  if (looksBadItem && sourceText && typeof extractReceiptPrimaryItem === 'function') {
     const primary = extractReceiptPrimaryItem(sourceText);
     if (primary) it = cleanExpenseItemForDisplay(primary);
   }
 
-  if (isUnknownItem(it)) it = 'Unknown';
+  if (!it || /^unknown\b/i.test(String(it || ''))) it = 'Unknown';
 
   // ---------------------------------------------------------
   // store
@@ -737,9 +727,7 @@ function buildExpenseSummaryLine({
 
   // ---------------------------------------------------------
   // date
-  // IMPORTANT:
-  // - show date only if actually known
-  // - never invent/force a date in summary
+  // show only if actually known
   // ---------------------------------------------------------
   const dt = String(date || '').trim()
     ? formatDisplayDate(date, tz)
@@ -753,7 +741,7 @@ function buildExpenseSummaryLine({
   // ---------------------------------------------------------
   // subtotal / tax / total
   // prefer explicit draft fields first
-  // only fall back to receipt OCR extraction if draft fields missing
+  // OCR fallback only if explicit fields missing
   // ---------------------------------------------------------
   const taxInfo =
     typeof extractReceiptTaxBreakdown === 'function'
@@ -801,9 +789,6 @@ function buildExpenseSummaryLine({
       ? `Total: ${formatMoneyDisplay(safeTotal)}`
       : null;
 
-  // ---------------------------------------------------------
-  // build lines
-  // ---------------------------------------------------------
   const lines = [];
   lines.push(`💸 ${amt} — ${it}`);
 
@@ -1809,28 +1794,26 @@ function extractReceiptPrimaryItem(text) {
   if (!lines.length) return null;
 
   const badLine =
-    /\b(subtotal|total|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details)\b/i;
+    /\b(subtotal|total|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#)\b/i;
 
   const looksPriceish = /(\$?\d+\.\d{2})/.test.bind(/(\$?\d+\.\d{2})/);
   const looksSkuish = /^\d{6,}$/.test.bind(/^\d{6,}$/);
 
-  // Prefer descriptive product lines
+  // Prefer descriptive product/material lines
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
 
     if (badLine.test(line)) continue;
     if (looksSkuish(line)) continue;
 
-    // Strong material/product-style line
     if (
       /[A-Za-z]/.test(line) &&
       line.length >= 6 &&
       line.length <= 80 &&
       !looksPriceish(line)
     ) {
-      // Ignore obvious headers
       if (/^(item|qty|price|total)$/i.test(line)) continue;
-      if (/^(mission exteriors|rona inc\.?)$/i.test(line)) continue;
+      if (/^(mission exteriors|rona inc\.?|rona\+?\s+n\.?w\.?\s+london)$/i.test(line)) continue;
 
       return cleanExpenseItemForDisplay(line);
     }
@@ -4523,6 +4506,35 @@ function getInboundTextExpense(input, meta = {}) {
   if (body) return body;
 
   return '';
+}
+
+// ---------------------------------------------------------
+// ✅ Media source msg id normalizer (FILE SCOPE)
+// Prevents double-prefix / junk prefixes and avoids TDZ issues
+// when YES / confirm / receipt seed paths all need the same helper.
+// ---------------------------------------------------------
+function normalizeMediaSourceMsgId(userKeyDigits, val) {
+  const u = String(userKeyDigits || '').trim();
+  const s0 = String(val || '').trim();
+
+  if (!u) return s0 || null;
+  if (!s0) return null;
+
+  // Already "digits:SM..."
+  if (/^\d{7,20}:SM[a-f0-9]{10,64}$/i.test(s0)) return s0;
+
+  // Raw SM...
+  const mSid = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
+  if (mSid?.[0]) return `${u}:${mSid[0]}`;
+
+  // Something like "junk:SM..."
+  if (s0.includes(':')) {
+    const m2 = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
+    if (m2?.[0]) return `${u}:${m2[0]}`;
+  }
+
+  // Fallback: prefix raw token
+  return `${u}:${s0}`;
 }
 
 // ---------------------------------------------------------
@@ -7309,29 +7321,6 @@ return out(twimlText(okMsg), false);
 
 /* ---- 3) New expense parse (deterministic first) ---- */
 
-// ✅ Helper: normalize "<digits>:SMxxxx" safely (prevents double-prefix / junk prefixes)
-const normalizeMediaSourceMsgId = (userKeyDigits, val) => {
-  const u = String(userKeyDigits || '').trim();
-  const s0 = String(val || '').trim();
-  if (!u) return s0 || null;
-  if (!s0) return null;
-
-  // Already "digits:SM..." -> keep
-  if (/^\d{7,20}:SM[a-f0-9]{10,64}$/i.test(s0)) return s0;
-
-  // If it's just SM...
-  const mSid = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
-  if (mSid?.[0]) return `${u}:${mSid[0]}`;
-
-  // If it's "something:SM..." but not digits prefix -> re-key with our userKey
-  if (s0.includes(':')) {
-    const m2 = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
-    if (m2?.[0]) return `${u}:${m2[0]}`;
-  }
-
-  // Otherwise treat as raw token -> prefix
-  return `${u}:${s0}`;
-};
 
 // ✅ Receipt/OCR path: seed/patch CONFIRM PA so "Yes" has something real to submit.
 // IMPORTANT: do NOT run deterministicExpenseParse on receipt blobs.

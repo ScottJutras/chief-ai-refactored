@@ -695,8 +695,6 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
     '';
 
   const line =
-    confirmPA?.payload?.humanLine ||
-    confirmPA?.payload?.summaryLine ||
     buildExpenseSummaryLine({
       amount: draft.amount,
       item: draft.item,
@@ -704,9 +702,12 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
       date: draft.date,
       jobName: draft.jobName,
       tz,
-      sourceText: srcText
-    }) ||
-    'Confirm expense?';
+      sourceText: srcText,
+      subtotalAmount: draft.subtotal_amount,
+      taxAmount: draft.tax_amount,
+      taxLabel: draft.tax_label,
+      currency: draft.currency
+    }) || 'Confirm expense?';
      // ✅ Ensure CIL draft exists whenever we show confirm UI
   try {
     const srcId =
@@ -752,7 +753,7 @@ function parseExpenseEditOverwrite(text) {
   }
 
   let s = src
-    .replace(/[💸🏪📅🧰]/g, ' ')
+    .replace(/[💸🏪📅🧰🧾🏷️📦]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -761,14 +762,12 @@ function parseExpenseEditOverwrite(text) {
   let date = null;
   let jobName = null;
 
-  // amount
   const amtMatch = s.match(/\$?\s*(\d+(?:\.\d{1,2})?)\b/);
   if (amtMatch?.[1]) {
     amount = `$${Number(amtMatch[1]).toFixed(2)}`;
     s = s.replace(amtMatch[0], ' ').replace(/\s+/g, ' ').trim();
   }
 
-  // job
   const jobMatch =
     s.match(/\bfor\s+job\s+(.+)$/i) ||
     s.match(/\bjob\b\s*[:\-]?\s*(.+)$/i);
@@ -782,7 +781,6 @@ function parseExpenseEditOverwrite(text) {
     s = s.replace(jobMatch[0], ' ').replace(/\s+/g, ' ').trim();
   }
 
-  // date
   const dateMatch =
     s.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b/i) ||
     s.match(/\b(?:on\s+)?(\d{4}-\d{2}-\d{2})\b/i) ||
@@ -798,9 +796,8 @@ function parseExpenseEditOverwrite(text) {
     s = s.replace(dateMatch[0], ' ').replace(/\s+/g, ' ').trim();
   }
 
-  // clean leading connectors
   s = s
-    .replace(/^\b(expense|from|at|store)\b[:\s-]*/i, '')
+    .replace(/^\b(expense|from|at|store|vendor|merchant)\b[:\s-]*/i, '')
     .replace(/\s+/g, ' ')
     .trim();
 
@@ -1361,81 +1358,118 @@ function formatDisplayDate(isoDate, tz = 'America/Toronto') {
   }
 }
 
-function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourceText }) {
-  // ✅ Display amount with commas + $ + 2 decimals when possible
-  const rawAmt = String(amount || '').trim();
+function normalizeExpenseData(data, userProfile, sourceText = '') {
+  const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
+  const d = { ...(data || {}) };
+  const src = String(sourceText || '').trim();
 
-  const amtNum = (() => {
-    const n = Number(rawAmt.replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
-    return Number.isFinite(n) ? n : NaN;
-  })();
+  // ---------------------------
+  // Receipt-first backfills
+  // ---------------------------
 
-  const amt =
-    Number.isFinite(amtNum) && amtNum > 0
-      ? formatMoneyDisplay(amtNum) // ✅ Intl.NumberFormat => commas
-      : rawAmt
-        ? (rawAmt.startsWith('$')
-            ? rawAmt
-            : /^\d+(?:\.\d+)?$/.test(rawAmt)
-              ? formatMoneyDisplay(Number(rawAmt))
-              : rawAmt)
-        : '$0.00';
+  const taxBreakdown = src ? extractReceiptTaxBreakdown(src) : null;
 
-  // Start with existing behavior
-  let it = cleanExpenseItemForDisplay(item);
+  // Amount = final total
+  const currentAmt = d.amount != null ? toNumberAmount(d.amount) : null;
+  const receiptTotal =
+    taxBreakdown?.total != null
+      ? taxBreakdown.total
+      : src
+      ? extractReceiptTotal(src)
+      : null;
 
-  // ✅ Option B: Only infer item from receipt-ish text (prevents job/date pollution)
-  if (isUnknownItem(it) && sourceText) {
-    const src0 = String(sourceText || '').trim();
-
-    const looksReceiptish =
-      /^\s*\$/.test(src0) || // starts with money
-      /\b(total|subtotal|hst|gst|pst|tax|amount due)\b/i.test(src0) ||
-      src0.split('\n').length >= 3; // multi-line = likely OCR/receipt
-
-    if (looksReceiptish) {
-      const src = normalizeDashes(src0);
-
-      // 1) "$883 - Railing ..."
-      let m =
-        src.match(
-          /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
-        ) || null;
-      if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
-
-      // 2) "purchased $883 in railing at Rona"
-      if (isUnknownItem(it)) {
-        m =
-          src.match(
-            /\b(?:spent|spend|paid|pay|purchased|purchase|bought|buy|ordered|order|got)\b.*?\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+\bin\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-          ) || null;
-        if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
-      }
-
-      // 3) "$883 railing at Rona"
-      if (isUnknownItem(it)) {
-        m =
-          src.match(
-            /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-          ) || null;
-        if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
-      }
-    }
+  if ((d.amount == null || !Number.isFinite(currentAmt) || currentAmt <= 0) && receiptTotal != null) {
+    d.amount = receiptTotal;
   }
 
-  if (isUnknownItem(it)) it = 'Unknown';
+  // Carry tax fields
+  if ((d.subtotal_amount == null || !Number.isFinite(Number(d.subtotal_amount))) && taxBreakdown?.subtotal != null) {
+    d.subtotal_amount = taxBreakdown.subtotal;
+  }
 
-  const st = String(store || '').trim() || 'Unknown Store';
-  const dt = formatDisplayDate(date, tz);
-  const jb = jobName ? String(jobName).trim() : '';
+  if ((d.tax_amount == null || !Number.isFinite(Number(d.tax_amount))) && taxBreakdown?.tax != null) {
+    d.tax_amount = taxBreakdown.tax;
+  }
 
-  const lines = [];
-  lines.push(`💸 ${amt} — ${it}`);
-  if (st && st !== 'Unknown Store') lines.push(`🏪 ${st}`);
-  if (dt) lines.push(`📅 ${dt}`);
-  if (jb) lines.push(`🧰 ${jb}`);
+  if (!String(d.tax_label || '').trim() && taxBreakdown?.taxLabel) {
+    d.tax_label = taxBreakdown.taxLabel;
+  }
 
-  return lines.join('\n');
+  // Date
+  if (!String(d.date || '').trim() && src) {
+    const receiptDate = extractReceiptDateYYYYMMDD(src, tz) || extractReceiptDate(src);
+    if (receiptDate) d.date = receiptDate;
+  }
+
+  // Store
+  const storeTrim = String(d.store || '').trim();
+  const storeWeak = !storeTrim || /^unknown\b/i.test(storeTrim) || storeTrim.length > 60 || /\$\d/.test(storeTrim);
+
+  if (storeWeak && src) {
+    const receiptStore = extractReceiptStore(src);
+    if (receiptStore) d.store = receiptStore;
+  }
+
+  // ---------------------------
+  // Item sanitization
+  // ---------------------------
+  const rawItem = String(d.item || '').trim();
+
+  const looksLikeReceiptMeta =
+    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|vat|visa|mastercard|debit|change|tender)\b/i.test(rawItem);
+
+  const looksLikeMoneyLine =
+    /^\$?\s*\d{1,6}(?:\.\d{2})?\s*$/.test(rawItem) ||
+    /\$\s*\d{1,6}(?:\.\d{2})?/.test(rawItem);
+
+  const tooLong = rawItem.length > 120;
+
+  if (!rawItem || looksLikeReceiptMeta || looksLikeMoneyLine || tooLong) {
+    d.item = null;
+  }
+
+  // ---------------------------
+  // Formatting / defaults
+  // ---------------------------
+  if (d.amount != null) {
+    const n = toNumberAmount(d.amount);
+    if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
+  }
+
+  if (d.subtotal_amount != null) {
+    const n = Number(d.subtotal_amount);
+    if (Number.isFinite(n) && n >= 0) d.subtotal_amount = Number(n.toFixed(2));
+  }
+
+  if (d.tax_amount != null) {
+    const n = Number(d.tax_amount);
+    if (Number.isFinite(n) && n >= 0) d.tax_amount = Number(n.toFixed(2));
+  }
+
+  if (d.tax_label != null) {
+    const x = String(d.tax_label || '').trim();
+    d.tax_label = x || null;
+  }
+
+  d.date = String(d.date || '').trim() || todayInTimeZone(tz);
+  d.item = cleanExpenseItemForDisplay(d.item);
+  d.store = String(d.store || '').trim() || 'Unknown Store';
+
+  if (d.jobName != null) d.jobName = normalizeJobNameCandidate(d.jobName);
+
+  if (d.suggestedCategory != null) {
+    const c = String(d.suggestedCategory).trim();
+    d.suggestedCategory = c || null;
+  }
+
+  if (d.jobSource != null) {
+    const js = String(d.jobSource).trim();
+    d.jobSource = js || null;
+  }
+
+  if (d.job_no != null && !Number.isFinite(Number(d.job_no))) d.job_no = null;
+
+  return d;
 }
 
 function isStalePickerTap(pickPA, inbound) {
@@ -1816,6 +1850,98 @@ function extractReceiptTotal(text) {
     return Number.isFinite(n) ? n : null;
   };
 
+function extractReceiptTaxBreakdown(text) {
+  const raw = String(text || '');
+  if (!raw) {
+    return {
+      subtotal: null,
+      tax: null,
+      total: null,
+      taxLabel: null
+    };
+  }
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const parseMoney = (line) => {
+    const m = String(line || '').match(
+      /(?:^|[^0-9])(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d{1,6}\.\d{2})(?:[^0-9]|$)/
+    );
+    if (!m?.[1]) return null;
+    const n = Number(String(m[1]).replace(/,/g, ''));
+    return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
+  };
+
+  let subtotal = null;
+  let tax = null;
+  let total = null;
+  let taxLabel = null;
+
+  for (const line of lines) {
+    const lc = line.toLowerCase();
+
+    if (subtotal == null && /\bsub\s*total\b|\bsubtotal\b/.test(lc)) {
+      const n = parseMoney(line);
+      if (n != null && n > 0) subtotal = n;
+    }
+
+    if (tax == null && /\b(hst|gst|pst|vat|tax)\b/.test(lc)) {
+      const n = parseMoney(line);
+      if (n != null && n >= 0) tax = n;
+
+      if (!taxLabel) {
+        if (/\bhst\b/i.test(line)) taxLabel = 'HST';
+        else if (/\bgst\b/i.test(line)) taxLabel = 'GST';
+        else if (/\bpst\b/i.test(line)) taxLabel = 'PST';
+        else if (/\bvat\b/i.test(line)) taxLabel = 'VAT';
+        else if (/\btax\b/i.test(line)) taxLabel = 'Tax';
+      }
+    }
+
+    if (total == null && /\b(grand\s*total|amount\s*due|total\s*due|total)\b/.test(lc)) {
+      const n = parseMoney(line);
+      if (n != null && n > 0) total = n;
+    }
+  }
+
+  if (total == null) {
+    total = extractReceiptTotal(raw);
+  }
+
+  if (subtotal == null && total != null && tax != null) {
+    const n = total - tax;
+    if (Number.isFinite(n) && n >= 0) subtotal = Number(n.toFixed(2));
+  }
+
+  if (tax == null && subtotal != null && total != null && total >= subtotal) {
+    const n = total - subtotal;
+    if (Number.isFinite(n) && n >= 0) {
+      tax = Number(n.toFixed(2));
+      if (!taxLabel) taxLabel = 'Tax';
+    }
+  }
+
+  return {
+    subtotal: subtotal != null ? Number(subtotal.toFixed(2)) : null,
+    tax: tax != null ? Number(tax.toFixed(2)) : null,
+    total: total != null ? Number(total.toFixed(2)) : null,
+    taxLabel: taxLabel || null
+  };
+}
+
+function formatMoneyDisplayMaybe(v) {
+  const n =
+    typeof v === 'number'
+      ? v
+      : Number(String(v || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
+
+  if (!Number.isFinite(n)) return null;
+  return formatMoneyDisplay(n);
+}
+  
 function formatMoneyMaybe(amountStrOrNum) {
   const n =
     typeof amountStrOrNum === 'number'
@@ -2091,12 +2217,32 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
   // Receipt-first backfills
   // ---------------------------
 
-  // Amount
+  const taxBreakdown = src ? extractReceiptTaxBreakdown(src) : null;
+
+  // Amount = final total
   const currentAmt = d.amount != null ? toNumberAmount(d.amount) : null;
-  const receiptTotal = src ? extractReceiptTotal(src) : null;
+  const receiptTotal =
+    taxBreakdown?.total != null
+      ? taxBreakdown.total
+      : src
+      ? extractReceiptTotal(src)
+      : null;
 
   if ((d.amount == null || !Number.isFinite(currentAmt) || currentAmt <= 0) && receiptTotal != null) {
-    d.amount = receiptTotal; // numeric; formatted below
+    d.amount = receiptTotal;
+  }
+
+  // Carry tax fields
+  if ((d.subtotal_amount == null || !Number.isFinite(Number(d.subtotal_amount))) && taxBreakdown?.subtotal != null) {
+    d.subtotal_amount = taxBreakdown.subtotal;
+  }
+
+  if ((d.tax_amount == null || !Number.isFinite(Number(d.tax_amount))) && taxBreakdown?.tax != null) {
+    d.tax_amount = taxBreakdown.tax;
+  }
+
+  if (!String(d.tax_label || '').trim() && taxBreakdown?.taxLabel) {
+    d.tax_label = taxBreakdown.taxLabel;
   }
 
   // Date
@@ -2105,7 +2251,7 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
     if (receiptDate) d.date = receiptDate;
   }
 
-  // Store (vendor)
+  // Store
   const storeTrim = String(d.store || '').trim();
   const storeWeak = !storeTrim || /^unknown\b/i.test(storeTrim) || storeTrim.length > 60 || /\$\d/.test(storeTrim);
 
@@ -2115,18 +2261,16 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
   }
 
   // ---------------------------
-  // ✅ Item sanitization (STOP Subtotal/Tax/Total)
+  // Item sanitization
   // ---------------------------
   const rawItem = String(d.item || '').trim();
 
-  // common receipt non-items / totals
   const looksLikeReceiptMeta =
-    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|visa|mastercard|debit|change|tender)\b/i.test(rawItem);
+    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|vat|visa|mastercard|debit|change|tender)\b/i.test(rawItem);
 
   const looksLikeMoneyLine =
     /^\$?\s*\d{1,6}(?:\.\d{2})?\s*$/.test(rawItem) ||
     /\$\s*\d{1,6}(?:\.\d{2})?/.test(rawItem);
-
 
   const tooLong = rawItem.length > 120;
 
@@ -2134,24 +2278,31 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
     d.item = null;
   }
 
-  // If still no item, keep it null (let category handle it).
-  // Optional: if you have an extractor for a "best item line", you can backfill here:
-  // if (!d.item && src && typeof extractReceiptPrimaryItem === 'function') d.item = extractReceiptPrimaryItem(src) || null;
-
   // ---------------------------
   // Formatting / defaults
   // ---------------------------
-
   if (d.amount != null) {
     const n = toNumberAmount(d.amount);
     if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
   }
 
+  if (d.subtotal_amount != null) {
+    const n = Number(d.subtotal_amount);
+    if (Number.isFinite(n) && n >= 0) d.subtotal_amount = Number(n.toFixed(2));
+  }
+
+  if (d.tax_amount != null) {
+    const n = Number(d.tax_amount);
+    if (Number.isFinite(n) && n >= 0) d.tax_amount = Number(n.toFixed(2));
+  }
+
+  if (d.tax_label != null) {
+    const x = String(d.tax_label || '').trim();
+    d.tax_label = x || null;
+  }
+
   d.date = String(d.date || '').trim() || todayInTimeZone(tz);
-
-  // keep item display-safe (may become null)
   d.item = cleanExpenseItemForDisplay(d.item);
-
   d.store = String(d.store || '').trim() || 'Unknown Store';
 
   if (d.jobName != null) d.jobName = normalizeJobNameCandidate(d.jobName);
@@ -3208,10 +3359,8 @@ function parseReceiptBackstop(ocrText) {
   const t = normalizeDashes(String(ocrText || '')).replace(/\s+/g, ' ').trim();
   if (!t) return null;
 
-  // ✅ Store: use extractReceiptStore instead of substring window heuristics
   const store = extractReceiptStore(t);
 
-  // ✅ Date: support MM/DD/YYYY and also ISO
   let dateIso = null;
   const mdY = t.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
   if (mdY) {
@@ -3219,26 +3368,10 @@ function parseReceiptBackstop(ocrText) {
     dateIso = `${yyyy}-${mm}-${dd}`;
   } else {
     const ymd = t.match(/\b(\d{4})\s*-\s*(\d{2})\s*-\s*(\d{2})\b/);
-if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
+    if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
   }
 
-  // ✅ Total: prefer explicit "Total"
-  let total = null;
-  const totalLine =
-    t.match(/\btotal\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
-    t.match(/\bdebit\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
-    t.match(/\binterac\b[^0-9]{0,20}(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\b/i) ||
-    null;
-
-  if (totalLine?.[1]) {
-    total = Number(String(totalLine[1]).replace(/,/g, ''));
-    if (!Number.isFinite(total)) total = null;
-  }
-
-  // ✅ Currency (optional): CAD, USD, etc
   let currency = null;
-
-  // Accept common variants: "CAD", "C$", "$CAD", "USD", "$USD"
   const cur =
     t.match(/\b(CAD|USD|EUR|GBP)\b/i) ||
     t.match(/\b(C\$|US\$)\b/i) ||
@@ -3251,10 +3384,28 @@ if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
     else currency = raw.replace('$', '');
   }
 
-  // If we found nothing useful, return null
-  if (!total && !dateIso && !store && !currency) return null;
+  const tax = extractReceiptTaxBreakdown(t);
 
-  return { total, dateIso, store, currency };
+  if (
+    tax.total == null &&
+    tax.subtotal == null &&
+    tax.tax == null &&
+    !dateIso &&
+    !store &&
+    !currency
+  ) {
+    return null;
+  }
+
+  return {
+    total: tax.total,
+    subtotal: tax.subtotal,
+    tax: tax.tax,
+    taxLabel: tax.taxLabel,
+    dateIso,
+    store,
+    currency
+  };
 }
 
 function chooseBestReceiptAmountCandidate(candidates) {
@@ -4331,10 +4482,19 @@ try {
     let jobPatch = null;
     try {
       jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
-    } catch {}
+    } catch {
+      jobPatch = null;
+    }
 
-    // ✅ AUTHORITATIVE OVERWRITE FROM USER'S EDIT MESSAGE
-    const overwrite = parseExpenseEditOverwrite(rawInboundText);
+    const originalTextKeepEarly =
+      String(
+        draftEarly?.originalText ||
+        draftEarly?.receiptText ||
+        draftEarly?.ocrText ||
+        ''
+      ).trim() || null;
+
+    const overwriteEarly = parseExpenseEditOverwrite(rawInboundText);
 
     const patchedDraft = {
       ...(draftEarly || {}),
@@ -4342,45 +4502,42 @@ try {
       ...(jobPatch || {}),
 
       amount:
-        overwrite.amount ||
+        overwriteEarly.amount ||
         nextDraft?.amount ||
         draftEarly?.amount ||
         null,
 
       store:
-        overwrite.store ||
+        overwriteEarly.store ||
         nextDraft?.store ||
         draftEarly?.store ||
         null,
 
       date:
-        overwrite.date ||
+        overwriteEarly.date ||
         nextDraft?.date ||
         draftEarly?.date ||
         null,
 
       jobName:
-        overwrite.jobName ||
+        overwriteEarly.jobName ||
         jobFromText ||
         jobPatch?.jobName ||
         nextDraft?.jobName ||
         draftEarly?.jobName ||
         null,
 
-      ...(overwrite.jobName || jobFromText ? { jobSource: 'typed' } : null),
+      ...(overwriteEarly.jobName || jobFromText
+        ? { jobSource: 'typed' }
+        : jobPatch?.jobName
+          ? { jobSource: jobPatch.jobSource || 'typed' }
+          : null),
 
-      // ✅ user's edit is authoritative for current draft text
+      humanLine: null,
+      summaryLine: null,
+
       draftText: String(rawInboundText || '').trim(),
-
-      // ✅ preserve original intake / OCR evidence
-      originalText: (
-        String(
-          draftEarly?.originalText ||
-          draftEarly?.receiptText ||
-          draftEarly?.ocrText ||
-          ''
-        ).trim() || null
-      ),
+      originalText: originalTextKeepEarly,
 
       awaiting_edit: false,
       edit_started_at: null,
@@ -4389,7 +4546,7 @@ try {
       needsReparse: false
     };
 
-    console.info('[EXPENSE_EDIT_OVERWRITE_RESULT]', {
+    console.info('[EXPENSE_EDIT_OVERWRITE_RESULT_EARLY]', {
       paUserId,
       amount: patchedDraft.amount || null,
       store: patchedDraft.store || null,
@@ -5481,14 +5638,14 @@ try {
     const jobFromText = extractJobNameFromEditText(rawInboundText);
 
     // ✅ best-effort structured job patch (safe, may be null)
-    let jobPatch = null;
-    try {
-      jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
-    } catch {
-      jobPatch = null;
-    }
+let jobPatch = null;
+try {
+  jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
+} catch {
+  jobPatch = null;
+}
 
-    // ✅ IMPORTANT: keep originalText as the original intake (audit trail)
+// ✅ IMPORTANT: keep originalText as the original intake (audit trail)
 const originalTextKeep =
   String(
     draftE?.originalText ||
@@ -5497,27 +5654,71 @@ const originalTextKeep =
     ''
   ).trim() || null;
 
+// ✅ AUTHORITATIVE OVERWRITE FROM USER'S EDIT MESSAGE
+const overwrite = parseExpenseEditOverwrite(rawInboundText);
+
 const patchedDraft = {
   ...(draftE || {}),
   ...(nextDraft || {}),
   ...(jobPatch || {}),
-  ...(jobFromText ? { jobName: jobFromText, jobSource: 'typed' } : null),
+
+  // ✅ user edit wins when explicitly present
+  amount:
+    overwrite.amount ||
+    nextDraft?.amount ||
+    draftE?.amount ||
+    null,
+
+  store:
+    overwrite.store ||
+    nextDraft?.store ||
+    draftE?.store ||
+    null,
+
+  date:
+    overwrite.date ||
+    nextDraft?.date ||
+    draftE?.date ||
+    null,
+
+  jobName:
+    overwrite.jobName ||
+    jobFromText ||
+    jobPatch?.jobName ||
+    nextDraft?.jobName ||
+    draftE?.jobName ||
+    null,
+
+  ...(overwrite.jobName || jobFromText
+    ? { jobSource: 'typed' }
+    : jobPatch?.jobName
+      ? { jobSource: jobPatch.jobSource || 'typed' }
+      : null),
+
+  // ✅ force re-render from fresh summary after edit
+  humanLine: null,
+  summaryLine: null,
 
   // ✅ user's edit is authoritative for current draft text
   draftText: String(rawInboundText || '').trim(),
 
-  // ✅ preserve original intake/audit text (do NOT overwrite with edit)
+  // ✅ preserve original intake / OCR evidence
   originalText: originalTextKeep,
 
-  // ✅ exit edit mode (and clear latches)
   awaiting_edit: false,
   edit_started_at: null,
   editStartedAt: null,
   edit_flow_id: null,
-
-  // ✅ prevent later receipt reparse from overwriting the edit
   needsReparse: false
 };
+
+console.info('[EXPENSE_EDIT_OVERWRITE_RESULT]', {
+  paUserId,
+  amount: patchedDraft.amount || null,
+  store: patchedDraft.store || null,
+  date: patchedDraft.date || null,
+  jobName: patchedDraft.jobName || null
+});
 
     await upsertPA({
       ownerId,
@@ -6293,33 +6494,33 @@ if (!jobName) {
 const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0).toFixed(2);
 
     const insertPayload = {
-      owner_id: String(ownerId || '').trim(),
-      user_id: String(paUserId || '').trim(), // actor
-      actor_phone: String(paUserId || '').trim(),
-      source_msg_id: txSourceMsgId || null,
+  owner_id: String(ownerId || '').trim(),
+  tenant_id: String(userProfile?.tenant_id || ownerProfile?.tenant_id || '').trim() || null,
+  user_id: String(paUserId || '').trim(),
+  actor_phone: String(paUserId || '').trim(),
+  source_msg_id: txSourceMsgId || null,
 
-      amount: amountNumericStr, // ✅ "10.00" (DB-safe),
-      amount_cents: amountCents,
-      currency: data.currency || null,
-      date: data.date,
+  amount: amountNumericStr,
+  amount_cents: amountCents,
+  currency: data.currency || null,
+  date: data.date,
 
-      store: data.store || null,
-      description: data.item || data.description || data.memo || null,
-      category: categoryStr,
+  store: data.store || null,
+  description: data.item || data.description || data.memo || null,
+  category: categoryStr,
 
-      job_name: data.jobName || null,
-      job_source: data.jobSource || null,
+  job_name: data.jobName || null,
+  job_source: data.jobSource || null,
 
-      media_asset_id: data.media_asset_id || null,
-      media_source_msg_id: data.media_source_msg_id || null,
+  media_asset_id: data.media_asset_id || null,
+  media_source_msg_id: data.media_source_msg_id || null,
 
-      // keep originals for audits/debug
-      original_text: draftForSubmit?.originalText || sourceText || null,
-      draft_text: draftForSubmit?.draftText || sourceText || null
-    };
+  original_text: draftForSubmit?.originalText || sourceText || null,
+  draft_text: draftForSubmit?.draftText || sourceText || null
+};
 
-    // Best-effort insert (tries known helper names first; falls back if one exists in your pg module)
-    async function insertExpenseBestEffort(pgSvc, p) {
+// Best-effort insert (tries known helper names first; falls back if one exists in your pg module)
+async function insertExpenseBestEffort(pgSvc, p) {
   // 1) If you already have a canonical helper
   if (typeof pgSvc.insertExpense === 'function') return pgSvc.insertExpense(p);
   if (typeof pgSvc.createExpense === 'function') return pgSvc.createExpense(p);
@@ -6331,18 +6532,25 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
       owner_id: p.owner_id,
       user_id: p.user_id,
       kind: 'expense',
-      amount: p.amount, // ✅ use payload, not closure
+      amount: p.amount,
       amount_cents: p.amount_cents,
       currency: p.currency,
       date: p.date,
+
+      // ✅ CRITICAL: insertTransaction expects `source`, not `store`
+      source: p.store,
       store: p.store,
+
       description: p.description,
       category: p.category,
       jobName: p.job_name,
       jobSource: p.job_source,
       media_asset_id: p.media_asset_id,
       media_source_msg_id: p.media_source_msg_id,
-      source_msg_id: p.source_msg_id
+      source_msg_id: p.source_msg_id,
+      tenant_id: p.tenant_id,
+      original_text: p.original_text,
+      draft_text: p.draft_text
     });
   }
 
@@ -6353,15 +6561,24 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
       userId: p.user_id,
       kind: 'expense',
       amount: p.amount,
+      amount_cents: p.amount_cents,
       currency: p.currency,
       date: p.date,
+
+      // ✅ same issue here
+      source: p.store,
       store: p.store,
+
+      description: p.description,
       category: p.category,
       jobName: p.job_name,
+      jobSource: p.job_source,
       media_asset_id: p.media_asset_id,
       media_source_msg_id: p.media_source_msg_id,
       source_msg_id: p.source_msg_id,
-      original_text: p.original_text
+      tenant_id: p.tenant_id,
+      original_text: p.original_text,
+      draft_text: p.draft_text
     });
   }
 

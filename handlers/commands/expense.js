@@ -1634,9 +1634,8 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
   const src = String(sourceText || '').trim();
 
   // ---------------------------
-  // Receipt-first backfills
+  // Receipt-first detection
   // ---------------------------
-
   const looksReceiptish =
     !!src &&
     (
@@ -1644,25 +1643,84 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
       src.split(/\r?\n/).filter(Boolean).length >= 3
     );
 
-  // Amount
-  const currentAmt = d.amount != null ? toNumberAmount(d.amount) : null;
-  const receiptTotal = src ? extractReceiptTotal(src) : null;
+  const taxBreakdown =
+    src && typeof extractReceiptTaxBreakdown === 'function'
+      ? extractReceiptTaxBreakdown(src)
+      : { subtotal: null, tax: null, total: null, taxLabel: null };
 
-  if ((d.amount == null || !Number.isFinite(currentAmt) || currentAmt <= 0) && receiptTotal != null) {
-    d.amount = receiptTotal;
+  // ---------------------------
+  // Amount
+  // Trust order:
+  // 1) explicit valid amount already on draft
+  // 2) explicit valid total already on draft
+  // 3) labeled receipt total
+  // Never allow absurd SKU-like totals through
+  // ---------------------------
+  const currentAmt = d.amount != null ? toNumberAmount(d.amount) : null;
+
+  const explicitDraftTotal =
+    d.total != null && Number.isFinite(Number(d.total))
+      ? Number(d.total)
+      : null;
+
+  const receiptTotal =
+    taxBreakdown?.total != null && Number.isFinite(Number(taxBreakdown.total))
+      ? Number(taxBreakdown.total)
+      : null;
+
+  const chosenTotal =
+    explicitDraftTotal != null
+      ? explicitDraftTotal
+      : receiptTotal != null
+        ? receiptTotal
+        : null;
+
+  if ((d.amount == null || !Number.isFinite(currentAmt) || currentAmt <= 0) && chosenTotal != null) {
+    d.amount = chosenTotal;
   }
 
+  // ---------------------------
+  // Tax fields (canonical names)
+  // ---------------------------
+  if ((d.subtotal == null || !Number.isFinite(Number(d.subtotal))) && taxBreakdown?.subtotal != null) {
+    d.subtotal = Number(taxBreakdown.subtotal).toFixed(2);
+  }
+
+  if ((d.tax == null || !Number.isFinite(Number(d.tax))) && taxBreakdown?.tax != null) {
+    d.tax = Number(taxBreakdown.tax).toFixed(2);
+  }
+
+  if ((d.total == null || !Number.isFinite(Number(d.total))) && taxBreakdown?.total != null) {
+    d.total = Number(taxBreakdown.total).toFixed(2);
+  }
+
+  if (!String(d.taxLabel || '').trim() && taxBreakdown?.taxLabel) {
+    d.taxLabel = String(taxBreakdown.taxLabel).trim();
+  }
+
+  // ---------------------------
   // Date
+  // ---------------------------
   if (!String(d.date || '').trim() && src) {
-    const receiptDate = extractReceiptDateYYYYMMDD(src, tz) || extractReceiptDate(src);
+    const receiptDate =
+      (typeof extractReceiptDateYYYYMMDD === 'function' ? extractReceiptDateYYYYMMDD(src, tz) : null) ||
+      (typeof extractReceiptDate === 'function' ? extractReceiptDate(src) : null) ||
+      null;
+
     if (receiptDate) d.date = receiptDate;
   }
 
+  // ---------------------------
   // Store
+  // ---------------------------
   const storeTrim = String(d.store || '').trim();
-  const storeWeak = !storeTrim || /^unknown\b/i.test(storeTrim) || storeTrim.length > 60 || /\$\d/.test(storeTrim);
+  const storeWeak =
+    !storeTrim ||
+    /^unknown\b/i.test(storeTrim) ||
+    storeTrim.length > 60 ||
+    /\$\d/.test(storeTrim);
 
-  if (storeWeak && src) {
+  if (storeWeak && src && typeof extractReceiptStore === 'function') {
     const receiptStore = extractReceiptStore(src);
     if (receiptStore) d.store = receiptStore;
   }
@@ -1673,15 +1731,18 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
   const rawItem = String(d.item || '').trim();
 
   const looksLikeReceiptMeta =
-    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|visa|mastercard|debit|change|tender|auth|acct|account|employee)\b/i.test(rawItem);
+    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|vat|visa|mastercard|debit|change|tender|auth|acct|account|employee|store details|rona\.ca|www\.|career|returns?-and-refunds)\b/i.test(rawItem);
 
   const looksLikeMoneyLine =
     /^\$?\s*\d{1,6}(?:\.\d{2})?\s*$/.test(rawItem) ||
     /\$\s*\d{1,6}(?:\.\d{2})?/.test(rawItem);
 
+  const looksLikeSkuLine =
+    /^\d{6,}$/.test(rawItem);
+
   const tooLong = rawItem.length > 120;
 
-  if (!rawItem || looksLikeReceiptMeta || looksLikeMoneyLine || tooLong) {
+  if (!rawItem || looksLikeReceiptMeta || looksLikeMoneyLine || looksLikeSkuLine || tooLong) {
     d.item = null;
   }
 
@@ -1691,18 +1752,40 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
     if (primary) d.item = primary;
   }
 
-  // ---------------------------
-  // Formatting / defaults
-  // ---------------------------
+  // Typed-text fallback only for non-receipt flows
+  if (!d.item && !looksReceiptish && typeof inferItemFromDashOrInPattern === 'function') {
+    const inferred = inferItemFromDashOrInPattern(src);
+    if (inferred) d.item = inferred;
+  }
 
+  // ---------------------------
+  // Formatting / normalization
+  // ---------------------------
   if (d.amount != null) {
     const n = toNumberAmount(d.amount);
     if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
   }
 
+  if (d.subtotal != null && Number.isFinite(Number(d.subtotal))) {
+    d.subtotal = Number(d.subtotal).toFixed(2);
+  }
+
+  if (d.tax != null && Number.isFinite(Number(d.tax))) {
+    d.tax = Number(d.tax).toFixed(2);
+  }
+
+  if (d.total != null && Number.isFinite(Number(d.total))) {
+    d.total = Number(d.total).toFixed(2);
+  }
+
+  if (d.taxLabel != null) {
+    const x = String(d.taxLabel || '').trim();
+    d.taxLabel = x || null;
+  }
+
   // ✅ CRITICAL:
-  // Do NOT invent "today" for receipt/OCR flows.
-  // Only use today for typed/manual non-receipt expense flows.
+  // Never invent today for receipt/OCR flows.
+  // Only default today for typed/manual non-receipt flows.
   if (!String(d.date || '').trim()) {
     d.date = looksReceiptish ? null : todayInTimeZone(tz);
   }
@@ -1757,27 +1840,90 @@ function extractReceiptPrimaryItem(text) {
 
   if (!lines.length) return null;
 
-  const badLine =
-    /\b(subtotal|total|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default)\b/i;
+  const isBadLine = (line) => {
+    const s = String(line || '').trim();
+    if (!s) return true;
 
-  const looksPriceish = /(\$?\d+\.\d{2})/.test.bind(/(\$?\d+\.\d{2})/);
-  const looksSkuish = /^\d{6,}$/.test.bind(/^\d{6,}$/);
+    return (
+      /\b(subtotal|total|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund)\b/i.test(s) ||
+      /^(item|qty|price|total)$/i.test(s) ||
+      /^(mission exteriors|rona inc\.?|rona\+?\s+n\.?w\.?\s+london)$/i.test(s)
+    );
+  };
+
+  const looksSkuish = (line) => /^\d{6,}$/.test(String(line || '').trim());
+
+  const looksMoneyish = (line) =>
+    /\$\s*\d+(?:\.\d{2})?/.test(String(line || '')) ||
+    /^\s*\d+(?:\.\d{2})\s*[A-Z]?\s*$/.test(String(line || '').trim());
+
+  const looksProductish = (line) => {
+    const s = String(line || '').trim();
+    if (!s) return false;
+    if (isBadLine(s)) return false;
+    if (looksSkuish(s)) return false;
+    if (looksMoneyish(s)) return false;
+    if (s.length < 5 || s.length > 80) return false;
+    if (!/[A-Za-z]/.test(s)) return false;
+
+    // strong signals for real product/material lines
+    if (/[A-Z]{3,}/.test(s)) return true;
+    if (/\b(roll|sheet|board|membrane|shingle|nail|screw|flashing|insulation|lumber|plywood|osb|caulk|adhesive)\b/i.test(s)) return true;
+    if (/\d+\s*[xX]\s*\d+/.test(s)) return true;
+    if (/\d/.test(s) && /[A-Za-z]/.test(s)) return true;
+
+    return true;
+  };
+
+  // ---------------------------------------------------------
+  // 1) STRONGEST RULE:
+  // if a SKU line exists, prefer the next product-like line
+  // ---------------------------------------------------------
+  for (let i = 0; i < lines.length - 1; i += 1) {
+    const cur = lines[i];
+    const next = lines[i + 1];
+
+    if (looksSkuish(cur) && looksProductish(next)) {
+      return cleanExpenseItemForDisplay(next);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 2) Look between item header and totals/payment/footer
+  // ---------------------------------------------------------
+  let itemZoneStart = 0;
+  let itemZoneEnd = lines.length;
 
   for (let i = 0; i < lines.length; i += 1) {
+    if (/^(item|qty|price|total)$/i.test(lines[i]) || /\bitem\b.*\bqty\b.*\bprice\b.*\btotal\b/i.test(lines[i])) {
+      itemZoneStart = i + 1;
+      break;
+    }
+  }
+
+  for (let i = itemZoneStart; i < lines.length; i += 1) {
+    if (/\b(subtotal|gst|hst|pst|tax|debit card|visa|mastercard|amex|acct|auth|employee|you saved today)\b/i.test(lines[i])) {
+      itemZoneEnd = i;
+      break;
+    }
+  }
+
+  for (let i = itemZoneStart; i < itemZoneEnd; i += 1) {
     const line = lines[i];
+    if (looksProductish(line)) {
+      return cleanExpenseItemForDisplay(line);
+    }
+  }
 
-    if (badLine.test(line)) continue;
-    if (looksSkuish(line)) continue;
-
-    if (
-      /[A-Za-z]/.test(line) &&
-      line.length >= 6 &&
-      line.length <= 80 &&
-      !looksPriceish(line)
-    ) {
-      if (/^(item|qty|price|total)$/i.test(line)) continue;
-      if (/^(mission exteriors|rona inc\.?|rona\+?\s+n\.?w\.?\s+london)$/i.test(line)) continue;
-
+  // ---------------------------------------------------------
+  // 3) Last safe pass: any product-like line before totals/footer
+  // ---------------------------------------------------------
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (/\b(subtotal|gst|hst|pst|tax|debit card|visa|mastercard|amex|acct|auth|employee|you saved today)\b/i.test(line)) {
+      break;
+    }
+    if (looksProductish(line)) {
       return cleanExpenseItemForDisplay(line);
     }
   }
@@ -2249,27 +2395,50 @@ function extractReceiptTaxBreakdown(text) {
   let total = null;
   let taxLabel = null;
 
-  const parseMoney = (s) => {
-    const m = String(s || '').match(/\$?\s*(-?\d+(?:\.\d{1,2})?)\b/);
+  const parseMoneyLike = (s) => {
+    const str = String(s || '').trim();
+    if (!str) return null;
+
+    const m = str.match(/\$?\s*(-?\d+(?:\.\d{1,2})?)\b/);
     if (!m?.[1]) return null;
-    const n = Number(m[1]);
-    return Number.isFinite(n) ? n : null;
+
+    const rawNum = String(m[1]).trim();
+
+    // ✅ HARD GUARD:
+    // reject long bare integers like SKUs: 773615003161
+    // allow:
+    //   88.02
+    //   77.89
+    //   1234.56
+    //   1234
+    // but reject huge unlabeled integers
+    if (!rawNum.includes('.') && rawNum.length > 6) return null;
+
+    const n = Number(rawNum);
+    if (!Number.isFinite(n)) return null;
+
+    // reject absurd receipt values
+    if (n <= 0 || n > 100000) return null;
+
+    return n;
   };
 
   for (const line of lines) {
     if (subtotal == null) {
-      const m = line.match(/\bsubtotal\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+      const m = line.match(/^\s*subtotal\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
       if (m?.[1]) {
         const n = Number(m[1]);
-        if (Number.isFinite(n)) subtotal = n;
+        if (Number.isFinite(n) && n > 0 && n <= 100000) {
+          subtotal = n;
+        }
       }
     }
 
     if (tax == null) {
-      const m = line.match(/\b(gst\/hst|hst|gst|pst|tax)\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+      const m = line.match(/^\s*(gst\/hst|hst|gst|pst|tax)\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
       if (m?.[1] && m?.[2]) {
         const n = Number(m[2]);
-        if (Number.isFinite(n)) {
+        if (Number.isFinite(n) && n >= 0 && n <= 100000) {
           tax = n;
           taxLabel = String(m[1]).toUpperCase();
         }
@@ -2277,31 +2446,36 @@ function extractReceiptTaxBreakdown(text) {
     }
 
     if (total == null) {
-      const m = line.match(/\btotal\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+      const m = line.match(/^\s*total\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
       if (m?.[1]) {
         const n = Number(m[1]);
-        if (Number.isFinite(n)) total = n;
+        if (Number.isFinite(n) && n > 0 && n <= 100000) {
+          total = n;
+        }
       }
     }
   }
 
-  // Fallback: if total still missing, use strongest labeled money line
+  // ✅ Safe fallback only if labeled total was not found
+  // and only for strongly total-like lines
   if (total == null) {
-    const candidates = lines
-      .map((line) => {
-        const n = parseMoney(line);
-        return n != null ? { line, value: n } : null;
-      })
-      .filter(Boolean);
+    for (const line of lines) {
+      if (!/\b(total|amount due|balance due|debit card|visa|mastercard|amex|paid)\b/i.test(line)) {
+        continue;
+      }
 
-    const best =
-      typeof chooseBestReceiptAmountCandidate === 'function'
-        ? chooseBestReceiptAmountCandidate(candidates)
-        : null;
-
-    if (best != null && Number.isFinite(Number(best))) {
-      total = Number(best);
+      const n = parseMoneyLike(line);
+      if (n != null) {
+        total = n;
+        break;
+      }
     }
+  }
+
+  // ✅ Optional consistency fallback:
+  // if total missing but subtotal + tax are both valid, derive total
+  if (total == null && subtotal != null && tax != null) {
+    total = Number((subtotal + tax).toFixed(2));
   }
 
   return {
@@ -2491,128 +2665,6 @@ function formatMoneyDisplay(n) {
     return `$${Number(n).toFixed(2)}`;
   }
 }
-
-/**
- * ✅ UPDATED: normalizeExpenseData(data, userProfile, sourceText?)
- * - Receipt-first: backfills missing/weak amount/date/store from receipt text
- * - Sanitizes "item" so Subtotal/Tax/Total never becomes description
- * - Then applies formatting/defaults
- */
-function normalizeExpenseData(data, userProfile, sourceText = '') {
-  const tz = userProfile?.timezone || userProfile?.tz || 'America/Toronto';
-  const d = { ...(data || {}) };
-  const src = String(sourceText || '').trim();
-
-  // ---------------------------
-  // Receipt-first backfills
-  // ---------------------------
-
-  const taxBreakdown = src ? extractReceiptTaxBreakdown(src) : null;
-
-  // Amount = final total
-  const currentAmt = d.amount != null ? toNumberAmount(d.amount) : null;
-  const receiptTotal =
-    taxBreakdown?.total != null
-      ? taxBreakdown.total
-      : src
-      ? extractReceiptTotal(src)
-      : null;
-
-  if ((d.amount == null || !Number.isFinite(currentAmt) || currentAmt <= 0) && receiptTotal != null) {
-    d.amount = receiptTotal;
-  }
-
-  // Carry tax fields
-  if ((d.subtotal_amount == null || !Number.isFinite(Number(d.subtotal_amount))) && taxBreakdown?.subtotal != null) {
-    d.subtotal_amount = taxBreakdown.subtotal;
-  }
-
-  if ((d.tax_amount == null || !Number.isFinite(Number(d.tax_amount))) && taxBreakdown?.tax != null) {
-    d.tax_amount = taxBreakdown.tax;
-  }
-
-  if (!String(d.tax_label || '').trim() && taxBreakdown?.taxLabel) {
-    d.tax_label = taxBreakdown.taxLabel;
-  }
-
-  // Date
-  if (!String(d.date || '').trim() && src) {
-    const receiptDate = extractReceiptDateYYYYMMDD(src, tz) || extractReceiptDate(src);
-    if (receiptDate) d.date = receiptDate;
-  }
-
-  // Store
-  const storeTrim = String(d.store || '').trim();
-  const storeWeak = !storeTrim || /^unknown\b/i.test(storeTrim) || storeTrim.length > 60 || /\$\d/.test(storeTrim);
-
-  if (storeWeak && src) {
-    const receiptStore = extractReceiptStore(src);
-    if (receiptStore) d.store = receiptStore;
-  }
-
-  // ---------------------------
-  // Item sanitization
-  // ---------------------------
-  const rawItem = String(d.item || '').trim();
-
-  const looksLikeReceiptMeta =
-    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|vat|visa|mastercard|debit|change|tender)\b/i.test(rawItem);
-
-  const looksLikeMoneyLine =
-    /^\$?\s*\d{1,6}(?:\.\d{2})?\s*$/.test(rawItem) ||
-    /\$\s*\d{1,6}(?:\.\d{2})?/.test(rawItem);
-
-  const tooLong = rawItem.length > 120;
-
-  if (!rawItem || looksLikeReceiptMeta || looksLikeMoneyLine || tooLong) {
-    d.item = null;
-  }
-
-  // ---------------------------
-  // Formatting / defaults
-  // ---------------------------
-  if (d.amount != null) {
-    const n = toNumberAmount(d.amount);
-    if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
-  }
-
-  if (d.subtotal_amount != null) {
-    const n = Number(d.subtotal_amount);
-    if (Number.isFinite(n) && n >= 0) d.subtotal_amount = Number(n.toFixed(2));
-  }
-
-  if (d.tax_amount != null) {
-    const n = Number(d.tax_amount);
-    if (Number.isFinite(n) && n >= 0) d.tax_amount = Number(n.toFixed(2));
-  }
-
-  if (d.tax_label != null) {
-    const x = String(d.tax_label || '').trim();
-    d.tax_label = x || null;
-  }
-
-  d.date = String(d.date || '').trim() || todayInTimeZone(tz);
-  d.item = cleanExpenseItemForDisplay(d.item);
-  d.store = String(d.store || '').trim() || 'Unknown Store';
-
-  if (d.jobName != null) d.jobName = normalizeJobNameCandidate(d.jobName);
-
-  if (d.suggestedCategory != null) {
-    const c = String(d.suggestedCategory).trim();
-    d.suggestedCategory = c || null;
-  }
-
-  if (d.jobSource != null) {
-    const js = String(d.jobSource).trim();
-    d.jobSource = js || null;
-  }
-
-  if (d.job_no != null && !Number.isFinite(Number(d.job_no))) d.job_no = null;
-
-  return d;
-}
-
-
 
 async function resolveExpenseCategory({ ownerId, data, ownerProfile }) {
   const vendor = String(data?.store || '').trim() || 'Unknown Store';

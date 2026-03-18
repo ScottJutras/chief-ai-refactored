@@ -1830,11 +1830,11 @@ function isStalePickerTap(pickPA, inbound) {
 }
 
 function extractReceiptPrimaryItem(text) {
-  const raw = String(text || '');
-  if (!raw) return null;
+  const normalized = normalizeReceiptOcrForParsing(text);
+  if (!normalized) return null;
 
-  const lines = raw
-    .split(/\r?\n/)
+  const lines = normalized
+    .split(/\n+/)
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
@@ -1845,86 +1845,80 @@ function extractReceiptPrimaryItem(text) {
     if (!s) return true;
 
     return (
-      /\b(subtotal|total|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund)\b/i.test(s) ||
+      /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund|returns? and refunds?)\b/i.test(s) ||
       /^(item|qty|price|total)$/i.test(s) ||
       /^(mission exteriors|rona inc\.?|rona\+?\s+n\.?w\.?\s+london)$/i.test(s)
     );
   };
 
-  const looksSkuish = (line) => /^\d{6,}$/.test(String(line || '').trim());
+  const looksSkuish = (line) => /^\d{8,14}$/.test(String(line || '').trim());
 
   const looksMoneyish = (line) =>
     /\$\s*\d+(?:\.\d{2})?/.test(String(line || '')) ||
     /^\s*\d+(?:\.\d{2})\s*[A-Z]?\s*$/.test(String(line || '').trim());
 
-  const looksProductish = (line) => {
-    const s = String(line || '').trim();
-    if (!s) return false;
-    if (isBadLine(s)) return false;
-    if (looksSkuish(s)) return false;
-    if (looksMoneyish(s)) return false;
-    if (s.length < 5 || s.length > 80) return false;
-    if (!/[A-Za-z]/.test(s)) return false;
+  const cleanCandidate = (line) => {
+    const s = cleanExpenseItemForDisplay(line)
+      .replace(/\bqty\b.*$/i, '')
+      .replace(/\bprice\b.*$/i, '')
+      .replace(/\bsubtotal\b.*$/i, '')
+      .replace(/\btotal\b.*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
 
-    // strong signals for real product/material lines
-    if (/[A-Z]{3,}/.test(s)) return true;
-    if (/\b(roll|sheet|board|membrane|shingle|nail|screw|flashing|insulation|lumber|plywood|osb|caulk|adhesive)\b/i.test(s)) return true;
+    if (!s) return null;
+    if (isBadLine(s)) return null;
+    if (looksMoneyish(s)) return null;
+    if (s.length < 4 || s.length > 80) return null;
+    if (!/[A-Za-z]/.test(s)) return null;
+
+    return s;
+  };
+
+  const looksProductish = (line) => {
+    const s = cleanCandidate(line);
+    if (!s) return false;
+
+    if (/\b(membrane|weathert|shingle|nail|screw|flashing|insulation|lumber|plywood|osb|caulk|adhesive|board|sheet|roll)\b/i.test(s)) return true;
     if (/\d+\s*[xX]\s*\d+/.test(s)) return true;
     if (/\d/.test(s) && /[A-Za-z]/.test(s)) return true;
+    if (/[A-Z]{3,}/.test(s)) return true;
 
     return true;
   };
 
-  // ---------------------------------------------------------
-  // 1) STRONGEST RULE:
-  // if a SKU line exists, prefer the next product-like line
-  // ---------------------------------------------------------
+  // 1) Best case: inline SKU followed by product text
+  const inlineSkuProduct = normalized.match(
+    /\b\d{8,14}\b\s+([A-Za-z][A-Za-z0-9'".\-\/ ]{4,80}?)(?=\s+\$?\d+\.\d{2}\b|\s+\b(subtotal|gst\/hst|gst|hst|pst|tax|total)\b|$)/i
+  );
+
+  if (inlineSkuProduct?.[1]) {
+    const candidate = cleanCandidate(inlineSkuProduct[1]);
+    if (candidate) return candidate;
+  }
+
+  // 2) SKU line then next product-like line
   for (let i = 0; i < lines.length - 1; i += 1) {
     const cur = lines[i];
     const next = lines[i + 1];
 
     if (looksSkuish(cur) && looksProductish(next)) {
-      return cleanExpenseItemForDisplay(next);
+      const candidate = cleanCandidate(next);
+      if (candidate) return candidate;
     }
   }
 
-  // ---------------------------------------------------------
-  // 2) Look between item header and totals/payment/footer
-  // ---------------------------------------------------------
-  let itemZoneStart = 0;
-  let itemZoneEnd = lines.length;
-
-  for (let i = 0; i < lines.length; i += 1) {
-    if (/^(item|qty|price|total)$/i.test(lines[i]) || /\bitem\b.*\bqty\b.*\bprice\b.*\btotal\b/i.test(lines[i])) {
-      itemZoneStart = i + 1;
-      break;
-    }
-  }
-
-  for (let i = itemZoneStart; i < lines.length; i += 1) {
-    if (/\b(subtotal|gst|hst|pst|tax|debit card|visa|mastercard|amex|acct|auth|employee|you saved today)\b/i.test(lines[i])) {
-      itemZoneEnd = i;
-      break;
-    }
-  }
-
-  for (let i = itemZoneStart; i < itemZoneEnd; i += 1) {
-    const line = lines[i];
-    if (looksProductish(line)) {
-      return cleanExpenseItemForDisplay(line);
-    }
-  }
-
-  // ---------------------------------------------------------
-  // 3) Last safe pass: any product-like line before totals/footer
-  // ---------------------------------------------------------
+  // 3) Search item zone before totals/payment/footer
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-    if (/\b(subtotal|gst|hst|pst|tax|debit card|visa|mastercard|amex|acct|auth|employee|you saved today)\b/i.test(line)) {
+
+    if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|acct|auth|employee|you saved today|returns? and refunds?)\b/i.test(line)) {
       break;
     }
+
     if (looksProductish(line)) {
-      return cleanExpenseItemForDisplay(line);
+      const candidate = cleanCandidate(line);
+      if (candidate) return candidate;
     }
   }
 
@@ -2380,13 +2374,13 @@ function extractReceiptTotal(text) {
 }
 
 function extractReceiptTaxBreakdown(text) {
-  const raw = String(text || '');
-  if (!raw) {
+  const normalized = normalizeReceiptOcrForParsing(text);
+  if (!normalized) {
     return { subtotal: null, tax: null, total: null, taxLabel: null };
   }
 
-  const lines = raw
-    .split(/\r?\n/)
+  const lines = normalized
+    .split(/\n+/)
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
@@ -2395,85 +2389,80 @@ function extractReceiptTaxBreakdown(text) {
   let total = null;
   let taxLabel = null;
 
-  const parseMoneyLike = (s) => {
+  const parseSafeMoney = (s) => {
     const str = String(s || '').trim();
     if (!str) return null;
 
-    const m = str.match(/\$?\s*(-?\d+(?:\.\d{1,2})?)\b/);
-    if (!m?.[1]) return null;
+    // Prefer explicit decimal money tokens first
+    const dec =
+      str.match(/\$\s*(-?\d{1,6}(?:,\d{3})*\.\d{2})\b/) ||
+      str.match(/\b(-?\d{1,6}(?:,\d{3})*\.\d{2})\b/);
 
-    const rawNum = String(m[1]).trim();
+    if (dec?.[1]) {
+      const n = Number(String(dec[1]).replace(/,/g, ''));
+      if (Number.isFinite(n) && n >= 0 && n <= 100000) return n;
+    }
 
-    // ✅ HARD GUARD:
-    // reject long bare integers like SKUs: 773615003161
-    // allow:
-    //   88.02
-    //   77.89
-    //   1234.56
-    //   1234
-    // but reject huge unlabeled integers
-    if (!rawNum.includes('.') && rawNum.length > 6) return null;
+    // Only allow plain integers when they are small and labeled
+    const intm =
+      str.match(/\$\s*(-?\d{1,5})\b/) ||
+      str.match(/\b(-?\d{1,5})\b/);
 
-    const n = Number(rawNum);
-    if (!Number.isFinite(n)) return null;
+    if (intm?.[1]) {
+      const rawNum = String(intm[1]).trim();
+      if (rawNum.length > 5) return null;
 
-    // reject absurd receipt values
-    if (n <= 0 || n > 100000) return null;
+      const n = Number(rawNum);
+      if (Number.isFinite(n) && n >= 0 && n <= 100000) return n;
+    }
 
-    return n;
+    return null;
   };
 
+  // Strong labeled passes first
   for (const line of lines) {
-    if (subtotal == null) {
-      const m = line.match(/^\s*subtotal\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
-      if (m?.[1]) {
-        const n = Number(m[1]);
-        if (Number.isFinite(n) && n > 0 && n <= 100000) {
-          subtotal = n;
-        }
-      }
+    if (subtotal == null && /\bsubtotal\b/i.test(line)) {
+      const n = parseSafeMoney(line);
+      if (n != null) subtotal = n;
     }
 
     if (tax == null) {
-      const m = line.match(/^\s*(gst\/hst|hst|gst|pst|tax)\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
-      if (m?.[1] && m?.[2]) {
-        const n = Number(m[2]);
-        if (Number.isFinite(n) && n >= 0 && n <= 100000) {
+      const m = line.match(/\b(gst\/hst|gst|hst|pst|tax)\b/i);
+      if (m?.[1]) {
+        const n = parseSafeMoney(line);
+        if (n != null) {
           tax = n;
           taxLabel = String(m[1]).toUpperCase();
         }
       }
     }
 
-    if (total == null) {
-      const m = line.match(/^\s*total\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
-      if (m?.[1]) {
-        const n = Number(m[1]);
+    if (total == null && /\b(total|amount due|balance due)\b/i.test(line)) {
+      const n = parseSafeMoney(line);
+      if (n != null) total = n;
+    }
+  }
+
+  // Card/payment lines are only allowed as fallback if they contain a decimal amount
+  if (total == null) {
+    for (const line of lines) {
+      if (!/\b(debit card|debit|visa|mastercard|amex|paid)\b/i.test(line)) continue;
+
+      const dec =
+        line.match(/\$\s*(-?\d{1,6}(?:,\d{3})*\.\d{2})\b/) ||
+        line.match(/\b(-?\d{1,6}(?:,\d{3})*\.\d{2})\b/);
+
+      if (dec?.[1]) {
+        const n = Number(String(dec[1]).replace(/,/g, ''));
         if (Number.isFinite(n) && n > 0 && n <= 100000) {
           total = n;
+          break;
         }
       }
     }
   }
 
-  // ✅ Safe fallback only if labeled total was not found
-  // and only for strongly total-like lines
-  if (total == null) {
-    for (const line of lines) {
-      if (!/\b(total|amount due|balance due|debit card|visa|mastercard|amex|paid)\b/i.test(line)) {
-        continue;
-      }
-
-      const n = parseMoneyLike(line);
-      if (n != null) {
-        total = n;
-        break;
-      }
-    }
-  }
-
-  // ✅ Optional consistency fallback:
-  // if total missing but subtotal + tax are both valid, derive total
+  // Derive total only if subtotal + tax are both valid
   if (total == null && subtotal != null && tax != null) {
     total = Number((subtotal + tax).toFixed(2));
   }
@@ -2484,6 +2473,31 @@ function extractReceiptTaxBreakdown(text) {
     total: total != null ? total.toFixed(2) : null,
     taxLabel: taxLabel || null
   };
+}
+
+function normalizeReceiptOcrForParsing(text) {
+  const raw = String(text || '');
+  if (!raw) return '';
+
+  let s = raw
+    .replace(/\r/g, '\n')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\u00A0/g, ' ')
+    .trim();
+
+  // If OCR came in as one flattened blob, create pseudo-line breaks
+  s = s
+    .replace(/\b(subtotal)\b/ig, '\n$1 ')
+    .replace(/\b(gst\/hst|gst|hst|pst|tax)\b/ig, '\n$1 ')
+    .replace(/\b(total|amount due|balance due)\b/ig, '\n$1 ')
+    .replace(/\b(debit card|debit|visa|mastercard|amex)\b/ig, '\n$1 ')
+    .replace(/\b(auth#?|acct|account|employee|you saved today|exchange or refund|returns? and refunds?|store details)\b/ig, '\n$1 ')
+    // split SKU -> product when OCR flattened them
+    .replace(/(\b\d{8,14}\b)\s+([A-Za-z])/g, '$1\n$2')
+    // split price-heavy product rows a bit more safely
+    .replace(/(\$\s*\d+\.\d{2})\s+([A-Za-z]{3,})/g, '$1\n$2');
+
+  return s;
 }
 
 function formatMoneyDisplayMaybe(v) {
@@ -7344,7 +7358,26 @@ if (looksLikeReceiptText(input)) {
     // --------------------------------------------
     // 1) Seed/patch CONFIRM PA from receipt text
     // --------------------------------------------
-    const receiptText = stripExpensePrefixes(String(input || '')).trim();
+    const receiptText = (() => {
+  const candidates = [
+    mergedDraft?.receiptText,
+    mergedDraft?.ocrText,
+    mergedDraft?.extractedText,
+    draft0?.receiptText,
+    draft0?.ocrText,
+    draft0?.extractedText,
+    draft0?.media_transcript,
+    draft0?.mediaTranscript,
+    input
+  ]
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+
+  // Prefer the richest source text, not the shortest flattened inbound body
+  candidates.sort((a, b) => b.length - a.length);
+
+  return stripExpensePrefixes(String(candidates[0] || '')).trim();
+})();
     const back = parseReceiptBackstop(receiptText);
 
     const locale0 = String(userProfile?.locale || ownerProfile?.locale || '').toLowerCase();

@@ -1195,6 +1195,21 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     if (repair) normalized.amount = `$${repair}`;
   }
 
+  // ✅ Amount must equal total, not subtotal
+  // If amount == subtotal and total > subtotal, repair amount to total
+  const _amtN = Number(String(normalized.amount || '').replace(/[^0-9.-]/g, ''));
+  const _subN = Number(String(normalized.subtotal || '').replace(/[^0-9.-]/g, ''));
+  const _totN = Number(String(normalized.total || '').replace(/[^0-9.-]/g, ''));
+
+  if (
+    Number.isFinite(_amtN) && Number.isFinite(_subN) && Number.isFinite(_totN) &&
+    Math.abs(_amtN - _subN) < 0.01 && _totN > _subN
+  ) {
+    normalized.amount = typeof formatMoneyDisplay === 'function'
+      ? formatMoneyDisplay(_totN)
+      : `$${_totN.toFixed(2)}`;
+  }
+
   // Preserve edit latch fields
   normalized.awaiting_edit = !!draft?.awaiting_edit;
   normalized.edit_started_at = draft?.edit_started_at ?? null;
@@ -1885,10 +1900,13 @@ function extractReceiptPrimaryItem(text) {
   const isBadLine = (line) => {
     const s = String(line || '').trim();
     if (!s) return true;
+
     return (
-      /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund|returns? and refunds?)\b/i.test(s) ||
+      /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund|returns? and refunds?|mission exteriors)\b/i.test(s) ||
       /^(item|qty|price|total)$/i.test(s) ||
-      /^(mission exteriors|rona inc\.?|rona\+?\s+n\.?w\.?\s+london)$/i.test(s)
+      /^(rona inc\.?|rona\+?\s+n\.?w\.?\s+london)$/i.test(s) ||
+      // customer/account number lines: short numeric ID followed by an all-caps name
+      /^\d{6,12}\s+[A-Z][A-Z\s]{3,}$/.test(s)
     );
   };
 
@@ -1935,27 +1953,30 @@ function extractReceiptPrimaryItem(text) {
   }
 
   // 2) SKU line then next product-like line
-  //    Skip lines that look like store names, addresses, or phone numbers
+  //    Skip lines that look like store names, addresses, phone numbers, or customer accounts
   const looksLikeStoreOrAddress = (line) => {
     const s = String(line || '').trim();
     return (
-      /\b(rona|home depot|lowes|canadian tire|costco|walmart|superstore|dollarama)\b/i.test(s) ||
+      /\b(rona|home depot|lowes|canadian tire|costco|walmart|superstore|dollarama|mission exteriors)\b/i.test(s) ||
       /\b(n\.?w\.?|n\.?e\.?|s\.?w\.?|s\.?e\.?)\b/i.test(s) ||
-      /\b\d{3,5}\s+[A-Za-z]/.test(s) ||        // address like "1335 Fanshawe"
-      /\(\d{3}\)\s*\d{3}-\d{4}/.test(s) ||      // phone number
+      /\b\d{3,5}\s+[A-Za-z]/.test(s) ||
+      /\(\d{3}\)\s*\d{3}-\d{4}/.test(s) ||
       /\b(london|toronto|ottawa|vancouver|calgary|edmonton|winnipeg)\b/i.test(s) ||
-      /\b(on|bc|ab|qc|sk|mb|ns|nb|pe|nl)\b,?\s*[A-Z]\d[A-Z]/i.test(s) || // postal code
-      /^\*+$/.test(s)                             // separator lines like *****
+      /\b(on|bc|ab|qc|sk|mb|ns|nb|pe|nl)\b,?\s*[A-Z]\d[A-Z]/i.test(s) ||
+      /^\*+$/.test(s) ||
+      /^={3,}$/.test(s) ||
+      /^-{3,}$/.test(s) ||
+      // customer account line: digits + all-caps business name
+      /^\d{6,12}\s+[A-Z][A-Z\s]{3,}$/.test(s)
     );
   };
 
   for (let i = 0; i < lines.length - 1; i += 1) {
     if (!looksSkuish(lines[i])) continue;
 
-    // scan forward past store/address/separator lines to find real product
     for (let j = i + 1; j < Math.min(i + 4, lines.length); j += 1) {
       if (looksLikeStoreOrAddress(lines[j])) continue;
-      if (looksSkuish(lines[j])) break; // hit another SKU — stop
+      if (looksSkuish(lines[j])) break;
 
       if (looksProductish(lines[j])) {
         const candidate = cleanCandidate(lines[j]);
@@ -7646,6 +7667,17 @@ if (looksLikeReceiptText(input)) {
       const s = mergedDraft.store.trim();
       if (mergedDraft?.item && /\sfor\s/i.test(s)) {
         mergedDraft.store = s.replace(/\s+for\s+.*/i, '').trim();
+      }
+    }
+
+   // ✅ Ensure amount reflects total, not subtotal
+    if (mergedDraft.amount && mergedDraft.subtotal && mergedDraft.total) {
+      const _a = Number(String(mergedDraft.amount).replace(/[^0-9.-]/g, ''));
+      const _s = Number(String(mergedDraft.subtotal).replace(/[^0-9.-]/g, ''));
+      const _t = Number(String(mergedDraft.total).replace(/[^0-9.-]/g, ''));
+      if (Number.isFinite(_a) && Number.isFinite(_s) && Number.isFinite(_t) &&
+          Math.abs(_a - _s) < 0.01 && _t > _s) {
+        mergedDraft.amount = `$${_t.toFixed(2)}`;
       }
     }
 

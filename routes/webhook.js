@@ -274,6 +274,8 @@ function aggregateCrewMessage({ action, count, previewNames = [], baseText }) {
   };
 
   const bt = String(baseText || '').trim();
+  const parts = bt.split('\n');
+  const tail = parts.slice(1).join('\n').trim();
   const head =
     map[a] ||
     (parts[0] || 'Time logged.')
@@ -378,7 +380,7 @@ function pickFirstMedia(body = {}) {
 
 function canUseAgent(ownerProfile) {
   const planKey = getEffectivePlanKey(ownerProfile);
-  return planKey === "pro";
+  return planKey === "starter" || planKey === "pro";
 }
 
 
@@ -1374,7 +1376,7 @@ router.use((req, res, next) => {
       phase: res.locals.phase || 'router',
       msInPhase,
       from: req.from,
-      messageSid
+      messageSid: safetyMessageSid
     });
 
     // NEVER return empty — always give user a bubble
@@ -3024,12 +3026,12 @@ const allowNewWhilePendingExpense = !!pending?.allow_new_while_pending;
 
 // ✅ Only allow job picker commands through when expense PA is NOT active
 const allowJobPickerThrough =
-  (isJobPickerIntent(lc) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
+  (isJobPickerIntent(lc2) || !!pending?.awaitingActiveJobPick) && !hasExpensePendingActions;
 
 if (pendingRevenueFlow && !isHardTimeCommand) {
-  if (lc === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
+  if (lc2 === 'skip') return ok(res, `Okay — leaving that revenue pending. What do you want to do next?`);
 
-  if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+  if (!allowJobPickerThrough && !isAllowedWhilePending(lc2) && looksHardCommand(lc2)) {
     const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'revenue' });
     if (msg) return ok(res, msg);
     // msg null => mid-edit; do NOT nag; fall through
@@ -3039,10 +3041,10 @@ if (pendingRevenueFlow && !isHardTimeCommand) {
 // ✅ EXPENSE NUDGE GATE — hardened: NEVER block when an expense PA exists
 if (pendingExpenseFlow && !isHardTimeCommand) {
   if (!hasExpensePendingActions) {
-    if (lc === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
+    if (lc2 === 'skip') return ok(res, `Okay — leaving that expense pending. What do you want to do next?`);
 
     if (!allowNewWhilePendingExpense) {
-      if (!allowJobPickerThrough && !isAllowedWhilePending(lc) && looksHardCommand(lc)) {
+      if (!allowJobPickerThrough && !isAllowedWhilePending(lc2) && looksHardCommand(lc2)) {
         const msg = pendingTxnNudgeMessage({ ...(pending || {}), type: 'expense' });
         if (msg) return ok(res, msg);
       }
@@ -3052,7 +3054,7 @@ if (pendingExpenseFlow && !isHardTimeCommand) {
   console.info('[WEBHOOK] after_nudge_gate', {
     hasExpensePendingActions,
     pendingExpenseFlow,
-    lc: String(lc || '').slice(0, 30),
+    lc: lc2.slice(0, 30),
     mostRecentPAKind: mostRecentPAKind || null
   });
 }
@@ -3642,7 +3644,7 @@ try {
      * AND NOT blocked by expense pending_actions.
      * ----------------------------------------------------------------------- */
     if (!hasExpensePendingActions && (isJobPickerIntent(lc2) || pending?.awaitingActiveJobPick)) {
-      if (isPickerToken && !pending?.awaitingActiveJobPick) {
+      if (looksLikeJobPickerReplyToken(text2) && !pending?.awaitingActiveJobPick) {
         // fall through
       } else {
         try {

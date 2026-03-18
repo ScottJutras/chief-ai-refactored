@@ -281,4 +281,4 @@ async function handleTeam(from, input, userProfile, ownerId, ownerProfile, isOwn
   }
 }
 
-module.exports = { handleTeam };
+module.exports = { handleTeam, teamHandler: handleTeam };

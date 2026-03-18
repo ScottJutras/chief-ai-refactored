@@ -368,6 +368,46 @@ function questionMenu() {
   ].join("\n");
 }
 
+// ----- Tool-calling loop -----------------------------------
+const MAX_TOOL_ITERATIONS = 6;
+
+async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
+  const { toolsSpec, reg } = getTools();
+  const messages = [...seedMessages];
+
+  for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+    const msg = await llm.chat({ messages, tools: toolsSpec });
+
+    if (!msg.tool_calls || msg.tool_calls.length === 0) {
+      return String(msg.content || '').trim() || genericMenu();
+    }
+
+    messages.push(msg);
+
+    for (const tc of msg.tool_calls) {
+      const name = tc.function?.name;
+      const handler = reg[name];
+      let result;
+      try {
+        const args = JSON.parse(tc.function?.arguments || '{}');
+        // Ensure owner_id is always scoped correctly
+        args.owner_id = args.owner_id || ownerId;
+        result = handler ? await handler(args) : { error: `Unknown tool: ${name}` };
+      } catch (e) {
+        result = { error: e?.message };
+      }
+      messages.push({
+        role: 'tool',
+        tool_call_id: tc.id,
+        content: JSON.stringify(result),
+      });
+    }
+  }
+
+  // Exceeded max iterations without a final text reply
+  return genericMenu();
+}
+
 // ----- Public ask API --------------------------------------
 async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) {
   const raw = String(text || '').trim();

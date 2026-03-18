@@ -1006,26 +1006,21 @@ function parseExpenseEditOverwrite(text) {
 
 
 async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProfile }) {
-  // ✅ paUserId param is treated as the CONFIRM PA KEY here
   const paKey = String(paUserId || '').trim();
   if (!paKey) return null;
 
   const confirmPA = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
   const draft = confirmPA?.payload?.draft || null;
 
-  // ✅ Nothing to do: no confirm, or confirm exists but no draft yet
   if (!confirmPA || !draft) return confirmPA;
 
-  // ✅ CRITICAL: never reparse while user is in Edit flow
   if (draft?.awaiting_edit) {
     console.info('[EXPENSE_REPARSE_SKIP_AWAITING_EDIT]', { paKey });
     return confirmPA;
   }
 
-  // ✅ Only reparse when explicitly requested
   if (!draft?.needsReparse) return confirmPA;
 
-  // ✅ Reparse must have some text source
   const sourceText = String(
     draft?.receiptText ||
       draft?.ocrText ||
@@ -1040,8 +1035,6 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     return confirmPA;
   }
 
-  // ✅ Re-run parser on receipt/OCR-ish source text.
-  // IMPORTANT: keep selected job/media authoritative.
   let parsed = {};
   try {
     parsed = (await parseExpenseMessage(sourceText, { tz })) || {};
@@ -1061,11 +1054,9 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     media_source_msg_id: draft?.media_source_msg_id ?? null
   };
 
-  // ✅ Preserve explicit draft tax fields if already present
-  // but allow receipt re-extraction to backfill missing ones
   const receiptTaxInfo =
     typeof extractReceiptTaxBreakdown === 'function'
-      ? extractReceiptTaxBreakdown(sourceText || '')
+      ? extractReceiptTaxBreakdown(sourceText)
       : { subtotal: null, tax: null, total: null, taxLabel: null };
 
   const safePrimaryItem =
@@ -1073,7 +1064,38 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
       ? extractReceiptPrimaryItem(sourceText)
       : null;
 
-  // ✅ Merge but never clobber existing values with nulls
+  // Helper: returns the number as toFixed(2) string only if plausible receipt money
+  const safeMoneyString = (v) => {
+    if (v == null) return null;
+    const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+    if (!Number.isFinite(n)) return null;
+    if (n <= 0 || n > 100000) return null;
+    return n.toFixed(2);
+  };
+
+  // Helper: returns true if value is clearly garbage (SKU-scale or missing)
+  const isClearlyBadMoney = (v) => {
+    if (v == null) return true;
+    const raw = String(v).trim();
+    if (!raw) return true;
+    const n = Number(raw.replace(/[^0-9.-]/g, ''));
+    if (!Number.isFinite(n)) return true;
+    if (n <= 0 || n > 100000) return true;
+    if (!raw.includes('.') && raw.replace(/[^0-9]/g, '').length > 5) return true;
+    return false;
+  };
+
+  // Receipt-derived values — these are the ground truth for this reparse
+  const receiptSubtotalSafe = safeMoneyString(receiptTaxInfo?.subtotal);
+  const receiptTaxSafe = safeMoneyString(receiptTaxInfo?.tax);
+  const receiptTotalSafe = safeMoneyString(receiptTaxInfo?.total);
+  const parsedAmountSafe = safeMoneyString(parsed?.amount);
+
+  // Old draft values — only used as fallback if receipt-derived values are missing
+  const draftSubtotalSafe = safeMoneyString(draft?.subtotal);
+  const draftTaxSafe = safeMoneyString(draft?.tax);
+  const draftTotalSafe = safeMoneyString(draft?.total);
+
   const mergedDraft = mergeDraftNonNull(
     {
       ...(draft || {}),
@@ -1086,82 +1108,89 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
       ...mediaFields,
 
       item:
-        parsed?.item ||
         safePrimaryItem ||
+        parsed?.item ||
         null,
 
+      // receipt-derived always wins over poisoned draft
       subtotal:
-        draft?.subtotal ??
-        (receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
-          ? Number(receiptTaxInfo.subtotal).toFixed(2)
-          : null),
+        receiptSubtotalSafe ||
+        draftSubtotalSafe ||
+        null,
 
       tax:
-        draft?.tax ??
-        (receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
-          ? Number(receiptTaxInfo.tax).toFixed(2)
-          : null),
+        receiptTaxSafe ||
+        draftTaxSafe ||
+        null,
 
       total:
-        draft?.total ??
-        (receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
-          ? Number(receiptTaxInfo.total).toFixed(2)
-          : null),
+        receiptTotalSafe ||
+        draftTotalSafe ||
+        parsedAmountSafe ||
+        null,
 
       taxLabel:
-        String(draft?.taxLabel || '').trim() ||
         String(receiptTaxInfo?.taxLabel || '').trim() ||
+        String(draft?.taxLabel || '').trim() ||
         null
     }
   );
 
-  // ✅ normalize AFTER merge (so we keep receipt-derived data but preserve job/media)
   const normalized = normalizeExpenseData(mergedDraft, userProfile, sourceText) || {};
 
-  // ✅ If item is still weak after normalize, backfill safely from receipt primary item
-  if ((typeof isUnknownItem === 'function' && isUnknownItem(normalized.item)) || !String(normalized.item || '').trim()) {
+  // Item: backfill if still unknown after normalize
+  if (
+    (typeof isUnknownItem === 'function' && isUnknownItem(normalized.item)) ||
+    !String(normalized.item || '').trim() ||
+    /^unknown$/i.test(String(normalized.item || '').trim())
+  ) {
     if (safePrimaryItem) normalized.item = safePrimaryItem;
   }
 
-  // ✅ Preserve explicit tax fields across normalize/reparse
+  // Tax fields: receipt-derived wins, then draft fallback, then normalized
   normalized.subtotal =
-    draft?.subtotal ??
-    normalized?.subtotal ??
-    (receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
-      ? Number(receiptTaxInfo.subtotal).toFixed(2)
-      : null);
-
-  normalized.tax =
-    draft?.tax ??
-    normalized?.tax ??
-    (receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
-      ? Number(receiptTaxInfo.tax).toFixed(2)
-      : null);
-
-  normalized.total =
-    draft?.total ??
-    normalized?.total ??
-    (receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
-      ? Number(receiptTaxInfo.total).toFixed(2)
-      : null);
-
-  normalized.taxLabel =
-    String(draft?.taxLabel || '').trim() ||
-    String(normalized?.taxLabel || '').trim() ||
-    String(receiptTaxInfo?.taxLabel || '').trim() ||
+    receiptSubtotalSafe ||
+    draftSubtotalSafe ||
+    safeMoneyString(normalized?.subtotal) ||
     null;
 
-  // ✅ Preserve edit latch fields across reparse
+  normalized.tax =
+    receiptTaxSafe ||
+    draftTaxSafe ||
+    safeMoneyString(normalized?.tax) ||
+    null;
+
+  normalized.total =
+    receiptTotalSafe ||
+    draftTotalSafe ||
+    parsedAmountSafe ||
+    safeMoneyString(normalized?.total) ||
+    safeMoneyString(normalized?.amount) ||
+    null;
+
+  normalized.taxLabel =
+    String(receiptTaxInfo?.taxLabel || '').trim() ||
+    String(draft?.taxLabel || '').trim() ||
+    String(normalized?.taxLabel || '').trim() ||
+    null;
+
+  // Amount: repair from receipt total if poisoned
+  if (isClearlyBadMoney(normalized.amount)) {
+    const repair = receiptTotalSafe || parsedAmountSafe;
+    if (repair) normalized.amount = `$${repair}`;
+  }
+
+  // Preserve edit latch fields
   normalized.awaiting_edit = !!draft?.awaiting_edit;
   normalized.edit_started_at = draft?.edit_started_at ?? null;
   normalized.editStartedAt = draft?.editStartedAt ?? null;
   normalized.edit_flow_id = draft?.edit_flow_id ?? null;
 
-  // ✅ Preserve media linkage again
+  // Preserve media linkage
   normalized.media_asset_id = mediaFields.media_asset_id ?? normalized.media_asset_id ?? null;
   normalized.media_source_msg_id = mediaFields.media_source_msg_id ?? normalized.media_source_msg_id ?? null;
 
-  // ✅ Preserve selected job fields again
+  // Preserve job fields
   normalized.jobName = jobFields.jobName;
   normalized.jobSource = jobFields.jobSource;
   normalized.job_no = jobFields.job_no;
@@ -1172,10 +1201,8 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     String(normalized.amount).trim() !== '$0.00';
 
   const gotDate = !!String(normalized?.date || '').trim();
-
   normalized.needsReparse = !(gotAmount && gotDate);
 
-  // ✅ Safety: never write an empty draft object back
   if (!Object.keys(normalized || {}).length) {
     console.warn('[EXPENSE_REPARSE] normalized draft empty; leaving confirmPA unchanged', { paKey });
     return confirmPA;
@@ -1843,7 +1870,6 @@ function extractReceiptPrimaryItem(text) {
   const isBadLine = (line) => {
     const s = String(line || '').trim();
     if (!s) return true;
-
     return (
       /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund|returns? and refunds?)\b/i.test(s) ||
       /^(item|qty|price|total)$/i.test(s) ||
@@ -1871,27 +1897,23 @@ function extractReceiptPrimaryItem(text) {
     if (looksMoneyish(s)) return null;
     if (s.length < 4 || s.length > 80) return null;
     if (!/[A-Za-z]/.test(s)) return null;
-
     return s;
   };
 
   const looksProductish = (line) => {
     const s = cleanCandidate(line);
     if (!s) return false;
-
     if (/\b(membrane|weathert|shingle|nail|screw|flashing|insulation|lumber|plywood|osb|caulk|adhesive|board|sheet|roll)\b/i.test(s)) return true;
     if (/\d+\s*[xX]\s*\d+/.test(s)) return true;
     if (/\d/.test(s) && /[A-Za-z]/.test(s)) return true;
     if (/[A-Z]{3,}/.test(s)) return true;
-
     return true;
   };
 
-  // 1) Best case: inline SKU followed by product text
+  // 1) Best case: inline SKU followed directly by product text (flattened OCR)
   const inlineSkuProduct = normalized.match(
     /\b\d{8,14}\b\s+([A-Za-z][A-Za-z0-9'".\-\/ ]{4,80}?)(?=\s+\$?\d+\.\d{2}\b|\s+\b(subtotal|gst\/hst|gst|hst|pst|tax|total)\b|$)/i
   );
-
   if (inlineSkuProduct?.[1]) {
     const candidate = cleanCandidate(inlineSkuProduct[1]);
     if (candidate) return candidate;
@@ -1899,11 +1921,8 @@ function extractReceiptPrimaryItem(text) {
 
   // 2) SKU line then next product-like line
   for (let i = 0; i < lines.length - 1; i += 1) {
-    const cur = lines[i];
-    const next = lines[i + 1];
-
-    if (looksSkuish(cur) && looksProductish(next)) {
-      const candidate = cleanCandidate(next);
+    if (looksSkuish(lines[i]) && looksProductish(lines[i + 1])) {
+      const candidate = cleanCandidate(lines[i + 1]);
       if (candidate) return candidate;
     }
   }
@@ -1911,11 +1930,9 @@ function extractReceiptPrimaryItem(text) {
   // 3) Search item zone before totals/payment/footer
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
-
     if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|acct|auth|employee|you saved today|returns? and refunds?)\b/i.test(line)) {
       break;
     }
-
     if (looksProductish(line)) {
       const candidate = cleanCandidate(line);
       if (candidate) return candidate;
@@ -2393,7 +2410,7 @@ function extractReceiptTaxBreakdown(text) {
     const str = String(s || '').trim();
     if (!str) return null;
 
-    // Prefer explicit decimal money tokens first
+    // Prefer explicit decimal money tokens
     const dec =
       str.match(/\$\s*(-?\d{1,6}(?:,\d{3})*\.\d{2})\b/) ||
       str.match(/\b(-?\d{1,6}(?:,\d{3})*\.\d{2})\b/);
@@ -2403,7 +2420,7 @@ function extractReceiptTaxBreakdown(text) {
       if (Number.isFinite(n) && n >= 0 && n <= 100000) return n;
     }
 
-    // Only allow plain integers when they are small and labeled
+    // Only allow plain integers if small and labeled
     const intm =
       str.match(/\$\s*(-?\d{1,5})\b/) ||
       str.match(/\b(-?\d{1,5})\b/);
@@ -2411,7 +2428,6 @@ function extractReceiptTaxBreakdown(text) {
     if (intm?.[1]) {
       const rawNum = String(intm[1]).trim();
       if (rawNum.length > 5) return null;
-
       const n = Number(rawNum);
       if (Number.isFinite(n) && n >= 0 && n <= 100000) return n;
     }
@@ -2419,7 +2435,6 @@ function extractReceiptTaxBreakdown(text) {
     return null;
   };
 
-  // Strong labeled passes first
   for (const line of lines) {
     if (subtotal == null && /\bsubtotal\b/i.test(line)) {
       const n = parseSafeMoney(line);
@@ -2443,7 +2458,7 @@ function extractReceiptTaxBreakdown(text) {
     }
   }
 
-  // Card/payment lines are only allowed as fallback if they contain a decimal amount
+  // Card/payment fallback — only accept decimal amounts
   if (total == null) {
     for (const line of lines) {
       if (!/\b(debit card|debit|visa|mastercard|amex|paid)\b/i.test(line)) continue;
@@ -2462,7 +2477,7 @@ function extractReceiptTaxBreakdown(text) {
     }
   }
 
-  // Derive total only if subtotal + tax are both valid
+  // Derive total from subtotal + tax if still missing
   if (total == null && subtotal != null && tax != null) {
     total = Number((subtotal + tax).toFixed(2));
   }
@@ -2485,16 +2500,13 @@ function normalizeReceiptOcrForParsing(text) {
     .replace(/\u00A0/g, ' ')
     .trim();
 
-  // If OCR came in as one flattened blob, create pseudo-line breaks
   s = s
     .replace(/\b(subtotal)\b/ig, '\n$1 ')
     .replace(/\b(gst\/hst|gst|hst|pst|tax)\b/ig, '\n$1 ')
     .replace(/\b(total|amount due|balance due)\b/ig, '\n$1 ')
     .replace(/\b(debit card|debit|visa|mastercard|amex)\b/ig, '\n$1 ')
     .replace(/\b(auth#?|acct|account|employee|you saved today|exchange or refund|returns? and refunds?|store details)\b/ig, '\n$1 ')
-    // split SKU -> product when OCR flattened them
     .replace(/(\b\d{8,14}\b)\s+([A-Za-z])/g, '$1\n$2')
-    // split price-heavy product rows a bit more safely
     .replace(/(\$\s*\d+\.\d{2})\s+([A-Za-z]{3,})/g, '$1\n$2');
 
   return s;
@@ -7356,39 +7368,12 @@ if (looksLikeReceiptText(input)) {
 
   try {
     // --------------------------------------------
-    // 1) Seed/patch CONFIRM PA from receipt text
+    // 1) Resolve draft0 and OCR transcript FIRST
+    //    before building receiptText
     // --------------------------------------------
-    const receiptText = (() => {
-  const candidates = [
-    mergedDraft?.receiptText,
-    mergedDraft?.ocrText,
-    mergedDraft?.extractedText,
-    draft0?.receiptText,
-    draft0?.ocrText,
-    draft0?.extractedText,
-    draft0?.media_transcript,
-    draft0?.mediaTranscript,
-    input
-  ]
-    .map((x) => String(x || '').trim())
-    .filter(Boolean);
-
-  // Prefer the richest source text, not the shortest flattened inbound body
-  candidates.sort((a, b) => b.length - a.length);
-
-  return stripExpensePrefixes(String(candidates[0] || '')).trim();
-})();
-    const back = parseReceiptBackstop(receiptText);
-
-    const locale0 = String(userProfile?.locale || ownerProfile?.locale || '').toLowerCase();
-    const defaultCurrency =
-      String(userProfile?.currency || '').trim().toUpperCase() ||
-      String(ownerProfile?.currency || '').trim().toUpperCase() ||
-      (locale0.includes('us') ? 'USD' : '') ||
-      (locale0.includes('ca') ? 'CAD' : '') ||
-      'CAD';
-
     const paKey = String(paUserId || '').trim();
+    const userKey = String(paUserId || '').trim();
+    const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
 
     const c0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
     const draft0 = c0?.payload?.draft || {};
@@ -7400,8 +7385,37 @@ if (looksLikeReceiptText(input)) {
       String(sourceMsgId || '').trim() ||
       null;
 
-    const userKey = String(paUserId || '').trim();
-    const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
+    // --------------------------------------------
+    // 2) Build receiptText — prefer richest OCR
+    //    transcript over flattened inbound body
+    // --------------------------------------------
+    const receiptText = (() => {
+      const candidates = [
+        draft0?.receiptText,
+        draft0?.ocrText,
+        draft0?.extractedText,
+        draft0?.media_transcript,
+        draft0?.mediaTranscript,
+        input
+      ]
+        .map((x) => String(x || '').trim())
+        .filter(Boolean);
+
+      // Prefer longest (richest) source — never the short flattened body
+      candidates.sort((a, b) => b.length - a.length);
+
+      return stripExpensePrefixes(String(candidates[0] || '')).trim();
+    })();
+
+    const back = parseReceiptBackstop(receiptText);
+
+    const locale0 = String(userProfile?.locale || ownerProfile?.locale || '').toLowerCase();
+    const defaultCurrency =
+      String(userProfile?.currency || '').trim().toUpperCase() ||
+      String(ownerProfile?.currency || '').trim().toUpperCase() ||
+      (locale0.includes('us') ? 'USD' : '') ||
+      (locale0.includes('ca') ? 'CAD' : '') ||
+      'CAD';
 
     // ✅ Deterministic receipt date from the receipt text itself
     const seededDate = extractReceiptDateYYYYMMDD(receiptText, tz0);
@@ -7418,7 +7432,7 @@ if (looksLikeReceiptText(input)) {
     // ✅ Tax/subtotal/total extraction at seed time
     const receiptTaxInfo =
       typeof extractReceiptTaxBreakdown === 'function'
-        ? extractReceiptTaxBreakdown(receiptText || '')
+        ? extractReceiptTaxBreakdown(receiptText)
         : { subtotal: null, tax: null, total: null, taxLabel: null };
 
     // ✅ Safe item extraction at seed time
@@ -7428,13 +7442,21 @@ if (looksLikeReceiptText(input)) {
         : null;
 
     // ✅ Build patch
-    // Prefer explicit receipt total over subtotal for confirm amount
+    // Prefer labeled receipt total; never accept absurd values
+    const safeMoneyStr = (v) => {
+      if (v == null) return null;
+      const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+      if (!Number.isFinite(n) || n <= 0 || n > 100000) return null;
+      return n.toFixed(2);
+    };
+
     const seededTotal =
-      receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
-        ? Number(receiptTaxInfo.total).toFixed(2)
-        : back?.total != null && Number.isFinite(Number(back.total))
-          ? Number(back.total).toFixed(2)
-          : null;
+      safeMoneyStr(receiptTaxInfo?.total) ||
+      safeMoneyStr(back?.total) ||
+      null;
+
+    const seededSubtotal = safeMoneyStr(receiptTaxInfo?.subtotal) || null;
+    const seededTax = safeMoneyStr(receiptTaxInfo?.tax) || null;
 
     const patch = {
       store: back?.store || draft0?.store || null,
@@ -7442,8 +7464,9 @@ if (looksLikeReceiptText(input)) {
       date: String(draft0?.date || '').trim() || seededDate || back?.dateIso || null,
 
       amount:
-        seededTotal ||
-        (String(draft0?.amount || '').trim() || null),
+        seededTotal
+          ? `$${seededTotal}`
+          : (String(draft0?.amount || '').trim() || null),
 
       currency: back?.currency || draft0?.currency || defaultCurrency,
 
@@ -7453,19 +7476,19 @@ if (looksLikeReceiptText(input)) {
         null,
 
       subtotal:
-        receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
-          ? Number(receiptTaxInfo.subtotal).toFixed(2)
-          : draft0?.subtotal || null,
+        seededSubtotal ||
+        draft0?.subtotal ||
+        null,
 
       tax:
-        receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
-          ? Number(receiptTaxInfo.tax).toFixed(2)
-          : draft0?.tax || null,
+        seededTax ||
+        draft0?.tax ||
+        null,
 
       total:
-        receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
-          ? Number(receiptTaxInfo.total).toFixed(2)
-          : draft0?.total || null,
+        seededTotal ||
+        draft0?.total ||
+        null,
 
       taxLabel:
         String(receiptTaxInfo?.taxLabel || '').trim() ||
@@ -7492,8 +7515,7 @@ if (looksLikeReceiptText(input)) {
     mergedDraft.media_asset_id =
       mergedDraft.media_asset_id || resolvedFlowMediaAssetId || flowMediaAssetId || null;
 
-    // ✅ Vendor sanitation (receipt seed): prevent “Rona for plywood” pollution.
-    // Only strip trailing “ for …” if we ALSO have an item/description already.
+    // ✅ Vendor sanitation: prevent "Rona for plywood" pollution
     if (mergedDraft?.store && typeof mergedDraft.store === 'string') {
       const s = mergedDraft.store.trim();
       if (mergedDraft?.item && /\sfor\s/i.test(s)) {

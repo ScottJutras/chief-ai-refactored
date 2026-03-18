@@ -159,7 +159,8 @@ async function hasTimeEntriesSourceMsgIdColumn() {
   try {
     _hasTimeEntriesSourceMsgIdCol = await hasColumn('time_entries_v2', 'source_msg_id');
   } catch {
-    _hasTimeEntriesSourceMsgIdCol = false;
+    // Don't cache transient errors — allow retry on next call
+    return false;
   }
   return _hasTimeEntriesSourceMsgIdCol;
 }
@@ -190,7 +191,8 @@ async function detectTimeEntriesShape() {
     if (hasEmployeeName && hasTimestamp && hasType) _timeEntriesShape = 'legacy';
     else _timeEntriesShape = 'unknown';
   } catch {
-    _timeEntriesShape = 'unknown';
+    // Don't cache transient errors — allow retry on next call
+    return 'unknown';
   }
 
   return _timeEntriesShape;
@@ -551,7 +553,8 @@ async function insertEntry(row) {
     return rows[0] || null;
   }
 
-  // fallback (non-idempotent)
+  // fallback (non-idempotent) — source_msg_id column absent; a Twilio retry will create a duplicate
+  console.warn('[insertEntry] source_msg_id column missing — insert is NOT idempotent', { ownerId, userId, kind: row.kind });
   const cols = ['owner_id', 'user_id', 'job_id', 'parent_id', 'kind', 'start_at_utc', 'end_at_utc', 'meta', 'created_by'];
   const vals = cols.map((_, i) => `$${i + 1}`).join(',');
   const params = [
@@ -2326,6 +2329,10 @@ function computeRangeUtc(mode, tz, now = new Date()) {
 
 const _nameCache = new Map();     // key: `${owner_id}:${q}` -> [user_id]
 const _displayCache = new Map();  // key: `${owner_id}:${user_id}` -> "Name"
+const _CACHE_MAX = 500;           // evict when either cache exceeds this size
+
+function _nameSet(k, v)    { if (_nameCache.size    >= _CACHE_MAX) _nameCache.clear();    _nameCache.set(k, v); }
+function _displaySet(k, v) { if (_displayCache.size >= _CACHE_MAX) _displayCache.clear(); _displayCache.set(k, v); }
 
 function _cacheKey(owner_id, s) {
   return `${String(owner_id || '').trim()}:${String(s || '').trim().toLowerCase()}`;
@@ -2348,7 +2355,7 @@ async function resolveUserIdsByName(owner_id, nameQuery, actorKey = null) {
   // 1) If they typed digits, treat as user_id
   if (/^\d+$/.test(qRaw)) {
     const out = [qRaw];
-    _nameCache.set(ck, out);
+    _nameSet(ck, out);
     return out;
   }
 
@@ -2357,7 +2364,7 @@ async function resolveUserIdsByName(owner_id, nameQuery, actorKey = null) {
     const exact = await getUserByName(ownerId, qRaw);
     if (exact?.user_id) {
       const out = [String(exact.user_id)];
-      _nameCache.set(ck, out);
+      _nameSet(ck, out);
       return out;
     }
   } catch {}
@@ -2379,7 +2386,7 @@ async function resolveUserIdsByName(owner_id, nameQuery, actorKey = null) {
 
     if (rows?.length === 1) {
       const out = [String(rows[0].user_id)];
-      _nameCache.set(ck, out);
+      _nameSet(ck, out);
       return out;
     }
 
@@ -2387,7 +2394,7 @@ async function resolveUserIdsByName(owner_id, nameQuery, actorKey = null) {
     // You can later upgrade this to show a picker.
   } catch {}
 
-  _nameCache.set(ck, null);
+  _nameSet(ck, null);
   return null;
 }
 
@@ -2407,14 +2414,14 @@ async function displayNameForUserId(owner_id, user_id) {
       const u = await getUserBasic(uid);
       const nm = String(u?.name || '').trim();
       if (nm) {
-        _displayCache.set(ck, nm);
+        _displaySet(ck, nm);
         return nm;
       }
     } catch {}
   }
 
   // fallback: show id
-  _displayCache.set(ck, uid);
+  _displaySet(ck, uid);
   return uid;
 }
 

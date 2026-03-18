@@ -659,6 +659,106 @@ async function upsertCilDraftForExpenseConfirm({
   }
 }
 
+function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourceText }) {
+  // ✅ Display amount with commas + $ + 2 decimals when possible
+  const rawAmt = String(amount || '').trim();
+
+  const amtNum = (() => {
+    const n = Number(rawAmt.replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
+    return Number.isFinite(n) ? n : NaN;
+  })();
+
+  const amt =
+    Number.isFinite(amtNum) && amtNum > 0
+      ? formatMoneyDisplay(amtNum)
+      : rawAmt
+        ? (rawAmt.startsWith('$')
+            ? rawAmt
+            : /^\d+(?:\.\d+)?$/.test(rawAmt)
+              ? formatMoneyDisplay(Number(rawAmt))
+              : rawAmt)
+        : '$0.00';
+
+  let it = cleanExpenseItemForDisplay(item);
+
+  // ✅ Only infer item from receipt-ish text
+  if (isUnknownItem(it) && sourceText) {
+    const src0 = String(sourceText || '').trim();
+
+    const looksReceiptish =
+      /^\s*\$/.test(src0) ||
+      /\b(total|subtotal|hst|gst|pst|tax|amount due)\b/i.test(src0) ||
+      src0.split('\n').length >= 3;
+
+    if (looksReceiptish) {
+      const src = normalizeDashes(src0);
+
+      // 1) "$883 - Railing ..."
+      let m =
+        src.match(
+          /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
+        ) || null;
+      if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
+
+      // 2) "purchased $883 in railing at Rona"
+      if (isUnknownItem(it)) {
+        m =
+          src.match(
+            /\b(?:spent|spend|paid|pay|purchased|purchase|bought|buy|ordered|order|got)\b.*?\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+\bin\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+          ) || null;
+        if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
+      }
+
+      // 3) "$883 railing at Rona"
+      if (isUnknownItem(it)) {
+        m =
+          src.match(
+            /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
+          ) || null;
+        if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
+      }
+    }
+  }
+
+  if (isUnknownItem(it)) it = 'Unknown';
+
+  const st = String(store || '').trim() || 'Unknown Store';
+  const dt = formatDisplayDate(date, tz);
+  const jb = jobName ? String(jobName).trim() : '';
+
+  const taxInfo =
+    typeof extractReceiptTaxBreakdown === 'function'
+      ? extractReceiptTaxBreakdown(sourceText || '')
+      : { subtotal: null, tax: null, total: null, taxLabel: null };
+
+  const subtotalLine =
+    taxInfo?.subtotal != null && Number.isFinite(Number(taxInfo.subtotal))
+      ? `Subtotal: ${formatMoneyDisplay(Number(taxInfo.subtotal))}`
+      : null;
+
+  const taxLine =
+    taxInfo?.tax != null && Number.isFinite(Number(taxInfo.tax))
+      ? `${String(taxInfo.taxLabel || 'Tax')}: ${formatMoneyDisplay(Number(taxInfo.tax))}`
+      : null;
+
+  const totalLine =
+    taxInfo?.total != null && Number.isFinite(Number(taxInfo.total))
+      ? `Total: ${formatMoneyDisplay(Number(taxInfo.total))}`
+      : null;
+
+  const lines = [];
+  lines.push(`💸 ${amt} — ${it}`);
+  if (st && st !== 'Unknown Store') lines.push(`🏪 ${st}`);
+  if (dt) lines.push(`📅 ${dt}`);
+  if (jb) lines.push(`🧰 ${jb}`);
+
+  if (subtotalLine) lines.push(subtotalLine);
+  if (taxLine) lines.push(taxLine);
+  if (totalLine) lines.push(totalLine);
+
+  return lines.join('\n');
+}
+
 async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile = null }) {
   const paKey = String(paUserId || '').trim();
 

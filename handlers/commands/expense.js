@@ -669,9 +669,6 @@ function buildExpenseSummaryLine({
   total,
   taxLabel
 }) {
-  // ---------------------------------------------------------
-  // amount
-  // ---------------------------------------------------------
   const rawAmt = String(amount || '').trim();
 
   const amtNum = (() => {
@@ -690,14 +687,6 @@ function buildExpenseSummaryLine({
               : rawAmt)
         : '$0.00';
 
-  // ---------------------------------------------------------
-  // item
-  // TRUST ORDER:
-  // 1) explicit cleaned item already on draft
-  // 2) safe receipt primary item extractor
-  // 3) Unknown
-  // NEVER broad-regex fallback over noisy OCR footer text
-  // ---------------------------------------------------------
   let it = cleanExpenseItemForDisplay(item);
 
   const looksBadItem =
@@ -713,36 +702,16 @@ function buildExpenseSummaryLine({
 
   if (!it || /^unknown\b/i.test(String(it || ''))) it = 'Unknown';
 
-  // ---------------------------------------------------------
-  // store
-  // ---------------------------------------------------------
   let st = String(store || '').trim();
-
   if ((!st || /^unknown\b/i.test(st)) && sourceText && typeof extractReceiptStore === 'function') {
     const receiptStore = extractReceiptStore(sourceText);
     if (receiptStore) st = String(receiptStore).trim();
   }
-
   if (!st) st = 'Unknown Store';
 
-  // ---------------------------------------------------------
-  // date
-  // show only if actually known
-  // ---------------------------------------------------------
-  const dt = String(date || '').trim()
-    ? formatDisplayDate(date, tz)
-    : null;
-
-  // ---------------------------------------------------------
-  // job
-  // ---------------------------------------------------------
+  const dt = String(date || '').trim() ? formatDisplayDate(date, tz) : null;
   const jb = jobName ? String(jobName).trim() : '';
 
-  // ---------------------------------------------------------
-  // subtotal / tax / total
-  // prefer explicit draft fields first
-  // OCR fallback only if explicit fields missing
-  // ---------------------------------------------------------
   const taxInfo =
     typeof extractReceiptTaxBreakdown === 'function'
       ? extractReceiptTaxBreakdown(sourceText || '')
@@ -774,31 +743,14 @@ function buildExpenseSummaryLine({
     String(taxInfo?.taxLabel || '').trim() ||
     'Tax';
 
-  const subtotalLine =
-    safeSubtotal != null
-      ? `Subtotal: ${formatMoneyDisplay(safeSubtotal)}`
-      : null;
-
-  const taxLine =
-    safeTax != null
-      ? `${safeTaxLabel}: ${formatMoneyDisplay(safeTax)}`
-      : null;
-
-  const totalLine =
-    safeTotal != null
-      ? `Total: ${formatMoneyDisplay(safeTotal)}`
-      : null;
-
   const lines = [];
   lines.push(`💸 ${amt} — ${it}`);
-
   if (st && st !== 'Unknown Store') lines.push(`🏪 ${st}`);
   if (dt) lines.push(`📅 ${dt}`);
   if (jb) lines.push(`🧰 ${jb}`);
-
-  if (subtotalLine) lines.push(subtotalLine);
-  if (taxLine) lines.push(taxLine);
-  if (totalLine) lines.push(totalLine);
+  if (safeSubtotal != null) lines.push(`Subtotal: ${formatMoneyDisplay(safeSubtotal)}`);
+  if (safeTax != null) lines.push(`${safeTaxLabel}: ${formatMoneyDisplay(safeTax)}`);
+  if (safeTotal != null) lines.push(`Total: ${formatMoneyDisplay(safeTotal)}`);
 
   return lines.join('\n');
 }
@@ -921,15 +873,27 @@ function parseExpenseEditOverwrite(text) {
   // prefer first standalone money line
   // or explicit amount/total/price/cost line
   // ---------------------------------------------------------
+    // Prefer explicit Total first
   for (const line of cleanedLines) {
-    if (
-      /^\$?\s*\d+(?:\.\d{1,2})?\s*$/.test(line) ||
-      /\b(amount|total|price|cost)\b/i.test(line)
-    ) {
-      const m = line.match(/\$?\s*(-?\d+(?:\.\d{1,2})?)\b/);
-      if (m?.[1]) {
-        amount = `$${Number(m[1]).toFixed(2)}`;
-        break;
+    const m = line.match(/^\s*total\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+    if (m?.[1]) {
+      amount = `$${Number(m[1]).toFixed(2)}`;
+      break;
+    }
+  }
+
+  // Fallback to first standalone amount / explicit amount line
+  if (!amount) {
+    for (const line of cleanedLines) {
+      if (
+        /^\$?\s*\d+(?:\.\d{1,2})?\s*$/.test(line) ||
+        /\b(amount|price|cost)\b/i.test(line)
+      ) {
+        const m = line.match(/\$?\s*(-?\d+(?:\.\d{1,2})?)\b/);
+        if (m?.[1]) {
+          amount = `$${Number(m[1]).toFixed(2)}`;
+          break;
+        }
       }
     }
   }
@@ -1794,12 +1758,11 @@ function extractReceiptPrimaryItem(text) {
   if (!lines.length) return null;
 
   const badLine =
-    /\b(subtotal|total|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#)\b/i;
+    /\b(subtotal|total|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default)\b/i;
 
   const looksPriceish = /(\$?\d+\.\d{2})/.test.bind(/(\$?\d+\.\d{2})/);
   const looksSkuish = /^\d{6,}$/.test.bind(/^\d{6,}$/);
 
-  // Prefer descriptive product/material lines
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
 
@@ -2273,12 +2236,7 @@ function extractReceiptTotal(text) {
 function extractReceiptTaxBreakdown(text) {
   const raw = String(text || '');
   if (!raw) {
-    return {
-      subtotal: null,
-      tax: null,
-      total: null,
-      taxLabel: null
-    };
+    return { subtotal: null, tax: null, total: null, taxLabel: null };
   }
 
   const lines = raw
@@ -2286,68 +2244,70 @@ function extractReceiptTaxBreakdown(text) {
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
-  const parseMoney = (line) => {
-    const m = String(line || '').match(
-      /(?:^|[^0-9])(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d{1,6}\.\d{2})(?:[^0-9]|$)/
-    );
-    if (!m?.[1]) return null;
-    const n = Number(String(m[1]).replace(/,/g, ''));
-    return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
-  };
-
   let subtotal = null;
   let tax = null;
   let total = null;
   let taxLabel = null;
 
+  const parseMoney = (s) => {
+    const m = String(s || '').match(/\$?\s*(-?\d+(?:\.\d{1,2})?)\b/);
+    if (!m?.[1]) return null;
+    const n = Number(m[1]);
+    return Number.isFinite(n) ? n : null;
+  };
+
   for (const line of lines) {
-    const lc = line.toLowerCase();
-
-    if (subtotal == null && (/\bsub\s*total\b/.test(lc) || /\bsubtotal\b/.test(lc))) {
-      const n = parseMoney(line);
-      if (n != null && n > 0) subtotal = n;
-    }
-
-    if (tax == null && /\b(hst|gst|pst|vat|tax)\b/.test(lc)) {
-      const n = parseMoney(line);
-      if (n != null && n >= 0) tax = n;
-
-      if (!taxLabel) {
-        if (/\bhst\b/i.test(line)) taxLabel = 'HST';
-        else if (/\bgst\b/i.test(line)) taxLabel = 'GST';
-        else if (/\bpst\b/i.test(line)) taxLabel = 'PST';
-        else if (/\bvat\b/i.test(line)) taxLabel = 'VAT';
-        else if (/\btax\b/i.test(line)) taxLabel = 'Tax';
+    if (subtotal == null) {
+      const m = line.match(/\bsubtotal\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+      if (m?.[1]) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n)) subtotal = n;
       }
     }
 
-    if (total == null && /\b(grand\s*total|amount\s*due|total\s*due|total)\b/.test(lc)) {
-      const n = parseMoney(line);
-      if (n != null && n > 0) total = n;
+    if (tax == null) {
+      const m = line.match(/\b(gst\/hst|hst|gst|pst|tax)\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+      if (m?.[1] && m?.[2]) {
+        const n = Number(m[2]);
+        if (Number.isFinite(n)) {
+          tax = n;
+          taxLabel = String(m[1]).toUpperCase();
+        }
+      }
+    }
+
+    if (total == null) {
+      const m = line.match(/\btotal\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+      if (m?.[1]) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n)) total = n;
+      }
     }
   }
 
+  // Fallback: if total still missing, use strongest labeled money line
   if (total == null) {
-    total = extractReceiptTotal(raw);
-  }
+    const candidates = lines
+      .map((line) => {
+        const n = parseMoney(line);
+        return n != null ? { line, value: n } : null;
+      })
+      .filter(Boolean);
 
-  if (subtotal == null && total != null && tax != null) {
-    const n = total - tax;
-    if (Number.isFinite(n) && n >= 0) subtotal = Number(n.toFixed(2));
-  }
+    const best =
+      typeof chooseBestReceiptAmountCandidate === 'function'
+        ? chooseBestReceiptAmountCandidate(candidates)
+        : null;
 
-  if (tax == null && subtotal != null && total != null && total >= subtotal) {
-    const n = total - subtotal;
-    if (Number.isFinite(n) && n >= 0) {
-      tax = Number(n.toFixed(2));
-      if (!taxLabel) taxLabel = 'Tax';
+    if (best != null && Number.isFinite(Number(best))) {
+      total = Number(best);
     }
   }
 
   return {
-    subtotal: subtotal != null ? Number(subtotal.toFixed(2)) : null,
-    tax: tax != null ? Number(tax.toFixed(2)) : null,
-    total: total != null ? Number(total.toFixed(2)) : null,
+    subtotal: subtotal != null ? subtotal.toFixed(2) : null,
+    tax: tax != null ? tax.toFixed(2) : null,
+    total: total != null ? total.toFixed(2) : null,
     taxLabel: taxLabel || null
   };
 }

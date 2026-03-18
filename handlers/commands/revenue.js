@@ -33,6 +33,8 @@ const todayInTimeZone =
 const {
   sendWhatsAppInteractiveList,
   sendWhatsAppTemplate,
+  sendWhatsApp,
+  sendQuickReply,
   toTemplateVar
 } = require('../../services/twilio');
 
@@ -668,25 +670,28 @@ function sendConfirmRevenueTwiML(from, summaryLine) {
 async function sendConfirmRevenueTemplateOrFallback(from, summaryLine) {
   summaryLine = String(summaryLine || '').trim() || 'Confirm revenue?';
   const sid = String(process.env.TWILIO_REVENUE_CONFIRM_TEMPLATE_SID || '').trim();
-  
-  // If template SID missing, fall back to TwiML confirm (NO recursion)
-  if (!sid) return sendConfirmRevenueTwiML(from, summaryLine);
 
+  // ✅ 1) Best path: Content Template with buttons
+  if (sid) {
+    try {
+      await sendWhatsAppTemplate({ to: from, templateSid: sid, summaryLine });
+      return out(twimlEmpty(), true);
+    } catch (e) {
+      console.warn('[REVENUE_CONFIRM_TEMPLATE] failed, falling back to quick replies:', e?.message);
+    }
+  }
+
+  // ✅ 2) Middle tier: quick replies
   try {
-    const { sendWhatsAppTemplate } = require('../../services/twilio'); // path may vary
-
-    await sendWhatsAppTemplate({
-      to: from,
-      templateSid: sid,
-      summaryLine
-    });
-
-    // outbound WhatsApp sent, return empty TwiML to stop double replies
+    await sendQuickReply(from, `✅ Confirm revenue\n${summaryLine}`, ['Yes', 'Edit', 'Cancel']);
+    await sendWhatsApp(from, `🔁 To change the job, reply: "change job"`);
     return out(twimlEmpty(), true);
   } catch (e) {
-    console.warn('[REVENUE_CONFIRM_TEMPLATE] failed, falling back:', e?.message);
-    return sendConfirmRevenueTwiML(from, summaryLine);
+    console.warn('[REVENUE_CONFIRM_QUICK_REPLY] failed, falling back to TwiML:', e?.message);
   }
+
+  // ✅ 3) Final fallback: TwiML
+  return sendConfirmRevenueTwiML(from, summaryLine);
 }
 
 async function sendConfirmRevenueOrFallback(from, summaryLine, ctx = null) {
@@ -2777,9 +2782,11 @@ if (strictTok === 'yes') {
     const sourceForDb = String(data.source || '').trim() || 'Unknown';
     const descForDb = String(data.description || '').trim() || 'Revenue received';
 
-    const insertFn = typeof pg.insertTransaction === 'function' ? pg.insertTransaction : insertTransaction;
+    if (typeof pg.insertTransaction !== 'function') {
+      throw new Error('[REVENUE_YES] pg.insertTransaction is not available');
+    }
 
-    const ins = await insertFn({
+    const ins = await pg.insertTransaction({
       ownerId,
       owner_id: ownerId,
       userId: paUserId,
@@ -2798,6 +2805,7 @@ if (strictTok === 'yes') {
 
       jobName,
       jobSource,
+      job_id: data.job_id || rawDraft?.job_id || null,
 
       category: categoryStr,
       source_msg_id: txSourceMsgId || null

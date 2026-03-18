@@ -261,29 +261,36 @@ if (needsPro && planKey !== "pro") {
 }
 
 
-    // 4) Dedicated handlers first (so they can manage stateful flows cleanly)
-    // Expense + Revenue should run before task/timeclock/job so they can consume confirmations, job pickers, etc.
-    if (handleExpense && /^expense\b/i.test(lc)) {
-      const out = await handleExpense(from, raw, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId);
-      // expense handler returns TwiML string (in your drop-in), so send it here.
-      res.status(200).type('application/xml').send(out);
+    // 4) Expense + Revenue — run before tasks/timeclock/job so they consume confirmations and job pickers.
+    // Decision tokens (yes/edit/cancel/change job/job pickers) are also routed here so pending confirms
+    // reach the right handler instead of falling through to the agent.
+    const isDecisionToken =
+      /^(yes|y|yeah|yep|ok|okay|edit|cancel|skip|resume|change.?job)\b/i.test(lc) ||
+      /^(jobno_|jobix_)\d+/i.test(lc);
+
+    if (handleExpense && (/^expense\b/i.test(lc) || isDecisionToken)) {
+      const result = await handleExpense(from, raw, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId);
+      if (result?.sentOutOfBand) {
+        twimlEmpty(res);
+      } else {
+        res.status(200).type('application/xml; charset=utf-8').send(result?.twiml || '<Response></Response>');
+      }
       await safeCleanup({ from, ownerId });
       return true;
     }
 
-    if (handleRevenue && (/^revenue\b/i.test(lc) || /^(received|got paid|payment)\b/i.test(lc))) {
-      // NOTE: your revenue handler expects to return TwiML string (in your drop-in)
-      const out = await handleRevenue(from, raw, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId);
-      res.status(200).type('application/xml').send(out);
+    if (handleRevenue && (/^revenue\b/i.test(lc) || /^(received|got paid|payment)\b/i.test(lc) || isDecisionToken)) {
+      const result = await handleRevenue(from, raw, userProfile, ownerId, ownerProfile, isOwner, sourceMsgId);
+      if (result?.sentOutOfBand) {
+        twimlEmpty(res);
+      } else {
+        res.status(200).type('application/xml; charset=utf-8').send(result?.twiml || '<Response></Response>');
+      }
       await safeCleanup({ from, ownerId });
       return true;
     }
 
-    // If the user is replying "yes/edit/cancel" and we have expense/revenue handlers enabled,
-    // DO NOT intercept here — let those handlers pick it up based on pending state.
-    // We'll just fall through to them below.
-    
-    // 5) Dedicated handlers first (stateful flows)
+    // 5) Remaining dedicated handlers (team, tasks, timeclock, job)
 // ✅ TEAM (employees/crew) — Gate #3 lives inside team.js
 if (teamHandler) {
   const teamHit =

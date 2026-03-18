@@ -114,58 +114,6 @@ function getDbQueryFn() {
 
   throw new Error('DB query function not available (query/pool missing)');
 }
-// ✅ Cancel a draft by source message id (best-effort)
-async function cancelCilDraftBySourceMsg({ owner_id, source_msg_id, status = 'cancelled' } = {}) {
-  const ownerKey = String(owner_id || '').trim();
-  const src = String(source_msg_id || '').trim();
-  if (!ownerKey || !src) return { ok: false, reason: 'missing_owner_or_source' };
-
-  const q = getDbQueryFn();
-
-  const { rows } = await q(
-    `
-    update public.cil_drafts
-       set status = $3,
-           updated_at = now()
-     where owner_id::text = $1
-       and source_msg_id = $2
-       and status = 'draft'
-     returning id, status, source_msg_id
-    `,
-    [ownerKey, src, String(status || 'cancelled')]
-  );
-
-  return { ok: true, cancelled: rows?.length || 0, row: rows?.[0] || null };
-}
-
-
-// ✅ Expire old drafts (so PA TTL expiration doesn't leave zombies)
-async function expireOldCilDrafts(owner_id, { maxAgeMinutes = 360 } = {}) {
-  const ownerKey = String(owner_id || '').trim();
-  if (!ownerKey) return { ok: false, reason: 'missing_owner' };
-
-  const mins = Number(maxAgeMinutes);
-  const maxMins = Number.isFinite(mins) && mins > 0 ? Math.floor(mins) : 360;
-
-  const q = getDbQueryFn();
-
-  const { rows } = await q(
-    `
-    update public.cil_drafts
-       set status = 'expired',
-           updated_at = now()
-     where owner_id::text = $1
-       and status = 'draft'
-       and created_at < (now() - (($2::text || ' minutes')::interval))
-     returning id
-    `,
-    [ownerKey, String(maxMins)]
-  );
-
-  return { ok: true, expired: rows?.length || 0 };
-}
-
-
 async function withClient(fn, { useTransaction = true } = {}) {
   const client = await pool.connect();
   try {
@@ -369,37 +317,6 @@ const r = await query(
   return r;
 }
 
-// -------------------- Schema introspection (cached) --------------------
-
-const __colCache = new Map(); // key: "schema.table" => Set(cols)
-
-async function getColumnsCached(schema, table) {
-  const key = `${schema}.${table}`;
-  if (__colCache.has(key)) return __colCache.get(key);
-
-  const r = await query(
-    `
-    select column_name
-    from information_schema.columns
-    where table_schema = $1 and table_name = $2
-    `,
-    [schema, table]
-  );
-
-  const set = new Set((r?.rows || []).map((x) => String(x.column_name || "").toLowerCase()));
-  __colCache.set(key, set);
-  return set;
-}
-
-async function hasColumn(schema, table, col) {
-  try {
-    const cols = await getColumnsCached(schema, table);
-    return cols.has(String(col || "").toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
 // -------------------- Job profit by range (transactions-first) --------------------
 
 /**
@@ -429,8 +346,8 @@ async function getJobProfitByRange({ ownerId, jobId = null, jobNo = null, fromIs
   const b = from <= to ? to : from;
 
   // Decide which job-link column is available
-  const hasJobId = await hasColumn("public", "transactions", "job_id");
-  const hasJobNo = await hasColumn("public", "transactions", "job_no");
+  const hasJobId = await hasColumn("transactions", "job_id");
+  const hasJobNo = await hasColumn("transactions", "job_no");
 
   // Fail-closed: if we have neither, we cannot do ranged job profit safely
   if (!hasJobId && !hasJobNo) {
@@ -907,27 +824,27 @@ async function detectTransactionsCapabilities() {
     TX_HAS_UPDATED_AT = names.has('updated_at');
   } catch (e) {
     console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
-
-    TX_HAS_TENANT_ID = false;
-
-    TX_HAS_SOURCE_MSG_ID = false;
-    TX_HAS_AMOUNT = false;
-    TX_HAS_MEDIA_URL = false;
-    TX_HAS_MEDIA_TYPE = false;
-    TX_HAS_MEDIA_TXT = false;
-    TX_HAS_MEDIA_CONF = false;
-    TX_HAS_JOB_ID = false;
-    TX_HAS_JOB_NO = false;
-    TX_HAS_DEDUPE_HASH = false;
-    TX_HAS_MEDIA_ASSET_ID = false;
-
-    TX_HAS_JOB = false;
-    TX_HAS_JOB_NAME = false;
-    TX_HAS_CATEGORY = false;
-    TX_HAS_USER_NAME = false;
-    TX_HAS_MEDIA_META = false;
-    TX_HAS_CREATED_AT = false;
-    TX_HAS_UPDATED_AT = false;
+    // Don't cache transient errors — allow retry on next call
+    return {
+      TX_HAS_SOURCE_MSG_ID: false,
+      TX_HAS_AMOUNT: false,
+      TX_HAS_MEDIA_URL: false,
+      TX_HAS_MEDIA_TYPE: false,
+      TX_HAS_MEDIA_TXT: false,
+      TX_HAS_MEDIA_CONF: false,
+      TX_HAS_JOB_ID: false,
+      TX_HAS_JOB_NO: false,
+      TX_HAS_DEDUPE_HASH: false,
+      TX_HAS_JOB: false,
+      TX_HAS_JOB_NAME: false,
+      TX_HAS_CATEGORY: false,
+      TX_HAS_USER_NAME: false,
+      TX_HAS_MEDIA_META: false,
+      TX_HAS_CREATED_AT: false,
+      TX_HAS_UPDATED_AT: false,
+      TX_HAS_MEDIA_ASSET_ID: false,
+      TX_HAS_TENANT_ID: false
+    };
   }
 
   return {
@@ -2481,7 +2398,8 @@ try {
     const c = await client.query(
       `select count(*)::int as n
          from public.jobs
-        where owner_id=$1`,
+        where owner_id=$1
+          and (status is null or status in ('open','active','draft'))`,
       [owner]
     );
 
@@ -3059,24 +2977,8 @@ async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
   // 4) user_active_job (supports uuid OR text schema)
   if (caps.has_user_active_job) {
     try {
-      // detect job_id type once per cold start
-      let jobIdType = 'text';
-      try {
-        const t = await query(
-          `
-          select data_type, udt_name
-            from information_schema.columns
-           where table_schema='public'
-             and table_name='user_active_job'
-             and column_name='job_id'
-           limit 1
-          `
-        );
-        const row = t?.rows?.[0];
-        const dt = String(row?.data_type || '').toLowerCase();
-        const udt = String(row?.udt_name || '').toLowerCase();
-        if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
-      } catch {}
+      const detectedType = await detectUserActiveJobJobIdType().catch(() => 'unknown');
+      const jobIdType = detectedType === 'uuid' ? 'uuid' : 'text';
 
       // If clearing
       if (!jobNoText && !name) {
@@ -3301,24 +3203,8 @@ async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
   // 4) user_active_job (supports uuid OR text job_id)
   if (caps.has_user_active_job) {
     try {
-      // detect job_id type
-      let jobIdType = 'text';
-      try {
-        const t = await query(
-          `
-          select data_type, udt_name
-            from information_schema.columns
-           where table_schema='public'
-             and table_name='user_active_job'
-             and column_name='job_id'
-           limit 1
-          `
-        );
-        const row = t?.rows?.[0];
-        const dt = String(row?.data_type || '').toLowerCase();
-        const udt = String(row?.udt_name || '').toLowerCase();
-        if (dt === 'uuid' || udt === 'uuid') jobIdType = 'uuid';
-      } catch {}
+      const detectedType = await detectUserActiveJobJobIdType().catch(() => 'unknown');
+      const jobIdType = detectedType === 'uuid' ? 'uuid' : 'text';
 
       const r = await query(`select job_id from public.user_active_job where owner_id=$1 and user_id=$2 limit 1`, [
         owner,
@@ -3395,9 +3281,20 @@ async function createUserProfile({ user_id, ownerId, onboarding_in_progress = fa
 }
 
 
+const _SAVE_USER_PROFILE_ALLOWED_COLS = new Set([
+  'user_id', 'owner_id', 'name', 'email', 'phone', 'phone_e164',
+  'wa_id', 'timezone', 'tz', 'plan_key', 'subscription_tier', 'paid_tier',
+  'sub_status', 'stripe_customer_id', 'stripe_subscription_id', 'stripe_price_id',
+  'current_period_start', 'current_period_end', 'cancel_at_period_end',
+  'onboarding_in_progress', 'dashboard_token', 'active_job_id', 'active_job_name',
+  'otp', 'otp_expiry', 'created_at', 'updated_at'
+]);
+
 async function saveUserProfile(p) {
-  const keys = Object.keys(p);
-  const vals = Object.values(p);
+  const keys = Object.keys(p).filter((k) => _SAVE_USER_PROFILE_ALLOWED_COLS.has(k));
+  if (!keys.length) throw new Error('saveUserProfile: no valid columns to save');
+
+  const vals = keys.map((k) => p[k]);
   const insCols = keys.join(', ');
   const insVals = keys.map((_, i) => `$${i + 1}`).join(', ');
   const upd = keys
@@ -4264,9 +4161,8 @@ async function detectTimeEntriesCapabilities() {
     SUPPORTS_USER_ID = names.has('user_id');
     SUPPORTS_SOURCE_MSG_ID = names.has('source_msg_id');
   } catch {
-    SUPPORTS_CREATED_BY = false;
-    SUPPORTS_USER_ID = false;
-    SUPPORTS_SOURCE_MSG_ID = false;
+    // Don't cache transient errors — allow retry on next call
+    return { SUPPORTS_CREATED_BY: false, SUPPORTS_USER_ID: false, SUPPORTS_SOURCE_MSG_ID: false };
   }
 
   return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
@@ -4899,7 +4795,5 @@ module.exports = {
   allocateNextActivityLogNo,
   getActorMemory,
   patchActorMemory,
-  sumExpensesCentsByRange,
-  sumRevenueCentsByRange,
   getJobProfitByRange,
 };

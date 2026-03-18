@@ -57,10 +57,11 @@ function twimlText(msg) {
 }
 
 function respond(res, msg) {
-  if (!res || res.headersSent) return false;
-
-  const xml = twimlText(msg); // will be empty-safe
-  return res.status(200).type('text/xml; charset=utf-8').send(xml);
+  if (res && !res.headersSent) {
+    const xml = twimlText(msg); // will be empty-safe
+    res.status(200).type('application/xml; charset=utf-8').send(xml);
+  }
+  return true; // always signal "handled" to caller
 }
 
 
@@ -127,7 +128,7 @@ async function tasksHasSourceMsgIdColumn() {
   try {
     _tasksHasSourceMsgIdCol = await hasColumn('tasks', 'source_msg_id');
   } catch {
-    _tasksHasSourceMsgIdCol = false;
+    return false; // Don't cache transient errors — allow retry on next call
   }
   return _tasksHasSourceMsgIdCol;
 }
@@ -230,6 +231,7 @@ async function createTaskIdempotent({
   }
 
   // Fallback (non-idempotent) - prefer postgres.js helper if present
+  console.warn('[createTaskIdempotent] source_msg_id column missing or no sid — insert is NOT idempotent', { ownerId, createdBy });
   if (typeof pg.createTaskWithJob === 'function') {
     const task = await pg.createTaskWithJob({
       ownerId,
@@ -368,9 +370,6 @@ if (!isOwner) {
   }
 }
 
-
-  // If you have a middleware lock system, we try to release via req.releaseLock first (preferred).
-  const lockKey = `lock:${paUserId}`;
 
   try {
     let pending = await getPendingTransactionState(paUserId);
@@ -614,7 +613,7 @@ try {
     // ASSIGN #N TO NAME
     // -------------------------------------------------
     {
-      const m = lc.match(/^assign\s*#?\s*(\d+)\s+(?:to|@)\s*(.+)$/i);
+      const m = raw.match(/^assign\s*#?\s*(\d+)\s+(?:to|@)\s*(.+)$/i);
       if (m) {
         const taskNo = parseInt(m[1], 10);
         const name = normalizeTaskText(m[2]);
@@ -691,16 +690,6 @@ try {
   } catch (e) {
     console.error('[tasks] error:', e?.message);
     return respond(res, '⚠️ Task error. Try again.');
-  } finally {
-    // ✅ Prefer request-scoped release (matches timeclock + your middleware patterns)
-    try { res?.req?.releaseLock?.(); } catch {}
-
-    // optional fallback if your lock middleware exports a release function
-    try {
-      // eslint-disable-next-line global-require
-      const lock = require('../../middleware/lock');
-      if (typeof lock.releaseLock === 'function') await lock.releaseLock(lockKey);
-    } catch {}
   }
 }
 

@@ -91,20 +91,20 @@ function respond(res, message) {
   const xml = t ? twimlText(t) : twimlEmpty();
 
   if (res && !res.headersSent) {
-    return res.status(200).type('text/xml; charset=utf-8').send(xml);
+    res.status(200).type('application/xml; charset=utf-8').send(xml);
   }
 
-  return xml;
+  return true;
 }
 
 function respondEmpty(res) {
   const xml = twimlEmpty();
 
   if (res && !res.headersSent) {
-    return res.status(200).type('text/xml; charset=utf-8').send(xml);
+    res.status(200).type('application/xml; charset=utf-8').send(xml);
   }
 
-  return xml;
+  return true;
 }
 
 
@@ -206,6 +206,7 @@ const ENABLE_LIST_PICKER = (() => {
 const CONTENT_API_BASE = 'https://content.twilio.com/v1/Content';
 const _contentSidCache = new Map(); // key -> { sid, at }
 const CONTENT_SID_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const _CONTENT_SID_CACHE_MAX = 200;
 
 function _cacheGet(key) {
   const v = _contentSidCache.get(key);
@@ -217,6 +218,7 @@ function _cacheGet(key) {
   return v.sid;
 }
 function _cacheSet(key, sid) {
+  if (_contentSidCache.size >= _CONTENT_SID_CACHE_MAX) _contentSidCache.clear();
   _contentSidCache.set(key, { sid, at: Date.now() });
 }
 
@@ -585,7 +587,10 @@ function normalizeJobOptions(jobRows) {
     if (!name || isGarbageJobName(name)) continue;
 
     const job_no = r?.job_no != null && Number.isFinite(Number(r.job_no)) ? Number(r.job_no) : null;
-    if (job_no == null) continue;
+    if (job_no == null) {
+      console.warn('[JOB] normalizeJobOptions: dropping job with no job_no', { name });
+      continue;
+    }
 
     if (seen.has(job_no)) continue;
     seen.add(job_no);
@@ -933,6 +938,71 @@ async function activateJobBestEffort(ownerId, selector) {
 }
 
 
+/* ---------------- archive helper (module scope) ---------------- */
+
+async function archiveJobBestEffort({ ownerId, jobNo, jobName }) {
+  const owner = String(ownerId || '').trim();
+  const no = jobNo != null && Number.isFinite(Number(jobNo)) ? Number(jobNo) : null;
+  const nm = jobName ? String(jobName).trim() : null;
+
+  if (!owner) throw new Error('missing ownerId');
+  if (no == null && !nm) throw new Error('missing job selector');
+
+  // Prefer pg helpers if they exist
+  const fnCandidates = [
+    'archiveJobByNo',
+    'archiveJob',
+    'deleteJobByNo', // some codebases use delete* but implement soft delete
+    'removeJobByNo',
+    'closeJobByNo'
+  ];
+
+  for (const fn of fnCandidates) {
+    if (typeof pg[fn] !== 'function') continue;
+    try {
+      if (no != null) {
+        const out = await pg[fn](owner, no);
+        if (out) return true;
+      }
+      if (nm) {
+        const out = await pg[fn](owner, nm);
+        if (out) return true;
+      }
+    } catch (e) {
+      console.warn('[JOB] pg.' + fn + ' failed:', e?.message);
+    }
+  }
+
+  // SQL fallback (safe)
+  if (typeof pg.query !== 'function') return false;
+
+  if (no != null) {
+    const r = await pg.query(
+      `update public.jobs
+          set status = 'archived',
+              active = false,
+              updated_at = now()
+        where owner_id=$1
+          and job_no=$2
+        returning job_no`,
+      [owner, Number(no)]
+    );
+    return !!r?.rowCount;
+  }
+
+  const r = await pg.query(
+    `update public.jobs
+        set status = 'archived',
+            active = false,
+            updated_at = now()
+      where owner_id=$1
+        and lower(coalesce(name, job_name)) = lower($2)
+      returning job_no`,
+    [owner, String(nm)]
+  );
+  return !!r?.rowCount;
+}
+
 /* ---------------- main handler ---------------- */
 
 async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId) {
@@ -944,72 +1014,6 @@ async function handleJob(fromPhone, text, userProfile, ownerId, ownerProfile, is
 
   try {
     const pending = await getPendingTransactionState(fromPhone);
-
-    /* ------------------------------------------------------------
-     * Helper: Archive job best-effort (SAFE = soft delete)
-     * ------------------------------------------------------------ */
-    async function archiveJobBestEffort({ ownerId, jobNo, jobName }) {
-      const owner = String(ownerId || '').trim();
-      const no = jobNo != null && Number.isFinite(Number(jobNo)) ? Number(jobNo) : null;
-      const nm = jobName ? String(jobName).trim() : null;
-
-      if (!owner) throw new Error('missing ownerId');
-      if (no == null && !nm) throw new Error('missing job selector');
-
-      // Prefer pg helpers if they exist
-      const fnCandidates = [
-        'archiveJobByNo',
-        'archiveJob',
-        'deleteJobByNo', // some codebases use delete* but implement soft delete
-        'removeJobByNo',
-        'closeJobByNo'
-      ];
-
-      for (const fn of fnCandidates) {
-        if (typeof pg[fn] !== 'function') continue;
-        try {
-          if (no != null) {
-            const out = await pg[fn](owner, no);
-            if (out) return true;
-          }
-          if (nm) {
-            const out = await pg[fn](owner, nm);
-            if (out) return true;
-          }
-        } catch (e) {
-          console.warn('[JOB] pg.' + fn + ' failed:', e?.message);
-        }
-      }
-
-      // SQL fallback (safe)
-      if (typeof pg.query !== 'function') return false;
-
-      if (no != null) {
-        const r = await pg.query(
-          `update public.jobs
-              set status = 'archived',
-                  active = false,
-                  updated_at = now()
-            where owner_id=$1
-              and job_no=$2
-            returning job_no`,
-          [owner, Number(no)]
-        );
-        return !!r?.rowCount;
-      }
-
-      const r = await pg.query(
-        `update public.jobs
-            set status = 'archived',
-                active = false,
-                updated_at = now()
-          where owner_id=$1
-            and lower(coalesce(name, job_name)) = lower($2)
-          returning job_no`,
-        [owner, String(nm)]
-      );
-      return !!r?.rowCount;
-    }
 
     /* ------------------------------------------------------------
      * Pending: Awaiting delete-job confirmation
@@ -1383,7 +1387,8 @@ Now you can:
           const { rows } = await pg.query(
             `select count(*)::int as c
                from public.jobs
-              where owner_id=$1`,
+              where owner_id=$1
+                and (status is null or status in ('open','active','draft'))`,
             [String(owner).trim()]
           );
 

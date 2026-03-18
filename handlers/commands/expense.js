@@ -1088,7 +1088,22 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
   // Receipt-derived values — these are the ground truth for this reparse
   const receiptSubtotalSafe = safeMoneyString(receiptTaxInfo?.subtotal);
   const receiptTaxSafe = safeMoneyString(receiptTaxInfo?.tax);
-  const receiptTotalSafe = safeMoneyString(receiptTaxInfo?.total);
+  const rawRTotal = receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+    ? Number(receiptTaxInfo.total) : null;
+  const rawRSubtotal = receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
+    ? Number(receiptTaxInfo.subtotal) : null;
+  const rawRTax = receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
+    ? Number(receiptTaxInfo.tax) : null;
+
+  const rTotalLooksLikeSubtotal =
+    rawRTotal != null && rawRSubtotal != null && rawRTax != null &&
+    Math.abs(rawRTotal - rawRSubtotal) < 0.01;
+
+  const correctedReceiptTotal = rTotalLooksLikeSubtotal
+    ? Number((rawRSubtotal + rawRTax).toFixed(2))
+    : rawRTotal;
+
+  const receiptTotalSafe = safeMoneyString(correctedReceiptTotal);
   const parsedAmountSafe = safeMoneyString(parsed?.amount);
 
   // Old draft values — only used as fallback if receipt-derived values are missing
@@ -1920,10 +1935,33 @@ function extractReceiptPrimaryItem(text) {
   }
 
   // 2) SKU line then next product-like line
+  //    Skip lines that look like store names, addresses, or phone numbers
+  const looksLikeStoreOrAddress = (line) => {
+    const s = String(line || '').trim();
+    return (
+      /\b(rona|home depot|lowes|canadian tire|costco|walmart|superstore|dollarama)\b/i.test(s) ||
+      /\b(n\.?w\.?|n\.?e\.?|s\.?w\.?|s\.?e\.?)\b/i.test(s) ||
+      /\b\d{3,5}\s+[A-Za-z]/.test(s) ||        // address like "1335 Fanshawe"
+      /\(\d{3}\)\s*\d{3}-\d{4}/.test(s) ||      // phone number
+      /\b(london|toronto|ottawa|vancouver|calgary|edmonton|winnipeg)\b/i.test(s) ||
+      /\b(on|bc|ab|qc|sk|mb|ns|nb|pe|nl)\b,?\s*[A-Z]\d[A-Z]/i.test(s) || // postal code
+      /^\*+$/.test(s)                             // separator lines like *****
+    );
+  };
+
   for (let i = 0; i < lines.length - 1; i += 1) {
-    if (looksSkuish(lines[i]) && looksProductish(lines[i + 1])) {
-      const candidate = cleanCandidate(lines[i + 1]);
-      if (candidate) return candidate;
+    if (!looksSkuish(lines[i])) continue;
+
+    // scan forward past store/address/separator lines to find real product
+    for (let j = i + 1; j < Math.min(i + 4, lines.length); j += 1) {
+      if (looksLikeStoreOrAddress(lines[j])) continue;
+      if (looksSkuish(lines[j])) break; // hit another SKU — stop
+
+      if (looksProductish(lines[j])) {
+        const candidate = cleanCandidate(lines[j]);
+        if (candidate) return candidate;
+      }
+      break;
     }
   }
 
@@ -7305,24 +7343,88 @@ try {
   }
 } catch {}
 
-// ✅ Format amount for display (with commas)
-const amountNum = Number.isFinite(amountCents) ? amountCents / 100 : null;
-const amountDisplay =
+// ✅ Build structured confirmation receipt
+const confirmedCurrency = String(data?.currency || draftForSubmit?.currency || '').trim().toUpperCase() || 'CAD';
+
+// Subtotal, tax, total — pull from draft (most complete source at this point)
+const confirmedSubtotalNum = (() => {
+  const v = draftForSubmit?.subtotal ?? data?.subtotal ?? null;
+  if (v == null) return null;
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(n) && n > 0 ? n : null;
+})();
+
+const confirmedTaxNum = (() => {
+  const v = draftForSubmit?.tax ?? data?.tax ?? null;
+  if (v == null) return null;
+  const n = Number(String(v).replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(n) && n >= 0 ? n : null;
+})();
+
+const confirmedTotalNum = (() => {
+  // Prefer explicit total field
+  const v = draftForSubmit?.total ?? data?.total ?? null;
+  const t = v != null ? Number(String(v).replace(/[^0-9.-]/g, '')) : null;
+
+  // If total == subtotal and we have tax, derive real total
+  if (
+    t != null &&
+    confirmedSubtotalNum != null &&
+    confirmedTaxNum != null &&
+    Math.abs(t - confirmedSubtotalNum) < 0.01
+  ) {
+    return Number((confirmedSubtotalNum + confirmedTaxNum).toFixed(2));
+  }
+
+  if (t != null && Number.isFinite(t) && t > 0) return t;
+
+  // Fallback: subtotal + tax
+  if (confirmedSubtotalNum != null && confirmedTaxNum != null) {
+    return Number((confirmedSubtotalNum + confirmedTaxNum).toFixed(2));
+  }
+
+  // Last resort: use amountCents
+  return Number.isFinite(amountCents) ? amountCents / 100 : null;
+})();
+
+const fmt = (n) =>
   typeof formatMoneyDisplay === 'function'
-    ? formatMoneyDisplay(amountNum)
-    : (amountNum != null ? amountNum.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : String(data.amount || ''));
+    ? formatMoneyDisplay(n)
+    : `$${Number(n).toFixed(2)}`;
 
-const currencyDisplay = String(data?.currency || draftForSubmit?.currency || '').trim().toUpperCase();
-const currencySuffix = currencyDisplay ? ` ${currencyDisplay}` : '';
+const confirmedItem = String(draftForSubmit?.item || data?.item || '').trim();
+const confirmedStore = String(data?.store || draftForSubmit?.store || '').trim();
+const confirmedDate = (() => {
+  const raw = String(data?.date || '').trim();
+  if (!raw) return null;
+  if (typeof formatDisplayDate === 'function') return formatDisplayDate(raw, tz);
+  return raw;
+})();
+const confirmedJob = String(jobName || data?.jobName || '').trim();
+const confirmedCategory = String(categoryStr || '').trim();
+const confirmedTaxLabel = String(draftForSubmit?.taxLabel || data?.taxLabel || '').trim() || 'Tax';
 
-const okMsg = [
-  `✅ Logged expense ${amountDisplay}${currencySuffix} — ${data.store || 'Unknown Store'}`,
-  data.date ? `Date: ${data.date}` : null,
-  jobName ? `Job: ${jobName}` : null,
-  categoryStr ? `Category: ${categoryStr}` : null
-]
-  .filter(Boolean)
-  .join('\n');
+const okLines = ['✅ Logged expense:'];
+
+if (confirmedSubtotalNum != null) {
+  okLines.push(`Cost: ${fmt(confirmedSubtotalNum)} ${confirmedCurrency}`);
+} else {
+  // No subtotal available — show total as cost
+  const fallbackAmt = confirmedTotalNum ?? (Number.isFinite(amountCents) ? amountCents / 100 : null);
+  if (fallbackAmt != null) okLines.push(`Cost: ${fmt(fallbackAmt)} ${confirmedCurrency}`);
+}
+
+if (confirmedTaxNum != null && confirmedTaxNum > 0) okLines.push(`${confirmedTaxLabel}: ${fmt(confirmedTaxNum)}`);
+
+if (confirmedTotalNum != null) okLines.push(`Total: ${fmt(confirmedTotalNum)}`);
+
+if (confirmedItem && !/^unknown$/i.test(confirmedItem)) okLines.push(`Item: ${confirmedItem}`);
+if (confirmedStore && !/^unknown/i.test(confirmedStore)) okLines.push(`Store: ${confirmedStore}`);
+if (confirmedCategory) okLines.push(`Category: ${confirmedCategory}`);
+if (confirmedDate) okLines.push(`Date: ${confirmedDate}`);
+if (confirmedJob) okLines.push(`Job: ${confirmedJob}`);
+
+const okMsg = okLines.join('\n');
 
 return out(twimlText(okMsg), false);
     } catch (e) {
@@ -7450,10 +7552,34 @@ if (looksLikeReceiptText(input)) {
       return n.toFixed(2);
     };
 
+    // ✅ If labeled total == subtotal and we have tax, the labeled total is actually
+    // the subtotal row — derive the real total as subtotal + tax
+    const rawReceiptTotal = receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+      ? Number(receiptTaxInfo.total)
+      : null;
+    const rawReceiptSubtotal = receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
+      ? Number(receiptTaxInfo.subtotal)
+      : null;
+    const rawReceiptTax = receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
+      ? Number(receiptTaxInfo.tax)
+      : null;
+
+    const totalLooksLikeSubtotal =
+      rawReceiptTotal != null &&
+      rawReceiptSubtotal != null &&
+      rawReceiptTax != null &&
+      Math.abs(rawReceiptTotal - rawReceiptSubtotal) < 0.01;
+
+    const derivedTotal = totalLooksLikeSubtotal
+      ? Number((rawReceiptSubtotal + rawReceiptTax).toFixed(2))
+      : rawReceiptTotal;
+
     const seededTotal =
-      safeMoneyStr(receiptTaxInfo?.total) ||
-      safeMoneyStr(back?.total) ||
-      null;
+      derivedTotal != null
+        ? derivedTotal.toFixed(2)
+        : back?.total != null && Number.isFinite(Number(back.total))
+          ? Number(back.total).toFixed(2)
+          : null;
 
     const seededSubtotal = safeMoneyStr(receiptTaxInfo?.subtotal) || null;
     const seededTax = safeMoneyStr(receiptTaxInfo?.tax) || null;

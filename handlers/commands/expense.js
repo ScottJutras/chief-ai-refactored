@@ -861,12 +861,25 @@ function parseExpenseEditOverwrite(text) {
   );
 
   let amount = null;
+  let item = null;
   let store = null;
   let date = null;
   let jobName = null;
   let subtotal = null;
   let tax = null;
   let total = null;
+
+  // ---------------------------------------------------------
+  // item — extract from "💸 $AMOUNT — ITEM 🏪 STORE" first line
+  // ---------------------------------------------------------
+  const firstRawLine = rawLines[0] || '';
+  const itemMatch = firstRawLine.match(/—\s*(.+?)\s*🏪/u);
+  if (itemMatch?.[1]) {
+    const candidate = itemMatch[1].trim();
+    if (candidate && !/^unknown$/i.test(candidate)) {
+      item = candidate;
+    }
+  }
 
   // ---------------------------------------------------------
   // amount
@@ -970,6 +983,7 @@ function parseExpenseEditOverwrite(text) {
         !/^job\b/i.test(line) &&
         !/^on\b/i.test(line) &&
         !/^(subtotal|tax|total)\b/i.test(line) &&
+        !/^(expense|revenue|edit|confirm|unknown)\b/i.test(line) &&
         line.split(/\s+/).length <= 4 &&
         /[A-Za-z]/.test(line)
       ) {
@@ -995,6 +1009,7 @@ function parseExpenseEditOverwrite(text) {
 
   return {
     amount,
+    item,
     store,
     date,
     jobName,
@@ -5170,6 +5185,12 @@ const patchedDraft = {
       : jobPatch?.jobName
         ? { jobSource: jobPatch.jobSource || 'typed' }
         : null),
+
+  item:
+    overwriteEarly.item ||
+    nextDraft?.item ||
+    (draftEarly?.item && !/^unknown$/i.test(String(draftEarly.item)) ? draftEarly.item : null) ||
+    null,
 
   subtotal: overwriteEarly.subtotal || draftEarly?.subtotal || null,
   tax: overwriteEarly.tax || draftEarly?.tax || null,

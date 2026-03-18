@@ -4748,6 +4748,78 @@ async function resolveMediaAssetIdForFlow({ ownerId, userKey, rawDraft, flowMedi
 }
 
 
+/* ---------------- insert helper (module scope) ---------------- */
+
+// Best-effort insert (tries known helper names first; falls back if one exists in your pg module)
+async function insertExpenseBestEffort(pgSvc, p) {
+  // 1) If you already have a canonical helper
+  if (typeof pgSvc.insertExpense === 'function') return pgSvc.insertExpense(p);
+  if (typeof pgSvc.createExpense === 'function') return pgSvc.createExpense(p);
+  if (typeof pgSvc.logExpense === 'function') return pgSvc.logExpense(p);
+
+  // 2) Your actual common helper in Chief codebase
+  if (typeof pgSvc.insertTransaction === 'function') {
+    return pgSvc.insertTransaction({
+      owner_id: p.owner_id,
+      user_id: p.user_id,
+      kind: 'expense',
+      amount: p.amount,
+      amount_cents: p.amount_cents,
+      currency: p.currency,
+      date: p.date,
+
+      // ✅ CRITICAL: insertTransaction expects `source`, not `store`
+      source: p.store,
+      store: p.store,
+
+      description: p.description,
+      category: p.category,
+      jobName: p.job_name,
+      jobSource: p.job_source,
+      job_id: p.job_id ?? null,
+      media_asset_id: p.media_asset_id,
+      media_source_msg_id: p.media_source_msg_id,
+      source_msg_id: p.source_msg_id,
+      tenant_id: p.tenant_id,
+      original_text: p.original_text,
+      draft_text: p.draft_text
+    });
+  }
+
+  // 3) Generic transaction helpers (if you have one)
+  if (typeof pgSvc.createTransaction === 'function') {
+    return pgSvc.createTransaction({
+      ownerId: p.owner_id,
+      userId: p.user_id,
+      kind: 'expense',
+      amount: p.amount,
+      amount_cents: p.amount_cents,
+      currency: p.currency,
+      date: p.date,
+
+      // ✅ same issue here
+      source: p.store,
+      store: p.store,
+
+      description: p.description,
+      category: p.category,
+      jobName: p.job_name,
+      jobSource: p.job_source,
+      job_id: p.job_id ?? null,
+      media_asset_id: p.media_asset_id,
+      media_source_msg_id: p.media_source_msg_id,
+      source_msg_id: p.source_msg_id,
+      tenant_id: p.tenant_id,
+      original_text: p.original_text,
+      draft_text: p.draft_text
+    });
+  }
+
+  throw new Error(
+    'No expense insert function found on pg service (insertExpense/createExpense/logExpense/insertTransaction/createTransaction).'
+  );
+}
+
 /* ---------------- main handler ---------------- */
 
 async function handleExpense(
@@ -7151,8 +7223,9 @@ if (!jobName) {
     // ✅ ACTUAL DB INSERT (HARDENED amount → amount_cents)
     // ---------------------------------------------------
 
-    // amount_cents best-effort
+    // amount_cents best-effort — prefer already-computed data.amount_cents (set by ensureAmountCents above)
     const amountCents =
+      (Number.isFinite(Number(data.amount_cents)) && Number(data.amount_cents) > 0 && Number(data.amount_cents)) ||
       (typeof toAmountCents === 'function' && toAmountCents(data.amount)) ||
       (typeof toAmount === 'function' && Math.round(Number(toAmount(data.amount) || 0) * 100)) ||
       Math.round(Number(String(data.amount || '').replace(/[^0-9.\-]/g, '') || 0) * 100);
@@ -7181,6 +7254,7 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
 
   job_name: data.jobName || null,
   job_source: data.jobSource || null,
+  job_id: data.job_id || draftForSubmit.job_id || null,
 
   media_asset_id: data.media_asset_id || null,
   media_source_msg_id: data.media_source_msg_id || null,
@@ -7189,73 +7263,6 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
   draft_text: draftForSubmit?.draftText || sourceText || null
 };
 
-// Best-effort insert (tries known helper names first; falls back if one exists in your pg module)
-async function insertExpenseBestEffort(pgSvc, p) {
-  // 1) If you already have a canonical helper
-  if (typeof pgSvc.insertExpense === 'function') return pgSvc.insertExpense(p);
-  if (typeof pgSvc.createExpense === 'function') return pgSvc.createExpense(p);
-  if (typeof pgSvc.logExpense === 'function') return pgSvc.logExpense(p);
-
-  // 2) Your actual common helper in Chief codebase
-  if (typeof pgSvc.insertTransaction === 'function') {
-    return pgSvc.insertTransaction({
-      owner_id: p.owner_id,
-      user_id: p.user_id,
-      kind: 'expense',
-      amount: p.amount,
-      amount_cents: p.amount_cents,
-      currency: p.currency,
-      date: p.date,
-
-      // ✅ CRITICAL: insertTransaction expects `source`, not `store`
-      source: p.store,
-      store: p.store,
-
-      description: p.description,
-      category: p.category,
-      jobName: p.job_name,
-      jobSource: p.job_source,
-      media_asset_id: p.media_asset_id,
-      media_source_msg_id: p.media_source_msg_id,
-      source_msg_id: p.source_msg_id,
-      tenant_id: p.tenant_id,
-      original_text: p.original_text,
-      draft_text: p.draft_text
-    });
-  }
-
-  // 3) Generic transaction helpers (if you have one)
-  if (typeof pgSvc.createTransaction === 'function') {
-    return pgSvc.createTransaction({
-      ownerId: p.owner_id,
-      userId: p.user_id,
-      kind: 'expense',
-      amount: p.amount,
-      amount_cents: p.amount_cents,
-      currency: p.currency,
-      date: p.date,
-
-      // ✅ same issue here
-      source: p.store,
-      store: p.store,
-
-      description: p.description,
-      category: p.category,
-      jobName: p.job_name,
-      jobSource: p.job_source,
-      media_asset_id: p.media_asset_id,
-      media_source_msg_id: p.media_source_msg_id,
-      source_msg_id: p.source_msg_id,
-      tenant_id: p.tenant_id,
-      original_text: p.original_text,
-      draft_text: p.draft_text
-    });
-  }
-
-  throw new Error(
-    'No expense insert function found on pg service (insertExpense/createExpense/logExpense/insertTransaction/createTransaction).'
-  );
-}
     // --- INSERT ---
   const inserted = await insertExpenseBestEffort(pg, insertPayload).catch((e) => {
   console.error('[EXPENSE_YES_INSERT] failed:', e?.message);

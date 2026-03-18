@@ -546,21 +546,30 @@ async function sendConfirmExpenseOrFallback(fromPhone, summaryLine, ctx = null) 
     `✅ Confirm expense\n${safeSummary}\n\n` +
     `Reply: Yes / Edit / Cancel / Change Job`;
 
-  // ✅ Render-time truth log (NO undefined vars)
+  // ✅ Render-time truth log
   try {
     console.info('[EXPENSE_CONFIRM_RENDER_CTX]', {
       ownerId: ctx?.ownerId ?? null,
       paUserId: ctx?.paUserId ?? null,
       fromPhone: String(fromPhone || '').trim() || null,
-      // Draft job fields
+
       draft_job_id: ctx?.draft?.job_id ?? ctx?.draft?.jobId ?? null,
       draft_job_no: ctx?.draft?.job_no ?? null,
       draft_job_name:
         (ctx?.draft?.jobName || ctx?.draft?.job_name || ctx?.draft?.job_name_label || null),
-      // Active job fields (if passed)
+
+      draft_amount: ctx?.draft?.amount ?? null,
+      draft_store: ctx?.draft?.store ?? null,
+      draft_date: ctx?.draft?.date ?? null,
+      draft_item: ctx?.draft?.item ?? null,
+      draft_subtotal: ctx?.draft?.subtotal ?? null,
+      draft_tax: ctx?.draft?.tax ?? null,
+      draft_total: ctx?.draft?.total ?? null,
+      draft_taxLabel: ctx?.draft?.taxLabel ?? null,
+
       active_job_no: ctx?.activeJob?.job_no ?? null,
       active_job_name: ctx?.activeJob?.name ?? null,
-      // Template debug (if you pass contentVariables preview)
+
       varsPreview: ctx?.varsPreview ?? null,
       safeSummaryHead: safeSummary.slice(0, 140),
       safeSummaryLen: safeSummary.length
@@ -611,19 +620,24 @@ async function upsertCilDraftForExpenseConfirm({
 
     const sid = String(sourceMsgId || '').trim() || null;
 
-    // Best-effort: safe payload snapshot (don’t dump huge OCR blobs)
+    // Best-effort: safe payload snapshot
     const payload = {
       type: 'ExpenseDraft',
-      draft: pickConfirmDraftSnapshot(draft),
-      // keep a tiny amount of useful text
+      draft: {
+        ...pickConfirmDraftSnapshot(draft),
+        subtotal: draft?.subtotal ?? null,
+        tax: draft?.tax ?? null,
+        total: draft?.total ?? null,
+        taxLabel: draft?.taxLabel ?? null
+      },
       text_head: String(draft?.draftText || draft?.originalText || draft?.ocrText || '')
         .replace(/\u0000/g, '')
         .trim()
         .slice(0, 300)
     };
 
-    // Derive lightweight index fields
     const occurred_on = String(draft?.date || '').trim() || null;
+
     const amount_cents =
       draft?.amount_cents != null
         ? Number(draft.amount_cents)
@@ -659,8 +673,22 @@ async function upsertCilDraftForExpenseConfirm({
   }
 }
 
-function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourceText }) {
-  // ✅ Display amount with commas + $ + 2 decimals when possible
+function buildExpenseSummaryLine({
+  amount,
+  item,
+  store,
+  date,
+  jobName,
+  tz,
+  sourceText,
+  subtotal,
+  tax,
+  total,
+  taxLabel
+}) {
+  // ---------------------------------------------------------
+  // amount
+  // ---------------------------------------------------------
   const rawAmt = String(amount || '').trim();
 
   const amtNum = (() => {
@@ -679,75 +707,106 @@ function buildExpenseSummaryLine({ amount, item, store, date, jobName, tz, sourc
               : rawAmt)
         : '$0.00';
 
+  // ---------------------------------------------------------
+  // item
+  // trust order:
+  // 1) explicit cleaned item from draft
+  // 2) safe receipt primary item extractor
+  // 3) Unknown
+  // ---------------------------------------------------------
   let it = cleanExpenseItemForDisplay(item);
 
-  // ✅ Only infer item from receipt-ish text
-  if (isUnknownItem(it) && sourceText) {
-    const src0 = String(sourceText || '').trim();
-
-    const looksReceiptish =
-      /^\s*\$/.test(src0) ||
-      /\b(total|subtotal|hst|gst|pst|tax|amount due)\b/i.test(src0) ||
-      src0.split('\n').length >= 3;
-
-    if (looksReceiptish) {
-      const src = normalizeDashes(src0);
-
-      // 1) "$883 - Railing ..."
-      let m =
-        src.match(
-          /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s*-\s*(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|[.?!]|$)/i
-        ) || null;
-      if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
-
-      // 2) "purchased $883 in railing at Rona"
-      if (isUnknownItem(it)) {
-        m =
-          src.match(
-            /\b(?:spent|spend|paid|pay|purchased|purchase|bought|buy|ordered|order|got)\b.*?\$\s*[0-9][0-9,]*(?:\.[0-9]{1,2})?\s+\bin\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-          ) || null;
-        if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
-      }
-
-      // 3) "$883 railing at Rona"
-      if (isUnknownItem(it)) {
-        m =
-          src.match(
-            /\$\s*[0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\bfor\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
-          ) || null;
-        if (m?.[1]) it = cleanExpenseItemForDisplay(m[1]);
-      }
-    }
+  if (isUnknownItem(it) && sourceText && typeof extractReceiptPrimaryItem === 'function') {
+    const primary = extractReceiptPrimaryItem(sourceText);
+    if (primary) it = cleanExpenseItemForDisplay(primary);
   }
 
   if (isUnknownItem(it)) it = 'Unknown';
 
-  const st = String(store || '').trim() || 'Unknown Store';
-  const dt = formatDisplayDate(date, tz);
+  // ---------------------------------------------------------
+  // store
+  // ---------------------------------------------------------
+  let st = String(store || '').trim();
+
+  if ((!st || /^unknown\b/i.test(st)) && sourceText && typeof extractReceiptStore === 'function') {
+    const receiptStore = extractReceiptStore(sourceText);
+    if (receiptStore) st = String(receiptStore).trim();
+  }
+
+  if (!st) st = 'Unknown Store';
+
+  // ---------------------------------------------------------
+  // date
+  // IMPORTANT:
+  // - show date only if actually known
+  // - never invent/force a date in summary
+  // ---------------------------------------------------------
+  const dt = String(date || '').trim()
+    ? formatDisplayDate(date, tz)
+    : null;
+
+  // ---------------------------------------------------------
+  // job
+  // ---------------------------------------------------------
   const jb = jobName ? String(jobName).trim() : '';
 
+  // ---------------------------------------------------------
+  // subtotal / tax / total
+  // prefer explicit draft fields first
+  // only fall back to receipt OCR extraction if draft fields missing
+  // ---------------------------------------------------------
   const taxInfo =
     typeof extractReceiptTaxBreakdown === 'function'
       ? extractReceiptTaxBreakdown(sourceText || '')
       : { subtotal: null, tax: null, total: null, taxLabel: null };
 
+  const safeSubtotal =
+    subtotal != null && Number.isFinite(Number(subtotal))
+      ? Number(subtotal)
+      : taxInfo?.subtotal != null && Number.isFinite(Number(taxInfo.subtotal))
+        ? Number(taxInfo.subtotal)
+        : null;
+
+  const safeTax =
+    tax != null && Number.isFinite(Number(tax))
+      ? Number(tax)
+      : taxInfo?.tax != null && Number.isFinite(Number(taxInfo.tax))
+        ? Number(taxInfo.tax)
+        : null;
+
+  const safeTotal =
+    total != null && Number.isFinite(Number(total))
+      ? Number(total)
+      : taxInfo?.total != null && Number.isFinite(Number(taxInfo.total))
+        ? Number(taxInfo.total)
+        : null;
+
+  const safeTaxLabel =
+    String(taxLabel || '').trim() ||
+    String(taxInfo?.taxLabel || '').trim() ||
+    'Tax';
+
   const subtotalLine =
-    taxInfo?.subtotal != null && Number.isFinite(Number(taxInfo.subtotal))
-      ? `Subtotal: ${formatMoneyDisplay(Number(taxInfo.subtotal))}`
+    safeSubtotal != null
+      ? `Subtotal: ${formatMoneyDisplay(safeSubtotal)}`
       : null;
 
   const taxLine =
-    taxInfo?.tax != null && Number.isFinite(Number(taxInfo.tax))
-      ? `${String(taxInfo.taxLabel || 'Tax')}: ${formatMoneyDisplay(Number(taxInfo.tax))}`
+    safeTax != null
+      ? `${safeTaxLabel}: ${formatMoneyDisplay(safeTax)}`
       : null;
 
   const totalLine =
-    taxInfo?.total != null && Number.isFinite(Number(taxInfo.total))
-      ? `Total: ${formatMoneyDisplay(Number(taxInfo.total))}`
+    safeTotal != null
+      ? `Total: ${formatMoneyDisplay(safeTotal)}`
       : null;
 
+  // ---------------------------------------------------------
+  // build lines
+  // ---------------------------------------------------------
   const lines = [];
   lines.push(`💸 ${amt} — ${it}`);
+
   if (st && st !== 'Unknown Store') lines.push(`🏪 ${st}`);
   if (dt) lines.push(`📅 ${dt}`);
   if (jb) lines.push(`🧰 ${jb}`);
@@ -786,12 +845,12 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
   const draft = confirmPA?.payload?.draft || draft0;
 
   const srcText =
+    draft?.originalText ||
+    draft?.receiptText ||
+    draft?.ocrText ||
+    draft?.draftText ||
     confirmPA?.payload?.humanLine ||
     confirmPA?.payload?.summaryLine ||
-    draft.draftText ||
-    draft.originalText ||
-    draft.receiptText ||
-    draft.ocrText ||
     '';
 
   const line =
@@ -803,12 +862,13 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
       jobName: draft.jobName,
       tz,
       sourceText: srcText,
-      subtotalAmount: draft.subtotal_amount,
-      taxAmount: draft.tax_amount,
-      taxLabel: draft.tax_label,
-      currency: draft.currency
+      subtotal: draft.subtotal,
+      tax: draft.tax,
+      total: draft.total,
+      taxLabel: draft.taxLabel
     }) || 'Confirm expense?';
-     // ✅ Ensure CIL draft exists whenever we show confirm UI
+
+  // ✅ Ensure CIL draft exists whenever we show confirm UI
   try {
     const srcId =
       String(confirmPA?.payload?.sourceMsgId || '').trim() ||
@@ -824,21 +884,20 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
     });
   } catch {}
 
-  // Optional: get active job for debug only (safe)
-let activeJob = null;
-try {
-  if (typeof pg.getActiveJob === 'function') {
-    activeJob = await pg.getActiveJob(ownerId, paKey).catch(() => null);
-  }
-} catch {}
+  // ✅ Optional: get active job for debug only
+  let activeJob = null;
+  try {
+    if (typeof pg.getActiveJob === 'function') {
+      activeJob = await pg.getActiveJob(ownerId, paKey).catch(() => null);
+    }
+  } catch {}
 
-return await sendConfirmExpenseOrFallback(fromPhone, line, {
-  ownerId,
-  paUserId: paKey,
-  draft,
-  activeJob
-});
-
+  return await sendConfirmExpenseOrFallback(fromPhone, line, {
+    ownerId,
+    paUserId: paKey,
+    draft,
+    activeJob
+  });
 }
 
 function parseExpenseEditOverwrite(text) {
@@ -848,68 +907,151 @@ function parseExpenseEditOverwrite(text) {
       amount: null,
       store: null,
       date: null,
-      jobName: null
+      jobName: null,
+      subtotal: null,
+      tax: null,
+      total: null
     };
   }
 
-  let s = src
-    .replace(/[💸🏪📅🧰🧾🏷️📦]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const rawLines = src
+    .split(/\r?\n/)
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+
+  const cleanedLines = rawLines.map((line) =>
+    line.replace(/[💸🏪📅🧰]/g, ' ').replace(/\s+/g, ' ').trim()
+  );
 
   let amount = null;
   let store = null;
   let date = null;
   let jobName = null;
+  let subtotal = null;
+  let tax = null;
+  let total = null;
 
-  const amtMatch = s.match(/\$?\s*(\d+(?:\.\d{1,2})?)\b/);
-  if (amtMatch?.[1]) {
-    amount = `$${Number(amtMatch[1]).toFixed(2)}`;
-    s = s.replace(amtMatch[0], ' ').replace(/\s+/g, ' ').trim();
+  // ---------------------------------------------------------
+  // amount
+  // prefer first standalone money line
+  // or explicit amount/total/price/cost line
+  // ---------------------------------------------------------
+  for (const line of cleanedLines) {
+    if (
+      /^\$?\s*\d+(?:\.\d{1,2})?\s*$/.test(line) ||
+      /\b(amount|total|price|cost)\b/i.test(line)
+    ) {
+      const m = line.match(/\$?\s*(-?\d+(?:\.\d{1,2})?)\b/);
+      if (m?.[1]) {
+        amount = `$${Number(m[1]).toFixed(2)}`;
+        break;
+      }
+    }
   }
 
-  const jobMatch =
-    s.match(/\bfor\s+job\s+(.+)$/i) ||
-    s.match(/\bjob\b\s*[:\-]?\s*(.+)$/i);
+  // ---------------------------------------------------------
+  // date
+  // ---------------------------------------------------------
+  for (const line of cleanedLines) {
+    const dateMatch =
+      line.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b/i) ||
+      line.match(/\b(?:on\s+)?(\d{4}-\d{2}-\d{2})\b/i) ||
+      line.match(/\b(?:on\s+)?(\d{1,2}\/\d{1,2}\/\d{2,4})\b/i);
 
-  if (jobMatch?.[1]) {
-    jobName = String(jobMatch[1] || '')
-      .trim()
-      .replace(/[.!,;:]+$/g, '')
-      .trim();
+    if (dateMatch?.[1]) {
+      const iso =
+        typeof extractReceiptDateYYYYMMDD === 'function'
+          ? extractReceiptDateYYYYMMDD(dateMatch[1])
+          : null;
 
-    s = s.replace(jobMatch[0], ' ').replace(/\s+/g, ' ').trim();
+      date = iso || String(dateMatch[1]).trim();
+      break;
+    }
   }
 
-  const dateMatch =
-    s.match(/\b(?:on\s+)?([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b/i) ||
-    s.match(/\b(?:on\s+)?(\d{4}-\d{2}-\d{2})\b/i) ||
-    s.match(/\b(?:on\s+)?(\d{1,2}\/\d{1,2}\/\d{2,4})\b/i);
+  // ---------------------------------------------------------
+  // job
+  // MUST stop at a single line only
+  // NEVER consume subtotal/tax/total pollution
+  // ---------------------------------------------------------
+  for (const line of cleanedLines) {
+    const m =
+      line.match(/^\s*job\b\s*[:\-]?\s*(.+)$/i) ||
+      line.match(/^\s*for\s+job\s+(.+)$/i);
 
-  if (dateMatch?.[1]) {
-    const iso =
-      typeof extractReceiptDateYYYYMMDD === 'function'
-        ? extractReceiptDateYYYYMMDD(dateMatch[1])
-        : null;
+    if (m?.[1]) {
+      const candidate = String(m[1] || '')
+        .replace(/[.!,;:]+$/g, '')
+        .trim();
 
-    date = iso || String(dateMatch[1]).trim();
-    s = s.replace(dateMatch[0], ' ').replace(/\s+/g, ' ').trim();
+      if (
+        candidate &&
+        !/\b(subtotal|tax|total)\b/i.test(candidate)
+      ) {
+        jobName = candidate;
+        break;
+      }
+    }
   }
 
-  s = s
-    .replace(/^\b(expense|from|at|store|vendor|merchant)\b[:\s-]*/i, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  // ---------------------------------------------------------
+  // store/vendor
+  // ---------------------------------------------------------
+  for (const line of cleanedLines) {
+    const m = line.match(/^\s*(?:from|at|store|vendor|merchant)\b\s*[:\-]?\s*(.+)$/i);
+    if (m?.[1]) {
+      const candidate = String(m[1] || '')
+        .replace(/[.!,;:]+$/g, '')
+        .trim();
+      if (candidate) {
+        store = candidate;
+        break;
+      }
+    }
+  }
 
-  if (s) {
-    store = s.replace(/[.!,;:]+$/g, '').trim() || null;
+  // ---------------------------------------------------------
+  // fallback store/vendor
+  // only allow short vendor-like lines
+  // ---------------------------------------------------------
+  if (!store) {
+    for (const line of cleanedLines) {
+      if (
+        !/^\$/.test(line) &&
+        !/^job\b/i.test(line) &&
+        !/^on\b/i.test(line) &&
+        !/^(subtotal|tax|total)\b/i.test(line) &&
+        line.split(/\s+/).length <= 4 &&
+        /[A-Za-z]/.test(line)
+      ) {
+        store = line.replace(/[.!,;:]+$/g, '').trim();
+        break;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------
+  // subtotal / tax / total
+  // ---------------------------------------------------------
+  for (const line of cleanedLines) {
+    let m = line.match(/^\s*subtotal\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+    if (m?.[1]) subtotal = Number(m[1]).toFixed(2);
+
+    m = line.match(/^\s*(?:tax|hst|gst|pst)\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+    if (m?.[1]) tax = Number(m[1]).toFixed(2);
+
+    m = line.match(/^\s*total\b\s*[:\-]?\s*\$?\s*(\d+(?:\.\d{1,2})?)\b/i);
+    if (m?.[1]) total = Number(m[1]).toFixed(2);
   }
 
   return {
     amount,
     store,
     date,
-    jobName
+    jobName,
+    subtotal,
+    tax,
+    total
   };
 }
 
@@ -934,8 +1076,7 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
   // ✅ Only reparse when explicitly requested
   if (!draft?.needsReparse) return confirmPA;
 
-  // ✅ Reparse must have a receipt/OCR-ish source. If it's only a typed draft,
-  // we still allow, but we require *some* text to parse.
+  // ✅ Reparse must have some text source
   const sourceText = String(
     draft?.receiptText ||
       draft?.ocrText ||
@@ -950,13 +1091,8 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     return confirmPA;
   }
 
-  // ✅ If there's nothing receipt-like and parse would be low value, you can optionally skip.
-  // Keeping behavior: DO NOT skip — just a safe guard in case you want it later.
-  // const hasReceiptSignals = !!(draft?.receiptText || draft?.ocrText || draft?.extractedText);
-  // if (!hasReceiptSignals && !draft?.originalText && !draft?.draftText) return confirmPA;
-
-  // Re-run your existing parser on receipt/OCR source text.
-  // IMPORTANT: keep job fields as-is (job choice must win).
+  // ✅ Re-run parser on receipt/OCR-ish source text.
+  // IMPORTANT: keep selected job/media authoritative.
   let parsed = {};
   try {
     parsed = (await parseExpenseMessage(sourceText, { tz })) || {};
@@ -971,46 +1107,126 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     job_id: draft?.job_id ?? null
   };
 
+  const mediaFields = {
+    media_asset_id: draft?.media_asset_id ?? null,
+    media_source_msg_id: draft?.media_source_msg_id ?? null
+  };
+
+  // ✅ Preserve explicit draft tax fields if already present
+  // but allow receipt re-extraction to backfill missing ones
+  const receiptTaxInfo =
+    typeof extractReceiptTaxBreakdown === 'function'
+      ? extractReceiptTaxBreakdown(sourceText || '')
+      : { subtotal: null, tax: null, total: null, taxLabel: null };
+
+  const safePrimaryItem =
+    typeof extractReceiptPrimaryItem === 'function'
+      ? extractReceiptPrimaryItem(sourceText)
+      : null;
+
   // ✅ Merge but never clobber existing values with nulls
   const mergedDraft = mergeDraftNonNull(
     {
       ...(draft || {}),
       ...jobFields,
-      // keep media linkage
-      media_asset_id: draft?.media_asset_id ?? null,
-      media_source_msg_id: draft?.media_source_msg_id ?? null
+      ...mediaFields
     },
     {
       ...(parsed || {}),
-      ...jobFields
+      ...jobFields,
+      ...mediaFields,
+
+      item:
+        parsed?.item ||
+        safePrimaryItem ||
+        null,
+
+      subtotal:
+        draft?.subtotal ??
+        (receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
+          ? Number(receiptTaxInfo.subtotal).toFixed(2)
+          : null),
+
+      tax:
+        draft?.tax ??
+        (receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
+          ? Number(receiptTaxInfo.tax).toFixed(2)
+          : null),
+
+      total:
+        draft?.total ??
+        (receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+          ? Number(receiptTaxInfo.total).toFixed(2)
+          : null),
+
+      taxLabel:
+        String(draft?.taxLabel || '').trim() ||
+        String(receiptTaxInfo?.taxLabel || '').trim() ||
+        null
     }
   );
 
   // ✅ normalize AFTER merge (so we keep receipt-derived data but preserve job/media)
   const normalized = normalizeExpenseData(mergedDraft, userProfile, sourceText) || {};
 
-  // ✅ Preserve edit latch fields across reparse (never drop edit mode accidentally)
+  // ✅ If item is still weak after normalize, backfill safely from receipt primary item
+  if ((typeof isUnknownItem === 'function' && isUnknownItem(normalized.item)) || !String(normalized.item || '').trim()) {
+    if (safePrimaryItem) normalized.item = safePrimaryItem;
+  }
+
+  // ✅ Preserve explicit tax fields across normalize/reparse
+  normalized.subtotal =
+    draft?.subtotal ??
+    normalized?.subtotal ??
+    (receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
+      ? Number(receiptTaxInfo.subtotal).toFixed(2)
+      : null);
+
+  normalized.tax =
+    draft?.tax ??
+    normalized?.tax ??
+    (receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
+      ? Number(receiptTaxInfo.tax).toFixed(2)
+      : null);
+
+  normalized.total =
+    draft?.total ??
+    normalized?.total ??
+    (receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+      ? Number(receiptTaxInfo.total).toFixed(2)
+      : null);
+
+  normalized.taxLabel =
+    String(draft?.taxLabel || '').trim() ||
+    String(normalized?.taxLabel || '').trim() ||
+    String(receiptTaxInfo?.taxLabel || '').trim() ||
+    null;
+
+  // ✅ Preserve edit latch fields across reparse
   normalized.awaiting_edit = !!draft?.awaiting_edit;
   normalized.edit_started_at = draft?.edit_started_at ?? null;
   normalized.editStartedAt = draft?.editStartedAt ?? null;
   normalized.edit_flow_id = draft?.edit_flow_id ?? null;
 
-  // ✅ Preserve media linkage again (belt + suspenders)
-  normalized.media_asset_id = draft?.media_asset_id ?? normalized.media_asset_id ?? null;
-  normalized.media_source_msg_id = draft?.media_source_msg_id ?? normalized.media_source_msg_id ?? null;
+  // ✅ Preserve media linkage again
+  normalized.media_asset_id = mediaFields.media_asset_id ?? normalized.media_asset_id ?? null;
+  normalized.media_source_msg_id = mediaFields.media_source_msg_id ?? normalized.media_source_msg_id ?? null;
 
-  // ✅ Preserve job fields again (belt + suspenders)
+  // ✅ Preserve selected job fields again
   normalized.jobName = jobFields.jobName;
   normalized.jobSource = jobFields.jobSource;
   normalized.job_no = jobFields.job_no;
   normalized.job_id = jobFields.job_id;
 
-  const gotAmount = !!String(normalized?.amount || '').trim() && String(normalized.amount).trim() !== '$0.00';
+  const gotAmount =
+    !!String(normalized?.amount || '').trim() &&
+    String(normalized.amount).trim() !== '$0.00';
+
   const gotDate = !!String(normalized?.date || '').trim();
 
   normalized.needsReparse = !(gotAmount && gotDate);
 
-  // ✅ Safety: never write an empty draft object back (prevents accidental blanking)
+  // ✅ Safety: never write an empty draft object back
   if (!Object.keys(normalized || {}).length) {
     console.warn('[EXPENSE_REPARSE] normalized draft empty; leaving confirmPA unchanged', { paKey });
     return confirmPA;
@@ -1033,6 +1249,11 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
     amount: normalized?.amount || null,
     date: normalized?.date || null,
     store: normalized?.store || null,
+    item: normalized?.item || null,
+    subtotal: normalized?.subtotal || null,
+    tax: normalized?.tax || null,
+    total: normalized?.total || null,
+    taxLabel: normalized?.taxLabel || null,
     currency: normalized?.currency || null
   });
 
@@ -1467,32 +1688,19 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
   // Receipt-first backfills
   // ---------------------------
 
-  const taxBreakdown = src ? extractReceiptTaxBreakdown(src) : null;
+  const looksReceiptish =
+    !!src &&
+    (
+      /\b(subtotal|total|hst|gst|pst|tax|debit|visa|mastercard|amex|approved|auth|terminal|invoice|receipt)\b/i.test(src) ||
+      src.split(/\r?\n/).filter(Boolean).length >= 3
+    );
 
-  // Amount = final total
+  // Amount
   const currentAmt = d.amount != null ? toNumberAmount(d.amount) : null;
-  const receiptTotal =
-    taxBreakdown?.total != null
-      ? taxBreakdown.total
-      : src
-      ? extractReceiptTotal(src)
-      : null;
+  const receiptTotal = src ? extractReceiptTotal(src) : null;
 
   if ((d.amount == null || !Number.isFinite(currentAmt) || currentAmt <= 0) && receiptTotal != null) {
     d.amount = receiptTotal;
-  }
-
-  // Carry tax fields
-  if ((d.subtotal_amount == null || !Number.isFinite(Number(d.subtotal_amount))) && taxBreakdown?.subtotal != null) {
-    d.subtotal_amount = taxBreakdown.subtotal;
-  }
-
-  if ((d.tax_amount == null || !Number.isFinite(Number(d.tax_amount))) && taxBreakdown?.tax != null) {
-    d.tax_amount = taxBreakdown.tax;
-  }
-
-  if (!String(d.tax_label || '').trim() && taxBreakdown?.taxLabel) {
-    d.tax_label = taxBreakdown.taxLabel;
   }
 
   // Date
@@ -1516,7 +1724,7 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
   const rawItem = String(d.item || '').trim();
 
   const looksLikeReceiptMeta =
-    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|vat|visa|mastercard|debit|change|tender)\b/i.test(rawItem);
+    /\b(sub\s*total|subtotal|total|grand\s*total|balance\s*due|tax|hst|gst|pst|visa|mastercard|debit|change|tender|auth|acct|account|employee)\b/i.test(rawItem);
 
   const looksLikeMoneyLine =
     /^\$?\s*\d{1,6}(?:\.\d{2})?\s*$/.test(rawItem) ||
@@ -1528,30 +1736,28 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
     d.item = null;
   }
 
+  // Safe receipt item backfill
+  if (!d.item && src && typeof extractReceiptPrimaryItem === 'function') {
+    const primary = extractReceiptPrimaryItem(src);
+    if (primary) d.item = primary;
+  }
+
   // ---------------------------
   // Formatting / defaults
   // ---------------------------
+
   if (d.amount != null) {
     const n = toNumberAmount(d.amount);
     if (Number.isFinite(n) && n > 0) d.amount = formatMoneyDisplay(n);
   }
 
-  if (d.subtotal_amount != null) {
-    const n = Number(d.subtotal_amount);
-    if (Number.isFinite(n) && n >= 0) d.subtotal_amount = Number(n.toFixed(2));
+  // ✅ CRITICAL:
+  // Do NOT invent "today" for receipt/OCR flows.
+  // Only use today for typed/manual non-receipt expense flows.
+  if (!String(d.date || '').trim()) {
+    d.date = looksReceiptish ? null : todayInTimeZone(tz);
   }
 
-  if (d.tax_amount != null) {
-    const n = Number(d.tax_amount);
-    if (Number.isFinite(n) && n >= 0) d.tax_amount = Number(n.toFixed(2));
-  }
-
-  if (d.tax_label != null) {
-    const x = String(d.tax_label || '').trim();
-    d.tax_label = x || null;
-  }
-
-  d.date = String(d.date || '').trim() || todayInTimeZone(tz);
   d.item = cleanExpenseItemForDisplay(d.item);
   d.store = String(d.store || '').trim() || 'Unknown Store';
 
@@ -1589,6 +1795,48 @@ function isStalePickerTap(pickPA, inbound) {
   }
 
   return { stale: false, reason: null };
+}
+
+function extractReceiptPrimaryItem(text) {
+  const raw = String(text || '');
+  if (!raw) return null;
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  if (!lines.length) return null;
+
+  const badLine =
+    /\b(subtotal|total|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details)\b/i;
+
+  const looksPriceish = /(\$?\d+\.\d{2})/.test.bind(/(\$?\d+\.\d{2})/);
+  const looksSkuish = /^\d{6,}$/.test.bind(/^\d{6,}$/);
+
+  // Prefer descriptive product lines
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+
+    if (badLine.test(line)) continue;
+    if (looksSkuish(line)) continue;
+
+    // Strong material/product-style line
+    if (
+      /[A-Za-z]/.test(line) &&
+      line.length >= 6 &&
+      line.length <= 80 &&
+      !looksPriceish(line)
+    ) {
+      // Ignore obvious headers
+      if (/^(item|qty|price|total)$/i.test(line)) continue;
+      if (/^(mission exteriors|rona inc\.?)$/i.test(line)) continue;
+
+      return cleanExpenseItemForDisplay(line);
+    }
+  }
+
+  return null;
 }
 
 function buildJobPickerRows({
@@ -3408,20 +3656,40 @@ function buildExpenseCIL_LogExpense({ from, data, jobName, category, sourceMsgId
 
 function buildExpenseCIL_Legacy({ ownerId, from, userProfile, data, jobName, category, sourceMsgId }) {
   const cents = toCents(data.amount);
+
   return {
     cil_version: '1.0',
     type: 'expense',
-    tenant_id: String(ownerId),
+
+    // ✅ owner_id is the ingestion boundary
+    owner_id: String(ownerId),
+
     source: 'whatsapp',
-    source_msg_id: String(sourceMsgId),
-    actor: { actor_id: String(userProfile?.user_id || from || 'unknown'), role: 'owner' },
+    source_msg_id: String(sourceMsgId || ''),
+
+    actor: {
+      actor_id: String(userProfile?.user_id || from || 'unknown'),
+      role: 'owner'
+    },
+
     occurred_at: new Date().toISOString(),
+
     job: jobName ? { job_name: String(jobName) } : null,
     needs_job_resolution: !jobName,
+
     total_cents: cents,
     currency: 'CAD',
-    vendor: data.store && data.store !== 'Unknown Store' ? String(data.store) : undefined,
-    memo: data.item && data.item !== 'Unknown' ? String(data.item) : undefined,
+
+    vendor:
+      data.store && data.store !== 'Unknown Store'
+        ? String(data.store)
+        : undefined,
+
+    memo:
+      data.item && data.item !== 'Unknown'
+        ? String(data.item)
+        : undefined,
+
     category: category ? String(category) : undefined
   };
 }
@@ -3972,16 +4240,17 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
   const raw = String(editText || '').trim();
   const lc = raw.toLowerCase();
 
-  // --------- helpers ---------
   const isUnknownish = (s) => {
     const x = String(s || '').trim().toLowerCase();
     return !x || x === 'unknown' || x.startsWith('unknown ');
   };
 
   const hasMoney = (s) => /\$?\s*-?\d+(?:,\d{3})*(?:\.\d{1,2})?\b/.test(String(s || ''));
-  const explicitDate = (typeof hasExplicitDateToken === 'function')
-    ? !!hasExplicitDateToken(raw)
-    : /\b(\d{4}-\d{2}-\d{2}|today|yesterday|tomorrow|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(raw);
+
+  const explicitDate =
+    (typeof hasExplicitDateToken === 'function')
+      ? !!hasExplicitDateToken(raw)
+      : /\b(\d{4}-\d{2}-\d{2}|today|yesterday|tomorrow|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b/i.test(raw);
 
   const explicit = {
     amount: /\b(amount|total|price|cost)\b/i.test(raw) || hasMoney(raw),
@@ -3992,8 +4261,6 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
     job: /\b(job|for job|change job|overhead)\b/i.test(raw)
   };
 
-  // ✅ Treat short “just a vendor” edits as vendor edits.
-  // Examples: "Home Depot", "Value Village"
   const looksLikeJustVendor =
     !explicit.amount &&
     !explicit.date &&
@@ -4003,72 +4270,111 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
 
   explicit.store = explicit.store || looksLikeJustVendor;
 
-  // --------- deterministic extractors ---------
+  const overwrite =
+    typeof parseExpenseEditOverwrite === 'function'
+      ? parseExpenseEditOverwrite(raw)
+      : {
+          amount: null,
+          store: null,
+          date: null,
+          jobName: null,
+          subtotal: null,
+          tax: null,
+          total: null
+        };
+
   const out = { ...(existingDraft || {}) };
 
-  // Preserve receipt/media linkage ALWAYS
-  out.media_asset_id = existingDraft?.media_asset_id || existingDraft?.mediaAssetId || out.media_asset_id || null;
-  out.media_source_msg_id = existingDraft?.media_source_msg_id || existingDraft?.mediaSourceMsgId || out.media_source_msg_id || null;
-  out.source_msg_id = existingDraft?.source_msg_id || existingDraft?.sourceMsgId || out.source_msg_id || null;
+  // ✅ Preserve receipt/media linkage ALWAYS
+  out.media_asset_id =
+    existingDraft?.media_asset_id ||
+    existingDraft?.mediaAssetId ||
+    out.media_asset_id ||
+    null;
 
-  out.receiptText = existingDraft?.receiptText || existingDraft?.ocrText || existingDraft?.extractedText || out.receiptText || null;
+  out.media_source_msg_id =
+    existingDraft?.media_source_msg_id ||
+    existingDraft?.mediaSourceMsgId ||
+    out.media_source_msg_id ||
+    null;
+
+  out.source_msg_id =
+    existingDraft?.source_msg_id ||
+    existingDraft?.sourceMsgId ||
+    out.source_msg_id ||
+    null;
+
+  out.receiptText =
+    existingDraft?.receiptText ||
+    existingDraft?.ocrText ||
+    existingDraft?.extractedText ||
+    out.receiptText ||
+    null;
+
   out.ocrText = existingDraft?.ocrText || out.ocrText || null;
   out.extractedText = existingDraft?.extractedText || out.extractedText || null;
 
+  // ✅ Preserve existing tax fields unless explicitly overwritten
+  out.subtotal = existingDraft?.subtotal || out.subtotal || null;
+  out.tax = existingDraft?.tax || out.tax || null;
+  out.total = existingDraft?.total || out.total || null;
+  out.taxLabel = existingDraft?.taxLabel || out.taxLabel || null;
+
   // Amount
-if (explicit.amount) {
-  const amt =
-    (typeof extractMoneyAmount === 'function' ? extractMoneyAmount(raw) : null) ||
-    (() => {
-      // supports: $2000, $2,000, 2000, 2000.5, -2000
-      const m = raw.match(/\$?\s*(-?\s*\d+(?:,\d{3})*(?:\.\d{1,2})?)/);
-      if (!m?.[1]) return null;
+  if (explicit.amount) {
+    const amt =
+      overwrite.amount ||
+      (typeof extractMoneyAmount === 'function' ? extractMoneyAmount(raw) : null) ||
+      (() => {
+        const m = raw.match(/\$?\s*(-?\s*\d+(?:,\d{3})*(?:\.\d{1,2})?)/);
+        if (!m?.[1]) return null;
 
-      const numStr = String(m[1]).replace(/\s+/g, '').replace(/,/g, '');
-      const n = Number(numStr);
-      if (!Number.isFinite(n)) return null;
+        const numStr = String(m[1]).replace(/\s+/g, '').replace(/,/g, '');
+        const n = Number(numStr);
+        if (!Number.isFinite(n)) return null;
 
-      return `$${n.toFixed(2)}`;
-    })();
+        return `$${n.toFixed(2)}`;
+      })();
 
-  if (amt && amt !== '$0.00') out.amount = amt;
-}
-
-
-  // Date
-if (explicit.date) {
-  const typedDate =
-    (typeof extractReceiptDateYYYYMMDD === 'function'
-      ? extractReceiptDateYYYYMMDD(raw, tz)
-      : null);
-
-  if (!typedDate) {
-    return {
-      nextDraft: null,
-      aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Feb 14 2026" or "2026-02-14".'
-    };
+    if (amt && amt !== '$0.00') out.amount = amt;
   }
 
-  out.date = typedDate;
-} else {
-  // lock date if not explicit
-  if (existingDraft?.date) out.date = existingDraft.date;
-}
+  // Date
+  if (explicit.date) {
+    const typedDate =
+      overwrite.date ||
+      (typeof extractReceiptDateYYYYMMDD === 'function'
+        ? extractReceiptDateYYYYMMDD(raw, tz)
+        : null);
 
+    if (!typedDate) {
+      return {
+        nextDraft: null,
+        aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Feb 14 2026" or "2026-02-14".'
+      };
+    }
 
-  // Job (very conservative: only if they used "job ...")
+    out.date = typedDate;
+  } else if (existingDraft?.date) {
+    out.date = existingDraft.date;
+  }
+
+  // Job
   if (explicit.job) {
-    // If they typed "overhead"
     if (/\boverhead\b/i.test(raw)) {
       out.jobName = 'Overhead';
       out.jobSource = 'typed';
+    } else if (overwrite.jobName) {
+      out.jobName = overwrite.jobName;
+      out.jobSource = 'typed';
     } else {
       const m =
-  raw.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
-  raw.match(/\bjob\s*(\d{1,6}\b[^\n\r]*)$/i); // handles Job1556...
+        raw.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i) ||
+        raw.match(/\bjob\s*(\d{1,6}\b[^\n\r]*)$/i);
+
       if (m?.[1]) {
         const name = String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim();
-        if (name) {
+        if (name && !/\b(subtotal|tax|total)\b/i.test(name)) {
           out.jobName = name;
           out.jobSource = 'typed';
         }
@@ -4078,35 +4384,67 @@ if (explicit.date) {
 
   // Store
   if (explicit.store) {
-    // If it's a short phrase vendor edit, treat the entire raw as vendor
-    if (looksLikeJustVendor) {
+    if (overwrite.store) {
+      out.store = overwrite.store;
+    } else if (looksLikeJustVendor) {
       out.store = raw;
     } else {
-      // Try "at X" / "from X"
-      const m = raw.match(/\b(?:at|from|vendor|merchant|store)\b\s*[:\-]?\s*([^\n\r]+)$/i);
-      const v = m?.[1] ? String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim() : null;
-      if (v) out.store = v;
+      const lines = raw
+        .split(/\r?\n/)
+        .map((x) => String(x || '').trim())
+        .filter(Boolean);
+
+      let foundStore = null;
+
+      for (const line of lines) {
+        const m = line.match(/^\s*(?:at|from|vendor|merchant|store)\b\s*[:\-]?\s*(.+)$/i);
+        if (m?.[1]) {
+          foundStore = String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim();
+          if (foundStore) break;
+        }
+      }
+
+      if (foundStore) out.store = foundStore;
     }
   }
 
-  // Item / description (only if explicit)
+  // Item / description
   if (explicit.item) {
-    const m = raw.match(/\b(?:item|desc|description|for)\b\s*[:\-]?\s*([^\n\r]+)$/i);
-    const v = m?.[1] ? String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim() : null;
-    if (v) out.item = v;
+    const lines = raw
+      .split(/\r?\n/)
+      .map((x) => String(x || '').trim())
+      .filter(Boolean);
+
+    let foundItem = null;
+
+    for (const line of lines) {
+      const m = line.match(/^\s*(?:item|desc|description|for)\b\s*[:\-]?\s*(.+)$/i);
+      if (m?.[1]) {
+        foundItem = String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim();
+        if (foundItem && !/^\s*job\b/i.test(foundItem)) break;
+      }
+    }
+
+    if (foundItem) out.item = foundItem;
   }
 
-  // Category (only if explicit)
+  // Category
   if (explicit.category) {
     const m = raw.match(/\b(?:category|type)\b\s*[:\-]?\s*([^\n\r]+)$/i);
     const v = m?.[1] ? String(m[1]).trim().replace(/[.!,;:]+$/g, '').trim() : null;
     if (v) out.category = v;
   }
 
-  // Ensure we never accidentally null out strong values
+  // ✅ Tax fields from deterministic overwrite parser
+  if (overwrite.subtotal) out.subtotal = overwrite.subtotal;
+  if (overwrite.tax) out.tax = overwrite.tax;
+  if (overwrite.total) out.total = overwrite.total;
+
+  // ✅ Never accidentally null out strong values
   if (out.store && isUnknownish(out.store) && existingDraft?.store && !isUnknownish(existingDraft.store)) {
     out.store = existingDraft.store;
   }
+
   if (out.amount === '$0.00' && existingDraft?.amount && existingDraft.amount !== '$0.00') {
     out.amount = existingDraft.amount;
   }
@@ -4562,114 +4900,141 @@ try {
     }
 
     const extractJobNameFromEditText = (t) => {
-      const s = String(t || '').trim();
-      if (!s) return null;
+  const s = String(t || '').trim();
+  if (!s) return null;
 
-      const m = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
-      if (!m?.[1]) return null;
+  const lines = s
+    .split(/\r?\n/)
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
 
-      let name = String(m[1]).trim();
-      name = name.replace(/[.!,;:]+$/g, '').trim();
-      if (!name) return null;
+  for (const line of lines) {
+    const m =
+      line.match(/^\s*job\b\s*[:\-]?\s*(.+)$/i) ||
+      line.match(/^\s*for\s+job\s+(.+)$/i);
 
-      if (/^overhead$/i.test(name)) return 'Overhead';
-      return name;
-    };
+    if (!m?.[1]) continue;
 
-    const jobFromText = extractJobNameFromEditText(rawInboundText);
+    let name = String(m[1]).trim();
+    name = name.replace(/[.!,;:]+$/g, '').trim();
+    if (!name) return null;
 
-    let jobPatch = null;
-    try {
-      jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
-    } catch {
-      jobPatch = null;
-    }
+    if (/\b(subtotal|tax|total)\b/i.test(name)) return null;
+    if (/^overhead$/i.test(name)) return 'Overhead';
+    return name;
+  }
 
-    const originalTextKeepEarly =
-      String(
-        draftEarly?.originalText ||
-        draftEarly?.receiptText ||
-        draftEarly?.ocrText ||
-        ''
-      ).trim() || null;
+  return null;
+};
 
-    const overwriteEarly = parseExpenseEditOverwrite(rawInboundText);
+const jobFromText = extractJobNameFromEditText(rawInboundText);
 
-    const patchedDraft = {
-      ...(draftEarly || {}),
-      ...(nextDraft || {}),
-      ...(jobPatch || {}),
+let jobPatch = null;
+try {
+  jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
+} catch {
+  jobPatch = null;
+}
 
-      amount:
-        overwriteEarly.amount ||
-        nextDraft?.amount ||
-        draftEarly?.amount ||
-        null,
+const originalTextKeepEarly =
+  String(
+    draftEarly?.originalText ||
+    draftEarly?.receiptText ||
+    draftEarly?.ocrText ||
+    ''
+  ).trim() || null;
 
-      store:
-        overwriteEarly.store ||
-        nextDraft?.store ||
-        draftEarly?.store ||
-        null,
+const overwriteEarly = parseExpenseEditOverwrite(rawInboundText);
 
-      date:
-        overwriteEarly.date ||
-        nextDraft?.date ||
-        draftEarly?.date ||
-        null,
+const patchedDraft = {
+  ...(draftEarly || {}),
+  ...(nextDraft || {}),
+  ...(jobPatch || {}),
 
-      jobName:
-        overwriteEarly.jobName ||
-        jobFromText ||
-        jobPatch?.jobName ||
-        nextDraft?.jobName ||
-        draftEarly?.jobName ||
-        null,
+  amount:
+    overwriteEarly.amount ||
+    nextDraft?.amount ||
+    draftEarly?.amount ||
+    null,
 
-      ...(overwriteEarly.jobName || jobFromText
-        ? { jobSource: 'typed' }
-        : jobPatch?.jobName
-          ? { jobSource: jobPatch.jobSource || 'typed' }
-          : null),
+  store:
+    overwriteEarly.store ||
+    nextDraft?.store ||
+    draftEarly?.store ||
+    null,
 
-      humanLine: null,
-      summaryLine: null,
+  date:
+    overwriteEarly.date ||
+    nextDraft?.date ||
+    draftEarly?.date ||
+    null,
 
-      draftText: String(rawInboundText || '').trim(),
-      originalText: originalTextKeepEarly,
+  jobName:
+    overwriteEarly.jobName ||
+    jobFromText ||
+    (
+      jobPatch?.jobName &&
+      !/\b(subtotal|tax|total)\b/i.test(String(jobPatch.jobName || ''))
+        ? jobPatch.jobName
+        : null
+    ) ||
+    nextDraft?.jobName ||
+    draftEarly?.jobName ||
+    null,
 
-      awaiting_edit: false,
-      edit_started_at: null,
-      editStartedAt: null,
-      edit_flow_id: null,
-      needsReparse: false
-    };
+  ...(overwriteEarly.jobName || jobFromText
+    ? { jobSource: 'typed' }
+    : draftEarly?.jobSource
+      ? { jobSource: draftEarly.jobSource }
+      : jobPatch?.jobName
+        ? { jobSource: jobPatch.jobSource || 'typed' }
+        : null),
 
-    console.info('[EXPENSE_EDIT_OVERWRITE_RESULT_EARLY]', {
-      paUserId,
-      amount: patchedDraft.amount || null,
-      store: patchedDraft.store || null,
-      date: patchedDraft.date || null,
-      jobName: patchedDraft.jobName || null
-    });
+  subtotal: overwriteEarly.subtotal || draftEarly?.subtotal || null,
+  tax: overwriteEarly.tax || draftEarly?.tax || null,
+  total: overwriteEarly.total || draftEarly?.total || null,
 
-    await upsertPA({
-      ownerId,
-      userId: paKey,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        ...(confirmPAEarly?.payload || {}),
-        draft: patchedDraft
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
+  humanLine: null,
+  summaryLine: null,
 
-    try {
-      return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
-    } catch (e) {
-      console.warn('[AWAITING_EDIT_EARLY_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
-      return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
-    }
+  draftText: String(rawInboundText || '').trim(),
+  originalText: originalTextKeepEarly,
+
+  awaiting_edit: false,
+  edit_started_at: null,
+  editStartedAt: null,
+  edit_flow_id: null,
+  needsReparse: false
+};
+
+console.info('[EXPENSE_EDIT_OVERWRITE_RESULT_EARLY]', {
+  paUserId,
+  amount: patchedDraft.amount || null,
+  store: patchedDraft.store || null,
+  date: patchedDraft.date || null,
+  jobName: patchedDraft.jobName || null,
+  subtotal: patchedDraft.subtotal || null,
+  tax: patchedDraft.tax || null,
+  total: patchedDraft.total || null
+});
+
+await upsertPA({
+  ownerId,
+  userId: paKey,
+  kind: PA_KIND_CONFIRM,
+  payload: {
+    ...(confirmPAEarly?.payload || {}),
+    draft: patchedDraft
+  },
+  ttlSeconds: PA_TTL_SEC
+});
+
+try {
+  return await resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProfile });
+} catch (e) {
+  console.warn('[AWAITING_EDIT_EARLY_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
+  return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
+}
   }
 } catch (e) {
   console.warn('[AWAITING_EDIT_EARLY_CONSUME] failed (ignored):', e?.message);
@@ -4731,18 +5096,78 @@ try {
         (/ca/i.test(String(ownerProfile?.locale || '')) ? 'CAD' : '') ||
         'CAD';
 
+             const receiptTaxInfo =
+        typeof extractReceiptTaxBreakdown === 'function'
+          ? extractReceiptTaxBreakdown(receiptText || '')
+          : { subtotal: null, tax: null, total: null, taxLabel: null };
+
+      const receiptPrimaryItem =
+        typeof extractReceiptPrimaryItem === 'function'
+          ? extractReceiptPrimaryItem(receiptText || '')
+          : null;
+
       const patch = back
         ? {
             store: back.store || null,
-            date: back.dateIso || null,
-            amount: back.total != null ? String(Number(back.total).toFixed(2)) : null,
-            currency: back.currency || draft1?.currency || defaultCurrency
+            date: String(draft1?.date || '').trim() || back.dateIso || null,
+            amount:
+              receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+                ? String(Number(receiptTaxInfo.total).toFixed(2))
+                : back.total != null
+                  ? String(Number(back.total).toFixed(2))
+                  : null,
+            currency: back.currency || draft1?.currency || defaultCurrency,
+            item: draft1?.item || receiptPrimaryItem || null,
+            subtotal:
+              draft1?.subtotal ||
+              (receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
+                ? Number(receiptTaxInfo.subtotal).toFixed(2)
+                : null),
+            tax:
+              draft1?.tax ||
+              (receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
+                ? Number(receiptTaxInfo.tax).toFixed(2)
+                : null),
+            total:
+              draft1?.total ||
+              (receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+                ? Number(receiptTaxInfo.total).toFixed(2)
+                : null),
+            taxLabel:
+              String(draft1?.taxLabel || '').trim() ||
+              String(receiptTaxInfo?.taxLabel || '').trim() ||
+              null
           }
-        : { currency: draft1?.currency || defaultCurrency };
+        : {
+            currency: draft1?.currency || defaultCurrency,
+            item: draft1?.item || receiptPrimaryItem || null,
+            subtotal:
+              draft1?.subtotal ||
+              (receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
+                ? Number(receiptTaxInfo.subtotal).toFixed(2)
+                : null),
+            tax:
+              draft1?.tax ||
+              (receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
+                ? Number(receiptTaxInfo.tax).toFixed(2)
+                : null),
+            total:
+              draft1?.total ||
+              (receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+                ? Number(receiptTaxInfo.total).toFixed(2)
+                : null),
+            taxLabel:
+              String(draft1?.taxLabel || '').trim() ||
+              String(receiptTaxInfo?.taxLabel || '').trim() ||
+              null
+          };
 
       const mergedDraft = mergeDraftNonNull(draft1, patch);
 
-      const gotAmount = !!String(mergedDraft.amount || '').trim();
+      const gotAmount =
+        !!String(mergedDraft.amount || '').trim() &&
+        String(mergedDraft.amount).trim() !== '$0.00';
+
       const gotDate = !!String(mergedDraft.date || '').trim();
 
       await upsertPA({
@@ -4765,6 +5190,11 @@ try {
         amount: c?.payload?.draft?.amount || null,
         date: c?.payload?.draft?.date || null,
         store: c?.payload?.draft?.store || null,
+        item: c?.payload?.draft?.item || null,
+        subtotal: c?.payload?.draft?.subtotal || null,
+        tax: c?.payload?.draft?.tax || null,
+        total: c?.payload?.draft?.total || null,
+        taxLabel: c?.payload?.draft?.taxLabel || null,
         currency: c?.payload?.draft?.currency || null
       });
     } catch {}
@@ -5720,23 +6150,37 @@ try {
     }
 
     // ✅ Deterministic "Job ..." capture (so job edits never rely on LLM)
-    const extractJobNameFromEditText = (t) => {
-      const s = String(t || '').trim();
-      if (!s) return null;
+const extractJobNameFromEditText = (t) => {
+  const s = String(t || '').trim();
+  if (!s) return null;
 
-      const m = s.match(/\bjob\b\s*[:\-]?\s*([^\n\r]+)$/i);
-      if (!m?.[1]) return null;
+  const lines = s
+    .split(/\r?\n/)
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
 
-      let name = String(m[1]).trim();
-      name = name.replace(/[.!,;:]+$/g, '').trim();
-      if (!name) return null;
-      if (/^overhead$/i.test(name)) return 'Overhead';
-      return name;
-    };
+  for (const line of lines) {
+    const m =
+      line.match(/^\s*job\b\s*[:\-]?\s*(.+)$/i) ||
+      line.match(/^\s*for\s+job\s+(.+)$/i);
 
-    const jobFromText = extractJobNameFromEditText(rawInboundText);
+    if (!m?.[1]) continue;
 
-    // ✅ best-effort structured job patch (safe, may be null)
+    let name = String(m[1]).trim();
+    name = name.replace(/[.!,;:]+$/g, '').trim();
+    if (!name) return null;
+
+    if (/\b(subtotal|tax|total)\b/i.test(name)) return null;
+    if (/^overhead$/i.test(name)) return 'Overhead';
+    return name;
+  }
+
+  return null;
+};
+
+const jobFromText = extractJobNameFromEditText(rawInboundText);
+
+// ✅ best-effort structured job patch (safe, may be null)
 let jobPatch = null;
 try {
   jobPatch = await bestEffortResolveJobFromText(ownerId, rawInboundText);
@@ -5783,16 +6227,27 @@ const patchedDraft = {
   jobName:
     overwrite.jobName ||
     jobFromText ||
-    jobPatch?.jobName ||
+    (
+      jobPatch?.jobName &&
+      !/\b(subtotal|tax|total)\b/i.test(String(jobPatch.jobName || ''))
+        ? jobPatch.jobName
+        : null
+    ) ||
     nextDraft?.jobName ||
     draftE?.jobName ||
     null,
 
   ...(overwrite.jobName || jobFromText
     ? { jobSource: 'typed' }
-    : jobPatch?.jobName
-      ? { jobSource: jobPatch.jobSource || 'typed' }
-      : null),
+    : draftE?.jobSource
+      ? { jobSource: draftE.jobSource }
+      : jobPatch?.jobName
+        ? { jobSource: jobPatch.jobSource || 'typed' }
+        : null),
+
+  subtotal: overwrite.subtotal || draftE?.subtotal || null,
+  tax: overwrite.tax || draftE?.tax || null,
+  total: overwrite.total || draftE?.total || null,
 
   // ✅ force re-render from fresh summary after edit
   humanLine: null,
@@ -5816,49 +6271,52 @@ console.info('[EXPENSE_EDIT_OVERWRITE_RESULT]', {
   amount: patchedDraft.amount || null,
   store: patchedDraft.store || null,
   date: patchedDraft.date || null,
-  jobName: patchedDraft.jobName || null
+  jobName: patchedDraft.jobName || null,
+  subtotal: patchedDraft.subtotal || null,
+  tax: patchedDraft.tax || null,
+  total: patchedDraft.total || null
 });
 
-    await upsertPA({
-      ownerId,
-      userId: paKey,
-      kind: PA_KIND_CONFIRM,
-      payload: {
-        ...(confirmPA?.payload || {}),
-        draft: patchedDraft
-      },
-      ttlSeconds: PA_TTL_SEC
-    });
+await upsertPA({
+  ownerId,
+  userId: paKey,
+  kind: PA_KIND_CONFIRM,
+  payload: {
+    ...(confirmPA?.payload || {}),
+    draft: patchedDraft
+  },
+  ttlSeconds: PA_TTL_SEC
+});
 
-    // ✅ refresh in-memory (avoid stale confirmPA shadow bugs)
-    try {
-      const fresh2 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
-      if (fresh2) confirmPA = fresh2;
-    } catch {}
+// ✅ refresh in-memory (avoid stale confirmPA shadow bugs)
+try {
+  const fresh2 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM });
+  if (fresh2) confirmPA = fresh2;
+} catch {}
 
-    // ✅ After applying edit payload & saving patched draft:
-    // set one-shot auto-yes so webhook router re-calls handler with "yes"
-    try {
-      const editMsgSid =
-        String(sourceMsgId || '').trim() ||
-        String(inboundTwilioMeta?.MessageSid || '').trim() ||
-        null;
+// ✅ After applying edit payload & saving patched draft:
+// set one-shot auto-yes so webhook router re-calls handler with "yes"
+try {
+  const editMsgSid =
+    String(sourceMsgId || '').trim() ||
+    String(inboundTwilioMeta?.MessageSid || '').trim() ||
+    null;
 
-      await mergePendingTransactionState(paUserId, {
-        _autoYesAfterEdit: true,
-        _autoYesSourceMsgId: editMsgSid
-      });
-    } catch (e) {
-      console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
-    }
+  await mergePendingTransactionState(paUserId, {
+    _autoYesAfterEdit: true,
+    _autoYesSourceMsgId: editMsgSid
+  });
+} catch (e) {
+  console.warn('[AUTO_YES_FLAG_SET] failed (ignored):', e?.message);
+}
 
-    // ✅ MUST send interactive confirm, NEVER nag
-    try {
-      return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
-    } catch (e) {
-      console.warn('[AWAITING_EDIT_SAFETYNET_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
-      return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
-    }
+// ✅ MUST send interactive confirm, NEVER nag
+try {
+  return await resendConfirmExpense({ fromPhone, ownerId, tz: tz0, paUserId, userProfile });
+} catch (e) {
+  console.warn('[AWAITING_EDIT_SAFETYNET_CONSUME] resendConfirmExpense failed; fallback to text:', e?.message);
+  return out(twimlText(formatExpenseConfirmText(patchedDraft)), false);
+}
   }
 
   // ✅ If we're still awaiting_edit and user sent a control token, never nag.
@@ -6549,7 +7007,7 @@ if (!jobName) {
     confirmFlowId: txSourceMsgId || `${paUserId}:${Date.now()}`,
     jobOptions: jobs,
     paUserId,
-    pickUserId: canonicalUserKey, // ✅ MUST be canonical pick key
+    pickUserId: canonicalUserKey,
     page: 0,
     pageSize: 8,
     context: 'expense_jobpick',
@@ -6560,7 +7018,11 @@ if (!jobName) {
       media_asset_id: data.media_asset_id || null,
       media_source_msg_id: data.media_source_msg_id || null,
       originalText: draftForSubmit?.originalText || sourceText || '',
-      draftText: draftForSubmit?.draftText || sourceText || ''
+      draftText: draftForSubmit?.draftText || sourceText || '',
+      subtotal: draftForSubmit?.subtotal || data?.subtotal || null,
+      tax: draftForSubmit?.tax || data?.tax || null,
+      total: draftForSubmit?.total || data?.total || null,
+      taxLabel: draftForSubmit?.taxLabel || data?.taxLabel || null
     }
   });
 
@@ -6847,36 +7309,35 @@ return out(twimlText(okMsg), false);
 
 /* ---- 3) New expense parse (deterministic first) ---- */
 
+// ✅ Helper: normalize "<digits>:SMxxxx" safely (prevents double-prefix / junk prefixes)
+const normalizeMediaSourceMsgId = (userKeyDigits, val) => {
+  const u = String(userKeyDigits || '').trim();
+  const s0 = String(val || '').trim();
+  if (!u) return s0 || null;
+  if (!s0) return null;
+
+  // Already "digits:SM..." -> keep
+  if (/^\d{7,20}:SM[a-f0-9]{10,64}$/i.test(s0)) return s0;
+
+  // If it's just SM...
+  const mSid = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
+  if (mSid?.[0]) return `${u}:${mSid[0]}`;
+
+  // If it's "something:SM..." but not digits prefix -> re-key with our userKey
+  if (s0.includes(':')) {
+    const m2 = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
+    if (m2?.[0]) return `${u}:${m2[0]}`;
+  }
+
+  // Otherwise treat as raw token -> prefix
+  return `${u}:${s0}`;
+};
+
 // ✅ Receipt/OCR path: seed/patch CONFIRM PA so "Yes" has something real to submit.
 // IMPORTANT: do NOT run deterministicExpenseParse on receipt blobs.
 if (looksLikeReceiptText(input)) {
-  // ✅ hoist so the picker try/catch can use them
   let txSourceMsgId = null;
   let mergedDraft = null;
-
-  // Helper: normalize "<digits>:SMxxxx" safely (prevents double-prefix / junk prefixes)
-  const normalizeMediaSourceMsgId = (userKeyDigits, val) => {
-    const u = String(userKeyDigits || '').trim();
-    const s0 = String(val || '').trim();
-    if (!u) return s0 || null;
-    if (!s0) return null;
-
-    // Already "digits:SM..." -> keep
-    if (/^\d{7,20}:SM[a-f0-9]{10,64}$/i.test(s0)) return s0;
-
-    // If it's just SM...
-    const mSid = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
-    if (mSid?.[0]) return `${u}:${mSid[0]}`;
-
-    // If it's "something:SM..." but not digits prefix -> re-key with our userKey
-    if (s0.includes(':')) {
-      const m2 = s0.match(/\bSM[a-f0-9]{10,64}\b/i);
-      if (m2?.[0]) return `${u}:${m2[0]}`;
-    }
-
-    // Otherwise treat as raw token -> prefix
-    return `${u}:${s0}`;
-  };
 
   try {
     // --------------------------------------------
@@ -6908,7 +7369,7 @@ if (looksLikeReceiptText(input)) {
     const userKey = String(paUserId || '').trim();
     const tz0 = userProfile?.timezone || userProfile?.tz || ownerProfile?.tz || 'America/Toronto';
 
-    // ✅ Deterministic receipt date from the receipt text itself (01/13/26 works)
+    // ✅ Deterministic receipt date from the receipt text itself
     const seededDate = extractReceiptDateYYYYMMDD(receiptText, tz0);
 
     const inEdit = !!draft0?.awaiting_edit;
@@ -6920,30 +7381,74 @@ if (looksLikeReceiptText(input)) {
       edit_flow_id: draft0?.edit_flow_id ?? null
     };
 
-    // ✅ Build patch (prefer existing draft date first, then seededDate, then backstop)
+    // ✅ Tax/subtotal/total extraction at seed time
+    const receiptTaxInfo =
+      typeof extractReceiptTaxBreakdown === 'function'
+        ? extractReceiptTaxBreakdown(receiptText || '')
+        : { subtotal: null, tax: null, total: null, taxLabel: null };
+
+    // ✅ Safe item extraction at seed time
+    const seededItem =
+      typeof extractReceiptPrimaryItem === 'function'
+        ? extractReceiptPrimaryItem(receiptText)
+        : null;
+
+    // ✅ Build patch
+    // Prefer explicit receipt total over subtotal for confirm amount
+    const seededTotal =
+      receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+        ? Number(receiptTaxInfo.total).toFixed(2)
+        : back?.total != null && Number.isFinite(Number(back.total))
+          ? Number(back.total).toFixed(2)
+          : null;
+
     const patch = {
       store: back?.store || draft0?.store || null,
 
       date: String(draft0?.date || '').trim() || seededDate || back?.dateIso || null,
 
       amount:
-        back?.total != null
-          ? String(Number(back.total).toFixed(2))
-          : (String(draft0?.amount || '').trim() || null),
+        seededTotal ||
+        (String(draft0?.amount || '').trim() || null),
 
       currency: back?.currency || draft0?.currency || defaultCurrency,
+
+      item:
+        seededItem ||
+        draft0?.item ||
+        null,
+
+      subtotal:
+        receiptTaxInfo?.subtotal != null && Number.isFinite(Number(receiptTaxInfo.subtotal))
+          ? Number(receiptTaxInfo.subtotal).toFixed(2)
+          : draft0?.subtotal || null,
+
+      tax:
+        receiptTaxInfo?.tax != null && Number.isFinite(Number(receiptTaxInfo.tax))
+          ? Number(receiptTaxInfo.tax).toFixed(2)
+          : draft0?.tax || null,
+
+      total:
+        receiptTaxInfo?.total != null && Number.isFinite(Number(receiptTaxInfo.total))
+          ? Number(receiptTaxInfo.total).toFixed(2)
+          : draft0?.total || null,
+
+      taxLabel:
+        String(receiptTaxInfo?.taxLabel || '').trim() ||
+        String(draft0?.taxLabel || '').trim() ||
+        null,
 
       receiptText,
       ocrText: receiptText,
 
-      // ✅ Only overwrite these when NOT awaiting_edit (prevents clobbering user edit text)
+      // ✅ Only overwrite these when NOT awaiting_edit
       originalText: inEdit ? (draft0?.originalText || receiptText) : receiptText,
       draftText: inEdit ? (draft0?.draftText || receiptText) : receiptText
     };
 
     mergedDraft = mergeDraftNonNull(draft0, patch);
 
-    // ✅ Ensure media_source_msg_id always "userKey:SM..." (hardened)
+    // ✅ Ensure media_source_msg_id always "userKey:SM..."
     if (!mergedDraft.media_source_msg_id && txSourceMsgId) {
       mergedDraft.media_source_msg_id = normalizeMediaSourceMsgId(userKey, txSourceMsgId);
     } else if (mergedDraft.media_source_msg_id) {
@@ -6951,19 +7456,22 @@ if (looksLikeReceiptText(input)) {
     }
 
     mergedDraft.media_asset_id =
-  mergedDraft.media_asset_id || resolvedFlowMediaAssetId || flowMediaAssetId || null;
+      mergedDraft.media_asset_id || resolvedFlowMediaAssetId || flowMediaAssetId || null;
 
-// ✅ Vendor sanitation (receipt seed): prevent “Rona for plywood” pollution.
-// Only strip trailing “ for …” if we ALSO have an item/description already.
-if (mergedDraft?.store && typeof mergedDraft.store === 'string') {
-  const s = mergedDraft.store.trim();
-  if (mergedDraft?.item && /\sfor\s/i.test(s)) {
-    mergedDraft.store = s.replace(/\s+for\s+.*/i, '').trim();
-  }
-}
+    // ✅ Vendor sanitation (receipt seed): prevent “Rona for plywood” pollution.
+    // Only strip trailing “ for …” if we ALSO have an item/description already.
+    if (mergedDraft?.store && typeof mergedDraft.store === 'string') {
+      const s = mergedDraft.store.trim();
+      if (mergedDraft?.item && /\sfor\s/i.test(s)) {
+        mergedDraft.store = s.replace(/\s+for\s+.*/i, '').trim();
+      }
+    }
 
-const gotAmount = !!String(mergedDraft.amount || '').trim() && String(mergedDraft.amount).trim() !== '$0.00';
-const gotDate = !!String(mergedDraft.date || '').trim();
+    const gotAmount =
+      !!String(mergedDraft.amount || '').trim() &&
+      String(mergedDraft.amount).trim() !== '$0.00';
+
+    const gotDate = !!String(mergedDraft.date || '').trim();
 
     await upsertPA({
       ownerId,
@@ -6988,6 +7496,11 @@ const gotDate = !!String(mergedDraft.date || '').trim();
       store: mergedDraft.store || null,
       date: mergedDraft.date || null,
       amount: mergedDraft.amount || null,
+      item: mergedDraft.item || null,
+      subtotal: mergedDraft.subtotal || null,
+      tax: mergedDraft.tax || null,
+      total: mergedDraft.total || null,
+      taxLabel: mergedDraft.taxLabel || null,
       currency: mergedDraft.currency || null,
       needsReparse: !(gotAmount && gotDate),
       media_asset_id: mergedDraft.media_asset_id || null
@@ -6996,110 +7509,106 @@ const gotDate = !!String(mergedDraft.date || '').trim();
     console.warn('[RECEIPT_SEED_CONFIRM_PA] failed (ignored):', e?.message);
   }
 
-    // --------------------------------------------
+  // --------------------------------------------
   // 2) Receipt intake UX: ALWAYS go to job picker first
   // --------------------------------------------
-  if (looksLikeReceiptText(input)) {
-    try {
-      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
-      if (!jobs.length) {
-        return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
-      }
-
-      // ✅ confirmFlowId — NO stableMsgId dependency
-      const confirmFlowId =
-        String(txSourceMsgId || '').trim() ||
-        String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
-        String(sourceMsgId || '').trim() ||
-        `${paUserId}:${Date.now()}`;
-
-      await sendJobPickList({
-        fromPhone,
-        ownerId,
-        userProfile,
-        confirmFlowId,
-        jobOptions: jobs,
-        paUserId,
-        pickUserId: canonicalUserKey,
-        page: 0,
-        pageSize: 8,
-        context: 'expense_jobpick',
-        confirmDraft: mergedDraft
-          ? {
-              ...mergedDraft,
-              jobName: null,
-              jobSource: null,
-              media_asset_id: mergedDraft.media_asset_id || null,
-              media_source_msg_id: mergedDraft.media_source_msg_id || null,
-              originalText: mergedDraft.originalText || mergedDraft.receiptText || '',
-              draftText: mergedDraft.draftText || mergedDraft.receiptText || ''
-            }
-          : null
-      });
-
-      // ✅ picker sent out-of-band
-      return out(twimlEmpty(), true);
-    } catch (e) {
-      console.warn('[EXPENSE] receipt job picker send failed:', e?.message);
-      // fallback: at least avoid nagging
-      return out(twimlText('I had trouble showing the job list. Try again or reply "jobs".'), false);
-    }
-  } else {
-    // ✅ Non-receipt path: deterministic parse first
-    let backstop = deterministicExpenseParse(rawInboundText, userProfile);
-
-    // ✅ If parser failed to extract a date but the user clearly said one (e.g. "January 1st, 2025"),
-    // capture it here and inject it so we don't fall back to "today".
-    const explicitDate = extractExplicitDateFromText(rawInboundText, tz);
-
-    if (backstop && !backstop.date && explicitDate) {
-      backstop = { ...backstop, date: explicitDate };
+  try {
+    const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+    if (!jobs.length) {
+      return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
     }
 
-    console.info('[DET_EXPENSE_DATE_TOKEN]', {
-      head: String(rawInboundText || '').slice(0, 120),
-      explicitDate: explicitDate || null,
-      backstopDateBeforeFallback: backstop?.date ?? null
+    // ✅ confirmFlowId — NO stableMsgId dependency
+    const confirmFlowId =
+      String(txSourceMsgId || '').trim() ||
+      String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
+      String(sourceMsgId || '').trim() ||
+      `${paUserId}:${Date.now()}`;
+
+    await sendJobPickList({
+      fromPhone,
+      ownerId,
+      userProfile,
+      confirmFlowId,
+      jobOptions: jobs,
+      paUserId,
+      pickUserId: canonicalUserKey,
+      page: 0,
+      pageSize: 8,
+      context: 'expense_jobpick',
+      confirmDraft: mergedDraft
+        ? {
+            ...mergedDraft,
+            jobName: null,
+            jobSource: null,
+            media_asset_id: mergedDraft.media_asset_id || null,
+            media_source_msg_id: mergedDraft.media_source_msg_id || null,
+            originalText: mergedDraft.originalText || mergedDraft.receiptText || '',
+            draftText: mergedDraft.draftText || mergedDraft.receiptText || '',
+            subtotal: mergedDraft.subtotal || null,
+            tax: mergedDraft.tax || null,
+            total: mergedDraft.total || null,
+            taxLabel: mergedDraft.taxLabel || null
+          }
+        : null
     });
 
-    console.info('[EXPENSE_PARSE_RESULT_BACKSTOP]', {
-      hasBackstop: !!backstop,
-      amount: backstop?.amount ?? null,
-      store: backstop?.store ?? backstop?.vendor ?? null,
-      date: backstop?.date ?? null,
-      job: backstop?.jobName ?? backstop?.job ?? null,
-      head: String(rawInboundText || '').slice(0, 120)
-    });
+    // ✅ picker sent out-of-band
+    return out(twimlEmpty(), true);
+  } catch (e) {
+    console.warn('[EXPENSE] receipt job picker send failed:', e?.message);
+    return out(twimlText('I had trouble showing the job list. Try again or reply "jobs".'), false);
+  }
+} else {
+  // ✅ Non-receipt path: deterministic parse first
+  let backstop = deterministicExpenseParse(rawInboundText, userProfile);
 
-    // IMPORTANT:
-    // Do NOT `return` here — let the rest of your existing non-receipt flow continue
-    // using `backstop` (you’ll already have `backstop` in scope for the next steps).
+  // ✅ If parser failed to extract a date but the user clearly said one,
+  // capture it here and inject it so we don't fall back to "today".
+  const explicitDate = extractExplicitDateFromText(rawInboundText, tz);
+
+  if (backstop && !backstop.date && explicitDate) {
+    backstop = { ...backstop, date: explicitDate };
   }
 
+  console.info('[DET_EXPENSE_DATE_TOKEN]', {
+    head: String(rawInboundText || '').slice(0, 120),
+    explicitDate: explicitDate || null,
+    backstopDateBeforeFallback: backstop?.date ?? null
+  });
 
+  console.info('[EXPENSE_PARSE_RESULT_BACKSTOP]', {
+    hasBackstop: !!backstop,
+    amount: backstop?.amount ?? null,
+    store: backstop?.store ?? backstop?.vendor ?? null,
+    date: backstop?.date ?? null,
+    job: backstop?.jobName ?? backstop?.job ?? null,
+    head: String(rawInboundText || '').slice(0, 120)
+  });
 
-  
-
+  // IMPORTANT:
+  // Do NOT `return` here unless backstop is good enough to start confirm flow.
   if (backstop && backstop.amount) {
     const sourceText0 = String(backstop?.originalText || backstop?.draftText || input || '').trim();
     const data0 = normalizeExpenseData(backstop, userProfile, sourceText0);
     ensureAmountCents(data0);
 
+    console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
+      amount: data0?.amount ?? null,
+      amount_cents: data0?.amount_cents ?? null,
+      store: data0?.store ?? null,
+      date: data0?.date ?? null,
+      item: data0?.item ?? null,
+      jobName: data0?.jobName ?? null,
+      subtotal: data0?.subtotal ?? null,
+      tax: data0?.tax ?? null,
+      total: data0?.total ?? null,
+      taxLabel: data0?.taxLabel ?? null
+    });
 
-console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
-  amount: data0?.amount ?? null,
-  amount_cents: data0?.amount_cents ?? null,
-  store: data0?.store ?? null,
-  date: data0?.date ?? null,
-  item: data0?.item ?? null,
-  jobName: data0?.jobName ?? null
-});
-
-    
-        data0.store = await normalizeVendorName(ownerId, data0.store);
+    data0.store = await normalizeVendorName(ownerId, data0.store);
 
     // ✅ Vendor sanitation: prevent “Rona for plywood” pollution.
-    // Only strip trailing “ for …” if we ALSO have an item/description already.
     if (data0?.store && typeof data0.store === 'string') {
       const s = data0.store.trim();
       if (data0?.item && /\sfor\s/i.test(s)) {
@@ -7108,7 +7617,6 @@ console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
     }
 
     if (isUnknownItem(data0.item)) {
-
       const inferred = inferExpenseItemFallback(input);
       if (inferred) data0.item = inferred;
     }
@@ -7129,24 +7637,28 @@ console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
       jobSource = 'overhead';
     }
 
-    if (jobName) data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
+    if (jobName) {
+      data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
+    }
 
-    // ✅ Canonical per-message id for confirm PA (NO stableMsgId dependency)
+    // ✅ Canonical per-message id for confirm PA
     const safeMsgId0 =
       String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
       String(sourceMsgId || '').trim() ||
       `${paUserId}:${Date.now()}`;
 
+    const paKey = String(paUserId || '').trim();
     const u = String(paUserId || '').trim();
     const sid = String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim();
     const ms0 = sid ? normalizeMediaSourceMsgId(u, sid) : null;
+
     console.info('[MEDIA_SOURCE_MSG_ID_NORMALIZED]', {
-  u,
-  sid: sid || null,
-  ms0
-});
+      u,
+      sid: sid || null,
+      ms0
+    });
 
-
+    // ✅ Upsert CONFIRM PA (so “Yes/Edit” works)
     await upsertPA({
       ownerId,
       userId: paKey,
@@ -7164,13 +7676,35 @@ console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
           media_source_msg_id: ms0,
 
           originalText: input,
-          draftText: input
+          draftText: input,
+
+          subtotal: data0?.subtotal || null,
+          tax: data0?.tax || null,
+          total: data0?.total || null,
+          taxLabel: data0?.taxLabel || null
         },
         sourceMsgId: safeMsgId0,
         type: 'expense'
       },
       ttlSeconds: PA_TTL_SEC
     });
+
+    // ✅ Create/refresh CIL draft row (initial confirm send)
+    try {
+      const confirmPA1 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
+      const draft1 = confirmPA1?.payload?.draft || null;
+      const srcId = String(confirmPA1?.payload?.sourceMsgId || '').trim() || null;
+
+      if (draft1) {
+        await upsertCilDraftForExpenseConfirm({
+          ownerId,
+          paUserId: paKey,
+          fromPhone,
+          draft: draft1,
+          sourceMsgId: srcId
+        });
+      }
+    } catch {}
 
     // ✅ consume allow_new_while_pending
     try {
@@ -7184,10 +7718,10 @@ console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
       }
     } catch {}
 
+    // ✅ If no job, go to picker
     if (!jobName) {
       const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
 
-      // ✅ confirmFlowId — NO stableMsgId dependency
       const confirmFlowId =
         String(safeMsgId0 || '').trim() ||
         String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim() ||
@@ -7212,13 +7746,18 @@ console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
           media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
           media_source_msg_id: ms0,
           originalText: input,
-          draftText: input
+          draftText: input,
+          subtotal: data0?.subtotal || null,
+          tax: data0?.tax || null,
+          total: data0?.total || null,
+          taxLabel: data0?.taxLabel || null
         }
       });
 
       return out(twimlEmpty(), true);
     }
 
+    // ✅ Otherwise send confirm card
     const summaryLine = buildExpenseSummaryLine({
       amount: data0.amount,
       item: data0.item,
@@ -7226,58 +7765,48 @@ console.info('[EXPENSE_PARSE_RESULT_NORMALIZED]', {
       date: data0.date,
       jobName,
       tz,
-      sourceText: input
+      sourceText: input,
+      subtotal: data0?.subtotal,
+      tax: data0?.tax,
+      total: data0?.total,
+      taxLabel: data0?.taxLabel
     });
 
-    console.info('[CONFIRM_SEND]', { userId: paUserId, token: 'send_confirm' });
-
-    // ✅ CIL draft upsert (initial confirm send)
+    let activeJob = null;
     try {
-      const confirmPA1 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
-      const draft1 = confirmPA1?.payload?.draft || null;
-      const srcId = String(confirmPA1?.payload?.sourceMsgId || '').trim() || null;
-
-      if (draft1) {
-        await upsertCilDraftForExpenseConfirm({
-          ownerId,
-          paUserId: paKey,
-          fromPhone,
-          draft: draft1,
-          sourceMsgId: srcId
-        });
+      if (typeof pg.getActiveJob === 'function') {
+        activeJob = await pg.getActiveJob(ownerId, paKey).catch(() => null);
       }
     } catch {}
-let activeJob = null;
-try {
-  if (typeof pg.getActiveJob === 'function') {
-    activeJob = await pg.getActiveJob(ownerId, paKey).catch(() => null);
-  }
-} catch {}
 
-return await sendConfirmExpenseOrFallback(
-  fromPhone,
-  `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`,
-  {
-    ownerId,
-    paUserId: paKey,
-    draft: {
-      ...data0,
-      jobName,
-      jobSource,
-      suggestedCategory: category,
-      job_id: null,
-      job_no: null,
-      media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
-      media_source_msg_id: ms0,
-      originalText: input,
-      draftText: input
-    },
-    activeJob,       // ✅ USE THE VARIABLE YOU FETCHED
-    varsPreview: null
+    return await sendConfirmExpenseOrFallback(
+      fromPhone,
+      `${summaryLine}${buildActiveJobHint(jobName, jobSource)}`,
+      {
+        ownerId,
+        paUserId: paKey,
+        draft: {
+          ...data0,
+          jobName,
+          jobSource,
+          suggestedCategory: category,
+          job_id: null,
+          job_no: null,
+          media_asset_id: resolvedFlowMediaAssetId || flowMediaAssetId || null,
+          media_source_msg_id: ms0,
+          originalText: input,
+          draftText: input,
+          subtotal: data0?.subtotal || null,
+          tax: data0?.tax || null,
+          total: data0?.total || null,
+          taxLabel: data0?.taxLabel || null
+        },
+        activeJob,
+        varsPreview: null
+      }
+    );
   }
-);
-  }
-} 
+}
 // ✅ closes: if (looksLikeReceiptText(input)) { ... } else { ... }
 /* ---- 4) Parsing (AI optional; deterministic fallback always available) ---- */
 

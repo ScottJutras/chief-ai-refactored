@@ -1839,118 +1839,16 @@ function extractReceiptTotal(text) {
   const BAD_CONTEXT =
     /\b(invoice|inv|order|auth|approval|reference|ref|customer|acct|account|terminal|trace|batch|pump|litre|liter|l\/|price\/l)\b/i;
 
-  const hasHyphenatedId = (s) => /\b\d{3,6}-\d{1,4}\b/.test(s);          // 1852-4
-  const hasLongDigitRun = (s) => /\b\d{8,}\b/.test(s);                   // barcode/account-ish
+  const hasHyphenatedId = (s) => /\b\d{3,6}-\d{1,4}\b/.test(s);
+  const hasLongDigitRun = (s) => /\b\d{8,}\b/.test(s);
 
-  // ✅ allow 1,234.56 or 1234.56
-  const money2dp = (s) => s.match(/(?:^|[^0-9])(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d{1,6}\.\d{2})(?:[^0-9]|$)/);
+  const money2dp = (s) =>
+    s.match(/(?:^|[^0-9])(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d{1,6}\.\d{2})(?:[^0-9]|$)/);
 
   const toNum = (x) => {
     const n = Number(String(x).replace(/,/g, ''));
     return Number.isFinite(n) ? n : null;
   };
-
-function extractReceiptTaxBreakdown(text) {
-  const raw = String(text || '');
-  if (!raw) {
-    return {
-      subtotal: null,
-      tax: null,
-      total: null,
-      taxLabel: null
-    };
-  }
-
-  const lines = raw
-    .split(/\r?\n/)
-    .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
-
-  const parseMoney = (line) => {
-    const m = String(line || '').match(
-      /(?:^|[^0-9])(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d{1,6}\.\d{2})(?:[^0-9]|$)/
-    );
-    if (!m?.[1]) return null;
-    const n = Number(String(m[1]).replace(/,/g, ''));
-    return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
-  };
-
-  let subtotal = null;
-  let tax = null;
-  let total = null;
-  let taxLabel = null;
-
-  for (const line of lines) {
-    const lc = line.toLowerCase();
-
-    if (subtotal == null && /\bsub\s*total\b|\bsubtotal\b/.test(lc)) {
-      const n = parseMoney(line);
-      if (n != null && n > 0) subtotal = n;
-    }
-
-    if (tax == null && /\b(hst|gst|pst|vat|tax)\b/.test(lc)) {
-      const n = parseMoney(line);
-      if (n != null && n >= 0) tax = n;
-
-      if (!taxLabel) {
-        if (/\bhst\b/i.test(line)) taxLabel = 'HST';
-        else if (/\bgst\b/i.test(line)) taxLabel = 'GST';
-        else if (/\bpst\b/i.test(line)) taxLabel = 'PST';
-        else if (/\bvat\b/i.test(line)) taxLabel = 'VAT';
-        else if (/\btax\b/i.test(line)) taxLabel = 'Tax';
-      }
-    }
-
-    if (total == null && /\b(grand\s*total|amount\s*due|total\s*due|total)\b/.test(lc)) {
-      const n = parseMoney(line);
-      if (n != null && n > 0) total = n;
-    }
-  }
-
-  if (total == null) {
-    total = extractReceiptTotal(raw);
-  }
-
-  if (subtotal == null && total != null && tax != null) {
-    const n = total - tax;
-    if (Number.isFinite(n) && n >= 0) subtotal = Number(n.toFixed(2));
-  }
-
-  if (tax == null && subtotal != null && total != null && total >= subtotal) {
-    const n = total - subtotal;
-    if (Number.isFinite(n) && n >= 0) {
-      tax = Number(n.toFixed(2));
-      if (!taxLabel) taxLabel = 'Tax';
-    }
-  }
-
-  return {
-    subtotal: subtotal != null ? Number(subtotal.toFixed(2)) : null,
-    tax: tax != null ? Number(tax.toFixed(2)) : null,
-    total: total != null ? Number(total.toFixed(2)) : null,
-    taxLabel: taxLabel || null
-  };
-}
-
-function formatMoneyDisplayMaybe(v) {
-  const n =
-    typeof v === 'number'
-      ? v
-      : Number(String(v || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
-
-  if (!Number.isFinite(n)) return null;
-  return formatMoneyDisplay(n);
-}
-  
-function formatMoneyMaybe(amountStrOrNum) {
-  const n =
-    typeof amountStrOrNum === 'number'
-      ? amountStrOrNum
-      : Number(String(amountStrOrNum || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
-
-  if (!Number.isFinite(n)) return null;
-  return formatMoneyDisplay(n); // uses Intl.NumberFormat → commas
-}
 
   const goodLine = (lc) => {
     if (BAD_LINE.test(lc)) return false;
@@ -2018,8 +1916,7 @@ function formatMoneyMaybe(amountStrOrNum) {
     if (Number.isFinite(n) && n > 0 && n < 100000) return Number(n.toFixed(2));
   }
 
-  // ✅ 4) Final fallback: PURCHASE / PAID / DEBIT / AMOUNT (when TOTAL isn't present)
-  // Choose the *largest plausible* money value from these lines, but still filtered.
+  // 4) Final fallback: PURCHASE / PAID / DEBIT / AMOUNT
   let best = null;
 
   for (const line of lines) {
@@ -2040,6 +1937,108 @@ function formatMoneyMaybe(amountStrOrNum) {
   if (best != null) return Number(best.toFixed(2));
 
   return null;
+}
+
+function extractReceiptTaxBreakdown(text) {
+  const raw = String(text || '');
+  if (!raw) {
+    return {
+      subtotal: null,
+      tax: null,
+      total: null,
+      taxLabel: null
+    };
+  }
+
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const parseMoney = (line) => {
+    const m = String(line || '').match(
+      /(?:^|[^0-9])(\d{1,3}(?:,\d{3})*(?:\.\d{2})|\d{1,6}\.\d{2})(?:[^0-9]|$)/
+    );
+    if (!m?.[1]) return null;
+    const n = Number(String(m[1]).replace(/,/g, ''));
+    return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
+  };
+
+  let subtotal = null;
+  let tax = null;
+  let total = null;
+  let taxLabel = null;
+
+  for (const line of lines) {
+    const lc = line.toLowerCase();
+
+    if (subtotal == null && (/\bsub\s*total\b/.test(lc) || /\bsubtotal\b/.test(lc))) {
+      const n = parseMoney(line);
+      if (n != null && n > 0) subtotal = n;
+    }
+
+    if (tax == null && /\b(hst|gst|pst|vat|tax)\b/.test(lc)) {
+      const n = parseMoney(line);
+      if (n != null && n >= 0) tax = n;
+
+      if (!taxLabel) {
+        if (/\bhst\b/i.test(line)) taxLabel = 'HST';
+        else if (/\bgst\b/i.test(line)) taxLabel = 'GST';
+        else if (/\bpst\b/i.test(line)) taxLabel = 'PST';
+        else if (/\bvat\b/i.test(line)) taxLabel = 'VAT';
+        else if (/\btax\b/i.test(line)) taxLabel = 'Tax';
+      }
+    }
+
+    if (total == null && /\b(grand\s*total|amount\s*due|total\s*due|total)\b/.test(lc)) {
+      const n = parseMoney(line);
+      if (n != null && n > 0) total = n;
+    }
+  }
+
+  if (total == null) {
+    total = extractReceiptTotal(raw);
+  }
+
+  if (subtotal == null && total != null && tax != null) {
+    const n = total - tax;
+    if (Number.isFinite(n) && n >= 0) subtotal = Number(n.toFixed(2));
+  }
+
+  if (tax == null && subtotal != null && total != null && total >= subtotal) {
+    const n = total - subtotal;
+    if (Number.isFinite(n) && n >= 0) {
+      tax = Number(n.toFixed(2));
+      if (!taxLabel) taxLabel = 'Tax';
+    }
+  }
+
+  return {
+    subtotal: subtotal != null ? Number(subtotal.toFixed(2)) : null,
+    tax: tax != null ? Number(tax.toFixed(2)) : null,
+    total: total != null ? Number(total.toFixed(2)) : null,
+    taxLabel: taxLabel || null
+  };
+}
+
+function formatMoneyDisplayMaybe(v) {
+  const n =
+    typeof v === 'number'
+      ? v
+      : Number(String(v || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
+
+  if (!Number.isFinite(n)) return null;
+  return formatMoneyDisplay(n);
+}
+
+function formatMoneyMaybe(amountStrOrNum) {
+  const n =
+    typeof amountStrOrNum === 'number'
+      ? amountStrOrNum
+      : Number(String(amountStrOrNum || '').replace(/[^0-9.,-]/g, '').replace(/,/g, ''));
+
+  if (!Number.isFinite(n)) return null;
+  return formatMoneyDisplay(n);
 }
 
 

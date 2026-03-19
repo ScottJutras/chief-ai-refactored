@@ -5273,8 +5273,10 @@ try {
   // ✅ NOTE: early pendingTxState edit machine is removed entirely.
   // CONFIRM PA is the only source of truth for edit flow.
 
+  // ✅ Preserve pre-normalization receipt text — keeps newlines for OCR line parsing
+  const rawReceiptTextForParsing = stripExpensePrefixes(rawInboundText);
   // Now it is safe to normalize the input for "new expense" parsing.
-  input = correctTradeTerms(stripExpensePrefixes(rawInboundText));
+  input = correctTradeTerms(rawReceiptTextForParsing);
 
   // ---- media linkage (function-scope) ----
   let flowMediaAssetId = null;
@@ -7575,6 +7577,7 @@ if (looksLikeReceiptText(input)) {
         draft0?.extractedText,
         draft0?.media_transcript,
         draft0?.mediaTranscript,
+        rawReceiptTextForParsing, // ✅ preserves newlines; preferred over flattened input
         input
       ]
         .map((x) => String(x || '').trim())
@@ -7615,11 +7618,6 @@ if (looksLikeReceiptText(input)) {
         : { subtotal: null, tax: null, total: null, taxLabel: null };
 
     // ✅ Safe item extraction at seed time
-    const _normalizedForLog = normalizeReceiptOcrForParsing(receiptText || '');
-    console.info('[RECEIPT_OCR_TEXT]', {
-      raw: String(receiptText || '').slice(0, 800),
-      normalized: _normalizedForLog.slice(0, 800)
-    });
     const seededItem =
       typeof extractReceiptPrimaryItem === 'function'
         ? extractReceiptPrimaryItem(receiptText)
@@ -7703,8 +7701,8 @@ if (looksLikeReceiptText(input)) {
         String(draft0?.taxLabel || '').trim() ||
         null,
 
-      receiptText,
-      ocrText: receiptText,
+      receiptText: rawReceiptTextForParsing || receiptText,
+      ocrText: rawReceiptTextForParsing || receiptText,
 
       // ✅ Only overwrite these when NOT awaiting_edit
       originalText: inEdit ? (draft0?.originalText || receiptText) : receiptText,

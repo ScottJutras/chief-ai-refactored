@@ -1937,6 +1937,12 @@ function extractReceiptPrimaryItem(text) {
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
+  console.info('[EXTRACT_ITEM_DEBUG]', {
+    normalizedHead: normalized.slice(0, 500),
+    lineCount: lines.length,
+    lines: lines.slice(0, 12),
+  });
+
   if (!lines.length) return null;
 
   const isBadLine = (line) => {
@@ -1993,6 +1999,7 @@ function extractReceiptPrimaryItem(text) {
   const inlineSkuProduct = normalized.match(
     /\b\d{8,14}\b\s+([A-Za-z][A-Za-z0-9'".\-\/ ]{4,80}?)(?=\s+\$?\d+\.\d{2}\b|\s+\b(subtotal|gst\/hst|gst|hst|pst|tax|total)\b|$)/i
   );
+  console.info('[EXTRACT_ITEM_M1]', { raw: inlineSkuProduct?.[1] || null, candidate: inlineSkuProduct?.[1] ? cleanCandidate(inlineSkuProduct[1]) : null });
   if (inlineSkuProduct?.[1]) {
     const candidate = cleanCandidate(inlineSkuProduct[1]);
     if (candidate) return candidate;
@@ -2026,22 +2033,26 @@ function extractReceiptPrimaryItem(text) {
 
       if (looksProductish(lines[j])) {
         const candidate = cleanCandidate(lines[j]);
+        console.info('[EXTRACT_ITEM_M2]', { skuLine: lines[i], nextLine: lines[j], candidate });
         if (candidate) return candidate;
       }
       break;
     }
   }
+  console.info('[EXTRACT_ITEM_M2_MISS]', { skuLines: lines.filter((l) => looksSkuish(l)) });
 
   // 3) Search item zone before totals/payment/footer
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|acct|auth|employee|you saved today|returns? and refunds?)\b/i.test(line)) {
+      console.info('[EXTRACT_ITEM_M3_BREAK]', { breakLine: line, i });
       break;
     }
     // Skip store headers, addresses, and phone numbers
     if (looksLikeStoreOrAddress(line)) continue;
     if (looksProductish(line)) {
       const candidate = cleanCandidate(line);
+      console.info('[EXTRACT_ITEM_M3]', { line, candidate });
       if (candidate) return candidate;
     }
   }

@@ -2007,6 +2007,17 @@ function extractReceiptPrimaryItem(text) {
     return true;
   };
 
+  // 0) Hardware/building-supply receipt: barcode + price + 1-3 short unit/tax codes + product
+  //    Works on raw flat OCR — e.g. "773615003161 77.89 RL B MEMBRANE WEATHERTEX 3X65' 1 RL 77.89"
+  const m0 = String(text || '').match(
+    /\b\d{8,14}\b\s+\d[\d.,]*(?:\s+[A-Z]{1,3}){1,3}\s+([A-Z][A-Za-z0-9'".\-\/ ]{3,60}?)(?=\s+\d+\s+[A-Z]{1,3}\b|\s+\d+\.\d{2}\b|\s*$)/
+  );
+  console.info('[EXTRACT_ITEM_M0]', { raw: m0?.[1] || null });
+  if (m0?.[1]) {
+    const candidate = cleanCandidate(m0[1].trim());
+    if (candidate) return candidate;
+  }
+
   // 1) Best case: inline SKU followed directly by product text (flattened OCR)
   const inlineSkuProduct = normalized.match(
     /\b\d{8,14}\b\s+([A-Za-z][A-Za-z0-9'".\-\/ ]{4,80}?)(?=\s+\$?\d+\.\d{2}\b|\s+\b(subtotal|gst\/hst|gst|hst|pst|tax|total)\b|$)/i

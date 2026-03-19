@@ -1072,6 +1072,14 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
       ''
   ).trim();
 
+  console.info('[EXPENSE_REPARSE_SOURCE]', {
+    paKey,
+    sourceTextLen: sourceText.length,
+    sourceTextHead: sourceText.slice(0, 300),
+    hasReceiptText: !!draft?.receiptText,
+    hasOcrText: !!draft?.ocrText,
+  });
+
   if (!sourceText) {
     console.warn('[EXPENSE_REPARSE] no sourceText; leaving needsReparse=true', { paKey });
     return confirmPA;
@@ -1929,8 +1937,12 @@ function isStalePickerTap(pickPA, inbound) {
 }
 
 function extractReceiptPrimaryItem(text) {
+  console.info('[EXTRACT_ITEM_CALLED]', { textLen: String(text || '').length, textHead: String(text || '').slice(0, 100) });
   const normalized = normalizeReceiptOcrForParsing(text);
-  if (!normalized) return null;
+  if (!normalized) {
+    console.info('[EXTRACT_ITEM_NO_NORMALIZED]');
+    return null;
+  }
 
   const lines = normalized
     .split(/\n+/)

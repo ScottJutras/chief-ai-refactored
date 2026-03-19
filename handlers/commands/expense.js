@@ -4844,7 +4844,10 @@ async function insertExpenseBestEffort(pgSvc, p) {
       source_msg_id: p.source_msg_id,
       tenant_id: p.tenant_id,
       original_text: p.original_text,
-      draft_text: p.draft_text
+      draft_text: p.draft_text,
+      subtotal_amount: p.subtotal_amount,
+      tax_amount: p.tax_amount,
+      tax_label: p.tax_label
     });
   }
 
@@ -7331,7 +7334,11 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
   media_source_msg_id: data.media_source_msg_id || null,
 
   original_text: draftForSubmit?.originalText || sourceText || null,
-  draft_text: draftForSubmit?.draftText || sourceText || null
+  draft_text: draftForSubmit?.draftText || sourceText || null,
+
+  subtotal_amount: draftForSubmit?.subtotal || data?.subtotal || null,
+  tax_amount: draftForSubmit?.tax || data?.tax || null,
+  tax_label: draftForSubmit?.taxLabel || data?.taxLabel || null
 };
 
     // --- INSERT ---

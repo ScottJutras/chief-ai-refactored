@@ -744,6 +744,9 @@ let TX_HAS_USER_NAME = null;
 let TX_HAS_MEDIA_META = null; // jsonb single-field meta (if you have it)
 let TX_HAS_CREATED_AT = null;
 let TX_HAS_UPDATED_AT = null;
+let TX_HAS_SUBTOTAL_AMOUNT = null;
+let TX_HAS_TAX_AMOUNT = null;
+let TX_HAS_TAX_LABEL = null;
 
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
@@ -767,7 +770,10 @@ async function detectTransactionsCapabilities() {
     TX_HAS_CREATED_AT !== null &&
     TX_HAS_UPDATED_AT !== null &&
     TX_HAS_MEDIA_ASSET_ID !== null &&
-    TX_HAS_TENANT_ID !== null
+    TX_HAS_TENANT_ID !== null &&
+    TX_HAS_SUBTOTAL_AMOUNT !== null &&
+    TX_HAS_TAX_AMOUNT !== null &&
+    TX_HAS_TAX_LABEL !== null
   ) {
     return {
       TX_HAS_SOURCE_MSG_ID,
@@ -787,7 +793,10 @@ async function detectTransactionsCapabilities() {
       TX_HAS_CREATED_AT,
       TX_HAS_UPDATED_AT,
       TX_HAS_MEDIA_ASSET_ID,
-      TX_HAS_TENANT_ID
+      TX_HAS_TENANT_ID,
+      TX_HAS_SUBTOTAL_AMOUNT,
+      TX_HAS_TAX_AMOUNT,
+      TX_HAS_TAX_LABEL
     };
   }
 
@@ -822,6 +831,9 @@ async function detectTransactionsCapabilities() {
     TX_HAS_MEDIA_META = names.has('media_meta');
     TX_HAS_CREATED_AT = names.has('created_at');
     TX_HAS_UPDATED_AT = names.has('updated_at');
+    TX_HAS_SUBTOTAL_AMOUNT = names.has('subtotal_amount');
+    TX_HAS_TAX_AMOUNT = names.has('tax_amount');
+    TX_HAS_TAX_LABEL = names.has('tax_label');
   } catch (e) {
     console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
     // Don't cache transient errors — allow retry on next call
@@ -843,7 +855,10 @@ async function detectTransactionsCapabilities() {
       TX_HAS_CREATED_AT: false,
       TX_HAS_UPDATED_AT: false,
       TX_HAS_MEDIA_ASSET_ID: false,
-      TX_HAS_TENANT_ID: false
+      TX_HAS_TENANT_ID: false,
+      TX_HAS_SUBTOTAL_AMOUNT: false,
+      TX_HAS_TAX_AMOUNT: false,
+      TX_HAS_TAX_LABEL: false
     };
   }
 
@@ -865,7 +880,10 @@ async function detectTransactionsCapabilities() {
     TX_HAS_CREATED_AT,
     TX_HAS_UPDATED_AT,
     TX_HAS_MEDIA_ASSET_ID,
-    TX_HAS_TENANT_ID
+    TX_HAS_TENANT_ID,
+    TX_HAS_SUBTOTAL_AMOUNT,
+    TX_HAS_TAX_AMOUNT,
+    TX_HAS_TAX_LABEL
   };
 }
 
@@ -1844,6 +1862,19 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
   if (caps.TX_HAS_UPDATED_AT) {
     cols.push('updated_at');
     vals.push(new Date());
+  }
+
+  if (caps.TX_HAS_SUBTOTAL_AMOUNT && opts.subtotal_amount != null) {
+    const v = Number(opts.subtotal_amount);
+    if (Number.isFinite(v)) { cols.push('subtotal_amount'); vals.push(v); }
+  }
+  if (caps.TX_HAS_TAX_AMOUNT && opts.tax_amount != null) {
+    const v = Number(opts.tax_amount);
+    if (Number.isFinite(v)) { cols.push('tax_amount'); vals.push(v); }
+  }
+  if (caps.TX_HAS_TAX_LABEL && opts.tax_label != null) {
+    const v = String(opts.tax_label).trim();
+    if (v) { cols.push('tax_label'); vals.push(v); }
   }
 
   const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');

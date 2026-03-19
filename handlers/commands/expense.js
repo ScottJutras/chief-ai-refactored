@@ -1966,6 +1966,8 @@ function extractReceiptPrimaryItem(text) {
       .replace(/\btotal\b.*$/i, '')
       // ✅ Strip trailing inline price+tax (e.g. "MEMBRANE WEATHERTEX 3X65 68.01 N 1")
       .replace(/\s+\d+\.\d{2}\s*[A-Z]?.*$/, '')
+      // ✅ Strip trailing qty+unit code (e.g. "MEMBRANE WEATHERTEX 3X65 1 RL")
+      .replace(/\s+\d+(?:\s+[A-Z]{1,3})+\s*$/, '')
       .replace(/\s+/g, ' ')
       .trim();
 
@@ -2612,10 +2614,11 @@ function normalizeReceiptOcrForParsing(text) {
     .replace(/\b(debit card|debit|visa|mastercard|amex)\b/ig, '\n$1 ')
     .replace(/\b(auth#?|acct|account|employee|you saved today|exchange or refund|returns? and refunds?|store details)\b/ig, '\n$1 ')
     .replace(/(\b\d{8,14}\b)\s+([A-Za-z])/g, '$1\n$2')
-    // ✅ 6-7 digit product codes (common in hardware/home-improvement receipts) followed by 3+ uppercase
+    // ✅ 6-7 digit product codes + 3+ uppercase (hardware receipt short SKUs)
     .replace(/(\b\d{6,7}\b)\s+([A-Z]{3,})/g, '$1\n$2')
-    // ✅ Inline price + tax-category letter then next word (separates item from totals)
-    .replace(/(\b\d{1,6}\.\d{2}\s+[NEYT]\s+\d*)\s+([A-Z][a-z]|\bSubtotal\b|\bTotal\b)/gi, '$1\n$2')
+    // ✅ Barcode + price + short unit/tax codes → split before product description
+    // e.g. "773615003161 77.89 RL B MEMBRANE" → "773615003161 77.89 RL B\nMEMBRANE"
+    .replace(/(\b\d{8,14}\b(?:\s+[\d.,]+)+(?:\s+[A-Z]{1,3}){1,3}\s+)([A-Z]{4,})/g, '$1\n$2')
     .replace(/(\$\s*\d+\.\d{2})\s+([A-Za-z]{3,})/g, '$1\n$2');
 
   return s;

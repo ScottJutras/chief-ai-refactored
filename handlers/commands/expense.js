@@ -870,18 +870,26 @@ function parseExpenseEditOverwrite(text) {
   let total = null;
 
   // ---------------------------------------------------------
-  // item — extract from "💸 $AMOUNT — ITEM 🏪 STORE" pattern
+  // item — extract from "— ITEM 🏪" (emoji) or "— ITEM at/on/job" (plain)
   // The emoji line may not be the first line (e.g. "Expense\n💸 ...")
-  // so scan all raw lines for the — ITEM 🏪 delimiter pattern.
+  // so scan all raw lines.
   // ---------------------------------------------------------
   for (const rawLine of rawLines) {
-    const itemMatch = rawLine.match(/—\s*(.+?)\s*🏪/u);
-    if (itemMatch?.[1]) {
-      const candidate = itemMatch[1].trim();
-      if (candidate && !/^unknown$/i.test(candidate)) {
-        item = candidate;
-      }
+    // Emoji-delimited: "— ITEM 🏪"
+    const emojiMatch = rawLine.match(/—\s*(.+?)\s*🏪/u);
+    if (emojiMatch?.[1]) {
+      const candidate = emojiMatch[1].trim();
+      if (candidate && !/^unknown$/i.test(candidate)) item = candidate;
       break;
+    }
+    // Plain-text: "— ITEM at/on/job" (no emojis)
+    const plainMatch = rawLine.match(/—\s*(.+?)\s+(?:at|on|job)\b/i);
+    if (plainMatch?.[1]) {
+      const candidate = plainMatch[1].trim();
+      if (candidate && !/^unknown$/i.test(candidate) && !/^\$/.test(candidate)) {
+        item = candidate;
+        break;
+      }
     }
   }
 
@@ -961,7 +969,7 @@ function parseExpenseEditOverwrite(text) {
   }
 
   // ---------------------------------------------------------
-  // store/vendor
+  // store/vendor — explicit label or "at VENDOR on/for" inline pattern
   // ---------------------------------------------------------
   for (const line of cleanedLines) {
     const m = line.match(/^\s*(?:from|at|store|vendor|merchant)\b\s*[:\-]?\s*(.+)$/i);
@@ -976,6 +984,20 @@ function parseExpenseEditOverwrite(text) {
     }
   }
 
+  // Inline "at VENDOR on/for/job" pattern (plain-text no-emoji edits)
+  if (!store) {
+    for (const rawLine of rawLines) {
+      const m = rawLine.match(/\bat\s+(.+?)\s+(?:on|for|job)\b/i);
+      if (m?.[1]) {
+        const candidate = m[1].trim();
+        if (candidate && !/^\$/.test(candidate)) {
+          store = candidate;
+          break;
+        }
+      }
+    }
+  }
+
   // ---------------------------------------------------------
   // fallback store/vendor
   // only allow short vendor-like lines
@@ -984,9 +1006,10 @@ function parseExpenseEditOverwrite(text) {
     for (const line of cleanedLines) {
       if (
         !/^\$/.test(line) &&
+        !/\$/.test(line) &&
         !/^job\b/i.test(line) &&
         !/^on\b/i.test(line) &&
-        !/^(subtotal|tax|total)\b/i.test(line) &&
+        !/^(subtotal|tax|hst|gst|pst|total)\b/i.test(line) &&
         !/^(expense|revenue|edit|confirm|unknown)\b/i.test(line) &&
         line.split(/\s+/).length <= 4 &&
         /[A-Za-z]/.test(line)

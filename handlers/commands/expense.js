@@ -7615,6 +7615,11 @@ if (looksLikeReceiptText(input)) {
         : { subtotal: null, tax: null, total: null, taxLabel: null };
 
     // ✅ Safe item extraction at seed time
+    const _normalizedForLog = normalizeReceiptOcrForParsing(receiptText || '');
+    console.info('[RECEIPT_OCR_TEXT]', {
+      raw: String(receiptText || '').slice(0, 800),
+      normalized: _normalizedForLog.slice(0, 800)
+    });
     const seededItem =
       typeof extractReceiptPrimaryItem === 'function'
         ? extractReceiptPrimaryItem(receiptText)

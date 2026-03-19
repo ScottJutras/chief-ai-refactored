@@ -84,7 +84,7 @@ router.get("/api/receipts/:transactionId", async (req, res) => {
       if (res.headersSent) return;
     } else {
       await new Promise((resolve, reject) =>
-        requirePortalUser(req, res, (err) => (err ? reject(err) : resolve()))
+        requirePortalUser()(req, res, (err) => (err ? reject(err) : resolve()))
       );
       if (res.headersSent) return;
     }

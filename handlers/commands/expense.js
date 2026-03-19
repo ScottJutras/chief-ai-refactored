@@ -1946,7 +1946,7 @@ function extractReceiptPrimaryItem(text) {
     return (
       /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund|returns? and refunds?|mission exteriors)\b/i.test(s) ||
       /^(item|qty|price|total)$/i.test(s) ||
-      /^(rona inc\.?|rona\+?\s+n\.?w\.?\s+london)$/i.test(s) ||
+      /^(rona inc\.?|rona\+?\s+n\.?w\.?\s+london)(\s+\d+)?$/i.test(s) ||
       // customer/account number lines: short numeric ID followed by an all-caps name
       /^\d{6,12}\s+[A-Z][A-Z\s]{3,}$/.test(s)
     );
@@ -2034,6 +2034,8 @@ function extractReceiptPrimaryItem(text) {
     if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|acct|auth|employee|you saved today|returns? and refunds?)\b/i.test(line)) {
       break;
     }
+    // Skip store headers, addresses, and phone numbers
+    if (looksLikeStoreOrAddress(line)) continue;
     if (looksProductish(line)) {
       const candidate = cleanCandidate(line);
       if (candidate) return candidate;

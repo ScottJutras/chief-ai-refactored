@@ -1072,14 +1072,6 @@ async function maybeReparseConfirmDraftExpense({ ownerId, paUserId, tz, userProf
       ''
   ).trim();
 
-  console.info('[EXPENSE_REPARSE_SOURCE]', {
-    paKey,
-    sourceTextLen: sourceText.length,
-    sourceTextHead: sourceText.slice(0, 300),
-    hasReceiptText: !!draft?.receiptText,
-    hasOcrText: !!draft?.ocrText,
-  });
-
   if (!sourceText) {
     console.warn('[EXPENSE_REPARSE] no sourceText; leaving needsReparse=true', { paKey });
     return confirmPA;
@@ -1937,23 +1929,13 @@ function isStalePickerTap(pickPA, inbound) {
 }
 
 function extractReceiptPrimaryItem(text) {
-  console.info('[EXTRACT_ITEM_CALLED]', { textLen: String(text || '').length, textHead: String(text || '').slice(0, 100) });
   const normalized = normalizeReceiptOcrForParsing(text);
-  if (!normalized) {
-    console.info('[EXTRACT_ITEM_NO_NORMALIZED]');
-    return null;
-  }
+  if (!normalized) return null;
 
   const lines = normalized
     .split(/\n+/)
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
-
-  console.info('[EXTRACT_ITEM_DEBUG]', {
-    normalizedHead: normalized.slice(0, 500),
-    lineCount: lines.length,
-    lines: lines.slice(0, 12),
-  });
 
   if (!lines.length) return null;
 
@@ -2012,7 +1994,6 @@ function extractReceiptPrimaryItem(text) {
   const m0 = String(text || '').match(
     /\b\d{8,14}\b\s+\d[\d.,]*(?:\s+[A-Z]{1,3}){1,3}\s+([A-Z][A-Za-z0-9'".\-\/ ]{3,60}?)(?=\s+\d+\s+[A-Z]{1,3}\b|\s+\d+\.\d{2}\b|\s*$)/
   );
-  console.info('[EXTRACT_ITEM_M0]', { raw: m0?.[1] || null });
   if (m0?.[1]) {
     const candidate = cleanCandidate(m0[1].trim());
     if (candidate) return candidate;
@@ -2022,7 +2003,6 @@ function extractReceiptPrimaryItem(text) {
   const inlineSkuProduct = normalized.match(
     /\b\d{8,14}\b\s+([A-Za-z][A-Za-z0-9'".\-\/ ]{4,80}?)(?=\s+\$?\d+\.\d{2}\b|\s+\b(subtotal|gst\/hst|gst|hst|pst|tax|total)\b|$)/i
   );
-  console.info('[EXTRACT_ITEM_M1]', { raw: inlineSkuProduct?.[1] || null, candidate: inlineSkuProduct?.[1] ? cleanCandidate(inlineSkuProduct[1]) : null });
   if (inlineSkuProduct?.[1]) {
     const candidate = cleanCandidate(inlineSkuProduct[1]);
     if (candidate) return candidate;
@@ -2056,26 +2036,21 @@ function extractReceiptPrimaryItem(text) {
 
       if (looksProductish(lines[j])) {
         const candidate = cleanCandidate(lines[j]);
-        console.info('[EXTRACT_ITEM_M2]', { skuLine: lines[i], nextLine: lines[j], candidate });
         if (candidate) return candidate;
       }
       break;
     }
   }
-  console.info('[EXTRACT_ITEM_M2_MISS]', { skuLines: lines.filter((l) => looksSkuish(l)) });
-
   // 3) Search item zone before totals/payment/footer
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|acct|auth|employee|you saved today|returns? and refunds?)\b/i.test(line)) {
-      console.info('[EXTRACT_ITEM_M3_BREAK]', { breakLine: line, i });
       break;
     }
     // Skip store headers, addresses, and phone numbers
     if (looksLikeStoreOrAddress(line)) continue;
     if (looksProductish(line)) {
       const candidate = cleanCandidate(line);
-      console.info('[EXTRACT_ITEM_M3]', { line, candidate });
       if (candidate) return candidate;
     }
   }
@@ -7821,8 +7796,7 @@ if (looksLikeReceiptText(input)) {
       taxLabel: mergedDraft.taxLabel || null,
       currency: mergedDraft.currency || null,
       needsReparse: !(gotAmount && gotDate),
-      media_asset_id: mergedDraft.media_asset_id || null,
-      receiptHead: String(receiptText || '').slice(0, 200)
+      media_asset_id: mergedDraft.media_asset_id || null
     });
   } catch (e) {
     console.warn('[RECEIPT_SEED_CONFIRM_PA] failed (ignored):', e?.message);

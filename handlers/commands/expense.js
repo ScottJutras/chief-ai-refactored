@@ -1944,9 +1944,13 @@ function extractReceiptPrimaryItem(text) {
     if (!s) return true;
 
     return (
-      /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund|returns? and refunds?|mission exteriors)\b/i.test(s) ||
+      /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit|visa|mastercard|amex|auth|acct|account|employee|refund|return|exchange|career|rona\.ca|www\.|http|store details|saved today|debit card|acct type|auth#|default|you saved today|interested in a career|exchange or refund|returns? and refunds?|mission exteriors|paypoi|paypoint|interac|transaction record|wonderland|ontario|london)\b/i.test(s) ||
       /^(item|qty|price|total)$/i.test(s) ||
       /^(rona inc\.?|rona\+?\s+n\.?w\.?\s+london)(\s+\d+)?$/i.test(s) ||
+      // payment terminal ID + masked card: "PC163473: ***132801"
+      /^PC\d{4,}:\s*\*+\d+/.test(s) ||
+      // FHST receipt number line: "FHST #: 871917936"
+      /^[FP]HST\s*#/.test(s) ||
       // customer/account number lines: short numeric ID followed by an all-caps name
       /^\d{6,12}\s+[A-Z][A-Z\s]{3,}$/.test(s)
     );
@@ -1983,11 +1987,24 @@ function extractReceiptPrimaryItem(text) {
     const s = cleanCandidate(line);
     if (!s) return false;
     if (/\b(membrane|weathert|shingle|nail|screw|flashing|insulation|lumber|plywood|osb|caulk|adhesive|board|sheet|roll)\b/i.test(s)) return true;
+    if (/\b(regular|premium|diesel|unleaded|super|midgrade|fuel|gasoline|e85)\b/i.test(s)) return true;
     if (/\d+\s*[xX]\s*\d+/.test(s)) return true;
     if (/\d/.test(s) && /[A-Za-z]/.test(s)) return true;
     if (/[A-Z]{3,}/.test(s)) return true;
     return true;
   };
+
+  // 0a) Fuel station receipt: look for fuel grade, fall back to "Fuel"
+  if (/\b(petro-canada|petro canada|shell|esso|mobil|pioneer|ultramar|irving|husky|sunoco)\b/i.test(String(text || ''))) {
+    const fuelGradeMatch = String(text || '').match(
+      /\b(regular\s+unleaded|premium\s+unleaded|regular|premium|super|midgrade|diesel|unleaded|e85)\b/i
+    );
+    if (fuelGradeMatch?.[1]) {
+      const grade = fuelGradeMatch[1].trim();
+      return grade.charAt(0).toUpperCase() + grade.slice(1).toLowerCase();
+    }
+    return 'Fuel';
+  }
 
   // 0) Hardware/building-supply receipt: barcode + price + 1-3 short unit/tax codes + product
   //    Works on raw flat OCR — e.g. "773615003161 77.89 RL B MEMBRANE WEATHERTEX 3X65' 1 RL 77.89"
@@ -2013,7 +2030,7 @@ function extractReceiptPrimaryItem(text) {
   const looksLikeStoreOrAddress = (line) => {
     const s = String(line || '').trim();
     return (
-      /\b(rona|home depot|lowes|canadian tire|costco|walmart|superstore|dollarama|mission exteriors)\b/i.test(s) ||
+      /\b(rona|home depot|lowes|canadian tire|costco|walmart|superstore|dollarama|mission exteriors|petro-canada|petro canada|shell|esso|mobil|pioneer|ultramar|irving|husky|sunoco)\b/i.test(s) ||
       /\b(n\.?w\.?|n\.?e\.?|s\.?w\.?|s\.?e\.?)\b/i.test(s) ||
       /\b\d{3,5}\s+[A-Za-z]/.test(s) ||
       /\(\d{3}\)\s*\d{3}-\d{4}/.test(s) ||
@@ -2557,6 +2574,7 @@ function extractReceiptTaxBreakdown(text) {
       if (n != null) subtotal = n;
     }
 
+    // Standard tax labels: GST/HST, GST, HST, PST, TAX
     if (tax == null) {
       const m = line.match(/\b(gst\/hst|gst|hst|pst|tax)\b/i);
       if (m?.[1]) {
@@ -2565,6 +2583,16 @@ function extractReceiptTaxBreakdown(text) {
           tax = n;
           taxLabel = String(m[1]).toUpperCase();
         }
+      }
+    }
+
+    // Petro-Canada style: "FHST INCLUDE $1.08" / "PHST INCLUDE $1.73"
+    // FHST = Federal HST, PHST = Provincial HST — sum both into a single tax value
+    if (/\b(f|p)hst\s+include/i.test(line)) {
+      const n = parseSafeMoney(line);
+      if (n != null) {
+        tax = tax != null ? Number((tax + n).toFixed(2)) : n;
+        taxLabel = taxLabel || 'HST';
       }
     }
 
@@ -2598,6 +2626,11 @@ function extractReceiptTaxBreakdown(text) {
     total = Number((subtotal + tax).toFixed(2));
   }
 
+  // Derive subtotal from total - tax if subtotal not on receipt (e.g. fuel receipts)
+  if (subtotal == null && total != null && tax != null) {
+    subtotal = Number((total - tax).toFixed(2));
+  }
+
   return {
     subtotal: subtotal != null ? subtotal.toFixed(2) : null,
     tax: tax != null ? tax.toFixed(2) : null,
@@ -2619,6 +2652,7 @@ function normalizeReceiptOcrForParsing(text) {
   s = s
     .replace(/\b(subtotal)\b/ig, '\n$1 ')
     .replace(/\b(gst\/hst|gst|hst|pst|tax)\b/ig, '\n$1 ')
+    .replace(/\b([fp]hst\s+include)\b/ig, '\n$1 ')
     .replace(/\b(total|amount due|balance due)\b/ig, '\n$1 ')
     .replace(/\b(debit card|debit|visa|mastercard|amex)\b/ig, '\n$1 ')
     .replace(/\b(auth#?|acct|account|employee|you saved today|exchange or refund|returns? and refunds?|store details)\b/ig, '\n$1 ')

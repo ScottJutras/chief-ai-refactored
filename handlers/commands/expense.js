@@ -870,14 +870,18 @@ function parseExpenseEditOverwrite(text) {
   let total = null;
 
   // ---------------------------------------------------------
-  // item — extract from "💸 $AMOUNT — ITEM 🏪 STORE" first line
+  // item — extract from "💸 $AMOUNT — ITEM 🏪 STORE" pattern
+  // The emoji line may not be the first line (e.g. "Expense\n💸 ...")
+  // so scan all raw lines for the — ITEM 🏪 delimiter pattern.
   // ---------------------------------------------------------
-  const firstRawLine = rawLines[0] || '';
-  const itemMatch = firstRawLine.match(/—\s*(.+?)\s*🏪/u);
-  if (itemMatch?.[1]) {
-    const candidate = itemMatch[1].trim();
-    if (candidate && !/^unknown$/i.test(candidate)) {
-      item = candidate;
+  for (const rawLine of rawLines) {
+    const itemMatch = rawLine.match(/—\s*(.+?)\s*🏪/u);
+    if (itemMatch?.[1]) {
+      const candidate = itemMatch[1].trim();
+      if (candidate && !/^unknown$/i.test(candidate)) {
+        item = candidate;
+      }
+      break;
     }
   }
 
@@ -5212,6 +5216,7 @@ const patchedDraft = {
 console.info('[EXPENSE_EDIT_OVERWRITE_RESULT_EARLY]', {
   paUserId,
   amount: patchedDraft.amount || null,
+  item: patchedDraft.item || null,
   store: patchedDraft.store || null,
   date: patchedDraft.date || null,
   jobName: patchedDraft.jobName || null,

@@ -1964,6 +1964,8 @@ function extractReceiptPrimaryItem(text) {
       .replace(/\bprice\b.*$/i, '')
       .replace(/\bsubtotal\b.*$/i, '')
       .replace(/\btotal\b.*$/i, '')
+      // ✅ Strip trailing inline price+tax (e.g. "MEMBRANE WEATHERTEX 3X65 68.01 N 1")
+      .replace(/\s+\d+\.\d{2}\s*[A-Z]?.*$/, '')
       .replace(/\s+/g, ' ')
       .trim();
 
@@ -2610,6 +2612,10 @@ function normalizeReceiptOcrForParsing(text) {
     .replace(/\b(debit card|debit|visa|mastercard|amex)\b/ig, '\n$1 ')
     .replace(/\b(auth#?|acct|account|employee|you saved today|exchange or refund|returns? and refunds?|store details)\b/ig, '\n$1 ')
     .replace(/(\b\d{8,14}\b)\s+([A-Za-z])/g, '$1\n$2')
+    // ✅ 6-7 digit product codes (common in hardware/home-improvement receipts) followed by 3+ uppercase
+    .replace(/(\b\d{6,7}\b)\s+([A-Z]{3,})/g, '$1\n$2')
+    // ✅ Inline price + tax-category letter then next word (separates item from totals)
+    .replace(/(\b\d{1,6}\.\d{2}\s+[NEYT]\s+\d*)\s+([A-Z][a-z]|\bSubtotal\b|\bTotal\b)/gi, '$1\n$2')
     .replace(/(\$\s*\d+\.\d{2})\s+([A-Za-z]{3,})/g, '$1\n$2');
 
   return s;
@@ -7778,7 +7784,8 @@ if (looksLikeReceiptText(input)) {
       taxLabel: mergedDraft.taxLabel || null,
       currency: mergedDraft.currency || null,
       needsReparse: !(gotAmount && gotDate),
-      media_asset_id: mergedDraft.media_asset_id || null
+      media_asset_id: mergedDraft.media_asset_id || null,
+      receiptHead: String(receiptText || '').slice(0, 200)
     });
   } catch (e) {
     console.warn('[RECEIPT_SEED_CONFIRM_PA] failed (ignored):', e?.message);

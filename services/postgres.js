@@ -1752,8 +1752,11 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
             : null;
 
   const shouldDedupeByContent = kind === 'expense' || kind === 'revenue';
+  // Per-item inserts (source_msg_id ends with :i<N>) use source_msg_id for idempotency;
+  // skip content-based dedupe_hash so soft-deleted rows don't block genuine re-submissions.
+  const isPerItemInsert = typeof sourceMsgId === 'string' && /:i\d+$/.test(sourceMsgId);
   const dedupeHash =
-    shouldDedupeByContent && typeof buildTxnDedupeHash === 'function'
+    shouldDedupeByContent && !isPerItemInsert && typeof buildTxnDedupeHash === 'function'
       ? buildTxnDedupeHash({ owner, kind, date, amountCents, source, description, jobNo, jobName })
       : null;
 

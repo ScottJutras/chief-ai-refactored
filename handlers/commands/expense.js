@@ -7653,6 +7653,7 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
   if (lineItemsToInsert) {
     // Insert one transaction row per approved line item with proportional tax
     const insertedIds = [];
+    let insertedNewCount = 0;
     for (let itemIdx = 0; itemIdx < lineItemsToInsert.length; itemIdx++) {
       const lineItem = lineItemsToInsert[itemIdx];
       const itemAmountCents = Math.round(Number(lineItem.price || 0) * 100);
@@ -7687,13 +7688,15 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
         throw e;
       });
       insertedIds.push(itemInserted?.id ?? itemInserted?.tx_id ?? itemInserted?.transaction_id ?? itemInserted?.row?.id ?? null);
+      if (itemInserted?.inserted) insertedNewCount++;
     }
-    ins = { id: insertedIds[0], inserted: insertedIds.length > 0 };
+    ins = { id: insertedIds[0], inserted: insertedNewCount > 0 };
     console.info('[EXPENSE_INSERT_OK]', {
       paUserId,
       txSourceMsgId: txSourceMsgId || null,
       media_asset_id: data.media_asset_id || null,
       inserted: ins.inserted,
+      insertedNewCount,
       id: ins.id,
       itemCount: insertedIds.length,
       allIds: insertedIds

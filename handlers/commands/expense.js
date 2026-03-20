@@ -2705,10 +2705,12 @@ function extractReceiptTaxBreakdown(text) {
     }
 
     // Standard tax labels: GST/HST, GST, HST, PST, TAX
+    // Strip tax registration numbers (e.g. "HST#784752966") before matching
     if (tax == null) {
-      const m = line.match(/\b(gst\/hst|gst|hst|pst|tax)\b/i);
+      const lineNoTaxReg = line.replace(/\b(hst|gst)#\d+\b/ig, '');
+      const m = lineNoTaxReg.match(/\b(gst\/hst|gst|hst|pst|tax)\b/i);
       if (m?.[1]) {
-        const n = parseSafeMoney(line);
+        const n = parseSafeMoney(lineNoTaxReg);
         if (n != null) {
           tax = n;
           taxLabel = String(m[1]).toUpperCase();
@@ -2726,7 +2728,8 @@ function extractReceiptTaxBreakdown(text) {
       }
     }
 
-    if (total == null && /\b(total|amount due|balance due)\b/i.test(line)) {
+    // Use last-match for total so the grand total wins over sub-total annotations
+    if (/\b(total|amount due|balance due)\b/i.test(line)) {
       const n = parseSafeMoney(line);
       if (n != null) total = n;
     }
@@ -2780,6 +2783,8 @@ function normalizeReceiptOcrForParsing(text) {
     .trim();
 
   s = s
+    // Normalize "Sub.Total" (Chick-fil-A style) to "Subtotal" before keyword splits
+    .replace(/\bSub\.Total\b/gi, 'Subtotal')
     .replace(/\b(subtotal)\b/ig, '\n$1 ')
     .replace(/\b(gst\/hst|gst|hst|pst|tax)\b(?!\s*#\d)/ig, '\n$1 ')
     .replace(/\b([fp]hst\s+include)\b/ig, '\n$1 ')
@@ -2795,7 +2800,11 @@ function normalizeReceiptOcrForParsing(text) {
     .replace(/(\$\s*\d+\.\d{2})\s+([A-Za-z]{3,})/g, '$1\n$2')
     // ✅ RONA/hardware item-row boundary: "qty unit_price 2-char-unit 1-char-taxcode"
     // e.g. "PREMIUM 28.02H 1 28.02 EA B 6626..." → "PREMIUM 28.02H\n1 28.02 EA B 6626..."
-    .replace(/(\S)\s+(?=[1-9]\d{0,2}\s+\d+\.\d{2}\s+[A-Z]{2}\s+[A-Z]\b)/g, '$1\n');
+    .replace(/(\S)\s+(?=[1-9]\d{0,2}\s+\d+\.\d{2}\s+[A-Z]{2}\s+[A-Z]\b)/g, '$1\n')
+    // ✅ Restaurant receipt item-row boundary: split before "N Word3+" (qty + item name ≥3 chars)
+    // e.g. "13.79 Fries MD 1 CobSld" → "13.79 Fries MD\n1 CobSld"
+    // Requires word ≥3 chars to avoid splitting on add-on tokens like "5 Ct"
+    .replace(/(\S)\s+([1-9]\d?\s+[A-Za-z]{3}[A-Za-z]*)/g, '$1\n$2');
 
   return s;
 }
@@ -2914,7 +2923,7 @@ function extractReceiptStore(text) {
   if (/\bRONA\b/i.test(t)) return 'Rona';
   if (/\bLOWE'?S\b/i.test(t)) return "Lowe's";
 
-  if (/\bCHICK[- ]?FIL[- ]?A\b/i.test(t)) return 'Chick-fil-A';
+  if (/\bCHICK(?:\s*-\s*|\s+)FIL(?:\s*-\s*|\s+)A\b/i.test(t)) return 'Chick-fil-A';
   if (/\bMCDONALD'?S\b/i.test(t)) return "McDonald's";
   if (/\bTIM\s*HORTONS?\b/i.test(t)) return 'Tim Hortons';
   if (/\bSTARBUCKS\b/i.test(t)) return 'Starbucks';
@@ -4050,15 +4059,7 @@ function parseReceiptBackstop(ocrText) {
 
   const store = extractReceiptStore(t);
 
-  let dateIso = null;
-  const mdY = t.match(/\b(\d{2})\/(\d{2})\/(\d{4})\b/);
-  if (mdY) {
-    const mm = mdY[1], dd = mdY[2], yyyy = mdY[3];
-    dateIso = `${yyyy}-${mm}-${dd}`;
-  } else {
-    const ymd = t.match(/\b(\d{4})\s*-\s*(\d{2})\s*-\s*(\d{2})\b/);
-    if (ymd) dateIso = `${ymd[1]}-${ymd[2]}-${ymd[3]}`;
-  }
+  const dateIso = extractReceiptDateYYYYMMDD(t) || null;
 
   let currency = null;
   const cur =

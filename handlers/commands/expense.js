@@ -5785,7 +5785,7 @@ if (reviewItemsPA?.payload?.draft) {
         total: reviewDraft.total ? Number(reviewDraft.total) : null,
         store: reviewDraft.store || null
       });
-      await sendWhatsAppTextMessage({ toPhone: fromPhone, body: reviewMsg });
+      await sendWhatsApp(fromPhone, reviewMsg);
       return out(twimlEmpty(), true);
     }
 
@@ -8177,7 +8177,7 @@ if (looksLikeReceiptText(input)) {
 
       let reviewMsgSid = null;
       try {
-        const reviewMsgResult = await sendWhatsAppTextMessage({ toPhone: fromPhone, body: reviewMsg });
+        const reviewMsgResult = await sendWhatsApp(fromPhone, reviewMsg);
         reviewMsgSid = reviewMsgResult?.sid || null;
       } catch (sendErr) {
         console.warn('[RECEIPT_MULTI_ITEM_SEND_ERR]', { toPhone: fromPhone, error: sendErr?.message, code: sendErr?.code, status: sendErr?.status });

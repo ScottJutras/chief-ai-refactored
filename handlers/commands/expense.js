@@ -185,7 +185,7 @@ function normalizeEditedExpense(raw) {
   // Normalize money commas: "$4,500" -> "$4500"
   s = s.replace(/\$(\d{1,3})(,\d{3})+(?=\b)/g, (m) => m.replace(/,/g, ''));
 
-  // If user didn’t include the word "expense" anywhere, add a prefix.
+  // If user didn't include the word "expense" anywhere, add a prefix.
   // This makes downstream parsing more consistent.
   const hasExpenseKeyword = /\bexpense\b/i.test(s);
   if (!hasExpenseKeyword) {
@@ -194,7 +194,7 @@ function normalizeEditedExpense(raw) {
 
   // Light canonical phrases (helps the parser)
   // Convert "at Home Depot" / "from Home Depot" consistently
-  // (Don’t overdo it; keep it tolerant.)
+  // (Don't overdo it; keep it tolerant.)
   s = s.replace(/\s+@+\s+/g, ' at ');
   s = s.replace(/\s+from\s+/gi, ' from ');
   s = s.replace(/\s+on\s+/gi, ' on ');
@@ -765,7 +765,7 @@ async function resendConfirmExpense({ fromPhone, ownerId, tz, paUserId, userProf
   const draft0 = confirmPA0?.payload?.draft || null;
 
   if (!draft0 || !Object.keys(draft0).length) {
-    return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
+    return out(twimlText("couldn't"), false);
   }
 
   // ✅ Only reparse if explicitly requested AND not in edit flow
@@ -1913,7 +1913,7 @@ function normalizeExpenseData(data, userProfile, sourceText = '') {
 
 function isStalePickerTap(pickPA, inbound) {
   // We only enforce staleness when Twilio tells us what message the user replied to.
-  // If Twilio doesn’t send it (some client cases), we do NOT block — but we log.
+  // If Twilio doesn't send it (some client cases), we do NOT block — but we log.
   const expected = pickPA?.payload?.lastPickerMsgSid || pickPA?.payload?.expectedPickerMsgSid || null;
   const repliedTo = inbound?.OriginalRepliedMessageSid || inbound?.originalReplied || null;
 
@@ -2507,7 +2507,7 @@ function resolveJobPickSelection(arg1, arg2 = {}, arg3 = null) {
 
 /* ---------------- receipt-safe extractors (TOTAL/date/store) ---------------- */
 
-// Prefer TOTAL lines; ignore loyalty/points; ignore hyphenated IDs; avoid “largest number wins”.
+// Prefer TOTAL lines; ignore loyalty/points; ignore hyphenated IDs; avoid "largest number wins".
 function extractReceiptTotal(text) {
   const raw = String(text || '');
   if (!raw) return null;
@@ -3548,7 +3548,7 @@ function getJobDisplayNameClean(job) {
   return cleaned || null;
 }
 
-// tiny nonce for “this picker instance”
+// tiny nonce for "this picker instance"
 function makePickerNonce() {
   return Math.random().toString(16).slice(2, 10);
 }
@@ -3588,7 +3588,7 @@ function hash8(s) {
 // ============================================================================
 // ✅ DROP-IN: sendJobPickList (FULLY ACTIVATES stable jp: row IDs via makeRowId)
 // ----------------------------------------------------------------------------
-// What’s new vs your current sendJobPickList:
+// What's new vs your current sendJobPickList:
 // 1) Uses makeRowId({ flow, nonce, jobNo, secret }) for each row.id  ✅
 // 2) Stores `flow8` (8-hex) in PA payload so parseRowId() expects jp:<flow8>:<nonce>:... ✅
 // 3) Leaves displayedJobNos + sentRows intact (resolver still has fallbacks)
@@ -3624,7 +3624,7 @@ async function sendJobPickList({
   if (!to) return out(twimlText('Missing recipient.'), false);
 
   // ✅ Guard: enforce that callers pass pickUserId (canonical PA key)
-  // We still fail-open to paUserId so we don’t break prod flows,
+  // We still fail-open to paUserId so we don't break prod flows,
   // but this warns loudly so you can fix missed callsites.
   const pickUserIdDigits = normalizeIdentityDigits(pickUserId);
   if (!pickUserIdDigits) {
@@ -3984,7 +3984,7 @@ function assertExpenseCILOrClarify({ ownerId, from, userProfile, data, jobName, 
       return { ok: true, cil: cil2, variant: 'Legacy' };
     }
   } catch {
-    return { ok: false, reply: `⚠️ Couldn't log that expense yet. Try: "expense $84.12 nails from Home Depot".` };
+    return { ok: false, reply: `⚠️ Couldn\'t log that expense yet. Try: "expense $84.12 nails from Home Depot".` };
   }
 }
 
@@ -4137,7 +4137,7 @@ function extractMoneyToken(input) {
 
     // skip ISO dates like 2026-02-14 (reNum won't match full, but be safe)
     if (/\b\d{4}-\d{2}-\d{2}\b/.test(s)) {
-      // keep, but don’t auto-skip everything; just skip tokens that are date pieces if any
+      // keep, but don't auto-skip everything; just skip tokens that are date pieces if any
       // (practically: no action needed here)
     }
 
@@ -4297,7 +4297,7 @@ console.info('[DET_EXPENSE_MONEY_TOKEN]', {
     if (dashItem?.[1]) item = String(dashItem[1]).trim();
   }
 
-  // 4) Keep "for <item> ..." rule (but don’t allow "for job ...")
+  // 4) Keep "for <item> ..." rule (but don't allow "for job ...")
   if (!item) {
     const itemMatch = raw.match(
       /\bfor\s+(.+?)(?:\s+\b(from|at)\b|\s+\bon\b|\s+\b(today|yesterday|tomorrow)\b|\s+\d{4}-\d{2}-\d{2}\b|[.?!]|$)/i
@@ -4626,7 +4626,7 @@ async function applyEditPayloadToConfirmDraft(editText, existingDraft, ctx) {
     if (!typedDate) {
       return {
         nextDraft: null,
-        aiReply: 'I saw a date in your message, but I couldn’t parse it. Try: "Feb 14 2026" or "2026-02-14".'
+        aiReply: 'I saw a date in your message, but I couldn\'t parse it. Try: "Feb 14 2026" or "2026-02-14".'
       };
     }
 
@@ -5101,7 +5101,7 @@ async function handleExpense(
   // NOTE: getInboundTextExpense MUST exist at FILE SCOPE (do NOT define it inside handleExpense)
   const rawInboundText = getInboundTextExpense(input, inboundTwilioMeta);
 
-  // ✅ Debug: verify we’re extracting the right signal for list picks / IRJ
+  // ✅ Debug: verify we're extracting the right signal for list picks / IRJ
   console.info('[EXPENSE_INBOUND_EXTRACTOR]', {
     rawInboundText: String(rawInboundText || '').slice(0, 80),
     body: String(inboundTwilioMeta?.Body || '').slice(0, 80),
@@ -5231,7 +5231,7 @@ try {
       return out(
         twimlText(
           [
-            '✏️ I’m waiting for your edited expense details in ONE message.',
+            "✏️ I\'m waiting for your edited expense details in ONE message.",
             'Example:',
             'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
             'Reply "cancel" to discard.'
@@ -5264,7 +5264,7 @@ try {
       if (msg.includes('429')) {
         return out(
           twimlText(
-            '⚠️ I’m temporarily rate-limited. Please resend your edited expense with: amount + store + date + (optional) job.'
+            "⚠️ I\'m temporarily rate-limited. Please resend your edited expense with: amount + store + date + (optional) job."
           ),
           false
         );
@@ -5274,7 +5274,7 @@ try {
 
     if (!nextDraft) {
       return out(
-        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
+        twimlText(aiReply || "I couldn\'t understand that edit. Please resend with amount + date + job."),
         false
       );
     }
@@ -5645,7 +5645,7 @@ try {
       return out(
         twimlText(
           [
-            'I couldn’t match that job selection.',
+            "I couldn\'t match that job selection.",
             'Please tap the job again (or type the job name exactly as shown).',
             'Reply "cancel" to exit.'
           ].join('\n')
@@ -5712,7 +5712,7 @@ try {
     // ============================================================================
 // ✅ DROP-IN: JOB_PICK_DEBUG block (with stale-click guard)
 // ----------------------------------------------------------------------------
-// What’s new:
+// What's new:
 // - Uses pickPA.payload.lastPickerMsgSid (stored by sendJobPickList)
 // - Compares against inboundTwilioMeta.OriginalRepliedMessageSid
 // - If mismatch -> treat as stale tap and resend page 0 (no wrong-job mapping)
@@ -5729,13 +5729,13 @@ const reviewItemsPA = await getPA({
 if (reviewItemsPA?.payload?.draft) {
   const reviewDraft = reviewItemsPA.payload.draft;
   const lineItems = Array.isArray(reviewDraft.lineItems) ? reviewDraft.lineItems : [];
-  const receiptTaxRate = typeof reviewDraft.receiptTaxRate === ‘number’ ? reviewDraft.receiptTaxRate : null;
+  const receiptTaxRate = typeof reviewDraft.receiptTaxRate === 'number' ? reviewDraft.receiptTaxRate : null;
 
   if (lineItems.length >= 2) {
-    const rawReply = String(rawInboundText || ‘’).trim().toLowerCase();
+    const rawReply = String(rawInboundText || '').trim().toLowerCase();
 
     // Check if this looks like a valid review response
-    const isAllReply = rawReply === ‘all’;
+    const isAllReply = rawReply === 'all';
     const nums = rawReply.split(/[\s,]+/).map((s) => parseInt(s, 10)).filter((n) => !isNaN(n));
     const isNumericReply = nums.length > 0;
 
@@ -5766,7 +5766,7 @@ if (reviewItemsPA?.payload?.draft) {
       // All items excluded — cancel the expense
       await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_REVIEW_ITEMS });
       await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_CONFIRM });
-      return out(twimlText(‘All items excluded — expense cancelled. Send a new receipt to start over.’), false);
+      return out(twimlText('All items excluded — expense cancelled. Send a new receipt to start over.'), false);
     }
 
     // Recalculate totals from approved items
@@ -5799,14 +5799,14 @@ if (reviewItemsPA?.payload?.draft) {
       userId: canonicalUserKey,
       kind: PA_KIND_CONFIRM,
       payload: {
-        type: ‘expense’,
+        type: 'expense',
         sourceMsgId: reviewItemsPA.payload.sourceMsgId,
         draft: updatedDraft
       },
       ttlSeconds: PA_TTL_SEC
     });
 
-    console.info(‘[RECEIPT_ITEM_REVIEW]’, {
+    console.info('[RECEIPT_ITEM_REVIEW]', {
       paUserId: canonicalUserKey,
       totalItems: lineItems.length,
       approvedCount: approvedItems.length,
@@ -5820,10 +5820,10 @@ if (reviewItemsPA?.payload?.draft) {
     try {
       const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
       if (!jobs.length) {
-        return out(twimlText(‘No jobs found. Reply "Overhead" or create a job first.’), false);
+        return out(twimlText('No jobs found. Reply "Overhead" or create a job first.'), false);
       }
       const confirmFlowId =
-        String(reviewItemsPA.payload.sourceMsgId || ‘’).trim() ||
+        String(reviewItemsPA.payload.sourceMsgId || '').trim() ||
         `${canonicalUserKey}:${Date.now()}`;
 
       await sendJobPickList({
@@ -5836,7 +5836,7 @@ if (reviewItemsPA?.payload?.draft) {
         pickUserId: canonicalUserKey,
         page: 0,
         pageSize: 8,
-        context: ‘expense_jobpick’,
+        context: 'expense_jobpick',
         confirmDraft: {
           ...updatedDraft,
           jobName: null,
@@ -5845,8 +5845,8 @@ if (reviewItemsPA?.payload?.draft) {
       });
       return out(twimlEmpty(), true);
     } catch (e) {
-      console.warn(‘[EXPENSE] item review job picker send failed:’, e?.message);
-      return out(twimlText(‘Items noted. I had trouble showing the job list — try replying "jobs".’), false);
+      console.warn('[EXPENSE] item review job picker send failed:', e?.message);
+      return out(twimlText('Items noted. I had trouble showing the job list — try replying "jobs".'), false);
     }
   }
 }
@@ -5903,7 +5903,7 @@ if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payloa
 
     const effectiveConfirmFlowId = confirmFlowId || stableMsgId || `${paUserId}:${Date.now()}`;
 
-    // ✅ Resume works even while we’re in the picker flow
+    // ✅ Resume works even while we're in the picker flow
     if (tok === 'resume') {
       const confirmPA0 = await getPA({ ownerId, userId: paKey, kind: PA_KIND_CONFIRM }).catch(() => null);
       const draft0 = confirmPA0?.payload?.draft || null;
@@ -5917,7 +5917,7 @@ if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payloa
         }
       }
 
-      return out(twimlText('I couldn’t find anything pending. What do you want to do next?'), false);
+      return out(twimlText("couldn't"), false);
     }
 
     // If user sent a brand new expense while waiting for job pick, clear state and continue parsing.
@@ -5969,7 +5969,7 @@ if (pickPA?.payload && Array.isArray(pickPA.payload.jobOptions) && pickPA.payloa
       }
 
       // ✅ NEW: Stale picker protection (message reply mismatch)
-// Only enforce when this looks like a picker tap (don’t block typed messages)
+// Only enforce when this looks like a picker tap (don't block typed messages)
 const expectedPickerMsgSid = String(pickPA?.payload?.lastPickerMsgSid || '').trim() || null;
 const repliedToMsgSid = String(inboundTwilioMeta?.OriginalRepliedMessageSid || '').trim() || null;
 
@@ -6140,7 +6140,7 @@ let skipPickHandling = false;
 // 1) PICKER-TAP PATH
 // ----------------------------
 if (looksLikePickerTap) {
-  // ✅ IMPORTANT: detect control tokens FIRST (don’t attempt selection resolution)
+  // ✅ IMPORTANT: detect control tokens FIRST (don't attempt selection resolution)
   const token2 = normalizeDecisionToken(rawInput);
   const isControlToken2 =
     token2 === 'yes' ||
@@ -6326,7 +6326,7 @@ if (!skipPickHandling) {
   });
 
   if (!resolved) {
-    // ✅ Don’t loop forever: for typed replies, show guidance (no resend spam)
+    // ✅ Don't loop forever: for typed replies, show guidance (no resend spam)
     return out(
       twimlText('Please reply with a job from the list, a number, job name, "Overhead", or "more".'),
       false
@@ -6605,7 +6605,7 @@ try {
 
   const lc = String(rawInboundText || '').trim().toLowerCase();
 
-  // “info commands” that should NOT be consumed as an edit payload
+  // "info commands" that should NOT be consumed as an edit payload
   const isNonIntakeQuery =
     /^show\b/.test(lc) ||
     lc.includes('last expense') ||
@@ -6665,7 +6665,7 @@ try {
 
     if (!nextDraft) {
       return out(
-        twimlText(aiReply || 'I couldn’t understand that edit. Please resend with amount + date + job.'),
+        twimlText(aiReply || "I couldn\'t understand that edit. Please resend with amount + date + job."),
         false
       );
     }
@@ -6845,7 +6845,7 @@ try {
     return out(
       twimlText(
         [
-          '✏️ I’m waiting for your edited expense details in ONE message.',
+          "✏️ I\'m waiting for your edited expense details in ONE message.",
           'Example:',
           'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
           'Reply "cancel" to discard.'
@@ -6860,7 +6860,7 @@ try {
     return out(
       twimlText(
         [
-          '✏️ I’m waiting for your edited expense details in ONE message.',
+          "✏️ I\'m waiting for your edited expense details in ONE message.",
           'Example:',
           'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
           'Reply "cancel" to discard.'
@@ -6968,7 +6968,7 @@ const gate = canEmployeeSelfLog(plan);
 
   const lc = String(rawInboundText || '').trim().toLowerCase();
 
-  // “info commands” that should NOT be blocked by confirm draft
+  // "info commands" that should NOT be blocked by confirm draft
   const isNonIntakeQuery =
   /^show\b/.test(lc) ||
   lc.includes('last expense') ||
@@ -7015,9 +7015,9 @@ const gate = canEmployeeSelfLog(plan);
       return out(
         twimlText(
           [
-            'Okay — I’ll keep that expense pending.',
+            'Okay — I\'ll keep that expense pending.',
             'Now send the *new* expense (or photo) you want to log.',
-            'Tip: reply “resume” anytime to bring back the pending one.'
+            'Tip: reply "resume" anytime to bring back the pending one.'
           ].join('\n')
         ),
         false
@@ -7029,7 +7029,7 @@ const gate = canEmployeeSelfLog(plan);
       return out(
         twimlText(
           [
-            '✏️ I’m waiting for your edited expense details in ONE message.',
+            "✏️ I\'m waiting for your edited expense details in ONE message.",
             'Example:',
             'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
             'Reply "cancel" to discard.'
@@ -7055,7 +7055,7 @@ const gate = canEmployeeSelfLog(plan);
         return out(
           twimlText(
             [
-              'You’ve still got an expense waiting for confirmation.',
+              'You\'ve still got an expense waiting for confirmation.',
               '',
               'Reply:',
               '• "yes" to submit it',
@@ -7273,7 +7273,7 @@ const gate = canEmployeeSelfLog(plan);
           }
         } catch {}
 
-        return out(twimlText('❌ Cancelled. You’re cleared.'), false);
+        return out(twimlText("❌ Cancelled. You\'re cleared."), false);
       }
 
       // --------------------------------------------
@@ -7285,7 +7285,7 @@ if (strictTok === 'yes') {
     return out(
       twimlText(
         [
-          '✏️ I’m still waiting for your edited expense details in ONE message.',
+          "✏️ I\'m still waiting for your edited expense details in ONE message.",
           'Example:',
           'expense $14.21 spray foam insulation from Home Hardware on Sept 27 2025',
           'Reply "cancel" to discard.'
@@ -7423,7 +7423,7 @@ if (strictTok === 'yes') {
 
     if (!rawDraft2 || !Object.keys(rawDraft2).length) {
       return out(
-        twimlText(`I didn’t find an expense draft to submit. Reply "resume" to see what’s pending.`),
+        twimlText(`I didn\'t find an expense draft to submit. Reply "resume" to see what\'s pending.`),
         false
       );
     }
@@ -7497,11 +7497,11 @@ if (!data?.amount_cents) {
     head: String(raw || '').slice(0, 120),
     amount: data?.amount ?? null
   });
-  return out(twimlText('I didn’t catch the amount. Try: expense $48 from RONA for plywood'), false);
+  return out(twimlText("I didn\'t catch the amount. Try: expense $48 from RONA for plywood"), false);
 }
 
 if (!dateStr) {
-  return out(twimlText(`I’m missing the date. Reply like: "The transaction date is 01/05/2026".`), false);
+  return out(twimlText(`I\'m missing the date. Reply like: "The transaction date is 01/05/2026".`), false);
 }
 
 // ✅ Job resolution
@@ -7571,7 +7571,7 @@ if (!jobName) {
       Math.round(Number(String(data.amount || '').replace(/[^0-9.\-]/g, '') || 0) * 100);
 
     if (!amountCents || amountCents <= 0) {
-      return out(twimlText(`That amount doesn’t look valid. Reply like: "Total 14.84" (or "14.84 CAD").`), false);
+      return out(twimlText(`That amount doesn\'t look valid. Reply like: "Total 14.84" (or "14.84 CAD").`), false);
     }
 // ✅ Ensure DB-safe numeric amount (never "$10.00")
 const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0).toFixed(2);
@@ -7804,7 +7804,7 @@ return out(twimlText(okMsg), false);
     // fail-soft: do not lose the confirm PA; user can "resume"
     return out(
       twimlText(
-        `⚠️ I couldn’t submit that expense right now.\n\nReply "resume" to see what’s pending, or "cancel" to discard it.`
+        `⚠️ I couldn\'t submit that expense right now.\n\nReply "resume" to see what\'s pending, or "cancel" to discard it.`
       ),
       false
     );
@@ -7814,7 +7814,7 @@ return out(twimlText(okMsg), false);
       return out(
         twimlText(
           [
-            'You’ve still got an expense waiting for confirmation.',
+            'You\'ve still got an expense waiting for confirmation.',
             '',
             'Reply:',
             '• "yes" to submit it',
@@ -8254,7 +8254,7 @@ if (looksLikeReceiptText(input)) {
 
     data0.store = await normalizeVendorName(ownerId, data0.store);
 
-    // ✅ Vendor sanitation: prevent “Rona for plywood” pollution.
+    // ✅ Vendor sanitation: prevent "Rona for plywood" pollution.
     if (data0?.store && typeof data0.store === 'string') {
       const s = data0.store.trim();
       if (data0?.item && /\sfor\s/i.test(s)) {
@@ -8304,7 +8304,7 @@ if (looksLikeReceiptText(input)) {
       ms0
     });
 
-    // ✅ Upsert CONFIRM PA (so “Yes/Edit” works)
+    // ✅ Upsert CONFIRM PA (so "Yes/Edit" works)
     await upsertPA({
       ownerId,
       userId: paKey,
@@ -8814,7 +8814,7 @@ if (aiReply && missingCore) {
 // If still missing core after deterministic attempt, show a clear fallback
 if (missingCore) {
   return out(
-    twimlText(`🤔 Couldn’t parse an expense from "${input}". Try:\nexpense $84.12 at Home Depot today`),
+    twimlText(`🤔 Couldn\'t parse an expense from "${input}". Try:\nexpense $84.12 at Home Depot today`),
     false
   );
 }
@@ -8833,8 +8833,8 @@ try {
     } catch {}
   }
 
-  // Vendor sanitation: prevent “Rona for plywood” pollution.
-  // Only strip trailing “ for …” if we ALSO have an item/description already.
+  // Vendor sanitation: prevent "Rona for plywood" pollution.
+  // Only strip trailing " for …" if we ALSO have an item/description already.
   if (data0?.store && typeof data0.store === 'string') {
     const s = data0.store.trim();
     if (data0?.item && /\sfor\s/i.test(s)) {
@@ -8871,7 +8871,7 @@ try {
     jobSource = 'overhead';
   }
 
-  // Clean “item” of embedded job/date junk once job is known
+  // Clean "item" of embedded job/date junk once job is known
   if (jobName) {
     data0.item = stripEmbeddedDateAndJobFromItem(data0.item, { date: data0.date, jobName });
   }
@@ -8887,7 +8887,7 @@ try {
   const sid = String(inboundTwilioMeta?.MessageSid || inboundTwilioMeta?.SmsMessageSid || '').trim();
   const ms0 = sid ? normalizeMediaSourceMsgId(u, sid) : null;
 
-  // ✅ Upsert CONFIRM PA (so “Yes/Edit” works)
+  // ✅ Upsert CONFIRM PA (so "Yes/Edit" works)
   await upsertPA({
     ownerId,
     userId: paKey,
@@ -9008,7 +9008,7 @@ try {
 } catch (e) {
   console.warn('[EXPENSE_CONFIRM_FLOW_FAILED]', e?.message);
   return out(
-    twimlText(`🤔 I parsed that expense, but I couldn’t start the confirm flow. Try again or reply "resume".`),
+    twimlText(`🤔 I parsed that expense, but I couldn\'t start the confirm flow. Try again or reply "resume".`),
     false
   );
 }
@@ -9024,7 +9024,7 @@ console.warn('[EXPENSE_FALLTHROUGH_NO_REPLY]', {
 return out(
   twimlText(
     [
-      "I couldn’t confirm that expense yet.",
+      "I couldn\'t confirm that expense yet.",
       "Try: expense $48 from RONA for plywood",
       'Or reply: "help expense"'
     ].join('\n')

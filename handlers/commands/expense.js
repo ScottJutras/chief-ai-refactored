@@ -5765,10 +5765,15 @@ if (reviewItemsPA?.payload?.draft) {
   if (lineItems.length >= 2) {
     const rawReply = String(rawInboundText || '').trim().toLowerCase();
 
-    // Check if this looks like a valid review response
+    // Check if this looks like a valid review response.
+    // isNumericReply requires the ENTIRE reply to be digits/commas/spaces so that
+    // receipt OCR text (which contains numbers like "1 28.02 EA B ...") isn't
+    // misinterpreted as an item-exclusion command.
     const isAllReply = rawReply === 'all';
-    const nums = rawReply.split(/[\s,]+/).map((s) => parseInt(s, 10)).filter((n) => !isNaN(n));
-    const isNumericReply = nums.length > 0;
+    const isNumericReply = /^[\d\s,]+$/.test(rawReply) && /\d/.test(rawReply);
+    const nums = isNumericReply
+      ? rawReply.split(/[\s,]+/).map((s) => parseInt(s, 10)).filter((n) => !isNaN(n))
+      : [];
 
     if (!isAllReply && !isNumericReply) {
       // Not a valid item-review reply — resend the review message

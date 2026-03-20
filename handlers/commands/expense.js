@@ -2091,6 +2091,8 @@ function extractAllReceiptLineItems(text) {
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
+  console.info('[RECEIPT_NORM_LINES]', { lineCount: lines.length, lines: lines.slice(0, 20) });
+
   const isFooterLine = (line) => {
     if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|interac|acct|auth|employee|you saved today|returns? and refunds?|fhst|phst)\b/i.test(line)) return true;
     // "total" is only a footer when directly adjacent to a decimal amount (not a column header like "QTY PRICE TOTAL")

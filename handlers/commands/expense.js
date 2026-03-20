@@ -2094,11 +2094,18 @@ function extractAllReceiptLineItems(text) {
   const isFooterLine = (line) =>
     /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|interac|acct|auth|employee|you saved today|returns? and refunds?|fhst|phst)\b/i.test(line);
 
-  const isStoreLine = (line) =>
+  const isSkipLine = (line) =>
     /\b(rona|home depot|lowes|canadian tire|costco|walmart|petro-canada|petro canada|shell|esso|mission exteriors)\b/i.test(line) ||
     /\(\d{3}\)\s*\d{3}-\d{4}/.test(line) ||
-    /^\d{3,5}\s+[A-Za-z]/.test(line) ||
-    /\b(on|bc|ab|qc)\b,?\s*[A-Z]\d[A-Z]/i.test(line);
+    /\b(on|bc|ab|qc)\b,?\s*[A-Z]\d[A-Z]/i.test(line) ||
+    /\b(item|items|qty|quantity|=====)\b/i.test(line);
+
+  const isBadName = (name) =>
+    !name || name.length < 3 ||
+    isSkipLine(name) ||
+    /^\d+$/.test(name) ||
+    !/[A-Za-z]/.test(name) ||
+    /\b(subtotal|total|tax|gst|hst|pst|debit|visa|mastercard|amex|interac)\b/i.test(name);
 
   const parseMoney = (line) => {
     const m = line.match(/\b(\d{1,4}\.\d{2})\b/);
@@ -2108,42 +2115,47 @@ function extractAllReceiptLineItems(text) {
   };
 
   const items = [];
-  let inItemZone = false;
+  let pendingName = null; // item name seen without a price yet
   let footerStarted = false;
 
   for (const line of lines) {
     if (footerStarted) break;
     if (isFooterLine(line)) { footerStarted = true; break; }
-    if (isStoreLine(line)) continue;
+    if (isSkipLine(line)) { pendingName = null; continue; }
 
-    // Barcode line signals start of item zone
-    if (/^\d{8,14}$/.test(line)) { inItemZone = true; continue; }
+    // Pure barcode line — marks start of item zone, clears pending
+    if (/^\d{8,14}$/.test(line)) { pendingName = null; continue; }
 
-    // Line with text + price at the end
     const price = parseMoney(line);
+
     if (price == null) {
-      // Could still be an item name line (price on next line)
-      if (inItemZone && /[A-Za-z]{3,}/.test(line) && line.length >= 4) {
-        // Peek: treat as pending item name, price on next line handled below
+      // No price on this line — could be an item name (price follows on next line)
+      // Strip leading barcode if present
+      const candidate = line.replace(/^\d{8,14}\s*/, '').replace(/\s+/g, ' ').trim();
+      if (!isBadName(candidate)) {
+        pendingName = candidate;
+      } else {
+        pendingName = null;
       }
       continue;
     }
 
-    // Extract name by stripping trailing price and codes
-    const name = line
-      .replace(/\s+\d+\.\d{2}\s*[A-Z]?\s*$/, '')
-      .replace(/\s+\d+(?:\s+[A-Z]{1,3})+\s*$/, '')
-      .replace(/^\d{8,14}\s*/, '') // strip leading barcode if present
+    // We have a price — try to get a name from this line or use pendingName
+    let name = line
+      .replace(/\s+\d+\.\d{2}\s*[A-Z]?\s*$/, '')  // strip trailing price + tax code
+      .replace(/\s+\d+(?:\s+[A-Z]{1,3})+\s*$/, '') // strip trailing quantity codes
+      .replace(/^\d{8,14}\s*/, '')                   // strip leading barcode
       .replace(/\s+/g, ' ')
       .trim();
 
-    if (!name || name.length < 3) continue;
-    if (isStoreLine(name)) continue;
-    if (/^\d+$/.test(name)) continue;
-    if (!/[A-Za-z]/.test(name)) continue;
+    if (isBadName(name)) {
+      // Name not on this line — use pending name from previous line
+      name = pendingName || null;
+    }
 
-    // Avoid tax/total keywords
-    if (/\b(subtotal|total|tax|gst|hst|pst|debit|visa|mastercard|amex|interac)\b/i.test(name)) continue;
+    pendingName = null;
+
+    if (!name || isBadName(name)) continue;
 
     items.push({ name, price });
   }
@@ -5782,7 +5794,7 @@ if (reviewItemsPA?.payload?.draft) {
     const updatedDraft = {
       ...reviewDraft,
       item: itemLabel,
-      amount: `$${newTotal.toFixed(2)}`,
+      amount: `$${newSubtotal.toFixed(2)}`,
       subtotal: newSubtotal.toFixed(2),
       tax: newTax.toFixed(2),
       total: newTotal.toFixed(2),
@@ -7969,10 +7981,14 @@ if (looksLikeReceiptText(input)) {
 
       date: String(draft0?.date || '').trim() || seededDate || back?.dateIso || null,
 
+      // Use pre-tax subtotal as the primary expense amount (tax recovered as ITC for GST/HST registrants).
+      // Fall back to total when no subtotal is available.
       amount:
-        seededTotal
-          ? `$${seededTotal}`
-          : (String(draft0?.amount || '').trim() || null),
+        seededSubtotal
+          ? `$${seededSubtotal}`
+          : seededTotal
+            ? `$${seededTotal}`
+            : (String(draft0?.amount || '').trim() || null),
 
       currency: back?.currency || draft0?.currency || defaultCurrency,
 
@@ -8029,16 +8045,6 @@ if (looksLikeReceiptText(input)) {
       }
     }
 
-   // ✅ Ensure amount reflects total, not subtotal
-    if (mergedDraft.amount && mergedDraft.subtotal && mergedDraft.total) {
-      const _a = Number(String(mergedDraft.amount).replace(/[^0-9.-]/g, ''));
-      const _s = Number(String(mergedDraft.subtotal).replace(/[^0-9.-]/g, ''));
-      const _t = Number(String(mergedDraft.total).replace(/[^0-9.-]/g, ''));
-      if (Number.isFinite(_a) && Number.isFinite(_s) && Number.isFinite(_t) &&
-          Math.abs(_a - _s) < 0.01 && _t > _s) {
-        mergedDraft.amount = `$${_t.toFixed(2)}`;
-      }
-    }
 
     const gotAmount =
       !!String(mergedDraft.amount || '').trim() &&

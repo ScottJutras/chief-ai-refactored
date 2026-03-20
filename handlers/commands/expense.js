@@ -8170,7 +8170,13 @@ if (looksLikeReceiptText(input)) {
         store: mergedDraft?.store || null
       });
 
-      await sendWhatsAppTextMessage({ toPhone: fromPhone, body: reviewMsg });
+      let reviewMsgSid = null;
+      try {
+        const reviewMsgResult = await sendWhatsAppTextMessage({ toPhone: fromPhone, body: reviewMsg });
+        reviewMsgSid = reviewMsgResult?.sid || null;
+      } catch (sendErr) {
+        console.warn('[RECEIPT_MULTI_ITEM_SEND_ERR]', { toPhone: fromPhone, error: sendErr?.message, code: sendErr?.code, status: sendErr?.status });
+      }
 
       console.info('[RECEIPT_MULTI_ITEM]', {
         paUserId,
@@ -8179,7 +8185,8 @@ if (looksLikeReceiptText(input)) {
         subtotal: mergedDraft?.subtotal,
         tax: mergedDraft?.tax,
         total: mergedDraft?.total,
-        receiptTaxRate
+        receiptTaxRate,
+        reviewMsgSid
       });
 
       return out(twimlEmpty(), true);

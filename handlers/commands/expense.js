@@ -2105,6 +2105,7 @@ function extractAllReceiptLineItems(text) {
     isSkipLine(name) ||
     /^\d+$/.test(name) ||
     !/[A-Za-z]/.test(name) ||
+    /^\d+\.\d{2}\s*[A-Z]?\s*$/.test(name) ||   // price-only string like "28.02 A"
     /\b(subtotal|total|tax|gst|hst|pst|debit|visa|mastercard|amex|interac)\b/i.test(name);
 
   const parseMoney = (line) => {
@@ -2123,8 +2124,8 @@ function extractAllReceiptLineItems(text) {
     if (isFooterLine(line)) { footerStarted = true; break; }
     if (isSkipLine(line)) { pendingName = null; continue; }
 
-    // Pure barcode line — marks start of item zone, clears pending
-    if (/^\d{8,14}$/.test(line)) { pendingName = null; continue; }
+    // Pure barcode line — skip it but keep pendingName (barcode is item metadata, not a separator)
+    if (/^\d{8,14}$/.test(line)) { continue; }
 
     const price = parseMoney(line);
 
@@ -2142,7 +2143,8 @@ function extractAllReceiptLineItems(text) {
 
     // We have a price — try to get a name from this line or use pendingName
     let name = line
-      .replace(/\s+\d+\.\d{2}\s*[A-Z]?\s*$/, '')  // strip trailing price + tax code
+      .replace(/\s+\d{8,14}\s*$/, '')               // strip trailing barcode first (e.g. "NAME 28.02 A 66267160150")
+      .replace(/\s+\d+\.\d{2}\s*[A-Z]?\s*$/, '')   // then strip trailing price + tax code
       .replace(/\s+\d+(?:\s+[A-Z]{1,3})+\s*$/, '') // strip trailing quantity codes
       .replace(/^\d{8,14}\s*/, '')                   // strip leading barcode
       .replace(/\s+/g, ' ')

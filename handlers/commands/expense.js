@@ -2158,6 +2158,11 @@ function extractAllReceiptLineItems(text) {
       .replace(/\s+/g, ' ')
       .trim();
 
+    // Strip RONA size-code repetition e.g. "ROOF VENT BROWN PREMIUM 50 IN ROOF VENT BROWN PREMIUM" → "ROOF VENT BROWN PREMIUM"
+    if (/\s+\d{2,3}\s+IN\b/i.test(name)) {
+      name = name.replace(/\s+\d{2,3}\s+IN\b.*$/i, '').trim();
+    }
+
     if (isBadName(name)) {
       // Name not on this line — use pending name from previous line
       name = pendingName || null;
@@ -2168,6 +2173,7 @@ function extractAllReceiptLineItems(text) {
     if (!name || isBadName(name)) continue;
 
     items.push({ name, price });
+    pendingName = name; // carry forward so next qty-only line (e.g. RONA second item) can use it
   }
 
   return items;

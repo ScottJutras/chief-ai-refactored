@@ -7653,11 +7653,16 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
   if (lineItemsToInsert) {
     // Insert one transaction row per approved line item with proportional tax
     const insertedIds = [];
-    for (const lineItem of lineItemsToInsert) {
+    for (let itemIdx = 0; itemIdx < lineItemsToInsert.length; itemIdx++) {
+      const lineItem = lineItemsToInsert[itemIdx];
       const itemAmountCents = Math.round(Number(lineItem.price || 0) * 100);
       const itemTaxCents = receiptTaxRateForInsert != null ? Math.round(itemAmountCents * receiptTaxRateForInsert) : 0;
       const itemSubtotal = (itemAmountCents / 100).toFixed(2);
       const itemTax = (itemTaxCents / 100).toFixed(2);
+      // Append item index to source_msg_id so each row gets a unique dedup key
+      const itemSourceMsgId = insertPayload.source_msg_id
+        ? `${insertPayload.source_msg_id}:i${itemIdx}`
+        : null;
       const itemInsertPayload = {
         ...insertPayload,
         amount: itemSubtotal,
@@ -7665,6 +7670,7 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
         description: String(lineItem.name || '').trim() || insertPayload.description,
         subtotal_amount: itemSubtotal,
         tax_amount: itemTax,
+        source_msg_id: itemSourceMsgId,
       };
       const itemInserted = await insertExpenseBestEffort(pg, itemInsertPayload).catch((e) => {
         console.error('[EXPENSE_YES_INSERT_ITEM] failed:', e?.message);

@@ -2091,10 +2091,14 @@ function extractAllReceiptLineItems(text) {
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
+  console.info('[RECEIPT_NORM_LINES]', { lineCount: lines.length, lines: lines.slice(0, 30) });
+
   const isFooterLine = (line) => {
-    if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|interac|acct|auth|employee|you saved today|returns? and refunds?|fhst|phst)\b/i.test(line)) return true;
+    // Strip tax registration numbers (e.g. "HST#784752966") before checking footer keywords
+    const stripped = line.replace(/\b(hst|gst)#\d+\b/ig, '');
+    if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|interac|acct|auth|employee|you saved today|returns? and refunds?|fhst|phst)\b/i.test(stripped)) return true;
     // "total" is only a footer when directly adjacent to a decimal amount (not a column header like "QTY PRICE TOTAL")
-    if (/\btotal\b/i.test(line) && /\btotal\b\s*\$?\d+\.\d{2}/i.test(line)) return true;
+    if (/\btotal\b/i.test(stripped) && /\btotal\b\s*\$?\d+\.\d{2}/i.test(stripped)) return true;
     return false;
   };
 
@@ -2777,7 +2781,7 @@ function normalizeReceiptOcrForParsing(text) {
 
   s = s
     .replace(/\b(subtotal)\b/ig, '\n$1 ')
-    .replace(/\b(gst\/hst|gst|hst|pst|tax)\b/ig, '\n$1 ')
+    .replace(/\b(gst\/hst|gst|hst|pst|tax)\b(?!\s*#\d)/ig, '\n$1 ')
     .replace(/\b([fp]hst\s+include)\b/ig, '\n$1 ')
     .replace(/\b(total|amount due|balance due)\b/ig, '\n$1 ')
     .replace(/\b(debit card|debit|visa|mastercard|amex)\b/ig, '\n$1 ')
@@ -2822,16 +2826,23 @@ function extractReceiptDateYYYYMMDD(text, tz = 'America/Toronto') {
   const src = String(text || '').trim();
   if (!src) return null;
 
-  // 1) MM/DD/YY or MM/DD/YYYY (receipt common)
-  // Example: 01/13/26 or 01/13/2026
-  const m1 = src.match(/\b(0?[1-9]|1[0-2])[\/\-\.](0?[1-9]|[12]\d|3[01])[\/\-\.](\d{2}|\d{4})\b/);
+  // 1) Numeric date: MM/DD/YYYY or DD/MM/YYYY
+  // If first component > 12, must be DD/MM/YYYY (e.g. "18/03/2026")
+  const m1 = src.match(/\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2}|\d{4})\b/);
   if (m1) {
-    let mm = Number(m1[1]);
-    let dd = Number(m1[2]);
+    let a = Number(m1[1]);
+    let b = Number(m1[2]);
     let yy = String(m1[3]);
     let yyyy = yy.length === 2 ? (Number(yy) >= 70 ? 1900 + Number(yy) : 2000 + Number(yy)) : Number(yy);
     const pad = (n) => String(n).padStart(2, '0');
-    return `${yyyy}-${pad(mm)}-${pad(dd)}`;
+    // Disambiguate: if first > 12 it must be day (DD/MM/YYYY)
+    if (a > 12 && b >= 1 && b <= 12) {
+      return `${yyyy}-${pad(b)}-${pad(a)}`;
+    }
+    // Otherwise default to MM/DD/YYYY (North American)
+    if (a >= 1 && a <= 12 && b >= 1 && b <= 31) {
+      return `${yyyy}-${pad(a)}-${pad(b)}`;
+    }
   }
 
   // 2) Month name formats: "Jan 13, 2026" / "January 13 2026"
@@ -2902,6 +2913,12 @@ function extractReceiptStore(text) {
   if (/\bHOME\s*HARDWARE\b/i.test(t)) return 'Home Hardware';
   if (/\bRONA\b/i.test(t)) return 'Rona';
   if (/\bLOWE'?S\b/i.test(t)) return "Lowe's";
+
+  if (/\bCHICK[- ]?FIL[- ]?A\b/i.test(t)) return 'Chick-fil-A';
+  if (/\bMCDONALD'?S\b/i.test(t)) return "McDonald's";
+  if (/\bTIM\s*HORTONS?\b/i.test(t)) return 'Tim Hortons';
+  if (/\bSTARBUCKS\b/i.test(t)) return 'Starbucks';
+  if (/\bSUBWAY\b/i.test(t)) return 'Subway';
 
   // 3) Nothing found
   return null;

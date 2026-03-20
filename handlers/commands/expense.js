@@ -98,6 +98,8 @@ exports.PA_KIND_PICK_JOB = PA_KIND_PICK_JOB;
 
 const PA_KIND_CONFIRM = 'confirm_expense';
 
+const PA_KIND_REVIEW_ITEMS = 'review_receipt_items';
+
 const PA_TTL_MIN = Number(process.env.PENDING_TTL_MIN || 10);
 const PA_TTL_SEC = PA_TTL_MIN * 60;
 exports.PA_TTL_SEC = PA_TTL_SEC;
@@ -2073,6 +2075,104 @@ function extractReceiptPrimaryItem(text) {
   }
 
   return null;
+}
+
+/**
+ * Extract all line items from a receipt.
+ * Returns [{name, price}] sorted by order of appearance.
+ * Skips store headers, totals, tax, and payment lines.
+ */
+function extractAllReceiptLineItems(text) {
+  const normalized = normalizeReceiptOcrForParsing(text);
+  if (!normalized) return [];
+
+  const lines = normalized
+    .split(/\n+/)
+    .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const isFooterLine = (line) =>
+    /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|interac|acct|auth|employee|you saved today|returns? and refunds?|fhst|phst)\b/i.test(line);
+
+  const isStoreLine = (line) =>
+    /\b(rona|home depot|lowes|canadian tire|costco|walmart|petro-canada|petro canada|shell|esso|mission exteriors)\b/i.test(line) ||
+    /\(\d{3}\)\s*\d{3}-\d{4}/.test(line) ||
+    /^\d{3,5}\s+[A-Za-z]/.test(line) ||
+    /\b(on|bc|ab|qc)\b,?\s*[A-Z]\d[A-Z]/i.test(line);
+
+  const parseMoney = (line) => {
+    const m = line.match(/\b(\d{1,4}\.\d{2})\b/);
+    if (!m) return null;
+    const n = Number(m[1]);
+    return Number.isFinite(n) && n > 0 && n < 10000 ? n : null;
+  };
+
+  const items = [];
+  let inItemZone = false;
+  let footerStarted = false;
+
+  for (const line of lines) {
+    if (footerStarted) break;
+    if (isFooterLine(line)) { footerStarted = true; break; }
+    if (isStoreLine(line)) continue;
+
+    // Barcode line signals start of item zone
+    if (/^\d{8,14}$/.test(line)) { inItemZone = true; continue; }
+
+    // Line with text + price at the end
+    const price = parseMoney(line);
+    if (price == null) {
+      // Could still be an item name line (price on next line)
+      if (inItemZone && /[A-Za-z]{3,}/.test(line) && line.length >= 4) {
+        // Peek: treat as pending item name, price on next line handled below
+      }
+      continue;
+    }
+
+    // Extract name by stripping trailing price and codes
+    const name = line
+      .replace(/\s+\d+\.\d{2}\s*[A-Z]?\s*$/, '')
+      .replace(/\s+\d+(?:\s+[A-Z]{1,3})+\s*$/, '')
+      .replace(/^\d{8,14}\s*/, '') // strip leading barcode if present
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    if (!name || name.length < 3) continue;
+    if (isStoreLine(name)) continue;
+    if (/^\d+$/.test(name)) continue;
+    if (!/[A-Za-z]/.test(name)) continue;
+
+    // Avoid tax/total keywords
+    if (/\b(subtotal|total|tax|gst|hst|pst|debit|visa|mastercard|amex|interac)\b/i.test(name)) continue;
+
+    items.push({ name, price });
+  }
+
+  return items;
+}
+
+/**
+ * Send a plain WhatsApp text message to a user via Twilio API.
+ */
+async function sendWhatsAppTextMessage({ toPhone, body }) {
+  const tw = getTwilioClient();
+  const { waFrom, messagingServiceSid } = getSendFromConfig();
+  const to = `whatsapp:+${String(toPhone).replace(/\D/g, '')}`;
+  const params = { to, body: String(body || '').slice(0, 1600) };
+  if (messagingServiceSid) params.messagingServiceSid = messagingServiceSid;
+  else params.from = waFrom;
+  return tw.messages.create(params);
+}
+
+function buildItemReviewMessage({ items, subtotal, tax, taxLabel, total, store }) {
+  const storeName = String(store || 'Receipt').trim();
+  const header = `📋 ${storeName} — ${items.length} items found`;
+  const itemLines = items.map((it, i) => `${i + 1}. ${it.name} — $${Number(it.price).toFixed(2)}`).join('\n');
+  const taxStr = taxLabel ? `${taxLabel} $${Number(tax || 0).toFixed(2)}` : `Tax $${Number(tax || 0).toFixed(2)}`;
+  const footer = subtotal
+    ? `Subtotal $${Number(subtotal).toFixed(2)} | ${taxStr} | Total $${Number(total).toFixed(2)}`
+    : `Total $${Number(total).toFixed(2)}`;
+  return `${header}\n${itemLines}\n\n${footer}\n\nReply "all" to include everything, or type the number(s) of any personal/excluded items (e.g. "2" or "1,2").`;
 }
 
 function buildJobPickerRows({
@@ -5619,6 +5719,138 @@ try {
 // - Also logs `expectedPickerMsgSid` + `repliedToMsgSid` for debugging
 // ============================================================================
 
+/* ---- 0) Awaiting receipt item review ---- */
+const reviewItemsPA = await getPA({
+  ownerId,
+  userId: canonicalUserKey,
+  kind: PA_KIND_REVIEW_ITEMS
+}).catch(() => null);
+
+if (reviewItemsPA?.payload?.draft) {
+  const reviewDraft = reviewItemsPA.payload.draft;
+  const lineItems = Array.isArray(reviewDraft.lineItems) ? reviewDraft.lineItems : [];
+  const receiptTaxRate = typeof reviewDraft.receiptTaxRate === ‘number’ ? reviewDraft.receiptTaxRate : null;
+
+  if (lineItems.length >= 2) {
+    const rawReply = String(rawInboundText || ‘’).trim().toLowerCase();
+
+    // Check if this looks like a valid review response
+    const isAllReply = rawReply === ‘all’;
+    const nums = rawReply.split(/[\s,]+/).map((s) => parseInt(s, 10)).filter((n) => !isNaN(n));
+    const isNumericReply = nums.length > 0;
+
+    if (!isAllReply && !isNumericReply) {
+      // Not a valid item-review reply — resend the review message
+      const reviewMsg = buildItemReviewMessage({
+        items: lineItems,
+        subtotal: reviewDraft.subtotal ? Number(reviewDraft.subtotal) : null,
+        tax: reviewDraft.tax ? Number(reviewDraft.tax) : null,
+        taxLabel: reviewDraft.taxLabel || null,
+        total: reviewDraft.total ? Number(reviewDraft.total) : null,
+        store: reviewDraft.store || null
+      });
+      await sendWhatsAppTextMessage({ toPhone: fromPhone, body: reviewMsg });
+      return out(twimlEmpty(), true);
+    }
+
+    // Determine which items to exclude (user sends numbers like "2" or "1,3")
+    let excludeIndices = new Set(); // 0-based
+    if (!isAllReply) {
+      const validNums = nums.filter((n) => n >= 1 && n <= lineItems.length);
+      for (const n of validNums) excludeIndices.add(n - 1);
+    }
+
+    const approvedItems = lineItems.filter((_, i) => !excludeIndices.has(i));
+
+    if (approvedItems.length === 0) {
+      // All items excluded — cancel the expense
+      await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_REVIEW_ITEMS });
+      await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_CONFIRM });
+      return out(twimlText(‘All items excluded — expense cancelled. Send a new receipt to start over.’), false);
+    }
+
+    // Recalculate totals from approved items
+    const newSubtotal = approvedItems.reduce((sum, it) => sum + Number(it.price || 0), 0);
+    const newTax = receiptTaxRate != null ? Number((newSubtotal * receiptTaxRate).toFixed(2)) : Number(reviewDraft.tax || 0);
+    const newTotal = Number((newSubtotal + newTax).toFixed(2));
+
+    // Update the confirm PA draft with recalculated amounts and single item label
+    const itemLabel = approvedItems.length === 1
+      ? approvedItems[0].name
+      : `${approvedItems.length} items`;
+
+    const updatedDraft = {
+      ...reviewDraft,
+      item: itemLabel,
+      amount: `$${newTotal.toFixed(2)}`,
+      subtotal: newSubtotal.toFixed(2),
+      tax: newTax.toFixed(2),
+      total: newTotal.toFixed(2),
+      lineItems: undefined,
+      receiptTaxRate: undefined
+    };
+
+    // Clear review PA
+    await deletePA({ ownerId, userId: canonicalUserKey, kind: PA_KIND_REVIEW_ITEMS });
+
+    // Update confirm PA
+    await upsertPA({
+      ownerId,
+      userId: canonicalUserKey,
+      kind: PA_KIND_CONFIRM,
+      payload: {
+        type: ‘expense’,
+        sourceMsgId: reviewItemsPA.payload.sourceMsgId,
+        draft: updatedDraft
+      },
+      ttlSeconds: PA_TTL_SEC
+    });
+
+    console.info(‘[RECEIPT_ITEM_REVIEW]’, {
+      paUserId: canonicalUserKey,
+      totalItems: lineItems.length,
+      approvedCount: approvedItems.length,
+      excludedCount: excludeIndices.size,
+      newSubtotal,
+      newTax,
+      newTotal
+    });
+
+    // Proceed to job picker
+    try {
+      const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));
+      if (!jobs.length) {
+        return out(twimlText(‘No jobs found. Reply "Overhead" or create a job first.’), false);
+      }
+      const confirmFlowId =
+        String(reviewItemsPA.payload.sourceMsgId || ‘’).trim() ||
+        `${canonicalUserKey}:${Date.now()}`;
+
+      await sendJobPickList({
+        fromPhone,
+        ownerId,
+        userProfile,
+        confirmFlowId,
+        jobOptions: jobs,
+        paUserId,
+        pickUserId: canonicalUserKey,
+        page: 0,
+        pageSize: 8,
+        context: ‘expense_jobpick’,
+        confirmDraft: {
+          ...updatedDraft,
+          jobName: null,
+          jobSource: null
+        }
+      });
+      return out(twimlEmpty(), true);
+    } catch (e) {
+      console.warn(‘[EXPENSE] item review job picker send failed:’, e?.message);
+      return out(twimlText(‘Items noted. I had trouble showing the job list — try replying "jobs".’), false);
+    }
+  }
+}
+
 /* ---- 1) Awaiting job pick ---- */
 const pickPA = await getPA({
   ownerId,
@@ -7711,7 +7943,14 @@ if (looksLikeReceiptText(input)) {
       rawReceiptTax != null &&
       Math.abs(rawReceiptTotal - rawReceiptSubtotal) < 0.01;
 
-    const derivedTotal = totalLooksLikeSubtotal
+    // Also catch when parser grabbed a line-item price instead of grand total
+    const totalIsTooSmall =
+      rawReceiptTotal != null &&
+      rawReceiptSubtotal != null &&
+      rawReceiptTax != null &&
+      rawReceiptTotal < rawReceiptSubtotal;
+
+    const derivedTotal = (totalLooksLikeSubtotal || totalIsTooSmall)
       ? Number((rawReceiptSubtotal + rawReceiptTax).toFixed(2))
       : rawReceiptTotal;
 
@@ -7844,7 +8083,80 @@ if (looksLikeReceiptText(input)) {
   }
 
   // --------------------------------------------
-  // 2) Receipt intake UX: ALWAYS go to job picker first
+  // 2) Multi-item check: if receipt has 2+ items, ask user to review before job picker
+  // --------------------------------------------
+  try {
+    const allLineItems = typeof extractAllReceiptLineItems === 'function'
+      ? extractAllReceiptLineItems(mergedDraft?.receiptText || mergedDraft?.ocrText || '')
+      : [];
+
+    if (allLineItems.length >= 2) {
+      // Calculate tax rate from parsed totals for later recalculation
+      const subNum = Number(mergedDraft?.subtotal || 0);
+      const taxNum = Number(mergedDraft?.tax || 0);
+      const receiptTaxRate = subNum > 0 && taxNum > 0 ? taxNum / subNum : null;
+
+      // Store line items + tax rate in draft so the review handler can use them
+      const draftWithItems = {
+        ...mergedDraft,
+        lineItems: allLineItems,
+        receiptTaxRate
+      };
+
+      await upsertPA({
+        ownerId,
+        userId: paKey,
+        kind: PA_KIND_REVIEW_ITEMS,
+        payload: {
+          type: 'expense',
+          sourceMsgId: txSourceMsgId,
+          draft: draftWithItems
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+
+      // Also keep the confirm PA updated with latest draft (without items list bloat)
+      await upsertPA({
+        ownerId,
+        userId: paKey,
+        kind: PA_KIND_CONFIRM,
+        payload: {
+          type: 'expense',
+          sourceMsgId: txSourceMsgId,
+          draft: draftWithItems
+        },
+        ttlSeconds: PA_TTL_SEC
+      });
+
+      const reviewMsg = buildItemReviewMessage({
+        items: allLineItems,
+        subtotal: mergedDraft?.subtotal ? Number(mergedDraft.subtotal) : null,
+        tax: mergedDraft?.tax ? Number(mergedDraft.tax) : null,
+        taxLabel: mergedDraft?.taxLabel || null,
+        total: mergedDraft?.total ? Number(mergedDraft.total) : null,
+        store: mergedDraft?.store || null
+      });
+
+      await sendWhatsAppTextMessage({ toPhone: fromPhone, body: reviewMsg });
+
+      console.info('[RECEIPT_MULTI_ITEM]', {
+        paUserId,
+        itemCount: allLineItems.length,
+        items: allLineItems,
+        subtotal: mergedDraft?.subtotal,
+        tax: mergedDraft?.tax,
+        total: mergedDraft?.total,
+        receiptTaxRate
+      });
+
+      return out(twimlEmpty(), true);
+    }
+  } catch (e) {
+    console.warn('[EXPENSE] multi-item check failed (continuing to job picker):', e?.message);
+  }
+
+  // --------------------------------------------
+  // 3) Receipt intake UX: ALWAYS go to job picker first
   // --------------------------------------------
   try {
     const jobs = normalizeJobOptions(await listOpenJobsDetailed(ownerId, 50));

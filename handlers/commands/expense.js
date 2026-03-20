@@ -2091,8 +2091,6 @@ function extractAllReceiptLineItems(text) {
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
-  console.info('[RECEIPT_NORM_LINES]', { lineCount: lines.length, lines: lines.slice(0, 20) });
-
   const isFooterLine = (line) => {
     if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|interac|acct|auth|employee|you saved today|returns? and refunds?|fhst|phst)\b/i.test(line)) return true;
     // "total" is only a footer when directly adjacent to a decimal amount (not a column header like "QTY PRICE TOTAL")
@@ -5822,8 +5820,9 @@ if (reviewItemsPA?.payload?.draft) {
       subtotal: newSubtotal.toFixed(2),
       tax: newTax.toFixed(2),
       total: newTotal.toFixed(2),
-      lineItems: undefined,
-      receiptTaxRate: undefined
+      // Preserve approved line items + tax rate so confirm step can insert per-item
+      lineItems: approvedItems.length >= 2 ? approvedItems : undefined,
+      receiptTaxRate: approvedItems.length >= 2 ? receiptTaxRate : undefined
     };
 
     // Clear review PA
@@ -7643,25 +7642,63 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
   tax_label: draftForSubmit?.taxLabel || data?.taxLabel || null
 };
 
-    // --- INSERT ---
-  const inserted = await insertExpenseBestEffort(pg, insertPayload).catch((e) => {
-  console.error('[EXPENSE_YES_INSERT] failed:', e?.message);
-  throw e;
-});
+    // --- INSERT (one per line item when multi-item receipt, otherwise single) ---
+  const lineItemsToInsert = Array.isArray(draftForSubmit.lineItems) && draftForSubmit.lineItems.length >= 2
+    ? draftForSubmit.lineItems
+    : null;
+  const receiptTaxRateForInsert = typeof draftForSubmit.receiptTaxRate === 'number' ? draftForSubmit.receiptTaxRate : null;
 
-// Normalize "ins" shape so legacy tail logic works
-const ins = {
-  id: inserted?.id ?? inserted?.tx_id ?? inserted?.transaction_id ?? inserted?.row?.id ?? null,
-  inserted: inserted?.inserted ?? (inserted?.id != null || inserted?.tx_id != null || inserted?.transaction_id != null)
-};
+  let ins;
 
-console.info('[EXPENSE_INSERT_OK]', {
-  paUserId,
-  txSourceMsgId: txSourceMsgId || null,
-  media_asset_id: data.media_asset_id || null,
-  inserted: ins?.inserted ?? null,
-  id: ins?.id ?? null
-});
+  if (lineItemsToInsert) {
+    // Insert one transaction row per approved line item with proportional tax
+    const insertedIds = [];
+    for (const lineItem of lineItemsToInsert) {
+      const itemAmountCents = Math.round(Number(lineItem.price || 0) * 100);
+      const itemTaxCents = receiptTaxRateForInsert != null ? Math.round(itemAmountCents * receiptTaxRateForInsert) : 0;
+      const itemSubtotal = (itemAmountCents / 100).toFixed(2);
+      const itemTax = (itemTaxCents / 100).toFixed(2);
+      const itemInsertPayload = {
+        ...insertPayload,
+        amount: itemSubtotal,
+        amount_cents: itemAmountCents,
+        description: String(lineItem.name || '').trim() || insertPayload.description,
+        subtotal_amount: itemSubtotal,
+        tax_amount: itemTax,
+      };
+      const itemInserted = await insertExpenseBestEffort(pg, itemInsertPayload).catch((e) => {
+        console.error('[EXPENSE_YES_INSERT_ITEM] failed:', e?.message);
+        throw e;
+      });
+      insertedIds.push(itemInserted?.id ?? itemInserted?.tx_id ?? itemInserted?.transaction_id ?? itemInserted?.row?.id ?? null);
+    }
+    ins = { id: insertedIds[0], inserted: insertedIds.length > 0 };
+    console.info('[EXPENSE_INSERT_OK]', {
+      paUserId,
+      txSourceMsgId: txSourceMsgId || null,
+      media_asset_id: data.media_asset_id || null,
+      inserted: ins.inserted,
+      id: ins.id,
+      itemCount: insertedIds.length,
+      allIds: insertedIds
+    });
+  } else {
+    const singleInserted = await insertExpenseBestEffort(pg, insertPayload).catch((e) => {
+      console.error('[EXPENSE_YES_INSERT] failed:', e?.message);
+      throw e;
+    });
+    ins = {
+      id: singleInserted?.id ?? singleInserted?.tx_id ?? singleInserted?.transaction_id ?? singleInserted?.row?.id ?? null,
+      inserted: singleInserted?.inserted ?? (singleInserted?.id != null || singleInserted?.tx_id != null || singleInserted?.transaction_id != null)
+    };
+    console.info('[EXPENSE_INSERT_OK]', {
+      paUserId,
+      txSourceMsgId: txSourceMsgId || null,
+      media_asset_id: data.media_asset_id || null,
+      inserted: ins?.inserted ?? null,
+      id: ins?.id ?? null
+    });
+  }
 
 // ------------------------------
 // ✅ Brain v0 fact emission (expense.confirmed)

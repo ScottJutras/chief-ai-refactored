@@ -2091,8 +2091,12 @@ function extractAllReceiptLineItems(text) {
     .map((l) => String(l || '').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
-  const isFooterLine = (line) =>
-    /\b(subtotal|total|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|interac|acct|auth|employee|you saved today|returns? and refunds?|fhst|phst)\b/i.test(line);
+  const isFooterLine = (line) => {
+    if (/\b(subtotal|gst\/hst|gst|hst|pst|tax|debit card|debit|visa|mastercard|amex|interac|acct|auth|employee|you saved today|returns? and refunds?|fhst|phst)\b/i.test(line)) return true;
+    // "total" is only a footer when directly adjacent to a decimal amount (not a column header like "QTY PRICE TOTAL")
+    if (/\btotal\b/i.test(line) && /\btotal\b\s*\$?\d+\.\d{2}/i.test(line)) return true;
+    return false;
+  };
 
   const isSkipLine = (line) =>
     /\b(rona|home depot|lowes|canadian tire|costco|walmart|petro-canada|petro canada|shell|esso|mission exteriors)\b/i.test(line) ||

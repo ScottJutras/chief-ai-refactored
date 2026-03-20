@@ -7663,11 +7663,21 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
       const itemSourceMsgId = insertPayload.source_msg_id
         ? `${insertPayload.source_msg_id}:i${itemIdx}`
         : null;
+      // Disambiguate description so identical items get distinct dedupe_hash values
+      const rawItemName = String(lineItem.name || '').trim() || insertPayload.description;
+      const dupeCount = lineItemsToInsert.filter(
+        (x) => (String(x.name || '').trim() || insertPayload.description) === rawItemName
+      ).length;
+      const dupeIdx = lineItemsToInsert
+        .slice(0, itemIdx)
+        .filter((x) => (String(x.name || '').trim() || insertPayload.description) === rawItemName)
+        .length;
+      const itemDescription = dupeCount > 1 ? `${rawItemName} (${dupeIdx + 1}/${dupeCount})` : rawItemName;
       const itemInsertPayload = {
         ...insertPayload,
         amount: itemSubtotal,
         amount_cents: itemAmountCents,
-        description: String(lineItem.name || '').trim() || insertPayload.description,
+        description: itemDescription,
         subtotal_amount: itemSubtotal,
         tax_amount: itemTax,
         source_msg_id: itemSourceMsgId,

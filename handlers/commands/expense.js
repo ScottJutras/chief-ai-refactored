@@ -2110,10 +2110,12 @@ function extractAllReceiptLineItems(text) {
     /^\d+$/.test(name) ||
     !/[A-Za-z]/.test(name) ||
     /^\d+\.\d{2}\s*[A-Z]?\s*$/.test(name) ||   // price-only string like "28.02 A"
+    /^\d{1,3}\s+\d+\.\d{2}\s+[A-Z]{1,3}\s+[A-Z]/.test(name) || // qty/price/unit/tax line like "1 28.02 EA B"
     /\b(subtotal|total|tax|gst|hst|pst|debit|visa|mastercard|amex|interac)\b/i.test(name);
 
   const parseMoney = (line) => {
-    const m = line.match(/\b(\d{1,4}\.\d{2})\b/);
+    // Allow optional single trailing tax-code letter (e.g. "28.02H" on RONA receipts)
+    const m = line.match(/\b(\d{1,4}\.\d{2})[A-Z]?\b/);
     if (!m) return null;
     const n = Number(m[1]);
     return Number.isFinite(n) && n > 0 && n < 10000 ? n : null;
@@ -2780,7 +2782,10 @@ function normalizeReceiptOcrForParsing(text) {
     // ✅ Barcode + price + short unit/tax codes → split before product description
     // e.g. "773615003161 77.89 RL B MEMBRANE" → "773615003161 77.89 RL B\nMEMBRANE"
     .replace(/(\b\d{8,14}\b(?:\s+[\d.,]+)+(?:\s+[A-Z]{1,3}){1,3}\s+)([A-Z]{4,})/g, '$1\n$2')
-    .replace(/(\$\s*\d+\.\d{2})\s+([A-Za-z]{3,})/g, '$1\n$2');
+    .replace(/(\$\s*\d+\.\d{2})\s+([A-Za-z]{3,})/g, '$1\n$2')
+    // ✅ RONA/hardware item-row boundary: "qty unit_price 2-char-unit 1-char-taxcode"
+    // e.g. "PREMIUM 28.02H 1 28.02 EA B 6626..." → "PREMIUM 28.02H\n1 28.02 EA B 6626..."
+    .replace(/(\S)\s+(?=[1-9]\d{0,2}\s+\d+\.\d{2}\s+[A-Z]{2}\s+[A-Z]\b)/g, '$1\n');
 
   return s;
 }

@@ -8092,9 +8092,17 @@ if (looksLikeReceiptText(input)) {
   // 2) Multi-item check: if receipt has 2+ items, ask user to review before job picker
   // --------------------------------------------
   try {
+    const _receiptSrc = mergedDraft?.receiptText || mergedDraft?.ocrText || '';
     const allLineItems = typeof extractAllReceiptLineItems === 'function'
-      ? extractAllReceiptLineItems(mergedDraft?.receiptText || mergedDraft?.ocrText || '')
+      ? extractAllReceiptLineItems(_receiptSrc)
       : [];
+
+    console.info('[RECEIPT_LINE_ITEMS_CHECK]', {
+      srcLen: _receiptSrc.length,
+      srcHead: _receiptSrc.slice(0, 200),
+      itemCount: allLineItems.length,
+      items: allLineItems
+    });
 
     if (allLineItems.length >= 2) {
       // Calculate tax rate from parsed totals for later recalculation

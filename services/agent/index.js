@@ -188,14 +188,25 @@ function pickTopic(text = '', hints = []) {
 function genericMenu(channel = 'whatsapp') {
   if (channel === 'portal') {
     return [
-      "I don't have enough data to answer that specifically. Try a more direct question:",
+      "I don't have a specific answer for that yet — it may be that your ledger doesn't have enough data, or I need a more specific question to pull the right numbers.",
       "",
-      "• What did I spend this month (MTD)?",
-      "• What's my revenue this week (WTD)?",
-      "• Show me expenses for [job name]",
-      "• How much did I make last month?",
+      "Here's what I can answer right now:",
       "",
-      "Make sure your range selector (MTD, WTD, etc.) matches your question."
+      "Spending & revenue",
+      "  • What did we spend this month?",
+      "  • What's our revenue vs. expenses MTD?",
+      "  • Which vendor are we spending the most with?",
+      "",
+      "Jobs & profitability",
+      "  • Is [job name] making money?",
+      "  • Which jobs are losing money this week?",
+      "  • What expenses are unassigned to a job?",
+      "",
+      "Crew & time",
+      "  • How many hours did the crew log this week?",
+      "  • What did we spend on labour MTD?",
+      "",
+      "Try one of these and I'll give you the real numbers."
     ].join("\n");
   }
 
@@ -472,11 +483,39 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
     return genericMenu(channel);
   }
 
-  // 0) Help/menu
-  if (/\b(what can i do|what can i do here|help|how to|how do i|what now)\b/i.test(lc)) {
-    // reset stale flow state to avoid weird followups
+  // 0) Help / intro intent — always answer deterministically, never hit the LLM
+  const isHelpIntent =
+    /\b(what can (you|i) do|how can you help|what do you do|who are you|what are you|how does this work|how do i use|what can i ask|tell me what you can do|help me understand)\b/i.test(lc) ||
+    /\b(what can i do here|how to|how do i|what now)\b/i.test(lc) ||
+    lc === 'help' || lc === '?' || lc === 'menu';
+
+  if (isHelpIntent) {
     await patchActorMemorySafe(ownerDigits, actorKey, { pending_choice: null, pending_intent: null });
-    return genericMenu();
+    if (channel === 'portal') {
+      return [
+        "I'm Chief — think of me as your on-call CFO. I read your transaction ledger in real time and give you straight answers about where the money is going, which jobs are profitable, and what needs your attention.",
+        "",
+        "Here's what you can ask me:",
+        "",
+        "Financial position",
+        "  \"What did we spend this month?\"",
+        "  \"How much revenue came in this week (WTD)?\"",
+        "  \"Are we up or down vs. last month?\"",
+        "",
+        "Job profitability",
+        "  \"Is [job name] making money?\"",
+        "  \"Which jobs are losing money right now?\"",
+        "  \"What expenses aren't assigned to a job yet?\"",
+        "",
+        "Crew & operations",
+        "  \"How many hours did the team log this week?\"",
+        "  \"What's still in Pending Review?\"",
+        "  \"Which tasks are overdue?\"",
+        "",
+        "The more you log through WhatsApp — expenses, revenue, time — the more precise my answers get. What would you like to know first?"
+      ].join("\n");
+    }
+    return genericMenu(channel);
   }
 
   // 1) Deterministic choice handling + memory

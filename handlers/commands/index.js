@@ -30,12 +30,14 @@ const { getEffectivePlanKey } = require("../../src/config/getEffectivePlanKey");
 
 // Lazy-load per-file handlers
 let tasksHandler, handleTimeclock, handleJob, handleExpense, handleRevenue, teamHandler;
+let handleMileage, isMileageMessage;
 try { ({ tasksHandler } = require('./tasks')); } catch {}
 try { ({ handleTimeclock } = require('./timeclock')); } catch {}
 try { ({ handleJob } = require('./job')); } catch {}
 try { ({ handleExpense } = require('./expense')); } catch {}
 try { ({ handleRevenue } = require('./revenue')); } catch {}
-try { ({ teamHandler } = require('./team')); } catch {} // ✅ add
+try { ({ teamHandler } = require('./team')); } catch {}
+try { ({ handleMileage, isMileageMessage } = require('./mileage')); } catch {}
 
 
 
@@ -333,6 +335,22 @@ if (teamHandler) {
         await safeCleanup({ from, ownerId });
         return true;
       }
+    }
+
+    // Mileage — check after timeclock to avoid ambiguity
+    if (handleMileage && isMileageMessage && isMileageMessage(raw)) {
+      const country = String(ownerProfile?.country || 'CA').toUpperCase();
+      const tenantId = String(ownerProfile?.tenant_id || ownerId || '');
+      const reply = await handleMileage({
+        text: raw,
+        ownerId,
+        tenantId,
+        country,
+        sourceMsgId,
+      }).catch((e) => `⚠️ Mileage log failed: ${e?.message || 'unknown error'}`);
+      twiml(res, reply);
+      await safeCleanup({ from, ownerId });
+      return true;
     }
 
     // 6) Bootstrap CIL (ONLY for areas without dedicated handlers)

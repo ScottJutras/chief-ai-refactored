@@ -459,6 +459,27 @@ try {
   console.warn('[FACT_EVENT] task.created insert failed (ignored):', e?.message);
 }
 
+      // Schedule reminder 1h before due date (non-fatal)
+      if (task?.due_at && task?.task_no) {
+        try {
+          const { createReminder } = require('../../services/reminders');
+          let remindAt = new Date(task.due_at);
+          remindAt.setTime(remindAt.getTime() - 60 * 60 * 1000); // 1h before
+          if (remindAt <= new Date()) remindAt = new Date(task.due_at); // already past → remind at due time
+          await createReminder({
+            ownerId,
+            userId: paUserId,
+            taskNo: task.task_no,
+            taskTitle: task.title || title,
+            remindAt,
+            kind: 'task',
+            sourceMsgId: safeMsgId ? `remind:${safeMsgId}` : null,
+          });
+        } catch (e) {
+          console.warn('[REMINDERS] createReminder failed (ignored):', e?.message);
+        }
+      }
+
       const due = task?.due_at ? ` (due ${formatDue(task.due_at, tz)})` : '';
       const who = assignedTo ? ` — assigned` : '';
       return respond(res, `✅ Task #${task?.task_no || ''} created: ${task?.title || title}${due}${who}`);

@@ -1627,6 +1627,24 @@ async function clearRepairPrompt(id) {
         inserted.id ?? null,
         job_id || null
       );
+
+      // Schedule lunch reminder (non-fatal)
+      try {
+        const { createLunchReminder } = require('../../services/reminders');
+        // Noon local today; if already past noon, fallback to 4h from now
+        const noon = new Date();
+        noon.setHours(12, 0, 0, 0);
+        const remindAt = noon > new Date() ? noon : new Date(Date.now() + 4 * 60 * 60 * 1000);
+        await createLunchReminder({
+          ownerId: owner_id,
+          userId: user_id,
+          shiftId: String(inserted.id ?? ''),
+          remindAt,
+          sourceMsgId: source_msg_id ? `lunch:${source_msg_id}` : null,
+        });
+      } catch (e) {
+        console.warn('[REMINDERS] createLunchReminder failed (ignored):', e?.message);
+      }
     }
 
     return ret(`✅ Clocked in at ${toHumanTime(occurredAtIso, tz)}.`);

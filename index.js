@@ -189,7 +189,17 @@ app.use("/api/dashboard", dashboardRouter);
 
 if (!process.env.VERCEL && process.env.NODE_ENV !== "test") {
   const PORT = process.env.PORT || 3000;
-  app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`✅ Server running on ${PORT}`);
+
+    // Start reminder dispatch loop (polls DB every 60s, sends WhatsApp)
+    try {
+      const { startReminderDispatch } = require('./workers/reminder_dispatch');
+      startReminderDispatch();
+    } catch (e) {
+      console.warn('[REMINDERS] Failed to start reminder dispatch (ignored):', e?.message);
+    }
+  });
 }
 
 module.exports = app;

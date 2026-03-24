@@ -403,7 +403,10 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
     const msg = await llm.chat({ messages, tools: toolsSpec });
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
-      return String(msg.content || '').trim() || genericMenu();
+      const content = String(msg.content || '').trim();
+      if (content) return content;
+      // LLM returned no content and no tool calls — give a useful fallback
+      return "I don't have enough data logged yet to answer that. Once you start logging expenses, revenue, and time through WhatsApp, I can give you real insights on this.";
     }
 
     messages.push(msg);
@@ -738,7 +741,14 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
   });
 
   const channelContext = channel === 'portal'
-    ? '\n\nCHANNEL: Web portal. Respond in clear prose. Do NOT suggest WhatsApp commands. The user is asking a business intelligence question from a browser dashboard.'
+    ? `
+
+CHANNEL: Web portal dashboard. Rules for this context:
+- Respond in clear prose paragraphs. Do NOT suggest WhatsApp commands.
+- The user is asking a business intelligence question from their browser.
+- If tool results are empty (no transactions, no jobs, no tasks): respond with something like "You don't have any [expenses/revenue/activity] logged yet. Once you start logging through WhatsApp, I can answer questions like this with real numbers." Be specific about what's missing.
+- Never return an error or dead-end. Always end with a concrete next step or example question the user can ask once they have data.
+- If you cannot answer due to missing data, still be helpful: explain what data would unlock the answer.`
     : '';
 
   const seed = [
@@ -747,7 +757,8 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
       content: `${CHIEF_SYSTEM_PROMPT}${channelContext}
 
 Execution rules:
-- If details are sufficient: use tools, then reply with "✅ <short confirmation>" (+ IDs if relevant).
+- If details are sufficient: use tools, then reply with a clear prose answer (+ numbers/dates from the data).
+- If tool results come back empty, explain what's missing and what the user should do next.
 - If details are missing: ask exactly ONE clarifying question (do not execute yet).
 - Never dead-end; always offer the next best action.`
     },

@@ -13,9 +13,20 @@ const { getEffectivePlanKey } = require('../../src/config/getEffectivePlanKey');
 
 // ----- Subscription gate (free/starter can't use Agent) -----
 function canUseAgent(ownerProfile) {
-  // Ask Chief unlocks on Starter, so Agent should too.
+  if (!ownerProfile) return false;
+  // Check explicit plan key first
   const k = getEffectivePlanKey(ownerProfile);
-  return k === "starter" || k === "pro";
+  if (k === "starter" || k === "pro") return true;
+  // Also allow active trial or active subscription period (mirrors routes/askChief.js looksPaid)
+  const now = Date.now();
+  const trialEnd = ownerProfile.trial_end ? new Date(ownerProfile.trial_end).getTime() : 0;
+  if (trialEnd > now) return true;
+  const periodEnd = ownerProfile.current_period_end ? new Date(ownerProfile.current_period_end).getTime() : 0;
+  if (periodEnd > now) return true;
+  const subId = String(ownerProfile.stripe_subscription_id || "").trim();
+  const status = String(ownerProfile.sub_status || "").toLowerCase().trim();
+  if (subId && status !== "canceled" && status !== "cancelled") return true;
+  return false;
 }
 
 
@@ -174,7 +185,20 @@ function pickTopic(text = '', hints = []) {
 }
 
 // ----- Generic menu (never dead-ends) ----------------------
-function genericMenu() {
+function genericMenu(channel = ‘whatsapp’) {
+  if (channel === ‘portal’) {
+    return [
+      "I don’t have enough data to answer that specifically. Try a more direct question:",
+      "",
+      "• What did I spend this month (MTD)?",
+      "• What’s my revenue this week (WTD)?",
+      "• Show me expenses for [job name]",
+      "• How much did I make last month?",
+      "",
+      "Make sure your range selector (MTD, WTD, etc.) matches your question."
+    ].join("\n");
+  }
+
   return [
     "Here’s what I can do right now:",
     "",
@@ -405,29 +429,33 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
   }
 
   // Exceeded max iterations without a final text reply
-  return genericMenu();
+  return "I wasn't able to pull a complete answer in time. Try narrowing your question — for example, specify a date range (MTD, WTD) or a specific job name.";
 }
 
 // ----- Public ask API --------------------------------------
 async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) {
-  const raw = String(text || '').trim();
+  const raw = String(text || ‘’).trim();
   const lc = normBare(raw);
 
   const ownerDigits = DIGITS_ONLY(ownerId);
   const actorKey = DIGITS_ONLY(from) || ownerDigits; // WhatsApp "from" is your actor identity
 
+  // Detect channel from hints
+  const hintSet = new Set((topicHints || []).map(h => String(h).toLowerCase()));
+  const channel = hintSet.has(‘portal’) || hintSet.has(‘askchief’) ? ‘portal’ : ‘whatsapp’;
+
   // Load memory (best-effort)
   const memory = await loadActorMemorySafe(ownerDigits, actorKey);
-  const pending_choice = String(memory?.pending_choice || '').toLowerCase().trim(); // 'log' | 'question'
-  const pending_intent = String(memory?.pending_intent || '').toLowerCase().trim(); // 'expense'|'revenue'|'task'|'time'|'job'
+  const pending_choice = String(memory?.pending_choice || ‘’).toLowerCase().trim(); // ‘log’ | ‘question’
+  const pending_intent = String(memory?.pending_intent || ‘’).toLowerCase().trim(); // ‘expense’|’revenue’|’task’|’time’|’job’
 
   // If Agent not available for this plan, still give a non-dead-end reply
   if (!canUseAgent(ownerProfile)) {
     // If they’re mid-flow, still help
-    if (pending_choice === 'log') {
+    if (pending_choice === ‘log’) {
       return `Got it. What are you logging — expense, revenue, task, or time?`;
     }
-    if (pending_choice === 'question') {
+    if (pending_choice === ‘question’) {
       return `Ask away — what do you want to know? (cashflow, profit on a job, what you logged today, etc.)`;
     }
 
@@ -438,7 +466,7 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
         if (out && out.trim()) return out;
       } catch {}
     }
-    return genericMenu();
+    return genericMenu(channel);
   }
 
   // 0) Help/menu
@@ -709,10 +737,14 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
     model: process.env.LLM_MODEL || 'gpt-4o-mini',
   });
 
+  const channelContext = channel === 'portal'
+    ? '\n\nCHANNEL: Web portal. Respond in clear prose. Do NOT suggest WhatsApp commands. The user is asking a business intelligence question from a browser dashboard.'
+    : '';
+
   const seed = [
     {
       role: 'system',
-      content: `${CHIEF_SYSTEM_PROMPT}
+      content: `${CHIEF_SYSTEM_PROMPT}${channelContext}
 
 Execution rules:
 - If details are sufficient: use tools, then reply with "✅ <short confirmation>" (+ IDs if relevant).
@@ -726,7 +758,7 @@ Execution rules:
     return await runToolsLoop({ llm, seedMessages: seed, ownerId: ownerDigits, from });
   } catch (e) {
     console.warn('[AGENT] tools loop failed:', e?.message);
-    return genericMenu();
+    return genericMenu(channel);
   }
 }
 

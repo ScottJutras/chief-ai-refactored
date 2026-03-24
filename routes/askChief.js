@@ -10,7 +10,7 @@ const { runAgent } = require("../services/agent");
 const { enforceAskChiefGates_AND_Consume } = require("../services/answerChief");
 
 const ASK_CHIEF_REQUIRE_PLAN = String(process.env.ASK_CHIEF_REQUIRE_PLAN || "1") === "1";
-const ASK_CHIEF_AGENT_TIMEOUT_MS = Number(process.env.ASK_CHIEF_AGENT_TIMEOUT_MS || 8000);
+const ASK_CHIEF_AGENT_TIMEOUT_MS = Number(process.env.ASK_CHIEF_AGENT_TIMEOUT_MS || 20000);
 
 let _admin = null;
 function getAdminSupabase() {
@@ -165,10 +165,10 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
       return res.status(200).json({
         ok: false,
         code: "NOT_LINKED",
-        message: "Link WhatsApp to this business before using Ask Chief.",
+        message: "Ask Chief reads your transaction ledger, which is built by logging expenses and revenue through WhatsApp. Link your WhatsApp to start — once you have data, Chief can answer questions about cashflow, job profit, and more.",
         actions: [
-          { label: "Generate link code", href: "https://app.usechiefos.com/app/link-phone", kind: "primary" },
-          { label: "How linking works", href: "https://usechiefos.com/#faq", kind: "secondary" },
+          { label: "Link WhatsApp", href: "https://app.usechiefos.com/app/link-phone", kind: "primary" },
+          { label: "How it works", href: "https://usechiefos.com/#faq", kind: "secondary" },
         ],
         traceId,
       });
@@ -197,10 +197,10 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
             return res.status(200).json({
               ok: false,
               code: "NOT_LINKED",
-              message: "Link WhatsApp to this business before using Ask Chief.",
+              message: "Ask Chief reads your transaction ledger, which is built by logging expenses and revenue through WhatsApp. Link your WhatsApp to start — once you have data, Chief can answer questions about cashflow, job profit, and more.",
               actions: [
-                { label: "Generate link code", href: "https://app.usechiefos.com/app/link-phone", kind: "primary" },
-                { label: "How linking works", href: "https://usechiefos.com/#faq", kind: "secondary" },
+                { label: "Link WhatsApp", href: "https://app.usechiefos.com/app/link-phone", kind: "primary" },
+                { label: "How it works", href: "https://usechiefos.com/#faq", kind: "secondary" },
               ],
               traceId,
             });
@@ -229,10 +229,10 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
             return res.status(200).json({
               ok: false,
               code: "NOT_LINKED",
-              message: "This business isn’t fully linked to an owner phone yet. Link WhatsApp to continue.",
+              message: "Ask Chief reads your transaction ledger, which is built by logging expenses and revenue through WhatsApp. Link your WhatsApp to start — once you have data, Chief can answer questions about cashflow, job profit, and more.",
               actions: [
-                { label: "Generate link code", href: "https://app.usechiefos.com/app/link-phone", kind: "primary" },
-                { label: "How linking works", href: "https://usechiefos.com/#faq", kind: "secondary" },
+                { label: "Link WhatsApp", href: "https://app.usechiefos.com/app/link-phone", kind: "primary" },
+                { label: "How it works", href: "https://usechiefos.com/#faq", kind: "secondary" },
               ],
               traceId,
             });
@@ -327,12 +327,8 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
           error: e?.message || String(e),
         });
 
-        return res.status(500).json({
-          ok: false,
-          code: "ERROR",
-          message: "Plan check failed.",
-          traceId,
-        });
+        // Fail open with a warning rather than a hard error — user already authenticated
+        console.warn("[ASK_CHIEF_PLAN_GATE_FAILOPEN]", { traceId, reason: "proceeding_after_gate_error" });
       }
     }
 
@@ -402,13 +398,18 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
     }
   } catch (e) {
     console.error("[ASK_CHIEF_FAILED]", {
+      traceId,
       error: e?.message || String(e),
     });
 
-    return res.status(500).json({
-      ok: false,
-      code: "ERROR",
-      message: "Ask Chief failed.",
+    return res.status(200).json({
+      ok: true,
+      answer: "I ran into an unexpected problem. Your data is safe — please try again in a moment.",
+      evidence_meta: buildEvidenceMeta({ range: "mtd", tenantId: null, tz: "America/Toronto", actorKey: null }),
+      warnings: ["Unexpected error — the question was not answered."],
+      actions: [],
+      degraded: true,
+      traceId,
     });
   }
 });

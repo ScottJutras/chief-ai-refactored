@@ -185,13 +185,13 @@ function pickTopic(text = '', hints = []) {
 }
 
 // ----- Generic menu (never dead-ends) ----------------------
-function genericMenu(channel = ‘whatsapp’) {
-  if (channel === ‘portal’) {
+function genericMenu(channel = 'whatsapp') {
+  if (channel === 'portal') {
     return [
-      "I don’t have enough data to answer that specifically. Try a more direct question:",
+      "I don't have enough data to answer that specifically. Try a more direct question:",
       "",
       "• What did I spend this month (MTD)?",
-      "• What’s my revenue this week (WTD)?",
+      "• What's my revenue this week (WTD)?",
       "• Show me expenses for [job name]",
       "• How much did I make last month?",
       "",
@@ -200,7 +200,7 @@ function genericMenu(channel = ‘whatsapp’) {
   }
 
   return [
-    "Here’s what I can do right now:",
+    "Here's what I can do right now:",
     "",
     "If you want to **log something**, send one of these:",
     "• task - buy nails",
@@ -209,11 +209,11 @@ function genericMenu(channel = ‘whatsapp’) {
     "• clock in / clock out",
     "",
     "If you want an **answer**, ask:",
-    "• what’s my cashflow this month?",
+    "• what's my cashflow this month?",
     "• profit on job 1556",
     "• what did I log today?",
     "",
-    "Tell me: **log** or **question** — and I’ll drive."
+    "Tell me: **log** or **question** — and I'll drive."
   ].join("\n");
 }
 
@@ -386,7 +386,7 @@ function questionMenu() {
     "Alright — ask it straight.",
     "",
     "Examples:",
-    "• what’s my cashflow this month?",
+    "• what's my cashflow this month?",
     "• profit on job 1556",
     "• what did I log today?"
   ].join("\n");
@@ -434,7 +434,7 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
 
 // ----- Public ask API --------------------------------------
 async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) {
-  const raw = String(text || ‘’).trim();
+  const raw = String(text || '').trim();
   const lc = normBare(raw);
 
   const ownerDigits = DIGITS_ONLY(ownerId);
@@ -442,20 +442,20 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
 
   // Detect channel from hints
   const hintSet = new Set((topicHints || []).map(h => String(h).toLowerCase()));
-  const channel = hintSet.has(‘portal’) || hintSet.has(‘askchief’) ? ‘portal’ : ‘whatsapp’;
+  const channel = hintSet.has('portal') || hintSet.has('askchief') ? 'portal' : 'whatsapp';
 
   // Load memory (best-effort)
   const memory = await loadActorMemorySafe(ownerDigits, actorKey);
-  const pending_choice = String(memory?.pending_choice || ‘’).toLowerCase().trim(); // ‘log’ | ‘question’
-  const pending_intent = String(memory?.pending_intent || ‘’).toLowerCase().trim(); // ‘expense’|’revenue’|’task’|’time’|’job’
+  const pending_choice = String(memory?.pending_choice || '').toLowerCase().trim(); // 'log' | 'question'
+  const pending_intent = String(memory?.pending_intent || '').toLowerCase().trim(); // 'expense'|'revenue'|'task'|'time'|'job'
 
   // If Agent not available for this plan, still give a non-dead-end reply
   if (!canUseAgent(ownerProfile)) {
-    // If they’re mid-flow, still help
-    if (pending_choice === ‘log’) {
+    // If they're mid-flow, still help
+    if (pending_choice === 'log') {
       return `Got it. What are you logging — expense, revenue, task, or time?`;
     }
-    if (pending_choice === ‘question’) {
+    if (pending_choice === 'question') {
       return `Ask away — what do you want to know? (cashflow, profit on a job, what you logged today, etc.)`;
     }
 
@@ -489,7 +489,7 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
     return `Okay — what do you want to know?`;
   }
 
-  // 2) If we already know they’re logging, treat bare intents as a continuation (NOT a new convo)
+  // 2) If we already know they're logging, treat bare intents as a continuation (NOT a new convo)
   if (pending_choice === 'log') {
   if (isBareExpense(raw)) {
     await patchActorMemorySafe(ownerDigits, actorKey, {
@@ -512,7 +512,7 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
       pending_intent: 'task',
       intake_draft: { kind: 'task', taskText: null }
     });
-    return `What’s the task?`;
+    return `What's the task?`;
   }
 
   if (isBareTime(raw)) {
@@ -585,7 +585,7 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
       });
 
       const cmd = buildExpenseCommand({ amountText: intake.amountText, vendor, dateIso });
-      // Clear flow state so they don’t get stuck
+      // Clear flow state so they don't get stuck
       await patchActorMemorySafe(ownerDigits, actorKey, {
         pending_choice: null,
         pending_intent: null,
@@ -637,7 +637,7 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
       return `✅ Got it — revenue ${amt}. What was it for? (optional)`;
     }
 
-    // 2) Optional description — if they type anything non-empty, we’ll capture and finalize.
+    // 2) Optional description — if they type anything non-empty, we'll capture and finalize.
     const desc = cleanVendorOrDesc(raw);
     const dateIso = extractIsoDate(desc, tz) || intake.dateIso || null;
 
@@ -662,12 +662,12 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
       await patchActorMemorySafe(ownerDigits, actorKey, {
         intake_draft: { kind: 'task', taskText: null }
       });
-      return `What’s the task?`;
+      return `What's the task?`;
     }
 
     if (!intake.taskText) {
       const taskText = cleanVendorOrDesc(raw);
-      if (!taskText) return `What’s the task?`;
+      if (!taskText) return `What's the task?`;
 
       const cmd = buildTaskCommand({ taskText });
 
@@ -713,7 +713,7 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
   // 4) If user types bare intent without saying “log” first, still be helpful (ChatGPT-like)
   if (isBareExpense(raw)) return `Got it — how much was it?`;
   if (isBareRevenue(raw)) return `Got it — how much came in?`;
-  if (isBareTask(raw)) return `Got it — what’s the task?`;
+  if (isBareTask(raw)) return `Got it — what's the task?`;
   if (isBareTime(raw)) return `Got it — clock **in** or **out**?`;
   if (isBareJob(raw)) return `Got it — create, list, or set active?`;
 

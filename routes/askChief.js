@@ -92,7 +92,7 @@ async function requireOneAuthMode(req, res) {
   }
 
   await new Promise((resolve, reject) =>
-    requirePortalUser(req, res, (err) => (err ? reject(err) : resolve()))
+    requirePortalUser()(req, res, (err) => (err ? reject(err) : resolve()))
   );
   return "portal";
 }

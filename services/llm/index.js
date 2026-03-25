@@ -17,7 +17,7 @@ class LLMProvider {
 
     this.openai =
       this.provider === "openai" && process.env.OPENAI_API_KEY
-        ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+        ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 12000 })
         : null;
   }
 

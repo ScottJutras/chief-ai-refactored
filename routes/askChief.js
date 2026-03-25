@@ -10,7 +10,7 @@ const { runAgent } = require("../services/agent");
 const { enforceAskChiefGates_AND_Consume } = require("../services/answerChief");
 
 const ASK_CHIEF_REQUIRE_PLAN = String(process.env.ASK_CHIEF_REQUIRE_PLAN || "1") === "1";
-const ASK_CHIEF_AGENT_TIMEOUT_MS = Number(process.env.ASK_CHIEF_AGENT_TIMEOUT_MS || 20000);
+const ASK_CHIEF_AGENT_TIMEOUT_MS = Number(process.env.ASK_CHIEF_AGENT_TIMEOUT_MS || 15000);
 
 let _admin = null;
 function getAdminSupabase() {

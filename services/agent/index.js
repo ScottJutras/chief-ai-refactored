@@ -404,7 +404,7 @@ function questionMenu() {
 }
 
 // ----- Tool-calling loop -----------------------------------
-const MAX_TOOL_ITERATIONS = 6;
+const MAX_TOOL_ITERATIONS = 3;
 
 async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
   const { toolsSpec, reg } = getTools();

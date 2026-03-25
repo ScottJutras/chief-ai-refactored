@@ -524,7 +524,7 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
   if (channel === 'portal') {
     const llmPortal = new LLMProvider({
       provider: process.env.LLM_PROVIDER || process.env.AI_PROVIDER || 'openai',
-      model: process.env.LLM_MODEL_PORTAL || process.env.LLM_MODEL || 'gpt-4o',
+      model: process.env.LLM_MODEL_PORTAL || process.env.LLM_MODEL || 'gpt-4o-mini',
     });
 
     const portalSystemPrompt = `${CHIEF_SYSTEM_PROMPT}

@@ -518,6 +518,42 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
     return genericMenu(channel);
   }
 
+  // ---- PORTAL FAST PATH ----------------------------------------
+  // For portal users, skip ALL WhatsApp-specific deterministic flows.
+  // Go straight to the LLM with tools — answer anything, never hallucinate data.
+  if (channel === 'portal') {
+    const llmPortal = new LLMProvider({
+      provider: process.env.LLM_PROVIDER || process.env.AI_PROVIDER || 'openai',
+      model: process.env.LLM_MODEL_PORTAL || process.env.LLM_MODEL || 'gpt-4o',
+    });
+
+    const portalSystemPrompt = `${CHIEF_SYSTEM_PROMPT}
+
+CHANNEL: Web portal dashboard (not WhatsApp). You are Chief, the user's on-call CFO.
+
+Rules for every response:
+- Answer ANY question the user asks. For general business questions, answer from your knowledge.
+- For questions about the user's OWN data (their expenses, revenue, jobs, time, tasks): ALWAYS call the available tools first. Never invent numbers or make up transactions.
+- If tools return empty results, say so honestly and helpfully — explain what data would need to be logged to answer the question, and what logging through WhatsApp would unlock.
+- Respond in clear, conversational prose. No bullet-point menus. No WhatsApp command suggestions.
+- Be direct and specific. If you have real numbers from tools, lead with them.
+- Never return a dead-end. Always end with something actionable or a follow-up question.
+- Do not mention "WhatsApp commands" or "say expense $X" style prompts — this is a web dashboard.`;
+
+    const portalSeed = [
+      { role: 'system', content: portalSystemPrompt },
+      { role: 'user', content: raw }
+    ];
+
+    try {
+      return await runToolsLoop({ llm: llmPortal, seedMessages: portalSeed, ownerId: ownerDigits, from });
+    } catch (e) {
+      console.warn('[AGENT] portal tools loop failed:', e?.message);
+      return "I ran into a problem pulling that answer. Your data is safe — please try again in a moment.";
+    }
+  }
+  // ---- END PORTAL FAST PATH ------------------------------------
+
   // 1) Deterministic choice handling + memory
   if (isLogChoice(raw)) {
     await patchActorMemorySafe(ownerDigits, actorKey, { pending_choice: 'log', pending_intent: null });

@@ -17,11 +17,11 @@ class LLMProvider {
 
     this.openai =
       this.provider === "openai" && process.env.OPENAI_API_KEY
-        ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 12000 })
+        ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, timeout: 22000 })
         : null;
   }
 
-  async chat({ messages, tools, temperature = 0.2, max_tokens = 800 }) {
+  async chat({ messages, tools, temperature = 0.2, max_tokens = 1200 }) {
     if (this.provider === "openai" && this.openai) {
       const resp = await this.openai.chat.completions.create({
         model: this.model,

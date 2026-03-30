@@ -404,14 +404,15 @@ function questionMenu() {
 }
 
 // ----- Tool-calling loop -----------------------------------
-const MAX_TOOL_ITERATIONS = 3;
+const MAX_TOOL_ITERATIONS = 5;
 
-async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
+async function runToolsLoop({ llm, seedMessages, ownerId, from, max_tokens }) {
   const { toolsSpec, reg } = getTools();
   const messages = [...seedMessages];
+  const chatOpts = max_tokens ? { max_tokens } : {};
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-    const msg = await llm.chat({ messages, tools: toolsSpec });
+    const msg = await llm.chat({ messages, tools: toolsSpec, ...chatOpts });
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
       const content = String(msg.content || '').trim();
@@ -442,12 +443,23 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from }) {
     }
   }
 
-  // Exceeded max iterations without a final text reply
-  return "I wasn't able to pull a complete answer in time. Try narrowing your question — for example, specify a date range (MTD, WTD) or a specific job name.";
+  // Exceeded max iterations without a final text reply — do one final pass without tools to synthesize what we have
+  try {
+    const summaryMsg = await llm.chat({
+      messages: [
+        ...messages,
+        { role: 'user', content: 'Based on everything you found so far, give your best answer. Be honest about any gaps.' }
+      ],
+      max_tokens: chatOpts.max_tokens || 800
+    });
+    const summaryContent = String(summaryMsg?.content || '').trim();
+    if (summaryContent) return summaryContent;
+  } catch {}
+  return "I gathered some data but ran out of steps to complete a full analysis. Try asking with a specific date range (MTD, WTD, today) or a specific job name — that helps me answer in fewer steps.";
 }
 
 // ----- Public ask API --------------------------------------
-async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) {
+async function ask({ from, ownerId, text, topicHints = [], ownerProfile, pageContext, history, tz } = {}) {
   const raw = String(text || '').trim();
   const lc = normBare(raw);
 
@@ -524,29 +536,89 @@ async function ask({ from, ownerId, text, topicHints = [], ownerProfile } = {}) 
   if (channel === 'portal') {
     const llmPortal = new LLMProvider({
       provider: process.env.LLM_PROVIDER || process.env.AI_PROVIDER || 'openai',
-      model: process.env.LLM_MODEL_PORTAL || process.env.LLM_MODEL || 'gpt-4o-mini',
+      model: process.env.LLM_MODEL_PORTAL || process.env.LLM_MODEL || 'gpt-4o',
     });
+
+    // Build rich context block so Chief knows what the user is looking at
+    const userTz = tz || 'America/Toronto';
+    let dateStr;
+    try {
+      dateStr = new Date().toLocaleDateString('en-CA', {
+        timeZone: userTz,
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+      });
+    } catch {
+      dateStr = new Date().toISOString().split('T')[0];
+    }
+
+    const PAGE_LABELS = {
+      '/app/jobs': 'the Jobs list (all jobs overview)',
+      '/app/dashboard': 'the Dashboard (business-wide metrics)',
+      '/app/pending-review': 'the Pending Review page',
+      '/app/uploads': 'the Capture / Uploads page',
+      '/app/activity/expenses': 'the Activity — Expenses page',
+      '/app/activity': 'the Activity page',
+      '/app/chief': 'the Ask Chief page',
+      '/app/settings': 'the Settings page',
+    };
+
+    let contextLines = [`Today is ${dateStr}.`];
+
+    if (pageContext?.job_name || pageContext?.job_no || pageContext?.job_id) {
+      const jobLabel = [
+        pageContext.job_name,
+        pageContext.job_no ? `job #${pageContext.job_no}` : null,
+      ].filter(Boolean).join(' — ');
+      contextLines.push(
+        `\nThe user is currently viewing: ${jobLabel}.`,
+        `When they say "this job", "the current job", or ask without specifying a job, they mean this one.`,
+        `Always look up this job's data first before asking which job they mean.`,
+      );
+    } else if (pageContext?.page) {
+      const pagePath = String(pageContext.page).split('?')[0];
+      // Check for job detail pages like /app/jobs/123
+      const jobDetailMatch = pagePath.match(/^\/app\/jobs\/([^/]+)$/);
+      if (jobDetailMatch) {
+        contextLines.push(`\nThe user is currently on a job detail page (job ID: ${jobDetailMatch[1]}).`);
+      } else {
+        const label = PAGE_LABELS[pagePath] || `the ${pagePath} page`;
+        contextLines.push(`\nThe user is currently on ${label}.`);
+      }
+    }
+
+    const contextBlock = contextLines.join('\n');
 
     const portalSystemPrompt = `${CHIEF_SYSTEM_PROMPT}
 
 CHANNEL: Web portal dashboard (not WhatsApp). You are Chief, the user's on-call CFO.
 
+${contextBlock}
+
 Rules for every response:
 - Answer ANY question the user asks. For general business questions, answer from your knowledge.
-- For questions about the user's OWN data (their expenses, revenue, jobs, time, tasks): ALWAYS call the available tools first. Never invent numbers or make up transactions.
-- If tools return empty results, say so honestly and helpfully — explain what data would need to be logged to answer the question, and what logging through WhatsApp would unlock.
-- Respond in clear, conversational prose. No bullet-point menus. No WhatsApp command suggestions.
-- Be direct and specific. If you have real numbers from tools, lead with them.
-- Never return a dead-end. Always end with something actionable or a follow-up question.
-- Do not mention "WhatsApp commands" or "say expense $X" style prompts — this is a web dashboard.`;
+- For questions about the user's OWN data (expenses, revenue, jobs, time, tasks): ALWAYS call tools first. Never invent numbers.
+- If tools return empty results: say so honestly, explain what data would need to be logged, and offer a concrete next step.
+- Respond in clear, conversational prose. No bullet-point menus. No WhatsApp command prompts.
+- Be direct. If you have real numbers from tools, lead with them.
+- Never return a dead-end. Always close with something actionable or a follow-up question.
+- If the user refers to "this job" or "the current job", use the context above — do not ask which job unless the context is genuinely ambiguous.
+- Conversation is multi-turn: refer back to what was discussed earlier in this session if relevant.`;
 
-    const portalSeed = [
-      { role: 'system', content: portalSystemPrompt },
-      { role: 'user', content: raw }
-    ];
+    // Build seed: system + up to last 10 history messages + current user message
+    const portalSeed = [{ role: 'system', content: portalSystemPrompt }];
+
+    if (Array.isArray(history) && history.length > 0) {
+      for (const h of history.slice(-10)) {
+        const role = h.role === 'user' ? 'user' : 'assistant';
+        const content = String(h.content || '').trim();
+        if (content) portalSeed.push({ role, content });
+      }
+    }
+
+    portalSeed.push({ role: 'user', content: raw });
 
     try {
-      return await runToolsLoop({ llm: llmPortal, seedMessages: portalSeed, ownerId: ownerDigits, from });
+      return await runToolsLoop({ llm: llmPortal, seedMessages: portalSeed, ownerId: ownerDigits, from, max_tokens: 1500 });
     } catch (e) {
       console.warn('[AGENT] portal tools loop failed:', e?.message);
       return "I ran into a problem pulling that answer. Your data is safe — please try again in a moment.";

@@ -63,8 +63,11 @@ function buildEvidenceMeta({ range, tenantId, tz, actorKey }) {
   };
 }
 
-function safeTimeoutAnswer() {
-  return "I’m having trouble reasoning right now. Your data is safe. Please try again in a moment.";
+function safeTimeoutAnswer(text) {
+  const hint = text && text.length > 0
+    ? " Try narrowing the question — add a date range (MTD, WTD, today) or a specific job name so I can answer faster."
+    : " Try again in a moment, or rephrase with a specific date range or job name.";
+  return "That question took longer than my time limit." + hint;
 }
 
 function withTimeout(promise, ms, label = "operation_timeout") {
@@ -119,6 +122,14 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
 
     const range = String(req.body?.range || "mtd").trim() || "mtd";
     const actorKey = portalUserId || ownerId || "portal";
+
+    // Page context — where the user is in the portal and which job they're viewing
+    const pageContext = req.body?.page_context && typeof req.body.page_context === "object"
+      ? req.body.page_context
+      : null;
+
+    // Conversation history — last N message pairs from the client UI
+    const history = Array.isArray(req.body?.history) ? req.body.history.slice(0, 20) : [];
 
     console.info("[ASK_CHIEF_START]", {
       traceId,
@@ -350,6 +361,9 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
           text,
           topicHints: ["portal", "askchief"],
           ownerProfile: req.ownerProfile || null,
+          pageContext: pageContext || null,
+          history: history.length > 0 ? history : [],
+          tz,
         }),
         ASK_CHIEF_AGENT_TIMEOUT_MS,
         "ask_chief_agent_timeout"
@@ -385,7 +399,7 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
 
         return res.status(200).json({
           ok: true,
-          answer: safeTimeoutAnswer(),
+          answer: safeTimeoutAnswer(text),
           evidence_meta: buildEvidenceMeta({ range, tenantId, tz, actorKey }),
           warnings: ["Chief timed out before a full reasoning pass completed."],
           actions: [],

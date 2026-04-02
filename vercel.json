@@ -22,6 +22,10 @@
     "api/cron/cleanup_pending.js": {
       "memory": 512,
       "maxDuration": 10
+    },
+    "api/cron/overhead_reminders.js": {
+      "memory": 512,
+      "maxDuration": 30
     }
   },
   "routes": [
@@ -31,7 +35,8 @@
     { "src": "^/favicon\\.png$", "dest": "/favicon.png" },
 
     { "src": "^/api/cron/refresh_docs$", "dest": "/api/cron/refresh_docs.js" },
-    { "src": "^/api/cron/cleanup-pending$", "dest": "/api/cron/cleanup_pending.js" },
+    { "src": "^/api/cron/cleanup-pending$",      "dest": "/api/cron/cleanup_pending.js" },
+    { "src": "^/api/cron/overhead-reminders$",   "dest": "/api/cron/overhead_reminders.js" },
 
     { "src": "^/api/webhook/reminders/cron/(.*)$", "dest": "/api/webhook.js" },
     { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
@@ -46,6 +51,7 @@
   ],
   "crons": [
     { "path": "/api/cron/refresh_docs", "schedule": "0 3 * * 1" },
-    { "path": "/api/cron/cleanup-pending", "schedule": "5 3 * * 1" }
+    { "path": "/api/cron/cleanup-pending",    "schedule": "5 3 * * 1" },
+    { "path": "/api/cron/overhead-reminders", "schedule": "0 8 * * *" }
   ]
 }

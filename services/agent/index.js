@@ -459,7 +459,7 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from, max_tokens }) {
 }
 
 // ----- Public ask API --------------------------------------
-async function ask({ from, ownerId, text, topicHints = [], ownerProfile, pageContext, history, tz } = {}) {
+async function ask({ from, ownerId, text, topicHints = [], ownerProfile, pageContext, history, tz = 'America/Toronto' } = {}) {
   const raw = String(text || '').trim();
   const lc = normBare(raw);
 
@@ -683,7 +683,7 @@ Rules for every response:
 }
 
    // 3) Draft-driven log flows (ChatGPT-like: one question at a time)
-  const tz = ownerProfile?.tz || 'America/Toronto';
+  // tz is already a parameter of ask() — use it directly
   const intake = safeJson(memory?.intake_draft || {});
   const intakeKind = String(intake?.kind || '').toLowerCase().trim();
 

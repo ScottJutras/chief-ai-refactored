@@ -100,7 +100,18 @@ module.exports = async (req, res) => {
     }
 
     console.log(`[overhead_reminders] ${created} reminders created, ${notified} WhatsApp sent`);
-    return res.status(200).json({ ok: true, created, notified, now: now.toISOString() });
+
+    // Phase 3.3: also run receivables nudge daily
+    let receivables = { checked: 0, sent: 0 };
+    try {
+      const { runReceivablesNudge } = require('../../workers/receivablesNudge');
+      receivables = await runReceivablesNudge();
+      console.log(`[overhead_reminders] receivables nudge: ${JSON.stringify(receivables)}`);
+    } catch (e) {
+      console.warn('[overhead_reminders] receivablesNudge failed (non-fatal):', e?.message);
+    }
+
+    return res.status(200).json({ ok: true, created, notified, receivables, now: now.toISOString() });
 
   } catch (err) {
     console.error('[overhead_reminders] fatal error:', err?.message);

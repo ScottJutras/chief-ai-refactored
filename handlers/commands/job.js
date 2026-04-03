@@ -1439,6 +1439,26 @@ Now you can:
           isFirstJobCreated = rows?.length === 1;
         } catch {}
 
+        // Phase 3.1: fire-and-forget predictive cost suggestion
+        // Sends a follow-up WhatsApp with budget ranges from historical jobs.
+        // Never blocks or errors the main creation response.
+        setImmediate(async () => {
+          try {
+            const { generateCostSuggestionMessage } = require('../../services/jobCostPredictor');
+            const { sendWhatsApp: _sendWA } = require('../../services/twilio');
+            const suggestion = await generateCostSuggestionMessage({
+              ownerId: String(owner).trim(),
+              newJobName: jobName,
+              estimatedRevenueCents: null,
+            });
+            if (suggestion) {
+              await _sendWA(fromPhone, `💡 *Cost estimate for "${jobName}":*\n\n${suggestion}`);
+            }
+          } catch (e) {
+            console.warn('[JOB] cost predictor fire-and-forget failed (non-fatal):', e?.message);
+          }
+        });
+
         if (shouldShowJobCreatedOrientation({ plan, isFirstJobCreated })) {
           return respond(
             res,

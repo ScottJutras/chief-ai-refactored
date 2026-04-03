@@ -152,6 +152,24 @@ function getTools() {
     toolsSpec.push(t);
   }
 
+  // BI Agent Tools (Phase 1–3)
+  const biTools = [
+    'jobPnl', 'labourUtil', 'comparePeriods', 'getTopN', 'budgetVsActual', 'cashFlowForecast',
+  ];
+  for (const toolFile of biTools) {
+    try {
+      const mod = require(`../agentTools/${toolFile}`);
+      // Each module exports a single tool spec with __handler
+      const tool = Object.values(mod).find(v => v?.type === 'function' && v?.function?.name);
+      if (tool) {
+        reg[tool.function.name] = tool.__handler;
+        toolsSpec.push(tool);
+      }
+    } catch (e) {
+      console.warn(`[AGENT] BI tool ${toolFile} not available:`, e?.message);
+    }
+  }
+
   TOOL_REGISTRY = { reg, toolsSpec };
   return TOOL_REGISTRY;
 }

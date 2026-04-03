@@ -9,7 +9,15 @@
 //   - Exponential backoff on rate-limit / overloaded errors.
 //   - Soft-fail: returns { role:'assistant', content:'(llm offline)' } if key missing.
 
-const Anthropic = require('@anthropic-ai/sdk');
+// Lazy-load the SDK — same pattern as visionService/transcriptionService.
+// Top-level require crashes Vercel's bundler when the package isn't in the
+// function's bundle; lazy load lets the server start and falls back to OpenAI.
+let Anthropic = null;
+try {
+  Anthropic = require('@anthropic-ai/sdk');
+} catch (e) {
+  console.warn('[LLM/anthropic] @anthropic-ai/sdk not available:', e?.message);
+}
 
 // Per-model pricing (USD per 1M tokens)
 const PRICING = {
@@ -165,10 +173,12 @@ function anthropicRespToOai(resp) {
 let _client = null;
 function getClient() {
   if (_client) return _client;
+  if (!Anthropic) return null;          // SDK not available in this bundle
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) return null;
   // SDK v0.82: both Anthropic.default and Anthropic.Anthropic work; prefer named export
   const Ctor = Anthropic.Anthropic || Anthropic.default;
+  if (!Ctor) return null;
   _client = new Ctor({ apiKey: key, timeout: 30000 });
   return _client;
 }

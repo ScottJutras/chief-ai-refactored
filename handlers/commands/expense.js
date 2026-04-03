@@ -2668,6 +2668,7 @@ function extractReceiptTaxBreakdown(text) {
   let tax = null;
   let total = null;
   let taxLabel = null;
+  let subtotalPending = false; // true when SUBTOTAL label seen but no amount on the same line
 
   const parseSafeMoney = (s) => {
     const str = String(s || '').trim();
@@ -2701,7 +2702,13 @@ function extractReceiptTaxBreakdown(text) {
   for (const line of lines) {
     if (subtotal == null && /\bsubtotal\b/i.test(line)) {
       const n = parseSafeMoney(line);
-      if (n != null) subtotal = n;
+      if (n != null) {
+        subtotal = n;
+        subtotalPending = false;
+      } else {
+        // SUBTOTAL label only — amount may appear merged onto the next tax line
+        subtotalPending = true;
+      }
     }
 
     // Standard tax labels: GST/HST, GST, HST, PST, TAX
@@ -2710,6 +2717,25 @@ function extractReceiptTaxBreakdown(text) {
       const lineNoTaxReg = line.replace(/\b(hst|gst)#\d+\b/ig, '');
       const m = lineNoTaxReg.match(/\b(gst\/hst|gst|hst|pst|tax)\b/i);
       if (m?.[1]) {
+        // Some receipts (e.g. Rona) print SUBTOTAL on its own line then show
+        // "GST/HST $<subtotal_base> $<tax_amount>" on the tax line.
+        // When we saw a bare SUBTOTAL label above, extract both amounts here.
+        if (subtotalPending && subtotal == null) {
+          const decRe = /\$\s*(\d{1,6}(?:,\d{3})*\.\d{2})\b/g;
+          const found = [];
+          let am;
+          while ((am = decRe.exec(lineNoTaxReg)) !== null) {
+            const n = Number(String(am[1]).replace(/,/g, ''));
+            if (Number.isFinite(n) && n >= 0 && n <= 100000) found.push(n);
+          }
+          if (found.length >= 2) {
+            subtotal = found[0];
+            tax = found[found.length - 1];
+            taxLabel = String(m[1]).toUpperCase();
+            subtotalPending = false;
+            continue;
+          }
+        }
         const n = parseSafeMoney(lineNoTaxReg);
         if (n != null) {
           tax = n;

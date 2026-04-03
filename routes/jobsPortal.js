@@ -260,4 +260,79 @@ router.post("/api/jobs/:jobId/delete", requirePortalUser(), async (req, res) => 
   }
 });
 
+// ─── List phases for a job (with cost breakdown) ──────────────────────────────
+
+router.get("/api/jobs/:jobId/phases", requirePortalUser(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { tenantId, ownerId, jobId } = ctx;
+
+    // Fetch phases for this job scoped to tenant
+    const phasesRes = await pg.query(
+      `SELECT
+         jp.id,
+         jp.phase_name,
+         jp.started_at,
+         jp.ended_at,
+         jp.expires_at,
+         COALESCE(SUM(CASE WHEN t.kind = 'expense' THEN t.amount_cents ELSE 0 END), 0)::bigint AS expense_cents,
+         COALESCE(SUM(CASE WHEN t.kind = 'revenue' THEN t.amount_cents ELSE 0 END), 0)::bigint AS revenue_cents
+       FROM public.job_phases jp
+       LEFT JOIN public.transactions t
+         ON  t.job_id    = jp.job_id
+         AND t.tenant_id = jp.tenant_id
+         AND t.transaction_date >= jp.started_at::date
+         AND (jp.ended_at IS NULL OR t.transaction_date < jp.ended_at::date)
+       WHERE jp.job_id    = $1
+         AND jp.tenant_id = $2
+         AND jp.owner_id  = $3
+       GROUP BY jp.id
+       ORDER BY jp.started_at ASC`,
+      [jobId, tenantId, ownerId]
+    );
+
+    return res.status(200).json({ ok: true, phases: phasesRes.rows });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_PHASES_LIST] failed:", e?.message || e);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not load phases." });
+  }
+});
+
+// ─── Remove a phase ────────────────────────────────────────────────────────────
+// Deletes the phase row entirely. Entries that fell in this phase window
+// become unphased (or fall into an adjacent phase) — no entries are modified.
+
+router.delete("/api/jobs/:jobId/phases/:phaseId", requirePortalUser(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { tenantId, ownerId, jobId } = ctx;
+    const phaseId = String(req.params.phaseId || "").trim();
+
+    if (!phaseId) {
+      return res.status(400).json({ ok: false, code: "BAD_REQUEST", message: "Phase ID required." });
+    }
+
+    const result = await pg.query(
+      `DELETE FROM public.job_phases
+        WHERE id       = $1
+          AND job_id   = $2
+          AND tenant_id = $3
+          AND owner_id  = $4
+        RETURNING id, phase_name`,
+      [phaseId, jobId, tenantId, ownerId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ ok: false, code: "NOT_FOUND", message: "Phase not found." });
+    }
+
+    return res.status(200).json({ ok: true, message: "Phase removed.", phase: result.rows[0] });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_PHASES_DELETE] failed:", e?.message || e);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not remove phase." });
+  }
+});
+
 module.exports = router;

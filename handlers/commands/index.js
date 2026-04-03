@@ -31,6 +31,7 @@ const { getEffectivePlanKey } = require("../../src/config/getEffectivePlanKey");
 // Lazy-load per-file handlers
 let tasksHandler, handleTimeclock, handleJob, handleExpense, handleRevenue, teamHandler;
 let handleMileage, isMileageMessage;
+let handlePhase, isPhaseMessage;
 try { ({ tasksHandler } = require('./tasks')); } catch {}
 try { ({ handleTimeclock } = require('./timeclock')); } catch {}
 try { ({ handleJob } = require('./job')); } catch {}
@@ -38,6 +39,7 @@ try { ({ handleExpense } = require('./expense')); } catch {}
 try { ({ handleRevenue } = require('./revenue')); } catch {}
 try { ({ teamHandler } = require('./team')); } catch {}
 try { ({ handleMileage, isMileageMessage } = require('./mileage')); } catch {}
+try { ({ handlePhase, isPhaseMessage } = require('./phase')); } catch {}
 
 
 
@@ -315,6 +317,15 @@ if (teamHandler) {
 
     if (tasksHandler) {
       const handled = await tasksHandler(from, raw, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId);
+      if (handled) {
+        await safeCleanup({ from, ownerId });
+        return true;
+      }
+    }
+
+    // Phase handler — runs before timeclock so "starting X" isn't mis-routed
+    if (handlePhase && isPhaseMessage && isPhaseMessage(raw)) {
+      const handled = await handlePhase(from, raw, userProfile, ownerId, ownerProfile, isOwner, res);
       if (handled) {
         await safeCleanup({ from, ownerId });
         return true;

@@ -8079,13 +8079,12 @@ if (looksLikeReceiptText(input)) {
 
       date: String(draft0?.date || '').trim() || seededDate || back?.dateIso || null,
 
-      // Use pre-tax subtotal as the primary expense amount (tax recovered as ITC for GST/HST registrants).
-      // Fall back to total when no subtotal is available.
+      // Use total as the primary expense amount; fall back to subtotal when total is unavailable.
       amount:
-        seededSubtotal
-          ? `$${seededSubtotal}`
-          : seededTotal
-            ? `$${seededTotal}`
+        seededTotal
+          ? `$${seededTotal}`
+          : seededSubtotal
+            ? `$${seededSubtotal}`
             : (String(draft0?.amount || '').trim() || null),
 
       currency: back?.currency || draft0?.currency || defaultCurrency,

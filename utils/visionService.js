@@ -25,6 +25,29 @@
 
 const { checkMonthlyQuota, consumeMonthlyQuota } = require('./quota');
 
+let sharp = null;
+try {
+  // eslint-disable-next-line global-require
+  sharp = require('sharp');
+} catch (e) {
+  console.warn('[visionService] sharp unavailable — EXIF rotation will be skipped:', e?.message || e);
+}
+
+/**
+ * Normalize JPEG/HEIC image orientation using EXIF metadata.
+ * Returns the corrected buffer, or the original buffer if sharp is unavailable.
+ * Never throws.
+ */
+async function normalizeOrientation(buf) {
+  if (!sharp || !buf) return buf;
+  try {
+    return await sharp(buf).rotate().toBuffer();
+  } catch (e) {
+    console.warn('[visionService] normalizeOrientation failed (ignored):', e?.message || e);
+    return buf;
+  }
+}
+
 let cachedClient = undefined; // undefined = not initialized, null = unavailable, object = client
 let cachedCaps = undefined;
 
@@ -245,8 +268,11 @@ async function extractTextFromImage(imageUrl, opts = {}) {
   const planKey = String(opts.planKey || '').trim().toLowerCase() || 'free';
 
   try {
-    const buf = await fetchTwilioMediaBytes(url);
-    if (!buf || !buf.length) return { text: '' };
+    const rawBuf = await fetchTwilioMediaBytes(url);
+    if (!rawBuf || !rawBuf.length) return { text: ‘’ };
+
+    // Normalize EXIF orientation before OCR so rotated photos aren’t misread.
+    const buf = await normalizeOrientation(rawBuf);
 
     // ✅ Hard safety: if we don’t know who/plan, don’t spend money.
     if (!ownerId) {

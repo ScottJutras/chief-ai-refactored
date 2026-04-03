@@ -88,6 +88,10 @@ async function safeCleanup({ from, ownerId }) {
   } catch {}
 }
 
+function canonicalUserKey(from) {
+  return String(from || '').replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '') || String(from || '').trim();
+}
+
 // Tiny bootstrap mapper → CIL (only for things without dedicated handlers)
 function simpleTextToCIL(raw) {
   const lc = String(raw || '').toLowerCase().trim();
@@ -142,6 +146,56 @@ module.exports = async function handleCommands(from, text, userProfile, ownerId,
       if (handled) {
         await safeCleanup({ from, ownerId });
         return true;
+      }
+    }
+
+    // 1b) Pending job photo picker — user responding to "which job is this for?"
+    {
+      const jobnoMatch = raw.match(/^jobno_(\d+)/i);
+      if (jobnoMatch) {
+        const pending = await getPendingTransactionState(canonicalUserKey(from));
+        if (pending?.pendingJobPhoto) {
+          const photo = pending.pendingJobPhoto;
+          const jobId = parseInt(jobnoMatch[1], 10);
+
+          let saved = false;
+          try {
+            let pg = null;
+            try { pg = require('../../services/postgres'); } catch {}
+            if (pg && typeof pg.query === 'function' && Number.isFinite(jobId)) {
+              // Verify the job belongs to this owner
+              const jobRes = await pg.query(
+                `SELECT id, job_name, name, job_no FROM public.jobs WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL LIMIT 1`,
+                [ownerId, jobId]
+              );
+              const job = jobRes?.rows?.[0];
+              if (job && photo.tenantId) {
+                await pg.query(
+                  `INSERT INTO public.job_photos (tenant_id, job_id, owner_id, storage_path, public_url, description, source, source_msg_id)
+                   VALUES ($1, $2, $3, $4, $5, $6, 'whatsapp', $7)
+                   ON CONFLICT (owner_id, source_msg_id) WHERE source_msg_id IS NOT NULL
+                   DO UPDATE SET public_url = excluded.public_url`,
+                  [photo.tenantId, jobId, ownerId, photo.storagePath, photo.publicUrl || null, photo.caption || null, photo.stableMediaMsgId || null]
+                );
+                const jobLabel = job.job_name || job.name || `Job #${job.job_no || job.id}`;
+                // Clear pending photo state
+                await deletePendingTransactionState(canonicalUserKey(from));
+                twiml(res, `📷 Photo saved to ${jobLabel}${photo.caption ? ` — "${photo.caption}"` : ''}.`);
+                await safeCleanup({ from, ownerId });
+                saved = true;
+                return true;
+              }
+            }
+          } catch (e) {
+            console.error('[commands] pendingJobPhoto confirm failed:', e?.message);
+          }
+
+          if (!saved) {
+            twiml(res, `⚠️ Couldn't save the photo. Try again.`);
+            await safeCleanup({ from, ownerId });
+            return true;
+          }
+        }
       }
     }
 

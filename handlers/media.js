@@ -715,6 +715,133 @@ async function runTimeclockPipeline(from, normalized, userProfile, ownerId) {
   return payload;
 }
 
+// ─── Job photo storage ────────────────────────────────────────────────────────
+// Called from the image pipeline when we detect a non-receipt image.
+// Downloads from Twilio, uploads to Supabase Storage, inserts job_photos row.
+// If no active job → stores pending state + returns job picker TwiML.
+
+let supabaseAdmin = null;
+try { supabaseAdmin = require('../services/supabaseAdmin'); } catch {}
+
+async function uploadPhotoToStorage({ ownerId, tenantId, stableMediaMsgId, mediaUrl, normType }) {
+  if (!supabaseAdmin) return null;
+  const client = supabaseAdmin.getAdminClient();
+  if (!client) return null;
+
+  try {
+    const buf = await withTimeout(fetchTwilioMediaBytes(mediaUrl, stableMediaMsgId), 8000, 'photo_fetch');
+    const ext = (normType || 'image/jpeg').split('/')[1]?.split(';')[0] || 'jpg';
+    const storagePath = `${tenantId}/${ownerId}/${stableMediaMsgId}.${ext}`;
+    const publicUrl = await supabaseAdmin.uploadToStorage({
+      bucket: 'job-photos',
+      path: storagePath,
+      buffer: buf,
+      contentType: normType || 'image/jpeg',
+    });
+    return publicUrl ? { storagePath, publicUrl } : null;
+  } catch (e) {
+    console.warn('[MEDIA] photo upload to storage failed (ignored):', e?.message);
+    return null;
+  }
+}
+
+async function insertJobPhoto({ tenantId, jobId, ownerId, storagePath, publicUrl, caption, stableMediaMsgId, source = 'whatsapp' }) {
+  if (!dbQuery) return null;
+  try {
+    const r = await dbQuery(
+      `INSERT INTO public.job_photos
+         (tenant_id, job_id, owner_id, storage_path, public_url, description, source, source_msg_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (owner_id, source_msg_id) WHERE source_msg_id IS NOT NULL
+       DO UPDATE SET public_url = excluded.public_url, description = COALESCE(excluded.description, public.job_photos.description)
+       RETURNING id`,
+      [tenantId, jobId, ownerId, storagePath, publicUrl, caption || null, source, stableMediaMsgId || null]
+    );
+    return r?.rows?.[0]?.id || null;
+  } catch (e) {
+    console.warn('[MEDIA] insertJobPhoto failed:', e?.message);
+    return null;
+  }
+}
+
+async function buildJobPicker(ownerId) {
+  if (!dbQuery) return null;
+  try {
+    const r = await dbQuery(
+      `SELECT id, job_no, job_name, name
+       FROM public.jobs
+       WHERE owner_id = $1
+         AND active = true
+         AND deleted_at IS NULL
+         AND status != 'archived'
+       ORDER BY updated_at DESC
+       LIMIT 8`,
+      [ownerId]
+    );
+    return r?.rows || [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveJobPhoto({ ownerId, tenantId, from, mediaUrl, normType, stableMediaMsgId,
+    activeJobId, activeJobName, activeJobNo, caption, userKey,
+    mergePendingTransactionState, getPendingTransactionState }) {
+
+  // Try to upload to permanent storage
+  const uploaded = await uploadPhotoToStorage({ ownerId, tenantId, stableMediaMsgId, mediaUrl, normType });
+  const storagePath = uploaded?.storagePath || `twilio:${stableMediaMsgId}`;
+  const publicUrl   = uploaded?.publicUrl   || null;
+
+  // If there's an active job, save immediately
+  if (activeJobId && tenantId) {
+    await insertJobPhoto({ tenantId, jobId: activeJobId, ownerId, storagePath, publicUrl, caption, stableMediaMsgId });
+    const jobLabel = activeJobName || `Job #${activeJobNo || activeJobId}`;
+    return {
+      transcript: null,
+      twiml: twiml(`📷 Photo saved to ${jobLabel}${caption ? ` — "${caption}"` : ''}.`)
+    };
+  }
+
+  // No active job → store pending state + send job picker
+  const jobs = await buildJobPicker(ownerId);
+
+  // Save pending photo details so we can complete the save when user picks a job
+  try {
+    const pending = await getPendingTransactionState(userKey);
+    await mergePendingTransactionState(userKey, {
+      ...(pending || {}),
+      pendingJobPhoto: {
+        storagePath,
+        publicUrl,
+        caption: caption || null,
+        stableMediaMsgId,
+        tenantId,
+        ownerId,
+      }
+    });
+  } catch (e) {
+    console.warn('[MEDIA] saveJobPhoto pending state failed:', e?.message);
+  }
+
+  if (!jobs.length) {
+    return {
+      transcript: null,
+      twiml: twiml(`📷 Photo received but no active jobs found. Create a job in the portal first, then resend.`)
+    };
+  }
+
+  const lines = jobs.map((j, i) => {
+    const label = j.job_name || j.name || `Job #${j.job_no || j.id}`;
+    return `${i + 1}. ${label}  → jobno_${j.id}`;
+  });
+
+  return {
+    transcript: null,
+    twiml: twiml(`📷 Photo received! Which job is this for?\n\n${lines.join('\n')}\n\nReply with the jobno_ code (e.g. jobno_${jobs[0]?.id}).`)
+  };
+}
+
 async function handleMedia(from, input, userProfile, ownerId, mediaUrl, mediaType, sourceMsgId) {
   try {
     console.info('[MEDIA_HANDLE_CALLED]', {
@@ -992,6 +1119,22 @@ if (isImage) {
     /\b(ocr|scan|read|extract|parse)\b/.test(rawHint) &&
     rawHint.length <= 80;
 
+  // ── Job photo early-exit: caption explicitly marks this as a site photo ──
+  // Skip OCR entirely to save quota. Resolve job + store, then return TwiML.
+  const isExplicitJobPhoto =
+    /\b(job\s*photo|site\s*photo|progress\s*photo|before\s*photo|after\s*photo|day\s+\d+|week\s+\d+|on[- ]?site|photo\s*update)\b/i.test(rawHint);
+
+  if (isExplicitJobPhoto) {
+    console.info('[MEDIA] explicit job photo caption — skipping OCR', { rawHint: rawHint.slice(0, 80) });
+    const result = await saveJobPhoto({
+      ownerId: ownerIdKey, tenantId, from, mediaUrl, normType,
+      stableMediaMsgId, activeJobId, activeJobName, activeJobNo,
+      caption: String(input || '').trim() || null,
+      userKey, mergePendingTransactionState, getPendingTransactionState
+    });
+    return result;
+  }
+
   // 1) Always create/update a media asset row first, even before OCR.
   // IMPORTANT:
   // - assign to outer-scoped mediaAssetId
@@ -1251,7 +1394,15 @@ if (isImage) {
     return { transcript: `expense ${extractedText}`.trim(), twiml: null };
   }
 
-  return { transcript: extractedText, twiml: null };
+  // ── No financial content → treat as job photo ────────────────────────────
+  console.info('[MEDIA] no financial content — treating as job photo');
+  const jpResult = await saveJobPhoto({
+    ownerId: ownerIdKey, tenantId, from, mediaUrl, normType,
+    stableMediaMsgId, activeJobId, activeJobName, activeJobNo,
+    caption: extractedText || String(input || '').trim() || null,
+    userKey, mergePendingTransactionState, getPendingTransactionState
+  });
+  return jpResult;
 }
 
 

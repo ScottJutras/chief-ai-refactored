@@ -32,6 +32,7 @@ const { getEffectivePlanKey } = require("../../src/config/getEffectivePlanKey");
 let tasksHandler, handleTimeclock, handleJob, handleExpense, handleRevenue, teamHandler;
 let handleMileage, isMileageMessage;
 let handlePhase, isPhaseMessage;
+let handlePhotos, isPhotosCommand;
 try { ({ tasksHandler } = require('./tasks')); } catch {}
 try { ({ handleTimeclock } = require('./timeclock')); } catch {}
 try { ({ handleJob } = require('./job')); } catch {}
@@ -40,6 +41,7 @@ try { ({ handleRevenue } = require('./revenue')); } catch {}
 try { ({ teamHandler } = require('./team')); } catch {}
 try { ({ handleMileage, isMileageMessage } = require('./mileage')); } catch {}
 try { ({ handlePhase, isPhaseMessage } = require('./phase')); } catch {}
+try { ({ handlePhotos, isPhotosCommand } = require('./photos')); } catch {}
 
 
 
@@ -317,6 +319,15 @@ if (teamHandler) {
 
     if (tasksHandler) {
       const handled = await tasksHandler(from, raw, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId);
+      if (handled) {
+        await safeCleanup({ from, ownerId });
+        return true;
+      }
+    }
+
+    // Photos handler — "send me job pictures" / "send client job pictures"
+    if (handlePhotos && isPhotosCommand && isPhotosCommand(raw)) {
+      const handled = await handlePhotos(from, raw, userProfile, ownerId, ownerProfile, isOwner, res);
       if (handled) {
         await safeCleanup({ from, ownerId });
         return true;

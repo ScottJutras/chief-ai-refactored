@@ -5,6 +5,9 @@ const pg = require("../services/postgres");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
 const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
 
+let supabaseAdmin = null;
+try { supabaseAdmin = require("../services/supabaseAdmin"); } catch {}
+
 function sanitizeJobName(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
@@ -332,6 +335,212 @@ router.delete("/api/jobs/:jobId/phases/:phaseId", requirePortalUser(), async (re
   } catch (e) {
     console.error("[JOBS_PORTAL_PHASES_DELETE] failed:", e?.message || e);
     return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not remove phase." });
+  }
+});
+
+// ─── Job Photos — list ────────────────────────────────────────────────────────
+
+router.get("/api/jobs/:jobId/photos", requirePortalUser(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { tenantId, ownerId, jobId } = ctx;
+
+    const result = await pg.query(
+      `SELECT id, description, public_url, storage_path, storage_bucket, source, created_at
+       FROM public.job_photos
+       WHERE job_id   = $1
+         AND tenant_id = $2
+         AND owner_id  = $3
+       ORDER BY created_at DESC`,
+      [jobId, tenantId, ownerId]
+    );
+
+    return res.status(200).json({ ok: true, photos: result.rows });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_PHOTOS_LIST]", e?.message);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not load photos." });
+  }
+});
+
+// ─── Job Photos — record portal upload ────────────────────────────────────────
+// Frontend uploads directly to Supabase Storage, then POSTs the storage path here
+
+router.post("/api/jobs/:jobId/photos", requirePortalUser(), express.json(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { tenantId, ownerId, jobId } = ctx;
+
+    const storagePath = String(req.body?.storagePath || "").trim();
+    const publicUrl   = String(req.body?.publicUrl   || "").trim();
+    const description = String(req.body?.description || "").trim() || null;
+
+    if (!storagePath || !publicUrl) {
+      return res.status(400).json({ ok: false, code: "BAD_REQUEST", message: "storagePath and publicUrl required." });
+    }
+
+    const result = await pg.query(
+      `INSERT INTO public.job_photos
+         (tenant_id, job_id, owner_id, storage_path, public_url, description, source)
+       VALUES ($1, $2, $3, $4, $5, $6, 'portal')
+       RETURNING id, description, public_url, storage_path, created_at`,
+      [tenantId, jobId, ownerId, storagePath, publicUrl, description]
+    );
+
+    return res.status(200).json({ ok: true, photo: result.rows[0] });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_PHOTOS_INSERT]", e?.message);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not save photo record." });
+  }
+});
+
+// ─── Job Photos — delete ──────────────────────────────────────────────────────
+
+router.delete("/api/jobs/:jobId/photos/:photoId", requirePortalUser(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { tenantId, ownerId, jobId } = ctx;
+    const photoId = String(req.params.photoId || "").trim();
+
+    if (!photoId) {
+      return res.status(400).json({ ok: false, code: "BAD_REQUEST", message: "Photo ID required." });
+    }
+
+    // Get storage path first so we can delete from storage
+    const getRes = await pg.query(
+      `SELECT storage_path, storage_bucket FROM public.job_photos
+       WHERE id = $1 AND job_id = $2 AND tenant_id = $3 AND owner_id = $4`,
+      [photoId, jobId, tenantId, ownerId]
+    );
+
+    if (!getRes.rows.length) {
+      return res.status(404).json({ ok: false, code: "NOT_FOUND", message: "Photo not found." });
+    }
+
+    const { storage_path, storage_bucket } = getRes.rows[0];
+
+    // Delete from Supabase Storage (best-effort)
+    if (supabaseAdmin && storage_path && storage_bucket) {
+      try {
+        const client = supabaseAdmin.getAdminClient();
+        if (client) {
+          await client.storage.from(storage_bucket).remove([storage_path]);
+        }
+      } catch (se) {
+        console.warn("[JOBS_PORTAL_PHOTOS_DELETE] storage remove failed (ignored):", se?.message);
+      }
+    }
+
+    await pg.query(
+      `DELETE FROM public.job_photos WHERE id = $1 AND tenant_id = $2 AND owner_id = $3`,
+      [photoId, tenantId, ownerId]
+    );
+
+    return res.status(200).json({ ok: true, message: "Photo deleted." });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_PHOTOS_DELETE]", e?.message);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not delete photo." });
+  }
+});
+
+// ─── Job Photos — generate gallery share link ──────────────────────────────────
+
+router.post("/api/jobs/:jobId/photos/share", requirePortalUser(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { tenantId, ownerId, jobId } = ctx;
+
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL
+      || process.env.APP_URL
+      || process.env.VERCEL_URL
+      || "https://chiefos.app";
+
+    // Reuse unexpired token
+    const existing = await pg.query(
+      `SELECT token FROM public.job_photo_shares
+       WHERE job_id   = $1 AND tenant_id = $2 AND owner_id = $3
+         AND expires_at > now()
+       ORDER BY created_at DESC LIMIT 1`,
+      [jobId, tenantId, ownerId]
+    );
+
+    if (existing.rows[0]?.token) {
+      return res.status(200).json({
+        ok: true,
+        url: `${appUrl}/gallery/${existing.rows[0].token}`,
+        token: existing.rows[0].token,
+        reused: true,
+      });
+    }
+
+    const ins = await pg.query(
+      `INSERT INTO public.job_photo_shares (tenant_id, job_id, owner_id, expires_at)
+       VALUES ($1, $2, $3, now() + interval '30 days')
+       RETURNING token, expires_at`,
+      [tenantId, jobId, ownerId]
+    );
+
+    const { token, expires_at } = ins.rows[0];
+    return res.status(200).json({
+      ok: true,
+      url: `${appUrl}/gallery/${token}`,
+      token,
+      expiresAt: expires_at,
+    });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_PHOTOS_SHARE]", e?.message);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not generate gallery link." });
+  }
+});
+
+// ─── Gallery — public endpoint (no auth, uses token) ─────────────────────────
+
+router.get("/api/gallery/:token", async (req, res) => {
+  try {
+    const token = String(req.params.token || "").trim();
+    if (!token) return res.status(400).json({ ok: false, message: "Token required." });
+
+    const shareRes = await pg.query(
+      `SELECT s.job_id, s.tenant_id, s.owner_id, s.expires_at,
+              j.job_name, j.name
+       FROM public.job_photo_shares s
+       JOIN public.jobs j ON j.id = s.job_id
+       WHERE s.token = $1`,
+      [token]
+    );
+
+    if (!shareRes.rows.length) {
+      return res.status(404).json({ ok: false, message: "Gallery not found or expired." });
+    }
+
+    const share = shareRes.rows[0];
+
+    if (new Date(share.expires_at) < new Date()) {
+      return res.status(410).json({ ok: false, message: "Gallery link has expired." });
+    }
+
+    const photosRes = await pg.query(
+      `SELECT id, description, public_url, created_at
+       FROM public.job_photos
+       WHERE job_id   = $1
+         AND tenant_id = $2
+         AND public_url IS NOT NULL
+       ORDER BY created_at ASC`,
+      [share.job_id, share.tenant_id]
+    );
+
+    return res.status(200).json({
+      ok: true,
+      job: { name: share.job_name || share.name },
+      photos: photosRes.rows,
+      expiresAt: share.expires_at,
+    });
+  } catch (e) {
+    console.error("[GALLERY_PUBLIC]", e?.message);
+    return res.status(500).json({ ok: false, message: "Could not load gallery." });
   }
 });
 

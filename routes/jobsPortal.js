@@ -156,4 +156,108 @@ router.post("/api/jobs/create", requirePortalUser(), express.json(), async (req,
   }
 });
 
+// ─── Shared auth + job resolution helper ──────────────────────────────────
+
+function portalJobGuard(req, res) {
+  const tenantId  = String(req.tenantId  || "").trim();
+  const ownerId   = String(req.ownerId   || "").trim();
+  const portalRole = String(req.portalRole || "").trim().toLowerCase();
+  const jobId     = parseInt(req.params.jobId, 10);
+
+  if (!tenantId || !ownerId) {
+    res.status(403).json({ ok: false, code: "TENANT_CONTEXT_REQUIRED", message: "Missing tenant context." });
+    return null;
+  }
+  if (!Number.isFinite(jobId)) {
+    res.status(400).json({ ok: false, code: "BAD_REQUEST", message: "Invalid job ID." });
+    return null;
+  }
+
+  const allowed = new Set(["owner", "admin", "board", "board_member"]);
+  if (portalRole && !allowed.has(portalRole)) {
+    res.status(403).json({ ok: false, code: "PERMISSION_DENIED", message: "You do not have permission to modify jobs." });
+    return null;
+  }
+
+  return { tenantId, ownerId, jobId };
+}
+
+// ─── Archive job ───────────────────────────────────────────────────────────
+
+router.post("/api/jobs/:jobId/archive", requirePortalUser(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { ownerId, jobId } = ctx;
+
+    const result = await pg.query(
+      `UPDATE public.jobs
+          SET status = 'archived', active = false, updated_at = now()
+        WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL
+        RETURNING id, job_no, job_name, name, status`,
+      [ownerId, jobId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ ok: false, code: "NOT_FOUND", message: "Job not found." });
+    }
+    return res.status(200).json({ ok: true, message: "Job archived.", job: result.rows[0] });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_ARCHIVE] failed:", e?.message || e);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not archive the job." });
+  }
+});
+
+// ─── Unarchive job ─────────────────────────────────────────────────────────
+
+router.post("/api/jobs/:jobId/unarchive", requirePortalUser(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { ownerId, jobId } = ctx;
+
+    const result = await pg.query(
+      `UPDATE public.jobs
+          SET status = 'active', active = true, updated_at = now()
+        WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL
+        RETURNING id, job_no, job_name, name, status`,
+      [ownerId, jobId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ ok: false, code: "NOT_FOUND", message: "Job not found." });
+    }
+    return res.status(200).json({ ok: true, message: "Job restored.", job: result.rows[0] });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_UNARCHIVE] failed:", e?.message || e);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not restore the job." });
+  }
+});
+
+// ─── Delete job (soft delete) ──────────────────────────────────────────────
+
+router.post("/api/jobs/:jobId/delete", requirePortalUser(), async (req, res) => {
+  try {
+    const ctx = portalJobGuard(req, res);
+    if (!ctx) return;
+    const { ownerId, jobId } = ctx;
+
+    const result = await pg.query(
+      `UPDATE public.jobs
+          SET deleted_at = now(), active = false, updated_at = now()
+        WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL
+        RETURNING id, job_no, job_name, name`,
+      [ownerId, jobId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ ok: false, code: "NOT_FOUND", message: "Job not found or already deleted." });
+    }
+    return res.status(200).json({ ok: true, message: "Job deleted.", job: result.rows[0] });
+  } catch (e) {
+    console.error("[JOBS_PORTAL_DELETE] failed:", e?.message || e);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not delete the job." });
+  }
+});
+
 module.exports = router;

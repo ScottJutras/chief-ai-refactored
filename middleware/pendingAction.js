@@ -200,7 +200,13 @@ if (lc === 'skip') return next();
     // Confirm
     let raw = pending.payload;
     if (raw == null) raw = {};
-    const payload = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw;
+    let payload;
+    try {
+      payload = typeof raw === 'string' ? JSON.parse(raw || '{}') : raw;
+    } catch {
+      await pg.deletePendingAction(pending.id).catch(() => {});
+      return res.status(200).type('application/xml').send(xmlMsg('Confirmation data was corrupted. Try again.'));
+    }
 
     // MOVE LAST LOG
     if (pending.kind === 'move_last_log') {

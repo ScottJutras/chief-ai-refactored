@@ -1559,9 +1559,16 @@ router.post('*', async (req, res, next) => {
   const { n, url, type } = pickFirstMedia(req.body || {});
   if (n <= 0) return next();
 
+  let handleMedia;
   try {
-    const { handleMedia } = require('../handlers/media');
+    ({ handleMedia } = require('../handlers/media'));
+  } catch (loadErr) {
+    console.error('[MEDIA] module load error:', loadErr?.message, loadErr?.stack);
+    if (!res.headersSent) return ok(res, null);
+    return;
+  }
 
+  try {
     // Use canonical inbound text resolver (interactive-aware)
     const bodyText = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
     const sourceMsgId = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
@@ -1636,7 +1643,7 @@ router.post('*', async (req, res, next) => {
 
     return next();
   } catch (e) {
-    console.error('[MEDIA] error:', e?.message);
+    console.error('[MEDIA] error:', e?.message, e?.stack);
     if (!res.headersSent) return ok(res, null); // empty TwiML
   }
 });

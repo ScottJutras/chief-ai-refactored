@@ -269,12 +269,12 @@ async function extractTextFromImage(imageUrl, opts = {}) {
 
   try {
     const rawBuf = await fetchTwilioMediaBytes(url);
-    if (!rawBuf || !rawBuf.length) return { text: ‘’ };
+    if (!rawBuf || !rawBuf.length) return { text: '' };
 
-    // Normalize EXIF orientation before OCR so rotated photos aren’t misread.
+    // Normalize EXIF orientation before OCR so rotated photos aren't misread.
     const buf = await normalizeOrientation(rawBuf);
 
-    // ✅ Hard safety: if we don’t know who/plan, don’t spend money.
+    // ✅ Hard safety: if we don't know who/plan, don't spend money.
     if (!ownerId) {
       console.warn('[visionService] Missing opts.ownerId → skipping paid OCR (safe).');
       return { text: '' };

@@ -46,6 +46,10 @@
     "api/cron/tax_readiness.js": {
       "memory": 512,
       "maxDuration": 60
+    },
+    "api/inbound/email.js": {
+      "memory": 1024,
+      "maxDuration": 30
     }
   },
   "routes": [
@@ -64,6 +68,7 @@
     { "src": "^/api/cron/tax-readiness$",         "dest": "/api/cron/tax_readiness.js" },
 
     { "src": "^/api/webhook/reminders/cron/(.*)$", "dest": "/api/webhook.js" },
+    { "src": "^/api/inbound/email$", "dest": "/api/inbound/email.js" },
     { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
     { "src": "^/webhook$", "dest": "/api/webhook.js" },
 

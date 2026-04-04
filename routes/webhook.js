@@ -2707,6 +2707,15 @@ try {
           }
           return;
         }
+
+        if (kind === 'confirm_email_lead') {
+          const { handleEmailLeadConfirm } = require('../handlers/email/lead');
+          await handleEmailLeadConfirm(req, res).catch((e) => {
+            console.error('[WEBHOOK] email lead confirm error:', e?.message);
+          });
+          if (!res.headersSent) return sendTwiml(res, null);
+          return;
+        }
       } catch (e) {
         console.warn('[WEBHOOK] resume pending failed (ignored):', e?.message);
       }
@@ -2891,7 +2900,8 @@ try {
     k === "confirm_expense" ||
     k === "pick_job_for_expense" ||
     k === "confirm_revenue" ||
-    k === "pick_job_for_revenue";
+    k === "pick_job_for_revenue" ||
+    k === "confirm_email_lead";
 
   if (!hasActiveConfirmFlow && req.ownerId) {
     const actorKeyDigits =

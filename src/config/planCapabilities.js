@@ -67,6 +67,7 @@ const plan_capabilities = {
     retention: { history_days: 90, while_subscribed: false },
 
     bulk_import: { enabled: true, monthly_rows: 500, behavior: "pause" },
+    email_capture: { enabled: false, monthly_capacity: 0, behavior: "pause" },
 
     onboarding: { priority_onboarding: false },
   },
@@ -113,6 +114,7 @@ const plan_capabilities = {
     retention: { history_days: 365 * 3, while_subscribed: true },
 
     bulk_import: { enabled: true, monthly_rows: null, behavior: "pause" },
+    email_capture: { enabled: true, monthly_capacity: 30, behavior: "pause" },
 
     onboarding: { priority_onboarding: false },
   },
@@ -160,6 +162,7 @@ const plan_capabilities = {
     retention: { history_days: 365 * 7, while_subscribed: true },
 
     bulk_import: { enabled: true, monthly_rows: null, behavior: "pause" },
+    email_capture: { enabled: true, monthly_capacity: null, behavior: "pause" },
 
     onboarding: { priority_onboarding: true },
   },

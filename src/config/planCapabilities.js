@@ -66,6 +66,8 @@ const plan_capabilities = {
 
     retention: { history_days: 90, while_subscribed: false },
 
+    bulk_import: { enabled: true, monthly_rows: 500, behavior: "pause" },
+
     onboarding: { priority_onboarding: false },
   },
 
@@ -109,6 +111,8 @@ const plan_capabilities = {
     audit: { trail: true, depth: "standard" },
 
     retention: { history_days: 365 * 3, while_subscribed: true },
+
+    bulk_import: { enabled: true, monthly_rows: null, behavior: "pause" },
 
     onboarding: { priority_onboarding: false },
   },
@@ -154,6 +158,8 @@ const plan_capabilities = {
     audit: { trail: true, depth: "full" },
 
     retention: { history_days: 365 * 7, while_subscribed: true },
+
+    bulk_import: { enabled: true, monthly_rows: null, behavior: "pause" },
 
     onboarding: { priority_onboarding: true },
   },

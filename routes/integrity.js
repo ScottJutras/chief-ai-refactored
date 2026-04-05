@@ -8,11 +8,12 @@ const express = require('express');
 const router = express.Router();
 const pg = require('../services/postgres');
 const integrityService = require('../services/integrity');
-const { requirePortalUser } = require('../middleware/requirePortalUser');
+const { requirePortalUser, withPlanKey } = require('../middleware/requirePortalUser');
 const { plan_capabilities } = require('../src/config/planCapabilities');
 
-// All integrity endpoints require portal auth
-router.use(requirePortalUser);
+// All integrity endpoints require portal auth + plan resolution
+router.use(requirePortalUser());
+router.use(withPlanKey);
 
 /**
  * POST /api/integrity/verify

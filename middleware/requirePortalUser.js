@@ -167,4 +167,58 @@ function requirePortalUser(opts = {}) {
   };
 }
 
-module.exports = { requirePortalUser };
+/**
+ * withPlanKey — resolves req.planKey from the authenticated tenant's owner.
+ * Must run AFTER requirePortalUser(). Sets req.planKey to 'free'|'starter'|'pro'.
+ */
+function normalizePlanKey(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  if (!v) return 'free';
+  if (v.includes('pro')) return 'pro';
+  if (v.includes('starter')) return 'starter';
+  return 'free';
+}
+
+async function withPlanKey(req, res, next) {
+  // Default to free — fail closed
+  req.planKey = 'free';
+
+  try {
+    const ownerId = req.ownerId || null;
+    const tenantId = req.tenantId || null;
+
+    if (ownerId) {
+      const r = await pg.query(
+        `SELECT plan_key, subscription_tier, paid_tier FROM public.users WHERE owner_id = $1 LIMIT 1`,
+        [String(ownerId)]
+      );
+      const row = r.rows?.[0];
+      if (row) {
+        req.planKey =
+          normalizePlanKey(row.plan_key) ||
+          normalizePlanKey(row.subscription_tier) ||
+          normalizePlanKey(row.paid_tier) ||
+          'free';
+        return next();
+      }
+    }
+
+    // Fallback: billing_subscriptions by tenant_id
+    if (tenantId) {
+      const r2 = await pg.query(
+        `SELECT plan_key FROM public.billing_subscriptions WHERE tenant_id = $1::uuid ORDER BY created_at DESC LIMIT 1`,
+        [tenantId]
+      );
+      const row2 = r2.rows?.[0];
+      if (row2) {
+        req.planKey = normalizePlanKey(row2.plan_key);
+      }
+    }
+  } catch (e) {
+    console.warn('[WITH_PLAN_KEY] plan resolution failed, defaulting to free:', e?.message);
+  }
+
+  return next();
+}
+
+module.exports = { requirePortalUser, withPlanKey };

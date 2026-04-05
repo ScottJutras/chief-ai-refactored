@@ -11,12 +11,13 @@ const multer = require('multer');
 const path = require('path');
 const os = require('os');
 const pg = require('../services/postgres');
-const { requirePortalUser } = require('../middleware/requirePortalUser');
+const { requirePortalUser, withPlanKey } = require('../middleware/requirePortalUser');
 
 const upload = multer({ dest: os.tmpdir() });
 
-// All catalog endpoints require portal auth
-router.use(requirePortalUser);
+// All catalog endpoints require portal auth + plan resolution
+router.use(requirePortalUser());
+router.use(withPlanKey);
 
 // Plan gate helper
 function requireCatalogAccess(req, res, next) {

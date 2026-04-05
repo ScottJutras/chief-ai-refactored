@@ -102,6 +102,8 @@ const receiptsRouter = require("./routes/receipts");
 const portalRouter = require("./routes/portal");
 const crewAdminRouter = require("./routes/crewAdmin");
 const jobsPortalRouter = require("./routes/jobsPortal");
+const catalogRouter = require("./routes/catalog");
+const integrityRouter = require("./routes/integrity");
 
 // ✅ Portal auth + tenant/actor context for protected API routes
 const { requirePortalUser } = require("./middleware/requirePortalUser");
@@ -186,6 +188,12 @@ app.use("/api/parse", parseRouter);
 // Account + Dashboard
 app.use("/api/account", accountRouter);
 app.use("/api/dashboard", dashboardRouter);
+
+// Supplier catalog (portal auth applied inside router)
+app.use("/api/catalog", catalogRouter);
+
+// Record integrity (portal auth applied inside router)
+app.use("/api/integrity", integrityRouter);
 
 if (!process.env.VERCEL && process.env.NODE_ENV !== "test") {
   const PORT = process.env.PORT || 3000;

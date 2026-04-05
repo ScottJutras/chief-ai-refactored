@@ -31,6 +31,11 @@ BEGIN
       ADD CONSTRAINT reminders_owner_source_msg_id_key
       UNIQUE (owner_id, source_msg_id);
   END IF;
+
+
+
+
+  
 END$$;
 
 -- Polling index: only unsent, uncanceled, pending rows

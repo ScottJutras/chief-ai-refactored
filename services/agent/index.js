@@ -152,9 +152,10 @@ function getTools() {
     toolsSpec.push(t);
   }
 
-  // BI Agent Tools (Phase 1–3)
+  // BI Agent Tools (Phase 1–3) + Catalog
   const biTools = [
     'jobPnl', 'labourUtil', 'comparePeriods', 'getTopN', 'budgetVsActual', 'cashFlowForecast',
+    'catalogLookup',
   ];
   for (const toolFile of biTools) {
     try {

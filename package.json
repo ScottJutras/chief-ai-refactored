@@ -17,6 +17,7 @@
     "postinstall": "node -e \"require.resolve('pdfkit'); require.resolve('@supabase/supabase-js'); console.log('deps ok')\""
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.82.0",
     "@ffmpeg/ffmpeg": "^0.12.10",
     "@google-cloud/documentai": "^9.5.0",
     "@google-cloud/speech": "^7.2.1",

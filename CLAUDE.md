@@ -1,130 +1,123 @@
-# ChiefOS — Claude Code Instructions
+# CLAUDE.md — ChiefOS
 
-## Project Overview
+## What This Project Is
 
-ChiefOS is a business management platform for contractors and tradespeople. It handles job tracking, expense/receipt logging (with AI-powered OCR), overhead management, revenue tracking, labour hours, and an AI assistant called "Ask Chief".
+ChiefOS is an AI-native, WhatsApp-first operating system for small businesses. It has one authoritative reasoning interface (Chief) for the owner/operator and many ingestion inputs (the senses) for employees/contractors. The MVP spine is complete. Beta expansion is in progress.
 
-This repo (`chief-ai-refactored`) is the **root repository**. It contains the Node.js AI backend and has `chiefos-site` as a **git submodule**.
+Stack: Twilio → Vercel (Express) → Supabase (Postgres + RLS + Storage). Serverless-first. Provider-agnostic LLM layer.
 
----
+## Critical Architecture Rules
 
-## Repository Structure
+### Identity Model (Dual-Boundary — Never Collapse)
 
-```
-Chief/                        ← root repo (chief-ai-refactored on GitHub)
-├── chiefos-site/             ← git submodule (chiefos-site on GitHub)
-│   ├── app/                  ← Next.js App Router pages and API routes
-│   │   ├── app/              ← frontend pages (/app/jobs, /app/uploads, etc.)
-│   │   └── api/              ← server-side API routes
-│   ├── lib/                  ← shared utilities and server-only helpers
-│   └── package.json
-├── services/agent/index.js   ← Chief AI agent (OpenAI tool-calling loop)
-├── routes/                   ← Express API routes
-├── handlers/                 ← Business logic handlers
-├── migrations/               ← Supabase SQL migrations
-└── vercel.json               ← Vercel config for the AI backend
-```
+- **tenant_id (uuid):** Portal/RLS boundary. All portal queries MUST filter by tenant_id. Resolved via membership table.
+- **owner_id (digits string):** Ingestion/audit boundary. All WhatsApp/backend writes MUST include owner_id. Must resolve deterministically to tenant_id.
+- **user_id (digits string):** Actor identity. Scoped under owner_id. NEVER used as tenant boundary.
+- **UUIDs:** Row identifiers only. Never tenant boundary, user identity, or owner identity.
+- If tenant resolution is ambiguous → **FAIL CLOSED** (block write, log error, treat as Free tier).
 
----
+### Query Rules
 
-## Tech Stack
+Every query MUST include a tenant boundary key appropriate to the surface:
 
-### chiefos-site (frontend + Next.js API)
-- **Framework**: Next.js 16, App Router, React 19
-- **Language**: TypeScript (strict-ish — null checks may not always be enforced)
-- **Styling**: Tailwind CSS v4
-- **Database client**: `@supabase/supabase-js` v2
-- **OCR**: Google Document AI (not functional on Vercel — no ADC). Falls back to **OpenAI GPT-4o vision** (`OPENAI_API_KEY`)
-- **Deployment**: Vercel (auto-deploys on push to `main`)
+```sql
+-- Portal queries: use tenant_id
+SELECT ... FROM <table> WHERE tenant_id = $1 AND ...;
 
-### Root backend (chief-ai-refactored)
-- **Runtime**: Node.js 22
-- **AI**: OpenAI GPT-4o via tool-calling agent loop (`services/agent/index.js`)
-- **Deployment**: Vercel serverless (`vercel.json`)
+-- Ingestion/backend queries: use owner_id  
+SELECT ... FROM <table> WHERE owner_id = $1 AND ...;
 
-### Database
-- **Supabase** — project: `xnmsjdummnnistzcxrtj` (region: us-east-2)
-- Auth: Supabase Auth + `chiefos_portal_users` table for tenant membership
-- Multi-tenant: every query must be scoped to `tenant_id`
-
----
-
-## Git Workflow
-
-`chiefos-site` is a submodule. **Always commit in this order:**
-
-```bash
-# 1. Commit changes inside the submodule first
-cd chiefos-site
-git add <files>
-git commit -m "..."
-git push origin main
-
-# 2. Then update the root repo's submodule pointer
-cd ..
-git add chiefos-site
-git commit -m "Update chiefos-site: ..."
-git push origin main
+-- Updates/deletes: NEVER by UUID alone
+UPDATE <table> SET ... WHERE owner_id = $1 AND id = $2;
 ```
 
-Never commit chiefos-site changes directly from the root — the submodule SHA must be updated separately.
+**FORBIDDEN:** `WHERE id = $1` alone. `WHERE user_id = $1` alone. Queries without tenant boundary. Cross-tenant joins. Implicit ownership inference.
 
----
+### Canonical Data
 
-## Key Patterns
+- Financial truth: `public.transactions` (kind = expense/revenue/etc.)
+- Portal reads via tenant-safe views (e.g., `chiefos_portal_expenses`)
+- Legacy expense tables are archived — do NOT reintroduce as read surfaces
+- Compatibility views may include placeholder columns (e.g., deleted_at = NULL) for UI stability
 
-### Auth + Tenant Context
-All API routes use a consistent pattern:
-```ts
-// 1. Extract bearer token from Authorization header
-// 2. Verify with admin Supabase client (service role key)
-// 3. Look up chiefos_portal_users to get tenant_id and role
-// 4. Look up chiefos_tenants to get owner_id
-// 5. Scope all DB queries to tenant_id
+### CIL (Canonical Intermediate Language)
+
+All ingestion MUST follow: Ingress → CIL Draft → Validation → Domain Mutation.
+No direct ingestion-to-database writes. No LLM creativity at this layer.
+Amounts in cents. ISO datetimes. E.164 phone normalization.
+
+### Idempotency
+
+All writes MUST be idempotent. Enforced by (owner_id, source_msg_id, kind) or per-kind unique constraints.
+Replays must never create duplicates.
+
+### Plan Gating (Fail-Closed)
+
+- Plan resolves by owner_id, never by user_id or cached state
+- If plan lookup fails → treat as Free, block gated actions
+- Check quota BEFORE execution, consume BEFORE execution (never after)
+- Reason codes: NOT_INCLUDED, OVER_QUOTA
+
+## Key Tables
+
+- `public.transactions` — canonical financial spine (expenses, revenue)
+- `public.time_entries_v2` — timeclock entries
+- `public.jobs` — job spine (job_int_id for linkage)
+- `public.file_exports` — generated export files
+- `public.media_assets` — receipts, images, documents
+- `chiefos_portal_expenses` — portal-safe expense view
+- `chiefos_portal_users` — portal membership (tenant_id scoping)
+
+## Error Handling
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "PERMISSION_DENIED",
+    "message": "Owner-only action",
+    "hint": "Ask the owner to perform this action",
+    "traceId": "abc123"
+  }
+}
 ```
-Use `requirePortalUser()` factory (not middleware) where available.
 
-### Admin Supabase Client
-Server-side routes use `SUPABASE_SERVICE_ROLE_KEY` — never expose this to the client.
-Client-side uses the `supabase` singleton from `@/lib/supabase` (anon key).
+Every response within 8 seconds. Never expose stack traces. Never crash on malformed input. Safe-fail with user-facing message.
 
-### Environment Variables
-- `NEXT_PUBLIC_SUPABASE_URL` — public, used client + server
-- `NEXT_PUBLIC_SUPABASE_ANON_KEY` — public
-- `SUPABASE_SERVICE_ROLE_KEY` — server only (never `NEXT_PUBLIC_`)
-- `OPENAI_API_KEY` — server only, used for GPT-4o vision OCR and Ask Chief
-- `GOOGLE_DOCUMENT_AI_PROJECT_ID` / `GOOGLE_DOCUMENT_AI_RECEIPT_PROCESSOR_ID` — not functional on Vercel (no ADC credentials), vision fallback handles this
+## One Mind, Many Senses
 
-### Receipt / Intake Pipeline
-1. `POST /api/intake/upload` — uploads file to Supabase storage, creates `intake_items` record
-2. `POST /api/intake/process` — downloads file, tries Document AI OCR → falls back to GPT-4o vision, extracts fields, creates `intake_item_drafts`
-3. `GET /api/intake/items?batchId=...` — fetches items for review UI
-4. `POST /api/intake/items/[id]/confirm` — confirms draft, writes to expenses/revenue tables
+- Exactly ONE reasoning seat per business (the Owner via Chief)
+- Employees are ingestion identities only — they capture facts, not reasoning
+- Micro-apps are senses: capture/confirm/submit only, no reasoning
+- Scale by adding senses, never by adding minds
 
-Duplicate detection: only items with `status IN ('confirmed', 'persisted')` count as true duplicates. Skipped/deleted items do not block re-upload.
+## Stage Awareness
 
-### Navigation
-- `/app/uploads` — combined Log & Review page (tab=log | tab=review)
-- `/app/pending-review` — redirects to `/app/uploads?tab=review`
-- Sidebar + MobileNav show a combined badge: pending intake items + overdue overhead
+- MVP: COMPLETE
+- Beta: IN PROGRESS (sequenced via Execution Playbook)
+- Public monetized launch: NOT APPROVED
 
----
+Beta pause rule: if transport stability, tenant isolation, idempotency, or plan enforcement regress → all Beta work stops until restored.
 
-## Coding Conventions
+## Beta Exclusions (Do Not Build)
 
-- Prefer editing existing files over creating new ones
-- Keep API routes self-contained (auth, validation, business logic all in route file)
-- CSS hiding pattern for persistent tab state: `className={tab === "log" ? "" : "hidden"}` (not conditional rendering)
-- `export const maxDuration = 45` on any route that calls external AI APIs
-- All money stored as **cents** (integer) in the database
-- Dates stored as ISO strings; timezone from `chiefos_portal_users.tz` (default `America/Toronto`)
+Multi-seat reasoning. Autonomous forecasting. Auto-execution of financial changes. Cross-tenant benchmarking. Silent data mutation. Predictive analytics without history. Payroll. Autonomous advice.
 
----
+## Migration Safety
 
-## Common Gotchas
+- Never change owner_id datatype without full migration plan
+- Never remove owner_id from ingestion/audit tables
+- Never infer tenant from user_id alone
+- Any migration touching transactions, time_entries, exports, or quotas requires regression test + cross-tenant isolation test
+- All migrations must be timestamped, documented, idempotent, and reversible
 
-- **Google Document AI** does not work on Vercel serverless — no Application Default Credentials. Always ensure GPT-4o vision fallback is in place.
-- **`mustEnv()`** throws if an env var is missing — this is caught and triggers the vision fallback, not a crash.
-- **Submodule commits**: forgetting to update the root repo pointer after pushing chiefos-site means Vercel deploys the old version.
-- **`useSearchParams()`** in Next.js App Router requires a `<Suspense>` boundary around the component.
-- **Duplicate `const` declarations** inside the same function scope will crash the Lambda on startup (`SyntaxError`) — caught in `services/agent/index.js` previously.
+## Pre-Commit Checklist
+
+Before any deployment:
+- [ ] All queries include tenant boundary (tenant_id or owner_id)
+- [ ] No cross-tenant joins
+- [ ] Writes are idempotent (source_msg_id / dedupe_hash)
+- [ ] Plan gating is fail-closed
+- [ ] No PII in logs
+- [ ] Exports verify tenant boundary before returning bytes
+- [ ] Error responses include traceId, never stack traces

@@ -2,6 +2,7 @@
 // ------------------------------------------------------------
 const { Pool } = require('pg');
 const crypto = require('crypto');
+const integrity = require('./integrity');
 const { formatInTimeZone } = require('date-fns-tz');
 const { getEffectivePlanKey } = require('../src/config/getEffectivePlanKey');
 /* ---------- Environment (robust) ---------- */
@@ -747,6 +748,7 @@ let TX_HAS_UPDATED_AT = null;
 let TX_HAS_SUBTOTAL_AMOUNT = null;
 let TX_HAS_TAX_AMOUNT = null;
 let TX_HAS_TAX_LABEL = null;
+let TX_HAS_RECORD_HASH = null;
 
 let TX_HAS_OWNER_SOURCEMSG_UNIQUE = null;
 
@@ -773,7 +775,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_TENANT_ID !== null &&
     TX_HAS_SUBTOTAL_AMOUNT !== null &&
     TX_HAS_TAX_AMOUNT !== null &&
-    TX_HAS_TAX_LABEL !== null
+    TX_HAS_TAX_LABEL !== null &&
+    TX_HAS_RECORD_HASH !== null
   ) {
     return {
       TX_HAS_SOURCE_MSG_ID,
@@ -796,7 +799,8 @@ async function detectTransactionsCapabilities() {
       TX_HAS_TENANT_ID,
       TX_HAS_SUBTOTAL_AMOUNT,
       TX_HAS_TAX_AMOUNT,
-      TX_HAS_TAX_LABEL
+      TX_HAS_TAX_LABEL,
+      TX_HAS_RECORD_HASH
     };
   }
 
@@ -834,6 +838,7 @@ async function detectTransactionsCapabilities() {
     TX_HAS_SUBTOTAL_AMOUNT = names.has('subtotal_amount');
     TX_HAS_TAX_AMOUNT = names.has('tax_amount');
     TX_HAS_TAX_LABEL = names.has('tax_label');
+    TX_HAS_RECORD_HASH = names.has('record_hash');
   } catch (e) {
     console.warn('[PG/transactions] detect capabilities failed (fail-open):', e?.message);
     // Don't cache transient errors — allow retry on next call
@@ -858,7 +863,8 @@ async function detectTransactionsCapabilities() {
       TX_HAS_TENANT_ID: false,
       TX_HAS_SUBTOTAL_AMOUNT: false,
       TX_HAS_TAX_AMOUNT: false,
-      TX_HAS_TAX_LABEL: false
+      TX_HAS_TAX_LABEL: false,
+      TX_HAS_RECORD_HASH: false
     };
   }
 
@@ -883,7 +889,8 @@ async function detectTransactionsCapabilities() {
     TX_HAS_TENANT_ID,
     TX_HAS_SUBTOTAL_AMOUNT,
     TX_HAS_TAX_AMOUNT,
-    TX_HAS_TAX_LABEL
+    TX_HAS_TAX_LABEL,
+    TX_HAS_RECORD_HASH
   };
 }
 
@@ -1880,8 +1887,6 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     if (v) { cols.push('tax_label'); vals.push(v); }
   }
 
-  const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
-
   let conflictSql = '';
 
   if (caps.TX_HAS_DEDUPE_HASH && dedupeHash && hasOwnerDedupeUnique) {
@@ -1895,15 +1900,58 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
     }
   }
 
-  const sql = `
-    insert into public.transactions (${cols.join(', ')})
-    values (${placeholders})
-    ${conflictSql}
-    returning id
-  `;
+  // Snapshot the pre-hash record state for hash input computation (tenant_id required)
+  const hashableRecord = {
+    owner_id: owner,
+    tenant_id: tenantId,
+    kind,
+    amount_cents: amountCents,
+    description,
+    source,
+    source_msg_id: sourceMsgId,
+    job_id: resolvedJobId,
+    created_at: new Date().toISOString(),
+  };
 
   try {
-    const r = await queryWithTimeout(sql, vals, timeoutMs);
+    // ─── Execute INSERT inside an explicit DB transaction ──────────────────────
+    // This ensures the hash chain previous_hash lookup and the INSERT are atomic,
+    // preventing concurrent writes from corrupting the chain (FOR UPDATE SKIP LOCKED).
+    const r = await withClient(async (client) => {
+      await client.query(`SET LOCAL statement_timeout = '${timeoutMs}ms'`);
+
+      // Append hash columns when schema supports them
+      const insertCols = [...cols];
+      const insertVals = [...vals];
+
+      if (caps.TX_HAS_RECORD_HASH && tenantId) {
+        try {
+          const hashData = await integrity.generateHashData(hashableRecord, 'transactions', client);
+          insertCols.push('record_hash', 'previous_hash', 'hash_version', 'hash_input_snapshot');
+          insertVals.push(
+            hashData.record_hash,
+            hashData.previous_hash,
+            hashData.hash_version,
+            JSON.stringify(hashData.hash_input_snapshot)
+          );
+        } catch (hashErr) {
+          // Hash generation failure is non-fatal — write the record without hash
+          // (backfill script can recover it later)
+          console.warn('[integrity] hash generation failed (record written without hash):', hashErr.message);
+        }
+      }
+
+      const placeholders = insertCols.map((_, i) => `$${i + 1}`).join(', ');
+      const sql = `
+        insert into public.transactions (${insertCols.join(', ')})
+        values (${placeholders})
+        ${conflictSql}
+        returning id
+      `;
+
+      return client.query(sql, insertVals);
+    }, { useTransaction: true });
+
     const id = r?.rows?.[0]?.id ?? null;
 
     console.info('[TX_WRITE_JOB]', {
@@ -4696,6 +4744,228 @@ const exportTimesheetPdf =
   null;
 
 
+/* ─────────────────────────────────────────────────────────────────────────────
+   SUPPLIER CATALOG QUERIES
+   Catalog tables are shared reference data — no tenant_id, no RLS.
+   Contractors read from the global catalog; writes are ingestion-pipeline only.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+// Freshness cadence in days
+const CADENCE_DAYS = { monthly: 30, quarterly: 90, annual: 365 };
+
+function getSupplierFreshnessState(lastUpdatedDate, cadence) {
+  if (!lastUpdatedDate) return 'UNKNOWN';
+  const cadenceDays = CADENCE_DAYS[cadence] || 90;
+  const daysSince = Math.floor((Date.now() - new Date(lastUpdatedDate).getTime()) / (1000 * 60 * 60 * 24));
+  if (daysSince > cadenceDays * 2) return 'EXPIRED';
+  if (daysSince > cadenceDays) return 'STALE';
+  if (daysSince > cadenceDays - 30) return 'AGING';
+  return 'FRESH';
+}
+
+async function listSuppliers() {
+  const { rows } = await query(
+    `SELECT id, slug, name, description, website_url, logo_storage_key,
+            catalog_update_cadence, is_active, updated_at,
+            (SELECT COUNT(*) FROM public.catalog_products cp WHERE cp.supplier_id = s.id AND cp.is_active = true) AS product_count,
+            (SELECT MAX(price_effective_date) FROM public.catalog_products cp WHERE cp.supplier_id = s.id) AS last_price_date
+     FROM public.suppliers s
+     WHERE is_active = true
+     ORDER BY name`
+  );
+  return rows.map((r) => ({
+    ...r,
+    freshness: getSupplierFreshnessState(r.last_price_date, r.catalog_update_cadence),
+  }));
+}
+
+async function getSupplierBySlug(slug) {
+  const { rows } = await query(
+    `SELECT id, slug, name, description, website_url, logo_storage_key,
+            contact_email, catalog_update_cadence, is_active, created_at, updated_at
+     FROM public.suppliers
+     WHERE slug = $1 AND is_active = true
+     LIMIT 1`,
+    [slug]
+  );
+  return rows[0] ?? null;
+}
+
+async function listSupplierCategories(supplierId) {
+  const { rows } = await query(
+    `SELECT id, name, slug, parent_category_id, sort_order
+     FROM public.supplier_categories
+     WHERE supplier_id = $1 AND is_active = true
+     ORDER BY sort_order, name`,
+    [supplierId]
+  );
+  return rows;
+}
+
+async function listCatalogProducts(supplierId, { categoryId = null, search = null, limit = 50, offset = 0 } = {}) {
+  const conditions = [`cp.supplier_id = $1`, `cp.is_active = true`];
+  const params = [supplierId];
+
+  if (categoryId) {
+    params.push(categoryId);
+    conditions.push(`cp.category_id = $${params.length}`);
+  }
+
+  let orderBy = 'cp.name';
+
+  if (search && search.trim()) {
+    params.push(search.trim());
+    const idx = params.length;
+    conditions.push(`to_tsvector('english', cp.name || ' ' || COALESCE(cp.description, '')) @@ plainto_tsquery('english', $${idx})`);
+    orderBy = `ts_rank(to_tsvector('english', cp.name || ' ' || COALESCE(cp.description, '')), plainto_tsquery('english', $${idx})) DESC`;
+  }
+
+  params.push(limit);
+  params.push(offset);
+
+  const { rows } = await query(
+    `SELECT cp.id, cp.sku, cp.name, cp.description, cp.unit_of_measure,
+            cp.unit_price_cents, cp.price_type, cp.price_effective_date,
+            cp.price_expires_date, cp.min_order_quantity, cp.metadata, cp.updated_at,
+            sc.name AS category_name
+     FROM public.catalog_products cp
+     LEFT JOIN public.supplier_categories sc ON sc.id = cp.category_id
+     WHERE ${conditions.join(' AND ')}
+     ORDER BY ${orderBy}
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+  return rows;
+}
+
+async function searchAllCatalog(searchQuery, { limit = 20 } = {}) {
+  if (!searchQuery || !searchQuery.trim()) return [];
+  const { rows } = await query(
+    `SELECT cp.id, cp.sku, cp.name, cp.description, cp.unit_of_measure,
+            cp.unit_price_cents, cp.price_effective_date, cp.metadata,
+            s.name AS supplier_name, s.slug AS supplier_slug,
+            s.catalog_update_cadence
+     FROM public.catalog_products cp
+     JOIN public.suppliers s ON s.id = cp.supplier_id
+     WHERE cp.is_active = true
+       AND s.is_active = true
+       AND to_tsvector('english', cp.name || ' ' || COALESCE(cp.description, ''))
+           @@ plainto_tsquery('english', $1)
+     ORDER BY ts_rank(
+       to_tsvector('english', cp.name || ' ' || COALESCE(cp.description, '')),
+       plainto_tsquery('english', $1)
+     ) DESC
+     LIMIT $2`,
+    [searchQuery.trim(), limit]
+  );
+  return rows.map((r) => ({
+    ...r,
+    freshness: getSupplierFreshnessState(r.price_effective_date, r.catalog_update_cadence),
+  }));
+}
+
+async function getCatalogProduct(productId) {
+  const { rows } = await query(
+    `SELECT cp.id, cp.sku, cp.name, cp.description, cp.unit_of_measure,
+            cp.unit_price_cents, cp.price_type, cp.price_effective_date,
+            cp.price_expires_date, cp.min_order_quantity, cp.metadata,
+            cp.is_active, cp.discontinued_at, cp.updated_at,
+            s.name AS supplier_name, s.slug AS supplier_slug,
+            s.catalog_update_cadence,
+            sc.name AS category_name
+     FROM public.catalog_products cp
+     JOIN public.suppliers s ON s.id = cp.supplier_id
+     LEFT JOIN public.supplier_categories sc ON sc.id = cp.category_id
+     WHERE cp.id = $1
+     LIMIT 1`,
+    [productId]
+  );
+  if (!rows[0]) return null;
+  return {
+    ...rows[0],
+    freshness: getSupplierFreshnessState(rows[0].price_effective_date, rows[0].catalog_update_cadence),
+  };
+}
+
+async function getProductPriceHistory(productId, limit = 20) {
+  const { rows } = await query(
+    `SELECT old_price_cents, new_price_cents, price_type, effective_date, change_source, created_at
+     FROM public.catalog_price_history
+     WHERE product_id = $1
+     ORDER BY created_at DESC
+     LIMIT $2`,
+    [productId, limit]
+  );
+  return rows;
+}
+
+async function getTenantSupplierPreferences(tenantId) {
+  const { rows } = await query(
+    `SELECT tsp.id, tsp.supplier_id, tsp.is_preferred, tsp.contractor_account_number,
+            tsp.discount_percentage, tsp.notes, tsp.updated_at,
+            s.slug, s.name AS supplier_name, s.website_url
+     FROM public.tenant_supplier_preferences tsp
+     JOIN public.suppliers s ON s.id = tsp.supplier_id
+     WHERE tsp.tenant_id = $1
+     ORDER BY tsp.is_preferred DESC, s.name`,
+    [tenantId]
+  );
+  return rows;
+}
+
+async function upsertTenantSupplierPreference(tenantId, supplierId, prefs) {
+  const { is_preferred, contractor_account_number, discount_percentage, notes } = prefs;
+  const { rows } = await query(
+    `INSERT INTO public.tenant_supplier_preferences
+       (tenant_id, supplier_id, is_preferred, contractor_account_number, discount_percentage, notes)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     ON CONFLICT (tenant_id, supplier_id)
+     DO UPDATE SET
+       is_preferred = EXCLUDED.is_preferred,
+       contractor_account_number = EXCLUDED.contractor_account_number,
+       discount_percentage = EXCLUDED.discount_percentage,
+       notes = EXCLUDED.notes,
+       updated_at = now()
+     RETURNING *`,
+    [tenantId, supplierId, is_preferred ?? false,
+     contractor_account_number ?? null, discount_percentage ?? 0, notes ?? null]
+  );
+  return rows[0];
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   INTEGRITY VERIFICATION QUERIES
+   ───────────────────────────────────────────────────────────────────────────── */
+
+async function getIntegrityVerificationHistory(tenantId, limit = 20) {
+  const { rows } = await query(
+    `SELECT id, table_name, verification_type, total_records_checked,
+            records_valid, records_invalid, records_unhashed,
+            first_invalid_record_id, invalid_details, chain_intact,
+            started_at, completed_at, created_at,
+            (records_invalid = 0) AS chain_intact
+     FROM public.integrity_verification_log
+     WHERE tenant_id = $1
+     ORDER BY created_at DESC
+     LIMIT $2`,
+    [tenantId, limit]
+  );
+  return rows;
+}
+
+async function getLatestIntegrityStatus(tenantId) {
+  const { rows } = await query(
+    `SELECT records_invalid = 0 AS chain_intact, total_records_checked,
+            records_valid, records_invalid, completed_at
+     FROM public.integrity_verification_log
+     WHERE tenant_id = $1
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [tenantId]
+  );
+  return rows[0] ?? null;
+}
+
 /* -------------------- module exports -------------------- */
 module.exports = {
   pool,
@@ -4830,4 +5100,20 @@ module.exports = {
   getActorMemory,
   patchActorMemory,
   getJobProfitByRange,
+
+  // Supplier catalog
+  listSuppliers,
+  getSupplierBySlug,
+  listSupplierCategories,
+  listCatalogProducts,
+  searchAllCatalog,
+  getCatalogProduct,
+  getProductPriceHistory,
+  getTenantSupplierPreferences,
+  upsertTenantSupplierPreference,
+  getSupplierFreshnessState,
+
+  // Integrity verification
+  getIntegrityVerificationHistory,
+  getLatestIntegrityStatus,
 };

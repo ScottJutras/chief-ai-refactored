@@ -69,6 +69,10 @@ const plan_capabilities = {
     bulk_import: { enabled: true, monthly_rows: 500, behavior: "pause" },
     email_capture: { enabled: false, monthly_capacity: 0, behavior: "pause" },
 
+    supplier_catalog: { enabled: false },
+
+    integrity: { hash_generation: true, on_demand_verify: false, export_badge: false, history: false },
+
     onboarding: { priority_onboarding: false },
   },
 
@@ -115,6 +119,15 @@ const plan_capabilities = {
 
     bulk_import: { enabled: true, monthly_rows: null, behavior: "pause" },
     email_capture: { enabled: true, monthly_capacity: 30, behavior: "pause" },
+
+    // Starter: browse catalogs, search products, catalog-assisted quoting, expense itemization
+    supplier_catalog: {
+      enabled: true,
+      preferred_suppliers: false,       // Pro only
+      cross_supplier_compare: false,    // Pro only
+    },
+
+    integrity: { hash_generation: true, on_demand_verify: true, export_badge: true, history: false },
 
     onboarding: { priority_onboarding: false },
   },
@@ -163,6 +176,15 @@ const plan_capabilities = {
 
     bulk_import: { enabled: true, monthly_rows: null, behavior: "pause" },
     email_capture: { enabled: true, monthly_capacity: null, behavior: "pause" },
+
+    // Pro: full catalog access — preferred suppliers, cross-supplier comparison, purchasing analytics
+    supplier_catalog: {
+      enabled: true,
+      preferred_suppliers: true,
+      cross_supplier_compare: true,
+    },
+
+    integrity: { hash_generation: true, on_demand_verify: true, export_badge: true, history: true },
 
     onboarding: { priority_onboarding: true },
   },

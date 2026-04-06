@@ -40,7 +40,7 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
 
   if (details.missingItems?.length) {
     return (
-      `I can’t price: ${details.missingItems.join(‘, ‘)}.\n` +
+      `I can't price: ${details.missingItems.join(', ')}.\n` +
       `Add them to your pricing list, or give a manual price like "$50 for ${details.missingItems[0]}".`
     );
   }
@@ -98,11 +98,11 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
       if (reason === 'OVER_QUOTA') {
         const proNudge =
           planKey === 'starter'
-            ? `\n\nYou’re on Starter. Pro includes higher monthly export capacity — upgrade only if your volume justifies it.`
+            ? `\n\nYou're on Starter. Pro includes higher monthly export capacity — upgrade only if your volume justifies it.`
             : '';
 
         return (
-          `You’ve used your monthly PDF export allowance.\n\n` +
+          `You've used your monthly PDF export allowance.\n\n` +
           `You can:\n` +
           `• Wait until your limit resets next month\n` +
           `• Upgrade for higher capacity\n\n` +
@@ -112,7 +112,7 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
       }
 
       return (
-        `PDF export isn’t included on your plan.\n\n` +
+        `PDF export isn't included on your plan.\n\n` +
         `Starter unlocks PDF/Excel exports so you can hand a clean file to your accountant or customer.\n\n` +
         `Upgrade when it makes sense.`
       );

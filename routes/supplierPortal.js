@@ -62,13 +62,35 @@ function requireChiefOSAdmin(req, res, next) {
 router.post('/signup', express.json(), async (req, res) => {
   const {
     company_name, supplier_type = 'manufacturer', region = 'canada',
-    contact_name, email, phone, address, description, password,
+    contact_name, email, phone, address, city, description, password,
+    // camelCase aliases (sent by the Next.js signup form)
+    companyName, supplierType, contactName, contactEmail, contactPhone,
+    companyAddress, companyCity,
   } = req.body || {};
 
-  if (!company_name?.trim()) return res.status(400).json({ ok: false, error: 'MISSING_FIELD', message: 'Company name is required.' });
-  if (!email?.trim()) return res.status(400).json({ ok: false, error: 'MISSING_FIELD', message: 'Email is required.' });
+  // Accept either snake_case (direct) or camelCase (from frontend form)
+  const _companyName  = (company_name  || companyName  || '').trim();
+  const _supplierType = supplier_type  || supplierType  || 'manufacturer';
+  const _region       = region;
+  const _contactName  = (contact_name  || contactName  || '').trim();
+  const _email        = (email         || contactEmail  || '').trim().toLowerCase();
+  const _phone        = (phone         || contactPhone  || '').trim() || null;
+  const _address      = (address       || companyAddress|| '').trim() || null;
+  const _city         = (city          || companyCity   || '').trim() || null;
+  const _description  = (description   || '').trim() || null;
+
+  // reassign for compat with rest of handler
+  const resolvedBody = {
+    company_name: _companyName, supplier_type: _supplierType, region: _region,
+    contact_name: _contactName, email: _email, phone: _phone, address: _address,
+    city: _city, description: _description, password,
+  };
+  Object.assign(req.body, resolvedBody);
+
+  if (!_companyName) return res.status(400).json({ ok: false, error: 'MISSING_FIELD', message: 'Company name is required.' });
+  if (!_email) return res.status(400).json({ ok: false, error: 'MISSING_FIELD', message: 'Email is required.' });
   if (!password || password.length < 8) return res.status(400).json({ ok: false, error: 'WEAK_PASSWORD', message: 'Password must be at least 8 characters.' });
-  if (!contact_name?.trim()) return res.status(400).json({ ok: false, error: 'MISSING_FIELD', message: 'Contact name is required.' });
+  if (!_contactName) return res.status(400).json({ ok: false, error: 'MISSING_FIELD', message: 'Contact name is required.' });
 
   try {
     const sb = supabaseAdmin();
@@ -76,7 +98,7 @@ router.post('/signup', express.json(), async (req, res) => {
     // Check for existing supplier user with this email
     const { rows: existing } = await pg.query(
       `SELECT id FROM public.supplier_users WHERE email = $1 LIMIT 1`,
-      [email.trim().toLowerCase()]
+      [_email]
     );
     if (existing.length > 0) {
       return res.status(409).json({ ok: false, error: 'EMAIL_EXISTS', message: 'A supplier account with this email already exists.' });
@@ -84,10 +106,10 @@ router.post('/signup', express.json(), async (req, res) => {
 
     // Create Supabase auth user
     const { data: authData, error: authErr } = await sb.auth.admin.createUser({
-      email: email.trim().toLowerCase(),
+      email: _email,
       password,
       email_confirm: false,
-      user_metadata: { user_type: 'supplier', full_name: contact_name.trim() },
+      user_metadata: { user_type: 'supplier', full_name: _contactName },
     });
 
     if (authErr || !authData?.user?.id) {
@@ -96,7 +118,7 @@ router.post('/signup', express.json(), async (req, res) => {
     }
 
     const authUid = authData.user.id;
-    const baseSlug = slugify(company_name);
+    const baseSlug = slugify(_companyName);
 
     // Generate unique slug
     let slug = baseSlug;
@@ -115,12 +137,12 @@ router.post('/signup', express.json(), async (req, res) => {
       `INSERT INTO public.suppliers
          (slug, name, description, public_description, status, supplier_type, region,
           primary_contact_name, primary_contact_email, primary_contact_phone,
-          company_address, catalog_update_cadence, is_active, onboarding_completed)
-       VALUES ($1,$2,$3,$4,'pending_review',$5,$6,$7,$8,$9,$10,'quarterly',false,false)
+          company_address, city, catalog_update_cadence, is_active, onboarding_completed)
+       VALUES ($1,$2,$3,$4,'pending_review',$5,$6,$7,$8,$9,$10,$11,'quarterly',false,false)
        RETURNING id, slug, name, status`,
-      [slug, company_name.trim(), description?.trim() || null, description?.trim() || null,
-       supplier_type, region, contact_name.trim(), email.trim().toLowerCase(),
-       phone?.trim() || null, address?.trim() || null]
+      [slug, _companyName, _description, _description,
+       _supplierType, _region, _contactName, _email,
+       _phone, _address, _city]
     );
     const supplier = supRows[0];
 
@@ -128,7 +150,7 @@ router.post('/signup', express.json(), async (req, res) => {
     await pg.query(
       `INSERT INTO public.supplier_users (auth_uid, supplier_id, email, full_name, role)
        VALUES ($1, $2, $3, $4, 'owner')`,
-      [authUid, supplier.id, email.trim().toLowerCase(), contact_name.trim()]
+      [authUid, supplier.id, _email, _contactName]
     );
 
     // Notify admin (fire-and-forget)

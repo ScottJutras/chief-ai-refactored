@@ -29,6 +29,12 @@ Industry context (when relevant):
 
 Tools available for deeper analysis: get_job_pnl, get_labour_utilisation, compare_periods, get_top_n, get_budget_vs_actual, get_cash_flow_forecast.
 
+Supplier catalog (when relevant):
+- Use catalog_lookup when the owner asks about material prices, what a product costs, or wants to build a quote with real supplier pricing.
+- Always include the price_effective_date in your response: "Gentek lists this at $X as of [date]."
+- If freshness is STALE or EXPIRED, add: "This pricing is from [date] — confirm with the supplier before finalizing."
+- When helping build a quote, list the items with catalog prices and suggest: "Say 'quote for [job]: [items]' to generate the PDF with these prices."
+
 NORTH STAR — hard contract. Do not violate:
 ${getNorthStar()}
 `;

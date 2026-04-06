@@ -4933,6 +4933,53 @@ async function upsertTenantSupplierPreference(tenantId, supplierId, prefs) {
   return rows[0];
 }
 
+/**
+ * saveQuoteLineItemsWithSnapshots
+ * Persists catalog-sourced WhatsApp quote line items to quote_line_items
+ * so they appear in the portal with frozen catalog snapshots.
+ * Requires job to exist — resolves by job_name under ownerId.
+ * Fail-open: if job or tenant not found, skips silently.
+ */
+async function saveQuoteLineItemsWithSnapshots({ ownerId, jobName, items }) {
+  if (!ownerId || !jobName || !items?.length) return;
+
+  // Resolve tenant_id from owner_id
+  const tenantRes = await query(
+    `SELECT id FROM public.chiefos_tenants WHERE owner_id = $1 LIMIT 1`,
+    [String(ownerId)]
+  );
+  const tenantId = tenantRes.rows?.[0]?.id;
+  if (!tenantId) return;
+
+  // Resolve job_id from job_name under owner
+  const jobRes = await query(
+    `SELECT id FROM public.jobs WHERE owner_id = $1 AND LOWER(job_name) = LOWER($2) ORDER BY id DESC LIMIT 1`,
+    [String(ownerId), jobName.trim()]
+  );
+  const jobId = jobRes.rows?.[0]?.id;
+  if (!jobId) return;
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    await query(
+      `INSERT INTO public.quote_line_items
+         (job_id, tenant_id, description, qty, unit_price_cents, category, sort_order, catalog_product_id, catalog_snapshot)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        jobId,
+        tenantId,
+        item.item || item.catalog_snapshot?.name || 'Material',
+        item.quantity || 1,
+        Math.round((item.price || 0) * 100),
+        'materials',
+        i,
+        item.catalog_product_id || null,
+        item.catalog_snapshot ? JSON.stringify(item.catalog_snapshot) : null,
+      ]
+    );
+  }
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
    INTEGRITY VERIFICATION QUERIES
    ───────────────────────────────────────────────────────────────────────────── */
@@ -5112,6 +5159,7 @@ module.exports = {
   getTenantSupplierPreferences,
   upsertTenantSupplierPreference,
   getSupplierFreshnessState,
+  saveQuoteLineItemsWithSnapshots,
 
   // Integrity verification
   getIntegrityVerificationHistory,

@@ -5,6 +5,9 @@ const axios = require('axios');
 /**
  * generateQuotePDFBuffer(quoteData) -> Buffer
  * No filesystem writes. Safe for serverless.
+ *
+ * quoteData.catalogDisclaimer: ISO date string (e.g. "2026-01-15") if any
+ *   line items were priced from the supplier catalog. Triggers a footer note.
  */
 async function generateQuotePDFBuffer(quoteData) {
   const {
@@ -18,7 +21,8 @@ async function generateQuotePDFBuffer(quoteData) {
     companyName,
     companyAddress,
     companyPhone,
-    logoUrl
+    logoUrl,
+    catalogDisclaimer = null,
   } = quoteData || {};
 
   const doc = new PDFDocument({ size: 'A4', margin: 50 });
@@ -62,13 +66,18 @@ async function generateQuotePDFBuffer(quoteData) {
 
   let y = tableTop + 25;
 
+  // Track whether any line came from catalog (for asterisk)
+  let anyCatalog = false;
+
   for (const row of items) {
     const item = String(row?.item || '').trim();
     const quantity = Number(row?.quantity || 0);
     const price = Number(row?.price || 0);
     const lineTotal = price * quantity;
+    const fromCatalog = !!row?.from_catalog;
+    if (fromCatalog) anyCatalog = true;
 
-    doc.text(item || '—', 50, y)
+    doc.text(fromCatalog ? `${item || '—'} *` : (item || '—'), 50, y)
       .text(String(quantity || 0), 250, y)
       .text(`$${price.toFixed(2)}`, 340, y)
       .text(`$${lineTotal.toFixed(2)}`, 450, y);
@@ -88,6 +97,27 @@ async function generateQuotePDFBuffer(quoteData) {
   doc.text(`Tax: $${Number(tax || 0).toFixed(2)}`, 350, y, { align: 'right' });
   y += 20;
   doc.text(`Total: $${Number(total || 0).toFixed(2)}`, 350, y, { align: 'right' });
+  y += 30;
+
+  // Catalog pricing disclaimer
+  if (anyCatalog && catalogDisclaimer) {
+    const dateStr = (() => {
+      try {
+        return new Date(catalogDisclaimer).toLocaleDateString('en-CA', { year: 'numeric', month: 'long', day: 'numeric' });
+      } catch {
+        return catalogDisclaimer;
+      }
+    })();
+    doc
+      .fontSize(8)
+      .fillColor('#777777')
+      .text(
+        `* Pricing marked with * was sourced from supplier catalog as of ${dateStr}. Confirm current pricing with your supplier before finalizing this quote.`,
+        50, y,
+        { width: 500 }
+      )
+      .fillColor('#000000');
+  }
 
   doc.end();
   return done;

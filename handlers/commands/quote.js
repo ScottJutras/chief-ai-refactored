@@ -35,13 +35,13 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
     return `Try: quote for <job>: 2 paint, 10 shingles, $50 for disposal plus 40%`;
   }
 
-  // price + totals
+  // price + totals (falls back to catalog for unpriced items)
   const details = await buildQuoteDetails(parsed, owner_id);
 
   if (details.missingItems?.length) {
     return (
-      `I can’t price: ${details.missingItems.join(', ')}.\n` +
-      `Add them to pricing first, or give a manual price like "$50 for ${details.missingItems[0]}".`
+      `I can’t price: ${details.missingItems.join(‘, ‘)}.\n` +
+      `Add them to your pricing list, or give a manual price like "$50 for ${details.missingItems[0]}".`
     );
   }
 
@@ -51,6 +51,15 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
   const total = subtotal + tax;
 
   const quoteId = newQuoteId();
+
+  // Check if any items sourced from catalog (for PDF disclaimer)
+  const hasCatalogItems = details.items.some((i) => i.from_catalog);
+  const catalogDates = details.items
+    .filter((i) => i.from_catalog && i.catalog_snapshot?.price_as_of)
+    .map((i) => i.catalog_snapshot.price_as_of);
+  const oldestCatalogDate = catalogDates.length
+    ? catalogDates.sort()[0]
+    : null;
 
   const quoteData = {
     jobName: parsed.jobName,
@@ -63,7 +72,8 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
     companyName: userProfile?.business_name || userProfile?.company_name || null,
     companyAddress: userProfile?.company_address || null,
     companyPhone: userProfile?.phone || null,
-    logoUrl: userProfile?.logo_url || null
+    logoUrl: userProfile?.logo_url || null,
+    catalogDisclaimer: hasCatalogItems ? oldestCatalogDate : null,
   };
 
   // ✅ Canonical effective plan (normalized)
@@ -131,7 +141,7 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
     expiresInSec: 60 * 60 * 24 * 7
   });
 
-  // Optional: persist record (fail-open)
+  // Optional: persist record + catalog-sourced line items (fail-open)
   try {
     if (typeof pg.createQuoteRecord === 'function') {
       await pg.createQuoteRecord({
@@ -145,6 +155,20 @@ async function handleQuoteCommand({ ownerId, from, text, userProfile }) {
       });
     }
   } catch {}
+
+  // Persist catalog-sourced line items so they appear in the portal with snapshots
+  try {
+    const catalogItems = details.items.filter((i) => i.from_catalog && i.catalog_product_id);
+    if (catalogItems.length > 0 && typeof pg.saveQuoteLineItemsWithSnapshots === 'function') {
+      await pg.saveQuoteLineItemsWithSnapshots({
+        ownerId: owner_id,
+        jobName: parsed.jobName,
+        items: catalogItems,
+      });
+    }
+  } catch (e) {
+    console.warn('[quote] failed to persist catalog line items:', e?.message);
+  }
 
   return (
     `✅ Quote ready for ${parsed.jobName}\n` +

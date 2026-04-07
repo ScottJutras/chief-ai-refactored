@@ -4820,6 +4820,17 @@ async function listCatalogProducts(supplierId, { categoryId = null, search = nul
     orderBy = `ts_rank(to_tsvector('english', cp.name || ' ' || COALESCE(cp.description, '')), plainto_tsquery('english', $${idx})) DESC`;
   }
 
+  const whereClause = conditions.join(' AND ');
+
+  // Total count (same filters, no limit/offset)
+  const { rows: countRows } = await query(
+    `SELECT COUNT(*) AS total
+     FROM public.catalog_products cp
+     WHERE ${whereClause}`,
+    params
+  );
+  const total = parseInt(countRows[0]?.total ?? '0', 10);
+
   params.push(limit);
   params.push(offset);
 
@@ -4830,12 +4841,12 @@ async function listCatalogProducts(supplierId, { categoryId = null, search = nul
             sc.name AS category_name
      FROM public.catalog_products cp
      LEFT JOIN public.supplier_categories sc ON sc.id = cp.category_id
-     WHERE ${conditions.join(' AND ')}
+     WHERE ${whereClause}
      ORDER BY ${orderBy}
      LIMIT $${params.length - 1} OFFSET $${params.length}`,
     params
   );
-  return rows;
+  return { rows, total };
 }
 
 async function searchAllCatalog(searchQuery, { limit = 20 } = {}) {

@@ -98,14 +98,14 @@ router.get('/suppliers/:slug/products', requireCatalogAccess, async (req, res) =
       return res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Supplier not found.' } });
     }
 
-    const products = await pg.listCatalogProducts(supplier.id, {
+    const { rows: products, total } = await pg.listCatalogProducts(supplier.id, {
       categoryId: category_id || null,
       search: q || null,
       limit: Math.min(Number(limit) || 50, 200),
       offset: Number(offset) || 0,
     });
 
-    return res.json({ ok: true, supplier_slug: slug, products });
+    return res.json({ ok: true, supplier_slug: slug, products, total });
   } catch (err) {
     console.error('[catalog/products] error:', err.message);
     return res.status(500).json({ ok: false, error: { code: 'QUERY_FAILED', message: 'Could not fetch products.' } });

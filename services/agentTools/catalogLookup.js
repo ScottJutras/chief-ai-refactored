@@ -59,7 +59,7 @@ async function catalogLookup({ search_query, supplier_slug, limit }) {
         return { error: `Supplier "${slug}" not found. Available suppliers can be browsed in the Catalogs section.` };
       }
 
-      const rows = await pg.listCatalogProducts(supplier.id, {
+      const { rows } = await pg.listCatalogProducts(supplier.id, {
         search: search_query,
         limit: maxResults,
       });

@@ -108,7 +108,7 @@ router.post('/signup', express.json(), async (req, res) => {
     const { data: authData, error: authErr } = await sb.auth.admin.createUser({
       email: _email,
       password,
-      email_confirm: false,
+      email_confirm: true,  // skip email verification — pending_review status is our approval gate
       user_metadata: { user_type: 'supplier', full_name: _contactName },
     });
 

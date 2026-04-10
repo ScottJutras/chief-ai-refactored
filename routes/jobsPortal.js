@@ -347,7 +347,7 @@ router.get("/api/jobs/:jobId/photos", requirePortalUser(), async (req, res) => {
     const { tenantId, ownerId, jobId } = ctx;
 
     const result = await pg.query(
-      `SELECT id, description, public_url, storage_path, storage_bucket, source, created_at
+      `SELECT id, description, public_url, storage_path, storage_bucket, source, photo_phase, created_at
        FROM public.job_photos
        WHERE job_id   = $1
          AND tenant_id = $2
@@ -372,9 +372,11 @@ router.post("/api/jobs/:jobId/photos", requirePortalUser(), express.json(), asyn
     if (!ctx) return;
     const { tenantId, ownerId, jobId } = ctx;
 
-    const storagePath = String(req.body?.storagePath || "").trim();
-    const publicUrl   = String(req.body?.publicUrl   || "").trim();
-    const description = String(req.body?.description || "").trim() || null;
+    const storagePath  = String(req.body?.storagePath  || "").trim();
+    const publicUrl    = String(req.body?.publicUrl    || "").trim();
+    const description  = String(req.body?.description  || "").trim() || null;
+    const VALID_PHASES = ['before', 'during', 'after'];
+    const photoPhase   = VALID_PHASES.includes(req.body?.photoPhase) ? req.body.photoPhase : null;
 
     if (!storagePath || !publicUrl) {
       return res.status(400).json({ ok: false, code: "BAD_REQUEST", message: "storagePath and publicUrl required." });
@@ -382,10 +384,10 @@ router.post("/api/jobs/:jobId/photos", requirePortalUser(), express.json(), asyn
 
     const result = await pg.query(
       `INSERT INTO public.job_photos
-         (tenant_id, job_id, owner_id, storage_path, public_url, description, source)
-       VALUES ($1, $2, $3, $4, $5, $6, 'portal')
-       RETURNING id, description, public_url, storage_path, created_at`,
-      [tenantId, jobId, ownerId, storagePath, publicUrl, description]
+         (tenant_id, job_id, owner_id, storage_path, public_url, description, source, photo_phase)
+       VALUES ($1, $2, $3, $4, $5, $6, 'portal', $7)
+       RETURNING id, description, public_url, storage_path, photo_phase, created_at`,
+      [tenantId, jobId, ownerId, storagePath, publicUrl, description, photoPhase]
     );
 
     return res.status(200).json({ ok: true, photo: result.rows[0] });
@@ -541,6 +543,85 @@ router.get("/api/gallery/:token", async (req, res) => {
   } catch (e) {
     console.error("[GALLERY_PUBLIC]", e?.message);
     return res.status(500).json({ ok: false, message: "Could not load gallery." });
+  }
+});
+
+// ─── Customer Notes (communication log) ──────────────────────────────────
+// GET  /api/customers/:customerId/notes  → list notes (newest first)
+// POST /api/customers/:customerId/notes  → add note
+
+router.get('/api/customers/:customerId/notes', requirePortalUser(), async (req, res) => {
+  try {
+    const tenantId    = String(req.tenantId || '').trim();
+    const customerId  = String(req.params.customerId || '').trim();
+    if (!tenantId || !customerId) return res.status(400).json({ ok: false, message: 'Missing context.' });
+
+    // Verify customer belongs to this tenant
+    const custCheck = await pg.query(
+      `SELECT id FROM public.customers WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
+      [customerId, tenantId]
+    );
+    if (!custCheck?.rows?.length) return res.status(404).json({ ok: false, message: 'Customer not found.' });
+
+    const r = await pg.query(
+      `SELECT id, note, created_by, created_at
+       FROM public.customer_notes
+       WHERE customer_id = $1 AND tenant_id = $2
+       ORDER BY created_at DESC`,
+      [customerId, tenantId]
+    );
+    return res.status(200).json({ ok: true, notes: r.rows });
+  } catch (e) {
+    console.error('[CUSTOMER_NOTES_GET]', e?.message);
+    return res.status(500).json({ ok: false, message: 'Could not load notes.' });
+  }
+});
+
+router.post('/api/customers/:customerId/notes', requirePortalUser(), express.json(), async (req, res) => {
+  try {
+    const tenantId    = String(req.tenantId || '').trim();
+    const customerId  = String(req.params.customerId || '').trim();
+    const note        = String(req.body?.note || '').trim();
+    const createdBy   = String(req.body?.created_by || 'Owner').trim();
+
+    if (!tenantId || !customerId) return res.status(400).json({ ok: false, message: 'Missing context.' });
+    if (!note) return res.status(400).json({ ok: false, code: 'BAD_REQUEST', message: 'Note text is required.' });
+
+    // Verify customer belongs to this tenant
+    const custCheck = await pg.query(
+      `SELECT id FROM public.customers WHERE id = $1 AND tenant_id = $2 LIMIT 1`,
+      [customerId, tenantId]
+    );
+    if (!custCheck?.rows?.length) return res.status(404).json({ ok: false, message: 'Customer not found.' });
+
+    const r = await pg.query(
+      `INSERT INTO public.customer_notes (tenant_id, customer_id, note, created_by)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, note, created_by, created_at`,
+      [tenantId, customerId, note, createdBy]
+    );
+    return res.status(200).json({ ok: true, note: r.rows[0] });
+  } catch (e) {
+    console.error('[CUSTOMER_NOTES_POST]', e?.message);
+    return res.status(500).json({ ok: false, message: 'Could not save note.' });
+  }
+});
+
+router.delete('/api/customers/:customerId/notes/:noteId', requirePortalUser(), async (req, res) => {
+  try {
+    const tenantId    = String(req.tenantId || '').trim();
+    const customerId  = String(req.params.customerId || '').trim();
+    const noteId      = String(req.params.noteId || '').trim();
+    if (!tenantId || !customerId || !noteId) return res.status(400).json({ ok: false, message: 'Missing context.' });
+
+    await pg.query(
+      `DELETE FROM public.customer_notes WHERE id = $1 AND tenant_id = $2 AND customer_id = $3`,
+      [noteId, tenantId, customerId]
+    );
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error('[CUSTOMER_NOTES_DELETE]', e?.message);
+    return res.status(500).json({ ok: false, message: 'Could not delete note.' });
   }
 });
 

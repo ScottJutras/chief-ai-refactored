@@ -83,7 +83,7 @@
     { "path": "/api/cron/refresh_docs", "schedule": "0 3 * * 1" },
     { "path": "/api/cron/cleanup-pending",    "schedule": "5 3 * * 1" },
     { "path": "/api/cron/overhead-reminders", "schedule": "0 8 * * *" },
-    { "path": "/api/cron/weekly-digest",      "schedule": "0 16 * * 5" },
+    { "path": "/api/cron/weekly-digest",      "schedule": "0 * * * *" },
     { "path": "/api/cron/margin-monitor",     "schedule": "0 */6 * * *" },
     { "path": "/api/cron/daily-job-summary",  "schedule": "0 22 * * *" },
     { "path": "/api/cron/anomaly-detector",   "schedule": "0 */4 * * *" },

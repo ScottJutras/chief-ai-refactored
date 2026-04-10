@@ -377,6 +377,18 @@ function pickFirstMedia(body = {}) {
   return { n, url, type: typ ? String(typ).toLowerCase() : null };
 }
 
+function pickAllMedia(body = {}) {
+  const n = parseInt(body.NumMedia || '0', 10) || 0;
+  if (n <= 0) return [];
+  const items = [];
+  for (let i = 0; i < n; i++) {
+    const url = body[`MediaUrl${i}`] || null;
+    const typ = body[`MediaContentType${i}`] || null;
+    if (url) items.push({ url, type: typ ? String(typ).toLowerCase() : null, index: i });
+  }
+  return items;
+}
+
 
 function canUseAgent(ownerProfile) {
   const planKey = getEffectivePlanKey(ownerProfile);
@@ -1559,20 +1571,69 @@ router.post('*', async (req, res, next) => {
   const { n, url, type } = pickFirstMedia(req.body || {});
   if (n <= 0) return next();
 
-  let handleMedia;
+  let handleMedia, handleBulkMedia;
   try {
-    ({ handleMedia } = require('../handlers/media'));
+    ({ handleMedia, handleBulkMedia } = require('../handlers/media'));
   } catch (loadErr) {
     console.error('[MEDIA] module load error:', loadErr?.message, loadErr?.stack);
     if (!res.headersSent) return ok(res, null);
     return;
   }
 
+  const bodyText   = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
+  const sourceMsgId = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
+
+  // ── Bulk: multiple images in one message ────────────────────────────────
+  if (n > 1) {
+    try {
+      const allMedia = pickAllMedia(req.body || {});
+      const bulkResult = await handleBulkMedia(
+        req.from, bodyText, req.userProfile || {}, req.ownerId, allMedia, sourceMsgId
+      );
+      if (bulkResult?.twiml && !res.headersSent) {
+        return res.status(200).type('text/xml').send(String(bulkResult.twiml));
+      }
+    } catch (bulkErr) {
+      console.error('[MEDIA_BULK] handleBulkMedia failed:', bulkErr?.message);
+      // fall through to single-image handling as a safety net
+    }
+  }
+
+  // ── Check if a sequential batch session is active ───────────────────────
+  try {
+    const { isBatchActive, addReceiptToBatch } = require('../handlers/commands/batchReceipts');
+    if (await isBatchActive(req.ownerId)) {
+      // Process this image silently, add to batch
+      const singleResult = await handleMedia(
+        req.from, bodyText, req.userProfile || {}, req.ownerId, url, type, sourceMsgId
+      );
+      // Extract parsed data from the transcript
+      const transcript = singleResult?.transcript || '';
+      const { parseMediaText: pmt } = require('../services/mediaParser');
+      const parsed = await pmt(transcript.replace(/^(expense|revenue)\s+/i, '')).catch(() => null);
+      const { count } = await addReceiptToBatch(req.ownerId, {
+        amount:          parsed?.data?.amount  || null,
+        vendor:          parsed?.data?.store   || parsed?.data?.vendor || null,
+        date:            parsed?.data?.date    || null,
+        rawText:         transcript || null,
+        stableMediaMsgId: sourceMsgId ? `${String(req.ownerId).replace(/\D/g, '')}:${sourceMsgId}` : null,
+      });
+      if (!res.headersSent) {
+        const ackMsg = `✅ Receipt ${count} added to your batch.\n\nSend more photos, or reply *done* to review and log them.`;
+        return res.status(200).type('text/xml').send(
+          `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${
+            String(ackMsg).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          }</Message></Response>`
+        );
+      }
+      return;
+    }
+  } catch (batchErr) {
+    console.warn('[MEDIA_BATCH] batch check failed (ignored):', batchErr?.message);
+  }
+
   try {
     // Use canonical inbound text resolver (interactive-aware)
-    const bodyText = String(resolveInboundTextFromTwilio(req.body || {}) || '').trim();
-    const sourceMsgId = String(req.body?.MessageSid || req.body?.SmsMessageSid || '').trim() || null;
-
     const result = await handleMedia(
       req.from,
       bodyText,
@@ -2674,6 +2735,23 @@ try {
             req.body
           );
 
+          // Fire post-action nudge after response (non-blocking, best-effort)
+          if (result && (typeof result === 'string' ? result.includes('Logged expense') : result?.twiml?.includes('Logged expense'))) {
+            try {
+              const { sendPostActionNudge } = require('../handlers/postActionNudge');
+              const pending = await getPendingTransactionState(req.from).catch(() => null);
+              const jobId = pending?.jobId || pending?.job_id || null;
+              const jobName = pending?.jobName || pending?.job_name || null;
+              setImmediate(() => sendPostActionNudge({
+                ownerId: req.ownerId,
+                fromPhone: String(req.from || '').replace(/^\+/, ''),
+                kind: 'expense_saved',
+                jobId,
+                jobName,
+              }).catch(() => {}));
+            } catch {}
+          }
+
           if (!res.headersSent) {
             const tw = typeof result === 'string' ? result : (result?.twiml || null);
             return sendTwiml(res, tw);
@@ -2700,6 +2778,23 @@ try {
             messageSid,
             req.body
           );
+
+          // Fire post-action nudge after response (non-blocking, best-effort)
+          if (result) {
+            try {
+              const { sendPostActionNudge } = require('../handlers/postActionNudge');
+              const pending = await getPendingTransactionState(req.from).catch(() => null);
+              const jobId = pending?.jobId || pending?.job_id || null;
+              const jobName = pending?.jobName || pending?.job_name || null;
+              setImmediate(() => sendPostActionNudge({
+                ownerId: req.ownerId,
+                fromPhone: String(req.from || '').replace(/^\+/, ''),
+                kind: 'revenue_saved',
+                jobId,
+                jobName,
+              }).catch(() => {}));
+            } catch {}
+          }
 
           if (!res.headersSent) {
             const tw = typeof result === 'string' ? result : (result?.twiml || null);
@@ -4251,8 +4346,9 @@ try {
 
  try {
   const { answerChief } = require('../services/answerChief');
+  const { looksLikeReasoningQuery } = require('../services/agent');
 
-  const out = await answerChief({
+  const chiefArgs = {
     ownerId: req.ownerId,
     actorKey: req.actorKey || req.from,
     text: text2,
@@ -4269,7 +4365,33 @@ try {
       reqBody: req.body,
       topicHints
     }
-  });
+  };
+
+  // ── Fast-ack: reasoning queries take 5-15s; acknowledge immediately so
+  // the user sees feedback, then push the real answer via the Twilio API.
+  // Action/log commands are fast (deterministic), so skip the ack for those.
+  if (looksLikeReasoningQuery(text2) && !res.headersSent) {
+    ok(res, '⏳ Looking that up…');
+
+    // Run agent async — res is already closed so we push via sendWhatsApp
+    answerChief(chiefArgs).then(async (out) => {
+      if (out?.route === 'action' && typeof out.run === 'function') {
+        const ran = await out.run();
+        const ans = String(ran?.answer || '').trim() || 'Done.';
+        await sendWhatsApp(req.from, ans);
+        return;
+      }
+      const ans = String(out?.answer || '').trim();
+      if (ans) await sendWhatsApp(req.from, ans);
+    }).catch(e => {
+      console.warn('[CHIEF] async fast-ack push failed:', e?.message);
+    });
+
+    return; // Twilio already got its TwiML response
+  }
+
+  // Synchronous path for action/log commands
+  const out = await answerChief(chiefArgs);
 
   if (out?.route === 'action' && typeof out.run === 'function') {
     const ran = await out.run();

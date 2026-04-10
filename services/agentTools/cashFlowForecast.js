@@ -105,8 +105,8 @@ async function estimateOutflows(ownerId, horizonDays) {
       ) AS weekly_labour_cost
     FROM public.time_entries_v2 te
     LEFT JOIN public.chiefos_crew_rates cr
-      ON cr.owner_id::text = te.owner_id::text
-      AND LOWER(cr.name) = LOWER(te.employee_name)
+      ON cr.owner_id = te.owner_id::text
+      AND LOWER(cr.employee_name) = LOWER(te.employee_name)
     WHERE te.owner_id::text = $1
       AND te.clock_in >= NOW() - INTERVAL '4 weeks'
   `, [String(ownerId)]).catch(() => null);

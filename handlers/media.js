@@ -745,17 +745,29 @@ async function uploadPhotoToStorage({ ownerId, tenantId, stableMediaMsgId, media
   }
 }
 
+function extractPhotoPhase(caption) {
+  if (!caption) return null;
+  const s = String(caption).toLowerCase();
+  if (/\bbefore\b/.test(s)) return 'before';
+  if (/\bafter\b/.test(s))  return 'after';
+  if (/\bduring\b|\bprogress\b|\bwip\b/.test(s)) return 'during';
+  return null;
+}
+
 async function insertJobPhoto({ tenantId, jobId, ownerId, storagePath, publicUrl, caption, stableMediaMsgId, source = 'whatsapp' }) {
   if (!dbQuery) return null;
   try {
+    const phase = extractPhotoPhase(caption);
     const r = await dbQuery(
       `INSERT INTO public.job_photos
-         (tenant_id, job_id, owner_id, storage_path, public_url, description, source, source_msg_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         (tenant_id, job_id, owner_id, storage_path, public_url, description, source, source_msg_id, photo_phase)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (owner_id, source_msg_id) WHERE source_msg_id IS NOT NULL
-       DO UPDATE SET public_url = excluded.public_url, description = COALESCE(excluded.description, public.job_photos.description)
+       DO UPDATE SET public_url = excluded.public_url,
+                     description = COALESCE(excluded.description, public.job_photos.description),
+                     photo_phase = COALESCE(excluded.photo_phase, public.job_photos.photo_phase)
        RETURNING id`,
-      [tenantId, jobId, ownerId, storagePath, publicUrl, caption || null, source, stableMediaMsgId || null]
+      [tenantId, jobId, ownerId, storagePath, publicUrl, caption || null, source, stableMediaMsgId || null, phase]
     );
     return r?.rows?.[0]?.id || null;
   } catch (e) {
@@ -1530,4 +1542,130 @@ if (result?.type === 'expense' || result?.type === 'revenue') {
   }
 }
 
-module.exports = { handleMedia };
+// ─── Bulk receipt handler (NumMedia > 1) ─────────────────────────────────────
+//
+// Called when a single WhatsApp message contains multiple images.
+// Runs OCR in parallel (up to MAX_BULK_PARALLEL images), builds a combined
+// summary, and stores the batch in pending state for job assignment.
+//
+// Returns { twiml } (always responds immediately; does not use transcript path).
+
+const MAX_BULK_PARALLEL = 4; // OCR this many images in parallel before timing out
+
+async function ocrOneImage({ mediaUrl, stableId }) {
+  try {
+    const buf = await withTimeout(fetchTwilioMediaBytes(mediaUrl, stableId), 6000, 'bulk_ocr_fetch');
+    if (!buf) return { ok: false, stableId };
+    const raw = await withTimeout(
+      extractTextFromImage(buf, 'image/jpeg'),
+      5000,
+      'bulk_ocr_extract'
+    );
+    const text = normalizeHumanText(String(raw || '').trim());
+    if (!text) return { ok: false, stableId };
+
+    // Quick parse for amount + vendor
+    const { parseMediaText: pmt } = require('../services/mediaParser');
+    const parsed = await pmt(text).catch(() => null);
+    const amount = parsed?.data?.amount || null;
+    const vendor = parsed?.data?.store  || parsed?.data?.vendor || null;
+    const date   = parsed?.data?.date   || null;
+
+    return { ok: true, stableId, text, amount, vendor, date };
+  } catch (e) {
+    console.warn('[BULK_OCR] image failed (ignored):', e?.message, { stableId });
+    return { ok: false, stableId };
+  }
+}
+
+async function handleBulkMedia(from, bodyText, userProfile, ownerId, mediaItems, sourceMsgId) {
+  // mediaItems: Array<{ url: string, type: string, index: number }>
+  const userKey = canonicalUserKey(from);
+  const tenantId = await resolveTenantIdForMedia({ ownerId, from, userProfile }).catch(() => null);
+
+  // Filter to images only (cap at MAX_BULK_PARALLEL for Twilio 8s window)
+  const images = mediaItems
+    .filter(m => {
+      const base = normalizeContentType(m.type);
+      return base.startsWith('image/') || !base;
+    })
+    .slice(0, MAX_BULK_PARALLEL);
+
+  if (!images.length) {
+    return { twiml: twiml('I received multiple files but none appeared to be images. Please send photos one at a time.') };
+  }
+
+  // Build stable IDs
+  const toProcess = images.map((item, i) => ({
+    mediaUrl: item.url,
+    stableId: `${userKey}:bulk:${sourceMsgId || Date.now()}:${item.index ?? i}`,
+  }));
+
+  // OCR all images in parallel
+  const results = await Promise.all(toProcess.map(ocrOneImage));
+  const succeeded = results.filter(r => r.ok);
+  const failed    = results.filter(r => !r.ok);
+
+  if (!succeeded.length) {
+    return {
+      twiml: twiml(
+        `I received ${images.length} image${images.length !== 1 ? 's' : ''} but couldn't read any of them.\n\n` +
+        `Try sending them one at a time, or type the expenses manually.\n` +
+        `Example: expense $45 Home Depot`
+      )
+    };
+  }
+
+  // Store batch in pending state
+  const batchItems = succeeded.map(r => ({
+    stable_media_msg_id: r.stableId,
+    url:    toProcess.find(t => t.stableId === r.stableId)?.mediaUrl || null,
+    amount: r.amount,
+    vendor: r.vendor,
+    date:   r.date,
+    text:   r.text ? String(r.text).slice(0, 400) : null,
+  }));
+
+  try {
+    const existing = await getPendingTransactionState(userKey);
+    await mergePendingTransactionState(userKey, {
+      ...(existing || {}),
+      bulkReceiptBatch: batchItems,
+      bulkReceiptBatchMsgId: sourceMsgId || null,
+      bulkReceiptBatchTenantId: tenantId || null,
+    });
+  } catch (e) {
+    console.warn('[BULK] failed to save batch state:', e?.message);
+  }
+
+  // Build reply
+  const lines = succeeded.map((r, i) => {
+    const parts = [];
+    if (r.amount) parts.push(r.amount);
+    if (r.vendor) parts.push(`at ${r.vendor}`);
+    if (r.date)   parts.push(`(${r.date})`);
+    return `${i + 1}. ${parts.join(' ') || 'Receipt (no amount found)'}`;
+  });
+
+  const skippedNote = failed.length > 0
+    ? `\n\n⚠️ ${failed.length} image${failed.length !== 1 ? 's' : ''} couldn't be read and won't be included.`
+    : '';
+
+  const extraNote = mediaItems.length > MAX_BULK_PARALLEL
+    ? `\n\n📌 Only the first ${MAX_BULK_PARALLEL} images were processed. Please resend the remaining ${mediaItems.length - MAX_BULK_PARALLEL}.`
+    : '';
+
+  return {
+    twiml: twiml([
+      `📎 Got ${succeeded.length} receipt${succeeded.length !== 1 ? 's' : ''}:`,
+      ``,
+      ...lines,
+      `${skippedNote}${extraNote}`,
+      ``,
+      `Which job are these for?`,
+      `Reply with the job name (e.g. "Oak Street"), or "overhead".`,
+    ].filter(l => l !== undefined).join('\n'))
+  };
+}
+
+module.exports = { handleMedia, handleBulkMedia };

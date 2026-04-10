@@ -152,10 +152,16 @@ function getTools() {
     toolsSpec.push(t);
   }
 
-  // BI Agent Tools (Phase 1–3) + Catalog
+  // BI Agent Tools (Phase 1–3) + Catalog + Phase 2 additions
   const biTools = [
     'jobPnl', 'labourUtil', 'comparePeriods', 'getTopN', 'budgetVsActual', 'cashFlowForecast',
     'catalogLookup',
+    // Phase 2 tools
+    'customerHistory', 'photoQuery', 'overtimeReport', 'payrollSummary', 'supplierSpend',
+    // Phase 3 tools
+    'compareQuoteVsActual',
+    // Phase 3.2 — pattern & benchmark tools
+    'jobPatternTrends', 'ownerBenchmarks',
   ];
   for (const toolFile of biTools) {
     try {
@@ -261,6 +267,21 @@ function normBare(s = "") {
 
 function safeJson(obj) {
   return obj && typeof obj === "object" ? obj : {};
+}
+
+// ----- WhatsApp conversation history settings ----------------------
+const MAX_WA_HISTORY_PAIRS = 3;          // keep last 3 Q&A pairs in memory
+const MAX_WA_HISTORY_MSG_CHARS = 400;    // per-message truncation before storage
+
+function trimMsg(s = '') {
+  const str = String(s || '').trim();
+  return str.length > MAX_WA_HISTORY_MSG_CHARS ? str.slice(0, MAX_WA_HISTORY_MSG_CHARS) + '…' : str;
+}
+
+// Extract the rolling history slice from actorMemory (last N pairs = N*2 messages)
+function buildHistorySlice(memory = {}) {
+  const hist = Array.isArray(memory.conversation_history) ? memory.conversation_history : [];
+  return hist.slice(-(MAX_WA_HISTORY_PAIRS * 2));
 }
 
 async function loadActorMemorySafe(ownerId, actorKey) {
@@ -422,6 +443,11 @@ function questionMenu() {
   ].join("\n");
 }
 
+// ----- LLM failure sentinel --------------------------------
+const LLM_OFFLINE_SENTINEL = '(llm offline)';
+const LLM_OFFLINE_MESSAGE  =
+  "I'm not able to reach my reasoning engine right now. Your data is safe — please try again in a moment.";
+
 // ----- Tool-calling loop -----------------------------------
 const MAX_TOOL_ITERATIONS = 5;
 
@@ -435,12 +461,22 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from, max_tokens }) {
 
     if (!msg.tool_calls || msg.tool_calls.length === 0) {
       const content = String(msg.content || '').trim();
+
+      // Hard sentinel: LLM provider soft-failed (both providers down or key missing).
+      if (content === LLM_OFFLINE_SENTINEL || content.includes(LLM_OFFLINE_SENTINEL)) {
+        console.warn('[AGENT] LLM offline sentinel received — returning user-facing fallback');
+        return LLM_OFFLINE_MESSAGE;
+      }
+
       if (content) return content;
       // LLM returned no content and no tool calls — give a useful fallback
       return "I don't have enough data logged yet to answer that. Once you start logging expenses, revenue, and time through WhatsApp, I can give you real insights on this.";
     }
 
     messages.push(msg);
+
+    // Track whether every tool call in this round returned an error
+    let roundErrorCount = 0;
 
     for (const tc of msg.tool_calls) {
       const name = tc.function?.name;
@@ -454,11 +490,21 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from, max_tokens }) {
       } catch (e) {
         result = { error: e?.message };
       }
+      if (result?.error) roundErrorCount++;
       messages.push({
         role: 'tool',
         tool_call_id: tc.id,
         content: JSON.stringify(result),
       });
+    }
+
+    // If every tool in the first round errored, the LLM has nothing real to work with.
+    // Synthesize a specific "nothing logged" message rather than letting the LLM hallucinate.
+    if (i === 0 && roundErrorCount === msg.tool_calls.length && msg.tool_calls.length > 0) {
+      const toolNames = msg.tool_calls.map(tc => tc.function?.name).filter(Boolean).join(', ');
+      console.warn('[AGENT] All tools errored on first round:', toolNames);
+      // Let the LLM see the errors and synthesize — it might still produce a helpful "what's missing" message.
+      // But cap iterations to 1 more round so we don't spin.
     }
   }
 
@@ -472,9 +518,166 @@ async function runToolsLoop({ llm, seedMessages, ownerId, from, max_tokens }) {
       max_tokens: chatOpts.max_tokens || 800
     });
     const summaryContent = String(summaryMsg?.content || '').trim();
+    if (summaryContent === LLM_OFFLINE_SENTINEL || summaryContent.includes(LLM_OFFLINE_SENTINEL)) {
+      return LLM_OFFLINE_MESSAGE;
+    }
     if (summaryContent) return summaryContent;
   } catch {}
   return "I gathered some data but ran out of steps to complete a full analysis. Try asking with a specific date range (MTD, WTD, today) or a specific job name — that helps me answer in fewer steps.";
+}
+
+// ----- Date range parsing (for WhatsApp temporal expressions) ------
+// Returns { date_from, date_to } strings (YYYY-MM-DD) or null.
+function parseDateRange(text, tz = 'America/Toronto') {
+  const t = String(text || '').toLowerCase().trim();
+  const today = getTodayIso(tz);
+
+  // Helper: offset date
+  function shift(date, days) {
+    const d = new Date(date);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().slice(0, 10);
+  }
+
+  // Start of week (Monday)
+  function weekStart(date) {
+    const d = new Date(`${date}T12:00:00Z`);
+    const dow = d.getUTCDay(); // 0=Sun
+    const diff = dow === 0 ? -6 : 1 - dow;
+    d.setUTCDate(d.getUTCDate() + diff);
+    return d.toISOString().slice(0, 10);
+  }
+
+  // Start of month
+  function monthStart(date) { return date.slice(0, 7) + '-01'; }
+
+  // End of month
+  function monthEnd(date) {
+    const [y, m] = date.split('-').map(Number);
+    const d = new Date(Date.UTC(y, m, 0)); // day 0 of next month = last day of this
+    return d.toISOString().slice(0, 10);
+  }
+
+  // Start of quarter
+  function quarterStart(date) {
+    const [y, m] = date.split('-').map(Number);
+    const q = Math.ceil(m / 3);
+    return `${y}-${String((q - 1) * 3 + 1).padStart(2, '0')}-01`;
+  }
+
+  function quarterEnd(date) {
+    const [y, m] = date.split('-').map(Number);
+    const q = Math.ceil(m / 3);
+    const endMonth = q * 3;
+    const d = new Date(Date.UTC(y, endMonth, 0));
+    return d.toISOString().slice(0, 10);
+  }
+
+  // "this week" / "wtd"
+  if (/\b(this week|week to date|wtd)\b/.test(t)) {
+    return { date_from: weekStart(today), date_to: today };
+  }
+  // "last week"
+  if (/\blast week\b/.test(t)) {
+    const lastMon = shift(weekStart(today), -7);
+    const lastSun = shift(lastMon, 6);
+    return { date_from: lastMon, date_to: lastSun };
+  }
+  // "this month" / "mtd"
+  if (/\b(this month|month to date|mtd)\b/.test(t)) {
+    return { date_from: monthStart(today), date_to: today };
+  }
+  // "last month"
+  if (/\blast month\b/.test(t)) {
+    const lastMonthEnd = shift(monthStart(today), -1);
+    const lastMonthStart = monthStart(lastMonthEnd);
+    return { date_from: lastMonthStart, date_to: lastMonthEnd };
+  }
+  // "year to date" / "ytd" / "this year"
+  if (/\b(year to date|ytd|this year)\b/.test(t)) {
+    return { date_from: `${today.slice(0, 4)}-01-01`, date_to: today };
+  }
+  // "last year"
+  if (/\blast year\b/.test(t)) {
+    const y = Number(today.slice(0, 4)) - 1;
+    return { date_from: `${y}-01-01`, date_to: `${y}-12-31` };
+  }
+  // "Q1" / "Q2" / "Q3" / "Q4" (current year implied)
+  const qMatch = t.match(/\bq([1-4])\b/);
+  if (qMatch) {
+    const q = Number(qMatch[1]);
+    const y = today.slice(0, 4);
+    const startMonth = String((q - 1) * 3 + 1).padStart(2, '0');
+    const endMonth = q * 3;
+    const d = new Date(Date.UTC(Number(y), endMonth, 0));
+    return { date_from: `${y}-${startMonth}-01`, date_to: d.toISOString().slice(0, 10) };
+  }
+  // "this quarter"
+  if (/\b(this quarter|quarter to date|qtd)\b/.test(t)) {
+    return { date_from: quarterStart(today), date_to: today };
+  }
+  // "last quarter"
+  if (/\blast quarter\b/.test(t)) {
+    const qStartOfCurrent = new Date(`${quarterStart(today)}T12:00:00Z`);
+    const prevQEnd = shift(quarterStart(today), -1);
+    const prevQStart = quarterStart(prevQEnd);
+    return { date_from: prevQStart, date_to: prevQEnd };
+  }
+  // "today"
+  if (/\btoday\b/.test(t)) {
+    return { date_from: today, date_to: today };
+  }
+  // "yesterday"
+  if (/\byesterday\b/.test(t)) {
+    const yd = shift(today, -1);
+    return { date_from: yd, date_to: yd };
+  }
+
+  return null;
+}
+
+// ----- Entity reference detectors (WhatsApp multi-turn) ------------
+// True if the message references a job implicitly (no job# stated).
+function hasEntityRef(text = '') {
+  return /\b(that job|same job|this job|the job|last job|the last one|that one|it|the same one|the project)\b/i.test(text);
+}
+
+// True if the message references a prior date range implicitly.
+function hasPeriodRef(text = '') {
+  return /\b(same period|same range|same time|that month|that week|that quarter|that range|same month|same week|same quarter|that date|same dates?|same timeframe)\b/i.test(text);
+}
+
+// Extract job number from user text (if any).
+function extractJobNo(text = '') {
+  const m = String(text).match(/\bjob\s*#?\s*(\d+)\b/i);
+  return m ? Number(m[1]) : null;
+}
+
+// Build a context line for WhatsApp system prompt based on actorMemory.
+function buildWhatsappContextBlock(memory = {}, tz = 'America/Toronto') {
+  const lines = [];
+
+  // Today's date (always inject)
+  const today = getTodayIso(tz);
+  lines.push(`Today is ${today} (timezone: ${tz}).`);
+
+  // Last discussed job
+  if (memory.last_job_no || memory.last_job_name) {
+    const jobRef = [
+      memory.last_job_no ? `Job #${memory.last_job_no}` : null,
+      memory.last_job_name ? `"${memory.last_job_name}"` : null,
+    ].filter(Boolean).join(' — ');
+    lines.push(`Last job discussed in this session: ${jobRef}.`);
+    lines.push(`When the user says "that job", "same job", "the last one", or similar — they mean ${jobRef}.`);
+  }
+
+  // Date range context
+  if (memory.last_date_from || memory.last_date_to) {
+    const dr = [memory.last_date_from, memory.last_date_to].filter(Boolean).join(' to ');
+    lines.push(`Last date range queried: ${dr}.`);
+  }
+
+  return lines.join('\n');
 }
 
 // ----- Public ask API --------------------------------------
@@ -906,6 +1109,55 @@ Rules for every response:
     model: process.env.LLM_MODEL || 'gpt-4o-mini',
   });
 
+  // ── WhatsApp: inject date + session context ──────────────────────────
+  // Resolve the effective query text (substitute entity references if we
+  // have a last_job in memory, so the LLM doesn't need to ask again).
+  let effectiveText = raw;
+
+  if (channel !== 'portal') {
+    // If the user said "that job" / "same job" / etc. and we have context, enrich the query
+    if (hasEntityRef(raw) && (memory.last_job_no || memory.last_job_name)) {
+      const jobRef = [
+        memory.last_job_no ? `job #${memory.last_job_no}` : null,
+        memory.last_job_name ? `"${memory.last_job_name}"` : null,
+      ].filter(Boolean).join(' ');
+      effectiveText = `${effectiveText} [referring to ${jobRef} from earlier in this conversation]`;
+      console.log('[AGENT] entity-ref substitution applied:', jobRef);
+    }
+
+    // If the user referenced "same period" / "that month" etc., inject the last date range
+    if (hasPeriodRef(raw) && (memory.last_date_from || memory.last_date_to)) {
+      const dr = [memory.last_date_from, memory.last_date_to].filter(Boolean).join(' to ');
+      effectiveText = `${effectiveText} [date range from earlier: ${dr}]`;
+      console.log('[AGENT] period-ref substitution applied:', dr);
+    }
+
+    // If the user mentioned a new job number, store it for future turns
+    const mentionedJobNo = extractJobNo(raw);
+    if (mentionedJobNo && mentionedJobNo !== memory.last_job_no) {
+      // Store optimistically; also attempt to resolve the job name from DB
+      patchActorMemorySafe(ownerDigits, actorKey, { last_job_no: mentionedJobNo, last_job_name: null })
+        .catch(() => {});
+      pg.query(
+        `SELECT name FROM public.jobs WHERE job_int_id = $1 AND owner_id::text = $2 LIMIT 1`,
+        [String(mentionedJobNo), ownerDigits]
+      ).then(r => {
+        if (r?.rows?.[0]?.name) {
+          patchActorMemorySafe(ownerDigits, actorKey, { last_job_name: r.rows[0].name }).catch(() => {});
+        }
+      }).catch(() => {});
+    }
+
+    // Store date range if detected
+    const dr = parseDateRange(raw, tz);
+    if (dr) {
+      patchActorMemorySafe(ownerDigits, actorKey, {
+        last_date_from: dr.date_from,
+        last_date_to: dr.date_to,
+      }).catch(() => {});
+    }
+  }
+
   const channelContext = channel === 'portal'
     ? `
 
@@ -915,7 +1167,14 @@ CHANNEL: Web portal dashboard. Rules for this context:
 - If tool results are empty (no transactions, no jobs, no tasks): respond with something like "You don't have any [expenses/revenue/activity] logged yet. Once you start logging through WhatsApp, I can answer questions like this with real numbers." Be specific about what's missing.
 - Never return an error or dead-end. Always end with a concrete next step or example question the user can ask once they have data.
 - If you cannot answer due to missing data, still be helpful: explain what data would unlock the answer.`
-    : '';
+    : `
+
+CHANNEL: WhatsApp. Keep answers concise — 3-5 sentences max unless the user asks for more detail.
+
+${buildWhatsappContextBlock(memory, tz)}`;
+
+  // For WhatsApp: include rolling conversation history (last N Q&A pairs)
+  const waHistory = channel !== 'portal' ? buildHistorySlice(memory) : [];
 
   const seed = [
     {
@@ -926,17 +1185,131 @@ Execution rules:
 - If details are sufficient: use tools, then reply with a clear prose answer (+ numbers/dates from the data).
 - If tool results come back empty, explain what's missing and what the user should do next.
 - If details are missing: ask exactly ONE clarifying question (do not execute yet).
-- Never dead-end; always offer the next best action.`
+- Never dead-end; always offer the next best action.
+- After answering a job-specific question, always call get_owner_benchmarks to compare the result to the owner's own historical average. This makes every job answer feel like a CFO insight, not just a data lookup.`
     },
-    { role: 'user', content: raw }
+    ...waHistory,                               // prior WhatsApp turns (WhatsApp only)
+    { role: 'user', content: effectiveText }
   ];
 
   try {
-    return await runToolsLoop({ llm, seedMessages: seed, ownerId: ownerDigits, from });
+    let answer = await runToolsLoop({ llm, seedMessages: seed, ownerId: ownerDigits, from });
+
+    // Catch sentinel that escaped runToolsLoop (belt-and-suspenders)
+    if (typeof answer === 'string' && answer.includes(LLM_OFFLINE_SENTINEL)) {
+      answer = LLM_OFFLINE_MESSAGE;
+    }
+
+    if (channel !== 'portal') {
+      // Guard: persist last_job_no if it appeared only via entity-ref substitution
+      const jobNoInQuery = extractJobNo(effectiveText);
+      if (jobNoInQuery && jobNoInQuery !== memory.last_job_no) {
+        patchActorMemorySafe(ownerDigits, actorKey, { last_job_no: jobNoInQuery }).catch(() => {});
+        // Also look up job name if not yet stored
+        if (!memory.last_job_name) {
+          pg.query(
+            `SELECT name FROM public.jobs WHERE job_int_id = $1 AND owner_id::text = $2 LIMIT 1`,
+            [String(jobNoInQuery), ownerDigits]
+          ).then(r => {
+            if (r?.rows?.[0]?.name) {
+              patchActorMemorySafe(ownerDigits, actorKey, { last_job_name: r.rows[0].name }).catch(() => {});
+            }
+          }).catch(() => {});
+        }
+      }
+
+      // Save this Q&A pair to rolling conversation history (fire-and-forget)
+      const newHistory = [
+        ...waHistory,
+        { role: 'user',      content: trimMsg(effectiveText) },
+        { role: 'assistant', content: trimMsg(typeof answer === 'string' ? answer : '') },
+      ].slice(-(MAX_WA_HISTORY_PAIRS * 2));
+      patchActorMemorySafe(ownerDigits, actorKey, { conversation_history: newHistory }).catch(() => {});
+    }
+
+    return answer;
   } catch (e) {
     console.warn('[AGENT] tools loop failed:', e?.message);
     return genericMenu(channel);
   }
+}
+
+// ----- Tool phase for streaming (used by askChiefStream route) -----
+// Runs tool-calling rounds synchronously using chat() (same logic as runToolsLoop)
+// but instead of returning a string, returns the accumulated messages so the
+// caller can do a final streaming synthesis pass with chatStream().
+//
+// onRound({ tools, iteration }) is called after each tool round completes.
+// Returns { messages, earlyAnswer } where earlyAnswer is set if the LLM returned
+// text without any tool calls (i.e., no tools were needed).
+const MAX_TOOL_PHASE_ITERATIONS = 4;
+
+async function runToolPhaseSync({ llm, seedMessages, ownerId, onRound }) {
+  const { toolsSpec, reg } = getTools();
+  const messages = [...seedMessages];
+
+  for (let i = 0; i < MAX_TOOL_PHASE_ITERATIONS; i++) {
+    let msg;
+    try {
+      msg = await llm.chat({ messages, tools: toolsSpec });
+    } catch (e) {
+      console.warn('[AGENT/stream] chat() failed in tool phase:', e?.message);
+      return { messages, earlyAnswer: LLM_OFFLINE_MESSAGE };
+    }
+
+    const content = String(msg.content || '').trim();
+
+    // LLM returned text — no more tool calls needed
+    if (!msg.tool_calls || !msg.tool_calls.length) {
+      if (content === LLM_OFFLINE_SENTINEL || content.includes(LLM_OFFLINE_SENTINEL)) {
+        return { messages, earlyAnswer: LLM_OFFLINE_MESSAGE };
+      }
+      return { messages, earlyAnswer: content || null };
+    }
+
+    messages.push(msg);
+    const toolNames = msg.tool_calls.map(tc => tc.function?.name).filter(Boolean);
+
+    for (const tc of msg.tool_calls) {
+      const name = tc.function?.name;
+      const handler = reg[name];
+      let result;
+      try {
+        const args = JSON.parse(tc.function?.arguments || '{}');
+        args.owner_id = args.owner_id || ownerId;
+        result = handler ? await handler(args) : { error: `Unknown tool: ${name}` };
+      } catch (e) {
+        result = { error: e?.message };
+      }
+      messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(result) });
+    }
+
+    onRound?.({ tools: toolNames, iteration: i });
+  }
+
+  // Max iterations reached — caller should synthesize from accumulated messages
+  return { messages, earlyAnswer: null };
+}
+
+// ----- Reasoning query detector (used by webhook for fast-ack) ----
+// Returns true if the message is almost certainly a question/analysis query
+// that will hit the LLM (vs a deterministic log/action command).
+// Conservative: false positives (calling it a question when it's a command)
+// are harmless — they just skip the ack. False negatives send an unnecessary ack.
+function looksLikeReasoningQuery(text = '') {
+  const t = String(text).toLowerCase().trim();
+  if (!t) return false;
+
+  // Known log/action prefixes — these route deterministically, skip ack
+  if (/^(expense|revenue|task\s*[-–]|clock\s*(in|out)|break|lunch|drive|batch|payroll|set\s+rate|mileage|recurring|job\s+(create|list|close|set)|photo|receipt)\b/.test(t)) return false;
+  if (/^\$\d/.test(t)) return false; // bare dollar amount = expense
+
+  // Question/analysis signals
+  return (
+    /\b(how|what|which|when|why|show me|tell me|give me|is |did |do i|am i|are we|were we|have i|has)\b/.test(t) ||
+    /\b(profit|margin|revenue|expense|cashflow|cash flow|labour|labor|overtime|payroll|quote|budget|forecast|kpi|benchmark|average|pattern|trend|report|summary|breakdown)\b/.test(t) ||
+    /\b(job\s*#?\d+|last\s+\d+|this week|last week|this month|last month|ytd|mtd|wtd|q[1-4])\b/.test(t)
+  );
 }
 
 // ----- Back-compat shim ------------------------------------
@@ -949,4 +1322,4 @@ async function runAgent(opts = {}) {
   return ask({ from, ownerId, text, topicHints, ownerProfile });
 }
 
-module.exports = { ask, runAgent, canUseAgent };
+module.exports = { ask, runAgent, canUseAgent, looksLikeReasoningQuery, runToolPhaseSync };

@@ -29,12 +29,19 @@ Rules you must follow on every response:
 - Only answer from the provided job records and tool results. Never invent numbers.
 - If data is missing, say exactly what is missing instead of guessing.
 - Calculate gross margin as: (revenue - costs) / revenue * 100
-- Flag when data seems incomplete. Examples:
-    "3 cost entries found but no material costs logged — margin may be understated."
-    "No revenue logged for this job yet — cannot calculate profitability."
 - When comparing jobs, always show the raw numbers (revenue, costs, margin%) side by side.
 - Amounts should be in dollars with two decimal places unless the user asks otherwise.
-- Be direct and concise. Contractors want numbers, not disclaimers.`;
+- Be direct and concise. Contractors want numbers, not disclaimers.
+
+Uncertainty rules — required on every response:
+- Tool returned zero rows / empty:  "No [X] is logged for [Y] yet. Record it via WhatsApp and I can answer this."
+- Tool returned error:  "I couldn't retrieve [X] right now — [brief reason if available]. Try again or ask a different way."
+- Partial data (some categories missing):  "Based on what's recorded: [findings]. [Missing field] isn't logged yet, so [stated implication]."
+  Example: "3 cost entries found but no material costs logged — margin may be understated."
+  Example: "No revenue logged for this job yet — cannot calculate profitability."
+- Missing crew rates:  "Hours are recorded but [employee name] has no pay rate set. Use 'set rate [name] $X/hour' to unlock the dollar figure."
+- Full data, confident answer:  Lead directly with the number. No hedges.
+Never say "probably", "might be", "I think", or "possibly" about tool results — either you have the data or you don't. State which.`;
 
 class LLMProvider {
   constructor(opts = {}) {
@@ -55,6 +62,36 @@ class LLMProvider {
     // Stored for cost logging context
     this._queryKind = opts.queryKind || null;
     this._ownerId   = opts.ownerId   || null;
+  }
+
+  /**
+   * chatStream({ messages, temperature, max_tokens })
+   *
+   * Async generator — yields text tokens from whichever provider handles this query.
+   * No tools are passed; this is used only for the final synthesis step after tool
+   * rounds have already run. Falls back cross-provider if the primary throws.
+   */
+  async *chatStream({ messages, temperature = 0.2, max_tokens = 1200 }) {
+    const target = pickProvider(messages);
+    const effectiveMessages = target === 'anthropic' ? _injectFinancialSystemPrompt(messages) : messages;
+    const primary   = target === 'anthropic' ? this._anthropic : this._openai;
+    const fallback  = target === 'anthropic' ? this._openai    : this._anthropic;
+
+    try {
+      for await (const token of primary.chatStream({ messages: effectiveMessages, temperature, max_tokens })) {
+        yield token;
+      }
+    } catch (primaryErr) {
+      console.warn(`[LLM] chatStream primary (${target}) failed, falling back:`, primaryErr?.message);
+      try {
+        for await (const token of fallback.chatStream({ messages, temperature, max_tokens })) {
+          yield token;
+        }
+      } catch (fallbackErr) {
+        console.error('[LLM] chatStream fallback also failed:', fallbackErr?.message);
+        yield '(llm offline)';
+      }
+    }
   }
 
   /**

@@ -1,0 +1,51 @@
+{
+  "_note": "TEMPLATE ONLY — adjust column letters and header_row after receiving Gentek's actual price list spreadsheet.",
+  "supplier_slug": "gentek",
+  "file_type": "xlsx",
+  "header_row": 1,
+  "data_start_row": 2,
+  "column_mapping": {
+    "sku": "A",
+    "name": "B",
+    "description": "C",
+    "category": "D",
+    "unit_of_measure": "E",
+    "unit_price": "F"
+  },
+  "price_includes_tax": false,
+  "price_format": "dollars",
+  "currency": "CAD",
+  "unit_of_measure_mapping": {
+    "SQ": "sq",
+    "Square": "sq",
+    "Sq": "sq",
+    "LF": "lf",
+    "Linear Foot": "lf",
+    "Linear Feet": "lf",
+    "EA": "ea",
+    "Each": "ea",
+    "Ea": "ea",
+    "BOX": "box",
+    "Box": "box",
+    "BDL": "bundle",
+    "Bundle": "bundle",
+    "BUNDLE": "bundle",
+    "PC": "ea",
+    "Piece": "ea",
+    "PCS": "ea"
+  },
+  "skip_rows_where": {
+    "sku": ["", null],
+    "unit_price": ["", null, "0", 0]
+  },
+  "expected_categories": [
+    "Vinyl Siding",
+    "Engineered Wood Siding",
+    "Aluminum Siding",
+    "Soffit & Fascia",
+    "Rainware",
+    "Trim & Mouldings",
+    "Accessories",
+    "Windows"
+  ]
+}

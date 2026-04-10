@@ -268,6 +268,62 @@ class AnthropicProvider {
     return msg;
   }
 
+  /**
+   * chatStream({ messages, temperature, max_tokens })
+   * Async generator that yields text tokens as they arrive from the Anthropic API.
+   * Uses client.messages.stream() (non-beta) — prompt caching skipped for the
+   * streaming synthesis step, which is acceptable since it's a one-time call.
+   * cache_control blocks in the system message are stripped to avoid beta-header
+   * rejection from the non-beta endpoint.
+   */
+  async *chatStream({ messages, temperature = 0.2, max_tokens = 1200 }) {
+    const client = getClient();
+    if (!client || !Anthropic) {
+      yield '(llm offline)';
+      return;
+    }
+
+    const { systemBlocks, messages: anthropicMessages } = oaiMessagesToAnthropic(messages);
+
+    // Strip cache_control — the non-beta endpoint ignores/rejects these blocks
+    const cleanSystem = systemBlocks
+      ? systemBlocks.map(b => ({ type: b.type, text: b.text }))
+      : null;
+
+    const baseParams = {
+      model: this.model,
+      max_tokens,
+      temperature,
+      messages: anthropicMessages,
+      ...(cleanSystem ? { system: cleanSystem } : {}),
+    };
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const stream = client.messages.stream({ ...baseParams, model: attempt === 0 ? this.model : this.fallbackModel });
+        for await (const event of stream) {
+          if (
+            event.type === 'content_block_delta' &&
+            event.delta?.type === 'text_delta' &&
+            event.delta.text
+          ) {
+            yield event.delta.text;
+          }
+        }
+        return; // success
+      } catch (err) {
+        const status = err?.status || err?.statusCode || 0;
+        const retryable = status === 529 || status === 429 || (status >= 500 && status < 600);
+        if (retryable && attempt === 0) {
+          console.warn(`[LLM/anthropic/stream] ${status} — retrying with ${this.fallbackModel}`);
+          await _backoff(0);
+          continue;
+        }
+        throw err;
+      }
+    }
+  }
+
   _offlineMeta() {
     return { provider: 'anthropic', model: this.model, inputTokens: 0, outputTokens: 0, cacheHits: 0, latencyMs: 0, costUsd: 0 };
   }

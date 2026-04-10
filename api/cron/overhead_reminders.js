@@ -1,5 +1,6 @@
 // api/cron/overhead_reminders.js
-// Daily cron: find recurring overhead items due today, create reminder records + send WhatsApp.
+// Daily cron: find recurring overhead items due today (or overdue), send WhatsApp reminder,
+// create overhead_reminders record, then advance next_due_at to the next period.
 // Schedule: 8:00 AM UTC daily (see vercel.json)
 'use strict';
 
@@ -10,6 +11,34 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
+
+function advanceNextDue(currentDate, frequency) {
+  const d = new Date(currentDate);
+  switch (frequency) {
+    case 'weekly':    d.setUTCDate(d.getUTCDate() + 7);   break;
+    case 'monthly':   d.setUTCMonth(d.getUTCMonth() + 1); break;
+    case 'quarterly': d.setUTCMonth(d.getUTCMonth() + 3); break;
+    case 'annual':    d.setUTCFullYear(d.getUTCFullYear() + 1); break;
+    default:          d.setUTCMonth(d.getUTCMonth() + 1); break;
+  }
+  return d.toISOString().slice(0, 10);
+}
+
+function freqLabel(f) {
+  return { monthly: 'month', weekly: 'week', quarterly: 'quarter', annual: 'year' }[f] || f;
+}
+
+// period key so dedup works across frequencies: YYYY-WW for weekly, YYYY-MM for monthly/quarterly/annual
+function periodKey(date, frequency) {
+  const d = new Date(date);
+  if (frequency === 'weekly') {
+    // ISO week number
+    const jan1 = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+    const week = Math.ceil(((d - jan1) / 86400000 + jan1.getUTCDay() + 1) / 7);
+    return { year: d.getUTCFullYear(), month: week }; // re-use month column as week number for weekly
+  }
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1 };
+}
 
 module.exports = async (req, res) => {
   try {
@@ -25,83 +54,91 @@ module.exports = async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    const now       = new Date();
-    const todayDay  = now.getDate();
-    const year      = now.getFullYear();
-    const month     = now.getMonth() + 1; // 1–12
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
-    // Find active recurring items due today with no payment or reminder this period
+    // Find active recurring items due today or overdue (next_due_at <= today)
     const { rows: dueItems } = await pool.query(`
       SELECT
         oi.id,
         oi.tenant_id,
+        oi.owner_id,
         oi.name,
         oi.amount_cents,
         oi.tax_amount_cents,
-        oi.due_day,
-        tap.phone_digits
-      FROM overhead_items oi
-      LEFT JOIN chiefos_tenant_actor_profiles tap
-        ON tap.tenant_id = oi.tenant_id
-      WHERE oi.active        = true
-        AND oi.item_type     = 'recurring'
-        AND oi.due_day       = $1
-        AND NOT EXISTS (
-          SELECT 1 FROM overhead_payments op
-          WHERE op.item_id      = oi.id
-            AND op.period_year  = $2
-            AND op.period_month = $3
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM overhead_reminders orr
-          WHERE orr.item_id      = oi.id
-            AND orr.period_year  = $2
-            AND orr.period_month = $3
-        )
-    `, [todayDay, year, month]);
+        oi.frequency,
+        oi.next_due_at
+      FROM public.overhead_items oi
+      WHERE oi.active       = true
+        AND oi.next_due_at <= $1
+    `, [today]);
 
     let created  = 0;
     let notified = 0;
+    let advanced = 0;
 
     for (const item of dueItems) {
-      // Create pending reminder
-      await pool.query(`
-        INSERT INTO overhead_reminders
-          (tenant_id, item_id, item_name, period_year, period_month, amount_cents, tax_amount_cents, status)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-        ON CONFLICT (item_id, period_year, period_month) DO NOTHING
-      `, [item.tenant_id, item.id, item.name, year, month, item.amount_cents, item.tax_amount_cents]);
-      created++;
+      const { year, month: periodMonth } = periodKey(item.next_due_at || today, item.frequency);
 
-      // Send WhatsApp notification if phone is available
-      if (item.phone_digits) {
+      // Check if reminder already created this period
+      const existing = await pool.query(`
+        SELECT id FROM public.overhead_reminders
+        WHERE item_id      = $1
+          AND period_year  = $2
+          AND period_month = $3
+        LIMIT 1
+      `, [item.id, year, periodMonth]).catch(() => null);
+
+      if (!existing?.rows?.length) {
+        // Create pending reminder record
+        await pool.query(`
+          INSERT INTO public.overhead_reminders
+            (tenant_id, item_id, item_name, period_year, period_month, amount_cents, tax_amount_cents, status)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+          ON CONFLICT (item_id, period_year, period_month) DO NOTHING
+        `, [item.tenant_id, item.id, item.name, year, periodMonth, item.amount_cents, item.tax_amount_cents]);
+        created++;
+      }
+
+      // owner_id is already the digits (e.g. "15551234567")
+      const phoneDigits = String(item.owner_id || '').replace(/\D/g, '');
+      if (phoneDigits) {
         const totalCents = (item.amount_cents || 0) + (item.tax_amount_cents || 0);
-        const totalFmt   = `$${(totalCents / 100).toFixed(2)}`;
-        const taxNote    = item.tax_amount_cents ? ' incl. tax' : '';
+        const totalFmt   = `$${(totalCents / 100).toFixed(0)}`;
+        const taxNote    = item.tax_amount_cents ? ' (incl. tax)' : '';
+        const freqWord   = freqLabel(item.frequency);
         const msg = [
-          `💳 *Payment reminder*`,
-          `${item.name} is due today (${totalFmt}${taxNote}).`,
+          `💳 Overhead reminder`,
+          `${item.name} — ${totalFmt}/${freqWord}${taxNote} is due today.`,
           ``,
-          `Log into ChiefOS to confirm the payment was made.`,
+          `Reply "paid ${item.name}" to confirm, or "list recurring" to see all.`,
         ].join('\n');
 
         try {
-          await sendWhatsApp(`+${item.phone_digits}`, msg);
+          await sendWhatsApp(`whatsapp:+${phoneDigits}`, msg);
           await pool.query(`
-            UPDATE overhead_reminders
-            SET whatsapp_sent_at = NOW()
+            UPDATE public.overhead_reminders
+            SET whatsapp_sent_at = NOW(), status = 'sent'
             WHERE item_id = $1 AND period_year = $2 AND period_month = $3
-          `, [item.id, year, month]);
+          `, [item.id, year, periodMonth]);
           notified++;
         } catch (e) {
           console.error('[overhead_reminders] WhatsApp send failed for item', item.id, e?.message);
         }
       }
+
+      // Advance next_due_at to the next period
+      const nextDue = advanceNextDue(item.next_due_at || today, item.frequency);
+      await pool.query(`
+        UPDATE public.overhead_items
+        SET next_due_at = $1, updated_at = NOW()
+        WHERE id = $2
+      `, [nextDue, item.id]);
+      advanced++;
     }
 
-    console.log(`[overhead_reminders] ${created} reminders created, ${notified} WhatsApp sent`);
+    console.log(`[overhead_reminders] ${created} reminders created, ${notified} WhatsApp sent, ${advanced} items advanced`);
 
-    // Phase 3.3: also run receivables nudge daily
+    // Also run receivables nudge daily
     let receivables = { checked: 0, sent: 0 };
     try {
       const { runReceivablesNudge } = require('../../workers/receivablesNudge');
@@ -111,7 +148,7 @@ module.exports = async (req, res) => {
       console.warn('[overhead_reminders] receivablesNudge failed (non-fatal):', e?.message);
     }
 
-    return res.status(200).json({ ok: true, created, notified, receivables, now: now.toISOString() });
+    return res.status(200).json({ ok: true, created, notified, advanced, receivables, today });
 
   } catch (err) {
     console.error('[overhead_reminders] fatal error:', err?.message);

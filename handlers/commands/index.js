@@ -33,6 +33,13 @@ let tasksHandler, handleTimeclock, handleJob, handleExpense, handleRevenue, team
 let handleMileage, isMileageMessage;
 let handlePhase, isPhaseMessage;
 let handlePhotos, isPhotosCommand;
+let handleSetRate, isSetRateCommand;
+let handleRecurring, isRecurringCommand;
+let handlePayroll, isPayrollCommand;
+let handleCrewSelf, isCrewSelfCommand;
+let handleDigestSettings, isDigestSettingsCommand;
+let handleTimesheetApproval, isTimesheetApprovalCommand;
+let batchReceiptsHandler;
 try { ({ tasksHandler } = require('./tasks')); } catch {}
 try { ({ handleTimeclock } = require('./timeclock')); } catch {}
 try { ({ handleJob } = require('./job')); } catch {}
@@ -42,6 +49,13 @@ try { ({ teamHandler } = require('./team')); } catch {}
 try { ({ handleMileage, isMileageMessage } = require('./mileage')); } catch {}
 try { ({ handlePhase, isPhaseMessage } = require('./phase')); } catch {}
 try { ({ handlePhotos, isPhotosCommand } = require('./photos')); } catch {}
+try { ({ handleSetRate, isSetRateCommand } = require('./rates')); } catch {}
+try { ({ handleRecurring, isRecurringCommand } = require('./recurring')); } catch {}
+try { ({ handlePayroll, isPayrollCommand } = require('./payroll')); } catch {}
+try { ({ handleCrewSelf, isCrewSelfCommand } = require('./crewSelf')); } catch {}
+try { ({ handleDigestSettings, isDigestSettingsCommand } = require('./digestSettings')); } catch {}
+try { ({ handleTimesheetApproval, isTimesheetApprovalCommand } = require('./timesheetApproval')); } catch {}
+try { batchReceiptsHandler = require('./batchReceipts'); } catch {}
 
 
 
@@ -350,7 +364,162 @@ if (needsPro && planKey !== "pro") {
       return true;
     }
 
-    // 5) Remaining dedicated handlers (team, tasks, timeclock, job)
+    // 5) Remaining dedicated handlers (rates, team, tasks, timeclock, job)
+
+// ✅ RATES — "set rate John $28/hour" / "set my rate $45/hour"
+if (handleSetRate && isSetRateCommand && isSetRateCommand(raw)) {
+  const handled = await handleSetRate(from, raw, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId);
+  if (handled) {
+    await safeCleanup({ from, ownerId });
+    return true;
+  }
+}
+
+// ✅ RECURRING EXPENSES — "recurring $200/month storage unit" / "list recurring"
+if (handleRecurring && isRecurringCommand && isRecurringCommand(raw)) {
+  const handled = await handleRecurring(from, raw, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId);
+  if (handled) {
+    await safeCleanup({ from, ownerId });
+    return true;
+  }
+}
+
+// ✅ PAYROLL SUMMARY — "payroll this week" / "payroll summary" / "overtime report"
+if (handlePayroll && isPayrollCommand && isPayrollCommand(raw)) {
+  const handled = await handlePayroll(from, raw, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId);
+  if (handled) {
+    await safeCleanup({ from, ownerId });
+    return true;
+  }
+}
+
+// ✅ CREW SELF-QUERY — "my hours", "my jobs", "my tasks", "crew settings" (Pro)
+if (handleCrewSelf && isCrewSelfCommand && isCrewSelfCommand(raw)) {
+  const handled = await handleCrewSelf(from, raw, userProfile, ownerId, ownerProfile, isOwner, res, sourceMsgId);
+  if (handled) {
+    await safeCleanup({ from, ownerId });
+    return true;
+  }
+}
+
+// ✅ TIMESHEET APPROVAL — "submit timesheet", "pending timesheets", "approve/reject timesheet [name]"
+if (handleTimesheetApproval && isTimesheetApprovalCommand && isTimesheetApprovalCommand(raw)) {
+  const handled = await handleTimesheetApproval(from, raw, userProfile, ownerId, ownerProfile, isOwner, res);
+  if (handled) {
+    await safeCleanup({ from, ownerId });
+    return true;
+  }
+}
+
+// ✅ DIGEST SETTINGS — "digest settings", "digest day friday", "digest time 4pm", "digest on/off"
+if (handleDigestSettings && isDigestSettingsCommand && isDigestSettingsCommand(raw)) {
+  const handled = await handleDigestSettings(from, raw, userProfile, ownerId, ownerProfile, isOwner, res);
+  if (handled) {
+    await safeCleanup({ from, ownerId });
+    return true;
+  }
+}
+
+// ✅ BATCH RECEIPTS — "batch receipts", "done", "cancel batch", job assignment reply
+if (batchReceiptsHandler) {
+  const {
+    isBatchStartCommand,
+    isBatchDoneCommand,
+    isBatchCancelCommand,
+    handleBatchTextCommand,
+    startBatchSession,
+    isBatchActive,
+  } = batchReceiptsHandler;
+
+  // Start batch mode
+  if (isBatchStartCommand && isBatchStartCommand(raw)) {
+    const result = await startBatchSession(ownerId);
+    await safeCleanup({ from, ownerId });
+    return twiml(res, result.replyText);
+  }
+
+  // Done / cancel / job-name assignment (only if batch is active or these are batch commands)
+  const isBatchCmd = (isBatchDoneCommand && isBatchDoneCommand(raw)) ||
+                     (isBatchCancelCommand && isBatchCancelCommand(raw));
+  const batchActive = !isBatchCmd && handleBatchTextCommand
+    ? await isBatchActive(ownerId)
+    : false;
+
+  if (isBatchCmd || batchActive) {
+    const result = await handleBatchTextCommand(raw, ownerId);
+    if (result.handled) {
+      // Job assignment confirmed — create all expense transactions
+      if (result.batchConfirm) {
+        const { items, jobName } = result.batchConfirm;
+        let pg = null;
+        try { pg = require('../../services/postgres'); } catch {}
+
+        let jobRow = null;
+        if (pg) {
+          // Resolve job by name (fuzzy)
+          const jobRes = await pg.query(
+            `SELECT id, job_int_id, job_name, name FROM public.jobs
+             WHERE owner_id = $1 AND deleted_at IS NULL
+             AND (LOWER(job_name) ILIKE $2 OR LOWER(name) ILIKE $2)
+             ORDER BY created_at DESC LIMIT 1`,
+            [ownerId, `%${jobName.toLowerCase()}%`]
+          );
+          jobRow = jobRes?.rows?.[0] || null;
+        }
+
+        const created = [];
+        const failed  = [];
+        for (const item of items) {
+          try {
+            const amountCents = item.amount
+              ? Math.round(parseFloat(String(item.amount).replace(/[^0-9.]/g, '')) * 100)
+              : null;
+
+            const dedupe = `batch:${ownerId}:${item.stable_media_msg_id || item.added_at}`;
+            const { applyCIL: applyCilFn } = require('../../services/cilRouter');
+            await applyCilFn({
+              type: 'CreateExpense',
+              owner_id: ownerId,
+              amount_cents: amountCents || 0,
+              vendor: item.vendor || 'Unknown',
+              description: `Batch receipt — ${item.vendor || 'Unknown'}`,
+              expense_date: item.date || new Date().toISOString().slice(0, 10),
+              job_int_id: jobRow?.job_int_id || null,
+              source_msg_id: dedupe,
+              raw_text: item.raw_text || null,
+            });
+            created.push(item);
+          } catch (e) {
+            failed.push(item);
+          }
+        }
+
+        const jobLabel = jobRow?.job_name || jobRow?.name || jobName;
+        const lines = [
+          `✅ Logged ${created.length} receipt${created.length !== 1 ? 's' : ''} to *${jobLabel}*.`,
+        ];
+        if (failed.length) lines.push(`⚠️ ${failed.length} couldn't be saved — try logging them individually.`);
+        if (created.length) {
+          const total = created.reduce((sum, it) => {
+            const v = parseFloat(String(it.amount || '0').replace(/[^0-9.]/g, ''));
+            return sum + (isNaN(v) ? 0 : v);
+          }, 0);
+          if (total > 0) lines.push(`Total: $${total.toFixed(2)}`);
+        }
+
+        await safeCleanup({ from, ownerId });
+        return twiml(res, lines.join('\n'));
+      }
+
+      // Done summary / cancel reply
+      if (result.replyText) {
+        await safeCleanup({ from, ownerId });
+        return twiml(res, result.replyText);
+      }
+    }
+  }
+}
+
 // ✅ TEAM (employees/crew) — Gate #3 lives inside team.js
 if (teamHandler) {
   const teamHit =

@@ -121,3 +121,13 @@ Before any deployment:
 - [ ] No PII in logs
 - [ ] Exports verify tenant boundary before returning bytes
 - [ ] Error responses include traceId, never stack traces
+
+## Active Execution Plan
+
+Read CHIEFOS_EXECUTION_PLAN.md before starting any work.
+Current Phase: 3 — Onboarding & Conversational Intelligence Polish
+Phase 1 ✅ COMPLETE | Phase 2 ✅ COMPLETE | Phase 3 🔄 IN PROGRESS
+Remaining Phase 3 build items:
+  - Live PWA install verification (Android + iOS)
+Do not accept work outside the current phase unless explicitly approved by the developer.
+Before suggesting any new feature or refactor, check if it is already built (see CHIEFOS_EXECUTION_PLAN.md audit notes) to avoid rebuilding working code.

@@ -95,7 +95,8 @@ const stripeRouter = require("./routes/stripe");
 const webhookRouter = require("./routes/webhook");
 const parseRouter = require("./routes/parse");
 const dashboardRouter = require("./routes/dashboard");
-const askChiefRouter = require("./routes/askChief");
+const askChiefRouter       = require("./routes/askChief");
+const askChiefStreamRouter = require("./routes/askChiefStream");
 const billingRouter = require("./routes/billing");
 const accountRouter = require("./routes/account");
 const receiptsRouter = require("./routes/receipts");
@@ -105,6 +106,9 @@ const jobsPortalRouter = require("./routes/jobsPortal");
 const catalogRouter = require("./routes/catalog");
 const integrityRouter = require("./routes/integrity");
 const supplierPortalRouter = require("./routes/supplierPortal");
+const alertsRouter = require("./routes/alerts");
+const exportsPortalRouter = require("./routes/exportsPortal");
+const emailIngestRouter = require("./routes/emailIngest");
 
 // ✅ Portal auth + tenant/actor context for protected API routes
 const { requirePortalUser } = require("./middleware/requirePortalUser");
@@ -180,6 +184,8 @@ app.use("/api/crew", crewAdminRouter);
 app.use("/api/crew", requirePortalUser, require("./routes/crewReview"));
 // AskChief defines POST /api/ask-chief internally
 app.use(askChiefRouter);
+// AskChief SSE stream: POST /api/ask-chief/stream
+app.use(askChiefStreamRouter);
 
 
 // Parse
@@ -190,11 +196,20 @@ app.use("/api/parse", parseRouter);
 app.use("/api/account", accountRouter);
 app.use("/api/dashboard", dashboardRouter);
 
+// Alerts (portal auth applied inside router)
+app.use("/api/alerts", alertsRouter);
+
+// Export pack (portal auth + plan gate applied inside router)
+app.use("/api/exports", exportsPortalRouter);
+
 // Supplier catalog (portal auth applied inside router)
 app.use("/api/catalog", catalogRouter);
 
 // Record integrity (portal auth applied inside router)
 app.use("/api/integrity", integrityRouter);
+
+// Email ingest webhook (Postmark inbound parse — no user auth, POSTMARK_WEBHOOK_TOKEN header)
+app.use(emailIngestRouter);
 
 // Supplier self-service portal (public signup + authenticated supplier routes + admin routes)
 app.use("/api/supplier", supplierPortalRouter);

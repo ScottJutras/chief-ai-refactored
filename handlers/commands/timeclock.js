@@ -1819,6 +1819,37 @@ let finalText = `✅ Clocked out.\n${truthLines.join('\n')}`;
     }
   }
 
+  // ── Overtime awareness: check week hours on clock-out ──────────────────
+  try {
+    const OT_THRESHOLD = 40;
+    const now2 = new Date();
+    const dayOfWeek = now2.getUTCDay() || 7; // Mon=1
+    const weekStart = new Date(now2);
+    weekStart.setUTCDate(now2.getUTCDate() - (dayOfWeek - 1));
+    weekStart.setUTCHours(0, 0, 0, 0);
+    const weekEnd = new Date(weekStart);
+    weekEnd.setUTCDate(weekStart.getUTCDate() + 6);
+    weekEnd.setUTCHours(23, 59, 59, 999);
+
+    const otRows = await pg.query(
+      `SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(clock_out, NOW()) - clock_in)) / 3600.0) AS hrs
+       FROM public.time_entries_v2
+       WHERE owner_id = $1
+         AND LOWER(employee_name) = LOWER($2)
+         AND kind = 'shift'
+         AND clock_in >= $3
+         AND clock_in <= $4
+         AND deleted_at IS NULL`,
+      [owner_id, employee_name || user_id, weekStart.toISOString(), weekEnd.toISOString()]
+    ).catch(() => null);
+
+    const weekHours = Math.round((Number(otRows?.rows?.[0]?.hrs) || 0) * 10) / 10;
+    if (weekHours > OT_THRESHOLD) {
+      const otHours = Math.round((weekHours - OT_THRESHOLD) * 10) / 10;
+      finalText += `\n\n⚠️ Overtime: ${weekHours}h this week (${otHours}h over ${OT_THRESHOLD}h). Ask Chief "payroll summary" to see the cost impact.`;
+    }
+  } catch {}
+
   return ret(finalText);
 }
 
@@ -2211,6 +2242,30 @@ if (mForceIn || mForceOut) {
     // UNDO (new schema)
     if (isUndo) {
       try {
+        // Check if the most recent entry falls inside an approved timesheet period
+        let isTimePeriodLocked;
+        try { ({ isTimePeriodLocked } = require('./timesheetApproval')); } catch {}
+        if (isTimePeriodLocked) {
+          const peek = await pg.query(
+            `SELECT id, employee_name, coalesce(start_at_utc, clock_in, created_at) AS entry_ts
+               FROM public.time_entries_v2
+              WHERE owner_id=$1 AND user_id=$2
+              ORDER BY coalesce(start_at_utc, created_at) DESC
+              LIMIT 1`,
+            [String(ownerId || '').trim(), targetUserId]
+          ).catch(() => null);
+          if (peek?.rows?.length) {
+            const { employee_name, entry_ts } = peek.rows[0];
+            const locked = await isTimePeriodLocked(ownerId, employee_name, entry_ts).catch(() => false);
+            if (locked) {
+              return twiml(res,
+                `🔒 That entry is in an approved timesheet period and cannot be undone.\n` +
+                `Ask the business owner to unlock the period if a correction is needed.`
+              );
+            }
+          }
+        }
+
         const del = await pg.query(
           `DELETE FROM public.time_entries_v2
             WHERE id = (

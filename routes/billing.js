@@ -136,7 +136,7 @@ router.post("/checkout", async (req, res) => {
       await db.updateOwnerBilling(ownerId, { stripe_customer_id: customerId });
     }
 
-    const session = await stripe.checkout.sessions.create({
+    const sessionParams = {
       mode: "subscription",
       customer: customerId,
       line_items: [{ price: priceId, quantity: 1 }],
@@ -151,7 +151,14 @@ router.post("/checkout", async (req, res) => {
         owner_id: String(ownerId),
         plan_key_requested: String(planKey),
       },
-    });
+    };
+
+    // Starter plan: 7-day free trial — no charge until day 8
+    if (planKey === 'starter') {
+      sessionParams.subscription_data = { trial_period_days: 7 };
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionParams);
 
     return res.json({ ok: true, url: session.url });
   } catch (e) {

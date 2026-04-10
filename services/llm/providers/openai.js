@@ -97,6 +97,46 @@ class OpenAIProvider {
     return msg;
   }
 
+  /**
+   * chatStream({ messages, temperature, max_tokens })
+   * Async generator that yields text tokens as they arrive from the API.
+   * No tools — used only for the final synthesis step after tool rounds complete.
+   */
+  async *chatStream({ messages, temperature = 0.2, max_tokens = 1200 }) {
+    const client = getClient();
+    if (!client) {
+      yield '(llm offline)';
+      return;
+    }
+
+    const params = { model: this.model, messages, temperature, max_tokens, stream: true };
+
+    try {
+      const stream = await client.chat.completions.create(params);
+      for await (const chunk of stream) {
+        const token = chunk.choices?.[0]?.delta?.content;
+        if (token) yield token;
+      }
+    } catch (err) {
+      const retryable = err?.status === 429 || (err?.status >= 500 && err?.status < 600);
+      if (retryable && this.model !== this.fallbackModel) {
+        console.warn(`[LLM/openai/stream] ${err.status} — retrying with ${this.fallbackModel}`);
+        await _backoff(1);
+        try {
+          const stream = await client.chat.completions.create({ ...params, model: this.fallbackModel });
+          for await (const chunk of stream) {
+            const token = chunk.choices?.[0]?.delta?.content;
+            if (token) yield token;
+          }
+          return;
+        } catch (err2) {
+          throw err2;
+        }
+      }
+      throw err;
+    }
+  }
+
   _offlineMeta() {
     return { provider: 'openai', model: this.model, inputTokens: 0, outputTokens: 0, cacheHits: 0, latencyMs: 0, costUsd: 0 };
   }

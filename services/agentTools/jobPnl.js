@@ -119,11 +119,8 @@ async function computeJobPnl({ ownerId, jobId, jobNo, dateFrom, dateTo }) {
       COALESCE(cr.hourly_rate_cents, 0) AS rate_cents
     FROM public.time_entries_v2 te
     LEFT JOIN public.chiefos_crew_rates cr
-      ON cr.owner_id::text = te.owner_id::text
-      AND (
-        LOWER(cr.name) = LOWER(te.employee_name)
-        OR cr.employee_id::text = te.employee_id::text
-      )
+      ON cr.owner_id = te.owner_id::text
+      AND LOWER(cr.employee_name) = LOWER(te.employee_name)
     WHERE te.owner_id::text = $1
       AND te.job_id::text = $2
       ${labourDateFilters.length ? 'AND ' + labourDateFilters.join(' AND ') : ''}

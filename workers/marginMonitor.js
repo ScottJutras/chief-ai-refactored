@@ -2,16 +2,18 @@
 
 /**
  * workers/marginMonitor.js
- * Phase 1.3 — Smart Margin Alert
+ * Phase 1.3 — Margin Alert (Portal Notification)
  *
  * Runs every 6 hours. For each active job whose margin has fallen below the
- * threshold (default 20%), or is declining rapidly, sends a WhatsApp alert —
- * at most once every 7 days per job.
+ * threshold (default 20%), or is declining rapidly, writes an unacknowledged
+ * alert to insight_log. The portal dashboard reads and displays these alerts.
+ * No WhatsApp messages are sent — those cost money outside the 24-hour window.
+ *
+ * Dedup: at most one open (unacknowledged) alert per job per calendar month.
+ * Cooldown: 7 days between alerts for the same job.
  */
 
 const { Pool } = require('pg');
-const Anthropic = require('@anthropic-ai/sdk');
-const { sendQuickReply } = require('../services/twilio');
 const { computeJobPnl } = require('../services/agentTools/jobPnl');
 
 const pool = new Pool({
@@ -62,41 +64,34 @@ async function marginSevenDaysAgo(ownerId, jobId) {
   } catch { return null; }
 }
 
-async function generateMarginAlert(pnl, threshold, prevMargin) {
-  const client = new Anthropic();
-
-  const trendNote = prevMargin !== null ? `7 days ago the margin was ${prevMargin}%.` : '';
+function buildAlertSummary(pnl, threshold, prevMargin, isRapidDrop) {
+  const jobLabel = pnl.job_name || `Job #${pnl.job_no}`;
+  const marginStr = `${pnl.margin_pct}%`;
 
   const topExpenses = Object.entries(pnl.expenses_by_category || {})
     .sort((a, b) => b[1] - a[1]).slice(0, 3)
     .map(([cat, cents]) => `${cat} $${(cents / 100).toFixed(0)}`).join(', ');
 
-  const prompt = [
-    `Job: ${pnl.job_name || `Job ${pnl.job_no}`}`,
-    `Current margin: ${pnl.margin_pct}% (threshold: ${threshold}%)`,
-    trendNote,
-    `Revenue to date: $${(pnl.revenue_cents / 100).toFixed(2)}`,
-    `Total costs: $${(pnl.expense_cents / 100).toFixed(2)}`,
-    `Top expense categories: ${topExpenses || 'n/a'}`,
-    `Labour: $${(pnl.labour_cents / 100).toFixed(2)}`,
-  ].filter(Boolean).join('\n');
+  let title, summary;
 
-  const system = [
-    'You are Chief, a plain-language CFO for contractors.',
-    'Write a short (3–4 sentence) WhatsApp alert about this job\'s margin problem.',
-    'Be specific and direct. Name the job. Name the margin. Name what\'s eating into it.',
-    'End with one concrete action the contractor can take.',
-    'Tone: trusted advisor, not alarmist. Use *bold* for the job name only.',
-  ].join(' ');
+  if (isRapidDrop && pnl.margin_pct >= threshold) {
+    title = `Margin declining on ${jobLabel}`;
+    summary = prevMargin != null
+      ? `Down from ${prevMargin}% to ${marginStr} in the last 7 days.`
+      : `Margin is dropping toward your ${threshold}% threshold.`;
+  } else {
+    title = `Low margin on ${jobLabel}`;
+    summary = `Currently at ${marginStr} — below your ${threshold}% threshold.`;
+  }
 
-  const response = await client.messages.create({
-    model:      'claude-haiku-4-5-20251001',
-    max_tokens: 250,
-    messages:   [{ role: 'user', content: prompt }],
-    system,
-  });
+  if (topExpenses) {
+    summary += ` Top costs: ${topExpenses}.`;
+  }
+  if (pnl.labour_cents > 0) {
+    summary += ` Labour: $${(pnl.labour_cents / 100).toFixed(0)}.`;
+  }
 
-  return response.content?.[0]?.text?.trim() || '';
+  return { title, summary };
 }
 
 async function runMarginMonitor() {
@@ -107,13 +102,11 @@ async function runMarginMonitor() {
   const jobsResult = await pool.query(`
     SELECT
       j.id, j.job_no, j.name, j.owner_id,
-      tap.phone_digits, tap.tenant_id
+      tap.tenant_id
     FROM public.jobs j
     JOIN public.chiefos_tenant_actor_profiles tap
       ON tap.owner_id::text = j.owner_id::text
     WHERE j.status NOT IN ('archived', 'cancelled', 'completed')
-      AND tap.phone_digits IS NOT NULL
-      AND tap.phone_digits != ''
   `).catch(() => null);
 
   const jobs = jobsResult?.rows || [];
@@ -126,6 +119,7 @@ async function runMarginMonitor() {
 
       const pnl = await computeJobPnl({ ownerId: String(job.owner_id), jobId: String(job.id) });
       if (pnl.error || pnl.margin_pct === null) continue;
+      // Skip jobs with less than $100 revenue — too early to be meaningful
       if (pnl.revenue_cents < 10000) continue;
 
       const prevMargin = await marginSevenDaysAgo(job.owner_id, job.id);
@@ -137,9 +131,10 @@ async function runMarginMonitor() {
       if (!belowThreshold && !rapidDrop) continue;
 
       const signalKey = rapidDrop && !belowThreshold
-        ? `margin_trend_${job.id}_${year}_${String(now.getUTCMonth() + 1).padStart(2,'0')}_w${Math.ceil(now.getUTCDate()/7)}`
+        ? `margin_trend_${job.id}_${year}_${String(month).padStart(2,'0')}_w${Math.ceil(now.getUTCDate()/7)}`
         : `margin_alert_${job.id}_${year}_${String(month).padStart(2,'0')}`;
 
+      // Check cooldown — skip if an alert (acknowledged or not) was written in the last 7 days
       const existing = await pool.query(
         `SELECT sent_at FROM public.insight_log WHERE owner_id = $1 AND signal_key = $2 LIMIT 1`,
         [String(job.owner_id), signalKey]
@@ -151,27 +146,42 @@ async function runMarginMonitor() {
         if (daysSince < ALERT_COOLDOWN_DAYS) continue;
       }
 
-      const alertText = await generateMarginAlert(pnl, threshold, prevMargin);
-      if (!alertText) continue;
+      const { title, summary } = buildAlertSummary(pnl, threshold, prevMargin, rapidDrop && !belowThreshold);
 
-      const prefix = rapidDrop && !belowThreshold ? `⚠️ *Margin Trend Alert*\n\n` : `🔴 *Low Margin Alert*\n\n`;
-      const fullMessage = prefix + alertText;
-
-      await sendQuickReply(`+${job.phone_digits}`, fullMessage, ['View Breakdown', 'Got it']);
-      alerted++;
+      const payload = {
+        job_id:       job.id,
+        job_no:       job.job_no,
+        job_name:     pnl.job_name || job.name,
+        margin_pct:   pnl.margin_pct,
+        prev_margin:  prevMargin,
+        threshold,
+        revenue_cents: pnl.revenue_cents,
+        expense_cents: pnl.expense_cents,
+        labour_cents:  pnl.labour_cents,
+        is_rapid_drop: rapidDrop && !belowThreshold,
+        title,
+        summary,
+      };
 
       await pool.query(`
-        INSERT INTO public.insight_log (tenant_id, owner_id, kind, signal_key, payload, message_text)
+        INSERT INTO public.insight_log
+          (tenant_id, owner_id, kind, signal_key, payload, message_text)
         VALUES ($1, $2, 'margin_alert', $3, $4, $5)
         ON CONFLICT (owner_id, signal_key) DO UPDATE SET
-          sent_at = NOW(), message_text = EXCLUDED.message_text, payload = EXCLUDED.payload
+          sent_at          = NOW(),
+          acknowledged_at  = NULL,
+          message_text     = EXCLUDED.message_text,
+          payload          = EXCLUDED.payload
       `, [
-        job.tenant_id, String(job.owner_id), signalKey,
-        JSON.stringify({ job_id: job.id, job_no: job.job_no, margin_pct: pnl.margin_pct, prev_margin: prevMargin, threshold }),
-        fullMessage,
-      ]).catch(e => console.error('[marginMonitor] insight_log insert failed:', e?.message));
+        job.tenant_id,
+        String(job.owner_id),
+        signalKey,
+        JSON.stringify(payload),
+        `${title} — ${summary}`,
+      ]);
 
-      console.log(`[marginMonitor] alerted owner ${job.owner_id} for job ${job.job_no} — margin ${pnl.margin_pct}%`);
+      alerted++;
+      console.log(`[marginMonitor] alert written for owner ${job.owner_id} job ${job.job_no} — margin ${pnl.margin_pct}%`);
 
     } catch (err) {
       errors++;
@@ -179,6 +189,7 @@ async function runMarginMonitor() {
     }
   }
 
+  console.log(`[marginMonitor] done — checked: ${checked}, alerted: ${alerted}, errors: ${errors}`);
   return { checked, alerted, errors };
 }
 

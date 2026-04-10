@@ -376,12 +376,38 @@ const created = await bestEffortCreateJob({
       };
     }
 
-    await setSetting(ownerId, "onboarding.stage", "video");
+    await setSetting(ownerId, “onboarding.stage”, “workflow_pref”);
 
     return {
       handled: true,
       replyText: [
         `✅ Created your first job: “${jobName}”`,
+        ``,
+        `Quick question — how does your team work?`,
+        ``,
+        `Reply *1* — Everyone works the same jobs together`,
+        `Reply *2* — Technicians run their own jobs independently`,
+        `Reply *skip* — Skip this`,
+      ].join(“\n”),
+    };
+  }
+
+  // Stage: workflow_pref -> capture team structure preference
+  if (stage === “workflow_pref”) {
+    let pref = null;
+    if (lc === “1” || /\btogether\b/i.test(lc) || /\bcrew\b/i.test(lc)) pref = “crew_together”;
+    else if (lc === “2” || /\bindependent\b/i.test(lc) || /\bown\b/i.test(lc) || /\btech/i.test(lc)) pref = “techs_independent”;
+
+    if (pref) {
+      await setSetting(ownerId, “onboarding.workflow_pref”, pref);
+    }
+    // Move to video regardless of answer
+    await setSetting(ownerId, “onboarding.stage”, “video”);
+
+    return {
+      handled: true,
+      replyText: [
+        pref ? `✅ Got it.` : `✅ No problem.`,
         ``,
         `Portal: ${portalUrl()}`,
         ``,
@@ -392,7 +418,7 @@ const created = await bestEffortCreateJob({
         `• expense $18 Home Depot`,
         `• revenue $500 deposit`,
         `• send a receipt photo`,
-      ].join("\n"),
+      ].join(“\n”),
     };
   }
 
@@ -403,41 +429,43 @@ const created = await bestEffortCreateJob({
       return { handled: false };
     }
 
-    const videoUrl = process.env.ONBOARDING_VIDEO_URL || "";
-    if (!videoUrl) {
-      await setSetting(ownerId, "onboarding.stage", "done");
-      return {
-        handled: true,
-        replyText: `✅ Walkthrough video is not configured yet.\n\nPortal: ${portalUrl()}\n\nIn the meantime, try: expense $18 Home Depot\n\nTip: Send 'commands' anytime to see everything Chief can do.`,
-      };
-    }
-
-    try {
-      await sendWhatsAppVideo({
-        fromPhone,
-        videoUrl,
-        caption: "🎥 60-second walkthrough",
-      });
-    } catch {}
-
     await setSetting(ownerId, "onboarding.stage", "done");
     await setSetting(ownerId, "onboarding.video_sent_at", String(Date.now()));
 
+    // Prefer YouTube link (no cost, always works); fall back to media attachment
+    const youtubeUrl = process.env.YOUTUBE_WALKTHROUGH || "";
+    const videoUrl   = process.env.ONBOARDING_VIDEO_URL || "";
+
+    const replyLines = [
+      `🎬 ChiefOS quick start — 4 things to try:`,
+      ``,
+    ];
+
+    if (youtubeUrl) {
+      replyLines.push(`📺 Video walkthrough: ${youtubeUrl}`, ``);
+    }
+
+    replyLines.push(
+      `1️⃣ Log an expense: expense $18 Home Depot`,
+      `2️⃣ Log revenue: revenue $1200 deposit`,
+      `3️⃣ Clock in/out: clock in [job name]`,
+      `4️⃣ Check profitability: job kpis [job name]`,
+      ``,
+      `Portal (dashboard + exports): ${portalUrl()}`,
+      ``,
+      `Tip: Send 'commands' anytime.`
+    );
+
+    // Also send video attachment if configured
+    if (videoUrl) {
+      try {
+        await sendWhatsAppVideo({ fromPhone, videoUrl, caption: "🎥 Quick start" });
+      } catch {}
+    }
+
     return {
       handled: true,
-      replyText: [
-        `✅ Sent the walkthrough video.`,
-        ``,
-        `Portal: ${portalUrl()}`,
-        ``,
-        `Now try one:`,
-        `• expense $18 Home Depot`,
-        `• revenue $500 deposit`,
-        `• clock in`,
-        `• send a receipt photo`,
-        ``,
-        `Tip: Send 'commands' anytime to see everything Chief can do.`,
-      ].join("\n"),
+      replyText: replyLines.join("\n"),
     };
   }
 

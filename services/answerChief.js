@@ -44,12 +44,37 @@ async function enforceAskChiefGates_AND_Consume({ ownerId, ownerProfile, tz }) {
   const monthlyLimit = Number(caps?.reasoning?.ask_chief?.monthly_questions ?? 0) || 0;
 
   if (!enabled) {
-    return {
-      ok: true,
-      gated: true,
-      answer: `Ask Chief is not enabled on your plan.\n\nUpgrade to Starter or Pro to unlock it.`,
-      evidence: { sql: [], facts_used: 0, warnings: ['NOT_INCLUDED'] }
-    };
+    // Free tier: allow up to 3 trial Ask Chief queries per month
+    try {
+      const ym = ymInTZ(tz);
+      const trialUsage = await pg.getUsageMonthly(String(ownerId), ym);
+      const trialUsed = Number(trialUsage?.ask_chief_trial || 0);
+      const TRIAL_LIMIT = 3;
+
+      if (trialUsed >= TRIAL_LIMIT) {
+        return {
+          ok: true,
+          gated: true,
+          answer:
+            `You've used your ${TRIAL_LIMIT} free Ask Chief queries this month.\n\n` +
+            `Upgrade to Starter ($59/month) to unlock unlimited financial insights, job profitability, and more.\n\n` +
+            `👉 usechiefos.com/pricing`,
+          evidence: { sql: [], facts_used: 0, warnings: ['TRIAL_EXHAUSTED'] }
+        };
+      }
+
+      // Consume BEFORE execution (fail-closed rule)
+      await pg.incrementUsageMonthly(String(ownerId), ym, 'ask_chief_trial', 1);
+      return { ok: true, gated: false, trial: true, trialUsed: trialUsed + 1, trialLimit: TRIAL_LIMIT };
+    } catch {
+      // Fail-closed: if trial check fails, block access
+      return {
+        ok: true,
+        gated: true,
+        answer: `Ask Chief is available on Starter and above.\n\nUpgrade at usechiefos.com/pricing`,
+        evidence: { sql: [], facts_used: 0, warnings: ['NOT_INCLUDED'] }
+      };
+    }
   }
 
   // Quota must be fail-closed per Monetization Enforcement Constitution
@@ -136,16 +161,28 @@ try {
   if (gate?.gated) return gate;
 
   // 4) Execute reasoning AFTER gates
+  let result;
   if (typeof decision?.run === "function") {
     try {
-      return await decision.run();
+      result = await decision.run();
     } catch (e) {
       console.warn("[CHIEF] reasoning run failed:", e?.message);
       return { ok: true, answer: "Something went wrong. Try again.", evidence: { sql: [], facts_used: 0 } };
     }
+  } else {
+    result = decision;
   }
 
-  return decision;
+  // 5) Append free trial footer
+  if (gate?.trial && result?.answer) {
+    const remaining = gate.trialLimit - gate.trialUsed;
+    const footer = remaining > 0
+      ? `\n\n─\n🆓 Free query ${gate.trialUsed}/${gate.trialLimit} — ${remaining} left this month.\nUpgrade to Starter ($59/mo) for unlimited: usechiefos.com/pricing`
+      : `\n\n─\n🆓 That was your last free query this month.\nUpgrade to Starter ($59/mo) for unlimited: usechiefos.com/pricing`;
+    result = { ...result, answer: result.answer + footer };
+  }
+
+  return result;
 }
 
 module.exports = { answerChief, enforceAskChiefGates_AND_Consume };

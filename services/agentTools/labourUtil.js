@@ -44,11 +44,8 @@ async function computeLabourUtilisation({ ownerId, dateFrom, dateTo, employeeNam
     FROM public.time_entries_v2 te_in
     LEFT JOIN public.jobs j ON j.id = te_in.job_id
     LEFT JOIN public.chiefos_crew_rates cr
-      ON cr.owner_id::text = te_in.owner_id::text
-      AND (
-        LOWER(cr.name) = LOWER(te_in.employee_name)
-        OR cr.employee_id::text = te_in.employee_id::text
-      )
+      ON cr.owner_id = te_in.owner_id::text
+      AND LOWER(cr.employee_name) = LOWER(te_in.employee_name)
     WHERE te_in.owner_id::text = $1
       ${filterSql}
     GROUP BY te_in.employee_name, te_in.job_id, j.name, j.job_no, cr.hourly_rate_cents

@@ -180,16 +180,9 @@ router.post("/api/ask-chief/stream", express.json(), async (req, res) => {
         ["starter", "pro", "beta", "paid"].includes(planKey) ||
         ["starter", "pro"].includes(tier);
 
-      if (!looksPaid) {
-        return res.status(200).json({
-          ok: false, code: "PLAN_REQUIRED",
-          message: "Ask Chief unlocks on Starter.",
-          required_plan: "starter",
-          upgrade_url: "https://app.usechiefos.com/app/settings/billing",
-          traceId,
-        });
-      }
-
+      // All authenticated users (including free tier) reach the quota check.
+      // enforceAskChiefGates_AND_Consume handles free (3 trial questions/month)
+      // and paid quota enforcement — no early block needed here.
       req.ownerProfile = userRow;
 
       const quota = await enforceAskChiefGates_AND_Consume({ ownerId: ownerDigits, ownerProfile: userRow, tz });

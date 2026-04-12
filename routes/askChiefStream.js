@@ -139,9 +139,9 @@ router.post("/api/ask-chief/stream", express.json(), async (req, res) => {
   const NOT_LINKED_BODY = {
     ok: false,
     code: "NOT_LINKED",
-    message: "Ask Chief reads your transaction ledger, which is built by logging expenses and revenue through WhatsApp. Link your WhatsApp to start — once you have data, Chief can answer questions about cashflow, job profit, and more.",
+    message: "Ask Chief reads your transaction ledger. Start logging expenses and revenue — via WhatsApp or the web portal — and Chief can answer questions about cashflow, job profit, overhead, and more.",
     actions: [
-      { label: "Link WhatsApp", href: "https://app.usechiefos.com/app/link-phone", kind: "primary" },
+      { label: "Log a transaction", href: "https://app.usechiefos.com/app/transactions/new", kind: "primary" },
       { label: "How it works", href: "https://usechiefos.com/#faq", kind: "secondary" },
     ],
     traceId,

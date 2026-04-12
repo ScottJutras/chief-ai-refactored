@@ -97,6 +97,7 @@ const parseRouter = require("./routes/parse");
 const dashboardRouter = require("./routes/dashboard");
 const askChiefRouter       = require("./routes/askChief");
 const askChiefStreamRouter = require("./routes/askChiefStream");
+const chiefQuotaRouter     = require("./routes/chiefQuota");
 const billingRouter = require("./routes/billing");
 const accountRouter = require("./routes/account");
 const receiptsRouter = require("./routes/receipts");
@@ -186,6 +187,8 @@ app.use("/api/crew", requirePortalUser, require("./routes/crewReview"));
 app.use(askChiefRouter);
 // AskChief SSE stream: POST /api/ask-chief/stream
 app.use(askChiefStreamRouter);
+// Chief quota: GET /api/chief-quota
+app.use(chiefQuotaRouter);
 
 
 // Parse

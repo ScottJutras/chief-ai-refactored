@@ -44,11 +44,12 @@ async function enforceAskChiefGates_AND_Consume({ ownerId, ownerProfile, tz }) {
   const monthlyLimit = Number(caps?.reasoning?.ask_chief?.monthly_questions ?? 0) || 0;
 
   if (!enabled) {
-    // Free tier: allow up to 3 trial Ask Chief queries per month
+    // Free tier: allow up to 3 Ask Chief queries per month.
+    // Uses the shared ask_chief_questions column (same as paid plans, just a lower limit).
     try {
       const ym = ymInTZ(tz);
-      const trialUsage = await pg.getUsageMonthly(String(ownerId), ym);
-      const trialUsed = Number(trialUsage?.ask_chief_trial || 0);
+      const usage = await pg.getUsageMonthly(String(ownerId), ym);
+      const trialUsed = Number(usage?.ask_chief_questions || 0);
       const TRIAL_LIMIT = 3;
 
       if (trialUsed >= TRIAL_LIMIT) {
@@ -57,14 +58,14 @@ async function enforceAskChiefGates_AND_Consume({ ownerId, ownerProfile, tz }) {
           gated: true,
           answer:
             `You've used your ${TRIAL_LIMIT} free Ask Chief queries this month.\n\n` +
-            `Upgrade to Starter ($59/month) to unlock unlimited financial insights, job profitability, and more.\n\n` +
+            `Upgrade to Starter ($59/month) to unlock 250 questions/month, plus financial insights, job profitability, and more.\n\n` +
             `👉 usechiefos.com/pricing`,
           evidence: { sql: [], facts_used: 0, warnings: ['TRIAL_EXHAUSTED'] }
         };
       }
 
       // Consume BEFORE execution (fail-closed rule)
-      await pg.incrementUsageMonthly(String(ownerId), ym, 'ask_chief_trial', 1);
+      await pg.incrementUsageMonthly(String(ownerId), ym, 'ask_chief_questions', 1);
       return { ok: true, gated: false, trial: true, trialUsed: trialUsed + 1, trialLimit: TRIAL_LIMIT };
     } catch {
       // Fail-closed: if trial check fails, block access

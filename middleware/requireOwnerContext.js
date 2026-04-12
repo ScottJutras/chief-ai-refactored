@@ -67,9 +67,13 @@ module.exports = async function requireOwnerContext(req, res, next) {
     const tenant_id = rows?.[0]?.tenant_id || null;
     const owner_id = rows?.[0]?.owner_id || null;
 
-    if (!tenant_id || !owner_id) {
-      // This is the exact error you're hitting
+    if (!tenant_id) {
       return jsonErr(res, 401, "401", "Missing owner context");
+    }
+
+    if (!owner_id) {
+      // Portal user exists but has no WhatsApp owner linked yet
+      return jsonErr(res, 401, "NOT_LINKED", "not_linked");
     }
 
     // Attach context for routes

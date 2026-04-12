@@ -142,6 +142,7 @@ router.post("/api/ask-chief/stream", express.json(), async (req, res) => {
     message: "Ask Chief reads your transaction ledger. Start logging expenses and revenue — via WhatsApp or the web portal — and Chief can answer questions about cashflow, job profit, overhead, and more.",
     actions: [
       { label: "Log a transaction", href: "https://app.usechiefos.com/app/transactions/new", kind: "primary" },
+      { label: "Link WhatsApp", href: "https://app.usechiefos.com/app/link-phone", kind: "secondary" },
       { label: "How it works", href: "https://usechiefos.com/#faq", kind: "secondary" },
     ],
     traceId,

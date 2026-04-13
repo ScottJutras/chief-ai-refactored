@@ -55,7 +55,7 @@ const plan_capabilities = {
     },
 
     reasoning: {
-      ask_chief: { enabled: false, owner_only: true, monthly_questions: 0, behavior: "pause" },
+      ask_chief: { enabled: true, owner_only: true, monthly_questions: 10, behavior: "pause" },
     },
 
     exports: { enabled: true, watermark: true },

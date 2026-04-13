@@ -182,7 +182,7 @@ router.post("/api/ask-chief/stream", express.json(), async (req, res) => {
         ["starter", "pro"].includes(tier);
 
       // All authenticated users (including free tier) reach the quota check.
-      // enforceAskChiefGates_AND_Consume handles free (3 trial questions/month)
+      // enforceAskChiefGates_AND_Consume handles free (10 questions/month)
       // and paid quota enforcement — no early block needed here.
       req.ownerProfile = userRow;
 

@@ -9,7 +9,7 @@ const { requirePortalUser }       = require("../middleware/requirePortalUser");
 const pg                          = require("../services/postgres");
 const { getEffectivePlanFromOwner } = require("../src/config/effectivePlan");
 
-const PLAN_LIMITS = { free: 3, starter: 250, pro: 2000 };
+const PLAN_LIMITS = { free: 10, starter: 250, pro: 2000 };
 
 let _admin = null;
 function getAdminSupabase() {
@@ -35,7 +35,7 @@ router.get("/api/chief-quota", requirePortalUser(), async (req, res) => {
 
   // If no owner is linked, return free defaults — no error
   if (!ownerId) {
-    return res.status(200).json({ ok: true, used: 0, limit: 3, planKey: "free" });
+    return res.status(200).json({ ok: true, used: 0, limit: 10, planKey: "free" });
   }
 
   try {
@@ -47,7 +47,7 @@ router.get("/api/chief-quota", requirePortalUser(), async (req, res) => {
       .maybeSingle();
 
     const planKey = String(getEffectivePlanFromOwner(userRow) || "free").toLowerCase().trim();
-    const limit   = PLAN_LIMITS[planKey] ?? 3;
+    const limit   = PLAN_LIMITS[planKey] ?? 10;
 
     const ym    = ymNow(tz);
     const usage = await pg.getUsageMonthly(ownerId, ym, { createIfMissing: false });
@@ -55,8 +55,8 @@ router.get("/api/chief-quota", requirePortalUser(), async (req, res) => {
 
     return res.status(200).json({ ok: true, used, limit, planKey });
   } catch {
-    // Fail open — worst case shows 0/3
-    return res.status(200).json({ ok: true, used: 0, limit: 3, planKey: "free" });
+    // Fail open — worst case shows 0/10
+    return res.status(200).json({ ok: true, used: 0, limit: 10, planKey: "free" });
   }
 });
 

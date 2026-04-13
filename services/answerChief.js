@@ -44,13 +44,13 @@ async function enforceAskChiefGates_AND_Consume({ ownerId, ownerProfile, tz }) {
   const monthlyLimit = Number(caps?.reasoning?.ask_chief?.monthly_questions ?? 0) || 0;
 
   if (!enabled) {
-    // Free tier: allow up to 3 Ask Chief queries per month.
-    // Uses the shared ask_chief_questions column (same as paid plans, just a lower limit).
+    // Fallback for plans where ask_chief.enabled is false (should not happen for free/starter/pro).
+    // Uses a conservative limit so unexpected plan states don't grant unlimited access.
     try {
       const ym = ymInTZ(tz);
       const usage = await pg.getUsageMonthly(String(ownerId), ym);
       const trialUsed = Number(usage?.ask_chief_questions || 0);
-      const TRIAL_LIMIT = 3;
+      const TRIAL_LIMIT = 10;
 
       if (trialUsed >= TRIAL_LIMIT) {
         return {

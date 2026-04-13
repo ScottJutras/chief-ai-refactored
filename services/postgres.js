@@ -4610,6 +4610,21 @@ async function findOwnerIdByStripeCustomer(customerId) {
   return r?.rows?.[0]?.user_id || null;
 }
 
+async function findOwnerIdByEmail(email) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!e) return null;
+
+  const r = await query(
+    `select user_id
+       from public.users
+      where lower(email) = $1
+      limit 1`,
+    [e]
+  );
+
+  return r?.rows?.[0]?.user_id || null;
+}
+
 async function updateOwnerBilling(ownerId, patch = {}) {
   const id = String(ownerId || "").trim();
   if (!id) throw new Error("updateOwnerBilling: missing ownerId");
@@ -5135,6 +5150,7 @@ module.exports = {
   insertStripeEvent,
   getOwner,
   findOwnerIdByStripeCustomer,
+  findOwnerIdByEmail,
   updateOwnerBilling,
   getOwnerByDashboardToken,
   getMonthlyUsage,

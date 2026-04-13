@@ -108,6 +108,7 @@ async function stripeWebhookHandler(req, res) {
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
         const sub = event.data.object;
+        const isDeleted = event.type === "customer.subscription.deleted";
 
         const customerId = String(sub.customer || "").trim();
         const subscriptionId = String(sub.id || "").trim();
@@ -118,8 +119,28 @@ async function stripeWebhookHandler(req, res) {
         const priceId = subscriptionToPriceId(sub);
         const mappedPlanKey = priceIdToPlanKey(priceId);
 
-        // ✅ Deterministic owner mapping: customerId → owner row
-        const ownerId = await db.findOwnerIdByStripeCustomer(customerId);
+        // ✅ Deterministic owner mapping: customerId → owner row.
+        // Fallback: fetch the customer's email from Stripe and look up by email
+        // — handles cases where checkout.session.completed never stored the customer ID.
+        let ownerId = await db.findOwnerIdByStripeCustomer(customerId);
+        if (!ownerId && customerId) {
+          try {
+            const customer = await stripe.customers.retrieve(customerId);
+            if (customer && !customer.deleted && customer.email) {
+              ownerId = await db.findOwnerIdByEmail(customer.email);
+              if (ownerId) {
+                // Backfill the customer ID so future events resolve directly
+                await db.updateOwnerBilling(ownerId, { stripe_customer_id: customerId });
+                console.log("[STRIPE] resolved owner via email fallback and backfilled customer ID", {
+                  customerId, ownerId, email: customer.email,
+                });
+              }
+            }
+          } catch (e) {
+            console.warn("[STRIPE] email fallback lookup failed:", e?.message);
+          }
+        }
+
         if (!ownerId) {
           console.warn("[STRIPE] subscription event but no owner found for customer", customerId, {
             eventType: event.type,
@@ -149,11 +170,13 @@ async function stripeWebhookHandler(req, res) {
           plan_key: isEntitled ? mappedPlanKey : "free",
           sub_status: status,
           stripe_customer_id: customerId || null,
-          stripe_subscription_id: subscriptionId || null,
-          stripe_price_id: priceId || null,
-          cancel_at_period_end: cancelAtPeriodEnd,
+          // On deletion, clear the subscription/price so getEffectivePlanKey
+          // never sees a stale plan_key from a cancelled sub without a status.
+          stripe_subscription_id: isDeleted ? null : (subscriptionId || null),
+          stripe_price_id: isDeleted ? null : (priceId || null),
+          cancel_at_period_end: isDeleted ? false : cancelAtPeriodEnd,
           current_period_start: periodStart,
-          current_period_end: periodEnd,
+          current_period_end: isDeleted ? null : periodEnd,
         });
 
         break;

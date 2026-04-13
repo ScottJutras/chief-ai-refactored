@@ -2528,7 +2528,7 @@ if (/^chiefonboarding\b/i.test(lc2Clean)) {
 
           return ok(
             res,
-            `✅ WhatsApp linked.\n\nNow you can try:\n• expense $18 Home Depot\n• revenue $500 deposit`
+            `✅ You're connected to ChiefOS!\n\nHere's what you can tell me:\n\n💰 MONEY\n• expense $45 gas\n• revenue $2,000 deposit\n• overhead $850 rent\n\n⏱ TIME\n• clock in [job name]\n• clock out\n• time 3.5h framing [job name]\n\n🏗 JOBS\n• new job Kitchen Reno for Smith\n• jobs list\n• job status Kitchen Reno\n\n📋 QUOTES, INVOICES & CHANGE ORDERS\n• quote Smith $4,500 deck build\n• invoice Smith $2,000\n• change order Kitchen Reno +$600 extra tile\n\n✅ TASKS & REMINDERS\n• task call supplier re: lumber\n• remind me Friday to submit payroll\n\n📎 RECEIPTS\n• send a photo + description\n\n📊 REPORTS\n• profit this month\n• expenses last week\n• job kpis Kitchen Reno\n\nSave this message — come back any time to see what's possible.`
           );
         } catch (e) {
           console.warn('[LINK] redeem failed:', e?.message);

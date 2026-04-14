@@ -3,7 +3,8 @@ const express = require("express");
 const crypto = require("crypto");
 const pg = require("../services/postgres");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
-const { sendSMS, sendWhatsApp } = require("../services/twilio");
+const { sendSMS } = require("../services/twilio");
+const { sendEmail } = require("../services/postmark");
 
 const PLAN_LIMITS = {
   free:    { employees: 3,  board: 0  },
@@ -828,15 +829,7 @@ router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res
     let deliveryOk = false;
     let deliveryError = null;
 
-    if (deliveryMethod === "whatsapp" && phoneDigits) {
-      try {
-        await sendWhatsApp("+" + phoneDigits, inviteMsg);
-        deliveryOk = true;
-      } catch (e) {
-        deliveryError = String(e?.message || "WhatsApp delivery failed");
-        console.warn("[CREW_INVITE] WhatsApp send failed:", deliveryError);
-      }
-    } else if (deliveryMethod === "sms" && phoneDigits) {
+    if (deliveryMethod === "sms" && phoneDigits) {
       try {
         await sendSMS("+" + phoneDigits, inviteMsg);
         deliveryOk = true;
@@ -844,8 +837,32 @@ router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res
         deliveryError = String(e?.message || "SMS delivery failed");
         console.warn("[CREW_INVITE] SMS send failed:", deliveryError);
       }
+    } else if (deliveryMethod === "email" && email) {
+      try {
+        await sendEmail({
+          to: email,
+          subject: "You've been invited to ChiefOS",
+          textBody: inviteMsg,
+          htmlBody: `
+            <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px 16px">
+              <p style="font-size:20px;font-weight:600;color:#111">You've been invited to join ChiefOS</p>
+              <p style="color:#555">Tap the button below to get started. The link expires in 7 days.</p>
+              <a href="${inviteUrl}"
+                 style="display:inline-block;margin-top:16px;padding:12px 24px;background:#D4A853;color:#0C0B0A;font-weight:600;border-radius:10px;text-decoration:none">
+                Accept invite
+              </a>
+              <p style="margin-top:24px;color:#999;font-size:12px">
+                Or copy this link: <a href="${inviteUrl}" style="color:#D4A853">${inviteUrl}</a>
+              </p>
+            </div>
+          `,
+        });
+        deliveryOk = true;
+      } catch (e) {
+        deliveryError = String(e?.message || "Email delivery failed");
+        console.warn("[CREW_INVITE] Email send failed:", deliveryError);
+      }
     }
-    // 'email' method: no mail service — invite record created, link returned for manual send
 
     return res.json({ ok: true, item: { id: out.id, token: out.token, inviteUrl, expires_at: out.expires_at, deliveryMethod, deliveryOk, deliveryError } });
   } catch (e) {

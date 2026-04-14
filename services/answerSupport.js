@@ -49,16 +49,20 @@ Troubleshooting: If the code expired, tap "New code" on the welcome page. Make s
 Free ($0/month):
   - 10 Ask Chief questions/month
   - Up to 3 jobs, 3 employees
+  - Employee time clock via WhatsApp (all tiers include this)
+  - Employee web portal (PWA)
   - Expense + revenue + time capture via WhatsApp
   - CSV export, 90-day history
 
 Starter ($59/month):
   - 250 Ask Chief questions/month
   - Up to 25 jobs, 10 employees
+  - Employee tasks & reminders
+  - Employee mileage logging via WhatsApp
+  - Employee job site photo submission
   - Receipt scanner (send a photo of a receipt on WhatsApp)
   - Voice expense logging (send a voice note)
   - Documents: quotes, invoices, contracts
-  - Tasks and reminders
   - Job site photos and notes
   - PDF/XLS/CSV exports, 3-year history
   - Bulk import
@@ -66,6 +70,7 @@ Starter ($59/month):
 Pro ($149/month):
   - 2,000 Ask Chief questions/month
   - Unlimited jobs, up to 50 employees + 5 board members
+  - Employee expense & revenue submission (goes to owner pending-review queue)
   - Crew self-logging via WhatsApp
   - Time entry approvals and edit requests
   - Forecasting
@@ -96,9 +101,13 @@ Chief logs the duration and links it to the job.
 To review hours: portal Time Clock tab.
 
 === EMPLOYEES ===
-Invite via portal: Settings > Team > Invite.
-On Free: up to 3 employees. Starter: up to 10. Pro: up to 50.
-On Pro: crew can self-log time and expenses via their own WhatsApp.
+Invite via portal: Settings > Team > Invite (send an SMS link or email magic link).
+Employee time clock via WhatsApp is available on ALL plans (Free, Starter, Pro).
+On Free: up to 3 employees — time clock only.
+On Starter: up to 10 employees — time clock + tasks, mileage logging, job site photo submission.
+On Pro: up to 50 employees + 5 board members — everything in Starter + expense/revenue submission (goes into a pending-review queue for the owner to approve or decline before it hits the books).
+Board members can use all OS features but cannot access Ask Chief (financial intelligence is owner-only).
+Employees get their own limited web portal — they can only see their own time, tasks, and submissions.
 
 === COMMON TROUBLESHOOTING ===
 WhatsApp not linking:       Send the exact 4-6 digit code from the welcome page to +1 (231) 680-2664. Tap "New code" if expired.

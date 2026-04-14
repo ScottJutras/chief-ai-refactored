@@ -48,7 +48,16 @@ function mustCtx(req) {
   const ownerId = String(req.ownerId || "").trim();
   const role = String(req.portalRole || "").trim();
 
-  if (!tenantId || !actorId) {
+  if (!tenantId) {
+    const err = new Error("Access not resolved. Please re-authenticate.");
+    err.code = "TENANT_CTX_MISSING";
+    throw err;
+  }
+
+  // actorId may be absent when the owner's email hasn't been linked in
+  // chiefos_actor_identities yet. Owners/admins can proceed — their portalRole
+  // (set by requirePortalUser from chiefos_portal_users) is the auth authority.
+  if (!actorId && role !== "owner" && role !== "admin") {
     const err = new Error("Access not resolved. Please re-authenticate.");
     err.code = "TENANT_CTX_MISSING";
     throw err;

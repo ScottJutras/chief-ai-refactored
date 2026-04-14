@@ -6,9 +6,9 @@ const { requirePortalUser } = require("../middleware/requirePortalUser");
 const { sendSMS } = require("../services/twilio");
 
 const PLAN_LIMITS = {
-  free:    { employees: 3,   board: 0  },
-  starter: { employees: 25,  board: 25 },
-  pro:     { employees: 150, board: 25 },
+  free:    { employees: 3,  board: 0  },
+  starter: { employees: 10, board: 5  },
+  pro:     { employees: 50, board: 5  },
 };
 
 async function getPlanKey(ownerId, client) {
@@ -84,8 +84,11 @@ async function getActorRole({ tenantId, actorId }, client) {
   return r?.rows?.[0]?.role || null;
 }
 
-function mustOwnerOrAdmin(role) {
-  if (role !== "owner" && role !== "admin") {
+// Accepts actorRole (from chiefos_tenant_actors) with portalRole as fallback.
+// portalRole is authoritative from chiefos_portal_users via requirePortalUser.
+function mustOwnerOrAdmin(actorRole, portalRole = null) {
+  const effective = actorRole || portalRole;
+  if (effective !== "owner" && effective !== "admin") {
     const err = new Error("Permission denied");
     err.code = "PERMISSION_DENIED";
     throw err;
@@ -215,8 +218,8 @@ router.get("/admin/members", requirePortalUser(), async (req, res) => {
     const { tenantId, actorId, ownerId } = mustCtx(req);
 
     const out = await pg.withClient(async (client) => {
-      const role = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(role);
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       await ensureOwnerProfiles({ tenantId }, client);
 
@@ -284,8 +287,8 @@ router.get("/admin/assignments", requirePortalUser(),async (req, res) => {
     const { tenantId, actorId } = mustCtx(req);
 
     const out = await pg.withClient(async (client) => {
-      const role = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(role);
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       const r = await client.query(
         `
@@ -342,8 +345,8 @@ router.post("/admin/members", requirePortalUser(), express.json(), async (req, r
     }
 
     const out = await pg.withClient(async (client) => {
-      const role = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(role);
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       const planKey = await getPlanKey(ownerId, client);
       await assertLimits({ tenantId, planKey }, client, { addingRole: "employee" });
@@ -462,8 +465,8 @@ router.patch("/admin/members/:actorId/role", requirePortalUser(), express.json()
     if (!["employee", "board", "admin"].includes(newRole)) return jsonErr(res, 400, "INVALID_ROLE", "Invalid role.");
 
     const out = await pg.withClient(async (client) => {
-      const role = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(role);
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       if (targetActorId === actorId && newRole !== role) {
         const err = new Error("Cannot change your own role here");
@@ -539,8 +542,8 @@ router.delete("/admin/members/:actorId", requirePortalUser(),async (req, res) =>
     if (!targetActorId) return jsonErr(res, 400, "MISSING_TARGET", "Missing actorId.");
 
     const out = await pg.withClient(async (client) => {
-      const role = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(role);
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       if (targetActorId === actorId) {
         const err = new Error("You can’t remove yourself.");
@@ -627,8 +630,8 @@ router.get("/admin/members/export.csv", requirePortalUser(),async (req, res) => 
     const { tenantId, actorId } = mustCtx(req);
 
     const rows = await pg.withClient(async (client) => {
-      const role = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(role);
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       const r = await client.query(
         `
@@ -705,8 +708,8 @@ router.post("/admin/assign", requirePortalUser(),express.json(), async (req, res
     }
 
     const out = await pg.withClient(async (client) => {
-      const role = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(role);
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       const chk = await client.query(
         `
@@ -793,7 +796,7 @@ router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res
 
     const out = await pg.withClient(async (client) => {
       const actorRole = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(actorRole);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       const r = await client.query(
         `
@@ -839,8 +842,8 @@ router.get("/admin/invites", requirePortalUser(),async (req, res) => {
     const { tenantId, actorId } = mustCtx(req);
 
     const out = await pg.withClient(async (client) => {
-      const role = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(role);
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
 
       const r = await client.query(
         `

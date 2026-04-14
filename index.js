@@ -181,9 +181,9 @@ app.use(receiptsRouter);
 app.use("/api", portalRouter);
 app.use(jobsPortalRouter);
 // ✅ Crew+Control (Pro-gated) — portal-auth required
-app.use("/api/crew", requirePortalUser, require("./routes/crewControl"));
+app.use("/api/crew", requirePortalUser(), require("./routes/crewControl"));
 app.use("/api/crew", crewAdminRouter);
-app.use("/api/crew", requirePortalUser, require("./routes/crewReview"));
+app.use("/api/crew", requirePortalUser(), require("./routes/crewReview"));
 // Public invite-claim (no portal membership required)
 app.use("/api/invite", inviteClaimRouter);
 // AskChief defines POST /api/ask-chief internally

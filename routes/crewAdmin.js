@@ -166,7 +166,7 @@ async function ensureOwnerProfiles({ tenantId }, client) {
  * GET /api/crew/admin/members
  * Owner/admin view of all actors + profiles.
  */
-router.get("/admin/members", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
+router.get("/admin/members", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -219,7 +219,7 @@ router.get("/admin/members", requirePortalUser, requireCrewControlStarter(), asy
  *
  * Returns: { ok: true, items: [{ employee_actor_id, board_actor_id, active }] }
  */
-router.get("/admin/assignments", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
+router.get("/admin/assignments", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -260,7 +260,7 @@ router.get("/admin/assignments", requirePortalUser, requireCrewControlStarter(),
  * Body: { display_name, phone, email }
  * Creates (or reuses) an employee actor + membership + profile + identities.
  */
-router.post("/admin/members", requirePortalUser, requireCrewControlStarter(), express.json(), async (req, res) => {
+router.post("/admin/members", requirePortalUser(), requireCrewControlStarter(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -390,7 +390,7 @@ router.post("/admin/members", requirePortalUser, requireCrewControlStarter(), ex
  * PATCH /api/crew/admin/members/:actorId/role
  * Body: { role: 'employee'|'board'|'admin' }
  */
-router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewControlStarter(), express.json(), async (req, res) => {
+router.patch("/admin/members/:actorId/role", requirePortalUser(), requireCrewControlStarter(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
     const targetActorId = String(req.params.actorId || "").trim();
@@ -469,7 +469,7 @@ router.patch("/admin/members/:actorId/role", requirePortalUser, requireCrewContr
  * - cannot delete owner
  * - cannot delete yourself
  */
-router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
+router.delete("/admin/members/:actorId", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
     const targetActorId = String(req.params.actorId || "").trim();
@@ -559,7 +559,7 @@ router.delete("/admin/members/:actorId", requirePortalUser, requireCrewControlSt
  * GET /api/crew/admin/members/export.csv
  * Owner/admin exports members as CSV.
  */
-router.get("/admin/members/export.csv", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
+router.get("/admin/members/export.csv", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -628,7 +628,7 @@ router.get("/admin/members/export.csv", requirePortalUser, requireCrewControlSta
  * POST /api/crew/admin/assign
  * Body: { employee_actor_id, board_actor_id }
  */
-router.post("/admin/assign", requirePortalUser, requireCrewControlStarter(), express.json(), async (req, res) => {
+router.post("/admin/assign", requirePortalUser(), requireCrewControlStarter(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
     const employeeActorId = String(req.body?.employee_actor_id || "").trim();
@@ -710,7 +710,7 @@ router.post("/admin/assign", requirePortalUser, requireCrewControlStarter(), exp
  * Body: { employee_name, phone?, email?, role? }
  * Owner creates an invite link and optionally sends it via SMS.
  */
-router.post("/admin/invite", requirePortalUser, requireCrewControlStarter(), express.json(), async (req, res) => {
+router.post("/admin/invite", requirePortalUser(), requireCrewControlStarter(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId, ownerId } = mustCtx(req);
 
@@ -771,7 +771,7 @@ router.post("/admin/invite", requirePortalUser, requireCrewControlStarter(), exp
  * GET /api/crew/admin/invites
  * Owner lists pending (unclaimed) invites for their tenant.
  */
-router.get("/admin/invites", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
+router.get("/admin/invites", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 

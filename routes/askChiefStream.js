@@ -20,6 +20,8 @@ const { requirePortalUser }     = require("../middleware/requirePortalUser");
 const { runToolPhaseSync }      = require("../services/agent");
 const { enforceAskChiefGates_AND_Consume } = require("../services/answerChief");
 const { LLMProvider }           = require("../services/llm");
+const { looksLikeSupportQuestion } = require("../services/orchestrator");
+const { answerSupport }         = require("../services/answerSupport");
 
 const ASK_CHIEF_REQUIRE_PLAN  = String(process.env.ASK_CHIEF_REQUIRE_PLAN || "1") === "1";
 const STREAM_TIMEOUT_MS       = Number(process.env.ASK_CHIEF_STREAM_TIMEOUT_MS || 25000);
@@ -150,6 +152,36 @@ router.post("/api/ask-chief/stream", express.json(), async (req, res) => {
 
   if (authMode === "portal" && tenantId && !ownerId) {
     return res.status(200).json(NOT_LINKED_BODY);
+  }
+
+  // ---- Support gate (BEFORE quota) — product help never consumes a question ----
+  if (looksLikeSupportQuestion(text)) {
+    const supportAnswer = await answerSupport({ text, ownerId: ownerId || "" });
+    const answer = supportAnswer ||
+      "I don't have docs for that yet. Try checking usechiefos.com/help or ask in a different way.";
+
+    const wantsSSE = (req.headers.accept || "").includes("text/event-stream");
+    if (!wantsSSE) {
+      return res.status(200).json({
+        ok: true, answer,
+        evidence_meta: buildEvidenceMeta({ range, tenantId, tz, actorKey }),
+        support: true, traceId,
+      });
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
+    sseWrite(res, { token: answer });
+    sseWrite(res, {
+      done: true, ok: true, answer,
+      evidence_meta: buildEvidenceMeta({ range, tenantId, tz, actorKey }),
+      support: true, traceId,
+    });
+    sseDone(res);
+    return;
   }
 
   // ---- Plan gate (mirrors askChief.js exactly) ----

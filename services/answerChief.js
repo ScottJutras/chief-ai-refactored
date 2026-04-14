@@ -154,8 +154,9 @@ try {
   context: { ...context, ownerProfile, actorMemory }
 });
 
-    // 2) If action route: DO NOT Ask-Chief gate. This preserves Free-tier capture.
-  if (decision?.route === "action") return decision;
+    // 2) If action or support route: DO NOT Ask-Chief gate.
+  // Action = writes (expense, clock, task). Support = product help (no quota consumed).
+  if (decision?.route === "action" || decision?.route === "support") return decision;
 
   // 3) If reasoning route: enforce plan + quota (fail-closed) + consume quota before answering.
   const gate = await enforceAskChiefGates_AND_Consume({ ownerId: ownerIdNorm, ownerProfile, tz });

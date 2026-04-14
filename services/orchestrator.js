@@ -27,30 +27,98 @@ function DIGITS(x) {
   return String(x ?? "").replace(/\D/g, "");
 }
 
-function looksLikeHowToOrDefinition(text) {
+// ── Support question classifier ──────────────────────────────────────────────
+// Returns true for product help / how-to / troubleshooting / feature questions.
+// Returns false for questions that require querying the user's own business data.
+// Exported so askChiefStream.js can use it before the quota gate.
+function looksLikeSupportQuestion(text) {
   const s = lc(text);
 
-  // If it contains finance metrics, treat as insight (NOT a definition request)
-    if (/\b(profitability|profit|revenue|spend|spent|expenses?|cash ?flow|margin|kpi|invoice|paid)\b/.test(s)) {
-    return false;
-  }
+  // ── Guard: personal financial data signals always route to BI (quota) ───────
+  // These patterns indicate the user wants info FROM their own data, not a how-to.
+  const DATA_SIGNALS = [
+    /\bhow\s+much\s+(did\s+i|have\s+i|do\s+i\s+owe|did\s+we)\b/,
+    /\bwhat\s+(did\s+i|do\s+i|have\s+i)\s+(spend|earn|make|owe|log)\b/,
+    // “my profit/revenue/expenses this month” etc.
+    /\bmy\s+(profit|revenue|expenses?|spending|margin|overhead|costs?)\b.*\b(this|last|today|week|month|quarter|year)\b/,
+    /\blast\s+\d+\s+days?\b/,
+    /\blast\s+(week|month|quarter|year)\b/,
+    /\bthis\s+(week|month|quarter|year)\b.*\b(spend|profit|revenue|margin|cost|expense)\b/,
+    /\b(mtd|ytd|wtd)\b/,
+    /\bjob\s+(kpis?|p&l|profitability|margin|revenue|cost)\b/,
+    /\bwhich\s+job\s+(is|made|was|has)\b/,
+    /\btop\s+\d+\s+(jobs?|expenses?)\b/,
+    /\b(show|give)\s+me\s+(my|the)\b.{0,40}\b(profit|revenue|expenses?|spending|summary|report)\b/,
+    /\bhow('?s|\s+is)\s+(my|the)\s+(business|cashflow|cash\s+flow|profit|margin)\b/,
+  ];
 
-  // How-to / help intent
-  if (/\bhow do i\b|\bhow to\b|\bdefine\b|\bmeaning\b|\bhelp\b|\bguide\b|\bhow can i\b/.test(s)) {
-    return true;
-  }
+  if (DATA_SIGNALS.some((rx) => rx.test(s))) return false;
 
-  // Contractor vocabulary terms (OK for RAG)
-  if (/\bretainage\b|\bholdback\b|\bprogress billing\b|\bchange order\b/.test(s)) {
-    return true;
-  }
+  // ── Support signals ──────────────────────────────────────────────────────────
+  const SUPPORT_SIGNALS = [
+    // How-to intent
+    /\bhow\s+do\s+i\b/,
+    /\bhow\s+to\b/,
+    /\bhow\s+can\s+i\b/,
+    /\bhow\s+does\s+(this|chief|chiefos)\b/,
+    /\bwhat\s+should\s+i\b/,
+    /\bwalk\s*me\s+through\b/,
+    /\bstep[\s-]by[\s-]step\b/,
 
-  // Only allow "what is" if it's a contractor term (prevents “what is my profit”)
-  if (/\bwhat is\b/.test(s) && /\b(retainage|holdback|change order|progress billing)\b/.test(s)) {
-    return true;
-  }
+    // Setup and configuration
+    /\bset\s*up\b|\bsetup\b/,
+    /\bconfigure\b|\binstall\b/,
+    /\bhow\s+to\s+(add|create|link|connect|invite|import|export|set)\b/,
+    /\blink\s+(my\s+)?whatsapp\b/,
+    /\badd\s+(my\s+)?phone\b|\bconnect\s+(my\s+)?phone\b/,
 
-  return false;
+    // Troubleshooting
+    /\bnot\s+working\b|\bwon'?t\s+work\b/,
+    /\bbroken\b/,
+    /\bi\s+can'?t\b/,
+    /\bwhy\s+(isn'?t|won'?t|doesn'?t|can'?t|don'?t)\b/,
+    /\b(problem|issue|trouble|error|bug)\s+(with|linking|connecting|using|setting)\b/,
+
+    // Feature / product questions
+    /\bwhat\s+is\s+(a\s+)?(job|overhead|task|expense|chiefos|chief|starter|pro|free\s+plan|subscription)\b/,
+    /\bwhat\s+(can|does|will)\s+(chief|chiefos)\b/,
+    /\bwhat'?s\s+included\b/,
+    /\bwhat\s+features?\b|\bwhat\s+plans?\b/,
+    /\bwhat('s|\s+is)\s+the\s+difference\b/,
+    /\bhow\s+does\s+(chief|chiefos|overhead|timeclock|job|expense|receipt)\s+(work|function)\b/,
+
+    // Navigation
+    /\bwhere\s+(do\s+i|can\s+i|is\s+the)\b.{0,50}(find|see|view|check|export|download)\b/,
+    /\bhow\s+do\s+i\s+(find|see|view|access|export|download|navigate)\b/,
+
+    // Billing / pricing (plan questions — NOT “how much did I spend”)
+    /\bpricing\b/,
+    /\bhow\s+much\s+(does|is\s+the|do\s+plans)\b/,
+    /\b(upgrade|downgrade)\s+(my\s+)?(plan|subscription)\b/,
+    /\bcancel\s+my\s+(plan|subscription)\b/,
+    /\bchange\s+my\s+(plan|subscription)\b/,
+    /\bwhat'?s\s+(starter|pro|free)\s+plan\b/,
+
+    // Explanatory / educational
+    /\bexplain\b/,
+    /\bwhat\s+does\b.{0,40}\bmean\b/,
+    /\bdifference\s+between\b|\bcompared?\s+to\b/,
+    /\bwhen\s+should\s+i\s+use\b/,
+    /\bwhy\s+(should|would|do)\s+i\b/,
+
+    // Contractor terms — safe for documentation lookup
+    /\bretainage\b|\bholdback\b/,
+    /\bprogress\s+billing\b|\bchange\s+order\b/,
+
+    // General help / confusion
+    /^\s*help\s*$/,
+    /^\s*\?\s*$/,
+    /\bhelp\s+me\b/,
+    /\bi\s+need\s+help\b/,
+    /\bi('m|\s+am)\s+(confused|lost|stuck)\b/,
+  ];
+
+  return SUPPORT_SIGNALS.some((rx) => rx.test(s));
 }
 
 function looksLikeTimeclock(text) {
@@ -433,17 +501,18 @@ return { ok: true, route: "action", answer: msg, evidence: { sql: [], facts_used
 
   // 2) Reasoning routes (do NOT execute here — return run() for answerChief to call after gates)
 
-  if (looksLikeHowToOrDefinition(rawText)) {
+  if (looksLikeSupportQuestion(rawText)) {
     return {
       ok: true,
-      route: "reasoning",
-      kind: "rag",
+      route: "support",
+      kind: "product_help",
       run: async () => {
-        const ans = await ragAnswer({ text: rawText, ownerId });
+        const { answerSupport } = require("./answerSupport");
+        const ans = await answerSupport({ text: rawText, ownerId });
         return {
           ok: true,
-          route: "rag",
-          answer: ans || `I don’t have that in docs yet.`,
+          route: "support",
+          answer: ans || "I don’t have that in my docs yet. Try asking a different way or visit usechiefos.com/help.",
           evidence: { sql: [], facts_used: 0 },
         };
       },
@@ -592,4 +661,4 @@ if (looksLikeInsightQuestion(rawText)) {
   };
 }
 
-module.exports = { orchestrateChief };
+module.exports = { orchestrateChief, looksLikeSupportQuestion };

@@ -80,6 +80,7 @@ function normalizePhoneDigits(input) {
 }
 
 async function getActorRole({ tenantId, actorId }, client) {
+  if (!actorId) return null; // empty string would cause 22P02 UUID cast error
   const r = await client.query(
     `
     select role

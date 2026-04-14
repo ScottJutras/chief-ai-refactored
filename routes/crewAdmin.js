@@ -823,29 +823,31 @@ router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res
     const appBase = String(process.env.APP_BASE_URL || "https://app.usechiefos.com").replace(/\/$/, "");
     const inviteUrl = `${appBase}/invite/${out.token}`;
 
-    // Deliver invite via chosen method (non-fatal)
+    // Deliver invite via chosen method — always non-fatal, surface result to caller
+    const inviteMsg = `You've been invited to join ChiefOS. Tap to get started:\n${inviteUrl}\n\nLink expires in 7 days.`;
+    let deliveryOk = false;
+    let deliveryError = null;
+
     if (deliveryMethod === "whatsapp" && phoneDigits) {
       try {
-        await sendWhatsApp(
-          "+" + phoneDigits,
-          `You've been invited to join ChiefOS. Tap to get started:\n${inviteUrl}\n\nLink expires in 7 days.`
-        );
+        await sendWhatsApp("+" + phoneDigits, inviteMsg);
+        deliveryOk = true;
       } catch (e) {
-        console.warn("[CREW_INVITE] WhatsApp send failed (non-fatal):", e?.message);
+        deliveryError = String(e?.message || "WhatsApp delivery failed");
+        console.warn("[CREW_INVITE] WhatsApp send failed:", deliveryError);
       }
     } else if (deliveryMethod === "sms" && phoneDigits) {
       try {
-        await sendSMS(
-          "+" + phoneDigits,
-          `You've been invited to join ChiefOS. Tap to get started:\n${inviteUrl}\n\nLink expires in 7 days.`
-        );
+        await sendSMS("+" + phoneDigits, inviteMsg);
+        deliveryOk = true;
       } catch (e) {
-        console.warn("[CREW_INVITE] SMS send failed (non-fatal):", e?.message);
+        deliveryError = String(e?.message || "SMS delivery failed");
+        console.warn("[CREW_INVITE] SMS send failed:", deliveryError);
       }
     }
-    // 'email' method: no mail service configured — caller receives inviteUrl to share manually
+    // 'email' method: no mail service — invite record created, link returned for manual send
 
-    return res.json({ ok: true, item: { id: out.id, token: out.token, inviteUrl, expires_at: out.expires_at } });
+    return res.json({ ok: true, item: { id: out.id, token: out.token, inviteUrl, expires_at: out.expires_at, deliveryMethod, deliveryOk, deliveryError } });
   } catch (e) {
     const code = e?.code || "CREATE_INVITE_FAILED";
     const status = code === "TENANT_CTX_MISSING" ? 403 : code === "PERMISSION_DENIED" ? 403 : 500;

@@ -121,7 +121,7 @@ async function notifyCreatorWhatsApp({ tenantId, createdByActorId, text }, clien
 /**
  * GET /api/crew/review/inbox
  */
-router.get("/review/inbox", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+router.get("/review/inbox", requirePortalUser(), requireCrewControlPro(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -181,7 +181,7 @@ router.get("/review/inbox", requirePortalUser, requireCrewControlPro(), async (r
  * - edit text: edited_text OR content_text
  * - notes: notes OR note OR reason
  */
-router.patch("/review/:logId", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
+router.patch("/review/:logId", requirePortalUser(), requireCrewControlPro(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId, ownerId } = mustCtx(req);
     const logId = String(req.params.logId || "").trim();
@@ -465,7 +465,7 @@ router.patch("/review/:logId", requirePortalUser, requireCrewControlPro(), expre
  * GET /api/crew/review/expenses/pending
  * Owner/admin/board: list transactions with submission_status = 'pending_review'.
  */
-router.get("/review/expenses/pending", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+router.get("/review/expenses/pending", requirePortalUser(), requireCrewControlPro(), async (req, res) => {
   try {
     const { tenantId, actorId, ownerId } = mustCtx(req);
 
@@ -518,7 +518,7 @@ router.get("/review/expenses/pending", requirePortalUser, requireCrewControlPro(
  * Body: { action: 'approve' | 'decline', reviewer_note? }
  * Updates submission_status on the transaction.
  */
-router.patch("/review/expenses/:id", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
+router.patch("/review/expenses/:id", requirePortalUser(), requireCrewControlPro(), express.json(), async (req, res) => {
   try {
     const { tenantId, actorId, ownerId } = mustCtx(req);
     const txId = String(req.params.id || "").trim();

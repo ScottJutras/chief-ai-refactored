@@ -103,6 +103,7 @@ const accountRouter = require("./routes/account");
 const receiptsRouter = require("./routes/receipts");
 const portalRouter = require("./routes/portal");
 const crewAdminRouter = require("./routes/crewAdmin");
+const inviteClaimRouter = require("./routes/inviteClaim");
 const jobsPortalRouter = require("./routes/jobsPortal");
 const catalogRouter = require("./routes/catalog");
 const integrityRouter = require("./routes/integrity");
@@ -183,6 +184,8 @@ app.use(jobsPortalRouter);
 app.use("/api/crew", requirePortalUser, require("./routes/crewControl"));
 app.use("/api/crew", crewAdminRouter);
 app.use("/api/crew", requirePortalUser, require("./routes/crewReview"));
+// Public invite-claim (no portal membership required)
+app.use("/api/invite", inviteClaimRouter);
 // AskChief defines POST /api/ask-chief internally
 app.use(askChiefRouter);
 // AskChief SSE stream: POST /api/ask-chief/stream

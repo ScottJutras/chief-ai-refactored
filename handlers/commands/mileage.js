@@ -5,6 +5,9 @@
 'use strict';
 
 const { getPool } = require('../../services/postgres');
+const { canEmployeeLogMileage } = require('../../src/config/checkCapability');
+const { logCapabilityDenial } = require('../../src/lib/capabilityDenials');
+const { getEffectivePlanFromOwner } = require('../../src/config/effectivePlan');
 
 // CRA 2024 rates (cents per km)
 const CRA_RATE_FIRST_5000  = 72; // $0.72/km
@@ -124,15 +127,18 @@ function calcDeductible(distance, unit, country, ytdKmBefore) {
 
 /**
  * Insert a mileage log and return the row.
+ * employeeUserId is non-null when an employee (non-owner) submits.
  */
-async function insertMileageLog(pool, { tenantId, ownerId, distance, unit, origin, destination, jobName, tripDate, rateCents, deductibleCents, sourceMsgId }) {
+async function insertMileageLog(pool, { tenantId, ownerId, employeeUserId, distance, unit, origin, destination, jobName, tripDate, rateCents, deductibleCents, sourceMsgId }) {
   const result = await pool.query(
     `INSERT INTO mileage_logs
-       (tenant_id, owner_id, job_name, trip_date, origin, destination,
+       (tenant_id, owner_id, employee_user_id, job_name, trip_date, origin, destination,
         distance, unit, rate_cents, deductible_cents, source_msg_id, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW(),NOW())
+     ON CONFLICT (owner_id, source_msg_id) DO NOTHING
      RETURNING id`,
-    [tenantId, ownerId, jobName || null, tripDate, origin || null, destination || null,
+    [tenantId, ownerId, employeeUserId || null, jobName || null, tripDate,
+     origin || null, destination || null,
      distance, unit, rateCents, deductibleCents, sourceMsgId || null]
   );
   return result.rows[0];
@@ -140,8 +146,33 @@ async function insertMileageLog(pool, { tenantId, ownerId, distance, unit, origi
 
 /**
  * Main handler for mileage messages.
+ * isOwner: boolean — false when an employee is the sender.
+ * ownerProfile: the owner's profile object (used for plan resolution).
+ * paUserId: the actor's phone digits (for employee attribution).
  */
-async function handleMileage({ text, ownerId, tenantId, country, sourceMsgId }) {
+async function handleMileage({ text, ownerId, tenantId, country, sourceMsgId, isOwner, ownerProfile, paUserId }) {
+  // ✅ Plan gate: employees need Starter+ to self-log mileage
+  if (!isOwner) {
+    const plan = getEffectivePlanFromOwner(ownerProfile);
+    const gate = canEmployeeLogMileage(plan);
+    if (!gate.allowed) {
+      try {
+        await logCapabilityDenial(getPool(), {
+          owner_id: String(ownerId || '').trim(),
+          user_id: String(paUserId || '').trim(),
+          actor_role: 'employee',
+          plan,
+          capability: 'mileage',
+          reason_code: gate.reason_code,
+          upgrade_plan: gate.upgrade_plan || null,
+          source_msg_id: sourceMsgId || null,
+          context: { handler: 'mileage.handleMileage' },
+        });
+      } catch {}
+      return gate.message || 'Employee mileage logging is available on Starter and Pro. Ask your employer to upgrade.';
+    }
+  }
+
   const dist = parseDistance(text);
   if (!dist) {
     return 'I couldn\'t read the distance. Try: "drove 45km to the Harris job" or "35 miles to site."';
@@ -150,6 +181,7 @@ async function handleMileage({ text, ownerId, tenantId, country, sourceMsgId }) 
   const { distance, unit } = dist;
   const jobName = parseJobName(text);
   const tripDate = parseDate(text);
+  const employeeUserId = isOwner ? null : (String(paUserId || '').trim() || null);
 
   const pool = getPool();
 
@@ -169,6 +201,7 @@ async function handleMileage({ text, ownerId, tenantId, country, sourceMsgId }) 
   await insertMileageLog(pool, {
     tenantId,
     ownerId,
+    employeeUserId,
     distance,
     unit,
     origin: null,

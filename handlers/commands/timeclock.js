@@ -2056,27 +2056,8 @@ const role = isOwner ? "owner" : "employee";
 const crew_count = 0;
 
   const lc = String(text || '').toLowerCase().trim();
-// ✅ Optional early Gate #1 (cheap reject; handleClock still enforces)
-try {
-  if (!isOwner) {
-    const isPro = plan === 'pro' || plan === 'enterprise';
-
-    const looksLikeTimeLog =
-      /\b(clock|punch)\s+(in|out)\b/.test(lc) ||
-      /\b(break|lunch)\s+(start|stop|end)\b/.test(lc) ||
-      /\bdrive\s+(start|stop|end)\b/.test(lc) ||
-      /\b(start|end)\s+(shift|work)\b/.test(lc);
-
-    if (looksLikeTimeLog && !isPro) {
-      return twiml(
-        res,
-        `⛔ Crew self-logging is Pro only.\n\nThe owner can still log your time from their phone.\n\nUpgrade to Pro to let employees clock in/out from their own phones.`
-      );
-    }
-  }
-} catch (e) {
-  console.warn('[TIMELOCK_GATE] failed (fail-open):', e?.message);
-}
+// ✅ Gate #1 removed: employee time clock self-logging is now available on all tiers.
+// canLogTime() in handleClock() remains the authoritative gate (allows employee on all plans).
 
   try {
     // Help

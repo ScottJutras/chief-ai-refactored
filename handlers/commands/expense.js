@@ -86,7 +86,7 @@ const parseNaturalDateTz =
   });
 
 const categorizeEntry = (typeof ai.categorizeEntry === 'function' && ai.categorizeEntry) || (async () => null);
-const { canEmployeeSelfLog, getPlanOrDefault } = require("../../src/config/checkCapability");
+const { canEmployeeSelfLog, canEmployeeSubmitExpenses, getPlanOrDefault } = require("../../src/config/checkCapability");
 const { logCapabilityDenial } = require("../../src/lib/capabilityDenials");
 const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require("../../src/config/upgradeCopy");
 
@@ -5060,7 +5060,10 @@ async function insertExpenseBestEffort(pgSvc, p) {
       draft_text: p.draft_text,
       subtotal_amount: p.subtotal_amount,
       tax_amount: p.tax_amount,
-      tax_label: p.tax_label
+      tax_label: p.tax_label,
+      // ✅ Employee submission queue: pending_review until owner approves
+      submission_status: p.submission_status || 'confirmed',
+      submitted_by: p.submitted_by || null,
     });
   }
 
@@ -5251,7 +5254,7 @@ const plan = getEffectivePlanFromOwner(ownerProfile);
 
 
   if (!isOwner) {
-    const gate = canEmployeeSelfLog(plan);
+    const gate = canEmployeeSubmitExpenses(plan);
     if (!gate.allowed) {
       try {
         await logCapabilityDenial(pg, {
@@ -5262,13 +5265,18 @@ const plan = getEffectivePlanFromOwner(ownerProfile);
           capability: "expense",
           reason_code: gate.reason_code,
           upgrade_plan: gate.upgrade_plan || null,
-          source_msg_id: safeMsgId || null, // ✅ ensure safeMsgId is used here
+          source_msg_id: safeMsgId || null,
           context: { handler: "expense.handleExpense" }
         });
       } catch {}
 
-      return out(twimlText(`${PRO_CREW_UPGRADE_LINE}\n${UPGRADE_FOLLOWUP_ASK}`), false);
+      return out(twimlText(gate.message || `Employee expense submission is available on Pro. Ask your employer to upgrade.`), false);
     }
+    // ✅ Pro employee allowed: their entries go to pending_review queue.
+    // The flag is set on the transaction insert below via req.employeeSubmission.
+    // Downstream insert helpers check ownerProfile._employeeSubmission to set submission_status.
+    if (!ownerProfile) ownerProfile = {};
+    ownerProfile._employeeSubmission = { submittedBy: String(paUserId || '').trim() };
   }
 
   // ✅ Canonical PICK key used everywhere in this handler
@@ -7689,7 +7697,11 @@ const amountNumericStr = (Number.isFinite(amountCents) ? (amountCents / 100) : 0
 
   subtotal_amount: draftForSubmit?.subtotal || data?.subtotal || null,
   tax_amount: draftForSubmit?.tax || data?.tax || null,
-  tax_label: draftForSubmit?.taxLabel || data?.taxLabel || null
+  tax_label: draftForSubmit?.taxLabel || data?.taxLabel || null,
+
+  // ✅ Employee submission queue: set pending_review for Pro employees; confirmed for owner
+  submission_status: ownerProfile?._employeeSubmission ? 'pending_review' : 'confirmed',
+  submitted_by: ownerProfile?._employeeSubmission?.submittedBy || null,
 };
 
     // --- INSERT (one per line item when multi-item receipt, otherwise single) ---
@@ -7937,6 +7949,28 @@ if (confirmedStore && !/^unknown/i.test(confirmedStore)) okLines.push(`Store: ${
 if (confirmedCategory) okLines.push(`Category: ${confirmedCategory}`);
 if (confirmedDate) okLines.push(`Date: ${confirmedDate}`);
 if (confirmedJob) okLines.push(`Job: ${confirmedJob}`);
+
+// ✅ Employee pending-review variant: different message + owner notification
+if (ownerProfile?._employeeSubmission) {
+  const pendingMsg = [
+    '✅ Expense submitted for review:',
+    ...okLines.slice(1),
+    '',
+    'Your employer will review and approve it.'
+  ].join('\n');
+
+  // Notify owner via WhatsApp (best-effort, non-fatal)
+  try {
+    const ownerPhone = String(ownerProfile?.phone || ownerProfile?.owner_phone || ownerId || '').trim();
+    if (ownerPhone && typeof sendWhatsApp === 'function') {
+      const employeeName = String(userProfile?.name || userProfile?.display_name || ownerProfile?._employeeSubmission?.submittedBy || 'An employee').trim();
+      const notifyMsg = `📋 ${employeeName} submitted an expense for review:\n${okLines.slice(1).join('\n')}\n\nReply "pending expenses" to review.`;
+      sendWhatsApp(ownerPhone, notifyMsg).catch(() => {});
+    }
+  } catch {}
+
+  return out(twimlText(pendingMsg), false);
+}
 
 const okMsg = okLines.join('\n');
 

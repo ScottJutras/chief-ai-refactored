@@ -29,6 +29,8 @@ const pg = require('../services/postgres');
 const { checkMonthlyQuota } = require('../utils/quota'); // adjust path if needed
 const { shouldShowUpgradePromptOnce } = require('../src/lib/handleCapabilityDenied');
 const { getEffectivePlanFromOwner } = require('../src/config/effectivePlan');
+const { canEmployeeSubmitPhotos } = require('../src/config/checkCapability');
+const { logCapabilityDenial } = require('../src/lib/capabilityDenials');
 const { normalizeTranscriptMoney, stripLeadingFiller } = require('../utils/transcriptNormalize');
 // ✅ Preferred: resolve caps from an already-loaded ownerProfile (NO extra DB call)
 async function resolveCapsForOwnerProfile(ownerProfile) {
@@ -1130,6 +1132,34 @@ if (isImage) {
   const userExplicitlyRequestedOcr =
     /\b(ocr|scan|read|extract|parse)\b/.test(rawHint) &&
     rawHint.length <= 80;
+
+  // ── Photo gate: employees need Starter+ to submit job site photos ──────────
+  const senderDigits = DIGITS(from);
+  const ownerDigits  = DIGITS(ownerId);
+  const isSenderOwner = senderDigits && ownerDigits && senderDigits === ownerDigits;
+
+  if (!isSenderOwner) {
+    const photoGate = canEmployeeSubmitPhotos(planKey);
+    if (!photoGate.allowed) {
+      try {
+        await logCapabilityDenial(pg, {
+          owner_id: String(ownerId || '').trim(),
+          user_id: String(from || '').replace(/\D/g, ''),
+          actor_role: 'employee',
+          plan: planKey,
+          capability: 'photos',
+          reason_code: photoGate.reason_code,
+          upgrade_plan: photoGate.upgrade_plan || null,
+          source_msg_id: sourceMsgId || null,
+          context: { handler: 'media.handleMedia' },
+        });
+      } catch {}
+      return {
+        transcript: null,
+        twiml: twiml(photoGate.message || 'Job site photo submission for employees is available on Starter and Pro.'),
+      };
+    }
+  }
 
   // ── Job photo early-exit: caption explicitly marks this as a site photo ──
   // Skip OCR entirely to save quota. Resolve job + store, then return TwiML.

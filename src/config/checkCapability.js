@@ -37,19 +37,55 @@ function getCaps(plan) {
 }
 
 /**
- * Your clarified semantics:
- * - "crew logging" in Free/Starter means: owner can log time FOR crew members.
- * - Pro unlocks: employees can self-log from their own phone numbers.
- *
- * So we DO NOT gate owner time capture by role=crew unless the actor is truly an employee phone.
+ * Employee self-logging: time clock is now unlocked on all tiers.
+ * Richer features (mileage, photos, expenses) are gated separately below.
  */
 function canEmployeeSelfLog(plan) {
   const p = getPlanOrDefault(plan);
   const caps = getCaps(p);
 
   if (!caps.people || caps.people.employee_self_logging !== true) {
-    return deny("EMPLOYEE_SELF_LOGGING_REQUIRES_PRO");
+    return deny("EMPLOYEE_SELF_LOGGING_REQUIRES_STARTER");
   }
+  return allow();
+}
+
+/** Employee mileage logging: Starter+ */
+function canEmployeeLogMileage(plan) {
+  const p = getPlanOrDefault(plan);
+  const caps = getCaps(p);
+  if (!caps.people?.employee_features?.mileage) {
+    return deny("EMPLOYEE_MILEAGE_REQUIRES_STARTER");
+  }
+  return allow();
+}
+
+/** Employee job site photo submission: Starter+ */
+function canEmployeeSubmitPhotos(plan) {
+  const p = getPlanOrDefault(plan);
+  const caps = getCaps(p);
+  if (!caps.people?.employee_features?.photos) {
+    return deny("EMPLOYEE_PHOTOS_REQUIRES_STARTER");
+  }
+  return allow();
+}
+
+/** Employee expense/revenue submission to pending review queue: Pro only */
+function canEmployeeSubmitExpenses(plan) {
+  const p = getPlanOrDefault(plan);
+  const caps = getCaps(p);
+  if (!caps.people?.employee_features?.expenses) {
+    return deny("EMPLOYEE_EXPENSE_REQUIRES_PRO");
+  }
+  return allow();
+}
+
+/** Board member review/approval actions: Pro only */
+function canBoardReview(plan, role) {
+  const p = getPlanOrDefault(plan);
+  if (p !== "pro") return deny("APPROVALS_REQUIRES_PRO");
+  const r = String(role || "").toLowerCase();
+  if (r !== "owner" && r !== "board") return deny("APPROVALS_REQUIRES_PRO");
   return allow();
 }
 
@@ -166,16 +202,16 @@ function canLogTime(plan, role) {
   // owner can always log time (for self OR for named crew members)
   if (r === "owner") return allow();
 
-  // board logging is pro-only in your roadmap; allow only if pro (optional)
+  // employees can clock in/out on all tiers (time clock is universal)
+  if (r === "crew" || r === "employee") {
+    return canEmployeeSelfLog(plan); // allow() on all tiers since employee_self_logging: true everywhere
+  }
+
+  // board members can log time on Pro
   if (r === "board") {
     const p = getPlanOrDefault(plan);
     if (p !== "pro") return deny("BOARD_REQUIRES_PRO");
     return allow();
-  }
-
-  // treat "crew" as employee self-logging from their phone
-  if (r === "crew" || r === "employee") {
-    return canEmployeeSelfLog(plan);
   }
 
   // unknown role => fail safe
@@ -193,4 +229,8 @@ module.exports = {
   canUseApprovals,
   canLogTime,
   canUseTasks,
+  canEmployeeLogMileage,
+  canEmployeeSubmitPhotos,
+  canEmployeeSubmitExpenses,
+  canBoardReview,
 };

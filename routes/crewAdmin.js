@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const pg = require("../services/postgres");
 const { requireCrewControlStarter } = require("../middleware/requireCrewControlStarter");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
+const { sendSMS } = require("../services/twilio");
 
 const router = express.Router();
 
@@ -701,6 +702,102 @@ router.post("/admin/assign", requirePortalUser, requireCrewControlStarter(), exp
       500;
     console.error("[CREW_ADMIN] assign error", e?.message || e);
     return jsonErr(res, status, code, "Unable to assign employee to board.");
+  }
+});
+
+/**
+ * POST /api/crew/admin/invite
+ * Body: { employee_name, phone?, email?, role? }
+ * Owner creates an invite link and optionally sends it via SMS.
+ */
+router.post("/admin/invite", requirePortalUser, requireCrewControlStarter(), express.json(), async (req, res) => {
+  try {
+    const { tenantId, actorId, ownerId } = mustCtx(req);
+
+    const employeeName = String(req.body?.employee_name || "").trim();
+    const rawPhone = String(req.body?.phone || "").trim();
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const role = String(req.body?.role || "employee").trim();
+
+    if (!employeeName) return jsonErr(res, 400, "MISSING_NAME", "Employee name is required.");
+    if (!rawPhone && !email) return jsonErr(res, 400, "MISSING_CONTACT", "Phone or email is required to send invite.");
+    if (!["employee", "board"].includes(role)) return jsonErr(res, 400, "INVALID_ROLE", "Role must be employee or board.");
+
+    const phoneDigits = normalizePhoneDigits(rawPhone);
+    if (rawPhone && !(phoneDigits.length === 11 && phoneDigits.startsWith("1"))) {
+      return jsonErr(res, 400, "INVALID_PHONE", "Phone must be 10 digits (Canada/US) or include country code.");
+    }
+
+    const out = await pg.withClient(async (client) => {
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole);
+
+      const r = await client.query(
+        `
+        INSERT INTO public.employee_invites (tenant_id, owner_id, employee_name, phone, email, role)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, token, expires_at
+        `,
+        [tenantId, ownerId || actorId, employeeName, phoneDigits || null, email || null, role]
+      );
+      return r.rows[0];
+    });
+
+    const appBase = String(process.env.APP_BASE_URL || "https://app.usechiefos.com").replace(/\/$/, "");
+    const inviteUrl = `${appBase}/invite/${out.token}`;
+
+    // Send SMS (non-fatal)
+    if (phoneDigits) {
+      try {
+        await sendSMS(
+          "+" + phoneDigits,
+          `You've been invited to join ChiefOS. Tap to get started:\n${inviteUrl}\n\nLink expires in 7 days.`
+        );
+      } catch (smsErr) {
+        console.warn("[CREW_INVITE] SMS send failed (non-fatal):", smsErr?.message);
+      }
+    }
+
+    return res.json({ ok: true, item: { id: out.id, token: out.token, inviteUrl, expires_at: out.expires_at } });
+  } catch (e) {
+    const code = e?.code || "CREATE_INVITE_FAILED";
+    const status = code === "TENANT_CTX_MISSING" ? 403 : code === "PERMISSION_DENIED" ? 403 : 500;
+    console.error("[CREW_INVITE] create error", e?.message || e);
+    return jsonErr(res, status, code, "Unable to create invite.");
+  }
+});
+
+/**
+ * GET /api/crew/admin/invites
+ * Owner lists pending (unclaimed) invites for their tenant.
+ */
+router.get("/admin/invites", requirePortalUser, requireCrewControlStarter(), async (req, res) => {
+  try {
+    const { tenantId, actorId } = mustCtx(req);
+
+    const out = await pg.withClient(async (client) => {
+      const role = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(role);
+
+      const r = await client.query(
+        `
+        SELECT id, token, employee_name, phone, email, role, expires_at, claimed_at, created_at
+        FROM public.employee_invites
+        WHERE tenant_id = $1
+        ORDER BY created_at DESC
+        LIMIT 50
+        `,
+        [tenantId]
+      );
+      return r.rows || [];
+    });
+
+    return res.json({ ok: true, items: out });
+  } catch (e) {
+    const code = e?.code || "LIST_INVITES_FAILED";
+    const status = code === "TENANT_CTX_MISSING" ? 403 : code === "PERMISSION_DENIED" ? 403 : 500;
+    console.error("[CREW_INVITE] list error", e?.message || e);
+    return jsonErr(res, status, code, "Unable to list invites.");
   }
 });
 

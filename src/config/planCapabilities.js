@@ -30,12 +30,21 @@ const plan_capabilities = {
     people: {
       owner_seats: 1,
 
-      // ✅ employees exist as records even in Free (owner can name them),
-      // but they cannot self-log from their own phone until Pro.
+      // ✅ employees exist as records; they can clock in/out on all tiers.
       max_employee_records: 3,
 
-      // ✅ self-logging via WhatsApp (employees sending commands) is Pro.
-      employee_self_logging: false,
+      // ✅ time clock self-logging is unlocked on all tiers.
+      employee_self_logging: true,
+
+      // ✅ per-feature employee capabilities for this tier
+      employee_features: {
+        time_clock: true,
+        tasks: false,     // Starter+
+        mileage: false,   // Starter+
+        photos: false,    // Starter+
+        expenses: false,  // Pro only
+        revenue: false,   // Pro only
+      },
 
       // board is Pro only
       max_board: 0,
@@ -84,11 +93,20 @@ const plan_capabilities = {
     people: {
       owner_seats: 1,
 
-      // ✅ Starter: owner can add up to 10 employees (records) and log for them
+      // ✅ Starter: up to 10 employee records; employees can self-log time + tasks + mileage + photos
       max_employee_records: 10,
 
-      // ✅ still NOT self-logging from their own phones
-      employee_self_logging: false,
+      employee_self_logging: true,
+
+      // ✅ per-feature employee capabilities for this tier
+      employee_features: {
+        time_clock: true,
+        tasks: true,      // Starter+
+        mileage: true,    // Starter+
+        photos: true,     // Starter+
+        expenses: false,  // Pro only
+        revenue: false,   // Pro only
+      },
 
       max_board: 0,
     },
@@ -140,14 +158,23 @@ const plan_capabilities = {
     people: {
       owner_seats: 1,
 
-      // ✅ Pro: up to 25 employees records
-      max_employee_records: 25,
+      // ✅ Pro: up to 50 employee records
+      max_employee_records: 50,
 
-      // ✅ Pro: employees can self-log from their own phones (WhatsApp)
       employee_self_logging: true,
 
-      // ✅ Pro: board members
-      max_board: 10,
+      // ✅ per-feature employee capabilities for this tier
+      employee_features: {
+        time_clock: true,
+        tasks: true,
+        mileage: true,
+        photos: true,
+        expenses: true,  // Pro: employees can submit expenses → pending review
+        revenue: true,   // Pro: employees can submit revenue → pending review
+      },
+
+      // ✅ Pro: up to 5 board members (foremen/supervisors)
+      max_board: 5,
     },
 
     capture: {

@@ -1775,7 +1775,7 @@ const messageSid =
 // (D) CREW+CONTROL FAST PATH (task/time → activity logs)
 // - requires actor identity + tenant mapping
 // - captures crew-auditable log stream
-// - IMPORTANT: enforce Pro for employee/board self-logging (fail-closed)
+// - Time clock: all tiers (Free/Starter/Pro). Task commands: Starter+.
 try {
   const crewEnabled = String(process.env.FEATURE_CREW_CONTROL || "0") === "1";
   if (crewEnabled) {
@@ -1895,22 +1895,28 @@ try {
                 planKey = "free";
               }
 
+              // Time clock: available on all tiers. Tasks: Starter+.
+              if (type === "time") {
+                return { ok: true, reason: "TIME_ALL_TIERS", actorRole, planKey };
+              }
+
+              // Task commands require Starter+
               const isStarterOrPro = planKey === "starter" || planKey === "pro";
-if (!isStarterOrPro) {
-  return { ok: false, reason: "NOT_INCLUDED", actorRole, planKey };
-}
-return { ok: true, reason: "STARTER_OK", actorRole, planKey };
+              if (!isStarterOrPro) {
+                return { ok: false, reason: "TASKS_REQUIRE_STARTER", actorRole, planKey };
+              }
+              return { ok: true, reason: "STARTER_OK", actorRole, planKey };
             });
 
             if (!gate.ok) {
               // IMPORTANT: do not create Crew activity log if not allowed.
               // Calm upsell message for employee/board self-log; avoid spamming.
-              if (gate.reason === "NOT_INCLUDED") {
+              if (gate.reason === "TASKS_REQUIRE_STARTER" || gate.reason === "NOT_INCLUDED") {
                 return ok(
                   res,
                   [
-                    "🔒 Crew logging requires Starter or Pro (Crew+Control).",
-                    "Ask the owner to upgrade in the portal, then try again.",
+                    "Tasks and reminders are available on Starter and Pro.",
+                    "Ask your employer to upgrade at usechiefos.com/pricing.",
                   ].join("\n")
                 );
               }

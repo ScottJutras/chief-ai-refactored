@@ -41,6 +41,8 @@ const {
 const { normalizeJobNameCandidate } = require('../../utils/jobNameUtils');
 const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require('../../src/config/upgradeCopy');
 const { getEffectivePlanFromOwner } = require('../../src/config/effectivePlan');
+const { canEmployeeSubmitExpenses } = require('../../src/config/checkCapability');
+const { logCapabilityDenial } = require('../../src/lib/capabilityDenials');
 
 // ---- CIL validator (fail-open) ----
 const cilMod = require('../../cil');
@@ -1678,6 +1680,31 @@ async function handleRevenue(from, input, userProfile, ownerId, ownerProfile, is
   twilioMeta = twilioMeta && typeof twilioMeta === 'object' ? twilioMeta : {};
   const plan = getEffectivePlanFromOwner(ownerProfile);
 
+  // ✅ Employee gate: only Pro employees can submit revenue (→ pending_review queue)
+  if (!isOwner) {
+    const gate = canEmployeeSubmitExpenses(plan); // reuses same Pro gate as expenses
+    if (!gate.allowed) {
+      try {
+        const pg = require('../../services/postgres');
+        await logCapabilityDenial(pg, {
+          owner_id: String(ownerId || '').trim(),
+          user_id: String(from || '').replace(/\D/g, ''),
+          actor_role: 'employee',
+          plan,
+          capability: 'revenue',
+          reason_code: gate.reason_code,
+          upgrade_plan: gate.upgrade_plan || null,
+          source_msg_id: String(sourceMsgId || '').trim() || null,
+          context: { handler: 'revenue.handleRevenue' },
+        });
+      } catch {}
+      return out(twimlText(gate.message || 'Employee revenue submission is available on Pro. Ask your employer to upgrade.'), false);
+    }
+    // Pro employee allowed: mark for pending_review
+    if (!ownerProfile) ownerProfile = {};
+    ownerProfile._employeeSubmission = { submittedBy: String(from || '').replace(/\D/g, '') };
+  }
+
 
   // ✅ Canonical PA key (digits) — prefer WaId, then userProfile, then from
   const paUserId =
@@ -2089,10 +2116,10 @@ const resolved = resolveJobOptionFromReply(pickerText, jobOptions, { page, pageS
     let confirmPA = await getPA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }).catch(() => null);
 
     if (confirmPA?.payload?.draft) {
-      // Owner gate
-      if (!isOwner) {
+      // Owner + Pro employee gate (Pro employees allowed above; owner always allowed)
+      if (!isOwner && !ownerProfile?._employeeSubmission) {
         try { await deletePA({ ownerId, userId: paUserId, kind: PA_KIND_CONFIRM }); } catch {}
-        return out(twimlText('⚠️ Only the owner can manage revenue.'), false);
+        return out(twimlText('⚠️ Only the owner or Pro employees can manage revenue.'), false);
       }
 
       const strictTok = strictDecisionToken(input);

@@ -31,7 +31,32 @@ const plan_messages = {
     upgrade_plan: "starter",
   },
 
-  // ✅ Semantics: employees cannot self-log from their own phones unless Pro
+  // Employee time clock is now on all tiers; this message is kept for safety/fallback
+  EMPLOYEE_SELF_LOGGING_REQUIRES_STARTER: {
+    title: "Employee time logging requires an active plan",
+    message: "Employees can clock in/out on all plans. Make sure you have an active ChiefOS account.",
+    upgrade_plan: "starter",
+  },
+
+  EMPLOYEE_MILEAGE_REQUIRES_STARTER: {
+    title: "Employee mileage logging is part of Starter",
+    message: "Employee mileage tracking is available on Starter and Pro. Upgrade to let your crew log drives from their phones.",
+    upgrade_plan: "starter",
+  },
+
+  EMPLOYEE_PHOTOS_REQUIRES_STARTER: {
+    title: "Employee photo submission is part of Starter",
+    message: "Job site photo submission for employees is available on Starter and Pro. Upgrade to let your crew send site photos.",
+    upgrade_plan: "starter",
+  },
+
+  EMPLOYEE_EXPENSE_REQUIRES_PRO: {
+    title: "Employee expense submission is part of Pro",
+    message: "Pro lets employees submit expenses and revenue for your review. Upgrade to enable crew expense capture.",
+    upgrade_plan: "pro",
+  },
+
+  // Legacy key — kept for backward compat with any existing logs
   EMPLOYEE_SELF_LOGGING_REQUIRES_PRO: {
     title: "Crew self-logging is part of Pro",
     message: PRO_CREW_UPGRADE_LINE,

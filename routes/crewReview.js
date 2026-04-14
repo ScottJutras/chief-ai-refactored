@@ -461,4 +461,118 @@ router.patch("/review/:logId", requirePortalUser, requireCrewControlPro(), expre
   }
 });
 
+/**
+ * GET /api/crew/review/expenses/pending
+ * Owner/admin/board: list transactions with submission_status = 'pending_review'.
+ */
+router.get("/review/expenses/pending", requirePortalUser, requireCrewControlPro(), async (req, res) => {
+  try {
+    const { tenantId, actorId, ownerId } = mustCtx(req);
+
+    const out = await pg.withClient(async (client) => {
+      const role = await getActorRole({ tenantId, actorId }, client);
+      if (!["owner", "admin", "board"].includes(role)) {
+        const err = new Error("Permission denied");
+        err.code = "PERMISSION_DENIED";
+        throw err;
+      }
+
+      const r = await client.query(
+        `
+        SELECT
+          t.id,
+          t.kind,
+          t.amount_cents,
+          t.description,
+          t.vendor,
+          t.category,
+          t.job_no,
+          t.occurred_at,
+          t.submitted_by,
+          t.submission_status,
+          t.reviewer_note,
+          t.created_at
+        FROM public.transactions t
+        WHERE t.owner_id = $1
+          AND t.submission_status = 'pending_review'
+          AND t.kind IN ('expense', 'revenue')
+        ORDER BY t.created_at DESC
+        LIMIT 100
+        `,
+        [ownerId]
+      );
+      return r.rows || [];
+    });
+
+    return res.json({ ok: true, items: out });
+  } catch (e) {
+    const code = e?.code || "PENDING_EXPENSES_FAILED";
+    const status = code === "TENANT_CTX_MISSING" ? 403 : code === "PERMISSION_DENIED" ? 403 : 500;
+    console.error("[CREW_REVIEW_EXPENSES] list error", e?.message || e);
+    return jsonErr(res, status, code, "Unable to load pending submissions.");
+  }
+});
+
+/**
+ * PATCH /api/crew/review/expenses/:id
+ * Body: { action: 'approve' | 'decline', reviewer_note? }
+ * Updates submission_status on the transaction.
+ */
+router.patch("/review/expenses/:id", requirePortalUser, requireCrewControlPro(), express.json(), async (req, res) => {
+  try {
+    const { tenantId, actorId, ownerId } = mustCtx(req);
+    const txId = String(req.params.id || "").trim();
+    const action = String(req.body?.action || "").trim();
+    const reviewerNote = String(req.body?.reviewer_note || "").trim() || null;
+
+    if (!txId) return jsonErr(res, 400, "MISSING_ID", "Transaction ID required.");
+    if (!["approve", "decline"].includes(action)) return jsonErr(res, 400, "INVALID_ACTION", "Action must be approve or decline.");
+
+    const newStatus = action === "approve" ? "confirmed" : "declined";
+
+    const out = await pg.withClient(async (client) => {
+      const role = await getActorRole({ tenantId, actorId }, client);
+      if (!["owner", "admin", "board"].includes(role)) {
+        const err = new Error("Permission denied");
+        err.code = "PERMISSION_DENIED";
+        throw err;
+      }
+
+      const r = await client.query(
+        `
+        UPDATE public.transactions
+        SET
+          submission_status = $1,
+          reviewed_at = now(),
+          reviewer_note = $2
+        WHERE owner_id = $3
+          AND id = $4
+          AND submission_status = 'pending_review'
+        RETURNING id, kind, amount_cents, description, submission_status, reviewed_at
+        `,
+        [newStatus, reviewerNote, ownerId, txId]
+      );
+
+      if (!r.rowCount) {
+        const err = new Error("Transaction not found or already reviewed.");
+        err.code = "NOT_FOUND";
+        throw err;
+      }
+
+      return r.rows[0];
+    });
+
+    return res.json({ ok: true, item: out });
+  } catch (e) {
+    const code = e?.code || "EXPENSE_REVIEW_FAILED";
+    const status =
+      code === "TENANT_CTX_MISSING" ? 403 :
+      code === "PERMISSION_DENIED" ? 403 :
+      code === "NOT_FOUND" ? 404 :
+      500;
+    console.error("[CREW_REVIEW_EXPENSES] action error", e?.message || e);
+    return jsonErr(res, status, code, "Unable to review submission.");
+  }
+});
+
 module.exports = router;

@@ -586,12 +586,16 @@ if (teamHandler) {
     if (handleMileage && isMileageMessage && isMileageMessage(raw)) {
       const country = String(ownerProfile?.country || 'CA').toUpperCase();
       const tenantId = String(ownerProfile?.tenant_id || ownerId || '');
+      const paUserIdMileage = canonicalUserKey(from);
       const reply = await handleMileage({
         text: raw,
         ownerId,
         tenantId,
         country,
         sourceMsgId,
+        isOwner,
+        ownerProfile,
+        paUserId: paUserIdMileage,
       }).catch((e) => `⚠️ Mileage log failed: ${e?.message || 'unknown error'}`);
       twiml(res, reply);
       await safeCleanup({ from, ownerId });

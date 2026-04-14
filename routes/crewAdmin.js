@@ -2,9 +2,39 @@
 const express = require("express");
 const crypto = require("crypto");
 const pg = require("../services/postgres");
-const { requireCrewControlStarter } = require("../middleware/requireCrewControlStarter");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
 const { sendSMS } = require("../services/twilio");
+
+const PLAN_LIMITS = {
+  free:    { employees: 3,   board: 0  },
+  starter: { employees: 25,  board: 25 },
+  pro:     { employees: 150, board: 25 },
+};
+
+async function getPlanKey(ownerId, client) {
+  if (!ownerId) return "free";
+  const reg = await client.query(
+    `select to_regclass('public.users') as t_users,
+            to_regclass('public.chiefos_users') as t_chiefos_users`
+  );
+  const tUsers = reg?.rows?.[0]?.t_users || null;
+  const tChiefosUsers = reg?.rows?.[0]?.t_chiefos_users || null;
+  let key = "free";
+  if (tUsers) {
+    const r = await client.query(
+      `select plan_key from public.users where owner_id = $1 limit 1`,
+      [ownerId]
+    );
+    key = r?.rows?.[0]?.plan_key || "free";
+  } else if (tChiefosUsers) {
+    const r = await client.query(
+      `select plan_key from public.chiefos_users where owner_id = $1 limit 1`,
+      [ownerId]
+    );
+    key = r?.rows?.[0]?.plan_key || "free";
+  }
+  return String(key || "free").trim().toLowerCase();
+}
 
 const router = express.Router();
 
@@ -62,7 +92,9 @@ function mustOwnerOrAdmin(role) {
   }
 }
 
-async function assertLimits({ tenantId }, client, { addingRole = null } = {}) {
+async function assertLimits({ tenantId, planKey = "free" }, client, { addingRole = null } = {}) {
+  const limits = PLAN_LIMITS[planKey] ?? PLAN_LIMITS.free;
+
   const counts = await client.query(
     `
     select
@@ -77,16 +109,28 @@ async function assertLimits({ tenantId }, client, { addingRole = null } = {}) {
   const employees = counts.rows?.[0]?.employees ?? 0;
   const board = counts.rows?.[0]?.board ?? 0;
 
-  if (addingRole === "employee" && employees >= 150) {
-    const err = new Error("Employee limit reached");
+  if (addingRole === "employee" && employees >= limits.employees) {
+    const err = new Error(
+      `Employee limit reached (${limits.employees} on ${planKey} plan). Upgrade to add more.`
+    );
     err.code = "EMPLOYEE_LIMIT";
+    err.plan_key = planKey;
+    err.limit = limits.employees;
     throw err;
   }
-  if (addingRole === "board" && board >= 25) {
-    const err = new Error("Board member limit reached");
+  if (addingRole === "board" && board >= limits.board) {
+    const err = new Error(
+      limits.board === 0
+        ? `Board members require Starter or Pro.`
+        : `Board member limit reached (${limits.board} on ${planKey} plan).`
+    );
     err.code = "BOARD_LIMIT";
+    err.plan_key = planKey;
+    err.limit = limits.board;
     throw err;
   }
+
+  return { employees, board, limits };
 }
 
 /**
@@ -166,15 +210,18 @@ async function ensureOwnerProfiles({ tenantId }, client) {
  * GET /api/crew/admin/members
  * Owner/admin view of all actors + profiles.
  */
-router.get("/admin/members", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
+router.get("/admin/members", requirePortalUser(), async (req, res) => {
   try {
-    const { tenantId, actorId } = mustCtx(req);
+    const { tenantId, actorId, ownerId } = mustCtx(req);
 
     const out = await pg.withClient(async (client) => {
       const role = await getActorRole({ tenantId, actorId }, client);
       mustOwnerOrAdmin(role);
 
       await ensureOwnerProfiles({ tenantId }, client);
+
+      const planKey = await getPlanKey(ownerId, client);
+      const limits = PLAN_LIMITS[planKey] ?? PLAN_LIMITS.free;
 
       const r = await client.query(
         `
@@ -197,10 +244,23 @@ router.get("/admin/members", requirePortalUser(), requireCrewControlStarter(), a
         [tenantId]
       );
 
-      return r.rows || [];
+      const items = r.rows || [];
+      const employees_used = items.filter((i) => i.role === "employee").length;
+      const board_used = items.filter((i) => i.role === "board").length;
+
+      return {
+        items,
+        quota: {
+          plan_key: planKey,
+          employees_used,
+          employees_limit: limits.employees,
+          board_used,
+          board_limit: limits.board,
+        },
+      };
     });
 
-    return res.json({ ok: true, items: out });
+    return res.json({ ok: true, items: out.items, quota: out.quota });
   } catch (e) {
     const code = e?.code || "MEMBERS_FAILED";
     const status =
@@ -219,7 +279,7 @@ router.get("/admin/members", requirePortalUser(), requireCrewControlStarter(), a
  *
  * Returns: { ok: true, items: [{ employee_actor_id, board_actor_id, active }] }
  */
-router.get("/admin/assignments", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
+router.get("/admin/assignments", requirePortalUser(),async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -260,9 +320,9 @@ router.get("/admin/assignments", requirePortalUser(), requireCrewControlStarter(
  * Body: { display_name, phone, email }
  * Creates (or reuses) an employee actor + membership + profile + identities.
  */
-router.post("/admin/members", requirePortalUser(), requireCrewControlStarter(), express.json(), async (req, res) => {
+router.post("/admin/members", requirePortalUser(), express.json(), async (req, res) => {
   try {
-    const { tenantId, actorId } = mustCtx(req);
+    const { tenantId, actorId, ownerId } = mustCtx(req);
 
     const displayName = String(req.body?.display_name || "").trim();
     const phoneDigits = normalizePhoneDigits(req.body?.phone || "");
@@ -285,7 +345,8 @@ router.post("/admin/members", requirePortalUser(), requireCrewControlStarter(), 
       const role = await getActorRole({ tenantId, actorId }, client);
       mustOwnerOrAdmin(role);
 
-      await assertLimits({ tenantId }, client, { addingRole: "employee" });
+      const planKey = await getPlanKey(ownerId, client);
+      await assertLimits({ tenantId, planKey }, client, { addingRole: "employee" });
 
       const existingActorId = await findExistingActorId({ phoneDigits, email }, client);
       const newActorId = existingActorId || crypto.randomUUID();
@@ -379,10 +440,11 @@ router.post("/admin/members", requirePortalUser(), requireCrewControlStarter(), 
     const status =
       code === "TENANT_CTX_MISSING" ? 403 :
       code === "PERMISSION_DENIED" ? 403 :
-      code === "EMPLOYEE_LIMIT" ? 409 :
+      code === "EMPLOYEE_LIMIT" ? 402 :
       500;
     console.error("[CREW_ADMIN] create member error", e?.message || e);
-    return jsonErr(res, status, code, "Unable to add employee.");
+    const msg = code === "EMPLOYEE_LIMIT" ? (e?.message || "Employee limit reached.") : "Unable to add employee.";
+    return jsonErr(res, status, code, msg, code === "EMPLOYEE_LIMIT" ? { plan_key: e?.plan_key, limit: e?.limit } : {});
   }
 });
 
@@ -390,9 +452,9 @@ router.post("/admin/members", requirePortalUser(), requireCrewControlStarter(), 
  * PATCH /api/crew/admin/members/:actorId/role
  * Body: { role: 'employee'|'board'|'admin' }
  */
-router.patch("/admin/members/:actorId/role", requirePortalUser(), requireCrewControlStarter(), express.json(), async (req, res) => {
+router.patch("/admin/members/:actorId/role", requirePortalUser(), express.json(), async (req, res) => {
   try {
-    const { tenantId, actorId } = mustCtx(req);
+    const { tenantId, actorId, ownerId } = mustCtx(req);
     const targetActorId = String(req.params.actorId || "").trim();
     const newRole = String(req.body?.role || "").trim();
 
@@ -410,7 +472,8 @@ router.patch("/admin/members/:actorId/role", requirePortalUser(), requireCrewCon
       }
 
       if (newRole === "board") {
-        await assertLimits({ tenantId }, client, { addingRole: "board" });
+        const planKey = await getPlanKey(ownerId, client);
+        await assertLimits({ tenantId, planKey }, client, { addingRole: "board" });
       }
 
       const u = await client.query(
@@ -469,7 +532,7 @@ router.patch("/admin/members/:actorId/role", requirePortalUser(), requireCrewCon
  * - cannot delete owner
  * - cannot delete yourself
  */
-router.delete("/admin/members/:actorId", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
+router.delete("/admin/members/:actorId", requirePortalUser(),async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
     const targetActorId = String(req.params.actorId || "").trim();
@@ -559,7 +622,7 @@ router.delete("/admin/members/:actorId", requirePortalUser(), requireCrewControl
  * GET /api/crew/admin/members/export.csv
  * Owner/admin exports members as CSV.
  */
-router.get("/admin/members/export.csv", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
+router.get("/admin/members/export.csv", requirePortalUser(),async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 
@@ -628,7 +691,7 @@ router.get("/admin/members/export.csv", requirePortalUser(), requireCrewControlS
  * POST /api/crew/admin/assign
  * Body: { employee_actor_id, board_actor_id }
  */
-router.post("/admin/assign", requirePortalUser(), requireCrewControlStarter(), express.json(), async (req, res) => {
+router.post("/admin/assign", requirePortalUser(),express.json(), async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
     const employeeActorId = String(req.body?.employee_actor_id || "").trim();
@@ -710,7 +773,7 @@ router.post("/admin/assign", requirePortalUser(), requireCrewControlStarter(), e
  * Body: { employee_name, phone?, email?, role? }
  * Owner creates an invite link and optionally sends it via SMS.
  */
-router.post("/admin/invite", requirePortalUser(), requireCrewControlStarter(), express.json(), async (req, res) => {
+router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res) => {
   try {
     const { tenantId, actorId, ownerId } = mustCtx(req);
 
@@ -771,7 +834,7 @@ router.post("/admin/invite", requirePortalUser(), requireCrewControlStarter(), e
  * GET /api/crew/admin/invites
  * Owner lists pending (unclaimed) invites for their tenant.
  */
-router.get("/admin/invites", requirePortalUser(), requireCrewControlStarter(), async (req, res) => {
+router.get("/admin/invites", requirePortalUser(),async (req, res) => {
   try {
     const { tenantId, actorId } = mustCtx(req);
 

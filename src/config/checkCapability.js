@@ -131,6 +131,16 @@ function canUseApprovals(plan, role) {
 
   return allow();
 }
+function canUseTasks(plan) {
+  const p = getPlanOrDefault(plan);
+  const caps = getCaps(p);
+
+  if (!caps.capture || !caps.capture.text_logging || caps.capture.text_logging.tasks?.enabled !== true) {
+    return deny("TASKS_REQUIRES_STARTER");
+  }
+  return allow();
+}
+
 function canCrewSelfLog(plan) {
   const p = getPlanOrDefault(plan);
   if (p === 'pro' || p === 'enterprise') return allow();
@@ -182,4 +192,5 @@ module.exports = {
   canUseVoice,
   canUseApprovals,
   canLogTime,
+  canUseTasks,
 };

@@ -13,6 +13,12 @@ const plan_messages = {
   },
 
 
+  TASKS_REQUIRES_STARTER: {
+    title: "Tasks & reminders are part of Owner Mode",
+    message: "Tasks and reminders are available on Starter and Pro. Upgrade to create tasks, set due dates, and assign crew.",
+    upgrade_plan: "starter",
+  },
+
   OCR_REQUIRES_STARTER: {
     title: "Receipt scanning is part of Owner Mode",
     message: "Receipt scanning (OCR) is available on Starter and Pro. You can still log expenses by text.",

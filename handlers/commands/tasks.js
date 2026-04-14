@@ -30,7 +30,7 @@ const deletePendingTransactionState =
 const mergePendingTransactionState =
   state.mergePendingTransactionState ||
   (async (userId, patch) => state.setPendingTransactionState(userId, patch, { merge: true }));
-const { canEmployeeSelfLog, getPlanOrDefault } = require("../../src/config/checkCapability");
+const { canEmployeeSelfLog, canUseTasks, getPlanOrDefault } = require("../../src/config/checkCapability");
 const { logCapabilityDenial } = require("../../src/lib/capabilityDenials");
 const { PRO_CREW_UPGRADE_LINE, UPGRADE_FOLLOWUP_ASK } = require("../../src/config/upgradeCopy");
  const { getEffectivePlanFromOwner } = require("../../src/config/effectivePlan");
@@ -347,6 +347,28 @@ const plan = getEffectivePlanFromOwner(_ownerProfile);
 
 
 const role = isOwner ? "owner" : "employee";
+
+// Gate: tasks require Starter or higher (free plan cannot use tasks)
+{
+  const gate = canUseTasks(plan);
+  if (!gate.allowed) {
+    try {
+      await logCapabilityDenial(pg, {
+        owner_id: String(ownerId || "").trim(),
+        user_id: String(paUserId || "").trim(),
+        actor_role: role,
+        plan,
+        capability: "tasks",
+        reason_code: gate.reason_code,
+        upgrade_plan: gate.upgrade_plan || null,
+        source_msg_id: safeMsgId || null,
+        context: { handler: "tasks.tasksHandler" },
+      });
+    } catch {}
+
+    return respond(res, gate.message || "Tasks and reminders are available on Starter and Pro. Upgrade at usechiefos.com/pricing");
+  }
+}
 
 // Gate: employees can’t self-use tasks unless Pro (same semantics as time self-log)
 if (!isOwner) {

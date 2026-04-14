@@ -46,7 +46,7 @@ const plan_capabilities = {
         expenses: { enabled: true },
         revenue: { enabled: true },
         time: { enabled: true },
-        tasks: { enabled: true },
+        tasks: { enabled: false },
       },
 
       // premium capture surfaces

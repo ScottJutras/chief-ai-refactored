@@ -3,11 +3,11 @@ const express = require("express");
 const crypto = require("crypto");
 const pg = require("../services/postgres");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
-const { sendSMS } = require("../services/twilio");
+const { sendSMS, sendWhatsApp } = require("../services/twilio");
 
 const PLAN_LIMITS = {
   free:    { employees: 3,  board: 0  },
-  starter: { employees: 10, board: 5  },
+  starter: { employees: 10, board: 0  },  // board is Pro-only
   pro:     { employees: 50, board: 5  },
 };
 
@@ -794,6 +794,7 @@ router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res
     const rawPhone = String(req.body?.phone || "").trim();
     const email = String(req.body?.email || "").trim().toLowerCase();
     const role = String(req.body?.role || "employee").trim();
+    const deliveryMethod = String(req.body?.delivery_method || "sms").trim(); // 'sms' | 'whatsapp' | 'email'
 
     if (!employeeName) return jsonErr(res, 400, "MISSING_NAME", "Employee name is required.");
     if (!rawPhone && !email) return jsonErr(res, 400, "MISSING_CONTACT", "Phone or email is required to send invite.");
@@ -822,17 +823,27 @@ router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res
     const appBase = String(process.env.APP_BASE_URL || "https://app.usechiefos.com").replace(/\/$/, "");
     const inviteUrl = `${appBase}/invite/${out.token}`;
 
-    // Send SMS (non-fatal)
-    if (phoneDigits) {
+    // Deliver invite via chosen method (non-fatal)
+    if (deliveryMethod === "whatsapp" && phoneDigits) {
+      try {
+        await sendWhatsApp(
+          "+" + phoneDigits,
+          `You've been invited to join ChiefOS. Tap to get started:\n${inviteUrl}\n\nLink expires in 7 days.`
+        );
+      } catch (e) {
+        console.warn("[CREW_INVITE] WhatsApp send failed (non-fatal):", e?.message);
+      }
+    } else if (deliveryMethod === "sms" && phoneDigits) {
       try {
         await sendSMS(
           "+" + phoneDigits,
           `You've been invited to join ChiefOS. Tap to get started:\n${inviteUrl}\n\nLink expires in 7 days.`
         );
-      } catch (smsErr) {
-        console.warn("[CREW_INVITE] SMS send failed (non-fatal):", smsErr?.message);
+      } catch (e) {
+        console.warn("[CREW_INVITE] SMS send failed (non-fatal):", e?.message);
       }
     }
+    // 'email' method: no mail service configured — caller receives inviteUrl to share manually
 
     return res.json({ ok: true, item: { id: out.id, token: out.token, inviteUrl, expires_at: out.expires_at } });
   } catch (e) {

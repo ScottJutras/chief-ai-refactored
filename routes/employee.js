@@ -10,6 +10,7 @@ const express = require("express");
 const crypto = require("crypto");
 const pg = require("../services/postgres");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
+const { logTimeEntry } = require("../services/postgres");
 
 const router = express.Router();
 
@@ -174,8 +175,9 @@ router.post("/api/employee/time/clock-in", requirePortalUser(), express.json(), 
       return jsonErr(res, 403, "NOT_LINKED", "Your account is not fully linked. Ask your owner to resend the invite.");
     }
 
-    const { phoneDigits } = await resolveEmployeeIdentity({ tenantId, actorId });
+    const { displayName, phoneDigits } = await resolveEmployeeIdentity({ tenantId, actorId });
     const userId = resolveUserIdKey({ phoneDigits, actorId });
+    const tz = req.tenant?.tz || "America/Toronto";
 
     // Reject double clock-in
     const existing = await pg.query(
@@ -188,23 +190,26 @@ router.post("/api/employee/time/clock-in", requirePortalUser(), express.json(), 
       return jsonErr(res, 409, "ALREADY_CLOCKED_IN", "You're already clocked in. Clock out first.");
     }
 
-    // Resolve job reference into a canonical job name stored in meta.
-    // time_entries_v2.job_id is a UUID column and the WhatsApp clock-in
-    // path never populates it either — it always writes NULL and keeps
-    // the job as meta.job_name. We mirror that behaviour exactly so
-    // downstream dashboards and crewSelf queries don't diverge.
+    // Resolve job reference into a canonical job name + job_no. The
+    // time_entries_v2.job_id column is UUID and the WhatsApp path never
+    // populates it — we store the label in meta.job_name instead. The
+    // legacy time_entries.job_no column is bigint and IS populated, so
+    // we grab both fields in one lookup.
     const jobIdRaw = req.body?.job_id;
     let resolvedJobName = null;
+    let resolvedJobNo = null;
     if (jobIdRaw && /^\d+$/.test(String(jobIdRaw))) {
       try {
         const jr = await pg.query(
-          `SELECT COALESCE(NULLIF(TRIM(job_name), ''), NULLIF(TRIM(name), ''), 'Untitled job') AS name
+          `SELECT job_no,
+                  COALESCE(NULLIF(TRIM(job_name), ''), NULLIF(TRIM(name), ''), 'Untitled job') AS name
              FROM public.jobs
             WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL
             LIMIT 1`,
           [ownerId, Number(jobIdRaw)]
         );
         resolvedJobName = jr?.rows?.[0]?.name || null;
+        resolvedJobNo = jr?.rows?.[0]?.job_no ?? null;
       } catch {
         // fall through — start the shift without a job rather than fail
       }
@@ -219,6 +224,7 @@ router.post("/api/employee/time/clock-in", requirePortalUser(), express.json(), 
       note,
     };
 
+    // v2 insert (authoritative shift record)
     const ins = await pg.query(
       `INSERT INTO public.time_entries_v2
          (owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
@@ -232,7 +238,25 @@ router.post("/api/employee/time/clock-in", requirePortalUser(), express.json(), 
       return jsonErr(res, 500, "INSERT_FAILED", "Could not record clock-in.");
     }
 
-    console.info("[EMPLOYEE_CLOCK_IN]", { ownerId, userId, id: row.id });
+    // Legacy public.time_entries dual-write so owner-side views
+    // (/app/activity/time and the dashboard records panel) pick up
+    // the shift. Non-fatal — if the legacy insert fails for any reason
+    // the shift is still authoritative in v2.
+    try {
+      await logTimeEntry(
+        ownerId,
+        displayName || null,
+        "clock_in",
+        row.start_at_utc,
+        resolvedJobNo,
+        tz,
+        { requester_id: userId, source_msg_id: sourceMsgId + ":legacy" }
+      );
+    } catch (e) {
+      console.warn("[EMPLOYEE_CLOCK_IN] legacy dual-write failed:", e?.message || e);
+    }
+
+    console.info("[EMPLOYEE_CLOCK_IN]", { ownerId, userId, id: row.id, jobNo: resolvedJobNo });
     return res.json({ ok: true, id: row.id, start_at_utc: row.start_at_utc });
   } catch (e) {
     console.error("[EMPLOYEE] clock-in error:", e?.message || e);
@@ -259,8 +283,9 @@ router.post("/api/employee/time/clock-out", requirePortalUser(), express.json(),
       return jsonErr(res, 403, "NOT_LINKED", "Your account is not fully linked.");
     }
 
-    const { phoneDigits } = await resolveEmployeeIdentity({ tenantId, actorId });
+    const { displayName, phoneDigits } = await resolveEmployeeIdentity({ tenantId, actorId });
     const userId = resolveUserIdKey({ phoneDigits, actorId });
+    const tz = req.tenant?.tz || "America/Toronto";
 
     const upd = await pg.query(
       `UPDATE public.time_entries_v2
@@ -271,7 +296,7 @@ router.post("/api/employee/time/clock-out", requirePortalUser(), express.json(),
            ORDER BY start_at_utc DESC
            LIMIT 1
         )
-        RETURNING id, start_at_utc, end_at_utc`,
+        RETURNING id, start_at_utc, end_at_utc, meta`,
       [ownerId, userId]
     );
 
@@ -287,6 +312,40 @@ router.post("/api/employee/time/clock-out", requirePortalUser(), express.json(),
         WHERE owner_id = $1 AND parent_id = $2 AND end_at_utc IS NULL`,
       [ownerId, row.id]
     ).catch(() => {});
+
+    // Legacy dual-write so the owner-side views update. We look up
+    // job_no by name from the shift's meta (the clock-in path stored
+    // the canonical name when the employee picked a job).
+    try {
+      const shiftJobName = row?.meta?.job_name || null;
+      let jobNo = null;
+      if (shiftJobName) {
+        const jr = await pg.query(
+          `SELECT job_no FROM public.jobs
+            WHERE owner_id = $1
+              AND deleted_at IS NULL
+              AND (LOWER(job_name) = LOWER($2) OR LOWER(name) = LOWER($2))
+            LIMIT 1`,
+          [ownerId, shiftJobName]
+        );
+        jobNo = jr?.rows?.[0]?.job_no ?? null;
+      }
+
+      await logTimeEntry(
+        ownerId,
+        displayName || null,
+        "clock_out",
+        row.end_at_utc,
+        jobNo,
+        tz,
+        {
+          requester_id: userId,
+          source_msg_id: makeSourceMsgId("portal:clock-out-legacy", userId),
+        }
+      );
+    } catch (e) {
+      console.warn("[EMPLOYEE_CLOCK_OUT] legacy dual-write failed:", e?.message || e);
+    }
 
     const durationMs = new Date(row.end_at_utc).getTime() - new Date(row.start_at_utc).getTime();
     const durationMinutes = Math.max(0, Math.round(durationMs / 60000));

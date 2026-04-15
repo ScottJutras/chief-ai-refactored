@@ -30,12 +30,30 @@ function ymNow(tz = "America/Toronto") {
 }
 
 router.get("/api/chief-quota", requirePortalUser(), async (req, res) => {
-  const ownerId  = String(req.ownerId  || "").trim();
-  const tz       = req.tenant?.tz || "America/Toronto";
+  const ownerId    = String(req.ownerId  || "").trim();
+  const tz         = req.tenant?.tz || "America/Toronto";
+  const portalRole = String(req.portalRole || "").trim().toLowerCase();
+
+  // Employees get unmetered support mode — they use Ask Chief as a help
+  // assistant, not the owner's reasoning engine. The UI reads `mode` to
+  // hide the x/y counter and show a "Support" chip instead.
+  const isEmployeeRole =
+    portalRole && portalRole !== "owner" && portalRole !== "admin" &&
+    portalRole !== "board" && portalRole !== "board_member";
+  if (isEmployeeRole) {
+    return res.status(200).json({
+      ok: true,
+      mode: "support",
+      unlimited: true,
+      used: 0,
+      limit: 0,
+      planKey: "free",
+    });
+  }
 
   // If no owner is linked, return free defaults — no error
   if (!ownerId) {
-    return res.status(200).json({ ok: true, used: 0, limit: 10, planKey: "free" });
+    return res.status(200).json({ ok: true, mode: "metered", used: 0, limit: 10, planKey: "free" });
   }
 
   try {
@@ -53,10 +71,10 @@ router.get("/api/chief-quota", requirePortalUser(), async (req, res) => {
     const usage = await pg.getUsageMonthly(ownerId, ym, { createIfMissing: false });
     const used  = Number(usage?.ask_chief_questions || 0);
 
-    return res.status(200).json({ ok: true, used, limit, planKey });
+    return res.status(200).json({ ok: true, mode: "metered", used, limit, planKey });
   } catch {
     // Fail open — worst case shows 0/10
-    return res.status(200).json({ ok: true, used: 0, limit: 10, planKey: "free" });
+    return res.status(200).json({ ok: true, mode: "metered", used: 0, limit: 10, planKey: "free" });
   }
 });
 

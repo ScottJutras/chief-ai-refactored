@@ -22,6 +22,7 @@ const { enforceAskChiefGates_AND_Consume } = require("../services/answerChief");
 const { LLMProvider }           = require("../services/llm");
 const { looksLikeSupportQuestion } = require("../services/orchestrator");
 const { answerSupport }         = require("../services/answerSupport");
+const { runEmployeeSupportMode } = require("../handlers/askChief/employeeSupport");
 
 const ASK_CHIEF_REQUIRE_PLAN  = String(process.env.ASK_CHIEF_REQUIRE_PLAN || "1") === "1";
 const STREAM_TIMEOUT_MS       = Number(process.env.ASK_CHIEF_STREAM_TIMEOUT_MS || 25000);
@@ -130,10 +131,57 @@ router.post("/api/ask-chief/stream", express.json(), async (req, res) => {
   }
 
   // ---- Role gate ----
+  // Employees get an unmetered support-mode response. Respond as a single
+  // SSE chunk (or plain JSON when SSE isn't requested) to match the
+  // existing looksLikeSupportQuestion / answerSupport path below.
   if (authMode === "portal" && portalRole) {
-    const allowed = new Set(["owner", "admin", "board", "board_member"]);
-    if (!allowed.has(portalRole)) {
-      return res.status(403).json({ ok: false, code: "PERMISSION_DENIED", message: "You do not have access to Ask Chief.", traceId });
+    const ownerAllowed = new Set(["owner", "admin", "board", "board_member"]);
+    if (!ownerAllowed.has(portalRole)) {
+      const support = await runEmployeeSupportMode({
+        tenantId,
+        actorId: req.actorId,
+        ownerId: ownerId || null,
+        portalRole,
+        planKey: req.planKey || null,
+        prompt: text,
+        history,
+        tz,
+        traceId,
+      });
+      const answer = support.answer;
+      const evidenceMeta = { range, tables: {}, totals: {}, meta: { channel: "portal", tenantId, tz, actorKey } };
+
+      const wantsSSE = (req.headers.accept || "").includes("text/event-stream");
+      if (!wantsSSE) {
+        return res.status(200).json({
+          ok: true,
+          answer,
+          evidence_meta: evidenceMeta,
+          warnings: support.warnings,
+          actions: support.actions,
+          mode: "support",
+          traceId,
+        });
+      }
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
+      sseWrite(res, { token: answer });
+      sseWrite(res, {
+        done: true,
+        ok: true,
+        answer,
+        evidence_meta: evidenceMeta,
+        warnings: support.warnings,
+        actions: support.actions,
+        mode: "support",
+        traceId,
+      });
+      sseDone(res);
+      return;
     }
   }
 

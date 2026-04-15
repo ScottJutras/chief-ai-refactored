@@ -8,6 +8,7 @@ const { requireDashboardOwner } = require("../middleware/requireDashboardOwner")
 const { requirePortalUser } = require("../middleware/requirePortalUser");
 const { runAgent } = require("../services/agent");
 const { enforceAskChiefGates_AND_Consume } = require("../services/answerChief");
+const { runEmployeeSupportMode } = require("../handlers/askChief/employeeSupport");
 
 const ASK_CHIEF_REQUIRE_PLAN = String(process.env.ASK_CHIEF_REQUIRE_PLAN || "1") === "1";
 const ASK_CHIEF_AGENT_TIMEOUT_MS = Number(process.env.ASK_CHIEF_AGENT_TIMEOUT_MS || 15000);
@@ -152,13 +153,30 @@ router.post("/api/ask-chief", express.json(), async (req, res) => {
     }
 
     // ---------------- Role gate (portal only) ----------------
+    // owner/admin/board => full Ask Chief (metered, tenant financial scope).
+    // employee (or anything else) => unmetered support mode with restricted
+    // prompt and own-data-only access. Skips plan gate + quota consume.
     if (authMode === "portal" && portalRole) {
-      const allowed = new Set(["owner", "admin", "board", "board_member"]);
-      if (!allowed.has(portalRole)) {
-        return res.status(403).json({
-          ok: false,
-          code: "PERMISSION_DENIED",
-          message: "You do not have access to Ask Chief.",
+      const ownerAllowed = new Set(["owner", "admin", "board", "board_member"]);
+      if (!ownerAllowed.has(portalRole)) {
+        const support = await runEmployeeSupportMode({
+          tenantId,
+          actorId: req.actorId,
+          ownerId: ownerId || null,
+          portalRole,
+          planKey: req.planKey || "free",
+          prompt: text,
+          history,
+          tz,
+          traceId,
+        });
+        return res.status(200).json({
+          ok: true,
+          answer: support.answer,
+          evidence_meta: buildEvidenceMeta({ range, tenantId, tz, actorKey }),
+          warnings: support.warnings,
+          actions: support.actions,
+          mode: "support",
           traceId,
         });
       }

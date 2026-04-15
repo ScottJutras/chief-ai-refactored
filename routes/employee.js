@@ -128,24 +128,25 @@ router.get("/api/employee/time/status", requirePortalUser(), async (req, res) =>
     const userId = resolveUserIdKey({ phoneDigits, actorId });
 
     const r = await pg.query(
-      `SELECT id, start_at_utc, job_id
+      `SELECT id, start_at_utc, meta
          FROM public.time_entries_v2
         WHERE owner_id = $1
           AND user_id = $2
           AND kind = 'shift'
           AND end_at_utc IS NULL
-          AND (deleted_at IS NULL OR deleted_at IS NULL)
+          AND deleted_at IS NULL
         ORDER BY start_at_utc DESC
         LIMIT 1`,
       [ownerId, userId]
     );
 
     const open = r?.rows?.[0] || null;
+    const jobName = open?.meta?.job_name || null;
     return res.json({
       ok: true,
       clocked_in: !!open,
       open_shift: open
-        ? { id: open.id, start_at_utc: open.start_at_utc, job_id: open.job_id || null }
+        ? { id: open.id, start_at_utc: open.start_at_utc, job_name: jobName }
         : null,
     });
   } catch (e) {
@@ -187,18 +188,43 @@ router.post("/api/employee/time/clock-in", requirePortalUser(), express.json(), 
       return jsonErr(res, 409, "ALREADY_CLOCKED_IN", "You're already clocked in. Clock out first.");
     }
 
+    // Resolve job reference into a canonical job name stored in meta.
+    // time_entries_v2.job_id is a UUID column and the WhatsApp clock-in
+    // path never populates it either — it always writes NULL and keeps
+    // the job as meta.job_name. We mirror that behaviour exactly so
+    // downstream dashboards and crewSelf queries don't diverge.
     const jobIdRaw = req.body?.job_id;
-    const jobId = jobIdRaw && /^\d+$/.test(String(jobIdRaw)) ? Number(jobIdRaw) : null;
+    let resolvedJobName = null;
+    if (jobIdRaw && /^\d+$/.test(String(jobIdRaw))) {
+      try {
+        const jr = await pg.query(
+          `SELECT COALESCE(NULLIF(TRIM(job_name), ''), NULLIF(TRIM(name), ''), 'Untitled job') AS name
+             FROM public.jobs
+            WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL
+            LIMIT 1`,
+          [ownerId, Number(jobIdRaw)]
+        );
+        resolvedJobName = jr?.rows?.[0]?.name || null;
+      } catch {
+        // fall through — start the shift without a job rather than fail
+      }
+    }
+
     const note = String(req.body?.note || "").trim().slice(0, 500) || null;
     const sourceMsgId = makeSourceMsgId("portal:clock-in", userId);
-    const meta = { source: "employee_portal", actor_id: actorId, note };
+    const meta = {
+      source: "employee_portal",
+      actor_id: actorId,
+      job_name: resolvedJobName,
+      note,
+    };
 
     const ins = await pg.query(
       `INSERT INTO public.time_entries_v2
          (owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
-       VALUES ($1, $2, $3, NULL, 'shift', NOW(), NULL, $4, 'portal', $5)
+       VALUES ($1, $2, NULL, NULL, 'shift', NOW(), NULL, $3, 'portal', $4)
        RETURNING id, start_at_utc`,
-      [ownerId, userId, jobId, meta, sourceMsgId]
+      [ownerId, userId, meta, sourceMsgId]
     );
 
     const row = ins?.rows?.[0];

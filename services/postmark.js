@@ -21,7 +21,7 @@ function getClient() {
  * @param {string} [opts.htmlBody]
  * @param {string} [opts.from]   defaults to POSTMARK_FROM_EMAIL
  */
-async function sendEmail({ to, subject, textBody, htmlBody, from }) {
+async function sendEmail({ to, subject, textBody, htmlBody, from, replyTo }) {
   const client = getClient();
   const fromAddr = from || FROM_EMAIL;
   if (!fromAddr) throw new Error("POSTMARK_FROM_EMAIL is not configured.");
@@ -29,6 +29,7 @@ async function sendEmail({ to, subject, textBody, htmlBody, from }) {
   const result = await client.sendEmail({
     From: fromAddr,
     To: to,
+    ReplyTo: replyTo || undefined,
     Subject: subject,
     TextBody: textBody,
     HtmlBody: htmlBody || undefined,

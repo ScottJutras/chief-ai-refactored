@@ -7,9 +7,9 @@ const { sendSMS } = require("../services/twilio");
 const { sendEmail } = require("../services/postmark");
 
 const PLAN_LIMITS = {
-  free:    { employees: 3,  board: 0  },
-  starter: { employees: 10, board: 0  },  // board is Pro-only
-  pro:     { employees: 50, board: 5  },
+  free:    { employees: 3,  board: 0, admin: 0 },
+  starter: { employees: 10, board: 0, admin: 0 },  // board + admin are Pro-only
+  pro:     { employees: 50, board: 5, admin: 1 },
 };
 
 async function getPlanKey(ownerId, client) {
@@ -113,7 +113,8 @@ async function assertLimits({ tenantId, planKey = "free" }, client, { addingRole
     `
     select
       sum(case when role = 'employee' then 1 else 0 end)::int as employees,
-      sum(case when role = 'board' then 1 else 0 end)::int as board
+      sum(case when role = 'board' then 1 else 0 end)::int as board,
+      sum(case when role = 'admin' then 1 else 0 end)::int as admin
     from public.chiefos_tenant_actors
     where tenant_id = $1
     `,
@@ -122,6 +123,7 @@ async function assertLimits({ tenantId, planKey = "free" }, client, { addingRole
 
   const employees = counts.rows?.[0]?.employees ?? 0;
   const board = counts.rows?.[0]?.board ?? 0;
+  const admin = counts.rows?.[0]?.admin ?? 0;
 
   if (addingRole === "employee" && employees >= limits.employees) {
     const err = new Error(
@@ -135,7 +137,7 @@ async function assertLimits({ tenantId, planKey = "free" }, client, { addingRole
   if (addingRole === "board" && board >= limits.board) {
     const err = new Error(
       limits.board === 0
-        ? `Board members require Starter or Pro.`
+        ? `Board members require Pro.`
         : `Board member limit reached (${limits.board} on ${planKey} plan).`
     );
     err.code = "BOARD_LIMIT";
@@ -143,8 +145,19 @@ async function assertLimits({ tenantId, planKey = "free" }, client, { addingRole
     err.limit = limits.board;
     throw err;
   }
+  if (addingRole === "admin" && admin >= limits.admin) {
+    const err = new Error(
+      limits.admin === 0
+        ? `Admin role requires the Pro plan.`
+        : `Admin limit reached (${limits.admin} on ${planKey} plan).`
+    );
+    err.code = "ADMIN_LIMIT";
+    err.plan_key = planKey;
+    err.limit = limits.admin;
+    throw err;
+  }
 
-  return { employees, board, limits };
+  return { employees, board, admin, limits };
 }
 
 /**
@@ -261,6 +274,7 @@ router.get("/admin/members", requirePortalUser(), async (req, res) => {
       const items = r.rows || [];
       const employees_used = items.filter((i) => i.role === "employee").length;
       const board_used = items.filter((i) => i.role === "board").length;
+      const admin_used = items.filter((i) => i.role === "admin").length;
 
       return {
         items,
@@ -270,6 +284,8 @@ router.get("/admin/members", requirePortalUser(), async (req, res) => {
           employees_limit: limits.employees,
           board_used,
           board_limit: limits.board,
+          admin_used,
+          admin_limit: limits.admin,
         },
       };
     });
@@ -485,9 +501,19 @@ router.patch("/admin/members/:actorId/role", requirePortalUser(), express.json()
         throw err;
       }
 
-      if (newRole === "board") {
-        const planKey = await getPlanKey(ownerId, client);
-        await assertLimits({ tenantId, planKey }, client, { addingRole: "board" });
+      if (newRole === "board" || newRole === "admin") {
+        // Skip the limit check when the target is already in the requested
+        // role (no-op reassign shouldn't trip the quota).
+        const cur = await client.query(
+          `select role from public.chiefos_tenant_actors
+            where tenant_id = $1 and actor_id = $2 limit 1`,
+          [tenantId, targetActorId]
+        );
+        const currentRole = cur.rows?.[0]?.role || null;
+        if (currentRole !== newRole) {
+          const planKey = await getPlanKey(ownerId, client);
+          await assertLimits({ tenantId, planKey }, client, { addingRole: newRole });
+        }
       }
 
       const u = await client.query(
@@ -531,11 +557,14 @@ router.patch("/admin/members/:actorId/role", requirePortalUser(), express.json()
       code === "TENANT_CTX_MISSING" ? 403 :
       code === "PERMISSION_DENIED" ? 403 :
       code === "BOARD_LIMIT" ? 409 :
+      code === "ADMIN_LIMIT" ? 409 :
       code === "NOT_FOUND" ? 404 :
       code === "SELF_ROLE_CHANGE_BLOCKED" ? 409 :
       500;
     console.error("[CREW_ADMIN] role error", e?.message || e);
-    return jsonErr(res, status, code, "Unable to update role.");
+    return jsonErr(res, status, code, e?.message || "Unable to update role.",
+      (code === "BOARD_LIMIT" || code === "ADMIN_LIMIT") ? { plan_key: e?.plan_key, limit: e?.limit } : {}
+    );
   }
 });
 
@@ -1007,6 +1036,7 @@ router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res
       try {
         await sendEmail({
           to: email,
+          replyTo: "hello@usechiefos.com",
           subject: "You've been invited to ChiefOS",
           textBody: inviteMsg,
           htmlBody: `

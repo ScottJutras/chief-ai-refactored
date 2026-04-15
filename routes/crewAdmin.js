@@ -15,16 +15,12 @@ const { getAdminClient } = require("../services/supabaseAdmin");
 async function generateInviteMagicLink({ email, appBase, token }) {
   try {
     const client = getAdminClient();
-    if (!client) {
-      console.warn("[CREW_INVITE] generateLink skipped: admin client unavailable");
-      return null;
-    }
+    if (!client) return null;
 
     // Redirect straight to the invite page (no query params) so Supabase's
     // URL allowlist match is trivial — just needs app.usechiefos.com/**.
     // The invite page auto-claims when it detects a hydrated session.
     const redirectTo = `${appBase}/invite/${token}`;
-    console.info("[CREW_INVITE] generateLink requested", { email, redirectTo });
 
     const { data, error } = await client.auth.admin.generateLink({
       type: "magiclink",
@@ -37,13 +33,7 @@ async function generateInviteMagicLink({ email, appBase, token }) {
       return null;
     }
 
-    const actionLink = data?.properties?.action_link || null;
-    console.info("[CREW_INVITE] generateLink returned", {
-      email,
-      actionLink,
-      hashed_token: data?.properties?.hashed_token ? "present" : "missing",
-    });
-    return actionLink;
+    return data?.properties?.action_link || null;
   } catch (e) {
     console.warn("[CREW_INVITE] generateLink exception:", e?.message || e);
     return null;

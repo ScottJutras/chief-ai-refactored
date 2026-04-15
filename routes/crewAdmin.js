@@ -17,8 +17,10 @@ async function generateInviteMagicLink({ email, appBase, token }) {
     const client = getAdminClient();
     if (!client) return null;
 
-    const returnTo = `/invite/${token}?claim=1`;
-    const redirectTo = `${appBase}/auth/callback?returnTo=${encodeURIComponent(returnTo)}`;
+    // Redirect straight to the invite page (no query params) so Supabase's
+    // URL allowlist match is trivial — just needs app.usechiefos.com/**.
+    // The invite page auto-claims when it detects a hydrated session.
+    const redirectTo = `${appBase}/invite/${token}`;
 
     const { data, error } = await client.auth.admin.generateLink({
       type: "magiclink",

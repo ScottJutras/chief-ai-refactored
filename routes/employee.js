@@ -143,16 +143,183 @@ router.get("/api/employee/time/status", requirePortalUser(), async (req, res) =>
 
     const open = r?.rows?.[0] || null;
     const jobName = open?.meta?.job_name || null;
+
+    // If there's an open shift, also report any still-open child
+    // segments (break / lunch / drive) so the UI can render "On break"
+    // / "End break" state correctly.
+    let openSegments = [];
+    if (open?.id) {
+      const segRows = await pg.query(
+        `SELECT id, kind, start_at_utc
+           FROM public.time_entries_v2
+          WHERE owner_id = $1
+            AND parent_id = $2
+            AND kind IN ('break','lunch','drive')
+            AND end_at_utc IS NULL
+            AND deleted_at IS NULL
+          ORDER BY start_at_utc DESC`,
+        [ownerId, open.id]
+      );
+      openSegments = (segRows?.rows || []).map((s) => ({
+        id: s.id,
+        kind: s.kind,
+        start_at_utc: s.start_at_utc,
+      }));
+    }
+
     return res.json({
       ok: true,
       clocked_in: !!open,
       open_shift: open
         ? { id: open.id, start_at_utc: open.start_at_utc, job_name: jobName }
         : null,
+      open_segments: openSegments,
     });
   } catch (e) {
     console.error("[EMPLOYEE] time/status error:", e?.message || e);
     return jsonErr(res, 500, "STATUS_FAILED", "Could not load clock status.");
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// POST /api/employee/time/segment
+// Body: { kind: "break"|"lunch"|"drive", action: "start"|"stop" }
+// Inserts or closes a child row under the employee's currently open
+// shift. Dual-writes to legacy public.time_entries using the owner
+// portal's expected type tokens:
+//   break_start / break_stop / lunch_start / lunch_end / drive_start /
+//   drive_stop
+// (note the lunch asymmetry — legacy uses "lunch_end" on the owner
+// filter chip set).
+// ─────────────────────────────────────────────────────────────────────
+const LEGACY_TYPE_BY_KIND_ACTION = {
+  "break:start": "break_start",
+  "break:stop":  "break_stop",
+  "lunch:start": "lunch_start",
+  "lunch:stop":  "lunch_end",    // legacy uses lunch_end, not lunch_stop
+  "drive:start": "drive_start",
+  "drive:stop":  "drive_stop",
+};
+
+router.post("/api/employee/time/segment", requirePortalUser(), express.json(), async (req, res) => {
+  try {
+    const portalRole = String(req.portalRole || "").toLowerCase();
+    if (!isEmployeeRole(portalRole)) {
+      return jsonErr(res, 403, "PERMISSION_DENIED", "Employee portal only.");
+    }
+
+    const tenantId = String(req.tenantId || "").trim();
+    const actorId = String(req.actorId || "").trim();
+    const ownerId = String(req.ownerId || "").trim();
+    if (!tenantId || !actorId || !ownerId) {
+      return jsonErr(res, 403, "NOT_LINKED", "Your account is not fully linked.");
+    }
+
+    const kind = String(req.body?.kind || "").toLowerCase().trim();
+    const action = String(req.body?.action || "").toLowerCase().trim();
+    if (!["break", "lunch", "drive"].includes(kind)) {
+      return jsonErr(res, 400, "INVALID_KIND", "kind must be break, lunch, or drive.");
+    }
+    if (!["start", "stop"].includes(action)) {
+      return jsonErr(res, 400, "INVALID_ACTION", "action must be start or stop.");
+    }
+
+    const { displayName, phoneDigits } = await resolveEmployeeIdentity({ tenantId, actorId });
+    const userId = resolveUserIdKey({ phoneDigits, actorId });
+    const tz = req.tenant?.tz || "America/Toronto";
+
+    // Must have an open shift to start OR stop a segment.
+    const shiftRes = await pg.query(
+      `SELECT id FROM public.time_entries_v2
+        WHERE owner_id = $1 AND user_id = $2 AND kind = 'shift' AND end_at_utc IS NULL
+        ORDER BY start_at_utc DESC
+        LIMIT 1`,
+      [ownerId, userId]
+    );
+    const shift = shiftRes?.rows?.[0];
+    if (!shift?.id) {
+      return jsonErr(res, 409, "NOT_CLOCKED_IN", "You need to clock in before starting a break, lunch, or drive.");
+    }
+
+    const legacyType = LEGACY_TYPE_BY_KIND_ACTION[`${kind}:${action}`];
+    const sourceMsgId = makeSourceMsgId(`portal:${kind}-${action}`, userId);
+
+    let newRowId = null;
+    let tsIso = new Date().toISOString();
+
+    if (action === "start") {
+      // Reject second open segment of the same kind on this shift.
+      const existing = await pg.query(
+        `SELECT id FROM public.time_entries_v2
+          WHERE owner_id = $1 AND parent_id = $2 AND kind = $3 AND end_at_utc IS NULL
+          LIMIT 1`,
+        [ownerId, shift.id, kind]
+      );
+      if (existing?.rows?.length) {
+        return jsonErr(
+          res,
+          409,
+          "SEGMENT_ALREADY_OPEN",
+          `You already have an open ${kind}. End it first.`
+        );
+      }
+
+      const meta = { source: "employee_portal", actor_id: actorId };
+      const ins = await pg.query(
+        `INSERT INTO public.time_entries_v2
+           (owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
+         VALUES ($1, $2, NULL, $3, $4, NOW(), NULL, $5, 'portal', $6)
+         RETURNING id, start_at_utc`,
+        [ownerId, userId, shift.id, kind, meta, sourceMsgId]
+      );
+      const row = ins?.rows?.[0];
+      if (!row?.id) {
+        return jsonErr(res, 500, "INSERT_FAILED", `Could not start ${kind}.`);
+      }
+      newRowId = row.id;
+      tsIso = row.start_at_utc;
+    } else {
+      // stop — close the most recent open segment of this kind.
+      const upd = await pg.query(
+        `UPDATE public.time_entries_v2
+            SET end_at_utc = NOW(), updated_at = NOW()
+          WHERE id = (
+            SELECT id FROM public.time_entries_v2
+             WHERE owner_id = $1 AND parent_id = $2 AND kind = $3 AND end_at_utc IS NULL
+             ORDER BY start_at_utc DESC
+             LIMIT 1
+          )
+          RETURNING id, end_at_utc`,
+        [ownerId, shift.id, kind]
+      );
+      const row = upd?.rows?.[0];
+      if (!row?.id) {
+        return jsonErr(res, 409, "SEGMENT_NOT_OPEN", `You don't have an open ${kind} to end.`);
+      }
+      newRowId = row.id;
+      tsIso = row.end_at_utc;
+    }
+
+    // Legacy dual-write so owner views show the segment event.
+    try {
+      await logTimeEntry(
+        ownerId,
+        displayName || null,
+        legacyType,
+        tsIso,
+        null, // segments don't carry a job_no
+        tz,
+        { source_msg_id: sourceMsgId + ":legacy" }
+      );
+    } catch (e) {
+      console.warn(`[EMPLOYEE_SEGMENT] legacy dual-write failed:`, e?.message || e);
+    }
+
+    console.info("[EMPLOYEE_SEGMENT]", { ownerId, userId, shiftId: shift.id, kind, action, rowId: newRowId });
+    return res.json({ ok: true, id: newRowId, kind, action, at: tsIso });
+  } catch (e) {
+    console.error("[EMPLOYEE] segment error:", e?.message || e);
+    return jsonErr(res, 500, "SEGMENT_FAILED", "Could not record segment.");
   }
 });
 
@@ -243,6 +410,10 @@ router.post("/api/employee/time/clock-in", requirePortalUser(), express.json(), 
     // the shift. Non-fatal — if the legacy insert fails for any reason
     // the shift is still authoritative in v2.
     try {
+      // Don't pass requester_id — time_entries.user_id has a FK to
+      // public.users(user_id) and employees (like Jaclyn) aren't rows
+      // there. Falling back to ownerId satisfies the FK; the row is
+      // still attributable to the employee via employee_name.
       await logTimeEntry(
         ownerId,
         displayName || null,
@@ -250,7 +421,7 @@ router.post("/api/employee/time/clock-in", requirePortalUser(), express.json(), 
         row.start_at_utc,
         resolvedJobNo,
         tz,
-        { requester_id: userId, source_msg_id: sourceMsgId + ":legacy" }
+        { source_msg_id: sourceMsgId + ":legacy" }
       );
     } catch (e) {
       console.warn("[EMPLOYEE_CLOCK_IN] legacy dual-write failed:", e?.message || e);
@@ -339,7 +510,6 @@ router.post("/api/employee/time/clock-out", requirePortalUser(), express.json(),
         jobNo,
         tz,
         {
-          requester_id: userId,
           source_msg_id: makeSourceMsgId("portal:clock-out-legacy", userId),
         }
       );

@@ -56,6 +56,57 @@ function resolveUserIdKey({ phoneDigits, actorId }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// GET /api/employee/jobs
+// Returns { ok, items: [{ id, job_no, name, status }] } — owner's active
+// jobs, for dropdown selection in employee write forms (clock-in,
+// mileage, photos, tasks). Scoped by owner_id only; employees see every
+// active job in the tenant so they can pick the one they're working on.
+// ─────────────────────────────────────────────────────────────────────
+router.get("/api/employee/jobs", requirePortalUser(), async (req, res) => {
+  try {
+    const portalRole = String(req.portalRole || "").toLowerCase();
+    if (!isEmployeeRole(portalRole)) {
+      return jsonErr(res, 403, "PERMISSION_DENIED", "Employee portal only.");
+    }
+
+    const ownerId = String(req.ownerId || "").trim();
+    if (!ownerId) {
+      return jsonErr(res, 403, "NOT_LINKED", "Your account is not fully linked.");
+    }
+
+    const r = await pg.query(
+      `SELECT id,
+              job_no,
+              COALESCE(NULLIF(TRIM(job_name), ''), NULLIF(TRIM(name), ''), 'Untitled job') AS name,
+              status,
+              active
+         FROM public.jobs
+        WHERE owner_id = $1
+          AND deleted_at IS NULL
+          AND (
+            active = true
+            OR LOWER(COALESCE(status, '')) IN ('', 'active', 'open', 'in_progress', 'in progress')
+          )
+        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        LIMIT 200`,
+      [ownerId]
+    );
+
+    const items = (r?.rows || []).map((row) => ({
+      id: row.id,
+      job_no: row.job_no,
+      name: row.name,
+      status: row.status || null,
+    }));
+
+    return res.json({ ok: true, items });
+  } catch (e) {
+    console.error("[EMPLOYEE] jobs error:", e?.message || e);
+    return jsonErr(res, 500, "JOBS_FAILED", "Could not load jobs.");
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // GET /api/employee/time/status
 // Returns { ok, clocked_in, open_shift: {id, start_at_utc, job_id} | null }
 // ─────────────────────────────────────────────────────────────────────
@@ -262,8 +313,26 @@ router.post("/api/employee/mileage", requirePortalUser(), express.json(), async 
     const unit = String(req.body?.unit || "km").toLowerCase() === "mi" ? "mi" : "km";
     const origin = String(req.body?.origin || "").trim().slice(0, 200) || null;
     const destination = String(req.body?.destination || "").trim().slice(0, 200) || null;
-    const jobName = String(req.body?.job_name || "").trim().slice(0, 200) || null;
+    let jobName = String(req.body?.job_name || "").trim().slice(0, 200) || null;
     const notes = String(req.body?.notes || "").trim().slice(0, 500) || null;
+
+    // If the client sent a job_id (preferred), resolve the job name from
+    // the owner's jobs table so we store the canonical label.
+    const jobIdRaw = req.body?.job_id;
+    if (jobIdRaw && /^\d+$/.test(String(jobIdRaw))) {
+      try {
+        const jr = await pg.query(
+          `SELECT COALESCE(NULLIF(TRIM(job_name), ''), NULLIF(TRIM(name), ''), 'Untitled job') AS name
+             FROM public.jobs
+            WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL
+            LIMIT 1`,
+          [ownerId, Number(jobIdRaw)]
+        );
+        if (jr?.rows?.[0]?.name) jobName = jr.rows[0].name;
+      } catch {
+        // fall through — jobName stays as-is
+      }
+    }
 
     const tripDateRaw = String(req.body?.trip_date || "").trim();
     const tripDate = /^\d{4}-\d{2}-\d{2}$/.test(tripDateRaw)

@@ -5,6 +5,38 @@ const pg = require("../services/postgres");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
 const { sendSMS } = require("../services/twilio");
 const { sendEmail } = require("../services/postmark");
+const { getAdminClient } = require("../services/supabaseAdmin");
+
+/**
+ * Generate a Supabase magic link that, when clicked, hydrates a session and
+ * redirects to the invite page with ?claim=1 so the auto-claim path runs.
+ * Returns null on failure — caller should fall back to the bare invite URL.
+ */
+async function generateInviteMagicLink({ email, appBase, token }) {
+  try {
+    const client = getAdminClient();
+    if (!client) return null;
+
+    const returnTo = `/invite/${token}?claim=1`;
+    const redirectTo = `${appBase}/auth/callback?returnTo=${encodeURIComponent(returnTo)}`;
+
+    const { data, error } = await client.auth.admin.generateLink({
+      type: "magiclink",
+      email,
+      options: { redirectTo },
+    });
+
+    if (error) {
+      console.warn("[CREW_INVITE] generateLink failed:", error.message);
+      return null;
+    }
+
+    return data?.properties?.action_link || null;
+  } catch (e) {
+    console.warn("[CREW_INVITE] generateLink exception:", e?.message || e);
+    return null;
+  }
+}
 
 const PLAN_LIMITS = {
   free:    { employees: 3,  board: 0, admin: 0 },
@@ -1034,21 +1066,28 @@ router.post("/admin/invite", requirePortalUser(),express.json(), async (req, res
       }
     } else if (deliveryMethod === "email" && email) {
       try {
+        // Generate a Supabase magic link so the invitee lands authenticated
+        // and the invite auto-claims — one email, one click, no retyping.
+        // Falls back to the bare invite URL if generation fails; that path
+        // still works via the "enter your email" form on the invite page.
+        const magicLink = await generateInviteMagicLink({ email, appBase, token: out.token });
+        const buttonHref = magicLink || inviteUrl;
+
         await sendEmail({
           to: email,
           replyTo: "hello@usechiefos.com",
           subject: "You've been invited to ChiefOS",
-          textBody: inviteMsg,
+          textBody: `You've been invited to join ChiefOS. Tap to get started:\n${buttonHref}\n\nLink expires in 7 days.`,
           htmlBody: `
             <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:32px 16px">
               <p style="font-size:20px;font-weight:600;color:#111">You've been invited to join ChiefOS</p>
               <p style="color:#555">Tap the button below to get started. The link expires in 7 days.</p>
-              <a href="${inviteUrl}"
+              <a href="${buttonHref}"
                  style="display:inline-block;margin-top:16px;padding:12px 24px;background:#D4A853;color:#0C0B0A;font-weight:600;border-radius:10px;text-decoration:none">
                 Accept invite
               </a>
               <p style="margin-top:24px;color:#999;font-size:12px">
-                Or copy this link: <a href="${inviteUrl}" style="color:#D4A853">${inviteUrl}</a>
+                Or copy this link: <a href="${buttonHref}" style="color:#D4A853">${buttonHref}</a>
               </p>
             </div>
           `,

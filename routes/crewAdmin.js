@@ -540,6 +540,172 @@ router.patch("/admin/members/:actorId/role", requirePortalUser(), express.json()
 });
 
 /**
+ * PATCH /api/crew/admin/members/:actorId
+ * Body: { display_name?, phone?, email? }
+ * Owner/admin updates contact info for a member (name/phone/email).
+ */
+router.patch("/admin/members/:actorId", requirePortalUser(), express.json(), async (req, res) => {
+  try {
+    const { tenantId, actorId } = mustCtx(req);
+    const targetActorId = String(req.params.actorId || "").trim();
+    if (!targetActorId) return jsonErr(res, 400, "MISSING_TARGET", "Missing actorId.");
+
+    const hasName = Object.prototype.hasOwnProperty.call(req.body || {}, "display_name");
+    const hasPhone = Object.prototype.hasOwnProperty.call(req.body || {}, "phone");
+    const hasEmail = Object.prototype.hasOwnProperty.call(req.body || {}, "email");
+    if (!hasName && !hasPhone && !hasEmail) {
+      return jsonErr(res, 400, "NO_FIELDS", "Nothing to update.");
+    }
+
+    const displayName = hasName ? String(req.body.display_name || "").trim() : null;
+    const phoneDigits = hasPhone ? normalizePhoneDigits(req.body.phone || "") : null;
+    const email = hasEmail ? String(req.body.email || "").trim().toLowerCase() : null;
+
+    if (hasName && !displayName) {
+      return jsonErr(res, 400, "MISSING_NAME", "Display name cannot be empty.");
+    }
+    if (hasPhone && phoneDigits && !(phoneDigits.length === 11 && phoneDigits.startsWith("1"))) {
+      return jsonErr(
+        res,
+        400,
+        "INVALID_PHONE",
+        "Phone must be 10 digits (Canada/US) or include country code (e.g., 1XXXXXXXXXX)."
+      );
+    }
+
+    const out = await pg.withClient(async (client) => {
+      const actorRole = await getActorRole({ tenantId, actorId }, client);
+      mustOwnerOrAdmin(actorRole, req.portalRole);
+
+      const cur = await client.query(
+        `
+        select p.display_name, p.phone_digits, p.email
+          from public.chiefos_tenant_actor_profiles p
+         where p.tenant_id = $1 and p.actor_id = $2
+         limit 1
+        `,
+        [tenantId, targetActorId]
+      );
+      if (!cur.rowCount) {
+        const err = new Error("Member not found");
+        err.code = "NOT_FOUND";
+        throw err;
+      }
+      const prev = cur.rows[0];
+
+      const nextName = hasName ? displayName : prev.display_name;
+      const nextPhone = hasPhone ? (phoneDigits || null) : prev.phone_digits;
+      const nextEmail = hasEmail ? (email || null) : prev.email;
+
+      if (!nextPhone && !nextEmail) {
+        const err = new Error("Phone or email is required.");
+        err.code = "MISSING_CONTACT";
+        throw err;
+      }
+
+      await client.query(
+        `
+        update public.chiefos_tenant_actor_profiles
+           set display_name = $3,
+               phone_digits = $4,
+               email = $5,
+               updated_at = now()
+         where tenant_id = $1 and actor_id = $2
+        `,
+        [tenantId, targetActorId, nextName, nextPhone, nextEmail]
+      );
+
+      if (hasName && nextName) {
+        await client.query(
+          `
+          update public.chiefos_actors
+             set display_name = $2, updated_at = now()
+           where id = $1
+          `,
+          [targetActorId, nextName]
+        );
+      }
+
+      // Refresh identity rows so ingestion lookups keep resolving to this actor.
+      if (hasPhone) {
+        if (prev.phone_digits && prev.phone_digits !== nextPhone) {
+          const oldCandidates = [
+            prev.phone_digits,
+            "+" + prev.phone_digits,
+            "whatsapp:" + prev.phone_digits,
+            "whatsapp:+" + prev.phone_digits,
+          ];
+          await client.query(
+            `
+            delete from public.chiefos_actor_identities
+             where actor_id = $1
+               and kind = 'whatsapp'
+               and identifier = any($2::text[])
+            `,
+            [targetActorId, oldCandidates]
+          );
+        }
+        if (nextPhone) {
+          await client.query(
+            `
+            insert into public.chiefos_actor_identities (kind, identifier, actor_id, created_at, updated_at)
+            values
+              ('whatsapp', $1, $2, now(), now()),
+              ('whatsapp', '+' || $1, $2, now(), now()),
+              ('whatsapp', 'whatsapp:' || $1, $2, now(), now()),
+              ('whatsapp', 'whatsapp:+' || $1, $2, now(), now())
+            on conflict do nothing
+            `,
+            [nextPhone, targetActorId]
+          );
+        }
+      }
+
+      if (hasEmail) {
+        if (prev.email && prev.email !== nextEmail) {
+          await client.query(
+            `
+            delete from public.chiefos_actor_identities
+             where actor_id = $1 and kind = 'email' and identifier = $2
+            `,
+            [targetActorId, prev.email]
+          );
+        }
+        if (nextEmail) {
+          await client.query(
+            `
+            insert into public.chiefos_actor_identities (kind, identifier, actor_id, created_at, updated_at)
+            values ('email', $1, $2, now(), now())
+            on conflict do nothing
+            `,
+            [nextEmail, targetActorId]
+          );
+        }
+      }
+
+      return {
+        actor_id: targetActorId,
+        display_name: nextName,
+        phone_digits: nextPhone,
+        email: nextEmail,
+      };
+    });
+
+    return res.json({ ok: true, item: out });
+  } catch (e) {
+    const code = e?.code || "UPDATE_MEMBER_FAILED";
+    const status =
+      code === "TENANT_CTX_MISSING" ? 403 :
+      code === "PERMISSION_DENIED" ? 403 :
+      code === "NOT_FOUND" ? 404 :
+      code === "MISSING_CONTACT" ? 400 :
+      500;
+    console.error("[CREW_ADMIN] update member error", e?.message || e);
+    return jsonErr(res, status, code, e?.message || "Unable to update member.");
+  }
+});
+
+/**
  * DELETE /api/crew/admin/members/:actorId
  * Owner/admin can remove a member from the tenant.
  * Safety:

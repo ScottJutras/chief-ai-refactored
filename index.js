@@ -104,6 +104,7 @@ const receiptsRouter = require("./routes/receipts");
 const portalRouter = require("./routes/portal");
 const crewAdminRouter = require("./routes/crewAdmin");
 const inviteClaimRouter = require("./routes/inviteClaim");
+const employeeRouter = require("./routes/employee");
 const jobsPortalRouter = require("./routes/jobsPortal");
 const catalogRouter = require("./routes/catalog");
 const integrityRouter = require("./routes/integrity");
@@ -186,6 +187,9 @@ app.use("/api/crew", crewAdminRouter);
 app.use("/api/crew", requirePortalUser(), require("./routes/crewReview"));
 // Public invite-claim (no portal membership required)
 app.use("/api/invite", inviteClaimRouter);
+// Employee portal write endpoints (clock in/out, log mileage). The router
+// mounts each path under /api/employee/... internally so no prefix here.
+app.use(employeeRouter);
 // AskChief defines POST /api/ask-chief internally
 app.use(askChiefRouter);
 // AskChief SSE stream: POST /api/ask-chief/stream

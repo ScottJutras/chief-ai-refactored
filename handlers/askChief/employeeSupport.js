@@ -16,22 +16,27 @@
 const pg = require("../../services/postgres");
 const { LLMProvider } = require("../../services/llm");
 
+// Employee feature matrix — what they can DO on each plan tier.
+// Employees never submit expenses or revenue on any tier; that's reserved
+// for owner and board members.
 const FEATURES_BY_TIER = {
   free: [
-    "Log your labour hours (timeclock) via text — through WhatsApp or the web portal.",
-    "Log your mileage via text — through WhatsApp or the web portal.",
+    "Log your labour hours (clock in / clock out) via text — WhatsApp or the web portal.",
+    "Log your mileage via text — WhatsApp or the web portal.",
   ],
   starter: [
-    "Log your labour hours (timeclock) via text OR audio — through WhatsApp or the web portal.",
-    "Log your mileage via text OR audio — through WhatsApp or the web portal.",
-    "Create tasks and reminders for yourself; receive tasks assigned to you by the owner.",
+    "Log your labour hours (clock in / clock out) via text or audio — WhatsApp or the web portal.",
+    "Log your mileage via text or audio — WhatsApp or the web portal.",
     "Submit job-site photos with notes.",
+    "Create and be assigned tasks.",
+    "Create and be assigned reminders.",
   ],
   pro: [
-    "Log your labour hours (timeclock) via text OR audio — through WhatsApp or the web portal.",
-    "Log your mileage via text OR audio — through WhatsApp or the web portal.",
-    "Create tasks and reminders for yourself; receive tasks assigned to you by the owner.",
+    "Log your labour hours (clock in / clock out) via text or audio — WhatsApp or the web portal.",
+    "Log your mileage via text or audio — WhatsApp or the web portal.",
     "Submit job-site photos with notes.",
+    "Create and be assigned tasks.",
+    "Create and be assigned reminders.",
   ],
 };
 

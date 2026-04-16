@@ -637,8 +637,14 @@ router.patch("/admin/members/:actorId", requirePortalUser(), express.json(), asy
     }
 
     const out = await pg.withClient(async (client) => {
-      const actorRole = await getActorRole({ tenantId, actorId }, client);
-      mustOwnerOrAdmin(actorRole, req.portalRole);
+      // Self-edit is always allowed (e.g., employee updating their own
+      // phone number from /employee/settings). Cross-actor edits still
+      // require owner/admin.
+      const isSelfEdit = actorId && targetActorId === actorId;
+      if (!isSelfEdit) {
+        const actorRole = await getActorRole({ tenantId, actorId }, client);
+        mustOwnerOrAdmin(actorRole, req.portalRole);
+      }
 
       const cur = await client.query(
         `

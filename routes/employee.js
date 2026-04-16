@@ -603,6 +603,7 @@ router.post("/api/employee/mileage", requirePortalUser(), express.json(), async 
 
     const sourceMsgId = makeSourceMsgId("portal:mileage", userIdKey);
 
+    // mileage_logs.owner_id is UUID (not phone digits).
     const ins = await pg.query(
       `INSERT INTO public.mileage_logs
          (tenant_id, owner_id, employee_user_id, job_name, trip_date, origin, destination,
@@ -612,8 +613,8 @@ router.post("/api/employee/mileage", requirePortalUser(), express.json(), async 
        RETURNING id`,
       [
         tenantId,
-        ownerId,
-        phoneDigits || null, // legacy column: only real phones here
+        tenantId, // owner_id = tenant uuid (column is uuid, not phone digits)
+        phoneDigits || null,
         jobName,
         tripDate,
         origin,

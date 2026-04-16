@@ -633,6 +633,9 @@ router.post("/api/employee/mileage", requirePortalUser(), express.json(), async 
     const sourceMsgId = makeSourceMsgId("portal:mileage", userIdKey);
 
     // mileage_logs.owner_id is UUID (not phone digits).
+    // Always store a stable employee identifier — phone digits preferred,
+    // portal:actorId fallback when phone isn't linked yet.
+    const empUserId = phoneDigits || `portal:${String(actorId).slice(0, 16)}`;
     const ins = await pg.query(
       `INSERT INTO public.mileage_logs
          (tenant_id, owner_id, employee_user_id, job_name, trip_date, origin, destination,
@@ -642,7 +645,7 @@ router.post("/api/employee/mileage", requirePortalUser(), express.json(), async 
       [
         tenantId,
         tenantId, // owner_id = tenant uuid (column is uuid, not phone digits)
-        phoneDigits || null,
+        empUserId,
         jobName,
         tripDate,
         origin,

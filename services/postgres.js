@@ -4388,6 +4388,16 @@ async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras =
     vals.push(sourceMsgId);
   }
 
+  if (extras?.tenant_id) {
+    cols.push('tenant_id');
+    vals.push(extras.tenant_id);
+  }
+
+  if (extras?.job_name) {
+    cols.push('job_name');
+    vals.push(extras.job_name);
+  }
+
   cols.push('created_at');
   const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
 

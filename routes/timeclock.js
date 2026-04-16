@@ -233,6 +233,51 @@ router.get("/api/timeclock/jobs", requirePortalUser(), async (req, res) => {
   }
 });
 
+// ── GET /api/timeclock/active-shifts ─────────────────────────────────
+// Returns all currently open shifts across the tenant for the "Live
+// Activity" widget on the owner dashboard and job detail pages.
+router.get("/api/timeclock/active-shifts", requirePortalUser(), async (req, res) => {
+  try {
+    const tenantId = String(req.tenantId || "").trim();
+    if (!tenantId) return res.json({ ok: true, shifts: [] });
+
+    const jobId = req.query.job_id ? Number(req.query.job_id) : null;
+
+    let sql = `
+      SELECT te.id, te.user_id, te.start_at_utc, te.meta,
+             COALESCE(p.display_name, te.user_id) AS employee_name
+        FROM public.time_entries_v2 te
+        LEFT JOIN public.chiefos_tenant_actor_profiles p
+          ON p.tenant_id = te.tenant_id AND p.phone_digits = te.user_id
+       WHERE te.tenant_id = $1
+         AND te.kind = 'shift'
+         AND te.end_at_utc IS NULL`;
+    const params = [tenantId];
+
+    if (jobId) {
+      sql += ` AND te.meta->>'job_name' = (
+        SELECT COALESCE(NULLIF(TRIM(job_name), ''), NULLIF(TRIM(name), ''))
+          FROM public.jobs WHERE id = $2 AND deleted_at IS NULL LIMIT 1)`;
+      params.push(jobId);
+    }
+
+    sql += ` ORDER BY te.start_at_utc ASC`;
+
+    const { rows } = await pg.query(sql, params);
+    const shifts = rows.map((r) => ({
+      id: r.id,
+      employee_name: r.employee_name,
+      start_at_utc: r.start_at_utc,
+      job_name: r.meta?.job_name || null,
+    }));
+
+    return res.json({ ok: true, shifts });
+  } catch (e) {
+    console.error("[TIMECLOCK_ACTIVE_SHIFTS] error:", e?.message || e);
+    return res.status(500).json({ ok: false, code: "SERVER_ERROR", message: "Could not load active shifts." });
+  }
+});
+
 // ── GET /api/timeclock/status ────────────────────────────────────────
 // Returns { clocked_in, open_shift, open_segments, target } for the
 // resolved target. Accepts target_actor_id via query param.
@@ -374,7 +419,7 @@ router.post("/api/timeclock/clock-in", requirePortalUser(), express.json(), asyn
         row.start_at_utc,
         resolvedJobNo,
         tz,
-        { source_msg_id: sourceMsgId + ":legacy" }
+        { source_msg_id: sourceMsgId + ":legacy", tenant_id: tenantId, job_name: resolvedJobName }
       );
     } catch (e) {
       console.warn("[TIMECLOCK] legacy clock_in dual-write failed:", e?.message || e);
@@ -452,7 +497,7 @@ router.post("/api/timeclock/clock-out", requirePortalUser(), express.json(), asy
         row.end_at_utc,
         jobNo,
         tz,
-        { source_msg_id: makeSourceMsgId("tc:clock-out-legacy", userId) }
+        { source_msg_id: makeSourceMsgId("tc:clock-out-legacy", userId), tenant_id: tenantId, job_name: shiftJobName }
       );
     } catch (e) {
       console.warn("[TIMECLOCK] legacy clock_out dual-write failed:", e?.message || e);

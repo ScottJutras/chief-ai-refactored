@@ -105,6 +105,7 @@ const portalRouter = require("./routes/portal");
 const crewAdminRouter = require("./routes/crewAdmin");
 const inviteClaimRouter = require("./routes/inviteClaim");
 const employeeRouter = require("./routes/employee");
+const timeclockRouter = require("./routes/timeclock");
 const jobsPortalRouter = require("./routes/jobsPortal");
 const catalogRouter = require("./routes/catalog");
 const integrityRouter = require("./routes/integrity");
@@ -190,6 +191,10 @@ app.use("/api/invite", inviteClaimRouter);
 // Employee portal write endpoints (clock in/out, log mileage). The router
 // mounts each path under /api/employee/... internally so no prefix here.
 app.use(employeeRouter);
+// Unified timeclock endpoints (owner/admin/board/employee). Supports
+// target_actor_id so the owner card on /app/activity/time can clock
+// an employee in on their behalf. Paths are /api/timeclock/...
+app.use(timeclockRouter);
 // AskChief defines POST /api/ask-chief internally
 app.use(askChiefRouter);
 // AskChief SSE stream: POST /api/ask-chief/stream

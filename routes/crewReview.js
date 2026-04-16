@@ -38,8 +38,27 @@ async function getActorRole({ tenantId, actorId }, client) {
   return r?.rows?.[0]?.role || null;
 }
 
+// Roles that see the full tenant review queue regardless of
+// per-log reviewer assignment. Board members get full visibility
+// now too, but they cannot act on items created/submitted by the
+// owner — enforced at each action site below.
 function canOverrideReviewer(role) {
-  return role === "owner" || role === "admin";
+  return role === "owner" || role === "admin" || role === "board";
+}
+
+// Look up the tenant owner's actor_id once per request — used to
+// exclude owner-created items from board reviewers.
+async function getOwnerActorId(tenantId, client) {
+  if (!tenantId) return null;
+  const r = await client.query(
+    `select actor_id
+       from public.chiefos_tenant_actors
+      where tenant_id = $1 and role = 'owner'
+      order by created_at asc
+      limit 1`,
+    [tenantId]
+  );
+  return r?.rows?.[0]?.actor_id || null;
 }
 
 // Must match DB CHECK constraint allowed values
@@ -130,8 +149,28 @@ router.get("/review/inbox", requirePortalUser(), requireCrewControlPro(), async 
         const myRole = await getActorRole({ tenantId, actorId }, client);
         if (!myRole) return [];
 
-        const r = await client.query(
-          `
+        const override = canOverrideReviewer(myRole);
+
+        // Board sees the full queue EXCEPT logs created by the owner.
+        // Owner/admin see the full queue. Anyone else falls back to
+        // only the logs where they're the assigned reviewer.
+        let whereExtra = "and l.reviewer_actor_id = $2";
+        const params = [tenantId, actorId];
+
+        if (override) {
+          whereExtra = "";
+          params.length = 1; // just tenantId
+
+          if (myRole === "board") {
+            const ownerActorId = await getOwnerActorId(tenantId, client);
+            if (ownerActorId) {
+              whereExtra = "and l.created_by_actor_id <> $2";
+              params.push(ownerActorId);
+            }
+          }
+        }
+
+        const sql = `
           select
             l.id,
             l.log_no,
@@ -152,13 +191,11 @@ router.get("/review/inbox", requirePortalUser(), requireCrewControlPro(), async 
            and p.actor_id = l.created_by_actor_id
           where l.tenant_id = $1
             and l.status = 'submitted'
-            and l.reviewer_actor_id = $2
+            ${whereExtra}
           order by l.created_at desc
           limit 200
-          `,
-          [tenantId, actorId]
-        );
-
+        `;
+        const r = await client.query(sql, params);
         return r.rows || [];
       },
       { useTransaction: false }
@@ -250,6 +287,16 @@ router.patch("/review/:logId", requirePortalUser(), requireCrewControlPro(), exp
         const err = new Error("Permission denied");
         err.code = "PERMISSION_DENIED";
         throw err;
+      }
+
+      // Board members cannot review items created by the owner.
+      if (myRole === "board") {
+        const ownerActorId = await getOwnerActorId(tenantId, client);
+        if (ownerActorId && String(log.created_by_actor_id || "") === String(ownerActorId)) {
+          const err = new Error("Board members cannot review the owner's activity.");
+          err.code = "PERMISSION_DENIED";
+          throw err;
+        }
       }
 
       // Guard status transitions to prevent races
@@ -477,8 +524,12 @@ router.get("/review/expenses/pending", requirePortalUser(), requireCrewControlPr
         throw err;
       }
 
-      const r = await client.query(
-        `
+      // Board members do not see submissions made BY the owner.
+      // submitted_by stores the submitter's phone digits (paUserId),
+      // and ownerId is the owner's phone digits, so a string compare
+      // is the right exclusion.
+      const excludeOwnerSubmissions = role === "board";
+      const sql = `
         SELECT
           t.id,
           t.kind,
@@ -496,11 +547,13 @@ router.get("/review/expenses/pending", requirePortalUser(), requireCrewControlPr
         WHERE t.owner_id = $1
           AND t.submission_status = 'pending_review'
           AND t.kind IN ('expense', 'revenue')
+          ${excludeOwnerSubmissions ? "AND (t.submitted_by IS NULL OR t.submitted_by <> $2)" : ""}
         ORDER BY t.created_at DESC
         LIMIT 100
-        `,
-        [ownerId]
-      );
+      `;
+      const params = excludeOwnerSubmissions ? [ownerId, ownerId] : [ownerId];
+
+      const r = await client.query(sql, params);
       return r.rows || [];
     });
 
@@ -536,6 +589,23 @@ router.patch("/review/expenses/:id", requirePortalUser(), requireCrewControlPro(
         const err = new Error("Permission denied");
         err.code = "PERMISSION_DENIED";
         throw err;
+      }
+
+      // Board members cannot act on transactions submitted by the
+      // owner. Check submitter before attempting the update.
+      if (role === "board") {
+        const check = await client.query(
+          `SELECT submitted_by FROM public.transactions
+            WHERE owner_id = $1 AND id = $2
+            LIMIT 1`,
+          [ownerId, txId]
+        );
+        const row = check?.rows?.[0];
+        if (row && String(row.submitted_by || "") === String(ownerId)) {
+          const err = new Error("Board members cannot review the owner's submissions.");
+          err.code = "PERMISSION_DENIED";
+          throw err;
+        }
       }
 
       const r = await client.query(

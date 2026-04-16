@@ -674,7 +674,7 @@ router.post("/api/timeclock/mileage", requirePortalUser(), express.json(), async
     // Always store a stable employee identifier so the read side can
     // resolve a name even when the employee hasn't linked a phone yet.
     // Mirrors the userIdKey pattern from the timeclock inserts.
-    const employeeUserId = target.phone_digits || (target.is_self ? null : `portal:${target.actor_id.slice(0, 16)}`);
+    const employeeUserId = target.phone_digits || `portal:${target.actor_id.slice(0, 16)}`;
     const sourceMsgId = makeSourceMsgId(
       target.is_self ? `tc:mileage-self` : `tc:mileage-for:${target.actor_id.slice(0, 8)}`,
       employeeUserId || target.actor_id

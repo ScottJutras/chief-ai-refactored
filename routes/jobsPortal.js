@@ -283,8 +283,8 @@ router.get("/api/jobs/:jobId/phases", requirePortalUser(), async (req, res) => {
          COALESCE(SUM(CASE WHEN t.kind = 'revenue' THEN t.amount_cents ELSE 0 END), 0)::bigint AS revenue_cents
        FROM public.job_phases jp
        LEFT JOIN public.transactions t
-         ON  t.job_id    = jp.job_id
-         AND t.tenant_id = jp.tenant_id
+         ON  t.job_int_id = jp.job_id
+         AND t.tenant_id  = jp.tenant_id
          AND t.transaction_date >= jp.started_at::date
          AND (jp.ended_at IS NULL OR t.transaction_date < jp.ended_at::date)
        WHERE jp.job_id    = $1

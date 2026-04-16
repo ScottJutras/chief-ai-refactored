@@ -675,15 +675,16 @@ router.post("/api/timeclock/mileage", requirePortalUser(), express.json(), async
       employeeUserId || target.actor_id
     );
 
-    // mileage_logs.owner_id is UUID (not phone digits). The migration
-    // defines it as uuid NOT NULL. We store the tenant UUID to satisfy
-    // the constraint — it's the only stable uuid we have in this context.
+    // mileage_logs.owner_id is UUID (not phone digits). We store the
+    // tenant UUID to satisfy the constraint. Skip ON CONFLICT — the
+    // source_msg_id contains a timestamp + random hex so collisions
+    // are effectively impossible and the unique constraint may not
+    // exist in production if the migration was partial.
     const ins = await pg.query(
       `INSERT INTO public.mileage_logs
          (tenant_id, owner_id, employee_user_id, job_name, trip_date, origin, destination,
           distance, unit, rate_cents, deductible_cents, source_msg_id, notes, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
-       ON CONFLICT (owner_id, source_msg_id) DO NOTHING
        RETURNING id`,
       [
         tenantId,

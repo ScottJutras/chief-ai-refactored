@@ -108,6 +108,35 @@ router.get("/api/employee/jobs", requirePortalUser(), async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// GET /api/employee/profile
+// Returns the caller's own identity: actor_id, display_name, phone,
+// email. Used by /employee/settings to know the actor_id for self-edit.
+// ─────────────────────────────────────────────────────────────────────
+router.get("/api/employee/profile", requirePortalUser(), async (req, res) => {
+  try {
+    const tenantId = String(req.tenantId || "").trim();
+    const actorId = String(req.actorId || "").trim();
+    if (!tenantId || !actorId) {
+      return jsonErr(res, 403, "NOT_LINKED", "Your account is not fully linked.");
+    }
+
+    const { displayName, phoneDigits } = await resolveEmployeeIdentity({ tenantId, actorId });
+
+    return res.json({
+      ok: true,
+      actor_id: actorId,
+      display_name: displayName || null,
+      phone_digits: phoneDigits || null,
+      email: null, // caller can get their own email from supabase.auth.getUser()
+      role: String(req.portalRole || "").toLowerCase() || null,
+    });
+  } catch (e) {
+    console.error("[EMPLOYEE] profile error:", e?.message || e);
+    return jsonErr(res, 500, "PROFILE_FAILED", "Could not load profile.");
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // GET /api/employee/time/status
 // Returns { ok, clocked_in, open_shift: {id, start_at_utc, job_id} | null }
 // ─────────────────────────────────────────────────────────────────────
@@ -609,7 +638,6 @@ router.post("/api/employee/mileage", requirePortalUser(), express.json(), async 
          (tenant_id, owner_id, employee_user_id, job_name, trip_date, origin, destination,
           distance, unit, rate_cents, deductible_cents, source_msg_id, notes, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
-       ON CONFLICT (owner_id, source_msg_id) DO NOTHING
        RETURNING id`,
       [
         tenantId,

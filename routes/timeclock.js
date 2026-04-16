@@ -309,6 +309,7 @@ router.post("/api/timeclock/clock-in", requirePortalUser(), express.json(), asyn
       return jsonErr(res, resolved.error.status, resolved.error.code, resolved.error.message);
     }
     const target = resolved.target;
+    const tenantId = String(req.tenantId || "").trim();
     const ownerId = String(req.ownerId || "").trim();
     const userId = userIdKey({ phoneDigits: target.phone_digits, actorId: target.actor_id });
     const tz = req.tenant?.tz || "America/Toronto";
@@ -507,6 +508,7 @@ router.post("/api/timeclock/segment", requirePortalUser(), express.json(), async
       return jsonErr(res, 400, "INVALID_ACTION", "action must be start or stop.");
     }
 
+    const tenantId = String(req.tenantId || "").trim();
     const ownerId = String(req.ownerId || "").trim();
     const userId = userIdKey({ phoneDigits: target.phone_digits, actorId: target.actor_id });
     const tz = req.tenant?.tz || "America/Toronto";

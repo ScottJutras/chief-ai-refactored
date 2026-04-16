@@ -606,4 +606,286 @@ router.post("/api/timeclock/segment", requirePortalUser(), express.json(), async
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// Mileage — unified endpoint. Same permission matrix as the timeclock
+// actions: owner/admin act on anyone, board act on anyone except the
+// owner, employee acts on self only. Writes into public.mileage_logs
+// with employee_user_id set to the target's phone digits (null when
+// the target is portal-only without a phone).
+// ─────────────────────────────────────────────────────────────────────
+
+// POST /api/timeclock/mileage
+// Body: { target_actor_id?, trip_date?, distance, unit?, origin?,
+//         destination?, job_id?, job_name?, notes? }
+router.post("/api/timeclock/mileage", requirePortalUser(), express.json(), async (req, res) => {
+  try {
+    const resolved = await resolveTarget(req);
+    if (resolved.error) {
+      return jsonErr(res, resolved.error.status, resolved.error.code, resolved.error.message);
+    }
+    const target = resolved.target;
+    const tenantId = String(req.tenantId || "").trim();
+    const ownerId = String(req.ownerId || "").trim();
+
+    const distance = Number(req.body?.distance);
+    if (!Number.isFinite(distance) || distance <= 0) {
+      return jsonErr(res, 400, "INVALID_DISTANCE", "Distance must be a positive number.");
+    }
+    if (distance > 10000) {
+      return jsonErr(res, 400, "INVALID_DISTANCE", "Distance looks too large — please re-check.");
+    }
+
+    const unit = String(req.body?.unit || "km").toLowerCase() === "mi" ? "mi" : "km";
+    const origin = String(req.body?.origin || "").trim().slice(0, 200) || null;
+    const destination = String(req.body?.destination || "").trim().slice(0, 200) || null;
+    const notes = String(req.body?.notes || "").trim().slice(0, 500) || null;
+
+    // Job reference — prefer job_id lookup, fall back to literal job_name.
+    let jobName = String(req.body?.job_name || "").trim().slice(0, 200) || null;
+    const jobIdRaw = req.body?.job_id;
+    if (jobIdRaw && /^\d+$/.test(String(jobIdRaw))) {
+      try {
+        const jr = await pg.query(
+          `SELECT COALESCE(NULLIF(TRIM(job_name), ''), NULLIF(TRIM(name), ''), 'Untitled job') AS name
+             FROM public.jobs
+            WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL
+            LIMIT 1`,
+          [ownerId, Number(jobIdRaw)]
+        );
+        if (jr?.rows?.[0]?.name) jobName = jr.rows[0].name;
+      } catch {
+        // non-fatal
+      }
+    }
+
+    const tripDateRaw = String(req.body?.trip_date || "").trim();
+    const tripDate = /^\d{4}-\d{2}-\d{2}$/.test(tripDateRaw)
+      ? tripDateRaw
+      : new Date().toISOString().slice(0, 10);
+
+    // Conservative per-unit rate — owner WhatsApp handler re-tiers
+    // via CRA YTD rules, which is fine to let run on next WhatsApp
+    // mileage entry. Portal entries get the flat rate.
+    const rateCents = unit === "mi" ? 70 : 72;
+    const deductibleCents = Math.round(distance * rateCents);
+
+    const employeeUserId = target.phone_digits || null; // legacy column expects phone digits
+    const sourceMsgId = makeSourceMsgId(
+      target.is_self ? `tc:mileage-self` : `tc:mileage-for:${target.actor_id.slice(0, 8)}`,
+      employeeUserId || target.actor_id
+    );
+
+    const ins = await pg.query(
+      `INSERT INTO public.mileage_logs
+         (tenant_id, owner_id, employee_user_id, job_name, trip_date, origin, destination,
+          distance, unit, rate_cents, deductible_cents, source_msg_id, notes, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW(), NOW())
+       ON CONFLICT (owner_id, source_msg_id) DO NOTHING
+       RETURNING id`,
+      [
+        tenantId,
+        ownerId,
+        employeeUserId,
+        jobName,
+        tripDate,
+        origin,
+        destination,
+        distance,
+        unit,
+        rateCents,
+        deductibleCents,
+        sourceMsgId,
+        notes,
+      ]
+    );
+    const row = ins?.rows?.[0];
+    if (!row?.id) {
+      return jsonErr(res, 500, "INSERT_FAILED", "Could not record trip.");
+    }
+
+    console.info("[TIMECLOCK_MILEAGE]", {
+      callerRole: req.portalRole,
+      target: target.actor_id,
+      ownerId,
+      distance,
+      unit,
+      id: row.id,
+    });
+    return res.json({ ok: true, id: row.id, target: { actor_id: target.actor_id, display_name: target.display_name } });
+  } catch (e) {
+    console.error("[TIMECLOCK] mileage error:", e?.message || e);
+    return jsonErr(res, 500, "MILEAGE_FAILED", "Could not log trip.");
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Tasks — create + complete. Same permission matrix as timeclock:
+// owner/admin can assign to anyone, board can assign to anyone but
+// the owner, employees can only create tasks assigned to themselves.
+// ─────────────────────────────────────────────────────────────────────
+
+// POST /api/timeclock/tasks
+// Body: { target_actor_id?, title, body?, due_date?, job_id? }
+router.post("/api/timeclock/tasks", requirePortalUser(), express.json(), async (req, res) => {
+  try {
+    const resolved = await resolveTarget(req);
+    if (resolved.error) {
+      return jsonErr(res, resolved.error.status, resolved.error.code, resolved.error.message);
+    }
+    const target = resolved.target;
+    const ownerId = String(req.ownerId || "").trim();
+
+    const title = String(req.body?.title || "").trim().slice(0, 200);
+    if (!title) {
+      return jsonErr(res, 400, "MISSING_TITLE", "Task title is required.");
+    }
+    const body = String(req.body?.body || "").trim().slice(0, 2000) || null;
+
+    const dueDateRaw = String(req.body?.due_date || "").trim();
+    const dueAt = /^\d{4}-\d{2}-\d{2}$/.test(dueDateRaw)
+      ? new Date(dueDateRaw + "T00:00:00")
+      : null;
+
+    // Resolve job_id → job_no + (optional) job name for display context.
+    let jobNo = null;
+    const jobIdRaw = req.body?.job_id;
+    if (jobIdRaw && /^\d+$/.test(String(jobIdRaw))) {
+      try {
+        const jr = await pg.query(
+          `SELECT job_no FROM public.jobs
+            WHERE owner_id = $1 AND id = $2 AND deleted_at IS NULL
+            LIMIT 1`,
+          [ownerId, Number(jobIdRaw)]
+        );
+        jobNo = jr?.rows?.[0]?.job_no ?? null;
+      } catch {
+        // non-fatal
+      }
+    }
+
+    // assigned_to = target's display_name to match the crewSelf read
+    // path which queries LOWER(assigned_to) = LOWER(displayName).
+    const assignedTo = target.display_name || null;
+    const createdBy = String(req.actorId || "").trim() || null;
+    const sourceMsgId = makeSourceMsgId(
+      target.is_self ? "tc:task-self" : `tc:task-for:${target.actor_id.slice(0, 8)}`,
+      createdBy || "portal"
+    );
+
+    const ins = await pg.query(
+      `INSERT INTO public.tasks
+         (owner_id, created_by, assigned_to, title, body, type, due_at, job_no, source_msg_id, status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, 'general', $6, $7, $8, 'open', NOW(), NOW())
+       ON CONFLICT DO NOTHING
+       RETURNING id, task_no, title, assigned_to, due_at, status`,
+      [ownerId, createdBy, assignedTo, title, body, dueAt, jobNo, sourceMsgId]
+    );
+
+    const row = ins?.rows?.[0];
+    if (!row?.id) {
+      return jsonErr(res, 500, "INSERT_FAILED", "Could not create task.");
+    }
+
+    console.info("[TIMECLOCK_TASK_CREATE]", {
+      callerRole: req.portalRole,
+      target: target.actor_id,
+      id: row.id,
+      jobNo,
+    });
+    return res.json({ ok: true, task: row });
+  } catch (e) {
+    console.error("[TIMECLOCK] task create error:", e?.message || e);
+    return jsonErr(res, 500, "TASK_CREATE_FAILED", "Could not create task.");
+  }
+});
+
+// PATCH /api/timeclock/tasks/:id — mark done / reopen / delete
+// Body: { action: "done"|"reopen"|"delete" }
+router.patch("/api/timeclock/tasks/:id", requirePortalUser(), express.json(), async (req, res) => {
+  try {
+    const ownerId = String(req.ownerId || "").trim();
+    const tenantId = String(req.tenantId || "").trim();
+    const callerActorId = String(req.actorId || "").trim();
+    const callerRole = String(req.portalRole || "").toLowerCase();
+    if (!ownerId || !tenantId || !callerActorId) {
+      return jsonErr(res, 403, "NOT_LINKED", "Your account is not fully linked.");
+    }
+
+    const taskId = String(req.params.id || "").trim();
+    if (!taskId) return jsonErr(res, 400, "MISSING_ID", "task id required.");
+
+    const action = String(req.body?.action || "").toLowerCase().trim();
+    if (!["done", "reopen", "delete"].includes(action)) {
+      return jsonErr(res, 400, "INVALID_ACTION", "action must be done, reopen, or delete.");
+    }
+    const newStatus = action === "done" ? "done" : action === "reopen" ? "open" : "deleted";
+
+    // Load the task and figure out whose it is.
+    const t = await pg.query(
+      `SELECT id, owner_id, assigned_to, status
+         FROM public.tasks
+        WHERE owner_id = $1 AND id = $2
+        LIMIT 1`,
+      [ownerId, taskId]
+    );
+    const task = t?.rows?.[0];
+    if (!task) return jsonErr(res, 404, "NOT_FOUND", "Task not found.");
+
+    // Permission: owner/admin can touch anything; board can touch
+    // anything except tasks assigned to the owner; employees can
+    // only touch tasks assigned to themselves.
+    if (callerRole !== "owner" && callerRole !== "admin") {
+      // Need the caller's display name to compare against assigned_to.
+      const cr = await pg.query(
+        `SELECT display_name FROM public.chiefos_tenant_actor_profiles
+          WHERE tenant_id = $1 AND actor_id = $2 LIMIT 1`,
+        [tenantId, callerActorId]
+      );
+      const callerName = String(cr?.rows?.[0]?.display_name || "").toLowerCase().trim();
+      const assignedLower = String(task.assigned_to || "").toLowerCase().trim();
+
+      if (callerRole === "board") {
+        // Block if task is assigned to the owner.
+        const ownerActorRow = await pg.query(
+          `SELECT p.display_name FROM public.chiefos_tenant_actors a
+             LEFT JOIN public.chiefos_tenant_actor_profiles p
+               ON p.tenant_id = a.tenant_id AND p.actor_id = a.actor_id
+            WHERE a.tenant_id = $1 AND a.role = 'owner' LIMIT 1`,
+          [tenantId]
+        );
+        const ownerName = String(ownerActorRow?.rows?.[0]?.display_name || "").toLowerCase().trim();
+        if (ownerName && assignedLower === ownerName) {
+          return jsonErr(res, 403, "PERMISSION_DENIED", "Board members cannot edit the owner's tasks.");
+        }
+      } else {
+        // Employee — must be assigned to themselves.
+        if (!callerName || callerName !== assignedLower) {
+          return jsonErr(res, 403, "PERMISSION_DENIED", "You can only complete your own tasks.");
+        }
+      }
+    }
+
+    const upd = await pg.query(
+      `UPDATE public.tasks
+          SET status = $1, updated_at = NOW()
+        WHERE owner_id = $2 AND id = $3
+        RETURNING id, status`,
+      [newStatus, ownerId, taskId]
+    );
+    if (!upd.rowCount) {
+      return jsonErr(res, 404, "NOT_FOUND", "Task not found.");
+    }
+
+    console.info("[TIMECLOCK_TASK_PATCH]", {
+      callerRole,
+      taskId,
+      action,
+    });
+    return res.json({ ok: true, task: upd.rows[0] });
+  } catch (e) {
+    console.error("[TIMECLOCK] task patch error:", e?.message || e);
+    return jsonErr(res, 500, "TASK_PATCH_FAILED", "Could not update task.");
+  }
+});
+
 module.exports = router;

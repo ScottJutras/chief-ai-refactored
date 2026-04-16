@@ -355,10 +355,10 @@ router.post("/api/timeclock/clock-in", requirePortalUser(), express.json(), asyn
 
     const ins = await pg.query(
       `INSERT INTO public.time_entries_v2
-         (owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
-       VALUES ($1, $2, NULL, NULL, 'shift', NOW(), NULL, $3, 'portal', $4)
+         (tenant_id, owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
+       VALUES ($1, $2, $3, NULL, NULL, 'shift', NOW(), NULL, $4, 'portal', $5)
        RETURNING id, start_at_utc`,
-      [ownerId, userId, meta, sourceMsgId]
+      [tenantId, ownerId, userId, meta, sourceMsgId]
     );
     const row = ins?.rows?.[0];
     if (!row?.id) {
@@ -546,10 +546,10 @@ router.post("/api/timeclock/segment", requirePortalUser(), express.json(), async
       };
       const ins = await pg.query(
         `INSERT INTO public.time_entries_v2
-           (owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
-         VALUES ($1, $2, NULL, $3, $4, NOW(), NULL, $5, 'portal', $6)
+           (tenant_id, owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
+         VALUES ($1, $2, $3, NULL, $4, $5, NOW(), NULL, $6, 'portal', $7)
          RETURNING id, start_at_utc`,
-        [ownerId, userId, shift.id, kind, meta, sourceMsgId]
+        [tenantId, ownerId, userId, shift.id, kind, meta, sourceMsgId]
       );
       const row = ins?.rows?.[0];
       if (!row?.id) {

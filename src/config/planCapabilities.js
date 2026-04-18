@@ -67,6 +67,8 @@ const plan_capabilities = {
       ask_chief: { enabled: true, owner_only: true, monthly_questions: 10, behavior: "pause" },
     },
 
+    quotes: { enabled: false, monthly_capacity: 0, behavior: "pause" },
+
     exports: { enabled: true, watermark: true },
 
     approvals: { enabled: false },
@@ -126,6 +128,8 @@ const plan_capabilities = {
     reasoning: {
       ask_chief: { enabled: true, owner_only: true, monthly_questions: 250, behavior: "pause" },
     },
+
+    quotes: { enabled: true, monthly_capacity: 50, behavior: "pause" },
 
     exports: { enabled: true, watermark: false },
 
@@ -192,6 +196,8 @@ const plan_capabilities = {
     reasoning: {
       ask_chief: { enabled: true, owner_only: true, monthly_questions: 1000, behavior: "pause" },
     },
+
+    quotes: { enabled: true, monthly_capacity: 500, behavior: "pause" },
 
     exports: { enabled: true, watermark: false },
 

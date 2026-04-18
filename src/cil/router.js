@@ -38,18 +38,9 @@ const NEW_IDIOM_HANDLERS = Object.freeze({
   // ReissueQuote: handleReissueQuote,
 });
 
-// ── Constitution §9 error envelope ──────────────────────────────────────────
-function errEnvelope({ code, message, hint, traceId }) {
-  return {
-    ok: false,
-    error: {
-      code,
-      message,
-      hint: hint || null,
-      traceId: traceId || null,
-    },
-  };
-}
+// Constitution §9 error envelope lives in src/cil/utils.js so the facade
+// and every new-idiom handler share one shape (§17.16).
+const { errEnvelope } = require('./utils');
 
 /**
  * applyCIL — single public CIL entry point (§17.5, §17.12).

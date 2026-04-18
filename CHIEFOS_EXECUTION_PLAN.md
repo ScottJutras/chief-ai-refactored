@@ -138,6 +138,18 @@ so the context survives memory reset.
   probably bundled with a future schema-hygiene migration, not urgent.
   Flagged 2026-04-18 during C2 decision session (§17.14).
 
+- **C7 completed 2026-04-19 — `public.audit` consumer grep.** Live-tree
+  hits: `services/audit.js:15` (`SELECT id FROM public.audit` inside
+  `ensureNotDuplicate`) and `services/audit.js:31` (`INSERT INTO
+  public.audit` inside `recordAudit`). Callers of the module:
+  `domain/lead.js`, `domain/changeOrder.js`, `domain/agreement.js`. No
+  quote-relevant consumers (no reader selects from `public.audit`
+  expecting Quote operations); no test fixtures; `domain/quote.js` no
+  longer calls the audit service. All hits are category (1) — legitimate
+  legacy infrastructure; no action required until §17.3 fires
+  (services/audit.js retires alongside `cil.js` when all legacy handlers
+  migrate per §17.2). Visibility gap per §17.8 confirmed as non-blocking.
+
 ### 1.3 — Invoice Spine
 - ✅ Invoice generation from quote (quote → invoice flow) *(pre-sprint — fully built)*
 - ✅ Invoice PDF generation with branding *(pre-sprint)*

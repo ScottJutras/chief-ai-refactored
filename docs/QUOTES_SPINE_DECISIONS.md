@@ -49,6 +49,13 @@ migration context.
     insert version, insert line items, UPDATE header pointer, emit audit
     events — all in one transaction. No orphan rows possible; no reliance
     on `DEFERRABLE` FK.
+  - **Plan gating (§17.16).** All gated new-idiom handlers resolve plan
+    and monthly usage via shared `gateNewIdiomHandler(ctx, checkFn,
+    kindLiteral)` in `src/cil/utils.js`. Gating runs after schema
+    validation and before the §17.14 transaction opens; counter
+    increments only after successful commit. `errEnvelope` lives in
+    `utils.js` as the single source of Constitution §9 shape. Legacy
+    caller-resolves pattern unchanged; principle governs new-idiom only.
   - **Dedup (§17.8–§17.11).** Entity-table `(owner_id, source_msg_id) UNIQUE`
     is canonical for CIL-retry dedup on root entities; events' `external_event_id`
     partial UNIQUE is a distinct webhook-retry dedup surface — do not conflate.
@@ -68,6 +75,12 @@ migration context.
   generic `allocateNextDocCounter(tenantId, counterKind, client)` for new-
   idiom handlers. Design shape committed 2026-04-18; SQL lands in its own
   session as a pre-CreateQuote dependency.
+- **§19 — Plan gating for CreateQuote.** Adapts `canUseOCR` pattern.
+  New capability block `quotes` (Starter 50/mo, Pro 500/mo, Free
+  disabled) at top level of each tier. Denial codes
+  `QUOTES_REQUIRES_STARTER`, `QUOTES_CAPACITY_REACHED`. Counter kind
+  `'quote_created'` on `usage_monthly_v2`, increments after commit.
+  Call via §17.16 helper.
 
 ## §0. Source of truth
 - Handoff: `C:\Users\scott\Documents\mission-quote-standalone\QUOTES_HANDOFF_TO_CHIEFOS.md`
@@ -1666,6 +1679,44 @@ CreateQuote (no UPDATE) and EditDraft/ReissueQuote (UPDATE required).
 
 **§17.14 committed 2026-04-18.**
 
+**§17.16 — Plan gating for new-idiom handlers.** All new-idiom CIL
+handlers subject to plan gating resolve plan and monthly usage via the
+shared `gateNewIdiomHandler(ctx, checkFn, kindLiteral)` helper in
+`src/cil/utils.js`. Handlers do not resolve plan directly and do not
+trust a pre-resolved `ctx.plan` field. The helper centralizes plan
+resolution, usage lookup, and denial envelope composition so every
+gated handler produces an identical denial envelope shape.
+
+Gating runs **after** BaseCILZ schema validation and **before** the
+§17.14 transaction opens. Failure returns the denial envelope directly;
+no DB writes, no events emitted.
+
+Counter increment happens **after** successful transaction commit, not
+before. Rationale: (a) rolled-back transactions don't burn counter,
+(b) idempotent retries catch at `classifyUniqueViolation` before counter
+call, (c) matches established pattern in `services/answerChief.js`.
+
+Legacy caller-resolves pattern (e.g., `handlers/media.js:1225`) remains
+for legacy handlers. This principle governs new-idiom only. Legacy
+handlers migrate to this pattern only if §17.2 trigger fires on them for
+other reasons.
+
+Tightening committed in the implementation:
+- `errEnvelope` is also exported from `src/cil/utils.js` (moved from
+  `src/cil/router.js`). Single source of truth for the §9 shape across
+  the facade and every gated handler.
+- `resolvePlanForOwner(ownerId)` in utils.js is the canonical plan
+  resolver for new-idiom handlers: queries `public.users(plan_key,
+  sub_status)` and runs the row through `getEffectivePlanKey` so
+  entitlement status (active/trialing) is honored. Fail-closed — any
+  lookup failure resolves to `'free'` per CLAUDE.md.
+- `gateNewIdiomHandler` accepts optional dependency overrides
+  (`deps.resolvePlan`, `deps.getMonthlyUsage`) for unit testing. Live
+  callers never pass deps; tests do.
+
+**§17.16 committed 2026-04-19.** (§17.15 reserved for the return-shape
+decision landing in C6 this same session.)
+
 ---
 
 ## §18. Migration 5 design shape — counter table restructure
@@ -1720,7 +1771,61 @@ Migration 5 lands **before** CreateQuote handler code.
 **§18 shape committed 2026-04-18. SQL proposal and verification in a
 separate session.**
 
+## §19. Plan gating for CreateQuote — adaptation of canUseOCR pattern (2026-04-19)
+
+**Decision.** CreateQuote plan gating mirrors the `canUseOCR` pattern
+structurally. New capability block `quotes: { enabled, monthly_capacity,
+behavior }` at the top level of each tier (sibling to `capture`, `reasoning`
+— not nested, because quotes are document-lifecycle not capture). New
+function `canCreateQuote(plan, usedQuotesThisMonth)` in `checkCapability.js`.
+Denial codes `QUOTES_REQUIRES_STARTER` and `QUOTES_CAPACITY_REACHED` in
+`planMessages.js`. Counter `kind='quote_created'` on `usage_monthly_v2`,
+incremented **after** successful transaction commit (§17.16).
+
+**Tier table.**
+
+| Plan | Enabled | Monthly capacity |
+|---|---|---|
+| free | ❌ | 0 |
+| starter | ✅ | 50 |
+| pro | ✅ | 500 |
+
+**Starter capacity reasoning (50/mo).** Quotes are low-volume effortful
+creation (typical contractor 5–15/mo, busy 30–50/mo), unlike OCR high-
+volume reactive capture. 50/mo aligns with voice-minutes Starter (the
+other effortful-creation activity on the plan). 10× Pro scaling matches
+voice (50→500). Upgrade pressure triggers at commercial-sales-team scale
+where tooling needs genuinely diverge (multi-estimator workflows, shared
+templates). Rejected: 30 (matches OCR — wrong volume class), 25
+(independent round number — no principled justification).
+
+**Counter-kind literal (`'quote_created'`).** Singular, past tense.
+Rationale: matches the per-event counting semantic (each increment
+corresponds to one `lifecycle.created` emission in
+`chiefos_quote_events`). Existing v2 kinds are inconsistent
+(`ask_chief_questions` plural, `ocr_receipts_count` count-suffix,
+`voice_minutes` unit-of-measure) so no established convention to match —
+setting new-idiom convention here.
+
+**Denial copy choices.**
+- `QUOTES_REQUIRES_STARTER` carves out the unaffected Free-tier surface
+  ("you can still log jobs, time, and expenses") so Free users don't
+  feel globally blocked.
+- `QUOTES_CAPACITY_REACHED` explicitly notes existing quotes stay
+  visible/signable so mid-pipeline quotes don't feel orphaned when the
+  monthly limit trips.
+
+**Counter-increment timing.** After successful transaction commit, not
+before. See §17.16 for full rationale.
+
+**Call site.** Via `gateNewIdiomHandler(ctx, canCreateQuote,
+'quote_created')` per §17.16. Gating runs after BaseCILZ schema
+validation and before the §17.14 transaction opens.
+
+**§19 committed 2026-04-19.**
+
 ## Next entries (to be added as decisions land)
-- §19. Plan-gating quota counter granularity
-- §20. Template table schema (when tenant template editor is designed)
-- §21. Cross-quote pointer enforcement (the 4-column composite FK, if needed)
+- §17.15. Return shape for new-idiom handlers (C6 — this session)
+- §20. Input contract (Zod schema) for CreateQuote (C4 — this session)
+- §21. Template table schema (when tenant template editor is designed)
+- §22. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

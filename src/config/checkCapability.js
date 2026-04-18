@@ -138,6 +138,28 @@ function canUseOCR(plan, usedReceiptsThisMonth) {
   return allow();
 }
 
+/**
+ * Quote creation: tier-gated + monthly capacity.
+ * Starter 50/mo, Pro 500/mo, Free disabled. See §19 in
+ * docs/QUOTES_SPINE_DECISIONS.md for capacity-number reasoning.
+ * Call via gateNewIdiomHandler in src/cil/utils.js per §17.16.
+ */
+function canCreateQuote(plan, usedQuotesThisMonth) {
+  const p = getPlanOrDefault(plan);
+  const caps = getCaps(p);
+
+  if (!caps.quotes || caps.quotes.enabled !== true) {
+    return deny("QUOTES_REQUIRES_STARTER");
+  }
+
+  const cap = caps.quotes.monthly_capacity;
+  if (typeof cap === "number" && typeof usedQuotesThisMonth === "number" && usedQuotesThisMonth >= cap) {
+    return deny("QUOTES_CAPACITY_REACHED");
+  }
+
+  return allow();
+}
+
 function canUseVoice(plan, usedVoiceMinutesThisMonth) {
   const p = getPlanOrDefault(plan);
   const caps = getCaps(p);
@@ -225,6 +247,7 @@ module.exports = {
   canAskChief,
   canExport,
   canUseOCR,
+  canCreateQuote,
   canUseVoice,
   canUseApprovals,
   canLogTime,

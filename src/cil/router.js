@@ -4,51 +4,39 @@
 //
 // Callers import `applyCIL` from this module (NOT from services/cilRouter).
 // The facade inspects `rawCil.type`, dispatches:
-//   - registered new-idiom types    → handler from NEW_IDIOM_HANDLERS registry
+//   - registered new-idiom types    → handler from NEW_IDIOM_HANDLERS map
 //   - everything else                → legacy router via runtime require (§17.5)
 //
 // When §17.3 fires (legacy handler count reaches zero), the legacy delegation
 // branch is removed and services/cilRouter.js is deleted in the same PR.
 
 // ── New-idiom handler registry ──────────────────────────────────────────────
-// Populated at handler-module load time via registerNewIdiomHandler() (§17.4).
-// Empty at facade creation; first entries land when CreateQuote ships.
-const NEW_IDIOM_HANDLERS = Object.create(null);
+// STATIC, FROZEN MAP per §17.12. New handlers land in two explicit steps:
+//   (a) add `const { handleFooBar } = require('./foo');` below
+//   (b) add `FooBar: handleFooBar,` to the map
+// Both in this file. No runtime registration API — the map is the registry.
+//
+// Forgetting step (b) means the type falls through to legacy and returns
+// CIL_TYPE_UNKNOWN on first call — loud at the call site, caught in review
+// by the router.js diff. See §17.12 rejected alternatives.
+//
+// Freezing prevents future sessions from accidentally re-introducing a
+// runtime-registration side channel. If you're tempted to mutate this map
+// at runtime: don't. Add to the map literal and redeploy.
 
-/**
- * Register a new-idiom CIL handler. Called from src/cil/<doctype>.js modules
- * (e.g., src/cil/quotes.js for CreateQuote / SendQuote / etc.).
- *
- * @param {string} type - CIL type literal, e.g. 'CreateQuote'.
- * @param {(cil: Object, ctx: Object) => Promise<Object>} handler
- * @throws if the type is missing, handler isn't a function, or the type is already registered.
- */
-function registerNewIdiomHandler(type, handler) {
-  if (!type || typeof type !== 'string') {
-    throw new Error(`registerNewIdiomHandler: type must be a non-empty string (got ${type})`);
-  }
-  if (typeof handler !== 'function') {
-    throw new Error(`registerNewIdiomHandler: handler must be a function for type='${type}'`);
-  }
-  if (NEW_IDIOM_HANDLERS[type]) {
-    throw new Error(`registerNewIdiomHandler: duplicate registration for type='${type}'`);
-  }
-  NEW_IDIOM_HANDLERS[type] = handler;
-}
+// Imports for registered handlers (populated as each handler ships).
+// First handler lands with CreateQuote in a future session.
+// Example (uncomment when src/cil/quotes.js exports handleCreateQuote):
+// const { handleCreateQuote } = require('./quotes');
 
-/**
- * Test-only: deregister a previously-registered handler. NOT part of the
- * public API; handlers in production never deregister.
- *
- * @param {string} type
- */
-function _deregisterNewIdiomHandlerForTesting(type) {
-  delete NEW_IDIOM_HANDLERS[type];
-}
-
-function isNewIdiomType(type) {
-  return !!(type && NEW_IDIOM_HANDLERS[type]);
-}
+const NEW_IDIOM_HANDLERS = Object.freeze({
+  // CreateQuote: handleCreateQuote,
+  // SendQuote:   handleSendQuote,
+  // SignQuote:   handleSignQuote,
+  // LockQuote:   handleLockQuote,
+  // VoidQuote:   handleVoidQuote,
+  // ReissueQuote: handleReissueQuote,
+});
 
 // ── Constitution §9 error envelope ──────────────────────────────────────────
 function errEnvelope({ code, message, hint, traceId }) {
@@ -64,7 +52,7 @@ function errEnvelope({ code, message, hint, traceId }) {
 }
 
 /**
- * applyCIL — single public CIL entry point (§17.5).
+ * applyCIL — single public CIL entry point (§17.5, §17.12).
  *
  * @param {Object} rawCil - CIL payload; must have a `type` field.
  * @param {Object} ctx - handler context (owner_id, tenant_id, source_msg_id, traceId, ...).
@@ -92,9 +80,10 @@ async function applyCIL(rawCil, ctx) {
     });
   }
 
-  // New-idiom dispatch.
-  if (isNewIdiomType(type)) {
-    return NEW_IDIOM_HANDLERS[type](rawCil, ctx);
+  // New-idiom dispatch — lookup in the frozen map.
+  const newHandler = NEW_IDIOM_HANDLERS[type];
+  if (newHandler) {
+    return newHandler(rawCil, ctx);
   }
 
   // Legacy delegation. Runtime require is load-bearing per §17.5 — do not
@@ -110,10 +99,4 @@ async function applyCIL(rawCil, ctx) {
   return legacyRouter.applyCIL(rawCil, ctx);
 }
 
-module.exports = {
-  applyCIL,
-  registerNewIdiomHandler,
-  isNewIdiomType,
-  // test-only:
-  _deregisterNewIdiomHandlerForTesting,
-};
+module.exports = { applyCIL };

@@ -1,6 +1,13 @@
 // src/cil/router.test.js
-// Facade tests: new-idiom dispatch, legacy delegation, error envelope consistency.
-// See docs/QUOTES_SPINE_DECISIONS.md §17.
+// Facade tests: dispatch paths that exist in the current state (empty new-idiom
+// map + legacy delegation + error envelopes). See docs/QUOTES_SPINE_DECISIONS.md
+// §17 (CIL Architecture Principles) — specifically §17.12 (static frozen map,
+// no runtime registration).
+//
+// New-idiom dispatch coverage lands with the first handler (CreateQuote):
+// its own integration test suite will exercise the NEW_IDIOM_HANDLERS[type]
+// path once the map includes a real entry. No way to test the branch here
+// without runtime registration (rejected by §17.12).
 
 // Mock the legacy router so tests don't depend on the DB.
 // The runtime require in src/cil/router.js picks up this mock on each call.
@@ -24,7 +31,7 @@ describe('src/cil/router applyCIL facade', () => {
     legacyRouter.applyCIL.mockClear();
   });
 
-  // ── Payload validation ────────────────────────────────────────────────────
+  // ── Payload validation (handled in-facade, no legacy touched) ────────────
   test('null payload returns CIL_PAYLOAD_INVALID envelope; does not touch legacy', async () => {
     const result = await router.applyCIL(null, { traceId: 't-null' });
     expect(result.ok).toBe(false);
@@ -53,8 +60,8 @@ describe('src/cil/router applyCIL facade', () => {
     expect(legacyRouter.applyCIL).not.toHaveBeenCalled();
   });
 
-  // ── Legacy delegation path ────────────────────────────────────────────────
-  test('unknown type delegates to legacy router (runtime require is load-bearing)', async () => {
+  // ── Legacy delegation path (map is empty until CreateQuote ships) ────────
+  test('type with no new-idiom entry delegates to legacy router (runtime require is load-bearing)', async () => {
     const result = await router.applyCIL(
       { type: 'DefinitelyNotARealType' },
       { traceId: 't-unknown' }
@@ -73,72 +80,5 @@ describe('src/cil/router applyCIL facade', () => {
     const result = await router.applyCIL({ type: 'CreateLead' }, { traceId: 't-legacy' });
     expect(legacyRouter.applyCIL).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ ok: true, lead_id: 'abc' });
-  });
-
-  // ── New-idiom dispatch ────────────────────────────────────────────────────
-  test('registered new-idiom type dispatches to handler and skips legacy', async () => {
-    const handler = jest.fn(async () => ({ ok: true, handled: true }));
-    router.registerNewIdiomHandler('TestNewType_A', handler);
-    try {
-      const result = await router.applyCIL(
-        { type: 'TestNewType_A', foo: 'bar' },
-        { traceId: 't-new' }
-      );
-      expect(handler).toHaveBeenCalledWith(
-        { type: 'TestNewType_A', foo: 'bar' },
-        { traceId: 't-new' }
-      );
-      expect(legacyRouter.applyCIL).not.toHaveBeenCalled();
-      expect(result).toEqual({ ok: true, handled: true });
-    } finally {
-      router._deregisterNewIdiomHandlerForTesting('TestNewType_A');
-    }
-  });
-
-  test('new-idiom handler errors propagate (not enveloped by facade)', async () => {
-    router.registerNewIdiomHandler('TestNewType_Err', async () => {
-      const e = new Error('handler exploded');
-      e.code = 'HANDLER_EXPLODED';
-      throw e;
-    });
-    try {
-      await expect(router.applyCIL({ type: 'TestNewType_Err' }, {})).rejects.toThrow('handler exploded');
-    } finally {
-      router._deregisterNewIdiomHandlerForTesting('TestNewType_Err');
-    }
-  });
-
-  // ── Registration edge cases ──────────────────────────────────────────────
-  test('registerNewIdiomHandler rejects missing type', () => {
-    expect(() => router.registerNewIdiomHandler('', async () => ({ ok: true }))).toThrow(
-      /type must be a non-empty string/
-    );
-    expect(() => router.registerNewIdiomHandler(null, async () => ({ ok: true }))).toThrow();
-  });
-
-  test('registerNewIdiomHandler rejects non-function handler', () => {
-    expect(() => router.registerNewIdiomHandler('X', null)).toThrow(/handler must be a function/);
-    expect(() => router.registerNewIdiomHandler('X', 'not a fn')).toThrow();
-  });
-
-  test('registerNewIdiomHandler rejects duplicate type', () => {
-    router.registerNewIdiomHandler('DuplicateCheck', async () => ({ ok: true }));
-    try {
-      expect(() =>
-        router.registerNewIdiomHandler('DuplicateCheck', async () => ({ ok: true }))
-      ).toThrow(/duplicate registration/);
-    } finally {
-      router._deregisterNewIdiomHandlerForTesting('DuplicateCheck');
-    }
-  });
-
-  test('isNewIdiomType reflects the registry', () => {
-    expect(router.isNewIdiomType('NotRegistered')).toBe(false);
-    router.registerNewIdiomHandler('IsRegisteredCheck', async () => ({ ok: true }));
-    try {
-      expect(router.isNewIdiomType('IsRegisteredCheck')).toBe(true);
-    } finally {
-      router._deregisterNewIdiomHandlerForTesting('IsRegisteredCheck');
-    }
   });
 });

@@ -23,7 +23,7 @@ const deletePendingTransactionState =
   (async () => null);
 
 const { sendTemplateMessage } = require('../../services/twilio');
-const { applyCIL } = require('../../services/cilRouter');
+const { applyCIL } = require('../../src/cil/router');
 const confirmationTemplates = require('../../config').confirmationTemplates;
 const { getEffectivePlanKey } = require("../../src/config/getEffectivePlanKey");
 
@@ -286,7 +286,13 @@ module.exports = async function handleCommands(from, text, userProfile, ownerId,
           try {
             const result = await applyCIL(cil, ctx);
             await deletePendingTransactionState(from);
-            twiml(res, result?.summary || `${type} logged.`);
+            if (result && result.ok === false) {
+              // Constitution §9 error envelope from router (§17.6). Surface as failure.
+              console.warn('[commands] applyCIL envelope for pending:', result.error?.code, result.error?.message);
+              twiml(res, `⚠️ I couldn't log that ${type}. Please try again.`);
+            } else {
+              twiml(res, result?.summary || `${type} logged.`);
+            }
           } catch (e) {
             console.error('[commands] applyCIL failed for pending:', e?.message);
             await deletePendingTransactionState(from);
@@ -476,8 +482,8 @@ if (batchReceiptsHandler) {
               : null;
 
             const dedupe = `batch:${ownerId}:${item.stable_media_msg_id || item.added_at}`;
-            const { applyCIL: applyCilFn } = require('../../services/cilRouter');
-            await applyCilFn({
+            const { applyCIL: applyCilFn } = require('../../src/cil/router');
+            const r = await applyCilFn({
               type: 'CreateExpense',
               owner_id: ownerId,
               amount_cents: amountCents || 0,
@@ -488,7 +494,13 @@ if (batchReceiptsHandler) {
               source_msg_id: dedupe,
               raw_text: item.raw_text || null,
             });
-            created.push(item);
+            // Constitution §9 error envelope from router (§17.6) — treat as failure.
+            if (r && r.ok === false) {
+              console.warn('[commands] batch applyCIL envelope:', r.error?.code, r.error?.message);
+              failed.push(item);
+            } else {
+              created.push(item);
+            }
           } catch (e) {
             failed.push(item);
           }
@@ -608,7 +620,13 @@ if (teamHandler) {
     if (cil) {
       const ctx = { owner_id: ownerId, source_msg_id: sourceMsgId, actor_phone: from };
       const result = await applyCIL(cil, ctx);
-      twiml(res, result?.summary || 'Done.');
+      if (result && result.ok === false) {
+        // Constitution §9 error envelope (§17.6).
+        console.warn('[commands] bootstrap applyCIL envelope:', result.error?.code, result.error?.message);
+        twiml(res, `⚠️ ${result.error?.message || "I couldn't process that."}`);
+      } else {
+        twiml(res, result?.summary || 'Done.');
+      }
       await safeCleanup({ from, ownerId });
       return true;
     }

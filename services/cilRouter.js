@@ -9,7 +9,8 @@ const { cilSchemas } = require('../cil');
 
 // Domain handlers
 const { createLead } = require('../domain/lead');
-const { createQuote } = require('../domain/quote');
+// createQuote removed 2026-04-18 — old handler wrote to dropped `public.quotes`
+// table with broken column shape. New spine in src/cil/quotes.js.
 const { createAgreement } = require('../domain/agreement');
 const { createInvoice } = require('../domain/invoice');
 const { createChangeOrder } = require('../domain/changeOrder');
@@ -27,7 +28,7 @@ try {
 
 const schemaMap = {
   CreateLead: cilSchemas?.CreateLead,
-  CreateQuote: cilSchemas?.CreateQuote,
+  // CreateQuote removed 2026-04-18 (Beta Delta Appendix rebuild)
   CreateAgreement: cilSchemas?.CreateAgreement,
   CreateInvoice: cilSchemas?.CreateInvoice,
   CreateChangeOrder: cilSchemas?.CreateChangeOrder,
@@ -42,7 +43,7 @@ const schemaMap = {
 
 const handlerMap = {
   CreateLead: createLead,
-  CreateQuote: createQuote,
+  // CreateQuote: new handler lives in src/cil/quotes.js (future migration round)
   CreateAgreement: createAgreement,
   CreateInvoice: createInvoice,
   CreateChangeOrder: createChangeOrder,
@@ -82,7 +83,17 @@ async function applyCIL(rawCil, ctx) {
 
   const schema = schemaMap[rawCil.type];
   if (!schema || typeof schema.parse !== 'function') {
-    throw new Error(`Unsupported CIL type: ${rawCil.type}`);
+    // §17.6 — Constitution §9 error envelope for unknown types, consistent
+    // with the src/cil/router.js facade so upstream callers handle one shape.
+    return {
+      ok: false,
+      error: {
+        code: 'CIL_TYPE_UNKNOWN',
+        message: `No handler registered for type '${rawCil.type}'`,
+        hint: 'Verify the CIL type name; check src/cil/router.js registrations and services/cilRouter.js schemaMap',
+        traceId: (ctx && ctx.traceId) || null,
+      },
+    };
   }
 
   const baseCtx = ctx && typeof ctx === 'object' ? ctx : {};

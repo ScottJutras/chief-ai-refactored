@@ -1,9 +1,9 @@
 # ChiefOS — Execution Plan (Gap-Closing Sprint)
 
-Version: 1.3
-Status: Active — Phase 1 ✅ COMPLETE | Phase 2 ✅ COMPLETE | Phase 3 IN PROGRESS
+Version: 1.4
+Status: Active — Phase 1 🔄 PARTIAL (§1.2 re-opened 2026-04-18) | Phase 2 ✅ COMPLETE | Phase 3 IN PROGRESS
 Owner: Scott Jutras
-Last Updated: 2026-04-10
+Last Updated: 2026-04-18
 Depends on: North Star v4.0, Execution Playbook v4.0, Engineering Constitution v4.0
 
 ---
@@ -42,12 +42,101 @@ To own that positioning, ChiefOS must absorb the best, most useful features from
 - ✅ Multi-job summary: "How did I do this week?" returns jobs with margin breakdown *(2026-04-10 — agent ask() fallback)*
 - ✅ Comparative context: "That's below your average of 34% across similar jobs" *(2026-04-10 — `services/agentTools/ownerBenchmarks.js`, auto-called after job P&L answers)*
 
-### 1.2 — Quote-to-Actual Loop
-- ✅ Quotes spine functional: draft → sent → viewed → signed → locked *(pre-sprint — fully built)*
-- ✅ Quote builder: owner creates quote via portal with line items (labor estimate, materials, markup) *(pre-sprint)*
-- ✅ Quote PDF generation with business branding *(pre-sprint)*
-- ✅ When job closes, Ask Chief compares quoted vs actual: `compare_quote_vs_actual` agent tool joins `quote_line_items` × actual transactions × time_entries, returns variance by category with over/under budget *(2026-04-10 — `services/agentTools/compareQuoteVsActual.js`)*
-- ✅ Pattern detection over time: "Your last 5 bathroom renos averaged 15% over quoted labor" *(2026-04-10 — `services/agentTools/jobPatternTrends.js`, `get_job_pattern_trends` tool)*
+### 1.2 — Quote-to-Actual Loop (🔄 RE-OPENED 2026-04-18 per Beta Delta Appendix)
+
+The pre-sprint Quotes spine was a ghost build: tables existed, portal UI was wired up,
+`/api/documents/{upload,send,sign}` endpoints shipped, but the tables were never
+populated in production (verified: 0 rows across `quote_line_items`, `job_documents`,
+`job_document_files`, `change_orders`, `customers`, legacy `public.quotes`). The
+`domain/quote.js` write path was broken (referencing columns that didn't exist on
+the legacy table). The customer flow used to close Darlene MacDonald's job was built
+in a separate standalone repo (`mission-quote-standalone`), not inside ChiefOS.
+
+This item is re-opened. The new spine is being built per the Beta Delta Appendix:
+  - Dual-boundary identity (`tenant_id` uuid + `owner_id` text) on every new table.
+  - Header + immutable versions model; signed/locked versions protected by DB triggers.
+  - Server-authoritative SHA-256 hash over a canonical serialization of each version.
+  - Token-based share links (single-purpose, expiring) replacing slug-as-secret.
+  - CIL enforcement on sign: Ingress → CIL Draft → Validation → Domain Mutation.
+  - Starter+-only plan gating with monthly quota in `usage_monthly_v2`.
+  - Dedicated events table (`chiefos_quote_events`) — first in the repo.
+
+Reference: `C:\Users\scott\Documents\mission-quote-standalone\QUOTES_HANDOFF_TO_CHIEFOS.md`
+for the UX/visual spec. Nothing is ported from the pre-sprint schema; the only
+known reader (`services/agentTools/compareQuoteVsActual.js`) is rewritten in the
+same PR as the first migration.
+
+Architectural decisions locked for this work: see `docs/QUOTES_SPINE_DECISIONS.md`.
+
+Items:
+- [x] `compare_quote_vs_actual` agent tool (joins quotes × actuals × time_entries) — WORKS against the new spine after rewrite *(2026-04-10, rewritten 2026-04-18)*
+- [x] Pattern detection ("Your last 5 bathroom renos averaged 15% over quoted labor") — unchanged *(2026-04-10 — `services/agentTools/jobPatternTrends.js`)*
+- [x] Migration 1: `chiefos_quotes`, `chiefos_quote_versions`, `chiefos_quote_line_items`, triggers (immutability + cross-table parent-lock + header identity), composite dual-boundary FKs, tenant-scoped RLS *(2026-04-18 — applied as `chiefos_quotes_spine_20260418`; 12/12 verification tests passed; see `docs/QUOTES_SPINE_DECISIONS.md` §10)*
+- [x] Migration 2 (events): `chiefos_quote_events` (append-only audit stream), global sequence, scoped-immutability trigger (DELETE forbidden, `prev_event_hash`/`triggered_by_event_id` fill-once on UPDATE), dual-boundary composite FKs, `chiefos_all_events_v` cross-doc view *(2026-04-18 — applied as `chiefos_quote_events_20260418`; 10/10 verification tests passed; see `docs/QUOTES_SPINE_DECISIONS.md` §13)*
+- [x] Migration 3 (share tokens): `chiefos_quote_share_tokens` with bearer-token model (128-bit base58, 30-day absolute expiry, timestamp-derived state, recipient snapshot, dual-boundary composite FKs, fill-once lifecycle trigger); backfilled deferred FK `chiefos_qe_share_token_fk` on `chiefos_quote_events` *(2026-04-18 — applied as `chiefos_quote_share_tokens_20260418`; 16/16 verification tests passed; see `docs/QUOTES_SPINE_DECISIONS.md` §15)*
+- [x] Migration 4 (signatures): `chiefos_quote_signatures` with strict-immutability, composite dual-boundary FKs to version + event + share token, `name_match_at_sign` + `recipient_name_at_sign` + `share_token_id NOT NULL`; `chiefos_all_signatures_v` view (excludes PNG + source_msg_id); backfilled composite FK `chiefos_qe_signature_identity_fk`; extended `chiefos_qe_kind_enum` with `integrity.name_mismatch_signed`; RLS harmonization on versions + line_items per §11.0. Correction 4b: relaxed `chiefos_qe_payload_signed` CHECK (signature_id ceremonial per §14.10) *(2026-04-18 — applied as `chiefos_quote_signatures_20260418` + `chiefos_qe_payload_signed_relax_20260418`; 20/20 verification tests passed; see `docs/QUOTES_SPINE_DECISIONS.md` §16)*
+- [x] **CIL platform architecture (pre-CreateQuote scaffolding)**: created `src/cil/router.js` facade per §17.4–§17.7 + §17.12 (static `Object.freeze`-sealed new-idiom map, legacy delegation via runtime `require`); created `src/cil/utils.js` with `classifyUniqueViolation(err, {expectedSourceMsgConstraint})` per §17.10; migrated caller imports (`handlers/commands/index.js`) from `services/cilRouter` → `src/cil/router` per §17.7; wired Constitution §9 error envelope at both routers per §17.6 *(2026-04-18 — applied in commits `d87c59b9` (scaffolding) + `e87ad05a` (§17.12 refactor to frozen map); 17 tests passing; see `docs/QUOTES_SPINE_DECISIONS.md` §17.12)*
+- [ ] **Migration 5 (pre-CreateQuote dependency)**: restructure `chiefos_tenant_counters` to support per-tenant per-kind counters per §17.13; add generic `allocateNextDocCounter(tenantId, counterKind, client)` function. Design shape committed 2026-04-18 as §18; SQL proposal + verification in a dedicated session *(see `docs/QUOTES_SPINE_DECISIONS.md` §18)*
+- [ ] CIL types in `src/cil/quotes.js`: CreateQuote, SendQuote, SignQuote, LockQuote, VoidQuote, ReissueQuote *(all extend `src/cil/schema.js::BaseCILZ` per §17.1; CIL-retry dedup via `(owner_id, source_msg_id)` UNIQUE on root entities per §17.8–§17.11)*
+- [ ] Portal: quote builder UI wired to new spine, customer-facing view at `/q/:token`
+- [ ] Plan gating: Starter+ entitlement in `src/config/planCapabilities.js`, quota counter in `usage_monthly_v2`
+- [ ] Server PDF render on sign; Postmark email (contractor + customer); signed PDF stored in Supabase Storage
+
+#### CIL migration tracking (per §17.3)
+
+Visible count of legacy handlers still extending `cil.js::baseCIL`. When this
+table reaches zero rows, `cil.js` is deleted and removal is logged in
+`docs/QUOTES_SPINE_DECISIONS.md`. No deadline — reality indicator only.
+`§17.2` migration trigger applies: any non-trivial change to a listed
+handler migrates it to `src/cil/schema.js::BaseCILZ` as part of the same
+change.
+
+**Legacy handler inventory as of 2026-04-18 (six files, ten CIL types):**
+
+| File | Legacy CIL types | Audit pattern | Migrated? |
+|---|---|---|---|
+| `domain/lead.js` | CreateLead | `public.audit` via `ensureNotDuplicate` + `recordAudit` | ☐ |
+| `domain/agreement.js` | CreateAgreement | `public.audit` (partially stubbed on `cil.quote_id`) | ☐ |
+| `domain/invoice.js` | CreateInvoice | TBD (verify when touched) | ☐ |
+| `domain/changeOrder.js` | CreateChangeOrder | `public.audit` | ☐ |
+| `domain/transactions.js` | LogExpense, LogRevenue | internal dedup in `insertTransaction` | ☐ |
+| `domain/pricing.js` | AddPricingItem, UpdatePricingItem, DeletePricingItem | `ON CONFLICT DO NOTHING` | ☐ |
+
+Retired: `domain/quote.js` (stub, throws `NOT_IMPLEMENTED`) — not counted.
+Orphan: `domain/receipt.js` (not dispatched through `cilRouter.js`) — not
+counted.
+
+When a handler migrates: check the box above, update the decisions log
+with the migration date, ensure tests cover the hardened input. When all
+six files are migrated and `cilRouter.js` no longer imports from
+`../cil`: delete `cil.js`, log the deletion as a `§17.3` event.
+
+#### Deferred items discovered during CIL work
+
+Small issues surfaced during CIL architecture / scaffolding sessions that
+don't block CreateQuote but must not be lost. Each is filed with file:line
+so the context survives memory reset.
+
+- **Batch-receipts flow uses unregistered CIL type `CreateExpense`**
+  (`handlers/commands/index.js:486`). Legacy `schemaMap` has `LogExpense`,
+  not `CreateExpense`. Pre-existing bug: before the §17.6 envelope change
+  this failed via thrown `Unsupported CIL type`; the `try/catch` at line
+  ~500 silently treated items as failed. After the scaffolding session's
+  §17.6 + caller update (envelope-aware `r.ok === false` check), behavior
+  is preserved (still treated as failed) but the underlying bug remains.
+  **Fix when batch-receipts is next touched:** either (a) change the
+  `type:` to `'LogExpense'` and remap the payload shape to match
+  `cilSchemas.LogExpense`, or (b) register a `CreateExpense` alias in the
+  legacy router. Option (a) is cleaner — matches the rest of the codebase
+  naming. Flagged here 2026-04-18 during CIL scaffolding session.
+
+- **Future cleanup: `chiefos_quotes.chiefos_quotes_current_version_fk` is
+  currently `DEFERRABLE INITIALLY DEFERRED`.** With §17.14's
+  NULL-then-UPDATE pattern, no handler depends on deferral. A future
+  migration can tighten this to `IMMEDIATE`, unifying FK behavior across
+  the spine. Not blocking any feature; purely architectural cleanup —
+  probably bundled with a future schema-hygiene migration, not urgent.
+  Flagged 2026-04-18 during C2 decision session (§17.14).
 
 ### 1.3 — Invoice Spine
 - ✅ Invoice generation from quote (quote → invoice flow) *(pre-sprint — fully built)*
@@ -484,7 +573,7 @@ To own that positioning, ChiefOS must absorb the best, most useful features from
 ## Active Execution Plan
 Read CHIEFOS_EXECUTION_PLAN.md before starting any work.
 
-Phase 1 ✅ COMPLETE | Phase 2 ✅ COMPLETE | Phase 3 🔄 IN PROGRESS
+Phase 1 🔄 PARTIAL (§1.2 re-opened 2026-04-18) | Phase 2 ✅ COMPLETE | Phase 3 🔄 IN PROGRESS
 
 Current Phase: 3 — Onboarding & Conversational Intelligence Polish
 Remaining Phase 3 build items:

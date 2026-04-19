@@ -1880,6 +1880,16 @@ owner"), which is a misleading framing — the *shape* was valid, the
 **§17.17 committed 2026-04-19.** Pairs with §17.16 to define the full
 pre-transaction validation sequence for gated new-idiom handlers.
 
+**§17.17 addendum (2026-04-20) — handler reads actor from validated CIL
+payload, not from ctx.** The handler reads `actor.role` (and any other
+actor sub-fields) from the Zod-parsed CIL payload (`parsed.actor.role`),
+not from a duplicated `ctx.actor` field. Payload-layer fields are
+validated at the schema step and consumed from the parsed result. `ctx`
+carries infrastructure state only (traceId, request-scoped metadata).
+Do not lift payload fields into ctx — it creates two sources of truth
+and invites drift. Applies to every new-idiom handler, not just
+CreateQuote.
+
 ---
 
 ## §18. Migration 5 — counter table restructure (APPLIED 2026-04-20)
@@ -2370,6 +2380,56 @@ const CustomerSnapshotZ = z.object({
 
 **§20 committed 2026-04-19.** Schema file `src/cil/quotes.js` lands
 with handler code in the next session (post-Migration 5).
+
+**§20 addendum (2026-04-20) — source enum narrowed for CreateQuote.**
+`CreateQuoteCILZ.source` is narrowed to `z.enum(['whatsapp', 'web'])`.
+BaseCILZ's wider `SourceZ = z.enum(['whatsapp','upload','web'])` remains
+for capture-oriented CIL types (Expense, Payment) where `upload` is
+meaningful (e.g., receipt OCR from uploaded image). `upload` has no
+natural target in quote authoring — rejected at the schema layer rather
+than silently coerced to a quote source column value. `email`-initiated
+quote creation is a future path that will require a coordinated
+extension of BaseCILZ.SourceZ. No-silent-coercion posture per the
+Engineering Constitution's fail-closed rule.
+
+**§20 addendum (2026-04-20) — CreateQuote overrides JobRef with
+integer-typed job_id.** BaseCILZ's `JobRefZ.job_id: UUIDZ.optional()`
+is inconsistent with `public.jobs.id` which is `integer`
+(sequence-backed, non-UUID). `chiefos_quotes.job_id integer REFERENCES
+public.jobs(id)` also uses integer. The BaseCILZ-wide UUID declaration
+is a pre-existing latent bug — existing callers (Expense, Payment) work
+around it by passing `job_name` only. For CreateQuote the schema is
+narrowed to match reality:
+
+```js
+const CreateQuoteJobRefZ = z.object({
+  job_id: z.number().int().positive().optional(),
+  job_name: z.string().min(1).optional(),
+  create_if_missing: z.boolean().optional(),
+}).refine((j) => !!j.job_id || !!j.job_name, 'JobRef must include job_id or job_name')
+  .refine((j) => (j.create_if_missing ? !!j.job_name : true), 'create_if_missing requires job_name');
+
+CreateQuoteCILZ.extend({ job: CreateQuoteJobRefZ, ... })
+```
+
+Broader fix (normalizing BaseCILZ's `JobRefZ.job_id` to integer or an
+accept-either union) is a coordinated change affecting Expense and
+Payment handlers — out of scope here. Parked as a known issue for the
+session that touches those handlers (per §17.2 non-trivial-change
+trigger). When that session lands, delete the CreateQuote-specific
+`CreateQuoteJobRefZ` and use the corrected BaseCILZ `JobRefZ`.
+
+**§20 addendum (2026-04-20) — create_if_missing jobs do not set
+source_msg_id.** CreateQuote's inline find-or-create job path inserts
+a new job row without a `source_msg_id` value (leaves it NULL). Job-
+layer idempotency via `jobs_owner_source_msg_uidx` is not exercised by
+this handler. Idempotency for CreateQuote retries happens at the
+**quote** layer via `chiefos_quotes_source_msg_unique (owner_id,
+source_msg_id)` and §17.10 classifier — the retry's job find-step
+returns the existing job by `(owner_id, lower(job_name))` match before
+reaching create-if-missing. No orphan job rows possible: if the quote
+INSERT rolls back, the job INSERT in the same transaction rolls back
+with it.
 
 ## Next entries (to be added as decisions land)
 - §21. Template table schema (when tenant template editor is designed)

@@ -1035,6 +1035,116 @@ async function insertShareToken(client, {
   return rows[0];
 }
 
+// ─── SendQuote Section 5: state transitions + lifecycle.sent ───────────────
+//
+// Per Refinement A: state UPDATEs precede the lifecycle.sent event INSERT.
+// The event represents the fact of state transition and must be written
+// AFTER the transition is recorded. If either UPDATE fails, the transaction
+// aborts before the event INSERT fires — no phantom events for
+// un-transitioned quotes.
+
+/**
+ * markQuoteSent — Section 5. Two UPDATEs flipping a draft quote to
+ * 'sent' state, treated as one semantic operation. Both MUST succeed
+ * or the transaction rolls back — splitting into separate helpers
+ * would invite call-site sequencing mistakes. Call as a unit.
+ *
+ * Header transition (chiefos_quotes): status 'draft' → 'sent',
+ * updated_at = NOW(). Header immutability trigger permits status +
+ * updated_at transitions.
+ *
+ * Version transition (chiefos_quote_versions): issued_at = NOW(),
+ * sent_at = NOW(). Version immutability trigger permits timestamp
+ * updates while locked_at IS NULL (draft).
+ *
+ * Both UPDATEs include tenant_id + owner_id predicates per CLAUDE.md
+ * §3 + Section 5 (CreateQuote)'s setQuoteCurrentVersion pattern.
+ * Rowcount assertions: rowcount !== 1 is a handler bug.
+ *
+ * Status predicate on header UPDATE (`AND status = 'draft'`) is
+ * belt-and-suspenders against concurrent state change between
+ * loadDraftQuote and this UPDATE. locked_at predicate on version
+ * UPDATE defends against an edge case where current_version_id
+ * somehow points to a locked version (shouldn't happen given correct
+ * ReissueQuote design; if it ever fires, investigation starts with
+ * 'why does current_version_id point to a locked version?').
+ */
+async function markQuoteSent(client, { quoteId, versionId, tenantId, ownerId }) {
+  const headerResult = await client.query(
+    `UPDATE public.chiefos_quotes
+        SET status = 'sent', updated_at = NOW()
+      WHERE id = $1 AND tenant_id = $2 AND owner_id = $3 AND status = 'draft'`,
+    [quoteId, tenantId, ownerId]
+  );
+  if (headerResult.rowCount !== 1) {
+    throw new Error(
+      `markQuoteSent header UPDATE expected 1 row, got ${headerResult.rowCount}`
+    );
+  }
+
+  const versionResult = await client.query(
+    `UPDATE public.chiefos_quote_versions
+        SET issued_at = NOW(), sent_at = NOW()
+      WHERE id = $1 AND tenant_id = $2 AND owner_id = $3 AND locked_at IS NULL`,
+    [versionId, tenantId, ownerId]
+  );
+  if (versionResult.rowCount !== 1) {
+    throw new Error(
+      `markQuoteSent version UPDATE expected 1 row, got ${versionResult.rowCount}`
+    );
+  }
+}
+
+/**
+ * emitLifecycleSent — INSERTs a chiefos_quote_events row for the
+ * state transition draft→sent. Runs AFTER markQuoteSent per
+ * Refinement A's ordering requirement.
+ *
+ * Per Migration 2:
+ *   - lifecycle.sent is VERSION-scoped (chiefos_qe_version_scoped_kinds)
+ *     — quote_version_id NOT NULL.
+ *   - chiefos_qe_payload_sent CHECK requires payload ? 'recipient_channel'
+ *     AND payload ? 'recipient_address' AND recipient_channel IN
+ *     {email,whatsapp,sms} AND share_token_id IS NOT NULL.
+ *
+ * Payload uses `recipient_channel` / `recipient_address` (prefixed)
+ * matching the lifecycle.sent CHECK. Note this differs from
+ * notification.* kinds which use `channel` / `recipient` (unprefixed)
+ * — inherited schema drift from Migration 2 (to be documented in §22).
+ * In-handler mapping handles both.
+ *
+ * share_token_id COLUMN populated (distinct from the payload keys) —
+ * required by the CHECK. The event links bidirectionally to the
+ * share-token row inserted in Section 4.
+ */
+async function emitLifecycleSent(client, {
+  quoteId, versionId, tenantId, ownerId,
+  actorSource, actorUserId, emittedAt,
+  customerId, shareTokenId,
+  recipientChannel, recipientAddress, recipientName,
+}) {
+  const payload = {
+    recipient_channel: recipientChannel,
+    recipient_address: recipientAddress,
+    recipient_name: recipientName,  // extra audit field, not required by CHECK
+  };
+  await client.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id, emitted_at,
+        customer_id, share_token_id, correlation_id, payload
+      )
+      VALUES ($1, $2, $3, $4,
+              'lifecycle.sent', $5, $6, $7,
+              $8, $9, NULL, $10)`,
+    [
+      tenantId, ownerId, quoteId, versionId,
+      actorSource, actorUserId || null, emittedAt,
+      customerId || null, shareTokenId, payload,
+    ]
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1332,6 +1442,9 @@ module.exports = {
     // SendQuote Section 4
     generateShareToken,
     insertShareToken,
+    // SendQuote Section 5
+    markQuoteSent,
+    emitLifecycleSent,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

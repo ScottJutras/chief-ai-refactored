@@ -1488,6 +1488,7 @@ const {
   SendQuoteCILZ, QuoteRefInputZ,
   loadDraftQuote, resolveRecipient,
   generateShareToken, insertShareToken,
+  markQuoteSent, emitLifecycleSent,
 } = _internals;
 
 describe('SendQuote — Section 1: Zod schemas', () => {
@@ -1940,6 +1941,195 @@ describeIfDb('SendQuote — Section 4b: insertShareToken (integration)', () => {
       expect(caught).not.toBeNull();
       expect(caught.code).toBe('23505');
       expect(caught.constraint).toBe('chiefos_qst_source_msg_unique');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SendQuote — Section 5: markQuoteSent + emitLifecycleSent (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('SendQuote — Section 5: state transitions + lifecycle.sent (integration)', () => {
+  let pool;
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  async function seedDraftQuote(client, pre) {
+    const {
+      insertQuoteHeader, insertQuoteVersion, setQuoteCurrentVersion,
+      composeTenantSnapshot,
+    } = _internals;
+    const header = await insertQuoteHeader(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await insertQuoteVersion(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'Seeded', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: composeTenantSnapshot(pre.tenantId),
+    });
+    await setQuoteCurrentVersion(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    return { header, version };
+  }
+
+  test('markQuoteSent: header flips draft → sent, updated_at bumped', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedDraftQuote(client, pre);
+
+      const before = await client.query(
+        `SELECT status, updated_at FROM public.chiefos_quotes WHERE id = $1`,
+        [header.id]
+      );
+      expect(before.rows[0].status).toBe('draft');
+      const updatedAtBefore = before.rows[0].updated_at;
+
+      await markQuoteSent(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+
+      const after = await client.query(
+        `SELECT status, updated_at FROM public.chiefos_quotes WHERE id = $1`,
+        [header.id]
+      );
+      expect(after.rows[0].status).toBe('sent');
+      // NOW() is transaction-pinned so updated_at ≥ before (same instant within txn).
+      expect(new Date(after.rows[0].updated_at).getTime())
+        .toBeGreaterThanOrEqual(new Date(updatedAtBefore).getTime());
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('markQuoteSent: version issued_at + sent_at populated (both equal; transaction-pinned NOW)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedDraftQuote(client, pre);
+
+      const before = await client.query(
+        `SELECT issued_at, sent_at FROM public.chiefos_quote_versions WHERE id = $1`,
+        [version.id]
+      );
+      expect(before.rows[0].issued_at).toBeNull();
+      expect(before.rows[0].sent_at).toBeNull();
+
+      await markQuoteSent(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+
+      const after = await client.query(
+        `SELECT issued_at, sent_at FROM public.chiefos_quote_versions WHERE id = $1`,
+        [version.id]
+      );
+      expect(after.rows[0].issued_at).not.toBeNull();
+      expect(after.rows[0].sent_at).not.toBeNull();
+      // Both set from the same transaction NOW(), so they're equal.
+      expect(after.rows[0].issued_at.getTime()).toBe(after.rows[0].sent_at.getTime());
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('markQuoteSent: on already-sent quote, rowcount assertion throws', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedDraftQuote(client, pre);
+
+      // Manually flip to 'sent' to simulate concurrent state change.
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status = 'sent', updated_at = NOW() WHERE id = $1`,
+        [header.id]
+      );
+
+      await expect(
+        markQuoteSent(client, {
+          quoteId: header.id, versionId: version.id,
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+        })
+      ).rejects.toThrow(/expected 1 row, got 0/);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('emitLifecycleSent: inserts version-scoped row with prefixed-key payload + share_token_id column', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedDraftQuote(client, pre);
+
+      // Insert a share token to produce the share_token_id for the event.
+      const tokenRow = await insertShareToken(client, {
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        quoteVersionId: version.id,
+        token: generateShareToken(),
+        recipient: { name: 'Darlene MacDonald', email: 'darlene@example.com' },
+        sourceMsgId: `test-send-s5-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      });
+
+      await emitLifecycleSent(client, {
+        quoteId: header.id,
+        versionId: version.id,
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        actorSource: 'whatsapp',
+        actorUserId: pre.ownerId,
+        emittedAt: '2026-04-19T12:00:00.000Z',
+        customerId: pre.customer.id,
+        shareTokenId: tokenRow.id,
+        recipientChannel: 'email',
+        recipientAddress: 'darlene@example.com',
+        recipientName: 'Darlene MacDonald',
+      });
+
+      const rows = await client.query(
+        `SELECT kind, quote_version_id, share_token_id, correlation_id,
+                actor_source, actor_user_id, customer_id, payload
+           FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.sent'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      const ev = rows.rows[0];
+      expect(ev.kind).toBe('lifecycle.sent');
+      expect(ev.quote_version_id).toBe(version.id);     // version-scoped per schema
+      expect(ev.share_token_id).toBe(tokenRow.id);      // required by chiefos_qe_payload_sent CHECK
+      expect(ev.correlation_id).toBeNull();             // §17.14 clarification
+      expect(ev.actor_source).toBe('whatsapp');
+      expect(ev.customer_id).toBe(pre.customer.id);
+      expect(ev.payload).toEqual({
+        recipient_channel: 'email',                     // prefixed key per lifecycle.sent CHECK
+        recipient_address: 'darlene@example.com',
+        recipient_name: 'Darlene MacDonald',
+      });
     } finally {
       await client.query('ROLLBACK').catch(() => {});
       client.release();

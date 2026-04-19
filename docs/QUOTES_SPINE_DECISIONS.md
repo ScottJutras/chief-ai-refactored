@@ -3277,6 +3277,99 @@ also emits `integrity.name_mismatch_signed`.
 Two candidate principles (#1 + #2 above) will be exercised for the
 second time. If they hold, formalize during SignQuote's session close.
 
+## §23. SignQuote split into three sessions — Phase 1 landed (2026-04-19)
+
+**Status.** SignQuote's original single-session scope split into three
+dedicated sessions. Phase 1 (canonical-serialization algorithm)
+landed this session as a standalone deliverable. Phases 2 and 3 open
+fresh in later sessions.
+
+### Why the split
+
+The SignQuote session brief anticipated three phases: canonical-
+serialization design, handler implementation, real-write ceremony.
+Phase 1 reading surfaced two architectural findings that shifted
+scope:
+
+**G7 finding — signature PNG storage is mandatory.** Migration 4's
+`signature_png_storage_key text NOT NULL` + `signature_png_sha256 text
+NOT NULL CHECK (~'^[0-9a-f]{64}\$')` make Supabase Storage wiring a
+prerequisite for SignQuote, not a sub-task. The §11a template
+deliberately commits to bucket-plus-sha256-content-hash rather than
+base64-in-DB; schema relaxation to inline PNGs was rejected. Storage
+is a first-class architectural surface that affects future
+attachments beyond signatures (receipts, invoices, logos, PDFs).
+
+**Algorithm-first posture.** The canonical-hash algorithm is the
+foundation of every signed quote's integrity claim. Doing it under
+session-end fatigue alongside handler logic + Storage decisions
+would rush the most durable artifact in the spine. Phase 1 as a
+standalone session produces a self-contained deliverable regardless
+of downstream timeline.
+
+### Three-session structure
+
+**Phase 1 — canonical-serialization algorithm (COMPLETE 2026-04-19).**
+- `src/cil/quoteHash.js` implementation + 52 unit tests
+- §4 clarification §4.A through §4.K exhaustive spec
+- Cross-version regression lock pinned:
+  `e9088c36066a73a9cee9efcdb59f2748b4ca5040134d21ba5cb37e8327e77d51`
+- Commits: `914ad319` (§4), `94ad0b39` (impl + tests)
+
+**Phase 2 — Supabase Storage prep (NEXT SESSION).**
+- Bucket architecture + access policies (RLS vs. service-role vs.
+  signed-URL retrieval)
+- PNG-from-data-URL upload helper
+- `signature_png_sha256` computation path (content hash, separate
+  from the canonical version hash)
+- Affects future attachments: receipts, invoices, logos, PDFs
+- Not constrained to SignQuote's timeline
+
+**Phase 3 — SignQuote handler + real-write ceremony (SESSION AFTER
+PHASE 2).** Standard 7-section rhythm. Orchestrates Phase 1's hash
++ Phase 2's Storage upload + soft-step-up name-match per §11a + the
+§17.14 INSERT sequence (lifecycle.signed event FIRST, signature
+SECOND due to the NOT NULL composite FK from signature to event) +
+version-locking transition (status + locked_at co-transition per
+`chiefos_qv_status_locked_consistency`) + optional contractor
+confirmation email. First non-owner actor-role exercise (`customer`
+or `anonymous` authenticated by share_token).
+
+### Candidate-principle formalization deferred
+
+Three principles surfaced during SendQuote (§22) await second-
+exercise validation by SignQuote's Phase 3:
+1. Post-commit external-call with paired `notification.sent` /
+   `notification.failed` events → §17.19 if mirrored
+2. `correlation_id` linking `notification.*` to triggering
+   `lifecycle.*` → §14 expansion if wired
+3. Multi-entity §17.15 return shape (already validated in
+   production by SendQuote's ceremony; cross-reference only)
+
+Formalization happens at Phase 3's session close, not Phase 1's.
+
+### Why Plan D over Plan A
+
+Considered at Phase 1 opening: Plan A was "wire Supabase Storage this
+session, land full SignQuote including ceremony." Rejected in favor
+of Plan D (defer SignQuote; algorithm-first).
+
+- Plan A compresses three independent architectural concerns
+  (canonical hashing, Storage wiring, handler orchestration) into a
+  single session under accumulating fatigue. Doing the most durable
+  artifact (hash algorithm) last in a fatigued session increases the
+  probability of subtle regression that isn't caught until years
+  later when a dispute arises.
+- Plan D's serial schedule trades calendar time for correctness
+  insurance on the integrity claim. Phase 1's output is valuable
+  regardless of when Phases 2 and 3 land.
+- Supabase Storage also benefits from its own focused session:
+  attachment handling is cross-cutting infrastructure, not a sub-
+  task of SignQuote.
+
+**§23 committed 2026-04-19.** Phase 1 complete. Phase 2 and 3 open
+in dedicated future sessions.
+
 ## Next entries (to be added as decisions land)
-- §23. Template table schema (when tenant template editor is designed)
-- §24. Cross-quote pointer enforcement (the 4-column composite FK, if needed)
+- §24. Template table schema (when tenant template editor is designed)
+- §25. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

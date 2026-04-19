@@ -2055,31 +2055,45 @@ async function withTenantAllocLock(tenantId, client) {
   await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [String(tenantId)]);
 }
 
-async function allocateNextActivityLogNo(tenantId, client) {
+/**
+ * Allocate the next integer for (tenantId, counterKind). Atomic UPSERT.
+ * Returns the allocated integer (1-based; first call for a pair returns 1).
+ *
+ * Used by new-idiom CIL handlers for per-tenant per-kind sequence numbers
+ * (quote human_ids, invoice numbers, etc.). See docs/QUOTES_SPINE_DECISIONS.md
+ * §17.13 (strategy) and §18 (Migration 5).
+ *
+ * counterKind must be a member of COUNTER_KINDS (src/cil/counterKinds.js).
+ * The DB-side format CHECK accepts any lowercase-snake_case string; the
+ * product-concept set is policed app-side.
+ */
+async function allocateNextDocCounter(tenantId, counterKind, client) {
   const tid = String(tenantId || "").trim();
-  if (!tid) throw new Error("Missing tenantId for allocateNextActivityLogNo");
+  const kind = String(counterKind || "").trim();
+  if (!tid) throw new Error("Missing tenantId for allocateNextDocCounter");
+  if (!kind) throw new Error("Missing counterKind for allocateNextDocCounter");
 
   // Atomic upsert: allocate current value, then advance counter.
   // If row doesn't exist, start at 1 and advance to 2.
   const r = await client.query(
     `
-    insert into public.chiefos_tenant_counters (tenant_id, next_activity_log_no, updated_at)
-    values ($1, 2, now())
-    on conflict (tenant_id)
+    insert into public.chiefos_tenant_counters (tenant_id, counter_kind, next_no, updated_at)
+    values ($1, $2, 2, now())
+    on conflict (tenant_id, counter_kind)
     do update
-      set next_activity_log_no = public.chiefos_tenant_counters.next_activity_log_no + 1,
+      set next_no = public.chiefos_tenant_counters.next_no + 1,
           updated_at = now()
     returning
       case
         when xmax = 0 then 1                         -- inserted path allocates 1
-        else (public.chiefos_tenant_counters.next_activity_log_no - 1) -- update path allocates previous
+        else (public.chiefos_tenant_counters.next_no - 1) -- update path allocates previous
       end as allocated_no
     `,
-    [tid]
+    [tid, kind]
   );
 
   const n = r?.rows?.[0]?.allocated_no;
-  if (!Number.isFinite(Number(n))) throw new Error("Failed to allocate activity log number");
+  if (!Number.isFinite(Number(n))) throw new Error("Failed to allocate doc counter");
   return Number(n);
 }
 
@@ -5180,7 +5194,7 @@ module.exports = {
   topExpenseVendorsByRange,
   topExpenseCategoriesByRange,
   withTenantAllocLock,
-  allocateNextActivityLogNo,
+  allocateNextDocCounter,
   getActorMemory,
   patchActorMemory,
   getJobProfitByRange,

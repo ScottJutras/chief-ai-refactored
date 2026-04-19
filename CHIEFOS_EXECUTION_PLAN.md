@@ -81,6 +81,70 @@ Items:
 - [x] **CreateQuote handler (COMPLETE 2026-04-19).** `src/cil/quotes.js` with `handleCreateQuote` + `CreateQuoteCILZ` + `TenantSnapshotZ` + `CustomerSnapshotZ` fully implemented across 7 sections: (1) customer resolution per §20 Q1 no-auto-match, (2) job resolution per §20 Q2 + §17.17 addendum 3 unified-error pattern, (3) `computeTotals` + `allocateQuoteHumanId` (`QT-YYYY-MM-DD-NNNN`) + snapshot composition, (4) header + version + line-items INSERTs per §17.14 NULL-then-UPDATE, (5) `current_version_id` UPDATE pointer swing, (6) `lifecycle.created` + `lifecycle.version_created` event emission per §17.14 step 5, (7) classifyCilError 4-kind outer catch + post-commit counter increment + §17.15 return shape + §17.12 frozen-map registration. 72 tests passing; first real quote **`QT-2026-04-19-0001`** persisted in Mission Exteriors tenant via `scripts/real_create_quote_mission.js` (commit `e6b856d7` + `5fd11647`; see `docs/QUOTES_SPINE_DECISIONS.md` §21 for full commit chain + verification dump).
 - [ ] **SendQuote handler (NEXT SESSION).** Second new-idiom handler. Consumes `draft` quote → creates `chiefos_quote_share_tokens` row → transitions quote to `sent` → emits `lifecycle.sent` + `share_token.issued` + `notification.queued` events → triggers outbound email via Postmark. CreateQuote's architectural foundation carries forward (§17.10–§17.18 family-wide); SendQuote adds its own entries for share-token format + notification dispatch.
 - [ ] CIL types remaining after SendQuote: SignQuote, LockQuote, VoidQuote, ReissueQuote *(all extend `src/cil/schema.js::BaseCILZ` per §17.1; CIL-retry dedup via `(owner_id, source_msg_id)` UNIQUE on root entities per §17.8–§17.11; return shape family-wide per §17.15)*
+
+#### Quote Spine — Product Extensions (Post Core Handlers)
+
+Named future tracks surfaced during 2026-04-19 planning. NOT active
+work — captured here so they don't get lost during the remaining
+quote-spine handler sessions.
+
+- **Ext 1 — Payment schedule in quote.** Structured dated milestone
+  payments inside the quote version (e.g., "30% on acceptance, 40%
+  at midpoint, 30% on completion"). Either folds into existing
+  `payment_terms` JSONB or adds a `payment_schedule` field via
+  migration. **Sized: small.** Rationale: helps contractors maintain
+  cash flow without midstream begging for payment. **Target:**
+  extension session after SendQuote lands, or folded into SendQuote
+  session if time permits.
+
+- **Ext 2 — Pro-tier Board + Admin can create quotes.** Revises
+  §17.17 to make actor role checks plan-aware (currently owner-only
+  for CreateQuote; Pro tier should admit Board Members and Admins).
+  **Sized: medium.** Architectural decision touches every handler
+  in the chain (SendQuote, SignQuote, LockQuote, VoidQuote,
+  ReissueQuote all need consistent role-gating). **Target:**
+  dedicated session after core handler chain lands — principles
+  revise after the family exercises them, not before.
+
+- **Ext 3 — Deposit Paid receipt.** New document type parallel to
+  Invoice/Receipt. Own state machine, own human_id sequence
+  (`DR-YYYY-MMDD-NNNN`), own handlers (CreateDepositReceipt,
+  SendDepositReceipt). **Sized: large.** New CIL types, new
+  migration, new handlers. Rationale: deposits are paid before work
+  starts (covering materials); the receipt is a professional
+  acknowledgment. **Target:** after quote chain complete, alongside
+  invoice-spine work.
+
+- **Ext 4 — Lead → Quote data flow.** When a Lead becomes a Quote,
+  Lead's customer info pre-populates the quote. Primarily
+  transport-layer (caller composes CreateQuoteCILZ from Lead data).
+  **Sized: dependent on Leads work.** **Target:** after Leads spine
+  lands (Beta Playbook item 7).
+
+- **Ext 5 — Logo / branding upload.** Tenant uploads a logo that
+  renders on customer-facing documents. Real tenant-profile DB
+  table (replaces `src/config/tenantProfiles.js` bootstrap per §20
+  addendum), Supabase storage for logo files, portal upload UI,
+  signed-URL retrieval at render time. **Sized: multi-session
+  track.** **Target:** after core handler chain + before heavy GTM
+  push (logos are load-bearing for customer-facing artifact
+  professionalism).
+
+**Sequencing lean:**
+
+1. SendQuote (this session)
+2. Payment schedule (folded into SendQuote if time/scope aligns, else
+   next session after SendQuote)
+3. SignQuote, LockQuote, VoidQuote, ReissueQuote (sequential sessions)
+4. Pro-tier Board/Admin quote creation (revises §17.17 across the
+   family — after the family exists)
+5. Tenant-profile DB table + logo upload (after handler chain; before
+   GTM)
+6. Deposit Paid receipt (parallel with or after invoice spine)
+7. Lead → Quote flow (dependent on Leads spine)
+
+Preserves the architectural discipline: revise principles after the
+handler family exercises them, not before.
 - [ ] Portal: quote builder UI wired to new spine, customer-facing view at `/q/:token`
 - [ ] Plan gating: Starter+ entitlement in `src/config/planCapabilities.js`, quota counter in `usage_monthly_v2`
 - [ ] Server PDF render on sign; Postmark email (contractor + customer); signed PDF stored in Supabase Storage

@@ -49,6 +49,13 @@ migration context.
     insert version, insert line items, UPDATE header pointer, emit audit
     events — all in one transaction. No orphan rows possible; no reliance
     on `DEFERRABLE` FK.
+  - **Return shape (§17.15).** Every new-idiom handler success response
+    has shape `{ ok: true, <entity_key>: {...}, meta: { already_existed,
+    events_emitted, traceId } }`. `meta` is the success-side parallel to
+    `error` on the failure side. Multi-entity handlers add sibling
+    entity keys; `meta` stays one key. `traceId` is always a string
+    (never null). `meta.already_existed: true` is source_msg_id-granular
+    idempotency, NOT payload equivalence.
   - **Plan gating (§17.16).** All gated new-idiom handlers resolve plan
     and monthly usage via shared `gateNewIdiomHandler(ctx, checkFn,
     kindLiteral)` in `src/cil/utils.js`. Gating runs after schema
@@ -1691,6 +1698,110 @@ CreateQuote (no UPDATE) and EditDraft/ReissueQuote (UPDATE required).
 
 **§17.14 committed 2026-04-18.**
 
+**§17.15 — Return shape for new-idiom handlers.** All new-idiom CIL
+handlers return a success envelope with the shape:
+
+```js
+{
+  ok: true,
+  <entity_key>: { /* entity fields */ },
+  [<entity_key_2>: { ... }],             // multi-entity handlers (SignQuote, SendQuote)
+  meta: {
+    already_existed: boolean,
+    events_emitted: string[],
+    traceId: string,
+  }
+}
+```
+
+Each top-level `<entity_key>` is the canonical entity name (singular,
+lowercase) the handler affected — e.g. `quote`, `signature`,
+`share_token`. Handlers surface one or more entities based on what was
+mutated. Entity objects carry enough fields for the portal to render a
+result card without a follow-up query and for the next handler in a
+workflow chain to accept the entity as input.
+
+`meta` is the single well-known object carrying operation-level
+metadata — parallel in position to `error` on the failure side.
+
+**Why this shape — axis analysis:**
+
+1. **Transport separation.** Handler returns typed data; WhatsApp /
+   portal / worker transports compose presentation. Handler never
+   pre-composes summary strings. A contractor-facing phrasing change
+   in one transport never touches the handler.
+2. **Portal render.** Entity carries enough for a result card
+   without re-query.
+3. **§9 symmetry.** `{ok:false, error:{code,message,hint,traceId}}`
+   pairs cleanly with `{ok:true, <entity>:{...}, meta:{...}}`. Both
+   success and failure have one well-known sub-object (`error` vs.
+   `meta`) carrying operation metadata, with `traceId` in the same
+   relative position on both sides.
+4. **Idempotent retry.** `meta.already_existed` has a clean home that
+   doesn't pollute the entity. See semantics below.
+5. **Composability.** Multi-entity handlers (SignQuote: quote +
+   signature; SendQuote: quote + share_token) add sibling entity keys;
+   `meta` stays one key. No prefix-namespace explosion.
+6. **Testing.** Entity assertions separate from operation-metadata
+   assertions. `expect(r.quote.id)` vs. `expect(r.meta.already_existed)`
+   — tests read clearly.
+
+**Rejected alternatives:**
+- **Flat summary with handler-composed string** (legacy shape).
+  Couples handler to one transport's phrasing; portal must re-query;
+  multi-entity handlers degenerate into prefix-namespacing
+  (`signature_id`, `quote_id`, `share_token_id` at top level).
+- **Rich nested entity without `meta`.** Forces operation metadata
+  (`events_emitted`, `already_existed`) into top-level siblings of
+  entities, muddling "what was affected" vs. "how the operation went."
+
+**`meta.traceId` is always a string, never null.** Every CIL
+invocation carries a traceId per Constitution §9. If `ctx.traceId` is
+missing at handler entry, that is an upstream bug worth surfacing —
+handler returns a `TRACE_ID_MISSING` error envelope before any other
+logic runs. The type of `meta.traceId` is `string`, not `string |
+null`; silently tolerating null would hide the upstream defect.
+
+**Idempotent-retry semantics (`meta.already_existed`).** The flag
+means: "the handler's canonical first write caught a
+`unique_violation` on `(owner_id, source_msg_id)` and we returned the
+prior entity via §17.9's optimistic-insert-and-catch pattern."
+
+**It does NOT mean: "the current input payload matches the prior
+input."**
+
+If a caller retries with a matching `source_msg_id` but semantically
+different input (different customer, different line items), the
+handler still returns the prior entity with `already_existed: true`.
+The retry is honored at the source_msg_id granularity; payload
+equivalence is not checked. Future handlers and future debug sessions
+must not misread the flag as "the input matches the prior."
+
+If stricter semantics are ever needed ("error if retry payload
+differs from prior"), that is a new field or a distinct code path —
+not a redefinition of this flag. The contract committed here is
+source_msg_id-granular idempotency.
+
+**Per-handler entity inventory (preliminary; each handler confirms
+when it lands):**
+
+| Handler | Entity keys returned |
+|---|---|
+| CreateQuote | `quote` |
+| SendQuote | `quote`, `share_token` |
+| SignQuote | `quote`, `signature` |
+| LockQuote | `quote` |
+| VoidQuote | `quote` |
+| ReissueQuote | `quote` (with new `version_id`) |
+
+Fields beyond what the result-card + chain-to-next-handler use cases
+need (full line items, full snapshots, server_hash) are reachable via
+a detail endpoint, not returned on write.
+
+**§17.15 committed 2026-04-19.** Family-wide contract for every
+new-idiom Quote-spine handler and every future doc-type handler
+family.
+
 **§17.16 — Plan gating for new-idiom handlers.** All new-idiom CIL
 handlers subject to plan gating resolve plan and monthly usage via the
 shared `gateNewIdiomHandler(ctx, checkFn, kindLiteral)` helper in
@@ -2116,6 +2227,5 @@ const CustomerSnapshotZ = z.object({
 with handler code in the next session (post-Migration 5).
 
 ## Next entries (to be added as decisions land)
-- §17.15. Return shape for new-idiom handlers (C6 — this session)
 - §21. Template table schema (when tenant template editor is designed)
 - §22. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

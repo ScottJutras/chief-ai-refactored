@@ -25,11 +25,11 @@
 // at runtime: don't. Add to the map literal and redeploy.
 
 // Imports for registered handlers (populated as each handler ships).
-const { handleCreateQuote } = require('./quotes');
+const { handleCreateQuote, handleSendQuote } = require('./quotes');
 
 const NEW_IDIOM_HANDLERS = Object.freeze({
   CreateQuote: handleCreateQuote,
-  // SendQuote:   handleSendQuote,
+  SendQuote: handleSendQuote,
   // SignQuote:   handleSignQuote,
   // LockQuote:   handleLockQuote,
   // VoidQuote:   handleVoidQuote,

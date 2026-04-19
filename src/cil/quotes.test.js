@@ -16,7 +16,7 @@
 // Load .env for local runs; no-op if dotenv or .env is absent.
 try { require('dotenv').config(); } catch (_) { /* dotenv optional at runtime */ }
 
-const { handleCreateQuote, _internals } = require('./quotes');
+const { handleCreateQuote, handleSendQuote, _internals } = require('./quotes');
 const { CilIntegrityError } = require('./utils');
 
 const {
@@ -2322,6 +2322,414 @@ describeIfDb('SendQuote — Section 6b: notification.* emitters (integration)', 
     } finally {
       await client.query('ROLLBACK').catch(() => {});
       client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SendQuote — Section 7: end-to-end handleSendQuote (integration + unit)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helper to seed a real draft quote via the handleCreateQuote path so
+// SendQuote tests operate on authentic committed state (not
+// BEGIN/ROLLBACK-only seeding). Tests clean up via cleanupCreatedQuote.
+async function seedRealDraftForSendQuote({ pg, ownerId, tenantId, sourceMsgId }) {
+  // Caller MUST have already seeded the user row with plan_key='starter'.
+  const createCil = {
+    cil_version: '1.0',
+    type: 'CreateQuote',
+    tenant_id: tenantId,
+    source: 'whatsapp',
+    source_msg_id: sourceMsgId,
+    actor: { actor_id: ownerId, role: 'owner' },
+    occurred_at: new Date().toISOString(),
+    job: { job_name: `Send Test Job ${Math.random().toString(36).slice(2, 8)}`, create_if_missing: true },
+    needs_job_resolution: false,
+    customer: {
+      name: 'SendQuote Integration Recipient',
+      email: 'send-test@chiefos.test',
+      phone_e164: '+15195550199',
+      address: '1 Test Way, London, ON',
+    },
+    project: { title: 'SendQuote Integration Test', scope: 'Section 7 test scope.' },
+    currency: 'CAD',
+    tax_rate_bps: 1300,
+    tax_code: 'HST-ON',
+    line_items: [
+      { sort_order: 0, description: 'Test item', category: 'materials', qty: 1, unit_price_cents: 10000 },
+    ],
+    deposit_cents: 0,
+    payment_terms: {},
+    warranty_snapshot: {},
+    clauses_snapshot: {},
+  };
+  const ctx = { owner_id: ownerId, traceId: `trace-send-seed-${Date.now()}` };
+  const result = await handleCreateQuote(createCil, ctx);
+  if (!result.ok) {
+    throw new Error(`Seed CreateQuote failed: ${JSON.stringify(result.error)}`);
+  }
+  return result.quote;
+}
+
+describeIfDb('SendQuote — Section 7: end-to-end integration', () => {
+  afterEach(() => {
+    _internals.resetSendEmailForTests();
+  });
+
+  test('Happy path: sends email, flips quote to sent, emits lifecycle.sent + notification.sent; counter unchanged (G6)', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s7-send-happy-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s7-send-happy-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+
+    // Mock Postmark for a clean success return.
+    const sentCalls = [];
+    _internals.setSendEmailForTests(async (opts) => {
+      sentCalls.push(opts);
+      return { MessageID: 'fake-postmark-msg-happy-xyz', To: opts.to };
+    });
+
+    let quoteId;
+    try {
+      const seedQuote = await seedRealDraftForSendQuote({
+        pg, ownerId, tenantId: _internals.composeTenantSnapshot
+          ? '86907c28-a9ea-4318-819d-5a012192119b'      // Mission — has tenant profile
+          : MISSION_TENANT_UUID,
+        sourceMsgId: seedMsgId,
+      });
+      quoteId = seedQuote.id;
+
+      const usageBefore = await pg.getMonthlyUsage({
+        ownerId, kind: 'quote_created', monthKey,
+      });
+
+      const sendCil = {
+        cil_version: '1.0',
+        type: 'SendQuote',
+        tenant_id: MISSION_TENANT_UUID,
+        source: 'whatsapp',
+        source_msg_id: sendMsgId,
+        actor: { actor_id: ownerId, role: 'owner' },
+        occurred_at: new Date().toISOString(),
+        job: null,
+        needs_job_resolution: false,
+        quote_ref: { quote_id: seedQuote.id },
+      };
+      const result = await handleSendQuote(sendCil, {
+        owner_id: ownerId, traceId: 'trace-s7-send-happy',
+      });
+
+      // §17.15 multi-entity shape
+      expect(result.ok).toBe(true);
+      expect(result.quote).toBeDefined();
+      expect(result.share_token).toBeDefined();
+      expect(result.quote.id).toBe(seedQuote.id);
+      expect(result.quote.status).toBe('sent');
+      expect(result.quote.issued_at).toBeDefined();
+      expect(result.quote.customer.email).toBe('send-test@chiefos.test');
+      expect(result.share_token.token).toMatch(/^[1-9A-HJ-NP-Za-km-z]{22}$/);
+      expect(result.share_token.recipient).toEqual({
+        channel: 'email',
+        address: 'send-test@chiefos.test',
+        name: 'SendQuote Integration Recipient',
+      });
+      expect(result.share_token.url).toContain(`/q/${result.share_token.token}`);
+      expect(result.meta).toEqual({
+        already_existed: false,
+        events_emitted: ['lifecycle.sent', 'notification.sent'],
+        traceId: 'trace-s7-send-happy',
+      });
+
+      // Postmark mock was called with composed subject + textBody
+      expect(sentCalls).toHaveLength(1);
+      expect(sentCalls[0].to).toBe('send-test@chiefos.test');
+      expect(sentCalls[0].textBody).toContain(result.share_token.url);
+
+      // DB state: quote flipped to sent; 4 events present (2 from Create +
+      // lifecycle.sent + notification.sent); share token exists.
+      const quoteRow = await pg.query(
+        `SELECT status FROM public.chiefos_quotes WHERE id = $1`,
+        [seedQuote.id]
+      );
+      expect(quoteRow.rows[0].status).toBe('sent');
+
+      const events = await pg.query(
+        `SELECT kind FROM public.chiefos_quote_events
+          WHERE quote_id = $1 ORDER BY global_seq ASC`,
+        [seedQuote.id]
+      );
+      expect(events.rows.map((r) => r.kind)).toEqual([
+        'lifecycle.created',
+        'lifecycle.version_created',
+        'lifecycle.sent',
+        'notification.sent',
+      ]);
+
+      // G6: SendQuote intentionally has no dedicated quota. Per-month
+      // quote_created counter reflects creation, not send.
+      const usageAfter = await pg.getMonthlyUsage({
+        ownerId, kind: 'quote_created', monthKey,
+      });
+      expect(usageAfter).toBe(usageBefore);
+    } finally {
+      if (quoteId) {
+        await _internals.cleanupCreatedQuote
+          ? _internals.cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey)
+          : await cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey);
+      }
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  }, 30000);
+
+  test('Idempotent retry: second SendQuote with same source_msg_id returns already_existed=true, no double-email', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s7-send-retry-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s7-send-retry-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+
+    const sentCalls = [];
+    _internals.setSendEmailForTests(async (opts) => {
+      sentCalls.push(opts);
+      return { MessageID: `fake-postmark-${sentCalls.length}`, To: opts.to };
+    });
+
+    let quoteId;
+    try {
+      const seedQuote = await seedRealDraftForSendQuote({
+        pg, ownerId, tenantId: MISSION_TENANT_UUID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seedQuote.id;
+
+      const sendCil = {
+        cil_version: '1.0', type: 'SendQuote', tenant_id: MISSION_TENANT_UUID,
+        source: 'whatsapp', source_msg_id: sendMsgId,
+        actor: { actor_id: ownerId, role: 'owner' },
+        occurred_at: new Date().toISOString(),
+        job: null, needs_job_resolution: false,
+        quote_ref: { quote_id: seedQuote.id },
+      };
+      const ctx = { owner_id: ownerId, traceId: 'trace-s7-send-retry' };
+
+      const first = await handleSendQuote(sendCil, ctx);
+      expect(first.ok).toBe(true);
+      expect(first.meta.already_existed).toBe(false);
+      expect(first.meta.events_emitted).toEqual(['lifecycle.sent', 'notification.sent']);
+
+      const retry = await handleSendQuote(sendCil, ctx);
+      expect(retry.ok).toBe(true);
+      expect(retry.meta.already_existed).toBe(true);
+      expect(retry.meta.events_emitted).toEqual([]);   // retry emits nothing
+      expect(retry.share_token.id).toBe(first.share_token.id);
+      expect(retry.share_token.token).toBe(first.share_token.token);
+      expect(retry.quote.status).toBe('sent');
+
+      // Postmark called exactly once — retry didn't re-send.
+      expect(sentCalls).toHaveLength(1);
+    } finally {
+      if (quoteId) {
+        await cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey).catch(() => {});
+      }
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  }, 30000);
+
+  test('Postmark failure end-to-end: ok:true, events_emitted includes notification.failed, quote still sent', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s7-send-fail-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s7-send-fail-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+
+    // Postmark mock throws a realistic PascalCase error shape.
+    _internals.setSendEmailForTests(async () => {
+      const err = new Error('Bad or missing API token.');
+      err.ErrorCode = 10;
+      err.Message = 'Bad or missing API token.';
+      err.HttpStatusCode = 422;
+      throw err;
+    });
+
+    let quoteId;
+    try {
+      const seedQuote = await seedRealDraftForSendQuote({
+        pg, ownerId, tenantId: MISSION_TENANT_UUID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seedQuote.id;
+
+      const sendCil = {
+        cil_version: '1.0', type: 'SendQuote', tenant_id: MISSION_TENANT_UUID,
+        source: 'whatsapp', source_msg_id: sendMsgId,
+        actor: { actor_id: ownerId, role: 'owner' },
+        occurred_at: new Date().toISOString(),
+        job: null, needs_job_resolution: false,
+        quote_ref: { quote_id: seedQuote.id },
+      };
+
+      const result = await handleSendQuote(sendCil, {
+        owner_id: ownerId, traceId: 'trace-s7-send-fail',
+      });
+
+      // Load-bearing: ok:true holds despite Postmark throw. Locks the
+      // Refinement B 'do NOT rethrow' decision against future refactor.
+      expect(result.ok).toBe(true);
+      expect(result.meta.events_emitted).toContain('notification.failed');
+      expect(result.meta.events_emitted).toContain('lifecycle.sent');
+      expect(result.meta.events_emitted).not.toContain('notification.sent');
+
+      // Quote still transitioned to sent — email failure doesn't roll it back.
+      expect(result.quote.status).toBe('sent');
+
+      // notification.failed event carries operator-facing error context.
+      const failedEvents = await pg.query(
+        `SELECT payload FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'notification.failed'`,
+        [seedQuote.id]
+      );
+      expect(failedEvents.rows).toHaveLength(1);
+      expect(failedEvents.rows[0].payload).toMatchObject({
+        channel: 'email',
+        recipient: 'send-test@chiefos.test',
+        provider_message_id: null,
+        provider: 'postmark',
+        error_code: 10,
+        error_message: 'Bad or missing API token.',
+      });
+    } finally {
+      if (quoteId) {
+        await cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey).catch(() => {});
+      }
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  }, 30000);
+
+  test('Quote not found: CIL_INTEGRITY_ERROR envelope with QUOTE_NOT_FOUND_OR_CROSS_OWNER hint', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+    _internals.setSendEmailForTests(async () => ({ MessageID: 'never-called' }));
+
+    try {
+      const sendCil = {
+        cil_version: '1.0', type: 'SendQuote', tenant_id: MISSION_TENANT_UUID,
+        source: 'whatsapp',
+        source_msg_id: `test-s7-send-404-${Date.now()}`,
+        actor: { actor_id: ownerId, role: 'owner' },
+        occurred_at: new Date().toISOString(),
+        job: null, needs_job_resolution: false,
+        quote_ref: { quote_id: '00000000-0000-0000-0000-000000000000' },
+      };
+      const result = await handleSendQuote(sendCil, {
+        owner_id: ownerId, traceId: 'trace-s7-send-404',
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('CIL_INTEGRITY_ERROR');
+      expect(result.error.hint).toContain('tenant+owner scope');
+    } finally {
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  });
+
+  test('Quote not draft: CIL_INTEGRITY_ERROR with QUOTE_NOT_DRAFT hint pointing at ReissueQuote', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s7-send-notdraft-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+    _internals.setSendEmailForTests(async () => ({ MessageID: 'never-called' }));
+
+    let quoteId;
+    try {
+      const seedQuote = await seedRealDraftForSendQuote({
+        pg, ownerId, tenantId: MISSION_TENANT_UUID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seedQuote.id;
+
+      // Flip to 'sent' manually to exercise the QUOTE_NOT_DRAFT path.
+      await pg.query(
+        `UPDATE public.chiefos_quotes SET status='sent', updated_at=NOW() WHERE id=$1`,
+        [seedQuote.id]
+      );
+
+      const sendCil = {
+        cil_version: '1.0', type: 'SendQuote', tenant_id: MISSION_TENANT_UUID,
+        source: 'whatsapp',
+        source_msg_id: `test-s7-send-notdraft-${Date.now()}`,
+        actor: { actor_id: ownerId, role: 'owner' },
+        occurred_at: new Date().toISOString(),
+        job: null, needs_job_resolution: false,
+        quote_ref: { quote_id: seedQuote.id },
+      };
+      const result = await handleSendQuote(sendCil, {
+        owner_id: ownerId, traceId: 'trace-s7-send-notdraft',
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('CIL_INTEGRITY_ERROR');
+      expect(result.error.hint).toContain('ReissueQuote');
+    } finally {
+      if (quoteId) {
+        await cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey).catch(() => {});
+      }
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  }, 30000);
+
+  test('Actor role rejection (employee): PERMISSION_DENIED', async () => {
+    // No DB writes beyond the initial user seed — the handler's actor check
+    // fires before step 4 transaction opens.
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+    try {
+      const sendCil = {
+        cil_version: '1.0', type: 'SendQuote', tenant_id: MISSION_TENANT_UUID,
+        source: 'whatsapp',
+        source_msg_id: `test-s7-send-emp-${Date.now()}`,
+        actor: { actor_id: ownerId, role: 'employee' },  // non-owner
+        occurred_at: new Date().toISOString(),
+        job: null, needs_job_resolution: false,
+        quote_ref: { quote_id: '00000000-0000-0000-0000-000000000000' },
+      };
+      const result = await handleSendQuote(sendCil, {
+        owner_id: ownerId, traceId: 'trace-s7-send-emp',
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('PERMISSION_DENIED');
+      expect(result.error.message).toContain('owner');
+    } finally {
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
     }
   });
 });

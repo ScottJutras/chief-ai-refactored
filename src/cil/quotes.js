@@ -225,6 +225,7 @@ const LOAD_QUOTE_COLUMNS = `
   q.customer_id,
   v.id             AS version_id,
   v.version_no,
+  v.project_title,
   v.currency,
   v.total_cents,
   v.customer_snapshot,
@@ -822,7 +823,7 @@ async function lookupPriorQuote(ownerId, sourceMsgId) {
 }
 
 /**
- * buildQuoteReturnShape — composes the §17.15 family-wide success envelope
+ * buildCreateQuoteReturnShape — composes the §17.15 family-wide success envelope
  * from a normalized input shape. Used by both the happy-path return (from
  * txnResult) and the idempotent-retry return (from lookupPriorQuote).
  *
@@ -831,7 +832,7 @@ async function lookupPriorQuote(ownerId, sourceMsgId) {
  * (alreadyExisted=true) returns [] because this call emitted no events.
  * Callers wanting entity event history query a dedicated events endpoint.
  */
-function buildQuoteReturnShape({
+function buildCreateQuoteReturnShape({
   quoteId, versionId, humanId, versionNo, status, currency, totalCents,
   customer, jobId, issuedAt, createdAt,
   alreadyExisted, traceId,
@@ -1496,7 +1497,7 @@ async function handleCreateQuote(rawCil, ctx) {
       // original call's counter consumption stands (source_msg_id-granular
       // idempotency per §17.10 clarification 2026-04-20).
       const prior = await lookupPriorQuote(ctx.owner_id, data.source_msg_id);
-      return buildQuoteReturnShape({
+      return buildCreateQuoteReturnShape({
         quoteId: prior.quote_id,
         versionId: prior.version_id,
         humanId: prior.human_id,
@@ -1542,7 +1543,7 @@ async function handleCreateQuote(rawCil, ctx) {
   });
 
   // ─── Step 6 (§17.15): compose return shape ─── IMPLEMENTED ──────────────
-  return buildQuoteReturnShape({
+  return buildCreateQuoteReturnShape({
     quoteId: txnResult.quote_id,
     versionId: txnResult.version_id,
     humanId: txnResult.human_id,
@@ -1560,12 +1561,406 @@ async function handleCreateQuote(rawCil, ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// handleSendQuote (Section 7 — orchestration + outer catch + return shape)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * lookupPriorShareToken — lookup by (owner_id, source_msg_id). Returns
+ * the row or null (caller decides whether null is an error).
+ *
+ * Serves two call sites:
+ *   (a) Pre-transaction retry detection at handler entry. Sequential
+ *       retry case: first call transitioned the quote to 'sent'; second
+ *       call's loadDraftQuote would hit QUOTE_NOT_DRAFT before the
+ *       share_token INSERT can raise unique_violation. This pre-check
+ *       returns the prior share token before entering the transaction.
+ *   (b) Post-rollback recovery in the classifyCilError idempotent_retry
+ *       branch. Concurrent retry case: both calls start while quote is
+ *       draft; first commits; second's share_token INSERT hits 23505.
+ *       After withClient rolls back, this lookup finds the first's row.
+ *
+ * Joins share_token → quote → current version for full multi-entity
+ * state. Returns CURRENT state per §17.10 clarification.
+ */
+async function lookupPriorShareToken(ownerId, sourceMsgId) {
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  const { rows } = await pg.query(
+    `SELECT s.id              AS share_token_id,
+            s.token,
+            s.absolute_expires_at,
+            s.recipient_name,
+            s.recipient_channel,
+            s.recipient_address,
+            ${LOAD_QUOTE_COLUMNS}
+       FROM public.chiefos_quote_share_tokens s
+       JOIN public.chiefos_quote_versions sv ON sv.id = s.quote_version_id
+       JOIN public.chiefos_quotes q ON q.id = sv.quote_id
+       JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+      WHERE s.owner_id = $1 AND s.source_msg_id = $2
+      LIMIT 1`,
+    [ownerId, sourceMsgId]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * priorShareTokenToReturnShape — composes §17.15 shape from a prior
+ * share_token lookup row. Shared by pre-transaction retry detection
+ * and post-rollback idempotent_retry recovery. Both branches produce
+ * identical output.
+ */
+function priorShareTokenToReturnShape(prior, traceId) {
+  return buildSendQuoteReturnShape({
+    quoteId: prior.quote_id,
+    versionId: prior.version_id,
+    humanId: prior.human_id,
+    versionNo: prior.version_no,
+    status: prior.status,
+    currency: prior.currency,
+    totalCents: prior.total_cents,
+    customer: {
+      id: prior.customer_id,
+      name: prior.customer_snapshot.name,
+      email: prior.customer_snapshot.email,
+      phone_e164: prior.customer_snapshot.phone_e164,
+    },
+    jobId: prior.job_id,
+    issuedAt: prior.issued_at,
+    createdAt: prior.header_created_at,
+    shareTokenId: prior.share_token_id,
+    token: prior.token,
+    absoluteExpiresAt: prior.absolute_expires_at,
+    recipientChannel: prior.recipient_channel,
+    recipientAddress: prior.recipient_address,
+    recipientName: prior.recipient_name,
+    shareUrl: buildQuoteShareUrl(prior.token),
+    alreadyExisted: true,
+    eventsEmitted: [],  // §17.15 clarification: retry emitted no events
+    traceId,
+  });
+}
+
+/**
+ * buildSendQuoteReturnShape — §17.15 multi-entity composer. First handler
+ * to surface two entity keys: `quote` + `share_token`. Used by both the
+ * happy-path return and the idempotent-retry return.
+ *
+ * meta.events_emitted semantics per §17.15 clarification: describes events
+ * THIS invocation emitted. Retry returns [] because the original call
+ * emitted; this call did not.
+ *
+ * Intentionally separate from buildCreateQuoteReturnShape per approved
+ * Q2: one composer per handler stays at 15-25 lines; parameterizing
+ * across handlers grows into 40-line conditional blocks as the family
+ * accumulates entity shapes.
+ */
+function buildSendQuoteReturnShape({
+  // quote entity
+  quoteId, versionId, humanId, versionNo, status, currency, totalCents,
+  customer, jobId, issuedAt, createdAt,
+  // share_token entity
+  shareTokenId, token, absoluteExpiresAt,
+  recipientChannel, recipientAddress, recipientName, shareUrl,
+  // meta
+  alreadyExisted, eventsEmitted, traceId,
+}) {
+  return {
+    ok: true,
+    quote: {
+      id: quoteId,
+      version_id: versionId,
+      human_id: humanId,
+      version_no: versionNo,
+      status,
+      currency,
+      total_cents: Number(totalCents),
+      customer: {
+        id: customer.id,
+        name: customer.name,
+        email: customer.email || null,
+        phone_e164: customer.phone_e164 || null,
+      },
+      job_id: jobId,
+      issued_at: issuedAt,
+      created_at: createdAt,
+    },
+    share_token: {
+      id: shareTokenId,
+      token,
+      absolute_expires_at: absoluteExpiresAt,
+      recipient: {
+        channel: recipientChannel,
+        address: recipientAddress,
+        name: recipientName,
+      },
+      url: shareUrl,
+    },
+    meta: {
+      already_existed: alreadyExisted,
+      events_emitted: eventsEmitted,
+      traceId,
+    },
+  };
+}
+
+async function handleSendQuote(rawCil, ctx) {
+  // ─── Ctx preflight (§17.17 addendum 2) ────────────────────────────────────
+  if (!ctx || !ctx.owner_id) {
+    return errEnvelope({
+      code: 'OWNER_ID_MISSING',
+      message: 'ctx.owner_id is required',
+      hint: 'Upstream identity resolver must populate ctx.owner_id before applyCIL',
+      traceId: (ctx && ctx.traceId) || null,
+    });
+  }
+  if (!ctx.traceId) {
+    return errEnvelope({
+      code: 'TRACE_ID_MISSING',
+      message: 'ctx.traceId is required',
+      hint: 'Upstream request handler must populate ctx.traceId before applyCIL',
+      traceId: null,
+    });
+  }
+
+  // ─── Step 1 (§17.17 step 1): Zod validation ───────────────────────────────
+  const parsed = SendQuoteCILZ.safeParse(rawCil);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const pathStr = issue && issue.path && issue.path.length ? issue.path.join('.') : '<root>';
+    return errEnvelope({
+      code: 'CIL_SCHEMA_INVALID',
+      message: issue ? `${pathStr}: ${issue.message}` : 'SendQuote input failed validation',
+      hint: 'See docs/QUOTES_SPINE_DECISIONS.md §22 for the SendQuoteCILZ input contract',
+      traceId: ctx.traceId,
+    });
+  }
+  const data = parsed.data;
+
+  // ─── Step 2: Plan gating — NONE per G6 ────────────────────────────────────
+  // SendQuote is follow-through to CreateQuote. §19 gates creation; Free-tier
+  // can't create → can't send. No dedicated quote_sent counter.
+
+  // ─── Step 3 (§17.17 step 3 + addendum): actor role check ──────────────────
+  if (data.actor.role !== 'owner') {
+    return errEnvelope({
+      code: 'PERMISSION_DENIED',
+      message: 'SendQuote is owner-only',
+      hint: 'Ask the owner to send quotes (One Mind, Many Senses)',
+      traceId: ctx.traceId,
+    });
+  }
+
+  // ─── Step 4 (§17.17 step 4 / §17.14): transaction ─────────────────────────
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+
+  // ─── Pre-transaction idempotent-retry check ───────────────────────────────
+  // Handles the sequential retry case: first call already transitioned the
+  // quote to 'sent'; without this check, the second call's loadDraftQuote
+  // would surface QUOTE_NOT_DRAFT (semantic_error) instead of recognizing
+  // the retry. The concurrent retry case still flows through classifyCilError
+  // via 23505 on chiefos_qst_source_msg_unique.
+  const preTxnPrior = await lookupPriorShareToken(ctx.owner_id, data.source_msg_id);
+  if (preTxnPrior) {
+    return priorShareTokenToReturnShape(preTxnPrior, ctx.traceId);
+  }
+
+  let txnResult;
+  try {
+    txnResult = await pg.withClient(async (client) => {
+      // Section 2 — load draft quote
+      const loaded = await loadDraftQuote(client, {
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        quoteRef: data.quote_ref,
+      });
+
+      // Section 3 — resolve recipient (override > snapshot > RECIPIENT_MISSING)
+      const recipient = resolveRecipient({
+        parsedRecipientEmail: data.recipient_email,
+        parsedRecipientName: data.recipient_name,
+        customerSnapshot: loaded.customer_snapshot,
+      });
+
+      // Section 4 — generate + insert share token
+      const tokenValue = generateShareToken();
+      const tokenRow = await insertShareToken(client, {
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        quoteVersionId: loaded.version_id,
+        token: tokenValue,
+        recipient,
+        sourceMsgId: data.source_msg_id,
+      });
+
+      // Section 5a — state transitions (draft → sent; issued_at, sent_at)
+      await markQuoteSent(client, {
+        quoteId: loaded.quote_id,
+        versionId: loaded.version_id,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+      });
+
+      // Section 5b — lifecycle.sent event emission
+      await emitLifecycleSent(client, {
+        quoteId: loaded.quote_id,
+        versionId: loaded.version_id,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        actorSource: CIL_TO_EVENT_ACTOR_SOURCE[data.source],
+        actorUserId: data.actor.actor_id,
+        emittedAt: data.occurred_at,
+        customerId: loaded.customer_id,
+        shareTokenId: tokenRow.id,
+        recipientChannel: 'email',
+        recipientAddress: recipient.email,
+        recipientName: recipient.name,
+      });
+
+      return { loaded, recipient, tokenRow };
+    });
+  } catch (err) {
+    const c = classifyCilError(err, {
+      expectedSourceMsgConstraint: SEND_QUOTE_SOURCE_MSG_CONSTRAINT,
+    });
+
+    if (c.kind === 'semantic_error') {
+      return errEnvelope({
+        code: 'CIL_INTEGRITY_ERROR',
+        message: c.error.message,
+        hint: c.error.hint,
+        traceId: ctx.traceId,
+      });
+    }
+
+    if (c.kind === 'idempotent_retry') {
+      const prior = await lookupPriorShareToken(ctx.owner_id, data.source_msg_id);
+      if (!prior) {
+        // Unexpected — 23505 on chiefos_qst_source_msg_unique fired, so a
+        // row with this (owner_id, source_msg_id) must exist. Missing means
+        // the DB is in an inconsistent state. Rethrow as 500-class.
+        throw new Error(
+          `Idempotent retry lookup missed for SendQuote (${ctx.owner_id}, ${data.source_msg_id})`
+        );
+      }
+      return priorShareTokenToReturnShape(prior, ctx.traceId);
+    }
+
+    if (c.kind === 'integrity_error') {
+      return errEnvelope({
+        code: 'CIL_INTEGRITY_ERROR',
+        message: `Unique constraint violation on ${c.constraint}`,
+        hint: 'Verify tenant/owner FK consistency for the target quote or share token',
+        traceId: ctx.traceId,
+      });
+    }
+
+    throw err;  // not_unique_violation
+  }
+
+  // ─── Step 5 (§17.16 / §19): NO counter increment per G6 ───────────────────
+  // SendQuote is not a monetizable event. Creation is gated (§19); sending is
+  // follow-through. meta.events_emitted below distinguishes notification
+  // outcomes.
+
+  // ─── Post-commit Postmark dispatch + paired notification events ───────────
+  const { loaded, recipient, tokenRow } = txnResult;
+  const shareUrl = buildQuoteShareUrl(tokenRow.token);
+  const { subject, textBody } = buildSendQuoteEmail({
+    tenantSnapshot: loaded.tenant_snapshot,
+    quote: {
+      human_id: loaded.human_id,
+      project_title: loaded.project_title,  // Refactor 2 — from loaded, not side query
+      total_cents: loaded.total_cents,
+      currency: loaded.currency,
+    },
+    recipient,
+    shareUrl,
+  });
+
+  const eventsEmitted = ['lifecycle.sent'];  // emitted inside txn; committed
+
+  const sharedEventArgs = {
+    quoteId: loaded.quote_id,
+    versionId: loaded.version_id,
+    tenantId: data.tenant_id,
+    ownerId: ctx.owner_id,
+    actorSource: CIL_TO_EVENT_ACTOR_SOURCE[data.source],
+    actorUserId: data.actor.actor_id,
+    emittedAt: data.occurred_at,
+    customerId: loaded.customer_id,
+    shareTokenId: tokenRow.id,
+    channel: 'email',
+    recipient: recipient.email,
+  };
+
+  const sendEmail = getSendEmail();
+  try {
+    const postmarkResult = await sendEmail({
+      to: recipient.email,
+      subject,
+      textBody,
+    });
+    await emitNotificationSent(pg, {
+      ...sharedEventArgs,
+      providerMessageId: (postmarkResult && postmarkResult.MessageID) || 'unknown',
+    });
+    eventsEmitted.push('notification.sent');
+  } catch (postmarkErr) {
+    await emitNotificationFailed(pg, {
+      ...sharedEventArgs,
+      errorCode: postmarkErr.ErrorCode || postmarkErr.errorCode || postmarkErr.code || 'unknown',
+      errorMessage: postmarkErr.Message || postmarkErr.message || 'unknown',
+    });
+    eventsEmitted.push('notification.failed');
+    // Do NOT rethrow per Refinement B: quote is committed as 'sent'; email
+    // failure is a separate notification facet, not a state-transition
+    // rollback trigger. Handler returns ok:true regardless.
+  }
+
+  // ─── §17.15 multi-entity return shape ─────────────────────────────────────
+  // Customer sub-object built from snapshot (Refactor 1) — reflects the
+  // captured-at-send-time contract, not a later customer-row edit.
+  return buildSendQuoteReturnShape({
+    quoteId: loaded.quote_id,
+    versionId: loaded.version_id,
+    humanId: loaded.human_id,
+    versionNo: loaded.version_no,
+    status: 'sent',  // just transitioned in Section 5
+    currency: loaded.currency,
+    totalCents: loaded.total_cents,
+    customer: {
+      id: loaded.customer_id,
+      name: loaded.customer_snapshot.name,
+      email: loaded.customer_snapshot.email,
+      phone_e164: loaded.customer_snapshot.phone_e164,
+    },
+    jobId: loaded.job_id,
+    issuedAt: data.occurred_at,  // just populated in markQuoteSent
+    createdAt: loaded.header_created_at,
+    shareTokenId: tokenRow.id,
+    token: tokenRow.token,
+    absoluteExpiresAt: tokenRow.absolute_expires_at,
+    recipientChannel: 'email',
+    recipientAddress: recipient.email,
+    recipientName: recipient.name,
+    shareUrl,
+    alreadyExisted: false,
+    eventsEmitted,
+    traceId: ctx.traceId,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════
 
 module.exports = {
   handleCreateQuote,
+  handleSendQuote,
   CreateQuoteCILZ,
+  SendQuoteCILZ,
   // Test-only internals. Not part of the handler's public contract. External
   // callers should not reach through _internals — if genuine reuse need
   // emerges, hoist to a dedicated module rather than expand this surface.
@@ -1584,7 +1979,7 @@ module.exports = {
     emitLifecycleCreated,
     emitLifecycleVersionCreated,
     lookupPriorQuote,
-    buildQuoteReturnShape,
+    buildCreateQuoteReturnShape,
     // SendQuote schemas (Section 1)
     SendQuoteCILZ,
     QuoteRefInputZ,
@@ -1608,6 +2003,10 @@ module.exports = {
     resetSendEmailForTests,
     APP_URL,
     SEND_QUOTE_SOURCE_MSG_CONSTRAINT,
+    // SendQuote Section 7
+    lookupPriorShareToken,
+    buildSendQuoteReturnShape,
+    priorShareTokenToReturnShape,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

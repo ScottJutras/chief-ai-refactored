@@ -2615,6 +2615,34 @@ session that touches those handlers (per §17.2 non-trivial-change
 trigger). When that session lands, delete the CreateQuote-specific
 `CreateQuoteJobRefZ` and use the corrected BaseCILZ `JobRefZ`.
 
+**§20 addendum (2026-04-19) — tenant_snapshot source.** `TenantSnapshotZ`
+is populated from `src/config/tenantProfiles.js`, a frozen lookup by
+tenant_id. Bootstrap pattern until a tenant-profile DB table ships.
+When DB-backed source is built, the handler's `composeTenantSnapshot`
+function swaps the config-file read for a DB query returning the same
+`TenantSnapshotZ` shape. Contract stable; source is detail.
+
+Missing profiles surface as `CIL_INTEGRITY_ERROR` envelope with
+`TENANT_PROFILE_MISSING` internal code — fails closed rather than
+producing an empty snapshot. Rationale: snapshots are immutable per §6;
+a version created with an empty `tenant_snapshot` locks permanently
+with no branding and cannot be backfilled when the tenant-profile data
+later exists. Better to refuse the quote than ship an unfillable
+placeholder.
+
+Rejected alternative: soften `TenantSnapshotZ` to all-optional fields
+and permit empty `{}` snapshots. Rejected because it trades immediate
+quote-creation for permanent historical-record degradation. The
+config-file bootstrap accepts a small per-tenant onboarding cost
+(adding an entry to `TENANT_PROFILES`) in exchange for snapshot
+durability.
+
+Rejected alternative: hardcode single-tenant branding inline in the
+handler. Rejected because it embeds tenant identity into shared source
+code. The config file is no cleaner than hardcoding for one tenant,
+but scales trivially as tenants onboard and provides a clean
+swap-for-DB migration path.
+
 **§20 addendum (2026-04-20) — create_if_missing jobs do not set
 source_msg_id.** CreateQuote's inline find-or-create job path inserts
 a new job row without a `source_msg_id` value (leaves it NULL). Job-

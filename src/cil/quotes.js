@@ -4,7 +4,7 @@
 // SECTION STATUS (as of this commit):
 //   Section 1 (customer resolution): IMPLEMENTED
 //   Section 2 (job resolution): IMPLEMENTED
-//   Section 3 (human_id + totals + snapshots): TODO
+//   Section 3 (human_id + totals + snapshots): IMPLEMENTED
 //   Section 4 (header + version + line items INSERTs): TODO
 //   Section 5 (current_version_id UPDATE): TODO
 //   Section 6 (event emission): TODO
@@ -48,6 +48,7 @@ const {
 } = require('./utils');
 const { canCreateQuote } = require('../config/checkCapability');
 const { COUNTER_KINDS } = require('./counterKinds');
+const { getTenantProfile } = require('../config/tenantProfiles');
 
 // services/postgres is required LAZILY inside handleCreateQuote — keeps this
 // module loadable in unit tests that don't have DATABASE_URL. Same idiom as
@@ -323,6 +324,132 @@ async function resolveOrCreateJob(client, ownerId, jobInput) {
   return ins.rows[0].id;
 }
 
+// ─── Section 3: totals, human_id, snapshots ────────────────────────────────
+
+/**
+ * computeTotals — pure function. Server-authoritative per §20 Q5: caller
+ * supplies per-line `qty` + `unit_price_cents` + header `tax_rate_bps`;
+ * handler computes all line + header totals. Totals are NEVER in the CIL
+ * input schema.
+ *
+ * Returns:
+ *   {
+ *     line_totals: [{ line_subtotal_cents, line_tax_cents }, ...],
+ *     subtotal_cents,
+ *     tax_cents,
+ *     total_cents,
+ *   }
+ *
+ * Per-line rounding produces header tax as the sum of rounded line tax
+ * values. A theoretical ±1¢ difference vs. `subtotal × tax_rate_bps / 10000`
+ * is intentional — the customer-facing quote shows per-line tax and must
+ * sum to header tax exactly. The subtotal × rate calculation would produce
+ * a different header tax that doesn't match visible line-tax values.
+ *
+ * Math.round is half-away-from-zero for positive integers — standard
+ * accounting rounding.
+ */
+function computeTotals(lineItems, taxRateBps) {
+  const line_totals = lineItems.map((li) => {
+    // qty is numeric(18,3) in DB; input is positive number. Multiplication
+    // produces a float; Math.round collapses to integer cents. Lossy only
+    // at sub-cent precision, which is acceptable.
+    const line_subtotal_cents = Math.round(li.qty * li.unit_price_cents);
+    const line_tax_cents = Math.round((line_subtotal_cents * taxRateBps) / 10000);
+    return { line_subtotal_cents, line_tax_cents };
+  });
+
+  const subtotal_cents = line_totals.reduce((s, l) => s + l.line_subtotal_cents, 0);
+  const tax_cents = line_totals.reduce((s, l) => s + l.line_tax_cents, 0);
+  const total_cents = subtotal_cents + tax_cents;
+
+  return { line_totals, subtotal_cents, tax_cents, total_cents };
+}
+
+/**
+ * formatHumanIdDatePart — UTC YYYY-MM-DD from ISO8601 occurred_at string.
+ *
+ * UTC-not-tenant-tz decision: date part is an identifier label, not a
+ * calendar date the contractor sees as "my local day." Cross-tenant
+ * consistency and zero-tenant-profile-reads are worth the edge case at
+ * UTC/local midnight.
+ *
+ * Edge case: a contractor submitting at 23:59 local could see a human_id
+ * dated "tomorrow UTC." Acceptable trade-off vs. reading tenant tz every
+ * allocation. Future: if contractors complain, add a tenant_tz resolution
+ * path — schema and format unchanged.
+ */
+function formatHumanIdDatePart(occurredAtIso) {
+  const d = new Date(occurredAtIso);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+/**
+ * allocateQuoteHumanId — allocates the per-tenant quote counter and
+ * formats the customer-facing human_id. Format: `QT-YYYY-MM-DD-NNNN`.
+ *
+ * Counter is monotonic per-tenant per-kind (§17.13). Cross-day resets
+ * are NOT a thing — `QT-2026-04-19-0142` and `QT-2026-04-20-0143` are
+ * adjacent in the sequence. Padding is 4 digits; overflow at 9999 is
+ * a future concern (contractor issuing 10000+ quotes/year hits it;
+ * counter holds the real value past 9999, format just displays wider).
+ */
+async function allocateQuoteHumanId(client, tenantId, occurredAtIso) {
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  const seq = await pg.allocateNextDocCounter(tenantId, COUNTER_KINDS.QUOTE, client);
+  const datePart = formatHumanIdDatePart(occurredAtIso);
+  return `QT-${datePart}-${String(seq).padStart(4, '0')}`;
+}
+
+/**
+ * composeCustomerSnapshot — maps Section 1's resolvedCustomer (DB row) to
+ * the CustomerSnapshotZ-validated output shape. Renames DB column `phone`
+ * (legacy, free-form) → snapshot key `phone_e164` (E.164 per schema).
+ *
+ * CustomerInputZ already validates phone_e164 at the CIL boundary, so the
+ * DB row's `phone` column holds an E.164 value on freshly-created
+ * customers. Pre-existing customers from other ingestion paths may have
+ * non-E.164 phone values; PhoneE164Z.parse below will reject those with a
+ * schema error, surfacing as CIL_INTEGRITY_ERROR — correct fail-closed
+ * posture.
+ */
+function composeCustomerSnapshot(resolvedCustomer) {
+  const snap = { name: resolvedCustomer.name };
+  if (resolvedCustomer.email) snap.email = resolvedCustomer.email;
+  if (resolvedCustomer.phone) snap.phone_e164 = resolvedCustomer.phone;
+  if (resolvedCustomer.address) snap.address = resolvedCustomer.address;
+  return CustomerSnapshotZ.parse(snap);
+}
+
+/**
+ * composeTenantSnapshot — reads tenant profile from bootstrap config
+ * (src/config/tenantProfiles.js) and validates against TenantSnapshotZ.
+ *
+ * Fail-closed on missing profile per §17.17 addendum 3 philosophy: better
+ * to refuse the quote than ship one with empty branding that cannot be
+ * fixed post-lock. Throws CilIntegrityError with TENANT_PROFILE_MISSING
+ * internal code; outer catch surfaces as CIL_INTEGRITY_ERROR envelope.
+ *
+ * Source-swap plan: when tenant-profile DB table ships, swap this
+ * function's body for a SELECT against that table. TenantSnapshotZ
+ * contract unchanged.
+ */
+function composeTenantSnapshot(tenantId) {
+  const profile = getTenantProfile(tenantId);
+  if (!profile) {
+    throw new CilIntegrityError({
+      code: 'TENANT_PROFILE_MISSING',
+      message: 'Tenant profile not configured',
+      hint: `Add tenant ${tenantId} to src/config/tenantProfiles.js until tenant-profile table ships`,
+    });
+  }
+  return TenantSnapshotZ.parse(profile);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -402,22 +529,19 @@ async function handleCreateQuote(rawCil, ctx) {
         data.job
       );
 
-      // ─── iii. Compute totals server-side (§20 Q5) ─── TODO Section 3 ────
-      // const totals = computeTotalsServerSide(data.line_items, data.tax_rate_bps);
+      // ─── iii. Compute totals server-side (§20 Q5) ─── IMPLEMENTED ───────
+      const totals = computeTotals(data.line_items, data.tax_rate_bps);
 
-      // ─── iv. Allocate human_id (§17.13 / COUNTER_KINDS.QUOTE) ── TODO S3 ─
-      // const seq = await pg.allocateNextDocCounter(
-      //   data.tenant_id, COUNTER_KINDS.QUOTE, client
-      // );
-      // const human_id = composeHumanId(data.occurred_at, seq);
+      // ─── iv. Allocate human_id (§17.13 / COUNTER_KINDS.QUOTE) ── IMPLEMENTED
+      const human_id = await allocateQuoteHumanId(
+        client,
+        data.tenant_id,
+        data.occurred_at
+      );
 
-      // ─── v. Compose + validate snapshots (§20) ─── TODO Section 3 ───────
-      // const customerSnapshot = CustomerSnapshotZ.parse(
-      //   composeCustomerSnapshot(resolvedCustomer)
-      // );
-      // const tenantSnapshot = TenantSnapshotZ.parse(
-      //   await composeTenantSnapshot(client, data.tenant_id)
-      // );
+      // ─── v. Compose + validate snapshots (§20) ─── IMPLEMENTED ──────────
+      const customer_snapshot = composeCustomerSnapshot(resolvedCustomer);
+      const tenant_snapshot = composeTenantSnapshot(data.tenant_id);
 
       // ─── vi. INSERT chiefos_quotes, current_version_id=NULL ─── TODO S4 ──
       // const { id: quoteId, created_at } = await insertQuoteHeader(
@@ -448,11 +572,13 @@ async function handleCreateQuote(rawCil, ctx) {
       return {
         customer: resolvedCustomer,
         job_id: resolvedJobId,
+        human_id,
+        totals,
+        customer_snapshot,
+        tenant_snapshot,
         // Placeholders — filled as sections land:
         // quote_id: undefined,
         // version_id: undefined,
-        // human_id: undefined,
-        // total_cents: undefined,
         // created_at: undefined,
       };
     });
@@ -529,6 +655,11 @@ module.exports = {
   _internals: {
     resolveOrCreateCustomer,
     resolveOrCreateJob,
+    computeTotals,
+    formatHumanIdDatePart,
+    allocateQuoteHumanId,
+    composeCustomerSnapshot,
+    composeTenantSnapshot,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

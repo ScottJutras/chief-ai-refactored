@@ -19,7 +19,17 @@ try { require('dotenv').config(); } catch (_) { /* dotenv optional at runtime */
 const { _internals } = require('./quotes');
 const { CilIntegrityError } = require('./utils');
 
-const { resolveOrCreateCustomer, resolveOrCreateJob } = _internals;
+const {
+  resolveOrCreateCustomer,
+  resolveOrCreateJob,
+  computeTotals,
+  formatHumanIdDatePart,
+  allocateQuoteHumanId,
+  composeCustomerSnapshot,
+  composeTenantSnapshot,
+} = _internals;
+
+const MISSION_TENANT_UUID = '86907c28-a9ea-4318-819d-5a012192119b';
 
 const hasDb = Boolean(
   process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.SUPABASE_DB_URL
@@ -409,14 +419,171 @@ describeIfDb('handleCreateQuote — Section 2: job resolution (integration)', ()
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Section 3: totals, human_id, snapshots
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('handleCreateQuote — Section 3a: computeTotals (unit)', () => {
+  test('3 line items × known qty/price with 13% HST → expected server totals', () => {
+    // Standalone spec: HST 13% = 1300 bps. Three typical line items.
+    const lineItems = [
+      { qty: 1, unit_price_cents: 250000 },   // $2500
+      { qty: 2, unit_price_cents: 150050 },   // $1500.50 each → $3001
+      { qty: 1.5, unit_price_cents: 800000 }, // qty fractional → $12000
+    ];
+    const result = computeTotals(lineItems, 1300);
+
+    expect(result.line_totals).toEqual([
+      { line_subtotal_cents: 250000, line_tax_cents: 32500 },    // 2500 × 0.13 = 325.00
+      { line_subtotal_cents: 300100, line_tax_cents: 39013 },    // 3001.00 × 0.13 = 390.13
+      { line_subtotal_cents: 1200000, line_tax_cents: 156000 },  // 12000 × 0.13 = 1560.00
+    ]);
+
+    expect(result.subtotal_cents).toBe(250000 + 300100 + 1200000);     // 1_750_100
+    expect(result.tax_cents).toBe(32500 + 39013 + 156000);             // 227_513
+    expect(result.total_cents).toBe(result.subtotal_cents + result.tax_cents); // 1_977_613
+  });
+
+  test('half-cent line tax rounds half-away-from-zero (Math.round semantics)', () => {
+    // Construct a line where line_subtotal × rate lands exactly on .5 cents.
+    // line_subtotal_cents=500, tax_rate_bps=1 → 500 × 1 / 10000 = 0.05 → rounds to 0.
+    // line_subtotal_cents=500, tax_rate_bps=3 → 500 × 3 / 10000 = 0.15 → rounds to 0.
+    // line_subtotal_cents=500, tax_rate_bps=11 → 500 × 11 / 10000 = 0.55 → rounds to 1.
+    // line_subtotal_cents=50000, tax_rate_bps=1 → 50000 × 1 / 10000 = 5.0 → rounds to 5.
+    // Construct a specific half-cent case: 100 * 5 / 10000 = 0.05 — rounds to 0.
+    // Better demo: 10000 * 5 / 10000 = 5.0 (whole). Need something like
+    // 1000 * 5 / 10000 = 0.5 → Math.round(0.5) = 1 (half-away-from-zero on positive).
+    const resultWhole = computeTotals(
+      [{ qty: 1, unit_price_cents: 1000 }],
+      5
+    );
+    expect(resultWhole.line_totals[0].line_tax_cents).toBe(1); // 0.5 rounds up to 1
+
+    // And the complement: 1000 * 4 / 10000 = 0.4 → rounds down to 0.
+    const resultDown = computeTotals(
+      [{ qty: 1, unit_price_cents: 1000 }],
+      4
+    );
+    expect(resultDown.line_totals[0].line_tax_cents).toBe(0); // 0.4 rounds to 0
+  });
+});
+
+describe('handleCreateQuote — Section 3b: human_id + tenant_snapshot (integration where needed)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool || null;
+    if (!pool || !pool.connect) {
+      const { Pool } = require('pg');
+      pool = new Pool({
+        connectionString:
+          process.env.DATABASE_URL ||
+          process.env.POSTGRES_URL ||
+          process.env.SUPABASE_DB_URL,
+        ssl: { rejectUnauthorized: false },
+      });
+    }
+  });
+
+  test('formatHumanIdDatePart (unit): UTC YYYY-MM-DD from ISO8601 string', () => {
+    expect(formatHumanIdDatePart('2026-04-19T12:00:00.000Z')).toBe('2026-04-19');
+    expect(formatHumanIdDatePart('2026-01-01T00:00:00.000Z')).toBe('2026-01-01');
+    // 23:59 local edge case (user in America/Toronto submits at 23:59 EDT):
+    // 2026-04-19T23:59:00-04:00 === 2026-04-20T03:59:00Z → date part is "2026-04-20" in UTC
+    expect(formatHumanIdDatePart('2026-04-19T23:59:00-04:00')).toBe('2026-04-20');
+  });
+
+  const describeIfDb = hasDb ? describe : describe.skip;
+  describeIfDb('human_id allocation (integration against live counter)', () => {
+    test('allocateQuoteHumanId: format QT-YYYY-MM-DD-NNNN with 4-digit padding', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const id1 = await allocateQuoteHumanId(
+          client,
+          MISSION_TENANT_UUID,
+          '2026-04-19T12:00:00.000Z'
+        );
+        expect(id1).toMatch(/^QT-2026-04-19-\d{4}$/);
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+      }
+    });
+
+    test('allocateQuoteHumanId: second allocation for same tenant yields next sequence number', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const id1 = await allocateQuoteHumanId(client, MISSION_TENANT_UUID, '2026-04-19T12:00:00Z');
+        const id2 = await allocateQuoteHumanId(client, MISSION_TENANT_UUID, '2026-04-19T12:00:00Z');
+        const seq1 = Number(id1.slice(-4));
+        const seq2 = Number(id2.slice(-4));
+        expect(seq2).toBe(seq1 + 1);
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+      }
+    });
+  });
+});
+
+describe('handleCreateQuote — Section 3c: snapshots (unit)', () => {
+  test('composeCustomerSnapshot: DB `phone` column renamed to `phone_e164` snapshot key', () => {
+    const dbRow = {
+      id: 'ignored-uuid',
+      tenant_id: 'ignored-tenant-uuid',
+      name: 'Darlene MacDonald',
+      email: 'darlene@example.com',
+      phone: '+14165551234',     // DB column name
+      address: '119 St Lawrence Ave, Komoka, ON',
+    };
+    const snap = composeCustomerSnapshot(dbRow);
+    expect(snap).toEqual({
+      name: 'Darlene MacDonald',
+      email: 'darlene@example.com',
+      phone_e164: '+14165551234',   // snapshot key name
+      address: '119 St Lawrence Ave, Komoka, ON',
+    });
+    // Ensure DB identity columns absent from snapshot
+    expect(snap.id).toBeUndefined();
+    expect(snap.tenant_id).toBeUndefined();
+    // Ensure source column `phone` is not carried through
+    expect(snap.phone).toBeUndefined();
+  });
+
+  test('composeTenantSnapshot: Mission Exteriors profile populates TenantSnapshotZ correctly', () => {
+    const snap = composeTenantSnapshot(MISSION_TENANT_UUID);
+    expect(snap).toEqual({
+      legal_name: '9839429 Canada Inc.',
+      brand_name: 'Mission Exteriors',
+      address: '1556 Medway Park Dr, London, ON, N6G 0X5',
+      phone_e164: '+18449590109',
+      email: 'scott@missionexteriors.ca',
+      web: 'missionexteriors.ca',
+      hst_registration: '759884893RT0001',
+    });
+  });
+
+  test('composeTenantSnapshot: missing profile throws CilIntegrityError with TENANT_PROFILE_MISSING code', () => {
+    const unknownUuid = '00000000-0000-0000-0000-000000000000';
+    expect(() => composeTenantSnapshot(unknownUuid)).toThrow(CilIntegrityError);
+    try {
+      composeTenantSnapshot(unknownUuid);
+    } catch (e) {
+      expect(e.code).toBe('TENANT_PROFILE_MISSING');
+      expect(e.message).toBe('Tenant profile not configured');
+      expect(e.hint).toContain(unknownUuid);
+      expect(e.hint).toContain('tenantProfiles.js');
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Remaining scenarios from session brief — todos until their sections land.
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('handleCreateQuote — remaining coverage (todos)', () => {
-  // Section 3 (totals + human_id format)
-  it.todo('human_id format matches QT-YYYY-MMDD-NNNN derived from occurred_at');
-  it.todo('Counter increments: second CreateQuote in same tenant yields NNNN=0002');
-  it.todo('Totals computed correctly: 3 line items × qty/price + tax_rate_bps → expected subtotal/tax/total');
 
   // Section 4 + 5 (INSERTs + pointer UPDATE)
   it.todo('Happy path: header + v1 + line items + 2 events emitted; return shape matches §17.15');

@@ -325,6 +325,200 @@ function computePngSha256(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
 
+// ─── §25.2 / §25.7 admin-client gate (shared by Sections 3 + 4) ─────────────
+
+/**
+ * requireAdmin — asserts supabaseAdmin.getAdminClient() returns a non-null
+ * client, throws a CilIntegrityError with a configurable code otherwise.
+ *
+ * Section 3 (upload) calls with PNG_UPLOAD_FAILED.
+ * Section 4 (retrieve) will call with STORAGE_FETCH_FAILED.
+ *
+ * cleanupOrphanPng does NOT use this — its error posture is best-effort
+ * (console.warn, no throw), which diverges from requireAdmin's throw-on-null
+ * contract.
+ *
+ * @param {object} supabaseAdmin
+ * @param {string} errCode — SIG_ERR.*.code to attach on failure
+ * @returns {object} admin client (never null)
+ * @throws {CilIntegrityError}
+ */
+function requireAdmin(supabaseAdmin, errCode) {
+  const admin = supabaseAdmin && supabaseAdmin.getAdminClient
+    ? supabaseAdmin.getAdminClient()
+    : null;
+  if (!admin) {
+    throw new CilIntegrityError({
+      code: errCode || SIG_ERR.PNG_UPLOAD_FAILED.code,
+      message: 'Supabase admin client unavailable',
+      hint: 'services/supabaseAdmin.getAdminClient() returned null; check SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY env vars',
+    });
+  }
+  return admin;
+}
+
+// ─── §25.5 Supabase-layer error classifier (internal) ───────────────────────
+
+/**
+ * classifySupabaseUploadError — maps raw Supabase StorageError to a
+ * CilIntegrityError with an appropriate SIG_ERR code.
+ *
+ * Always returns CilIntegrityError. Never re-throws. Network-transient
+ * failures fall into PNG_UPLOAD_FAILED; CIL-layer idempotency via
+ * source_msg_id handles retry semantics at a higher level.
+ *
+ * Classification (substring match on error.message, case-insensitive):
+ *   "already exists"              → PNG_UPLOAD_DUPLICATE
+ *   "bucket not found" / "bucket does not exist" → PNG_BUCKET_MISSING
+ *   anything else                 → PNG_UPLOAD_FAILED (auth, network, generic)
+ *
+ * Defensive shape handling: Supabase library has changed error shapes
+ * across major versions. We accept anything with a .message field; coerce
+ * strings to their own text; non-object non-string inputs degrade to
+ * 'unknown supabase error' with generic PNG_UPLOAD_FAILED.
+ *
+ * No dedicated AUTH_FAILED code — hint text surfaces auth-specific
+ * diagnosis (status 401/403, "not authorized" message) for operators
+ * without bloating SIG_ERR; handler retry policy is identical for all
+ * non-duplicate non-bucket-missing failures.
+ *
+ * @param {object|string} supabaseError
+ * @returns {CilIntegrityError}
+ */
+function classifySupabaseUploadError(supabaseError) {
+  const rawMessage =
+    (supabaseError && typeof supabaseError === 'object' && supabaseError.message)
+      ? String(supabaseError.message)
+      : (typeof supabaseError === 'string' ? supabaseError : 'unknown supabase error');
+  const msg = rawMessage.toLowerCase();
+  const status = (supabaseError && typeof supabaseError === 'object')
+    ? (supabaseError.statusCode ?? supabaseError.status ?? null)
+    : null;
+
+  if (msg.includes('already exists')) {
+    return new CilIntegrityError({
+      code: SIG_ERR.PNG_UPLOAD_DUPLICATE.code,
+      message: 'Signature PNG upload hit duplicate key',
+      hint:
+        `Supabase: ${rawMessage}; storage_key already exists in bucket. ` +
+        'Most likely cause: a prior upload with this signatureId succeeded but its cleanup ' +
+        'or INSERT failed, leaving an orphan. Check the future reaper queue (§25.6 Direction A). ' +
+        'Collision via crypto.randomUUID() is astronomically unlikely.',
+    });
+  }
+  if (msg.includes('bucket not found') || msg.includes('bucket does not exist')) {
+    return new CilIntegrityError({
+      code: SIG_ERR.PNG_BUCKET_MISSING.code,
+      message: 'Signature bucket missing',
+      hint: `Supabase: ${rawMessage}; run the §25.7 bucket provisioning step (${SIGNATURE_BUCKET} bucket, private, 2MB, image/png only)`,
+    });
+  }
+  return new CilIntegrityError({
+    code: SIG_ERR.PNG_UPLOAD_FAILED.code,
+    message: 'Signature PNG upload failed',
+    hint: `Supabase: ${rawMessage}${status ? ` (status ${status})` : ''}`,
+  });
+}
+
+// ─── §25.4 Upload pipeline ──────────────────────────────────────────────────
+
+/**
+ * uploadSignaturePng — §25.4 four-invariant upload pipeline for signature
+ * PNGs. Composes Section 2 validators + SHA-256 + §25.3 storage_key parse
+ * + service-role upload with upsert:false (non-negotiable per §25.4 inv 4).
+ *
+ * Caller responsibility (per §25.3 strict-immutable write-path sequencing):
+ *   1. Pre-generate signatureId via crypto.randomUUID()
+ *   2. Call buildSignatureStorageKey(...) to produce storageKey
+ *   3. Pass storageKey to this helper
+ *   4. On success, INSERT signature row with storageKey + returned sha256
+ *   5. On INSERT failure, call cleanupOrphanPng({ supabaseAdmin, storageKey })
+ *
+ * Pipeline (matches Q4 step sequence):
+ *   a. extractAndNormalizeBase64(pngDataUrl) — §25.4 inv 1 + inv 2 (base64 precheck)
+ *   b. Buffer.from(..., 'base64') — decode
+ *   c. validatePngBuffer(...) — §25.4 inv 1 (structural) + inv 2 (decoded size)
+ *   d. computePngSha256(...) — §25.4 inv 3
+ *   e. parseSignatureStorageKey(storageKey) — §25.3 rule 3 (helper-parsed)
+ *   f. path = storageKey.slice(SIGNATURE_BUCKET.length + 1)
+ *   g. requireAdmin(supabaseAdmin, PNG_UPLOAD_FAILED) — §25.2 rule 1 + §25.7 DI
+ *   h. admin.storage.from(BUCKET).upload(path, buffer, { contentType, upsert:false })
+ *   i. if (error) throw classifySupabaseUploadError(error) — §25.5
+ *   j. return { pngBuffer, sha256 }
+ *
+ * @param {object} params
+ * @param {string} params.pngDataUrl   — raw data:image/png;base64,... string
+ * @param {string} params.storageKey   — pre-built from buildSignatureStorageKey
+ * @param {object} params.supabaseAdmin — services/supabaseAdmin module (DI)
+ * @returns {Promise<{ pngBuffer: Buffer, sha256: string }>}
+ * @throws {CilIntegrityError}
+ *   PNG_MALFORMED | PNG_TOO_SMALL | PNG_TOO_LARGE | STORAGE_KEY_MALFORMED |
+ *   PNG_UPLOAD_DUPLICATE | PNG_BUCKET_MISSING | PNG_UPLOAD_FAILED
+ */
+async function uploadSignaturePng({ pngDataUrl, storageKey, supabaseAdmin }) {
+  const normalized = extractAndNormalizeBase64(pngDataUrl);
+  const pngBuffer = Buffer.from(normalized, 'base64');
+  validatePngBuffer(pngBuffer);
+  const sha256 = computePngSha256(pngBuffer);
+
+  // Validate input storageKey; parseSignatureStorageKey throws on malformed.
+  parseSignatureStorageKey(storageKey);
+  const path = storageKey.slice(SIGNATURE_BUCKET.length + 1);
+
+  const admin = requireAdmin(supabaseAdmin, SIG_ERR.PNG_UPLOAD_FAILED.code);
+
+  const { error } = await admin.storage.from(SIGNATURE_BUCKET).upload(
+    path,
+    pngBuffer,
+    { contentType: 'image/png', upsert: false }
+  );
+  if (error) throw classifySupabaseUploadError(error);
+
+  return { pngBuffer, sha256 };
+}
+
+// ─── §25.6 Direction A best-effort orphan cleanup ───────────────────────────
+
+/**
+ * cleanupOrphanPng — §25.6 Direction A best-effort orphan cleanup.
+ *
+ * Called from handleSignQuote's INSERT-catch block when upload succeeded
+ * but the signature row INSERT failed. Best-effort: swallows ALL errors
+ * with console.warn; never throws. Caller is already in an error path
+ * and will re-throw its own original error; this helper must not mask it.
+ *
+ * Diverges from requireAdmin's throw-on-null contract — cleanup's null-
+ * admin case is a warning, not an error, because the caller is already
+ * failing and we're just being polite about orphan bytes.
+ *
+ * @param {object} params
+ * @param {object} params.supabaseAdmin — services/supabaseAdmin module
+ * @param {string} params.storageKey    — same key used for the upload
+ * @returns {Promise<void>}
+ */
+async function cleanupOrphanPng({ supabaseAdmin, storageKey }) {
+  try {
+    // Defensive parse — if storageKey is malformed, skip cleanup cleanly.
+    parseSignatureStorageKey(storageKey);
+    const path = storageKey.slice(SIGNATURE_BUCKET.length + 1);
+
+    const admin = supabaseAdmin && supabaseAdmin.getAdminClient
+      ? supabaseAdmin.getAdminClient()
+      : null;
+    if (!admin) {
+      console.warn('[SIG_CLEANUP] supabaseAdmin unavailable; orphan left for reaper:', storageKey);
+      return;
+    }
+
+    const { error } = await admin.storage.from(SIGNATURE_BUCKET).remove([path]);
+    if (error) {
+      console.warn('[SIG_CLEANUP] remove failed; orphan left for reaper:', storageKey, error.message);
+    }
+  } catch (cleanupErr) {
+    console.warn('[SIG_CLEANUP] threw; orphan left for reaper:', storageKey, cleanupErr && cleanupErr.message);
+  }
+}
+
 // ─── Exports ────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -336,6 +530,10 @@ module.exports = {
   // Format helpers (pure)
   buildSignatureStorageKey,
   parseSignatureStorageKey,
+
+  // Write path (Section 3)
+  uploadSignaturePng,
+  cleanupOrphanPng,
 
   // Placeholders — populated by later sections. Mirror quoteHash.js pattern:
   // declaring future _internals contents as comments keeps the full test
@@ -353,7 +551,8 @@ module.exports = {
     validatePngBuffer,
     computePngSha256,
 
-    // Section 3: upload error classifier
-    // classifySupabaseUploadError,
+    // Section 3: admin gate + error classifier
+    requireAdmin,
+    classifySupabaseUploadError,
   },
 };

@@ -1,6 +1,6 @@
 // src/cil/quoteSignatureStorage.test.js
-// Phase 2B Sections 1–2: format helpers + constants + PNG validation + SHA-256.
-// Sections 3–4 add upload / retrieval suites to this file.
+// Phase 2B Sections 1–3: format helpers + PNG validation + upload pipeline.
+// Section 4 adds retrieval suite.
 
 const crypto = require('crypto');
 const zlib = require('zlib');
@@ -12,6 +12,8 @@ const {
   SIG_ERR,
   buildSignatureStorageKey,
   parseSignatureStorageKey,
+  uploadSignaturePng,
+  cleanupOrphanPng,
   _internals,
 } = mod;
 const {
@@ -24,6 +26,8 @@ const {
   extractAndNormalizeBase64,
   validatePngBuffer,
   computePngSha256,
+  requireAdmin,
+  classifySupabaseUploadError,
 } = _internals;
 
 // ─── Section 2 test fixtures ────────────────────────────────────────────────
@@ -658,5 +662,471 @@ describe('computePngSha256', () => {
   it('rejects non-Buffer input with PNG_MALFORMED', () => {
     expectCilError(() => computePngSha256('string'), SIG_ERR.PNG_MALFORMED.code);
     expectCilError(() => computePngSha256(null), SIG_ERR.PNG_MALFORMED.code);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section 3 tests: upload pipeline + orphan cleanup + error classifier
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Mock supabaseAdmin shape (shared with Section 4) ──────────────────────
+//
+// Minimum-viable mock matching services/supabaseAdmin.js's public surface.
+// createSignedUrl is stubbed even though Section 3 doesn't use it — avoids
+// mock-shape churn when Section 4 lands.
+
+function createMockSupabaseAdmin({ uploadError, removeError, removeThrows, adminNull } = {}) {
+  const uploadMock = jest.fn().mockResolvedValue(
+    uploadError
+      ? { data: null, error: uploadError }
+      : { data: { path: 'mock-path' }, error: null }
+  );
+  const removeMock = removeThrows
+    ? jest.fn().mockRejectedValue(new Error('simulated remove throw'))
+    : jest.fn().mockResolvedValue(
+        removeError
+          ? { data: null, error: removeError }
+          : { data: [], error: null }
+      );
+  const createSignedUrlMock = jest.fn().mockResolvedValue({
+    data: { signedUrl: 'mock://signed-url' },
+    error: null,
+  });
+  const fromMock = jest.fn().mockReturnValue({
+    upload: uploadMock,
+    remove: removeMock,
+    createSignedUrl: createSignedUrlMock,
+  });
+  const getAdminClient = jest.fn().mockReturnValue(
+    adminNull ? null : { storage: { from: fromMock } }
+  );
+  return {
+    module: { getAdminClient },
+    uploadMock,
+    removeMock,
+    createSignedUrlMock,
+    fromMock,
+    getAdminClient,
+  };
+}
+
+// ─── Section 3 fixtures: valid data URL + storageKey for happy-path use ────
+
+// Build a 100-byte synthetic PNG buffer and wrap it as a data URL.
+// Used across Section 3 happy-path and storage-key-related tests.
+const VALID_PNG_BUFFER_100 = makeSynthetic(100);
+const VALID_PNG_DATA_URL = `data:image/png;base64,${VALID_PNG_BUFFER_100.toString('base64')}`;
+const VALID_STORAGE_KEY = buildSignatureStorageKey(PINNED_INPUTS);
+
+describe('Section 3 mock shape', () => {
+  it('createMockSupabaseAdmin returns expected interface', () => {
+    const mock = createMockSupabaseAdmin();
+    expect(mock.module).toHaveProperty('getAdminClient');
+    expect(typeof mock.module.getAdminClient).toBe('function');
+
+    const admin = mock.module.getAdminClient();
+    expect(admin).toHaveProperty('storage');
+    expect(admin.storage).toHaveProperty('from');
+
+    const bucket = admin.storage.from('any-bucket');
+    expect(bucket).toHaveProperty('upload');
+    expect(bucket).toHaveProperty('remove');
+    expect(bucket).toHaveProperty('createSignedUrl');
+  });
+});
+
+// ─── classifySupabaseUploadError ───────────────────────────────────────────
+
+describe('classifySupabaseUploadError', () => {
+  it('maps "The resource already exists" → PNG_UPLOAD_DUPLICATE', () => {
+    const err = classifySupabaseUploadError({ message: 'The resource already exists' });
+    expect(err.name).toBe('CilIntegrityError');
+    expect(err.code).toBe(SIG_ERR.PNG_UPLOAD_DUPLICATE.code);
+    expect(err.hint).toMatch(/orphan/i);
+    expect(err.hint).toMatch(/reaper/i);
+  });
+
+  it('maps "Bucket not found" → PNG_BUCKET_MISSING', () => {
+    const err = classifySupabaseUploadError({ message: 'Bucket not found' });
+    expect(err.code).toBe(SIG_ERR.PNG_BUCKET_MISSING.code);
+    expect(err.hint).toMatch(/chiefos-signatures/);
+    expect(err.hint).toMatch(/provisioning/i);
+  });
+
+  it('maps "Bucket does not exist" → PNG_BUCKET_MISSING (alt phrasing)', () => {
+    const err = classifySupabaseUploadError({ message: 'Bucket does not exist for project' });
+    expect(err.code).toBe(SIG_ERR.PNG_BUCKET_MISSING.code);
+  });
+
+  it('maps auth failure with status 401 → PNG_UPLOAD_FAILED with status in hint', () => {
+    const err = classifySupabaseUploadError({
+      message: 'Not authorized',
+      status: 401,
+    });
+    expect(err.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+    expect(err.hint).toMatch(/not authorized/i);
+    expect(err.hint).toMatch(/status 401/);
+  });
+
+  it('maps generic unknown error → PNG_UPLOAD_FAILED with raw message in hint', () => {
+    const err = classifySupabaseUploadError({ message: 'Something unexpected' });
+    expect(err.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+    expect(err.hint).toMatch(/Something unexpected/);
+  });
+
+  it('defensively handles undefined input → PNG_UPLOAD_FAILED', () => {
+    const err = classifySupabaseUploadError(undefined);
+    expect(err.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+    expect(err.hint).toMatch(/unknown supabase error/);
+  });
+
+  it('defensively handles plain string input → PNG_UPLOAD_FAILED', () => {
+    const err = classifySupabaseUploadError('raw string error');
+    expect(err.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+    expect(err.hint).toMatch(/raw string error/);
+  });
+
+  it('defensively handles object without .message → PNG_UPLOAD_FAILED', () => {
+    const err = classifySupabaseUploadError({ someRandomField: 'x' });
+    expect(err.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+    expect(err.hint).toMatch(/unknown supabase error/);
+  });
+
+  it('reads statusCode when status absent', () => {
+    const err = classifySupabaseUploadError({
+      message: 'Something failed',
+      statusCode: 500,
+    });
+    expect(err.hint).toMatch(/status 500/);
+  });
+});
+
+// ─── requireAdmin ──────────────────────────────────────────────────────────
+
+describe('requireAdmin', () => {
+  it('returns admin client when getAdminClient returns non-null', () => {
+    const mock = createMockSupabaseAdmin();
+    const admin = requireAdmin(mock.module, SIG_ERR.PNG_UPLOAD_FAILED.code);
+    expect(admin).toBeTruthy();
+    expect(admin).toHaveProperty('storage');
+  });
+
+  it('throws with passed error code when getAdminClient returns null', () => {
+    const mock = createMockSupabaseAdmin({ adminNull: true });
+    try {
+      requireAdmin(mock.module, SIG_ERR.STORAGE_FETCH_FAILED.code);
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe(SIG_ERR.STORAGE_FETCH_FAILED.code);
+      expect(e.hint).toMatch(/SUPABASE_URL/);
+      expect(e.hint).toMatch(/SUPABASE_SERVICE_ROLE_KEY/);
+    }
+  });
+
+  it('falls back to PNG_UPLOAD_FAILED when no errCode supplied', () => {
+    const mock = createMockSupabaseAdmin({ adminNull: true });
+    try {
+      requireAdmin(mock.module, null);
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+    }
+  });
+
+  it('throws when supabaseAdmin itself is null / missing getAdminClient', () => {
+    try {
+      requireAdmin(null, SIG_ERR.PNG_UPLOAD_FAILED.code);
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+    }
+    try {
+      requireAdmin({}, SIG_ERR.PNG_UPLOAD_FAILED.code);
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+    }
+  });
+});
+
+// ─── uploadSignaturePng — happy path ──────────────────────────────────────
+
+describe('uploadSignaturePng — happy path', () => {
+  it('returns { pngBuffer, sha256 } with correct values', async () => {
+    const mock = createMockSupabaseAdmin();
+    const result = await uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    });
+    expect(Buffer.isBuffer(result.pngBuffer)).toBe(true);
+    expect(result.pngBuffer.equals(VALID_PNG_BUFFER_100)).toBe(true);
+    expect(result.sha256).toMatch(/^[0-9a-f]{64}$/);
+
+    // Hash matches reference.
+    const ref = crypto.createHash('sha256').update(VALID_PNG_BUFFER_100).digest('hex');
+    expect(result.sha256).toBe(ref);
+  });
+
+  it('calls admin.storage.from with SIGNATURE_BUCKET literal', async () => {
+    const mock = createMockSupabaseAdmin();
+    await uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    });
+    expect(mock.fromMock).toHaveBeenCalledWith(SIGNATURE_BUCKET);
+    expect(mock.fromMock).toHaveBeenCalledWith('chiefos-signatures');
+  });
+
+  it('calls upload with path stripped of bucket prefix + buffer + correct options', async () => {
+    const mock = createMockSupabaseAdmin();
+    await uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    });
+    expect(mock.uploadMock).toHaveBeenCalledTimes(1);
+    const [pathArg, bufferArg, optionsArg] = mock.uploadMock.mock.calls[0];
+
+    // Path is storageKey minus "chiefos-signatures/" prefix.
+    expect(pathArg).toBe(VALID_STORAGE_KEY.slice(SIGNATURE_BUCKET.length + 1));
+    // Buffer equals decoded PNG bytes.
+    expect(Buffer.isBuffer(bufferArg)).toBe(true);
+    expect(bufferArg.equals(VALID_PNG_BUFFER_100)).toBe(true);
+    // Options include contentType.
+    expect(optionsArg.contentType).toBe('image/png');
+  });
+});
+
+// ─── uploadSignaturePng — §25.4 invariant checks ──────────────────────────
+
+describe('uploadSignaturePng — invariants', () => {
+  it('passes upsert: false explicitly (§25.4 invariant 4 non-negotiable)', async () => {
+    const mock = createMockSupabaseAdmin();
+    await uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    });
+    const uploadOptions = mock.uploadMock.mock.calls[0][2];
+    // Presence: option key is set (catches "forgot to specify" bugs).
+    expect(uploadOptions).toHaveProperty('upsert');
+    // Strict value: must be exactly false (catches both missing-key and wrong-value bugs).
+    expect(uploadOptions.upsert).toBe(false);
+  });
+
+  it('passes contentType: image/png explicitly (§25.7 bucket MIME restriction)', async () => {
+    const mock = createMockSupabaseAdmin();
+    await uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    });
+    const uploadOptions = mock.uploadMock.mock.calls[0][2];
+    expect(uploadOptions.contentType).toBe('image/png');
+  });
+});
+
+// ─── uploadSignaturePng — validation propagation ──────────────────────────
+
+describe('uploadSignaturePng — validation propagation', () => {
+  it('propagates PNG_MALFORMED from non-PNG data URL', async () => {
+    const mock = createMockSupabaseAdmin();
+    await expect(uploadSignaturePng({
+      pngDataUrl: 'data:image/jpeg;base64,/9j/4A==',
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.PNG_MALFORMED.code });
+    expect(mock.uploadMock).not.toHaveBeenCalled();
+  });
+
+  it('propagates PNG_TOO_LARGE from base64 precheck (hint mentions base64 length)', async () => {
+    const mock = createMockSupabaseAdmin();
+    const huge = 'A'.repeat(PNG_MAX_BASE64_LENGTH + 1);
+    try {
+      await uploadSignaturePng({
+        pngDataUrl: `data:image/png;base64,${huge}`,
+        storageKey: VALID_STORAGE_KEY,
+        supabaseAdmin: mock.module,
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.PNG_TOO_LARGE.code);
+      expect(e.hint).toMatch(/base64 length/);
+    }
+  });
+
+  it('propagates PNG_TOO_SMALL from decoded size below MIN', async () => {
+    const mock = createMockSupabaseAdmin();
+    const tiny = Buffer.alloc(50).toString('base64');
+    await expect(uploadSignaturePng({
+      pngDataUrl: `data:image/png;base64,${tiny}`,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.PNG_TOO_SMALL.code });
+  });
+
+  it('propagates PNG_TOO_LARGE from decoded size above MAX (hint mentions decoded size)', async () => {
+    // Craft a buffer just above MAX but with base64 length still under precheck.
+    // Decoded 2097153 bytes → base64 ~2796205 chars, below MAX_BASE64 (2796220).
+    const mock = createMockSupabaseAdmin();
+    const tooLargeBuffer = makeSynthetic(PNG_MAX_BYTES + 1);
+    const b64 = tooLargeBuffer.toString('base64');
+    try {
+      await uploadSignaturePng({
+        pngDataUrl: `data:image/png;base64,${b64}`,
+        storageKey: VALID_STORAGE_KEY,
+        supabaseAdmin: mock.module,
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.PNG_TOO_LARGE.code);
+      expect(e.hint).toMatch(/decoded size/);
+    }
+  });
+
+  it('propagates PNG_MALFORMED from wrong magic bytes', async () => {
+    const mock = createMockSupabaseAdmin();
+    const badBuf = Buffer.from(VALID_PNG_BUFFER_100);
+    badBuf[0] = 0x00;
+    await expect(uploadSignaturePng({
+      pngDataUrl: `data:image/png;base64,${badBuf.toString('base64')}`,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.PNG_MALFORMED.code });
+  });
+
+  it('propagates STORAGE_KEY_MALFORMED from bad storageKey', async () => {
+    const mock = createMockSupabaseAdmin();
+    await expect(uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: 'not-a-valid-storage-key',
+      supabaseAdmin: mock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.STORAGE_KEY_MALFORMED.code });
+    expect(mock.uploadMock).not.toHaveBeenCalled();
+  });
+});
+
+// ─── uploadSignaturePng — Supabase error propagation ──────────────────────
+
+describe('uploadSignaturePng — Supabase error propagation', () => {
+  it('maps duplicate-key error to PNG_UPLOAD_DUPLICATE', async () => {
+    const mock = createMockSupabaseAdmin({
+      uploadError: { message: 'The resource already exists' },
+    });
+    await expect(uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.PNG_UPLOAD_DUPLICATE.code });
+  });
+
+  it('maps bucket-missing error to PNG_BUCKET_MISSING', async () => {
+    const mock = createMockSupabaseAdmin({
+      uploadError: { message: 'Bucket not found' },
+    });
+    await expect(uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.PNG_BUCKET_MISSING.code });
+  });
+
+  it('maps unknown error to PNG_UPLOAD_FAILED', async () => {
+    const mock = createMockSupabaseAdmin({
+      uploadError: { message: 'Network timeout', status: 504 },
+    });
+    await expect(uploadSignaturePng({
+      pngDataUrl: VALID_PNG_DATA_URL,
+      storageKey: VALID_STORAGE_KEY,
+      supabaseAdmin: mock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.PNG_UPLOAD_FAILED.code });
+  });
+
+  it('throws PNG_UPLOAD_FAILED when getAdminClient returns null (env missing)', async () => {
+    const mock = createMockSupabaseAdmin({ adminNull: true });
+    try {
+      await uploadSignaturePng({
+        pngDataUrl: VALID_PNG_DATA_URL,
+        storageKey: VALID_STORAGE_KEY,
+        supabaseAdmin: mock.module,
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.PNG_UPLOAD_FAILED.code);
+      expect(e.hint).toMatch(/SUPABASE_URL/);
+    }
+    expect(mock.uploadMock).not.toHaveBeenCalled();
+  });
+});
+
+// ─── cleanupOrphanPng ─────────────────────────────────────────────────────
+
+describe('cleanupOrphanPng', () => {
+  let warnSpy;
+  beforeEach(() => {
+    warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warnSpy.mockRestore();
+  });
+
+  it('happy path: calls remove([path]) with correct bucket + path', async () => {
+    const mock = createMockSupabaseAdmin();
+    await cleanupOrphanPng({
+      supabaseAdmin: mock.module,
+      storageKey: VALID_STORAGE_KEY,
+    });
+    expect(mock.fromMock).toHaveBeenCalledWith(SIGNATURE_BUCKET);
+    const expectedPath = VALID_STORAGE_KEY.slice(SIGNATURE_BUCKET.length + 1);
+    expect(mock.removeMock).toHaveBeenCalledWith([expectedPath]);
+    expect(warnSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not throw when Supabase remove returns error (logs warning)', async () => {
+    const mock = createMockSupabaseAdmin({
+      removeError: { message: 'Object not found' },
+    });
+    await expect(cleanupOrphanPng({
+      supabaseAdmin: mock.module,
+      storageKey: VALID_STORAGE_KEY,
+    })).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls[0][0]).toMatch(/SIG_CLEANUP/);
+    expect(warnSpy.mock.calls[0][0]).toMatch(/remove failed/);
+  });
+
+  it('does not throw when getAdminClient returns null (logs warning)', async () => {
+    const mock = createMockSupabaseAdmin({ adminNull: true });
+    await expect(cleanupOrphanPng({
+      supabaseAdmin: mock.module,
+      storageKey: VALID_STORAGE_KEY,
+    })).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls[0][0]).toMatch(/unavailable/);
+  });
+
+  it('does not throw when storageKey is malformed (logs warning)', async () => {
+    const mock = createMockSupabaseAdmin();
+    await expect(cleanupOrphanPng({
+      supabaseAdmin: mock.module,
+      storageKey: 'not-a-valid-key',
+    })).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls[0][0]).toMatch(/threw/);
+    // remove was never called.
+    expect(mock.removeMock).not.toHaveBeenCalled();
+  });
+
+  it('does not throw when remove itself rejects (logs warning)', async () => {
+    const mock = createMockSupabaseAdmin({ removeThrows: true });
+    await expect(cleanupOrphanPng({
+      supabaseAdmin: mock.module,
+      storageKey: VALID_STORAGE_KEY,
+    })).resolves.toBeUndefined();
+    expect(warnSpy).toHaveBeenCalled();
+    expect(warnSpy.mock.calls[0][0]).toMatch(/threw/);
   });
 });

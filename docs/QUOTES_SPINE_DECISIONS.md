@@ -1969,6 +1969,15 @@ a detail endpoint, not returned on write.
 new-idiom Quote-spine handler and every future doc-type handler
 family.
 
+**§17.15 clarification (2026-04-19) — events_emitted scope.**
+`meta.events_emitted` describes events emitted by **this invocation**,
+not events present in the entity's history. On idempotent retry
+(`already_existed: true`), `events_emitted` is `[]` because this call
+emitted no events — the original call did. Callers wanting entity
+event history query a dedicated events endpoint. This preserves
+internal consistency: returning the original's event list on retry
+would contradict the claim that this call didn't do the work.
+
 **§17.16 — Plan gating for new-idiom handlers.** All new-idiom CIL
 handlers subject to plan gating resolve plan and monthly usage via the
 shared `gateNewIdiomHandler(ctx, checkFn, kindLiteral)` helper in

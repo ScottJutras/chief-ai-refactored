@@ -3370,6 +3370,488 @@ of Plan D (defer SignQuote; algorithm-first).
 **§23 committed 2026-04-19.** Phase 1 complete. Phase 2 and 3 open
 in dedicated future sessions.
 
+## §25. Storage architecture for audit-kind artifacts — Phase 2A locked (2026-04-19)
+
+**Status.** Phase 2A of SignQuote session split (§23). Architectural
+decisions locked across seven question-rounds (Q1–Q7) establishing
+ChiefOS-wide convention for storing and retrieving audit-grade
+artifacts (signature PNGs in Phase 2; PDFs and tenant logos to inherit
+the convention in later phases). Nothing in §25 is feature-specific
+to signatures — the rules template forward to every future audit-kind
+byte-artifact.
+
+**Scope qualifier.** All §25 rules apply to **audit-kind buckets**:
+buckets holding artifacts where the bytes themselves are legal or
+audit evidence (signatures, signed PDFs, tenant brand marks that
+appear on signed documents). Non-audit-kind buckets (e.g.,
+`job-photos`, which is public by product design) retain their
+existing posture until explicitly re-classified.
+
+### §25.1 Bucket architecture — three storage-convention rules
+
+Three rules, independently checkable:
+
+1. **Dedicated bucket per audit-kind.** Signatures → `chiefos-signatures`.
+   PDFs → `chiefos-quote-pdfs` (future). Logos → `chiefos-tenant-logos`
+   (future). No bucket sharing across kinds that may diverge on
+   retention, backup, or access policies.
+2. **Tenant-first path.** First segment is `{tenantId}`. Subsequent
+   segments are kind-specific scoping (e.g., `{quoteId}/{versionId}/...`
+   for quote artifacts).
+3. **Combined self-describing storage_key.** DB column stores
+   `"bucket/path"`. A bare row is interpretable without code
+   archaeology.
+
+**Why dedicated buckets over shared.** The expedient alternative was
+reusing `chiefos-media` (the demo receipts bucket) with a
+`signatures/...` path prefix — zero provisioning, zero new convention.
+Rejected because signatures are audit-grade and will diverge from
+receipts on retention policy, backup policy, and per-kind access
+controls. Carving signatures out of a shared bucket later is more
+painful than provisioning a dedicated bucket now. The one-time cost
+of one Supabase dashboard click beats the long-term cost of mixed
+semantic boundaries.
+
+**Why tenant-first path over per-tenant bucket.** Per-tenant buckets
+(`chiefos-signatures-{tenantId}`) are the "strongest isolation"
+answer on paper, but service-role writes bypass bucket-level RLS —
+the operational benefit is marginal. Meanwhile per-tenant buckets
+impose per-tenant provisioning on onboarding, dashboard-list bloat,
+and divergence from every other bucket in the repo. Runtime
+isolation is identical under both postures; path-based matches
+existing convention.
+
+**Why combined self-describing storage_key over path-only + code-
+constant.** Migration 4's `signature_png_storage_key text NOT NULL`
+is a single column. Two encodings are plausible: (i) store full
+`"bucket/path"` (self-describing); (ii) store only `"path"` with
+the bucket name hidden in a code constant. Self-describing wins for
+audit-grade artifacts because an operator opening a row in 18
+months should not need to grep for `SIGNATURE_BUCKET` to locate the
+bytes. The column IS the authoritative address; let it be that.
+
+**Path template for signatures.** Exact shape:
+`chiefos-signatures/{tenantId}/{quoteId}/{versionId}/{signatureId}.png`.
+Fixed length 170 characters (19 + 4×36 UUIDs + 3 separators + 4).
+
+**Why `signatureId` segment even though UNIQUE (quote_version_id)
+enforces 1:1.** Migration 4's `chiefos_qs_version_unique` constraint
+enforces one signature per version today. Keeping `signatureId` in
+the path is forward-compatible with future schema evolution (co-
+signers, joint signatures) without file migration. It also provides
+a row-to-file cross-check invariant — the `signatureId` extractable
+from `storage_key` must match the row's `id`. Tightens the
+integrity chain at zero cost.
+
+### §25.2 Access posture — four rules
+
+Write path, portal-read path, public-read path, privacy invariant —
+each with a rule and an operational consequence.
+
+1. **Write posture.** Audit-kind buckets are written ONLY by CIL
+   handlers via service-role client (`services/supabaseAdmin.js`).
+   Client-side SDK uploads are forbidden; bucket policies must not
+   grant INSERT to authenticated/anon roles. The CIL is the server-
+   side ingress boundary; at the moment of write, `auth.uid()` is
+   unavailable (the customer is a share-token bearer, not a Supabase
+   auth user) and no client credential should exist to upload
+   directly.
+2. **Read posture.** Audit-kind buckets are read ONLY via ChiefOS-
+   proxied routes with streaming as default (buffering is an
+   exception requiring justification such as server-side content
+   validation or header derivation). Client-side SDK reads are
+   forbidden; signed URLs are minted server-side with **TTL = 60s**
+   and consumed server-side, never returned to clients.
+3. **Bucket privacy invariant.** Audit-kind buckets are always
+   private. `getPublicUrl` calls against audit-kind buckets are
+   forbidden (enforceable by grep-gate or lint rule in a follow-up
+   hygiene session).
+4. **Scope qualifier.** Rules 1–3 apply to audit-kind buckets
+   (`chiefos-signatures`, future `chiefos-quote-pdfs`, future
+   `chiefos-tenant-logos`). Non-audit-kind buckets retain existing
+   posture.
+
+**Why unified proxied-streaming over hybrid (signed-URL for portal,
+proxied for public).** The tempting hybrid returns signed URLs to
+authenticated portal clients (CDN-speed, zero server bytes) while
+proxying for the unauthenticated public path (audit-safe, bucket-
+policy-drift-resilient). Rejected because:
+- Two code paths = two failure modes; a future developer touching
+  one may not know about the other.
+- Signature-access audit gap on the portal side makes dispute
+  forensics asymmetric ("we know every customer access, but not
+  every contractor access").
+- Byte cost is trivial for signatures (~50KB); the hybrid optimizes
+  a non-constraint.
+
+**Why 60s TTL for server-internal signed URLs.** TTL is minimum
+viable for upstream fetch. Longer TTL is excess attack surface if
+URLs ever accidentally log. Prevents drift toward "7-day signed URL
+is normal" patterns imported from other codebases. Signed URLs in
+the audit-kind read path are internal implementation detail, not a
+user-facing artifact.
+
+**Defense-in-depth against bucket-policy drift.** If the bucket is
+ever accidentally flipped to public via Supabase dashboard, proxied
+reads still gate access through ChiefOS routing and authz checks.
+Under returned-signed-URL posture, bucket-policy-drift to public is
+catastrophic — the signed URL is no longer required for access.
+
+**Storage-backend-hidden is genuine operational flexibility.**
+Proxied reads mean the client never sees a `supabase.co` origin. If
+Supabase's pricing, RLS semantics, or regional availability ever
+force migration to S3/R2/self-hosted, the call sites do not change —
+only the helper module changes. This optionality is worth more than
+the marginal CDN-speed loss.
+
+**PDF access posture is NOT pre-decided by §25.2.** When PDF render
+ships (post-Phase-2), its access posture is an open question —
+proxied streaming may continue to apply, or CDN fronting / longer-
+TTL signed URLs may be warranted for multi-MB artifacts. Signature
+posture is not authority over PDF posture. Prevents future sessions
+from misquoting §25 as "all ChiefOS attachments must be proxied."
+
+### §25.3 storage_key format enforcement
+
+Four rules governing how the `storage_key` string is constructed,
+parsed, stored, and validated:
+
+1. **Format regex is single source of truth.** One regex in code
+   (`SIGNATURE_STORAGE_KEY_RE`), mirrored byte-identically in a DB
+   CHECK constraint. Cross-reference comments in both directions:
+   migration SQL references the helper module; helper module
+   references the migration. Drift is a §25 violation.
+2. **Construction via helper, never inline.** `buildSignatureStorageKey`
+   is the ONLY code path that produces a storage_key string. It
+   validates inputs (UUID format), constructs the string, runs two
+   orthogonal checks (length = 170; regex match), and throws
+   `CilIntegrityError('STORAGE_KEY_MALFORMED')` on any failure.
+3. **Parsing via helper, never inline.** `parseSignatureStorageKey`
+   is the ONLY code path that decomposes a storage_key. It
+   validates the format regex, splits on `/`, asserts the bucket
+   segment equals `SIGNATURE_BUCKET`, strips `.png` from the
+   signatureId, and returns the decomposed object. Two orthogonal
+   checks (regex + bucket-constant) fire on every parse.
+4. **Bucket constant is module-local.** Each audit-kind bucket's
+   name is a module-level constant in its kind-specific helper
+   module. No shared `buckets.js` grab-bag. Rationale: bucket
+   choice is coupled to kind-specific access/upload/retention
+   logic; centralizing constants invites refactors that don't
+   account for kind-specific implications.
+
+**Strict-immutable write-path sequencing.** For strict-immutable
+audit-kind rows (signature rows today; future invoice signatures,
+change-order signatures), the app layer pre-generates the row's
+primary key via `crypto.randomUUID()` before dependent artifact
+creation (PNG upload, hash computation). The single INSERT writes
+all NOT-NULL columns at once. §17.14's NULL-then-UPDATE pattern is
+illegal against strict-immutability triggers; pre-generated PK is
+the required alternative. For signatures specifically: `signatureId`
+is generated in `handleSignQuote` → used to construct `storage_key`
+→ used to upload PNG → used as the row's `id` in the single INSERT.
+
+**DB CHECK constraint matches app regex.** Migration 4 shipped with
+a nonempty check (`char_length > 0`) but no format check. A micro-
+migration in Phase 2B adds `chiefos_qs_png_storage_key_format CHECK`
+mirroring the app regex byte-for-byte. Fail-closed at the DB
+boundary; any bypass of the helper (direct SQL, future code path,
+migration error) blocks at INSERT time, not at some future read.
+Mirrors the §11a constitutional posture for audit-grade invariants.
+Optional Phase 2B tightening: a test that reads the migration SQL,
+extracts the regex, and asserts byte-identity with
+`SIGNATURE_STORAGE_KEY_RE.source` — automated drift detection.
+Decide at implementation time.
+
+### §25.4 Four-invariant audit-kind upload checklist
+
+Every audit-kind artifact upload satisfies four invariants:
+
+1. **Structural validation** — kind-specific strictness (magic
+   bytes, header+trailer, or full decode) matched to threat model.
+   Signatures use magic bytes (first 8) + IEND trailer (last 12) as
+   the minimum credible defense. Full decode via `sharp`/`pngjs`
+   is deferred until a threat emerges (e.g., a PDF renderer that
+   might crash on malformed PNG).
+2. **Size bounds** — kind-specific min/max enforced both at
+   transport-encoded form (base64-length precheck) and at decoded
+   form (post-decode byte length). Signatures: 100 B minimum, 2 MB
+   maximum decoded; ~2.75 MB base64 precheck.
+3. **Content integrity** — SHA-256 computed on the exact decoded
+   bytes persisted to the bucket, once at write time. Not on the
+   base64 string (transport encoding, not canonical). Not
+   recomputed on re-fetch (that is a separate verification
+   operation).
+4. **Immutability** — `upsert: false` in the Supabase upload call,
+   plus pre-generated primary keys per §25.3's strict-immutable
+   write-path rule. Second upload to same key is rejected by
+   Supabase; second INSERT with same id is rejected by PG — both
+   catch silent overwrite of audit evidence.
+
+**Pipeline ordering is load-bearing.** Extract base64 → normalize
+whitespace → precheck base64 length → decode → size bounds on
+decoded → magic bytes → IEND trailer → pre-generate signatureId →
+construct storage_key via helper → compute SHA-256 → upload with
+`upsert:false` → INSERT signature row with all fields populated →
+orphan cleanup in catch block if INSERT fails. Each step gates the
+next; no step can be skipped without breaking an invariant.
+
+**Why magic-bytes + trailer and not full chunk parse.** V3 (full
+chunk parse via IHDR → IDAT → IEND traversal with CRC checks) and
+V4 (image-library decode) were considered. V2 (magic + trailer) was
+selected as threat-model-matched: customer-drawn canvas
+`toDataURL()` is the input; the crafted-payload risk is narrow
+(triggering a bug in a future PDF consumer). V3 adds 200 lines of
+custom code; V4 adds a native binary dependency — both
+disproportionate to threat surface. Revisit when PDF render ships
+and a crafted PNG could hit `sharp`/puppeteer.
+
+**Why `upsert: false` is non-negotiable.** Signature ID is
+generated fresh per call; duplicate-key collision should never
+happen. If it does, it is a bug — not a retry case. Silent
+overwrite would leave the signature row's SHA-256 no longer
+matching the bucket bytes, which is integrity catastrophe.
+`upsert: false` makes silent overwrite impossible.
+
+**Base64 normalization detail.** Extracted base64 is whitespace-
+stripped before both length precheck and decode, so MIME-style
+line-wrapped input is handled correctly. Data URL regex enforces
+the base64 alphabet (`A-Za-z0-9+/=` plus whitespace for wrapping)
+so non-base64 payloads fail earlier with a clear error rather than
+later with a confusing magic-bytes mismatch.
+
+### §25.5 Retrieval helper contract
+
+Audit-kind retrieval helpers are kind-specific and live in the same
+module as their kind's upload helper. Each retrieval helper accepts
+an authorization context (portal: `tenantId` + `ownerId`; public:
+bearer token), performs DB-level authz with dual-boundary where
+applicable, parses the stored storage_key via the kind's parser,
+mints a server-internal signed URL with 60s TTL, fetches upstream,
+and returns a Node `Readable` stream plus metadata (sha256,
+signedAt, plus public-path bearer context for audit emission). Route
+handlers are thin: call helper, set headers, pipe stream, map
+`err.status` to HTTP. **Retrieval helpers NEVER return signed URLs
+or bucket paths to callers — only decoded bytes via stream.**
+Enforcement: grep-gate or lint rule in a follow-up hygiene session.
+
+**Dependency-injection posture.** `pg` and `supabaseAdmin` are
+passed to retrieval helpers as params, not required at module top.
+Enables test-time DI without module-patching; keeps module load
+side-effect-free. Matches handler convention (`handleCreateQuote`,
+`handleSendQuote` take `pg` via ctx).
+
+**Two-query split for public read.** Collapsing token-resolve and
+linkage-verify into a single JOIN query would make "token not
+found," "token expired," and "token valid-but-wrong-linkage"
+indistinguishable (all "no row returned"). The two-query split
+preserves error-code semantics: token-not-found → 404; token-valid-
+but-expired → 410; token-valid-but-revoked → 410; token-valid-but-
+not-linked → **404** (collapsed to not-found per §17.17 addendum 3
+— minimum necessary information disclosure on unauthenticated
+paths).
+
+**Enumeration tightening rationale.** The 128-bit entropy on share-
+tokens + UUIDs makes enumeration infeasible in practice, but the
+right frame is minimum necessary information disclosure. A bearer
+with correct token + correct signatureId sees 200; any failure case
+does not need to distinguish "wrong token" from "wrong linkage"
+because neither produces actionable bearer-side behavior.
+`SHARE_TOKEN_EXPIRED` and `SHARE_TOKEN_REVOKED` remain as 410
+because "your link is stale; request a new one" is legitimately
+actionable.
+
+**Flow ordering: expired/revoked take precedence over mismatch.**
+Query 1 resolves the token before Query 2 checks linkage. Without
+this ordering, a bearer with an expired token who guesses a wrong
+signatureId would get 404 instead of the more actionable 410.
+Query order ensures expired/revoked always wins if the token
+resolves at all.
+
+**Content-Length nullability.** Phase 2 accepts
+`contentLength: null` in the return shape (PNG signatures served
+inline via `<img>` tags; upstream may not provide Content-Length
+header). When the retrieval pattern extends to downloaded artifacts
+(PDFs), consider fallback: HEAD the signed URL first to populate
+Content-Length, or buffer upstream before response. Deferred
+decision; not a Phase 2 concern.
+
+**SHA-256 in response headers.** Portal path: include
+`X-Signature-Sha256` (trusted context; hash has audit utility for
+contractor-side verification). Public path: omit (bearer gains no
+actionable value from the hash; RFC 6648 deprecates `X-` custom
+headers regardless). If retained on both, the header name should
+shift to `Content-Sha256` or move to response body.
+
+### §25.6 Retention and orphan handling
+
+**Retention posture: indefinite.** Audit-kind rows and their bucket
+objects are retained indefinitely under normal CIL operations. The
+lifecycle is monotonically append-once: no CIL operation deletes,
+updates, or soft-deletes a row once inserted. Operations on the
+parent entity (void, reissue) do not affect the audit-kind
+artifact.
+
+**Why indefinite over fixed-period.** Canadian construction and tax
+context: CRA records retention is 6 years from filing (Income Tax
+Act §230); Ontario contract disputes have a 2-year limitation
+often extended by discovery rule; construction lien and insurance
+disputes can surface years after job close. Fixed-period retention
+(e.g., 7-year TTL) introduces a deletion cron for marginal cost
+savings; signature PNGs are ~50KB each, so indefinite retention is
+operationally cheap.
+
+**Why no delete-on-VoidQuote.** Voiding a quote is "this is
+invalid going forward," not "this never happened." The historical
+fact that a customer signed is itself audit-relevant — the
+signature explains why the version was locked even if the quote is
+later voided. Deletion would erase evidence.
+
+**Why no soft-delete column.** Migration 4's strict-immutability
+trigger forbids UPDATE; adding a `signature_voided_at` column would
+require either dropping the trigger (unacceptable) or a separate
+"erased" marker table (overengineered for a case we don't have
+yet).
+
+**Orphan handling — two directions:**
+
+*Direction A — object-without-row (upload succeeded, INSERT
+failed).* Handler performs best-effort `storage.remove()` in the
+INSERT catch block (Q4 Pattern A). Re-throws the original INSERT
+error; logs cleanup failure but does not mask the real error.
+
+Future hygiene (documented, not built): scheduled reaper job — list
+bucket, outer-join against `signature_png_storage_key`, delete
+unreferenced objects older than 24 hours.
+
+**Reaper threshold rationale.** Unreferenced bucket objects older
+than 24 hours are eligible for deletion. Normal race window
+(upload-to-INSERT-commit gap) is milliseconds to seconds; 24-hour
+buffer handles pathological cases — slow networks, process eviction
+mid-execution, hung transactions, future retry-backoff patterns.
+Threshold can be tightened after observational data from probe-
+job's first production runs.
+
+*Direction B — row-without-object (data loss, not an orphan).*
+Unreachable via CIL under Migration 4's NOT NULL + strict-
+immutability constraints. If it exists, it arose from manual
+dashboard deletion, bucket wipe, or Supabase project migration.
+Runtime behavior: retrieval helpers throw `STORAGE_FETCH_FAILED
+(502)`. The row's SHA-256 remains as forensic residue. Future
+hygiene: scheduled probe — iterate signatures, `HEAD` each
+`storage_key`, emit `integrity.storage_missing` event for each miss.
+
+**`integrity.storage_missing` event schema (pre-declared).**
+
+```
+integrity.storage_missing payload:
+  signature_id:   UUID
+  storage_key:    full bucket/path
+  sha256_at_row:  hex (historical residue, still truthful)
+  detected_at:    timestamptz
+  probe_run_id:   UUID (for correlation across probe-job execution)
+```
+
+Parallels Phase 1's frozen-field-list discipline — integrity events
+are forensic artifacts, not feature implementation details. Pre-
+declaring the schema prevents schema invention under pressure when
+the probe ships.
+
+**Privacy-erasure path (manual, documented).** The only supported
+deletion of an audit-kind artifact is a manual operator action in
+response to an explicit privacy-erasure request (PIPEDA, GDPR, or
+equivalent). Every such action emits `integrity.admin_corrected`
+with the reason in the event payload. No self-service deletion UX
+is permitted.
+
+**Privacy-erasure runbook (flagged as Phase 2+ prerequisite).** To
+be written before first erasure request. Must include exact SQL
+sequence: trigger drop → DELETE signature row → `storage.remove()`
+object → `integrity.admin_corrected` event with
+reason/operator_id/legal_basis → trigger re-add → verification via
+rejected UPDATE attempt. Out of Phase 2 scope; flagged in execution
+plan as prerequisite for any privacy-erasure SLA commitment. The
+runbook is not to be improvised under pressure.
+
+### §25.7 Module shape and bucket provisioning
+
+**Filename: `src/cil/quoteSignatureStorage.js`.** Follows `src/cil/`
+flat + kind-first convention (`quotes.js`, `quoteHash.js`,
+`router.js`, `utils.js`). `quote` prefix signals membership in the
+quotes spine; future non-quote signature kinds become
+`invoiceSignatureStorage.js`, `changeOrderSignatureStorage.js` — no
+nested directory churn.
+
+**Public API surface (top-level named exports):**
+- Constants: `SIGNATURE_BUCKET`, `SIGNATURE_STORAGE_KEY_RE`,
+  `PNG_MIN_BYTES`, `PNG_MAX_BYTES`, `PNG_MAX_BASE64_LENGTH`,
+  `SIG_ERR`
+- Format helpers (pure): `buildSignatureStorageKey`,
+  `parseSignatureStorageKey`
+- Write path: `uploadSignaturePng`, `cleanupOrphanPng`
+- Read path: `getSignatureForOwner`, `getSignatureViaShareToken`
+
+**`_internals` (test-only):** `PNG_MAGIC`, `PNG_IEND_TRAILER`,
+`DATA_URL_PNG_RE`, `extractAndNormalizeBase64`, `validatePngBuffer`,
+`computePngSha256`, `classifySupabaseUploadError`. Mirrors Phase 1's
+`quoteHash.js` pattern; `_internals` surface is frozen across the
+module's lifetime (changes break tests, forcing explicit review).
+
+**Test file: `src/cil/quoteSignatureStorage.test.js`.** Co-located
+with source per `quoteHash.test.js` precedent.
+
+**Cross-module dependencies.** `CilIntegrityError` from
+`src/cil/utils.js` and Node built-ins (`crypto`, `stream`) required
+at module top. `pg` and `supabaseAdmin` passed as params (DI
+posture for test-time isolation). No module-load-time side effects;
+all I/O deferred to function-call time.
+
+**Cross-version regression lock.** The test suite pins a known
+`(tenantId, quoteId, versionId, signatureId)` tuple to a known
+storage_key string, asserting both forward construction (`build`)
+and parser round-trip (`parse`). Failure message: "Storage key
+format changed; this is a §25 convention bump and requires
+migration for existing signatures." Mirrors Phase 1's pinned hex
+hash; protects against silent format drift.
+
+**Bucket provisioning contract** (manual Supabase dashboard step,
+prerequisite for Phase 2C ceremony). Audit-kind bucket provisioning
+settings:
+- Bucket name: `chiefos-signatures`
+- Public: **OFF**
+- File size limit: 2 MB (matches `PNG_MAX_BYTES`)
+- Allowed MIME types: `image/png` **only**
+- No RLS policies (service-role bypass is the only intended access)
+
+Bucket-level size and MIME restrictions are defense-in-depth: if
+handler validation has a bug, bucket enforcement catches it. Both
+one-click in Supabase dashboard. For future audit-kind buckets
+(`chiefos-quote-pdfs`, `chiefos-tenant-logos`), same settings
+pattern with kind-specific size/MIME values.
+
+### §25 summary — what Phase 2B implements
+
+1. `src/cil/quoteSignatureStorage.js` — all exports per §25.7.
+2. `src/cil/quoteSignatureStorage.test.js` — comprehensive suite
+   including cross-version regression lock.
+3. Micro-migration `migrations/2026_04_XX_chiefos_signatures_storage_key_format.sql`
+   — §25.3 DB CHECK with cross-reference comments.
+4. Local `.env` confirmation: `SUPABASE_URL` (or
+   `NEXT_PUBLIC_SUPABASE_URL`) + `SUPABASE_SERVICE_ROLE_KEY`.
+   `services/supabaseAdmin.js` already resolves both URL aliases.
+5. Bucket provisioning per §25.7 (manual Supabase dashboard step
+   before Phase 2C ceremony).
+6. `CHIEFOS_EXECUTION_PLAN.md` Phase 2A-complete tick.
+
+Phase 2C (ceremony):
+- Synthetic 100×100 PNG fixture (not `mission-logo.png` — that is
+  deferred to Extension 5 with tenant-profile + portal UI
+  dependencies).
+- Real upload to production `chiefos-signatures` bucket.
+- Real retrieve via both helpers (portal + share-token simulated).
+- Byte-identity verification (upload SHA == download SHA).
+
+**§25 committed 2026-04-19.** Phase 2A closed. Phase 2B opens.
+
 ## Next entries (to be added as decisions land)
 - §24. Template table schema (when tenant template editor is designed)
-- §25. Cross-quote pointer enforcement (the 4-column composite FK, if needed)
+- §26. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

@@ -38,6 +38,15 @@
 // IMPORTS
 // ═══════════════════════════════════════════════════════════════════════════
 
+const crypto = require('crypto');
+
+// bs58 v6+ is ESM-first; under CommonJS, `require('bs58')` returns the
+// namespace object, so .default exposes the actual encode/decode API.
+// Future readers (including future Claude Code sessions) will thank us
+// when they hit undefined on their first bs58.encode(...) attempt and
+// can't figure out why.
+const bs58 = require('bs58').default;
+
 const { z } = require('zod');
 const { BaseCILZ, UUIDZ, CurrencyZ, PhoneE164Z } = require('./schema');
 const {
@@ -975,6 +984,57 @@ function resolveRecipient({ parsedRecipientEmail, parsedRecipientName, customerS
   });
 }
 
+// ─── SendQuote Section 4: generateShareToken + insertShareToken ────────────
+//
+// §14 decision 3: 22-character base58 (Bitcoin alphabet) opaque bearer
+// token. crypto.randomBytes(16) → 128 bits → bs58.encode → 22 chars of
+// [1-9A-HJ-NP-Za-km-z]. Migration 3's chiefos_qst_token_format CHECK
+// enforces both length and alphabet at the DB layer — any token that
+// somehow doesn't meet spec is rejected.
+//
+// §14 decision 4: 30-day absolute expiry. Set by the handler (not a
+// column default) so future contractor-configurable-expiry roadmap
+// changes only touch this helper.
+
+function generateShareToken() {
+  return bs58.encode(crypto.randomBytes(16));
+}
+
+async function insertShareToken(client, {
+  tenantId, ownerId, quoteVersionId, token, recipient, sourceMsgId,
+}) {
+  // NOW() evaluations inside a single statement share the transaction
+  // start timestamp (Postgres semantics), so issued_at == created_at
+  // and absolute_expires_at is exactly 30 days from that same moment.
+  //
+  // Idempotency surface: chiefos_qst_source_msg_unique (owner_id,
+  // source_msg_id) — partial UNIQUE WHERE source_msg_id IS NOT NULL.
+  // On SendQuote retry with same source_msg_id, this INSERT hits 23505
+  // → classifyCilError returns idempotent_retry → Section 7 catch does
+  // post-rollback lookup.
+  //
+  // recipient_channel='email' hardcoded — this session supports email
+  // only. Migration 3 accepts whatsapp/sms; future channels add
+  // branches here and a channel parameter to this helper.
+  const { rows } = await client.query(
+    `INSERT INTO public.chiefos_quote_share_tokens (
+        tenant_id, owner_id, quote_version_id, token,
+        recipient_name, recipient_channel, recipient_address,
+        issued_at, absolute_expires_at, source_msg_id, created_at
+      )
+      VALUES ($1, $2, $3, $4,
+              $5, 'email', $6,
+              NOW(), NOW() + INTERVAL '30 days', $7, NOW())
+      RETURNING id, token, issued_at, absolute_expires_at`,
+    [
+      tenantId, ownerId, quoteVersionId, token,
+      recipient.name, recipient.email,
+      sourceMsgId,
+    ]
+  );
+  return rows[0];
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1269,6 +1329,9 @@ module.exports = {
     loadDraftQuote,
     // SendQuote Section 3
     resolveRecipient,
+    // SendQuote Section 4
+    generateShareToken,
+    insertShareToken,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

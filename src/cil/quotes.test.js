@@ -1484,7 +1484,11 @@ describe('handleCreateQuote — Section 7: Zod rejection (unit, no DB)', () => {
 // SendQuote — Section 1: Zod schemas (unit, no DB)
 // ═══════════════════════════════════════════════════════════════════════════
 
-const { SendQuoteCILZ, QuoteRefInputZ, loadDraftQuote, resolveRecipient } = _internals;
+const {
+  SendQuoteCILZ, QuoteRefInputZ,
+  loadDraftQuote, resolveRecipient,
+  generateShareToken, insertShareToken,
+} = _internals;
 
 describe('SendQuote — Section 1: Zod schemas', () => {
   const baseSendCil = {
@@ -1759,5 +1763,186 @@ describe('SendQuote — Section 3: resolveRecipient', () => {
       parsedRecipientEmail: undefined,
       customerSnapshot: null,
     })).toThrow(CilIntegrityError);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SendQuote — Section 4: share-token generation + INSERT
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('SendQuote — Section 4a: generateShareToken (unit)', () => {
+  test('generateShareToken produces 22-char base58 (Bitcoin alphabet)', () => {
+    const token = generateShareToken();
+    expect(token).toHaveLength(22);
+    expect(token).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
+  });
+
+  test('generateShareToken produces unique tokens (100 calls, 0 collisions)', () => {
+    const seen = new Set();
+    for (let i = 0; i < 100; i++) {
+      seen.add(generateShareToken());
+    }
+    expect(seen.size).toBe(100);
+  });
+});
+
+describeIfDb('SendQuote — Section 4b: insertShareToken (integration)', () => {
+  let pool;
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  async function seedDraftQuote(client, pre) {
+    const {
+      insertQuoteHeader, insertQuoteVersion, setQuoteCurrentVersion,
+      composeTenantSnapshot,
+    } = _internals;
+    const header = await insertQuoteHeader(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await insertQuoteVersion(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'Seeded', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: composeTenantSnapshot(pre.tenantId),
+    });
+    await setQuoteCurrentVersion(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    return { header, version };
+  }
+
+  test('Happy path: inserts row with correct scope, recipient, and 30-day expiry', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { version } = await seedDraftQuote(client, pre);
+
+      const token = generateShareToken();
+      const result = await insertShareToken(client, {
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        quoteVersionId: version.id,
+        token,
+        recipient: { name: 'Darlene MacDonald', email: 'darlene@example.com' },
+        sourceMsgId: `test-send-s4-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      });
+
+      expect(result.id).toBeDefined();
+      expect(result.token).toBe(token);
+      expect(result.issued_at).toBeDefined();
+      expect(result.absolute_expires_at).toBeDefined();
+
+      // 30-day expiry: exact math within the transaction since NOW() is pinned.
+      const issuedAtMs = new Date(result.issued_at).getTime();
+      const expiresAtMs = new Date(result.absolute_expires_at).getTime();
+      const diffDays = (expiresAtMs - issuedAtMs) / (1000 * 60 * 60 * 24);
+      expect(diffDays).toBe(30);
+
+      // Full row verification.
+      const row = await client.query(
+        `SELECT tenant_id, owner_id, quote_version_id, token,
+                recipient_name, recipient_channel, recipient_address,
+                revoked_at, superseded_at
+           FROM public.chiefos_quote_share_tokens WHERE id = $1`,
+        [result.id]
+      );
+      expect(row.rows[0]).toMatchObject({
+        tenant_id: pre.tenantId,
+        owner_id: pre.ownerId,
+        quote_version_id: version.id,
+        token,
+        recipient_name: 'Darlene MacDonald',
+        recipient_channel: 'email',
+        recipient_address: 'darlene@example.com',
+        revoked_at: null,
+        superseded_at: null,
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('DB CHECK enforces token format: malformed token is rejected', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { version } = await seedDraftQuote(client, pre);
+
+      // Bad token: length OK (22) but contains forbidden '0'.
+      const badToken = '0000000000000000000000';
+
+      await expect(
+        insertShareToken(client, {
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+          quoteVersionId: version.id,
+          token: badToken,
+          recipient: { name: 'Test', email: 'test@example.com' },
+          sourceMsgId: `test-send-s4-bad-${Date.now()}`,
+        })
+      ).rejects.toMatchObject({
+        code: '23514',               // check_violation
+        constraint: 'chiefos_qst_token_format',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('source_msg_id idempotency surface: second insert with same (owner, msg) → 23505', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { version } = await seedDraftQuote(client, pre);
+
+      const sourceMsgId = `test-send-s4-dup-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+      // First insert succeeds.
+      await insertShareToken(client, {
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        quoteVersionId: version.id,
+        token: generateShareToken(),
+        recipient: { name: 'First', email: 'first@example.com' },
+        sourceMsgId,
+      });
+
+      // Second insert with same (owner_id, source_msg_id) → 23505 on partial UNIQUE.
+      await client.query('SAVEPOINT sp_dup');
+      let caught = null;
+      try {
+        await insertShareToken(client, {
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+          quoteVersionId: version.id,
+          token: generateShareToken(),
+          recipient: { name: 'Second', email: 'second@example.com' },
+          sourceMsgId,   // same key
+        });
+      } catch (err) {
+        caught = err;
+      }
+      await client.query('ROLLBACK TO SAVEPOINT sp_dup');
+
+      expect(caught).not.toBeNull();
+      expect(caught.code).toBe('23505');
+      expect(caught.constraint).toBe('chiefos_qst_source_msg_unique');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
   });
 });

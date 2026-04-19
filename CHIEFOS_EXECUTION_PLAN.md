@@ -206,6 +206,23 @@ so the context survives memory reset.
   probably bundled with a future schema-hygiene migration, not urgent.
   Flagged 2026-04-18 during C2 decision session (§17.14).
 
+- **SendQuote polish: branded From header.** Current
+  `buildSendQuoteEmail` passes the raw address; Gmail displays
+  `hello@usechiefos.com` instead of `"Mission Exteriors" <hello@usechiefos.com>`.
+  Fix: compose `from` in the handler as `"${tenant_snapshot.brand_name}"
+  <${POSTMARK_FROM_EMAIL}>` and pass through to `sendEmail({ from, ... })`
+  (the helper already accepts `from`). ~5 lines of handler code + 1 test
+  tweak. Low-cost polish; bundle with SignQuote session or a dedicated
+  small commit. Flagged 2026-04-19 from SendQuote ceremony feedback.
+
+- **Postmark link-tracking note (informational, not a ticket).** Ceremony
+  email had share URLs wrapped by Postmark's click tracker
+  (`track.pstmrk.it/...`) — Postmark's default. Wrapped URLs still 302
+  to the actual `/q/:token` destination; bonus is click analytics per
+  recipient. Configurable at Postmark dashboard → Settings → Outbound →
+  Tracking. No code change required; documented here so future sessions
+  inspecting delivered-email URLs aren't surprised by the wrapper.
+
 - **C7 completed 2026-04-19 — `public.audit` consumer grep.** Live-tree
   hits: `services/audit.js:15` (`SELECT id FROM public.audit` inside
   `ensureNotDuplicate`) and `services/audit.js:31` (`INSERT INTO

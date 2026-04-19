@@ -16,7 +16,7 @@
 // Load .env for local runs; no-op if dotenv or .env is absent.
 try { require('dotenv').config(); } catch (_) { /* dotenv optional at runtime */ }
 
-const { _internals } = require('./quotes');
+const { handleCreateQuote, _internals } = require('./quotes');
 const { CilIntegrityError } = require('./utils');
 
 const {
@@ -35,7 +35,14 @@ const {
   emitLifecycleVersionCreated,
 } = _internals;
 
-const { setupQuotePreconditions, MISSION_TENANT_UUID } = require('./quotes.test.helpers');
+const {
+  setupQuotePreconditions,
+  seedThrowawayUser,
+  seedThrowawayCustomer,
+  seedThrowawayJob,
+  MISSION_TENANT_UUID,
+  FOREST_CITY_TENANT_UUID,
+} = require('./quotes.test.helpers');
 
 const hasDb = Boolean(
   process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.SUPABASE_DB_URL
@@ -1135,30 +1142,340 @@ describeIfDb('handleCreateQuote — Section 6: event emission (integration)', ()
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Remaining scenarios from session brief — todos until their sections land.
+// Section 7: end-to-end handleCreateQuote (integration + unit)
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// Tests 1-2 (happy path + idempotent retry) run against the Forest City
+// dedicated test tenant — Migration 2's event immutability trigger blocks
+// DELETE on chiefos_quote_events, so event rows accumulate permanently.
+// Using Forest City keeps Mission clean. Cleanup: void the quote header
+// + delete line items + delete counter row. Events + versions persist.
+//
+// Tests 3-5 (plan/actor rejection) use BEGIN/ROLLBACK where they can; the
+// plan resolution reads public.users which we seed + teardown explicitly
+// because the handler's own connection is outside any test-level txn.
+//
+// Tests 6-8 (Zod rejection) are pure unit — Zod rejects before any DB call.
 
-describe('handleCreateQuote — remaining coverage (todos)', () => {
+/**
+ * cleanupCreatedQuote — best-effort teardown for tests that run
+ * handleCreateQuote end-to-end. Deletes what can be deleted; voids what
+ * can't.
+ *
+ * Cannot delete: chiefos_quote_events (immutability trigger blocks DELETE).
+ * Cannot delete header: chiefos_qe_quote_identity_fk ON DELETE RESTRICT.
+ * So header gets status='voided'; events stay as-is.
+ */
+async function cleanupCreatedQuote(ownerId, quoteId, sourceMsgId, monthKey) {
+  const pg = require('../../services/postgres');
+  await pg.query(
+    `DELETE FROM public.chiefos_quote_line_items
+      WHERE quote_version_id IN
+            (SELECT id FROM public.chiefos_quote_versions WHERE quote_id = $1)`,
+    [quoteId]
+  );
+  await pg.query(
+    `UPDATE public.chiefos_quotes SET current_version_id = NULL WHERE id = $1`,
+    [quoteId]
+  );
+  await pg.query(
+    `UPDATE public.chiefos_quotes
+        SET status = 'voided', voided_at = NOW(),
+            voided_reason = 'test-cleanup', updated_at = NOW()
+      WHERE id = $1`,
+    [quoteId]
+  );
+  if (sourceMsgId && monthKey) {
+    await pg.query(
+      `DELETE FROM public.usage_monthly_v2
+        WHERE owner_id = $1 AND month_key = $2 AND kind = 'quote_created'`,
+      [ownerId, monthKey]
+    );
+  }
+}
 
-  // Section 5 (pointer UPDATE) + Section 6 (events) + Section 7 (happy path)
-  it.todo('Happy path: header + v1 + line items + 2 events emitted; return shape matches §17.15');
-  // Transaction rollback is covered by Section 4's fifth test (line-items
-  // INSERT failure → no orphan rows). Additional rollback scenarios covered
-  // by Section 5/6/7 tests will land with those sections.
+/** Build a minimal valid CreateQuote CIL payload for testing. */
+function buildValidCreateQuoteCil({
+  tenantId, sourceMsgId, actorId, occurredAt,
+}) {
+  return {
+    cil_version: '1.0',
+    type: 'CreateQuote',
+    tenant_id: tenantId,
+    source: 'whatsapp',
+    source_msg_id: sourceMsgId,
+    actor: { actor_id: actorId, role: 'owner' },
+    occurred_at: occurredAt,
+    job: {
+      job_name: `Test Job ${Math.random().toString(36).slice(2, 8)}`,
+      create_if_missing: true,
+    },
+    needs_job_resolution: false,
+    customer: {
+      name: 'ChiefOS Integration Test',
+      email: 'test@chiefos.test',
+      phone_e164: '+15195550100',
+      address: '1 Test Way, London, ON',
+    },
+    project: { title: 'Integration Test Project', scope: 'Section 7 test scope.' },
+    currency: 'CAD',
+    tax_rate_bps: 1300,
+    tax_code: 'HST-ON',
+    line_items: [
+      { sort_order: 0, description: 'Test labor', category: 'labour', qty: 2, unit_price_cents: 5000 },
+      { sort_order: 1, description: 'Test materials', category: 'materials', qty: 1, unit_price_cents: 25000 },
+    ],
+    deposit_cents: 0,
+    payment_terms: {},
+    warranty_snapshot: {},
+    clauses_snapshot: {},
+  };
+}
 
-  // Section 6 (events)
-  // Events are covered inline in the happy path assertion — no standalone todo.
+describeIfDb('handleCreateQuote — Section 7: end-to-end integration (Forest City)', () => {
+  test('Happy path: creates quote + v1 + line items + 2 events; returns §17.15 shape; counter incremented', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const sourceMsgId = `test-s7-happy-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
 
-  // Section 7 (catch branches + counter + return)
-  it.todo('Idempotent retry: same source_msg_id returns prior quote with meta.already_existed:true; counter not double-incremented');
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
 
-  // Plan gating + actor gating (already wired in handler but tested end-to-end)
-  it.todo('Plan gating rejection (Free tier): QUOTES_REQUIRES_STARTER envelope, no DB writes, no counter burn');
-  it.todo('Plan gating rejection (capacity reached): QUOTES_CAPACITY_REACHED envelope, no DB writes');
-  it.todo('Actor role rejection (employee): PERMISSION_DENIED envelope, no DB writes');
+    let quoteId;
+    try {
+      const cil = buildValidCreateQuoteCil({
+        tenantId: FOREST_CITY_TENANT_UUID,
+        sourceMsgId, actorId: ownerId,
+        occurredAt: new Date().toISOString(),
+      });
+      const result = await handleCreateQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s7-happy',
+      });
 
-  // Zod rejection cases
-  it.todo('Zod rejection: missing tax_rate_bps → CIL_SCHEMA_INVALID envelope');
-  it.todo('Zod rejection: empty line_items → schema rejection per §20 Q3');
-  it.todo('Zod rejection: customer missing both customer_id and inline fields → schema rejection per §20 Q1 refine');
+      expect(result.ok).toBe(true);
+      expect(result.quote).toBeDefined();
+      quoteId = result.quote.id;
+
+      expect(result.quote).toMatchObject({
+        version_no: 1, status: 'draft', currency: 'CAD', issued_at: null,
+      });
+      expect(result.quote.human_id).toMatch(/^QT-\d{4}-\d{2}-\d{2}-\d{4}$/);
+      // Line 1: qty=2 × unit=5000 = 10000; tax=1300 bps → 1300. Line total=11300.
+      // Line 2: qty=1 × unit=25000 = 25000; tax=3250. Line total=28250.
+      // Subtotal=35000, Tax=4550, Total=39550.
+      expect(result.quote.total_cents).toBe(39550);
+      expect(result.quote.customer.name).toBe('ChiefOS Integration Test');
+      expect(result.quote.customer.phone_e164).toBe('+15195550100');
+
+      expect(result.meta).toEqual({
+        already_existed: false,
+        events_emitted: ['lifecycle.created', 'lifecycle.version_created'],
+        traceId: 'trace-s7-happy',
+      });
+
+      const events = await pg.query(
+        `SELECT kind FROM public.chiefos_quote_events
+          WHERE quote_id = $1 ORDER BY global_seq ASC`,
+        [quoteId]
+      );
+      expect(events.rows.map((r) => r.kind)).toEqual([
+        'lifecycle.created', 'lifecycle.version_created',
+      ]);
+
+      const usage = await pg.getMonthlyUsage({
+        ownerId, kind: 'quote_created', monthKey,
+      });
+      expect(usage).toBe(1);
+    } finally {
+      if (quoteId) {
+        await cleanupCreatedQuote(ownerId, quoteId, sourceMsgId, monthKey).catch(() => {});
+      }
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  }, 30000);
+
+  test('Idempotent retry: same source_msg_id returns meta.already_existed=true; counter not double-incremented', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const sourceMsgId = `test-s7-retry-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+
+    let quoteId;
+    try {
+      const cil = buildValidCreateQuoteCil({
+        tenantId: FOREST_CITY_TENANT_UUID,
+        sourceMsgId, actorId: ownerId,
+        occurredAt: new Date().toISOString(),
+      });
+      const ctx = { owner_id: ownerId, traceId: 'trace-s7-retry' };
+
+      const first = await handleCreateQuote(cil, ctx);
+      expect(first.ok).toBe(true);
+      expect(first.meta.already_existed).toBe(false);
+      quoteId = first.quote.id;
+
+      const retry = await handleCreateQuote(cil, ctx);
+      expect(retry.ok).toBe(true);
+      expect(retry.meta.already_existed).toBe(true);
+      expect(retry.meta.events_emitted).toEqual([]);
+      expect(retry.quote.id).toBe(first.quote.id);
+      expect(retry.quote.version_id).toBe(first.quote.version_id);
+      expect(retry.quote.human_id).toBe(first.quote.human_id);
+
+      const usage = await pg.getMonthlyUsage({
+        ownerId, kind: 'quote_created', monthKey,
+      });
+      expect(usage).toBe(1);
+    } finally {
+      if (quoteId) {
+        await cleanupCreatedQuote(ownerId, quoteId, sourceMsgId, monthKey).catch(() => {});
+      }
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  }, 30000);
+});
+
+describeIfDb('handleCreateQuote — Section 7: rejection paths (no DB writes)', () => {
+  test('Plan gating (Free tier): QUOTES_REQUIRES_STARTER envelope', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'free', 'active', NOW())`,
+      [ownerId]
+    );
+    try {
+      const cil = buildValidCreateQuoteCil({
+        tenantId: MISSION_TENANT_UUID,
+        sourceMsgId: `test-s7-free-${Date.now()}`,
+        actorId: ownerId, occurredAt: new Date().toISOString(),
+      });
+      const result = await handleCreateQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s7-free',
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTES_REQUIRES_STARTER');
+      expect(result.error.hint).toBe('Upgrade to starter');
+      expect(result.error.traceId).toBe('trace-s7-free');
+    } finally {
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  });
+
+  test('Plan gating (capacity reached): QUOTES_CAPACITY_REACHED envelope', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+    await pg.query(
+      `INSERT INTO public.usage_monthly_v2 (owner_id, month_key, kind, units)
+       VALUES ($1, $2, 'quote_created', 50)`,
+      [ownerId, monthKey]
+    );
+    try {
+      const cil = buildValidCreateQuoteCil({
+        tenantId: MISSION_TENANT_UUID,
+        sourceMsgId: `test-s7-cap-${Date.now()}`,
+        actorId: ownerId, occurredAt: new Date().toISOString(),
+      });
+      const result = await handleCreateQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s7-cap',
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTES_CAPACITY_REACHED');
+      expect(result.error.hint).toBe('Upgrade to pro');
+    } finally {
+      await pg.query(
+        `DELETE FROM public.usage_monthly_v2 WHERE owner_id = $1 AND month_key = $2 AND kind = 'quote_created'`,
+        [ownerId, monthKey]
+      ).catch(() => {});
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  });
+
+  test('Actor role rejection (employee): PERMISSION_DENIED envelope', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+    try {
+      const cil = buildValidCreateQuoteCil({
+        tenantId: MISSION_TENANT_UUID,
+        sourceMsgId: `test-s7-emp-${Date.now()}`,
+        actorId: ownerId, occurredAt: new Date().toISOString(),
+      });
+      cil.actor.role = 'employee';
+      const result = await handleCreateQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s7-emp',
+      });
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('PERMISSION_DENIED');
+      expect(result.error.message).toContain('owner');
+    } finally {
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  });
+});
+
+describe('handleCreateQuote — Section 7: Zod rejection (unit, no DB)', () => {
+  const baseCtx = { owner_id: '12345', traceId: 'trace-zod' };
+  const baseCil = {
+    cil_version: '1.0',
+    type: 'CreateQuote',
+    tenant_id: MISSION_TENANT_UUID,
+    source: 'whatsapp',
+    source_msg_id: 'test-zod-1',
+    actor: { actor_id: '12345', role: 'owner' },
+    occurred_at: '2026-04-19T12:00:00.000Z',
+    job: { job_name: 'Test', create_if_missing: true },
+    needs_job_resolution: false,
+    customer: { name: 'Test' },
+    project: { title: 'T' },
+    currency: 'CAD',
+    tax_rate_bps: 1300,
+    line_items: [{ description: 'Item', unit_price_cents: 100 }],
+  };
+
+  test('missing tax_rate_bps → CIL_SCHEMA_INVALID envelope', async () => {
+    const cil = { ...baseCil };
+    delete cil.tax_rate_bps;
+    const result = await handleCreateQuote(cil, baseCtx);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('CIL_SCHEMA_INVALID');
+    expect(result.error.message).toContain('tax_rate_bps');
+    expect(result.error.traceId).toBe('trace-zod');
+  });
+
+  test('empty line_items → CIL_SCHEMA_INVALID per §20 Q3', async () => {
+    const cil = { ...baseCil, line_items: [] };
+    const result = await handleCreateQuote(cil, baseCtx);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('CIL_SCHEMA_INVALID');
+    expect(result.error.message).toMatch(/line_items|at least one/i);
+  });
+
+  test('customer missing both customer_id and name → CIL_SCHEMA_INVALID per §20 Q1 refine', async () => {
+    const cil = { ...baseCil, customer: {} };
+    const result = await handleCreateQuote(cil, baseCtx);
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('CIL_SCHEMA_INVALID');
+    expect(result.error.message).toMatch(/customer_id|name|customer/i);
+  });
 });

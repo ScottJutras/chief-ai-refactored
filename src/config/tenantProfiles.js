@@ -41,6 +41,23 @@ const TENANT_PROFILES = Object.freeze({
     web: 'missionexteriors.ca',
     hst_registration: '759884893RT0001',
   }),
+
+  // Forest City — dedicated integration-test tenant. Exists in chiefos_tenants
+  // but has no production activity. Used by Section 7 end-to-end tests that
+  // exercise handleCreateQuote in full (tests 1 happy-path + 2 idempotent-
+  // retry) because Migration 2's event-immutability trigger blocks DELETE on
+  // chiefos_quote_events. Residue (permanent events + voided quote headers)
+  // accumulates here, not on Mission. Manual SQL cleanup on Forest City if
+  // residue ever becomes material.
+  'c1336df0-5267-4c42-955d-9bf20e7e1d28': Object.freeze({
+    legal_name: 'Forest City Test Corp',
+    brand_name: 'Forest City',
+    address: '1 Test Way, London, ON, N6A 0A0',
+    phone_e164: '+15195550000',
+    email: 'test@forestcity.test',
+    web: 'forestcity.test',
+    hst_registration: 'TEST000000RT0001',
+  }),
 });
 
 /**

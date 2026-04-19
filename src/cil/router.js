@@ -25,12 +25,10 @@
 // at runtime: don't. Add to the map literal and redeploy.
 
 // Imports for registered handlers (populated as each handler ships).
-// First handler lands with CreateQuote in a future session.
-// Example (uncomment when src/cil/quotes.js exports handleCreateQuote):
-// const { handleCreateQuote } = require('./quotes');
+const { handleCreateQuote } = require('./quotes');
 
 const NEW_IDIOM_HANDLERS = Object.freeze({
-  // CreateQuote: handleCreateQuote,
+  CreateQuote: handleCreateQuote,
   // SendQuote:   handleSendQuote,
   // SignQuote:   handleSignQuote,
   // LockQuote:   handleLockQuote,

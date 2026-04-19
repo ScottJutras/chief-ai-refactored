@@ -8,7 +8,7 @@
 //   Section 4 (header + version + line items INSERTs): IMPLEMENTED
 //   Section 5 (current_version_id UPDATE): IMPLEMENTED
 //   Section 6 (event emission): IMPLEMENTED
-//   Section 7 (classifyCilError handler branches + counter increment + return): TODO
+//   Section 7 (classifyCilError handler branches + counter increment + return): IMPLEMENTED
 //
 // See docs/QUOTES_SPINE_DECISIONS.md:
 //   §17.10 — classifyCilError + CilIntegrityError (4-kind classification)
@@ -691,6 +691,106 @@ async function emitLifecycleVersionCreated(client, {
   );
 }
 
+// ─── Section 7: idempotent-retry lookup + return-shape composer ────────────
+
+/**
+ * lookupPriorQuote — post-rollback recovery for the idempotent_retry branch.
+ *
+ * When classifyCilError returns idempotent_retry (23505 on
+ * chiefos_quotes_source_msg_unique), the transaction is already rolled
+ * back. This function runs a fresh query via pg.query (not the aborted
+ * client) to fetch the prior quote's current state.
+ *
+ * Per §17.10 clarification: returns CURRENT entity state via JOIN through
+ * current_version_id, NOT v1-specifically. Input-equivalence and version-
+ * equivalence are both explicitly not guaranteed; the retry signals
+ * "exists at source_msg_id granularity; here's current renderable state."
+ */
+async function lookupPriorQuote(ownerId, sourceMsgId) {
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  const { rows } = await pg.query(
+    `SELECT q.id          AS quote_id,
+            q.human_id,
+            q.status,
+            q.job_id,
+            q.created_at  AS header_created_at,
+            q.customer_id,
+            v.id          AS version_id,
+            v.version_no,
+            v.currency,
+            v.total_cents,
+            v.issued_at,
+            c.id    AS c_id,
+            c.name  AS c_name,
+            c.email AS c_email,
+            c.phone AS c_phone
+       FROM public.chiefos_quotes q
+       JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+       LEFT JOIN public.customers c ON c.id = q.customer_id
+      WHERE q.owner_id = $1 AND q.source_msg_id = $2
+      LIMIT 1`,
+    [ownerId, sourceMsgId]
+  );
+  if (rows.length === 0) {
+    // Shouldn't happen — the unique_violation that triggered this lookup
+    // means a prior row exists. If it doesn't, the DB is in an inconsistent
+    // state or an RLS policy is blocking the read. Throw to surface as
+    // 500-class (the handler's outer caller treats unknowns as 500).
+    throw new Error(
+      `Idempotent retry lookup missed for (${ownerId}, ${sourceMsgId})`
+    );
+  }
+  return rows[0];
+}
+
+/**
+ * buildQuoteReturnShape — composes the §17.15 family-wide success envelope
+ * from a normalized input shape. Used by both the happy-path return (from
+ * txnResult) and the idempotent-retry return (from lookupPriorQuote).
+ *
+ * meta.events_emitted describes events emitted by THIS invocation, not
+ * events present in the entity's history. On idempotent retry
+ * (alreadyExisted=true) returns [] because this call emitted no events.
+ * Callers wanting entity event history query a dedicated events endpoint.
+ */
+function buildQuoteReturnShape({
+  quoteId, versionId, humanId, versionNo, status, currency, totalCents,
+  customer, jobId, issuedAt, createdAt,
+  alreadyExisted, traceId,
+}) {
+  return {
+    ok: true,
+    quote: {
+      id: quoteId,
+      version_id: versionId,
+      human_id: humanId,
+      version_no: versionNo,
+      status,
+      currency,
+      total_cents: Number(totalCents),
+      customer: {
+        id: customer.id,
+        name: customer.name,
+        email: customer.email || null,
+        // DB column `phone` → envelope key `phone_e164` (same rename as
+        // CustomerSnapshotZ per Section 3).
+        phone_e164: customer.phone || null,
+      },
+      job_id: jobId,
+      issued_at: issuedAt,  // null until SendQuote runs
+      created_at: createdAt,
+    },
+    meta: {
+      already_existed: alreadyExisted,
+      events_emitted: alreadyExisted
+        ? []  // retry emitted no events this call; original did
+        : ['lifecycle.created', 'lifecycle.version_created'],
+      traceId,
+    },
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -882,12 +982,33 @@ async function handleCreateQuote(rawCil, ctx) {
     }
 
     if (c.kind === 'idempotent_retry') {
-      // TODO Section 7: post-rollback prior-quote lookup via
-      // (owner_id, source_msg_id). Return §17.15 shape with
-      // meta.already_existed: true.
-      throw new Error(
-        '[TODO Section 7] idempotent_retry branch not yet implemented'
-      );
+      // Post-rollback lookup via (owner_id, source_msg_id). The transaction
+      // is already rolled back by withClient's catch; lookupPriorQuote
+      // issues a fresh pg.query. Return §17.15 shape with
+      // meta.already_existed: true. NO counter increment on retry — the
+      // original call's counter consumption stands (source_msg_id-granular
+      // idempotency per §17.10 clarification 2026-04-20).
+      const prior = await lookupPriorQuote(ctx.owner_id, data.source_msg_id);
+      return buildQuoteReturnShape({
+        quoteId: prior.quote_id,
+        versionId: prior.version_id,
+        humanId: prior.human_id,
+        versionNo: prior.version_no,
+        status: prior.status,
+        currency: prior.currency,
+        totalCents: prior.total_cents,
+        customer: {
+          id: prior.c_id,
+          name: prior.c_name,
+          email: prior.c_email,
+          phone: prior.c_phone,
+        },
+        jobId: prior.job_id,
+        issuedAt: prior.issued_at,
+        createdAt: prior.header_created_at,
+        alreadyExisted: true,
+        traceId: ctx.traceId,
+      });
     }
 
     if (c.kind === 'integrity_error') {
@@ -903,29 +1024,32 @@ async function handleCreateQuote(rawCil, ctx) {
     throw err;
   }
 
-  // ─── Step 5 (§17.16 / §19): post-commit counter increment ── TODO S7 ────
+  // ─── Step 5 (§17.16 / §19): post-commit counter increment ── IMPLEMENTED
   // Happy path only. Idempotent_retry + semantic_error + integrity_error
-  // branches returned from within the catch. If we reach here, the write
-  // succeeded and we consume counter capacity.
-  // await pg.incrementMonthlyUsage({
-  //   ownerId: ctx.owner_id,
-  //   kind: 'quote_created',
-  //   amount: 1,
-  // });
+  // branches returned from within the catch above. If we reach here, the
+  // write succeeded and we consume counter capacity.
+  await pg.incrementMonthlyUsage({
+    ownerId: ctx.owner_id,
+    kind: 'quote_created',
+    amount: 1,
+  });
 
-  // ─── Step 6 (§17.15): compose return shape ─── TODO Section 7 ──────────
-  // Final shape:
-  //   { ok: true, quote: {...}, meta: { already_existed:false,
-  //     events_emitted: ['lifecycle.created','lifecycle.version_created'],
-  //     traceId } }
-  //
-  // For now: throw explicitly so no one treats a partial Section 1 handler
-  // as a working end-to-end CreateQuote. Section 1 tests invoke
-  // _internals.resolveOrCreateCustomer directly and don't hit this path.
-  throw new Error(
-    '[TODO Section 7] handleCreateQuote end-to-end return shape not yet implemented; ' +
-      'invoke _internals.resolveOrCreateCustomer directly for Section 1 testing'
-  );
+  // ─── Step 6 (§17.15): compose return shape ─── IMPLEMENTED ──────────────
+  return buildQuoteReturnShape({
+    quoteId: txnResult.quote_id,
+    versionId: txnResult.version_id,
+    humanId: txnResult.human_id,
+    versionNo: 1,
+    status: 'draft',
+    currency: data.currency,
+    totalCents: txnResult.totals.total_cents,
+    customer: txnResult.customer,
+    jobId: txnResult.job_id,
+    issuedAt: null,  // populates on SendQuote
+    createdAt: txnResult.header_created_at,
+    alreadyExisted: false,
+    traceId: ctx.traceId,
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -952,6 +1076,8 @@ module.exports = {
     setQuoteCurrentVersion,
     emitLifecycleCreated,
     emitLifecycleVersionCreated,
+    lookupPriorQuote,
+    buildQuoteReturnShape,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,
@@ -964,18 +1090,13 @@ module.exports = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ROUTER REGISTRATION — DEFERRED
+// ROUTER REGISTRATION — COMPLETE (§17.12)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Registration in src/cil/router.js lands when Section 7 compiles — all
-// branches return a valid §17.15 shape. Per §17.12's two-step explicit
-// registration:
+// handleCreateQuote is registered in src/cil/router.js's
+// NEW_IDIOM_HANDLERS frozen map. applyCIL({ type: 'CreateQuote', ... })
+// now routes to this handler instead of falling through to the legacy
+// router's CIL_TYPE_UNKNOWN response.
 //
-//   1. Uncomment in router.js:
-//        const { handleCreateQuote } = require('./quotes');
-//   2. Add to Object.freeze({...}):
-//        CreateQuote: handleCreateQuote,
-//
-// Until registration lands, applyCIL({ type: 'CreateQuote', ... }) falls
-// through to the legacy router, which returns CIL_TYPE_UNKNOWN per §17.6.
-// Intentional — prevents partial handler from serving traffic.
+// Future handlers (SendQuote, SignQuote, LockQuote, VoidQuote,
+// ReissueQuote) follow the same two-step registration pattern per §17.12.

@@ -12,17 +12,31 @@ const { randomUUID } = require('crypto');
 // in each test ensures no real data persists.
 const MISSION_TENANT_UUID = '86907c28-a9ea-4318-819d-5a012192119b';
 
+// Forest City tenant UUID. Dedicated integration-test tenant. Has an entry
+// in tenantProfiles.js but no production activity. Used for Section 7
+// end-to-end tests that leave residue (event rows can't be deleted per
+// Migration 2's immutability trigger).
+const FOREST_CITY_TENANT_UUID = 'c1336df0-5267-4c42-955d-9bf20e7e1d28';
+
 /**
  * Seed a throwaway user row in public.users for tests that will insert
  * into public.jobs (jobs.owner_id has FK → users.user_id).
  *
- * Returns the ownerId string (caller's choice or auto-generated 13-digit).
+ * @param {pg.PoolClient} client
+ * @param {string} [ownerId] - caller's choice or auto-generated 13-digit
+ * @param {Object} [opts]
+ * @param {string} [opts.planKey] - override default 'free' plan_key column
+ * @returns {Promise<string>} the ownerId string
  */
-async function seedThrowawayUser(client, ownerId) {
+async function seedThrowawayUser(client, ownerId, opts = {}) {
   const id = ownerId || `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+  const planKey = opts.planKey || 'free';
+  // sub_status='active' required for getEffectivePlanKey to honor non-free plans.
+  // For 'free' the status doesn't matter (default resolve to free anyway).
   await client.query(
-    `INSERT INTO public.users (user_id, created_at) VALUES ($1, NOW())`,
-    [id]
+    `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+     VALUES ($1, $2, 'active', NOW())`,
+    [id, planKey]
   );
   return id;
 }
@@ -112,6 +126,7 @@ async function setupQuotePreconditions(client, opts = {}) {
 
 module.exports = {
   MISSION_TENANT_UUID,
+  FOREST_CITY_TENANT_UUID,
   seedThrowawayUser,
   seedThrowawayCustomer,
   seedThrowawayJob,

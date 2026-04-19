@@ -27,9 +27,12 @@ const {
   allocateQuoteHumanId,
   composeCustomerSnapshot,
   composeTenantSnapshot,
+  insertQuoteHeader,
+  insertQuoteVersion,
+  insertQuoteLineItems,
 } = _internals;
 
-const MISSION_TENANT_UUID = '86907c28-a9ea-4318-819d-5a012192119b';
+const { setupQuotePreconditions, MISSION_TENANT_UUID } = require('./quotes.test.helpers');
 
 const hasDb = Boolean(
   process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.SUPABASE_DB_URL
@@ -580,14 +583,309 @@ describe('handleCreateQuote — Section 3c: snapshots (unit)', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Section 4: header + version + line-items INSERTs (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('handleCreateQuote — Section 4: INSERT chain (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool || null;
+    if (!pool || !pool.connect) {
+      const { Pool } = require('pg');
+      pool = new Pool({
+        connectionString:
+          process.env.DATABASE_URL ||
+          process.env.POSTGRES_URL ||
+          process.env.SUPABASE_DB_URL,
+        ssl: { rejectUnauthorized: false },
+      });
+    }
+  });
+
+  test('Header INSERT: creates chiefos_quotes row with current_version_id=NULL, status=draft', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+
+      const header = await insertQuoteHeader(client, {
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        jobId: pre.jobId,
+        customerId: pre.customer.id,
+        humanId: pre.humanId,
+        source: 'whatsapp',
+        sourceMsgId: pre.sourceMsgId,
+      });
+
+      expect(header.id).toBeDefined();
+      expect(header.created_at).toBeDefined();
+
+      const row = await client.query(
+        `SELECT tenant_id, owner_id, job_id, customer_id, human_id, status,
+                current_version_id, source, source_msg_id
+           FROM public.chiefos_quotes WHERE id = $1`,
+        [header.id]
+      );
+      expect(row.rows[0]).toMatchObject({
+        tenant_id: pre.tenantId,
+        owner_id: pre.ownerId,
+        job_id: pre.jobId,
+        customer_id: pre.customer.id,
+        human_id: pre.humanId,
+        status: 'draft',
+        current_version_id: null,           // §17.14 step 1
+        source: 'whatsapp',
+        source_msg_id: pre.sourceMsgId,
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Version INSERT: creates v1 draft with composite FK to header; totals + snapshots populated', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+
+      const header = await insertQuoteHeader(client, {
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        jobId: pre.jobId, customerId: pre.customer.id,
+        humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+      });
+
+      const data = {
+        project: { title: 'Test Project', scope: 'Test scope paragraph.' },
+        currency: 'CAD',
+        deposit_cents: 50000,
+        tax_code: 'HST-ON',
+        tax_rate_bps: 1300,
+        warranty_snapshot: { coverage: 'lifetime' },
+        clauses_snapshot: { terms: 'standard' },
+        payment_terms: { etransfer: 'scott@example.com' },
+        warranty_template_ref: null,
+        clauses_template_ref: null,
+      };
+      const totals = { subtotal_cents: 100000, tax_cents: 13000, total_cents: 113000 };
+      const customerSnapshot = { name: pre.customer.name, email: pre.customer.email };
+      const tenantSnapshot = composeTenantSnapshot(pre.tenantId);
+
+      const version = await insertQuoteVersion(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        data, totals, customerSnapshot, tenantSnapshot,
+      });
+
+      expect(version.id).toBeDefined();
+      expect(version.created_at).toBeDefined();
+
+      const row = await client.query(
+        `SELECT quote_id, tenant_id, owner_id, version_no, status,
+                project_title, project_scope, currency,
+                subtotal_cents, tax_cents, total_cents, deposit_cents,
+                tax_code, tax_rate_bps,
+                customer_snapshot, tenant_snapshot, warranty_snapshot,
+                clauses_snapshot, payment_terms,
+                locked_at, server_hash
+           FROM public.chiefos_quote_versions WHERE id = $1`,
+        [version.id]
+      );
+      const v = row.rows[0];
+      expect(v.quote_id).toBe(header.id);
+      expect(v.tenant_id).toBe(pre.tenantId);
+      expect(v.owner_id).toBe(pre.ownerId);
+      expect(v.version_no).toBe(1);
+      expect(v.status).toBe('draft');
+      expect(v.project_title).toBe('Test Project');
+      expect(v.currency).toBe('CAD');
+      expect(Number(v.subtotal_cents)).toBe(100000);
+      expect(Number(v.tax_cents)).toBe(13000);
+      expect(Number(v.total_cents)).toBe(113000);
+      expect(Number(v.tax_rate_bps)).toBe(1300);
+      expect(v.customer_snapshot).toEqual(customerSnapshot);
+      expect(v.tenant_snapshot).toEqual(tenantSnapshot);
+      expect(v.warranty_snapshot).toEqual({ coverage: 'lifetime' });
+      expect(v.clauses_snapshot).toEqual({ terms: 'standard' });
+      expect(v.payment_terms).toEqual({ etransfer: 'scott@example.com' });
+      expect(v.locked_at).toBeNull();
+      expect(v.server_hash).toBeNull();
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Line items INSERT: N rows in insertion order with per-line totals from Section 3', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+
+      const header = await insertQuoteHeader(client, {
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        jobId: pre.jobId, customerId: pre.customer.id,
+        humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+      });
+
+      const lineItems = [
+        { sort_order: 0, description: 'Labor', category: 'labour', qty: 10, unit_price_cents: 5000 },
+        { sort_order: 1, description: 'Materials', category: 'materials', qty: 1, unit_price_cents: 200000 },
+        { sort_order: 2, description: 'Other', qty: 1, unit_price_cents: 15000 },
+      ];
+      const totals = computeTotals(lineItems, 1300);
+
+      const version = await insertQuoteVersion(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        data: {
+          project: { title: 'T', scope: null },
+          currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+          warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+          warranty_template_ref: null, clauses_template_ref: null,
+        },
+        totals,
+        customerSnapshot: { name: 'T' },
+        tenantSnapshot: composeTenantSnapshot(pre.tenantId),
+      });
+
+      await insertQuoteLineItems(client, {
+        versionId: version.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        lineItems, lineTotals: totals.line_totals,
+      });
+
+      const rows = await client.query(
+        `SELECT sort_order, description, category,
+                qty::text AS qty, unit_price_cents, line_subtotal_cents, line_tax_cents
+           FROM public.chiefos_quote_line_items
+          WHERE quote_version_id = $1
+          ORDER BY sort_order ASC`,
+        [version.id]
+      );
+      expect(rows.rows).toHaveLength(3);
+      expect(rows.rows[0]).toMatchObject({
+        sort_order: 0, description: 'Labor', category: 'labour',
+        unit_price_cents: '5000', line_subtotal_cents: '50000', line_tax_cents: '6500',
+      });
+      expect(rows.rows[1]).toMatchObject({
+        sort_order: 1, description: 'Materials', category: 'materials',
+        unit_price_cents: '200000', line_subtotal_cents: '200000', line_tax_cents: '26000',
+      });
+      expect(rows.rows[2]).toMatchObject({
+        sort_order: 2, description: 'Other', category: null,
+        unit_price_cents: '15000', line_subtotal_cents: '15000', line_tax_cents: '1950',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Header INSERT on retry (duplicate source_msg_id): throws unique_violation on chiefos_quotes_source_msg_unique', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+
+      // First insert succeeds.
+      await insertQuoteHeader(client, {
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        jobId: pre.jobId, customerId: pre.customer.id,
+        humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+      });
+
+      // Second insert with same (owner_id, source_msg_id) must hit
+      // chiefos_quotes_source_msg_unique.
+      //
+      // SAVEPOINT so the second INSERT's unique_violation doesn't kill our
+      // outer transaction; the test wants to inspect the error shape after.
+      await client.query('SAVEPOINT sp_retry');
+      let caught = null;
+      try {
+        // Allocate a fresh human_id for the retry (the original is taken).
+        // Retry reuses source_msg_id — that's the idempotency signal.
+        const pg = require('../../services/postgres');
+        const seq = await pg.allocateNextDocCounter(pre.tenantId, 'quote', client);
+        const retryHumanId = `QT-2026-04-19-${String(seq).padStart(4, '0')}`;
+        await insertQuoteHeader(client, {
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+          jobId: pre.jobId, customerId: pre.customer.id,
+          humanId: retryHumanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      await client.query('ROLLBACK TO SAVEPOINT sp_retry');
+
+      expect(caught).not.toBeNull();
+      expect(caught.code).toBe('23505');
+      expect(caught.constraint).toBe('chiefos_quotes_source_msg_unique');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Transaction rollback on line-items INSERT failure: no orphan header, version, or line-items', async () => {
+    // Use withClient — the real atomicity boundary. Force failure in line
+    // items; verify from a fresh query that no rows persisted.
+    const pg = require('../../services/postgres');
+    const uniqueMarker = `test-rollback-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let threw = false;
+    try {
+      await pg.withClient(async (client) => {
+        const pre = await setupQuotePreconditions(client);
+        const header = await insertQuoteHeader(client, {
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+          jobId: pre.jobId, customerId: pre.customer.id,
+          humanId: pre.humanId, source: 'whatsapp', sourceMsgId: uniqueMarker,
+        });
+        const version = await insertQuoteVersion(client, {
+          quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          data: {
+            project: { title: 'T', scope: null },
+            currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+            warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+            warranty_template_ref: null, clauses_template_ref: null,
+          },
+          totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+          customerSnapshot: { name: 'T' },
+          tenantSnapshot: composeTenantSnapshot(pre.tenantId),
+        });
+        // Force line-items failure via a CHECK violation on line_subtotal_cents (must be >= 0).
+        await insertQuoteLineItems(client, {
+          versionId: version.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          lineItems: [{ sort_order: 0, description: 'Bad', qty: 1, unit_price_cents: 100 }],
+          lineTotals: [{ line_subtotal_cents: -1, line_tax_cents: 0 }], // violates CHECK
+        });
+      });
+    } catch (_) {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+
+    // From a fresh query, confirm no orphan header for our unique marker.
+    const q = await pg.query(
+      `SELECT id FROM public.chiefos_quotes WHERE source_msg_id = $1`,
+      [uniqueMarker]
+    );
+    expect(q.rows).toHaveLength(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Remaining scenarios from session brief — todos until their sections land.
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('handleCreateQuote — remaining coverage (todos)', () => {
 
-  // Section 4 + 5 (INSERTs + pointer UPDATE)
+  // Section 5 (pointer UPDATE) + Section 6 (events) + Section 7 (happy path)
   it.todo('Happy path: header + v1 + line items + 2 events emitted; return shape matches §17.15');
-  it.todo('Transaction rollback on mid-INSERT failure: no orphan rows in any of the four tables');
+  // Transaction rollback is covered by Section 4's fifth test (line-items
+  // INSERT failure → no orphan rows). Additional rollback scenarios covered
+  // by Section 5/6/7 tests will land with those sections.
 
   // Section 6 (events)
   // Events are covered inline in the happy path assertion — no standalone todo.

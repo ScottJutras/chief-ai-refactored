@@ -5,7 +5,7 @@
 //   Section 1 (customer resolution): IMPLEMENTED
 //   Section 2 (job resolution): IMPLEMENTED
 //   Section 3 (human_id + totals + snapshots): IMPLEMENTED
-//   Section 4 (header + version + line items INSERTs): TODO
+//   Section 4 (header + version + line items INSERTs): IMPLEMENTED
 //   Section 5 (current_version_id UPDATE): TODO
 //   Section 6 (event emission): TODO
 //   Section 7 (classifyCilError handler branches + counter increment + return): TODO
@@ -450,6 +450,133 @@ function composeTenantSnapshot(tenantId) {
   return TenantSnapshotZ.parse(profile);
 }
 
+// ─── Section 4: header, version, line-items INSERTs (§17.14 core) ──────────
+
+/**
+ * insertQuoteHeader — §17.14 step 1. INSERTs chiefos_quotes with
+ * current_version_id = NULL. The DEFERRABLE FK
+ * chiefos_quotes_current_version_fk permits the NULL within the
+ * transaction; the UPDATE to non-NULL happens at Section 5.
+ *
+ * Idempotency surface: chiefos_quotes_source_msg_unique
+ * (owner_id, source_msg_id) fires here on retry. classifyCilError at
+ * the outer catch routes to idempotent_retry per §17.10.
+ */
+async function insertQuoteHeader(client, {
+  tenantId, ownerId, jobId, customerId, humanId, source, sourceMsgId,
+}) {
+  const { rows } = await client.query(
+    `INSERT INTO public.chiefos_quotes (
+        tenant_id, owner_id, job_id, customer_id, human_id,
+        status, current_version_id, source, source_msg_id,
+        created_at, updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, 'draft', NULL, $6, $7, NOW(), NOW())
+      RETURNING id, created_at`,
+    [tenantId, ownerId, jobId, customerId, humanId, source, sourceMsgId]
+  );
+  return rows[0];
+}
+
+/**
+ * insertQuoteVersion — §17.14 step 2. INSERTs chiefos_quote_versions
+ * with version_no=1, status='draft', locked_at=NULL, server_hash=NULL.
+ * Composite FK chiefos_qv_parent_identity_fk validates
+ * (quote_id, tenant_id, owner_id) matches the header.
+ *
+ * JSONB columns rely on node-postgres auto-serialization of JS objects.
+ * Zod schemas (CustomerSnapshotZ, TenantSnapshotZ) produce objects with
+ * explicit null or absent keys, never undefined — so auto-serialization
+ * is deterministic here.
+ */
+async function insertQuoteVersion(client, {
+  quoteId, tenantId, ownerId, data, totals, customerSnapshot, tenantSnapshot,
+}) {
+  // Composite FK failure here indicates a handler bug (mismatched
+  // tenant_id/owner_id between header and version), not user input.
+  // Bubble to outer catch for 500-class surfacing.
+  const { rows } = await client.query(
+    `INSERT INTO public.chiefos_quote_versions (
+        quote_id, tenant_id, owner_id, version_no, status,
+        project_title, project_scope,
+        currency, subtotal_cents, tax_cents, total_cents,
+        deposit_cents, tax_code, tax_rate_bps,
+        warranty_snapshot, clauses_snapshot, tenant_snapshot,
+        customer_snapshot, payment_terms,
+        warranty_template_ref, clauses_template_ref,
+        created_at
+      )
+      VALUES ($1, $2, $3, 1, 'draft',
+              $4, $5,
+              $6, $7, $8, $9,
+              $10, $11, $12,
+              $13, $14, $15,
+              $16, $17,
+              $18, $19,
+              NOW())
+      RETURNING id, created_at`,
+    [
+      quoteId, tenantId, ownerId,
+      data.project.title, data.project.scope || null,
+      data.currency, totals.subtotal_cents, totals.tax_cents, totals.total_cents,
+      data.deposit_cents, data.tax_code || null, data.tax_rate_bps,
+      data.warranty_snapshot, data.clauses_snapshot, tenantSnapshot,
+      customerSnapshot, data.payment_terms,
+      data.warranty_template_ref || null, data.clauses_template_ref || null,
+    ]
+  );
+  return rows[0];
+}
+
+/**
+ * insertQuoteLineItems — §17.14 step 3. INSERTs chiefos_quote_line_items
+ * one row per input line item. Parent-lock trigger is inert because
+ * parent version's locked_at IS NULL (draft state).
+ *
+ * Sequential INSERTs (not Promise.all) — parent-lock trigger fires per
+ * row regardless, and sequential guarantees deterministic sort_order
+ * matches insertion order for reproducible test output.
+ */
+async function insertQuoteLineItems(client, {
+  versionId, tenantId, ownerId, lineItems, lineTotals,
+}) {
+  // Alignment contract: lineItems[i] corresponds to lineTotals[i].
+  // Section 3's computeTotals preserves input order without filtering.
+  // Assert length match to fail loud if that ever changes.
+  if (lineItems.length !== lineTotals.length) {
+    throw new Error(
+      `Line item alignment drift: ${lineItems.length} items vs ${lineTotals.length} totals`
+    );
+  }
+
+  for (let i = 0; i < lineItems.length; i++) {
+    const li = lineItems[i];
+    const lt = lineTotals[i];
+    await client.query(
+      `INSERT INTO public.chiefos_quote_line_items (
+          quote_version_id, tenant_id, owner_id,
+          sort_order, description, category,
+          qty, unit_price_cents, line_subtotal_cents, line_tax_cents,
+          tax_code, catalog_product_id, catalog_snapshot,
+          created_at
+        )
+        VALUES ($1, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12, $13,
+                NOW())`,
+      [
+        versionId, tenantId, ownerId,
+        li.sort_order != null ? li.sort_order : i,
+        li.description, li.category || null,
+        li.qty, li.unit_price_cents, lt.line_subtotal_cents, lt.line_tax_cents,
+        li.tax_code || null, li.catalog_product_id || null,
+        li.catalog_snapshot || {},
+      ]
+    );
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -543,20 +670,38 @@ async function handleCreateQuote(rawCil, ctx) {
       const customer_snapshot = composeCustomerSnapshot(resolvedCustomer);
       const tenant_snapshot = composeTenantSnapshot(data.tenant_id);
 
-      // ─── vi. INSERT chiefos_quotes, current_version_id=NULL ─── TODO S4 ──
-      // const { id: quoteId, created_at } = await insertQuoteHeader(
-      //   client, { tenant_id, owner_id, job_id, customer_id, human_id,
-      //             source: CIL_TO_QUOTE_SOURCE[data.source],
-      //             source_msg_id: data.source_msg_id }
-      // );
+      // ─── vi. INSERT chiefos_quotes, current_version_id=NULL ── IMPLEMENTED
+      // Idempotency surface: chiefos_quotes_source_msg_unique fires here on
+      // retry; classifyCilError routes to idempotent_retry per §17.10.
+      const header = await insertQuoteHeader(client, {
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        jobId: resolvedJobId,
+        customerId: resolvedCustomer.id,
+        humanId: human_id,
+        source: CIL_TO_QUOTE_SOURCE[data.source],
+        sourceMsgId: data.source_msg_id,
+      });
 
-      // ─── vii. INSERT chiefos_quote_versions (v1, draft) ─── TODO S4 ──────
-      // const { id: versionId } = await insertQuoteVersion(
-      //   client, { quote_id: quoteId, ...v1Fields }
-      // );
+      // ─── vii. INSERT chiefos_quote_versions (v1, draft) ─── IMPLEMENTED ──
+      const version = await insertQuoteVersion(client, {
+        quoteId: header.id,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        data,
+        totals,
+        customerSnapshot: customer_snapshot,
+        tenantSnapshot: tenant_snapshot,
+      });
 
-      // ─── viii. INSERT chiefos_quote_line_items × N ─── TODO S4 ───────────
-      // await insertLineItems(client, versionId, data.line_items, totals);
+      // ─── viii. INSERT chiefos_quote_line_items × N ─── IMPLEMENTED ───────
+      await insertQuoteLineItems(client, {
+        versionId: version.id,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        lineItems: data.line_items,
+        lineTotals: totals.line_totals,
+      });
 
       // ─── ix. UPDATE chiefos_quotes SET current_version_id ─── TODO S5 ────
       // await setCurrentVersion(client, quoteId, versionId);
@@ -570,16 +715,15 @@ async function handleCreateQuote(rawCil, ctx) {
       // tests exercise resolveOrCreateCustomer directly via _internals and do
       // not invoke handleCreateQuote end-to-end yet.
       return {
+        quote_id: header.id,
+        version_id: version.id,
+        header_created_at: header.created_at,
         customer: resolvedCustomer,
         job_id: resolvedJobId,
         human_id,
         totals,
         customer_snapshot,
         tenant_snapshot,
-        // Placeholders — filled as sections land:
-        // quote_id: undefined,
-        // version_id: undefined,
-        // created_at: undefined,
       };
     });
   } catch (err) {
@@ -660,6 +804,9 @@ module.exports = {
     allocateQuoteHumanId,
     composeCustomerSnapshot,
     composeTenantSnapshot,
+    insertQuoteHeader,
+    insertQuoteVersion,
+    insertQuoteLineItems,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

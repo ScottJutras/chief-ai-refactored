@@ -65,15 +65,27 @@ migration context.
     caller-resolves pattern unchanged; principle governs new-idiom only.
   - **Actor role gating (§17.17).** Role restrictions enforced in
     handler logic, not in CIL schema. Canonical pre-transaction
-    sequence: (1) Zod schema → (2) plan gating via §17.16 → (3) actor
-    role check → (4) transaction. Each failure returns a Constitution
-    §9 envelope with the appropriate code. Pairs with §17.16.
+    sequence (§17.17 addenda): (0) ctx preflight — OWNER_ID_MISSING
+    / TRACE_ID_MISSING fail-loud before Zod → (1) Zod schema → (2)
+    plan gating via §17.16 → (3) actor role check (read from
+    parsed.actor.role, not ctx.actor) → (4) transaction. Each failure
+    returns a Constitution §9 envelope. Pairs with §17.16.
+  - **Error code naming (§17.18).** Three prefix categories:
+    `CIL_`-prefix for CIL-layer enforcement
+    (CIL_SCHEMA_INVALID, CIL_INTEGRITY_ERROR, etc.); capability-name
+    prefix for plan gating (QUOTES_REQUIRES_STARTER, etc.); bare
+    condition name for cross-cutting runtime checks
+    (PERMISSION_DENIED, OWNER_ID_MISSING, TRACE_ID_MISSING).
+    SCREAMING_SNAKE_CASE throughout.
   - **Dedup (§17.8–§17.11).** Entity-table `(owner_id, source_msg_id) UNIQUE`
     is canonical for CIL-retry dedup on root entities; events' `external_event_id`
     partial UNIQUE is a distinct webhook-retry dedup surface — do not conflate.
     Optimistic INSERT-and-catch, not SELECT-then-INSERT. Shared
     `classifyUniqueViolation` helper in `src/cil/utils.js`. Dedup scopes to
-    `(owner_id, source_msg_id)`, not `tenant_id`.
+    `(owner_id, source_msg_id)`, not `tenant_id`. **Idempotent_retry
+    returns current entity state, not original-call state** (§17.10
+    clarification 2026-04-20) — input- and version-equivalence are both
+    not checked; the retry signals "exists at source_msg_id granularity."
   - **Sequential IDs (§17.13).** Financial/contractual doc types (quotes,
     invoices, change orders, receipts) use **per-tenant** counters in
     `chiefos_tenant_counters` with a `counter_kind` discriminator. Format
@@ -1571,6 +1583,46 @@ constraint name uses the full form `chiefos_quotes_*` while other
 tables use the abbreviation `chiefos_<abbrev>_*` — handler passes whatever
 string its target table uses; no regex required).
 
+**§17.10 clarification (2026-04-20) — idempotent_retry returns current
+entity state, not original-call state.** When `classifyUniqueViolation`
+returns `idempotent_retry`, the handler's post-rollback lookup reads
+the entity's **current** state and returns it as the retry response.
+For CreateQuote specifically, the quote entity is populated from
+`chiefos_quotes` joined to `chiefos_quote_versions` via
+`current_version_id` (not via `version_no = 1`).
+
+Three alternatives considered and rejected:
+
+- **"Return v1 specifically"** (strict original-call semantics via
+  `WHERE version_no = 1`). Rejected because rows mutate: after
+  `SignQuote` or `ReissueQuote`, v1's state at retry-time differs
+  from v1's state at original-call-time. The strict-semantics
+  premise is unachievable under mutable schema — even this option
+  would return a stale, mutated view, not the response bytes of the
+  original call. The strictness is a mirage.
+
+- **"Error on stale retry"** (new `CIL_IDEMPOTENT_RETRY_STALE` code
+  when the quote has been edited post-creation). Rejected because
+  transport retries — the 95% case, a client that lost the original
+  response — genuinely don't care about v1 vs v2; they care about
+  "did my write land." Forcing every retrying caller to handle a
+  new error case they'd treat as "try again later" is friction
+  without matching value.
+
+- **"Return v1, but error if mutated past v1"** hybrid. Rejected as
+  over-engineered combination of the first two.
+
+Option (a) — current state — aligns with §17.15's committed
+`meta.already_existed` semantic: "the handler's canonical first write
+caught a unique_violation on `(owner_id, source_msg_id)`; the entity
+exists; here is its current renderable state." Input-equivalence is
+explicitly not checked; by the same logic, version-equivalence isn't
+a guarantee either. Callers needing v1 specifically use a detail
+endpoint with `?version=1` — outside CreateQuote's contract.
+
+**This clarification applies to every new-idiom handler's
+idempotent_retry path, not just CreateQuote.**
+
 **§17.11 — Dedup scope.** The dedup check scopes to `(owner_id,
 source_msg_id)`, NOT `(tenant_id, source_msg_id)`. Reasoning:
 `source_msg_id` originates from ingestion identity — WhatsApp Message
@@ -1889,6 +1941,41 @@ carries infrastructure state only (traceId, request-scoped metadata).
 Do not lift payload fields into ctx — it creates two sources of truth
 and invites drift. Applies to every new-idiom handler, not just
 CreateQuote.
+
+**§17.17 addendum 2 (2026-04-20) — required ctx preflight before Zod
+validation.** New-idiom handlers preflight required `ctx` fields
+before Zod validation. Missing `ctx.owner_id` returns
+`OWNER_ID_MISSING`; missing `ctx.traceId` returns `TRACE_ID_MISSING`.
+Both indicate upstream resolution bugs; surfacing as explicit error
+envelopes fails loud rather than degrading silently. Preflight runs
+**before** Zod validation because schema-validation error envelopes
+reference `ctx.traceId` — without traceId, the schema-failure envelope
+would carry `traceId: null`, masking the upstream bug. Locks the
+pattern for SendQuote and the four handlers after.
+
+**§17.18 — Error code naming convention for new-idiom handlers.**
+SCREAMING_SNAKE_CASE throughout. Three prefix categories:
+
+- **CIL-layer enforcement uses `CIL_` prefix**: `CIL_PAYLOAD_INVALID`,
+  `CIL_TYPE_MISSING`, `CIL_TYPE_UNKNOWN`, `CIL_SCHEMA_INVALID`,
+  `CIL_INTEGRITY_ERROR`. These codes fire at schema validation, router
+  dispatch, or DB-integrity boundaries — all CIL-layer concerns.
+
+- **Capability enforcement uses capability-name prefix**:
+  `QUOTES_REQUIRES_STARTER`, `QUOTES_CAPACITY_REACHED`,
+  `OCR_REQUIRES_STARTER`, etc. The prefix names the feature surface
+  being gated. Populated by `gateNewIdiomHandler` via
+  `planMessages.js`.
+
+- **Runtime semantic checks use condition name directly** (no prefix):
+  `PERMISSION_DENIED`, `OWNER_ID_MISSING`, `TRACE_ID_MISSING`. These
+  are cross-cutting conditions that aren't feature-specific.
+
+Future sessions proposing a new error code: pick the category first,
+then name. No `CHIEFOS_` prefix (that's a table namespace, not an
+error taxonomy). No mixed cases.
+
+**§17.18 committed 2026-04-20.**
 
 ---
 

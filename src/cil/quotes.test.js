@@ -1489,6 +1489,9 @@ const {
   loadDraftQuote, resolveRecipient,
   generateShareToken, insertShareToken,
   markQuoteSent, emitLifecycleSent,
+  buildQuoteShareUrl, formatCentsAsCurrency, buildSendQuoteEmail,
+  emitNotificationSent, emitNotificationFailed,
+  APP_URL,
 } = _internals;
 
 describe('SendQuote — Section 1: Zod schemas', () => {
@@ -2136,3 +2139,190 @@ describeIfDb('SendQuote — Section 5: state transitions + lifecycle.sent (integ
     }
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SendQuote — Section 6: email composition + notification emitters
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('SendQuote — Section 6a: buildSendQuoteEmail + formatCentsAsCurrency (unit)', () => {
+  test('formatCentsAsCurrency: handles small and large numbers with all thousands separators', () => {
+    expect(formatCentsAsCurrency(0, 'CAD')).toBe('$0.00 CAD');
+    expect(formatCentsAsCurrency(100, 'CAD')).toBe('$1.00 CAD');
+    expect(formatCentsAsCurrency(1234, 'CAD')).toBe('$12.34 CAD');
+    expect(formatCentsAsCurrency(123456, 'CAD')).toBe('$1,234.56 CAD');
+    expect(formatCentsAsCurrency(12345678, 'CAD')).toBe('$123,456.78 CAD');
+    // Load-bearing large-number test — guards the regex /g flag.
+    // Without /g, only the FIRST thousands boundary gets a comma.
+    expect(formatCentsAsCurrency(1234567890, 'CAD')).toBe('$12,345,678.90 CAD');
+    expect(formatCentsAsCurrency(11300, 'USD')).toBe('$113.00 USD');
+  });
+
+  test('buildSendQuoteEmail: subject + textBody compose correctly; textBody contains shareUrl', () => {
+    const result = buildSendQuoteEmail({
+      tenantSnapshot: {
+        legal_name: '9839429 Canada Inc.',
+        brand_name: 'Mission Exteriors',
+        phone_e164: '+18449590109',
+        email: 'scott@missionexteriors.ca',
+      },
+      quote: {
+        human_id: 'QT-2026-04-19-0042',
+        project_title: 'Roof replacement',
+        total_cents: 1234567,
+        currency: 'CAD',
+      },
+      recipient: { name: 'Darlene MacDonald', email: 'darlene@example.com' },
+      shareUrl: 'https://app.usechiefos.com/q/8xur5soy9bbnu8ypyaJehv',
+    });
+
+    expect(result.subject).toBe('Mission Exteriors — Quote QT-2026-04-19-0042');
+
+    expect(result.textBody).toContain('Hi Darlene MacDonald,');
+    expect(result.textBody).toContain('Mission Exteriors has prepared a quote for you.');
+    expect(result.textBody).toContain('Quote: QT-2026-04-19-0042');
+    expect(result.textBody).toContain('Project: Roof replacement');
+    expect(result.textBody).toContain('Total: $12,345.67 CAD');
+
+    // Load-bearing: shareUrl MUST appear in textBody — the whole reason the
+    // email exists. Future refactors that drop it would produce a useless
+    // email with no way for the customer to view and sign.
+    expect(result.textBody).toContain('https://app.usechiefos.com/q/8xur5soy9bbnu8ypyaJehv');
+
+    expect(result.textBody).toContain('This link expires in 30 days.');
+    expect(result.textBody).toContain('+18449590109');
+    expect(result.textBody).toContain('scott@missionexteriors.ca');
+  });
+
+  test('buildQuoteShareUrl: composes correctly; no double-slashes', () => {
+    const url = buildQuoteShareUrl('8xur5soy9bbnu8ypyaJehv');
+    expect(url).toMatch(/^https?:\/\//);
+    expect(url).toContain('/q/8xur5soy9bbnu8ypyaJehv');
+    expect(url).not.toMatch(/\/\/q\//);
+    expect(url.startsWith(APP_URL)).toBe(true);
+  });
+});
+
+describeIfDb('SendQuote — Section 6b: notification.* emitters (integration)', () => {
+  let pool;
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  async function seedQuoteAndToken(client, pre) {
+    const {
+      insertQuoteHeader, insertQuoteVersion, setQuoteCurrentVersion,
+      composeTenantSnapshot,
+    } = _internals;
+    const header = await insertQuoteHeader(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await insertQuoteVersion(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'T', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: composeTenantSnapshot(pre.tenantId),
+    });
+    await setQuoteCurrentVersion(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    const token = await insertShareToken(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      quoteVersionId: version.id,
+      token: generateShareToken(),
+      recipient: { name: pre.customer.name, email: pre.customer.email },
+      sourceMsgId: `test-s6-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    });
+    return { header, version, token };
+  }
+
+  test('emitNotificationSent: inserts with unprefixed keys + provider_message_id populated', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version, token } = await seedQuoteAndToken(client, pre);
+
+      // Pass a thin pgApi wrapper backed by the test's transaction client so
+      // the event write stays inside the test's BEGIN/ROLLBACK scope.
+      await emitNotificationSent({ query: (...args) => client.query(...args) }, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: pre.ownerId,
+        emittedAt: '2026-04-19T12:00:00.000Z',
+        customerId: pre.customer.id, shareTokenId: token.id,
+        channel: 'email', recipient: 'darlene@example.com',
+        providerMessageId: 'fake-postmark-msg-id-abc',
+      });
+
+      const rows = await client.query(
+        `SELECT kind, quote_version_id, share_token_id, correlation_id, payload
+           FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'notification.sent'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      const ev = rows.rows[0];
+      expect(ev.quote_version_id).toBe(version.id);
+      expect(ev.share_token_id).toBe(token.id);
+      expect(ev.correlation_id).toBeNull();
+      expect(ev.payload).toEqual({
+        channel: 'email',                    // UNPREFIXED per chiefos_qe_payload_notification CHECK
+        recipient: 'darlene@example.com',
+        provider_message_id: 'fake-postmark-msg-id-abc',
+        provider: 'postmark',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('emitNotificationFailed: inserts with provider_message_id:null + error_code + error_message', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version, token } = await seedQuoteAndToken(client, pre);
+
+      await emitNotificationFailed({ query: (...args) => client.query(...args) }, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: pre.ownerId,
+        emittedAt: '2026-04-19T12:00:00.000Z',
+        customerId: pre.customer.id, shareTokenId: token.id,
+        channel: 'email', recipient: 'darlene@example.com',
+        errorCode: 10,
+        errorMessage: 'Bad or missing API token',
+      });
+
+      const rows = await client.query(
+        `SELECT kind, payload FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'notification.failed'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      expect(rows.rows[0].payload).toEqual({
+        channel: 'email',
+        recipient: 'darlene@example.com',
+        provider_message_id: null,           // null value satisfies `?` key-existence CHECK
+        provider: 'postmark',
+        error_code: 10,
+        error_message: 'Bad or missing API token',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+

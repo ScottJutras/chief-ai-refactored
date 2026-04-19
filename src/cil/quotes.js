@@ -72,6 +72,14 @@ const { getTenantProfile } = require('../config/tenantProfiles');
 // 'idempotent_retry' only when err.constraint matches this exactly.
 const SOURCE_MSG_CONSTRAINT = 'chiefos_quotes_source_msg_unique';
 
+// SendQuote's dedup surface (Migration 3 partial UNIQUE).
+const SEND_QUOTE_SOURCE_MSG_CONSTRAINT = 'chiefos_qst_source_msg_unique';
+
+// Public base URL for customer-facing /q/<token> share links. Env-driven
+// with fallback. Trailing-slash strip so `${APP_URL}/q/${token}` never
+// double-slashes.
+const APP_URL = String(process.env.APP_URL || 'https://app.usechiefos.com').replace(/\/$/, '');
+
 // Maps §20-narrowed CIL source → chiefos_quotes.source enum value
 // (Migration 1: source ∈ {portal, whatsapp, email, system}).
 const CIL_TO_QUOTE_SOURCE = Object.freeze({
@@ -1145,6 +1153,151 @@ async function emitLifecycleSent(client, {
   );
 }
 
+// ─── SendQuote Section 6: Postmark dispatch + paired notification events ──
+//
+// Post-commit external call. Distinct from Sections 2-5 which run inside
+// withClient's transaction. The state transition (Section 5) commits
+// regardless of Postmark's outcome per Refinement B:
+//   - Postmark success → emit notification.sent with provider_message_id
+//   - Postmark failure → emit notification.failed with error_code/message
+// Either way, the quote IS sent from Chief's perspective. Email
+// deliverability is a separate fact surfaced via meta.events_emitted.
+
+// ─── 6a. URL builder ────────────────────────────────────────────────────────
+function buildQuoteShareUrl(token) {
+  return `${APP_URL}/q/${token}`;
+}
+
+// ─── 6b. Currency formatter — module-level; reused by email + future PDF ──
+//
+// $12,345,678.90 CAD shape. Tests cover large numbers to guard the regex's
+// global flag (without /g, only the first thousands boundary gets a comma —
+// Mission's $10K-$100K quotes would surface the bug in production).
+function formatCentsAsCurrency(cents, currency) {
+  const dollars = (Number(cents) / 100).toFixed(2);
+  // Global flag — matches every thousands boundary, not just the first.
+  const withCommas = dollars.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return `$${withCommas} ${currency}`;
+}
+
+// ─── 6c. Email body composer — pure ─────────────────────────────────────────
+function buildSendQuoteEmail({ tenantSnapshot, quote, recipient, shareUrl }) {
+  const brand = tenantSnapshot.brand_name || tenantSnapshot.legal_name || 'ChiefOS';
+  const subject = `${brand} — Quote ${quote.human_id}`;
+  const totalDisplay = formatCentsAsCurrency(quote.total_cents, quote.currency);
+
+  const lines = [
+    `Hi ${recipient.name},`,
+    '',
+    `${brand} has prepared a quote for you.`,
+    '',
+    `Quote: ${quote.human_id}`,
+    `Project: ${quote.project_title}`,
+    `Total: ${totalDisplay}`,
+    '',
+    'View and sign your quote here:',
+    shareUrl,
+    '',
+    'This link expires in 30 days.',
+    '',
+    'If you have questions, reply to this email.',
+    '',
+    brand,
+  ];
+  if (tenantSnapshot.phone_e164) lines.push(tenantSnapshot.phone_e164);
+  if (tenantSnapshot.email)      lines.push(tenantSnapshot.email);
+  return { subject, textBody: lines.join('\n') };
+}
+
+// ─── 6d. notification.sent + notification.failed emitters ─────────────────
+//
+// Per §17.14 addendum — one helper per event kind. Both emit POST-commit
+// via pg.query (fresh connection), NOT via the transaction client (which
+// is already released). correlation_id NULL per §17.14 clarification (not
+// the CIL trace); future session may link notification.* → lifecycle.sent
+// via correlation_id=lifecycle.sent.id — flagged for SignQuote session
+// (if the pattern recurs, formalize as §17 principle).
+//
+// Payload uses UNPREFIXED `channel` / `recipient` per Migration 2's
+// chiefos_qe_payload_notification + chiefos_qe_payload_notification_with_provider
+// CHECKs. Distinct from lifecycle.sent's prefixed form — schema drift.
+
+async function emitNotificationSent(pgApi, {
+  quoteId, versionId, tenantId, ownerId,
+  actorSource, actorUserId, emittedAt,
+  customerId, shareTokenId,
+  channel, recipient, providerMessageId,
+}) {
+  const payload = {
+    channel,
+    recipient,
+    provider_message_id: providerMessageId,
+    provider: 'postmark',
+  };
+  await pgApi.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id, emitted_at,
+        customer_id, share_token_id, correlation_id, payload
+      )
+      VALUES ($1, $2, $3, $4,
+              'notification.sent', $5, $6, $7,
+              $8, $9, NULL, $10)`,
+    [
+      tenantId, ownerId, quoteId, versionId,
+      actorSource, actorUserId || null, emittedAt,
+      customerId || null, shareTokenId, payload,
+    ]
+  );
+}
+
+async function emitNotificationFailed(pgApi, {
+  quoteId, versionId, tenantId, ownerId,
+  actorSource, actorUserId, emittedAt,
+  customerId, shareTokenId,
+  channel, recipient, errorCode, errorMessage,
+}) {
+  // provider_message_id: null — no Postmark ID on failure. The `?` JSONB
+  // operator tests key existence, not value; null satisfies the CHECK.
+  const payload = {
+    channel,
+    recipient,
+    provider_message_id: null,
+    provider: 'postmark',
+    error_code: errorCode || 'unknown',
+    error_message: errorMessage || 'unknown',
+  };
+  await pgApi.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id, emitted_at,
+        customer_id, share_token_id, correlation_id, payload
+      )
+      VALUES ($1, $2, $3, $4,
+              'notification.failed', $5, $6, $7,
+              $8, $9, NULL, $10)`,
+    [
+      tenantId, ownerId, quoteId, versionId,
+      actorSource, actorUserId || null, emittedAt,
+      customerId || null, shareTokenId, payload,
+    ]
+  );
+}
+
+// ─── 6e. sendEmail dependency injection for tests ──────────────────────────
+//
+// Tests override via setSendEmailForTests() and reset via
+// resetSendEmailForTests() in afterEach/afterAll. Pattern matches
+// gateNewIdiomHandler(deps) — production callers never pass deps; tests do.
+let _sendEmailOverride = null;
+function setSendEmailForTests(fn) { _sendEmailOverride = fn; }
+function resetSendEmailForTests() { _sendEmailOverride = null; }
+function getSendEmail() {
+  if (_sendEmailOverride) return _sendEmailOverride;
+  // eslint-disable-next-line global-require
+  return require('../../services/postmark').sendEmail;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1445,6 +1598,16 @@ module.exports = {
     // SendQuote Section 5
     markQuoteSent,
     emitLifecycleSent,
+    // SendQuote Section 6
+    buildQuoteShareUrl,
+    formatCentsAsCurrency,
+    buildSendQuoteEmail,
+    emitNotificationSent,
+    emitNotificationFailed,
+    setSendEmailForTests,
+    resetSendEmailForTests,
+    APP_URL,
+    SEND_QUOTE_SOURCE_MSG_CONSTRAINT,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

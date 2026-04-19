@@ -1,65 +1,68 @@
 // src/cil/utils.test.js
-// Unit tests for classifyUniqueViolation (§17.10), errEnvelope shape,
-// and gateNewIdiomHandler (§17.16).
+// Unit tests for classifyCilError (§17.10 + 2026-04-20 clarification),
+// errEnvelope shape, CilIntegrityError class, and gateNewIdiomHandler (§17.16).
 
-const { classifyUniqueViolation, errEnvelope, gateNewIdiomHandler } = require('./utils');
+const {
+  classifyCilError,
+  CilIntegrityError,
+  errEnvelope,
+  gateNewIdiomHandler,
+} = require('./utils');
 
-describe('classifyUniqueViolation', () => {
+describe('classifyCilError — 23505 / semantic / not_unique_violation paths', () => {
   const opts = { expectedSourceMsgConstraint: 'chiefos_quotes_source_msg_unique' };
 
   test('null err returns not_unique_violation', () => {
-    expect(classifyUniqueViolation(null, opts)).toEqual({ kind: 'not_unique_violation' });
+    expect(classifyCilError(null, opts)).toEqual({ kind: 'not_unique_violation' });
   });
 
   test('undefined err returns not_unique_violation', () => {
-    expect(classifyUniqueViolation(undefined, opts)).toEqual({ kind: 'not_unique_violation' });
+    expect(classifyCilError(undefined, opts)).toEqual({ kind: 'not_unique_violation' });
   });
 
   test('err with non-23505 code returns not_unique_violation', () => {
-    expect(classifyUniqueViolation({ code: '23502' }, opts)).toEqual({ kind: 'not_unique_violation' });
-    expect(classifyUniqueViolation({ code: '23503' }, opts)).toEqual({ kind: 'not_unique_violation' });
-    expect(classifyUniqueViolation({ code: '23514' }, opts)).toEqual({ kind: 'not_unique_violation' });
+    expect(classifyCilError({ code: '23502' }, opts)).toEqual({ kind: 'not_unique_violation' });
+    expect(classifyCilError({ code: '23503' }, opts)).toEqual({ kind: 'not_unique_violation' });
+    expect(classifyCilError({ code: '23514' }, opts)).toEqual({ kind: 'not_unique_violation' });
   });
 
   test('err with no code returns not_unique_violation', () => {
-    expect(classifyUniqueViolation({ message: 'some other error' }, opts))
+    expect(classifyCilError({ message: 'some other error' }, opts))
       .toEqual({ kind: 'not_unique_violation' });
   });
 
   test('23505 with matching constraint returns idempotent_retry', () => {
-    expect(classifyUniqueViolation(
+    expect(classifyCilError(
       { code: '23505', constraint: 'chiefos_quotes_source_msg_unique' },
       opts
     )).toEqual({ kind: 'idempotent_retry' });
   });
 
   test('23505 with different constraint returns integrity_error with name', () => {
-    expect(classifyUniqueViolation(
+    expect(classifyCilError(
       { code: '23505', constraint: 'chiefos_quotes_human_id_unique' },
       opts
     )).toEqual({ kind: 'integrity_error', constraint: 'chiefos_quotes_human_id_unique' });
   });
 
   test('23505 with no constraint name returns integrity_error with null', () => {
-    expect(classifyUniqueViolation({ code: '23505' }, opts))
+    expect(classifyCilError({ code: '23505' }, opts))
       .toEqual({ kind: 'integrity_error', constraint: null });
   });
 
   test('handlers pass their own expected constraint name (exact match)', () => {
-    // CreateQuote will guard chiefos_quotes_source_msg_unique
-    expect(classifyUniqueViolation(
+    expect(classifyCilError(
       { code: '23505', constraint: 'chiefos_quotes_source_msg_unique' },
       { expectedSourceMsgConstraint: 'chiefos_quotes_source_msg_unique' }
     )).toEqual({ kind: 'idempotent_retry' });
 
-    // SendQuote will guard chiefos_qst_source_msg_unique
-    expect(classifyUniqueViolation(
+    expect(classifyCilError(
       { code: '23505', constraint: 'chiefos_qst_source_msg_unique' },
       { expectedSourceMsgConstraint: 'chiefos_qst_source_msg_unique' }
     )).toEqual({ kind: 'idempotent_retry' });
 
     // Mismatch (wrong handler) = integrity_error
-    expect(classifyUniqueViolation(
+    expect(classifyCilError(
       { code: '23505', constraint: 'chiefos_qst_source_msg_unique' },
       { expectedSourceMsgConstraint: 'chiefos_quotes_source_msg_unique' }
     )).toEqual({ kind: 'integrity_error', constraint: 'chiefos_qst_source_msg_unique' });
@@ -67,10 +70,85 @@ describe('classifyUniqueViolation', () => {
 
   test('missing opts object does not throw', () => {
     // Defensive: if a caller forgets the opts arg, we still classify the 23505/non-23505 distinction.
-    expect(classifyUniqueViolation({ code: '23505', constraint: 'some_constraint' }))
+    expect(classifyCilError({ code: '23505', constraint: 'some_constraint' }))
       .toEqual({ kind: 'integrity_error', constraint: 'some_constraint' });
-    expect(classifyUniqueViolation({ code: '23502' }))
+    expect(classifyCilError({ code: '23502' }))
       .toEqual({ kind: 'not_unique_violation' });
+  });
+});
+
+describe('classifyCilError — semantic_error path (§17.10 clarification 2026-04-20)', () => {
+  const opts = { expectedSourceMsgConstraint: 'chiefos_quotes_source_msg_unique' };
+
+  test('CilIntegrityError instance returns semantic_error with error ref', () => {
+    const err = new CilIntegrityError({
+      code: 'CUSTOMER_NOT_FOUND_OR_CROSS_TENANT',
+      message: 'Customer lookup failed',
+      hint: 'customer_id does not exist or belongs to a different tenant',
+    });
+    const result = classifyCilError(err, opts);
+    expect(result.kind).toBe('semantic_error');
+    expect(result.error).toBe(err);
+    expect(result.error.code).toBe('CUSTOMER_NOT_FOUND_OR_CROSS_TENANT');
+    expect(result.error.hint).toBe('customer_id does not exist or belongs to a different tenant');
+  });
+
+  test('CilIntegrityError precedence: checked before 23505 branch', () => {
+    // A CilIntegrityError with a fabricated 23505 code still routes as semantic_error
+    // because instanceof check fires first. Defensive — reflects the documented order.
+    const err = new CilIntegrityError({ code: 'X', message: 'm' });
+    err.code = '23505'; // simulate accidental property collision
+    err.constraint = 'chiefos_quotes_source_msg_unique';
+    const result = classifyCilError(err, opts);
+    expect(result.kind).toBe('semantic_error');
+    expect(result.error).toBe(err);
+  });
+
+  test('plain Error (not CilIntegrityError) with 23505 routes by constraint, not to semantic', () => {
+    const err = Object.assign(new Error('plain'), {
+      code: '23505',
+      constraint: 'chiefos_quotes_source_msg_unique',
+    });
+    const result = classifyCilError(err, opts);
+    expect(result.kind).toBe('idempotent_retry');
+  });
+});
+
+describe('CilIntegrityError class', () => {
+  test('is an Error subclass', () => {
+    const err = new CilIntegrityError({ code: 'X', message: 'm' });
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(CilIntegrityError);
+    expect(err.name).toBe('CilIntegrityError');
+  });
+
+  test('stores code, message, hint', () => {
+    const err = new CilIntegrityError({ code: 'X_CODE', message: 'some msg', hint: 'some hint' });
+    expect(err.code).toBe('X_CODE');
+    expect(err.message).toBe('some msg');
+    expect(err.hint).toBe('some hint');
+  });
+
+  test('hint defaults to null when omitted', () => {
+    const err = new CilIntegrityError({ code: 'X', message: 'm' });
+    expect(err.hint).toBeNull();
+  });
+
+  test('empty constructor arg produces usable error (defensive)', () => {
+    const err = new CilIntegrityError();
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe('CIL integrity error');
+    expect(err.hint).toBeNull();
+    expect(err.code).toBeUndefined();
+  });
+
+  test('throwable — stack trace captured', () => {
+    try {
+      throw new CilIntegrityError({ code: 'X', message: 'thrown' });
+    } catch (e) {
+      expect(e).toBeInstanceOf(CilIntegrityError);
+      expect(e.stack).toBeDefined();
+    }
   });
 });
 

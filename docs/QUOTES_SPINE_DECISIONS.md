@@ -81,11 +81,15 @@ migration context.
     is canonical for CIL-retry dedup on root entities; events' `external_event_id`
     partial UNIQUE is a distinct webhook-retry dedup surface — do not conflate.
     Optimistic INSERT-and-catch, not SELECT-then-INSERT. Shared
-    `classifyUniqueViolation` helper in `src/cil/utils.js`. Dedup scopes to
-    `(owner_id, source_msg_id)`, not `tenant_id`. **Idempotent_retry
+    `classifyCilError` helper in `src/cil/utils.js` (renamed from
+    `classifyUniqueViolation` 2026-04-20; now handles both DB-level 23505
+    cases and semantic errors via `CilIntegrityError` class). Dedup scopes
+    to `(owner_id, source_msg_id)`, not `tenant_id`. **Idempotent_retry
     returns current entity state, not original-call state** (§17.10
     clarification 2026-04-20) — input- and version-equivalence are both
     not checked; the retry signals "exists at source_msg_id granularity."
+    Outer catch is a single switch over four kinds: `semantic_error`,
+    `idempotent_retry`, `integrity_error`, `not_unique_violation`.
   - **Sequential IDs (§17.13).** Financial/contractual doc types (quotes,
     invoices, change orders, receipts) use **per-tenant** counters in
     `chiefos_tenant_counters` with a `counter_kind` discriminator. Format
@@ -1622,6 +1626,89 @@ endpoint with `?version=1` — outside CreateQuote's contract.
 
 **This clarification applies to every new-idiom handler's
 idempotent_retry path, not just CreateQuote.**
+
+**§17.10 clarification 2 (2026-04-20) — classifier renamed and
+extended to handle semantic errors.** The shared helper in
+`src/cil/utils.js` is renamed from `classifyUniqueViolation` to
+`classifyCilError` to reflect broader scope: it now classifies both
+DB-level (Postgres 23505) and semantic (application-level) errors in
+a single switch.
+
+A new `CilIntegrityError` class is exported from `src/cil/utils.js`.
+Handlers throw this from within a transaction to surface a semantic
+integrity condition (e.g., customer UUID not found in tenant, job UUID
+doesn't belong to owner) that should render as a clean CIL envelope
+rather than a 500-class failure.
+
+```js
+class CilIntegrityError extends Error {
+  constructor({ code, message, hint } = {}) {
+    super(message || 'CIL integrity error');
+    this.name = 'CilIntegrityError';
+    this.code = code;
+    this.hint = hint || null;
+  }
+}
+```
+
+The classifier's return shape expands to four kinds:
+
+- `{ kind: 'semantic_error', error }` — `err instanceof
+  CilIntegrityError`. Caller composes envelope from `error.code`,
+  `error.message`, `error.hint`. The rendered envelope **code** is
+  `CIL_INTEGRITY_ERROR` per §17.18; the `CilIntegrityError.code` is
+  operator-facing diagnosis surfaced in `hint`.
+- `{ kind: 'idempotent_retry' }` — unchanged from prior contract.
+- `{ kind: 'integrity_error', constraint }` — unchanged.
+- `{ kind: 'not_unique_violation' }` — unchanged; caller rethrows.
+
+**Instanceof check precedence**. The classifier checks
+`err instanceof CilIntegrityError` **first**, before the Postgres
+`23505` branch. A `CilIntegrityError` does not have `err.code =
+'23505'` (it has our own `code` string); without this ordering it
+would fall through to `not_unique_violation`, which is not the
+handler's intent. Documented in the function's implementation order.
+
+**Rejected alternative: sentinel property on plain Error.** An earlier
+sketch used `err._cil_code = 'X'` and checked `err._cil_code` in the
+outer catch. Rejected because JavaScript's lack of type enforcement
+means every section that might throw has to remember to set the
+property; misses don't surface until runtime 500s, and over 5+
+handlers this accumulates. The typed `CilIntegrityError` class makes
+semantic throws impossible without a code — contract over
+convention.
+
+**Internal code vs. envelope code layering (per §17.18).**
+`CilIntegrityError.code` is operator-facing (specific, e.g.
+`CUSTOMER_NOT_FOUND_OR_CROSS_TENANT`) — useful in logs and for
+diagnostic tooling. The envelope `code` rendered to external callers
+is `CIL_INTEGRITY_ERROR` (the §17.18 CIL_-prefixed category code).
+The specific condition goes in the envelope's `hint`. Callers don't
+need to branch on every possible semantic error; operators do.
+
+**Outer catch contract** (single switch over four kinds):
+
+```js
+const c = classifyCilError(err, { expectedSourceMsgConstraint });
+if (c.kind === 'semantic_error') {
+  return errEnvelope({
+    code: 'CIL_INTEGRITY_ERROR',
+    message: c.error.message,
+    hint: c.error.hint,
+    traceId: ctx.traceId,
+  });
+}
+if (c.kind === 'idempotent_retry') { /* post-rollback lookup ... */ }
+if (c.kind === 'integrity_error') {
+  return errEnvelope({
+    code: 'CIL_INTEGRITY_ERROR',
+    message: `Unique constraint violation on ${c.constraint}`,
+    hint: 'Verify tenant/owner FK consistency',
+    traceId: ctx.traceId,
+  });
+}
+throw err;  // not_unique_violation — rethrow
+```
 
 **§17.11 — Dedup scope.** The dedup check scopes to `(owner_id,
 source_msg_id)`, NOT `(tenant_id, source_msg_id)`. Reasoning:

@@ -1,46 +1,86 @@
 // src/cil/utils.js
 // Shared utilities for new-idiom CIL handlers.
-// See docs/QUOTES_SPINE_DECISIONS.md §17.10 (dedup classifier) and
+// See docs/QUOTES_SPINE_DECISIONS.md §17.10 (dedup + error classifier) and
 // §17.16 (plan-gating helper for new-idiom handlers).
 
 const { getEffectivePlanKey } = require('../config/getEffectivePlanKey');
 
 /**
- * Classify a Postgres error after a unique-constraint failure inside a CIL
- * transaction. Used by new-idiom handlers implementing the optimistic
- * INSERT-and-catch dedup pattern from §17.9.
+ * CilIntegrityError — handlers throw this from within a transaction to surface
+ * a semantic (non-DB) integrity condition that should be rendered as a clean
+ * CIL error envelope rather than a 500-class failure.
  *
- * Three outcomes:
- *   - { kind: 'not_unique_violation' }
- *       err is not Postgres 23505 (or no err at all). Caller should treat
- *       as a generic error and rethrow (or no-op if err was null).
+ * Examples: customer UUID not found in tenant; job UUID doesn't belong to
+ * the quoting owner; composite-FK precondition violated by upstream state.
+ *
+ * See §17.10 clarification (2026-04-20): sentinel-property patterns
+ * (err._cil_code) were rejected as fragile against JavaScript's lack of type
+ * enforcement. A typed throw (class + constructor contract) means handlers
+ * cannot throw a semantic error without a `code` — contract over convention.
+ *
+ * Internal code vs. envelope code per §17.18:
+ *   - CilIntegrityError.code is operator-facing (specific, e.g.
+ *     CUSTOMER_NOT_FOUND_OR_CROSS_TENANT). Useful for logs and diagnostics.
+ *   - Envelope code rendered to callers is CIL_INTEGRITY_ERROR (the §17.18
+ *     CIL_-prefixed category code). The specific condition goes in `hint`.
+ */
+class CilIntegrityError extends Error {
+  constructor({ code, message, hint } = {}) {
+    super(message || 'CIL integrity error');
+    this.name = 'CilIntegrityError';
+    this.code = code;
+    this.hint = hint || null;
+  }
+}
+
+/**
+ * classifyCilError — single-entry classifier for handler catch blocks.
+ *
+ * Previously named `classifyUniqueViolation`. Renamed 2026-04-20 to reflect
+ * broader scope now that semantic (non-DB) errors flow through the same
+ * classifier via `CilIntegrityError`. See §17.10 clarification.
+ *
+ * Four outcomes:
+ *
+ *   - { kind: 'semantic_error', error }
+ *       err instanceof CilIntegrityError. Caller returns an envelope composed
+ *       from error.code, error.message, error.hint. The envelope `code`
+ *       rendered to the outside is CIL_INTEGRITY_ERROR per §17.18; the
+ *       CilIntegrityError.code is operator-facing diagnosis in `hint`.
  *
  *   - { kind: 'idempotent_retry' }
- *       err.constraint matches the expected (owner_id, source_msg_id) dedup
- *       constraint. The INSERT was a retry of a prior successful operation.
- *       Caller should roll back its transaction, look up the prior row via
- *       (owner_id, source_msg_id), and return an idempotent success envelope
- *       with `already_existed: true`.
+ *       Postgres 23505 on the expected (owner_id, source_msg_id) dedup
+ *       constraint. Caller looks up the prior entity and returns with
+ *       `meta.already_existed: true` per §17.10 clarification (current
+ *       entity state, not original-call state).
  *
  *   - { kind: 'integrity_error', constraint }
- *       A unique_violation fired, but on a constraint other than the dedup
- *       one (e.g., human_id collision, composite-identity UNIQUE). This is
- *       a genuine integrity error; the caller should rethrow with an
- *       explicit error code distinct from the idempotent case.
+ *       Postgres 23505 on a constraint OTHER than the source_msg_id dedup
+ *       one (human_id collision, composite-identity UNIQUE, etc.). Caller
+ *       returns CIL_INTEGRITY_ERROR envelope with the constraint name in
+ *       the hint for operator diagnosis.
  *
- * Handlers pass the exact expected constraint name. Exact match, no regex.
- * This tolerates current naming drift (e.g., chiefos_quotes uses the full
- * form `chiefos_quotes_source_msg_unique` while others use the abbreviated
- * form `chiefos_<abbrev>_source_msg_unique`).
+ *   - { kind: 'not_unique_violation' }
+ *       Neither a CilIntegrityError nor a 23505. Caller rethrows — upstream
+ *       (facade / transport) renders as 500-class failure.
  *
  * @param {Error | null | undefined} err
  * @param {Object} opts
  * @param {string} opts.expectedSourceMsgConstraint
- * @returns {{ kind: 'not_unique_violation' }
+ * @returns {{ kind: 'semantic_error', error: CilIntegrityError }
  *          | { kind: 'idempotent_retry' }
- *          | { kind: 'integrity_error', constraint: string | null }}
+ *          | { kind: 'integrity_error', constraint: string | null }
+ *          | { kind: 'not_unique_violation' }}
  */
-function classifyUniqueViolation(err, { expectedSourceMsgConstraint } = {}) {
+function classifyCilError(err, { expectedSourceMsgConstraint } = {}) {
+  // CilIntegrityError first — checked before Postgres codes because an
+  // instanceof match is the strongest signal. A CilIntegrityError does NOT
+  // have err.code === '23505'; without this check it would fall through to
+  // not_unique_violation, which is not the handler's intent.
+  if (err instanceof CilIntegrityError) {
+    return { kind: 'semantic_error', error: err };
+  }
+
   if (!err || err.code !== '23505') {
     return { kind: 'not_unique_violation' };
   }
@@ -120,7 +160,7 @@ async function resolvePlanForOwner(ownerId) {
  *
  * Counter-increment is the caller's responsibility and happens AFTER
  * transaction commit (rollback must not burn counter; idempotent retry
- * must be caught by classifyUniqueViolation before the increment runs).
+ * must be caught by classifyCilError before the increment runs).
  *
  * @param {Object} ctx - handler context. Must include owner_id; optional traceId.
  * @param {Function} checkFn - capability check, e.g. canCreateQuote(plan, used)
@@ -159,7 +199,8 @@ async function gateNewIdiomHandler(ctx, checkFn, kindLiteral, deps = {}) {
 }
 
 module.exports = {
-  classifyUniqueViolation,
+  CilIntegrityError,
+  classifyCilError,
   errEnvelope,
   resolvePlanForOwner,
   gateNewIdiomHandler,

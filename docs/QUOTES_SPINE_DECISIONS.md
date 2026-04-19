@@ -2816,6 +2816,147 @@ CreateQuote's architectural foundation carries forward — §17.10
 through §17.18 apply family-wide. SendQuote will add its own entries
 for signature canvas, share-token format, notification dispatch.
 
+## §22. SendQuote handler complete — second new-idiom handler (2026-04-19)
+
+**Status.** Second new-idiom CIL handler in the Quote spine. First real
+SendQuote delivered `QT-2026-04-19-0001` via Postmark to a real email
+address. Multi-entity §17.15 return shape (`{quote, share_token, meta}`)
+validated in production. Every principle §17.10–§17.18, §19, §20 held.
+
+### Commits
+
+- `534a1422` — bs58 ^6.0.0 dep (pre-implementation)
+- `c2c889dd` — Section 1 (SendQuoteCILZ + QuoteRefInputZ)
+- `391c5896` — Section 2 (loadDraftQuote + LOAD_QUOTE_COLUMNS)
+- `daab05bc` — Section 3 (resolveRecipient)
+- `b47d7205` — Section 4 (generateShareToken + insertShareToken)
+- `3141cc55` — Section 5 (markQuoteSent + emitLifecycleSent)
+- `6cb82362` — Section 6 (Postmark dispatch + notification emitters)
+- `476eff27` — Section 7 (handler orchestration + router registration)
+
+### Ceremony verification — first real SendQuote against Mission
+
+```
+Target:                 QT-2026-04-19-0001 (8430c4be-bcfd-44e7-b4e4-3603783d6b69)
+Tenant:                 86907c28-a9ea-4318-819d-5a012192119b (Mission Exteriors)
+Owner:                  19053279955
+quote_ref branch:       human_id (§2 Branch B — not covered by CreateQuote ceremony)
+recipient (override):   scott.tirakian@gmail.com / Scott Jutras
+Handler outcome:        ok:true
+Quote state:            draft → sent; updated_at 2026-04-19T11:28:52.098Z
+Version timestamps:     issued_at = sent_at = 2026-04-19T11:28:52.098Z (transaction-pinned)
+Share token:            df5b1261-ef11-41ac-bf01-babe41a967bb
+Token value:            XPtBaAPL5VAm7zRRJb9onA  (22-char base58)
+Share URL:              https://app.usechiefos.com/q/XPtBaAPL5VAm7zRRJb9onA
+absolute_expires_at:    2026-05-19T11:28:52.098Z  (exactly 30 days per §14.4)
+Events appended:        lifecycle.sent (global_seq 641)
+                        notification.sent (global_seq 642)
+Postmark MessageID:     a52b14f7-eb77-4929-a2db-6d4e167303b8
+POSTMARK_FROM:          hello@usechiefos.com
+```
+
+Four truth surfaces confirmed:
+- `chiefos_quotes.status = 'sent'`, `updated_at` bumped, `current_version_id` unchanged.
+- `chiefos_quote_versions.issued_at` + `sent_at` populated, `locked_at` still NULL.
+- `chiefos_quote_share_tokens` row created with recipient snapshot + 30-day expiry.
+- `chiefos_quote_events` chain extended from 2 (Create) to 4 (Create + Send pair); global_seq monotonic; payload shapes match the per-kind CHECKs exactly.
+
+### Tests
+
+101 total passing, 0 todos. 63 tests in `src/cil/quotes.test.js`
+(CreateQuote + SendQuote combined) + 38 in utils/router/schema suites.
+Cold-start flake observed on one full-suite run (recovered on re-run;
+environmental, not logic).
+
+### Candidate principles flagged for future formalization
+
+SendQuote exercised three patterns that are not yet canonicalized as
+§17 principles but will be if repeated by SignQuote next session.
+
+**Candidate 1 — post-commit external-call with paired `notification.sent`
+/ `notification.failed` events.** SendQuote's Section 6 pattern. Handler
+dispatches to Postmark after the state-transition transaction commits;
+try/catch chooses between two post-commit event emissions; handler
+returns `ok:true` regardless (state transition is the committed fact;
+delivery is a separate facet). If SignQuote's signature-confirmation
+email follows the same pattern, formalize as §17.19.
+
+**Candidate 2 — `correlation_id` on `notification.*` events linking to
+their triggering `lifecycle.*`.** SendQuote has a real causal chain
+(`lifecycle.sent` → `notification.sent|failed`) but currently passes
+NULL for `correlation_id` matching CreateQuote's precedent. Wiring
+`correlation_id = lifecycle.sent.id` would require capturing the
+lifecycle event's id via `RETURNING`. Deferred to SignQuote (which has
+the same pattern: `lifecycle.signed` → `notification.sent` for signature
+confirmation). If SignQuote wires it correctly, formalize as §14
+expansion. If not, formalize as the NULL-is-canonical decision.
+
+**Candidate 3 — multi-entity §17.15 return shape validated in
+production.** SendQuote's `{quote, share_token, meta}` is the first
+real-world exercise of §17.15's family contract with multiple entity
+keys. Pattern holds: one composer per handler (15–25 lines each);
+entity keys are handler-specific siblings of `meta`; retry path reuses
+the same composer with `already_existed:true, events_emitted:[]`. No
+formalization needed — the §17.15 contract already covers this; this
+ceremony is the production validation.
+
+### Schema quirks accepted (not fixed this session)
+
+**Payload field-name inconsistency between `lifecycle.sent` and
+`notification.*`.** Migration 2's as-shipped CHECKs:
+- `chiefos_qe_payload_sent` requires `recipient_channel` + `recipient_address` (prefixed)
+- `chiefos_qe_payload_notification` requires `channel` + `recipient` (unprefixed)
+
+In-handler mapping absorbs the difference. Future notification-spine
+refactor could unify if warranted; schema amendment costs more than the
+ergonomic benefit for now. Documented at Section 5b / Section 6d's
+inline comments.
+
+### Pre-implementation additions this session
+
+- **`bs58` ^6.0.0** in dependencies. v6 is ESM-first; under CommonJS,
+  `require('bs58')` returns the namespace object, so `.default` exposes
+  the encode/decode API. Documented inline at module top.
+- **`APP_URL` env var** (fallback `https://app.usechiefos.com`) for the
+  customer-facing `/q/<token>` URL.
+- **`v.project_title` added to `LOAD_QUOTE_COLUMNS`** — single-place
+  edit surfaces project title in SendQuote's email composition without
+  a side SELECT.
+- **`buildQuoteReturnShape` renamed to `buildCreateQuoteReturnShape`**
+  for naming parity with `buildSendQuoteReturnShape`. No semantic
+  change.
+
+### Deferred items flagged for future sessions
+
+- **§14.4 supersession cascade on version-creating CILs.** CreateQuote's
+  v1 has no prior share_tokens to supersede, so the UPDATE is a no-op
+  today. ReissueQuote (which creates v2) MUST implement the supersession
+  UPDATE per §14.4. Track in ReissueQuote's session.
+- **§14.4 also applies to EditDraft** (if/when that handler lands).
+  Same code pattern; add the UPDATE call to its transaction.
+
+### Session-state changes
+
+- First real share_token row `df5b1261-ef11-41ac-bf01-babe41a967bb`
+  persists in Mission Exteriors tenant, linked to `QT-2026-04-19-0001`.
+- Two new events on Mission's stream (641, 642).
+- Real email delivered to scott.tirakian@gmail.com via Postmark
+  (MessageID `a52b14f7-eb77-4929-a2db-6d4e167303b8`).
+
+### Next session — SignQuote
+
+**Third new-idiom handler.** Sent → signed transition. Consumes a
+share_token + signer identity + signature PNG + name-match validation
+per §14.12. Creates `chiefos_quote_signatures` row (Migration 4) with
+server-computed SHA-256 hash of the canonical quote serialization per
+§4. Locks the version (`locked_at` = NOW(), `server_hash` populated).
+Emits `lifecycle.signed` + `lifecycle.locked` + `notification.sent`
+(confirmation to contractor). If soft-step-up name-match mismatches,
+also emits `integrity.name_mismatch_signed`.
+
+Two candidate principles (#1 + #2 above) will be exercised for the
+second time. If they hold, formalize during SignQuote's session close.
+
 ## Next entries (to be added as decisions land)
-- §22. Template table schema (when tenant template editor is designed)
-- §23. Cross-quote pointer enforcement (the 4-column composite FK, if needed)
+- §23. Template table schema (when tenant template editor is designed)
+- §24. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

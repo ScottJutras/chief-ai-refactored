@@ -6,7 +6,7 @@
 //   Section 2 (job resolution): IMPLEMENTED
 //   Section 3 (human_id + totals + snapshots): IMPLEMENTED
 //   Section 4 (header + version + line items INSERTs): IMPLEMENTED
-//   Section 5 (current_version_id UPDATE): TODO
+//   Section 5 (current_version_id UPDATE): IMPLEMENTED
 //   Section 6 (event emission): TODO
 //   Section 7 (classifyCilError handler branches + counter increment + return): TODO
 //
@@ -577,6 +577,44 @@ async function insertQuoteLineItems(client, {
   }
 }
 
+// ─── Section 5: current_version_id UPDATE pointer swing ────────────────────
+
+/**
+ * setQuoteCurrentVersion — §17.14 step 4. UPDATEs chiefos_quotes to point
+ * at the newly-inserted version. Header immutability trigger
+ * (trg_chiefos_quotes_guard_header_immutable) permits current_version_id
+ * transitions — it's one of five mutable columns (alongside status,
+ * updated_at, voided_at, voided_reason).
+ *
+ * Composite FK chiefos_quotes_current_version_fk (DEFERRABLE INITIALLY
+ * DEFERRED) validates (current_version_id, tenant_id, owner_id) matches
+ * the pointed-to version. The FK's deferred mode is what enabled the
+ * header INSERT with current_version_id=NULL earlier; this UPDATE
+ * resolves the NULL to a real identity-matched id.
+ *
+ * WHERE clause includes tenant_id + owner_id predicates per Engineering
+ * Constitution §3 — belt-and-suspenders even though quote_id came from
+ * the same transaction's INSERT RETURNING. Removes the "is this trusted
+ * context?" reasoning from future readers.
+ *
+ * Rowcount assertion fails loud if the defensive predicates ever miss.
+ * Shouldn't happen in practice (quote_id + tenant_id + owner_id all came
+ * from Section 4's header INSERT result); asserting costs nothing.
+ */
+async function setQuoteCurrentVersion(client, { quoteId, versionId, tenantId, ownerId }) {
+  const result = await client.query(
+    `UPDATE public.chiefos_quotes
+        SET current_version_id = $1, updated_at = NOW()
+      WHERE id = $2 AND tenant_id = $3 AND owner_id = $4`,
+    [versionId, quoteId, tenantId, ownerId]
+  );
+  if (result.rowCount !== 1) {
+    throw new Error(
+      `setQuoteCurrentVersion expected 1 row updated, got ${result.rowCount}`
+    );
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -703,8 +741,13 @@ async function handleCreateQuote(rawCil, ctx) {
         lineTotals: totals.line_totals,
       });
 
-      // ─── ix. UPDATE chiefos_quotes SET current_version_id ─── TODO S5 ────
-      // await setCurrentVersion(client, quoteId, versionId);
+      // ─── ix. UPDATE chiefos_quotes SET current_version_id ─── IMPLEMENTED
+      await setQuoteCurrentVersion(client, {
+        quoteId: header.id,
+        versionId: version.id,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+      });
 
       // ─── x. INSERT chiefos_quote_events × 2 ─── TODO Section 6 ──────────
       // await insertLifecycleCreatedEvent(client, quoteId, ...);
@@ -807,6 +850,7 @@ module.exports = {
     insertQuoteHeader,
     insertQuoteVersion,
     insertQuoteLineItems,
+    setQuoteCurrentVersion,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

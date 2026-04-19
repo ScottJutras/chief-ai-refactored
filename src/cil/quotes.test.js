@@ -30,6 +30,7 @@ const {
   insertQuoteHeader,
   insertQuoteVersion,
   insertQuoteLineItems,
+  setQuoteCurrentVersion,
 } = _internals;
 
 const { setupQuotePreconditions, MISSION_TENANT_UUID } = require('./quotes.test.helpers');
@@ -872,6 +873,90 @@ describeIfDb('handleCreateQuote — Section 4: INSERT chain (integration)', () =
       [uniqueMarker]
     );
     expect(q.rows).toHaveLength(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section 5: current_version_id UPDATE pointer swing (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('handleCreateQuote — Section 5: pointer UPDATE (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool || null;
+    if (!pool || !pool.connect) {
+      const { Pool } = require('pg');
+      pool = new Pool({
+        connectionString:
+          process.env.DATABASE_URL ||
+          process.env.POSTGRES_URL ||
+          process.env.SUPABASE_DB_URL,
+        ssl: { rejectUnauthorized: false },
+      });
+    }
+  });
+
+  test('Pointer UPDATE: chiefos_quotes.current_version_id transitions from NULL to version.id, updated_at bumped', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+
+      const header = await insertQuoteHeader(client, {
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        jobId: pre.jobId, customerId: pre.customer.id,
+        humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+      });
+
+      // Capture the pre-UPDATE state.
+      const before = await client.query(
+        `SELECT current_version_id, updated_at FROM public.chiefos_quotes WHERE id = $1`,
+        [header.id]
+      );
+      expect(before.rows[0].current_version_id).toBeNull();
+      const updatedAtBefore = before.rows[0].updated_at;
+
+      const version = await insertQuoteVersion(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        data: {
+          project: { title: 'T', scope: null },
+          currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+          warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+          warranty_template_ref: null, clauses_template_ref: null,
+        },
+        totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+        customerSnapshot: { name: 'T' },
+        tenantSnapshot: composeTenantSnapshot(pre.tenantId),
+      });
+
+      // Ensure there's a measurable time delta for updated_at bump.
+      await new Promise((r) => setTimeout(r, 50));
+
+      await setQuoteCurrentVersion(client, {
+        quoteId: header.id,
+        versionId: version.id,
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+      });
+
+      const after = await client.query(
+        `SELECT current_version_id, updated_at FROM public.chiefos_quotes WHERE id = $1`,
+        [header.id]
+      );
+      expect(after.rows[0].current_version_id).toBe(version.id);
+      // Postgres NOW() returns transaction_timestamp() — pinned for the
+      // duration of the BEGIN/ROLLBACK scope. Within one transaction the
+      // INSERT's default updated_at and the UPDATE's NOW() resolve to the
+      // same instant. Cross-transaction callers would see strict-greater;
+      // in-transaction tests see equal. Asserting >= covers both.
+      expect(new Date(after.rows[0].updated_at).getTime())
+        .toBeGreaterThanOrEqual(new Date(updatedAtBefore).getTime());
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
   });
 });
 

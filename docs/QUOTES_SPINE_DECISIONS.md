@@ -56,6 +56,11 @@ migration context.
     increments only after successful commit. `errEnvelope` lives in
     `utils.js` as the single source of Constitution §9 shape. Legacy
     caller-resolves pattern unchanged; principle governs new-idiom only.
+  - **Actor role gating (§17.17).** Role restrictions enforced in
+    handler logic, not in CIL schema. Canonical pre-transaction
+    sequence: (1) Zod schema → (2) plan gating via §17.16 → (3) actor
+    role check → (4) transaction. Each failure returns a Constitution
+    §9 envelope with the appropriate code. Pairs with §17.16.
   - **Dedup (§17.8–§17.11).** Entity-table `(owner_id, source_msg_id) UNIQUE`
     is canonical for CIL-retry dedup on root entities; events' `external_event_id`
     partial UNIQUE is a distinct webhook-retry dedup surface — do not conflate.
@@ -81,6 +86,13 @@ migration context.
   `QUOTES_REQUIRES_STARTER`, `QUOTES_CAPACITY_REACHED`. Counter kind
   `'quote_created'` on `usage_monthly_v2`, increments after commit.
   Call via §17.16 helper.
+- **§20 — CreateQuote input contract.** Extends BaseCILZ. Customer
+  either/or (UUID OR inline; no auto-match). Job required, resolved
+  in-transaction. Line items min 1. Title required, scope optional.
+  `tax_rate_bps` required (no default); totals server-computed.
+  Payment terms caller-supplied. `customer_snapshot` + `tenant_snapshot`
+  handler-computed against defined Zod shapes; warranty/clauses
+  caller-supplied inline JSONB. Actor gated to owner-only per §17.17.
 
 ## §0. Source of truth
 - Handoff: `C:\Users\scott\Documents\mission-quote-standalone\QUOTES_HANDOFF_TO_CHIEFOS.md`
@@ -1717,6 +1729,43 @@ Tightening committed in the implementation:
 **§17.16 committed 2026-04-19.** (§17.15 reserved for the return-shape
 decision landing in C6 this same session.)
 
+**§17.17 — Actor role gating at handler level.** Role-based access
+restrictions (owner-only reasoning, employee-only capture, board-only
+approval, etc.) are enforced in handler logic, not in the CIL schema.
+Schema validates payload shape; handler validates semantic constraints
+(role, plan entitlement, business-state preconditions). These two
+concerns — "is this payload structurally valid" vs. "is this actor
+allowed to perform this action" — are distinct and should not be
+conflated in a single validation surface.
+
+**Canonical pre-transaction validation sequence for gated new-idiom
+handlers:**
+
+1. **Schema validation** via Zod (e.g. `CreateQuoteCILZ.safeParse`).
+   Failure → `CIL_SCHEMA_INVALID` envelope.
+2. **Plan gating** via `gateNewIdiomHandler` per §17.16. Failure →
+   plan-specific envelope (`QUOTES_REQUIRES_STARTER`,
+   `QUOTES_CAPACITY_REACHED`, etc.).
+3. **Actor role check** per this principle. Failure →
+   `PERMISSION_DENIED` envelope with a hint describing the required
+   role.
+4. **Transaction** per §17.14 (version-creating handlers) or
+   handler-specific pattern.
+
+Each failure short-circuits the sequence and returns the standard
+Constitution §9 envelope via the shared `errEnvelope` in
+`src/cil/utils.js`. No DB writes occur before step 4 passes.
+
+Why runtime check, not schema refinement: `.refine((payload) =>
+payload.actor.role === 'owner')` couples shape validation to semantic
+authorization. A caller submitting a technically-valid payload with
+`actor.role: 'employee'` gets a schema error ("actor.role must be
+owner"), which is a misleading framing — the *shape* was valid, the
+*action* was not authorized. `PERMISSION_DENIED` is the honest code.
+
+**§17.17 committed 2026-04-19.** Pairs with §17.16 to define the full
+pre-transaction validation sequence for gated new-idiom handlers.
+
 ---
 
 ## §18. Migration 5 design shape — counter table restructure
@@ -1824,8 +1873,249 @@ validation and before the §17.14 transaction opens.
 
 **§19 committed 2026-04-19.**
 
+## §20. CreateQuote input contract — Zod schema decisions (2026-04-19)
+
+Six open design questions from the reading pass, locked. Schema lives
+in `src/cil/quotes.js` (lands with handler code next session). Extends
+BaseCILZ from `src/cil/schema.js`.
+
+### Q1 — Customer identity: either/or, no auto-match
+
+Caller supplies `customer_id` (UUID) **OR** inline fields
+(`{name, email, phone_e164, address}`). Handler resolution:
+- `customer_id` present → link; validate it exists in tenant.
+- Only inline → INSERT new `public.customers` row with inline fields,
+  then link the new id.
+
+**CreateQuote never performs automatic customer deduplication.** Inline-
+only input always creates a new customer row. Explicit `customer_id`
+input is the only path to linking existing customers. Silent name/email/
+phone matching is wrong at this surface: a wrong match silently binds
+the quote to the wrong historical customer, and the contractor has no
+visibility into the match. Dedup of near-duplicate customers is a
+separate explicit flow (future `MergeCustomer` CIL, or a portal
+"similar customers exist" warning at entry time).
+
+### Q2 — Job linkage: required JobRef, resolved in-transaction
+
+Matches DB (`chiefos_quotes.job_id integer NOT NULL`). Uses BaseCILZ's
+existing `JobRefZ` (`job_id` or `job_name` + optional
+`create_if_missing`). CreateQuote extends BaseCILZ and **overrides**
+`job` to non-nullable (BaseCILZ declares it `JobRefZ.nullable()`;
+quotes tighten to non-null).
+
+**Transaction boundary.** If `create_if_missing: true` resolves to
+"create," job creation happens **inside CreateQuote's §17.14
+transaction**, not as a separate CIL call. Orphan job rows are
+prevented by transaction rollback at any §17.14 step failure.
+
+Autoresolution from customer's open jobs is a transport-layer concern
+(WhatsApp intent interpreter), not CIL-layer.
+
+### Q3 — Line items: minimum 1 at create
+
+Schema enforces `.min(1)`. Empty-shell quotes forbidden: semantically
+broken (total=0) and create orphan-cleanup burden. Multi-step flows
+(portal form, WhatsApp draft state) assemble line items at the
+transport layer and submit one complete CreateQuote. EditDraft handles
+post-create iteration.
+
+### Q4 — Project info: title required, scope optional
+
+Matches DB (`project_title NOT NULL`, `project_scope` nullable). No
+defaults — caller is explicit. Title is NOT defaulted to job name:
+internal job names and customer-facing project titles are distinct
+concepts that should not be collapsed.
+
+### Q5 — Tax: caller supplies rate, handler computes totals
+
+**Totals are server-computed, not caller-supplied.** The CIL input
+contract carries `tax_rate_bps` (basis points) + optional `tax_code`
+(e.g., `'HST-ON'`) at the header, `unit_price_cents` + `qty` + optional
+per-line `tax_code` on line items. `subtotal_cents`, `tax_cents`,
+`total_cents`, `line_subtotal_cents`, `line_tax_cents` are **not in
+the input schema** — the handler computes them. DB `total = subtotal +
+tax` CHECK is always satisfied by construction. Client-trust on money
+is eliminated.
+
+**Override on default behavior: `tax_rate_bps` has no default.** The
+original proposal set `default(0)`. Rejected because "no default" is
+the safer posture:
+- An Ontario contractor submitting a CreateQuote without explicit
+  tax rate would silently produce a zero-HST quote; the contractor
+  might not catch this until the customer questions missing HST on
+  the invoice. That's a revenue leak.
+- Hardcoding a locale default in the CIL layer is wrong — ChiefOS is
+  not Ontario-specific.
+- Tenant-profile-resolved default is the right long-term answer but
+  requires the tenant-settings table to ship first (rejected for this
+  round to avoid coupling).
+
+**Schema shape:** `tax_rate_bps: z.number().int().nonnegative()` with
+no `.default()`. Every CreateQuote must supply it explicitly. Caller
+(WhatsApp transport or portal form) supplies the rate — for Mission
+Exteriors today the caller hardcodes `1300` (13% HST ON); for future
+US contractors the caller supplies per-state rates. When tenant
+settings ship, the caller reads tenant default and supplies it.
+
+### Q6 — Payment terms: caller-supplied at create
+
+Caller sends `deposit_cents` + `payment_terms` JSONB. No tenant-profile
+coupling. Portal form pre-fills from tenant profile client-side; user
+can override; handler trusts the resolved values. Matches §17.16
+caller-brings-resolved-context idiom.
+
+**Rendering-layer note.** `payment_terms: {}` (empty object, the
+default) is a valid CIL input state. The customer-facing rendering
+must handle "no payment terms specified" gracefully — empty sections,
+not runtime errors, not missing-field warnings on the customer's page.
+
+### Snapshots: split by who knows the content
+
+- **`customer_snapshot`** — handler-computed from customer input (and
+  existing customer row if `customer_id` given). **Not in input schema.**
+- **`tenant_snapshot`** — handler-computed from tenant row. **Not in
+  input schema.** Avoids caller duplication + drift risk.
+- **`warranty_snapshot`, `clauses_snapshot`** — caller-supplied inline
+  structured JSONB per §6. Default `{}`. Mission Exteriors populates
+  from config at the caller layer today; future tenants supply their
+  own content; template-resolved content lands when template
+  management ships.
+- **`warranty_template_ref`, `clauses_template_ref`** — optional text
+  pointers for future template backref (soft reference, no FK).
+
+**Snapshot shapes are contractual, not arbitrary JSONB.**
+`customer_snapshot` and `tenant_snapshot` — handler-computed — still
+validate against defined Zod schemas before persistence. Leaving them
+as `z.record(z.any())` would let silent shape drift into signed quote
+payloads, which is incompatible with the canonical-serialization
+server-hash guarantee in §4.
+
+```js
+// Defined alongside CreateQuoteCILZ in src/cil/quotes.js
+const TenantSnapshotZ = z.object({
+  legal_name: z.string(),
+  brand_name: z.string().optional(),
+  address: z.string(),
+  phone_e164: PhoneE164Z.optional(),
+  email: z.string().email().optional(),
+  web: z.string().optional(),
+  hst_registration: z.string().optional(),
+});
+
+const CustomerSnapshotZ = z.object({
+  name: z.string(),
+  email: z.string().email().optional(),
+  phone_e164: PhoneE164Z.optional(),
+  address: z.string().optional(),
+});
+```
+
+`catalog_snapshot` on line items keeps `z.record(z.any()).optional()`
+for now — the supplier-catalog integration schema is not yet locked.
+When Gentek/Kaycan integration ships, migrate `catalog_snapshot` to a
+typed Zod schema matching the catalog spine. Flagged as temporary
+looseness.
+
+`warranty_snapshot` and `clauses_snapshot` remain
+`z.record(z.any()).default({})` — these are genuinely flexible
+structured content today. Reconsider shape lock when template
+management ships.
+
+### Actor gating
+
+CreateQuote restricts to `actor.role === 'owner'`. Enforcement is in
+handler logic per §17.17, not in schema `.refine()`. Runs after plan
+gating (§17.16) and before the §17.14 transaction opens. Non-owner
+callers receive `PERMISSION_DENIED` envelope with hint "Ask the owner
+to create quotes."
+
+### Canonical Zod schema (reference)
+
+```js
+// src/cil/quotes.js (lands with handler code in next session)
+const { z } = require('zod');
+const {
+  BaseCILZ, JobRefZ, UUIDZ, CurrencyZ, PhoneE164Z,
+} = require('./schema');
+
+const CustomerInputZ = z.object({
+  customer_id: UUIDZ.optional(),
+  name: z.string().min(1).optional(),
+  email: z.string().email().optional(),
+  phone_e164: PhoneE164Z.optional(),
+  address: z.string().optional(),
+}).refine(
+  (c) => !!c.customer_id || !!c.name,
+  'customer must include customer_id or name'
+);
+
+const LineItemInputZ = z.object({
+  sort_order: z.number().int().nonnegative().default(0),
+  description: z.string().min(1),
+  category: z.enum(['labour', 'materials', 'other']).optional(),
+  qty: z.number().positive().default(1),
+  unit_price_cents: z.number().int().nonnegative(),
+  tax_code: z.string().min(1).optional(),        // per-line override; null inherits header
+  catalog_product_id: UUIDZ.optional(),
+  catalog_snapshot: z.record(z.any()).optional(),// temporary: tighten when catalog ships
+});
+
+const CreateQuoteCILZ = BaseCILZ.extend({
+  type: z.literal('CreateQuote'),
+
+  job: JobRefZ,                                  // override BaseCILZ nullable → required
+
+  customer: CustomerInputZ,
+
+  project: z.object({
+    title: z.string().min(1),
+    scope: z.string().optional(),
+  }),
+
+  currency: CurrencyZ.default('CAD'),
+  tax_rate_bps: z.number().int().nonnegative(),  // NO default — must be explicit (§20 Q5)
+  tax_code: z.string().min(1).optional(),
+
+  line_items: z.array(LineItemInputZ).min(1, 'CreateQuote requires at least one line item'),
+
+  deposit_cents: z.number().int().nonnegative().default(0),
+  payment_terms: z.record(z.any()).default({}),
+
+  warranty_snapshot: z.record(z.any()).default({}),
+  clauses_snapshot: z.record(z.any()).default({}),
+  warranty_template_ref: z.string().min(1).optional(),
+  clauses_template_ref: z.string().min(1).optional(),
+});
+
+// Handler-computed output schemas (validated before persistence).
+const TenantSnapshotZ = z.object({
+  legal_name: z.string(),
+  brand_name: z.string().optional(),
+  address: z.string(),
+  phone_e164: PhoneE164Z.optional(),
+  email: z.string().email().optional(),
+  web: z.string().optional(),
+  hst_registration: z.string().optional(),
+});
+
+const CustomerSnapshotZ = z.object({
+  name: z.string(),
+  email: z.string().email().optional(),
+  phone_e164: PhoneE164Z.optional(),
+  address: z.string().optional(),
+});
+```
+
+**Fields intentionally absent from the input:** `subtotal_cents`,
+`tax_cents`, `total_cents`, `line_subtotal_cents`, `line_tax_cents`,
+`human_id`, `customer_snapshot`, `tenant_snapshot`, `version_no`,
+`issued_at`, `server_hash`. All handler-computed or handler-allocated.
+
+**§20 committed 2026-04-19.** Schema file `src/cil/quotes.js` lands
+with handler code in the next session (post-Migration 5).
+
 ## Next entries (to be added as decisions land)
 - §17.15. Return shape for new-idiom handlers (C6 — this session)
-- §20. Input contract (Zod schema) for CreateQuote (C4 — this session)
 - §21. Template table schema (when tenant template editor is designed)
 - §22. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

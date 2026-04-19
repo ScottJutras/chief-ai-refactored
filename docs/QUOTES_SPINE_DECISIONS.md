@@ -2689,6 +2689,133 @@ reaching create-if-missing. No orphan job rows possible: if the quote
 INSERT rolls back, the job INSERT in the same transaction rolls back
 with it.
 
+## §21. CreateQuote handler complete — first new-idiom handler (2026-04-19)
+
+**Status.** CreateQuote implemented and validated end-to-end against
+production data. First new-idiom CIL handler in the Quote spine. First
+real quote `QT-2026-04-19-0001` persisted in Mission Exteriors tenant.
+
+### Commits
+
+- `d87c59b9` — CIL scaffolding (router facade, utils)
+- `e87ad05a` — §17.12 frozen-map refactor
+- `b81c1250` — §17.12/§17.13/§17.14 + Migration 5 design
+- `f8bd732d` — C5 plan gating + §17.16 + §19 + C7 grep
+- `dff8a71c` — C4 input contract + §17.17 + §20
+- `8f3bd2f1` — C6 return shape + §17.15
+- `cb05db0e` — Migration 5 applied record
+- `94516acb` — Migration 5 service code + counterKinds.js
+- `f3e39fd9` — §17.17 + §20 addenda (reading pass)
+- `733c78f6` — §17.10 clarification + §17.17 addendum 2 + §17.18
+- `9160257f` — classifyCilError rename + CilIntegrityError
+- `d8195e0a` — Section 1 (customer resolution)
+- `b16a0be8` — Section 2 (job resolution) + §17.17 addendum 3
+- `e717a2af` — Section 3 (totals, human_id, snapshots) + §20 addendum
+- `a915bb99` — Section 4 (header + version + line items INSERTs)
+- `83602370` — Section 5 (current_version_id UPDATE)
+- `3c27e135` — Section 6 (events) + §17.14 addendum + correlation_id clarification
+- `e6b856d7` — Section 7 + router registration
+- `5fd11647` — §17.15 events_emitted clarification
+
+### Principles validated by implementation
+
+All of the following principles were authored during the CreateQuote
+design sessions and validated (or refined) during implementation:
+
+**Governing principles (cross-cutting):**
+- §11.0 — RLS governing principle (tight vs. broad)
+- §11c — Atomicity pattern for state-transitioning CIL flows
+- §14.10 — Structural invariants vs. ceremonial obligations
+
+**§17 — CIL Architecture Principles:**
+- §17.1–§17.3 — Idiom direction (BaseCILZ forward, legacy migration)
+- §17.4–§17.7 — Routing (facade pattern, runtime-require delegation,
+  Constitution §9 envelope, caller migration)
+- §17.8–§17.11 — Dedup ((owner_id, source_msg_id) UNIQUE, optimistic
+  INSERT-and-catch, classifyCilError helper, dedup scope)
+  - §17.10 clarification — idempotent_retry returns current entity
+    state, not original-call state
+  - §17.10 clarification 2 — classifier renamed to classifyCilError;
+    CilIntegrityError class; four-kind outer catch switch
+- §17.12 — Handler registration (static Object.freeze'd map; two-step
+  explicit registration)
+- §17.13 — Sequential-ID strategy (per-tenant counters via
+  chiefos_tenant_counters with counter_kind; QT-YYYY-MM-DD-NNNN format)
+- §17.14 — Canonical INSERT sequence (NULL-then-UPDATE pointer pattern)
+  - §17.14 addendum — one helper per event kind
+  - §17.14 correlation_id clarification — causal event chain, not CIL
+    trace_id
+- §17.15 — Return shape (`{ok, <entity>, meta}` family-wide)
+  - §17.15 clarification — events_emitted is per-invocation
+- §17.16 — Plan gating via gateNewIdiomHandler
+- §17.17 — Actor role gating at handler runtime
+  - §17.17 addendum — reads from validated payload, not ctx
+  - §17.17 addendum 2 — ctx preflight before Zod validation
+  - §17.17 addendum 3 — unified not-found-or-wrong-scope errors
+- §17.18 — Error code naming convention (CIL_ prefix, capability
+  prefix, bare runtime-check names)
+
+**§18 — Migration 5** (applied 2026-04-20) — counter table restructure
+to per-tenant per-kind. Unblocked §17.13's allocateNextDocCounter.
+
+**§19 — Plan gating for CreateQuote.** Starter 50/mo, Pro 500/mo,
+Free disabled. Counter kind `'quote_created'`.
+
+**§20 — Input contract.** Six design questions locked; four 2026-04-20
+addenda (G1 source narrowing, G7 integer job_id override, tenant_snapshot
+source via tenantProfiles.js, create_if_missing job source_msg_id).
+
+### Verification — `QT-2026-04-19-0001`
+
+First real quote persisted in production data:
+
+```
+human_id:           QT-2026-04-19-0001
+quote_id:           8430c4be-bcfd-44e7-b4e4-3603783d6b69
+version_id:         5432e769-abe1-4f4b-8c1c-bf75a2554428
+tenant_id:          86907c28-a9ea-4318-819d-5a012192119b  (Mission Exteriors)
+owner_id:           19053279955
+job_id:             205  (created via create_if_missing)
+customer_id:        b1eba24f-2689-4a33-8c98-4c2e66aeb389
+status:             draft
+current_version_id: 5432e769-abe1-4f4b-8c1c-bf75a2554428
+source:             whatsapp
+subtotal_cents:     10000  (1 line × $100)
+tax_cents:           1300  (13% HST)
+total_cents:        11300
+events_emitted:     [lifecycle.created (global_seq 201),
+                     lifecycle.version_created (global_seq 202)]
+counter:            usage_monthly_v2 (19053279955, 2026-04, quote_created) = 1
+```
+
+Per-section validation: `ok: true`, all columns populated correctly,
+per-line totals match Section 3's computeTotals formula, both events
+in chiefos_quote_events with correct payloads, counter incremented
+post-commit.
+
+### Session-state changes
+
+- `public.users.user_id='19053279955'` (Scott / Mission Exteriors
+  owner) plan bumped from `free` to `starter` for the ceremony. Left
+  in place — Scott is a legitimate Beta operator on Starter-tier
+  features.
+- First real quote left as draft (status='draft'). Can be manually
+  voided via `UPDATE public.chiefos_quotes SET status='voided',
+  voided_at=NOW(), voided_reason='ceremony' WHERE id='8430c4be-…'`
+  until VoidQuote handler ships.
+
+### Next session
+
+**SendQuote handler.** Second new-idiom handler. Consumes a `draft`
+quote → creates `chiefos_quote_share_tokens` row → transitions
+quote to `sent` → emits `lifecycle.sent` + `share_token.issued` +
+`notification.queued` events → triggers outbound email via Postmark.
+Follows the same rhythm: reading pass → structure → sections → tests.
+
+CreateQuote's architectural foundation carries forward — §17.10
+through §17.18 apply family-wide. SendQuote will add its own entries
+for signature canvas, share-token format, notification dispatch.
+
 ## Next entries (to be added as decisions land)
-- §21. Template table schema (when tenant template editor is designed)
-- §22. Cross-quote pointer enforcement (the 4-column composite FK, if needed)
+- §22. Template table schema (when tenant template editor is designed)
+- §23. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

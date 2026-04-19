@@ -4,6 +4,7 @@
 
 const crypto = require('crypto');
 const zlib = require('zlib');
+const { Readable } = require('stream');
 
 const mod = require('./quoteSignatureStorage');
 const {
@@ -14,6 +15,8 @@ const {
   parseSignatureStorageKey,
   uploadSignaturePng,
   cleanupOrphanPng,
+  getSignatureForOwner,
+  getSignatureViaShareToken,
   _internals,
 } = mod;
 const {
@@ -28,6 +31,14 @@ const {
   computePngSha256,
   requireAdmin,
   classifySupabaseUploadError,
+  SIG_LOAD_COLUMNS,
+  SIG_TOKEN_RESOLVE_COLUMNS,
+  UUID_LOWERCASE_RE,
+  SHARE_TOKEN_RE,
+  assertUuid,
+  assertOwnerId,
+  assertShareToken,
+  fetchSignatureStream,
 } = _internals;
 
 // ─── Section 2 test fixtures ────────────────────────────────────────────────
@@ -1128,5 +1139,657 @@ describe('cleanupOrphanPng', () => {
     })).resolves.toBeUndefined();
     expect(warnSpy).toHaveBeenCalled();
     expect(warnSpy.mock.calls[0][0]).toMatch(/threw/);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section 4 tests: retrieval helpers (portal P2 + public PU2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Section 4 mock helpers ────────────────────────────────────────────────
+
+function createMockPg(queryResults = []) {
+  let callIndex = 0;
+  const query = jest.fn().mockImplementation(() =>
+    Promise.resolve(queryResults[callIndex++] || { rows: [] })
+  );
+  return { query };
+}
+
+function createMockResponse(buffer, { status = 200, statusText = 'OK', contentLength = null } = {}) {
+  const body = new ReadableStream({
+    start(ctrl) {
+      ctrl.enqueue(buffer);
+      ctrl.close();
+    },
+  });
+  const headers = new Map();
+  if (contentLength !== null) headers.set('content-length', String(contentLength));
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText,
+    headers: { get: (k) => headers.get(k.toLowerCase()) || null },
+    body,
+  };
+}
+
+function installMockFetch(responses) {
+  let callIndex = 0;
+  global.fetch = jest.fn().mockImplementation(() => {
+    const r = responses[callIndex++];
+    if (r instanceof Error) return Promise.reject(r);
+    return Promise.resolve(r || { ok: false, status: 500, statusText: 'Internal' });
+  });
+}
+
+function installRejectingFetch(err) {
+  global.fetch = jest.fn().mockRejectedValue(err);
+}
+
+async function consumeStreamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+// ─── Section 4 fixture data ────────────────────────────────────────────────
+
+const VALID_SIG_BYTES = makeSynthetic(100);
+
+function makeSigRow(overrides = {}) {
+  return {
+    signature_id: PINNED_INPUTS.signatureId,
+    quote_version_id: PINNED_INPUTS.quoteVersionId,
+    tenant_id: PINNED_INPUTS.tenantId,
+    owner_id: '19053279955',
+    signature_png_storage_key: VALID_STORAGE_KEY,
+    signature_png_sha256: crypto.createHash('sha256').update(VALID_SIG_BYTES).digest('hex'),
+    signed_at: new Date('2026-04-19T12:00:00.000Z'),
+    quote_id: '0b1c2d3e-4f5a-6b7c-8d9e-0f1a2b3c4d5e',
+    ...overrides,
+  };
+}
+
+function makeTokenRow(overrides = {}) {
+  return {
+    share_token_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    tenant_id: PINNED_INPUTS.tenantId,
+    owner_id: '19053279955',
+    quote_version_id: PINNED_INPUTS.quoteVersionId,
+    absolute_expires_at: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+    revoked_at: null,
+    ...overrides,
+  };
+}
+
+const VALID_SHARE_TOKEN = 'XPtBaAPL5VAm7zRRJb9onA'; // 22 chars, base58
+
+// ─── Mock shape validation ────────────────────────────────────────────────
+
+describe('Section 4 mock shape', () => {
+  it('createMockPg returns a query function', () => {
+    const pg = createMockPg([{ rows: [{ foo: 'bar' }] }]);
+    expect(typeof pg.query).toBe('function');
+  });
+
+  it('createMockResponse body yields original buffer when streamed', async () => {
+    const buf = Buffer.from([1, 2, 3, 4, 5]);
+    const res = createMockResponse(buf);
+    const stream = Readable.fromWeb(res.body);
+    const collected = await consumeStreamToBuffer(stream);
+    expect(collected.equals(buf)).toBe(true);
+  });
+});
+
+// ─── Section 4 internals: UUID + token regex + assert helpers ──────────────
+
+describe('Section 4 input-validation regexes', () => {
+  it('UUID_LOWERCASE_RE accepts canonical lowercase UUID', () => {
+    expect(UUID_LOWERCASE_RE.test('86907c28-a9ea-4318-819d-5a012192119b')).toBe(true);
+  });
+
+  it('UUID_LOWERCASE_RE rejects uppercase UUID', () => {
+    expect(UUID_LOWERCASE_RE.test('86907C28-A9EA-4318-819D-5A012192119B')).toBe(false);
+  });
+
+  it('SHARE_TOKEN_RE accepts 22-char base58', () => {
+    expect(SHARE_TOKEN_RE.test(VALID_SHARE_TOKEN)).toBe(true);
+  });
+
+  it('SHARE_TOKEN_RE rejects 21-char token', () => {
+    expect(SHARE_TOKEN_RE.test(VALID_SHARE_TOKEN.slice(0, 21))).toBe(false);
+  });
+
+  it('SHARE_TOKEN_RE rejects base58-forbidden chars (0, O, I, l)', () => {
+    expect(SHARE_TOKEN_RE.test('0PtBaAPL5VAm7zRRJb9onA')).toBe(false); // has 0
+    expect(SHARE_TOKEN_RE.test('OPtBaAPL5VAm7zRRJb9onA')).toBe(false); // has O
+    expect(SHARE_TOKEN_RE.test('IPtBaAPL5VAm7zRRJb9onA')).toBe(false); // has I
+    expect(SHARE_TOKEN_RE.test('lPtBaAPL5VAm7zRRJb9onA')).toBe(false); // has l
+  });
+});
+
+// ─── getSignatureForOwner — happy path ─────────────────────────────────────
+
+describe('getSignatureForOwner — happy path', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('returns stream + metadata; stream yields upstream bytes', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES, { contentLength: 100 })]);
+
+    const result = await getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: supabaseMock.module,
+    });
+
+    expect(result.contentType).toBe('image/png');
+    expect(result.contentLength).toBe(100);
+    expect(result.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.signatureId).toBe(PINNED_INPUTS.signatureId);
+    expect(result.signedAt).toBeInstanceOf(Date);
+
+    const consumed = await consumeStreamToBuffer(result.stream);
+    expect(consumed.equals(VALID_SIG_BYTES)).toBe(true);
+  });
+
+  it('pg.query called with dual-boundary WHERE params', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES)]);
+
+    await getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: supabaseMock.module,
+    });
+
+    expect(pg.query).toHaveBeenCalledTimes(1);
+    const [sql, params] = pg.query.mock.calls[0];
+    expect(sql).toMatch(/FROM public\.chiefos_quote_signatures/);
+    expect(sql).toMatch(/WHERE qs\.id = \$1 AND qs\.tenant_id = \$2 AND qs\.owner_id = \$3/);
+    expect(params).toEqual([
+      PINNED_INPUTS.signatureId,
+      PINNED_INPUTS.tenantId,
+      '19053279955',
+    ]);
+  });
+
+  it('createSignedUrl called with path + 60s TTL', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES)]);
+
+    await getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: supabaseMock.module,
+    });
+
+    const [pathArg, ttlArg] = supabaseMock.createSignedUrlMock.mock.calls[0];
+    expect(pathArg).toBe(VALID_STORAGE_KEY.slice(SIGNATURE_BUCKET.length + 1));
+    expect(ttlArg).toBe(60);
+  });
+});
+
+// ─── getSignatureForOwner — input validation ──────────────────────────────
+
+describe('getSignatureForOwner — input validation', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('rejects non-UUID signatureId with BAD_REQUEST', async () => {
+    const pg = createMockPg();
+    await expect(getSignatureForOwner({
+      signatureId: 'not-a-uuid',
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.BAD_REQUEST.code });
+    expect(pg.query).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-UUID tenantId with BAD_REQUEST', async () => {
+    const pg = createMockPg();
+    await expect(getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: 'bad',
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.BAD_REQUEST.code });
+  });
+
+  it('rejects empty ownerId with BAD_REQUEST', async () => {
+    const pg = createMockPg();
+    await expect(getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '',
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.BAD_REQUEST.code });
+  });
+
+  it('rejects non-string inputs with BAD_REQUEST', async () => {
+    const pg = createMockPg();
+    await expect(getSignatureForOwner({
+      signatureId: 42,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.BAD_REQUEST.code });
+  });
+});
+
+// ─── getSignatureForOwner — DB / storage failures ─────────────────────────
+
+describe('getSignatureForOwner — failure modes', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('throws SIGNATURE_NOT_FOUND when DB returns no rows', async () => {
+    const pg = createMockPg([{ rows: [] }]);
+    await expect(getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.SIGNATURE_NOT_FOUND.code });
+  });
+
+  it('throws STORAGE_KEY_MALFORMED when row has corrupt storage_key', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow({ signature_png_storage_key: 'wrong-shape' })] }]);
+    await expect(getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.STORAGE_KEY_MALFORMED.code });
+  });
+
+  it('throws STORAGE_FETCH_FAILED when createSignedUrl errors', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin();
+    supabaseMock.createSignedUrlMock.mockResolvedValue({
+      data: null,
+      error: { message: 'Sign failed' },
+    });
+    await expect(getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: supabaseMock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.STORAGE_FETCH_FAILED.code });
+  });
+
+  it('throws STORAGE_FETCH_FAILED when fetch returns non-200', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(Buffer.alloc(0), { status: 404, statusText: 'Not Found' })]);
+    try {
+      await getSignatureForOwner({
+        signatureId: PINNED_INPUTS.signatureId,
+        tenantId: PINNED_INPUTS.tenantId,
+        ownerId: '19053279955',
+        pg,
+        supabaseAdmin: supabaseMock.module,
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.STORAGE_FETCH_FAILED.code);
+      expect(e.hint).toMatch(/HTTP 404/);
+    }
+  });
+
+  it('throws STORAGE_FETCH_FAILED when fetch rejects with network error', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin();
+    installRejectingFetch(new Error('ECONNREFUSED'));
+    try {
+      await getSignatureForOwner({
+        signatureId: PINNED_INPUTS.signatureId,
+        tenantId: PINNED_INPUTS.tenantId,
+        ownerId: '19053279955',
+        pg,
+        supabaseAdmin: supabaseMock.module,
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.STORAGE_FETCH_FAILED.code);
+      expect(e.hint).toMatch(/Network error/);
+      expect(e.hint).toMatch(/ECONNREFUSED/);
+    }
+  });
+
+  it('throws STORAGE_FETCH_FAILED (via requireAdmin override) when admin null', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin({ adminNull: true });
+    await expect(getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: supabaseMock.module,
+    })).rejects.toMatchObject({ code: SIG_ERR.STORAGE_FETCH_FAILED.code });
+  });
+});
+
+// ─── getSignatureViaShareToken — happy path ───────────────────────────────
+
+describe('getSignatureViaShareToken — happy path', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('returns stream + metadata + full audit context', async () => {
+    const tokenRow = makeTokenRow();
+    const sigRow = makeSigRow();
+    const pg = createMockPg([
+      { rows: [tokenRow] },
+      { rows: [sigRow] },
+    ]);
+    const supabaseMock = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES, { contentLength: 100 })]);
+
+    const result = await getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: supabaseMock.module,
+    });
+
+    expect(result.signatureId).toBe(PINNED_INPUTS.signatureId);
+    expect(result.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.shareTokenId).toBe(tokenRow.share_token_id);
+    expect(result.quoteId).toBe(sigRow.quote_id);
+    expect(result.tenantId).toBe(tokenRow.tenant_id);
+    expect(result.ownerId).toBe(tokenRow.owner_id);
+  });
+
+  it('executes queries in correct order with correct params', async () => {
+    const tokenRow = makeTokenRow();
+    const pg = createMockPg([
+      { rows: [tokenRow] },
+      { rows: [makeSigRow()] },
+    ]);
+    installMockFetch([createMockResponse(VALID_SIG_BYTES)]);
+
+    await getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    });
+
+    expect(pg.query).toHaveBeenCalledTimes(2);
+    expect(pg.query.mock.calls[0][0]).toMatch(/chiefos_quote_share_tokens/);
+    expect(pg.query.mock.calls[0][1]).toEqual([VALID_SHARE_TOKEN]);
+
+    expect(pg.query.mock.calls[1][0]).toMatch(/chiefos_quote_signatures/);
+    expect(pg.query.mock.calls[1][0]).toMatch(/chiefos_quote_versions/);
+    expect(pg.query.mock.calls[1][1]).toEqual([
+      PINNED_INPUTS.signatureId,
+      tokenRow.quote_version_id,
+      tokenRow.tenant_id,
+    ]);
+  });
+});
+
+// ─── getSignatureViaShareToken — input validation ─────────────────────────
+
+describe('getSignatureViaShareToken — input validation', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('rejects non-UUID signatureId with BAD_REQUEST', async () => {
+    const pg = createMockPg();
+    await expect(getSignatureViaShareToken({
+      signatureId: 'not-a-uuid',
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.BAD_REQUEST.code });
+    expect(pg.query).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-base58 shareToken with BAD_REQUEST', async () => {
+    const pg = createMockPg();
+    await expect(getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: 'has0OIl-invalid-chars!',
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.BAD_REQUEST.code });
+    expect(pg.query).not.toHaveBeenCalled();
+  });
+
+  it('rejects 21-char token with BAD_REQUEST', async () => {
+    const pg = createMockPg();
+    await expect(getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN.slice(0, 21),
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.BAD_REQUEST.code });
+  });
+});
+
+// ─── getSignatureViaShareToken — token state ──────────────────────────────
+
+describe('getSignatureViaShareToken — token state', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('SHARE_TOKEN_NOT_FOUND when Q1 returns empty', async () => {
+    const pg = createMockPg([{ rows: [] }]);
+    await expect(getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code });
+    expect(pg.query).toHaveBeenCalledTimes(1); // Q2 not executed
+  });
+
+  it('SHARE_TOKEN_REVOKED when Q1 returns revoked_at', async () => {
+    const pg = createMockPg([
+      { rows: [makeTokenRow({ revoked_at: new Date('2026-04-15T00:00:00Z') })] },
+    ]);
+    await expect(getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.SHARE_TOKEN_REVOKED.code });
+    expect(pg.query).toHaveBeenCalledTimes(1); // Q2 not executed
+  });
+
+  it('SHARE_TOKEN_EXPIRED when Q1 returns past absolute_expires_at', async () => {
+    const pg = createMockPg([
+      { rows: [makeTokenRow({ absolute_expires_at: new Date('2020-01-01T00:00:00Z') })] },
+    ]);
+    await expect(getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.SHARE_TOKEN_EXPIRED.code });
+    expect(pg.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('SHARE_TOKEN_NOT_FOUND when Q2 misses (collapsed mismatch)', async () => {
+    const pg = createMockPg([
+      { rows: [makeTokenRow()] },
+      { rows: [] },
+    ]);
+    await expect(getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code });
+    expect(pg.query).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ─── getSignatureViaShareToken — query-order precedence ───────────────────
+
+describe('getSignatureViaShareToken — query-order precedence', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('revoked token + wrong signatureId → SHARE_TOKEN_REVOKED (not NOT_FOUND)', async () => {
+    // Q1 returns revoked; revoked-check fires BEFORE Q2 executes.
+    const pg = createMockPg([
+      { rows: [makeTokenRow({ revoked_at: new Date('2026-04-15T00:00:00Z') })] },
+      // Q2 would return empty if called — but it shouldn't be called.
+      { rows: [] },
+    ]);
+    await expect(getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.SHARE_TOKEN_REVOKED.code });
+    expect(pg.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('expired token + wrong signatureId → SHARE_TOKEN_EXPIRED (not NOT_FOUND)', async () => {
+    const pg = createMockPg([
+      { rows: [makeTokenRow({ absolute_expires_at: new Date('2020-01-01T00:00:00Z') })] },
+      { rows: [] },
+    ]);
+    await expect(getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg,
+      supabaseAdmin: createMockSupabaseAdmin().module,
+    })).rejects.toMatchObject({ code: SIG_ERR.SHARE_TOKEN_EXPIRED.code });
+    expect(pg.query).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── getSignatureViaShareToken — defensive tenant_id mismatch ─────────────
+
+describe('getSignatureViaShareToken — defensive tenant_id cross-source check', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('throws STORAGE_KEY_MALFORMED when token.tenant_id ≠ signature.tenant_id', async () => {
+    // Unreachable under correct FK enforcement; synthetic mock exercises the branch.
+    const tokenRow = makeTokenRow({ tenant_id: PINNED_INPUTS.tenantId });
+    const sigRow = makeSigRow({ tenant_id: 'different-uuid-tenant-aaaa-bbbb-cccc-dddddddddd' });
+    const pg = createMockPg([
+      { rows: [tokenRow] },
+      { rows: [sigRow] },
+    ]);
+
+    try {
+      await getSignatureViaShareToken({
+        signatureId: PINNED_INPUTS.signatureId,
+        shareToken: VALID_SHARE_TOKEN,
+        pg,
+        supabaseAdmin: createMockSupabaseAdmin().module,
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.code).toBe(SIG_ERR.STORAGE_KEY_MALFORMED.code);
+      expect(e.hint).toMatch(/tenant_id/);
+      expect(e.hint).toMatch(/FK constraint violation/);
+    }
+  });
+});
+
+// ─── Cross-helper invariants ──────────────────────────────────────────────
+
+describe('Cross-helper invariants', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('both helpers call createSignedUrl with 60s TTL (load-bearing §25.2)', async () => {
+    // Portal
+    const pgPortal = createMockPg([{ rows: [makeSigRow()] }]);
+    const mockPortal = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES)]);
+    await getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg: pgPortal,
+      supabaseAdmin: mockPortal.module,
+    });
+    expect(mockPortal.createSignedUrlMock.mock.calls[0][1]).toBe(60);
+
+    // Public
+    const pgPublic = createMockPg([
+      { rows: [makeTokenRow()] },
+      { rows: [makeSigRow()] },
+    ]);
+    const mockPublic = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES)]);
+    await getSignatureViaShareToken({
+      signatureId: PINNED_INPUTS.signatureId,
+      shareToken: VALID_SHARE_TOKEN,
+      pg: pgPublic,
+      supabaseAdmin: mockPublic.module,
+    });
+    expect(mockPublic.createSignedUrlMock.mock.calls[0][1]).toBe(60);
+  });
+
+  it('both helpers call admin.storage.from with SIGNATURE_BUCKET literal', async () => {
+    const pgPortal = createMockPg([{ rows: [makeSigRow()] }]);
+    const mockPortal = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES)]);
+    await getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg: pgPortal,
+      supabaseAdmin: mockPortal.module,
+    });
+    expect(mockPortal.fromMock).toHaveBeenCalledWith(SIGNATURE_BUCKET);
+    expect(mockPortal.fromMock).toHaveBeenCalledWith('chiefos-signatures');
+  });
+});
+
+// ─── Content-Length header handling ───────────────────────────────────────
+
+describe('Content-Length header handling', () => {
+  afterEach(() => { delete global.fetch; });
+
+  it('parses content-length header to number', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES, { contentLength: 100 })]);
+
+    const result = await getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: supabaseMock.module,
+    });
+    expect(result.contentLength).toBe(100);
+    expect(typeof result.contentLength).toBe('number');
+  });
+
+  it('returns null contentLength when header absent', async () => {
+    const pg = createMockPg([{ rows: [makeSigRow()] }]);
+    const supabaseMock = createMockSupabaseAdmin();
+    installMockFetch([createMockResponse(VALID_SIG_BYTES)]); // no contentLength
+
+    const result = await getSignatureForOwner({
+      signatureId: PINNED_INPUTS.signatureId,
+      tenantId: PINNED_INPUTS.tenantId,
+      ownerId: '19053279955',
+      pg,
+      supabaseAdmin: supabaseMock.module,
+    });
+    expect(result.contentLength).toBeNull();
   });
 });

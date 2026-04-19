@@ -28,6 +28,7 @@
 //   Section 6: module assembly + integration tests
 
 const crypto = require('crypto');
+const { Readable } = require('stream');
 const { CilIntegrityError } = require('./utils');
 
 // ─── §25.1 Bucket + path convention ─────────────────────────────────────────
@@ -519,6 +520,316 @@ async function cleanupOrphanPng({ supabaseAdmin, storageKey }) {
   }
 }
 
+// ─── §25.5 Retrieval helpers (Section 4) ────────────────────────────────────
+
+// Column load constants — §17.14 LOAD_QUOTE_COLUMNS precedent. Source of
+// truth:
+//   migrations/2026_04_18_chiefos_quote_signatures.sql
+//   migrations/2026_04_18_chiefos_quote_share_tokens.sql
+
+const SIG_LOAD_COLUMNS = `
+  qs.id                        AS signature_id,
+  qs.quote_version_id,
+  qs.tenant_id,
+  qs.owner_id,
+  qs.signature_png_storage_key,
+  qs.signature_png_sha256,
+  qs.signed_at
+`;
+
+const SIG_TOKEN_RESOLVE_COLUMNS = `
+  t.id                 AS share_token_id,
+  t.tenant_id,
+  t.owner_id,
+  t.quote_version_id,
+  t.absolute_expires_at,
+  t.revoked_at
+`;
+
+// Lowercase-only UUID regex — matches how Migration 4 stores IDs.
+const UUID_LOWERCASE_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// Bitcoin base58 alphabet + exact 22 chars — mirrors Migration 3
+// chiefos_qst_token_format CHECK constraint.
+const SHARE_TOKEN_RE = /^[1-9A-HJ-NP-Za-km-z]{22}$/;
+
+function assertUuid(value, fieldName) {
+  if (typeof value !== 'string' || !UUID_LOWERCASE_RE.test(value)) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.BAD_REQUEST.code,
+      message: `${fieldName} must be a lowercase UUID`,
+      hint: `got: ${typeof value === 'string' ? value : `<${typeof value}>`}`,
+    });
+  }
+}
+
+function assertOwnerId(value) {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.BAD_REQUEST.code,
+      message: 'ownerId required',
+      hint: 'ownerId must be non-empty string',
+    });
+  }
+}
+
+function assertShareToken(value) {
+  if (typeof value !== 'string' || !SHARE_TOKEN_RE.test(value)) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.BAD_REQUEST.code,
+      message: 'shareToken must be 22-char base58',
+      hint: 'Token does not match expected shape (22 chars, Bitcoin base58)',
+    });
+  }
+}
+
+/**
+ * fetchSignatureStream — shared suffix for both retrieval helpers.
+ *
+ * Takes a row already loaded from DB, derives the path, mints a 60s
+ * internal signed URL (§25.2), fetches upstream, converts to Node
+ * Readable stream, returns {stream, metadata, ...auditContext}.
+ *
+ * Called by getSignatureForOwner and getSignatureViaShareToken after
+ * their respective DB-authz checks succeed.
+ *
+ * @param {object} params
+ * @param {object} params.row           — signature row with storage_key + sha256 + signed_at + signature_id
+ * @param {object} params.supabaseAdmin — services/supabaseAdmin module (DI)
+ * @param {object} params.auditContext  — extra fields merged into return (public path only)
+ * @returns {Promise<{stream, contentType, contentLength, sha256, signatureId, signedAt, ...auditContext}>}
+ * @throws {CilIntegrityError} STORAGE_KEY_MALFORMED | STORAGE_FETCH_FAILED
+ */
+async function fetchSignatureStream({ row, supabaseAdmin, auditContext }) {
+  const storageKey = row.signature_png_storage_key;
+
+  // Defensive row-integrity check — corruption detection.
+  try {
+    parseSignatureStorageKey(storageKey);
+  } catch (_) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.STORAGE_KEY_MALFORMED.code,
+      message: 'Signature row contains malformed storage_key',
+      hint: `row.id=${row.signature_id}; storage_key=${storageKey}`,
+    });
+  }
+  const path = storageKey.slice(SIGNATURE_BUCKET.length + 1);
+
+  const admin = requireAdmin(supabaseAdmin, SIG_ERR.STORAGE_FETCH_FAILED.code);
+
+  // 60s TTL per §25.2 — server-internal signed URL, never returned to caller.
+  const { data: signedData, error: signErr } =
+    await admin.storage.from(SIGNATURE_BUCKET).createSignedUrl(path, 60);
+  if (signErr || !signedData || !signedData.signedUrl) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.STORAGE_FETCH_FAILED.code,
+      message: 'Failed to mint signed URL',
+      hint: `Supabase: ${(signErr && signErr.message) || 'no signedUrl returned'}`,
+    });
+  }
+
+  // Network-error wrapping: DNS / connection-refused / TLS failures throw
+  // from fetch() rather than returning a non-ok response. Wrap so every
+  // failure exit from this helper is a CilIntegrityError.
+  let res;
+  try {
+    res = await fetch(signedData.signedUrl);
+  } catch (fetchErr) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.STORAGE_FETCH_FAILED.code,
+      message: 'Upstream fetch threw',
+      hint: `Network error: ${(fetchErr && fetchErr.message) || 'unknown'}`,
+    });
+  }
+  if (!res.ok) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.STORAGE_FETCH_FAILED.code,
+      message: 'Upstream fetch failed',
+      hint: `HTTP ${res.status} ${res.statusText || ''} from signed URL`.trim(),
+    });
+  }
+
+  const clHeader = res.headers.get('content-length');
+  const contentLength = clHeader ? parseInt(clHeader, 10) : null;
+  const stream = Readable.fromWeb(res.body);
+
+  return {
+    stream,
+    contentType: 'image/png',
+    contentLength,
+    sha256: row.signature_png_sha256,
+    signatureId: row.signature_id,
+    signedAt: row.signed_at,
+    ...auditContext,
+  };
+}
+
+/**
+ * getSignatureForOwner — portal-authenticated signature retrieval (P2
+ * posture per Q2 / §25.2).
+ *
+ * Pre-validated context: tenantId + ownerId come from portal session
+ * middleware. This helper re-asserts input shape and performs DB-level
+ * dual-boundary check (id + tenant_id + owner_id) before streaming.
+ *
+ * Stream lifecycle: caller handles stream 'error' events during
+ * consumption. Mid-stream failures (upstream drop, aborted request)
+ * surface on the returned Readable as error events, NOT as rejected
+ * promises from this helper. Recommended caller pattern:
+ *
+ *   const { stream } = await getSignatureForOwner(...);
+ *   try {
+ *     await pipeline(stream, res);
+ *   } catch (streamErr) { ... }
+ *
+ * @param {object} params
+ * @param {string} params.signatureId
+ * @param {string} params.tenantId
+ * @param {string} params.ownerId
+ * @param {object} params.pg             — pg client/pool
+ * @param {object} params.supabaseAdmin  — services/supabaseAdmin module
+ * @returns {Promise<{stream, contentType, contentLength, sha256, signatureId, signedAt}>}
+ * @throws {CilIntegrityError}
+ *   BAD_REQUEST | SIGNATURE_NOT_FOUND | STORAGE_KEY_MALFORMED | STORAGE_FETCH_FAILED
+ */
+async function getSignatureForOwner({ signatureId, tenantId, ownerId, pg, supabaseAdmin }) {
+  assertUuid(signatureId, 'signatureId');
+  assertUuid(tenantId, 'tenantId');
+  assertOwnerId(ownerId);
+
+  const { rows } = await pg.query(
+    `SELECT ${SIG_LOAD_COLUMNS}
+       FROM public.chiefos_quote_signatures qs
+      WHERE qs.id = $1 AND qs.tenant_id = $2 AND qs.owner_id = $3
+      LIMIT 1`,
+    [signatureId, tenantId, ownerId]
+  );
+  if (rows.length === 0) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SIGNATURE_NOT_FOUND.code,
+      message: 'Signature not found',
+      hint: `No signature id=${signatureId} in portal tenant/owner scope`,
+    });
+  }
+
+  return fetchSignatureStream({
+    row: rows[0],
+    supabaseAdmin,
+    auditContext: {},
+  });
+}
+
+/**
+ * getSignatureViaShareToken — public (unauthenticated) signature
+ * retrieval via share token (PU2 posture per Q2 / §25.2).
+ *
+ * Two-query split per §25.5:
+ *   Q1: token resolve → distinguishes NOT_FOUND / REVOKED / EXPIRED
+ *   Q2: linkage verify → MISS collapsed to NOT_FOUND (enumeration-
+ *       minimizing per §17.17 addendum 3 / Q5 tightening)
+ *
+ * Ordering ensures REVOKED/EXPIRED always take precedence over linkage
+ * mismatch when the token resolves at all. Defensive tenant_id cross-
+ * source consistency check between Q1 and Q2 rows surfaces any FK-
+ * invariant drift loudly.
+ *
+ * Stream lifecycle: see getSignatureForOwner docstring.
+ *
+ * @param {object} params
+ * @param {string} params.signatureId
+ * @param {string} params.shareToken
+ * @param {object} params.pg
+ * @param {object} params.supabaseAdmin
+ * @returns {Promise<{stream, contentType, contentLength, sha256, signatureId,
+ *                    signedAt, shareTokenId, quoteId, tenantId, ownerId}>}
+ * @throws {CilIntegrityError}
+ *   BAD_REQUEST | SHARE_TOKEN_NOT_FOUND | SHARE_TOKEN_REVOKED |
+ *   SHARE_TOKEN_EXPIRED | STORAGE_KEY_MALFORMED | STORAGE_FETCH_FAILED
+ */
+async function getSignatureViaShareToken({ signatureId, shareToken, pg, supabaseAdmin }) {
+  assertUuid(signatureId, 'signatureId');
+  assertShareToken(shareToken);
+
+  // Query 1: token resolve.
+  const { rows: tokenRows } = await pg.query(
+    `SELECT ${SIG_TOKEN_RESOLVE_COLUMNS}
+       FROM public.chiefos_quote_share_tokens t
+      WHERE t.token = $1 LIMIT 1`,
+    [shareToken]
+  );
+  if (tokenRows.length === 0) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code,
+      message: 'Share token not found',
+      hint: 'Token does not match any record',
+    });
+  }
+  const token = tokenRows[0];
+
+  // Revoked / expired take precedence over linkage mismatch.
+  if (token.revoked_at) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_REVOKED.code,
+      message: 'Share token revoked',
+      hint: `Revoked at ${new Date(token.revoked_at).toISOString()}`,
+    });
+  }
+  if (new Date(token.absolute_expires_at) <= new Date()) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_EXPIRED.code,
+      message: 'Share token expired',
+      hint: `Expired at ${new Date(token.absolute_expires_at).toISOString()}`,
+    });
+  }
+
+  // Query 2: linkage verify.
+  // The JOIN condition v.tenant_id = qs.tenant_id is functionally redundant
+  // given WHERE qs.tenant_id = $3 + the composite FK. Kept for defensive-
+  // explicit tenant-boundary intent in the query, which aids future SQL
+  // review.
+  const { rows: sigRows } = await pg.query(
+    `SELECT ${SIG_LOAD_COLUMNS}, v.quote_id
+       FROM public.chiefos_quote_signatures qs
+       JOIN public.chiefos_quote_versions v
+         ON v.id = qs.quote_version_id AND v.tenant_id = qs.tenant_id
+      WHERE qs.id = $1 AND qs.quote_version_id = $2 AND qs.tenant_id = $3
+      LIMIT 1`,
+    [signatureId, token.quote_version_id, token.tenant_id]
+  );
+  if (sigRows.length === 0) {
+    // §25.5 enumeration tightening: collapse mismatch into NOT_FOUND.
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code,
+      message: 'Share token not found',
+      hint: 'Token does not authorize this signature',
+    });
+  }
+  const row = sigRows[0];
+
+  // Defensive tenant_id cross-source consistency check. Unreachable under
+  // correct schema enforcement (Migration 4 composite FK); surfaces FK
+  // drift loudly if it ever breaks.
+  if (row.tenant_id !== token.tenant_id) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.STORAGE_KEY_MALFORMED.code,
+      message: 'tenant_id mismatch between token and signature rows',
+      hint: `token.tenant_id=${token.tenant_id}, signature.tenant_id=${row.tenant_id}; indicates FK constraint violation`,
+    });
+  }
+
+  return fetchSignatureStream({
+    row,
+    supabaseAdmin,
+    auditContext: {
+      shareTokenId: token.share_token_id,
+      quoteId: row.quote_id,
+      tenantId: token.tenant_id,
+      ownerId: token.owner_id,
+    },
+  });
+}
+
 // ─── Exports ────────────────────────────────────────────────────────────────
 
 module.exports = {
@@ -535,10 +846,10 @@ module.exports = {
   uploadSignaturePng,
   cleanupOrphanPng,
 
-  // Placeholders — populated by later sections. Mirror quoteHash.js pattern:
-  // declaring future _internals contents as comments keeps the full test
-  // surface visible from each section's diff and prevents later-section
-  // diffs surprising readers with newly-appearing internals.
+  // Read path (Section 4)
+  getSignatureForOwner,
+  getSignatureViaShareToken,
+
   _internals: {
     // Section 2: PNG validation + SHA-256 helpers
     PNG_MAGIC,
@@ -554,5 +865,15 @@ module.exports = {
     // Section 3: admin gate + error classifier
     requireAdmin,
     classifySupabaseUploadError,
+
+    // Section 4: column constants, input validators, shared stream helper
+    SIG_LOAD_COLUMNS,
+    SIG_TOKEN_RESOLVE_COLUMNS,
+    UUID_LOWERCASE_RE,
+    SHARE_TOKEN_RE,
+    assertUuid,
+    assertOwnerId,
+    assertShareToken,
+    fetchSignatureStream,
   },
 };

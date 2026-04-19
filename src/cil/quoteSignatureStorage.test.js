@@ -1793,3 +1793,83 @@ describe('Content-Length header handling', () => {
     expect(result.contentLength).toBeNull();
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section 5 tests: migration ↔ app regex byte-identity (drift detection)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * migration ↔ app regex byte-identity
+ *
+ * These tests catch source-level drift between the SQL migration regex
+ * and SIGNATURE_STORAGE_KEY_RE.source. They do NOT catch PG-ARE-specific
+ * parse errors (JS RegExp and PG ARE are functionally aligned only for
+ * the POSIX subset we use — [0-9a-f], {N}, ^, $, \. — but the compilers
+ * are distinct). PG-side regex compatibility is confirmed via the
+ * preflight psql dry-run documented in the migration commit message.
+ *
+ * Both test-side drift detection AND preflight dry-run are needed;
+ * together they cover the compatibility space.
+ */
+describe('migration ↔ app regex byte-identity', () => {
+  const fs = require('fs');
+  const path = require('path');
+
+  const MIGRATION_PATH = path.join(
+    __dirname, '..', '..', 'migrations',
+    '2026_04_19_chiefos_qs_png_storage_key_format.sql'
+  );
+
+  it('migration SQL file exists at the expected path', () => {
+    expect(fs.existsSync(MIGRATION_PATH)).toBe(true);
+  });
+
+  it('migration regex matches SIGNATURE_STORAGE_KEY_RE.source (forward-slash-normalized)', () => {
+    const sql = fs.readFileSync(MIGRATION_PATH, 'utf8');
+
+    // Extract the single-quoted regex body from the CHECK clause.
+    // Pattern: signature_png_storage_key ~ '<REGEX>'
+    //
+    // The regex body contains no single quotes and no SQL escape sequences,
+    // so a straightforward capture between ' delimiters is safe.
+    const match = /signature_png_storage_key\s*~\s*'([^']+)'/.exec(sql);
+    if (!match) {
+      throw new Error(
+        'Could not locate CHECK regex in migration SQL. ' +
+        'Has the migration file been restructured? If so, update this test.'
+      );
+    }
+    const sqlRegex = match[1];
+
+    // Normalize forward-slash escaping: V8's .source serializer emits \/
+    // (regex-literal-compat) even when the input string used bare /. PG's
+    // ARE does not require escaping / (it's not a delimiter). Both forms
+    // are semantically identical; normalize before comparing so the test
+    // catches real content drift, not engine-serializer quirks.
+    const appSourceNormalized = SIGNATURE_STORAGE_KEY_RE.source.replace(/\\\//g, '/');
+
+    if (sqlRegex !== appSourceNormalized) {
+      // Explicit diff rendering for debug.
+      throw new Error(
+        'Migration regex drifted from app regex.\n' +
+        `  SQL (literal):         ${sqlRegex}\n` +
+        `  App .source normalized: ${appSourceNormalized}\n` +
+        `  App .source raw:       ${SIGNATURE_STORAGE_KEY_RE.source}\n` +
+        'If this is an intentional convention bump, update both in the ' +
+        'same commit and bump the pinned storage_key in the regression lock.'
+      );
+    }
+    expect(sqlRegex).toBe(appSourceNormalized);
+  });
+
+  it('DB CHECK regex (compiled as JS RegExp) accepts the pinned storage_key', () => {
+    // Belt-and-suspenders: the DB regex, extracted and compiled via JS
+    // RegExp, must accept the known-good pinned key. If this fails while
+    // the byte-identity test passes, something is wrong with our JS regex
+    // or the pinned key.
+    const sql = fs.readFileSync(MIGRATION_PATH, 'utf8');
+    const match = /signature_png_storage_key\s*~\s*'([^']+)'/.exec(sql);
+    const sqlRegex = new RegExp(match[1]);
+    expect(sqlRegex.test(PINNED_STORAGE_KEY)).toBe(true);
+  });
+});

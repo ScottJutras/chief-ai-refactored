@@ -41,9 +41,11 @@ const SIGNATURE_BUCKET = 'chiefos-signatures';
 // ─── §25.3 storage_key format enforcement ───────────────────────────────────
 
 // Must match chiefos_qs_png_storage_key_format CHECK in
-// migrations/2026_04_19_chiefos_qs_png_storage_key_format.sql (Phase 2B
-// Section 5). Drift between these two regexes is a §25 violation — keep
-// byte-identical.
+// migrations/2026_04_19_chiefos_qs_png_storage_key_format.sql
+// (Migration 6). Drift between these two regexes is a §25 violation —
+// keep byte-identical. Automated drift check in
+// src/cil/quoteSignatureStorage.test.js ("migration ↔ app regex
+// byte-identity" describe block).
 //
 // Shape: chiefos-signatures/{tenantId}/{quoteId}/{versionId}/{signatureId}.png
 // Length: exactly 170 chars (19 bucket + 4×36 UUIDs + 3 separators + 4 ext).

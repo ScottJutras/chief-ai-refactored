@@ -177,6 +177,326 @@ Canonical serialization rules:
 Storage constraint: `CHECK (server_hash IS NULL OR server_hash ~ '^[0-9a-f]{64}$')`.
 Null only while version is draft.
 
+## §4 clarification — `_hash_alg_version: 1` exhaustive specification (2026-04-19)
+
+Phase 1 of the SignQuote session closed the canonical-serialization
+algorithm as an enumerated, byte-level contract. The high-level §4 rules
+above remain in force; this clarification enumerates every decision
+needed to implement a compliant producer (write path) or verifier (read
+path) without ambiguity. Implementation: `src/cil/quoteHash.js`.
+
+### §4.A — Content-vs-identity framing
+
+The canonical hash binds **contract content** (project, totals,
+snapshots, line items) to **contract identity** (quote_id, human_id,
+version_no). Both layers together make the hash a true per-version
+fingerprint. Content-only hashing would allow collision across
+structurally identical quotes; identity-only hashing would miss content
+tampering.
+
+### §4.B — Underscore-prefix metadata convention
+
+Keys beginning with underscore are canonical-serialization metadata,
+not contract content. Reserved for versioning and future algorithm-
+level fields. Contract keys never begin with underscore. Prevents
+future drift where business-meaningful data accidentally uses
+leading-underscore keys.
+
+### §4.C — Canonical hash input shape (frozen for HASH_ALG_VERSION: 1)
+
+Single JSON object; keys sort lexicographically at every nesting level
+(library-enforced). Presented here alphabetically in the serializer's
+output order.
+
+```jsonc
+{
+  "_hash_alg_version": 1,
+  "clauses_snapshot": { /* JSONB; empty → {} */ },
+  "currency": "CAD" | "USD",
+  "customer_snapshot": {
+    "address":    <string | null>,
+    "email":      <string | null>,    // lowercased + trimmed
+    "name":       <string>,           // NFC-normalized
+    "phone_e164": <string | null>     // E.164
+  },
+  "deposit_cents": <integer>,
+  "human_id": <string>,
+  "line_items": [
+    {
+      "catalog_product_id":   <UUID string | null>,
+      "catalog_snapshot":     { /* JSONB; null/absent → {} */ },
+      "category":             "labour" | "materials" | "other" | null,
+      "description":          <string>,          // NFC-normalized
+      "line_subtotal_cents":  <integer>,
+      "line_tax_cents":       <integer>,
+      "qty_thousandths":      <integer>,         // §4.E derivation
+      "sort_order":           <integer>,
+      "tax_code":             <string | null>,
+      "unit_price_cents":     <integer>
+    }
+    // Ordered by (sort_order ASC, id ASC) at fetch time.
+  ],
+  "payment_terms": { /* JSONB; empty → {} */ },
+  "project_scope": <string | null>,             // NFC-normalized when string
+  "project_title": <string>,                    // NFC-normalized
+  "quote_id": <UUID string>,
+  "subtotal_cents": <integer>,
+  "tax_cents": <integer>,
+  "tax_code": <string | null>,
+  "tax_rate_bps": <integer>,
+  "tenant_snapshot": {
+    "address":          <string>,
+    "brand_name":       <string | null>,
+    "email":            <string | null>,       // lowercased + trimmed
+    "hst_registration": <string | null>,
+    "legal_name":       <string>,
+    "phone_e164":       <string | null>,       // E.164
+    "web":              <string | null>
+  },
+  "total_cents": <integer>,
+  "version_no": <integer>,
+  "warranty_snapshot": { /* JSONB; empty → {} */ }
+}
+```
+
+**Excluded fields** (present on the version row but deliberately
+outside the hash): `id`, `tenant_id`, `owner_id`, `status`,
+`server_hash`, `created_at`, `issued_at`, `sent_at`, `viewed_at`,
+`signed_at`, `locked_at`, `warranty_template_ref`,
+`clauses_template_ref`. Timestamps are emission metadata, not contract
+content. `tenant_id` / `owner_id` are dual-boundary identity (ChiefOS-
+internal). Template refs are cross-table pointers; the snapshots
+themselves are already included as content.
+
+**`catalog_product_id` is included as a historical pointer** for audit-
+trail linkage. Deletion or renaming of the referenced `catalog_products`
+row does not invalidate past hashes — `catalog_snapshot` preserves the
+content snapshot; the UUID preserves the reference at that moment.
+
+### §4.D — Frozen field lists (NOT read from Zod schemas)
+
+Canonical field lists for `HASH_ALG_VERSION: 1` are frozen in
+`src/cil/quoteHash.js` as `Object.freeze(...)` arrays:
+
+- `CUSTOMER_SNAPSHOT_FIELDS_V1 = ['address', 'email', 'name', 'phone_e164']`
+- `TENANT_SNAPSHOT_FIELDS_V1   = ['address', 'brand_name', 'email', 'hst_registration', 'legal_name', 'phone_e164', 'web']`
+- `LINE_ITEM_FIELDS_V1         = ['catalog_product_id', 'catalog_snapshot', 'category', 'description', 'line_subtotal_cents', 'line_tax_cents', 'qty_thousandths', 'sort_order', 'tax_code', 'unit_price_cents']`
+
+They are deliberately NOT read from Zod schemas (e.g.,
+`CustomerSnapshotZ.shape`). Schema evolution is a legitimate product
+activity that must not silently affect past hashes. Adding a field to
+hashing requires bumping `HASH_ALG_VERSION` and explicit migration
+logic for existing signed quotes. The Zod schemas remain the validation
+source of truth for snapshot content at creation time; the canonical
+hash field lists are a separate, frozen enumeration per algorithm
+version.
+
+**Absent-vs-null normalization.** Optional fields in snapshots are
+canonicalized before hashing: every schema-declared field is present
+in the canonical form with explicit value, using `null` when absent in
+the source. This produces deterministic hash input regardless of JSONB
+storage shape variance across rows. Field enumeration comes from the
+frozen list above — not from runtime introspection of the stored value.
+
+**Empty JSONB snapshots** (`warranty_snapshot`, `clauses_snapshot`,
+`payment_terms`, `catalog_snapshot`) canonicalize as `{}`, not null.
+Zod schemas declare these as objects with `.default({})`; the DB
+stores `{}` for absent content. Normalizing `{}` → null would create
+drift between stored and hashed representations.
+
+### §4.E — `qty_thousandths` derivation (string arithmetic)
+
+`qty numeric(18,3)` → `qty_thousandths` integer via `qtyToThousandths`
+in `src/cil/quoteHash.js`. Parses the pg-driver-returned string and
+multiplies by 1000 without IEEE 754 intermediate representation.
+
+Rejected path: `Math.round(parseFloat(qtyStr) * 1000)`. Any path that
+can drift for some valid input is wrong for an integrity-claim
+algorithm. IEEE 754 intermediate representation in
+`parseFloat(x) * 1000` produces drift on certain decimal values
+(e.g., `0.1`, `0.2`, `2.675` at specific boundaries). `Math.round`
+masks most cases but not all. The algorithm is correct for all valid
+`numeric(18,3)` inputs, not just the ones that happen to survive
+IEEE 754 intermediate representation today.
+
+**SAFE_INTEGER ceiling.** String-arithmetic path is bounded by
+`Number.MAX_SAFE_INTEGER` (~9×10¹⁵). In `qty_thousandths` terms this
+corresponds to quote quantities ~9×10¹² — implausibly large for real
+contracting. If exceeded, `qtyToThousandths` throws with an explicit
+hint to bump `HASH_ALG_VERSION` and adopt BigInt serialization. The
+throw is preferable to silently hashing drifted values.
+
+**Strictness.** The helper rejects non-string input (a Number arriving
+here indicates a `pg-types` config override coercing numeric to
+Number). It rejects >3 fractional digits via regex (schema extension
+to `numeric(18,6)` would be a `HASH_ALG_VERSION: 2` situation, not a
+silent-accept). Both throws carry operator-diagnostic messages.
+
+### §4.F — Defensive-assertion design principle
+
+Canonicalization preconditions are defended at the function boundary.
+The hash function asserts:
+- Inputs are sorted as specified (line items in sort_order ASC, id
+  ASC tie-break at fetch time),
+- Integer-valued where integer (all numeric fields in hash input),
+- Correct type (string for `numeric(18,3)` inputs),
+- Within SAFE_INTEGER bounds.
+
+Violations throw loud rather than silently degrading. **A hash
+computed on corrupted input would verify successfully against the
+same corrupted input permanently — a silent integrity breach is
+worse than a loud throw.**
+
+Helpers: `assertIntegerNumbers`, `assertLineItemsSorted`, the strict
+behaviors inside `qtyToThousandths`. Future canonicalization work for
+other hash-bearing artifacts inherits the same posture.
+
+**`catalog_snapshot` integer-only precondition.** `catalog_snapshot`,
+when populated, must follow the integer-only rule — any numeric
+values must be integers in the stored form. Future catalog integration
+(§20 addendum when it lands) must satisfy this precondition at the
+catalog pipeline layer. Decimal values (weights, dimensions) must be
+pre-converted to integer units (e.g., `weight_grams` not
+`weight_kg`) before storage. `assertIntegerNumbers` throws on any
+float inside `catalog_snapshot`.
+
+### §4.G — Canonicalization pipeline
+
+```
+version row + line items (from DB or in-memory)
+    ↓
+buildHashInput(version, lineItems)
+    — schema-driven field canonicalization (§4.D):
+        • CUSTOMER_SNAPSHOT_FIELDS_V1 → absent fields become null
+        • TENANT_SNAPSHOT_FIELDS_V1   → absent fields become null
+        • Line items sorted by (sort_order ASC, id ASC); id stripped
+          before canonicalization (not in LINE_ITEM_FIELDS_V1)
+        • qty → qty_thousandths via qtyToThousandths (§4.E)
+        • Null/absent catalog_snapshot → {} (§4.D)
+        • Empty snapshots stay as {} (§4.D)
+        • _hash_alg_version: 1 prepended
+    ↓
+assertLineItemsSorted(hashInput.line_items)
+    ↓
+assertIntegerNumbers(hashInput)
+    ↓
+stableStringify(hashInput)  →  canonical UTF-8 string
+    ↓
+crypto.createHash('sha256').update(canonical, 'utf8').digest('hex')
+    ↓
+server_hash: 64 lowercase hex chars (matches DB CHECK ~'^[0-9a-f]{64}$')
+```
+
+Verification (future read path) runs the identical pipeline against
+DB-fetched values and compares the recomputed hex to stored
+`server_hash`. `buildHashInput` is **the single source of truth for
+canonicalization** — write path and read path share one
+implementation. Divergence would be the canonical verification-drift
+bug; keeping it as one function prevents that class entirely.
+
+### §4.H — Library choice + upgrade contract
+
+Canonical serialization uses `fast-json-stable-stringify` v2.x (or
+equivalent with byte-identical output: recursive lexicographic key
+ordering, no whitespace, null preservation). The library is part of
+the algorithm definition, not an implementation detail. Replacing it
+requires proving byte-for-byte equivalent output on the comprehensive
+test corpus in `src/cil/quoteHash.test.js` (especially the cross-
+version regression lock), or bumping `HASH_ALG_VERSION`.
+
+**Dependency upgrade contract.** `fast-json-stable-stringify` is
+pinned `^2.1.0` in `dependencies`. Minor/patch updates flow via
+normal `npm update`. Major version bump (2.x → 3.x) requires
+explicit validation: run all `computeVersionHash` unit tests plus a
+round-trip test reading existing signed quote versions from the
+production DB and reconfirming stored `server_hash` matches
+recomputed hash under the new library version. Any mismatch means
+the library version is incompatible with past hashes — cannot adopt
+without bumping `HASH_ALG_VERSION`.
+
+### §4.I — Single-hash architecture + dispute-resolution artifact
+
+The canonical JSON string produced by `stableStringify(hashInput)`
+is the signed artifact. Dispute resolution uses this string
+directly — byte-for-byte comparison is the primary verification
+path. Single-hash architecture keeps this a single operation rather
+than requiring two-layer verification. Rejected alternative:
+per-line-item sub-hashes aggregated at the top level. That would
+enable partial-disclosure proofs (not on the ChiefOS roadmap) at
+the cost of two-layer debugging and dual algorithm versioning.
+
+`computeVersionHash` returns `{ hex, canonical }`:
+- `hex` is persistent (stored as `chiefos_quote_versions.server_hash`)
+- `canonical` is transient — available for logging, diffing, and
+  dispute resolution but never persisted. Storing `canonical`
+  alongside `hex` would create drift risk and bloat rows.
+
+### §4.J — Implementation location
+
+`src/cil/quoteHash.js` + `src/cil/quoteHash.test.js`. Sibling to
+handler files; short import path from `quotes.js` (`require('./quoteHash')`).
+One-concern-per-file matches `src/cil/`'s pattern. Future invoice
+spine's parallel hashing lands as `src/cil/invoiceHash.js` with its
+own frozen field lists and independent version counter — per-doc-
+type algorithm separation is intentional.
+
+Public API (top-level exports):
+- `HASH_ALG_VERSION` — version pin for verifier dispatch
+- `computeVersionHash(version, lineItems)` → `{ hex, canonical }`
+- `CUSTOMER_SNAPSHOT_FIELDS_V1`, `TENANT_SNAPSHOT_FIELDS_V1`,
+  `LINE_ITEM_FIELDS_V1` — frozen field lists for audit visibility
+
+Internal (via `_internals`, test + internal tooling only):
+- `buildHashInput`, `assertIntegerNumbers`, `assertLineItemsSorted`,
+  `qtyToThousandths`, `canonicalizeSnapshot`, `canonicalizeLineItem`
+
+### §4.K — Test coverage
+
+`src/cil/quoteHash.test.js` covers:
+
+- Determinism: same input → same hex across calls
+- Round-trip: identical result across repeated calls + JSON cycle
+- Library behavior: canonical has no inter-token whitespace, valid
+  re-parseable JSON, starts with `_hash_alg_version` (lexicographically
+  first key)
+- JSONB key-order insensitivity: scrambled source key order → same hex
+- Field-change detection: every included field, including every line
+  item field, changes the hash when mutated
+- Excluded-field immunity: timestamps, IDs, status, template refs,
+  line item `id` — none change the hash
+- Null preservation: absent → null → same canonical (Q1-call-3);
+  value → null DOES change the hash (tamper caught)
+- Integer-validation precondition: floats/NaN/Infinity/BigInt/symbol/
+  function all throw with recursive path reporting
+- Sort-order assertion precondition: descending throws; equal
+  sort_order allowed (id tie-break is fetcher responsibility)
+- `qtyToThousandths` precision edge cases: `0.1`, `0.2`, `0.3`,
+  `2.675`, `1.005`, `123456789012.345`; malformed/non-string/overflow
+  inputs throw with diagnostic hints
+- Canonicalizer field lists are frozen; coverage matches spec
+- Line-item `catalog_snapshot` null/absent → `{}` normalization
+
+**Cross-version regression lock.** The single most important test for
+long-term integrity assurance: a fully-specified fixture + pinned
+hex. If any future code change accidentally alters the canonical form
+(library upgrade that subtly changes output, field-ordering drift,
+normalization regression), other tests may still pass — but this one
+fails loudly. Pinned hex as of 2026-04-19:
+
+```
+e9088c36066a73a9cee9efcdb59f2748b4ca5040134d21ba5cb37e8327e77d51
+```
+
+Future failure of this test means either (a) a test-fixture value was
+modified (revert the fixture change), (b) the canonical-serialization
+algorithm was modified (bump `HASH_ALG_VERSION` + migrate existing
+signed quotes), or (c) `fast-json-stable-stringify` output changed
+(re-validate per the library upgrade contract).
+
+**§4 clarification committed 2026-04-19.** Phase 1 of the SignQuote
+session complete. Implementation in `src/cil/quoteHash.js`, 52 tests
+passing, cross-version regression lock pinned.
+
 ## §5. Header immutability: per-column trigger (2026-04-18)
 Decision: all identity columns on `chiefos_quotes` (id, tenant_id, owner_id, job_id,
 customer_id, human_id, source, source_msg_id, created_at) are immutable after

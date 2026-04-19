@@ -191,6 +191,30 @@ const CreateQuoteCILZ = BaseCILZ.extend({
 // avoid per-call function recreation. Not exported on the public surface
 // (see `_internals` at bottom for test-only access).
 
+// ─── SendQuote column list — shared by Section 2 branches ──────────────────
+//
+// Extracted to a constant so adding a column to the handler's read surface
+// becomes a single-place edit. Avoids the silent-drift failure mode where
+// one branch of the quote_id/human_id lookup gets updated and the other
+// doesn't. All callers of this constant run the query against
+// chiefos_quotes q JOIN chiefos_quote_versions v ON v.id = q.current_version_id.
+const LOAD_QUOTE_COLUMNS = `
+  q.id             AS quote_id,
+  q.human_id,
+  q.status,
+  q.job_id,
+  q.current_version_id,
+  q.created_at     AS header_created_at,
+  q.customer_id,
+  v.id             AS version_id,
+  v.version_no,
+  v.currency,
+  v.total_cents,
+  v.customer_snapshot,
+  v.tenant_snapshot,
+  v.issued_at
+`;
+
 // ─── SendQuote schemas (§14 / §22) ──────────────────────────────────────────
 //
 // Second new-idiom handler in the Quote spine. Operates on an existing
@@ -827,6 +851,78 @@ function buildQuoteReturnShape({
   };
 }
 
+// ─── SendQuote Section 2: loadDraftQuote ───────────────────────────────────
+//
+// SELECTs an existing draft quote scoped to (tenant_id, owner_id). Returns
+// a bag of fields SendQuote's downstream steps consume: header id, current
+// version id, version_no, totals, customer + tenant snapshots.
+//
+// Three error surfaces (§17.18 naming, surfaced as CIL_INTEGRITY_ERROR
+// envelope via outer catch):
+//   - QUOTE_NOT_FOUND_OR_CROSS_OWNER — unified per §17.17 addendum 3
+//     (not found / wrong owner / wrong tenant all collapse into one
+//     error to prevent information disclosure about which quote IDs
+//     exist across scopes).
+//   - QUOTE_NOT_DRAFT — quote exists in scope but status ≠ 'draft'.
+//     SendQuote operates only on drafts. Already-sent quotes use
+//     ReissueQuote; signed/locked quotes can't be re-sent.
+//
+// Two branches (quote_id UUID vs. human_id string); Zod's QuoteRefInputZ
+// refine enforces exactly-one input. Branch A scopes by (id, tenant, owner);
+// Branch B scopes by (human_id, tenant, owner). human_id is tenant-unique
+// per chiefos_quotes_human_id_unique; owner_id predicate is
+// belt-and-suspenders (matches the CLAUDE.md §3 "every UPDATE includes
+// tenant+owner" pattern for SELECTs too).
+//
+// Returns CURRENT version state via JOIN through current_version_id — same
+// principle as §17.10 clarification. If the quote was created at v1, then
+// edited to v2 via EditDraft, SendQuote sends v2.
+
+async function loadDraftQuote(client, { tenantId, ownerId, quoteRef }) {
+  let rows;
+  if (quoteRef.quote_id) {
+    const result = await client.query(
+      `SELECT ${LOAD_QUOTE_COLUMNS}
+         FROM public.chiefos_quotes q
+         JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+        WHERE q.id = $1 AND q.tenant_id = $2 AND q.owner_id = $3
+        LIMIT 1`,
+      [quoteRef.quote_id, tenantId, ownerId]
+    );
+    rows = result.rows;
+  } else {
+    // human_id branch — human_id is tenant-unique per
+    // chiefos_quotes_human_id_unique (tenant_id, human_id).
+    const result = await client.query(
+      `SELECT ${LOAD_QUOTE_COLUMNS}
+         FROM public.chiefos_quotes q
+         JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+        WHERE q.human_id = $1 AND q.tenant_id = $2 AND q.owner_id = $3
+        LIMIT 1`,
+      [quoteRef.human_id, tenantId, ownerId]
+    );
+    rows = result.rows;
+  }
+
+  if (rows.length === 0) {
+    throw new CilIntegrityError({
+      code: 'QUOTE_NOT_FOUND_OR_CROSS_OWNER',
+      message: 'Quote lookup failed',
+      hint: 'quote_ref does not match a quote in this tenant+owner scope, or quote does not exist',
+    });
+  }
+
+  const row = rows[0];
+  if (row.status !== 'draft') {
+    throw new CilIntegrityError({
+      code: 'QUOTE_NOT_DRAFT',
+      message: `Cannot send quote in '${row.status}' status`,
+      hint: "SendQuote operates on draft quotes only; for an already-sent quote use ReissueQuote",
+    });
+  }
+  return row;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1117,6 +1213,8 @@ module.exports = {
     // SendQuote schemas (Section 1)
     SendQuoteCILZ,
     QuoteRefInputZ,
+    // SendQuote Section 2
+    loadDraftQuote,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

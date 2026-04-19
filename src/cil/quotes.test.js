@@ -1484,7 +1484,7 @@ describe('handleCreateQuote — Section 7: Zod rejection (unit, no DB)', () => {
 // SendQuote — Section 1: Zod schemas (unit, no DB)
 // ═══════════════════════════════════════════════════════════════════════════
 
-const { SendQuoteCILZ, QuoteRefInputZ } = _internals;
+const { SendQuoteCILZ, QuoteRefInputZ, loadDraftQuote } = _internals;
 
 describe('SendQuote — Section 1: Zod schemas', () => {
   const baseSendCil = {
@@ -1531,5 +1531,168 @@ describe('SendQuote — Section 1: Zod schemas', () => {
       recipient_email: 'darlene@example.com',
       recipient_name: 'Darlene MacDonald',
     }).success).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SendQuote — Section 2: loadDraftQuote (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('SendQuote — Section 2: loadDraftQuote (integration)', () => {
+  let pool;
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  /**
+   * Seed a complete draft quote end-to-end: preconditions + header +
+   * version + pointer swing. Returns { pre, header, version } for tests
+   * to assert against. All inside the caller's BEGIN/ROLLBACK transaction.
+   */
+  async function seedDraftQuote(client, pre) {
+    const {
+      insertQuoteHeader, insertQuoteVersion, setQuoteCurrentVersion,
+      composeTenantSnapshot,
+    } = _internals;
+    const header = await insertQuoteHeader(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await insertQuoteVersion(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'Seeded Project', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: composeTenantSnapshot(pre.tenantId),
+    });
+    await setQuoteCurrentVersion(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    return { header, version };
+  }
+
+  test('Branch A: quote_id resolves returns current version state', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedDraftQuote(client, pre);
+
+      const row = await loadDraftQuote(client, {
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        quoteRef: { quote_id: header.id },
+      });
+
+      expect(row.quote_id).toBe(header.id);
+      expect(row.version_id).toBe(version.id);
+      expect(row.status).toBe('draft');
+      expect(row.current_version_id).toBe(version.id);
+      expect(row.human_id).toBe(pre.humanId);
+      expect(row.version_no).toBe(1);
+      expect(row.currency).toBe('CAD');
+      expect(Number(row.total_cents)).toBe(1130);
+      expect(row.customer_snapshot).toEqual({
+        name: pre.customer.name, email: pre.customer.email,
+      });
+      expect(row.tenant_snapshot).toMatchObject({
+        legal_name: expect.any(String),
+        brand_name: expect.any(String),
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Branch B: human_id resolves within tenant scope', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedDraftQuote(client, pre);
+
+      const row = await loadDraftQuote(client, {
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        quoteRef: { human_id: pre.humanId },
+      });
+
+      expect(row.quote_id).toBe(header.id);
+      expect(row.version_id).toBe(version.id);
+      expect(row.human_id).toBe(pre.humanId);
+      expect(row.status).toBe('draft');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Cross-owner lookup throws QUOTE_NOT_FOUND_OR_CROSS_OWNER', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const preA = await setupQuotePreconditions(client);
+      const { header } = await seedDraftQuote(client, preA);
+
+      // Seed a second user in the same tenant.
+      const preB = await setupQuotePreconditions(client, {
+        tenantId: preA.tenantId,
+      });
+
+      // Attempt to load preA's quote as ownerB.
+      await expect(
+        loadDraftQuote(client, {
+          tenantId: preA.tenantId,
+          ownerId: preB.ownerId,
+          quoteRef: { quote_id: header.id },
+        })
+      ).rejects.toMatchObject({
+        code: 'QUOTE_NOT_FOUND_OR_CROSS_OWNER',
+        hint: expect.stringContaining('tenant+owner scope'),
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Already-sent quote throws QUOTE_NOT_DRAFT (hint points at ReissueQuote)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedDraftQuote(client, pre);
+
+      // Flip to 'sent' to exercise the state check.
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status = 'sent', updated_at = NOW()
+          WHERE id = $1`,
+        [header.id]
+      );
+
+      await expect(
+        loadDraftQuote(client, {
+          tenantId: pre.tenantId,
+          ownerId: pre.ownerId,
+          quoteRef: { quote_id: header.id },
+        })
+      ).rejects.toMatchObject({
+        code: 'QUOTE_NOT_DRAFT',
+        message: expect.stringContaining("'sent'"),
+        hint: expect.stringContaining('ReissueQuote'),
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
   });
 });

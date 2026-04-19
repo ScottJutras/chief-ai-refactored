@@ -1479,3 +1479,57 @@ describe('handleCreateQuote — Section 7: Zod rejection (unit, no DB)', () => {
     expect(result.error.message).toMatch(/customer_id|name|customer/i);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SendQuote — Section 1: Zod schemas (unit, no DB)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const { SendQuoteCILZ, QuoteRefInputZ } = _internals;
+
+describe('SendQuote — Section 1: Zod schemas', () => {
+  const baseSendCil = {
+    cil_version: '1.0',
+    type: 'SendQuote',
+    tenant_id: MISSION_TENANT_UUID,
+    source: 'whatsapp',
+    source_msg_id: 'test-send-zod-1',
+    actor: { actor_id: '12345', role: 'owner' },
+    occurred_at: '2026-04-19T12:00:00.000Z',
+    job: null,
+    needs_job_resolution: false,
+    quote_ref: { quote_id: '8430c4be-bcfd-44e7-b4e4-3603783d6b69' },
+  };
+
+  test('QuoteRefInputZ: accepts quote_id OR human_id; rejects neither', () => {
+    expect(QuoteRefInputZ.safeParse({ quote_id: '8430c4be-bcfd-44e7-b4e4-3603783d6b69' }).success).toBe(true);
+    expect(QuoteRefInputZ.safeParse({ human_id: 'QT-2026-04-19-0001' }).success).toBe(true);
+    expect(QuoteRefInputZ.safeParse({}).success).toBe(false);
+    // quote_id type check — accepts UUID only
+    expect(QuoteRefInputZ.safeParse({ quote_id: 'not-a-uuid' }).success).toBe(false);
+  });
+
+  test('SendQuoteCILZ: minimum-valid payload parses; rejects upload source + missing quote_ref + bad recipient_email', () => {
+    // Happy path — quote_id ref only
+    expect(SendQuoteCILZ.safeParse(baseSendCil).success).toBe(true);
+
+    // G1 narrowing: upload source rejected (inherits CreateQuote's decision)
+    expect(SendQuoteCILZ.safeParse({ ...baseSendCil, source: 'upload' }).success).toBe(false);
+
+    // Missing quote_ref → fail
+    const { quote_ref: _omitted, ...noRef } = baseSendCil;
+    expect(SendQuoteCILZ.safeParse(noRef).success).toBe(false);
+
+    // Optional recipient_email rejects malformed
+    expect(SendQuoteCILZ.safeParse({
+      ...baseSendCil,
+      recipient_email: 'not-an-email',
+    }).success).toBe(false);
+
+    // Optional recipient_email/name accepted when valid
+    expect(SendQuoteCILZ.safeParse({
+      ...baseSendCil,
+      recipient_email: 'darlene@example.com',
+      recipient_name: 'Darlene MacDonald',
+    }).success).toBe(true);
+  });
+});

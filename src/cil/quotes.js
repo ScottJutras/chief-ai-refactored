@@ -191,6 +191,42 @@ const CreateQuoteCILZ = BaseCILZ.extend({
 // avoid per-call function recreation. Not exported on the public surface
 // (see `_internals` at bottom for test-only access).
 
+// ─── SendQuote schemas (§14 / §22) ──────────────────────────────────────────
+//
+// Second new-idiom handler in the Quote spine. Operates on an existing
+// draft quote: creates chiefos_quote_share_tokens row (§14), flips quote
+// status draft→sent, emits lifecycle.sent (inside txn) + notification.sent
+// or notification.failed (post-commit). Reuses every §17 principle
+// validated by CreateQuote.
+
+// QuoteRefInputZ — either/or reference to an existing quote. Tenant scope
+// supplied separately at the CIL root (tenant_id); owner scope comes from
+// ctx.owner_id at handler time. Per §17.17 addendum 3, cross-tenant or
+// cross-owner lookups surface as unified QUOTE_NOT_FOUND_OR_CROSS_OWNER.
+const QuoteRefInputZ = z.object({
+  quote_id: UUIDZ.optional(),
+  human_id: z.string().min(1).optional(),
+}).refine(
+  (r) => !!r.quote_id || !!r.human_id,
+  'quote_ref must include quote_id or human_id'
+);
+
+// SendQuoteCILZ — extends BaseCILZ with SendQuote-specific fields. No
+// plan gate per G6 (sending is follow-through to creation; §19 gates
+// creation transitively gate sending). Source narrowed to ['whatsapp','web']
+// matching CreateQuote per §20 G1 addendum.
+const SendQuoteCILZ = BaseCILZ.extend({
+  type: z.literal('SendQuote'),
+  source: z.enum(['whatsapp', 'web']),
+  quote_ref: QuoteRefInputZ,
+  // Optional recipient overrides. customer_snapshot on the quote version is
+  // the canonical "who the quote is for"; share_token.recipient_address is
+  // tactical "who we sent this transmission to" (§14.2). An override here
+  // does NOT rewrite the customer snapshot — only the share-token row.
+  recipient_email: z.string().email().optional(),
+  recipient_name: z.string().min(1).optional(),
+});
+
 // ─── Section 1: resolveOrCreateCustomer ─────────────────────────────────────
 
 async function resolveOrCreateCustomer(client, tenantId, customerInput) {
@@ -1078,6 +1114,9 @@ module.exports = {
     emitLifecycleVersionCreated,
     lookupPriorQuote,
     buildQuoteReturnShape,
+    // SendQuote schemas (Section 1)
+    SendQuoteCILZ,
+    QuoteRefInputZ,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

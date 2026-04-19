@@ -2029,6 +2029,28 @@ Do not lift payload fields into ctx — it creates two sources of truth
 and invites drift. Applies to every new-idiom handler, not just
 CreateQuote.
 
+**§17.17 addendum 3 (2026-04-19) — unified not-found-or-wrong-scope
+errors.** Lookups against tenant-scoped or owner-scoped identifiers
+return identical errors for "does not exist" and "exists but belongs
+to a different scope." No information disclosure about which
+identifiers exist across scopes. Specific internal code describes the
+condition; envelope code stays `CIL_INTEGRITY_ERROR`; hint conveys
+the combined condition. Same principle as share-token 404
+unification (§14).
+
+Applied in CreateQuote:
+
+- Branch A customer lookup (§20 Q1): unified
+  `CUSTOMER_NOT_FOUND_OR_CROSS_TENANT` for Section 1's
+  customer_id-by-tenant query.
+- Branch A job lookup (§20 Q2): unified
+  `JOB_NOT_FOUND_OR_CROSS_OWNER` for Section 2's
+  job_id-by-owner query.
+
+Principle applies to every future handler doing tenant- or
+owner-scoped lookups. Probing for "does this ID exist in my scope?"
+is not a permitted observational path.
+
 **§17.17 addendum 2 (2026-04-20) — required ctx preflight before Zod
 validation.** New-idiom handlers preflight required `ctx` fields
 before Zod validation. Missing `ctx.owner_id` returns

@@ -19,7 +19,7 @@ try { require('dotenv').config(); } catch (_) { /* dotenv optional at runtime */
 const { _internals } = require('./quotes');
 const { CilIntegrityError } = require('./utils');
 
-const { resolveOrCreateCustomer } = _internals;
+const { resolveOrCreateCustomer, resolveOrCreateJob } = _internals;
 
 const hasDb = Boolean(
   process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.SUPABASE_DB_URL
@@ -61,9 +61,9 @@ describeIfDb('handleCreateQuote — Section 1: customer resolution (integration)
     tenantB = r.rows[1]?.id || null;
   });
 
-  afterAll(async () => {
-    if (pool && pool.end) await pool.end().catch(() => {});
-  });
+  // No afterAll pool.end() — services/postgres.js exports a shared singleton
+  // pool; ending it here would break subsequent describe blocks that reuse it.
+  // Jest --forceExit handles process-level cleanup.
 
   test('Branch B: inline-only input creates a fresh customer row', async () => {
     const client = await pool.connect();
@@ -184,14 +184,235 @@ describeIfDb('handleCreateQuote — Section 1: customer resolution (integration)
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Section 2: job resolution (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('handleCreateQuote — Section 2: job resolution (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool || null;
+    if (!pool || !pool.connect) {
+      const { Pool } = require('pg');
+      pool = new Pool({
+        connectionString:
+          process.env.DATABASE_URL ||
+          process.env.POSTGRES_URL ||
+          process.env.SUPABASE_DB_URL,
+        ssl: { rejectUnauthorized: false },
+      });
+    }
+  });
+
+  // No afterAll pool.end() — services/postgres.js exports a shared singleton
+  // pool; ending it here would break subsequent describe blocks that reuse it.
+  // Jest --forceExit handles process-level cleanup.
+
+  // public.jobs.owner_id has FK → public.users(user_id). Each test seeds a
+  // throwaway user inside its BEGIN/ROLLBACK scope so jobs inserts don't
+  // violate the FK. public.users requires user_id + created_at (NOT NULL,
+  // no default); all other columns have defaults or are nullable.
+  async function seedThrowawayUser(client, userId) {
+    await client.query(
+      `INSERT INTO public.users (user_id, created_at) VALUES ($1, NOW())`,
+      [userId]
+    );
+  }
+
+  test('Branch A: job_id matching owner returns existing id', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Seed a throwaway job for an arbitrary test owner.
+      const ownerId = '99999990001';
+      await seedThrowawayUser(client, ownerId);
+      const seed = await client.query(
+        `INSERT INTO public.jobs
+           (owner_id, job_no, job_name, name, active, start_date, status, created_at, updated_at)
+         VALUES ($1, 1, 'Test Job A', 'Test Job A', true, NOW(), 'active', NOW(), NOW())
+         RETURNING id`,
+        [ownerId]
+      );
+      const seededId = seed.rows[0].id;
+
+      const result = await resolveOrCreateJob(client, ownerId, { job_id: seededId });
+      expect(result).toBe(seededId);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Branch A: cross-owner job_id throws CilIntegrityError (JOB_NOT_FOUND_OR_CROSS_OWNER)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const ownerA = '99999990002';
+      const ownerB = '99999990003';
+      await seedThrowawayUser(client, ownerA);
+      await seedThrowawayUser(client, ownerB);
+      const seed = await client.query(
+        `INSERT INTO public.jobs
+           (owner_id, job_no, job_name, name, active, start_date, status, created_at, updated_at)
+         VALUES ($1, 1, 'Owner A Job', 'Owner A Job', true, NOW(), 'active', NOW(), NOW())
+         RETURNING id`,
+        [ownerA]
+      );
+      const seededId = seed.rows[0].id;
+
+      // Lookup seededId as ownerB.
+      await expect(
+        resolveOrCreateJob(client, ownerB, { job_id: seededId })
+      ).rejects.toThrow(CilIntegrityError);
+
+      await expect(
+        resolveOrCreateJob(client, ownerB, { job_id: seededId })
+      ).rejects.toMatchObject({
+        code: 'JOB_NOT_FOUND_OR_CROSS_OWNER',
+        hint: 'job_id does not exist, belongs to a different owner, or is deleted',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Branch A: soft-deleted job fails closed (deleted_at filter)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const ownerId = '99999990004';
+      await seedThrowawayUser(client, ownerId);
+      const seed = await client.query(
+        `INSERT INTO public.jobs
+           (owner_id, job_no, job_name, name, active, start_date, status, created_at, updated_at, deleted_at)
+         VALUES ($1, 1, 'Deleted Job', 'Deleted Job', false, NOW(), 'active', NOW(), NOW(), NOW())
+         RETURNING id`,
+        [ownerId]
+      );
+      const seededId = seed.rows[0].id;
+
+      await expect(
+        resolveOrCreateJob(client, ownerId, { job_id: seededId })
+      ).rejects.toMatchObject({ code: 'JOB_NOT_FOUND_OR_CROSS_OWNER' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Branch B: job_name found returns existing id without creating', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const ownerId = '99999990005';
+      await seedThrowawayUser(client, ownerId);
+      const seed = await client.query(
+        `INSERT INTO public.jobs
+           (owner_id, job_no, job_name, name, active, start_date, status, created_at, updated_at)
+         VALUES ($1, 42, 'Kitchen Reno', 'Kitchen Reno', true, NOW(), 'active', NOW(), NOW())
+         RETURNING id`,
+        [ownerId]
+      );
+      const seededId = seed.rows[0].id;
+
+      // Case-insensitive match on the existing name.
+      const result = await resolveOrCreateJob(client, ownerId, {
+        job_name: 'kitchen reno',
+        create_if_missing: true, // ignored because found
+      });
+
+      expect(result).toBe(seededId);
+
+      // Verify no new row created.
+      const count = await client.query(
+        `SELECT COUNT(*)::int AS n FROM public.jobs WHERE owner_id = $1`,
+        [ownerId]
+      );
+      expect(count.rows[0].n).toBe(1);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Branch B: create_if_missing=true with unknown name creates new jobs row', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const ownerId = '99999990006';
+      await seedThrowawayUser(client, ownerId);
+
+      const result = await resolveOrCreateJob(client, ownerId, {
+        job_name: 'Bathroom Reno',
+        create_if_missing: true,
+      });
+
+      expect(typeof result).toBe('number');
+      expect(result).toBeGreaterThan(0);
+
+      const row = await client.query(
+        `SELECT id, owner_id, job_no, job_name, name, active, status, source_msg_id, deleted_at
+           FROM public.jobs WHERE id = $1`,
+        [result]
+      );
+      expect(row.rows[0]).toMatchObject({
+        owner_id: ownerId,
+        job_name: 'Bathroom Reno',
+        name: 'Bathroom Reno',
+        active: true,
+        status: 'active',
+        source_msg_id: null,   // §20 addendum — no source_msg_id on create
+        deleted_at: null,
+      });
+      expect(row.rows[0].job_no).toBeGreaterThan(0);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Branch B: job_name not found AND create_if_missing=false throws JOB_NOT_FOUND', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const ownerId = '99999990007';
+
+      await expect(
+        resolveOrCreateJob(client, ownerId, {
+          job_name: 'Nonexistent Job',
+          create_if_missing: false,
+        })
+      ).rejects.toThrow(CilIntegrityError);
+
+      await expect(
+        resolveOrCreateJob(client, ownerId, {
+          job_name: 'Nonexistent Job',
+          // create_if_missing omitted → falsy → same path
+        })
+      ).rejects.toMatchObject({
+        code: 'JOB_NOT_FOUND',
+        hint: 'Set create_if_missing: true on the job ref, or pass an existing job_id',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Remaining scenarios from session brief — todos until their sections land.
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('handleCreateQuote — remaining coverage (todos)', () => {
-  // Section 2 (job resolution)
-  it.todo('Job resolution via JobRef create_if_missing creates new jobs row in transaction');
-  it.todo('Job resolution: cross-owner job_id throws CilIntegrityError');
-
   // Section 3 (totals + human_id format)
   it.todo('human_id format matches QT-YYYY-MMDD-NNNN derived from occurred_at');
   it.todo('Counter increments: second CreateQuote in same tenant yields NNNN=0002');

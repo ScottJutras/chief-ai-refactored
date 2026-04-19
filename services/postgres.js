@@ -5195,6 +5195,7 @@ module.exports = {
   topExpenseCategoriesByRange,
   withTenantAllocLock,
   allocateNextDocCounter,
+  allocateNextJobNo,
   getActorMemory,
   patchActorMemory,
   getJobProfitByRange,

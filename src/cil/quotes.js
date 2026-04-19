@@ -3,7 +3,7 @@
 //
 // SECTION STATUS (as of this commit):
 //   Section 1 (customer resolution): IMPLEMENTED
-//   Section 2 (job resolution): TODO
+//   Section 2 (job resolution): IMPLEMENTED
 //   Section 3 (human_id + totals + snapshots): TODO
 //   Section 4 (header + version + line items INSERTs): TODO
 //   Section 5 (current_version_id UPDATE): TODO
@@ -179,16 +179,18 @@ const CreateQuoteCILZ = BaseCILZ.extend({
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SECTION 1 HELPER — resolveOrCreateCustomer
+// SECTION HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Runs INSIDE the caller's transaction (takes a pg client). Throws
-// CilIntegrityError on cross-tenant or not-found UUID; caller's outer catch
-// routes to CIL_INTEGRITY_ERROR envelope via classifyCilError.
+// All section helpers run INSIDE the caller's transaction (take a pg client).
+// Throw CilIntegrityError on semantic failures; caller's outer catch routes
+// to CIL_INTEGRITY_ERROR envelope via classifyCilError.
 //
 // Module-scope (not nested in handleCreateQuote) for readability and to
 // avoid per-call function recreation. Not exported on the public surface
 // (see `_internals` at bottom for test-only access).
+
+// ─── Section 1: resolveOrCreateCustomer ─────────────────────────────────────
 
 async function resolveOrCreateCustomer(client, tenantId, customerInput) {
   if (customerInput.customer_id) {
@@ -233,6 +235,92 @@ async function resolveOrCreateCustomer(client, tenantId, customerInput) {
     ]
   );
   return rows[0];
+}
+
+// ─── Section 2: resolveOrCreateJob ──────────────────────────────────────────
+
+async function resolveOrCreateJob(client, ownerId, jobInput) {
+  if (jobInput.job_id) {
+    // Branch A: integer link — verify existence, owner membership, not deleted.
+    //
+    // Cross-owner and not-found produce identical error by design per
+    // §17.17 addendum 3 — no information disclosure about integer job IDs
+    // across owners. Same no-info-disclosure principle as Section 1's
+    // cross-tenant customer lookup and §14 share-token 404 unification.
+    // Soft-deleted rows also fail closed (creating a quote against a
+    // deleted job is a product-level bug; the soft-delete was intentional).
+    const { rows } = await client.query(
+      `SELECT id FROM public.jobs
+        WHERE id = $1
+          AND owner_id = $2
+          AND deleted_at IS NULL`,
+      [jobInput.job_id, ownerId]
+    );
+    if (rows.length === 0) {
+      throw new CilIntegrityError({
+        code: 'JOB_NOT_FOUND_OR_CROSS_OWNER',
+        message: 'Job lookup failed',
+        hint: 'job_id does not exist, belongs to a different owner, or is deleted',
+      });
+    }
+    return rows[0].id;
+  }
+
+  // Branch B: name-based find-or-create.
+  //
+  // Inline find-or-create SQL — cannot call pg.ensureJobByName because it
+  // wraps its own withClient (would nest transactions and break atomicity).
+  //
+  // Schema carries both `name` and `job_name` columns from legacy drift.
+  // Write both, read both, keep them synchronized. Future: migration to
+  // collapse into one column is possible but out of scope here.
+  const jobName = String(jobInput.job_name).trim();
+
+  // ORDER BY id ASC + LIMIT 1: deterministic earliest-created wins if legacy
+  // drift produced multiple matching rows. New writes keep name+job_name in
+  // sync, but prior data may not — guard with explicit ordering.
+  const found = await client.query(
+    `SELECT id FROM public.jobs
+      WHERE owner_id = $1
+        AND (lower(name) = lower($2) OR lower(job_name) = lower($2))
+        AND deleted_at IS NULL
+      ORDER BY id ASC
+      LIMIT 1`,
+    [ownerId, jobName]
+  );
+  if (found.rows.length > 0) return found.rows[0].id;
+
+  // Not found. create_if_missing gated at Zod schema's JobRef refinement;
+  // here we respect the caller's explicit opt-in (or absence thereof).
+  if (!jobInput.create_if_missing) {
+    throw new CilIntegrityError({
+      code: 'JOB_NOT_FOUND',
+      message: `No existing job matches name: ${jobName}`,
+      hint: 'Set create_if_missing: true on the job ref, or pass an existing job_id',
+    });
+  }
+
+  // Allocate per-owner job_no via existing pg helper (takes client — safe
+  // inside txn). §17.13: operational entities keep per-owner counters via
+  // allocateNextJobNo; quote/invoice use per-tenant allocateNextDocCounter.
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  const nextNo = await pg.allocateNextJobNo(ownerId, client);
+
+  // INSERT job WITHOUT source_msg_id per §20 addendum: idempotency for
+  // CreateQuote retries happens at the quote layer via
+  // chiefos_quotes_source_msg_unique. On retry, the find-step above returns
+  // the existing job before this INSERT runs. Orphan job rows impossible:
+  // if the quote INSERT rolls back, this INSERT rolls back with it (same
+  // transaction).
+  const ins = await client.query(
+    `INSERT INTO public.jobs
+       (owner_id, job_no, job_name, name, active, start_date, status, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, true, NOW(), 'active', NOW(), NOW())
+     RETURNING id`,
+    [ownerId, nextNo, jobName, jobName]
+  );
+  return ins.rows[0].id;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -307,10 +395,12 @@ async function handleCreateQuote(rawCil, ctx) {
         data.customer
       );
 
-      // ─── ii. Resolve or create job (§20 Q2) ─── TODO Section 2 ──────────
-      // const resolvedJobId = await resolveOrCreateJob(
-      //   client, ctx.owner_id, data.job
-      // );
+      // ─── ii. Resolve or create job (§20 Q2) ─── IMPLEMENTED ─────────────
+      const resolvedJobId = await resolveOrCreateJob(
+        client,
+        ctx.owner_id,
+        data.job
+      );
 
       // ─── iii. Compute totals server-side (§20 Q5) ─── TODO Section 3 ────
       // const totals = computeTotalsServerSide(data.line_items, data.tax_rate_bps);
@@ -357,11 +447,11 @@ async function handleCreateQuote(rawCil, ctx) {
       // not invoke handleCreateQuote end-to-end yet.
       return {
         customer: resolvedCustomer,
+        job_id: resolvedJobId,
         // Placeholders — filled as sections land:
         // quote_id: undefined,
         // version_id: undefined,
         // human_id: undefined,
-        // job_id: undefined,
         // total_cents: undefined,
         // created_at: undefined,
       };
@@ -438,6 +528,7 @@ module.exports = {
   // emerges, hoist to a dedicated module rather than expand this surface.
   _internals: {
     resolveOrCreateCustomer,
+    resolveOrCreateJob,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

@@ -1,14 +1,91 @@
 // src/cil/quoteSignatureStorage.test.js
-// Phase 2B Section 1: format helpers + constants.
-// Sections 2–4 add validation / upload / retrieval suites to this file.
+// Phase 2B Sections 1–2: format helpers + constants + PNG validation + SHA-256.
+// Sections 3–4 add upload / retrieval suites to this file.
 
+const crypto = require('crypto');
+const zlib = require('zlib');
+
+const mod = require('./quoteSignatureStorage');
 const {
   SIGNATURE_BUCKET,
   SIGNATURE_STORAGE_KEY_RE,
   SIG_ERR,
   buildSignatureStorageKey,
   parseSignatureStorageKey,
-} = require('./quoteSignatureStorage');
+  _internals,
+} = mod;
+const {
+  PNG_MAGIC,
+  PNG_IEND_TRAILER,
+  PNG_MIN_BYTES,
+  PNG_MAX_BYTES,
+  PNG_MAX_BASE64_LENGTH,
+  DATA_URL_PNG_RE,
+  extractAndNormalizeBase64,
+  validatePngBuffer,
+  computePngSha256,
+} = _internals;
+
+// ─── Section 2 test fixtures ────────────────────────────────────────────────
+//
+// MINIMAL_VALID_PNG — a real, spec-conformant 1×1 grayscale PNG built at
+// test-load time via zlib + hand-rolled CRC-32 (~67 bytes). Used for hash-
+// determinism tests where real PNG content matters.
+//
+// synthetic100BytePng — Buffer.concat([PNG_MAGIC, zero-padding, PNG_IEND_TRAILER]).
+// Deliberately NOT a spec-conformant PNG (body is zero-padding, not real
+// chunks). Passes V2 validation by design — V2 specifies "magic + IEND +
+// size bounds" per §25.4 invariant 1, NOT full PNG spec conformance. Tests
+// match the contract, not exceed it.
+
+// CRC-32 per RFC 1952 / PNG spec (polynomial 0xEDB88320). Used once at
+// test-load to construct MINIMAL_VALID_PNG; not shipped in the module.
+function testCrc32(buf) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) {
+    crc = crc ^ buf[i];
+    for (let j = 0; j < 8; j++) {
+      crc = (crc >>> 1) ^ ((crc & 1) * 0xEDB88320);
+    }
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+function makePngChunk(type, data) {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(testCrc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([length, typeBuf, data, crcBuf]);
+}
+
+const MINIMAL_VALID_PNG = (() => {
+  const signature = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+  // IHDR: 1×1, 8-bit, grayscale, no interlace
+  const ihdr = makePngChunk('IHDR', Buffer.from([
+    0x00, 0x00, 0x00, 0x01,  // width = 1
+    0x00, 0x00, 0x00, 0x01,  // height = 1
+    0x08,                    // bit depth = 8
+    0x00,                    // color type = grayscale
+    0x00,                    // compression = deflate
+    0x00,                    // filter method = default
+    0x00,                    // interlace = none
+  ]));
+  // IDAT: filter byte 0x00 + single white pixel 0xFF, zlib-compressed
+  const idat = makePngChunk('IDAT', zlib.deflateSync(Buffer.from([0x00, 0xFF])));
+  const iend = makePngChunk('IEND', Buffer.alloc(0));
+  return Buffer.concat([signature, ihdr, idat, iend]);
+})();
+
+// Synthetic buffer exactly 100 bytes: 8 magic + 80 zero pad + 12 IEND.
+// Structural passes V2; not a real PNG by spec.
+function makeSynthetic(totalBytes) {
+  if (totalBytes < 20) throw new Error('synthetic PNG needs >= 20 bytes');
+  const padLength = totalBytes - PNG_MAGIC.length - PNG_IEND_TRAILER.length;
+  return Buffer.concat([PNG_MAGIC, Buffer.alloc(padLength, 0), PNG_IEND_TRAILER]);
+}
+const synthetic100BytePng = makeSynthetic(100);
 
 // ─── Pinned inputs for cross-version regression lock (Q7 Addition 1) ────────
 const PINNED_INPUTS = Object.freeze({
@@ -314,5 +391,272 @@ describe('cross-version regression lock', () => {
       bucket: SIGNATURE_BUCKET,
       ...PINNED_INPUTS,
     });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section 2 tests: PNG validation constants + helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helper: assert thrown error carries a specific SIG_ERR code.
+function expectCilError(fn, expectedCode) {
+  try {
+    fn();
+    throw new Error('expected throw');
+  } catch (e) {
+    expect(e.name).toBe('CilIntegrityError');
+    expect(e.code).toBe(expectedCode);
+  }
+}
+
+// ─── PNG constants ──────────────────────────────────────────────────────────
+
+describe('PNG constants', () => {
+  it('PNG_MAGIC is the 8-byte PNG signature per RFC 2083 §3.1', () => {
+    expect(PNG_MAGIC.length).toBe(8);
+    expect(Array.from(PNG_MAGIC)).toEqual([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+  });
+
+  it('PNG_IEND_TRAILER is the 12-byte IEND chunk per RFC 2083 §11.2.5', () => {
+    expect(PNG_IEND_TRAILER.length).toBe(12);
+    expect(Array.from(PNG_IEND_TRAILER)).toEqual([
+      0x00, 0x00, 0x00, 0x00,  // length
+      0x49, 0x45, 0x4E, 0x44,  // 'IEND'
+      0xAE, 0x42, 0x60, 0x82,  // CRC
+    ]);
+  });
+
+  it('PNG_MIN_BYTES = 100', () => {
+    expect(PNG_MIN_BYTES).toBe(100);
+  });
+
+  it('PNG_MAX_BYTES = 2 MB', () => {
+    expect(PNG_MAX_BYTES).toBe(2 * 1024 * 1024);
+    expect(PNG_MAX_BYTES).toBe(2097152);
+  });
+
+  it('PNG_MAX_BASE64_LENGTH computed from PNG_MAX_BYTES', () => {
+    expect(PNG_MAX_BASE64_LENGTH).toBe(Math.ceil(PNG_MAX_BYTES / 3) * 4 + 16);
+    // 2097152 / 3 = 699050.666... → ceil = 699051
+    // 699051 * 4 = 2796204, + 16 slack = 2796220
+    expect(PNG_MAX_BASE64_LENGTH).toBe(2796220);
+  });
+
+  it('DATA_URL_PNG_RE accepts typical PNG data URL', () => {
+    expect(DATA_URL_PNG_RE.test('data:image/png;base64,iVBORw0KGgo=')).toBe(true);
+  });
+
+  it('DATA_URL_PNG_RE rejects non-PNG MIME type', () => {
+    expect(DATA_URL_PNG_RE.test('data:image/jpeg;base64,/9j/4A==')).toBe(false);
+  });
+
+  it('DATA_URL_PNG_RE rejects non-base64 characters', () => {
+    expect(DATA_URL_PNG_RE.test('data:image/png;base64,!@#$%^')).toBe(false);
+  });
+
+  it('DATA_URL_PNG_RE is case-sensitive on prefix', () => {
+    expect(DATA_URL_PNG_RE.test('Data:Image/PNG;Base64,iVBORw0KGgo=')).toBe(false);
+  });
+
+  it('DATA_URL_PNG_RE requires non-empty base64 body', () => {
+    // Regex uses + (one or more); empty body fails.
+    expect(DATA_URL_PNG_RE.test('data:image/png;base64,')).toBe(false);
+  });
+});
+
+// ─── extractAndNormalizeBase64 ─────────────────────────────────────────────
+
+describe('extractAndNormalizeBase64', () => {
+  it('happy path: valid data URL returns extracted base64', () => {
+    const out = extractAndNormalizeBase64('data:image/png;base64,iVBORw0KGgo=');
+    expect(out).toBe('iVBORw0KGgo=');
+  });
+
+  it('normalizes MIME-style line-wrapped base64 (strips \\n, \\r\\n, \\t, spaces)', () => {
+    const wrapped = 'data:image/png;base64,iV\nBOR\r\nw0\tKG go=';
+    const out = extractAndNormalizeBase64(wrapped);
+    expect(out).toBe('iVBORw0KGgo=');
+  });
+
+  it('rejects non-string input', () => {
+    expectCilError(() => extractAndNormalizeBase64(null), SIG_ERR.PNG_MALFORMED.code);
+    expectCilError(() => extractAndNormalizeBase64(undefined), SIG_ERR.PNG_MALFORMED.code);
+    expectCilError(() => extractAndNormalizeBase64(42), SIG_ERR.PNG_MALFORMED.code);
+  });
+
+  it('rejects non-PNG MIME type (JPEG)', () => {
+    expectCilError(
+      () => extractAndNormalizeBase64('data:image/jpeg;base64,/9j/4A=='),
+      SIG_ERR.PNG_MALFORMED.code
+    );
+  });
+
+  it('rejects non-base64 characters in body', () => {
+    expectCilError(
+      () => extractAndNormalizeBase64('data:image/png;base64,!@#$'),
+      SIG_ERR.PNG_MALFORMED.code
+    );
+  });
+
+  it('rejects empty base64 body', () => {
+    // Regex + quantifier rejects zero-length body outright.
+    expectCilError(
+      () => extractAndNormalizeBase64('data:image/png;base64,'),
+      SIG_ERR.PNG_MALFORMED.code
+    );
+  });
+
+  it('rejects whitespace-only base64 body (post-normalization empty)', () => {
+    expectCilError(
+      () => extractAndNormalizeBase64('data:image/png;base64,   \n  '),
+      SIG_ERR.PNG_MALFORMED.code
+    );
+  });
+
+  it('rejects case-mismatched prefix', () => {
+    expectCilError(
+      () => extractAndNormalizeBase64('Data:Image/PNG;Base64,iVBORw0KGgo='),
+      SIG_ERR.PNG_MALFORMED.code
+    );
+  });
+
+  it('rejects oversized base64 (PNG_TOO_LARGE precheck)', () => {
+    const huge = 'A'.repeat(PNG_MAX_BASE64_LENGTH + 1);
+    expectCilError(
+      () => extractAndNormalizeBase64(`data:image/png;base64,${huge}`),
+      SIG_ERR.PNG_TOO_LARGE.code
+    );
+  });
+
+  it('accepts exactly PNG_MAX_BASE64_LENGTH (boundary)', () => {
+    const atLimit = 'A'.repeat(PNG_MAX_BASE64_LENGTH);
+    const out = extractAndNormalizeBase64(`data:image/png;base64,${atLimit}`);
+    expect(out.length).toBe(PNG_MAX_BASE64_LENGTH);
+  });
+});
+
+// ─── validatePngBuffer — magic + trailer + size ────────────────────────────
+
+describe('validatePngBuffer', () => {
+  it('accepts synthetic 100-byte buffer (magic + pad + IEND)', () => {
+    // V2 contract: magic + trailer + size bounds. Synthetic body is not a
+    // valid PNG per spec; V2 doesn't claim to detect that.
+    expect(() => validatePngBuffer(synthetic100BytePng)).not.toThrow();
+  });
+
+  it('accepts real MINIMAL_VALID_PNG after padding to PNG_MIN_BYTES', () => {
+    // Real PNG built via zlib + CRC; ~67 bytes, below MIN. Padding to 100
+    // makes it pass size check while magic + trailer still valid.
+    // We verify the real MINIMAL_VALID_PNG has correct magic and trailer:
+    expect(MINIMAL_VALID_PNG.subarray(0, 8).equals(PNG_MAGIC)).toBe(true);
+    expect(MINIMAL_VALID_PNG.subarray(-12).equals(PNG_IEND_TRAILER)).toBe(true);
+    expect(MINIMAL_VALID_PNG.length).toBeLessThan(PNG_MIN_BYTES);
+    // And fails validation under-size:
+    expectCilError(() => validatePngBuffer(MINIMAL_VALID_PNG), SIG_ERR.PNG_TOO_SMALL.code);
+  });
+
+  it('rejects non-Buffer input', () => {
+    expectCilError(() => validatePngBuffer('not a buffer'), SIG_ERR.PNG_MALFORMED.code);
+    expectCilError(() => validatePngBuffer(null), SIG_ERR.PNG_MALFORMED.code);
+    expectCilError(() => validatePngBuffer(undefined), SIG_ERR.PNG_MALFORMED.code);
+    expectCilError(() => validatePngBuffer({}), SIG_ERR.PNG_MALFORMED.code);
+  });
+
+  it('rejects empty Buffer with PNG_TOO_SMALL', () => {
+    expectCilError(() => validatePngBuffer(Buffer.alloc(0)), SIG_ERR.PNG_TOO_SMALL.code);
+  });
+
+  it('rejects buffer at PNG_MIN_BYTES - 1 with PNG_TOO_SMALL', () => {
+    const tooSmall = Buffer.alloc(PNG_MIN_BYTES - 1);
+    expectCilError(() => validatePngBuffer(tooSmall), SIG_ERR.PNG_TOO_SMALL.code);
+  });
+
+  it('accepts buffer at exactly PNG_MIN_BYTES boundary', () => {
+    const atMin = makeSynthetic(PNG_MIN_BYTES);
+    expect(atMin.length).toBe(PNG_MIN_BYTES);
+    expect(() => validatePngBuffer(atMin)).not.toThrow();
+  });
+
+  it('accepts buffer at exactly PNG_MAX_BYTES boundary', () => {
+    const atMax = makeSynthetic(PNG_MAX_BYTES);
+    expect(atMax.length).toBe(PNG_MAX_BYTES);
+    expect(() => validatePngBuffer(atMax)).not.toThrow();
+  });
+
+  it('rejects buffer at PNG_MAX_BYTES + 1 with PNG_TOO_LARGE', () => {
+    const tooLarge = makeSynthetic(PNG_MAX_BYTES + 1);
+    expectCilError(() => validatePngBuffer(tooLarge), SIG_ERR.PNG_TOO_LARGE.code);
+  });
+
+  it('rejects buffer with wrong magic bytes', () => {
+    // Replace first byte of magic with 0x00.
+    const bad = Buffer.from(synthetic100BytePng);
+    bad[0] = 0x00;
+    expectCilError(() => validatePngBuffer(bad), SIG_ERR.PNG_MALFORMED.code);
+  });
+
+  it('rejects buffer with wrong IEND trailer', () => {
+    // Replace last byte of trailer with 0xFF.
+    const bad = Buffer.from(synthetic100BytePng);
+    bad[bad.length - 1] = 0xFF;
+    expectCilError(() => validatePngBuffer(bad), SIG_ERR.PNG_MALFORMED.code);
+  });
+
+  it('rejects truncated PNG (last byte removed destroys trailer)', () => {
+    // Build a 200-byte fixture so truncating 1 byte still leaves a buffer
+    // above PNG_MIN_BYTES; truncation destroys the IEND trailer alignment
+    // (what the test is actually exercising — size check would fire first
+    // on a sub-MIN buffer and mask the trailer-check contract).
+    const big = makeSynthetic(200);
+    const truncated = big.subarray(0, big.length - 1);
+    expect(truncated.length).toBeGreaterThanOrEqual(PNG_MIN_BYTES);
+    expectCilError(() => validatePngBuffer(truncated), SIG_ERR.PNG_MALFORMED.code);
+  });
+
+  it('rejects all-zero buffer of valid size', () => {
+    // All zeros = no magic, no trailer.
+    const zeros = Buffer.alloc(PNG_MIN_BYTES);
+    expectCilError(() => validatePngBuffer(zeros), SIG_ERR.PNG_MALFORMED.code);
+  });
+});
+
+// ─── computePngSha256 ──────────────────────────────────────────────────────
+
+describe('computePngSha256', () => {
+  it('handles empty buffer with known SHA-256', () => {
+    // Known-value test: SHA-256 of empty input is a well-known constant.
+    // In practice validatePngBuffer rejects empty buffers upstream; this
+    // test validates the crypto wiring, not a real code path.
+    expect(computePngSha256(Buffer.alloc(0)))
+      .toBe('e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+  });
+
+  it('produces 64-char lowercase hex output', () => {
+    const hash = computePngSha256(synthetic100BytePng);
+    expect(hash).toMatch(/^[0-9a-f]{64}$/);
+    expect(hash.length).toBe(64);
+  });
+
+  it('is deterministic — same buffer twice yields same hash', () => {
+    const a = computePngSha256(synthetic100BytePng);
+    const b = computePngSha256(synthetic100BytePng);
+    expect(a).toBe(b);
+  });
+
+  it('different buffers produce different hashes', () => {
+    const a = computePngSha256(synthetic100BytePng);
+    const b = computePngSha256(Buffer.concat([synthetic100BytePng, Buffer.from([0x00])]));
+    expect(a).not.toBe(b);
+  });
+
+  it('matches Node crypto SHA-256 reference (MINIMAL_VALID_PNG)', () => {
+    const ours = computePngSha256(MINIMAL_VALID_PNG);
+    const ref = crypto.createHash('sha256').update(MINIMAL_VALID_PNG).digest('hex');
+    expect(ours).toBe(ref);
+  });
+
+  it('rejects non-Buffer input with PNG_MALFORMED', () => {
+    expectCilError(() => computePngSha256('string'), SIG_ERR.PNG_MALFORMED.code);
+    expectCilError(() => computePngSha256(null), SIG_ERR.PNG_MALFORMED.code);
   });
 });

@@ -81,12 +81,15 @@ migration context.
     per-owner `allocateNextJobNo` pattern. Asymmetry intentional.
   Section is platform-level infrastructure; future doc-type sessions
   (invoices, change orders, receipts) reference it directly.
-- **§18 — Migration 5: counter table restructure.** Adds `counter_kind`
-  discriminator to `chiefos_tenant_counters`, renames `next_activity_log_no`
-  → `next_no`, restructures PK to `(tenant_id, counter_kind)`. Exposes
-  generic `allocateNextDocCounter(tenantId, counterKind, client)` for new-
-  idiom handlers. Design shape committed 2026-04-18; SQL lands in its own
-  session as a pre-CreateQuote dependency.
+- **§18 — Migration 5: counter table restructure (APPLIED 2026-04-20).**
+  Added `counter_kind` discriminator to `chiefos_tenant_counters`,
+  renamed `next_activity_log_no` → `next_no`, restructured PK to
+  `(tenant_id, counter_kind)`, added format-only CHECK. Replaced
+  `allocateNextActivityLogNo` with generic
+  `allocateNextDocCounter(tenantId, counterKind, client)`. Added
+  `COUNTER_KINDS` frozen constant at `src/cil/counterKinds.js`. 10/10
+  SQL verification tests passed + T12 correctness-fix verification. See
+  §18.1-§18.5 for applied-record details.
 - **§19 — Plan gating for CreateQuote.** Adapts `canUseOCR` pattern.
   New capability block `quotes` (Starter 50/mo, Pro 500/mo, Free
   disabled) at top level of each tier. Denial codes
@@ -1879,57 +1882,199 @@ pre-transaction validation sequence for gated new-idiom handlers.
 
 ---
 
-## §18. Migration 5 design shape — counter table restructure
+## §18. Migration 5 — counter table restructure (APPLIED 2026-04-20)
 
-**Scope.** Generalize `chiefos_tenant_counters` from its current
-single-purpose shape (`tenant_id`, `next_activity_log_no`, `updated_at`) to
-a per-tenant per-kind shape that serves quotes, invoices, change orders,
-and future doc-type counters uniformly per §17.13.
+**Status.** Applied to live Supabase 2026-04-20. 10/10 SQL verification
+tests passed. T12 `bumpTenantCounterToMax` correctness fix verified.
+Service code commit `94516acb` ready to push; push pending user action
+per session policy. Pre-CreateQuote dependency satisfied.
 
-**Shape (not SQL — the SQL lands in its own session per §18's scope).**
+**Scope.** Generalize `chiefos_tenant_counters` from its single-purpose
+shape (`tenant_id`, `next_activity_log_no`, `updated_at`) to per-tenant
+per-kind shape serving quotes, invoices, change orders, receipts, and
+future doc-type counters per §17.13.
 
-Migration 5 will, in a single transaction:
+### Applied schema
 
-1. **Add `counter_kind text NOT NULL DEFAULT 'activity_log'`** to
-   `chiefos_tenant_counters`. The DEFAULT backfills existing rows
-   semantically correctly (they all hold activity-log counters).
-2. **Rename `next_activity_log_no` → `next_no`** (generic). Existing rows'
-   values move with the column.
-3. **Restructure primary key** from `(tenant_id)` to
-   `(tenant_id, counter_kind)`. Allows multiple rows per tenant — one per
-   counter kind.
-4. **Migrate existing rows** to carry `counter_kind='activity_log'`
-   explicitly (the DEFAULT already did this; the migration confirms).
-5. **Update `allocateNextActivityLogNo`** in `services/postgres.js` to
-   query by composite key `(tenant_id, counter_kind='activity_log')`.
-6. **Add generic `allocateNextDocCounter(tenantId, counterKind, client)`**
-   function for new-idiom handlers. Same UPSERT idiom, parameterized on
-   `counter_kind`. Returns the allocated integer. Used by CreateQuote
-   (and later SendQuote, CreateInvoice, etc.).
+Before:
+```
+tenant_id uuid NOT NULL (PK)
+next_activity_log_no int NOT NULL DEFAULT 1
+updated_at timestamptz NOT NULL DEFAULT now()
+```
 
-**Design choices deferred to Migration 5's own session:**
-- In-flight activity-log allocations during migration — drain, pause
-  writes, or rely on the atomic ALTER?
-- Transaction boundaries — single transaction for all five steps or split?
-- Rename-in-place vs add-column-and-drop — rename risks breaking any
-  reader that hasn't been updated; add-and-drop is safer but requires two
-  migrations.
-- Rollback story — if the migration fails mid-way, can we recover
-  cleanly?
+After:
+```
+tenant_id uuid NOT NULL
+counter_kind text NOT NULL           -- no default; format CHECK'd
+next_no int NOT NULL DEFAULT 1        -- renamed from next_activity_log_no
+updated_at timestamptz NOT NULL DEFAULT now()
+PRIMARY KEY (tenant_id, counter_kind)
+FK tenant_id → chiefos_tenants(id) ON DELETE CASCADE
+CHECK counter_kind ~ '^[a-z][a-z_]*$' AND char_length(counter_kind) BETWEEN 1 AND 64
+```
 
-These are real design questions that deserve the same discovery treatment
-migrations 1–4 received. Migration 5 SQL is **not** bundled with any
-subsequent CreateQuote session decisions (C2/C4/C5/C6). It gets its own
-session.
+### §18.1 — Backfill strategy (applied: DEFAULT-then-DROP-DEFAULT)
 
-**Pre-CreateQuote dependency.** CreateQuote's handler uses
-`allocateNextDocCounter(tenantId, 'quote', client)` to generate the NNNN
-portion of `human_id`. Without Migration 5, that function doesn't exist
-and CreateQuote can't generate human_ids in the committed format.
-Migration 5 lands **before** CreateQuote handler code.
+Chose Option (a) `DEFAULT-then-DROP-DEFAULT`. DEFAULT `'activity_log'`
+during ADD COLUMN is a migration-step race-defense convenience; DROP
+DEFAULT immediately after is the principle-enforcing step (future
+INSERTs without explicit `counter_kind` fail loud). Table was empty at
+discovery and at apply time — no actual backfill needed, but the
+DEFAULT pathway was preserved for safety against any race window.
 
-**§18 shape committed 2026-04-18. SQL proposal and verification in a
-separate session.**
+Rejected: explicit UPDATE (same outcome, more verbose), NOT NULL
+DEFAULT forever (silent coercion is the exact failure mode Migration 5
+exists to prevent).
+
+### §18.2 — In-flight allocation safety (applied: no special handling)
+
+Empty table at discovery and apply time; no historical production
+allocations. ALTER TABLE's implicit `ACCESS EXCLUSIVE` covers the
+theoretical concurrent-allocation case via standard Postgres MVCC; no
+explicit `LOCK TABLE` needed, no deploy window required.
+
+Service-deploy ordering handled via Option A (coordinated push):
+migration applies first, service code push immediately after. Brief
+failure window (~2-5 min during Vercel deploy) acceptable on a surface
+with zero historical traffic. Worst-case observable outcome: one
+server-log error on a `createCrewActivityLog` submission during the
+window; self-resolves on the next submission.
+
+**No crew activity log failures observed during the actual apply
+window (zero crew activity logs exist in production — confirmed via
+`chiefos_activity_logs` row count = 0).**
+
+### §18.3 — PK transition (applied: single ALTER TABLE, atomic)
+
+Composite PK `DROP CONSTRAINT + ADD CONSTRAINT` executed atomically in
+one `ALTER TABLE` statement. Backing index auto-managed. FK from
+`chiefos_tenant_counters.tenant_id → chiefos_tenants(id)` survived
+unchanged (FK only cares about `tenant_id` column existence, not PK
+shape). No inbound FKs to the table (confirmed during discovery). No
+secondary indexes to rebuild (only the PK-backing index, which the
+constraint transition auto-replaces).
+
+Composite PK index serves legacy `WHERE tenant_id = $1` queries via
+btree leading-column prefix — no performance regression for the
+updated `allocateNextDocCounter('activity_log')` path.
+
+**Step-order dependency:** Step 3 (PK) must follow Step 1 (ADD COLUMN
+counter_kind); Step 2 (RENAME) can happen in either order relative to
+Step 1. Not a style preference — a real dependency.
+
+### §18.4 — Function update approach (applied: Option B direct migration)
+
+Deleted `allocateNextActivityLogNo` entirely. Added generic
+`allocateNextDocCounter(tenantId, counterKind, client)` as the single
+allocator for every counter_kind. One live caller updated:
+`services/crewControl.js:166` now calls
+`pg.allocateNextDocCounter(tid, COUNTER_KINDS.ACTIVITY_LOG, client)`.
+
+Decisive reason: §17.12 consistency. Per-kind wrapper functions are the
+side-channel convenience layer that §17.12 was written to prevent. With
+5+ future counter kinds, uniform explicit-at-call-site treatment is the
+pattern to establish now.
+
+**`COUNTER_KINDS` constant added at `src/cil/counterKinds.js`**
+(Object.freeze'd; parallels §17.12's frozen-map pattern). Source of
+truth for allowed `counter_kind` values app-side. DB-layer format CHECK
+enforces shape only, not the product-concept whitelist.
+
+**`bumpTenantCounterToMax` correctness fix (required, not cosmetic).**
+Under the new composite PK, `WHERE c.tenant_id = $1::uuid` alone matches
+every counter row for the tenant. Without the `AND c.counter_kind =
+'activity_log'` predicate added in this commit, `bumpTenantCounterToMax`
+would smash the quote/invoice/etc. counter rows for the tenant with the
+activity_log max. Fix applied at `services/crewControl.js:53-54`.
+
+### §18.5 — MCP parse-time limitation (discovered at apply)
+
+**New finding worth documenting for future schema migrations on this
+infrastructure.**
+
+Both `apply_migration` and `execute_sql` MCP tools do parse-time column
+resolution across statement boundaries. The following forms **failed**
+when submitted as a single SQL blob:
+
+- `ALTER TABLE ... ADD COLUMN counter_kind ..., ALTER COLUMN counter_kind DROP DEFAULT` (single ALTER with combined sub-clauses referencing the newly-added column)
+- Multi-statement SQL where later `ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY (tenant_id, counter_kind)` references a column added in an earlier `ALTER TABLE ... ADD COLUMN` within the same submitted blob
+
+Both failed with `42703: column "counter_kind" ... does not exist` at
+parse time, even though standard Postgres transactional DDL supports
+this pattern (ADD COLUMN is visible to subsequent statements in the
+same transaction).
+
+**Workaround applied for Migration 5:** split the DDL into 7 discrete
+`execute_sql` calls, each fully resolving against the committed schema
+state. Atomic per-statement, not atomic across statements.
+
+**Risk accepted:** table had zero rows at apply time, so no partial-
+state data corruption was possible. Each individual ALTER was
+independently valid; if any mid-sequence step had failed, manual
+rollback of prior completed ALTERs would have been trivial against an
+empty table.
+
+**Implication for future migrations on this infrastructure:** migrations
+that add a column AND reference it in the same SQL blob must either
+(a) split into multiple `execute_sql` calls with verification between,
+or (b) explore alternative tooling (direct psql via `supabase db push`
+from CLI, for example). Prior migrations 1–4 did not hit this because
+they created fresh tables rather than referencing newly-added columns
+on existing tables.
+
+The source-of-truth SQL file at
+`migrations/2026_04_20_chiefos_tenant_counters_generalize.sql`
+retains the combined-form SQL with `BEGIN/COMMIT` wrapper — it's
+correct Postgres and would apply cleanly against a psql-compatible
+tooling chain. The split form was purely an MCP workaround.
+
+### Verification
+
+**10/10 SQL tests passed (T1-T10)** via execute_sql with
+`BEGIN; DO ...; ROLLBACK;` pattern:
+- T1: post-migration schema shape correct
+- T2: sequential allocation 1, 2, 3 via UPSERT pattern
+- T3: independent sequences per counter_kind (same tenant)
+- T4: same-session sequential allocation (covered by T2)
+- T5: composite PK rejects duplicate (tenant_id, counter_kind)
+- T6: CHECK rejects empty string
+- T7: CHECK rejects Capitalized / trailing-space / digit-leading
+- T8: CHECK accepts all 5 canonical COUNTER_KINDS values
+  (activity_log, quote, invoice, change_order, receipt)
+- T9: NOT NULL enforced; DEFAULT dropped (explicit NULL and omitted
+  counter_kind both fail)
+- T10: cross-tenant isolation (tenant A's allocations don't affect
+  tenant B's)
+
+**T12 PASSED.** `bumpTenantCounterToMax` correctness-fix SQL pattern
+verified: inserted counter rows with `activity_log` + `quote` kinds
+for one tenant, ran the fixed UPDATE with `AND c.counter_kind =
+'activity_log'` predicate, confirmed only the activity_log row
+changed; quote row's `next_no` stayed at 10.
+
+**T11 pending post-deploy:** runtime check that
+`allocateNextActivityLogNo` is no longer exported from
+`services/postgres.js`. Run after Vercel deploys commit `94516acb`:
+```
+node -e "const pg = require('./services/postgres'); if (pg.allocateNextActivityLogNo !== undefined) process.exit(1); console.log('T11 PASSED');"
+```
+
+### Discovered bug in initial test data (for transparency)
+
+First verification run failed at T2 because my test kind names
+(`test_t2`, `test_t3`, `test_t10`) contained digits, which the format
+CHECK correctly rejects. This was a bug in the test data, not the
+constraint. Re-run with compliant names (`test_alpha`, `test_beta`,
+`test_gamma`) passed cleanly. The CHECK's rejection of digits in kind
+names is correct behavior and is now documented as part of the
+whitelist rationale.
+
+**§18 completed 2026-04-20.** Pre-CreateQuote dependency satisfied.
+Next session: CreateQuote handler code in `src/cil/quotes.js` per
+§20 input contract, §19/§17.16 plan gating, §17.15 return shape,
+§17.17 actor gating, §17.14 write sequence, §17.12 handler
+registration.
 
 ## §19. Plan gating for CreateQuote — adaptation of canUseOCR pattern (2026-04-19)
 

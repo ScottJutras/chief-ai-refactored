@@ -1840,6 +1840,31 @@ CreateQuote (no UPDATE) and EditDraft/ReissueQuote (UPDATE required).
 
 **§17.14 committed 2026-04-18.**
 
+**§17.14 addendum (2026-04-19) — one helper per event kind.** Event
+emission helpers are defined per-kind, not generic. Each kind has
+distinct DB CHECK requirements (payload keys, scope constraints), and
+generic helpers grow into conditional blocks as handlers add kinds.
+Specific helpers enforce scope at the call site (quote-scoped-kind
+helpers never accept `versionId`) and bind payload shape to the kind.
+Naming convention: `emit<EventKind>` matching the event kind in
+PascalCase — e.g., `emitLifecycleCreated`, `emitLifecycleVersionCreated`,
+`emitLifecycleSent`, `emitLifecycleSigned`.
+
+Scaling argument: with 5+ event kinds per handler family (Quote's
+lifecycle.created, sent, customer_viewed, signed, locked, voided) plus
+notification and share_token kinds, a generic `insertQuoteEvent` would
+carry `if (kind === 'X') check Y` conditionals for every
+per-kind payload CHECK. Specific helpers keep each handler's
+emission surface small, type-bound, and reviewable.
+
+**§17.14 correlation_id clarification (2026-04-19).** The
+`chiefos_quote_events.correlation_id` column chains causally-related
+events (e.g., `lifecycle.signed` correlates to the `lifecycle.sent`
+that preceded it) — not CIL trace_ids. Overloading it with
+`ctx.traceId` conflates two unrelated concepts. CreateQuote's events
+have no upstream event cause; handlers pass NULL. The CIL trace_id
+lives in the return envelope's `meta.traceId` per §17.15.
+
 **§17.15 — Return shape for new-idiom handlers.** All new-idiom CIL
 handlers return a success envelope with the shape:
 

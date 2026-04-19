@@ -31,6 +31,8 @@ const {
   insertQuoteVersion,
   insertQuoteLineItems,
   setQuoteCurrentVersion,
+  emitLifecycleCreated,
+  emitLifecycleVersionCreated,
 } = _internals;
 
 const { setupQuotePreconditions, MISSION_TENANT_UUID } = require('./quotes.test.helpers');
@@ -953,6 +955,178 @@ describeIfDb('handleCreateQuote — Section 5: pointer UPDATE (integration)', ()
       // in-transaction tests see equal. Asserting >= covers both.
       expect(new Date(after.rows[0].updated_at).getTime())
         .toBeGreaterThanOrEqual(new Date(updatedAtBefore).getTime());
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section 6: audit events emission (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('handleCreateQuote — Section 6: event emission (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool || null;
+    if (!pool || !pool.connect) {
+      const { Pool } = require('pg');
+      pool = new Pool({
+        connectionString:
+          process.env.DATABASE_URL ||
+          process.env.POSTGRES_URL ||
+          process.env.SUPABASE_DB_URL,
+        ssl: { rejectUnauthorized: false },
+      });
+    }
+  });
+
+  // Test helper: seed a complete header + version scaffold for event tests.
+  async function seedHeaderAndVersion(client, pre) {
+    const header = await insertQuoteHeader(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await insertQuoteVersion(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'T', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: 'T' },
+      tenantSnapshot: { legal_name: 'Test Co', address: 'Test' },
+    });
+    return { header, version };
+  }
+
+  test('emitLifecycleCreated: quote-scoped event with payload={}, quote_version_id=NULL', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedHeaderAndVersion(client, pre);
+
+      await emitLifecycleCreated(client, {
+        quoteId: header.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'whatsapp', actorUserId: pre.ownerId,
+        emittedAt: '2026-04-19T12:00:00.000Z',
+        customerId: pre.customer.id,
+      });
+
+      const rows = await client.query(
+        `SELECT kind, tenant_id, owner_id, quote_id, quote_version_id,
+                actor_source, actor_user_id, customer_id,
+                correlation_id, payload, emitted_at
+           FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.created'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      const ev = rows.rows[0];
+      expect(ev.kind).toBe('lifecycle.created');
+      expect(ev.tenant_id).toBe(pre.tenantId);
+      expect(ev.owner_id).toBe(pre.ownerId);
+      expect(ev.quote_id).toBe(header.id);
+      expect(ev.quote_version_id).toBeNull();        // quote-scoped per schema
+      expect(ev.actor_source).toBe('whatsapp');
+      expect(ev.actor_user_id).toBe(pre.ownerId);
+      expect(ev.customer_id).toBe(pre.customer.id);
+      expect(ev.correlation_id).toBeNull();          // §17.14 clarification
+      expect(ev.payload).toEqual({});                // no per-kind payload CHECK
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('emitLifecycleVersionCreated: version-scoped with payload={version_no:1, trigger_source:initial}', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedHeaderAndVersion(client, pre);
+
+      await emitLifecycleVersionCreated(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'whatsapp', actorUserId: pre.ownerId,
+        emittedAt: '2026-04-19T12:00:00.000Z',
+        customerId: pre.customer.id,
+        versionNo: 1, triggerSource: 'initial',
+      });
+
+      const rows = await client.query(
+        `SELECT kind, quote_version_id, payload
+           FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.version_created'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      const ev = rows.rows[0];
+      expect(ev.kind).toBe('lifecycle.version_created');
+      expect(ev.quote_version_id).toBe(version.id);  // version-scoped per schema
+      expect(ev.payload).toEqual({
+        version_no: 1,
+        trigger_source: 'initial',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('Pair invariant: lifecycle.created + lifecycle.version_created share tenant/owner/quote/actor/customer/emitted_at', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedHeaderAndVersion(client, pre);
+
+      const emittedAt = '2026-04-19T12:00:00.000Z';
+      const sharedArgs = {
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'whatsapp', actorUserId: pre.ownerId,
+        emittedAt, customerId: pre.customer.id,
+      };
+
+      await emitLifecycleCreated(client, { quoteId: header.id, ...sharedArgs });
+      await emitLifecycleVersionCreated(client, {
+        quoteId: header.id, versionId: version.id,
+        ...sharedArgs, versionNo: 1, triggerSource: 'initial',
+      });
+
+      const rows = await client.query(
+        `SELECT kind, tenant_id, owner_id, quote_id, actor_source,
+                actor_user_id, customer_id, emitted_at, global_seq, created_at
+           FROM public.chiefos_quote_events
+          WHERE quote_id = $1
+          ORDER BY global_seq ASC`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(2);
+      const [created, versionCreated] = rows.rows;
+
+      // Pair invariant — every shared field matches
+      for (const field of [
+        'tenant_id', 'owner_id', 'quote_id', 'actor_source',
+        'actor_user_id', 'customer_id',
+      ]) {
+        expect(created[field]).toEqual(versionCreated[field]);
+      }
+      expect(created.emitted_at.getTime()).toBe(versionCreated.emitted_at.getTime());
+
+      // INSERT order: lifecycle.created first, lifecycle.version_created second
+      expect(created.kind).toBe('lifecycle.created');
+      expect(versionCreated.kind).toBe('lifecycle.version_created');
+      expect(Number(created.global_seq)).toBeLessThan(Number(versionCreated.global_seq));
     } finally {
       await client.query('ROLLBACK').catch(() => {});
       client.release();

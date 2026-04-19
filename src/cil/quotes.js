@@ -7,7 +7,7 @@
 //   Section 3 (human_id + totals + snapshots): IMPLEMENTED
 //   Section 4 (header + version + line items INSERTs): IMPLEMENTED
 //   Section 5 (current_version_id UPDATE): IMPLEMENTED
-//   Section 6 (event emission): TODO
+//   Section 6 (event emission): IMPLEMENTED
 //   Section 7 (classifyCilError handler branches + counter increment + return): TODO
 //
 // See docs/QUOTES_SPINE_DECISIONS.md:
@@ -615,6 +615,82 @@ async function setQuoteCurrentVersion(client, { quoteId, versionId, tenantId, ow
   }
 }
 
+// ─── Section 6: audit events emission (§17.14 step 5) ──────────────────────
+//
+// Per §17.14 addendum (2026-04-19): one helper per event kind. Each handler's
+// emission surface is specific, type-bound, and enforces scope at the call
+// site. emit<EventKind> naming convention.
+//
+// CreateQuote emits exactly two events, always as a pair:
+//   1. lifecycle.created        — quote-scoped (quote_version_id NULL)
+//   2. lifecycle.version_created — version-scoped with
+//                                  {version_no, trigger_source} payload
+//
+// Both events share emitted_at (same semantic moment — "quote was created"
+// and "version 1 was created" happen simultaneously at creation time).
+// Chronological queries tiebreak by created_at (INSERT order), which places
+// lifecycle.created before lifecycle.version_created per §17.14 step 5's
+// documented emission order.
+//
+// correlation_id intentionally NULL on both. This column chains causally-
+// related events (e.g., lifecycle.signed → lifecycle.sent); CreateQuote's
+// events have no upstream event cause. The CIL ctx.traceId lives in the
+// return envelope's meta.traceId per §17.15; it is not the same concept
+// as event correlation. See §17.14 correlation_id clarification.
+//
+// emitted_at derives from data.occurred_at (contractor's semantic truth),
+// not server now(). DB CHECK enforces 2024+ and <7d future skew; extreme
+// values surface as integrity error via classifyCilError. Same principle
+// as Section 3 human_id date derivation — the contractor's moment, not the
+// server's.
+
+async function emitLifecycleCreated(client, {
+  quoteId, tenantId, ownerId,
+  actorSource, actorUserId, emittedAt,
+  customerId,
+}) {
+  await client.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id, emitted_at,
+        customer_id, correlation_id, payload
+      )
+      VALUES ($1, $2, $3, NULL,
+              'lifecycle.created', $4, $5, $6,
+              $7, NULL, '{}'::jsonb)`,
+    [
+      tenantId, ownerId, quoteId,
+      actorSource, actorUserId || null, emittedAt,
+      customerId || null,
+    ]
+  );
+}
+
+async function emitLifecycleVersionCreated(client, {
+  quoteId, versionId, tenantId, ownerId,
+  actorSource, actorUserId, emittedAt,
+  customerId, versionNo, triggerSource,
+}) {
+  // Payload structure required by Migration 2's chiefos_qe_payload_version_created
+  // CHECK: must have 'version_no' + 'trigger_source' ∈ {initial,edit,reissue}.
+  const payload = { version_no: versionNo, trigger_source: triggerSource };
+  await client.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id, emitted_at,
+        customer_id, correlation_id, payload
+      )
+      VALUES ($1, $2, $3, $4,
+              'lifecycle.version_created', $5, $6, $7,
+              $8, NULL, $9)`,
+    [
+      tenantId, ownerId, quoteId, versionId,
+      actorSource, actorUserId || null, emittedAt,
+      customerId || null, payload,
+    ]
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -749,9 +825,32 @@ async function handleCreateQuote(rawCil, ctx) {
         ownerId: ctx.owner_id,
       });
 
-      // ─── x. INSERT chiefos_quote_events × 2 ─── TODO Section 6 ──────────
-      // await insertLifecycleCreatedEvent(client, quoteId, ...);
-      // await insertLifecycleVersionCreatedEvent(client, quoteId, versionId, ...);
+      // ─── x. INSERT chiefos_quote_events × 2 (§17.14 step 5) ── IMPLEMENTED
+      // Pair emission: lifecycle.created (quote-scoped) then
+      // lifecycle.version_created (version-scoped with required payload).
+      // INSERT order matters for chronological queries that tiebreak on
+      // created_at when emitted_at is identical.
+      const actorSource = CIL_TO_EVENT_ACTOR_SOURCE[data.source];
+      const actorUserId = data.actor.actor_id;
+      const emittedAt = data.occurred_at;
+      const customerId = resolvedCustomer.id;
+
+      await emitLifecycleCreated(client, {
+        quoteId: header.id,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        actorSource, actorUserId, emittedAt, customerId,
+      });
+
+      await emitLifecycleVersionCreated(client, {
+        quoteId: header.id,
+        versionId: version.id,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        actorSource, actorUserId, emittedAt, customerId,
+        versionNo: 1,
+        triggerSource: 'initial',
+      });
 
       // Temporary partial return while sections ii-x are stubbed. Section 7
       // will populate all fields for the final §17.15 return shape. Section 1
@@ -851,6 +950,8 @@ module.exports = {
     insertQuoteVersion,
     insertQuoteLineItems,
     setQuoteCurrentVersion,
+    emitLifecycleCreated,
+    emitLifecycleVersionCreated,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

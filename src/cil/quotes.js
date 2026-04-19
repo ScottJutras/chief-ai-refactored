@@ -923,6 +923,58 @@ async function loadDraftQuote(client, { tenantId, ownerId, quoteRef }) {
   return row;
 }
 
+// ─── SendQuote Section 3: resolveRecipient ─────────────────────────────────
+//
+// Pure function. Determines who this specific SendQuote transmission goes
+// to. Priority order per §14.2 + G4:
+//
+//   1. Explicit override on the SendQuote CIL payload (parsed.recipient_email
+//      + optional parsed.recipient_name). Contractor can redirect to a
+//      different address than the customer's primary — common when a spouse,
+//      accountant, or different contact is the actual decision-maker.
+//   2. Fallback to customer_snapshot.email + .name captured at CreateQuote
+//      time. Canonical "who the quote is for" per §14.2.
+//   3. Neither → CilIntegrityError RECIPIENT_MISSING.
+//
+// The override does NOT rewrite the quote's customer_snapshot (captured-at-
+// creation and immutable per §6). It only sets the share-token row's
+// recipient_address + recipient_name columns (tactical "who we sent this
+// transmission to" vs. "who the quote is for").
+//
+// Returns { email, name } for downstream share-token INSERT + email dispatch.
+
+function resolveRecipient({ parsedRecipientEmail, parsedRecipientName, customerSnapshot }) {
+  // Branch 1: override present
+  if (parsedRecipientEmail) {
+    return {
+      email: parsedRecipientEmail,
+      // Override name is optional; fall back to customer snapshot name if
+      // only email was overridden. Real-world case: "send this to
+      // scott@acme.com" where scott is a different address but the quote
+      // is still for Darlene — the email header reads "Dear Darlene".
+      //
+      // Empty-string parsedRecipientName falls through to snapshot —
+      // intentional: empty string isn't a valid recipient name.
+      name: parsedRecipientName || (customerSnapshot && customerSnapshot.name),
+    };
+  }
+
+  // Branch 2: customer snapshot fallback
+  if (customerSnapshot && customerSnapshot.email) {
+    return {
+      email: customerSnapshot.email,
+      name: customerSnapshot.name,
+    };
+  }
+
+  // Branch 3: nothing to send to
+  throw new CilIntegrityError({
+    code: 'RECIPIENT_MISSING',
+    message: 'No recipient email available for SendQuote',
+    hint: 'Customer was created without an email; pass recipient_email on the SendQuote CIL payload',
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // handleCreateQuote
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1215,6 +1267,8 @@ module.exports = {
     QuoteRefInputZ,
     // SendQuote Section 2
     loadDraftQuote,
+    // SendQuote Section 3
+    resolveRecipient,
     TenantSnapshotZ,
     CustomerSnapshotZ,
     CreateQuoteJobRefZ,

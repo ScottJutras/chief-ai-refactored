@@ -1484,7 +1484,7 @@ describe('handleCreateQuote — Section 7: Zod rejection (unit, no DB)', () => {
 // SendQuote — Section 1: Zod schemas (unit, no DB)
 // ═══════════════════════════════════════════════════════════════════════════
 
-const { SendQuoteCILZ, QuoteRefInputZ, loadDraftQuote } = _internals;
+const { SendQuoteCILZ, QuoteRefInputZ, loadDraftQuote, resolveRecipient } = _internals;
 
 describe('SendQuote — Section 1: Zod schemas', () => {
   const baseSendCil = {
@@ -1694,5 +1694,70 @@ describeIfDb('SendQuote — Section 2: loadDraftQuote (integration)', () => {
       await client.query('ROLLBACK').catch(() => {});
       client.release();
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SendQuote — Section 3: resolveRecipient (unit, no DB)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('SendQuote — Section 3: resolveRecipient', () => {
+  const snapshot = { name: 'Darlene MacDonald', email: 'darlene@example.com' };
+
+  test('Branch 1: parsed recipient_email override wins; empty override name falls through to snapshot', () => {
+    // Both override fields present
+    expect(resolveRecipient({
+      parsedRecipientEmail: 'scott@acme.com',
+      parsedRecipientName: 'Scott Ibbotson',
+      customerSnapshot: snapshot,
+    })).toEqual({ email: 'scott@acme.com', name: 'Scott Ibbotson' });
+
+    // Override email only — name falls back to snapshot
+    expect(resolveRecipient({
+      parsedRecipientEmail: 'scott@acme.com',
+      parsedRecipientName: undefined,
+      customerSnapshot: snapshot,
+    })).toEqual({ email: 'scott@acme.com', name: 'Darlene MacDonald' });
+
+    // Empty-string override name — intentionally falls through
+    expect(resolveRecipient({
+      parsedRecipientEmail: 'scott@acme.com',
+      parsedRecipientName: '',
+      customerSnapshot: snapshot,
+    })).toEqual({ email: 'scott@acme.com', name: 'Darlene MacDonald' });
+  });
+
+  test('Branch 2: customer_snapshot fallback when no override', () => {
+    expect(resolveRecipient({
+      parsedRecipientEmail: undefined,
+      parsedRecipientName: undefined,
+      customerSnapshot: snapshot,
+    })).toEqual({ email: 'darlene@example.com', name: 'Darlene MacDonald' });
+  });
+
+  test('Branch 3: throws RECIPIENT_MISSING when override absent AND snapshot has no email', () => {
+    // Snapshot missing email (customer was created name-only)
+    expect(() => resolveRecipient({
+      parsedRecipientEmail: undefined,
+      parsedRecipientName: undefined,
+      customerSnapshot: { name: 'Anonymous' },
+    })).toThrow(CilIntegrityError);
+
+    try {
+      resolveRecipient({
+        parsedRecipientEmail: undefined,
+        customerSnapshot: { name: 'Anonymous' },
+      });
+    } catch (err) {
+      expect(err.code).toBe('RECIPIENT_MISSING');
+      expect(err.message).toBe('No recipient email available for SendQuote');
+      expect(err.hint).toMatch(/recipient_email|email/);
+    }
+
+    // Snapshot entirely missing
+    expect(() => resolveRecipient({
+      parsedRecipientEmail: undefined,
+      customerSnapshot: null,
+    })).toThrow(CilIntegrityError);
   });
 });

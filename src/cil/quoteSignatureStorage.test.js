@@ -190,19 +190,27 @@ describe('SIGNATURE_STORAGE_KEY_RE', () => {
 
 describe('SIG_ERR', () => {
   const expected = {
-    SIGNATURE_NOT_FOUND:   { code: 'SIGNATURE_NOT_FOUND',   status: 404 },
-    SHARE_TOKEN_NOT_FOUND: { code: 'SHARE_TOKEN_NOT_FOUND', status: 404 },
-    SHARE_TOKEN_EXPIRED:   { code: 'SHARE_TOKEN_EXPIRED',   status: 410 },
-    SHARE_TOKEN_REVOKED:   { code: 'SHARE_TOKEN_REVOKED',   status: 410 },
-    STORAGE_KEY_MALFORMED: { code: 'STORAGE_KEY_MALFORMED', status: 500 },
-    STORAGE_FETCH_FAILED:  { code: 'STORAGE_FETCH_FAILED',  status: 502 },
-    PNG_MALFORMED:         { code: 'PNG_MALFORMED',         status: 400 },
-    PNG_TOO_LARGE:         { code: 'PNG_TOO_LARGE',         status: 400 },
-    PNG_TOO_SMALL:         { code: 'PNG_TOO_SMALL',         status: 400 },
-    PNG_UPLOAD_FAILED:     { code: 'PNG_UPLOAD_FAILED',     status: 500 },
-    PNG_UPLOAD_DUPLICATE:  { code: 'PNG_UPLOAD_DUPLICATE',  status: 500 },
-    PNG_BUCKET_MISSING:    { code: 'PNG_BUCKET_MISSING',    status: 500 },
-    BAD_REQUEST:           { code: 'BAD_REQUEST',           status: 400 },
+    SIGNATURE_NOT_FOUND:     { code: 'SIGNATURE_NOT_FOUND',     status: 404 },
+    SHARE_TOKEN_NOT_FOUND:   { code: 'SHARE_TOKEN_NOT_FOUND',   status: 404 },
+    SHARE_TOKEN_EXPIRED:     { code: 'SHARE_TOKEN_EXPIRED',     status: 410 },
+    SHARE_TOKEN_REVOKED:     { code: 'SHARE_TOKEN_REVOKED',     status: 410 },
+    STORAGE_KEY_MALFORMED:   { code: 'STORAGE_KEY_MALFORMED',   status: 500 },
+    STORAGE_FETCH_FAILED:    { code: 'STORAGE_FETCH_FAILED',    status: 502 },
+    PNG_MALFORMED:           { code: 'PNG_MALFORMED',           status: 400 },
+    PNG_TOO_LARGE:           { code: 'PNG_TOO_LARGE',           status: 400 },
+    PNG_TOO_SMALL:           { code: 'PNG_TOO_SMALL',           status: 400 },
+    PNG_UPLOAD_FAILED:       { code: 'PNG_UPLOAD_FAILED',       status: 500 },
+    PNG_UPLOAD_DUPLICATE:    { code: 'PNG_UPLOAD_DUPLICATE',    status: 500 },
+    PNG_BUCKET_MISSING:      { code: 'PNG_BUCKET_MISSING',      status: 500 },
+    BAD_REQUEST:             { code: 'BAD_REQUEST',             status: 400 },
+    // SignQuote Section 1 additions
+    SIGNATURE_ALREADY_EXISTS: { code: 'SIGNATURE_ALREADY_EXISTS', status: 409 },
+    QUOTE_NOT_SIGNABLE:       { code: 'QUOTE_NOT_SIGNABLE',       status: 409 },
+    QUOTE_NOT_SENT:           { code: 'QUOTE_NOT_SENT',           status: 409 },
+    QUOTE_ALREADY_SIGNED:     { code: 'QUOTE_ALREADY_SIGNED',     status: 409 },
+    QUOTE_LOCKED:             { code: 'QUOTE_LOCKED',             status: 409 },
+    QUOTE_VOIDED:             { code: 'QUOTE_VOIDED',             status: 410 },
+    VERSION_ALREADY_LOCKED:   { code: 'VERSION_ALREADY_LOCKED',   status: 409 },
   };
 
   it.each(Object.entries(expected))('SIG_ERR.%s has correct code + status', (key, spec) => {

@@ -70,19 +70,29 @@ const SIGNATURE_STORAGE_KEY_RE = new RegExp(
 // no SHARE_TOKEN_MISMATCH entry (collapsed to SHARE_TOKEN_NOT_FOUND per
 // §25.5 addendum 3).
 const SIG_ERR = Object.freeze({
-  SIGNATURE_NOT_FOUND:   Object.freeze({ code: 'SIGNATURE_NOT_FOUND',   status: 404 }),
-  SHARE_TOKEN_NOT_FOUND: Object.freeze({ code: 'SHARE_TOKEN_NOT_FOUND', status: 404 }),
-  SHARE_TOKEN_EXPIRED:   Object.freeze({ code: 'SHARE_TOKEN_EXPIRED',   status: 410 }),
-  SHARE_TOKEN_REVOKED:   Object.freeze({ code: 'SHARE_TOKEN_REVOKED',   status: 410 }),
-  STORAGE_KEY_MALFORMED: Object.freeze({ code: 'STORAGE_KEY_MALFORMED', status: 500 }),
-  STORAGE_FETCH_FAILED:  Object.freeze({ code: 'STORAGE_FETCH_FAILED',  status: 502 }),
-  PNG_MALFORMED:         Object.freeze({ code: 'PNG_MALFORMED',         status: 400 }),
-  PNG_TOO_LARGE:         Object.freeze({ code: 'PNG_TOO_LARGE',         status: 400 }),
-  PNG_TOO_SMALL:         Object.freeze({ code: 'PNG_TOO_SMALL',         status: 400 }),
-  PNG_UPLOAD_FAILED:     Object.freeze({ code: 'PNG_UPLOAD_FAILED',     status: 500 }),
-  PNG_UPLOAD_DUPLICATE:  Object.freeze({ code: 'PNG_UPLOAD_DUPLICATE',  status: 500 }),
-  PNG_BUCKET_MISSING:    Object.freeze({ code: 'PNG_BUCKET_MISSING',    status: 500 }),
-  BAD_REQUEST:           Object.freeze({ code: 'BAD_REQUEST',           status: 400 }),
+  SIGNATURE_NOT_FOUND:     Object.freeze({ code: 'SIGNATURE_NOT_FOUND',     status: 404 }),
+  SHARE_TOKEN_NOT_FOUND:   Object.freeze({ code: 'SHARE_TOKEN_NOT_FOUND',   status: 404 }),
+  SHARE_TOKEN_EXPIRED:     Object.freeze({ code: 'SHARE_TOKEN_EXPIRED',     status: 410 }),
+  SHARE_TOKEN_REVOKED:     Object.freeze({ code: 'SHARE_TOKEN_REVOKED',     status: 410 }),
+  STORAGE_KEY_MALFORMED:   Object.freeze({ code: 'STORAGE_KEY_MALFORMED',   status: 500 }),
+  STORAGE_FETCH_FAILED:    Object.freeze({ code: 'STORAGE_FETCH_FAILED',    status: 502 }),
+  PNG_MALFORMED:           Object.freeze({ code: 'PNG_MALFORMED',           status: 400 }),
+  PNG_TOO_LARGE:           Object.freeze({ code: 'PNG_TOO_LARGE',           status: 400 }),
+  PNG_TOO_SMALL:           Object.freeze({ code: 'PNG_TOO_SMALL',           status: 400 }),
+  PNG_UPLOAD_FAILED:       Object.freeze({ code: 'PNG_UPLOAD_FAILED',       status: 500 }),
+  PNG_UPLOAD_DUPLICATE:    Object.freeze({ code: 'PNG_UPLOAD_DUPLICATE',    status: 500 }),
+  PNG_BUCKET_MISSING:      Object.freeze({ code: 'PNG_BUCKET_MISSING',      status: 500 }),
+  BAD_REQUEST:             Object.freeze({ code: 'BAD_REQUEST',             status: 400 }),
+
+  // SignQuote-specific state-machine rejections (Phase 3 Section 1 per §17.18)
+  // 409 Conflict: retry after state fix. 410 Gone: terminal state; retry won't help.
+  SIGNATURE_ALREADY_EXISTS: Object.freeze({ code: 'SIGNATURE_ALREADY_EXISTS', status: 409 }),
+  QUOTE_NOT_SIGNABLE:       Object.freeze({ code: 'QUOTE_NOT_SIGNABLE',       status: 409 }),
+  QUOTE_NOT_SENT:           Object.freeze({ code: 'QUOTE_NOT_SENT',           status: 409 }),
+  QUOTE_ALREADY_SIGNED:     Object.freeze({ code: 'QUOTE_ALREADY_SIGNED',     status: 409 }),
+  QUOTE_LOCKED:             Object.freeze({ code: 'QUOTE_LOCKED',             status: 409 }),
+  QUOTE_VOIDED:             Object.freeze({ code: 'QUOTE_VOIDED',             status: 410 }),
+  VERSION_ALREADY_LOCKED:   Object.freeze({ code: 'VERSION_ALREADY_LOCKED',   status: 409 }),
 });
 
 // ─── §25.3 Format helpers (pure) ────────────────────────────────────────────

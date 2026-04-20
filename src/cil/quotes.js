@@ -49,6 +49,7 @@ const bs58 = require('bs58').default;
 
 const { z } = require('zod');
 const { BaseCILZ, UUIDZ, CurrencyZ, PhoneE164Z } = require('./schema');
+const { PNG_MAX_BASE64_LENGTH } = require('./quoteSignatureStorage');
 const {
   CilIntegrityError,
   classifyCilError,
@@ -267,6 +268,94 @@ const SendQuoteCILZ = BaseCILZ.extend({
   // does NOT rewrite the customer snapshot — only the share-token row.
   recipient_email: z.string().email().optional(),
   recipient_name: z.string().min(1).optional(),
+});
+
+// ─── SignQuote schemas (§11a / §14.12 / §17.17 / §25) ──────────────────────
+//
+// Third new-idiom handler. First CIL type with actor.role = 'customer'
+// (non-owner actor; bearer-authenticated via share_token_id in the
+// audit chain per §14 customer-actor addendum). Composes Phase 1's
+// computeVersionHash + Phase 2's uploadSignaturePng + §11a name-match
+// rule into the sent/viewed → signed transition.
+//
+// Per §17.20 (Pre-BEGIN external write for strict-immutable INSERT):
+// Migration 4's signature-row strict-immutability forbids post-INSERT
+// UPDATE, so the PNG upload must happen before the transaction opens.
+// Orphan cleanup on transaction failure per §25.6 Direction A.
+//
+// SignQuote dedup constraint: chiefos_qs_source_msg_unique (partial
+// UNIQUE WHERE source_msg_id IS NOT NULL). On retry with same
+// source_msg_id, INSERT hits 23505 → classifyCilError returns
+// idempotent_retry → post-rollback lookup returns prior state.
+
+const SIGN_QUOTE_SOURCE_MSG_CONSTRAINT = 'chiefos_qs_source_msg_unique';
+
+// SignQuoteActorZ — BaseCILZ's ActorZ uses ActorRoleZ enum which
+// doesn't include 'customer'. This local override replaces actor
+// entirely via BaseCILZ.omit({ actor: true }).extend(...).
+//
+// Per §14 customer-actor addendum: role identifies the contractual
+// party, not the auth mechanism. actor_id carries the share_token_id
+// UUID (resolved by route-layer Query 1 before applyCIL); share_token
+// value itself is passed in the top-level CIL field for handler re-
+// validation. Dual carry: actor_id is the audit identity; share_token
+// string is the bearer credential.
+const SignQuoteActorZ = z.object({
+  actor_id: UUIDZ,
+  role: z.literal('customer'),
+});
+
+// Share-token literal regex — mirrors Migration 3's
+// chiefos_qst_token_format CHECK and Phase 2's SHARE_TOKEN_RE.
+// Bitcoin base58 alphabet, exactly 22 chars.
+const ShareTokenStringZ = z.string()
+  .regex(/^[1-9A-HJ-NP-Za-km-z]{22}$/,
+    'share_token must be 22-char base58 (Bitcoin alphabet)');
+
+// PngDataUrlZ — data URL shape gate at Zod layer. Magic-bytes / size
+// bounds are re-validated at upload time via extractAndNormalizeBase64
+// + validatePngBuffer (§25.4 invariant 1 + 2). Zod-side just refuses
+// obvious non-PNG inputs and applies a transport-size ceiling.
+const PngDataUrlZ = z.string()
+  .min(30, 'signature_png_data_url is too short to be a PNG data URL')
+  // Math: 22-char prefix "data:image/png;base64," + PNG_MAX_BASE64_LENGTH
+  // base64 body + 10-char slack. Actual size is re-validated at upload
+  // time via extractAndNormalizeBase64 (§25.4 invariant 2).
+  .max(PNG_MAX_BASE64_LENGTH + 32, 'signature_png_data_url exceeds max size')
+  .refine(
+    (s) => s.startsWith('data:image/png;base64,'),
+    'signature_png_data_url must start with "data:image/png;base64,"'
+  );
+
+// SignQuoteCILZ — extends BaseCILZ with SignQuote-specific fields.
+// Uses .omit({ actor: true }) to replace BaseCILZ's ActorZ (which
+// doesn't know about 'customer' role) with SignQuoteActorZ.
+//
+// Source narrowed to z.literal('web') — only customer-facing path
+// today is public /q/:token. 'portal' may widen in the future when
+// an authenticated customer portal exists; enum widening is cheap.
+//
+// signer_ip + signer_user_agent are intentionally NOT in the Zod
+// schema — those are ctx-sourced from route middleware per DB1 Q4
+// (infrastructure metadata, not customer input).
+const SignQuoteCILZ = BaseCILZ.omit({ actor: true }).extend({
+  type: z.literal('SignQuote'),
+  source: z.literal('web'),
+  actor: SignQuoteActorZ,
+
+  // Bearer credential — 22-char base58. Resolves to quote_version_id
+  // + tenant_id via shared token-resolve helper (Section 3).
+  share_token: ShareTokenStringZ,
+
+  // Typed customer name — compared to share_token.recipient_name via
+  // §11a computeNameMatch. 200-char cap prevents payload bloat; names
+  // rarely exceed 60 in practice.
+  signer_name: z.string().min(1, 'signer_name must be non-empty').max(200),
+
+  // PNG from signature pad, base64-encoded data URL. Structural
+  // validation + SHA-256 + bucket upload happen at upload time
+  // (Phase 2's uploadSignaturePng).
+  signature_png_data_url: PngDataUrlZ,
 });
 
 // ─── Section 1: resolveOrCreateCustomer ─────────────────────────────────────
@@ -2015,6 +2104,12 @@ module.exports = {
     SOURCE_MSG_CONSTRAINT,
     CIL_TO_QUOTE_SOURCE,
     CIL_TO_EVENT_ACTOR_SOURCE,
+    // SignQuote Section 1 (schema + constraint constant)
+    SignQuoteCILZ,
+    SignQuoteActorZ,
+    ShareTokenStringZ,
+    PngDataUrlZ,
+    SIGN_QUOTE_SOURCE_MSG_CONSTRAINT,
   },
 };
 

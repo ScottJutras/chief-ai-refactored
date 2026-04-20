@@ -2734,3 +2734,263 @@ describeIfDb('SendQuote — Section 7: end-to-end integration', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3 Section 1 tests: SignQuoteCILZ schema
+// ═══════════════════════════════════════════════════════════════════════════
+
+const {
+  SignQuoteCILZ,
+  SignQuoteActorZ: _SignQuoteActorZ,
+  ShareTokenStringZ: _ShareTokenStringZ,
+  PngDataUrlZ: _PngDataUrlZ,
+  SIGN_QUOTE_SOURCE_MSG_CONSTRAINT,
+} = _internals;
+const { SIG_ERR } = require('./quoteSignatureStorage');
+
+describe('SignQuote — Section 1: SignQuoteCILZ schema', () => {
+  const VALID_SHARE_TOKEN_UUID = '00000000-c2c2-c2c2-c2c2-000000000005';
+  const VALID_SHARE_TOKEN_STR = 'K5gQbxTdNcN1ZNqmoGtaww'; // 22-char base58 (ceremony token)
+  const VALID_PNG_DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+  function validSignPayload(overrides = {}) {
+    return {
+      cil_version: '1.0',
+      type: 'SignQuote',
+      tenant_id: '00000000-c2c2-c2c2-c2c2-000000000001',
+      source: 'web',
+      source_msg_id: 'test-sign-msg-1',
+      actor: { actor_id: VALID_SHARE_TOKEN_UUID, role: 'customer' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      share_token: VALID_SHARE_TOKEN_STR,
+      signer_name: 'Ceremony Customer',
+      signature_png_data_url: VALID_PNG_DATA_URL,
+      ...overrides,
+    };
+  }
+
+  describe('schema structure', () => {
+    it('valid payload parses cleanly', () => {
+      const result = SignQuoteCILZ.safeParse(validSignPayload());
+      expect(result.success).toBe(true);
+    });
+
+    it('missing type field rejects', () => {
+      const { type: _t, ...bad } = validSignPayload();
+      expect(SignQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('wrong type literal rejects', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload({ type: 'SignQoote' })).success).toBe(false);
+    });
+
+    it('missing source field rejects', () => {
+      const { source: _s, ...bad } = validSignPayload();
+      expect(SignQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+  });
+
+  describe('source field (narrowed to "web" only per DB1 Tightening 2)', () => {
+    it('"web" accepts', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload({ source: 'web' })).success).toBe(true);
+    });
+
+    it('"whatsapp" rejects (not customer-facing)', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload({ source: 'whatsapp' })).success).toBe(false);
+    });
+
+    it('"portal" rejects in Beta (enum widens when authenticated portal ships)', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload({ source: 'portal' })).success).toBe(false);
+    });
+  });
+
+  describe('actor field', () => {
+    it('role: "customer" accepts', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload()).success).toBe(true);
+    });
+
+    it('role: "owner" rejects (proves omit+extend override of BaseCILZ ActorZ)', () => {
+      const payload = validSignPayload({
+        actor: { actor_id: VALID_SHARE_TOKEN_UUID, role: 'owner' },
+      });
+      expect(SignQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+
+    it('role: "anonymous" rejects (not a ChiefOS role)', () => {
+      const payload = validSignPayload({
+        actor: { actor_id: VALID_SHARE_TOKEN_UUID, role: 'anonymous' },
+      });
+      expect(SignQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+
+    it('actor_id non-UUID rejects', () => {
+      const payload = validSignPayload({
+        actor: { actor_id: 'not-a-uuid', role: 'customer' },
+      });
+      expect(SignQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+
+    it('actor missing role field rejects', () => {
+      const payload = validSignPayload({ actor: { actor_id: VALID_SHARE_TOKEN_UUID } });
+      expect(SignQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+
+    it('actor missing actor_id field rejects', () => {
+      const payload = validSignPayload({ actor: { role: 'customer' } });
+      expect(SignQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+  });
+
+  describe('share_token field', () => {
+    it('22-char base58 accepts', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload()).success).toBe(true);
+    });
+
+    it('21-char rejects', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({ share_token: VALID_SHARE_TOKEN_STR.slice(0, 21) })
+      ).success).toBe(false);
+    });
+
+    it('23-char rejects', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({ share_token: VALID_SHARE_TOKEN_STR + 'A' })
+      ).success).toBe(false);
+    });
+
+    it('containing "0" rejects (not in Bitcoin base58 alphabet)', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({ share_token: '0' + VALID_SHARE_TOKEN_STR.slice(1) })
+      ).success).toBe(false);
+    });
+
+    it('empty string rejects', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({ share_token: '' })
+      ).success).toBe(false);
+    });
+  });
+
+  describe('signer_name field', () => {
+    it('non-empty string accepts', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload({ signer_name: 'A' })).success).toBe(true);
+    });
+
+    it('empty string rejects', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload({ signer_name: '' })).success).toBe(false);
+    });
+
+    it('200-char accepts', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({ signer_name: 'A'.repeat(200) })
+      ).success).toBe(true);
+    });
+
+    it('201-char rejects', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({ signer_name: 'A'.repeat(201) })
+      ).success).toBe(false);
+    });
+  });
+
+  describe('signature_png_data_url field', () => {
+    it('valid PNG data URL accepts', () => {
+      expect(SignQuoteCILZ.safeParse(validSignPayload()).success).toBe(true);
+    });
+
+    it('JPEG data URL rejects', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({
+          signature_png_data_url: 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEAYABgAAD',
+        })
+      ).success).toBe(false);
+    });
+
+    it('plain base64 (no data URL prefix) rejects', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({
+          signature_png_data_url: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB',
+        })
+      ).success).toBe(false);
+    });
+
+    it('too-short (<30 chars) rejects', () => {
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({ signature_png_data_url: 'data:image/png;base64,' })
+      ).success).toBe(false);
+    });
+
+    it('oversized (>PNG_MAX_BASE64_LENGTH + 32) rejects', () => {
+      const { PNG_MAX_BASE64_LENGTH } = require('./quoteSignatureStorage');
+      const huge = 'data:image/png;base64,' + 'A'.repeat(PNG_MAX_BASE64_LENGTH + 20);
+      expect(SignQuoteCILZ.safeParse(
+        validSignPayload({ signature_png_data_url: huge })
+      ).success).toBe(false);
+    });
+  });
+
+  describe('required-field completeness', () => {
+    it('missing share_token rejects', () => {
+      const { share_token: _x, ...bad } = validSignPayload();
+      expect(SignQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('missing signer_name rejects', () => {
+      const { signer_name: _x, ...bad } = validSignPayload();
+      expect(SignQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('missing signature_png_data_url rejects', () => {
+      const { signature_png_data_url: _x, ...bad } = validSignPayload();
+      expect(SignQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+  });
+
+  describe('BaseCILZ inheritance', () => {
+    it('missing tenant_id rejects', () => {
+      const { tenant_id: _x, ...bad } = validSignPayload();
+      expect(SignQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('missing source_msg_id rejects', () => {
+      const { source_msg_id: _x, ...bad } = validSignPayload();
+      expect(SignQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+  });
+
+  describe('SIG_ERR SignQuote extensions', () => {
+    const SIGN_QUOTE_CODES = {
+      SIGNATURE_ALREADY_EXISTS: 409,
+      QUOTE_NOT_SIGNABLE:       409,
+      QUOTE_NOT_SENT:           409,
+      QUOTE_ALREADY_SIGNED:     409,
+      QUOTE_LOCKED:             409,
+      QUOTE_VOIDED:             410,
+      VERSION_ALREADY_LOCKED:   409,
+    };
+
+    it.each(Object.entries(SIGN_QUOTE_CODES))(
+      'SIG_ERR.%s has correct code + status',
+      (key, expectedStatus) => {
+        expect(SIG_ERR[key]).toBeDefined();
+        expect(SIG_ERR[key].code).toBe(key);
+        expect(SIG_ERR[key].status).toBe(expectedStatus);
+      }
+    );
+
+    it('SIG_ERR remains deeply frozen after SignQuote additions', () => {
+      'use strict';
+      expect(() => { SIG_ERR.NEW_SIGN_KEY = { code: 'X', status: 999 }; }).toThrow(TypeError);
+      expect(() => { SIG_ERR.QUOTE_LOCKED.status = 999; }).toThrow(TypeError);
+      expect(SIG_ERR.QUOTE_LOCKED.status).toBe(409);
+    });
+  });
+
+  describe('SIGN_QUOTE_SOURCE_MSG_CONSTRAINT constant', () => {
+    it('equals "chiefos_qs_source_msg_unique"', () => {
+      expect(SIGN_QUOTE_SOURCE_MSG_CONSTRAINT).toBe('chiefos_qs_source_msg_unique');
+    });
+  });
+});
+

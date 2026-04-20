@@ -11,6 +11,9 @@ const {
   SIGNATURE_BUCKET,
   SIGNATURE_STORAGE_KEY_RE,
   SIG_ERR,
+  PNG_MIN_BYTES,
+  PNG_MAX_BYTES,
+  PNG_MAX_BASE64_LENGTH,
   buildSignatureStorageKey,
   parseSignatureStorageKey,
   uploadSignaturePng,
@@ -22,9 +25,6 @@ const {
 const {
   PNG_MAGIC,
   PNG_IEND_TRAILER,
-  PNG_MIN_BYTES,
-  PNG_MAX_BYTES,
-  PNG_MAX_BASE64_LENGTH,
   DATA_URL_PNG_RE,
   extractAndNormalizeBase64,
   validatePngBuffer,
@@ -1871,5 +1871,89 @@ describe('migration ↔ app regex byte-identity', () => {
     const match = /signature_png_storage_key\s*~\s*'([^']+)'/.exec(sql);
     const sqlRegex = new RegExp(match[1]);
     expect(sqlRegex.test(PINNED_STORAGE_KEY)).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Section 6 tests: module surface contract (Q7)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('module surface contract (Q7)', () => {
+  // These are the 12 exports Q7 committed to (see docs/QUOTES_SPINE_DECISIONS.md
+  // §25.7 and Phase 2A Q7). Changes to this list require a §25 / Q7 amendment —
+  // not a silent export reorganization. The list is hardcoded here verbatim,
+  // NOT derived from the module's current state, so a future session that
+  // silently adds or removes a top-level export fails this test with a clear
+  // message about the Q7 contract.
+  const Q7_TOP_LEVEL_EXPORTS = [
+    'SIGNATURE_BUCKET',
+    'SIGNATURE_STORAGE_KEY_RE',
+    'PNG_MIN_BYTES',
+    'PNG_MAX_BYTES',
+    'PNG_MAX_BASE64_LENGTH',
+    'SIG_ERR',
+    'buildSignatureStorageKey',
+    'parseSignatureStorageKey',
+    'uploadSignaturePng',
+    'cleanupOrphanPng',
+    'getSignatureForOwner',
+    'getSignatureViaShareToken',
+  ];
+
+  // _internals is allowed to evolve without Q7 amendment (it's the test
+  // surface, not the public API). The check here is "required names are
+  // present", not "exactly these names", to tolerate future additions.
+  const REQUIRED_INTERNALS = [
+    // Section 2
+    'PNG_MAGIC', 'PNG_IEND_TRAILER', 'DATA_URL_PNG_RE',
+    'extractAndNormalizeBase64', 'validatePngBuffer', 'computePngSha256',
+    // Section 3
+    'requireAdmin', 'classifySupabaseUploadError',
+    // Section 4
+    'SIG_LOAD_COLUMNS', 'SIG_TOKEN_RESOLVE_COLUMNS',
+    'UUID_LOWERCASE_RE', 'SHARE_TOKEN_RE',
+    'assertUuid', 'assertOwnerId', 'assertShareToken',
+    'fetchSignatureStream',
+  ];
+
+  it('exports exactly the 12 Q7-planned top-level names', () => {
+    const actualTopLevel = Object.keys(mod).filter((k) => k !== '_internals').sort();
+    expect(actualTopLevel).toEqual([...Q7_TOP_LEVEL_EXPORTS].sort());
+  });
+
+  it('each top-level export resolves to the expected type', () => {
+    // Strings
+    expect(typeof mod.SIGNATURE_BUCKET).toBe('string');
+    // RegExp
+    expect(mod.SIGNATURE_STORAGE_KEY_RE).toBeInstanceOf(RegExp);
+    // Numbers
+    expect(typeof mod.PNG_MIN_BYTES).toBe('number');
+    expect(typeof mod.PNG_MAX_BYTES).toBe('number');
+    expect(typeof mod.PNG_MAX_BASE64_LENGTH).toBe('number');
+    // Frozen object
+    expect(typeof mod.SIG_ERR).toBe('object');
+    expect(Object.isFrozen(mod.SIG_ERR)).toBe(true);
+    // Functions
+    for (const name of [
+      'buildSignatureStorageKey',
+      'parseSignatureStorageKey',
+      'uploadSignaturePng',
+      'cleanupOrphanPng',
+      'getSignatureForOwner',
+      'getSignatureViaShareToken',
+    ]) {
+      expect(typeof mod[name]).toBe('function');
+    }
+  });
+
+  it('_internals includes the expected test-visible helpers', () => {
+    expect(mod._internals).toBeDefined();
+    expect(typeof mod._internals).toBe('object');
+    for (const name of REQUIRED_INTERNALS) {
+      if (mod._internals[name] === undefined) {
+        throw new Error(`_internals missing required name: ${name}`);
+      }
+      expect(mod._internals[name]).toBeDefined();
+    }
   });
 });

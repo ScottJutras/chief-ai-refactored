@@ -20,12 +20,12 @@
 // SIG_ERR. Route handlers map SIG_ERR[err.code].status → HTTP status.
 //
 // Section progression:
-//   Section 1: constants + format helpers        (this commit)
-//   Section 2: PNG validation + SHA-256          (next)
-//   Section 3: upload + orphan cleanup
-//   Section 4: retrieval helpers (portal + public)
-//   Section 5: DB CHECK micro-migration + bucket provisioning
-//   Section 6: module assembly + integration tests
+//   Section 1: constants + format helpers        (eec849bc)
+//   Section 2: PNG validation + SHA-256 helpers  (a11e6bd4)
+//   Section 3: upload + orphan cleanup           (f595fea1)
+//   Section 4: retrieval helpers (portal/public) (545ea54b)
+//   Section 5: DB CHECK migration                (94d12c0e)
+//   Section 6: module surface finalization       (this commit)
 
 const crypto = require('crypto');
 const { Readable } = require('stream');
@@ -835,10 +835,17 @@ async function getSignatureViaShareToken({ signatureId, shareToken, pg, supabase
 // ─── Exports ────────────────────────────────────────────────────────────────
 
 module.exports = {
-  // Constants
+  // Constants (bucket + format regex + error taxonomy)
   SIGNATURE_BUCKET,
   SIGNATURE_STORAGE_KEY_RE,
   SIG_ERR,
+
+  // PNG size constants — top-level per Q7's public-API contract. Consumers
+  // (future portal endpoints, client-facing size-limit documentation) may
+  // want these without reaching into _internals.
+  PNG_MIN_BYTES,
+  PNG_MAX_BYTES,
+  PNG_MAX_BASE64_LENGTH,
 
   // Format helpers (pure)
   buildSignatureStorageKey,
@@ -853,12 +860,9 @@ module.exports = {
   getSignatureViaShareToken,
 
   _internals: {
-    // Section 2: PNG validation + SHA-256 helpers
+    // Section 2: PNG validation + SHA-256 helpers (internal)
     PNG_MAGIC,
     PNG_IEND_TRAILER,
-    PNG_MIN_BYTES,
-    PNG_MAX_BYTES,
-    PNG_MAX_BASE64_LENGTH,
     DATA_URL_PNG_RE,
     extractAndNormalizeBase64,
     validatePngBuffer,

@@ -49,7 +49,12 @@ const bs58 = require('bs58').default;
 
 const { z } = require('zod');
 const { BaseCILZ, UUIDZ, CurrencyZ, PhoneE164Z } = require('./schema');
-const { PNG_MAX_BASE64_LENGTH } = require('./quoteSignatureStorage');
+const {
+  PNG_MAX_BASE64_LENGTH,
+  SIG_ERR,
+  _internals: _qssInternals,
+} = require('./quoteSignatureStorage');
+const { resolveShareTokenByValue } = _qssInternals;
 const {
   CilIntegrityError,
   classifyCilError,
@@ -233,6 +238,318 @@ const LOAD_QUOTE_COLUMNS = `
   v.tenant_snapshot,
   v.issued_at
 `;
+
+// ─── Phase 3 Section 3: SIGN_LOAD_COLUMNS ───────────────────────────────────
+//
+// Full field set for loadSignContext — includes all §4 hash-input fields
+// (required by Phase 1 computeVersionHash) plus identity columns for the
+// handler's return shape. Used by one helper (loadSignContext); could be
+// reused by future signature-time version-load helpers.
+
+const SIGN_LOAD_COLUMNS = `
+  q.id                    AS quote_id,
+  q.human_id,
+  q.status                AS quote_status,
+  q.job_id,
+  q.customer_id,
+  q.current_version_id,
+  q.source                AS quote_source,
+  q.created_at            AS header_created_at,
+  q.updated_at            AS header_updated_at,
+  v.id                    AS version_id,
+  v.version_no,
+  v.status                AS version_status,
+  v.project_title,
+  v.project_scope,
+  v.currency,
+  v.subtotal_cents,
+  v.tax_cents,
+  v.total_cents,
+  v.deposit_cents,
+  v.tax_code,
+  v.tax_rate_bps,
+  v.payment_terms,
+  v.warranty_snapshot,
+  v.clauses_snapshot,
+  v.customer_snapshot,
+  v.tenant_snapshot,
+  v.issued_at             AS version_issued_at,
+  v.sent_at               AS version_sent_at,
+  v.viewed_at             AS version_viewed_at,
+  v.locked_at             AS version_locked_at,
+  v.server_hash           AS version_server_hash
+`;
+
+/**
+ * loadSignContext — SignQuote's pre-transaction context loader.
+ *
+ * Validates share-token + quote + version state BEFORE transaction
+ * opens (per DB3 Q3.1 Option B — upload happens pre-BEGIN; all
+ * validation completes before any external I/O).
+ *
+ * Throws CilIntegrityError for every rejection class. Handler never
+ * sees raw row shapes — only validated context or thrown errors.
+ *
+ * Three queries, all read-only:
+ *   Q1: resolveShareTokenByValue (shared helper — also used by retrieve)
+ *   Q2: quote + version JOIN (scoped to token's version identity)
+ *   Q3: line items (ordered by sort_order, id per §4 canonical sort)
+ *
+ * Supersession check (Decision A): token.quote_version_id must equal
+ * quote.current_version_id AND token.superseded_by_version_id must be
+ * null. Primary check is the current_version_id equality; the
+ * superseded_by check is belt-and-suspenders for future ReissueQuote
+ * handler which will populate that column explicitly. Both fire the
+ * same SHARE_TOKEN_SUPERSEDED error; one is defensive against a future
+ * state.
+ *
+ * Empty line items (Decision C — overridden to reject): a quote that
+ * reaches 'sent' with zero line items has bypassed CreateQuoteCILZ's
+ * min(1) check at some layer. Signing against zero line items would
+ * record a signature over empty state; that's integrity corruption,
+ * not a no-op. Throw CIL_INTEGRITY_ERROR.
+ *
+ * @param {object} params
+ * @param {object} params.pg — pg client or pool (supports .query)
+ * @param {string} params.tenantId — from CIL payload (cross-checked against token)
+ * @param {string} params.shareToken — 22-char base58
+ * @returns {Promise<object>} validated context with camelCase fields
+ * @throws {CilIntegrityError} — specific SIG_ERR codes per rejection class
+ */
+async function loadSignContext({ pg, tenantId, shareToken }) {
+  // ─── Q1: resolve share token ───────────────────────────────────────────
+  const token = await resolveShareTokenByValue(pg, shareToken);
+  if (!token) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code,
+      message: 'Share token not found',
+      hint: 'Token does not match any record',
+    });
+  }
+  if (token.revoked_at) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_REVOKED.code,
+      message: 'Share token revoked',
+      hint: `Revoked at ${new Date(token.revoked_at).toISOString()}`,
+    });
+  }
+  if (new Date(token.absolute_expires_at) <= new Date()) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_EXPIRED.code,
+      message: 'Share token expired',
+      hint: `Expired at ${new Date(token.absolute_expires_at).toISOString()}`,
+    });
+  }
+  // Tenant scope check — unified 404 per §17.17 addendum 3 (no enumeration).
+  if (token.tenant_id !== tenantId) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code,
+      message: 'Share token not found',
+      hint: 'Token does not match tenant scope',
+    });
+  }
+
+  // ─── Q2: quote + version (composite-scoped to token identity) ─────────
+  const { rows: qvRows } = await pg.query(
+    `SELECT ${SIGN_LOAD_COLUMNS}
+       FROM public.chiefos_quote_versions v
+       JOIN public.chiefos_quotes q
+         ON q.id = v.quote_id AND q.tenant_id = v.tenant_id AND q.owner_id = v.owner_id
+      WHERE v.id = $1 AND v.tenant_id = $2 AND v.owner_id = $3
+      LIMIT 1`,
+    [token.quote_version_id, token.tenant_id, token.owner_id]
+  );
+  if (qvRows.length === 0) {
+    // Unreachable under correct composite FK on share_tokens.quote_version_id
+    // → chiefos_quote_versions. If fires, FK drift — integrity error.
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Share token references non-existent version',
+      hint: `token=${token.share_token_id} version=${token.quote_version_id}; FK constraint violation`,
+    });
+  }
+  const qv = qvRows[0];
+
+  // ─── Quote state validation (DB3 Q3.4 explicit switch + default) ──────
+  switch (qv.quote_status) {
+    case 'sent':
+    case 'viewed':
+      break;
+    case 'draft':
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_NOT_SENT.code,
+        message: 'Quote has not been sent',
+        hint: `quote_id=${qv.quote_id} human_id=${qv.human_id}; draft state — customer should not have received a share link`,
+      });
+    case 'signed':
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_ALREADY_SIGNED.code,
+        message: 'Quote has already been signed',
+        hint: `quote_id=${qv.quote_id} human_id=${qv.human_id}; view signed version via the share link's /q/<token> page`,
+      });
+    case 'locked':
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_LOCKED.code,
+        message: 'Quote has been locked',
+        hint: `quote_id=${qv.quote_id} human_id=${qv.human_id}; contact contractor for changes`,
+      });
+    case 'voided':
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_VOIDED.code,
+        message: 'Quote has been voided',
+        hint: `quote_id=${qv.quote_id} human_id=${qv.human_id}; voided quotes cannot be signed`,
+      });
+    default:
+      // Fail-closed: unknown status rejected explicitly per DB3 tightening.
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_NOT_SIGNABLE.code,
+        message: 'Quote state is not signable',
+        hint: `quote_id=${qv.quote_id} unknown_status=${qv.quote_status}`,
+      });
+  }
+
+  // ─── Version state validation ─────────────────────────────────────────
+  if (qv.version_locked_at !== null) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.VERSION_ALREADY_LOCKED.code,
+      message: 'Version is already locked',
+      hint: `version_id=${qv.version_id} locked_at=${qv.version_locked_at}`,
+    });
+  }
+  // Quote/version status disagreement (Decision B with richer hint).
+  if (!['sent', 'viewed'].includes(qv.version_status)) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Quote/version status disagreement',
+      hint: `quote_id=${qv.quote_id} version_id=${qv.version_id} quote.status=${qv.quote_status} version.status=${qv.version_status}; SendQuote atomicity regression or direct DB write`,
+    });
+  }
+
+  // ─── Supersession check (Decision A) ──────────────────────────────────
+  if (token.quote_version_id !== qv.current_version_id) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_SUPERSEDED.code,
+      message: 'Share token points at superseded version',
+      hint: `token_version=${token.quote_version_id} current_version=${qv.current_version_id}; request a new share link`,
+    });
+  }
+  if (token.superseded_by_version_id !== null) {
+    // Belt-and-suspenders: current_version_id check above is the primary
+    // supersession signal. This column will be populated explicitly by
+    // future ReissueQuote; checking both makes the assertion robust
+    // regardless of ordering.
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_SUPERSEDED.code,
+      message: 'Share token has been superseded',
+      hint: `superseded_by_version_id=${token.superseded_by_version_id}; request a new share link`,
+    });
+  }
+
+  // ─── Q3: line items (ordered per §4 canonical sort) ───────────────────
+  const { rows: liRows } = await pg.query(
+    `SELECT id, sort_order, description, category,
+            qty, unit_price_cents, line_subtotal_cents, line_tax_cents,
+            tax_code, catalog_product_id, catalog_snapshot
+       FROM public.chiefos_quote_line_items
+      WHERE quote_version_id = $1 AND tenant_id = $2
+      ORDER BY sort_order ASC, id ASC`,
+    [qv.version_id, token.tenant_id]
+  );
+
+  // Empty line items (Decision C overridden — reject).
+  if (liRows.length === 0) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Quote has no line items',
+      hint: `quote_id=${qv.quote_id} version_id=${qv.version_id}; zero line items should be blocked at CreateQuote CIL schema — investigate upstream corruption`,
+    });
+  }
+
+  // ─── Composed validated context ───────────────────────────────────────
+  return {
+    // Share-token identity
+    shareTokenId: token.share_token_id,
+    shareTokenValue: shareToken,
+    shareTokenOwnerId: token.owner_id,
+    recipientName: token.recipient_name,
+    recipientChannel: token.recipient_channel,
+    recipientAddress: token.recipient_address,
+    absoluteExpiresAt: token.absolute_expires_at,
+    issuedAt: token.issued_at,
+
+    // Quote identity
+    quoteId: qv.quote_id,
+    humanId: qv.human_id,
+    quoteStatus: qv.quote_status,
+    jobId: qv.job_id,
+    customerId: qv.customer_id,
+    currentVersionId: qv.current_version_id,
+    quoteSource: qv.quote_source,
+    headerCreatedAt: qv.header_created_at,
+    headerUpdatedAt: qv.header_updated_at,
+
+    // Version identity (locked_at asserted NULL above)
+    versionId: qv.version_id,
+    versionNo: qv.version_no,
+    versionStatus: qv.version_status,
+
+    // Version fields for hash computation (§4 hash-input fields)
+    projectTitle: qv.project_title,
+    projectScope: qv.project_scope,
+    currency: qv.currency,
+    subtotalCents: qv.subtotal_cents,
+    taxCents: qv.tax_cents,
+    totalCents: qv.total_cents,
+    depositCents: qv.deposit_cents,
+    taxCode: qv.tax_code,
+    taxRateBps: qv.tax_rate_bps,
+    paymentTerms: qv.payment_terms,
+    warrantySnapshot: qv.warranty_snapshot,
+    clausesSnapshot: qv.clauses_snapshot,
+    customerSnapshot: qv.customer_snapshot,
+    tenantSnapshot: qv.tenant_snapshot,
+    versionIssuedAt: qv.version_issued_at,
+    versionSentAt: qv.version_sent_at,
+    versionViewedAt: qv.version_viewed_at,
+
+    // Line items (ordered per §4 canonical sort; min 1 asserted above)
+    lineItems: liRows,
+  };
+}
+
+/**
+ * buildVersionHashInput — maps camelCase SignContext → snake_case
+ * version object expected by Phase 1's computeVersionHash.
+ *
+ * Extracted per Section 3 Flag 1: isolation-testable. If Phase 1 ever
+ * adds a required hash-input field, this helper's test catches the
+ * missing mapping before Section 5's handler ships. Pure function;
+ * one consumer (Section 5 handler).
+ *
+ * @param {object} ctx — output of loadSignContext
+ * @returns {object} version object consumable by computeVersionHash
+ */
+function buildVersionHashInput(ctx) {
+  return {
+    quote_id: ctx.quoteId,
+    human_id: ctx.humanId,
+    version_no: ctx.versionNo,
+    project_title: ctx.projectTitle,
+    project_scope: ctx.projectScope,
+    currency: ctx.currency,
+    subtotal_cents: ctx.subtotalCents,
+    tax_cents: ctx.taxCents,
+    total_cents: ctx.totalCents,
+    deposit_cents: ctx.depositCents,
+    tax_code: ctx.taxCode,
+    tax_rate_bps: ctx.taxRateBps,
+    payment_terms: ctx.paymentTerms,
+    warranty_snapshot: ctx.warrantySnapshot,
+    clauses_snapshot: ctx.clausesSnapshot,
+    customer_snapshot: ctx.customerSnapshot,
+    tenant_snapshot: ctx.tenantSnapshot,
+  };
+}
 
 // ─── SendQuote schemas (§14 / §22) ──────────────────────────────────────────
 //
@@ -2110,6 +2427,10 @@ module.exports = {
     ShareTokenStringZ,
     PngDataUrlZ,
     SIGN_QUOTE_SOURCE_MSG_CONSTRAINT,
+    // SignQuote Section 3 (context loader + hash-input mapper)
+    SIGN_LOAD_COLUMNS,
+    loadSignContext,
+    buildVersionHashInput,
   },
 };
 

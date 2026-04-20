@@ -2994,3 +2994,505 @@ describe('SignQuote — Section 1: SignQuoteCILZ schema', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3 Section 3 tests: loadSignContext + buildVersionHashInput
+// ═══════════════════════════════════════════════════════════════════════════
+
+const {
+  loadSignContext,
+  buildVersionHashInput,
+  SIGN_LOAD_COLUMNS: _SIGN_LOAD_COLUMNS,
+} = _internals;
+
+describe('SignQuote — Section 3: loadSignContext', () => {
+  const CTX_TENANT_ID  = '00000000-c2c2-c2c2-c2c2-000000000001';
+  const CTX_OWNER_ID   = '00000000000';
+  const CTX_QUOTE_ID   = '00000000-c2c2-c2c2-c2c2-000000000002';
+  const CTX_VERSION_ID = '00000000-c2c2-c2c2-c2c2-000000000003';
+  const CTX_TOKEN_ID   = '00000000-c2c2-c2c2-c2c2-000000000005';
+  const CTX_TOKEN_STR  = 'K5gQbxTdNcN1ZNqmoGtaww';
+
+  const FUTURE_EXPIRES_AT = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+  const PAST_EXPIRES_AT   = new Date('2020-01-01T00:00:00Z');
+
+  function makeToken(overrides = {}) {
+    return {
+      share_token_id: CTX_TOKEN_ID,
+      tenant_id: CTX_TENANT_ID,
+      owner_id: CTX_OWNER_ID,
+      quote_version_id: CTX_VERSION_ID,
+      recipient_name: 'Ceremony Customer',
+      recipient_channel: 'email',
+      recipient_address: 'ceremony@invalid.test',
+      absolute_expires_at: FUTURE_EXPIRES_AT,
+      revoked_at: null,
+      superseded_by_version_id: null,
+      issued_at: new Date('2026-04-20T10:00:00Z'),
+      ...overrides,
+    };
+  }
+
+  function makeQuoteVersion(overrides = {}) {
+    return {
+      quote_id: CTX_QUOTE_ID,
+      human_id: 'QT-CEREMONY-2026-04-20-PHASE2C',
+      quote_status: 'sent',
+      job_id: 1257,
+      customer_id: null,
+      current_version_id: CTX_VERSION_ID,
+      quote_source: 'system',
+      header_created_at: new Date('2026-04-20T10:00:00Z'),
+      header_updated_at: new Date('2026-04-20T10:00:00Z'),
+      version_id: CTX_VERSION_ID,
+      version_no: 1,
+      version_status: 'sent',
+      project_title: 'Phase 2C Ceremony',
+      project_scope: null,
+      currency: 'CAD',
+      subtotal_cents: 0,
+      tax_cents: 0,
+      total_cents: 0,
+      deposit_cents: 0,
+      tax_code: null,
+      tax_rate_bps: 0,
+      payment_terms: {},
+      warranty_snapshot: {},
+      clauses_snapshot: {},
+      customer_snapshot: { name: 'Ceremony Customer', email: null, phone_e164: null },
+      tenant_snapshot: { legal_name: 'Phase 2C Ceremony Tenant' },
+      version_issued_at: new Date('2026-04-20T10:00:00Z'),
+      version_sent_at: new Date('2026-04-20T10:00:00Z'),
+      version_viewed_at: null,
+      version_locked_at: null,
+      version_server_hash: null,
+      ...overrides,
+    };
+  }
+
+  function makeLineItem(overrides = {}) {
+    return {
+      id: '00000000-0000-0000-0000-000000000a01',
+      sort_order: 0,
+      description: 'Ceremony item',
+      category: 'other',
+      qty: '1.000',
+      unit_price_cents: 1000,
+      line_subtotal_cents: 1000,
+      line_tax_cents: 0,
+      tax_code: null,
+      catalog_product_id: null,
+      catalog_snapshot: {},
+      ...overrides,
+    };
+  }
+
+  function mockPgWith(queryResults) {
+    let idx = 0;
+    const query = jest.fn().mockImplementation(() => {
+      const r = queryResults[idx++];
+      if (r instanceof Error) return Promise.reject(r);
+      return Promise.resolve(r || { rows: [] });
+    });
+    return { query };
+  }
+
+  async function expectCilError(fn, expectedCode) {
+    try {
+      await fn();
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe(expectedCode);
+    }
+  }
+
+  // ─── Happy path ────────────────────────────────────────────────────────
+  describe('happy path', () => {
+    it('valid token + sent quote + current version + line items → returns context', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion()] },
+        { rows: [makeLineItem()] },
+      ]);
+      const ctx = await loadSignContext({
+        pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR,
+      });
+      expect(ctx.shareTokenId).toBe(CTX_TOKEN_ID);
+      expect(ctx.quoteId).toBe(CTX_QUOTE_ID);
+      expect(ctx.versionId).toBe(CTX_VERSION_ID);
+      expect(ctx.quoteStatus).toBe('sent');
+      expect(ctx.versionStatus).toBe('sent');
+      expect(ctx.lineItems.length).toBe(1);
+    });
+
+    it('viewed quote accepts (same handler flow as sent)', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'viewed', version_status: 'viewed' })] },
+        { rows: [makeLineItem()] },
+      ]);
+      const ctx = await loadSignContext({
+        pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR,
+      });
+      expect(ctx.quoteStatus).toBe('viewed');
+    });
+
+    it('multiple line items returned ordered', async () => {
+      const items = [
+        makeLineItem({ id: 'a1', sort_order: 0 }),
+        makeLineItem({ id: 'a2', sort_order: 1 }),
+        makeLineItem({ id: 'a3', sort_order: 2 }),
+      ];
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion()] },
+        { rows: items },
+      ]);
+      const ctx = await loadSignContext({
+        pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR,
+      });
+      expect(ctx.lineItems.map((l) => l.id)).toEqual(['a1', 'a2', 'a3']);
+    });
+  });
+
+  // ─── Share-token failures ──────────────────────────────────────────────
+  describe('share-token failures', () => {
+    it('token not found → SHARE_TOKEN_NOT_FOUND', async () => {
+      const pg = mockPgWith([{ rows: [] }]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_NOT_FOUND.code
+      );
+    });
+
+    it('token revoked → SHARE_TOKEN_REVOKED', async () => {
+      const pg = mockPgWith([{ rows: [makeToken({ revoked_at: new Date() })] }]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_REVOKED.code
+      );
+    });
+
+    it('token expired → SHARE_TOKEN_EXPIRED', async () => {
+      const pg = mockPgWith([{ rows: [makeToken({ absolute_expires_at: PAST_EXPIRES_AT })] }]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_EXPIRED.code
+      );
+    });
+
+    it('tenant mismatch → SHARE_TOKEN_NOT_FOUND (unified 404)', async () => {
+      const pg = mockPgWith([{ rows: [makeToken({ tenant_id: '11111111-2222-3333-4444-555555555555' })] }]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_NOT_FOUND.code
+      );
+    });
+  });
+
+  // ─── Quote state rejections ────────────────────────────────────────────
+  describe('quote state rejections', () => {
+    it('draft → QUOTE_NOT_SENT', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'draft', version_status: 'draft' })] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.QUOTE_NOT_SENT.code
+      );
+    });
+
+    it('signed → QUOTE_ALREADY_SIGNED', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'signed', version_status: 'signed' })] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.QUOTE_ALREADY_SIGNED.code
+      );
+    });
+
+    it('locked → QUOTE_LOCKED', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'locked', version_status: 'locked' })] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.QUOTE_LOCKED.code
+      );
+    });
+
+    it('voided → QUOTE_VOIDED', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'voided', version_status: 'sent' })] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.QUOTE_VOIDED.code
+      );
+    });
+
+    it('unknown status → QUOTE_NOT_SIGNABLE (default branch)', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'some_future_state' })] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.QUOTE_NOT_SIGNABLE.code
+      );
+    });
+
+    it('quote/version status disagreement → CIL_INTEGRITY_ERROR', async () => {
+      // quote.status=sent accepted by switch; version.status=draft fails the version check.
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ version_status: 'draft' })] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        'CIL_INTEGRITY_ERROR'
+      );
+    });
+  });
+
+  // ─── Version state ─────────────────────────────────────────────────────
+  describe('version state rejections', () => {
+    it('version locked_at set → VERSION_ALREADY_LOCKED', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ version_locked_at: new Date() })] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.VERSION_ALREADY_LOCKED.code
+      );
+    });
+  });
+
+  // ─── Supersession ──────────────────────────────────────────────────────
+  describe('supersession', () => {
+    it('token.quote_version_id != quote.current_version_id → SHARE_TOKEN_SUPERSEDED', async () => {
+      const NEW_VERSION = '00000000-c2c2-c2c2-c2c2-00000000aaaa';
+      const pg = mockPgWith([
+        { rows: [makeToken({ quote_version_id: CTX_VERSION_ID })] },
+        { rows: [makeQuoteVersion({ current_version_id: NEW_VERSION })] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_SUPERSEDED.code
+      );
+    });
+
+    it('token.superseded_by_version_id set → SHARE_TOKEN_SUPERSEDED (belt-and-suspenders)', async () => {
+      const NEW_VERSION = '00000000-c2c2-c2c2-c2c2-00000000bbbb';
+      // current_version_id equals token's version (primary check passes) but
+      // superseded_by is populated (defensive check fires).
+      const pg = mockPgWith([
+        { rows: [makeToken({ superseded_by_version_id: NEW_VERSION })] },
+        { rows: [makeQuoteVersion()] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_SUPERSEDED.code
+      );
+    });
+  });
+
+  // ─── Empty line items (Decision C overridden) ──────────────────────────
+  describe('empty line items (Decision C — reject)', () => {
+    it('zero line items → CIL_INTEGRITY_ERROR', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion()] },
+        { rows: [] },
+      ]);
+      await expectCilError(
+        () => loadSignContext({ pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR }),
+        'CIL_INTEGRITY_ERROR'
+      );
+    });
+  });
+
+  // ─── Query-order short-circuits ────────────────────────────────────────
+  describe('query-order short-circuits', () => {
+    it('Q1 token miss → Q2 and Q3 never called', async () => {
+      const pg = mockPgWith([{ rows: [] }]);
+      await expect(loadSignContext({
+        pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR,
+      })).rejects.toBeDefined();
+      expect(pg.query).toHaveBeenCalledTimes(1);
+    });
+
+    it('Q2 quote state rejection → Q3 never called', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'voided', version_status: 'sent' })] },
+      ]);
+      await expect(loadSignContext({
+        pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR,
+      })).rejects.toBeDefined();
+      expect(pg.query).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ─── Return shape (exact-key-match per Flag 2) ─────────────────────────
+  describe('return shape (Flag 2: exact-key-match)', () => {
+    const EXPECTED_KEYS = [
+      // Share-token identity
+      'shareTokenId', 'shareTokenValue', 'shareTokenOwnerId',
+      'recipientName', 'recipientChannel', 'recipientAddress',
+      'absoluteExpiresAt', 'issuedAt',
+      // Quote identity
+      'quoteId', 'humanId', 'quoteStatus', 'jobId', 'customerId',
+      'currentVersionId', 'quoteSource', 'headerCreatedAt', 'headerUpdatedAt',
+      // Version identity
+      'versionId', 'versionNo', 'versionStatus',
+      // Hash-input fields
+      'projectTitle', 'projectScope', 'currency',
+      'subtotalCents', 'taxCents', 'totalCents', 'depositCents',
+      'taxCode', 'taxRateBps',
+      'paymentTerms', 'warrantySnapshot', 'clausesSnapshot',
+      'customerSnapshot', 'tenantSnapshot',
+      'versionIssuedAt', 'versionSentAt', 'versionViewedAt',
+      // Line items
+      'lineItems',
+    ];
+
+    it('return has exactly the expected camelCase keys', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion()] },
+        { rows: [makeLineItem()] },
+      ]);
+      const ctx = await loadSignContext({
+        pg, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR,
+      });
+      expect(Object.keys(ctx).sort()).toEqual([...EXPECTED_KEYS].sort());
+    });
+
+    it('determinism — same inputs produce same output', async () => {
+      const pg1 = mockPgWith([
+        { rows: [makeToken()] }, { rows: [makeQuoteVersion()] }, { rows: [makeLineItem()] },
+      ]);
+      const pg2 = mockPgWith([
+        { rows: [makeToken()] }, { rows: [makeQuoteVersion()] }, { rows: [makeLineItem()] },
+      ]);
+      const a = await loadSignContext({ pg: pg1, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR });
+      const b = await loadSignContext({ pg: pg2, tenantId: CTX_TENANT_ID, shareToken: CTX_TOKEN_STR });
+      expect(a).toEqual(b);
+    });
+  });
+});
+
+// ─── buildVersionHashInput ─────────────────────────────────────────────────
+
+describe('SignQuote — Section 3: buildVersionHashInput', () => {
+  it('maps camelCase ctx to snake_case hash input with all 17 expected keys', () => {
+    const ctx = {
+      quoteId: 'q1',
+      humanId: 'QT-TEST',
+      versionNo: 2,
+      projectTitle: 'Test Project',
+      projectScope: 'scope text',
+      currency: 'CAD',
+      subtotalCents: 100,
+      taxCents: 13,
+      totalCents: 113,
+      depositCents: 50,
+      taxCode: 'HST_ON',
+      taxRateBps: 1300,
+      paymentTerms: { net: 30 },
+      warrantySnapshot: { workmanship: '1yr' },
+      clausesSnapshot: { limitation: 'text' },
+      customerSnapshot: { name: 'Cust' },
+      tenantSnapshot: { legal_name: 'Tenant' },
+      // Extra fields intentionally present — helper maps only hash-input keys.
+      shareTokenId: 'ignored',
+      lineItems: [],
+    };
+    const out = buildVersionHashInput(ctx);
+    expect(out).toEqual({
+      quote_id: 'q1',
+      human_id: 'QT-TEST',
+      version_no: 2,
+      project_title: 'Test Project',
+      project_scope: 'scope text',
+      currency: 'CAD',
+      subtotal_cents: 100,
+      tax_cents: 13,
+      total_cents: 113,
+      deposit_cents: 50,
+      tax_code: 'HST_ON',
+      tax_rate_bps: 1300,
+      payment_terms: { net: 30 },
+      warranty_snapshot: { workmanship: '1yr' },
+      clauses_snapshot: { limitation: 'text' },
+      customer_snapshot: { name: 'Cust' },
+      tenant_snapshot: { legal_name: 'Tenant' },
+    });
+  });
+
+  it('exact-key-match on output (17 hash-input fields; no extras)', () => {
+    const ctx = {
+      quoteId: 'x', humanId: 'x', versionNo: 1,
+      projectTitle: 'x', projectScope: null, currency: 'CAD',
+      subtotalCents: 0, taxCents: 0, totalCents: 0, depositCents: 0,
+      taxCode: null, taxRateBps: 0,
+      paymentTerms: {}, warrantySnapshot: {}, clausesSnapshot: {},
+      customerSnapshot: {}, tenantSnapshot: {},
+      shareTokenId: 'ignored', lineItems: ['ignored'],
+    };
+    const out = buildVersionHashInput(ctx);
+    expect(Object.keys(out).sort()).toEqual([
+      'clauses_snapshot', 'currency', 'customer_snapshot', 'deposit_cents',
+      'human_id', 'payment_terms', 'project_scope', 'project_title',
+      'quote_id', 'subtotal_cents', 'tax_cents', 'tax_code', 'tax_rate_bps',
+      'tenant_snapshot', 'total_cents', 'version_no', 'warranty_snapshot',
+    ].sort());
+  });
+});
+
+// ─── resolveShareTokenByValue regression (shared helper extracted) ──────────
+
+describe('SignQuote — Section 3: resolveShareTokenByValue', () => {
+  const { resolveShareTokenByValue } = require('./quoteSignatureStorage')._internals;
+  const CTX_TOKEN_STR = 'K5gQbxTdNcN1ZNqmoGtaww';
+
+  it('returns row for valid token', async () => {
+    const tokenRow = {
+      share_token_id: 'st-1',
+      tenant_id: 't-1',
+      owner_id: 'o-1',
+      quote_version_id: 'v-1',
+      recipient_name: 'r',
+      recipient_channel: 'email',
+      recipient_address: 'r@x',
+      absolute_expires_at: new Date(Date.now() + 1000 * 3600),
+      revoked_at: null,
+      superseded_by_version_id: null,
+      issued_at: new Date(),
+    };
+    const pg = { query: jest.fn().mockResolvedValue({ rows: [tokenRow] }) };
+    const out = await resolveShareTokenByValue(pg, CTX_TOKEN_STR);
+    expect(out).toEqual(tokenRow);
+    expect(pg.query).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns null for missing token (does not throw)', async () => {
+    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    const out = await resolveShareTokenByValue(pg, CTX_TOKEN_STR);
+    expect(out).toBeNull();
+  });
+
+  it('query parameter is exactly the shareToken string', async () => {
+    const pg = { query: jest.fn().mockResolvedValue({ rows: [] }) };
+    await resolveShareTokenByValue(pg, CTX_TOKEN_STR);
+    expect(pg.query.mock.calls[0][1]).toEqual([CTX_TOKEN_STR]);
+  });
+});
+

@@ -211,6 +211,8 @@ describe('SIG_ERR', () => {
     QUOTE_LOCKED:             { code: 'QUOTE_LOCKED',             status: 409 },
     QUOTE_VOIDED:             { code: 'QUOTE_VOIDED',             status: 410 },
     VERSION_ALREADY_LOCKED:   { code: 'VERSION_ALREADY_LOCKED',   status: 409 },
+    // SignQuote Section 3 addition
+    SHARE_TOKEN_SUPERSEDED:   { code: 'SHARE_TOKEN_SUPERSEDED',   status: 409 },
   };
 
   it.each(Object.entries(expected))('SIG_ERR.%s has correct code + status', (key, spec) => {

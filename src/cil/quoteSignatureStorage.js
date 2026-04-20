@@ -93,6 +93,12 @@ const SIG_ERR = Object.freeze({
   QUOTE_LOCKED:             Object.freeze({ code: 'QUOTE_LOCKED',             status: 409 }),
   QUOTE_VOIDED:             Object.freeze({ code: 'QUOTE_VOIDED',             status: 410 }),
   VERSION_ALREADY_LOCKED:   Object.freeze({ code: 'VERSION_ALREADY_LOCKED',   status: 409 }),
+
+  // Share-token supersession (Section 3 Decision A): fires when the
+  // token's quote_version_id doesn't match the quote's current version
+  // (i.e. a ReissueQuote bumped the version while the old token remained
+  // extant). Customer must request a new share link.
+  SHARE_TOKEN_SUPERSEDED:   Object.freeze({ code: 'SHARE_TOKEN_SUPERSEDED',   status: 409 }),
 });
 
 // ─── §25.3 Format helpers (pure) ────────────────────────────────────────────
@@ -554,9 +560,41 @@ const SIG_TOKEN_RESOLVE_COLUMNS = `
   t.tenant_id,
   t.owner_id,
   t.quote_version_id,
+  t.recipient_name,
+  t.recipient_channel,
+  t.recipient_address,
   t.absolute_expires_at,
-  t.revoked_at
+  t.revoked_at,
+  t.superseded_by_version_id,
+  t.issued_at
 `;
+
+/**
+ * resolveShareTokenByValue — shared Query 1 helper used by:
+ *   - getSignatureViaShareToken (retrieval path; validates tokens on
+ *     signed versions)
+ *   - loadSignContext (sign path; validates tokens on sent/viewed versions)
+ *
+ * This helper does state-neutral resolution: returns the full token row
+ * with all validation-relevant fields. Caller applies domain-specific
+ * validation (revoked / expired / tenant match / supersession).
+ *
+ * Returns null if no matching token row; never throws.
+ *
+ * @param {object} pg — pg client or pool (supports .query)
+ * @param {string} shareToken — 22-char base58 token string
+ * @returns {Promise<object | null>} token row with aliased share_token_id
+ */
+async function resolveShareTokenByValue(pg, shareToken) {
+  const { rows } = await pg.query(
+    `SELECT ${SIG_TOKEN_RESOLVE_COLUMNS}
+       FROM public.chiefos_quote_share_tokens t
+      WHERE t.token = $1
+      LIMIT 1`,
+    [shareToken]
+  );
+  return rows[0] || null;
+}
 
 // Lowercase-only UUID regex — matches how Migration 4 stores IDs.
 const UUID_LOWERCASE_RE =
@@ -763,21 +801,17 @@ async function getSignatureViaShareToken({ signatureId, shareToken, pg, supabase
   assertUuid(signatureId, 'signatureId');
   assertShareToken(shareToken);
 
-  // Query 1: token resolve.
-  const { rows: tokenRows } = await pg.query(
-    `SELECT ${SIG_TOKEN_RESOLVE_COLUMNS}
-       FROM public.chiefos_quote_share_tokens t
-      WHERE t.token = $1 LIMIT 1`,
-    [shareToken]
-  );
-  if (tokenRows.length === 0) {
+  // Query 1: token resolve — via shared resolveShareTokenByValue helper
+  // (extracted Section 3). Returns full token row or null; same row shape
+  // as previously inlined query for this retrieval path.
+  const token = await resolveShareTokenByValue(pg, shareToken);
+  if (!token) {
     throw new CilIntegrityError({
       code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code,
       message: 'Share token not found',
       hint: 'Token does not match any record',
     });
   }
-  const token = tokenRows[0];
 
   // Revoked / expired take precedence over linkage mismatch.
   if (token.revoked_at) {
@@ -891,5 +925,7 @@ module.exports = {
     assertOwnerId,
     assertShareToken,
     fetchSignatureStream,
+    // Phase 3 Section 3: shared share-token resolver (reused by sign path)
+    resolveShareTokenByValue,
   },
 };

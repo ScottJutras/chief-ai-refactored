@@ -3852,6 +3852,160 @@ Phase 2C (ceremony):
 
 **§25 committed 2026-04-19.** Phase 2A closed. Phase 2B opens.
 
+## §26. Phase 2C ceremony — retrieval helpers exercised against production (2026-04-20)
+
+**Status.** Phase 2C of SignQuote session split (§23). Production ceremony
+proving `uploadSignaturePng` + `getSignatureForOwner` + `getSignatureViaShareToken`
+execute end-to-end against real Supabase Storage + Postgres with byte-
+identical stream output. Parallels §22's SendQuote production ceremony.
+Phase 2B code implementation → Scott's manual action (Migration 6 apply +
+bucket provisioning via Supabase MCP) → this ceremony. Phase 2B + 2C fully
+closed at this commit.
+
+### Scope
+
+The ceremony exercises the storage-helper layer directly. Prerequisite
+rows (tenant, quote, version, lifecycle.signed event, share_token) were
+inserted manually by the seed script via direct `pg` queries, not through
+CIL handlers. Phase 3 (SignQuote handler) is the session where the full
+handler → CIL → event emission → signature row → upload chain gets
+exercised end-to-end.
+
+### Ceremony identity (synthetic — clearly-marked non-real data)
+
+| Field | Value |
+|---|---|
+| `tenant_id`       | `00000000-c2c2-c2c2-c2c2-000000000001` |
+| `owner_id`        | `00000000000` |
+| `quote_id`        | `00000000-c2c2-c2c2-c2c2-000000000002` |
+| `version_id`      | `00000000-c2c2-c2c2-c2c2-000000000003` |
+| `signature_id`    | `00000000-c2c2-c2c2-c2c2-000000000004` |
+| `share_token_id`  | `00000000-c2c2-c2c2-c2c2-000000000005` |
+| `signed_event_id` | `00000000-c2c2-c2c2-c2c2-000000000006` |
+| `job_id`          | `1257` (allocated by jobs.id serial) |
+| `share_token`     | `K5gQbxTdNcN1ZNqmoGtaww` (deterministic via SHA-256 of fixed seed + bs58) |
+| `human_id`        | `QT-CEREMONY-2026-04-20-PHASE2C` |
+| `project_title`   | `Phase 2C Ceremony` |
+
+The `c2c2-c2c2-c2c2` hex group distinctively marks all ceremony UUIDs as
+synthetic artifacts greppable forever.
+
+### Fixture PNG
+
+- Shape: real 1×1 grayscale PNG built via `zlib.deflateSync` + hand-rolled
+  CRC-32, with a `tEXt` chunk carrying `Description = "ChiefOS Phase 2C
+  Ceremony fixture - 2026-04-20"`. Self-labeling — viewable in Supabase
+  dashboard as a forensic artifact.
+- Deterministic byte-for-byte across rebuilds (fixed filter byte, fixed
+  pixel value, fixed zlib level).
+- Size: **137 bytes** (passes `validatePngBuffer` — above `PNG_MIN_BYTES`
+  = 100, well below `PNG_MAX_BYTES` = 2 MB).
+- **SHA-256**: `7d4f0f5664e7e5942629cb6c8ccdeff04ad95178c2da98f8197056f8bad0d977`
+
+### Storage key (170 chars exactly)
+
+```
+chiefos-signatures/00000000-c2c2-c2c2-c2c2-000000000001/00000000-c2c2-c2c2-c2c2-000000000002/00000000-c2c2-c2c2-c2c2-000000000003/00000000-c2c2-c2c2-c2c2-000000000004.png
+```
+
+Matches `SIGNATURE_STORAGE_KEY_RE` (both app-layer and Migration 6's DB
+CHECK). Path template: `{bucket}/{tenantId}/{quoteId}/{versionId}/{signatureId}.png`.
+
+### Upload artifact
+
+- Uploaded at: **2026-04-20T11:18:22.366Z**
+- `uploadSignaturePng` return:
+  - `pngBuffer.length` = 137
+  - `sha256` = `7d4f0f5664e7e5942629cb6c8ccdeff04ad95178c2da98f8197056f8bad0d977`
+- `chiefos_quote_signatures` row inserted successfully with all NOT NULL
+  fields populated (composite FKs to versions + share_tokens + events all
+  satisfied).
+
+### Portal retrieve result (P2 posture)
+
+`getSignatureForOwner({ signatureId, tenantId, ownerId, pg, supabaseAdmin })`:
+- `contentType` = `image/png`
+- `contentLength` = 137 (upstream Content-Length header parsed)
+- `sha256` (from row) = `7d4f…d977`
+- `signedAt` = 2026-04-20T11:18:22 (from `chiefos_quote_signatures.signed_at`)
+- Stream consumed into 137-byte buffer
+- Downloaded SHA-256 = fixture SHA-256 = row SHA-256 ✓
+- Downloaded buffer byte-equal to fixture buffer ✓
+- Returned `signatureId` matches ceremony ✓
+
+### Public share-token retrieve result (PU2 posture)
+
+`getSignatureViaShareToken({ signatureId, shareToken, pg, supabaseAdmin })`:
+- Q1 token resolve: found, not revoked, not expired ✓
+- Q2 linkage verify: signature ↔ version ↔ tenant chain valid ✓
+- Stream consumed into 137-byte buffer
+- Downloaded SHA-256 = fixture SHA-256 = row SHA-256 ✓
+- Downloaded buffer byte-equal to fixture buffer ✓
+- Audit context populated and matches ceremony identity:
+  - `shareTokenId` = `00000000-c2c2-c2c2-c2c2-000000000005` ✓
+  - `quoteId`      = `00000000-c2c2-c2c2-c2c2-000000000002` ✓
+  - `tenantId`     = `00000000-c2c2-c2c2-c2c2-000000000001` ✓
+  - `ownerId`      = `00000000000` ✓
+
+### Forensic reference
+
+Supabase Storage dashboard path:
+`https://supabase.com/dashboard/project/xnmsjdummnnistzcxrtj/storage/buckets/chiefos-signatures`
+
+Object key within bucket (path component only, without bucket prefix):
+`00000000-c2c2-c2c2-c2c2-000000000001/00000000-c2c2-c2c2-c2c2-000000000002/00000000-c2c2-c2c2-c2c2-000000000003/00000000-c2c2-c2c2-c2c2-000000000004.png`
+
+### Posture
+
+- Fixture retained per §25.6 indefinite-retention default + leave-fixture
+  posture committed at Phase 2C opening.
+- Ceremony rows explicitly marked in `project_title`, `human_id`, and the
+  synthetic `c2c2-c2c2-c2c2` UUID fragment; fully greppable for later
+  forensic reference or manual cleanup.
+- Cleanup query (documented, not committed as a script):
+  ```sql
+  -- Manual ceremony sweep (if ever needed):
+  DELETE FROM chiefos_quote_signatures    WHERE tenant_id = '00000000-c2c2-c2c2-c2c2-000000000001';
+  DELETE FROM chiefos_quote_events        WHERE tenant_id = '00000000-c2c2-c2c2-c2c2-000000000001';
+  DELETE FROM chiefos_quote_share_tokens  WHERE tenant_id = '00000000-c2c2-c2c2-c2c2-000000000001';
+  DELETE FROM chiefos_quote_versions      WHERE tenant_id = '00000000-c2c2-c2c2-c2c2-000000000001';
+  DELETE FROM chiefos_quotes              WHERE tenant_id = '00000000-c2c2-c2c2-c2c2-000000000001';
+  DELETE FROM jobs                        WHERE id = 1257 AND job_name = 'Phase 2C Ceremony Job';
+  DELETE FROM chiefos_tenants             WHERE id = '00000000-c2c2-c2c2-c2c2-000000000001';
+  DELETE FROM users                       WHERE user_id = '00000000000';
+  -- + Supabase dashboard: delete chiefos-signatures bucket object manually.
+  ```
+
+### Findings surfaced by ceremony (now fixed in Scripts commit)
+
+Two FK / type issues in the first seed run, both non-destructive
+(transaction rolled back):
+1. `jobs.owner_id → users.user_id` FK required a ceremony `users` row.
+   Added to seed.
+2. `jobs.job_name` (varchar) vs `jobs.name` (text) rejected shared
+   positional parameter. Split into `$2` and `$4`.
+
+Both were schema facts that mocked tests didn't exercise (by design —
+mocks don't have FKs). Exactly the class of finding Phase 2C is designed
+to surface. Fixes committed in a follow-up to Commit 1; ceremony re-ran
+cleanly after fixes.
+
+### Principles confirmed by ceremony
+
+- §25.4 four-invariant upload pipeline works end-to-end with real
+  Supabase Storage.
+- §25.5 retrieval contract works: both helpers return streams that yield
+  byte-identical content to uploaded bytes; signed URLs never exposed to
+  callers; audit context populated correctly.
+- §25.3 storage_key format mirrors between app regex and DB CHECK
+  (Migration 6 applied earlier today).
+- §25.7 bucket provisioning contract honored (private bucket, 2 MB limit,
+  `image/png`-only MIME — all enforced at bucket level, code already
+  respects).
+
+**§26 committed 2026-04-20.** Phase 2C complete. Phase 2B + 2C fully
+closed. Phase 3 (SignQuote handler implementation) opens next session.
+
 ## Next entries (to be added as decisions land)
 - §24. Template table schema (when tenant template editor is designed)
-- §26. Cross-quote pointer enforcement (the 4-column composite FK, if needed)
+- §27. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

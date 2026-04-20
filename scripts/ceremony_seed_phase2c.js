@@ -79,6 +79,15 @@ async function main() {
   try {
     await client.query('BEGIN');
 
+    // ─── 0. Users row (FK target for jobs.owner_id) ──────────────────────
+    console.log('[SEED] inserting public.users row (FK target for jobs)...');
+    await client.query(
+      `INSERT INTO public.users (user_id, created_at)
+       VALUES ($1, NOW())
+       ON CONFLICT (user_id) DO NOTHING`,
+      [CEREMONY_OWNER_ID]
+    );
+
     // ─── 1. Tenant ────────────────────────────────────────────────────────
     console.log('[SEED] inserting chiefos_tenants row...');
     await client.query(
@@ -112,10 +121,12 @@ async function main() {
       );
       const nextJobNo = jobNoRes.rows[0].next_no;
       const jobInsert = await client.query(
+        // Separate params for job_name (varchar) vs name (text) — PG can't
+        // deduce a single type for $2 used in both slots.
         `INSERT INTO public.jobs (owner_id, job_name, job_no, status, name)
-         VALUES ($1, $2, $3, 'active', $2)
+         VALUES ($1, $2, $3, 'active', $4)
          RETURNING id`,
-        [CEREMONY_OWNER_ID, 'Phase 2C Ceremony Job', nextJobNo]
+        [CEREMONY_OWNER_ID, 'Phase 2C Ceremony Job', nextJobNo, 'Phase 2C Ceremony Job']
       );
       jobId = jobInsert.rows[0].id;
       console.log(`[SEED]   new ceremony job: id=${jobId}, job_no=${nextJobNo}`);

@@ -1344,9 +1344,14 @@ async function handleSignQuote(rawCil, ctx) {
   }
 
   // ─── Step 23: multi-entity §17.15 return shape ───────────────────────────
+  // sigResult merged with local storageKey so the return shape surfaces
+  // the key. insertSignature's tight return (signatureId/signedAt/
+  // nameMatchAtSign) doesn't include storageKey; handler has it locally
+  // from step 10. Regression lock test in quotes.test.js asserts
+  // shape.signature.storage_key is populated per SIGNATURE_STORAGE_KEY_RE.
   return buildSignQuoteReturnShape({
     signCtx,
-    sigResult,
+    sigResult: { ...sigResult, storageKey },
     verResult,
     qResult,
     uploadResult,

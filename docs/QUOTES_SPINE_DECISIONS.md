@@ -4006,6 +4006,451 @@ cleanly after fixes.
 **§26 committed 2026-04-20.** Phase 2C complete. Phase 2B + 2C fully
 closed. Phase 3 (SignQuote handler implementation) opens next session.
 
+## §27. Phase 3 ceremony — SignQuote exercised against production (2026-04-21)
+
+**Status.** Phase 3's final section. Production ceremony proving
+`handleSignQuote` (the 23-step SignQuote orchestration from Section 5)
+executes end-to-end against real Postgres + Supabase Storage. First
+customer-initiated CIL handler exercised in production. Parallels §22
+(SendQuote) and §26 (Phase 2C Storage ceremony).
+
+### Scope
+
+Match-path only (signer_name matches share_token.recipient_name →
+`name_match_at_sign=true`; no `integrity.name_mismatch_signed` event
+emitted). Mismatch path is covered by Section 5 unit tests. Ceremony's
+job is proving the full chain works against production, not exercising
+every branch.
+
+### Ceremony identity
+
+| Field | Value |
+|---|---|
+| tenant_id         | `00000000-c3c3-c3c3-c3c3-000000000001` |
+| owner_id          | `00000000001` |
+| quote_id          | `00000000-c3c3-c3c3-c3c3-000000000002` |
+| version_id        | `00000000-c3c3-c3c3-c3c3-000000000003` |
+| line_item_id      | `00000000-c3c3-c3c3-c3c3-0000000000a1` |
+| share_token_id    | `00000000-c3c3-c3c3-c3c3-000000000005` |
+| synthetic_sent_event_id | `00000000-c3c3-c3c3-c3c3-000000000007` |
+| share_token       | `SjBkxvAvPEx8CX3UFJ6mrT` (deterministic from seed) |
+| human_id          | `QT-CEREMONY-2026-04-21-PHASE3` |
+| project_title     | `Phase 3 SignQuote Ceremony` |
+| job_id            | `1740` (allocated by jobs.id serial) |
+
+The `c3c3-c3c3-c3c3` hex namespace distinguishes Phase 3 ceremony rows
+from Phase 2C's `c2c2-c2c2-c2c2`.
+
+### Fixture PNG
+
+- Shape: real 1×1 grayscale with `tEXt` "Description" = "ChiefOS Phase 3
+  SignQuote ceremony fixture - 2026-04-21"
+- Size: 146 bytes (deterministic across reruns)
+- SHA-256: `3bf500c9f868709756de44da89da7151e741a54c84eaad1edd64c6fb8c52935b`
+
+Four-way SHA confirmation: fixture bytes (computed at script load) =
+signature_png_sha256 (DB row) = portal retrieve downloaded SHA = public
+retrieve downloaded SHA.
+
+### Handler-generated artifacts
+
+| Field | Value |
+|---|---|
+| signature_id         | `8b9b982d-6268-4da8-b25e-5cf29228d197` |
+| signed_event_id      | `9245f83d-ed77-4a2c-bc35-9d68a036c07a` |
+| correlation_id       | `06cc4c9e-6406-4ffe-8de3-40f5c0af362d` |
+| signed_at (signature row) | `2026-04-21T10:40:46.700808Z` |
+| version.locked_at    | `2026-04-21T10:40:46.700808Z` |
+| version.signed_at    | `2026-04-21T10:40:46.700808Z` |
+| quote.updated_at     | `2026-04-21T10:40:46.700808Z` |
+
+All four state-transition timestamps share a single transaction_timestamp
+(NOW() inside a transaction returns the transaction start time) — txn-
+coherent.
+
+### Server hash — first Phase-1-to-Phase-3 integration artifact
+
+**`server_hash = 1e12cc5287c6edc79c9990a3aee47dab30598ddafea0816ea25b058e8b648485`**
+
+This hex is the SHA-256 of Phase 1's canonical serialization of the
+ceremony version + line items. Pinning this value in §27 means any
+future regression against this ceremony's version rows must produce
+this exact hash. Changes to `computeVersionHash` (requiring a new
+`_hash_alg_version` per Phase 1's discipline) would produce a different
+value; the §27 pin detects such drift.
+
+The hash is written to three places in a single transaction:
+- `chiefos_quote_signatures.version_hash_at_sign` (forensic residue)
+- `chiefos_quote_versions.server_hash` (version's permanent record)
+- `chiefos_quote_events.payload->>'version_hash_at_sign'` on the
+  lifecycle.signed event (redundant carrier for event-stream self-
+  sufficiency)
+
+### Storage key (170 chars exactly)
+
+```
+chiefos-signatures/00000000-c3c3-c3c3-c3c3-000000000001/00000000-c3c3-c3c3-c3c3-000000000002/00000000-c3c3-c3c3-c3c3-000000000003/8b9b982d-6268-4da8-b25e-5cf29228d197.png
+```
+
+Matches `SIGNATURE_STORAGE_KEY_RE` (app-layer) and Migration 6's DB
+CHECK constraint byte-for-byte. Object verified present in bucket:
+size 146 bytes, mime `image/png`.
+
+### Events chain (ordered by global_seq)
+
+| seq | kind | correlation_id | emitted_at | notes |
+|---|---|---|---|---|
+| 1505 | `lifecycle.sent` | NULL | 10:40:32 | seed-inserted (synthetic); `payload.ceremony_synthetic=true` |
+| 1506 | `lifecycle.signed` | `06cc4c9e-…362d` | 10:40:43 | handler step 14; `payload.version_hash_at_sign` present |
+| 1507 | `notification.sent` | **same** `06cc4c9e-…362d` | 10:40:43 | handler step 22; `payload.provider_message_id = 37336e10-…7a2a` |
+
+**Two consecutive handler-emitted events share the correlation_id — first
+production validation of DB3 Q3.6 wiring.** A single
+`SELECT … WHERE correlation_id = '06cc4c9e-…362d'` returns the two
+events that form the complete execution trace of this SignQuote call.
+The synthetic lifecycle.sent event (seed-inserted) carries NULL
+correlation_id, correctly reflecting that it wasn't part of this
+handler invocation.
+
+### Postmark dispatch
+
+- Recipient: `scott.tirakian@gmail.com` (same target as Mission §22;
+  consistency aids future email archaeology)
+- MessageID: `37336e10-0bd5-43f3-9b2d-e31f73ff7a2a`
+- Email content: contractor confirmation with name-match status line
+  ("MATCHED") and full signature metadata
+
+### What Phase 3 validated that prior sections could not
+
+- **First production emission of correlation_id** on
+  `chiefos_quote_events`. SendQuote's existing helpers leave NULL
+  (pre-Phase-3); SignQuote wires. §17.21 formalizes the pattern and
+  documents the SendQuote asymmetry.
+- **First production integration of Phase 1's `computeVersionHash`**
+  with a real quote's version row + line items. Pinned hex
+  `1e12cc52…8485` is the cross-phase integration artifact.
+- **First strict-immutable signature row** committed in production.
+  Migration 4's strict-immutability trigger exercised — no UPDATE
+  attempted or permitted by handler code.
+- **First §17.20 exercise**: pre-BEGIN external write (PNG upload) →
+  post-BEGIN INSERT (signature row), with cleanup-on-txn-failure
+  posture per §25.6 Direction A. Inversion of §17.19's post-commit
+  pattern is correct for strict-immutable target tables.
+- **First customer-initiated CIL handler** in production. `actor.role =
+  'customer'` validated against BaseCILZ via `.omit({ actor: true })
+  .extend(...)` pattern (formalized below as §14.11).
+
+### Formalizations landing in this session close
+
+| Principle | Section | Status |
+|---|---|---|
+| Post-commit paired notification events | §17.19 | Second exercise formalizes (proposed by §22) |
+| Pre-BEGIN external write for strict-immutable INSERT | §17.20 | Introduced |
+| correlation_id wiring + SendQuote asymmetry | §17.21 | Introduced |
+| Invariant-assertion discipline | §17.22 | Introduced |
+| Customer-initiated actor role (auth-orthogonal) | §14.11 | Introduced |
+| Customer-initiated actions not plan-gated | §14.12 | Introduced |
+| NAME_MATCH_RULE_ID in event payload | §11a refinement | Added |
+
+### Retention posture
+
+Fixture + ceremony rows retained per §25.6 indefinite-retention default
+and §26 precedent. Manual cleanup query (documented, not committed):
+
+```sql
+DELETE FROM chiefos_quote_signatures     WHERE tenant_id = '00000000-c3c3-c3c3-c3c3-000000000001';
+DELETE FROM chiefos_quote_events         WHERE tenant_id = '00000000-c3c3-c3c3-c3c3-000000000001';
+DELETE FROM chiefos_quote_share_tokens   WHERE tenant_id = '00000000-c3c3-c3c3-c3c3-000000000001';
+DELETE FROM chiefos_quote_line_items     WHERE tenant_id = '00000000-c3c3-c3c3-c3c3-000000000001';
+DELETE FROM chiefos_quote_versions       WHERE tenant_id = '00000000-c3c3-c3c3-c3c3-000000000001';
+DELETE FROM chiefos_quotes               WHERE tenant_id = '00000000-c3c3-c3c3-c3c3-000000000001';
+DELETE FROM jobs                         WHERE owner_id = '00000000001' AND job_name = 'Phase 3 Ceremony Job';
+DELETE FROM chiefos_tenants              WHERE id = '00000000-c3c3-c3c3-c3c3-000000000001';
+DELETE FROM users                        WHERE user_id = '00000000001';
+-- Supabase dashboard: delete bucket object at storage_key above.
+```
+
+### Findings surfaced by ceremony
+
+**One minor return-shape gap** (fixed in this commit alongside §27):
+`handleSignQuote`'s return shape's `signature.storage_key` was null —
+`buildSignQuoteReturnShape` reads `sigResult.storageKey` but
+`insertSignature` doesn't return that field. The key IS correctly
+persisted in DB + bucket (verified via MCP). Fix: handler passes its
+local `storageKey` through the composer's `sigResult` parameter.
+Regression-lock test added.
+
+Flag for future handler sections: exact-key-match tests on return
+shapes (like §25.7's Q7 surface contract) catch field-drop bugs at
+unit-test time rather than at ceremony time.
+
+**§27 committed 2026-04-21.** Phase 3 complete. Phase 2 + Phase 3
+fully closed. Next session candidates flagged in execution plan.
+
+## §17.19. Post-commit paired notification events (formalized 2026-04-21 after §27)
+
+**Pattern.** When a state-transition lifecycle event is followed by an
+external-call notification (email, SMS, webhook), emit the lifecycle
+event INSIDE the transaction and the `notification.*` event AFTER the
+external call completes. Success path emits `notification.sent` with
+provider_message_id in payload. Failure path emits `notification.failed`
+with error_code + error_message in payload. Neither path is a
+state-transition rollback.
+
+**Validated by.** SendQuote §22 (2026-04-19, first exercise) and
+SignQuote §27 (2026-04-21, second exercise). Pattern is frozen.
+
+**Two subtly distinct error-handling rules:**
+
+1. **Postmark-error-swallow rule.** If the external call (Postmark,
+   webhook, etc.) throws, the catch block emits `notification.failed`
+   with the external error's code + message. The handler does NOT
+   rethrow — the state transition is committed; the notification is a
+   separate facet. Handler return is still `ok:true`.
+
+2. **Emitter-error-propagate rule.** If the `notification.*` emit
+   helper itself throws (e.g., pg pool lost post-commit, event INSERT
+   hits an unexpected constraint), the error propagates as 500-class
+   to the caller. The catch block's `await emitNotificationFailed` is
+   not wrapped; its failure escalates. This is safe because signed
+   state is nonetheless real — client retry via `source_msg_id`
+   idempotency (§17.8–§17.11) calls `lookupPrior*` at handler entry
+   and returns the correct committed state.
+
+**When to apply.** Handlers that (a) transition state inside a
+transaction AND (b) dispatch an external notification afterward. Not
+applicable to handlers with no external dispatch or with dispatch
+inside the transaction.
+
+## §17.20. Pre-BEGIN external write for strict-immutable INSERT (introduced 2026-04-21 by §27)
+
+**Pattern.** When a CIL handler's INSERT target has a strict-
+immutability trigger forbidding post-INSERT UPDATE AND the INSERT
+requires fields populated from an external system (storage bucket,
+external API), the external write MUST precede BEGIN. §17.14's
+NULL-then-UPDATE pattern is illegal against strict-immutability
+triggers; pre-generated PK + pre-fetched external content is the
+required alternative.
+
+**Decision criterion — both conditions must hold:**
+1. Target table has a strict-immutability trigger (every column
+   immutable post-INSERT, DELETE forbidden).
+2. INSERT requires fields populated from an external system before the
+   row can be created (not "fields that will be computed later" — that
+   is §17.14's pattern).
+
+If only condition (1) holds: use §17.14's pre-generated PK but with DB-
+local field composition. If only condition (2) holds: use §17.19's
+post-commit pattern. Both conditions together: use §17.20.
+
+**On transaction failure after successful external write:** call the
+kind-specific cleanup helper (e.g., §25.6 Direction A for storage
+orphans) best-effort; re-throw the original error unmodified.
+
+The cleanup is best-effort — the cleanup helper itself may fail
+(network error, external system unavailable) and that failure MUST NOT
+mask the original transaction error. Cleanup wraps in try/catch and
+swallows; the original error is re-thrown to the caller unmodified. If
+cleanup silently fails, the orphan persists — acceptable because §25.6
+Direction B provides a separate reaper process for unreferenced
+storage artifacts.
+
+**Validated by.** SignQuote §27 (2026-04-21). PNG uploaded via
+Phase 2's `uploadSignaturePng` pre-BEGIN; signature row INSERT inside
+transaction references the uploaded PNG's storage_key + SHA-256. On
+txn failure, `cleanupOrphanPng` removes the orphan PNG before
+classifyCilError routes the error.
+
+**Applies forward to:** any future strict-immutable audit row
+depending on external content — contract signatures, attested
+receipts, signed-PDF-from-Puppeteer rows. NOT applicable to
+non-strict-immutable audit rows (those use §17.14) or to handlers
+where the external call is notification-only (those use §17.19).
+
+**Relationship to §17.19:** §17.20 inverts §17.19's ordering. Both
+inversions are correct for their respective table postures: post-
+commit when the row is mutable (SendQuote's state flip); pre-BEGIN
+when the row is strict-immutable and depends on external input
+(SignQuote's signature).
+
+## §17.21. correlation_id wiring discipline (introduced 2026-04-21 by §27)
+
+**Pattern.** Handlers generate a single `correlationId` (UUID) at
+invocation entry and thread it through every `chiefos_<doctype>_events`
+row emitted by that invocation. A single `SELECT ... WHERE
+correlation_id = $1 ORDER BY global_seq` returns the complete execution
+trace of one handler call.
+
+**Column.** `chiefos_quote_events.correlation_id uuid` (Migration 2).
+Nullable for backward compatibility with pre-Phase-3 emitters.
+
+**Events per invocation** (SignQuote example, validated in §27):
+- `lifecycle.signed` (inside txn) — correlation_id populated
+- `integrity.name_mismatch_signed` (inside txn, conditional) — same id
+- `notification.sent` OR `notification.failed` (post-commit) — same id
+
+**SendQuote asymmetry (documented, not drift).** SendQuote's existing
+event emitters (`emitLifecycleSent`, `emitNotificationSent`,
+`emitNotificationFailed`) were written before Phase 3 and leave
+correlation_id NULL. Phase 3 Section 5 extended `emitNotificationSent`
+and `emitNotificationFailed` to accept an optional `correlationId`
+param (default null) for backward-compatible future use; SendQuote
+callers do not currently pass a correlationId. SendQuote backfill to
+populate correlation_id consistently across its events is future
+hygiene — not a blocking issue.
+
+**Forward applicability.** All new handlers emit events with
+correlation_id populated. The asymmetry exists only for SendQuote's
+2026-04-19 lineage.
+
+**Validated by.** SignQuote §27 (2026-04-21). Two events (`lifecycle.
+signed` + `notification.sent`) share correlation_id
+`06cc4c9e-6406-4ffe-8de3-40f5c0af362d` — verified via MCP SELECT.
+
+## §17.22. Invariant-assertion discipline (introduced 2026-04-21)
+
+**Principle.** Every "shouldn't happen in practice" check is an
+invariant worth asserting at the earliest cheap boundary. Pre-
+transaction loaders are cheap; transaction bodies are expensive. Prefer
+loading-with-validation over trusting row shape mid-transaction.
+
+**Rationale.** An invariant that the writer assumes but doesn't assert
+is a silent corruption surface. When the assumption fails (upstream
+bug, direct DB write, FK drift), the handler proceeds with invalid
+state and produces downstream corruption. Asserting the invariant at
+load time surfaces the failure with a clean error code (typically
+CIL_INTEGRITY_ERROR) and an actionable hint, rather than masking it.
+
+**Cost boundary.** Pre-transaction loaders run before BEGIN — they hold
+no locks, so extra SELECTs / checks have no concurrency cost.
+Transaction bodies hold locks; asserting mid-transaction is
+acceptable but adds lock-hold time. Load-side validation is strictly
+preferable when both are possible.
+
+**Exemplars from Phase 3:**
+- **Section 3 Decision C**: `loadSignContext` rejects zero line-items
+  with CIL_INTEGRITY_ERROR. The original proposal would have passed
+  empty array through to `computeVersionHash`, producing a hash over
+  empty state. "Shouldn't happen in practice" (CreateQuoteCILZ's
+  min(1) enforces at Zod layer) — but asserting catches upstream
+  corruption, direct DB writes, or post-send line-item deletions.
+- **Section 3 quote/version status disagreement**: `loadSignContext`
+  rejects when quote.status is sent/viewed but version.status is not
+  sent/viewed. SendQuote's atomicity should prevent this; the check
+  catches atomicity regressions or direct DB writes.
+- **Section 4 updateVersionLocked / updateQuoteSigned row-count
+  check**: both assert rowCount === 1 post-UPDATE. Composite FK at
+  load time guarantees existence; mid-transaction disappearance is
+  unreachable. Assertion catches unreachable state cleanly.
+
+**Anti-pattern to avoid.** Do not write `// Shouldn't happen` comments
+alone — either remove the code (if truly unreachable) or assert it (if
+the check is worth writing). Comments without assertions rot into
+"nobody remembers why this is here."
+
+**Generalization.** This discipline applies to all CIL handler
+implementations, not just the quote spine. Handler authors should
+survey the pre-transaction loader and ask "what am I assuming about
+the row shapes I'm about to operate on?" — each assumption becomes
+either an assertion (if worth checking) or is removed (if the
+assumption is truly guaranteed by the load query's WHERE clause).
+
+## §14.11. Customer-initiated actor role — auth-orthogonal (introduced 2026-04-21 by §27)
+
+**Principle.** Customer-initiated actor roles identify the contractual
+party, not the authentication mechanism. A customer signing via share-
+token and a (future) customer signing via authenticated portal login
+both have `actor.role = 'customer'`. Authentication evidence is
+captured separately — `share_token_id` column for bearer-token auth,
+future `user_id` column for authenticated auth.
+
+**Rationale.** Conflating role with auth mechanism would force enum
+changes whenever a new auth path ships: existing rows under one enum
+value, new ones under a different value, audit inconsistency. Separating
+role (contractual position) from auth (how identity was proved)
+preserves stable audit semantics across future auth evolutions.
+
+**Precedent.** SignQuote's `SignQuoteActorZ` schema (Section 1) uses
+`BaseCILZ.omit({ actor: true }).extend({ actor: SignQuoteActorZ })`
+because `ActorRoleZ` in `src/cil/schema.js` does not include `'customer'`.
+The per-handler actor override accommodates new contractual-party roles
+without widening the base enum (which would admit 'customer' to
+handlers that should reject it).
+
+**Forward applicability.** RejectQuote, RequestRevision, and other
+future customer-initiated CIL handlers use `actor.role = 'customer'`
+regardless of whether the customer is bearer-token-authenticated or
+authenticated-user-authenticated. Auth evidence lives in the target
+row's auth columns (share_token_id, user_id, etc.).
+
+**Validated by.** SignQuote §27 (2026-04-21). First customer-initiated
+CIL handler in production.
+
+## §14.12. Customer-initiated actions not plan-gated (introduced 2026-04-21 by §27)
+
+**Principle.** Customer-initiated actions (signing, rejecting, viewing
+via share-token, etc.) are not plan-gated. Plan gating applies only to
+contractor-initiated actions that produce billable resource consumption.
+The contractor's plan determines whether they can create quotes;
+customers' actions against those quotes are unconstrained follow-through.
+
+**Rationale.** Plan gating exists to meter contractor resource usage,
+not customer engagement. A customer signing a quote consumes no
+contractor-metered resources beyond what CreateQuote already counted.
+Blocking customer sign on contractor plan downgrade would create
+contractual disputes — "customer can't sign the quote they were sent
+because contractor's plan lapsed" is a worse outcome than "contractor
+can't create new quotes until upgrade."
+
+**Implementation.** Customer-initiated handlers skip §17.16's
+`gateNewIdiomHandler` step entirely. No `usage_monthly_v2` counter
+increment; no plan-check envelope.
+
+**Precedent.** SendQuote's G6 decision (§22) already rejected sending
+as a metered event; signing extends the same posture to the customer
+side. Both decisions reflect the same principle: gate at creation, not
+downstream.
+
+**Forward applicability.** RejectQuote, RequestRevision, signature-
+view endpoints — none gated. If a future product decision wants to
+restrict customer access to signed/sent quotes (e.g., free tier limits
+viewable share-tokens), that restriction applies to the contractor's
+plan at the retrieval/generation layer (when the share-token is
+created or the quote is retrieved), NOT to the customer's action
+against an already-generated share-token. Once a share-token exists
+and is valid, the customer's use of it is unconstrained.
+
+**Validated by.** SignQuote §27 (2026-04-21). Handler does no plan
+gating per DB1 Q3.
+
+### §11a refinement — NAME_MATCH_RULE_ID in integrity.name_mismatch_signed payload (added 2026-04-21 by §27)
+
+Every `integrity.name_mismatch_signed` event payload MUST include the
+`rule_id` field equal to the current `NAME_MATCH_RULE_ID`
+(`'last_token_normalize_v1'` at time of writing). Past events remain
+forensically valid under future rule changes: an event emitted under
+v1 is interpreted by v1's rules, even if the current algorithm is v2.
+The payload's rule_id is the audit contract; changing it silently
+would break forensic interpretability.
+
+Migration 4's `chiefos_qe_payload_name_mismatch_signed` CHECK enforces
+`payload ? 'rule_id' AND signature_id IS NOT NULL`. DB-enforced
+minimum; handler-composed payload (via `composeNameMismatchPayload`,
+Phase 3 Section 5) exceeds the minimum with five additional forensic
+fields (typed_signer_name, recipient_name_at_sign, recipient_last_token,
+typed_last_token, recipient_normalized, typed_normalized) for replay-
+under-rule-v1 capability.
+
+Parallels Phase 1's `_hash_alg_version` discipline (§4.K): algorithm
+versioning is carried in the artifact, not presumed from the current
+implementation.
+
+**First production emission:** the match path of SignQuote §27 did NOT
+fire this event (match=true). First mismatch-path emission will occur
+when a ceremony or real customer signs with a non-matching name — that
+event's payload will be the first production instance of the rule_id
+discipline.
+
 ## Next entries (to be added as decisions land)
 - §24. Template table schema (when tenant template editor is designed)
-- §27. Cross-quote pointer enforcement (the 4-column composite FK, if needed)
+- §28. Cross-quote pointer enforcement (the 4-column composite FK, if needed)

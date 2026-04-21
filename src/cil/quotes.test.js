@@ -4363,6 +4363,22 @@ describe('SignQuote — Section 5: handleSignQuote', () => {
       expect(shape.version).toHaveProperty('server_hash');
       expect(shape.version).toHaveProperty('signed_at');
     });
+
+    it('storage_key field is populated from sigResult.storageKey (Phase 3 ceremony regression lock)', () => {
+      const inputs = baseInputs();
+      inputs.sigResult.storageKey =
+        'chiefos-signatures/00000000-c3c3-c3c3-c3c3-000000000001/' +
+        '00000000-c3c3-c3c3-c3c3-000000000002/' +
+        '00000000-c3c3-c3c3-c3c3-000000000003/' +
+        '00000000-c2c2-c2c2-c2c2-000000000004.png';
+      const { SIGNATURE_STORAGE_KEY_RE } = require('./quoteSignatureStorage');
+      const shape = buildSignQuoteReturnShape(inputs);
+      expect(shape.signature.storage_key).toBe(inputs.sigResult.storageKey);
+      expect(SIGNATURE_STORAGE_KEY_RE.test(shape.signature.storage_key)).toBe(true);
+      // Flag for future handler sections: exact-key-match tests on
+      // return shape (like §25.7's Q7 surface contract) catch these
+      // field-drop bugs at unit-test time, not at ceremony time.
+    });
   });
 
   describe('priorSignatureToReturnShape helper', () => {

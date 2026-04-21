@@ -3496,3 +3496,479 @@ describe('SignQuote — Section 3: resolveShareTokenByValue', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase 3 Section 4 tests: transaction-body helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+const {
+  insertSignedEvent,
+  insertSignature,
+  updateVersionLocked,
+  updateQuoteSigned,
+  insertNameMismatchEvent,
+} = _internals;
+
+function createMockClient({ rows = [], rejectWith = null } = {}) {
+  const query = jest.fn().mockImplementation(() => {
+    if (rejectWith) return Promise.reject(rejectWith);
+    return Promise.resolve({ rows });
+  });
+  return { query };
+}
+
+const S4_TENANT  = '00000000-c2c2-c2c2-c2c2-000000000001';
+const S4_OWNER   = '00000000000';
+const S4_QUOTE   = '00000000-c2c2-c2c2-c2c2-000000000002';
+const S4_VERSION = '00000000-c2c2-c2c2-c2c2-000000000003';
+const S4_SIG     = '00000000-c2c2-c2c2-c2c2-000000000004';
+const S4_TOKEN   = '00000000-c2c2-c2c2-c2c2-000000000005';
+const S4_EVENT   = '00000000-c2c2-c2c2-c2c2-000000000006';
+const S4_CORR    = '00000000-aaaa-bbbb-cccc-000000000001';
+const S4_HASH    = '7d4f0f5664e7e5942629cb6c8ccdeff04ad95178c2da98f8197056f8bad0d977';
+const S4_OCCURRED = new Date('2026-04-21T12:00:00Z');
+
+// ─── insertSignedEvent ────────────────────────────────────────────────────
+
+describe('SignQuote — Section 4: insertSignedEvent', () => {
+  function validParams(overrides = {}) {
+    return {
+      tenantId: S4_TENANT, ownerId: S4_OWNER, correlationId: S4_CORR,
+      quoteId: S4_QUOTE, quoteVersionId: S4_VERSION, shareTokenId: S4_TOKEN,
+      versionHashAtSign: S4_HASH,
+      actorSource: 'portal', actorUserId: S4_TOKEN,
+      occurredAt: S4_OCCURRED,
+      ...overrides,
+    };
+  }
+
+  it('happy path returns { signedEventId, emittedAt }', async () => {
+    const client = createMockClient({
+      rows: [{ id: S4_EVENT, emitted_at: S4_OCCURRED }],
+    });
+    const out = await insertSignedEvent(client, validParams());
+    expect(out).toEqual({ signedEventId: S4_EVENT, emittedAt: S4_OCCURRED });
+  });
+
+  it('SQL contains lifecycle.signed literal + correct table', async () => {
+    const client = createMockClient({ rows: [{ id: S4_EVENT, emitted_at: S4_OCCURRED }] });
+    await insertSignedEvent(client, validParams());
+    const sql = client.query.mock.calls[0][0];
+    expect(sql).toContain("'lifecycle.signed'");
+    expect(sql).toContain('INTO public.chiefos_quote_events');
+  });
+
+  it('params in correct positional order', async () => {
+    const client = createMockClient({ rows: [{ id: S4_EVENT, emitted_at: S4_OCCURRED }] });
+    await insertSignedEvent(client, validParams());
+    const params = client.query.mock.calls[0][1];
+    expect(params[0]).toBe(S4_TENANT);
+    expect(params[1]).toBe(S4_OWNER);
+    expect(params[2]).toBe(S4_QUOTE);
+    expect(params[3]).toBe(S4_VERSION);
+    expect(params[4]).toBe('portal');
+    expect(params[5]).toBe(S4_TOKEN);
+    expect(params[6]).toBe(S4_TOKEN);
+    expect(params[7]).toBe(S4_CORR);
+    expect(params[8]).toBe(S4_OCCURRED);
+    expect(JSON.parse(params[9])).toEqual({ version_hash_at_sign: S4_HASH });
+  });
+
+  it('correlation_id parameter is the passed-in value (not undefined)', async () => {
+    const client = createMockClient({ rows: [{ id: S4_EVENT, emitted_at: S4_OCCURRED }] });
+    await insertSignedEvent(client, validParams({ correlationId: S4_CORR }));
+    const params = client.query.mock.calls[0][1];
+    expect(params[7]).toBe(S4_CORR);
+  });
+
+  it('payload JSON includes version_hash_at_sign verbatim', async () => {
+    const client = createMockClient({ rows: [{ id: S4_EVENT, emitted_at: S4_OCCURRED }] });
+    await insertSignedEvent(client, validParams({ versionHashAtSign: S4_HASH }));
+    const payloadJson = client.query.mock.calls[0][1][9];
+    expect(JSON.parse(payloadJson).version_hash_at_sign).toBe(S4_HASH);
+  });
+
+  it('emits occurredAt as emitted_at (not server NOW) — Addition 2', async () => {
+    const occurredAt = new Date('2026-04-20T12:00:00Z');
+    const client = createMockClient({
+      rows: [{ id: S4_EVENT, emitted_at: occurredAt }],
+    });
+    await insertSignedEvent(client, validParams({ occurredAt }));
+    const params = client.query.mock.calls[0][1];
+    expect(params).toContain(occurredAt);
+  });
+
+  it('pg error propagates unmodified', async () => {
+    const err = new Error('mock pg failure');
+    const client = createMockClient({ rejectWith: err });
+    await expect(insertSignedEvent(client, validParams())).rejects.toBe(err);
+  });
+});
+
+// ─── insertSignature ──────────────────────────────────────────────────────
+
+describe('SignQuote — Section 4: insertSignature', () => {
+  function validParams(overrides = {}) {
+    return {
+      signatureId: S4_SIG, quoteVersionId: S4_VERSION,
+      tenantId: S4_TENANT, ownerId: S4_OWNER,
+      signedEventId: S4_EVENT, shareTokenId: S4_TOKEN,
+      signerName: 'Ceremony Signer',
+      signerEmail: null, signerIp: '1.2.3.4', signerUserAgent: 'test-ua',
+      signaturePngStorageKey: 'chiefos-signatures/' + S4_TENANT + '/' + S4_QUOTE + '/' + S4_VERSION + '/' + S4_SIG + '.png',
+      signaturePngSha256: S4_HASH,
+      versionHashAtSign: S4_HASH,
+      nameMatchAtSign: true,
+      recipientNameAtSign: 'Ceremony Customer',
+      sourceMsgId: 'test-src-msg-1',
+      ...overrides,
+    };
+  }
+
+  it('happy path returns { signatureId, signedAt, nameMatchAtSign }', async () => {
+    const signedAt = new Date('2026-04-21T12:00:00Z');
+    const client = createMockClient({
+      rows: [{ id: S4_SIG, signed_at: signedAt, name_match_at_sign: true }],
+    });
+    const out = await insertSignature(client, validParams());
+    expect(out).toEqual({ signatureId: S4_SIG, signedAt, nameMatchAtSign: true });
+  });
+
+  it('SQL targets chiefos_quote_signatures and uses NOW() for signed_at', async () => {
+    const client = createMockClient({
+      rows: [{ id: S4_SIG, signed_at: new Date(), name_match_at_sign: true }],
+    });
+    await insertSignature(client, validParams());
+    const sql = client.query.mock.calls[0][0];
+    expect(sql).toContain('INTO public.chiefos_quote_signatures');
+    expect(sql).toContain('NOW()');
+  });
+
+  it('16 params in correct positional order', async () => {
+    const client = createMockClient({
+      rows: [{ id: S4_SIG, signed_at: new Date(), name_match_at_sign: true }],
+    });
+    await insertSignature(client, validParams());
+    const params = client.query.mock.calls[0][1];
+    expect(params.length).toBe(16);
+    expect(params[0]).toBe(S4_SIG);
+    expect(params[1]).toBe(S4_VERSION);
+    expect(params[2]).toBe(S4_TENANT);
+    expect(params[3]).toBe(S4_OWNER);
+    expect(params[4]).toBe(S4_EVENT);
+    expect(params[5]).toBe(S4_TOKEN);
+    expect(params[12]).toBe(S4_HASH);          // version_hash_at_sign
+    expect(params[13]).toBe(true);             // name_match_at_sign
+    expect(params[14]).toBe('Ceremony Customer'); // recipient_name_at_sign
+    expect(params[15]).toBe('test-src-msg-1'); // source_msg_id
+  });
+
+  it('nameMatchAtSign=false writes boolean false (not string)', async () => {
+    const client = createMockClient({
+      rows: [{ id: S4_SIG, signed_at: new Date(), name_match_at_sign: false }],
+    });
+    await insertSignature(client, validParams({ nameMatchAtSign: false }));
+    const params = client.query.mock.calls[0][1];
+    expect(params[13]).toBe(false);
+    expect(typeof params[13]).toBe('boolean');
+  });
+
+  it('nullable fields (signerEmail, signerIp, signerUserAgent, sourceMsgId) accept null', async () => {
+    const client = createMockClient({
+      rows: [{ id: S4_SIG, signed_at: new Date(), name_match_at_sign: true }],
+    });
+    await insertSignature(client, validParams({
+      signerEmail: null, signerIp: null, signerUserAgent: null, sourceMsgId: null,
+    }));
+    const params = client.query.mock.calls[0][1];
+    expect(params[7]).toBeNull();   // signer_email
+    expect(params[8]).toBeNull();   // signer_ip
+    expect(params[9]).toBeNull();   // signer_user_agent
+    expect(params[15]).toBeNull();  // source_msg_id
+  });
+
+  it('23505 on source_msg_unique propagates unmodified', async () => {
+    const err = Object.assign(new Error('duplicate key'), {
+      code: '23505', constraint: 'chiefos_qs_source_msg_unique',
+    });
+    const client = createMockClient({ rejectWith: err });
+    await expect(insertSignature(client, validParams())).rejects.toBe(err);
+  });
+
+  it('23505 on version_unique propagates unmodified', async () => {
+    const err = Object.assign(new Error('duplicate key'), {
+      code: '23505', constraint: 'chiefos_qs_version_unique',
+    });
+    const client = createMockClient({ rejectWith: err });
+    await expect(insertSignature(client, validParams())).rejects.toBe(err);
+  });
+
+  it('generic pg error propagates unmodified', async () => {
+    const err = new Error('connection lost');
+    const client = createMockClient({ rejectWith: err });
+    await expect(insertSignature(client, validParams())).rejects.toBe(err);
+  });
+});
+
+// ─── updateVersionLocked ──────────────────────────────────────────────────
+
+describe('SignQuote — Section 4: updateVersionLocked', () => {
+  function validParams(overrides = {}) {
+    return {
+      versionId: S4_VERSION, tenantId: S4_TENANT, ownerId: S4_OWNER,
+      serverHash: S4_HASH,
+      ...overrides,
+    };
+  }
+
+  it('happy path returns 5 fields from RETURNING', async () => {
+    const lockedAt = new Date('2026-04-21T12:00:00Z');
+    const client = createMockClient({
+      rows: [{
+        id: S4_VERSION, locked_at: lockedAt, server_hash: S4_HASH,
+        signed_at: lockedAt, status: 'signed',
+      }],
+    });
+    const out = await updateVersionLocked(client, validParams());
+    expect(out).toEqual({
+      versionId: S4_VERSION, lockedAt, serverHash: S4_HASH,
+      signedAt: lockedAt, status: 'signed',
+    });
+  });
+
+  it('SQL contains single atomic update with status + locked_at + server_hash + signed_at', async () => {
+    const client = createMockClient({
+      rows: [{
+        id: S4_VERSION, locked_at: new Date(), server_hash: S4_HASH,
+        signed_at: new Date(), status: 'signed',
+      }],
+    });
+    await updateVersionLocked(client, validParams());
+    const sql = client.query.mock.calls[0][0];
+    expect(sql).toContain("status = 'signed'");
+    expect(sql).toContain('locked_at = NOW()');
+    expect(sql).toContain('server_hash = $1');
+    expect(sql).toContain('signed_at = NOW()');
+  });
+
+  it('params in correct order: [serverHash, versionId, tenantId, ownerId]', async () => {
+    const client = createMockClient({
+      rows: [{
+        id: S4_VERSION, locked_at: new Date(), server_hash: S4_HASH,
+        signed_at: new Date(), status: 'signed',
+      }],
+    });
+    await updateVersionLocked(client, validParams());
+    const params = client.query.mock.calls[0][1];
+    expect(params).toEqual([S4_HASH, S4_VERSION, S4_TENANT, S4_OWNER]);
+  });
+
+  it('rowCount = 0 throws CilIntegrityError with hint', async () => {
+    const client = createMockClient({ rows: [] });
+    try {
+      await updateVersionLocked(client, validParams());
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe('CIL_INTEGRITY_ERROR');
+      expect(e.hint).toContain(S4_VERSION);
+      expect(e.hint).toContain('rowCount=0');
+    }
+  });
+
+  it('pg error propagates unmodified', async () => {
+    const err = new Error('lock timeout');
+    const client = createMockClient({ rejectWith: err });
+    await expect(updateVersionLocked(client, validParams())).rejects.toBe(err);
+  });
+});
+
+// ─── updateQuoteSigned ────────────────────────────────────────────────────
+
+describe('SignQuote — Section 4: updateQuoteSigned', () => {
+  function validParams(overrides = {}) {
+    return {
+      quoteId: S4_QUOTE, tenantId: S4_TENANT, ownerId: S4_OWNER,
+      ...overrides,
+    };
+  }
+
+  it('happy path returns { quoteId, status, updatedAt }', async () => {
+    const updatedAt = new Date('2026-04-21T12:00:00Z');
+    const client = createMockClient({
+      rows: [{ id: S4_QUOTE, status: 'signed', updated_at: updatedAt }],
+    });
+    const out = await updateQuoteSigned(client, validParams());
+    expect(out).toEqual({ quoteId: S4_QUOTE, status: 'signed', updatedAt });
+  });
+
+  it('SQL contains status signed + updated_at NOW', async () => {
+    const client = createMockClient({
+      rows: [{ id: S4_QUOTE, status: 'signed', updated_at: new Date() }],
+    });
+    await updateQuoteSigned(client, validParams());
+    const sql = client.query.mock.calls[0][0];
+    expect(sql).toContain("status = 'signed'");
+    expect(sql).toContain('updated_at = NOW()');
+  });
+
+  it('params in correct order', async () => {
+    const client = createMockClient({
+      rows: [{ id: S4_QUOTE, status: 'signed', updated_at: new Date() }],
+    });
+    await updateQuoteSigned(client, validParams());
+    expect(client.query.mock.calls[0][1]).toEqual([S4_QUOTE, S4_TENANT, S4_OWNER]);
+  });
+
+  it('rowCount = 0 throws CilIntegrityError', async () => {
+    const client = createMockClient({ rows: [] });
+    try {
+      await updateQuoteSigned(client, validParams());
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe('CIL_INTEGRITY_ERROR');
+      expect(e.hint).toContain(S4_QUOTE);
+    }
+  });
+
+  it('pg error propagates unmodified', async () => {
+    const err = new Error('deadlock');
+    const client = createMockClient({ rejectWith: err });
+    await expect(updateQuoteSigned(client, validParams())).rejects.toBe(err);
+  });
+});
+
+// ─── insertNameMismatchEvent ──────────────────────────────────────────────
+
+describe('SignQuote — Section 4: insertNameMismatchEvent', () => {
+  const FORENSIC_PAYLOAD = {
+    rule_id: 'last_token_normalize_v1',
+    typed_signer_name: 'Darlene Smith',
+    recipient_name_at_sign: 'Darlene MacDonald',
+    recipient_last_token: 'macdonald',
+    typed_last_token: 'smith',
+    recipient_normalized: 'darlene macdonald',
+    typed_normalized: 'darlene smith',
+  };
+
+  function validParams(overrides = {}) {
+    return {
+      tenantId: S4_TENANT, ownerId: S4_OWNER, correlationId: S4_CORR,
+      quoteId: S4_QUOTE, quoteVersionId: S4_VERSION, signatureId: S4_SIG,
+      payload: FORENSIC_PAYLOAD,
+      actorSource: 'portal', actorUserId: S4_TOKEN,
+      occurredAt: S4_OCCURRED,
+      ...overrides,
+    };
+  }
+
+  it('happy path returns { eventId, emittedAt }', async () => {
+    const eventId = '00000000-c2c2-c2c2-c2c2-0000000000e1';
+    const client = createMockClient({
+      rows: [{ id: eventId, emitted_at: S4_OCCURRED }],
+    });
+    const out = await insertNameMismatchEvent(client, validParams());
+    expect(out).toEqual({ eventId, emittedAt: S4_OCCURRED });
+  });
+
+  it('SQL contains integrity.name_mismatch_signed literal', async () => {
+    const client = createMockClient({ rows: [{ id: 'e1', emitted_at: S4_OCCURRED }] });
+    await insertNameMismatchEvent(client, validParams());
+    const sql = client.query.mock.calls[0][0];
+    expect(sql).toContain("'integrity.name_mismatch_signed'");
+  });
+
+  it('params in correct positional order with signature_id populated', async () => {
+    const client = createMockClient({ rows: [{ id: 'e1', emitted_at: S4_OCCURRED }] });
+    await insertNameMismatchEvent(client, validParams());
+    const params = client.query.mock.calls[0][1];
+    expect(params[0]).toBe(S4_TENANT);
+    expect(params[1]).toBe(S4_OWNER);
+    expect(params[2]).toBe(S4_QUOTE);
+    expect(params[3]).toBe(S4_VERSION);
+    expect(params[4]).toBe('portal');
+    expect(params[5]).toBe(S4_TOKEN);
+    expect(params[6]).toBe(S4_SIG);   // signature_id populated (NOT NULL per CHECK)
+    expect(params[7]).toBe(S4_CORR);
+    expect(params[8]).toBe(S4_OCCURRED);
+  });
+
+  it('payload JSON includes all 7 forensic keys', async () => {
+    const client = createMockClient({ rows: [{ id: 'e1', emitted_at: S4_OCCURRED }] });
+    await insertNameMismatchEvent(client, validParams());
+    const payloadJson = client.query.mock.calls[0][1][9];
+    const parsed = JSON.parse(payloadJson);
+    expect(parsed).toEqual(FORENSIC_PAYLOAD);
+    expect(Object.keys(parsed).sort()).toEqual([
+      'recipient_last_token', 'recipient_name_at_sign', 'recipient_normalized',
+      'rule_id', 'typed_last_token', 'typed_normalized', 'typed_signer_name',
+    ]);
+  });
+
+  it('correlation_id matches input value', async () => {
+    const client = createMockClient({ rows: [{ id: 'e1', emitted_at: S4_OCCURRED }] });
+    await insertNameMismatchEvent(client, validParams());
+    expect(client.query.mock.calls[0][1][7]).toBe(S4_CORR);
+  });
+
+  it('emits occurredAt as emitted_at (not server NOW) — Addition 2', async () => {
+    const occurredAt = new Date('2026-04-20T12:00:00Z');
+    const client = createMockClient({ rows: [{ id: 'e1', emitted_at: occurredAt }] });
+    await insertNameMismatchEvent(client, validParams({ occurredAt }));
+    const params = client.query.mock.calls[0][1];
+    expect(params).toContain(occurredAt);
+  });
+
+  it('pg 23514 on CHECK violation propagates unmodified', async () => {
+    const err = Object.assign(new Error('check_violation'), {
+      code: '23514', constraint: 'chiefos_qe_payload_name_mismatch_signed',
+    });
+    const client = createMockClient({ rejectWith: err });
+    await expect(insertNameMismatchEvent(client, validParams())).rejects.toBe(err);
+  });
+});
+
+// ─── Cross-helper correlation_id invariant ─────────────────────────────────
+
+describe('SignQuote — Section 4: correlation_id invariant across event helpers', () => {
+  it('insertSignedEvent + insertNameMismatchEvent called with same correlationId write same DB value', async () => {
+    const sameCorr = '00000000-aaaa-aaaa-aaaa-000000000001';
+
+    const client1 = createMockClient({ rows: [{ id: 'e1', emitted_at: S4_OCCURRED }] });
+    await insertSignedEvent(client1, {
+      tenantId: S4_TENANT, ownerId: S4_OWNER, correlationId: sameCorr,
+      quoteId: S4_QUOTE, quoteVersionId: S4_VERSION, shareTokenId: S4_TOKEN,
+      versionHashAtSign: S4_HASH, actorSource: 'portal', actorUserId: S4_TOKEN,
+      occurredAt: S4_OCCURRED,
+    });
+    const corrInSignedEvent = client1.query.mock.calls[0][1][7];
+
+    const client2 = createMockClient({ rows: [{ id: 'e2', emitted_at: S4_OCCURRED }] });
+    await insertNameMismatchEvent(client2, {
+      tenantId: S4_TENANT, ownerId: S4_OWNER, correlationId: sameCorr,
+      quoteId: S4_QUOTE, quoteVersionId: S4_VERSION, signatureId: S4_SIG,
+      payload: { rule_id: 'last_token_normalize_v1' },
+      actorSource: 'portal', actorUserId: S4_TOKEN, occurredAt: S4_OCCURRED,
+    });
+    const corrInMismatchEvent = client2.query.mock.calls[0][1][7];
+
+    expect(corrInSignedEvent).toBe(sameCorr);
+    expect(corrInMismatchEvent).toBe(sameCorr);
+    expect(corrInSignedEvent).toBe(corrInMismatchEvent);
+  });
+
+  it('helpers do not generate their own correlationId — passing undefined writes undefined', async () => {
+    // Defensive: helpers must not have a fallback like `|| crypto.randomUUID()`.
+    // If the handler forgets to pass correlationId, the DB NULL/undefined write
+    // surfaces as a visible bug, not a silent self-correction.
+    const client = createMockClient({ rows: [{ id: 'e1', emitted_at: S4_OCCURRED }] });
+    await insertSignedEvent(client, {
+      tenantId: S4_TENANT, ownerId: S4_OWNER, correlationId: undefined,
+      quoteId: S4_QUOTE, quoteVersionId: S4_VERSION, shareTokenId: S4_TOKEN,
+      versionHashAtSign: S4_HASH, actorSource: 'portal', actorUserId: S4_TOKEN,
+      occurredAt: S4_OCCURRED,
+    });
+    expect(client.query.mock.calls[0][1][7]).toBeUndefined();
+  });
+});
+

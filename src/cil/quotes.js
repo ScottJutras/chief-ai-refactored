@@ -551,6 +551,240 @@ function buildVersionHashInput(ctx) {
   };
 }
 
+// ─── Phase 3 Section 4: transaction-body helpers ────────────────────────────
+//
+// Five focused INSERT/UPDATE helpers per DB3 Q3.9 steps 14-19. Each takes
+// an open pg client (inside caller's transaction) and never manages
+// transactions itself. Errors propagate unmodified for caller's
+// classifyCilError handling.
+//
+// correlation_id discipline (DB3 Q3.6 / Tightening 2): both event helpers
+// take correlationId as a required param and write it explicitly to
+// chiefos_quote_events.correlation_id. First handler-class wiring this
+// column — SendQuote's existing event emitters leave it NULL; asymmetry
+// documented at Phase 3 session close.
+
+/**
+ * insertSignedEvent — emits the lifecycle.signed event that the
+ * signature row will reference via signed_event_id composite FK.
+ * Must be INSERTed before the signature row (§17.14 ordering forced
+ * by FK). Payload carries version_hash_at_sign per
+ * chiefos_qe_payload_signed CHECK.
+ *
+ * Errors propagate unmodified; caller's classifyCilError handles.
+ */
+async function insertSignedEvent(client, {
+  tenantId, ownerId, correlationId,
+  quoteId, quoteVersionId, shareTokenId,
+  versionHashAtSign,
+  actorSource, actorUserId,
+  occurredAt,
+}) {
+  const payload = { version_hash_at_sign: versionHashAtSign };
+  const { rows } = await client.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id,
+        share_token_id, correlation_id,
+        emitted_at, payload
+      )
+      VALUES ($1, $2, $3, $4,
+              'lifecycle.signed', $5, $6,
+              $7, $8,
+              $9, $10::jsonb)
+      RETURNING id, emitted_at`,
+    [
+      tenantId, ownerId, quoteId, quoteVersionId,
+      actorSource, actorUserId,
+      shareTokenId, correlationId,
+      occurredAt, JSON.stringify(payload),
+    ]
+  );
+  return { signedEventId: rows[0].id, emittedAt: rows[0].emitted_at };
+}
+
+/**
+ * insertSignature — strict-immutable INSERT of the signature row per
+ * §17.20 (§25's pre-BEGIN upload discipline). All 14 NOT NULL fields
+ * populated in one statement; no UPDATE possible per Migration 4's
+ * strict-immutability trigger.
+ *
+ * Composite FKs (quote_version_id, signed_event_id, share_token_id)
+ * all scoped to tenant_id + owner_id — caller MUST ensure these match
+ * the loaded context.
+ *
+ * Unique constraint violations propagate as pg 23505:
+ *   chiefos_qs_source_msg_unique → caller routes to idempotent_retry
+ *   chiefos_qs_version_unique    → caller routes to integrity_error
+ *                                  (bug-state duplicate)
+ *
+ * signed_at uses NOW() (transaction_timestamp), txn-coherent with
+ * updateVersionLocked's version.signed_at / locked_at.
+ */
+async function insertSignature(client, {
+  signatureId, quoteVersionId, tenantId, ownerId,
+  signedEventId, shareTokenId,
+  signerName, signerEmail, signerIp, signerUserAgent,
+  signaturePngStorageKey, signaturePngSha256,
+  versionHashAtSign,
+  nameMatchAtSign, recipientNameAtSign,
+  sourceMsgId,
+}) {
+  const { rows } = await client.query(
+    `INSERT INTO public.chiefos_quote_signatures (
+        id, quote_version_id, tenant_id, owner_id,
+        signed_event_id, share_token_id,
+        signer_name, signer_email, signer_ip, signer_user_agent,
+        signed_at,
+        signature_png_storage_key, signature_png_sha256,
+        version_hash_at_sign,
+        name_match_at_sign, recipient_name_at_sign,
+        source_msg_id
+      )
+      VALUES ($1, $2, $3, $4,
+              $5, $6,
+              $7, $8, $9, $10,
+              NOW(),
+              $11, $12,
+              $13,
+              $14, $15,
+              $16)
+      RETURNING id, signed_at, name_match_at_sign`,
+    [
+      signatureId, quoteVersionId, tenantId, ownerId,
+      signedEventId, shareTokenId,
+      signerName, signerEmail, signerIp, signerUserAgent,
+      signaturePngStorageKey, signaturePngSha256,
+      versionHashAtSign,
+      nameMatchAtSign, recipientNameAtSign,
+      sourceMsgId,
+    ]
+  );
+  return {
+    signatureId: rows[0].id,
+    signedAt: rows[0].signed_at,
+    nameMatchAtSign: rows[0].name_match_at_sign,
+  };
+}
+
+/**
+ * updateVersionLocked — atomic transition of the version row from
+ * sent/viewed → signed. Single UPDATE covers four columns: status,
+ * locked_at, server_hash, signed_at (per DB3 Q3.3). Migration 1's
+ * strict-immutability trigger permits only the one-shot locked_at
+ * NULL → NOT NULL transition; splitting into multiple UPDATEs would
+ * reject the second.
+ *
+ * rowCount must be 1 after UPDATE. 0 indicates version disappeared
+ * mid-transaction — impossible under normal flow (composite FK
+ * ensures existence at load time); defensive CIL_INTEGRITY_ERROR.
+ */
+async function updateVersionLocked(client, {
+  versionId, tenantId, ownerId, serverHash,
+}) {
+  const { rows } = await client.query(
+    `UPDATE public.chiefos_quote_versions
+        SET status = 'signed',
+            locked_at = NOW(),
+            server_hash = $1,
+            signed_at = NOW()
+      WHERE id = $2 AND tenant_id = $3 AND owner_id = $4
+      RETURNING id, locked_at, server_hash, signed_at, status`,
+    [serverHash, versionId, tenantId, ownerId]
+  );
+  if (rows.length !== 1) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Version UPDATE affected unexpected row count',
+      hint: `version_id=${versionId} rowCount=${rows.length}; expected 1`,
+    });
+  }
+  return {
+    versionId: rows[0].id,
+    lockedAt: rows[0].locked_at,
+    serverHash: rows[0].server_hash,
+    signedAt: rows[0].signed_at,
+    status: rows[0].status,
+  };
+}
+
+/**
+ * updateQuoteSigned — quote header status transition sent/viewed →
+ * signed. Only status + updated_at change; identity columns are
+ * immutable per trg_chiefos_quotes_guard_header_immutable (Migration 1).
+ *
+ * rowCount = 1 assertion same as updateVersionLocked.
+ */
+async function updateQuoteSigned(client, {
+  quoteId, tenantId, ownerId,
+}) {
+  const { rows } = await client.query(
+    `UPDATE public.chiefos_quotes
+        SET status = 'signed', updated_at = NOW()
+      WHERE id = $1 AND tenant_id = $2 AND owner_id = $3
+      RETURNING id, status, updated_at`,
+    [quoteId, tenantId, ownerId]
+  );
+  if (rows.length !== 1) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Quote UPDATE affected unexpected row count',
+      hint: `quote_id=${quoteId} rowCount=${rows.length}; expected 1`,
+    });
+  }
+  return {
+    quoteId: rows[0].id,
+    status: rows[0].status,
+    updatedAt: rows[0].updated_at,
+  };
+}
+
+/**
+ * insertNameMismatchEvent — fires when computeNameMatch result's
+ * matches === false. Called AFTER signature INSERT because the event
+ * references signature_id via composite FK (Migration 4 requires
+ * signature_id NOT NULL for this kind per
+ * chiefos_qe_payload_name_mismatch_signed CHECK).
+ *
+ * Payload validation: Caller composes payload; helper does not
+ * validate shape. Migration 4's chiefos_qe_payload_name_mismatch_signed
+ * CHECK enforces minimum (payload ? 'rule_id' AND signature_id
+ * NOT NULL). Missing required key surfaces as pg 23514 at INSERT
+ * time; the handler is responsible for composing the payload
+ * correctly from computeNameMatch's fixed return shape:
+ *   { rule_id, typed_signer_name, recipient_name_at_sign,
+ *     recipient_last_token, typed_last_token,
+ *     recipient_normalized, typed_normalized }
+ */
+async function insertNameMismatchEvent(client, {
+  tenantId, ownerId, correlationId,
+  quoteId, quoteVersionId, signatureId,
+  payload,
+  actorSource, actorUserId,
+  occurredAt,
+}) {
+  const { rows } = await client.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id,
+        signature_id, correlation_id,
+        emitted_at, payload
+      )
+      VALUES ($1, $2, $3, $4,
+              'integrity.name_mismatch_signed', $5, $6,
+              $7, $8,
+              $9, $10::jsonb)
+      RETURNING id, emitted_at`,
+    [
+      tenantId, ownerId, quoteId, quoteVersionId,
+      actorSource, actorUserId,
+      signatureId, correlationId,
+      occurredAt, JSON.stringify(payload),
+    ]
+  );
+  return { eventId: rows[0].id, emittedAt: rows[0].emitted_at };
+}
+
 // ─── SendQuote schemas (§14 / §22) ──────────────────────────────────────────
 //
 // Second new-idiom handler in the Quote spine. Operates on an existing
@@ -2431,6 +2665,12 @@ module.exports = {
     SIGN_LOAD_COLUMNS,
     loadSignContext,
     buildVersionHashInput,
+    // SignQuote Section 4 (transaction-body helpers)
+    insertSignedEvent,
+    insertSignature,
+    updateVersionLocked,
+    updateQuoteSigned,
+    insertNameMismatchEvent,
   },
 };
 

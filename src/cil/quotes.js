@@ -52,9 +52,15 @@ const { BaseCILZ, UUIDZ, CurrencyZ, PhoneE164Z } = require('./schema');
 const {
   PNG_MAX_BASE64_LENGTH,
   SIG_ERR,
+  buildSignatureStorageKey,
+  uploadSignaturePng,
+  cleanupOrphanPng,
   _internals: _qssInternals,
 } = require('./quoteSignatureStorage');
 const { resolveShareTokenByValue } = _qssInternals;
+const { computeVersionHash } = require('./quoteHash');
+const { computeNameMatch } = require('./signatureNameMatch');
+const supabaseAdmin = require('../../services/supabaseAdmin');
 const {
   CilIntegrityError,
   classifyCilError,
@@ -467,6 +473,13 @@ async function loadSignContext({ pg, tenantId, shareToken }) {
 
   // ─── Composed validated context ───────────────────────────────────────
   return {
+    // tenantId / ownerId are asserted equal to data.tenant_id via the
+    // token tenant-check above. Handler uses these as authoritative
+    // identity for the rest of execution (avoids threading data.tenant_id
+    // and ctx.owner_id through every helper call; context is self-sufficient).
+    tenantId: token.tenant_id,
+    ownerId: token.owner_id,
+
     // Share-token identity
     shareTokenId: token.share_token_id,
     shareTokenValue: shareToken,
@@ -783,6 +796,565 @@ async function insertNameMismatchEvent(client, {
     ]
   );
   return { eventId: rows[0].id, emittedAt: rows[0].emitted_at };
+}
+
+// ─── Phase 3 Section 5: handleSignQuote orchestration ──────────────────────
+//
+// Third new-idiom handler. First non-owner actor (customer via share-token
+// bearer auth). Composes Phase 1 (computeVersionHash) + Phase 2
+// (uploadSignaturePng, getSignatureViaShareToken) + Sections 1-4 (schema,
+// name-match, loadSignContext, transaction helpers) into the 23-step
+// sequence specified in DB3 Q3.9.
+//
+// Post-commit notification event failures:
+//
+// After transaction commit, the signature is real and permanent. If the
+// sendEmail call fails OR emitNotificationSent itself fails (e.g. pg pool
+// lost), the catch block calls emitNotificationFailed. If
+// emitNotificationFailed ALSO fails, the error propagates as 500-class to
+// signal degraded observability. The signed state is nonetheless real;
+// client retry with same source_msg_id hits lookupPriorSignature and
+// returns the signed state correctly.
+//
+// This matches SendQuote's post-commit posture exactly (handleSendQuote
+// steps 20-22 verified 2026-04-21). §17.19 Refinement B covers the
+// general pattern; the "emitter-failure-escalates" behavior is implicit
+// in the "await emitNotificationFailed" shape inside the catch.
+
+/**
+ * lookupPriorSignature — SignQuote's analog of lookupPriorShareToken.
+ * Pre-transaction SELECT to detect idempotent retry. Joins
+ * signatures → version → quote → share_token for the full multi-entity
+ * state needed by priorSignatureToReturnShape.
+ *
+ * Per DB3 Tightening 3: returns prior state REGARDLESS of current
+ * share_token state. Signatures are strict-immutable per Migration 4;
+ * retries return the completed state unconditionally. Share_token
+ * validity is only checked on first-time sign attempts at loadSignContext.
+ */
+async function lookupPriorSignature(ownerId, sourceMsgId) {
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  const { rows } = await pg.query(
+    `SELECT qs.id                         AS signature_id,
+            qs.quote_version_id,
+            qs.tenant_id,
+            qs.owner_id,
+            qs.signed_event_id,
+            qs.share_token_id,
+            qs.signer_name,
+            qs.signed_at,
+            qs.name_match_at_sign,
+            qs.recipient_name_at_sign,
+            qs.signature_png_storage_key,
+            qs.signature_png_sha256,
+            qs.version_hash_at_sign,
+            s.token                       AS share_token_value,
+            s.absolute_expires_at,
+            s.recipient_channel,
+            s.recipient_address,
+            q.id                          AS quote_id,
+            q.human_id,
+            q.status                      AS quote_status,
+            q.job_id,
+            q.customer_id,
+            q.current_version_id,
+            q.created_at                  AS header_created_at,
+            v.version_no,
+            v.project_title,
+            v.currency,
+            v.total_cents,
+            v.customer_snapshot,
+            v.tenant_snapshot,
+            v.locked_at                   AS version_locked_at,
+            v.server_hash                 AS version_server_hash,
+            v.signed_at                   AS version_signed_at,
+            v.status                      AS version_status
+       FROM public.chiefos_quote_signatures qs
+       JOIN public.chiefos_quote_share_tokens s
+         ON s.id = qs.share_token_id AND s.tenant_id = qs.tenant_id
+       JOIN public.chiefos_quote_versions v
+         ON v.id = qs.quote_version_id AND v.tenant_id = qs.tenant_id
+       JOIN public.chiefos_quotes q
+         ON q.id = v.quote_id AND q.tenant_id = v.tenant_id
+      WHERE qs.owner_id = $1 AND qs.source_msg_id = $2
+      LIMIT 1`,
+    [ownerId, sourceMsgId]
+  );
+  return rows[0] || null;
+}
+
+/**
+ * composeNameMismatchPayload — builds the 7-key forensic payload for
+ * integrity.name_mismatch_signed events. Pure function; testable in
+ * isolation.
+ */
+function composeNameMismatchPayload(nameMatchResult, signerName, recipientName) {
+  return {
+    rule_id: nameMatchResult.ruleId,
+    typed_signer_name: signerName,
+    recipient_name_at_sign: recipientName,
+    recipient_last_token: nameMatchResult.recipientLastToken,
+    typed_last_token: nameMatchResult.typedLastToken,
+    recipient_normalized: nameMatchResult.recipientNormalized,
+    typed_normalized: nameMatchResult.typedNormalized,
+  };
+}
+
+/**
+ * composeSignQuoteEmail — contractor confirmation email. Mirrors
+ * buildSendQuoteEmail shape. Name-match status is explicit in body
+ * text so contractors see mismatch forensics without opening portal.
+ */
+function composeSignQuoteEmail({ ctx, signatureInfo, nameMatchResult, shareUrl }) {
+  const brandName = (ctx.tenantSnapshot && ctx.tenantSnapshot.brand_name)
+    || (ctx.tenantSnapshot && ctx.tenantSnapshot.legal_name)
+    || 'ChiefOS';
+  const subject = `[${brandName}] ${ctx.recipientName} signed ${ctx.humanId}`;
+  const matchLine = nameMatchResult.matches
+    ? 'Name match:  MATCHED'
+    : `Name match:  MISMATCH — typed "${signatureInfo.typedName}" vs recipient "${ctx.recipientName}"`;
+  const textBody = [
+    `${ctx.recipientName} signed ${ctx.humanId} (${ctx.projectTitle}).`,
+    '',
+    `Total:       ${formatCentsAsCurrency(ctx.totalCents, ctx.currency)}`,
+    `Signed at:   ${signatureInfo.signedAt instanceof Date ? signatureInfo.signedAt.toISOString() : signatureInfo.signedAt}`,
+    `SHA-256:     ${signatureInfo.sha256}`,
+    matchLine,
+    '',
+    `View signed quote:  ${shareUrl}`,
+    '',
+    '— ChiefOS',
+  ].join('\n');
+  return { subject, textBody };
+}
+
+/**
+ * buildSignQuoteReturnShape — §17.15 multi-entity return composer.
+ * Includes signature, quote, version, share_token entities + meta with
+ * correlation_id + events_emitted list + already_existed flag.
+ *
+ * Intentionally separate composer per handler per §17.15 Q2:
+ * parameterizing across handlers grows into 40-line conditional blocks.
+ */
+function buildSignQuoteReturnShape({
+  signCtx, sigResult, verResult, qResult, uploadResult,
+  correlationId, eventsEmitted, alreadyExisted, traceId,
+}) {
+  return {
+    ok: true,
+    signature: {
+      id: sigResult.signatureId,
+      signed_at: sigResult.signedAt,
+      name_match_at_sign: sigResult.nameMatchAtSign,
+      sha256: (uploadResult && uploadResult.sha256) || sigResult.sha256 || null,
+      storage_key: sigResult.storageKey || null,
+    },
+    quote: {
+      id: qResult.quoteId,
+      human_id: signCtx.humanId,
+      status: qResult.status,
+      updated_at: qResult.updatedAt,
+    },
+    version: {
+      id: verResult.versionId,
+      version_no: signCtx.versionNo,
+      status: verResult.status,
+      locked_at: verResult.lockedAt,
+      server_hash: verResult.serverHash,
+      signed_at: verResult.signedAt,
+    },
+    share_token: {
+      id: signCtx.shareTokenId,
+      token: signCtx.shareTokenValue,
+    },
+    meta: {
+      already_existed: alreadyExisted,
+      events_emitted: eventsEmitted,
+      correlation_id: correlationId,
+      traceId,
+    },
+  };
+}
+
+/**
+ * priorSignatureToReturnShape — composes §17.15 shape from
+ * lookupPriorSignature row. Retry returns the ORIGINAL call's committed
+ * state; events_emitted is [] because the original invocation emitted
+ * (retry does not re-emit).
+ */
+function priorSignatureToReturnShape(prior, traceId) {
+  return {
+    ok: true,
+    signature: {
+      id: prior.signature_id,
+      signed_at: prior.signed_at,
+      name_match_at_sign: prior.name_match_at_sign,
+      sha256: prior.signature_png_sha256,
+      storage_key: prior.signature_png_storage_key,
+    },
+    quote: {
+      id: prior.quote_id,
+      human_id: prior.human_id,
+      status: prior.quote_status,
+      updated_at: null,  // not captured on retry; header timestamps are not part of prior-lookup SELECT
+    },
+    version: {
+      id: prior.quote_version_id,
+      version_no: prior.version_no,
+      status: prior.version_status,
+      locked_at: prior.version_locked_at,
+      server_hash: prior.version_server_hash,
+      signed_at: prior.version_signed_at,
+    },
+    share_token: {
+      id: prior.share_token_id,
+      token: prior.share_token_value,
+    },
+    meta: {
+      already_existed: true,
+      events_emitted: [],
+      correlation_id: null,  // original invocation's correlation_id is not persisted on signature row; lookup cannot recover it
+      traceId,
+    },
+  };
+}
+
+/**
+ * handleSignQuote — third new-idiom CIL handler.
+ *
+ * 23-step sequence per DB3 Q3.9:
+ *   1.  ctx preflight
+ *   2.  Zod validation
+ *   3.  no plan gating (§14 customer exemption)
+ *   4.  actor role check (defense-in-depth; Zod locks to 'customer')
+ *   5.  pre-txn idempotent retry lookup
+ *   6-7. load share-token + quote + version + line items
+ *   8.  compute server_hash via Phase 1
+ *   9.  pre-generate signatureId (§17.20)
+ *   10. build storage_key via Phase 2
+ *   11. correlation_id (DB3 Q3.6)
+ *   12. name-match (§11a)
+ *   13. upload PNG (pre-BEGIN per §17.20)
+ *   14-19. transaction: lifecycle.signed → signature → version lock →
+ *          quote signed → conditional mismatch event → COMMIT
+ *   20-22. post-commit: compose email → Postmark dispatch → paired
+ *          notification.sent / notification.failed (§17.19)
+ *   23. multi-entity §17.15 return shape
+ */
+async function handleSignQuote(rawCil, ctx) {
+  // ─── Step 1: ctx preflight (§17.17 addendum 2) ───────────────────────────
+  if (!ctx || !ctx.owner_id) {
+    return errEnvelope({
+      code: 'OWNER_ID_MISSING',
+      message: 'ctx.owner_id is required',
+      hint: 'Upstream identity resolver must populate ctx.owner_id before applyCIL',
+      traceId: (ctx && ctx.traceId) || null,
+    });
+  }
+  if (!ctx.traceId) {
+    return errEnvelope({
+      code: 'TRACE_ID_MISSING',
+      message: 'ctx.traceId is required',
+      hint: 'Upstream request handler must populate ctx.traceId before applyCIL',
+      traceId: null,
+    });
+  }
+
+  // ─── Step 2: Zod validation ──────────────────────────────────────────────
+  const parsed = SignQuoteCILZ.safeParse(rawCil);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const pathStr = issue && issue.path && issue.path.length ? issue.path.join('.') : '<root>';
+    return errEnvelope({
+      code: 'CIL_SCHEMA_INVALID',
+      message: issue ? `${pathStr}: ${issue.message}` : 'SignQuote input failed validation',
+      hint: 'See docs/QUOTES_SPINE_DECISIONS.md §23 for the SignQuoteCILZ input contract',
+      traceId: ctx.traceId,
+    });
+  }
+  const data = parsed.data;
+
+  // ─── Step 3: no plan gating (§14 customer-action exemption) ──────────────
+
+  // ─── Step 4: actor role check (defense-in-depth; Zod locks role) ─────────
+  if (data.actor.role !== 'customer') {
+    return errEnvelope({
+      code: 'PERMISSION_DENIED',
+      message: 'SignQuote is customer-only',
+      hint: 'Share-token-authenticated customer sign flow; actor.role must be "customer"',
+      traceId: ctx.traceId,
+    });
+  }
+
+  // ─── Step 5: pre-txn idempotent retry ────────────────────────────────────
+  const preTxnPrior = await lookupPriorSignature(ctx.owner_id, data.source_msg_id);
+  if (preTxnPrior) return priorSignatureToReturnShape(preTxnPrior, ctx.traceId);
+
+  // ─── Steps 6-7: load share-token + quote + version + line items ──────────
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  let signCtx;
+  try {
+    signCtx = await loadSignContext({
+      pg,
+      tenantId: data.tenant_id,
+      shareToken: data.share_token,
+    });
+  } catch (loadErr) {
+    if (loadErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: loadErr.code,
+        message: loadErr.message,
+        hint: loadErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw loadErr;  // non-CIL errors propagate for 500-class
+  }
+
+  // ─── Step 8: compute server_hash (Phase 1) ───────────────────────────────
+  const { hex: serverHash } = computeVersionHash(
+    buildVersionHashInput(signCtx),
+    signCtx.lineItems
+  );
+
+  // ─── Step 9: pre-generate signatureId (§17.20 strict-immutable write) ────
+  const signatureId = crypto.randomUUID();
+
+  // ─── Step 10: build storage_key (Phase 2) ────────────────────────────────
+  const storageKey = buildSignatureStorageKey({
+    tenantId: signCtx.tenantId,
+    quoteId: signCtx.quoteId,
+    quoteVersionId: signCtx.versionId,
+    signatureId,
+  });
+
+  // ─── Step 11: generate correlation_id (DB3 Q3.6) ─────────────────────────
+  const correlationId = crypto.randomUUID();
+
+  // ─── Step 12: name-match (§11a) ──────────────────────────────────────────
+  const nameMatchResult = computeNameMatch(signCtx.recipientName, data.signer_name);
+
+  // ─── Step 13: upload PNG (pre-BEGIN per §17.20) ──────────────────────────
+  let uploadResult;
+  try {
+    uploadResult = await uploadSignaturePng({
+      pngDataUrl: data.signature_png_data_url,
+      storageKey,
+      supabaseAdmin,
+    });
+  } catch (uploadErr) {
+    if (uploadErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: uploadErr.code,
+        message: uploadErr.message,
+        hint: uploadErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw uploadErr;
+  }
+
+  // ─── Steps 14-19: transaction ────────────────────────────────────────────
+  const actorSource = CIL_TO_EVENT_ACTOR_SOURCE[data.source];  // 'web' → 'portal'
+  const actorUserId = data.actor.actor_id;
+  const emittedAt = data.occurred_at;
+
+  let txnResult;
+  try {
+    txnResult = await pg.withClient(async (client) => {
+      // Step 14 — lifecycle.signed event (FK target for signature.signed_event_id)
+      const signedEvent = await insertSignedEvent(client, {
+        tenantId: signCtx.tenantId,
+        ownerId: signCtx.ownerId,
+        correlationId,
+        quoteId: signCtx.quoteId,
+        quoteVersionId: signCtx.versionId,
+        shareTokenId: signCtx.shareTokenId,
+        versionHashAtSign: serverHash,
+        actorSource,
+        actorUserId,
+        occurredAt: emittedAt,
+      });
+
+      // Step 15 — signature row (strict-immutable INSERT)
+      const sigResult = await insertSignature(client, {
+        signatureId,
+        quoteVersionId: signCtx.versionId,
+        tenantId: signCtx.tenantId,
+        ownerId: signCtx.ownerId,
+        signedEventId: signedEvent.signedEventId,
+        shareTokenId: signCtx.shareTokenId,
+        signerName: data.signer_name,
+        signerEmail: null,  // not captured in Beta
+        signerIp: (ctx && ctx.signer_ip) || null,
+        signerUserAgent: (ctx && ctx.signer_user_agent) || null,
+        signaturePngStorageKey: storageKey,
+        signaturePngSha256: uploadResult.sha256,
+        versionHashAtSign: serverHash,
+        nameMatchAtSign: nameMatchResult.matches,
+        recipientNameAtSign: signCtx.recipientName,
+        sourceMsgId: data.source_msg_id,
+      });
+
+      // Step 16 — version lock (single atomic UPDATE)
+      const verResult = await updateVersionLocked(client, {
+        versionId: signCtx.versionId,
+        tenantId: signCtx.tenantId,
+        ownerId: signCtx.ownerId,
+        serverHash,
+      });
+
+      // Step 17 — quote header → signed
+      const qResult = await updateQuoteSigned(client, {
+        quoteId: signCtx.quoteId,
+        tenantId: signCtx.tenantId,
+        ownerId: signCtx.ownerId,
+      });
+
+      // Step 18 — conditional name-mismatch event
+      let mismatchEvent = null;
+      if (!nameMatchResult.matches) {
+        mismatchEvent = await insertNameMismatchEvent(client, {
+          tenantId: signCtx.tenantId,
+          ownerId: signCtx.ownerId,
+          correlationId,
+          quoteId: signCtx.quoteId,
+          quoteVersionId: signCtx.versionId,
+          signatureId: sigResult.signatureId,
+          payload: composeNameMismatchPayload(nameMatchResult, data.signer_name, signCtx.recipientName),
+          actorSource,
+          actorUserId,
+          occurredAt: emittedAt,
+        });
+      }
+
+      return { signedEvent, sigResult, verResult, qResult, mismatchEvent };
+    });
+  } catch (txnErr) {
+    // Orphan cleanup removes THIS call's upload (uploaded at step 13 with
+    // a fresh signatureId). The prior call's signature and PNG (at a
+    // different storageKey via a different signatureId) remain intact —
+    // they are the prior signature's permanent record.
+    await cleanupOrphanPng({ supabaseAdmin, storageKey });
+
+    const c = classifyCilError(txnErr, {
+      expectedSourceMsgConstraint: SIGN_QUOTE_SOURCE_MSG_CONSTRAINT,
+    });
+
+    if (c.kind === 'semantic_error') {
+      return errEnvelope({
+        code: c.error.code,
+        message: c.error.message,
+        hint: c.error.hint,
+        traceId: ctx.traceId,
+      });
+    }
+
+    if (c.kind === 'idempotent_retry') {
+      const prior = await lookupPriorSignature(ctx.owner_id, data.source_msg_id);
+      if (!prior) {
+        throw new Error(
+          `Idempotent retry lookup missed for SignQuote (${ctx.owner_id}, ${data.source_msg_id})`
+        );
+      }
+      return priorSignatureToReturnShape(prior, ctx.traceId);
+    }
+
+    if (c.kind === 'integrity_error') {
+      return errEnvelope({
+        code: 'CIL_INTEGRITY_ERROR',
+        message: `Unique constraint violation on ${c.constraint}`,
+        hint: 'Signature for this version already exists or FK drift detected',
+        traceId: ctx.traceId,
+      });
+    }
+
+    throw txnErr;  // not_unique_violation — 500-class
+  }
+
+  // ─── Steps 20-22: post-commit Postmark + paired notification events ──────
+  const { sigResult, verResult, qResult, mismatchEvent } = txnResult;
+  const eventsEmitted = ['lifecycle.signed'];
+  if (mismatchEvent) eventsEmitted.push('integrity.name_mismatch_signed');
+
+  const shareUrl = buildQuoteShareUrl(data.share_token);
+  const contractorEmail = (signCtx.tenantSnapshot && signCtx.tenantSnapshot.email) || null;
+
+  const sharedNotificationArgs = {
+    quoteId: signCtx.quoteId,
+    versionId: signCtx.versionId,
+    tenantId: signCtx.tenantId,
+    ownerId: signCtx.ownerId,
+    actorSource,
+    actorUserId,
+    emittedAt,
+    customerId: signCtx.customerId,
+    shareTokenId: signCtx.shareTokenId,
+    channel: 'email',
+    recipient: contractorEmail,
+    correlationId,  // threaded through extended emitters (first handler wiring this)
+  };
+
+  if (!contractorEmail) {
+    // No contractor email on tenant snapshot — emit notification.failed
+    // forensically. Signature is committed; only the notification is
+    // skipped. Handler return remains ok:true.
+    await emitNotificationFailed(pg, {
+      ...sharedNotificationArgs,
+      errorCode: 'NO_CONTRACTOR_EMAIL',
+      errorMessage: 'tenant_snapshot.email is null; contractor notification skipped. Signature completed successfully.',
+    });
+    eventsEmitted.push('notification.failed');
+  } else {
+    const { subject, textBody } = composeSignQuoteEmail({
+      ctx: signCtx,
+      signatureInfo: {
+        signedAt: sigResult.signedAt,
+        sha256: uploadResult.sha256,
+        typedName: data.signer_name,
+      },
+      nameMatchResult,
+      shareUrl,
+    });
+
+    const sendEmail = getSendEmail();
+    try {
+      const postmarkResult = await sendEmail({
+        to: contractorEmail,
+        subject,
+        textBody,
+      });
+      await emitNotificationSent(pg, {
+        ...sharedNotificationArgs,
+        providerMessageId: (postmarkResult && postmarkResult.MessageID) || 'unknown',
+      });
+      eventsEmitted.push('notification.sent');
+    } catch (postmarkErr) {
+      await emitNotificationFailed(pg, {
+        ...sharedNotificationArgs,
+        errorCode: postmarkErr.ErrorCode || postmarkErr.errorCode || postmarkErr.code || 'unknown',
+        errorMessage: postmarkErr.Message || postmarkErr.message || 'unknown',
+      });
+      eventsEmitted.push('notification.failed');
+      // Do NOT rethrow per §17.19 Refinement B — signature is real and
+      // permanent post-commit. Email failure is notification-facet only.
+    }
+  }
+
+  // ─── Step 23: multi-entity §17.15 return shape ───────────────────────────
+  return buildSignQuoteReturnShape({
+    signCtx,
+    sigResult,
+    verResult,
+    qResult,
+    uploadResult,
+    correlationId,
+    eventsEmitted,
+    alreadyExisted: false,
+    traceId: ctx.traceId,
+  });
 }
 
 // ─── SendQuote schemas (§14 / §22) ──────────────────────────────────────────
@@ -1868,6 +2440,7 @@ async function emitNotificationSent(pgApi, {
   actorSource, actorUserId, emittedAt,
   customerId, shareTokenId,
   channel, recipient, providerMessageId,
+  correlationId = null,  // Phase 3 Section 5 extension — optional; SendQuote passes nothing (default null).
 }) {
   const payload = {
     channel,
@@ -1883,11 +2456,11 @@ async function emitNotificationSent(pgApi, {
       )
       VALUES ($1, $2, $3, $4,
               'notification.sent', $5, $6, $7,
-              $8, $9, NULL, $10)`,
+              $8, $9, $10, $11)`,
     [
       tenantId, ownerId, quoteId, versionId,
       actorSource, actorUserId || null, emittedAt,
-      customerId || null, shareTokenId, payload,
+      customerId || null, shareTokenId, correlationId, payload,
     ]
   );
 }
@@ -1897,6 +2470,7 @@ async function emitNotificationFailed(pgApi, {
   actorSource, actorUserId, emittedAt,
   customerId, shareTokenId,
   channel, recipient, errorCode, errorMessage,
+  correlationId = null,  // Phase 3 Section 5 extension — optional; SendQuote passes nothing (default null).
 }) {
   // provider_message_id: null — no Postmark ID on failure. The `?` JSONB
   // operator tests key existence, not value; null satisfies the CHECK.
@@ -1916,11 +2490,11 @@ async function emitNotificationFailed(pgApi, {
       )
       VALUES ($1, $2, $3, $4,
               'notification.failed', $5, $6, $7,
-              $8, $9, NULL, $10)`,
+              $8, $9, $10, $11)`,
     [
       tenantId, ownerId, quoteId, versionId,
       actorSource, actorUserId || null, emittedAt,
-      customerId || null, shareTokenId, payload,
+      customerId || null, shareTokenId, correlationId, payload,
     ]
   );
 }
@@ -2599,6 +3173,7 @@ async function handleSendQuote(rawCil, ctx) {
 module.exports = {
   handleCreateQuote,
   handleSendQuote,
+  handleSignQuote,
   CreateQuoteCILZ,
   SendQuoteCILZ,
   // Test-only internals. Not part of the handler's public contract. External
@@ -2671,6 +3246,12 @@ module.exports = {
     updateVersionLocked,
     updateQuoteSigned,
     insertNameMismatchEvent,
+    // SignQuote Section 5 (handler + orchestration helpers)
+    lookupPriorSignature,
+    priorSignatureToReturnShape,
+    composeNameMismatchPayload,
+    composeSignQuoteEmail,
+    buildSignQuoteReturnShape,
   },
 };
 

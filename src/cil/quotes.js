@@ -2500,7 +2500,19 @@ function resolveRecipient({ parsedRecipientEmail, parsedRecipientName, customerS
 // changes only touch this helper.
 
 function generateShareToken() {
-  return bs58.encode(crypto.randomBytes(16));
+  // bs58 encoding of 16 random bytes produces 22 chars ~97.2% of the
+  // time and 21 chars ~2.8% of the time (when the 128-bit value happens
+  // to fit in 58^21 ≈ 5.2×10^36). Migration 3's chiefos_qst_token_format
+  // CHECK requires exactly 22. Retry on short output. Expected iterations
+  // per call: ~1.03. 20-iteration bound is defense against pathological
+  // RNG failure (probability of 20 consecutive short outputs: ~10^-31).
+  for (let i = 0; i < 20; i++) {
+    const token = bs58.encode(crypto.randomBytes(16));
+    if (token.length === 22) return token;
+  }
+  throw new Error(
+    'generateShareToken: 20 consecutive short outputs — entropy failure'
+  );
 }
 
 async function insertShareToken(client, {

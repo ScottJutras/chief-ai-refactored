@@ -1776,10 +1776,19 @@ describe('SendQuote — Section 3: resolveRecipient', () => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 describe('SendQuote — Section 4a: generateShareToken (unit)', () => {
-  test('generateShareToken produces 22-char base58 (Bitcoin alphabet)', () => {
-    const token = generateShareToken();
-    expect(token).toHaveLength(22);
-    expect(token).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
+  // Regression lock for the bs58-short-output production bug. Prior
+  // version (`return bs58.encode(crypto.randomBytes(16))` — no retry)
+  // returned 21-char tokens ~2.83% of the time. Migration 3's
+  // chiefos_qst_token_format CHECK requires exactly 22, so ~3% of real
+  // SendQuote calls would fail with 23514. 10,000-iteration assertion
+  // would fire ~283 times against the unfixed function; under the fix
+  // it must produce zero failures.
+  test('generateShareToken produces 22-char base58 across 10,000 calls (bs58 short-output regression lock)', () => {
+    for (let i = 0; i < 10000; i++) {
+      const token = generateShareToken();
+      expect(token).toHaveLength(22);
+      expect(token).toMatch(/^[1-9A-HJ-NP-Za-km-z]+$/);
+    }
   });
 
   test('generateShareToken produces unique tokens (100 calls, 0 collisions)', () => {

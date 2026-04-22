@@ -2348,6 +2348,7 @@ async function emitLifecycleSent(client, {
   actorSource, actorUserId, emittedAt,
   customerId, shareTokenId,
   recipientChannel, recipientAddress, recipientName,
+  correlationId = null,  // Phase A Session 1 extension — optional; pre-Phase-A callers default null.
 }) {
   const payload = {
     recipient_channel: recipientChannel,
@@ -2362,11 +2363,11 @@ async function emitLifecycleSent(client, {
       )
       VALUES ($1, $2, $3, $4,
               'lifecycle.sent', $5, $6, $7,
-              $8, $9, NULL, $10)`,
+              $8, $9, $10, $11)`,
     [
       tenantId, ownerId, quoteId, versionId,
       actorSource, actorUserId || null, emittedAt,
-      customerId || null, shareTokenId, payload,
+      customerId || null, shareTokenId, correlationId, payload,
     ]
   );
 }
@@ -2857,6 +2858,10 @@ function priorShareTokenToReturnShape(prior, traceId) {
     alreadyExisted: true,
     eventsEmitted: [],  // §17.15 clarification: retry emitted no events
     traceId,
+    // §17.21: the original invocation's correlation_id is not persisted on
+    // the share_token row, so the retry path cannot surface it. Same
+    // limitation as priorSignatureToReturnShape per §27.
+    correlationId: null,
   });
 }
 
@@ -2882,7 +2887,7 @@ function buildSendQuoteReturnShape({
   shareTokenId, token, absoluteExpiresAt,
   recipientChannel, recipientAddress, recipientName, shareUrl,
   // meta
-  alreadyExisted, eventsEmitted, traceId,
+  alreadyExisted, eventsEmitted, traceId, correlationId = null,
 }) {
   return {
     ok: true,
@@ -2919,6 +2924,7 @@ function buildSendQuoteReturnShape({
       already_existed: alreadyExisted,
       events_emitted: eventsEmitted,
       traceId,
+      correlation_id: correlationId,
     },
   };
 }
@@ -2985,6 +2991,13 @@ async function handleSendQuote(rawCil, ctx) {
     return priorShareTokenToReturnShape(preTxnPrior, ctx.traceId);
   }
 
+  // ─── correlation_id for event-chain grouping (§17.21) ─────────────────────
+  // Phase A Session 1 backfill: threaded through every chiefos_quote_events
+  // row emitted by this invocation — lifecycle.sent (inside txn) +
+  // notification.sent or notification.failed (post-commit). Closes the
+  // §17.21 asymmetry flagged during Phase 3 §27.
+  const correlationId = crypto.randomUUID();
+
   let txnResult;
   try {
     txnResult = await pg.withClient(async (client) => {
@@ -3035,6 +3048,7 @@ async function handleSendQuote(rawCil, ctx) {
         recipientChannel: 'email',
         recipientAddress: recipient.email,
         recipientName: recipient.name,
+        correlationId,  // Phase A Session 1: §17.21 wiring
       });
 
       return { loaded, recipient, tokenRow };
@@ -3112,6 +3126,7 @@ async function handleSendQuote(rawCil, ctx) {
     shareTokenId: tokenRow.id,
     channel: 'email',
     recipient: recipient.email,
+    correlationId,  // Phase A Session 1: §17.21 wiring — flows through to both emitNotificationSent (success) and emitNotificationFailed (catch branch)
   };
 
   const sendEmail = getSendEmail();
@@ -3168,6 +3183,7 @@ async function handleSendQuote(rawCil, ctx) {
     alreadyExisted: false,
     eventsEmitted,
     traceId: ctx.traceId,
+    correlationId,  // Phase A Session 1: §17.21 wiring — threads through meta.correlation_id
   });
 }
 

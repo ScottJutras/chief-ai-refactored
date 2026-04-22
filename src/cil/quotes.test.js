@@ -1491,6 +1491,7 @@ const {
   markQuoteSent, emitLifecycleSent,
   buildQuoteShareUrl, formatCentsAsCurrency, buildSendQuoteEmail,
   emitNotificationSent, emitNotificationFailed,
+  buildSendQuoteReturnShape, priorShareTokenToReturnShape,
   APP_URL,
 } = _internals;
 
@@ -2138,6 +2139,51 @@ describeIfDb('SendQuote — Section 5: state transitions + lifecycle.sent (integ
       client.release();
     }
   });
+
+  test('emitLifecycleSent: correlationId param writes through to correlation_id column (§17.21 Phase A Session 1)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedDraftQuote(client, pre);
+
+      const tokenRow = await insertShareToken(client, {
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        quoteVersionId: version.id,
+        token: generateShareToken(),
+        recipient: { name: 'Darlene MacDonald', email: 'darlene@example.com' },
+        sourceMsgId: `test-send-s5-corr-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      });
+
+      const corr = '11111111-2222-3333-4444-555555555555';
+      await emitLifecycleSent(client, {
+        quoteId: header.id,
+        versionId: version.id,
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        actorSource: 'whatsapp',
+        actorUserId: pre.ownerId,
+        emittedAt: '2026-04-19T12:00:00.000Z',
+        customerId: pre.customer.id,
+        shareTokenId: tokenRow.id,
+        recipientChannel: 'email',
+        recipientAddress: 'darlene@example.com',
+        recipientName: 'Darlene MacDonald',
+        correlationId: corr,
+      });
+
+      const rows = await client.query(
+        `SELECT correlation_id FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.sent'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      expect(rows.rows[0].correlation_id).toBe(corr);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2327,6 +2373,88 @@ describeIfDb('SendQuote — Section 6b: notification.* emitters (integration)', 
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SendQuote — Section 6c: return-shape composers (unit, no DB)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('SendQuote — Section 6c: buildSendQuoteReturnShape (unit)', () => {
+  const baseArgs = {
+    quoteId: '00000000-1111-2222-3333-444444444401',
+    versionId: '00000000-1111-2222-3333-444444444402',
+    humanId: 'QT-2026-04-19-0042',
+    versionNo: 1,
+    status: 'sent',
+    currency: 'CAD',
+    totalCents: 1130,
+    customer: {
+      id: '00000000-1111-2222-3333-444444444403',
+      name: 'Darlene MacDonald',
+      email: 'darlene@example.com',
+      phone_e164: '+15195550199',
+    },
+    jobId: 9001,
+    issuedAt: '2026-04-19T12:00:00.000Z',
+    createdAt: '2026-04-18T10:00:00.000Z',
+    shareTokenId: '00000000-1111-2222-3333-444444444404',
+    token: '8xur5soy9bbnu8ypyaJehv',
+    absoluteExpiresAt: '2026-05-19T12:00:00.000Z',
+    recipientChannel: 'email',
+    recipientAddress: 'darlene@example.com',
+    recipientName: 'Darlene MacDonald',
+    shareUrl: 'https://app.usechiefos.com/q/8xur5soy9bbnu8ypyaJehv',
+    alreadyExisted: false,
+    eventsEmitted: ['lifecycle.sent', 'notification.sent'],
+    traceId: 'trace-s6c-1',
+  };
+
+  test('correlationId param surfaces at meta.correlation_id (§17.21 Phase A Session 1)', () => {
+    const corr = '11111111-2222-3333-4444-555555555555';
+    const shape = buildSendQuoteReturnShape({ ...baseArgs, correlationId: corr });
+    expect(shape.meta.correlation_id).toBe(corr);
+  });
+
+  test('omitted correlationId defaults meta.correlation_id to null (backward compat)', () => {
+    const shape = buildSendQuoteReturnShape({ ...baseArgs });  // no correlationId
+    expect(shape.meta).toHaveProperty('correlation_id', null);
+  });
+});
+
+describe('SendQuote — Section 6c: priorShareTokenToReturnShape (unit)', () => {
+  const priorRow = {
+    quote_id: '00000000-1111-2222-3333-444444444501',
+    version_id: '00000000-1111-2222-3333-444444444502',
+    human_id: 'QT-2026-04-19-0043',
+    version_no: 1,
+    status: 'sent',
+    currency: 'CAD',
+    total_cents: '1130',  // bigint as string from pg
+    customer_id: '00000000-1111-2222-3333-444444444503',
+    customer_snapshot: { name: 'Darlene MacDonald', email: 'darlene@example.com', phone_e164: '+15195550199' },
+    tenant_snapshot: {},
+    project_title: 'T',
+    job_id: 9001,
+    issued_at: '2026-04-19T12:00:00.000Z',
+    header_created_at: '2026-04-18T10:00:00.000Z',
+    share_token_id: '00000000-1111-2222-3333-444444444504',
+    token: '8xur5soy9bbnu8ypyaJehv',
+    absolute_expires_at: '2026-05-19T12:00:00.000Z',
+    recipient_name: 'Darlene MacDonald',
+    recipient_channel: 'email',
+    recipient_address: 'darlene@example.com',
+  };
+
+  test('meta.correlation_id is null (§17.21: original invocation id not persisted on share_token row)', () => {
+    const shape = priorShareTokenToReturnShape(priorRow, 'trace-retry-xyz');
+    expect(shape.meta).toHaveProperty('correlation_id', null);
+  });
+
+  test('alreadyExisted:true and eventsEmitted:[] on retry path (§17.15)', () => {
+    const shape = priorShareTokenToReturnShape(priorRow, 'trace-retry-xyz');
+    expect(shape.meta.already_existed).toBe(true);
+    expect(shape.meta.events_emitted).toEqual([]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SendQuote — Section 7: end-to-end handleSendQuote (integration + unit)
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -2445,6 +2573,7 @@ describeIfDb('SendQuote — Section 7: end-to-end integration', () => {
         already_existed: false,
         events_emitted: ['lifecycle.sent', 'notification.sent'],
         traceId: 'trace-s7-send-happy',
+        correlation_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
       });
 
       // Postmark mock was called with composed subject + textBody
@@ -2528,17 +2657,84 @@ describeIfDb('SendQuote — Section 7: end-to-end integration', () => {
       expect(first.ok).toBe(true);
       expect(first.meta.already_existed).toBe(false);
       expect(first.meta.events_emitted).toEqual(['lifecycle.sent', 'notification.sent']);
+      expect(first.meta.correlation_id).toMatch(/^[0-9a-f-]{36}$/);
 
       const retry = await handleSendQuote(sendCil, ctx);
       expect(retry.ok).toBe(true);
       expect(retry.meta.already_existed).toBe(true);
       expect(retry.meta.events_emitted).toEqual([]);   // retry emits nothing
+      // §17.21: original invocation's correlation_id is not persisted on the
+      // share_token row, so the retry path returns null. Parallels §27's
+      // priorSignatureToReturnShape behavior.
+      expect(retry.meta.correlation_id).toBeNull();
       expect(retry.share_token.id).toBe(first.share_token.id);
       expect(retry.share_token.token).toBe(first.share_token.token);
       expect(retry.quote.status).toBe('sent');
 
       // Postmark called exactly once — retry didn't re-send.
       expect(sentCalls).toHaveLength(1);
+    } finally {
+      if (quoteId) {
+        await cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey).catch(() => {});
+      }
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  }, 30000);
+
+  test('correlation_id invariant: lifecycle.sent + notification.sent share same correlation_id + match meta (§17.21)', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s7-send-corr-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s7-send-corr-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+
+    _internals.setSendEmailForTests(async (opts) => ({
+      MessageID: 'fake-postmark-corr-msg', To: opts.to,
+    }));
+
+    let quoteId;
+    try {
+      const seedQuote = await seedRealDraftForSendQuote({
+        pg, ownerId, tenantId: MISSION_TENANT_UUID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seedQuote.id;
+
+      const sendCil = {
+        cil_version: '1.0', type: 'SendQuote', tenant_id: MISSION_TENANT_UUID,
+        source: 'whatsapp', source_msg_id: sendMsgId,
+        actor: { actor_id: ownerId, role: 'owner' },
+        occurred_at: new Date().toISOString(),
+        job: null, needs_job_resolution: false,
+        quote_ref: { quote_id: seedQuote.id },
+      };
+      const result = await handleSendQuote(sendCil, {
+        owner_id: ownerId, traceId: 'trace-s7-send-corr',
+      });
+      expect(result.ok).toBe(true);
+
+      const metaCorr = result.meta.correlation_id;
+      expect(metaCorr).toMatch(/^[0-9a-f-]{36}$/);
+
+      // Both lifecycle.sent (inside-txn) and notification.sent (post-commit)
+      // must carry the same correlation_id generated once at handler entry.
+      // This is the invariant §17.21 closes: the handler MUST pass a single
+      // id through both helpers, not let each helper fall back to null.
+      const rows = await pg.query(
+        `SELECT kind, correlation_id FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind IN ('lifecycle.sent', 'notification.sent')
+          ORDER BY global_seq ASC`,
+        [seedQuote.id]
+      );
+      expect(rows.rows).toHaveLength(2);
+      expect(rows.rows[0].correlation_id).toBe(metaCorr);
+      expect(rows.rows[1].correlation_id).toBe(metaCorr);
+      expect(rows.rows[0].correlation_id).toBe(rows.rows[1].correlation_id);
     } finally {
       if (quoteId) {
         await cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey).catch(() => {});

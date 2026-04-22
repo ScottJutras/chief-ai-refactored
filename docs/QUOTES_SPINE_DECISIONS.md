@@ -4289,23 +4289,48 @@ Nullable for backward compatibility with pre-Phase-3 emitters.
 - `integrity.name_mismatch_signed` (inside txn, conditional) — same id
 - `notification.sent` OR `notification.failed` (post-commit) — same id
 
-**SendQuote asymmetry (documented, not drift).** SendQuote's existing
-event emitters (`emitLifecycleSent`, `emitNotificationSent`,
-`emitNotificationFailed`) were written before Phase 3 and leave
-correlation_id NULL. Phase 3 Section 5 extended `emitNotificationSent`
-and `emitNotificationFailed` to accept an optional `correlationId`
-param (default null) for backward-compatible future use; SendQuote
-callers do not currently pass a correlationId. SendQuote backfill to
-populate correlation_id consistently across its events is future
-hygiene — not a blocking issue.
+**SendQuote asymmetry (closed 2026-04-19, Phase A Session 1).**
+Originally documented below as "future hygiene" after Phase 3 Section 5
+extended `emitNotificationSent`/`emitNotificationFailed` to accept an
+optional `correlationId` param but SendQuote callers still passed
+nothing. Phase A Session 1 backfilled the wiring at commit `e8e4a1f7`:
+`handleSendQuote` now generates a fresh `correlationId` via
+`crypto.randomUUID()` after the pre-transaction idempotency check and
+before opening the transaction, then threads it through
+`emitLifecycleSent` (inside txn), `emitNotificationSent` (post-commit
+success), and `emitNotificationFailed` (post-commit catch).
+`emitLifecycleSent` was extended with the same optional `correlationId`
+param + SQL placeholder as its sister notification emitters.
+`buildSendQuoteReturnShape` surfaces the value at `meta.correlation_id`
+so callers can correlate their client-side trace to the three server
+events. As of this commit, both Quote-spine handlers (CreateQuote emits
+no notifications; SendQuote + SignQuote) wire correlation_id
+consistently.
 
-**Forward applicability.** All new handlers emit events with
-correlation_id populated. The asymmetry exists only for SendQuote's
-2026-04-19 lineage.
+**Retry-path limitation.** `priorShareTokenToReturnShape` returns
+`meta.correlation_id: null` because the original invocation's
+`correlation_id` is not persisted on the `chiefos_quote_share_tokens`
+row — same limitation as `priorSignatureToReturnShape` per §27. An
+operator who needs to recover the original trace can still pivot on
+`(owner_id, source_msg_id)` via the share_token row's FK to the event.
+Future work: if the retry path needs to surface the original
+correlation_id, add a `correlation_id uuid` column to
+`chiefos_quote_share_tokens` (and to `chiefos_quote_signatures`) backed
+by the first invocation's write.
 
-**Validated by.** SignQuote §27 (2026-04-21). Two events (`lifecycle.
-signed` + `notification.sent`) share correlation_id
-`06cc4c9e-6406-4ffe-8de3-40f5c0af362d` — verified via MCP SELECT.
+**Forward applicability.** All handlers emit events with
+correlation_id populated. Tests asserting the cross-event invariant
+(`lifecycle.sent` + `notification.sent` share the same uuid, matching
+`meta.correlation_id`) live in `src/cil/quotes.test.js`.
+
+**Validated by.**
+- SignQuote §27 (2026-04-21). Two events (`lifecycle.signed` +
+  `notification.sent`) share correlation_id
+  `06cc4c9e-6406-4ffe-8de3-40f5c0af362d` — verified via MCP SELECT.
+- SendQuote Phase A Session 1 (2026-04-19). Cross-event invariant test
+  in `quotes.test.js` Section 7 asserts `lifecycle.sent` +
+  `notification.sent` share correlation_id, matching
+  `result.meta.correlation_id`.
 
 ## §17.22. Invariant-assertion discipline (introduced 2026-04-21)
 

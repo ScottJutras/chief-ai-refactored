@@ -4279,6 +4279,522 @@ describe('ViewQuote — Section 2: loadViewContext', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 2 Section 3 tests: markQuoteViewed + emitLifecycleCustomerViewed
+// ═══════════════════════════════════════════════════════════════════════════
+
+const {
+  markQuoteViewed,
+  emitLifecycleCustomerViewed,
+} = _internals;
+
+describeIfDb('ViewQuote — Section 3: markQuoteViewed (integration)', () => {
+  let pool;
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  // Seed a quote + version in 'sent' state (header and version both flipped).
+  // Wraps insertQuoteHeader / insertQuoteVersion / setQuoteCurrentVersion plus
+  // manual direct UPDATE to 'sent' to avoid pulling in the full markQuoteSent
+  // dependency chain (keeps Section 3 tests isolated from Section 5).
+  async function seedSentQuote(client, pre) {
+    const header = await _ihq(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await _ivq(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'ViewQuote Section 3 seed', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: _cts(pre.tenantId),
+    });
+    await _spv(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    // Flip both rows to 'sent' directly (no state-machine helper dep).
+    await client.query(
+      `UPDATE public.chiefos_quotes SET status='sent', updated_at=NOW() WHERE id=$1`,
+      [header.id]
+    );
+    await client.query(
+      `UPDATE public.chiefos_quote_versions
+          SET status='sent', issued_at=NOW(), sent_at=NOW()
+        WHERE id=$1`,
+      [version.id]
+    );
+    return { header, version };
+  }
+
+  test('happy path: sent → viewed flips both rows; returns transitioned:true with timestamps', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedSentQuote(client, pre);
+
+      const before = await client.query(
+        `SELECT updated_at FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      const beforeUpdatedAt = before.rows[0].updated_at;
+
+      const result = await markQuoteViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+
+      expect(result.transitioned).toBe(true);
+      expect(result.quoteUpdatedAt).toBeDefined();
+      expect(result.versionViewedAt).toBeDefined();
+
+      const qRow = await client.query(
+        `SELECT status, updated_at FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(qRow.rows[0].status).toBe('viewed');
+      expect(qRow.rows[0].updated_at.getTime()).toBeGreaterThanOrEqual(beforeUpdatedAt.getTime());
+
+      const vRow = await client.query(
+        `SELECT status, viewed_at FROM public.chiefos_quote_versions WHERE id=$1`, [version.id]
+      );
+      expect(vRow.rows[0].status).toBe('viewed');
+      expect(vRow.rows[0].viewed_at).not.toBeNull();
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('already-viewed quote: returns transitioned:false with no row mutations', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedSentQuote(client, pre);
+
+      // Pre-flip to 'viewed' state.
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status='viewed' WHERE id=$1`, [header.id]
+      );
+      const existingViewedAt = new Date('2026-04-21T10:00:00Z');
+      await client.query(
+        `UPDATE public.chiefos_quote_versions SET status='viewed', viewed_at=$2 WHERE id=$1`,
+        [version.id, existingViewedAt]
+      );
+
+      const result = await markQuoteViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+      expect(result).toEqual({ transitioned: false });
+
+      // Version.viewed_at must be unchanged (helper short-circuited on header rowcount=0).
+      const vRow = await client.query(
+        `SELECT viewed_at FROM public.chiefos_quote_versions WHERE id=$1`, [version.id]
+      );
+      expect(vRow.rows[0].viewed_at.toISOString()).toBe(existingViewedAt.toISOString());
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('already-signed quote: returns transitioned:false (signed quotes do not re-transition)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedSentQuote(client, pre);
+
+      // Drift to signed state (header+version atomic for test purposes).
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status='signed' WHERE id=$1`, [header.id]
+      );
+      await client.query(
+        `UPDATE public.chiefos_quote_versions
+            SET status='signed', signed_at=NOW(), locked_at=NOW(),
+                server_hash=$2
+          WHERE id=$1`,
+        [version.id, 'a'.repeat(64)]
+      );
+
+      const result = await markQuoteViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+      expect(result).toEqual({ transitioned: false });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('§3.3 co-transition violation: header=sent, version=viewed drift → CIL_INTEGRITY_ERROR', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedSentQuote(client, pre);
+
+      // Drift: version pre-flipped to 'viewed' while header still 'sent'.
+      // Helper's header UPDATE succeeds (rowcount=1); version UPDATE fails
+      // with rowcount=0 (version.status!='sent'); throws CIL_INTEGRITY_ERROR.
+      await client.query(
+        `UPDATE public.chiefos_quote_versions SET status='viewed', viewed_at=NOW() WHERE id=$1`,
+        [version.id]
+      );
+
+      try {
+        await markQuoteViewed(client, {
+          quoteId: header.id, versionId: version.id,
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+        });
+        throw new Error('expected throw');
+      } catch (e) {
+        expect(e.name).toBe('CilIntegrityError');
+        expect(e.code).toBe('CIL_INTEGRITY_ERROR');
+        expect(e.message).toMatch(/Version co-transition failed/);
+      }
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('header-first ordering: version UPDATE failure rolls back header UPDATE (no §3.3 inversion)', async () => {
+    // Locks in the architectural decision: when version UPDATE fails, the
+    // caller's transaction (or SAVEPOINT) rolls back — header's UPDATE is
+    // not persisted. Prevents the worst-case persisted state: header=viewed,
+    // version=sent (§3.3 inversion). Future regressions that reorder UPDATEs
+    // or remove the throw fail this test loudly.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedSentQuote(client, pre);
+
+      // Drift: version to 'viewed' so helper's version UPDATE fails.
+      await client.query(
+        `UPDATE public.chiefos_quote_versions SET status='viewed', viewed_at=NOW() WHERE id=$1`,
+        [version.id]
+      );
+
+      await client.query('SAVEPOINT pre_mark');
+
+      let threw = false;
+      try {
+        await markQuoteViewed(client, {
+          quoteId: header.id, versionId: version.id,
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+        });
+      } catch (e) {
+        threw = true;
+        expect(e.name).toBe('CilIntegrityError');
+      }
+      expect(threw).toBe(true);
+
+      // Mid-state proves header-first ordering: between header UPDATE and
+      // the throw, header.status IS 'viewed' in-transaction.
+      const midRows = await client.query(
+        `SELECT status FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(midRows.rows[0].status).toBe('viewed');
+
+      // Now roll back the SAVEPOINT — simulates pg.withClient's ROLLBACK
+      // on throw. Header returns to 'sent' state.
+      await client.query('ROLLBACK TO SAVEPOINT pre_mark');
+
+      const postRows = await client.query(
+        `SELECT status FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(postRows.rows[0].status).toBe('sent');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('tenant scope: cross-tenant (tenant_id, owner_id) → rowcount=0 → transitioned:false', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedSentQuote(client, pre);
+
+      const result = await markQuoteViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: '11111111-2222-3333-4444-555555555555',  // wrong tenant
+        ownerId: pre.ownerId,
+      });
+      expect(result).toEqual({ transitioned: false });
+
+      // Confirm no mutation occurred.
+      const qRow = await client.query(
+        `SELECT status FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(qRow.rows[0].status).toBe('sent');  // unchanged
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+describeIfDb('ViewQuote — Section 3: emitLifecycleCustomerViewed (integration)', () => {
+  let pool;
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+    insertShareToken: _ist,
+    generateShareToken: _gst,
+  } = _internals;
+
+  async function seedQuoteAndToken(client, pre) {
+    const header = await _ihq(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await _ivq(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'ViewQuote Section 3 event seed', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: _cts(pre.tenantId),
+    });
+    await _spv(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    const token = await _ist(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      quoteVersionId: version.id,
+      token: _gst(),
+      recipient: { name: pre.customer.name, email: pre.customer.email },
+      sourceMsgId: `test-view-s3-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    });
+    return { header, version, token };
+  }
+
+  test('happy path (no source_msg_id, no correlationId): inserts row with empty payload', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version, token } = await seedQuoteAndToken(client, pre);
+
+      await emitLifecycleCustomerViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'portal', actorUserId: token.id,
+        emittedAt: '2026-04-22T12:00:00.000Z',
+        customerId: pre.customer.id, shareTokenId: token.id,
+      });
+
+      const rows = await client.query(
+        `SELECT kind, quote_version_id, share_token_id, correlation_id,
+                actor_source, actor_user_id, customer_id, payload, emitted_at
+           FROM public.chiefos_quote_events
+          WHERE quote_id=$1 AND kind='lifecycle.customer_viewed'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      const ev = rows.rows[0];
+      expect(ev.kind).toBe('lifecycle.customer_viewed');
+      expect(ev.quote_version_id).toBe(version.id);
+      expect(ev.share_token_id).toBe(token.id);
+      expect(ev.correlation_id).toBeNull();
+      expect(ev.actor_source).toBe('portal');
+      expect(ev.actor_user_id).toBe(token.id);
+      expect(ev.customer_id).toBe(pre.customer.id);
+      expect(ev.payload).toEqual({});  // no source_msg_id; payload is empty object
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('correlationId param writes through to correlation_id column (§17.21 wiring)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version, token } = await seedQuoteAndToken(client, pre);
+
+      const corr = '22222222-3333-4444-5555-666666666666';
+      await emitLifecycleCustomerViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'portal', actorUserId: token.id,
+        emittedAt: '2026-04-22T12:00:00.000Z',
+        customerId: pre.customer.id, shareTokenId: token.id,
+        correlationId: corr,
+      });
+
+      const rows = await client.query(
+        `SELECT correlation_id FROM public.chiefos_quote_events
+          WHERE quote_id=$1 AND kind='lifecycle.customer_viewed'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      expect(rows.rows[0].correlation_id).toBe(corr);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('source_msg_id present (non-empty): echoed into payload (Q1 decision)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version, token } = await seedQuoteAndToken(client, pre);
+
+      await emitLifecycleCustomerViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'portal', actorUserId: token.id,
+        emittedAt: '2026-04-22T12:00:00.000Z',
+        customerId: pre.customer.id, shareTokenId: token.id,
+        sourceMsgId: 'req-abc-123',
+      });
+
+      const rows = await client.query(
+        `SELECT payload FROM public.chiefos_quote_events
+          WHERE quote_id=$1 AND kind='lifecycle.customer_viewed'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      expect(rows.rows[0].payload).toEqual({ source_msg_id: 'req-abc-123' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('source_msg_id absent (undefined): key not written (payload={})', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version, token } = await seedQuoteAndToken(client, pre);
+
+      // Omit sourceMsgId entirely.
+      await emitLifecycleCustomerViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'portal', actorUserId: token.id,
+        emittedAt: '2026-04-22T12:00:00.000Z',
+        customerId: pre.customer.id, shareTokenId: token.id,
+      });
+
+      const rows = await client.query(
+        `SELECT payload FROM public.chiefos_quote_events
+          WHERE quote_id=$1 AND kind='lifecycle.customer_viewed'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      expect(rows.rows[0].payload).toEqual({});
+      expect(Object.keys(rows.rows[0].payload)).not.toContain('source_msg_id');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('source_msg_id empty string (Zod regression edge): posture B writes "" (helper does not silently filter)', async () => {
+    // Posture B rationale: Zod's ViewQuoteCILZ rejects empty strings via
+    // z.string().min(1).optional(). If an empty string ever reaches the
+    // helper, that's a Zod regression worth surfacing — helper writes it
+    // to payload rather than silently dropping. Diverging from Zod's
+    // contract would mask the regression.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version, token } = await seedQuoteAndToken(client, pre);
+
+      await emitLifecycleCustomerViewed(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'portal', actorUserId: token.id,
+        emittedAt: '2026-04-22T12:00:00.000Z',
+        customerId: pre.customer.id, shareTokenId: token.id,
+        sourceMsgId: '',  // empty string — should NOT be silently filtered
+      });
+
+      const rows = await client.query(
+        `SELECT payload FROM public.chiefos_quote_events
+          WHERE quote_id=$1 AND kind='lifecycle.customer_viewed'`,
+        [header.id]
+      );
+      expect(rows.rows).toHaveLength(1);
+      expect(rows.rows[0].payload).toEqual({ source_msg_id: '' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('chiefos_qe_payload_customer_viewed CHECK: share_token_id NULL → 23514', async () => {
+    // Smoke test proving the DB CHECK is engaged. If the constraint is ever
+    // dropped or weakened, this test fails loudly.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedQuoteAndToken(client, pre);
+
+      let threw = false;
+      try {
+        await emitLifecycleCustomerViewed(client, {
+          quoteId: header.id, versionId: version.id,
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+          actorSource: 'portal', actorUserId: null,
+          emittedAt: '2026-04-22T12:00:00.000Z',
+          customerId: pre.customer.id, shareTokenId: null,  // CHECK violator
+        });
+      } catch (e) {
+        threw = true;
+        // pg 23514 = check_violation
+        expect(String(e.code || e.message)).toMatch(/23514|chiefos_qe_payload_customer_viewed|check constraint/i);
+      }
+      expect(threw).toBe(true);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Phase 3 Section 4 tests: transaction-body helpers
 // ═══════════════════════════════════════════════════════════════════════════
 

@@ -797,6 +797,121 @@ async function loadViewContext({ pg, tenantId, shareToken }) {
   };
 }
 
+// ─── Phase A Session 2 Section 3: markQuoteViewed + emitLifecycleCustomerViewed ──
+//
+// Two transaction-body helpers for ViewQuote. Both operate on an open pg
+// client (inside caller's transaction) and never manage transactions
+// themselves. Errors propagate unmodified for caller's handling.
+
+/**
+ * markQuoteViewed — §17.23 state-driven idempotency + §3.3 co-transition.
+ *
+ * Sequential UPDATEs on chiefos_quotes (header) then chiefos_quote_versions
+ * (version), both predicated on status='sent'. Header-first ordering:
+ *
+ *   - rowcount=0 on header means the quote is NOT in 'sent' state (another
+ *     invocation transitioned concurrently, or the quote advanced past 'sent'
+ *     via SignQuote etc.). Returns { transitioned: false }; handler composes
+ *     alreadyViewed return from pre-txn loadViewContext.
+ *   - rowcount=1 on header → proceeds to version UPDATE.
+ *   - rowcount≠1 on version after header flipped → §3.3 co-transition
+ *     violation; throws CilIntegrityError. Caller's transaction rolls back;
+ *     header's UPDATE is not committed. Prevents the worst-case failure
+ *     mode (header=viewed, version=sent) from persisting.
+ *
+ * Rationale for sequential UPDATEs vs. joined UPDATE ... FROM subquery:
+ * per-row immutability triggers on chiefos_quote_versions fire per-row;
+ * attribution of which row failed is clearer with sequential writes. Two
+ * UPDATEs in the same transaction is still atomic semantically.
+ *
+ * @param {object} client — open pg transaction client
+ * @param {object} params — { quoteId, versionId, tenantId, ownerId }
+ * @returns {Promise<{ transitioned: false } |
+ *                   { transitioned: true, quoteUpdatedAt, versionViewedAt }>}
+ * @throws {CilIntegrityError} on §3.3 co-transition violation
+ */
+async function markQuoteViewed(client, { quoteId, versionId, tenantId, ownerId }) {
+  const headerResult = await client.query(
+    `UPDATE public.chiefos_quotes
+        SET status = 'viewed', updated_at = NOW()
+      WHERE id = $1 AND tenant_id = $2 AND owner_id = $3 AND status = 'sent'
+      RETURNING updated_at`,
+    [quoteId, tenantId, ownerId]
+  );
+  if (headerResult.rowCount === 0) {
+    return { transitioned: false };
+  }
+
+  const versionResult = await client.query(
+    `UPDATE public.chiefos_quote_versions
+        SET status = 'viewed', viewed_at = NOW()
+      WHERE id = $1 AND tenant_id = $2 AND owner_id = $3 AND status = 'sent'
+      RETURNING viewed_at`,
+    [versionId, tenantId, ownerId]
+  );
+  if (versionResult.rowCount !== 1) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Version co-transition failed after header flipped',
+      hint: `version_id=${versionId} rowCount=${versionResult.rowCount}; §3.3 co-transition violation (header flipped to viewed but version did not)`,
+    });
+  }
+  return {
+    transitioned: true,
+    quoteUpdatedAt: headerResult.rows[0].updated_at,
+    versionViewedAt: versionResult.rows[0].viewed_at,
+  };
+}
+
+/**
+ * emitLifecycleCustomerViewed — INSERTs a chiefos_quote_events row for the
+ * state transition sent→viewed. Runs AFTER markQuoteViewed per the ordering
+ * discipline (state flip first, event emission second — matches SendQuote's
+ * markQuoteSent → emitLifecycleSent sequence).
+ *
+ * Per Migration 2:
+ *   - lifecycle.customer_viewed is VERSION-scoped (chiefos_qe_version_scoped_kinds)
+ *     — quote_version_id NOT NULL.
+ *   - chiefos_qe_payload_customer_viewed CHECK requires only
+ *     share_token_id IS NOT NULL. No payload-key requirements.
+ *
+ * correlation_id discipline (§17.21): wired from day one. Handler passes a
+ * fresh UUID; helper writes it to the column.
+ *
+ * source_msg_id echo (Q1 decision, Section 1): when present in CIL input,
+ * flows into payload as audit trail. Helper uses strict `!== undefined`
+ * check (posture B) — if an empty string ever reaches the helper (Zod
+ * regression), payload writes `source_msg_id: ''` rather than silently
+ * dropping. Helper does not diverge from Zod's contract.
+ */
+async function emitLifecycleCustomerViewed(client, {
+  quoteId, versionId, tenantId, ownerId,
+  actorSource, actorUserId, emittedAt,
+  customerId, shareTokenId,
+  correlationId = null,
+  sourceMsgId,
+}) {
+  const payload = {};
+  if (sourceMsgId !== undefined) {
+    payload.source_msg_id = sourceMsgId;
+  }
+  await client.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id, emitted_at,
+        customer_id, share_token_id, correlation_id, payload
+      )
+      VALUES ($1, $2, $3, $4,
+              'lifecycle.customer_viewed', $5, $6, $7,
+              $8, $9, $10, $11)`,
+    [
+      tenantId, ownerId, quoteId, versionId,
+      actorSource, actorUserId || null, emittedAt,
+      customerId || null, shareTokenId, correlationId, payload,
+    ]
+  );
+}
+
 // ─── Phase 3 Section 4: transaction-body helpers ────────────────────────────
 //
 // Five focused INSERT/UPDATE helpers per DB3 Q3.9 steps 14-19. Each takes
@@ -3552,6 +3667,9 @@ module.exports = {
     // ViewQuote Section 2 (load helper + columns)
     VIEW_LOAD_COLUMNS,
     loadViewContext,
+    // ViewQuote Section 3 (transaction-body helpers)
+    markQuoteViewed,
+    emitLifecycleCustomerViewed,
     // SignQuote Section 3 (context loader + hash-input mapper)
     SIGN_LOAD_COLUMNS,
     loadSignContext,

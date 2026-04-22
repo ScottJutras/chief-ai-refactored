@@ -3925,6 +3925,351 @@ describe('SignQuote — Section 3: resolveShareTokenByValue', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 2 Section 2 tests: loadViewContext + VIEW_LOAD_COLUMNS
+// ═══════════════════════════════════════════════════════════════════════════
+
+const {
+  loadViewContext,
+  VIEW_LOAD_COLUMNS: _VIEW_LOAD_COLUMNS,
+} = _internals;
+
+describe('ViewQuote — Section 2: loadViewContext', () => {
+  const VCTX_TENANT_ID  = '00000000-c2c2-c2c2-c2c2-000000000001';
+  const VCTX_OWNER_ID   = '00000000000';
+  const VCTX_QUOTE_ID   = '00000000-c2c2-c2c2-c2c2-000000000002';
+  const VCTX_VERSION_ID = '00000000-c2c2-c2c2-c2c2-000000000003';
+  const VCTX_TOKEN_ID   = '00000000-c2c2-c2c2-c2c2-000000000005';
+  const VCTX_TOKEN_STR  = 'K5gQbxTdNcN1ZNqmoGtaww';
+
+  const FUTURE_EXPIRES_AT = new Date(Date.now() + 7 * 24 * 3600 * 1000);
+  const PAST_EXPIRES_AT   = new Date('2020-01-01T00:00:00Z');
+
+  function makeToken(overrides = {}) {
+    return {
+      share_token_id: VCTX_TOKEN_ID,
+      tenant_id: VCTX_TENANT_ID,
+      owner_id: VCTX_OWNER_ID,
+      quote_version_id: VCTX_VERSION_ID,
+      recipient_name: 'View Customer',
+      recipient_channel: 'email',
+      recipient_address: 'view@invalid.test',
+      absolute_expires_at: FUTURE_EXPIRES_AT,
+      revoked_at: null,
+      superseded_by_version_id: null,
+      issued_at: new Date('2026-04-21T10:00:00Z'),
+      ...overrides,
+    };
+  }
+
+  function makeQuoteVersion(overrides = {}) {
+    return {
+      quote_id: VCTX_QUOTE_ID,
+      human_id: 'QT-2026-04-21-VIEW01',
+      quote_status: 'sent',
+      job_id: 2001,
+      customer_id: null,
+      current_version_id: VCTX_VERSION_ID,
+      header_created_at: new Date('2026-04-21T10:00:00Z'),
+      header_updated_at: new Date('2026-04-21T10:00:00Z'),
+      version_id: VCTX_VERSION_ID,
+      version_no: 1,
+      version_status: 'sent',
+      project_title: 'View Test',
+      currency: 'CAD',
+      total_cents: 11300,
+      customer_snapshot: { name: 'View Customer', email: 'view@invalid.test', phone_e164: null },
+      version_issued_at: new Date('2026-04-21T10:00:00Z'),
+      version_sent_at: new Date('2026-04-21T10:00:00Z'),
+      version_viewed_at: null,
+      version_signed_at: null,
+      version_locked_at: null,
+      version_server_hash: null,
+      ...overrides,
+    };
+  }
+
+  function mockPgWith(queryResults) {
+    let idx = 0;
+    const query = jest.fn().mockImplementation(() => {
+      const r = queryResults[idx++];
+      if (r instanceof Error) return Promise.reject(r);
+      return Promise.resolve(r || { rows: [] });
+    });
+    return { query };
+  }
+
+  async function expectCilError(fn, expectedCode) {
+    try {
+      await fn();
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe(expectedCode);
+    }
+  }
+
+  // ─── Happy path — all four valid source states return context ─────────
+  describe('happy path — four valid source states', () => {
+    it('sent quote + current version → returns ctx with quoteStatus=sent', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion()] },
+      ]);
+      const ctx = await loadViewContext({
+        pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR,
+      });
+      expect(ctx.quoteStatus).toBe('sent');
+      expect(ctx.quoteId).toBe(VCTX_QUOTE_ID);
+      expect(ctx.versionId).toBe(VCTX_VERSION_ID);
+      expect(ctx.shareTokenId).toBe(VCTX_TOKEN_ID);
+    });
+
+    it('viewed quote → returns ctx with quoteStatus=viewed', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({
+          quote_status: 'viewed', version_status: 'viewed',
+          version_viewed_at: new Date('2026-04-21T11:00:00Z'),
+        })] },
+      ]);
+      const ctx = await loadViewContext({
+        pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR,
+      });
+      expect(ctx.quoteStatus).toBe('viewed');
+      expect(ctx.versionViewedAt).toEqual(new Date('2026-04-21T11:00:00Z'));
+    });
+
+    it('signed quote → returns ctx with quoteStatus=signed and server_hash populated', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({
+          quote_status: 'signed', version_status: 'signed',
+          version_signed_at: new Date('2026-04-21T12:00:00Z'),
+          version_server_hash: 'a'.repeat(64),
+        })] },
+      ]);
+      const ctx = await loadViewContext({
+        pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR,
+      });
+      expect(ctx.quoteStatus).toBe('signed');
+      expect(ctx.versionServerHash).toBe('a'.repeat(64));
+    });
+
+    it('locked quote → returns ctx with quoteStatus=locked', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({
+          quote_status: 'locked', version_status: 'locked',
+          version_signed_at: new Date('2026-04-21T12:00:00Z'),
+          version_locked_at: new Date('2026-04-21T12:00:01Z'),
+          version_server_hash: 'b'.repeat(64),
+        })] },
+      ]);
+      const ctx = await loadViewContext({
+        pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR,
+      });
+      expect(ctx.quoteStatus).toBe('locked');
+      expect(ctx.versionLockedAt).toEqual(new Date('2026-04-21T12:00:01Z'));
+    });
+  });
+
+  // ─── Share-token failures ─────────────────────────────────────────────
+  describe('share-token failures', () => {
+    it('token not found → SHARE_TOKEN_NOT_FOUND', async () => {
+      const pg = mockPgWith([{ rows: [] }]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_NOT_FOUND.code
+      );
+    });
+
+    it('token revoked → SHARE_TOKEN_REVOKED', async () => {
+      const pg = mockPgWith([{ rows: [makeToken({ revoked_at: new Date() })] }]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_REVOKED.code
+      );
+    });
+
+    it('token expired → SHARE_TOKEN_EXPIRED', async () => {
+      const pg = mockPgWith([{ rows: [makeToken({ absolute_expires_at: PAST_EXPIRES_AT })] }]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_EXPIRED.code
+      );
+    });
+
+    it('tenant mismatch → SHARE_TOKEN_NOT_FOUND (unified 404)', async () => {
+      const pg = mockPgWith([{ rows: [makeToken({ tenant_id: '11111111-2222-3333-4444-555555555555' })] }]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_NOT_FOUND.code
+      );
+    });
+  });
+
+  // ─── Quote state rejections ───────────────────────────────────────────
+  describe('quote state rejections', () => {
+    it('draft → QUOTE_NOT_SENT', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'draft', version_status: 'draft' })] },
+      ]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.QUOTE_NOT_SENT.code
+      );
+    });
+
+    it('voided → QUOTE_VOIDED', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'voided', version_status: 'voided' })] },
+      ]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.QUOTE_VOIDED.code
+      );
+    });
+
+    it('unknown status → CIL_INTEGRITY_ERROR (fail-closed per §17.22)', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'zombie', version_status: 'zombie' })] },
+      ]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        'CIL_INTEGRITY_ERROR'
+      );
+    });
+  });
+
+  // ─── Co-transition check (§3.3) ───────────────────────────────────────
+  describe('version/quote status disagreement', () => {
+    it('quote=sent but version=viewed → CIL_INTEGRITY_ERROR', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion({ quote_status: 'sent', version_status: 'viewed' })] },
+      ]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        'CIL_INTEGRITY_ERROR'
+      );
+    });
+  });
+
+  // ─── Supersession (fires AFTER state check; SUP.2 posture B) ──────────
+  describe('supersession (fires AFTER state check)', () => {
+    it('SUP.1: token.quote_version_id != current_version_id → SHARE_TOKEN_SUPERSEDED', async () => {
+      const staleVersionId = '00000000-c2c2-c2c2-c2c2-00000000ffff';
+      const pg = mockPgWith([
+        { rows: [makeToken({ quote_version_id: staleVersionId })] },
+        // Q2 is keyed on token.quote_version_id (staleVersionId). The
+        // returned row reports the current version is something else —
+        // this is what SUP.1 compares against.
+        { rows: [makeQuoteVersion({ version_id: staleVersionId, current_version_id: VCTX_VERSION_ID })] },
+      ]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_SUPERSEDED.code
+      );
+    });
+
+    it('SUP.2 posture B: SUP.1 passes but superseded_by_version_id set → CIL_INTEGRITY_ERROR (not SHARE_TOKEN_SUPERSEDED)', async () => {
+      // Disagreement: token IS current by SUP.1 (quote_version_id ==
+      // current_version_id) but ReissueQuote's forward-plan column
+      // marks it as superseded. SUP.1 is authoritative → integrity
+      // violation, not masking as a parallel SHARE_TOKEN_SUPERSEDED.
+      const pg = mockPgWith([
+        { rows: [makeToken({ superseded_by_version_id: '00000000-c2c2-c2c2-c2c2-00000000dead' })] },
+        { rows: [makeQuoteVersion()] },
+      ]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        'CIL_INTEGRITY_ERROR'
+      );
+    });
+
+    it('superseded token on signed quote still surfaces SHARE_TOKEN_SUPERSEDED (state-check runs first but succeeds; supersession then rejects)', async () => {
+      const staleVersionId = '00000000-c2c2-c2c2-c2c2-00000000ffff';
+      const pg = mockPgWith([
+        { rows: [makeToken({ quote_version_id: staleVersionId })] },
+        { rows: [makeQuoteVersion({
+          version_id: staleVersionId,
+          current_version_id: VCTX_VERSION_ID,
+          quote_status: 'signed',
+          version_status: 'signed',
+        })] },
+      ]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_SUPERSEDED.code
+      );
+    });
+  });
+
+  // ─── Query-order short-circuit ────────────────────────────────────────
+  describe('query-order short-circuits', () => {
+    it('Q1 token miss → Q2 never called', async () => {
+      const pg = mockPgWith([{ rows: [] }]);
+      await expectCilError(
+        () => loadViewContext({ pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR }),
+        SIG_ERR.SHARE_TOKEN_NOT_FOUND.code
+      );
+      expect(pg.query).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // ─── Return shape (Flag 2: exact-key-match) ───────────────────────────
+  describe('return shape (Flag 2: exact-key-match)', () => {
+    it('return has exactly the 30 expected camelCase keys (no extras, no omissions)', async () => {
+      const pg = mockPgWith([
+        { rows: [makeToken()] },
+        { rows: [makeQuoteVersion()] },
+      ]);
+      const ctx = await loadViewContext({
+        pg, tenantId: VCTX_TENANT_ID, shareToken: VCTX_TOKEN_STR,
+      });
+      // Sorted for deterministic comparison; changing this set is a
+      // contract change affecting Section 3 (transaction helpers) and
+      // Section 4 (handler return-shape composer).
+      expect(Object.keys(ctx).sort()).toEqual([
+        'absoluteExpiresAt',
+        'currency',
+        'currentVersionId',
+        'customerId',
+        'customerSnapshot',
+        'headerCreatedAt',
+        'headerUpdatedAt',
+        'humanId',
+        'issuedAt',
+        'jobId',
+        'ownerId',
+        'projectTitle',
+        'quoteId',
+        'quoteStatus',
+        'recipientAddress',
+        'recipientChannel',
+        'recipientName',
+        'shareTokenId',
+        'shareTokenValue',
+        'tenantId',
+        'totalCents',
+        'versionId',
+        'versionIssuedAt',
+        'versionLockedAt',
+        'versionNo',
+        'versionSentAt',
+        'versionServerHash',
+        'versionSignedAt',
+        'versionStatus',
+        'versionViewedAt',
+      ].sort());
+    });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Phase 3 Section 4 tests: transaction-body helpers
 // ═══════════════════════════════════════════════════════════════════════════
 

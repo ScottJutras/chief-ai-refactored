@@ -564,6 +564,239 @@ function buildVersionHashInput(ctx) {
   };
 }
 
+// ─── Phase A Session 2 Section 2: VIEW_LOAD_COLUMNS + loadViewContext ───────
+//
+// ViewQuote's pre-transaction context loader. Smaller footprint than
+// loadSignContext: no line items, no hash-input fields, no tenant_snapshot,
+// no customer creation. Just enough to validate the share-token + render
+// the customer view page.
+//
+// VIEW_LOAD_COLUMNS is 21 cols vs SIGN_LOAD_COLUMNS' 30. Omitted: project_
+// scope, subtotal/tax/deposit cents, tax_code, tax_rate_bps, payment_terms,
+// warranty_snapshot, clauses_snapshot, tenant_snapshot — all hash-input or
+// reissue fields that ViewQuote does not consume. Included: version_signed_
+// at (SIGN_LOAD_COLUMNS omits because sign path never reaches signed
+// state; ViewQuote supports signed/locked source states) and server_hash
+// (forward-positioning for customer signature-verification display).
+
+const VIEW_LOAD_COLUMNS = `
+  q.id                    AS quote_id,
+  q.human_id,
+  q.status                AS quote_status,
+  q.job_id,
+  q.customer_id,
+  q.current_version_id,
+  q.created_at            AS header_created_at,
+  q.updated_at            AS header_updated_at,
+  v.id                    AS version_id,
+  v.version_no,
+  v.status                AS version_status,
+  v.project_title,
+  v.currency,
+  v.total_cents,
+  v.customer_snapshot,
+  v.issued_at             AS version_issued_at,
+  v.sent_at               AS version_sent_at,
+  v.viewed_at             AS version_viewed_at,
+  v.signed_at             AS version_signed_at,
+  v.locked_at             AS version_locked_at,
+  v.server_hash           AS version_server_hash
+`;
+
+/**
+ * loadViewContext — ViewQuote's pre-transaction context loader.
+ *
+ * Two queries, read-only:
+ *   Q1: resolveShareTokenByValue (shared helper — also used by loadSignContext)
+ *   Q2: quote + version JOIN (VIEW_LOAD_COLUMNS)
+ *
+ * State-validation posture (§17.22 invariant-at-load):
+ *   Q1.1 token missing                       → SHARE_TOKEN_NOT_FOUND
+ *   Q1.2 token.revoked_at                    → SHARE_TOKEN_REVOKED
+ *   Q1.3 token.absolute_expires_at <= now()  → SHARE_TOKEN_EXPIRED
+ *   Q1.4 token.tenant_id != request tenant   → SHARE_TOKEN_NOT_FOUND (unified 404)
+ *   Q2.1 JOIN returns zero rows              → CIL_INTEGRITY_ERROR (FK drift)
+ *   Q2.2 quote_status == 'draft'             → QUOTE_NOT_SENT
+ *   Q2.3 quote_status == 'voided'            → QUOTE_VOIDED
+ *   Q2.4 quote_status unknown                → CIL_INTEGRITY_ERROR (fail-closed)
+ *   Q2.5 version_status != quote_status      → CIL_INTEGRITY_ERROR (§3.3 co-transition)
+ *   SUP.1 token.quote_version_id != current  → SHARE_TOKEN_SUPERSEDED
+ *   SUP.2 superseded_by_version_id set       → CIL_INTEGRITY_ERROR (posture B:
+ *         SUP.1 is authoritative; SUP.2 disagreement is internal corruption)
+ *
+ * Supersession runs AFTER state validation so that voided/locked quotes
+ * surface their own specific error rather than being masked by a stale-
+ * token error. Customer actionability: "quote is voided" is more useful
+ * than "your link is stale" when the underlying state is terminal.
+ *
+ * SUP.2 posture B rationale (§17.22 invariant-assertion discipline):
+ * SUP.1 (quote_version_id != current_version_id) is the authoritative
+ * "is this token current?" check. superseded_by_version_id is a forward-
+ * plan column populated explicitly by a future ReissueQuote handler.
+ * If SUP.1 passes (token IS current) but superseded_by_version_id is
+ * set, those two facts disagree — that's internal state corruption worth
+ * surfacing as CIL_INTEGRITY_ERROR rather than masking as another
+ * SHARE_TOKEN_SUPERSEDED. Loud fail beats silent fallback.
+ *
+ * Accepts four source states (returns ctx; handler routes):
+ *   sent | viewed | signed | locked
+ *
+ * @param {object} params
+ * @param {object} params.pg — pg client or pool (supports .query)
+ * @param {string} params.tenantId — from CIL payload (cross-checked against token)
+ * @param {string} params.shareToken — 22-char base58
+ * @returns {Promise<object>} validated context (26 camelCase keys)
+ * @throws {CilIntegrityError} — specific SIG_ERR codes per rejection class
+ */
+async function loadViewContext({ pg, tenantId, shareToken }) {
+  // ─── Q1: resolve share token ───────────────────────────────────────────
+  const token = await resolveShareTokenByValue(pg, shareToken);
+  if (!token) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code,
+      message: 'Share token not found',
+      hint: 'Token does not match any record',
+    });
+  }
+  if (token.revoked_at) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_REVOKED.code,
+      message: 'Share token revoked',
+      hint: `Revoked at ${new Date(token.revoked_at).toISOString()}`,
+    });
+  }
+  if (new Date(token.absolute_expires_at) <= new Date()) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_EXPIRED.code,
+      message: 'Share token expired',
+      hint: `Expired at ${new Date(token.absolute_expires_at).toISOString()}`,
+    });
+  }
+  if (token.tenant_id !== tenantId) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_NOT_FOUND.code,
+      message: 'Share token not found',
+      hint: 'Token does not match tenant scope',
+    });
+  }
+
+  // ─── Q2: quote + version JOIN (composite-scoped to token identity) ─────
+  const { rows: qvRows } = await pg.query(
+    `SELECT ${VIEW_LOAD_COLUMNS}
+       FROM public.chiefos_quote_versions v
+       JOIN public.chiefos_quotes q
+         ON q.id = v.quote_id AND q.tenant_id = v.tenant_id AND q.owner_id = v.owner_id
+      WHERE v.id = $1 AND v.tenant_id = $2 AND v.owner_id = $3
+      LIMIT 1`,
+    [token.quote_version_id, token.tenant_id, token.owner_id]
+  );
+  if (qvRows.length === 0) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Share token references non-existent version',
+      hint: `token=${token.share_token_id} version=${token.quote_version_id}; FK constraint violation`,
+    });
+  }
+  const qv = qvRows[0];
+
+  // ─── Quote state validation (permissive — 4 valid states for View) ────
+  switch (qv.quote_status) {
+    case 'sent':
+    case 'viewed':
+    case 'signed':
+    case 'locked':
+      break;
+    case 'draft':
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_NOT_SENT.code,
+        message: 'Quote has not been sent',
+        hint: `quote_id=${qv.quote_id} human_id=${qv.human_id}; draft state — customer should not have received a share link`,
+      });
+    case 'voided':
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_VOIDED.code,
+        message: 'Quote has been voided',
+        hint: `quote_id=${qv.quote_id} human_id=${qv.human_id}; voided quotes cannot be viewed via share link`,
+      });
+    default:
+      // Fail-closed per §17.22 — unknown status is integrity violation.
+      throw new CilIntegrityError({
+        code: 'CIL_INTEGRITY_ERROR',
+        message: 'Unknown quote status',
+        hint: `quote_id=${qv.quote_id} unknown_status=${qv.quote_status}`,
+      });
+  }
+
+  // ─── Co-transition check (§3.3) ───────────────────────────────────────
+  if (qv.version_status !== qv.quote_status) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Quote/version status disagreement',
+      hint: `quote_id=${qv.quote_id} version_id=${qv.version_id} quote.status=${qv.quote_status} version.status=${qv.version_status}; atomicity regression or direct DB write`,
+    });
+  }
+
+  // ─── Supersession (runs AFTER state validation) ───────────────────────
+  // SUP.1: authoritative check.
+  if (token.quote_version_id !== qv.current_version_id) {
+    throw new CilIntegrityError({
+      code: SIG_ERR.SHARE_TOKEN_SUPERSEDED.code,
+      message: 'Share token points at superseded version',
+      hint: `token_version=${token.quote_version_id} current_version=${qv.current_version_id}; request a new share link`,
+    });
+  }
+  // SUP.2 posture B: if SUP.1 passes (token IS current) but the forward-
+  // plan superseded_by_version_id column is set, those two facts disagree.
+  // Surface as integrity violation, not masking as SHARE_TOKEN_SUPERSEDED.
+  if (token.superseded_by_version_id !== null) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Share token integrity mismatch',
+      hint: `token=${token.share_token_id} is current (quote_version_id=${token.quote_version_id} == current_version_id=${qv.current_version_id}) but superseded_by_version_id=${token.superseded_by_version_id}; disagreement indicates data corruption`,
+    });
+  }
+
+  // ─── Composed validated context ───────────────────────────────────────
+  return {
+    tenantId: token.tenant_id,
+    ownerId: token.owner_id,
+
+    // Share-token fields
+    shareTokenId: token.share_token_id,
+    shareTokenValue: shareToken,
+    recipientName: token.recipient_name,
+    recipientChannel: token.recipient_channel,
+    recipientAddress: token.recipient_address,
+    absoluteExpiresAt: token.absolute_expires_at,
+    issuedAt: token.issued_at,
+
+    // Quote identity
+    quoteId: qv.quote_id,
+    humanId: qv.human_id,
+    quoteStatus: qv.quote_status,
+    jobId: qv.job_id,
+    customerId: qv.customer_id,
+    currentVersionId: qv.current_version_id,
+    headerCreatedAt: qv.header_created_at,
+    headerUpdatedAt: qv.header_updated_at,
+
+    // Version fields
+    versionId: qv.version_id,
+    versionNo: qv.version_no,
+    versionStatus: qv.version_status,
+    projectTitle: qv.project_title,
+    currency: qv.currency,
+    totalCents: qv.total_cents,
+    customerSnapshot: qv.customer_snapshot,
+    versionIssuedAt: qv.version_issued_at,
+    versionSentAt: qv.version_sent_at,
+    versionViewedAt: qv.version_viewed_at,
+    versionSignedAt: qv.version_signed_at,
+    versionLockedAt: qv.version_locked_at,
+    versionServerHash: qv.version_server_hash,
+  };
+}
+
 // ─── Phase 3 Section 4: transaction-body helpers ────────────────────────────
 //
 // Five focused INSERT/UPDATE helpers per DB3 Q3.9 steps 14-19. Each takes
@@ -3304,6 +3537,9 @@ module.exports = {
     // ViewQuote Section 1 (schema only; no constraint constant per §17.23)
     ViewQuoteCILZ,
     ViewQuoteActorZ,
+    // ViewQuote Section 2 (load helper + columns)
+    VIEW_LOAD_COLUMNS,
+    loadViewContext,
     // SignQuote Section 3 (context loader + hash-input mapper)
     SIGN_LOAD_COLUMNS,
     loadSignContext,

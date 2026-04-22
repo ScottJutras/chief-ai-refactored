@@ -40,7 +40,7 @@ is safe when needed.
 | **Section 3** | ✅ LANDED | `056d61aa` | `markQuoteViewed` — single helper, sequential header→version UPDATEs, both predicated on `status='sent'`. Header-first ordering. §17.23 rowcount=0 returns `{transitioned: false}`. §3.3 co-transition: version rowcount≠1 after header flipped → `CIL_INTEGRITY_ERROR`. `emitLifecycleCustomerViewed` — INSERT with correlation_id wired from day one (§17.21). `source_msg_id` posture B (strict `!== undefined`). 12 tests including SAVEPOINT-based header-first-rollback regression lock. |
 | **Section 4** | ⏳ OPEN (NEXT) | — | `handleViewQuote` orchestration + `buildViewQuoteReturnShape` (happy path) + `alreadyViewedReturnShape` (prior-state). Full scope in §4 below. |
 | **Section 5** | ⏳ OPEN | — | Remaining tests + edge cases. Includes composer unit tests for `buildViewQuoteReturnShape` + `alreadyViewedReturnShape` (matching SignQuote's Section 5 precedent of ~13 composer unit tests). Potentially includes §17.21 cross-event correlation_id invariant integration test mirroring SendQuote's. |
-| **Section 6** | ⏳ OPEN | — | Router registration in `src/cil/router.js` `NEW_IDIOM_HANDLERS` frozen map. Ceremony script artifact (§28 per sequential numbering). §17.23 formalization in `docs/QUOTES_SPINE_DECISIONS.md`. Supersession-after-state ordering discipline formalization. §17.24 (if adopted) post-rollback re-read discipline. Update `CHIEFOS_EXECUTION_PLAN.md` Phase A Session 2 status. |
+| **Section 6** | ⏳ OPEN | — | Router registration in `src/cil/router.js` `NEW_IDIOM_HANDLERS` frozen map. Ceremony script artifact **§28** (number verified 2026-04-22 — see §10 below). §17.N formalizations under the two-track numbering discipline (see §10). Update `CHIEFOS_EXECUTION_PLAN.md` Phase A Session 2 status. |
 
 ---
 
@@ -171,6 +171,30 @@ flake was a masking symptom, not the bug.
 workaround (e.g., readback-retry helper), verify the hypothesis with failure-
 output diagnostics. The diagnostic approach saved us from shipping a
 workaround that would have masked the production bug.
+
+### 3.8 Phase A Session 1 §17.21 pre-amend SHA quirk — `0beb6327` with `e8e4a1f7` reference
+
+The `docs/QUOTES_SPINE_DECISIONS.md` §17.21 "asymmetry closed" paragraph
+references commit `e8e4a1f7`, but the actual committed SHA is `0beb6327`.
+
+**Why the mismatch is intentional:** Option 1 amend strategy (commit with
+`<sha>` placeholder, then `git commit --amend` to substitute real SHA)
+produces a paradox — amending changes the tree hash, which changes the
+commit hash. The final amended commit's SHA differs from the pre-amend SHA
+that was substituted into the text. Chosen posture: the reference points to
+the superseded initial commit that introduced the backfill (narratively
+accurate — that commit DID do the work). The amended `0beb6327` retains the
+backfill + the SHA-substituted decisions-log reference to the pre-amend
+identity.
+
+**For future readers tracing the reference:** `git log --all` won't find
+`e8e4a1f7` as a live commit; it was orphaned by the amend. `git reflog` for
+Phase A Session 1's window preserves it. The functional code is in
+`0beb6327` under the `main` branch history.
+
+**For future sessions:** prefer post-hoc documentation updates (write the
+decisions-log reference in a follow-on commit that cites the already-landed
+SHA) over pre-hoc SHA substitution via amend. Eliminates the paradox.
 
 ---
 
@@ -339,12 +363,12 @@ Phase sequence decided: **Path B** — change orders deferred to Phase E
 post-cutover. Order:
 
 - **Phase A:** Quote spine (current).
-- **Phase B:** Quote editing + logos + templates + warranty/payment schedule + line-item polymorphic source_type.
-- **Phase C:** Leads spine.
-- **Phase D:** Deposit receipts + payment tracking (first wiring to `public.transactions`).
-- **Phase E:** Change Orders spine (separate 6-table spine; not fold-in).
-- **Phase F:** Invoices spine (generates from signed quote + accepted change orders).
-- **Phase G:** Final receipts + polish.
+- **Phase B:** Quote editing capability (draft quotes only; sent quotes must use ReissueQuote) + tenant logos (brand assets bucket + reference column on tenant profile) + template system (creates the `chiefos_quote_templates` table that §3.6 of Foundation Rebuild deferred; migrates the `warranty_template_ref` / `clauses_template_ref` text columns from soft-reference to FK) + warranty/payment schedule structured fields (richer than current jsonb snapshots) + line-item polymorphic source_type (§6.1 below).
+- **Phase C:** Leads spine (pre-quote lead capture + qualification).
+- **Phase D:** Deposit receipts + payment tracking (first wiring into `public.transactions`; Stripe/e-transfer ingestion).
+- **Phase E:** Change Orders spine (separate 6-table spine mirroring Quote architecture — see §6.2; not fold-in).
+- **Phase F:** Invoices spine (generates from signed quote + accepted change orders; carries line items through for final billing).
+- **Phase G:** Final receipts + polish (close-out, warranty activation, customer handoff artifacts).
 
 **Option 1 locked:** signed quote IS the contract. No separate Contracts
 spine. `chiefos_quote_signatures` + signed-status quote = legal artifact.
@@ -443,7 +467,7 @@ version=new + header=old).
 
 After `/clear`:
 
-1. **Read this handoff** (`docs/PHASE_A_SESSION_2_VIEWQUOTE_HANDOFF.md`) in full.
+1. **Read this handoff** (`docs/PHASE_A_SESSION_2_VIEWQUOTE_HANDOFF.md`) in full. All 11 sections are load-bearing; do not skim §10/§11 because they land at the end.
 2. **Confirm git state** — `git log --oneline -20` — verify SHAs in §1 match HEAD lineage.
 3. **Inspect Section 3 surface** — `git show 056d61aa --stat` to see the 2-file, +634-line footprint.
 4. **Run test baseline** — `npx jest src/cil/quotes.test.js` — expect 271/271 passing. Flaky >1/5? Regression in the share-token fix; halt and investigate before coding.
@@ -469,3 +493,71 @@ this document in place and commit — do not rely on chat context.
 If the cleared session discovers the handoff is incomplete or wrong,
 surface that to the user as "handoff gap detected: [what's missing]"
 before proceeding. Don't paper over gaps; fill them before Section 4.
+
+---
+
+## 10. Decisions-log numbering discipline (two-track)
+
+`docs/QUOTES_SPINE_DECISIONS.md` uses a two-track numbering scheme. The
+cleared session must preserve this discipline when composing Section 6:
+
+**Track 1 — Top-level §N:** architectural ceremonies. One per production-
+exercise of a new handler. Numbers assigned sequentially; each represents a
+distinct deployment milestone.
+- §25 — Phase 2A storage architecture
+- §26 — Phase 2C storage ceremony
+- §27 — Phase 3 SignQuote ceremony
+- **§28 — ViewQuote ceremony (next; verified 2026-04-22 via `grep -E '^## §[0-9]+' docs/QUOTES_SPINE_DECISIONS.md | tail -20` — last top-level is §27)**
+- §29 — expected LockQuote ceremony (if warranted)
+- §30 — expected VoidQuote ceremony (if warranted)
+- §31 — expected ReissueQuote ceremony (if warranted)
+
+**Track 2 — §17.N subsections:** CIL architecture principles derived from
+ceremonies. The §17 family is "CIL Architecture Principles." Subsections
+accrete as ceremonies expose new patterns.
+- §17.19 — post-commit paired notifications
+- §17.20 — pre-BEGIN external write for strict-immutable INSERT
+- §17.21 — correlation_id wiring discipline
+- §17.22 — invariant-assertion discipline
+- **§17.23 — state-driven idempotency (next; first-exerciser ViewQuote)**
+- §17.24 — post-rollback re-read discipline (if Section 4 ships cleanly)
+
+Phase 3 alone originated §17.19 through §17.22 (four subsections from one
+ceremony). ViewQuote may similarly originate multiple subsections.
+
+### Section 6 formalizations under this discipline
+
+- **§28 — ViewQuote production-exercise ceremony artifact.** Top-level,
+  numbered sequentially. Parallels §27's structure: load verification,
+  handler invocation, post-state reconciliation, event-stream audit.
+- **§17.23 — state-driven idempotency pattern.** First-exerciser ViewQuote
+  (see §3.5 and §7.1 of this handoff). LockQuote/VoidQuote are expected
+  second/third exercisers.
+- **§17.24 — post-rollback re-read discipline.** If Section 4 ships
+  cleanly with posture A (see §7.2 of this handoff).
+- **Remaining disciplines — composition judgment at Section 6 time.** Three
+  patterns worth documenting: header-first ordering (see §3.3 and §7.4),
+  echo-if-present source_msg_id posture (see §3.1 and §7.3), supersession-
+  after-state check ordering (see §3.6). Options:
+  - **Bundle:** fold into §17.23 or §17.24 as sub-paragraphs if the
+    patterns naturally belong to the idempotency or re-read discipline.
+  - **Split:** standalone §17.25 / §17.26 / §17.27 if each deserves
+    independent citation.
+  - Decision deferred to Section 6 composition; both are defensible.
+
+---
+
+## 11. Cross-session decision completeness note
+
+The two cross-session decisions documented in §6 (Q3 polymorphic line-item
+source_type, Q4 separate change orders spine) are the **complete
+load-bearing set** from the Foundation Rebuild session's cross-session
+routing round, per the review state as of this handoff. If the cleared
+session discovers additional cross-session decisions referenced elsewhere
+(commit messages, other docs) that aren't captured in §6, surface as
+"handoff gap detected" per §9.
+
+**Known bounded scope of §6:** only routing decisions that affect Phase A
+or Phase B directly. Deep-phase decisions (e.g., Phase E change orders
+architecture beyond "6-table mirror of Quotes") intentionally omitted —
+those will be surfaced in their own phase-scoped handoffs.

@@ -1486,6 +1486,50 @@ const SignQuoteCILZ = BaseCILZ.omit({ actor: true }).extend({
   signature_png_data_url: PngDataUrlZ,
 });
 
+// ─── ViewQuote schema (§14.11 customer actor + §17.23 state-driven idempotency) ──
+//
+// Fourth new-idiom handler; second customer-role handler (after SignQuote).
+// Transitions chiefos_quotes.status 'sent' → 'viewed' when customer opens
+// the /q/:token page, emitting a single lifecycle.customer_viewed event.
+//
+// Architectural posture differs from SignQuote in three ways:
+//   1. No plan gating (§14.12 customer-action exemption).
+//   2. No strict-immutable INSERT; header is mutable; §17.20 does not apply.
+//   3. No natural (owner_id, source_msg_id) unique-constraint surface —
+//      there is no ViewQuote-owned row that carries source_msg_id as a
+//      UNIQUE key. Idempotency is enforced at the state-read layer per
+//      §17.23 (pre-txn status check + conditional UPDATE WHERE status='sent').
+//      No 23505 classification, no classifyCilError branch.
+//
+// Source narrowed to z.literal('web') — only customer surface is public
+// /q/:token (matches SignQuote narrowing). Enum widens when an
+// authenticated customer portal ships.
+//
+// source_msg_id is OPTIONAL per §17.23: not load-bearing for dedupe. When
+// present, echoed into lifecycle.customer_viewed payload as free audit
+// trail (Section 3's emitLifecycleCustomerViewed handles the echo). When
+// absent, key is simply not written.
+//
+// No viewer_ip / viewer_user_agent — viewing is a state flip, not a
+// notarized artifact. Forensic IP/UA capture is reserved for the signed
+// signature row (§14.11 customer-actor authentication is share-token-
+// bearer; the token itself is the credential audit trail).
+
+const ViewQuoteActorZ = z.object({
+  actor_id: UUIDZ,                      // share_token_id per §14.11
+  role: z.literal('customer'),
+});
+
+const ViewQuoteCILZ = BaseCILZ
+  .omit({ actor: true, source_msg_id: true })
+  .extend({
+    type: z.literal('ViewQuote'),
+    source: z.literal('web'),
+    source_msg_id: z.string().min(1).optional(),  // §17.23 departure — optional
+    actor: ViewQuoteActorZ,
+    share_token: ShareTokenStringZ,     // reused from SignQuote block
+  });
+
 // ─── Section 1: resolveOrCreateCustomer ─────────────────────────────────────
 
 async function resolveOrCreateCustomer(client, tenantId, customerInput) {
@@ -3257,6 +3301,9 @@ module.exports = {
     ShareTokenStringZ,
     PngDataUrlZ,
     SIGN_QUOTE_SOURCE_MSG_CONSTRAINT,
+    // ViewQuote Section 1 (schema only; no constraint constant per §17.23)
+    ViewQuoteCILZ,
+    ViewQuoteActorZ,
     // SignQuote Section 3 (context loader + hash-input mapper)
     SIGN_LOAD_COLUMNS,
     loadSignContext,

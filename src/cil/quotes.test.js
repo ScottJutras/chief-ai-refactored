@@ -3191,6 +3191,236 @@ describe('SignQuote — Section 1: SignQuoteCILZ schema', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 2 Section 1 tests: ViewQuoteCILZ schema
+// ═══════════════════════════════════════════════════════════════════════════
+
+const {
+  ViewQuoteCILZ,
+  ViewQuoteActorZ: _ViewQuoteActorZ,
+} = _internals;
+
+describe('ViewQuote — Section 1: ViewQuoteCILZ schema', () => {
+  const VALID_SHARE_TOKEN_UUID = '00000000-c2c2-c2c2-c2c2-000000000005';
+  const VALID_SHARE_TOKEN_STR = 'K5gQbxTdNcN1ZNqmoGtaww';  // 22-char base58
+
+  function validViewPayload(overrides = {}) {
+    return {
+      cil_version: '1.0',
+      type: 'ViewQuote',
+      tenant_id: '00000000-c2c2-c2c2-c2c2-000000000001',
+      source: 'web',
+      source_msg_id: 'test-view-msg-1',
+      actor: { actor_id: VALID_SHARE_TOKEN_UUID, role: 'customer' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      share_token: VALID_SHARE_TOKEN_STR,
+      ...overrides,
+    };
+  }
+
+  describe('schema structure', () => {
+    it('valid payload parses cleanly', () => {
+      const result = ViewQuoteCILZ.safeParse(validViewPayload());
+      expect(result.success).toBe(true);
+    });
+
+    it('missing type field rejects', () => {
+      const { type: _t, ...bad } = validViewPayload();
+      expect(ViewQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('wrong type literal rejects', () => {
+      expect(ViewQuoteCILZ.safeParse(validViewPayload({ type: 'ViewQuoot' })).success).toBe(false);
+    });
+
+    it('missing source field rejects', () => {
+      const { source: _s, ...bad } = validViewPayload();
+      expect(ViewQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+  });
+
+  describe('source field (narrowed to "web" per §20)', () => {
+    it('"web" accepts', () => {
+      expect(ViewQuoteCILZ.safeParse(validViewPayload({ source: 'web' })).success).toBe(true);
+    });
+
+    it('"whatsapp" rejects (not customer-facing)', () => {
+      expect(ViewQuoteCILZ.safeParse(validViewPayload({ source: 'whatsapp' })).success).toBe(false);
+    });
+
+    it('"portal" rejects in Beta (enum widens when authenticated portal ships)', () => {
+      expect(ViewQuoteCILZ.safeParse(validViewPayload({ source: 'portal' })).success).toBe(false);
+    });
+  });
+
+  describe('actor field', () => {
+    it('role: "customer" accepts', () => {
+      expect(ViewQuoteCILZ.safeParse(validViewPayload()).success).toBe(true);
+    });
+
+    it('role: "owner" rejects (proves omit+extend override of BaseCILZ ActorZ)', () => {
+      const payload = validViewPayload({
+        actor: { actor_id: VALID_SHARE_TOKEN_UUID, role: 'owner' },
+      });
+      expect(ViewQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+
+    it('role: "anonymous" rejects (not a ChiefOS role)', () => {
+      const payload = validViewPayload({
+        actor: { actor_id: VALID_SHARE_TOKEN_UUID, role: 'anonymous' },
+      });
+      expect(ViewQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+
+    it('actor_id non-UUID rejects', () => {
+      const payload = validViewPayload({
+        actor: { actor_id: 'not-a-uuid', role: 'customer' },
+      });
+      expect(ViewQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+
+    it('actor missing role field rejects', () => {
+      const payload = validViewPayload({ actor: { actor_id: VALID_SHARE_TOKEN_UUID } });
+      expect(ViewQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+
+    it('actor missing actor_id field rejects', () => {
+      const payload = validViewPayload({ actor: { role: 'customer' } });
+      expect(ViewQuoteCILZ.safeParse(payload).success).toBe(false);
+    });
+  });
+
+  describe('share_token field', () => {
+    it('22-char base58 accepts', () => {
+      expect(ViewQuoteCILZ.safeParse(validViewPayload()).success).toBe(true);
+    });
+
+    it('21-char rejects', () => {
+      expect(ViewQuoteCILZ.safeParse(
+        validViewPayload({ share_token: VALID_SHARE_TOKEN_STR.slice(0, 21) })
+      ).success).toBe(false);
+    });
+
+    it('23-char rejects', () => {
+      expect(ViewQuoteCILZ.safeParse(
+        validViewPayload({ share_token: VALID_SHARE_TOKEN_STR + 'A' })
+      ).success).toBe(false);
+    });
+
+    it('containing "0" rejects (not in Bitcoin base58 alphabet)', () => {
+      expect(ViewQuoteCILZ.safeParse(
+        validViewPayload({ share_token: '0' + VALID_SHARE_TOKEN_STR.slice(1) })
+      ).success).toBe(false);
+    });
+
+    it('empty string rejects', () => {
+      expect(ViewQuoteCILZ.safeParse(
+        validViewPayload({ share_token: '' })
+      ).success).toBe(false);
+    });
+  });
+
+  describe('source_msg_id optionality (§17.23 state-driven idempotency)', () => {
+    it('present (non-empty) accepts', () => {
+      expect(ViewQuoteCILZ.safeParse(
+        validViewPayload({ source_msg_id: 'req-abc-123' })
+      ).success).toBe(true);
+    });
+
+    it('absent (undefined) accepts — no dedupe constraint per §17.23', () => {
+      const { source_msg_id: _x, ...bad } = validViewPayload();
+      expect(ViewQuoteCILZ.safeParse(bad).success).toBe(true);
+    });
+
+    it('empty string rejects (min(1) still applies when present)', () => {
+      expect(ViewQuoteCILZ.safeParse(
+        validViewPayload({ source_msg_id: '' })
+      ).success).toBe(false);
+    });
+
+    it('null rejects (optional means undefined, not null)', () => {
+      expect(ViewQuoteCILZ.safeParse(
+        validViewPayload({ source_msg_id: null })
+      ).success).toBe(false);
+    });
+
+    // Regression guard: if Zod's .optional() ever accidentally strips the
+    // value, Section 3's emitLifecycleCustomerViewed payload echo breaks
+    // silently. Catch it here at the schema layer.
+    it('value passes through to parsed payload when present', () => {
+      const result = ViewQuoteCILZ.parse(validViewPayload({ source_msg_id: 'req-abc-123' }));
+      expect(result.source_msg_id).toBe('req-abc-123');
+    });
+  });
+
+  describe('required-field completeness', () => {
+    it('missing share_token rejects', () => {
+      const { share_token: _x, ...bad } = validViewPayload();
+      expect(ViewQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+  });
+
+  describe('BaseCILZ inheritance', () => {
+    it('missing tenant_id rejects', () => {
+      const { tenant_id: _x, ...bad } = validViewPayload();
+      expect(ViewQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('missing cil_version rejects', () => {
+      const { cil_version: _x, ...bad } = validViewPayload();
+      expect(ViewQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('missing occurred_at rejects', () => {
+      const { occurred_at: _x, ...bad } = validViewPayload();
+      expect(ViewQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+    // Note: no missing-source_msg_id test — it's optional per §17.23.
+  });
+
+  describe('SIG_ERR codes consumed by ViewQuote', () => {
+    // ViewQuote reuses SIG_ERR as-is; no VIEW_ERR taxonomy. These assertions
+    // guard that each code ViewQuote's loadViewContext / handler will throw
+    // remains defined. If a future refactor deletes QUOTE_NOT_SENT from
+    // SIG_ERR, ViewQuote tests break loudly rather than handler breaking
+    // silently at runtime.
+    const VIEW_CONSUMED = {
+      SHARE_TOKEN_NOT_FOUND:  404,
+      SHARE_TOKEN_EXPIRED:    410,
+      SHARE_TOKEN_REVOKED:    410,
+      SHARE_TOKEN_SUPERSEDED: 409,
+      QUOTE_NOT_SENT:         409,
+      QUOTE_VOIDED:           410,
+      BAD_REQUEST:            400,
+    };
+
+    it.each(Object.entries(VIEW_CONSUMED))(
+      'SIG_ERR.%s is defined with correct code + status %s',
+      (key, expectedStatus) => {
+        expect(SIG_ERR[key]).toBeDefined();
+        expect(SIG_ERR[key].code).toBe(key);
+        expect(SIG_ERR[key].status).toBe(expectedStatus);
+      }
+    );
+  });
+
+  describe('No VIEW_QUOTE_SOURCE_MSG_CONSTRAINT export (§17.23 signal via absence)', () => {
+    // Section 1 contract: ViewQuote does NOT have a (owner_id, source_msg_id)
+    // unique-constraint surface. The absence of these exports is how future
+    // readers learn "this handler uses state-driven idempotency, not 23505".
+    // If a future refactor adds such a constant, these guard rails fire.
+    it('_internals does NOT expose VIEW_QUOTE_SOURCE_MSG_CONSTRAINT', () => {
+      expect(_internals.VIEW_QUOTE_SOURCE_MSG_CONSTRAINT).toBeUndefined();
+    });
+
+    it('_internals does NOT expose VIEW_QUOTE_SOURCE_MSG_UNIQUE', () => {
+      expect(_internals.VIEW_QUOTE_SOURCE_MSG_UNIQUE).toBeUndefined();
+    });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Phase 3 Section 3 tests: loadSignContext + buildVersionHashInput
 // ═══════════════════════════════════════════════════════════════════════════
 

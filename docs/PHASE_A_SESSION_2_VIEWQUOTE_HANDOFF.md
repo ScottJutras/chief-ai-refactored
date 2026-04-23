@@ -22,10 +22,15 @@ Git-durable artifacts. Commits listed in chronological order (oldest first):
 | `58c5d30f` | ViewQuote Section 2: `VIEW_LOAD_COLUMNS` + `loadViewContext` + 17 tests; SUP.2 posture B |
 | `92fef9e0` | `generateShareToken` short-output production bug fix (10k-iteration regression test) |
 | `056d61aa` | ViewQuote Section 3: `markQuoteViewed` + `emitLifecycleCustomerViewed` + 12 tests; `source_msg_id` posture B |
+| `0dedea58` | Fix `markQuoteSent` version.status='draft' leak (§3.3 co-transition) + SendQuote Section 7 regression test |
+| `20b015c4` | ViewQuote Section 4: `handleViewQuote` + `buildViewQuoteReturnShape` + `alreadyViewedReturnShape` + 13 tests |
 
-**Current test baseline:** 271/271 passing on `src/cil/quotes.test.js`.
+**Current test baseline:** 285/285 passing on `src/cil/quotes.test.js`
+(271 prior + 1 markQuoteSent regression + 13 Section 4). Requires
+`--testTimeout=30000` to avoid cold pg-pool-init flakes (pre-existing
+environmental behavior; forward-flag for future test-setup warmup).
 
-**Current branch:** `main`. 58 commits ahead of `origin/main` (nothing pushed;
+**Current branch:** `main`. 60 commits ahead of `origin/main` (nothing pushed;
 Phase A development is local). Operating in pre-push territory; `git commit --amend`
 is safe when needed.
 
@@ -38,7 +43,7 @@ is safe when needed.
 | **Section 1** | ✅ LANDED | `367d4895` | `ViewQuoteCILZ` schema. BaseCILZ.omit({actor, source_msg_id}).extend(...). `source` narrowed to `z.literal('web')`. `source_msg_id` optional per §17.23. Reuses `ShareTokenStringZ`. 36 tests. |
 | **Section 2** | ✅ LANDED | `58c5d30f` | `VIEW_LOAD_COLUMNS` (21 cols, includes `v.server_hash` for future signature-verification display). `loadViewContext` — two-query helper (token resolve + quote/version JOIN). State-validation posture: draft→QUOTE_NOT_SENT, voided→QUOTE_VOIDED, sent/viewed/signed/locked → return ctx. Supersession check AFTER state-validation. SUP.2 posture B: SUP.1 authoritative, SUP.1-pass + superseded_by_version_id set → CIL_INTEGRITY_ERROR. 17 tests. |
 | **Section 3** | ✅ LANDED | `056d61aa` | `markQuoteViewed` — single helper, sequential header→version UPDATEs, both predicated on `status='sent'`. Header-first ordering. §17.23 rowcount=0 returns `{transitioned: false}`. §3.3 co-transition: version rowcount≠1 after header flipped → `CIL_INTEGRITY_ERROR`. `emitLifecycleCustomerViewed` — INSERT with correlation_id wired from day one (§17.21). `source_msg_id` posture B (strict `!== undefined`). 12 tests including SAVEPOINT-based header-first-rollback regression lock. |
-| **Section 4** | ⏳ OPEN (NEXT) | — | `handleViewQuote` orchestration + `buildViewQuoteReturnShape` (happy path) + `alreadyViewedReturnShape` (prior-state). Full scope in §4 below. |
+| **Section 4** | ✅ LANDED | `20b015c4` | `handleViewQuote` — 7-step orchestration (ctx preflight, Zod, correlation_id, loadViewContext, status-routing, withClient txn, concurrent-transition re-read posture A, happy-path composer). `buildViewQuoteReturnShape` — 4-entity happy-path composer (quote, version, share_token, meta); version has exactly 12 keys. `alreadyViewedReturnShape` — prior-state composer (meta.correlation_id=null, events_emitted=[]); serves pre-txn routing AND post-rollback re-read. Dropped actor.role defense-in-depth check (Zod literal('customer') makes it unreachable). 13 tests (3 pre-BEGIN + 10 integration). Prerequisite fix landed at `0dedea58` (markQuoteSent version.status leak). |
 | **Section 5** | ⏳ OPEN | — | Remaining tests + edge cases. Includes composer unit tests for `buildViewQuoteReturnShape` + `alreadyViewedReturnShape` (matching SignQuote's Section 5 precedent of ~13 composer unit tests). Potentially includes §17.21 cross-event correlation_id invariant integration test mirroring SendQuote's. |
 | **Section 6** | ⏳ OPEN | — | Router registration in `src/cil/router.js` `NEW_IDIOM_HANDLERS` frozen map. Ceremony script artifact **§28** (number verified 2026-04-22 — see §10 below). §17.N formalizations under the two-track numbering discipline (see §10). Update `CHIEFOS_EXECUTION_PLAN.md` Phase A Session 2 status. |
 
@@ -196,11 +201,105 @@ Phase A Session 1's window preserves it. The functional code is in
 decisions-log reference in a follow-on commit that cites the already-landed
 SHA) over pre-hoc SHA substitution via amend. Eliminates the paradox.
 
+### 3.9 SendQuote `markQuoteSent` version.status leak — discovered during Section 4, fixed at `0dedea58`
+
+`markQuoteSent` (landed in SendQuote Section 5, pre-ViewQuote) updated
+`chiefos_quotes.status` to 'sent' but the version-row UPDATE only wrote
+`issued_at` + `sent_at`, never flipping `chiefos_quote_versions.status`
+from its `insertQuoteVersion`-assigned default of 'draft'. Every real
+`handleSendQuote` call left DB state in §3.3-co-transition violation:
+`quote.status='sent'` + `version.status='draft'`.
+
+**How Section 4 caught it:** ViewQuote's `loadViewContext` (Section 2,
+`58c5d30f`) enforces §3.3 at line 731:
+```js
+if (qv.version_status !== qv.quote_status) {
+  throw new CilIntegrityError({ code: 'CIL_INTEGRITY_ERROR',
+    message: 'Quote/version status disagreement', ... });
+}
+```
+Section 4's end-to-end tests (4, 5, 9, 13) seed via `handleCreateQuote` →
+`handleSendQuote`, producing real drift state. `loadViewContext` threw
+`"quote.status=sent version.status=draft; atomicity regression or direct DB
+write"`. SignQuote's `loadSignContext` at line 426 enforces the same
+invariant (`version.status ∈ ['sent', 'viewed']`) — would also fail on any
+real SendQuote'd quote.
+
+**Why undetected for so long:**
+- SignQuote integration tests use a hand-crafted Phase 2C ceremony
+  signature (tenant `00000000-c2c2-c2c2-c2c2-000000000001`, owner
+  `00000000000`) with `version.status='sent'` pre-seeded. Bypasses the
+  Create→Send chain.
+- SendQuote's own Section 7 tests verify `quote.status='sent'` after
+  commit but never cross-check `version.status`.
+- Section 3's `markQuoteViewed` tests manually flip `version.status='sent'`
+  in their seeding helper (`seedSentQuote`) — precisely because the
+  handler chain's output state wouldn't have worked.
+
+**Fix (`0dedea58`):** single-line addition of `status = 'sent'` to the
+version UPDATE in `markQuoteSent`. Regression-locked with a SendQuote
+Section 7 test that readbacks both `q.status` and `v.status` after commit.
+
+**Architectural lesson:** invariant-assertion discipline (§17.22) protects
+only when downstream consumers actually enforce the invariant. §3.3
+co-transition was dormant from SendQuote's landing until ViewQuote's
+`loadViewContext` became its first enforcer. **End-to-end Create→Send→(Sign
+| View) integration coverage would have caught this earlier.** Consider
+adding an "every handler chain reads cleanly via every downstream load
+helper" regression test as a cross-cutting discipline at Section 6.
+
+**Secondary observation:** the one-line nature of the fix is disarming.
+The bug sat undetected across two ceremonies (§26 Phase 2C storage, §27
+Phase 3 SignQuote) because no integration test exercised the full chain.
+Integration-test surface area is a load-bearing architectural property.
+
+### 3.10 §3.3 co-transition asymmetry: `voided` is header-only
+
+Discovered while writing Section 4 Test 11 (voided-quote rejection):
+`chiefos_quote_versions.status` CHECK enum is `{'draft', 'sent', 'viewed',
+'signed', 'locked'}` — does **not** include `'voided'`. Migration 1
+line 121. Attempting `UPDATE chiefos_quote_versions SET status='voided'`
+fails with `chiefos_quote_versions_status_check` violation.
+
+**Why the asymmetry is correct:** `voided` is a terminal header-level
+state. The version row's immutability semantics (once `locked_at` is set,
+row cannot be updated) handle the analogous concept for signed/locked
+versions. An unlocked version attached to a voided header is archival —
+the version remains queryable at its final pre-void state, and the
+terminal determination lives on the header alone. Forcing the version to
+carry a parallel `voided` status would duplicate state without adding
+invariant protection (the header is the authoritative state-machine row).
+
+**How this affects Section 2's §3.3 co-transition check:** `loadViewContext`
+runs state-validation BEFORE the co-transition check (line 703 switch vs.
+line 731 disagreement check). When `quote.status='voided'`, the switch
+throws `QUOTE_VOIDED` before the co-transition check fires. So a header-
+only void (`quote.status='voided'` + `version.status='sent'`) routes to
+the user-meaningful `QUOTE_VOIDED` error, NOT a confusing
+`CIL_INTEGRITY_ERROR`. The asymmetry is load-bearing for customer-facing
+error clarity.
+
+**For future handlers:** `VoidQuote` must flip ONLY the header. Any
+test-fixture or production path that UPDATEs the version to `'voided'`
+will throw at the DB CHECK layer. `ReissueQuote`, when it ships, also
+must not mirror void onto the version row.
+
+**To formalize at Section 6:** this joins §3.6 (supersession-after-state
+ordering) as an ordering discipline that exists because of error-
+classification priority. Candidate for §17.25 or folded into §17.24's
+post-rollback re-read discipline.
+
 ---
 
-## 4. Section 4 scope (NEXT UP)
+## 4. Section 4 scope (LANDED at `20b015c4`)
 
-Three deliverables:
+> **Status: LANDED.** Section 4 shipped at `20b015c4` on 2026-04-23. The
+> scope below reflects the actual landed shape. 13 tests (3 pre-BEGIN + 10
+> integration); 285/285 total suite passing at `--testTimeout=30000`.
+> Section 4's downstream dependency on SendQuote's `markQuoteSent` shipped
+> first as a prerequisite fix at `0dedea58` — see §3.9.
+
+Three deliverables (all landed):
 - `handleViewQuote` — handler orchestration
 - `buildViewQuoteReturnShape` — happy-path multi-entity composer (§17.15)
 - `alreadyViewedReturnShape` — prior-state composer (called by three paths)
@@ -287,49 +386,58 @@ conditional blocks over time).
 ### 4.5 Pre-implementation verifications (already done; findings below)
 
 - **`buildSignQuoteReturnShape` (line 1288):** 5 entities — signature, quote, version, share_token, meta. `events_emitted` is array. `meta.correlation_id` present.
-- **`buildSendQuoteReturnShape` (line 3286):** 4 entities — quote, share_token, meta. `events_emitted` is array.
+- **`buildSendQuoteReturnShape` (line 3286):** 3 entities — quote, share_token, meta (version data is inlined into `quote`, not broken out as a separate entity like SignQuote/ViewQuote do). `events_emitted` is array. [Corrected during Section 4 landing: original handoff said "4" which was miscounting — `ok:true` is a top-level key, not an entity.]
 - **`priorSignatureToReturnShape` (line 1334):** retry-path composer; `events_emitted: []`; `meta.correlation_id: null`.
 - **`errEnvelope`:** imported from `./utils` at line 67. Shape: `{ ok: false, error: { code, message, hint, traceId } }`.
 - **`pg.withClient`** (services/postgres.js line 118): acquires pool connection, BEGIN, runs body, COMMIT on success / ROLLBACK on throw, releases. Exactly the pattern Section 4 needs.
 - **`CIL_TO_EVENT_ACTOR_SOURCE`** (line 105): `{ whatsapp: 'whatsapp', web: 'portal' }`. ViewQuote's source='web' → actor_source='portal'.
 
-### 4.6 Test taxonomy — 11 tests
+### 4.6 Test taxonomy — 13 tests (landed)
 
-**Pre-BEGIN rejections (unit, no DB):**
+**Pre-BEGIN rejections (unit, no DB) — 3 tests:**
 1. Ctx missing `owner_id` → `OWNER_ID_MISSING` envelope
 2. Ctx missing `traceId` → `TRACE_ID_MISSING` envelope
 3. Zod failure (missing type) → `CIL_SCHEMA_INVALID`
-4. Actor role=owner → `PERMISSION_DENIED`
 
-**End-to-end (integration, DB-gated):**
-5. Happy path: sent → viewed; full shape; `meta.correlation_id` populated;
-   `meta.events_emitted=['lifecycle.customer_viewed']`;
+**Pre-BEGIN Test 4 (actor role=owner → PERMISSION_DENIED) dropped** during
+Section 4 proposal: `ViewQuoteActorZ.role = z.literal('customer')` narrows
+at Zod (Step 1), so a runtime defense-in-depth check would be unreachable.
+Zod rejection returns `CIL_SCHEMA_INVALID` before any runtime check fires.
+Dropping was a proposal-approved decision; handler has a comment where the
+check would have lived to document the intentional absence.
+
+**End-to-end (integration, DB-gated, `--testTimeout=30000`) — 10 tests:**
+4. Happy path: sent → viewed; full 4-entity shape; `meta.correlation_id`
+   populated; `meta.events_emitted=['lifecycle.customer_viewed']`;
    `lifecycle.customer_viewed` event carries same correlation_id (SELECT
-   to prove invariant)
-6. `source_msg_id` pass-through: present in CIL → event payload includes
+   readback to prove §17.21 cross-event invariant)
+5. `source_msg_id` pass-through: present in CIL → event payload includes
    it via readback
-7. Already-viewed: `alreadyViewed` shape, `meta.correlation_id: null`,
-   `events_emitted: []`
-8. Already-signed: `alreadyViewed` shape (legitimate post-sign review)
-9. Already-locked: `alreadyViewed` shape
-10. Concurrent-transition (posture A regression lock): mock `pg.withClient`
-    to pre-flip header status between handler's load and markQuoteViewed
-    call. Handler returns `alreadyViewed` from re-read.
-11. Draft quote → `QUOTE_NOT_SENT` errEnvelope
-12. Voided quote → `QUOTE_VOIDED` errEnvelope
-13. Share-token not-found → `SHARE_TOKEN_NOT_FOUND` errEnvelope
-14. Version-shape regression guard: happy-path `return.version` has exactly
-    12 expected keys (Flag 2 — locks entity contract against drift)
+6. Already-viewed: `alreadyViewed` shape, `meta.correlation_id: null`,
+   `events_emitted: []`, no second `lifecycle.customer_viewed` event
+7. Already-signed: `alreadyViewed` shape; version exposes `signed_at` +
+   `locked_at` + `server_hash` from ctx (not hardcoded)
+8. Already-locked: `alreadyViewed` shape; version exposes `locked_at`
+9. Concurrent-transition (posture A §4.2 regression lock): stubbed
+   `pg.withClient` pre-flips BOTH header AND version rows per §3.3 before
+   `markQuoteViewed` runs. Handler's header UPDATE returns rowcount=0 →
+   re-reads via `loadViewContext` → returns `alreadyViewed` from fresh
+   state. Stub restored in `finally`.
+10. Draft quote → `QUOTE_NOT_SENT` errEnvelope
+11. Voided quote → `QUOTE_VOIDED` errEnvelope (header-only void — §3.10)
+12. Share-token not-found → `SHARE_TOKEN_NOT_FOUND` errEnvelope
+13. Version-shape regression guard: happy-path `return.version` has
+    exactly 12 expected keys (Flag 2 — locks entity contract against drift)
 
-**Update:** 14 tests (4 pre-BEGIN + 10 end-to-end). Proposal mentioned 8-10
-but the end-to-end set expanded during verification. Acceptable.
+### 4.7 Commit posture (landed per §4.7 two-commit sequence)
 
-### 4.7 Commit posture
+Section 4 landed as a single commit (`20b015c4`) per handoff §4.7 posture,
+but the sequence required a prerequisite fix commit (`0dedea58`) landed
+first to unblock Section 4's withClient-entering tests (see §3.9).
 
-Single commit: `Phase A Session 2 Section 4: handleViewQuote orchestration + return shapes`
-
-- `src/cil/quotes.js`: +~200 lines (handler + 2 composers + `_internals` exports)
-- `src/cil/quotes.test.js`: +~400 lines (14 tests + fixtures)
+Commit `20b015c4`:
+- `src/cil/quotes.js`: +307 lines (handler + 2 composers + `_internals` exports)
+- `src/cil/quotes.test.js`: +695 lines (13 tests + fixtures)
 - No decisions-log edit (§17.23 and post-rollback re-read discipline land in Section 6)
 - No router registration (Section 6)
 
@@ -349,9 +457,16 @@ Section 4 stays focused on handler orchestration + end-to-end.
 Five CIL handlers close the Quote state machine:
 
 1. **SendQuote** — backfill (`correlation_id` wiring). ✅ Done `0beb6327`.
-2. **ViewQuote** — sent→viewed. 🔄 In progress, Section 3 of ~6 landed.
+   Critical `markQuoteSent` version.status fix also landed during this
+   session at `0dedea58` (see §3.9).
+2. **ViewQuote** — sent→viewed. 🔄 In progress, Section 4 of ~6 landed
+   (`20b015c4`). Remaining: Section 5 (composer unit tests + edge cases) and
+   Section 6 (router registration + §17.23/§17.24/§17.25? formalization +
+   §28 ceremony artifact).
 3. **LockQuote** — likely auto-lock after cooling period or signed→locked on external event. Scope TBD.
 4. **VoidQuote** — sent/viewed/signed/locked → voided. Soft-terminal state.
+   Must flip header only — `chiefos_quote_versions.status` CHECK enum
+   excludes 'voided' by design (§3.10).
 5. **ReissueQuote** — voided → new quote with prior version reference. Populates `superseded_by_version_id` on old share-tokens.
 
 LockQuote/VoidQuote are second/third exercisers of §17.23 state-driven

@@ -6575,4 +6575,382 @@ describeIfDb('ViewQuote — Section 4: handleViewQuote (integration)', () => {
   }, 30000);
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 2 Section 5 tests: composer unit tests (pure, no DB)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Two blocks, 13 tests each, matching SignQuote Section 5's per-composer
+// coverage posture. ViewQuote has two composers (buildViewQuoteReturnShape
+// + alreadyViewedReturnShape); SignQuote had one primary composer, so
+// symmetric ViewQuote coverage doubles the test count — this is correct,
+// not scope creep.
+
+const {
+  buildViewQuoteReturnShape: _bvqrs,
+  alreadyViewedReturnShape: _avrs,
+} = _internals;
+
+// Fixture identity constants (not real UUIDs in DB — pure-unit scope).
+const S5V_TENANT  = '00000000-c2c2-c2c2-c2c2-000000000001';
+const S5V_OWNER   = '00000000000';
+const S5V_QUOTE   = '00000000-c2c2-c2c2-c2c2-000000000002';
+const S5V_VERSION = '00000000-c2c2-c2c2-c2c2-000000000003';
+const S5V_TOKEN_ID     = '00000000-c2c2-c2c2-c2c2-000000000005';
+const S5V_TOKEN_VALUE  = 'K5gQbxTdNcN1ZNqmoGtaww';  // 22-char base58
+const S5V_JOB_ID       = 2001;
+const S5V_CUSTOMER_ID  = '00000000-c2c2-c2c2-c2c2-000000000007';
+const S5V_CURRENT_VID  = S5V_VERSION;
+
+describe('ViewQuote — Section 5: buildViewQuoteReturnShape (happy-path composer)', () => {
+  // Full loadViewContext-return-shaped ctx for the happy-path composer's
+  // input. Mirrors Section 2's 30-field return (minus fields not surfaced
+  // into the 4-entity return shape — e.g., versionViewedAt from ctx is
+  // IGNORED on happy path, markResult.versionViewedAt wins).
+  function sentCtx(overrides = {}) {
+    return {
+      tenantId: S5V_TENANT,
+      ownerId: S5V_OWNER,
+      shareTokenId: S5V_TOKEN_ID,
+      shareTokenValue: S5V_TOKEN_VALUE,
+      recipientName: 'Happy Path Customer',
+      recipientChannel: 'email',
+      recipientAddress: 'happy@invalid.test',
+      absoluteExpiresAt: new Date('2026-05-21T10:00:00Z'),
+      issuedAt: new Date('2026-04-21T10:00:00Z'),
+      quoteId: S5V_QUOTE,
+      humanId: 'QT-2026-04-21-SEC5',
+      quoteStatus: 'sent',  // pre-txn; handler will transition to 'viewed'
+      jobId: S5V_JOB_ID,
+      customerId: S5V_CUSTOMER_ID,
+      currentVersionId: S5V_CURRENT_VID,
+      headerCreatedAt: new Date('2026-04-21T09:00:00Z'),
+      headerUpdatedAt: new Date('2026-04-21T10:00:00Z'),
+      versionId: S5V_VERSION,
+      versionNo: 1,
+      versionStatus: 'sent',
+      projectTitle: 'Section 5 Unit Test Project',
+      currency: 'CAD',
+      totalCents: 11300,
+      customerSnapshot: { name: 'Happy Path Customer' },
+      versionIssuedAt: new Date('2026-04-21T10:00:00Z'),
+      versionSentAt: new Date('2026-04-21T10:00:00Z'),
+      versionViewedAt: null,
+      versionSignedAt: null,
+      versionLockedAt: null,
+      versionServerHash: null,
+      ...overrides,
+    };
+  }
+
+  function markResultFixture(overrides = {}) {
+    return {
+      transitioned: true,
+      quoteUpdatedAt: new Date('2026-04-22T14:30:00Z'),  // fresh bump
+      versionViewedAt: new Date('2026-04-22T14:30:00Z'), // fresh mark
+      ...overrides,
+    };
+  }
+
+  function baseInputs(overrides = {}) {
+    return {
+      ctx: sentCtx(),
+      markResult: markResultFixture(),
+      correlationId: '00000000-aaaa-bbbb-cccc-000000000001',
+      eventsEmitted: ['lifecycle.customer_viewed'],
+      alreadyExisted: false,
+      traceId: 'trace-s5v-1',
+      ...overrides,
+    };
+  }
+
+  it('Test 1 — ok:true present on happy-path output', () => {
+    const shape = _bvqrs(baseInputs());
+    expect(shape.ok).toBe(true);
+  });
+
+  it('Test 2 — 4 entities present (quote, version, share_token, meta)', () => {
+    const shape = _bvqrs(baseInputs());
+    expect(shape).toHaveProperty('quote');
+    expect(shape).toHaveProperty('version');
+    expect(shape).toHaveProperty('share_token');
+    expect(shape).toHaveProperty('meta');
+  });
+
+  it('Test 3 — meta.correlation_id matches input correlationId', () => {
+    const shape = _bvqrs(baseInputs());
+    expect(shape.meta.correlation_id).toBe('00000000-aaaa-bbbb-cccc-000000000001');
+  });
+
+  it('Test 4 — meta.already_existed = false (passed through from input)', () => {
+    const shape = _bvqrs(baseInputs());
+    expect(shape.meta.already_existed).toBe(false);
+  });
+
+  it('Test 5 — meta.events_emitted matches input array', () => {
+    const shape = _bvqrs(baseInputs());
+    expect(shape.meta.events_emitted).toEqual(['lifecycle.customer_viewed']);
+  });
+
+  it('Test 6 — meta.traceId matches input', () => {
+    const shape = _bvqrs(baseInputs());
+    expect(shape.meta.traceId).toBe('trace-s5v-1');
+  });
+
+  it("Test 7 — quote.status hardcoded to 'viewed' (composer does not read ctx.quoteStatus)", () => {
+    // Regression guard: even if ctx carries a non-sent status somehow, the
+    // happy-path composer must emit 'viewed'. The handler's Step 5 routing
+    // ensures this composer is only invoked when ctx.quoteStatus === 'sent',
+    // but the composer itself shouldn't depend on that (separation of
+    // concerns).
+    const inputs = baseInputs({ ctx: sentCtx({ quoteStatus: 'DRIFT_SHOULD_NOT_LEAK' }) });
+    const shape = _bvqrs(inputs);
+    expect(shape.quote.status).toBe('viewed');
+  });
+
+  it('Test 8 — quote.updated_at from markResult.quoteUpdatedAt (fresh bump), NOT ctx.headerUpdatedAt', () => {
+    // Distinguishing timestamp proves composer reads from the correct
+    // source. If this regresses, the happy-path return would expose stale
+    // pre-txn timestamps.
+    const freshBump = new Date('2026-04-22T14:30:00Z');
+    const staleCtx = new Date('2026-04-21T10:00:00Z');
+    const shape = _bvqrs(baseInputs({
+      ctx: sentCtx({ headerUpdatedAt: staleCtx }),
+      markResult: markResultFixture({ quoteUpdatedAt: freshBump }),
+    }));
+    expect(shape.quote.updated_at).toEqual(freshBump);
+    expect(shape.quote.updated_at).not.toEqual(staleCtx);
+  });
+
+  it("Test 9 — version.status hardcoded to 'viewed'", () => {
+    const inputs = baseInputs({ ctx: sentCtx({ versionStatus: 'DRIFT_SHOULD_NOT_LEAK' }) });
+    const shape = _bvqrs(inputs);
+    expect(shape.version.status).toBe('viewed');
+  });
+
+  it('Test 10 — version.viewed_at from markResult.versionViewedAt, NOT ctx.versionViewedAt', () => {
+    const freshMark = new Date('2026-04-22T14:30:00Z');
+    const shape = _bvqrs(baseInputs({
+      ctx: sentCtx({ versionViewedAt: null }),  // pre-txn: not yet viewed
+      markResult: markResultFixture({ versionViewedAt: freshMark }),
+    }));
+    expect(shape.version.viewed_at).toEqual(freshMark);
+  });
+
+  it('Test 11 — version.signed_at / locked_at / server_hash all null on happy path', () => {
+    // sent→viewed transition doesn't touch these fields. The composer
+    // hardcodes null, not reading ctx (which would be null anyway on a
+    // sent-state version but the composer shouldn't rely on that).
+    const shape = _bvqrs(baseInputs());
+    expect(shape.version.signed_at).toBeNull();
+    expect(shape.version.locked_at).toBeNull();
+    expect(shape.version.server_hash).toBeNull();
+  });
+
+  it('Test 12 — version entity has exactly 12 expected keys (exact-key-match regression lock)', () => {
+    const shape = _bvqrs(baseInputs());
+    expect(Object.keys(shape.version).sort()).toEqual([
+      'currency',
+      'id',
+      'issued_at',
+      'locked_at',
+      'project_title',
+      'sent_at',
+      'server_hash',
+      'signed_at',
+      'status',
+      'total_cents',
+      'version_no',
+      'viewed_at',
+    ]);
+  });
+
+  it('Test 13 — share_token entity has exactly 7 expected keys (exact-key-match regression lock)', () => {
+    const shape = _bvqrs(baseInputs());
+    expect(Object.keys(shape.share_token).sort()).toEqual([
+      'absolute_expires_at',
+      'id',
+      'issued_at',
+      'recipient_address',
+      'recipient_channel',
+      'recipient_name',
+      'token',
+    ]);
+  });
+});
+
+describe('ViewQuote — Section 5: alreadyViewedReturnShape (prior-state composer)', () => {
+  // This composer serves three handler paths:
+  //   1. Pre-txn routing when quoteStatus ∈ {viewed, signed, locked} (Step 5)
+  //   2. Post-rollback re-read after concurrent transition (Step 7a, posture A §4.2)
+  //   3. Conceptually, any future "quote moved past sent before we could act"
+  //      path that a sibling handler might introduce
+  // The return shape is IDENTICAL regardless of which path invoked it — the
+  // composer has no awareness of caller context. Tests below exercise all
+  // three valid prior states (viewed/signed/locked) to confirm shape
+  // invariance under state variation.
+
+  function priorCtx(state, overrides = {}) {
+    // state ∈ {'viewed', 'signed', 'locked'} — determines version timestamp
+    // fields that should be populated from ctx (not hardcoded to null).
+    const viewedAt = new Date('2026-04-22T11:00:00Z');
+    const signedAt = state === 'signed' || state === 'locked'
+      ? new Date('2026-04-22T12:00:00Z') : null;
+    const lockedAt = state === 'signed' || state === 'locked'
+      ? new Date('2026-04-22T12:00:00Z') : null;
+    const serverHash = state === 'signed' || state === 'locked'
+      ? 'a'.repeat(64) : null;
+    return {
+      tenantId: S5V_TENANT,
+      ownerId: S5V_OWNER,
+      shareTokenId: S5V_TOKEN_ID,
+      shareTokenValue: S5V_TOKEN_VALUE,
+      recipientName: 'Prior State Customer',
+      recipientChannel: 'email',
+      recipientAddress: 'prior@invalid.test',
+      absoluteExpiresAt: new Date('2026-05-21T10:00:00Z'),
+      issuedAt: new Date('2026-04-21T10:00:00Z'),
+      quoteId: S5V_QUOTE,
+      humanId: 'QT-2026-04-21-SEC5',
+      quoteStatus: state,
+      jobId: S5V_JOB_ID,
+      customerId: S5V_CUSTOMER_ID,
+      currentVersionId: S5V_CURRENT_VID,
+      headerCreatedAt: new Date('2026-04-21T09:00:00Z'),
+      headerUpdatedAt: new Date('2026-04-22T11:00:00Z'),  // no fresh bump this call
+      versionId: S5V_VERSION,
+      versionNo: 1,
+      versionStatus: state,
+      projectTitle: 'Section 5 Prior State Test',
+      currency: 'CAD',
+      totalCents: 11300,
+      customerSnapshot: { name: 'Prior State Customer' },
+      versionIssuedAt: new Date('2026-04-21T10:00:00Z'),
+      versionSentAt: new Date('2026-04-21T10:00:00Z'),
+      versionViewedAt: viewedAt,  // non-null for all three prior states
+      versionSignedAt: signedAt,
+      versionLockedAt: lockedAt,
+      versionServerHash: serverHash,
+      ...overrides,
+    };
+  }
+
+  it('Test 1 — ok:true present', () => {
+    const shape = _avrs({ ctx: priorCtx('viewed'), traceId: 't' });
+    expect(shape.ok).toBe(true);
+  });
+
+  it('Test 2 — 4 entities present (quote, version, share_token, meta)', () => {
+    const shape = _avrs({ ctx: priorCtx('viewed'), traceId: 't' });
+    expect(shape).toHaveProperty('quote');
+    expect(shape).toHaveProperty('version');
+    expect(shape).toHaveProperty('share_token');
+    expect(shape).toHaveProperty('meta');
+  });
+
+  it('Test 3 — meta.correlation_id = null (hardcoded — §17.21 retry-path limitation)', () => {
+    // No ViewQuote-owned row carries the original invocation's correlation_id,
+    // so the prior-state composer cannot surface it. Hardcoded null is the
+    // contract. Ignores any caller-passed correlationId (composer signature
+    // has no correlationId param; this is by design).
+    const shape = _avrs({ ctx: priorCtx('viewed'), traceId: 't' });
+    expect(shape.meta.correlation_id).toBeNull();
+  });
+
+  it('Test 4 — meta.already_existed = true (hardcoded)', () => {
+    const shape = _avrs({ ctx: priorCtx('viewed'), traceId: 't' });
+    expect(shape.meta.already_existed).toBe(true);
+  });
+
+  it('Test 5 — meta.events_emitted = [] (hardcoded)', () => {
+    // Prior-state paths emit nothing — the original invocation already
+    // emitted lifecycle.customer_viewed. Retry doesn't re-emit.
+    const shape = _avrs({ ctx: priorCtx('viewed'), traceId: 't' });
+    expect(shape.meta.events_emitted).toEqual([]);
+  });
+
+  it('Test 6 — meta.traceId matches input', () => {
+    const shape = _avrs({ ctx: priorCtx('viewed'), traceId: 'trace-avrs-6' });
+    expect(shape.meta.traceId).toBe('trace-avrs-6');
+  });
+
+  it("Test 7 — viewed state: quote.status='viewed' from ctx; quote.updated_at=ctx.headerUpdatedAt (no fresh bump)", () => {
+    const ctx = priorCtx('viewed');
+    const shape = _avrs({ ctx, traceId: 't' });
+    expect(shape.quote.status).toBe('viewed');
+    expect(shape.quote.updated_at).toEqual(ctx.headerUpdatedAt);
+  });
+
+  it("Test 8 — signed state: quote.status='signed'; version exposes signed_at + locked_at + server_hash from ctx", () => {
+    const ctx = priorCtx('signed');
+    const shape = _avrs({ ctx, traceId: 't' });
+    expect(shape.quote.status).toBe('signed');
+    expect(shape.version.signed_at).toEqual(ctx.versionSignedAt);
+    expect(shape.version.locked_at).toEqual(ctx.versionLockedAt);
+    expect(shape.version.server_hash).toBe(ctx.versionServerHash);
+    expect(shape.version.server_hash).toBe('a'.repeat(64));
+  });
+
+  it("Test 9 — locked state: quote.status='locked'; version exposes signed_at + locked_at + server_hash from ctx", () => {
+    const ctx = priorCtx('locked');
+    const shape = _avrs({ ctx, traceId: 't' });
+    expect(shape.quote.status).toBe('locked');
+    expect(shape.version.signed_at).toEqual(ctx.versionSignedAt);
+    expect(shape.version.locked_at).toEqual(ctx.versionLockedAt);
+    expect(shape.version.server_hash).toBe(ctx.versionServerHash);
+  });
+
+  it('Test 10 — version.status from ctx.versionStatus (not hardcoded) across all three prior states', () => {
+    for (const state of ['viewed', 'signed', 'locked']) {
+      const shape = _avrs({ ctx: priorCtx(state), traceId: 't' });
+      expect(shape.version.status).toBe(state);
+    }
+  });
+
+  it('Test 11 — version.viewed_at from ctx.versionViewedAt with defensive non-null type check', () => {
+    // Hardening per Section 5 proposal Finding 3: if a corrupted prior-state
+    // ctx ever carries version.status='viewed' with versionViewedAt=null,
+    // this test fails loudly rather than silently passing on undefined ===
+    // undefined. Asserts BOTH ctx-match AND real-timestamp type.
+    const ctx = priorCtx('viewed');
+    const shape = _avrs({ ctx, traceId: 't' });
+    expect(shape.version.viewed_at).toEqual(ctx.versionViewedAt);
+    expect(shape.version.viewed_at).not.toBeNull();
+    expect(shape.version.viewed_at).toBeInstanceOf(Date);
+  });
+
+  it('Test 12 — version entity has exactly 12 expected keys (same shape as happy-path)', () => {
+    // Locks shape identity across buildViewQuoteReturnShape and
+    // alreadyViewedReturnShape — both emit the same 12-key version entity.
+    // If they drift, consumers parsing `result.version` break on the
+    // prior-state path without warning.
+    const shape = _avrs({ ctx: priorCtx('viewed'), traceId: 't' });
+    expect(Object.keys(shape.version).sort()).toEqual([
+      'currency',
+      'id',
+      'issued_at',
+      'locked_at',
+      'project_title',
+      'sent_at',
+      'server_hash',
+      'signed_at',
+      'status',
+      'total_cents',
+      'version_no',
+      'viewed_at',
+    ]);
+  });
+
+  it('Test 13 — share_token entity has exactly 7 expected keys (same shape as happy-path)', () => {
+    const shape = _avrs({ ctx: priorCtx('viewed'), traceId: 't' });
+    expect(Object.keys(shape.share_token).sort()).toEqual([
+      'absolute_expires_at',
+      'id',
+      'issued_at',
+      'recipient_address',
+      'recipient_channel',
+      'recipient_name',
+      'token',
+    ]);
+  });
+});
 

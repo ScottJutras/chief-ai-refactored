@@ -5,13 +5,7 @@
 // Namespace: 'c4c4-c4c4-c4c4' hex group distinguishes Phase A Session 2
 // ceremony rows from Phase 3's 'c3c3-c3c3-c3c3' and Phase 2C's 'c2c2-c2c2-c2c2'.
 
-const crypto = require('crypto');
-let bs58;
-try {
-  bs58 = require('bs58').default || require('bs58');
-} catch (_) {
-  bs58 = null;
-}
+const { deriveDeterministicShareToken } = require('./_ceremony_shared');
 
 const CEREMONY_TENANT_ID      = '00000000-c4c4-c4c4-c4c4-000000000001';
 const CEREMONY_OWNER_ID       = '00000000002';  // distinct from §27's 00000000001
@@ -26,28 +20,14 @@ const CEREMONY_PROJECT_TITLE   = 'Phase A Session 2 ViewQuote Ceremony';
 const CEREMONY_CUSTOMER_NAME   = 'Phase A Session 2 Ceremony Customer';
 const CEREMONY_RECIPIENT_EMAIL = 'phase-a-s2-ceremony@chiefos.invalid';
 
-// Deterministic share_token: bs58-encoded SHA-256 of a versioned seed string,
-// truncated to 16 bytes. bs58 produces 22 chars ≥97.2% of the time and 21
-// chars ~2.83% (the §3.7 / §17.22 short-output case). Seed version iterated
-// until output is exactly 22 chars — first valid seed becomes the frozen
-// ceremony token. v1 was a 21-char short-output; v2 derives to 22.
-function deriveShareToken() {
-  if (!bs58) return null;
-  const seed = crypto.createHash('sha256')
-    .update('chiefos-phase-a-session-2-viewquote-ceremony-share-token-seed-v2')
-    .digest()
-    .subarray(0, 16);
-  return bs58.encode(seed);
-}
-const CEREMONY_SHARE_TOKEN = deriveShareToken();
-
-if (!CEREMONY_SHARE_TOKEN || CEREMONY_SHARE_TOKEN.length !== 22) {
-  throw new Error(
-    `[phase-a-s2-constants] share_token wrong length: ${
-      CEREMONY_SHARE_TOKEN && CEREMONY_SHARE_TOKEN.length
-    } (expected 22). bs58 not installed?`
-  );
-}
+// Deterministic share_token: via shared ceremony helper. Seed string `-v2`
+// suffix is a historical marker (v1 derived to 21 chars — the §3.7 / §17.22
+// short-output case — manually iterated during Section 6 implementation).
+// With the shared helper's retry iteration, future ceremonies can use clean
+// seed strings without the manual-iteration footgun.
+const CEREMONY_SHARE_TOKEN = deriveDeterministicShareToken(
+  'chiefos-phase-a-session-2-viewquote-ceremony-share-token-seed-v2'
+);
 
 module.exports = {
   CEREMONY_TENANT_ID,

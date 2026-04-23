@@ -6,12 +6,7 @@
 // rows from Phase 2C's 'c2c2-c2c2-c2c2'.
 
 const crypto = require('crypto');
-let bs58;
-try {
-  bs58 = require('bs58').default || require('bs58');
-} catch (_) {
-  bs58 = null;
-}
+const { deriveDeterministicShareToken } = require('./_ceremony_shared');
 
 const CEREMONY_TENANT_ID        = '00000000-c3c3-c3c3-c3c3-000000000001';
 const CEREMONY_OWNER_ID         = '00000000001';
@@ -28,23 +23,13 @@ const CEREMONY_RECIPIENT_EMAIL  = 'phase3-ceremony@chiefos.invalid';
 const CEREMONY_SIGNER_NAME      = CEREMONY_CUSTOMER_NAME;  // match-path for ceremony
 const CEREMONY_CONTRACTOR_EMAIL = 'scott.tirakian@gmail.com';  // Postmark target (Mission §22 parallel)
 
-function deriveShareToken() {
-  if (!bs58) return null;
-  const seed = crypto.createHash('sha256')
-    .update('chiefos-phase3-ceremony-share-token-seed-v1')
-    .digest()
-    .subarray(0, 16);
-  return bs58.encode(seed);
-}
-const CEREMONY_SHARE_TOKEN = deriveShareToken();
-
-if (!CEREMONY_SHARE_TOKEN || CEREMONY_SHARE_TOKEN.length !== 22) {
-  throw new Error(
-    `[phase3-constants] share_token wrong length: ${
-      CEREMONY_SHARE_TOKEN && CEREMONY_SHARE_TOKEN.length
-    }. bs58 not installed?`
-  );
-}
+// Deterministic share_token: via shared ceremony helper. Seed string `-v1`
+// suffix is preserved as-is — happened to produce 22-char output on first
+// attempt, so the landed §27 token (SjBkxvAvPEx8CX3UFJ6mrT) is preserved
+// byte-for-byte.
+const CEREMONY_SHARE_TOKEN = deriveDeterministicShareToken(
+  'chiefos-phase3-ceremony-share-token-seed-v1'
+);
 
 // ─── PNG fixture (real 1×1 grayscale + tEXt metadata) ──────────────────────
 

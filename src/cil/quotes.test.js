@@ -5880,4 +5880,699 @@ describe('SignQuote — Section 5: handleSignQuote', () => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 2 Section 4 tests: handleViewQuote (handler orchestration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const { handleViewQuote } = require('./quotes');
+
+describe('ViewQuote — Section 4: handleViewQuote (pre-BEGIN rejection)', () => {
+  const VALID_VIEW_TOKEN = 'K5gQbxTdNcN1ZNqmoGtaww';  // 22-char base58
+  const VALID_ACTOR_UUID = '00000000-c2c2-c2c2-c2c2-000000000005';
+
+  function validViewCil(overrides = {}) {
+    return {
+      cil_version: '1.0',
+      type: 'ViewQuote',
+      tenant_id: '00000000-c2c2-c2c2-c2c2-000000000001',
+      source: 'web',
+      actor: { actor_id: VALID_ACTOR_UUID, role: 'customer' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      share_token: VALID_VIEW_TOKEN,
+      ...overrides,
+    };
+  }
+
+  test('Test 1 — ctx missing owner_id → OWNER_ID_MISSING envelope', async () => {
+    const result = await handleViewQuote(validViewCil(), { traceId: 'trace-s4-1' });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('OWNER_ID_MISSING');
+    expect(result.error.traceId).toBe('trace-s4-1');
+  });
+
+  test('Test 2 — ctx missing traceId → TRACE_ID_MISSING envelope', async () => {
+    const result = await handleViewQuote(validViewCil(), { owner_id: '99999999999' });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('TRACE_ID_MISSING');
+    expect(result.error.traceId).toBeNull();
+  });
+
+  test('Test 3 — Zod failure (missing type) → CIL_SCHEMA_INVALID envelope', async () => {
+    const { type: _t, ...bad } = validViewCil();
+    const result = await handleViewQuote(bad, {
+      owner_id: '99999999999', traceId: 'trace-s4-3',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('CIL_SCHEMA_INVALID');
+    expect(result.error.traceId).toBe('trace-s4-3');
+  });
+});
+
+describeIfDb('ViewQuote — Section 4: handleViewQuote (integration)', () => {
+  const VIEW_TENANT_ID = MISSION_TENANT_UUID;
+
+  // Seeds a real sent quote via handleCreateQuote → handleSendQuote chain.
+  // Returns identifiers needed to exercise handleViewQuote in all 10
+  // integration tests (happy path, state-variant paths, concurrent-transition
+  // regression lock, errEnvelope paths, shape-regression guard).
+  async function seedSentQuoteForView({ pg, ownerId, tenantId, seedMsgId, sendMsgId }) {
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+
+    const createCil = {
+      cil_version: '1.0',
+      type: 'CreateQuote',
+      tenant_id: tenantId,
+      source: 'whatsapp',
+      source_msg_id: seedMsgId,
+      actor: { actor_id: ownerId, role: 'owner' },
+      occurred_at: new Date().toISOString(),
+      job: {
+        job_name: `View Test Job ${Math.random().toString(36).slice(2, 8)}`,
+        create_if_missing: true,
+      },
+      needs_job_resolution: false,
+      customer: {
+        name: 'ViewQuote Integration Recipient',
+        email: 'view-test@chiefos.test',
+        phone_e164: '+15195550288',
+        address: '1 Test Way, London, ON',
+      },
+      project: { title: 'ViewQuote Integration Test', scope: 'Section 4 test scope.' },
+      currency: 'CAD',
+      tax_rate_bps: 1300,
+      tax_code: 'HST-ON',
+      line_items: [
+        { sort_order: 0, description: 'Test item', category: 'materials', qty: 1, unit_price_cents: 10000 },
+      ],
+      deposit_cents: 0,
+      payment_terms: {},
+      warranty_snapshot: {},
+      clauses_snapshot: {},
+    };
+    const createResult = await handleCreateQuote(createCil, {
+      owner_id: ownerId, traceId: `trace-view-seed-${Date.now()}`,
+    });
+    if (!createResult.ok) {
+      throw new Error(`Seed CreateQuote failed: ${JSON.stringify(createResult.error)}`);
+    }
+    const quoteId = createResult.quote.id;
+
+    const sendCil = {
+      cil_version: '1.0',
+      type: 'SendQuote',
+      tenant_id: tenantId,
+      source: 'whatsapp',
+      source_msg_id: sendMsgId,
+      actor: { actor_id: ownerId, role: 'owner' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      quote_ref: { quote_id: quoteId },
+    };
+    const sendResult = await handleSendQuote(sendCil, {
+      owner_id: ownerId, traceId: `trace-view-send-${Date.now()}`,
+    });
+    if (!sendResult.ok) {
+      throw new Error(`Seed SendQuote failed: ${JSON.stringify(sendResult.error)}`);
+    }
+
+    return {
+      quoteId,
+      versionId: sendResult.quote.version_id,
+      shareTokenId: sendResult.share_token.id,
+      shareTokenValue: sendResult.share_token.token,
+      customerId: sendResult.quote.customer.id,
+      recipientName: 'ViewQuote Integration Recipient',
+      recipientAddress: 'view-test@chiefos.test',
+    };
+  }
+
+  async function cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey }) {
+    await pg.query(
+      `DELETE FROM public.chiefos_quote_share_tokens
+        WHERE quote_version_id IN
+              (SELECT id FROM public.chiefos_quote_versions WHERE quote_id = $1)`,
+      [quoteId]
+    ).catch(() => {});
+    await cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey).catch(() => {});
+    await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+  }
+
+  function buildViewCil({ tenantId, shareToken, shareTokenId, sourceMsgId }) {
+    const cil = {
+      cil_version: '1.0',
+      type: 'ViewQuote',
+      tenant_id: tenantId,
+      source: 'web',
+      actor: { actor_id: shareTokenId, role: 'customer' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      share_token: shareToken,
+    };
+    if (sourceMsgId !== undefined) cil.source_msg_id = sourceMsgId;
+    return cil;
+  }
+
+  beforeEach(() => {
+    // Mock Postmark for SendQuote seed path (not for ViewQuote — it sends no email).
+    _internals.setSendEmailForTests(async (opts) => ({
+      MessageID: `fake-postmark-view-${Math.random().toString(36).slice(2, 8)}`,
+      To: opts.to,
+    }));
+  });
+  afterEach(() => {
+    _internals.resetSendEmailForTests();
+  });
+
+  test('Test 4 — Happy path: sent → viewed; §17.21 correlation_id invariant across meta + event', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-happy-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-happy-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+        sourceMsgId: `test-s4-happy-view-${Date.now()}`,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-happy',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.id).toBe(seed.quoteId);
+      expect(result.quote.status).toBe('viewed');
+      expect(result.version.id).toBe(seed.versionId);
+      expect(result.version.status).toBe('viewed');
+      expect(result.version.viewed_at).toBeDefined();
+      expect(result.version.signed_at).toBeNull();
+      expect(result.version.locked_at).toBeNull();
+      expect(result.version.server_hash).toBeNull();
+      expect(result.share_token.id).toBe(seed.shareTokenId);
+      expect(result.share_token.token).toBe(seed.shareTokenValue);
+      expect(result.share_token.recipient_channel).toBe('email');
+      expect(result.share_token.recipient_address).toBe(seed.recipientAddress);
+      expect(result.share_token.recipient_name).toBe(seed.recipientName);
+      expect(result.meta.already_existed).toBe(false);
+      expect(result.meta.events_emitted).toEqual(['lifecycle.customer_viewed']);
+      expect(result.meta.correlation_id).toMatch(/^[0-9a-f-]{36}$/);
+      expect(result.meta.traceId).toBe('trace-s4-happy');
+
+      // §17.21 cross-event invariant: lifecycle.customer_viewed event row
+      // MUST carry the same correlation_id that meta.correlation_id exposes.
+      // If the handler ever lets the helper default to null, this test catches it.
+      const { rows } = await pg.query(
+        `SELECT correlation_id FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.customer_viewed'`,
+        [seed.quoteId]
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].correlation_id).toBe(result.meta.correlation_id);
+
+      // DB state matches return: header + version both flipped.
+      const dbState = await pg.query(
+        `SELECT q.status AS q_status, v.status AS v_status, v.viewed_at
+           FROM public.chiefos_quotes q
+           JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+          WHERE q.id = $1`,
+        [seed.quoteId]
+      );
+      expect(dbState.rows[0].q_status).toBe('viewed');
+      expect(dbState.rows[0].v_status).toBe('viewed');
+      expect(dbState.rows[0].viewed_at).not.toBeNull();
+    } finally {
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 5 — source_msg_id pass-through: present in CIL → event payload carries source_msg_id', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-smi-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-smi-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const viewMsgId = `test-s4-smi-view-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+        sourceMsgId: viewMsgId,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-smi',
+      });
+      expect(result.ok).toBe(true);
+
+      const { rows } = await pg.query(
+        `SELECT payload FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.customer_viewed'`,
+        [seed.quoteId]
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0].payload).toEqual({ source_msg_id: viewMsgId });
+    } finally {
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 6 — Already-viewed: alreadyViewed shape, meta.correlation_id null, events_emitted []', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-av-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-av-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      // Pre-flip to viewed state (both rows per §3.3).
+      await pg.query(
+        `UPDATE public.chiefos_quotes SET status='viewed', updated_at=NOW() WHERE id=$1`,
+        [seed.quoteId]
+      );
+      await pg.query(
+        `UPDATE public.chiefos_quote_versions SET status='viewed', viewed_at=NOW() WHERE id=$1`,
+        [seed.versionId]
+      );
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-av',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.status).toBe('viewed');
+      expect(result.version.status).toBe('viewed');
+      expect(result.version.viewed_at).not.toBeNull();
+      expect(result.meta.already_existed).toBe(true);
+      expect(result.meta.events_emitted).toEqual([]);
+      expect(result.meta.correlation_id).toBeNull();
+
+      // No lifecycle.customer_viewed emission — handler took the pre-txn
+      // routing branch, never opened a transaction.
+      const { rows } = await pg.query(
+        `SELECT COUNT(*)::int AS n FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.customer_viewed'`,
+        [seed.quoteId]
+      );
+      expect(rows[0].n).toBe(0);
+    } finally {
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 7 — Already-signed: alreadyViewed shape; version exposes signed_at + locked_at + server_hash', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-as-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-as-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      // Flip to signed in a single UPDATE per row — locked_at must be set in
+      // the same write since chiefos_quote_versions_guard_immutable blocks
+      // any subsequent UPDATE once locked_at is non-null.
+      await pg.query(
+        `UPDATE public.chiefos_quotes SET status='signed', updated_at=NOW() WHERE id=$1`,
+        [seed.quoteId]
+      );
+      const serverHashFixture = 'a'.repeat(64);
+      await pg.query(
+        `UPDATE public.chiefos_quote_versions
+            SET status='signed', signed_at=NOW(), locked_at=NOW(), server_hash=$2
+          WHERE id=$1`,
+        [seed.versionId, serverHashFixture]
+      );
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-as',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.status).toBe('signed');
+      expect(result.version.status).toBe('signed');
+      expect(result.version.signed_at).not.toBeNull();
+      expect(result.version.locked_at).not.toBeNull();
+      expect(result.version.server_hash).toBe(serverHashFixture);
+      expect(result.meta.already_existed).toBe(true);
+      expect(result.meta.events_emitted).toEqual([]);
+      expect(result.meta.correlation_id).toBeNull();
+    } finally {
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 8 — Already-locked: alreadyViewed shape; version exposes locked_at + server_hash', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-al-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-al-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      await pg.query(
+        `UPDATE public.chiefos_quotes SET status='locked', updated_at=NOW() WHERE id=$1`,
+        [seed.quoteId]
+      );
+      const serverHashFixture = 'b'.repeat(64);
+      await pg.query(
+        `UPDATE public.chiefos_quote_versions
+            SET status='locked', signed_at=NOW(), locked_at=NOW(), server_hash=$2
+          WHERE id=$1`,
+        [seed.versionId, serverHashFixture]
+      );
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-al',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.status).toBe('locked');
+      expect(result.version.status).toBe('locked');
+      expect(result.version.locked_at).not.toBeNull();
+      expect(result.version.server_hash).toBe(serverHashFixture);
+      expect(result.meta.already_existed).toBe(true);
+      expect(result.meta.events_emitted).toEqual([]);
+      expect(result.meta.correlation_id).toBeNull();
+    } finally {
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 9 — Concurrent-transition (posture A §4.2): stub pre-flips both rows per §3.3; handler re-reads, returns alreadyViewed', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-ct-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-ct-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    const originalWithClient = pg.withClient;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      // Stub pg.withClient to pre-flip BOTH header and version rows per §3.3
+      // co-transition invariant, BEFORE the handler's body (markQuoteViewed)
+      // runs. The pre-flip is committed along with the body's no-op result,
+      // so the handler's post-rollback re-read via loadViewContext sees
+      // viewed state and returns alreadyViewed shape.
+      //
+      // Flipping only the header would leave state inconsistent; re-read
+      // would throw CIL_INTEGRITY_ERROR (co-transition violation). Both
+      // rows flip together here to model the real interleaving a concurrent
+      // ViewQuote would produce.
+      pg.withClient = async (body) => {
+        return originalWithClient.call(pg, async (client) => {
+          await client.query(
+            `UPDATE public.chiefos_quotes SET status='viewed', updated_at=NOW()
+               WHERE id = $1 AND tenant_id = $2 AND owner_id = $3`,
+            [seed.quoteId, VIEW_TENANT_ID, ownerId]
+          );
+          await client.query(
+            `UPDATE public.chiefos_quote_versions SET status='viewed', viewed_at=NOW()
+               WHERE id = $1 AND tenant_id = $2 AND owner_id = $3`,
+            [seed.versionId, VIEW_TENANT_ID, ownerId]
+          );
+          return body(client);
+        });
+      };
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-ct',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.status).toBe('viewed');
+      expect(result.version.status).toBe('viewed');
+      expect(result.meta.already_existed).toBe(true);
+      expect(result.meta.events_emitted).toEqual([]);
+      expect(result.meta.correlation_id).toBeNull();
+
+      // No lifecycle.customer_viewed emission — handler bailed before
+      // reaching emitLifecycleCustomerViewed.
+      const { rows } = await pg.query(
+        `SELECT COUNT(*)::int AS n FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.customer_viewed'`,
+        [seed.quoteId]
+      );
+      expect(rows[0].n).toBe(0);
+    } finally {
+      pg.withClient = originalWithClient;
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 10 — Draft quote → QUOTE_NOT_SENT errEnvelope', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-draft-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-draft-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      // Flip back to draft. locked_at is null on a sent-state version, so
+      // chiefos_quote_versions_guard_immutable does not block this UPDATE.
+      await pg.query(
+        `UPDATE public.chiefos_quotes SET status='draft', updated_at=NOW() WHERE id=$1`,
+        [seed.quoteId]
+      );
+      await pg.query(
+        `UPDATE public.chiefos_quote_versions SET status='draft' WHERE id=$1`,
+        [seed.versionId]
+      );
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-draft',
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTE_NOT_SENT');
+      expect(result.error.traceId).toBe('trace-s4-draft');
+    } finally {
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 11 — Voided quote → QUOTE_VOIDED errEnvelope', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-void-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-void-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      // Voiding is header-only — chiefos_quote_versions.status CHECK enum
+      // does not include 'voided' (§3.3 co-transition is asymmetric for the
+      // terminal void state). loadViewContext's switch on quote_status='voided'
+      // throws QUOTE_VOIDED before the co-transition check runs, so leaving
+      // version.status='sent' is correct.
+      await pg.query(
+        `UPDATE public.chiefos_quotes
+            SET status='voided', voided_at=NOW(), voided_reason='test',
+                updated_at=NOW()
+          WHERE id=$1`,
+        [seed.quoteId]
+      );
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-void',
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTE_VOIDED');
+      expect(result.error.traceId).toBe('trace-s4-void');
+    } finally {
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 12 — Share-token not-found → SHARE_TOKEN_NOT_FOUND errEnvelope', async () => {
+    const cil = {
+      cil_version: '1.0',
+      type: 'ViewQuote',
+      tenant_id: VIEW_TENANT_ID,
+      source: 'web',
+      actor: {
+        actor_id: '00000000-dead-dead-dead-000000000000',
+        role: 'customer',
+      },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      share_token: 'NotFoundTokenAbcDefGhJ',  // 22-char base58, valid format but unknown
+    };
+    const result = await handleViewQuote(cil, {
+      owner_id: '99999999999', traceId: 'trace-s4-nf',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('SHARE_TOKEN_NOT_FOUND');
+    expect(result.error.traceId).toBe('trace-s4-nf');
+  }, 30000);
+
+  test('Test 13 — Version-shape regression guard: happy-path return.version has exactly 12 expected keys (Flag 2)', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s4-shape-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s4-shape-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    let quoteId;
+    try {
+      const seed = await seedSentQuoteForView({
+        pg, ownerId, tenantId: VIEW_TENANT_ID, seedMsgId, sendMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      const cil = buildViewCil({
+        tenantId: VIEW_TENANT_ID,
+        shareToken: seed.shareTokenValue,
+        shareTokenId: seed.shareTokenId,
+      });
+      const result = await handleViewQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-s4-shape',
+      });
+      expect(result.ok).toBe(true);
+
+      // Changing this set is a return-shape contract change. Keep sorted
+      // for deterministic diff if a future test adds/removes a key.
+      expect(Object.keys(result.version).sort()).toEqual([
+        'currency',
+        'id',
+        'issued_at',
+        'locked_at',
+        'project_title',
+        'sent_at',
+        'server_hash',
+        'signed_at',
+        'status',
+        'total_cents',
+        'version_no',
+        'viewed_at',
+      ]);
+    } finally {
+      if (quoteId) {
+        await cleanupViewTest({ pg, ownerId, quoteId, seedMsgId, monthKey });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+});
+
 

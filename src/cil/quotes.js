@@ -912,6 +912,309 @@ async function emitLifecycleCustomerViewed(client, {
   );
 }
 
+// ─── Phase A Session 2 Section 4: handleViewQuote + return-shape composers ──
+//
+// Handler orchestrates Sections 1-3 primitives. Two return-shape composers:
+// buildViewQuoteReturnShape (happy path, sent→viewed transition) and
+// alreadyViewedReturnShape (prior-state paths: already viewed/signed/locked,
+// and concurrent-transition rollback per posture A §4.2). Kept as separate
+// composers per §17.15 Q2 — parameterizing one composer with conditional
+// blocks grows into branching logic over time.
+
+/**
+ * buildViewQuoteReturnShape — §17.15 multi-entity envelope for the happy
+ * path where markQuoteViewed flipped both rows sent→viewed.
+ *
+ * 4 entities: quote, version, share_token, meta. Version has exactly 12
+ * keys (regression-locked by Section 4 test 13 via exact-key-match).
+ *
+ * events_emitted is always ['lifecycle.customer_viewed'] on this path —
+ * array of event-kind strings per SignQuote/SendQuote precedent, NOT a
+ * numeric count.
+ */
+function buildViewQuoteReturnShape({
+  ctx, markResult, correlationId, eventsEmitted, alreadyExisted, traceId,
+}) {
+  return {
+    ok: true,
+    quote: {
+      id: ctx.quoteId,
+      human_id: ctx.humanId,
+      status: 'viewed',
+      job_id: ctx.jobId,
+      customer_id: ctx.customerId,
+      current_version_id: ctx.currentVersionId,
+      created_at: ctx.headerCreatedAt,
+      updated_at: markResult.quoteUpdatedAt,
+    },
+    version: {
+      id: ctx.versionId,
+      version_no: ctx.versionNo,
+      status: 'viewed',
+      project_title: ctx.projectTitle,
+      currency: ctx.currency,
+      total_cents: ctx.totalCents,
+      issued_at: ctx.versionIssuedAt,
+      sent_at: ctx.versionSentAt,
+      viewed_at: markResult.versionViewedAt,
+      signed_at: null,
+      locked_at: null,
+      server_hash: null,
+    },
+    share_token: {
+      id: ctx.shareTokenId,
+      token: ctx.shareTokenValue,
+      recipient_channel: ctx.recipientChannel,
+      recipient_address: ctx.recipientAddress,
+      recipient_name: ctx.recipientName,
+      absolute_expires_at: ctx.absoluteExpiresAt,
+      issued_at: ctx.issuedAt,
+    },
+    meta: {
+      already_existed: alreadyExisted,
+      events_emitted: eventsEmitted,
+      correlation_id: correlationId,
+      traceId,
+    },
+  };
+}
+
+/**
+ * alreadyViewedReturnShape — prior-state envelope for three paths:
+ *   - Pre-txn status routing: quote already in {viewed, signed, locked}
+ *     (legitimate post-first-view review via share link)
+ *   - Post-rollback re-read: concurrent transition between pre-txn load
+ *     and markQuoteViewed's header UPDATE (posture A, §4.2)
+ *
+ * Same 4-entity shape as buildViewQuoteReturnShape. Differences:
+ *   - quote.status / version.status from ctx (not hardcoded 'viewed')
+ *   - quote.updated_at = ctx.headerUpdatedAt (no fresh bump; no write
+ *     occurred this call)
+ *   - version.viewed_at / signed_at / locked_at / server_hash from ctx
+ *     (populated if the path is serving signed/locked state)
+ *   - meta.already_existed: true (hardcoded — always true on this path)
+ *   - meta.events_emitted: [] (hardcoded — no emission on retry path)
+ *   - meta.correlation_id: null (§17.21 retry-path limitation — no
+ *     ViewQuote-owned row carries the original invocation's correlation_id)
+ */
+function alreadyViewedReturnShape({ ctx, traceId }) {
+  return {
+    ok: true,
+    quote: {
+      id: ctx.quoteId,
+      human_id: ctx.humanId,
+      status: ctx.quoteStatus,
+      job_id: ctx.jobId,
+      customer_id: ctx.customerId,
+      current_version_id: ctx.currentVersionId,
+      created_at: ctx.headerCreatedAt,
+      updated_at: ctx.headerUpdatedAt,
+    },
+    version: {
+      id: ctx.versionId,
+      version_no: ctx.versionNo,
+      status: ctx.versionStatus,
+      project_title: ctx.projectTitle,
+      currency: ctx.currency,
+      total_cents: ctx.totalCents,
+      issued_at: ctx.versionIssuedAt,
+      sent_at: ctx.versionSentAt,
+      viewed_at: ctx.versionViewedAt,
+      signed_at: ctx.versionSignedAt,
+      locked_at: ctx.versionLockedAt,
+      server_hash: ctx.versionServerHash,
+    },
+    share_token: {
+      id: ctx.shareTokenId,
+      token: ctx.shareTokenValue,
+      recipient_channel: ctx.recipientChannel,
+      recipient_address: ctx.recipientAddress,
+      recipient_name: ctx.recipientName,
+      absolute_expires_at: ctx.absoluteExpiresAt,
+      issued_at: ctx.issuedAt,
+    },
+    meta: {
+      already_existed: true,
+      events_emitted: [],
+      correlation_id: null,
+      traceId,
+    },
+  };
+}
+
+/**
+ * handleViewQuote — applies a ViewQuote CIL idiom.
+ *
+ * Sequence:
+ *   Step 0. Ctx preflight (owner_id, traceId required)
+ *   Step 1. Zod validation (ViewQuoteCILZ.safeParse)
+ *   Step 2. No plan gating (§14.12 customer-action exemption)
+ *   Step 3. correlation_id = crypto.randomUUID() (§17.21 wired from day one)
+ *   Step 4. loadViewContext (pre-txn); CilIntegrityError → errEnvelope
+ *   Step 5. Pre-txn status routing: viewed/signed/locked →
+ *           alreadyViewedReturnShape (no txn); sent → proceed
+ *   Step 6. pg.withClient transaction:
+ *             - markQuoteViewed; transitioned:false → concurrent-transition
+ *               signal (rowcount=0 on header UPDATE)
+ *             - emitLifecycleCustomerViewed with correlationId + sourceMsgId echo
+ *   Step 7a. Concurrent-transition re-read (posture A, §4.2): re-invoke
+ *            loadViewContext, return alreadyViewedReturnShape from fresh
+ *            state. Re-read wrapped in its own try/catch — a concurrent
+ *            VoidQuote between Step 4's load and Step 6's txn makes the
+ *            re-read throw QUOTE_VOIDED.
+ *   Step 7b. Happy path: buildViewQuoteReturnShape with
+ *            events_emitted=['lifecycle.customer_viewed'].
+ *
+ * No second-layer actor.role check: ViewQuoteActorZ.role = z.literal('customer')
+ * narrows at Zod (Step 1). role='owner' inputs return CIL_SCHEMA_INVALID
+ * before reaching this point.
+ */
+async function handleViewQuote(rawCil, ctx) {
+  // Step 0 — ctx preflight (§17.17 addendum 2)
+  if (!ctx || !ctx.owner_id) {
+    return errEnvelope({
+      code: 'OWNER_ID_MISSING',
+      message: 'ctx.owner_id is required',
+      hint: 'Upstream identity resolver must populate ctx.owner_id before applyCIL',
+      traceId: (ctx && ctx.traceId) || null,
+    });
+  }
+  if (!ctx.traceId) {
+    return errEnvelope({
+      code: 'TRACE_ID_MISSING',
+      message: 'ctx.traceId is required',
+      hint: 'Upstream request handler must populate ctx.traceId before applyCIL',
+      traceId: null,
+    });
+  }
+
+  // Step 1 — Zod validation
+  const parsed = ViewQuoteCILZ.safeParse(rawCil);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const pathStr = issue && issue.path && issue.path.length ? issue.path.join('.') : '<root>';
+    return errEnvelope({
+      code: 'CIL_SCHEMA_INVALID',
+      message: issue ? `${pathStr}: ${issue.message}` : 'ViewQuote input failed validation',
+      hint: 'See docs/QUOTES_SPINE_DECISIONS.md for the ViewQuoteCILZ input contract',
+      traceId: ctx.traceId,
+    });
+  }
+  const data = parsed.data;
+
+  // Step 2 — no plan gating (§14.12 customer-action exemption)
+
+  // Step 3 — correlation_id (§17.21 wired from day one)
+  const correlationId = crypto.randomUUID();
+
+  // Step 4 — loadViewContext (pre-txn)
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  let viewCtx;
+  try {
+    viewCtx = await loadViewContext({
+      pg,
+      tenantId: data.tenant_id,
+      shareToken: data.share_token,
+    });
+  } catch (loadErr) {
+    if (loadErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: loadErr.code,
+        message: loadErr.message,
+        hint: loadErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw loadErr;  // non-CIL errors propagate for 500-class
+  }
+
+  // Step 5 — pre-txn status routing
+  // Viewed/signed/locked are legitimate post-first-view review paths;
+  // return prior-state shape without opening a transaction.
+  if (viewCtx.quoteStatus !== 'sent') {
+    return alreadyViewedReturnShape({ ctx: viewCtx, traceId: ctx.traceId });
+  }
+
+  // Step 6 — transaction body
+  const actorSource = CIL_TO_EVENT_ACTOR_SOURCE[data.source];  // 'web' → 'portal'
+  let txnResult;
+  try {
+    txnResult = await pg.withClient(async (client) => {
+      const markResult = await markQuoteViewed(client, {
+        quoteId: viewCtx.quoteId,
+        versionId: viewCtx.versionId,
+        tenantId: viewCtx.tenantId,
+        ownerId: viewCtx.ownerId,
+      });
+      if (!markResult.transitioned) {
+        return { concurrentTransition: true };
+      }
+      await emitLifecycleCustomerViewed(client, {
+        quoteId: viewCtx.quoteId,
+        versionId: viewCtx.versionId,
+        tenantId: viewCtx.tenantId,
+        ownerId: viewCtx.ownerId,
+        actorSource,
+        actorUserId: data.actor.actor_id,
+        emittedAt: data.occurred_at,
+        customerId: viewCtx.customerId,
+        shareTokenId: viewCtx.shareTokenId,
+        correlationId,
+        sourceMsgId: data.source_msg_id,
+      });
+      return { markResult, concurrentTransition: false };
+    });
+  } catch (txnErr) {
+    if (txnErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: txnErr.code,
+        message: txnErr.message,
+        hint: txnErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw txnErr;  // 500-class; no classifyCilError branch (state-driven
+                   // idempotency — no INSERT with 23505 surface per §17.23)
+  }
+
+  // Step 7a — concurrent-transition re-read (posture A, §4.2)
+  if (txnResult.concurrentTransition) {
+    let freshCtx;
+    try {
+      freshCtx = await loadViewContext({
+        pg,
+        tenantId: data.tenant_id,
+        shareToken: data.share_token,
+      });
+    } catch (reReadErr) {
+      // A concurrent VoidQuote between Step 4's load and Step 6's
+      // markQuoteViewed rowcount=0 will make this re-read throw
+      // QUOTE_VOIDED. Must wrap and route — unwrapped, it becomes 500-class.
+      if (reReadErr instanceof CilIntegrityError) {
+        return errEnvelope({
+          code: reReadErr.code,
+          message: reReadErr.message,
+          hint: reReadErr.hint,
+          traceId: ctx.traceId,
+        });
+      }
+      throw reReadErr;
+    }
+    return alreadyViewedReturnShape({ ctx: freshCtx, traceId: ctx.traceId });
+  }
+
+  // Step 7b — happy path
+  return buildViewQuoteReturnShape({
+    ctx: viewCtx,
+    markResult: txnResult.markResult,
+    correlationId,
+    eventsEmitted: ['lifecycle.customer_viewed'],
+    alreadyExisted: false,
+    traceId: ctx.traceId,
+  });
+}
+
 // ─── Phase 3 Section 4: transaction-body helpers ────────────────────────────
 //
 // Five focused INSERT/UPDATE helpers per DB3 Q3.9 steps 14-19. Each takes
@@ -3599,6 +3902,7 @@ module.exports = {
   handleCreateQuote,
   handleSendQuote,
   handleSignQuote,
+  handleViewQuote,
   CreateQuoteCILZ,
   SendQuoteCILZ,
   // Test-only internals. Not part of the handler's public contract. External
@@ -3670,6 +3974,9 @@ module.exports = {
     // ViewQuote Section 3 (transaction-body helpers)
     markQuoteViewed,
     emitLifecycleCustomerViewed,
+    // ViewQuote Section 4 (return-shape composers; handler hoisted to top-level)
+    buildViewQuoteReturnShape,
+    alreadyViewedReturnShape,
     // SignQuote Section 3 (context loader + hash-input mapper)
     SIGN_LOAD_COLUMNS,
     loadSignContext,

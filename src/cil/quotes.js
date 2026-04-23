@@ -2714,7 +2714,7 @@ async function markQuoteSent(client, { quoteId, versionId, tenantId, ownerId }) 
 
   const versionResult = await client.query(
     `UPDATE public.chiefos_quote_versions
-        SET issued_at = NOW(), sent_at = NOW()
+        SET status = 'sent', issued_at = NOW(), sent_at = NOW()
       WHERE id = $1 AND tenant_id = $2 AND owner_id = $3 AND locked_at IS NULL`,
     [versionId, tenantId, ownerId]
   );

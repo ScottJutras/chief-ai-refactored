@@ -2626,6 +2626,70 @@ describeIfDb('SendQuote — Section 7: end-to-end integration', () => {
     }
   }, 30000);
 
+  test('markQuoteSent writes version.status=sent (§3.3 co-transition regression lock)', async () => {
+    // Regression lock for the bug discovered during ViewQuote Section 4
+    // implementation: markQuoteSent previously updated chiefos_quotes.status
+    // to 'sent' but left chiefos_quote_versions.status='draft'. Any downstream
+    // handler whose load helper enforces §3.3 co-transition (ViewQuote's
+    // loadViewContext, SignQuote's loadSignContext) threw 'Quote/version
+    // status disagreement' on real SendQuote'd quotes. Fix added status='sent'
+    // to the version UPDATE at src/cil/quotes.js markQuoteSent.
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-s7-cotrans-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sendMsgId = `test-s7-cotrans-send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const monthKey = new Date().toISOString().slice(0, 7);
+
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+    _internals.setSendEmailForTests(async (opts) => ({
+      MessageID: 'fake-postmark-cotrans', To: opts.to,
+    }));
+
+    let quoteId;
+    try {
+      const seedQuote = await seedRealDraftForSendQuote({
+        pg, ownerId, tenantId: MISSION_TENANT_UUID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seedQuote.id;
+
+      const sendCil = {
+        cil_version: '1.0', type: 'SendQuote', tenant_id: MISSION_TENANT_UUID,
+        source: 'whatsapp', source_msg_id: sendMsgId,
+        actor: { actor_id: ownerId, role: 'owner' },
+        occurred_at: new Date().toISOString(),
+        job: null, needs_job_resolution: false,
+        quote_ref: { quote_id: seedQuote.id },
+      };
+      const result = await handleSendQuote(sendCil, {
+        owner_id: ownerId, traceId: 'trace-s7-cotrans',
+      });
+      expect(result.ok).toBe(true);
+
+      // Both rows MUST carry status='sent' after commit. §3.3 co-transition
+      // invariant. If this test ever fails, any downstream handler whose
+      // load helper enforces the invariant will break on real traffic.
+      const rows = await pg.query(
+        `SELECT q.status AS q_status, v.status AS v_status
+           FROM public.chiefos_quotes q
+           JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+          WHERE q.id = $1`,
+        [seedQuote.id]
+      );
+      expect(rows.rows[0].q_status).toBe('sent');
+      expect(rows.rows[0].v_status).toBe('sent');
+    } finally {
+      _internals.resetSendEmailForTests();
+      if (quoteId) {
+        await cleanupCreatedQuote(ownerId, quoteId, seedMsgId, monthKey).catch(() => {});
+      }
+      await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+    }
+  }, 30000);
+
   test('Idempotent retry: second SendQuote with same source_msg_id returns already_existed=true, no double-email', async () => {
     const pg = require('../../services/postgres');
     const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;

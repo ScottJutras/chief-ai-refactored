@@ -152,6 +152,71 @@ Sign-time ordering: line items inserted first (parent still unlocked), then
 `locked_at` set on parent in the same transaction. From that moment on, both
 triggers deny further mutation.
 
+## §3A. Co-transition between header and version status (amended 2026-04-23 by §28)
+
+**Amendment note.** This amendment supersedes handoff-document narrative
+references to "§3.3 co-transition asymmetry" — canonical reference is §3A.
+Future references use §3A.
+
+**Principle.** Quote state transitions that touch both `chiefos_quotes.status`
+(header) and `chiefos_quote_versions.status` (version) are DB-side separate
+columns but logically a single state machine. Consumers (load helpers) enforce
+the invariant `quote.status == version.status`. Handlers that transition state
+must flip BOTH rows atomically within a single transaction — "co-transition."
+
+**Valid co-transitioning states:**
+
+| Quote status | Version status | Co-transition? |
+|---|---|---|
+| draft | draft | Yes |
+| sent | sent | Yes |
+| viewed | viewed | Yes |
+| signed | signed | Yes |
+| locked | locked | Yes |
+| **voided** | (unchanged — typically `sent`) | **No — header-only** |
+
+**Voided asymmetry.** The one exception: `voided` is a header-only terminal
+state. `chiefos_quote_versions.status` CHECK enum explicitly excludes
+`'voided'` (Migration 1 line 121 — enum is `{draft, sent, viewed, signed,
+locked}`). When a quote is voided, the header flips to `voided` and the
+version row retains its final pre-void status.
+
+**Rationale for the asymmetry.** Voiding is a soft-terminal header-level
+determination: "this quote will not be acted on further." The version's
+final pre-void status is archival — what the quote was when the contractor
+or customer killed it. Forcing a parallel `voided` status on the version
+would duplicate state without adding invariant protection: the header is
+the state-machine authority, and the version's `chiefos_qv_status_locked_consistency`
+CHECK already enforces locked-state immutability separately.
+
+**Consumer handling.** `loadViewContext` (Section 2) routes on
+`quote.status` first: `case 'voided': throw QUOTE_VOIDED`. The co-transition
+check runs AFTER state validation, so a voided quote (header voided,
+version still `sent`) short-circuits to the user-meaningful QUOTE_VOIDED
+error BEFORE the co-transition check fires. Without this ordering, voided
+quotes would surface as `CIL_INTEGRITY_ERROR: Quote/version status
+disagreement` — correct-but-useless to the customer.
+
+**For future handlers.** `VoidQuote` (expected Phase A Session 3) must flip
+ONLY the header. Tests or ceremonies that attempt `UPDATE chiefos_quote_versions
+SET status='voided'` fail at the DB CHECK layer. `ReissueQuote` (voided → new
+draft, expected Phase A Session 5) must not mirror void onto the version either.
+
+**Cross-reference.** §17.23 state-driven idempotency — the state-validation-
+before-supersession-check ordering in `loadViewContext` follows the same
+error-classification-priority discipline that produces user-meaningful
+QUOTE_VOIDED instead of CIL_INTEGRITY_ERROR.
+
+**Exercised by.** Section 4 Test 11 (`Voided quote → QUOTE_VOIDED
+errEnvelope`) — seeded a sent quote, flipped header only to `voided`,
+verified handler returns QUOTE_VOIDED envelope (not integrity error).
+
+**Discovered during.** Phase A Session 2 Section 4 Test 11 implementation —
+initial test naively attempted to flip version.status='voided' alongside the
+header and failed with `chiefos_quote_versions_status_check` violation. The
+failure surfaced the asymmetry as a canonical discipline rather than a
+test-specific workaround.
+
 ## §4. Server hash: full SHA-256 over canonical serialization (2026-04-18)
 Decision: `chiefos_quote_versions.server_hash` is full SHA-256 hex (64 chars),
 never truncated, computed server-side at lock time over a canonical serialization
@@ -4380,6 +4445,272 @@ the row shapes I'm about to operate on?" — each assumption becomes
 either an assertion (if worth checking) or is removed (if the
 assumption is truly guaranteed by the load query's WHERE clause).
 
+## §17.23. State-driven idempotency + post-rollback re-read recovery (introduced 2026-04-23 by §28)
+
+**Principle.** When a CIL handler transitions state on an existing row
+WITHOUT an INSERT surface that has a natural unique constraint, idempotency
+is enforced at the state-read layer rather than at 23505 classification.
+Pre-txn SELECT reads target state; handler branches on observed state.
+Conditional UPDATE `WHERE status='expected_prior'` inside the transaction
+body fires — rowcount=0 is the concurrent-transition signal, not a failure.
+
+Detection (state read + conditional UPDATE) and recovery (post-rollback
+re-read) are bundled in one discipline: the recovery path is the handler's
+response to the detection signal. Splitting into two subsections would
+produce artificial separation — the recovery path only fires in response to
+the detection signal, never independently.
+
+**Detection pattern (write path).**
+
+```
+handler(cil, ctx):
+  1. ctx preflight + Zod validation
+  2. generate correlationId
+  3. pre-txn loadCtx (reads current state)
+  4. if loaded.status ∈ {terminal-for-this-handler}:
+       return alreadyReturnShape  # no txn, no emission
+  5. if loaded.status != expected_prior:
+       return errEnvelope  # not-in-valid-prior-state
+  6. withClient txn:
+       markResult = conditional UPDATE WHERE status='expected_prior'
+       if markResult.rowcount == 0:
+         return { concurrentTransition: true }  # detection signal
+       emit lifecycle event
+       return { markResult, concurrentTransition: false }
+  7. if txnResult.concurrentTransition:
+       # recovery path — see below
+```
+
+**Recovery pattern (post-rollback re-read).**
+
+When the transaction body returns `{ concurrentTransition: true }`, the
+handler MUST re-invoke the SAME context-loader used pre-txn (NOT a
+specialized lookup — consistency matters across detection and recovery).
+The re-read sees the committed state of whichever sibling invocation won
+the race. The recovery path composes `alreadyReturnShape` from the fresh
+ctx.
+
+The re-read MUST be wrapped in its own try/catch: a concurrent terminal-
+state transition (e.g., VoidQuote firing between the pre-txn load and the
+post-rollback re-read) causes the loader to throw a terminal error
+(`QUOTE_VOIDED`), which routes to errEnvelope — not 500-class.
+
+```
+post-rollback recovery:
+  try:
+    freshCtx = loadCtx(...)  # same helper, not a specialized lookup
+  except CilIntegrityError as e:
+    return errEnvelope(e)  # concurrent VoidQuote, SHARE_TOKEN_REVOKED, etc.
+  return alreadyReturnShape(freshCtx)
+```
+
+**Rationale.** Handlers that transition state on existing rows cannot use
+23505 classification (there's no INSERT with a natural unique constraint
+to trip). Pre-txn state reads cost a SELECT at no concurrency cost (no
+locks held). Conditional UPDATEs at the `WHERE status='expected_prior'`
+layer detect concurrent sibling invocations atomically — rowcount=0 is
+the race outcome, recoverable via re-read. The caller's transaction
+naturally rolls back the no-op UPDATE; the emit step is gated on the
+rowcount check, so no spurious event rows commit.
+
+**Worked example — supersession-after-state check ordering.** Within
+`loadViewContext` (Section 2), state-validation runs BEFORE supersession
+check. A voided quote with a stale share_token returns `QUOTE_VOIDED`
+(user-meaningful) rather than `SHARE_TOKEN_SUPERSEDED` (technically
+narrower but less actionable). This is the §17.23 pattern applied to
+error-classification priority: prefer the error class that describes the
+user's actual situation over the narrowest technical rejection. See §3A
+for the terminal-state case.
+
+**First exerciser.** ViewQuote (Section 4 handler + Section 2 load helper).
+Pre-txn routing for viewed/signed/locked → `alreadyViewedReturnShape`.
+Conditional UPDATE in `markQuoteViewed` WHERE `status='sent'`. Rowcount=0
+→ handler re-reads via `loadViewContext` → composes alreadyViewed shape.
+
+**Production validation.** §28 ceremony (2026-04-23) exercised the happy-
+path first-invocation sent→viewed transition. The already-viewed retry
+path is exercised by re-running `scripts/real_view_quote_ceremony.js`
+without re-seeding; the current ceremony proves the happy-path half.
+
+**Expected future exercisers.**
+- **LockQuote** (expected Phase A Session 3) — signed→locked transition
+  on signature-post-cooling-period trigger. State-driven; follows §17.23.
+- **VoidQuote** (expected Phase A Session 4) — sent/viewed/signed/locked
+  → voided (header-only per §3A). State-driven; follows §17.23.
+- **ReissueQuote** (expected Phase A Session 5) — voided → new draft
+  version. **CAVEAT:** ReissueQuote may surface supersession-specific
+  sub-cases not cleanly covered by §17.23. If the `superseded_by_version_id`
+  column write pattern reveals a regime §17.23 doesn't cover, a future
+  §17.26 sub-amendment is the expected path — do NOT force-fit. The
+  pattern documented here is bundled idempotency+recovery on a single
+  existing row; supersession wiring touches two rows and pointer columns,
+  a distinct concern.
+
+**Failure mode if violated.**
+- If pre-txn routing omitted: double-emission of lifecycle events (handler
+  hits the transaction, UPDATE returns rowcount=0, returns no-op instead
+  of alreadyReturnShape — customer sees confusing "nothing happened"
+  response).
+- If recovery re-read omitted: handler returns nonsense state shape when
+  sibling races (e.g., empty result, stale ctx values).
+- If re-read uses a specialized lookup (not the same loadCtx): discovery-
+  surface drift between pre-txn and post-rollback paths; error class
+  inconsistency across the two reads (pre-txn surfaces `QUOTE_VOIDED`,
+  post-rollback surfaces something else).
+
+**Cross-references.** §17.15 multi-entity return shape. §17.21
+correlation_id wiring. §17.24 header-first ordering (the dual-row write
+discipline for state-driven transitions). §3A co-transition (the
+consumer-side invariant enforced by the load helper).
+
+## §17.24. Header-first ordering for dual-row state transitions (introduced 2026-04-23 by §28)
+
+**Principle.** State-transition helpers that update both `chiefos_quotes`
+(header) and `chiefos_quote_versions` (version) within a single transaction
+MUST update the header first. Sequential UPDATEs: header → rowcount check
+(short-circuit if 0) → version → rowcount check (throw CIL_INTEGRITY_ERROR
+on co-transition failure).
+
+**Pattern.**
+
+```js
+async function markStateTransition(client, {quoteId, versionId, tenantId, ownerId}) {
+  // Header first — state-machine authority row (§3A)
+  const headerResult = await client.query(
+    `UPDATE public.chiefos_quotes SET status='new_state', updated_at=NOW()
+      WHERE id=$1 AND tenant_id=$2 AND owner_id=$3 AND status='old_state'
+      RETURNING updated_at`,
+    [quoteId, tenantId, ownerId]
+  );
+  if (headerResult.rowCount === 0) {
+    return { transitioned: false };  // §17.23 concurrent-transition signal
+  }
+
+  // Version second — co-transition per §3A
+  const versionResult = await client.query(
+    `UPDATE public.chiefos_quote_versions SET status='new_state', new_state_at=NOW()
+      WHERE id=$1 AND tenant_id=$2 AND owner_id=$3 AND status='old_state'
+      RETURNING new_state_at`,
+    [versionId, tenantId, ownerId]
+  );
+  if (versionResult.rowCount !== 1) {
+    throw new CilIntegrityError({ code: 'CIL_INTEGRITY_ERROR',
+      message: 'Version co-transition failed after header flipped', ... });
+  }
+  return { transitioned: true, headerUpdatedAt: headerResult.rows[0].updated_at,
+    versionAt: versionResult.rows[0].new_state_at };
+}
+```
+
+**Rationale.** The header is the state-machine authority row (§3A). Header
+UPDATE failure (rowcount=0) short-circuits cleanly — no intermediate state,
+no side effects on disk. Version UPDATE failure AFTER the header flip throws
+CIL_INTEGRITY_ERROR; caller's `pg.withClient` rolls back the transaction,
+including the header's UPDATE. Worst-case failure mode is transient — no
+persisted drift.
+
+**Why header-first specifically.** Inverted order (version first, header
+second) creates a recoverable-only-via-manual-surgery worst case: if version
+UPDATE succeeds but header UPDATE fails (or the connection drops post-
+version, pre-header), persisted state becomes `version=new_state AND
+header=old_state`. §3A's consumer-side invariant (`quote.status ==
+version.status`) rejects this state as CIL_INTEGRITY_ERROR on next load —
+correct rejection but the row is corrupted, requiring manual SQL surgery
+to restore.
+
+**Regression lock (Section 3).** ViewQuote's `markQuoteViewed` has a
+SAVEPOINT-based test (`quotes.test.js:4478`) proving rollback semantics:
+inside a transaction, the helper flips the header, then the test manually
+sabotages the version UPDATE, then `ROLLBACK TO SAVEPOINT` restores the
+header to its pre-call state. Future refactors that reorder UPDATEs or
+drop the throw fail this test loudly.
+
+**First exerciser.** ViewQuote's `markQuoteViewed` (Section 3). Production-
+exercised in §28 ceremony. The captured artifact `quote.updated_at ===
+version.viewed_at === 2026-04-23T12:24:38.513Z` reflects Postgres's
+single-transaction `NOW()` coherence — the header and version both receive
+the transaction-start timestamp.
+
+**Expected future exercisers.**
+- **LockQuote** — dual-row (header status=locked, version status=locked +
+  locked_at column).
+- **VoidQuote** — header-only per §3A; §17.24 does NOT apply (no dual-row
+  co-transition in this case).
+- **ReissueQuote** new-version-creation is a different pattern (INSERT new
+  version, not UPDATE existing) — §17.24 does not apply.
+
+**Failure mode if violated.** §3A-inversion worst case (persisted header/
+version status drift). Recovery requires manual SQL surgery and loses
+audit clarity about when the drift occurred.
+
+**Cross-references.** §17.23 state-driven idempotency (the header-
+rowcount-0 short-circuit is §17.23's detection signal). §3A co-transition
+(the consumer-side invariant the ordering protects).
+
+## §17.25. Echo-if-present posture for Zod-optional audit fields (introduced 2026-04-23 by §28)
+
+**Principle.** When a CIL field is Zod-optional (`z.string().min(1).optional()`)
+and the downstream helper conditionally surfaces it into an audit-payload,
+use **strict `!== undefined`** to check presence — NOT truthiness, NOT
+defensive filter-empty-strings.
+
+**Pattern.**
+
+```js
+async function emitEvent(client, { ..., sourceMsgId }) {
+  const payload = {};
+  if (sourceMsgId !== undefined) {
+    payload.source_msg_id = sourceMsgId;
+  }
+  await client.query(`INSERT INTO chiefos_quote_events ... payload=$N`, [..., payload]);
+}
+```
+
+**Rationale.** Zod rejects empty strings via `.min(1)` at the schema layer;
+empty strings cannot reach a compliant handler. If an empty string DOES
+reach the helper, that's a Zod regression worth surfacing in the event
+stream (writes `''` through) rather than masking at the helper layer
+(silent filter).
+
+The helper does not defend against Zod contract violations. It surfaces
+them. Defensive filtering creates a gap where audit-payload content and
+Zod contract diverge silently — impossible to debug from the payload
+alone.
+
+**Contrast with truthy checks.** `if (sourceMsgId)` would:
+- Accept `'hello'` → write it (correct)
+- Skip `''` → silent Zod regression mask (INCORRECT — hides the bug)
+- Skip `0` → N/A for string-typed fields, but the pattern matters
+- Skip `null` → N/A for Zod-optional (undefined is the absence signal)
+
+Strict `!== undefined` accepts `'hello'`, accepts `''` (surfacing the
+regression), and correctly skips `undefined`. Matches Zod's semantic
+(optional = undefined-or-valid-string).
+
+**First exerciser.** ViewQuote's `emitLifecycleCustomerViewed` (Section 3).
+Production-exercised in §28 ceremony — `payload.source_msg_id` carried
+`'ceremony-phase-a-s2-viewquote-run-1'` end-to-end from CIL input through
+helper to event row.
+
+**Distinction from §17.23.** §17.23 is about state-transition idempotency
+(how to detect and recover from concurrent sibling invocations). §17.25 is
+about helper input-contract discipline when the input is Zod-optional.
+Orthogonal concerns; citing both in commit messages is fine.
+
+**Forward applicability.** Applies to any optional CIL field that flows
+into an event payload:
+- `payload.recipient_name_override` (if SendQuote adds override field)
+- `payload.rejection_reason` (if RejectQuote ships)
+- Any `payload.*_override` audit field
+
+**Failure mode if violated.** Silent Zod-contract divergence. Downstream
+consumers of event payloads can't distinguish "field absent" from "field
+empty, caller screwed up, but it went through anyway." Audit value erodes.
+
+**Cross-references.** §17.23 state-driven idempotency (different discipline,
+same handler surface). §17.21 correlation_id wiring (always-present field,
+different posture — required, not optional).
+
 ## §14.11. Customer-initiated actor role — auth-orthogonal (introduced 2026-04-21 by §27)
 
 **Principle.** Customer-initiated actor roles identify the contractual
@@ -4476,6 +4807,202 @@ when a ceremony or real customer signs with a non-matching name — that
 event's payload will be the first production instance of the rule_id
 discipline.
 
+## §28. Phase A Session 2 — ViewQuote exercised against production (2026-04-23)
+
+**Status.** Phase A Session 2's closing ceremony. Production exercise proving
+`handleViewQuote` (the 7-step ViewQuote orchestration from Section 4) executes
+end-to-end against real Postgres. Second customer-initiated CIL handler
+exercised in production (first was SignQuote §27). First handler whose
+exclusive idempotency surface is state-driven (§17.23) — no INSERT with 23505
+idempotency path.
+
+### Scope
+
+Happy-path only (pre-txn loadViewContext returns sent-state; markQuoteViewed
+transitions sent→viewed; emitLifecycleCustomerViewed fires). Already-viewed /
+signed / locked paths, share-token-not-found path, draft / voided rejection
+paths covered by Section 4's 10 integration tests. Ceremony validates the
+chain against production, not each branch.
+
+### Ceremony identity
+
+| Field | Value |
+|---|---|
+| tenant_id         | `00000000-c4c4-c4c4-c4c4-000000000001` |
+| owner_id          | `00000000002` |
+| quote_id          | `00000000-c4c4-c4c4-c4c4-000000000002` |
+| version_id        | `00000000-c4c4-c4c4-c4c4-000000000003` |
+| line_item_id      | `00000000-c4c4-c4c4-c4c4-0000000000a1` |
+| share_token_id    | `00000000-c4c4-c4c4-c4c4-000000000005` |
+| synthetic_sent_event_id | `00000000-c4c4-c4c4-c4c4-000000000007` |
+| share_token       | `HAstYeR6QB8VD9XF7zfRFN` (deterministic from seed v2) |
+| human_id          | `QT-CEREMONY-2026-04-23-PHASE-A-S2` |
+| project_title     | `Phase A Session 2 ViewQuote Ceremony` |
+| job_id            | `3414` (allocated by jobs.id serial) |
+
+The `c4c4-c4c4-c4c4` hex namespace distinguishes Phase A Session 2 ceremony
+rows from Phase 3's `c3c3-c3c3-c3c3` and Phase 2C's `c2c2-c2c2-c2c2`.
+
+### Share-token derivation
+
+`HAstYeR6QB8VD9XF7zfRFN` is `bs58.encode(sha256('chiefos-phase-a-session-2-viewquote-ceremony-share-token-seed-v2').subarray(0, 16))`.
+Seed version **v2** — v1 derived to 21 characters (the ~2.83% short-output
+case documented in §17.22's post-mortem of `generateShareToken`). Migration
+3's `chiefos_qst_token_format` CHECK requires exactly 22. Seed iterated until
+output was 22 chars; v1 is orphaned and documented here for integrity.
+
+### Seed posture — SQL INSERT, not handler chain
+
+§27 established seeding via explicit INSERT (not `handleCreateQuote` +
+`handleSendQuote`). Handlers allocate UUIDs via `crypto.randomUUID()`
+internally, incompatible with deterministic c4c4 identity. The Phase A
+Session 2 seed follows the same posture — raw INSERTs at c4c4 IDs in
+`scripts/ceremony_seed_phase_a_session2.js`.
+
+Seed inserts: user, tenant, job, quote (sent), version (sent, unlocked),
+line_item, share_token (unexpired), synthetic lifecycle.sent event with
+`payload.ceremony_synthetic=true`. The synthetic event preserves event-
+stream chronology; without it, the share_token would appear without a
+prior lifecycle.sent anchor.
+
+### Handler-generated artifacts
+
+| Field | Value |
+|---|---|
+| correlation_id       | `c83f405d-e8e6-4d70-9dd1-f33e0b7a909c` |
+| quote.status (before / after) | `sent` / `viewed` |
+| version.status (before / after) | `sent` / `viewed` |
+| quote.updated_at     | `2026-04-23T12:24:38.513Z` (txn NOW()) |
+| version.viewed_at    | `2026-04-23T12:24:38.513Z` (same txn NOW()) |
+
+**Txn-timestamp coherence.** `quote.updated_at === version.viewed_at` —
+both are `NOW()` within the same transaction (Postgres returns the
+transaction-start timestamp for all `NOW()` calls in a given BEGIN scope).
+§17.24 header-first ordering landed both UPDATEs atomically in a single
+`pg.withClient` scope.
+
+### Events chain (ordered by global_seq)
+
+| seq | kind | correlation_id | emitted_at | notes |
+|---|---|---|---|---|
+| 3233 | `lifecycle.sent` | NULL | `12:24:22.867Z` | seed-inserted (synthetic); `payload.ceremony_synthetic=true` |
+| 3234 | `lifecycle.customer_viewed` | `c83f405d-…909c` | `12:24:38.388Z` | handler step 6; `payload.source_msg_id` echoed from CIL input |
+
+**Single handler-emitted event per invocation.** Unlike §27's SignQuote
+ceremony (which emits two events, lifecycle.signed + notification.sent,
+sharing a correlation_id), ViewQuote emits ONE event. §17.21's intra-handler
+cross-event correlation_id wiring is trivially satisfied (only one event
+to wire). §17.23 state-driven idempotency fills the structural invariant
+role that §17.21 cross-event coherence plays for multi-event handlers.
+
+### emitted_at vs. updated_at (intentional 125ms divergence)
+
+`lifecycle.customer_viewed.emitted_at` (`12:24:38.388Z`) precedes
+`quote.updated_at` (`12:24:38.513Z`) by 125 ms. This is intentional, not a
+drift:
+
+- `emitted_at` is populated from `data.occurred_at` in the CIL input —
+  when the customer clicked the share link (client-perceived event time).
+- `quote.updated_at` is `NOW()` inside the handler's transaction —
+  when the server committed the state flip.
+
+Matches SendQuote and SignQuote precedents. `emitted_at` is the customer's
+event clock; `updated_at` is the server's commit clock. Gap reflects
+handler execution time (network + parse + load + txn BEGIN).
+
+### source_msg_id payload echo
+
+`lifecycle.customer_viewed.payload.source_msg_id = 'ceremony-phase-a-s2-viewquote-run-1'`
+(matches CIL input). First production exercise of §17.25 echo-if-present
+posture — helper uses strict `!== undefined` to pass through, does not
+filter or fabricate.
+
+### What Phase A Session 2 validated that prior sections could not
+
+- **First production exercise of state-driven idempotency (§17.23).**
+  ViewQuote has no INSERT-with-natural-unique-constraint idempotency
+  surface; retries on viewed/signed/locked quotes take the
+  `alreadyViewedReturnShape` pre-txn routing branch. The ceremony
+  exercises the first-invocation happy-path; re-running without re-seeding
+  exercises the already-viewed retry branch, validating the state-read-
+  enforced idempotency pattern.
+- **First production header-first dual-row transition (§17.24).**
+  `markQuoteViewed` flips `chiefos_quotes.status` and
+  `chiefos_quote_versions.status` in sequence, both predicated on
+  `status='sent'`. SignQuote's `updateQuoteSigned` + `updateVersionLocked`
+  are two separate helpers for distinct concerns (version lock, header
+  signed) — ViewQuote's symmetric dual-row flip is cleaner.
+- **First production exercise of echo-if-present posture (§17.25).**
+  The `payload.source_msg_id` field is an audit-only passthrough when
+  Zod-optional fields reach helpers. Strict `!== undefined` keeps Zod
+  contract violations visible rather than masking them.
+- **First production demonstration that §17.21 cross-event correlation_id
+  scales down to single-event handlers.** ViewQuote emits only one event
+  per call, but the correlation_id wiring discipline still applies:
+  `meta.correlation_id === lifecycle.customer_viewed.correlation_id`.
+  Pinning this relationship matters for future multi-event ViewQuote
+  successors (e.g., a hypothetical RejectQuote emitting lifecycle.rejected
+  + notification.sent).
+
+### Anomaly-stop validation (ran before documentation)
+
+The ceremony runner (`scripts/real_view_quote_ceremony.js`) executes 10
+inline anomaly checks before writing §28:
+1. `events_emitted` exactly `['lifecycle.customer_viewed']`
+2. `meta.already_existed === false`
+3. `meta.correlation_id` UUID-shaped and non-null
+4. `result.quote.status === 'viewed'`
+5. `result.version.status === 'viewed'`
+6. `lifecycle.customer_viewed` event count === 1
+7. `lifecycle.customer_viewed` event row's `correlation_id === meta.correlation_id`
+8. `payload.source_msg_id === CIL input's source_msg_id`
+9. `quote.updated_at === version.viewed_at` (single-txn coherence)
+10. Post-state: `quote.status === 'viewed' AND version.status === 'viewed'` at DB
+
+All 10 passed. No anomalies. Documentation proceeded.
+
+### Formalizations landing in this session close
+
+| Principle | Section | Status |
+|---|---|---|
+| State-driven idempotency (bundled with post-rollback re-read recovery) | §17.23 | Introduced (first exerciser: ViewQuote) |
+| Header-first ordering for dual-row state transitions | §17.24 | Introduced (first exerciser: markQuoteViewed) |
+| Echo-if-present posture for Zod-optional audit fields | §17.25 | Introduced (first exerciser: emitLifecycleCustomerViewed) |
+| Co-transition between header and version status; voided asymmetry | §3A | Amended (supersedes handoff narrative "§3.3" references) |
+| SendQuote markQuoteSent version.status leak fix | commit `0dedea58` | Landed pre-ceremony (discovered during Section 4; regression-locked in SendQuote Section 7) |
+
+Composition note: the handoff proposed four §17.N subsections (state-driven
+idempotency, post-rollback re-read, header-first ordering, echo-if-present).
+Composition review bundled the first two into §17.23 — the recovery path
+only fires in response to the detection signal, never independently; they
+are one discipline, not two. Net three new subsections.
+
+### Retention posture
+
+Ceremony rows retained per §25.6 indefinite-retention default and §26/§27
+precedent. `chiefos_quote_events` immutability trigger prevents DELETE;
+manual cleanup query (documented, not committed) would be:
+
+```sql
+-- c4c4 namespace cleanup (runs outside DB-enforced immutability):
+UPDATE public.chiefos_quotes
+  SET status='voided', voided_at=NOW(), voided_reason='c4c4-ceremony-cleanup'
+  WHERE id = '00000000-c4c4-c4c4-c4c4-000000000002';
+-- share_tokens, line_items, versions: preserved for forensic continuity
+-- events: DB-immutable, preserved indefinitely
+```
+
+### Cross-reference map
+
+- **§3A** (co-transition asymmetry for voided) — exercised by Section 4 Test 11
+- **§17.23** (state-driven idempotency) — exercised by Sections 2-4, formalized here
+- **§17.24** (header-first ordering) — exercised by Sections 3-4, formalized here
+- **§17.25** (echo-if-present posture) — exercised by Section 3, formalized here
+- Section 6 router registration adds ViewQuote to `NEW_IDIOM_HANDLERS`
+
 ## Next entries (to be added as decisions land)
 - §24. Template table schema (when tenant template editor is designed)
-- §28. Cross-quote pointer enforcement (the 4-column composite FK, if needed)
+- §29. Cross-quote pointer enforcement (the 4-column composite FK, if needed) — renumbered from §28 placeholder after ViewQuote claimed §28
+- §30. LockQuote ceremony (expected Phase A Session 3, if warranted)
+- §31. VoidQuote ceremony (expected Phase A Session 4, if warranted)
+- §32. ReissueQuote ceremony (expected Phase A Session 5, if warranted)

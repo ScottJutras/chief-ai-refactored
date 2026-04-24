@@ -6954,3 +6954,1003 @@ describe('ViewQuote — Section 5: alreadyViewedReturnShape (prior-state compose
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 3 Section 1 tests: LockQuoteCILZ schema
+// ═══════════════════════════════════════════════════════════════════════════
+
+const {
+  LockQuoteCILZ,
+  LOCK_LOAD_COLUMNS: _LOCK_LOAD_COLUMNS,
+  loadLockContext,
+  markQuoteLocked,
+  emitLifecycleLocked,
+} = _internals;
+
+describe('LockQuote — Section 1: LockQuoteCILZ schema', () => {
+  const VALID_QUOTE_UUID = '00000000-c5c5-c5c5-c5c5-000000000002';
+
+  function validLockPayload(overrides = {}) {
+    return {
+      cil_version: '1.0',
+      type: 'LockQuote',
+      tenant_id: '00000000-c5c5-c5c5-c5c5-000000000001',
+      source: 'system',
+      source_msg_id: 'test-lock-msg-1',
+      actor: { role: 'system', actor_id: 'system:cooling-period-expiry' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      quote_ref: { quote_id: VALID_QUOTE_UUID },
+      ...overrides,
+    };
+  }
+
+  describe('schema structure', () => {
+    it('valid payload parses cleanly', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload()).success).toBe(true);
+    });
+
+    it('wrong type literal rejects', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({ type: 'LockQuot' })).success).toBe(false);
+    });
+  });
+
+  describe('source field (z.literal("system") for Phase A; widens in A.5)', () => {
+    it('"system" accepts', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({ source: 'system' })).success).toBe(true);
+    });
+
+    it('"portal" rejects (enum widens in Phase A.5)', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({ source: 'portal' })).success).toBe(false);
+    });
+
+    it('"whatsapp" rejects (enum widens in Phase A.5)', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({ source: 'whatsapp' })).success).toBe(false);
+    });
+
+    it('"web" rejects (customer surface, not contractor-facing)', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({ source: 'web' })).success).toBe(false);
+    });
+  });
+
+  describe('actor field (discriminated union over role)', () => {
+    it('role="system" accepts', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        actor: { role: 'system', actor_id: 'system:cooling-period-expiry' },
+      })).success).toBe(true);
+    });
+
+    it('role="owner" accepts (dual-actor — handler-only in Phase A per surface plan)', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        actor: { role: 'owner', actor_id: '00000000000' },
+      })).success).toBe(true);
+    });
+
+    it('role="customer" rejects (not in discriminated union)', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        actor: { role: 'customer', actor_id: '00000000-c5c5-c5c5-c5c5-000000000099' },
+      })).success).toBe(false);
+    });
+
+    it('role="employee" rejects (not in discriminated union)', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        actor: { role: 'employee', actor_id: '00000000001' },
+      })).success).toBe(false);
+    });
+
+    it('actor_id empty string rejects (min(1))', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        actor: { role: 'system', actor_id: '' },
+      })).success).toBe(false);
+    });
+
+    it('actor missing role rejects', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        actor: { actor_id: 'system:x' },
+      })).success).toBe(false);
+    });
+  });
+
+  describe('source_msg_id optionality (§17.25 echo-if-present)', () => {
+    it('present (non-empty) accepts', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({ source_msg_id: 'req-abc' })).success).toBe(true);
+    });
+
+    it('absent (undefined) accepts', () => {
+      const { source_msg_id: _x, ...without } = validLockPayload();
+      expect(LockQuoteCILZ.safeParse(without).success).toBe(true);
+    });
+
+    it('empty string rejects (min(1) still applies when present)', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({ source_msg_id: '' })).success).toBe(false);
+    });
+  });
+
+  describe('quote_ref field (reused from SendQuote QuoteRefInputZ)', () => {
+    it('quote_id UUID branch accepts', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        quote_ref: { quote_id: VALID_QUOTE_UUID },
+      })).success).toBe(true);
+    });
+
+    it('human_id branch accepts', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        quote_ref: { human_id: 'QT-2026-04-24-0001' },
+      })).success).toBe(true);
+    });
+
+    it('both quote_id and human_id accepts (QuoteRefInputZ refine is at-least-one, not exactly-one)', () => {
+      // Existing SendQuote QuoteRefInputZ contract: refine enforces "at least
+      // one present" via `!!r.quote_id || !!r.human_id`. Both-present is
+      // legal; loadDraftQuote's branch order makes quote_id win when both
+      // are supplied. Test documents the actual contract to prevent future
+      // readers from assuming exactly-one. If that posture is desired, the
+      // refine would need to change — out of scope for LockQuote.
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        quote_ref: { quote_id: VALID_QUOTE_UUID, human_id: 'QT-2026-04-24-0001' },
+      })).success).toBe(true);
+    });
+
+    it('neither quote_id nor human_id rejects (refine requires at least one)', () => {
+      expect(LockQuoteCILZ.safeParse(validLockPayload({
+        quote_ref: {},
+      })).success).toBe(false);
+    });
+  });
+
+  describe('BaseCILZ inheritance', () => {
+    it('missing tenant_id rejects', () => {
+      const { tenant_id: _x, ...bad } = validLockPayload();
+      expect(LockQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('missing occurred_at rejects', () => {
+      const { occurred_at: _x, ...bad } = validLockPayload();
+      expect(LockQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+
+    it('missing cil_version rejects', () => {
+      const { cil_version: _x, ...bad } = validLockPayload();
+      expect(LockQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+  });
+
+  describe('SIG_ERR codes consumed by LockQuote', () => {
+    // LockQuote reuses SIG_ERR (no LOCK_ERR taxonomy — same posture as
+    // ViewQuote). These guards fire if a future refactor removes a code
+    // that loadLockContext throws. SIG_ERR tech-debt rename flagged for
+    // post-Phase-A housekeeping; see §3 close-out handoff discipline note.
+    const LOCK_CONSUMED = {
+      QUOTE_NOT_SIGNED: 409,  // introduced for LockQuote this session
+      QUOTE_VOIDED:     410,
+    };
+
+    it.each(Object.entries(LOCK_CONSUMED))(
+      'SIG_ERR.%s is defined with correct code + status %s',
+      (key, expectedStatus) => {
+        expect(SIG_ERR[key]).toBeDefined();
+        expect(SIG_ERR[key].code).toBe(key);
+        expect(SIG_ERR[key].status).toBe(expectedStatus);
+      }
+    );
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 3 Section 2 tests: loadLockContext (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('LockQuote — Section 2: loadLockContext (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  // Seed a signed quote: full CreateQuote-style chain, then flip both header
+  // and version to 'signed' state (version.locked_at NOT NULL, server_hash
+  // populated). Direct UPDATE (no markQuoteSent/SignQuote dep chain) — keeps
+  // Section 2 tests isolated from upstream handler surface.
+  async function seedSignedQuote(client, pre) {
+    const header = await _ihq(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await _ivq(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'LockQuote Section 2 seed', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: _cts(pre.tenantId),
+    });
+    await _spv(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    // Flip header to 'signed'.
+    await client.query(
+      `UPDATE public.chiefos_quotes SET status='signed', updated_at=NOW() WHERE id=$1`,
+      [header.id]
+    );
+    // Flip version to 'signed' with locked_at + server_hash (mirrors
+    // updateVersionLocked's single-UPDATE four-column flip per Migration 1's
+    // strict-immutability trigger).
+    await client.query(
+      `UPDATE public.chiefos_quote_versions
+          SET status='signed', issued_at=NOW(), sent_at=NOW(),
+              signed_at=NOW(), locked_at=NOW(), server_hash=$2
+        WHERE id=$1`,
+      [version.id, 'a'.repeat(64)]
+    );
+    return { header, version };
+  }
+
+  async function expectCilError(fn, expectedCode) {
+    try {
+      await fn();
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe(expectedCode);
+    }
+  }
+
+  test('happy path: signed quote → returns ctx with quoteStatus=signed, versionStatus=signed, versionLockedAt set', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedSignedQuote(client, pre);
+
+      const ctx = await loadLockContext({
+        pg: client,
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        quoteRef: { quote_id: header.id },
+      });
+
+      expect(ctx.quoteId).toBe(header.id);
+      expect(ctx.versionId).toBe(version.id);
+      expect(ctx.quoteStatus).toBe('signed');
+      expect(ctx.versionStatus).toBe('signed');
+      expect(ctx.versionLockedAt).not.toBeNull();
+      expect(ctx.versionServerHash).toBe('a'.repeat(64));
+      expect(ctx.tenantId).toBe(pre.tenantId);
+      expect(ctx.ownerId).toBe(pre.ownerId);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('idempotency routing: locked quote → returns ctx with quoteStatus=locked (no throw)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+      // Flip header to 'locked' (version stays 'signed' per §3A asymmetry).
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status='locked' WHERE id=$1`,
+        [header.id]
+      );
+
+      const ctx = await loadLockContext({
+        pg: client,
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        quoteRef: { quote_id: header.id },
+      });
+      expect(ctx.quoteStatus).toBe('locked');
+      expect(ctx.versionStatus).toBe('signed');  // §3A asymmetry — version unchanged
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('quote not found → QUOTE_NOT_FOUND_OR_CROSS_OWNER', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+
+      await expectCilError(
+        () => loadLockContext({
+          pg: client, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          quoteRef: { quote_id: '00000000-0000-0000-0000-000000000099' },
+        }),
+        'QUOTE_NOT_FOUND_OR_CROSS_OWNER'
+      );
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('cross-tenant → QUOTE_NOT_FOUND_OR_CROSS_OWNER (unified 404 per §17.17 addendum 3)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+
+      await expectCilError(
+        () => loadLockContext({
+          pg: client,
+          tenantId: FOREST_CITY_TENANT_UUID,  // different tenant
+          ownerId: pre.ownerId,
+          quoteRef: { quote_id: header.id },
+        }),
+        'QUOTE_NOT_FOUND_OR_CROSS_OWNER'
+      );
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('cross-owner → QUOTE_NOT_FOUND_OR_CROSS_OWNER (unified 404; prevents system-cron drift)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+
+      await expectCilError(
+        () => loadLockContext({
+          pg: client,
+          tenantId: pre.tenantId,
+          ownerId: '99000000000',  // different owner, same tenant
+          quoteRef: { quote_id: header.id },
+        }),
+        'QUOTE_NOT_FOUND_OR_CROSS_OWNER'
+      );
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('voided quote → QUOTE_VOIDED (§3A terminal-state rejection)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+      // Flip header to voided; version stays signed per §3A.
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status='voided', voided_at=NOW(), voided_reason='test' WHERE id=$1`,
+        [header.id]
+      );
+
+      await expectCilError(
+        () => loadLockContext({
+          pg: client, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          quoteRef: { quote_id: header.id },
+        }),
+        SIG_ERR.QUOTE_VOIDED.code
+      );
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test.each(['draft', 'sent', 'viewed'])(
+    'pre-signed state (%s) → QUOTE_NOT_SIGNED',
+    async (status) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const pre = await setupQuotePreconditions(client);
+        // Seed a fresh draft quote (no sign flip).
+        const header = await _ihq(client, {
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+          jobId: pre.jobId, customerId: pre.customer.id,
+          humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+        });
+        const version = await _ivq(client, {
+          quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          data: {
+            project: { title: 'Pre-signed test', scope: null },
+            currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+            warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+            warranty_template_ref: null, clauses_template_ref: null,
+          },
+          totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+          customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+          tenantSnapshot: _cts(pre.tenantId),
+        });
+        await _spv(client, {
+          quoteId: header.id, versionId: version.id,
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+        });
+        // Non-signed states: locked_at stays NULL, status stays in
+        // {draft,sent,viewed} — satisfies chiefos_qv_status_locked_consistency.
+        if (status !== 'draft') {
+          await client.query(
+            `UPDATE public.chiefos_quotes SET status=$2 WHERE id=$1`,
+            [header.id, status]
+          );
+          await client.query(
+            `UPDATE public.chiefos_quote_versions SET status=$2, issued_at=NOW(), sent_at=NOW() WHERE id=$1`,
+            [version.id, status]
+          );
+        }
+
+        await expectCilError(
+          () => loadLockContext({
+            pg: client, tenantId: pre.tenantId, ownerId: pre.ownerId,
+            quoteRef: { quote_id: header.id },
+          }),
+          SIG_ERR.QUOTE_NOT_SIGNED.code
+        );
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+      }
+    }
+  );
+
+  test('human_id lookup branch: returns same ctx as quote_id branch', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+
+      const ctx = await loadLockContext({
+        pg: client, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        quoteRef: { human_id: pre.humanId },
+      });
+      expect(ctx.quoteId).toBe(header.id);
+      expect(ctx.humanId).toBe(pre.humanId);
+      expect(ctx.quoteStatus).toBe('signed');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 3 Section 2 tests: loadLockContext invariant assertions (unit)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The §3A co-transition, §3A asymmetry, and §17.22 locked_at-NULL cases are
+// DB-unreachable by design: chiefos_qv_status_locked_consistency CHECK +
+// trg_chiefos_quote_versions_guard_immutable prevent any UPDATE path that
+// would produce them. The loader's assertions are defense-in-depth for
+// hypothetical direct-DB-write / FK-drift scenarios. Exercised here via a
+// pg-query mock that returns synthetic rows bypassing DB constraints, so
+// the assertions remain test-covered without requiring DB-level bypass.
+//
+// Same pattern as ViewQuote's loadViewContext tests (line 4064's mockPgWith).
+
+describe('LockQuote — Section 2: loadLockContext invariant assertions (unit)', () => {
+  const LCTX_TENANT_ID  = '00000000-c5c5-c5c5-c5c5-000000000001';
+  const LCTX_OWNER_ID   = '00000000000';
+  const LCTX_QUOTE_ID   = '00000000-c5c5-c5c5-c5c5-000000000002';
+  const LCTX_VERSION_ID = '00000000-c5c5-c5c5-c5c5-000000000003';
+
+  function makeLockRow(overrides = {}) {
+    return {
+      quote_id: LCTX_QUOTE_ID,
+      human_id: 'QT-2026-04-24-LOCK01',
+      quote_status: 'signed',
+      job_id: 3001,
+      customer_id: null,
+      current_version_id: LCTX_VERSION_ID,
+      header_created_at: new Date('2026-04-24T10:00:00Z'),
+      header_updated_at: new Date('2026-04-24T10:00:00Z'),
+      version_id: LCTX_VERSION_ID,
+      version_no: 1,
+      version_status: 'signed',
+      project_title: 'Lock Invariant Test',
+      currency: 'CAD',
+      total_cents: 11300,
+      customer_snapshot: { name: 'Lock Customer', email: null, phone_e164: null },
+      version_issued_at: new Date('2026-04-24T10:00:00Z'),
+      version_sent_at: new Date('2026-04-24T10:00:00Z'),
+      version_viewed_at: null,
+      version_signed_at: new Date('2026-04-24T10:05:00Z'),
+      version_locked_at: new Date('2026-04-24T10:05:00Z'),
+      version_server_hash: 'c'.repeat(64),
+      ...overrides,
+    };
+  }
+
+  function mockPgWith(queryResults) {
+    let idx = 0;
+    const query = jest.fn().mockImplementation(() => {
+      const r = queryResults[idx++];
+      if (r instanceof Error) return Promise.reject(r);
+      return Promise.resolve(r || { rows: [] });
+    });
+    return { query };
+  }
+
+  async function expectCilError(fn, expectedCode) {
+    try {
+      await fn();
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe(expectedCode);
+    }
+  }
+
+  test('§3A co-transition: signed header + sent version → CIL_INTEGRITY_ERROR', async () => {
+    const pg = mockPgWith([
+      { rows: [makeLockRow({ quote_status: 'signed', version_status: 'sent' })] },
+    ]);
+    await expectCilError(
+      () => loadLockContext({
+        pg, tenantId: LCTX_TENANT_ID, ownerId: LCTX_OWNER_ID,
+        quoteRef: { quote_id: LCTX_QUOTE_ID },
+      }),
+      'CIL_INTEGRITY_ERROR'
+    );
+  });
+
+  test('§3A asymmetry: locked header + locked version → CIL_INTEGRITY_ERROR (version must stay "signed")', async () => {
+    const pg = mockPgWith([
+      { rows: [makeLockRow({ quote_status: 'locked', version_status: 'locked' })] },
+    ]);
+    await expectCilError(
+      () => loadLockContext({
+        pg, tenantId: LCTX_TENANT_ID, ownerId: LCTX_OWNER_ID,
+        quoteRef: { quote_id: LCTX_QUOTE_ID },
+      }),
+      'CIL_INTEGRITY_ERROR'
+    );
+  });
+
+  test('§17.22 invariant: signed quote with NULL version.locked_at → CIL_INTEGRITY_ERROR', async () => {
+    const pg = mockPgWith([
+      { rows: [makeLockRow({ quote_status: 'signed', version_status: 'signed', version_locked_at: null })] },
+    ]);
+    await expectCilError(
+      () => loadLockContext({
+        pg, tenantId: LCTX_TENANT_ID, ownerId: LCTX_OWNER_ID,
+        quoteRef: { quote_id: LCTX_QUOTE_ID },
+      }),
+      'CIL_INTEGRITY_ERROR'
+    );
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 3 Section 3 tests: markQuoteLocked (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('LockQuote — Section 3: markQuoteLocked (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  async function seedSignedQuote(client, pre) {
+    const header = await _ihq(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await _ivq(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'markQuoteLocked seed', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: _cts(pre.tenantId),
+    });
+    await _spv(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    await client.query(
+      `UPDATE public.chiefos_quotes SET status='signed', updated_at=NOW() WHERE id=$1`,
+      [header.id]
+    );
+    await client.query(
+      `UPDATE public.chiefos_quote_versions
+          SET status='signed', issued_at=NOW(), sent_at=NOW(),
+              signed_at=NOW(), locked_at=NOW(), server_hash=$2
+        WHERE id=$1`,
+      [version.id, 'b'.repeat(64)]
+    );
+    return { header, version };
+  }
+
+  test('happy path: signed → locked; returns transitioned:true with quoteUpdatedAt', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+
+      const result = await markQuoteLocked(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+
+      expect(result.transitioned).toBe(true);
+      expect(result.quoteUpdatedAt).toBeDefined();
+
+      const qRow = await client.query(
+        `SELECT status FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(qRow.rows[0].status).toBe('locked');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('§3A asymmetry: version row UNTOUCHED post-lock (locked_at + status unchanged)', async () => {
+    // This is the load-bearing §3A asymmetry assertion. A future refactor
+    // that adds a version UPDATE to markQuoteLocked would be rejected by
+    // trg_chiefos_quote_versions_guard_immutable at runtime, but this test
+    // catches the regression at test time with a clear assertion.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedSignedQuote(client, pre);
+
+      const before = await client.query(
+        `SELECT status, locked_at, server_hash, signed_at
+           FROM public.chiefos_quote_versions WHERE id=$1`,
+        [version.id]
+      );
+
+      await markQuoteLocked(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+
+      const after = await client.query(
+        `SELECT status, locked_at, server_hash, signed_at
+           FROM public.chiefos_quote_versions WHERE id=$1`,
+        [version.id]
+      );
+      expect(after.rows[0].status).toBe('signed');  // §3A: unchanged
+      expect(after.rows[0].status).toBe(before.rows[0].status);
+      expect(after.rows[0].locked_at.toISOString()).toBe(before.rows[0].locked_at.toISOString());
+      expect(after.rows[0].server_hash).toBe(before.rows[0].server_hash);
+      expect(after.rows[0].signed_at.toISOString()).toBe(before.rows[0].signed_at.toISOString());
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('already-locked quote: returns transitioned:false (§17.23 concurrent-transition signal)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+      // Pre-flip header to 'locked'.
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status='locked' WHERE id=$1`,
+        [header.id]
+      );
+
+      const result = await markQuoteLocked(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+      expect(result).toEqual({ transitioned: false });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test.each(['draft', 'sent', 'viewed'])(
+    'pre-signed state (%s): returns transitioned:false (not in "signed" state)',
+    async (status) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const pre = await setupQuotePreconditions(client);
+        const header = await _ihq(client, {
+          tenantId: pre.tenantId, ownerId: pre.ownerId,
+          jobId: pre.jobId, customerId: pre.customer.id,
+          humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+        });
+        if (status !== 'draft') {
+          await client.query(
+            `UPDATE public.chiefos_quotes SET status=$2 WHERE id=$1`,
+            [header.id, status]
+          );
+        }
+
+        const result = await markQuoteLocked(client, {
+          quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        });
+        expect(result).toEqual({ transitioned: false });
+
+        // No mutation.
+        const qRow = await client.query(
+          `SELECT status FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+        );
+        expect(qRow.rows[0].status).toBe(status);
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+      }
+    }
+  );
+
+  test('cross-tenant scope: returns transitioned:false with no mutation', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+
+      const result = await markQuoteLocked(client, {
+        quoteId: header.id,
+        tenantId: FOREST_CITY_TENANT_UUID,  // wrong tenant
+        ownerId: pre.ownerId,
+      });
+      expect(result).toEqual({ transitioned: false });
+
+      const qRow = await client.query(
+        `SELECT status FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(qRow.rows[0].status).toBe('signed');  // unchanged
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('quoteUpdatedAt reflects transaction NOW() (txn-coherent timestamp)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedSignedQuote(client, pre);
+
+      const result = await markQuoteLocked(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      });
+
+      const qRow = await client.query(
+        `SELECT updated_at FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(result.quoteUpdatedAt.toISOString()).toBe(qRow.rows[0].updated_at.toISOString());
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 3 Section 3 tests: emitLifecycleLocked (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('LockQuote — Section 3: emitLifecycleLocked (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  async function seedQuote(client, pre) {
+    const header = await _ihq(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await _ivq(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'emitLifecycleLocked seed', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: _cts(pre.tenantId),
+    });
+    await _spv(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    return { header, version };
+  }
+
+  test('happy path: inserts lifecycle.locked row with quote_version_id + correlation_id', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedQuote(client, pre);
+      const correlationId = '11111111-2222-3333-4444-555555555555';
+
+      await emitLifecycleLocked(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system',
+        actorUserId: 'system:cooling-period-expiry',
+        emittedAt: new Date('2026-04-24T12:00:00Z'),
+        customerId: pre.customer.id,
+        correlationId,
+        sourceMsgId: 'lock-msg-1',
+      });
+
+      const { rows } = await client.query(
+        `SELECT kind, quote_version_id, correlation_id, actor_source, actor_user_id, customer_id, payload
+           FROM public.chiefos_quote_events
+          WHERE quote_id=$1 AND kind='lifecycle.locked'`,
+        [header.id]
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].kind).toBe('lifecycle.locked');
+      expect(rows[0].quote_version_id).toBe(version.id);
+      expect(rows[0].correlation_id).toBe(correlationId);
+      expect(rows[0].actor_source).toBe('system');
+      expect(rows[0].actor_user_id).toBe('system:cooling-period-expiry');
+      expect(rows[0].customer_id).toBe(pre.customer.id);
+      expect(rows[0].payload).toEqual({ source_msg_id: 'lock-msg-1' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('§17.25 echo-if-present: source_msg_id present → payload.source_msg_id set', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedQuote(client, pre);
+
+      await emitLifecycleLocked(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: 'system:x',
+        emittedAt: new Date('2026-04-24T12:00:00Z'),
+        customerId: null, correlationId: null,
+        sourceMsgId: 'echo-me',
+      });
+
+      const { rows } = await client.query(
+        `SELECT payload FROM public.chiefos_quote_events WHERE quote_id=$1 AND kind='lifecycle.locked'`,
+        [header.id]
+      );
+      expect(rows[0].payload).toEqual({ source_msg_id: 'echo-me' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('§17.25 echo-if-present: source_msg_id absent (undefined) → payload.source_msg_id NOT set', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedQuote(client, pre);
+
+      await emitLifecycleLocked(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: 'system:x',
+        emittedAt: new Date('2026-04-24T12:00:00Z'),
+        customerId: null, correlationId: null,
+        // sourceMsgId intentionally omitted
+      });
+
+      const { rows } = await client.query(
+        `SELECT payload FROM public.chiefos_quote_events WHERE quote_id=$1 AND kind='lifecycle.locked'`,
+        [header.id]
+      );
+      expect(rows[0].payload).toEqual({});
+      expect(rows[0].payload.source_msg_id).toBeUndefined();
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('§17.25 strict !== undefined: source_msg_id empty string echoes (not defensively filtered)', async () => {
+    // Zod's .min(1) rejects empty strings at the schema layer, so this
+    // case is unreachable from the handler entry point. Helper-level test
+    // guards that if a Zod regression ever lets an empty string through,
+    // it surfaces in audit as `source_msg_id: ""` rather than being
+    // silently dropped.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedQuote(client, pre);
+
+      await emitLifecycleLocked(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: 'system:x',
+        emittedAt: new Date('2026-04-24T12:00:00Z'),
+        customerId: null, correlationId: null,
+        sourceMsgId: '',
+      });
+
+      const { rows } = await client.query(
+        `SELECT payload FROM public.chiefos_quote_events WHERE quote_id=$1 AND kind='lifecycle.locked'`,
+        [header.id]
+      );
+      expect(rows[0].payload).toEqual({ source_msg_id: '' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('customer_id NULL path (system-actor invocation)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header, version } = await seedQuote(client, pre);
+
+      await emitLifecycleLocked(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: 'system:x',
+        emittedAt: new Date('2026-04-24T12:00:00Z'),
+        customerId: null,  // system-actor — no customer context
+        correlationId: null,
+        sourceMsgId: 'x',
+      });
+
+      const { rows } = await client.query(
+        `SELECT customer_id FROM public.chiefos_quote_events WHERE quote_id=$1 AND kind='lifecycle.locked'`,
+        [header.id]
+      );
+      expect(rows[0].customer_id).toBeNull();
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+

@@ -105,6 +105,9 @@ const CIL_TO_QUOTE_SOURCE = Object.freeze({
 const CIL_TO_EVENT_ACTOR_SOURCE = Object.freeze({
   whatsapp: 'whatsapp',
   web: 'portal',
+  // LockQuote Phase A: source='system' (cooling-period-expiry and sibling
+  // system-initiated paths). Widens alongside source-enum widening in Phase A.5.
+  system: 'system',
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3895,6 +3898,354 @@ async function handleSendQuote(rawCil, ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 3 — LockQuote (header-only per §3A asymmetry)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// LockQuote transitions chiefos_quotes.status from 'signed' to 'locked' on
+// explicit signal — either a system-initiated event (e.g., cooling-period
+// expiry fired by cron) or an owner-initiated manual lock (owner path
+// reachable in Phase A via internal CIL dispatch only; human dispatch surface
+// lands in Phase A.5). The version row was already DB-frozen at SignQuote
+// time by updateVersionLocked (status='signed', locked_at NOT NULL,
+// server_hash populated). Further mutation of the version row is blocked by
+// trg_chiefos_quote_versions_guard_immutable, so LockQuote is a HEADER-ONLY
+// transition — no dual-row co-transition, no version.status='locked' UPDATE.
+//
+// §3A asymmetry: locked, like voided, is a header-only terminal-ish state.
+// Unlike voided (true terminal), locked is reachable-from-voided via
+// ReissueQuote (new version); the locked version itself remains frozen.
+//
+// Dual-actor Zod union: 'system' OR 'owner'. Both paths reach the same
+// state-transition core via a uniform loadLockContext (Posture A per
+// Investigation 2.5 — identity via upstream-resolved ctx.owner_id for both).
+// Plan gating applies to 'owner' (consistent with SendQuote posture); skipped
+// for 'system' (§14.12 parallel — system actors aren't plan-holders).
+//
+// Second §17.23 exerciser: state-driven idempotency. Pre-txn SELECT routes
+// already-locked quotes to alreadyLockedReturnShape; conditional UPDATE
+// WHERE status='signed' detects concurrent transitions at rowcount=0.
+// Header-only means §17.24 dual-row ordering does NOT apply.
+
+// ─── Phase A Session 3 Section 1: LockQuoteCILZ schema ──────────────────────
+
+// Actor: dual-actor Zod discriminated union. Both paths reach the same
+// state-transition core (signed → locked header-only) but diverge on plan
+// gating (owner gated; system skipped per §14.12 parallel). Discriminator
+// on role; actor_id is a free-form non-empty string for both (owner uses
+// user UUID or phone; system uses a stable identifier like
+// 'system:cooling-period-expiry').
+const LockQuoteActorZ = z.discriminatedUnion('role', [
+  z.object({ role: z.literal('owner'),  actor_id: z.string().min(1) }),
+  z.object({ role: z.literal('system'), actor_id: z.string().min(1) }),
+]);
+
+const LockQuoteCILZ = BaseCILZ
+  .omit({ actor: true, source_msg_id: true })
+  .extend({
+    type: z.literal('LockQuote'),
+    // Phase A: system-only. Widens in Phase A.5 to
+    // z.enum(['portal','whatsapp','system']). Form changes (literal → enum),
+    // not just values — prevents a future widener from writing invalid
+    // z.literal([...]).
+    source: z.literal('system'),
+    // §17.25 echo-if-present posture: optional in input; when present, helper
+    // echoes to payload.source_msg_id via strict `!== undefined` check.
+    source_msg_id: z.string().min(1).optional(),
+    actor: LockQuoteActorZ,
+    // Reuse SendQuote's QuoteRefInputZ — exactly-one quote_id | human_id
+    // with Zod refine enforcement.
+    quote_ref: QuoteRefInputZ,
+  });
+
+// ─── Phase A Session 3 Section 2: LOCK_LOAD_COLUMNS + loadLockContext ──────
+
+// LOCK_LOAD_COLUMNS — pre-txn read surface for LockQuote. Includes header
+// identity + status fields for §17.23 routing and §3A/§17.22 invariant
+// assertions, plus enough version fields to build the return shape without
+// a second query.
+const LOCK_LOAD_COLUMNS = `
+  q.id                   AS quote_id,
+  q.human_id,
+  q.status               AS quote_status,
+  q.job_id,
+  q.customer_id,
+  q.current_version_id,
+  q.created_at           AS header_created_at,
+  q.updated_at           AS header_updated_at,
+  v.id                   AS version_id,
+  v.version_no,
+  v.status               AS version_status,
+  v.project_title,
+  v.currency,
+  v.total_cents,
+  v.customer_snapshot,
+  v.issued_at            AS version_issued_at,
+  v.sent_at              AS version_sent_at,
+  v.viewed_at            AS version_viewed_at,
+  v.signed_at            AS version_signed_at,
+  v.locked_at            AS version_locked_at,
+  v.server_hash          AS version_server_hash
+`;
+
+/**
+ * loadLockContext — pre-txn context loader for LockQuote.
+ *
+ * UNIFORM ACROSS BOTH ACTOR PATHS (Posture A per Investigation 2.5). Both
+ * 'owner' and 'system' actors pass through the same identity resolution:
+ * ctx.owner_id populated by upstream resolver (portal session for owner;
+ * cron config for system). Loader is actor-oblivious — no branching on
+ * actor.role.
+ *
+ * Scopes by (tenant_id, owner_id). Cross-tenant / cross-owner / not-found
+ * all unify to QUOTE_NOT_FOUND_OR_CROSS_OWNER per §17.17 addendum 3 (no
+ * enumeration). Owner-only scoping ensures the system path fails closed on
+ * upstream cron config drift (tenant removed, primary-owner deleted, etc.)
+ * identically to the owner path.
+ *
+ * State routing per §17.23 (detection half):
+ *   signed → return ctx (happy path — caller proceeds to txn)
+ *   locked → return ctx (idempotency — caller composes alreadyLockedReturnShape)
+ *   voided → throw QUOTE_VOIDED (terminal-state rejection per §3A)
+ *   draft/sent/viewed → throw QUOTE_NOT_SIGNED (not-in-valid-prior-state)
+ *   unknown → throw CIL_INTEGRITY_ERROR
+ *
+ * Three invariant assertions (§17.22):
+ *   signed: version.status === 'signed' else CIL_INTEGRITY_ERROR (co-transition)
+ *   locked: version.status === 'signed' else CIL_INTEGRITY_ERROR (§3A asymmetry)
+ *   signed|locked: version.locked_at NOT NULL else CIL_INTEGRITY_ERROR
+ *     (chiefos_qv_status_locked_consistency CHECK invariant)
+ *
+ * Accepts `pg` (not a txn client) because LockQuote's §17.23 posture is
+ * pre-txn SELECT + conditional in-txn UPDATE. Same pattern as loadViewContext.
+ *
+ * @throws {CilIntegrityError}
+ */
+async function loadLockContext({ pg, tenantId, ownerId, quoteRef }) {
+  let rows;
+  if (quoteRef.quote_id) {
+    const r = await pg.query(
+      `SELECT ${LOCK_LOAD_COLUMNS}
+         FROM public.chiefos_quotes q
+         JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+        WHERE q.id = $1 AND q.tenant_id = $2 AND q.owner_id = $3
+        LIMIT 1`,
+      [quoteRef.quote_id, tenantId, ownerId]
+    );
+    rows = r.rows;
+  } else {
+    // human_id branch — human_id is tenant-unique per chiefos_quotes_human_id_unique.
+    const r = await pg.query(
+      `SELECT ${LOCK_LOAD_COLUMNS}
+         FROM public.chiefos_quotes q
+         JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+        WHERE q.human_id = $1 AND q.tenant_id = $2 AND q.owner_id = $3
+        LIMIT 1`,
+      [quoteRef.human_id, tenantId, ownerId]
+    );
+    rows = r.rows;
+  }
+
+  // Fail-closed: not found or cross-boundary unified per §17.17 addendum 3.
+  if (rows.length === 0) {
+    throw new CilIntegrityError({
+      code: 'QUOTE_NOT_FOUND_OR_CROSS_OWNER',
+      message: 'Quote lookup failed',
+      hint: 'quote_ref does not match a quote in this tenant+owner scope, or quote does not exist',
+    });
+  }
+  const row = rows[0];
+
+  // State routing (§17.23 detection half).
+  switch (row.quote_status) {
+    case 'signed':
+      break;  // happy path
+    case 'locked':
+      break;  // idempotency — caller composes alreadyLockedReturnShape
+    case 'voided':
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_VOIDED.code,
+        message: 'Quote has been voided',
+        hint: `quote_id=${row.quote_id} human_id=${row.human_id}; voided quotes cannot be locked`,
+      });
+    case 'draft':
+    case 'sent':
+    case 'viewed':
+      throw new CilIntegrityError({
+        code: SIG_ERR.QUOTE_NOT_SIGNED.code,
+        message: `Cannot lock quote in '${row.quote_status}' status`,
+        hint: `quote_id=${row.quote_id} human_id=${row.human_id}; LockQuote operates on signed quotes only`,
+      });
+    default:
+      throw new CilIntegrityError({
+        code: 'CIL_INTEGRITY_ERROR',
+        message: 'Unknown quote status',
+        hint: `quote_id=${row.quote_id} unknown_status=${row.quote_status}`,
+      });
+  }
+
+  // §17.22 invariant assertions.
+  // Signed state: version must also be 'signed' (co-transition per §3A).
+  if (row.quote_status === 'signed' && row.version_status !== 'signed') {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Quote/version status disagreement',
+      hint: `quote_id=${row.quote_id} version_id=${row.version_id} quote.status=signed version.status=${row.version_status}; SignQuote atomicity regression or direct DB write`,
+    });
+  }
+  // Locked state: version stays 'signed' per §3A header-only asymmetry.
+  // An UPDATE flipping version.status to 'locked' would be rejected by
+  // trg_chiefos_quote_versions_guard_immutable (locked_at IS NOT NULL → all
+  // UPDATEs forbidden). Version.status MUST be 'signed' for locked quotes.
+  if (row.quote_status === 'locked' && row.version_status !== 'signed') {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Locked quote has unexpected version.status',
+      hint: `quote_id=${row.quote_id} version_id=${row.version_id} version.status=${row.version_status}; expected 'signed' per §3A header-only asymmetry`,
+    });
+  }
+  // Both signed and locked require locked_at NOT NULL per
+  // chiefos_qv_status_locked_consistency CHECK. If NULL, direct DB write or
+  // schema regression.
+  if (row.version_locked_at === null) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Signed/locked quote has NULL version.locked_at',
+      hint: `quote_id=${row.quote_id} version_id=${row.version_id}; schema CHECK chiefos_qv_status_locked_consistency violated`,
+    });
+  }
+
+  return {
+    tenantId,
+    ownerId,
+    // Quote identity
+    quoteId: row.quote_id,
+    humanId: row.human_id,
+    quoteStatus: row.quote_status,
+    jobId: row.job_id,
+    customerId: row.customer_id,
+    currentVersionId: row.current_version_id,
+    headerCreatedAt: row.header_created_at,
+    headerUpdatedAt: row.header_updated_at,
+    // Version fields
+    versionId: row.version_id,
+    versionNo: row.version_no,
+    versionStatus: row.version_status,
+    projectTitle: row.project_title,
+    currency: row.currency,
+    totalCents: row.total_cents,
+    customerSnapshot: row.customer_snapshot,
+    versionIssuedAt: row.version_issued_at,
+    versionSentAt: row.version_sent_at,
+    versionViewedAt: row.version_viewed_at,
+    versionSignedAt: row.version_signed_at,
+    versionLockedAt: row.version_locked_at,
+    versionServerHash: row.version_server_hash,
+  };
+}
+
+// ─── Phase A Session 3 Section 3: markQuoteLocked + emitLifecycleLocked ────
+
+/**
+ * markQuoteLocked — §17.23 state-driven idempotency. HEADER-ONLY UPDATE per
+ * §3A asymmetry: transitions chiefos_quotes.status from 'signed' to 'locked'.
+ *
+ * DO NOT add a version-row UPDATE. The version row was set to status='signed'
+ * + locked_at NOT NULL at SignQuote time (updateVersionLocked). The DB trigger
+ * trg_chiefos_quote_versions_guard_immutable blocks ALL UPDATEs once
+ * locked_at IS NOT NULL, including a status flip 'signed' → 'locked'. The
+ * version row's 'locked' enum value is only reachable via a hypothetical
+ * new-version path, not via a post-sign UPDATE.
+ *
+ * §3A rationale: locked is a header-level product concept ("this quote will
+ * not change further, even cosmetically") applied on top of already-DB-
+ * immutable version content. Header carries state-machine authority per §3A;
+ * version carries content snapshot. §17.24 dual-row ordering does NOT apply.
+ *
+ * §17.23 signal semantics:
+ *   rowCount === 1 → transitioned:true + quoteUpdatedAt (happy path)
+ *   rowCount === 0 → transitioned:false (concurrent-transition signal;
+ *                    caller re-reads via loadLockContext and composes
+ *                    alreadyLockedReturnShape, or maps concurrent VoidQuote
+ *                    to QUOTE_VOIDED per §17.23 recovery discipline)
+ *
+ * Header-column mutability: `status` and `updated_at` are NOT guarded by
+ * trg_chiefos_quotes_guard_header_immutable (verified at Migration 1 lines
+ * 295-305 — only id/tenant_id/owner_id/job_id/customer_id/human_id/source/
+ * source_msg_id/created_at are immutable). This UPDATE is legitimate.
+ *
+ * @returns {Promise<{ transitioned: false } | { transitioned: true, quoteUpdatedAt }>}
+ */
+async function markQuoteLocked(client, { quoteId, tenantId, ownerId }) {
+  const result = await client.query(
+    `UPDATE public.chiefos_quotes
+        SET status = 'locked', updated_at = NOW()
+      WHERE id = $1 AND tenant_id = $2 AND owner_id = $3 AND status = 'signed'
+      RETURNING updated_at`,
+    [quoteId, tenantId, ownerId]
+  );
+  if (result.rowCount === 0) {
+    return { transitioned: false };
+  }
+  return {
+    transitioned: true,
+    quoteUpdatedAt: result.rows[0].updated_at,
+  };
+}
+
+/**
+ * emitLifecycleLocked — INSERTs a chiefos_quote_events row for the lock
+ * transition. Runs AFTER markQuoteLocked per ordering discipline (state flip
+ * first, event emission second — mirrors markQuoteSent→emitLifecycleSent and
+ * markQuoteViewed→emitLifecycleCustomerViewed).
+ *
+ * Per Migration 2:
+ *   - lifecycle.locked is VERSION-scoped (chiefos_qe_version_scoped_kinds)
+ *     — quote_version_id NOT NULL required.
+ *   - No per-kind payload CHECK exists for lifecycle.locked; payload is
+ *     structurally unconstrained at the DB layer. Phase A payload is minimal
+ *     (source_msg_id echo only per §17.25). Future extension (lock_reason,
+ *     trigger_source, etc.) would require adding a chiefos_qe_payload_locked
+ *     CHECK in a subsequent migration.
+ *
+ * correlation_id discipline (§17.21): caller passes fresh UUID per invocation;
+ * helper writes to the column.
+ *
+ * source_msg_id echo (§17.25): strict `!== undefined` — empty string passes
+ * through as a Zod-regression surface rather than being defensively filtered.
+ *
+ * customer_id may be NULL for system-actor invocations where no customer-facing
+ * context is established (e.g., cooling-period expiry auto-lock). Schema permits
+ * NULL per absence of NOT NULL on chiefos_quote_events.customer_id.
+ */
+async function emitLifecycleLocked(client, {
+  quoteId, versionId, tenantId, ownerId,
+  actorSource, actorUserId, emittedAt,
+  customerId,
+  correlationId = null,
+  sourceMsgId,
+}) {
+  const payload = {};
+  if (sourceMsgId !== undefined) {
+    payload.source_msg_id = sourceMsgId;
+  }
+  await client.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id, emitted_at,
+        customer_id, correlation_id, payload
+      )
+      VALUES ($1, $2, $3, $4,
+              'lifecycle.locked', $5, $6, $7,
+              $8, $9, $10)`,
+    [
+      tenantId, ownerId, quoteId, versionId,
+      actorSource, actorUserId || null, emittedAt,
+      customerId || null, correlationId, payload,
+    ]
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -3993,6 +4344,15 @@ module.exports = {
     composeNameMismatchPayload,
     composeSignQuoteEmail,
     buildSignQuoteReturnShape,
+    // LockQuote Section 1 (schema)
+    LockQuoteCILZ,
+    LockQuoteActorZ,
+    // LockQuote Section 2 (loader + columns)
+    LOCK_LOAD_COLUMNS,
+    loadLockContext,
+    // LockQuote Section 3 (transaction-body helpers)
+    markQuoteLocked,
+    emitLifecycleLocked,
   },
 };
 

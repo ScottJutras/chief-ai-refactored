@@ -89,6 +89,7 @@ const SIG_ERR = Object.freeze({
   SIGNATURE_ALREADY_EXISTS: Object.freeze({ code: 'SIGNATURE_ALREADY_EXISTS', status: 409 }),
   QUOTE_NOT_SIGNABLE:       Object.freeze({ code: 'QUOTE_NOT_SIGNABLE',       status: 409 }),
   QUOTE_NOT_SENT:           Object.freeze({ code: 'QUOTE_NOT_SENT',           status: 409 }),
+  QUOTE_NOT_SIGNED:         Object.freeze({ code: 'QUOTE_NOT_SIGNED',         status: 409 }),
   QUOTE_ALREADY_SIGNED:     Object.freeze({ code: 'QUOTE_ALREADY_SIGNED',     status: 409 }),
   QUOTE_LOCKED:             Object.freeze({ code: 'QUOTE_LOCKED',             status: 409 }),
   QUOTE_VOIDED:             Object.freeze({ code: 'QUOTE_VOIDED',             status: 410 }),

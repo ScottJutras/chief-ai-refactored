@@ -3952,8 +3952,11 @@ const LockQuoteCILZ = BaseCILZ
     // echoes to payload.source_msg_id via strict `!== undefined` check.
     source_msg_id: z.string().min(1).optional(),
     actor: LockQuoteActorZ,
-    // Reuse SendQuote's QuoteRefInputZ — exactly-one quote_id | human_id
-    // with Zod refine enforcement.
+    // Reuse SendQuote's QuoteRefInputZ — at-least-one quote_id | human_id
+    // (refine is `!!r.quote_id || !!r.human_id`, not XOR). Both-present is
+    // legal; loadDraftQuote/loadLockContext branch on quote_id first when
+    // both supplied. Documented at-least-one contract is the reality
+    // (Section 1 nuance preserved by the §1 test assertions).
     quote_ref: QuoteRefInputZ,
   });
 
@@ -4245,6 +4248,326 @@ async function emitLifecycleLocked(client, {
   );
 }
 
+// ─── Phase A Session 3 Section 2: handleLockQuote + return-shape composers ──
+//
+// Handler orchestrates Sections 1-3 primitives (LockQuoteCILZ +
+// loadLockContext + markQuoteLocked + emitLifecycleLocked). Two return-shape
+// composers: buildLockQuoteReturnShape (happy path, signed→locked transition)
+// and alreadyLockedReturnShape (prior-state path: already locked, OR
+// post-rollback re-read after concurrent transition per §17.23 recovery).
+// Same-shape rationale per ViewQuote §17.15 Q2 — separate composers prevent
+// branching logic from accumulating in a parameterized single composer.
+//
+// 3 entities: quote, version, meta. NO share_token entity — LockQuote is
+// system-only in Phase A (z.literal('system')) and has no customer surface
+// requiring share-token disclosure. SendQuote's portal/whatsapp surfaces
+// widen LockQuote in Phase A.5 but still without a customer-facing path
+// (lock is owner-side / system-side action, not customer-side).
+
+/**
+ * buildLockQuoteReturnShape — §17.15 multi-entity envelope for the happy
+ * path where markQuoteLocked flipped the header signed→locked.
+ *
+ * 3 entities: quote (8 keys), version (12 keys), meta (4 keys).
+ * Quote.status is hardcoded 'locked' (this composer is happy-path-only and
+ * is invoked iff the header was just transitioned). Version.status is
+ * hardcoded 'signed' per §3A header-only asymmetry (see inline comment
+ * below). Meta carries the freshly generated correlation_id (§17.21) and
+ * the lifecycle.locked event-kind in events_emitted.
+ */
+function buildLockQuoteReturnShape({
+  ctx, markResult, correlationId, eventsEmitted, alreadyExisted, traceId,
+}) {
+  return {
+    ok: true,
+    quote: {
+      id: ctx.quoteId,
+      human_id: ctx.humanId,
+      status: 'locked',
+      job_id: ctx.jobId,
+      customer_id: ctx.customerId,
+      current_version_id: ctx.currentVersionId,
+      created_at: ctx.headerCreatedAt,
+      updated_at: markResult.quoteUpdatedAt,
+    },
+    version: {
+      id: ctx.versionId,
+      version_no: ctx.versionNo,
+      // version.status intentionally remains 'signed' post-lock — §3A
+      // header-only asymmetry. The version row is constitutionally immutable
+      // post-sign (trg_chiefos_quote_versions_guard_immutable). LockQuote is
+      // a header-only state flip; version.status and version.locked_at are
+      // unchanged. ctx.versionLockedAt below is the sign-time timestamp,
+      // pass-through unchanged on this happy path.
+      status: 'signed',
+      project_title: ctx.projectTitle,
+      currency: ctx.currency,
+      total_cents: ctx.totalCents,
+      issued_at: ctx.versionIssuedAt,
+      sent_at: ctx.versionSentAt,
+      viewed_at: ctx.versionViewedAt,
+      signed_at: ctx.versionSignedAt,
+      locked_at: ctx.versionLockedAt,
+      server_hash: ctx.versionServerHash,
+    },
+    meta: {
+      already_existed: alreadyExisted,
+      events_emitted: eventsEmitted,
+      correlation_id: correlationId,
+      traceId,
+    },
+  };
+}
+
+/**
+ * alreadyLockedReturnShape — prior-state envelope for two handler paths:
+ *   - Pre-txn status routing: quote already in 'locked' state (Step 5)
+ *   - Post-rollback re-read: concurrent transition between Step 4's load
+ *     and Step 6's markQuoteLocked rowcount=0 (§17.23 recovery half)
+ *
+ * Shape is IDENTICAL regardless of which path invoked it — composer is
+ * caller-oblivious (parallel to alreadyViewedReturnShape posture).
+ *
+ * Same 3-entity shape as buildLockQuoteReturnShape. Differences:
+ *   - quote.status / version.status from ctx (not hardcoded — proves the
+ *     composer reads ctx, doesn't pin a literal). Expected: quote.status
+ *     'locked', version.status 'signed' (per §3A asymmetry — version row
+ *     is immutable post-sign).
+ *   - quote.updated_at = ctx.headerUpdatedAt (no fresh bump; no write
+ *     occurred on this call).
+ *   - version.locked_at = ctx.versionLockedAt (sign-time timestamp,
+ *     UNCHANGED post-lock per §3A; version row was never touched by
+ *     LockQuote — its locked_at is whatever SignQuote set).
+ *   - meta.already_existed: true (hardcoded — always true on this path).
+ *   - meta.events_emitted: [] (hardcoded — no emission on this path).
+ *   - meta.correlation_id: null (§17.21 retry-path limitation — no
+ *     LockQuote-owned row on the prior state to recover the original
+ *     invocation's correlation_id from).
+ */
+function alreadyLockedReturnShape({ ctx, traceId }) {
+  return {
+    ok: true,
+    quote: {
+      id: ctx.quoteId,
+      human_id: ctx.humanId,
+      status: ctx.quoteStatus,
+      job_id: ctx.jobId,
+      customer_id: ctx.customerId,
+      current_version_id: ctx.currentVersionId,
+      created_at: ctx.headerCreatedAt,
+      updated_at: ctx.headerUpdatedAt,
+    },
+    version: {
+      id: ctx.versionId,
+      version_no: ctx.versionNo,
+      status: ctx.versionStatus,
+      project_title: ctx.projectTitle,
+      currency: ctx.currency,
+      total_cents: ctx.totalCents,
+      issued_at: ctx.versionIssuedAt,
+      sent_at: ctx.versionSentAt,
+      viewed_at: ctx.versionViewedAt,
+      signed_at: ctx.versionSignedAt,
+      locked_at: ctx.versionLockedAt,
+      server_hash: ctx.versionServerHash,
+    },
+    meta: {
+      already_existed: true,
+      events_emitted: [],
+      correlation_id: null,
+      traceId,
+    },
+  };
+}
+
+/**
+ * handleLockQuote — applies a LockQuote CIL idiom.
+ *
+ * Sequence:
+ *   Step 0. Ctx preflight (owner_id, traceId required per §17.17 addendum 2)
+ *   Step 1. Zod validation (LockQuoteCILZ.safeParse)
+ *   Step 2. NO plan gating — see inline rationale comment below
+ *   Step 3. correlation_id = crypto.randomUUID() (§17.21 wired from day one)
+ *   Step 4. loadLockContext (pre-txn); CilIntegrityError → errEnvelope
+ *           (loader handles QUOTE_NOT_SIGNED / QUOTE_VOIDED /
+ *            QUOTE_NOT_FOUND_OR_CROSS_OWNER routing per its switch)
+ *   Step 5. Pre-txn state routing: locked → alreadyLockedReturnShape
+ *           (no txn); signed → proceed to Step 6
+ *   Step 6. pg.withClient transaction:
+ *             - markQuoteLocked; transitioned:false → concurrent-transition
+ *               signal (rowcount=0 on header UPDATE)
+ *             - emitLifecycleLocked with correlationId + sourceMsgId echo
+ *   Step 7a. Concurrent-transition re-read (§17.23 recovery half):
+ *            re-invoke loadLockContext; return alreadyLockedReturnShape
+ *            from fresh state. Re-read wrapped in its own try/catch — a
+ *            concurrent VoidQuote between Step 4's load and Step 6's
+ *            markQuoteLocked rowcount=0 makes the re-read throw QUOTE_VOIDED.
+ *   Step 7b. Happy path: buildLockQuoteReturnShape with
+ *            events_emitted=['lifecycle.locked'].
+ *
+ * Dual-actor (owner|system): both paths reach the same state-transition
+ * core (signed→locked header-only). Identity is upstream-resolved per
+ * Posture A (ctx.owner_id from portal session for owner; cron config for
+ * system). loadLockContext is actor-oblivious — no role branching.
+ */
+async function handleLockQuote(rawCil, ctx) {
+  // Step 0 — ctx preflight (§17.17 addendum 2)
+  if (!ctx || !ctx.owner_id) {
+    return errEnvelope({
+      code: 'OWNER_ID_MISSING',
+      message: 'ctx.owner_id is required',
+      hint: 'Upstream identity resolver must populate ctx.owner_id before applyCIL',
+      traceId: (ctx && ctx.traceId) || null,
+    });
+  }
+  if (!ctx.traceId) {
+    return errEnvelope({
+      code: 'TRACE_ID_MISSING',
+      message: 'ctx.traceId is required',
+      hint: 'Upstream request handler must populate ctx.traceId before applyCIL',
+      traceId: null,
+    });
+  }
+
+  // Step 1 — Zod validation
+  const parsed = LockQuoteCILZ.safeParse(rawCil);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const pathStr = issue && issue.path && issue.path.length ? issue.path.join('.') : '<root>';
+    return errEnvelope({
+      code: 'CIL_SCHEMA_INVALID',
+      message: issue ? `${pathStr}: ${issue.message}` : 'LockQuote input failed validation',
+      hint: 'See docs/QUOTES_SPINE_DECISIONS.md for the LockQuoteCILZ input contract',
+      traceId: ctx.traceId,
+    });
+  }
+  const data = parsed.data;
+
+  // Step 2 — NO plan gating.
+  //
+  // LockQuote is a lifecycle state transition on an already-created quote.
+  // Per G6 follow-through principle, creation consumes the plan gate;
+  // downstream lifecycle actions (send, sign, view, lock, void, reissue)
+  // are transitively gated via creation. This matches SendQuote, SignQuote,
+  // and ViewQuote posture — none apply plan gating for the same reason.
+  //
+  // If LockQuote develops independent gating semantics in Phase A.5+ (e.g.,
+  // if owner-initiated lock is distinguished from system-initiated cooling-
+  // period lock in a way that changes counter economics), formalize at the
+  // next-free §17.N slot.
+
+  // Step 3 — correlation_id (§17.21 wired from day one)
+  const correlationId = crypto.randomUUID();
+
+  // Step 4 — loadLockContext (pre-txn)
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  let lockCtx;
+  try {
+    lockCtx = await loadLockContext({
+      pg,
+      tenantId: data.tenant_id,
+      ownerId: ctx.owner_id,
+      quoteRef: data.quote_ref,
+    });
+  } catch (loadErr) {
+    if (loadErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: loadErr.code,
+        message: loadErr.message,
+        hint: loadErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw loadErr;  // non-CIL errors propagate for 500-class
+  }
+
+  // Step 5 — pre-txn state routing.
+  // Locked is the legitimate idempotent path; return prior-state shape
+  // without opening a transaction. (Other states already threw inside
+  // loadLockContext per its fail-closed switch.)
+  if (lockCtx.quoteStatus === 'locked') {
+    return alreadyLockedReturnShape({ ctx: lockCtx, traceId: ctx.traceId });
+  }
+
+  // Step 6 — transaction body
+  const actorSource = CIL_TO_EVENT_ACTOR_SOURCE[data.source];  // 'system' → 'system'
+  let txnResult;
+  try {
+    txnResult = await pg.withClient(async (client) => {
+      const markResult = await markQuoteLocked(client, {
+        quoteId: lockCtx.quoteId,
+        tenantId: lockCtx.tenantId,
+        ownerId: lockCtx.ownerId,
+      });
+      if (!markResult.transitioned) {
+        return { concurrentTransition: true };
+      }
+      await emitLifecycleLocked(client, {
+        quoteId: lockCtx.quoteId,
+        versionId: lockCtx.versionId,
+        tenantId: lockCtx.tenantId,
+        ownerId: lockCtx.ownerId,
+        actorSource,
+        actorUserId: data.actor.actor_id,
+        emittedAt: data.occurred_at,
+        customerId: lockCtx.customerId,
+        correlationId,
+        sourceMsgId: data.source_msg_id,
+      });
+      return { markResult, concurrentTransition: false };
+    });
+  } catch (txnErr) {
+    if (txnErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: txnErr.code,
+        message: txnErr.message,
+        hint: txnErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw txnErr;  // 500-class; no classifyCilError branch (state-driven
+                   // idempotency — no INSERT with 23505 surface per §17.23)
+  }
+
+  // Step 7a — concurrent-transition re-read (§17.23 recovery half)
+  if (txnResult.concurrentTransition) {
+    let freshCtx;
+    try {
+      freshCtx = await loadLockContext({
+        pg,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        quoteRef: data.quote_ref,
+      });
+    } catch (reReadErr) {
+      // A concurrent VoidQuote between Step 4's load and Step 6's
+      // markQuoteLocked rowcount=0 will make this re-read throw
+      // QUOTE_VOIDED. Must wrap and route — unwrapped, it becomes 500-class.
+      if (reReadErr instanceof CilIntegrityError) {
+        return errEnvelope({
+          code: reReadErr.code,
+          message: reReadErr.message,
+          hint: reReadErr.hint,
+          traceId: ctx.traceId,
+        });
+      }
+      throw reReadErr;
+    }
+    return alreadyLockedReturnShape({ ctx: freshCtx, traceId: ctx.traceId });
+  }
+
+  // Step 7b — happy path
+  return buildLockQuoteReturnShape({
+    ctx: lockCtx,
+    markResult: txnResult.markResult,
+    correlationId,
+    eventsEmitted: ['lifecycle.locked'],
+    alreadyExisted: false,
+    traceId: ctx.traceId,
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4254,6 +4577,7 @@ module.exports = {
   handleSendQuote,
   handleSignQuote,
   handleViewQuote,
+  handleLockQuote,
   CreateQuoteCILZ,
   SendQuoteCILZ,
   // Test-only internals. Not part of the handler's public contract. External
@@ -4353,6 +4677,9 @@ module.exports = {
     // LockQuote Section 3 (transaction-body helpers)
     markQuoteLocked,
     emitLifecycleLocked,
+    // LockQuote §2 (return-shape composers; handler hoisted to top-level)
+    buildLockQuoteReturnShape,
+    alreadyLockedReturnShape,
   },
 };
 

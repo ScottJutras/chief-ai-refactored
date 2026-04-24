@@ -16,7 +16,9 @@
 // Load .env for local runs; no-op if dotenv or .env is absent.
 try { require('dotenv').config(); } catch (_) { /* dotenv optional at runtime */ }
 
-const { handleCreateQuote, handleSendQuote, _internals } = require('./quotes');
+const {
+  handleCreateQuote, handleSendQuote, handleLockQuote, _internals,
+} = require('./quotes');
 const { CilIntegrityError } = require('./utils');
 
 const {
@@ -7951,6 +7953,975 @@ describeIfDb('LockQuote — Section 3: emitLifecycleLocked (integration)', () =>
       await client.query('ROLLBACK').catch(() => {});
       client.release();
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 3 §2 tests: handleLockQuote + return-shape composers
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Three blocks:
+//   - Pre-BEGIN rejection (3 unit tests, no DB)
+//   - Block 1: handleLockQuote integration (10 tests, real DB)
+//   - Block 2: buildLockQuoteReturnShape composer unit (13 tests, no DB)
+//   - Block 3: alreadyLockedReturnShape composer unit (10 tests, no DB)
+
+const {
+  buildLockQuoteReturnShape: _blqrs,
+  alreadyLockedReturnShape: _alrs,
+} = _internals;
+
+describe('LockQuote — §2: handleLockQuote (pre-BEGIN rejection)', () => {
+  const VALID_LOCK_QUOTE_ID = '00000000-c5c5-c5c5-c5c5-000000000002';
+
+  function validLockCil(overrides = {}) {
+    return {
+      cil_version: '1.0',
+      type: 'LockQuote',
+      tenant_id: '00000000-c5c5-c5c5-c5c5-000000000001',
+      source: 'system',
+      source_msg_id: 'test-lock-prebegin-1',
+      actor: { role: 'system', actor_id: 'system:cooling-period-expiry' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      quote_ref: { quote_id: VALID_LOCK_QUOTE_ID },
+      ...overrides,
+    };
+  }
+
+  test('Test 1 — ctx missing owner_id → OWNER_ID_MISSING envelope', async () => {
+    const result = await handleLockQuote(validLockCil(), { traceId: 'trace-lq-pb-1' });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('OWNER_ID_MISSING');
+    expect(result.error.traceId).toBe('trace-lq-pb-1');
+  });
+
+  test('Test 2 — ctx missing traceId → TRACE_ID_MISSING envelope', async () => {
+    const result = await handleLockQuote(validLockCil(), { owner_id: '99999999999' });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('TRACE_ID_MISSING');
+    expect(result.error.traceId).toBeNull();
+  });
+
+  test('Test 3 — Zod failure (missing type) → CIL_SCHEMA_INVALID envelope', async () => {
+    const { type: _t, ...bad } = validLockCil();
+    const result = await handleLockQuote(bad, {
+      owner_id: '99999999999', traceId: 'trace-lq-pb-3',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('CIL_SCHEMA_INVALID');
+    expect(result.error.traceId).toBe('trace-lq-pb-3');
+  });
+});
+
+describeIfDb('LockQuote — §2: handleLockQuote (integration)', () => {
+  const LOCK_TENANT_ID = MISSION_TENANT_UUID;
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  // Seed a real signed quote at pool scope (no BEGIN/ROLLBACK — handleLockQuote
+  // opens its own pg.withClient transaction). Direct INSERT path via _internals
+  // helpers + manual UPDATE to flip header+version into signed state. Avoids
+  // the handleSignQuote dependency chain (signature upload, name match, etc.)
+  // since LockQuote tests only need the post-sign starting state.
+  async function seedSignedQuoteForLock({ pg, ownerId, tenantId, sourceMsgId }) {
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+
+    return pg.withClient(async (client) => {
+      const customerRow = await client.query(
+        `INSERT INTO public.customers (tenant_id, name, email, phone, address)
+         VALUES ($1, 'LockQuote Integration Customer', 'lock-test@chiefos.test', '+15195550299', '1 Test Way, London, ON')
+         RETURNING id`,
+        [tenantId]
+      );
+      const customerId = customerRow.rows[0].id;
+
+      const jobRow = await client.query(
+        `INSERT INTO public.jobs
+           (owner_id, job_no, job_name, name, active, start_date, status, created_at, updated_at)
+         VALUES ($1, $2, 'LockQuote Integration Job', 'LockQuote Integration Job',
+                 true, NOW(), 'active', NOW(), NOW())
+         RETURNING id`,
+        [ownerId, Math.floor(Math.random() * 9000) + 1000]
+      );
+      const jobId = jobRow.rows[0].id;
+
+      const seq = await pg.allocateNextDocCounter(tenantId, 'quote', client);
+      const humanId = `QT-2026-04-24-${String(seq).padStart(4, '0')}`;
+
+      const header = await _ihq(client, {
+        tenantId, ownerId, jobId, customerId,
+        humanId, source: 'whatsapp', sourceMsgId,
+      });
+      const version = await _ivq(client, {
+        quoteId: header.id, tenantId, ownerId,
+        data: {
+          project: { title: 'LockQuote Integration', scope: null },
+          currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+          warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+          warranty_template_ref: null, clauses_template_ref: null,
+        },
+        totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+        customerSnapshot: { name: 'LockQuote Integration Customer', email: 'lock-test@chiefos.test' },
+        tenantSnapshot: _cts(tenantId),
+      });
+      await _spv(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId, ownerId,
+      });
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status='signed', updated_at=NOW() WHERE id=$1`,
+        [header.id]
+      );
+      await client.query(
+        `UPDATE public.chiefos_quote_versions
+            SET status='signed', issued_at=NOW(), sent_at=NOW(),
+                signed_at=NOW(), locked_at=NOW(), server_hash=$2
+          WHERE id=$1`,
+        [version.id, 'a'.repeat(64)]
+      );
+      return { quoteId: header.id, versionId: version.id, humanId, customerId, jobId };
+    });
+  }
+
+  async function cleanupLockTest({ pg, ownerId, quoteId }) {
+    // chiefos_quote_events cannot be deleted (immutability trigger). Header
+    // can't be deleted (FK from events ON DELETE RESTRICT). Strategy:
+    // detach version pointer, delete line items, void header, delete user
+    // (cascade-friendly path). Best-effort throughout.
+    await pg.query(
+      `UPDATE public.chiefos_quotes SET current_version_id = NULL WHERE id = $1`,
+      [quoteId]
+    ).catch(() => {});
+    await pg.query(
+      `DELETE FROM public.chiefos_quote_line_items
+        WHERE quote_version_id IN
+              (SELECT id FROM public.chiefos_quote_versions WHERE quote_id = $1)`,
+      [quoteId]
+    ).catch(() => {});
+    // Header status flip to 'voided' is permitted on header (status column not
+    // guarded by trg_chiefos_quotes_guard_header_immutable).
+    await pg.query(
+      `UPDATE public.chiefos_quotes
+          SET status = 'voided', voided_at = NOW(),
+              voided_reason = 'test-cleanup', updated_at = NOW()
+        WHERE id = $1`,
+      [quoteId]
+    ).catch(() => {});
+    await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+  }
+
+  function buildLockCil({ tenantId, quoteRef, sourceMsgId, actor }) {
+    const cil = {
+      cil_version: '1.0',
+      type: 'LockQuote',
+      tenant_id: tenantId,
+      source: 'system',
+      actor: actor || { role: 'system', actor_id: 'system:cooling-period-expiry' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      quote_ref: quoteRef,
+    };
+    if (sourceMsgId !== undefined) cil.source_msg_id = sourceMsgId;
+    return cil;
+  }
+
+  test('Test 1 — Happy path: signed → locked + lifecycle.locked emitted + version untouched + §17.21 correlation_id wiring', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-lq-happy-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedSignedQuoteForLock({
+        pg, ownerId, tenantId: LOCK_TENANT_ID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      // Snapshot version state pre-call to assert §3A asymmetry below.
+      const versionBefore = await pg.query(
+        `SELECT status, locked_at, server_hash, signed_at
+           FROM public.chiefos_quote_versions WHERE id = $1`,
+        [seed.versionId]
+      );
+
+      const cil = buildLockCil({
+        tenantId: LOCK_TENANT_ID,
+        quoteRef: { quote_id: seed.quoteId },
+        sourceMsgId: `test-lq-happy-lock-${Date.now()}`,
+      });
+      const result = await handleLockQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-lq-happy',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.id).toBe(seed.quoteId);
+      expect(result.quote.status).toBe('locked');
+      expect(result.version.id).toBe(seed.versionId);
+      expect(result.version.status).toBe('signed');  // §3A asymmetry
+      expect(result.version.locked_at).not.toBeNull();
+      expect(result.version.server_hash).toBe('a'.repeat(64));
+      expect(result.meta.already_existed).toBe(false);
+      expect(result.meta.events_emitted).toEqual(['lifecycle.locked']);
+      expect(result.meta.correlation_id).toMatch(/^[0-9a-f-]{36}$/);
+      expect(result.meta.traceId).toBe('trace-lq-happy');
+
+      // §17.21 cross-event invariant: lifecycle.locked event row carries the
+      // SAME correlation_id surfaced in meta. Catches a regression where the
+      // helper defaults to null.
+      const eventRows = await pg.query(
+        `SELECT correlation_id FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.locked'`,
+        [seed.quoteId]
+      );
+      expect(eventRows.rows).toHaveLength(1);
+      expect(eventRows.rows[0].correlation_id).toBe(result.meta.correlation_id);
+
+      // §3A header-only asymmetry: version row UNTOUCHED (status, locked_at,
+      // server_hash, signed_at all unchanged). The DB trigger
+      // trg_chiefos_quote_versions_guard_immutable would reject any UPDATE
+      // attempt on a sign-locked version row, but this assertion catches a
+      // regression at test time with a clear diff.
+      const versionAfter = await pg.query(
+        `SELECT status, locked_at, server_hash, signed_at
+           FROM public.chiefos_quote_versions WHERE id = $1`,
+        [seed.versionId]
+      );
+      expect(versionAfter.rows[0].status).toBe('signed');
+      expect(versionAfter.rows[0].status).toBe(versionBefore.rows[0].status);
+      expect(versionAfter.rows[0].locked_at.toISOString())
+        .toBe(versionBefore.rows[0].locked_at.toISOString());
+      expect(versionAfter.rows[0].server_hash).toBe(versionBefore.rows[0].server_hash);
+      expect(versionAfter.rows[0].signed_at.toISOString())
+        .toBe(versionBefore.rows[0].signed_at.toISOString());
+
+      // Header DB state matches the return shape.
+      const headerAfter = await pg.query(
+        `SELECT status FROM public.chiefos_quotes WHERE id = $1`,
+        [seed.quoteId]
+      );
+      expect(headerAfter.rows[0].status).toBe('locked');
+    } finally {
+      if (quoteId) {
+        await cleanupLockTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 2 — Already-locked idempotency (pre-txn routing): returns alreadyLocked shape with correlation_id=null; uses human_id ref', async () => {
+    // Uses human_id branch of QuoteRefInputZ — exercises the at-least-one
+    // contract from a different angle than Test 1's quote_id branch.
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-lq-already-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedSignedQuoteForLock({
+        pg, ownerId, tenantId: LOCK_TENANT_ID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      // Pre-flip header to 'locked' (version stays 'signed' per §3A asymmetry).
+      await pg.query(
+        `UPDATE public.chiefos_quotes SET status='locked', updated_at=NOW() WHERE id=$1`,
+        [seed.quoteId]
+      );
+
+      const cil = buildLockCil({
+        tenantId: LOCK_TENANT_ID,
+        quoteRef: { human_id: seed.humanId },
+        sourceMsgId: `test-lq-already-lock-${Date.now()}`,
+      });
+      const result = await handleLockQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-lq-already',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.id).toBe(seed.quoteId);
+      expect(result.quote.status).toBe('locked');
+      expect(result.version.status).toBe('signed');  // §3A asymmetry
+      expect(result.meta.already_existed).toBe(true);
+      expect(result.meta.events_emitted).toEqual([]);
+      expect(result.meta.correlation_id).toBeNull();
+      expect(result.meta.traceId).toBe('trace-lq-already');
+
+      // No NEW lifecycle.locked event emitted on the prior-state path —
+      // handler bailed at Step 5 routing without opening a transaction.
+      const { rows } = await pg.query(
+        `SELECT COUNT(*)::int AS n FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.locked'`,
+        [seed.quoteId]
+      );
+      expect(rows[0].n).toBe(0);
+    } finally {
+      if (quoteId) {
+        await cleanupLockTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 3 — Concurrent-transition (§17.23 recovery): pg.withClient stub pre-flips header inside txn body; handler re-reads, returns alreadyLocked', async () => {
+    // Mirrors ViewQuote Test 9 pattern. Stub pg.withClient to flip header
+    // to 'locked' BEFORE markQuoteLocked runs inside the same transaction.
+    // markQuoteLocked sees status != 'signed' → rowcount=0 → handler bails
+    // through concurrentTransition signal → re-reads via loadLockContext
+    // (sees 'locked') → composes alreadyLockedReturnShape.
+    //
+    // §3A header-only asymmetry simplifies this vs. ViewQuote: only the
+    // header needs flipping. Version row stays 'signed' per §3A — the
+    // re-read's §17.22 invariant (locked + version.status='signed') passes.
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-lq-ct-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    const originalWithClient = pg.withClient;
+    try {
+      const seed = await seedSignedQuoteForLock({
+        pg, ownerId, tenantId: LOCK_TENANT_ID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      pg.withClient = async (body) => {
+        return originalWithClient.call(pg, async (client) => {
+          await client.query(
+            `UPDATE public.chiefos_quotes SET status='locked', updated_at=NOW()
+               WHERE id = $1 AND tenant_id = $2 AND owner_id = $3`,
+            [seed.quoteId, LOCK_TENANT_ID, ownerId]
+          );
+          return body(client);
+        });
+      };
+
+      const cil = buildLockCil({
+        tenantId: LOCK_TENANT_ID,
+        quoteRef: { quote_id: seed.quoteId },
+        sourceMsgId: `test-lq-ct-lock-${Date.now()}`,
+      });
+      const result = await handleLockQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-lq-ct',
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.status).toBe('locked');
+      expect(result.version.status).toBe('signed');  // §3A
+      expect(result.meta.already_existed).toBe(true);
+      expect(result.meta.events_emitted).toEqual([]);
+      expect(result.meta.correlation_id).toBeNull();
+
+      // No lifecycle.locked emission — handler bailed before reaching
+      // emitLifecycleLocked.
+      const { rows } = await pg.query(
+        `SELECT COUNT(*)::int AS n FROM public.chiefos_quote_events
+          WHERE quote_id = $1 AND kind = 'lifecycle.locked'`,
+        [seed.quoteId]
+      );
+      expect(rows[0].n).toBe(0);
+    } finally {
+      pg.withClient = originalWithClient;
+      if (quoteId) {
+        await cleanupLockTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test.each(['draft', 'sent', 'viewed'])(
+    'Tests 4-6 — Wrong-state rejection (%s) → QUOTE_NOT_SIGNED errEnvelope',
+    async (status) => {
+      const pg = require('../../services/postgres');
+      const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+      const seedMsgId = `test-lq-wrong-${status}-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+      let quoteId;
+      try {
+        // Seed a signed quote, then flip BACK to the wrong-state target. We
+        // can't directly seed draft/sent/viewed via the same helper because
+        // the helper's UPDATE on chiefos_quote_versions requires a non-locked
+        // version row to mutate. Approach: seed signed, then bypass the
+        // version immutability trigger by disabling it for the cleanup-style
+        // flip — but simpler is to seed FRESH (no signing flip) per state.
+        await pg.query(
+          `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+           VALUES ($1, 'starter', 'active', NOW())`,
+          [ownerId]
+        );
+        const seed = await pg.withClient(async (client) => {
+          const customerRow = await client.query(
+            `INSERT INTO public.customers (tenant_id, name, email, phone, address)
+             VALUES ($1, 'LockQuote Wrong-State Customer', 'lock-wrong@chiefos.test', '+15195550298', '1 Test Way')
+             RETURNING id`,
+            [LOCK_TENANT_ID]
+          );
+          const customerId = customerRow.rows[0].id;
+          const jobRow = await client.query(
+            `INSERT INTO public.jobs
+               (owner_id, job_no, job_name, name, active, start_date, status, created_at, updated_at)
+             VALUES ($1, $2, 'LockQuote Wrong-State Job', 'LockQuote Wrong-State Job',
+                     true, NOW(), 'active', NOW(), NOW())
+             RETURNING id`,
+            [ownerId, Math.floor(Math.random() * 9000) + 1000]
+          );
+          const jobId = jobRow.rows[0].id;
+          const seq = await pg.allocateNextDocCounter(LOCK_TENANT_ID, 'quote', client);
+          const humanId = `QT-2026-04-24-${String(seq).padStart(4, '0')}`;
+          const header = await _ihq(client, {
+            tenantId: LOCK_TENANT_ID, ownerId, jobId, customerId,
+            humanId, source: 'whatsapp', sourceMsgId: seedMsgId,
+          });
+          const version = await _ivq(client, {
+            quoteId: header.id, tenantId: LOCK_TENANT_ID, ownerId,
+            data: {
+              project: { title: 'Wrong-state', scope: null },
+              currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+              warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+              warranty_template_ref: null, clauses_template_ref: null,
+            },
+            totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+            customerSnapshot: { name: 'LockQuote Wrong-State Customer', email: 'lock-wrong@chiefos.test' },
+            tenantSnapshot: _cts(LOCK_TENANT_ID),
+          });
+          await _spv(client, {
+            quoteId: header.id, versionId: version.id,
+            tenantId: LOCK_TENANT_ID, ownerId,
+          });
+          // For non-draft states, flip both rows. locked_at stays NULL on
+          // pre-signed states (satisfies chiefos_qv_status_locked_consistency).
+          if (status !== 'draft') {
+            await client.query(
+              `UPDATE public.chiefos_quotes SET status=$2, updated_at=NOW() WHERE id=$1`,
+              [header.id, status]
+            );
+            await client.query(
+              `UPDATE public.chiefos_quote_versions SET status=$2, issued_at=NOW(), sent_at=NOW() WHERE id=$1`,
+              [version.id, status]
+            );
+          }
+          return { quoteId: header.id, versionId: version.id };
+        });
+        quoteId = seed.quoteId;
+
+        const cil = buildLockCil({
+          tenantId: LOCK_TENANT_ID,
+          quoteRef: { quote_id: seed.quoteId },
+          sourceMsgId: `test-lq-wrong-${status}-lock-${Date.now()}`,
+        });
+        const result = await handleLockQuote(cil, {
+          owner_id: ownerId, traceId: `trace-lq-wrong-${status}`,
+        });
+
+        expect(result.ok).toBe(false);
+        expect(result.error.code).toBe('QUOTE_NOT_SIGNED');
+        expect(result.error.traceId).toBe(`trace-lq-wrong-${status}`);
+      } finally {
+        if (quoteId) {
+          await cleanupLockTest({ pg, ownerId, quoteId });
+        } else {
+          await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+        }
+      }
+    },
+    30000
+  );
+
+  test('Test 7 — Wrong-state rejection (voided) → QUOTE_VOIDED errEnvelope', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-lq-voided-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedSignedQuoteForLock({
+        pg, ownerId, tenantId: LOCK_TENANT_ID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      // Void the header. Voiding is header-only; version stays 'signed' per
+      // §3A. loadLockContext's switch on quote_status='voided' throws
+      // QUOTE_VOIDED before any version-level invariant check.
+      await pg.query(
+        `UPDATE public.chiefos_quotes
+            SET status='voided', voided_at=NOW(), voided_reason='test',
+                updated_at=NOW()
+          WHERE id=$1`,
+        [seed.quoteId]
+      );
+
+      const cil = buildLockCil({
+        tenantId: LOCK_TENANT_ID,
+        quoteRef: { quote_id: seed.quoteId },
+        sourceMsgId: `test-lq-voided-lock-${Date.now()}`,
+      });
+      const result = await handleLockQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-lq-voided',
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTE_VOIDED');
+      expect(result.error.traceId).toBe('trace-lq-voided');
+    } finally {
+      if (quoteId) {
+        await cleanupLockTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 8 — Cross-tenant fail-closed → QUOTE_NOT_FOUND_OR_CROSS_OWNER (unified per §17.17 addendum 3)', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-lq-xtenant-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedSignedQuoteForLock({
+        pg, ownerId, tenantId: LOCK_TENANT_ID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      const cil = buildLockCil({
+        tenantId: FOREST_CITY_TENANT_UUID,  // wrong tenant
+        quoteRef: { quote_id: seed.quoteId },
+        sourceMsgId: `test-lq-xtenant-lock-${Date.now()}`,
+      });
+      const result = await handleLockQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-lq-xtenant',
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTE_NOT_FOUND_OR_CROSS_OWNER');
+      expect(result.error.traceId).toBe('trace-lq-xtenant');
+    } finally {
+      if (quoteId) {
+        await cleanupLockTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 9 — Cross-owner fail-closed → QUOTE_NOT_FOUND_OR_CROSS_OWNER (prevents system-cron drift)', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const wrongOwnerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-lq-xowner-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedSignedQuoteForLock({
+        pg, ownerId, tenantId: LOCK_TENANT_ID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      const cil = buildLockCil({
+        tenantId: LOCK_TENANT_ID,
+        quoteRef: { quote_id: seed.quoteId },
+        sourceMsgId: `test-lq-xowner-lock-${Date.now()}`,
+      });
+      const result = await handleLockQuote(cil, {
+        owner_id: wrongOwnerId,  // wrong owner, same tenant
+        traceId: 'trace-lq-xowner',
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTE_NOT_FOUND_OR_CROSS_OWNER');
+      expect(result.error.traceId).toBe('trace-lq-xowner');
+    } finally {
+      if (quoteId) {
+        await cleanupLockTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 10 — Version-shape regression guard: happy-path return.version has exactly 12 expected keys', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-lq-shape-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedSignedQuoteForLock({
+        pg, ownerId, tenantId: LOCK_TENANT_ID, sourceMsgId: seedMsgId,
+      });
+      quoteId = seed.quoteId;
+
+      const cil = buildLockCil({
+        tenantId: LOCK_TENANT_ID,
+        quoteRef: { quote_id: seed.quoteId },
+        sourceMsgId: `test-lq-shape-lock-${Date.now()}`,
+      });
+      const result = await handleLockQuote(cil, {
+        owner_id: ownerId, traceId: 'trace-lq-shape',
+      });
+      expect(result.ok).toBe(true);
+
+      // Changing this set is a return-shape contract change. Sorted for
+      // deterministic diff.
+      expect(Object.keys(result.version).sort()).toEqual([
+        'currency',
+        'id',
+        'issued_at',
+        'locked_at',
+        'project_title',
+        'sent_at',
+        'server_hash',
+        'signed_at',
+        'status',
+        'total_cents',
+        'version_no',
+        'viewed_at',
+      ]);
+      // 3-entity shape regression: NO share_token entity (LockQuote is
+      // system-only in Phase A; no customer surface).
+      expect(result).not.toHaveProperty('share_token');
+    } finally {
+      if (quoteId) {
+        await cleanupLockTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LockQuote — §2 Block 2: buildLockQuoteReturnShape (happy-path composer)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Pure unit tests — no DB. Mirrors ViewQuote Section 5 Block 1 structure.
+// Fixture identity constants below are NOT real DB UUIDs; only the
+// composer's pure transformation logic is under test.
+
+const S2L_TENANT  = '00000000-c5c5-c5c5-c5c5-000000000001';
+const S2L_OWNER   = '00000000000';
+const S2L_QUOTE   = '00000000-c5c5-c5c5-c5c5-000000000010';
+const S2L_VERSION = '00000000-c5c5-c5c5-c5c5-000000000011';
+const S2L_JOB_ID  = 5001;
+const S2L_CUSTOMER_ID = '00000000-c5c5-c5c5-c5c5-000000000012';
+
+describe('LockQuote — §2 Block 2: buildLockQuoteReturnShape (happy-path composer)', () => {
+  // loadLockContext-shaped ctx for the happy-path composer's input. Mirrors
+  // Section 2's ~22-field return. quoteStatus='signed' is the pre-txn state
+  // (handler transitions to 'locked' via markQuoteLocked); composer hardcodes
+  // 'locked' on the quote entity output regardless of ctx value.
+  function signedCtx(overrides = {}) {
+    return {
+      tenantId: S2L_TENANT,
+      ownerId: S2L_OWNER,
+      quoteId: S2L_QUOTE,
+      humanId: 'QT-2026-04-24-LOCK',
+      quoteStatus: 'signed',  // pre-txn; happy-path composer ignores
+      jobId: S2L_JOB_ID,
+      customerId: S2L_CUSTOMER_ID,
+      currentVersionId: S2L_VERSION,
+      headerCreatedAt: new Date('2026-04-21T09:00:00Z'),
+      headerUpdatedAt: new Date('2026-04-22T12:00:00Z'),  // pre-bump (stale)
+      versionId: S2L_VERSION,
+      versionNo: 1,
+      versionStatus: 'signed',  // happy-path composer ignores; hardcoded 'signed'
+      projectTitle: 'Block 2 Unit Test Project',
+      currency: 'CAD',
+      totalCents: 11300,
+      customerSnapshot: { name: 'Block 2 Customer' },
+      versionIssuedAt: new Date('2026-04-21T10:00:00Z'),
+      versionSentAt: new Date('2026-04-21T11:00:00Z'),
+      versionViewedAt: new Date('2026-04-22T10:00:00Z'),
+      versionSignedAt: new Date('2026-04-22T12:00:00Z'),
+      versionLockedAt: new Date('2026-04-22T12:00:00Z'),  // sign-time; pass-through
+      versionServerHash: 'a'.repeat(64),
+      ...overrides,
+    };
+  }
+
+  function markResultFixture(overrides = {}) {
+    return {
+      transitioned: true,
+      quoteUpdatedAt: new Date('2026-04-23T14:30:00Z'),  // fresh bump
+      ...overrides,
+    };
+  }
+
+  function baseInputs(overrides = {}) {
+    return {
+      ctx: signedCtx(),
+      markResult: markResultFixture(),
+      correlationId: '00000000-aaaa-bbbb-cccc-000000000010',
+      eventsEmitted: ['lifecycle.locked'],
+      alreadyExisted: false,
+      traceId: 'trace-s2l-1',
+      ...overrides,
+    };
+  }
+
+  it('Test 1 — ok:true present on happy-path output', () => {
+    expect(_blqrs(baseInputs()).ok).toBe(true);
+  });
+
+  it('Test 2 — 3 entities present (quote, version, meta) — NO share_token entity', () => {
+    const shape = _blqrs(baseInputs());
+    expect(shape).toHaveProperty('quote');
+    expect(shape).toHaveProperty('version');
+    expect(shape).toHaveProperty('meta');
+    expect(shape).not.toHaveProperty('share_token');
+  });
+
+  it('Test 3 — meta.correlation_id matches input correlationId', () => {
+    expect(_blqrs(baseInputs()).meta.correlation_id)
+      .toBe('00000000-aaaa-bbbb-cccc-000000000010');
+  });
+
+  it('Test 4 — meta.already_existed = false (passed through from input)', () => {
+    expect(_blqrs(baseInputs()).meta.already_existed).toBe(false);
+  });
+
+  it("Test 5 — meta.events_emitted = ['lifecycle.locked'] (passed through from input)", () => {
+    expect(_blqrs(baseInputs()).meta.events_emitted).toEqual(['lifecycle.locked']);
+  });
+
+  it('Test 6 — meta.traceId matches input', () => {
+    expect(_blqrs(baseInputs({ traceId: 'trace-s2l-6' })).meta.traceId).toBe('trace-s2l-6');
+  });
+
+  it("Test 7 — quote.status hardcoded to 'locked' (composer does not read ctx.quoteStatus)", () => {
+    // Regression guard: even if ctx carries an unexpected status, the
+    // happy-path composer must emit 'locked'. Step 5 routing prevents this
+    // composer from being invoked unless ctx.quoteStatus === 'signed', but
+    // the composer should not depend on that (separation of concerns).
+    const shape = _blqrs(baseInputs({ ctx: signedCtx({ quoteStatus: 'DRIFT_SHOULD_NOT_LEAK' }) }));
+    expect(shape.quote.status).toBe('locked');
+  });
+
+  it('Test 8 — quote.updated_at from markResult.quoteUpdatedAt (fresh bump), NOT ctx.headerUpdatedAt', () => {
+    const freshBump = new Date('2026-04-23T14:30:00Z');
+    const staleCtx = new Date('2026-04-22T12:00:00Z');
+    const shape = _blqrs(baseInputs({
+      ctx: signedCtx({ headerUpdatedAt: staleCtx }),
+      markResult: markResultFixture({ quoteUpdatedAt: freshBump }),
+    }));
+    expect(shape.quote.updated_at).toEqual(freshBump);
+    expect(shape.quote.updated_at).not.toEqual(staleCtx);
+  });
+
+  it("Test 9 — version.status hardcoded to 'signed' (§3A header-only asymmetry — version row is post-sign immutable)", () => {
+    // §3A asymmetry locks this contract: LockQuote does NOT touch the
+    // version row, so version.status remains 'signed' even though the
+    // quote header is now 'locked'. trg_chiefos_quote_versions_guard_immutable
+    // would reject any UPDATE attempt at runtime; this test catches the
+    // regression at composer level.
+    const shape = _blqrs(baseInputs({ ctx: signedCtx({ versionStatus: 'DRIFT_SHOULD_NOT_LEAK' }) }));
+    expect(shape.version.status).toBe('signed');
+  });
+
+  it('Test 10 — version.locked_at from ctx.versionLockedAt (sign-time pass-through, NOT fresh)', () => {
+    // §3A asymmetry corollary: locked_at is the sign-time timestamp from
+    // updateVersionLocked at SignQuote time. LockQuote does not produce a
+    // new locked_at; the composer reads from ctx unchanged. If a refactor
+    // ever sourced this from markResult, downstream consumers would see a
+    // post-lock bump that doesn't match the version row's actual locked_at.
+    const signTime = new Date('2026-04-22T12:00:00Z');
+    const shape = _blqrs(baseInputs({
+      ctx: signedCtx({ versionLockedAt: signTime }),
+    }));
+    expect(shape.version.locked_at).toEqual(signTime);
+  });
+
+  it('Test 11 — version.signed_at and server_hash pass-through from ctx', () => {
+    const signedAt = new Date('2026-04-22T12:00:00Z');
+    const serverHash = 'b'.repeat(64);
+    const shape = _blqrs(baseInputs({
+      ctx: signedCtx({ versionSignedAt: signedAt, versionServerHash: serverHash }),
+    }));
+    expect(shape.version.signed_at).toEqual(signedAt);
+    expect(shape.version.server_hash).toBe(serverHash);
+  });
+
+  it('Test 12 — quote entity has exactly 8 expected keys (exact-key-match regression lock)', () => {
+    const shape = _blqrs(baseInputs());
+    expect(Object.keys(shape.quote).sort()).toEqual([
+      'created_at',
+      'current_version_id',
+      'customer_id',
+      'human_id',
+      'id',
+      'job_id',
+      'status',
+      'updated_at',
+    ]);
+  });
+
+  it('Test 13 — version entity has exactly 12 expected keys (exact-key-match regression lock; matches ViewQuote shape)', () => {
+    const shape = _blqrs(baseInputs());
+    expect(Object.keys(shape.version).sort()).toEqual([
+      'currency',
+      'id',
+      'issued_at',
+      'locked_at',
+      'project_title',
+      'sent_at',
+      'server_hash',
+      'signed_at',
+      'status',
+      'total_cents',
+      'version_no',
+      'viewed_at',
+    ]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LockQuote — §2 Block 3: alreadyLockedReturnShape (prior-state composer)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// This composer serves two handler paths:
+//   1. Pre-txn routing when quoteStatus === 'locked' (Step 5)
+//   2. Post-rollback re-read after concurrent transition (Step 7a)
+// Shape is IDENTICAL regardless of which path invoked it — composer is
+// caller-oblivious, mirroring alreadyViewedReturnShape's posture.
+
+describe('LockQuote — §2 Block 3: alreadyLockedReturnShape (prior-state composer)', () => {
+  // loadLockContext-shaped ctx representing pre-existing locked state.
+  // quoteStatus='locked'; versionStatus='signed' per §3A asymmetry (the
+  // version row was NOT flipped by the original LockQuote — it stays
+  // signed forever post-sign).
+  function lockedCtx(overrides = {}) {
+    return {
+      tenantId: S2L_TENANT,
+      ownerId: S2L_OWNER,
+      quoteId: S2L_QUOTE,
+      humanId: 'QT-2026-04-24-LOCK',
+      quoteStatus: 'locked',
+      jobId: S2L_JOB_ID,
+      customerId: S2L_CUSTOMER_ID,
+      currentVersionId: S2L_VERSION,
+      headerCreatedAt: new Date('2026-04-21T09:00:00Z'),
+      headerUpdatedAt: new Date('2026-04-23T14:30:00Z'),  // post-original-lock; no fresh bump this call
+      versionId: S2L_VERSION,
+      versionNo: 1,
+      versionStatus: 'signed',  // §3A: unchanged post-lock
+      projectTitle: 'Block 3 Prior-State Test',
+      currency: 'CAD',
+      totalCents: 11300,
+      customerSnapshot: { name: 'Block 3 Customer' },
+      versionIssuedAt: new Date('2026-04-21T10:00:00Z'),
+      versionSentAt: new Date('2026-04-21T11:00:00Z'),
+      versionViewedAt: new Date('2026-04-22T10:00:00Z'),
+      versionSignedAt: new Date('2026-04-22T12:00:00Z'),
+      versionLockedAt: new Date('2026-04-22T12:00:00Z'),  // sign-time, immutable
+      versionServerHash: 'a'.repeat(64),
+      ...overrides,
+    };
+  }
+
+  it('Test 1 — ok:true present', () => {
+    expect(_alrs({ ctx: lockedCtx(), traceId: 't' }).ok).toBe(true);
+  });
+
+  it('Test 2 — 3 entities present (quote, version, meta) — NO share_token entity', () => {
+    const shape = _alrs({ ctx: lockedCtx(), traceId: 't' });
+    expect(shape).toHaveProperty('quote');
+    expect(shape).toHaveProperty('version');
+    expect(shape).toHaveProperty('meta');
+    expect(shape).not.toHaveProperty('share_token');
+  });
+
+  it('Test 3 — meta.correlation_id = null (hardcoded — §17.21 retry-path limitation)', () => {
+    // No LockQuote-owned row on the prior state to recover the original
+    // invocation's correlation_id from. Hardcoded null is the contract.
+    // Composer signature has no correlationId param — by design.
+    expect(_alrs({ ctx: lockedCtx(), traceId: 't' }).meta.correlation_id).toBeNull();
+  });
+
+  it('Test 4 — meta.already_existed = true (hardcoded)', () => {
+    expect(_alrs({ ctx: lockedCtx(), traceId: 't' }).meta.already_existed).toBe(true);
+  });
+
+  it('Test 5 — meta.events_emitted = [] (hardcoded — no emission on prior-state path)', () => {
+    expect(_alrs({ ctx: lockedCtx(), traceId: 't' }).meta.events_emitted).toEqual([]);
+  });
+
+  it('Test 6 — meta.traceId matches input', () => {
+    expect(_alrs({ ctx: lockedCtx(), traceId: 'trace-alrs-6' }).meta.traceId).toBe('trace-alrs-6');
+  });
+
+  it('Test 7 — quote.status from ctx (NOT hardcoded — proves composer reads ctx, not a literal)', () => {
+    // Distinguishing-value guard: if ctx carries an unexpected status, the
+    // composer must surface it (handler's Step 5 ensures it's 'locked' in
+    // production, but the composer itself shouldn't pin a literal). Mirrors
+    // alreadyViewedReturnShape Test 10.
+    const shape = _alrs({ ctx: lockedCtx({ quoteStatus: 'CTX_VALUE' }), traceId: 't' });
+    expect(shape.quote.status).toBe('CTX_VALUE');
+  });
+
+  it('Test 8 — quote.updated_at from ctx.headerUpdatedAt (no fresh bump — proves no markResult shape leak)', () => {
+    // Prior-state path performs no header UPDATE; updated_at must be the
+    // pre-existing ctx value, not a markResult-style fresh timestamp.
+    const ctx = lockedCtx();
+    const shape = _alrs({ ctx, traceId: 't' });
+    expect(shape.quote.updated_at).toEqual(ctx.headerUpdatedAt);
+  });
+
+  it("Test 9 — version.status from ctx.versionStatus (expected 'signed' per §3A; defensive non-null + Date instanceof on locked_at)", () => {
+    // Hardening per ViewQuote Test 11 pattern: assert BOTH ctx-match AND
+    // real-timestamp type for the §3A-critical fields. If a corrupted
+    // prior-state ctx ever carries version.versionStatus 'locked' (which
+    // would itself be a §17.22 invariant violation that loadLockContext
+    // would have already thrown on), this composer's output would silently
+    // pass the bad value through — defensive type checks fail loudly.
+    const ctx = lockedCtx();
+    const shape = _alrs({ ctx, traceId: 't' });
+    expect(shape.version.status).toBe('signed');  // §3A asymmetry — version stays signed
+    expect(shape.version.status).toBe(ctx.versionStatus);
+    expect(shape.version.locked_at).not.toBeNull();
+    expect(shape.version.locked_at).toBeInstanceOf(Date);
+    expect(shape.version.locked_at).toEqual(ctx.versionLockedAt);
+  });
+
+  it('Test 10 — version entity has exactly 12 expected keys (same shape as happy-path composer; caller-path-oblivious)', () => {
+    // Locks shape identity across buildLockQuoteReturnShape and
+    // alreadyLockedReturnShape. Both emit the same 12-key version entity
+    // — if they drift, consumers parsing `result.version` break on the
+    // prior-state path without warning.
+    const shape = _alrs({ ctx: lockedCtx(), traceId: 't' });
+    expect(Object.keys(shape.version).sort()).toEqual([
+      'currency',
+      'id',
+      'issued_at',
+      'locked_at',
+      'project_title',
+      'sent_at',
+      'server_hash',
+      'signed_at',
+      'status',
+      'total_cents',
+      'version_no',
+      'viewed_at',
+    ]);
   });
 });
 

@@ -72,12 +72,13 @@ Full lineage: `git log --oneline -15`.
 
 ## 3. Phase plan — Path B locked
 
-**Phase sequence** (decided 2026-04-22, unchanged):
+**Phase sequence** (decided 2026-04-22; amended 2026-04-23 to add A.5):
 
 | Phase | Scope |
 |---|---|
-| **A** | Quote spine — five CIL handlers. **Current.** |
-| **B** | Quote editing (draft only; sent use ReissueQuote) + tenant logos + template system (`chiefos_quote_templates` table) + warranty/payment structured fields + line-item polymorphic source_type (§6.1) |
+| **A** | Quote spine — five CIL handlers (handler-spine only; internal CIL dispatch coverage). **Current.** |
+| **A.5** | Quote surface parity sprint — fuzzy quote resolver (shared), WhatsApp commands (`/lock`, `/void`, `/reissue`, retrofit `/send` if needed), portal quote detail view, portal action API endpoints. Widens source enums to `['portal', 'whatsapp', 'system']` across all Quote-spine handlers. Estimated 3–4 sessions. Closes parity-as-principle for Quote spine: every handler has a human dispatch surface parallel to its internal CIL dispatch. |
+| **B** | Quote editing (draft only; sent use ReissueQuote) + tenant logos + template system (`chiefos_quote_templates` table) + warranty/payment structured fields + line-item polymorphic source_type (§6.1). Opens post-A.5. |
 | **C** | Leads spine (pre-quote capture + qualification) |
 | **D** | Deposit receipts + payment tracking (first wiring into `public.transactions`) |
 | **E** | Change Orders spine (separate 6-table spine mirroring Quote — see §6.2; not fold-in) |
@@ -390,6 +391,13 @@ fields + line-item polymorphic source_type. **Explicit decision on Phase
 B opening order still required** (which sub-item ships first vs. second,
 whether template system blocks quote editing, etc.). Not blocking
 Phase A close.
+
+**Phase B opens post-A.5, not post-A** (amended 2026-04-23). The A.5
+parity sprint lands between handler-spine close and Phase B. Rationale:
+handlers with only internal CIL dispatch aren't user-visible, so Phase B
+product work against them would be building on top of a surface-less
+substrate. Parity-as-principle (every handler has a human dispatch
+surface before product expansion) is the gating discipline for Phase B.
 
 ### 8.4 End-to-end test suite
 

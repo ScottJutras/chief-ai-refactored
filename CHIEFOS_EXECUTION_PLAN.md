@@ -155,6 +155,36 @@ quote-spine handler sessions.
 
 Preserves the architectural discipline: revise principles after the
 handler family exercises them, not before.
+
+#### Phase A.5 — Quote Surface Parity Sprint (between handler spine and Phase B)
+
+Named phase bridging handler-spine completion (Phase A close) and Phase
+B opening. Closes parity-as-principle for Quote spine: every handler has
+a human dispatch surface parallel to its internal CIL dispatch before
+product work builds on top of it.
+
+**Scope:**
+- Fuzzy quote resolver (shared helper — WhatsApp and portal both reach
+  quotes by `QT-…` human_id, project-title fragment, customer-name
+  fragment, etc.)
+- WhatsApp commands: `/lock`, `/void`, `/reissue`; retrofit `/send` if
+  needed to match the new pattern
+- Portal quote detail view (portal surface for viewing a sent/signed/
+  locked quote)
+- Portal action API endpoints (portal surface for locking, voiding,
+  reissuing — parity with WhatsApp)
+- Source-enum widening: `['portal', 'whatsapp', 'system']` across all
+  Quote-spine handlers (currently narrowed per-handler; LockQuote ships
+  `['system']`-only in Phase A)
+
+**Estimated:** 3–4 sessions.
+
+**Discipline:** Phase A closes as handler-spine-only — handlers exist
+with internal CIL-dispatch test coverage but limited user-facing surface.
+Phase A.5 adds human dispatch surfaces in parallel across the whole
+handler family. No handler ships user-visible before the family does.
+Phase B product work opens only after A.5 closes.
+
 - [ ] Portal: quote builder UI wired to new spine, customer-facing view at `/q/:token`
 - [ ] Plan gating: Starter+ entitlement in `src/config/planCapabilities.js`, quota counter in `usage_monthly_v2`
 - [ ] Server PDF render on sign; Postmark email (contractor + customer); signed PDF stored in Supabase Storage

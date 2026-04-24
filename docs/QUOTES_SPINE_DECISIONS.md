@@ -4632,8 +4632,13 @@ single-transaction `NOW()` coherence — the header and version both receive
 the transaction-start timestamp.
 
 **Expected future exercisers.**
-- **LockQuote** — dual-row (header status=locked, version status=locked +
-  locked_at column).
+- **LockQuote** — header-only per §3A asymmetry; §17.24 does NOT apply
+  (single-row UPDATE on `chiefos_quotes` header; version row
+  constitutionally immutable post-sign via
+  `trg_chiefos_quote_versions_guard_immutable`). Corrected 2026-04-24 at §30
+  close-out — the original bullet above predated §3A's post-sign immutability
+  formalization. Schema-verify forward-applicability before listing handlers
+  in this section; see §30 "Five discipline notes" #1.
 - **VoidQuote** — header-only per §3A; §17.24 does NOT apply (no dual-row
   co-transition in this case).
 - **ReissueQuote** new-version-creation is a different pattern (INSERT new
@@ -5000,9 +5005,260 @@ UPDATE public.chiefos_quotes
 - **§17.25** (echo-if-present posture) — exercised by Section 3, formalized here
 - Section 6 router registration adds ViewQuote to `NEW_IDIOM_HANDLERS`
 
+## §30. Phase A Session 3 — LockQuote exercised against production (2026-04-24)
+
+**Status.** Phase A Session 3's closing ceremony. Production exercise proving
+`handleLockQuote` (the 7-step LockQuote orchestration from §2) executes
+end-to-end against real Postgres. Third new-idiom CIL handler exercised in
+production after SignQuote (§27) and ViewQuote (§28). First system-initiated
+handler in Phase A. Second §17.23 state-driven idempotency exerciser. First
+ceremony that verifies §3A header-only asymmetry against live DB state
+(version row untouched post-lock).
+
+### Scope
+
+Happy-path only (pre-txn `loadLockContext` returns signed-state;
+`markQuoteLocked` transitions header signed→locked WITHOUT touching version;
+`emitLifecycleLocked` fires). Already-locked / draft-sent-viewed rejection /
+voided rejection / concurrent-transition recovery / cross-tenant+cross-owner
+fail-closed paths covered by §2's 10 integration tests. Ceremony validates
+the happy path against production, not each branch.
+
+### Ceremony identity
+
+| Field | Value |
+|---|---|
+| tenant_id         | `00000000-c5c5-c5c5-c5c5-000000000001` |
+| owner_id          | `00000000003` |
+| quote_id          | `00000000-c5c5-c5c5-c5c5-000000000002` |
+| version_id        | `00000000-c5c5-c5c5-c5c5-000000000003` |
+| share_token_id    | `00000000-c5c5-c5c5-c5c5-000000000005` |
+| synthetic_sent_event_id   | `00000000-c5c5-c5c5-c5c5-000000000007` |
+| synthetic_signed_event_id | `00000000-c5c5-c5c5-c5c5-000000000008` |
+| synthetic_signature_id    | `00000000-c5c5-c5c5-c5c5-000000000009` |
+| share_token       | `MGBi1RsGiGNFMxxFf232Qe` (deterministic from seed) |
+| human_id          | `QT-CEREMONY-2026-04-24-PHASE-A-S3` |
+| project_title     | `Phase A Session 3 LockQuote Ceremony` |
+| job_id            | `4331` (allocated by jobs.id serial) |
+
+The `c5c5-c5c5-c5c5` hex namespace distinguishes Phase A Session 3 ceremony
+rows from Phase A Session 2's `c4c4-c4c4-c4c4` and Phase 3's `c3c3-c3c3-c3c3`.
+
+### Share-token derivation
+
+`MGBi1RsGiGNFMxxFf232Qe` is `bs58.encode(sha256('chiefos-phase-a-session-3-lockquote-ceremony-share-token-seed').subarray(0, 16))`,
+via `deriveDeterministicShareToken` shared helper with bounded retry
+(`scripts/_ceremony_shared.js`). Single-shot seed (no v-iteration footgun);
+the Session 2 v2-iteration lesson held — bounded-retry helper resolved the
+§17.22 short-output case without manual iteration.
+
+Note: LockQuote is system-only in Phase A (`LockQuoteActorZ` is
+`z.literal('system')`); the share_token here anchors the pre-existing
+synthetic lifecycle.sent event chain. It is NOT presented to a customer
+during the ceremony — no customer surface is exercised by LockQuote.
+
+### Seed posture — SQL INSERT, signed-state pre-state
+
+§27/§28 established seeding via explicit INSERT (not handler chain);
+same posture here. The LockQuote pre-state must be `quote.status='signed'`
+with `version.status='signed'` AND `version.locked_at IS NOT NULL` per
+§17.22 invariant. Seed at `scripts/ceremony_seed_phase_a_session3.js`
+inserts: user, tenant, job, quote (signed), version (signed, locked_at set,
+server_hash 64-hex), share_token (30-day expiry), synthetic lifecycle.sent
+event (`payload.ceremony_synthetic=true`), synthetic lifecycle.signed event
+(`payload.version_hash_at_sign=c5c5…` + `ceremony_synthetic=true`), synthetic
+signature row (storage_key matches `chiefos_qs_png_storage_key_format`
+regex; no bucket upload — LockQuote does not read the signature row).
+
+Line-items omitted per §27 Phase 2C precedent: `chiefos_qli_parent_locked`
+trigger forbids INSERT on a locked version row. Totals zeroed (0/0/0) to
+satisfy `chiefos_qv_totals_balance`.
+
+### Handler-generated artifacts
+
+| Field | Value |
+|---|---|
+| correlation_id       | `f69516da-528a-4988-90a7-83870f63f7e0` |
+| quote.status (before / after) | `signed` / `locked` |
+| version.status (before / after) | `signed` / `signed` (§3A — UNCHANGED) |
+| version.locked_at (before / after) | `22:52:12.319Z` / `22:52:12.319Z` (§3A — UNCHANGED) |
+| version.server_hash (before / after) | `c5c5…c5c5` / `c5c5…c5c5` (§3A — UNCHANGED) |
+| quote.updated_at     | `2026-04-24T22:53:20.359Z` (txn NOW()) |
+| lifecycle.locked.emitted_at | `2026-04-24T22:53:19.805Z` (data.occurred_at) |
+
+**§3A header-only asymmetry — production-verified.** The version row is
+DB-immutable post-sign (`trg_chiefos_quote_versions_guard_immutable`); had
+`markQuoteLocked` attempted ANY version-row UPDATE, the trigger would have
+rejected the transaction. The ceremony verifies at handler-return AND at
+post-ceremony DB read that `version.status`, `version.locked_at`,
+`version.server_hash`, and `version.signed_at` are ALL byte-identical
+pre-to-post. This is the first production exercise making §3A a captured
+artifact rather than a design principle.
+
+### Events chain (ordered by global_seq)
+
+| seq | kind | correlation_id | emitted_at | notes |
+|---|---|---|---|---|
+| 4419 | `lifecycle.sent`   | NULL | `22:51:12.319Z` | seed-inserted (synthetic); `payload.ceremony_synthetic=true` |
+| 4420 | `lifecycle.signed` | NULL | `22:52:12.319Z` | seed-inserted (synthetic); `payload.version_hash_at_sign=c5c5…`; `payload.ceremony_synthetic=true` |
+| 4421 | `lifecycle.locked` | `f69516da-…f7e0` | `22:53:19.805Z` | handler Step 6; `payload.source_msg_id` echoed from CIL input |
+
+**Single handler-emitted event per invocation.** Like ViewQuote (§28),
+LockQuote emits ONE event. §17.21's intra-handler cross-event correlation_id
+wiring is trivially satisfied (only one event to wire); §17.23 state-driven
+idempotency fills the structural invariant role for single-event handlers.
+
+### emitted_at vs. updated_at (intentional 554ms divergence)
+
+`lifecycle.locked.emitted_at` (`22:53:19.805Z`) precedes `quote.updated_at`
+(`22:53:20.359Z`) by 554 ms. Same semantic pattern as §28's ViewQuote:
+
+- `emitted_at` is populated from `data.occurred_at` in the CIL input — when
+  the system-cron fired the LockQuote CIL (client-perceived event time).
+- `quote.updated_at` is `NOW()` inside the handler's transaction — when the
+  server committed the state flip.
+
+Gap reflects handler execution time (ctx preflight + Zod parse +
+loadLockContext pre-txn load + txn BEGIN + markQuoteLocked +
+emitLifecycleLocked + COMMIT). Larger than §28's 125 ms gap because the
+ceremony runner invokes the handler via Node `require`, not via a warm
+HTTP handler.
+
+### source_msg_id payload echo
+
+`lifecycle.locked.payload.source_msg_id = 'ceremony-phase-a-s3-lockquote-run-1'`
+(matches CIL input). Second production exercise of §17.25 echo-if-present
+posture (first was ViewQuote §28) — confirms the strict `!== undefined`
+pattern holds for system-initiated handlers as well as customer-initiated.
+
+### What Phase A Session 3 validated that prior sections could not
+
+- **First production verification of §3A post-sign immutability.**
+  §28 established §3A as co-transition discipline for sent→viewed (both
+  rows flip). §30 is the first production exercise of the ASYMMETRIC
+  branch: header flips, version does NOT. The version-row-unchanged
+  anomaly-stop check in the ceremony runner locks this as captured artifact
+  — any future regression where LockQuote or a sibling handler mutates
+  a post-sign version row would fail the check loudly.
+- **Second production exercise of state-driven idempotency (§17.23).**
+  LockQuote has no INSERT-with-natural-unique-constraint surface; retries
+  on locked quotes take the `alreadyLockedReturnShape` pre-txn routing
+  branch. First run is the sole happy-path exercise; re-running without
+  re-seed exercises the prior-state retry branch. Confirms §17.23 scales
+  across handler types (customer-initiated viewed, system-initiated locked).
+- **First system-actor handler in production.** SendQuote, SignQuote, and
+  ViewQuote are all customer- or portal-actor origination patterns. LockQuote
+  is the first handler where `actor.role='system'` is the ONLY valid
+  value (`LockQuoteActorZ = z.literal('system')` in Phase A). Confirms
+  the system-actor path threads identity cleanly through ctx preflight →
+  loadLockContext → markQuoteLocked → emitLifecycleLocked without
+  customer-surface assumptions leaking in.
+- **No-plan-gating posture captured.** LockQuote intentionally omits plan
+  gating per G6 follow-through: creation consumes the plan gate;
+  lifecycle state transitions (send, sign, view, lock, void, reissue) are
+  transitively gated via creation. §2's handler has an inline comment
+  reserving a next-free §17.N slot if Phase A.5+ introduces independent
+  gating semantics for owner-initiated vs. system-initiated locks.
+
+### Anomaly-stop validation (ran before documentation)
+
+The ceremony runner (`scripts/real_lock_quote_ceremony.js`) executes
+inline anomaly checks before writing §30. Happy-path set:
+
+1. `events_emitted` exactly `['lifecycle.locked']`
+2. `meta.already_existed === false`
+3. `meta.correlation_id` UUID-shaped and non-null
+4. `result.quote.status === 'locked'`
+5. **`result.version.status === 'signed'` (CRITICAL §3A)**
+6. `lifecycle.locked` event count === 1
+7. `lifecycle.locked` event row's `correlation_id === meta.correlation_id`
+8. `payload.source_msg_id === CIL input's source_msg_id`
+9. **DB-side: `version.locked_at` UNCHANGED pre-to-post (§3A)**
+10. **DB-side: `version.server_hash` UNCHANGED pre-to-post (§3A)**
+11. **DB-side: `version.status === 'signed'` post-lock (§3A)**
+12. `quote.status === 'locked'` post-lock (header-flip completeness)
+13. `quote.updated_at` strictly AFTER `version.locked_at` (timestamp ordering)
+
+All 13 passed. No anomalies. Documentation proceeded.
+
+### Formalizations landing in this session close
+
+| Principle | Section | Status |
+|---|---|---|
+| §17.24 forward-applicability correction | §17.24 | Amended (LockQuote bullet corrected — header-only per §3A, §17.24 does NOT apply) |
+| §3A header-only asymmetry | §3A | Production-verified (first captured artifact — version row unchanged post-lock) |
+| Path B no-plan-gating posture | §2 handler inline comment | Reserved next-free §17.N slot if Phase A.5+ develops independent gating |
+
+**No new §17.N subsection originated this session.** Unlike Phase 3
+(originated §17.19–§17.22) and Phase A Session 2 (originated §17.23/§17.24/§17.25
++ §3A), Session 3 consumed prior formalizations cleanly and corrected one
+forward-applicability bullet. This reflects the maturity of the Phase A
+architecture — LockQuote's clean arc is a trailing indicator that the
+Session 2 formalizations landed at the right level of abstraction.
+
+### Five discipline notes (Session 3 lessons)
+
+1. **Schema-verify forward-applicability.** Future §17.N formalizations
+   that list forward exercisers must schema-verify each listed handler
+   before commit. The §17.24 LockQuote dual-row bullet was drafted in
+   Session 2 before §3A post-sign immutability was canonical; corrected
+   here after §2 implementation revealed the drift. Drafting multiple
+   forward bullets simultaneously without per-handler schema check is how
+   incoherence enters the decisions log.
+2. **Surface-enum questions are product-level.** When a handler decision
+   involves surface enumeration (`source`, `actor.role`, `channel`),
+   surface the product-intent question before the technical-implementation
+   question. Mid-session scope expansion often indicates a missing phase
+   or missing principle in the plan, not a missing handler detail.
+   Session 3's parity-principle discussion produced Phase A.5 as a named
+   phase — the right answer was "elevate to plan," not "absorb into
+   handler scope."
+3. **SIG_ERR rename backlog.** `SIG_ERR` has become a misnomer — houses
+   `QUOTE_NOT_SIGNED`, `QUOTE_VOIDED`, `QUOTE_NOT_SENT` (none sign-related).
+   Consider renaming to `QUOTE_ERR` or `LOAD_ERR` in a post-Phase-A
+   housekeeping pass after VoidQuote + ReissueQuote ship and the right
+   name is clearer. Do not rename inline during handler work.
+4. **Mid-session checkpoint discipline.** When a Claude Code session must
+   `/clear` mid-arc, the outgoing session commits a `_CHECKPOINT.md`
+   document summarizing scope lockdowns, implementation-time nuances, and
+   approved-but-unstarted work. Distinct from `_HANDOFF.md`
+   (session-boundary artifacts). Fresh session reads checkpoint before
+   accepting directives; checkpoint is deleted when arc closes. Session 3
+   exercised this cleanly (`d6f97bc6` introduction → deletion in the §30
+   close-out commit).
+5. **Directives are proposals, not ground truth.** Pre-implementation
+   verification — grepping actual source, reading actual handler precedents,
+   checking actual schema constraints — is the contract. Halt-and-surface
+   when drift detected. Session 3 LockQuote arc caught three directive
+   corrections this way (QuoteRefInputZ at-least-one contract, plan-gating
+   precedent, `ctx.versionServerHash` field naming); verification prevented
+   silent incoherence in production code.
+
+### Retention posture
+
+Ceremony rows retained per §25.6 indefinite-retention default and §26/§27/§28
+precedent. `chiefos_quote_events` immutability trigger prevents DELETE;
+manual cleanup query (documented, not committed) would be:
+
+```sql
+-- c5c5 namespace cleanup (runs outside DB-enforced immutability):
+UPDATE public.chiefos_quotes
+  SET status='voided', voided_at=NOW(), voided_reason='c5c5-ceremony-cleanup'
+  WHERE id = '00000000-c5c5-c5c5-c5c5-000000000002';
+-- share_tokens, signatures, versions: preserved for forensic continuity
+-- events: DB-immutable, preserved indefinitely
+```
+
+### Cross-reference map
+
+- **§3A** (post-sign version-row immutability) — exercised by §2 Block 1 Test 1 AND captured at §30 as first production artifact
+- **§17.23** (state-driven idempotency) — second exerciser (LockQuote); first was ViewQuote §28
+- **§17.24** (header-first ordering) — forward-applicability corrected; LockQuote does NOT exercise (single-row header UPDATE)
+- **§17.25** (echo-if-present posture) — second production exercise (LockQuote); first was ViewQuote §28
+- §2 router registration adds LockQuote to `NEW_IDIOM_HANDLERS`
+
 ## Next entries (to be added as decisions land)
 - §24. Template table schema (when tenant template editor is designed)
 - §29. Cross-quote pointer enforcement (the 4-column composite FK, if needed) — renumbered from §28 placeholder after ViewQuote claimed §28
-- §30. LockQuote ceremony (expected Phase A Session 3, if warranted)
 - §31. VoidQuote ceremony (expected Phase A Session 4, if warranted)
 - §32. ReissueQuote ceremony (expected Phase A Session 5, if warranted)

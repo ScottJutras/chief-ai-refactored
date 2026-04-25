@@ -44,7 +44,7 @@ exercised this three times — see §10.5).
 Phase A development is local). Pre-push territory — `git commit --amend`
 safe when needed.
 
-**Test baseline:** 397/397 passing at `--testTimeout=30000`. 30-second
+**Test baseline:** 403/403 passing at `--testTimeout=30000`. 30-second
 timeout required to avoid pre-existing cold pg-pool-init flakes; documented
 under §8.4 as a forward item.
 

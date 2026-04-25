@@ -658,12 +658,258 @@ UPDATE public.chiefos_quotes
 
 ---
 
-## §31. VoidQuote ceremony (RESERVED)
+## §31. Phase A Session 4 — VoidQuote exercised against production (2026-04-25)
 
-Expected Phase A Session 4 if the VoidQuote handler arc warrants
-production-exercise capture. Handler shape under construction at time of
-this file's authoring; ceremony script and §31 entry to be authored at
-session close.
+**Status.** Phase A Session 4's closing ceremony. Production exercise proving
+`handleVoidQuote` (the Step 0–7 VoidQuote orchestration from §2) executes
+end-to-end against real Postgres. Sixth new-idiom CIL handler exercised in
+production after CreateQuote, SendQuote, SignQuote (§27), ViewQuote (§28),
+and LockQuote (§30). Third §17.23 state-driven idempotency exerciser (after
+ViewQuote §28 and LockQuote §30). Second ceremony to verify §3A header-only
+asymmetry against live DB state — first was LockQuote §30 (post-sign
+immutability case); §31 captures the **canonical asymmetry case** (any-of-
+five → voided header-only flip; version row enum at Migration 1 line 121
+excludes 'voided', so version is unchanged across the void transition
+regardless of source state).
+
+### Scope
+
+Happy-path only (pre-txn `loadVoidContext` returns sent-state;
+`markQuoteVoided` transitions header sent→voided WITHOUT touching version;
+`emitLifecycleVoided` fires with `payload.voided_reason` per
+`chiefos_qe_payload_voided` CHECK obligation). Already-voided idempotent
+retry path (Step 5 pre-txn routing → `alreadyVoidedReturnShape` with
+persisted voided_reason from header) covered by §2's integration tests
+plus the ceremony's exit-0 idempotent re-run path. Concurrent-transition
+recovery (§17.23 recovery half via Step 7a re-read) covered by §2's
+integration tests. Cross-tenant + cross-owner fail-closed and unknown-
+quote_ref paths covered by §2's integration tests. Ceremony validates
+the happy path against production, not each branch.
+
+### Source state — sent (representative)
+
+VoidQuote can fire from any of 5 prior states {draft, sent, viewed, signed,
+locked}. The ceremony picks `sent` as the representative path — most
+operationally common void source (a quote was sent and rejected/superseded
+by ops), exercises the §17.23 single-event happy path, and avoids the
+§17.22 signed/locked locked_at-NOT-NULL invariant chain so the seed is
+minimal (no synthetic signature row, no synthetic lifecycle.signed event).
+Other source states are state-machine-symmetric per the §3A canonical
+asymmetry argument; future ceremonies may re-exercise from signed or
+locked if a regression target emerges.
+
+### Ceremony identity
+
+| Field | Value |
+|---|---|
+| tenant_id         | `00000000-c6c6-c6c6-c6c6-000000000001` |
+| owner_id          | `00000000004` |
+| quote_id          | `00000000-c6c6-c6c6-c6c6-000000000002` |
+| version_id        | `00000000-c6c6-c6c6-c6c6-000000000003` |
+| line_item_id      | `00000000-c6c6-c6c6-c6c6-0000000000a1` |
+| share_token_id    | `00000000-c6c6-c6c6-c6c6-000000000005` |
+| synthetic_sent_event_id | `00000000-c6c6-c6c6-c6c6-000000000007` |
+| share_token       | (deterministic via `deriveDeterministicShareToken` shared helper) |
+| human_id          | `QT-CEREMONY-2026-04-25-PHASE-A-S4` |
+| project_title     | `Phase A Session 4 VoidQuote Ceremony` |
+| job_id            | `6779` (allocated by jobs.id serial) |
+
+The `c6c6-c6c6-c6c6` hex namespace distinguishes Phase A Session 4 ceremony
+rows from Phase A Session 3's `c5c5-c5c5-c5c5`, Phase A Session 2's
+`c4c4-c4c4-c4c4`, and Phase 3's `c3c3-c3c3-c3c3`.
+
+### Seed posture — SQL INSERT, sent-state pre-state
+
+§27/§28/§30 established seeding via explicit INSERT (not handler chain);
+same posture here. The VoidQuote pre-state is `quote.status='sent'` with
+`version.status='sent'`, `version.locked_at IS NULL`, and
+`version.server_hash IS NULL` — no §17.22 invariant assertion fires for
+pre-sign source states. Seed at `scripts/ceremony_seed_phase_a_session4.js`
+inserts: user, tenant, job, quote (sent), version (sent, unlocked, hash
+NULL), 1 line_item (allowed pre-lock), share_token (30-day expiry),
+synthetic lifecycle.sent event (`payload.ceremony_synthetic=true`).
+
+No signature row, no synthetic lifecycle.signed event — sent state has
+neither. Mirrors §28 ViewQuote seed exactly (same source state); diverges
+from §30 LockQuote seed (which required signed-state with locked_at + hash
++ signature).
+
+### Handler-generated artifacts
+
+| Field | Value |
+|---|---|
+| correlation_id       | `52b48aa0-7306-4bde-9154-9339160b5bb7` |
+| quote.status (before / after) | `sent` / `voided` |
+| version.status (before / after) | `sent` / `sent` (§3A — UNCHANGED) |
+| version.sent_at (before / after) | `20:57:54.634Z` / `20:57:54.634Z` (§3A — UNCHANGED) |
+| version.locked_at (before / after) | `NULL` / `NULL` (§3A — UNCHANGED) |
+| version.server_hash (before / after) | `NULL` / `NULL` (§3A — UNCHANGED) |
+| quote.updated_at     | `2026-04-25T20:58:17.926Z` (txn NOW()) |
+| quote.voided_at      | `2026-04-25T20:58:17.926Z` (same txn NOW()) |
+| quote.voided_reason  | `Phase A Session 4 ceremony — representative system-initiated void from sent state` |
+| lifecycle.voided.emitted_at | `2026-04-25T20:58:17.926Z` (= quote.updated_at; data.occurred_at within ms) |
+
+**Single-txn coherence.** `quote.updated_at === quote.voided_at` — both
+`NOW()` within the same transaction (Postgres returns the transaction-
+start timestamp for all `NOW()` calls in a given BEGIN scope).
+`markQuoteVoided` sets both columns in a single UPDATE. The
+`lifecycle.voided` event row's `emitted_at` is populated from
+`data.occurred_at` (CIL input), which the ceremony runner timestamps at
+invocation time — within milliseconds of the txn-start clock.
+
+**§3A canonical asymmetry — production-verified.** Unlike LockQuote (§30,
+post-sign-immutability case where `trg_chiefos_quote_versions_guard_immutable`
+DB-rejects any version UPDATE), VoidQuote's pre-sign source states have a
+mutable version row by DB rules — it is the **handler's discipline** plus
+the version-status enum's exclusion of `'voided'` that keeps the version
+row unchanged. The ceremony verifies at handler-return AND at post-ceremony
+DB read that `version.status`, `version.sent_at`, `version.locked_at`,
+and `version.server_hash` are ALL byte-identical pre-to-post. This is the
+first production exercise making §3A's **canonical** asymmetry case (the
+five-source-state → single-target case) a captured artifact. Combined with
+§30's post-sign-immutability artifact, §3A now has both arms of the
+asymmetry production-verified.
+
+### Events chain (ordered by global_seq)
+
+| seq | kind | correlation_id | emitted_at | notes |
+|---|---|---|---|---|
+| 6625 | `lifecycle.sent`   | NULL | (seed time) | seed-inserted (synthetic); `payload.ceremony_synthetic=true` |
+| 6626 | `lifecycle.voided` | `52b48aa0-…5bb7` | `20:58:17Z` | handler Step 6; `payload.voided_reason` populated; `payload.source_msg_id` echoed from CIL input |
+
+**Single handler-emitted event per invocation.** Like ViewQuote (§28) and
+LockQuote (§30), VoidQuote emits ONE event. §17.21's intra-handler cross-
+event correlation_id wiring is trivially satisfied (only one event to wire);
+§17.23 state-driven idempotency fills the structural invariant role for
+single-event handlers. No `notification.*` paired event — VoidQuote is
+system-only in Phase A and has no customer surface.
+
+### Payload CHECK obligation — production-verified
+
+`chiefos_qe_payload_voided` (Migration 2 line 190-191) requires
+`payload ? 'voided_reason'` when `kind='lifecycle.voided'`. The handler's
+`emitLifecycleVoided` assembles `payload.voided_reason` from
+`data.voided_reason` (VoidQuoteCILZ `z.string().min(1)` enforced upstream).
+Anomaly-stop check #9 confirmed the CHECK is satisfied at production
+INSERT time:
+
+```
+payload.voided_reason = "Phase A Session 4 ceremony — representative system-initiated void from sent state"
+```
+
+This is the first production exercise of a per-kind payload CHECK
+constraint in the Quotes spine. SignQuote (§27) writes
+`payload.version_hash_at_sign` to satisfy `chiefos_qe_payload_signed`
+similarly, but the pattern was less load-bearing because SignQuote's
+payload assembly is constrained by Phase 1's hash-spec; VoidQuote's
+voided_reason is the first **CIL-input-sourced** payload CHECK obligation.
+
+### source_msg_id payload echo
+
+`lifecycle.voided.payload.source_msg_id = 'ceremony-phase-a-s4-voidquote-run-1'`
+(matches CIL input). Third production exercise of §17.25 echo-if-present
+posture (after ViewQuote §28 and LockQuote §30) — confirms strict
+`!== undefined` pattern holds for system-initiated handlers across distinct
+state transitions (sent→viewed, signed→locked, sent→voided).
+
+### What Phase A Session 4 validated that prior sections could not
+
+- **First production verification of §3A canonical asymmetry (five-source
+  → header-only voided flip).** §28 established §3A as co-transition
+  discipline for sent→viewed (both rows flip). §30 captured the post-sign
+  immutability arm (header flips, version DB-immutable). §31 captures the
+  **canonical asymmetry arm**: header flips to `voided`; version row is
+  unchanged across the transition by handler discipline (the version-
+  status enum at Migration 1 line 121 excludes `'voided'`, making any
+  version UPDATE attempt a constitutional violation). Combined with §30,
+  §3A now has both arms production-verified.
+- **First production exercise of CIL-input-sourced payload CHECK.**
+  `chiefos_qe_payload_voided` requires `payload.voided_reason` when
+  `kind='lifecycle.voided'`. Handler discipline pulls
+  `data.voided_reason` (Zod-enforced `z.string().min(1)`) into the event
+  payload at emit time. This is the first per-kind payload CHECK whose
+  satisfaction depends on a CIL input field (not a handler-derived value
+  like §27's `version_hash_at_sign`).
+- **Third production exercise of state-driven idempotency (§17.23).**
+  VoidQuote has no INSERT-with-natural-unique-constraint surface; retries
+  on already-voided quotes take the `alreadyVoidedReturnShape` Step 5
+  pre-txn routing branch, returning persisted `voided_reason` from the
+  header (§17.21 retry-path posture: silently drop current call's
+  voided_reason; return the original). First run is the sole happy-path
+  exercise; re-running without re-seed exercises the prior-state retry
+  branch. §17.23 now has three exercisers across customer-initiated
+  (ViewQuote §28) and system-initiated (LockQuote §30, VoidQuote §31)
+  handlers — the discipline scales across the full Phase A handler set.
+- **Dual-actor schema, single ceremony actor.** `VoidQuoteActorZ` is a
+  discriminated union of `'owner'` and `'system'` roles (unlike LockQuote's
+  `z.literal('system')`). The ceremony exercises the system path only —
+  cron-initiated auto-void shape — but `loadVoidContext` is actor-oblivious
+  per Posture A, so the owner path is structurally the same. No new
+  formalization needed; §14.11/§14.12 customer-actor patterns from §27
+  remain orthogonal (VoidQuote has no customer surface in Phase A).
+- **Second ceremony exercising §17.25 + §17.23 in combination, third
+  overall.** Confirms the 2026-04-23 §17.23/§17.24/§17.25/§3A formalization
+  cluster from §28 has now been exercised across three handlers without
+  amendment — the formalization landed at the right level of abstraction.
+
+### Anomaly-stop validation (ran before documentation)
+
+The ceremony runner (`scripts/real_void_quote_ceremony.js`) executes 17
+inline anomaly checks before writing §31. Happy-path set:
+
+1. `events_emitted` exactly `['lifecycle.voided']`
+2. `meta.already_existed === false`
+3. `meta.correlation_id` UUID-shaped and non-null
+4. `result.quote.status === 'voided'`
+5. `result.quote.voided_reason === CIL.voided_reason` (exact match)
+6. `result.quote.voided_at` populated (truthy timestamp)
+7. **`result.version.status === before.v_status` (CRITICAL §3A pass-through)**
+8. `lifecycle.voided` event row count === 1
+9. **`lifecycle.voided` payload.voided_reason populated and matches CIL input (CHECK obligation)**
+10. `lifecycle.voided` payload.source_msg_id matches CIL input (§17.25 echo)
+11. **DB-side: `version.status` UNCHANGED pre-to-post (§3A)**
+12. **DB-side: `version.sent_at` UNCHANGED pre-to-post (§3A)**
+13. **DB-side: `version.locked_at` UNCHANGED pre-to-post (§3A)**
+14. **DB-side: `version.server_hash` UNCHANGED pre-to-post (§3A)**
+15. `quote.status === 'voided'` post-void (header-flip completeness)
+16. `quote.voided_at` populated post-void
+17. `quote.voided_reason` persisted post-void matches CIL input
+
+All 17 passed. No anomalies. Documentation proceeded.
+
+### Formalizations landing in this session close
+
+| Principle | Section | Status |
+|---|---|---|
+| §3A canonical asymmetry (five-source → header-only voided) | §3A | Production-verified (second captured artifact — first was §30 post-sign immutability arm) |
+| §17.23 state-driven idempotency | §17.23 | Third exerciser (after ViewQuote §28 and LockQuote §30) |
+| §17.25 echo-if-present posture | §17.25 | Third exerciser (after ViewQuote §28 and LockQuote §30) |
+| `chiefos_qe_payload_voided` CHECK | §12/§14 (existing) | First production exercise of CIL-input-sourced payload CHECK |
+
+**No new §17.N subsection originated this session.** Continuing the §30
+trend: Session 4 consumed prior formalizations cleanly. The §17.23/§17.24/
+§17.25/§3A cluster from §28 has now been exercised across three handlers
+(ViewQuote, LockQuote, VoidQuote) without amendment — strong signal the
+formalization landed at the right level of abstraction. §17.26 remains
+free for a ReissueQuote-specific sub-amendment if that handler's
+supersession write pattern reveals a regime not covered by §17.23.
+
+### Retention posture
+
+Ceremony rows retained per §25.6 indefinite-retention default and
+§26/§27/§28/§30 precedent. `chiefos_quote_events` immutability trigger
+prevents DELETE; the ceremony's terminal state (`quote.status='voided'`)
+is itself the operational cleanup marker. No additional cleanup query
+required — the c6c6 quote is already voided post-ceremony.
+
+### Cross-reference map
+
+- **§3A** (canonical asymmetry: five-source → header-only voided) — exercised by §2 integration tests AND captured at §31 as second production artifact (first was §30)
+- **§17.23** (state-driven idempotency) — third exerciser (VoidQuote); prior were ViewQuote §28, LockQuote §30
+- **§17.24** (header-first ordering) — does NOT apply to VoidQuote (single-row header UPDATE; same disposition as §30 LockQuote)
+- **§17.25** (echo-if-present posture) — third exerciser (VoidQuote); prior were ViewQuote §28, LockQuote §30
+- **`chiefos_qe_payload_voided` CHECK** — first production exercise of CIL-input-sourced payload CHECK obligation
+- §3 router registration adds VoidQuote to `NEW_IDIOM_HANDLERS`
 
 ---
 

@@ -27,6 +27,7 @@
 // Imports for registered handlers (populated as each handler ships).
 const {
   handleCreateQuote, handleSendQuote, handleSignQuote, handleViewQuote, handleLockQuote,
+  handleVoidQuote,
 } = require('./quotes');
 
 const NEW_IDIOM_HANDLERS = Object.freeze({
@@ -35,7 +36,7 @@ const NEW_IDIOM_HANDLERS = Object.freeze({
   SignQuote: handleSignQuote,
   ViewQuote: handleViewQuote,
   LockQuote: handleLockQuote,
-  // VoidQuote:   handleVoidQuote,
+  VoidQuote: handleVoidQuote,
   // ReissueQuote: handleReissueQuote,
 });
 

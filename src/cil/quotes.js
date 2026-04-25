@@ -4569,6 +4569,369 @@ async function handleLockQuote(rawCil, ctx) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 4: VoidQuote — §1
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// VoidQuote transitions a quote to terminal 'voided' state from any of five
+// prior states (draft / sent / viewed / signed / locked). Header-only
+// transition per §3A — the version status enum at Migration 1 line 121 is
+// ('draft','sent','viewed','signed','locked'), so 'voided' is not an
+// admissible version status; trg_chiefos_quote_versions_guard_immutable
+// additionally freezes signed/locked rows. No dual-row co-transition across
+// any source state. §3A voided-is-header-only is the canonical asymmetry
+// case this handler exercises for the first time in production.
+//
+// Third §17.23 exerciser (after ViewQuote and LockQuote). §17.24 does NOT
+// apply — uniform header-only per §3A canonical asymmetry; no dual-row
+// ordering.
+//
+// Dual-actor ('owner' | 'system') per LockQuote precedent. 'system' covers
+// cron-initiated auto-void (cooling-period expiry, payment failure, etc.);
+// 'owner' covers contractor-initiated void. Customer-initiated is out of
+// product scope. Phase A: source='system' only (internal CIL dispatch);
+// Phase A.5 widens source uniformly to z.enum(['portal','whatsapp','system']).
+//
+// voided_reason is SCHEMA-REQUIRED at two enforcement points:
+//   (1) chiefos_qe_payload_voided CHECK at Migration 2 line 190-191 requires
+//       payload ? 'voided_reason' when kind='lifecycle.voided'.
+//   (2) chiefos_quotes_voided_consistency CHECK at Migration 1 line 98-102
+//       is biconditional on voided_at (status='voided' ↔ voided_at NOT NULL);
+//       the voided_reason column itself is nullable at the DB level, but
+//       handler layer requires z.string().min(1) and markQuoteVoided writes
+//       it into the header column cohesively with the status+voided_at flip.
+
+// ─── Phase A Session 4 §1: VoidQuoteCILZ schema ─────────────────────────────
+
+// Actor: dual-actor Zod discriminated union mirroring LockQuoteActorZ. Both
+// paths reach the same state-transition core (header-only void). Owner path
+// covers contractor-initiated void; system path covers cron-initiated auto-
+// void. No customer path — customers don't void, they ignore or sign.
+const VoidQuoteActorZ = z.discriminatedUnion('role', [
+  z.object({ role: z.literal('owner'),  actor_id: z.string().min(1) }),
+  z.object({ role: z.literal('system'), actor_id: z.string().min(1) }),
+]);
+
+const VoidQuoteCILZ = BaseCILZ
+  .omit({ actor: true, source_msg_id: true })
+  .extend({
+    type: z.literal('VoidQuote'),
+    // Phase A: system-only (matches LockQuote precedent). Widens in Phase
+    // A.5 to z.enum(['portal','whatsapp','system']). Form changes (literal
+    // → enum), not just values — prevents a future widener from writing
+    // invalid z.literal([...]).
+    source: z.literal('system'),
+    // §17.25 echo-if-present posture: optional in input; when present,
+    // helper echoes to payload.source_msg_id via strict `!== undefined`.
+    source_msg_id: z.string().min(1).optional(),
+    actor: VoidQuoteActorZ,
+    // Reuse SendQuote's QuoteRefInputZ — at-least-one quote_id | human_id.
+    quote_ref: QuoteRefInputZ,
+    // SCHEMA-REQUIRED (not optional). Downstream CHECK obligation per
+    // chiefos_qe_payload_voided (Migration 2 line 190-191). Also persisted
+    // to chiefos_quotes.voided_reason by markQuoteVoided. Minimum length 1.
+    voided_reason: z.string().min(1),
+  });
+
+// ─── Phase A Session 4 §1: VOID_LOAD_COLUMNS + loadVoidContext ──────────────
+
+// VOID_LOAD_COLUMNS — pre-txn read surface for VoidQuote. Mirrors
+// LOCK_LOAD_COLUMNS plus q.voided_at + q.voided_reason for the already-
+// voided retry path. Per §17.21 retry-path posture (parallel to LockQuote
+// correlation_id): current call's voided_reason is silently dropped on
+// already-voided retry; the composer returns the persisted original from
+// the header.
+const VOID_LOAD_COLUMNS = `
+  q.id                   AS quote_id,
+  q.human_id,
+  q.status               AS quote_status,
+  q.job_id,
+  q.customer_id,
+  q.current_version_id,
+  q.voided_at,
+  q.voided_reason,
+  q.created_at           AS header_created_at,
+  q.updated_at           AS header_updated_at,
+  v.id                   AS version_id,
+  v.version_no,
+  v.status               AS version_status,
+  v.project_title,
+  v.currency,
+  v.total_cents,
+  v.customer_snapshot,
+  v.issued_at            AS version_issued_at,
+  v.sent_at              AS version_sent_at,
+  v.viewed_at            AS version_viewed_at,
+  v.signed_at            AS version_signed_at,
+  v.locked_at            AS version_locked_at,
+  v.server_hash          AS version_server_hash
+`;
+
+/**
+ * loadVoidContext — pre-txn context loader for VoidQuote.
+ *
+ * UNIFORM ACROSS BOTH ACTOR PATHS (Posture A). Both 'owner' and 'system'
+ * actors pass through identical identity resolution via ctx.owner_id
+ * (populated upstream — portal session for owner; cron config for system).
+ * Loader is actor-oblivious — no branching on actor.role. Scopes by
+ * (tenant_id, owner_id); cross-tenant / cross-owner / not-found all unify
+ * to QUOTE_NOT_FOUND_OR_CROSS_OWNER per §17.17 addendum 3. Owner-only
+ * scoping ensures the system path fails closed on cron config drift
+ * (tenant removed, primary-owner deleted, etc.) identically to the owner
+ * path.
+ *
+ * State routing per §17.23 (detection half) — WIDER than LockQuote:
+ *   draft | sent | viewed | signed | locked → return ctx (all transitionable)
+ *   voided                                  → return ctx (idempotency;
+ *                                             caller composes
+ *                                             alreadyVoidedReturnShape in
+ *                                             §2 from persisted voided_at
+ *                                             and voided_reason)
+ *   unknown                                 → throw CIL_INTEGRITY_ERROR
+ *
+ * NO wrong-state arm. All 5 prior states are valid void sources; the only
+ * error codes this loader surfaces are QUOTE_NOT_FOUND_OR_CROSS_OWNER
+ * (cross-tenant / missing) and CIL_INTEGRITY_ERROR (unknown enum value
+ * and §17.22 invariant violations).
+ *
+ * Two §17.22 invariant assertions (simpler than LockQuote's three):
+ *   signed | locked source → version.locked_at NOT NULL
+ *     (chiefos_qv_status_locked_consistency CHECK invariant — Migration 1
+ *     line 159-162)
+ *   draft | sent | viewed source → version.locked_at IS NULL
+ *     (same CHECK, opposite arm)
+ *
+ * The voided source-state has no locked_at invariant assertion — a quote
+ * voided from pre-signed state has version.locked_at NULL; from signed/
+ * locked it has version.locked_at NOT NULL. Both are legitimate post-void
+ * resting states per §3A (the version row is unchanged by VoidQuote; its
+ * locked_at reflects the pre-void state).
+ *
+ * Accepts `pg` (not a txn client). Pattern matches loadLockContext.
+ *
+ * @throws {CilIntegrityError}
+ */
+async function loadVoidContext({ pg, tenantId, ownerId, quoteRef }) {
+  let rows;
+  if (quoteRef.quote_id) {
+    const r = await pg.query(
+      `SELECT ${VOID_LOAD_COLUMNS}
+         FROM public.chiefos_quotes q
+         JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+        WHERE q.id = $1 AND q.tenant_id = $2 AND q.owner_id = $3
+        LIMIT 1`,
+      [quoteRef.quote_id, tenantId, ownerId]
+    );
+    rows = r.rows;
+  } else {
+    // human_id branch — tenant-unique per chiefos_quotes_human_id_unique.
+    const r = await pg.query(
+      `SELECT ${VOID_LOAD_COLUMNS}
+         FROM public.chiefos_quotes q
+         JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+        WHERE q.human_id = $1 AND q.tenant_id = $2 AND q.owner_id = $3
+        LIMIT 1`,
+      [quoteRef.human_id, tenantId, ownerId]
+    );
+    rows = r.rows;
+  }
+
+  if (rows.length === 0) {
+    throw new CilIntegrityError({
+      code: 'QUOTE_NOT_FOUND_OR_CROSS_OWNER',
+      message: 'Quote lookup failed',
+      hint: 'quote_ref does not match a quote in this tenant+owner scope, or quote does not exist',
+    });
+  }
+  const row = rows[0];
+
+  // State routing — all six known values are legitimate.
+  switch (row.quote_status) {
+    case 'draft':
+    case 'sent':
+    case 'viewed':
+    case 'signed':
+    case 'locked':
+    case 'voided':
+      break;
+    default:
+      throw new CilIntegrityError({
+        code: 'CIL_INTEGRITY_ERROR',
+        message: 'Unknown quote status',
+        hint: `quote_id=${row.quote_id} unknown_status=${row.quote_status}`,
+      });
+  }
+
+  // §17.22 invariants — locked_at coherence with quote_status.
+  // chiefos_qv_status_locked_consistency CHECK enforces biconditional:
+  //   (locked_at NOT NULL ↔ status IN ('signed','locked'))
+  // Split into two assertions to produce clear hints when either side fails.
+  if ((row.quote_status === 'signed' || row.quote_status === 'locked')
+      && row.version_locked_at === null) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Signed/locked quote has NULL version.locked_at',
+      hint: `quote_id=${row.quote_id} version_id=${row.version_id} quote.status=${row.quote_status}; schema CHECK chiefos_qv_status_locked_consistency violated`,
+    });
+  }
+  if ((row.quote_status === 'draft' || row.quote_status === 'sent' || row.quote_status === 'viewed')
+      && row.version_locked_at !== null) {
+    throw new CilIntegrityError({
+      code: 'CIL_INTEGRITY_ERROR',
+      message: 'Pre-signed quote has NOT NULL version.locked_at',
+      hint: `quote_id=${row.quote_id} version_id=${row.version_id} quote.status=${row.quote_status}; schema CHECK chiefos_qv_status_locked_consistency violated`,
+    });
+  }
+
+  return {
+    tenantId,
+    ownerId,
+    quoteId: row.quote_id,
+    humanId: row.human_id,
+    quoteStatus: row.quote_status,
+    jobId: row.job_id,
+    customerId: row.customer_id,
+    currentVersionId: row.current_version_id,
+    // Persisted void fields — populated when quote_status='voided'; NULL
+    // otherwise. §2 alreadyVoidedReturnShape consumes these for the retry
+    // path (persisted original, not current call's values — §17.21 parallel).
+    voidedAt: row.voided_at,
+    voidedReason: row.voided_reason,
+    headerCreatedAt: row.header_created_at,
+    headerUpdatedAt: row.header_updated_at,
+    versionId: row.version_id,
+    versionNo: row.version_no,
+    versionStatus: row.version_status,
+    projectTitle: row.project_title,
+    currency: row.currency,
+    totalCents: row.total_cents,
+    customerSnapshot: row.customer_snapshot,
+    versionIssuedAt: row.version_issued_at,
+    versionSentAt: row.version_sent_at,
+    versionViewedAt: row.version_viewed_at,
+    versionSignedAt: row.version_signed_at,
+    versionLockedAt: row.version_locked_at,
+    versionServerHash: row.version_server_hash,
+  };
+}
+
+// ─── Phase A Session 4 §1: markQuoteVoided + emitLifecycleVoided ─────────────
+
+/**
+ * markQuoteVoided — §17.23 state-driven idempotency. HEADER-ONLY UPDATE per
+ * §3A canonical asymmetry: transitions chiefos_quotes.status from any of
+ * five valid prior states {draft, sent, viewed, signed, locked} to 'voided'.
+ *
+ * DO NOT add a version row UPDATE — schema-forbidden across all source
+ * states:
+ *   - The version status CHECK at Migration 1 line 121 is
+ *     ('draft','sent','viewed','signed','locked'). 'voided' is NOT an
+ *     admissible version.status value.
+ *   - For signed/locked source, trg_chiefos_quote_versions_guard_immutable
+ *     blocks all version UPDATEs (locked_at IS NOT NULL).
+ *   - For draft/sent/viewed source, any status change on the version row
+ *     would have to land at a non-'voided' value; the co-transition is a
+ *     no-op, so header-only is the only semantically-defined shape.
+ *
+ * §3A canonical rationale: voided IS the asymmetry case the principle was
+ * named for. Header carries state-machine authority; version carries
+ * content snapshot. A voided quote's version remains at its pre-void
+ * status because the content didn't change — only the header's voided
+ * marker changed. §17.24 dual-row ordering does NOT apply.
+ *
+ * WHERE-clause includes all 5 valid source states. rowcount=0 means a
+ * concurrent VoidQuote already took the row to 'voided' between the
+ * pre-txn loadVoidContext and this UPDATE (§17.23 concurrent-transition
+ * signal). Caller re-reads via loadVoidContext and composes
+ * alreadyVoidedReturnShape.
+ *
+ * chiefos_quotes_voided_consistency CHECK (Migration 1 line 98-102) is
+ * biconditional on voided_at — setting status='voided' without voided_at
+ * would fail the CHECK. All three columns (status + voided_at + voided_reason)
+ * are written cohesively in one UPDATE statement. voided_at and updated_at
+ * both use NOW() in the same statement → they equal the same txn timestamp.
+ *
+ * @returns {Promise<{ transitioned: false } | { transitioned: true, quoteUpdatedAt, quoteVoidedAt }>}
+ */
+async function markQuoteVoided(client, { quoteId, tenantId, ownerId, voidedReason }) {
+  const result = await client.query(
+    `UPDATE public.chiefos_quotes
+        SET status='voided',
+            voided_at=NOW(),
+            voided_reason=$4,
+            updated_at=NOW()
+      WHERE id=$1
+        AND tenant_id=$2
+        AND owner_id=$3
+        AND status IN ('draft','sent','viewed','signed','locked')
+      RETURNING updated_at, voided_at`,
+    [quoteId, tenantId, ownerId, voidedReason]
+  );
+  if (result.rowCount === 0) {
+    return { transitioned: false };
+  }
+  return {
+    transitioned: true,
+    quoteUpdatedAt: result.rows[0].updated_at,
+    quoteVoidedAt: result.rows[0].voided_at,
+  };
+}
+
+/**
+ * emitLifecycleVoided — INSERTs a chiefos_quote_events row for the void
+ * transition. Runs AFTER markQuoteVoided per ordering discipline (mirrors
+ * markQuoteLocked → emitLifecycleLocked and markQuoteViewed →
+ * emitLifecycleCustomerViewed).
+ *
+ * Per Migration 2:
+ *   - lifecycle.voided is QUOTE-scoped (chiefos_qe_quote_scoped_kinds at
+ *     line 164-166): quote_version_id MUST be NULL. The INSERT hard-codes
+ *     NULL for quote_version_id.
+ *   - chiefos_qe_payload_voided CHECK at line 190-191 requires
+ *     `payload ? 'voided_reason'` when kind='lifecycle.voided'. Payload
+ *     ALWAYS starts with { voided_reason: <value> }; the CHECK fires if
+ *     the key is absent. §17.25 echo-if-present source_msg_id is appended
+ *     alongside.
+ *
+ * correlation_id per §17.21 (caller passes fresh UUID per invocation;
+ * helper writes to the column).
+ *
+ * source_msg_id echo (§17.25): strict `!== undefined` — empty string
+ * passes through as a Zod-regression surface rather than being defensively
+ * filtered.
+ *
+ * customer_id may be NULL for system-actor invocations without customer
+ * context (cron-initiated auto-void on expiry).
+ */
+async function emitLifecycleVoided(client, {
+  quoteId, tenantId, ownerId,
+  actorSource, actorUserId, emittedAt,
+  customerId,
+  correlationId = null,
+  sourceMsgId,
+  voidedReason,
+}) {
+  const payload = { voided_reason: voidedReason };
+  if (sourceMsgId !== undefined) {
+    payload.source_msg_id = sourceMsgId;
+  }
+  await client.query(
+    `INSERT INTO public.chiefos_quote_events (
+        tenant_id, owner_id, quote_id, quote_version_id,
+        kind, actor_source, actor_user_id, emitted_at,
+        customer_id, correlation_id, payload
+      )
+      VALUES ($1, $2, $3, NULL,
+              'lifecycle.voided', $4, $5, $6,
+              $7, $8, $9)`,
+    [
+      tenantId, ownerId, quoteId,
+      actorSource, actorUserId || null, emittedAt,
+      customerId || null, correlationId, payload,
+    ]
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -4680,6 +5043,15 @@ module.exports = {
     // LockQuote §2 (return-shape composers; handler hoisted to top-level)
     buildLockQuoteReturnShape,
     alreadyLockedReturnShape,
+    // VoidQuote §1 (schema)
+    VoidQuoteCILZ,
+    VoidQuoteActorZ,
+    // VoidQuote §1 (loader + columns)
+    VOID_LOAD_COLUMNS,
+    loadVoidContext,
+    // VoidQuote §1 (transaction-body helpers)
+    markQuoteVoided,
+    emitLifecycleVoided,
   },
 };
 

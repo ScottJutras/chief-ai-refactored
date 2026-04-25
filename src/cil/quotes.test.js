@@ -8925,3 +8925,934 @@ describe('LockQuote — §2 Block 3: alreadyLockedReturnShape (prior-state compo
   });
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 4 §1 tests: VoidQuoteCILZ schema
+// ═══════════════════════════════════════════════════════════════════════════
+
+const {
+  VoidQuoteCILZ,
+  VOID_LOAD_COLUMNS: _VOID_LOAD_COLUMNS,
+  loadVoidContext,
+  markQuoteVoided,
+  emitLifecycleVoided,
+} = _internals;
+
+describe('VoidQuote — §1: VoidQuoteCILZ schema', () => {
+  const VALID_QUOTE_UUID = '00000000-c5c5-c5c5-c5c5-000000000002';
+
+  function validVoidPayload(overrides = {}) {
+    return {
+      cil_version: '1.0',
+      type: 'VoidQuote',
+      tenant_id: '00000000-c5c5-c5c5-c5c5-000000000001',
+      source: 'system',
+      source_msg_id: 'test-void-msg-1',
+      actor: { role: 'system', actor_id: 'system:cooling-period-expiry' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      quote_ref: { quote_id: VALID_QUOTE_UUID },
+      voided_reason: 'customer requested cancellation',
+      ...overrides,
+    };
+  }
+
+  describe('schema structure', () => {
+    it('valid payload parses cleanly', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload()).success).toBe(true);
+    });
+
+    it('wrong type literal rejects', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({ type: 'VoidQuot' })).success).toBe(false);
+    });
+  });
+
+  describe('source field (z.literal("system") for Phase A; widens in A.5)', () => {
+    it('"system" accepts', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({ source: 'system' })).success).toBe(true);
+    });
+
+    it('"portal" rejects (enum widens in Phase A.5)', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({ source: 'portal' })).success).toBe(false);
+    });
+
+    it('"whatsapp" rejects (enum widens in Phase A.5)', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({ source: 'whatsapp' })).success).toBe(false);
+    });
+  });
+
+  describe('actor field (discriminated union over role — matches LockQuote precedent)', () => {
+    it('role="system" accepts', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        actor: { role: 'system', actor_id: 'system:cooling-period-expiry' },
+      })).success).toBe(true);
+    });
+
+    it('role="owner" accepts (dual-actor — handler-only in Phase A per surface plan)', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        actor: { role: 'owner', actor_id: '00000000000' },
+      })).success).toBe(true);
+    });
+
+    it('role="customer" rejects (not in discriminated union)', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        actor: { role: 'customer', actor_id: '00000000-c5c5-c5c5-c5c5-000000000099' },
+      })).success).toBe(false);
+    });
+
+    it('actor_id empty string rejects (min(1))', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        actor: { role: 'system', actor_id: '' },
+      })).success).toBe(false);
+    });
+
+    it('actor missing role rejects', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        actor: { actor_id: 'system:x' },
+      })).success).toBe(false);
+    });
+  });
+
+  describe('source_msg_id optionality (§17.25 echo-if-present)', () => {
+    it('present (non-empty) accepts', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({ source_msg_id: 'req-void-1' })).success).toBe(true);
+    });
+
+    it('absent (undefined) accepts', () => {
+      const { source_msg_id: _x, ...without } = validVoidPayload();
+      expect(VoidQuoteCILZ.safeParse(without).success).toBe(true);
+    });
+
+    it('empty string rejects (min(1) still applies when present)', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({ source_msg_id: '' })).success).toBe(false);
+    });
+  });
+
+  describe('quote_ref field (reused from SendQuote QuoteRefInputZ)', () => {
+    it('quote_id UUID branch accepts', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        quote_ref: { quote_id: VALID_QUOTE_UUID },
+      })).success).toBe(true);
+    });
+
+    it('human_id branch accepts', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        quote_ref: { human_id: 'QT-2026-04-24-0001' },
+      })).success).toBe(true);
+    });
+
+    it('both quote_id and human_id accepts (at-least-one refine)', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        quote_ref: { quote_id: VALID_QUOTE_UUID, human_id: 'QT-2026-04-24-0001' },
+      })).success).toBe(true);
+    });
+
+    it('neither quote_id nor human_id rejects (refine requires at least one)', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        quote_ref: {},
+      })).success).toBe(false);
+    });
+  });
+
+  describe('voided_reason field (SCHEMA-REQUIRED per chiefos_qe_payload_voided CHECK)', () => {
+    // Unlike LockQuote's payload (which has no per-kind CHECK), VoidQuote
+    // carries a downstream CHECK obligation at Migration 2 line 190-191:
+    // payload ? 'voided_reason' must be true when kind='lifecycle.voided'.
+    // The Zod layer surfaces this obligation as a required z.string().min(1)
+    // field so callers get a clean 400 rather than a 500 from Postgres.
+
+    it('present (non-empty) accepts', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({
+        voided_reason: 'payment failed after 90 days',
+      })).success).toBe(true);
+    });
+
+    it('empty string rejects (min(1))', () => {
+      expect(VoidQuoteCILZ.safeParse(validVoidPayload({ voided_reason: '' })).success).toBe(false);
+    });
+
+    it('missing (undefined) rejects', () => {
+      const { voided_reason: _x, ...without } = validVoidPayload();
+      expect(VoidQuoteCILZ.safeParse(without).success).toBe(false);
+    });
+  });
+
+  describe('BaseCILZ inheritance', () => {
+    it('missing tenant_id rejects', () => {
+      const { tenant_id: _x, ...bad } = validVoidPayload();
+      expect(VoidQuoteCILZ.safeParse(bad).success).toBe(false);
+    });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 4 §1 tests: loadVoidContext (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('VoidQuote — §1: loadVoidContext (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  // Seed an in-state quote. For draft/sent/viewed the version row stays
+  // pre-signed (locked_at NULL); for signed/locked we set locked_at +
+  // server_hash to satisfy chiefos_qv_status_locked_consistency.
+  async function seedQuoteInState(client, pre, quoteStatus) {
+    const header = await _ihq(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await _ivq(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'VoidQuote §1 seed', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: _cts(pre.tenantId),
+    });
+    await _spv(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+
+    if (quoteStatus === 'signed' || quoteStatus === 'locked') {
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status=$2, updated_at=NOW() WHERE id=$1`,
+        [header.id, quoteStatus]
+      );
+      await client.query(
+        `UPDATE public.chiefos_quote_versions
+            SET status='signed', issued_at=NOW(), sent_at=NOW(),
+                signed_at=NOW(), locked_at=NOW(), server_hash=$2
+          WHERE id=$1`,
+        [version.id, 'd'.repeat(64)]
+      );
+    } else if (quoteStatus === 'sent' || quoteStatus === 'viewed') {
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status=$2, updated_at=NOW() WHERE id=$1`,
+        [header.id, quoteStatus]
+      );
+      await client.query(
+        `UPDATE public.chiefos_quote_versions
+            SET status=$2, issued_at=NOW(), sent_at=NOW()
+          WHERE id=$1`,
+        [version.id, quoteStatus]
+      );
+    }
+    // draft: no further mutation — default state after insertQuoteHeader.
+    return { header, version };
+  }
+
+  async function expectCilError(fn, expectedCode) {
+    try {
+      await fn();
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe(expectedCode);
+    }
+  }
+
+  test.each(['draft', 'sent', 'viewed', 'signed', 'locked'])(
+    'happy path: %s quote → returns ctx with quoteStatus=%s (transitionable)',
+    async (status) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const pre = await setupQuotePreconditions(client);
+        const { header, version } = await seedQuoteInState(client, pre, status);
+
+        const ctx = await loadVoidContext({
+          pg: client,
+          tenantId: pre.tenantId,
+          ownerId: pre.ownerId,
+          quoteRef: { quote_id: header.id },
+        });
+
+        expect(ctx.quoteId).toBe(header.id);
+        expect(ctx.versionId).toBe(version.id);
+        expect(ctx.quoteStatus).toBe(status);
+        expect(ctx.voidedAt).toBeNull();
+        expect(ctx.voidedReason).toBeNull();
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+      }
+    }
+  );
+
+  test('already-voided routing: ctx carries persisted voided_at + voided_reason (§17.21 retry-path parallel)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuoteInState(client, pre, 'signed');
+      // Flip header to voided with a persisted reason.
+      await client.query(
+        `UPDATE public.chiefos_quotes
+            SET status='voided', voided_at=NOW(), voided_reason='persisted original reason'
+          WHERE id=$1`,
+        [header.id]
+      );
+
+      const ctx = await loadVoidContext({
+        pg: client,
+        tenantId: pre.tenantId,
+        ownerId: pre.ownerId,
+        quoteRef: { quote_id: header.id },
+      });
+      expect(ctx.quoteStatus).toBe('voided');
+      expect(ctx.voidedAt).not.toBeNull();
+      expect(ctx.voidedReason).toBe('persisted original reason');
+      // §3A: version row unchanged — stays 'signed' (its pre-void value).
+      expect(ctx.versionStatus).toBe('signed');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('quote not found → QUOTE_NOT_FOUND_OR_CROSS_OWNER', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+
+      await expectCilError(
+        () => loadVoidContext({
+          pg: client, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          quoteRef: { quote_id: '00000000-0000-0000-0000-000000000099' },
+        }),
+        'QUOTE_NOT_FOUND_OR_CROSS_OWNER'
+      );
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('cross-tenant → QUOTE_NOT_FOUND_OR_CROSS_OWNER (unified 404 per §17.17 addendum 3)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuoteInState(client, pre, 'draft');
+
+      await expectCilError(
+        () => loadVoidContext({
+          pg: client,
+          tenantId: FOREST_CITY_TENANT_UUID,
+          ownerId: pre.ownerId,
+          quoteRef: { quote_id: header.id },
+        }),
+        'QUOTE_NOT_FOUND_OR_CROSS_OWNER'
+      );
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('cross-owner → QUOTE_NOT_FOUND_OR_CROSS_OWNER (unified; system-cron drift defense)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuoteInState(client, pre, 'signed');
+
+      await expectCilError(
+        () => loadVoidContext({
+          pg: client,
+          tenantId: pre.tenantId,
+          ownerId: '99000000000',
+          quoteRef: { quote_id: header.id },
+        }),
+        'QUOTE_NOT_FOUND_OR_CROSS_OWNER'
+      );
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('human_id lookup branch: returns same ctx as quote_id branch', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuoteInState(client, pre, 'signed');
+
+      const ctx = await loadVoidContext({
+        pg: client, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        quoteRef: { human_id: pre.humanId },
+      });
+      expect(ctx.quoteId).toBe(header.id);
+      expect(ctx.humanId).toBe(pre.humanId);
+      expect(ctx.quoteStatus).toBe('signed');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 4 §1 tests: loadVoidContext invariant assertions (unit)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The §17.22 locked_at-NULL cases are DB-unreachable by design
+// (chiefos_qv_status_locked_consistency CHECK). The loader's assertions
+// are defense-in-depth for direct-DB-write / FK-drift scenarios. Exercised
+// via a pg-query mock returning synthetic rows that bypass DB constraints.
+
+describe('VoidQuote — §1: loadVoidContext invariant assertions (unit)', () => {
+  const VCTX_TENANT_ID  = '00000000-c5c5-c5c5-c5c5-000000000001';
+  const VCTX_OWNER_ID   = '00000000000';
+  const VCTX_QUOTE_ID   = '00000000-c5c5-c5c5-c5c5-000000000002';
+  const VCTX_VERSION_ID = '00000000-c5c5-c5c5-c5c5-000000000003';
+
+  function makeVoidRow(overrides = {}) {
+    return {
+      quote_id: VCTX_QUOTE_ID,
+      human_id: 'QT-2026-04-24-VOID01',
+      quote_status: 'signed',
+      job_id: 3001,
+      customer_id: null,
+      current_version_id: VCTX_VERSION_ID,
+      voided_at: null,
+      voided_reason: null,
+      header_created_at: new Date('2026-04-24T10:00:00Z'),
+      header_updated_at: new Date('2026-04-24T10:00:00Z'),
+      version_id: VCTX_VERSION_ID,
+      version_no: 1,
+      version_status: 'signed',
+      project_title: 'Void Invariant Test',
+      currency: 'CAD',
+      total_cents: 11300,
+      customer_snapshot: { name: 'Void Customer', email: null, phone_e164: null },
+      version_issued_at: new Date('2026-04-24T10:00:00Z'),
+      version_sent_at: new Date('2026-04-24T10:00:00Z'),
+      version_viewed_at: null,
+      version_signed_at: new Date('2026-04-24T10:05:00Z'),
+      version_locked_at: new Date('2026-04-24T10:05:00Z'),
+      version_server_hash: 'd'.repeat(64),
+      ...overrides,
+    };
+  }
+
+  function mockPgWith(queryResults) {
+    let idx = 0;
+    const query = jest.fn().mockImplementation(() => {
+      const r = queryResults[idx++];
+      if (r instanceof Error) return Promise.reject(r);
+      return Promise.resolve(r || { rows: [] });
+    });
+    return { query };
+  }
+
+  async function expectCilError(fn, expectedCode) {
+    try {
+      await fn();
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e.name).toBe('CilIntegrityError');
+      expect(e.code).toBe(expectedCode);
+    }
+  }
+
+  test('§17.22 invariant: signed quote with NULL version.locked_at → CIL_INTEGRITY_ERROR', async () => {
+    const pg = mockPgWith([
+      { rows: [makeVoidRow({ quote_status: 'signed', version_status: 'signed', version_locked_at: null })] },
+    ]);
+    await expectCilError(
+      () => loadVoidContext({
+        pg, tenantId: VCTX_TENANT_ID, ownerId: VCTX_OWNER_ID,
+        quoteRef: { quote_id: VCTX_QUOTE_ID },
+      }),
+      'CIL_INTEGRITY_ERROR'
+    );
+  });
+
+  test('§17.22 invariant: draft quote with NOT-NULL version.locked_at → CIL_INTEGRITY_ERROR', async () => {
+    const pg = mockPgWith([
+      { rows: [makeVoidRow({
+        quote_status: 'draft', version_status: 'draft',
+        version_locked_at: new Date('2026-04-24T10:00:00Z'),
+      })] },
+    ]);
+    await expectCilError(
+      () => loadVoidContext({
+        pg, tenantId: VCTX_TENANT_ID, ownerId: VCTX_OWNER_ID,
+        quoteRef: { quote_id: VCTX_QUOTE_ID },
+      }),
+      'CIL_INTEGRITY_ERROR'
+    );
+  });
+
+  test('unknown quote_status → CIL_INTEGRITY_ERROR', async () => {
+    const pg = mockPgWith([
+      { rows: [makeVoidRow({ quote_status: 'zombie' })] },
+    ]);
+    await expectCilError(
+      () => loadVoidContext({
+        pg, tenantId: VCTX_TENANT_ID, ownerId: VCTX_OWNER_ID,
+        quoteRef: { quote_id: VCTX_QUOTE_ID },
+      }),
+      'CIL_INTEGRITY_ERROR'
+    );
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 4 §1 tests: markQuoteVoided (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('VoidQuote — §1: markQuoteVoided (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  async function seedQuoteInState(client, pre, quoteStatus) {
+    const header = await _ihq(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await _ivq(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'markQuoteVoided seed', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: _cts(pre.tenantId),
+    });
+    await _spv(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    if (quoteStatus === 'signed' || quoteStatus === 'locked') {
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status=$2, updated_at=NOW() WHERE id=$1`,
+        [header.id, quoteStatus]
+      );
+      await client.query(
+        `UPDATE public.chiefos_quote_versions
+            SET status='signed', issued_at=NOW(), sent_at=NOW(),
+                signed_at=NOW(), locked_at=NOW(), server_hash=$2
+          WHERE id=$1`,
+        [version.id, 'e'.repeat(64)]
+      );
+    } else if (quoteStatus === 'sent' || quoteStatus === 'viewed') {
+      await client.query(
+        `UPDATE public.chiefos_quotes SET status=$2 WHERE id=$1`,
+        [header.id, quoteStatus]
+      );
+      await client.query(
+        `UPDATE public.chiefos_quote_versions
+            SET status=$2, issued_at=NOW(), sent_at=NOW()
+          WHERE id=$1`,
+        [version.id, quoteStatus]
+      );
+    }
+    return { header, version };
+  }
+
+  test.each(['draft', 'signed', 'locked'])(
+    'happy path: %s → voided; returns transitioned:true with {quoteUpdatedAt, quoteVoidedAt}',
+    async (sourceStatus) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const pre = await setupQuotePreconditions(client);
+        const { header } = await seedQuoteInState(client, pre, sourceStatus);
+
+        const result = await markQuoteVoided(client, {
+          quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          voidedReason: 'spot-check reason',
+        });
+        expect(result.transitioned).toBe(true);
+        expect(result.quoteUpdatedAt).toBeDefined();
+        expect(result.quoteVoidedAt).toBeDefined();
+
+        const qRow = await client.query(
+          `SELECT status, voided_reason FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+        );
+        expect(qRow.rows[0].status).toBe('voided');
+        expect(qRow.rows[0].voided_reason).toBe('spot-check reason');
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+      }
+    }
+  );
+
+  test.each(['sent', 'viewed'])(
+    'happy path (smoke): %s → voided',
+    async (sourceStatus) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const pre = await setupQuotePreconditions(client);
+        const { header } = await seedQuoteInState(client, pre, sourceStatus);
+
+        const result = await markQuoteVoided(client, {
+          quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          voidedReason: 'smoke',
+        });
+        expect(result.transitioned).toBe(true);
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+      }
+    }
+  );
+
+  test('already-voided: returns transitioned:false (§17.23 concurrent-transition signal)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuoteInState(client, pre, 'signed');
+      // Pre-flip to voided.
+      await client.query(
+        `UPDATE public.chiefos_quotes
+            SET status='voided', voided_at=NOW(), voided_reason='first void'
+          WHERE id=$1`,
+        [header.id]
+      );
+
+      const result = await markQuoteVoided(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        voidedReason: 'second void call (should be dropped)',
+      });
+      expect(result).toEqual({ transitioned: false });
+
+      // Persisted reason from first void is preserved.
+      const qRow = await client.query(
+        `SELECT voided_reason FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(qRow.rows[0].voided_reason).toBe('first void');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('§3A canonical regression: version row UNTOUCHED post-void across 5 source states', async () => {
+    // Load-bearing — §3A voided-is-header-only is the canonical asymmetry
+    // case. A future refactor adding a version UPDATE to markQuoteVoided
+    // would break for signed/locked sources at the DB trigger, but for
+    // draft/sent/viewed sources the trigger doesn't fire — this test
+    // catches the regression uniformly across all 5.
+    for (const sourceStatus of ['draft', 'sent', 'viewed', 'signed', 'locked']) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const pre = await setupQuotePreconditions(client);
+        const { header, version } = await seedQuoteInState(client, pre, sourceStatus);
+
+        const before = await client.query(
+          `SELECT status, locked_at, server_hash, signed_at, sent_at, viewed_at, issued_at
+             FROM public.chiefos_quote_versions WHERE id=$1`,
+          [version.id]
+        );
+
+        await markQuoteVoided(client, {
+          quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+          voidedReason: `void from ${sourceStatus}`,
+        });
+
+        const after = await client.query(
+          `SELECT status, locked_at, server_hash, signed_at, sent_at, viewed_at, issued_at
+             FROM public.chiefos_quote_versions WHERE id=$1`,
+          [version.id]
+        );
+        expect(after.rows[0]).toEqual(before.rows[0]);
+      } finally {
+        await client.query('ROLLBACK').catch(() => {});
+        client.release();
+      }
+    }
+  });
+
+  test('txn coherence: voided_at === updated_at (same NOW() in single statement)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuoteInState(client, pre, 'signed');
+
+      const result = await markQuoteVoided(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        voidedReason: 'txn-coherence',
+      });
+      expect(result.quoteVoidedAt.toISOString()).toBe(result.quoteUpdatedAt.toISOString());
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('voided_reason persisted to chiefos_quotes.voided_reason column (read-back)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuoteInState(client, pre, 'locked');
+
+      await markQuoteVoided(client, {
+        quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+        voidedReason: 'exact string to read back',
+      });
+
+      const qRow = await client.query(
+        `SELECT voided_reason FROM public.chiefos_quotes WHERE id=$1`, [header.id]
+      );
+      expect(qRow.rows[0].voided_reason).toBe('exact string to read back');
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 4 §1 tests: emitLifecycleVoided (integration)
+// ═══════════════════════════════════════════════════════════════════════════
+
+describeIfDb('VoidQuote — §1: emitLifecycleVoided (integration)', () => {
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  async function seedQuote(client, pre) {
+    const header = await _ihq(client, {
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+      jobId: pre.jobId, customerId: pre.customer.id,
+      humanId: pre.humanId, source: 'whatsapp', sourceMsgId: pre.sourceMsgId,
+    });
+    const version = await _ivq(client, {
+      quoteId: header.id, tenantId: pre.tenantId, ownerId: pre.ownerId,
+      data: {
+        project: { title: 'emitLifecycleVoided seed', scope: null },
+        currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+        warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+        warranty_template_ref: null, clauses_template_ref: null,
+      },
+      totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+      customerSnapshot: { name: pre.customer.name, email: pre.customer.email },
+      tenantSnapshot: _cts(pre.tenantId),
+    });
+    await _spv(client, {
+      quoteId: header.id, versionId: version.id,
+      tenantId: pre.tenantId, ownerId: pre.ownerId,
+    });
+    return { header, version };
+  }
+
+  test('happy path: inserts lifecycle.voided row with quote_version_id=NULL + payload.voided_reason', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuote(client, pre);
+      const correlationId = '22222222-3333-4444-5555-666666666666';
+
+      await emitLifecycleVoided(client, {
+        quoteId: header.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system',
+        actorUserId: 'system:cooling-period-expiry',
+        emittedAt: new Date('2026-04-24T13:00:00Z'),
+        customerId: pre.customer.id,
+        correlationId,
+        sourceMsgId: 'void-msg-1',
+        voidedReason: 'cooling-period expired without signature',
+      });
+
+      const { rows } = await client.query(
+        `SELECT kind, quote_version_id, correlation_id, actor_source,
+                actor_user_id, customer_id, payload
+           FROM public.chiefos_quote_events
+          WHERE quote_id=$1 AND kind='lifecycle.voided'`,
+        [header.id]
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].kind).toBe('lifecycle.voided');
+      expect(rows[0].quote_version_id).toBeNull();  // quote-scoped per CHECK
+      expect(rows[0].correlation_id).toBe(correlationId);
+      expect(rows[0].actor_source).toBe('system');
+      expect(rows[0].actor_user_id).toBe('system:cooling-period-expiry');
+      expect(rows[0].customer_id).toBe(pre.customer.id);
+      expect(rows[0].payload).toEqual({
+        voided_reason: 'cooling-period expired without signature',
+        source_msg_id: 'void-msg-1',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('§17.25 echo-if-present: source_msg_id absent → payload has voided_reason only', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuote(client, pre);
+
+      await emitLifecycleVoided(client, {
+        quoteId: header.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: 'system:x',
+        emittedAt: new Date('2026-04-24T13:00:00Z'),
+        customerId: null, correlationId: null,
+        voidedReason: 'reason only',
+        // sourceMsgId intentionally omitted
+      });
+
+      const { rows } = await client.query(
+        `SELECT payload FROM public.chiefos_quote_events WHERE quote_id=$1 AND kind='lifecycle.voided'`,
+        [header.id]
+      );
+      expect(rows[0].payload).toEqual({ voided_reason: 'reason only' });
+      expect(rows[0].payload.source_msg_id).toBeUndefined();
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('§17.25 echo-if-present: source_msg_id present → payload carries both keys', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuote(client, pre);
+
+      await emitLifecycleVoided(client, {
+        quoteId: header.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: 'system:x',
+        emittedAt: new Date('2026-04-24T13:00:00Z'),
+        customerId: null, correlationId: null,
+        voidedReason: 'two-key payload',
+        sourceMsgId: 'echo-void',
+      });
+
+      const { rows } = await client.query(
+        `SELECT payload FROM public.chiefos_quote_events WHERE quote_id=$1 AND kind='lifecycle.voided'`,
+        [header.id]
+      );
+      expect(rows[0].payload).toEqual({
+        voided_reason: 'two-key payload',
+        source_msg_id: 'echo-void',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('customer_id NULL path (system-actor invocation without customer context)', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuote(client, pre);
+
+      await emitLifecycleVoided(client, {
+        quoteId: header.id,
+        tenantId: pre.tenantId, ownerId: pre.ownerId,
+        actorSource: 'system', actorUserId: 'system:x',
+        emittedAt: new Date('2026-04-24T13:00:00Z'),
+        customerId: null,
+        correlationId: null,
+        voidedReason: 'no customer',
+      });
+
+      const { rows } = await client.query(
+        `SELECT customer_id FROM public.chiefos_quote_events WHERE quote_id=$1 AND kind='lifecycle.voided'`,
+        [header.id]
+      );
+      expect(rows[0].customer_id).toBeNull();
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+
+  test('defensive: payload missing voided_reason → chiefos_qe_payload_voided CHECK fires (Postgres error)', async () => {
+    // Confirms the CHECK constraint is live: construct an INSERT that
+    // bypasses emitLifecycleVoided's payload assembly, with payload={}
+    // and kind='lifecycle.voided'. Postgres must reject at the CHECK
+    // chiefos_qe_payload_voided barrier.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const pre = await setupQuotePreconditions(client);
+      const { header } = await seedQuote(client, pre);
+
+      let error;
+      try {
+        await client.query(
+          `INSERT INTO public.chiefos_quote_events (
+              tenant_id, owner_id, quote_id, quote_version_id,
+              kind, actor_source, actor_user_id, emitted_at,
+              customer_id, correlation_id, payload
+            )
+            VALUES ($1, $2, $3, NULL,
+                    'lifecycle.voided', 'system', 'system:x', $4,
+                    NULL, NULL, '{}'::jsonb)`,
+          [pre.tenantId, pre.ownerId, header.id, new Date()]
+        );
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeDefined();
+      expect(String(error.message)).toMatch(/chiefos_qe_payload_voided/);
+    } finally {
+      await client.query('ROLLBACK').catch(() => {});
+      client.release();
+    }
+  });
+});

@@ -21,7 +21,7 @@ const { deriveDeterministicShareToken } = require('../scripts/_ceremony_shared')
 describe('deriveDeterministicShareToken — ceremony-shared utility', () => {
   // ─── Test 1: regression lock on landed tokens ────────────────────────
   //
-  // Both §27 and §28 identity tables in docs/QUOTES_SPINE_DECISIONS.md
+  // Both §27 and §28 identity tables in docs/QUOTES_SPINE_CEREMONIES.md
   // cite specific share_token values by prose. If the helper ever
   // produces different output for these seeds, the decisions-log
   // drifts out of sync with the infrastructure. Lock this at test time.

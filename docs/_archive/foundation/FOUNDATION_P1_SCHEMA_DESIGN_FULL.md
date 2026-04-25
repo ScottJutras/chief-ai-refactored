@@ -2988,3 +2988,100 @@ The rebuilt schema is narrower, cleaner, and more auditable than the current one
 **Phase 1 Session 2 complete. FOUNDATION_P1_SCHEMA_DESIGN.md is ready for Founder Checkpoint 1 review before Phase 2 begins.**
 
 **Phase 1 Session 3 addendum complete. FOUNDATION_P1_SCHEMA_DESIGN.md has complete design coverage for every KEEP-WITH-REDESIGN table. Ready for Founder Checkpoint 1 final approval before Phase 2 begins.**
+
+---
+
+## Phase 4.5 / 4.5b Amendments (Added 2026-04-22)
+
+The following gaps were identified in Phase 4 app code audit and Phase 4.5/4.5b feature classification:
+
+- `reminders` (Gap 1) — see migration `2026_04_22_amendment_reminders_and_insight_log.sql`
+- Supplier catalog §3.13 (Gap 2) — see §3.13 below, delivered in Session P1A-2
+- RAG knowledge §3.14 (Gap 3) — delivered in Session P1A-3; see §3.14 below and migrations `2026_04_22_amendment_rag_docs.sql`, `2026_04_22_amendment_rag_terms.sql`, `2026_04_22_amendment_tenant_knowledge.sql`
+- `insight_log` (Gap 4) — see migration `2026_04_22_amendment_reminders_and_insight_log.sql`
+- `pricing_items` (Gap 5) — see migration `2026_04_22_amendment_pricing_items.sql`
+- `job_documents` + `job_document_files` (Gap 6, Q5 Option A) — see migration `2026_04_22_amendment_documents_flow.sql`
+
+These tables fill gaps where Phase 1's original DISCARD scope was over-aggressive. Full decision rationale in `PHASE_4_5_DECISIONS_AND_HANDOFF.md`.
+
+Change orders spine + Leads spine + Receipts spine + portal Quotes UI are deferred to post-cutover product development (not Phase 1 amendment scope).
+
+---
+
+## 3.13 Supplier Catalog (Added via Phase 4.5 Gap 2 / Session P1A-2)
+
+The supplier catalog is load-bearing for three product surfaces:
+
+1. **Quotes line-item composition** — the polymorphic source_type model (deferred to Phase B) lets quote line items reference `catalog_products.id` alongside owner-defined `pricing_items.id` and free-text lines.
+2. **Ask Chief `catalog_lookup` tool** — wired into the agent tool registry at `services/agent/index.js:158`. Answers "what does Gentek charge for J-channel?" with freshness-aware pricing.
+3. **Channel-partner GTM** — Gentek, Home Hardware, TIMBER MART partnerships depend on this surface for supplier onboarding + contractor catalog browsing.
+
+Phase 1 §6.1 Decision 6 originally marked the supplier catalog "out of scope." This was incorrect. Phase 4.5 Q2 corrected the decision; Session P1A-2 delivered the rebuild migrations. The cluster has **7 tables** across **3 migration files**.
+
+### Design decisions resolved during Session P1A-2
+
+- **Decision A (GLOBAL-vs-tenant scoping):** `suppliers` is fully GLOBAL. Production has no `tenant_id` column; one supplier record is visible to all contractor tenants. Resolved via introspection of live production schema (authoritative per P1A-1's drift-correction precedent).
+- **Decision B (supplier-portal auth surface):** `supplier_users.auth_uid` references `auth.users(id)` directly — NOT `chiefos_portal_users`. Supplier-portal users are a parallel auth channel. Production lacked the explicit FK; rebuild adds it for referential integrity.
+- **Decision C (plan-gated contractor reads):** enforced at **route layer** (`routes/catalog.js::requireCatalogAccess` middleware checks `plan_key` before RLS fires). Rebuild preserves this posture — no plan check in RLS. Route-layer gate + tenant-membership RLS compose safely.
+- **Decision D (admin approval flow):** uses service_role with a hardcoded email check at route layer (`routes/supplierPortal.js::requireChiefOSAdmin`). No admin-role RLS needed.
+- **Decision E (append-only `catalog_price_history`):** same pattern as `integrity_verification_log` (§3.11). service_role SELECT+INSERT only; no UPDATE/DELETE policies for authenticated. Hard column-restriction trigger deferred to P3-4c.
+
+### Tables
+
+**§3.13.1 `suppliers` (GLOBAL)**
+UUID PK. `slug text UNIQUE`, name, description, public_description, website_url, logo_storage_key, contact_email, primary_contact_{name,email,phone}, company_phone, company_address, city. `region` CHECK (`canada`/`usa`/`international`). `supplier_type` CHECK (`manufacturer`/`distributor`/`retailer`/`other`). `catalog_update_cadence` CHECK (`weekly`/`monthly`/`quarterly`/`annually`/`on_change`). `status` CHECK (`pending`/`active`/`suspended`/`archived`). `is_active boolean`. `onboarding_completed boolean`. `approved_at`, `approved_by text`, created_at, updated_at. RLS: authenticated SELECT where status='active' + is_active=true; supplier-portal users SELECT/UPDATE their own row (owner/admin only for UPDATE); INSERT/DELETE service_role only (admin approval flow).
+
+**§3.13.2 `supplier_users`**
+UUID PK. `auth_uid uuid NOT NULL UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE` (non-standard FK — parallel auth channel). `supplier_id uuid NOT NULL REFERENCES suppliers(id) ON DELETE CASCADE`. email, full_name, `role` CHECK (`owner`/`admin`/`editor`). `is_active boolean`. last_login_at, created_at, updated_at. **UNIQUE (auth_uid)** means one auth user belongs to exactly one supplier. RLS: self-SELECT (`auth_uid = auth.uid()`); co-supplier SELECT (members of same supplier); self-UPDATE; INSERT/DELETE service_role only.
+
+**§3.13.3 `supplier_categories`**
+UUID PK. `supplier_id uuid NOT NULL` FK to suppliers. `parent_category_id uuid NULL` self-FK (hierarchical). name, slug, sort_order, is_active, created_at, updated_at. **UNIQUE (supplier_id, slug)**. RLS: authenticated SELECT (inherits supplier visibility, active categories of active suppliers); supplier-portal users CRUD own (delete requires owner/admin role).
+
+**§3.13.4 `catalog_products`**
+UUID PK. `supplier_id uuid NOT NULL` FK. `category_id uuid NULL` FK to supplier_categories. `sku`, `name`, description, `unit_of_measure`. `unit_price_cents integer NOT NULL` (note: integer, not bigint — max ~$21M per line item, adequate for building materials; matches production). `price_type` CHECK (`list`/`contractor`/`distributor`/`promo`). `price_effective_date date`, `price_expires_date date NULL`, min_order_quantity, is_active, discontinued_at, metadata jsonb. **UNIQUE (supplier_id, sku)**. RLS: authenticated SELECT active products of active suppliers (plan gate at route); supplier-portal SELECT all their own (including inactive); supplier-portal CRUD own (delete requires owner/admin).
+
+**§3.13.5 `catalog_price_history` (append-only)**
+UUID PK. FK to catalog_products(id) ON DELETE CASCADE. FK to suppliers(id) ON DELETE CASCADE. `old_price_cents integer NULL` (first-record history rows have no prior). `new_price_cents integer NOT NULL`. `price_type` CHECK. `effective_date date`. `change_source` CHECK (`manual`/`ingestion`/`api`/`migration`). created_at only (no updated_at — append-only). RLS: authenticated SELECT (for active suppliers, feeds Ask Chief `supplier_spend` enrichment); supplier-portal SELECT own. **No UPDATE/DELETE policies** — append-only enforced by GRANT posture (service_role SELECT+INSERT only) + planned P3-4c column-restriction trigger.
+
+**§3.13.6 `catalog_ingestion_log`**
+UUID PK. FK to suppliers. `source_type` CHECK (`xlsx_upload`/`csv_upload`/`email_attachment`/`api`/`manual`). source_filename, source_email_id, products_added/updated/discontinued counts, prices_changed, errors, error_details jsonb. `status` CHECK (`pending`/`processing`/`completed`/`failed`/`partial`). started_at, completed_at, created_at. RLS: supplier-portal SELECT own only (not visible to contractor portal). INSERT/UPDATE service_role only (ingestion pipeline).
+
+**§3.13.7 `tenant_supplier_preferences`**
+UUID PK. `tenant_id uuid NOT NULL` FK to chiefos_tenants (production lacked this FK; rebuild adds). `supplier_id uuid NOT NULL` FK to suppliers. `is_preferred boolean` (NOT a 3-way enum — matches production). `contractor_account_number text`, `discount_percentage integer CHECK (0-100)`, notes, created_at, updated_at. **UNIQUE (tenant_id, supplier_id)** — one row per (tenant, supplier). **No owner_id** — tenant-only scope (preferences are a tenant-level decision). RLS: standard tenant-membership SELECT; INSERT/UPDATE/DELETE gated to owner/board_member roles.
+
+---
+
+## 3.14 RAG Knowledge (Added via Phase 4.5 Gap 3 / Session P1A-3)
+
+The RAG (Retrieval-Augmented Generation) cluster is load-bearing for the brain layer: every conversation with Chief consults it for grounded answers, SOP snippets, and accumulated tenant-specific facts. Four tables across three migration files.
+
+Phase 1 §6.1 originally DISCARDed the RAG surface as "not yet used." Phase 4.5 Gap 3 corrected the decision — `services/tools/rag.js`, `services/rag_search.js`, `services/ragTerms.js`, and `services/learning.js` all depend on it, and the agent tool registry wires `rag_search` as an active tool. Session P1A-3 delivered the rebuild migrations.
+
+### Design decisions resolved during Session P1A-3
+
+- **Decision F (GLOBAL + per-owner hybrid on docs/doc_chunks):** `owner_id text NOT NULL` supports both the `'GLOBAL'` sentinel (system-wide SOPs readable by all tenants) and per-tenant digit-string owner ids. `services/tools/rag.js` defaults `ownerId='GLOBAL'` when unscoped; `fetchRagContext` can narrow by tenant when provided. No `tenant_id` column — RAG uses the ingestion owner_id boundary and resolves to tenant via `chiefos_tenants` for portal reads.
+- **Decision G (embedding dimension pinned at 1536):** matches OpenAI `text-embedding-3-small` used in `services/tools/rag.js`. Rebuild pins the column as `vector(1536)` rather than the unbounded `vector` that production has. A future model swap (e.g., to `text-embedding-3-large` at 3072) requires a migration.
+- **Decision H (fully-GLOBAL glossary on rag_terms):** no scoping columns. Parallels suppliers (also GLOBAL) but simpler — a single shared dictionary, curated by service_role, readable by all authenticated users.
+- **Decision I (drift correction on tenant_knowledge.owner_id):** production typed the column `uuid`, but `services/learning.js` passes `ctx.owner_id` (text digit-string). Type mismatch means production row count is 0 — the code path has never completed an INSERT. Rebuild corrects to `text`. No data migration needed.
+- **Decision J (ivfflat index consolidation):** production has two ivfflat indexes on `doc_chunks.embedding` (one default, one with `lists=50`) and two btree indexes on `owner_id`. Rebuild consolidates to one of each: ivfflat `WITH (lists=100)` and a single btree.
+
+### Tables
+
+**§3.14.1 `docs` (RAG document root)**
+UUID PK. `owner_id text NOT NULL` (supports `'GLOBAL'` + digit-strings). `source text NOT NULL` (free text — no CHECK; production has none). title, `path text NOT NULL`, mime, `sha text NOT NULL`, `file_hash text NULL` (preserved from production — second hash distinct from sha; unclear purpose, retained). created_at, updated_at. **UNIQUE (owner_id, path, sha)**. RLS: authenticated SELECT where `owner_id='GLOBAL'` OR owner_id maps to a tenant the user belongs to; writes service_role only (backend ingestion via DATABASE_URL pool).
+
+**§3.14.2 `doc_chunks` (vectorized chunks)**
+UUID PK. `doc_id uuid NOT NULL REFERENCES docs(id) ON DELETE CASCADE`. `owner_id text NOT NULL` (duplicated from parent for cheap non-vector filtering). `idx integer NOT NULL CHECK (idx >= 0)`. `content text NOT NULL`. `metadata jsonb`. `embedding vector(1536)`. sha, created_at. **UNIQUE (doc_id, idx)**. Indexes: btree(doc_id), btree(owner_id), ivfflat(embedding vector_cosine_ops) lists=100. Consumer query pattern: `ORDER BY c.embedding <=> $::vector LIMIT k` (cosine distance). RLS: same as docs.
+
+**§3.14.3 `rag_terms` (GLOBAL glossary)**
+UUID PK. `term text NOT NULL` (CHECK not-blank). meaning, `cfo_map text` (brain-layer mapping hint), `nudge text` (coaching-style hint), source, created_at, updated_at. **UNIQUE index on `lower(term)`** (case-insensitive one-entry-per-term — rebuild addition; production had a non-unique btree only). Fully GLOBAL — no scoping columns. RLS: authenticated SELECT `USING (true)`; writes service_role only (curated dictionary).
+
+**§3.14.4 `tenant_knowledge` (accumulated CIL-derived facts)**
+Composite PK (`owner_id`, `kind`, `key`) — doubles as UPSERT dedupe key. No surrogate id column. `owner_id text NOT NULL` **(drift-corrected: production typed this as uuid)**. `kind text NOT NULL` (known values: `job_name`, `vendor`, `material`, `customer` — no CHECK; kinds expected to grow). `key text NOT NULL` (canonicalized lowercased/trimmed by `services/learning.js`). `first_seen`, `last_seen` timestamptz. `seen_count integer DEFAULT 1 CHECK (>= 1)`. `confidence real DEFAULT 0.6 CHECK (0.0-1.0)`. Indexes: PK, btree(owner_id, last_seen DESC), btree(owner_id, kind). RLS: authenticated SELECT where owner_id maps to user's tenant; writes service_role only.
+
+### Consumer-side touch-points (reference)
+
+- `services/tools/rag.js` — vector search via `<=> ::vector` on doc_chunks JOIN docs; agent tool `rag_search` in agent registry.
+- `services/rag_search.js` — keyword search via on-the-fly `to_tsvector('english', content) @@ plainto_tsquery(...)` on doc_chunks. No materialized tsvector column.
+- `services/ragTerms.js` — case-insensitive exact-match lookup on rag_terms.
+- `services/learning.js` — UPSERT into tenant_knowledge from validated CIL events (Onboarding/Clock/Expense/Quote switch cases).

@@ -9856,3 +9856,797 @@ describeIfDb('VoidQuote — §1: emitLifecycleVoided (integration)', () => {
     }
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase A Session 4 §2 tests: handleVoidQuote + return-shape composers
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Four blocks:
+//   - Pre-BEGIN rejection (3 unit tests, no DB)
+//   - Block 1: handleVoidQuote integration (13 tests, real DB)
+//   - Block 2: buildVoidQuoteReturnShape composer unit (13 tests, no DB)
+//   - Block 3: alreadyVoidedReturnShape composer unit (10 tests, no DB)
+
+const { handleVoidQuote } = require('./quotes');
+const {
+  buildVoidQuoteReturnShape: _bvoidShape,
+  alreadyVoidedReturnShape: _avoidShape,
+} = _internals;
+
+describe('VoidQuote — §2: handleVoidQuote (pre-BEGIN rejection)', () => {
+  const VALID_VOID_QUOTE_ID = '00000000-c5c5-c5c5-c5c5-000000000002';
+
+  function validVoidCil(overrides = {}) {
+    return {
+      cil_version: '1.0',
+      type: 'VoidQuote',
+      tenant_id: '00000000-c5c5-c5c5-c5c5-000000000001',
+      source: 'system',
+      source_msg_id: 'test-void-prebegin-1',
+      actor: { role: 'system', actor_id: 'system:cooling-period-expiry' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      quote_ref: { quote_id: VALID_VOID_QUOTE_ID },
+      voided_reason: 'pre-BEGIN test reason',
+      ...overrides,
+    };
+  }
+
+  test('Test 1 — ctx missing owner_id → OWNER_ID_MISSING envelope', async () => {
+    const result = await handleVoidQuote(validVoidCil(), { traceId: 'trace-vq-pb-1' });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('OWNER_ID_MISSING');
+    expect(result.error.traceId).toBe('trace-vq-pb-1');
+  });
+
+  test('Test 2 — ctx missing traceId → TRACE_ID_MISSING envelope', async () => {
+    const result = await handleVoidQuote(validVoidCil(), { owner_id: '99999999999' });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('TRACE_ID_MISSING');
+    expect(result.error.traceId).toBeNull();
+  });
+
+  test('Test 3 — Zod failure (missing voided_reason) → CIL_SCHEMA_INVALID envelope', async () => {
+    // Exercises the §1 schema obligation through the handler entry point —
+    // voided_reason missing is the canonical Zod-failure case for VoidQuote.
+    const { voided_reason: _v, ...bad } = validVoidCil();
+    const result = await handleVoidQuote(bad, {
+      owner_id: '99999999999', traceId: 'trace-vq-pb-3',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('CIL_SCHEMA_INVALID');
+    expect(result.error.traceId).toBe('trace-vq-pb-3');
+  });
+});
+
+describeIfDb('VoidQuote — §2: handleVoidQuote (integration)', () => {
+  const VOID_TENANT_ID = MISSION_TENANT_UUID;
+  let pool;
+
+  beforeAll(async () => {
+    const pg = require('../../services/postgres');
+    pool = pg.pool;
+  });
+
+  const {
+    insertQuoteHeader: _ihq,
+    insertQuoteVersion: _ivq,
+    setQuoteCurrentVersion: _spv,
+    composeTenantSnapshot: _cts,
+  } = _internals;
+
+  // Seed a quote at pool scope (no BEGIN/ROLLBACK — handleVoidQuote opens
+  // its own pg.withClient transaction). Source state argument flips the
+  // header+version into the requested state. Avoids handleSendQuote /
+  // handleSignQuote dependency chain.
+  async function seedQuoteForVoid({ pg, ownerId, tenantId, sourceMsgId, sourceStatus }) {
+    await pg.query(
+      `INSERT INTO public.users (user_id, plan_key, sub_status, created_at)
+       VALUES ($1, 'starter', 'active', NOW())`,
+      [ownerId]
+    );
+
+    return pg.withClient(async (client) => {
+      const customerRow = await client.query(
+        `INSERT INTO public.customers (tenant_id, name, email, phone, address)
+         VALUES ($1, 'VoidQuote Integration Customer', 'void-test@chiefos.test', '+15195550299', '1 Test Way, London, ON')
+         RETURNING id`,
+        [tenantId]
+      );
+      const customerId = customerRow.rows[0].id;
+
+      const jobRow = await client.query(
+        `INSERT INTO public.jobs
+           (owner_id, job_no, job_name, name, active, start_date, status, created_at, updated_at)
+         VALUES ($1, $2, 'VoidQuote Integration Job', 'VoidQuote Integration Job',
+                 true, NOW(), 'active', NOW(), NOW())
+         RETURNING id`,
+        [ownerId, Math.floor(Math.random() * 9000) + 1000]
+      );
+      const jobId = jobRow.rows[0].id;
+
+      const seq = await pg.allocateNextDocCounter(tenantId, 'quote', client);
+      const humanId = `QT-2026-04-25-${String(seq).padStart(4, '0')}`;
+
+      const header = await _ihq(client, {
+        tenantId, ownerId, jobId, customerId,
+        humanId, source: 'whatsapp', sourceMsgId,
+      });
+      const version = await _ivq(client, {
+        quoteId: header.id, tenantId, ownerId,
+        data: {
+          project: { title: 'VoidQuote Integration', scope: null },
+          currency: 'CAD', deposit_cents: 0, tax_code: null, tax_rate_bps: 1300,
+          warranty_snapshot: {}, clauses_snapshot: {}, payment_terms: {},
+          warranty_template_ref: null, clauses_template_ref: null,
+        },
+        totals: { subtotal_cents: 1000, tax_cents: 130, total_cents: 1130 },
+        customerSnapshot: { name: 'VoidQuote Integration Customer', email: 'void-test@chiefos.test' },
+        tenantSnapshot: _cts(tenantId),
+      });
+      await _spv(client, {
+        quoteId: header.id, versionId: version.id,
+        tenantId, ownerId,
+      });
+
+      if (sourceStatus === 'signed' || sourceStatus === 'locked') {
+        await client.query(
+          `UPDATE public.chiefos_quotes SET status=$2, updated_at=NOW() WHERE id=$1`,
+          [header.id, sourceStatus]
+        );
+        await client.query(
+          `UPDATE public.chiefos_quote_versions
+              SET status='signed', issued_at=NOW(), sent_at=NOW(),
+                  signed_at=NOW(), locked_at=NOW(), server_hash=$2
+            WHERE id=$1`,
+          [version.id, 'a'.repeat(64)]
+        );
+      } else if (sourceStatus === 'sent' || sourceStatus === 'viewed') {
+        await client.query(
+          `UPDATE public.chiefos_quotes SET status=$2 WHERE id=$1`,
+          [header.id, sourceStatus]
+        );
+        await client.query(
+          `UPDATE public.chiefos_quote_versions
+              SET status=$2, issued_at=NOW(), sent_at=NOW()
+            WHERE id=$1`,
+          [version.id, sourceStatus]
+        );
+      }
+
+      return { quoteId: header.id, versionId: version.id, humanId, customerId, jobId };
+    });
+  }
+
+  async function cleanupVoidTest({ pg, ownerId, quoteId }) {
+    // Same shape as cleanupLockTest. Header status flip to 'voided' is
+    // permitted on the header (status column not guarded by the immutable
+    // trigger). VoidQuote tests will often have already voided the quote.
+    await pg.query(
+      `UPDATE public.chiefos_quotes SET current_version_id = NULL WHERE id = $1`,
+      [quoteId]
+    ).catch(() => {});
+    await pg.query(
+      `DELETE FROM public.chiefos_quote_line_items
+        WHERE quote_version_id IN
+              (SELECT id FROM public.chiefos_quote_versions WHERE quote_id = $1)`,
+      [quoteId]
+    ).catch(() => {});
+    await pg.query(
+      `UPDATE public.chiefos_quotes
+          SET status = 'voided', voided_at = COALESCE(voided_at, NOW()),
+              voided_reason = COALESCE(voided_reason, 'test-cleanup'),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [quoteId]
+    ).catch(() => {});
+    await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+  }
+
+  function buildVoidCil({ tenantId, quoteRef, sourceMsgId, voidedReason, actor }) {
+    const cil = {
+      cil_version: '1.0',
+      type: 'VoidQuote',
+      tenant_id: tenantId,
+      source: 'system',
+      actor: actor || { role: 'system', actor_id: 'system:cooling-period-expiry' },
+      occurred_at: new Date().toISOString(),
+      job: null,
+      needs_job_resolution: false,
+      quote_ref: quoteRef,
+      voided_reason: voidedReason || 'integration test reason',
+    };
+    if (sourceMsgId !== undefined) cil.source_msg_id = sourceMsgId;
+    return cil;
+  }
+
+  // Detailed happy-path tests for 3 representative source states. For each:
+  // header status=voided, voided_at populated, voided_reason persisted,
+  // §17.21 correlation_id wiring, version row §3A regression lock, event
+  // payload structure (voided_reason in payload + source_msg_id echo).
+  test.each(['draft', 'signed', 'locked'])(
+    'Test 1.x — Happy path: %s → voided + lifecycle.voided emitted + version untouched + §17.21 wiring',
+    async (sourceStatus) => {
+      const pg = require('../../services/postgres');
+      const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+      const seedMsgId = `test-vq-happy-${sourceStatus}-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+      let quoteId;
+      try {
+        const seed = await seedQuoteForVoid({
+          pg, ownerId, tenantId: VOID_TENANT_ID, sourceMsgId: seedMsgId, sourceStatus,
+        });
+        quoteId = seed.quoteId;
+
+        const versionBefore = await pg.query(
+          `SELECT status, locked_at, server_hash, signed_at, sent_at, viewed_at, issued_at
+             FROM public.chiefos_quote_versions WHERE id = $1`,
+          [seed.versionId]
+        );
+
+        const callMsgId = `test-vq-happy-${sourceStatus}-${Date.now()}`;
+        const cil = buildVoidCil({
+          tenantId: VOID_TENANT_ID,
+          quoteRef: { quote_id: seed.quoteId },
+          sourceMsgId: callMsgId,
+          voidedReason: `test void from ${sourceStatus}`,
+        });
+        const result = await handleVoidQuote(cil, {
+          owner_id: ownerId, traceId: `trace-vq-happy-${sourceStatus}`,
+        });
+
+        expect(result.ok).toBe(true);
+        expect(result.quote.id).toBe(seed.quoteId);
+        expect(result.quote.status).toBe('voided');
+        expect(result.quote.voided_at).not.toBeNull();
+        expect(result.quote.voided_reason).toBe(`test void from ${sourceStatus}`);
+        expect(result.version.id).toBe(seed.versionId);
+        expect(result.meta.already_existed).toBe(false);
+        expect(result.meta.events_emitted).toEqual(['lifecycle.voided']);
+        expect(result.meta.correlation_id).toMatch(/^[0-9a-f-]{36}$/);
+        expect(result.meta.traceId).toBe(`trace-vq-happy-${sourceStatus}`);
+
+        // §17.21 cross-event invariant: lifecycle.voided event row carries
+        // SAME correlation_id surfaced in meta. Catches a regression where
+        // the helper defaults to null.
+        const eventRows = await pg.query(
+          `SELECT correlation_id, payload, quote_version_id
+             FROM public.chiefos_quote_events
+            WHERE quote_id = $1 AND kind = 'lifecycle.voided'`,
+          [seed.quoteId]
+        );
+        expect(eventRows.rows).toHaveLength(1);
+        expect(eventRows.rows[0].correlation_id).toBe(result.meta.correlation_id);
+        // Quote-scoped per chiefos_qe_quote_scoped_kinds CHECK.
+        expect(eventRows.rows[0].quote_version_id).toBeNull();
+        // Payload carries voided_reason (CHECK obligation) + source_msg_id (§17.25 echo).
+        expect(eventRows.rows[0].payload.voided_reason).toBe(`test void from ${sourceStatus}`);
+        expect(eventRows.rows[0].payload.source_msg_id).toBe(callMsgId);
+
+        // §3A regression: version row UNCHANGED across the void transition.
+        const versionAfter = await pg.query(
+          `SELECT status, locked_at, server_hash, signed_at, sent_at, viewed_at, issued_at
+             FROM public.chiefos_quote_versions WHERE id = $1`,
+          [seed.versionId]
+        );
+        expect(versionAfter.rows[0]).toEqual(versionBefore.rows[0]);
+
+        // Header DB state matches return shape.
+        const headerAfter = await pg.query(
+          `SELECT status, voided_reason FROM public.chiefos_quotes WHERE id = $1`,
+          [seed.quoteId]
+        );
+        expect(headerAfter.rows[0].status).toBe('voided');
+        expect(headerAfter.rows[0].voided_reason).toBe(`test void from ${sourceStatus}`);
+      } finally {
+        if (quoteId) {
+          await cleanupVoidTest({ pg, ownerId, quoteId });
+        } else {
+          await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+        }
+      }
+    },
+    30000
+  );
+
+  test.each(['sent', 'viewed'])(
+    'Test 1.y — Happy path smoke: %s → voided',
+    async (sourceStatus) => {
+      const pg = require('../../services/postgres');
+      const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+      const seedMsgId = `test-vq-smoke-${sourceStatus}-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+      let quoteId;
+      try {
+        const seed = await seedQuoteForVoid({
+          pg, ownerId, tenantId: VOID_TENANT_ID, sourceMsgId: seedMsgId, sourceStatus,
+        });
+        quoteId = seed.quoteId;
+
+        const result = await handleVoidQuote(
+          buildVoidCil({
+            tenantId: VOID_TENANT_ID,
+            quoteRef: { quote_id: seed.quoteId },
+            sourceMsgId: `test-vq-smoke-${sourceStatus}-${Date.now()}`,
+            voidedReason: `smoke void from ${sourceStatus}`,
+          }),
+          { owner_id: ownerId, traceId: `trace-vq-smoke-${sourceStatus}` }
+        );
+        expect(result.ok).toBe(true);
+        expect(result.quote.status).toBe('voided');
+      } finally {
+        if (quoteId) {
+          await cleanupVoidTest({ pg, ownerId, quoteId });
+        } else {
+          await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+        }
+      }
+    },
+    30000
+  );
+
+  test('Test 2 — Already-voided idempotency (pre-txn routing): returns alreadyVoided shape with PERSISTED reason; uses human_id ref', async () => {
+    // Founder-locked retry semantics: current call's voided_reason is
+    // silently dropped; persisted original is returned. Mirrors §17.21
+    // correlation_id retry-path posture.
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-vq-already-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedQuoteForVoid({
+        pg, ownerId, tenantId: VOID_TENANT_ID, sourceMsgId: seedMsgId, sourceStatus: 'signed',
+      });
+      quoteId = seed.quoteId;
+
+      // Pre-flip header to voided with a specific persisted reason.
+      await pg.query(
+        `UPDATE public.chiefos_quotes
+            SET status='voided', voided_at=NOW(),
+                voided_reason='persisted original reason', updated_at=NOW()
+          WHERE id=$1`,
+        [seed.quoteId]
+      );
+
+      const result = await handleVoidQuote(
+        buildVoidCil({
+          tenantId: VOID_TENANT_ID,
+          quoteRef: { human_id: seed.humanId },
+          sourceMsgId: `test-vq-already-${Date.now()}`,
+          voidedReason: 'second call reason (should be DROPPED)',
+        }),
+        { owner_id: ownerId, traceId: 'trace-vq-already' }
+      );
+
+      expect(result.ok).toBe(true);
+      expect(result.quote.status).toBe('voided');
+      // KEY: persisted reason returned, NOT current call's reason.
+      expect(result.quote.voided_reason).toBe('persisted original reason');
+      expect(result.meta.already_existed).toBe(true);
+      expect(result.meta.events_emitted).toEqual([]);
+      expect(result.meta.correlation_id).toBeNull();  // §17.21 retry-path limitation
+    } finally {
+      if (quoteId) {
+        await cleanupVoidTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 3 — Concurrent-transition retry (§17.23 recovery): pre-flip BEFORE handler invocation simulates concurrent winner; alreadyVoided shape returned with persisted reason', async () => {
+    // Cannot easily simulate a true mid-handler concurrent transition
+    // without injecting hooks into pg.withClient. The pre-flip pattern
+    // exercises the same downstream code path: loadVoidContext returns
+    // quote_status='voided', Step 5 routes to alreadyVoidedReturnShape.
+    // Real concurrent-transition recovery (Step 7a) requires racing
+    // transactions and is covered structurally by the §1 markQuoteVoided
+    // rowcount=0 unit test combined with this Step 5 routing test.
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-vq-recover-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedQuoteForVoid({
+        pg, ownerId, tenantId: VOID_TENANT_ID, sourceMsgId: seedMsgId, sourceStatus: 'locked',
+      });
+      quoteId = seed.quoteId;
+
+      await pg.query(
+        `UPDATE public.chiefos_quotes
+            SET status='voided', voided_at=NOW(),
+                voided_reason='winner reason from concurrent VoidQuote', updated_at=NOW()
+          WHERE id=$1`,
+        [seed.quoteId]
+      );
+
+      const result = await handleVoidQuote(
+        buildVoidCil({
+          tenantId: VOID_TENANT_ID,
+          quoteRef: { quote_id: seed.quoteId },
+          sourceMsgId: `test-vq-recover-${Date.now()}`,
+          voidedReason: 'loser reason (silently dropped)',
+        }),
+        { owner_id: ownerId, traceId: 'trace-vq-recover' }
+      );
+      expect(result.ok).toBe(true);
+      expect(result.quote.voided_reason).toBe('winner reason from concurrent VoidQuote');
+      expect(result.meta.already_existed).toBe(true);
+    } finally {
+      if (quoteId) {
+        await cleanupVoidTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 4 — Cross-tenant fail-closed: QUOTE_NOT_FOUND_OR_CROSS_OWNER', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-vq-xtenant-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedQuoteForVoid({
+        pg, ownerId, tenantId: VOID_TENANT_ID, sourceMsgId: seedMsgId, sourceStatus: 'signed',
+      });
+      quoteId = seed.quoteId;
+
+      const result = await handleVoidQuote(
+        buildVoidCil({
+          tenantId: FOREST_CITY_TENANT_UUID,  // cross-tenant
+          quoteRef: { quote_id: seed.quoteId },
+          sourceMsgId: `test-vq-xtenant-${Date.now()}`,
+        }),
+        { owner_id: ownerId, traceId: 'trace-vq-xtenant' }
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTE_NOT_FOUND_OR_CROSS_OWNER');
+    } finally {
+      if (quoteId) {
+        await cleanupVoidTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+
+  test('Test 5 — Cross-owner fail-closed: same error code, owner mismatch within tenant', async () => {
+    const pg = require('../../services/postgres');
+    const ownerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const wrongOwnerId = `99${Math.floor(Math.random() * 1e11).toString().padStart(11, '0')}`;
+    const seedMsgId = `test-vq-xowner-seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    let quoteId;
+    try {
+      const seed = await seedQuoteForVoid({
+        pg, ownerId, tenantId: VOID_TENANT_ID, sourceMsgId: seedMsgId, sourceStatus: 'signed',
+      });
+      quoteId = seed.quoteId;
+
+      const result = await handleVoidQuote(
+        buildVoidCil({
+          tenantId: VOID_TENANT_ID,
+          quoteRef: { quote_id: seed.quoteId },
+          sourceMsgId: `test-vq-xowner-${Date.now()}`,
+        }),
+        { owner_id: wrongOwnerId, traceId: 'trace-vq-xowner' }
+      );
+      expect(result.ok).toBe(false);
+      expect(result.error.code).toBe('QUOTE_NOT_FOUND_OR_CROSS_OWNER');
+    } finally {
+      if (quoteId) {
+        await cleanupVoidTest({ pg, ownerId, quoteId });
+      } else {
+        await pg.query(`DELETE FROM public.users WHERE user_id = $1`, [ownerId]).catch(() => {});
+      }
+    }
+  }, 30000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VoidQuote — §2 Block 2: buildVoidQuoteReturnShape (happy-path composer)
+// ═══════════════════════════════════════════════════════════════════════════
+
+const S2V_TENANT  = '00000000-c5c5-c5c5-c5c5-000000000001';
+const S2V_OWNER   = '00000000000';
+const S2V_QUOTE   = '00000000-c5c5-c5c5-c5c5-000000000020';
+const S2V_VERSION = '00000000-c5c5-c5c5-c5c5-000000000021';
+const S2V_JOB_ID  = 6001;
+const S2V_CUSTOMER_ID = '00000000-c5c5-c5c5-c5c5-000000000022';
+
+describe('VoidQuote — §2 Block 2: buildVoidQuoteReturnShape (happy-path composer)', () => {
+  // loadVoidContext-shaped ctx for the happy-path composer's input.
+  // quoteStatus represents the pre-txn state (handler transitions to
+  // 'voided' via markQuoteVoided); composer hardcodes 'voided' on the
+  // quote entity output regardless of ctx value.
+  function transitionableCtx(overrides = {}) {
+    return {
+      tenantId: S2V_TENANT,
+      ownerId: S2V_OWNER,
+      quoteId: S2V_QUOTE,
+      humanId: 'QT-2026-04-25-VOID',
+      quoteStatus: 'signed',  // pre-txn; happy-path composer hardcodes 'voided'
+      jobId: S2V_JOB_ID,
+      customerId: S2V_CUSTOMER_ID,
+      currentVersionId: S2V_VERSION,
+      quoteVoidedAt: null,
+      quoteVoidedReason: null,
+      headerCreatedAt: new Date('2026-04-21T09:00:00Z'),
+      headerUpdatedAt: new Date('2026-04-22T12:00:00Z'),  // pre-bump (stale)
+      versionId: S2V_VERSION,
+      versionNo: 1,
+      versionStatus: 'signed',  // pass-through to composer output
+      projectTitle: 'Block 2 Unit Test Project',
+      currency: 'CAD',
+      totalCents: 11300,
+      customerSnapshot: { name: 'Block 2 Customer' },
+      versionIssuedAt: new Date('2026-04-21T10:00:00Z'),
+      versionSentAt: new Date('2026-04-21T11:00:00Z'),
+      versionViewedAt: new Date('2026-04-22T10:00:00Z'),
+      versionSignedAt: new Date('2026-04-22T12:00:00Z'),
+      versionLockedAt: new Date('2026-04-22T12:00:00Z'),
+      versionServerHash: 'a'.repeat(64),
+      ...overrides,
+    };
+  }
+
+  function markResultFixture(overrides = {}) {
+    return {
+      transitioned: true,
+      quoteUpdatedAt: new Date('2026-04-25T14:30:00Z'),  // fresh bump
+      quoteVoidedAt: new Date('2026-04-25T14:30:00Z'),   // same NOW() in single statement
+      ...overrides,
+    };
+  }
+
+  function baseInputs(overrides = {}) {
+    return {
+      ctx: transitionableCtx(),
+      markResult: markResultFixture(),
+      voidedReason: 'happy-path test reason',
+      correlationId: '00000000-aaaa-bbbb-cccc-000000000020',
+      eventsEmitted: ['lifecycle.voided'],
+      alreadyExisted: false,
+      traceId: 'trace-s2v-1',
+      ...overrides,
+    };
+  }
+
+  it('Test 1 — ok:true present on happy-path output', () => {
+    expect(_bvoidShape(baseInputs()).ok).toBe(true);
+  });
+
+  it('Test 2 — 3 entities present (quote, version, meta) — NO share_token entity', () => {
+    const shape = _bvoidShape(baseInputs());
+    expect(shape).toHaveProperty('quote');
+    expect(shape).toHaveProperty('version');
+    expect(shape).toHaveProperty('meta');
+    expect(shape).not.toHaveProperty('share_token');
+  });
+
+  it('Test 3 — meta.correlation_id matches input correlationId', () => {
+    expect(_bvoidShape(baseInputs()).meta.correlation_id)
+      .toBe('00000000-aaaa-bbbb-cccc-000000000020');
+  });
+
+  it('Test 4 — meta.already_existed = false (passed through from input)', () => {
+    expect(_bvoidShape(baseInputs()).meta.already_existed).toBe(false);
+  });
+
+  it("Test 5 — meta.events_emitted = ['lifecycle.voided'] (passed through from input)", () => {
+    expect(_bvoidShape(baseInputs()).meta.events_emitted).toEqual(['lifecycle.voided']);
+  });
+
+  it('Test 6 — meta.traceId matches input', () => {
+    expect(_bvoidShape(baseInputs({ traceId: 'trace-s2v-6' })).meta.traceId).toBe('trace-s2v-6');
+  });
+
+  it("Test 7 — quote.status hardcoded to 'voided' (composer does not read ctx.quoteStatus)", () => {
+    // Regression guard: even if ctx carries an unexpected status, the
+    // happy-path composer must emit 'voided'.
+    const shape = _bvoidShape(baseInputs({ ctx: transitionableCtx({ quoteStatus: 'DRIFT_SHOULD_NOT_LEAK' }) }));
+    expect(shape.quote.status).toBe('voided');
+  });
+
+  it('Test 8 — quote.updated_at from markResult.quoteUpdatedAt (fresh bump), NOT ctx.headerUpdatedAt', () => {
+    const freshBump = new Date('2026-04-25T14:30:00Z');
+    const staleCtx = new Date('2026-04-22T12:00:00Z');
+    const shape = _bvoidShape(baseInputs({
+      ctx: transitionableCtx({ headerUpdatedAt: staleCtx }),
+      markResult: markResultFixture({ quoteUpdatedAt: freshBump }),
+    }));
+    expect(shape.quote.updated_at).toEqual(freshBump);
+    expect(shape.quote.updated_at).not.toEqual(staleCtx);
+  });
+
+  it('Test 9 — quote.voided_at from markResult.quoteVoidedAt (fresh from UPDATE)', () => {
+    const fresh = new Date('2026-04-25T14:30:00Z');
+    const shape = _bvoidShape(baseInputs({
+      markResult: markResultFixture({ quoteVoidedAt: fresh }),
+    }));
+    expect(shape.quote.voided_at).toEqual(fresh);
+  });
+
+  it('Test 10 — quote.voided_reason from voidedReason param (current call reason on happy path)', () => {
+    const shape = _bvoidShape(baseInputs({ voidedReason: 'specific happy-path reason' }));
+    expect(shape.quote.voided_reason).toBe('specific happy-path reason');
+  });
+
+  it('Test 11 — version.status pass-through from ctx (NOT hardcoded — proves composer reads ctx)', () => {
+    // §3A canonical asymmetry case. Source state's version.status carries
+    // through unchanged. This contract differs from LockQuote (which
+    // hardcodes 'signed') because VoidQuote can void from any of 5 source
+    // states — version.status varies accordingly.
+    const shape = _bvoidShape(baseInputs({ ctx: transitionableCtx({ versionStatus: 'draft' }) }));
+    expect(shape.version.status).toBe('draft');
+
+    const shape2 = _bvoidShape(baseInputs({ ctx: transitionableCtx({ versionStatus: 'sent' }) }));
+    expect(shape2.version.status).toBe('sent');
+  });
+
+  it('Test 12 — quote entity has exactly 10 expected keys (exact-key-match regression lock)', () => {
+    const shape = _bvoidShape(baseInputs());
+    expect(Object.keys(shape.quote).sort()).toEqual([
+      'created_at',
+      'current_version_id',
+      'customer_id',
+      'human_id',
+      'id',
+      'job_id',
+      'status',
+      'updated_at',
+      'voided_at',
+      'voided_reason',
+    ]);
+  });
+
+  it('Test 13 — version entity has exactly 12 expected keys (exact-key-match regression lock)', () => {
+    const shape = _bvoidShape(baseInputs());
+    expect(Object.keys(shape.version).sort()).toEqual([
+      'currency',
+      'id',
+      'issued_at',
+      'locked_at',
+      'project_title',
+      'sent_at',
+      'server_hash',
+      'signed_at',
+      'status',
+      'total_cents',
+      'version_no',
+      'viewed_at',
+    ]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VoidQuote — §2 Block 3: alreadyVoidedReturnShape (prior-state composer)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// This composer serves two handler paths:
+//   1. Pre-txn routing when quoteStatus === 'voided' (Step 5)
+//   2. Post-rollback re-read after concurrent transition (Step 7a)
+// Shape is IDENTICAL regardless of which path invoked it — composer is
+// caller-oblivious, mirroring alreadyLockedReturnShape's posture.
+
+describe('VoidQuote — §2 Block 3: alreadyVoidedReturnShape (prior-state composer)', () => {
+  // loadVoidContext-shaped ctx representing pre-existing voided state.
+  // quoteStatus='voided'; quoteVoidedAt and quoteVoidedReason populated
+  // (persisted from the original void invocation). versionStatus is the
+  // pre-void version state — could be any of draft/sent/viewed/signed
+  // depending on which state the void transitioned from. §3A: version
+  // never changes across the transition.
+  function voidedCtx(overrides = {}) {
+    return {
+      tenantId: S2V_TENANT,
+      ownerId: S2V_OWNER,
+      quoteId: S2V_QUOTE,
+      humanId: 'QT-2026-04-25-VOID',
+      quoteStatus: 'voided',
+      jobId: S2V_JOB_ID,
+      customerId: S2V_CUSTOMER_ID,
+      currentVersionId: S2V_VERSION,
+      quoteVoidedAt: new Date('2026-04-24T08:00:00Z'),  // persisted
+      quoteVoidedReason: 'persisted original reason',    // persisted
+      headerCreatedAt: new Date('2026-04-21T09:00:00Z'),
+      headerUpdatedAt: new Date('2026-04-24T08:00:00Z'),  // post-original-void; no fresh bump
+      versionId: S2V_VERSION,
+      versionNo: 1,
+      versionStatus: 'signed',  // §3A: unchanged across void (signed source)
+      projectTitle: 'Block 3 Unit Test Project',
+      currency: 'CAD',
+      totalCents: 11300,
+      customerSnapshot: { name: 'Block 3 Customer' },
+      versionIssuedAt: new Date('2026-04-21T10:00:00Z'),
+      versionSentAt: new Date('2026-04-21T11:00:00Z'),
+      versionViewedAt: new Date('2026-04-22T10:00:00Z'),
+      versionSignedAt: new Date('2026-04-22T12:00:00Z'),
+      versionLockedAt: new Date('2026-04-22T12:00:00Z'),
+      versionServerHash: 'a'.repeat(64),
+      ...overrides,
+    };
+  }
+
+  it('Test 1 — ok:true present on prior-state output', () => {
+    expect(_avoidShape({ ctx: voidedCtx(), traceId: 't' }).ok).toBe(true);
+  });
+
+  it('Test 2 — 3 entities present (quote, version, meta) — NO share_token entity', () => {
+    const shape = _avoidShape({ ctx: voidedCtx(), traceId: 't' });
+    expect(shape).toHaveProperty('quote');
+    expect(shape).toHaveProperty('version');
+    expect(shape).toHaveProperty('meta');
+    expect(shape).not.toHaveProperty('share_token');
+  });
+
+  it('Test 3 — meta.correlation_id = null (hardcoded — §17.21 retry-path limitation)', () => {
+    expect(_avoidShape({ ctx: voidedCtx(), traceId: 't' }).meta.correlation_id).toBeNull();
+  });
+
+  it('Test 4 — meta.already_existed = true (hardcoded)', () => {
+    expect(_avoidShape({ ctx: voidedCtx(), traceId: 't' }).meta.already_existed).toBe(true);
+  });
+
+  it('Test 5 — meta.events_emitted = [] (hardcoded — no emission on this path)', () => {
+    expect(_avoidShape({ ctx: voidedCtx(), traceId: 't' }).meta.events_emitted).toEqual([]);
+  });
+
+  it('Test 6 — meta.traceId pass-through from input', () => {
+    expect(_avoidShape({ ctx: voidedCtx(), traceId: 'trace-s2v-b3-6' }).meta.traceId).toBe('trace-s2v-b3-6');
+  });
+
+  it('Test 7 — quote.status from ctx (proves composer reads ctx — NOT hardcoded)', () => {
+    // Even if ctx carries an unexpected status, composer should emit it
+    // unchanged (Step 5 routing prevents this composer from being invoked
+    // unless quoteStatus === 'voided', but composer should not depend on
+    // that).
+    const shape = _avoidShape({ ctx: voidedCtx({ quoteStatus: 'DRIFT_FROM_CTX' }), traceId: 't' });
+    expect(shape.quote.status).toBe('DRIFT_FROM_CTX');
+  });
+
+  it('Test 8 — quote.updated_at from ctx.headerUpdatedAt (NO fresh bump — proves no markResult shape leak)', () => {
+    const ctxBump = new Date('2026-04-24T08:00:00Z');
+    const shape = _avoidShape({ ctx: voidedCtx({ headerUpdatedAt: ctxBump }), traceId: 't' });
+    expect(shape.quote.updated_at).toEqual(ctxBump);
+  });
+
+  it('Test 9 — quote.voided_reason from ctx.quoteVoidedReason (PERSISTED original — KEY retry semantics regression lock)', () => {
+    // Load-bearing assertion: the founder-locked retry semantics are
+    // implemented HERE. If a future refactor changes this to read from
+    // the current call's data.voided_reason, retry-path callers would
+    // see their own input echoed back instead of the persisted original.
+    // §17.21 correlation_id retry-path posture parallel.
+    const shape = _avoidShape({
+      ctx: voidedCtx({ quoteVoidedReason: 'load-bearing persisted reason' }),
+      traceId: 't',
+    });
+    expect(shape.quote.voided_reason).toBe('load-bearing persisted reason');
+  });
+
+  it('Test 10 — version entity has exactly 12 expected keys (exact-key-match regression lock; matches happy-path composer shape)', () => {
+    // Cross-composer entity-shape parity guard between buildVoidQuoteReturnShape
+    // and alreadyVoidedReturnShape. Both emit the same 12-key version entity
+    // — if they drift, consumers parsing `result.version` break on the
+    // prior-state path without warning.
+    const shape = _avoidShape({ ctx: voidedCtx(), traceId: 't' });
+    expect(Object.keys(shape.version).sort()).toEqual([
+      'currency',
+      'id',
+      'issued_at',
+      'locked_at',
+      'project_title',
+      'sent_at',
+      'server_hash',
+      'signed_at',
+      'status',
+      'total_cents',
+      'version_no',
+      'viewed_at',
+    ]);
+  });
+});

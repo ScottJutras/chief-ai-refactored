@@ -4934,6 +4934,351 @@ async function emitLifecycleVoided(client, {
   );
 }
 
+// ─── Phase A Session 4 §2: handleVoidQuote + return-shape composers ─────────
+//
+// Handler orchestrates §1 primitives (VoidQuoteCILZ + loadVoidContext +
+// markQuoteVoided + emitLifecycleVoided). Two return-shape composers:
+// buildVoidQuoteReturnShape (happy path, any-of-five → voided transition)
+// and alreadyVoidedReturnShape (prior-state path: already voided, OR
+// post-rollback re-read after concurrent transition per §17.23 recovery).
+// Same-shape rationale per ViewQuote §17.15 Q2 — separate composers prevent
+// branching logic from accumulating in a parameterized single composer.
+//
+// 3 entities: quote, version, meta. NO share_token entity — VoidQuote is
+// system-only in Phase A (z.literal('system')) and has no customer surface.
+// Phase A.5 widens source to portal/whatsapp but VoidQuote remains owner-
+// or system-side, never customer-side.
+
+/**
+ * buildVoidQuoteReturnShape — §17.15 multi-entity envelope for the happy
+ * path where markQuoteVoided flipped the header from any of the five
+ * valid prior states {draft, sent, viewed, signed, locked} to 'voided'.
+ *
+ * 3 entities: quote (10 keys — 2 more than LockQuote's 8 to carry voided_at
+ * and voided_reason), version (12 keys), meta (4 keys).
+ *
+ * quote.status is hardcoded 'voided' (this composer is happy-path-only;
+ * invoked iff the header was just transitioned).
+ *
+ * version.status is PASS-THROUGH from ctx — §3A canonical asymmetry case.
+ * The chiefos_quote_versions enum at Migration 1 line 121 excludes 'voided',
+ * so the version row is unchanged across the void transition regardless of
+ * source state. For signed/locked source states, the version row is also
+ * constitutionally immutable post-sign
+ * (trg_chiefos_quote_versions_guard_immutable). VoidQuote is a header-only
+ * state flip across all source states.
+ *
+ * voidedReason parameter is named (not reached through `data`) for
+ * symmetry with markResult shape — composer reads logical fields from
+ * named parameters regardless of source.
+ */
+function buildVoidQuoteReturnShape({
+  ctx, markResult, voidedReason, correlationId, eventsEmitted, alreadyExisted, traceId,
+}) {
+  return {
+    ok: true,
+    quote: {
+      id: ctx.quoteId,
+      human_id: ctx.humanId,
+      status: 'voided',
+      job_id: ctx.jobId,
+      customer_id: ctx.customerId,
+      current_version_id: ctx.currentVersionId,
+      created_at: ctx.headerCreatedAt,
+      updated_at: markResult.quoteUpdatedAt,
+      voided_at: markResult.quoteVoidedAt,
+      voided_reason: voidedReason,
+    },
+    version: {
+      id: ctx.versionId,
+      version_no: ctx.versionNo,
+      // version.status pass-through from ctx — §3A canonical asymmetry case.
+      // chiefos_quote_versions enum excludes 'voided' (Migration 1 line 121),
+      // so version row is unchanged across the void transition regardless
+      // of source state. For signed/locked source, the version row is also
+      // constitutionally immutable post-sign
+      // (trg_chiefos_quote_versions_guard_immutable). Source state's version
+      // row passes through unchanged on the happy path.
+      status: ctx.versionStatus,
+      project_title: ctx.projectTitle,
+      currency: ctx.currency,
+      total_cents: ctx.totalCents,
+      issued_at: ctx.versionIssuedAt,
+      sent_at: ctx.versionSentAt,
+      viewed_at: ctx.versionViewedAt,
+      signed_at: ctx.versionSignedAt,
+      locked_at: ctx.versionLockedAt,
+      server_hash: ctx.versionServerHash,
+    },
+    meta: {
+      already_existed: alreadyExisted,
+      events_emitted: eventsEmitted,
+      correlation_id: correlationId,
+      traceId,
+    },
+  };
+}
+
+/**
+ * alreadyVoidedReturnShape — prior-state envelope for two handler paths:
+ *   - Pre-txn status routing: quote already in 'voided' state (Step 5)
+ *   - Post-rollback re-read: concurrent transition between Step 4's load
+ *     and Step 6's markQuoteVoided rowcount=0 (§17.23 recovery half)
+ *
+ * Shape is IDENTICAL regardless of which path invoked it — composer is
+ * caller-oblivious (parallel to alreadyLockedReturnShape and
+ * alreadyViewedReturnShape posture).
+ *
+ * Same 3-entity shape as buildVoidQuoteReturnShape. Differences:
+ *   - quote.status / version.status from ctx (not hardcoded — proves
+ *     the composer reads ctx).
+ *   - quote.updated_at = ctx.headerUpdatedAt (no fresh bump; no write
+ *     occurred on this call).
+ *   - quote.voided_at = ctx.quoteVoidedAt (PERSISTED — from prior void).
+ *   - quote.voided_reason = ctx.quoteVoidedReason (PERSISTED — load-bearing
+ *     for retry semantics. Founder-locked decision: silently drop current
+ *     call's voided_reason; return persisted original. Mirrors §17.21
+ *     correlation_id retry-path posture.)
+ *   - version.status / version.locked_at / etc. all from ctx (pass-through).
+ *   - meta.already_existed: true (hardcoded — always true on this path).
+ *   - meta.events_emitted: [] (hardcoded — no emission on this path).
+ *   - meta.correlation_id: null (§17.21 retry-path limitation — no
+ *     VoidQuote-owned row on the prior state to recover the original
+ *     invocation's correlation_id from).
+ */
+function alreadyVoidedReturnShape({ ctx, traceId }) {
+  return {
+    ok: true,
+    quote: {
+      id: ctx.quoteId,
+      human_id: ctx.humanId,
+      status: ctx.quoteStatus,
+      job_id: ctx.jobId,
+      customer_id: ctx.customerId,
+      current_version_id: ctx.currentVersionId,
+      created_at: ctx.headerCreatedAt,
+      updated_at: ctx.headerUpdatedAt,
+      voided_at: ctx.quoteVoidedAt,
+      voided_reason: ctx.quoteVoidedReason,
+    },
+    version: {
+      id: ctx.versionId,
+      version_no: ctx.versionNo,
+      // version.status pass-through from ctx — §3A canonical asymmetry case.
+      // For signed/locked source, version.status is 'signed'; for
+      // draft/sent/viewed source, version.status equals the source state.
+      // VoidQuote never changes the version row.
+      status: ctx.versionStatus,
+      project_title: ctx.projectTitle,
+      currency: ctx.currency,
+      total_cents: ctx.totalCents,
+      issued_at: ctx.versionIssuedAt,
+      sent_at: ctx.versionSentAt,
+      viewed_at: ctx.versionViewedAt,
+      signed_at: ctx.versionSignedAt,
+      locked_at: ctx.versionLockedAt,
+      server_hash: ctx.versionServerHash,
+    },
+    meta: {
+      already_existed: true,
+      events_emitted: [],
+      correlation_id: null,
+      traceId,
+    },
+  };
+}
+
+/**
+ * handleVoidQuote — applies a VoidQuote CIL idiom.
+ *
+ * Sequence:
+ *   Step 0. Ctx preflight (owner_id, traceId required per §17.17 addendum 2)
+ *   Step 1. Zod validation (VoidQuoteCILZ.safeParse)
+ *   Step 2. NO plan gating — see inline rationale comment below
+ *   Step 3. correlation_id = crypto.randomUUID() (§17.21 wired from day one)
+ *   Step 4. loadVoidContext (pre-txn); CilIntegrityError → errEnvelope
+ *           (loader handles QUOTE_NOT_FOUND_OR_CROSS_OWNER and
+ *            CIL_INTEGRITY_ERROR routing per its switch — no wrong-state
+ *            arm; all 5 prior states are valid void sources)
+ *   Step 5. Pre-txn state routing: voided → alreadyVoidedReturnShape
+ *           (no txn); 5 valid prior states → proceed to Step 6
+ *   Step 6. pg.withClient transaction:
+ *             - markQuoteVoided; transitioned:false → concurrent-transition
+ *               signal (rowcount=0 on header UPDATE)
+ *             - emitLifecycleVoided with correlationId + voided_reason +
+ *               sourceMsgId echo
+ *   Step 7a. Concurrent-transition re-read (§17.23 recovery half):
+ *            re-invoke loadVoidContext; return alreadyVoidedReturnShape
+ *            from fresh state (carries persisted voided_reason from the
+ *            winner of the race). Re-read wrapped in its own try/catch.
+ *   Step 7b. Happy path: buildVoidQuoteReturnShape with
+ *            events_emitted=['lifecycle.voided'].
+ *
+ * Dual-actor (owner|system): both paths reach the same state-transition
+ * core (any-of-five → voided header-only). Identity is upstream-resolved
+ * per Posture A (ctx.owner_id from portal session for owner; cron config
+ * for system). loadVoidContext is actor-oblivious — no role branching.
+ */
+async function handleVoidQuote(rawCil, ctx) {
+  // Step 0 — ctx preflight (§17.17 addendum 2)
+  if (!ctx || !ctx.owner_id) {
+    return errEnvelope({
+      code: 'OWNER_ID_MISSING',
+      message: 'ctx.owner_id is required',
+      hint: 'Upstream identity resolver must populate ctx.owner_id before applyCIL',
+      traceId: (ctx && ctx.traceId) || null,
+    });
+  }
+  if (!ctx.traceId) {
+    return errEnvelope({
+      code: 'TRACE_ID_MISSING',
+      message: 'ctx.traceId is required',
+      hint: 'Upstream request handler must populate ctx.traceId before applyCIL',
+      traceId: null,
+    });
+  }
+
+  // Step 1 — Zod validation
+  const parsed = VoidQuoteCILZ.safeParse(rawCil);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const pathStr = issue && issue.path && issue.path.length ? issue.path.join('.') : '<root>';
+    return errEnvelope({
+      code: 'CIL_SCHEMA_INVALID',
+      message: issue ? `${pathStr}: ${issue.message}` : 'VoidQuote input failed validation',
+      hint: 'See docs/QUOTES_SPINE_DECISIONS.md for the VoidQuoteCILZ input contract',
+      traceId: ctx.traceId,
+    });
+  }
+  const data = parsed.data;
+
+  // Step 2 — NO plan gating.
+  //
+  // VoidQuote is a lifecycle state transition on an already-created quote.
+  // Per G6 follow-through principle, creation consumes the plan gate;
+  // downstream lifecycle actions (send, sign, view, lock, void, reissue)
+  // are transitively gated via creation. This matches SendQuote, SignQuote,
+  // ViewQuote, and LockQuote posture — none apply plan gating for the same
+  // reason.
+  //
+  // If VoidQuote develops independent gating semantics in Phase A.5+ (e.g.,
+  // system-initiated cooling-period void counter economics distinct from
+  // owner-initiated void), formalize at the next-free §17.N slot.
+
+  // Step 3 — correlation_id (§17.21 wired from day one)
+  const correlationId = crypto.randomUUID();
+
+  // Step 4 — loadVoidContext (pre-txn)
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  let voidCtx;
+  try {
+    voidCtx = await loadVoidContext({
+      pg,
+      tenantId: data.tenant_id,
+      ownerId: ctx.owner_id,
+      quoteRef: data.quote_ref,
+    });
+  } catch (loadErr) {
+    if (loadErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: loadErr.code,
+        message: loadErr.message,
+        hint: loadErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw loadErr;  // non-CIL errors propagate for 500-class
+  }
+
+  // Step 5 — pre-txn state routing.
+  // Voided is the legitimate idempotent path; return prior-state shape
+  // (with persisted voided_reason from ctx) without opening a transaction.
+  // The 5 valid prior states proceed to Step 6.
+  if (voidCtx.quoteStatus === 'voided') {
+    return alreadyVoidedReturnShape({ ctx: voidCtx, traceId: ctx.traceId });
+  }
+
+  // Step 6 — transaction body
+  const actorSource = CIL_TO_EVENT_ACTOR_SOURCE[data.source];  // 'system' → 'system'
+  let txnResult;
+  try {
+    txnResult = await pg.withClient(async (client) => {
+      const markResult = await markQuoteVoided(client, {
+        quoteId: voidCtx.quoteId,
+        tenantId: voidCtx.tenantId,
+        ownerId: voidCtx.ownerId,
+        voidedReason: data.voided_reason,
+      });
+      if (!markResult.transitioned) {
+        return { concurrentTransition: true };
+      }
+      await emitLifecycleVoided(client, {
+        quoteId: voidCtx.quoteId,
+        tenantId: voidCtx.tenantId,
+        ownerId: voidCtx.ownerId,
+        actorSource,
+        actorUserId: data.actor.actor_id,
+        emittedAt: data.occurred_at,
+        customerId: voidCtx.customerId,
+        correlationId,
+        sourceMsgId: data.source_msg_id,
+        voidedReason: data.voided_reason,
+      });
+      return { markResult, concurrentTransition: false };
+    });
+  } catch (txnErr) {
+    if (txnErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: txnErr.code,
+        message: txnErr.message,
+        hint: txnErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw txnErr;  // 500-class; no classifyCilError branch (state-driven
+                   // idempotency — no INSERT with 23505 surface per §17.23)
+  }
+
+  // Step 7a — concurrent-transition re-read (§17.23 recovery half)
+  if (txnResult.concurrentTransition) {
+    let freshCtx;
+    try {
+      freshCtx = await loadVoidContext({
+        pg,
+        tenantId: data.tenant_id,
+        ownerId: ctx.owner_id,
+        quoteRef: data.quote_ref,
+      });
+    } catch (reReadErr) {
+      // Re-read shouldn't normally throw — VoidQuote is the terminal state.
+      // Wrap defensively in case of an exotic concurrent path (e.g., direct
+      // DB delete between Step 6 and re-read).
+      if (reReadErr instanceof CilIntegrityError) {
+        return errEnvelope({
+          code: reReadErr.code,
+          message: reReadErr.message,
+          hint: reReadErr.hint,
+          traceId: ctx.traceId,
+        });
+      }
+      throw reReadErr;
+    }
+    return alreadyVoidedReturnShape({ ctx: freshCtx, traceId: ctx.traceId });
+  }
+
+  // Step 7b — happy path
+  return buildVoidQuoteReturnShape({
+    ctx: voidCtx,
+    markResult: txnResult.markResult,
+    voidedReason: data.voided_reason,
+    correlationId,
+    eventsEmitted: ['lifecycle.voided'],
+    alreadyExisted: false,
+    traceId: ctx.traceId,
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4944,6 +5289,7 @@ module.exports = {
   handleSignQuote,
   handleViewQuote,
   handleLockQuote,
+  handleVoidQuote,
   CreateQuoteCILZ,
   SendQuoteCILZ,
   // Test-only internals. Not part of the handler's public contract. External
@@ -5055,6 +5401,9 @@ module.exports = {
     // VoidQuote §1 (transaction-body helpers)
     markQuoteVoided,
     emitLifecycleVoided,
+    // VoidQuote §2 (return-shape composers; handler hoisted to top-level)
+    buildVoidQuoteReturnShape,
+    alreadyVoidedReturnShape,
   },
 };
 

@@ -4794,8 +4794,11 @@ async function loadVoidContext({ pg, tenantId, ownerId, quoteRef }) {
     // Persisted void fields — populated when quote_status='voided'; NULL
     // otherwise. §2 alreadyVoidedReturnShape consumes these for the retry
     // path (persisted original, not current call's values — §17.21 parallel).
-    voidedAt: row.voided_at,
-    voidedReason: row.voided_reason,
+    // Field naming uses `quote*` prefix for parity with markResult shape
+    // (markResult.quoteVoidedAt, markResult.quoteUpdatedAt), letting the §2
+    // composer read the same field name regardless of source.
+    quoteVoidedAt: row.voided_at,
+    quoteVoidedReason: row.voided_reason,
     headerCreatedAt: row.header_created_at,
     headerUpdatedAt: row.header_updated_at,
     versionId: row.version_id,

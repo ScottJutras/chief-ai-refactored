@@ -9187,8 +9187,8 @@ describeIfDb('VoidQuote — §1: loadVoidContext (integration)', () => {
         expect(ctx.quoteId).toBe(header.id);
         expect(ctx.versionId).toBe(version.id);
         expect(ctx.quoteStatus).toBe(status);
-        expect(ctx.voidedAt).toBeNull();
-        expect(ctx.voidedReason).toBeNull();
+        expect(ctx.quoteVoidedAt).toBeNull();
+        expect(ctx.quoteVoidedReason).toBeNull();
       } finally {
         await client.query('ROLLBACK').catch(() => {});
         client.release();
@@ -9217,8 +9217,8 @@ describeIfDb('VoidQuote — §1: loadVoidContext (integration)', () => {
         quoteRef: { quote_id: header.id },
       });
       expect(ctx.quoteStatus).toBe('voided');
-      expect(ctx.voidedAt).not.toBeNull();
-      expect(ctx.voidedReason).toBe('persisted original reason');
+      expect(ctx.quoteVoidedAt).not.toBeNull();
+      expect(ctx.quoteVoidedReason).toBe('persisted original reason');
       // §3A: version row unchanged — stays 'signed' (its pre-void value).
       expect(ctx.versionStatus).toBe('signed');
     } finally {

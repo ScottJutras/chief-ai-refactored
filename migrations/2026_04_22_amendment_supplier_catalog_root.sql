@@ -129,44 +129,14 @@ BEGIN
       TO authenticated
       USING (status = 'active' AND is_active = true);
   END IF;
-
-  -- Supplier-portal users: SELECT their own supplier (regardless of status —
-  -- they need to see their pending/suspended state).
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='suppliers'
-                   AND policyname='suppliers_supplier_portal_select') THEN
-    CREATE POLICY suppliers_supplier_portal_select
-      ON public.suppliers FOR SELECT
-      TO authenticated
-      USING (
-        id IN (
-          SELECT supplier_id FROM public.supplier_users
-          WHERE auth_uid = auth.uid() AND is_active = true
-        )
-      );
-  END IF;
-
-  -- Supplier-portal users: UPDATE their own supplier.
-  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='suppliers'
-                   AND policyname='suppliers_supplier_portal_update') THEN
-    CREATE POLICY suppliers_supplier_portal_update
-      ON public.suppliers FOR UPDATE
-      TO authenticated
-      USING (
-        id IN (
-          SELECT supplier_id FROM public.supplier_users
-          WHERE auth_uid = auth.uid() AND is_active = true AND role IN ('owner','admin')
-        )
-      )
-      WITH CHECK (
-        id IN (
-          SELECT supplier_id FROM public.supplier_users
-          WHERE auth_uid = auth.uid() AND is_active = true AND role IN ('owner','admin')
-        )
-      );
-  END IF;
   -- INSERT + DELETE: service_role only (admin approval flow via
   -- routes/supplierPortal.js requireChiefOSAdmin).
 END $$;
+
+-- suppliers_supplier_portal_select + suppliers_supplier_portal_update policies
+-- reference public.supplier_users; created BELOW after supplier_users CREATE TABLE
+-- (forward-ref defect fix: PG resolves CREATE POLICY relation refs at parse time,
+-- so policies referencing supplier_users must run after that table exists).
 
 GRANT SELECT, UPDATE ON public.suppliers TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.suppliers TO service_role;
@@ -254,6 +224,52 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON public.supplier_users TO service_role;
 
 COMMENT ON TABLE public.supplier_users IS
   'Supplier-portal authentication membership. Non-standard: auth_uid references auth.users(id) directly (not chiefos_portal_users membership). UNIQUE (auth_uid) means one auth user belongs to exactly one supplier. Supplier team management: service_role adds/removes members via route-layer endpoints.';
+
+-- ============================================================================
+-- Deferred suppliers RLS policies (forward-ref defect fix)
+--
+-- These two policies on public.suppliers reference public.supplier_users in
+-- their USING/WITH CHECK clauses. They were originally co-located with the
+-- suppliers section above but moved here (after supplier_users CREATE TABLE)
+-- so the relation reference resolves at CREATE POLICY parse time.
+-- ============================================================================
+DO $$
+BEGIN
+  -- Supplier-portal users: SELECT their own supplier (regardless of status —
+  -- they need to see their pending/suspended state).
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='suppliers'
+                   AND policyname='suppliers_supplier_portal_select') THEN
+    CREATE POLICY suppliers_supplier_portal_select
+      ON public.suppliers FOR SELECT
+      TO authenticated
+      USING (
+        id IN (
+          SELECT supplier_id FROM public.supplier_users
+          WHERE auth_uid = auth.uid() AND is_active = true
+        )
+      );
+  END IF;
+
+  -- Supplier-portal users: UPDATE their own supplier.
+  IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename='suppliers'
+                   AND policyname='suppliers_supplier_portal_update') THEN
+    CREATE POLICY suppliers_supplier_portal_update
+      ON public.suppliers FOR UPDATE
+      TO authenticated
+      USING (
+        id IN (
+          SELECT supplier_id FROM public.supplier_users
+          WHERE auth_uid = auth.uid() AND is_active = true AND role IN ('owner','admin')
+        )
+      )
+      WITH CHECK (
+        id IN (
+          SELECT supplier_id FROM public.supplier_users
+          WHERE auth_uid = auth.uid() AND is_active = true AND role IN ('owner','admin')
+        )
+      );
+  END IF;
+END $$;
 
 -- ============================================================================
 -- 3. supplier_categories — per-supplier category taxonomy (hierarchical)

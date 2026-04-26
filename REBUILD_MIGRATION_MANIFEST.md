@@ -82,6 +82,7 @@ amendment_trigger_extensions          -- formerly 17j; moved here from amendment
 rebuild_triggers                      -- 10 distinct + 26 touch_updated_at bindings; depends on rebuild_functions
 rebuild_views                         -- 6 views, all SECURITY INVOKER WITH (security_invoker = true)
 rebuild_rls_coverage_gap_fix          -- additive GRANTs for 6 Quotes spine tables (Principle 9)
+2026_04_25_chiefos_quote_versions_source_msg_id  -- Phase A Session 5; adds source_msg_id + partial UNIQUE for §17.8 ReissueQuote dedup; extends chiefos_quote_versions_guard_immutable to block UPDATE/DELETE on superseded versions (header pointer divergence detection)
 drift_detection_script                -- scripts/schema_drift_check.js + package.json entries
 2026_04_21_drop_unsafe_signup_test_user_function.sql
 remediation_drop_users_dashboard_token -- R1; must run AFTER R9 cleans services/postgres.js references

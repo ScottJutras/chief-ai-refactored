@@ -107,6 +107,24 @@ BEGIN
   END IF;
 END $$;
 
+-- 2-col UNIQUE (id, tenant_id) for cross-spine FK targets that key by tenant only
+-- (e.g., import_batches_media_asset_fk in rebuild_admin_support).
+-- PG's FK catalog match requires an exact column-set; the 3-col UNIQUE above does
+-- NOT satisfy a 2-col REFERENCES (id, tenant_id) even though id alone is PK and the
+-- (id, tenant_id) shape is semantically unique by extension. This explicit
+-- constraint exposes that uniqueness to the catalog so cross-spine FKs can match.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'media_assets_id_tenant_unique'
+      AND conrelid = 'public.media_assets'::regclass
+  ) THEN
+    ALTER TABLE public.media_assets
+      ADD CONSTRAINT media_assets_id_tenant_unique UNIQUE (id, tenant_id);
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS media_assets_tenant_created_idx
   ON public.media_assets (tenant_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS media_assets_hash_idx

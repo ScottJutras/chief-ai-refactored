@@ -190,6 +190,21 @@ CREATE TABLE IF NOT EXISTS public.intake_items (
     CHECK (confidence_score IS NULL OR (confidence_score >= 0 AND confidence_score <= 1))
 );
 
+-- Composite identity UNIQUE (Principle 11) — must be added BEFORE any FK that
+-- references intake_items(id, tenant_id, owner_id), including the self-FK below.
+-- PG resolves FK target uniqueness eagerly at ALTER TABLE ADD CONSTRAINT time.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'intake_items_identity_unique'
+      AND conrelid = 'public.intake_items'::regclass
+  ) THEN
+    ALTER TABLE public.intake_items
+      ADD CONSTRAINT intake_items_identity_unique UNIQUE (id, tenant_id, owner_id);
+  END IF;
+END $$;
+
 -- Composite FK to intake_batches (Principle 11)
 DO $$
 BEGIN
@@ -234,19 +249,6 @@ BEGIN
       ADD CONSTRAINT intake_items_job_fk
       FOREIGN KEY (job_int_id) REFERENCES public.jobs(id)
       ON DELETE SET NULL;
-  END IF;
-END $$;
-
--- Composite identity UNIQUE (Principle 11)
-DO $$
-BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM pg_constraint
-    WHERE conname = 'intake_items_identity_unique'
-      AND conrelid = 'public.intake_items'::regclass
-  ) THEN
-    ALTER TABLE public.intake_items
-      ADD CONSTRAINT intake_items_identity_unique UNIQUE (id, tenant_id, owner_id);
   END IF;
 END $$;
 

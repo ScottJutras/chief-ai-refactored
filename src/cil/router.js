@@ -27,7 +27,7 @@
 // Imports for registered handlers (populated as each handler ships).
 const {
   handleCreateQuote, handleSendQuote, handleSignQuote, handleViewQuote, handleLockQuote,
-  handleVoidQuote,
+  handleVoidQuote, handleReissueQuote,
 } = require('./quotes');
 
 const NEW_IDIOM_HANDLERS = Object.freeze({
@@ -37,7 +37,7 @@ const NEW_IDIOM_HANDLERS = Object.freeze({
   ViewQuote: handleViewQuote,
   LockQuote: handleLockQuote,
   VoidQuote: handleVoidQuote,
-  // ReissueQuote: handleReissueQuote,
+  ReissueQuote: handleReissueQuote,
 });
 
 // Constitution §9 error envelope lives in src/cil/utils.js so the facade

@@ -5279,6 +5279,705 @@ async function handleVoidQuote(rawCil, ctx) {
   });
 }
 
+// ─── Phase A Session 5 §1: ReissueQuoteCILZ schema ──────────────────────────
+
+// ReissueQuote dedup constraint (Migration 2026_04_25_chiefos_quote_versions_
+// source_msg_id). Partial UNIQUE on (owner_id, source_msg_id) WHERE
+// source_msg_id IS NOT NULL. classifyCilError returns 'idempotent_retry'
+// only when err.constraint matches this exactly.
+const REISSUE_QUOTE_SOURCE_MSG_CONSTRAINT = 'chiefos_qv_source_msg_unique';
+
+// Actor: dual-actor mirroring VoidQuote. Owner path covers contractor-
+// initiated reissue; system path covers cron/automation-initiated reissue
+// (currently unused; reserved for future workflow-driven reissue).
+const ReissueQuoteActorZ = z.discriminatedUnion('role', [
+  z.object({ role: z.literal('owner'),  actor_id: z.string().min(1) }),
+  z.object({ role: z.literal('system'), actor_id: z.string().min(1) }),
+]);
+
+const ReissueQuoteCILZ = BaseCILZ
+  .omit({ actor: true, source_msg_id: true })
+  .extend({
+    type: z.literal('ReissueQuote'),
+    // Phase A Session 5 ships the source enum directly (not a literal). This
+    // is a fresh schema, not a widening of an existing literal — Decision A
+    // (LockQuote/VoidQuote source widening) is Session 6 territory and does
+    // not gate this handler.
+    source: z.enum(['portal', 'whatsapp', 'system']),
+    // §17.8 dedup key — REQUIRED (not optional). Unlike VoidQuote (state-
+    // machine idempotent), ReissueQuote creates a new version row and uses
+    // entity-table dedup via the chiefos_qv_source_msg_unique partial UNIQUE.
+    // Caller must always supply a stable key (Twilio sid for whatsapp;
+    // Idempotency-Key UUID for portal; cron-derived nonce for system).
+    source_msg_id: z.string().min(1),
+    actor: ReissueQuoteActorZ,
+    quote_ref: QuoteRefInputZ,
+  });
+
+// ─── Phase A Session 5 §1: REISSUE_LOAD_COLUMNS + loadReissueContext ────────
+
+const REISSUE_LOAD_COLUMNS = `
+  q.id                   AS quote_id,
+  q.human_id,
+  q.status               AS quote_status,
+  q.job_id,
+  q.customer_id,
+  q.current_version_id,
+  q.voided_at,
+  q.voided_reason,
+  q.created_at           AS header_created_at,
+  q.updated_at           AS header_updated_at,
+  v.id                   AS version_id,
+  v.version_no,
+  v.status               AS version_status,
+  v.project_title,
+  v.project_scope,
+  v.currency,
+  v.subtotal_cents,
+  v.tax_cents,
+  v.total_cents,
+  v.deposit_cents,
+  v.tax_code,
+  v.tax_rate_bps,
+  v.warranty_snapshot,
+  v.clauses_snapshot,
+  v.tenant_snapshot,
+  v.customer_snapshot,
+  v.payment_terms,
+  v.warranty_template_ref,
+  v.clauses_template_ref,
+  v.locked_at            AS version_locked_at,
+  v.server_hash          AS version_server_hash
+`;
+
+/**
+ * loadReissueContext — pre-txn context loader for ReissueQuote.
+ *
+ * UNIFORM ACROSS BOTH ACTOR PATHS (Posture A) — actor-oblivious; scopes
+ * by (tenant_id, owner_id); cross-tenant / cross-owner / not-found unify
+ * to QUOTE_NOT_FOUND_OR_CROSS_OWNER per §17.17 addendum 3.
+ *
+ * State routing — STRICT precondition: prior status MUST be 'voided' per
+ * §3A. Reissuing a non-voided quote is a state-machine violation and
+ * returns ILLEGAL_STATE; caller's response should hint at VoidQuote.
+ *
+ *   voided                                    → return ctx (proceed to txn)
+ *   draft | sent | viewed | signed | locked   → throw CIL_INTEGRITY_ERROR
+ *                                               with QUOTE_NOT_VOIDED hint
+ *   unknown                                   → throw CIL_INTEGRITY_ERROR
+ *
+ * Loads the FULL prior version snapshot — every column the new version
+ * row will copy. ReissueQuote replays the prior content forward by
+ * default; line-item edits are out of scope (EditDraft, future phase).
+ *
+ * Accepts `pg` (not a txn client). Pattern matches loadVoidContext.
+ *
+ * @throws {CilIntegrityError}
+ */
+async function loadReissueContext({ pg, tenantId, ownerId, quoteRef }) {
+  let rows;
+  if (quoteRef.quote_id) {
+    const r = await pg.query(
+      `SELECT ${REISSUE_LOAD_COLUMNS}
+         FROM public.chiefos_quotes q
+         JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+        WHERE q.id = $1 AND q.tenant_id = $2 AND q.owner_id = $3
+        LIMIT 1`,
+      [quoteRef.quote_id, tenantId, ownerId]
+    );
+    rows = r.rows;
+  } else {
+    const r = await pg.query(
+      `SELECT ${REISSUE_LOAD_COLUMNS}
+         FROM public.chiefos_quotes q
+         JOIN public.chiefos_quote_versions v ON v.id = q.current_version_id
+        WHERE q.human_id = $1 AND q.tenant_id = $2 AND q.owner_id = $3
+        LIMIT 1`,
+      [quoteRef.human_id, tenantId, ownerId]
+    );
+    rows = r.rows;
+  }
+
+  if (rows.length === 0) {
+    throw new CilIntegrityError({
+      code: 'QUOTE_NOT_FOUND_OR_CROSS_OWNER',
+      message: 'Quote lookup failed',
+      hint: 'quote_ref does not match a quote in this tenant+owner scope, or quote does not exist',
+    });
+  }
+  const row = rows[0];
+
+  // STRICT state precondition — only voided quotes can be reissued (§3A).
+  switch (row.quote_status) {
+    case 'voided':
+      break;
+    case 'draft':
+    case 'sent':
+    case 'viewed':
+    case 'signed':
+    case 'locked':
+      throw new CilIntegrityError({
+        code: 'QUOTE_NOT_VOIDED',
+        message: 'ReissueQuote requires a voided quote',
+        hint: `quote_id=${row.quote_id} current_status=${row.quote_status}; void the quote first via VoidQuote, then reissue`,
+      });
+    default:
+      throw new CilIntegrityError({
+        code: 'CIL_INTEGRITY_ERROR',
+        message: 'Unknown quote status',
+        hint: `quote_id=${row.quote_id} unknown_status=${row.quote_status}`,
+      });
+  }
+
+  return {
+    tenantId,
+    ownerId,
+    quoteId: row.quote_id,
+    humanId: row.human_id,
+    quoteStatus: row.quote_status,
+    jobId: row.job_id,
+    customerId: row.customer_id,
+    currentVersionId: row.current_version_id,
+    quoteVoidedAt: row.voided_at,
+    quoteVoidedReason: row.voided_reason,
+    headerCreatedAt: row.header_created_at,
+    headerUpdatedAt: row.header_updated_at,
+    priorVersionId: row.version_id,
+    priorVersionNo: row.version_no,
+    priorVersionStatus: row.version_status,
+    priorProjectTitle: row.project_title,
+    priorProjectScope: row.project_scope,
+    priorCurrency: row.currency,
+    priorSubtotalCents: row.subtotal_cents,
+    priorTaxCents: row.tax_cents,
+    priorTotalCents: row.total_cents,
+    priorDepositCents: row.deposit_cents,
+    priorTaxCode: row.tax_code,
+    priorTaxRateBps: row.tax_rate_bps,
+    priorWarrantySnapshot: row.warranty_snapshot,
+    priorClausesSnapshot: row.clauses_snapshot,
+    priorTenantSnapshot: row.tenant_snapshot,
+    priorCustomerSnapshot: row.customer_snapshot,
+    priorPaymentTerms: row.payment_terms,
+    priorWarrantyTemplateRef: row.warranty_template_ref,
+    priorClausesTemplateRef: row.clauses_template_ref,
+    priorVersionLockedAt: row.version_locked_at,
+    priorVersionServerHash: row.version_server_hash,
+  };
+}
+
+// ─── Phase A Session 5 §1: insertReissuedVersion ────────────────────────────
+
+/**
+ * insertReissuedVersion — INSERTs a new chiefos_quote_versions row with
+ * version_no = priorVersionNo + 1, status='draft', locked_at=NULL.
+ * Carries forward all snapshot fields from the prior version (warranty,
+ * clauses, tenant, customer, payment terms, template refs). The new
+ * source_msg_id is recorded for §17.8 entity-table dedup.
+ *
+ * 23505 on chiefos_qv_source_msg_unique surfaces the replay path —
+ * classifyCilError returns 'idempotent_retry'; handler post-rollback
+ * lookup returns the prior reissued version via lookupPriorReissuedVersion.
+ *
+ * Composite FK chiefos_qv_parent_identity_fk validates (quote_id, tenant_id,
+ * owner_id) matches the header. RLS: service role.
+ */
+async function insertReissuedVersion(client, { ctx, sourceMsgId, newVersionNo }) {
+  const { rows } = await client.query(
+    `INSERT INTO public.chiefos_quote_versions (
+        quote_id, tenant_id, owner_id, version_no, status,
+        project_title, project_scope,
+        currency, subtotal_cents, tax_cents, total_cents,
+        deposit_cents, tax_code, tax_rate_bps,
+        warranty_snapshot, clauses_snapshot, tenant_snapshot,
+        customer_snapshot, payment_terms,
+        warranty_template_ref, clauses_template_ref,
+        source_msg_id,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, 'draft',
+              $5, $6,
+              $7, $8, $9, $10,
+              $11, $12, $13,
+              $14, $15, $16,
+              $17, $18,
+              $19, $20,
+              $21,
+              NOW())
+      RETURNING id, version_no, created_at`,
+    [
+      ctx.quoteId, ctx.tenantId, ctx.ownerId, newVersionNo,
+      ctx.priorProjectTitle, ctx.priorProjectScope,
+      ctx.priorCurrency, ctx.priorSubtotalCents, ctx.priorTaxCents, ctx.priorTotalCents,
+      ctx.priorDepositCents, ctx.priorTaxCode, ctx.priorTaxRateBps,
+      ctx.priorWarrantySnapshot, ctx.priorClausesSnapshot, ctx.priorTenantSnapshot,
+      ctx.priorCustomerSnapshot, ctx.priorPaymentTerms,
+      ctx.priorWarrantyTemplateRef, ctx.priorClausesTemplateRef,
+      sourceMsgId,
+    ]
+  );
+  return rows[0];
+}
+
+// ─── Phase A Session 5 §1: copyLineItemsToNewVersion ────────────────────────
+
+/**
+ * copyLineItemsToNewVersion — INSERT...SELECT to copy all line items from
+ * the prior version onto the new (draft) version atomically. Preserves
+ * sort_order, descriptions, qty, prices, computed line totals, tax codes,
+ * and catalog snapshots. Atomic single-statement (no per-row loop).
+ *
+ * Parent-lock trigger (chiefos_quote_line_items_guard_parent_lock) is
+ * inert because the new version's locked_at IS NULL (draft state).
+ *
+ * Returns the count of line items copied for assertion in handler.
+ */
+async function copyLineItemsToNewVersion(client, { newVersionId, priorVersionId, tenantId, ownerId }) {
+  const result = await client.query(
+    `INSERT INTO public.chiefos_quote_line_items (
+        quote_version_id, tenant_id, owner_id,
+        sort_order, description, category,
+        qty, unit_price_cents, line_subtotal_cents, line_tax_cents,
+        tax_code, catalog_product_id, catalog_snapshot,
+        created_at
+      )
+      SELECT
+        $1, tenant_id, owner_id,
+        sort_order, description, category,
+        qty, unit_price_cents, line_subtotal_cents, line_tax_cents,
+        tax_code, catalog_product_id, catalog_snapshot,
+        NOW()
+      FROM public.chiefos_quote_line_items
+      WHERE quote_version_id = $2
+        AND tenant_id = $3
+        AND owner_id = $4
+      ORDER BY sort_order`,
+    [newVersionId, priorVersionId, tenantId, ownerId]
+  );
+  return result.rowCount;
+}
+
+// ─── Phase A Session 5 §1: setQuoteHeaderToReissuedDraft ────────────────────
+
+/**
+ * setQuoteHeaderToReissuedDraft — UPDATEs chiefos_quotes header to point
+ * at the new version and transition status from 'voided' → 'draft'.
+ * Clears voided_at and voided_reason because the chiefos_quotes_voided_
+ * consistency CHECK (Migration 1 line 98-100) is biconditional: status
+ * <> 'voided' requires voided_at IS NULL.
+ *
+ * The void event remains in chiefos_quote_events as a lifecycle.voided
+ * row — the audit chain is preserved even though the header columns are
+ * cleared. The header reflects current state; events reflect history.
+ *
+ * WHERE clause includes status='voided' predicate — concurrent-transition
+ * detection. rowcount=0 means a sibling ReissueQuote (or other transition)
+ * already moved status off 'voided'; caller treats as concurrent-transition
+ * signal and re-reads via loadReissueContext (which will then fail with
+ * QUOTE_NOT_VOIDED — the prior reissue won the race).
+ *
+ * @returns {Promise<{ transitioned: false } | { transitioned: true, headerUpdatedAt }>}
+ */
+async function setQuoteHeaderToReissuedDraft(client, { quoteId, newVersionId, tenantId, ownerId }) {
+  const result = await client.query(
+    `UPDATE public.chiefos_quotes
+        SET current_version_id = $1,
+            status = 'draft',
+            voided_at = NULL,
+            voided_reason = NULL,
+            updated_at = NOW()
+      WHERE id = $2
+        AND tenant_id = $3
+        AND owner_id = $4
+        AND status = 'voided'
+      RETURNING updated_at`,
+    [newVersionId, quoteId, tenantId, ownerId]
+  );
+  if (result.rowCount === 0) {
+    return { transitioned: false };
+  }
+  return {
+    transitioned: true,
+    headerUpdatedAt: result.rows[0].updated_at,
+  };
+}
+
+// ─── Phase A Session 5 §1: lookupPriorReissuedVersion ───────────────────────
+
+/**
+ * lookupPriorReissuedVersion — post-rollback recovery for the
+ * idempotent_retry branch. When classifyCilError returns idempotent_retry
+ * (23505 on chiefos_qv_source_msg_unique), the transaction has already
+ * rolled back. This fresh query (via pg, not the aborted client) fetches
+ * the prior reissued version's current state for return.
+ *
+ * Per §17.10 idempotent-retry pattern (mirrors lookupPriorQuote):
+ * returns CURRENT entity state — version + parent header + line items.
+ */
+async function lookupPriorReissuedVersion(ownerId, sourceMsgId) {
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  const { rows } = await pg.query(
+    `SELECT v.id            AS version_id,
+            v.version_no,
+            v.status        AS version_status,
+            v.project_title,
+            v.currency,
+            v.total_cents,
+            v.locked_at     AS version_locked_at,
+            v.server_hash   AS version_server_hash,
+            v.created_at    AS version_created_at,
+            q.id            AS quote_id,
+            q.human_id,
+            q.status        AS quote_status,
+            q.job_id,
+            q.customer_id,
+            q.current_version_id,
+            q.voided_at,
+            q.voided_reason,
+            q.created_at    AS header_created_at,
+            q.updated_at    AS header_updated_at
+       FROM public.chiefos_quote_versions v
+       JOIN public.chiefos_quotes q ON q.id = v.quote_id
+      WHERE v.owner_id = $1 AND v.source_msg_id = $2
+      LIMIT 1`,
+    [ownerId, sourceMsgId]
+  );
+  if (rows.length === 0) {
+    throw new Error(
+      `Idempotent retry lookup missed for ReissueQuote (${ownerId}, ${sourceMsgId})`
+    );
+  }
+  return rows[0];
+}
+
+// ─── Phase A Session 5 §2: handleReissueQuote + return-shape composers ──────
+//
+// 4 entities in return shape: quote, version (NEW), prior_version, meta.
+// The new version is the "current renderable state" (per §17.15 multi-entity
+// shape); prior_version exposes the supersession chain so callers can
+// render "v3 reissued from v2 (voided 2026-04-22)" without a follow-up
+// query.
+//
+// §17.26 reservation: prior to writing this handler, the directive
+// reserved §17.26 in case supersession semantics did not fit §17.23.
+// Implementation finding (recorded for the close handoff): supersession
+// is implicit via chiefos_quotes.current_version_id pointer divergence
+// (no per-version superseded_at column). The constitutional immutability
+// trigger extension (Migration 2026_04_25_chiefos_quote_versions_source_
+// msg_id) covers the consequent immutability rule. NO §17.26 sub-amendment
+// is needed — ReissueQuote slots into §17.8 (entity-table dedup) + §3A
+// (header status authority) + the new immutability extension. The §17.26
+// slot remains reserved for any future deeper supersession concern.
+
+/**
+ * buildReissueQuoteReturnShape — §17.15 multi-entity envelope for the
+ * happy path where setQuoteHeaderToReissuedDraft transitioned the header
+ * from 'voided' to 'draft' and the new version was inserted.
+ *
+ * 4 entities: quote (10 keys), version (NEW; 8 keys), prior_version (4
+ * keys — minimal supersession chain pointer), meta (4 keys).
+ */
+function buildReissueQuoteReturnShape({
+  ctx, newVersion, headerUpdatedAt, lineItemsCopied,
+  correlationId, eventsEmitted, alreadyExisted, traceId,
+}) {
+  return {
+    ok: true,
+    quote: {
+      id: ctx.quoteId,
+      human_id: ctx.humanId,
+      status: 'draft',
+      job_id: ctx.jobId,
+      customer_id: ctx.customerId,
+      current_version_id: newVersion.id,
+      created_at: ctx.headerCreatedAt,
+      updated_at: headerUpdatedAt,
+      voided_at: null,
+      voided_reason: null,
+    },
+    version: {
+      id: newVersion.id,
+      version_no: newVersion.version_no,
+      status: 'draft',
+      project_title: ctx.priorProjectTitle,
+      currency: ctx.priorCurrency,
+      total_cents: ctx.priorTotalCents,
+      locked_at: null,
+      server_hash: null,
+    },
+    prior_version: {
+      id: ctx.priorVersionId,
+      version_no: ctx.priorVersionNo,
+      status: ctx.priorVersionStatus,
+      locked_at: ctx.priorVersionLockedAt,
+    },
+    meta: {
+      already_existed: alreadyExisted,
+      events_emitted: eventsEmitted,
+      line_items_copied: lineItemsCopied,
+      correlation_id: correlationId,
+      traceId,
+    },
+  };
+}
+
+/**
+ * alreadyReissuedReturnShape — prior-state envelope for the §17.10
+ * idempotent_retry path: source_msg_id replayed; chiefos_qv_source_msg_
+ * unique fired; handler ran lookupPriorReissuedVersion to recover the
+ * prior reissued version's current state.
+ *
+ * Shape is parallel to buildReissueQuoteReturnShape but reads from the
+ * recovery-lookup row (priorRow). prior_version cannot be reconstructed
+ * from the lookup alone (we'd need a second query) — set to null on this
+ * path. Callers that need the supersession chain on retry can re-query.
+ *
+ * meta.already_existed: true (hardcoded — always true on this path).
+ * meta.events_emitted: [] (no emission on this path).
+ * meta.correlation_id: null (§17.21 retry-path limitation).
+ */
+function alreadyReissuedReturnShape({ priorRow, traceId }) {
+  return {
+    ok: true,
+    quote: {
+      id: priorRow.quote_id,
+      human_id: priorRow.human_id,
+      status: priorRow.quote_status,
+      job_id: priorRow.job_id,
+      customer_id: priorRow.customer_id,
+      current_version_id: priorRow.current_version_id,
+      created_at: priorRow.header_created_at,
+      updated_at: priorRow.header_updated_at,
+      voided_at: priorRow.voided_at,
+      voided_reason: priorRow.voided_reason,
+    },
+    version: {
+      id: priorRow.version_id,
+      version_no: priorRow.version_no,
+      status: priorRow.version_status,
+      project_title: priorRow.project_title,
+      currency: priorRow.currency,
+      total_cents: priorRow.total_cents,
+      locked_at: priorRow.version_locked_at,
+      server_hash: priorRow.version_server_hash,
+    },
+    prior_version: null,
+    meta: {
+      already_existed: true,
+      events_emitted: [],
+      line_items_copied: null,
+      correlation_id: null,
+      traceId,
+    },
+  };
+}
+
+/**
+ * handleReissueQuote — applies a ReissueQuote CIL idiom.
+ *
+ * Sequence:
+ *   Step 0. Ctx preflight (owner_id, traceId required per §17.17 addendum 2)
+ *   Step 1. Zod validation (ReissueQuoteCILZ.safeParse)
+ *   Step 2. NO plan gating — G6 follow-through; CreateQuote consumed the gate
+ *   Step 3. correlation_id = crypto.randomUUID() (§17.21)
+ *   Step 4. loadReissueContext (pre-txn); CilIntegrityError → errEnvelope
+ *           (loader handles QUOTE_NOT_FOUND_OR_CROSS_OWNER, QUOTE_NOT_VOIDED,
+ *            and CIL_INTEGRITY_ERROR routing)
+ *   Step 5. pg.withClient transaction:
+ *             - insertReissuedVersion (new version row; 23505 on
+ *               chiefos_qv_source_msg_unique → idempotent_retry branch)
+ *             - copyLineItemsToNewVersion (atomic INSERT...SELECT)
+ *             - setQuoteHeaderToReissuedDraft; transitioned:false →
+ *               concurrent-transition signal (sibling won the race)
+ *             - emitLifecycleVersionCreated with trigger_source='reissue',
+ *               new version_no
+ *   Step 6a. classifyCilError → idempotent_retry: lookupPriorReissuedVersion,
+ *            return alreadyReissuedReturnShape
+ *   Step 6b. Concurrent-transition: NO RE-READ — concurrent reissue means
+ *            the prior reissue already won; the prior reissue's source_msg_id
+ *            was different, so our source_msg_id has no row to recover. Per
+ *            §17.23 deviation noted in §2 header above, this branch returns
+ *            errEnvelope CONCURRENT_REISSUE_CONFLICT — caller's responsibility
+ *            to retry with fresh state read.
+ *   Step 6c. Happy path: buildReissueQuoteReturnShape with
+ *            events_emitted=['lifecycle.version_created'].
+ *
+ * Dual-actor (owner|system): both paths reach the same state-transition
+ * core. Identity is upstream-resolved per Posture A (ctx.owner_id).
+ * loadReissueContext is actor-oblivious.
+ */
+async function handleReissueQuote(rawCil, ctx) {
+  // Step 0 — ctx preflight (§17.17 addendum 2)
+  if (!ctx || !ctx.owner_id) {
+    return errEnvelope({
+      code: 'OWNER_ID_MISSING',
+      message: 'ctx.owner_id is required',
+      hint: 'Upstream identity resolver must populate ctx.owner_id before applyCIL',
+      traceId: (ctx && ctx.traceId) || null,
+    });
+  }
+  if (!ctx.traceId) {
+    return errEnvelope({
+      code: 'TRACE_ID_MISSING',
+      message: 'ctx.traceId is required',
+      hint: 'Upstream request handler must populate ctx.traceId before applyCIL',
+      traceId: null,
+    });
+  }
+
+  // Step 1 — Zod validation
+  const parsed = ReissueQuoteCILZ.safeParse(rawCil);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    const pathStr = issue && issue.path && issue.path.length ? issue.path.join('.') : '<root>';
+    return errEnvelope({
+      code: 'CIL_SCHEMA_INVALID',
+      message: issue ? `${pathStr}: ${issue.message}` : 'ReissueQuote input failed validation',
+      hint: 'See docs/QUOTES_SPINE_DECISIONS.md for the ReissueQuoteCILZ input contract',
+      traceId: ctx.traceId,
+    });
+  }
+  const data = parsed.data;
+
+  // Step 2 — NO plan gating (G6 follow-through; CreateQuote consumed the gate)
+
+  // Step 3 — correlation_id (§17.21)
+  const correlationId = crypto.randomUUID();
+
+  // Step 4 — loadReissueContext (pre-txn)
+  // eslint-disable-next-line global-require
+  const pg = require('../../services/postgres');
+  let reissueCtx;
+  try {
+    reissueCtx = await loadReissueContext({
+      pg,
+      tenantId: data.tenant_id,
+      ownerId: ctx.owner_id,
+      quoteRef: data.quote_ref,
+    });
+  } catch (loadErr) {
+    if (loadErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: loadErr.code,
+        message: loadErr.message,
+        hint: loadErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw loadErr;  // 500-class
+  }
+
+  const newVersionNo = reissueCtx.priorVersionNo + 1;
+  const actorSource = CIL_TO_EVENT_ACTOR_SOURCE[data.source];
+
+  // Step 5 — transaction body
+  let txnResult;
+  try {
+    txnResult = await pg.withClient(async (client) => {
+      const newVersion = await insertReissuedVersion(client, {
+        ctx: reissueCtx,
+        sourceMsgId: data.source_msg_id,
+        newVersionNo,
+      });
+      const lineItemsCopied = await copyLineItemsToNewVersion(client, {
+        newVersionId: newVersion.id,
+        priorVersionId: reissueCtx.priorVersionId,
+        tenantId: reissueCtx.tenantId,
+        ownerId: reissueCtx.ownerId,
+      });
+      const headerResult = await setQuoteHeaderToReissuedDraft(client, {
+        quoteId: reissueCtx.quoteId,
+        newVersionId: newVersion.id,
+        tenantId: reissueCtx.tenantId,
+        ownerId: reissueCtx.ownerId,
+      });
+      if (!headerResult.transitioned) {
+        return { concurrentTransition: true };
+      }
+      await emitLifecycleVersionCreated(client, {
+        quoteId: reissueCtx.quoteId,
+        versionId: newVersion.id,
+        tenantId: reissueCtx.tenantId,
+        ownerId: reissueCtx.ownerId,
+        actorSource,
+        actorUserId: data.actor.actor_id,
+        emittedAt: data.occurred_at,
+        customerId: reissueCtx.customerId,
+        versionNo: newVersionNo,
+        triggerSource: 'reissue',
+      });
+      return {
+        newVersion,
+        headerUpdatedAt: headerResult.headerUpdatedAt,
+        lineItemsCopied,
+        concurrentTransition: false,
+      };
+    });
+  } catch (txnErr) {
+    // §17.10 — classifyCilError routes 23505 on chiefos_qv_source_msg_unique
+    // to idempotent_retry; CHECK violations to integrity_error.
+    const c = classifyCilError(txnErr, {
+      sourceMsgConstraint: REISSUE_QUOTE_SOURCE_MSG_CONSTRAINT,
+    });
+    if (c.kind === 'idempotent_retry') {
+      // Step 6a — fresh lookup of the prior reissued version row
+      let priorRow;
+      try {
+        priorRow = await lookupPriorReissuedVersion(ctx.owner_id, data.source_msg_id);
+      } catch (lookupErr) {
+        // Lookup-miss-after-23505 is a 500-class invariant violation.
+        return errEnvelope({
+          code: 'INTERNAL_ERROR',
+          message: 'Idempotent retry lookup failed',
+          hint: lookupErr.message,
+          traceId: ctx.traceId,
+        });
+      }
+      return alreadyReissuedReturnShape({ priorRow, traceId: ctx.traceId });
+    }
+    if (c.kind === 'integrity_error') {
+      return errEnvelope({
+        code: 'CIL_INTEGRITY_ERROR',
+        message: c.message || 'Integrity constraint violated',
+        hint: c.hint || null,
+        traceId: ctx.traceId,
+      });
+    }
+    if (txnErr instanceof CilIntegrityError) {
+      return errEnvelope({
+        code: txnErr.code,
+        message: txnErr.message,
+        hint: txnErr.hint,
+        traceId: ctx.traceId,
+      });
+    }
+    throw txnErr;  // 500-class
+  }
+
+  // Step 6b — concurrent transition (sibling reissue won the race)
+  if (txnResult.concurrentTransition) {
+    return errEnvelope({
+      code: 'CONCURRENT_REISSUE_CONFLICT',
+      message: 'Quote was concurrently reissued by a sibling actor',
+      hint: 'Re-read the quote state and retry if a new reissue is still desired (the new current_version_id reflects the winning reissue)',
+      traceId: ctx.traceId,
+    });
+  }
+
+  // Step 6c — happy path
+  return buildReissueQuoteReturnShape({
+    ctx: reissueCtx,
+    newVersion: txnResult.newVersion,
+    headerUpdatedAt: txnResult.headerUpdatedAt,
+    lineItemsCopied: txnResult.lineItemsCopied,
+    correlationId,
+    eventsEmitted: ['lifecycle.version_created'],
+    alreadyExisted: false,
+    traceId: ctx.traceId,
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5290,6 +5989,7 @@ module.exports = {
   handleViewQuote,
   handleLockQuote,
   handleVoidQuote,
+  handleReissueQuote,
   CreateQuoteCILZ,
   SendQuoteCILZ,
   // Test-only internals. Not part of the handler's public contract. External
@@ -5404,6 +6104,21 @@ module.exports = {
     // VoidQuote §2 (return-shape composers; handler hoisted to top-level)
     buildVoidQuoteReturnShape,
     alreadyVoidedReturnShape,
+    // ReissueQuote §1 (schema + constraint constant)
+    ReissueQuoteCILZ,
+    ReissueQuoteActorZ,
+    REISSUE_QUOTE_SOURCE_MSG_CONSTRAINT,
+    // ReissueQuote §1 (loader + columns)
+    REISSUE_LOAD_COLUMNS,
+    loadReissueContext,
+    // ReissueQuote §1 (transaction-body helpers)
+    insertReissuedVersion,
+    copyLineItemsToNewVersion,
+    setQuoteHeaderToReissuedDraft,
+    lookupPriorReissuedVersion,
+    // ReissueQuote §2 (return-shape composers; handler hoisted to top-level)
+    buildReissueQuoteReturnShape,
+    alreadyReissuedReturnShape,
   },
 };
 

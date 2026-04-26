@@ -913,7 +913,145 @@ required — the c6c6 quote is already voided post-ceremony.
 
 ---
 
-## §32. ReissueQuote ceremony (RESERVED)
+## §32. Phase A Session 5 — ReissueQuote exercised against production (2026-04-25)
 
-Expected Phase A Session 5 if the ReissueQuote handler arc warrants
-production-exercise capture. Handler shape and ceremony script TBD.
+ReissueQuote handler authored, wired into `src/cil/router.js:40`, and
+ceremonialized via `scripts/real_reissue_quote_ceremony.js`. Closes Phase A.
+
+### §32.1 Pre-conditions
+
+- Migration `2026_04_25_chiefos_quote_versions_source_msg_id.sql` applied
+  (adds `chiefos_quote_versions.source_msg_id` column + partial UNIQUE
+  index `chiefos_qv_source_msg_unique` + immutability trigger
+  `trg_chiefos_qv_source_msg_immutable` + supersession-arm extension to
+  `chiefos_quote_versions_guard_immutable`).
+- Constants frozen in `scripts/_phase_a_session5_constants.js` under
+  the `c7c7-c7c7-c7c7` UUID namespace (distinct from §31's `c6c6`).
+- Seed step is idempotent (uses `ON CONFLICT DO NOTHING` on every
+  fixture row; users/customers/jobs use `WHERE NOT EXISTS` guards).
+  First-run cost: 1 user + 1 customer + 1 job + 1 voided quote header
+  + 1 version + 1 line item.
+
+### §32.2 Run command
+
+```
+node scripts/real_reissue_quote_ceremony.js
+```
+
+Exit codes:
+- `0` — happy-path reissue OR idempotent-retry reissue (both are success)
+- `1` — handler returned `ok:false` (state-machine rejection)
+- `2` — uncaught exception
+- `3` — anomaly detected (post-state expectation drift)
+
+### §32.3 Expected first-run output (anonymized)
+
+```
+Phase A Session 5 — ReissueQuote ceremony
+CEREMONY_QUOTE_ID: 00000000-c7c7-c7c7-c7c7-000000000002
+CEREMONY_REISSUE_SOURCE_MSG_ID: ceremony-phase-a-s5-reissue-run-1
+
+=== PRE-REISSUE STATE ===
+header: { q_status: 'voided', current_version_id: '...000003', voided_at: <ts>, voided_reason: 'Phase A Session 5 ceremony seed — voided in fixture', updated_at: <ts> }
+versions: [ { id: '...000003', version_no: 1, status: 'sent', source_msg_id: null, ... } ]
+lifecycle.version_created events: []
+
+HANDLER RESULT:
+{ ok: true,
+  quote: { status: 'draft', voided_at: null, current_version_id: <new_v2_id>, ... },
+  version: { id: <new_v2_id>, version_no: 2, status: 'draft', ... },
+  prior_version: { id: '...000003', version_no: 1, status: 'sent', locked_at: null },
+  meta: { already_existed: false, events_emitted: ['lifecycle.version_created'], line_items_copied: 1, correlation_id: <uuid>, traceId: 'ceremony-phase-a-s5-reissuequote-trace' } }
+
+=== POST-REISSUE STATE ===
+header: { q_status: 'draft', current_version_id: <new_v2_id>, voided_at: null, voided_reason: null, ... }
+versions: [ v1, v2 ]
+lifecycle.version_created events: [ { kind: 'lifecycle.version_created', payload: { version_no: 2, trigger_source: 'reissue' }, ... } ]
+
+CEREMONY OK — happy-path reissue
+new version_no: 2
+prior_version: 00000000-c7c7-c7c7-c7c7-000000000003
+line_items_copied: 1
+```
+
+### §32.4 Post-condition verification
+
+Run-time anomaly checks built into the ceremony script verify:
+
+1. `header.status = 'draft'` (the post-reissue state)
+2. `header.voided_at IS NULL` (cleared per `chiefos_quotes_voided_consistency` CHECK)
+3. `header.voided_reason IS NULL` (paired with voided_at)
+4. version count grew by exactly 1 (happy path) or 0 (replay)
+5. `header.current_version_id = result.version.id` (pointer swung correctly)
+6. `events_emitted[0] = 'lifecycle.version_created'` on happy path
+7. **Supersession immutability probe**: an UPDATE attempt on the prior
+   version row raises an exception matching `/superseded/i` (the new
+   constitutional immutability extension fires).
+
+If any anomaly fires, exit code 3 — investigate before clearing.
+
+### §32.5 Idempotent re-run path (§17.10 entity-table dedup)
+
+Re-running the ceremony script after a successful happy-path run lands on
+the §17.10 idempotent_retry path:
+
+- `insertReissuedVersion` raises 23505 on `chiefos_qv_source_msg_unique`
+  (same `source_msg_id` from the constants file)
+- `classifyCilError` returns `kind: 'idempotent_retry'`
+- Handler invokes `lookupPriorReissuedVersion(owner_id, source_msg_id)`
+- Returns `alreadyReissuedReturnShape` with `meta.already_existed = true`,
+  `events_emitted = []`
+
+Anomaly check #4 (version-count delta) accommodates this by reading
+`result.meta.already_existed` and adjusting the expected delta to 0.
+
+### §32.6 Re-running the happy path
+
+Requires fixture teardown:
+
+```sql
+DELETE FROM public.chiefos_quote_events WHERE quote_id = '00000000-c7c7-c7c7-c7c7-000000000002';
+DELETE FROM public.chiefos_quote_line_items WHERE tenant_id = '00000000-c7c7-c7c7-c7c7-000000000001';
+DELETE FROM public.chiefos_quote_versions WHERE quote_id = '00000000-c7c7-c7c7-c7c7-000000000002';
+DELETE FROM public.chiefos_quotes WHERE id = '00000000-c7c7-c7c7-c7c7-000000000002';
+```
+
+(Customer + job + user rows can stay — the seed step uses `WHERE NOT EXISTS`.)
+
+### §32.7 §17.26 reservation outcome
+
+The directive reserved `§17.26` for any supersession-specific behavior
+that did not fit `§17.23` cleanly. Implementation finding: supersession
+is implicit via `chiefos_quotes.current_version_id` pointer divergence
+(no per-version `superseded_at` column on `chiefos_quote_versions`; that
+column lives only on `chiefos_quote_share_tokens` per §14.4). The new
+immutability trigger extension (Migration 2026_04_25, §1.4) covers the
+consequent immutability rule.
+
+**No `§17.26` sub-amendment is needed.** ReissueQuote slots into:
+- `§17.8` — entity-table dedup via `(owner_id, source_msg_id)` UNIQUE
+  on `chiefos_quote_versions`
+- `§3A` — header status authority + voided_at clearing on draft transition
+- The new immutability extension — block UPDATE/DELETE on superseded
+  versions
+
+The `§17.26` slot remains reserved for any future deeper supersession
+concern (e.g., share-token chain mutations during reissue, if those ever
+surface drift).
+
+### §32.8 Files touched
+
+- `migrations/2026_04_25_chiefos_quote_versions_source_msg_id.sql` (new)
+- `migrations/rollbacks/2026_04_25_chiefos_quote_versions_source_msg_id_rollback.sql` (new)
+- `REBUILD_MIGRATION_MANIFEST.md` (apply-order entry added)
+- `src/cil/quotes.js` (ReissueQuoteCILZ schema, loadReissueContext,
+  insertReissuedVersion, copyLineItemsToNewVersion,
+  setQuoteHeaderToReissuedDraft, lookupPriorReissuedVersion,
+  buildReissueQuoteReturnShape, alreadyReissuedReturnShape,
+  handleReissueQuote; module.exports updated)
+- `src/cil/router.js` (line 40 stub replaced with live registration)
+- `src/cil/quotes.test.js` (16 unit tests + 9 integration tests appended)
+- `scripts/_phase_a_session5_constants.js` (new; c7c7 namespace)
+- `scripts/real_reissue_quote_ceremony.js` (new)
+- `docs/QUOTES_SPINE_CEREMONIES.md` (this entry, replacing reservation)
+

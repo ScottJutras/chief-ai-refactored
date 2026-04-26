@@ -93,36 +93,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS chiefos_tenants_token_idx
 
 ALTER TABLE public.chiefos_tenants ENABLE ROW LEVEL SECURITY;
 
--- RLS policies — tenant-membership pattern (Principle 8)
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_policies
-                 WHERE schemaname='public' AND tablename='chiefos_tenants'
-                   AND policyname='chiefos_tenants_portal_select') THEN
-    CREATE POLICY chiefos_tenants_portal_select
-      ON public.chiefos_tenants FOR SELECT
-      USING (id IN (SELECT tenant_id FROM public.chiefos_portal_users WHERE user_id = auth.uid()));
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies
-                 WHERE schemaname='public' AND tablename='chiefos_tenants'
-                   AND policyname='chiefos_tenants_portal_insert') THEN
-    CREATE POLICY chiefos_tenants_portal_insert
-      ON public.chiefos_tenants FOR INSERT
-      WITH CHECK (true);  -- signup handshake; authenticated role only
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies
-                 WHERE schemaname='public' AND tablename='chiefos_tenants'
-                   AND policyname='chiefos_tenants_owner_update') THEN
-    CREATE POLICY chiefos_tenants_owner_update
-      ON public.chiefos_tenants FOR UPDATE
-      USING (id IN (SELECT tenant_id FROM public.chiefos_portal_users
-                    WHERE user_id = auth.uid() AND role = 'owner'))
-      WITH CHECK (id IN (SELECT tenant_id FROM public.chiefos_portal_users
-                         WHERE user_id = auth.uid() AND role = 'owner'));
-  END IF;
-END $$;
+-- RLS policies attached BELOW after chiefos_portal_users is created (forward-ref defect fix:
+-- CREATE POLICY resolves relation refs at parse time, so policies referencing
+-- chiefos_portal_users must run after that table exists).
 
 GRANT SELECT, INSERT, UPDATE ON public.chiefos_tenants TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.chiefos_tenants TO service_role;
@@ -199,28 +172,7 @@ CREATE INDEX IF NOT EXISTS users_email_idx
 
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
 
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_policies
-                 WHERE schemaname='public' AND tablename='users'
-                   AND policyname='users_tenant_select') THEN
-    CREATE POLICY users_tenant_select
-      ON public.users FOR SELECT
-      USING (tenant_id IN (SELECT tenant_id FROM public.chiefos_portal_users WHERE user_id = auth.uid()));
-  END IF;
-
-  IF NOT EXISTS (SELECT 1 FROM pg_policies
-                 WHERE schemaname='public' AND tablename='users'
-                   AND policyname='users_tenant_update_owner') THEN
-    -- Only owner role in the tenant can UPDATE users
-    CREATE POLICY users_tenant_update_owner
-      ON public.users FOR UPDATE
-      USING (tenant_id IN (SELECT tenant_id FROM public.chiefos_portal_users
-                           WHERE user_id = auth.uid() AND role = 'owner'))
-      WITH CHECK (tenant_id IN (SELECT tenant_id FROM public.chiefos_portal_users
-                                WHERE user_id = auth.uid() AND role = 'owner'));
-  END IF;
-END $$;
+-- RLS policies attached BELOW after chiefos_portal_users is created (forward-ref defect fix).
 
 -- Note: users INSERTs flow through service_role (signup flow + crew onboarding).
 -- No INSERT policy for authenticated — intentional per design §3.1.
@@ -296,6 +248,71 @@ END $$;
 
 GRANT SELECT, INSERT, UPDATE ON public.chiefos_portal_users TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON public.chiefos_portal_users TO service_role;
+
+-- ============================================================================
+-- Deferred RLS policies for chiefos_tenants and users
+--
+-- These were originally co-located with their tables (sections 1 and 2) but
+-- referenced public.chiefos_portal_users in their USING/WITH CHECK clauses.
+-- PostgreSQL resolves CREATE POLICY relation refs at parse time, so the
+-- referenced table must already exist. Moved here (after chiefos_portal_users
+-- is created in section 3) to fix the forward-reference defect.
+-- ============================================================================
+
+-- chiefos_tenants — tenant-membership pattern (Principle 8)
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies
+                 WHERE schemaname='public' AND tablename='chiefos_tenants'
+                   AND policyname='chiefos_tenants_portal_select') THEN
+    CREATE POLICY chiefos_tenants_portal_select
+      ON public.chiefos_tenants FOR SELECT
+      USING (id IN (SELECT tenant_id FROM public.chiefos_portal_users WHERE user_id = auth.uid()));
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_policies
+                 WHERE schemaname='public' AND tablename='chiefos_tenants'
+                   AND policyname='chiefos_tenants_portal_insert') THEN
+    CREATE POLICY chiefos_tenants_portal_insert
+      ON public.chiefos_tenants FOR INSERT
+      WITH CHECK (true);  -- signup handshake; authenticated role only
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_policies
+                 WHERE schemaname='public' AND tablename='chiefos_tenants'
+                   AND policyname='chiefos_tenants_owner_update') THEN
+    CREATE POLICY chiefos_tenants_owner_update
+      ON public.chiefos_tenants FOR UPDATE
+      USING (id IN (SELECT tenant_id FROM public.chiefos_portal_users
+                    WHERE user_id = auth.uid() AND role = 'owner'))
+      WITH CHECK (id IN (SELECT tenant_id FROM public.chiefos_portal_users
+                         WHERE user_id = auth.uid() AND role = 'owner'));
+  END IF;
+END $$;
+
+-- users — tenant-membership SELECT; owner-only UPDATE
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_policies
+                 WHERE schemaname='public' AND tablename='users'
+                   AND policyname='users_tenant_select') THEN
+    CREATE POLICY users_tenant_select
+      ON public.users FOR SELECT
+      USING (tenant_id IN (SELECT tenant_id FROM public.chiefos_portal_users WHERE user_id = auth.uid()));
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM pg_policies
+                 WHERE schemaname='public' AND tablename='users'
+                   AND policyname='users_tenant_update_owner') THEN
+    -- Only owner role in the tenant can UPDATE users
+    CREATE POLICY users_tenant_update_owner
+      ON public.users FOR UPDATE
+      USING (tenant_id IN (SELECT tenant_id FROM public.chiefos_portal_users
+                           WHERE user_id = auth.uid() AND role = 'owner'))
+      WITH CHECK (tenant_id IN (SELECT tenant_id FROM public.chiefos_portal_users
+                                WHERE user_id = auth.uid() AND role = 'owner'));
+  END IF;
+END $$;
 
 -- ============================================================================
 -- 4. chiefos_legal_acceptances — append-only compliance log

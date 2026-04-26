@@ -74,12 +74,12 @@ rebuild_financial_observability       -- append-only via GRANT; hard triggers in
 17g. amendment_rag_docs                   -- P1A-3 (§3.14; pgvector(1536); requires CREATE EXTENSION vector preflight)
 17h. amendment_rag_terms                  -- P1A-3 (§3.14; GLOBAL glossary)
 17i. amendment_tenant_knowledge           -- P1A-3 (§3.14; owner_id drift-corrected uuid→text)
-17j. amendment_trigger_extensions         -- P3-4c (4 functions + 11 touch bindings + 9 append-only-family bindings; depends on chiefos_touch_updated_at from step 18)
 17k. amendment_p1a4_users_auth_user_id    -- P1A-4 (auth_user_id reverse pointer; consumed by R2.5)
 17l. amendment_p1a5_submission_status     -- P1A-5 (time_entries_v2 + tasks; consumed by R3b)
 17m. amendment_p1a6_portal_users_status   -- P1A-6 (chiefos_portal_users soft-delete; consumed by F1)
 rebuild_functions                     -- 10 functions, all SECURITY INVOKER, SET search_path=''
-rebuild_triggers                      -- 10 distinct + 26 touch_updated_at bindings; depends on step 18
+amendment_trigger_extensions          -- formerly 17j; moved here from amendment block to satisfy chiefos_touch_updated_at dependency. P3-4c (4 functions + 11 touch bindings + 9 append-only-family bindings; CREATE TRIGGER resolves function refs at parse time, so must run after rebuild_functions defines chiefos_touch_updated_at)
+rebuild_triggers                      -- 10 distinct + 26 touch_updated_at bindings; depends on rebuild_functions
 rebuild_views                         -- 6 views, all SECURITY INVOKER WITH (security_invoker = true)
 rebuild_rls_coverage_gap_fix          -- additive GRANTs for 6 Quotes spine tables (Principle 9)
 drift_detection_script                -- scripts/schema_drift_check.js + package.json entries
@@ -92,7 +92,7 @@ remediation_drop_users_dashboard_token -- R1; must run AFTER R9 cleans services/
 **Critical dependency notes:**
 
 - Step 7 must run before step 8 (Quotes spine FK to customers).
-- Step 17j must run after step 18 (touch trigger function dependency).
+- `amendment_trigger_extensions` (formerly 17j) must run after `rebuild_functions` so `chiefos_touch_updated_at()` exists at parse time. Resolved in apply-order list above (2026-04-26 manifest reorder); prior ordering placed 17j before `rebuild_functions` and would have failed against an empty schema with `42883: function public.chiefos_touch_updated_at() does not exist`.
 - Step 24 must run after R9 cleans `services/postgres.js:3370,3385,4593` references to `dashboard_token`.
 
 ---

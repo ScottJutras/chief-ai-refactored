@@ -50,11 +50,14 @@ async function generateFollowUpDraft({ jobName, amountCents, daysPending, custom
 async function runReceivablesNudge() {
   const now = new Date();
 
+  // Post-rebuild canonical: public.users keyed by (owner_id, role='owner')
+  // (chiefos_tenant_actor_profiles DISCARDed per Decision 12).
+  // user_id is the digits PK = phone_digits.
   const overdueResult = await pool.query(`
     SELECT
       t.owner_id,
-      tap.phone_digits,
-      tap.tenant_id,
+      u.user_id    AS phone_digits,
+      t.tenant_id,
       j.name       AS job_name,
       j.job_no,
       t.id         AS tx_id,
@@ -64,12 +67,10 @@ async function runReceivablesNudge() {
       (NOW()::date - t.date) AS days_pending
     FROM public.transactions t
     JOIN public.jobs j ON j.id = t.job_id
-    JOIN public.chiefos_tenant_actor_profiles tap
-      ON tap.owner_id::text = t.owner_id::text
+    JOIN public.users u ON u.owner_id = t.owner_id AND u.role = 'owner'
     WHERE t.kind           = 'revenue'
       AND COALESCE(t.payment_status, 'pending') = 'pending'
       AND t.date           <= NOW() - ($1 || ' days')::interval
-      AND tap.phone_digits IS NOT NULL
     ORDER BY t.owner_id, days_pending DESC
   `, [OVERDUE_THRESHOLD_DAYS]).catch(() => null);
 

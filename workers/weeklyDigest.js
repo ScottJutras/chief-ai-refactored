@@ -296,10 +296,14 @@ async function runWeeklyDigest() {
   const range   = isoWeekRange(now);
   const qStart  = detectQuarterStart(now);
 
+  // Post-rebuild canonical owner registry: public.users + chiefos_tenants
+  // (chiefos_tenant_actor_profiles DISCARDed per Decision 12). user_id is the
+  // digits PK = phone_digits; tz lives on chiefos_tenants.
   const ownersResult = await pool.query(`
-    SELECT DISTINCT owner_id, phone_digits, tz
-    FROM public.chiefos_tenant_actor_profiles
-    WHERE phone_digits IS NOT NULL AND phone_digits != ''
+    SELECT u.owner_id, u.user_id AS phone_digits, t.tz
+      FROM public.users u
+      JOIN public.chiefos_tenants t ON t.id = u.tenant_id
+     WHERE u.role = 'owner'
   `).catch(() => null);
 
   const owners = ownersResult?.rows || [];
@@ -355,7 +359,7 @@ async function runWeeklyDigest() {
       sent++;
 
       const tenantResult = await pool.query(
-        `SELECT tenant_id FROM public.chiefos_tenant_actor_profiles WHERE owner_id = $1 LIMIT 1`,
+        `SELECT id AS tenant_id FROM public.chiefos_tenants WHERE owner_id = $1 LIMIT 1`,
         [String(owner.owner_id)]
       ).catch(() => null);
       const tenantId = tenantResult?.rows?.[0]?.tenant_id || '00000000-0000-0000-0000-000000000000';

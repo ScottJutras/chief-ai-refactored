@@ -187,6 +187,44 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ## P1B — Post-cutover audit trackers (from 2026-04-28 audit cycle)
 
+### P1B-jobs-fe-stale-schema-references
+
+**Source:** Surfaced 2026-04-28 during /api/log preview testing (P1 punchlist item #7). **11th instance** of the stale-schema-reference pattern caught today.
+
+**Symptom:** Both `/app/jobs` (list) and `/app/jobs/[jobId]` (detail) pages 400 against PostgREST. Network log:
+
+```
+GET /rest/v1/jobs?select=id,job_no,job_name,name,status,active,start_date,end_date,
+                          created_at,material_budget_cents,labour_hours_budget,
+                          contract_value_cents
+                  &id=eq.6&deleted_at=is.null
+→ 400 Bad Request
+```
+
+**Drift:** the SELECT requests two columns that don't exist post-rebuild:
+- `job_name` — DROPPED; current schema has `name` only.
+- `active` — DROPPED; current schema uses `status` enum (`active` / `paused` / `done` / `archived` or similar).
+
+**Affected files (likely):**
+- `chiefos-site/app/app/jobs/page.tsx` (list view)
+- `chiefos-site/app/app/jobs/[jobId]/page.tsx` (detail view)
+
+There may be additional call sites (job pickers, dashboards, etc.) that grep for `.from("jobs").select(...job_name|active)`.
+
+**Fix:** rewrite the SELECT clause to use post-rebuild canonical columns:
+- Remove `job_name` from select; references to `job.job_name` in the FE pivot to `job.name`.
+- Remove `active` from select; references pivot to `job.status === 'active'`.
+
+**Caller verification before fix:** grep all chiefos-site files for `.from("jobs")` and audit each SELECT against current `public.jobs` schema. Same audit pattern as the comprehensive-working-tree-audit methodology.
+
+**Sized:** 1-2 hours (refactor 1-2 SELECT statements + audit other potential call sites + retest).
+
+**Bundle posture:** independent small PR, not bundled with /api/log or the cleanup PR. Ships before Beta launch.
+
+**Cross-reference:** Surfaced via /api/log preview testing — couldn't reach the entry forms because the parent page 400'd loading job data. The /api/log route itself is functional independent of this bug; the bug just blocks the human-friendly test path. Console-fetch testing bypasses it.
+
+---
+
 ### P1B-source-msg-id-unique-on-task-time-reminder
 
 **Source:** Surfaced 2026-04-28 during /api/log rewrite pre-write schema verification (P1 punchlist item #7).
@@ -342,6 +380,7 @@ Introspection Discipline language updated to reference R-session findings ("F2/F
 3. **Characterize every modified/untracked file by origin** — author intent, session source, defer/commit/discard.
 4. **Cross-reference against documented-as-shipped work** — manifests, session reports, FOUNDATION_CURRENT.md, decisions logs.
 5. **Surface findings as candidates** — commit/discard/tracker per file.
+6. **Grep all chiefos-site `supabase.from()` and `supabase.rpc()` call sites** and cross-reference each table/RPC name + each SELECTed column against current `public.*` schema. Catches the structural bug class that surfaced with `chiefos_link_codes` (P1B-r2.5 fix), `chiefos_user_identities` (chief-ai-refactored R-rewrites fix), and now `jobs.job_name`/`jobs.active` (`P1B-jobs-fe-stale-schema-references`). All three are the same class: FE direct-PostgREST call → schema drift → 400/404 at runtime.
 
 **Sized:** half-day focused work.
 

@@ -47,3 +47,7 @@ twilio_content_*.json
 docs/_archive/**/_DRAFT*
 /Screenshot_*.jpg
 
+# Claude Code worktrees — local agent scratch space, never commit
+# (poisons grep results across audits if tracked)
+.claude/worktrees/
+

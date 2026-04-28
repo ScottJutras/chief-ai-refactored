@@ -187,6 +187,54 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ## P1B — Post-cutover audit trackers (from 2026-04-28 audit cycle)
 
+### P1B-api-log-idempotency-conflict-response-code
+
+**Source:** Surfaced 2026-04-28 during /api/log preview testing (P1 punchlist item #7). Final happy-path + error-path validation found this nuance.
+
+**Symptom:** /api/log handlers `handleExpense` and `handleRevenue` use `INSERT INTO transactions ... ON CONFLICT (owner_id, source_msg_id, kind) DO NOTHING`. When the conflict fires, the route returns HTTP 200 with `{ ok: true, id: undefined, kind, traceId }` even though no row was inserted. Per Engineering Constitution §9 the duplicate-submission response should be HTTP 409 with `error.code === "IDEMPOTENCY_CONFLICT"`.
+
+**Functional behavior:** dedup IS working — DB-layer ON CONFLICT prevents duplicate rows (verified at validation: 2 transactions inserted via 4 POSTs, 2 of which were duplicates). The bug is response-code mapping only.
+
+**Affected handlers:**
+- `handleExpense` (chiefos-site/app/api/log/route.ts) — uses ON CONFLICT.
+- `handleRevenue` — same pattern.
+- `handleHours`, `handleTask`, `handleReminder` use SELECT-then-INSERT manual dedup and DO return 200 with the IDEMPOTENCY_CONFLICT code (different status than spec — they return 200 not 409, also a small bug per the spec).
+
+**Fix:**
+```ts
+// Replace the bare INSERT pattern with:
+const { data: insertedRow, error } = await admin
+  .from("transactions")
+  .insert(row)
+  .select("id")
+  .maybeSingle();
+
+if (error) { /* existing error handling */ }
+
+if (!insertedRow) {
+  // ON CONFLICT DO NOTHING fired — row already exists. Look up original.
+  const { data: existing } = await admin
+    .from("transactions")
+    .select("id")
+    .eq("owner_id", ctx.ownerId)
+    .eq("source_msg_id", sourceMsgId)
+    .eq("kind", "expense")
+    .maybeSingle();
+  return jsonErr(409, "IDEMPOTENCY_CONFLICT",
+    "Duplicate entry detected.",
+    `This entry was already logged today; original id: ${existing?.id}.`,
+    traceId, { existing_id: existing?.id });
+}
+```
+
+Also: the SELECT-then-INSERT dedup paths (hours/task/reminder) should return 409 instead of 200 for the same consistency reason.
+
+**Sized:** ~30 min to fix all 5 handlers + retest. Single small follow-up commit.
+
+**Bundle posture:** independent small PR or appended to the cleanup PR before merge. Not blocking — dedup works correctly at the DB layer; only the response code is wrong, and the FE catches the absence of `data.id` either way for re-render logic.
+
+---
+
 ### P1B-jobs-fe-stale-schema-references
 
 **Source:** Surfaced 2026-04-28 during /api/log preview testing (P1 punchlist item #7). **11th instance** of the stale-schema-reference pattern caught today.

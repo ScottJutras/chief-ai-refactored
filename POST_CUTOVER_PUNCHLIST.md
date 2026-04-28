@@ -59,6 +59,78 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ---
 
+## P1 — Job-picker pending-state rewrite
+
+**Status:** 3 functions in `services/postgres.js` are STUBBED with warn logs (commit `8023234e`). Live job picker uses HMAC-signed `jp:` row IDs in `handlers/commands/expense.js` with inline state — these stubs are dead-path under normal traffic but guard against legacy `jobpick::` token replay.
+
+**Drift:** `confirm_flow_pending` and `confirm_flows` tables are DROPPED post-rebuild. Replacements:
+- `pending_actions` (9 cols, jsonb payload, no soft-mark — consume via DELETE or expires_at)
+- `cil_drafts` (15 cols, replaces confirm_flows for staged-payload mutation)
+
+**Required tasks:**
+
+1. Verify `cil_drafts` shape supports the staged-payload mutation pattern (`UPDATE ... SET draft = jsonb_set(...)`). Pull schema from `mcp__claude_ai_Supabase__list_tables`.
+2. Rewrite `getPendingJobPick`: SELECT from `pending_actions WHERE kind='JOB_PICK' AND owner_id=$1 AND user_id=$2 AND expires_at > NOW()`. Return `id` (instead of `confirm_flow_id`), `payload->'context'`, `payload->>'resume_key'`.
+3. Rewrite `applyJobToPendingDraft`: write to `cil_drafts` instead of `confirm_flows`. Update the staged payload's `job_id` field via `jsonb_set`.
+4. Rewrite `clearPendingJobPick`: `DELETE FROM pending_actions WHERE id=$1` (drop the soft-mark `used_at` semantic).
+5. Update caller in `handlers/system/jobPickRouter.js`:18-26 to use `id` instead of `confirm_flow_id`.
+6. End-to-end retest: WhatsApp expense → job picker → selection → confirmation flow.
+
+**Estimated scope:** 1-2 hours focused work + ~30 min `cil_drafts` shape verification.
+
+**Reference:** 2026-04-27 cutover-integration-parity audit (commit `8023234e`).
+
+---
+
+## P1 — Active-job-memory rewrite
+
+**Status:** 4 functions in `services/postgres.js` are STUBBED with warn logs (commit `8023234e`). Active-job memory has been silently broken in production since the cutover (the dual-write to `user_active_job` table errored in try/catches; the fallback path queried dropped `jobs.active` column).
+
+**Drift:** Multi-table fan-out across DROPPED schemas:
+- `user_active_job` table (DROPPED)
+- `users.active_job_id` column (DROPPED — rebuild's canonical column is `auto_assign_active_job_id`)
+- `memberships.active_job_id` (DROPPED)
+- `user_profiles.active_job_id` (DROPPED)
+- `jobs.active` boolean column (DROPPED — rebuild uses `jobs.status` enum)
+
+**Canonical replacement:** `public.users.auto_assign_active_job_id` (integer NULL, FK to `jobs.id`). Single column, no fan-out.
+
+**Required tasks:**
+
+1. Confirm shape: `SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='auto_assign_active_job_id'`. Expected: integer / YES / FK to jobs.id.
+2. Rewrite `setActiveJob` / `setActiveJobForIdentity`: resolve job_no → jobs.id via single SELECT, then `UPDATE users SET auto_assign_active_job_id = $jobid, auto_assign_activated_at = now() WHERE owner_id=$1 AND user_id=$2`. Drop the multi-target fan-out, drop the "owner-wide active job" fallback (no longer exists post-rebuild).
+3. Rewrite `getActiveJob` / `getActiveJobForIdentity`: `SELECT u.auto_assign_active_job_id, j.name, j.job_no FROM public.users u LEFT JOIN public.jobs j ON j.id = u.auto_assign_active_job_id WHERE u.owner_id=$1 AND u.user_id=$2`.
+4. Caller audit: grep `setActiveJob`/`getActiveJob`/`setActiveJobForIdentity`/`getActiveJobForIdentity`/`setActiveJobForUser`/`setActiveJobForPhone`/`setUserActiveJob`/`updateUserActiveJob`/`saveActiveJob` to confirm callers handle the simpler return shape.
+5. End-to-end retest: WhatsApp expense capture WITHOUT explicit job-picker → does it correctly recall and use the active job?
+
+**Estimated scope:** 1.5-2 hours focused work.
+
+**Reference:** 2026-04-27 cutover-integration-parity audit (commit `8023234e`).
+
+---
+
+## P1 — Legacy-time_entries dual-write removal + caller migration to time_entries_v2
+
+**Status:** 5 functions in `services/postgres.js` are STUBBED with warn logs (commit `8023234e`). The legacy table `public.time_entries` is DROPPED post-rebuild.
+
+**Drift:** `getLatestTimeEvent`, `logTimeEntry`, `logTimeEntryWithJob`, `checkTimeEntryLimit`, `moveLastLogToJob` all targeted the legacy table with pre-rebuild columns (`type`, `timestamp`, `employee_name`, `local_time`, `tz`).
+
+**Canonical replacement:** `public.time_entries_v2` with `kind` (e.g., `'shift'`), `start_at_utc`, `end_at_utc`, `meta` jsonb (job_name lives in meta).
+
+**Required tasks:**
+
+1. Audit callers (`routes/timeclock.js`, `routes/employee.js`, `handlers/commands/timeclock.js`, `middleware/pendingAction.js`, `services/ai_confirm.js`). Most already write to `time_entries_v2` directly — the legacy dual-write was for the owner-side views which now read v2 too.
+2. Remove the legacy dual-write call sites (each `logTimeEntry(...)` invocation in callers becomes either a no-op deletion or a v2 INSERT).
+3. Re-implement `checkTimeEntryLimit` against `time_entries_v2` (use `kind`, `start_at_utc`, `created_at` as appropriate).
+4. Either rewrite the 5 functions against `time_entries_v2` OR delete them entirely and remove from exports + caller imports.
+5. End-to-end retest: WhatsApp clock-in/out, portal clock-in/out, owner-side activity views all read consistent data.
+
+**Estimated scope:** 2-3 hours focused work (caller audit dominates).
+
+**Reference:** 2026-04-27 cutover-integration-parity audit (commit `8023234e`).
+
+---
+
 ## P1 — services/integrity.js field-set alignment (V6.B)
 
 **Status:** verify endpoints currently return 503 (`routes/integrity.js`, commit `73321bfb`). On-disk integrity chain stamped by trigger `chiefos_integrity_chain_stamp` is intact and continues stamping new INSERTs correctly. JS verifier in `services/integrity.js` references stale field set, would mark every row invalid if called.

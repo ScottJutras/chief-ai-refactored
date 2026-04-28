@@ -11,7 +11,6 @@
     "dev": "nodemon index.js",
     "db:bootstrap": "docker exec -i chief-db-1 psql -U sherpa -d sherpa_test < scripts/bootstrap-local-db.sql",
     "test": "jest",
-    "worker:kpi": "node services/kpiWorker.js",
     "sql": "node scripts/runSql.js",
     "ingest:rag": "node scripts/ingestRAG.js data/rag/contractor_terms.csv",
     "postinstall": "node -e \"require.resolve('pdfkit'); require.resolve('@supabase/supabase-js'); console.log('deps ok')\""

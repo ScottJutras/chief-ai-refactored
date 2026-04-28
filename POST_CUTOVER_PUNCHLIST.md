@@ -28,6 +28,54 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ---
 
+## P1 — Onboarding refactor (post-rebuild Path α)
+
+**Status:** 4 onboarding routes return 503 with `issue: post-rebuild-onboarding-refactor-p1` (chiefos-site commit `a063416`). Five surfaces are broken; Path α is the architecturally correct target but doesn't fit the audit-fix PR scope.
+
+### Schema amendment first (P1A-7 pattern)
+
+1. **Decide column placement for country/province** — they live on `chiefos_tenants` post-rebuild. `public.users` does NOT have these columns. Confirm no caller writes them to users; if any does, it's drift to clean up.
+2. **Author `chiefos_finish_signup` PG RPC** with full design:
+   - Reads `auth.uid()` and metadata from `auth.users.raw_user_meta_data`.
+   - Resolves `owner_id` digits — decision: phone-based if metadata.phone is present, else generated (need decision from founder before authoring).
+   - Creates `chiefos_tenants` row (`id`, `owner_id`, `name=company`, `country`, `province` from metadata).
+   - Creates `chiefos_portal_users` row (`user_id=auth.uid()`, `tenant_id`, `role='owner'`, `can_insert_financials=true`, `status='active'`).
+   - Creates `public.users` owner row (`user_id=owner_id`, `owner_id`, `tenant_id`, `name`, `email`, `role='owner'`, `signup_status='complete'`, `auth_user_id=auth.uid()`).
+   - All within a single PG function = transactional by default.
+   - Returns `{ tenant_id, owner_id, portal_user_id }`.
+3. **Migration file**: `migrations/2026_04_NN_amendment_chiefos_finish_signup_rpc.sql`.
+4. **Manifest update + rollback file**.
+
+### Code refactor (6 chiefos-site files)
+
+- `app/api/auth/signup/route.ts`: pass metadata via Supabase Auth `options.data` → `auth.users.raw_user_meta_data` (not a separate `chiefos_pending_signups` upsert).
+- `app/api/auth/pending-signup/route.ts` (GET): read from `admin.auth.getUser().user_metadata`.
+- `app/api/auth/pending-signup/route.ts` (POST `set-tenant-meta`): UPDATE `chiefos_tenants` country/province only; remove `public.users` country/province writes (those columns don't exist).
+- `app/api/auth/pending-signup/route.ts` (POST `consume`): replace with `email_confirmed_at` check + `users.signup_status` flip to `'complete'`.
+- `app/api/tester-access/activate/route.ts`: replace `user_auth_links` lookup with `chiefos_portal_users` + `users.auth_user_id`; remove `users.subscription_tier`/`users.paid_tier` writes (use `plan_key`).
+- `app/finish-signup/FinishSignupClient.tsx`: update RPC call to new `chiefos_finish_signup` signature + handle new return shape.
+
+### End-to-end retest acceptance criteria
+
+1. Fresh signup from clean DB state.
+2. Email confirm via Supabase Auth flow.
+3. Tenant + owner creation completes via RPC (atomic — no partial state on error).
+4. Phone link via OTP (`portal_phone_link_otp` flow).
+5. WhatsApp test logs an expense to the new tenant.
+6. Portal whoami returns 200 with correct `tenant_id`, `owner_id`, `role`.
+7. All writes verified to land in `tctohnzqxzrfijdufrss` (production DB).
+8. Stranded auth.users rows cleaned up post-test.
+
+### Estimated scope
+
+4-6 hours including RPC authoring + migration + 6-file refactor + end-to-end retest. **Dedicated focused session** — do not bundle with other work.
+
+### Reference
+
+2026-04-28 cutover-integration-parity audit, Bundle 3 deferral (chiefos-site commit `a063416`). Stranded `auth.users` row `c32509fa-40d2-4f93-abf9-11ab2c4f728d` (`scott@missionexteriors.ca`) needs deletion before retest.
+
+---
+
 ## P1 — chiefos-site/app/api/log/route.ts full rewrite
 
 **Status:** route returns 503 with `issue: post-rebuild-log-route-rewrite` (commit `<this-PR-merge>`). 5 owner job-detail forms (expense / revenue / hours / task / reminder) hit this endpoint from `chiefos-site/app/app/jobs/[jobId]/page.tsx`. WhatsApp capture is unaffected.

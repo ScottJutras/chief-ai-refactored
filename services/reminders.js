@@ -1,397 +1,254 @@
 // services/reminders.js
-// ------------------------------------------------------------
-// Reminders CRUD – create, fetch due, mark sent, cancel.
-// Works for task reminders + lunch reminders.
-// Schema-aware + idempotent with (owner_id, source_msg_id) unique index.
-// ------------------------------------------------------------
+// ============================================================================
+// Reminders CRUD against the rebuild schema.
 //
-// ✅ Alignments included in THIS drop-in (without dropping logic):
-// - ✅ Keep ownerId as String().trim() (NO DIGITS / NO stripping)
-// - ✅ Canonical userId normalization helper that prefers WaId/phone digits but never breaks non-phone IDs
-// - ✅ Safer query resolution (pg.query fallback) + early hard error if query missing
-// - ✅ Capability detection cached + resilient if reminders table missing columns
-// - ✅ Idempotency ON CONFLICT is only used when source_msg_id exists + provided
-// - ✅ getDue* queries properly filter by kind + pending/sent/canceled across schema variants
-// - ✅ mark/cancel handle multiple schema shapes (sent/status/canceled columns optional)
+// Rebuild target: public.reminders (P1A-1 amendment — see
+// migrations/2026_04_22_amendment_reminders_and_insight_log.sql).
 //
-// NOTE: This file is a service; it should not try to read Twilio request body.
-// Callers should pass userId (ideally paUserId = WaId||digits(from)) and sourceMsgId (MessageSid) where possible.
+// Identity model (Engineering Constitution §2):
+//   - tenant_id (uuid, REQUIRED on every write)   — portal/RLS boundary
+//   - owner_id  (digit string, REQUIRED)          — ingestion/audit boundary
+//   - user_id   (digit string, OPTIONAL)          — actor scope
+//
+// Schema delta from pre-rebuild (R4 migration):
+//   remind_at         → due_at                       (renamed)
+//   sent + canceled   → sent_at + cancelled_at       (NULLs encode pending)
+//   status enum       → derived from sent_at/cancelled_at NULL state
+//   task_no/title/shift_id → payload jsonb           (no dedicated columns)
+//   kind 'lunch_reminder' → kind 'lunch'             (renamed enum value)
+//   id bigserial      → uuid (gen_random_uuid)
+//   ADDED tenant_id (uuid NOT NULL)
+//   ADDED correlation_id (uuid NOT NULL, §17.21)
+//
+// Worker (workers/reminder_dispatch.js) reads task_no/task_title/shift_id at
+// row-top-level; this module unpacks payload jsonb so the worker's call shape
+// is preserved.
+// ============================================================================
 
-const pg = require('./postgres');
-const query = pg.query || pg.pool?.query || pg.db?.query;
+const crypto = require('crypto');
+const { query } = require('./postgres');
 
-function assertQuery() {
-  if (typeof query !== 'function') {
-    throw new Error('[reminders] pg.query not available');
-  }
-}
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const VALID_KINDS = new Set(['task', 'lunch', 'custom']);
 
-function OWNER(x) {
+function isUuid(v) { return typeof v === 'string' && UUID_RE.test(v); }
+
+function normOwner(x) {
   const s = String(x ?? '').trim();
   return s || null;
 }
 
-// Keep user ids stable. If caller passes digits (WaId/phone), we keep it.
-// If caller passes UUID/text, we keep it too.
-function USER(x) {
-  const s = String(x ?? '').trim();
-  return s || null;
-}
-
-function normalizeUserId(x) {
-  // Prefer digits if it clearly looks like a phone-ish identity,
-  // but never destroy UUID/text ids.
+function normUserId(x) {
   const raw = String(x ?? '').trim();
   if (!raw) return null;
-
   const digits = raw.replace(/^whatsapp:/i, '').replace(/^\+/, '').replace(/\D/g, '');
-  // If it's long enough to be a phone id (or waId), use digits
   if (digits && digits.length >= 8) return digits;
-
   return raw;
 }
 
-function toIsoOrNull(dt) {
+function toIso(dt) {
   if (!dt) return null;
   const d = dt instanceof Date ? dt : new Date(dt);
   if (Number.isNaN(d.getTime())) return null;
   return d.toISOString();
 }
 
-let _caps = null;
-
-async function hasColumn(table, col) {
-  assertQuery();
-  const r = await query(
-    `select 1
-       from information_schema.columns
-      where table_schema='public'
-        and table_name=$1
-        and column_name=$2
-      limit 1`,
-    [table, col]
-  );
-  return (r?.rows?.length || 0) > 0;
+function ensureTenantId(tenantId) {
+  if (!isUuid(tenantId)) {
+    throw new Error('[reminders] tenantId is required and must be a uuid');
+  }
+  return tenantId;
 }
 
-async function detectReminderCaps() {
-  if (_caps) return _caps;
+function ensureOwnerId(ownerId) {
+  const owner = normOwner(ownerId);
+  if (!owner) throw new Error('[reminders] ownerId is required');
+  return owner;
+}
 
-  const table = 'reminders';
-  const caps = {
-    hasSourceMsgId: false,
-    hasCanceled: false,
-    hasCanceledAt: false,
-    hasKind: false,
-    hasTaskNo: false,
-    hasTaskTitle: false,
-    hasShiftId: false,
-    hasStatus: false,
-    hasSent: false,
-    hasSentAt: false
+function ensureCorrelationId(id) {
+  return isUuid(id) ? id : crypto.randomUUID();
+}
+
+// Decompose row.payload jsonb back into worker-expected top-level keys.
+function shapeWorkerRow(row) {
+  const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
+  return {
+    id: row.id,
+    tenant_id: row.tenant_id,
+    owner_id: row.owner_id,
+    user_id: row.user_id,
+    kind: row.kind,
+    due_at: row.due_at,
+    task_no: payload.task_no ?? null,
+    task_title: payload.task_title ?? null,
+    shift_id: payload.shift_id ?? null,
+    correlation_id: row.correlation_id,
   };
+}
 
-  try {
-    // If query isn't available, just cache defaults (fail-open).
-    if (typeof query !== 'function') {
-      _caps = caps;
-      return caps;
-    }
+async function insertReminder({ tenantId, ownerId, userId, kind, remindAt, payload, sourceMsgId, correlationId }) {
+  const tenant = ensureTenantId(tenantId);
+  const owner = ensureOwnerId(ownerId);
+  const user = normUserId(userId);
+  const dueIso = toIso(remindAt);
+  if (!dueIso) throw new Error('[reminders] Invalid remindAt');
 
-    caps.hasSourceMsgId = await hasColumn(table, 'source_msg_id');
-    caps.hasCanceled = await hasColumn(table, 'canceled');
-    caps.hasCanceledAt = await hasColumn(table, 'canceled_at');
-    caps.hasKind = await hasColumn(table, 'kind');
-    caps.hasTaskNo = await hasColumn(table, 'task_no');
-    caps.hasTaskTitle = await hasColumn(table, 'task_title');
-    caps.hasShiftId = await hasColumn(table, 'shift_id');
-    caps.hasStatus = await hasColumn(table, 'status');
-    caps.hasSent = await hasColumn(table, 'sent');
-    caps.hasSentAt = await hasColumn(table, 'sent_at');
-  } catch {
-    // fail-open
+  const safeKind = String(kind || 'task').trim() || 'task';
+  if (!VALID_KINDS.has(safeKind)) {
+    throw new Error(`[reminders] kind must be one of task|lunch|custom (got ${safeKind})`);
   }
 
-  _caps = caps;
-  return caps;
+  const sm = String(sourceMsgId || '').trim() || null;
+  const corr = ensureCorrelationId(correlationId);
+  const safePayload = payload && typeof payload === 'object' ? payload : {};
+
+  // ON CONFLICT uses the partial unique index reminders_owner_source_msg_unique_idx
+  // (owner_id, source_msg_id) WHERE source_msg_id IS NOT NULL — only fires when
+  // sm is non-null because NULL never conflicts under that predicate.
+  const sql = `
+    insert into public.reminders
+      (tenant_id, owner_id, user_id, kind, due_at, payload, source_msg_id, correlation_id)
+    values
+      ($1::uuid, $2, $3, $4, $5::timestamptz, $6::jsonb, $7, $8::uuid)
+    on conflict (owner_id, source_msg_id) where source_msg_id is not null
+    do nothing
+    returning id, tenant_id, owner_id, correlation_id
+  `;
+
+  const res = await query(sql, [tenant, owner, user, safeKind, dueIso, safePayload, sm, corr]);
+  if (res?.rowCount) {
+    const row = res.rows[0];
+    return { inserted: true, id: row.id, tenantId: row.tenant_id, ownerId: row.owner_id, correlationId: row.correlation_id };
+  }
+  return { inserted: false, id: null, tenantId: null, ownerId: null, correlationId: null };
 }
 
 async function createReminder({
+  tenantId,
   ownerId,
   userId,
   taskNo = null,
   taskTitle = null,
+  jobNo = null,
   remindAt,
   kind = 'task',
-  sourceMsgId = null
+  sourceMsgId = null,
+  correlationId = null,
 }) {
-  assertQuery();
-  const caps = await detectReminderCaps();
+  const payload = {};
+  if (taskNo != null) payload.task_no = Number(taskNo);
+  if (taskTitle) payload.task_title = String(taskTitle).trim();
+  if (jobNo != null) payload.job_no = Number(jobNo);
 
-  const owner = OWNER(ownerId);
-  const user = normalizeUserId(USER(userId));
-  const atIso = toIsoOrNull(remindAt);
+  return insertReminder({
+    tenantId, ownerId, userId, kind, remindAt, payload, sourceMsgId, correlationId,
+  });
+}
 
-  if (!owner) throw new Error('Missing ownerId');
-  if (!user) throw new Error('Missing userId');
-  if (!atIso) throw new Error('Invalid remindAt');
+async function createLunchReminder({
+  tenantId,
+  ownerId,
+  userId,
+  shiftId,
+  remindAt,
+  sourceMsgId = null,
+  correlationId = null,
+}) {
+  const payload = {};
+  if (shiftId != null) payload.shift_id = String(shiftId);
 
-  const cols = ['owner_id', 'user_id', 'remind_at'];
-  const vals = [owner, user, atIso];
-
-  // normalize kind
-  const safeKind = String(kind || 'task').trim() || 'task';
-
-  if (caps.hasStatus) {
-    cols.push('status');
-    vals.push('pending');
-  }
-  if (caps.hasSent) {
-    cols.push('sent');
-    vals.push(false);
-  }
-  if (caps.hasKind) {
-    cols.push('kind');
-    vals.push(safeKind);
-  }
-  if (caps.hasTaskNo) {
-    cols.push('task_no');
-    vals.push(taskNo != null ? Number(taskNo) : null);
-  }
-  if (caps.hasTaskTitle) {
-    cols.push('task_title');
-    vals.push(taskTitle ? String(taskTitle).trim() : null);
-  }
-
-  const sm = caps.hasSourceMsgId ? (String(sourceMsgId || '').trim() || null) : null;
-  if (caps.hasSourceMsgId) {
-    cols.push('source_msg_id');
-    vals.push(sm);
-  }
-
-  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
-  const smProvided = caps.hasSourceMsgId && !!sm;
-
-  // Idempotent only when source_msg_id exists AND provided.
-  // NOTE: requires a matching unique index/constraint; otherwise this is a syntax error.
-  // To stay fail-open, we use ON CONFLICT (owner_id, source_msg_id) only when source_msg_id exists.
-  const sql = smProvided
-    ? `
-      insert into public.reminders (${cols.join(', ')})
-      values (${placeholders})
-      on conflict (owner_id, source_msg_id)
-      do nothing
-      returning id
-    `
-    : `
-      insert into public.reminders (${cols.join(', ')})
-      values (${placeholders})
-      returning id
-    `;
-
-  const res = await query(sql, vals);
-  if (res?.rowCount) return { inserted: true, id: res.rows?.[0]?.id || null };
-  return { inserted: false, id: null };
+  return insertReminder({
+    tenantId, ownerId, userId,
+    kind: 'lunch',
+    remindAt, payload, sourceMsgId, correlationId,
+  });
 }
 
 async function getDueReminders({ now = new Date(), limit = 500 } = {}) {
-  assertQuery();
-  const caps = await detectReminderCaps();
-  const nowIso = toIsoOrNull(now) || new Date().toISOString();
+  const nowIso = toIso(now) || new Date().toISOString();
   const lim = Math.max(1, Math.min(Number(limit) || 500, 2000));
-
-  const whereCanceled = caps.hasCanceled ? `and canceled = false` : ``;
-  const whereStatus = caps.hasStatus ? `and status = 'pending'` : ``;
-
-  // Exclude lunch reminders here if kind exists.
-  const whereKind = caps.hasKind ? `and (kind is null or kind <> 'lunch_reminder')` : ``;
-
-  // Sent filter depends on columns present:
-  // - if hasSent: sent=false
-  // - else if hasStatus: status='pending' already handled
-  // - else: allow all (fail-open)
-  const whereSent = caps.hasSent ? `sent = false` : `true`;
 
   const { rows } = await query(
     `
-    select
-      id,
-      owner_id,
-      user_id,
-      ${caps.hasKind ? 'kind,' : `null as kind,`}
-      ${caps.hasTaskNo ? 'task_no,' : 'null as task_no,'}
-      ${caps.hasTaskTitle ? 'task_title,' : 'null as task_title,'}
-      remind_at
-    from public.reminders
-    where ${whereSent}
-      ${whereCanceled}
-      ${whereStatus}
-      ${whereKind}
-      and remind_at <= $1::timestamptz
-    order by remind_at asc
-    limit ${lim}
+    select id, tenant_id, owner_id, user_id, kind, due_at, payload, correlation_id
+      from public.reminders
+     where due_at <= $1::timestamptz
+       and sent_at is null
+       and cancelled_at is null
+       and kind in ('task','custom')
+     order by due_at asc
+     limit ${lim}
     `,
     [nowIso]
   );
 
-  return rows || [];
-}
-
-async function markReminderSent(id) {
-  assertQuery();
-  const caps = await detectReminderCaps();
-
-  const setStatus = caps.hasStatus ? `, status = 'sent'` : ``;
-  const setSentAt = caps.hasSentAt ? `, sent_at = now()` : ``;
-
-  // If hasSent, flip it. If not, best-effort: set status if exists.
-  const setCore = caps.hasSent ? `sent = true` : caps.hasStatus ? `status = 'sent'` : `remind_at = remind_at`;
-
-  await query(
-    `
-    update public.reminders
-       set ${setCore}${setStatus}${setSentAt}
-     where id = $1
-    `,
-    [id]
-  );
-
-  return true;
-}
-
-async function cancelReminder(id) {
-  assertQuery();
-  const caps = await detectReminderCaps();
-
-  // If no canceled column, treat cancel as "sent" (removes from due queue).
-  if (!caps.hasCanceled) {
-    await markReminderSent(id);
-    return { ok: true, mode: 'mark_sent' };
-  }
-
-  const setCanceledAt = caps.hasCanceledAt ? `, canceled_at = now()` : '';
-  const setStatus = caps.hasStatus ? `, status = 'canceled'` : '';
-  const setSent = caps.hasSent ? `, sent = true` : '';
-
-  await query(
-    `
-    update public.reminders
-       set canceled = true
-           ${setCanceledAt}
-           ${setStatus}
-           ${setSent}
-     where id = $1
-    `,
-    [id]
-  );
-
-  return { ok: true, mode: 'canceled' };
-}
-
-async function createLunchReminder({ ownerId, userId, shiftId, remindAt, sourceMsgId = null }) {
-  assertQuery();
-  const caps = await detectReminderCaps();
-
-  const owner = OWNER(ownerId);
-  const user = normalizeUserId(USER(userId));
-  const atIso = toIsoOrNull(remindAt);
-
-  if (!owner) throw new Error('Missing ownerId');
-  if (!user) throw new Error('Missing userId');
-  if (!atIso) throw new Error('Invalid remindAt');
-
-  const cols = ['owner_id', 'user_id', 'remind_at'];
-  const vals = [owner, user, atIso];
-
-  if (caps.hasStatus) {
-    cols.push('status');
-    vals.push('pending');
-  }
-  if (caps.hasSent) {
-    cols.push('sent');
-    vals.push(false);
-  }
-  if (caps.hasKind) {
-    cols.push('kind');
-    vals.push('lunch_reminder');
-  }
-  if (caps.hasShiftId) {
-    cols.push('shift_id');
-    vals.push(shiftId != null ? String(shiftId) : null);
-  }
-
-  const sm = caps.hasSourceMsgId ? (String(sourceMsgId || '').trim() || null) : null;
-  if (caps.hasSourceMsgId) {
-    cols.push('source_msg_id');
-    vals.push(sm);
-  }
-
-  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ');
-  const smProvided = caps.hasSourceMsgId && !!sm;
-
-  const sql = smProvided
-    ? `
-      insert into public.reminders (${cols.join(', ')})
-      values (${placeholders})
-      on conflict (owner_id, source_msg_id)
-      do nothing
-      returning id
-    `
-    : `
-      insert into public.reminders (${cols.join(', ')})
-      values (${placeholders})
-      returning id
-    `;
-
-  const res = await query(sql, vals);
-  if (res?.rowCount) return { inserted: true, id: res.rows?.[0]?.id || null };
-  return { inserted: false, id: null };
+  return (rows || []).map(shapeWorkerRow);
 }
 
 async function getDueLunchReminders({ now = new Date(), limit = 500 } = {}) {
-  assertQuery();
-  const caps = await detectReminderCaps();
-  const nowIso = toIsoOrNull(now) || new Date().toISOString();
+  const nowIso = toIso(now) || new Date().toISOString();
   const lim = Math.max(1, Math.min(Number(limit) || 500, 2000));
-
-  const whereCanceled = caps.hasCanceled ? `and canceled = false` : ``;
-  const whereStatus = caps.hasStatus ? `and status = 'pending'` : ``;
-  const whereKind = caps.hasKind ? `and kind = 'lunch_reminder'` : ``;
-
-  const whereSent = caps.hasSent ? `sent = false` : `true`;
 
   const { rows } = await query(
     `
-    select
-      id,
-      owner_id,
-      user_id,
-      ${caps.hasShiftId ? 'shift_id,' : 'null as shift_id,'}
-      remind_at
-    from public.reminders
-    where ${whereSent}
-      ${whereCanceled}
-      ${whereStatus}
-      ${whereKind}
-      and remind_at <= $1::timestamptz
-    order by remind_at asc
-    limit ${lim}
+    select id, tenant_id, owner_id, user_id, kind, due_at, payload, correlation_id
+      from public.reminders
+     where due_at <= $1::timestamptz
+       and sent_at is null
+       and cancelled_at is null
+       and kind = 'lunch'
+     order by due_at asc
+     limit ${lim}
     `,
     [nowIso]
   );
 
-  return rows || [];
+  return (rows || []).map(shapeWorkerRow);
+}
+
+async function markReminderSent(id, { tenantId, ownerId } = {}) {
+  if (!isUuid(id)) throw new Error('[reminders] markReminderSent: id must be a uuid');
+  const tenant = ensureTenantId(tenantId);
+  const owner = ensureOwnerId(ownerId);
+
+  await query(
+    `update public.reminders
+        set sent_at = now(), updated_at = now()
+      where id = $1::uuid
+        and tenant_id = $2::uuid
+        and owner_id = $3
+        and sent_at is null
+        and cancelled_at is null`,
+    [id, tenant, owner]
+  );
+  return true;
+}
+
+async function cancelReminder(id, { tenantId, ownerId } = {}) {
+  if (!isUuid(id)) throw new Error('[reminders] cancelReminder: id must be a uuid');
+  const tenant = ensureTenantId(tenantId);
+  const owner = ensureOwnerId(ownerId);
+
+  await query(
+    `update public.reminders
+        set cancelled_at = now(), updated_at = now()
+      where id = $1::uuid
+        and tenant_id = $2::uuid
+        and owner_id = $3
+        and sent_at is null
+        and cancelled_at is null`,
+    [id, tenant, owner]
+  );
+  return { ok: true };
 }
 
 module.exports = {
   createReminder,
+  createLunchReminder,
   getDueReminders,
+  getDueLunchReminders,
   markReminderSent,
   cancelReminder,
-  createLunchReminder,
-  getDueLunchReminders,
-
-  // helpful exports for callers/tests (non-breaking)
-  detectReminderCaps,
-  normalizeUserId
+  normalizeUserId: normUserId,
 };

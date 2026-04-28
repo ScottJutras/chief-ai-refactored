@@ -1636,11 +1636,13 @@ async function clearRepairPrompt(id) {
         noon.setHours(12, 0, 0, 0);
         const remindAt = noon > new Date() ? noon : new Date(Date.now() + 4 * 60 * 60 * 1000);
         await createLunchReminder({
+          tenantId: ctx?.tenant_id,
           ownerId: owner_id,
           userId: user_id,
           shiftId: String(inserted.id ?? ''),
           remindAt,
           sourceMsgId: source_msg_id ? `lunch:${source_msg_id}` : null,
+          correlationId: ctx?.correlation_id,
         });
       } catch (e) {
         console.warn('[REMINDERS] createLunchReminder failed (ignored):', e?.message);

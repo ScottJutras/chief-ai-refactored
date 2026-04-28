@@ -26,6 +26,8 @@ const crypto = require("crypto");
 const pg = require("../services/postgres");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
 const { logTimeEntry } = require("../services/postgres");
+const { emitActivityLog } = require("../services/activityLog");
+const { buildActorContext } = require("../services/actorContext");
 
 const router = express.Router();
 
@@ -41,36 +43,61 @@ function makeSourceMsgId(prefix, actorKey) {
 
 // Map the role of the caller + target into an allow/deny decision. The
 // target's role drives the rules; the caller's role drives the check.
+// Post-rebuild role enum: chiefos_portal_users.role IN (owner, board_member,
+// employee); public.users.role IN (owner, employee, contractor). 'admin'
+// from pre-rebuild is no longer a valid role.
 function assertCanActFor(callerRole, targetRole) {
   const cr = String(callerRole || "").toLowerCase();
   const tr = String(targetRole || "").toLowerCase();
-  if (cr === "owner" || cr === "admin") return null;
-  if (cr === "board") {
+  if (cr === "owner") return null;
+  if (cr === "board_member") {
     if (tr === "owner") {
       return { code: "PERMISSION_DENIED", message: "Board members cannot act for the owner." };
     }
     return null;
   }
-  // employee (or any other role) can only target themselves — the
-  // self-target short-circuit handles that above this call.
+  // employee / contractor (or any other role) can only target themselves —
+  // the self-target short-circuit handles that above this call.
   return { code: "PERMISSION_DENIED", message: "You can only clock yourself in/out." };
 }
 
 // Load the target actor's identity fields for writes. Returns null if
-// the actor doesn't belong to the caller's tenant (treated as not found
-// to avoid leaking other-tenant actor ids via error messages).
+// the actor doesn't belong to the caller's tenant.
+//
+// Post-rebuild, "actor" splits into two surfaces (Decision 12):
+//   - portal members:    chiefos_portal_users.user_id is auth.users.id (uuid)
+//   - WhatsApp-only emp: public.users.user_id is digit string (phone)
+// Both surfaces live in the same tenant. The actorId argument is opaque text
+// — could be a uuid (portal) or digits (whatsapp). The UNION below tries
+// both, returns the first match, and tags the row with `source` so the
+// caller can disambiguate. WhatsApp-paired employees only appear via the
+// portal branch (auth_user_id IS NULL filter on the WA branch prevents dupes).
 async function loadTenantActor({ tenantId, actorId }) {
   if (!tenantId || !actorId) return null;
   const r = await pg.query(
-    `SELECT a.actor_id,
-            a.role,
-            p.display_name,
-            p.phone_digits,
-            p.email
-       FROM public.chiefos_tenant_actors a
-       LEFT JOIN public.chiefos_tenant_actor_profiles p
-         ON p.tenant_id = a.tenant_id AND p.actor_id = a.actor_id
-      WHERE a.tenant_id = $1 AND a.actor_id = $2
+    `SELECT pu.user_id::text AS actor_id,
+            pu.role,
+            COALESCE(u.name, '')        AS display_name,
+            u.user_id                   AS phone_digits,
+            u.email                     AS email,
+            'portal'::text              AS source
+       FROM public.chiefos_portal_users pu
+       LEFT JOIN public.users u
+         ON u.auth_user_id = pu.user_id AND u.tenant_id = pu.tenant_id
+      WHERE pu.tenant_id = $1
+        AND pu.user_id::text = $2
+        AND pu.status = 'active'
+     UNION ALL
+     SELECT u.user_id                   AS actor_id,
+            u.role,
+            COALESCE(u.name, '')        AS display_name,
+            u.user_id                   AS phone_digits,
+            u.email                     AS email,
+            'whatsapp'::text            AS source
+       FROM public.users u
+      WHERE u.tenant_id = $1
+        AND u.user_id = $2
+        AND u.auth_user_id IS NULL
       LIMIT 1`,
     [tenantId, actorId]
   );
@@ -153,22 +180,37 @@ router.get("/api/timeclock/actors", requirePortalUser(), async (req, res) => {
       return jsonErr(res, 403, "NOT_LINKED", "Your account is not fully linked.");
     }
 
+    // Post-rebuild union: portal members (auth uuid) + WhatsApp-only
+    // employees (digits user_id). The `source` field on each row lets the
+    // frontend disambiguate without inspecting actor_id shape.
     const r = await pg.query(
-      `SELECT a.actor_id,
-              a.role,
-              COALESCE(NULLIF(TRIM(p.display_name), ''),
-                       NULLIF(TRIM(p.email), ''),
-                       'Unnamed')                    AS display_name
-         FROM public.chiefos_tenant_actors a
-         LEFT JOIN public.chiefos_tenant_actor_profiles p
-           ON p.tenant_id = a.tenant_id AND p.actor_id = a.actor_id
-        WHERE a.tenant_id = $1
+      `SELECT pu.user_id::text                       AS actor_id,
+              pu.role                                AS role,
+              COALESCE(NULLIF(TRIM(u.name), ''),
+                       NULLIF(TRIM(u.email), ''),
+                       'Unnamed')                    AS display_name,
+              'portal'::text                         AS source
+         FROM public.chiefos_portal_users pu
+         LEFT JOIN public.users u
+           ON u.auth_user_id = pu.user_id AND u.tenant_id = pu.tenant_id
+        WHERE pu.tenant_id = $1
+          AND pu.status = 'active'
+       UNION ALL
+       SELECT u.user_id                              AS actor_id,
+              u.role                                 AS role,
+              COALESCE(NULLIF(TRIM(u.name), ''),
+                       NULLIF(TRIM(u.email), ''),
+                       'Unnamed')                    AS display_name,
+              'whatsapp'::text                       AS source
+         FROM public.users u
+        WHERE u.tenant_id = $1
+          AND u.auth_user_id IS NULL
         ORDER BY
-          CASE a.role
+          CASE role
             WHEN 'owner' THEN 0
-            WHEN 'admin' THEN 1
-            WHEN 'board' THEN 2
-            WHEN 'employee' THEN 3
+            WHEN 'board_member' THEN 1
+            WHEN 'employee' THEN 2
+            WHEN 'contractor' THEN 3
             ELSE 4
           END,
           display_name ASC`,
@@ -182,6 +224,7 @@ router.get("/api/timeclock/actors", requirePortalUser(), async (req, res) => {
         actor_id: row.actor_id,
         role: row.role,
         display_name: row.display_name,
+        source: row.source,
         is_self: isSelf,
         is_allowed: isSelf || !denial,
       };
@@ -243,12 +286,14 @@ router.get("/api/timeclock/active-shifts", requirePortalUser(), async (req, res)
 
     const jobId = req.query.job_id ? Number(req.query.job_id) : null;
 
+    // Post-rebuild: resolve employee display_name via public.users
+    // (user_id is the digits PK = phone_digits in te.user_id).
     let sql = `
       SELECT te.id, te.user_id, te.start_at_utc, te.meta,
-             COALESCE(p.display_name, te.user_id) AS employee_name
+             COALESCE(u.name, te.user_id) AS employee_name
         FROM public.time_entries_v2 te
-        LEFT JOIN public.chiefos_tenant_actor_profiles p
-          ON p.tenant_id = te.tenant_id AND p.phone_digits = te.user_id
+        LEFT JOIN public.users u
+          ON u.tenant_id = te.tenant_id AND u.user_id = te.user_id
        WHERE te.tenant_id = $1
          AND te.kind = 'shift'
          AND te.end_at_utc IS NULL`;
@@ -399,12 +444,21 @@ router.post("/api/timeclock/clock-in", requirePortalUser(), express.json(), asyn
       ...(target.is_self ? {} : { initiated_by_actor_id: req.actorId }),
     };
 
+    // R3b: crew submissions land as pending_review for owner approval.
+    // - Employee clocking themselves in → pending_review (crew submission).
+    // - Owner/admin/board acting on self or behalf of another → approved
+    //   (trusted role, no review needed).
+    const submissionStatus =
+      target.is_self && String(target.role || "").toLowerCase() === "employee"
+        ? "pending_review"
+        : "approved";
+
     const ins = await pg.query(
       `INSERT INTO public.time_entries_v2
-         (tenant_id, owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
-       VALUES ($1, $2, $3, NULL, NULL, 'shift', NOW(), NULL, $4, 'portal', $5)
-       RETURNING id, start_at_utc`,
-      [tenantId, ownerId, userId, meta, sourceMsgId]
+         (tenant_id, owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id, submission_status)
+       VALUES ($1, $2, $3, NULL, NULL, 'shift', NOW(), NULL, $4, 'portal', $5, $6)
+       RETURNING id, start_at_utc, submission_status`,
+      [tenantId, ownerId, userId, meta, sourceMsgId, submissionStatus]
     );
     const row = ins?.rows?.[0];
     if (!row?.id) {
@@ -506,6 +560,23 @@ router.post("/api/timeclock/clock-out", requirePortalUser(), express.json(), asy
     const durationMs = new Date(row.end_at_utc).getTime() - new Date(row.start_at_utc).getTime();
     const durationMinutes = Math.max(0, Math.round(durationMs / 60000));
 
+    // F3.3: emit canonical activity log row for the state change.
+    try {
+      await emitActivityLog(buildActorContext(req), {
+        action_kind: "update",
+        target_table: "time_entries_v2",
+        target_id: String(row.id),
+        payload: {
+          event: "clock_out",
+          target_user_id: userId,
+          duration_minutes: durationMinutes,
+          end_at_utc: row.end_at_utc,
+        },
+      });
+    } catch (e) {
+      console.warn("[TIMECLOCK] clock_out activity log emit failed (non-fatal):", e?.message || e);
+    }
+
     console.info("[TIMECLOCK_CLOCK_OUT]", {
       callerRole: req.portalRole,
       target: target.actor_id,
@@ -591,12 +662,17 @@ router.post("/api/timeclock/segment", requirePortalUser(), express.json(), async
         actor_id: target.actor_id,
         ...(target.is_self ? {} : { initiated_by_actor_id: req.actorId }),
       };
+      // R3b/F3: crew submissions land as pending_review (matches /clock-in).
+      const submissionStatus =
+        target.is_self && String(target.role || "").toLowerCase() === "employee"
+          ? "pending_review"
+          : "approved";
       const ins = await pg.query(
         `INSERT INTO public.time_entries_v2
-           (tenant_id, owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id)
-         VALUES ($1, $2, $3, NULL, $4, $5, NOW(), NULL, $6, 'portal', $7)
-         RETURNING id, start_at_utc`,
-        [tenantId, ownerId, userId, shift.id, kind, meta, sourceMsgId]
+           (tenant_id, owner_id, user_id, job_id, parent_id, kind, start_at_utc, end_at_utc, meta, created_by, source_msg_id, submission_status)
+         VALUES ($1, $2, $3, NULL, $4, $5, NOW(), NULL, $6, 'portal', $7, $8)
+         RETURNING id, start_at_utc, submission_status`,
+        [tenantId, ownerId, userId, shift.id, kind, meta, sourceMsgId, submissionStatus]
       );
       const row = ins?.rows?.[0];
       if (!row?.id) {
@@ -637,6 +713,24 @@ router.post("/api/timeclock/segment", requirePortalUser(), express.json(), async
       );
     } catch (e) {
       console.warn(`[TIMECLOCK] legacy ${legacyType} dual-write failed:`, e?.message || e);
+    }
+
+    // F3.3: emit canonical activity log. start branch is a row creation;
+    // stop branch is an update on the existing row. Both target time_entries_v2.
+    try {
+      await emitActivityLog(buildActorContext(req), {
+        action_kind: action === "start" ? "create" : "update",
+        target_table: "time_entries_v2",
+        target_id: String(newRowId),
+        payload: {
+          event: `${kind}_${action}`,
+          target_user_id: userId,
+          parent_shift_id: String(shift.id),
+          at: tsIso,
+        },
+      });
+    } catch (e) {
+      console.warn("[TIMECLOCK] segment activity log emit failed (non-fatal):", e?.message || e);
     }
 
     console.info("[TIMECLOCK_SEGMENT]", {
@@ -757,6 +851,27 @@ router.post("/api/timeclock/mileage", requirePortalUser(), express.json(), async
       return jsonErr(res, 500, "INSERT_FAILED", "Could not record trip.");
     }
 
+    // F3.3: emit canonical activity log row for the mileage entry creation.
+    try {
+      await emitActivityLog(buildActorContext(req), {
+        action_kind: "create",
+        target_table: "mileage_logs",
+        target_id: String(row.id),
+        payload: {
+          event: "mileage_logged",
+          target_actor_id: target.actor_id,
+          employee_user_id: employeeUserId,
+          distance,
+          unit,
+          deductible_cents: deductibleCents,
+          job_name: jobName,
+          trip_date: tripDate,
+        },
+      });
+    } catch (e) {
+      console.warn("[TIMECLOCK] mileage activity log emit failed (non-fatal):", e?.message || e);
+    }
+
     console.info("[TIMECLOCK_MILEAGE]", {
       callerRole: req.portalRole,
       target: target.actor_id,
@@ -821,23 +936,50 @@ router.post("/api/timeclock/tasks", requirePortalUser(), express.json(), async (
     // path which queries LOWER(assigned_to) = LOWER(displayName).
     const assignedTo = target.display_name || null;
     const createdBy = String(req.actorId || "").trim() || null;
+    const tenantId = String(req.tenantId || "").trim();
     const sourceMsgId = makeSourceMsgId(
       target.is_self ? "tc:task-self" : `tc:task-for:${target.actor_id.slice(0, 8)}`,
       createdBy || "portal"
     );
 
+    // R3b/F3: crew submissions land as pending_review (matches /clock-in).
+    // Owner/admin/board acting on self or behalf of another → approved.
+    const submissionStatus =
+      target.is_self && String(target.role || "").toLowerCase() === "employee"
+        ? "pending_review"
+        : "approved";
+
     const ins = await pg.query(
       `INSERT INTO public.tasks
-         (owner_id, created_by, assigned_to, title, body, type, due_at, job_no, source_msg_id, status, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, 'general', $6, $7, $8, 'open', NOW(), NOW())
+         (tenant_id, owner_id, created_by, assigned_to, title, body, type, due_at, job_no, source_msg_id, status, submission_status, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'general', $7, $8, $9, 'open', $10, NOW(), NOW())
        ON CONFLICT DO NOTHING
-       RETURNING id, task_no, title, assigned_to, due_at, status`,
-      [ownerId, createdBy, assignedTo, title, body, dueAt, jobNo, sourceMsgId]
+       RETURNING id, task_no, title, assigned_to, due_at, status, submission_status`,
+      [tenantId, ownerId, createdBy, assignedTo, title, body, dueAt, jobNo, sourceMsgId, submissionStatus]
     );
 
     const row = ins?.rows?.[0];
     if (!row?.id) {
       return jsonErr(res, 500, "INSERT_FAILED", "Could not create task.");
+    }
+
+    // F3.3: emit canonical activity log row for the task creation.
+    try {
+      await emitActivityLog(buildActorContext(req), {
+        action_kind: "create",
+        target_table: "tasks",
+        target_id: String(row.id),
+        payload: {
+          event: "task_created",
+          target_actor_id: target.actor_id,
+          assigned_to: assignedTo,
+          title,
+          job_no: jobNo,
+          submission_status: row.submission_status || null,
+        },
+      });
+    } catch (e) {
+      console.warn("[TIMECLOCK] task create activity log emit failed (non-fatal):", e?.message || e);
     }
 
     console.info("[TIMECLOCK_TASK_CREATE]", {
@@ -885,29 +1027,31 @@ router.patch("/api/timeclock/tasks/:id", requirePortalUser(), express.json(), as
     const task = t?.rows?.[0];
     if (!task) return jsonErr(res, 404, "NOT_FOUND", "Task not found.");
 
-    // Permission: owner/admin can touch anything; board can touch
+    // Permission: owner can touch anything; board_member can touch
     // anything except tasks assigned to the owner; employees can
     // only touch tasks assigned to themselves.
-    if (callerRole !== "owner" && callerRole !== "admin") {
+    // Post-rebuild role enum: {owner, board_member, employee} — 'admin' is
+    // no longer a valid role.
+    if (callerRole !== "owner") {
       // Need the caller's display name to compare against assigned_to.
+      // Post-rebuild: name lives on public.users keyed by auth_user_id.
       const cr = await pg.query(
-        `SELECT display_name FROM public.chiefos_tenant_actor_profiles
-          WHERE tenant_id = $1 AND actor_id = $2 LIMIT 1`,
+        `SELECT name FROM public.users
+          WHERE tenant_id = $1 AND auth_user_id = $2 LIMIT 1`,
         [tenantId, callerActorId]
       );
-      const callerName = String(cr?.rows?.[0]?.display_name || "").toLowerCase().trim();
+      const callerName = String(cr?.rows?.[0]?.name || "").toLowerCase().trim();
       const assignedLower = String(task.assigned_to || "").toLowerCase().trim();
 
-      if (callerRole === "board") {
-        // Block if task is assigned to the owner.
-        const ownerActorRow = await pg.query(
-          `SELECT p.display_name FROM public.chiefos_tenant_actors a
-             LEFT JOIN public.chiefos_tenant_actor_profiles p
-               ON p.tenant_id = a.tenant_id AND p.actor_id = a.actor_id
-            WHERE a.tenant_id = $1 AND a.role = 'owner' LIMIT 1`,
+      if (callerRole === "board_member") {
+        // Block if task is assigned to the owner. Post-rebuild: owner's
+        // name lives on public.users where role='owner' for this tenant.
+        const ownerNameRow = await pg.query(
+          `SELECT name FROM public.users
+            WHERE tenant_id = $1 AND role = 'owner' LIMIT 1`,
           [tenantId]
         );
-        const ownerName = String(ownerActorRow?.rows?.[0]?.display_name || "").toLowerCase().trim();
+        const ownerName = String(ownerNameRow?.rows?.[0]?.name || "").toLowerCase().trim();
         if (ownerName && assignedLower === ownerName) {
           return jsonErr(res, 403, "PERMISSION_DENIED", "Board members cannot edit the owner's tasks.");
         }

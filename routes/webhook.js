@@ -41,6 +41,7 @@ const mergePendingTransactionState =
 
 const pg = require('../services/postgres');
 const { query } = pg;
+const { verifyPhoneLinkOtp } = require('../services/phoneLinkOtp');
 const { normalizeTranscriptMoney, stripLeadingFiller } = require('../utils/transcriptNormalize');
 const twilioSvc = require('../services/twilio');
 const sendWhatsApp = twilioSvc.sendWhatsApp;
@@ -304,69 +305,10 @@ function normalizeE164(fromRaw) {
   return digits;
 }
 
-function parseLinkCommand(raw = '') {
-  const s = String(raw || '').trim();
-
-  // LINK 123456  (legacy)
-  let m = s.match(/^link\s+([a-z0-9]{4,12})$/i);
-  if (m) return String(m[1]).trim();
-
-  // Just the code: 123456
-  m = s.match(/^([0-9]{6})$/);
-  if (m) return String(m[1]).trim();
-
-  return null;
-}
-
-
-
-// Uses your existing pg.query connection
-async function redeemLinkCodeToTenant({ code, fromPhone }) {
-  const cleanCode = String(code || '').trim();
-  const phone = String(fromPhone || '').trim();
-
-  if (!cleanCode || !phone) return { ok: false, error: 'Missing code or phone.' };
-
-  // 1) Atomically "claim" the code (mark used) and get tenant_id.
-  // This prevents races + ensures one-time use.
-  const claimed = await query(
-    `
-    WITH claimed AS (
-      UPDATE public.chiefos_link_codes
-         SET used_at = now()
-       WHERE code = $1
-         AND used_at IS NULL
-         AND (expires_at IS NULL OR expires_at > now())
-       RETURNING tenant_id
-    )
-    SELECT tenant_id FROM claimed
-    `,
-    [cleanCode]
-  );
-
-  const tenantId = claimed?.rows?.[0]?.tenant_id;
-  if (!tenantId) {
-    return {
-      ok: false,
-      error: 'That code was already used or expired. Generate a new one in the portal.'
-    };
-  }
-
-  // 2) Upsert identity mapping (WhatsApp phone -> tenant)
-  await query(
-    `
-    INSERT INTO public.chiefos_identity_map (tenant_id, kind, identifier, created_at)
-    VALUES ($1, 'whatsapp', $2, now())
-    ON CONFLICT (kind, identifier)
-    DO UPDATE SET
-      tenant_id = EXCLUDED.tenant_id,
-      updated_at = now()
-    `,
-    [tenantId, phone]
-  );
-
-  return { ok: true, tenantId };
-}
+// parseLinkCommand + redeemLinkCodeToTenant removed in R2.5.
+// Replaced by portal_phone_link_otp flow (services/phoneLinkOtp.js).
+// Inbound OTP detection happens inline below in the message-processing
+// pipeline, after Twilio signature verification and tenant resolution.
 
 
 function pickFirstMedia(body = {}) {
@@ -1831,30 +1773,33 @@ try {
             // If plan lookup fails -> treat as Free.
             // ------------------------------------------------------------------
             const gate = await pg.withClient(async (client) => {
-              // role of this actor inside tenant
+              // Role of this actor inside tenant. Post-rebuild ingestion-side
+              // role lives on public.users (chiefos_tenant_actors DISCARDed
+              // per Decision 12). user_id is the digits PK; this is the
+              // WhatsApp surface, so req.actorId for ingestion is digits.
+              // public.users.role enum: {owner, employee, contractor}.
+              // Board members are portal-only (no users row), so they
+              // never appear here.
               const rr = await client.query(
-                `
-                select role
-                  from public.chiefos_tenant_actors
-                 where tenant_id = $1
-                   and actor_id = $2
-                 limit 1
-                `,
+                `select role from public.users
+                  where tenant_id = $1 and user_id = $2 limit 1`,
                 [req.tenantId, req.actorId]
               );
               const actorRole = String(rr?.rows?.[0]?.role || "").trim();
 
-              // Owners/admins allowed regardless of plan (core capture)
-              const isOwnerOrAdmin = actorRole === "owner" || actorRole === "admin";
-              const isEmployeeOrBoard = actorRole === "employee" || actorRole === "board";
+              // Owner allowed regardless of plan (core capture).
+              const isOwner = actorRole === "owner";
+              // Employees + contractors are crew → Pro-gated on WhatsApp self-log.
+              const isCrew = actorRole === "employee" || actorRole === "contractor";
 
-              // If role is missing/unknown, fail closed for crew capture (do not create crew log)
+              // If role is missing/unknown, fail closed for crew capture
+              // (do not create crew log).
               if (!actorRole) {
                 return { ok: false, reason: "ROLE_UNKNOWN", actorRole: null, planKey: "free" };
               }
 
-              // Only employee/board are Pro-gated on WhatsApp self-log
-              if (!isEmployeeOrBoard) {
+              // Only crew are Pro-gated on WhatsApp self-log.
+              if (!isCrew) {
                 return { ok: true, reason: "ROLE_ALLOWED", actorRole, planKey: "n/a" };
               }
 
@@ -2507,98 +2452,56 @@ if (/^chiefonboarding\b/i.test(lc2Clean)) {
 
 
     // -----------------------------------------------------------------------
-    // ✅ LINK CODE REDEEM (must run EARLY, and MUST work even when unlinked)
-    // Accepts: "LINK 123456" OR "123456"
+    // PHONE-LINK OTP CONSUMPTION (R2.5)
+    // Runs EARLY — must work even when the sender is unlinked.
+    // Detects a pure 6-digit numeric message and tries to verify it against
+    // portal_phone_link_otp. On success, writes public.users.auth_user_id.
+    // Non-matching 6-digit messages fall through to normal routing.
     // -----------------------------------------------------------------------
     {
-      const linkCode = parseLinkCommand(text2);
-      if (linkCode) {
-        try {
-          const phone = String(req.from || '').trim(); // +E164
-          if (!phone) return ok(res, 'Missing sender phone. Try again.');
-
-          const out = await redeemLinkCodeToTenant({ code: linkCode, fromPhone: phone });
-
-          if (!out?.ok) {
-            return ok(
-              res,
-              `❌ Link failed: ${out?.error || 'Unknown error'}\n\nGo back to the portal, generate a fresh code, then text the 6 digits.`
-            );
-          }
-
-          // After redeem, your middleware may not have req.ownerId yet on THIS request.
-          // Clear pending using the actor key only (safe).
+      const trimmed = String(text2 || '').trim();
+      if (/^\d{6}$/.test(trimmed)) {
+        const phoneDigits = String(req.from || '').replace(/\D/g, '');
+        if (phoneDigits && phoneDigits.length >= 7) {
           try {
-            await clearAllPendingForUser({ ownerId: null, from: (req.actorKey || req.from) });
-          } catch {}
+            const result = await verifyPhoneLinkOtp(phoneDigits, trimmed);
 
-          return ok(
-            res,
-            `✅ You're connected to ChiefOS!\n\nHere's what you can tell me:\n\n💰 MONEY\n• expense $45 gas\n• revenue $2,000 deposit\n• overhead $850 rent\n\n⏱ TIME\n• clock in [job name]\n• clock out\n• time 3.5h framing [job name]\n\n🏗 JOBS\n• new job Kitchen Reno for Smith\n• jobs list\n• job status Kitchen Reno\n\n📋 QUOTES, INVOICES & CHANGE ORDERS\n• quote Smith $4,500 deck build\n• invoice Smith $2,000\n• change order Kitchen Reno +$600 extra tile\n\n✅ TASKS & REMINDERS\n• task call supplier re: lumber\n• remind me Friday to submit payroll\n\n📎 RECEIPTS\n• send a photo + description\n\n📊 REPORTS\n• profit this month\n• expenses last week\n• job kpis Kitchen Reno\n\nSave this message — come back any time to see what's possible.`
-          );
-        } catch (e) {
-          console.warn('[LINK] redeem failed:', e?.message);
-          return ok(res, '⚠️ Link failed. Please request a new code in the portal and try again.');
+            if (result?.paired) {
+              try {
+                await clearAllPendingForUser({ ownerId: null, from: (req.actorKey || req.from) });
+              } catch {}
+              return ok(
+                res,
+                `✅ You're connected to ChiefOS!\n\nHere's what you can tell me:\n\n💰 MONEY\n• expense $45 gas\n• revenue $2,000 deposit\n• overhead $850 rent\n\n⏱ TIME\n• clock in [job name]\n• clock out\n• time 3.5h framing [job name]\n\n🏗 JOBS\n• new job Kitchen Reno for Smith\n• jobs list\n• job status Kitchen Reno\n\n📋 QUOTES, INVOICES & CHANGE ORDERS\n• quote Smith $4,500 deck build\n• invoice Smith $2,000\n• change order Kitchen Reno +$600 extra tile\n\n✅ TASKS & REMINDERS\n• task call supplier re: lumber\n• remind me Friday to submit payroll\n\n📎 RECEIPTS\n• send a photo + description\n\n📊 REPORTS\n• profit this month\n• expenses last week\n• job kpis Kitchen Reno\n\nSave this message — come back any time to see what's possible.`
+              );
+            }
+
+            if (result?.error === 'IDENTITY_CONFLICT') {
+              return ok(
+                res,
+                `This phone is already linked to a different ChiefOS account. If this is a mistake, contact support.`
+              );
+            }
+
+            // result.paired === false with no error → not an OTP, or expired.
+            // Fall through to normal routing so the 6-digit message can be
+            // interpreted as a regular command if applicable.
+          } catch (e) {
+            console.warn('[PHONE_LINK_OTP] verify failed:', e?.message);
+            // Fall through; do not crash the pipeline on OTP verification errors.
+          }
         }
       }
     }
 
 // -----------------------------------------------------------------------
-// ✅ MULTI-TENANT SELECTION GATE (FAIL CLOSED)
-// - If user has access to multiple tenants and has no active tenant selected,
-//   we show a numbered menu and STOP.
-// - User sets active tenant with: "use 1" (or "use 2", etc.)
+// MULTI-TENANT SELECTION GATE — removed in R2.
+// Rebuild schema enforces one-phone-one-tenant via public.users.user_id PK
+// (see migrations/2026_04_21_rebuild_identity_tenancy.sql §2).
+// userProfile middleware now always sets req.multiTenant = false, so this
+// branch is unreachable; deleted to drop the chiefos_phone_active_tenant
+// reference and keep intent clear for future readers.
 // -----------------------------------------------------------------------
-if (!req.tenantId && req.multiTenant && Array.isArray(req.multiTenantChoices) && req.multiTenantChoices.length) {
-  const raw = String(text2 || "").trim();
-  const lc = raw.toLowerCase();
-
-  // "use" command: use <n>
-  const m = lc.match(/^use\s+(\d+)\s*$/i);
-  if (m) {
-    const idx = parseInt(m[1], 10);
-    const choice = req.multiTenantChoices[idx - 1];
-
-    if (!choice?.tenant_id) {
-      return ok(res, `❌ Invalid choice. Reply "use 1" (or another number) from the list.`);
-    }
-
-    const phone = String(req.actorKey || req.from || "").replace(/\D/g, "");
-    try {
-      await query(
-  `
-  insert into public.chiefos_phone_active_tenant (phone_digits, tenant_id, updated_at)
-  values ($1, $2, now())
-  on conflict (phone_digits) do update
-    set tenant_id = excluded.tenant_id,
-        updated_at = now()
-  `,
-  [phone, choice.tenant_id]
-);
-    } catch (e) {
-      console.warn("[MULTI_TENANT] failed to set active tenant:", e?.message);
-      return ok(res, `⚠️ Could not set active business. Please try again.`);
-    }
-
-    const label = choice.tenant_name ? ` (${choice.tenant_name})` : "";
-    return ok(res, `✅ Active business set${label}. Now send your log again.`);
-  }
-
-  // Show menu (tenant names if available)
-  const lines = [
-    "You have access to more than one business.",
-    "Reply with: use 1 (or use 2, etc.)",
-    "",
-    ...req.multiTenantChoices.map((c, i) => {
-      const name = c.tenant_name ? ` — ${c.tenant_name}` : "";
-      return ` ${i + 1}) ${c.tenant_id}${name}`;
-    }),
-    "",
-    "Tip: once set, we’ll keep using that business until you switch.",
-  ];
-
-  return ok(res, lines.join("\n"));
-}
 
 
     // ✅ Now that redeem had a chance, enforce tenant link
@@ -3009,16 +2912,16 @@ try {
       String(req.actorKey || "").trim() ||
       String(req.from || "").replace(/\D/g, "").trim();
 
-    // Load actor memory (best-effort)
-    let actorMemory = {};
-    try {
-      if (typeof pg.getActorMemory === "function") {
-        actorMemory = (await pg.getActorMemory(String(req.ownerId), actorKeyDigits)) || {};
-      }
-    } catch (e) {
-      console.warn("[MEMORY] getActorMemory failed (ignored):", e?.message);
-      actorMemory = {};
-    }
+    // R4c-migrate: read active session's active_entities for pending_choice
+    // routing. Fail-soft to {} so memory-load misses never break webhook routing.
+    const { getSessionStateSafe } = require("../services/conversationState");
+    const actorMemory = await getSessionStateSafe({
+      tenantId: req.tenantId || null,
+      ownerId: String(req.ownerId),
+      userId: actorKeyDigits,
+      source: "whatsapp",
+      correlationId: req.correlationId || null,
+    });
 
     const pendingChoice = String(actorMemory?.pending_choice || "").trim().toLowerCase();
 
@@ -4220,6 +4123,8 @@ if (flags.timeclock_v2 && looksHardTimeCommand(text2)) {
 
     const baseCtx = {
   owner_id: ownerDigits,
+  tenant_id: req.tenantId || null,
+  correlation_id: req.correlationId || null,
   job_id: req.userProfile?.active_job_id || null,
   created_by: actorId,
   source_msg_id: messageSid || null,

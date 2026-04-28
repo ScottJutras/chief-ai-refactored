@@ -1,8 +1,14 @@
 // routes/portal.js
+//
+// Related middleware (R2.5):
+//   - middleware/requirePhonePaired.js — exported gate that returns 403
+//     PHONE_LINK_REQUIRED when req.isPhonePaired is false. Not mounted
+//     globally here; individual routes opt in per product decision.
 const express = require("express");
 const router = express.Router();
 const pg = require("../services/postgres");
 const { requirePortalUser } = require("../middleware/requirePortalUser");
+const { isPhonePaired, generatePhoneLinkOtp } = require("../services/phoneLinkOtp");
 
 function jsonErr(res, status, code, message) {
   return res.status(status).json({ ok: false, code, message: message || code });
@@ -139,23 +145,15 @@ router.get("/whoami", requirePortalUser({ allowUnlinked: true }), async (req, re
       email = null;
     }
 
+    // R2.5: durable check against public.users.auth_user_id (P1A-4 column).
+    // Works for owners AND non-owner portal users (employees, board members).
+    // Prefer req.isPhonePaired populated by requirePortalUser; fall back to
+    // a direct lookup if the middleware's cache path didn't set it.
     try {
-      if (req.tenantId && req.portalUserId) {
-        const idnRes = await pg.query(
-          `
-          select 1
-          from public.chiefos_user_identities
-          where tenant_id = $1::uuid
-            and user_id = $2::uuid
-            and kind = 'whatsapp'
-          limit 1
-          `,
-          [req.tenantId, req.portalUserId]
-        );
-
-        hasWhatsApp = !!idnRes?.rows?.[0];
-      } else {
-        hasWhatsApp = false;
+      if (typeof req.isPhonePaired === 'boolean') {
+        hasWhatsApp = req.isPhonePaired;
+      } else if (req.portalUserId) {
+        hasWhatsApp = await isPhonePaired(req.portalUserId);
       }
     } catch (e) {
       console.warn("[WHOAMI_WHATSAPP_CHECK] failed:", e?.message);
@@ -224,17 +222,58 @@ router.get("/health/entitlement", requirePortalUser, async (req, res) => {
 });
 
 /* =========================
-   LINK PHONE START
+   LINK PHONE START (R2.5)
+   POST body: { phoneDigits: string, ownerPhone?: string }  ← ownerPhone kept for
+     backward compat with legacy LinkPhoneClient.tsx; prefer phoneDigits.
+   Returns: { ok: true, code: string, expiresAt: string }
+   Plaintext code is returned for portal display ONLY; user sends it from
+   phoneDigits to the ChiefOS WhatsApp number. Verification happens in
+   routes/webhook.js via services/phoneLinkOtp.verifyPhoneLinkOtp.
 ========================= */
-router.post("/link-phone/start", requirePortalUser, async (req, res) => {
-  return res.json({ ok: true });
+router.post("/link-phone/start", requirePortalUser(), async (req, res) => {
+  // Diagnostic logging added 2026-04-28 to root-cause /api/link-phone/start
+  // 504 hang. Remove once the underlying issue is resolved.
+  const t0 = Date.now();
+  console.log("[LINK_PHONE_START] step=enter portalUserId=" + req.portalUserId + " tenantId=" + (req.tenantId || "null") + " isPhonePaired=" + req.isPhonePaired);
+  try {
+    const raw = String(req.body?.phoneDigits ?? req.body?.ownerPhone ?? "");
+    const phoneDigits = raw.replace(/\D/g, "");
+    console.log(`[LINK_PHONE_START] step=validated phoneDigits.length=${phoneDigits.length} elapsed=${Date.now() - t0}ms`);
+    if (!phoneDigits || phoneDigits.length < 7) {
+      return res.status(400).json({
+        ok: false,
+        error: { code: "INVALID_PHONE", message: "phoneDigits must be digit-only, length >= 7", traceId: req.traceId || null },
+      });
+    }
+    if (!req.portalUserId) {
+      return res.status(401).json({ ok: false, error: { code: "MISSING_AUTH", message: "missing_auth" } });
+    }
+
+    console.log(`[LINK_PHONE_START] step=calling_generate elapsed=${Date.now() - t0}ms`);
+    const { code, expiresAt } = await generatePhoneLinkOtp(req.portalUserId, phoneDigits);
+    console.log(`[LINK_PHONE_START] step=generated elapsed=${Date.now() - t0}ms`);
+    return res.json({ ok: true, code, expiresAt: expiresAt.toISOString() });
+  } catch (e) {
+    console.warn(`[LINK_PHONE_START] step=catch elapsed=${Date.now() - t0}ms err=${e?.message} stack=${e?.stack?.split("\n").slice(0, 3).join(" | ")}`);
+    return jsonErr(res, 500, "LINK_PHONE_START_FAILED", "link_phone_start_failed");
+  }
 });
 
 /* =========================
-   LINK PHONE VERIFY
+   LINK PHONE VERIFY (R2.5)
+   The actual verification happens inside routes/webhook.js when the user
+   texts the code from WhatsApp. This endpoint is retained as a "check current
+   pairing state" helper for portal UIs polling for completion.
+   Returns: { ok: true, paired: boolean }
 ========================= */
-router.post("/link-phone/verify", requirePortalUser, async (req, res) => {
-  return res.json({ ok: true });
+router.post("/link-phone/verify", requirePortalUser(), async (req, res) => {
+  try {
+    const paired = await isPhonePaired(req.portalUserId);
+    return res.json({ ok: true, paired });
+  } catch (e) {
+    console.warn("[LINK_PHONE_VERIFY] failed:", e?.message);
+    return jsonErr(res, 500, "LINK_PHONE_VERIFY_FAILED", "link_phone_verify_failed");
+  }
 });
 
 /* =========================

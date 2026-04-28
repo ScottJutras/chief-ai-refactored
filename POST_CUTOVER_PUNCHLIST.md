@@ -187,6 +187,122 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ## P1B — Post-cutover audit trackers (from 2026-04-28 audit cycle)
 
+### P1B-beta-delta-appendix-quote-spine-cleanup
+
+**Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). Comment in `cil.js` dates the work to 2026-04-18: *"CreateQuote schema was removed 2026-04-18 as part of the Quotes spine rebuild (Beta Delta Appendix)."*
+
+**Scope:** removes pre-rebuild legacy Quote-spine code that's been latent post-cutover (writes to dropped `public.quotes` table; uses removed helpers).
+
+**Files (all in chief-ai-refactored, working tree):**
+- `cil.js` (+4/-7) — removes legacy `createQuoteSchema` block; replaces with cross-reference comment to `src/cil/quotes.js` (the new spine).
+- `domain/quote.js` (+13/-44) — guts legacy `createQuote(cil, ctx)` (drops uuidv4, ensureNotDuplicate, insertOneReturning).
+- `domain/agreement.js` (+9/-11) — replaces `public.quotes` existence check with fail-loud error (table dropped in rebuild).
+- `handlers/commands/quote.js` (+1/-22) — removes legacy `pg.createQuoteRecord` + catalog-line-items writes.
+
+**Resolution:** caller-grep + commit. Pattern matches the R3b/R4 cleanup PRs. Caller-grep target: `pg.createQuoteRecord`, `domain/quote.createQuote`, any reference to `public.quotes` table writes. If zero callers, ship as small commit/PR.
+
+**Sized:** 1-2 hours (caller verify + 4-file commit + small focused PR).
+
+**Cross-reference:** comment in cil.js cites `docs/QUOTES_SPINE_DECISIONS.md` §1–§2 as authoritative for the rebuild rationale.
+
+---
+
+### P1B-r4c-migrate-actor-memory-conversation-sessions
+
+**Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). Comments in working-tree diffs explicitly say *"R4c-migrate: read active session's active_entities..."* and *"R4c-migrate: build actor context once for conversation_sessions writes."*
+
+**This is the 9th instance** of the uncommitted-but-claimed-shipped pattern caught today. The session-reports audit identified `R4c-investigate` as investigation-only (0 files modified), but R4c-migrate is a follow-up workstream that authored these files and never committed. Quarantined-zone status in `CLAUDE.md` ("Actor-memory cluster pending R4c") is consistent with R4c-migrate being the resolution.
+
+**Files (all in chief-ai-refactored, working tree):**
+- `services/agent/index.js` (~360 lines changed) — adds `conversationState` requires (`getSessionStateSafe`, `patchSessionStateSafe`, `appendMessageSafe`, `getRecentMessagesSafe`); replaces `actorMemory` lookup against DISCARDed `chief_actor_memory`.
+- `services/answerChief.js` (+18/-18) — replaces `pg.getActorMemory` with `getSessionStateSafe` (R4c-migrate explicit comment).
+- `services/orchestrator.js` (+25) — adds `patchSessionStateSafe` require; builds `actorCtx` for conversation_sessions writes.
+- `routes/askChief.js` (+2) — adds `tenantId` + `traceId` to `runAgent({...})` call (caller-side update).
+- `handlers/commands/index.js` (+2) — adds `tenantId` + `traceId` to `ask({...})` call (caller-side update).
+
+**Production-impact:** Same R2.5-class pattern. Live actor-memory reads/writes hit the DISCARDed `chief_actor_memory` table → silent failure paths (try/catch returns `{}` on error). Latent-broken since cutover.
+
+**Resolution:** schema-drift verify (confirm `services/conversationState` module exists at expected path; confirm `conversation_sessions` table shape matches; confirm `active_entities jsonb` column accepts the session-state shape) + commit + small focused PR. Mirror of R3b/R4 cleanup pattern.
+
+**Sized:** 2-4 hours (verify + commit + retest authenticated client load).
+
+---
+
+### P1B-email-ingest-defensive-fixes
+
+**Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). Defensive collateral, not session-tagged — likely from someone debugging email ingestion locally and never committing.
+
+**Files (chief-ai-refactored, working tree):**
+- `api/inbound/email.js` (+9) — early dedup query against `email_ingest_events` to prevent duplicate WhatsApp notifications on Postmark retries.
+- `services/emailIngest.js` (+7/-1) — wraps `pdf-parse` require in try/catch so absent module doesn't crash module load (env-portability fix).
+
+**Verdict:** Both are pure defense-in-depth additions, low-risk. Could commit immediately or defer.
+
+**Sized:** 30 min (review diff substance + commit + small focused PR).
+
+---
+
+### P1B-claude-md-discipline-doc-rewrite
+
+**Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). **This is the 10th instance** of the uncommitted-but-claimed-shipped pattern caught today.
+
+**Substance of the rewrite (all in `CLAUDE.md`, working tree):**
+
+NEW sections added:
+- **Identity-column cross-reference** — points at `FOUNDATION_CURRENT.md` for specific column documentation (e.g., `users.auth_user_id` reverse pointer).
+- **Session reports section** — rules: *write directly to `docs/_archive/sessions/SESSION_<NAME>.md`*, 30-50 line max, 1-line bullets, architectural decisions go in decisions-log, schema rationale goes in migration file comment.
+- **Manifest discipline** — *replacement, not narrative append*; resolved forward-flags removed, not crossed out; session history lives in `docs/_archive/sessions/`.
+- **Handoff discipline** — phase-arc handoffs are rewritten state-reflection per session; latest replaces prior; prior moves to `docs/_archive/handoffs/`.
+- **Documentation lifecycle** — explicit aging-out posture per artifact type (migrations + decisions-log + ceremony archives persist; manifest + handoffs + FOUNDATION_CURRENT.md rewrite-replacement; mid-session checkpoints deleted at arc close; session reports written directly, never auto-loaded).
+
+Intentional consolidations:
+- "Active Execution Plan" section removed (replaced by Context Budget cross-reference).
+- "Identity Addendum (P1A-4)" details removed; replaced by cross-reference to `FOUNDATION_CURRENT.md` at top of file.
+- Canonical Helpers list compressed; specific file paths moved to a planned `REBUILD_CANONICAL_HELPERS.md` (separate file, not yet authored).
+
+Reference Docs list updates:
+- Adds `QUOTES_SPINE_CEREMONIES.md` to the speculatively-skip list.
+- Refines load conditions for several entries.
+
+Introspection Discipline language updated to reference R-session findings ("F2/F3, B1/B2, amendment-column-shape drift") rather than the prior single example.
+
+**Note:** the SQL `<TABLE>` placeholder fix was extracted as a tiny surgical commit on the cleanup-PR branch (commit `f5caed11`). The rewrite content here stays in working tree with the surgical fix preserved (no re-revert).
+
+**Resolution:** review the rewrite content, ensure `REBUILD_CANONICAL_HELPERS.md` is authored before merge (it's referenced but not yet created), commit + small focused PR.
+
+**Sized:** 1-2 hours (review + author REBUILD_CANONICAL_HELPERS.md + commit + small PR).
+
+---
+
+### P1B-comprehensive-working-tree-audit
+
+**Source:** Meta-finding, 2026-04-28. Today's session-reports audit caught 6 of 10 uncommitted-but-claimed-shipped instances. The other 4 surfaced via adjacent-work discovery:
+- R2.5 chiefos-site (caught via Path α step-6 production bug investigation)
+- chief-ai-refactored identity rewrites (caught via link-phone/start 504 diagnosis)
+- schema-drift-check script (caught during R1 prep when package.json scope-split surfaced new entries)
+- R4c-migrate, email-ingest, CLAUDE.md (caught during working-tree characterization for the cleanup PR push)
+
+**Pattern indicates session-reports audit alone is insufficient.** Working-tree characterization catches everything the session-reports audit misses, but is more labor-intensive.
+
+**Recommended methodology:**
+
+1. **Run `git diff HEAD` across all repos** (chief-ai-refactored, chiefos-site, any others). Each modified file gets a diff-substance summary.
+2. **Run `git status -s` across all repos.** Untracked files get classified: belongs to known workstream, P2 deferred docs, or unknown.
+3. **Characterize every modified/untracked file by origin** — author intent, session source, defer/commit/discard.
+4. **Cross-reference against documented-as-shipped work** — manifests, session reports, FOUNDATION_CURRENT.md, decisions logs.
+5. **Surface findings as candidates** — commit/discard/tracker per file.
+
+**Sized:** half-day focused work.
+
+**When to run:**
+- Pre-Beta launch (catches latent broken code before user traffic exposes it).
+- Pre-merge for any major release (PR review surface verification).
+- Quarterly thereafter as a standing hygiene discipline.
+
+**Cross-reference:** today's audit-PR cycle established the pattern; this tracker formalizes it as a repeatable process.
+
+---
+
 ### P1B-schema-drift-check-script-commit
 
 **Source:** Surfaced 2026-04-28 during R1 commit prep (post-cutover-stale-work-cleanup PR). The `drift_detection_script` work is documented as **shipped** in `REBUILD_MIGRATION_MANIFEST.md` apply-order entry (between `2026_04_25_chiefos_quote_versions_source_msg_id` and `2026_04_21_drop_unsafe_signup_test_user_function`), but the actual files are uncommitted:

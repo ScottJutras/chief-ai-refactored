@@ -119,8 +119,9 @@ async function getJobPatternTrends({ ownerId, keyword, limit = 5, status }) {
   }
 
   // ── 4. Batch: quoted labour from quote_line_items (needs tenant_id) ───
+  // Post-rebuild: tenant_id by owner_id lives on chiefos_tenants (UNIQUE).
   const tenantRow = await pool.query(
-    `SELECT tenant_id FROM public.chiefos_tenant_actor_profiles WHERE owner_id = $1 LIMIT 1`,
+    `SELECT id AS tenant_id FROM public.chiefos_tenants WHERE owner_id = $1 LIMIT 1`,
     [String(ownerId)]
   ).catch(() => null);
   const tenantId = tenantRow?.rows?.[0]?.tenant_id || null;

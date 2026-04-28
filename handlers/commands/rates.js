@@ -90,13 +90,16 @@ async function resolveOwnerName(ownerId, ownerProfile) {
   if (ownerProfile?.name) return String(ownerProfile.name).trim();
   if (ownerProfile?.display_name) return String(ownerProfile.display_name).trim();
   try {
+    // Post-rebuild: owner display name lives on public.users.name where
+    // role='owner'. chiefos_tenant_actor_profiles DISCARDed (Decision 12);
+    // its is_owner flag is replaced by users.role='owner'.
     const r = await pool.query(
-      `SELECT display_name, name FROM public.chiefos_tenant_actor_profiles
-        WHERE owner_id::text = $1 AND is_owner = true LIMIT 1`,
+      `SELECT name FROM public.users
+        WHERE owner_id = $1 AND role = 'owner' LIMIT 1`,
       [String(ownerId)]
     );
     const row = r?.rows?.[0];
-    return String(row?.display_name || row?.name || 'Owner').trim();
+    return String(row?.name || 'Owner').trim();
   } catch {
     return 'Owner';
   }

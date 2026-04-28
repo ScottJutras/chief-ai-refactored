@@ -185,7 +185,72 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ---
 
-## P2 — Other deferred items
+## P1B — Post-cutover audit trackers (from 2026-04-28 audit cycle)
+
+### P1B-schema-drift-check-script-commit
+
+**Source:** Surfaced 2026-04-28 during R1 commit prep (post-cutover-stale-work-cleanup PR). The `drift_detection_script` work is documented as **shipped** in `REBUILD_MIGRATION_MANIFEST.md` apply-order entry (between `2026_04_25_chiefos_quote_versions_source_msg_id` and `2026_04_21_drop_unsafe_signup_test_user_function`), but the actual files are uncommitted:
+
+- `scripts/schema_drift_check.js` — **untracked** (working tree only).
+- `package.json` 3 script entries (`schema:drift-check`, `schema:drift-check:verbose`, `schema:drift-check:baseline`) — **uncommitted** (working-tree modification).
+
+This is the **8th occurrence** of the uncommitted-but-claimed-shipped pattern (after R2.5, identity rewrites, R4, R3b, R4b, Phase A 5 partial, R1 partial). Surfaced during R1 prep rather than the session-reports audit because the manifest documents this work in apply-order discipline (not in a session report).
+
+**Current state:** R1 commit deliberately left the schema-drift-check additions OUT of scope (they're additions, not deletions; mixing them into R1's dead-code-removal commit would muddle the discipline). Untracked + uncommitted state preserved for separate ship.
+
+**Resolution:** separate commit on a separate branch, separate PR. Not bundled with `post-cutover-stale-work-cleanup` PR.
+
+- Branch suggestion: `schema-drift-check-script-commit`
+- Files: `scripts/schema_drift_check.js` (commit) + `package.json` (3 script-entry additions)
+- Sized: small (single commit, no schema impact, no DB changes).
+
+**Priority:** should ship before Beta launch — the script is the canonical pre-merge schema-drift gate documented in the manifest. Not strictly blocking the cleanup PR or trial migration.
+
+---
+
+### P1B-phase-a-5-reissuequote-deferred
+
+**Source:** Phase A Session 5 ReissueQuote handler (`src/cil/quotes.js` +716, `src/cil/quotes.test.js` +599 with 16 unit + 9 integration tests, `src/cil/router.js` registration uncomment, ceremony scripts) — work authored but NOT committed in the post-cutover-stale-work-cleanup PR (2026-04-28) because integration tests fail.
+
+**Migration is already shipped:** `2026_04_25_chiefos_quote_versions_source_msg_id.sql` is in production via commit `971ca0ea` (per audit). Schema side is clean. Only application-layer wire-up remains.
+
+**Test failure root cause:** `seedThrowawayUser` in `src/cil/quotes.test.helpers.js:32` 42501s on `users_pkey` UNIQUE collision. Helper generates per-call random `99XXXXXXXXXXX` ids, so the collision is most likely either (a) a deterministic `ownerId` passed by a caller in `setupQuotePreconditions` (line 108), or (b) stale DB rows from prior unconfigured-cleanup runs. **Not a schema-drift issue, not a regression in Phase A 5 handler code** — all 16 ReissueQuote unit tests pass; only the 9 integration tests cascade-fail starting from the first fixture-bootstrap failure.
+
+**Three options for resolution:**
+
+1. **(a) Fix the test helper** — change `setupQuotePreconditions` to always pass a fresh `ownerId`, OR add `DELETE FROM users WHERE user_id = $1` before each test's INSERT, OR wrap the INSERT in `ON CONFLICT (user_id) DO NOTHING`. Sized: 30-60 min.
+2. **(b) Reset local test DB state** — verify the test runs against a clean fixture state. Sized: depends on test harness setup.
+3. **(c) Skip integration tests temporarily** — `xdescribe` the ReissueQuote integration block, ship the handler + unit tests, file integration tests as separate follow-up. Sized: 5 min change but loses the BLOCKING regression locks the integration tests are designed to enforce.
+
+**Currently no live caller of ReissueQuote.** The CIL ingestion path doesn't emit `ReissueQuote` actions until a portal/WhatsApp UI surface generates them. Migration shipped + handler uncommitted = the action would route to nowhere if emitted today, but nothing is emitting.
+
+**Urgency:** not urgent — no live emission. But Phase A is documented as closed in production, and ReissueQuote is named in the closure surface; failing to wire the handler eventually surfaces as "ReissueQuote returns CIL_ACTION_UNKNOWN" the first time a quote-edit flow tries it.
+
+**Decision needed before:** any UI work that would emit `ReissueQuote` CIL actions.
+
+---
+
+### P1B-user-memory-kv-rebuild-target-decision
+
+**Source:** `services/memory.js` header comment (committed in R4 cleanup, SHA `f58f6a33`).
+
+The pre-rebuild target tables for per-user persistent KV (`assistant_events`, `user_memory`, `convo_state`, `entity_summary`) were DISCARDed by the rebuild. `services/memory.js` is now a no-op shim — module exports preserved so `require('../services/memory')` doesn't throw, but every function returns benign defaults.
+
+**Three options for resolution:**
+
+1. **(a) Phase 1 amendment table** — author `chiefos_user_memory` or similar, with RLS policies + service_role grants + integration with conversation flow. Sized: 3-5 days.
+2. **(b) Repurpose `conversation_sessions.active_entities`** for KV-like semantics. The column already exists; cardinality may not match (session-scoped, not long-lived). Sized: 1-2 days.
+3. **(c) Drop the user-memory feature entirely** — accept that Chief doesn't carry context across sessions; document as design choice. Sized: zero work.
+
+**Currently no live caller.** Only `nlp/conversation.js` imports the shim, and its exported `converseAndRoute` has zero call sites in live code (per R4's V4 grep).
+
+**Urgency:** not urgent today; deferred indefinitely is also not great. At some point Chief's lack of cross-session memory becomes a UX issue, especially for power users (vendor aliases, default expense bucket recall, etc.).
+
+**Decision needed before:** any feature work that wants to surface "Chief remembers X about you across conversations."
+
+---
+
+
 
 - **Admin role build** — `chiefos_portal_users.role` enum is `{owner, board_member, employee}`. No `admin` value. When admin tier is needed post-Beta, add a P1A-7-style amendment migration extending the role enum + adding any needed `chiefos_role_audit.action` value (`admin_grant`/`admin_revoke`).
 - **GitGuardian secret leaks (3)** — founder is identifying secrets in parallel to cutover. Track resolution separately.

@@ -187,6 +187,57 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ## P1B — Post-cutover audit trackers (from 2026-04-28 audit cycle)
 
+### P1B-source-msg-id-unique-on-task-time-reminder
+
+**Source:** Surfaced 2026-04-28 during /api/log rewrite pre-write schema verification (P1 punchlist item #7).
+
+**Finding:** Only `public.transactions` has a `source_msg_id`-based UNIQUE constraint (`transactions_owner_msg_kind_unique UNIQUE (owner_id, source_msg_id, kind) DEFERRABLE`). `public.tasks`, `public.time_entries_v2`, and `public.reminders` lack equivalent constraints despite all four being targets of idempotent ingestion paths (WhatsApp + portal + email).
+
+**Current workaround:** /api/log handlers for tasks/time/reminders use SELECT-then-INSERT manual dedup (filter by `tenant_id` + `source_msg_id`, skip INSERT if row found). Functional but race-prone under concurrent writes (theoretically — portal-direct entries are user-initiated so concurrency risk is low).
+
+**Resolution:** P1A-N amendment migration adding `UNIQUE (owner_id, source_msg_id)` (or `(tenant_id, source_msg_id)`) to:
+- `tasks`
+- `time_entries_v2`
+- `reminders`
+
+Standardize the idempotency arbiter so all four ingestion targets use the same `INSERT ... ON CONFLICT (owner_id, source_msg_id, ...) DO NOTHING` pattern.
+
+**Sized:** 1-2 hours (single migration + rollback + manifest entry + handler simplification).
+
+**Bundle posture:** belongs in the `P1B-comprehensive-rls-grant-check-unique-audit` consolidation (4th bug class: missing UNIQUE for ON CONFLICT), not a standalone PR. File pre-Beta.
+
+---
+
+### P1B-submission-status-vocabulary-normalization
+
+**Source:** Surfaced 2026-04-28 during /api/log rewrite pre-write schema verification (P1 punchlist item #7).
+
+**Finding:** `submission_status` enum vocabulary diverges across canonical financial/work tables:
+
+| Table | Allowed values |
+|---|---|
+| `transactions` | `confirmed`, `pending_review`, `voided` |
+| `tasks` | `approved`, `pending_review`, `needs_clarification`, `rejected` |
+| `time_entries_v2` | `approved`, `pending_review`, `needs_clarification`, `rejected` |
+
+The `confirmed` (transactions) vs `approved` (tasks/time) divergence is **the same drift class** as the `accepted_via='signup'` channel/lifecycle confusion that surfaced during Path α (resolved by mapping to `'portal'` channel). Two non-equivalent vocabularies for "owner has approved this entry" creates application-layer branching that's easy to mis-handle.
+
+**Current state:** /api/log uses `approvedFor(table, role)` helper that returns the right per-table string. Functional but documents the divergence as a known footgun.
+
+**Resolution options:**
+
+1. **(a) Normalize to `approved`** across all three tables. Migrate transactions: `UPDATE transactions SET submission_status='approved' WHERE submission_status='confirmed'`; ALTER TABLE adjust CHECK constraint. Backfill is a one-time UPDATE; CHECK rewrite is straightforward.
+2. **(b) Normalize to `confirmed`** across all three. Rename approved→confirmed on tasks + time_entries_v2.
+3. **(c) Document the divergence as deliberate** (transactions has special `voided` state for reverse-revenue scenarios that doesn't fit the workflow-status semantic). Keep helper function as the abstraction layer.
+
+**Recommendation:** Option (a) or (c). Vocabulary normalization is correct architecturally but requires careful caller-grep + integrity-chain consideration (transactions has `submission_status` in `hash_input_snapshot` — changing the value rewrites the hash unless we filter it out of the snapshot).
+
+**Sized:** 2-4 hours including caller audit + integrity-chain review + migration + rollback.
+
+**Bundle posture:** belongs in the `P1B-comprehensive-rls-grant-check-unique-audit` consolidation (4th bug class: CHECK constraint values vs application code writes). File pre-Beta.
+
+---
+
 ### P1B-beta-delta-appendix-quote-spine-cleanup
 
 **Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). Comment in `cil.js` dates the work to 2026-04-18: *"CreateQuote schema was removed 2026-04-18 as part of the Quotes spine rebuild (Beta Delta Appendix)."*

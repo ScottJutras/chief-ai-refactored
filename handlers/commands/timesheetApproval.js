@@ -132,10 +132,13 @@ async function calcWeeklyTotals(ownerId, employeeName, range) {
   return { totalHours, costCents, shiftCount: Number(rows[0]?.shift_count || 0) };
 }
 
+// Post-rebuild canonical: public.users keyed by (owner_id, role).
+// chiefos_tenant_actor_profiles DISCARDed per Decision 12.
+// user_id is the digits PK = phone.
 async function getOwnerPhone(ownerId) {
   try {
     const { rows } = await pool.query(
-      `SELECT phone_digits FROM public.chiefos_tenant_actor_profiles
+      `SELECT user_id AS phone_digits FROM public.users
        WHERE owner_id = $1 AND role = 'owner' LIMIT 1`,
       [String(ownerId)]
     );
@@ -146,7 +149,7 @@ async function getOwnerPhone(ownerId) {
 async function getEmployeePhone(ownerId, employeeName) {
   try {
     const { rows } = await pool.query(
-      `SELECT phone_digits FROM public.chiefos_tenant_actor_profiles
+      `SELECT user_id AS phone_digits FROM public.users
        WHERE owner_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1`,
       [String(ownerId), String(employeeName)]
     );
@@ -389,9 +392,9 @@ async function handleTimesheetApproval(from, text, userProfile, ownerId, ownerPr
       return true;
     }
 
-    // Get tenant_id for the row
+    // Post-rebuild: tenant_id by owner_id lives on chiefos_tenants (UNIQUE).
     const tenantResult = await pool.query(
-      `SELECT tenant_id FROM public.chiefos_tenant_actor_profiles WHERE owner_id = $1 LIMIT 1`,
+      `SELECT id AS tenant_id FROM public.chiefos_tenants WHERE owner_id = $1 LIMIT 1`,
       [String(ownerId)]
     ).catch(() => ({ rows: [] }));
     const tenantId = tenantResult.rows[0]?.tenant_id || '00000000-0000-0000-0000-000000000000';

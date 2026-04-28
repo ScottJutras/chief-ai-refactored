@@ -48,10 +48,13 @@ function featuresFor(planKey) {
 async function resolveEmployeeIdentity({ tenantId, actorId }) {
   if (!tenantId || !actorId) return { displayName: null, phoneDigits: null };
   try {
+    // Post-rebuild: chiefos_tenant_actor_profiles DISCARDed (Decision 12).
+    // Identity for portal-paired employees lives on public.users keyed by
+    // (tenant_id, auth_user_id). user_id is the digits PK = phone.
     const r = await pg.query(
-      `select display_name, phone_digits
-         from public.chiefos_tenant_actor_profiles
-        where tenant_id = $1 and actor_id = $2
+      `select u.name as display_name, u.user_id as phone_digits
+         from public.users u
+        where u.tenant_id = $1 and u.auth_user_id = $2
         limit 1`,
       [tenantId, actorId]
     );

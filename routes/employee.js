@@ -4,7 +4,7 @@
 // Contract: only the authenticated employee's own data is touched. Owner,
 // admin, and board accounts are rejected here — they use the /app tree's
 // existing write paths. Writes are scoped by the resolved actor's identity
-// from chiefos_tenant_actor_profiles (email → display_name + phone_digits).
+// from public.users (auth_user_id → name + user_id-as-phone-digits).
 
 const express = require("express");
 const crypto = require("crypto");
@@ -29,10 +29,15 @@ function isEmployeeRole(portalRole) {
 
 async function resolveEmployeeIdentity({ tenantId, actorId }) {
   if (!tenantId || !actorId) return { displayName: null, phoneDigits: null };
+  // Post-rebuild: chiefos_tenant_actor_profiles is DISCARDed (Decision 12).
+  // Employee identity lives on public.users — auth_user_id (uuid back-pointer
+  // from the portal user) → name + user_id (digits PK = phone). Portal-only
+  // employees with no WhatsApp pairing return null phoneDigits; the caller's
+  // resolveUserIdKey() falls back to a portal:actorId stable key.
   const r = await pg.query(
-    `select display_name, phone_digits
-       from public.chiefos_tenant_actor_profiles
-      where tenant_id = $1 and actor_id = $2
+    `select u.name as display_name, u.user_id as phone_digits
+       from public.users u
+      where u.tenant_id = $1 and u.auth_user_id = $2
       limit 1`,
     [tenantId, actorId]
   );

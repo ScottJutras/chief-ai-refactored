@@ -99,13 +99,15 @@ async function runMarginMonitor() {
   const year  = now.getUTCFullYear();
   const month = now.getUTCMonth() + 1;
 
+  // Post-rebuild canonical: jobs.tenant_id is NOT NULL on every row, so we
+  // no longer need a JOIN to resolve tenant — read directly off jobs. The
+  // chiefos_tenant_actor_profiles JOIN was a holdover from when jobs lacked
+  // a tenant_id column. (DISCARDed in rebuild Decision 12.)
   const jobsResult = await pool.query(`
     SELECT
       j.id, j.job_no, j.name, j.owner_id,
-      tap.tenant_id
+      j.tenant_id
     FROM public.jobs j
-    JOIN public.chiefos_tenant_actor_profiles tap
-      ON tap.owner_id::text = j.owner_id::text
     WHERE j.status NOT IN ('archived', 'cancelled', 'completed')
   `).catch(() => null);
 

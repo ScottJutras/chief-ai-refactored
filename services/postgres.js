@@ -179,7 +179,7 @@ function ownerDigitsOrNull(ownerId) {
 
 /**
  * Map owner digits (e.g. "19053279955") -> tenant UUID (e.g. "5c7c3a45-...").
- * Tries both resolver view names because code + DB dumps show both.
+ * Rebuild schema: chiefos_tenants.owner_id is UNIQUE, so a single lookup suffices.
  *
  * Returns: tenant_id UUID string OR null
  */
@@ -187,14 +187,12 @@ async function getTenantIdForOwnerDigits(ownerDigits) {
   const owner = DIGITS(ownerDigits);
   if (!owner) return null;
 
-  // Prefer the view referenced by middleware/userProfile.js
   try {
     const r = await query(
       `
-      select tenant_id
-      from public.v_actor_identity_resolver
-      where kind = 'whatsapp'
-        and identifier = $1
+      select id as tenant_id
+      from public.chiefos_tenants
+      where owner_id = $1
       limit 1
       `,
       [owner]
@@ -204,28 +202,7 @@ async function getTenantIdForOwnerDigits(ownerDigits) {
   } catch (e) {
     const msg = String(e?.message || '');
     if (!/does not exist|permission denied/i.test(msg)) {
-      console.warn('[PG] getTenantIdForOwnerDigits(v_actor_identity_resolver) failed:', msg);
-    }
-  }
-
-  // Fallback: alternate name that shows up in some DB exports
-  try {
-    const r = await query(
-      `
-      select tenant_id
-      from public.v_identity_resolver
-      where kind = 'whatsapp'
-        and identifier = $1
-      limit 1
-      `,
-      [owner]
-    );
-    const tid = r?.rows?.[0]?.tenant_id || null;
-    if (tid) return String(tid);
-  } catch (e) {
-    const msg = String(e?.message || '');
-    if (!/does not exist|permission denied/i.test(msg)) {
-      console.warn('[PG] getTenantIdForOwnerDigits(v_identity_resolver) failed:', msg);
+      console.warn('[PG] getTenantIdForOwnerDigits(chiefos_tenants) failed:', msg);
     }
   }
 
@@ -426,7 +403,8 @@ async function getJobProfitByRange({ ownerId, jobId = null, jobNo = null, fromIs
 
 /**
  * Sum expenses (in cents) for a date range.
- * chiefos_expenses.amount is numeric dollars (e.g. 4000.0000000000000000)
+ * Post-rebuild canonical: public.transactions WHERE kind='expense' (chiefos_expenses
+ * was DISCARDed). amount_cents is bigint cents, no conversion needed.
  */
 async function sumExpensesCentsByRange({ tenantId, ownerId, fromIso, toIso }) {
   let tid = tenantId ? String(tenantId).trim() : null;
@@ -454,14 +432,14 @@ async function sumExpensesCentsByRange({ tenantId, ownerId, fromIso, toIso }) {
 
   const r = await query(
     `
-    select coalesce(sum(
-      (round(coalesce(amount, 0)::numeric * 100))::bigint
-    ), 0)::bigint as total_cents
-    from public.chiefos_expenses
-    where tenant_id = $1
-      and deleted_at is null
-      and expense_date >= $2::date
-      and expense_date <= $3::date
+    select coalesce(sum(amount_cents), 0)::bigint as total_cents
+      from public.transactions
+     where tenant_id = $1
+       and kind = 'expense'
+       and deleted_at is null
+       and submission_status = 'confirmed'
+       and date >= $2::date
+       and date <= $3::date
     `,
     [tid, a, b]
   );
@@ -689,32 +667,11 @@ async function getColumnDataType(table, col) {
 // memberships self-disabling cache
 let _MEMBERSHIPS_OK = null;
 
-/* ------------------------------------------------------------------ */
-/* ✅ user_active_job job_id type detection (FIXES integer = uuid)      */
-/* ------------------------------------------------------------------ */
-let _USER_ACTIVE_JOB_JOB_ID_TYPE = null;
-
-async function detectUserActiveJobJobIdType() {
-  if (_USER_ACTIVE_JOB_JOB_ID_TYPE !== null) return _USER_ACTIVE_JOB_JOB_ID_TYPE;
-
-  try {
-    const r = await query(
-      `
-      select data_type
-      from information_schema.columns
-      where table_schema='public'
-        and table_name='user_active_job'
-        and column_name='job_id'
-      limit 1
-      `
-    );
-    _USER_ACTIVE_JOB_JOB_ID_TYPE = String(r?.rows?.[0]?.data_type || '').toLowerCase() || 'unknown';
-  } catch {
-    _USER_ACTIVE_JOB_JOB_ID_TYPE = 'unknown';
-  }
-
-  return _USER_ACTIVE_JOB_JOB_ID_TYPE;
-}
+// detectUserActiveJobJobIdType — DELETED post-rebuild.
+// user_active_job table is DROPPED; canonical replacement is
+// users.auto_assign_active_job_id (integer FK to jobs.id). Type
+// detection is no longer needed. Active-job get/set are stubbed
+// pending rewrite per P1 punchlist.
 
 /* ------------------------------------------------------------------ */
 /* ✅ Media transcript truncation + transactions schema capabilities    */
@@ -1119,114 +1076,52 @@ async function detectTransactionsUniqueOwnerDedupeHash() {
   return TX_HAS_OWNER_DEDUPE_UNIQUE;
 }
 
-async function getActorMemory(ownerId, actorKey) {
-  const owner_id = String(ownerId || '').replace(/\D/g,'');
-  const actor_key = String(actorKey || '').replace(/\D/g,'');
-  if (!owner_id || !actor_key) return {};
-
-  const r = await query(
-    `
-    select memory
-      from public.chief_actor_memory
-     where owner_id = $1 and actor_key = $2
-     limit 1
-    `,
-    [owner_id, actor_key]
-  );
-
-  return r?.rows?.[0]?.memory || {};
-}
-
-async function patchActorMemory(ownerId, actorKey, patch = {}) {
-  const owner_id = String(ownerId || '').replace(/\D/g,'');
-  const actor_key = String(actorKey || '').replace(/\D/g,'');
-  if (!owner_id || !actor_key) return;
-
-  const patchObj = patch && typeof patch === 'object' ? patch : {};
-  const patchJson = JSON.stringify(patchObj);
-
-  // We deep-merge known nested object "conversation" to avoid accidental overwrite.
-  await query(
-    `
-    insert into public.chief_actor_memory (owner_id, actor_key, memory, updated_at)
-    values ($1, $2, $3::jsonb, now())
-    on conflict (owner_id, actor_key)
-    do update set
-      memory =
-        (
-          public.chief_actor_memory.memory
-          || (excluded.memory - 'conversation')
-          || jsonb_build_object(
-               'conversation',
-               coalesce(public.chief_actor_memory.memory->'conversation', '{}'::jsonb)
-               || coalesce(excluded.memory->'conversation', '{}'::jsonb)
-             )
-        ),
-      updated_at = now()
-    `,
-    [owner_id, actor_key, patchJson]
-  );
-}
-
+// R4c-migrate (2026-04-24): getActorMemory + patchActorMemory removed.
+// Replacement: services/conversationState.js (getSessionStateSafe,
+// patchSessionStateSafe, appendMessageSafe, getRecentMessagesSafe) writing to
+// the rebuild's conversation_sessions + conversation_messages per §3.10.
+// Pre-rebuild table public.chief_actor_memory is DISCARDed at cutover.
 
 // --- Job Picker Pending State (owner-scoped, pickUserId-scoped) ---
+//
+// STUBBED — confirm_flow_pending + confirm_flows are DROPPED post-rebuild.
+// Replacement model is pending_actions (jsonb payload, no soft-mark) +
+// cil_drafts (replaces confirm_flows for staged-payload mutation). Full
+// rewrite is filed as P1 in POST_CUTOVER_PUNCHLIST.md.
+//
+// These 3 functions are reachable only from handlers/system/jobPickRouter.js
+// via the legacy `jobpick::` text token path. Nothing in the active codebase
+// sends that token (the live job picker uses HMAC-signed `jp:` row IDs in
+// handlers/commands/expense.js with inline state, NOT these functions).
+// So these stubs are dead-path under normal traffic; they exist purely for
+// safety if a stale Twilio template ever delivers a `jobpick::` reply.
+//
+// Audit: 2026-04-27 cutover-integration-parity. Rewrite: P1 punchlist
+// "Job-picker pending-state rewrite".
 
 async function getPendingJobPick({ ownerId, pickUserId }) {
-  if (!ownerId) throw new Error('getPendingJobPick missing ownerId');
-  if (!pickUserId) throw new Error('getPendingJobPick missing pickUserId');
-
-  // Assumes you have a table for pending flows.
-  // If your actual table name differs, keep the query shape identical.
-  const q = `
-    SELECT confirm_flow_id, context, resume_key
-    FROM public.confirm_flow_pending
-    WHERE owner_id = $1
-      AND pick_user_id = $2
-      AND kind = 'JOB_PICK'
-      AND used_at IS NULL
-      AND expires_at > NOW()
-    ORDER BY created_at DESC
-    LIMIT 1
-  `;
-  const { rows } = await pool.query(q, [ownerId, pickUserId]);
-  return rows[0] || null;
+  console.warn(
+    '[STUB] getPendingJobPick: confirm_flow_pending DROPPED post-rebuild. ' +
+    'Job-picker pending state needs rewrite per P1 punchlist. Returning null.',
+    { ownerId, pickUserId }
+  );
+  return null;
 }
 
 async function applyJobToPendingDraft({ ownerId, confirmFlowId, jobId }) {
-  if (!ownerId) throw new Error('applyJobToPendingDraft missing ownerId');
-  if (!confirmFlowId) throw new Error('applyJobToPendingDraft missing confirmFlowId');
-  if (!jobId) throw new Error('applyJobToPendingDraft missing jobId');
-
-  // This MUST update a CIL draft / staged payload, not directly mutate final domain rows.
-  // If your drafts are stored in confirm_flow table, update that payload JSON.
-  const q = `
-    UPDATE public.confirm_flows
-    SET draft = jsonb_set(
-      COALESCE(draft, '{}'::jsonb),
-      '{job_id}',
-      to_jsonb($3::text),
-      true
-    ),
-    updated_at = NOW()
-    WHERE owner_id = $1
-      AND id = $2
-  `;
-  await pool.query(q, [ownerId, confirmFlowId, jobId]);
+  console.warn(
+    '[STUB] applyJobToPendingDraft: confirm_flows DROPPED post-rebuild. ' +
+    'Job-picker pending state needs rewrite per P1 punchlist. No-op.',
+    { ownerId, confirmFlowId, jobId }
+  );
 }
 
 async function clearPendingJobPick({ ownerId, confirmFlowId }) {
-  if (!ownerId) throw new Error('clearPendingJobPick missing ownerId');
-  if (!confirmFlowId) throw new Error('clearPendingJobPick missing confirmFlowId');
-
-  const q = `
-    UPDATE public.confirm_flow_pending
-    SET used_at = NOW()
-    WHERE owner_id = $1
-      AND confirm_flow_id = $2
-      AND kind = 'JOB_PICK'
-      AND used_at IS NULL
-  `;
-  await pool.query(q, [ownerId, confirmFlowId]);
+  console.warn(
+    '[STUB] clearPendingJobPick: confirm_flow_pending DROPPED post-rebuild. ' +
+    'Job-picker pending state needs rewrite per P1 punchlist. No-op.',
+    { ownerId, confirmFlowId }
+  );
 }
 
 
@@ -2021,16 +1916,20 @@ async function insertTransaction(opts = {}, { timeoutMs = 4000 } = {}) {
 }
 
 /* -------------------- Time helpers -------------------- */
+// Post-rebuild: legacy public.time_entries table is DROPPED. Canonical is
+// public.time_entries_v2. The functions below are stubbed pending rewrite —
+// they were the WhatsApp-side legacy dual-write path that owner views used
+// to read from. Owner-side reads now query time_entries_v2 directly; the
+// dual-write was already a silent no-op in production (table didn't exist).
+// Filed as P1: legacy-time_entries dual-write removal + caller migration.
+
 async function getLatestTimeEvent(ownerId, employeeName) {
-  const { rows } = await query(
-    `SELECT type, timestamp
-       FROM public.time_entries
-      WHERE owner_id=$1 AND lower(employee_name)=lower($2)
-      ORDER BY timestamp DESC
-      LIMIT 1`,
-    [String(DIGITS(ownerId)), String(employeeName || '').trim()]
+  console.warn(
+    '[STUB] getLatestTimeEvent: public.time_entries DROPPED post-rebuild. ' +
+    'Caller should read from public.time_entries_v2 directly. Returning null.',
+    { ownerId, employeeName }
   );
-  return rows[0] || null;
+  return null;
 }
 
 /* -------------------- JOB HELPERS -------------------- */
@@ -2612,214 +2511,50 @@ if (!owner) throw new Error("Missing ownerId (digits) for jobs subsystem");
   return rows[0] || { id: j?.id || null, job_no: jobNo, name, active: true };
 }
 
-/**
- * ✅ getActiveJob (compat)
- */
-let _HAS_USER_ACTIVE_JOB_TABLE = null;
-
-async function detectUserActiveJobTable() {
-  if (_HAS_USER_ACTIVE_JOB_TABLE !== null) return _HAS_USER_ACTIVE_JOB_TABLE;
-  try {
-    _HAS_USER_ACTIVE_JOB_TABLE = await hasTable('user_active_job');
-  } catch {
-    _HAS_USER_ACTIVE_JOB_TABLE = false;
-  }
-  return _HAS_USER_ACTIVE_JOB_TABLE;
-}
+// ─────────────────────────────────────────────────────────────────────────
+// getActiveJob / setActiveJob — STUBBED (compat shape preserved)
+// Both functions read/wrote a mix of DROPPED schema:
+//   - user_active_job table (DROPPED post-rebuild)
+//   - jobs.active boolean column (DROPPED; rebuild uses jobs.status enum)
+// Canonical replacement is users.auto_assign_active_job_id (integer FK to
+// jobs.id) — but the rewrite needs caller audit + job_no→jobs.id resolution.
+// Filed as P1 in POST_CUTOVER_PUNCHLIST.md ("Active-job-memory rewrite").
+// Audit: 2026-04-27 cutover-integration-parity.
+// ─────────────────────────────────────────────────────────────────────────
 
 async function getActiveJob(ownerId, userId = null) {
-  const owner = ownerDigitsOrNull(ownerId);
-if (!owner) throw new Error("Missing ownerId (digits) for jobs subsystem");
-
-  // per-user active job if available
-  if (userId && (await detectUserActiveJobTable())) {
-    try {
-      const sql = `
-        select
-          u.job_id as active_job_id,
-          coalesce(j.name, j.job_name) as name,
-          j.job_no
-        from public.user_active_job u
-        join public.jobs j
-          on j.owner_id = u.owner_id
-         and (u.job_id::text ~ '^\\d+$')
-         and j.job_no = (u.job_id::text)::int
-        where u.owner_id = $1
-          and u.user_id  = $2
-        limit 1
-      `;
-      const { rows } = await query(sql, [owner, String(userId)]);
-      if (rows?.[0]) return rows[0];
-    } catch (e) {
-      console.warn("[PG/getActiveJob] user_active_job lookup failed (ignored):", e?.message);
-    }
-  }
-
-  // owner-wide active job fallback
-  const act = await query(
-    `select coalesce(name, job_name) as name, job_no
-       from public.jobs
-      where owner_id=$1 and active=true
-      order by updated_at desc nulls last, created_at desc
-      limit 1`,
-    [owner]
+  console.warn(
+    '[STUB] getActiveJob: user_active_job table DROPPED post-rebuild + ' +
+    'jobs.active column DROPPED. Active-job memory needs rewrite to use ' +
+    'users.auto_assign_active_job_id per P1 punchlist. Returning null.',
+    { ownerId, userId }
   );
-
-  const row = act.rows?.[0] || null;
-  if (!row) return null;
-
-  if (!userId) return row.name || null;
-  return { job_no: row.job_no, name: row.name };
-}
-
-/**
- * ✅ setActiveJob (compat) — FORCE job_no mode for user_active_job.job_id
- * In today's schema (most common):
- * - jobs.job_no is INT
- * - user_active_job.job_id stores job_no (INT or TEXT)
- */
-async function setActiveJob(ownerId, userId, jobRef) {
-  const owner = ownerDigitsOrNull(ownerId);
-if (!owner) throw new Error("Missing ownerId (digits) for jobs subsystem");
-
-  const ref = String(jobRef || "").trim();
-
-  // 1) Per-user active job (preferred) if table exists
-  if (userId && (await detectUserActiveJobTable())) {
-    try {
-      let jobNo = null;
-
-      if (/^\d+$/.test(ref)) {
-        jobNo = Number(ref);
-      } else if (ref) {
-        jobNo = (await ensureJobByName(owner, ref))?.job_no ?? null;
-      }
-
-      if (jobNo != null && Number.isFinite(Number(jobNo))) {
-        await query(
-          `insert into public.user_active_job (owner_id,user_id,job_id,updated_at)
-           values ($1,$2,$3,now())
-           on conflict (owner_id,user_id) do update
-             set job_id=excluded.job_id, updated_at=now()`,
-          [owner, String(userId), Number(jobNo)]
-        );
-        return true;
-      }
-    } catch (e) {
-      console.warn("[PG/setActiveJob] user_active_job upsert failed (ignored):", e?.message);
-      // fall through to owner-wide activation
-    }
-  }
-
-  // 2) Owner-wide activation fallback (jobs.active=true)
-  let jobNo = null;
-  if (/^\d+$/.test(ref)) jobNo = Number(ref);
-  else if (ref) jobNo = (await ensureJobByName(owner, ref))?.job_no ?? null;
-
-  if (!jobNo) throw new Error("Could not resolve job");
-
-  await withClient(async (client) => {
-    await client.query(
-      `update public.jobs set active=false, updated_at=now()
-        where owner_id=$1 and active=true and job_no<>$2`,
-      [owner, Number(jobNo)]
-    );
-    await client.query(
-      `update public.jobs set active=true, updated_at=now()
-        where owner_id=$1 and job_no=$2`,
-      [owner, Number(jobNo)]
-    );
-  });
-
-  return true;
-}
-
-/* ------------------------------------------------------------------ */
-/* ✅ Canonical per-identity Active Job                                */
-/* ------------------------------------------------------------------ */
-let _ACTIVEJOB_CAPS = null;
-let _ACTIVEJOB_ID_TYPES = null; // cache active_job_id column types
-
-async function detectActiveJobCaps() {
-  if (_ACTIVEJOB_CAPS) return _ACTIVEJOB_CAPS;
-
-  const caps = {
-    users_has_active_job_id: false,
-    users_has_active_job_name: false,
-    memberships_has_active_job_id: false,
-    memberships_has_active_job_name: false,
-    user_profiles_has_active_job_id: false,
-    user_profiles_has_active_job_name: false,
-    has_memberships: false,
-    has_user_profiles: false,
-    has_users: false,
-    has_user_active_job: false
-  };
-
-  try {
-    caps.has_users = await hasTable('users');
-    if (caps.has_users) {
-      caps.users_has_active_job_id = await hasColumn('users', 'active_job_id');
-      caps.users_has_active_job_name = await hasColumn('users', 'active_job_name');
-    }
-  } catch {}
-
-  try {
-    caps.has_memberships = await hasTable('memberships');
-    if (caps.has_memberships) {
-      caps.memberships_has_active_job_id = await hasColumn('memberships', 'active_job_id');
-      caps.memberships_has_active_job_name = await hasColumn('memberships', 'active_job_name');
-    }
-  } catch {}
-
-  try {
-    caps.has_user_profiles = await hasTable('user_profiles');
-    if (caps.has_user_profiles) {
-      caps.user_profiles_has_active_job_id = await hasColumn('user_profiles', 'active_job_id');
-      caps.user_profiles_has_active_job_name = await hasColumn('user_profiles', 'active_job_name');
-    }
-  } catch {}
-
-  try {
-    caps.has_user_active_job = await detectUserActiveJobTable();
-  } catch {}
-
-  _ACTIVEJOB_CAPS = caps;
-  return caps;
-}
-
-async function detectActiveJobIdColumnTypes() {
-  if (_ACTIVEJOB_ID_TYPES) return _ACTIVEJOB_ID_TYPES;
-  const out = { users: null, memberships: null, user_profiles: null };
-  try {
-    if (await hasTable('users')) out.users = await getColumnDataType('users', 'active_job_id');
-  } catch {}
-  try {
-    if (await hasTable('memberships')) out.memberships = await getColumnDataType('memberships', 'active_job_id');
-  } catch {}
-  try {
-    if (await hasTable('user_profiles')) out.user_profiles = await getColumnDataType('user_profiles', 'active_job_id');
-  } catch {}
-  _ACTIVEJOB_ID_TYPES = out;
-  return out;
-}
-
-function coerceActiveJobIdValue(colType, { jobUuid, jobNo }) {
-  const t = String(colType || '').toLowerCase();
-  if (!t) return jobUuid || jobNo || null;
-
-  if (t.includes('uuid')) return jobUuid && looksLikeUuid(jobUuid) ? jobUuid : null;
-  if (t.includes('int') || t.includes('bigint') || t.includes('smallint')) {
-    if (jobNo == null) return null;
-    const n = Number(jobNo);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  // text/other: store uuid if present, else job_no as string
-  if (jobUuid) return String(jobUuid);
-  if (jobNo != null) return String(jobNo);
   return null;
 }
+
+async function setActiveJob(ownerId, userId, jobRef) {
+  console.warn(
+    '[STUB] setActiveJob: user_active_job table DROPPED post-rebuild + ' +
+    'jobs.active column DROPPED. Active-job memory needs rewrite to use ' +
+    'users.auto_assign_active_job_id per P1 punchlist. Returning false.',
+    { ownerId, userId, jobRef }
+  );
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Active-job detection helpers DELETED post-rebuild.
+//
+// detectActiveJobCaps / detectActiveJobIdColumnTypes / coerceActiveJobIdValue
+// were built for the multi-schema-detection era (users.active_job_id /
+// memberships.active_job_id / user_profiles.active_job_id /
+// user_active_job.job_id with uuid-vs-int-vs-text type variations). The
+// rebuild collapsed all of these onto a single canonical column:
+//   public.users.auto_assign_active_job_id (integer NULL FK to jobs.id)
+//
+// Active-job get/set is stubbed pending rewrite to use that column directly.
+// See P1 punchlist "Active-job-memory rewrite". No callers remain.
+// ─────────────────────────────────────────────────────────────────────────
 
 async function resolveJobIdAndName(ownerId, jobId, jobName) {
   const owner = DIGITS(ownerId);
@@ -2929,415 +2664,24 @@ async function resolveJobIdAndName(ownerId, jobId, jobName) {
 }
 
 async function setActiveJobForIdentity(ownerId, userIdOrPhone, jobId, jobName) {
-  const owner = DIGITS(ownerId);
-  const userId = DIGITS(userIdOrPhone);
-
-  if (!owner || !userId) throw new Error('setActiveJobForIdentity missing ownerId/userId');
-
-  const caps = await detectActiveJobCaps();
-  const types = await detectActiveJobIdColumnTypes();
-
-  const isBadJobNameToken = (s) => {
-    const t = String(s || '').trim();
-    if (!t) return true;
-    const lc = t.toLowerCase();
-    if (/^jobix_\d+$/i.test(lc)) return true;
-    if (/^jobno_\d+$/i.test(lc)) return true;
-    if (/^job_\d+_[0-9a-z]+$/i.test(lc)) return true;
-    if (/^#\s*\d+\b/.test(lc)) return true;
-    return false;
-  };
-
-  // Resolve to a jobNo + name (jobNo-first)
-  const resolved = await resolveJobIdAndName(owner, jobId, jobName);
-
-  // Only accept a real name (never token garbage)
-  const resolvedName = resolved?.name ? String(resolved.name).trim() : null;
-  const inputName = jobName ? String(jobName).trim() : null;
-  const name =
-    (resolvedName && !isBadJobNameToken(resolvedName) ? resolvedName : null) ||
-    (inputName && !isBadJobNameToken(inputName) ? inputName : null) ||
-    null;
-
-  // Prefer numeric job_no whenever possible
-  const jobNo =
-    resolved?.jobNo != null && Number.isFinite(Number(resolved.jobNo))
-      ? Number(resolved.jobNo)
-      : jobId != null && /^\d+$/.test(String(jobId).trim())
-        ? Number(jobId)
-        : null;
-
-  // Fallback: if we only have a non-token name, attempt to lookup job_no by name
-  let finalJobNo = jobNo;
-  if (!Number.isFinite(finalJobNo) && name) {
-    try {
-      const r = await query(
-        `
-        select job_no
-          from public.jobs
-         where owner_id = $1
-           and lower(coalesce(name, job_name)) = lower($2)
-         order by job_no desc
-         limit 1
-        `,
-        [owner, String(name)]
-      );
-      const n = r?.rows?.[0]?.job_no;
-      if (n != null && Number.isFinite(Number(n))) finalJobNo = Number(n);
-    } catch {}
-  }
-
-  const jobNoText = Number.isFinite(finalJobNo) ? String(finalJobNo) : null;
-
-  // If we can’t resolve a jobNo, treat as "clear active job" (fail soft)
-  const effectiveName = jobNoText ? name : null;
-
-  // 1) users
-  if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
-    try {
-      const sets = [];
-      const params = [owner, userId];
-      let i = 3;
-
-      if (caps.users_has_active_job_id) {
-        const v = coerceActiveJobIdValue(types.users, { jobUuid: null, jobNo: finalJobNo });
-        sets.push(`active_job_id = $${i++}`);
-        params.push(v);
-      }
-      if (caps.users_has_active_job_name) {
-        sets.push(`active_job_name = $${i++}`);
-        params.push(effectiveName);
-      }
-      if (await hasColumn('users', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
-
-      if (sets.length) {
-        await query(`update public.users set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
-      }
-    } catch (e) {
-      console.warn('[PG/activeJob] users update failed (ignored):', e?.message);
-    }
-  }
-
-  // 2) memberships
-  if (caps.has_memberships && (caps.memberships_has_active_job_id || caps.memberships_has_active_job_name)) {
-    try {
-      const sets = [];
-      const params = [owner, userId];
-      let i = 3;
-
-      if (caps.memberships_has_active_job_id) {
-        const v = coerceActiveJobIdValue(types.memberships, { jobUuid: null, jobNo: finalJobNo });
-        sets.push(`active_job_id = $${i++}`);
-        params.push(v);
-      }
-      if (caps.memberships_has_active_job_name) {
-        sets.push(`active_job_name = $${i++}`);
-        params.push(effectiveName);
-      }
-      if (await hasColumn('memberships', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
-
-      if (sets.length) {
-        await query(`update public.memberships set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
-      }
-    } catch (e) {
-      console.warn('[PG/activeJob] memberships update failed (ignored):', e?.message);
-    }
-  }
-
-  // 3) user_profiles
-  if (caps.has_user_profiles && (caps.user_profiles_has_active_job_id || caps.user_profiles_has_active_job_name)) {
-    try {
-      const sets = [];
-      const params = [owner, userId];
-      let i = 3;
-
-      if (caps.user_profiles_has_active_job_id) {
-        const v = coerceActiveJobIdValue(types.user_profiles, { jobUuid: null, jobNo: finalJobNo });
-        sets.push(`active_job_id = $${i++}`);
-        params.push(v);
-      }
-      if (caps.user_profiles_has_active_job_name) {
-        sets.push(`active_job_name = $${i++}`);
-        params.push(effectiveName);
-      }
-      if (await hasColumn('user_profiles', 'updated_at').catch(() => false)) sets.push(`updated_at = now()`);
-
-      if (sets.length) {
-        await query(`update public.user_profiles set ${sets.join(', ')} where owner_id=$1 and user_id=$2`, params);
-      }
-    } catch (e) {
-      console.warn('[PG/activeJob] user_profiles update failed (ignored):', e?.message);
-    }
-  }
-
-  // 4) user_active_job (supports uuid OR text schema)
-  if (caps.has_user_active_job) {
-    try {
-      const detectedType = await detectUserActiveJobJobIdType().catch(() => 'unknown');
-      const jobIdType = detectedType === 'uuid' ? 'uuid' : 'text';
-
-      // If clearing
-      if (!jobNoText && !name) {
-        await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
-        return { active_job_id: null, active_job_name: null, source: 'user_active_job' };
-      }
-
-      // UUID schema: store jobs.id
-      if (jobIdType === 'uuid') {
-        // resolve UUID from job_no first, then name
-        let jobUuid = null;
-
-        if (Number.isFinite(finalJobNo)) {
-          try {
-            const r = await query(`select id from public.jobs where owner_id=$1 and job_no=$2::int limit 1`, [
-              owner,
-              Number(finalJobNo)
-            ]);
-            const id = r?.rows?.[0]?.id;
-            if (id && looksLikeUuid(String(id))) jobUuid = String(id);
-          } catch {}
-        }
-
-        if (!jobUuid && name) {
-          try {
-            const r = await query(
-              `
-              select id
-                from public.jobs
-               where owner_id=$1
-                 and lower(coalesce(name, job_name)) = lower($2)
-               order by job_no desc
-               limit 1
-              `,
-              [owner, String(name)]
-            );
-            const id = r?.rows?.[0]?.id;
-            if (id && looksLikeUuid(String(id))) jobUuid = String(id);
-          } catch {}
-        }
-
-        // can't resolve UUID => clear (don't store junk)
-        if (!jobUuid) {
-          await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
-          return { active_job_id: null, active_job_name: effectiveName || null, source: 'user_active_job' };
-        }
-
-        await query(
-          `
-          insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
-          values ($1, $2, $3::uuid, now())
-          on conflict (owner_id, user_id)
-          do update set job_id = excluded.job_id, updated_at = now()
-          `,
-          [owner, String(userId), jobUuid]
-        );
-
-        return { active_job_id: jobUuid, active_job_name: effectiveName || null, source: 'user_active_job' };
-      }
-
-      // text schema: store job_no as text
-      if (!jobNoText) {
-        await query(`delete from public.user_active_job where owner_id=$1 and user_id=$2`, [owner, String(userId)]);
-        return { active_job_id: null, active_job_name: effectiveName || null, source: 'user_active_job' };
-      }
-
-      await query(
-        `
-        insert into public.user_active_job (owner_id, user_id, job_id, updated_at)
-        values ($1, $2, $3::text, now())
-        on conflict (owner_id, user_id)
-        do update set job_id = excluded.job_id, updated_at = now()
-        `,
-        [owner, String(userId), jobNoText]
-      );
-
-      return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'user_active_job' };
-    } catch (e) {
-      console.warn('[PG/activeJob] user_active_job write failed (ignored):', e?.message);
-    }
-  }
-
-  return { active_job_id: jobNoText, active_job_name: effectiveName || null, source: 'unknown' };
+  console.warn(
+    '[STUB] setActiveJobForIdentity: user_active_job + memberships + ' +
+    'user_profiles + users.active_job_id all DROPPED post-rebuild. ' +
+    'Active-job memory needs rewrite to use users.auto_assign_active_job_id ' +
+    'per P1 punchlist. Returning unknown-source no-op shape.',
+    { ownerId, userIdOrPhone, jobId, jobName }
+  );
+  return { active_job_id: null, active_job_name: null, source: 'unknown' };
 }
 
 async function getActiveJobForIdentity(ownerId, userIdOrPhone) {
-  const owner = DIGITS(ownerId);
-  const userId = DIGITS(userIdOrPhone);
-  if (!owner || !userId) return null;
-
-  const caps = await detectActiveJobCaps();
-
-  // helper: if id present but no name, resolve via jobs table (UUID or job_no)
-  async function enrichIfNeeded(activeId, activeName, source) {
-    const id = activeId != null ? activeId : null;
-    let name = activeName != null ? String(activeName).trim() : null;
-
-    if (name) return { active_job_id: id, active_job_name: name, source };
-    if (id == null) return { active_job_id: null, active_job_name: null, source };
-
-    const s = String(id).trim();
-
-    try {
-      // Future schema: UUID job id
-      if (looksLikeUuid(s)) {
-        const j = await query(
-          `select coalesce(name, job_name) as job_name
-             from public.jobs
-            where owner_id=$1 and id=$2::uuid
-            limit 1`,
-          [owner, s]
-        );
-        name = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
-        return { active_job_id: id, active_job_name: name, source };
-      }
-
-      // Current schema: numeric job_no
-      if (/^\d+$/.test(s)) {
-        const j = await query(
-          `select coalesce(name, job_name) as job_name
-             from public.jobs
-            where owner_id=$1 and job_no=$2::int
-            limit 1`,
-          [owner, Number(s)]
-        );
-        name = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
-        return { active_job_id: id, active_job_name: name, source };
-      }
-    } catch {
-      // ignore
-    }
-
-    return { active_job_id: id, active_job_name: null, source };
-  }
-
-  // 1) users
-  if (caps.has_users && (caps.users_has_active_job_id || caps.users_has_active_job_name)) {
-    try {
-      const cols = [];
-      if (caps.users_has_active_job_id) cols.push('active_job_id');
-      if (caps.users_has_active_job_name) cols.push('active_job_name');
-
-      const r = await query(`select ${cols.join(', ')} from public.users where owner_id=$1 and user_id=$2 limit 1`, [
-        owner,
-        userId
-      ]);
-
-      const row = r?.rows?.[0];
-      if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'users');
-        if (out?.active_job_id != null || out?.active_job_name) return out;
-      }
-    } catch (e) {
-      console.warn('[PG/activeJob] users read failed (ignored):', e?.message);
-    }
-  }
-
-  // 2) memberships (self-disabling)
-  if (
-    _MEMBERSHIPS_OK !== false &&
-    caps.has_memberships &&
-    (caps.memberships_has_active_job_id || caps.memberships_has_active_job_name)
-  ) {
-    try {
-      const membershipsExists = await hasTable('memberships').catch(() => false);
-      if (!membershipsExists) {
-        _MEMBERSHIPS_OK = false; // permanently stop trying
-      } else {
-        _MEMBERSHIPS_OK = true;
-
-        const cols = [];
-        if (caps.memberships_has_active_job_id) cols.push('active_job_id');
-        if (caps.memberships_has_active_job_name) cols.push('active_job_name');
-
-        if (cols.length) {
-          const r = await query(
-            `select ${cols.join(', ')} from public.memberships where owner_id=$1 and user_id=$2 limit 1`,
-            [owner, userId]
-          );
-
-          const row = r?.rows?.[0];
-          if (row && (row.active_job_id != null || row.active_job_name != null)) {
-            const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'memberships');
-            if (out?.active_job_id != null || out?.active_job_name) return out;
-          }
-        }
-      }
-    } catch (e) {
-      const msg = String(e?.message || '').toLowerCase();
-      const code = String(e?.code || '');
-
-      if (code === '42P01' || (msg.includes('memberships') && msg.includes('does not exist'))) {
-        _MEMBERSHIPS_OK = false; // permanently stop trying
-      } else {
-        console.warn('[PG/activeJob] memberships read failed (ignored):', e?.message);
-      }
-    }
-  }
-
-  // 3) user_profiles
-  if (caps.has_user_profiles && (caps.user_profiles_has_active_job_id || caps.user_profiles_has_active_job_name)) {
-    try {
-      const cols = [];
-      if (caps.user_profiles_has_active_job_id) cols.push('active_job_id');
-      if (caps.user_profiles_has_active_job_name) cols.push('active_job_name');
-
-      const r = await query(
-        `select ${cols.join(', ')} from public.user_profiles where owner_id=$1 and user_id=$2 limit 1`,
-        [owner, userId]
-      );
-
-      const row = r?.rows?.[0];
-      if (row && (row.active_job_id != null || row.active_job_name != null)) {
-        const out = await enrichIfNeeded(row.active_job_id ?? null, row.active_job_name ?? null, 'user_profiles');
-        if (out?.active_job_id != null || out?.active_job_name) return out;
-      }
-    } catch (e) {
-      console.warn('[PG/activeJob] user_profiles read failed (ignored):', e?.message);
-    }
-  }
-
-  // 4) user_active_job (supports uuid OR text job_id)
-  if (caps.has_user_active_job) {
-    try {
-      const detectedType = await detectUserActiveJobJobIdType().catch(() => 'unknown');
-      const jobIdType = detectedType === 'uuid' ? 'uuid' : 'text';
-
-      const r = await query(`select job_id from public.user_active_job where owner_id=$1 and user_id=$2 limit 1`, [
-        owner,
-        userId
-      ]);
-      const row = r?.rows?.[0];
-      if (!row?.job_id) return null;
-
-      const jid = String(row.job_id).trim();
-
-      // UUID schema => resolve by jobs.id
-      if (jobIdType === 'uuid' && looksLikeUuid(jid)) {
-        const j = await query(
-          `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and id=$2::uuid limit 1`,
-          [owner, jid]
-        );
-        const nm = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
-        return { active_job_id: jid, active_job_name: nm, source: 'user_active_job' };
-      }
-
-      // text schema => treat as job_no if numeric
-      if (/^\d+$/.test(jid)) {
-        const j = await query(
-          `select coalesce(name, job_name) as job_name from public.jobs where owner_id=$1 and job_no=$2::int limit 1`,
-          [owner, Number(jid)]
-        );
-        const nm = j?.rows?.[0]?.job_name ? String(j.rows[0].job_name).trim() : null;
-        return { active_job_id: jid, active_job_name: nm, source: 'user_active_job' };
-      }
-
-      // otherwise return id only
-      return { active_job_id: jid, active_job_name: null, source: 'user_active_job' };
-    } catch (e) {
-      console.warn('[PG/activeJob] user_active_job read failed (ignored):', e?.message);
-    }
-  }
-
+  console.warn(
+    '[STUB] getActiveJobForIdentity: user_active_job + memberships + ' +
+    'user_profiles + users.active_job_id all DROPPED post-rebuild. ' +
+    'Active-job memory needs rewrite to use users.auto_assign_active_job_id ' +
+    'per P1 punchlist. Returning null.',
+    { ownerId, userIdOrPhone }
+  );
   return null;
 }
 
@@ -4234,249 +3578,58 @@ async function listOpenJobs(ownerId, { limit = 8 } = {}) {
 }
 
 /* -------------------- Time Limits & Audit -------------------- */
-// Cache detected columns on public.time_entries
-let SUPPORTS_CREATED_BY = null;
-let SUPPORTS_USER_ID = null;
-let SUPPORTS_SOURCE_MSG_ID = null;
-let TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = null;
+// Post-rebuild: public.time_entries DROPPED — these capability detectors
+// are dead. Canonical is public.time_entries_v2.
 
 async function detectTimeEntriesCapabilities() {
-  if (SUPPORTS_CREATED_BY !== null && SUPPORTS_USER_ID !== null && SUPPORTS_SOURCE_MSG_ID !== null) {
-    return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
-  }
-
-  try {
-    const { rows } = await query(
-      `SELECT column_name
-         FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name   = 'time_entries'`
-    );
-    const names = new Set((rows || []).map((r) => String(r.column_name).toLowerCase()));
-    SUPPORTS_CREATED_BY = names.has('created_by');
-    SUPPORTS_USER_ID = names.has('user_id');
-    SUPPORTS_SOURCE_MSG_ID = names.has('source_msg_id');
-  } catch {
-    // Don't cache transient errors — allow retry on next call
-    return { SUPPORTS_CREATED_BY: false, SUPPORTS_USER_ID: false, SUPPORTS_SOURCE_MSG_ID: false };
-  }
-
-  return { SUPPORTS_CREATED_BY, SUPPORTS_USER_ID, SUPPORTS_SOURCE_MSG_ID };
+  return { SUPPORTS_CREATED_BY: false, SUPPORTS_USER_ID: false, SUPPORTS_SOURCE_MSG_ID: false };
 }
 
 async function detectTimeEntriesUniqueOwnerUserSourceMsg() {
-  if (TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE !== null) return TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE;
-  try {
-    const { rows } = await query(
-      `
-      select pg_get_indexdef(ix.indexrelid) as def
-        from pg_class t
-        join pg_namespace n on n.oid=t.relnamespace
-        join pg_index ix on ix.indrelid=t.oid
-       where n.nspname='public'
-         and t.relname='time_entries'
-         and ix.indisunique=true
-      `
-    );
-    const defs = (rows || []).map((r) => String(r.def || '').toLowerCase());
-    TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = defs.some(
-      (d) => d.includes('(owner_id') && d.includes('user_id') && d.includes('source_msg_id')
-    );
-  } catch {
-    TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = false;
-  }
-  return TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE;
+  return false;
 }
 
-// ✅ aligned with timeclock.js: accepts { max } OR { maxInWindow }
+// All 4 functions below are STUBBED — public.time_entries DROPPED post-rebuild.
+// Canonical surface is public.time_entries_v2 (different shape: `kind`,
+// `start_at_utc`, `end_at_utc`, `meta jsonb`, no `type`/`employee_name`/
+// `local_time`/`timestamp` columns). The owner-side dual-write that these
+// functions performed is gone — owner views read time_entries_v2 directly.
+// Filed as P1: legacy-time_entries removal + caller migration to v2.
+
 async function checkTimeEntryLimit(ownerId, createdBy, opts = {}) {
-  const windowSec = Number(opts.windowSec ?? 30);
-  const maxInWindow = Number(opts.maxInWindow ?? opts.max ?? 8);
-
-  const owner = DIGITS(ownerId);
-  const actor = DIGITS(createdBy || owner);
-  const windowIntervalExpr = `(($3::text || ' seconds')::interval)`;
-
-  try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND user_id=$2
-          AND created_at >= NOW() - ${windowIntervalExpr}`,
-      [owner, actor, windowSec]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-  } catch (eUser) {
-    const msg = String(eUser?.message || '').toLowerCase();
-    if (!msg.includes('column "user_id" does not exist')) {
-      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
-    }
-  }
-
-  try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND COALESCE(created_by,$2::text) = $2::text
-          AND created_at >= NOW() - ${windowIntervalExpr}`,
-      [owner, actor, windowSec]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-  } catch (eCreated) {
-    const msg = String(eCreated?.message || '').toLowerCase();
-    if (!msg.includes('column "created_by" does not exist')) {
-      return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
-    }
-  }
-
-  try {
-    const { rows } = await query(
-      `SELECT COUNT(*)::int AS n
-         FROM public.time_entries
-        WHERE owner_id=$1
-          AND created_at >= NOW() - ${windowIntervalExpr}`,
-      [owner, windowSec]
-    );
-    const n = rows?.[0]?.n ?? 0;
-    return { ok: n < maxInWindow, n, limit: maxInWindow, windowSec };
-  } catch {
-    return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
-  }
+  // Returning "no rate-limit hit" preserves caller behavior under the legacy
+  // dual-write path. Real rate-limiting on time_entries_v2 belongs in the P1
+  // rewrite — this stub disables the legacy check rather than blocking writes.
+  console.warn(
+    '[STUB] checkTimeEntryLimit: public.time_entries DROPPED post-rebuild. ' +
+    'Returning ok:true (rate-limit disabled). Rewrite via time_entries_v2 in P1.',
+    { ownerId, createdBy, opts }
+  );
+  return { ok: true, n: 0, limit: Infinity, windowSec: 0 };
 }
 
-// ---------- Job-aware time entry ----------
 async function logTimeEntryWithJob(ownerId, employeeName, type, ts, jobName, tz, extras = {}) {
-  let jobNo = null;
-
-  try {
-    if (jobName && String(jobName).trim()) {
-      const j = await ensureJobByName(ownerId, jobName);
-      jobNo = j?.job_no ?? null;
-    } else {
-      const j = await resolveJobContext(ownerId, { require: false });
-      jobNo = j?.job_no ?? null;
-    }
-  } catch (e) {
-    console.warn('[PG/logTimeEntryWithJob] job resolve failed:', e?.message);
-  }
-
-  return await logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras);
+  return await logTimeEntry(ownerId, employeeName, type, ts, null, tz, extras);
 }
 
 async function logTimeEntry(ownerId, employeeName, type, ts, jobNo, tz, extras = {}) {
-  const tsIso = new Date(ts).toISOString();
-  const zone = tz || 'America/Toronto';
-
-  const ownerDigits = DIGITS(ownerId);
-  const actorDigits = DIGITS(extras?.requester_id || ownerId);
-
-  const ownerSafe = ownerDigits || actorDigits || '0';
-  const actorSafe = actorDigits || ownerDigits || '0';
-
-  const local = formatInTimeZone(tsIso, zone, 'yyyy-MM-dd HH:mm:ss');
-
-  if (SUPPORTS_USER_ID === null || SUPPORTS_CREATED_BY === null || SUPPORTS_SOURCE_MSG_ID === null) {
-    await detectTimeEntriesCapabilities().catch((e) => console.error('[PG/logTimeEntry] detection failed:', e?.message));
-  }
-
-  const cols = ['owner_id', 'employee_name', 'type', 'timestamp', 'job_no', 'tz', 'local_time'];
-  const vals = [ownerSafe, employeeName, type, tsIso, jobNo, zone, local];
-
-  if (SUPPORTS_USER_ID) {
-    cols.push('user_id');
-    vals.push(actorSafe);
-  }
-
-  if (SUPPORTS_CREATED_BY) {
-    cols.push('created_by');
-    vals.push(actorSafe);
-  }
-
-  const sourceMsgId = String(extras?.source_msg_id || '').trim() || null;
-  if (SUPPORTS_SOURCE_MSG_ID && sourceMsgId) {
-    cols.push('source_msg_id');
-    vals.push(sourceMsgId);
-  }
-
-  if (extras?.tenant_id) {
-    cols.push('tenant_id');
-    vals.push(extras.tenant_id);
-  }
-
-  if (extras?.job_name) {
-    cols.push('job_name');
-    vals.push(extras.job_name);
-  }
-
-  cols.push('created_at');
-  const placeholders = vals.map((_, i) => `$${i + 1}`).join(', ') + ', NOW()';
-
-  const canIdempotent =
-    SUPPORTS_SOURCE_MSG_ID &&
-    SUPPORTS_USER_ID &&
-    !!sourceMsgId &&
-    (await detectTimeEntriesUniqueOwnerUserSourceMsg().catch(() => false));
-
-  const sql = canIdempotent
-    ? `
-      INSERT INTO public.time_entries (${cols.join(', ')})
-      VALUES (${placeholders})
-      ON CONFLICT (owner_id, user_id, source_msg_id) DO NOTHING
-      RETURNING id
-    `
-    : `
-      INSERT INTO public.time_entries (${cols.join(', ')})
-      VALUES (${placeholders})
-      RETURNING id
-    `;
-
-  try {
-    const { rows } = await query(sql, vals);
-    return rows?.[0]?.id || null;
-  } catch (e) {
-    const msg = String(e?.message || '').toLowerCase();
-    const code = String(e?.code || '');
-    if (canIdempotent && (code === '42P10' || msg.includes('there is no unique') || msg.includes('on conflict'))) {
-      TE_HAS_OWNER_USER_SOURCEMSG_UNIQUE = false;
-      const sql2 = `
-        INSERT INTO public.time_entries (${cols.join(', ')})
-        VALUES (${placeholders})
-        RETURNING id
-      `;
-      const { rows: rows2 } = await query(sql2, vals);
-      return rows2?.[0]?.id || null;
-    }
-    throw e;
-  }
+  console.warn(
+    '[STUB] logTimeEntry: public.time_entries DROPPED post-rebuild. ' +
+    'Authoritative writes go to time_entries_v2 directly from caller (e.g., ' +
+    'routes/timeclock.js, routes/employee.js). Legacy dual-write was already ' +
+    'a silent no-op in production. Returning null.',
+    { ownerId, employeeName, type, ts, jobNo, tz }
+  );
+  return null;
 }
 
 async function moveLastLogToJob(ownerId, userName, jobRef) {
-  const owner = DIGITS(ownerId);
-  if (!owner) throw new Error('Missing ownerId');
-
-  let jobNo = null;
-  const s = String(jobRef || '').trim();
-  if (/^\d+$/.test(s)) jobNo = Number(s);
-  else if (s) jobNo = (await ensureJobByName(owner, s))?.job_no || null;
-
-  if (!jobNo) throw new Error('Could not resolve job');
-
-  const { rows } = await query(
-    `update public.time_entries t
-        set job_no=$1
-      where t.id = (
-        select id from public.time_entries
-         where owner_id=$2 and lower(employee_name)=lower($3)
-         order by timestamp desc limit 1
-      )
-      returning id, type, timestamp`,
-    [jobNo, owner, String(userName)]
+  console.warn(
+    '[STUB] moveLastLogToJob: public.time_entries DROPPED post-rebuild. ' +
+    'Caller should UPDATE public.time_entries_v2 directly. Returning null.',
+    { ownerId, userName, jobRef }
   );
-  return rows[0] || null;
+  return null;
 }
 
 async function enqueueKpiTouch(ownerId, jobId, isoDate) {
@@ -5164,7 +4317,7 @@ module.exports = {
   getJobBySourceMsg,
 
   // optional: debugging / inspection
-  detectUserActiveJobJobIdType,
+  // detectUserActiveJobJobIdType — REMOVED post-rebuild (user_active_job DROPPED)
   userActiveJobJoinMode,
   ymInTZ,
   getUsageMonthly,
@@ -5196,8 +4349,6 @@ module.exports = {
   withTenantAllocLock,
   allocateNextDocCounter,
   allocateNextJobNo,
-  getActorMemory,
-  patchActorMemory,
   getJobProfitByRange,
 
   // Supplier catalog

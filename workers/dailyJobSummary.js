@@ -139,10 +139,13 @@ async function generateJobSummary(activity, today) {
 async function runDailyJobSummary() {
   const today = todayUtc();
 
+  // Post-rebuild canonical owner registry: public.users
+  // (chiefos_tenant_actor_profiles DISCARDed per Decision 12).
+  // user_id is the digits PK = phone_digits.
   const ownersResult = await pool.query(`
-    SELECT DISTINCT owner_id, phone_digits, tenant_id
-    FROM public.chiefos_tenant_actor_profiles
-    WHERE phone_digits IS NOT NULL AND phone_digits != ''
+    SELECT owner_id, user_id AS phone_digits, tenant_id
+      FROM public.users
+     WHERE role = 'owner'
   `).catch(() => null);
 
   const owners = ownersResult?.rows || [];

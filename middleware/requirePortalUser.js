@@ -1,6 +1,8 @@
 // middleware/requirePortalUser.js
 const { createClient } = require("@supabase/supabase-js");
 const pg = require("../services/postgres");
+const { isPhonePaired } = require("../services/phoneLinkOtp");
+const { resolvePortalActor, ensureCorrelationId } = require("../services/actorContext");
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -44,7 +46,9 @@ function supabaseAdmin() {
  *   req.portalRole (text|null)
  *   req.tenant (row|null)
  *   req.ownerId (digits|null)
- *   req.actorId (uuid|null)
+ *   req.actorId (text digit-string|null)  — R3, from public.users.user_id
+ *   req.actorRole (text|null)             — R3, from public.users.role
+ *   req.isPhonePaired (boolean)  — R2.5, derived from public.users.auth_user_id
  *   req.supabaseAccessToken
  */
 function requirePortalUser(opts = {}) {
@@ -52,6 +56,10 @@ function requirePortalUser(opts = {}) {
 
   return async function portalAuthMiddleware(req, res, next) {
     try {
+      // R3a: ensure correlation_id is threaded through the request for §17.21
+      // causal-chain reconstruction. Idempotent across middleware layers.
+      ensureCorrelationId(req);
+
       const token = parseBearer(req);
       if (!token) {
         return res.status(401).json({ ok: false, error: "missing_bearer" });
@@ -73,6 +81,8 @@ function requirePortalUser(opts = {}) {
       req.tenant = null;
       req.ownerId = null;
       req.actorId = null;
+      req.actorRole = null;
+      req.isPhonePaired = false;
       req.supabaseAccessToken = token;
 
       // 2) Resolve membership (portal user -> tenant)
@@ -89,6 +99,13 @@ function requirePortalUser(opts = {}) {
       // If user is authenticated but not linked yet, allow only when explicitly requested.
       if (!membership?.tenant_id) {
         if (allowUnlinked) {
+          // Still derive phone-pairing status — helpful for onboarding flows
+          // that need to know whether this auth user has a paired WhatsApp.
+          try {
+            req.isPhonePaired = await isPhonePaired(user.id);
+          } catch (e) {
+            console.warn("[PORTAL_PHONE_PAIRED_CHECK] failed:", e?.message);
+          }
           return next();
         }
         return res.status(403).json({ ok: false, error: "not_linked" });
@@ -117,46 +134,24 @@ function requirePortalUser(opts = {}) {
       req.tenant = tenant;
       req.ownerId = DIGITS(tenant.owner_id || "") || null;
 
-      // 4) Resolve portal actorId by email identity (preferred)
+      // Phone-pairing signal (R2.5). Keyed on auth.uid() via public.users.auth_user_id.
       try {
-        const email = String(user.email || "").trim().toLowerCase();
-        if (email) {
-          const r = await pg.query(
-            `
-            select actor_id
-            from public.v_actor_identity_resolver
-            where kind = 'email'
-              and identifier = $1
-              and tenant_id = $2
-            limit 1
-            `,
-            [email, tenant.id]
-          );
+        req.isPhonePaired = await isPhonePaired(user.id);
+      } catch (e) {
+        console.warn("[PORTAL_PHONE_PAIRED_CHECK] failed:", e?.message);
+      }
 
-          req.actorId = r?.rows?.[0]?.actor_id || null;
+      // Actor resolution against rebuild schema. resolvePortalActor reads
+      // chiefos_portal_users (auth_uid → tenant_id, role) — the canonical
+      // post-rebuild path. Returns { actorId, role } or fail-closed nulls.
+      try {
+        const portalActor = await resolvePortalActor(user.id, tenant.id);
+        if (portalActor.actorId) {
+          req.actorId = portalActor.actorId;
+          req.actorRole = portalActor.role;
         }
       } catch (e) {
         console.warn("[PORTAL_ACTOR_RESOLVE] failed:", e?.message);
-      }
-
-      // 5) If still missing and owner/admin, fallback to tenant owner/admin actor
-      if (!req.actorId && req.tenantId && (req.portalRole === "owner" || req.portalRole === "admin")) {
-        try {
-          const r2 = await pg.query(
-            `
-            select actor_id
-            from public.chiefos_tenant_actors
-            where tenant_id = $1
-              and role in ('owner','admin')
-            order by case role when 'owner' then 0 else 1 end
-            limit 1
-            `,
-            [req.tenantId]
-          );
-          req.actorId = r2?.rows?.[0]?.actor_id || null;
-        } catch (e) {
-          console.warn("[PORTAL_ACTOR_FALLBACK] failed:", e?.message);
-        }
       }
 
       return next();

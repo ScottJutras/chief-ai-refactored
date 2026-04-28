@@ -5,7 +5,8 @@
  * Compares quoted (estimate) cost vs actual (recorded) cost for a specific job.
  * Returns variance by category: labour, materials, other, plus total quoted vs actual.
  *
- * Quote source: quote_line_items (qty × unit_price_cents, grouped by category)
+ * Quote source: chiefos_quote_line_items joined through chiefos_quote_versions and
+ *                chiefos_quotes (current_version_id pointer, voided quotes excluded).
  * Actual source: transactions (expenses by category) + time_entries_v2 × crew_rates
  */
 
@@ -57,10 +58,12 @@ async function compareQuoteVsActual({ ownerId, jobId, jobNo }) {
       jobStatus     = row.rows[0].status;
     }
   } else if (resolvedJobId) {
+    // Post-rebuild: jobs.tenant_id is NOT NULL — read directly off the job row.
+    // The chiefos_tenant_actor_profiles JOIN was a holdover from when jobs
+    // lacked a tenant_id column. (DISCARDed in Decision 12.)
     const row = await pool.query(
-      `SELECT j.name, j.job_no, j.status, p.tenant_id
+      `SELECT j.name, j.job_no, j.status, j.tenant_id
        FROM public.jobs j
-       LEFT JOIN public.chiefos_tenant_actor_profiles p ON p.owner_id = j.owner_id::text
        WHERE j.owner_id::text = $1 AND j.id = $2 LIMIT 1`,
       [String(ownerId), resolvedJobId]
     ).catch(() => null);
@@ -79,7 +82,7 @@ async function compareQuoteVsActual({ ownerId, jobId, jobNo }) {
   // Need tenant_id for quote_line_items (which is tenant-scoped)
   if (!resolvedTenantId) {
     const tRow = await pool.query(
-      `SELECT tenant_id FROM public.chiefos_tenant_actor_profiles WHERE owner_id = $1 LIMIT 1`,
+      `SELECT id AS tenant_id FROM public.chiefos_tenants WHERE owner_id = $1 LIMIT 1`,
       [String(ownerId)]
     ).catch(() => null);
     resolvedTenantId = tRow?.rows?.[0]?.tenant_id || null;
@@ -92,11 +95,21 @@ async function compareQuoteVsActual({ ownerId, jobId, jobNo }) {
   let hasQuote        = false;
 
   if (resolvedTenantId) {
+    // Line items from the CURRENT version of a non-voided quote on this job.
+    // current_version_id guarantees we're reading "the quote" — not draft history.
     const qResult = await pool.query(`
-      SELECT category, SUM(qty * unit_price_cents) AS total_cents
-      FROM public.quote_line_items
-      WHERE job_id = $1 AND tenant_id = $2
-      GROUP BY category
+      SELECT li.category,
+             SUM(li.qty * li.unit_price_cents)::bigint AS total_cents
+      FROM public.chiefos_quote_line_items li
+      JOIN public.chiefos_quote_versions v
+        ON v.id = li.quote_version_id
+      JOIN public.chiefos_quotes q
+        ON q.id = v.quote_id
+       AND q.current_version_id = v.id
+      WHERE q.job_id    = $1
+        AND q.tenant_id = $2
+        AND q.status   <> 'voided'
+      GROUP BY li.category
     `, [Number(resolvedJobId), resolvedTenantId]).catch(() => null);
 
     for (const row of (qResult?.rows || [])) {

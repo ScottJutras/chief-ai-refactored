@@ -185,6 +185,7 @@ Phase 5 cutover completed 2026-04-28 (sentinel commit `8f44ea90`). The §3 apply
 | Apply date | File | Purpose | Rollback |
 |---|---|---|---|
 | 2026-04-29 | `2026_04_29_amendment_p1a7_chiefos_finish_signup_rpc.sql` | P1A-7. Path α onboarding spine RPC. Reads `auth.users.raw_user_meta_data`; creates `chiefos_tenants` + `chiefos_portal_users` + `public.users` atomically. Idempotent on `chiefos_portal_users(user_id)`. Phone collisions surface as `OWNER_PHONE_ALREADY_CLAIMED` (P0001). | `DROP FUNCTION chiefos_finish_signup(text)` |
+| 2026-04-29 | `2026_04_29_amendment_p1a8_rls_recursion_fix.sql` | P1A-8. Fixes 42P17 infinite-recursion bug in 3 RLS policies that subqueried their own table (`chiefos_portal_users.portal_users_tenant_read_by_owner` + `..._owner_update_roles`; `supplier_users.supplier_users_co_supplier_select`). Adds `chiefos_owner_tenants_for(uuid)` + `chiefos_supplier_ids_for(uuid)` SECURITY DEFINER helpers as canonical pattern. Surfaced during Path α end-to-end test. | restores broken policies + drops helpers (rollback exists for completeness; not expected to fire) |
 
 ---
 

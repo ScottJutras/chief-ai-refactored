@@ -17,14 +17,14 @@ async function requirePortal(req, res) {
 }
 
 /**
- * Resolve the caller's tenant_id using:
- * - req.userId (supabase auth uid) or req.ownerId (digits) depending on your middleware
+ * Resolve the caller's tenant_id + owner digits.
  *
- * Your system currently uses:
- * - chiefos_portal_users: user_id uuid, tenant_id uuid, role, can_insert_financials, created_at
- * - chiefos_user_identities: tenant_id, user_id, kind, identifier (digits for whatsapp)
+ * Rebuild schema:
+ * - chiefos_portal_users: user_id uuid (auth.uid()) → tenant_id uuid, role
+ * - chiefos_tenants.owner_id: the canonical phone-digit owner_id for the tenant
  *
- * We'll prefer tenant from portal membership using req.userId.
+ * requirePortalUser already populates req.ownerId from tenant.owner_id; the
+ * fallback path (previously via chiefos_user_identities) is redundant here.
  */
 async function resolveTenantAndOwner(req) {
   const ownerDigits = String(req.ownerId || "").trim();
@@ -34,8 +34,6 @@ async function resolveTenantAndOwner(req) {
     throw new Error("Missing user id (portal auth).");
   }
 
-  // Find the most relevant tenant membership for this user.
-  // (If you later support multiple tenants, you can select active one.)
   const mem = await pg.query(
     `
     select tenant_id
@@ -50,22 +48,14 @@ async function resolveTenantAndOwner(req) {
   const tenantId = mem?.rows?.[0]?.tenant_id || null;
   if (!tenantId) throw new Error("No tenant membership found for this user.");
 
-  // If middleware didn't populate ownerId digits, resolve from identities table.
+  // Fallback to chiefos_tenants.owner_id when middleware didn't populate it.
   let owner = ownerDigits;
   if (!owner) {
-    const idn = await pg.query(
-      `
-      select identifier
-      from public.chiefos_user_identities
-      where tenant_id = $1::uuid
-        and user_id = $2::uuid
-        and kind = 'whatsapp'
-      order by created_at desc
-      limit 1
-      `,
-      [tenantId, userId]
+    const t = await pg.query(
+      `select owner_id from public.chiefos_tenants where id = $1::uuid limit 1`,
+      [tenantId]
     );
-    owner = String(idn?.rows?.[0]?.identifier || "").trim();
+    owner = String(t?.rows?.[0]?.owner_id || "").trim();
   }
 
   if (!owner) throw new Error("No owner identifier found for this user.");
@@ -132,10 +122,13 @@ router.post("/delete", async (req, res) => {
     );
     await pg.query(`delete from public.jobs where owner_id = $1`, [ownerId]);
 
-    // Remove portal membership + identities for this tenant
+    // Remove portal membership + ingestion identity for this tenant.
+    // Rebuild schema: public.users is the ingestion identity (keyed by
+    // phone-digit user_id = ownerId here). chiefos_user_identities no longer
+    // exists in the rebuild.
     await pg.query(
-      `delete from public.chiefos_user_identities where tenant_id = $1::uuid and user_id = $2::uuid`,
-      [tenantId, userId]
+      `delete from public.users where tenant_id = $1::uuid and user_id = $2`,
+      [tenantId, String(ownerId)]
     );
     await pg.query(
       `delete from public.chiefos_portal_users where tenant_id = $1::uuid and user_id = $2::uuid`,

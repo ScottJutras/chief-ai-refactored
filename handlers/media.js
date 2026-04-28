@@ -298,16 +298,15 @@ async function resolveTenantIdForMedia({ ownerId, from, userProfile }) {
   const owner = String(ownerId || '').trim();
   const digits = DIGITS(from);
 
-  // 1) Best source for WhatsApp/media contexts: direct identity mapping
+  // 1) Best source for WhatsApp/media contexts: direct users lookup by phone digits.
+  // Rebuild schema: public.users.user_id is the phone-digit PK → tenant_id.
   try {
     if (digits) {
       const q1 = await dbQuery(
         `
           select tenant_id
-          from public.chiefos_user_identities
-          where kind = 'whatsapp'
-            and identifier = $1
-          order by created_at desc
+          from public.users
+          where user_id = $1
           limit 1
         `,
         [digits]
@@ -316,7 +315,7 @@ async function resolveTenantIdForMedia({ ownerId, from, userProfile }) {
       const t1 = String(q1?.rows?.[0]?.tenant_id || '').trim() || null;
       if (t1) {
         console.info('[MEDIA_TENANT_RESOLVED]', {
-          source: 'chiefos_user_identities',
+          source: 'users_direct',
           from: digits,
           tenantId: t1,
           ownerId: owner || null
@@ -325,7 +324,7 @@ async function resolveTenantIdForMedia({ ownerId, from, userProfile }) {
       }
     }
   } catch (e) {
-    console.warn('[MEDIA] resolveTenantIdForMedia chiefos_user_identities failed:', e?.message);
+    console.warn('[MEDIA] resolveTenantIdForMedia users lookup failed:', e?.message);
   }
 
   // 2) Fallback: tenant root by owner_id

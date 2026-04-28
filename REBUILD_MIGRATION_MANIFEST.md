@@ -178,4 +178,14 @@ Rollbacks tested in fresh-DB scenario: apply all rebuild migrations, apply rollb
 
 ---
 
+## 7. Post-Cutover Amendments
+
+Phase 5 cutover completed 2026-04-28 (sentinel commit `8f44ea90`). The §3 apply-order list is frozen as the cold-start contract. Amendments authored after cutover apply directly to production via `mcp__claude_ai_Supabase__apply_migration` and are listed here for traceability. Each entry has a paired rollback in `migrations/rollbacks/`.
+
+| Apply date | File | Purpose | Rollback |
+|---|---|---|---|
+| 2026-04-29 | `2026_04_29_amendment_p1a7_chiefos_finish_signup_rpc.sql` | P1A-7. Path α onboarding spine RPC. Reads `auth.users.raw_user_meta_data`; creates `chiefos_tenants` + `chiefos_portal_users` + `public.users` atomically. Idempotent on `chiefos_portal_users(user_id)`. Phone collisions surface as `OWNER_PHONE_ALREADY_CLAIMED` (P0001). | `DROP FUNCTION chiefos_finish_signup(text)` |
+
+---
+
 **End of manifest. Updated by replacement, not narrative append. Session history in `docs/_archive/sessions/`.**

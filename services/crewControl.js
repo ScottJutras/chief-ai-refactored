@@ -1,309 +1,215 @@
 // services/crewControl.js
-const pg = require("./postgres");
-const { COUNTER_KINDS } = require("../src/cil/counterKinds");
+// ============================================================================
+// Crew submission/review state-transition helpers (R3b rewrite, 2026-04-24).
+//
+// REPLACES the pre-rebuild service that wrote to chiefos_activity_logs (with
+// type/content_text/structured/status/log_no columns) and chiefos_activity_log_events
+// child table — both DISCARDed per FOUNDATION §3.11 / Decision 12.
+//
+// New model: crew submissions land as canonical rows on time_entries_v2 / tasks
+// with submission_status='pending_review' (per P1A-5 amendment §17l). Owner
+// review transitions submission_status; every transition emits one
+// chiefos_activity_logs row via the canonical emitActivityLog helper.
+//
+// State→action_kind mapping (R3a F2 decision):
+//   approved              → 'confirm'
+//   rejected              → 'reject'
+//   needs_clarification   → 'update'  (payload describes the request)
+//   pending_review        → 'update'  (crew clarification response)
+//
+// Tenant boundary (Engineering Constitution §3): every UPDATE filters by
+//   id + tenant_id + owner_id. Never id alone.
+// ============================================================================
 
-/**
- * Resolve reviewer for a log:
- * 1) If creator is employee and has active board assignment → board_actor_id
- * 2) Else fallback to tenant owner/admin actor (prefer owner)
- */
-async function resolveReviewerActorId({ tenantId, creatorActorId }) {
-  // 1) board assignment
-  const a = await pg.query(
-    `
-    select board_actor_id
-      from public.chiefos_board_assignments
-     where tenant_id = $1
-       and employee_actor_id = $2
-       and active = true
-     limit 1
-    `,
-    [tenantId, creatorActorId]
-  );
+const { query } = require('./postgres');
+const { emitActivityLog, ACTION_KINDS } = require('./activityLog');
+const { buildActorContext } = require('./actorContext');
 
-  const board = a?.rows?.[0]?.board_actor_id || null;
-  if (board) return board;
+const VALID_TARGET_TABLES = new Set(['time_entries_v2', 'tasks']);
+const VALID_NEW_STATUS = new Set(['approved', 'rejected', 'needs_clarification', 'pending_review']);
+const STATE_TO_ACTION = Object.freeze({
+  approved: 'confirm',
+  rejected: 'reject',
+  needs_clarification: 'update',
+  pending_review: 'update',
+});
 
-  // 2) owner/admin fallback
-  const b = await pg.query(
-    `
-    select actor_id, role
-      from public.chiefos_tenant_actors
-     where tenant_id = $1
-       and role in ('owner','admin')
-     order by case role when 'owner' then 0 else 1 end
-     limit 1
-    `,
-    [tenantId]
-  );
-
-  return b?.rows?.[0]?.actor_id || null;
-}
-
-/**
- * Repair counter drift by bumping next_activity_log_no = max(log_no)+1
- * Safe to run any time.
- */
-async function bumpTenantCounterToMax(tenantId) {
-  const tid = String(tenantId || "").trim();
-  if (!tid) return;
-
-  try {
-    // Correctness fix for Migration 5: counter_kind predicate is load-bearing
-    // under the composite PK. Without it this UPDATE would smash every counter
-    // kind for the tenant with the activity_log max. See docs/QUOTES_SPINE_DECISIONS.md §18.4.
-    await pg.query(
-      `
-      update public.chiefos_tenant_counters c
-      set next_no = x.next_no,
-          updated_at = now()
-      from (
-        select (coalesce(max(log_no), 0) + 1)::int as next_no
-        from public.chiefos_activity_logs
-        where tenant_id = $1
-      ) x
-      where c.tenant_id = $1::uuid and c.counter_kind = 'activity_log'
-      `,
-      [tid]
-    );
-  } catch (e) {
-    console.warn("[CREW_CONTROL] bumpTenantCounterToMax failed (ignored):", e?.message || e);
+function ensureBoundary(ctx, label) {
+  if (!ctx?.tenantId || !ctx?.ownerId) {
+    const err = new Error(`[crewControl] ${label}: tenant/owner boundary missing`);
+    err.code = 'TENANT_BOUNDARY_MISSING';
+    throw err;
   }
 }
 
-/**
- * Create a Crew activity log + an append-only event.
- * Idempotent per (tenant_id, source_msg_id) if source_msg_id is provided.
- *
- * Returns:
- *  { ok: true, logId, logNo, reviewerActorId, deduped }
- */
-async function createCrewActivityLog({
-  tenantId,
-  ownerId,
-  createdByActorId,
-  type, // 'time' | 'task'
-  source, // 'whatsapp' | 'portal' | ...
-  contentText,
-  structured = {},
-  status = "submitted",
-  sourceMsgId = null,
-} = {}) {
-  // ---- Required validation ----
-  const tid = String(tenantId || "").trim();
-  const oid = String(ownerId || "").trim();
-  const by = String(createdByActorId || "").trim();
-  const t = String(type || "").trim();
-  const s = String(source || "").trim();
-  const rawText = String(contentText || "").trim();
+// Owner inbox: list canonical rows with submission_status pending_review or
+// needs_clarification, scoped by tenant. Cross-table union; sorted by created_at.
+async function listPendingForReview(req, { limit = 100 } = {}) {
+  const ctx = buildActorContext(req);
+  ensureBoundary(ctx, 'listPendingForReview');
+  const lim = Math.max(1, Math.min(Number(limit) || 100, 500));
 
-  if (!tid) throw new Error("Missing tenantId");
-  if (!oid) throw new Error("Missing ownerId");
-  if (!by) throw new Error("Missing createdByActorId");
-  if (!t) throw new Error("Missing type");
-  if (!s) throw new Error("Missing source");
-  if (!rawText) throw new Error("Missing contentText");
+  const r = await query(
+    `select * from (
+       select
+         'time_entries_v2'::text as target_table,
+         t.id::text               as id,
+         t.user_id                as submitter_user_id,
+         t.submission_status,
+         t.created_at,
+         jsonb_build_object(
+           'kind', t.kind,
+           'job_id', t.job_id,
+           'start_at_utc', t.start_at_utc,
+           'end_at_utc', t.end_at_utc,
+           'meta', t.meta
+         ) as detail
+       from public.time_entries_v2 t
+       where t.tenant_id = $1::uuid
+         and t.submission_status in ('pending_review','needs_clarification')
 
-  // reviewer (board assignment -> owner/admin -> null)
-  let reviewerActorId = null;
-  try {
-    reviewerActorId = await resolveReviewerActorId({
-      tenantId: tid,
-      creatorActorId: by,
-    });
-  } catch (e) {
-    console.warn("[CREW_CONTROL] resolveReviewerActorId failed:", e?.message || e);
-    reviewerActorId = null;
+       union all
+
+       select
+         'tasks'::text            as target_table,
+         k.id::text               as id,
+         coalesce(k.created_by_user_id, '') as submitter_user_id,
+         k.submission_status,
+         k.created_at,
+         jsonb_build_object(
+           'task_no', k.task_no,
+           'title', k.title,
+           'job_id', k.job_id,
+           'status', k.status
+         ) as detail
+       from public.tasks k
+       where k.tenant_id = $1::uuid
+         and k.submission_status in ('pending_review','needs_clarification')
+     ) u
+     order by created_at desc
+     limit ${lim}`,
+    [ctx.tenantId]
+  );
+
+  return r?.rows || [];
+}
+
+// Crew → submit: flip an existing 'approved' canonical row to 'pending_review'.
+// Used when crew explicitly resubmits after a needs_clarification, or for
+// out-of-band crew submission flows. INSERT-with-pending-status is done at
+// the callsite (e.g., routes/timeclock.js) instead — this helper handles
+// the explicit transition path.
+async function submitForReview(req, { target_table, target_id }) {
+  if (!VALID_TARGET_TABLES.has(target_table)) {
+    throw new Error(`[crewControl] invalid target_table: ${target_table}`);
+  }
+  const ctx = buildActorContext(req);
+  ensureBoundary(ctx, 'submitForReview');
+
+  const upd = await query(
+    `update public.${target_table}
+        set submission_status = 'pending_review', updated_at = now()
+      where id::text = $1
+        and tenant_id = $2::uuid
+        and owner_id = $3
+        and submission_status in ('approved','needs_clarification')
+      returning id::text as id, submission_status`,
+    [String(target_id), ctx.tenantId, ctx.ownerId]
+  );
+  if (!upd?.rowCount) {
+    return { ok: false, error: { code: 'NOT_FOUND_OR_OUT_OF_TENANT' } };
   }
 
-  // ✅ fallback to self-review (prevents capture from breaking in half-configured tenants)
-  const reviewerFinal = reviewerActorId || by;
-  if (!reviewerActorId) {
-    console.warn("[CREW_CONTROL] reviewer fallback to self", { tenantId: tid, createdByActorId: by });
+  const emit = await emitActivityLog(ctx, {
+    action_kind: 'update',
+    target_table,
+    target_id: String(target_id),
+    payload: { from: 'approved_or_clarification', to: 'pending_review', reason: 'crew_submitted' },
+  });
+  if (!emit?.ok) {
+    return { ok: false, error: emit?.error || { code: 'ACTIVITY_EMIT_FAILED' } };
   }
 
-  const msgId = sourceMsgId ? String(sourceMsgId).trim() : null;
+  return { ok: true, target_table, target_id, new_status: 'pending_review' };
+}
 
-  // ✅ CLEAN stored content (no "Task " prefix)
-  let cleanText = rawText;
-  if (t === "task") {
-    cleanText = cleanText
-      .replace(/^\s*task\s*-\s*/i, "")
-      .replace(/^\s*task-\s*/i, "")
-      .replace(/^\s*task\s+/i, "")
-      .trim();
+// Owner review action: transition submission_status + emit activity log.
+async function transitionSubmissionStatus(req, { target_table, target_id, new_status, note = null }) {
+  if (!VALID_TARGET_TABLES.has(target_table)) {
+    throw new Error(`[crewControl] invalid target_table: ${target_table}`);
   }
-  if (!cleanText) throw new Error("Missing contentText");
+  if (!VALID_NEW_STATUS.has(new_status)) {
+    throw new Error(`[crewControl] invalid new_status: ${new_status}`);
+  }
+  const action = STATE_TO_ACTION[new_status];
+  if (!ACTION_KINDS.includes(action)) {
+    throw new Error(`[crewControl] mapped action_kind not in spec: ${action}`);
+  }
 
-  const tryOnce = async () => {
-    return await pg.withClient(async (client) => {
-      // Ensure per-tenant allocation lock (single-flight allocator)
-      if (typeof pg.withTenantAllocLock === "function") {
-        await pg.withTenantAllocLock(tid, client);
-      }
+  const ctx = buildActorContext(req);
+  ensureBoundary(ctx, 'transitionSubmissionStatus');
 
-      // ✅ Idempotency pre-check (fast)
-      if (msgId) {
-        const existing = await client.query(
-          `
-          select id, log_no
-            from public.chiefos_activity_logs
-           where tenant_id = $1
-             and source_msg_id = $2
-           limit 1
-          `,
-          [tid, msgId]
-        );
+  // Capture prior status for the payload.
+  const prior = await query(
+    `select submission_status from public.${target_table}
+      where id::text = $1 and tenant_id = $2::uuid and owner_id = $3
+      limit 1`,
+    [String(target_id), ctx.tenantId, ctx.ownerId]
+  );
+  if (!prior?.rows?.length) {
+    return { ok: false, error: { code: 'NOT_FOUND_OR_OUT_OF_TENANT' } };
+  }
+  const previous_status = prior.rows[0].submission_status;
 
-        if (existing?.rowCount) {
-          return {
-            ok: true,
-            logId: existing.rows[0].id,
-            logNo: existing.rows[0].log_no,
-            reviewerActorId: reviewerFinal,
-            deduped: true,
-          };
-        }
-      }
+  const upd = await query(
+    `update public.${target_table}
+        set submission_status = $4, updated_at = now()
+      where id::text = $1 and tenant_id = $2::uuid and owner_id = $3
+      returning id::text as id`,
+    [String(target_id), ctx.tenantId, ctx.ownerId, new_status]
+  );
+  if (!upd?.rowCount) {
+    return { ok: false, error: { code: 'UPDATE_NO_MATCH' } };
+  }
 
-      // ✅ Allocate log_no (must exist in postgres.js)
-      const logNo = await pg.allocateNextDocCounter(tid, COUNTER_KINDS.ACTIVITY_LOG, client);
+  const payload = { from: previous_status, to: new_status };
+  if (note) payload.note = String(note).trim().slice(0, 1000);
 
-      let ins;
+  const emit = await emitActivityLog(ctx, {
+    action_kind: action,
+    target_table,
+    target_id: String(target_id),
+    payload,
+  });
+  if (!emit?.ok) {
+    return { ok: false, error: emit?.error || { code: 'ACTIVITY_EMIT_FAILED' } };
+  }
 
-      if (msgId) {
-        // ✅ Idempotent path (predicate matches your partial unique index exactly)
-        ins = await client.query(
-          `
-          insert into public.chiefos_activity_logs (
-            tenant_id,
-            owner_id,
-            log_no,
-            created_by_actor_id,
-            reviewer_actor_id,
-            type,
-            source,
-            content_text,
-            structured,
-            status,
-            source_msg_id
-          )
-          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-          on conflict (tenant_id, source_msg_id)
-          where (source_msg_id is not null)
-          do update set updated_at = now()
-          returning id, log_no
-          `,
-          [
-            tid,
-            oid,
-            logNo,
-            by,
-            reviewerFinal,
-            t,
-            s,
-            cleanText,
-            structured || {},
-            String(status || "submitted"),
-            msgId,
-          ]
-        );
-      } else {
-        // ✅ Non-idempotent path (no source_msg_id)
-        ins = await client.query(
-          `
-          insert into public.chiefos_activity_logs (
-            tenant_id,
-            owner_id,
-            log_no,
-            created_by_actor_id,
-            reviewer_actor_id,
-            type,
-            source,
-            content_text,
-            structured,
-            status,
-            source_msg_id
-          )
-          values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-          returning id, log_no
-          `,
-          [
-            tid,
-            oid,
-            logNo,
-            by,
-            reviewerFinal,
-            t,
-            s,
-            cleanText,
-            structured || {},
-            String(status || "submitted"),
-            null,
-          ]
-        );
-      }
+  return { ok: true, target_table, target_id, new_status, previous_status };
+}
 
-      const logId = ins?.rows?.[0]?.id || null;
-      const logNoOut = ins?.rows?.[0]?.log_no ?? logNo;
-      if (!logId) throw new Error("Failed to create crew activity log");
-
-      // ✅ event (append-only)
-      await client.query(
-        `
-        insert into public.chiefos_activity_log_events (
-          tenant_id,
-          owner_id,
-          log_id,
-          event_type,
-          actor_id,
-          payload
-        )
-        values ($1,$2,$3,$4,$5,$6)
-        `,
-        [
-          tid,
-          oid,
-          logId,
-          "created",
-          by,
-          {
-            type: t,
-            source: s,
-            status: String(status || "submitted"),
-            reviewer_actor_id: reviewerFinal,
-            source_msg_id: msgId,
-            log_no: logNoOut,
-          },
-        ]
-      );
-
-      return { ok: true, logId, logNo: logNoOut, reviewerActorId: reviewerFinal, deduped: false };
-    });
+// DEPRECATED stub for routes/webhook.js's crew WhatsApp ingestion path. Crew
+// self-logging via WhatsApp is OUT OF R3b scope (separate Pro-tier surface)
+// per directive. Returns ok:false envelope; webhook caller already handles
+// missing function gracefully (lazy-load + null-check pattern).
+async function createCrewActivityLog(_args = {}) {
+  console.warn('[CREW_CONTROL] createCrewActivityLog is deprecated; crew WhatsApp ingestion path requires separate remediation (R3b out-of-scope).');
+  return {
+    ok: false,
+    error: {
+      code: 'NOT_IMPLEMENTED',
+      message: 'Crew WhatsApp ingestion path replaced post-R3b; use canonical INSERT + emitActivityLog directly.',
+    },
   };
-
-  // ✅ retry once if log_no collided (counter drift)
-  try {
-    return await tryOnce();
-  } catch (e) {
-    const code = String(e?.code || "");
-    const msg = String(e?.message || "");
-    const isLogNoCollision =
-      code === "23505" && /ux_activity_logs_tenant_log_no/i.test(msg);
-
-    if (!isLogNoCollision) throw e;
-
-    console.warn("[CREW_CONTROL] log_no collision → repairing counter and retrying", {
-      tenantId: tid,
-      sourceMsgId: msgId,
-    });
-
-    await bumpTenantCounterToMax(tid);
-    return await tryOnce();
-  }
 }
 
 module.exports = {
-  resolveReviewerActorId,
+  listPendingForReview,
+  submitForReview,
+  transitionSubmissionStatus,
   createCrewActivityLog,
+  // exported for tests
+  VALID_TARGET_TABLES,
+  VALID_NEW_STATUS,
+  STATE_TO_ACTION,
 };

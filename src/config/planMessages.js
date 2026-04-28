@@ -25,6 +25,12 @@ const plan_messages = {
     upgrade_plan: "starter",
   },
 
+  QUOTES_REQUIRES_STARTER: {
+    title: "Quotes are part of Owner Mode",
+    message: "Quote creation is available on Starter and Pro. You can still log jobs, time, and expenses on Free.",
+    upgrade_plan: "starter",
+  },
+
   VOICE_REQUIRES_STARTER: {
     title: "Voice capture is part of Owner Mode",
     message: "Voice capture is available on Starter and Pro. You can still log by text anytime.",
@@ -91,6 +97,12 @@ const plan_messages = {
     title: "Receipt scanning is paused for this month",
     message: "You can keep logging expenses by text. Upgrade to keep scanning receipts instantly.",
     upgrade_plan: "starter",
+  },
+
+  QUOTES_CAPACITY_REACHED: {
+    title: "Quote creation is paused for this month",
+    message: "You've reached your monthly quote limit. Your existing quotes are still visible and signable. Upgrade to Pro to keep issuing quotes this month.",
+    upgrade_plan: "pro",
   },
 
   VOICE_CAPACITY_REACHED: {

@@ -1,5 +1,6 @@
 // services/crewControl.js
 const pg = require("./postgres");
+const { COUNTER_KINDS } = require("../src/cil/counterKinds");
 
 /**
  * Resolve reviewer for a log:
@@ -48,17 +49,20 @@ async function bumpTenantCounterToMax(tenantId) {
   if (!tid) return;
 
   try {
+    // Correctness fix for Migration 5: counter_kind predicate is load-bearing
+    // under the composite PK. Without it this UPDATE would smash every counter
+    // kind for the tenant with the activity_log max. See docs/QUOTES_SPINE_DECISIONS.md §18.4.
     await pg.query(
       `
       update public.chiefos_tenant_counters c
-      set next_activity_log_no = x.next_no,
+      set next_no = x.next_no,
           updated_at = now()
       from (
         select (coalesce(max(log_no), 0) + 1)::int as next_no
         from public.chiefos_activity_logs
         where tenant_id = $1
       ) x
-      where c.tenant_id = $1::uuid
+      where c.tenant_id = $1::uuid and c.counter_kind = 'activity_log'
       `,
       [tid]
     );
@@ -163,7 +167,7 @@ async function createCrewActivityLog({
       }
 
       // ✅ Allocate log_no (must exist in postgres.js)
-      const logNo = await pg.allocateNextActivityLogNo(tid, client);
+      const logNo = await pg.allocateNextDocCounter(tid, COUNTER_KINDS.ACTIVITY_LOG, client);
 
       let ins;
 

@@ -124,10 +124,83 @@ Before any deployment:
 
 ## Active Execution Plan
 
-Read CHIEFOS_EXECUTION_PLAN.md before starting any work.
-Current Phase: 3 — Onboarding & Conversational Intelligence Polish
-Phase 1 ✅ COMPLETE | Phase 2 ✅ COMPLETE | Phase 3 🔄 IN PROGRESS
-Remaining Phase 3 build items:
-  - Live PWA install verification (Android + iOS)
-Do not accept work outside the current phase unless explicitly approved by the developer.
-Before suggesting any new feature or refactor, check if it is already built (see CHIEFOS_EXECUTION_PLAN.md audit notes) to avoid rebuilding working code.
+Reference docs by name only. Do NOT pre-load.
+
+## Context Budget (binding)
+
+For any session, do not pre-load more than 2 reference docs.
+
+If a task would require reading more than 2 reference docs, use the Agent/Explore subagent — it reads what it needs and returns a 1-page summary. The bulk never enters the parent session context.
+
+If a task references "the rebuild" or "the quotes spine" generically, ask the user which specific surface before reading anything. Do not pre-load FOUNDATION_CURRENT.md, REBUILD_MIGRATION_MANIFEST.md, QUOTES_SPINE_DECISIONS.md, or session reports speculatively.
+
+If the user asks about a completed session, read only the specific SESSION_*_REPORT.md they reference. Other session reports stay in `docs/_archive/sessions/` and are not auto-loaded.
+
+When verifying schema, decisions-log entries, or handler precedents: use targeted reads (specific line ranges via the `view` tool) rather than full-file loads. The decisions-log and schema docs are large; targeted reads pull only what's needed.
+
+Verification-first discipline is non-negotiable. Pre-implementation verification (grep actual source, read actual handler precedents, check actual schema constraints) MUST continue. Targeted reads ARE verification; defensive pre-loading of full files is not. Do not soften verification rigor in pursuit of token savings.
+
+## Current Reference Docs (root + docs/, small)
+
+- `CLAUDE.md` — this file (always loaded)
+- `FOUNDATION_CURRENT.md` — canonical schema state summary (load only when schema-relevant)
+- `REBUILD_MIGRATION_MANIFEST.md` — migration apply order (load only when migration-relevant)
+- `PHASE_4_5_DECISIONS_AND_HANDOFF.md` — current forward planning (load only when sequencing decisions are involved)
+- `PHASE_5_PRE_CUTOVER_CHECKLIST.md` — cutover validation list (load only at cutover time)
+- `docs/QUOTES_SPINE_DECISIONS.md` — active CIL architecture patterns (§3A, §17.19-§17.25, §17.26 reservation). Load when quote-spine handler work is active.
+- `docs/QUOTES_SPINE_CEREMONIES.md` — production ceremony archives (§27, §28, §30, future §31/§32). Load only when ceremony work is active.
+- `docs/PHASE_A_SESSION_3_LOCKQUOTE_HANDOFF.md` — current Phase A session handoff. Load when resuming Phase A work.
+
+## Historical Reference (archived, do not auto-load)
+
+- `docs/_archive/sessions/` — all completed R-session and amendment reports
+- `docs/_archive/foundation/FOUNDATION_P1_SCHEMA_DESIGN_FULL.md` — full schema design history (read only if FOUNDATION_CURRENT.md is insufficient)
+- `docs/_archive/handoffs/` — superseded handoff docs
+
+## Session Discipline
+
+- `/clear` between unrelated tasks (rebuild work vs portal UI work vs feature build)
+- Directives reference docs by name; Claude Code reads only what the directive's "Reference docs" section explicitly lists
+- Session reports stay terse (30-50 lines) and are filed to `docs/_archive/sessions/` once the session closes
+
+
+## Rebuild Remediation Protocol (Active)
+
+The foundation rebuild is mid-remediation. R-sessions (R1-R9) migrate call sites from pre-rebuild to rebuild shape. Sessions are governed by directives; this section is the persistent context.
+
+### Quarantined Zones (do not modify outside their dedicated session)
+
+- **Crew cluster** (`services/crewControl.js`, `routes/crewControl.js`, `routes/crewReview.js`): pending R3b. Contains scope-conflict headers. Writes to pre-rebuild `chiefos_activity_logs` shape — will break at cutover; awaiting founder decisions F2/F3/F4 from R3a report.
+- **Actor-memory cluster** (`services/postgres.js` `getActorMemory` / `patchActorMemory` + callers in `services/agent/index.js`, `services/answerChief.js`, `services/orchestrator.js`): pending R4c. Writes to DISCARDed `chief_actor_memory` table.
+
+### Canonical Helpers (use, don't reinvent)
+
+- `services/actorContext.js` — exports `resolvePortalActor`, `resolveWhatsAppActor`, `buildActorContext`, `ensureCorrelationId`
+- `services/activityLog.js` — exports `emitActivityLog`, `emitActivityLogBatch`. Single write surface for `chiefos_activity_logs` (flat rebuild shape per FOUNDATION §3.11)
+- Middleware populates: `req.tenantId`, `req.ownerId`, `req.actorId`, `req.actorRole`, `req.correlationId`, `req.isPhonePaired`
+
+### Identity Addendum (P1A-4)
+
+`public.users.auth_user_id uuid NULL REFERENCES auth.users(id) ON DELETE SET NULL` is the reverse pointer for portal↔WhatsApp linkage. UNIQUE on non-NULL. Populated by OTP verification in `routes/webhook.js` via `services/phoneLinkOtp.js`. Nullable because most ingestion identities are not paired to a portal auth user.
+
+### Session Directive Protocol
+
+R-session directives are intentionally terse. They reference authoritative docs (FOUNDATION_CURRENT.md, the specific session reports under `docs/_archive/sessions/` cited by name, this CLAUDE.md) rather than restating them. When executing a directive:
+
+- Read "Reference docs" entries only if the session needs them
+- Skip "zero-context preflight" steps — CLAUDE.md is the preflight
+- Produce terse session reports: Status, Files changed, Findings (1-line bullets), Bugs flagged (severity + file:line + 1-line), Next blocks on. 30-50 lines max. Full diffs live in git.
+- Do not write executive summaries unless the directive asks for one
+- Do not repeat scope exclusions from CLAUDE.md in the session report
+
+### Introspection Discipline
+
+Every session that modifies code must verify its assumptions against actual schema/code before authoring. The introspection-first pattern has caught real bugs (F2 camelCase/snake_case in R4b-finalize, column-shape drift in multiple amendments). Scope: verify what could have drifted since the previous session, not what's stable.
+
+### STOP Conditions (universal)
+
+Halt and report if:
+- Scope expands beyond the directive (more files than expected, new architectural decisions needed)
+- Schema drift between spec and migration files
+- Cross-tenant leakage risk discovered
+- Directive conflicts with this CLAUDE.md (CLAUDE.md wins)

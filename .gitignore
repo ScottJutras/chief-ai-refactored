@@ -41,3 +41,9 @@ dashboard/build/
 
 twilio_content_*.json
 
+# Token-bloat cleanup additions
+*.session*.json
+*.session*.cache
+docs/_archive/**/_DRAFT*
+/Screenshot_*.jpg
+

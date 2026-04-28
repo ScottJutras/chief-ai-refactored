@@ -1,9 +1,9 @@
 # ChiefOS — Execution Plan (Gap-Closing Sprint)
 
-Version: 1.3
-Status: Active — Phase 1 ✅ COMPLETE | Phase 2 ✅ COMPLETE | Phase 3 IN PROGRESS
+Version: 1.4
+Status: Active — Phase 1 🔄 PARTIAL (§1.2 re-opened 2026-04-18) | Phase 2 ✅ COMPLETE | Phase 3 IN PROGRESS
 Owner: Scott Jutras
-Last Updated: 2026-04-10
+Last Updated: 2026-04-18
 Depends on: North Star v4.0, Execution Playbook v4.0, Engineering Constitution v4.0
 
 ---
@@ -42,12 +42,237 @@ To own that positioning, ChiefOS must absorb the best, most useful features from
 - ✅ Multi-job summary: "How did I do this week?" returns jobs with margin breakdown *(2026-04-10 — agent ask() fallback)*
 - ✅ Comparative context: "That's below your average of 34% across similar jobs" *(2026-04-10 — `services/agentTools/ownerBenchmarks.js`, auto-called after job P&L answers)*
 
-### 1.2 — Quote-to-Actual Loop
-- ✅ Quotes spine functional: draft → sent → viewed → signed → locked *(pre-sprint — fully built)*
-- ✅ Quote builder: owner creates quote via portal with line items (labor estimate, materials, markup) *(pre-sprint)*
-- ✅ Quote PDF generation with business branding *(pre-sprint)*
-- ✅ When job closes, Ask Chief compares quoted vs actual: `compare_quote_vs_actual` agent tool joins `quote_line_items` × actual transactions × time_entries, returns variance by category with over/under budget *(2026-04-10 — `services/agentTools/compareQuoteVsActual.js`)*
-- ✅ Pattern detection over time: "Your last 5 bathroom renos averaged 15% over quoted labor" *(2026-04-10 — `services/agentTools/jobPatternTrends.js`, `get_job_pattern_trends` tool)*
+### 1.2 — Quote-to-Actual Loop (🔄 RE-OPENED 2026-04-18 per Beta Delta Appendix)
+
+The pre-sprint Quotes spine was a ghost build: tables existed, portal UI was wired up,
+`/api/documents/{upload,send,sign}` endpoints shipped, but the tables were never
+populated in production (verified: 0 rows across `quote_line_items`, `job_documents`,
+`job_document_files`, `change_orders`, `customers`, legacy `public.quotes`). The
+`domain/quote.js` write path was broken (referencing columns that didn't exist on
+the legacy table). The customer flow used to close Darlene MacDonald's job was built
+in a separate standalone repo (`mission-quote-standalone`), not inside ChiefOS.
+
+This item is re-opened. The new spine is being built per the Beta Delta Appendix:
+  - Dual-boundary identity (`tenant_id` uuid + `owner_id` text) on every new table.
+  - Header + immutable versions model; signed/locked versions protected by DB triggers.
+  - Server-authoritative SHA-256 hash over a canonical serialization of each version.
+  - Token-based share links (single-purpose, expiring) replacing slug-as-secret.
+  - CIL enforcement on sign: Ingress → CIL Draft → Validation → Domain Mutation.
+  - Starter+-only plan gating with monthly quota in `usage_monthly_v2`.
+  - Dedicated events table (`chiefos_quote_events`) — first in the repo.
+
+Reference: `C:\Users\scott\Documents\mission-quote-standalone\QUOTES_HANDOFF_TO_CHIEFOS.md`
+for the UX/visual spec. Nothing is ported from the pre-sprint schema; the only
+known reader (`services/agentTools/compareQuoteVsActual.js`) is rewritten in the
+same PR as the first migration.
+
+Architectural decisions locked for this work: see `docs/QUOTES_SPINE_DECISIONS.md`.
+
+Items:
+- [x] `compare_quote_vs_actual` agent tool (joins quotes × actuals × time_entries) — WORKS against the new spine after rewrite *(2026-04-10, rewritten 2026-04-18)*
+- [x] Pattern detection ("Your last 5 bathroom renos averaged 15% over quoted labor") — unchanged *(2026-04-10 — `services/agentTools/jobPatternTrends.js`)*
+- [x] Migration 1: `chiefos_quotes`, `chiefos_quote_versions`, `chiefos_quote_line_items`, triggers (immutability + cross-table parent-lock + header identity), composite dual-boundary FKs, tenant-scoped RLS *(2026-04-18 — applied as `chiefos_quotes_spine_20260418`; 12/12 verification tests passed; see `docs/QUOTES_SPINE_DECISIONS.md` §10)*
+- [x] Migration 2 (events): `chiefos_quote_events` (append-only audit stream), global sequence, scoped-immutability trigger (DELETE forbidden, `prev_event_hash`/`triggered_by_event_id` fill-once on UPDATE), dual-boundary composite FKs, `chiefos_all_events_v` cross-doc view *(2026-04-18 — applied as `chiefos_quote_events_20260418`; 10/10 verification tests passed; see `docs/QUOTES_SPINE_DECISIONS.md` §13)*
+- [x] Migration 3 (share tokens): `chiefos_quote_share_tokens` with bearer-token model (128-bit base58, 30-day absolute expiry, timestamp-derived state, recipient snapshot, dual-boundary composite FKs, fill-once lifecycle trigger); backfilled deferred FK `chiefos_qe_share_token_fk` on `chiefos_quote_events` *(2026-04-18 — applied as `chiefos_quote_share_tokens_20260418`; 16/16 verification tests passed; see `docs/QUOTES_SPINE_DECISIONS.md` §15)*
+- [x] Migration 4 (signatures): `chiefos_quote_signatures` with strict-immutability, composite dual-boundary FKs to version + event + share token, `name_match_at_sign` + `recipient_name_at_sign` + `share_token_id NOT NULL`; `chiefos_all_signatures_v` view (excludes PNG + source_msg_id); backfilled composite FK `chiefos_qe_signature_identity_fk`; extended `chiefos_qe_kind_enum` with `integrity.name_mismatch_signed`; RLS harmonization on versions + line_items per §11.0. Correction 4b: relaxed `chiefos_qe_payload_signed` CHECK (signature_id ceremonial per §14.10) *(2026-04-18 — applied as `chiefos_quote_signatures_20260418` + `chiefos_qe_payload_signed_relax_20260418`; 20/20 verification tests passed; see `docs/QUOTES_SPINE_DECISIONS.md` §16)*
+- [x] **CIL platform architecture (pre-CreateQuote scaffolding)**: created `src/cil/router.js` facade per §17.4–§17.7 + §17.12 (static `Object.freeze`-sealed new-idiom map, legacy delegation via runtime `require`); created `src/cil/utils.js` with `classifyUniqueViolation(err, {expectedSourceMsgConstraint})` per §17.10; migrated caller imports (`handlers/commands/index.js`) from `services/cilRouter` → `src/cil/router` per §17.7; wired Constitution §9 error envelope at both routers per §17.6 *(2026-04-18 — applied in commits `d87c59b9` (scaffolding) + `e87ad05a` (§17.12 refactor to frozen map); 17 tests passing; see `docs/QUOTES_SPINE_DECISIONS.md` §17.12)*
+- [x] **CreateQuote design decisions locked (C4/C5/C6/C7 session — 2026-04-19).** Input contract per §20 (customer either/or no-auto-match; job required resolved in-transaction; line items min 1; title required + scope optional; `tax_rate_bps` required no default with totals server-computed; payment terms caller-supplied; snapshots split with `TenantSnapshotZ`/`CustomerSnapshotZ` shapes defined). Plan gating per §19/§17.16 (`canCreateQuote` + `gateNewIdiomHandler` helper; Starter 50/mo, Pro 500/mo; counter `quote_created`). Return shape per §17.15 (`{ ok, <entity>, meta }` family-wide contract; `meta.traceId` non-null; `meta.already_existed` source_msg_id-granular idempotency). Actor gating per §17.17 (owner-only, handler-runtime enforcement). Pre-transaction validation sequence: Zod → §17.16 plan gate → §17.17 actor check → §17.14 transaction. C7 grep completed — `public.audit` has no quote-relevant consumers. Commits: `f8bd732d` (C5+C7+§17.16+§19), `dff8a71c` (C4+§17.17+§20), *(this commit)* (C6+§17.15).
+- [x] **Migration 5 — `chiefos_tenant_counters` generalization (APPLIED 2026-04-20).** Added `counter_kind` discriminator, renamed `next_activity_log_no` → `next_no`, composite PK `(tenant_id, counter_kind)`, format-only CHECK per §18.4. Replaced `allocateNextActivityLogNo` with generic `allocateNextDocCounter(tenantId, counterKind, client)` in `services/postgres.js`; added `COUNTER_KINDS` frozen constant at `src/cil/counterKinds.js`. `bumpTenantCounterToMax` correctness fix applied at `services/crewControl.js:53-54` (required under composite PK). 10/10 SQL verification tests passed + T12 `bumpTenantCounterToMax` correctness-fix verification. Discovered MCP parse-time limitation (documented §18.5); applied via split `execute_sql` calls rather than single `apply_migration` blob. *(Service code committed locally as `94516acb`, push pending user action; Migration SQL source-of-truth at `migrations/2026_04_20_chiefos_tenant_counters_generalize.sql`; see `docs/QUOTES_SPINE_DECISIONS.md` §18 applied record.)*
+- [x] **CreateQuote handler (COMPLETE 2026-04-19).** `src/cil/quotes.js` with `handleCreateQuote` + `CreateQuoteCILZ` + `TenantSnapshotZ` + `CustomerSnapshotZ` fully implemented across 7 sections: (1) customer resolution per §20 Q1 no-auto-match, (2) job resolution per §20 Q2 + §17.17 addendum 3 unified-error pattern, (3) `computeTotals` + `allocateQuoteHumanId` (`QT-YYYY-MM-DD-NNNN`) + snapshot composition, (4) header + version + line-items INSERTs per §17.14 NULL-then-UPDATE, (5) `current_version_id` UPDATE pointer swing, (6) `lifecycle.created` + `lifecycle.version_created` event emission per §17.14 step 5, (7) classifyCilError 4-kind outer catch + post-commit counter increment + §17.15 return shape + §17.12 frozen-map registration. 72 tests passing; first real quote **`QT-2026-04-19-0001`** persisted in Mission Exteriors tenant via `scripts/real_create_quote_mission.js` (commit `e6b856d7` + `5fd11647`; see `docs/QUOTES_SPINE_DECISIONS.md` §21 for full commit chain + verification dump).
+- [x] **SendQuote handler (COMPLETE 2026-04-19).** Second new-idiom handler. 7 sections across commits `c2c889dd` → `476eff27` (+ `534a1422` bs58 dep): (1) SendQuoteCILZ + QuoteRefInputZ, (2) loadDraftQuote with dual-boundary scope + QUOTE_NOT_DRAFT state check, (3) resolveRecipient (override > snapshot > RECIPIENT_MISSING), (4) generateShareToken (bs58.encode(randomBytes(16)) → 22-char base58) + insertShareToken (30-day absolute expiry per §14), (5) markQuoteSent (header + version UPDATEs) + emitLifecycleSent, (6) Postmark dispatch with paired notification.sent/notification.failed post-commit (Refinement B — do NOT rethrow on Postmark failure), (7) orchestration + multi-entity §17.15 return shape `{quote, share_token, meta}` + router registration. 101 tests passing. First real SendQuote delivered **`QT-2026-04-19-0001` to scott.tirakian@gmail.com** (Postmark MessageID `a52b14f7-eb77-4929-a2db-6d4e167303b8`, share URL `https://app.usechiefos.com/q/XPtBaAPL5VAm7zRRJb9onA`) via `scripts/real_send_quote_mission.js`. See `docs/QUOTES_SPINE_DECISIONS.md` §22 for full commit chain + verification dump + three candidate principles flagged for SignQuote validation.
+- [x] **SignQuote Phase 1 — canonical-serialization algorithm (COMPLETE 2026-04-19).** `computeVersionHash` + frozen field lists + string-arithmetic `qtyToThousandths` + defensive-assertion preconditions implemented in `src/cil/quoteHash.js`. §4 exhaustive clarification (§4.A–§4.K) committed. 52 unit tests passing including cross-version regression lock. Pinned hex: `e9088c36066a73a9cee9efcdb59f2748b4ca5040134d21ba5cb37e8327e77d51`. Commits `914ad319` (§4), `94ad0b39` (impl+tests).
+- [x] **SignQuote Phase 2A — Storage architecture decisions locked (COMPLETE 2026-04-19).** Seven question-rounds (Q1–Q7) established ChiefOS-wide convention for audit-kind artifact storage: dedicated bucket per kind + tenant-first path + combined self-describing storage_key (Q1); unified proxied-streaming access posture with 60s server-internal TTL (Q2); helper-built + helper-parsed format with DB CHECK mirror + strict-immutable write-path sequencing (Q3); four-invariant audit-kind upload checklist — structural validation + size bounds + content integrity + immutability (Q4); retrieval helper contract with "NEVER returns signed URLs to callers" invariant + two-query split for public path + enumeration-minimizing error taxonomy (Q5); indefinite retention + two-direction orphan handling + pre-declared `integrity.storage_missing` event schema + privacy-erasure runbook flag (Q6); module shape `src/cil/quoteSignatureStorage.js` + DI posture + bucket provisioning contract (Q7). §25 composed in `docs/QUOTES_SPINE_DECISIONS.md` — ~500 lines of prose-form rationale covering all seven sub-sections. Rules template forward to future audit-kind artifacts (PDFs, logos) without feature-specific bias.
+- [x] **SignQuote Phase 2B — Storage helper implementation (COMPLETE 2026-04-19/20).** `src/cil/quoteSignatureStorage.js` + test suite (158 passing) across 6 section commits: constants + format helpers (Section 1), PNG validation + SHA-256 (Section 2), upload + cleanup + Supabase error classifier (Section 3), retrieval helpers portal + public (Section 4), DB CHECK micro-migration with drift-detection test (Section 5), module surface finalization with Q7 contract test (Section 6). Migration 6 applied to production via Supabase MCP; `chiefos_qs_png_storage_key_format` CHECK live. `chiefos-signatures` bucket provisioned via Supabase dashboard: private, 2 MB limit, `image/png`-only MIME, no RLS. See `docs/QUOTES_SPINE_DECISIONS.md` §25 for architectural spec; Section commits `eec849bc` → `a11e6bd4` → `f595fea1` → `545ea54b` → `94d12c0e` → `c12f4a76`.
+- [x] **SignQuote Phase 2C — Storage pipeline ceremony (COMPLETE 2026-04-20).** Four ceremony scripts (`scripts/ceremony_*_phase2c.js`) exercise `uploadSignaturePng` + `getSignatureForOwner` + `getSignatureViaShareToken` end-to-end against production Supabase Storage + Postgres with synthetic ceremony rows. Fixture: real 137-byte 1×1 grayscale PNG with tEXt metadata self-labeling the file. SHA-256 `7d4f0f5664e7e5942629cb6c8ccdeff04ad95178c2da98f8197056f8bad0d977` verified byte-identical on upload, portal retrieve, and public retrieve. Audit context fields populated correctly on public path. Two FK / type issues surfaced (jobs.owner_id FK to users; jobs varchar/text param-reuse) — both fixed in seed script. See §26 for full artifact record.
+- [x] **SignQuote Phase 3 — handler implementation + real-write ceremony (COMPLETE 2026-04-21).** Third new-idiom CIL handler, first customer-initiated handler in production. Six commits across six sections: schema + SIG_ERR extensions (Section 1), name-match module (Section 2), loadSignContext + shared share-token resolver (Section 3), transaction-body helpers (Section 4), handler orchestration with 23-step sequence + post-commit paired events (Section 5), router registration + production ceremony (Section 6). Production ceremony verified: signature `8b9b982d-6268-4da8-b25e-5cf29228d197` committed with server_hash `1e12cc5287c6edc79c9990a3aee47dab30598ddafea0816ea25b058e8b648485` (first Phase-1-to-Phase-3 integration artifact), correlation_id `06cc4c9e-6406-4ffe-8de3-40f5c0af362d` threaded through `lifecycle.signed` + `notification.sent` events, Postmark MessageID `37336e10-0bd5-43f3-9b2d-e31f73ff7a2a`. Six session-close formalizations landed in decisions log: §17.19 (post-commit paired notifications), §17.20 (pre-BEGIN external write for strict-immutable INSERT), §17.21 (correlation_id wiring), §17.22 (invariant-assertion discipline), §14.11 (customer actor role auth-orthogonal), §14.12 (customer actions not plan-gated), §11a refinement (NAME_MATCH_RULE_ID in payload). See `docs/QUOTES_SPINE_CEREMONIES.md` §27 for full ceremony artifact. Section commits: `ba731315` → `4ba05486` → `3353011c` → `7db945e2` → `45ea71d1` → `3c5b6e9d` (Commit 1 router+scripts) + Commit 2 §27+formalizations+storage_key fix.
+- [x] **ViewQuote handler (COMPLETE 2026-04-23).** Fourth new-idiom CIL handler, second customer-initiated handler in production. Sent→viewed state transition via share-token resolution. 311 tests passing (Section 4: 13 handler tests; Section 5: 26 composer unit tests). Router-registered in `src/cil/router.js` `NEW_IDIOM_HANDLERS`. Production ceremony validated: correlation_id `c83f405d-e8e6-4d70-9dd1-f33e0b7a909c` threaded through `lifecycle.customer_viewed` event; quote + version co-transitioned atomically (`quote.updated_at === version.viewed_at` — single-txn coherence). Prerequisite: SendQuote `markQuoteSent` version.status leak fixed pre-ceremony at `0dedea58`. Three new decisions-log formalizations landed at session close: §17.23 (state-driven idempotency + post-rollback re-read recovery; first exerciser ViewQuote), §17.24 (header-first ordering for dual-row state transitions), §17.25 (echo-if-present posture for Zod-optional audit fields); plus §3A amendment (co-transition between header and version status; voided-is-header-only asymmetry). See `docs/QUOTES_SPINE_CEREMONIES.md` §28 for full ceremony artifact.
+- [x] **LockQuote handler (COMPLETE 2026-04-24).** Fifth new-idiom CIL handler, first system-actor handler in production. Signed → locked header-only transition per §3A asymmetry (version row constitutionally immutable post-sign; LockQuote does NOT touch it). 397 tests passing (36 new §2 tests: 3 pre-BEGIN + 10 integration + 13 Block 2 composer + 10 Block 3 composer). Router-registered in `src/cil/router.js` `NEW_IDIOM_HANDLERS`. Production ceremony validated: correlation_id `f69516da-528a-4988-90a7-83870f63f7e0` threaded through `lifecycle.locked` event; version row byte-identical pre-to-post lock (status/locked_at/server_hash/signed_at UNCHANGED — first production artifact capturing §3A post-sign immutability). Path B no-plan-gating posture (G6 follow-through: creation consumes the gate; lifecycle transitions are transitively gated). §17.24 forward-applicability corrected at session close — LockQuote is header-only, §17.24 does NOT apply. No new §17.N subsection this session; Session 2 formalizations consumed cleanly. Session commits: Section 1 `050372f7`, Section 2 `237d8f74`, Section 3 close-out `<PENDING>`. See `docs/QUOTES_SPINE_CEREMONIES.md` §30 for full ceremony artifact.
+- [ ] **Next session candidates (flagged 2026-04-24; no decision required).** Two handlers remaining in the Quote state machine:
+    1. *VoidQuote handler* — draft/sent/viewed/signed/locked → voided (terminal, header-only per §3A). Small-medium; third §17.23 exerciser.
+    2. *ReissueQuote handler* — voided → new draft version. Triggers §17.20 again; populates `superseded_by_version_id`. Medium-size; may surface a §17.26 sub-amendment to §17.23 per ceremony caveat.
+- [ ] CIL types remaining in quote spine: LockQuote, VoidQuote, ReissueQuote *(all extend `src/cil/schema.js::BaseCILZ` per §17.1; CIL-retry dedup via `(owner_id, source_msg_id)` UNIQUE on root entities per §17.8–§17.11; return shape family-wide per §17.15)*
+
+#### Quote Spine — Product Extensions (Post Core Handlers)
+
+Named future tracks surfaced during 2026-04-19 planning. NOT active
+work — captured here so they don't get lost during the remaining
+quote-spine handler sessions.
+
+- **Ext 1 — Payment schedule in quote.** Structured dated milestone
+  payments inside the quote version (e.g., "30% on acceptance, 40%
+  at midpoint, 30% on completion"). Either folds into existing
+  `payment_terms` JSONB or adds a `payment_schedule` field via
+  migration. **Sized: small.** Rationale: helps contractors maintain
+  cash flow without midstream begging for payment. **Target:**
+  extension session after SendQuote lands, or folded into SendQuote
+  session if time permits.
+
+- **Ext 2 — Pro-tier Board + Admin can create quotes.** Revises
+  §17.17 to make actor role checks plan-aware (currently owner-only
+  for CreateQuote; Pro tier should admit Board Members and Admins).
+  **Sized: medium.** Architectural decision touches every handler
+  in the chain (SendQuote, SignQuote, LockQuote, VoidQuote,
+  ReissueQuote all need consistent role-gating). **Target:**
+  dedicated session after core handler chain lands — principles
+  revise after the family exercises them, not before.
+
+- **Ext 3 — Deposit Paid receipt.** New document type parallel to
+  Invoice/Receipt. Own state machine, own human_id sequence
+  (`DR-YYYY-MMDD-NNNN`), own handlers (CreateDepositReceipt,
+  SendDepositReceipt). **Sized: large.** New CIL types, new
+  migration, new handlers. Rationale: deposits are paid before work
+  starts (covering materials); the receipt is a professional
+  acknowledgment. **Target:** after quote chain complete, alongside
+  invoice-spine work.
+
+- **Ext 4 — Lead → Quote data flow.** When a Lead becomes a Quote,
+  Lead's customer info pre-populates the quote. Primarily
+  transport-layer (caller composes CreateQuoteCILZ from Lead data).
+  **Sized: dependent on Leads work.** **Target:** after Leads spine
+  lands (Beta Playbook item 7).
+
+- **Ext 5 — Logo / branding upload.** Tenant uploads a logo that
+  renders on customer-facing documents. Real tenant-profile DB
+  table (replaces `src/config/tenantProfiles.js` bootstrap per §20
+  addendum), Supabase storage for logo files, portal upload UI,
+  signed-URL retrieval at render time. **Sized: multi-session
+  track.** **Target:** after core handler chain + before heavy GTM
+  push (logos are load-bearing for customer-facing artifact
+  professionalism).
+
+**Sequencing lean:**
+
+1. SendQuote (this session)
+2. Payment schedule (folded into SendQuote if time/scope aligns, else
+   next session after SendQuote)
+3. SignQuote, LockQuote, VoidQuote, ReissueQuote (sequential sessions)
+4. Pro-tier Board/Admin quote creation (revises §17.17 across the
+   family — after the family exists)
+5. Tenant-profile DB table + logo upload (after handler chain; before
+   GTM)
+6. Deposit Paid receipt (parallel with or after invoice spine)
+7. Lead → Quote flow (dependent on Leads spine)
+
+Preserves the architectural discipline: revise principles after the
+handler family exercises them, not before.
+
+#### Phase A.5 — Quote Surface Parity Sprint (between handler spine and Phase B)
+
+Named phase bridging handler-spine completion (Phase A close) and Phase
+B opening. Closes parity-as-principle for Quote spine: every handler has
+a human dispatch surface parallel to its internal CIL dispatch before
+product work builds on top of it.
+
+**Scope:**
+- Fuzzy quote resolver (shared helper — WhatsApp and portal both reach
+  quotes by `QT-…` human_id, project-title fragment, customer-name
+  fragment, etc.)
+- WhatsApp commands: `/lock`, `/void`, `/reissue`; retrofit `/send` if
+  needed to match the new pattern
+- Portal quote detail view (portal surface for viewing a sent/signed/
+  locked quote)
+- Portal action API endpoints (portal surface for locking, voiding,
+  reissuing — parity with WhatsApp)
+- Source-enum widening: `['portal', 'whatsapp', 'system']` across all
+  Quote-spine handlers (currently narrowed per-handler; LockQuote ships
+  `['system']`-only in Phase A)
+
+**Estimated:** 3–4 sessions.
+
+**Discipline:** Phase A closes as handler-spine-only — handlers exist
+with internal CIL-dispatch test coverage but limited user-facing surface.
+Phase A.5 adds human dispatch surfaces in parallel across the whole
+handler family. No handler ships user-visible before the family does.
+Phase B product work opens only after A.5 closes.
+
+- [ ] Portal: quote builder UI wired to new spine, customer-facing view at `/q/:token`
+- [ ] Plan gating: Starter+ entitlement in `src/config/planCapabilities.js`, quota counter in `usage_monthly_v2`
+- [ ] Server PDF render on sign; Postmark email (contractor + customer); signed PDF stored in Supabase Storage
+
+#### CIL migration tracking (per §17.3)
+
+Visible count of legacy handlers still extending `cil.js::baseCIL`. When this
+table reaches zero rows, `cil.js` is deleted and removal is logged in
+`docs/QUOTES_SPINE_DECISIONS.md`. No deadline — reality indicator only.
+`§17.2` migration trigger applies: any non-trivial change to a listed
+handler migrates it to `src/cil/schema.js::BaseCILZ` as part of the same
+change.
+
+**Legacy handler inventory as of 2026-04-18 (six files, ten CIL types):**
+
+| File | Legacy CIL types | Audit pattern | Migrated? |
+|---|---|---|---|
+| `domain/lead.js` | CreateLead | `public.audit` via `ensureNotDuplicate` + `recordAudit` | ☐ |
+| `domain/agreement.js` | CreateAgreement | `public.audit` (partially stubbed on `cil.quote_id`) | ☐ |
+| `domain/invoice.js` | CreateInvoice | TBD (verify when touched) | ☐ |
+| `domain/changeOrder.js` | CreateChangeOrder | `public.audit` | ☐ |
+| `domain/transactions.js` | LogExpense, LogRevenue | internal dedup in `insertTransaction` | ☐ |
+| `domain/pricing.js` | AddPricingItem, UpdatePricingItem, DeletePricingItem | `ON CONFLICT DO NOTHING` | ☐ |
+
+Retired: `domain/quote.js` (stub, throws `NOT_IMPLEMENTED`) — not counted.
+Orphan: `domain/receipt.js` (not dispatched through `cilRouter.js`) — not
+counted.
+
+When a handler migrates: check the box above, update the decisions log
+with the migration date, ensure tests cover the hardened input. When all
+six files are migrated and `cilRouter.js` no longer imports from
+`../cil`: delete `cil.js`, log the deletion as a `§17.3` event.
+
+#### Deferred items discovered during CIL work
+
+Small issues surfaced during CIL architecture / scaffolding sessions that
+don't block CreateQuote but must not be lost. Each is filed with file:line
+so the context survives memory reset.
+
+- **Batch-receipts flow uses unregistered CIL type `CreateExpense`**
+  (`handlers/commands/index.js:486`). Legacy `schemaMap` has `LogExpense`,
+  not `CreateExpense`. Pre-existing bug: before the §17.6 envelope change
+  this failed via thrown `Unsupported CIL type`; the `try/catch` at line
+  ~500 silently treated items as failed. After the scaffolding session's
+  §17.6 + caller update (envelope-aware `r.ok === false` check), behavior
+  is preserved (still treated as failed) but the underlying bug remains.
+  **Fix when batch-receipts is next touched:** either (a) change the
+  `type:` to `'LogExpense'` and remap the payload shape to match
+  `cilSchemas.LogExpense`, or (b) register a `CreateExpense` alias in the
+  legacy router. Option (a) is cleaner — matches the rest of the codebase
+  naming. Flagged here 2026-04-18 during CIL scaffolding session.
+
+- **Future cleanup: `chiefos_quotes.chiefos_quotes_current_version_fk` is
+  currently `DEFERRABLE INITIALLY DEFERRED`.** With §17.14's
+  NULL-then-UPDATE pattern, no handler depends on deferral. A future
+  migration can tighten this to `IMMEDIATE`, unifying FK behavior across
+  the spine. Not blocking any feature; purely architectural cleanup —
+  probably bundled with a future schema-hygiene migration, not urgent.
+  Flagged 2026-04-18 during C2 decision session (§17.14).
+
+- **SendQuote polish: branded From header.** Current
+  `buildSendQuoteEmail` passes the raw address; Gmail displays
+  `hello@usechiefos.com` instead of `"Mission Exteriors" <hello@usechiefos.com>`.
+  Fix: compose `from` in the handler as `"${tenant_snapshot.brand_name}"
+  <${POSTMARK_FROM_EMAIL}>` and pass through to `sendEmail({ from, ... })`
+  (the helper already accepts `from`). ~5 lines of handler code + 1 test
+  tweak. Low-cost polish; bundle with SignQuote session or a dedicated
+  small commit. Flagged 2026-04-19 from SendQuote ceremony feedback.
+
+- **Postmark link-tracking note (informational, not a ticket).** Ceremony
+  email had share URLs wrapped by Postmark's click tracker
+  (`track.pstmrk.it/...`) — Postmark's default. Wrapped URLs still 302
+  to the actual `/q/:token` destination; bonus is click analytics per
+  recipient. Configurable at Postmark dashboard → Settings → Outbound →
+  Tracking. No code change required; documented here so future sessions
+  inspecting delivered-email URLs aren't surprised by the wrapper.
+
+- **C7 completed 2026-04-19 — `public.audit` consumer grep.** Live-tree
+  hits: `services/audit.js:15` (`SELECT id FROM public.audit` inside
+  `ensureNotDuplicate`) and `services/audit.js:31` (`INSERT INTO
+  public.audit` inside `recordAudit`). Callers of the module:
+  `domain/lead.js`, `domain/changeOrder.js`, `domain/agreement.js`. No
+  quote-relevant consumers (no reader selects from `public.audit`
+  expecting Quote operations); no test fixtures; `domain/quote.js` no
+  longer calls the audit service. All hits are category (1) — legitimate
+  legacy infrastructure; no action required until §17.3 fires
+  (services/audit.js retires alongside `cil.js` when all legacy handlers
+  migrate per §17.2). Visibility gap per §17.8 confirmed as non-blocking.
 
 ### 1.3 — Invoice Spine
 - ✅ Invoice generation from quote (quote → invoice flow) *(pre-sprint — fully built)*
@@ -484,7 +709,7 @@ To own that positioning, ChiefOS must absorb the best, most useful features from
 ## Active Execution Plan
 Read CHIEFOS_EXECUTION_PLAN.md before starting any work.
 
-Phase 1 ✅ COMPLETE | Phase 2 ✅ COMPLETE | Phase 3 🔄 IN PROGRESS
+Phase 1 🔄 PARTIAL (§1.2 re-opened 2026-04-18) | Phase 2 ✅ COMPLETE | Phase 3 🔄 IN PROGRESS
 
 Current Phase: 3 — Onboarding & Conversational Intelligence Polish
 Remaining Phase 3 build items:

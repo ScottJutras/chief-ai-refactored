@@ -26,6 +26,8 @@
 
 **Amendment 2026-04-29 (Phase 0 p2+p3):** §4.1 audit list clarified — `paid_breaks_policy` is binary enum (`paid`|`unpaid`) per implementation, default `'unpaid'`, lives on `chiefos_tenants`. `tax_region` added as GENERATED column from `country || '-' || province` on `chiefos_tenants`; `tax_code` retained as distinct tax-math regime (`HST_ON`, `GST_ONLY`, etc.). Dead `region` column dropped. Implementation: migration `2026_04_29_phase0_p2_p3_chiefos_tenants_paid_breaks_and_tax_region.sql`.
 
+**Amendment 2026-04-29 (Phase 1 PR-A — lifecycle + plan_key placement):** §5.1, §5.2, §6, §7, §8, §9.4 corrected. All 12 §5.1 lifecycle/activation columns + `reminders_sent` JSONB are placed on `public.chiefos_tenants`, NOT `public.users`. §5.2 `plan_key` is moved to `public.chiefos_tenants` and dropped from `public.users`. Reason: every column is per-business state; `public.users` is multi-actor-per-owner (UNIQUE `(owner_id, user_id)`), so per-business state on that table forces denormalization across crew rows. Same precedent that drove `phone_e164` → `chiefos_tenants` in the prior amendment. §5.2 also corrects the constraint name (`users_plan_key_check` → `users_plan_key_chk`, the actual production name) and adds the explicit `DROP COLUMN users.plan_key` step. §6 plan-resolution and §7/§8/§9.4 transition logic now read/write lifecycle and plan_key via `chiefos_tenants` keyed by `owner_id` (or by JOIN through `users.tenant_id` where the entry surface is owner_id-bound). Implementation: migration `2026_04_29_phase1_pra_lifecycle_and_plan_key_on_chiefos_tenants.sql` + RPC amendment `2026_04_29_amendment_p1a14_chiefos_finish_signup_rpc_lifecycle_and_plan.sql`. Application-code reads of `users.plan_key` tracked under `P1B-application-code-plan-key-source-update` for post-Phase-1 cleanup.
+
 ---
 
 ## 1. Purpose
@@ -158,55 +160,55 @@ Per Engineering Constitution Section 5, any migration touching these fields requ
 
 ### 5.1 Users table modifications
 
-The canonical user/owner record is `public.users` (verify exact name during Phase 0). Add the following columns:
+The canonical per-business record is `public.chiefos_tenants` (1:1 with each business). Per Amendment 2026-04-29 (Phase 1 PR-A), all lifecycle/activation columns live on `chiefos_tenants`, not on `public.users` (which is multi-actor-per-owner). Add the following columns:
 
 ```sql
--- File: migrations/2026_04_28_001_add_trial_lifecycle_columns.sql
+-- File: migrations/2026_04_29_phase1_pra_lifecycle_and_plan_key_on_chiefos_tenants.sql
 -- Purpose: Add lifecycle columns to support trial-based access model
 -- Stage: Pre-launch (zero users); reversible without data loss
 
 BEGIN;
 
 -- Add lifecycle state column with explicit default
-ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS lifecycle_state TEXT NOT NULL DEFAULT 'pre_trial'
-    CHECK (lifecycle_state IN ('pre_trial', 'trial', 'paid', 'read_only', 'archived'));
+ALTER TABLE public.chiefos_tenants
+  ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'pre_trial'
+    CONSTRAINT chiefos_tenants_lifecycle_state_chk
+      CHECK (lifecycle_state IN ('pre_trial', 'trial', 'paid', 'read_only', 'archived'));
 
 -- Add trial timestamps
-ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ;
+ALTER TABLE public.chiefos_tenants
+  ADD COLUMN trial_started_at TIMESTAMPTZ,
+  ADD COLUMN trial_ends_at    TIMESTAMPTZ;
 
 -- Add read-only timestamps
-ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS read_only_started_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS read_only_ends_at TIMESTAMPTZ;
+ALTER TABLE public.chiefos_tenants
+  ADD COLUMN read_only_started_at TIMESTAMPTZ,
+  ADD COLUMN read_only_ends_at    TIMESTAMPTZ;
 
--- Add archive timestamp
-ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS archived_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS data_deletion_eligible_at TIMESTAMPTZ;
+-- Add archive timestamps
+ALTER TABLE public.chiefos_tenants
+  ADD COLUMN archived_at               TIMESTAMPTZ,
+  ADD COLUMN data_deletion_eligible_at TIMESTAMPTZ;
 
--- Add tracking fields for activation events
-ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS first_whatsapp_message_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS first_portal_login_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS first_capture_at TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS first_job_created_at TIMESTAMPTZ;
+-- Add tracking fields for activation events (telemetry-grade attribution)
+ALTER TABLE public.chiefos_tenants
+  ADD COLUMN first_whatsapp_message_at TIMESTAMPTZ,
+  ADD COLUMN first_portal_login_at     TIMESTAMPTZ,
+  ADD COLUMN first_capture_at          TIMESTAMPTZ,
+  ADD COLUMN first_job_created_at      TIMESTAMPTZ;
 
 -- Add reminders tracking (idempotent reminder dispatch)
-ALTER TABLE public.users
-  ADD COLUMN IF NOT EXISTS reminders_sent JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE public.chiefos_tenants
+  ADD COLUMN reminders_sent JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 -- Indexes for lifecycle state queries
-CREATE INDEX IF NOT EXISTS idx_users_lifecycle_state ON public.users(lifecycle_state);
-CREATE INDEX IF NOT EXISTS idx_users_trial_ends_at ON public.users(trial_ends_at)
+CREATE INDEX idx_chiefos_tenants_lifecycle_state ON public.chiefos_tenants(lifecycle_state);
+CREATE INDEX idx_chiefos_tenants_trial_ends_at ON public.chiefos_tenants(trial_ends_at)
   WHERE lifecycle_state = 'trial';
-CREATE INDEX IF NOT EXISTS idx_users_read_only_ends_at ON public.users(read_only_ends_at)
+CREATE INDEX idx_chiefos_tenants_read_only_ends_at ON public.chiefos_tenants(read_only_ends_at)
   WHERE lifecycle_state = 'read_only';
 -- Phone storage moved to chiefos_tenants.phone_e164 per Amendment 2026-04-29.
 -- Migration: 2026_04_29_phase0_p1_phone_e164_on_chiefos_tenants.sql
--- (Adds phone_e164 column + E.164 format CHECK + partial UNIQUE INDEX.)
 
 COMMIT;
 ```
@@ -220,25 +222,24 @@ COMMIT;
 
 ### 5.2 Plan key constraint
 
+Per Amendment 2026-04-29 (Phase 1 PR-A), `plan_key` is a per-business attribute and lives on `public.chiefos_tenants` alongside `lifecycle_state`. The pre-Phase-1 `users.plan_key` column (CHECK `users_plan_key_chk` with values `'free','starter','pro','enterprise'`) is dropped. `'free'` is removed from the v1.1 enum; `'trial'` and `'read_only'` are added. The migration is bundled in the same file as §5.1:
+
 ```sql
--- File: migrations/2026_04_28_002_update_plan_keys.sql
+-- File: migrations/2026_04_29_phase1_pra_lifecycle_and_plan_key_on_chiefos_tenants.sql
+-- (continues from §5.1 block in the same BEGIN/COMMIT transaction)
 
-BEGIN;
+-- Add plan_key on chiefos_tenants with v1.1 enum, default 'trial'
+ALTER TABLE public.chiefos_tenants
+  ADD COLUMN plan_key TEXT NOT NULL DEFAULT 'trial'
+    CONSTRAINT chiefos_tenants_plan_key_chk
+      CHECK (plan_key IN ('trial', 'starter', 'pro', 'enterprise', 'read_only'));
 
--- Replace any existing plan_key constraint with the v1.1 set
-ALTER TABLE public.users DROP CONSTRAINT IF EXISTS users_plan_key_check;
-
-ALTER TABLE public.users
-  ADD CONSTRAINT users_plan_key_check
-  CHECK (plan_key IN ('trial', 'starter', 'pro', 'enterprise', 'read_only'));
-
--- Set default plan_key for any user records that exist (should be zero pre-launch)
--- This is defensive; per stage assumption there should be no rows in users yet
-UPDATE public.users SET plan_key = 'trial' WHERE plan_key IS NULL;
-
-ALTER TABLE public.users ALTER COLUMN plan_key SET NOT NULL;
-
-COMMIT;
+-- Drop users.plan_key + its CHECK constraint.
+-- NOTE: actual production constraint name is users_plan_key_chk
+-- (recon during Phase 1 confirmed; the v1.0 migration that created the
+-- constraint used the _chk suffix, not _check).
+ALTER TABLE public.users DROP CONSTRAINT users_plan_key_chk;
+ALTER TABLE public.users DROP COLUMN plan_key;
 ```
 
 ### 5.3 Plan tier feature definitions
@@ -341,15 +342,18 @@ export async function resolveEffectivePlan(owner_id: string, trace_id: string): 
     };
   }
 
-  const user = await db.users.findOne({ owner_id });
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): lifecycle_state and plan_key
+  // live on chiefos_tenants (per-business), keyed by owner_id. We read the
+  // tenant directly rather than going through public.users (multi-actor).
+  const tenant = await db.chiefos_tenants.findOne({ owner_id });
 
-  if (!user) {
-    logger.warn({ trace_id, owner_id }, 'User not found in plan resolution');
+  if (!tenant) {
+    logger.warn({ trace_id, owner_id }, 'Tenant not found in plan resolution');
     return {
       ok: false,
       error: {
         code: 'TENANT_RESOLUTION_FAILED',
-        message: 'No user found for owner_id',
+        message: 'No tenant found for owner_id',
         hint: 'Account may have been archived or never existed',
         trace_id,
       },
@@ -357,13 +361,13 @@ export async function resolveEffectivePlan(owner_id: string, trace_id: string): 
   }
 
   // Step 3: Validate lifecycle_state and plan_key are both present
-  if (!user.lifecycle_state || !user.plan_key) {
-    logger.error({ trace_id, owner_id, user_id: user.id }, 'User has null lifecycle_state or plan_key — failing closed');
+  if (!tenant.lifecycle_state || !tenant.plan_key) {
+    logger.error({ trace_id, owner_id, tenant_id: tenant.id }, 'Tenant has null lifecycle_state or plan_key — failing closed');
     return {
       ok: false,
       error: {
         code: 'LIFECYCLE_AMBIGUOUS',
-        message: 'User lifecycle state cannot be determined',
+        message: 'Tenant lifecycle state cannot be determined',
         hint: 'Account requires manual review',
         trace_id,
       },
@@ -373,8 +377,8 @@ export async function resolveEffectivePlan(owner_id: string, trace_id: string): 
   const now = new Date();
 
   // Step 4: Drift detection — fail closed if lifecycle has not transitioned correctly
-  if (user.lifecycle_state === 'trial' && user.trial_ends_at && user.trial_ends_at < now) {
-    logger.error({ trace_id, owner_id, trial_ends_at: user.trial_ends_at, now }, 'Trial expired without lifecycle transition');
+  if (tenant.lifecycle_state === 'trial' && tenant.trial_ends_at && tenant.trial_ends_at < now) {
+    logger.error({ trace_id, owner_id, trial_ends_at: tenant.trial_ends_at, now }, 'Trial expired without lifecycle transition');
     return {
       ok: false,
       error: {
@@ -386,7 +390,7 @@ export async function resolveEffectivePlan(owner_id: string, trace_id: string): 
     };
   }
 
-  if (user.lifecycle_state === 'read_only' && user.read_only_ends_at && user.read_only_ends_at < now) {
+  if (tenant.lifecycle_state === 'read_only' && tenant.read_only_ends_at && tenant.read_only_ends_at < now) {
     logger.error({ trace_id, owner_id }, 'Read-only expired without archive transition');
     return {
       ok: false,
@@ -401,8 +405,8 @@ export async function resolveEffectivePlan(owner_id: string, trace_id: string): 
 
   return {
     ok: true,
-    plan_key: user.plan_key as PlanKey,
-    lifecycle_state: user.lifecycle_state as LifecycleState,
+    plan_key: tenant.plan_key as PlanKey,
+    lifecycle_state: tenant.lifecycle_state as LifecycleState,
     effective_at: now,
     trace_id,
   };
@@ -473,13 +477,20 @@ async function createPreTrialAccount(input: {
     return { user_id: existing.id, owner_id };
   }
 
-  // Per Amendment 2026-04-29: phone_e164 is persisted to chiefos_tenants
-  // (1:1 with business), not public.users. The tenant row is created first;
-  // the public.users row links to the tenant via tenant_id.
+  // Per Amendments 2026-04-29: phone_e164 (Phase 0 P1) AND lifecycle_state +
+  // plan_key (Phase 1 PR-A) are persisted to chiefos_tenants (1:1 with the
+  // business), not public.users. The tenant row is created first; the
+  // public.users row links to the tenant via tenant_id and carries no
+  // per-business lifecycle/plan attributes.
+  //
+  // lifecycle_state defaults to 'pre_trial' and plan_key defaults to 'trial'
+  // via the column DEFAULT clauses; both can be omitted from INSERT.
+  // trial_started_at intentionally NULL — clock has not started yet.
   const tenant = await db.chiefos_tenants.insert({
     owner_id,
     phone_e164: input.phone_number,  // E.164 normalized at form-submit
     name: input.business_name,
+    // lifecycle_state, plan_key, reminders_sent receive defaults
     // ... other tenant fields
   });
 
@@ -489,9 +500,8 @@ async function createPreTrialAccount(input: {
     tenant_id: tenant.id,
     email: input.email,
     name: input.owner_name,
-    lifecycle_state: 'pre_trial',
-    plan_key: 'trial',  // Plan key is 'trial' even in pre_trial state for capability purposes
-    // trial_started_at intentionally NULL — clock has not started yet
+    role: 'owner',
+    // No lifecycle_state or plan_key here — those live on chiefos_tenants now.
   });
 
   await db.acquisition_events.insert({
@@ -530,8 +540,10 @@ async function startTrialClock(
   const now = new Date();
   const trial_ends_at = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000); // 14 days
 
-  // Conditional update: only fires if still in pre_trial
-  const result = await db.users.update(
+  // Conditional update: only fires if still in pre_trial.
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): lifecycle and activation
+  // timestamps live on chiefos_tenants, keyed by owner_id (UNIQUE).
+  const result = await db.chiefos_tenants.update(
     { owner_id, lifecycle_state: 'pre_trial' },
     {
       lifecycle_state: 'trial',
@@ -543,7 +555,7 @@ async function startTrialClock(
 
   if (result.modifiedCount === 0) {
     // Already in trial state from other trigger — just record the event
-    await db.users.update(
+    await db.chiefos_tenants.update(
       { owner_id },
       { [trigger_source === 'whatsapp' ? 'first_whatsapp_message_at' : 'first_portal_login_at']: now }
     );
@@ -578,13 +590,19 @@ async function transitionTrialToPaid(
   selected_plan_key: 'starter' | 'pro' | 'enterprise',
   trace_id: string
 ): Promise<void> {
-  await db.users.update(
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): lifecycle_state and plan_key
+  // live on chiefos_tenants. stripe_subscription_id remains on public.users
+  // (per-actor billing surface), so this is a two-table write.
+  await db.chiefos_tenants.update(
     { owner_id, lifecycle_state: 'trial' },
     {
       lifecycle_state: 'paid',
       plan_key: selected_plan_key,
-      stripe_subscription_id,
     }
+  );
+  await db.users.update(
+    { owner_id, role: 'owner' },
+    { stripe_subscription_id }
   );
 
   await db.acquisition_events.insert({
@@ -613,7 +631,9 @@ async function transitionTrialToReadOnly(owner_id: string, trace_id: string): Pr
   const now = new Date();
   const read_only_ends_at = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000); // 14 days
 
-  await db.users.update(
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): lifecycle/plan/read-only
+  // window timestamps all live on chiefos_tenants.
+  await db.chiefos_tenants.update(
     { owner_id, lifecycle_state: 'trial' },
     {
       lifecycle_state: 'read_only',
@@ -645,15 +665,21 @@ async function recoverReadOnlyToPaid(
   selected_plan_key: 'starter' | 'pro' | 'enterprise',
   trace_id: string
 ): Promise<void> {
-  await db.users.update(
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): lifecycle/plan/read-only
+  // window timestamps live on chiefos_tenants. stripe_subscription_id
+  // remains on public.users.
+  await db.chiefos_tenants.update(
     { owner_id, lifecycle_state: 'read_only' },
     {
       lifecycle_state: 'paid',
       plan_key: selected_plan_key,
-      stripe_subscription_id,
       read_only_started_at: null,
       read_only_ends_at: null,
     }
+  );
+  await db.users.update(
+    { owner_id, role: 'owner' },
+    { stripe_subscription_id }
   );
 
   await auditLog({
@@ -676,7 +702,8 @@ async function transitionReadOnlyToArchived(owner_id: string, trace_id: string):
   const now = new Date();
   const data_deletion_eligible_at = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000); // 12 months
 
-  await db.users.update(
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): archive timestamps live on chiefos_tenants.
+  await db.chiefos_tenants.update(
     { owner_id, lifecycle_state: 'read_only' },
     {
       lifecycle_state: 'archived',
@@ -709,7 +736,9 @@ async function transitionPaidToReadOnly(
   const now = new Date();
   const read_only_ends_at = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
 
-  await db.users.update(
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): lifecycle/plan/read-only window
+  // timestamps live on chiefos_tenants.
+  await db.chiefos_tenants.update(
     { owner_id, lifecycle_state: 'paid' },
     {
       lifecycle_state: 'read_only',
@@ -743,21 +772,24 @@ export async function reconcileLifecycleStates(): Promise<void> {
   const trace_id = generateTraceId();
   const now = new Date();
 
-  // 1. Pre-trial accounts that have been dormant for 30+ days without activation
-  // Soft-delete these to keep the database clean
-  const dormantPreTrials = await db.users.find({
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): all lifecycle reads/writes
+  // target chiefos_tenants. owner_id is the iteration key.
+
+  // 1. Pre-trial tenants that have been dormant for 30+ days without activation.
+  // Soft-archive these to keep the database clean.
+  const dormantPreTrials = await db.chiefos_tenants.find({
     lifecycle_state: 'pre_trial',
     created_at: { $lt: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000) },
   });
 
-  for (const user of dormantPreTrials) {
-    await db.users.update(
-      { id: user.id },
+  for (const tenant of dormantPreTrials) {
+    await db.chiefos_tenants.update(
+      { id: tenant.id },
       { lifecycle_state: 'archived', archived_at: now }
     );
     await auditLog({
       event_type: 'lifecycle_transition',
-      owner_id: user.owner_id,
+      owner_id: tenant.owner_id,
       from_state: 'pre_trial',
       to_state: 'archived',
       metadata: { reason: 'dormant_pre_trial_30d' },
@@ -766,31 +798,31 @@ export async function reconcileLifecycleStates(): Promise<void> {
   }
 
   // 2. Trial → Read-only (trial expired without paid conversion)
-  const expiredTrials = await db.users.find({
+  const expiredTrials = await db.chiefos_tenants.find({
     lifecycle_state: 'trial',
     trial_ends_at: { $lt: now },
   });
 
-  for (const user of expiredTrials) {
+  for (const tenant of expiredTrials) {
     try {
-      await transitionTrialToReadOnly(user.owner_id, trace_id);
-      await sendWhatsAppTemplate(user.owner_id, 'trial_ended_read_only_starting');
+      await transitionTrialToReadOnly(tenant.owner_id, trace_id);
+      await sendWhatsAppTemplate(tenant.owner_id, 'trial_ended_read_only_starting');
     } catch (err) {
-      logger.error({ err, owner_id: user.owner_id, trace_id }, 'Failed to transition expired trial');
+      logger.error({ err, owner_id: tenant.owner_id, trace_id }, 'Failed to transition expired trial');
     }
   }
 
   // 3. Read-only → Archived
-  const expiredReadOnly = await db.users.find({
+  const expiredReadOnly = await db.chiefos_tenants.find({
     lifecycle_state: 'read_only',
     read_only_ends_at: { $lt: now },
   });
 
-  for (const user of expiredReadOnly) {
+  for (const tenant of expiredReadOnly) {
     try {
-      await transitionReadOnlyToArchived(user.owner_id, trace_id);
+      await transitionReadOnlyToArchived(tenant.owner_id, trace_id);
     } catch (err) {
-      logger.error({ err, owner_id: user.owner_id, trace_id }, 'Failed to archive expired read-only account');
+      logger.error({ err, owner_id: tenant.owner_id, trace_id }, 'Failed to archive expired read-only account');
     }
   }
 
@@ -916,9 +948,12 @@ async function handleInboundWhatsAppMessage(
 ): Promise<void> {
   const owner_id = derivePhoneOwnerId(from_phone);
 
-  const user = await db.users.findOne({ owner_id });
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): lifecycle_state lives on
+  // chiefos_tenants. We resolve the tenant first to read lifecycle, then
+  // resolve the user row for downstream message handling.
+  const tenant = await db.chiefos_tenants.findOne({ owner_id });
 
-  if (!user) {
+  if (!tenant) {
     // Unknown phone — prompt for signup
     await sendWhatsAppMessage(owner_id,
       "Hey — looks like you haven't signed up for ChiefOS yet. Visit usechiefos.com/start to get started, then come back here. Takes about 30 seconds."
@@ -926,14 +961,15 @@ async function handleInboundWhatsAppMessage(
     return;
   }
 
-  // If user is in pre_trial state, this message starts the trial clock
-  if (user.lifecycle_state === 'pre_trial') {
+  // If tenant is in pre_trial state, this message starts the trial clock
+  if (tenant.lifecycle_state === 'pre_trial') {
     await startTrialClock(owner_id, 'whatsapp', trace_id);
     await sendWelcomeMessage(owner_id);
     return;
   }
 
   // Otherwise, route to normal message handling per existing CIL pipeline
+  const user = await db.users.findOne({ owner_id });
   await routeToMessageHandler(user, message_body, twilio_metadata, trace_id);
 }
 ```
@@ -950,19 +986,25 @@ This is the "quiet confidence" cadence. Contractors who don't respond to two ema
 
 ```typescript
 async function dispatchEmailBackups(now: Date, trace_id: string): Promise<void> {
-  // Email 1: Pre-trial account, no engagement after 24 hours
-  const dormantPreTrials = await db.users.find({
+  // Per Amendment 2026-04-29 (Phase 1 PR-A): lifecycle_state, reminders_sent,
+  // and the trial/read-only window timestamps live on chiefos_tenants.
+  // The email field still lives on public.users (per-actor); the recipient
+  // is resolved by joining via tenant_id (owner-self row).
+
+  // Email 1: Pre-trial tenant, no engagement after 24 hours
+  const dormantPreTrials = await db.chiefos_tenants.find({
     lifecycle_state: 'pre_trial',
     created_at: { $lt: new Date(now.getTime() - 24 * 60 * 60 * 1000) },
     'reminders_sent.email_pre_trial_24h': null,
   });
 
-  for (const user of dormantPreTrials) {
-    await sendEmailIfNotSent(user, 'email_pre_trial_24h', PRE_TRIAL_NUDGE_EMAIL_TEMPLATE);
+  for (const tenant of dormantPreTrials) {
+    const owner = await db.users.findOne({ tenant_id: tenant.id, role: 'owner' });
+    await sendEmailIfNotSent(tenant, owner, 'email_pre_trial_24h', PRE_TRIAL_NUDGE_EMAIL_TEMPLATE);
   }
 
   // Email 2: Read-only state, day 7 (halfway through window)
-  const midReadOnly = await db.users.find({
+  const midReadOnly = await db.chiefos_tenants.find({
     lifecycle_state: 'read_only',
     read_only_started_at: {
       $gte: new Date(now.getTime() - 8 * 24 * 60 * 60 * 1000),
@@ -971,8 +1013,9 @@ async function dispatchEmailBackups(now: Date, trace_id: string): Promise<void> 
     'reminders_sent.email_read_only_day_7': null,
   });
 
-  for (const user of midReadOnly) {
-    await sendEmailIfNotSent(user, 'email_read_only_day_7', READ_ONLY_NUDGE_EMAIL_TEMPLATE);
+  for (const tenant of midReadOnly) {
+    const owner = await db.users.findOne({ tenant_id: tenant.id, role: 'owner' });
+    await sendEmailIfNotSent(tenant, owner, 'email_read_only_day_7', READ_ONLY_NUDGE_EMAIL_TEMPLATE);
   }
 }
 ```

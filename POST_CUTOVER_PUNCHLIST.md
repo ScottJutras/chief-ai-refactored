@@ -185,7 +185,326 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ---
 
-## P2 — Other deferred items
+## P1B — Post-cutover audit trackers (from 2026-04-28 audit cycle)
+
+### P1B-api-log-idempotency-conflict-response-code
+
+**Source:** Surfaced 2026-04-28 during /api/log preview testing (P1 punchlist item #7). Final happy-path + error-path validation found this nuance.
+
+**Symptom:** /api/log handlers `handleExpense` and `handleRevenue` use `INSERT INTO transactions ... ON CONFLICT (owner_id, source_msg_id, kind) DO NOTHING`. When the conflict fires, the route returns HTTP 200 with `{ ok: true, id: undefined, kind, traceId }` even though no row was inserted. Per Engineering Constitution §9 the duplicate-submission response should be HTTP 409 with `error.code === "IDEMPOTENCY_CONFLICT"`.
+
+**Functional behavior:** dedup IS working — DB-layer ON CONFLICT prevents duplicate rows (verified at validation: 2 transactions inserted via 4 POSTs, 2 of which were duplicates). The bug is response-code mapping only.
+
+**Affected handlers:**
+- `handleExpense` (chiefos-site/app/api/log/route.ts) — uses ON CONFLICT.
+- `handleRevenue` — same pattern.
+- `handleHours`, `handleTask`, `handleReminder` use SELECT-then-INSERT manual dedup and DO return 200 with the IDEMPOTENCY_CONFLICT code (different status than spec — they return 200 not 409, also a small bug per the spec).
+
+**Fix:**
+```ts
+// Replace the bare INSERT pattern with:
+const { data: insertedRow, error } = await admin
+  .from("transactions")
+  .insert(row)
+  .select("id")
+  .maybeSingle();
+
+if (error) { /* existing error handling */ }
+
+if (!insertedRow) {
+  // ON CONFLICT DO NOTHING fired — row already exists. Look up original.
+  const { data: existing } = await admin
+    .from("transactions")
+    .select("id")
+    .eq("owner_id", ctx.ownerId)
+    .eq("source_msg_id", sourceMsgId)
+    .eq("kind", "expense")
+    .maybeSingle();
+  return jsonErr(409, "IDEMPOTENCY_CONFLICT",
+    "Duplicate entry detected.",
+    `This entry was already logged today; original id: ${existing?.id}.`,
+    traceId, { existing_id: existing?.id });
+}
+```
+
+Also: the SELECT-then-INSERT dedup paths (hours/task/reminder) should return 409 instead of 200 for the same consistency reason.
+
+**Sized:** ~30 min to fix all 5 handlers + retest. Single small follow-up commit.
+
+**Bundle posture:** independent small PR or appended to the cleanup PR before merge. Not blocking — dedup works correctly at the DB layer; only the response code is wrong, and the FE catches the absence of `data.id` either way for re-render logic.
+
+---
+
+### P1B-jobs-fe-stale-schema-references
+
+**Source:** Surfaced 2026-04-28 during /api/log preview testing (P1 punchlist item #7). **11th instance** of the stale-schema-reference pattern caught today.
+
+**Symptom:** Both `/app/jobs` (list) and `/app/jobs/[jobId]` (detail) pages 400 against PostgREST. Network log:
+
+```
+GET /rest/v1/jobs?select=id,job_no,job_name,name,status,active,start_date,end_date,
+                          created_at,material_budget_cents,labour_hours_budget,
+                          contract_value_cents
+                  &id=eq.6&deleted_at=is.null
+→ 400 Bad Request
+```
+
+**Drift:** the SELECT requests two columns that don't exist post-rebuild:
+- `job_name` — DROPPED; current schema has `name` only.
+- `active` — DROPPED; current schema uses `status` enum (`active` / `paused` / `done` / `archived` or similar).
+
+**Affected files (likely):**
+- `chiefos-site/app/app/jobs/page.tsx` (list view)
+- `chiefos-site/app/app/jobs/[jobId]/page.tsx` (detail view)
+
+There may be additional call sites (job pickers, dashboards, etc.) that grep for `.from("jobs").select(...job_name|active)`.
+
+**Fix:** rewrite the SELECT clause to use post-rebuild canonical columns:
+- Remove `job_name` from select; references to `job.job_name` in the FE pivot to `job.name`.
+- Remove `active` from select; references pivot to `job.status === 'active'`.
+
+**Caller verification before fix:** grep all chiefos-site files for `.from("jobs")` and audit each SELECT against current `public.jobs` schema. Same audit pattern as the comprehensive-working-tree-audit methodology.
+
+**Sized:** 1-2 hours (refactor 1-2 SELECT statements + audit other potential call sites + retest).
+
+**Bundle posture:** independent small PR, not bundled with /api/log or the cleanup PR. Ships before Beta launch.
+
+**Cross-reference:** Surfaced via /api/log preview testing — couldn't reach the entry forms because the parent page 400'd loading job data. The /api/log route itself is functional independent of this bug; the bug just blocks the human-friendly test path. Console-fetch testing bypasses it.
+
+---
+
+### P1B-source-msg-id-unique-on-task-time-reminder
+
+**Source:** Surfaced 2026-04-28 during /api/log rewrite pre-write schema verification (P1 punchlist item #7).
+
+**Finding:** Only `public.transactions` has a `source_msg_id`-based UNIQUE constraint (`transactions_owner_msg_kind_unique UNIQUE (owner_id, source_msg_id, kind) DEFERRABLE`). `public.tasks`, `public.time_entries_v2`, and `public.reminders` lack equivalent constraints despite all four being targets of idempotent ingestion paths (WhatsApp + portal + email).
+
+**Current workaround:** /api/log handlers for tasks/time/reminders use SELECT-then-INSERT manual dedup (filter by `tenant_id` + `source_msg_id`, skip INSERT if row found). Functional but race-prone under concurrent writes (theoretically — portal-direct entries are user-initiated so concurrency risk is low).
+
+**Resolution:** P1A-N amendment migration adding `UNIQUE (owner_id, source_msg_id)` (or `(tenant_id, source_msg_id)`) to:
+- `tasks`
+- `time_entries_v2`
+- `reminders`
+
+Standardize the idempotency arbiter so all four ingestion targets use the same `INSERT ... ON CONFLICT (owner_id, source_msg_id, ...) DO NOTHING` pattern.
+
+**Sized:** 1-2 hours (single migration + rollback + manifest entry + handler simplification).
+
+**Bundle posture:** belongs in the `P1B-comprehensive-rls-grant-check-unique-audit` consolidation (4th bug class: missing UNIQUE for ON CONFLICT), not a standalone PR. File pre-Beta.
+
+---
+
+### P1B-submission-status-vocabulary-normalization
+
+**Source:** Surfaced 2026-04-28 during /api/log rewrite pre-write schema verification (P1 punchlist item #7).
+
+**Finding:** `submission_status` enum vocabulary diverges across canonical financial/work tables:
+
+| Table | Allowed values |
+|---|---|
+| `transactions` | `confirmed`, `pending_review`, `voided` |
+| `tasks` | `approved`, `pending_review`, `needs_clarification`, `rejected` |
+| `time_entries_v2` | `approved`, `pending_review`, `needs_clarification`, `rejected` |
+
+The `confirmed` (transactions) vs `approved` (tasks/time) divergence is **the same drift class** as the `accepted_via='signup'` channel/lifecycle confusion that surfaced during Path α (resolved by mapping to `'portal'` channel). Two non-equivalent vocabularies for "owner has approved this entry" creates application-layer branching that's easy to mis-handle.
+
+**Current state:** /api/log uses `approvedFor(table, role)` helper that returns the right per-table string. Functional but documents the divergence as a known footgun.
+
+**Resolution options:**
+
+1. **(a) Normalize to `approved`** across all three tables. Migrate transactions: `UPDATE transactions SET submission_status='approved' WHERE submission_status='confirmed'`; ALTER TABLE adjust CHECK constraint. Backfill is a one-time UPDATE; CHECK rewrite is straightforward.
+2. **(b) Normalize to `confirmed`** across all three. Rename approved→confirmed on tasks + time_entries_v2.
+3. **(c) Document the divergence as deliberate** (transactions has special `voided` state for reverse-revenue scenarios that doesn't fit the workflow-status semantic). Keep helper function as the abstraction layer.
+
+**Recommendation:** Option (a) or (c). Vocabulary normalization is correct architecturally but requires careful caller-grep + integrity-chain consideration (transactions has `submission_status` in `hash_input_snapshot` — changing the value rewrites the hash unless we filter it out of the snapshot).
+
+**Sized:** 2-4 hours including caller audit + integrity-chain review + migration + rollback.
+
+**Bundle posture:** belongs in the `P1B-comprehensive-rls-grant-check-unique-audit` consolidation (4th bug class: CHECK constraint values vs application code writes). File pre-Beta.
+
+---
+
+### P1B-beta-delta-appendix-quote-spine-cleanup
+
+**Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). Comment in `cil.js` dates the work to 2026-04-18: *"CreateQuote schema was removed 2026-04-18 as part of the Quotes spine rebuild (Beta Delta Appendix)."*
+
+**Scope:** removes pre-rebuild legacy Quote-spine code that's been latent post-cutover (writes to dropped `public.quotes` table; uses removed helpers).
+
+**Files (all in chief-ai-refactored, working tree):**
+- `cil.js` (+4/-7) — removes legacy `createQuoteSchema` block; replaces with cross-reference comment to `src/cil/quotes.js` (the new spine).
+- `domain/quote.js` (+13/-44) — guts legacy `createQuote(cil, ctx)` (drops uuidv4, ensureNotDuplicate, insertOneReturning).
+- `domain/agreement.js` (+9/-11) — replaces `public.quotes` existence check with fail-loud error (table dropped in rebuild).
+- `handlers/commands/quote.js` (+1/-22) — removes legacy `pg.createQuoteRecord` + catalog-line-items writes.
+
+**Resolution:** caller-grep + commit. Pattern matches the R3b/R4 cleanup PRs. Caller-grep target: `pg.createQuoteRecord`, `domain/quote.createQuote`, any reference to `public.quotes` table writes. If zero callers, ship as small commit/PR.
+
+**Sized:** 1-2 hours (caller verify + 4-file commit + small focused PR).
+
+**Cross-reference:** comment in cil.js cites `docs/QUOTES_SPINE_DECISIONS.md` §1–§2 as authoritative for the rebuild rationale.
+
+---
+
+### P1B-r4c-migrate-actor-memory-conversation-sessions
+
+**Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). Comments in working-tree diffs explicitly say *"R4c-migrate: read active session's active_entities..."* and *"R4c-migrate: build actor context once for conversation_sessions writes."*
+
+**This is the 9th instance** of the uncommitted-but-claimed-shipped pattern caught today. The session-reports audit identified `R4c-investigate` as investigation-only (0 files modified), but R4c-migrate is a follow-up workstream that authored these files and never committed. Quarantined-zone status in `CLAUDE.md` ("Actor-memory cluster pending R4c") is consistent with R4c-migrate being the resolution.
+
+**Files (all in chief-ai-refactored, working tree):**
+- `services/agent/index.js` (~360 lines changed) — adds `conversationState` requires (`getSessionStateSafe`, `patchSessionStateSafe`, `appendMessageSafe`, `getRecentMessagesSafe`); replaces `actorMemory` lookup against DISCARDed `chief_actor_memory`.
+- `services/answerChief.js` (+18/-18) — replaces `pg.getActorMemory` with `getSessionStateSafe` (R4c-migrate explicit comment).
+- `services/orchestrator.js` (+25) — adds `patchSessionStateSafe` require; builds `actorCtx` for conversation_sessions writes.
+- `routes/askChief.js` (+2) — adds `tenantId` + `traceId` to `runAgent({...})` call (caller-side update).
+- `handlers/commands/index.js` (+2) — adds `tenantId` + `traceId` to `ask({...})` call (caller-side update).
+
+**Production-impact:** Same R2.5-class pattern. Live actor-memory reads/writes hit the DISCARDed `chief_actor_memory` table → silent failure paths (try/catch returns `{}` on error). Latent-broken since cutover.
+
+**Resolution:** schema-drift verify (confirm `services/conversationState` module exists at expected path; confirm `conversation_sessions` table shape matches; confirm `active_entities jsonb` column accepts the session-state shape) + commit + small focused PR. Mirror of R3b/R4 cleanup pattern.
+
+**Sized:** 2-4 hours (verify + commit + retest authenticated client load).
+
+---
+
+### P1B-email-ingest-defensive-fixes
+
+**Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). Defensive collateral, not session-tagged — likely from someone debugging email ingestion locally and never committing.
+
+**Files (chief-ai-refactored, working tree):**
+- `api/inbound/email.js` (+9) — early dedup query against `email_ingest_events` to prevent duplicate WhatsApp notifications on Postmark retries.
+- `services/emailIngest.js` (+7/-1) — wraps `pdf-parse` require in try/catch so absent module doesn't crash module load (env-portability fix).
+
+**Verdict:** Both are pure defense-in-depth additions, low-risk. Could commit immediately or defer.
+
+**Sized:** 30 min (review diff substance + commit + small focused PR).
+
+---
+
+### P1B-claude-md-discipline-doc-rewrite
+
+**Source:** Surfaced 2026-04-28 during working-tree characterization (post-cutover-stale-work-cleanup PR). **This is the 10th instance** of the uncommitted-but-claimed-shipped pattern caught today.
+
+**Substance of the rewrite (all in `CLAUDE.md`, working tree):**
+
+NEW sections added:
+- **Identity-column cross-reference** — points at `FOUNDATION_CURRENT.md` for specific column documentation (e.g., `users.auth_user_id` reverse pointer).
+- **Session reports section** — rules: *write directly to `docs/_archive/sessions/SESSION_<NAME>.md`*, 30-50 line max, 1-line bullets, architectural decisions go in decisions-log, schema rationale goes in migration file comment.
+- **Manifest discipline** — *replacement, not narrative append*; resolved forward-flags removed, not crossed out; session history lives in `docs/_archive/sessions/`.
+- **Handoff discipline** — phase-arc handoffs are rewritten state-reflection per session; latest replaces prior; prior moves to `docs/_archive/handoffs/`.
+- **Documentation lifecycle** — explicit aging-out posture per artifact type (migrations + decisions-log + ceremony archives persist; manifest + handoffs + FOUNDATION_CURRENT.md rewrite-replacement; mid-session checkpoints deleted at arc close; session reports written directly, never auto-loaded).
+
+Intentional consolidations:
+- "Active Execution Plan" section removed (replaced by Context Budget cross-reference).
+- "Identity Addendum (P1A-4)" details removed; replaced by cross-reference to `FOUNDATION_CURRENT.md` at top of file.
+- Canonical Helpers list compressed; specific file paths moved to a planned `REBUILD_CANONICAL_HELPERS.md` (separate file, not yet authored).
+
+Reference Docs list updates:
+- Adds `QUOTES_SPINE_CEREMONIES.md` to the speculatively-skip list.
+- Refines load conditions for several entries.
+
+Introspection Discipline language updated to reference R-session findings ("F2/F3, B1/B2, amendment-column-shape drift") rather than the prior single example.
+
+**Note:** the SQL `<TABLE>` placeholder fix was extracted as a tiny surgical commit on the cleanup-PR branch (commit `f5caed11`). The rewrite content here stays in working tree with the surgical fix preserved (no re-revert).
+
+**Resolution:** review the rewrite content, ensure `REBUILD_CANONICAL_HELPERS.md` is authored before merge (it's referenced but not yet created), commit + small focused PR.
+
+**Sized:** 1-2 hours (review + author REBUILD_CANONICAL_HELPERS.md + commit + small PR).
+
+---
+
+### P1B-comprehensive-working-tree-audit
+
+**Source:** Meta-finding, 2026-04-28. Today's session-reports audit caught 6 of 10 uncommitted-but-claimed-shipped instances. The other 4 surfaced via adjacent-work discovery:
+- R2.5 chiefos-site (caught via Path α step-6 production bug investigation)
+- chief-ai-refactored identity rewrites (caught via link-phone/start 504 diagnosis)
+- schema-drift-check script (caught during R1 prep when package.json scope-split surfaced new entries)
+- R4c-migrate, email-ingest, CLAUDE.md (caught during working-tree characterization for the cleanup PR push)
+
+**Pattern indicates session-reports audit alone is insufficient.** Working-tree characterization catches everything the session-reports audit misses, but is more labor-intensive.
+
+**Recommended methodology:**
+
+1. **Run `git diff HEAD` across all repos** (chief-ai-refactored, chiefos-site, any others). Each modified file gets a diff-substance summary.
+2. **Run `git status -s` across all repos.** Untracked files get classified: belongs to known workstream, P2 deferred docs, or unknown.
+3. **Characterize every modified/untracked file by origin** — author intent, session source, defer/commit/discard.
+4. **Cross-reference against documented-as-shipped work** — manifests, session reports, FOUNDATION_CURRENT.md, decisions logs.
+5. **Surface findings as candidates** — commit/discard/tracker per file.
+6. **Grep all chiefos-site `supabase.from()` and `supabase.rpc()` call sites** and cross-reference each table/RPC name + each SELECTed column against current `public.*` schema. Catches the structural bug class that surfaced with `chiefos_link_codes` (P1B-r2.5 fix), `chiefos_user_identities` (chief-ai-refactored R-rewrites fix), and now `jobs.job_name`/`jobs.active` (`P1B-jobs-fe-stale-schema-references`). All three are the same class: FE direct-PostgREST call → schema drift → 400/404 at runtime.
+
+**Sized:** half-day focused work.
+
+**When to run:**
+- Pre-Beta launch (catches latent broken code before user traffic exposes it).
+- Pre-merge for any major release (PR review surface verification).
+- Quarterly thereafter as a standing hygiene discipline.
+
+**Cross-reference:** today's audit-PR cycle established the pattern; this tracker formalizes it as a repeatable process.
+
+---
+
+### P1B-schema-drift-check-script-commit
+
+**Source:** Surfaced 2026-04-28 during R1 commit prep (post-cutover-stale-work-cleanup PR). The `drift_detection_script` work is documented as **shipped** in `REBUILD_MIGRATION_MANIFEST.md` apply-order entry (between `2026_04_25_chiefos_quote_versions_source_msg_id` and `2026_04_21_drop_unsafe_signup_test_user_function`), but the actual files are uncommitted:
+
+- `scripts/schema_drift_check.js` — **untracked** (working tree only).
+- `package.json` 3 script entries (`schema:drift-check`, `schema:drift-check:verbose`, `schema:drift-check:baseline`) — **uncommitted** (working-tree modification).
+
+This is the **8th occurrence** of the uncommitted-but-claimed-shipped pattern (after R2.5, identity rewrites, R4, R3b, R4b, Phase A 5 partial, R1 partial). Surfaced during R1 prep rather than the session-reports audit because the manifest documents this work in apply-order discipline (not in a session report).
+
+**Current state:** R1 commit deliberately left the schema-drift-check additions OUT of scope (they're additions, not deletions; mixing them into R1's dead-code-removal commit would muddle the discipline). Untracked + uncommitted state preserved for separate ship.
+
+**Resolution:** separate commit on a separate branch, separate PR. Not bundled with `post-cutover-stale-work-cleanup` PR.
+
+- Branch suggestion: `schema-drift-check-script-commit`
+- Files: `scripts/schema_drift_check.js` (commit) + `package.json` (3 script-entry additions)
+- Sized: small (single commit, no schema impact, no DB changes).
+
+**Priority:** should ship before Beta launch — the script is the canonical pre-merge schema-drift gate documented in the manifest. Not strictly blocking the cleanup PR or trial migration.
+
+---
+
+### P1B-phase-a-5-reissuequote-deferred
+
+**Source:** Phase A Session 5 ReissueQuote handler (`src/cil/quotes.js` +716, `src/cil/quotes.test.js` +599 with 16 unit + 9 integration tests, `src/cil/router.js` registration uncomment, ceremony scripts) — work authored but NOT committed in the post-cutover-stale-work-cleanup PR (2026-04-28) because integration tests fail.
+
+**Migration is already shipped:** `2026_04_25_chiefos_quote_versions_source_msg_id.sql` is in production via commit `971ca0ea` (per audit). Schema side is clean. Only application-layer wire-up remains.
+
+**Test failure root cause:** `seedThrowawayUser` in `src/cil/quotes.test.helpers.js:32` 42501s on `users_pkey` UNIQUE collision. Helper generates per-call random `99XXXXXXXXXXX` ids, so the collision is most likely either (a) a deterministic `ownerId` passed by a caller in `setupQuotePreconditions` (line 108), or (b) stale DB rows from prior unconfigured-cleanup runs. **Not a schema-drift issue, not a regression in Phase A 5 handler code** — all 16 ReissueQuote unit tests pass; only the 9 integration tests cascade-fail starting from the first fixture-bootstrap failure.
+
+**Three options for resolution:**
+
+1. **(a) Fix the test helper** — change `setupQuotePreconditions` to always pass a fresh `ownerId`, OR add `DELETE FROM users WHERE user_id = $1` before each test's INSERT, OR wrap the INSERT in `ON CONFLICT (user_id) DO NOTHING`. Sized: 30-60 min.
+2. **(b) Reset local test DB state** — verify the test runs against a clean fixture state. Sized: depends on test harness setup.
+3. **(c) Skip integration tests temporarily** — `xdescribe` the ReissueQuote integration block, ship the handler + unit tests, file integration tests as separate follow-up. Sized: 5 min change but loses the BLOCKING regression locks the integration tests are designed to enforce.
+
+**Currently no live caller of ReissueQuote.** The CIL ingestion path doesn't emit `ReissueQuote` actions until a portal/WhatsApp UI surface generates them. Migration shipped + handler uncommitted = the action would route to nowhere if emitted today, but nothing is emitting.
+
+**Urgency:** not urgent — no live emission. But Phase A is documented as closed in production, and ReissueQuote is named in the closure surface; failing to wire the handler eventually surfaces as "ReissueQuote returns CIL_ACTION_UNKNOWN" the first time a quote-edit flow tries it.
+
+**Decision needed before:** any UI work that would emit `ReissueQuote` CIL actions.
+
+---
+
+### P1B-user-memory-kv-rebuild-target-decision
+
+**Source:** `services/memory.js` header comment (committed in R4 cleanup, SHA `f58f6a33`).
+
+The pre-rebuild target tables for per-user persistent KV (`assistant_events`, `user_memory`, `convo_state`, `entity_summary`) were DISCARDed by the rebuild. `services/memory.js` is now a no-op shim — module exports preserved so `require('../services/memory')` doesn't throw, but every function returns benign defaults.
+
+**Three options for resolution:**
+
+1. **(a) Phase 1 amendment table** — author `chiefos_user_memory` or similar, with RLS policies + service_role grants + integration with conversation flow. Sized: 3-5 days.
+2. **(b) Repurpose `conversation_sessions.active_entities`** for KV-like semantics. The column already exists; cardinality may not match (session-scoped, not long-lived). Sized: 1-2 days.
+3. **(c) Drop the user-memory feature entirely** — accept that Chief doesn't carry context across sessions; document as design choice. Sized: zero work.
+
+**Currently no live caller.** Only `nlp/conversation.js` imports the shim, and its exported `converseAndRoute` has zero call sites in live code (per R4's V4 grep).
+
+**Urgency:** not urgent today; deferred indefinitely is also not great. At some point Chief's lack of cross-session memory becomes a UX issue, especially for power users (vendor aliases, default expense bucket recall, etc.).
+
+**Decision needed before:** any feature work that wants to surface "Chief remembers X about you across conversations."
+
+---
+
+
 
 - **Admin role build** — `chiefos_portal_users.role` enum is `{owner, board_member, employee}`. No `admin` value. When admin tier is needed post-Beta, add a P1A-7-style amendment migration extending the role enum + adding any needed `chiefos_role_audit.action` value (`admin_grant`/`admin_revoke`).
 - **GitGuardian secret leaks (3)** — founder is identifying secrets in parallel to cutover. Track resolution separately.

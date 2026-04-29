@@ -7,6 +7,10 @@
 // Lunch reminders  → "🥪 Heads up — have you taken a lunch break yet?"
 //
 // Call startReminderDispatch() once at app boot (non-Vercel only).
+//
+// Rebuild schema (R4): markReminderSent now requires { tenantId, ownerId }
+// per Engineering Constitution §3 (no `WHERE id = $1` alone). The row
+// returned by getDueReminders / getDueLunchReminders carries both.
 // ---------------------------------------------------------
 
 const POLL_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -22,7 +26,6 @@ const {
   getDueReminders,
   getDueLunchReminders,
   markReminderSent,
-  cancelReminder,
 } = require('../services/reminders');
 
 function toWaNumber(userId) {
@@ -30,6 +33,10 @@ function toWaNumber(userId) {
   const digits = String(userId || '').replace(/\D/g, '');
   if (!digits) return null;
   return `whatsapp:+${digits}`;
+}
+
+function rowBoundary(row) {
+  return { tenantId: row.tenant_id, ownerId: row.owner_id };
 }
 
 async function dispatchTaskReminders() {
@@ -45,7 +52,7 @@ async function dispatchTaskReminders() {
     const to = toWaNumber(row.user_id);
     if (!to) {
       console.warn('[REMINDER_DISPATCH] Skipping task reminder — no valid user_id:', row.id);
-      await markReminderSent(row.id).catch(() => {});
+      await markReminderSent(row.id, rowBoundary(row)).catch(() => {});
       continue;
     }
 
@@ -59,7 +66,7 @@ async function dispatchTaskReminders() {
       } else {
         console.log('[REMINDER_DISPATCH] (no Twilio) would send to', to, ':', body);
       }
-      await markReminderSent(row.id);
+      await markReminderSent(row.id, rowBoundary(row));
       console.info('[REMINDER_DISPATCH] Task reminder sent:', { id: row.id, to, task_no: row.task_no });
     } catch (e) {
       console.error('[REMINDER_DISPATCH] Failed to send task reminder:', row.id, e?.message);
@@ -81,7 +88,7 @@ async function dispatchLunchReminders() {
     const to = toWaNumber(row.user_id);
     if (!to) {
       console.warn('[REMINDER_DISPATCH] Skipping lunch reminder — no valid user_id:', row.id);
-      await markReminderSent(row.id).catch(() => {});
+      await markReminderSent(row.id, rowBoundary(row)).catch(() => {});
       continue;
     }
 
@@ -93,7 +100,7 @@ async function dispatchLunchReminders() {
       } else {
         console.log('[REMINDER_DISPATCH] (no Twilio) would send to', to, ':', body);
       }
-      await markReminderSent(row.id);
+      await markReminderSent(row.id, rowBoundary(row));
       console.info('[REMINDER_DISPATCH] Lunch reminder sent:', { id: row.id, to });
     } catch (e) {
       console.error('[REMINDER_DISPATCH] Failed to send lunch reminder:', row.id, e?.message);

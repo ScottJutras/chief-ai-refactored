@@ -22,13 +22,13 @@ Every query MUST include a tenant boundary key appropriate to the surface:
 
 ```sql
 -- Portal queries: use tenant_id
-SELECT ... FROM <table> WHERE tenant_id = $1 AND ...;
+SELECT ... FROM <TABLE> WHERE tenant_id = $1 AND ...;
 
--- Ingestion/backend queries: use owner_id  
-SELECT ... FROM <table> WHERE owner_id = $1 AND ...;
+-- Ingestion/backend queries: use owner_id
+SELECT ... FROM <TABLE> WHERE owner_id = $1 AND ...;
 
 -- Updates/deletes: NEVER by UUID alone
-UPDATE <table> SET ... WHERE owner_id = $1 AND id = $2;
+UPDATE <TABLE> SET ... WHERE owner_id = $1 AND id = $2;
 ```
 
 **FORBIDDEN:** `WHERE id = $1` alone. `WHERE user_id = $1` alone. Queries without tenant boundary. Cross-tenant joins. Implicit ownership inference.

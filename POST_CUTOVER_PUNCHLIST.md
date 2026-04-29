@@ -187,6 +187,50 @@ Items deferred from the Phase 5 cutover session (2026-04-26 / 2026-04-27). All n
 
 ## P1B — Post-cutover audit trackers (from 2026-04-28 audit cycle)
 
+### P1B-timecalc-test-fixture-update
+
+**Source:** Surfaced 2026-04-28 during Phase 1 stage-gate Gate 1 (MVP regression). `__tests__/timecalc.test.js` failed: `computeShiftCalc` returns `paidMinutes: 0` and `unpaidLunch: 0` for every input despite valid `segments` array + `policy` object.
+
+**Diagnosis:** pre-existing test debt, NOT today's regression. `git log 8f44ea90..HEAD -- __tests__/timecalc.test.js services/timecalc.js` returns zero commits since cutover sentinel. Last touched at commit `1711a5ae` (pre-cutover).
+
+**Symptom:** `expect(r.paidMinutes).toBe(480)` → received `0`. Function appears to short-circuit or return a default-zeroed result.
+
+**Sized:** 1-2 hours (find the bug in `services/timecalc.js`, fix, re-run test). Not blocking.
+
+**Bundle posture:** standalone small PR. Pre-Beta.
+
+---
+
+### P1B-tmts-spec-commit-to-repo
+
+**Source:** Surfaced 2026-04-28 at session close. Trial Migration Technical Spec v1.0 references §3 stage gates, §4.1 schema columns, §4.2 plan_key CHECK update, §13 rollback, §14 phase ordering. Spec lives outside the repo (likely in chat history / founder's working notes only).
+
+**Resolution:** commit the spec to `docs/TRIAL_MIGRATION_TECHNICAL_SPEC.md` so future Phase 1/2/3 work has it available without chat-paste dependency. Pattern matches the FOUNDATION + decisions-log durability discipline.
+
+**Sized:** docs-only PR; ~5 minutes once the spec text is in hand.
+
+**Sequencing:** should land before Phase 1 schema migrations tomorrow (so the migrations cite the committed spec) OR alongside the migration PR (single PR with both the spec doc + the migrations). Either order works.
+
+**Cross-reference:** Phase 1 schema migration (TMTS §4.1 + §4.2) is queued for tomorrow; spec must be committed or pasted before authoring.
+
+---
+
+### P1B-jest-worktree-exclusion
+
+**Source:** Surfaced 2026-04-28 during Gate 1 (MVP regression). Jest scans `.claude/worktrees/*` directories and re-runs every test there as a duplicate suite, inflating failure counts 4×.
+
+**Fix:** add to `jest.config.js`:
+
+```js
+testPathIgnorePatterns: ['/node_modules/', '/.next/', '/.claude/worktrees/'],
+```
+
+**Sized:** 5 minutes. Tiny change, big quality-of-life improvement for future test runs.
+
+**Bundle posture:** trivial commit. Could ship with the next docs/test-debt PR.
+
+---
+
 ### P1B-api-log-idempotency-conflict-response-code
 
 **Source:** Surfaced 2026-04-28 during /api/log preview testing (P1 punchlist item #7). Final happy-path + error-path validation found this nuance.

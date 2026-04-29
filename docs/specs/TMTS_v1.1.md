@@ -24,6 +24,8 @@
 
 **Amendment 2026-04-29 (in-place; no version bump):** §5.1, §6, §16.2 phone storage location corrected from `public.users.phone_number` to `public.chiefos_tenants.phone_e164`. Reason discovered during Phase 0 audit: `public.users` is multi-actor-per-owner (the rebuilt schema stores N user rows per owner), so phone correctly belongs on the 1:1 tenant record. Column renamed `phone_number` → `phone_e164` for format-explicitness. Partial `UNIQUE INDEX ... WHERE phone_e164 IS NOT NULL` named explicitly as the structural anti-abuse mechanism per §16.2 intent. Implementation: migration `2026_04_29_phase0_p1_phone_e164_on_chiefos_tenants.sql` + RPC amendment `2026_04_29_amendment_p1a13_chiefos_finish_signup_rpc_phone_e164.sql`.
 
+**Amendment 2026-04-29 (Phase 0 p2+p3):** §4.1 audit list clarified — `paid_breaks_policy` is binary enum (`paid`|`unpaid`) per implementation, default `'unpaid'`, lives on `chiefos_tenants`. `tax_region` added as GENERATED column from `country || '-' || province` on `chiefos_tenants`; `tax_code` retained as distinct tax-math regime (`HST_ON`, `GST_ONLY`, etc.). Dead `region` column dropped. Implementation: migration `2026_04_29_phase0_p2_p3_chiefos_tenants_paid_breaks_and_tax_region.sql`.
+
 ---
 
 ## 1. Purpose
@@ -112,8 +114,8 @@ For each of the following business-state fields, identify every location where i
 
 - `business_name` — the contractor's company name
 - `timezone` — IANA timezone string (e.g., "America/Toronto")
-- `tax_region` — country/province code for tax handling (e.g., "CA-ON" for Ontario, Canada)
-- `paid_breaks_policy` — boolean or enum for whether breaks are paid time
+- `tax_region` — country/province code for tax handling (e.g., "CA-ON" for Ontario, Canada). Implementation: GENERATED column on `chiefos_tenants` from `country || '-' || province`. Distinct from `tax_code` (tax-math regime, e.g., `HST_ON`). Both columns retained.
+- `paid_breaks_policy` — TEXT enum on `chiefos_tenants` with CHECK (`'paid'` | `'unpaid'`). Default `'unpaid'`. Set during onboarding wizard per §14.2. Distinct from `auto_lunch_deduct_minutes`.
 - `phone_number` — owner's primary phone (canonical for owner_id derivation)
 - `email` — owner's primary email (canonical for portal auth and Stripe)
 

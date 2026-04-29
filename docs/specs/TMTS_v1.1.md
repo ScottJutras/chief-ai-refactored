@@ -22,6 +22,8 @@
 - Added WhatsApp template library specification
 - Removed all migration sections (no existing users)
 
+**Amendment 2026-04-29 (in-place; no version bump):** §5.1, §6, §16.2 phone storage location corrected from `public.users.phone_number` to `public.chiefos_tenants.phone_e164`. Reason discovered during Phase 0 audit: `public.users` is multi-actor-per-owner (the rebuilt schema stores N user rows per owner), so phone correctly belongs on the 1:1 tenant record. Column renamed `phone_number` → `phone_e164` for format-explicitness. Partial `UNIQUE INDEX ... WHERE phone_e164 IS NOT NULL` named explicitly as the structural anti-abuse mechanism per §16.2 intent. Implementation: migration `2026_04_29_phase0_p1_phone_e164_on_chiefos_tenants.sql` + RPC amendment `2026_04_29_amendment_p1a13_chiefos_finish_signup_rpc_phone_e164.sql`.
+
 ---
 
 ## 1. Purpose
@@ -200,7 +202,9 @@ CREATE INDEX IF NOT EXISTS idx_users_trial_ends_at ON public.users(trial_ends_at
   WHERE lifecycle_state = 'trial';
 CREATE INDEX IF NOT EXISTS idx_users_read_only_ends_at ON public.users(read_only_ends_at)
   WHERE lifecycle_state = 'read_only';
-CREATE INDEX IF NOT EXISTS idx_users_phone_number ON public.users(phone_number);
+-- Phone storage moved to chiefos_tenants.phone_e164 per Amendment 2026-04-29.
+-- Migration: 2026_04_29_phase0_p1_phone_e164_on_chiefos_tenants.sql
+-- (Adds phone_e164 column + E.164 format CHECK + partial UNIQUE INDEX.)
 
 COMMIT;
 ```
@@ -467,12 +471,22 @@ async function createPreTrialAccount(input: {
     return { user_id: existing.id, owner_id };
   }
 
+  // Per Amendment 2026-04-29: phone_e164 is persisted to chiefos_tenants
+  // (1:1 with business), not public.users. The tenant row is created first;
+  // the public.users row links to the tenant via tenant_id.
+  const tenant = await db.chiefos_tenants.insert({
+    owner_id,
+    phone_e164: input.phone_number,  // E.164 normalized at form-submit
+    name: input.business_name,
+    // ... other tenant fields
+  });
+
   const user = await db.users.insert({
     owner_id,
-    phone_number: input.phone_number,
+    user_id: owner_id,  // owner-self row
+    tenant_id: tenant.id,
     email: input.email,
-    business_name: input.business_name,
-    owner_name: input.owner_name,
+    name: input.owner_name,
     lifecycle_state: 'pre_trial',
     plan_key: 'trial',  // Plan key is 'trial' even in pre_trial state for capability purposes
     // trial_started_at intentionally NULL — clock has not started yet
@@ -1316,6 +1330,8 @@ Contractor enters one phone number on the form but messages Chief from a differe
 Same phone number, same email, two form submissions.
 
 **Resolution:** Per Section 7.2, idempotent account creation. Second submission returns the existing account, does not create a duplicate.
+
+**Structural anti-abuse enforcement (Amendment 2026-04-29):** The application-layer idempotency above is backed by a database-level partial UNIQUE INDEX on `chiefos_tenants.phone_e164` WHERE `phone_e164 IS NOT NULL`. Even if `createPreTrialAccount`'s idempotency check is bypassed by a bug or race, a second tenant insertion with the same phone raises `unique_violation`, which the signup RPC re-raises as `OWNER_PHONE_ALREADY_CLAIMED`. Defense-in-depth: same phone cannot create two tenants at the database level.
 
 ### 16.3 Both triggers fire simultaneously
 

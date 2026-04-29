@@ -489,6 +489,7 @@ try {
           remindAt.setTime(remindAt.getTime() - 60 * 60 * 1000); // 1h before
           if (remindAt <= new Date()) remindAt = new Date(task.due_at); // already past → remind at due time
           await createReminder({
+            tenantId: res?.req?.tenantId,
             ownerId,
             userId: paUserId,
             taskNo: task.task_no,
@@ -496,6 +497,7 @@ try {
             remindAt,
             kind: 'task',
             sourceMsgId: safeMsgId ? `remind:${safeMsgId}` : null,
+            correlationId: res?.req?.correlationId,
           });
         } catch (e) {
           console.warn('[REMINDERS] createReminder failed (ignored):', e?.message);

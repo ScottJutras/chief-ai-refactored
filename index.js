@@ -94,7 +94,6 @@ const cors = require("cors");
 const stripeRouter = require("./routes/stripe");
 const webhookRouter = require("./routes/webhook");
 const parseRouter = require("./routes/parse");
-const dashboardRouter = require("./routes/dashboard");
 const askChiefRouter       = require("./routes/askChief");
 const askChiefStreamRouter = require("./routes/askChiefStream");
 const chiefQuotaRouter     = require("./routes/chiefQuota");
@@ -183,7 +182,8 @@ app.use(receiptsRouter);
 app.use("/api", portalRouter);
 app.use(jobsPortalRouter);
 // ✅ Crew+Control (Pro-gated) — portal-auth required
-app.use("/api/crew", requirePortalUser(), require("./routes/crewControl"));
+// R3b: routes/crewControl.js deleted (dead surface — zero portal callers).
+// All crew review now in routes/crewReview.js.
 app.use("/api/crew", crewAdminRouter);
 app.use("/api/crew", requirePortalUser(), require("./routes/crewReview"));
 // Public invite-claim (no portal membership required)
@@ -207,9 +207,8 @@ app.use(chiefQuotaRouter);
 app.use("/api/parse", parseRouter);
 
 
-// Account + Dashboard
+// Account
 app.use("/api/account", accountRouter);
-app.use("/api/dashboard", dashboardRouter);
 
 // Alerts (portal auth applied inside router)
 app.use("/api/alerts", alertsRouter);

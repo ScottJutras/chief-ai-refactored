@@ -97,7 +97,7 @@ async function pgSearch(ownerId, embedding, k = 8) {
         where c.owner_id = $1
         order by c.embedding <=> $2::vector
         limit $3`,
-      [ownerId || 'GLOBAL', vec, limit]
+      [ownerId, vec, limit]
     );
 
     return (rows || []).map((r) => ({
@@ -112,7 +112,12 @@ async function pgSearch(ownerId, embedding, k = 8) {
   }
 }
 
-async function searchRag({ ownerId = 'GLOBAL', query, k = 8 }) {
+async function searchRag({ ownerId, query, k = 8 }) {
+  if (!ownerId || typeof ownerId !== 'string') {
+    const err = new Error('searchRag: ownerId is required (fail-closed per North Star §14)');
+    err.code = 'TENANT_BOUNDARY_MISSING';
+    throw err;
+  }
   initOnce();
   if (!query || typeof query !== 'string') return [];
 
@@ -124,7 +129,12 @@ async function searchRag({ ownerId = 'GLOBAL', query, k = 8 }) {
 }
 
 // ---------- Agent-facing string answer ----------
-async function answer({ from, query, hints = [], ownerId = 'GLOBAL' } = {}) {
+async function answer({ from, query, hints = [], ownerId } = {}) {
+  if (!ownerId || typeof ownerId !== 'string') {
+    const err = new Error('answer: ownerId is required (fail-closed per North Star §14)');
+    err.code = 'TENANT_BOUNDARY_MISSING';
+    throw err;
+  }
   const q = String(query || '');
 
   // ✅ Guard: don't treat receipt/OCR dumps as RAG questions
@@ -171,7 +181,7 @@ const ragTool = {
     parameters: {
       type: 'object',
       properties: {
-        ownerId: { type: 'string', description: 'tenant id or "GLOBAL"' },
+        ownerId: { type: 'string', description: 'owner_id digit-string for the current tenant; auto-injected by agent loop' },
         query: { type: 'string' },
         k: { type: 'number', default: 8 },
       },
@@ -179,7 +189,12 @@ const ragTool = {
     },
   },
   __handler: async (args) => {
-    const result = await searchRag({ ownerId: args.ownerId || 'GLOBAL', query: args.query, k: args.k || 8 });
+    // services/agent/index.js:526 injects args.owner_id from request context;
+    // also accept args.ownerId from LLM-emitted spec for back-compat. No
+    // 'GLOBAL' fallback — searchRag throws TENANT_BOUNDARY_MISSING which the
+    // agent loop catches and feeds back to the LLM as a tool-call error.
+    const ownerId = args.owner_id || args.ownerId;
+    const result = await searchRag({ ownerId, query: args.query, k: args.k || 8 });
     return { results: result };
   },
 };

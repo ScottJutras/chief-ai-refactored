@@ -132,9 +132,8 @@ router.get("/whoami", requirePortalUser({ allowUnlinked: true }), async (req, re
       const portalRes = await pg.query(
         `
         select email
-        from public.chiefos_portal_users
-        where user_id = $1::uuid
-        order by created_at desc
+        from public.users
+        where auth_user_id = $1::uuid
         limit 1
         `,
         [req.portalUserId]

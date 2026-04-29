@@ -1,22 +1,20 @@
-// middleware/userProfile.js (DROP-IN)
-// Canonical identity resolution via tenant actor mapping (secure).
-// Falls back to legacy public.users only if resolver has no row.
-//
-// Adds:
-// - req.dbDegraded (boolean): true if DB was unavailable / timed out.
-// - short cache (positive mapping) to survive transient DB outages.
+// middleware/userProfile.js
+// Direct-query identity resolution against rebuild schema (public.users PK).
 //
 // Sets:
 // - req.from (digits)
 // - req.tenantId (uuid)
-// - req.ownerId (digits string, legacy compatibility)
+// - req.ownerId (digits string)
 // - req.isOwner (role === 'owner')
 // - req.userProfile (shaped minimal profile)
 // - req.ownerProfile (shaped minimal owner profile)
 // - req.tz (tenant tz)
+// - req.dbDegraded (boolean): true if DB was unavailable / timed out.
+// - req.actorId (reserved, always null in rebuild — redesigned in R3)
 
 const pg = require('../services/postgres');
 const { getEffectivePlanKey } = require("../src/config/getEffectivePlanKey");
+const { ensureCorrelationId } = require('../services/actorContext');
 const DEFAULT_TZ = 'America/Toronto';
 
 
@@ -106,24 +104,6 @@ function isTransientDbError(e) {
 
   return false;
 }
-async function getActiveTenantForPhone(phoneDigits, markDegraded) {
-  const p = normalizeDigits(phoneDigits);
-  if (!p) return null;
-
-  const r = await safeQuery(
-    `
-    select tenant_id, actor_id
-    from public.chiefos_phone_active_tenant
-    where phone_digits = $1
-    limit 1
-    `,
-    [p],
-    markDegraded
-  );
-
-  return r?.rows?.[0] || null;
-}
-
 // A safe query wrapper that can signal dbDegraded without changing pg.js
 async function safeQuery(sql, params, markDegraded) {
   try {
@@ -138,115 +118,34 @@ async function safeQuery(sql, params, markDegraded) {
 
 /* ------------------------ resolver queries ------------------------ */
 
-// ---- Resolver query (actor identity system) ----
-// Returns ALL candidates (multi-tenant safe). Caller decides.
-async function resolveActorIdentities({ kind, identifier }, markDegraded) {
-  const k = String(kind || "").trim().toLowerCase();
-  const raw = String(identifier || "").trim();
-  if (!k || !raw) return [];
-
-  const digits = raw.replace(/\D/g, "");
-
-  const candidates =
-    k === "whatsapp"
-      ? Array.from(
-          new Set(
-            [
-              digits,
-              "+" + digits,
-              "whatsapp:+" + digits,
-              "whatsapp:" + digits,
-              raw
-            ].filter(Boolean)
-          )
-        )
-      : [raw.toLowerCase()];
-
-  try {
-    const { rows } = await pg.query(
-      `
-      select
-        kind,
-        identifier,
-        tenant_id,
-        role,
-        owner_phone_digits,
-        tz,
-        actor_id
-      from public.v_actor_identity_resolver
-      where kind = $1
-        and identifier = any($2::text[])
-      order by
-        tenant_id asc,
-        (actor_id is not null) desc
-      `,
-      [k, candidates]
-    );
-
-    return rows || [];
-  } catch (e) {
-    const msg = String(e?.message || "");
-    const code = String(e?.code || "");
-    const looksTransient =
-      code === "57P01" ||
-      code === "57P02" ||
-      code === "53300" ||
-      /timeout|ECONNRESET|ENETUNREACH|EAI_AGAIN|connection/i.test(msg);
-
-    if (looksTransient && typeof markDegraded === "function") markDegraded();
-    throw e;
-  }
-}
-
-async function resolveWhatsAppIdentityDirect(phoneDigits, markDegraded) {
+// Direct-query identity resolver against the rebuild schema.
+// public.users.user_id is the phone-digit PK; one phone → one tenant by PK
+// uniqueness (see migrations/2026_04_21_rebuild_identity_tenancy.sql §2).
+// Returns the tenant row for this phone, or null if unknown.
+async function resolveWhatsAppIdentity(phoneDigits, markDegraded) {
   const p = normalizeDigits(phoneDigits);
-  if (!p) return [];
-
-  const candidates = Array.from(
-    new Set(
-      [
-        p,
-        "+" + p,
-        "whatsapp:+" + p,
-        "whatsapp:" + p,
-      ].filter(Boolean)
-    )
-  );
+  if (!p) return null;
 
   const r = await safeQuery(
     `
     select
-      ui.tenant_id,
-      ui.user_id::text as portal_user_id,
-      ui.identifier,
-      t.owner_id as owner_phone_digits,
-      cp.role,
-      t.tz
-    from public.chiefos_user_identities ui
-    join public.chiefos_tenants t
-      on t.id = ui.tenant_id
-    left join public.chiefos_portal_users cp
-      on cp.tenant_id = ui.tenant_id
-     and cp.user_id = ui.user_id
-    where ui.kind = 'whatsapp'
-      and ui.identifier = any($1::text[])
-    order by ui.created_at desc
+      u.user_id,
+      u.owner_id,
+      u.tenant_id,
+      u.role,
+      u.plan_key,
+      u.sub_status,
+      coalesce(u.tz, t.tz) as tz
+    from public.users u
+    join public.chiefos_tenants t on t.id = u.tenant_id
+    where u.user_id = $1
+    limit 1
     `,
-    [candidates],
+    [p],
     markDegraded
   );
 
-  return (r?.rows || []).map((row) => ({
-    kind: "whatsapp",
-    identifier: row.identifier,
-    tenant_id: row.tenant_id,
-    role: row.role || null,
-    owner_phone_digits: normalizeDigits(row.owner_phone_digits) || null,
-    tz: row.tz || null,
-    actor_id: null, // no actor_id from this fallback path
-    portal_user_id: row.portal_user_id || null,
-    source: "chiefos_user_identities_direct",
-  }));
+  return r?.rows?.[0] || null;
 }
 
 async function resolveOwnerPlan(ownerDigits, markDegraded) {
@@ -283,58 +182,17 @@ async function resolveOwnerPlan(ownerDigits, markDegraded) {
   };
 }
 
-async function loadTenantNames(tenantIds, markDegraded) {
-  const ids = (tenantIds || []).map(String).filter(Boolean);
-  if (!ids.length) return new Map();
-
-  const r = await safeQuery(
-    `
-    select id::text as tenant_id,
-           coalesce(nullif(business_name,''), nullif(name,''), 'Business') as tenant_name
-      from public.chiefos_tenants
-     where id = any($1::uuid[])
-    `,
-    [ids],
-    markDegraded
-  );
-
-  const m = new Map();
-  for (const row of (r?.rows || [])) {
-    m.set(String(row.tenant_id), String(row.tenant_name || "Business"));
-  }
-  return m;
-}
-
-// ---- Legacy fallback (public.users) ----
-async function resolveLegacyUser(fromDigits, markDegraded) {
-  // Prefer helper if present
-  try {
-    if (typeof pg.getUserProfile === 'function') {
-      const u = await pg.getUserProfile(fromDigits);
-      return u || null;
-    }
-  } catch (e) {
-    if (isTransientDbError(e)) markDegraded();
-    // fall through to direct SQL
-  }
-
-  const r = await safeQuery(
-    `select user_id, owner_id, role, plan_key, sub_status, timezone
-       from public.users
-      where user_id = $1
-      limit 1`,
-    [fromDigits],
-    markDegraded
-  );
-  return r?.rows?.[0] || null;
-}
-
 async function userProfileMiddleware(req, _res, next) {
   const markDegraded = () => {
     req.dbDegraded = true;
   };
 
   try {
+    // R3a: ensure correlation_id is threaded per §17.21. Idempotent across
+    // middleware layers; safe if requirePortalUser also called it for the
+    // same request.
+    ensureCorrelationId(req);
+
     const from = normalizeDigits(req.body?.From || req.from);
     req.from = from;
 
@@ -348,6 +206,7 @@ async function userProfileMiddleware(req, _res, next) {
     req.userProfile = null;
     req.ownerProfile = null;
     req.actorId = null;
+    req.actorRole = null;
 
     // new flag
     req.dbDegraded = false;
@@ -359,26 +218,24 @@ async function userProfileMiddleware(req, _res, next) {
     }
 
     // -----------------------------
-    // 0) Cache fast path
-    // ONLY accept cache-hit if it includes actorId
+    // 0) Cache fast path — accept any positive mapping.
     // -----------------------------
     const cached = cacheGet(from);
 
-    const hasCore = !!(cached?.tenantId && cached?.ownerId);
-    const hasActor = !!cached?.actorId;
-
-    if (hasCore && hasActor) {
+    if (cached?.tenantId && cached?.ownerId) {
       req.tenantId = cached.tenantId;
       req.ownerId = cached.ownerId;
       req.isOwner = !!cached.isOwner;
       req.tz = cached.tz || DEFAULT_TZ;
       req.actorId = cached.actorId || null;
+      req.actorRole = cached.actorRole || null;
+      req.multiTenant = false;
+      req.multiTenantChoices = [];
 
       const plan = String(cached.plan || "free").trim().toLowerCase();
       const plan_key = cached?.plan_key ?? null;
       const sub_status = cached?.sub_status ?? null;
 
-      // ✅ Debug: confirms what plan we are using on warm/cache path
       try {
         console.info("[PLAN_RESOLVE][userProfile][cache]", {
           from,
@@ -388,7 +245,6 @@ async function userProfileMiddleware(req, _res, next) {
           resolvedPlan: plan,
           plan_key,
           sub_status,
-          note: "plan comes from identityCache; stored onto req.userProfile.plan / req.ownerProfile.plan",
         });
       } catch {}
 
@@ -408,131 +264,50 @@ async function userProfileMiddleware(req, _res, next) {
         plan,
       });
 
-      // ✅ Attach raw plan truth for downstream gating/debugging
       req.ownerProfile.plan_key = plan_key;
       req.ownerProfile.sub_status = sub_status;
 
       return next();
     }
 
-    // ✅ Cache entry exists but is missing actorId (old cache schema)
-    // Treat as miss so resolver runs and re-caches correctly.
-    if (hasCore && !hasActor) {
+    // -----------------------------
+    // 1) Canonical resolver (phone digits -> users row -> tenant)
+    // Rebuild schema enforces one-phone-one-tenant via users.user_id PK.
+    // Multi-tenant phone is architecturally impossible here.
+    // -----------------------------
+    req.multiTenant = false;
+    req.multiTenantChoices = [];
+
+    let chosen = null;
+    try {
+      chosen = await resolveWhatsAppIdentity(from, markDegraded);
+    } catch (e) {
+      console.warn("[userProfile] resolveWhatsAppIdentity failed:", e?.message);
+      chosen = null;
+    }
+
+    if (chosen?.tenant_id) {
+      req.tenantId = String(chosen.tenant_id);
+      req.ownerId = normalizeDigits(chosen.owner_id) || from;
+      req.isOwner = String(chosen.role || "").toLowerCase() === "owner";
+      req.tz = pickTz(chosen) || DEFAULT_TZ;
+      // R3: actor = public.users.user_id (phone-digit PK). chosen.user_id
+      // already came from the direct-query resolver; fall back to `from` if
+      // the column somehow isn't present.
+      req.actorId = String(chosen.user_id || from);
+      req.actorRole = chosen.role || null;
+
       try {
-        console.info("[userProfile] cache hit missing actorId → bypassing cache", {
+        console.info("[userProfile] whatsapp identity resolved", {
           from,
-          tenantId: cached?.tenantId || null,
-          ownerId: cached?.ownerId || null,
+          tenantId: req.tenantId,
+          ownerId: req.ownerId,
+          actorId: req.actorId,
+          role: chosen.role || null,
+          source: "users_direct",
         });
       } catch {}
     }
-
-    // -----------------------------
-// 1) Canonical resolver (whatsapp identity -> tenant + role + actorId)
-// MULTI-TENANT SAFE: may return multiple candidates
-// -----------------------------
-let resolvedRows = [];
-try {
-  resolvedRows = await resolveActorIdentities({ kind: "whatsapp", identifier: from }, markDegraded);
-} catch (e) {
-  console.warn("[userProfile] actor identity resolver failed:", e?.message);
-  resolvedRows = [];
-}
-
-let candidates = (resolvedRows || []).filter((r) => !!r?.tenant_id);
-
-// Fallback: direct canonical lookup from chiefos_user_identities
-if (!candidates.length) {
-  try {
-    const directRows = await resolveWhatsAppIdentityDirect(from, markDegraded);
-    candidates = (directRows || []).filter((r) => !!r?.tenant_id);
-
-    try {
-      console.info("[userProfile] direct whatsapp identity fallback", {
-        from,
-        candidateCount: candidates.length,
-        source: "chiefos_user_identities_direct",
-      });
-    } catch {}
-  } catch (e) {
-    console.warn("[userProfile] direct whatsapp identity fallback failed:", e?.message);
-  }
-}
-const uniqTenantIds = Array.from(new Set(candidates.map(r => String(r.tenant_id))));
-
-if (uniqTenantIds.length > 1) {
-  // Multi-tenant phone: require an active tenant selection or fail closed.
-  let active = null;
-  try {
-    active = await getActiveTenantForPhone(from, markDegraded);
-  } catch (e) {
-    console.warn("[userProfile] getActiveTenantForPhone failed:", e?.message);
-    active = null;
-  }
-
-  if (!active?.tenant_id) {
-    // FAIL CLOSED: do not set tenant/actor.
-    req.multiTenant = true;
-    const names = await loadTenantNames(uniqTenantIds, markDegraded);
-
-req.multiTenantChoices = uniqTenantIds.map((tid) => {
-  const row = candidates.find((x) => String(x.tenant_id) === String(tid));
-  return {
-    tenant_id: tid,
-    tenant_name: names.get(String(tid)) || null,
-    owner_phone_digits: row?.owner_phone_digits || null,
-    role: row?.role || null,
-    tz: row?.tz || null,
-    actor_id: row?.actor_id || null,
-  };
-});
-
-    try {
-      console.info("[userProfile] multi-tenant detected, no active tenant → selection required", {
-        from,
-        tenantCount: uniqTenantIds.length,
-      });
-    } catch {}
-
-    // leave req.tenantId / req.actorId null
-    return next();
-  }
-
-  // active tenant exists → pick matching candidate
-  const chosen = candidates.find((x) => String(x.tenant_id) === String(active.tenant_id)) || null;
-  if (!chosen) {
-    // active tenant points to something no longer valid → fail closed
-    req.multiTenant = true;
-    req.multiTenantChoices = uniqTenantIds.map((tid) => ({ tenant_id: tid }));
-    return next();
-  }
-
-  // proceed as normal with chosen
-  req.tenantId = chosen.tenant_id;
-  req.ownerId = normalizeDigits(chosen.owner_phone_digits) || from;
-  req.isOwner = String(chosen.role || "").toLowerCase() === "owner";
-  req.tz = pickTz(chosen) || DEFAULT_TZ;
-  req.actorId = chosen.actor_id || null;
-
-} else if (uniqTenantIds.length === 1) {
-  // single tenant mapping
-  const chosen = candidates[0];
-  req.tenantId = chosen.tenant_id;
-  req.ownerId = normalizeDigits(chosen.owner_phone_digits) || from;
-  req.isOwner = String(chosen.role || "").toLowerCase() === "owner";
-  req.tz = pickTz(chosen) || DEFAULT_TZ;
-  req.actorId = chosen.actor_id || null;
-
-  try {
-    console.info("[userProfile] whatsapp identity resolved", {
-      from,
-      tenantId: req.tenantId,
-      ownerId: req.ownerId,
-      role: chosen.role || null,
-      source: chosen.source || "resolver_view",
-    });
-  } catch {}
-}
 
 if (req.tenantId) {
   // Plan resolve (best-effort, fail-soft)
@@ -567,7 +342,7 @@ if (req.tenantId) {
   req.userProfile = shapeMinimalProfile({
     from,
     ownerId: req.ownerId,
-    role: req.isOwner ? "owner" : (candidates?.[0]?.role || null),
+    role: req.isOwner ? "owner" : (chosen?.role || null),
     tz: req.tz,
     plan,
   });
@@ -587,6 +362,7 @@ if (req.tenantId) {
     tenantId: req.tenantId,
     ownerId: req.ownerId,
     actorId: req.actorId || null,
+    actorRole: req.actorRole || null,
     isOwner: req.isOwner,
     tz: req.tz,
     role: req.userProfile.role || null,
@@ -599,51 +375,7 @@ if (req.tenantId) {
 }
 
     // -----------------------------
-    // 2) Legacy fallback (public.users / old systems)
-    // -----------------------------
-    let legacy = null;
-    try {
-      legacy = await resolveLegacyUser(from, markDegraded);
-    } catch (e) {
-      console.warn("[userProfile] legacy lookup failed:", e?.message);
-      legacy = null;
-    }
-
-    if (legacy) {
-      const ownerId = normalizeDigits(legacy.owner_id) || from;
-      const role = legacy.role || (String(legacy.user_id) === String(ownerId) ? "owner" : "employee");
-      const tz = legacy.timezone || DEFAULT_TZ;
-      const plan = String(getEffectivePlanKey(legacy) || "free").trim().toLowerCase();
-
-      req.ownerId = ownerId;
-      req.isOwner = String(role).toLowerCase() === "owner";
-      req.tz = tz;
-
-      req.userProfile = shapeMinimalProfile({ from, ownerId, role, tz, plan });
-      req.ownerProfile = shapeMinimalProfile({ from: ownerId, ownerId, role: "owner", tz, plan });
-
-      // ✅ Attach raw plan truth if present on legacy row
-      req.ownerProfile.plan_key = legacy?.plan_key ?? null;
-      req.ownerProfile.sub_status = legacy?.sub_status ?? null;
-
-      // ✅ Cache positive mapping (legacy has no actorId)
-      cacheSet(from, {
-        tenantId: null,
-        ownerId,
-        actorId: null,
-        isOwner: req.isOwner,
-        tz: req.tz,
-        role,
-        plan,
-        plan_key: legacy?.plan_key ?? null,
-        sub_status: legacy?.sub_status ?? null,
-      });
-
-      return next();
-    }
-
-    // -----------------------------
-    // 3) Unknown identity (not linked)
+    // 2) Unknown identity (not linked)
     // -----------------------------
     req.ownerId = null;
     req.isOwner = false;
@@ -651,6 +383,7 @@ if (req.tenantId) {
     req.ownerProfile = null;
     req.tenantId = null;
     req.actorId = null;
+    req.actorRole = null;
     req.tz = DEFAULT_TZ;
 
     return next();

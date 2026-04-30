@@ -28,6 +28,8 @@
 
 **Amendment 2026-04-29 (Phase 1 PR-A — lifecycle + plan_key placement):** §5.1, §5.2, §6, §7, §8, §9.4 corrected. All 12 §5.1 lifecycle/activation columns + `reminders_sent` JSONB are placed on `public.chiefos_tenants`, NOT `public.users`. §5.2 `plan_key` is moved to `public.chiefos_tenants` and dropped from `public.users`. Reason: every column is per-business state; `public.users` is multi-actor-per-owner (UNIQUE `(owner_id, user_id)`), so per-business state on that table forces denormalization across crew rows. Same precedent that drove `phone_e164` → `chiefos_tenants` in the prior amendment. §5.2 also corrects the constraint name (`users_plan_key_check` → `users_plan_key_chk`, the actual production name) and adds the explicit `DROP COLUMN users.plan_key` step. §6 plan-resolution and §7/§8/§9.4 transition logic now read/write lifecycle and plan_key via `chiefos_tenants` keyed by `owner_id` (or by JOIN through `users.tenant_id` where the entry surface is owner_id-bound). Implementation: migration `2026_04_29_phase1_pra_lifecycle_and_plan_key_on_chiefos_tenants.sql` + RPC amendment `2026_04_29_amendment_p1a14_chiefos_finish_signup_rpc_lifecycle_and_plan.sql`. Application-code reads of `users.plan_key` tracked under `P1B-application-code-plan-key-source-update` for post-Phase-1 cleanup.
 
+**Amendment 2026-04-29 (Phase 1 PR-B — §5.4 split into landing_events + acquisition_events):** §5.4 rewritten. The v1.1 spec literal had two structural defects: (a) `user_id UUID REFERENCES public.users(id)` does not compile because `public.users` has no `id` column (PK is `user_id text`); (b) pre-signup events fire before any tenant row exists, so a single table with NOT NULL tenant FK is impossible. Resolution: split into two tables. `public.landing_events` captures pre-signup anonymous funnel (`landing_page_viewed`, `landing_page_form_submitted`, `whatsapp_deep_link_clicked`) — no `tenant_id`, no RLS (service-role only). `public.acquisition_events` captures post-signup tenant-scoped events (`first_whatsapp_message_sent`, `first_portal_login`, `first_capture`, `first_job_created`, `first_ask_chief_question`, `paid_conversion`) — `tenant_id UUID NOT NULL REFERENCES chiefos_tenants(id) ON DELETE CASCADE`, RLS enabled with SELECT policy scoped via `chiefos_portal_users` membership. Both tables share `anonymous_session_id TEXT` to bridge end-to-end funnel queries via `UNION ALL`. INSERTs occur via SECURITY DEFINER functions or service-role contexts (no INSERT policy for portal users). Implementation: migration `2026_04_29_phase1_prb_acquisition_events_and_landing_events.sql`. Event-emitting application code is a subsequent workstream.
+
 ---
 
 ## 1. Purpose
@@ -254,42 +256,96 @@ ALTER TABLE public.users DROP COLUMN plan_key;
 
 **Critical:** `trial` and `starter` have identical feature access. They differ only in lifecycle state. The trial experience must equal the paid Starter experience so contractors evaluate the real product.
 
-### 5.4 Acquisition tracking table
+### 5.4 Acquisition tracking tables
+
+Per Amendment 2026-04-29 (Phase 1 PR-B), funnel telemetry is split into two tables to handle the pre-signup vs post-signup boundary correctly:
+
+- **`public.landing_events`** — pre-signup anonymous funnel. No `tenant_id` (the tenant does not exist yet at capture time). Service-role only; no RLS policy.
+- **`public.acquisition_events`** — post-signup tenant-scoped funnel. `tenant_id UUID NOT NULL REFERENCES public.chiefos_tenants(id) ON DELETE CASCADE`. RLS enabled with SELECT policy scoped to `chiefos_portal_users` membership.
+
+Both tables share `anonymous_session_id TEXT` to enable end-to-end funnel queries (landing_page_viewed → paid_conversion) via `UNION ALL` on the session ID. INSERTs occur via SECURITY DEFINER functions or service-role contexts (event-logging RPCs, cron jobs, webhook handlers); portal users do not insert events directly.
 
 ```sql
--- File: migrations/2026_04_28_003_acquisition_tracking.sql
+-- File: migrations/2026_04_29_phase1_prb_acquisition_events_and_landing_events.sql
 
 BEGIN;
 
-CREATE TABLE IF NOT EXISTS public.acquisition_events (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id UUID REFERENCES public.users(id) ON DELETE CASCADE,
-  event_type TEXT NOT NULL CHECK (event_type IN (
-    'landing_page_viewed',
-    'landing_page_form_submitted',
-    'whatsapp_deep_link_clicked',
-    'first_whatsapp_message_sent',
-    'first_portal_login',
-    'first_capture',
-    'first_job_created',
-    'first_ask_chief_question',
-    'paid_conversion'
-  )),
-  event_data JSONB DEFAULT '{}'::jsonb,
-  utm_source TEXT,
-  utm_medium TEXT,
-  utm_campaign TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+-- 1. landing_events: pre-signup funnel (anonymous, no tenant)
+CREATE TABLE public.landing_events (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  event_type           TEXT NOT NULL
+    CONSTRAINT landing_events_event_type_chk
+      CHECK (event_type IN (
+        'landing_page_viewed',
+        'landing_page_form_submitted',
+        'whatsapp_deep_link_clicked'
+      )),
+  event_data           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  anonymous_session_id TEXT,
+  utm_source           TEXT,
+  utm_medium           TEXT,
+  utm_campaign         TEXT,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_acquisition_events_user_id ON public.acquisition_events(user_id);
-CREATE INDEX idx_acquisition_events_event_type ON public.acquisition_events(event_type);
-CREATE INDEX idx_acquisition_events_created_at ON public.acquisition_events(created_at);
+CREATE INDEX idx_landing_events_event_type
+  ON public.landing_events(event_type);
+CREATE INDEX idx_landing_events_created_at
+  ON public.landing_events(created_at);
+CREATE INDEX idx_landing_events_anonymous_session_id
+  ON public.landing_events(anonymous_session_id)
+  WHERE anonymous_session_id IS NOT NULL;
+-- landing_events: NO RLS. Service-role only.
+
+-- 2. acquisition_events: post-signup funnel (tenant-scoped)
+CREATE TABLE public.acquisition_events (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id            UUID NOT NULL
+    REFERENCES public.chiefos_tenants(id) ON DELETE CASCADE,
+  event_type           TEXT NOT NULL
+    CONSTRAINT acquisition_events_event_type_chk
+      CHECK (event_type IN (
+        'first_whatsapp_message_sent',
+        'first_portal_login',
+        'first_capture',
+        'first_job_created',
+        'first_ask_chief_question',
+        'paid_conversion'
+      )),
+  event_data           JSONB NOT NULL DEFAULT '{}'::jsonb,
+  anonymous_session_id TEXT,  -- bridges to landing_events
+  utm_source           TEXT,
+  utm_medium           TEXT,
+  utm_campaign         TEXT,
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_acquisition_events_tenant_id
+  ON public.acquisition_events(tenant_id);
+CREATE INDEX idx_acquisition_events_event_type
+  ON public.acquisition_events(event_type);
+CREATE INDEX idx_acquisition_events_created_at
+  ON public.acquisition_events(created_at);
+CREATE INDEX idx_acquisition_events_tenant_event
+  ON public.acquisition_events(tenant_id, event_type, created_at);
+
+ALTER TABLE public.acquisition_events ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Tenants can read own acquisition events"
+  ON public.acquisition_events
+  FOR SELECT
+  USING (
+    tenant_id IN (
+      SELECT tenant_id FROM public.chiefos_portal_users
+      WHERE user_id = auth.uid()
+    )
+  );
+-- No INSERT/UPDATE/DELETE policy. Writes via SECURITY DEFINER only.
 
 COMMIT;
 ```
 
-This table tracks the contractor's journey from ad click to paid conversion. It is not the same as the audit log (Engineering Constitution Section 9); audit log is for security/compliance, acquisition events are for funnel analysis.
+These tables track the contractor's journey from ad click to paid conversion. They are not the same as the audit log (Engineering Constitution Section 9); audit log is for security/compliance, acquisition + landing events are for funnel analysis.
 
 ---
 

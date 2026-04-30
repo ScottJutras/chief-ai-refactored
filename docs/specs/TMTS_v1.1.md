@@ -30,6 +30,8 @@
 
 **Amendment 2026-04-29 (Phase 1 PR-B — §5.4 split into landing_events + acquisition_events):** §5.4 rewritten. The v1.1 spec literal had two structural defects: (a) `user_id UUID REFERENCES public.users(id)` does not compile because `public.users` has no `id` column (PK is `user_id text`); (b) pre-signup events fire before any tenant row exists, so a single table with NOT NULL tenant FK is impossible. Resolution: split into two tables. `public.landing_events` captures pre-signup anonymous funnel (`landing_page_viewed`, `landing_page_form_submitted`, `whatsapp_deep_link_clicked`) — no `tenant_id`, no RLS (service-role only). `public.acquisition_events` captures post-signup tenant-scoped events (`first_whatsapp_message_sent`, `first_portal_login`, `first_capture`, `first_job_created`, `first_ask_chief_question`, `paid_conversion`) — `tenant_id UUID NOT NULL REFERENCES chiefos_tenants(id) ON DELETE CASCADE`, RLS enabled with SELECT policy scoped via `chiefos_portal_users` membership. Both tables share `anonymous_session_id TEXT` to bridge end-to-end funnel queries via `UNION ALL`. INSERTs occur via SECURITY DEFINER functions or service-role contexts (no INSERT policy for portal users). Implementation: migration `2026_04_29_phase1_prb_acquisition_events_and_landing_events.sql`. Event-emitting application code is a subsequent workstream.
 
+**Amendment 2026-04-29 (Phase 1 PR-B follow-up — base table GRANTs):** Adds GRANT statements that were missed in PR-B. Schema unchanged. RLS policies filter rows on top of base privileges; without a GRANT the authenticated role gets `permission denied for table acquisition_events` from Postgres before the policy is consulted. PR-B production-apply RLS round-trip surfaced this gap; this follow-up closes it. `acquisition_events`: GRANT SELECT to `authenticated` (RLS-filtered), GRANT SELECT/INSERT/UPDATE/DELETE to `service_role` (RLS-bypass; used by event-logging RPCs and webhook handlers). `landing_events`: GRANT SELECT/INSERT/UPDATE/DELETE to `service_role` only — no `authenticated` grant by design (anonymous funnel; not user-visible). **Pattern note for §5.4 and any future RLS-enabled table:** `ENABLE ROW LEVEL SECURITY` and `CREATE POLICY` MUST be paired with explicit `GRANT` statements in the same migration. Filed as `P1B-rls-grant-pattern-for-future-tables`. Implementation: migration `2026_04_29_phase1_prb_grants_followup.sql`.
+
 ---
 
 ## 1. Purpose
@@ -346,6 +348,19 @@ COMMIT;
 ```
 
 These tables track the contractor's journey from ad click to paid conversion. They are not the same as the audit log (Engineering Constitution Section 9); audit log is for security/compliance, acquisition + landing events are for funnel analysis.
+
+**GRANT pattern for RLS tables (binding):** Per the Phase 1 PR-B follow-up, every table with `ENABLE ROW LEVEL SECURITY` MUST include explicit `GRANT` statements in the same migration. RLS policies layer on top of base table privileges; without a `GRANT SELECT` the role hits `permission denied` before the policy is consulted. The shape used by `acquisition_events`:
+
+```sql
+-- Portal users: SELECT only; rows filtered by the RLS policy.
+GRANT SELECT ON public.<table> TO authenticated;
+
+-- Service role: full CRUD; bypasses RLS automatically.
+-- Used by SECURITY DEFINER event-logging RPCs, cron jobs, webhook handlers.
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.<table> TO service_role;
+```
+
+Tables that are intentionally service-role-only (`landing_events`) omit the `authenticated` grant. Audit checklist for any new RLS table: (1) `ENABLE ROW LEVEL SECURITY`; (2) `CREATE POLICY` for each access shape; (3) `GRANT` for each role that will hit a policy. All three in the same migration.
 
 ---
 
